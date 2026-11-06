@@ -3,7 +3,6 @@ package service
 import (
 	"fmt"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -12,7 +11,6 @@ import (
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -29,11 +27,8 @@ func setupChannelSelectAutoGroupsTest(t *testing.T) *gorm.DB {
 	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
 	originalMaxTokenAutoGroups := setting.GetMaxTokenAutoGroups()
 
-	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
-	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
-	require.NoError(t, err)
+	db := model.UseTestDatabases(t)
 	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}))
-	model.DB = db
 	common.MemoryCacheEnabled = true
 	common.RetryTimes = 0
 

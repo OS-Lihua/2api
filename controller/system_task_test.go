@@ -8,19 +8,15 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 )
 
 func TestSystemTaskListFiltersAndPaginationResponse(t *testing.T) {
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
+	db := model.UseTestDatabases(t)
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	previousDB := model.DB
-	model.DB = db
 	t.Cleanup(func() {
 		model.DB = previousDB
 		require.NoError(t, sqlDB.Close())

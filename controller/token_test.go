@@ -21,7 +21,6 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -83,25 +82,8 @@ func openTokenControllerTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 
 	gin.SetMode(gin.TestMode)
-	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
 	common.RedisEnabled = false
-
-	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
-	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("failed to open sqlite db: %v", err)
-	}
-	model.DB = db
-	model.LOG_DB = db
-
-	t.Cleanup(func() {
-		sqlDB, err := db.DB()
-		if err == nil {
-			_ = sqlDB.Close()
-		}
-	})
-
-	return db
+	return model.UseTestDatabases(t)
 }
 
 func migrateTokenControllerTestDB(t *testing.T, db *gorm.DB) {
@@ -405,6 +387,9 @@ func runTokenMigrationCompatibilityTest(t *testing.T, db *gorm.DB, dialect strin
 
 func TestTokenAutoMigrateUsesVarchar128KeyColumn(t *testing.T) {
 	db := setupTokenControllerTestDB(t)
+	if !common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+		t.Skip("SQLite-only variant; TestTokenMigrationFromChar48ToVarchar128Postgres covers PostgreSQL")
+	}
 
 	if got := getTokenKeyColumnType(t, db, "sqlite"); got != "varchar(128)" {
 		t.Fatalf("expected key column type varchar(128), got %q", got)
@@ -416,6 +401,9 @@ func TestTokenAutoMigrateUsesVarchar128KeyColumn(t *testing.T) {
 
 func TestTokenMigrationFromChar48ToVarchar128(t *testing.T) {
 	db := openTokenControllerTestDB(t)
+	if !common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+		t.Skip("SQLite-only variant; TestTokenMigrationFromChar48ToVarchar128Postgres covers PostgreSQL")
+	}
 	runTokenMigrationCompatibilityTest(t, db, "sqlite", nil)
 }
 
@@ -873,7 +861,7 @@ func verifyAPITokenAudit(t *testing.T) {
 				assert.Greater(t, response.Body.Len(), 64*1024)
 			}
 			var events []model.AuditLog
-			require.NoError(t, model.LOG_DB.Where("request_id = ?", response.Header().Get(common.RequestIdKey)).Find(&events).Error)
+			require.NoError(t, model.AuditLogQuery().Where("request_id = ?", response.Header().Get(common.RequestIdKey)).Find(&events).Error)
 			expectedEvents := 1
 			if tc.usePAT {
 				expectedEvents = 2
@@ -954,7 +942,7 @@ func verifyAPITokenAudit(t *testing.T) {
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, request)
 			var event model.AuditLog
-			require.NoError(t, model.LOG_DB.Where("request_id = ?", response.Header().Get(common.RequestIdKey)).First(&event).Error)
+			require.NoError(t, model.AuditLogQuery().Where("request_id = ?", response.Header().Get(common.RequestIdKey)).First(&event).Error)
 			var params struct {
 				IDs       []int `json:"requested_ids"`
 				Truncated bool  `json:"requested_ids_truncated"`
@@ -984,7 +972,7 @@ func verifyAPITokenAudit(t *testing.T) {
 		} {
 			response := auditRequest(router, tc.method, tc.path, tc.credential)
 			var count int64
-			require.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).Where("request_id = ?", response.Header().Get(common.RequestIdKey)).Count(&count).Error)
+			require.NoError(t, model.AuditLogQuery().Where("request_id = ?", response.Header().Get(common.RequestIdKey)).Count(&count).Error)
 			assert.Zero(t, count)
 		}
 	})

@@ -3,6 +3,7 @@ package middleware
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -17,7 +18,6 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/gin-gonic/gin"
-	"github.com/glebarez/sqlite"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -31,12 +31,8 @@ func setupDashboardAuthMiddlewareTest(t *testing.T) {
 	previousType := common.MainDatabaseType()
 	previousRedis := common.RedisEnabled
 	previousSecret := common.SessionSecret
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
+	db := model.UseTestDatabases(t)
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.AuditLog{}, &model.UserAccessToken{}, &model.Option{}))
-	model.DB = db
-	model.LOG_DB = db
-	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
 	common.RedisEnabled = false
 	common.SessionSecret = "middleware-auth-test-secret"
 	require.NoError(t, model.EnsureLegacyAccessTokenRetireAt(time.Now().Unix()))
@@ -85,7 +81,7 @@ func createMiddlewarePATUser(t *testing.T, username, token string) *model.User {
 	user := &model.User{
 		Username: username, Password: "password-placeholder", Role: common.RoleCommonUser,
 		Status: common.UserStatusEnabled, Group: "default", AccessToken: &token, AuthVersion: 1,
-		AffCode: "middleware-aff-" + username,
+		AffCode: middlewareTestAffCode(username),
 	}
 	require.NoError(t, model.DB.Create(user).Error)
 	return user
@@ -141,7 +137,16 @@ func TestUserAuthNeverFallsBackForRecognizedInvalidInternalJWT(t *testing.T) {
 	token, _, err := service.IssueAccessToken(identity)
 	require.NoError(t, err)
 	tampered := tamperDashboardToken(token)
-	createMiddlewarePATUser(t, "jwt-fallback-user", tampered)
+	// users.access_token is char(32), so a JWT can never match a stored legacy
+	// token. Assert the stronger contract directly: no legacy lookup happens.
+	var legacyLookups int
+	const callbackName = "test:jwt-fallback-legacy-lookup"
+	require.NoError(t, model.DB.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table == "users" && strings.Contains(tx.Statement.SQL.String(), "access_token") {
+			legacyLookups++
+		}
+	}))
+	t.Cleanup(func() { model.DB.Callback().Query().Remove(callbackName) })
 	router := gin.New()
 	router.GET("/protected", UserAuth(), func(c *gin.Context) {
 		c.Status(http.StatusNoContent)
@@ -154,6 +159,7 @@ func TestUserAuthNeverFallsBackForRecognizedInvalidInternalJWT(t *testing.T) {
 
 	assert.Equal(t, http.StatusUnauthorized, response.Code)
 	assert.Contains(t, response.Body.String(), "AUTH_UNAUTHORIZED")
+	assert.Zero(t, legacyLookups, "a recognized internal JWT must not fall back to legacy token lookup")
 }
 
 func TestDashboardAuthRejectsRedisRoleTampering(t *testing.T) {
@@ -426,13 +432,15 @@ func TestUserAuthAppliesAccessTokenRouteRules(t *testing.T) {
 		{name: "legacy token on a session route", path: "/api/user/access_tokens", token: legacy, status: http.StatusForbidden, code: "AUTH_SESSION_REQUIRED", reason: "session_required"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			// Keep only this request's audit row; ClickHouse rows have no insertion order.
+			model.ClearTestLogTable("audit_logs")
 			response := middlewareBearerRequest(router, test.path, test.token)
 			assert.Equal(t, test.status, response.Code, response.Body.String())
 			if test.code != "" {
 				assert.Contains(t, response.Body.String(), `"code":"`+test.code+`"`)
 			}
 			var audit model.AuditLog
-			require.NoError(t, model.LOG_DB.Where("category = ?", model.AuditCategoryAccessToken).Order("id desc").First(&audit).Error)
+			require.NoError(t, model.AuditLogQuery().Where("category = ?", model.AuditCategoryAccessToken).First(&audit).Error)
 			assert.Equal(t, model.AccessTokenFingerprint(test.token), audit.TokenRef)
 			assert.Equal(t, test.status, audit.Status)
 			if test.reason == "" {
@@ -614,4 +622,11 @@ func TestApplyWebSocketSubprotocolAuthorizationReadsRepeatedHeaders(t *testing.T
 
 	assert.True(t, applyWebSocketSubprotocolAuthorization(header))
 	assert.Equal(t, "Bearer sk-later-field", header.Get("Authorization"))
+}
+
+// middlewareTestAffCode returns a unique affiliate code that fits the
+// varchar(32) aff_code column.
+func middlewareTestAffCode(username string) string {
+	sum := sha256.Sum256([]byte(username))
+	return "mw-" + hex.EncodeToString(sum[:])[:16]
 }

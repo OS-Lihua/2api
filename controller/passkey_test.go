@@ -407,7 +407,7 @@ func TestPasskeyDomainPreviewConfirmationAndAudit(t *testing.T) {
 	require.True(t, result.Success, response.Body.String())
 	assert.Equal(t, upper, settings.LegacyRPIDs)
 	var audits []model.AuditLog
-	require.NoError(t, model.LOG_DB.Find(&audits).Error)
+	require.NoError(t, model.AuditLogQuery().Find(&audits).Error)
 	for _, audit := range audits {
 		if audit.Action == "option.passkey_domains_blocked" {
 			assert.False(t, audit.Success)

@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/testdb"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -42,16 +43,12 @@ func TestDeleteRedemptionBatch(t *testing.T) {
 				logDriver = mysql.Open(logDSN)
 				dbType = common.DatabaseTypeMySQL
 			case "postgres":
-				dsn := os.Getenv("TEST_POSTGRES_DSN")
+				dsn := testdb.PostgresDSN(t)
 				if dsn == "" {
 					t.Skip("TEST_POSTGRES_DSN is not configured")
 				}
 				driver = postgres.Open(dsn)
-				logDSN := os.Getenv("TEST_POSTGRES_LOG_DSN")
-				if logDSN == "" {
-					logDSN = dsn
-				}
-				logDriver = postgres.Open(logDSN)
+				logDriver = postgres.Open(testdb.PostgresDSN(t))
 				dbType = common.DatabaseTypePostgreSQL
 			}
 			db, err := gorm.Open(driver, &gorm.Config{})

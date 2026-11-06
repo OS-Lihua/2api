@@ -22,7 +22,6 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -90,11 +89,8 @@ func TestKlingNativeRouteSubmitPollSettleAndQuery(t *testing.T) {
 	previousBatchUpdate := common.BatchUpdateEnabled
 	previousLogConsume := common.LogConsumeEnabled
 	previousRedisEnabled := common.RedisEnabled
-	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
+	database := model.UseTestDatabases(t)
 	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Channel{}, &model.Task{}, &model.Log{}))
-	model.DB = database
-	model.LOG_DB = database
 	common.MemoryCacheEnabled = false
 	common.BatchUpdateEnabled = false
 	common.LogConsumeEnabled = false
@@ -278,11 +274,8 @@ func TestDoubaoRelayedImageStreamSettlement(t *testing.T) {
 	previousLogConsume := common.LogConsumeEnabled
 	previousRedisEnabled := common.RedisEnabled
 	previousDeadline := constant.TaskPluginProtocolTimeoutSeconds
-	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
+	database := model.UseTestDatabases(t)
 	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Channel{}, &model.Task{}, &model.Log{}))
-	model.DB = database
-	model.LOG_DB = database
 	common.MemoryCacheEnabled = false
 	common.BatchUpdateEnabled = false
 	common.LogConsumeEnabled = true
@@ -370,7 +363,7 @@ func TestDoubaoRelayedImageStreamSettlement(t *testing.T) {
 	} {
 		t.Run(tc.prompt, func(t *testing.T) {
 			require.NoError(t, database.Model(&model.User{}).Where("id = ?", 7).Update("quota", 1_000_000).Error)
-			require.NoError(t, database.Where("type = ?", model.LogTypeConsume).Delete(&model.Log{}).Error)
+			model.ClearTestLogTable("logs")
 			failTaskInsert.Store(tc.prompt == "insert_fails")
 			recorder := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(recorder)
@@ -415,7 +408,7 @@ func TestDoubaoRelayedImageStreamSettlement(t *testing.T) {
 			require.NoError(t, database.First(&user, 7).Error)
 			assert.Equal(t, 1_000_000-tc.wantQuota, user.Quota, "the delivered images are charged")
 			var consumeLogs []model.Log
-			require.NoError(t, database.Where("type = ?", model.LogTypeConsume).Find(&consumeLogs).Error)
+			require.NoError(t, model.LOG_DB.Where("type = ?", model.LogTypeConsume).Find(&consumeLogs).Error)
 			require.Len(t, consumeLogs, 1)
 			assert.Equal(t, tc.wantQuota, consumeLogs[0].Quota)
 		})

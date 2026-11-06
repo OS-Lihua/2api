@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -36,13 +37,10 @@ func setupAccessTokenAudit(t *testing.T) (*model.User, string) {
 	previousDB, previousLogDB := model.DB, model.LOG_DB
 	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
 	previousRedis := common.RedisEnabled
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
+	db := model.UseTestDatabases(t)
 	require.NoError(t, i18n.Init())
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Log{}, &model.AuditLog{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.UserAccessToken{}, &model.Option{},
 		&model.AuthFlow{}, &model.TwoFA{}, &model.TwoFABackupCode{}, &model.PasskeyCredential{}, &model.UserOAuthBinding{}))
-	model.DB, model.LOG_DB = db, db
-	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
 	require.NoError(t, model.EnsureLegacyAccessTokenRetireAt(time.Now().Unix()))
 	common.RedisEnabled = false
 	previousMaster := common.IsMasterNode
@@ -54,7 +52,7 @@ func setupAccessTokenAudit(t *testing.T) (*model.User, string) {
 		common.SetDatabaseTypes(previousMain, previousLog)
 		common.RedisEnabled = previousRedis
 	})
-	token := "legacy-opaque-token"
+	token := "legacy-opaque-token-0123456789ab"
 	user := &model.User{Username: "audit-owner", Password: "placeholder", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, Group: "default", AccessToken: &token, AuthVersion: 1, AffCode: "audit-owner"}
 	require.NoError(t, db.Create(user).Error)
 	return user, token
@@ -268,19 +266,24 @@ func TestAccessTokenLifecycleAndLateRequests(t *testing.T) {
 	assert.Equal(t, legacy, stored.GetAccessToken())
 
 	var revoked []model.AuditLog
-	require.NoError(t, model.LOG_DB.Where("action = ?", "access_token.revoke").Order("id").Find(&revoked).Error)
+	require.NoError(t, model.AuditLogQuery().Where("action = ?", "access_token.revoke").Find(&revoked).Error)
 	require.Len(t, revoked, 2)
-	for i, want := range []string{
+	// ClickHouse audit rows have no insertion order, so match by content.
+	var revokedParams []string
+	for _, audit := range revoked {
+		require.NotNil(t, audit.Other.Op)
+		params, err := common.Marshal(audit.Other.Op.Params)
+		require.NoError(t, err)
+		revokedParams = append(revokedParams, string(params))
+	}
+	for _, want := range []string{
 		fmt.Sprintf(`"token_ref":"%s"`, scopedToken.TokenHash),
 		fmt.Sprintf(`"legacy":true,"token_ref":"%s"`, model.AccessTokenFingerprint(legacy)),
 	} {
-		require.NotNil(t, revoked[i].Other.Op)
-		params, err := common.Marshal(revoked[i].Other.Op.Params)
-		require.NoError(t, err)
-		assert.Contains(t, string(params), want)
+		assert.True(t, slices.ContainsFunc(revokedParams, func(params string) bool { return strings.Contains(params, want) }), "missing revoke audit with %s in %v", want, revokedParams)
 	}
 	var history []model.AuditLog
-	require.NoError(t, model.LOG_DB.Find(&history).Error)
+	require.NoError(t, model.AuditLogQuery().Find(&history).Error)
 	encoded, err := common.Marshal(history)
 	require.NoError(t, err)
 	for _, secret := range []string{scoped, legacy, browser, proof, legacyProof, otherRaw, otherProof, "Authorization"} {
@@ -407,14 +410,14 @@ func TestAccessTokenCreationChecksGrantBeforeConsumingProof(t *testing.T) {
 	assert.Equal(t, legacy, stored.GetAccessToken(), "creating a token never replaces the legacy token")
 
 	var generated model.AuditLog
-	require.NoError(t, model.LOG_DB.Where("action = ?", "access_token.generate").First(&generated).Error)
+	require.NoError(t, model.AuditLogQuery().Where("action = ?", "access_token.generate").First(&generated).Error)
 	require.NotNil(t, generated.Other.Op)
 	params, err := common.Marshal(generated.Other.Op.Params)
 	require.NoError(t, err)
 	assert.Contains(t, string(params), fmt.Sprintf(`"token_ref":"%s"`, created.Data.Item.TokenRef))
 	assert.Contains(t, string(params), `"scopes":["profile:read","usage:read"]`)
 	var history []model.AuditLog
-	require.NoError(t, model.LOG_DB.Find(&history).Error)
+	require.NoError(t, model.AuditLogQuery().Find(&history).Error)
 	encoded, err := common.Marshal(history)
 	require.NoError(t, err)
 	for _, secret := range []string{raw, browser, proof} {
@@ -497,17 +500,26 @@ func TestAccessTokenUpdateRenamesFreelyAndChangesGrantOnlyWithProof(t *testing.T
 	assert.Contains(t, response.Body.String(), `"code":"SECURITY_PROOF_CONSUMED"`)
 
 	var audits []model.AuditLog
-	require.NoError(t, model.LOG_DB.Where("action IN ?", []string{"access_token.rename", "access_token.update"}).Order("id").Find(&audits).Error)
+	require.NoError(t, model.AuditLogQuery().Where("action IN ?", []string{"access_token.rename", "access_token.update"}).Find(&audits).Error)
 	require.Len(t, audits, 3)
-	assert.Equal(t, "access_token.rename", audits[0].Action)
-	assert.Equal(t, "access_token.update", audits[1].Action)
-	assert.Equal(t, "access_token.update", audits[2].Action)
-	require.NotNil(t, audits[2].Other.Op)
-	params, err := common.Marshal(audits[2].Other.Op.Params)
-	require.NoError(t, err)
-	assert.Contains(t, string(params), `"previous_scopes":["profile:read","usage:read"]`)
-	assert.Contains(t, string(params), `"scopes":["usage:read"]`)
-	assert.Contains(t, string(params), fmt.Sprintf(`"token_ref":"%s"`, token.TokenHash))
+	// ClickHouse audit rows have no insertion order, so match by content.
+	var actions, updateParams []string
+	for _, audit := range audits {
+		actions = append(actions, audit.Action)
+		if audit.Action != "access_token.update" {
+			continue
+		}
+		require.NotNil(t, audit.Other.Op)
+		params, err := common.Marshal(audit.Other.Op.Params)
+		require.NoError(t, err)
+		updateParams = append(updateParams, string(params))
+	}
+	assert.ElementsMatch(t, []string{"access_token.rename", "access_token.update", "access_token.update"}, actions)
+	assert.True(t, slices.ContainsFunc(updateParams, func(params string) bool {
+		return strings.Contains(params, `"previous_scopes":["profile:read","usage:read"]`) &&
+			strings.Contains(params, `"scopes":["usage:read"]`) &&
+			strings.Contains(params, fmt.Sprintf(`"token_ref":"%s"`, token.TokenHash))
+	}), "missing scope-change audit in %v", updateParams)
 	encoded, err := common.Marshal(audits)
 	require.NoError(t, err)
 	for _, secret := range []string{raw, browser, widenProof, proof, generateProof} {
@@ -538,7 +550,7 @@ func TestAccessTokenAuditsResultsAndExcludesBrowserSessions(t *testing.T) {
 		response := auditRequest(router, tc.method, tc.path, pat)
 		require.Equal(t, tc.status, response.Code)
 		var access model.AuditLog
-		require.NoError(t, model.LOG_DB.Where("request_id = ? AND category = ?", response.Header().Get(common.RequestIdKey), model.AuditCategoryAccessToken).First(&access).Error)
+		require.NoError(t, model.AuditLogQuery().Where("request_id = ? AND category = ?", response.Header().Get(common.RequestIdKey), model.AuditCategoryAccessToken).First(&access).Error)
 		assert.Equal(t, tc.success, access.Success)
 		assert.Equal(t, tc.status, access.Status)
 		assert.Equal(t, user.Id, access.UserId)
@@ -547,7 +559,7 @@ func TestAccessTokenAuditsResultsAndExcludesBrowserSessions(t *testing.T) {
 		assert.NotContains(t, access.Route, "sensitive-id")
 	}
 	var operationCount int64
-	require.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).Where("category = ?", model.AuditCategoryOperation).Count(&operationCount).Error)
+	require.NoError(t, model.AuditLogQuery().Where("category = ?", model.AuditCategoryOperation).Count(&operationCount).Error)
 	assert.EqualValues(t, 2, operationCount, "manual operation must not be duplicated by fallback")
 	now := time.Now().Unix()
 	session := &model.UserSession{SID: "audit-session", UserID: user.Id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: "refresh-placeholder", LoginMethod: "password", LastActiveAt: now, ExpiresAt: now + 3600}
@@ -744,7 +756,7 @@ func TestSecurityAndOperationEventsUseAuditTable(t *testing.T) {
 		model.RecordLog(user.Id, typ, common.NewMessage("business entry"))
 	}
 	var audits []model.AuditLog
-	require.NoError(t, model.LOG_DB.Find(&audits).Error)
+	require.NoError(t, model.AuditLogQuery().Find(&audits).Error)
 	assert.Len(t, audits, 10)
 	for _, entry := range audits {
 		assert.Equal(t, "correlated-request", entry.RequestId)
@@ -756,7 +768,7 @@ func TestSecurityAndOperationEventsUseAuditTable(t *testing.T) {
 	_, err := model.DeleteOldLogBatch(context.Background(), time.Now().Unix()+1, 100)
 	require.NoError(t, err)
 	var count int64
-	require.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).Count(&count).Error)
+	require.NoError(t, model.AuditLogQuery().Count(&count).Error)
 	assert.EqualValues(t, 10, count)
 }
 
@@ -918,7 +930,7 @@ func verifyAuditRoleStorage(t *testing.T) {
 
 func verifyAuditJSONStorage(t *testing.T) {
 	t.Helper()
-	columns, err := model.LOG_DB.Migrator().ColumnTypes(&model.AuditLog{})
+	columns, err := model.AuditLogQuery().Migrator().ColumnTypes(&model.AuditLog{})
 	require.NoError(t, err)
 	var otherType string
 	for _, column := range columns {
@@ -1111,7 +1123,7 @@ func TestAuditDatabaseMatrix(t *testing.T) {
 					require.Len(t, byRef, 1, "audit rows of a scoped token are found by its token_ref")
 					_, err = model.DeleteUserAccessToken(1, scopedToken.Id)
 					require.NoError(t, err)
-					require.NoError(t, model.LOG_DB.Where("token_ref = ?", scopedToken.TokenHash).Delete(&model.AuditLog{}).Error)
+					require.NoError(t, model.AuditLogQuery().Where("token_ref = ?", scopedToken.TokenHash).Delete(&model.AuditLog{}).Error)
 					for _, timestamp := range []int64{101, 102, 103} {
 						model.RecordAuditLog(nil, model.AuditLog{ActorRole: common.RoleAdminUser, UserId: 1, Username: "owner", CreatedAt: timestamp, Category: model.AuditCategoryAccessToken, TokenRef: model.AccessTokenFingerprint("matrix-token"), Ip: "192.0.2.1", Success: timestamp != 102})
 					}

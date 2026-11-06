@@ -1,6 +1,8 @@
 package model
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strconv"
 	"testing"
@@ -60,7 +62,7 @@ func TestUserUpdateDoesNotOverwriteConcurrentAccountingOrTokenChanges(t *testing
 		AffQuota:        800,
 		AffHistoryQuota: 1200,
 	}
-	user.SetAccessToken("old-token")
+	user.SetAccessToken(testAccessToken("old-token"))
 	require.NoError(t, DB.Create(&user).Error)
 
 	staleUser, err := GetUserById(user.Id, true)
@@ -73,7 +75,7 @@ func TestUserUpdateDoesNotOverwriteConcurrentAccountingOrTokenChanges(t *testing
 		"aff_count":     gorm.Expr("aff_count + ?", 1),
 		"aff_quota":     gorm.Expr("aff_quota - ?", 500),
 		"aff_history":   gorm.Expr("aff_history + ?", 500),
-		"access_token":  "rotated-token",
+		"access_token":  testAccessToken("rotated-token"),
 	}).Error)
 
 	staleUser.DisplayName = "after"
@@ -88,7 +90,7 @@ func TestUserUpdateDoesNotOverwriteConcurrentAccountingOrTokenChanges(t *testing
 	assert.Equal(t, 3, got.AffCount)
 	assert.Equal(t, 300, got.AffQuota)
 	assert.Equal(t, 1700, got.AffHistoryQuota)
-	assert.Equal(t, "rotated-token", got.GetAccessToken())
+	assert.Equal(t, testAccessToken("rotated-token"), got.GetAccessToken())
 }
 
 func TestUsageAccountingSupportsSignedDirectAndBatchDeltas(t *testing.T) {
@@ -161,7 +163,7 @@ func TestRevokeUserAccessTokenOnlyClearsLegacyToken(t *testing.T) {
 		AffHistoryQuota:      1200,
 		AccessTokenCreatedAt: &createdAt,
 	}
-	user.SetAccessToken("legacy-token")
+	user.SetAccessToken(testAccessToken("legacy-token"))
 	require.NoError(t, DB.Create(&user).Error)
 
 	require.NoError(t, DB.Model(&User{}).Where("id = ?", user.Id).Updates(map[string]any{
@@ -172,7 +174,7 @@ func TestRevokeUserAccessTokenOnlyClearsLegacyToken(t *testing.T) {
 
 	tokenRef, err := RevokeUserAccessToken(user.Id)
 	require.NoError(t, err)
-	assert.Equal(t, AccessTokenFingerprint("legacy-token"), tokenRef)
+	assert.Equal(t, AccessTokenFingerprint(testAccessToken("legacy-token")), tokenRef)
 
 	var got User
 	require.NoError(t, DB.First(&got, user.Id).Error)
@@ -193,7 +195,7 @@ func TestRevokeUserAccessTokenRejectsSoftDeletedUser(t *testing.T) {
 		Password: "password",
 		Status:   common.UserStatusEnabled,
 	}
-	user.SetAccessToken("old-token")
+	user.SetAccessToken(testAccessToken("old-token"))
 	require.NoError(t, DB.Create(&user).Error)
 	require.NoError(t, DB.Delete(&user).Error)
 
@@ -202,7 +204,7 @@ func TestRevokeUserAccessTokenRejectsSoftDeletedUser(t *testing.T) {
 
 	var got User
 	require.NoError(t, DB.Unscoped().First(&got, user.Id).Error)
-	assert.Equal(t, "old-token", got.GetAccessToken())
+	assert.Equal(t, testAccessToken("old-token"), got.GetAccessToken())
 }
 
 func TestUpdateUserSettingOnlyUpdatesSetting(t *testing.T) {
@@ -622,4 +624,11 @@ func TestValidateAuthSessionWithTxChecksAccessTokenIdentity(t *testing.T) {
 			assert.ErrorIs(t, plainErr, ErrUserSessionInactive)
 		})
 	}
+}
+
+// testAccessToken returns a 32-character legacy access token derived from
+// label. users.access_token is char(32), and PostgreSQL pads shorter values.
+func testAccessToken(label string) string {
+	sum := sha256.Sum256([]byte(label))
+	return hex.EncodeToString(sum[:])[:32]
 }

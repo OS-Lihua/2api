@@ -275,7 +275,7 @@ func TestAdminUserProofIsBoundToTargetAndActionAndConsumedOnce(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, common.UserStatusDisabled, stored.Status)
 	var audit model.AuditLog
-	require.NoError(t, model.LOG_DB.Where("action = ?", "user.manage").Last(&audit).Error)
+	require.NoError(t, model.AuditLogQuery().Where("action = ?", "user.manage").Last(&audit).Error)
 	require.NotNil(t, audit.Other.Op)
 	verificationMethod, err := common.Marshal(audit.Other.Op.Params["verification_method"])
 	require.NoError(t, err)
@@ -315,7 +315,7 @@ func TestAdminUserBindingProofDistinguishesBuiltInAndCustomBindings(t *testing.T
 	require.NoError(t, err)
 	assert.Empty(t, bindings)
 	var audit model.AuditLog
-	require.NoError(t, model.LOG_DB.Where("action = ?", "user.binding_clear").Last(&audit).Error)
+	require.NoError(t, model.AuditLogQuery().Where("action = ?", "user.binding_clear").Last(&audit).Error)
 	require.NotNil(t, audit.Other.Op)
 	providerID, err := common.Marshal(audit.Other.Op.Params["provider_id"])
 	require.NoError(t, err)
@@ -368,7 +368,7 @@ func TestAdminUserVerificationPolicy(t *testing.T) {
 		_, err := model.GetUserById(target.Id, true)
 		assert.Error(t, err)
 		var audit model.AuditLog
-		require.NoError(t, model.LOG_DB.Where("action = ?", "user.delete").Last(&audit).Error)
+		require.NoError(t, model.AuditLogQuery().Where("action = ?", "user.delete").Last(&audit).Error)
 		assert.Equal(t, "access_token", audit.AuthMethod)
 		auditJSON, err := common.Marshal(audit)
 		require.NoError(t, err)

@@ -238,7 +238,7 @@ func TestDeleteChannelBatchReportsAndAuditsActualDeletedCount(t *testing.T) {
 	assert.Equal(t, int64(1), response.Data)
 
 	var auditLog model.AuditLog
-	require.NoError(t, db.Order("id desc").First(&auditLog).Error)
+	require.NoError(t, model.AuditLogQuery().First(&auditLog).Error)
 	var auditData struct {
 		Operation struct {
 			Params map[string]any `json:"params"`

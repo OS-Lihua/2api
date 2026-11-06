@@ -3,14 +3,11 @@ package model
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/glebarez/sqlite"
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -86,22 +83,11 @@ func TestSubscriptionGroupTransitionsPreserveAuthVersionAndSessions(t *testing.T
 }
 
 func TestSubscriptionGroupCacheRefreshFailureDoesNotChangeCommittedResult(t *testing.T) {
-	previousDB, previousLogDB := DB, LOG_DB
-	previousMainDatabaseType, previousLogDatabaseType := common.MainDatabaseType(), common.LogDatabaseType()
-	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
-	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
-	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
-	require.NoError(t, err)
-	DB, LOG_DB = db, db
+	db := UseTestDatabases(t)
 	require.NoError(t, db.AutoMigrate(&User{}, &SubscriptionPlan{}, &UserSubscription{}))
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(4)
-	t.Cleanup(func() {
-		DB, LOG_DB = previousDB, previousLogDB
-		common.SetDatabaseTypes(previousMainDatabaseType, previousLogDatabaseType)
-		_ = sqlDB.Close()
-	})
 
 	user := User{
 		Username:    "subscription-cache-failure",

@@ -13,10 +13,8 @@ import (
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/gin-gonic/gin"
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 )
 
 func setupTaskPluginBindChannelTest(t *testing.T) {
@@ -26,14 +24,11 @@ func setupTaskPluginBindChannelTest(t *testing.T) {
 	previousRedisEnabled := common.RedisEnabled
 	common.RedisEnabled = false
 	originalDB, originalLogDB := model.DB, model.LOG_DB
-	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
+	database := model.UseTestDatabases(t)
 	sqlDB, err := database.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.Log{}, &model.AuditLog{}, &model.User{}))
-	model.DB = database
-	model.LOG_DB = database
 	require.NoError(t, authz.Init(database))
 	t.Cleanup(func() {
 		common.IsMasterNode = wasMaster
@@ -159,7 +154,7 @@ export function parseTaskResult() { return {}; }
 	assert.Equal(t, "http://10.0.0.5:8000", *created.BaseURL, "the normalized plugin default is stored on the channel row")
 
 	var audits []model.AuditLog
-	require.NoError(t, model.LOG_DB.Where("action = ?", "channel.create").Find(&audits).Error)
+	require.NoError(t, model.AuditLogQuery().Where("action = ?", "channel.create").Find(&audits).Error)
 	encoded, err := common.Marshal(audits)
 	require.NoError(t, err)
 	assert.Contains(t, string(encoded), `"base_url_source":"plugin_default"`)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -16,32 +17,25 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/testdb"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
-	"github.com/glebarez/sqlite"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 )
 
 func TestMain(m *testing.M) {
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	if err != nil {
-		panic("failed to open test db: " + err.Error())
-	}
+	scope := &testdb.MainScope{}
+	db := model.UseTestDatabases(scope)
 	sqlDB, err := db.DB()
 	if err != nil {
 		panic("failed to get sql.DB: " + err.Error())
 	}
 	sqlDB.SetMaxOpenConns(1)
 
-	model.DB = db
-	model.LOG_DB = db
-
-	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
 	common.RedisEnabled = false
 	common.BatchUpdateEnabled = false
 	common.LogConsumeEnabled = true
@@ -64,7 +58,9 @@ func TestMain(m *testing.M) {
 		panic("failed to migrate: " + err.Error())
 	}
 
-	os.Exit(m.Run())
+	code := m.Run()
+	scope.Close()
+	os.Exit(code)
 }
 
 // ---------------------------------------------------------------------------
@@ -77,7 +73,7 @@ func truncate(t *testing.T) {
 		model.DB.Exec("DELETE FROM tasks")
 		model.DB.Exec("DELETE FROM users")
 		model.DB.Exec("DELETE FROM tokens")
-		model.DB.Exec("DELETE FROM logs")
+		model.ClearTestLogTable("logs")
 		model.DB.Exec("DELETE FROM channels")
 		model.DB.Exec("DELETE FROM midjourneys")
 		model.DB.Exec("DELETE FROM top_ups")
@@ -735,17 +731,7 @@ func TestSettleMidjourneyTaskBillingFundingFailureClearsMarkers(t *testing.T) {
 	require.True(t, prepared)
 	require.NoError(t, task.Insert())
 
-	require.NoError(t, model.DB.Exec(`
-		CREATE TRIGGER fail_midjourney_user_update
-		BEFORE UPDATE ON users
-		WHEN OLD.id = 52
-		BEGIN
-			SELECT RAISE(ABORT, 'forced user quota failure');
-		END;
-	`).Error)
-	t.Cleanup(func() {
-		model.DB.Exec("DROP TRIGGER IF EXISTS fail_midjourney_user_update")
-	})
+	failRowUpdates(t, "users", 52, "forced user quota failure")
 
 	billed, err := SettleMidjourneyTaskBilling(relayInfo, task, prepared)
 
@@ -789,17 +775,7 @@ func TestSettleMidjourneyTaskBillingTokenFailureKeepsFundingRefundable(t *testin
 	require.True(t, prepared)
 	require.NoError(t, task.Insert())
 
-	require.NoError(t, model.DB.Exec(`
-		CREATE TRIGGER fail_midjourney_token_update
-		BEFORE UPDATE ON tokens
-		WHEN OLD.id = 53
-		BEGIN
-			SELECT RAISE(ABORT, 'forced token quota failure');
-		END;
-	`).Error)
-	t.Cleanup(func() {
-		model.DB.Exec("DROP TRIGGER IF EXISTS fail_midjourney_token_update")
-	})
+	failRowUpdates(t, "tokens", 53, "forced token quota failure")
 
 	billed, err := SettleMidjourneyTaskBilling(relayInfo, task, prepared)
 
@@ -1809,4 +1785,40 @@ func TestSettle_TokenRecalcFallsBackToCompletionTokens(t *testing.T) {
 			assert.Equal(t, testCase.wantQuota, task.Quota)
 		})
 	}
+}
+
+// failRowUpdates installs a database trigger that rejects every UPDATE of the
+// row with the given id, so a test can force a write failure regardless of
+// which SQL statement the code under test issues.
+func failRowUpdates(t *testing.T, table string, id int, message string) {
+	t.Helper()
+	name := fmt.Sprintf("fail_%s_%d_update", table, id)
+	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
+		require.NoError(t, model.DB.Exec(fmt.Sprintf(`
+			CREATE FUNCTION %[1]s() RETURNS trigger AS $body$
+			BEGIN
+				IF OLD.id = %[2]d THEN
+					RAISE EXCEPTION '%[3]s';
+				END IF;
+				RETURN NEW;
+			END
+			$body$ LANGUAGE plpgsql`, name, id, message)).Error)
+		require.NoError(t, model.DB.Exec(fmt.Sprintf(
+			`CREATE TRIGGER %[1]s BEFORE UPDATE ON %[2]s FOR EACH ROW EXECUTE FUNCTION %[1]s()`, name, table)).Error)
+		t.Cleanup(func() {
+			model.DB.Exec(fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, name, table))
+			model.DB.Exec(fmt.Sprintf(`DROP FUNCTION IF EXISTS %s()`, name))
+		})
+		return
+	}
+	require.NoError(t, model.DB.Exec(fmt.Sprintf(`
+		CREATE TRIGGER %[1]s
+		BEFORE UPDATE ON %[2]s
+		WHEN OLD.id = %[3]d
+		BEGIN
+			SELECT RAISE(ABORT, '%[4]s');
+		END;`, name, table, id, message)).Error)
+	t.Cleanup(func() {
+		model.DB.Exec(fmt.Sprintf("DROP TRIGGER IF EXISTS %s", name))
+	})
 }

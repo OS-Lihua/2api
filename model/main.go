@@ -40,6 +40,18 @@ func jsonScanBytes(value any) []byte {
 	}
 }
 
+// InitColumnNames recomputes the dialect-specific column names and boolean
+// literals after the database types change.
+func InitColumnNames() {
+	initCol()
+}
+
+// MigrateLogDB creates or updates the log tables on LOG_DB for the current log
+// database type.
+func MigrateLogDB() error {
+	return migrateLOGDB()
+}
+
 func initCol() {
 	// init common column names
 	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
@@ -138,7 +150,13 @@ func normalizeClickHouseDSN(dsn string) string {
 }
 
 func chooseDB(envName string, isLog bool) (*gorm.DB, common.DatabaseType, error) {
-	dsn := os.Getenv(envName)
+	return OpenDSN(envName, os.Getenv(envName), isLog)
+}
+
+// OpenDSN opens the database described by dsn with the same driver settings the
+// gateway uses at startup. envName only labels error messages. An empty dsn
+// selects the default SQLite file.
+func OpenDSN(envName string, dsn string, isLog bool) (*gorm.DB, common.DatabaseType, error) {
 	if dsn != "" {
 		if isClickHouseDSN(dsn) {
 			if !isLog {

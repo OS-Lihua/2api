@@ -341,7 +341,7 @@ func TestSecurityEnrollmentAccessTokenLifecycleConsumesProofs(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, response.Code, "there is nothing left to revoke")
 
 	var audits []model.AuditLog
-	require.NoError(t, model.LOG_DB.Order("id").Find(&audits).Error)
+	require.NoError(t, model.AuditLogQuery().Order("id").Find(&audits).Error)
 	actions := make([]string, 0, len(audits))
 	for _, audit := range audits {
 		actions = append(actions, audit.Action)
@@ -456,7 +456,7 @@ func TestSecurityEnrollmentAccessTokenStepUpDisablesTwoFA(t *testing.T) {
 	assert.Equal(t, http.StatusOK, accessTokenRequest(router, http.MethodGet, "/api/user/self", raw, "", "").Code)
 
 	var audits []model.AuditLog
-	require.NoError(t, model.LOG_DB.Where("action IN ?", []string{"user.security_verify", "user.2fa_disable_self"}).Order("id").Find(&audits).Error)
+	require.NoError(t, model.AuditLogQuery().Where("action IN ?", []string{"user.security_verify", "user.2fa_disable_self"}).Order("id").Find(&audits).Error)
 	require.Len(t, audits, 2)
 	encoded, err := common.Marshal(audits)
 	require.NoError(t, err)
@@ -1135,7 +1135,7 @@ func TestSecurityEnrollmentPasskeyProofProtectsChannelKeyRead(t *testing.T) {
 		})
 	}
 	var logs []model.AuditLog
-	require.NoError(t, model.LOG_DB.Where("action = ?", "channel.key_view").Find(&logs).Error)
+	require.NoError(t, model.AuditLogQuery().Where("action = ?", "channel.key_view").Find(&logs).Error)
 	require.Len(t, logs, 1)
 	encodedLogs, err := common.Marshal(logs)
 	require.NoError(t, err)
@@ -1240,7 +1240,7 @@ func TestSecurityEnrollmentTwoFAFlowAndSessionRotation(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, enabled.IsEnabled)
 	var logs []model.AuditLog
-	require.NoError(t, model.LOG_DB.Find(&logs).Error)
+	require.NoError(t, model.AuditLogQuery().Find(&logs).Error)
 	require.NotEmpty(t, logs)
 	encoded, err := common.Marshal(logs)
 	require.NoError(t, err)

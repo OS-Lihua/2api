@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -15,11 +14,8 @@ func useFrontendOptionMigrationDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	previousDB := DB
 	previousType := common.MainDatabaseType()
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
+	db := UseTestDatabases(t)
 	require.NoError(t, db.AutoMigrate(&Option{}))
-	DB = db
-	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
 	t.Cleanup(func() {
 		DB = previousDB
 		common.SetMainDatabaseType(previousType)
