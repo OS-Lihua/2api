@@ -110,10 +110,6 @@ func normalizeClickHouseDSN(dsn string) string {
 	return parsed.String()
 }
 
-func isPostgresDSN(dsn string) bool {
-	return strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://")
-}
-
 // OpenDSN opens the database described by dsn with the same driver settings the
 // gateway uses at startup. envName only labels error messages. The primary
 // database must be PostgreSQL; the log database may be PostgreSQL or
@@ -130,7 +126,7 @@ func OpenDSN(envName string, dsn string, isLog bool) (*gorm.DB, common.DatabaseT
 		db, err := gorm.Open(clickhouse.Open(normalizeClickHouseDSN(dsn)), newGormConfig())
 		return db, common.DatabaseTypeClickHouse, err
 	}
-	if !isPostgresDSN(dsn) {
+	if !strings.HasPrefix(dsn, "postgres://") && !strings.HasPrefix(dsn, "postgresql://") {
 		if isLog {
 			return nil, "", fmt.Errorf("%s must be a PostgreSQL (postgres://) or ClickHouse (clickhouse://) DSN; SQLite and MySQL are not supported", envName)
 		}
@@ -149,9 +145,6 @@ func OpenDSN(envName string, dsn string, isLog bool) (*gorm.DB, common.DatabaseT
 func InitDB() (err error) {
 	db, _, err := OpenDSN("SQL_DSN", os.Getenv("SQL_DSN"), false)
 	if err == nil {
-		if os.Getenv("LOG_SQL_DSN") == "" {
-			common.SetLogDatabaseType(common.DatabaseTypePostgreSQL)
-		}
 		if common.DebugEnabled {
 			db = db.Debug()
 		}
