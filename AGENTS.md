@@ -51,6 +51,19 @@ This is an AI API gateway/proxy built with Go. It aggregates 40+ upstream AI pro
 - A separate function is appropriate when it represents reusable behavior, a required interface/framework callback, an exported API, a test fixture, or complex business logic that deserves direct tests.
 - If a single-use helper is kept, its name must describe a durable domain concept rather than a mechanical step extracted only to shorten the caller.
 
+### Writing Style
+
+Applies to text an agent writes for people: chat replies, issue and PR bodies, ticket resolutions, code comments, log text, error messages, and UI copy.
+
+- Answer in the user's language. For Chinese, apply the same clarity rules without English vocabulary or word-count limits.
+- Lead with the result or main point. Use short sentences, familiar words, and active voice; one main idea per sentence.
+- Use one term for one concept throughout. Use the terms defined in `GLOSSARY.md`; do not switch to synonyms it lists under `_Avoid_`.
+- Remove filler and repetition. Explain a technical term only when the reader needs it.
+- Use numbered steps for procedures and bullets for parallel items.
+- Keep necessary context, constraints, uncertainty, and verification results; brevity never justifies dropping them.
+- Preserve exact code identifiers, commands, API names, and quoted text.
+- Give more detail when the user asks for it.
+
 ### Authentication Security (OWASP Mandatory)
 
 - Any implementation, modification, or review involving authentication-related flows MUST comply with the applicable requirements of the latest stable [OWASP Application Security Verification Standard (ASVS)](https://owasp.org/www-project-application-security-verification-standard/) and the relevant [OWASP Cheat Sheet Series](https://cheatsheetseries.owasp.org/). This applies to both backend and frontend changes, including registration, login/logout, password changes and recovery, email verification, MFA, WebAuthn/Passkeys, OAuth/OIDC, account linking/unlinking, sessions, JWTs, API credentials, and re-authentication for sensitive actions.

@@ -14,3 +14,17 @@ Rules:
 - After reading, follow every rule in `AGENTS.md` for the rest of the work.
 - If the task touches `web/`, also Read `web/AGENTS.md` before editing frontend files.
 - If the task touches billing as defined under **Billing rules (mandatory read gate)** in `AGENTS.md`, also Read `.agents/rules/billing.md` in full before planning or editing. Tasks outside that definition may skip it.
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked in GitHub Issues on the fork `OS-Lihua/2api` (not upstream). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five-role vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: root `GLOSSARY.md` + `docs/adr/`. See `docs/agents/domain.md`.
