@@ -6,6 +6,15 @@ Mandatory conventions for quota, pricing, pre-consume, settlement, refund, and u
 
 **Built-in model pricing:** New built-in model prices MUST be defined as self-contained billing expressions in `setting/billing_setting/builtin_billing.go`, using real USD per million tokens. Do not add new built-in prices to the legacy model/completion/cache ratio tables. Preserve explicit administrator pricing overrides. Existing legacy prices are migrated only when explicitly requested. Verify published prices and cover applicable context-length thresholds and cache categories.
 
+**Fixed-point money:** Amounts that carry a currency (wallet balances, ledger entries, sale and purchase prices, attempt costs, exchange-rate conversions) MUST use `pkg/money`. It replaces `common/quota_math.go` for these amounts; `common/quota_math.go` stays only for the legacy `int` quota paths until they are removed, and new code MUST NOT convert between the two.
+
+- A stored amount is `money.Amount`: `int64` in 10⁻⁹ units of the currency plus an ISO 4217 code. Embed it with `gorm:"embedded;embeddedPrefix:<name>_"` to get a `bigint` and a `char(3)` column. Do not store amounts as `float`, `numeric`, or `int` quota.
+- Calculate with `money.Value` (exact decimal): `Add`, `Sub`, `MulQuantity`, `MulUnitPrice`, and `Convert` with a `money.Rate`. Do not route amounts through `float64`, and do not build `money.Amount` from `decimal.IntPart()` or a bare cast.
+- Do not round during calculation. Round only when writing: `Value.Receivable` rounds a user charge up to 10⁻⁹; `Value.Cost` writes a purchase cost unrounded and returns `money.ErrInexact` when digits remain below 10⁻⁹.
+- Every operation returns `money.ErrOverflow` outside the `int64` range of 10⁻⁹ units and `money.ErrCurrencyMismatch` for different currencies. Reject the operation on these errors; never clamp, saturate, or truncate. Converting to another currency requires an explicit `money.Rate`.
+- On PostgreSQL, `SUM` of an amount column returns `numeric`; scan it into `decimal.Decimal` and sum one currency at a time.
+- The safety invariants below still apply: bound every billing multiplier before it reaches a calculation, and never let arithmetic or input produce a credit.
+
 **Billing safety invariants:** Quota/billing code MUST never produce a negative charge (a credit) from arithmetic overflow or unvalidated input. Apply defense in depth:
 
 - Every user-controlled quantity that becomes a billing multiplier (image `n`, video `seconds`/`duration`, resolution/quality ratios, batch counts) MUST be bounded before it reaches quota calculation. Reject out-of-range values at request validation with a 400. Existing bounds: `dto.MaxImageN` for image generation count, `relaycommon.MaxTaskDurationSeconds` for task video duration, `maxTokensLimit` (`relay/helper/valid_request.go`) for `max_tokens`-family fields on every relay format (OpenAI, Claude, Gemini, Responses). Reuse these constants instead of introducing new ad hoc limits for the same concepts. When adding a new relay format or request DTO, bound its max-tokens and count fields in its validator from day one.
