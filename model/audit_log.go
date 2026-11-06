@@ -136,7 +136,9 @@ func RecordAuditLog(c *gin.Context, entry AuditLog) {
 	}
 }
 
-func GetAuditLogs(filter AuditLogFilter, start, limit, viewerRole int) ([]*AuditLog, int64, error) {
+// AuditLogQuery returns a query on the audit log table that can decode
+// AuditOther on every supported log database.
+func AuditLogQuery() *gorm.DB {
 	query := LOG_DB.Model(&AuditLog{})
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		// Decode native JSON through database/sql as text for AuditOther.Scan.
@@ -146,6 +148,11 @@ func GetAuditLogs(filter AuditLogFilter, start, limit, viewerRole int) ([]*Audit
 			"output_format_json_quote_64bit_integers":   0,
 		})))
 	}
+	return query
+}
+
+func GetAuditLogs(filter AuditLogFilter, start, limit, viewerRole int) ([]*AuditLog, int64, error) {
+	query := AuditLogQuery()
 	if viewerRole < common.RoleRootUser {
 		query = query.Where("actor_role IN ?", []int{common.RoleCommonUser, common.RoleAdminUser})
 	}

@@ -23,10 +23,8 @@ import (
 	"github.com/QuantumNous/new-api/plugins"
 	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 )
 
 func TestPluginDispatcherMissFallsThroughWithoutLeakingInnerResponse(t *testing.T) {
@@ -867,10 +865,8 @@ func TestProductionPluginRoutePipelineRequiresTokenAuth(t *testing.T) {
 
 func TestProductionPluginNativeQueryTraversesInnerRouter(t *testing.T) {
 	previousDB := model.DB
-	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
+	database := model.UseTestDatabases(t)
 	require.NoError(t, database.AutoMigrate(&model.Task{}))
-	model.DB = database
 	t.Cleanup(func() { model.DB = previousDB })
 	require.NoError(t, database.Create(&model.Task{
 		TaskID:    "task_native_router",

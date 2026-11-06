@@ -23,8 +23,9 @@ func TestLockForUpdateEmitsRowLock(t *testing.T) {
 		return lockForUpdate(dummyDB).Where("id = ?", 1).Find(&rows).Statement.SQL.String()
 	}
 
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
 	t.Cleanup(func() {
-		common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+		common.SetDatabaseTypes(previousMain, previousLog)
 	})
 
 	common.SetDatabaseTypes(common.DatabaseTypeMySQL, common.DatabaseTypeSQLite)

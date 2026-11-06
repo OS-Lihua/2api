@@ -301,7 +301,7 @@ func TestManageUserQuotaRecordsTopupAndAudit(t *testing.T) {
 			assert.Zero(t, total)
 			assert.Empty(t, logs)
 			var audits []model.AuditLog
-			require.NoError(t, model.LOG_DB.Find(&audits).Error)
+			require.NoError(t, model.AuditLogQuery().Find(&audits).Error)
 			require.Len(t, audits, 1)
 			assert.Equal(t, 9999, audits[0].UserId)
 			assert.Equal(t, "root-operator", audits[0].Username)
@@ -346,11 +346,11 @@ func TestManageUserQuotaFailuresDoNotRecordTopup(t *testing.T) {
 			assert.Equal(t, 1000, user.Quota)
 			var logCount, auditCount int64
 			require.NoError(t, model.LOG_DB.Model(&model.Log{}).Count(&logCount).Error)
-			require.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).Count(&auditCount).Error)
+			require.NoError(t, model.AuditLogQuery().Count(&auditCount).Error)
 			assert.Zero(t, logCount)
 			assert.EqualValues(t, 1, auditCount)
 			var audit model.AuditLog
-			require.NoError(t, model.LOG_DB.First(&audit).Error)
+			require.NoError(t, model.AuditLogQuery().First(&audit).Error)
 			assert.False(t, audit.Success)
 			params, err := common.Marshal(audit.Other.Op.Params)
 			require.NoError(t, err)
@@ -386,7 +386,7 @@ func TestManageUserQuotaLogFailureKeepsSuccessfulAdjustment(t *testing.T) {
 			assert.Equal(t, 1500, user.Quota)
 			var logCount, auditCount int64
 			require.NoError(t, model.LOG_DB.Model(&model.Log{}).Count(&logCount).Error)
-			require.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).Count(&auditCount).Error)
+			require.NoError(t, model.AuditLogQuery().Count(&auditCount).Error)
 			if failedTable == "logs" {
 				assert.Zero(t, logCount)
 				assert.EqualValues(t, 1, auditCount)
@@ -449,7 +449,7 @@ func TestManageUserQuotaTargetsAndWalletBounds(t *testing.T) {
 			require.NoError(t, db.Unscoped().First(&user, user.Id).Error)
 			assert.Equal(t, tc.before, user.Quota)
 			var audits []model.AuditLog
-			require.NoError(t, model.LOG_DB.Find(&audits).Error)
+			require.NoError(t, model.AuditLogQuery().Find(&audits).Error)
 			require.Len(t, audits, 1)
 			assert.False(t, audits[0].Success)
 			params, err := common.Marshal(audits[0].Other.Op.Params)
@@ -492,7 +492,7 @@ func TestManageUserQuotaMiddlewareKeepsOneOperationPerRequest(t *testing.T) {
 		requestID := recorder.Header().Get(common.RequestIdKey)
 		require.NotEmpty(t, requestID)
 		var audits []model.AuditLog
-		require.NoError(t, model.LOG_DB.Where("request_id = ?", requestID).Find(&audits).Error)
+		require.NoError(t, model.AuditLogQuery().Where("request_id = ?", requestID).Find(&audits).Error)
 		require.Len(t, audits, 2, "one operation audit and one PAT request audit")
 		for _, audit := range audits {
 			assert.Equal(t, tc.success, audit.Success)

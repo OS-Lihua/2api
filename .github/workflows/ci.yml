@@ -15,12 +15,58 @@ concurrency:
 # queued runs start, and a base branch can advance after the merge event.
 jobs:
   backend:
-    name: Backend vet, build, and test
+    name: Backend test (${{ matrix.name }})
     if: github.event.action != 'closed' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # PostgreSQL 14 is the minimum supported version.
+          - name: postgres-14
+            postgres: '14-alpine'
+            clickhouse_log: false
+            checks: false
+          - name: postgres-18
+            postgres: '18-alpine'
+            clickhouse_log: false
+            checks: true
+          # Same primary database, with the log database on ClickHouse.
+          - name: postgres-18-clickhouse-log
+            postgres: '18-alpine'
+            clickhouse_log: true
+            checks: false
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.8-alpine
+        env:
+          CLICKHOUSE_PASSWORD: test
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: '1'
+        ports:
+          - 9000:9000
+          - 8123:8123
+        options: >-
+          --health-cmd "wget -qO- http://127.0.0.1:8123/ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
     env:
       GOWORK: 'off'
+      # Tests reject non-loopback database hosts, so use 127.0.0.1, not localhost.
+      TEST_POSTGRES_DSN: postgres://postgres:test@127.0.0.1:5432/postgres?sslmode=disable
+      TEST_CLICKHOUSE_LOG_DSN: ${{ matrix.clickhouse_log && 'clickhouse://default:test@127.0.0.1:9000/default' || '' }}
 
     steps:
       - name: Checkout
@@ -44,24 +90,30 @@ jobs:
           touch web/dist/index.html
 
       - name: Vet root module
+        if: matrix.checks
         run: go vet ./...
 
       - name: Vet relaykit independently
+        if: matrix.checks
         working-directory: relaykit
         run: go vet ./...
 
       - name: Vet tokenkit independently
+        if: matrix.checks
         working-directory: tokenkit
         run: go vet ./...
 
       - name: Build root module
+        if: matrix.checks
         run: go build ./...
 
       - name: Build relaykit independently
+        if: matrix.checks
         working-directory: relaykit
         run: go build ./...
 
       - name: Build tokenkit independently
+        if: matrix.checks
         working-directory: tokenkit
         run: go build ./...
 

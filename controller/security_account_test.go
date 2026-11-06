@@ -80,7 +80,7 @@ func TestSecurityAccountDeletionRequiresScopedProof(t *testing.T) {
 			_, _, err = service.ValidateLoginSession(originalIdentity)
 			assert.NoError(t, err)
 			var audit model.AuditLog
-			require.NoError(t, model.LOG_DB.Where("action = ?", "user.account_delete").Last(&audit).Error)
+			require.NoError(t, model.AuditLogQuery().Where("action = ?", "user.account_delete").Last(&audit).Error)
 			assert.False(t, audit.Success)
 			auditJSON, err := common.Marshal(audit)
 			require.NoError(t, err)
@@ -159,7 +159,7 @@ func TestSecurityAccountDeletionAcceptsEitherFactorAndRevokesSessions(t *testing
 			require.NoError(t, err)
 			assert.Nil(t, tokenUser)
 			var audit model.AuditLog
-			require.NoError(t, model.LOG_DB.Where("action = ?", "user.account_delete").Last(&audit).Error)
+			require.NoError(t, model.AuditLogQuery().Where("action = ?", "user.account_delete").Last(&audit).Error)
 			assert.True(t, audit.Success)
 		})
 	}
@@ -638,7 +638,7 @@ func TestSecurityAccountEmailConfirmationAndAudit(t *testing.T) {
 			legacy := securityEnrollmentRequest("POST", "/api/oauth/email/bind", `{"email":"other@example.com","code":"123456"}`, "", identity, EmailBind)
 			assert.Contains(t, legacy.Body.String(), `"success":false`)
 			var audits []model.AuditLog
-			require.NoError(t, model.LOG_DB.Find(&audits).Error)
+			require.NoError(t, model.AuditLogQuery().Find(&audits).Error)
 			require.NotEmpty(t, audits)
 			assert.False(t, audits[len(audits)-1].Success, "a rejected legacy request must be recorded as failed")
 			encoded, err := common.Marshal(audits)

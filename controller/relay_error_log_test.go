@@ -13,10 +13,8 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 
 	"github.com/gin-gonic/gin"
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 )
 
 func TestProcessChannelErrorUsesSnapshotWithoutLeakingChannelMetadata(t *testing.T) {
@@ -27,15 +25,12 @@ func TestProcessChannelErrorUsesSnapshotWithoutLeakingChannelMetadata(t *testing
 	previousLogDatabaseType := common.LogDatabaseType()
 	previousErrorLogEnabled := constant.ErrorLogEnabled
 
-	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
+	database := model.UseTestDatabases(t)
 	sqlDB, err := database.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Log{}))
-	model.DB, model.LOG_DB = database, database
 	common.RedisEnabled = false
-	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
 	constant.ErrorLogEnabled = true
 	t.Cleanup(func() {
 		model.DB, model.LOG_DB = previousDB, previousLogDB
@@ -72,7 +67,7 @@ func TestProcessChannelErrorUsesSnapshotWithoutLeakingChannelMetadata(t *testing
 	processChannelError(ctx, channelSnapshot, apiErr, nil)
 
 	var stored model.Log
-	require.NoError(t, database.First(&stored).Error)
+	require.NoError(t, model.LOG_DB.First(&stored).Error)
 	assert.Equal(t, channelSnapshot.ChannelId, stored.ChannelId)
 	storedOther, err := common.StrToMap(stored.Other)
 	require.NoError(t, err)

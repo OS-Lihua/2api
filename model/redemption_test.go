@@ -107,7 +107,7 @@ func setupRedeemFixture(t *testing.T, quota int) (userId int, key string) {
 	t.Cleanup(func() {
 		require.NoError(t, DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Unscoped().Delete(&Redemption{}).Error)
 		DB.Exec("DELETE FROM users")
-		DB.Exec("DELETE FROM logs")
+		ClearTestLogTable("logs")
 	})
 
 	user := &User{Username: "redeem-user", Password: "password", Status: common.UserStatusEnabled, Quota: 0}

@@ -32,10 +32,8 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 )
 
 const mockPlugin = `
@@ -2850,8 +2848,7 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 	// The second decode matches its model as the first did: a channel alias
 	// or a case variant names the same task as the prepared name.
 	previousDB := model.DB
-	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
+	database := model.UseTestDatabases(t)
 	model.DB = database
 	t.Cleanup(func() {
 		model.DB = previousDB

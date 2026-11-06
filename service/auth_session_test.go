@@ -2,6 +2,8 @@ package service
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -12,7 +14,6 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
-	"github.com/glebarez/sqlite"
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,13 +28,11 @@ func setupAuthSessionTestDB(t *testing.T) *model.User {
 	previousIssuanceWindow := common.UserSessionIssuanceWindowSeconds
 	previousRevokedRetention := common.UserSessionRevokedRetentionDays
 	previousAlertThreshold := common.UserSessionHourlyAlertThreshold
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
+	db := model.UseTestDatabases(t)
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.AuthFlow{}, &model.UserAccessToken{}))
-	model.DB = db
 	common.RedisEnabled = false
 	common.UserSessionActiveLimit = common.DefaultUserSessionActiveLimit
 	common.UserSessionIssuanceLimit = common.DefaultUserSessionIssuanceLimit
@@ -268,11 +267,11 @@ func TestCleanupAuthArtifactsRemovesOnlyExpiredRecords(t *testing.T) {
 		CreatedAt: oldExpiry.Unix(), LastActiveAt: oldExpiry.Unix(), ExpiresAt: oldExpiry.Unix(),
 	}).Error)
 	require.NoError(t, model.DB.Create(&model.AuthFlow{
-		TokenHash: "expired-flow", Purpose: model.AuthFlowPurposeTwoFALogin,
+		TokenHash: testFlowTokenHash("expired-flow"), Purpose: model.AuthFlowPurposeTwoFALogin,
 		ExpiresAt: oldExpiry,
 	}).Error)
 	require.NoError(t, model.DB.Create(&model.AuthFlow{
-		TokenHash: "recent-flow", Purpose: model.AuthFlowPurposeTwoFALogin,
+		TokenHash: testFlowTokenHash("recent-flow"), Purpose: model.AuthFlowPurposeTwoFALogin,
 		ExpiresAt: now.Add(time.Minute),
 	}).Error)
 
@@ -294,7 +293,7 @@ func TestCleanupAuthArtifactsRemovesOnlyExpiredRecords(t *testing.T) {
 	var flows []model.AuthFlow
 	require.NoError(t, model.DB.Find(&flows).Error)
 	require.Len(t, flows, 1)
-	assert.Equal(t, "recent-flow", flows[0].TokenHash)
+	assert.Equal(t, testFlowTokenHash("recent-flow"), flows[0].TokenHash)
 	var kept []string
 	require.NoError(t, model.DB.Model(&model.UserAccessToken{}).Order("id").Pluck("token_hash", &kept).Error)
 	assert.Equal(t, []string{"within-retention", "never-expires"}, kept)
@@ -441,4 +440,11 @@ func TestUserAuthVersionInvalidatesExistingSession(t *testing.T) {
 	assert.ErrorIs(t, err, ErrLoginSessionRevoked)
 	_, err = CreateLoginSessionAtAuthVersion(user.Id, identity.UserAuthVersion, "2fa", "127.0.0.1", "test-agent")
 	assert.ErrorIs(t, err, ErrLoginSessionRevoked, "a pending 2FA flow must not survive an auth-version change")
+}
+
+// testFlowTokenHash returns a 64-character token hash derived from label.
+// auth_flows.token_hash is char(64), and PostgreSQL pads shorter values.
+func testFlowTokenHash(label string) string {
+	sum := sha256.Sum256([]byte(label))
+	return hex.EncodeToString(sum[:])
 }

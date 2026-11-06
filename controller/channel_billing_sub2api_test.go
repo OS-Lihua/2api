@@ -7,11 +7,8 @@ import (
 
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
 // setupSub2APIBalanceTest wires an in-memory SQLite DB into model.DB so
@@ -19,19 +16,8 @@ import (
 // controller tests.
 func setupSub2APIBalanceTest(t *testing.T) {
 	t.Helper()
-	originalDB := model.DB
-	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
-		Logger: logger.Discard,
-	})
-	require.NoError(t, err)
-	sqlDB, err := database.DB()
-	require.NoError(t, err)
-	sqlDB.SetMaxOpenConns(1)
+	database := model.UseTestDatabases(t)
 	require.NoError(t, database.AutoMigrate(&model.Channel{}))
-	model.DB = database
-	t.Cleanup(func() {
-		model.DB = originalDB
-	})
 }
 
 func newSub2APITestChannel(t *testing.T, serverURL string) *model.Channel {

@@ -3,7 +3,6 @@ package model
 import (
 	"testing"
 
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -12,12 +11,8 @@ import (
 
 func setupTaskPluginModelTest(t *testing.T) {
 	t.Helper()
-	originalDB := DB
-	t.Cleanup(func() { DB = originalDB })
-	var err error
-	DB, err = gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
-	require.NoError(t, DB.AutoMigrate(&TaskPlugin{}))
+	db := UseTestDatabases(t)
+	require.NoError(t, db.AutoMigrate(&TaskPlugin{}))
 }
 
 func TestTaskPluginVersionActivationAndSourceImmutability(t *testing.T) {

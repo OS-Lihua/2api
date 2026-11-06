@@ -10,25 +10,18 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/glebarez/sqlite"
+	"github.com/QuantumNous/new-api/pkg/testdb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 )
 
 func TestMain(m *testing.M) {
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	if err != nil {
-		panic("failed to open test db: " + err.Error())
-	}
-	DB = db
-	LOG_DB = db
+	scope := &testdb.MainScope{}
+	db := UseTestDatabases(scope)
 
-	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
 	common.RedisEnabled = false
 	common.BatchUpdateEnabled = false
 	common.LogConsumeEnabled = true
-	initCol()
 
 	sqlDB, err := db.DB()
 	if err != nil {
@@ -64,7 +57,9 @@ func TestMain(m *testing.M) {
 		panic("failed to migrate: " + err.Error())
 	}
 
-	os.Exit(m.Run())
+	code := m.Run()
+	scope.Close()
+	os.Exit(code)
 }
 
 func truncateTables(t *testing.T) {
@@ -81,7 +76,7 @@ func truncateTables(t *testing.T) {
 		DB.Exec("DELETE FROM user_access_tokens")
 		DB.Exec("DELETE FROM user_oauth_bindings")
 		DB.Exec("DELETE FROM users")
-		DB.Exec("DELETE FROM logs")
+		ClearTestLogTable("logs")
 		DB.Exec("DELETE FROM channels")
 		DB.Exec("DELETE FROM quota_data")
 		DB.Exec("DELETE FROM abilities")
