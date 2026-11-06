@@ -9,7 +9,6 @@ package clock
 import (
 	"sync"
 	"sync/atomic"
-	"testing"
 	"time"
 )
 
@@ -51,9 +50,16 @@ func (f *Fake) Set(t time.Time) {
 	f.now = t
 }
 
+// TB is the part of testing.TB that UseFake needs. It keeps the testing
+// package out of production binaries that import clock.
+type TB interface {
+	Helper()
+	Cleanup(func())
+}
+
 // UseFake makes Now return a fake clock that starts at start, and restores
 // system time when the test ends.
-func UseFake(tb testing.TB, start time.Time) *Fake {
+func UseFake(tb TB, start time.Time) *Fake {
 	tb.Helper()
 	fake := &Fake{now: start}
 	previous := fakeClock.Swap(fake)
