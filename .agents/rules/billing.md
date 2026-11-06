@@ -10,7 +10,7 @@ Mandatory conventions for quota, pricing, pre-consume, settlement, refund, and u
 
 - A stored amount is `money.Amount`: `int64` in 10⁻⁹ units of the currency plus an ISO 4217 code. Embed it with `gorm:"embedded;embeddedPrefix:<name>_"` to get a `bigint` and a `char(3)` column. Do not store amounts as `float`, `numeric`, or `int` quota.
 - Calculate with `money.Value` (exact decimal): `Add`, `Sub`, `MulQuantity`, `MulUnitPrice`, and `Convert` with a `money.Rate`. Do not route amounts through `float64`, and do not build `money.Amount` from `decimal.IntPart()` or a bare cast.
-- Do not round during calculation. Round only when writing: `Value.Receivable` rounds a user charge up to 10⁻⁹; `Value.Cost` writes a purchase cost unrounded and returns `money.ErrInexact` when digits remain below 10⁻⁹.
+- Do not round during calculation. Round only when writing: `Value.Receivable` rounds a user charge up to 10⁻⁹; `Value.Cost` rounds a purchase cost to the nearest 10⁻⁹, halves away from zero, so costs reconcile with provider invoices without drifting in one direction.
 - Every operation returns `money.ErrOverflow` outside the `int64` range of 10⁻⁹ units and `money.ErrCurrencyMismatch` for different currencies. Reject the operation on these errors; never clamp, saturate, or truncate. Converting to another currency requires an explicit `money.Rate`.
 - On PostgreSQL, `SUM` of an amount column returns `numeric`; scan it into `decimal.Decimal` and sum one currency at a time.
 - The safety invariants below still apply: bound every billing multiplier before it reaches a calculation, and never let arithmetic or input produce a credit.

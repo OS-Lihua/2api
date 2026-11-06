@@ -24,7 +24,6 @@ var (
 	ErrInvalidCurrency  = errors.New("money: invalid ISO 4217 currency code")
 	ErrCurrencyMismatch = errors.New("money: currency mismatch")
 	ErrOverflow         = errors.New("money: amount outside the int64 range of 10^-9 units")
-	ErrInexact          = errors.New("money: amount has digits below 10^-9")
 	ErrInvalidRate      = errors.New("money: invalid exchange rate")
 )
 
@@ -198,14 +197,11 @@ func (v Value) Receivable() (Amount, error) {
 	return amountFromNanos(v.amount.Shift(Scale).Ceil(), v)
 }
 
-// Cost writes a purchase cost without rounding. A value with digits below
-// 10^-9 is rejected with ErrInexact.
+// Cost writes a purchase cost rounded to the nearest 10^-9, with halves
+// rounded away from zero. Costs are reconciled against provider invoices, so
+// the rounding must not drift in one direction across many entries.
 func (v Value) Cost() (Amount, error) {
-	nanos := v.amount.Shift(Scale)
-	if !nanos.IsInteger() {
-		return Amount{}, fmt.Errorf("%w: %s", ErrInexact, v.String())
-	}
-	return amountFromNanos(nanos, v)
+	return amountFromNanos(v.amount.Shift(Scale).Round(0), v)
 }
 
 func amountFromNanos(nanos decimal.Decimal, v Value) (Amount, error) {

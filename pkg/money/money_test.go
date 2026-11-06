@@ -198,16 +198,17 @@ func TestValueWrite(t *testing.T) {
 		value          string
 		wantReceivable int64
 		wantCost       int64
-		costErr        error
 	}{
 		{name: "exact", value: "1.5", wantReceivable: 1_500_000_000, wantCost: 1_500_000_000},
 		{name: "zero", value: "0", wantReceivable: 0, wantCost: 0},
-		{name: "positive fraction rounds up", value: "0.0000002625", wantReceivable: 263, costErr: money.ErrInexact},
-		{name: "smallest positive fraction rounds up", value: "0.0000000000001", wantReceivable: 1, costErr: money.ErrInexact},
-		{name: "negative fraction rounds toward positive", value: "-0.0000002625", wantReceivable: -262, costErr: money.ErrInexact},
+		// 7 tokens at $0.0375 per 1M tokens.
+		{name: "half fraction", value: "0.0000002625", wantReceivable: 263, wantCost: 263},
+		{name: "fraction below half", value: "0.0000000024", wantReceivable: 3, wantCost: 2},
+		{name: "smallest positive fraction", value: "0.0000000000001", wantReceivable: 1, wantCost: 0},
+		{name: "negative half fraction", value: "-0.0000002625", wantReceivable: -262, wantCost: -263},
 		{name: "maximum", value: maxUnits, wantReceivable: math.MaxInt64, wantCost: math.MaxInt64},
 		{name: "minimum", value: "-9223372036.854775808", wantReceivable: math.MinInt64, wantCost: math.MinInt64},
-		{name: "fraction below the maximum rounds up to it", value: "9223372036.8547758061", wantReceivable: math.MaxInt64, costErr: money.ErrInexact},
+		{name: "fraction below the maximum", value: "9223372036.8547758061", wantReceivable: math.MaxInt64, wantCost: math.MaxInt64 - 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -218,12 +219,8 @@ func TestValueWrite(t *testing.T) {
 			assert.Equal(t, money.Amount{Nanos: tt.wantReceivable, Currency: "USD"}, receivable)
 
 			cost, err := v.Cost()
-			if tt.costErr != nil {
-				require.ErrorIs(t, err, tt.costErr)
-			} else {
-				require.NoError(t, err)
-				assert.Equal(t, money.Amount{Nanos: tt.wantCost, Currency: "USD"}, cost)
-			}
+			require.NoError(t, err)
+			assert.Equal(t, money.Amount{Nanos: tt.wantCost, Currency: "USD"}, cost)
 		})
 	}
 }
