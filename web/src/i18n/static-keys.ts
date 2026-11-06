@@ -354,8 +354,6 @@ export const STATIC_I18N_KEYS = [
   'Confirm settings and finish setup',
 
   // Setup wizard — database step
-  'SQLite stores all data in a single file. Make sure that file is persisted when running in containers.',
-  'MySQL is a production-ready relational database. Keep your credentials secure.',
   'PostgreSQL offers advanced reliability and data integrity for production workloads.',
   'Custom database driver detected.',
   'The setup wizard will use this database during initialization.',

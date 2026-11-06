@@ -1,9 +1,9 @@
 # Third-Party Licenses
 
 This file summarizes direct third-party dependencies used by distributed builds of this project.
-It is an engineering compliance artifact and should be kept with Docker images, standalone binaries, frontend bundles, and Electron installers.
+It is an engineering compliance artifact and should be kept with Docker images, standalone binaries, and frontend bundles.
 
-Scope: direct dependencies from `go.mod` (including the in-repo `relaykit` and `tokenkit` modules), `web/package.json`, and `electron/package.json`.
+Scope: direct dependencies from `go.mod` (including the in-repo `relaykit` and `tokenkit` modules) and `web/package.json`.
 Transitive dependencies should be audited before a final external release.
 
 ## Dependency Inventory
@@ -33,13 +33,10 @@ Transitive dependencies should be audited before a final external release.
 | backend  | production  | Go        | `github.com/gin-contrib/gzip`                           | `v0.0.6`                             | MIT                     |
 | backend  | production  | Go        | `github.com/gin-contrib/static`                         | `v0.0.1`                             | MIT                     |
 | backend  | production  | Go        | `github.com/gin-gonic/gin`                              | `v1.9.1`                             | MIT                     |
-| backend  | production  | Go        | `github.com/glebarez/go-sqlite`                         | `v1.21.2`                            | BSD-3-Clause            |
-| backend  | production  | Go        | `github.com/glebarez/sqlite`                            | `v1.11.0`                            | MIT                     |
 | backend  | production  | Go        | `github.com/go-audio/aiff`                              | `v1.1.0`                             | Apache-2.0              |
 | backend  | production  | Go        | `github.com/go-audio/wav`                               | `v1.1.0`                             | Apache-2.0              |
 | backend  | production  | Go        | `github.com/go-playground/validator/v10`                | `v10.20.0`                           | MIT                     |
 | backend  | production  | Go        | `github.com/go-redis/redis/v8`                          | `v8.11.5`                            | BSD-2-Clause            |
-| backend  | production  | Go        | `github.com/go-sql-driver/mysql`                        | `v1.7.0`                             | MPL-2.0                 |
 | backend  | production  | Go        | `github.com/go-webauthn/webauthn`                       | `v0.14.0`                            | BSD-3-Clause            |
 | backend  | production  | Go        | `github.com/golang-jwt/jwt/v5`                          | `v5.3.0`                             | MIT                     |
 | backend  | production  | Go        | `github.com/google/uuid`                                | `v1.6.0`                             | BSD-3-Clause            |
@@ -79,7 +76,6 @@ Transitive dependencies should be audited before a final external release.
 | backend  | production  | Go        | `golang.org/x/text`                                     | `v0.37.0`                            | BSD-3-Clause            |
 | backend  | production  | Go        | `gopkg.in/yaml.v3`                                      | `v3.0.1`                             | Apache-2.0 OR MIT       |
 | backend  | production  | Go        | `gorm.io/driver/clickhouse`                             | `v0.6.0`                             | MIT                     |
-| backend  | production  | Go        | `gorm.io/driver/mysql`                                  | `v1.5.7`                             | MIT                     |
 | backend  | production  | Go        | `gorm.io/driver/postgres`                               | `v1.5.9`                             | MIT                     |
 | backend  | production  | Go        | `gorm.io/gorm`                                          | `v1.25.12`                           | MIT                     |
 | web      | production  | npm       | `@base-ui/react`                                        | `1.6.0`                              | MIT                     |
@@ -164,9 +160,6 @@ Transitive dependencies should be audited before a final external release.
 | web      | development | npm       | `oxlint`                                                | `1.74.0`                             | MIT                     |
 | web      | development | npm       | `shadcn`                                                | `4.13.1`                             | MIT                     |
 | web      | development | npm       | `vitest`                                                | `4.1.10`                             | MIT                     |
-| electron | development | npm       | `cross-env`                                             | `7.0.3`                              | MIT                     |
-| electron | development | npm       | `electron`                                              | `41.10.6`                            | MIT                     |
-| electron | development | npm       | `electron-builder`                                      | `26.15.3`                            | MIT                     |
 
 ## License Texts
 
@@ -319,13 +312,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
-### MPL-2.0
-
-Mozilla Public License 2.0
-https://mozilla.org/MPL/2.0/
-
-The source code of the MPL-covered files is available from the upstream project at https://github.com/go-sql-driver/mysql.
 
 ### OFL-1.1
 

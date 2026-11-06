@@ -109,7 +109,7 @@ Inside `relaykit/`, use `kitutil.*` from `relaykit/relayconvert/kitutil/json.go`
 
 **Database support:** PostgreSQL >= 14 is the only supported primary database. The log database may be PostgreSQL or ClickHouse; when `LOG_SQL_DSN` is unset it is the primary database.
 
-- SQLite and MySQL support is being removed (#54). Until that lands, legacy dialect branches still exist; do not extend them, and do not add SQLite or MySQL fallbacks to new code.
+- SQLite and MySQL support has been removed (#54). Do not add SQLite or MySQL drivers, dialect branches, or fallbacks.
 - Any change that can affect database behavior MUST be verified before the work is considered complete. This includes ORM/database-driver dependency changes, connection/DSN/protocol or prepared-statement configuration, models and GORM tags, migrations and `AutoMigrate`, constraints and indexes, `Scanner`/`Valuer`/serializer behavior, raw SQL, transactions, and row locking.
 - Required database verification MUST exercise a real PostgreSQL instance. Unit tests, mocks, a successful build, or code inspection are not substitutes. Changes that depend on version-specific behavior must also cover PostgreSQL 14. Changes to a path used by the log database must also be verified on ClickHouse.
 - Treat GORM core and its PostgreSQL and ClickHouse driver packages as a compatible version set. Any change to one of them requires checking upstream compatibility and running the full verification; do not upgrade only the core package and infer that existing drivers remain compatible.

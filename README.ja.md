@@ -149,18 +149,26 @@ New API は、アプリケーション、Agent、チーム向けのセルフホ�
 
 ### Docker でローカル実行
 
-SQLite を使う単一インスタンスを、ローカルホスト限定で起動します。
+New API は PostgreSQL 14 以上にデータを保存します。次のコマンドで PostgreSQL と、ローカルホスト限定の単一インスタンスを起動します。
 
 ```bash
-mkdir -p data
+docker network create new-api
+docker run --name new-api-postgres -d --restart unless-stopped \
+  --network new-api \
+  -e POSTGRES_USER=root \
+  -e POSTGRES_PASSWORD=change-me \
+  -e POSTGRES_DB=new-api \
+  -v new-api-pg:/var/lib/postgresql/data \
+  postgres:15
 docker run --name new-api -d --restart unless-stopped \
+  --network new-api \
   -p 127.0.0.1:3000:3000 \
   -e TZ=Asia/Shanghai \
-  -v "$(pwd)/data:/data" \
+  -e SQL_DSN=postgresql://root:change-me@new-api-postgres:5432/new-api \
   calciumion/new-api:latest
 ```
 
-[http://localhost:3000](http://localhost:3000) を開き、初期設定ウィザードで管理者アカウントを作成します。SQLite データベースはマウントした `data` ディレクトリに保存され、コンテナを置き換えても残ります。
+[http://localhost:3000](http://localhost:3000) を開き、初期設定ウィザードで管理者アカウントを作成します。データベースは `new-api-pg` ボリュームに保存され、コンテナを置き換えても残ります。
 
 ### 最初のリクエスト
 
@@ -191,7 +199,7 @@ curl --fail-with-body http://localhost:3000/v1/responses \
 
 ### Docker Compose
 
-リポジトリの [Compose 設定](./docker-compose.yml) は、既定で **New API + PostgreSQL + Redis** を起動します。MySQL と独立した ClickHouse ログデータベースの設定例も含まれます。
+リポジトリの [Compose 設定](./docker-compose.yml) は、既定で **New API + PostgreSQL + Redis** を起動します。独立した PostgreSQL または ClickHouse ログデータベースの設定例も含まれます。
 
 ```bash
 git clone https://github.com/QuantumNous/new-api.git
@@ -209,15 +217,15 @@ docker compose logs -f new-api
 
 | コンポーネント | 選択肢 |
 | --- | --- |
-| メインデータベース | SQLite、MySQL ≥ 5.7.8、PostgreSQL ≥ 9.6 |
-| 独立したログデータベース | `LOG_SQL_DSN` で設定。ClickHouse にも対応 |
+| メインデータベース | PostgreSQL ≥ 14 |
+| 独立したログデータベース | `LOG_SQL_DSN` で設定。PostgreSQL または ClickHouse |
 | キャッシュ | 任意の Redis とメモリキャッシュ。ノード間でレート制限を共有する場合は Redis を共有 |
 | コンテナのプラットフォーム | Linux amd64 / arm64 |
 
 | 環境変数 | 用途 |
 | --- | --- |
-| `SQL_DSN` | メインデータベースへの接続。未設定なら SQLite |
-| `LOG_SQL_DSN` | 任意の独立ログデータベースへの接続 |
+| `SQL_DSN` | メインデータベースの PostgreSQL 接続。必須 |
+| `LOG_SQL_DSN` | 任意の独立ログデータベースへの接続。未設定ならメインデータベースを使用 |
 | `REDIS_CONN_STRING` | Redis 接続文字列 |
 | `SESSION_SECRET` | 永続的な認証用シークレット。全ノードで同じ値を使用 |
 | `CRYPTO_SECRET` | 既定は `SESSION_SECRET`。Redis を共有するノードは同じ実効値を使用 |
@@ -265,7 +273,6 @@ bun run dev -- --port 5173
 | [relaykit/](./relaykit/README.md) | プロトコル DTO と変換を提供する、独立してビルド可能な Go モジュール |
 | [plugins/tasks/](./plugins/tasks/) | JavaScript タスクプラグイン。作成方法とホストの境界は [Task Plugin API v1](./docs/plugin-api/v1.md) を参照 |
 | `web/` | Web 管理画面。[フロントエンドの規約](./web/AGENTS.md)を参照 |
-| [electron/](./electron/README.md) | デスクトップアプリのラッパーとパッケージング |
 
 貢献前に [AGENTS.md](./AGENTS.md) を確認してください。変更に応じて、Go モジュールは `make test`、フロントエンドは `web/` で `bun check -b`、`bun run lint`、`bun run test`、`bun run build` を実行します。RelayKit を変更した場合は、`relaykit/` で `GOWORK=off go build ./...` も実行してください。
 
