@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -66,47 +65,40 @@ func seedExportLogs(t *testing.T, mainDB *gorm.DB, logDB *gorm.DB, now int64) {
 	}
 }
 
-func useLogExportDatabases(t *testing.T, mainDB *gorm.DB, logDB *gorm.DB, mainType common.DatabaseType, logType common.DatabaseType) {
+func useLogExportDatabases(t *testing.T, mainDB *gorm.DB, logDB *gorm.DB, logType common.DatabaseType) {
 	t.Helper()
 	previousDB, previousLogDB := model.DB, model.LOG_DB
-	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	previousLog := common.LogDatabaseType()
 	previousRedis, previousMemory := common.RedisEnabled, common.MemoryCacheEnabled
 	model.DB, model.LOG_DB = mainDB, logDB
-	common.SetDatabaseTypes(mainType, logType)
+	common.SetLogDatabaseType(logType)
 	common.RedisEnabled, common.MemoryCacheEnabled = false, false
 	t.Cleanup(func() {
 		model.DB, model.LOG_DB = previousDB, previousLogDB
-		common.SetDatabaseTypes(previousMain, previousLog)
+		common.SetLogDatabaseType(previousLog)
 		common.RedisEnabled, common.MemoryCacheEnabled = previousRedis, previousMemory
 	})
 }
 
-func TestLogExportDatabaseMatrix(t *testing.T) {
+func TestLogExportDatabases(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	previousMaster := common.IsMasterNode
 	common.IsMasterNode = true
 	t.Cleanup(func() { common.IsMasterNode = previousMaster })
 	for _, tc := range []struct {
-		kind, env string
-		typ       common.DatabaseType
+		kind string
+		typ  common.DatabaseType
 	}{
-		{"sqlite", "", common.DatabaseTypeSQLite},
-		{"mysql", "AUDIT_MYSQL_DSN", common.DatabaseTypeMySQL},
-		{"postgres", "AUDIT_POSTGRES_DSN", common.DatabaseTypePostgreSQL},
-		{"clickhouse", "AUDIT_CLICKHOUSE_DSN", common.DatabaseTypeClickHouse},
+		{"postgres", common.DatabaseTypePostgreSQL},
+		{"clickhouse", common.DatabaseTypeClickHouse},
 	} {
 		t.Run(tc.kind, func(t *testing.T) {
-			dsn := os.Getenv(tc.env)
-			if tc.env != "" && dsn == "" {
-				t.Skip(tc.env + " is not configured")
-			}
-			db, isolatedDSN := newAuditTestDatabase(t, tc.kind, dsn)
-			mainDB, mainType := db, tc.typ
+			db, isolatedDSN := newAuditTestDatabase(t, tc.kind)
+			mainDB := db
 			if tc.kind == "clickhouse" {
-				mainDB, _ = newAuditTestDatabase(t, "sqlite", "")
-				mainType = common.DatabaseTypeSQLite
+				mainDB, _ = newAuditTestDatabase(t, "postgres")
 			}
-			useLogExportDatabases(t, mainDB, db, mainType, tc.typ)
+			useLogExportDatabases(t, mainDB, db, tc.typ)
 			require.NoError(t, mainDB.AutoMigrate(&model.Channel{}))
 			if tc.kind == "clickhouse" {
 				t.Setenv("LOG_SQL_DSN", isolatedDSN)
@@ -114,13 +106,6 @@ func TestLogExportDatabaseMatrix(t *testing.T) {
 			} else {
 				require.NoError(t, db.AutoMigrate(&model.Log{}))
 			}
-			versionSQL := "SELECT version()"
-			if tc.kind == "sqlite" {
-				versionSQL = "SELECT sqlite_version()"
-			}
-			var version string
-			require.NoError(t, model.LOG_DB.Raw(versionSQL).Scan(&version).Error)
-			t.Logf("log database: %s %s", tc.kind, version)
 			now := time.Now().Unix()
 			seedExportLogs(t, mainDB, model.LOG_DB, now)
 			query := fmt.Sprintf("start_timestamp=%d&end_timestamp=%d", now-2*24*3600, now+3600)
@@ -152,8 +137,8 @@ func TestLogExportDatabaseMatrix(t *testing.T) {
 
 func TestLogExportRules(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	db, _ := newAuditTestDatabase(t, "sqlite", "")
-	useLogExportDatabases(t, db, db, common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	db, _ := newAuditTestDatabase(t, "postgres")
+	useLogExportDatabases(t, db, db, common.DatabaseTypePostgreSQL)
 	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Log{}, &model.QuotaData{}))
 	now := time.Now().Unix()
 	seedExportLogs(t, db, db, now)

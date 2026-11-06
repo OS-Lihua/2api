@@ -21,8 +21,6 @@ func TestProcessChannelErrorUsesSnapshotWithoutLeakingChannelMetadata(t *testing
 	gin.SetMode(gin.TestMode)
 	previousDB, previousLogDB := model.DB, model.LOG_DB
 	previousRedisEnabled := common.RedisEnabled
-	previousMainDatabaseType := common.MainDatabaseType()
-	previousLogDatabaseType := common.LogDatabaseType()
 	previousErrorLogEnabled := constant.ErrorLogEnabled
 
 	database := model.UseTestDatabases(t)
@@ -35,7 +33,6 @@ func TestProcessChannelErrorUsesSnapshotWithoutLeakingChannelMetadata(t *testing
 	t.Cleanup(func() {
 		model.DB, model.LOG_DB = previousDB, previousLogDB
 		common.RedisEnabled = previousRedisEnabled
-		common.SetDatabaseTypes(previousMainDatabaseType, previousLogDatabaseType)
 		constant.ErrorLogEnabled = previousErrorLogEnabled
 		require.NoError(t, sqlDB.Close())
 	})

@@ -3,7 +3,6 @@ package model
 import (
 	"fmt"
 
-	"github.com/QuantumNous/new-api/common"
 	"gorm.io/gorm"
 )
 
@@ -35,7 +34,7 @@ func GetRankingQuotaBuckets(startTime int64, endTime int64, bucketSize int64) ([
 	if bucketSize <= 0 {
 		bucketSize = 3600
 	}
-	bucketExpr := rankingBucketExpr(bucketSize)
+	bucketExpr := fmt.Sprintf("(created_at / %d) * %d", bucketSize, bucketSize)
 	var rows []RankingQuotaBucket
 	query := DB.Table("quota_data").
 		Select(fmt.Sprintf("model_name, %s as bucket, sum(token_used) as tokens", bucketExpr)).
@@ -46,13 +45,6 @@ func GetRankingQuotaBuckets(startTime int64, endTime int64, bucketSize int64) ([
 	query = applyRankingQuotaTimeRange(query, startTime, endTime)
 	err := query.Find(&rows).Error
 	return rows, err
-}
-
-func rankingBucketExpr(bucketSize int64) string {
-	if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
-		return fmt.Sprintf("FLOOR(created_at / %d) * %d", bucketSize, bucketSize)
-	}
-	return fmt.Sprintf("(created_at / %d) * %d", bucketSize, bucketSize)
 }
 
 func applyRankingQuotaTimeRange(query *gorm.DB, startTime int64, endTime int64) *gorm.DB {

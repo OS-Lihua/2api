@@ -359,13 +359,8 @@ func EnsureEmailAvailable(email string, excludeUserID int) error {
 // withNormalizedEmailLock serializes concurrent writers that target the same
 // normalized email inside tx, so a "check then write" sequence cannot be raced
 // by two transactions. It must be called inside an active transaction; the lock
-// is scoped to that transaction and released on commit/rollback.
-//
-//   - PostgreSQL: transaction-level advisory lock keyed by the normalized email.
-//   - MySQL (default REPEATABLE READ): a locking read that takes a next-key/gap
-//     lock on the email index, blocking concurrent inserts of the same value.
-//   - SQLite: no explicit lock; the single-writer model already serializes the
-//     write, so a racing second write fails instead of duplicating.
+// is scoped to that transaction and released on commit/rollback. The lock is a
+// PostgreSQL transaction-level advisory lock keyed by the normalized email.
 //
 // An empty email is allowed to repeat and needs no serialization.
 func withNormalizedEmailLock(tx *gorm.DB, email string, fn func(tx *gorm.DB) error) error {
@@ -380,18 +375,7 @@ func lockNormalizedEmail(tx *gorm.DB, email string) error {
 	if email == "" {
 		return nil
 	}
-	switch {
-	case common.UsingMainDatabase(common.DatabaseTypePostgreSQL):
-		if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", email).Error; err != nil {
-			return err
-		}
-	case common.UsingMainDatabase(common.DatabaseTypeMySQL):
-		var ids []int
-		if err := tx.Raw("SELECT id FROM users WHERE email = ? FOR UPDATE", email).Scan(&ids).Error; err != nil {
-			return err
-		}
-	}
-	return nil
+	return tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", email).Error
 }
 
 func GetMaxUserId() int {
@@ -468,7 +452,7 @@ func SearchUsers(keyword string, group string, role *int, status *int, startIdx 
 
 	query = query.Where("("+likeCondition+")", likeArgs...)
 	if group != "" {
-		query = query.Where(commonGroupCol+" = ?", group)
+		query = query.Where(`"group" = ?`, group)
 	}
 	if role != nil {
 		query = query.Where("role = ?", *role)
@@ -1011,7 +995,7 @@ func (user *User) HardDelete() (int64, error) {
 			return err
 		}
 		if common.RedisEnabled {
-			if err := tx.Unscoped().Select("id", commonKeyCol).Where("user_id = ?", user.Id).Find(&tokens).Error; err != nil {
+			if err := tx.Unscoped().Select("id", `"key"`).Where("user_id = ?", user.Id).Find(&tokens).Error; err != nil {
 				return err
 			}
 		}
@@ -1291,7 +1275,7 @@ func GetUserGroup(id int, fromDB bool) (group string, err error) {
 		// Don't return error - fall through to DB
 	}
 	fromDB = true
-	err = DB.Model(&User{}).Where("id = ?", id).Select(commonGroupCol).Find(&group).Error
+	err = DB.Model(&User{}).Where("id = ?", id).Select(`"group"`).Find(&group).Error
 	if err != nil {
 		return "", err
 	}

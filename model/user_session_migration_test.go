@@ -3,17 +3,13 @@ package model
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/driver/mysql"
-	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -79,8 +75,9 @@ func TestUserSessionPreviousRefreshHashSchemaUsesNullableVarchar(t *testing.T) {
 	assert.False(t, field.NotNull)
 }
 
-func testPreviousRefreshHashMigration(t *testing.T, db *gorm.DB, recorder *migrationSQLRecorder, dialect string) {
-	t.Helper()
+func TestUserSessionPreviousRefreshHashMigration(t *testing.T) {
+	recorder := &migrationSQLRecorder{}
+	db := UseTestDatabases(t).Session(&gorm.Session{Logger: recorder})
 	tableName := fmt.Sprintf("user_session_previous_hash_migration_%d", time.Now().UnixNano())
 	t.Cleanup(func() { _ = db.Migrator().DropTable(tableName) })
 
@@ -109,9 +106,7 @@ func testPreviousRefreshHashMigration(t *testing.T, db *gorm.DB, recorder *migra
 		previousHashColumnFound = true
 		nullable, ok := columnType.Nullable()
 		require.True(t, ok)
-		if dialect != "sqlite" {
-			assert.True(t, nullable)
-		}
+		assert.True(t, nullable)
 		assert.Contains(t, strings.ToUpper(columnType.DatabaseTypeName()), "VARCHAR")
 	}
 	assert.True(t, previousHashColumnFound)
@@ -119,39 +114,4 @@ func testPreviousRefreshHashMigration(t *testing.T, db *gorm.DB, recorder *migra
 	recorder.reset()
 	require.NoError(t, db.Table(tableName).AutoMigrate(&previousRefreshHashMigrationTarget{}))
 	assert.Empty(t, recorder.schemaMutations(), "a second migration must not repeat type-changing DDL")
-}
-
-func TestUserSessionPreviousRefreshHashMigrationSQLite(t *testing.T) {
-	recorder := &migrationSQLRecorder{}
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{Logger: recorder})
-	require.NoError(t, err)
-	testPreviousRefreshHashMigration(t, db, recorder, "sqlite")
-}
-
-func TestUserSessionPreviousRefreshHashMigrationConfiguredDatabases(t *testing.T) {
-	tests := []struct {
-		name      string
-		env       string
-		dialector func(string) gorm.Dialector
-	}{
-		{name: "mysql", env: "TEST_MYSQL_DSN", dialector: func(dsn string) gorm.Dialector { return mysql.Open(dsn) }},
-		{name: "postgres", env: "TEST_POSTGRES_DSN", dialector: func(dsn string) gorm.Dialector {
-			return postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true})
-		}},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			dsn := strings.TrimSpace(os.Getenv(test.env))
-			if dsn == "" {
-				t.Skip(test.env + " is not configured")
-			}
-			recorder := &migrationSQLRecorder{}
-			db, err := gorm.Open(test.dialector(dsn), &gorm.Config{Logger: recorder})
-			require.NoError(t, err)
-			sqlDB, err := db.DB()
-			require.NoError(t, err)
-			t.Cleanup(func() { _ = sqlDB.Close() })
-			testPreviousRefreshHashMigration(t, db, recorder, test.name)
-		})
-	}
 }

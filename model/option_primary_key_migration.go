@@ -1,7 +1,6 @@
 package model
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -12,7 +11,6 @@ import (
 
 const (
 	optionPrimaryKeyTmpTable = "options_pk_tmp"
-	optionPrimaryKeyLockName = "new_api_options_pk"
 	optionPrimaryKeyLockID   = 75820193
 	optionLegacyTablePrefix  = "options_legacy_"
 )
@@ -59,9 +57,6 @@ func optionsKeyIsUnique(db *gorm.DB) (bool, error) {
 			return true, nil
 		}
 	}
-	if db.Dialector.Name() != "postgres" {
-		return false, nil
-	}
 	// PostgreSQL GetIndexes omits constraint-backed primary/unique keys.
 	var count int64
 	if err := db.Raw(`
@@ -80,39 +75,12 @@ WHERE constraint_meta.conrelid = to_regclass('options')
 }
 
 func withOptionPrimaryKeyLock(db *gorm.DB, fn func(*gorm.DB) error) error {
-	switch db.Dialector.Name() {
-	case "mysql":
-		sqlDB, err := db.DB()
-		if err != nil {
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", optionPrimaryKeyLockID).Error; err != nil {
 			return fmt.Errorf("lock options table: %w", err)
 		}
-		ctx := context.Background()
-		conn, err := sqlDB.Conn(ctx)
-		if err != nil {
-			return fmt.Errorf("lock options table: %w", err)
-		}
-		defer conn.Close()
-		var acquired int
-		if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, 60)", optionPrimaryKeyLockName).Scan(&acquired); err != nil {
-			return fmt.Errorf("lock options table: %w", err)
-		}
-		if acquired != 1 {
-			return fmt.Errorf("lock options table: timeout")
-		}
-		defer conn.ExecContext(ctx, "SELECT RELEASE_LOCK(?)", optionPrimaryKeyLockName)
-		return fn(db)
-	case "postgres":
-		return db.Transaction(func(tx *gorm.DB) error {
-			if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", optionPrimaryKeyLockID).Error; err != nil {
-				return fmt.Errorf("lock options table: %w", err)
-			}
-			return fn(tx)
-		})
-	default:
-		return db.Transaction(func(tx *gorm.DB) error {
-			return fn(tx)
-		})
-	}
+		return fn(tx)
+	})
 }
 
 func repairOptionPrimaryKey(db *gorm.DB) error {
@@ -191,13 +159,6 @@ func dedupeOptionRows(rows []Option) ([]Option, int) {
 func swapOptionTables(db *gorm.DB, tmp, backup string) error {
 	if !optionSafeIdent(tmp) || !optionSafeIdent(backup) {
 		return fmt.Errorf("unsafe options table name")
-	}
-	if db.Dialector.Name() == "mysql" {
-		sql := "RENAME TABLE `options` TO `" + backup + "`, `" + tmp + "` TO `options`"
-		if err := db.Exec(sql).Error; err != nil {
-			return fmt.Errorf("rename options tables: %w", err)
-		}
-		return nil
 	}
 	if err := db.Migrator().RenameTable("options", backup); err != nil {
 		return fmt.Errorf("rename options to %s: %w", backup, err)

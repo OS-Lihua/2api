@@ -58,20 +58,11 @@ func UnbindTaskPlugin(channelID int, key string) (bool, error) {
 	return true, DB.Model(&Channel{}).Where("id = ?", channelID).Update("setting", channel.Setting).Error
 }
 
-// LongText is a string column sized for plugin payloads on every supported
-// database: longtext on MySQL, text on PostgreSQL and SQLite. A bare
-// `type:text` tag stops at 64 KiB on MySQL. A `size:` tag above that becomes
-// varchar(N) on PostgreSQL, which rejects sizes past 10485760, and a NOT NULL
-// column declared that way is re-altered by AutoMigrate on every MySQL start
-// because the reported column length never equals N. Neither type chosen here
-// carries a length, so an up-to-date column is left alone, and MySQL widens a
-// shipped text column once, without data loss.
+// LongText is an unbounded text column for plugin payloads. A `size:` tag
+// would become varchar(N) on PostgreSQL, which rejects sizes past 10485760.
 type LongText string
 
-func (LongText) GormDBDataType(db *gorm.DB, _ *schema.Field) string {
-	if db.Dialector.Name() == string(common.DatabaseTypeMySQL) {
-		return "longtext"
-	}
+func (LongText) GormDBDataType(*gorm.DB, *schema.Field) string {
 	return "text"
 }
 
@@ -85,8 +76,7 @@ type TaskPlugin struct {
 	// Icon is the plugin logo shipped as a sidecar icon.svg / icon.png next to
 	// plugin.js, stored as a data URI so one column carries both the media
 	// type and the bytes. It never travels inside list or detail JSON; the UI
-	// loads it through GET /api/plugin/task/:key/icon. LongText keeps the
-	// 512 KiB icon cap storable on MySQL, where a bare TEXT holds only 64 KiB.
+	// loads it through GET /api/plugin/task/:key/icon.
 	Icon      LongText `json:"-"`
 	Enabled   bool     `json:"enabled" gorm:"not null"`
 	Active    bool     `json:"active" gorm:"not null;index"`

@@ -1793,32 +1793,19 @@ func TestSettle_TokenRecalcFallsBackToCompletionTokens(t *testing.T) {
 func failRowUpdates(t *testing.T, table string, id int, message string) {
 	t.Helper()
 	name := fmt.Sprintf("fail_%s_%d_update", table, id)
-	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		require.NoError(t, model.DB.Exec(fmt.Sprintf(`
-			CREATE FUNCTION %[1]s() RETURNS trigger AS $body$
-			BEGIN
-				IF OLD.id = %[2]d THEN
-					RAISE EXCEPTION '%[3]s';
-				END IF;
-				RETURN NEW;
-			END
-			$body$ LANGUAGE plpgsql`, name, id, message)).Error)
-		require.NoError(t, model.DB.Exec(fmt.Sprintf(
-			`CREATE TRIGGER %[1]s BEFORE UPDATE ON %[2]s FOR EACH ROW EXECUTE FUNCTION %[1]s()`, name, table)).Error)
-		t.Cleanup(func() {
-			model.DB.Exec(fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, name, table))
-			model.DB.Exec(fmt.Sprintf(`DROP FUNCTION IF EXISTS %s()`, name))
-		})
-		return
-	}
 	require.NoError(t, model.DB.Exec(fmt.Sprintf(`
-		CREATE TRIGGER %[1]s
-		BEFORE UPDATE ON %[2]s
-		WHEN OLD.id = %[3]d
+		CREATE FUNCTION %[1]s() RETURNS trigger AS $body$
 		BEGIN
-			SELECT RAISE(ABORT, '%[4]s');
-		END;`, name, table, id, message)).Error)
+			IF OLD.id = %[2]d THEN
+				RAISE EXCEPTION '%[3]s';
+			END IF;
+			RETURN NEW;
+		END
+		$body$ LANGUAGE plpgsql`, name, id, message)).Error)
+	require.NoError(t, model.DB.Exec(fmt.Sprintf(
+		`CREATE TRIGGER %[1]s BEFORE UPDATE ON %[2]s FOR EACH ROW EXECUTE FUNCTION %[1]s()`, name, table)).Error)
 	t.Cleanup(func() {
-		model.DB.Exec(fmt.Sprintf("DROP TRIGGER IF EXISTS %s", name))
+		model.DB.Exec(fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, name, table))
+		model.DB.Exec(fmt.Sprintf(`DROP FUNCTION IF EXISTS %s()`, name))
 	})
 }

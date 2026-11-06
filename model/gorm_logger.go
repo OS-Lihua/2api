@@ -10,8 +10,6 @@ import (
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/proto"
 	"github.com/QuantumNous/new-api/common"
-	sqlitedriver "github.com/glebarez/go-sqlite"
-	"github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -22,10 +20,9 @@ const (
 	maxSlowThresholdMs     = 60 * 60 * 1000
 )
 
-func newGormConfig(prepareStmt bool) *gorm.Config {
+func newGormConfig() *gorm.Config {
 	return &gorm.Config{
-		PrepareStmt: prepareStmt,
-		Logger:      newGormLogger(os.Stdout),
+		Logger: newGormLogger(os.Stdout),
 	}
 }
 
@@ -46,7 +43,7 @@ func newGormLogger(w io.Writer) logger.Interface {
 	})
 }
 
-// ParameterizedQueries 只过滤 SQL 字符串,驱动错误消息(如 MySQL 1062)同样会
+// ParameterizedQueries 只过滤 SQL 字符串,驱动错误消息(如唯一约束冲突)同样会
 // 内联数据值,在这里收敛为错误码;DEBUG=true 保留原文。
 type sanitizedLogWriter struct {
 	delegate *log.Logger
@@ -66,10 +63,6 @@ func (s *sanitizedLogWriter) Printf(format string, args ...any) {
 // 只收敛数据库服务端生成的驱动错误(消息可能内联数据值);网络/上下文等
 // 其它错误不含查询数据,原样保留以便排障。
 func sanitizeDBError(err error) error {
-	var mysqlErr *mysql.MySQLError
-	if errors.As(err, &mysqlErr) {
-		return fmt.Errorf("mysql error %d", mysqlErr.Number)
-	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		// 08P01 是 PgBouncer 对同连接重名 Parse 的 FATAL,42P05 是原生 PostgreSQL 的
@@ -82,10 +75,6 @@ func sanitizeDBError(err error) error {
 	var chErr *proto.Exception
 	if errors.As(err, &chErr) {
 		return fmt.Errorf("clickhouse error %d", chErr.Code)
-	}
-	var sqliteErr *sqlitedriver.Error
-	if errors.As(err, &sqliteErr) {
-		return fmt.Errorf("sqlite error %d", sqliteErr.Code())
 	}
 	return err
 }

@@ -48,7 +48,7 @@ func IsPasskeyDomainOption(key string) bool {
 }
 
 // lockPasskeyDomainSettings serializes trust changes and credential writes across
-// nodes. Callers also hold passkeyOptionMutex for SQLite and local cache ordering.
+// nodes. Callers also hold passkeyOptionMutex for local cache ordering.
 // Always acquire these option rows before any user/session/credential row locks.
 func lockPasskeyDomainSettings(tx *gorm.DB) (system_setting.PasskeySettings, string, error) {
 	common.OptionMapRWMutex.RLock()
@@ -60,7 +60,7 @@ func lockPasskeyDomainSettings(tx *gorm.DB) (system_setting.PasskeySettings, str
 		{Key: "passkey.origins", Value: settings.Origins},
 		{Key: "passkey.rp_id", Value: settings.RPID},
 	}
-	// The first write also acquires SQLite's writer lock before any reads.
+	// Create missing rows first so every option row exists to lock.
 	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&rows).Error; err != nil {
 		return settings, serverAddress, err
 	}
@@ -179,8 +179,8 @@ func UpdatePasskeyDomainOptions(values map[string]string, preview bool, confirma
 			}
 		}
 		if len(change.RemovedRPIDs) > 0 {
-			// MySQL may compare/group text case-insensitively. Select only
-			// candidate RP values, then count exact bytes without credential IDs.
+			// Select only candidate RP values, then count exact bytes without
+			// credential IDs.
 			rows, err := tx.Model(&PasskeyCredential{}).Select("rp_id").
 				Where("rp_id IS NULL OR rp_id = ? OR rp_id IN ?", "", change.RemovedRPIDs).Rows()
 			if err != nil {

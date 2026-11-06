@@ -325,22 +325,20 @@ export function parseTaskResult() { return {}; }
 	assert.True(t, ok)
 }
 
-// The shipped alibaba plugin is already larger than a MySQL TEXT column
-// (64 KiB), so storing it through the model path the upload endpoint uses and
-// reading it back unchanged proves the source and icon columns are not
-// truncated. Set TEST_TASK_DB_DIALECT plus TEST_MYSQL_DSN or TEST_POSTGRES_DSN
-// to run the same contract against a real MySQL or PostgreSQL server.
-func TestTaskPluginSourceAboveMySQLTextLimitRoundTrips(t *testing.T) {
-	database, _ := openTaskDialectDatabase(t, &model.TaskPlugin{})
+// The shipped alibaba plugin is larger than 64 KiB, so storing it through the
+// model path the upload endpoint uses and reading it back unchanged proves the
+// source and icon columns are not truncated.
+func TestTaskPluginLargeSourceRoundTrips(t *testing.T) {
+	database := openTaskTestDatabase(t, &model.TaskPlugin{})
 	originalDB := model.DB
 	model.DB = database
 	t.Cleanup(func() { model.DB = originalDB })
 
 	source, err := plugins.Source("alibaba")
 	require.NoError(t, err)
-	require.Greater(t, len(source), 65535, "fixture must exceed the MySQL TEXT limit")
+	require.Greater(t, len(source), 65535, "fixture must exceed 64 KiB")
 	icon := "data:image/svg+xml;base64," + base64.StdEncoding.EncodeToString([]byte(strings.Repeat(`<svg xmlns="http://www.w3.org/2000/svg"></svg>`, 2048)))
-	require.Greater(t, len(icon), 65535, "icon fixture must exceed the MySQL TEXT limit")
+	require.Greater(t, len(icon), 65535, "icon fixture must exceed 64 KiB")
 
 	plugin := model.TaskPlugin{Key: "alibaba", APIVersion: 1, Version: "roundtrip", Source: model.LongText(source), SourceHash: "hash", Enabled: true}
 	require.NoError(t, model.SaveTaskPlugin(&plugin))

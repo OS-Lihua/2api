@@ -56,8 +56,7 @@ func AdjustUserQuota(userID, operatorRole int, mode string, value int) (*UserQuo
 		if err != nil {
 			return ErrWalletQuotaLimitExceeded
 		}
-		// An unchanged override is a successful operation, including on MySQL
-		// configurations that count only changed rows in RowsAffected.
+		// An unchanged override is a successful operation without a write.
 		if after != user.Quota {
 			result := tx.Model(&User{}).Where("id = ?", userID).Update("quota", after)
 			if result.Error != nil {

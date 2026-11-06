@@ -13,12 +13,10 @@ import (
 func useFrontendOptionMigrationDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	previousDB := DB
-	previousType := common.MainDatabaseType()
 	db := UseTestDatabases(t)
 	require.NoError(t, db.AutoMigrate(&Option{}))
 	t.Cleanup(func() {
 		DB = previousDB
-		common.SetMainDatabaseType(previousType)
 	})
 	return db
 }

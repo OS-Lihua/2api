@@ -11,9 +11,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// setupSub2APIBalanceTest wires an in-memory SQLite DB into model.DB so
-// Channel.UpdateBalance can persist, mirroring the pattern used by other
-// controller tests.
+// setupSub2APIBalanceTest wires an isolated PostgreSQL schema into model.DB
+// so Channel.UpdateBalance can persist.
 func setupSub2APIBalanceTest(t *testing.T) {
 	t.Helper()
 	database := model.UseTestDatabases(t)

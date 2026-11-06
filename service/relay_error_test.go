@@ -56,7 +56,7 @@ func TestShouldRetryRelayErrorHonorsChannelPinOnChannelError(t *testing.T) {
 }
 
 func TestProcessChannelErrorMasksDisableReasonAndNotification(t *testing.T) {
-	previousDB, previousType := model.DB, common.MainDatabaseType()
+	previousDB := model.DB
 	previousCache, previousRedis := common.MemoryCacheEnabled, common.RedisEnabled
 	previousAutoDisable, previousErrorLog := common.AutomaticDisableChannelEnabled, constant.ErrorLogEnabled
 	previousNotifyLimit := constant.NotifyLimitCount
@@ -65,7 +65,6 @@ func TestProcessChannelErrorMasksDisableReasonAndNotification(t *testing.T) {
 	previousFetch := *fetch
 	t.Cleanup(func() {
 		model.DB = previousDB
-		common.SetMainDatabaseType(previousType)
 		common.MemoryCacheEnabled, common.RedisEnabled = previousCache, previousRedis
 		common.AutomaticDisableChannelEnabled, constant.ErrorLogEnabled = previousAutoDisable, previousErrorLog
 		constant.NotifyLimitCount = previousNotifyLimit

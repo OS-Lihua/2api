@@ -2,94 +2,19 @@ package model
 
 import (
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/driver/mysql"
-	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
-func testPrefillGroupMigrationNonPostgreSQL(t *testing.T, db *gorm.DB) {
-	t.Helper()
-	var version string
-	versionQuery := "SELECT version()"
-	if db.Dialector.Name() == "sqlite" {
-		versionQuery = "SELECT sqlite_version()"
-	}
-	require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
-	t.Logf("%s version: %s", db.Dialector.Name(), version)
-	tableName := fmt.Sprintf("prefill_group_migration_%d", time.Now().UnixNano())
-	t.Cleanup(func() { _ = db.Migrator().DropTable(tableName) })
-
-	tableDB := db.Table(tableName)
-	require.NoError(t, tableDB.AutoMigrate(&PrefillGroup{}))
-	require.NoError(t, tableDB.Create(&PrefillGroup{
-		Name:        "preserved-name",
-		Type:        "model",
-		Items:       JSONValue(`["gpt-test"]`),
-		Description: "preserve me",
-	}).Error)
-
-	recorder := &migrationSQLRecorder{}
-	for pass := range 2 {
-		recorder.reset()
-		require.NoError(t, migratePrefillGroupUniqueness(db.Session(&gorm.Session{Logger: recorder})))
-		require.NoError(t, tableDB.Session(&gorm.Session{Logger: recorder}).AutoMigrate(&PrefillGroup{}))
-		if pass == 1 {
-			assert.Empty(t, recorder.schemaMutations(), "repeated startup must not change the schema")
-		}
-	}
-
-	var preserved PrefillGroup
-	require.NoError(t, tableDB.Where("name = ?", "preserved-name").First(&preserved).Error)
-	assert.Equal(t, "preserve me", preserved.Description)
-	assert.JSONEq(t, `["gpt-test"]`, string(preserved.Items))
-	assert.True(t, tableDB.Migrator().HasIndex(&PrefillGroup{}, prefillGroupNameIndex))
-	require.Error(t, tableDB.Create(&PrefillGroup{Name: preserved.Name, Type: "model"}).Error)
-}
-
-func TestMigratePrefillGroupUniquenessSQLite(t *testing.T) {
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
-	testPrefillGroupMigrationNonPostgreSQL(t, db)
-}
-
-func TestMigratePrefillGroupUniquenessMySQL(t *testing.T) {
-	dsn := strings.TrimSpace(os.Getenv("TEST_MYSQL_DSN"))
-	if dsn == "" {
-		t.Skip("TEST_MYSQL_DSN is not configured")
-	}
-
-	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
-	require.NoError(t, err)
-	sqlDB, err := db.DB()
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
-	testPrefillGroupMigrationNonPostgreSQL(t, db)
-}
-
-func TestMigratePrefillGroupUniquenessPostgreSQL(t *testing.T) {
-	dsn := strings.TrimSpace(os.Getenv("TEST_POSTGRES_DSN"))
-	if dsn == "" {
-		t.Skip("TEST_POSTGRES_DSN is not configured")
-	}
-
-	db, err := gorm.Open(postgres.New(postgres.Config{
-		DSN:                  dsn,
-		PreferSimpleProtocol: true,
-	}), &gorm.Config{})
-	require.NoError(t, err)
-	sqlDB, err := db.DB()
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+func TestMigratePrefillGroupUniqueness(t *testing.T) {
+	db := UseTestDatabases(t)
 
 	var version string
 	require.NoError(t, db.Raw("SELECT version()").Scan(&version).Error)

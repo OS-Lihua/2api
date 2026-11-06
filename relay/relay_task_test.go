@@ -32,7 +32,6 @@ import (
 func setupRelayChannelDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	previousDB := model.DB
-	previousType := common.MainDatabaseType()
 	previousCache := common.MemoryCacheEnabled
 	database := model.UseTestDatabases(t)
 	sqlDB, err := database.DB()
@@ -42,7 +41,6 @@ func setupRelayChannelDB(t *testing.T) *gorm.DB {
 	common.MemoryCacheEnabled = false
 	t.Cleanup(func() {
 		model.DB = previousDB
-		common.SetMainDatabaseType(previousType)
 		common.MemoryCacheEnabled = previousCache
 		require.NoError(t, sqlDB.Close())
 	})

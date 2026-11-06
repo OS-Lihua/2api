@@ -43,7 +43,7 @@ func GetAllEnableAbilityWithChannels() ([]AbilityWithChannel, error) {
 func GetGroupEnabledModels(group string) []string {
 	var models []string
 	// Find distinct models
-	DB.Table("abilities").Where(commonGroupCol+" = ? and enabled = ?", group, true).Distinct("model").Pluck("model", &models)
+	DB.Table("abilities").Where(`"group" = ? and enabled = ?`, group, true).Distinct("model").Pluck("model", &models)
 	return models
 }
 
@@ -65,7 +65,7 @@ func getPriority(group string, model string, retry int) (int, error) {
 	var priorities []int
 	err := DB.Model(&Ability{}).
 		Select("DISTINCT(priority)").
-		Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true).
+		Where(`"group" = ? and model = ? and enabled = ?`, group, model, true).
 		Order("priority DESC").              // 按优先级降序排序
 		Pluck("priority", &priorities).Error // Pluck用于将查询的结果直接扫描到一个切片中
 
@@ -91,14 +91,14 @@ func getPriority(group string, model string, retry int) (int, error) {
 }
 
 func getChannelQuery(group string, model string, retry int) (*gorm.DB, error) {
-	maxPrioritySubQuery := DB.Model(&Ability{}).Select("MAX(priority)").Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true)
-	channelQuery := DB.Where(commonGroupCol+" = ? and model = ? and enabled = ? and priority = (?)", group, model, true, maxPrioritySubQuery)
+	maxPrioritySubQuery := DB.Model(&Ability{}).Select("MAX(priority)").Where(`"group" = ? and model = ? and enabled = ?`, group, model, true)
+	channelQuery := DB.Where(`"group" = ? and model = ? and enabled = ? and priority = (?)`, group, model, true, maxPrioritySubQuery)
 	if retry != 0 {
 		priority, err := getPriority(group, model, retry)
 		if err != nil {
 			return nil, err
 		} else {
-			channelQuery = DB.Where(commonGroupCol+" = ? and model = ? and enabled = ? and priority = ?", group, model, true, priority)
+			channelQuery = DB.Where(`"group" = ? and model = ? and enabled = ? and priority = ?`, group, model, true, priority)
 		}
 	}
 
@@ -112,7 +112,7 @@ func GetChannel(
 	filters []dto.ChannelFilter,
 ) (*Channel, error) {
 	var abilities []Ability
-	err := DB.Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true).Order("priority DESC, weight DESC").Find(&abilities).Error
+	err := DB.Where(`"group" = ? and model = ? and enabled = ?`, group, model, true).Order("priority DESC, weight DESC").Find(&abilities).Error
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +120,7 @@ func GetChannel(
 	// Like the memory cache, retry with the routing name (for example without
 	// @ modifiers) when no channel serves the exact name.
 	if normalized := ratio_setting.RoutingMatchModelName(model); len(abilities) == 0 && normalized != "" && normalized != model {
-		err = DB.Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, normalized, true).Order("priority DESC, weight DESC").Find(&abilities).Error
+		err = DB.Where(`"group" = ? and model = ? and enabled = ?`, group, normalized, true).Order("priority DESC, weight DESC").Find(&abilities).Error
 		if err != nil {
 			return nil, err
 		}
@@ -371,18 +371,9 @@ func FixAbility() (int, int, error) {
 	defer fixLock.Unlock()
 
 	// truncate abilities table
-	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
-		err := DB.Exec("DELETE FROM abilities").Error
-		if err != nil {
-			common.SysLog(common.LogText("Delete abilities failed: %s", err.Error()))
-			return 0, 0, err
-		}
-	} else {
-		err := DB.Exec("TRUNCATE TABLE abilities").Error
-		if err != nil {
-			common.SysLog(common.LogText("Truncate abilities failed: %s", err.Error()))
-			return 0, 0, err
-		}
+	if err := DB.Exec("TRUNCATE TABLE abilities").Error; err != nil {
+		common.SysLog(common.LogText("Truncate abilities failed: %s", err.Error()))
+		return 0, 0, err
 	}
 	var channels []*Channel
 	// Find all channels
