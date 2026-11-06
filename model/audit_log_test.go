@@ -7,7 +7,6 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 )
 
 // TestAuditLogSortIndexDatabase verifies audit ordering and index migrations
@@ -29,39 +28,43 @@ func TestAuditLogSortIndexDatabase(t *testing.T) {
 				{EventId: "event-z", CreatedAt: 200, UserId: 1, ActorRole: common.RoleCommonUser},
 			}
 			require.NoError(t, db.Create(&entries).Error)
-			originalIndexes, err := db.Migrator().GetIndexes(&AuditLog{})
-			require.NoError(t, err)
-			for range 2 {
-				require.NoError(t, MigrateAuditLogs())
+			// GORM's PostgreSQL GetIndexes neither filters by schema nor keeps
+			// key order, so read the indexes of this test's schema directly.
+			type auditIndex struct {
+				Name    string
+				Columns string
+				Unique  bool
 			}
-			indexes, err := db.Migrator().GetIndexes(&AuditLog{})
-			require.NoError(t, err)
-			byName := make(map[string]gorm.Index, len(indexes))
-			for _, index := range indexes {
-				byName[index.Name()] = index
-			}
-			index, ok := byName["idx_audit_time_event"]
-			require.True(t, ok, "migration must create the audit ordering index")
-			var columns []string
-			// GORM's PostgreSQL GetIndexes does not preserve index key order.
-			require.NoError(t, db.Raw(`
-SELECT attribute.attname
+			readIndexes := func() map[string]auditIndex {
+				var rows []auditIndex
+				require.NoError(t, db.Raw(`
+SELECT index_class.relname AS name,
+       string_agg(attribute.attname, ',' ORDER BY index_column.ordinal_position) AS columns,
+       index_meta.indisunique AS "unique"
 FROM pg_catalog.pg_index AS index_meta
+JOIN pg_catalog.pg_class AS index_class ON index_class.oid = index_meta.indexrelid
 CROSS JOIN LATERAL unnest(index_meta.indkey) WITH ORDINALITY AS index_column(attnum, ordinal_position)
 JOIN pg_catalog.pg_attribute AS attribute
   ON attribute.attrelid = index_meta.indrelid AND attribute.attnum = index_column.attnum
-WHERE index_meta.indexrelid = to_regclass(?)
-ORDER BY index_column.ordinal_position
-`, index.Name()).Scan(&columns).Error)
-			assert.Equal(t, []string{"created_at", "event_id"}, columns)
-			for _, original := range originalIndexes {
-				preserved, ok := byName[original.Name()]
-				require.True(t, ok, "existing index %s must remain", original.Name())
-				assert.Equal(t, original.Columns(), preserved.Columns(), original.Name())
-				originalUnique, originalKnown := original.Unique()
-				preservedUnique, preservedKnown := preserved.Unique()
-				assert.Equal(t, originalKnown, preservedKnown, original.Name())
-				assert.Equal(t, originalUnique, preservedUnique, original.Name())
+WHERE index_meta.indrelid = to_regclass('audit_logs')
+GROUP BY index_class.relname, index_meta.indisunique
+`).Scan(&rows).Error)
+				byName := make(map[string]auditIndex, len(rows))
+				for _, row := range rows {
+					byName[row.Name] = row
+				}
+				return byName
+			}
+			originalIndexes := readIndexes()
+			for range 2 {
+				require.NoError(t, MigrateAuditLogs())
+			}
+			indexes := readIndexes()
+			index, ok := indexes["idx_audit_time_event"]
+			require.True(t, ok, "migration must create the audit ordering index")
+			assert.Equal(t, "created_at,event_id", index.Columns)
+			for name, original := range originalIndexes {
+				assert.Equal(t, original, indexes[name], "existing index %s must remain unchanged", name)
 			}
 			var stored []AuditLog
 			require.NoError(t, db.Order("id").Find(&stored).Error)

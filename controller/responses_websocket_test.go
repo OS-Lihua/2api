@@ -63,7 +63,12 @@ func setupResponsesWSRequestTest(t *testing.T) (*model.User, *model.Token) {
 		setting.ModelRequestRateLimitGroup = previousGroups
 		setting.ModelRequestRateLimitMutex.Unlock()
 	})
+	// The accounting assertions read consume logs back in insertion order, so
+	// the log database is the primary database. UseTestDatabases restores
+	// LOG_DB and the log database type.
 	db := model.UseTestDatabases(t)
+	model.LOG_DB = db
+	common.SetLogDatabaseType(common.DatabaseTypePostgreSQL)
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}))
 	// The shared in-memory limiter outlives each database fixture. Give every
 	// user a separate quota bucket, including when the tests run with -count.
