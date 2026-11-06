@@ -8,8 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,13 +38,9 @@ var responsesWSTestUserSequence atomic.Int64
 
 func setupResponsesWSRequestTest(t *testing.T) (*model.User, *model.Token) {
 	t.Helper()
-	previousDB := model.DB
-	previousLogDB := model.LOG_DB
-	previousType := common.MainDatabaseType()
-	previousLogType := common.LogDatabaseType()
 	previousRedis := common.RedisEnabled
 	previousRDB := common.RDB
-	previousMaster, previousMemory, previousSQLite := common.IsMasterNode, common.MemoryCacheEnabled, common.SQLitePath
+	previousMaster, previousMemory := common.IsMasterNode, common.MemoryCacheEnabled
 	previousEnabled := setting.ModelRequestRateLimitEnabled
 	previousDuration := setting.ModelRequestRateLimitDurationMinutes
 	previousTotal := setting.ModelRequestRateLimitCount
@@ -55,30 +49,12 @@ func setupResponsesWSRequestTest(t *testing.T) (*model.User, *model.Token) {
 	previousGroups := setting.ModelRequestRateLimitGroup
 	setting.ModelRequestRateLimitGroup = nil
 	setting.ModelRequestRateLimitMutex.Unlock()
-	t.Setenv("SQL_DSN", os.Getenv("TEST_RESPONSES_SQL_DSN"))
-	t.Setenv("LOG_SQL_DSN", os.Getenv("TEST_RESPONSES_LOG_SQL_DSN"))
 	common.IsMasterNode, common.MemoryCacheEnabled, common.RedisEnabled = false, false, false
-	common.SQLitePath = filepath.Join(t.TempDir(), "responses.db")
-	require.NoError(t, model.InitDB())
-	db := model.DB
-	sqlDB, err := db.DB()
-	require.NoError(t, err)
-	sqlDB.SetMaxOpenConns(1)
-	require.NoError(t, model.InitLogDB())
-	if model.LOG_DB != db {
-		logSQL, err := model.LOG_DB.DB()
-		require.NoError(t, err)
-		logSQL.SetMaxOpenConns(1)
-		t.Cleanup(func() { require.NoError(t, logSQL.Close()) })
-	}
 	setting.ModelRequestRateLimitEnabled = false
 	t.Cleanup(func() {
-		model.DB = previousDB
-		model.LOG_DB = previousLogDB
-		common.SetDatabaseTypes(previousType, previousLogType)
 		common.RedisEnabled = previousRedis
 		common.RDB = previousRDB
-		common.IsMasterNode, common.MemoryCacheEnabled, common.SQLitePath = previousMaster, previousMemory, previousSQLite
+		common.IsMasterNode, common.MemoryCacheEnabled = previousMaster, previousMemory
 		setting.ModelRequestRateLimitEnabled = previousEnabled
 		setting.ModelRequestRateLimitDurationMinutes = previousDuration
 		setting.ModelRequestRateLimitCount = previousTotal
@@ -86,8 +62,13 @@ func setupResponsesWSRequestTest(t *testing.T) (*model.User, *model.Token) {
 		setting.ModelRequestRateLimitMutex.Lock()
 		setting.ModelRequestRateLimitGroup = previousGroups
 		setting.ModelRequestRateLimitMutex.Unlock()
-		require.NoError(t, sqlDB.Close())
 	})
+	// The accounting assertions read consume logs back in insertion order, so
+	// the log database is the primary database. UseTestDatabases restores
+	// LOG_DB and the log database type.
+	db := model.UseTestDatabases(t)
+	model.LOG_DB = db
+	common.SetLogDatabaseType(common.DatabaseTypePostgreSQL)
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}))
 	// The shared in-memory limiter outlives each database fixture. Give every
 	// user a separate quota bucket, including when the tests run with -count.
@@ -871,8 +852,6 @@ func TestResponsesWebSocketInitialUpstreamRejectionRefundsReservation(t *testing
 	}
 }
 
-// TEST_RESPONSES_SQL_DSN / TEST_RESPONSES_LOG_SQL_DSN optionally run these
-// entry-point regressions against isolated real MySQL/PostgreSQL databases.
 func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 	for _, transport := range []string{"websocket", "http-sse"} {
 		for _, tc := range []struct {

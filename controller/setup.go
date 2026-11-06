@@ -36,7 +36,7 @@ func GetSetup(c *gin.Context) {
 		return
 	}
 	setup.RootInit = model.RootUserExists()
-	setup.DatabaseType = string(common.MainDatabaseType())
+	setup.DatabaseType = string(common.DatabaseTypePostgreSQL)
 	c.JSON(200, gin.H{
 		"success": true,
 		"data":    setup,

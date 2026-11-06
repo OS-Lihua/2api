@@ -24,12 +24,10 @@ import (
 func setupOriginTaskDB(t *testing.T) {
 	t.Helper()
 	previousDB := model.DB
-	previousType := common.MainDatabaseType()
 	database := model.UseTestDatabases(t)
 	require.NoError(t, database.AutoMigrate(&model.Task{}, &model.Channel{}))
 	t.Cleanup(func() {
 		model.DB = previousDB
-		common.SetMainDatabaseType(previousType)
 	})
 }
 

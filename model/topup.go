@@ -148,14 +148,9 @@ func UpdatePendingTopUpStatus(tradeNo string, expectedPaymentProvider string, ta
 		return errors.New("payment order number not provided")
 	}
 
-	refCol := "`trade_no`"
-	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		refCol = `"trade_no"`
-	}
-
 	return DB.Transaction(func(tx *gorm.DB) error {
 		topUp := &TopUp{}
-		if err := lockForUpdate(tx).Where(refCol+" = ?", tradeNo).First(topUp).Error; err != nil {
+		if err := lockForUpdate(tx).Where(`"trade_no" = ?`, tradeNo).First(topUp).Error; err != nil {
 			return ErrTopUpNotFound
 		}
 		if expectedPaymentProvider != "" && topUp.PaymentProvider != expectedPaymentProvider {
@@ -179,15 +174,10 @@ func RechargeEpay(tradeNo string, actualPaymentMethod string, callerIp string) (
 		return false, errors.New("payment order number not provided")
 	}
 
-	refCol := "`trade_no`"
-	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		refCol = `"trade_no"`
-	}
-
 	var quotaToAdd int
 	topUp := &TopUp{}
 	err = DB.Transaction(func(tx *gorm.DB) error {
-		if err := lockForUpdate(tx).Where(refCol+" = ?", tradeNo).First(topUp).Error; err != nil {
+		if err := lockForUpdate(tx).Where(`"trade_no" = ?`, tradeNo).First(topUp).Error; err != nil {
 			return ErrTopUpNotFound
 		}
 		if topUp.PaymentProvider != PaymentProviderEpay {
@@ -241,13 +231,8 @@ func Recharge(referenceId string, customerId string, callerIp string) (err error
 	var quota int
 	topUp := &TopUp{}
 
-	refCol := "`trade_no`"
-	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		refCol = `"trade_no"`
-	}
-
 	err = DB.Transaction(func(tx *gorm.DB) error {
-		err := lockForUpdate(tx).Where(refCol+" = ?", referenceId).First(topUp).Error
+		err := lockForUpdate(tx).Where(`"trade_no" = ?`, referenceId).First(topUp).Error
 		if err != nil {
 			return errors.New("top-up order not found")
 		}
@@ -452,11 +437,6 @@ func ManualCompleteTopUp(tradeNo string, callerIp string) error {
 		return common.NewMessage("Order number not provided")
 	}
 
-	refCol := "`trade_no`"
-	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		refCol = `"trade_no"`
-	}
-
 	var userId int
 	var quotaToAdd int
 	var payMoney float64
@@ -465,7 +445,7 @@ func ManualCompleteTopUp(tradeNo string, callerIp string) error {
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		topUp := &TopUp{}
 		// 行级锁，避免并发补单
-		if err := lockForUpdate(tx).Where(refCol+" = ?", tradeNo).First(topUp).Error; err != nil {
+		if err := lockForUpdate(tx).Where(`"trade_no" = ?`, tradeNo).First(topUp).Error; err != nil {
 			return common.NewMessage("Top-up order does not exist")
 		}
 
@@ -530,13 +510,8 @@ func RechargeCreem(referenceId string, customerEmail string, customerName string
 	var quota int
 	topUp := &TopUp{}
 
-	refCol := "`trade_no`"
-	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		refCol = `"trade_no"`
-	}
-
 	err = DB.Transaction(func(tx *gorm.DB) error {
-		err := lockForUpdate(tx).Where(refCol+" = ?", referenceId).First(topUp).Error
+		err := lockForUpdate(tx).Where(`"trade_no" = ?`, referenceId).First(topUp).Error
 		if err != nil {
 			return errors.New("top-up order not found")
 		}
@@ -602,13 +577,8 @@ func RechargeWaffo(tradeNo string, callerIp string) (err error) {
 	var quotaToAdd int
 	topUp := &TopUp{}
 
-	refCol := "`trade_no`"
-	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		refCol = `"trade_no"`
-	}
-
 	err = DB.Transaction(func(tx *gorm.DB) error {
-		err := lockForUpdate(tx).Where(refCol+" = ?", tradeNo).First(topUp).Error
+		err := lockForUpdate(tx).Where(`"trade_no" = ?`, tradeNo).First(topUp).Error
 		if err != nil {
 			return errors.New("top-up order not found")
 		}
@@ -662,13 +632,8 @@ func RechargeWaffoPancake(tradeNo string) (err error) {
 	var quotaToAdd int
 	topUp := &TopUp{}
 
-	refCol := "`trade_no`"
-	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		refCol = `"trade_no"`
-	}
-
 	err = DB.Transaction(func(tx *gorm.DB) error {
-		err := lockForUpdate(tx).Where(refCol+" = ?", tradeNo).First(topUp).Error
+		err := lockForUpdate(tx).Where(`"trade_no" = ?`, tradeNo).First(topUp).Error
 		if err != nil {
 			return errors.New("top-up order not found")
 		}

@@ -28,7 +28,6 @@ func setupDashboardAuthMiddlewareTest(t *testing.T) {
 	t.Helper()
 	previousDB := model.DB
 	previousLogDB := model.LOG_DB
-	previousType := common.MainDatabaseType()
 	previousRedis := common.RedisEnabled
 	previousSecret := common.SessionSecret
 	db := model.UseTestDatabases(t)
@@ -39,7 +38,6 @@ func setupDashboardAuthMiddlewareTest(t *testing.T) {
 	t.Cleanup(func() {
 		model.DB = previousDB
 		model.LOG_DB = previousLogDB
-		common.SetMainDatabaseType(previousType)
 		common.RedisEnabled = previousRedis
 		common.SessionSecret = previousSecret
 	})

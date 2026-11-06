@@ -1,7 +1,6 @@
 package model
 
 import (
-	"os"
 	"strings"
 	"testing"
 
@@ -48,22 +47,30 @@ func TestNormalizeClickHouseDSN(t *testing.T) {
 	assert.Equal(t, "tcp://localhost:9000/logs", normalizeClickHouseDSN("tcp://localhost:9000/logs"))
 }
 
-func TestChooseDBRejectsClickHouseForMainDatabase(t *testing.T) {
-	original, had := os.LookupEnv("SQL_DSN")
-	t.Cleanup(func() {
-		if had {
-			require.NoError(t, os.Setenv("SQL_DSN", original))
-		} else {
-			require.NoError(t, os.Unsetenv("SQL_DSN"))
-		}
-	})
-	require.NoError(t, os.Setenv("SQL_DSN", "clickhouse://default:pass@localhost:9000/logs"))
-
-	db, dbType, err := chooseDB("SQL_DSN", false)
-	require.Error(t, err)
-	assert.Nil(t, db)
-	assert.Equal(t, common.DatabaseType(""), dbType)
-	assert.Contains(t, err.Error(), "does not support ClickHouse")
+func TestOpenDSNRejectsUnsupportedDatabases(t *testing.T) {
+	cases := []struct {
+		name    string
+		envName string
+		dsn     string
+		isLog   bool
+		want    string
+	}{
+		{"primary unset", "SQL_DSN", "", false, "SQL_DSN is not set"},
+		{"primary MySQL", "SQL_DSN", "root:pass@tcp(localhost:3306)/db", false, "SQL_DSN must be a PostgreSQL DSN"},
+		{"primary SQLite", "SQL_DSN", "local", false, "SQL_DSN must be a PostgreSQL DSN"},
+		{"primary ClickHouse", "SQL_DSN", "clickhouse://default:pass@localhost:9000/logs", false, "SQL_DSN does not support ClickHouse"},
+		{"log MySQL", "LOG_SQL_DSN", "root:pass@tcp(localhost:3306)/logs", true, "LOG_SQL_DSN must be a PostgreSQL (postgres://) or ClickHouse (clickhouse://) DSN"},
+		{"log SQLite", "LOG_SQL_DSN", "logs.db", true, "LOG_SQL_DSN must be a PostgreSQL (postgres://) or ClickHouse (clickhouse://) DSN"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			db, dbType, err := OpenDSN(c.envName, c.dsn, c.isLog)
+			require.Error(t, err)
+			assert.Nil(t, db)
+			assert.Equal(t, common.DatabaseType(""), dbType)
+			assert.Contains(t, err.Error(), c.want)
+		})
+	}
 }
 
 func TestClickHouseLogTTLExpression(t *testing.T) {
@@ -106,7 +113,7 @@ func TestBuildLogLikeConditionUsesStandardEscape(t *testing.T) {
 	t.Cleanup(func() {
 		common.SetLogDatabaseType(originalLogDatabaseType)
 	})
-	common.SetLogDatabaseType(common.DatabaseTypeSQLite)
+	common.SetLogDatabaseType(common.DatabaseTypePostgreSQL)
 
 	condition, pattern, err := buildLogLikeCondition("logs.model_name", "gpt_4%")
 

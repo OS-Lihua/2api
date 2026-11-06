@@ -655,7 +655,6 @@ func setupAuthFlowControllerTest(t *testing.T) *authFlowTestOAuthProvider {
 	previousDB, previousLogDB := model.DB, model.LOG_DB
 	previousRedis := common.RedisEnabled
 	common.RedisEnabled = false
-	previousType := common.MainDatabaseType()
 	db := model.UseTestDatabases(t)
 	require.NoError(t, db.AutoMigrate(&model.AuthFlow{}, &model.User{}, &model.UserSession{}, &model.AuditLog{}))
 	provider := &authFlowTestOAuthProvider{}
@@ -664,7 +663,6 @@ func setupAuthFlowControllerTest(t *testing.T) *authFlowTestOAuthProvider {
 		oauth.Unregister("auth-flow-test")
 		model.DB, model.LOG_DB = previousDB, previousLogDB
 		common.RedisEnabled = previousRedis
-		common.SetMainDatabaseType(previousType)
 	})
 	return provider
 }

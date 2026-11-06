@@ -320,7 +320,7 @@ func TestModelPricingIssuesFollowPluginChanges(t *testing.T) {
 	require.NoError(t, DB.AutoMigrate(&Option{}))
 	saved := config.GlobalConfig.ExportAllConfigs()
 	t.Cleanup(func() {
-		require.NoError(t, DB.Where(commonKeyCol+" IN ?", modelPricingOptionKeys).Delete(&Option{}).Error)
+		require.NoError(t, DB.Where(`"key" IN ?`, modelPricingOptionKeys).Delete(&Option{}).Error)
 		require.NoError(t, config.GlobalConfig.LoadFromDB(saved))
 	})
 	pluginSource := func(key, name, version, models, usageSchema string) string {

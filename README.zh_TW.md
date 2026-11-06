@@ -148,18 +148,26 @@ New API 是面向應用程式、Agent 和團隊的自託管 AI 閘道。將不�
 
 ### 使用 Docker 本機體驗
 
-以下指令使用 SQLite 啟動單一執行個體，僅監聽本機連接埠：
+New API 使用 PostgreSQL 14 以上版本儲存資料。以下指令啟動 PostgreSQL 和一個僅監聽本機連接埠的單一執行個體：
 
 ```bash
-mkdir -p data
+docker network create new-api
+docker run --name new-api-postgres -d --restart unless-stopped \
+  --network new-api \
+  -e POSTGRES_USER=root \
+  -e POSTGRES_PASSWORD=change-me \
+  -e POSTGRES_DB=new-api \
+  -v new-api-pg:/var/lib/postgresql/data \
+  postgres:15
 docker run --name new-api -d --restart unless-stopped \
+  --network new-api \
   -p 127.0.0.1:3000:3000 \
   -e TZ=Asia/Shanghai \
-  -v "$(pwd)/data:/data" \
+  -e SQL_DSN=postgresql://root:change-me@new-api-postgres:5432/new-api \
   calciumion/new-api:latest
 ```
 
-開啟 [http://localhost:3000](http://localhost:3000)，依初始化精靈建立管理員帳號。SQLite 資料庫存放在掛載的 `data` 目錄中，更換容器後仍會保留。
+開啟 [http://localhost:3000](http://localhost:3000)，依初始化精靈建立管理員帳號。資料庫存放在 `new-api-pg` 資料卷中，更換容器後仍會保留。
 
 ### 發起第一次請求
 
@@ -190,7 +198,7 @@ curl --fail-with-body http://localhost:3000/v1/responses \
 
 ### Docker Compose
 
-儲存庫的 [Compose 設定](./docker-compose.yml) 預設啟動 **New API + PostgreSQL + Redis**，並提供 MySQL 和獨立 ClickHouse 日誌資料庫的設定範例。
+儲存庫的 [Compose 設定](./docker-compose.yml) 預設啟動 **New API + PostgreSQL + Redis**，並提供獨立 PostgreSQL 或 ClickHouse 日誌資料庫的設定範例。
 
 ```bash
 git clone https://github.com/QuantumNous/new-api.git
@@ -208,15 +216,15 @@ docker compose logs -f new-api
 
 | 元件 | 可選方案 |
 | --- | --- |
-| 主資料庫 | SQLite、MySQL ≥ 5.7.8、PostgreSQL ≥ 9.6 |
-| 獨立日誌資料庫 | 透過 `LOG_SQL_DSN` 設定，額外支援 ClickHouse |
+| 主資料庫 | PostgreSQL ≥ 14 |
+| 獨立日誌資料庫 | 透過 `LOG_SQL_DSN` 設定，支援 PostgreSQL 或 ClickHouse |
 | 快取 | 可選 Redis 與記憶體快取；多節點需要共享限流額度時使用共享 Redis |
 | 容器平台 | Linux amd64 / arm64 |
 
 | 環境變數 | 用途 |
 | --- | --- |
-| `SQL_DSN` | 主資料庫連線字串；未設定時使用 SQLite |
-| `LOG_SQL_DSN` | 可選的獨立日誌資料庫連線字串 |
+| `SQL_DSN` | 主資料庫的 PostgreSQL 連線字串，必填 |
+| `LOG_SQL_DSN` | 可選的獨立日誌資料庫連線字串；未設定時使用主資料庫 |
 | `REDIS_CONN_STRING` | Redis 連線字串 |
 | `SESSION_SECRET` | 持久保存的驗證金鑰，所有節點必須一致 |
 | `CRYPTO_SECRET` | 預設使用 `SESSION_SECRET`；共享 Redis 的節點必須使用相同的有效值 |
@@ -264,7 +272,6 @@ bun run dev -- --port 5173
 | [relaykit/](./relaykit/README.md) | 可獨立建置的協定 DTO 與轉換 Go 模組 |
 | [plugins/tasks/](./plugins/tasks/) | JavaScript 任務外掛；編寫方式與宿主邊界見 [Task Plugin API v1](./docs/plugin-api/v1.md) |
 | `web/` | Web 控制台，參閱[前端開發約定](./web/AGENTS.md) |
-| [electron/](./electron/README.md) | 桌面封裝與打包 |
 
 貢獻前請閱讀 [AGENTS.md](./AGENTS.md)。依改動範圍執行檢查：Go 模組使用 `make test`；前端在 `web/` 下執行 `bun check -b`、`bun run lint`、`bun run test` 和 `bun run build`。修改 RelayKit 後還必須在 `relaykit/` 下執行 `GOWORK=off go build ./...`。
 

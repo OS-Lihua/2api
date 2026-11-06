@@ -64,7 +64,7 @@ func GetChannelPriorityOrder() (ChannelPriorityOrder, error) {
 
 // ReorderChannelPriority updates only priorities, including the routing copy in
 // abilities. A snapshot check also protects preview/commit and undo from stale
-// clients; row locks serialize concurrent reorders on MySQL and PostgreSQL.
+// clients; row locks serialize concurrent reorders.
 func ReorderChannelPriority(move ChannelPriorityMove) (ChannelPriorityOrder, error) {
 	result := ChannelPriorityOrder{Items: []ChannelPriority{}, Changes: []ChannelPriorityChange{}}
 	err := DB.Transaction(func(tx *gorm.DB) error {

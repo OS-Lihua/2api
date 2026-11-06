@@ -168,18 +168,26 @@ This README describes the current source tree. Check the release notes for the v
 
 ### Try locally with Docker
 
-This starts a single instance with SQLite and binds it to localhost:
+New API stores its data in PostgreSQL 14 or later. These commands start PostgreSQL and a single instance bound to localhost:
 
 ```bash
-mkdir -p data
+docker network create new-api
+docker run --name new-api-postgres -d --restart unless-stopped \
+  --network new-api \
+  -e POSTGRES_USER=root \
+  -e POSTGRES_PASSWORD=change-me \
+  -e POSTGRES_DB=new-api \
+  -v new-api-pg:/var/lib/postgresql/data \
+  postgres:15
 docker run --name new-api -d --restart unless-stopped \
+  --network new-api \
   -p 127.0.0.1:3000:3000 \
   -e TZ=Asia/Shanghai \
-  -v "$(pwd)/data:/data" \
+  -e SQL_DSN=postgresql://root:change-me@new-api-postgres:5432/new-api \
   calciumion/new-api:latest
 ```
 
-Open [http://localhost:3000](http://localhost:3000) and complete the setup wizard to create the administrator account. The `data` directory persists the SQLite database across container replacements.
+Open [http://localhost:3000](http://localhost:3000) and complete the setup wizard to create the administrator account. The `new-api-pg` volume keeps the database across container replacements.
 
 ### Make your first request
 
@@ -210,7 +218,7 @@ curl --fail-with-body http://localhost:3000/v1/responses \
 
 ### Docker Compose
 
-The repository's [Compose configuration](./docker-compose.yml) starts **New API + PostgreSQL + Redis** by default. It also contains examples for MySQL and a separate ClickHouse log database.
+The repository's [Compose configuration](./docker-compose.yml) starts **New API + PostgreSQL + Redis** by default. It also contains examples for a separate PostgreSQL or ClickHouse log database.
 
 ```bash
 git clone https://github.com/QuantumNous/new-api.git
@@ -228,15 +236,15 @@ docker compose logs -f new-api
 
 | Component | Options |
 | --- | --- |
-| Main database | SQLite, MySQL ≥ 5.7.8, or PostgreSQL ≥ 9.6 |
-| Separate log database | Configure with `LOG_SQL_DSN`; also supports ClickHouse |
+| Main database | PostgreSQL ≥ 14 |
+| Separate log database | Configure with `LOG_SQL_DSN`; PostgreSQL or ClickHouse |
 | Cache | Optional Redis plus in-memory caching; use shared Redis when application nodes need shared rate limits |
 | Container platforms | Linux amd64 / arm64 |
 
 | Variable | Purpose |
 | --- | --- |
-| `SQL_DSN` | Main database connection; unset uses SQLite |
-| `LOG_SQL_DSN` | Optional separate log database connection |
+| `SQL_DSN` | Required PostgreSQL connection for the main database |
+| `LOG_SQL_DSN` | Optional separate log database connection; unset uses the main database |
 | `REDIS_CONN_STRING` | Redis connection string |
 | `SESSION_SECRET` | Persistent authentication secret; all nodes must use the same value |
 | `CRYPTO_SECRET` | Defaults to `SESSION_SECRET`; nodes sharing Redis must use the same effective value |
@@ -284,7 +292,6 @@ Open [http://localhost:5173](http://localhost:5173); the development server prox
 | [relaykit/](./relaykit/README.md) | Independently buildable Go module for protocol DTOs and conversions |
 | [plugins/tasks/](./plugins/tasks/) | JavaScript task plugins; see [Task Plugin API v1](./docs/plugin-api/v1.md) for authoring and host boundaries |
 | `web/` | Web console; see [frontend conventions](./web/AGENTS.md) |
-| [electron/](./electron/README.md) | Desktop wrapper and packaging |
 
 Read [AGENTS.md](./AGENTS.md) before contributing. Run checks appropriate to your change, including `make test` for the Go modules and `bun check -b`, `bun run lint`, `bun run test`, and `bun run build` in `web/` for frontend changes. Changes to RelayKit must also pass `GOWORK=off go build ./...` from `relaykit/`.
 

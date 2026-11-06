@@ -34,50 +34,24 @@ func setupManageUserTestDB(t *testing.T) *gorm.DB {
 	require.NoError(t, i18n.Init())
 	previousDB, previousLogDB := model.DB, model.LOG_DB
 	previousRedisEnabled, previousSecret := common.RedisEnabled, common.SessionSecret
-	previousMainDatabaseType, previousLogDatabaseType := common.MainDatabaseType(), common.LogDatabaseType()
-	dialect := os.Getenv("TEST_MANAGE_USER_DIALECT")
-	if dialect == "" {
-		dialect = "sqlite"
-	}
-	databaseTypes := map[string]common.DatabaseType{
-		"sqlite": common.DatabaseTypeSQLite, "mysql": common.DatabaseTypeMySQL, "postgres": common.DatabaseTypePostgreSQL,
-	}
-	require.Contains(t, databaseTypes, dialect)
-	dsn := os.Getenv("TEST_" + strings.ToUpper(dialect) + "_DSN")
-	db, _ := newAuditTestDatabase(t, dialect, dsn)
+	previousLogDatabaseType := common.LogDatabaseType()
+	db, _ := newAuditTestDatabase(t, "postgres")
 	logDB := db
 	if os.Getenv("TEST_MANAGE_USER_SEPARATE_LOG_DB") == "1" {
-		logDB, _ = newAuditTestDatabase(t, dialect, dsn)
+		logDB, _ = newAuditTestDatabase(t, "postgres")
 	}
 	model.DB, model.LOG_DB = db, logDB
 	common.RedisEnabled = false
 	common.SessionSecret = "manage-user-test-secret"
-	common.SetDatabaseTypes(databaseTypes[dialect], databaseTypes[dialect])
+	common.SetLogDatabaseType(common.DatabaseTypePostgreSQL)
 
 	t.Cleanup(func() {
 		model.DB, model.LOG_DB = previousDB, previousLogDB
 		common.RedisEnabled, common.SessionSecret = previousRedisEnabled, previousSecret
-		common.SetDatabaseTypes(previousMainDatabaseType, previousLogDatabaseType)
-		sqlDB, err := db.DB()
-		if err == nil {
-			_ = sqlDB.Close()
-		}
-		if logDB != db {
-			sqlLogDB, err := logDB.DB()
-			if err == nil {
-				_ = sqlLogDB.Close()
-			}
-		}
+		common.SetLogDatabaseType(previousLogDatabaseType)
 	})
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.AuthFlow{}, &model.TwoFA{}, &model.PasskeyCredential{}, &model.UserAccessToken{}))
 	require.NoError(t, logDB.AutoMigrate(&model.Log{}, &model.AuditLog{}))
-	versionQuery := "SELECT version()"
-	if dialect == "sqlite" {
-		versionQuery = "SELECT sqlite_version()"
-	}
-	var version string
-	require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
-	t.Logf("database: %s %s, separate log database: %v", dialect, version, logDB != db)
 	return db
 }
 
@@ -551,18 +525,13 @@ func TestManageUserQuotaConcurrentSnapshots(t *testing.T) {
 	var committed []model.UserQuotaAdjustment
 	for range 2 {
 		result := <-results
-		if result.err != nil {
-			require.True(t, common.UsingMainDatabase(common.DatabaseTypeSQLite), "row-locking databases must serialize both adjustments: %v", result.err)
-			assert.Contains(t, strings.ToLower(result.err.Error()), "locked")
-			assert.Nil(t, result.adjustment)
-			continue
-		}
+		require.NoError(t, result.err, "row locks must serialize both adjustments")
 		require.NotNil(t, result.adjustment)
 		assert.Equal(t, result.value, result.adjustment.After-result.adjustment.Before)
 		committed = append(committed, *result.adjustment)
 	}
 	require.NoError(t, db.Callback().Query().Remove("test:concurrent_quota_start"))
-	require.NotEmpty(t, committed)
+	require.Len(t, committed, 2)
 	sort.Slice(committed, func(i, j int) bool { return committed[i].Before < committed[j].Before })
 	balance := 1000
 	for _, adjustment := range committed {

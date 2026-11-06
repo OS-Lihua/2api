@@ -107,9 +107,6 @@ func migratePrefillGroupUniqueness(db *gorm.DB) error {
 	if db == nil {
 		return fmt.Errorf("migrate prefill group uniqueness: database is nil")
 	}
-	if db.Dialector.Name() != "postgres" {
-		return nil
-	}
 
 	statement := &gorm.Statement{DB: db}
 	if err := statement.Parse(&PrefillGroup{}); err != nil {

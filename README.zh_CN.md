@@ -164,18 +164,26 @@ New API 是面向应用、Agent 和团队的自托管 AI 网关。将不同厂�
 
 ### 使用 Docker 本地体验
 
-以下命令使用 SQLite 启动单实例，仅监听本机端口：
+New API 使用 PostgreSQL 14 及以上版本存储数据。以下命令启动 PostgreSQL 和一个仅监听本机端口的单实例：
 
 ```bash
-mkdir -p data
+docker network create new-api
+docker run --name new-api-postgres -d --restart unless-stopped \
+  --network new-api \
+  -e POSTGRES_USER=root \
+  -e POSTGRES_PASSWORD=change-me \
+  -e POSTGRES_DB=new-api \
+  -v new-api-pg:/var/lib/postgresql/data \
+  postgres:15
 docker run --name new-api -d --restart unless-stopped \
+  --network new-api \
   -p 127.0.0.1:3000:3000 \
   -e TZ=Asia/Shanghai \
-  -v "$(pwd)/data:/data" \
+  -e SQL_DSN=postgresql://root:change-me@new-api-postgres:5432/new-api \
   calciumion/new-api:latest
 ```
 
-打开 [http://localhost:3000](http://localhost:3000)，按初始化向导创建管理员账号。SQLite 数据库存放在挂载的 `data` 目录中，更换容器后仍会保留。
+打开 [http://localhost:3000](http://localhost:3000)，按初始化向导创建管理员账号。数据库存放在 `new-api-pg` 数据卷中，更换容器后仍会保留。
 
 ### 发起第一次请求
 
@@ -206,7 +214,7 @@ curl --fail-with-body http://localhost:3000/v1/responses \
 
 ### Docker Compose
 
-仓库的 [Compose 配置](./docker-compose.yml) 默认启动 **New API + PostgreSQL + Redis**，并提供 MySQL 和独立 ClickHouse 日志库的配置示例。
+仓库的 [Compose 配置](./docker-compose.yml) 默认启动 **New API + PostgreSQL + Redis**，并提供独立 PostgreSQL 或 ClickHouse 日志库的配置示例。
 
 ```bash
 git clone https://github.com/QuantumNous/new-api.git
@@ -224,15 +232,15 @@ docker compose logs -f new-api
 
 | 组件 | 可选方案 |
 | --- | --- |
-| 主数据库 | SQLite、MySQL ≥ 5.7.8、PostgreSQL ≥ 9.6 |
-| 独立日志库 | 通过 `LOG_SQL_DSN` 配置，额外支持 ClickHouse |
+| 主数据库 | PostgreSQL ≥ 14 |
+| 独立日志库 | 通过 `LOG_SQL_DSN` 配置，支持 PostgreSQL 或 ClickHouse |
 | 缓存 | 可选 Redis 与内存缓存；多节点需要共享限流额度时使用共享 Redis |
 | 容器平台 | Linux amd64 / arm64 |
 
 | 环境变量 | 用途 |
 | --- | --- |
-| `SQL_DSN` | 主数据库连接串；未设置时使用 SQLite |
-| `LOG_SQL_DSN` | 可选的独立日志数据库连接串 |
+| `SQL_DSN` | 主数据库的 PostgreSQL 连接串，必填 |
+| `LOG_SQL_DSN` | 可选的独立日志数据库连接串；未设置时使用主数据库 |
 | `REDIS_CONN_STRING` | Redis 连接串 |
 | `SESSION_SECRET` | 持久保存的鉴权密钥，所有节点必须一致 |
 | `CRYPTO_SECRET` | 默认使用 `SESSION_SECRET`；共享 Redis 的节点必须使用相同的有效值 |
@@ -280,7 +288,6 @@ bun run dev -- --port 5173
 | [relaykit/](./relaykit/README.md) | 可独立构建的协议 DTO 与转换 Go 模块 |
 | [plugins/tasks/](./plugins/tasks/) | JavaScript 任务插件；编写方式与宿主边界见 [Task Plugin API v1](./docs/plugin-api/v1.md) |
 | `web/` | Web 控制台，参阅[前端开发约定](./web/AGENTS.md) |
-| [electron/](./electron/README.md) | 桌面封装与打包 |
 
 贡献前请阅读 [AGENTS.md](./AGENTS.md)。按改动范围执行检查：Go 模块使用 `make test`；前端在 `web/` 下运行 `bun check -b`、`bun run lint`、`bun run test` 和 `bun run build`。修改 RelayKit 后还必须在 `relaykit/` 下执行 `GOWORK=off go build ./...`。
 

@@ -149,18 +149,26 @@ Ce README décrit le code source actuel. Consultez les notes de la version que v
 
 ### Essai local avec Docker
 
-Cette commande démarre une instance SQLite accessible uniquement depuis la machine locale :
+New API stocke ses données dans PostgreSQL 14 ou une version ultérieure. Ces commandes démarrent PostgreSQL et une instance accessible uniquement depuis la machine locale :
 
 ```bash
-mkdir -p data
+docker network create new-api
+docker run --name new-api-postgres -d --restart unless-stopped \
+  --network new-api \
+  -e POSTGRES_USER=root \
+  -e POSTGRES_PASSWORD=change-me \
+  -e POSTGRES_DB=new-api \
+  -v new-api-pg:/var/lib/postgresql/data \
+  postgres:15
 docker run --name new-api -d --restart unless-stopped \
+  --network new-api \
   -p 127.0.0.1:3000:3000 \
   -e TZ=Asia/Shanghai \
-  -v "$(pwd)/data:/data" \
+  -e SQL_DSN=postgresql://root:change-me@new-api-postgres:5432/new-api \
   calciumion/new-api:latest
 ```
 
-Ouvrez [http://localhost:3000](http://localhost:3000) et suivez l'assistant pour créer le compte administrateur. Le répertoire `data` conserve la base SQLite lors du remplacement du conteneur.
+Ouvrez [http://localhost:3000](http://localhost:3000) et suivez l'assistant pour créer le compte administrateur. Le volume `new-api-pg` conserve la base de données lors du remplacement du conteneur.
 
 ### Première requête
 
@@ -191,7 +199,7 @@ curl --fail-with-body http://localhost:3000/v1/responses \
 
 ### Docker Compose
 
-La [configuration Compose](./docker-compose.yml) du dépôt démarre **New API + PostgreSQL + Redis** par défaut. Elle contient aussi des exemples pour MySQL et une base de journaux ClickHouse distincte.
+La [configuration Compose](./docker-compose.yml) du dépôt démarre **New API + PostgreSQL + Redis** par défaut. Elle contient aussi des exemples de base de journaux distincte, PostgreSQL ou ClickHouse.
 
 ```bash
 git clone https://github.com/QuantumNous/new-api.git
@@ -209,15 +217,15 @@ docker compose logs -f new-api
 
 | Composant | Options |
 | --- | --- |
-| Base principale | SQLite, MySQL ≥ 5.7.8 ou PostgreSQL ≥ 9.6 |
-| Base de journaux distincte | Configurée avec `LOG_SQL_DSN` ; prend aussi en charge ClickHouse |
+| Base principale | PostgreSQL ≥ 14 |
+| Base de journaux distincte | Configurée avec `LOG_SQL_DSN` ; PostgreSQL ou ClickHouse |
 | Cache | Redis facultatif et cache mémoire ; partagez Redis si les nœuds doivent partager les limites de débit |
 | Plateformes des conteneurs | Linux amd64 / arm64 |
 
 | Variable | Rôle |
 | --- | --- |
-| `SQL_DSN` | Connexion à la base principale ; SQLite si non définie |
-| `LOG_SQL_DSN` | Connexion facultative à une base de journaux distincte |
+| `SQL_DSN` | Connexion PostgreSQL obligatoire à la base principale |
+| `LOG_SQL_DSN` | Connexion facultative à une base de journaux distincte ; la base principale si non définie |
 | `REDIS_CONN_STRING` | Chaîne de connexion Redis |
 | `SESSION_SECRET` | Secret d'authentification persistant, identique sur tous les nœuds |
 | `CRYPTO_SECRET` | Vaut `SESSION_SECRET` par défaut ; même valeur effective pour les nœuds partageant Redis |
@@ -265,7 +273,6 @@ Ouvrez [http://localhost:5173](http://localhost:5173) ; les requêtes API sont r
 | [relaykit/](./relaykit/README.md) | Module Go autonome pour les DTO et conversions de protocoles |
 | [plugins/tasks/](./plugins/tasks/) | Extensions de tâches JavaScript ; contrat et limites de l'hôte dans [Task Plugin API v1](./docs/plugin-api/v1.md) |
 | `web/` | Console web ; voir les [conventions frontend](./web/AGENTS.md) |
-| [electron/](./electron/README.md) | Application de bureau et packaging |
 
 Lisez [AGENTS.md](./AGENTS.md) avant de contribuer. Exécutez les vérifications adaptées : `make test` pour les modules Go ; `bun check -b`, `bun run lint`, `bun run test` et `bun run build` dans `web/` pour le frontend. Une modification de RelayKit nécessite aussi `GOWORK=off go build ./...` depuis `relaykit/`.
 

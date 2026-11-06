@@ -3,8 +3,6 @@ package controller
 import (
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -18,36 +16,19 @@ import (
 
 func setupChannelCreateTest(t *testing.T) int {
 	t.Helper()
-	previousDB, previousLogDB := model.DB, model.LOG_DB
-	previousType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
-	previousMaster, previousCache, previousRedis, previousSQLite := common.IsMasterNode, common.MemoryCacheEnabled, common.RedisEnabled, common.SQLitePath
+	previousMaster, previousCache, previousRedis := common.IsMasterNode, common.MemoryCacheEnabled, common.RedisEnabled
 	t.Cleanup(func() {
-		model.DB, model.LOG_DB = previousDB, previousLogDB
-		common.SetDatabaseTypes(previousType, previousLogType)
-		common.IsMasterNode, common.MemoryCacheEnabled, common.RedisEnabled, common.SQLitePath = previousMaster, previousCache, previousRedis, previousSQLite
+		common.IsMasterNode, common.MemoryCacheEnabled, common.RedisEnabled = previousMaster, previousCache, previousRedis
 	})
-	t.Setenv("SQL_DSN", os.Getenv("TEST_CHANNEL_SQL_DSN"))
-	t.Setenv("LOG_SQL_DSN", "")
 	common.IsMasterNode, common.MemoryCacheEnabled, common.RedisEnabled = false, false, false
-	common.SQLitePath = filepath.Join(t.TempDir(), "channel.db")
-	require.NoError(t, model.InitDB())
-	database := model.DB
-	sqlDB, err := database.DB()
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+	// UseTestDatabases restores LOG_DB and the log database type.
+	database := model.UseTestDatabases(t)
 	model.LOG_DB = database
-	common.SetLogDatabaseType(common.MainDatabaseType())
+	common.SetLogDatabaseType(common.DatabaseTypePostgreSQL)
 	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.User{}, &model.Log{}, &model.AuditLog{}))
 	root := &model.User{Username: "channel-create-review-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled}
 	require.NoError(t, database.Create(root).Error)
 	t.Cleanup(func() { require.NoError(t, database.Unscoped().Delete(root).Error) })
-	versionQuery := "SELECT VERSION()"
-	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
-		versionQuery = "SELECT sqlite_version()"
-	}
-	var version string
-	require.NoError(t, database.Raw(versionQuery).Scan(&version).Error)
-	t.Logf("database=%s version=%s", common.MainDatabaseType(), version)
 	return root.Id
 }
 
@@ -196,12 +177,8 @@ func TestAddChannelRollbackDoesNotReturnIDs(t *testing.T) {
 	rootID := setupChannelCreateTest(t)
 	// Force a real database error in the second chunk, after the first 50 rows
 	// received IDs. This constraint exists only in the isolated test database.
-	column := `"key"`
-	if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
-		column = "`key`(191)"
-	}
 	const indexName = "channel_create_test_unique_key"
-	require.NoError(t, model.DB.Exec("CREATE UNIQUE INDEX "+indexName+" ON channels ("+column+")").Error)
+	require.NoError(t, model.DB.Exec("CREATE UNIQUE INDEX "+indexName+` ON channels ("key")`).Error)
 	t.Cleanup(func() { require.NoError(t, model.DB.Migrator().DropIndex(&model.Channel{}, indexName)) })
 	keys := make([]string, 51)
 	for i := range keys[:50] {

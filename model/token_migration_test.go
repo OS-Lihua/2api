@@ -2,16 +2,11 @@ package model
 
 import (
 	"fmt"
-	"os"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/driver/mysql"
-	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -40,61 +35,8 @@ WHERE index_meta.indrelid = to_regclass(?)
 	require.EqualValues(t, 1, count)
 }
 
-func testTokenKeyMigrationNonPostgreSQL(t *testing.T, db *gorm.DB) {
-	t.Helper()
-	tableName := fmt.Sprintf("token_migration_%d", time.Now().UnixNano())
-	t.Cleanup(func() { _ = db.Migrator().DropTable(tableName) })
-
-	tableDB := db.Table(tableName)
-	require.NoError(t, tableDB.AutoMigrate(&Token{}))
-	require.NoError(t, tableDB.Create(&Token{UserId: 1, Key: "preserved-key"}).Error)
-
-	for range 2 {
-		require.NoError(t, migrateTokenKeyUniqueness(db))
-		require.NoError(t, tableDB.AutoMigrate(&Token{}))
-	}
-
-	var preserved Token
-	require.NoError(t, tableDB.Where(&Token{Key: "preserved-key"}).First(&preserved).Error)
-	assert.Equal(t, 1, preserved.UserId)
-	expectedIndex := db.NamingStrategy.IndexName(tableName, "key")
-	assert.True(t, db.Migrator().HasIndex(tableName, expectedIndex))
-}
-
-func TestMigrateTokenKeyUniquenessSQLite(t *testing.T) {
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
-	testTokenKeyMigrationNonPostgreSQL(t, db)
-}
-
-func TestMigrateTokenKeyUniquenessMySQL(t *testing.T) {
-	dsn := strings.TrimSpace(os.Getenv("TEST_MYSQL_DSN"))
-	if dsn == "" {
-		t.Skip("TEST_MYSQL_DSN is not configured")
-	}
-
-	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
-	require.NoError(t, err)
-	sqlDB, err := db.DB()
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
-	testTokenKeyMigrationNonPostgreSQL(t, db)
-}
-
-func TestMigrateTokenKeyUniquenessPostgreSQL(t *testing.T) {
-	dsn := strings.TrimSpace(os.Getenv("TEST_POSTGRES_DSN"))
-	if dsn == "" {
-		t.Skip("TEST_POSTGRES_DSN is not configured")
-	}
-
-	db, err := gorm.Open(postgres.New(postgres.Config{
-		DSN:                  dsn,
-		PreferSimpleProtocol: true,
-	}), &gorm.Config{})
-	require.NoError(t, err)
-	sqlDB, err := db.DB()
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+func TestMigrateTokenKeyUniqueness(t *testing.T) {
+	db := UseTestDatabases(t)
 
 	tests := []struct {
 		name                 string

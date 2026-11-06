@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -32,7 +31,6 @@ import (
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/gin-gonic/gin"
-	"github.com/glebarez/sqlite"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/pquerna/otp/totp"
 	"github.com/stretchr/testify/assert"
@@ -46,62 +44,29 @@ func setupSecurityEnrollmentTest(t *testing.T) (*model.User, service.AuthIdentit
 	require.NoError(t, i18n.Init())
 	gin.SetMode(gin.TestMode)
 	previousDB, previousLogDB := model.DB, model.LOG_DB
-	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	previousLog := common.LogDatabaseType()
 	previousRedis, previousSecret := common.RedisEnabled, common.SessionSecret
 	previousEncryption := common.PasswordLoginEncryptionEnabled
 	previousSettings := *system_setting.GetPasskeySettings()
-	dialect := os.Getenv("TEST_SECURITY_DIALECT")
-	if dialect == "" {
-		dialect = "sqlite"
-	}
-	dsn := os.Getenv("TEST_" + strings.ToUpper(dialect) + "_DSN")
-	var db *gorm.DB
-	if dialect == "sqlite" {
-		// Match common.SQLitePath: take the writer lock before transaction reads.
-		// Deferred transactions can fail to upgrade their read lock when concurrent
-		// proof consumption overlaps account deletion or session revocation.
-		var err error
-		db, err = gorm.Open(sqlite.Open(t.TempDir()+"/security.db?_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)&_txlock=immediate"), &gorm.Config{})
-		require.NoError(t, err)
-	} else {
-		db, _ = newAuditTestDatabase(t, dialect, dsn)
-	}
-	logDB, _ := newAuditTestDatabase(t, dialect, dsn)
+	db, _ := newAuditTestDatabase(t, "postgres")
+	logDB, _ := newAuditTestDatabase(t, "postgres")
 	db.Logger = logger.Default.LogMode(logger.Silent)
 	logDB.Logger = logger.Default.LogMode(logger.Silent)
-	versionQuery := "SELECT VERSION()"
-	if dialect == "sqlite" {
-		versionQuery = "SELECT sqlite_version()"
-	}
-	var version string
-	require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
-	t.Logf("database: %s %s", dialect, version)
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.TwoFA{}, &model.TwoFABackupCode{}, &model.PasskeyCredential{}, &model.AuthFlow{}, &model.UserOAuthBinding{}, &model.Option{}, &model.UserAccessToken{}))
 	require.NoError(t, logDB.AutoMigrate(&model.AuditLog{}))
 	model.DB, model.LOG_DB = db, logDB
 	require.NoError(t, model.EnsureLegacyAccessTokenRetireAt(time.Now().Unix()))
-	dbType := common.DatabaseTypeSQLite
-	if dialect == "mysql" {
-		dbType = common.DatabaseTypeMySQL
-	}
-	if dialect == "postgres" {
-		dbType = common.DatabaseTypePostgreSQL
-	}
-	common.SetDatabaseTypes(dbType, dbType)
+	common.SetLogDatabaseType(common.DatabaseTypePostgreSQL)
 	common.PasswordLoginEncryptionEnabled = false
 	common.RedisEnabled = false
 	common.SessionSecret = "security-enrollment-test-secret"
 	*system_setting.GetPasskeySettings() = system_setting.PasskeySettings{Enabled: true, RPID: "example.com", Origins: "https://example.com", RPDisplayName: "new-api"}
 	t.Cleanup(func() {
 		model.DB, model.LOG_DB = previousDB, previousLogDB
-		common.SetDatabaseTypes(previousMain, previousLog)
+		common.SetLogDatabaseType(previousLog)
 		common.RedisEnabled, common.SessionSecret = previousRedis, previousSecret
 		common.PasswordLoginEncryptionEnabled = previousEncryption
 		*system_setting.GetPasskeySettings() = previousSettings
-		connection, err := db.DB()
-		if err == nil {
-			_ = connection.Close()
-		}
 	})
 	password, err := common.Password2Hash("enrollment-password")
 	require.NoError(t, err)

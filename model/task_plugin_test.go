@@ -137,7 +137,7 @@ func TestTaskPluginSyncSnapshotRevisionTracksDesiredRuntimeState(t *testing.T) {
 	assert.NotEqual(t, v2Snapshot.Revision, disabled.Revision)
 }
 
-func TestTaskPluginOrderSQLQuotesMySQLKeyColumn(t *testing.T) {
+func TestTaskPluginOrderSQLQuotesKeyColumn(t *testing.T) {
 	db, err := gorm.Open(tests.DummyDialector{}, &gorm.Config{DryRun: true})
 	require.NoError(t, err)
 

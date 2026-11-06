@@ -14,7 +14,7 @@ import (
 // Conversion must understand both; reading only the map form made every model
 // with array-form metadata look like a broken routing configuration.
 func TestModelPricingConversionAcceptsDeclaredEndpointArray(t *testing.T) {
-	db := modelManagementDB(t, "sqlite", "")
+	db := modelManagementDB(t)
 	previousQuota := common.QuotaPerUnit
 	common.QuotaPerUnit = 500000
 	t.Cleanup(func() { common.QuotaPerUnit = previousQuota })

@@ -145,13 +145,6 @@ func NormalizeChannelGroupFilter(group string) string {
 	return group
 }
 
-func channelGroupFilterCondition() string {
-	if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
-		return `CONCAT(',', ` + commonGroupCol + `, ',') LIKE ? ESCAPE '!'`
-	}
-	return `(',' || ` + commonGroupCol + ` || ',') LIKE ? ESCAPE '!'`
-}
-
 func channelGroupFilterPattern(group string) string {
 	group = strings.NewReplacer(
 		"!", "!!",
@@ -166,7 +159,7 @@ func ApplyChannelGroupFilter(query *gorm.DB, group string) *gorm.DB {
 	if group == "" {
 		return query
 	}
-	return query.Where(channelGroupFilterCondition(), channelGroupFilterPattern(group))
+	return query.Where(`(',' || "group" || ',') LIKE ? ESCAPE '!'`, channelGroupFilterPattern(group))
 }
 
 // Value implements driver.Valuer interface
@@ -401,26 +394,13 @@ func GetChannelsByTag(tag string, idSort bool, selectAll bool, sortOptions ...Ch
 
 func SearchChannels(keyword string, group string, model string, idSort bool, sortOptions ...ChannelSortOptions) ([]*Channel, error) {
 	var channels []*Channel
-	modelsCol := "`models`"
-
-	// 如果是 PostgreSQL，使用双引号
-	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		modelsCol = `"models"`
-	}
-
-	baseURLCol := "`base_url`"
-	// 如果是 PostgreSQL，使用双引号
-	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		baseURLCol = `"base_url"`
-	}
-
 	order := resolveChannelSortOptions(idSort, sortOptions)
 
 	// 构造基础查询
 	baseQuery := DB.Model(&Channel{}).Omit("key")
 
 	// 构造WHERE子句
-	whereClause := "(id = ? OR name LIKE ? OR " + commonKeyCol + " = ? OR " + baseURLCol + " LIKE ?) AND " + modelsCol + " LIKE ?"
+	whereClause := `(id = ? OR name LIKE ? OR "key" = ? OR "base_url" LIKE ?) AND "models" LIKE ?`
 	args := []any{common.String2Int(keyword), "%" + keyword + "%", keyword, "%" + keyword + "%", "%" + model + "%"}
 	baseQuery = ApplyChannelGroupFilter(baseQuery.Where(whereClause, args...), group)
 
@@ -954,19 +934,6 @@ func GetPaginatedChannelTags(query *gorm.DB, offset int, limit int) ([]*string, 
 
 func SearchTags(keyword string, group string, model string, idSort bool) ([]*string, error) {
 	var tags []*string
-	modelsCol := "`models`"
-
-	// 如果是 PostgreSQL，使用双引号
-	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		modelsCol = `"models"`
-	}
-
-	baseURLCol := "`base_url`"
-	// 如果是 PostgreSQL，使用双引号
-	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		baseURLCol = `"base_url"`
-	}
-
 	order := "priority desc"
 	if idSort {
 		order = "id desc"
@@ -976,7 +943,7 @@ func SearchTags(keyword string, group string, model string, idSort bool) ([]*str
 	baseQuery := DB.Model(&Channel{}).Omit("key")
 
 	// 构造WHERE子句
-	whereClause := "(id = ? OR name LIKE ? OR " + commonKeyCol + " = ? OR " + baseURLCol + " LIKE ?) AND " + modelsCol + " LIKE ?"
+	whereClause := `(id = ? OR name LIKE ? OR "key" = ? OR "base_url" LIKE ?) AND "models" LIKE ?`
 	args := []any{common.String2Int(keyword), "%" + keyword + "%", keyword, "%" + keyword + "%", "%" + model + "%"}
 	baseQuery = ApplyChannelGroupFilter(baseQuery.Where(whereClause, args...), group)
 

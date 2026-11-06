@@ -9,7 +9,6 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -23,8 +22,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/driver/mysql"
-	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
@@ -47,11 +44,6 @@ type tokenResponseItem struct {
 
 type tokenKeyResponse struct {
 	Key string `json:"key"`
-}
-
-type sqliteColumnInfo struct {
-	Name string `gorm:"column:name"`
-	Type string `gorm:"column:type"`
 }
 
 type legacyToken struct {
@@ -100,54 +92,6 @@ func setupTokenControllerTestDB(t *testing.T) *gorm.DB {
 	db := openTokenControllerTestDB(t)
 	migrateTokenControllerTestDB(t, db)
 	return db
-}
-
-func openTokenControllerExternalDB(t *testing.T, dialect string, dsn string) (*gorm.DB, *bool) {
-	t.Helper()
-
-	gin.SetMode(gin.TestMode)
-	common.RedisEnabled = false
-
-	var (
-		db     *gorm.DB
-		dbType common.DatabaseType
-		err    error
-	)
-	switch dialect {
-	case "mysql":
-		dbType = common.DatabaseTypeMySQL
-		db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
-	case "postgres":
-		dbType = common.DatabaseTypePostgreSQL
-		db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
-	default:
-		t.Fatalf("unsupported dialect %q", dialect)
-	}
-	common.SetDatabaseTypes(dbType, dbType)
-	if err != nil {
-		t.Fatalf("failed to open %s db: %v", dialect, err)
-	}
-
-	model.DB = db
-	model.LOG_DB = db
-
-	if db.Migrator().HasTable("tokens") {
-		t.Skipf("refusing to run %s migration compatibility test against external database because tokens table already exists", dialect)
-	}
-
-	managedTokensTable := new(bool)
-
-	t.Cleanup(func() {
-		if *managedTokensTable && db.Migrator().HasTable("tokens") {
-			_ = db.Migrator().DropTable("tokens")
-		}
-		sqlDB, err := db.DB()
-		if err == nil {
-			_ = sqlDB.Close()
-		}
-	})
-
-	return db, managedTokensTable
 }
 
 func seedToken(t *testing.T, db *gorm.DB, userID int, name string, rawKey string) *model.Token {
@@ -205,103 +149,50 @@ func decodeAPIResponse(t *testing.T, recorder *httptest.ResponseRecorder) tokenA
 	return response
 }
 
-func getSQLiteColumnType(t *testing.T, db *gorm.DB, tableName string, columnName string) string {
+func getTokenKeyColumnType(t *testing.T, db *gorm.DB) string {
 	t.Helper()
 
-	var columns []sqliteColumnInfo
-	if err := db.Raw("PRAGMA table_info(" + tableName + ")").Scan(&columns).Error; err != nil {
-		t.Fatalf("failed to inspect %s schema: %v", tableName, err)
+	var dataType string
+	var maxLength sql.NullInt64
+	if err := db.Raw(`SELECT data_type, character_maximum_length
+		FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?`,
+		"tokens", "key").Row().Scan(&dataType, &maxLength); err != nil {
+		t.Fatalf("failed to inspect token key column: %v", err)
 	}
-
-	for _, column := range columns {
-		if column.Name == columnName {
-			return strings.ToLower(column.Type)
-		}
-	}
-
-	t.Fatalf("column %s not found in %s schema", columnName, tableName)
-	return ""
-}
-
-func getTokenKeyColumnType(t *testing.T, db *gorm.DB, dialect string) string {
-	t.Helper()
-
-	switch dialect {
-	case "sqlite":
-		return getSQLiteColumnType(t, db, "tokens", "key")
-	case "mysql":
-		var columnType string
-		if err := db.Raw(`SELECT COLUMN_TYPE FROM information_schema.columns
-			WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
-			"tokens", "key").Scan(&columnType).Error; err != nil {
-			t.Fatalf("failed to inspect mysql token key column: %v", err)
-		}
-		return strings.ToLower(columnType)
-	case "postgres":
-		var dataType string
-		var maxLength sql.NullInt64
-		if err := db.Raw(`SELECT data_type, character_maximum_length
-			FROM information_schema.columns
-			WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?`,
-			"tokens", "key").Row().Scan(&dataType, &maxLength); err != nil {
-			t.Fatalf("failed to inspect postgres token key column: %v", err)
-		}
-		switch strings.ToLower(dataType) {
-		case "character varying":
-			return fmt.Sprintf("varchar(%d)", maxLength.Int64)
-		case "character":
-			return fmt.Sprintf("char(%d)", maxLength.Int64)
-		default:
-			if maxLength.Valid {
-				return fmt.Sprintf("%s(%d)", strings.ToLower(dataType), maxLength.Int64)
-			}
-			return strings.ToLower(dataType)
-		}
+	switch strings.ToLower(dataType) {
+	case "character varying":
+		return fmt.Sprintf("varchar(%d)", maxLength.Int64)
+	case "character":
+		return fmt.Sprintf("char(%d)", maxLength.Int64)
 	default:
-		t.Fatalf("unsupported dialect %q", dialect)
-		return ""
-	}
-}
-
-func getTokenAutoGroupsColumnType(t *testing.T, db *gorm.DB, dialect string) string {
-	t.Helper()
-
-	switch dialect {
-	case "sqlite":
-		return getSQLiteColumnType(t, db, "tokens", "auto_groups")
-	case "mysql":
-		var columnType string
-		if err := db.Raw(`SELECT DATA_TYPE FROM information_schema.columns
-			WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
-			"tokens", "auto_groups").Scan(&columnType).Error; err != nil {
-			t.Fatalf("failed to inspect mysql token auto_groups column: %v", err)
-		}
-		return strings.ToLower(columnType)
-	case "postgres":
-		var dataType string
-		if err := db.Raw(`SELECT data_type FROM information_schema.columns
-			WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?`,
-			"tokens", "auto_groups").Scan(&dataType).Error; err != nil {
-			t.Fatalf("failed to inspect postgres token auto_groups column: %v", err)
+		if maxLength.Valid {
+			return fmt.Sprintf("%s(%d)", strings.ToLower(dataType), maxLength.Int64)
 		}
 		return strings.ToLower(dataType)
-	default:
-		t.Fatalf("unsupported dialect %q", dialect)
-		return ""
 	}
 }
 
-func runTokenMigrationCompatibilityTest(t *testing.T, db *gorm.DB, dialect string, managedTokensTable *bool) {
+func getTokenAutoGroupsColumnType(t *testing.T, db *gorm.DB) string {
 	t.Helper()
+
+	var dataType string
+	if err := db.Raw(`SELECT data_type FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?`,
+		"tokens", "auto_groups").Scan(&dataType).Error; err != nil {
+		t.Fatalf("failed to inspect token auto_groups column: %v", err)
+	}
+	return strings.ToLower(dataType)
+}
+
+func TestTokenMigrationFromChar48ToVarchar128(t *testing.T) {
+	db := openTokenControllerTestDB(t)
 
 	legacyKey := strings.Repeat("a", 48)
 	longKey := strings.Repeat("b", 64)
 
 	if err := db.AutoMigrate(&legacyToken{}); err != nil {
 		t.Fatalf("failed to create legacy token schema: %v", err)
-	}
-	if managedTokensTable != nil {
-		*managedTokensTable = true
 	}
 	if err := db.Create(&legacyToken{
 		UserId:             7,
@@ -323,19 +214,19 @@ func runTokenMigrationCompatibilityTest(t *testing.T, db *gorm.DB, dialect strin
 		t.Fatalf("failed to seed legacy token row: %v", err)
 	}
 
-	if got := getTokenKeyColumnType(t, db, dialect); got != "char(48)" {
+	if got := getTokenKeyColumnType(t, db); got != "char(48)" {
 		t.Fatalf("expected legacy key column type char(48), got %q", got)
 	}
 
 	migrateTokenControllerTestDB(t, db)
 
-	if got := getTokenKeyColumnType(t, db, dialect); got != "varchar(128)" {
+	if got := getTokenKeyColumnType(t, db); got != "varchar(128)" {
 		t.Fatalf("expected migrated key column type varchar(128), got %q", got)
 	}
 	if !db.Migrator().HasColumn(&model.Token{}, "auto_groups") {
 		t.Fatal("expected migration to add auto_groups column")
 	}
-	if got := getTokenAutoGroupsColumnType(t, db, dialect); got != "text" {
+	if got := getTokenAutoGroupsColumnType(t, db); got != "text" {
 		t.Fatalf("expected migrated auto_groups column type text, got %q", got)
 	}
 
@@ -387,44 +278,13 @@ func runTokenMigrationCompatibilityTest(t *testing.T, db *gorm.DB, dialect strin
 
 func TestTokenAutoMigrateUsesVarchar128KeyColumn(t *testing.T) {
 	db := setupTokenControllerTestDB(t)
-	if !common.UsingMainDatabase(common.DatabaseTypeSQLite) {
-		t.Skip("SQLite-only variant; TestTokenMigrationFromChar48ToVarchar128Postgres covers PostgreSQL")
-	}
 
-	if got := getTokenKeyColumnType(t, db, "sqlite"); got != "varchar(128)" {
+	if got := getTokenKeyColumnType(t, db); got != "varchar(128)" {
 		t.Fatalf("expected key column type varchar(128), got %q", got)
 	}
-	if got := getSQLiteColumnType(t, db, "tokens", "auto_groups"); got != "text" {
+	if got := getTokenAutoGroupsColumnType(t, db); got != "text" {
 		t.Fatalf("expected auto_groups column type text, got %q", got)
 	}
-}
-
-func TestTokenMigrationFromChar48ToVarchar128(t *testing.T) {
-	db := openTokenControllerTestDB(t)
-	if !common.UsingMainDatabase(common.DatabaseTypeSQLite) {
-		t.Skip("SQLite-only variant; TestTokenMigrationFromChar48ToVarchar128Postgres covers PostgreSQL")
-	}
-	runTokenMigrationCompatibilityTest(t, db, "sqlite", nil)
-}
-
-func TestTokenMigrationFromChar48ToVarchar128MySQL(t *testing.T) {
-	dsn := os.Getenv("TEST_MYSQL_DSN")
-	if dsn == "" {
-		t.Skip("set TEST_MYSQL_DSN to run mysql migration compatibility test")
-	}
-
-	db, managedTokensTable := openTokenControllerExternalDB(t, "mysql", dsn)
-	runTokenMigrationCompatibilityTest(t, db, "mysql", managedTokensTable)
-}
-
-func TestTokenMigrationFromChar48ToVarchar128Postgres(t *testing.T) {
-	dsn := os.Getenv("TEST_POSTGRES_DSN")
-	if dsn == "" {
-		t.Skip("set TEST_POSTGRES_DSN to run postgres migration compatibility test")
-	}
-
-	db, managedTokensTable := openTokenControllerExternalDB(t, "postgres", dsn)
-	runTokenMigrationCompatibilityTest(t, db, "postgres", managedTokensTable)
 }
 
 func TestGetAllTokensMasksKeyInResponse(t *testing.T) {
@@ -695,58 +555,37 @@ func TestGetTokenUsageFollowsTheUserQuotaSwitchAndIPWhitelist(t *testing.T) {
 	}
 }
 
-func TestAPITokenAuditDatabaseMatrix(t *testing.T) {
-	for _, database := range []struct {
-		name, env string
-		typ       common.DatabaseType
-	}{
-		{"sqlite", "", common.DatabaseTypeSQLite},
-		{"mysql", "AUDIT_MYSQL_DSN", common.DatabaseTypeMySQL},
-		{"postgres", "AUDIT_POSTGRES_DSN", common.DatabaseTypePostgreSQL},
-	} {
-		for _, separateLog := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/separate_log=%v", database.name, separateLog), func(t *testing.T) {
-				dsn := os.Getenv(database.env)
-				if database.env != "" && dsn == "" {
-					t.Skip(database.env + " is not configured")
-				}
-				previousDB, previousLogDB := model.DB, model.LOG_DB
-				previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
-				previousRedis, previousMaster, previousSecret := common.RedisEnabled, common.IsMasterNode, common.SessionSecret
-				t.Cleanup(func() {
-					model.DB, model.LOG_DB = previousDB, previousLogDB
-					common.SetDatabaseTypes(previousMain, previousLog)
-					common.RedisEnabled, common.IsMasterNode, common.SessionSecret = previousRedis, previousMaster, previousSecret
-				})
-				common.RedisEnabled, common.IsMasterNode = false, true
-				common.SessionSecret = "api-token-audit-test-secret"
-				t.Setenv("LOG_SQL_DSN", "")
-				db, _ := newAuditTestDatabase(t, database.name, dsn)
-				model.DB = db
-				common.SetDatabaseTypes(database.typ, database.typ)
-				require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Token{}))
-				// Initialize production column quoting as well as the existing audit table.
-				require.NoError(t, model.InitLogDB())
-				if separateLog {
-					logDB, _ := newAuditTestDatabase(t, database.name, dsn)
-					model.LOG_DB = logDB
-					require.NoError(t, model.MigrateAuditLogs())
-				}
-				versionSQL := "SELECT version()"
-				if database.name == "sqlite" {
-					versionSQL = "SELECT sqlite_version()"
-				}
-				var version string
-				require.NoError(t, db.Raw(versionSQL).Scan(&version).Error)
-				t.Logf("database version: %s", version)
-				verifyAPITokenAudit(t)
-				if separateLog {
-					var count int64
-					require.NoError(t, db.Model(&model.AuditLog{}).Count(&count).Error)
-					assert.Zero(t, count, "all audit events must use the configured log database")
-				}
+func TestAPITokenAuditDatabase(t *testing.T) {
+	for _, separateLog := range []bool{false, true} {
+		t.Run(fmt.Sprintf("separate_log=%v", separateLog), func(t *testing.T) {
+			previousDB, previousLogDB := model.DB, model.LOG_DB
+			previousLog := common.LogDatabaseType()
+			previousRedis, previousMaster, previousSecret := common.RedisEnabled, common.IsMasterNode, common.SessionSecret
+			t.Cleanup(func() {
+				model.DB, model.LOG_DB = previousDB, previousLogDB
+				common.SetLogDatabaseType(previousLog)
+				common.RedisEnabled, common.IsMasterNode, common.SessionSecret = previousRedis, previousMaster, previousSecret
 			})
-		}
+			common.RedisEnabled, common.IsMasterNode = false, true
+			common.SessionSecret = "api-token-audit-test-secret"
+			t.Setenv("LOG_SQL_DSN", "")
+			db, _ := newAuditTestDatabase(t, "postgres")
+			model.DB = db
+			require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Token{}))
+			// Use the startup path that places the audit table on the primary database.
+			require.NoError(t, model.InitLogDB())
+			if separateLog {
+				logDB, _ := newAuditTestDatabase(t, "postgres")
+				model.LOG_DB = logDB
+				require.NoError(t, model.MigrateAuditLogs())
+			}
+			verifyAPITokenAudit(t)
+			if separateLog {
+				var count int64
+				require.NoError(t, db.Model(&model.AuditLog{}).Count(&count).Error)
+				assert.Zero(t, count, "all audit events must use the configured log database")
+			}
+		})
 	}
 }
 

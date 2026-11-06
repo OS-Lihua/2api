@@ -130,9 +130,6 @@ func migrateTokenKeyUniqueness(db *gorm.DB) error {
 	if db == nil {
 		return fmt.Errorf("migrate token key uniqueness: database is nil")
 	}
-	if db.Dialector.Name() != "postgres" {
-		return nil
-	}
 
 	statement := &gorm.Statement{DB: db}
 	if err := statement.Parse(&Token{}); err != nil {

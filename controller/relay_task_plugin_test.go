@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -21,13 +20,9 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/driver/mysql"
-	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"gorm.io/gorm/schema"
 )
 
 type taskSubmissionTestBilling struct {
@@ -283,7 +278,7 @@ func TestExecuteTaskSubmissionHonorsRouteRetainResult(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			events := make([]string, 0, 3)
-			database, _ := openTaskDialectDatabase(t, &model.Task{}, &model.User{}, &model.Channel{})
+			database := openTaskTestDatabase(t, &model.Task{}, &model.User{}, &model.Channel{})
 			previousDB := model.DB
 			model.DB = database
 			t.Cleanup(func() { model.DB = previousDB })
@@ -458,8 +453,7 @@ func TestExecuteTaskSubmissionDisconnectAfterDurableInsertDoesNotRefund(t *testi
 	assert.False(t, c.Writer.Written())
 }
 
-// setupTaskSubmissionDatabase opens the dialect selected by
-// TEST_TASK_DB_DIALECT (SQLite in memory by default) and records every task
+// setupTaskSubmissionDatabase opens an empty PostgreSQL schema and records every task
 // INSERT in events so tests can assert the reserve → insert → settle order.
 // Without migrate the task table does not exist and inserts fail.
 func setupTaskSubmissionDatabase(t *testing.T, migrate bool, events *[]string) *gorm.DB {
@@ -469,7 +463,7 @@ func setupTaskSubmissionDatabase(t *testing.T, migrate bool, events *[]string) *
 	if migrate {
 		models = append(models, &model.Task{})
 	}
-	database, _ := openTaskDialectDatabase(t, models...)
+	database := openTaskTestDatabase(t, models...)
 	require.NoError(t, database.Callback().Create().Before("gorm:create").Register("test:task-submit-order", func(*gorm.DB) {
 		*events = append(*events, "insert")
 	}))
@@ -499,61 +493,28 @@ func taskSubmissionRelayInfo(billing relaycommon.BillingSettler) *relaycommon.Re
 	}
 }
 
-// Uses the real submit adaptor, expression evaluator, BillingSession, task row
-// and consume log. Set TEST_TASK_DB_DIALECT plus TEST_MYSQL_DSN or
-// TEST_POSTGRES_DSN to exercise the same contract on an external test database.
-// Unique table prefixes keep the fixture isolated from all existing tables.
-// openTaskDialectDatabase opens the engine selected by TEST_TASK_DB_DIALECT
-// (default SQLite in memory; MySQL and PostgreSQL through TEST_MYSQL_DSN and
-// TEST_POSTGRES_DSN) with a unique table prefix, migrates the given models and
-// drops them on cleanup. It logs the engine version so database verification
-// runs leave a record.
-func openTaskDialectDatabase(t *testing.T, models ...any) (*gorm.DB, common.DatabaseType) {
+// openTaskTestDatabase opens an empty PostgreSQL schema, migrates the given
+// models and returns the connection without changing model.DB.
+func openTaskTestDatabase(t *testing.T, models ...any) *gorm.DB {
 	t.Helper()
-	dialect := common.DatabaseType(os.Getenv("TEST_TASK_DB_DIALECT"))
-	var driver gorm.Dialector
-	switch dialect {
-	case "", common.DatabaseTypeSQLite:
-		dialect = common.DatabaseTypeSQLite
-		driver = sqlite.Open(":memory:")
-	case common.DatabaseTypeMySQL:
-		require.NotEmpty(t, os.Getenv("TEST_MYSQL_DSN"))
-		driver = mysql.Open(os.Getenv("TEST_MYSQL_DSN"))
-	case common.DatabaseTypePostgreSQL:
-		require.NotEmpty(t, os.Getenv("TEST_POSTGRES_DSN"))
-		driver = postgres.New(postgres.Config{DSN: os.Getenv("TEST_POSTGRES_DSN"), PreferSimpleProtocol: true})
-	default:
-		t.Fatalf("unsupported test dialect %q", dialect)
-	}
-	db, err := gorm.Open(driver, &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: fmt.Sprintf("tsubmit_%d_", time.Now().UnixNano())}})
-	require.NoError(t, err)
-	sqlDB, err := db.DB()
-	require.NoError(t, err)
-	sqlDB.SetMaxOpenConns(1)
-	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, _ := newAuditTestDatabase(t, "postgres")
 	require.NoError(t, db.AutoMigrate(models...))
-	t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(models...)) })
-	var version string
-	if dialect == common.DatabaseTypeSQLite {
-		require.NoError(t, db.Raw("SELECT sqlite_version()").Scan(&version).Error)
-	} else {
-		require.NoError(t, db.Raw("SELECT version()").Scan(&version).Error)
-	}
-	t.Logf("database: %s %s", dialect, version)
-	return db, dialect
+	return db
 }
 
+// Uses the real submit adaptor, expression evaluator, BillingSession, task row
+// and consume log.
 func TestImmediateTaskSettlementDatabase(t *testing.T) {
-	db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Channel{}, &model.Task{}, &model.Log{})
+	db := openTaskTestDatabase(t, &model.User{}, &model.Channel{}, &model.Task{}, &model.Log{})
 	oldDB, oldLogDB := model.DB, model.LOG_DB
-	oldMain, oldLog := common.MainDatabaseType(), common.LogDatabaseType()
+	oldLog := common.LogDatabaseType()
 	oldRedis, oldMemory, oldBatch, oldConsume, oldExport := common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled
 	model.DB, model.LOG_DB = db, db
-	common.SetDatabaseTypes(dialect, dialect)
+	common.SetLogDatabaseType(common.DatabaseTypePostgreSQL)
 	common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled = false, false, false, true, false
 	t.Cleanup(func() {
 		model.DB, model.LOG_DB = oldDB, oldLogDB
-		common.SetDatabaseTypes(oldMain, oldLog)
+		common.SetLogDatabaseType(oldLog)
 		common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled = oldRedis, oldMemory, oldBatch, oldConsume, oldExport
 	})
 
