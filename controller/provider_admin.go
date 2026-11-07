@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -45,13 +46,50 @@ type providerView struct {
 func readableProvider(provider *model.Provider) providerView {
 	view := providerView{
 		ID: provider.Id, Type: provider.Type, Name: provider.Name, Status: provider.Status,
-		BaseURL: provider.BaseURL, Balance: provider.Balance,
+		BaseURL: readableProviderURL(provider.BaseURL), Balance: provider.Balance,
 		BalanceUpdatedTime: provider.BalanceUpdatedTime, CreatedTime: provider.CreatedTime, Remark: provider.Remark,
 	}
 	view.Info.IsMultiKey = provider.ProviderInfo.IsMultiKey
 	view.Info.MultiKeySize = provider.ProviderInfo.MultiKeySize
 	view.Info.MultiKeyMode = provider.ProviderInfo.MultiKeyMode
 	return view
+}
+
+const (
+	providerURLRedaction     = "REDACTED"
+	providerURLRedactedQuery = "__redacted__"
+	providerURLRedactedHost  = "redacted.invalid"
+)
+
+// readableProviderURL retains the endpoint but hides opaque URL credentials.
+// The public marker also distinguishes a readback from an explicit replacement.
+func readableProviderURL(raw *string) *string {
+	if raw == nil || *raw == "" {
+		return raw
+	}
+	endpoint, err := url.Parse(*raw)
+	if err != nil || endpoint.Hostname() == "" || endpoint.Scheme == "" {
+		redacted := "https://" + providerURLRedactedHost + "/"
+		return &redacted
+	}
+	changed := false
+	if endpoint.User != nil {
+		endpoint.User = url.UserPassword(providerURLRedaction, providerURLRedaction)
+		changed = true
+	}
+	if endpoint.RawQuery != "" {
+		endpoint.RawQuery = providerURLRedactedQuery + "=1"
+		changed = true
+	}
+	if endpoint.Fragment != "" {
+		endpoint.Fragment, endpoint.RawFragment = providerURLRedaction, ""
+		changed = true
+	}
+	if !changed {
+		return raw
+	}
+	redacted := endpoint.String()
+	return &redacted
 }
 
 // providerKeyView is the state of one key of a multi-key Provider.
@@ -155,7 +193,7 @@ func respondProvider(c *gin.Context, id int) {
 	common.ApiSuccess(c, readableProvider(provider))
 }
 
-// ListProviders lists Providers. Filters: keyword (ID, name, or base URL),
+// ListProviders lists Providers. Filters: keyword (ID, name, or address host),
 // group, status (enabled or disabled), and type.
 func ListProviders(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
@@ -173,7 +211,13 @@ func ListProviders(c *gin.Context) {
 	query := buildChannelListQuery(model.NormalizeProviderGroupFilter(c.Query("group")), parseStatusFilter(c.Query("status")), typeFilter)
 	if keyword := strings.TrimSpace(c.Query("keyword")); keyword != "" {
 		pattern := "%" + keyword + "%"
-		query = query.Where(`(id = ? OR name LIKE ? OR "base_url" LIKE ?)`, common.String2Int(keyword), pattern, pattern)
+		host := keyword
+		if address, err := url.Parse(keyword); err == nil && address.Hostname() != "" {
+			host = address.Host
+		}
+		// Address search must not act as an oracle for the hidden URL parts.
+		const hostPattern = `^[A-Za-z][A-Za-z0-9+.-]*://(?:[^/?#]*@)?((?:\[[^]]+\]|[[:alnum:]._-]+)(?::[0-9]+)?)(?:[/?#]|$)`
+		query = query.Where(`("id" = ? OR "name" LIKE ? OR substring("base_url" FROM ?) ILIKE ?)`, common.String2Int(keyword), pattern, hostPattern, "%"+host+"%")
 	}
 
 	var total int64
@@ -276,6 +320,32 @@ func UpdateProvider(c *gin.Context) {
 	if err != nil {
 		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
 		return
+	}
+	if rawURL, provided := fields["base_url"]; provided {
+		var replacement *string
+		if err := common.Unmarshal(rawURL, &replacement); err != nil {
+			common.ApiErrorStatus(c, http.StatusBadRequest, err)
+			return
+		}
+		visible := readableProviderURL(candidate.BaseURL)
+		if replacement != nil && visible != nil && candidate.BaseURL != nil && *visible != *candidate.BaseURL && *replacement == *visible {
+			delete(fields, "base_url")
+		} else if replacement != nil && *replacement != "" {
+			endpoint, err := url.Parse(*replacement)
+			if err != nil {
+				common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Enter the full base URL to replace the hidden credentials"))
+				return
+			}
+			incomplete := strings.EqualFold(endpoint.Hostname(), providerURLRedactedHost) || endpoint.Query().Has(providerURLRedactedQuery) || endpoint.Fragment == providerURLRedaction
+			if endpoint.User != nil {
+				userPassword, _ := endpoint.User.Password()
+				incomplete = incomplete || endpoint.User.Username() == providerURLRedaction || userPassword == providerURLRedaction
+			}
+			if incomplete {
+				common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Enter the full base URL to replace the hidden credentials"))
+				return
+			}
+		}
 	}
 	patch, err := common.Marshal(fields)
 	if err != nil {

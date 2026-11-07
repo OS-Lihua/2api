@@ -2389,6 +2389,7 @@
     "Enter the complete URL, supports": "Saisir l'URL complète, prend en charge",
     "Enter the Coze agent ID": "Saisir l'ID de l'agent Coze",
     "Enter the Discovery URL or Issuer URL first": "Saisissez d’abord l’URL Discovery ou l’URL Issuer",
+    "Enter the full base URL to replace the hidden credentials": "Saisissez l’URL de base complète pour remplacer les identifiants masqués",
     "Enter the full URL of your Gotify server": "Saisir l'URL complète de votre serveur Gotify",
     "Enter the key; one key per line": "Saisissez la clé, une clé par ligne",
     "Enter the knowledge base ID": "Saisir l'ID de la base de connaissances",

@@ -2389,6 +2389,7 @@
     "Enter the complete URL, supports": "Введите полный URL, поддерживает",
     "Enter the Coze agent ID": "Введите ID агента Coze",
     "Enter the Discovery URL or Issuer URL first": "Сначала укажите Discovery URL или Issuer URL",
+    "Enter the full base URL to replace the hidden credentials": "Введите полный базовый URL для замены скрытых учётных данных",
     "Enter the full URL of your Gotify server": "Введите полный URL вашего сервера Gotify",
     "Enter the key; one key per line": "Введите ключ, по одному на строку",
     "Enter the knowledge base ID": "Введите ID базы знаний",
