@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 
 	"github.com/gin-gonic/gin"
@@ -22,19 +23,42 @@ import (
 // no response of this API contains a key or a part of one. A rejected request
 // answers 400, a missing Provider 404, and an internal failure 500.
 
-// providerView is a Provider as this API returns it. The shallower Key field
-// hides the embedded credential and is always empty, so it is omitted.
+// providerView explicitly lists readable fields. Adapter configuration, upstream
+// errors, and credentials are write-only, including custom authentication headers.
 type providerView struct {
-	*model.Provider
-	Key string `json:"key,omitempty"`
+	ID                 int     `json:"id"`
+	Type               int     `json:"type"`
+	Name               string  `json:"name"`
+	Status             int     `json:"status"`
+	BaseURL            *string `json:"base_url"`
+	Balance            float64 `json:"balance"`
+	BalanceUpdatedTime int64   `json:"balance_updated_time"`
+	CreatedTime        int64   `json:"created_time"`
+	Remark             *string `json:"remark"`
+	Info               struct {
+		IsMultiKey   bool                  `json:"is_multi_key"`
+		MultiKeySize int                   `json:"multi_key_size"`
+		MultiKeyMode constant.MultiKeyMode `json:"multi_key_mode"`
+	} `json:"channel_info"`
+}
+
+func readableProvider(provider *model.Provider) providerView {
+	view := providerView{
+		ID: provider.Id, Type: provider.Type, Name: provider.Name, Status: provider.Status,
+		BaseURL: provider.BaseURL, Balance: provider.Balance,
+		BalanceUpdatedTime: provider.BalanceUpdatedTime, CreatedTime: provider.CreatedTime, Remark: provider.Remark,
+	}
+	view.Info.IsMultiKey = provider.ProviderInfo.IsMultiKey
+	view.Info.MultiKeySize = provider.ProviderInfo.MultiKeySize
+	view.Info.MultiKeyMode = provider.ProviderInfo.MultiKeyMode
+	return view
 }
 
 // providerKeyView is the state of one key of a multi-key Provider.
 type providerKeyView struct {
-	Index        int    `json:"index"`
-	Status       int    `json:"status"`
-	DisabledTime int64  `json:"disabled_time,omitempty"`
-	Reason       string `json:"reason,omitempty"`
+	Index        int   `json:"index"`
+	Status       int   `json:"status"`
+	DisabledTime int64 `json:"disabled_time,omitempty"`
 }
 
 type createProviderRequest struct {
@@ -128,7 +152,7 @@ func respondProvider(c *gin.Context, id int) {
 		return
 	}
 	clearChannelInfo(provider)
-	common.ApiSuccess(c, providerView{Provider: provider})
+	common.ApiSuccess(c, readableProvider(provider))
 }
 
 // ListProviders lists Providers. Filters: keyword (ID, name, or base URL),
@@ -167,7 +191,7 @@ func ListProviders(c *gin.Context) {
 	items := make([]providerView, 0, len(providers))
 	for _, provider := range providers {
 		clearChannelInfo(provider)
-		items = append(items, providerView{Provider: provider})
+		items = append(items, readableProvider(provider))
 	}
 	common.ApiSuccess(c, gin.H{
 		"items":     items,
@@ -194,7 +218,7 @@ func CreateProvider(c *gin.Context) {
 		common.ApiErrorStatus(c, http.StatusBadRequest, err)
 		return
 	}
-	if len(request.Provider) == 0 {
+	if len(request.Provider) == 0 || request.BatchAddSetKeyPrefix2Name {
 		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
 		return
 	}
@@ -242,6 +266,30 @@ func UpdateProvider(c *gin.Context) {
 		fields = map[string]json.RawMessage{}
 	}
 	fields["id"] = json.RawMessage(strconv.Itoa(id))
+	// Validate the effective adapter configuration without resubmitting omitted
+	// fields, which must preserve stored credentials and concurrent edits.
+	candidate, err := model.GetProviderById(id, false)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		common.ApiErrorStatus(c, http.StatusNotFound, common.NewMessage("Provider does not exist"))
+		return
+	}
+	if err != nil {
+		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
+		return
+	}
+	patch, err := common.Marshal(fields)
+	if err != nil {
+		common.ApiErrorStatus(c, http.StatusBadRequest, err)
+		return
+	}
+	if err := common.Unmarshal(patch, candidate); err != nil {
+		common.ApiErrorStatus(c, http.StatusBadRequest, err)
+		return
+	}
+	if err := validateChannel(candidate, false); err != nil {
+		common.ApiErrorStatus(c, http.StatusBadRequest, err)
+		return
+	}
 	reply, err := runLegacyProviderHandler(c, UpdateChannel, fields, nil)
 	if err != nil {
 		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
@@ -292,9 +340,8 @@ func DisableProvider(c *gin.Context) {
 	setProviderStatus(c, common.ChannelStatusManuallyDisabled)
 }
 
-// RefreshProviderBalance queries the upstream balance and stores it. The reply
-// is the Provider with the new balance; raw_response is set when the upstream
-// answer could not be read as a balance.
+// RefreshProviderBalance queries and stores the upstream balance. Raw upstream
+// responses are not returned because they may contain account credentials.
 func RefreshProviderBalance(c *gin.Context) {
 	id, ok := providerIDParam(c)
 	if !ok {
@@ -305,12 +352,8 @@ func RefreshProviderBalance(c *gin.Context) {
 		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
 		return
 	}
-	if !reply.Success {
-		reply.forward(c)
-		return
-	}
-	if reply.Raw != "" {
-		common.ApiSuccess(c, gin.H{"raw_response": reply.Raw})
+	if !reply.Success || reply.Raw != "" {
+		common.ApiErrorStatus(c, http.StatusBadGateway, common.NewMessage("Failed to query balance"))
 		return
 	}
 	respondProvider(c, id)
@@ -359,7 +402,7 @@ func ListProviderKeys(c *gin.Context) {
 	}
 	keys := make([]providerKeyView, 0, len(keyStatus.Keys))
 	for _, key := range keyStatus.Keys {
-		keys = append(keys, providerKeyView{Index: key.Index, Status: key.Status, DisabledTime: key.DisabledTime, Reason: key.Reason})
+		keys = append(keys, providerKeyView{Index: key.Index, Status: key.Status, DisabledTime: key.DisabledTime})
 	}
 	common.ApiSuccess(c, gin.H{
 		"keys":                  keys,

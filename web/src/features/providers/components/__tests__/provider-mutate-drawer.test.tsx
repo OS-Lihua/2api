@@ -53,7 +53,7 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
-function renderDrawer() {
+function renderDrawer(currentRow?: Provider) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -64,13 +64,52 @@ function renderDrawer() {
         <ProviderMutateDrawer
           open
           onOpenChange={onOpenChange}
-          currentRow={stored}
+          currentRow={currentRow}
         />
       </QueryClientProvider>
     </I18nextProvider>
   )
   return onOpenChange
 }
+
+it('creating a Vertex Provider sends its deployment configuration', async () => {
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValue({ data: { success: true, data: { ids: [8] } } })
+  const onOpenChange = renderDrawer(undefined)
+  await userEvent.click(screen.getByRole('combobox', { name: 'Type' }))
+  await userEvent.click(
+    await screen.findByRole('option', { name: 'Vertex AI' })
+  )
+  await userEvent.type(
+    screen.getByRole('textbox', { name: 'Name' }),
+    'Vertex Provider'
+  )
+  await userEvent.click(screen.getByRole('textbox', { name: 'Key' }))
+  await userEvent.paste('{"project_id":"test-project"}')
+  await userEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+  expect(
+    await screen.findByText(
+      'This channel type requires additional configuration'
+    )
+  ).toBeVisible()
+  expect(post).not.toHaveBeenCalled()
+  await userEvent.type(
+    screen.getByRole('textbox', { name: /Deployment Region/ }),
+    'us-central1'
+  )
+  await userEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(post).toHaveBeenCalledWith('/api/admin/v1/providers', {
+    mode: 'single',
+    provider: {
+      name: 'Vertex Provider',
+      type: 41,
+      key: '{"project_id":"test-project"}',
+      other: '{"default":"us-central1"}',
+    },
+  })
+})
 
 it('saving an edit with an empty key field keeps the stored key', async () => {
   vi.spyOn(api, 'get').mockResolvedValue({
@@ -79,9 +118,13 @@ it('saving an edit with an empty key field keeps the stored key', async () => {
   const patch = vi
     .spyOn(api, 'patch')
     .mockResolvedValue({ data: { success: true, data: stored } })
-  const onOpenChange = renderDrawer()
+  const onOpenChange = renderDrawer(stored)
 
   const name = await screen.findByDisplayValue('account one')
+  expect(screen.getByRole('combobox', { name: 'Type' })).toBeDisabled()
+  expect(
+    screen.getByText('Create a new Provider to use a different type.')
+  ).toBeVisible()
   const key = screen.getByRole('textbox', { name: 'Key' })
   expect(key).toHaveValue('')
   expect(key).toHaveAttribute(

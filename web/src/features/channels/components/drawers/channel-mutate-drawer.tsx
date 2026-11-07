@@ -234,6 +234,7 @@ import {
 import { ModelRedirectPanel } from '../model-redirect-panel'
 import { ResponsesWebSocketSetting } from '../responses-websocket-setting'
 import { UpstreamModelSelection } from '../upstream-model-selection'
+import { AdapterDeploymentField } from './adapter-deployment-field'
 import {
   ChannelConfiguration,
   ChannelConfigurationStatusIndicator,
@@ -3596,24 +3597,10 @@ export function ChannelMutateDrawer({
                     </FormItem>
                   )}
                 />
-                <FormField
+                <AdapterDeploymentField
                   control={form.control}
                   name='other'
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel required>{t('Default API Version')}</FormLabel>
-                      <FormControl>
-                        <Input
-                          placeholder={t('e.g., 2025-04-01-preview')}
-                          {...field}
-                        />
-                      </FormControl>
-                      <FormDescription>
-                        {t('Default API version for this channel')}
-                      </FormDescription>
-                      <FormMessage />
-                    </FormItem>
-                  )}
+                  type={currentType}
                 />
                 <FormField
                   control={form.control}
@@ -3669,23 +3656,10 @@ export function ChannelMutateDrawer({
 
             {/* Xunfei/Spark (type 18) */}
             {currentType === 18 && (
-              <FormField
+              <AdapterDeploymentField
                 control={form.control}
                 name='other'
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel required>{t('Model Version')}</FormLabel>
-                    <FormControl>
-                      <Input placeholder={t('e.g., v2.1')} {...field} />
-                    </FormControl>
-                    <FormDescription>
-                      {t(
-                        'Spark model version, e.g., v2.1 (version number in API URL)'
-                      )}
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
+                type={currentType}
               />
             )}
 
@@ -3816,21 +3790,10 @@ export function ChannelMutateDrawer({
 
             {/* AI Proxy Library (type 21) */}
             {currentType === 21 && (
-              <FormField
+              <AdapterDeploymentField
                 control={form.control}
                 name='other'
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel required>{t('Knowledge Base ID')}</FormLabel>
-                    <FormControl>
-                      <Input placeholder={t('e.g., 123456')} {...field} />
-                    </FormControl>
-                    <FormDescription>
-                      {t('Enter the knowledge base ID')}
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
+                type={currentType}
               />
             )}
 
@@ -3887,24 +3850,10 @@ export function ChannelMutateDrawer({
 
             {/* Cloudflare Workers AI (type 39) */}
             {currentType === 39 && (
-              <FormField
+              <AdapterDeploymentField
                 control={form.control}
                 name='other'
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel required>{t('Account ID')}</FormLabel>
-                    <FormControl>
-                      <Input
-                        placeholder={t('e.g., d6b5da8hk1awo8nap34ube6gh')}
-                        {...field}
-                      />
-                    </FormControl>
-                    <FormDescription>
-                      {t('Your Cloudflare Account ID')}
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
+                type={currentType}
               />
             )}
 
@@ -4083,31 +4032,10 @@ export function ChannelMutateDrawer({
                     <FormMessage />
                   </FormItem>
                 )}
-                <FormField
+                <AdapterDeploymentField
                   control={form.control}
                   name='other'
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel required>{t('Deployment Region')}</FormLabel>
-                      <FormControl>
-                        <Textarea
-                          placeholder={t(
-                            'e.g., us-central1 or JSON format for model-specific regions'
-                          )}
-                          rows={3}
-                          {...field}
-                        />
-                      </FormControl>
-                      <FormDescription>
-                        {t('Enter deployment region or JSON mapping:')} {'{'}
-                        {t(
-                          '"default": "us-central1", "claude-3-5-sonnet-20240620": "europe-west1"'
-                        )}
-                        {'}'}
-                      </FormDescription>
-                      <FormMessage />
-                    </FormItem>
-                  )}
+                  type={currentType}
                 />
               </>
             )}
@@ -4192,24 +4120,10 @@ export function ChannelMutateDrawer({
 
             {/* Coze (type 49) */}
             {currentType === 49 && (
-              <FormField
+              <AdapterDeploymentField
                 control={form.control}
                 name='other'
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel required>{t('Agent ID')}</FormLabel>
-                    <FormControl>
-                      <Input
-                        placeholder={t('e.g., 7342866812345')}
-                        {...field}
-                      />
-                    </FormControl>
-                    <FormDescription>
-                      {t('Enter the Coze agent ID')}
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
+                type={currentType}
               />
             )}
 

@@ -149,6 +149,116 @@ func TestProviderAdminAPIManagesProviderWithWriteOnlyKeys(t *testing.T) {
 	assert.False(t, missing.Success)
 }
 
+func TestProviderAdminAPIKeepsAccountSecretsWriteOnly(t *testing.T) {
+	engine := newProviderAdminEngine(t)
+	headers := `{"Authorization":"Bearer fixture-header-secret","x-api-key":"fixture-api-secret","X-Custom":"fixture-custom-secret"}`
+	setting := `{"proxy":"http://user:fixture-proxy-secret@proxy.example:8080"}`
+	provider := &model.Provider{Type: constant.ChannelTypeOpenAI, Name: "secret fixture", Key: providerKeyA,
+		HeaderOverride: &headers, Setting: &setting, OtherInfo: `{"error":"fixture-info-secret"}`,
+		OtherSettings: `{"custom":"fixture-settings-secret"}`, ParamOverride: common.GetPointer(`{"token":"fixture-param-secret"}`),
+		Models: "gpt-test", Group: "default",
+		ProviderInfo: model.ProviderInfo{IsMultiKey: true, MultiKeySize: 1, MultiKeyStatusList: map[int]int{0: common.ChannelStatusAutoDisabled}, MultiKeyDisabledReason: map[int]string{0: "fixture-reason-secret"}}}
+	require.NoError(t, provider.Insert())
+	path := "/" + common.Interface2String(provider.Id)
+	for _, tc := range []struct{ method, path, body string }{
+		{http.MethodGet, "", ""},
+		{http.MethodGet, path, ""},
+		{http.MethodGet, path + "/keys", ""},
+		{http.MethodPatch, path, `{"name":"renamed"}`},
+		{http.MethodPost, path + "/disable", ""},
+		{http.MethodPost, path + "/enable", ""},
+		{http.MethodPatch, path, `{"header_override":"{\"Authorization\":\"Bearer fixture-new-secret\"}"}`},
+	} {
+		t.Run(tc.method+tc.path+tc.body, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(tc.method, "/api/admin/v1/providers"+tc.path, strings.NewReader(tc.body))
+			request.Header.Set("Content-Type", "application/json")
+			engine.ServeHTTP(recorder, request)
+			require.Equal(t, http.StatusOK, recorder.Code)
+			for _, secret := range []string{providerKeyA, "fixture-header-secret", "fixture-api-secret", "fixture-custom-secret", "fixture-proxy-secret", "fixture-info-secret", "fixture-settings-secret", "fixture-param-secret", "fixture-new-secret", "fixture-reason-secret"} {
+				assert.NotContains(t, recorder.Body.String(), secret)
+			}
+		})
+		if tc.method == http.MethodPatch && tc.body == `{"name":"renamed"}` {
+			assert.Equal(t, headers, *storedProvider(t, provider.Id).HeaderOverride, "omitting header overrides preserves existing credentials")
+		}
+	}
+	assert.Equal(t, `{"Authorization":"Bearer fixture-new-secret"}`, *storedProvider(t, provider.Id).HeaderOverride)
+}
+
+func TestProviderAdminAPICreatesConfiguredAdapters(t *testing.T) {
+	engine := newProviderAdminEngine(t)
+	for _, tc := range []struct {
+		name            string
+		typeID          int
+		other, settings string
+	}{
+		{"azure", constant.ChannelTypeAzure, "2025-04-01-preview", `{"azure_responses_version":"preview"}`},
+		{"spark", constant.ChannelTypeXunfei, "v2.1", ""},
+		{"cloudflare", constant.ChannelCloudflare, "account-id", ""},
+		{"vertex", constant.ChannelTypeVertexAi, `{"default":"us-central1"}`, `{"vertex_key_type":"api_key","vertex_project_id":"test-project"}`},
+		{"aws", constant.ChannelTypeAws, "", `{"aws_key_type":"api_key","aws_api_type":"mantle"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := common.Marshal(map[string]any{"provider": map[string]any{
+				"name": tc.name, "type": tc.typeID, "key": providerKeyA, "base_url": "https://upstream.example", "other": tc.other, "settings": tc.settings,
+			}})
+			require.NoError(t, err)
+			created := callProviderAPI(t, engine, http.MethodPost, "", string(body))
+			require.True(t, created.Success, created.Message)
+			id := int(created.Data["ids"].([]any)[0].(float64))
+			assert.Equal(t, tc.other, storedProvider(t, id).Other)
+			assert.Equal(t, tc.settings, storedProvider(t, id).OtherSettings)
+			updated := callProviderAPI(t, engine, http.MethodPatch, "/"+common.Interface2String(id), `{"name":"renamed"}`)
+			require.True(t, updated.Success, updated.Message)
+			assert.Equal(t, tc.other, storedProvider(t, id).Other)
+			assert.Equal(t, tc.settings, storedProvider(t, id).OtherSettings)
+		})
+	}
+}
+
+func TestProviderAdminAPIValidatesPartialAdapterUpdates(t *testing.T) {
+	engine := newProviderAdminEngine(t)
+	provider := &model.Provider{Type: constant.ChannelTypeVertexAi, Name: "vertex", Key: providerKeyA, Other: `{"default":"us-central1"}`, OtherSettings: `{"vertex_key_type":"api_key"}`}
+	require.NoError(t, provider.Insert())
+	path := "/" + common.Interface2String(provider.Id)
+	for _, body := range []string{`{"settings":"{\"vertex_api_version\":\"invalid-version\"}"}`, `{"other":"not-json"}`} {
+		reply := callProviderAPIStatus(t, engine, http.StatusBadRequest, http.MethodPatch, path, body)
+		assert.False(t, reply.Success)
+	}
+	assert.Equal(t, provider.Other, storedProvider(t, provider.Id).Other)
+	assert.Equal(t, provider.OtherSettings, storedProvider(t, provider.Id).OtherSettings)
+}
+
+func TestProviderAdminAPIHidesRawBalanceResponses(t *testing.T) {
+	engine := newProviderAdminEngine(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"token":"sk-provider-secret-a","custom_header":"fixture-header-secret"}`))
+	}))
+	defer server.Close()
+	baseURL := server.URL
+	provider := &model.Provider{Type: constant.ChannelTypeAdvancedCustom, BaseURL: &baseURL, Key: providerKeyA, Name: "custom balance",
+		OtherSettings: `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/dashboard/billing/credit_grants","upstream_path":"/balance","converter":"none"}]}}`}
+	require.NoError(t, model.DB.Create(provider).Error)
+	reply := callProviderAPIStatus(t, engine, http.StatusBadGateway, http.MethodPost, "/"+common.Interface2String(provider.Id)+"/balance", "")
+	assert.False(t, reply.Success)
+	assert.Equal(t, "Failed to query balance", reply.Message)
+}
+
+func TestProviderAdminAPIHidesBalanceErrors(t *testing.T) {
+	engine := newProviderAdminEngine(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"code":false,"message":"sk-provider-secret-a"}`))
+	}))
+	defer server.Close()
+	baseURL := server.URL + "/"
+	provider := &model.Provider{Type: constant.ChannelTypeNewAPI, BaseURL: &baseURL, Key: providerKeyA, Name: "failed balance"}
+	require.NoError(t, model.DB.Create(provider).Error)
+	reply := callProviderAPIStatus(t, engine, http.StatusBadGateway, http.MethodPost, "/"+common.Interface2String(provider.Id)+"/balance", "")
+	assert.False(t, reply.Success)
+	assert.Equal(t, "Failed to query balance", reply.Message)
+}
+
 func TestProviderAdminAPIRefreshesBalance(t *testing.T) {
 	engine := newProviderAdminEngine(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -186,6 +296,7 @@ func TestProviderAdminAPIRejectsInvalidRequestsWithBadRequest(t *testing.T) {
 		{name: "unsupported add mode", method: http.MethodPost, path: "", body: `{"mode":"copy","provider":{"name":"x","type":1,"key":"` + providerKeyB + `","models":"gpt-test","group":"default"}}`},
 		{name: "status in update body", method: http.MethodPatch, path: path, body: `{"status":2}`},
 		{name: "key actions on a single-key provider", method: http.MethodGet, path: path + "/keys", body: ""},
+		{name: "credential prefix in name", method: http.MethodPost, path: "", body: `{"mode":"batch","batch_add_set_key_prefix_2_name":true,"provider":{"name":"x","type":1,"key":"` + providerKeyB + `\\n` + providerKeyC + `"}}`},
 		{name: "invalid id", method: http.MethodGet, path: "/abc", body: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

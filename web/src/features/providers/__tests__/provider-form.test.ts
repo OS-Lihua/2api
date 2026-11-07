@@ -72,6 +72,58 @@ describe('toUpdateProviderPayload', () => {
 })
 
 describe('toCreateProviderPayload', () => {
+  it.each([
+    [3, '2025-04-01-preview', '{"azure_responses_version":"preview"}'],
+    [18, 'v2.1', ''],
+    [21, 'knowledge-base', ''],
+    [39, 'cloudflare-account', ''],
+    [
+      41,
+      '{"default":"us-east1"}',
+      '{"vertex_key_type":"api_key","vertex_project_id":"project"}',
+    ],
+    [49, 'coze-agent', ''],
+    [33, '', '{"aws_key_type":"api_key","aws_api_type":"mantle"}'],
+  ])('preserves adapter configuration for type %s', (type, other, settings) => {
+    const payload = toCreateProviderPayload({
+      ...PROVIDER_FORM_DEFAULT_VALUES,
+      type: Number(type),
+      name: 'configured',
+      key: 'new-key',
+      other: String(other),
+      settings: String(settings),
+    })
+    expect(payload.provider).toMatchObject({
+      type,
+      name: 'configured',
+      key: 'new-key',
+    })
+    if (other) expect(payload.provider.other).toBe(other)
+    if (settings) expect(payload.provider.settings).toBe(settings)
+  })
+
+  it('sends replacement headers only when entered and preserves omitted configuration on edit', () => {
+    const values = {
+      ...PROVIDER_FORM_DEFAULT_VALUES,
+      name: 'configured',
+      header_override: '{"Authorization":"Bearer new-secret"}',
+    }
+    expect(toCreateProviderPayload(values).provider.header_override).toBe(
+      values.header_override
+    )
+    expect(toUpdateProviderPayload(values, provider(false))).toEqual({
+      name: 'configured',
+      base_url: '',
+      remark: '',
+      header_override: values.header_override,
+    })
+    expect(
+      toUpdateProviderPayload(
+        { ...values, header_override: '' },
+        provider(false)
+      )
+    ).not.toHaveProperty('header_override')
+  })
   it('sends the rotation mode only when several keys form one provider', () => {
     const values = {
       ...PROVIDER_FORM_DEFAULT_VALUES,

@@ -19,6 +19,8 @@ For commercial licensing, please contact support@quantumnous.com
 import type { TFunction } from 'i18next'
 import { z } from 'zod'
 
+import { channelFormSchema } from '@/features/channels/lib/channel-form'
+
 import type {
   CreateProviderPayload,
   Provider,
@@ -37,10 +39,46 @@ export function getProviderFormSchema(t: TFunction, isUpdate: boolean) {
       mode: z.enum(['single', 'batch', 'multi_to_single']),
       multi_key_mode: z.enum(['random', 'polling']),
       key_mode: z.enum(['append', 'replace']),
+      other: z.string(),
+      settings: channelFormSchema.shape.settings,
+      setting: channelFormSchema.shape.setting,
+      header_override: channelFormSchema.shape.header_override,
+      openai_organization: z.string(),
     })
     .refine((values) => isUpdate || values.key.trim() !== '', {
       path: ['key'],
       message: t('Key is required'),
+    })
+    .superRefine((values, ctx) => {
+      if (
+        !isUpdate &&
+        [3, 18, 21, 39, 41, 49].includes(values.type) &&
+        !values.other.trim()
+      ) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['other'],
+          message: t('This channel type requires additional configuration'),
+        })
+      }
+      if (values.type === 41 && values.other.trim().startsWith('{')) {
+        try {
+          const regions: unknown = JSON.parse(values.other)
+          if (
+            !regions ||
+            typeof regions !== 'object' ||
+            !('default' in regions)
+          ) {
+            throw new Error()
+          }
+        } catch {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['other'],
+            message: t('Deployment region must include a default field'),
+          })
+        }
+      }
     })
 }
 
@@ -57,6 +95,11 @@ export const PROVIDER_FORM_DEFAULT_VALUES: ProviderFormValues = {
   mode: 'single' satisfies ProviderAddMode,
   multi_key_mode: 'random',
   key_mode: 'append',
+  other: '',
+  settings: '',
+  setting: '',
+  header_override: '',
+  openai_organization: '',
 }
 
 export function providerToFormValues(provider: Provider): ProviderFormValues {
@@ -83,10 +126,31 @@ export function toCreateProviderPayload(
   }
   if (values.base_url) payload.provider.base_url = values.base_url
   if (values.remark) payload.provider.remark = values.remark
+  Object.assign(payload.provider, toAdapterConfiguration(values))
   if (values.mode === 'multi_to_single') {
     payload.multi_key_mode = values.multi_key_mode
   }
   return payload
+}
+
+// Adapter fields are write-only. Blank inputs omit the field on edit so stored
+// authentication headers and proxy credentials survive ordinary saves.
+function toAdapterConfiguration(values: ProviderFormValues) {
+  const fields: Record<string, string> = {}
+  for (const name of [
+    'other',
+    'settings',
+    'setting',
+    'header_override',
+    'openai_organization',
+  ] as const) {
+    const value = values[name]?.trim()
+    if (value) fields[name] = value
+  }
+  if (values.type === 41 && fields.other && !fields.other.startsWith('{')) {
+    fields.other = JSON.stringify({ default: fields.other })
+  }
+  return fields
 }
 
 // An empty key keeps the stored credential. A multi-key Provider either
@@ -99,6 +163,7 @@ export function toUpdateProviderPayload(
     name: values.name.trim(),
     base_url: values.base_url,
     remark: values.remark,
+    ...toAdapterConfiguration(values),
   }
   if (values.key.trim() === '') return payload
   payload.key = values.key

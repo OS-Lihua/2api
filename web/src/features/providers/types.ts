@@ -68,6 +68,11 @@ export interface CreateProviderPayload {
     key: string
     base_url?: string
     remark?: string
+    other?: string
+    settings?: string
+    setting?: string
+    header_override?: string
+    openai_organization?: string
   }
 }
 
@@ -76,6 +81,11 @@ export interface UpdateProviderPayload {
   base_url?: string
   remark?: string
   key?: string
+  other?: string
+  settings?: string
+  setting?: string
+  header_override?: string
+  openai_organization?: string
   key_mode?: 'append' | 'replace'
 }
 

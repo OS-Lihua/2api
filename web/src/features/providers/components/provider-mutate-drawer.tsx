@@ -30,6 +30,7 @@ import {
   sideDrawerFormClassName,
   sideDrawerHeaderClassName,
 } from '@/components/drawer-layout'
+import { JsonEditor } from '@/components/json-editor'
 import { Button } from '@/components/ui/button'
 import {
   Form,
@@ -59,11 +60,20 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet'
 import { Textarea } from '@/components/ui/textarea'
+import { AdapterDeploymentField } from '@/features/channels/components/drawers/adapter-deployment-field'
 import {
   MULTI_KEY_MODES,
   channelTypeOptionsForTaskPluginBind,
 } from '@/features/channels/constants'
+import { getAdvancedCustomTemplateConfig } from '@/features/channels/lib/advanced-custom'
+import { CHANNEL_FORM_DEFAULT_VALUES } from '@/features/channels/lib/channel-form'
+import {
+  ADMIN_PERMISSION_ACTIONS,
+  ADMIN_PERMISSION_RESOURCES,
+  hasPermission,
+} from '@/lib/admin-permissions'
 import { handleServerError } from '@/lib/handle-server-error'
+import { useAuthStore } from '@/stores/auth-store'
 
 import {
   createProvider,
@@ -88,11 +98,30 @@ import type { Provider } from '../types'
 
 type SelectOption = { value: string; label: string }
 
+const adapterSettingsTemplates: Record<number, Record<string, unknown>> = {
+  3: { azure_responses_version: 'preview' },
+  20: {
+    openrouter_enterprise: CHANNEL_FORM_DEFAULT_VALUES.is_enterprise_account,
+  },
+  33: {
+    aws_key_type: CHANNEL_FORM_DEFAULT_VALUES.aws_key_type,
+    aws_api_type: CHANNEL_FORM_DEFAULT_VALUES.aws_api_type,
+  },
+  41: {
+    vertex_key_type: CHANNEL_FORM_DEFAULT_VALUES.vertex_key_type,
+    vertex_project_id: '',
+    vertex_api_version: CHANNEL_FORM_DEFAULT_VALUES.vertex_api_version,
+  },
+  58: { advanced_custom: getAdvancedCustomTemplateConfig('all_protocols') },
+}
+
 function ProviderSelectField(props: {
   form: UseFormReturn<ProviderFormValues>
   name: Path<ProviderFormValues>
   label: string
   options: SelectOption[]
+  disabled?: boolean
+  description?: string
   toValue?: (value: string) => string | number
 }) {
   return (
@@ -103,6 +132,7 @@ function ProviderSelectField(props: {
         <FormItem>
           <FormLabel>{props.label}</FormLabel>
           <Select
+            disabled={props.disabled}
             items={props.options}
             value={String(field.value)}
             onValueChange={(value) =>
@@ -125,6 +155,9 @@ function ProviderSelectField(props: {
               </SelectGroup>
             </SelectContent>
           </Select>
+          {props.description && (
+            <FormDescription>{props.description}</FormDescription>
+          )}
           <FormMessage />
         </FormItem>
       )}
@@ -141,6 +174,12 @@ type ProviderMutateDrawerProps = {
 export function ProviderMutateDrawer(props: ProviderMutateDrawerProps) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
+  const currentUser = useAuthStore((state) => state.auth.user)
+  const canBindTaskPlugin = hasPermission(
+    currentUser,
+    ADMIN_PERMISSION_RESOURCES.TASK_PLUGIN,
+    ADMIN_PERMISSION_ACTIONS.BIND
+  )
   const providerId = props.currentRow?.id
   const isUpdate = providerId !== undefined
   const [loaded, setLoaded] = useState<Provider | null>(null)
@@ -176,6 +215,7 @@ export function ProviderMutateDrawer(props: ProviderMutateDrawerProps) {
 
   const isReady = !isUpdate || loaded !== null
   const mode = form.watch('mode')
+  const type = form.watch('type')
   const key = form.watch('key')
   const isMultiKey = loaded?.channel_info?.is_multi_key === true
 
@@ -207,9 +247,9 @@ export function ProviderMutateDrawer(props: ProviderMutateDrawerProps) {
     }
   }
 
-  const typeOptions = channelTypeOptionsForTaskPluginBind(false).map(
-    (option) => ({ value: String(option.value), label: option.label })
-  )
+  const typeOptions = channelTypeOptionsForTaskPluginBind(
+    canBindTaskPlugin
+  ).map((option) => ({ value: String(option.value), label: option.label }))
   const translate = (options: readonly SelectOption[]) =>
     options.map((option) => ({ value: option.value, label: t(option.label) }))
   let submitLabel = t('Save changes')
@@ -244,6 +284,12 @@ export function ProviderMutateDrawer(props: ProviderMutateDrawerProps) {
                   label={t('Type')}
                   options={typeOptions}
                   toValue={Number}
+                  disabled={isUpdate}
+                  description={
+                    isUpdate
+                      ? t('Create a new Provider to use a different type.')
+                      : undefined
+                  }
                 />
                 <FormField
                   control={form.control}
@@ -340,6 +386,73 @@ export function ProviderMutateDrawer(props: ProviderMutateDrawerProps) {
                     </FormItem>
                   )}
                 />
+              </SideDrawerSection>
+              <SideDrawerSection>
+                <h3 className='text-sm font-medium'>{t('Adapter settings')}</h3>
+                <p className='text-muted-foreground text-sm'>
+                  {t(
+                    'Saved adapter settings are never shown. Leave blank to keep existing values; enter a complete JSON object to replace a setting.'
+                  )}
+                </p>
+                <AdapterDeploymentField
+                  control={form.control}
+                  name='other'
+                  type={type}
+                  required={!isUpdate}
+                />
+                {type === 1 && (
+                  <FormField
+                    control={form.control}
+                    name='openai_organization'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>
+                          {t('OpenAI Organization ID (optional)')}
+                        </FormLabel>
+                        <FormControl>
+                          <Input {...field} />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                )}
+                {(['settings', 'setting', 'header_override'] as const).map(
+                  (name) => (
+                    <FormField
+                      key={name}
+                      control={form.control}
+                      name={name}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>
+                            {t(
+                              {
+                                settings: 'Type-specific settings (JSON)',
+                                setting: 'Connection settings (JSON)',
+                                header_override: 'Header Override',
+                              }[name]
+                            )}
+                          </FormLabel>
+                          <FormControl>
+                            <JsonEditor
+                              value={field.value || ''}
+                              onChange={field.onChange}
+                              valueType='any'
+                              disabled={isSubmitting || !isReady}
+                              template={
+                                name === 'settings'
+                                  ? adapterSettingsTemplates[type]
+                                  : undefined
+                              }
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  )
+                )}
               </SideDrawerSection>
             </fieldset>
           </form>
