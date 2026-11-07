@@ -249,6 +249,7 @@ func TestSingleModelChannelAPI(t *testing.T) {
 			{"video input", "openai_chat", "input_video", "application/json", `{"choices":[{"message":{"content":"red"}}]}`, "passed", 200},
 			{"PDF input", "openai_chat", "input_pdf", "application/json", `{"choices":[{"message":{"content":"GWP4831"}}]}`, "passed", 200},
 			{"text output", "openai_chat", "output_text", "application/json", `{"choices":[{"message":{"content":"ok"}}]}`, "passed", 200},
+			{"Gemini image output", "gemini_generate", "output_image", "application/json", fmt.Sprintf(`{"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":%q}}]}}]}`, base64.StdEncoding.EncodeToString(imageFixture)), "passed", 200},
 			{"image edit", "openai_images", "input_image", "application/json", fmt.Sprintf(`{"data":[{"b64_json":%q}]}`, base64.StdEncoding.EncodeToString(blueFixture)), "passed", 200},
 			{"image edit ignored", "openai_images", "input_image", "application/json", fmt.Sprintf(`{"data":[{"b64_json":%q}]}`, base64.StdEncoding.EncodeToString(imageFixture)), "inconclusive", 200},
 			{"image output", "openai_images", "output_image", "application/json", fmt.Sprintf(`{"data":[{"b64_json":%q}]}`, base64.StdEncoding.EncodeToString(imageFixture)), "passed", 200},
@@ -345,6 +346,8 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 		blueImage, err := os.ReadFile("../controller/probe-fixtures/blue.png")
 		require.NoError(t, err)
 		validMedia := true
+		cacheMode := false
+		cacheSubmits := 0
 		var cdnURL string
 		var cancelProbe context.CancelFunc
 		counts := map[string]int{}
@@ -357,6 +360,9 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 			}
 			switch r.URL.Path {
 			case "/submit":
+				if cacheMode {
+					cacheSubmits++
+				}
 				var sent map[string]any
 				require.NoError(t, common.DecodeJson(r.Body, &sent))
 				assert.Equal(t, "task-probe-upstream", sent["model"])
@@ -368,7 +374,11 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 					<-r.Context().Done()
 					return
 				}
-				_, _ = fmt.Fprintf(w, `{"id":"private-task-123","status":"SUCCESS","private_marker":"do-not-store-task-response","cdn_url":%q}`, cdnURL)
+				cached := 0
+				if cacheMode && cacheSubmits >= 2 {
+					cached = 12
+				}
+				_, _ = fmt.Fprintf(w, `{"id":"private-task-123","status":"SUCCESS","private_marker":"do-not-store-task-response","cdn_url":%q,"usage":{"input_tokens_details":{"cached_tokens":%d}}}`, cdnURL, cached)
 			case "/content/private-task-123", "/cdn/private-task-123":
 				if validMedia {
 					w.Header().Set("Content-Type", "video/mp4")
@@ -414,6 +424,12 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 			}
 			assert.Equal(t, expected, result["data"].(map[string]any)["status"], result)
 		}
+		cacheMode = true
+		status, cachedResult := call(http.MethodPost, channelPath+"/probes", `{"capability":"caching"}`)
+		require.Equal(t, http.StatusOK, status, cachedResult)
+		assert.Equal(t, "passed", cachedResult["data"].(map[string]any)["status"], cachedResult)
+		assert.Equal(t, 2, cacheSubmits)
+		cacheMode = false
 		fetchSetting := system_setting.GetFetchSetting()
 		previousFetch := *fetchSetting
 		fetchSetting.EnableSSRFProtection = true
@@ -441,6 +457,12 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 		for _, override := range []string{`{"parameters":{"durationSeconds":600}}`, `{"parameters":{"numberOfVideos":20}}`, `{"operations":[{"path":"parameters.durationSeconds","mode":"set","value":600}]}`} {
 			require.NoError(t, db.Model(&provider).Update("param_override", override).Error)
 			status, result := call(http.MethodPost, channelPath+"/probes", `{"capability":"output_video"}`)
+			require.Equal(t, http.StatusOK, status, result)
+			assert.Equal(t, "request_invalid", result["data"].(map[string]any)["reason"], result)
+		}
+		require.NoError(t, db.Model(&provider).Update("param_override", `{"operations":[{"mode":"delete","path":"max_output_tokens"}]}`).Error)
+		for _, feature := range []string{"input_text", "input_image", "input_audio", "input_video", "input_pdf"} {
+			status, result := call(http.MethodPost, channelPath+"/probes", fmt.Sprintf(`{"capability":%q}`, feature))
 			require.Equal(t, http.StatusOK, status, result)
 			assert.Equal(t, "request_invalid", result["data"].(map[string]any)["reason"], result)
 		}
@@ -624,11 +646,11 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 		status, created := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":"openai_chat","upstream_model_name":"two-image-probe"}`, provider.Id, parent.Id))
 		require.Equal(t, http.StatusOK, status, created)
 		probePath := fmt.Sprintf("/api/admin/v1/channels/%v/probes", created["data"].(map[string]any)["id"])
-		for _, expected := range []string{"inconclusive", "passed", "passed"} {
+		for _, tc := range []struct{ reply, expected string }{{"red", "inconclusive"}, {"red,blue", "passed"}, {"red, blue", "passed"}, {"blue,red", "inconclusive"}, {"red,blue,red", "inconclusive"}} {
+			reply = tc.reply
 			status, result := call(http.MethodPost, probePath, `{"capability":"max_images"}`)
 			require.Equal(t, http.StatusOK, status, result)
-			assert.Equal(t, expected, result["data"].(map[string]any)["status"], result)
-			reply = "red, blue"
+			assert.Equal(t, tc.expected, result["data"].(map[string]any)["status"], result)
 		}
 	})
 	t.Run("Provider response repairs run before capability inspection", func(t *testing.T) {
@@ -667,7 +689,18 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 					w.Header().Set("Content-Type", "application/x-ndjson")
 					_, _ = w.Write([]byte("{\"model\":\"ollama-probe\",\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"done\":false}\n{\"model\":\"ollama-probe\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"prompt_eval_count\":1,\"eval_count\":1}\n"))
 				} else {
-					_, _ = w.Write([]byte(`{"model":"ollama-probe","message":{"role":"assistant","content":"ok"},"done":true,"prompt_eval_count":1,"eval_count":1,"private_marker":"do-not-log-native-response"}`))
+					encoded, _ := common.Marshal(body)
+					reply, promptTokens, outputTokens, doneReason := "ok", 1, 1, "stop"
+					if strings.Contains(string(encoded), "Remember code") {
+						reply = "GWP4831"
+						promptTokens = 256
+					}
+					if strings.Contains(string(encoded), "Continue writing") {
+						reply = strings.Repeat("probe ", 64)
+						outputTokens = 64
+						doneReason = "length"
+					}
+					_, _ = fmt.Fprintf(w, `{"model":"ollama-probe","message":{"role":"assistant","content":%q,"thinking":"I checked the quantities"},"done":true,"done_reason":%q,"prompt_eval_count":%d,"eval_count":%d,"private_marker":"do-not-log-native-response"}`, reply, doneReason, promptTokens, outputTokens)
 				}
 			case "/api/embed":
 				_, _ = w.Write([]byte(`{"embeddings":[[0.2,0.4]],"prompt_eval_count":1}`))
@@ -684,7 +717,7 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 			probePath := fmt.Sprintf("/api/admin/v1/channels/%v/probes", created["data"].(map[string]any)["id"])
 			features := []string{"input_text"}
 			if kind == "openai_chat" {
-				features = append(features, "streaming")
+				features = append(features, "streaming", "reasoning", "context_length", "max_output_tokens")
 			}
 			for _, feature := range features {
 				status, result := call(http.MethodPost, probePath, fmt.Sprintf(`{"capability":%q}`, feature))

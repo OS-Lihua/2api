@@ -250,7 +250,7 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 			return "failed", "request_invalid"
 		}
 	}
-	if wire == "openai_responses" && slices.Contains([]string{"streaming", "tool_calling", "reasoning", "structured_output", "caching", "output_text", "context_length", "max_output_tokens"}, result.Capability) && !probeHasOutputBudget(gjson.ParseBytes(encoded)) {
+	if wire == "openai_responses" && !slices.Contains([]string{"output_image", "output_video", "output_audio", "output_pdf", "max_duration_seconds"}, result.Capability) && !probeHasOutputBudget(gjson.ParseBytes(encoded)) {
 		return "failed", "request_invalid"
 	}
 	if result.Capability == "input_image" && !bytes.Contains(encoded, probeRedImage) && !bytes.Contains(encoded, []byte(base64.StdEncoding.EncodeToString(probeRedImage))) {
@@ -318,6 +318,9 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 		return "failed", "upstream_rejected"
 	}
 	task.Status = model.TaskStatusSuccess
+	if result.Capability == "caching" && (observeProbeJSON(protocol.OpenAIResponses, "caching", task.Data) || observeProbeJSON(protocol.GeminiGenerate, "caching", task.Data) || observeProbeJSON(protocol.AnthropicMessages, "caching", task.Data)) {
+		return "passed", "verified"
+	}
 	if wire == "openai_responses" || wire == "openai_image" {
 		view, err := service.BuildTaskPluginView(task)
 		if err != nil {

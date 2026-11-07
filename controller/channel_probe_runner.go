@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/protocol"
@@ -49,6 +50,12 @@ func probeChannel(ctx context.Context, record model.Channel, provider *model.Pro
 		request.PromptCacheKey = "gateway-capability-probe"
 	}
 	if _, task := record.Protocol.TaskPluginKey(); task {
+		if feature == "caching" {
+			status, reason := probeTaskChannel(ctx, record, provider, result, request)
+			if status == "failed" {
+				return status, reason
+			}
+		}
 		return probeTaskChannel(ctx, record, provider, result, request)
 	}
 	apiType, supported := common.ChannelType2APIType(provider.Type)
@@ -195,7 +202,18 @@ func probeChannel(ctx context.Context, record model.Channel, provider *model.Pro
 		observed := observeChannelProbe(recipe, normalizedKind, feature, writer.body.Bytes())
 		// Usage evidence must come from the bounded upstream response, never
 		// from a protocol handler's fallback token estimates.
-		if feature == "caching" || feature == "reasoning" || feature == "context_length" || feature == "max_output_tokens" {
+		if provider.Type == constant.ChannelTypeOllama && record.Protocol == protocol.OpenAIChat && gjson.GetBytes(body, "message").IsObject() {
+			native := gjson.ParseBytes(body)
+			message := map[string]any{"content": native.Get("message.content").String(), "reasoning_content": native.Get("message.thinking").String()}
+			usage := map[string]any{}
+			for from, to := range map[string]string{"prompt_eval_count": "prompt_tokens", "eval_count": "completion_tokens"} {
+				if value := native.Get(from); value.Type == gjson.Number {
+					usage[to] = value.Value()
+				}
+			}
+			body, _ = common.Marshal(map[string]any{"choices": []any{map[string]any{"message": message, "finish_reason": native.Get("done_reason").String()}}, "usage": usage})
+		}
+		if feature == "caching" || feature == "reasoning" || feature == "context_length" || feature == "max_output_tokens" || feature == "output_image" && record.Protocol == protocol.GeminiGenerate {
 			observed = observeChannelProbe(recipe, record.Protocol, feature, body)
 		}
 		if observed {
