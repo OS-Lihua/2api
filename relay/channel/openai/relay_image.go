@@ -59,6 +59,11 @@ func OpenaiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 	if info.ResponseFacts != nil && count <= dto.MaxImageN {
 		info.ResponseFacts.ImageCount = &count
 	}
+	if info.ResponseFacts != nil {
+		if fault := observeMediaError(info, responseBody, resp.StatusCode); fault != nil {
+			return &usageResp.Usage, types.WithOpenAIError(*fault, resp.StatusCode)
+		}
+	}
 	if oaiError := usageResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		if info.ResponseFacts != nil {
 			return &usageResp.Usage, types.WithOpenAIError(*oaiError, resp.StatusCode)
@@ -182,7 +187,7 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		raw := common.StringToByteSlice(data)
 		lastStreamData = raw
-		if isOpenAIImageStreamErrorEvent(raw) {
+		if info.ResponseFacts == nil && isOpenAIImageStreamErrorEvent(raw) {
 			// Record the error as a soft error; the scanner drives the final
 			// EndReason. HasErrors() flags the failure for logging/handling.
 			sr.Error(fmt.Errorf("%s", extractOpenAIImageStreamErrorMessage(raw)))
@@ -211,6 +216,12 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 			} else if service.ValidUsage(&chunk.Usage) {
 				usage = &chunk.Usage
 			}
+			if info.ResponseFacts != nil {
+				if fault := observeMediaError(info, raw, resp.StatusCode); fault != nil {
+					sr.Stop(errors.New("upstream image stream failed"))
+					return
+				}
+			}
 			if chunk.Type == "image_generation.completed" || chunk.Type == "image_edit.completed" {
 				if info.ResponseFacts == nil || openaiImageDataHasField(ojson.Parse(data), "url") || openaiImageDataHasField(ojson.Parse(data), "b64_json") {
 					completedImages++
@@ -219,6 +230,9 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 					}
 				}
 			}
+		} else if info.ResponseFacts != nil {
+			sr.Stop(errors.New("invalid image stream event"))
+			return
 		}
 		writeErr := writeOpenaiImageStreamChunk(c, raw)
 		if info.ResponseFacts != nil {
@@ -246,7 +260,7 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 
 	// StreamScannerHandler consumes the upstream [DONE]; re-emit it so the
 	// client still receives a terminal data: [DONE].
-	if info.StreamStatus != nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone {
+	if info.StreamStatus != nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone && (info.ResponseFacts == nil || info.StreamStatus.ResponseOutcome() == string(relaycommon.ResponseOutcomeCompleted)) {
 		helper.Done(c)
 	}
 
@@ -260,7 +274,7 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 	// exceed the recorded n, bill the higher actual count regardless.
 	if info.StreamStatus != nil {
 		upstreamFinished := info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone ||
-			info.StreamStatus.EndReason == relaycommon.StreamEndReasonEOF
+			info.StreamStatus.EndReason == relaycommon.StreamEndReasonEOF || info.StreamStatus.ResponseFailed()
 		if upstreamFinished || completedImages > int64(info.RequestedImageCount()) {
 			info.UpdateImageCount(completedImages)
 			if info.ResponseFacts != nil && completedImages <= dto.MaxImageN {
@@ -291,9 +305,6 @@ func writeOpenaiImageStreamChunk(c *gin.Context, data []byte) error {
 // "data:" payload. A payload carrying just a "message" key is deliberately NOT
 // treated as an error to avoid false positives.
 func isOpenAIImageStreamErrorEvent(data []byte) bool {
-	if !json.Valid(data) {
-		return false
-	}
 	var payload struct {
 		Type  string          `json:"type"`
 		Error json.RawMessage `json:"error"`
@@ -306,7 +317,7 @@ func isOpenAIImageStreamErrorEvent(data []byte) bool {
 }
 
 func extractOpenAIImageStreamErrorMessage(data []byte) string {
-	if len(data) == 0 || !json.Valid(data) {
+	if len(data) == 0 {
 		return "upstream image stream returned error event"
 	}
 	var payload struct {
@@ -352,22 +363,20 @@ func openaiImageJSONAsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 	}
 	normalizeOpenAIUsage(&usageResp.Usage)
 	observeMediaUsage(info, &usageResp.Usage, responseBody)
-	if oaiError := usageResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
-		if info.ResponseFacts != nil {
-			return &usageResp.Usage, types.WithOpenAIError(*oaiError, resp.StatusCode)
-		}
-		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
-	}
-	applyUsagePostProcessing(info, &usageResp.Usage, responseBody)
-
-	info.UpdateImageCount(openaiImageResponseCount(responseBody))
+	count := openaiImageResponseCount(responseBody)
 	if info.ResponseFacts != nil {
-		count := openaiImageResponseCount(responseBody)
 		if count <= dto.MaxImageN {
 			info.ResponseFacts.ImageCount = &count
 		}
-		observeMediaUsage(info, &usageResp.Usage, responseBody)
+		if fault := observeMediaError(info, responseBody, resp.StatusCode); fault != nil {
+			return &usageResp.Usage, types.WithOpenAIError(*fault, resp.StatusCode)
+		}
 	}
+	if oaiError := usageResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
+		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
+	}
+	applyUsagePostProcessing(info, &usageResp.Usage, responseBody)
+	info.UpdateImageCount(count)
 
 	helper.SetEventStreamHeaders(c)
 	c.Status(http.StatusOK)

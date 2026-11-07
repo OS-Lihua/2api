@@ -1,14 +1,45 @@
 package openai
 
 import (
+	"strings"
+
 	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 )
+
+// observeMediaError keeps structured classification facts without copying a
+// Provider's message or other error details into downstream output or logs.
+func observeMediaError(info *relaycommon.RelayInfo, body []byte, status int) *types.OpenAIError {
+	var envelope struct {
+		Type  string `json:"type"`
+		Code  any    `json:"code"`
+		Error any    `json:"error"`
+	}
+	if common.Unmarshal(body, &envelope) != nil {
+		return nil
+	}
+	fault := dto.GetOpenAIError(envelope.Error)
+	if fault == nil {
+		switch strings.ToLower(strings.TrimSpace(envelope.Type)) {
+		case "error", "upstream_error":
+			fault = &types.OpenAIError{Type: envelope.Type, Code: envelope.Code}
+		default:
+			return nil
+		}
+	}
+	if info.StreamStatus == nil {
+		info.StreamStatus = relaycommon.NewStreamStatus()
+	}
+	code, _ := fault.Code.(string)
+	info.StreamStatus.MarkFailed(code, fault.Type, status)
+	return &types.OpenAIError{Type: fault.Type, Code: fault.Code}
+}
 
 // observeMediaUsage preserves each reported counter, including explicit zero,
 // across OpenAI-compatible image and audio response envelopes.
