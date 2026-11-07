@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -216,12 +217,12 @@ func getBaiduAccessTokenHelper(apiKey string) (*BaiduAccessToken, error) {
 	if len(parts) != 2 {
 		return nil, errors.New("invalid baidu apikey")
 	}
-	req, err := http.NewRequest("POST", fmt.Sprintf("https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id=%s&client_secret=%s",
-		parts[0], parts[1]), nil)
+	values := url.Values{"grant_type": {"client_credentials"}, "client_id": {parts[0]}, "client_secret": {parts[1]}}
+	req, err := http.NewRequest(http.MethodPost, "https://aip.baidubce.com/oauth/2.0/token", strings.NewReader(values.Encode()))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Add("Accept", "application/json")
 	res, err := service.GetHttpClient().Do(req)
 	if err != nil {
@@ -230,7 +231,7 @@ func getBaiduAccessTokenHelper(apiKey string) (*BaiduAccessToken, error) {
 	defer res.Body.Close()
 
 	var accessToken BaiduAccessToken
-	err = json.NewDecoder(res.Body).Decode(&accessToken)
+	err = common.DecodeJson(res.Body, &accessToken)
 	if err != nil {
 		return nil, err
 	}

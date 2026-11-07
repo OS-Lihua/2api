@@ -320,7 +320,25 @@ func applyHeaderOverrideToRequest(req *http.Request, headerOverride map[string]s
 	}
 }
 
-func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
+func redactUpstreamURLError(err error) error {
+	var urlError *url.Error
+	if !errors.As(err, &urlError) {
+		return err
+	}
+	redacted := *urlError
+	endpoint, parseErr := url.Parse(urlError.URL)
+	if parseErr != nil {
+		redacted.URL = "[invalid upstream URL]"
+		return &redacted
+	}
+	endpoint.User = nil
+	endpoint.RawQuery = ""
+	endpoint.Fragment = ""
+	redacted.URL = endpoint.String()
+	return &redacted
+}
+
+func DoApiRequest(a ProviderTransport, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", err)
@@ -328,7 +346,7 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	logger.LogDebug(c, "fullRequestURL: %s", common.SanitizeURLForLog(fullRequestURL))
 	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
 	if err != nil {
-		return nil, fmt.Errorf("new request failed: %w", err)
+		return nil, fmt.Errorf("new request failed: %w", redactUpstreamURLError(err))
 	}
 	ApplyUpstreamBodyMetadata(req, requestBody)
 	headers := req.Header
@@ -348,7 +366,7 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	return resp, nil
 }
 
-func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
+func DoFormRequest(a ProviderTransport, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", err)
@@ -356,7 +374,7 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 	logger.LogDebug(c, "fullRequestURL: %s", common.SanitizeURLForLog(fullRequestURL))
 	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
 	if err != nil {
-		return nil, fmt.Errorf("new request failed: %w", err)
+		return nil, fmt.Errorf("new request failed: %w", redactUpstreamURLError(err))
 	}
 	ApplyUpstreamBodyMetadata(req, requestBody)
 	// set form data
@@ -382,7 +400,7 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 // and Responses WebSocket relays. It honors the channel proxy, is bound to the
 // request context, and reports a rejected handshake as a *types.NewAPIError
 // carrying the upstream status code (types.NewError preserves it).
-func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*websocket.Conn, error) {
+func DoWssRequest(a ProviderTransport, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*websocket.Conn, error) {
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", err)
@@ -426,7 +444,7 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 				_ = resp.Body.Close()
 			}
 		}
-		return nil, types.NewErrorWithStatusCode(fmt.Errorf("dial failed to %s: %w", common.SanitizeURLForLog(fullRequestURL), err), types.ErrorCodeDoRequestFailed, statusCode)
+		return nil, types.NewErrorWithStatusCode(fmt.Errorf("dial failed to %s: %w", common.SanitizeURLForLog(fullRequestURL), redactUpstreamURLError(err)), types.ErrorCodeDoRequestFailed, statusCode)
 	}
 	return targetConn, nil
 }
@@ -488,7 +506,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, req.URL.Scheme+"://"+req.URL.Host)
 	resp, err := relayClient.Do(req)
 	if err != nil {
-		logger.LogError(c, common2.LogText("do request failed: %s", err.Error()))
+		logger.LogError(c, common2.LogText("do request failed: %s", redactUpstreamURLError(err).Error()))
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))
 	}
 	if resp == nil {

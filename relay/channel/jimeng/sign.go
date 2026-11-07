@@ -5,7 +5,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,7 +15,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/gin-gonic/gin"
 )
 
@@ -42,11 +41,10 @@ import (
 const HexPayloadHashKey = "HexPayloadHash"
 
 func SetPayloadHash(c *gin.Context, req any) error {
-	body, err := json.Marshal(req)
+	body, err := common.Marshal(req)
 	if err != nil {
 		return err
 	}
-	logger.LogInfo(c, common.LogText("SetPayloadHash body: %s", body))
 	payloadHash := sha256.Sum256(body)
 	hexPayloadHash := hex.EncodeToString(payloadHash[:])
 	c.Set(HexPayloadHashKey, hexPayloadHash)
@@ -57,6 +55,11 @@ func getPayloadHash(c *gin.Context) string {
 }
 
 func Sign(c *gin.Context, req *http.Request, apiKey string) error {
+	return (&Provider{}).SignRequest(req, &channel.ProviderRequest{ApiKey: apiKey})
+}
+
+func (p *Provider) SignRequest(req *http.Request, metadata channel.ProviderMetadata) error {
+	apiKey := metadata.ProviderRequest().ApiKey
 	header := req.Header
 
 	var bodyBytes []byte
@@ -74,7 +77,7 @@ func Sign(c *gin.Context, req *http.Request, apiKey string) error {
 	payloadHash := sha256.Sum256(bodyBytes)
 	hexPayloadHash := hex.EncodeToString(payloadHash[:])
 
-	method := c.Request.Method
+	method := req.Method
 	u := req.URL
 	keyParts := strings.Split(apiKey, "|")
 	if len(keyParts) != 2 {

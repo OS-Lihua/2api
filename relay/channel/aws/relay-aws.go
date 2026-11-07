@@ -2,7 +2,6 @@ package aws
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -62,7 +61,12 @@ func newAwsInvokeError(requestContext context.Context, err error, operation stri
 }
 
 func newAwsClient(c *gin.Context, info *relaycommon.RelayInfo) (*bedrockruntime.Client, error) {
-	httpClient, err := service.GetHttpClientWithProxySettings(info.ChannelSetting.Proxy, info.ChannelSetting)
+	return (&Provider{}).NewClient(channel.NewProviderMetadata(info))
+}
+
+func (a *Provider) NewClient(metadata channel.ProviderMetadata) (*bedrockruntime.Client, error) {
+	info := metadata.ProviderRequest()
+	httpClient, err := service.GetHttpClientWithProxySettings(info.ChannelSetting.Proxy, info.ChannelSetting.HTTPSettings())
 	if err != nil {
 		return nil, fmt.Errorf("new proxy http client failed: %w", err)
 	}
@@ -94,7 +98,7 @@ func newAwsClient(c *gin.Context, info *relaycommon.RelayInfo) (*bedrockruntime.
 	return client, nil
 }
 
-func doAwsClientRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor, requestBody io.Reader) (any, error) {
+func doAwsClientRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Protocol, requestBody io.Reader) (any, error) {
 	awsCli, err := newAwsClient(c, info)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeChannelAwsClientError)
@@ -232,7 +236,7 @@ func getAwsModelID(requestModel string) string {
 	return requestModel
 }
 
-func awsHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types.NewAPIError, *dto.Usage) {
+func awsHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Protocol) (*types.NewAPIError, *dto.Usage) {
 
 	requestContext := c.Request.Context()
 	ctx, cancel := newAwsInvokeContext(requestContext)
@@ -263,7 +267,7 @@ func awsHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types
 	return nil, claudeInfo.Usage
 }
 
-func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types.NewAPIError, *dto.Usage) {
+func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Protocol) (*types.NewAPIError, *dto.Usage) {
 	requestContext := c.Request.Context()
 	ctx, cancel := newAwsInvokeContext(requestContext)
 	defer cancel()
@@ -320,7 +324,7 @@ streamLoop:
 }
 
 // Nova模型处理函数
-func handleNovaRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types.NewAPIError, *dto.Usage) {
+func handleNovaRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Protocol) (*types.NewAPIError, *dto.Usage) {
 
 	requestContext := c.Request.Context()
 	ctx, cancel := newAwsInvokeContext(requestContext)
@@ -331,47 +335,10 @@ func handleNovaRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) 
 		return newAwsInvokeError(requestContext, err, "InvokeModel"), nil
 	}
 
-	// 解析Nova响应
-	var novaResp struct {
-		Output struct {
-			Message struct {
-				Content []struct {
-					Text string `json:"text"`
-				} `json:"content"`
-			} `json:"message"`
-		} `json:"output"`
-		Usage struct {
-			InputTokens  int `json:"inputTokens"`
-			OutputTokens int `json:"outputTokens"`
-			TotalTokens  int `json:"totalTokens"`
-		} `json:"usage"`
-	}
-
-	if err := json.Unmarshal(awsResp.Body, &novaResp); err != nil {
+	response, _, err := novaChatResponse(awsResp.Body, info.UpstreamModelName, helper.GetResponseID(c))
+	if err != nil {
 		return types.NewError(errors.Wrap(err, "unmarshal nova response"), types.ErrorCodeBadResponseBody), nil
 	}
-
-	// 构造OpenAI格式响应
-	response := dto.OpenAITextResponse{
-		Id:      helper.GetResponseID(c),
-		Object:  "chat.completion",
-		Created: common.GetTimestamp(),
-		Model:   info.UpstreamModelName,
-		Choices: []dto.OpenAITextResponseChoice{{
-			Index: 0,
-			Message: dto.Message{
-				Role:    "assistant",
-				Content: novaResp.Output.Message.Content[0].Text,
-			},
-			FinishReason: "stop",
-		}},
-		Usage: dto.Usage{
-			PromptTokens:     novaResp.Usage.InputTokens,
-			CompletionTokens: novaResp.Usage.OutputTokens,
-			TotalTokens:      novaResp.Usage.TotalTokens,
-		},
-	}
-
 	c.JSON(http.StatusOK, response)
 	return nil, &response.Usage
 }

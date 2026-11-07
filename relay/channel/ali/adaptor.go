@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
@@ -21,7 +22,7 @@ import (
 	"github.com/samber/lo"
 )
 
-type Adaptor struct {
+type Protocol struct {
 }
 
 const aliAnthropicMessagesModelsEnv = "ALI_ANTHROPIC_MESSAGES_MODELS"
@@ -46,12 +47,12 @@ func aliAnthropicMessagesModelPatterns() []string {
 	})
 }
 
-func (a *Adaptor) ConvertGeminiRequest(*gin.Context, *relaycommon.RelayInfo, *dto.GeminiChatRequest) (any, error) {
+func (a *Protocol) ConvertGeminiRequest(*gin.Context, *relaycommon.RelayInfo, *dto.GeminiChatRequest) (any, error) {
 	//TODO implement me
 	return nil, errors.New("not implemented")
 }
 
-func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayInfo, req *dto.ClaudeRequest) (any, error) {
+func (a *Protocol) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayInfo, req *dto.ClaudeRequest) (any, error) {
 	if supportsAliAnthropicMessages(info.UpstreamModelName) {
 		ensureAnthropicWebSearchEntrypoint(req)
 		return req, nil
@@ -71,7 +72,7 @@ func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayIn
 	return a.ConvertOpenAIRequest(c, info, oaiReq)
 }
 
-func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
+func (a *Protocol) Init(info *relaycommon.RelayInfo) {
 	if info.RelayMode == constant.RelayModeResponses {
 		info.VendorToolUsage = aliResponsesToolUsage
 	}
@@ -86,7 +87,11 @@ func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 	}
 }
 
-func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
+func (a *Provider) RequestURL(metadata channel.ProviderMetadata) (string, error) {
+	info := metadata.ProviderRequest()
+	if info.Protocol == protocol.AnthropicMessages && !supportsAliAnthropicMessages(info.UpstreamModelName) {
+		return "", errors.New("ali model does not support explicitly selected Anthropic Messages")
+	}
 	var fullRequestURL string
 	switch info.RelayFormat {
 	case types.RelayFormatClaude:
@@ -117,19 +122,20 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 	return fullRequestURL, nil
 }
 
-func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *relaycommon.RelayInfo) error {
-	channel.SetupApiRequestHeader(info, c, req)
+func (a *Provider) SetupHeader(c *gin.Context, req *http.Header, metadata channel.ProviderMetadata) error {
+	info := metadata.ProviderRequest()
+	channel.SetupProviderRequestHeader(info, c, req)
 	req.Set("Authorization", "Bearer "+info.ApiKey)
 	if info.IsStream {
 		req.Set("X-DashScope-SSE", "enable")
 	}
-	if c.GetString("plugin") != "" {
+	if c != nil && c.GetString("plugin") != "" {
 		req.Set("X-DashScope-Plugin", c.GetString("plugin"))
 	}
 	return nil
 }
 
-func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) (any, error) {
+func (a *Protocol) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) (any, error) {
 	if request == nil {
 		return nil, errors.New("request is nil")
 	}
@@ -160,7 +166,7 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 // The rejection is a 400 that skips channel retries: every channel of this
 // type refuses the same name, and a retryable 500 would only hide the
 // misconfiguration behind unrelated channels.
-func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.ImageRequest) (any, error) {
+func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.ImageRequest) (any, error) {
 	return nil, types.NewErrorWithStatusCode(
 		fmt.Errorf("image model %q is not served by the alibaba task plugin; use a Bailian image model name declared by the plugin or map it with the channel model mapping", info.UpstreamModelName),
 		types.ErrorCodeInvalidRequest,
@@ -169,31 +175,31 @@ func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInf
 	)
 }
 
-func (a *Adaptor) ConvertRerankRequest(c *gin.Context, relayMode int, request dto.RerankRequest) (any, error) {
+func (a *Protocol) ConvertRerankRequest(c *gin.Context, relayMode int, request dto.RerankRequest) (any, error) {
 	return ConvertRerankRequest(request), nil
 }
 
-func (a *Adaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.EmbeddingRequest) (any, error) {
+func (a *Protocol) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.EmbeddingRequest) (any, error) {
 	if isMultimodalEmbeddingModel(info.UpstreamModelName) {
 		return convertToMultimodalEmbeddingRequest(request)
 	}
 	return request, nil
 }
 
-func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.AudioRequest) (io.Reader, error) {
+func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.AudioRequest) (io.Reader, error) {
 	//TODO implement me
 	return nil, errors.New("not implemented")
 }
 
-func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
+func (a *Protocol) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
 	return request, nil
 }
 
-func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
+func (a *Protocol) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
 	return channel.DoApiRequest(a, c, info, requestBody)
 }
 
-func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {
+func (a *Protocol) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {
 	switch info.RelayFormat {
 	case types.RelayFormatClaude:
 		if supportsAliAnthropicMessages(info.UpstreamModelName) {
@@ -222,10 +228,10 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	}
 }
 
-func (a *Adaptor) GetModelList() []string {
+func (a *Protocol) GetModelList() []string {
 	return ModelList
 }
 
-func (a *Adaptor) GetChannelName() string {
+func (a *Protocol) GetChannelName() string {
 	return ChannelName
 }

@@ -12,7 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func (a *Adaptor) doSGLangRerankResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
+func (a *Protocol) doSGLangRerankResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
 	// SGLang v0.5.19 returns a sorted array with score, not a Jina results envelope.
 	// https://github.com/sgl-project/sglang/blob/v0.5.19/python/sglang/srt/entrypoints/openai/serving_rerank.py

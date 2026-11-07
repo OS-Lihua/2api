@@ -18,13 +18,11 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/advancedcustom"
 	"github.com/QuantumNous/new-api/relay/channel/gemini"
 	"github.com/QuantumNous/new-api/relay/channel/ollama"
-	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
-	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
@@ -473,20 +471,13 @@ func fetchAdvancedCustomUpstreamModelIDs(channel *model.Provider, baseURL string
 	}
 	key = strings.TrimSpace(key)
 
-	info := &relaycommon.RelayInfo{
-		RelayFormat:    types.RelayFormatOpenAI,
-		RelayMode:      relayconstant.RelayModeUnknown,
-		RequestURLPath: dto.AdvancedCustomModelListPath,
-		ProviderMeta: &relaycommon.ProviderMeta{
-			ChannelType:          channel.Type,
-			ChannelBaseUrl:       baseURL,
-			ApiKey:               key,
-			ChannelOtherSettings: channel.GetOtherSettings(),
-		},
+	metadata := &relaychannel.ProviderRequest{
+		ChannelType:          channel.Type,
+		ChannelBaseUrl:       baseURL,
+		ApiKey:               key,
+		ChannelOtherSettings: relaychannel.ProviderAccountSettings{AdvancedCustom: channel.GetOtherSettings().AdvancedCustom},
 	}
-
-	adaptor := &advancedcustom.Adaptor{}
-	url, headers, err := adaptor.BuildModelListRequest(info)
+	url, headers, err := (&advancedcustom.Provider{}).BuildModelListRequest(metadata)
 	if err != nil {
 		return nil, sanitizeFetchModelsError(err, key)
 	}

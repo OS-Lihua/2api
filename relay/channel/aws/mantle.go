@@ -2,26 +2,24 @@ package aws
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/QuantumNous/new-api/relay/channel"
-	"github.com/QuantumNous/new-api/relay/channel/claude"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 
 	"github.com/MoeForge/moego/ojson"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/gin-gonic/gin"
 )
 
 func mantleRequestURL(info *relaycommon.RelayInfo) (string, error) {
+	return mantleProviderRequestURL(channel.NewProviderMetadata(info))
+}
+
+func mantleProviderRequestURL(info *channel.ProviderRequest) (string, error) {
 	parts := strings.Split(info.ApiKey, "|")
 	if len(parts) != 2 && len(parts) != 3 {
 		return "", fmt.Errorf("invalid AWS credentials: use APIKey|Region or AccessKey|SecretAccessKey|Region")
@@ -59,12 +57,29 @@ func mantleRequestURL(info *relaycommon.RelayInfo) (string, error) {
 
 // Mantle uses native Messages JSON and SSE, not the InvokeModel envelope.
 // Sign the final payload and headers, including administrator overrides.
-func (a *Adaptor) newMantleRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (*http.Request, error) {
-	endpoint, err := mantleRequestURL(info)
+func (a *Protocol) newMantleRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (*http.Request, error) {
+	if a.IsNova {
+		return nil, fmt.Errorf("AWS Mantle Messages API requires a Claude model; use InvokeModel for Amazon Nova")
+	}
+	metadata := channel.NewProviderMetadata(info)
+	overrides, err := channel.ResolveHeaderOverride(info, c)
 	if err != nil {
 		return nil, err
 	}
-	if a.IsNova || isNovaModel(getAwsModelID(info.UpstreamModelName)) {
+	metadata.RequestHeaders = make(http.Header, len(overrides))
+	for key, value := range overrides {
+		metadata.RequestHeaders.Set(key, value)
+	}
+	return (&Provider{}).NewMantleRequest(c, metadata, requestBody)
+}
+
+func (p *Provider) NewMantleRequest(c *gin.Context, metadata channel.ProviderMetadata, requestBody io.Reader) (*http.Request, error) {
+	info := metadata.ProviderRequest()
+	endpoint, err := mantleProviderRequestURL(info)
+	if err != nil {
+		return nil, err
+	}
+	if isNovaModel(getAwsModelID(info.UpstreamModelName)) {
 		return nil, fmt.Errorf("AWS Mantle Messages API requires a Claude model; use InvokeModel for Amazon Nova")
 	}
 	payload, err := io.ReadAll(requestBody)
@@ -100,48 +115,17 @@ func (a *Adaptor) newMantleRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 	if err != nil {
 		return nil, fmt.Errorf("create AWS Mantle request: %w", err)
 	}
-	channel.SetupApiRequestHeader(info, c, &req.Header)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("anthropic-version", "2023-06-01")
-	claude.CommonClaudeHeadersOperation(c, &req.Header, info)
-	parts := strings.Split(info.ApiKey, "|")
-	if len(parts) == 2 {
-		req.Header.Set("x-api-key", parts[0])
-	}
-	headerOverride, err := channel.ResolveHeaderOverride(info, c)
-	if err != nil {
+	if err := p.SetupHeader(c, &req.Header, metadata); err != nil {
 		return nil, err
 	}
-	for key, value := range headerOverride {
-		req.Header.Set(key, value)
+	for key, values := range info.RequestHeaders {
+		req.Header[key] = append([]string(nil), values...)
 		if strings.EqualFold(key, "Host") {
-			req.Host = value
+			req.Host = info.RequestHeaders.Get(key)
 		}
 	}
-	// HTTP/2 and intermediaries can remove hop-by-hop headers. Strip them
-	// after overrides, including fields named by Connection, so SigV4 covers
-	// only headers that will reach Mantle. Proxy credentials must stay local.
-	for _, connection := range req.Header.Values("Connection") {
-		for name := range strings.SplitSeq(connection, ",") {
-			req.Header.Del(strings.TrimSpace(name))
-		}
-	}
-	for _, name := range []string{
-		"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate",
-		"Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade",
-	} {
-		req.Header.Del(name)
-	}
-	if len(parts) == 3 {
-		// Never send an unrelated bearer credential alongside SigV4. The AWS
-		// signer handles timestamps and signing the exact transmitted payload.
-		req.Header.Del("Authorization")
-		req.Header.Del("x-api-key")
-		credentials := aws.Credentials{AccessKeyID: parts[0], SecretAccessKey: parts[1]}
-		hash := sha256.Sum256(body)
-		if err := v4.NewSigner().SignHTTP(req.Context(), credentials, req, hex.EncodeToString(hash[:]), "bedrock-mantle", parts[2], time.Now()); err != nil {
-			return nil, fmt.Errorf("sign AWS Mantle request: %w", err)
-		}
+	if err := p.SignRequest(req, metadata, body); err != nil {
+		return nil, err
 	}
 	return req, nil
 }
