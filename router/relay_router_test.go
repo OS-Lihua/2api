@@ -727,6 +727,21 @@ func TestTextGatewayMissingUsageIgnoresOutputCeilings(t *testing.T) {
 	}
 }
 
+func TestTextGatewayGeminiResolvesColonAlias(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	})
+	fixture.offering.Aliases = append(fixture.offering.Aliases, "gateway:alias")
+	require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1beta/models/gateway:alias:generateContent", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16}}`)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, "gateway:alias", record.RequestedName)
+	assert.Equal(t, int64(36000), record.Receivable.Nanos)
+}
+
 func TestTextGatewayClaudeConversionPreservesExplicitZeroScalars(t *testing.T) {
 	for _, test := range []struct{ path, body string }{
 		{"/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":0,"temperature":0,"top_p":0}`},

@@ -67,9 +67,10 @@ func TextGatewayEndpoint(method, path string) (protocol.Type, string) {
 	}
 	for _, prefix := range []string{"/v1beta/models/", "/v1/models/"} {
 		if modelAction, ok := strings.CutPrefix(path, prefix); ok {
-			name, action, found := strings.Cut(modelAction, ":")
-			if found && name != "" && (action == "generateContent" || action == "streamGenerateContent") {
-				return protocol.GeminiGenerate, name
+			for _, action := range []string{"generateContent", "streamGenerateContent"} {
+				if name, found := strings.CutSuffix(modelAction, ":"+action); found && name != "" {
+					return protocol.GeminiGenerate, name
+				}
 			}
 		}
 	}
