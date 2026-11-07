@@ -31,6 +31,46 @@ type KeyPermissions struct {
 	Revision     int64 `json:"revision"`
 }
 
+// MigrateKeyPermissions freezes legacy name allowlists as Offering identities.
+// Existing ID policies always win, including policies edited on another node.
+func MigrateKeyPermissions(db *gorm.DB) error {
+	var tokens []Token
+	return db.Select("id").Where(`"model_limits_enabled" = TRUE AND NOT EXISTS (SELECT 1 FROM "token_offering_policies" WHERE "token_id" = "tokens"."id")`).FindInBatches(&tokens, 100, func(_ *gorm.DB, _ int) error {
+		for _, candidate := range tokens {
+			if err := db.Transaction(func(tx *gorm.DB) error {
+				var token Token
+				if err := lockForUpdate(tx).Select("id", "model_limits_enabled", "model_limits").First(&token, candidate.Id).Error; err != nil {
+					return err
+				}
+				var count int64
+				if err := tx.Model(&TokenOfferingPolicy{}).Where("token_id = ?", token.Id).Count(&count).Error; err != nil {
+					return err
+				}
+				if count > 0 || !token.ModelLimitsEnabled {
+					return nil
+				}
+				ids := []int{}
+				if err := tx.Model(&ModelOfferingName{}).Where(`"name" = ANY(string_to_array(?, ','))`, token.ModelLimits).Distinct("offering_id").Order("offering_id").Pluck("offering_id", &ids).Error; err != nil {
+					return err
+				}
+				policy := TokenOfferingPolicy{TokenID: token.Id, DefaultAllow: false}
+				if err := tx.Omit("Token").Create(&policy).Error; err != nil {
+					return err
+				}
+				for _, id := range ids {
+					if err := tx.Omit("Token", "Offering").Create(&TokenOfferingException{TokenID: token.Id, OfferingID: id}).Error; err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}).Error
+}
+
 var ErrKeyPermissionsConflict = errors.New("key permissions changed")
 
 func GetKeyPermissions(ctx context.Context, tokenID, ownerID int) (*KeyPermissions, error) {

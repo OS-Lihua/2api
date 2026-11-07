@@ -17,6 +17,37 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestKeyPermissionsLegacyAllowlistMigration(t *testing.T) {
+	f := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+	})
+	other := model.ModelOffering{Name: "outside-legacy-list", Members: f.offering.Members}
+	require.NoError(t, model.SaveModelOffering(t.Context(), &other, "save"))
+	price := model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: other.ID, Currency: f.sale.Currency, Expression: f.sale.Expression, EffectiveAt: f.fake.Now().Unix() - 1}
+	require.NoError(t, model.CreatePriceVersion(t.Context(), &price, f.sale.CreatedBy))
+	require.NoError(t, model.SaveModelOffering(t.Context(), &other, "enable"))
+	require.NoError(t, model.DB.Model(f.token).Updates(map[string]any{"model_limits_enabled": true, "model_limits": "gateway-alias,missing-legacy-name"}).Error)
+	require.NoError(t, model.MigrateKeyPermissions(model.DB))
+	require.NoError(t, model.MigrateKeyPermissions(model.DB))
+	pat := createWalletTestAccessToken(t, f.user.Id, "api_key:read")
+	permissions := adminSecurityRequest(f.engine, pat, http.MethodGet, fmt.Sprintf("/api/token/%d/permissions", f.token.Id), "")
+	assert.Contains(t, permissions.Body.String(), `"default_allow":false`)
+	assert.Contains(t, permissions.Body.String(), fmt.Sprintf(`"exception_ids":[%d]`, f.offering.ID))
+	denied := adminSecurityRequest(f.engine, f.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"outside-legacy-list","messages":[{"role":"user","content":"Hello"}]}`)
+	assert.Equal(t, 404, denied.Code, denied.Body.String())
+	f.offering.Name = "renamed-legacy-offering"
+	f.offering.Aliases = []string{}
+	require.NoError(t, model.SaveModelOffering(t.Context(), f.offering, "save"))
+	allowed := adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, "/v1/models/renamed-legacy-offering", "")
+	assert.Equal(t, 200, allowed.Code, allowed.Body.String())
+	_, err := model.MutateKeyPermissions(t.Context(), f.token.Id, f.user.Id, 0, "allow_all", model.KeyPermissions{}, nil)
+	require.NoError(t, err)
+	require.NoError(t, model.MigrateKeyPermissions(model.DB))
+	allowed = adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, "/v1/models/outside-legacy-list", "")
+	assert.Equal(t, 200, allowed.Code, allowed.Body.String())
+}
+
 func TestKeyPermissionsDiscoveryProtocols(t *testing.T) {
 	f := newTextGatewayFixture(t, func(http.ResponseWriter, *http.Request) { t.Error("unexpected dispatch") })
 	for _, tc := range []struct{ path, header, field string }{{"/v1/models/gateway-alias", "x-api-key", "type"}, {"/v1beta/models/gateway-alias", "x-goog-api-key", "name"}} {
@@ -180,6 +211,10 @@ func TestKeyPermissionsListDetailAndCall(t *testing.T) {
 	endpoint := fmt.Sprintf("/api/token/%d/permissions", f.token.Id)
 	deniedPolicy := adminSecurityRequest(f.engine, pat, http.MethodPatch, endpoint, `{"action":"deny_all","revision":0}`)
 	require.Equal(t, 200, deniedPolicy.Code, deniedPolicy.Body.String())
+	rejected := adminSecurityRequest(f.engine, pat, http.MethodPatch, endpoint, `{"action":"replace","default_allow":true,"revision":1}`)
+	assert.Equal(t, 400, rejected.Code, rejected.Body.String())
+	list = adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, "/v1/models", "")
+	assert.Contains(t, list.Body.String(), `"data":[]`)
 	denied := adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, "/v1/models/gateway-alias", "")
 	missing := adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, "/v1/models/missing", "")
 	assert.Equal(t, 404, denied.Code, denied.Body.String())
