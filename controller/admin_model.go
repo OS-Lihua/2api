@@ -261,7 +261,7 @@ func AdminDeleteModel(c *gin.Context) {
 		return
 	}
 	if _, err := model.DeleteModelMetadata([]int{id}, false, false); err != nil {
-		if errors.Is(err, model.ErrModelHasChannels) {
+		if errors.Is(err, model.ErrModelHasChannels) || errors.Is(err, model.ErrModelOfferingMember) {
 			common.ApiErrorStatus(c, http.StatusConflict, err)
 			return
 		}

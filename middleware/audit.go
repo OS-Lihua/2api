@@ -106,6 +106,13 @@ var auditRouteActions = map[string]string{
 	"POST /api/admin/v1/channels/:id/enable":  "channel.enable",
 	"POST /api/admin/v1/channels/:id/disable": "channel.disable",
 
+	// ModelOffering management.
+	"POST /api/admin/v1/model-offerings":             "model_offering.create",
+	"PUT /api/admin/v1/model-offerings/:id":          "model_offering.update",
+	"DELETE /api/admin/v1/model-offerings/:id":       "model_offering.delete",
+	"POST /api/admin/v1/model-offerings/:id/enable":  "model_offering.enable",
+	"POST /api/admin/v1/model-offerings/:id/disable": "model_offering.disable",
+
 	// 部署
 	"POST /api/deployments/":      "deployment.create",
 	"PUT /api/deployments/:id":    "deployment.update",
