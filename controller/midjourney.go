@@ -89,7 +89,7 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 		}
 		midjourneyChannel, err := model.CacheGetProvider(channelId)
 		if err != nil {
-			logger.LogError(ctx, common.LogText("CacheGetChannel: %v", err))
+			logger.LogError(ctx, common.LogText("CacheGetProvider: %v", err))
 			err := model.MjBulkUpdate(taskIds, map[string]any{
 				"fail_reason": "Failed to get the channel information. Please contact the administrator",
 				"status":      "FAILURE",

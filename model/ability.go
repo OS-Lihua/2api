@@ -172,7 +172,7 @@ func GetProvider(
 	return &channel, err
 }
 
-// filterAbilitiesByConstraints applies the same ChannelSatisfiesFilters
+// filterAbilitiesByConstraints applies the same ProviderSatisfiesFilters
 // predicate used by the memory-cache path. A failed channel lookup fails
 // closed when a task-plugin identity is required and fails open otherwise.
 func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters []dto.ProviderFilter) []Ability {

@@ -94,8 +94,8 @@ func (p *RetryParam) ResetRetryNextTry() {
 //   - priorityRetry = Retry - startRetryIndex, represents the priority level within current group.
 //     priorityRetry = Retry - startRetryIndex，表示当前分组内的优先级级别。
 //
-//   - When GetRandomSatisfiedChannel returns nil (priorities exhausted), moves to next group.
-//     当 GetRandomSatisfiedChannel 返回 nil（优先级用完）时，切换到下一个分组。
+//   - When GetRandomSatisfiedProvider returns nil (priorities exhausted), moves to next group.
+//     当 GetRandomSatisfiedProvider 返回 nil（优先级用完）时，切换到下一个分组。
 //
 // Example flow (2 groups, each with 2 priorities, RetryTimes=3):
 // 示例流程（2个分组，每个有2个优先级，RetryTimes=3）：

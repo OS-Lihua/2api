@@ -246,7 +246,7 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	}
 	ch, err := model.CacheGetProvider(channelId)
 	if err != nil {
-		common.SysLog(common.LogText("CacheGetChannel: %v", err))
+		common.SysLog(common.LogText("CacheGetProvider: %v", err))
 		// Collect DB primary key IDs for bulk update (taskIds are upstream IDs, not task_id column values)
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
@@ -448,7 +448,7 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 		if errUpdate != nil {
 			common.SysLog(common.LogText("UpdateVideoTask error: %v", errUpdate))
 		}
-		return fmt.Errorf("CacheGetChannel failed: %w", err)
+		return fmt.Errorf("CacheGetProvider failed: %w", err)
 	}
 	adaptor := GetTaskAdaptorFunc(platform)
 	if adaptor == nil {

@@ -566,7 +566,7 @@ func refreshChannelRuntimeCache() {
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					common.SysLog(common.LogText("InitChannelCache panic: %v", r))
+					common.SysLog(common.LogText("InitProviderCache panic: %v", r))
 				}
 			}()
 			model.InitProviderCache()

@@ -133,7 +133,7 @@ func runCodexCredentialAutoRefreshOnce() {
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					logger.LogWarn(ctx, common.LogText("codex credential auto-refresh: InitChannelCache panic: %v", r))
+					logger.LogWarn(ctx, common.LogText("codex credential auto-refresh: InitProviderCache panic: %v", r))
 				}
 			}()
 			model.InitProviderCache()

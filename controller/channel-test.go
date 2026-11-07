@@ -858,7 +858,7 @@ func TestChannel(c *gin.Context) {
 		}
 	}
 	//defer func() {
-	//	if channel.ChannelInfo.IsMultiKey {
+	//	if channel.ProviderInfo.IsMultiKey {
 	//		go func() { _ = channel.SaveChannelInfo() }()
 	//	}
 	//}()

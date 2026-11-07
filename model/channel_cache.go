@@ -287,7 +287,7 @@ func CacheUpdateProvider(channel *Provider) {
 		channelsIDM = make(map[int]*Provider)
 	}
 	if oldChannel, ok := channelsIDM[channel.Id]; ok {
-		logger.LogDebug(nil, "CacheUpdateChannel before: id=%d, name=%s, status=%d, polling_index=%d", channel.Id, channel.Name, channel.Status, oldChannel.ProviderInfo.MultiKeyPollingIndex)
+		logger.LogDebug(nil, "CacheUpdateProvider before: id=%d, name=%s, status=%d, polling_index=%d", channel.Id, channel.Name, channel.Status, oldChannel.ProviderInfo.MultiKeyPollingIndex)
 	}
 	channelsIDM[channel.Id] = channel
 	if channel2advancedCustomConfig == nil {
@@ -299,7 +299,7 @@ func CacheUpdateProvider(channel *Provider) {
 			channel2advancedCustomConfig[channel.Id] = config
 		}
 	}
-	logger.LogDebug(nil, "CacheUpdateChannel after: id=%d, name=%s, status=%d, polling_index=%d", channel.Id, channel.Name, channel.Status, channel.ProviderInfo.MultiKeyPollingIndex)
+	logger.LogDebug(nil, "CacheUpdateProvider after: id=%d, name=%s, status=%d, polling_index=%d", channel.Id, channel.Name, channel.Status, channel.ProviderInfo.MultiKeyPollingIndex)
 	// Lock ordering: do NOT hold channelSyncLock while calling
 	// InvalidatePricingCache. GetPricing acquires updatePricingLock first and then
 	// channelSyncLock.RLock (via loadPricingAdvancedCustomConfigs); acquiring

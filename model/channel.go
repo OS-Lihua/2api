@@ -264,7 +264,7 @@ func (channel *Provider) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 			if !common.MemoryCacheEnabled {
 				_ = channel.SaveProviderInfo()
 			} else {
-				// CacheUpdateChannel(channel)
+				// CacheUpdateProvider(channel)
 			}
 		}()
 		// Start from the saved polling index and look for the next enabled key
@@ -417,7 +417,7 @@ func SearchProviders(keyword string, group string, model string, idSort bool, so
 //
 // WARNING: do NOT call this on request hot paths (middleware, distribution,
 // relay submit/retry, polling). Every call is a synchronous DB query and will
-// not see cache-only state. Use CacheGetChannel instead: it serves from the
+// not see cache-only state. Use CacheGetProvider instead: it serves from the
 // in-memory cache and falls back to this function automatically when
 // MemoryCacheEnabled is false. Direct use is appropriate only where fresh DB
 // state is required, e.g. admin CRUD, channel testing, or cache (re)building.
@@ -748,7 +748,7 @@ func UpdateProviderStatus(channelId int, usingKey string, status int, reason str
 			if beforeStatus != channelCache.Status {
 				CacheUpdateProviderStatus(channelId, channelCache.Status)
 			}
-			//CacheUpdateChannel(channelCache)
+			//CacheUpdateProvider(channelCache)
 			//return true
 		} else {
 			// 如果缓存渠道存在，且状态已是目标状态，直接返回

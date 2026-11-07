@@ -133,7 +133,7 @@ func getPricingEndpointTypesForAbility(ability AbilityWithProvider, advancedCust
 // updatePricingLock is held, and nests channelSyncLock.RLock. This defines the
 // global lock order updatePricingLock -> channelSyncLock: any code path holding
 // channelSyncLock must release it before touching the pricing cache (see
-// InitChannelCache / CacheUpdateChannel), otherwise it deadlocks.
+// InitProviderCache / CacheUpdateProvider), otherwise it deadlocks.
 // The returned configs are pointers shared with the channel cache; they are
 // replaced wholesale on update and never mutated in place, so reading them after
 // RUnlock is safe.

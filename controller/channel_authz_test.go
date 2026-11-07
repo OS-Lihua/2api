@@ -159,7 +159,7 @@ func TestChannelStatusValidation(t *testing.T) {
 }
 
 // TestChannelFieldsAreClassified guards the fail-closed sensitivity check: every
-// JSON field of PatchProvider (including the embedded model.Channel) must be listed
+// JSON field of PatchProvider (including the embedded model.Provider) must be listed
 // in channelSensitiveFields, channelNonSensitiveFields, or
 // channelOperationalFields. A newly added field that is left unclassified will
 // fail this test, forcing a conscious permission decision instead of silently

@@ -113,7 +113,7 @@ func clearChannelReadOnlyFields(channel *PatchProvider, requestData map[string]a
 
 // channelNonSensitiveFields lists routing / server-managed channel
 // fields a ChannelWrite admin may edit without ChannelSensitiveWrite. When a new
-// field is added to model.Channel it must be added to either this set or
+// field is added to model.Provider it must be added to either this set or
 // channelSensitiveFields or channelOperationalFields; otherwise it falls through
 // to the fail-closed branch and is treated as sensitive. The
 // TestChannelFieldsAreClassified guard test enforces this.
