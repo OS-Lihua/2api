@@ -148,3 +148,22 @@ func gatewayResponseTool(item gjson.Result) (string, string, bool) {
 		return "", "", false
 	}
 }
+
+func gatewayMessagesBlockText(block gjson.Result) string {
+	switch block.Get("type").String() {
+	case "text":
+		return block.Get("text").String()
+	case "thinking":
+		return block.Get("thinking").String()
+	case "tool_use", "server_tool_use", "mcp_tool_use":
+		text := block.Get("name").String()
+		input := block.Get("input")
+		// An empty initial object is a placeholder before input_json_delta.
+		if input.Exists() && input.Type != gjson.Null && input.Raw != "{}" {
+			text += input.String()
+		}
+		return text
+	default:
+		return ""
+	}
+}

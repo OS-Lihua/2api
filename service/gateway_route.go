@@ -54,6 +54,7 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 	var selected *GatewaySelection
 	var rejected []types.ConversionDiagnostic
 	bestRank := 5
+	mediaPrepared := false
 	for _, candidate := range candidates {
 		reason := ""
 		var provider *model.Provider
@@ -78,6 +79,12 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 			if err != nil || !GatewayCapabilitiesMatch(request, caps, 0) {
 				reason = "capability"
 				break
+			}
+			if !mediaPrepared {
+				if err := PrepareGatewayMedia(c, original); err != nil {
+					return nil, &GatewayConversionError{Diagnostics: []types.ConversionDiagnostic{{Code: "request_media_unavailable", Path: "request", Message: "The request media could not be prepared", Severity: types.ConversionDiagnosticError}}}
+				}
+				mediaPrepared = true
 			}
 			common.SetContextKey(c, constant.ContextKeyOriginalModel, candidate.Model.ModelName)
 			info := relaycommon.GenRelayInfoOpenAI(c, request)

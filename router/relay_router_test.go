@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,10 +22,14 @@ import (
 	"github.com/QuantumNous/new-api/pkg/capability"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/money"
+	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
@@ -725,6 +730,113 @@ func TestTextGatewayMissingUsageIgnoresOutputCeilings(t *testing.T) {
 			assert.Equal(t, test.prompt, requests[0].Usage.PromptTokens)
 			assert.Equal(t, "estimated", requests[0].UsageSource)
 		})
+	}
+}
+
+func TestTextGatewayPreparesImageOnceForGeminiCandidate(t *testing.T) {
+	maxDownload := constant.MaxFileDownloadMB
+	constant.MaxFileDownloadMB = 1
+	t.Cleanup(func() { constant.MaxFileDownloadMB = maxDownload })
+	fetch := system_setting.GetFetchSetting()
+	original := *fetch
+	t.Cleanup(func() { *fetch = original })
+	fetch.EnableSSRFProtection = false
+	image, err := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jw0kAAAAASUVORK5CYII=")
+	require.NoError(t, err)
+	reads := 0
+	asset := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reads++
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(image)
+	}))
+	t.Cleanup(asset.Close)
+	var sent dto.GeminiChatRequest
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		require.NoError(t, common.Unmarshal(body, &sent))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}`))
+	})
+	require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "gemini_generate").Error)
+	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", capability.Set{InputModalities: []capability.Modality{capability.Text, capability.Image}, OutputModalities: []capability.Modality{capability.Text}}).Error)
+	body := fmt.Sprintf(`{"model":"gateway-offering","messages":[{"role":"user","content":[{"type":"text","text":"Hello"},{"type":"image_url","image_url":{"url":%q}}]}],"max_tokens":16}`, asset.URL)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Equal(t, 1, reads)
+	require.Len(t, sent.Contents, 1)
+	require.Len(t, sent.Contents[0].Parts, 2)
+	require.NotNil(t, sent.Contents[0].Parts[1].InlineData)
+	assert.Equal(t, "image/png", sent.Contents[0].Parts[1].InlineData.MimeType)
+	assert.Equal(t, base64.StdEncoding.EncodeToString(image), sent.Contents[0].Parts[1].InlineData.Data)
+	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, int64(36000), record.Receivable.Nanos)
+}
+
+func TestTextGatewayCandidatePreconversionDoesNotReadMedia(t *testing.T) {
+	reads := 0
+	asset := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reads++
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write([]byte("prepared image"))
+	}))
+	t.Cleanup(asset.Close)
+	relayconvert.SetMediaResolver(relayconvert.MediaResolver{
+		GetBase64Data: func(ctx context.Context, source types.FileSource, _ ...string) (string, string, error) {
+			response, err := http.Get(source.GetRawData())
+			if err != nil {
+				return "", "", err
+			}
+			defer response.Body.Close()
+			_, err = io.ReadAll(response.Body)
+			return "cHJlcGFyZWQgaW1hZ2U=", "image/png", err
+		},
+		DecodeBase64FileData: service.DecodeBase64FileData,
+	})
+	t.Cleanup(func() {
+		relayconvert.SetMediaResolver(relayconvert.MediaResolver{
+			GetBase64Data: func(ctx context.Context, source types.FileSource, reason ...string) (string, string, error) {
+				c, _ := ctx.(*gin.Context)
+				return service.GetBase64Data(c, source, reason...)
+			},
+			DecodeBase64FileData: service.DecodeBase64FileData,
+		})
+	})
+	var request dto.GeneralOpenAIRequest
+	require.NoError(t, common.Unmarshal([]byte(fmt.Sprintf(`{"model":"gpt-4o","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":%q}}]}]}`, asset.URL)), &request))
+	_, err := service.PreconvertGatewayRequest(t.Context(), nil, protocol.GeminiGenerate, &request, nil)
+	assert.Zero(t, reads, "candidate preconversion must not invoke a media loader")
+	require.Error(t, err)
+}
+
+func TestTextGatewayNativeMessagesInitialContentIsBillable(t *testing.T) {
+	for _, content := range []struct{ kind, block string }{
+		{"text", `{"type":"text","text":"Hello"}`},
+		{"server_tool_use", `{"type":"server_tool_use","id":"search","name":"web_search","input":{"query":"Hello"}}`},
+	} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", content.kind, stream), func(t *testing.T) {
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					if stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = fmt.Fprintf(w, "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":%s}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n\ndata: {\"type\":\"message_stop\"}\n\n", content.block)
+					} else {
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = fmt.Fprintf(w, `{"id":"msg","type":"message","role":"assistant","content":[%s],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`, content.block)
+					}
+				})
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "anthropic_messages").Error)
+				body := fmt.Sprintf(`{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stream":%t}`, stream)
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/messages", body)
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				assert.Contains(t, response.Body.String(), "Hello")
+				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, "success", record.Status)
+				assert.Equal(t, int64(36000), record.Receivable.Nanos)
+			})
+		}
 	}
 }
 

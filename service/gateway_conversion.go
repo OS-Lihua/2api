@@ -38,7 +38,7 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 		copy.Conversation, copy.Prompt, copy.ContextManagement = nil, nil, nil
 		request = &copy
 	}
-	result, err := relayconvert.ConvertRequest(ctx, nil, types.RelayFormatOpenAI, request)
+	result, err := relayconvert.ConvertRequest(gatewayConversionContext(ctx), nil, types.RelayFormatOpenAI, request)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +61,7 @@ func PreconvertGatewayRequest(ctx context.Context, info convmeta.Meta, kind prot
 	if err != nil {
 		return nil, err
 	}
-	result, err := relayconvert.ConvertRequest(ctx, info, format, clone)
+	result, err := relayconvert.ConvertRequest(gatewayConversionContext(ctx), info, format, clone)
 	if err != nil {
 		return result, err
 	}

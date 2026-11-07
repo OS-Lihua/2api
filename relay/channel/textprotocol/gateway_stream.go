@@ -246,8 +246,8 @@ func gatewayStreamBusinessText(body []byte, format types.RelayFormat) string {
 			}
 		}
 	case types.RelayFormatClaude:
-		if root.Get("type").String() == "content_block_start" && root.Get("content_block.type").String() == "tool_use" {
-			text.WriteString(root.Get("content_block.name").String())
+		if root.Get("type").String() == "content_block_start" {
+			text.WriteString(gatewayMessagesBlockText(root.Get("content_block")))
 		}
 		if root.Get("type").String() == "content_block_delta" {
 			for _, key := range []string{"text", "thinking", "partial_json"} {
