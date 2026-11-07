@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -253,6 +254,10 @@ func StringData(c *gin.Context, str string) error {
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
 
+	if facts, _ := common.GetContextKey(c, constant.ContextKeyResponseFacts); facts == nil {
+		c.Render(-1, common.CustomEvent{Data: "data: " + str})
+		return FlushWriter(c)
+	}
 	event := common.CustomEvent{Data: "data: " + str}
 	if err := event.Render(c.Writer); err != nil {
 		return err

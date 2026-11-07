@@ -109,6 +109,7 @@ func TextGateway(c *gin.Context) {
 	}
 	info.TokenizerModel = selection.Channel.Model.ModelName
 	info.ResponseFacts = &relaycommon.ResponseFacts{}
+	common.SetContextKey(c, constant.ContextKeyResponseFacts, info.ResponseFacts)
 	info.InitChannelMeta(c)
 	info.UpstreamModelName = selection.Channel.UpstreamModelName
 	info.IsModelMapped = true
