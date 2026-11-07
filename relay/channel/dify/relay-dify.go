@@ -269,7 +269,9 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			sr.Stop(fmt.Errorf("Dify stream delivery failed"))
 		}
 	})
-	helper.Done(c)
+	if info.ResponseFacts == nil || info.ResponseFacts.OnBusinessOutput == nil || info.ResponseFacts.BusinessOutput && info.StreamStatus.IsNormalEnd() {
+		helper.Done(c)
+	}
 	if info.ResponseFacts != nil {
 		if !info.ResponseFacts.UsageReported {
 			estimated := service.ResponseText2Usage(c, info.ResponseFacts.GeneratedText, info.TokenizerModelName(), info.GetEstimatePromptTokens())

@@ -77,7 +77,7 @@ func TextGateway(c *gin.Context) {
 		return
 	}
 	if run.status != 0 {
-		if c.Writer.Written() && strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream") {
+		if strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream") {
 			_ = helper.ObjectData(c, gin.H{"error": types.OpenAIError{Code: run.code, Type: "gateway_error", Message: run.message}})
 		} else if !c.Writer.Written() {
 			gatewayError(c, run.status, run.code, run.message)
@@ -117,25 +117,24 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	if started.IsZero() {
 		started = clock.Now()
 	}
-	sale, err := model.CurrentPriceVersion(c.Request.Context(), model.DB, model.PriceOwnerOffering, offering.ID, started.Unix())
-	if err != nil {
-		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
-		return
-	}
-	saleFX, saleRate, err := service.GatewayFX(c.Request.Context(), sale.Currency)
-	if err != nil {
-		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
-		return
-	}
-	ratio, err := service.ExactGatewayGroupRatio(userGroup)
-	if err != nil {
-		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
-		return
-	}
-	if run.sale == nil {
+	sale, saleFX, saleRate, ratio := run.sale, run.saleFX, run.saleRate, run.ratio
+	if sale == nil {
+		sale, err = model.CurrentPriceVersion(c.Request.Context(), model.DB, model.PriceOwnerOffering, offering.ID, started.Unix())
+		if err != nil {
+			run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
+			return
+		}
+		saleFX, saleRate, err = service.GatewayFX(c.Request.Context(), sale.Currency)
+		if err != nil {
+			run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
+			return
+		}
+		ratio, err = service.ExactGatewayGroupRatio(userGroup)
+		if err != nil {
+			run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
+			return
+		}
 		run.sale, run.saleFX, run.saleRate, run.ratio = sale, saleFX, saleRate, ratio
-	} else {
-		sale, saleFX, saleRate, ratio = run.sale, run.saleFX, run.saleRate, run.ratio
 	}
 	selection, err := service.SelectGatewayChannel(c, offering, request, exclusions)
 	if err != nil {
@@ -324,6 +323,15 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		if attempt != nil {
 			attempt.EndedAt = record.EndedAt
 			attempt.Status, attempt.ErrorClass = gatewayAttemptOutcome(c, info, attemptErr)
+			if budget.TimedOut() && parent.Context().Err() == nil {
+				attempt.Status = "failed"
+			}
+			if upstreamCode == "" {
+				upstreamCode = info.ResponseFacts.UpstreamErrorCode
+			}
+			if info.PerformanceBusinessRejection {
+				upstreamCode = "content_filter"
+			}
 			failure := service.ClassifyGatewayFailure(upstreamStatus, upstreamCode, transportFailed, budget.TimedOut(), parent.Context().Err() != nil, info.ResponseFacts.DownstreamWriteFailed)
 			if attempt.Status == "success" {
 				failure = service.GatewayFailure{}
@@ -331,21 +339,21 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			if attempt.Status != "success" {
 				attempt.ErrorClass = failure.Class
 			}
-			if info.IsStream && attempt.Status != "success" && !failure.Switch && !info.ResponseFacts.DownstreamWriteFailed && parent.Context().Err() == nil && upstreamStatus == 200 {
+			if info.IsStream && attempt.Status != "success" && failure.Class == "upstream_error" && !failure.Switch && !info.ResponseFacts.DownstreamWriteFailed && parent.Context().Err() == nil && upstreamStatus == 200 {
 				failure = service.GatewayFailure{Class: "stream_interrupted", Switch: true}
 				attempt.ErrorClass = failure.Class
 			}
 			result = service.GatewayAttemptResult{Attempt: attempt, Failure: failure, Delivered: info.ResponseFacts.BusinessOutput}
 
 			record.Status = attempt.Status
-			if !info.ResponseFacts.BusinessOutput && !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && !info.ResponseFacts.CompletionTokensReported {
+			if !info.ResponseFacts.BusinessOutput && info.ResponseFacts.GeneratedText == "" && !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && !info.ResponseFacts.CompletionTokensReported {
 				usage = nil
 			}
-			if usage == nil && info.ResponseFacts.BusinessOutput {
+			if usage == nil && (info.ResponseFacts.BusinessOutput || info.ResponseFacts.GeneratedText != "") {
 				usage = &dto.Usage{PromptTokens: estimatedInput, CompletionTokens: tokenkit.Count(info.TokenizerModel, info.ResponseFacts.GeneratedText)}
 			}
 			if usage != nil {
-				if !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && info.ResponseFacts.BusinessOutput {
+				if !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && (info.ResponseFacts.BusinessOutput || info.ResponseFacts.GeneratedText != "") {
 					usage.PromptTokens = estimatedInput
 				}
 				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
@@ -496,6 +504,13 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	responseUsage, responseErr := adaptor.DoResponse(c, httpResponse, info)
 	usage, _ = responseUsage.(*dto.Usage)
 	attemptErr = responseErr
+	if responseErr != nil {
+		apiError := responseErr.ToOpenAIError()
+		upstreamCode, _ = apiError.Code.(string)
+		if responseErr.StatusCode >= 400 {
+			upstreamStatus = responseErr.StatusCode
+		}
+	}
 	if status, _ := gatewayAttemptOutcome(c, info, responseErr); status != "success" {
 		run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream response failed")
 	}

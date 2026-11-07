@@ -273,7 +273,9 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			}
 		}
 		// send [DONE]
-		helper.Done(c)
+		if info.ResponseFacts == nil || info.ResponseFacts.OnBusinessOutput == nil || info.ResponseFacts.BusinessOutput {
+			helper.Done(c)
+		}
 		break
 	}
 	if err := scanner.Err(); err != nil && err != io.EOF {

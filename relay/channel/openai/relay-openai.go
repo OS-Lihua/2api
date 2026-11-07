@@ -196,6 +196,23 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 					}
 				}
 			}
+			if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+				var envelope struct {
+					Error *struct {
+						Code string `json:"code"`
+						Type string `json:"type"`
+					} `json:"error"`
+				}
+				if common.UnmarshalJsonStr(data, &envelope) == nil && envelope.Error != nil {
+					info.ResponseFacts.UpstreamErrorCode = envelope.Error.Code
+					if info.ResponseFacts.UpstreamErrorCode == "" {
+						info.ResponseFacts.UpstreamErrorCode = envelope.Error.Type
+					}
+					lastStreamData = ""
+					sr.Error(errors.New("upstream stream failed"))
+					return
+				}
+			}
 			observeStreamChoices(info, data, seenStreamToolCalls, &streamFunctionCallNames)
 			if err := processTokenData(info, data, &responseTextBuilder, &toolCount); err != nil {
 				logger.LogError(c, common.LogText("error processing stream token data: %s", err.Error()))
@@ -210,7 +227,11 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	shouldSendLastResp := true
 	if err := handleLastResponse(lastStreamData, &responseId, &createAt, &systemFingerprint, &model, &usage,
 		&containStreamUsage, info, &shouldSendLastResp); err != nil {
-		logger.LogError(c, common.LogText("error handling last response: %s, lastStreamData: [%s]", err.Error(), lastStreamData))
+		if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+			logger.LogError(c, "invalid upstream stream response")
+		} else {
+			logger.LogError(c, common.LogText("error handling last response: %s, lastStreamData: [%s]", err.Error(), lastStreamData))
+		}
 	}
 
 	// 部分兼容网关把完整的累计usage附在倒数第二个事件上，随后发送一个空的最后事件。
@@ -272,6 +293,9 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		info.CountBillableToolCall(dto.BuildInCallFunctionCall, name)
 	}
 
+	if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil && (!info.ResponseFacts.BusinessOutput || info.ResponseFacts.UpstreamErrorCode != "" || !info.StreamStatus.IsNormalEnd() || info.StreamStatus.OutcomeSnapshot().HasErrors) {
+		return usage, nil
+	}
 	HandleFinalResponse(c, info, lastStreamData, responseId, createAt, model, systemFingerprint, usage, containStreamUsage)
 
 	return usage, nil
@@ -341,7 +365,9 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
-	logger.LogDebug(c, "upstream response body: %s", responseBody)
+	if info.ResponseFacts == nil || info.ResponseFacts.OnBusinessOutput == nil {
+		logger.LogDebug(c, "upstream response body: %s", responseBody)
+	}
 	// Unmarshal to simpleResponse
 	if !channel.ProviderResponseWasRepaired(c) && info.ChannelType == constant.ChannelTypeOpenRouter && info.ChannelOtherSettings.IsOpenRouterEnterprise() {
 		responseBody, err = (&Provider{}).unwrapEnterpriseResponse(responseBody)

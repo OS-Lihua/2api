@@ -34,6 +34,7 @@ type ResponseFacts struct {
 	DownstreamWriteFailed    bool
 	GeneratedText            string
 	OnBusinessOutput         func()
+	UpstreamErrorCode        string
 }
 
 // MarkBusinessOutput records accepted content and disarms first-byte budgets.
