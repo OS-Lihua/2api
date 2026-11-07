@@ -3,6 +3,7 @@ package openai
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -74,14 +75,8 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		if err != nil {
 			return usage
 		}
-		var envelope struct {
-			Usage dto.Usage `json:"usage"`
-		}
-		if common.Unmarshal(body, &envelope) == nil {
-			usage = &envelope.Usage
-			normalizeOpenAIUsage(usage)
-			observeMediaUsage(info, usage, body)
-		}
+		usage = reportedMediaUsage(body)
+		observeMediaUsage(info, usage, body)
 		observeMediaError(info, body, resp.StatusCode)
 		return usage
 	}
@@ -100,25 +95,26 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		var completed bool
 		helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 			var chunk struct {
-				Type  string     `json:"type"`
-				Audio string     `json:"audio"`
-				Delta string     `json:"delta"`
-				Usage *dto.Usage `json:"usage"`
+				Type  string          `json:"type"`
+				Audio string          `json:"audio"`
+				Delta string          `json:"delta"`
+				Usage json.RawMessage `json:"usage"`
 			}
 			if err := common.UnmarshalJsonStr(data, &chunk); err != nil {
 				sr.Stop(errors.New("invalid speech stream event"))
 				return
 			}
-			if chunk.Usage != nil {
-				normalizeOpenAIUsage(chunk.Usage)
+			if len(chunk.Usage) > 0 && string(chunk.Usage) != "null" {
+				reported := reportedMediaUsage([]byte(data))
 				prompt, completion := relaycommon.MediaUsagePresence([]byte(data))
-				observeMediaUsage(info, chunk.Usage, []byte(data))
+				observeMediaUsage(info, reported, []byte(data))
 				if prompt {
-					usage.PromptTokens, usage.PromptTokensDetails = chunk.Usage.PromptTokens, chunk.Usage.PromptTokensDetails
+					usage.PromptTokens = reported.PromptTokens
 				}
 				if completion {
-					usage.CompletionTokens, usage.CompletionTokenDetails = chunk.Usage.CompletionTokens, chunk.Usage.CompletionTokenDetails
+					usage.CompletionTokens = reported.CompletionTokens
 				}
+				mergeMediaTokenDetails(usage, []byte(data))
 			}
 			if observeMediaError(info, []byte(data), resp.StatusCode) != nil {
 				sr.Stop(errors.New("upstream speech stream failed"))
@@ -211,14 +207,8 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		}
 
 		if info.ResponseFacts != nil && strings.Contains(resp.Header.Get("Content-Type"), "json") && observeMediaError(info, bodyBytes, resp.StatusCode) != nil {
-			var envelope struct {
-				Usage dto.Usage `json:"usage"`
-			}
-			if common.Unmarshal(bodyBytes, &envelope) == nil {
-				usage = &envelope.Usage
-				normalizeOpenAIUsage(usage)
-				observeMediaUsage(info, usage, bodyBytes)
-			}
+			usage = reportedMediaUsage(bodyBytes)
+			observeMediaUsage(info, usage, bodyBytes)
 			return usage
 		}
 		// 写入响应到客户端
@@ -298,25 +288,41 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	if err != nil {
 		return types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError), nil
 	}
-	if info.ResponseFacts != nil {
-		info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported = relaycommon.MediaUsagePresence(responseBody)
-		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
-	}
+	structured := responseFormat != "text" && responseFormat != "srt" && responseFormat != "vtt" || strings.Contains(resp.Header.Get("Content-Type"), "json")
 	var responseData struct {
 		Usage *dto.Usage `json:"usage"`
 		Text  string     `json:"text"`
 	}
-	decodeErr := common.Unmarshal(responseBody, &responseData)
+	var decodeErr error
+	if info.ResponseFacts != nil {
+		if structured {
+			var envelope struct {
+				Usage json.RawMessage `json:"usage"`
+				Text  string          `json:"text"`
+			}
+			decodeErr = common.Unmarshal(responseBody, &envelope)
+			responseData.Text = envelope.Text
+			if decodeErr == nil {
+				info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported = relaycommon.MediaUsagePresence(responseBody)
+				info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
+				if len(envelope.Usage) > 0 && string(envelope.Usage) != "null" {
+					responseData.Usage = reportedMediaUsage(responseBody)
+				}
+			}
+		}
+	} else {
+		decodeErr = common.Unmarshal(responseBody, &responseData)
+	}
 	if decodeErr == nil && responseData.Usage != nil {
 		normalizeOpenAIUsage(responseData.Usage)
 		observeMediaUsage(info, responseData.Usage, responseBody)
 	}
-	if info.ResponseFacts != nil && (responseFormat != "text" && responseFormat != "srt" && responseFormat != "vtt" || strings.Contains(resp.Header.Get("Content-Type"), "json")) {
+	if info.ResponseFacts != nil && structured {
 		if fault := observeMediaError(info, responseBody, resp.StatusCode); fault != nil {
 			return types.WithOpenAIError(*fault, resp.StatusCode), responseData.Usage
 		}
 	}
-	if info.ResponseFacts != nil && decodeErr == nil {
+	if info.ResponseFacts != nil && structured && decodeErr == nil {
 		duration := ojson.GetBytes(responseBody, "usage.seconds")
 		if !duration.Exists() {
 			duration = ojson.GetBytes(responseBody, "duration")

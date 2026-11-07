@@ -48,7 +48,16 @@ func OpenaiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 	}
 
 	var usageResp dto.SimpleResponse
-	err = common.Unmarshal(responseBody, &usageResp)
+	if info.ResponseFacts != nil {
+		var envelope struct {
+			Error any `json:"error"`
+		}
+		err = common.Unmarshal(responseBody, &envelope)
+		usageResp.Error = envelope.Error
+		usageResp.Usage = *reportedMediaUsage(responseBody)
+	} else {
+		err = common.Unmarshal(responseBody, &usageResp)
+	}
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
@@ -195,28 +204,33 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 			sr.Error(fmt.Errorf("%s", extractOpenAIImageStreamErrorMessage(raw)))
 		}
 		var chunk struct {
-			Type  string    `json:"type"`
-			Usage dto.Usage `json:"usage"`
+			Type  string          `json:"type"`
+			Usage json.RawMessage `json:"usage"`
 		}
 		if err := common.Unmarshal(raw, &chunk); err == nil {
-			normalizeOpenAIUsage(&chunk.Usage)
+			var reported dto.Usage
+			if info.ResponseFacts != nil {
+				reported = *reportedMediaUsage(raw)
+			} else {
+				_ = common.Unmarshal(chunk.Usage, &reported)
+				normalizeOpenAIUsage(&reported)
+			}
 			if info.ResponseFacts != nil {
 				prompt, completion := relaycommon.MediaUsagePresence(raw)
-				observeMediaUsage(info, &chunk.Usage, raw)
+				observeMediaUsage(info, &reported, raw)
 				if prompt {
-					usage.PromptTokens = chunk.Usage.PromptTokens
-					usage.PromptTokensDetails = chunk.Usage.PromptTokensDetails
+					usage.PromptTokens = reported.PromptTokens
 				}
 				if completion {
-					usage.CompletionTokens = chunk.Usage.CompletionTokens
-					usage.CompletionTokenDetails = chunk.Usage.CompletionTokenDetails
+					usage.CompletionTokens = reported.CompletionTokens
 				}
+				mergeMediaTokenDetails(usage, raw)
 				info.ResponseFacts.PromptTokensReported = info.ResponseFacts.PromptTokensReported || prompt
 				info.ResponseFacts.CompletionTokensReported = info.ResponseFacts.CompletionTokensReported || completion
 				info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
-			} else if service.ValidUsage(&chunk.Usage) {
-				usage = &chunk.Usage
+			} else if service.ValidUsage(&reported) {
+				usage = &reported
 			}
 			if info.ResponseFacts != nil {
 				if fault := observeMediaError(info, raw, resp.StatusCode); fault != nil {
@@ -360,8 +374,19 @@ func openaiImageJSONAsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 	// b64_json values are large and would be copied into Go strings then
 	// re-marshaled for each SSE event.
 	var usageResp dto.SimpleResponse
-	if err := common.Unmarshal(responseBody, &usageResp); err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+	var decodeErr error
+	if info.ResponseFacts != nil {
+		var envelope struct {
+			Error any `json:"error"`
+		}
+		decodeErr = common.Unmarshal(responseBody, &envelope)
+		usageResp.Error = envelope.Error
+		usageResp.Usage = *reportedMediaUsage(responseBody)
+	} else {
+		decodeErr = common.Unmarshal(responseBody, &usageResp)
+	}
+	if decodeErr != nil {
+		return nil, types.NewOpenAIError(decodeErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	normalizeOpenAIUsage(&usageResp.Usage)
 	observeMediaUsage(info, &usageResp.Usage, responseBody)

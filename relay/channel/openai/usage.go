@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"encoding/json"
 	"strings"
 
 	"github.com/MoeForge/moego/ojson"
@@ -12,6 +13,79 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 )
+
+// mediaUsageCounters bounds each reported quantity independently. A malformed
+// total or sibling cannot erase a valid base counter or explicit zero.
+func mediaUsageCounters(body []byte, depth int) map[string]any {
+	var fields map[string]json.RawMessage
+	if common.Unmarshal(body, &fields) != nil {
+		return nil
+	}
+	bounded := make(map[string]any, len(fields))
+	for name, raw := range fields {
+		if depth == 0 {
+			switch name {
+			case "prompt_tokens", "completion_tokens", "input_tokens", "output_tokens", "total_tokens", "prompt_cache_hit_tokens", "claude_cache_creation_5_m_tokens", "claude_cache_creation_1_h_tokens", "prompt_tokens_details", "completion_tokens_details", "input_tokens_details", "output_tokens_details":
+			default:
+				continue
+			}
+		}
+		if strings.HasSuffix(name, "_details") && depth < 2 {
+			if nested := mediaUsageCounters(raw, depth+1); nested != nil {
+				bounded[name] = nested
+			}
+			continue
+		}
+		var count int64
+		if string(raw) != "null" && common.Unmarshal(raw, &count) == nil && count >= 0 && count <= 1<<31-1 {
+			bounded[name] = count
+		}
+	}
+	return bounded
+}
+
+func reportedMediaUsage(body []byte) *dto.Usage {
+	usage := &dto.Usage{}
+	var envelope struct {
+		Usage json.RawMessage `json:"usage"`
+	}
+	if common.Unmarshal(body, &envelope) != nil {
+		return usage
+	}
+	bounded := mediaUsageCounters(envelope.Usage, 0)
+	encoded, err := common.Marshal(bounded)
+	if err == nil {
+		_ = common.Unmarshal(encoded, usage)
+	}
+	normalizeOpenAIUsage(usage)
+	return usage
+}
+
+// mergeMediaTokenDetails preserves cumulative details omitted by later frames;
+// an explicitly reported zero still resets its own counter.
+func mergeMediaTokenDetails(usage *dto.Usage, body []byte) {
+	var envelope struct {
+		Usage json.RawMessage `json:"usage"`
+	}
+	if common.Unmarshal(body, &envelope) != nil {
+		return
+	}
+	fields := mediaUsageCounters(envelope.Usage, 0)
+	for _, alias := range []struct{ from, to string }{{"input_tokens_details", "prompt_tokens_details"}, {"output_tokens_details", "completion_tokens_details"}} {
+		if detail, ok := fields[alias.from]; ok {
+			fields[alias.to] = detail
+		}
+	}
+	for name := range fields {
+		if name != "prompt_tokens_details" && name != "completion_tokens_details" && name != "prompt_cache_hit_tokens" && name != "claude_cache_creation_5_m_tokens" && name != "claude_cache_creation_1_h_tokens" {
+			delete(fields, name)
+		}
+	}
+	encoded, err := common.Marshal(fields)
+	if err == nil {
+		_ = common.Unmarshal(encoded, usage)
+	}
+}
 
 // observeMediaError keeps structured classification facts without copying a
 // Provider's message or other error details into downstream output or logs.
@@ -48,10 +122,10 @@ func observeMediaUsage(info *relaycommon.RelayInfo, usage *dto.Usage, body []byt
 		return
 	}
 	prompt, completion := relaycommon.MediaUsagePresence(body)
-	if prompt && ojson.GetBytes(body, "usage.input_tokens").Exists() {
+	if raw := ojson.GetBytes(body, "usage.input_tokens").Raw; prompt && raw != "" && raw != "null" {
 		usage.PromptTokens = usage.InputTokens
 	}
-	if completion && ojson.GetBytes(body, "usage.output_tokens").Exists() {
+	if raw := ojson.GetBytes(body, "usage.output_tokens").Raw; completion && raw != "" && raw != "null" {
 		usage.CompletionTokens = usage.OutputTokens
 	}
 	info.ResponseFacts.PromptTokensReported = info.ResponseFacts.PromptTokensReported || prompt

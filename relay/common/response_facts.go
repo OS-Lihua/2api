@@ -15,31 +15,14 @@ func ChatUsagePresence(body []byte) (prompt, completion bool) {
 // MediaUsagePresence reports the OpenAI Images/audio counters independently.
 // Explicit zero is authoritative; malformed or out-of-range counters are absent.
 func MediaUsagePresence(body []byte) (prompt, completion bool) {
-	var response struct {
-		Usage *struct {
-			InputTokens      *int64 `json:"input_tokens"`
-			OutputTokens     *int64 `json:"output_tokens"`
-			PromptTokens     *int64 `json:"prompt_tokens"`
-			CompletionTokens *int64 `json:"completion_tokens"`
-			TotalTokens      *int64 `json:"total_tokens"`
-		} `json:"usage"`
+	input, output := "usage.input_tokens", "usage.output_tokens"
+	if raw := ojson.GetBytes(body, input).Raw; raw == "" || raw == "null" {
+		input = "usage.prompt_tokens"
 	}
-	if common.Unmarshal(body, &response) != nil || response.Usage == nil {
-		return false, false
+	if raw := ojson.GetBytes(body, output).Raw; raw == "" || raw == "null" {
+		output = "usage.completion_tokens"
 	}
-	usage := response.Usage
-	if usage.TotalTokens != nil && (*usage.TotalTokens < 0 || *usage.TotalTokens > 1<<31-1) {
-		return false, false
-	}
-	input, output := usage.InputTokens, usage.OutputTokens
-	if input == nil {
-		input = usage.PromptTokens
-	}
-	if output == nil {
-		output = usage.CompletionTokens
-	}
-	return input != nil && *input >= 0 && *input <= 1<<31-1,
-		output != nil && *output >= 0 && *output <= 1<<31-1
+	return NativeUsagePresence(body, input, output, "")
 }
 
 // ResponseFacts separates upstream-reported zero usage from a local estimate,
