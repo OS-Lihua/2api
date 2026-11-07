@@ -224,12 +224,22 @@ func validateLedgerPosting(posting LedgerPosting) error {
 	if !ok {
 		return fmt.Errorf("%w: unknown account type %q", ErrLedgerInvalidEntry, posting.Account.Type)
 	}
+	if posting.Account.Type == LedgerAccountPlatformRevenue {
+		if posting.Account.OwnerId != 0 {
+			return fmt.Errorf("%w: platform revenue owner must be zero", ErrLedgerInvalidEntry)
+		}
+	} else if posting.Account.OwnerId <= 0 {
+		return fmt.Errorf("%w: account owner must be positive", ErrLedgerInvalidEntry)
+	}
 	sign, ok := signs[posting.Type]
 	if !ok {
 		return fmt.Errorf("%w: %s entries are not allowed on %s accounts", ErrLedgerInvalidEntry, posting.Type, posting.Account.Type)
 	}
 	if _, err := money.ParseCurrency(string(posting.Account.Currency)); err != nil {
 		return err
+	}
+	if posting.Account.Type == LedgerAccountUserWallet && posting.Account.Currency != SettlementCurrency() {
+		return fmt.Errorf("%w: user wallets must use %s", money.ErrCurrencyMismatch, SettlementCurrency())
 	}
 	if posting.Amount.Currency != posting.Account.Currency {
 		return fmt.Errorf("%w: %s amount posted to a %s account", money.ErrCurrencyMismatch, posting.Amount.Currency, posting.Account.Currency)

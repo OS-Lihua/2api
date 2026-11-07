@@ -120,6 +120,36 @@ func TestTopUpWalletRejectsInvalidConversion(t *testing.T) {
 	assert.Nil(t, wallet, "a rejected top-up must not leave a wallet behind")
 }
 
+func TestPostLedgerEntriesRejectsFirstUserWalletInAnotherCurrency(t *testing.T) {
+	useWalletLedgerDB(t)
+	t.Setenv("SETTLEMENT_CURRENCY", "USD")
+	originalCurrency := SettlementCurrency()
+	t.Cleanup(func() { settlementCurrency = originalCurrency })
+	require.NoError(t, InitSettlementCurrency())
+
+	entries, err := PostLedgerEntries(LedgerPosting{
+		Account: LedgerAccount{Type: LedgerAccountUserWallet, OwnerId: 1, Currency: "CNY"},
+		Type:    LedgerEntryAdjustment,
+		Amount:  money.Amount{Nanos: 100, Currency: "CNY"},
+	})
+	assert.ErrorIs(t, err, money.ErrCurrencyMismatch)
+	assert.Empty(t, entries)
+	wallet, err := GetUserWallet(1)
+	require.NoError(t, err)
+	assert.Nil(t, wallet, "a rejected first posting must not create a wallet")
+
+	entry, err := TopUpWallet(WalletTopUp{UserId: 1, Source: usd(10)})
+	require.NoError(t, err, "the rejected posting must not block a settlement-currency top-up")
+	assert.Equal(t, usd(10), entry.BalanceAfter)
+	wallet, err = GetUserWallet(1)
+	require.NoError(t, err)
+	require.NotNil(t, wallet)
+	assert.Equal(t, usd(10), wallet.Balance)
+	_, total, err := ListLedgerEntries(wallet.Id, 0, 10)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), total)
+}
+
 func TestPostLedgerEntriesEnforcesTypeAndSign(t *testing.T) {
 	useWalletLedgerDB(t)
 	_, err := TopUpWallet(WalletTopUp{UserId: 1, Source: usd(100)})
@@ -143,7 +173,13 @@ func TestPostLedgerEntriesEnforcesTypeAndSign(t *testing.T) {
 		{name: "revenue charge", posting: LedgerPosting{Account: revenue, Type: LedgerEntryCharge, Amount: usd(5)}},
 		{name: "revenue refund", posting: LedgerPosting{Account: revenue, Type: LedgerEntryRefund, Amount: usd(-5)}},
 		{name: "provider cost", posting: LedgerPosting{Account: payable, Type: LedgerEntryCharge, Amount: money.Amount{Nanos: 7, Currency: "CNY"}}},
+		{name: "same provider cost in another currency", posting: LedgerPosting{Account: ProviderPayableAccount(3, "USD"), Type: LedgerEntryCharge, Amount: usd(2)}},
 
+		{name: "user owner zero", posting: LedgerPosting{Account: UserWalletAccount(0), Type: LedgerEntryAdjustment, Amount: usd(1)}, wantErr: ErrLedgerInvalidEntry},
+		{name: "negative user owner", posting: LedgerPosting{Account: UserWalletAccount(-1), Type: LedgerEntryAdjustment, Amount: usd(1)}, wantErr: ErrLedgerInvalidEntry},
+		{name: "provider owner zero", posting: LedgerPosting{Account: ProviderPayableAccount(0, "USD"), Type: LedgerEntryCharge, Amount: usd(1)}, wantErr: ErrLedgerInvalidEntry},
+		{name: "negative provider owner", posting: LedgerPosting{Account: ProviderPayableAccount(-1, "USD"), Type: LedgerEntryCharge, Amount: usd(1)}, wantErr: ErrLedgerInvalidEntry},
+		{name: "nonzero revenue owner", posting: LedgerPosting{Account: LedgerAccount{Type: LedgerAccountPlatformRevenue, OwnerId: 1, Currency: "USD"}, Type: LedgerEntryCharge, Amount: usd(1)}, wantErr: ErrLedgerInvalidEntry},
 		{name: "positive pre-consume", posting: LedgerPosting{Account: user, Type: LedgerEntryPreConsume, Amount: usd(10)}, wantErr: ErrLedgerInvalidEntry},
 		{name: "negative release", posting: LedgerPosting{Account: user, Type: LedgerEntryPreConsumeRelease, Amount: usd(-10)}, wantErr: ErrLedgerInvalidEntry},
 		{name: "positive charge", posting: LedgerPosting{Account: user, Type: LedgerEntryCharge, Amount: usd(5)}, wantErr: ErrLedgerInvalidEntry},
