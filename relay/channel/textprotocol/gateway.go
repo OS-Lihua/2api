@@ -78,7 +78,8 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		usage.CompletionTokens = tokenkit.Count(info.TokenizerModelName(), facts.GeneratedText)
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
-	if resp.StatusCode != http.StatusOK || gjson.GetBytes(body, "error").Exists() {
+	upstreamError := gjson.GetBytes(body, "error")
+	if resp.StatusCode != http.StatusOK || upstreamError.Exists() && upstreamError.Type != gjson.Null {
 		return usage, types.NewError(fmt.Errorf("upstream response failed"), types.ErrorCodeBadResponse)
 	}
 	converted, err := relayconvert.ConvertResponse(c, info, info.RelayFormat, response)

@@ -903,7 +903,7 @@ func TestTextGatewayStreamConversionFacts(t *testing.T) {
 		{"gemini", "/v1beta/models/gateway-offering:streamGenerateContent?alt=sse", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16}}`, `"candidates"`},
 	} {
 		for _, upstream := range []struct{ protocol, events string }{
-			{"openai_chat", "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n"},
+			{"openai_chat", "data: {\"error\":null,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n"},
 			{"openai_responses", "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15}}}\n\n"},
 			{"anthropic_messages", "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":10}}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\ndata: {\"type\":\"message_stop\"}\n\n"},
 			{"gemini_generate", "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5,\"totalTokenCount\":15}}\n\n"},
@@ -963,9 +963,30 @@ func TestTextGatewayStrictConversionLosses(t *testing.T) {
 				caps := capability.Set{Features: []capability.Feature{capability.Streaming, capability.ToolCalling, capability.Caching, capability.StructuredOutput}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}
 				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
 				if policy == "global" {
+					require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", fixture.sale.CreatedBy).Update("role", common.RoleRootUser).Error)
+					rootPAT := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "option:write", "option:read")
+					if test.name == "cache control" {
+						for _, invalid := range []string{`{}`, `[1]`, `null`, `[""]`} {
+							body, err := common.Marshal(map[string]string{"key": "global.accepted_conversion_losses", "value": invalid})
+							require.NoError(t, err)
+							invalidResponse := adminSecurityRequest(fixture.engine, rootPAT, http.MethodPut, "/api/option/", string(body))
+							var result struct {
+								Success bool `json:"success"`
+							}
+							require.NoError(t, common.Unmarshal(invalidResponse.Body.Bytes(), &result))
+							assert.False(t, result.Success, invalidResponse.Body.String())
+						}
+					}
 					codes, err := common.Marshal([]string{test.code})
 					require.NoError(t, err)
-					require.NoError(t, model.UpdateOption("global.accepted_conversion_losses", string(codes)))
+					body, err := common.Marshal(map[string]string{"key": "global.accepted_conversion_losses", "value": string(codes)})
+					require.NoError(t, err)
+					saved := adminSecurityRequest(fixture.engine, rootPAT, http.MethodPut, "/api/option/", string(body))
+					var result struct {
+						Success bool `json:"success"`
+					}
+					require.NoError(t, common.Unmarshal(saved.Body.Bytes(), &result))
+					require.True(t, result.Success, saved.Body.String())
 					t.Cleanup(func() { require.NoError(t, model.UpdateOption("global.accepted_conversion_losses", "[]")) })
 				} else if policy == "offering" {
 					fixture.offering.AcceptedConversionLosses = []string{test.code}
@@ -1027,7 +1048,7 @@ func TestTextGatewayFourDownstreamEntrances(t *testing.T) {
 	} {
 		for _, upstream := range []struct{ protocol, body string }{
 			{"openai_chat", `{"id":"chat-test","object":"chat.completion","model":"upstream-model","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`},
-			{"openai_responses", `{"id":"resp-test","object":"response","status":"completed","model":"upstream-model","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}`},
+			{"openai_responses", `{"id":"resp-test","object":"response","status":"completed","error":null,"model":"upstream-model","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}`},
 			{"anthropic_messages", `{"id":"msg","type":"message","role":"assistant","model":"upstream-model","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`},
 			{"gemini_generate", `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}`},
 		} {

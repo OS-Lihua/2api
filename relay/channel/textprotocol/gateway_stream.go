@@ -89,7 +89,8 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 				}
 			}
 		}
-		if gjson.Get(data, "error").Exists() || gjson.Get(data, "type").String() == "error" || info.StreamStatus.ResponseFailed() {
+		upstreamError := gjson.Get(data, "error")
+		if upstreamError.Exists() && upstreamError.Type != gjson.Null || gjson.Get(data, "type").String() == "error" || info.StreamStatus.ResponseFailed() {
 			streamErr = errors.New("upstream stream failed")
 			sr.Stop(streamErr)
 			return

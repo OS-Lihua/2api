@@ -77,6 +77,8 @@ func TextGateway(c *gin.Context) {
 		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "The request cannot be converted")
 		return
 	}
+	projection := *request
+	request = &projection
 	request.Stream = common.GetPointer(native.IsStream(c.Request))
 	if pathName != "" {
 		request.Model = pathName
@@ -153,7 +155,6 @@ func TextGateway(c *gin.Context) {
 	info.UpstreamModelName = selection.Channel.UpstreamModelName
 	info.IsModelMapped = true
 	request.Model = info.UpstreamModelName
-	native.SetModelName(info.UpstreamModelName)
 	input, err := helper.ResolveIncomingBillingExprRequestInput(c, info)
 	if err != nil {
 		gatewayError(c, http.StatusBadRequest, "invalid_request", "Invalid chat request")
