@@ -54,6 +54,34 @@ func registerChannelRoutes(apiRouter *gin.RouterGroup) {
 	}
 }
 
+// registerProviderRoutes registers /api/admin/v1/providers. It keeps the
+// permissions of the matching /api/channel routes.
+func registerProviderRoutes(apiRouter *gin.RouterGroup) {
+	providerRoute := apiRouter.Group("/admin/v1/providers")
+	providerRoute.Use(middleware.AdminAuth())
+	for _, route := range providerPermissionRoutes {
+		handlePermissionRoute(providerRoute, route.method, route.path, route.permission, route.handler)
+	}
+}
+
+var providerPermissionRoutes = []permissionRoute{
+	{method: http.MethodGet, path: "", permission: authz.ChannelRead, handler: controller.ListProviders},
+	{method: http.MethodPost, path: "", permission: authz.ChannelSensitiveWrite, handler: controller.CreateProvider},
+	{method: http.MethodGet, path: "/:id", permission: authz.ChannelRead, handler: controller.GetProvider},
+	{method: http.MethodPatch, path: "/:id", permission: authz.ChannelWrite, handler: controller.UpdateProvider},
+	{method: http.MethodDelete, path: "/:id", permission: authz.ChannelSensitiveWrite, handler: controller.DeleteProvider},
+	{method: http.MethodPost, path: "/:id/enable", permission: authz.ChannelOperate, handler: controller.EnableProvider},
+	{method: http.MethodPost, path: "/:id/disable", permission: authz.ChannelOperate, handler: controller.DisableProvider},
+	{method: http.MethodPost, path: "/:id/balance", permission: authz.ChannelOperate, handler: controller.RefreshProviderBalance},
+	{method: http.MethodGet, path: "/:id/keys", permission: authz.ChannelOperate, handler: controller.ListProviderKeys},
+	{method: http.MethodPost, path: "/:id/keys/enable", permission: authz.ChannelOperate, handler: controller.EnableAllProviderKeys},
+	{method: http.MethodPost, path: "/:id/keys/disable", permission: authz.ChannelOperate, handler: controller.DisableAllProviderKeys},
+	{method: http.MethodDelete, path: "/:id/keys/disabled", permission: authz.ChannelOperate, handler: controller.DeleteDisabledProviderKeys},
+	{method: http.MethodPost, path: "/:id/keys/:index/enable", permission: authz.ChannelOperate, handler: controller.EnableProviderKey},
+	{method: http.MethodPost, path: "/:id/keys/:index/disable", permission: authz.ChannelOperate, handler: controller.DisableProviderKey},
+	{method: http.MethodDelete, path: "/:id/keys/:index", permission: authz.ChannelOperate, handler: controller.DeleteProviderKey},
+}
+
 var channelPermissionRoutes = []permissionRoute{
 	{method: http.MethodGet, path: "/priority/order", permission: authz.ChannelRead, handler: controller.GetChannelPriorityOrder},
 	{method: http.MethodPost, path: "/priority/reorder", permission: authz.ChannelWrite, handler: controller.ReorderChannelPriority},
