@@ -24,7 +24,7 @@ import (
 // Actual price-version persistence is exercised when #33 supplies this seam.
 type freeOfferingSalePrice struct{}
 
-func (freeOfferingSalePrice) HasSalePrice(context.Context, *gorm.DB, int) (bool, error) {
+func (freeOfferingSalePrice) HasSalePrice(context.Context, *gorm.DB, *model.ModelOffering) (bool, error) {
 	return true, nil
 }
 

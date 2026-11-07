@@ -43,6 +43,11 @@ const calendarLocales = {
 } as const
 
 interface DateTimePickerProps {
+  id?: string
+  disabled?: boolean
+  'aria-invalid'?: React.AriaAttributes['aria-invalid']
+  'aria-describedby'?: string
+  'aria-label'?: string
   value?: Date
   onChange?: (date: Date | undefined) => void
   placeholder?: string
@@ -54,6 +59,8 @@ export function DateTimePicker({
   onChange,
   placeholder,
   className,
+  disabled = false,
+  ...controlProps
 }: DateTimePickerProps) {
   const { t, i18n } = useTranslation()
   const placeholderText = placeholder ?? t('Select date')
@@ -119,6 +126,13 @@ export function DateTimePicker({
         <PopoverTrigger
           render={
             <Button
+              {...controlProps}
+              aria-label={
+                controlProps['aria-label'] ??
+                (date ? dayjs(date).format('YYYY-MM-DD') : placeholderText)
+              }
+              type='button'
+              disabled={disabled}
               variant='outline'
               className={cn(
                 'flex-1 justify-between font-normal',
@@ -133,6 +147,7 @@ export function DateTimePicker({
         <PopoverContent className='w-auto overflow-hidden p-0' align='start'>
           <Calendar
             mode='single'
+            disabled={disabled}
             selected={date}
             month={month}
             onMonthChange={setMonth}
@@ -151,7 +166,7 @@ export function DateTimePicker({
         aria-label={t('Time')}
         onChange={handleTimeChange}
         className='w-32 appearance-none [&::-webkit-calendar-picker-indicator]:hidden [&::-webkit-calendar-picker-indicator]:appearance-none'
-        disabled={!date}
+        disabled={disabled || !date}
       />
       {date && (
         <Button
@@ -160,7 +175,8 @@ export function DateTimePicker({
           size='icon'
           onClick={handleClear}
           className='shrink-0'
-          aria-label='Clear'
+          disabled={disabled}
+          aria-label={t('Clear')}
         >
           <span aria-hidden='true'>✕</span>
         </Button>

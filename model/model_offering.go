@@ -60,10 +60,11 @@ type OfferingChannelScope struct {
 	ExcludeChannelIDs  []int `json:"exclude_channel_ids"`
 }
 
-// OfferingSalePriceChecker is supplied by price-version management. An absent
-// checker denies activation; an explicit zero price is still configured.
+// OfferingSalePriceChecker validates the proposed declaration before it is
+// persisted, in the mutation transaction. An absent checker denies activation;
+// an explicit zero price is still configured.
 type OfferingSalePriceChecker interface {
-	HasSalePrice(context.Context, *gorm.DB, int) (bool, error)
+	HasSalePrice(context.Context, *gorm.DB, *ModelOffering) (bool, error)
 }
 
 var offeringPrices struct {
@@ -176,7 +177,7 @@ func SaveModelOffering(ctx context.Context, record *ModelOffering, action string
 			configured := false
 			if checker != nil {
 				var err error
-				configured, err = checker.HasSalePrice(ctx, tx, record.ID)
+				configured, err = checker.HasSalePrice(ctx, tx, record)
 				if err != nil {
 					return err
 				}

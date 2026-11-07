@@ -27,7 +27,7 @@ func modelOfferingError(c *gin.Context, err error) {
 		switch databaseError.Code {
 		case "23505":
 			status, message = http.StatusConflict, common.NewMessage("ModelOffering name or alias already exists")
-		case "23503":
+		case "23503", "23001":
 			status, message = http.StatusConflict, common.NewMessage("The ModelOffering is still referenced")
 		}
 	}

@@ -65,6 +65,7 @@ export function PricingAmountInput({
       )
     }
   }
+  if (currency.native) displayed = source
   const text =
     draft?.source === source && draft.rate === currency.exchangeRate
       ? draft.text
@@ -109,8 +110,9 @@ export function PricingAmountInput({
             setDraft({ text: next, source, rate: currency.exchangeRate })
             return
           }
-          const canonical =
+          let canonical =
             next === '' || next === '.' ? '' : formatPricingNumber(nextUSD)
+          if (currency.native) canonical = next === '.' ? '' : next
           const nextSource =
             typeof value === 'number' ? String(Number(canonical)) : canonical
           setDraft({
