@@ -53,6 +53,31 @@ func adminSecurityRequest(engine http.Handler, token, method, path, body string)
 	return recorder
 }
 
+func TestAdminAPIAuditsCompressedSuccess(t *testing.T) {
+	for _, description := range []string{"normal description", strings.Repeat("long description ", 8192)} {
+		t.Run(fmt.Sprintf("description bytes %d", len(description)), func(t *testing.T) {
+			engine, _, token := newAdminTestServer(t)
+			publisher := &model.Vendor{Name: "audit-publisher"}
+			require.NoError(t, model.DB.Create(publisher).Error)
+			body, err := common.Marshal(map[string]any{"name": "audit-model", "publisher_id": publisher.Id, "description": description})
+			require.NoError(t, err)
+			request := httptest.NewRequest(http.MethodPost, "/api/admin/v1/models", strings.NewReader(string(body)))
+			request.Header.Set("Authorization", "Bearer "+token)
+			request.Header.Set("Accept-Encoding", "gzip")
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			require.Equal(t, http.StatusOK, response.Code)
+			require.Equal(t, "gzip", response.Header().Get("Content-Encoding"))
+			for _, category := range []string{model.AuditCategoryOperation, model.AuditCategoryAccessToken} {
+				logs, total, err := model.GetAuditLogs(model.AuditLogFilter{Category: category}, 0, 10, common.RoleRootUser)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, total, "exactly one %s event", category)
+				assert.True(t, logs[0].Success, category)
+			}
+		})
+	}
+}
+
 func TestAdminAPIAuditsCompressedBusinessFailures(t *testing.T) {
 	engine, admin, token := newAdminTestServer(t)
 	require.NoError(t, authz.SetUserPermissions(admin.Id, authz.PermissionsMap{"ledger": {"read": true, "write": true}}))

@@ -154,7 +154,7 @@ func finishAdminAudit(c *gin.Context, writer *auditResponseWriter) {
 	operatorRole := c.GetInt("role")
 	ip := c.ClientIP()
 	status := writer.Status()
-	success := auditResponseSuccess(status, writer.body.Bytes())
+	success := auditResponseSuccess(c, status, writer.body.Bytes())
 
 	route := c.FullPath()
 	action := auditRouteActions[method+" "+route]
@@ -204,9 +204,14 @@ func auditAuthMethod(c *gin.Context) string {
 
 // auditResponseSuccess 依据 HTTP 状态码与响应体推断操作是否成功。
 // 优先解析响应 JSON 中的 success 字段；无法解析时退回到状态码判断。
-func auditResponseSuccess(status int, body []byte) bool {
+func auditResponseSuccess(c *gin.Context, status int, body []byte) bool {
 	if status >= 400 {
 		return false
+	}
+	if common.GetContextKeyBool(c, constant.ContextKeyAdminAPIAudit) {
+		if success, ok := common.GetContextKeyType[bool](c, constant.ContextKeyAPIResponseSuccess); ok {
+			return success
+		}
 	}
 	// The prefix audit also surrounds gzip and early middleware rejections.
 	// Decode only the bounded envelope; never persist the captured payload.
@@ -253,7 +258,7 @@ func AdminAPISecurity() gin.HandlerFunc {
 			if !completed {
 				status = http.StatusInternalServerError
 			}
-			success := completed && auditResponseSuccess(status, writer.body.Bytes())
+			success := completed && auditResponseSuccess(c, status, writer.body.Bytes())
 			if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead || c.Request.Method == http.MethodOptions {
 				if success {
 					return
@@ -337,7 +342,7 @@ func TokenOperationAudit() gin.HandlerFunc {
 		c.Writer = writer
 		c.Next()
 		entry.Status = writer.Status()
-		entry.Success = auditResponseSuccess(entry.Status, writer.body.Bytes())
+		entry.Success = auditResponseSuccess(c, entry.Status, writer.body.Bytes())
 		if writer.body.Len() == writer.maxSize {
 			// JSON may be truncated before its success field. A completed handler
 			// supplies the result without retaining an unbounded response body.
@@ -363,7 +368,11 @@ func AccessTokenAudit() gin.HandlerFunc {
 			if !internal {
 				if lookup := lookupAccessToken(c, raw); lookup.user != nil {
 					beginAccessTokenAudit(c, lookup.user, lookup.ref)
-					defer finishAccessTokenAudit(c)
+					// Prefix authentication owns the outer audit writer and must
+					// finish it after gzip closes, not from this inner middleware.
+					if !common.GetContextKeyBool(c, constant.ContextKeyAdminAPIAudit) {
+						defer finishAccessTokenAudit(c)
+					}
 				}
 			}
 		}
@@ -408,6 +417,6 @@ func finishAccessTokenAudit(c *gin.Context) {
 	}
 	audit.finished = true
 	audit.entry.Status = audit.writer.Status()
-	audit.entry.Success = auditResponseSuccess(audit.entry.Status, audit.writer.body.Bytes())
+	audit.entry.Success = auditResponseSuccess(c, audit.entry.Status, audit.writer.body.Bytes())
 	model.RecordAuditLog(c, audit.entry)
 }
