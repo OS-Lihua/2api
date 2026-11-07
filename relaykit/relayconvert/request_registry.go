@@ -291,6 +291,9 @@ func executeRequestSteps(c context.Context, info convmeta.Meta, from types.Relay
 
 	tools.Model = convmeta.UpstreamModelName(info)
 	current, toolDiagnostics, err := toolconv.AttachRequest(target, current, tools, convmeta.OptionsOf(info))
+	if err == nil {
+		err = convdiag.InspectRequestParameters(c, request, current, from, target)
+	}
 	diagnostics := append(diagnosticCollector.Diagnostics(), toolDiagnostics...)
 	for i := range diagnostics {
 		if diagnostics[i].From == "" {

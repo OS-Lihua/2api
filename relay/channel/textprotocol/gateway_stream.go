@@ -25,6 +25,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		return nil, types.NewError(err, types.ErrorCodeBadResponse)
 	}
 	usage := &dto.Usage{}
+	meter := gatewayUsageAccumulator{format: p.format}
 	var streamErr error
 	var output strings.Builder
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
@@ -51,19 +52,21 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			sr.Stop(err)
 			return
 		}
-		for _, result := range results {
-			if result.Usage != nil {
-				usage = dto.MergeUsageNonZero(usage, result.Usage)
-			}
+		measured, err := meter.Observe([]byte(data))
+		if err != nil {
+			streamErr = err
+			sr.Stop(err)
+			return
+		}
+		if measured != nil {
+			usage = measured
 		}
 		prompt, completion := gatewayUsageCounters([]byte(data), p.format)
-		if prompt.Exists() && prompt.Int() >= 0 && prompt.Int() <= 1<<31-1 {
+		if prompt.Type == gjson.Number && prompt.Int() >= 0 && prompt.Int() <= 1<<31-1 {
 			info.ResponseFacts.PromptTokensReported = true
-			usage.PromptTokens = int(prompt.Int())
 		}
-		if completion.Exists() && completion.Int() >= 0 && completion.Int() <= 1<<31-1 {
+		if completion.Type == gjson.Number && completion.Int() >= 0 && completion.Int() <= 1<<31-1 {
 			info.ResponseFacts.CompletionTokensReported = true
-			usage.CompletionTokens = int(completion.Int())
 		}
 		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 		switch p.format {

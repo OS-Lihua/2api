@@ -28,7 +28,7 @@ func InspectCacheControls(ctx context.Context, value any, path string, from, to 
 				continue
 			}
 			// Schema properties and opaque tool inputs are user data, not controls.
-			if key == "properties" || key == "input" || key == "arguments" || key == "parameters" || key == "input_schema" {
+			if key == "properties" || key == "input" || key == "arguments" || key == "parameters" || key == "input_schema" || key == "metadata" || key == "responseSchema" || key == "responseJsonSchema" {
 				continue
 			}
 			InspectCacheControls(ctx, value[key], child, from, to)

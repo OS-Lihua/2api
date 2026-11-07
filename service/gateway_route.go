@@ -12,17 +12,19 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 )
 
 type GatewaySelection struct {
-	Channel      model.Channel
-	Provider     *model.Provider
-	InputTokens  int
-	Capabilities capability.Set
-	Diagnostics  map[string]any
-	Conversion   *relayconvert.RequestResult
+	Channel        model.Channel
+	Provider       *model.Provider
+	InputTokens    int
+	Capabilities   capability.Set
+	Diagnostics    map[string]any
+	Conversion     *relayconvert.RequestResult
+	ResponsesTools *convmeta.ResponsesToolState
 }
 
 var ErrGatewayCapability = errors.New("no Channel supports the requested capabilities")
@@ -48,6 +50,7 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 	diagnostics := map[string]any{"method": "single_channel", "candidate_count": len(candidates), "eligible_count": 0}
 	counts := map[string]int{}
 	excluded := []map[string]any{}
+	accepted := GatewayAcceptedConversionLosses(offering)
 	var selected *GatewaySelection
 	var rejected []types.ConversionDiagnostic
 	bestRank := 5
@@ -57,6 +60,7 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 		var caps capability.Set
 		var tokens int
 		var conversion *relayconvert.RequestResult
+		var responsesTools *convmeta.ResponsesToolState
 		rank := 0
 		switch {
 		case candidate.Status != model.ChannelEnabled || !candidate.MappingConfirmed || candidate.Model.Status != 1:
@@ -88,14 +92,18 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 			}
 			info.InitChannelMeta(c)
 			info.UpstreamModelName = candidate.UpstreamModelName
-			conversion, err = PreconvertGatewayRequest(c, info, candidate.Protocol, original, offering.AcceptedConversionLosses)
+			conversion, err = PreconvertGatewayRequest(c, info, candidate.Protocol, original, accepted)
 			if err != nil {
 				reason = "conversion_loss"
 				if conversion != nil {
 					rejected = append(rejected, conversion.Diagnostics...)
 				}
+				if conversion == nil || len(conversion.Diagnostics) == 0 {
+					rejected = append(rejected, types.ConversionDiagnostic{Code: "request_conversion_failed", Path: "request", Message: "The target protocol cannot represent this request", Severity: types.ConversionDiagnosticError})
+				}
 				break
 			}
+			responsesTools = info.ResponsesToolState()
 			if conversion.From != conversion.To {
 				rank = 3
 				if conversion.Quality == relayconvert.RequestConverterQualityGood {
@@ -115,7 +123,7 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 		diagnostics["eligible_count"] = diagnostics["eligible_count"].(int) + 1
 		if selected == nil || rank < bestRank {
 			bestRank = rank
-			selected = &GatewaySelection{Channel: candidate, Provider: provider, InputTokens: tokens, Capabilities: caps, Conversion: conversion}
+			selected = &GatewaySelection{Channel: candidate, Provider: provider, InputTokens: tokens, Capabilities: caps, Conversion: conversion, ResponsesTools: responsesTools}
 		}
 	}
 	diagnostics["excluded_counts"], diagnostics["excluded"] = counts, excluded

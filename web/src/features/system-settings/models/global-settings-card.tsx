@@ -90,6 +90,20 @@ const jsonString = z.string().refine((value) => {
 const schema = z.object({
   global: z.object({
     pass_through_request_enabled: z.boolean(),
+    accepted_conversion_losses: z.string().refine((value) => {
+      try {
+        const parsed: unknown = JSON.parse(value.trim() || '[]')
+        return (
+          Array.isArray(parsed) &&
+          parsed.every(
+            (code: unknown) =>
+              typeof code === 'string' && /^[a-z][a-z0-9_]*$/.test(code)
+          )
+        )
+      } catch {
+        return false
+      }
+    }, 'Enter a JSON array of diagnostic codes'),
     thinking_model_blacklist: jsonString,
     chat_completions_to_responses_policy: jsonString,
   }),
@@ -104,6 +118,7 @@ type GlobalModelSettingsFormInput = z.input<typeof schema>
 
 type FlatGlobalModelSettings = {
   'global.pass_through_request_enabled': boolean
+  'global.accepted_conversion_losses': string
   'global.thinking_model_blacklist': string
   'global.chat_completions_to_responses_policy': string
   'general_setting.ping_interval_enabled': boolean
@@ -115,6 +130,10 @@ const flattenGlobalValues = (
 ): FlatGlobalModelSettings => ({
   'global.pass_through_request_enabled':
     values.global.pass_through_request_enabled,
+  'global.accepted_conversion_losses': normalizeJsonText(
+    values.global.accepted_conversion_losses,
+    '[]'
+  ),
   'global.thinking_model_blacklist': normalizeJsonText(
     values.global.thinking_model_blacklist,
     '[]'
@@ -206,6 +225,34 @@ export function GlobalSettingsCard({ defaultValues }: GlobalSettingsCardProps) {
                   />
                 </FormControl>
               </SettingsSwitchItem>
+            )}
+          />
+
+          <FormField
+            control={form.control}
+            name='global.accepted_conversion_losses'
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>{t('Default accepted conversion losses')}</FormLabel>
+                <FormControl>
+                  <JsonCodeEditor
+                    value={field.value}
+                    onChange={field.onChange}
+                    name={field.name}
+                    onBlur={field.onBlur}
+                    textareaRef={field.ref}
+                    ariaLabel={t('Default accepted conversion losses')}
+                    placeholder='[]'
+                    heightClassName='h-32 min-h-32 max-h-32'
+                  />
+                </FormControl>
+                <FormDescription>
+                  {t(
+                    'Diagnostic codes accepted for every ModelOffering, in addition to its own list. Empty means no default losses are allowed. Stateful Responses fields cannot be allowed across protocols.'
+                  )}
+                </FormDescription>
+                <FormMessage />
+              </FormItem>
             )}
           />
 

@@ -232,6 +232,17 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
+	if key == "global.accepted_conversion_losses" {
+		var codes []string
+		if common.UnmarshalJsonStr(value, &codes) != nil || codes == nil || len(codes) > 1000 {
+			return common.NewMessage("Enter a JSON array of diagnostic codes")
+		}
+		for _, code := range codes {
+			if code == "" || strings.TrimSpace(code) != code || len(code) > 128 {
+				return common.NewMessage("Invalid conversion loss code")
+			}
+		}
+	}
 	if key == legacyAccessTokenRetireAtKey {
 		return errLegacyRetireAtReadOnly
 	}

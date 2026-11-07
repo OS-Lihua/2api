@@ -17,6 +17,7 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
 
@@ -83,6 +84,29 @@ func (a *ChannelAdaptor) ProjectChatRequest(info *relaycommon.RelayInfo, convert
 		}
 		return &effective, nil
 	}
+	var native dto.Request
+	switch converted.(type) {
+	case *dto.OpenAIResponsesRequest, dto.OpenAIResponsesRequest:
+		native = &dto.OpenAIResponsesRequest{}
+	case *dto.ClaudeRequest, dto.ClaudeRequest:
+		native = &dto.ClaudeRequest{}
+	case *dto.GeminiChatRequest, dto.GeminiChatRequest:
+		native = &dto.GeminiChatRequest{}
+	}
+	if native != nil {
+		if err := common.Unmarshal(body, native); err != nil {
+			return nil, err
+		}
+		effective, err := service.GatewayChatProjection(nil, native)
+		if err != nil {
+			return nil, err
+		}
+		if _, gemini := native.(*dto.GeminiChatRequest); gemini {
+			effective.Model = info.UpstreamModelName
+			effective.Stream = common.GetPointer(info.IsStream)
+		}
+		return effective, nil
+	}
 	if len(info.ParamOverride) > 0 {
 		return nil, errors.New("native request overrides require a wire projection")
 	}
@@ -95,7 +119,16 @@ func (a *ChannelAdaptor) SetChatOutputLimit(converted any, body []byte, limit ui
 	if setter, ok := converted.(channel.ChatOutputLimitSetter); ok {
 		return setter.SetChatOutputLimit(body, limit)
 	}
-	if _, ok := converted.(*dto.GeneralOpenAIRequest); !ok {
+	key := "max_completion_tokens"
+	switch converted.(type) {
+	case *dto.GeneralOpenAIRequest:
+	case *dto.OpenAIResponsesRequest, dto.OpenAIResponsesRequest:
+		key = "max_output_tokens"
+	case *dto.ClaudeRequest, dto.ClaudeRequest:
+		key = "max_tokens"
+	case *dto.GeminiChatRequest, dto.GeminiChatRequest:
+		key = "generationConfig"
+	default:
 		return body, nil
 	}
 	var wire map[string]common.RawMessage
@@ -106,7 +139,20 @@ func (a *ChannelAdaptor) SetChatOutputLimit(converted any, body []byte, limit ui
 	if err != nil {
 		return nil, err
 	}
-	wire["max_completion_tokens"] = encoded
+	if key == "generationConfig" {
+		config := map[string]common.RawMessage{}
+		if len(wire[key]) > 0 {
+			if err := common.Unmarshal(wire[key], &config); err != nil {
+				return nil, err
+			}
+		}
+		config["maxOutputTokens"] = encoded
+		encoded, err = common.Marshal(config)
+		if err != nil {
+			return nil, err
+		}
+	}
+	wire[key] = encoded
 	return common.Marshal(wire)
 }
 

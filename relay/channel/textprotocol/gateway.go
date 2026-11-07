@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 // gatewayJSONResponse uses the shared conversion registry and preserves the
@@ -43,34 +44,18 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
-	usage := canonical.Usage
+	meter := gatewayUsageAccumulator{format: p.format}
+	usage, err := meter.Observe(body)
+	if err != nil {
+		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+	}
 	if usage == nil {
 		usage = &dto.Usage{}
 	}
 	facts := info.ResponseFacts
-	var presence struct {
-		Usage struct {
-			Prompt     *int64 `json:"prompt_tokens"`
-			Completion *int64 `json:"completion_tokens"`
-			Input      *int64 `json:"input_tokens"`
-			Output     *int64 `json:"output_tokens"`
-		} `json:"usage"`
-		Gemini struct {
-			Prompt     *int64 `json:"promptTokenCount"`
-			Completion *int64 `json:"candidatesTokenCount"`
-		} `json:"usageMetadata"`
-	}
-	if err := common.Unmarshal(body, &presence); err != nil {
-		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
-	}
-	prompt, completion := presence.Usage.Prompt, presence.Usage.Completion
-	if p.kind == protocol.OpenAIResponses || p.kind == protocol.AnthropicMessages {
-		prompt, completion = presence.Usage.Input, presence.Usage.Output
-	} else if p.kind == protocol.GeminiGenerate {
-		prompt, completion = presence.Gemini.Prompt, presence.Gemini.Completion
-	}
-	facts.PromptTokensReported = prompt != nil && *prompt >= 0 && *prompt <= 1<<31-1
-	facts.CompletionTokensReported = completion != nil && *completion >= 0 && *completion <= 1<<31-1
+	prompt, completion := gatewayUsageCounters(body, p.format)
+	facts.PromptTokensReported = prompt.Type == gjson.Number && prompt.Int() >= 0 && prompt.Int() <= 1<<31-1
+	facts.CompletionTokensReported = completion.Type == gjson.Number && completion.Int() >= 0 && completion.Int() <= 1<<31-1
 	facts.UsageReported = facts.PromptTokensReported && facts.CompletionTokensReported
 	var generated strings.Builder
 	if chat, ok := canonical.Value.(*dto.OpenAITextResponse); ok {

@@ -149,6 +149,7 @@ func TextGateway(c *gin.Context) {
 	info.ResponseFacts = &relaycommon.ResponseFacts{}
 	common.SetContextKey(c, constant.ContextKeyResponseFacts, info.ResponseFacts)
 	info.InitChannelMeta(c)
+	info.ChannelOtherSettings.ToolLossPolicy = string(types.ConversionLossPolicyAllow)
 	info.UpstreamModelName = selection.Channel.UpstreamModelName
 	info.IsModelMapped = true
 	request.Model = info.UpstreamModelName
@@ -175,12 +176,20 @@ func TextGateway(c *gin.Context) {
 		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
 		return
 	}
-	converted, err := adaptor.ConvertRequest(c, info, native)
+	info.SetResponsesToolState(selection.ResponsesTools)
+	selection.Conversion.Value.(dto.Request).SetModelName(info.UpstreamModelName)
+	info.RecordConversionDiagnostics(c, selection.Conversion.Diagnostics)
+	converted, err := adaptor.ConvertRequest(c, info, selection.Conversion.Value)
 	if err != nil {
 		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "The request cannot be sent to this Channel")
 		return
 	}
-	losses := service.GatewayConversionCodes(info.ConversionDiagnostics())
+	diagnostics := append(selection.Conversion.Diagnostics, info.ConversionDiagnostics()...)
+	if err := service.CheckGatewayConversionLosses(diagnostics, service.GatewayAcceptedConversionLosses(offering)); err != nil || info.ConversionDiagnosticsTruncated() {
+		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", (&service.GatewayConversionError{Diagnostics: diagnostics}).Error())
+		return
+	}
+	losses := service.GatewayConversionCodes(diagnostics)
 	if len(losses) > 0 {
 		c.Header("X-Gateway-Conversion-Loss", strings.Join(losses, ","))
 	}
@@ -201,6 +210,17 @@ func TextGateway(c *gin.Context) {
 		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "Invalid Channel request parameters")
 		return
 	}
+	boundDefault := request.MaxTokens == nil && request.MaxCompletionTokens == nil
+	for _, key := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens", "generationConfig", "generation_config"} {
+		if _, overridden := info.ParamOverride[key]; overridden {
+			boundDefault = false
+		}
+	}
+	if boundDefault && (selection.Capabilities.Limits.MaxOutputTokens != nil || selection.Capabilities.Limits.ContextLength != nil) {
+		// Converter defaults are provisional until effective input has been
+		// counted; the bounded value is written back to the actual wire below.
+		effective.MaxTokens, effective.MaxCompletionTokens = nil, nil
+	}
 	if _, err := helper.ValidateTextRequest(c, effective, relayconstant.RelayModeChatCompletions); err != nil || effective.Model != selection.Channel.UpstreamModelName || effective.IsStream(c.Request) != info.IsStream || !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, selection.InputTokens) {
 		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
 		return
@@ -211,7 +231,7 @@ func TextGateway(c *gin.Context) {
 		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
 		return
 	}
-	if effective.GetMaxTokens() == 0 && (selection.Capabilities.Limits.MaxOutputTokens != nil || selection.Capabilities.Limits.ContextLength != nil) {
+	if boundDefault && (selection.Capabilities.Limits.MaxOutputTokens != nil || selection.Capabilities.Limits.ContextLength != nil) {
 		var limit int64
 		if output := selection.Capabilities.Limits.MaxOutputTokens; output != nil {
 			limit = *output

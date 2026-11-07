@@ -7,11 +7,13 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 )
 
 // GatewayProtocolFormat maps the four public text protocols independently of Provider type.
@@ -85,16 +87,26 @@ func PreconvertGatewayRequest(ctx context.Context, info convmeta.Meta, kind prot
 	if err != nil {
 		return result, err
 	}
+	return result, CheckGatewayConversionLosses(result.Diagnostics, accepted)
+}
+
+func GatewayAcceptedConversionLosses(offering *model.ModelOffering) []string {
+	accepted := append([]string(nil), model_setting.GetGlobalSettings().AcceptedConversionLosses...)
+	return append(accepted, offering.AcceptedConversionLosses...)
+}
+
+// CheckGatewayConversionLosses requires an exact explicit code for every loss.
+func CheckGatewayConversionLosses(diagnostics []types.ConversionDiagnostic, accepted []string) error {
 	var rejected []types.ConversionDiagnostic
-	for _, diagnostic := range result.Diagnostics {
+	for _, diagnostic := range diagnostics {
 		if !slices.Contains(accepted, diagnostic.Code) {
 			rejected = append(rejected, diagnostic)
 		}
 	}
 	if len(rejected) > 0 {
-		return result, &types.ConversionLossError{Diagnostics: rejected}
+		return &types.ConversionLossError{Diagnostics: rejected}
 	}
-	return result, nil
+	return nil
 }
 
 // GatewayConversionCodes produces a stable, deduplicated header and record value.
