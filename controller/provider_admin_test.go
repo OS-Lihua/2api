@@ -72,14 +72,14 @@ func callProviderAPI(t *testing.T, engine *gin.Engine, method, path, body string
 	return callProviderAPIStatus(t, engine, http.StatusOK, method, path, body)
 }
 
-func callProviderAPIStatus(t *testing.T, engine *gin.Engine, wantStatus int, method, path, body string) providerAPIReply {
+func callProviderAPIStatus(t *testing.T, engine *gin.Engine, wantStatus int, method, path, body string, secrets ...string) providerAPIReply {
 	t.Helper()
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(method, "/api/admin/v1/providers"+path, strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	engine.ServeHTTP(recorder, request)
 	require.Equal(t, wantStatus, recorder.Code, recorder.Body.String())
-	for _, secret := range []string{providerKeyA, "sk-provider", `"key":`, "key_preview", "fixture-header-secret", "fixture-query-secret"} {
+	for _, secret := range append(secrets, providerKeyA, "sk-provider", `"key":`, "key_preview") {
 		assert.NotContains(t, recorder.Body.String(), secret, "%s %s", method, path)
 	}
 	var reply providerAPIReply
@@ -233,15 +233,18 @@ func TestProviderAdminAPIValidatesPartialAdapterUpdates(t *testing.T) {
 
 func TestProviderAdminAPIHidesRawBalanceResponses(t *testing.T) {
 	engine := newProviderAdminEngine(t)
+	headerSecret, querySecret := "fixture-header-secret", "fixture-query-secret"
+	upstreamBody, err := common.Marshal(gin.H{"token": providerKeyA, "custom_header": headerSecret, "query": querySecret})
+	require.NoError(t, err)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"token":"sk-provider-secret-a","custom_header":"fixture-header-secret"}`))
+		_, _ = w.Write(upstreamBody)
 	}))
 	defer server.Close()
 	baseURL := server.URL
 	provider := &model.Provider{Type: constant.ChannelTypeAdvancedCustom, BaseURL: &baseURL, Key: providerKeyA, Name: "custom balance",
 		OtherSettings: `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/dashboard/billing/credit_grants","upstream_path":"/balance","converter":"none"}]}}`}
 	require.NoError(t, model.DB.Create(provider).Error)
-	reply := callProviderAPIStatus(t, engine, http.StatusBadGateway, http.MethodPost, "/"+common.Interface2String(provider.Id)+"/balance", "")
+	reply := callProviderAPIStatus(t, engine, http.StatusBadGateway, http.MethodPost, "/"+common.Interface2String(provider.Id)+"/balance", "", headerSecret, querySecret, "raw_response")
 	assert.False(t, reply.Success)
 	assert.Equal(t, "Failed to query balance", reply.Message)
 }
@@ -262,7 +265,7 @@ func TestProviderAdminAPIHidesBalanceErrors(t *testing.T) {
 
 func TestProviderAdminAPIHidesBalanceTransportErrors(t *testing.T) {
 	engine := newProviderAdminEngine(t)
-	querySecret := "fixture-query-secret"
+	headerSecret, querySecret := "fixture-header-secret", "fixture-query-secret"
 	var upstreamCalled atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalled.Store(true)
@@ -277,11 +280,13 @@ func TestProviderAdminAPIHidesBalanceTransportErrors(t *testing.T) {
 	// The legacy helper appends its path to this URL; keep a credential in the
 	// query to exercise url.Error without contacting a real Provider.
 	baseURL := server.URL + "/?api_key=" + querySecret + "&path="
-	headers := `{"X-Api-Key":"fixture-header-secret"}`
+	headers, err := common.Marshal(gin.H{"X-Api-Key": headerSecret})
+	require.NoError(t, err)
+	headerOverride := string(headers)
 	provider := &model.Provider{Type: constant.ChannelTypeOpenAI, BaseURL: &baseURL, Key: providerKeyA,
-		HeaderOverride: &headers, Name: "disconnected balance"}
+		HeaderOverride: &headerOverride, Name: "disconnected balance"}
 	require.NoError(t, model.DB.Create(provider).Error)
-	reply := callProviderAPIStatus(t, engine, http.StatusBadGateway, http.MethodPost, "/"+common.Interface2String(provider.Id)+"/balance", "")
+	reply := callProviderAPIStatus(t, engine, http.StatusBadGateway, http.MethodPost, "/"+common.Interface2String(provider.Id)+"/balance", "", headerSecret, querySecret, "raw_response")
 	assert.False(t, reply.Success)
 	assert.Equal(t, "Failed to query balance", reply.Message)
 	assert.Empty(t, reply.Data)
