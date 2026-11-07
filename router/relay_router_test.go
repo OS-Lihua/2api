@@ -2154,5 +2154,5 @@ func setupRelayRouterTestDB(t *testing.T) {
 		common.RedisEnabled = originalRedisEnabled
 	})
 	db := model.UseTestDatabases(t)
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Ability{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Ability{}, &model.ModelOffering{}, &model.ModelOfferingName{}, &model.ModelOfferingMember{}))
 }
