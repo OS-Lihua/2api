@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"strconv"
 
 	"github.com/QuantumNous/new-api/common"
@@ -29,9 +30,11 @@ type GatewayBilling struct {
 }
 
 type GatewaySettlement struct {
-	Request    GatewayRequest  `json:"request"`
-	Attempt    *GatewayAttempt `json:"attempt,omitempty"`
-	SaleSource money.Amount    `json:"sale_source"`
+	Request          GatewayRequest  `json:"request"`
+	Attempt          *GatewayAttempt `json:"attempt,omitempty"`
+	SaleSource       money.Amount    `json:"sale_source"`
+	ReceivableDue    money.Amount    `json:"receivable_due"`
+	PostedSaleSource money.Amount    `json:"posted_sale_source"`
 }
 
 func MigrateGatewayBilling(db *gorm.DB) error {
@@ -46,6 +49,9 @@ func MigrateGatewayBilling(db *gorm.DB) error {
 func ReserveGateway(request *GatewayRequest, reservation, source money.Amount) error {
 	if request.ID == "" || request.UserID <= 0 || reservation.Currency != SettlementCurrency() || reservation.Nanos < 0 {
 		return ErrLedgerInvalidEntry
+	}
+	if err := PreflightGatewaySettlementStorage(request.ID); err != nil {
+		return err
 	}
 	return DB.Transaction(func(tx *gorm.DB) error {
 		row := GatewayBilling{RequestID: request.ID, UserID: request.UserID, Reservation: reservation, Phase: "reserved", CreatedAt: clock.Now().UnixMilli(), UpdatedAt: clock.Now().UnixMilli()}
@@ -90,20 +96,34 @@ func ReserveGateway(request *GatewayRequest, reservation, source money.Amount) e
 // Once prepared, both ordinary completion and the recovery job use the same
 // immutable intent; a retry never recomputes prices or adds another charge.
 func PrepareGatewaySettlement(settlement GatewaySettlement) error {
+	if settlement.ReceivableDue.Currency == "" {
+		settlement.ReceivableDue = settlement.Request.Receivable
+	}
+	settlement, path, err := journalGatewaySettlement(settlement)
+	if err != nil {
+		return err
+	}
 	encoded, err := common.Marshal(settlement)
 	if err != nil {
 		return err
 	}
-	return DB.Transaction(func(tx *gorm.DB) error {
+	err = DB.Transaction(func(tx *gorm.DB) error {
 		var row GatewayBilling
 		if err := lockForUpdate(tx).First(&row, "request_id = ?", settlement.Request.ID).Error; err != nil {
 			return err
+		}
+		if row.UserID != settlement.Request.UserID {
+			return ErrLedgerInvalidEntry
 		}
 		if row.Phase != "reserved" {
 			return nil
 		}
 		return tx.Model(&row).Updates(map[string]any{"settlement": string(encoded), "phase": "settlement_pending", "updated_at": clock.Now().UnixMilli()}).Error
 	})
+	if err != nil {
+		return err
+	}
+	return removeGatewaySettlementJournal(path)
 }
 
 // SettleGateway atomically releases the reservation, charges once, recognizes
@@ -151,6 +171,9 @@ func SettleGateway(requestID string) (*GatewayRequest, error) {
 		if err != nil {
 			return err
 		}
+		if intent.ReceivableDue.Currency == "" {
+			intent.ReceivableDue = request.Receivable
+		}
 		if request.Receivable.Nanos > available.Nanos {
 			request.Receivable.Nanos = available.Nanos
 			request.ErrorCode = "wallet_shortfall"
@@ -159,18 +182,33 @@ func SettleGateway(requestID string) (*GatewayRequest, error) {
 			}
 		}
 		saleRate, err := decimal.NewFromString(request.SaleFXRate)
-		if err != nil {
-			return err
+		if err != nil || !saleRate.IsPositive() {
+			return money.ErrInvalidRate
+		}
+		intent.PostedSaleSource = money.Amount{Currency: intent.SaleSource.Currency}
+		if request.Receivable.Nanos > 0 {
+			intent.PostedSaleSource = intent.SaleSource
+			if request.Receivable.Nanos < intent.ReceivableDue.Nanos {
+				// Reverse the frozen FX exactly; rounding belongs to this posting.
+				source, err := money.NewRationalValue(new(big.Rat).Quo(big.NewRat(request.Receivable.Nanos, 1_000_000_000), saleRate.Rat()), intent.SaleSource.Currency)
+				if err != nil {
+					return err
+				}
+				intent.PostedSaleSource, err = source.Receivable()
+				if err != nil {
+					return err
+				}
+			}
 		}
 		postings := []LedgerPosting{}
 		if row.Reservation.Nanos > 0 {
 			postings = append(postings, LedgerPosting{Account: account, Type: LedgerEntryPreConsumeRelease, Amount: row.Reservation, RequestId: requestID, IdempotencyKey: "gateway:" + requestID + ":release"})
 		}
 		if request.Receivable.Nanos > 0 {
-			debitSource := money.Amount{Nanos: -intent.SaleSource.Nanos, Currency: intent.SaleSource.Currency}
+			debitSource := money.Amount{Nanos: -intent.PostedSaleSource.Nanos, Currency: intent.PostedSaleSource.Currency}
 			postings = append(postings,
 				LedgerPosting{Account: account, Type: LedgerEntryCharge, Amount: money.Amount{Nanos: -request.Receivable.Nanos, Currency: request.Receivable.Currency}, RequestId: requestID, IdempotencyKey: "gateway:" + requestID + ":charge", sourceAmount: &debitSource, fxRate: decimal.NewNullDecimal(saleRate)},
-				LedgerPosting{Account: PlatformRevenueAccount(request.Receivable.Currency), Type: LedgerEntryCharge, Amount: request.Receivable, RequestId: requestID, IdempotencyKey: "gateway:" + requestID + ":revenue", sourceAmount: &intent.SaleSource, fxRate: decimal.NewNullDecimal(saleRate)})
+				LedgerPosting{Account: PlatformRevenueAccount(request.Receivable.Currency), Type: LedgerEntryCharge, Amount: request.Receivable, RequestId: requestID, IdempotencyKey: "gateway:" + requestID + ":revenue", sourceAmount: &intent.PostedSaleSource, fxRate: decimal.NewNullDecimal(saleRate)})
 		}
 		if attempt := intent.Attempt; attempt != nil && attempt.Cost.Nanos > 0 {
 			rate, err := decimal.NewFromString(attempt.AccountingFXRate)
@@ -242,6 +280,12 @@ func PublishGatewayRecords(requestID string) error {
 // In-flight reservations are never released by a timeout: another process may
 // still be delivering output. Their IDs remain available for reconciliation.
 func RecoverGatewaySettlements(ctx context.Context, limit int) (int, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	if err := recoverGatewaySettlementJournals(ctx, limit); err != nil {
+		return 0, err
+	}
 	var rows []GatewayBilling
 	if err := DB.WithContext(ctx).Where("phase IN ? AND published = ?", []string{"settlement_pending", "settled"}, false).Order("created_at, request_id").Limit(limit).Find(&rows).Error; err != nil {
 		return 0, err

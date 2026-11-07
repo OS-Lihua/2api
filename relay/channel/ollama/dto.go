@@ -2,6 +2,11 @@ package ollama
 
 import (
 	"encoding/json"
+	"fmt"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 )
 
 type OllamaChatMessage struct {
@@ -42,6 +47,69 @@ type OllamaChatRequest struct {
 	Options   map[string]any      `json:"options,omitempty"`
 	KeepAlive any                 `json:"keep_alive,omitempty"`
 	Think     json.RawMessage     `json:"think,omitempty"`
+}
+
+func (*OllamaChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error) {
+	var wire OllamaChatRequest
+	if err := common.Unmarshal(body, &wire); err != nil {
+		return nil, err
+	}
+	effective, err := channel.ProjectChatRequestControls(body, public)
+	if err != nil {
+		return nil, err
+	}
+	effective.Model, effective.Stream = wire.Model, common.GetPointer(wire.Stream)
+	if raw, ok := wire.Options["num_predict"]; ok {
+		encoded, err := common.Marshal(raw)
+		if err != nil {
+			return nil, err
+		}
+		var limit uint
+		if err := common.Unmarshal(encoded, &limit); err != nil || limit == 0 {
+			return nil, fmt.Errorf("invalid Ollama output limit")
+		}
+		effective.MaxCompletionTokens = &limit
+	}
+	effective.Messages = make([]dto.Message, 0, len(wire.Messages))
+	for _, message := range wire.Messages {
+		content := []dto.MediaContent{{Type: dto.ContentTypeText, Text: message.Content}}
+		for _, image := range message.Images {
+			content = append(content, dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: "data:image/jpeg;base64," + image}})
+		}
+		projected := dto.Message{Role: message.Role, Content: content}
+		if len(message.ToolCalls) > 0 {
+			calls, _ := ollamaToolCallsToOpenAI(message.ToolCalls, 0, false)
+			projected.ToolCalls, err = common.Marshal(calls)
+			if err != nil {
+				return nil, err
+			}
+		}
+		effective.Messages = append(effective.Messages, projected)
+	}
+	if wire.Tools != nil {
+		encoded, err := common.Marshal(wire.Tools)
+		if err != nil {
+			return nil, err
+		}
+		if err := common.Unmarshal(encoded, &effective.Tools); err != nil {
+			return nil, err
+		}
+	}
+	if len(wire.Think) > 0 {
+		var enabled bool
+		if common.Unmarshal(wire.Think, &enabled) == nil {
+			effective.ReasoningEffort = "none"
+			if enabled {
+				effective.ReasoningEffort = "high"
+			}
+		} else if err := common.Unmarshal(wire.Think, &effective.ReasoningEffort); err != nil {
+			return nil, fmt.Errorf("invalid Ollama reasoning setting")
+		}
+	}
+	if wire.Format != nil && wire.Format != "" {
+		effective.ResponseFormat = &dto.ResponseFormat{Type: "json_schema"}
+	}
+	return effective, nil
 }
 
 type OllamaGenerateRequest struct {

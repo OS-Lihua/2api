@@ -152,7 +152,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 			}
 
 			lastStreamData = data
-			if info.ResponseFacts != nil && hasReportedChatUsage([]byte(data)) {
+			if info.ResponseFacts != nil && relaycommon.HasReportedChatUsage([]byte(data)) {
 				var frame dto.ChatCompletionsStreamResponse
 				if common.UnmarshalJsonStr(data, &frame) == nil {
 					reportedStreamUsage = frame.Usage
@@ -307,7 +307,7 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	}
 
 	if info.ResponseFacts != nil {
-		info.ResponseFacts.UsageReported = hasReportedChatUsage(responseBody)
+		info.ResponseFacts.UsageReported = relaycommon.HasReportedChatUsage(responseBody)
 	}
 	var responseErr *types.NewAPIError
 	if oaiError := simpleResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
@@ -347,7 +347,7 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	usageModified := false
 	reportedUsage := ojson.GetBytes(responseBody, "usage").IsObject()
 	if info.ResponseFacts != nil {
-		reportedUsage = hasReportedChatUsage(responseBody)
+		reportedUsage = relaycommon.HasReportedChatUsage(responseBody)
 		info.ResponseFacts.UsageReported = reportedUsage
 		var output strings.Builder
 		for _, choice := range simpleResponse.Choices {
@@ -356,6 +356,7 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 			for _, call := range choice.Message.ParseToolCalls() {
 				output.WriteString(call.Function.Name)
 				output.WriteString(call.Function.Arguments)
+				output.Write(call.Custom)
 			}
 		}
 		info.ResponseFacts.GeneratedText = output.String()
@@ -363,9 +364,13 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	if (simpleResponse.Usage.PromptTokens == 0 && (info.UpstreamProtocol == "" || !reportedUsage)) || info.ResponseFacts != nil && !reportedUsage {
 		completionTokens := simpleResponse.Usage.CompletionTokens
 		if completionTokens == 0 {
-			for _, choice := range simpleResponse.Choices {
-				ctkm := tokenkit.Count(info.TokenizerModelName(), choice.Message.StringContent()+choice.Message.GetReasoningContent())
-				completionTokens += ctkm
+			if info.ResponseFacts != nil {
+				completionTokens = tokenkit.Count(info.TokenizerModelName(), info.ResponseFacts.GeneratedText)
+			} else {
+				for _, choice := range simpleResponse.Choices {
+					ctkm := tokenkit.Count(info.TokenizerModelName(), choice.Message.StringContent()+choice.Message.GetReasoningContent())
+					completionTokens += ctkm
+				}
 			}
 		}
 		fallbackUsage := &dto.Usage{

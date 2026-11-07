@@ -8,12 +8,14 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/nontextprotocol"
 	"github.com/QuantumNous/new-api/relay/channel/textprotocol"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 )
@@ -58,6 +60,25 @@ func (a *ChannelAdaptor) ConvertRequest(c *gin.Context, info *relaycommon.RelayI
 		a.requestURLPath = info.RequestURLPath
 	}
 	return converted, err
+}
+
+func (a *ChannelAdaptor) ProjectChatRequest(info *relaycommon.RelayInfo, converted any, public *dto.GeneralOpenAIRequest, body []byte) (*dto.GeneralOpenAIRequest, error) {
+	if projector, ok := converted.(channel.ChatRequestProjector); ok {
+		return projector.ProjectChatRequest(body, *public)
+	}
+	if _, ok := converted.(*dto.GeneralOpenAIRequest); ok {
+		var effective dto.GeneralOpenAIRequest
+		if err := common.Unmarshal(body, &effective); err != nil {
+			return nil, err
+		}
+		return &effective, nil
+	}
+	if len(info.ParamOverride) > 0 {
+		return nil, errors.New("native request overrides require a wire projection")
+	}
+	// An unchanged native conversion retains the already validated public facts.
+	effective := *public
+	return &effective, nil
 }
 
 func (a *ChannelAdaptor) providerMetadata(info *relaycommon.RelayInfo) *channel.ProviderRequest {
@@ -126,7 +147,26 @@ func (a *ChannelAdaptor) providerMetadata(info *relaycommon.RelayInfo) *channel.
 	return metadata
 }
 
+// PreparedChannelRequest holds the existing transport's destination, body and
+// final headers in request memory. Preparing it performs no upstream I/O.
+type PreparedChannelRequest struct {
+	adaptor  *ChannelAdaptor
+	request  *http.Request
+	metadata *channel.ProviderRequest
+	body     io.Reader
+}
+
+func (r *PreparedChannelRequest) Headers() http.Header { return r.request.Header.Clone() }
+
 func (a *ChannelAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
+	prepared, err := a.PrepareRequest(c, info, requestBody)
+	if err != nil {
+		return nil, err
+	}
+	return a.DoPreparedRequest(c, info, prepared)
+}
+
+func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (*PreparedChannelRequest, error) {
 	if c == nil || c.Request == nil || info == nil || info.ProviderMeta == nil {
 		return nil, errors.New("missing upstream request metadata")
 	}
@@ -162,8 +202,15 @@ func (a *ChannelAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 		return nil, errors.New("invalid provider header override")
 	}
 	metadata.RequestHeaders = request.Header.Clone()
+	return &PreparedChannelRequest{adaptor: a, request: request, metadata: metadata, body: requestBody}, nil
+}
+
+func (a *ChannelAdaptor) DoPreparedRequest(c *gin.Context, info *relaycommon.RelayInfo, prepared *PreparedChannelRequest) (any, error) {
+	if prepared == nil || prepared.adaptor != a {
+		return nil, errors.New("missing prepared upstream request")
+	}
 	if executor, ok := a.provider.(channel.ProviderRequestExecutor); ok {
-		response, executeErr := executor.ExecuteRequest(c, metadata, requestBody)
+		response, executeErr := executor.ExecuteRequest(c, prepared.metadata, prepared.body)
 		if !errors.Is(executeErr, channel.ErrUseHTTPTransport) {
 			if executeErr != nil {
 				return nil, providerRequestError(executeErr)
@@ -174,10 +221,10 @@ func (a *ChannelAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 			return response, nil
 		}
 	}
-	if requestURL == "" {
+	if prepared.request.URL == nil {
 		return nil, errors.New("provider did not supply an upstream destination")
 	}
-	response, err := channel.DoRequest(c, request, info)
+	response, err := channel.DoRequest(c, prepared.request, info)
 	if err != nil {
 		return nil, providerRequestError(err)
 	}
