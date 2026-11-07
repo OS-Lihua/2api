@@ -50,11 +50,15 @@ export function ChannelProbeDialog(props: {
   const query = useQuery({
     queryKey: ['channel-probes', props.channel.id],
     queryFn: () => listChannelProbes(props.channel.id),
+    refetchInterval: (query) =>
+      query.state.data?.results.some((result) => result.status === 'running')
+        ? 1500
+        : false,
   })
   const { mutate, isPending, variables } = useMutation({
     mutationFn: (capability: string) =>
       runChannelProbe(props.channel.id, capability),
-    onSuccess: async () => {
+    onSettled: async () => {
       await Promise.all([
         query.refetch(),
         client.invalidateQueries({ queryKey: channelKeys.all }),

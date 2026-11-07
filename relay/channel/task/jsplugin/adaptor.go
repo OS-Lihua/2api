@@ -1256,11 +1256,16 @@ func (a *TaskAdaptor) ListArtifactsWithContext(ctx context.Context, task *model.
 // {key: {key, type, url, mimeType?}}, each url a gateway content address from
 // contentURL. Other tasks, and plugins without listArtifacts, have none.
 func RendererArtifacts(plugin *pluginruntime.LoadedPlugin, task *model.Task, contentURL func(taskID, artifactKey string) (string, error)) (map[string]any, error) {
+	return RendererArtifactsWithContext(context.Background(), plugin, task, contentURL)
+}
+
+// RendererArtifactsWithContext bounds artifact projection by the caller's deadline.
+func RendererArtifactsWithContext(ctx context.Context, plugin *pluginruntime.LoadedPlugin, task *model.Task, contentURL func(taskID, artifactKey string) (string, error)) (map[string]any, error) {
 	projected := make(map[string]any)
 	if task == nil || task.Status != model.TaskStatusSuccess {
 		return projected, nil
 	}
-	artifacts, err := New(plugin).ListArtifacts(task)
+	artifacts, err := New(plugin).ListArtifactsWithContext(ctx, task)
 	if err != nil {
 		return nil, fmt.Errorf("project task artifacts: %w", err)
 	}

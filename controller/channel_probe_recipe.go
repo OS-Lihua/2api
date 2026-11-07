@@ -27,6 +27,9 @@ import (
 //go:embed probe-fixtures/red.png
 var probeRedImage []byte
 
+//go:embed probe-fixtures/blue.png
+var probeBlueImage []byte
+
 //go:embed probe-fixtures/red.mp4
 var probeRedVideo []byte
 
@@ -91,8 +94,10 @@ func channelProbeRecipeFor(ctx context.Context, record model.Channel, feature st
 					recipe.TestedValue = min(*effective.Limits.MaxImages, 2)
 					recipe.SampledLimit = *effective.Limits.MaxImages > 2
 				}
-				for range recipe.TestedValue - 1 {
-					parts = append(parts, part)
+				if recipe.TestedValue == 2 {
+					parts[0].Text = "List the colors of every image in order. Reply with only comma-separated color names."
+					recipe.ExpectedText = "red,blue"
+					parts = append(parts, dto.MediaContent{Type: "image_url", ImageUrl: map[string]any{"url": "data:image/png;base64," + base64.StdEncoding.EncodeToString(probeBlueImage)}})
 				}
 			}
 			if feature == "max_duration_seconds" {

@@ -308,9 +308,9 @@ func TestSingleModelChannelAPI(t *testing.T) {
 		previousRegistry := jsplugin.DefaultRegistry
 		jsplugin.DefaultRegistry = jsplugin.NewRegistry()
 		defer func() { jsplugin.DefaultRegistry = previousRegistry }()
-		source := `export const meta={apiVersion:1,key:"probe",name:"Probe",version:"1.0.0",author:{name:"Test"},models:["task-probe-upstream"],fetchMode:"per_task",protocols:["openai_video"]};
-export const protocols={openai_video:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,requestBody:ctx.body.value}},render(ctx,task){return {id:task.task_id,status:"completed"}}}};
-export function buildSubmitRequest(ctx){return {url:ctx.baseUrl+"/submit",method:"POST",headers:{Authorization:"Bearer "+ctx.apiKey},body:{model:ctx.upstreamModel,prompt:ctx.requestBody.prompt,seconds:4}}}
+		source := `export const meta={apiVersion:1,key:"probe",name:"Probe",version:"1.0.0",author:{name:"Test"},models:["task-probe-upstream"],fetchMode:"per_task",protocols:[{name:"openai_video"},{name:"openai_responses",supports:["stream","sync"]}]};
+export const protocols={openai_responses:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,requestBody:ctx.body.value}},renderFinal(){return {output:[{type:"message",role:"assistant",content:[{type:"output_text",text:"red"}]}]}},renderEvents(){return {events:[{type:"output",data:"streamed"}],done:true}}},openai_video:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,requestBody:ctx.body.value}},render(ctx,task){return {id:task.task_id,status:"completed"}}}};
+export function buildSubmitRequest(ctx){const body={model:ctx.upstreamModel,prompt:ctx.requestBody.prompt,seconds:4};if(ctx.requestBody.max_output_tokens!==undefined)body.max_output_tokens=ctx.requestBody.max_output_tokens;return {url:ctx.baseUrl+"/submit",method:"POST",headers:{Authorization:"Bearer "+ctx.apiKey},body:body}}
 export function parseSubmitResponse(ctx,r){return {taskId:r.body.id,taskData:r.body}}
 export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/poll/"+ctx.taskId,headers:{Authorization:"Bearer "+ctx.apiKey}}}
 export function parseTaskResult(ctx,body){return {status:body.status,taskId:body.id,progress:"100%"}}
@@ -371,6 +371,25 @@ export function buildContentRequest(ctx){return {url:ctx.baseUrl+"/content/"+ctx
 			validMedia = false
 		}
 		assert.Equal(t, map[string]int{"/submit": 2, "/poll/private-task-123": 2, "/content/private-task-123": 2}, counts)
+		validMedia = true
+		for _, capability := range []string{"input_audio", "input_pdf", "tool_calling", "reasoning", "structured_output", "caching", "streaming"} {
+			status, result := call(http.MethodPost, channelPath+"/probes", fmt.Sprintf(`{"capability":%q}`, capability))
+			require.Equal(t, http.StatusOK, status, result)
+			expected := "inconclusive"
+			if capability == "streaming" {
+				expected = "passed"
+			}
+			assert.Equal(t, expected, result["data"].(map[string]any)["status"], result)
+		}
+		beforeBudgetCheck := counts["/submit"]
+		for _, override := range []string{`{"parameters":{"durationSeconds":600}}`, `{"parameters":{"numberOfVideos":20}}`, `{"operations":[{"path":"parameters.durationSeconds","mode":"set","value":600}]}`} {
+			require.NoError(t, db.Model(&provider).Update("param_override", override).Error)
+			status, result := call(http.MethodPost, channelPath+"/probes", `{"capability":"output_video"}`)
+			require.Equal(t, http.StatusOK, status, result)
+			assert.Equal(t, "request_invalid", result["data"].(map[string]any)["reason"], result)
+		}
+		require.NoError(t, db.Model(&provider).Update("param_override", nil).Error)
+		assert.Equal(t, beforeBudgetCheck, counts["/submit"])
 		probeCtx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		cancelProbe = cancel
@@ -384,7 +403,12 @@ export function buildContentRequest(ctx){return {url:ctx.baseUrl+"/content/"+ctx
 		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &cancelledResult))
 		assert.Equal(t, "failed", cancelledResult["data"].(map[string]any)["status"])
 		_, latest := call(http.MethodGet, channelPath+"/probes", "")
-		assert.Equal(t, cancelledResult["data"], latest["data"].(map[string]any)["results"].([]any)[0])
+		for _, item := range latest["data"].(map[string]any)["results"].([]any) {
+			observation := item.(map[string]any)
+			if observation["capability"] == "output_video" {
+				assert.Equal(t, cancelledResult["data"], observation)
+			}
+		}
 		_, after := call(http.MethodGet, channelPath, "")
 		assert.Equal(t, created["data"], after["data"])
 	})
@@ -523,6 +547,46 @@ export function buildContentRequest(ctx){return {url:ctx.baseUrl+"/content/"+ctx
 		require.Equal(t, http.StatusOK, status, result)
 		assert.Equal(t, "passed", result["data"].(map[string]any)["status"], result)
 		assert.EqualValues(t, 2, result["data"].(map[string]any)["tested_value"])
+	})
+	t.Run("image limits require evidence from every distinct input", func(t *testing.T) {
+		parent := unified
+		parent.Id = 0
+		parent.ModelName = "two-image-probe"
+		parent.Capabilities.Limits.MaxImages = common.GetPointer(int64(2))
+		require.NoError(t, db.Create(&parent).Error)
+		reply := "red"
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body map[string]any
+			require.NoError(t, common.DecodeJson(r.Body, &body))
+			parts := body["messages"].([]any)[0].(map[string]any)["content"].([]any)
+			require.Len(t, parts, 3)
+			assert.NotEqual(t, parts[1].(map[string]any)["image_url"], parts[2].(map[string]any)["image_url"])
+			_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"content":%q}}]}`, reply)
+		}))
+		defer upstream.Close()
+		require.NoError(t, db.Model(&provider).Update("base_url", upstream.URL).Error)
+		status, created := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":"openai_chat","upstream_model_name":"two-image-probe"}`, provider.Id, parent.Id))
+		require.Equal(t, http.StatusOK, status, created)
+		probePath := fmt.Sprintf("/api/admin/v1/channels/%v/probes", created["data"].(map[string]any)["id"])
+		for _, expected := range []string{"inconclusive", "passed"} {
+			status, result := call(http.MethodPost, probePath, `{"capability":"max_images"}`)
+			require.Equal(t, http.StatusOK, status, result)
+			assert.Equal(t, expected, result["data"].(map[string]any)["status"], result)
+			reply = "red,blue"
+		}
+	})
+	t.Run("Provider response repairs run before capability inspection", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`{"success":true,"data":{"choices":[{"message":{"content":"ok"}}]}}`))
+		}))
+		defer upstream.Close()
+		account := model.Provider{Name: "Enterprise probe Provider", Type: constant.ChannelTypeOpenRouter, Key: "secret", BaseURL: common.GetPointer(upstream.URL), Status: common.ChannelStatusEnabled, OtherSettings: `{"openrouter_enterprise":true}`}
+		require.NoError(t, db.Create(&account).Error)
+		status, created := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":"openai_chat","upstream_model_name":"enterprise-probe"}`, account.Id, unified.Id))
+		require.Equal(t, http.StatusOK, status, created)
+		status, result := call(http.MethodPost, fmt.Sprintf("/api/admin/v1/channels/%v/probes", created["data"].(map[string]any)["id"]), `{"capability":"input_text"}`)
+		require.Equal(t, http.StatusOK, status, result)
+		assert.Equal(t, "passed", result["data"].(map[string]any)["status"], result)
 	})
 	t.Run("capability narrowing and model edits stay consistent", func(t *testing.T) {
 		unified.Capabilities = capability.Set{Features: []capability.Feature{capability.Streaming, capability.ToolCalling}, InputModalities: []capability.Modality{capability.Text, capability.Image}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{ContextLength: common.GetPointer(int64(32000)), MaxOutputTokens: common.GetPointer(int64(4096)), MaxImages: common.GetPointer(int64(8)), MaxDurationSeconds: common.GetPointer(int64(60)), EmbeddingDimensions: common.GetPointer(int64(3072))}}

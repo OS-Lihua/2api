@@ -25,6 +25,7 @@ import {
   RouterProvider,
 } from '@tanstack/react-router'
 import {
+  act,
   cleanup,
   render,
   screen,
@@ -40,6 +41,7 @@ import { api } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { ChannelMutateDrawer } from '../channel-mutate-drawer'
+import { ChannelProbeDialog } from '../channel-probe-dialog'
 import { ProviderChannels } from '../provider-channels'
 import { ProvidersProvider } from '../providers-provider'
 import { ProvidersTable } from '../providers-table'
@@ -52,6 +54,7 @@ await i18n.init({
 })
 afterEach(() => {
   cleanup()
+  vi.useRealTimers()
   vi.restoreAllMocks()
   useAuthStore.getState().auth.reset()
 })
@@ -382,6 +385,71 @@ it('opens capability probes and shows persisted results before activation', asyn
     within(dialog).getByText(
       'Results do not change capability declarations. Test requests may incur Provider costs.'
     )
+  ).toBeVisible()
+  client.clear()
+})
+
+it('refreshes another administrator’s running probe and reconciles a failed submission', async () => {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+  let status = 'running'
+  vi.spyOn(api, 'get').mockImplementation(async () => ({
+    data: {
+      success: true,
+      data: {
+        capabilities: ['streaming'],
+        results: [
+          {
+            id: 1,
+            capability: 'streaming',
+            status,
+            reason: status === 'passed' ? 'verified' : 'behavior_not_observed',
+            finished_at: 1794000001,
+          },
+        ],
+      },
+    },
+  }))
+  vi.spyOn(api, 'post').mockImplementation(async () => {
+    status = 'inconclusive'
+    throw new Error('synthetic network failure')
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <ChannelProbeDialog
+          channel={{
+            id: 3,
+            provider_id: 7,
+            model_id: 2,
+            protocol: 'openai_chat',
+            upstream_model_name: 'probe-model',
+            status: 'pending',
+            mapping_confirmed: false,
+            capabilities: null,
+            parameter_overrides: {},
+            rpm: 0,
+            tpm: 0,
+            max_concurrency: 0,
+            weight: 1,
+          }}
+          canOperate
+          onClose={() => {}}
+        />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  expect(await screen.findByText('Testing...')).toBeVisible()
+  status = 'passed'
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1500)
+  })
+  expect(await screen.findByText('Capability behavior observed')).toBeVisible()
+  await userEvent.click(screen.getByRole('button', { name: 'Probe Streaming' }))
+  expect(
+    await screen.findByText('Capability behavior was not observed')
   ).toBeVisible()
   client.clear()
 })

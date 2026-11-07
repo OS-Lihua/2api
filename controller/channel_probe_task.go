@@ -261,7 +261,6 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return "failed", "upstream_rejected"
 	}
-	streamType := response.Header.Get("Content-Type")
 	captured := &bytes.Buffer{}
 	response.Body = struct {
 		io.Reader
@@ -325,26 +324,72 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 		if err != nil {
 			return "failed", "response_invalid"
 		}
-		hook := "renderFinal"
-		if wire == "openai_image" {
-			hook = "render"
+		renderContext := protocolContext.JSValueFor(plugin.Meta)
+		artifacts, artifactErr := taskadaptor.RendererArtifactsWithContext(ctx, plugin, task, service.BuildTaskArtifactContentURL)
+		if artifactErr != nil {
+			return "failed", "response_invalid"
 		}
-		rendered, err := plugin.Engine.CallPath(ctx, "protocols", []string{wire, hook}, protocolContext.JSValueFor(plugin.Meta), viewValue)
-		if err == nil {
-			data, encodeErr := common.Marshal(rendered)
-			if encodeErr == nil {
-				if result.Capability == "streaming" && strings.HasPrefix(streamType, "text/event-stream") {
-					return observeProbeStream(protocol.OpenAIResponses, streamType, captured.Bytes())
+		renderContext["artifacts"] = artifacts
+		if wire == "openai_responses" && stream {
+			value, err := plugin.Engine.CallPath(ctx, "protocols", []string{wire, "renderEvents"}, renderContext, viewValue, nil)
+			if err != nil {
+				return "inconclusive", "behavior_not_observed"
+			}
+			limits := relay.DefaultPluginProtocolLimits()
+			eventResult, err := relay.DecodePluginProtocolEventResult(value, limits)
+			if err != nil {
+				return "failed", "response_invalid"
+			}
+			machine := relay.NewPluginResponsesMachine(task.TaskID, record.UpstreamModelName, task.SubmitTime, limits)
+			created, err := machine.CreatedEvent()
+			if err != nil {
+				return "failed", "response_invalid"
+			}
+			if writeTaskPluginProtocolEvent(c, created) != nil {
+				return "failed", "response_too_large"
+			}
+			events, err := machine.ApplyTick(eventResult, string(task.Status))
+			if err != nil {
+				return "failed", "response_invalid"
+			}
+			for _, event := range events {
+				if writeTaskPluginProtocolEvent(c, event) != nil {
+					return "failed", "response_too_large"
 				}
-				kind := protocol.OpenAIResponses
-				if wire == "openai_image" {
-					kind = protocol.OpenAIImages
+			}
+			if result.Capability == "streaming" {
+				return observeProbeStream(protocol.OpenAIResponses, "text/event-stream", writer.body.Bytes())
+			}
+			final, err := common.Marshal(events[len(events)-1].Response)
+			if err == nil && observeChannelProbe(recipe, protocol.OpenAIResponses, result.Capability, final) {
+				if recipe.SampledLimit {
+					return "inconclusive", "limit_sample_only"
 				}
-				if observeChannelProbe(recipe, kind, result.Capability, data) {
-					if recipe.SampledLimit {
-						return "inconclusive", "limit_sample_only"
+				return "passed", "verified"
+			}
+		} else {
+			hook := "renderFinal"
+			if wire == "openai_image" {
+				hook = "render"
+			}
+			rendered, err := plugin.Engine.CallPath(ctx, "protocols", []string{wire, hook}, renderContext, viewValue)
+			if err == nil && wire == "openai_responses" {
+				machine := relay.NewPluginResponsesMachine(task.TaskID, record.UpstreamModelName, task.SubmitTime, relay.DefaultPluginProtocolLimits())
+				rendered, err = machine.FinalResponse(rendered, string(task.Status))
+			}
+			if err == nil {
+				data, encodeErr := common.Marshal(rendered)
+				if encodeErr == nil {
+					kind := protocol.OpenAIResponses
+					if wire == "openai_image" {
+						kind = protocol.OpenAIImages
 					}
-					return "passed", "verified"
+					if observeChannelProbe(recipe, kind, result.Capability, data) {
+						if recipe.SampledLimit {
+							return "inconclusive", "limit_sample_only"
+						}
+						return "passed", "verified"
+					}
 				}
 			}
 		}
@@ -353,8 +398,18 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 	if err != nil {
 		return "inconclusive", "behavior_not_observed"
 	}
-	wanted := "video"
+	wanted := ""
 	switch result.Capability {
+	case "output_video":
+		wanted = "video"
+	case "input_text":
+		if wire == "openai_video" {
+			wanted = "video"
+		} else if wire == "openai_image" {
+			wanted = "image"
+		}
+	case "max_duration_seconds":
+		wanted = "timed_media"
 	case "output_image", "max_images":
 		wanted = "image"
 	case "output_audio":
@@ -362,9 +417,16 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 	case "output_pdf":
 		wanted = "pdf"
 	}
+	if wanted == "" {
+		return "inconclusive", "behavior_not_observed"
+	}
 	observed := int64(0)
 	for _, artifact := range artifacts {
-		if artifact.Type != wanted && !(wanted == "pdf" && artifact.MimeType == "application/pdf") {
+		if wanted == "timed_media" {
+			if artifact.Type != "video" && artifact.Type != "audio" {
+				continue
+			}
+		} else if artifact.Type != wanted && !(wanted == "pdf" && artifact.MimeType == "application/pdf") {
 			continue
 		}
 		descriptor, err := adaptor.BuildContentRequest(ctx, task, artifact.Key, channel.TaskArtifactClientRequest{Method: http.MethodGet})
@@ -379,7 +441,11 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 			continue
 		}
 		valid := false
-		switch wanted {
+		mediaKind := wanted
+		if wanted == "timed_media" {
+			mediaKind = artifact.Type
+		}
+		switch mediaKind {
 		case "video":
 			seconds, validVideo := probeVideoSeconds(payload)
 			valid = validVideo && (result.Capability != "max_duration_seconds" || seconds >= recipe.TestedValue)
@@ -427,9 +493,13 @@ func probeTaskRequestWithinBudget(value gjson.Result) bool {
 				return valid
 			}
 		}
-		if key.String() == "duration" || key.String() == "seconds" {
+		switch key.String() {
+		case "duration", "seconds", "durationSeconds", "duration_seconds", "duration_in_seconds", "video_duration", "audio_duration":
 			number, err := strconv.ParseInt(item.String(), 10, 64)
 			valid = err == nil && number >= 1 && number <= min(60, relaycommon.MaxTaskDurationSeconds)
+		case "numberOfVideos", "number_of_videos", "num_videos", "video_count":
+			number, err := strconv.ParseInt(item.String(), 10, 64)
+			valid = err == nil && number == 1
 		}
 		return valid
 	})
@@ -461,12 +531,17 @@ func probeTaskMultipartWithinBudget(body []byte, contentType string) bool {
 		}
 		text := strings.TrimSpace(string(value))
 		switch part.FormName() {
-		case "n", "batch_size", "batch_count", "num_images", "num_outputs", "sampleCount":
+		case "n", "batch_size", "batch_count", "num_images", "num_outputs", "sampleCount", "numberOfImages", "number_of_images", "numImages":
 			number, err := strconv.ParseInt(text, 10, 64)
 			if err != nil || number < 1 || number > 2 {
 				return false
 			}
-		case "seconds", "duration":
+		case "numberOfVideos", "number_of_videos", "num_videos", "video_count":
+			number, err := strconv.ParseInt(text, 10, 64)
+			if err != nil || number != 1 {
+				return false
+			}
+		case "seconds", "duration", "durationSeconds", "duration_seconds", "duration_in_seconds", "video_duration", "audio_duration":
 			number, err := strconv.ParseInt(text, 10, 64)
 			if err != nil || number < 1 || number > min(60, relaycommon.MaxTaskDurationSeconds) {
 				return false

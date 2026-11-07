@@ -145,6 +145,21 @@ func probeChannel(ctx context.Context, record model.Channel, provider *model.Pro
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
 			return "failed", "upstream_rejected"
 		}
+		bounded := *response
+		bounded.Body = io.NopCloser(bytes.NewReader(body))
+		repaired, repairErr := adaptor.FixResponse(c, info, &bounded)
+		if repairErr != nil || repaired == nil || repaired.Body == nil {
+			return "failed", "response_invalid"
+		}
+		body, readErr = io.ReadAll(io.LimitReader(repaired.Body, (1<<20)+1))
+		repaired.Body.Close()
+		if readErr != nil {
+			return "failed", "response_interrupted"
+		}
+		if len(body) > 1<<20 {
+			return "failed", "response_too_large"
+		}
+		response = repaired
 		if attempt+1 < attempts {
 			continue
 		}
@@ -176,7 +191,7 @@ func probeRequestWithinBudget(value gjson.Result, maxCount int64) bool {
 		switch key.String() {
 		case "max_tokens", "max_completion_tokens", "max_output_tokens", "maxOutputTokens", "max_new_tokens", "maxTokens", "MaxTokens", "num_predict", "maxTokenCount":
 			valid = item.Type == gjson.Number && item.Float() >= 1 && item.Float() <= 2048 && item.Float() == float64(item.Int())
-		case "n", "batch_size", "batch_count", "num_images", "num_outputs", "sampleCount":
+		case "n", "batch_size", "batch_count", "num_images", "num_outputs", "sampleCount", "numberOfVideos", "number_of_videos", "num_videos", "video_count", "numberOfImages", "number_of_images", "numImages":
 			valid = item.Type == gjson.Number && item.Float() >= 1 && item.Float() <= float64(maxCount) && item.Float() == float64(item.Int())
 		case "candidateCount":
 			valid = item.Type == gjson.Number && item.Float() == 1
@@ -207,6 +222,7 @@ type probeResponseWriter struct {
 	overflow bool
 }
 
+func (w *probeResponseWriter) Flush()              {}
 func (w *probeResponseWriter) Header() http.Header { return w.header }
 func (w *probeResponseWriter) Write(data []byte) (int, error) {
 	limit := w.maxBytes
