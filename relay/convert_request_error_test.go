@@ -1,8 +1,11 @@
 package relay
 
 import (
+	"bytes"
 	"errors"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/protocol"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -43,6 +47,108 @@ func (*imageReservation) Refund(*gin.Context)        {}
 func (*imageReservation) NeedsRefund() bool          { return false }
 
 func (s *imageReservation) ReserveBeforeSubmit(quota int) error { return s.Reserve(quota) }
+
+func TestMediaPreparationValidatesAndSendsFinalQuantity(t *testing.T) {
+	service.InitHttpClient()
+	for _, tc := range []struct {
+		name, body string
+		override   any
+		count      int
+		invalid    bool
+	}{
+		{"zero normalized", `{"model":"image","prompt":"draw","n":0}`, nil, 1, false},
+		{"provider override", `{"model":"image","prompt":"draw","n":1}`, 4, 4, false},
+		{"oversized override", `{"model":"image","prompt":"draw","n":1}`, 129, 0, true},
+		{"nested bypass", `{"model":"image","prompt":"draw","parameters":{"n":129}}`, nil, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var sent []byte
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var err error
+				sent, err = io.ReadAll(r.Body)
+				require.NoError(t, err)
+				_, _ = io.WriteString(w, `{"data":{"url":"image"}}`)
+			}))
+			t.Cleanup(upstream.Close)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(tc.body))
+			c.Request.Header.Set("Content-Type", "application/json")
+			parsed, err := helper.ParseGatewayMediaRequest(c)
+			if tc.name == "nested bypass" {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeOpenAI, ChannelBaseUrl: upstream.URL, UpstreamModelName: "wire-image"}, RelayMode: relayconstant.RelayModeImagesGenerations, RelayFormat: types.RelayFormatOpenAIImage}
+			if tc.override != nil {
+				info.ParamOverride = map[string]any{"operations": []any{map[string]any{"path": "n", "mode": "set", "value": tc.override}}}
+			}
+			adaptor, err := GetChannelAdaptor(constant.APITypeOpenAI, protocol.OpenAIImages)
+			require.NoError(t, err)
+			prepared, err := adaptor.PrepareMediaRequest(c, info, parsed)
+			if tc.invalid {
+				require.Error(t, err)
+				assert.Empty(t, sent)
+				return
+			}
+			require.NoError(t, err)
+			assert.Empty(t, sent, "preparation must not dispatch")
+			assert.Equal(t, tc.count, *prepared.Input.ImageCount)
+			response, err := adaptor.DoPreparedRequest(c, info, prepared.Prepared)
+			require.NoError(t, err)
+			require.NoError(t, response.(*http.Response).Body.Close())
+			assert.Equal(t, int64(tc.count), ojson.GetBytes(sent, "n").Int())
+			assert.Equal(t, "wire-image", ojson.GetBytes(sent, "model").String())
+		})
+	}
+}
+
+func TestMediaMultipartPreparationUsesOverriddenQuantity(t *testing.T) {
+	service.InitHttpClient()
+	var received string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseMultipartForm(1<<20))
+		received = r.FormValue("n")
+		assert.Equal(t, "wire-image", r.FormValue("model"))
+		file, _, err := r.FormFile("image")
+		require.NoError(t, err)
+		image, err := io.ReadAll(file)
+		require.NoError(t, err)
+		require.NoError(t, file.Close())
+		assert.Equal(t, "image bytes", string(image))
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(upstream.Close)
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	require.NoError(t, writer.WriteField("model", "image"))
+	require.NoError(t, writer.WriteField("prompt", "edit"))
+	require.NoError(t, writer.WriteField("n", "1"))
+	part, err := writer.CreateFormFile("image", "image.png")
+	require.NoError(t, err)
+	_, err = part.Write([]byte("image bytes"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
+	c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+	parsed, err := helper.ParseGatewayMediaRequest(c)
+	require.NoError(t, err)
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeOpenAI, ChannelBaseUrl: upstream.URL, UpstreamModelName: "wire-image", ParamOverride: map[string]any{"operations": []any{map[string]any{"path": "n", "mode": "set", "value": 4}}}}, RelayMode: relayconstant.RelayModeImagesEdits, RelayFormat: types.RelayFormatOpenAIImage}
+	adaptor, err := GetChannelAdaptor(constant.APITypeOpenAI, protocol.OpenAIImages)
+	require.NoError(t, err)
+	prepared, err := adaptor.PrepareMediaRequest(c, info, parsed)
+	require.NoError(t, err)
+	require.NotNil(t, prepared.Input.ImageCount)
+	assert.Equal(t, 4, *prepared.Input.ImageCount)
+	contentType, _, err := mime.ParseMediaType(prepared.Prepared.Headers().Get("Content-Type"))
+	require.NoError(t, err)
+	assert.Equal(t, "multipart/form-data", contentType)
+	response, err := adaptor.DoPreparedRequest(c, info, prepared.Prepared)
+	require.NoError(t, err)
+	require.NoError(t, response.(*http.Response).Body.Close())
+	assert.Equal(t, "4", received)
+}
 
 func TestImageRequestReservesFinalQuantityBeforeUpstream(t *testing.T) {
 	service.InitHttpClient()

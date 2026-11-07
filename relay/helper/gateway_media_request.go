@@ -2,6 +2,7 @@ package helper
 
 import (
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"strconv"
 	"strings"
@@ -50,24 +51,7 @@ func ParseGatewayMediaRequest(c *gin.Context) (*GatewayMediaRequest, error) {
 		}
 		c.Request.MultipartForm = form
 		c.Set("gateway_media_multipart", true)
-		scalars := make(map[string]common.RawMessage, len(form.Value))
-		for key, values := range form.Value {
-			if len(values) != 1 {
-				return nil, fmt.Errorf("media scalar %s must occur once", key)
-			}
-			value := values[0]
-			switch key {
-			case "n", "batch_size", "batch_count", "num_images", "num_outputs", "max_tokens", "max_completion_tokens", "max_output_tokens", "max_new_tokens", "duration", "seconds", "duration_seconds", "speed", "parameters", "metadata":
-				scalars[key] = common.RawMessage(value)
-			default:
-				encoded, err := common.Marshal(value)
-				if err != nil {
-					return nil, err
-				}
-				scalars[key] = encoded
-			}
-		}
-		body, err = common.Marshal(scalars)
+		body, err = GatewayMediaMultipartInput(form)
 		if err != nil {
 			return nil, err
 		}
@@ -119,6 +103,29 @@ func ParseGatewayMediaRequest(c *gin.Context) (*GatewayMediaRequest, error) {
 		parsed.Input.Headers[strings.ToLower(key)] = strings.Join(values, ",")
 	}
 	return parsed, nil
+}
+
+// GatewayMediaMultipartInput converts only form scalars to exact JSON probes.
+// Files are deliberately excluded, and duplicate scalar fields are rejected.
+func GatewayMediaMultipartInput(form *multipart.Form) ([]byte, error) {
+	scalars := make(map[string]common.RawMessage, len(form.Value))
+	for key, values := range form.Value {
+		if len(values) != 1 {
+			return nil, fmt.Errorf("media scalar %s must occur once", key)
+		}
+		value := values[0]
+		switch key {
+		case "n", "batch_size", "batch_count", "num_images", "num_outputs", "max_tokens", "max_completion_tokens", "max_output_tokens", "max_new_tokens", "duration", "seconds", "duration_seconds", "speed", "parameters", "metadata":
+			scalars[key] = common.RawMessage(value)
+		default:
+			encoded, err := common.Marshal(value)
+			if err != nil {
+				return nil, err
+			}
+			scalars[key] = encoded
+		}
+	}
+	return common.Marshal(scalars)
 }
 
 // MaxGatewayImageDimension bounds both sides of a requested image. It also
