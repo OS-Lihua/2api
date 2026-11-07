@@ -24,7 +24,13 @@ import {
   createMemoryHistory,
   RouterProvider,
 } from '@tanstack/react-router'
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import {
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { createInstance } from 'i18next'
 import { I18nextProvider } from 'react-i18next'
@@ -219,7 +225,7 @@ it('creating a channel suggests its Model, validates limits, and retains a rejec
   client.clear()
 })
 
-it('editing a channel saves explicit zero limits and its capability narrowing', async () => {
+it('editing a channel clears overrides while saving zero limits and capability narrowing', async () => {
   const channel = {
     id: 3,
     provider_id: 7,
@@ -271,6 +277,11 @@ it('editing a channel saves explicit zero limits and its capability narrowing', 
   const tpm = screen.getByRole('textbox', { name: 'TPM' })
   await userEvent.clear(tpm)
   await userEvent.type(tpm, '0')
+  await userEvent.click(
+    within(
+      screen.getByRole('group', { name: 'Parameter overrides' })
+    ).getByRole('button', { name: 'Delete row' })
+  )
   await userEvent.click(screen.getByRole('button', { name: 'Save changes' }))
   await waitFor(() => expect(onSaved).toHaveBeenCalled())
   expect(patch).toHaveBeenCalledWith('/api/admin/v1/channels/3', {
@@ -283,7 +294,7 @@ it('editing a channel saves explicit zero limits and its capability narrowing', 
     max_concurrency: 2,
     weight: 1,
     capabilities: channel.capabilities,
-    parameter_overrides: { temperature: 0 },
+    parameter_overrides: {},
   })
   client.clear()
 })

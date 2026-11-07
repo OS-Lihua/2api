@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -131,6 +132,13 @@ func TestSingleModelChannelAPI(t *testing.T) {
 		require.Equal(t, http.StatusOK, status, result)
 		assert.Equal(t, "disabled", result["data"].(map[string]any)["status"])
 	})
+	t.Run("referenced models cannot become metadata matching rules", func(t *testing.T) {
+		legacyBody := fmt.Sprintf(`{"id":%d,"model_name":"gpt-4o","vendor_id":%d,"name_rule":1,"status":1,"sync_official":1}`, unified.Id, publisher.Id)
+		_, result := call(http.MethodPut, "/api/models/", legacyBody)
+		assert.Equal(t, false, result["success"], result)
+		status, _ := call(http.MethodGet, fmt.Sprintf("/api/admin/v1/models/%d", unified.Id), "")
+		assert.Equal(t, http.StatusOK, status)
+	})
 	t.Run("referenced models cannot be soft deleted", func(t *testing.T) {
 		status, result := call(http.MethodDelete, fmt.Sprintf("/api/admin/v1/models/%d", unified.Id), "")
 		assert.Equal(t, http.StatusConflict, status, result)
@@ -154,6 +162,36 @@ func TestSingleModelChannelAPI(t *testing.T) {
 			status, result := call(http.MethodPatch, path, invalid)
 			assert.Equal(t, http.StatusBadRequest, status, result)
 		}
+	})
+	t.Run("concurrent patches preserve fields omitted by the later body", func(t *testing.T) {
+		reader, writer := io.Pipe()
+		defer reader.Close()
+		defer writer.Close()
+		request := httptest.NewRequest(http.MethodPatch, path, reader)
+		request.Header.Set("Authorization", "Bearer "+token)
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		done := make(chan struct{})
+		go func() { defer close(done); engine.ServeHTTP(recorder, request) }()
+		prefixRead := make(chan error, 1)
+		go func() { _, err := writer.Write([]byte(`{`)); prefixRead <- err }()
+		select {
+		case err := <-prefixRead:
+			require.NoError(t, err)
+		case <-done:
+			t.Fatalf("PATCH returned before reading its body: %d %s", recorder.Code, recorder.Body.String())
+		}
+		status, result := call(http.MethodPatch, path, `{"tpm":77}`)
+		require.Equal(t, http.StatusOK, status, result)
+		_, err := writer.Write([]byte(`"weight":2}`))
+		require.NoError(t, err)
+		require.NoError(t, writer.Close())
+		<-done
+		require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+		status, result = call(http.MethodGet, path, "")
+		require.Equal(t, http.StatusOK, status, result)
+		assert.EqualValues(t, 77, result["data"].(map[string]any)["tpm"])
+		assert.EqualValues(t, 2, result["data"].(map[string]any)["weight"])
 	})
 	t.Run("task binding needs permission and unavailable plugins can be disabled", func(t *testing.T) {
 		previousRegistry := jsplugin.DefaultRegistry

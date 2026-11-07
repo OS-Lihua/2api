@@ -324,7 +324,14 @@ export function ChannelMutateDrawer(props: {
                       control={form.control}
                       name={name}
                       render={({ field }) => (
-                        <FormItem>
+                        <FormItem
+                          role='group'
+                          aria-label={
+                            name === 'capabilities'
+                              ? t('Capabilities')
+                              : t('Parameter overrides')
+                          }
+                        >
                           <FormLabel>
                             {name === 'capabilities'
                               ? t('Capabilities')

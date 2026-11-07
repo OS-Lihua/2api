@@ -277,22 +277,32 @@ func (mi *Model) UpdateDeclaration() error {
 	return mi.updateColumns(append(slices.Clone(modelMetadataColumns), "capabilities"))
 }
 
+func (mi *Model) validateChannelDeclarations(tx *gorm.DB, capabilitiesChanged bool) error {
+	var channels []Channel
+	if err := tx.Where("model_id = ?", mi.Id).Find(&channels).Error; err != nil {
+		return err
+	}
+	for _, channel := range channels {
+		if mi.NameRule != NameRuleExact {
+			return ErrModelHasChannels
+		}
+		if capabilitiesChanged {
+			if _, err := channel.EffectiveCapabilities(mi.Capabilities); err != nil {
+				return ErrModelChannelCapabilities
+			}
+		}
+	}
+	return nil
+}
+
 func (mi *Model) updateColumns(columns []string) error {
 	return metadataTransaction(func(tx *gorm.DB) error {
-		if slices.Contains(columns, "capabilities") {
-			var previous Model
-			if err := lockForUpdate(tx).First(&previous, mi.Id).Error; err != nil {
-				return err
-			}
-			var channels []Channel
-			if err := tx.Where("model_id = ?", mi.Id).Find(&channels).Error; err != nil {
-				return err
-			}
-			for _, channel := range channels {
-				if _, err := channel.EffectiveCapabilities(mi.Capabilities); err != nil {
-					return ErrModelChannelCapabilities
-				}
-			}
+		var previous Model
+		if err := lockForUpdate(tx).First(&previous, mi.Id).Error; err != nil {
+			return err
+		}
+		if err := mi.validateChannelDeclarations(tx, slices.Contains(columns, "capabilities")); err != nil {
+			return err
 		}
 		if err := validateModelVendor(tx, mi.VendorID); err != nil {
 			return err

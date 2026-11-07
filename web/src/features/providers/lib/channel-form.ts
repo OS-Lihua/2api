@@ -23,16 +23,19 @@ import {
   transformCapabilitiesToFormValues,
 } from '@/features/models/lib/model-form'
 
-const objectJSON = z.string().refine((value) => {
-  try {
-    const parsed: unknown = JSON.parse(value)
-    return (
-      typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
-    )
-  } catch {
-    return false
-  }
-}, 'Parameter overrides must be a JSON object')
+const objectJSON = z
+  .string()
+  .transform((value) => (value.trim() === '' ? '{}' : value))
+  .refine((value) => {
+    try {
+      const parsed: unknown = JSON.parse(value)
+      return (
+        typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      )
+    } catch {
+      return false
+    }
+  }, 'Parameter overrides must be a JSON object')
 const nonnegative = z
   .string()
   .regex(/^\d+$/, 'Enter a non-negative integer')
