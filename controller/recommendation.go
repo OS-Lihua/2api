@@ -64,7 +64,6 @@ func SaveRecommendationRule(c *gin.Context) {
 		common.ApiErrorStatus(c, 500, err)
 		return
 	}
-	recordManageAudit(c, "recommendation_rule.save", map[string]any{"id": rule.ID, "kind": rule.Kind})
 	common.ApiSuccess(c, rule)
 }
 
@@ -83,7 +82,6 @@ func DeleteRecommendationRule(c *gin.Context) {
 		recommendationLookupError(c, gorm.ErrRecordNotFound)
 		return
 	}
-	recordManageAudit(c, "recommendation_rule.delete", map[string]any{"id": id})
 	common.ApiSuccess(c, gin.H{"id": id})
 }
 

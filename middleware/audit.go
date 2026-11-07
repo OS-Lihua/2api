@@ -93,6 +93,11 @@ var auditRouteActions = map[string]string{
 	"PUT /api/admin/v1/models/:id":    "model.update",
 	"DELETE /api/admin/v1/models/:id": "model.delete",
 
+	// Provider and Publisher recommendation rules
+	"POST /api/admin/v1/recommendation-rules":       "recommendation_rule.save",
+	"PUT /api/admin/v1/recommendation-rules/:id":    "recommendation_rule.save",
+	"DELETE /api/admin/v1/recommendation-rules/:id": "recommendation_rule.delete",
+
 	// 部署
 	"POST /api/deployments/":      "deployment.create",
 	"PUT /api/deployments/:id":    "deployment.update",
