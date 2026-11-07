@@ -191,10 +191,11 @@ func SmokeTestExpr(exprStr string) error {
 }
 
 func smokeTestExpr(exprStr string) error {
-	if _, err := billingexpr.CompileFromCache(exprStr); err != nil {
+	compiled, err := billingexpr.Compile(exprStr)
+	if err != nil {
 		return err
 	}
-	usageKeys := billingexpr.UsedUsageKeys(exprStr)
+	usageKeys := compiled.UsageKeys()
 	if len(usageKeys) > 0 {
 		sortedKeys := make([]string, 0, len(usageKeys))
 		for key := range usageKeys {
@@ -216,7 +217,7 @@ func smokeTestExpr(exprStr string) error {
 
 	for _, v := range vectors {
 		for _, request := range billingExprSmokeRequests() {
-			result, _, err := billingexpr.RunExprWithRequest(exprStr, v, request)
+			result, _, err := compiled.Run(v, request)
 			if err != nil {
 				return fmt.Errorf("vector {p=%g, c=%g}: run failed: %w", v.P, v.C, err)
 			}
@@ -232,13 +233,14 @@ func smokeTestExpr(exprStr string) error {
 // declared by its plugin. Literal u() keys must be declared; dynamic calls are
 // still exercised by the generated runtime vectors when possible.
 func SmokeTestTaskExpr(exprStr string, schema map[string]jsplugin.UsageFieldSchema) error {
-	if _, err := billingexpr.CompileFromCache(exprStr); err != nil {
+	compiled, err := billingexpr.Compile(exprStr)
+	if err != nil {
 		return err
 	}
-	if billingexpr.UsesFixedPricing(exprStr) {
+	if compiled.UsesFixedPricing() {
 		return fmt.Errorf("fixed pricing is not supported for task usage expressions")
 	}
-	for key := range billingexpr.UsedUsageKeys(exprStr) {
+	for key := range compiled.UsageKeys() {
 		if _, declared := schema[key]; !declared {
 			return fmt.Errorf("usage key %q is not declared by the task plugin", key)
 		}
@@ -247,7 +249,7 @@ func SmokeTestTaskExpr(exprStr string, schema map[string]jsplugin.UsageFieldSche
 	for _, usage := range taskUsageSmokeVectors(schema) {
 		for _, request := range billingExprSmokeRequests() {
 			request.Usage = usage
-			result, _, err := billingexpr.RunExprWithRequest(exprStr, billingexpr.TokenParams{}, request)
+			result, _, err := compiled.Run(billingexpr.TokenParams{}, request)
 			if err != nil {
 				return fmt.Errorf("usage vector %v: run failed: %w", usage, err)
 			}

@@ -53,6 +53,7 @@ var auditContentTemplates = map[string]string{
 	"option.passkey_domains_failed":    "Passkey domain update failed",
 
 	"channel.create":             "Created channel ${name} (type ${type}, count ${count})",
+	"channel.probe":              "Probed channel capability ${capability} (ID: ${id}, result: ${status})",
 	"channel.update":             "Updated channel ${name} (ID: ${id})",
 	"channel.delete":             "Deleted channel ${name} (ID: ${id})",
 	"channel.delete_batch":       "Batch deleted ${count} channels",

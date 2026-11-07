@@ -45,6 +45,16 @@ func GetChannelAdaptor(apiType int, upstream protocol.Type) (*ChannelAdaptor, er
 	return &ChannelAdaptor{provider: provider, protocol: handler, kind: upstream}, nil
 }
 
+// FixResponse applies the selected Provider's response-envelope repair without
+// running protocol presentation or usage processing.
+func (a *ChannelAdaptor) FixResponse(c *gin.Context, info *relaycommon.RelayInfo, response *http.Response) (*http.Response, error) {
+	fixer, ok := a.provider.(channel.ProviderResponseFixer)
+	if !ok {
+		return response, nil
+	}
+	return fixer.FixResponse(c, &channel.ProtocolResponseContext{Protocol: a.kind, ChannelType: info.ChannelType, OpenRouterEnterprise: info.ChannelOtherSettings.IsOpenRouterEnterprise(), IsStream: info.IsStream}, response)
+}
+
 func GetProtocolHandler(kind protocol.Type) (channel.ProtocolHandler, error) {
 	if channel.IsNonTextProtocol(kind) || strings.HasPrefix(string(kind), "task:") {
 		return nontextprotocol.New(kind)

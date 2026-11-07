@@ -511,6 +511,8 @@ const AUDIT_TEMPLATES: Record<string, string> = {
   'performance.clear_logs': 'Cleared log files',
   // Channel
   'channel.create': 'Created channel {{name}} (type {{type}}, count {{count}})',
+  'channel.probe':
+    'Probed Channel capability {{capability}} (ID: {{id}}, result: {{status}})',
   'channel.update': 'Updated channel {{name}} (ID: {{id}})',
   'channel.status_update': 'Updated channel status (ID: {{id}})',
   'channel.status_update_batch':
