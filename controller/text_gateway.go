@@ -333,9 +333,20 @@ func TextGateway(c *gin.Context) {
 		gatewayError(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
 	}
+	attempt = &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: record.ID, ChannelID: selection.Channel.ID, ProviderID: selection.Channel.ProviderID, ModelID: selection.Channel.ModelID, MemberTier: 1,
+		StartedAt: attemptStart.UnixMilli(), FailoverDecision: "stop", FailoverReason: "single_attempt", CircuitAction: "none", RouteDiagnostics: selection.Diagnostics,
+		UsageSource: "none", PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, Cost: money.Amount{Currency: purchase.Currency}, AccountingFXRate: purchaseRate,
+		ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, ConversionLosses: []string{}}
 	info.SetEstimatePromptTokens(estimatedInput)
+	encoded, err = adaptor.PrepareChatRequest(c, info, converted, encoded)
+	if err != nil {
+		attemptErr = types.NewError(errors.New("upstream preparation failed"), types.ErrorCodeDoRequestFailed)
+		gatewayError(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
+		return
+	}
 	prepared, err := adaptor.PrepareRequest(c, info, bytes.NewReader(encoded))
 	if err != nil {
+		attemptErr = types.NewError(err, types.ErrorCodeDoRequestFailed)
 		gatewayError(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
 		return
 	}
@@ -358,10 +369,6 @@ func TextGateway(c *gin.Context) {
 		gatewayError(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
 	}
-	attempt = &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: record.ID, ChannelID: selection.Channel.ID, ProviderID: selection.Channel.ProviderID, ModelID: selection.Channel.ModelID, MemberTier: 1,
-		StartedAt: attemptStart.UnixMilli(), FailoverDecision: "stop", FailoverReason: "single_attempt", CircuitAction: "none", RouteDiagnostics: selection.Diagnostics,
-		UsageSource: "none", PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, Cost: money.Amount{Currency: purchase.Currency}, AccountingFXRate: purchaseRate,
-		ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, ConversionLosses: []string{}}
 	response, err := adaptor.DoPreparedRequest(c, info, prepared)
 	if err != nil {
 		attemptErr = types.NewError(err, types.ErrorCodeDoRequestFailed)

@@ -155,7 +155,7 @@ func sendOllamaDelta(c *gin.Context, info *relaycommon.RelayInfo, delta dto.Chat
 				text += call.Function.Name + call.Function.Arguments
 			}
 			if text != "" || len(choice.Delta.ToolCalls) > 0 {
-				info.ResponseFacts.BusinessOutput = true
+				info.ResponseFacts.MarkBusinessOutput()
 				info.ResponseFacts.GeneratedText += text
 			}
 		}
@@ -398,7 +398,10 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	if info.ResponseFacts != nil {
 		info.ResponseFacts.PromptTokensReported = lastChunk.PromptEvalCount != nil && *lastChunk.PromptEvalCount >= 0 && *lastChunk.PromptEvalCount <= 1<<31-1
 		info.ResponseFacts.CompletionTokensReported = lastChunk.EvalCount != nil && *lastChunk.EvalCount >= 0 && *lastChunk.EvalCount <= 1<<31-1
-		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
+		info.ResponseFacts.RecordUsage(usage, usage, info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported)
+		if resp.StatusCode != http.StatusOK {
+			return usage, types.NewErrorWithStatusCode(fmt.Errorf("upstream request failed"), types.ErrorCodeBadResponse, resp.StatusCode)
+		}
 		var output strings.Builder
 		output.WriteString(content)
 		output.WriteString(msg.GetReasoningContent())
@@ -435,7 +438,7 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	if info.ResponseFacts != nil {
 		info.ResponseFacts.DownstreamWriteFailed = writeErr != nil
 		if writeErr == nil && resp.StatusCode == http.StatusOK && info.ResponseFacts.GeneratedText != "" {
-			info.ResponseFacts.BusinessOutput = true
+			info.ResponseFacts.MarkBusinessOutput()
 		}
 	}
 	return usage, nil

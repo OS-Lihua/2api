@@ -89,7 +89,7 @@ func uploadDifyFile(c *gin.Context, info *relaycommon.RelayInfo, user string, me
 		writer.Close()
 
 		// Create HTTP request
-		req, err := http.NewRequest("POST", uploadUrl, body)
+		req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, uploadUrl, body)
 		if err != nil {
 			common.SysLog(common.LogText("failed to create request: %s", err.Error()))
 			return nil
@@ -106,6 +106,9 @@ func uploadDifyFile(c *gin.Context, info *relaycommon.RelayInfo, user string, me
 			return nil
 		}
 		defer resp.Body.Close()
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			return nil
+		}
 
 		// Parse response
 		var result struct {
@@ -116,6 +119,9 @@ func uploadDifyFile(c *gin.Context, info *relaycommon.RelayInfo, user string, me
 			return nil
 		}
 
+		if result.Id == "" {
+			return nil
+		}
 		return &DifyFile{
 			UploadFileId: result.Id,
 			Type:         "image",
@@ -160,10 +166,14 @@ func requestOpenAI2Dify(c *gin.Context, info *relaycommon.RelayInfo, request dto
 						// 导致 file.Type = ... 触发 nil pointer dereference
 						// 而 panic（500: "invalid memory address or nil pointer dereference"）。
 						file = &DifyFile{
-							Type:         media.MimeType,
+							Type:         "image",
 							TransferMode: "remote_url",
 							URL:          media.Url,
 						}
+					} else if info.ResponseFacts != nil {
+						// Keep inline media transient until reservation and resolve only
+						// the files retained by the effective Channel overrides.
+						file = &DifyFile{Type: "image", TransferMode: "local_file", URL: media.Url}
 					} else {
 						file = uploadDifyFile(c, info, difyReq.User, mediaContent)
 					}
@@ -182,6 +192,36 @@ func requestOpenAI2Dify(c *gin.Context, info *relaycommon.RelayInfo, request dto
 	}
 	difyReq.ResponseMode = mode
 	return &difyReq
+}
+
+func (*DifyChatRequest) PrepareChatRequest(c *gin.Context, info *relaycommon.RelayInfo, body []byte) ([]byte, error) {
+	var wire DifyChatRequest
+	if err := common.Unmarshal(body, &wire); err != nil {
+		return nil, fmt.Errorf("invalid Dify chat request")
+	}
+	changed := false
+	for i, file := range wire.Files {
+		media := dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: file.URL}}
+		if file.URL == "" || media.GetImageMedia().IsRemoteImage() {
+			continue
+		}
+		if err := c.Request.Context().Err(); err != nil {
+			return nil, fmt.Errorf("Dify file upload cancelled")
+		}
+		uploaded := uploadDifyFile(c, info, wire.User, media)
+		if uploaded == nil {
+			return nil, fmt.Errorf("Dify file upload failed")
+		}
+		wire.Files[i], changed = *uploaded, true
+	}
+	if !changed {
+		return body, nil
+	}
+	document := ojson.NewDoc(body)
+	if err := document.Set("files", wire.Files); err != nil {
+		return nil, fmt.Errorf("invalid Dify chat request")
+	}
+	return document.Bytes(), nil
 }
 
 func streamResponseDify2OpenAI(difyResponse DifyChunkChatCompletionResponse) *dto.ChatCompletionsStreamResponse {
@@ -233,11 +273,21 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			sr.Error(err)
 			return
 		}
+		if info.ResponseFacts != nil {
+			prompt, completion := relaycommon.ChatUsagePresence([]byte(ojson.Get(data, "metadata").Raw))
+			if rawUsage := ojson.Get(data, "metadata.usage"); rawUsage.IsObject() {
+				previousPrompt, previousCompletion := usage.PromptTokens, usage.CompletionTokens
+				if err := common.UnmarshalJsonStr(rawUsage.Raw, usage); err != nil {
+					sr.Error(err)
+					return
+				}
+				usage.PromptTokens, usage.CompletionTokens = previousPrompt, previousCompletion
+			}
+			info.ResponseFacts.RecordUsage(usage, &difyResponse.MetaData.Usage, prompt, completion)
+		}
 		if difyResponse.Event == "message_end" {
-			usage = &difyResponse.MetaData.Usage
-			if info.ResponseFacts != nil {
-				info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported = relaycommon.ChatUsagePresence([]byte(ojson.Get(data, "metadata").Raw))
-				info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
+			if info.ResponseFacts == nil {
+				usage = &difyResponse.MetaData.Usage
 			}
 			info.StreamStatus.MarkCompleted()
 			sr.Done()
@@ -261,7 +311,7 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		if info.ResponseFacts != nil && len(openaiResponse.Choices) > 0 && (err == nil || errors.As(err, &flushErr)) {
 			text := openaiResponse.Choices[0].Delta.GetContentString()
 			if text != "" {
-				info.ResponseFacts.BusinessOutput = true
+				info.ResponseFacts.MarkBusinessOutput()
 				info.ResponseFacts.GeneratedText += text
 			}
 		}
@@ -303,22 +353,8 @@ func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	if info.ResponseFacts != nil {
-		info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported = relaycommon.ChatUsagePresence([]byte(ojson.GetBytes(responseBody, "metadata").Raw))
-		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
-		if resp.StatusCode != http.StatusOK {
-			return &difyResponse.MetaData.Usage, nil
-		}
-		info.ResponseFacts.GeneratedText = difyResponse.Answer
-		if !info.ResponseFacts.UsageReported {
-			estimated := service.ResponseText2Usage(c, difyResponse.Answer, info.TokenizerModelName(), info.GetEstimatePromptTokens())
-			if !info.ResponseFacts.PromptTokensReported {
-				difyResponse.MetaData.Usage.PromptTokens = estimated.PromptTokens
-			}
-			if !info.ResponseFacts.CompletionTokensReported {
-				difyResponse.MetaData.Usage.CompletionTokens = estimated.CompletionTokens
-			}
-			difyResponse.MetaData.Usage.TotalTokens = difyResponse.MetaData.Usage.PromptTokens + difyResponse.MetaData.Usage.CompletionTokens
-		}
+		prompt, completion := relaycommon.ChatUsagePresence([]byte(ojson.GetBytes(responseBody, "metadata").Raw))
+		info.ResponseFacts.RecordUsage(&difyResponse.MetaData.Usage, &difyResponse.MetaData.Usage, prompt, completion)
 	}
 	fullTextResponse := dto.OpenAITextResponse{
 		Id:      difyResponse.ConversationId,
@@ -335,18 +371,15 @@ func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 		FinishReason: "stop",
 	}
 	fullTextResponse.Choices = append(fullTextResponse.Choices, choice)
+	if info.ResponseFacts != nil {
+		return helper.WriteChatResponse(c, info, resp, &fullTextResponse)
+	}
 	jsonResponse, err := common.Marshal(fullTextResponse)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	c.Writer.Header().Set("Content-Type", "application/json")
 	c.Writer.WriteHeader(resp.StatusCode)
-	_, writeErr := c.Writer.Write(jsonResponse)
-	if info.ResponseFacts != nil {
-		info.ResponseFacts.DownstreamWriteFailed = writeErr != nil
-		if writeErr == nil && difyResponse.Answer != "" {
-			info.ResponseFacts.BusinessOutput = true
-		}
-	}
+	_, _ = c.Writer.Write(jsonResponse)
 	return &difyResponse.MetaData.Usage, nil
 }
