@@ -567,6 +567,8 @@ const AUDIT_TEMPLATES: Record<string, string> = {
   'wallet.top_up': 'Credited a top-up to a user wallet',
   'wallet.adjust': 'Adjusted a user wallet balance',
   'wallet.reverse_entry': 'Reversed a ledger entry',
+  'recommendation_rule.save': 'Saved a recommendation rule',
+  'recommendation_rule.delete': 'Deleted a recommendation rule',
   // Generic middleware fallback
   generic: '{{method}} {{route}}',
 }

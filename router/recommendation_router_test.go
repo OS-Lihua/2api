@@ -19,9 +19,11 @@ import (
 )
 
 func TestRecommendationAdminAPI(t *testing.T) {
-	previousMaster, previousRedis := common.IsMasterNode, common.RedisEnabled
-	t.Cleanup(func() { common.IsMasterNode, common.RedisEnabled = previousMaster, previousRedis })
-	common.IsMasterNode, common.RedisEnabled = true, false
+	previousMaster, previousRedis, previousCache := common.IsMasterNode, common.RedisEnabled, common.MemoryCacheEnabled
+	t.Cleanup(func() {
+		common.IsMasterNode, common.RedisEnabled, common.MemoryCacheEnabled = previousMaster, previousRedis, previousCache
+	})
+	common.IsMasterNode, common.RedisEnabled, common.MemoryCacheEnabled = true, false, false
 	db := model.UseTestDatabases(t)
 	require.NoError(t, i18n.Init())
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.UserAccessToken{}, &model.Option{}, &model.Vendor{}, &model.Model{}, &model.Provider{}, &model.Ability{}))

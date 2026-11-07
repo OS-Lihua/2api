@@ -64,9 +64,18 @@ export function RecommendationRules(props: { kind: RecommendationKind }) {
   const [pagination, setPagination] = useState({ pageIndex: 0, pageSize: 20 })
   const client = useQueryClient()
   const query = useQuery({
-    queryKey: ['recommendation-rules', props.kind, pagination.pageIndex],
+    queryKey: [
+      'recommendation-rules',
+      props.kind,
+      pagination.pageIndex,
+      pagination.pageSize,
+    ],
     queryFn: () =>
-      listRecommendationRules(props.kind, pagination.pageIndex + 1),
+      listRecommendationRules(
+        props.kind,
+        pagination.pageIndex + 1,
+        pagination.pageSize
+      ),
     enabled: open && canRead,
   })
   const remove = useMutation({
@@ -178,6 +187,7 @@ export function RecommendationRules(props: { kind: RecommendationKind }) {
                 isLoading={query.isLoading}
                 isFetching={query.isFetching}
                 emptyTitle={t('No recommendation rules')}
+                paginationInFooter={false}
                 toolbar={false}
               />
             )}

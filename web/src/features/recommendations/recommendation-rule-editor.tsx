@@ -50,18 +50,26 @@ import {
 } from '@/components/ui/sheet'
 import { Switch } from '@/components/ui/switch'
 import { CHANNEL_TYPE_OPTIONS } from '@/features/channels/constants'
-import { getVendors } from '@/features/models/api'
-import { requireServerSuccess } from '@/lib/server-error-message'
+import { getAllPublishers } from '@/features/models/api'
 
 import { saveRecommendationRule, type RecommendationRule } from './api'
 
+const invalidRule = 'Invalid recommendation rule'
 const schema = z.object({
-  pattern: z.string().trim().min(1).max(253),
-  priority: z.number().int().min(-2147483648).max(2147483647),
-  enabled: z.boolean(),
-  provider_name: z.string().max(128),
-  provider_type: z.number().int(),
-  publisher_id: z.number().int(),
+  pattern: z
+    .string({ error: invalidRule })
+    .trim()
+    .min(1, invalidRule)
+    .max(253, invalidRule),
+  priority: z
+    .number({ error: invalidRule })
+    .int(invalidRule)
+    .min(-2147483648, invalidRule)
+    .max(2147483647, invalidRule),
+  enabled: z.boolean({ error: invalidRule }),
+  provider_name: z.string({ error: invalidRule }).max(128, invalidRule),
+  provider_type: z.number({ error: invalidRule }).int(invalidRule),
+  publisher_id: z.number({ error: invalidRule }).int(invalidRule),
 })
 
 export function RecommendationRuleEditor(props: {
@@ -75,9 +83,8 @@ export function RecommendationRuleEditor(props: {
     defaultValues: props.rule,
   })
   const publishers = useQuery({
-    queryKey: ['vendors', 'recommendation-selector'],
-    queryFn: async () =>
-      requireServerSuccess(await getVendors({ page_size: 1000 })),
+    queryKey: ['vendors', 'all-publishers'],
+    queryFn: getAllPublishers,
     enabled: props.rule.kind === 'publisher',
   })
   const save = useMutation({
@@ -91,7 +98,7 @@ export function RecommendationRuleEditor(props: {
   })
   const typeOptions = CHANNEL_TYPE_OPTIONS.map((option) => ({
     value: String(option.value),
-    label: option.label,
+    label: t(option.label),
   }))
   return (
     <Sheet
@@ -202,7 +209,7 @@ export function RecommendationRuleEditor(props: {
                         <FormLabel>{t('Publisher')}</FormLabel>
                         <FormControl>
                           <Combobox
-                            options={(publishers.data?.data?.items ?? []).map(
+                            options={(publishers.data ?? []).map(
                               (publisher) => ({
                                 value: String(publisher.id),
                                 label: publisher.name,

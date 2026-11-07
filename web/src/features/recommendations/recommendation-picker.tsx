@@ -55,13 +55,14 @@ export function RecommendationPicker(props: {
       (props.kind === 'provider' || Boolean(props.input.model_name)),
   })
   if (!hasPermission(user, 'recommendation', 'read')) return null
-  if (query.isError)
-    {return (
+  if (query.isError) {
+    return (
       <ErrorState
         description={t('Failed to load')}
         onRetry={() => void query.refetch()}
       />
-    )}
+    )
+  }
   return (
     <div className='space-y-2'>
       <p className='text-muted-foreground text-sm'>
@@ -102,8 +103,9 @@ export function RecommendationPicker(props: {
         confirmText={t('Confirm recommendation')}
         disabled={pending?.source !== source}
         handleConfirm={() => {
-          if (pending && pending.source === source)
-            {props.onConfirm(pending.rule)}
+          if (pending && pending.source === source) {
+            props.onConfirm(pending.rule)
+          }
           setPending(null)
         }}
       />

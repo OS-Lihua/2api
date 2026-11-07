@@ -66,12 +66,11 @@ import { Textarea } from '@/components/ui/textarea'
 import { ModelPricingPanel } from '@/features/model-pricing/model-pricing-panel'
 import { RecommendationPicker } from '@/features/recommendations/recommendation-picker'
 import {
-  requireServerSuccess,
   createServerError,
   getServerErrorMessage,
 } from '@/lib/server-error-message'
 
-import { createModel, updateModel, getModel, getVendors } from '../../api'
+import { createModel, updateModel, getModel, getAllPublishers } from '../../api'
 import { getNameRuleOptions, ENDPOINT_TEMPLATES } from '../../constants'
 import { modelsQueryKeys, vendorsQueryKeys } from '../../lib'
 import {
@@ -123,12 +122,11 @@ export function ModelMutateDrawer(props: {
     defaultValues: MODEL_FORM_DEFAULT_VALUES,
   })
   const vendorsQuery = useQuery({
-    queryKey: vendorsQueryKeys.list(),
-    queryFn: async () =>
-      requireServerSuccess(await getVendors({ page_size: 1000 })),
+    queryKey: ['vendors', 'all-publishers'],
+    queryFn: getAllPublishers,
     enabled: props.open,
   })
-  const vendors = vendorsQuery.data?.data?.items ?? []
+  const vendors = vendorsQuery.data ?? []
   const selectedVendor = vendors.find(
     (vendor) => vendor.id === form.watch('vendor_id')
   )

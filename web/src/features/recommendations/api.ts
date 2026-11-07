@@ -49,10 +49,11 @@ export async function queryRecommendations(
 }
 export async function listRecommendationRules(
   kind: RecommendationKind,
-  page: number
+  page: number,
+  pageSize: number
 ): Promise<{ items: RecommendationRule[]; total: number }> {
   const response = await api.get(rulesPath, {
-    params: { kind, p: page, page_size: 20 },
+    params: { kind, p: page, page_size: pageSize },
   })
   return requireServerSuccess(response.data).data
 }

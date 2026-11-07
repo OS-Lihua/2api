@@ -32,7 +32,7 @@ afterEach(() => {
   useAuthStore.getState().auth.reset()
 })
 
-it('administrator can create and edit persisted Provider recommendation rules', async () => {
+it('administrator can change page size and edit persisted Provider recommendation rules', async () => {
   useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
   const rule = {
     id: 1,
@@ -45,8 +45,8 @@ it('administrator can create and edit persisted Provider recommendation rules', 
     publisher_id: 0,
     publisher_name: '',
   }
-  vi.spyOn(api, 'get').mockResolvedValue({
-    data: { success: true, data: { items: [rule], total: 1 } },
+  const get = vi.spyOn(api, 'get').mockResolvedValue({
+    data: { success: true, data: { items: [rule], total: 60 } },
   })
   const put = vi
     .spyOn(api, 'put')
@@ -62,9 +62,20 @@ it('administrator can create and edit persisted Provider recommendation rules', 
   await userEvent.click(
     screen.getByRole('button', { name: 'Recommendation rules' })
   )
+  await screen.findByRole('button', { name: 'Edit' })
+  await userEvent.click(screen.getByRole('combobox'))
+  await userEvent.click(await screen.findByRole('option', { name: '50' }))
+  await waitFor(() =>
+    expect(get).toHaveBeenCalledWith('/api/admin/v1/recommendation-rules', {
+      params: { kind: 'provider', p: 1, page_size: 50 },
+    })
+  )
   await userEvent.click(await screen.findByRole('button', { name: 'Edit' }))
   const pattern = await screen.findByRole('textbox', { name: 'Match pattern' })
   await userEvent.clear(pattern)
+  await userEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+  expect(await screen.findByText('Invalid recommendation rule')).toBeVisible()
+  expect(put).not.toHaveBeenCalled()
   await userEvent.type(pattern, '*.example.com')
   await userEvent.click(screen.getByRole('button', { name: 'Save changes' }))
   await waitFor(() =>
@@ -75,6 +86,60 @@ it('administrator can create and edit persisted Provider recommendation rules', 
         provider_name: 'Example',
         provider_type: 1,
       })
+    )
+  )
+  client.clear()
+})
+
+it('Publisher rule editor can select a Publisher beyond the first server page', async () => {
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
+  vi.spyOn(api, 'get').mockImplementation(async (path, config) => {
+    if (path === '/api/vendors/') {
+      const page = (config?.params as { p?: number } | undefined)?.p ?? 1
+      const items =
+        page === 1
+          ? Array.from({ length: 100 }, (_, index) => ({
+              id: index + 1,
+              name: `Publisher ${index + 1}`,
+            }))
+          : [{ id: 101, name: 'Older Publisher' }]
+      return {
+        data: {
+          success: true,
+          data: { items, total: 101, page, page_size: 100 },
+        },
+      }
+    }
+    return { data: { success: true, data: { items: [], total: 0 } } }
+  })
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValue({ data: { success: true } })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <RecommendationRules kind='publisher' />
+    </QueryClientProvider>
+  )
+  await userEvent.click(
+    screen.getByRole('button', { name: 'Recommendation rules' })
+  )
+  await userEvent.click(await screen.findByRole('button', { name: 'Add rule' }))
+  await userEvent.type(
+    screen.getByRole('textbox', { name: 'Match pattern' }),
+    'custom-'
+  )
+  await userEvent.click(screen.getByRole('combobox', { name: 'Publisher' }))
+  await userEvent.click(
+    await screen.findByRole('option', { name: 'Older Publisher' })
+  )
+  await userEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+  await waitFor(() =>
+    expect(post).toHaveBeenCalledWith(
+      '/api/admin/v1/recommendation-rules',
+      expect.objectContaining({ pattern: 'custom-', publisher_id: 101 })
     )
   )
   client.clear()
