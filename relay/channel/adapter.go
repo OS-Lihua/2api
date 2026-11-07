@@ -15,11 +15,26 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-type Adaptor interface {
-	// Init IsStream bool
-	Init(info *relaycommon.RelayInfo)
+// ProtocolHandler converts a public DTO to an upstream DTO or io.Reader. A
+// reader carries already encoded JSON, multipart or binary data; the host must
+// pass it through its replayable BodyStorage path rather than JSON-marshal it.
+// Unsupported requests must return an error, never a nil result with nil error.
+type ProtocolHandler interface {
+	ConvertRequest(c *gin.Context, info *relaycommon.RelayInfo, request any) (any, error)
+	DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError)
+}
+
+// ProviderTransport is the legacy transport seam. It deliberately excludes
+// conversion and response parsing so HTTP transport can be reused independently.
+type ProviderTransport interface {
 	GetRequestURL(info *relaycommon.RelayInfo) (string, error)
 	SetupRequestHeader(c *gin.Context, req *http.Header, info *relaycommon.RelayInfo) error
+}
+
+type Adaptor interface {
+	ProviderTransport
+	// Init IsStream bool
+	Init(info *relaycommon.RelayInfo)
 	ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) (any, error)
 	ConvertRerankRequest(c *gin.Context, relayMode int, request dto.RerankRequest) (any, error)
 	ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.EmbeddingRequest) (any, error)

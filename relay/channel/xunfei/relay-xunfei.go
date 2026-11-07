@@ -13,6 +13,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -103,6 +104,10 @@ func streamResponseXunfei2OpenAI(xunfeiResponse *XunfeiChatResponse) *dto.ChatCo
 }
 
 func buildXunfeiAuthUrl(hostUrl string, apiKey, apiSecret string) string {
+	return (&Provider{}).authURL(hostUrl, apiKey, apiSecret)
+}
+
+func (p *Provider) authURL(hostUrl string, apiKey, apiSecret string) string {
 	HmacWithShaToBase64 := func(algorithm, data, key string) string {
 		mac := hmac.New(sha256.New, []byte(key))
 		mac.Write([]byte(data))
@@ -111,7 +116,7 @@ func buildXunfeiAuthUrl(hostUrl string, apiKey, apiSecret string) string {
 	}
 	ul, err := url.Parse(hostUrl)
 	if err != nil {
-		fmt.Println(err)
+		return ""
 	}
 	date := time.Now().UTC().Format(time.RFC1123)
 	signString := []string{"host: " + ul.Host, "date: " + date, "GET " + ul.Path + " HTTP/1.1"}
@@ -266,7 +271,7 @@ func apiVersion2domain(apiVersion string) string {
 func getXunfeiAuthUrl(c *gin.Context, apiKey string, apiSecret string, modelName string) (string, string) {
 	apiVersion := getAPIVersion(c, modelName)
 	domain := apiVersion2domain(apiVersion)
-	authUrl := buildXunfeiAuthUrl(fmt.Sprintf("wss://spark-api.xf-yun.com/%s/chat", apiVersion), apiKey, apiSecret)
+	authUrl, _ := (&Provider{}).RequestURL(&channel.ProviderRequest{ApiKey: "|" + apiSecret + "|" + apiKey, ApiVersion: apiVersion})
 	return domain, authUrl
 }
 

@@ -27,7 +27,7 @@ import (
 
 // https://cloud.tencent.com/document/product/1729/97732
 
-func requestOpenAI2Tencent(a *Adaptor, request dto.GeneralOpenAIRequest) *TencentChatRequest {
+func requestOpenAI2Tencent(a *Protocol, request dto.GeneralOpenAIRequest) *TencentChatRequest {
 	messages := make([]*TencentMessage, 0, len(request.Messages))
 	for i := 0; i < len(request.Messages); i++ {
 		message := request.Messages[i]
@@ -184,7 +184,12 @@ func hmacSha256(s, key string) string {
 	return string(hashed.Sum(nil))
 }
 
-func getTencentSign(req TencentChatRequest, adaptor *Adaptor, secId, secKey string) string {
+func getTencentSign(req TencentChatRequest, adaptor *Protocol, secId, secKey string) string {
+	payload, _ := common.Marshal(req)
+	return (&Provider{Action: adaptor.Action, Timestamp: adaptor.Timestamp}).SignPayload(payload, secId, secKey)
+}
+
+func (adaptor *Provider) SignPayload(payload []byte, secId, secKey string) string {
 	// build canonical request string
 	host := "hunyuan.tencentcloudapi.com"
 	httpRequestMethod := "POST"
@@ -193,7 +198,6 @@ func getTencentSign(req TencentChatRequest, adaptor *Adaptor, secId, secKey stri
 	canonicalHeaders := fmt.Sprintf("content-type:%s\nhost:%s\nx-tc-action:%s\n",
 		"application/json", host, strings.ToLower(adaptor.Action))
 	signedHeaders := "content-type;host;x-tc-action"
-	payload, _ := json.Marshal(req)
 	hashedRequestPayload := sha256hex(string(payload))
 	canonicalRequest := fmt.Sprintf("%s\n%s\n%s\n%s\n%s\n%s",
 		httpRequestMethod,

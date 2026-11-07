@@ -2,10 +2,12 @@ package vertex
 
 import (
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
-	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel"
 	"net/url"
 	"strings"
 
@@ -31,18 +33,18 @@ var Cache = asynccache.NewAsyncCache(asynccache.Options{
 	RefreshDuration: time.Minute * 35,
 	EnableExpire:    true,
 	ExpireDuration:  time.Minute * 30,
-	Fetcher: func(key string) (interface{}, error) {
+	Fetcher: func(key string) (any, error) {
 		return nil, errors.New("not found")
 	},
 })
 
-func getAccessToken(a *Adaptor, info *relaycommon.RelayInfo) (string, error) {
-	var cacheKey string
-	if info.ChannelIsMultiKey {
-		cacheKey = fmt.Sprintf("access-token-%d-%d", info.ChannelId, info.ChannelMultiKeyIndex)
-	} else {
-		cacheKey = fmt.Sprintf("access-token-%d", info.ChannelId)
-	}
+func getAccessToken(a *Protocol, info *relaycommon.RelayInfo) (string, error) {
+	return getProviderAccessToken(&Provider{AccountCredentials: a.AccountCredentials}, channel.NewProviderMetadata(info))
+}
+
+func getProviderAccessToken(a *Provider, info *channel.ProviderRequest) (string, error) {
+	credentialHash := sha256.Sum256([]byte(info.ApiKey))
+	cacheKey := fmt.Sprintf("access-token-%d-%d-%x", info.ChannelId, info.ChannelMultiKeyIndex, credentialHash)
 	val, err := Cache.Get(cacheKey)
 	if err == nil {
 		return val.(string), nil
@@ -132,12 +134,12 @@ func exchangeJwtForAccessToken(signedJWT string, proxy string) (string, error) {
 	defer resp.Body.Close()
 
 	var result map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := common.DecodeJson(resp.Body, &result); err != nil {
 		return "", err
 	}
 
 	if accessToken, ok := result["access_token"].(string); ok {
 		return accessToken, nil
 	}
-	return "", fmt.Errorf("failed to get access token: %v", result)
+	return "", errors.New("failed to get access token")
 }

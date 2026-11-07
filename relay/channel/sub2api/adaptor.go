@@ -4,14 +4,17 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/newapi"
 )
 
-type Adaptor struct {
+// Protocol reuses the newapi public protocol implementation.
+type Protocol struct {
 	newapi.Adaptor
 }
 
-func (a *Adaptor) GetModelList() []string {
+type Adaptor = Protocol
+
+func (a *Protocol) GetModelList() []string {
 	return ModelList
 }
 
-func (a *Adaptor) GetChannelName() string {
+func (a *Protocol) GetChannelName() string {
 	return ChannelName
 }
