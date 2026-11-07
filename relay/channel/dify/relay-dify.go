@@ -230,6 +230,9 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		info.StreamStatus.RequireTerminal()
 		var difyResponse DifyChunkChatCompletionResponse
 		if err := common.Unmarshal([]byte(data), &difyResponse); err != nil {
+			if info.ResponseFacts != nil {
+				err = errors.New("invalid upstream stream data")
+			}
 			common.SysLog(common.LogText("error unmarshalling stream response: %s", err.Error()))
 			sr.Error(err)
 			return
@@ -254,6 +257,10 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			sr.Stop(fmt.Errorf("dify error event"))
 			return
 		}
+		// Workflow diagnostics are metadata, not model reasoning or billable output.
+		if info.ResponseFacts != nil && (strings.HasPrefix(difyResponse.Event, "workflow_") || strings.HasPrefix(difyResponse.Event, "node_")) {
+			return
+		}
 		openaiResponse := *streamResponseDify2OpenAI(difyResponse)
 		if len(openaiResponse.Choices) != 0 {
 			responseText += openaiResponse.Choices[0].Delta.GetContentString()
@@ -267,7 +274,7 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		}
 		var flushErr *helper.StreamFlushError
 		if info.ResponseFacts != nil && len(openaiResponse.Choices) > 0 && (err == nil || errors.As(err, &flushErr)) {
-			text := openaiResponse.Choices[0].Delta.GetContentString()
+			text := openaiResponse.Choices[0].Delta.GetContentString() + openaiResponse.Choices[0].Delta.GetReasoningContent()
 			if text != "" {
 				info.ResponseFacts.MarkBusinessOutput()
 				info.ResponseFacts.GeneratedText += text

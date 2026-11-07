@@ -335,6 +335,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		}
 		if err := scanner.Err(); err != nil {
 			if err != io.EOF {
+				if info.ResponseFacts != nil {
+					err = errors.New("upstream stream read failed")
+				}
 				logger.LogError(c, common.LogText("scanner error: %s", err.Error()))
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)
 			}

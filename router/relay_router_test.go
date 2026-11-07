@@ -713,6 +713,46 @@ func TestTextGatewayStreamInvalidRequestStopsBeforeSwitching(t *testing.T) {
 	assert.Equal(t, "stop", attempts[0].FailoverDecision)
 }
 
+func TestTextGatewayDifyMetadataDoesNotBecomeBillableReasoning(t *testing.T) {
+	for _, business := range []bool{false, true} {
+		t.Run(fmt.Sprint("business=", business), func(t *testing.T) {
+			previous := constant.DifyDebug
+			constant.DifyDebug = true
+			t.Cleanup(func() { constant.DifyDebug = previous })
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: {\"event\":\"workflow_started\",\"data\":{\"workflow_id\":\"internal-workflow\"}}\n\ndata: {\"event\":\"node_started\",\"data\":{\"node_type\":\"internal-node\"}}\n\n"))
+				if business {
+					_, _ = w.Write([]byte("data: {\"event\":\"message\",\"answer\":\"Hello\"}\n\n"))
+				}
+				_, _ = w.Write([]byte("data: {\"event\":\"error\",\"status\":503,\"code\":\"overloaded\"}\n\n"))
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeDify).Error)
+			calls := 0
+			addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+			})
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			assert.NotContains(t, response.Body.String(), "internal-workflow")
+			assert.NotContains(t, response.Body.String(), "internal-node")
+			assert.NotContains(t, response.Body.String(), "reasoning_content")
+			if business {
+				assert.Zero(t, calls)
+				assert.Contains(t, response.Body.String(), "Hello")
+				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, "partial", record.Status)
+				assert.EqualValues(t, 1, record.Usage.CompletionTokens)
+			} else {
+				assert.Equal(t, 1, calls)
+				assert.Contains(t, response.Body.String(), "Recovered")
+			}
+		})
+	}
+}
+
 func TestTextGatewayDifyStreamErrorsRespectFailureScope(t *testing.T) {
 	for _, tc := range []struct {
 		name, code, class string
@@ -777,21 +817,69 @@ func TestTextGatewayFailoverClearsProviderOrganization(t *testing.T) {
 	assert.Contains(t, response.Body.String(), "Recovered")
 }
 
+func captureGatewayDebugLog(t *testing.T) string {
+	t.Helper()
+	logFile, err := os.Create(filepath.Join(t.TempDir(), "debug.log"))
+	require.NoError(t, err)
+	common.LogWriterMu.Lock()
+	previousWriter, previousErrorWriter, previousDebug := gin.DefaultWriter, gin.DefaultErrorWriter, common.DebugEnabled
+	gin.DefaultWriter, gin.DefaultErrorWriter, common.DebugEnabled = logFile, logFile, true
+	common.LogWriterMu.Unlock()
+	t.Cleanup(func() {
+		common.LogWriterMu.Lock()
+		gin.DefaultWriter, gin.DefaultErrorWriter, common.DebugEnabled = previousWriter, previousErrorWriter, previousDebug
+		common.LogWriterMu.Unlock()
+		require.NoError(t, logFile.Close())
+	})
+	return logFile.Name()
+}
+
+type gatewayStreamReadFailure struct {
+	io.ReadCloser
+	read bool
+}
+
+func (body *gatewayStreamReadFailure) Read(p []byte) (int, error) {
+	if body.read {
+		return 0, fmt.Errorf("Bearer provider-secret https://private.invalid/?key=secret")
+	}
+	body.read = true
+	n, err := body.ReadCloser.Read(p)
+	if n > 0 {
+		return n, nil
+	}
+	return n, err
+}
+
+func TestTextGatewayStreamReadErrorsNeverLogProviderSecrets(t *testing.T) {
+	path := captureGatewayDebugLog(t)
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n"))
+	})
+	client := service.GetHttpClient()
+	original := client.Transport
+	t.Cleanup(func() { client.Transport = original })
+	client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
+		response, err := original.RoundTrip(request)
+		if err == nil {
+			response.Body = &gatewayStreamReadFailure{ReadCloser: response.Body}
+		}
+		return response, err
+	})
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	logged, err := os.ReadFile(path)
+	require.NoError(t, err)
+	for _, secret := range []string{"provider-secret", "private.invalid"} {
+		assert.NotContains(t, response.Body.String(), secret)
+		assert.NotContains(t, string(logged), secret)
+	}
+}
+
 func TestTextGatewayStreamFailoverNeverLeaksErrorsOrEndsEarly(t *testing.T) {
 	for _, business := range []bool{false, true} {
 		t.Run(fmt.Sprint("business=", business), func(t *testing.T) {
-			logFile, err := os.Create(filepath.Join(t.TempDir(), "debug.log"))
-			require.NoError(t, err)
-			common.LogWriterMu.Lock()
-			previousWriter, previousErrorWriter, previousDebug := gin.DefaultWriter, gin.DefaultErrorWriter, common.DebugEnabled
-			gin.DefaultWriter, gin.DefaultErrorWriter, common.DebugEnabled = logFile, logFile, true
-			common.LogWriterMu.Unlock()
-			t.Cleanup(func() {
-				common.LogWriterMu.Lock()
-				gin.DefaultWriter, gin.DefaultErrorWriter, common.DebugEnabled = previousWriter, previousErrorWriter, previousDebug
-				common.LogWriterMu.Unlock()
-				require.NoError(t, logFile.Close())
-			})
+			logPath := captureGatewayDebugLog(t)
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				_, _ = w.Write([]byte(": PING\n\ndata: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"))
@@ -809,7 +897,7 @@ func TestTextGatewayStreamFailoverNeverLeaksErrorsOrEndsEarly(t *testing.T) {
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
 			assert.NotContains(t, response.Body.String(), "secret")
 			assert.NotContains(t, response.Body.String(), "private.invalid")
-			logged, err := os.ReadFile(logFile.Name())
+			logged, err := os.ReadFile(logPath)
 			require.NoError(t, err)
 			assert.NotContains(t, string(logged), "provider-secret")
 			assert.NotContains(t, string(logged), "private.invalid")
@@ -917,11 +1005,23 @@ func TestTextGatewayTotalBudgetFiveSecondBoundaryAndAttemptLimit(t *testing.T) {
 }
 
 func TestTextGatewayPreparationFailureDoesNotSpendAttempts(t *testing.T) {
-	for _, badURL := range []bool{false, true} {
-		t.Run(fmt.Sprint("bad URL=", badURL), func(t *testing.T) {
+	for _, test := range []struct {
+		name, url, proxy string
+		providerType     int
+	}{
+		{name: "parameters"}, {name: "invalid escape", url: "http://%zz"}, {name: "unsupported scheme", url: "ftp://upstream.invalid"}, {name: "SDK HTTP fallback scheme", url: "ftp://upstream.invalid", providerType: constant.ChannelTypeVolcEngine}, {name: "missing scheme", url: "upstream.invalid"}, {name: "missing host", url: "http:///relative"}, {name: "invalid proxy", proxy: "ftp://proxy.invalid"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("invalid prepared candidate must not be sent") })
-			if badURL {
-				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("base_url", "http://%zz").Error)
+			if test.providerType != 0 {
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", test.providerType).Error)
+			}
+			if test.url != "" {
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("base_url", test.url).Error)
+			} else if test.proxy != "" {
+				setting, err := common.Marshal(map[string]string{"proxy": test.proxy})
+				require.NoError(t, err)
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("setting", string(setting)).Error)
 			} else {
 				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", `{"n":129}`).Error)
 			}

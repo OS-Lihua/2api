@@ -200,6 +200,11 @@ func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayI
 	if c == nil || c.Request == nil || info == nil || info.ProviderMeta == nil {
 		return nil, errors.New("missing upstream request metadata")
 	}
+	if strings.TrimSpace(info.ChannelSetting.Proxy) != "" {
+		if _, _, err := common.ParseProxyURLRuntime(info.ChannelSetting.Proxy); err != nil {
+			return nil, errors.New("invalid provider proxy URL")
+		}
+	}
 	metadata := a.providerMetadata(info)
 	if providerNeedsPayload(a.provider) {
 		payload, err := io.ReadAll(requestBody)
@@ -217,8 +222,14 @@ func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayI
 	request := &http.Request{Header: make(http.Header)}
 	if requestURL != "" {
 		request, err = http.NewRequestWithContext(c.Request.Context(), c.Request.Method, requestURL, requestBody)
-		if err != nil {
+		if err != nil || request.URL.Hostname() == "" {
 			return nil, errors.New("invalid upstream request URL")
+		}
+		request.URL.Scheme = strings.ToLower(request.URL.Scheme)
+		_, hasExecutor := a.provider.(channel.ProviderRequestExecutor)
+		sdkWebsocket := hasExecutor && (request.URL.Scheme == "ws" || request.URL.Scheme == "wss")
+		if request.URL.Scheme != "http" && request.URL.Scheme != "https" && !sdkWebsocket {
+			return nil, errors.New("invalid upstream request URL scheme")
 		}
 		if channel.IsNonTextProtocol(a.kind) {
 			request.Header.Set("Content-Type", c.Request.Header.Get("Content-Type"))
