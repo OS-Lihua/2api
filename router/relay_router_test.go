@@ -39,6 +39,7 @@ import (
 
 func TestListModelsSupportsOpenAIAndGeminiAuthentication(t *testing.T) {
 	setupRelayRouterTestDB(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Model{}, &model.ModelOffering{}, &model.ModelOfferingName{}, &model.ModelOfferingMember{}, &model.TokenOfferingPolicy{}, &model.TokenOfferingException{}))
 
 	user := model.User{
 		Username: "models-user",
@@ -188,7 +189,7 @@ func newTextGatewayFixture(t *testing.T, upstream http.HandlerFunc) textGatewayF
 	t.Cleanup(func() { constant.StreamingTimeout = previousStreamTimeout })
 	require.NoError(t, model.InitSettlementCurrency())
 	db := model.DB
-	require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Channel{}, &model.ModelOffering{}, &model.ModelOfferingName{}, &model.ModelOfferingMember{}, &model.Wallet{}, &model.LedgerEntry{}))
+	require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Channel{}, &model.ModelOffering{}, &model.ModelOfferingName{}, &model.ModelOfferingMember{}, &model.TokenOfferingPolicy{}, &model.TokenOfferingException{}, &model.Wallet{}, &model.LedgerEntry{}))
 	require.NoError(t, db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS "idx_wallets_account" ON "wallets" ("account_type", "owner_id", "balance_currency")`).Error)
 	require.NoError(t, model.MigratePricing(db))
 	require.NoError(t, model.MigrateGatewayBilling(db))
@@ -1263,8 +1264,9 @@ func TestTextGatewayAuthorizationCapabilityAndScopeFilters(t *testing.T) {
 			f.offering.Groups = []string{"vip"}
 			require.NoError(t, model.SaveModelOffering(t.Context(), f.offering, "save"))
 		}, status: 404, code: "model_not_found"},
-		{name: "token model restriction", change: func(t *testing.T, f *textGatewayFixture) {
-			require.NoError(t, model.DB.Model(f.token).Updates(map[string]any{"model_limits_enabled": true, "model_limits": "other-model"}).Error)
+		{name: "token Offering restriction", change: func(t *testing.T, f *textGatewayFixture) {
+			_, err := model.MutateKeyPermissions(t.Context(), f.token.Id, f.user.Id, 0, "deny_all", model.KeyPermissions{}, nil)
+			require.NoError(t, err)
 		}, status: 404, code: "model_not_found"},
 		{name: "Provider exclusion", change: func(t *testing.T, f *textGatewayFixture) {
 			f.offering.ChannelScope.ExcludeProviderIDs = []int{f.channel.ProviderID}

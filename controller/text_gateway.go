@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"net/http"
-	"slices"
 	"strings"
 	"time"
 
@@ -43,7 +42,12 @@ func TextGateway(c *gin.Context) {
 	}
 	c.Abort()
 	userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
-	if !offering.Enabled || offering.Visibility == "groups" && !slices.Contains(offering.Groups, userGroup) {
+	allowed, err := service.GatewayOfferingAllowed(c, offering)
+	if err != nil {
+		gatewayError(c, http.StatusServiceUnavailable, "authorization_unavailable", "Model authorization is unavailable")
+		return
+	}
+	if !allowed {
 		gatewayError(c, http.StatusNotFound, "model_not_found", "Model not found")
 		return
 	}
@@ -53,14 +57,6 @@ func TextGateway(c *gin.Context) {
 		return
 	}
 	requestedName := request.Model
-	if c.GetBool("token_model_limit_enabled") {
-		limits, _ := c.Get("token_model_limit")
-		allowed, _ := limits.(map[string]bool)
-		if !allowed[requestedName] && !allowed[offering.Name] {
-			gatewayError(c, http.StatusNotFound, "model_not_found", "Model not found")
-			return
-		}
-	}
 	started := c.GetTime(middleware.TextGatewayStartedAtKey)
 	if started.IsZero() {
 		started = clock.Now()

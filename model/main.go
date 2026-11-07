@@ -277,6 +277,8 @@ func migrateDB() error {
 		&ModelOffering{},
 		&ModelOfferingName{},
 		&ModelOfferingMember{},
+		&TokenOfferingPolicy{},
+		&TokenOfferingException{},
 		&Token{},
 		&User{},
 		&UserSession{},
