@@ -1,0 +1,268 @@
+package controller
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"io"
+	"net/http"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/protocol"
+	"github.com/QuantumNous/new-api/relay"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
+)
+
+// ChannelProbeCapabilities lists request features that can be observed with
+// bounded synthetic requests. Results describe observations, not declarations.
+var channelProbeCapabilities = []string{"streaming", "tool_calling", "reasoning", "structured_output", "caching"}
+
+// ProbeChannel uses the same Provider/Protocol composition as production calls.
+// No caller headers, user identity, wallet or accounting state enter the call.
+func probeChannel(ctx context.Context, record model.Channel, provider *model.Provider, feature string) (string, string) {
+	apiType, supported := common.ChannelType2APIType(provider.Type)
+	if !supported {
+		return "inconclusive", "protocol_unavailable"
+	}
+	adaptor, err := relay.GetChannelAdaptor(apiType, record.Protocol)
+	if err != nil {
+		return "inconclusive", "protocol_unavailable"
+	}
+	key, index, keyErr := provider.GetNextEnabledKey()
+	if keyErr != nil {
+		return "failed", "credential_unavailable"
+	}
+	request := &dto.GeneralOpenAIRequest{Model: record.UpstreamModelName, Messages: []dto.Message{{Role: "user", Content: "Reply with ok."}}, MaxTokens: common.GetPointer(uint(64))}
+	switch feature {
+	case "streaming":
+		request.Stream = common.GetPointer(true)
+	case "tool_calling":
+		if common.UnmarshalJsonStr(`{"messages":[{"role":"user","content":"Call probe_echo with value ok."}],"tools":[{"type":"function","function":{"name":"probe_echo","description":"Echo the probe value","parameters":{"type":"object","properties":{"value":{"type":"string","enum":["ok"]}},"required":["value"],"additionalProperties":false}}}],"tool_choice":{"type":"function","function":{"name":"probe_echo"}}}`, request) != nil {
+			return "failed", "request_invalid"
+		}
+	case "structured_output":
+		request.Messages[0].Content = `Return JSON with probe equal to ok.`
+		request.ResponseFormat = &dto.ResponseFormat{Type: "json_schema", JsonSchema: []byte(`{"name":"probe","strict":true,"schema":{"type":"object","properties":{"probe":{"type":"string","enum":["ok"]}},"required":["probe"],"additionalProperties":false}}`)}
+	case "reasoning":
+		request.ReasoningEffort = "low"
+		request.MaxTokens = common.GetPointer(uint(2048))
+		request.Messages[0].Content = "Think through this problem, then give only the answer: if three boxes contain 2, 4 and 8 items, how many items remain after moving half of each box into a fourth box?"
+	case "caching":
+		request.Messages[0].Content = strings.Repeat("This is a synthetic cache probe with no private information. ", 160) + "Reply with ok."
+		request.PromptCacheKey = "gateway-capability-probe"
+	}
+	// Only trusted Provider settings determine the transport. Channel parameter
+	// overrides cannot increase the fixed probe budget or replace the test input.
+	organization := ""
+	if provider.OpenAIOrganization != nil {
+		organization = *provider.OpenAIOrganization
+	}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: provider.Type, ChannelId: provider.Id, ChannelIsMultiKey: provider.ProviderInfo.IsMultiKey, ChannelMultiKeyIndex: index, ChannelBaseUrl: provider.GetBaseURL(), ApiType: apiType, ApiKey: key, Organization: organization, ChannelCreateTime: provider.CreatedTime, HeadersOverride: provider.GetHeaderOverride(), ChannelSetting: provider.GetSetting(), ChannelOtherSettings: provider.GetOtherSettings(), UpstreamModelName: record.UpstreamModelName}, DisablePing: true, OriginModelName: record.UpstreamModelName, RelayFormat: types.RelayFormatOpenAI, IsStream: feature == "streaming", IsChannelTest: true}
+	cleanRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", nil)
+	if err != nil {
+		return "failed", "request_invalid"
+	}
+	cleanRequest.Header.Set("Content-Type", "application/json")
+	cleanRequest.Body = http.NoBody
+	c := &gin.Context{Request: cleanRequest, Writer: &probeResponseWriter{header: make(http.Header)}}
+	converted, err := adaptor.ConvertRequest(c, info, request)
+	if err != nil {
+		return "inconclusive", "request_not_representable"
+	}
+	var encoded []byte
+	if reader, ok := converted.(io.Reader); ok {
+		encoded, err = io.ReadAll(io.LimitReader(reader, 1<<20))
+	} else {
+		encoded, err = common.Marshal(converted)
+	}
+	if err != nil {
+		return "failed", "request_invalid"
+	}
+	attempts := 1
+	if feature == "caching" {
+		attempts = 2
+	}
+	for attempt := range attempts {
+		upstream, err := adaptor.DoRequest(c, info, bytes.NewReader(encoded))
+		if err != nil {
+			if ctx.Err() != nil {
+				return "failed", "request_timeout"
+			}
+			return "failed", "transport_failed"
+		}
+		response, ok := upstream.(*http.Response)
+		if !ok || response == nil || response.Body == nil {
+			return "failed", "response_invalid"
+		}
+		body, readErr := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
+		response.Body.Close()
+		if readErr != nil {
+			return "failed", "response_interrupted"
+		}
+		if len(body) > 1<<20 {
+			return "failed", "response_too_large"
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			return "failed", "upstream_rejected"
+		}
+		if attempt+1 < attempts {
+			continue
+		}
+		if feature == "streaming" {
+			return observeProbeStream(record.Protocol, response.Header.Get("Content-Type"), body)
+		}
+		if !gjson.ValidBytes(body) {
+			return "failed", "response_invalid"
+		}
+		if observeProbeJSON(record.Protocol, feature, body) {
+			return "passed", "verified"
+		}
+	}
+	return "inconclusive", "behavior_not_observed"
+}
+
+// probeResponseWriter isolates upstream stream headers from the management
+// response. Probe calls read the upstream body directly and never relay output.
+type probeResponseWriter struct {
+	bufferedResponseWriter
+	header http.Header
+}
+
+func (w *probeResponseWriter) Header() http.Header { return w.header }
+
+// observeProbeJSON checks evidence in the selected wire protocol. Usage is read
+// only to observe caching/reasoning; it is never fabricated or billed.
+func observeProbeJSON(kind protocol.Type, feature string, body []byte) bool {
+	root := gjson.ParseBytes(body)
+	var text, reasoning string
+	var calls []gjson.Result
+	var cached, reasoningTokens int64
+	switch kind {
+	case protocol.OpenAIChat:
+		text = root.Get("choices.0.message.content").String()
+		reasoning = root.Get("choices.0.message.reasoning_content").String() + root.Get("choices.0.message.reasoning").String()
+		calls = root.Get("choices.0.message.tool_calls").Array()
+		cached = root.Get("usage.prompt_tokens_details.cached_tokens").Int()
+		reasoningTokens = root.Get("usage.completion_tokens_details.reasoning_tokens").Int()
+	case protocol.OpenAIResponses:
+		for _, output := range root.Get("output").Array() {
+			switch output.Get("type").String() {
+			case "message":
+				for _, part := range output.Get("content").Array() {
+					if part.Get("type").String() == "output_text" {
+						text += part.Get("text").String()
+					}
+				}
+			case "function_call":
+				calls = append(calls, output)
+			case "reasoning":
+				reasoning += output.Get("summary.0.text").String()
+			}
+		}
+		cached = root.Get("usage.input_tokens_details.cached_tokens").Int()
+		reasoningTokens = root.Get("usage.output_tokens_details.reasoning_tokens").Int()
+	case protocol.AnthropicMessages:
+		for _, part := range root.Get("content").Array() {
+			switch part.Get("type").String() {
+			case "text":
+				text += part.Get("text").String()
+			case "thinking":
+				reasoning += part.Get("thinking").String()
+			case "tool_use":
+				calls = append(calls, part)
+			}
+		}
+		cached = root.Get("usage.cache_read_input_tokens").Int()
+	case protocol.GeminiGenerate:
+		for _, part := range root.Get("candidates.0.content.parts").Array() {
+			if part.Get("thought").Bool() {
+				reasoning += part.Get("text").String()
+			} else {
+				text += part.Get("text").String()
+			}
+			if part.Get("functionCall").Exists() {
+				calls = append(calls, part.Get("functionCall"))
+			}
+		}
+		cached = root.Get("usageMetadata.cachedContentTokenCount").Int()
+		reasoningTokens = root.Get("usageMetadata.thoughtsTokenCount").Int()
+	}
+	switch feature {
+	case "structured_output":
+		return gjson.Valid(text) && gjson.Get(text, "probe").String() == "ok" && len(gjson.Parse(text).Map()) == 1
+	case "reasoning":
+		return strings.TrimSpace(reasoning) != "" || reasoningTokens > 0
+	case "caching":
+		return cached > 0
+	case "tool_calling":
+		for _, call := range calls {
+			name := call.Get("name").String()
+			args := call.Get("arguments").String()
+			if kind == protocol.OpenAIChat {
+				name = call.Get("function.name").String()
+				args = call.Get("function.arguments").String()
+			}
+			if kind == protocol.AnthropicMessages {
+				args = call.Get("input").Raw
+			}
+			if kind == protocol.GeminiGenerate {
+				args = call.Get("args").Raw
+			}
+			if name == "probe_echo" && gjson.Valid(args) && gjson.Get(args, "value").String() == "ok" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func observeProbeStream(kind protocol.Type, contentType string, body []byte) (string, string) {
+	if !strings.HasPrefix(contentType, "text/event-stream") {
+		return "inconclusive", "behavior_not_observed"
+	}
+	observed, complete := false, false
+	scanner := bufio.NewScanner(bytes.NewReader(body))
+	scanner.Buffer(make([]byte, 4096), 1<<20)
+	for scanner.Scan() {
+		payload, ok := strings.CutPrefix(scanner.Text(), "data:")
+		if !ok {
+			continue
+		}
+		payload = strings.TrimSpace(payload)
+		if payload == "[DONE]" {
+			complete = true
+			continue
+		}
+		if !gjson.Valid(payload) {
+			continue
+		}
+		item := gjson.Parse(payload)
+		switch kind {
+		case protocol.OpenAIChat:
+			observed = observed || item.Get("choices.0.delta.content").String() != ""
+			complete = complete || item.Get("choices.0.finish_reason").String() != ""
+		case protocol.OpenAIResponses:
+			observed = observed || (item.Get("type").String() == "response.output_text.delta" && item.Get("delta").String() != "")
+			complete = complete || item.Get("type").String() == "response.completed"
+		case protocol.AnthropicMessages:
+			observed = observed || (item.Get("type").String() == "content_block_delta" && item.Get("delta.text").String() != "")
+			complete = complete || item.Get("type").String() == "message_stop"
+		case protocol.GeminiGenerate:
+			observed = observed || item.Get("candidates.0.content.parts.0.text").String() != ""
+			complete = complete || item.Get("candidates.0.finishReason").String() == "STOP"
+		}
+	}
+	if scanner.Err() != nil {
+		return "failed", "response_invalid"
+	}
+	if observed && complete {
+		return "passed", "verified"
+	}
+	return "inconclusive", "behavior_not_observed"
+}

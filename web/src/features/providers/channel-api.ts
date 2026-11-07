@@ -58,6 +58,23 @@ export async function listSingleModelChannels(
     data: { items: SingleModelChannel[]; total: number }
   }>(response.data).data
 }
+export interface ChannelProbeResult {
+  id: number
+  capability: string
+  protocol: string
+  started_at: number
+  finished_at: number
+  status: 'running' | 'passed' | 'failed' | 'inconclusive'
+  reason: string
+}
+export async function listChannelProbes(id: number) {
+  const response = await api.get(`${path}/${id}/probes`)
+  return requireServerSuccess<{ success: boolean; data: { capabilities: string[]; results: ChannelProbeResult[] } }>(response.data).data
+}
+export async function runChannelProbe(id: number, capability: string) {
+  const response = await api.post(`${path}/${id}/probes`, { capability })
+  return requireServerSuccess<{ success: boolean; data: ChannelProbeResult }>(response.data).data
+}
 export async function channelAction(id: number, action: string) {
   const response =
     action === 'delete'

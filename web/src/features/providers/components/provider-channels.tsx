@@ -39,6 +39,7 @@ import {
   listSingleModelChannels,
   type SingleModelChannel,
 } from '../channel-api'
+import { ChannelProbeDialog } from './channel-probe-dialog'
 import { ChannelMutateDrawer } from './channel-mutate-drawer'
 
 export function ProviderChannels(props: { providerId: number }) {
@@ -54,6 +55,7 @@ export function ProviderChannels(props: { providerId: number }) {
     ADMIN_PERMISSION_RESOURCES.CHANNEL,
     ADMIN_PERMISSION_ACTIONS.OPERATE
   )
+  const [probing, setProbing] = useState<SingleModelChannel | null>(null)
   const [pagination, setPagination] = useState({ pageIndex: 0, pageSize: 10 })
   const [editing, setEditing] = useState<SingleModelChannel | null | undefined>(
     undefined
@@ -106,6 +108,9 @@ export function ProviderChannels(props: { providerId: number }) {
       header: t('Actions'),
       cell: ({ row }) => (
         <div className='flex flex-wrap gap-2'>
+          <Button size='sm' variant='outline' onClick={() => setProbing(row.original)}>
+            {t('Capability probes')}
+          </Button>
           {canWrite && (
             <Button
               size='sm'
@@ -199,6 +204,7 @@ export function ProviderChannels(props: { providerId: number }) {
           }}
         />
       )}
+      {probing && <ChannelProbeDialog channel={probing} canOperate={canOperate} onClose={() => setProbing(null)} />}
       <ConfirmDialog
         open={operation !== null}
         onOpenChange={(open) => {

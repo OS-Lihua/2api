@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/capability"
+	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/service"
@@ -40,7 +41,7 @@ func TestSingleModelChannelAPI(t *testing.T) {
 	common.IsMasterNode, common.RedisEnabled = true, false
 	db := model.UseTestDatabases(t)
 	require.NoError(t, i18n.Init())
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.UserAccessToken{}, &model.Option{}, &model.Provider{}, &model.Channel{}, &model.Ability{}, &model.TaskPlugin{}, &model.Model{}, &model.Vendor{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.UserAccessToken{}, &model.Option{}, &model.Provider{}, &model.Channel{}, &model.ChannelProbeResult{}, &model.Ability{}, &model.TaskPlugin{}, &model.Model{}, &model.Vendor{}))
 	require.NoError(t, model.MigrateAuditLogs())
 	require.NoError(t, model.EnsureLegacyAccessTokenRetireAt(time.Now().Unix()))
 	require.NoError(t, authz.Init(db))
@@ -90,6 +91,62 @@ func TestSingleModelChannelAPI(t *testing.T) {
 	require.Equal(t, http.StatusOK, status)
 	assert.EqualValues(t, 1, listed["data"].(map[string]any)["total"])
 
+	t.Run("capability probes are readable before channel activation", func(t *testing.T) {
+		status, result := call(http.MethodGet, path+"/probes", "")
+		require.Equal(t, http.StatusOK, status, result)
+		assert.Empty(t, result["data"].(map[string]any)["results"])
+		assert.NotEmpty(t, result["data"].(map[string]any)["capabilities"])
+	})
+	t.Run("probe input cannot override the destination or caller credentials", func(t *testing.T) {
+		for _, body := range []string{`{"capability":"unknown"}`, `{"capability":"streaming","base_url":"http://127.0.0.1/"}`, `{"capability":"streaming","authorization":"secret"}`} {
+			status, result := call(http.MethodPost, path+"/probes", body)
+			assert.Equal(t, http.StatusBadRequest, status, result)
+		}
+		original := token
+		token = createWalletTestAccessToken(t, root.Id, "channel:read")
+		status, _ := call(http.MethodPost, path+"/probes", `{"capability":"streaming"}`)
+		assert.Equal(t, http.StatusForbidden, status)
+		token = original
+	})
+	t.Run("probes observe real upstream behavior using the channel protocol without changing declarations", func(t *testing.T) {
+		fake := clock.UseFake(t, time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC))
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "Bearer secret", r.Header.Get("Authorization"))
+			assert.NotContains(t, r.Header.Get("Authorization"), token)
+			var sent map[string]any
+			require.NoError(t, common.DecodeJson(r.Body, &sent))
+			assert.Equal(t, "probe-model", sent["model"])
+			fake.Advance(time.Second)
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.Path == "/v1/responses" {
+				_, _ = w.Write([]byte(`{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{\"probe\":\"ok\"}"}]}]}`))
+				return
+			}
+			assert.Equal(t, "/v1/chat/completions", r.URL.Path)
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"plain text, not structured JSON"},"finish_reason":"stop"}]}`))
+		}))
+		defer upstream.Close()
+		require.NoError(t, db.Model(&provider).Update("base_url", upstream.URL).Error)
+		for _, protocolName := range []string{"openai_chat", "openai_responses"} {
+			status, created := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":%q,"upstream_model_name":"probe-model"}`, provider.Id, unified.Id, protocolName))
+			require.Equal(t, http.StatusOK, status, created)
+			probePath := fmt.Sprintf("/api/admin/v1/channels/%v", created["data"].(map[string]any)["id"])
+			status, result := call(http.MethodPost, probePath+"/probes", `{"capability":"structured_output"}`)
+			require.Equal(t, http.StatusOK, status, result)
+			observation := result["data"].(map[string]any)
+			if protocolName == "openai_responses" {
+				assert.Equal(t, "passed", observation["status"])
+			} else {
+				assert.Equal(t, "inconclusive", observation["status"], "2xx alone cannot verify a capability")
+			}
+			assert.Equal(t, protocolName, observation["protocol"])
+			assert.EqualValues(t, fake.Now().Unix(), observation["finished_at"])
+			_, persisted := call(http.MethodGet, probePath+"/probes", "")
+			assert.Equal(t, observation, persisted["data"].(map[string]any)["results"].([]any)[0])
+			_, after := call(http.MethodGet, probePath, "")
+			assert.Equal(t, created["data"], after["data"])
+		}
+	})
 	t.Run("capability narrowing and model edits stay consistent", func(t *testing.T) {
 		unified.Capabilities = capability.Set{Features: []capability.Feature{capability.Streaming, capability.ToolCalling}, InputModalities: []capability.Modality{capability.Text, capability.Image}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{ContextLength: common.GetPointer(int64(32000)), MaxOutputTokens: common.GetPointer(int64(4096)), MaxImages: common.GetPointer(int64(8)), MaxDurationSeconds: common.GetPointer(int64(60)), EmbeddingDimensions: common.GetPointer(int64(3072))}}
 		require.NoError(t, unified.UpdateDeclaration())
