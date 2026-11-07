@@ -304,6 +304,8 @@ func enforceAccessTokenRoute(c *gin.Context, lookup *accessTokenLookup, abort bo
 	switch {
 	case declared && rule.kind == accessTokenRuleSession:
 		code, reason, message = "AUTH_SESSION_REQUIRED", "session_required", common.NewMessage(accessTokenSessionRequiredMsg)
+	case lookup.legacy && common.GetContextKeyBool(c, constant.ContextKeyAdminAPIAudit):
+		code, reason, message = "ACCESS_TOKEN_SCOPE_DENIED", "legacy_unscoped", common.NewMessage("Unauthorized, insufficient privileges")
 	case lookup.legacy:
 		return true
 	case !declared:

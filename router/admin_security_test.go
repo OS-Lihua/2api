@@ -55,6 +55,25 @@ func adminSecurityRequest(engine http.Handler, token, method, path, body string)
 	return recorder
 }
 
+func TestAdminAPIDoesNotAcceptUnscopedLegacyCredentials(t *testing.T) {
+	engine, admin, _ := newAdminTestServer(t)
+	legacy := strings.Repeat("l", 32)
+	require.NoError(t, model.DB.Model(admin).Update("access_token", legacy).Error)
+	// Legacy credentials remain in their deployment transition period, but
+	// cannot satisfy any permission scope on the versioned management API.
+	response := adminSecurityRequest(engine, legacy, http.MethodGet, "/api/admin/v1/models", "")
+	assert.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
+	write := adminSecurityRequest(engine, legacy, http.MethodPost, "/api/admin/v1/models", `{}`)
+	assert.Equal(t, http.StatusForbidden, write.Code, write.Body.String())
+	logs, total, err := model.GetAuditLogs(model.AuditLogFilter{Category: model.AuditCategoryOperation}, 0, 10, common.RoleRootUser)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, total)
+	for _, entry := range logs {
+		assert.False(t, entry.Success)
+		assert.Equal(t, "access_token", entry.AuthMethod)
+	}
+}
+
 func TestAdminAPIRateLimitStillPrecedesAuthentication(t *testing.T) {
 	_, _, token := newAdminTestServer(t)
 	previousEnable, previousNum, previousDuration, previousRedis, previousRDB := common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration, common.RedisEnabled, common.RDB
