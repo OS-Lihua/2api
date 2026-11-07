@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
 )
@@ -236,8 +237,10 @@ func GetRandomInt(max int) int {
 	return rand.Intn(max)
 }
 
+// GetTimestamp returns the current Unix time in seconds from pkg/clock, so a
+// test with a fake clock controls it.
 func GetTimestamp() int64 {
-	return time.Now().Unix()
+	return clock.Now().Unix()
 }
 
 func GetTimeString() string {
