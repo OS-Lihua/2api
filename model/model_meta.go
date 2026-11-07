@@ -35,21 +35,20 @@ type BoundChannel struct {
 }
 
 type Model struct {
-	Id                 int      `json:"id"`
-	ModelName          string   `json:"model_name" gorm:"size:128;not null;uniqueIndex:uk_model_name_delete_at,priority:1"`
-	Description        string   `json:"description,omitempty" gorm:"type:text"`
-	Icon               string   `json:"icon,omitempty" gorm:"type:varchar(128)"`
-	Tags               string   `json:"tags,omitempty" gorm:"type:varchar(255)"`
-	VendorID           int      `json:"vendor_id,omitempty" gorm:"index"`
-	Endpoints          string   `json:"endpoints,omitempty" gorm:"type:text"`
-	SupportedEndpoints []string `json:"supported_endpoints,omitempty" gorm:"-"`
-	// Capabilities applies to exact-name Models only; rule rows leave it empty.
-	Capabilities capability.Set `json:"capabilities" gorm:"type:jsonb"`
-	Status       int            `json:"status" gorm:"default:1"`
-	SyncOfficial int            `json:"sync_official" gorm:"default:1"`
-	CreatedTime  int64          `json:"created_time" gorm:"bigint"`
-	UpdatedTime  int64          `json:"updated_time" gorm:"bigint"`
-	DeletedAt    gorm.DeletedAt `json:"-" gorm:"index;uniqueIndex:uk_model_name_delete_at,priority:2"`
+	Id                 int            `json:"id"`
+	ModelName          string         `json:"model_name" gorm:"size:128;not null;uniqueIndex:uk_model_name_delete_at,priority:1"`
+	Description        string         `json:"description,omitempty" gorm:"type:text"`
+	Icon               string         `json:"icon,omitempty" gorm:"type:varchar(128)"`
+	Tags               string         `json:"tags,omitempty" gorm:"type:varchar(255)"`
+	VendorID           int            `json:"vendor_id,omitempty" gorm:"index"`
+	Endpoints          string         `json:"endpoints,omitempty" gorm:"type:text"`
+	SupportedEndpoints []string       `json:"supported_endpoints,omitempty" gorm:"-"`
+	Status             int            `json:"status" gorm:"default:1"`
+	SyncOfficial       int            `json:"sync_official" gorm:"default:1"`
+	CreatedTime        int64          `json:"created_time" gorm:"bigint"`
+	UpdatedTime        int64          `json:"updated_time" gorm:"bigint"`
+	DeletedAt          gorm.DeletedAt `json:"-" gorm:"index;uniqueIndex:uk_model_name_delete_at,priority:2"`
+	Capabilities       capability.Set `json:"capabilities" gorm:"type:jsonb"` // exact-name Models only
 
 	BoundChannels []BoundChannel `json:"bound_channels,omitempty" gorm:"-"`
 	EnableGroups  []string       `json:"enable_groups,omitempty" gorm:"-"`
