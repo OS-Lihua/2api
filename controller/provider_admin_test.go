@@ -180,6 +180,28 @@ func TestProviderAdminAPIRequiresCompleteHiddenURLReplacement(t *testing.T) {
 	assert.Empty(t, *storedProvider(t, provider.Id).BaseURL)
 }
 
+func TestProviderAdminAPIRejectsStaleHiddenURLFallback(t *testing.T) {
+	engine := newProviderAdminEngine(t)
+	baseURL := "https://fixture-account:fixture@invalid["
+	provider := &model.Provider{Type: constant.ChannelTypeOpenAI, Name: "saved endpoint", Key: providerKeyA, BaseURL: &baseURL}
+	require.NoError(t, provider.Insert())
+	path := "/" + common.Interface2String(provider.Id)
+	stale := callProviderAPI(t, engine, http.MethodGet, path, "")
+	endpoint := url.URL{Scheme: "https", Host: "replacement.example", User: url.UserPassword("new-account", "new-credential")}
+	body, err := common.Marshal(map[string]any{"base_url": endpoint.String()})
+	require.NoError(t, err)
+	replaced := callProviderAPI(t, engine, http.MethodPatch, path, string(body))
+	require.True(t, replaced.Success, replaced.Message)
+
+	body, err = common.Marshal(map[string]any{"name": "stale rename", "base_url": stale.Data["base_url"]})
+	require.NoError(t, err)
+	rejected := callProviderAPIStatus(t, engine, http.StatusBadRequest, http.MethodPatch, path, string(body))
+	assert.False(t, rejected.Success)
+	current := storedProvider(t, provider.Id)
+	assert.Equal(t, endpoint.String(), *current.BaseURL)
+	assert.Equal(t, "saved endpoint", current.Name)
+}
+
 func TestProviderAdminAPISearchDoesNotProbeHiddenURLValues(t *testing.T) {
 	for _, host := range []string{"upstream.example:8443", "[::1]:8443"} {
 		t.Run(host, func(t *testing.T) {

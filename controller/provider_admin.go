@@ -58,6 +58,7 @@ func readableProvider(provider *model.Provider) providerView {
 const (
 	providerURLRedaction     = "REDACTED"
 	providerURLRedactedQuery = "__redacted__"
+	providerURLRedactedHost  = "redacted.invalid"
 )
 
 // readableProviderURL retains the endpoint but hides opaque URL credentials.
@@ -68,7 +69,7 @@ func readableProviderURL(raw *string) *string {
 	}
 	endpoint, err := url.Parse(*raw)
 	if err != nil || endpoint.Hostname() == "" || endpoint.Scheme == "" {
-		redacted := "https://redacted.invalid/"
+		redacted := "https://" + providerURLRedactedHost + "/"
 		return &redacted
 	}
 	changed := false
@@ -335,10 +336,10 @@ func UpdateProvider(c *gin.Context) {
 				common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Enter the full base URL to replace the hidden credentials"))
 				return
 			}
-			incomplete := endpoint.Query().Has(providerURLRedactedQuery) || endpoint.Fragment == providerURLRedaction
+			incomplete := strings.EqualFold(endpoint.Hostname(), providerURLRedactedHost) || endpoint.Query().Has(providerURLRedactedQuery) || endpoint.Fragment == providerURLRedaction
 			if endpoint.User != nil {
-				password, _ := endpoint.User.Password()
-				incomplete = incomplete || endpoint.User.Username() == providerURLRedaction || password == providerURLRedaction
+				userPassword, _ := endpoint.User.Password()
+				incomplete = incomplete || endpoint.User.Username() == providerURLRedaction || userPassword == providerURLRedaction
 			}
 			if incomplete {
 				common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Enter the full base URL to replace the hidden credentials"))
