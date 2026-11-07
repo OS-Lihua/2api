@@ -430,6 +430,7 @@ func SetApiRouter(router *gin.Engine) {
 			modelsRoute.DELETE("/:id", controller.DeleteModelMeta)
 		}
 
+		registerModelOfferingRoutes(apiRouter)
 		adminV1 := apiRouter.Group("/admin/v1")
 		adminV1.Use(middleware.AdminAuth())
 		{
