@@ -216,6 +216,7 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	// router/api-router.go: /api/token
 	"GET /api/token/":                  accessTokenScopeRule("api_key:read"),
 	"GET /api/token/search":            accessTokenScopeRule("api_key:read"),
+	"GET /api/token/offerings":         accessTokenScopeRule("api_key:read"),
 	"GET /api/token/auto-groups":       accessTokenScopeRule("api_key:read"),
 	"PUT /api/token/:id/permissions":   accessTokenScopeRule("api_key:write"),
 	"PATCH /api/token/:id/permissions": accessTokenScopeRule("api_key:write"),

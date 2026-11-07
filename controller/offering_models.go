@@ -13,10 +13,29 @@ import (
 	"gorm.io/gorm"
 )
 
+func offeringModelsError(c *gin.Context, modelType, status int, code, message string) {
+	switch modelType {
+	case constant.ChannelTypeAnthropic:
+		kind := "api_error"
+		if status == http.StatusNotFound {
+			kind = "not_found_error"
+		}
+		c.AbortWithStatusJSON(status, gin.H{"type": "error", "error": gin.H{"type": kind, "code": code, "message": message}})
+	case constant.ChannelTypeGemini:
+		kind := "UNAVAILABLE"
+		if status == http.StatusNotFound {
+			kind = "NOT_FOUND"
+		}
+		c.AbortWithStatusJSON(status, gin.H{"error": gin.H{"code": status, "message": message, "status": kind, "details": []gin.H{{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": code, "domain": "gateway"}}}})
+	default:
+		gatewayError(c, status, code, message)
+	}
+}
+
 func ListOfferingModels(c *gin.Context, modelType int) {
 	offerings := []model.ModelOffering{}
 	if err := model.AllowedOfferingsQuery(c.Request.Context(), c.GetInt("id"), c.GetInt("token_id")).Order("name").Find(&offerings).Error; err != nil {
-		gatewayError(c, http.StatusServiceUnavailable, "authorization_unavailable", "Model authorization is unavailable")
+		offeringModelsError(c, modelType, http.StatusServiceUnavailable, "authorization_unavailable", "Model authorization is unavailable")
 		return
 	}
 	switch modelType {
@@ -48,20 +67,24 @@ func ListOfferingModels(c *gin.Context, modelType int) {
 func RetrieveOfferingModel(c *gin.Context, modelType int) {
 	offering, err := model.FindModelOfferingByName(c.Request.Context(), c.Param("model"))
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		gatewayError(c, 404, "model_not_found", "Model not found")
+		offeringModelsError(c, modelType, 404, "model_not_found", "Model not found")
 		return
 	}
 	if err != nil {
-		gatewayError(c, 503, "authorization_unavailable", "Model authorization is unavailable")
+		offeringModelsError(c, modelType, 503, "authorization_unavailable", "Model authorization is unavailable")
 		return
 	}
 	allowed, err := service.GatewayOfferingAllowed(c, offering)
 	if err != nil {
-		gatewayError(c, 503, "authorization_unavailable", "Model authorization is unavailable")
+		offeringModelsError(c, modelType, 503, "authorization_unavailable", "Model authorization is unavailable")
 		return
 	}
 	if !allowed {
-		gatewayError(c, 404, "model_not_found", "Model not found")
+		offeringModelsError(c, modelType, 404, "model_not_found", "Model not found")
+		return
+	}
+	if modelType == constant.ChannelTypeGemini {
+		c.JSON(200, dto.GeminiModel{Name: offering.Name, DisplayName: offering.Name})
 		return
 	}
 	if modelType == constant.ChannelTypeAnthropic {

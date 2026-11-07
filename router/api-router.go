@@ -295,6 +295,7 @@ func SetApiRouter(router *gin.Engine) {
 		{
 			tokenRoute.GET("/", controller.GetAllTokens)
 			tokenRoute.GET("/search", middleware.SearchRateLimit(), controller.SearchTokens)
+			tokenRoute.GET("/offerings", middleware.DisableCache(), controller.ListKeyOfferings)
 			tokenRoute.GET("/auto-groups", controller.GetTokenAutoGroups)
 			tokenRoute.PUT("/:id/permissions", middleware.DisableCache(), controller.UpdateKeyPermissions)
 			tokenRoute.PATCH("/:id/permissions", middleware.DisableCache(), controller.UpdateKeyPermissions)
@@ -434,6 +435,10 @@ func SetApiRouter(router *gin.Engine) {
 		}
 
 		registerModelOfferingRoutes(apiRouter)
+		keyPermissions := apiRouter.Group("/admin/v1/tokens", middleware.DisableCache(), middleware.AdminAuth())
+		handlePermissionRoute(keyPermissions, http.MethodGet, "/:id/permissions", authz.KeyPermissionRead, controller.GetKeyPermissions)
+		handlePermissionRoute(keyPermissions, http.MethodPut, "/:id/permissions", authz.KeyPermissionWrite, controller.UpdateKeyPermissions)
+		handlePermissionRoute(keyPermissions, http.MethodPatch, "/:id/permissions", authz.KeyPermissionWrite, controller.UpdateKeyPermissions)
 		registerPricingRoutes(apiRouter)
 		registerGatewayRecordRoutes(apiRouter)
 		bulk := apiRouter.Group("/admin/v1", middleware.AdminAuth())

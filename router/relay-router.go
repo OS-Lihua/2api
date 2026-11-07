@@ -20,7 +20,7 @@ func SetRelayRouter(router *gin.Engine) {
 	// https://platform.openai.com/docs/api-reference/introduction
 	modelsRouter := router.Group("/v1/models")
 	modelsRouter.Use(middleware.RouteTag("relay"))
-	modelsRouter.Use(middleware.TokenAuth())
+	modelsRouter.Use(middleware.DisableCache(), middleware.TokenAuth())
 	{
 		modelsRouter.GET("", func(c *gin.Context) {
 			switch {
@@ -37,6 +37,8 @@ func SetRelayRouter(router *gin.Engine) {
 			switch {
 			case c.GetHeader("x-api-key") != "" && c.GetHeader("anthropic-version") != "":
 				controller.RetrieveOfferingModel(c, constant.ChannelTypeAnthropic)
+			case c.GetHeader("x-goog-api-key") != "" || c.Query("key") != "":
+				controller.RetrieveOfferingModel(c, constant.ChannelTypeGemini)
 			default:
 				controller.RetrieveOfferingModel(c, constant.ChannelTypeOpenAI)
 			}
@@ -45,16 +47,17 @@ func SetRelayRouter(router *gin.Engine) {
 
 	geminiRouter := router.Group("/v1beta/models")
 	geminiRouter.Use(middleware.RouteTag("relay"))
-	geminiRouter.Use(middleware.TokenAuth())
+	geminiRouter.Use(middleware.DisableCache(), middleware.TokenAuth())
 	{
 		geminiRouter.GET("", func(c *gin.Context) {
 			controller.ListOfferingModels(c, constant.ChannelTypeGemini)
 		})
+		geminiRouter.GET("/:model", func(c *gin.Context) { controller.RetrieveOfferingModel(c, constant.ChannelTypeGemini) })
 	}
 
 	geminiCompatibleRouter := router.Group("/v1beta/openai/models")
 	geminiCompatibleRouter.Use(middleware.RouteTag("relay"))
-	geminiCompatibleRouter.Use(middleware.TokenAuth())
+	geminiCompatibleRouter.Use(middleware.DisableCache(), middleware.TokenAuth())
 	{
 		geminiCompatibleRouter.GET("", func(c *gin.Context) {
 			controller.ListOfferingModels(c, constant.ChannelTypeOpenAI)

@@ -71,6 +71,7 @@ func MutateKeyPermissions(ctx context.Context, tokenID, ownerID int, revision in
 		if current.Revision != revision {
 			return ErrKeyPermissionsConflict
 		}
+		previousIDs := slices.Clone(current.ExceptionIDs)
 		switch action {
 		case "allow_all", "deny_all":
 			current.DefaultAllow = action == "allow_all"
@@ -92,7 +93,14 @@ func MutateKeyPermissions(ctx context.Context, tokenID, ownerID int, revision in
 		}
 		if len(current.ExceptionIDs) > 0 {
 			var count int64
-			if err := tx.Model(&ModelOffering{}).Where("id IN ?", current.ExceptionIDs).Count(&count).Error; err != nil {
+			// Retain existing hidden exceptions, but never reveal or add an Offering
+			// outside the owner's current visibility boundary.
+			var user User
+			if err := tx.Select("id", "group").First(&user, token.UserId).Error; err != nil {
+				return err
+			}
+			permitted := tx.Model(&ModelOffering{}).Where("id IN ?", current.ExceptionIDs).Where(`("visibility" = 'all' OR "groups" @> jsonb_build_array(?) OR "id" IN ?)`, user.Group, previousIDs)
+			if err := permitted.Count(&count).Error; err != nil {
 				return err
 			}
 			if count != int64(len(current.ExceptionIDs)) {
