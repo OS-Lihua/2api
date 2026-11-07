@@ -645,6 +645,25 @@ func parseRoutePattern(routePath string) []routePatternSegment {
 	return segments
 }
 
+func routeMatchesPath(pattern, path string) bool {
+	segments := parseRoutePattern(pattern)
+	index := 0
+	for part := range strings.SplitSeq(strings.TrimPrefix(path, "/"), "/") {
+		if index >= len(segments) {
+			return false
+		}
+		segment := segments[index]
+		if segment.catchAll {
+			return true
+		}
+		if segment.dynamic && part == "" || !segment.dynamic && segment.value != part {
+			return false
+		}
+		index++
+	}
+	return index == len(segments)
+}
+
 func routePatternsIntersect(leftPath, rightPath string) bool {
 	return routeSegmentsIntersect(parseRoutePattern(leftPath), parseRoutePattern(rightPath))
 }
