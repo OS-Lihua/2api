@@ -63,9 +63,11 @@ var defaultPluginDispatcher = &pluginRouteDispatcher{registry: jsplugin.DefaultR
 // pluginHandoffRoutes are the host routes that offer matching requests to the
 // plugin routes before their own handlers run, so a plugin route may overlap
 // them: GET /v1/videos/:task_id offers a task to its own plugin's query route
-// (handOffNativeTaskQuery) and the Gemini relay offers :predictLongRunning.
+// (handOffNativeTaskQuery), Gemini discovery offers native operation queries,
+// and the Gemini relay offers :predictLongRunning.
 var pluginHandoffRoutes = map[string]struct{}{
 	http.MethodGet + " /v1/videos/:task_id":   {},
+	http.MethodGet + " /v1beta/models/*model": {},
 	http.MethodPost + " /v1beta/models/*path": {},
 }
 
