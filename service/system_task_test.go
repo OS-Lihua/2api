@@ -314,7 +314,7 @@ func TestWalletReconcileRunsEveryIntervalAndAlertsRoot(t *testing.T) {
 	}
 	first := runDueReconciliation()
 	assert.Equal(t, model.SystemTaskStatusSucceeded, first.Status)
-	assert.JSONEq(t, `{"checked_wallets":2,"mismatches":[]}`, first.Result)
+	assert.JSONEq(t, `{"checked_wallets":4,"mismatches":[]}`, first.Result)
 
 	wallet, err := model.GetUserWallet(2)
 	require.NoError(t, err)
@@ -328,8 +328,8 @@ func TestWalletReconcileRunsEveryIntervalAndAlertsRoot(t *testing.T) {
 	second := runDueReconciliation()
 	assert.NotEqual(t, first.TaskID, second.TaskID)
 	assert.Equal(t, model.SystemTaskStatusFailed, second.Status)
-	assert.Equal(t, "1 of 2 wallets do not match their ledger entries", second.Error)
-	assert.JSONEq(t, fmt.Sprintf(`{"checked_wallets":2,"mismatches":[{"wallet_id":%d,"account_type":"user_wallet","owner_id":2,
+	assert.Equal(t, "1 of 4 wallets do not match their ledger entries", second.Error)
+	assert.JSONEq(t, fmt.Sprintf(`{"checked_wallets":4,"mismatches":[{"wallet_id":%d,"account_type":"user_wallet","owner_id":2,
 		"balance":{"nanos":"25","currency":"USD"},"entry_total_nanos":"10","foreign_currency_entries":0}]}`, wallet.Id), second.Result)
 	assert.Equal(t, map[string][]string{
 		"root": {"wallet_reconcile Wallet reconciliation found 1 mismatched wallets"},

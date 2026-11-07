@@ -17,10 +17,12 @@ import (
 // walletView is a wallet in the admin API. Amounts are decimal strings in
 // major currency units, for example "12.5".
 type walletView struct {
-	UserId    int            `json:"user_id"`
-	Currency  money.Currency `json:"currency"`
-	Balance   string         `json:"balance"`
-	UpdatedAt int64          `json:"updated_at"`
+	UserId         int            `json:"user_id"`
+	Currency       money.Currency `json:"currency"`
+	Balance        string         `json:"balance"`
+	UpdatedAt      int64          `json:"updated_at"`
+	Outstanding    string         `json:"outstanding,omitempty"`
+	RequestsPaused bool           `json:"requests_paused,omitempty"`
 }
 
 type ledgerEntryView struct {
@@ -154,6 +156,15 @@ func GetUserWallet(c *gin.Context) {
 		view.Currency = wallet.Balance.Currency
 		view.Balance = amountString(wallet.Balance)
 		view.UpdatedAt = wallet.UpdatedAt
+	}
+	outstanding, err := model.GetUserOutstanding(user.Id)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if outstanding.Nanos > 0 {
+		view.Outstanding = amountString(outstanding)
+		view.RequestsPaused = true
 	}
 	common.ApiSuccess(c, view)
 }

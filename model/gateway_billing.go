@@ -58,7 +58,7 @@ func ReserveGateway(request *GatewayRequest, reservation, source money.Amount) e
 			return err
 		}
 		wallet := wallets[account]
-		if wallet.RequestsPaused || wallet.Balance.Nanos < reservation.Nanos {
+		if wallet.RequestsPaused || wallets[UserReceivableAccount(request.UserID)].Balance.Nanos > 0 || wallet.Balance.Nanos < reservation.Nanos {
 			return ErrInsufficientWalletBalance
 		}
 		request.LedgerEntryIDs = []string{}
@@ -108,7 +108,7 @@ func PrepareGatewaySettlement(settlement GatewaySettlement) error {
 
 // SettleGateway atomically releases the reservation, charges once, recognizes
 // revenue and records Provider payable in its original currency. A shortfall
-// consumes the remaining balance and pauses requests until the next top-up.
+// remains in the user's receivable account until subsequent credits pay it.
 func SettleGateway(requestID string) (*GatewayRequest, error) {
 	var result GatewayRequest
 	err := DB.Transaction(func(tx *gorm.DB) error {
@@ -151,12 +151,13 @@ func SettleGateway(requestID string) (*GatewayRequest, error) {
 		if err != nil {
 			return err
 		}
-		if request.Receivable.Nanos > available.Nanos {
-			request.Receivable.Nanos = available.Nanos
+		// Existing debt has first claim on released reservations as on any
+		// other credit. Keep the complete receivable in the immutable intent.
+		collectible := max(int64(0), available.Nanos-wallets[UserReceivableAccount(row.UserID)].Balance.Nanos)
+		collected := min(request.Receivable.Nanos, collectible)
+		shortfall := request.Receivable.Nanos - collected
+		if shortfall > 0 {
 			request.ErrorCode = "wallet_shortfall"
-			if err := tx.Model(&Wallet{}).Where("id = ?", wallets[account].Id).Update("requests_paused", true).Error; err != nil {
-				return err
-			}
 		}
 		saleRate, err := decimal.NewFromString(request.SaleFXRate)
 		if err != nil {
@@ -166,11 +167,20 @@ func SettleGateway(requestID string) (*GatewayRequest, error) {
 		if row.Reservation.Nanos > 0 {
 			postings = append(postings, LedgerPosting{Account: account, Type: LedgerEntryPreConsumeRelease, Amount: row.Reservation, RequestId: requestID, IdempotencyKey: "gateway:" + requestID + ":release"})
 		}
+		if collected > 0 {
+			posting := LedgerPosting{Account: account, Type: LedgerEntryCharge, Amount: money.Amount{Nanos: -collected, Currency: request.Receivable.Currency}, RequestId: requestID, IdempotencyKey: "gateway:" + requestID + ":charge"}
+			if shortfall == 0 {
+				debitSource := money.Amount{Nanos: -intent.SaleSource.Nanos, Currency: intent.SaleSource.Currency}
+				posting.sourceAmount = &debitSource
+				posting.fxRate = decimal.NewNullDecimal(saleRate)
+			}
+			postings = append(postings, posting)
+		}
+		if shortfall > 0 {
+			postings = append(postings, LedgerPosting{Account: UserReceivableAccount(row.UserID), Type: LedgerEntryCharge, Amount: money.Amount{Nanos: shortfall, Currency: request.Receivable.Currency}, RequestId: requestID, IdempotencyKey: "gateway:" + requestID + ":receivable"})
+		}
 		if request.Receivable.Nanos > 0 {
-			debitSource := money.Amount{Nanos: -intent.SaleSource.Nanos, Currency: intent.SaleSource.Currency}
-			postings = append(postings,
-				LedgerPosting{Account: account, Type: LedgerEntryCharge, Amount: money.Amount{Nanos: -request.Receivable.Nanos, Currency: request.Receivable.Currency}, RequestId: requestID, IdempotencyKey: "gateway:" + requestID + ":charge", sourceAmount: &debitSource, fxRate: decimal.NewNullDecimal(saleRate)},
-				LedgerPosting{Account: PlatformRevenueAccount(request.Receivable.Currency), Type: LedgerEntryCharge, Amount: request.Receivable, RequestId: requestID, IdempotencyKey: "gateway:" + requestID + ":revenue", sourceAmount: &intent.SaleSource, fxRate: decimal.NewNullDecimal(saleRate)})
+			postings = append(postings, LedgerPosting{Account: PlatformRevenueAccount(request.Receivable.Currency), Type: LedgerEntryCharge, Amount: request.Receivable, RequestId: requestID, IdempotencyKey: "gateway:" + requestID + ":revenue", sourceAmount: &intent.SaleSource, fxRate: decimal.NewNullDecimal(saleRate)})
 		}
 		if attempt := intent.Attempt; attempt != nil && attempt.Cost.Nanos > 0 {
 			rate, err := decimal.NewFromString(attempt.AccountingFXRate)

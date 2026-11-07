@@ -146,7 +146,16 @@ func listGatewayRequests(c *gin.Context, self bool) {
 		}
 		payload = users
 	}
-	common.ApiSuccess(c, gin.H{"items": payload, "total": total, "page": page.Page, "page_size": page.PageSize})
+	response := gin.H{"items": payload, "total": total, "page": page.Page, "page_size": page.PageSize}
+	if self {
+		outstanding, err := model.GetUserOutstanding(filter.UserID)
+		if err != nil {
+			gatewayRecordError(c, err)
+			return
+		}
+		response["outstanding"] = outstanding
+	}
+	common.ApiSuccess(c, response)
 }
 
 func ListGatewayAttempts(c *gin.Context)     { listGatewayAttempts(c, false) }

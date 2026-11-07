@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/plugins"
 	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/postgres"
@@ -226,7 +228,7 @@ func newTextGatewayFixture(t *testing.T, upstream http.HandlerFunc) textGatewayF
 	engine.Use(middleware.RequestId())
 	SetApiRouter(engine)
 	SetRelayRouter(engine)
-	return textGatewayFixture{engine: engine, user: user, token: token, adminPAT: createWalletTestAccessToken(t, actor.Id, "request:read"), userPAT: createWalletTestAccessToken(t, user.Id, "log:read"), offering: offering, channel: channel, sale: sale, purchase: purchase, fake: fake}
+	return textGatewayFixture{engine: engine, user: user, token: token, adminPAT: createWalletTestAccessToken(t, actor.Id, "request:read", "ledger:read"), userPAT: createWalletTestAccessToken(t, user.Id, "log:read"), offering: offering, channel: channel, sale: sale, purchase: purchase, fake: fake}
 }
 
 func TestTextGatewayAliasBillsWalletAndRecordsAttempt(t *testing.T) {
@@ -970,6 +972,171 @@ func TestTextGatewayMetadataPrefixIsNotDeliveredBusinessOutput(t *testing.T) {
 	attempt := attempts.Data["items"].([]any)[0].(map[string]any)
 	assert.Equal(t, "downstream_write_failed", attempt["error_class"])
 	assert.Equal(t, map[string]any{"nanos": "20000", "currency": "USD"}, attempt["cost"], "the platform still records the Provider's reported cost")
+}
+
+func TestTextGatewayShortfallPersistsAndTopUpCannotBypassDebt(t *testing.T) {
+	calls := 0
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		completion := 1
+		if calls == 2 {
+			completion = 16
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"chat-test","object":"chat.completion","model":"upstream-model","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":%d,"total_tokens":%d}}`, completion, 10+completion)
+	})
+	body := `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`
+	warmup := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+	require.Equal(t, http.StatusOK, warmup.Code, warmup.Body.String())
+	// Keep a second real reservation in flight while the request settles short.
+	pending := model.GatewayRequest{ID: "debt-pending-release", UserID: fixture.user.Id, SaleFXRate: "1", SaleCurrency: "USD", Receivable: money.Amount{Nanos: 2_000, Currency: "USD"}, Status: "success"}
+	reserve := money.Amount{Nanos: 1_000, Currency: "USD"}
+	require.NoError(t, model.ReserveGateway(&pending, reserve, reserve))
+	concurrent := model.GatewayRequest{ID: "debt-concurrent-release", UserID: fixture.user.Id, SaleFXRate: "1", SaleCurrency: "USD", Receivable: money.Amount{Currency: "USD"}, Status: "failed"}
+	require.NoError(t, model.ReserveGateway(&concurrent, reserve, reserve))
+	negative, err := model.PostLedgerEntries(model.LedgerPosting{Account: model.UserWalletAccount(fixture.user.Id), Type: model.LedgerEntryAdjustment, Amount: money.Amount{Nanos: -1_000, Currency: "USD"}, Remark: "reversible debit"})
+	require.NoError(t, err)
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	_, err = model.PostLedgerEntries(model.LedgerPosting{Account: model.UserWalletAccount(fixture.user.Id), Type: model.LedgerEntryAdjustment, Amount: money.Amount{Nanos: 50_000 - wallet.Balance.Nanos, Currency: "USD"}, Remark: "controlled test starting balance"})
+	require.NoError(t, err)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	requests := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests?page=1&page_size=10", "")
+	require.True(t, requests.Success, requests.Message)
+	var record map[string]any
+	for _, item := range requests.Data["items"].([]any) {
+		candidate := item.(map[string]any)
+		if candidate["id"] == response.Header().Get(common.RequestIdKey) {
+			record = candidate
+		}
+	}
+	require.NotNil(t, record)
+	assert.Equal(t, map[string]any{"nanos": "75600", "currency": "USD"}, record["receivable"], "the full receivable must survive a 25600-nano shortfall")
+	wallet, err = model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	require.Zero(t, wallet.Balance.Nanos)
+	require.True(t, wallet.RequestsPaused)
+	_, err = model.TopUpWallet(model.WalletTopUp{UserId: fixture.user.Id, Source: money.Amount{Nanos: 20_000, Currency: "USD"}, Reference: "partial-debt-payment"})
+	require.NoError(t, err)
+	wallet, err = model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	t.Logf("full receivable=75600 observed=%v; after 20000 topup for 25600 debt: balance=%d paused=%v", record["receivable"], wallet.Balance.Nanos, wallet.RequestsPaused)
+	assert.Zero(t, wallet.Balance.Nanos, "the partial top-up must pay existing debt before becoming spendable")
+	assert.True(t, wallet.RequestsPaused, "5600 nanos of debt remain after partial repayment")
+	balanceView := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/user-wallets/%d", fixture.user.Id), "")
+	require.True(t, balanceView.Success, balanceView.Message)
+	assert.Equal(t, "0", balanceView.Data["balance"])
+	assert.Equal(t, "0.0000056", balanceView.Data["outstanding"])
+	assert.Equal(t, true, balanceView.Data["requests_paused"])
+	third := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":1}`)
+	t.Logf("request with unpaid debt: status=%d upstream_calls=%d", third.Code, calls)
+	assert.NotEqual(t, http.StatusOK, third.Code, "a partial top-up cannot authorize another billable request")
+	assert.Equal(t, 2, calls, "existing debt must stop dispatch before another upstream call")
+
+	_, err = model.TopUpWallet(model.WalletTopUp{UserId: fixture.user.Id, Source: money.Amount{Nanos: 20_000, Currency: "USD"}, Reference: "partial-debt-payment"})
+	require.ErrorIs(t, err, model.ErrDuplicateLedgerEntry)
+	for i, kind := range []model.LedgerEntryType{model.LedgerEntryAdjustment, model.LedgerEntryRefund, model.LedgerEntryOpeningBalance} {
+		_, err = model.PostLedgerEntries(model.LedgerPosting{Account: model.UserWalletAccount(fixture.user.Id), Type: kind, Amount: reserve, Remark: "credit pays existing debt"})
+		require.NoError(t, err)
+		outstanding, err := model.GetUserOutstanding(fixture.user.Id)
+		require.NoError(t, err)
+		assert.Equal(t, int64(4_600-i*1_000), outstanding.Nanos)
+		self := walletAPIRequest(t, fixture.engine, fixture.userPAT, http.MethodGet, "/api/requests/self", "")
+		require.True(t, self.Success, self.Message)
+		assert.Equal(t, map[string]any{"nanos": fmt.Sprint(4_600 - i*1_000), "currency": "USD"}, self.Data["outstanding"])
+	}
+	_, err = model.ReverseLedgerEntry(negative[0].Id, 0, "return the earlier debit")
+	require.NoError(t, err)
+	require.NoError(t, model.PrepareGatewaySettlement(model.GatewaySettlement{Request: pending, SaleSource: pending.Receivable}))
+	changed := pending
+	changed.Receivable = money.Amount{Nanos: 99_999, Currency: "USD"}
+	require.NoError(t, model.PrepareGatewaySettlement(model.GatewaySettlement{Request: changed, SaleSource: changed.Receivable}))
+	logDB := model.LOG_DB
+	model.LOG_DB = logDB.Table("receivable_debt_unavailable_log")
+	_, recoveryErr := model.RecoverGatewaySettlements(t.Context(), 100)
+	model.LOG_DB = logDB
+	require.Error(t, recoveryErr, "primary settlement succeeds even when log publication fails")
+	outstanding, err := model.GetUserOutstanding(fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2_600), outstanding.Nanos)
+	// The older request retains a 600-nano claim; the concurrent settlement
+	// records its complete new 2000-nano debt while its release pays old debt.
+	beforeFinal, _, err := model.ListLedgerEntries(wallet.Id, 0, 100)
+	require.NoError(t, err)
+	for _, entry := range beforeFinal {
+		if entry.Type == model.LedgerEntryRepayment {
+			assert.NotEqual(t, pending.ID, entry.RequestId)
+		}
+	}
+	require.NoError(t, model.PrepareGatewaySettlement(model.GatewaySettlement{Request: concurrent, SaleSource: concurrent.Receivable}))
+
+	// Race a duplicate payment against a prepared settlement and recovery.
+	rate, err := money.NewRate("EUR", "USD", decimal.NewFromInt(2))
+	require.NoError(t, err)
+	payment := model.WalletTopUp{UserId: fixture.user.Id, Source: money.Amount{Nanos: 20_000, Currency: "EUR"}, Rate: &rate, Reference: "final-debt-payment"}
+	results := make(chan error, 3)
+	var workers sync.WaitGroup
+	for range 2 {
+		workers.Go(func() {
+			_, err := model.TopUpWallet(payment)
+			results <- err
+		})
+	}
+	workers.Go(func() {
+		_, err := model.RecoverGatewaySettlements(t.Context(), 100)
+		results <- err
+	})
+	workers.Wait()
+	close(results)
+	duplicates := 0
+	for err := range results {
+		if err == model.ErrDuplicateLedgerEntry {
+			duplicates++
+		} else {
+			require.NoError(t, err)
+		}
+	}
+	assert.Equal(t, 1, duplicates)
+	for _, id := range []string{response.Header().Get(common.RequestIdKey), pending.ID, concurrent.ID} {
+		_, err = model.SettleGateway(id)
+		require.NoError(t, err)
+		require.NoError(t, model.PublishGatewayRecords(id))
+	}
+	wallet, err = model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, int64(38_400), wallet.Balance.Nanos)
+	assert.False(t, wallet.RequestsPaused)
+	outstanding, err = model.GetUserOutstanding(fixture.user.Id)
+	require.NoError(t, err)
+	assert.Zero(t, outstanding.Nanos)
+	entries, _, err := model.ListLedgerEntries(wallet.Id, 0, 100)
+	require.NoError(t, err)
+	var charged, repaid int64
+	for _, entry := range entries {
+		if entry.Type == model.LedgerEntryCharge && entry.RequestId == response.Header().Get(common.RequestIdKey) {
+			charged -= entry.Amount.Nanos
+		}
+		if entry.Type == model.LedgerEntryRepayment {
+			repaid -= entry.Amount.Nanos
+		}
+		if entry.Type == model.LedgerEntryTopUp && entry.SourceAmount.Currency == "EUR" {
+			assert.Equal(t, int64(20_000), entry.SourceAmount.Nanos)
+			assert.Equal(t, int64(40_000), entry.Amount.Nanos)
+			assert.Equal(t, "2", entry.FxRate.Decimal.String())
+		}
+	}
+	assert.Equal(t, int64(50_000), charged)
+	assert.Equal(t, int64(27_600), repaid)
+	var revenue model.Wallet
+	require.NoError(t, model.DB.Where("account_type = ?", model.LedgerAccountPlatformRevenue).Take(&revenue).Error)
+	assert.Equal(t, int64(99_200), revenue.Balance.Nanos, "repayment and recovery do not recognize revenue again")
+	reconciliation, err := model.ReconcileWallets(100)
+	require.NoError(t, err)
+	assert.Empty(t, reconciliation.Mismatches)
+	resumed := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":1}`)
+	require.Equal(t, http.StatusOK, resumed.Code, resumed.Body.String())
+	assert.Equal(t, 3, calls)
 }
 
 func setupRelayRouterTestDB(t *testing.T) {

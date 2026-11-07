@@ -24,6 +24,9 @@ const (
 	// LedgerAccountUserWallet is a user's balance in the settlement currency;
 	// its owner is the user ID.
 	LedgerAccountUserWallet LedgerAccountType = "user_wallet"
+	// LedgerAccountUserReceivable holds the user's unpaid charges. Repayments
+	// reduce this asset without recognizing revenue a second time.
+	LedgerAccountUserReceivable LedgerAccountType = "user_receivable"
 	// LedgerAccountPlatformRevenue is the platform's revenue in one currency;
 	// its owner is 0.
 	LedgerAccountPlatformRevenue LedgerAccountType = "platform_revenue"
@@ -36,6 +39,7 @@ const (
 type LedgerEntryType string
 
 const (
+	LedgerEntryRepayment         LedgerEntryType = "repayment"
 	LedgerEntryTopUp             LedgerEntryType = "top_up"
 	LedgerEntryPreConsume        LedgerEntryType = "pre_consume"
 	LedgerEntryPreConsumeRelease LedgerEntryType = "pre_consume_release"
@@ -58,7 +62,12 @@ const (
 // payable account a charge is a purchase cost the platform owes, and a
 // refund is a credit from the Provider. A reversal has the opposite sign.
 var ledgerEntrySigns = map[LedgerAccountType]map[LedgerEntryType]ledgerSign{
+	LedgerAccountUserReceivable: {
+		LedgerEntryCharge:    ledgerSignPositive,
+		LedgerEntryRepayment: ledgerSignNegative,
+	},
 	LedgerAccountUserWallet: {
+		LedgerEntryRepayment:         ledgerSignNegative,
 		LedgerEntryTopUp:             ledgerSignPositive,
 		LedgerEntryPreConsume:        ledgerSignNegative,
 		LedgerEntryPreConsumeRelease: ledgerSignPositive,
@@ -167,6 +176,11 @@ func UserWalletAccount(userId int) LedgerAccount {
 	return LedgerAccount{Type: LedgerAccountUserWallet, OwnerId: userId, Currency: settlementCurrency}
 }
 
+// UserReceivableAccount holds unpaid charges in the settlement currency.
+func UserReceivableAccount(userId int) LedgerAccount {
+	return LedgerAccount{Type: LedgerAccountUserReceivable, OwnerId: userId, Currency: settlementCurrency}
+}
+
 // PlatformRevenueAccount is the platform revenue account in currency.
 func PlatformRevenueAccount(currency money.Currency) LedgerAccount {
 	return LedgerAccount{Type: LedgerAccountPlatformRevenue, Currency: currency}
@@ -239,7 +253,7 @@ func validateLedgerPosting(posting LedgerPosting) error {
 	if _, err := money.ParseCurrency(string(posting.Account.Currency)); err != nil {
 		return err
 	}
-	if posting.Account.Type == LedgerAccountUserWallet && posting.Account.Currency != SettlementCurrency() {
+	if (posting.Account.Type == LedgerAccountUserWallet || posting.Account.Type == LedgerAccountUserReceivable) && posting.Account.Currency != SettlementCurrency() {
 		return fmt.Errorf("%w: user wallets must use %s", money.ErrCurrencyMismatch, SettlementCurrency())
 	}
 	if posting.Amount.Currency != posting.Account.Currency {
@@ -278,7 +292,7 @@ func postLedgerEntries(tx *gorm.DB, postings []LedgerPosting) ([]*LedgerEntry, e
 		if err != nil {
 			return nil, err
 		}
-		if wallet.AccountType == LedgerAccountUserWallet && posting.Amount.Nanos < 0 && balance.Nanos < 0 {
+		if (wallet.AccountType == LedgerAccountUserWallet || wallet.AccountType == LedgerAccountUserReceivable) && balance.Nanos < 0 {
 			return nil, ErrInsufficientWalletBalance
 		}
 		entry := &LedgerEntry{
@@ -314,9 +328,6 @@ func postLedgerEntries(tx *gorm.DB, postings []LedgerPosting) ([]*LedgerEntry, e
 			return nil, err
 		}
 		updates := map[string]any{"balance_nanos": balance.Nanos, "updated_at": now}
-		if wallet.AccountType == LedgerAccountUserWallet && posting.Type == LedgerEntryTopUp && balance.Nanos > 0 {
-			updates["requests_paused"] = false
-		}
 		if err := tx.Model(&Wallet{}).Where("id = ?", wallet.Id).Updates(updates).Error; err != nil {
 			return nil, err
 		}
@@ -324,7 +335,78 @@ func postLedgerEntries(tx *gorm.DB, postings []LedgerPosting) ([]*LedgerEntry, e
 		wallet.UpdatedAt = now
 		entries = append(entries, entry)
 	}
+	// Sweep after the whole batch: a settlement can release its reservation
+	// and charge in one posting. All account locks were acquired up front.
+	swept := make(map[int]bool)
+	for _, posting := range postings {
+		if (posting.Account.Type != LedgerAccountUserWallet && posting.Account.Type != LedgerAccountUserReceivable) || posting.Type == LedgerEntryRepayment || swept[posting.Account.OwnerId] {
+			continue
+		}
+		swept[posting.Account.OwnerId] = true
+		account := UserWalletAccount(posting.Account.OwnerId)
+		wallet := wallets[account]
+		debt := wallets[UserReceivableAccount(posting.Account.OwnerId)]
+		payment := min(wallet.Balance.Nanos, debt.Balance.Nanos)
+		if payment > 0 {
+			paid, err := repayWalletReceivables(tx, wallet, debt, payment)
+			if err != nil {
+				return nil, err
+			}
+			entries = append(entries, paid...)
+		}
+		if err := tx.Model(&Wallet{}).Where("id = ?", wallet.Id).Update("requests_paused", debt.Balance.Nanos > 0).Error; err != nil {
+			return nil, err
+		}
+	}
 	return entries, nil
+}
+
+// repayWalletReceivables allocates funds to the oldest unpaid request first.
+// Both wallets are already locked. The paired entries retain the debt's request
+// and identify the funding wallet entry without changing the original credit.
+func repayWalletReceivables(tx *gorm.DB, wallet, debt *Wallet, available int64) ([]*LedgerEntry, error) {
+	var funding LedgerEntry
+	if err := tx.Where("wallet_id = ? AND amount_nanos > 0", wallet.Id).Order("id DESC").First(&funding).Error; err != nil {
+		return nil, err
+	}
+	var unpaid []struct {
+		RequestId string
+		FirstId   int64
+		Nanos     decimal.Decimal
+	}
+	if err := tx.Model(&LedgerEntry{}).Select(`"request_id", MIN("id") AS "first_id", SUM("amount_nanos") AS "nanos"`).
+		Where("wallet_id = ?", debt.Id).Group(`"request_id"`).Having(`SUM("amount_nanos") > 0`).Order(`MIN("id")`).Scan(&unpaid).Error; err != nil {
+		return nil, err
+	}
+	var entries []*LedgerEntry
+	for _, item := range unpaid {
+		value, err := money.NewValue(item.Nanos.Shift(-money.Scale), debt.Balance.Currency)
+		if err != nil {
+			return nil, err
+		}
+		amount, err := value.Credit()
+		if err != nil {
+			return nil, err
+		}
+		payment := min(available, amount.Nanos)
+		key := fmt.Sprintf("repayment:%d:%d", funding.Id, item.FirstId)
+		remark := fmt.Sprintf("Receivable repayment funded by ledger entry %d", funding.Id)
+		paid, err := postLedgerEntries(tx, []LedgerPosting{
+			{Account: UserWalletAccount(wallet.OwnerId), Type: LedgerEntryRepayment, Amount: money.Amount{Nanos: -payment, Currency: wallet.Balance.Currency}, RequestId: item.RequestId, IdempotencyKey: key + ":wallet", Remark: remark},
+			{Account: UserReceivableAccount(wallet.OwnerId), Type: LedgerEntryRepayment, Amount: money.Amount{Nanos: -payment, Currency: wallet.Balance.Currency}, RequestId: item.RequestId, IdempotencyKey: key + ":receivable", Remark: remark},
+		})
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, paid...)
+		wallet.Balance = paid[0].BalanceAfter
+		debt.Balance = paid[1].BalanceAfter
+		available -= payment
+		if available == 0 {
+			return entries, nil
+		}
+	}
+	return nil, fmt.Errorf("%w: receivable balance differs from unpaid requests", ErrLedgerInvalidEntry)
 }
 
 // lockLedgerWallets creates any missing wallet and locks every wallet the
@@ -334,6 +416,16 @@ func postLedgerEntries(tx *gorm.DB, postings []LedgerPosting) ([]*LedgerEntry, e
 func lockLedgerWallets(tx *gorm.DB, postings []LedgerPosting) (map[LedgerAccount]*Wallet, error) {
 	accountList := make([]LedgerAccount, 0, len(postings))
 	for _, posting := range postings {
+		if posting.Account.Type == LedgerAccountUserWallet || posting.Account.Type == LedgerAccountUserReceivable {
+			debt := UserReceivableAccount(posting.Account.OwnerId)
+			user := UserWalletAccount(posting.Account.OwnerId)
+			if !slices.Contains(accountList, user) {
+				accountList = append(accountList, user)
+			}
+			if !slices.Contains(accountList, debt) {
+				accountList = append(accountList, debt)
+			}
+		}
 		if !slices.Contains(accountList, posting.Account) {
 			accountList = append(accountList, posting.Account)
 		}
@@ -483,7 +575,7 @@ func ReverseLedgerEntry(entryId int64, operatorId int, remark string) (*LedgerEn
 			}
 			return err
 		}
-		if original.ReversesEntryId != nil {
+		if original.ReversesEntryId != nil || original.Type == LedgerEntryRepayment || original.AccountType == LedgerAccountUserReceivable {
 			return ErrLedgerReversalNotReversible
 		}
 		var wallet Wallet
@@ -538,6 +630,16 @@ func GetUserWallet(userId int) (*Wallet, error) {
 		return nil, err
 	}
 	return &wallet, nil
+}
+
+// GetUserOutstanding returns unpaid receivables from the primary ledger.
+func GetUserOutstanding(userId int) (money.Amount, error) {
+	var wallet Wallet
+	err := DB.Where("account_type = ? AND owner_id = ?", LedgerAccountUserReceivable, userId).Take(&wallet).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return money.Amount{Currency: SettlementCurrency()}, nil
+	}
+	return wallet.Balance, err
 }
 
 // GetLedgerEntryWallet returns the wallet that holds a ledger entry.
