@@ -58,6 +58,9 @@ func authHelper(c *gin.Context, minRole int) {
 		writeDashboardAuthError(c, err)
 		return
 	}
+	if common.GetContextKeyBool(c, constant.ContextKeyAdminAPIAudit) {
+		c.Set("admin_api_actor", user)
+	}
 	if user.Status != common.UserStatusEnabled {
 		abortWithWebMessage(c, http.StatusUnauthorized, "AUTH_USER_DISABLED", common.NewMessage("User has been banned"))
 		return
@@ -82,6 +85,13 @@ func authHelper(c *gin.Context, minRole int) {
 		setAccessTokenContext(c, lookup)
 	}
 
+	if common.GetContextKeyBool(c, constant.ContextKeyAdminAPIAudit) {
+		permission, declared := PermissionRoute(c.Request.Method, c.FullPath())
+		if !declared || !authz.Can(user.Id, user.Role, permission) {
+			abortWithWebMessage(c, http.StatusForbidden, "", common.NewMessage("Unauthorized, insufficient privileges"))
+			return
+		}
+	}
 	// 管理/root 写操作审计兜底：内聚在鉴权链路里，保证任何经过 AdminAuth/RootAuth
 	// 的写接口都会自动留痕（无需在路由上单独挂审计中间件，避免漏挂）。
 	// handler 内手动埋点者会设置 ContextKeyAuditLogged，finishAdminAudit 据此跳过。

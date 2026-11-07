@@ -15,6 +15,7 @@ import (
 )
 
 func SetApiRouter(router *gin.Engine) {
+	router.Use(middleware.AdminAPISecurity())
 	apiRouter := router.Group("/api")
 	apiRouter.Use(middleware.RouteTag("api"))
 	apiRouter.Use(gzip.Gzip(gzip.DefaultCompression))
@@ -425,11 +426,11 @@ func SetApiRouter(router *gin.Engine) {
 		adminV1 := apiRouter.Group("/admin/v1")
 		adminV1.Use(middleware.AdminAuth())
 		{
-			adminV1.GET("/models", controller.AdminListModels)
-			adminV1.GET("/models/:id", controller.AdminGetModel)
-			adminV1.POST("/models", controller.AdminCreateModel)
-			adminV1.PUT("/models/:id", controller.AdminUpdateModel)
-			adminV1.DELETE("/models/:id", controller.AdminDeleteModel)
+			handlePermissionRoute(adminV1, http.MethodGet, "/models", authz.ModelRead, controller.AdminListModels)
+			handlePermissionRoute(adminV1, http.MethodGet, "/models/:id", authz.ModelRead, controller.AdminGetModel)
+			handlePermissionRoute(adminV1, http.MethodPost, "/models", authz.ModelWrite, controller.AdminCreateModel)
+			handlePermissionRoute(adminV1, http.MethodPut, "/models/:id", authz.ModelWrite, controller.AdminUpdateModel)
+			handlePermissionRoute(adminV1, http.MethodDelete, "/models/:id", authz.ModelWrite, controller.AdminDeleteModel)
 		}
 
 		// Deployments (model deployment management)

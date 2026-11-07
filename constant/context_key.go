@@ -79,7 +79,8 @@ const (
 	// a manage/operation audit log inside the handler. When set, the admin-audit
 	// fallback in authHelper (finishAdminAudit) skips its record to avoid
 	// duplicate entries.
-	ContextKeyAuditLogged ContextKey = "audit_logged"
+	ContextKeyAdminAPIAudit ContextKey = "admin_api_audit"
+	ContextKeyAuditLogged   ContextKey = "audit_logged"
 
 	// ContextKeyTokenAuditParams contains only the API token operation's safe metadata.
 	ContextKeyTokenAuditParams ContextKey = "token_audit_params"
