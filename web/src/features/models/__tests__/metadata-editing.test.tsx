@@ -668,7 +668,7 @@ describe('metadata editing', () => {
 })
 
 describe('capability declaration', () => {
-  function renderDrawer(currentRow: Model) {
+  function renderDrawer(currentRow: Model, onOpenChange = vi.fn()) {
     useAuthStore.getState().auth.setUser({ id: 2, username: 'admin', role: 10 })
     const client = new QueryClient({
       defaultOptions: {
@@ -680,13 +680,141 @@ describe('capability declaration', () => {
       <QueryClientProvider client={client}>
         <ModelMutateDrawer
           open
-          onOpenChange={() => {}}
+          onOpenChange={onOpenChange}
           currentRow={currentRow}
         />
       </QueryClientProvider>
     )
     return client
   }
+
+  it('keeps the capability draft and close warning after saving metadata', async () => {
+    let storedModel = { ...model }
+    vi.spyOn(api, 'get').mockImplementation(async (url) => {
+      if (url === '/api/models/7') {
+        return { data: { success: true, data: storedModel } }
+      }
+      return { data: { success: true, data: { items: [] } } }
+    })
+    const put = vi.spyOn(api, 'put').mockImplementation(async () => {
+      storedModel = { ...model, description: 'Saved metadata' }
+      return { data: { success: true, data: storedModel } }
+    })
+    const close = vi.fn()
+    const client = renderDrawer(model, close)
+    const user = userEvent.setup()
+    await waitFor(() =>
+      expect(screen.getByLabelText('Description')).toHaveValue('Original')
+    )
+    await user.click(screen.getByRole('tab', { name: 'Capabilities' }))
+    await user.type(
+      screen.getByRole('textbox', { name: 'Context length (tokens)' }),
+      '8192'
+    )
+    await user.click(screen.getByRole('tab', { name: 'Model metadata' }))
+    await user.clear(screen.getByLabelText('Description'))
+    await user.type(screen.getByLabelText('Description'), 'Saved metadata')
+    await user.click(screen.getByRole('button', { name: 'Save metadata' }))
+    await waitFor(() => expect(put).toHaveBeenCalledOnce())
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Save metadata' })
+      ).toBeEnabled()
+    )
+    expect(close).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('tab', { name: 'Capabilities' }))
+    expect(
+      screen.getByRole('textbox', { name: 'Context length (tokens)' })
+    ).toHaveValue('8192')
+    await user.click(screen.getAllByRole('button', { name: 'Close' })[0])
+    expect(await screen.findByRole('alertdialog')).toHaveTextContent(
+      'Discard unsaved changes?'
+    )
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(
+      screen.getByRole('textbox', { name: 'Context length (tokens)' })
+    ).toHaveValue('8192')
+    expect(close).not.toHaveBeenCalled()
+    client.clear()
+  })
+
+  it.each(['success', 'rejection'])(
+    'locks capability inputs while saving and restores editing after %s',
+    async (outcome) => {
+      vi.spyOn(api, 'get').mockImplementation(async (url) => {
+        if (url === '/api/models/7') {
+          return { data: { success: true, data: model } }
+        }
+        return { data: { success: true, data: { items: [] } } }
+      })
+      let finish!: (response: Awaited<ReturnType<typeof api.put>>) => void
+      const pending = new Promise<Awaited<ReturnType<typeof api.put>>>(
+        (resolve) => {
+          finish = resolve
+        }
+      )
+      const put = vi.spyOn(api, 'put').mockReturnValue(pending)
+      const close = vi.fn()
+      const client = renderDrawer(model, close)
+      const user = userEvent.setup()
+      await waitFor(() =>
+        expect(screen.getByLabelText('Description')).toHaveValue('Original')
+      )
+      await user.click(screen.getByRole('tab', { name: 'Capabilities' }))
+      const contextLength = screen.getByRole('textbox', {
+        name: 'Context length (tokens)',
+      })
+      await user.type(contextLength, '8192')
+      await user.click(
+        screen.getByRole('button', { name: 'Save capabilities' })
+      )
+      await waitFor(() => expect(put).toHaveBeenCalledOnce())
+      for (const input of [
+        ...screen.getAllByRole('textbox'),
+        ...screen.getAllByRole('combobox'),
+      ]) {
+        expect(input).toBeDisabled()
+      }
+      await user.type(contextLength, '9')
+      expect(contextLength).toHaveValue('8192')
+      expect(put.mock.calls[0][1]).toMatchObject({
+        capabilities: { limits: { context_length: 8192 } },
+      })
+      await act(async () => {
+        finish({
+          data: {
+            success: outcome === 'success',
+            message: 'Declaration rejected',
+          },
+        })
+      })
+      await waitFor(() =>
+        expect(
+          screen.getByRole('button', { name: 'Save capabilities' })
+        ).toBeEnabled()
+      )
+      expect(contextLength).toBeEnabled()
+      expect(contextLength).toHaveValue('8192')
+      if (outcome === 'rejection') {
+        expect(screen.getByRole('alert')).toHaveTextContent(
+          'Declaration rejected'
+        )
+      } else {
+        await user.click(screen.getAllByRole('button', { name: 'Close' })[0])
+        expect(close).toHaveBeenCalledWith(false)
+        expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+        close.mockClear()
+        await user.type(contextLength, '9')
+        expect(contextLength).toHaveValue('81929')
+      }
+      await user.click(screen.getAllByRole('button', { name: 'Close' })[0])
+      expect(await screen.findByRole('alertdialog')).toHaveTextContent(
+        'Discard unsaved changes?'
+      )
+      expect(close).not.toHaveBeenCalled()
+      client.clear()
+    }
+  )
 
   it('saves the declared capabilities with the saved metadata through the admin API', async () => {
     const declared = {

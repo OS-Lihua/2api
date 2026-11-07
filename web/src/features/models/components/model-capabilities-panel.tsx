@@ -92,8 +92,8 @@ export function ModelCapabilitiesPanel(props: {
         throw createServerError(response, t('Operation failed'))
       }
     },
-    onSuccess: async () => {
-      form.reset(form.getValues())
+    onSuccess: async (_data, values) => {
+      form.reset(values)
       await queryClient.invalidateQueries({ queryKey: modelsQueryKeys.all })
       toast.success(t('Model capabilities saved'))
     },
@@ -127,6 +127,7 @@ export function ModelCapabilitiesPanel(props: {
                       selected={field.value}
                       onChange={field.onChange}
                       placeholder={t('Select features')}
+                      disabled={save.isPending}
                     />
                   </FormControl>
                   <FormMessage />
@@ -145,6 +146,7 @@ export function ModelCapabilitiesPanel(props: {
                       selected={field.value}
                       onChange={field.onChange}
                       placeholder={t('Select input modalities')}
+                      disabled={save.isPending}
                     />
                   </FormControl>
                   <FormMessage />
@@ -163,6 +165,7 @@ export function ModelCapabilitiesPanel(props: {
                       selected={field.value}
                       onChange={field.onChange}
                       placeholder={t('Select output modalities')}
+                      disabled={save.isPending}
                     />
                   </FormControl>
                   <FormMessage />
@@ -186,7 +189,11 @@ export function ModelCapabilitiesPanel(props: {
                     <FormItem>
                       <FormLabel>{limit.label}</FormLabel>
                       <FormControl>
-                        <Input inputMode='numeric' {...field} />
+                        <Input
+                          inputMode='numeric'
+                          {...field}
+                          disabled={save.isPending}
+                        />
                       </FormControl>
                       <FormMessage />
                     </FormItem>

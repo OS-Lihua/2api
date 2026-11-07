@@ -225,7 +225,7 @@ export function ModelMutateDrawer(props: {
         queryClient.invalidateQueries({ queryKey: vendorsQueryKeys.all }),
       ])
       toast.success(t('Model metadata saved'))
-      if (!pricingDirty) props.onOpenChange(false)
+      if (!pricingDirty && !capabilitiesDirty) props.onOpenChange(false)
     },
     onError: (error) => {
       form.setError('root.server', {
