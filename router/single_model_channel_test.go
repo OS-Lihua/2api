@@ -298,7 +298,7 @@ func TestSingleModelChannelAPI(t *testing.T) {
 		fake := clock.UseFake(t, time.Date(2026, 11, 7, 20, 0, 0, 0, time.UTC))
 		var channel model.Channel
 		require.NoError(t, db.Where("provider_id = ?", provider.Id).Order("id").First(&channel).Error)
-		result := model.ChannelProbeResult{ChannelID: channel.ID, Capability: "streaming", Protocol: channel.Protocol, StartedAt: fake.Now().Unix() - 96, DeadlineAt: fake.Now().Unix() - 1, Status: "running", ActorID: root.Id}
+		result := model.ChannelProbeResult{ConfigurationHash: channel.ProbeConfigurationHash(), ChannelID: channel.ID, Capability: "streaming", Protocol: channel.Protocol, StartedAt: fake.Now().Unix() - 96, DeadlineAt: fake.Now().Unix() - 1, Status: "running", ActorID: root.Id}
 		require.NoError(t, db.Create(&result).Error)
 		status, listed := call(http.MethodGet, fmt.Sprintf("/api/admin/v1/channels?provider_id=%d", provider.Id), "")
 		require.Equal(t, http.StatusOK, status, listed)
@@ -320,7 +320,7 @@ func TestSingleModelChannelAPI(t *testing.T) {
 		jsplugin.DefaultRegistry = jsplugin.NewRegistry()
 		defer func() { jsplugin.DefaultRegistry = previousRegistry }()
 		source := `export const meta={apiVersion:1,key:"probe",name:"Probe",version:"1.0.0",author:{name:"Test"},models:["task-probe-upstream"],fetchMode:"per_task",protocols:[{name:"openai_video"},{name:"openai_responses",supports:["stream","sync"]}]};
-export const protocols={openai_responses:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,requestBody:ctx.body.value}},renderFinal(){return {output:[{type:"message",role:"assistant",content:[{type:"output_text",text:"red"}]}]}},renderEvents(){return {events:[{type:"output",data:"streamed"}],done:true}}},openai_video:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,requestBody:ctx.body.value}},render(ctx,task){return {id:task.task_id,status:"completed"}}}};
+export const protocols={openai_responses:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,requestBody:ctx.body.value}},renderFinal(){return {output:[{type:"message",role:"assistant",content:[{type:"output_text",text:"red",annotations:[],logprobs:[]}]}]}},renderEvents(){return {events:[{type:"output",data:"streamed"}],done:true}}},openai_video:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,requestBody:ctx.body.value}},render(ctx,task){return {id:task.task_id,status:"completed"}}}};
 export function buildSubmitRequest(ctx){const body={model:ctx.upstreamModel,prompt:ctx.requestBody.prompt,seconds:4};if(ctx.requestBody.max_output_tokens!==undefined)body.max_output_tokens=ctx.requestBody.max_output_tokens;if(ctx.requestBody.images!==undefined)body.images=ctx.requestBody.images;if(ctx.requestBody.input_reference!==undefined)body.input_reference=ctx.requestBody.input_reference;return {url:ctx.baseUrl+"/submit",method:"POST",headers:{Authorization:"Bearer "+ctx.apiKey},body:body}}
 export function parseSubmitResponse(ctx,r){return {taskId:r.body.id,taskData:r.body}}
 export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/poll/"+ctx.taskId,headers:{Authorization:"Bearer "+ctx.apiKey}}}
@@ -328,6 +328,11 @@ export function parseTaskResult(ctx,body){return {status:body.status,taskId:body
 export function listArtifacts(task){return task.status==="SUCCESS"?[{key:"video",type:"video",mimeType:"video/mp4"}]:[]}
 export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {url:ctx.data.cdn_url,credentialless:true};return {url:ctx.baseUrl+"/content/"+ctx.upstreamTaskId,headers:{Authorization:"Bearer "+ctx.apiKey}}}`
 		_, err := jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "probe"})
+		require.NoError(t, err)
+		textSource := strings.Replace(source, `key:"probe"`, `key:"probe-text"`, 1)
+		textSource = strings.Replace(textSource, `protocols:[{name:"openai_video"},{name:"openai_responses",supports:["stream","sync"]}]`, `protocols:[{name:"openai_responses",supports:["sync","stream"]}]`, 1)
+		textSource = strings.Replace(textSource, strings.Split(source, "\n")[1], `export const protocols={openai_responses:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,requestBody:ctx.body.value}},renderFinal(ctx,task){return {output:[{type:"message",role:"assistant",content:[{type:"output_text",text:task.data.answer||"ok",annotations:[],logprobs:[]}]}]}},renderEvents(){return {events:[{type:"output",data:"ok"}],done:true}}}};`, 1)
+		_, err = jsplugin.DefaultRegistry.RegisterFactory(textSource, jsplugin.Options{Key: "probe-text"})
 		require.NoError(t, err)
 		referenceSource := strings.Replace(source, `key:"probe"`, `key:"probe-reference"`, 1)
 		referenceSource = strings.Replace(referenceSource, `protocols:[{name:"openai_video"},{name:"openai_responses",supports:["stream","sync"]}]`, `protocols:["openai_video"]`, 1)
@@ -346,6 +351,7 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 		blueImage, err := os.ReadFile("../controller/probe-fixtures/blue.png")
 		require.NoError(t, err)
 		validMedia := true
+		numericMode := false
 		cacheMode := false
 		cacheSubmits := 0
 		var cdnURL string
@@ -372,6 +378,10 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 				if cancelProbe != nil {
 					cancelProbe()
 					<-r.Context().Done()
+					return
+				}
+				if numericMode {
+					_, _ = w.Write([]byte(`{"id":"private-task-123","status":"SUCCESS","answer":"GWP4831","usage":{"input_tokens":128,"output_tokens":64},"incomplete_details":{"reason":"max_output_tokens"}}`))
 					return
 				}
 				cached := 0
@@ -453,6 +463,16 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 		status, referenceResult := call(http.MethodPost, fmt.Sprintf("/api/admin/v1/channels/%v/probes", referenceCreated["data"].(map[string]any)["id"]), `{"capability":"input_image"}`)
 		require.Equal(t, http.StatusOK, status, referenceResult)
 		assert.Equal(t, "passed", referenceResult["data"].(map[string]any)["status"], referenceResult)
+		status, textCreated := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":"task:probe-text","upstream_model_name":"task-probe-upstream"}`, provider.Id, unified.Id))
+		require.Equal(t, http.StatusOK, status, textCreated)
+		textProbePath := fmt.Sprintf("/api/admin/v1/channels/%v/probes", textCreated["data"].(map[string]any)["id"])
+		numericMode = true
+		for _, feature := range []string{"context_length", "max_output_tokens"} {
+			status, result := call(http.MethodPost, textProbePath, fmt.Sprintf(`{"capability":%q}`, feature))
+			require.Equal(t, http.StatusOK, status, result)
+			assert.Equal(t, "passed", result["data"].(map[string]any)["status"], result)
+		}
+		numericMode = false
 		beforeBudgetCheck := counts["/submit"]
 		for _, override := range []string{`{"parameters":{"durationSeconds":600}}`, `{"parameters":{"numberOfVideos":20}}`, `{"operations":[{"path":"parameters.durationSeconds","mode":"set","value":600}]}`} {
 			require.NoError(t, db.Model(&provider).Update("param_override", override).Error)
@@ -462,7 +482,7 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 		}
 		require.NoError(t, db.Model(&provider).Update("param_override", `{"operations":[{"mode":"delete","path":"max_output_tokens"}]}`).Error)
 		for _, feature := range []string{"input_text", "input_image", "input_audio", "input_video", "input_pdf"} {
-			status, result := call(http.MethodPost, channelPath+"/probes", fmt.Sprintf(`{"capability":%q}`, feature))
+			status, result := call(http.MethodPost, textProbePath, fmt.Sprintf(`{"capability":%q}`, feature))
 			require.Equal(t, http.StatusOK, status, result)
 			assert.Equal(t, "request_invalid", result["data"].(map[string]any)["reason"], result)
 		}
@@ -515,6 +535,7 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 			}
 		})
 		require.NoError(t, db.Model(&provider).Update("base_url", upstream.URL).Error)
+		_, originalChannel := call(http.MethodGet, path, "")
 		request := httptest.NewRequest(http.MethodPost, path+"/probes", strings.NewReader(`{"capability":"structured_output"}`))
 		request.Header.Set("Authorization", "Bearer "+token)
 		request.Header.Set("Content-Type", "application/json")
@@ -526,10 +547,30 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 		}
 		status, result := call(http.MethodPost, path+"/probes", `{"capability":"streaming"}`)
 		assert.Equal(t, http.StatusConflict, status, result)
+		status, edited := call(http.MethodPatch, path, `{"upstream_model_name":"changed-during-probe"}`)
+		require.Equal(t, http.StatusOK, status, edited)
 		close(release)
 		completed := <-done
 		assert.Equal(t, http.StatusOK, completed.Code, completed.Body.String())
 		assert.EqualValues(t, 1, calls.Load())
+		_, stale := call(http.MethodGet, path+"/probes", "")
+		assert.Empty(t, stale["data"].(map[string]any)["results"])
+		status, restored := call(http.MethodPatch, path, fmt.Sprintf(`{"upstream_model_name":%q}`, originalChannel["data"].(map[string]any)["upstream_model_name"]))
+		require.Equal(t, http.StatusOK, status, restored)
+		_, current := call(http.MethodGet, path+"/probes", "")
+		assert.NotEmpty(t, current["data"].(map[string]any)["results"])
+		status, edited = call(http.MethodPatch, path, `{"parameter_overrides":{"metadata":{"probe_config_marker":"changed"}}}`)
+		require.Equal(t, http.StatusOK, status, edited)
+		_, stale = call(http.MethodGet, path+"/probes", "")
+		assert.Empty(t, stale["data"].(map[string]any)["results"])
+		originalParameters, err := common.Marshal(map[string]any{"parameter_overrides": originalChannel["data"].(map[string]any)["parameter_overrides"]})
+		require.NoError(t, err)
+		status, restored = call(http.MethodPatch, path, string(originalParameters))
+		require.Equal(t, http.StatusOK, status, restored)
+		if originalChannel["data"].(map[string]any)["mapping_confirmed"] == true {
+			status, restored = call(http.MethodPost, path+"/confirm", "")
+			require.Equal(t, http.StatusOK, status, restored)
+		}
 	})
 	t.Run("provider OAuth exchanges inherit cancellation without leaking credentials", func(t *testing.T) {
 		private, err := rsa.GenerateKey(rand.Reader, 2048)

@@ -50,7 +50,7 @@ func RunChannelProbe(c *gin.Context) {
 		return
 	}
 	startedAt := clock.Now().Unix()
-	result := model.ChannelProbeResult{ChannelID: id, Capability: feature, Protocol: record.Protocol, StartedAt: startedAt, DeadlineAt: startedAt + int64((channelProbeTimeout+channelProbeSaveTimeout)/time.Second), Status: "running", Reason: "", ActorID: c.GetInt("id")}
+	result := model.ChannelProbeResult{ConfigurationHash: record.ProbeConfigurationHash(), ChannelID: id, Capability: feature, Protocol: record.Protocol, StartedAt: startedAt, DeadlineAt: startedAt + int64((channelProbeTimeout+channelProbeSaveTimeout)/time.Second), Status: "running", Reason: "", ActorID: c.GetInt("id")}
 	if err := model.DB.Create(&result).Error; err != nil {
 		var conflict *pgconn.PgError
 		if errors.As(err, &conflict) && conflict.Code == "23505" {
@@ -90,7 +90,7 @@ func ListChannelProbes(c *gin.Context) {
 		return
 	}
 	results := []model.ChannelProbeResult{}
-	latestIDs := model.DB.Model(&model.ChannelProbeResult{}).Select("MAX(id)").Where("channel_id = ?", id).Group("capability")
+	latestIDs := model.DB.Model(&model.ChannelProbeResult{}).Select("MAX(id)").Where("channel_id = ? AND configuration_hash = ?", id, record.ProbeConfigurationHash()).Group("capability")
 	if err := model.DB.Where("id IN (?)", latestIDs).Order("capability").Find(&results).Error; err != nil {
 		singleChannelError(c, err)
 		return

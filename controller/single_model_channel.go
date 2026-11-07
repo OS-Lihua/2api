@@ -141,6 +141,9 @@ func ListSingleModelChannels(c *gin.Context) {
 	for _, record := range records {
 		view := channelView(record)
 		view.LatestProbe = byChannel[record.ID]
+		if view.LatestProbe != nil && view.LatestProbe.ConfigurationHash != record.ProbeConfigurationHash() {
+			view.LatestProbe = nil
+		}
 		items = append(items, view)
 	}
 	common.ApiSuccess(c, gin.H{"items": items, "total": total, "page": page.GetPage(), "page_size": page.GetPageSize()})

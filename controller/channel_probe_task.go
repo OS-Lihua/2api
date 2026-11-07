@@ -41,6 +41,8 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 	}
 	candidates := []string{"openai_responses", "openai_video", "openai_image"}
 	switch result.Capability {
+	case "input_text", "input_image":
+		candidates = []string{"openai_image", "openai_video", "openai_responses"}
 	case "output_video", "max_duration_seconds":
 		candidates = []string{"openai_video", "openai_responses"}
 	case "output_image", "max_images":
@@ -367,7 +369,7 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 				return observeProbeStream(protocol.OpenAIResponses, "text/event-stream", writer.body.Bytes())
 			}
 			final, err := common.Marshal(events[len(events)-1].Response)
-			if err == nil && observeChannelProbe(recipe, protocol.OpenAIResponses, result.Capability, final) {
+			if err == nil && observeTaskProbeResponse(recipe, protocol.OpenAIResponses, result.Capability, final, task.Data) {
 				if recipe.SampledLimit {
 					return "inconclusive", "limit_sample_only"
 				}
@@ -390,7 +392,7 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 					if wire == "openai_image" {
 						kind = protocol.OpenAIImages
 					}
-					if observeChannelProbe(recipe, kind, result.Capability, data) {
+					if observeTaskProbeResponse(recipe, kind, result.Capability, data, task.Data) {
 						if recipe.SampledLimit {
 							return "inconclusive", "limit_sample_only"
 						}
@@ -490,6 +492,30 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 		return "passed", "verified"
 	}
 	return "inconclusive", "behavior_not_observed"
+}
+
+// observeTaskProbeResponse preserves production presentation while taking
+// quantitative facts only from the bounded terminal upstream response.
+func observeTaskProbeResponse(recipe channelProbeRecipe, kind protocol.Type, feature string, rendered, upstream []byte) bool {
+	if feature != "context_length" && feature != "max_output_tokens" {
+		return observeChannelProbe(recipe, kind, feature, rendered)
+	}
+	var evidence map[string]any
+	if common.Unmarshal(rendered, &evidence) != nil {
+		return false
+	}
+	raw := gjson.ParseBytes(upstream)
+	for _, key := range []string{"usage", "incomplete_details"} {
+		delete(evidence, key)
+		if value := raw.Get(key); value.Exists() {
+			evidence[key] = value.Value()
+		}
+	}
+	if raw.Get("status").String() == "incomplete" {
+		evidence["status"] = "incomplete"
+	}
+	encoded, err := common.Marshal(evidence)
+	return err == nil && observeChannelProbe(recipe, kind, feature, encoded)
 }
 
 func probeTaskRequestWithinBudget(value gjson.Result) bool {
