@@ -83,6 +83,33 @@ func TestImageMoneyGatewayReportsPayloadAndUsageFacts(t *testing.T) {
 	}
 }
 
+func TestMediaAudioGatewayReportsDeliveryAndExplicitZero(t *testing.T) {
+	for _, tc := range []struct {
+		name, body         string
+		mode               int
+		format             string
+		business, reported bool
+	}{
+		{"speech PCM", strings.Repeat("x", 48000), relayconstant.RelayModeAudioSpeech, "pcm", true, false},
+		{"empty speech", "", relayconstant.RelayModeAudioSpeech, "pcm", false, false},
+		{"transcription zero", `{"text":"hello","usage":{"input_tokens":0,"output_tokens":0}}`, relayconstant.RelayModeAudioTranscription, "json", true, true},
+		{"transcription without usage", `{"text":"hello"}`, relayconstant.RelayModeAudioTranscription, "json", true, false},
+		{"empty transcription", `{"text":""}`, relayconstant.RelayModeAudioTranscription, "json", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, recorder, response, info := newImageTestContext(t, tc.body, "application/json", false)
+			info.RelayMode = tc.mode
+			info.ResponseFacts = &relaycommon.ResponseFacts{}
+			info.Request = &dto.AudioRequest{ResponseFormat: tc.format}
+			_, apiErr := (&Adaptor{ResponseFormat: tc.format}).DoResponse(c, response, info)
+			require.Nil(t, apiErr)
+			assert.Equal(t, tc.body, recorder.Body.String())
+			assert.Equal(t, tc.business, info.ResponseFacts.BusinessOutput)
+			assert.Equal(t, tc.reported, info.ResponseFacts.UsageReported)
+		})
+	}
+}
+
 func TestImageExpressionUsesCompletedCountAndProtectsAbortedStreams(t *testing.T) {
 	oldTimeout := constant.StreamingTimeout
 	constant.StreamingTimeout = 30

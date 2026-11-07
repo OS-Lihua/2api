@@ -2,9 +2,11 @@ package openai
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -65,9 +67,13 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 
 		// 写入响应到客户端
 		c.Writer.WriteHeaderNow()
-		_, err = c.Writer.Write(bodyBytes)
-		if err != nil {
-			logger.LogError(c, common.LogText("failed to write TTS response: %v", err))
+		n, writeErr := c.Writer.Write(bodyBytes)
+		if writeErr != nil {
+			logger.LogError(c, common.LogText("failed to write TTS response: %v", writeErr))
+		}
+		if info.ResponseFacts != nil {
+			info.ResponseFacts.DownstreamWriteFailed = writeErr != nil || n != len(bodyBytes)
+			info.ResponseFacts.BusinessOutput = !info.ResponseFacts.DownstreamWriteFailed && len(bodyBytes) > 0
 		}
 
 		// 计算音频时长并更新 usage
@@ -104,7 +110,10 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		} else if duration > 0 {
 			// 计算 token: ceil(duration) / 60.0 * 1000，即每分钟 1000 tokens。
 			// duration 解析自上游返回的音频元数据，饱和转换防止 int 回绕。
-			completionTokens := common.QuotaRound(math.Ceil(duration) / 60.0 * 1000)
+			completionTokens, clamp := common.QuotaRoundChecked(math.Ceil(duration) / 60.0 * 1000)
+			if clamp != nil {
+				info.QuotaClamp = clamp
+			}
 			usage.CompletionTokens = completionTokens
 			usage.CompletionTokenDetails.AudioTokens = completionTokens
 		}
@@ -121,13 +130,32 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	if err != nil {
 		return types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError), nil
 	}
-	// 写入新的 response body
-	service.IOCopyBytesGracefully(c, resp, responseBody)
-
+	if info.ResponseFacts != nil {
+		info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported = relaycommon.MediaUsagePresence(responseBody)
+		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
+	}
 	var responseData struct {
 		Usage *dto.Usage `json:"usage"`
+		Text  string     `json:"text"`
 	}
-	if err := common.Unmarshal(responseBody, &responseData); err == nil && responseData.Usage != nil {
+	decodeErr := common.Unmarshal(responseBody, &responseData)
+	if info.ResponseFacts != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices) {
+		return types.NewError(fmt.Errorf("upstream transcription request failed"), types.ErrorCodeBadResponse), responseData.Usage
+	}
+	writeErr := service.IOCopyBytesGracefully(c, resp, responseBody)
+	if info.ResponseFacts != nil {
+		if writeErr != nil {
+			info.ResponseFacts.DownstreamWriteFailed = true
+			return types.NewError(writeErr, types.ErrorCodeBadResponse), responseData.Usage
+		}
+		text := responseData.Text
+		if responseFormat == "text" || responseFormat == "srt" || responseFormat == "vtt" {
+			text = strings.TrimSpace(string(responseBody))
+		}
+		info.ResponseFacts.GeneratedText = text
+		info.ResponseFacts.BusinessOutput = text != ""
+	}
+	if decodeErr == nil && responseData.Usage != nil {
 		if responseData.Usage.TotalTokens > 0 || info.UpstreamProtocol != "" {
 			usage := responseData.Usage
 			if usage.PromptTokens == 0 {
