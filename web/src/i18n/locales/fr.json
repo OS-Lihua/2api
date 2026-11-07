@@ -4955,6 +4955,7 @@
     "Provider deleted": "Fournisseur supprimé",
     "Provider deleted successfully": "Fournisseur supprimé avec succès",
     "Provider disabled": "Fournisseur désactivé",
+    "Provider does not exist": "Le fournisseur n'existe pas",
     "Provider enabled": "Fournisseur activé",
     "Provider ID": "ID du fournisseur",
     "Provider Name": "Nom du fournisseur",

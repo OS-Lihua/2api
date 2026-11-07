@@ -4955,6 +4955,7 @@
     "Provider deleted": "Провайдер удалён",
     "Provider deleted successfully": "Поставщик успешно удален",
     "Provider disabled": "Провайдер отключён",
+    "Provider does not exist": "Провайдер не существует",
     "Provider enabled": "Провайдер включён",
     "Provider ID": "ID провайдера",
     "Provider Name": "Имя поставщика",

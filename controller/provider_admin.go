@@ -120,7 +120,7 @@ func providerIDParam(c *gin.Context) (int, bool) {
 func respondProvider(c *gin.Context, id int) {
 	provider, err := model.GetProviderById(id, false)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		common.ApiErrorStatus(c, http.StatusNotFound, common.NewMessage("Channel does not exist"))
+		common.ApiErrorStatus(c, http.StatusNotFound, common.NewMessage("Provider does not exist"))
 		return
 	}
 	if err != nil {
