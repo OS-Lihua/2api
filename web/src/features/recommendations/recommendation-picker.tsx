@@ -46,15 +46,32 @@ export function RecommendationPicker(props: {
     rule: RecommendationRule
     source: string
   } | null>(null)
-  const source = JSON.stringify(props.input)
+  const input: RecommendationInput =
+    props.kind === 'provider'
+      ? { url: '', type: props.input.type }
+      : { model_name: props.input.model_name }
+  let validInput = true
+  if (props.kind === 'provider' && props.input.url) {
+    try {
+      const endpoint = new URL(props.input.url)
+      validInput =
+        endpoint.protocol === 'http:' || endpoint.protocol === 'https:'
+      // Keep private URL components out of lookups and query keys.
+      input.url = endpoint.origin
+    } catch {
+      validInput = false
+    }
+  }
+  const source = JSON.stringify(input)
   const query = useQuery({
-    queryKey: ['recommendations', props.kind, props.input],
-    queryFn: () => queryRecommendations(props.kind, props.input),
+    queryKey: ['recommendations', props.kind, input],
+    queryFn: () => queryRecommendations(props.kind, input),
     enabled:
+      validInput &&
       hasPermission(user, 'recommendation', 'read') &&
-      (props.kind === 'provider' || Boolean(props.input.model_name)),
+      (props.kind === 'provider' || Boolean(input.model_name)),
   })
-  if (!hasPermission(user, 'recommendation', 'read')) return null
+  if (!hasPermission(user, 'recommendation', 'read') || !validInput) return null
   if (query.isError) {
     return (
       <ErrorState

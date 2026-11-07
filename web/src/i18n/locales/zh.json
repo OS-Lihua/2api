@@ -2463,6 +2463,7 @@
     "Enter the complete URL, supports": "输入完整的 URL，支持",
     "Enter the Coze agent ID": "输入 Coze 代理 ID",
     "Enter the Discovery URL or Issuer URL first": "请先填写 Discovery URL 或 Issuer URL",
+    "Enter the full base URL to replace the hidden credentials": "请输入完整地址以替换隐藏的凭据",
     "Enter the full URL of your Gotify server": "输入您的 Gotify 服务器的完整 URL",
     "Enter the key; one key per line": "输入密钥，每行一个",
     "Enter the knowledge base ID": "输入知识库 ID",
