@@ -66,7 +66,7 @@ func ClassifyGatewayFailure(status int, code string, transport, timeout, cancell
 		return GatewayFailure{Class: "account_quota", Switch: true, ExcludeProvider: true}
 	case status == 401 || status == 403 || code == "invalid_api_key" || code == "authentication_error" || kind == "authentication_error":
 		return GatewayFailure{Class: "credentials", Switch: true, ExcludeProvider: true}
-	case status == 404 && (code == "model_not_found" || code == "model_not_exist" || code == "not_found_error" || code == "ResourceNotFoundException" || strings.HasPrefix(code, "model '") && strings.HasSuffix(code, "' not found") || strings.HasPrefix(code, "model \"") && strings.HasSuffix(code, "\" not found")):
+	case status == 404 && (code == "model_not_found" || code == "model_not_exist" || code == "not_found_error" || code == "ResourceNotFoundException" || code == "DeploymentNotFound" || strings.HasPrefix(code, "model '") && strings.HasSuffix(code, "' not found") || strings.HasPrefix(code, "model \"") && strings.HasSuffix(code, "\" not found")):
 		return GatewayFailure{Class: "model_not_found", Switch: true}
 	case status == 429 || code == "rate_limit_exceeded" || code == "ThrottlingException":
 		return GatewayFailure{Class: "rate_limited", Switch: true}

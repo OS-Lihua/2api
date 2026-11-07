@@ -391,7 +391,7 @@ func TestTextGatewayFailureClassificationAndProviderScope(t *testing.T) {
 		{"429", 429, "", "rate_limited", 3}, {"500", 500, "", "upstream_unavailable", 3},
 		{"502", 502, "", "upstream_unavailable", 3}, {"503", 503, "", "upstream_unavailable", 3},
 		{"504", 504, "", "upstream_unavailable", 3}, {"529", 529, "", "upstream_unavailable", 3},
-		{"model 404", 404, "model_not_found", "model_not_found", 3}, {"other 404", 404, "unknown_path", "upstream_error", 1},
+		{"model 404", 404, "model_not_found", "model_not_found", 3}, {"Azure deployment 404", 404, "DeploymentNotFound", "model_not_found", 3}, {"other 404", 404, "unknown_path", "upstream_error", 1},
 		{"400", 400, "", "invalid_request", 1}, {"413", 413, "", "invalid_request", 1}, {"422", 422, "", "invalid_request", 1},
 		{"context", 400, "context_length_exceeded", "context_length", 1}, {"safety", 403, "content_filter", "content_safety", 1},
 	} {
@@ -619,6 +619,8 @@ func TestTextGatewaySDKPreparationDoesNotSpendAttempt(t *testing.T) {
 		{"empty region", []string{"fake", ""}},
 		{"empty access key", []string{"", "secret", "us-east-1"}},
 		{"empty secret key", []string{"fake", "", "us-east-1"}},
+		{"invalid region", []string{"fake", "bad region"}},
+		{"invalid region label", []string{"fake", "us-east-1..invalid"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("invalid SDK credentials must not be sent") })
@@ -700,7 +702,7 @@ func TestTextGatewaySDKRejectionsRetainStatusAndProviderScope(t *testing.T) {
 	for _, tc := range []struct {
 		status, sends     int
 		nativeCode, class string
-	}{{400, 1, "ValidationException", "invalid_request"}, {401, 2, "UnrecognizedClientException", "credentials"}, {403, 2, "AccessDeniedException", "credentials"}, {404, 3, "ResourceNotFoundException", "model_not_found"}, {429, 2, "ServiceQuotaExceededException", "account_quota"}} {
+	}{{400, 1, "ValidationException", "invalid_request"}, {401, 2, "UnrecognizedClientException", "credentials"}, {403, 2, "AccessDeniedException", "credentials"}, {404, 3, "ResourceNotFoundException", "model_not_found"}, {404, 1, "UnknownPath", "upstream_error"}, {429, 2, "ServiceQuotaExceededException", "account_quota"}} {
 		t.Run(fmt.Sprint(tc.status), func(t *testing.T) {
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("SDK must use its own transport") })
 			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeAws, "key": strings.Join([]string{"fake", "us-east-1"}, "|")}).Error)
@@ -728,7 +730,7 @@ func TestTextGatewaySDKRejectionsRetainStatusAndProviderScope(t *testing.T) {
 				return &http.Response{StatusCode: tc.status, Header: http.Header{"Content-Type": {"application/json"}, "X-Amzn-Errortype": {tc.nativeCode}}, Body: io.NopCloser(strings.NewReader(`{"message":"private-sdk-error"}`)), Request: request}, nil
 			})
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
-			if tc.status == 404 {
+			if tc.class == "model_not_found" {
 				assert.Equal(t, 2, sdkCalls, "a model failure excludes only its Channel")
 			} else {
 				assert.Equal(t, 1, sdkCalls)
@@ -967,41 +969,47 @@ func TestTextGatewayStreamReadErrorsNeverLogProviderSecrets(t *testing.T) {
 }
 
 func TestTextGatewayStreamFailoverNeverLeaksErrorsOrEndsEarly(t *testing.T) {
-	for _, business := range []bool{false, true} {
-		t.Run(fmt.Sprint("business=", business), func(t *testing.T) {
-			logPath := captureGatewayDebugLog(t)
-			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "text/event-stream")
-				_, _ = w.Write([]byte(": PING\n\ndata: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"))
+	for _, frame := range []struct{ name, data string }{
+		{"structured", `{"error":{"type":"server_error","code":123,"message":"Bearer provider-secret https://private.invalid/?key=secret"}}`},
+		{"truncated", `{"error":{"message":"Bearer provider-secret https://private.invalid/?key=secret`},
+	} {
+		for _, business := range []bool{false, true} {
+			t.Run(fmt.Sprint(frame.name, "/business=", business), func(t *testing.T) {
+				logPath := captureGatewayDebugLog(t)
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = w.Write([]byte(": PING\n\ndata: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"))
+					if business {
+						_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"First\"}}]}\n\n"))
+					}
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", frame.data)
+				})
+				secondCalls := 0
+				addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+					secondCalls++
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+				})
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+				assert.NotContains(t, response.Body.String(), "secret")
+				assert.NotContains(t, response.Body.String(), "private.invalid")
+				logged, err := os.ReadFile(logPath)
+				require.NoError(t, err)
+				assert.NotContains(t, string(logged), "provider-secret")
+				assert.NotContains(t, string(logged), "private.invalid")
 				if business {
-					_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"First\"}}]}\n\n"))
+					assert.Zero(t, secondCalls)
+					assert.Contains(t, response.Body.String(), `"code":"upstream_error"`)
+					assert.NotContains(t, response.Body.String(), "Recovered")
+					assert.NotContains(t, response.Body.String(), "[DONE]")
+				} else {
+					assert.Equal(t, 1, secondCalls)
+					assert.Contains(t, response.Body.String(), "Recovered")
+					assert.Equal(t, 1, strings.Count(response.Body.String(), "[DONE]"))
+					assert.Less(t, strings.Index(response.Body.String(), "Recovered"), strings.Index(response.Body.String(), "[DONE]"))
 				}
-				_, _ = w.Write([]byte("data: {\"error\":{\"type\":\"server_error\",\"code\":123,\"message\":\"Bearer provider-secret https://private.invalid/?key=secret\"}}\n\n"))
 			})
-			secondCalls := 0
-			addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
-				secondCalls++
-				w.Header().Set("Content-Type", "text/event-stream")
-				_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
-			})
-			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
-			assert.NotContains(t, response.Body.String(), "secret")
-			assert.NotContains(t, response.Body.String(), "private.invalid")
-			logged, err := os.ReadFile(logPath)
-			require.NoError(t, err)
-			assert.NotContains(t, string(logged), "provider-secret")
-			assert.NotContains(t, string(logged), "private.invalid")
-			if business {
-				assert.Zero(t, secondCalls)
-				assert.Contains(t, response.Body.String(), `"code":"upstream_error"`)
-				assert.NotContains(t, response.Body.String(), "Recovered")
-			} else {
-				assert.Equal(t, 1, secondCalls)
-				assert.Contains(t, response.Body.String(), "Recovered")
-				assert.Equal(t, 1, strings.Count(response.Body.String(), "[DONE]"))
-				assert.Less(t, strings.Index(response.Body.String(), "Recovered"), strings.Index(response.Body.String(), "[DONE]"))
-			}
-		})
+		}
 	}
 }
 
@@ -1152,41 +1160,48 @@ func TestTextGatewayPreparationFailureDoesNotSpendAttempts(t *testing.T) {
 }
 
 func TestTextGatewaySafetyStreamStopsWithoutWaitingForProviderEOF(t *testing.T) {
-	sent := make(chan struct{})
-	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(io.Discard, r.Body)
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"error\":{\"code\":\"content_filter\",\"message\":\"private-secret\"}}\n\n"))
-		w.(http.Flusher).Flush()
-		close(sent)
-		<-r.Context().Done()
-	})
-	addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) { t.Error("safety rejection must not switch Channel") })
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)).WithContext(ctx)
-	request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
-	request.Header.Set("Content-Type", "application/json")
-	response := httptest.NewRecorder()
-	done := make(chan struct{})
-	go func() { fixture.engine.ServeHTTP(response, request); close(done) }()
-	<-sent
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		cancel()
-		<-done
-		t.Fatal("the gateway waited for Provider EOF after a safety rejection")
+	for _, frame := range []struct{ name, data string }{
+		{"error envelope", "data: {\"error\":{\"code\":\"content_filter\",\"message\":\"private-secret\"}}\n\n"},
+		{"finish reason", "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n"},
+	} {
+		t.Run(frame.name, func(t *testing.T) {
+			sent := make(chan struct{})
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte(frame.data))
+				w.(http.Flusher).Flush()
+				close(sent)
+				<-r.Context().Done()
+			})
+			addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) { t.Error("safety rejection must not switch Channel") })
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)).WithContext(ctx)
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			done := make(chan struct{})
+			go func() { fixture.engine.ServeHTTP(response, request); close(done) }()
+			<-sent
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				cancel()
+				<-done
+				t.Fatal("the gateway waited for Provider EOF after a safety rejection")
+			}
+			assert.NotContains(t, response.Body.String(), "private-secret")
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, "content_safety", attempts[0].ErrorClass)
+			assert.Equal(t, "stop", attempts[0].FailoverDecision)
+			assert.Zero(t, record.Receivable.Nanos)
+		})
 	}
-	assert.NotContains(t, response.Body.String(), "private-secret")
-	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
-	require.NoError(t, err)
-	attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
-	require.NoError(t, err)
-	require.EqualValues(t, 1, total)
-	assert.Equal(t, "content_safety", attempts[0].ErrorClass)
-	assert.Equal(t, "stop", attempts[0].FailoverDecision)
-	assert.Zero(t, record.Receivable.Nanos)
 }
 
 func TestTextGatewayNativeModelNotFoundIsDistinctFromUnknownPath(t *testing.T) {
@@ -2183,14 +2198,16 @@ func TestTextGatewayPartialUsageRetainsCacheDetails(t *testing.T) {
 
 func TestTextGatewayFreeFixedPricesAndFailureCosts(t *testing.T) {
 	for _, test := range []struct {
-		name, expression, body, status, source string
-		upstreamStatus                         int
-		stream                                 bool
-		charge, cost                           int64
+		name, expression, body, status, source, errorClass string
+		upstreamStatus                                     int
+		stream                                             bool
+		charge, cost                                       int64
 	}{
 		{name: "explicit free request", expression: `tier("request",fixed(0))`, body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, status: "success", source: "upstream", cost: 20000},
 		{name: "fixed successful request", expression: `tier("request",fixed(0.01))`, body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, status: "success", source: "upstream", charge: 9000000, cost: 20000},
 		{name: "fixed interrupted stream refunds", expression: `tier("request",fixed(0.01))`, stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n", status: "partial", source: "estimated", cost: 11000},
+		{name: "fixed safety stream refunds", expression: `tier("request",fixed(0.01))`, stream: true, body: "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n", status: "partial", source: "upstream", errorClass: "content_safety", cost: 20000},
+		{name: "fixed safety JSON refunds", expression: `tier("request",fixed(0.01))`, body: `{"choices":[{"message":{"content":"Hello"},"finish_reason":"content_filter"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, status: "partial", source: "upstream", errorClass: "content_safety", cost: 20000},
 		{name: "HTTP failure without usage refunds", upstreamStatus: 503, body: `{"error":{"type":"provider_error","message":"provider-secret https://secret.invalid request-body-secret"}}`, status: "failed", source: "none"},
 		{name: "HTTP failure retains reported purchase usage", upstreamStatus: 503, body: `{"error":{"type":"provider_error","message":"provider-secret"},"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, status: "failed", source: "upstream", cost: 20000},
 		{name: "HTTP failure retains partial reported purchase usage", upstreamStatus: 503, body: `{"error":{"type":"provider_error","message":"provider-secret"},"usage":{"prompt_tokens":10}}`, status: "failed", source: "estimated", cost: 10000},
@@ -2234,6 +2251,12 @@ func TestTextGatewayFreeFixedPricesAndFailureCosts(t *testing.T) {
 			require.EqualValues(t, 1, total)
 			assert.Equal(t, test.source, attempts[0].UsageSource)
 			assert.Equal(t, test.cost, attempts[0].Cost.Nanos)
+			if test.errorClass != "" {
+				assert.Equal(t, test.errorClass, attempts[0].ErrorClass)
+				if test.stream {
+					assert.NotContains(t, response.Body.String(), "[DONE]")
+				}
+			}
 			wallet, err := model.GetUserWallet(fixture.user.Id)
 			require.NoError(t, err)
 			assert.Equal(t, int64(1000000000)-test.charge, wallet.Balance.Nanos)

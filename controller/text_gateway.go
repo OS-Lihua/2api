@@ -571,6 +571,12 @@ func gatewayAttemptOutcome(c *gin.Context, info *relaycommon.RelayInfo, err *typ
 	if info.ResponseFacts.DownstreamWriteFailed {
 		return "failed", "downstream_write_failed"
 	}
+	if info.PerformanceBusinessRejection {
+		if info.ResponseFacts.BusinessOutput {
+			return "partial", "content_safety"
+		}
+		return "failed", "content_safety"
+	}
 	if err != nil {
 		if info.ResponseFacts.BusinessOutput {
 			return "partial", "upstream_error"

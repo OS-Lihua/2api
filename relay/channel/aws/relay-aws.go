@@ -28,6 +28,7 @@ import (
 	bedrockruntimeTypes "github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/auth/bearer"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // getAwsErrorStatusCode extracts HTTP status code from AWS SDK error
@@ -108,6 +109,11 @@ func (a *Provider) NewClient(metadata channel.ProviderMetadata) (*bedrockruntime
 		return nil, errors.New("invalid aws secret key")
 	}
 
+	for label := range strings.SplitSeq(client.Options().Region, ".") {
+		if !smithyhttp.ValidHostLabel(label) {
+			return nil, errors.New("invalid aws region")
+		}
+	}
 	return client, nil
 }
 

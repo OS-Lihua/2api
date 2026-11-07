@@ -226,7 +226,15 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 					err = errors.New("invalid upstream stream data")
 				}
 				logger.LogError(c, common.LogText("error processing stream token data: %s", err.Error()))
+				if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+					lastStreamData = ""
+					sr.Stop(err)
+					return
+				}
 				sr.Error(err)
+			}
+			if info.PerformanceBusinessRejection && info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+				sr.Stop(errors.New("upstream content safety rejection"))
 			}
 		}
 	})
@@ -322,6 +330,9 @@ func observeStreamChoices(info *relaycommon.RelayInfo, data string, seen map[str
 		if choice.FinishReason != nil && *choice.FinishReason != "" {
 			if *choice.FinishReason == constant.FinishReasonContentFilter {
 				info.PerformanceBusinessRejection = true
+				if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+					info.StreamStatus.MarkFailed("content_filter", "", 0)
+				}
 			}
 			info.StreamStatus.MarkCompleted()
 		}
