@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -78,7 +79,7 @@ func callProviderAPIStatus(t *testing.T, engine *gin.Engine, wantStatus int, met
 	request.Header.Set("Content-Type", "application/json")
 	engine.ServeHTTP(recorder, request)
 	require.Equal(t, wantStatus, recorder.Code, recorder.Body.String())
-	for _, secret := range []string{"sk-provider", `"key":`, "key_preview"} {
+	for _, secret := range []string{providerKeyA, "sk-provider", `"key":`, "key_preview", "fixture-header-secret", "fixture-query-secret"} {
 		assert.NotContains(t, recorder.Body.String(), secret, "%s %s", method, path)
 	}
 	var reply providerAPIReply
@@ -257,6 +258,34 @@ func TestProviderAdminAPIHidesBalanceErrors(t *testing.T) {
 	reply := callProviderAPIStatus(t, engine, http.StatusBadGateway, http.MethodPost, "/"+common.Interface2String(provider.Id)+"/balance", "")
 	assert.False(t, reply.Success)
 	assert.Equal(t, "Failed to query balance", reply.Message)
+}
+
+func TestProviderAdminAPIHidesBalanceTransportErrors(t *testing.T) {
+	engine := newProviderAdminEngine(t)
+	querySecret := "fixture-query-secret"
+	var upstreamCalled atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled.Store(true)
+		assert.Equal(t, querySecret, r.URL.Query().Get("api_key"))
+		assert.Equal(t, "Bearer "+providerKeyA, r.Header.Get("Authorization"))
+		connection, _, err := w.(http.Hijacker).Hijack()
+		if assert.NoError(t, err) {
+			assert.NoError(t, connection.Close())
+		}
+	}))
+	defer server.Close()
+	// The legacy helper appends its path to this URL; keep a credential in the
+	// query to exercise url.Error without contacting a real Provider.
+	baseURL := server.URL + "/?api_key=" + querySecret + "&path="
+	headers := `{"X-Api-Key":"fixture-header-secret"}`
+	provider := &model.Provider{Type: constant.ChannelTypeOpenAI, BaseURL: &baseURL, Key: providerKeyA,
+		HeaderOverride: &headers, Name: "disconnected balance"}
+	require.NoError(t, model.DB.Create(provider).Error)
+	reply := callProviderAPIStatus(t, engine, http.StatusBadGateway, http.MethodPost, "/"+common.Interface2String(provider.Id)+"/balance", "")
+	assert.False(t, reply.Success)
+	assert.Equal(t, "Failed to query balance", reply.Message)
+	assert.Empty(t, reply.Data)
+	assert.True(t, upstreamCalled.Load(), "the balance request must reach the disconnecting upstream")
 }
 
 func TestProviderAdminAPIRefreshesBalance(t *testing.T) {
