@@ -199,6 +199,18 @@ func TestAdminModelsDatabase(t *testing.T) {
 		assert.EqualValues(t, 1, listed.Data["total"])
 	})
 
+	t.Run("reads a model saved before capabilities existed as an empty declaration", func(t *testing.T) {
+		legacy := model.Model{ModelName: "gpt-3.5-turbo", VendorID: openAI, Status: 1}
+		require.NoError(t, legacy.Insert())
+		require.NoError(t, model.DB.Exec(`UPDATE models SET capabilities = NULL WHERE id = ?`, legacy.Id).Error)
+
+		status, fetched := adminModelCall(t, engine, http.MethodGet, fmt.Sprintf("/api/admin/v1/models/%d", legacy.Id), nil)
+		require.Equal(t, http.StatusOK, status)
+		assert.Equal(t, map[string]any{
+			"features": []any{}, "input_modalities": []any{}, "output_modalities": []any{}, "limits": map[string]any{},
+		}, fetched.Data["capabilities"])
+	})
+
 	t.Run("legacy metadata API keeps capabilities", func(t *testing.T) {
 		_, created := adminModelCall(t, engine, http.MethodPost, "/api/admin/v1/models", map[string]any{
 			"name": "text-embedding-3-large", "publisher_id": openAI,
@@ -213,6 +225,8 @@ func TestAdminModelsDatabase(t *testing.T) {
 			"id": id, "model_name": "text-embedding-3-large", "vendor_id": openAI, "description": "legacy edit", "status": 1, "sync_official": 1,
 		}, &legacy)
 		require.True(t, legacy.Success)
+		require.NotNil(t, legacy.Data.Capabilities.Limits.EmbeddingDimensions, "the legacy response returns the stored capabilities")
+		assert.EqualValues(t, 3072, *legacy.Data.Capabilities.Limits.EmbeddingDimensions)
 
 		var stored model.Model
 		require.NoError(t, model.DB.First(&stored, id).Error)

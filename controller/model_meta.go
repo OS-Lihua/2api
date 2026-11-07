@@ -186,6 +186,13 @@ func UpdateModelMeta(c *gin.Context) {
 			return
 		}
 	}
+	// The legacy body carries no capabilities; return the stored declaration.
+	var stored model.Model
+	if err := model.DB.Select("capabilities").First(&stored, m.Id).Error; err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	m.Capabilities = stored.Capabilities
 	model.RefreshPricing()
 	m.HasMetadata = m.Id > 0
 	common.ApiSuccess(c, &m)

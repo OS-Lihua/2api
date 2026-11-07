@@ -64,10 +64,10 @@ func newAdminModelResponse(record *model.Model) adminModelResponse {
 // modelNameMaxLength matches the size of the model_name column.
 const modelNameMaxLength = 128
 
-// declaration validates the request and copies it onto record. Names are kept
+// apply validates the request and copies it onto record. Names are kept
 // as written: a version, date, quantization, or context suffix makes a
 // different Model.
-func (request adminModelRequest) declaration(record *model.Model) error {
+func (request adminModelRequest) apply(record *model.Model) error {
 	name := strings.TrimSpace(request.Name)
 	if name == "" {
 		return common.NewMessage("Model name cannot be empty")
@@ -196,7 +196,7 @@ func AdminCreateModel(c *gin.Context) {
 		return
 	}
 	var record model.Model
-	if err := request.declaration(&record); err != nil {
+	if err := request.apply(&record); err != nil {
 		common.ApiErrorStatus(c, http.StatusBadRequest, err)
 		return
 	}
@@ -228,7 +228,7 @@ func AdminUpdateModel(c *gin.Context) {
 		adminModelLookupError(c, err)
 		return
 	}
-	if err := request.declaration(record); err != nil {
+	if err := request.apply(record); err != nil {
 		common.ApiErrorStatus(c, http.StatusBadRequest, err)
 		return
 	}

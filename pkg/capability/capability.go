@@ -71,16 +71,19 @@ func (s Set) Normalize() (Set, error) {
 	if err != nil {
 		return Set{}, err
 	}
-	limits := map[string]*int64{
-		"context_length":       s.Limits.ContextLength,
-		"max_output_tokens":    s.Limits.MaxOutputTokens,
-		"max_images":           s.Limits.MaxImages,
-		"max_duration_seconds": s.Limits.MaxDurationSeconds,
-		"embedding_dimensions": s.Limits.EmbeddingDimensions,
+	limits := []struct {
+		name  string
+		value *int64
+	}{
+		{"context_length", s.Limits.ContextLength},
+		{"max_output_tokens", s.Limits.MaxOutputTokens},
+		{"max_images", s.Limits.MaxImages},
+		{"max_duration_seconds", s.Limits.MaxDurationSeconds},
+		{"embedding_dimensions", s.Limits.EmbeddingDimensions},
 	}
-	for name, limit := range limits {
-		if limit != nil && *limit <= 0 {
-			return Set{}, common.NewMessage("Capability limit {{name}} must be a positive integer", map[string]any{"name": name})
+	for _, limit := range limits {
+		if limit.value != nil && *limit.value <= 0 {
+			return Set{}, common.NewMessage("Capability limit {{name}} must be a positive integer", map[string]any{"name": limit.name})
 		}
 	}
 	return Set{Features: features, InputModalities: input, OutputModalities: output, Limits: s.Limits}, nil
@@ -103,38 +106,36 @@ func canonical[T ~string](values, all []T, unknownKey string) ([]T, error) {
 	return result, nil
 }
 
-// Scan reads a JSON column. NULL, written before capabilities existed, is an
-// empty declaration.
+// MarshalJSON writes absent lists as empty lists. A NULL column, written
+// before capabilities existed, reads as the zero Set.
+func (s Set) MarshalJSON() ([]byte, error) {
+	type plain Set
+	encoded := plain(s)
+	encoded.Features = nonNil(encoded.Features)
+	encoded.InputModalities = nonNil(encoded.InputModalities)
+	encoded.OutputModalities = nonNil(encoded.OutputModalities)
+	return common.Marshal(encoded)
+}
+
+// Scan reads a JSON column.
 func (s *Set) Scan(value any) error {
-	var data []byte
+	*s = Set{}
 	switch typed := value.(type) {
 	case nil:
+		return nil
 	case []byte:
-		data = typed
+		return common.Unmarshal(typed, s)
 	case string:
-		data = []byte(typed)
+		return common.UnmarshalJsonStr(typed, s)
 	default:
 		return fmt.Errorf("unsupported capability column type %T", value)
 	}
-	*s = Set{}
-	if len(data) > 0 {
-		if err := common.Unmarshal(data, s); err != nil {
-			return err
-		}
-	}
-	s.Features = nonNil(s.Features)
-	s.InputModalities = nonNil(s.InputModalities)
-	s.OutputModalities = nonNil(s.OutputModalities)
-	return nil
 }
 
 // Value writes a JSON column. It returns a string because PostgreSQL's simple
 // protocol encodes []byte as bytea.
 func (s Set) Value() (driver.Value, error) {
-	s.Features = nonNil(s.Features)
-	s.InputModalities = nonNil(s.InputModalities)
-	s.OutputModalities = nonNil(s.OutputModalities)
-	encoded, err := common.Marshal(s)
+	encoded, err := s.MarshalJSON()
 	if err != nil {
 		return nil, err
 	}
