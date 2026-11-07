@@ -21,6 +21,72 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestGatewayMediaMultipliersBoundNestedAndMultipartValues(t *testing.T) {
+	for _, tc := range []struct {
+		body    string
+		invalid bool
+	}{
+		{`{"n":0,"quality":"high","size":"1536x1024"}`, false},
+		{`{"n":128,"parameters":{"n":1},"metadata":{"duration":3600}}`, false},
+		{`{"n":18446744073686646784}`, true},
+		{`{"parameters":{"n":129}}`, true},
+		{`{"metadata":{"batch_size":129}}`, true},
+		{`{"duration":-1}`, true},
+		{`{"duration":1e200}`, true},
+		{`{"metadata":{"max_new_tokens":18446744073686646784}}`, true},
+		{`{"speed":0}`, true},
+		{`{"resolution":"999999999999999x1024"}`, true},
+		{`{"quality":"unbounded"}`, true},
+	} {
+		t.Run(tc.body, func(t *testing.T) {
+			err := ValidateGatewayMediaMultipliers([]byte(tc.body))
+			if tc.invalid {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestGatewayMediaMultipartValidatesEveryMultiplierBeforeParsing(t *testing.T) {
+	for _, tc := range []struct {
+		name, value string
+		invalid     bool
+	}{
+		{"n", "0", false},
+		{"n", "129", true},
+		{"parameters", `{"n":18446744073686646784}`, true},
+		{"metadata", `{"duration":-1}`, true},
+	} {
+		t.Run(tc.name+tc.value, func(t *testing.T) {
+			var body bytes.Buffer
+			writer := multipart.NewWriter(&body)
+			require.NoError(t, writer.WriteField("model", "image-model"))
+			require.NoError(t, writer.WriteField("prompt", "edit"))
+			require.NoError(t, writer.WriteField(tc.name, tc.value))
+			part, err := writer.CreateFormFile("image", "image.png")
+			require.NoError(t, err)
+			_, err = part.Write([]byte("image"))
+			require.NoError(t, err)
+			require.NoError(t, writer.Close())
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
+			c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+			parsed, err := ParseGatewayMediaRequest(c)
+			if tc.invalid {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			request := parsed.Request.(*dto.ImageRequest)
+			require.NotNil(t, request.N)
+			assert.Equal(t, uint(1), *request.N)
+			assert.Equal(t, []string{"1"}, c.Request.MultipartForm.Value["n"])
+		})
+	}
+}
+
 func TestLegacyDalleValidationAndPricesRemainCompatible(t *testing.T) {
 	for _, tc := range []struct {
 		body, size, quality string
