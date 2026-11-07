@@ -83,6 +83,18 @@ func (a *Protocol) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayI
 	if request == nil {
 		return nil, errors.New("request is nil")
 	}
+	if info.ResponseFacts != nil {
+		for _, message := range request.Messages {
+			for _, part := range message.ParseContent() {
+				if part.Type != dto.ContentTypeImageURL {
+					continue
+				}
+				if !part.GetImageMedia().IsRemoteImage() {
+					return nil, errors.New("Dify inline image upload requires upstream I/O during conversion")
+				}
+			}
+		}
+	}
 	return requestOpenAI2Dify(c, info, *request), nil
 }
 

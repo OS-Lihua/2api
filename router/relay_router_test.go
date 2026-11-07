@@ -1,9 +1,13 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -403,7 +407,11 @@ func TestTextGatewayFailureClassificationAndProviderScope(t *testing.T) {
 				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(test.status)
-				_, _ = fmt.Fprintf(w, `{"error":{"code":%q,"message":"Bearer provider-secret https://private.invalid/?key=private"}}`, test.code)
+				if test.code == "model_not_found" || test.status == 429 || test.status >= 500 {
+					_, _ = fmt.Fprintf(w, `{"error":{"type":"invalid_request_error","code":%q,"message":"private"}}`, test.code)
+				} else {
+					_, _ = fmt.Fprintf(w, `{"error":{"code":%q,"message":"Bearer provider-secret https://private.invalid/?key=private"}}`, test.code)
+				}
 			})
 			// A second model path on the same account must be skipped only for
 			// credentials/account quota. The final account always succeeds.
@@ -746,6 +754,41 @@ func TestTextGatewayStreamInvalidRequestStopsBeforeSwitching(t *testing.T) {
 	require.EqualValues(t, 1, total)
 	assert.Equal(t, "invalid_request", attempts[0].ErrorClass)
 	assert.Equal(t, "stop", attempts[0].FailoverDecision)
+}
+
+func TestTextGatewayDifyInlineImagesCannotUploadDuringConversion(t *testing.T) {
+	uploads, generations := 0, 0
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/files/upload") {
+			uploads++
+			_, _ = w.Write([]byte(`{"id":"uploaded-image"}`))
+			return
+		}
+		generations++
+		w.WriteHeader(503)
+	})
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeDify).Error)
+	var unified model.Model
+	require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+	unified.Capabilities.InputModalities = append(unified.Capabilities.InputModalities, capability.Image)
+	require.NoError(t, model.DB.Model(&unified).Select("capabilities").Updates(&unified).Error)
+	healthy := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	})
+	t.Setenv("GATEWAY_MAX_ATTEMPTS", "1")
+	var picture bytes.Buffer
+	require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+	body := fmt.Sprintf(`{"model":"gateway-alias","messages":[{"role":"user","content":[{"type":"text","text":"Hello"},{"type":"image_url","image_url":{"url":"data:image/png;base64,%s"}}]}],"max_tokens":16}`, base64.StdEncoding.EncodeToString(picture.Bytes()))
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+	assert.Zero(t, uploads, "conversion must not issue an upload outside the send budget")
+	assert.Zero(t, generations)
+	assert.Contains(t, response.Body.String(), "Recovered")
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, healthy.ID, attempts[0].ChannelID)
 }
 
 func TestTextGatewayDifyMetadataDoesNotBecomeBillableReasoning(t *testing.T) {
