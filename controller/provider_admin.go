@@ -192,7 +192,7 @@ func respondProvider(c *gin.Context, id int) {
 	common.ApiSuccess(c, readableProvider(provider))
 }
 
-// ListProviders lists Providers. Filters: keyword (ID, name, or base URL),
+// ListProviders lists Providers. Filters: keyword (ID, name, or address host),
 // group, status (enabled or disabled), and type.
 func ListProviders(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
@@ -210,7 +210,13 @@ func ListProviders(c *gin.Context) {
 	query := buildChannelListQuery(model.NormalizeProviderGroupFilter(c.Query("group")), parseStatusFilter(c.Query("status")), typeFilter)
 	if keyword := strings.TrimSpace(c.Query("keyword")); keyword != "" {
 		pattern := "%" + keyword + "%"
-		query = query.Where(`(id = ? OR name LIKE ? OR "base_url" LIKE ?)`, common.String2Int(keyword), pattern, pattern)
+		host := keyword
+		if address, err := url.Parse(keyword); err == nil && address.Hostname() != "" {
+			host = address.Host
+		}
+		// Address search must not act as an oracle for the hidden URL parts.
+		const hostPattern = `^[A-Za-z][A-Za-z0-9+.-]*://(?:[^/?#]*@)?((?:\[[^]]+\]|[[:alnum:]._-]+)(?::[0-9]+)?)(?:[/?#]|$)`
+		query = query.Where(`("id" = ? OR "name" LIKE ? OR substring("base_url" FROM ?) ILIKE ?)`, common.String2Int(keyword), pattern, hostPattern, "%"+host+"%")
 	}
 
 	var total int64

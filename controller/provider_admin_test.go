@@ -3,6 +3,7 @@ package controller
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -177,6 +178,31 @@ func TestProviderAdminAPIRequiresCompleteHiddenURLReplacement(t *testing.T) {
 	cleared := callProviderAPI(t, engine, http.MethodPatch, path, `{"base_url":""}`)
 	require.True(t, cleared.Success, cleared.Message)
 	assert.Empty(t, *storedProvider(t, provider.Id).BaseURL)
+}
+
+func TestProviderAdminAPISearchDoesNotProbeHiddenURLValues(t *testing.T) {
+	for _, host := range []string{"upstream.example:8443", "[::1]:8443"} {
+		t.Run(host, func(t *testing.T) {
+			engine := newProviderAdminEngine(t)
+			userSecret, passwordSecret := "url-search-user", "url-search-credential"
+			querySecret, fragmentSecret := "query-value-opaque", "fragment-value-opaque"
+			address := url.URL{Scheme: "https", Host: host, Path: "/v1", User: url.UserPassword(userSecret, passwordSecret), RawQuery: "api_key=" + querySecret, Fragment: fragmentSecret}
+			baseURL := address.String()
+			provider := &model.Provider{Type: constant.ChannelTypeOpenAI, Name: "private URL", Key: providerKeyA, BaseURL: &baseURL}
+			require.NoError(t, provider.Insert())
+			for _, secret := range []string{userSecret, passwordSecret, querySecret, fragmentSecret} {
+				result := callProviderAPI(t, engine, http.MethodGet, "?keyword="+url.QueryEscape(secret), "")
+				assert.EqualValues(t, 0, result.Data["total"])
+				assert.Empty(t, result.Data["items"])
+			}
+			lookup := address
+			lookup.User, lookup.RawQuery, lookup.Fragment = url.UserPassword("someone", "lookup-credential"), "api_key=another", "another"
+			for _, keyword := range []string{address.Hostname(), host, lookup.String()} {
+				result := callProviderAPI(t, engine, http.MethodGet, "?keyword="+url.QueryEscape(keyword), "")
+				assert.EqualValues(t, 1, result.Data["total"])
+			}
+		})
+	}
 }
 
 func TestProviderAdminAPIManagesProviderWithWriteOnlyKeys(t *testing.T) {
