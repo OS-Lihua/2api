@@ -420,6 +420,9 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 		}
 	}
+	if info.ResponseFacts != nil && resp.StatusCode != http.StatusOK {
+		return usage, types.NewErrorWithStatusCode(fmt.Errorf("upstream request failed"), types.ErrorCodeBadResponse, resp.StatusCode)
+	}
 	full := dto.OpenAITextResponse{
 		Id:      common.GetUUID(),
 		Model:   model,

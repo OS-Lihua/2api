@@ -269,7 +269,7 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			sr.Stop(fmt.Errorf("Dify stream delivery failed"))
 		}
 	})
-	if info.ResponseFacts == nil || info.ResponseFacts.OnBusinessOutput == nil || info.ResponseFacts.BusinessOutput && info.StreamStatus.IsNormalEnd() {
+	if info.ResponseFacts == nil || info.ResponseFacts.OnBusinessOutput == nil || info.ResponseFacts.BusinessOutput && info.StreamStatus.CompletedNormally() {
 		helper.Done(c)
 	}
 	if info.ResponseFacts != nil {

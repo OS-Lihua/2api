@@ -403,7 +403,7 @@ func TestTextGatewayStreamFailoverNeverLeaksErrorsOrEndsEarly(t *testing.T) {
 				if business {
 					_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"First\"}}]}\n\n"))
 				}
-				_, _ = w.Write([]byte("data: {\"error\":{\"type\":\"server_error\",\"code\":\"overloaded\",\"message\":\"Bearer provider-secret https://private.invalid/?key=secret\"}}\n\n"))
+				_, _ = w.Write([]byte("data: {\"error\":{\"type\":\"server_error\",\"code\":123,\"message\":\"Bearer provider-secret https://private.invalid/?key=secret\"}}\n\n"))
 			})
 			secondCalls := 0
 			addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
@@ -505,6 +505,116 @@ func TestTextGatewayTotalBudgetFiveSecondBoundaryAndAttemptLimit(t *testing.T) {
 			reconciliation, err := model.ReconcileWallets(100)
 			require.NoError(t, err)
 			assert.Empty(t, reconciliation.Mismatches)
+		})
+	}
+}
+
+func TestTextGatewayPreparationFailureDoesNotSpendAttempts(t *testing.T) {
+	for _, badURL := range []bool{false, true} {
+		t.Run(fmt.Sprint("bad URL=", badURL), func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("invalid prepared candidate must not be sent") })
+			if badURL {
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("base_url", "http://%zz").Error)
+			} else {
+				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", `{"n":129}`).Error)
+			}
+			t.Setenv("GATEWAY_MAX_ATTEMPTS", "1")
+			healthy := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+			})
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			require.Equal(t, 200, response.Code, response.Body.String())
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, healthy.ID, attempts[0].ChannelID)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			entries, _, err := model.ListLedgerEntries(wallet.Id, 0, 20)
+			require.NoError(t, err)
+			assert.Len(t, entries, 4)
+			assert.Equal(t, int64(999964000), wallet.Balance.Nanos)
+		})
+	}
+}
+
+func TestTextGatewaySafetyStreamStopsWithoutWaitingForProviderEOF(t *testing.T) {
+	sent := make(chan struct{})
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"error\":{\"code\":\"content_filter\",\"message\":\"private-secret\"}}\n\n"))
+		w.(http.Flusher).Flush()
+		close(sent)
+		<-r.Context().Done()
+	})
+	addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) { t.Error("safety rejection must not switch Channel") })
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)).WithContext(ctx)
+	request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() { fixture.engine.ServeHTTP(response, request); close(done) }()
+	<-sent
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("the gateway waited for Provider EOF after a safety rejection")
+	}
+	assert.NotContains(t, response.Body.String(), "private-secret")
+	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+	require.NoError(t, err)
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, "content_safety", attempts[0].ErrorClass)
+	assert.Equal(t, "stop", attempts[0].FailoverDecision)
+	assert.Zero(t, record.Receivable.Nanos)
+}
+
+func TestTextGatewayNativeModelNotFoundIsDistinctFromUnknownPath(t *testing.T) {
+	for _, missingModel := range []bool{false, true} {
+		t.Run(fmt.Sprint("model missing=", missingModel), func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(404)
+				if missingModel {
+					_, _ = w.Write([]byte(`{"error":"model 'upstream-model' not found"}`))
+				} else {
+					_, _ = w.Write([]byte(`{"error":"unknown endpoint"}`))
+				}
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeOllama).Error)
+			addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+			})
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			if missingModel {
+				assert.Equal(t, 200, response.Code, response.Body.String())
+			} else {
+				assert.Equal(t, 404, response.Code)
+			}
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			attempts, _, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			for _, attempt := range attempts {
+				if attempt.ChannelID == fixture.channel.ID {
+					if missingModel {
+						assert.Equal(t, "model_not_found", attempt.ErrorClass)
+					} else {
+						assert.Equal(t, "upstream_error", attempt.ErrorClass)
+					}
+				}
+			}
 		})
 	}
 }
@@ -1091,6 +1201,10 @@ func TestTextGatewayJSONAndStreamUsage(t *testing.T) {
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
 			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 			assert.Contains(t, response.Body.String(), "Hello")
+			if test.status == "partial" {
+				assert.NotContains(t, response.Body.String(), "[DONE]", "an interrupted stream must end with an error instead of a success terminator")
+				assert.Contains(t, response.Body.String(), `"code":"upstream_error"`)
+			}
 			requests, _, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
 			require.NoError(t, err)
 			require.Len(t, requests, 1)

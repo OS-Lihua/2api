@@ -58,8 +58,13 @@ func TextGateway(c *gin.Context) {
 	run := &textGatewayRun{}
 	parent := c.Request
 	attempts := service.RunGatewayAttempts(parent.Context(), service.GatewayPolicy(), func(budget *service.GatewayAttemptBudget, exclusions *service.GatewayExclusions) service.GatewayAttemptResult {
+		previousStatus, previousCode, previousMessage := run.status, run.code, run.message
 		run.status, run.code, run.message = 0, "", ""
-		return runTextGatewayAttempt(c, run, budget, exclusions)
+		result := runTextGatewayAttempt(c, run, budget, exclusions)
+		if result.Attempt == nil && result.SkippedChannel == 0 && run.code == "channel_unavailable" && previousCode == "unsupported_parameter" {
+			run.status, run.code, run.message = previousStatus, previousCode, previousMessage
+		}
+		return result
 	})
 	c.Request = parent
 	if run.record != nil {
@@ -145,6 +150,11 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
 		return
 	}
+	defer func() {
+		if result.Attempt == nil && (run.code == "unsupported_parameter" || run.code == "channel_unavailable" || run.code == "price_unavailable" || run.code == "upstream_error") {
+			result.SkippedChannel = selection.Channel.ID
+		}
+	}()
 	if setupErr := middleware.SetupContextForSelectedChannel(c, selection.Provider, selection.Channel.Model.ModelName); setupErr != nil {
 		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
 		return
@@ -375,6 +385,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				}
 			}
 			if info.ResponseFacts.BusinessOutput {
+				record.ChoiceCount = choiceCount
 				record.Usage, record.UsageSource = attempt.Usage, attempt.UsageSource
 				source, receivable, trace, priceErr := service.GatewayPrice(sale, usage, input, started, ratio, saleFX)
 				if trace.BillingUnit == billingexpr.BillingUnitRequest && attempt.Status != "success" {
@@ -449,10 +460,11 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	attemptContext, budgetErr := budget.Start()
 	if budgetErr != nil {
 		attempt = nil
-		run.fail(c, 503, "budget_exhausted", "Upstream request budget exhausted")
+		run.fail(c, http.StatusServiceUnavailable, "budget_exhausted", "Upstream request failed")
 		return
 	}
 	c.Request = parent.WithContext(attemptContext)
+	defer budget.Delivered()
 	response, err := adaptor.DoPreparedRequest(c, info, prepared)
 	if err != nil {
 		transportFailed = true
@@ -473,15 +485,17 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		_ = httpResponse.Body.Close()
 		httpResponse.Body = io.NopCloser(bytes.NewReader(raw))
 		var payload struct {
-			Error struct {
-				Code string `json:"code"`
-				Type string `json:"type"`
-			} `json:"error"`
+			Error any `json:"error"`
 		}
 		if readErr == nil && common.Unmarshal(raw, &payload) == nil {
-			upstreamCode = payload.Error.Code
-			if upstreamCode == "" {
-				upstreamCode = payload.Error.Type
+			switch failure := payload.Error.(type) {
+			case string:
+				upstreamCode = failure
+			case map[string]any:
+				upstreamCode, _ = failure["code"].(string)
+				if upstreamCode == "" {
+					upstreamCode, _ = failure["type"].(string)
+				}
 			}
 		}
 
@@ -507,6 +521,9 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	if responseErr != nil {
 		apiError := responseErr.ToOpenAIError()
 		upstreamCode, _ = apiError.Code.(string)
+		if upstreamCode == "" {
+			upstreamCode = apiError.Type
+		}
 		if responseErr.StatusCode >= 400 {
 			upstreamStatus = responseErr.StatusCode
 		}
@@ -520,8 +537,8 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	return
 }
 
-// gatewayAttemptOutcome classifies facts without persisting provider messages.
-// It is independent of any future failover policy.
+// gatewayAttemptOutcome distinguishes accepted business content from protocol
+// framing, downstream failures and incomplete upstream streams.
 func gatewayAttemptOutcome(c *gin.Context, info *relaycommon.RelayInfo, err *types.NewAPIError) (string, string) {
 	if c.Request.Context().Err() != nil {
 		return "cancelled", "client_cancelled"
@@ -536,8 +553,7 @@ func gatewayAttemptOutcome(c *gin.Context, info *relaycommon.RelayInfo, err *typ
 		return "failed", "upstream_error"
 	}
 	if info.IsStream {
-		outcome := info.StreamStatus.OutcomeSnapshot()
-		if outcome.Response == relaycommon.ResponseOutcomeFailed || outcome.Response == relaycommon.ResponseOutcomeIncomplete || outcome.HasErrors || !info.StreamStatus.IsNormalEnd() || outcome.ExpectsTerminal && outcome.Response == relaycommon.ResponseOutcomeUnknown && outcome.EndReason != relaycommon.StreamEndReasonDone {
+		if !info.StreamStatus.CompletedNormally() {
 			if info.ResponseFacts.BusinessOutput {
 				return "partial", "stream_interrupted"
 			}

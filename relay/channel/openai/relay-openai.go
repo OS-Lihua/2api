@@ -198,18 +198,23 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 			}
 			if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
 				var envelope struct {
-					Error *struct {
-						Code string `json:"code"`
-						Type string `json:"type"`
-					} `json:"error"`
+					Error common.RawMessage `json:"error"`
 				}
-				if common.UnmarshalJsonStr(data, &envelope) == nil && envelope.Error != nil {
-					info.ResponseFacts.UpstreamErrorCode = envelope.Error.Code
+				if common.UnmarshalJsonStr(data, &envelope) == nil && len(envelope.Error) > 0 && strings.TrimSpace(string(envelope.Error)) != "null" {
+					var failure struct {
+						Code any    `json:"code"`
+						Type string `json:"type"`
+					}
+					_ = common.Unmarshal(envelope.Error, &failure)
+					info.ResponseFacts.UpstreamErrorCode, _ = failure.Code.(string)
 					if info.ResponseFacts.UpstreamErrorCode == "" {
-						info.ResponseFacts.UpstreamErrorCode = envelope.Error.Type
+						info.ResponseFacts.UpstreamErrorCode = failure.Type
+					}
+					if info.ResponseFacts.UpstreamErrorCode == "" {
+						info.ResponseFacts.UpstreamErrorCode = "upstream_error"
 					}
 					lastStreamData = ""
-					sr.Error(errors.New("upstream stream failed"))
+					sr.Stop(errors.New("upstream stream failed"))
 					return
 				}
 			}
@@ -228,7 +233,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	if err := handleLastResponse(lastStreamData, &responseId, &createAt, &systemFingerprint, &model, &usage,
 		&containStreamUsage, info, &shouldSendLastResp); err != nil {
 		if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
-			logger.LogError(c, "invalid upstream stream response")
+			logger.LogError(c, common.LogText("invalid upstream stream response"))
 		} else {
 			logger.LogError(c, common.LogText("error handling last response: %s, lastStreamData: [%s]", err.Error(), lastStreamData))
 		}
@@ -293,7 +298,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		info.CountBillableToolCall(dto.BuildInCallFunctionCall, name)
 	}
 
-	if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil && (!info.ResponseFacts.BusinessOutput || info.ResponseFacts.UpstreamErrorCode != "" || !info.StreamStatus.IsNormalEnd() || info.StreamStatus.OutcomeSnapshot().HasErrors) {
+	if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil && (!info.ResponseFacts.BusinessOutput || !info.StreamStatus.CompletedNormally()) {
 		return usage, nil
 	}
 	HandleFinalResponse(c, info, lastStreamData, responseId, createAt, model, systemFingerprint, usage, containStreamUsage)
@@ -386,7 +391,7 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 	}
 	var responseErr *types.NewAPIError
-	if oaiError := simpleResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
+	if oaiError := simpleResponse.GetOpenAIError(); oaiError != nil && (oaiError.Type != "" || info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil) {
 		responseErr = types.WithOpenAIError(*oaiError, resp.StatusCode)
 	} else if info.ResponseFacts != nil && resp.StatusCode != http.StatusOK {
 		responseErr = types.NewOpenAIError(fmt.Errorf("upstream request failed"), types.ErrorCodeBadResponse, resp.StatusCode)

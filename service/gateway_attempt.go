@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/model"
@@ -41,28 +42,28 @@ type GatewayFailure struct {
 	Switch, ExcludeProvider bool
 }
 
-// ClassifyGatewayFailure accepts only protocol facts, never a provider message.
-// Local validation/authorization and downstream failures must not be supplied as
-// upstream HTTP failures.
+// ClassifyGatewayFailure accepts protocol facts, including a native error reason.
+// Its returned labels are fixed and safe to persist. Local validation and
+// authorization must not be supplied as upstream HTTP failures.
 func ClassifyGatewayFailure(status int, code string, transport, timeout, cancelled, downstream bool) GatewayFailure {
 	switch {
 	case cancelled:
 		return GatewayFailure{Class: "client_cancelled"}
 	case downstream:
 		return GatewayFailure{Class: "downstream_write_failed"}
-	case timeout:
-		return GatewayFailure{Class: "first_byte_timeout", Switch: true}
-	case transport:
-		return GatewayFailure{Class: "connection_failed", Switch: true}
 	case code == "context_length_exceeded" || code == "context_window_exceeded":
 		return GatewayFailure{Class: "context_length"}
 	case code == "content_filter" || code == "content_policy_violation" || code == "safety":
 		return GatewayFailure{Class: "content_safety"}
+	case timeout:
+		return GatewayFailure{Class: "first_byte_timeout", Switch: true}
+	case transport:
+		return GatewayFailure{Class: "connection_failed", Switch: true}
 	case code == "insufficient_quota" || code == "insufficient_balance" || code == "credit_balance_too_low" || code == "billing_hard_limit_reached":
 		return GatewayFailure{Class: "account_quota", Switch: true, ExcludeProvider: true}
 	case status == 401 || status == 403 || code == "invalid_api_key" || code == "authentication_error":
 		return GatewayFailure{Class: "credentials", Switch: true, ExcludeProvider: true}
-	case status == 404 && (code == "model_not_found" || code == "model_not_exist" || code == "not_found_error"):
+	case status == 404 && (code == "model_not_found" || code == "model_not_exist" || code == "not_found_error" || strings.HasPrefix(code, "model '") && strings.HasSuffix(code, "' not found") || strings.HasPrefix(code, "model \"") && strings.HasSuffix(code, "\" not found")):
 		return GatewayFailure{Class: "model_not_found", Switch: true}
 	case status == 429 || code == "rate_limit_exceeded":
 		return GatewayFailure{Class: "rate_limited", Switch: true}
