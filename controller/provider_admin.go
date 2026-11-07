@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -45,13 +46,49 @@ type providerView struct {
 func readableProvider(provider *model.Provider) providerView {
 	view := providerView{
 		ID: provider.Id, Type: provider.Type, Name: provider.Name, Status: provider.Status,
-		BaseURL: provider.BaseURL, Balance: provider.Balance,
+		BaseURL: readableProviderURL(provider.BaseURL), Balance: provider.Balance,
 		BalanceUpdatedTime: provider.BalanceUpdatedTime, CreatedTime: provider.CreatedTime, Remark: provider.Remark,
 	}
 	view.Info.IsMultiKey = provider.ProviderInfo.IsMultiKey
 	view.Info.MultiKeySize = provider.ProviderInfo.MultiKeySize
 	view.Info.MultiKeyMode = provider.ProviderInfo.MultiKeyMode
 	return view
+}
+
+const (
+	providerURLRedaction     = "REDACTED"
+	providerURLRedactedQuery = "__redacted__"
+)
+
+// readableProviderURL retains the endpoint but hides opaque URL credentials.
+// The public marker also distinguishes a readback from an explicit replacement.
+func readableProviderURL(raw *string) *string {
+	if raw == nil || *raw == "" {
+		return raw
+	}
+	endpoint, err := url.Parse(*raw)
+	if err != nil || endpoint.Hostname() == "" || endpoint.Scheme == "" {
+		redacted := "https://redacted.invalid/"
+		return &redacted
+	}
+	changed := false
+	if endpoint.User != nil {
+		endpoint.User = url.UserPassword(providerURLRedaction, providerURLRedaction)
+		changed = true
+	}
+	if endpoint.RawQuery != "" {
+		endpoint.RawQuery = providerURLRedactedQuery + "=1"
+		changed = true
+	}
+	if endpoint.Fragment != "" {
+		endpoint.Fragment, endpoint.RawFragment = providerURLRedaction, ""
+		changed = true
+	}
+	if !changed {
+		return raw
+	}
+	redacted := endpoint.String()
+	return &redacted
 }
 
 // providerKeyView is the state of one key of a multi-key Provider.
@@ -276,6 +313,32 @@ func UpdateProvider(c *gin.Context) {
 	if err != nil {
 		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
 		return
+	}
+	if rawURL, provided := fields["base_url"]; provided {
+		var replacement *string
+		if err := common.Unmarshal(rawURL, &replacement); err != nil {
+			common.ApiErrorStatus(c, http.StatusBadRequest, err)
+			return
+		}
+		visible := readableProviderURL(candidate.BaseURL)
+		if replacement != nil && visible != nil && candidate.BaseURL != nil && *visible != *candidate.BaseURL && *replacement == *visible {
+			delete(fields, "base_url")
+		} else if replacement != nil && *replacement != "" {
+			endpoint, err := url.Parse(*replacement)
+			if err != nil {
+				common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Enter the full base URL to replace the hidden credentials"))
+				return
+			}
+			incomplete := endpoint.Query().Has(providerURLRedactedQuery) || endpoint.Fragment == providerURLRedaction
+			if endpoint.User != nil {
+				password, _ := endpoint.User.Password()
+				incomplete = incomplete || endpoint.User.Username() == providerURLRedaction || password == providerURLRedaction
+			}
+			if incomplete {
+				common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Enter the full base URL to replace the hidden credentials"))
+				return
+			}
+		}
 	}
 	patch, err := common.Marshal(fields)
 	if err != nil {

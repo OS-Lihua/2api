@@ -2373,6 +2373,7 @@
     "Enter the complete URL, supports": "輸入完整的 URL，支援",
     "Enter the Coze agent ID": "輸入 Coze 代理 ID",
     "Enter the Discovery URL or Issuer URL first": "請先填寫 Discovery URL 或 Issuer URL",
+    "Enter the full base URL to replace the hidden credentials": "請輸入完整網址以取代隱藏的憑證",
     "Enter the full URL of your Gotify server": "輸入您的 Gotify 伺服器的完整 URL",
     "Enter the key; one key per line": "輸入金鑰，每行一個",
     "Enter the knowledge base ID": "輸入知識庫 ID",

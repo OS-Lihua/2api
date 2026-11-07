@@ -94,6 +94,91 @@ func storedProvider(t *testing.T, id int) *model.Provider {
 	return provider
 }
 
+func TestProviderAdminAPIKeepsURLCredentialsWriteOnly(t *testing.T) {
+	engine := newProviderAdminEngine(t)
+	userSecret, passwordSecret := "url-user-fixture", "srlpzvnhm-ysxwzq"
+	querySecret, fragmentSecret := "url-query-fixture", "url-fragment-fixture"
+	baseURL := "https://" + userSecret + ":" + passwordSecret + "@upstream.example/v1?api_key=" + querySecret + "&region=west#" + fragmentSecret
+	body, err := common.Marshal(map[string]any{"provider": map[string]any{
+		"type": constant.ChannelTypeOpenAI, "name": "credential URL", "key": providerKeyA, "base_url": baseURL,
+	}})
+	require.NoError(t, err)
+	created := callProviderAPI(t, engine, http.MethodPost, "", string(body))
+	require.True(t, created.Success, created.Message)
+	id := int(created.Data["ids"].([]any)[0].(float64))
+	path := "/" + common.Interface2String(id)
+	secrets := []string{userSecret, passwordSecret, querySecret, fragmentSecret}
+
+	for _, request := range []struct{ method, endpoint, body string }{
+		{http.MethodGet, path, ""},
+		{http.MethodGet, "?keyword=credential", ""},
+		{http.MethodPatch, path, `{"name":"credential URL renamed"}`},
+		{http.MethodPost, path + "/disable", ""},
+		{http.MethodPost, path + "/enable", ""},
+	} {
+		reply := callProviderAPIStatus(t, engine, http.StatusOK, request.method, request.endpoint, request.body, secrets...)
+		require.True(t, reply.Success, reply.Message)
+	}
+	assert.Equal(t, baseURL, *storedProvider(t, id).BaseURL)
+}
+
+func TestProviderAdminAPIPreservesURLReadbackOnUpdate(t *testing.T) {
+	for _, tc := range []struct {
+		name, baseURL string
+		hidden        bool
+	}{
+		{"userinfo", "https://fixture-account:fixture-value@upstream.example/v1", true},
+		{"query", "https://upstream.example/v1?custom_auth=fixture-value", true},
+		{"fragment", "https://upstream.example/v1#fixture-value", true},
+		{"legacy malformed", "https://fixture-account:fixture-value@invalid[", true},
+		{"public HTTP", "https://upstream.example/v1", false},
+		{"public WebSocket", "wss://upstream.example/v1", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine := newProviderAdminEngine(t)
+			baseURL := tc.baseURL
+			provider := &model.Provider{Type: constant.ChannelTypeOpenAI, Name: "saved endpoint", Key: providerKeyA, BaseURL: &baseURL}
+			require.NoError(t, provider.Insert())
+			path := "/" + common.Interface2String(provider.Id)
+			view := callProviderAPI(t, engine, http.MethodGet, path, "")
+			if tc.hidden {
+				assert.NotEqual(t, baseURL, view.Data["base_url"])
+			} else {
+				assert.Equal(t, baseURL, view.Data["base_url"])
+			}
+			body, err := common.Marshal(map[string]any{"name": "renamed endpoint", "base_url": view.Data["base_url"]})
+			require.NoError(t, err)
+			updated := callProviderAPI(t, engine, http.MethodPatch, path, string(body))
+			require.True(t, updated.Success, updated.Message)
+			assert.Equal(t, "renamed endpoint", updated.Data["name"])
+			assert.Equal(t, baseURL, *storedProvider(t, provider.Id).BaseURL)
+		})
+	}
+}
+
+func TestProviderAdminAPIRequiresCompleteHiddenURLReplacement(t *testing.T) {
+	engine := newProviderAdminEngine(t)
+	baseURL := "https://fixture-account:hkgapogh-msirj@upstream.example/v1?api_key=fixture-value#fixture-fragment"
+	provider := &model.Provider{Type: constant.ChannelTypeOpenAI, Name: "saved endpoint", Key: providerKeyA, BaseURL: &baseURL}
+	require.NoError(t, provider.Insert())
+	path := "/" + common.Interface2String(provider.Id)
+	view := callProviderAPI(t, engine, http.MethodGet, path, "")
+	partial := strings.Replace(view.Data["base_url"].(string), "upstream.example", "replacement.example", 1)
+	body, err := common.Marshal(map[string]any{"base_url": partial})
+	require.NoError(t, err)
+	rejected := callProviderAPIStatus(t, engine, http.StatusBadRequest, http.MethodPatch, path, string(body))
+	assert.False(t, rejected.Success)
+	assert.Equal(t, baseURL, *storedProvider(t, provider.Id).BaseURL)
+
+	replaced := callProviderAPI(t, engine, http.MethodPatch, path, `{"base_url":"https://replacement.example/v2"}`)
+	require.True(t, replaced.Success, replaced.Message)
+	assert.Equal(t, "https://replacement.example/v2", replaced.Data["base_url"])
+	assert.Equal(t, "https://replacement.example/v2", *storedProvider(t, provider.Id).BaseURL)
+	cleared := callProviderAPI(t, engine, http.MethodPatch, path, `{"base_url":""}`)
+	require.True(t, cleared.Success, cleared.Message)
+	assert.Empty(t, *storedProvider(t, provider.Id).BaseURL)
+}
+
 func TestProviderAdminAPIManagesProviderWithWriteOnlyKeys(t *testing.T) {
 	engine := newProviderAdminEngine(t)
 
