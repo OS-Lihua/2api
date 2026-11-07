@@ -26,6 +26,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	bedrockruntimeTypes "github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
+	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/auth/bearer"
 )
 
@@ -52,12 +53,19 @@ func newAwsInvokeError(requestContext context.Context, err error, operation stri
 	if requestContext.Err() != nil {
 		options = append(options, types.ErrOptionWithSkipRetry())
 	}
-	return types.NewOpenAIError(
+	rejection := types.NewOpenAIError(
 		errors.Wrap(err, operation),
 		types.ErrorCodeAwsInvokeError,
 		getAwsErrorStatusCode(err),
 		options...,
 	)
+	var upstream smithy.APIError
+	if errors.As(err, &upstream) {
+		failure := rejection.ToOpenAIError()
+		failure.Code = upstream.ErrorCode()
+		rejection.RelayError = failure
+	}
+	return rejection
 }
 
 func newAwsClient(c *gin.Context, info *relaycommon.RelayInfo) (*bedrockruntime.Client, error) {

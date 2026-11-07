@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -83,9 +84,16 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 		parent = c.Request.Context()
 	}
 	ctx, cancel := newAwsInvokeContext(parent)
+	var invokeOptions []func(*bedrockruntime.Options)
+	if c != nil {
+		if _, tracked := c.Get(string(constant.ContextKeyResponseFacts)); tracked {
+			// The gateway owns every actual send, including SDK transports.
+			invokeOptions = append(invokeOptions, func(options *bedrockruntime.Options) { options.RetryMaxAttempts = 1 })
+		}
+	}
 	if !request.IsStream || nova {
 		defer cancel()
-		output, err := client.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{ModelId: aws.String(modelID), ContentType: aws.String("application/json"), Accept: aws.String("application/json"), Body: payload})
+		output, err := client.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{ModelId: aws.String(modelID), ContentType: aws.String("application/json"), Accept: aws.String("application/json"), Body: payload}, invokeOptions...)
 		if err != nil {
 			return nil, newAwsInvokeError(parent, err, "InvokeModel")
 		}
@@ -93,7 +101,7 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 		response.Header.Set("Content-Type", "application/json")
 		return response, nil
 	}
-	output, err := client.InvokeModelWithResponseStream(ctx, &bedrockruntime.InvokeModelWithResponseStreamInput{ModelId: aws.String(modelID), ContentType: aws.String("application/json"), Accept: aws.String("application/json"), Body: payload})
+	output, err := client.InvokeModelWithResponseStream(ctx, &bedrockruntime.InvokeModelWithResponseStreamInput{ModelId: aws.String(modelID), ContentType: aws.String("application/json"), Accept: aws.String("application/json"), Body: payload}, invokeOptions...)
 	if err != nil {
 		cancel()
 		return nil, newAwsInvokeError(parent, err, "InvokeModelWithResponseStream")

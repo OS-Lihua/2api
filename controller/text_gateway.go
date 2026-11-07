@@ -319,7 +319,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	parent := c.Request
 	defer func() { c.Request = parent }()
 	var upstreamStatus int
-	var upstreamCode string
+	var upstreamCode, upstreamType string
 	var transportFailed bool
 	var attempt *model.GatewayAttempt
 	var usage *dto.Usage
@@ -336,13 +336,20 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			if budget.TimedOut() && parent.Context().Err() == nil {
 				attempt.Status = "failed"
 			}
+			outcome := info.StreamStatus.OutcomeSnapshot()
 			if upstreamCode == "" {
 				upstreamCode = info.ResponseFacts.UpstreamErrorCode
+			}
+			if upstreamType == "" {
+				upstreamType = outcome.ErrorType
+			}
+			if outcome.ErrorStatus >= 400 {
+				upstreamStatus = outcome.ErrorStatus
 			}
 			if info.PerformanceBusinessRejection {
 				upstreamCode = "content_filter"
 			}
-			failure := service.ClassifyGatewayFailure(upstreamStatus, upstreamCode, transportFailed, budget.TimedOut(), parent.Context().Err() != nil, info.ResponseFacts.DownstreamWriteFailed)
+			failure := service.ClassifyGatewayFailure(upstreamStatus, upstreamCode, transportFailed, budget.TimedOut(), parent.Context().Err() != nil, info.ResponseFacts.DownstreamWriteFailed, upstreamType)
 			if attempt.Status == "success" {
 				failure = service.GatewayFailure{}
 			}
@@ -469,6 +476,17 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	if err != nil {
 		transportFailed = true
 		attemptErr = types.NewError(err, types.ErrorCodeDoRequestFailed)
+		var rejection *types.NewAPIError
+		if errors.As(err, &rejection) && rejection.GetErrorCode() != types.ErrorCodeDoRequestFailed && rejection.StatusCode >= 400 && (!budget.TimedOut() || rejection.StatusCode != 500) {
+			attemptErr = rejection
+			upstreamStatus, transportFailed = rejection.StatusCode, false
+			failure := rejection.ToOpenAIError()
+			upstreamCode, _ = failure.Code.(string)
+			if upstreamCode == "" {
+				upstreamCode = string(rejection.GetErrorCode())
+			}
+			upstreamType = failure.Type
+		}
 		run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
 		return
 	}
@@ -492,6 +510,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			case string:
 				upstreamCode = failure
 			case map[string]any:
+				upstreamType, _ = failure["type"].(string)
 				upstreamCode, _ = failure["code"].(string)
 				if upstreamCode == "" {
 					upstreamCode, _ = failure["type"].(string)
@@ -520,6 +539,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	attemptErr = responseErr
 	if responseErr != nil {
 		apiError := responseErr.ToOpenAIError()
+		upstreamType = apiError.Type
 		upstreamCode, _ = apiError.Code.(string)
 		if upstreamCode == "" {
 			upstreamCode = apiError.Type

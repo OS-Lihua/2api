@@ -263,9 +263,10 @@ func (a *ChannelAdaptor) DoPreparedRequest(c *gin.Context, info *relaycommon.Rel
 func providerRequestError(err error) *types.NewAPIError {
 	var apiErr *types.NewAPIError
 	if errors.As(err, &apiErr) {
+		failure := apiErr.ToOpenAIError()
 		redacted := *apiErr
 		redacted.Err = errors.New("upstream request failed")
-		redacted.RelayError = nil
+		redacted.RelayError = types.OpenAIError{Message: "upstream request failed", Type: failure.Type, Code: failure.Code}
 		redacted.Metadata = nil
 		return &redacted
 	}

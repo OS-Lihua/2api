@@ -202,8 +202,9 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 				}
 				if common.UnmarshalJsonStr(data, &envelope) == nil && len(envelope.Error) > 0 && strings.TrimSpace(string(envelope.Error)) != "null" {
 					var failure struct {
-						Code any    `json:"code"`
-						Type string `json:"type"`
+						Code   any    `json:"code"`
+						Type   string `json:"type"`
+						Status int    `json:"status"`
 					}
 					_ = common.Unmarshal(envelope.Error, &failure)
 					info.ResponseFacts.UpstreamErrorCode, _ = failure.Code.(string)
@@ -213,6 +214,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 					if info.ResponseFacts.UpstreamErrorCode == "" {
 						info.ResponseFacts.UpstreamErrorCode = "upstream_error"
 					}
+					info.StreamStatus.MarkFailed(info.ResponseFacts.UpstreamErrorCode, failure.Type, failure.Status)
 					lastStreamData = ""
 					sr.Stop(errors.New("upstream stream failed"))
 					return
