@@ -17,24 +17,24 @@ import (
 // instances and each run is recorded as one task row. Call this before
 // service.StartSystemTaskRunner.
 func RegisterScheduledSystemTasks() {
-	service.RegisterSystemTaskHandler(channelTestHandler{})
+	service.RegisterSystemTaskHandler(providerTestHandler{})
 	service.RegisterSystemTaskHandler(modelUpdateHandler{})
 	service.RegisterSystemTaskHandler(midjourneyPollHandler{})
 	service.RegisterSystemTaskHandler(asyncTaskPollHandler{})
 }
 
-// channelTestHandler runs the scheduled "test all channels" job. Enablement and
+// providerTestHandler runs the scheduled "test all channels" job. Enablement and
 // cadence still come from the monitor settings; only the execution path moved
 // into the system task runner.
-type channelTestHandler struct{}
+type providerTestHandler struct{}
 
-func (channelTestHandler) Type() string { return model.SystemTaskTypeChannelTest }
+func (providerTestHandler) Type() string { return model.SystemTaskTypeChannelTest }
 
-func (channelTestHandler) Enabled() bool {
+func (providerTestHandler) Enabled() bool {
 	return operation_setting.GetMonitorSetting().AutoTestChannelEnabled
 }
 
-func (channelTestHandler) Interval() time.Duration {
+func (providerTestHandler) Interval() time.Duration {
 	minutes := operation_setting.GetMonitorSetting().AutoTestChannelMinutes
 	if minutes <= 0 {
 		minutes = 10
@@ -42,20 +42,20 @@ func (channelTestHandler) Interval() time.Duration {
 	return time.Duration(minutes * float64(time.Minute))
 }
 
-func (channelTestHandler) NewPayload() any { return nil }
+func (providerTestHandler) NewPayload() any { return nil }
 
-// channelTestTaskPayload controls one channel_test run. A nil/empty payload is a
+// providerTestTaskPayload controls one channel_test run. A nil/empty payload is a
 // scheduled run, which uses the configured monitor ChannelTestMode and does not
 // notify. A manual "test all channels" trigger sets Mode=scheduled_all and
 // Notify=true to reproduce the legacy manual behavior (test every channel and
 // notify root on completion).
-type channelTestTaskPayload struct {
+type providerTestTaskPayload struct {
 	Mode   string `json:"mode,omitempty"`
 	Notify bool   `json:"notify,omitempty"`
 }
 
-func (channelTestHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
-	payload := channelTestTaskPayload{}
+func (providerTestHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	payload := providerTestTaskPayload{}
 	if err := task.DecodePayload(&payload); err != nil {
 		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
 		return

@@ -23,7 +23,7 @@ func affinityTestKeys(t *testing.T) (string, string) {
 func buildChannelAffinityStatsContextForTest(ruleName, usingGroup, keyFP string) *gin.Context {
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
-	setChannelAffinityContext(ctx, channelAffinityMeta{
+	setChannelAffinityContext(ctx, providerAffinityMeta{
 		CacheKey:       fmt.Sprintf("test:%s:%s:%s", ruleName, usingGroup, keyFP),
 		TTLSeconds:     600,
 		RuleName:       ruleName,

@@ -908,9 +908,9 @@ func TestChannel(c *gin.Context) {
 	})
 }
 
-// channelTestSummary records the outcome of one channel test cycle so the
+// providerTestSummary records the outcome of one channel test cycle so the
 // system task can persist a per-run result for history.
-type channelTestSummary struct {
+type providerTestSummary struct {
 	Tested    int `json:"tested"`
 	Succeeded int `json:"succeeded"`
 	Failed    int `json:"failed"`
@@ -918,8 +918,8 @@ type channelTestSummary struct {
 	Enabled   int `json:"enabled"`
 }
 
-func testChannelForHealthCheck(ctx context.Context, channel *model.Provider, testUserID int, allowDisable bool, disableThreshold int64) channelTestSummary {
-	summary := channelTestSummary{}
+func testChannelForHealthCheck(ctx context.Context, channel *model.Provider, testUserID int, allowDisable bool, disableThreshold int64) providerTestSummary {
+	summary := providerTestSummary{}
 	isChannelEnabled := channel.Status == common.ChannelStatusEnabled
 	tik := time.Now()
 	result := testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel))
@@ -976,9 +976,9 @@ func runChannelTestWorkers(
 	ctx context.Context,
 	channels []*model.Provider,
 	concurrency int,
-	run func(context.Context, *model.Provider) channelTestSummary,
+	run func(context.Context, *model.Provider) providerTestSummary,
 	report func(processed, total int),
-) channelTestSummary {
+) providerTestSummary {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -987,12 +987,12 @@ func runChannelTestWorkers(
 		report(0, total)
 	}
 	if total == 0 {
-		return channelTestSummary{}
+		return providerTestSummary{}
 	}
 
 	workerCount := min(operation_setting.NormalizeChannelTestConcurrency(concurrency), total)
 	jobs := make(chan *model.Provider)
-	results := make(chan channelTestSummary)
+	results := make(chan providerTestSummary)
 
 	var workers sync.WaitGroup
 	workers.Add(workerCount)
@@ -1011,7 +1011,7 @@ func runChannelTestWorkers(
 						return
 					}
 
-					result := channelTestSummary{}
+					result := providerTestSummary{}
 					if channel != nil && channel.Status != common.ChannelStatusManuallyDisabled {
 						result = run(ctx, channel)
 					}
@@ -1046,7 +1046,7 @@ func runChannelTestWorkers(
 		close(results)
 	}()
 
-	summary := channelTestSummary{}
+	summary := providerTestSummary{}
 	processed := 0
 	for result := range results {
 		summary.Tested += result.Tested
@@ -1065,7 +1065,7 @@ func runChannelTestWorkers(
 // performChannelTests runs channel health checks with the configured bounded
 // concurrency and honors cancellation when a system-task runner loses its
 // lease.
-func performChannelTests(ctx context.Context, channels []*model.Provider, testUserID int, allowDisable bool, concurrency int, report func(processed, total int)) channelTestSummary {
+func performChannelTests(ctx context.Context, channels []*model.Provider, testUserID int, allowDisable bool, concurrency int, report func(processed, total int)) providerTestSummary {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1077,7 +1077,7 @@ func performChannelTests(ctx context.Context, channels []*model.Provider, testUs
 		ctx,
 		channels,
 		concurrency,
-		func(ctx context.Context, channel *model.Provider) channelTestSummary {
+		func(ctx context.Context, channel *model.Provider) providerTestSummary {
 			return testChannelForHealthCheck(ctx, channel, testUserID, allowDisable, disableThreshold)
 		},
 		report,
@@ -1093,14 +1093,14 @@ func performChannelTests(ctx context.Context, channels []*model.Provider, testUs
 // is set, the administrators who receive channel notices are notified on
 // completion. Cross-instance execution is guarded by the system task per-type
 // lock, so no process-local guard is needed.
-func runChannelTestTask(ctx context.Context, mode string, notify bool, report func(processed, total int)) (channelTestSummary, error) {
+func runChannelTestTask(ctx context.Context, mode string, notify bool, report func(processed, total int)) (providerTestSummary, error) {
 	testUserID, err := resolveChannelTestUserID(nil)
 	if err != nil {
-		return channelTestSummary{}, err
+		return providerTestSummary{}, err
 	}
 	channels, err := model.GetAllProviders(0, 0, true, false)
 	if err != nil {
-		return channelTestSummary{}, err
+		return providerTestSummary{}, err
 	}
 	if strings.TrimSpace(mode) == "" {
 		mode = operation_setting.GetMonitorSetting().ChannelTestMode
@@ -1138,7 +1138,7 @@ func selectChannelsForAutomaticTest(channels []*model.Provider, mode string) []*
 // test loop inline. If any channel_test task is already active, the manual run is
 // rejected so the caller does not mistake a scheduled run for this manual one.
 func TestAllChannels(c *gin.Context) {
-	task, created, err := service.EnqueueSystemTask(model.SystemTaskTypeChannelTest, channelTestTaskPayload{
+	task, created, err := service.EnqueueSystemTask(model.SystemTaskTypeChannelTest, providerTestTaskPayload{
 		Mode:   operation_setting.ChannelTestModeScheduledAll,
 		Notify: true,
 	})

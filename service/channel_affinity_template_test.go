@@ -20,7 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func buildChannelAffinityTemplateContextForTest(meta channelAffinityMeta) *gin.Context {
+func buildChannelAffinityTemplateContextForTest(meta providerAffinityMeta) *gin.Context {
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
 	setChannelAffinityContext(ctx, meta)
@@ -28,7 +28,7 @@ func buildChannelAffinityTemplateContextForTest(meta channelAffinityMeta) *gin.C
 }
 
 func TestApplyChannelAffinityOverrideTemplate_NoTemplate(t *testing.T) {
-	ctx := buildChannelAffinityTemplateContextForTest(channelAffinityMeta{
+	ctx := buildChannelAffinityTemplateContextForTest(providerAffinityMeta{
 		RuleName: "rule-no-template",
 	})
 	base := map[string]any{
@@ -41,7 +41,7 @@ func TestApplyChannelAffinityOverrideTemplate_NoTemplate(t *testing.T) {
 }
 
 func TestApplyChannelAffinityOverrideTemplate_MergeTemplate(t *testing.T) {
-	ctx := buildChannelAffinityTemplateContextForTest(channelAffinityMeta{
+	ctx := buildChannelAffinityTemplateContextForTest(providerAffinityMeta{
 		RuleName: "rule-with-template",
 		ParamTemplate: map[string]any{
 			"temperature": 0.2,
@@ -81,7 +81,7 @@ func TestApplyChannelAffinityOverrideTemplate_MergeTemplate(t *testing.T) {
 }
 
 func TestApplyChannelAffinityOverrideTemplate_MergeOperations(t *testing.T) {
-	ctx := buildChannelAffinityTemplateContextForTest(channelAffinityMeta{
+	ctx := buildChannelAffinityTemplateContextForTest(providerAffinityMeta{
 		RuleName: "rule-with-ops-template",
 		ParamTemplate: map[string]any{
 			"operations": []map[string]any{
@@ -138,7 +138,7 @@ func TestShouldSkipRetryAfterChannelAffinityFailure(t *testing.T) {
 		{
 			name: "explicit skip retry flag in context",
 			ctx: func() *gin.Context {
-				ctx := buildChannelAffinityTemplateContextForTest(channelAffinityMeta{
+				ctx := buildChannelAffinityTemplateContextForTest(providerAffinityMeta{
 					RuleName:   "rule-explicit-flag",
 					SkipRetry:  false,
 					UsingGroup: "default",
@@ -152,7 +152,7 @@ func TestShouldSkipRetryAfterChannelAffinityFailure(t *testing.T) {
 		{
 			name: "fallback to matched rule meta",
 			ctx: func() *gin.Context {
-				return buildChannelAffinityTemplateContextForTest(channelAffinityMeta{
+				return buildChannelAffinityTemplateContextForTest(providerAffinityMeta{
 					RuleName:   "rule-skip-retry",
 					SkipRetry:  true,
 					UsingGroup: "default",
@@ -164,7 +164,7 @@ func TestShouldSkipRetryAfterChannelAffinityFailure(t *testing.T) {
 		{
 			name: "no flag and no skip retry meta",
 			ctx: func() *gin.Context {
-				return buildChannelAffinityTemplateContextForTest(channelAffinityMeta{
+				return buildChannelAffinityTemplateContextForTest(providerAffinityMeta{
 					RuleName:   "rule-no-skip-retry",
 					SkipRetry:  false,
 					UsingGroup: "default",
@@ -253,7 +253,7 @@ func TestClearCurrentChannelAffinityCache(t *testing.T) {
 		_, _ = cache.DeleteMany([]string{cacheKeySuffix})
 	})
 
-	ctx := buildChannelAffinityTemplateContextForTest(channelAffinityMeta{
+	ctx := buildChannelAffinityTemplateContextForTest(providerAffinityMeta{
 		CacheKey:   cacheKeyFull,
 		TTLSeconds: 60,
 		RuleName:   "codex cli trace",

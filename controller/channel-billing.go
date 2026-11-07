@@ -55,7 +55,7 @@ type OpenAICreditGrants struct {
 
 const maxAdvancedCustomBalanceResponseBytes = 256 << 10
 
-type channelBalanceResult struct {
+type providerBalanceResult struct {
 	Balance     float64
 	RawResponse string
 }
@@ -535,7 +535,7 @@ func updateChannelNewAPIBalance(channel *model.Provider) (float64, error) {
 	return balance, nil
 }
 
-func fetchAdvancedCustomBalance(channel *model.Provider) (channelBalanceResult, error) {
+func fetchAdvancedCustomBalance(channel *model.Provider) (providerBalanceResult, error) {
 	key := strings.TrimSpace(channel.Key)
 	info := &relaycommon.RelayInfo{
 		RelayFormat:    types.RelayFormatOpenAI,
@@ -550,15 +550,15 @@ func fetchAdvancedCustomBalance(channel *model.Provider) (channelBalanceResult, 
 	}
 	requestURL, headers, err := (&advancedcustom.Adaptor{}).BuildBalanceRequest(info)
 	if err != nil {
-		return channelBalanceResult{}, sanitizeFetchModelsError(err, key)
+		return providerBalanceResult{}, sanitizeFetchModelsError(err, key)
 	}
 	if err := applyFetchModelsHeaderOverrides(channel, key, headers); err != nil {
-		return channelBalanceResult{}, sanitizeFetchModelsError(err, key)
+		return providerBalanceResult{}, sanitizeFetchModelsError(err, key)
 	}
 
 	request, err := http.NewRequest(http.MethodGet, requestURL, nil)
 	if err != nil {
-		return channelBalanceResult{}, sanitizeFetchModelsError(err, key)
+		return providerBalanceResult{}, sanitizeFetchModelsError(err, key)
 	}
 	for name, values := range headers {
 		for _, value := range values {
@@ -571,27 +571,27 @@ func fetchAdvancedCustomBalance(channel *model.Provider) (channelBalanceResult, 
 	setting := channel.GetSetting()
 	client, err := service.GetHttpClientWithProxySettings(setting.Proxy, setting)
 	if err != nil {
-		return channelBalanceResult{}, sanitizeFetchModelsError(err, key)
+		return providerBalanceResult{}, sanitizeFetchModelsError(err, key)
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return channelBalanceResult{}, sanitizeAdvancedCustomRequestError(err, key, requestURL)
+		return providerBalanceResult{}, sanitizeAdvancedCustomRequestError(err, key, requestURL)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return channelBalanceResult{}, fmt.Errorf("status code: %d", response.StatusCode)
+		return providerBalanceResult{}, fmt.Errorf("status code: %d", response.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxAdvancedCustomBalanceResponseBytes+1))
 	if err != nil {
-		return channelBalanceResult{}, sanitizeAdvancedCustomRequestError(err, key, requestURL)
+		return providerBalanceResult{}, sanitizeAdvancedCustomRequestError(err, key, requestURL)
 	}
 	if len(body) > maxAdvancedCustomBalanceResponseBytes {
-		return channelBalanceResult{}, fmt.Errorf("balance response exceeds %d bytes", maxAdvancedCustomBalanceResponseBytes)
+		return providerBalanceResult{}, fmt.Errorf("balance response exceeds %d bytes", maxAdvancedCustomBalanceResponseBytes)
 	}
 
 	var validated json.RawMessage
 	if err := common.Unmarshal(body, &validated); err != nil {
-		return channelBalanceResult{}, fmt.Errorf("invalid balance JSON response: %w", err)
+		return providerBalanceResult{}, fmt.Errorf("invalid balance JSON response: %w", err)
 	}
 	if common.GetJsonType(validated) == "object" {
 		var creditSummary struct {
@@ -599,7 +599,7 @@ func fetchAdvancedCustomBalance(channel *model.Provider) (channelBalanceResult, 
 			TotalAvailable json.RawMessage `json:"total_available"`
 		}
 		if err := common.Unmarshal(body, &creditSummary); err != nil {
-			return channelBalanceResult{}, fmt.Errorf("invalid balance JSON response: %w", err)
+			return providerBalanceResult{}, fmt.Errorf("invalid balance JSON response: %w", err)
 		}
 		if creditSummary.Object == "credit_summary" &&
 			common.GetJsonType(creditSummary.TotalAvailable) == "number" {
@@ -609,24 +609,24 @@ func fetchAdvancedCustomBalance(channel *model.Provider) (channelBalanceResult, 
 				!math.IsNaN(balance) &&
 				!math.IsInf(balance, 0) {
 				channel.UpdateBalance(balance)
-				return channelBalanceResult{Balance: balance}, nil
+				return providerBalanceResult{Balance: balance}, nil
 			}
 		}
 	}
 
 	formatted, err := common.IndentJson(body)
 	if err != nil {
-		return channelBalanceResult{}, fmt.Errorf("invalid balance JSON response: %w", err)
+		return providerBalanceResult{}, fmt.Errorf("invalid balance JSON response: %w", err)
 	}
-	return channelBalanceResult{RawResponse: string(formatted)}, nil
+	return providerBalanceResult{RawResponse: string(formatted)}, nil
 }
 
-func updateChannelBalance(channel *model.Provider) (channelBalanceResult, error) {
+func updateChannelBalance(channel *model.Provider) (providerBalanceResult, error) {
 	if channel.Type == constant.ChannelTypeAdvancedCustom {
 		return fetchAdvancedCustomBalance(channel)
 	}
 	balance, err := updateStandardChannelBalance(channel)
-	return channelBalanceResult{Balance: balance}, err
+	return providerBalanceResult{Balance: balance}, err
 }
 
 func updateStandardChannelBalance(channel *model.Provider) (float64, error) {

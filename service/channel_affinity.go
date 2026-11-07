@@ -42,7 +42,7 @@ var (
 	channelAffinityRegexCache sync.Map // map[string]*regexp.Regexp
 )
 
-type channelAffinityMeta struct {
+type providerAffinityMeta struct {
 	CacheKey       string
 	TTLSeconds     int
 	RuleName       string
@@ -351,7 +351,7 @@ func buildChannelAffinityCacheKeySuffix(rule operation_setting.ProviderAffinityR
 	return strings.Join(parts, ":")
 }
 
-func setChannelAffinityContext(c *gin.Context, meta channelAffinityMeta) {
+func setChannelAffinityContext(c *gin.Context, meta providerAffinityMeta) {
 	c.Set(ginKeyChannelAffinityCacheKey, meta.CacheKey)
 	c.Set(ginKeyChannelAffinityTTLSeconds, meta.TTLSeconds)
 	c.Set(ginKeyChannelAffinityMeta, meta)
@@ -374,14 +374,14 @@ func getChannelAffinityContext(c *gin.Context) (string, int, bool) {
 	return key, ttlSeconds, true
 }
 
-func getChannelAffinityMeta(c *gin.Context) (channelAffinityMeta, bool) {
+func getChannelAffinityMeta(c *gin.Context) (providerAffinityMeta, bool) {
 	anyMeta, ok := c.Get(ginKeyChannelAffinityMeta)
 	if !ok {
-		return channelAffinityMeta{}, false
+		return providerAffinityMeta{}, false
 	}
-	meta, ok := anyMeta.(channelAffinityMeta)
+	meta, ok := anyMeta.(providerAffinityMeta)
 	if !ok {
-		return channelAffinityMeta{}, false
+		return providerAffinityMeta{}, false
 	}
 	return meta, true
 }
@@ -494,7 +494,7 @@ func extractParamOperations(value any) ([]any, bool) {
 	}
 }
 
-func appendChannelAffinityTemplateAdminInfo(c *gin.Context, meta channelAffinityMeta) {
+func appendChannelAffinityTemplateAdminInfo(c *gin.Context, meta providerAffinityMeta) {
 	if c == nil {
 		return
 	}
@@ -596,7 +596,7 @@ func GetPreferredChannelByAffinity(c *gin.Context, modelName string, usingGroup 
 		cacheKeyFull := channelAffinityCacheNamespace + ":" + cacheKeySuffix
 		state.SessionMode, state.SessionModeSource = EffectiveSessionMode(setting, rule)
 		state.RuleName = rule.Name
-		setChannelAffinityContext(c, channelAffinityMeta{
+		setChannelAffinityContext(c, providerAffinityMeta{
 			CacheKey:       cacheKeyFull,
 			TTLSeconds:     ttlSeconds,
 			RuleName:       rule.Name,

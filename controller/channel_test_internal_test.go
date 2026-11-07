@@ -387,14 +387,14 @@ func TestRunChannelTestWorkersHonorsConfiguredConcurrency(t *testing.T) {
 	var active atomic.Int32
 	var maxActive atomic.Int32
 	progress := make([]int, 0, len(channels)+1)
-	summaryResult := make(chan channelTestSummary, 1)
+	summaryResult := make(chan providerTestSummary, 1)
 
 	go func() {
 		summaryResult <- runChannelTestWorkers(
 			context.Background(),
 			channels,
 			2,
-			func(_ context.Context, _ *model.Provider) channelTestSummary {
+			func(_ context.Context, _ *model.Provider) providerTestSummary {
 				current := active.Add(1)
 				defer active.Add(-1)
 				for {
@@ -405,7 +405,7 @@ func TestRunChannelTestWorkersHonorsConfiguredConcurrency(t *testing.T) {
 				}
 				started <- struct{}{}
 				<-release
-				return channelTestSummary{Tested: 1, Succeeded: 1}
+				return providerTestSummary{Tested: 1, Succeeded: 1}
 			},
 			func(processed, _ int) {
 				progress = append(progress, processed)
@@ -425,7 +425,7 @@ func TestRunChannelTestWorkersHonorsConfiguredConcurrency(t *testing.T) {
 	summary := <-summaryResult
 
 	assert.Equal(t, int32(2), maxActive.Load())
-	assert.Equal(t, channelTestSummary{Tested: 4, Succeeded: 4}, summary)
+	assert.Equal(t, providerTestSummary{Tested: 4, Succeeded: 4}, summary)
 	assert.Equal(t, []int{0, 1, 2, 3, 4}, progress)
 }
 
@@ -443,17 +443,17 @@ func TestRunChannelTestWorkersStopsAfterCancellation(t *testing.T) {
 	}
 	started := make(chan struct{}, len(channels))
 	progress := make([]int, 0, 1)
-	summaryResult := make(chan channelTestSummary, 1)
+	summaryResult := make(chan providerTestSummary, 1)
 
 	go func() {
 		summaryResult <- runChannelTestWorkers(
 			ctx,
 			channels,
 			2,
-			func(ctx context.Context, _ *model.Provider) channelTestSummary {
+			func(ctx context.Context, _ *model.Provider) providerTestSummary {
 				started <- struct{}{}
 				<-ctx.Done()
-				return channelTestSummary{Tested: 1, Succeeded: 1}
+				return providerTestSummary{Tested: 1, Succeeded: 1}
 			},
 			func(processed, _ int) {
 				progress = append(progress, processed)
@@ -472,7 +472,7 @@ func TestRunChannelTestWorkersStopsAfterCancellation(t *testing.T) {
 		t.Fatal("started another channel test after cancellation")
 	default:
 	}
-	assert.Equal(t, channelTestSummary{Tested: 2, Succeeded: 2}, summary)
+	assert.Equal(t, providerTestSummary{Tested: 2, Succeeded: 2}, summary)
 	assert.Equal(t, []int{0}, progress)
 }
 
