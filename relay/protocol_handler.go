@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -18,6 +19,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
+	"golang.org/x/net/http/httpguts"
 )
 
 // ChannelAdaptor composes an account transport and an independently selected
@@ -225,6 +227,12 @@ func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayI
 		if err != nil || request.URL.Hostname() == "" {
 			return nil, errors.New("invalid upstream request URL")
 		}
+		if port := request.URL.Port(); port != "" {
+			number, err := strconv.Atoi(port)
+			if err != nil || number < 1 || number > 65535 {
+				return nil, errors.New("invalid upstream destination port")
+			}
+		}
 		request.URL.Scheme = strings.ToLower(request.URL.Scheme)
 		_, hasExecutor := a.provider.(channel.ProviderRequestExecutor)
 		sdkWebsocket := hasExecutor && (request.URL.Scheme == "ws" || request.URL.Scheme == "wss")
@@ -241,6 +249,19 @@ func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayI
 	}
 	if err := channel.ApplyHeaderOverride(info, c, request); err != nil {
 		return nil, errors.New("invalid provider header override")
+	}
+	for name, values := range request.Header {
+		if !httpguts.ValidHeaderFieldName(name) {
+			return nil, errors.New("invalid upstream header name")
+		}
+		for _, value := range values {
+			if !httpguts.ValidHeaderFieldValue(value) {
+				return nil, errors.New("invalid upstream header value")
+			}
+		}
+	}
+	if request.Header.Get("Host") != "" && !httpguts.ValidHostHeader(request.Host) {
+		return nil, errors.New("invalid upstream host override")
 	}
 	metadata.RequestHeaders = request.Header.Clone()
 	prepared := &PreparedChannelRequest{adaptor: a, request: request, metadata: metadata, body: requestBody}

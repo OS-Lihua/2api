@@ -611,19 +611,31 @@ func TestTextGatewayUntrackedNativeResponseIsRejectedBeforeSend(t *testing.T) {
 }
 
 func TestTextGatewaySDKPreparationDoesNotSpendAttempt(t *testing.T) {
-	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("invalid SDK credentials must not be sent") })
-	t.Setenv("GATEWAY_MAX_ATTEMPTS", "1")
-	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeAws).Error)
-	require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", "amazon.nova-lite-v1:0").Error)
-	addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
-	})
-	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
-	assert.Contains(t, response.Body.String(), "Recovered")
-	_, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
-	require.NoError(t, err)
-	assert.EqualValues(t, 1, total)
+	for _, test := range []struct {
+		name  string
+		parts []string
+	}{
+		{"missing separator", []string{"fake"}},
+		{"empty region", []string{"fake", ""}},
+		{"empty access key", []string{"", "secret", "us-east-1"}},
+		{"empty secret key", []string{"fake", "", "us-east-1"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("invalid SDK credentials must not be sent") })
+			t.Setenv("GATEWAY_MAX_ATTEMPTS", "1")
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeAws, "key": strings.Join(test.parts, "|")}).Error)
+			require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", "amazon.nova-lite-v1:0").Error)
+			addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+			})
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			assert.Contains(t, response.Body.String(), "Recovered")
+			_, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+			require.NoError(t, err)
+			assert.EqualValues(t, 1, total)
+		})
+	}
 }
 
 func TestTextGatewaySendContextUsesSharedBudgetsInsteadOfRelayDeadline(t *testing.T) {
@@ -1084,10 +1096,21 @@ func TestTextGatewayTotalBudgetFiveSecondBoundaryAndAttemptLimit(t *testing.T) {
 
 func TestTextGatewayPreparationFailureDoesNotSpendAttempts(t *testing.T) {
 	for _, test := range []struct {
-		name, url, proxy string
-		providerType     int
+		name, url, proxy, header string
+		providerType             int
 	}{
-		{name: "parameters"}, {name: "invalid escape", url: "http://%zz"}, {name: "unsupported scheme", url: "ftp://upstream.invalid"}, {name: "SDK HTTP fallback scheme", url: "ftp://upstream.invalid", providerType: constant.ChannelTypeVolcEngine}, {name: "missing scheme", url: "upstream.invalid"}, {name: "missing host", url: "http:///relative"}, {name: "invalid proxy", proxy: "ftp://proxy.invalid"},
+		{name: "parameters"},
+		{name: "invalid escape", url: "http://%zz"},
+		{name: "unsupported scheme", url: "ftp://upstream.invalid"},
+		{name: "SDK HTTP fallback scheme", url: "ftp://upstream.invalid", providerType: constant.ChannelTypeVolcEngine},
+		{name: "missing scheme", url: "upstream.invalid"},
+		{name: "missing host", url: "http:///relative"},
+		{name: "invalid proxy", proxy: "ftp://proxy.invalid"},
+		{name: "invalid header name", header: `{"Bad Header":"value"}`},
+		{name: "invalid header value", header: `{"X-Test":"value\r\nInjected: true"}`},
+		{name: "invalid host override", header: `{"Host":"bad host"}`},
+		{name: "invalid destination port", url: "http://127.0.0.1:65536"},
+		{name: "zero destination port", url: "http://127.0.0.1:0"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("invalid prepared candidate must not be sent") })
@@ -1100,6 +1123,8 @@ func TestTextGatewayPreparationFailureDoesNotSpendAttempts(t *testing.T) {
 				setting, err := common.Marshal(map[string]string{"proxy": test.proxy})
 				require.NoError(t, err)
 				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("setting", string(setting)).Error)
+			} else if test.header != "" {
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("header_override", test.header).Error)
 			} else {
 				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", `{"n":129}`).Error)
 			}

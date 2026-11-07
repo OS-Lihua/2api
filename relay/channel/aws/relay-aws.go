@@ -80,6 +80,11 @@ func (a *Provider) NewClient(metadata channel.ProviderMetadata) (*bedrockruntime
 	}
 
 	awsSecret := strings.Split(info.ApiKey, "|")
+	for _, part := range awsSecret {
+		if strings.TrimSpace(part) == "" {
+			return nil, errors.New("invalid aws secret key")
+		}
+	}
 	var client *bedrockruntime.Client
 	switch len(awsSecret) {
 	case 2:
