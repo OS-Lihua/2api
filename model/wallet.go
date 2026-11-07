@@ -132,7 +132,7 @@ type Wallet struct {
 // updates and deletes; a mistake is corrected by a reversal entry.
 type LedgerEntry struct {
 	Id          int64             `json:"id" gorm:"primaryKey"`
-	WalletId    int64             `json:"wallet_id" gorm:"not null;index"`
+	WalletId    int64             `json:"wallet_id" gorm:"not null"`
 	AccountType LedgerAccountType `json:"account_type" gorm:"type:varchar(32);not null"`
 	Type        LedgerEntryType   `json:"type" gorm:"type:varchar(32);not null;index"`
 	// Amount is the signed change in the wallet currency.
