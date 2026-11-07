@@ -149,6 +149,11 @@ export function useSidebarData(badges: SidebarBadges = {}): SidebarData {
             icon: Box,
           },
           {
+            title: t('Model offerings'),
+            url: '/model-offerings',
+            icon: Box,
+          },
+          {
             title: t('Users'),
             url: '/users',
             icon: Users,

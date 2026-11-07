@@ -21,7 +21,7 @@ import userEvent from '@testing-library/user-event'
 import { useState } from 'react'
 import { describe, expect, it } from 'vitest'
 
-import { MultiSelect } from '@/components/multi-select'
+import { MultiSelect, type Option } from '@/components/multi-select'
 
 const options = [
   { value: 'a', label: 'a' },
@@ -32,13 +32,14 @@ function Fixture(props: {
   initialSelected?: string[]
   allowCreate?: boolean
   disabled?: boolean
+  options?: Option[]
 }) {
   const [selected, setSelected] = useState(props.initialSelected ?? [])
 
   return (
     <>
       <MultiSelect
-        options={options}
+        options={props.options ?? options}
         selected={selected}
         onChange={setSelected}
         allowCreate={props.allowCreate ?? true}
@@ -48,6 +49,36 @@ function Fixture(props: {
     </>
   )
 }
+
+it('searches displayed labels without changing submitted IDs and still finds values by ID', async () => {
+  render(
+    <Fixture
+      allowCreate={false}
+      options={[
+        { value: '7', label: 'Full model' },
+        { value: '8', label: 'Fast model' },
+      ]}
+    />
+  )
+  const user = userEvent.setup()
+  const input = screen.getByRole('combobox')
+  await user.type(input, 'FULL')
+  expect(
+    await screen.findByRole('option', { name: 'Full model' })
+  ).toBeVisible()
+  expect(
+    screen.queryByRole('option', { name: 'Fast model' })
+  ).not.toBeInTheDocument()
+  await user.click(screen.getByRole('option', { name: 'Full model' }))
+  expect(screen.getByLabelText('Selected values')).toHaveTextContent(/^7$/)
+  await user.type(input, '8')
+  expect(
+    await screen.findByRole('option', { name: 'Fast model' })
+  ).toBeVisible()
+  expect(
+    screen.queryByRole('option', { name: 'Full model' })
+  ).not.toBeInTheDocument()
+})
 
 describe('multi-select batch paste', () => {
   it.each(['a,b,c', 'a，b，c', 'a\nb\nc', 'a\r\nb\r\nc'])(

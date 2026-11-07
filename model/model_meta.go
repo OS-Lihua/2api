@@ -304,6 +304,15 @@ func (mi *Model) updateColumns(columns []string) error {
 		if err := mi.validateChannelDeclarations(tx, slices.Contains(columns, "capabilities")); err != nil {
 			return err
 		}
+		if mi.NameRule != NameRuleExact && tx.Migrator().HasTable(&ModelOfferingMember{}) {
+			var members int64
+			if err := tx.Model(&ModelOfferingMember{}).Where("model_id = ?", mi.Id).Count(&members).Error; err != nil {
+				return err
+			}
+			if members > 0 {
+				return ErrModelOfferingMember
+			}
+		}
 		if err := validateModelVendor(tx, mi.VendorID); err != nil {
 			return err
 		}
@@ -394,6 +403,15 @@ func DeleteModelMetadata(ids []int, removeFromChannels, removePricing bool) (Mod
 				return errors.New("only exact-match models can be removed from channels")
 			}
 			names[record.ModelName] = struct{}{}
+		}
+		if tx.Migrator().HasTable(&ModelOfferingMember{}) {
+			var memberships int64
+			if err := tx.Model(&ModelOfferingMember{}).Where("model_id IN ?", modelIDs).Count(&memberships).Error; err != nil {
+				return err
+			}
+			if memberships > 0 {
+				return ErrModelOfferingMember
+			}
 		}
 		if removeFromChannels {
 			var channels []Provider
