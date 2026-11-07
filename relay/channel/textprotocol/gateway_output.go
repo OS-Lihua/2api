@@ -9,11 +9,12 @@ import (
 
 type gatewayToolOutput struct{ name, arguments string }
 
-// gatewayGeneratedOutput retains only transient delivered text and tool inputs.
-// Responses tool snapshots replace accumulated deltas rather than billing them twice.
+// gatewayGeneratedOutput holds transient delivered content. Full Responses
+// snapshots replace their own deltas without erasing omitted content blocks.
 type gatewayGeneratedOutput struct {
 	text      strings.Builder
-	reasoning strings.Builder
+	parts     map[string]*strings.Builder
+	partOrder []string
 	tools     map[string]gatewayToolOutput
 	order     []string
 }
@@ -21,77 +22,113 @@ type gatewayGeneratedOutput struct {
 func (o *gatewayGeneratedOutput) ObserveResponses(body []byte) (string, bool) {
 	root := gjson.ParseBytes(body)
 	kind := root.Get("type").String()
-	item := root.Get("item")
-	id := root.Get("item_id").String()
-	if item.Exists() {
-		id = item.Get("id").String()
-	}
-	if id == "" {
-		id = "index:" + root.Get("output_index").String()
-	}
-	var name, arguments string
+	index := root.Get("output_index").Int()
 	switch kind {
-	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+	case "response.output_text.delta", "response.output_text.done", "response.refusal.delta", "response.refusal.done",
+		"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done", "response.reasoning_text.delta", "response.reasoning_text.done":
+		category, partIndex := "content", root.Get("content_index").Int()
+		if strings.HasPrefix(kind, "response.reasoning_summary") {
+			category, partIndex = "summary", root.Get("summary_index").Int()
+		}
+		if strings.HasPrefix(kind, "response.reasoning_text") {
+			category = "reasoning"
+		}
 		text := root.Get("delta").String()
-		o.reasoning.WriteString(text)
+		delta := strings.HasSuffix(kind, ".delta")
+		if !delta {
+			text = root.Get("text").String()
+			if value := root.Get("refusal"); value.Exists() {
+				text = value.String()
+			}
+		}
+		o.mergePart(fmt.Sprintf("%d/%s/%d", index, category, partIndex), text, delta)
+		return text, true
+	case "response.content_part.added", "response.content_part.done", "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		category, partIndex := "content", root.Get("content_index").Int()
+		if strings.HasPrefix(kind, "response.reasoning_summary") {
+			category, partIndex = "summary", root.Get("summary_index").Int()
+		}
+		text := gatewayResponsesContentText(root.Get("part"))
+		o.mergePart(fmt.Sprintf("%d/%s/%d", index, category, partIndex), text, false)
 		return text, true
 	case "response.completed", "response.done", "response.incomplete":
-		var business, text, reasoning strings.Builder
+		var text strings.Builder
 		for index, item := range root.Get("response.output").Array() {
-			if name, arguments, ok := gatewayResponseTool(item); ok {
-				id := item.Get("id").String()
-				if id == "" {
-					id = fmt.Sprintf("index:%d", index)
-				}
-				o.mergeTool(id, gatewayToolOutput{name, arguments}, false)
-				business.WriteString(name + arguments)
-			} else {
-				builder := &text
-				if item.Get("type").String() == "reasoning" {
-					builder = &reasoning
-				}
-				for _, content := range item.Get("content").Array() {
-					builder.WriteString(content.Get("text").String())
-				}
-				for _, summary := range item.Get("summary").Array() {
-					builder.WriteString(summary.Get("text").String())
-				}
-			}
+			text.WriteString(o.ObserveItem(int64(index), item))
 		}
-		for _, snapshot := range []struct {
-			builder *strings.Builder
-			text    string
-		}{{&o.text, text.String()}, {&o.reasoning, reasoning.String()}} {
-			if snapshot.text == "" {
-				continue
-			}
-			if strings.HasPrefix(snapshot.text, snapshot.builder.String()) {
-				snapshot.builder.Reset()
-				snapshot.builder.WriteString(snapshot.text)
-			}
-			business.WriteString(snapshot.text)
-		}
-		return business.String(), true
+		return text.String(), true
 	case "response.output_item.added", "response.output_item.done":
-		var ok bool
-		name, arguments, ok = gatewayResponseTool(item)
-		if !ok {
-			return "", false
-		}
-	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta",
-		"response.function_call_arguments.done", "response.custom_tool_call_input.done":
-		arguments = root.Get("delta").String()
-		if strings.HasSuffix(kind, ".done") {
+		return o.ObserveItem(index, root.Get("item")), true
+	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.function_call_arguments.done", "response.custom_tool_call_input.done":
+		arguments := root.Get("delta").String()
+		delta := strings.HasSuffix(kind, ".delta")
+		if !delta {
 			arguments = root.Get("arguments").String()
 			if value := root.Get("input"); value.Exists() {
 				arguments = value.String()
 			}
 		}
+		id := root.Get("item_id").String()
+		if id == "" {
+			id = fmt.Sprintf("index:%d", index)
+		}
+		o.mergeTool(id, gatewayToolOutput{arguments: arguments}, delta)
+		return arguments, true
 	default:
 		return "", false
 	}
-	o.mergeTool(id, gatewayToolOutput{name, arguments}, strings.HasSuffix(kind, ".delta"))
-	return name + arguments, true
+}
+
+func (o *gatewayGeneratedOutput) ObserveItem(index int64, item gjson.Result) string {
+	if name, arguments, ok := gatewayResponseTool(item); ok {
+		id := item.Get("id").String()
+		if id == "" {
+			id = fmt.Sprintf("index:%d", index)
+		}
+		o.mergeTool(id, gatewayToolOutput{name, arguments}, false)
+		return name + arguments
+	}
+	category := "content"
+	if item.Get("type").String() == "reasoning" {
+		category = "reasoning"
+	}
+	var text strings.Builder
+	for partIndex, part := range item.Get("content").Array() {
+		value := gatewayResponsesContentText(part)
+		o.mergePart(fmt.Sprintf("%d/%s/%d", index, category, partIndex), value, false)
+		text.WriteString(value)
+	}
+	for partIndex, part := range item.Get("summary").Array() {
+		value := gatewayResponsesContentText(part)
+		o.mergePart(fmt.Sprintf("%d/summary/%d", index, partIndex), value, false)
+		text.WriteString(value)
+	}
+	return text.String()
+}
+
+func (o *gatewayGeneratedOutput) mergePart(id, text string, delta bool) {
+	if text == "" {
+		return
+	}
+	if o.parts == nil {
+		o.parts = map[string]*strings.Builder{}
+	}
+	part, exists := o.parts[id]
+	if !exists {
+		part = &strings.Builder{}
+		o.parts[id] = part
+		o.partOrder = append(o.partOrder, id)
+	}
+	if delta {
+		part.WriteString(text)
+		return
+	}
+	if strings.HasPrefix(text, part.String()) {
+		part.Reset()
+		part.WriteString(text)
+	} else if !strings.Contains(part.String(), text) {
+		part.WriteString(text)
+	}
 }
 
 func (o *gatewayGeneratedOutput) mergeTool(id string, incoming gatewayToolOutput, delta bool) {
@@ -115,14 +152,23 @@ func (o *gatewayGeneratedOutput) mergeTool(id string, incoming gatewayToolOutput
 
 func (o *gatewayGeneratedOutput) String() string {
 	var output strings.Builder
-	output.WriteString(o.reasoning.String())
 	output.WriteString(o.text.String())
+	for _, id := range o.partOrder {
+		output.WriteString(o.parts[id].String())
+	}
 	for _, id := range o.order {
 		tool := o.tools[id]
 		output.WriteString(tool.name)
 		output.WriteString(tool.arguments)
 	}
 	return output.String()
+}
+
+func gatewayResponsesContentText(part gjson.Result) string {
+	if value := part.Get("refusal"); value.Type == gjson.String {
+		return value.String()
+	}
+	return part.Get("text").String()
 }
 
 func gatewayResponseTool(item gjson.Result) (string, string, bool) {

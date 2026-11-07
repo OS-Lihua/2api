@@ -26,6 +26,22 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
 	}
+	meter := gatewayUsageAccumulator{format: p.format}
+	usage, err := meter.Observe(body)
+	if err != nil {
+		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+	}
+	if usage == nil {
+		usage = &dto.Usage{}
+	}
+	facts := info.ResponseFacts
+	prompt, completion := gatewayUsageCounters(body, p.format)
+	facts.PromptTokensReported, facts.CompletionTokensReported = gatewayValidCounter(prompt), gatewayValidCounter(completion)
+	facts.UsageReported = facts.PromptTokensReported && facts.CompletionTokensReported
+	normalized, err := meter.NormalizedBody(body)
+	if err != nil {
+		return usage, types.NewError(err, types.ErrorCodeBadResponseBody)
+	}
 	var response any
 	switch p.kind {
 	case protocol.OpenAIChat:
@@ -37,30 +53,18 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	case protocol.GeminiGenerate:
 		response = &dto.GeminiChatResponse{}
 	}
-	if err := common.Unmarshal(body, response); err != nil {
-		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+	if err := common.Unmarshal(normalized, response); err != nil {
+		return usage, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	canonical, err := relayconvert.ConvertResponse(c, info, types.RelayFormatOpenAI, response)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
-	meter := gatewayUsageAccumulator{format: p.format}
-	usage, err := meter.Observe(body)
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
-	}
-	if usage == nil {
-		usage = &dto.Usage{}
-	}
-	facts := info.ResponseFacts
-	prompt, completion := gatewayUsageCounters(body, p.format)
-	facts.PromptTokensReported = prompt.Type == gjson.Number && prompt.Int() >= 0 && prompt.Int() <= 1<<31-1
-	facts.CompletionTokensReported = completion.Type == gjson.Number && completion.Int() >= 0 && completion.Int() <= 1<<31-1
-	facts.UsageReported = facts.PromptTokensReported && facts.CompletionTokensReported
 	var generated strings.Builder
 	nativeMessages := p.format == types.RelayFormatClaude && info.RelayFormat == types.RelayFormatClaude
 	nativeGemini := p.format == types.RelayFormatGemini && info.RelayFormat == types.RelayFormatGemini
-	if chat, ok := canonical.Value.(*dto.OpenAITextResponse); ok && !nativeMessages && !nativeGemini {
+	nativeResponses := p.format == types.RelayFormatOpenAIResponses && info.RelayFormat == types.RelayFormatOpenAIResponses
+	if chat, ok := canonical.Value.(*dto.OpenAITextResponse); ok && !nativeMessages && !nativeGemini && !nativeResponses {
 		for _, choice := range chat.Choices {
 			generated.WriteString(choice.Message.StringContent())
 			if choice.Message.ReasoningContent != nil {
@@ -74,13 +78,12 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 			}
 		}
 	}
-	if p.format == types.RelayFormatOpenAIResponses && info.RelayFormat == types.RelayFormatOpenAIResponses {
-		for _, item := range gjson.GetBytes(body, "output").Array() {
-			if name, arguments, ok := gatewayResponseTool(item); ok {
-				generated.WriteString(name)
-				generated.WriteString(arguments)
-			}
+	if nativeResponses {
+		var output gatewayGeneratedOutput
+		for index, item := range gjson.GetBytes(body, "output").Array() {
+			output.ObserveItem(int64(index), item)
 		}
+		generated.WriteString(output.String())
 	}
 	if nativeMessages {
 		for _, block := range gjson.GetBytes(body, "content").Array() {
@@ -113,6 +116,9 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	encoded, err := common.Marshal(converted.Value)
 	if err != nil {
 		return usage, types.NewError(err, types.ErrorCodeJsonMarshalFailed)
+	}
+	if p.format == info.RelayFormat {
+		encoded = normalized
 	}
 	if err := service.IOCopyBytesGracefully(c, resp, encoded); err != nil {
 		facts.DownstreamWriteFailed = true

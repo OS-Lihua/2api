@@ -43,13 +43,21 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 		return nil, err
 	}
 	for _, diagnostic := range result.Diagnostics {
-		if diagnostic.Code == "unsupported_media_type" && diagnostic.Severity == types.ConversionDiagnosticError {
+		if (diagnostic.Code == "unsupported_media_type" || diagnostic.Code == "unsupported_media_source") && diagnostic.Severity == types.ConversionDiagnosticError {
 			return nil, fmt.Errorf("request media cannot be represented for validation")
 		}
 	}
 	chat, ok := result.Value.(*dto.GeneralOpenAIRequest)
 	if !ok {
 		return nil, fmt.Errorf("missing text request projection")
+	}
+	if gemini, ok := request.(*dto.GeminiChatRequest); ok {
+		if gemini.CachedContent != "" {
+			chat.PromptCacheKey = gemini.CachedContent
+		}
+		if gemini.GenerationConfig.ResponseSchema != nil || len(gemini.GenerationConfig.ResponseJsonSchema) > 0 || gemini.GenerationConfig.ResponseMimeType == "application/json" {
+			chat.ResponseFormat = &dto.ResponseFormat{Type: "json_object"}
+		}
 	}
 	return chat, nil
 }

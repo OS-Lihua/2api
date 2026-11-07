@@ -1,6 +1,7 @@
 package textprotocol
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -30,6 +31,25 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 	var output gatewayGeneratedOutput
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		info.StreamStatus.RequireTerminal()
+		measured, err := meter.Observe([]byte(data))
+		if err != nil {
+			streamErr = err
+			sr.Stop(err)
+			return
+		}
+		if measured != nil {
+			usage = measured
+		}
+		prompt, completion := gatewayUsageCounters([]byte(data), p.format)
+		info.ResponseFacts.PromptTokensReported = info.ResponseFacts.PromptTokensReported || gatewayValidCounter(prompt)
+		info.ResponseFacts.CompletionTokensReported = info.ResponseFacts.CompletionTokensReported || gatewayValidCounter(completion)
+		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
+		normalized, err := meter.NormalizedBody([]byte(data))
+		if err != nil {
+			streamErr = err
+			sr.Stop(err)
+			return
+		}
 		var event any
 		switch p.format {
 		case types.RelayFormatOpenAI:
@@ -41,7 +61,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		case types.RelayFormatGemini:
 			event = &dto.GeminiChatResponse{}
 		}
-		if err := common.UnmarshalJsonStr(data, event); err != nil {
+		if err := common.Unmarshal(normalized, event); err != nil {
 			streamErr = err
 			sr.Stop(err)
 			return
@@ -52,23 +72,6 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			sr.Stop(err)
 			return
 		}
-		measured, err := meter.Observe([]byte(data))
-		if err != nil {
-			streamErr = err
-			sr.Stop(err)
-			return
-		}
-		if measured != nil {
-			usage = measured
-		}
-		prompt, completion := gatewayUsageCounters([]byte(data), p.format)
-		if prompt.Type == gjson.Number && prompt.Int() >= 0 && prompt.Int() <= 1<<31-1 {
-			info.ResponseFacts.PromptTokensReported = true
-		}
-		if completion.Type == gjson.Number && completion.Int() >= 0 && completion.Int() <= 1<<31-1 {
-			info.ResponseFacts.CompletionTokensReported = true
-		}
-		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 		switch p.format {
 		case types.RelayFormatOpenAIResponses:
 			service.ObserveResponsesOutcome(info, event.(*dto.ResponsesStreamResponse))
@@ -93,6 +96,13 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		if upstreamError.Exists() && upstreamError.Type != gjson.Null || gjson.Get(data, "type").String() == "error" || info.StreamStatus.ResponseFailed() {
 			streamErr = errors.New("upstream stream failed")
 			sr.Stop(streamErr)
+			return
+		}
+		if p.format == info.RelayFormat {
+			if _, err := writeGatewayStreamResult(c, info, json.RawMessage(normalized), &output); err != nil {
+				streamErr = err
+				sr.Stop(err)
+			}
 			return
 		}
 		for _, result := range results {
@@ -162,6 +172,8 @@ func gatewayUsageCounters(body []byte, format types.RelayFormat) (gjson.Result, 
 func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value any, output *gatewayGeneratedOutput) (string, error) {
 	event := ""
 	switch v := value.(type) {
+	case json.RawMessage:
+		event = gjson.GetBytes(v, "type").String()
 	case relayconvert.ChatToResponsesStreamEvent:
 		event, value = v.Type, v.Payload
 	case *dto.ResponsesStreamResponse:

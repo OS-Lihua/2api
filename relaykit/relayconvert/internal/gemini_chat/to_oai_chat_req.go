@@ -162,6 +162,9 @@ func GeminiGenerateContentRequestToOpenAIChat(ctx context.Context, geminiRequest
 		openaiRequest.MaxTokens = kitutil.GetPointer(*geminiRequest.GenerationConfig.MaxOutputTokens)
 	}
 	if len(geminiRequest.GenerationConfig.StopSequences) > 0 {
+		if len(geminiRequest.GenerationConfig.StopSequences) > 4 {
+			convdiag.Add(ctx, types.ConversionDiagnostic{Code: "stop_sequences_truncated", Path: "generationConfig.stopSequences", Message: "The target protocol accepts at most four stop sequences", Severity: types.ConversionDiagnosticWarning})
+		}
 		openaiRequest.Stop = geminiRequest.GenerationConfig.StopSequences[:min(len(geminiRequest.GenerationConfig.StopSequences), 4)]
 	}
 	if geminiRequest.GenerationConfig.CandidateCount != nil {

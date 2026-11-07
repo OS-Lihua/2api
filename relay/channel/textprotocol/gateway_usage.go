@@ -1,7 +1,6 @@
 package textprotocol
 
 import (
-	"errors"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -9,6 +8,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // gatewayUsageAccumulator overlays only present upstream fields. A zero resets
@@ -35,18 +35,13 @@ func (a *gatewayUsageAccumulator) Observe(body []byte) (*dto.Usage, error) {
 		return nil, nil
 	}
 	var incoming map[string]any
-	if err := common.UnmarshalJsonStr(raw.Raw, &incoming); err != nil {
-		return nil, err
-	}
-	if incoming == nil {
-		return nil, errors.New("invalid upstream usage")
+	if err := common.UnmarshalJsonStr(raw.Raw, &incoming); err != nil || incoming == nil {
+		return nil, nil
 	}
 	if a.snapshot == nil {
 		a.snapshot = map[string]any{}
 	}
-	if err := mergeGatewayUsageSnapshot(a.snapshot, incoming); err != nil {
-		return nil, err
-	}
+	mergeGatewayUsageSnapshot(a.snapshot, incoming)
 	encoded, err := common.Marshal(a.snapshot)
 	if err != nil {
 		return nil, err
@@ -63,6 +58,8 @@ func (a *gatewayUsageAccumulator) Observe(body []byte) (*dto.Usage, error) {
 		if err := common.Unmarshal(encoded, &native); err != nil {
 			return nil, err
 		}
+		// Total is not a substitute for an independently present output count.
+		native.TotalTokenCount = 0
 		return relayconvert.UsageFromGeminiMetadata(&native, 0), nil
 	default:
 		var native dto.Usage
@@ -76,37 +73,79 @@ func (a *gatewayUsageAccumulator) Observe(body []byte) (*dto.Usage, error) {
 	}
 }
 
-func mergeGatewayUsageSnapshot(current, incoming map[string]any) error {
+// NormalizedBody isolates invalid usage fields from the content DTO parser.
+func (a *gatewayUsageAccumulator) NormalizedBody(body []byte) ([]byte, error) {
+	key := "usage"
+	if a.format == types.RelayFormatGemini {
+		key = "usageMetadata"
+	}
+	if a.format == types.RelayFormatOpenAIResponses && gjson.GetBytes(body, "response").Exists() {
+		key = "response." + key
+	}
+	if a.format == types.RelayFormatClaude && gjson.GetBytes(body, "message").Exists() {
+		key = "message." + key
+	}
+	if !gjson.GetBytes(body, key).Exists() {
+		return body, nil
+	}
+	snapshot := a.snapshot
+	if snapshot == nil {
+		snapshot = map[string]any{}
+	}
+	encoded, err := common.Marshal(snapshot)
+	if err != nil {
+		return nil, err
+	}
+	return sjson.SetRawBytes(body, key, encoded)
+}
+
+func gatewayValidCounter(value gjson.Result) bool {
+	var count int64
+	return value.Type == gjson.Number && common.UnmarshalJsonStr(value.Raw, &count) == nil && count >= 0 && count <= 1<<31-1
+}
+
+func mergeGatewayUsageSnapshot(current, incoming map[string]any) {
 	for key, value := range incoming {
 		if fields, ok := value.(map[string]any); ok {
 			nested, _ := current[key].(map[string]any)
 			if nested == nil {
 				nested = map[string]any{}
 			}
-			if err := mergeGatewayUsageSnapshot(nested, fields); err != nil {
-				return err
-			}
+			mergeGatewayUsageSnapshot(nested, fields)
 			current[key] = nested
 			continue
 		}
 		if values, ok := value.([]any); ok {
+			previous, _ := current[key].([]any)
 			for _, entry := range values {
-				if fields, ok := entry.(map[string]any); ok {
-					if err := mergeGatewayUsageSnapshot(map[string]any{}, fields); err != nil {
-						return err
+				fields, ok := entry.(map[string]any)
+				if !ok {
+					continue
+				}
+				var merged map[string]any
+				if modality, ok := fields["modality"].(string); ok {
+					for _, old := range previous {
+						if old, ok := old.(map[string]any); ok && old["modality"] == modality {
+							merged = old
+							break
+						}
 					}
 				}
+				if merged == nil {
+					merged = map[string]any{}
+					previous = append(previous, merged)
+				}
+				mergeGatewayUsageSnapshot(merged, fields)
 			}
-			current[key] = value
+			current[key] = previous
 			continue
 		}
-		if strings.Contains(strings.ToLower(key), "token") && value != nil {
+		if strings.Contains(strings.ToLower(key), "token") {
 			number, ok := value.(float64)
 			if !ok || number < 0 || number > 1<<31-1 || number != float64(int64(number)) {
-				return errors.New("invalid upstream token count")
+				continue
 			}
 		}
 		current[key] = value
 	}
-	return nil
 }
