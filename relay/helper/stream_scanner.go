@@ -296,7 +296,11 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 
 			ticker.Reset(streamingTimeout)
 			data := scanner.Text()
-			logger.LogDebug(c, "stream scanner data: %s", data)
+			if info.ResponseFacts != nil {
+				logger.LogDebug(c, "stream scanner line: bytes=%d", len(data))
+			} else {
+				logger.LogDebug(c, "stream scanner data: %s", data)
+			}
 
 			data, hasDataPrefix := strings.CutPrefix(data, "data:")
 			data = strings.TrimSpace(data)

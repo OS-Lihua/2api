@@ -64,6 +64,8 @@ const fields = [
   },
 ] as const
 
+const refreshResetOptions = { keepDirtyValues: true }
+
 type BudgetValues = {
   GatewayMaxAttempts: number
   GatewayTotalFirstByteSeconds: number
@@ -93,6 +95,7 @@ export function GatewayBudgetSettings(props: { defaultValues: BudgetValues }) {
   const { form, handleSubmit, isSubmitting } = useSettingsForm<BudgetValues>({
     resolver: zodResolver(schema),
     defaultValues: props.defaultValues,
+    resetOptions: refreshResetOptions,
     onSubmit: async (_values, changed) => {
       for (const [key, value] of Object.entries(changed)) {
         await update.mutateAsync({ key, value: Number(value) })

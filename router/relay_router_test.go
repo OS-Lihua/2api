@@ -467,9 +467,85 @@ func addTextGatewayChannel(t *testing.T, fixture textGatewayFixture, upstream ht
 	return channel
 }
 
+func TestTextGatewayDifyStreamErrorsRespectFailureScope(t *testing.T) {
+	for _, tc := range []struct {
+		name, code, class string
+		status            int
+		sends             int
+	}{
+		{"invalid request", "invalid_param", "invalid_request", 400, 1},
+		{"credentials", "invalid_api_key", "credentials", 401, 2},
+		{"account quota", "insufficient_quota", "account_quota", 429, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			failedCalls, recoveryCalls := 0, 0
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				failedCalls++
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprintf(w, "data: {\"event\":\"error\",\"status\":%d,\"code\":%q,\"message\":\"provider-secret\"}\n\n", tc.status, tc.code)
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeDify).Error)
+			sibling := *fixture.channel
+			sibling.ID, sibling.UpstreamModelName = 0, "another-dify-model"
+			require.NoError(t, model.DB.Create(&sibling).Error)
+			price := *fixture.purchase
+			price.ID, price.OwnerID = 0, sibling.ID
+			require.NoError(t, model.CreatePriceVersion(t.Context(), &price, fixture.sale.CreatedBy))
+			addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+				recoveryCalls++
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+			})
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			assert.Equal(t, 1, failedCalls, "invalid requests stop; account failures exclude the Provider")
+			assert.Equal(t, tc.sends-1, recoveryCalls)
+			assert.NotContains(t, response.Body.String(), "provider-secret")
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, tc.sends, total)
+			for _, attempt := range attempts {
+				if attempt.ChannelID == fixture.channel.ID {
+					assert.Equal(t, tc.class, attempt.ErrorClass)
+				}
+			}
+		})
+	}
+}
+
+func TestTextGatewayFailoverClearsProviderOrganization(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "first-account", r.Header.Get("OpenAI-Organization"))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		_, _ = w.Write([]byte(`{"error":{"code":"overloaded"}}`))
+	})
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("open_ai_organization", "first-account").Error)
+	addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+		assert.Empty(t, r.Header.Get("OpenAI-Organization"), "the next Provider must not inherit another account's organization")
+		assert.Equal(t, "Bearer additional-secret", r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	})
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), "Recovered")
+}
+
 func TestTextGatewayStreamFailoverNeverLeaksErrorsOrEndsEarly(t *testing.T) {
 	for _, business := range []bool{false, true} {
 		t.Run(fmt.Sprint("business=", business), func(t *testing.T) {
+			logFile, err := os.Create(filepath.Join(t.TempDir(), "debug.log"))
+			require.NoError(t, err)
+			common.LogWriterMu.Lock()
+			previousWriter, previousErrorWriter, previousDebug := gin.DefaultWriter, gin.DefaultErrorWriter, common.DebugEnabled
+			gin.DefaultWriter, gin.DefaultErrorWriter, common.DebugEnabled = logFile, logFile, true
+			common.LogWriterMu.Unlock()
+			t.Cleanup(func() {
+				common.LogWriterMu.Lock()
+				gin.DefaultWriter, gin.DefaultErrorWriter, common.DebugEnabled = previousWriter, previousErrorWriter, previousDebug
+				common.LogWriterMu.Unlock()
+				require.NoError(t, logFile.Close())
+			})
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				_, _ = w.Write([]byte(": PING\n\ndata: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"))
@@ -487,6 +563,10 @@ func TestTextGatewayStreamFailoverNeverLeaksErrorsOrEndsEarly(t *testing.T) {
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
 			assert.NotContains(t, response.Body.String(), "secret")
 			assert.NotContains(t, response.Body.String(), "private.invalid")
+			logged, err := os.ReadFile(logFile.Name())
+			require.NoError(t, err)
+			assert.NotContains(t, string(logged), "provider-secret")
+			assert.NotContains(t, string(logged), "private.invalid")
 			if business {
 				assert.Zero(t, secondCalls)
 				assert.Contains(t, response.Body.String(), `"code":"upstream_error"`)

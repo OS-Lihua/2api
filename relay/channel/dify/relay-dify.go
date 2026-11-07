@@ -224,6 +224,7 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	var responseText string
 	usage := &dto.Usage{}
 	var nodeToken int
+	var streamError *types.NewAPIError
 	helper.SetEventStreamHeaders(c)
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		info.StreamStatus.RequireTerminal()
@@ -243,6 +244,13 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			sr.Done()
 			return
 		} else if difyResponse.Event == "error" {
+			if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+				status := difyResponse.Status
+				if status < 400 || status > 599 {
+					status = http.StatusBadGateway
+				}
+				streamError = types.WithOpenAIError(types.OpenAIError{Message: "Upstream stream failed", Type: "upstream_error", Code: difyResponse.Code}, status)
+			}
 			sr.Stop(fmt.Errorf("dify error event"))
 			return
 		}
@@ -289,7 +297,7 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		}
 		usage.CompletionTokens += nodeToken
 	}
-	return usage, nil
+	return usage, streamError
 }
 
 func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {

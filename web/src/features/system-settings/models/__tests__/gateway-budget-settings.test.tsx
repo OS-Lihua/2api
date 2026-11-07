@@ -25,33 +25,50 @@ import { afterEach, expect, test, vi } from 'vitest'
 import { api } from '@/lib/api'
 
 import { SettingsPageProvider } from '../../components/settings-page-context'
+import {
+  getOptionValue,
+  useSystemOptions,
+} from '../../hooks/use-system-options'
 import { GatewayBudgetSettings } from '../gateway-budget-settings'
 
-function Fixture() {
+const defaults = {
+  GatewayMaxAttempts: 3,
+  GatewayTotalFirstByteSeconds: 90,
+  GatewayAttemptFirstByteSeconds: 30,
+}
+
+function LiveSettings() {
+  const options = useSystemOptions()
+  return (
+    <GatewayBudgetSettings
+      defaultValues={getOptionValue(options.data?.data, defaults)}
+    />
+  )
+}
+
+function Fixture(props: { live?: boolean }) {
   const [container, setContainer] = useState<HTMLDivElement | null>(null)
   return (
     <>
       <div ref={setContainer} />
       <SettingsPageProvider actionsContainer={container}>
-        <GatewayBudgetSettings
-          defaultValues={{
-            GatewayMaxAttempts: 3,
-            GatewayTotalFirstByteSeconds: 90,
-            GatewayAttemptFirstByteSeconds: 30,
-          }}
-        />
+        {props.live ? (
+          <LiveSettings />
+        ) : (
+          <GatewayBudgetSettings defaultValues={defaults} />
+        )}
       </SettingsPageProvider>
     </>
   )
 }
 
-function renderSettings() {
+function renderSettings(live = false) {
   const client = new QueryClient({
     defaultOptions: { mutations: { retry: false } },
   })
   render(
     <QueryClientProvider client={client}>
-      <Fixture />
+      <Fixture live={live} />
     </QueryClientProvider>
   )
 }
@@ -103,6 +120,62 @@ test('rejects fractional or out-of-range budgets before saving', async () => {
   ).toBeVisible()
   expect(input).toHaveAttribute('aria-invalid', 'true')
   expect(put).not.toHaveBeenCalled()
+})
+
+test('preserves unsaved fields when a partial save refreshes options before the next write fails', async () => {
+  const saved = { ...defaults }
+  const get = vi
+    .spyOn(api, 'get')
+    .mockImplementation(async () => ({
+      data: {
+        success: true,
+        data: Object.entries(saved).map(([key, value]) => ({
+          key,
+          value: String(value),
+        })),
+      },
+    }))
+  let failSecond: (() => void) | undefined
+  const put = vi
+    .spyOn(api, 'put')
+    .mockImplementationOnce(async () => {
+      saved.GatewayMaxAttempts = 5
+      return { data: { success: true } }
+    })
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          failSecond = () =>
+            resolve({ data: { success: false, message: 'Save failed' } })
+        })
+    )
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  renderSettings(true)
+  await waitFor(() => expect(get).toHaveBeenCalledTimes(1))
+  fireEvent.change(
+    screen.getByRole('spinbutton', { name: 'Maximum attempts' }),
+    { target: { value: '5' } }
+  )
+  const total = screen.getByRole('spinbutton', {
+    name: 'Total first-byte budget (seconds)',
+  })
+  fireEvent.change(total, { target: { value: '61' } })
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await waitFor(() => expect(get).toHaveBeenCalledTimes(2))
+  await waitFor(() => expect(put).toHaveBeenCalledTimes(2))
+  failSecond?.()
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Save Changes' })).toBeEnabled()
+  )
+  expect(total).toHaveValue(61)
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await waitFor(() =>
+    expect(put).toHaveBeenLastCalledWith('/api/option/', {
+      key: 'GatewayTotalFirstByteSeconds',
+      value: 61,
+    })
+  )
 })
 
 test('keeps edited values after a failed save so the administrator can retry', async () => {

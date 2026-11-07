@@ -61,7 +61,7 @@ func TextGateway(c *gin.Context) {
 		previousStatus, previousCode, previousMessage := run.status, run.code, run.message
 		run.status, run.code, run.message = 0, "", ""
 		result := runTextGatewayAttempt(c, run, budget, exclusions)
-		if result.Attempt == nil && result.SkippedChannel == 0 && run.code == "channel_unavailable" && previousCode == "unsupported_parameter" {
+		if result.Attempt == nil && result.SkippedChannel == 0 && run.code == "channel_unavailable" && previousCode != "" {
 			run.status, run.code, run.message = previousStatus, previousCode, previousMessage
 		}
 		return result
