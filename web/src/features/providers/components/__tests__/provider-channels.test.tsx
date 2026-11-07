@@ -25,6 +25,7 @@ import {
   RouterProvider,
 } from '@tanstack/react-router'
 import {
+  act,
   cleanup,
   render,
   screen,
@@ -39,7 +40,9 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { api } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth-store'
 
+import { BulkImportDialog } from '../bulk-import-dialog'
 import { ChannelMutateDrawer } from '../channel-mutate-drawer'
+import { ChannelProbeDialog } from '../channel-probe-dialog'
 import { ProviderChannels } from '../provider-channels'
 import { ProvidersProvider } from '../providers-provider'
 import { ProvidersTable } from '../providers-table'
@@ -52,8 +55,219 @@ await i18n.init({
 })
 afterEach(() => {
   cleanup()
+  vi.useRealTimers()
   vi.restoreAllMocks()
   useAuthStore.getState().auth.reset()
+})
+
+it('previews a batch, invalidates edited previews, and confirms before committing', async () => {
+  const client = new QueryClient({
+    defaultOptions: { mutations: { retry: false } },
+  })
+  const preview = {
+    dry_run: true,
+    valid: true,
+    committed: false,
+    rows: [{ row: 1, resource: 'providers', action: 'create' }],
+  }
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValue({ data: { success: true, data: preview } })
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <BulkImportDialog open onOpenChange={() => {}} />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  const source = screen.getByRole('textbox', { name: 'Import content' })
+  const execute = screen.getByRole('button', { name: 'Execute import' })
+  expect(execute).toBeDisabled()
+  await userEvent.type(source, 'test batch')
+  await userEvent.click(screen.getByRole('button', { name: 'Preview import' }))
+  expect(await screen.findByRole('table')).toBeVisible()
+  await waitFor(() => expect(execute).toBeEnabled())
+  await userEvent.type(source, ' changed')
+  expect(execute).toBeDisabled()
+  await userEvent.click(screen.getByRole('button', { name: 'Preview import' }))
+  await waitFor(() => expect(execute).toBeEnabled())
+  await userEvent.click(execute)
+  expect(await screen.findByRole('alertdialog')).toBeVisible()
+  post.mockRejectedValueOnce(new Error('Commit rejected'))
+  await userEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  await waitFor(() =>
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+  )
+  expect(source).toHaveValue('test batch changed')
+  expect(
+    screen.queryByText('Batch imported successfully')
+  ).not.toBeInTheDocument()
+  await userEvent.click(execute)
+  expect(await screen.findByRole('alertdialog')).toBeVisible()
+  post.mockResolvedValue({
+    data: {
+      success: true,
+      data: { ...preview, dry_run: false, committed: true },
+    },
+  })
+  await userEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  expect(await screen.findByText('Batch imported successfully')).toBeVisible()
+  expect(source).toHaveValue('')
+  client.clear()
+})
+
+it('uses resource permissions through the selected import operation', async () => {
+  const client = new QueryClient({
+    defaultOptions: { mutations: { retry: false } },
+  })
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValue({
+      data: {
+        success: true,
+        data: { dry_run: true, valid: true, committed: false, rows: [] },
+      },
+    })
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <BulkImportDialog open onOpenChange={() => {}} />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  await userEvent.type(
+    screen.getByRole('textbox', { name: 'Import content' }),
+    'batch'
+  )
+  for (const target of [
+    'price-versions/import',
+    'channels/bulk-confirm',
+    'channels/bulk-enable',
+  ]) {
+    await userEvent.selectOptions(
+      screen.getByRole('combobox', { name: 'Operation' }),
+      target
+    )
+    expect(
+      screen.getByRole('button', { name: 'Execute import' })
+    ).toBeDisabled()
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Preview import' })
+    )
+    await waitFor(() =>
+      expect(post).toHaveBeenLastCalledWith(
+        `/api/admin/v1/${target}`,
+        'batch',
+        expect.objectContaining({ params: { dry_run: true } })
+      )
+    )
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Preview import' })
+      ).toBeEnabled()
+    )
+  }
+  client.clear()
+})
+
+it('blocks execution after invalid or rejected previews and while an uploaded file is being read', async () => {
+  const client = new QueryClient({
+    defaultOptions: { mutations: { retry: false } },
+  })
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValue({
+      data: {
+        success: false,
+        data: {
+          dry_run: true,
+          valid: false,
+          committed: false,
+          rows: [
+            {
+              row: 2,
+              resource: 'channels',
+              action: 'enable',
+              error: 'Configure a purchase price before enabling the channel',
+            },
+          ],
+        },
+      },
+    })
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <BulkImportDialog open onOpenChange={() => {}} />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  const source = screen.getByRole('textbox', { name: 'Import content' })
+  await userEvent.type(source, 'draft')
+  let complete: (text: string) => void = () => {}
+  const file = new File(['batch'], 'batch.json', { type: 'application/json' })
+  Object.defineProperty(file, 'text', {
+    value: () =>
+      new Promise<string>((resolve) => {
+        complete = resolve
+      }),
+  })
+  await userEvent.upload(screen.getByLabelText('Import file'), file)
+  expect(screen.getByRole('button', { name: 'Preview import' })).toBeDisabled()
+  expect(source).toBeDisabled()
+  await act(async () => complete('uploaded draft'))
+  await waitFor(() => expect(source).toHaveValue('uploaded draft'))
+  await userEvent.click(screen.getByRole('button', { name: 'Preview import' }))
+  expect(
+    await screen.findByText(
+      'Configure a purchase price before enabling the channel'
+    )
+  ).toBeVisible()
+  expect(screen.getByRole('button', { name: 'Execute import' })).toBeDisabled()
+  post.mockRejectedValue(new Error('Request failed'))
+  await userEvent.click(screen.getByRole('button', { name: 'Preview import' }))
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Preview import' })).toBeEnabled()
+  )
+  expect(screen.getByRole('button', { name: 'Execute import' })).toBeDisabled()
+  expect(source).toHaveValue('uploaded draft')
+  expect(
+    screen.queryByText('Batch imported successfully')
+  ).not.toBeInTheDocument()
+  client.clear()
+})
+
+it('associates oversized upload errors with the file input and updates their language', async () => {
+  const client = new QueryClient({
+    defaultOptions: { mutations: { retry: false } },
+  })
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <BulkImportDialog open onOpenChange={() => {}} />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  const input = screen.getByLabelText('Import file')
+  await userEvent.upload(
+    input,
+    new File([new Uint8Array((2 << 20) + 1)], 'large.csv', { type: 'text/csv' })
+  )
+  expect(input).toHaveAttribute('aria-invalid', 'true')
+  expect(input).toHaveAccessibleDescription('Import exceeds the upload limit')
+  i18n.addResource(
+    'zh',
+    'translation',
+    'Import exceeds the upload limit',
+    '超过上传上限'
+  )
+  await act(async () => {
+    await i18n.changeLanguage('zh')
+  })
+  expect(screen.getByRole('alert')).toHaveTextContent('超过上传上限')
+  await act(async () => {
+    await i18n.changeLanguage('en')
+  })
+  client.clear()
 })
 
 it('keyboard users expand and collapse one provider to load its channels', async () => {
@@ -296,6 +510,158 @@ it('editing a channel clears overrides while saving zero limits and capability n
     capabilities: channel.capabilities,
     parameter_overrides: {},
   })
+  client.clear()
+})
+
+it('opens capability probes and shows persisted results before activation', async () => {
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
+  vi.spyOn(api, 'get').mockImplementation(async (url) => ({
+    data: {
+      success: true,
+      data: url.endsWith('/probes')
+        ? {
+            capabilities: ['streaming', 'tool_calling'],
+            results: [
+              {
+                id: 1,
+                capability: 'streaming',
+                status: 'passed',
+                reason: 'verified',
+                finished_at: 1794000000,
+              },
+            ],
+          }
+        : {
+            items: [
+              {
+                id: 3,
+                provider_id: 7,
+                model_id: 2,
+                protocol: 'openai_chat',
+                upstream_model_name: 'probe-model',
+                status: 'pending',
+                mapping_confirmed: false,
+              },
+            ],
+            total: 1,
+          },
+    },
+  }))
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        capability: 'tool_calling',
+        status: 'inconclusive',
+        reason: 'behavior_not_observed',
+        finished_at: 1794000001,
+      },
+    },
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <ProviderChannels providerId={7} />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  await userEvent.click(
+    await screen.findByRole('button', { name: 'Capability probes' })
+  )
+  await waitFor(() =>
+    expect(
+      within(
+        screen.getByRole('dialog', { name: 'Capability probes' })
+      ).getByText('Success')
+    ).toBeVisible()
+  )
+  const dialog = screen.getByRole('dialog', { name: 'Capability probes' })
+  expect(within(dialog).getByText('Not tested')).toBeVisible()
+  await userEvent.click(
+    within(dialog).getByRole('button', { name: 'Probe Tool calling' })
+  )
+  await waitFor(() =>
+    expect(post).toHaveBeenCalledWith(
+      '/api/admin/v1/channels/3/probes',
+      {
+        capability: 'tool_calling',
+      },
+      { timeout: 100_000 }
+    )
+  )
+  expect(
+    within(dialog).getByText(
+      'Results do not change capability declarations. Test requests may incur Provider costs.'
+    )
+  ).toBeVisible()
+  client.clear()
+})
+
+it('refreshes another administrator’s running probe and reconciles a failed submission', async () => {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+  let status = 'running'
+  vi.spyOn(api, 'get').mockImplementation(async () => ({
+    data: {
+      success: true,
+      data: {
+        capabilities: ['streaming'],
+        results: [
+          {
+            id: 1,
+            capability: 'streaming',
+            status,
+            reason: status === 'passed' ? 'verified' : 'behavior_not_observed',
+            finished_at: 1794000001,
+          },
+        ],
+      },
+    },
+  }))
+  vi.spyOn(api, 'post').mockImplementation(async () => {
+    status = 'inconclusive'
+    throw new Error('synthetic network failure')
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <ChannelProbeDialog
+          channel={{
+            id: 3,
+            provider_id: 7,
+            model_id: 2,
+            protocol: 'openai_chat',
+            upstream_model_name: 'probe-model',
+            status: 'pending',
+            mapping_confirmed: false,
+            capabilities: null,
+            parameter_overrides: {},
+            rpm: 0,
+            tpm: 0,
+            max_concurrency: 0,
+            weight: 1,
+          }}
+          canOperate
+          onClose={() => {}}
+        />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  expect(await screen.findByText('Testing...')).toBeVisible()
+  status = 'passed'
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1500)
+  })
+  expect(await screen.findByText('Capability behavior observed')).toBeVisible()
+  await userEvent.click(screen.getByRole('button', { name: 'Probe Streaming' }))
+  expect(
+    await screen.findByText('Capability behavior was not observed')
+  ).toBeVisible()
   client.clear()
 })
 

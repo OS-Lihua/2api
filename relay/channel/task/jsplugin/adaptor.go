@@ -752,7 +752,7 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 		CompletionTokens: positiveInt(parsed.Immediate.CompletionTokens), TotalTokens: positiveInt(parsed.Immediate.TotalTokens),
 	}
 	response.Immediate = immediate
-	if immediate.Status != model.TaskStatusSuccess || !a.hasHook(c.Request.Context(), "extractUsageOnComplete") {
+	if immediate.Status != model.TaskStatusSuccess || info.IsChannelTest || !a.hasHook(c.Request.Context(), "extractUsageOnComplete") {
 		return response, nil
 	}
 	// A relayed stream that stopped early keeps the reservation: the plugin
@@ -806,18 +806,24 @@ func (a *TaskAdaptor) FetchBatchTasks(baseURL, key string, tasks []*model.Task, 
 }
 
 func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
+	return a.FetchTaskWithContext(context.Background(), baseURL, key, task, proxy)
+}
+
+// FetchTaskWithContext bounds management and request-scoped polling while the
+// background poller keeps its existing lifecycle through FetchTask.
+func (a *TaskAdaptor) FetchTaskWithContext(requestCtx context.Context, baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
 	if task != nil && task.PrivateData.Key != "" {
 		key = task.PrivateData.Key
 	}
-	ctx, err := a.queryContext(task, key, baseURL, proxy)
+	ctx, err := a.queryContextWithContext(requestCtx, task, key, baseURL, proxy)
 	if err != nil {
 		return nil, err
 	}
-	descriptor, err := a.requestDescriptor(pluginruntime.WithFetcher(context.Background(), a.hookFetcher(baseURL, proxy)), "buildQueryRequest", ctx)
+	descriptor, err := a.requestDescriptor(pluginruntime.WithFetcher(requestCtx, a.hookFetcher(baseURL, proxy)), "buildQueryRequest", ctx)
 	if err != nil {
 		return nil, err
 	}
-	return a.doFetchDescriptor(baseURL, key, proxy, descriptor)
+	return a.doFetchDescriptorWithContext(requestCtx, baseURL, key, proxy, descriptor)
 }
 
 // hookFetcher sends a driver hook's utils.fetch requests to the hosts its
@@ -867,6 +873,10 @@ func (a *TaskAdaptor) hookFetcher(baseURL, proxy string) pluginruntime.Fetcher {
 }
 
 func (a *TaskAdaptor) doFetchDescriptor(baseURL, key, proxy string, descriptor requestDescriptor) (*http.Response, error) {
+	return a.doFetchDescriptorWithContext(context.Background(), baseURL, key, proxy, descriptor)
+}
+
+func (a *TaskAdaptor) doFetchDescriptorWithContext(requestCtx context.Context, baseURL, key, proxy string, descriptor requestDescriptor) (*http.Response, error) {
 	if err := pluginruntime.ValidateRequestURL(descriptor.URL, baseURL, a.plugin.Meta.AllowedHosts); err != nil {
 		return nil, err
 	}
@@ -888,7 +898,7 @@ func (a *TaskAdaptor) doFetchDescriptor(baseURL, key, proxy string, descriptor r
 	if method == "" {
 		method = http.MethodGet
 	}
-	req, err := http.NewRequest(method, descriptor.URL, requestBody)
+	req, err := http.NewRequestWithContext(requestCtx, method, descriptor.URL, requestBody)
 	if err != nil {
 		return nil, err
 	}
@@ -1082,6 +1092,11 @@ func (a *TaskAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response,
 }
 
 func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, body []byte) (*relaycommon.TaskInfo, error) {
+	return a.ParseTaskResultWithContext(context.Background(), task, resp, body)
+}
+
+// ParseTaskResultWithContext keeps hook I/O inside the caller's deadline.
+func (a *TaskAdaptor) ParseTaskResultWithContext(requestCtx context.Context, task *model.Task, resp *http.Response, body []byte) (*relaycommon.TaskInfo, error) {
 	started := time.Now()
 	input := any(string(body))
 	var decoded any
@@ -1092,11 +1107,11 @@ func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, bod
 	if task != nil && task.PrivateData.Key != "" {
 		key = task.PrivateData.Key
 	}
-	ctx, err := a.queryContext(task, key, baseURL, proxy)
+	ctx, err := a.queryContextWithContext(requestCtx, task, key, baseURL, proxy)
 	if err != nil {
 		return nil, err
 	}
-	value, err := a.plugin.Engine.Call(pluginruntime.WithFetcher(context.Background(), a.hookFetcher(baseURL, proxy)), "parseTaskResult", ctx, input, hookHTTPResponse(resp))
+	value, err := a.plugin.Engine.Call(pluginruntime.WithFetcher(requestCtx, a.hookFetcher(baseURL, proxy)), "parseTaskResult", ctx, input, hookHTTPResponse(resp))
 	if err != nil {
 		logger.LogDebug(context.Background(), "task_plugin subsystem=adaptor event=parse_task_failed plugin=%q reason=hook_failed body_bytes=%d elapsed_ms=%d", a.plugin.Meta.Key, len(body), time.Since(started).Milliseconds())
 		return nil, err
@@ -1126,8 +1141,8 @@ func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, bod
 	}
 	// The raw polling response only exists at this boundary. Capture upstream
 	// units here so the host settlement path can consume them from TaskInfo.
-	if a.hasHook(context.Background(), "extractUsageOnComplete") {
-		facts, hookErr := a.plugin.Engine.Call(context.Background(), "extractUsageOnComplete", ctx, jsonValue(result), input)
+	if (a.info == nil || !a.info.IsChannelTest) && a.hasHook(requestCtx, "extractUsageOnComplete") {
+		facts, hookErr := a.plugin.Engine.Call(requestCtx, "extractUsageOnComplete", ctx, jsonValue(result), input)
 		if hookErr == nil {
 			upstreamModel, _ := ctx["upstreamModel"].(string)
 			originModel, _ := ctx["model"].(string)
@@ -1218,14 +1233,19 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
 }
 
 func (a *TaskAdaptor) ListArtifacts(task *model.Task) ([]channel.TaskArtifact, error) {
-	if !a.hasHook(context.Background(), "listArtifacts") {
+	return a.ListArtifactsWithContext(context.Background(), task)
+}
+
+// ListArtifactsWithContext uses the request's cancellation for artifact hooks.
+func (a *TaskAdaptor) ListArtifactsWithContext(ctx context.Context, task *model.Task) ([]channel.TaskArtifact, error) {
+	if !a.hasHook(ctx, "listArtifacts") {
 		return nil, nil
 	}
-	ctx, err := taskArtifactContext(task)
+	ctxValue, err := taskArtifactContext(task)
 	if err != nil {
 		return nil, err
 	}
-	value, err := a.plugin.Engine.Call(context.Background(), "listArtifacts", ctx)
+	value, err := a.plugin.Engine.Call(ctx, "listArtifacts", ctxValue)
 	if err != nil {
 		return nil, fmt.Errorf("plugin artifact listing failed")
 	}
@@ -1236,11 +1256,16 @@ func (a *TaskAdaptor) ListArtifacts(task *model.Task) ([]channel.TaskArtifact, e
 // {key: {key, type, url, mimeType?}}, each url a gateway content address from
 // contentURL. Other tasks, and plugins without listArtifacts, have none.
 func RendererArtifacts(plugin *pluginruntime.LoadedPlugin, task *model.Task, contentURL func(taskID, artifactKey string) (string, error)) (map[string]any, error) {
+	return RendererArtifactsWithContext(context.Background(), plugin, task, contentURL)
+}
+
+// RendererArtifactsWithContext bounds artifact projection by the caller's deadline.
+func RendererArtifactsWithContext(ctx context.Context, plugin *pluginruntime.LoadedPlugin, task *model.Task, contentURL func(taskID, artifactKey string) (string, error)) (map[string]any, error) {
 	projected := make(map[string]any)
 	if task == nil || task.Status != model.TaskStatusSuccess {
 		return projected, nil
 	}
-	artifacts, err := New(plugin).ListArtifacts(task)
+	artifacts, err := New(plugin).ListArtifactsWithContext(ctx, task)
 	if err != nil {
 		return nil, fmt.Errorf("project task artifacts: %w", err)
 	}
@@ -1262,7 +1287,7 @@ func RendererArtifacts(plugin *pluginruntime.LoadedPlugin, task *model.Task, con
 }
 
 func (a *TaskAdaptor) BuildContentRequest(ctx context.Context, task *model.Task, artifactKey string, clientRequest channel.TaskArtifactClientRequest) (*channel.TaskContentRequest, error) {
-	if !a.hasHook(context.Background(), "buildContentRequest") {
+	if !a.hasHook(ctx, "buildContentRequest") {
 		return nil, nil
 	}
 	if a.info == nil {
@@ -1279,7 +1304,7 @@ func (a *TaskAdaptor) BuildContentRequest(ctx context.Context, task *model.Task,
 	hookContext["artifactKey"] = artifactKey
 	hookContext["baseUrl"] = a.info.ChannelBaseUrl
 	hookContext["clientRequest"] = jsonValue(clientRequest)
-	if err = a.applyUpstreamCredentials(hookContext, a.info.ChannelType, a.info.ApiKey, a.info.ChannelSetting.Proxy); err != nil {
+	if err = a.applyUpstreamCredentialsWithContext(ctx, hookContext, a.info.ChannelType, a.info.ApiKey, a.info.ChannelSetting.Proxy); err != nil {
 		return nil, err
 	}
 	fetchContext := pluginruntime.WithFetcher(ctx, a.hookFetcher(a.info.ChannelBaseUrl, a.info.ChannelSetting.Proxy))
@@ -1400,6 +1425,10 @@ func taskArtifactContext(task *model.Task) (map[string]any, error) {
 }
 
 func (a *TaskAdaptor) queryContext(task *model.Task, key, baseURL, proxy string) (map[string]any, error) {
+	return a.queryContextWithContext(context.Background(), task, key, baseURL, proxy)
+}
+
+func (a *TaskAdaptor) queryContextWithContext(requestCtx context.Context, task *model.Task, key, baseURL, proxy string) (map[string]any, error) {
 	ctx := map[string]any{
 		"taskId":        "",
 		"publicTaskId":  "",
@@ -1439,7 +1468,7 @@ func (a *TaskAdaptor) queryContext(task *model.Task, key, baseURL, proxy string)
 			key = task.PrivateData.Key
 		}
 	}
-	if err := a.applyUpstreamCredentials(ctx, a.channelType(), key, proxy); err != nil {
+	if err := a.applyUpstreamCredentialsWithContext(requestCtx, ctx, a.channelType(), key, proxy); err != nil {
 		return nil, err
 	}
 	return ctx, nil
@@ -1484,6 +1513,10 @@ func (a *TaskAdaptor) channelSetting() kitdto.ProviderSettings {
 // channel key is that gateway's token, so it is sent as a Bearer header for
 // every auth type instead of running the plugin's vendor auth scheme.
 func (a *TaskAdaptor) applyUpstreamCredentials(ctx map[string]any, channelType int, key, proxy string) error {
+	return a.applyUpstreamCredentialsWithContext(context.Background(), ctx, channelType, key, proxy)
+}
+
+func (a *TaskAdaptor) applyUpstreamCredentialsWithContext(requestCtx context.Context, ctx map[string]any, channelType int, key, proxy string) error {
 	if channelType == constant.ChannelTypeNewAPI {
 		ctx["upstream"] = map[string]any{"kind": pluginruntime.UpstreamKindNewAPI}
 		ctx["auth"] = map[string]any{"authHeader": "Bearer " + key}
@@ -1492,7 +1525,7 @@ func (a *TaskAdaptor) applyUpstreamCredentials(ctx map[string]any, channelType i
 		return nil
 	}
 	ctx["upstream"] = map[string]any{"kind": pluginruntime.UpstreamKindVendor}
-	auth, err := resolveAuth(a.plugin.Meta.Auth, key, proxy)
+	auth, err := resolveAuth(requestCtx, a.plugin.Meta.Auth, key, proxy)
 	if err != nil {
 		return err
 	}
@@ -1824,7 +1857,11 @@ func (a *TaskAdaptor) submitContext(c *gin.Context, info *relaycommon.RelayInfo)
 	ctx["upstreamModel"] = info.UpstreamModelName
 	ctx["baseUrl"] = info.ChannelBaseUrl
 	ctx["userSetting"] = info.UserSetting
-	if err := a.applyUpstreamCredentials(ctx, info.ChannelType, info.ApiKey, info.ChannelSetting.Proxy); err != nil {
+	requestCtx := context.Background()
+	if c != nil && c.Request != nil {
+		requestCtx = c.Request.Context()
+	}
+	if err := a.applyUpstreamCredentialsWithContext(requestCtx, ctx, info.ChannelType, info.ApiKey, info.ChannelSetting.Proxy); err != nil {
 		ctx["authError"] = err.Error()
 	}
 	return ctx

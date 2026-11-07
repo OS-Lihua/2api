@@ -1,6 +1,7 @@
 package jsplugin
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -25,22 +26,22 @@ func TestOAuth2JWTAuthCachesAndRefreshes(t *testing.T) {
 	original := acquireAccessToken
 	t.Cleanup(func() { acquireAccessToken = original; pluginAuthCache = sync.Map{} })
 	calls := 0
-	acquireAccessToken = func(_ vertexcore.Credentials, _ string) (string, error) {
+	acquireAccessToken = func(_ context.Context, _ vertexcore.Credentials, _ string) (string, error) {
 		calls++
 		return fmt.Sprintf("token-%d", calls), nil
 	}
 	credentials, err := common.Marshal(vertexcore.Credentials{ProjectID: "project", ClientEmail: "a@example.com", PrivateKey: "secret"})
 	require.NoError(t, err)
 	meta := pluginruntime.AuthMeta{Type: "oauth2_jwt"}
-	first, err := resolveAuth(meta, string(credentials), "")
+	first, err := resolveAuth(t.Context(), meta, string(credentials), "")
 	require.NoError(t, err)
-	second, err := resolveAuth(meta, string(credentials), "")
+	second, err := resolveAuth(t.Context(), meta, string(credentials), "")
 	require.NoError(t, err)
 	assert.Equal(t, "Bearer token-1", first["authHeader"])
 	assert.Equal(t, first, second)
 	assert.Equal(t, 1, calls)
 	pluginAuthCache.Store(string(credentials)+"\x00", cachedAuth{expiresAt: time.Now().Add(-time.Second)})
-	refreshed, err := resolveAuth(meta, string(credentials), "")
+	refreshed, err := resolveAuth(t.Context(), meta, string(credentials), "")
 	require.NoError(t, err)
 	assert.Equal(t, "Bearer token-2", refreshed["authHeader"])
 	assert.Equal(t, 2, calls)
@@ -50,7 +51,7 @@ func TestOAuth2JWTContextDoesNotExposeServiceAccountKey(t *testing.T) {
 	pluginAuthCache = sync.Map{}
 	original := acquireAccessToken
 	t.Cleanup(func() { acquireAccessToken = original; pluginAuthCache = sync.Map{} })
-	acquireAccessToken = func(_ vertexcore.Credentials, _ string) (string, error) {
+	acquireAccessToken = func(_ context.Context, _ vertexcore.Credentials, _ string) (string, error) {
 		return "access-token", nil
 	}
 	credentials, err := common.Marshal(vertexcore.Credentials{ProjectID: "project", ClientEmail: "a@example.com", PrivateKey: "secret"})
@@ -83,7 +84,7 @@ func TestUpstreamContextsUseGatewayBearerOnNewAPIChannels(t *testing.T) {
 	pluginAuthCache = sync.Map{}
 	original := acquireAccessToken
 	exchanges := 0
-	acquireAccessToken = func(_ vertexcore.Credentials, _ string) (string, error) {
+	acquireAccessToken = func(_ context.Context, _ vertexcore.Credentials, _ string) (string, error) {
 		exchanges++
 		return "access-token", nil
 	}

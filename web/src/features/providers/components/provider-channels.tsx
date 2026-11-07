@@ -26,6 +26,7 @@ import { DataTablePage, useDataTable } from '@/components/data-table'
 import { ErrorState } from '@/components/error-state'
 import { StatusBadge } from '@/components/status-badge'
 import { Button } from '@/components/ui/button'
+import { toIntlLocale } from '@/i18n/languages'
 import {
   hasPermission,
   ADMIN_PERMISSION_RESOURCES,
@@ -39,10 +40,14 @@ import {
   listSingleModelChannels,
   type SingleModelChannel,
 } from '../channel-api'
+import { getChannelProbeLabels } from '../lib/channel-probes'
 import { ChannelMutateDrawer } from './channel-mutate-drawer'
+import { ChannelProbeDialog } from './channel-probe-dialog'
 
 export function ProviderChannels(props: { providerId: number }) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
+  const featureLabels = getChannelProbeLabels(t)
   const user = useAuthStore((state) => state.auth.user)
   const canWrite = hasPermission(
     user,
@@ -54,6 +59,7 @@ export function ProviderChannels(props: { providerId: number }) {
     ADMIN_PERMISSION_RESOURCES.CHANNEL,
     ADMIN_PERMISSION_ACTIONS.OPERATE
   )
+  const [probing, setProbing] = useState<SingleModelChannel | null>(null)
   const [pagination, setPagination] = useState({ pageIndex: 0, pageSize: 10 })
   const [editing, setEditing] = useState<SingleModelChannel | null | undefined>(
     undefined
@@ -102,10 +108,44 @@ export function ProviderChannels(props: { providerId: number }) {
       ),
     },
     {
+      id: 'probe',
+      header: t('Capability probes'),
+      cell: ({ row }) => {
+        const result = row.original.latest_probe
+        if (!result) return t('Not tested')
+        let status = t('Inconclusive')
+        if (result.status === 'passed') status = t('Success')
+        if (result.status === 'failed') status = t('Failed')
+        if (result.status === 'running') status = t('Testing...')
+        return (
+          <div className='space-y-1 text-xs'>
+            <div>
+              {featureLabels.get(result.capability) ?? result.capability} ·{' '}
+              {status}
+            </div>
+            {result.finished_at > 0 && (
+              <time
+                dateTime={new Date(result.finished_at * 1000).toISOString()}
+              >
+                {new Date(result.finished_at * 1000).toLocaleString(locale)}
+              </time>
+            )}
+          </div>
+        )
+      },
+    },
+    {
       id: 'actions',
       header: t('Actions'),
       cell: ({ row }) => (
         <div className='flex flex-wrap gap-2'>
+          <Button
+            size='sm'
+            variant='outline'
+            onClick={() => setProbing(row.original)}
+          >
+            {t('Capability probes')}
+          </Button>
           {canWrite && (
             <Button
               size='sm'
@@ -197,6 +237,13 @@ export function ProviderChannels(props: { providerId: number }) {
             setEditing(undefined)
             void query.refetch()
           }}
+        />
+      )}
+      {probing && (
+        <ChannelProbeDialog
+          channel={probing}
+          canOperate={canOperate}
+          onClose={() => setProbing(null)}
         />
       )}
       <ConfirmDialog

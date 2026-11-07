@@ -96,7 +96,16 @@ func LogDebug(ctx context.Context, msg string, args ...any) {
 	}
 }
 
+const suppressPayloadLogsKey = "logger.suppress_payload_logs"
+
+// SuppressPayloadLogs prevents protocol diagnostics from exposing sensitive
+// request-local payloads. The caller still owns its sanitized result reporting.
+func SuppressPayloadLogs(c *gin.Context) { c.Set(suppressPayloadLogsKey, true) }
+
 func logHelper(ctx context.Context, level string, msg string) {
+	if ctx != nil && ctx.Value(suppressPayloadLogsKey) == true {
+		return
+	}
 	var id any = "SYSTEM"
 	if ctx != nil {
 		if requestID := ctx.Value(common.RequestIdKey); requestID != nil {

@@ -12,6 +12,7 @@ import (
 func registerPricingRoutes(api *gin.RouterGroup) {
 	group := api.Group("/admin/v1", middleware.AdminAuth())
 	for _, route := range []permissionRoute{
+		{http.MethodPost, "/price-versions/import", authz.PricingWrite, controller.BulkImport},
 		{http.MethodGet, "/price-versions", authz.PricingRead, controller.ListPriceVersions},
 		{http.MethodPost, "/price-versions", authz.PricingWrite, controller.CreatePriceVersion},
 		{http.MethodGet, "/price-versions/current", authz.PricingRead, controller.GetCurrentPriceVersion},
