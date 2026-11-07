@@ -44,10 +44,10 @@ type Channel struct {
 }
 
 // ChannelPurchasePriceChecker reports configuration, including an explicit zero
-// price. It runs in the Channel mutation transaction. No checker denies enable.
-// Price version management supplies the checker when that subsystem is ready.
+// price. It validates the proposed declaration in the Channel mutation
+// transaction. No checker denies enable.
 type ChannelPurchasePriceChecker interface {
-	HasPurchasePrice(context.Context, *gorm.DB, int) (bool, error)
+	HasPurchasePrice(context.Context, *gorm.DB, *Channel) (bool, error)
 }
 
 var channelPrices struct {
@@ -169,7 +169,7 @@ func MutateChannel(ctx context.Context, id int, action ChannelAction, change fun
 			configured := false
 			if checker != nil {
 				var err error
-				configured, err = checker.HasPurchasePrice(ctx, tx, record.ID)
+				configured, err = checker.HasPurchasePrice(ctx, tx, record)
 				if err != nil {
 					return err
 				}

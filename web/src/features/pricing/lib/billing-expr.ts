@@ -656,7 +656,9 @@ export function combineBillingExpr(
   const rules = (requestRuleExpr || '').trim()
   if (!base) return ''
   if (!rules) return base
-  return `(${base}) * ${rules}`
+  const version = base.match(/^v\d+:/)?.[0] ?? ''
+  const body = base.slice(version.length)
+  return `${version}(${body}) * ${rules}`
 }
 
 // ---------------------------------------------------------------------------
@@ -866,6 +868,21 @@ function buildRuleGroupFactor(group: RequestRuleGroup): string {
       ? condExprs[0]
       : condExprs.map((e) => (e.includes(' || ') ? `(${e})` : e)).join(' && ')
   return `(${combined} ? ${multiplier} : 1)`
+}
+
+export function hasInvalidRequestRuleDraft(
+  groups: RequestRuleGroup[]
+): boolean {
+  return groups.some(
+    (group) =>
+      !NUMERIC_LITERAL_REGEX.test(group.multiplier.trim()) ||
+      !Number.isFinite(Number(group.multiplier)) ||
+      Number(group.multiplier) < 0 ||
+      group.conditions.length === 0 ||
+      group.conditions.some(
+        (condition) => !buildRequestConditionExpr(condition)
+      )
+  )
 }
 
 export function buildRequestRuleExpr(groups: RequestRuleGroup[]): string {

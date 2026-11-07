@@ -27,7 +27,7 @@ import (
 // configuredChannelPrice models a configured price version, including zero.
 type configuredChannelPrice struct{}
 
-func (configuredChannelPrice) HasPurchasePrice(context.Context, *gorm.DB, int) (bool, error) {
+func (configuredChannelPrice) HasPurchasePrice(context.Context, *gorm.DB, *model.Channel) (bool, error) {
 	return true, nil
 }
 

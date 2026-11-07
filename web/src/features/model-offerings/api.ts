@@ -96,12 +96,24 @@ async function listAllChoices(path: string): Promise<ChoiceRecord[]> {
   }
 }
 
-async function listScopeChoices(path: string): Promise<ChoiceRecord[] | null> {
+export async function listScopeChoices(
+  path: string
+): Promise<ChoiceRecord[] | null> {
   try {
     return await listAllChoices(path)
   } catch (error) {
     if (isAxiosError(error) && error.response?.status === 403) return null
     throw error
+  }
+}
+
+export function channelChoice(
+  channel: ChoiceRecord,
+  providerNames?: ReadonlyMap<number, string | undefined>
+): Option {
+  return {
+    value: String(channel.id),
+    label: `#${channel.id} · ${channel.upstream_model_name} · ${channel.protocol} · ${providerNames?.get(channel.provider_id ?? 0) ?? `#${channel.provider_id}`}`,
   }
 }
 
@@ -133,10 +145,7 @@ export async function getOfferingChoices(): Promise<OfferingChoices> {
         label: item.name ?? `#${item.id}`,
       })) ?? null,
     channels:
-      channels?.map((item) => ({
-        value: String(item.id),
-        label: `#${item.id} · ${item.upstream_model_name} · ${item.protocol} · ${providerNames.get(item.provider_id ?? 0) ?? `#${item.provider_id}`}`,
-      })) ?? null,
+      channels?.map((item) => channelChoice(item, providerNames)) ?? null,
     groups: (groups.data ?? []).map((group) => ({
       value: group,
       label: group,

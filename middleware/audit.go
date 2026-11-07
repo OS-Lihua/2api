@@ -106,6 +106,10 @@ var auditRouteActions = map[string]string{
 	"POST /api/admin/v1/channels/:id/enable":  "channel.enable",
 	"POST /api/admin/v1/channels/:id/disable": "channel.disable",
 
+	// Price versions and exchange rates.
+	"POST /api/admin/v1/price-versions": "price_version.create",
+	"PUT /api/admin/v1/fx-rates":        "fx_rate.save",
+
 	// ModelOffering management.
 	"POST /api/admin/v1/model-offerings":             "model_offering.create",
 	"PUT /api/admin/v1/model-offerings/:id":          "model_offering.update",

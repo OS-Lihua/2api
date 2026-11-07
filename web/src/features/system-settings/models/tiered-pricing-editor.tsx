@@ -69,6 +69,7 @@ import {
   SOURCE_PARAM,
   SOURCE_TIME,
   buildRequestRuleExpr,
+  hasInvalidRequestRuleDraft,
   combineBillingExpr,
   createEmptyCondition,
   createEmptyRuleGroup,
@@ -303,11 +304,16 @@ const PRESET_GROUPS: PresetGroup[] = [
 // ---------------------------------------------------------------------------
 
 type RawExprEditorProps = {
+  currencyLabel?: string
   exprString: string
   onChange: (value: string) => void
 }
 
-function RawExprEditor({ exprString, onChange }: RawExprEditorProps) {
+function RawExprEditor({
+  exprString,
+  onChange,
+  currencyLabel,
+}: RawExprEditorProps) {
   const { t } = useTranslation()
   return (
     <div className='space-y-3'>
@@ -327,9 +333,14 @@ function RawExprEditor({ exprString, onChange }: RawExprEditorProps) {
             <code>has(source, text)</code>
           </div>
           <div>
-            {t(
-              'Use tier(name, fixed(amount)) for a USD price per request. Group and request multipliers still apply.'
-            )}
+            {currencyLabel
+              ? t(
+                  'Use tier(name, fixed(amount)) for a {{currency}} price per request. Group and request multipliers still apply.',
+                  { currency: currencyLabel }
+                )
+              : t(
+                  'Use tier(name, fixed(amount)) for a USD price per request. Group and request multipliers still apply.'
+                )}
           </div>
         </AlertDescription>
       </Alert>
@@ -1047,12 +1058,14 @@ function LlmPromptHelper({ modelName }: LlmPromptHelperProps) {
 // ---------------------------------------------------------------------------
 
 export type TieredPricingEditorProps = {
+  nativeCurrency?: string
   currency?: PricingCurrency
   modelName?: string
   billingExpr: string
   requestRuleExpr: string
-  onBillingExprChange: (next: string) => void
-  onRequestRuleExprChange: (next: string) => void
+  onBillingExprChange?: (next: string) => void
+  onRequestRuleExprChange?: (next: string) => void
+  onExpressionChange?: (source: string) => void
 }
 
 type EditorMode = 'visual' | 'raw'
@@ -1064,14 +1077,24 @@ function parseTierEditorDocument(source: string): VisualBillingDocument | null {
 }
 
 export const TieredPricingEditor = memo(function TieredPricingEditor({
-  currency = USD_PRICING_CURRENCY,
+  currency: displayCurrency = USD_PRICING_CURRENCY,
+  nativeCurrency,
   modelName,
   billingExpr: currentExpr,
   requestRuleExpr: currentRequestRuleExpr,
   onBillingExprChange,
   onRequestRuleExprChange,
+  onExpressionChange,
 }: TieredPricingEditorProps) {
   const { t } = useTranslation()
+  const currency = nativeCurrency
+    ? {
+        label: nativeCurrency,
+        symbol: nativeCurrency,
+        exchangeRate: 1,
+        native: true,
+      }
+    : displayCurrency
   const [visualDocument, setVisualDocument] =
     useState<VisualBillingDocument | null>(() =>
       parseTierEditorDocument(currentExpr)
@@ -1105,7 +1128,9 @@ export const TieredPricingEditor = memo(function TieredPricingEditor({
       visualDocument ? serializeVisualBillingDocument(visualDocument) : null,
     [visualDocument]
   )
-  const invalidDraft = editorMode === 'visual' && serialized?.ok === false
+  const invalidDraft =
+    editorMode === 'visual' &&
+    (serialized?.ok === false || hasInvalidRequestRuleDraft(requestRuleGroups))
   const canUseVisualRules =
     !ruleExpr || tryParseRequestRuleExpr(ruleExpr) !== null
   const effectiveExpr = baseExpr
@@ -1116,10 +1141,13 @@ export const TieredPricingEditor = memo(function TieredPricingEditor({
       const result = serializeVisualBillingDocument(next)
       if (result.ok) {
         setBaseExpr(result.source)
-        onBillingExprChange(result.source)
+        const source = combineBillingExpr(result.source, ruleExpr)
+        setRawExpr(source)
+        onBillingExprChange?.(result.source)
+        onExpressionChange?.(source)
       }
     },
-    [onBillingExprChange]
+    [onBillingExprChange, onExpressionChange, ruleExpr]
   )
 
   const handleRawChange = useCallback(
@@ -1128,10 +1156,11 @@ export const TieredPricingEditor = memo(function TieredPricingEditor({
       const split = splitBillingExprAndRequestRules(value)
       setBaseExpr(split.billingExpr)
       setRuleExpr(split.requestRuleExpr)
-      onBillingExprChange(split.billingExpr)
-      onRequestRuleExprChange(split.requestRuleExpr)
+      onBillingExprChange?.(split.billingExpr)
+      onRequestRuleExprChange?.(split.requestRuleExpr)
+      onExpressionChange?.(value)
     },
-    [onBillingExprChange, onRequestRuleExprChange]
+    [onBillingExprChange, onRequestRuleExprChange, onExpressionChange]
   )
 
   const handleModeChange = useCallback(
@@ -1150,12 +1179,12 @@ export const TieredPricingEditor = memo(function TieredPricingEditor({
         }
         setVisualDocument(document)
         setRequestRuleGroups(tryParseRequestRuleExpr(ruleExpr) || [])
-      } else {
+      } else if (!nativeCurrency) {
         setRawExpr(combineBillingExpr(baseExpr, ruleExpr))
       }
       setEditorMode(next)
     },
-    [editorMode, invalidDraft, baseExpr, ruleExpr, t]
+    [editorMode, invalidDraft, baseExpr, ruleExpr, t, nativeCurrency]
   )
 
   const applyPreset = useCallback(
@@ -1169,20 +1198,25 @@ export const TieredPricingEditor = memo(function TieredPricingEditor({
       setVisualDocument(document)
       setEditorMode(document ? 'visual' : 'raw')
       setRequestRuleGroups(groups)
-      onBillingExprChange(preset.expr)
-      onRequestRuleExprChange(rules)
+      onBillingExprChange?.(preset.expr)
+      onRequestRuleExprChange?.(rules)
+      onExpressionChange?.(combineBillingExpr(preset.expr, rules))
     },
-    [onBillingExprChange, onRequestRuleExprChange]
+    [onBillingExprChange, onRequestRuleExprChange, onExpressionChange]
   )
 
   const handleRuleGroupsChange = useCallback(
     (next: RequestRuleGroup[]) => {
       setRequestRuleGroups(next)
+      if (hasInvalidRequestRuleDraft(next)) return
       const rules = buildRequestRuleExpr(next)
       setRuleExpr(rules)
-      onRequestRuleExprChange(rules)
+      const source = combineBillingExpr(baseExpr, rules)
+      setRawExpr(source)
+      onRequestRuleExprChange?.(rules)
+      onExpressionChange?.(source)
     },
-    [onRequestRuleExprChange]
+    [onRequestRuleExprChange, onExpressionChange, baseExpr]
   )
 
   return (
@@ -1215,7 +1249,7 @@ export const TieredPricingEditor = memo(function TieredPricingEditor({
             </SelectContent>
           </Select>
         </Field>
-        {editorMode === 'raw' && (
+        {editorMode === 'raw' && !nativeCurrency && (
           <div className='sm:pb-0.5'>
             <LlmPromptHelper modelName={modelName} />
           </div>
@@ -1223,9 +1257,14 @@ export const TieredPricingEditor = memo(function TieredPricingEditor({
       </div>
 
       <p className='text-muted-foreground text-xs'>
-        {t(
-          'Raw expressions and presets use USD. Currency selection only converts visual price inputs and monetary previews.'
-        )}
+        {nativeCurrency
+          ? t(
+              'Expression coefficients and presets use {{currency}}: token prices per million tokens, fixed prices per request. Changing currency does not convert the expression.',
+              { currency: nativeCurrency }
+            )
+          : t(
+              'Raw expressions and presets use USD. Currency selection only converts visual price inputs and monetary previews.'
+            )}
       </p>
       <PresetSection applyPreset={applyPreset} />
 
@@ -1239,7 +1278,11 @@ export const TieredPricingEditor = memo(function TieredPricingEditor({
           />
         )}
         {editorMode === 'raw' && (
-          <RawExprEditor exprString={rawExpr} onChange={handleRawChange} />
+          <RawExprEditor
+            currencyLabel={nativeCurrency}
+            exprString={rawExpr}
+            onChange={handleRawChange}
+          />
         )}
         {invalidDraft && (
           <p role='alert' className='text-destructive text-sm'>

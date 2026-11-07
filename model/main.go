@@ -318,6 +318,9 @@ func migrateDB() error {
 	if err := MigrateRecommendationRules(DB); err != nil {
 		return fmt.Errorf("migrate recommendation rules: %w", err)
 	}
+	if err := MigratePricing(DB); err != nil {
+		return fmt.Errorf("migrate pricing: %w", err)
+	}
 	if err := migrateWalletLedger(DB); err != nil {
 		return fmt.Errorf("migrate wallet ledger: %w", err)
 	}
