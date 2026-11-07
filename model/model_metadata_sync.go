@@ -265,7 +265,7 @@ func ApplyMetadataSync(updates []MetadataSyncUpdate, upstreamVendors map[string]
 				if _, changesRule := fields["name_rule"]; changesRule {
 					candidate := *locals[update.ModelName]
 					candidate.NameRule = update.Values.NameRule
-					if err := candidate.validateChannelDeclarations(tx, false); err != nil {
+					if err := candidate.validateReferences(tx, false); err != nil {
 						return err
 					}
 				}
