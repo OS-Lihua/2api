@@ -173,12 +173,12 @@ it('recommendations keep URL credentials out of requests', async () => {
     'private-pass-fixture',
     'private-query-fixture',
     'private-fragment-fixture',
-  ]
+  ] as const
   const endpoint = new URL('https://api.deepseek.com:8443/v1')
-  endpoint.username = secrets[0]!
-  endpoint.password = secrets[1]!
-  endpoint.searchParams.set('api_key', secrets[2]!)
-  endpoint.hash = secrets[3]!
+  endpoint.username = secrets[0]
+  endpoint.password = secrets[1]
+  endpoint.searchParams.set('api_key', secrets[2])
+  endpoint.hash = secrets[3]
   renderDrawer()
   await userEvent.click(screen.getByRole('textbox', { name: 'Base URL' }))
   await userEvent.paste(endpoint.href)
@@ -188,7 +188,7 @@ it('recommendations keep URL credentials out of requests', async () => {
       ([path]) => path === '/api/admin/v1/recommendations/provider'
     )
     expect(lookups.length).toBeGreaterThan(0)
-    const [path, config] = lookups.at(-1)!
+    const [path, config] = lookups.at(-1) ?? []
     const requestURI = new URL(
       api.getUri({ url: path, ...config }),
       'https://console.example'
