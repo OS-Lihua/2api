@@ -98,6 +98,14 @@ var auditRouteActions = map[string]string{
 	"PUT /api/admin/v1/recommendation-rules/:id":    "recommendation_rule.save",
 	"DELETE /api/admin/v1/recommendation-rules/:id": "recommendation_rule.delete",
 
+	// Single-model Channels.
+	"POST /api/admin/v1/channels":             "channel.create",
+	"PATCH /api/admin/v1/channels/:id":        "channel.update",
+	"DELETE /api/admin/v1/channels/:id":       "channel.delete",
+	"POST /api/admin/v1/channels/:id/confirm": "channel.confirm",
+	"POST /api/admin/v1/channels/:id/enable":  "channel.enable",
+	"POST /api/admin/v1/channels/:id/disable": "channel.disable",
+
 	// 部署
 	"POST /api/deployments/":      "deployment.create",
 	"PUT /api/deployments/:id":    "deployment.update",

@@ -287,6 +287,7 @@ func SetApiRouter(router *gin.Engine) {
 		handlePermissionRoute(recommendations, http.MethodPut, "/recommendation-rules/:id", authz.RecommendationWrite, controller.SaveRecommendationRule)
 		handlePermissionRoute(recommendations, http.MethodDelete, "/recommendation-rules/:id", authz.RecommendationWrite, controller.DeleteRecommendationRule)
 		handlePermissionRoute(recommendations, http.MethodGet, "/recommendations/:kind", authz.RecommendationRead, controller.QueryRecommendations)
+		registerSingleModelChannelRoutes(apiRouter)
 		registerAuthzRoutes(apiRouter)
 		tokenRoute := apiRouter.Group("/token")
 		tokenRoute.Use(middleware.UserAuth())

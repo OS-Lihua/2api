@@ -89,6 +89,46 @@ func (s Set) Normalize() (Set, error) {
 	return Set{Features: features, InputModalities: input, OutputModalities: output, Limits: s.Limits}, nil
 }
 
+// Narrow validates a Channel declaration against its Model and inherits
+// numeric limits omitted by the Channel.
+func (s Set) Narrow(parent Set) (Set, error) {
+	result, err := s.Normalize()
+	if err != nil {
+		return Set{}, err
+	}
+	for _, value := range result.Features {
+		if !slices.Contains(parent.Features, value) {
+			return Set{}, common.NewMessage("Channel capabilities exceed the model declaration")
+		}
+	}
+	for _, pair := range []struct{ child, parent []Modality }{{result.InputModalities, parent.InputModalities}, {result.OutputModalities, parent.OutputModalities}} {
+		for _, value := range pair.child {
+			if !slices.Contains(pair.parent, value) {
+				return Set{}, common.NewMessage("Channel capabilities exceed the model declaration")
+			}
+		}
+	}
+	for _, pair := range []struct {
+		child  **int64
+		parent *int64
+	}{
+		{&result.Limits.ContextLength, parent.Limits.ContextLength},
+		{&result.Limits.MaxOutputTokens, parent.Limits.MaxOutputTokens},
+		{&result.Limits.MaxImages, parent.Limits.MaxImages},
+		{&result.Limits.MaxDurationSeconds, parent.Limits.MaxDurationSeconds},
+		{&result.Limits.EmbeddingDimensions, parent.Limits.EmbeddingDimensions},
+	} {
+		if *pair.child == nil {
+			*pair.child = pair.parent
+			continue
+		}
+		if pair.parent == nil || **pair.child > *pair.parent {
+			return Set{}, common.NewMessage("Channel capabilities exceed the model declaration")
+		}
+	}
+	return result, nil
+}
+
 // canonical keeps the known values of all in their canonical order and
 // rejects any value outside all.
 func canonical[T ~string](values, all []T, unknownKey string) ([]T, error) {
