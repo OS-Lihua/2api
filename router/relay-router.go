@@ -62,7 +62,18 @@ func SetRelayRouter(router *gin.Engine) {
 	}
 
 	geminiRouter := router.Group("/v1beta/models")
-	geminiRouter.Use(defaultPluginDispatcher.dispatch)
+	geminiRouter.Use(func(c *gin.Context) {
+		generation := defaultPluginDispatcher.registry.Generation()
+		if generation != nil {
+			for _, group := range generation.RouteGroups() {
+				if group.Method == c.Request.Method && routePatternsIntersect(group.GinPath, c.Request.URL.Path) {
+					defaultPluginDispatcher.dispatch(c)
+					return
+				}
+			}
+		}
+		c.Next()
+	})
 	geminiRouter.Use(middleware.RouteTag("relay"))
 	geminiRouter.Use(redirectModelDiscoveryTrailingSlash)
 	geminiRouter.Use(middleware.DisableCache(), middleware.TokenAuth())

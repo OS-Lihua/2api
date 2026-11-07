@@ -11,6 +11,8 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/alicebob/miniredis/v2"
@@ -82,6 +84,17 @@ func TestKeyPermissionsLegacyAllowlistMigration(t *testing.T) {
 
 func TestKeyPermissionsDiscoveryProtocols(t *testing.T) {
 	f := newTextGatewayFixture(t, func(http.ResponseWriter, *http.Request) { t.Error("unexpected dispatch") })
+	source, err := plugins.Source("google")
+	require.NoError(t, err)
+	registry := jsplugin.NewRegistry()
+	_, err = registry.RegisterFactory(source, jsplugin.Options{Key: "google"})
+	require.NoError(t, err)
+	previousRegistry, previousDispatcherRegistry := jsplugin.DefaultRegistry, defaultPluginDispatcher.registry
+	jsplugin.DefaultRegistry, defaultPluginDispatcher.registry = registry, registry
+	t.Cleanup(func() {
+		jsplugin.DefaultRegistry, defaultPluginDispatcher.registry = previousRegistry, previousDispatcherRegistry
+	})
+	f.engine.NoRoute(SetPluginRouter(f.engine))
 	for _, path := range []string{"/v1/models/", "/v1/models/gateway-alias/", "/v1beta/models/", "/v1beta/models/gateway-alias/"} {
 		response := adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, path+"?limit=7", "")
 		assert.Equal(t, http.StatusMovedPermanently, response.Code, response.Body.String())
@@ -97,7 +110,7 @@ func TestKeyPermissionsDiscoveryProtocols(t *testing.T) {
 		assert.Contains(t, response.Body.String(), "gateway-offering")
 		assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
 	}
-	_, err := model.MutateKeyPermissions(t.Context(), f.token.Id, f.user.Id, 0, "deny_all", model.KeyPermissions{}, nil)
+	_, err = model.MutateKeyPermissions(t.Context(), f.token.Id, f.user.Id, 0, "deny_all", model.KeyPermissions{}, nil)
 	require.NoError(t, err)
 	for _, language := range []struct{ code, message string }{{"en", "Model not found"}, {"zh-CN", "模型不存在"}, {"zh-TW", "模型不存在"}} {
 		request := httptest.NewRequest(http.MethodGet, "/v1/models/gateway-alias", nil)
