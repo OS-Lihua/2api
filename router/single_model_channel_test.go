@@ -13,6 +13,8 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/capability"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/gin-gonic/gin"
@@ -43,7 +45,7 @@ func TestSingleModelChannelAPI(t *testing.T) {
 	require.NoError(t, authz.Init(db))
 	root := model.User{Username: "channel-root", Password: "placeholder", Role: common.RoleRootUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "channel-root"}
 	require.NoError(t, db.Create(&root).Error)
-	token := createWalletTestAccessToken(t, root.Id, "channel:read", "channel:write", "channel:sensitive_write", "channel:operate", "model:write")
+	token := createWalletTestAccessToken(t, root.Id, "channel:read", "channel:write", "channel:sensitive_write", "channel:operate", "model:write", "model:read")
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
 	SetApiRouter(engine)
@@ -63,7 +65,7 @@ func TestSingleModelChannelAPI(t *testing.T) {
 	require.NoError(t, unified.Insert())
 	provider := model.Provider{Name: "Channel provider", Key: "secret", Status: common.ChannelStatusEnabled, Type: 1}
 	require.NoError(t, db.Create(&provider).Error)
-	body := fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":"openai_chat","upstream_model_name":"openai/GPT-4o","rpm":60,"tpm":10000,"max_concurrency":2,"weight":10,"parameter_overrides":{"temperature":0}}`, provider.Id, unified.Id)
+	body := fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":"openai_chat","upstream_model_name":"openai/GPT-4o","rpm":60,"tpm":10000,"max_concurrency":2,"weight":10,"parameter_overrides":{"temperature":0,"private_marker":"channel-override-must-not-be-audited"}}`, provider.Id, unified.Id)
 	status, created := call(http.MethodPost, "/api/admin/v1/channels", body)
 	require.Equal(t, http.StatusOK, status, created)
 	require.Equal(t, true, created["success"], created)
@@ -129,6 +131,12 @@ func TestSingleModelChannelAPI(t *testing.T) {
 		require.Equal(t, http.StatusOK, status, result)
 		assert.Equal(t, "disabled", result["data"].(map[string]any)["status"])
 	})
+	t.Run("referenced models cannot be soft deleted", func(t *testing.T) {
+		status, result := call(http.MethodDelete, fmt.Sprintf("/api/admin/v1/models/%d", unified.Id), "")
+		assert.Equal(t, http.StatusConflict, status, result)
+		status, _ = call(http.MethodGet, fmt.Sprintf("/api/admin/v1/models/%d", unified.Id), "")
+		assert.Equal(t, http.StatusOK, status)
+	})
 	t.Run("suggestions ignore only casing and slash namespaces", func(t *testing.T) {
 		status, result := call(http.MethodGet, "/api/admin/v1/channels/suggest-models?upstream_model_name=tenant/OPENAI/GPT-4O", "")
 		require.Equal(t, http.StatusOK, status, result)
@@ -146,6 +154,36 @@ func TestSingleModelChannelAPI(t *testing.T) {
 			status, result := call(http.MethodPatch, path, invalid)
 			assert.Equal(t, http.StatusBadRequest, status, result)
 		}
+	})
+	t.Run("task binding needs permission and unavailable plugins can be disabled", func(t *testing.T) {
+		previousRegistry := jsplugin.DefaultRegistry
+		jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+		defer func() { jsplugin.DefaultRegistry = previousRegistry }()
+		source, err := plugins.Source("kling")
+		require.NoError(t, err)
+		_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "kling"})
+		require.NoError(t, err)
+		taskBody := fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":"task:kling","upstream_model_name":"task-model"}`, provider.Id, unified.Id)
+		status, result := call(http.MethodPost, "/api/admin/v1/channels", taskBody)
+		assert.Equal(t, http.StatusForbidden, status, result)
+		original := token
+		token = createWalletTestAccessToken(t, root.Id, "channel:read", "channel:write", "channel:operate", "task_plugin:bind")
+		defer func() { token = original }()
+		status, result = call(http.MethodPost, "/api/admin/v1/channels", taskBody)
+		require.Equal(t, http.StatusOK, status, result)
+		taskPath := fmt.Sprintf("/api/admin/v1/channels/%v", result["data"].(map[string]any)["id"])
+		status, _ = call(http.MethodPost, taskPath+"/confirm", "")
+		require.Equal(t, http.StatusOK, status)
+		status, _ = call(http.MethodPost, taskPath+"/enable", "")
+		require.Equal(t, http.StatusOK, status)
+		jsplugin.DefaultRegistry.SetEnabled(false)
+		status, _ = call(http.MethodPost, taskPath+"/enable", "")
+		assert.Equal(t, http.StatusBadRequest, status)
+		status, result = call(http.MethodPost, taskPath+"/disable", "")
+		require.Equal(t, http.StatusOK, status, result)
+		assert.Equal(t, "disabled", result["data"].(map[string]any)["status"])
+		status, _ = call(http.MethodDelete, taskPath, "")
+		require.Equal(t, http.StatusOK, status)
 	})
 	t.Run("PAT scopes and Casbin guard every action", func(t *testing.T) {
 		original := token
@@ -182,4 +220,18 @@ func TestSingleModelChannelAPI(t *testing.T) {
 	assert.Equal(t, http.StatusOK, status)
 	status, _ = call(http.MethodGet, path, "")
 	assert.Equal(t, http.StatusNotFound, status)
+	audits, _, err := model.GetAuditLogs(model.AuditLogFilter{UserId: root.Id, Category: model.AuditCategoryOperation}, 0, 100, common.RoleRootUser)
+	require.NoError(t, err)
+	actions := map[string]bool{}
+	for _, audit := range audits {
+		actions[audit.Action] = true
+		encoded, err := common.Marshal(audit)
+		require.NoError(t, err)
+		assert.NotContains(t, string(encoded), "channel-override-must-not-be-audited")
+		assert.NotContains(t, string(encoded), token)
+		assert.NotContains(t, string(encoded), provider.Key)
+	}
+	for _, action := range []string{"channel.create", "channel.update", "channel.confirm", "channel.enable", "channel.disable", "channel.delete"} {
+		assert.True(t, actions[action], action)
+	}
 }

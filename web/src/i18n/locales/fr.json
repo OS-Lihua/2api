@@ -3813,6 +3813,7 @@
     "Model ID": "ID du modèle",
     "Model ID is required": "L’identifiant du modèle est requis",
     "Model is required": "Le modèle est requis",
+    "Model is still referenced by a channel": "Ce modèle est encore référencé par un canal",
     "Model Limits": "Limites du modèle",
     "Model limits enabled": "Restrictions de modèles activées",
     "Model List": "Liste des modèles",

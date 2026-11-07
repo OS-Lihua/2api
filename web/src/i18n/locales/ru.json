@@ -3813,6 +3813,7 @@
     "Model ID": "ID модели",
     "Model ID is required": "Требуется ID модели",
     "Model is required": "Необходимо выбрать модель",
+    "Model is still referenced by a channel": "На эту модель всё ещё ссылается канал",
     "Model Limits": "Лимиты модели",
     "Model limits enabled": "Ограничения моделей включены",
     "Model List": "Список моделей",

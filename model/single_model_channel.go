@@ -61,19 +61,42 @@ func SetChannelPurchasePriceChecker(checker ChannelPurchasePriceChecker) {
 	channelPrices.checker = checker
 }
 
-// SaveChannel validates and persists a full declaration. The caller supplies
-// the original mapping and status on updates; actions are validated here too.
-func SaveChannel(ctx context.Context, record *Channel, action string) error {
-	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var previous Channel
-		if record.ID != 0 {
-			if err := lockForUpdate(tx).First(&previous, record.ID).Error; err != nil {
+type ChannelAction string
+
+const (
+	ChannelSave    ChannelAction = "save"
+	ChannelConfirm ChannelAction = "confirm"
+	ChannelEnable  ChannelAction = "enable"
+	ChannelDisable ChannelAction = "disable"
+)
+
+// MutateChannel applies a declaration change to the current row under its lock,
+// then validates the mapping and state. This keeps concurrent PATCH requests
+// from overwriting fields they did not submit. change may be nil for actions.
+func MutateChannel(ctx context.Context, id int, action ChannelAction, change func(*Channel) error) (*Channel, error) {
+	record := &Channel{}
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if id != 0 {
+			if err := lockForUpdate(tx).First(record, id).Error; err != nil {
 				return err
 			}
-			// Actions operate on the current mapping, never a stale HTTP snapshot.
-			if action != "save" {
-				*record = previous
+		} else if action != ChannelSave {
+			return gorm.ErrRecordNotFound
+		}
+		previous := *record
+		if change != nil {
+			if err := change(record); err != nil {
+				return err
 			}
+		}
+		record.UpstreamModelName = strings.TrimSpace(record.UpstreamModelName)
+		if action == ChannelDisable {
+			record.Status = ChannelDisabled
+			if !record.MappingConfirmed {
+				record.Status = ChannelPending
+			}
+			record.UpdatedAt = common.GetTimestamp()
+			return tx.Model(record).Select("status", "updated_at").Updates(record).Error
 		}
 		// Serialize with Model declaration updates before validating its narrowing.
 		var unified Model
@@ -122,19 +145,14 @@ func SaveChannel(ctx context.Context, record *Channel, action string) error {
 			return common.NewMessage("Parameter overrides must be a JSON object")
 		}
 		switch action {
-		case "confirm":
+		case ChannelConfirm:
 			if !record.MappingConfirmed {
 				record.Status = ChannelDisabled
 			}
 			record.MappingConfirmed = true
-		case "disable":
-			record.Status = ChannelDisabled
-			if !record.MappingConfirmed {
-				record.Status = ChannelPending
-			}
-		case "enable":
+		case ChannelEnable:
 			record.Status = ChannelEnabled
-		case "save":
+		case ChannelSave:
 		default:
 			return errors.New("unknown channel action")
 		}
@@ -166,6 +184,7 @@ func SaveChannel(ctx context.Context, record *Channel, action string) error {
 		}
 		return tx.Omit("Provider", "Model").Save(record).Error
 	})
+	return record, err
 }
 
 // EffectiveCapabilities validates a narrowing and inherits undeclared numeric

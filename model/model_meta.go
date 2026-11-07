@@ -270,6 +270,7 @@ func (mi *Model) Update() error {
 
 // ErrModelChannelCapabilities prevents a Model edit from invalidating Channels.
 var ErrModelChannelCapabilities = common.NewMessage("Model capabilities would invalidate an existing channel")
+var ErrModelHasChannels = common.NewMessage("Model is still referenced by a channel")
 
 // UpdateDeclaration saves metadata and the capability declaration.
 func (mi *Model) UpdateDeclaration() error {
@@ -370,6 +371,13 @@ func DeleteModelMetadata(ids []int, removeFromChannels, removePricing bool) (Mod
 		}
 		if len(records) != len(modelIDs) {
 			return errors.New("selected models changed; reload before deleting")
+		}
+		var channelCount int64
+		if err := tx.Model(&Channel{}).Where("model_id IN ?", modelIDs).Count(&channelCount).Error; err != nil {
+			return err
+		}
+		if channelCount > 0 {
+			return ErrModelHasChannels
 		}
 		for _, record := range records {
 			if removeFromChannels && record.NameRule != NameRuleExact {

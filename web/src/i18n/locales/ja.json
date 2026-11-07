@@ -3813,6 +3813,7 @@
     "Model ID": "モデル ID",
     "Model ID is required": "モデル ID が必要です",
     "Model is required": "モデルを選択してください",
+    "Model is still referenced by a channel": "このモデルはまだチャネルから参照されています",
     "Model Limits": "モデル制限",
     "Model limits enabled": "モデル制限が有効",
     "Model List": "モデル一覧",

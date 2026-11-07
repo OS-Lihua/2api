@@ -33,6 +33,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { api } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth-store'
 
+import { ChannelMutateDrawer } from '../channel-mutate-drawer'
 import { ProviderChannels } from '../provider-channels'
 import { ProvidersProvider } from '../providers-provider'
 import { ProvidersTable } from '../providers-table'
@@ -131,6 +132,160 @@ it('keyboard users expand and collapse one provider to load its channels', async
   )
   client.clear()
   localStorage.clear()
+})
+
+it('creating a channel suggests its Model, validates limits, and retains a rejected draft', async () => {
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
+  vi.spyOn(api, 'get').mockImplementation(async (url) => {
+    if (url === '/api/admin/v1/channels/protocols') {
+      return { data: { success: true, data: ['openai_chat'] } }
+    }
+    if (url === '/api/admin/v1/channels/suggest-models') {
+      return {
+        data: {
+          success: true,
+          data: { items: [{ id: 2, name: 'gpt-4o' }], selected_model_id: 2 },
+        },
+      }
+    }
+    return {
+      data: { success: true, data: { items: [{ id: 2, name: 'gpt-4o' }] } },
+    }
+  })
+  let complete: (value: unknown) => void = () => {}
+  const post = vi.spyOn(api, 'post').mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        complete = resolve
+      })
+  )
+  const onSaved = vi.fn()
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <ChannelMutateDrawer
+          providerId={7}
+          onClose={() => {}}
+          onSaved={onSaved}
+        />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  await userEvent.type(
+    screen.getByRole('textbox', { name: 'Upstream model name' }),
+    'openai/GPT-4o'
+  )
+  await userEvent.click(screen.getByRole('button', { name: 'Suggest Model' }))
+  await userEvent.click(screen.getByRole('combobox', { name: 'Protocol' }))
+  await userEvent.click(
+    await screen.findByRole('option', { name: 'openai_chat' })
+  )
+  const rpm = screen.getByRole('textbox', { name: 'RPM' })
+  await userEvent.clear(rpm)
+  await userEvent.type(rpm, '-1')
+  await userEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+  expect(await screen.findByText('Enter a non-negative integer')).toBeVisible()
+  expect(post).not.toHaveBeenCalled()
+  await userEvent.clear(rpm)
+  await userEvent.type(rpm, '60')
+  await userEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+  await waitFor(() =>
+    expect(post).toHaveBeenCalledWith('/api/admin/v1/channels', {
+      provider_id: 7,
+      model_id: 2,
+      protocol: 'openai_chat',
+      upstream_model_name: 'openai/GPT-4o',
+      rpm: 60,
+      tpm: 0,
+      max_concurrency: 0,
+      weight: 1,
+      parameter_overrides: {},
+      capabilities: null,
+    })
+  )
+  expect(screen.getByRole('button', { name: 'Saving...' })).toBeDisabled()
+  complete({ data: { success: false, message: 'Save rejected' } })
+  expect(await screen.findByRole('alert')).toHaveTextContent('Save rejected')
+  expect(onSaved).not.toHaveBeenCalled()
+  expect(
+    screen.getByRole('textbox', { name: 'Upstream model name' })
+  ).toHaveValue('openai/GPT-4o')
+  post.mockResolvedValue({ data: { success: true, data: { id: 3 } } })
+  await userEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+  await waitFor(() => expect(onSaved).toHaveBeenCalled())
+  client.clear()
+})
+
+it('editing a channel saves explicit zero limits and its capability narrowing', async () => {
+  const channel = {
+    id: 3,
+    provider_id: 7,
+    model_id: 2,
+    protocol: 'openai_chat',
+    upstream_model_name: 'gpt-4o',
+    status: 'disabled' as const,
+    mapping_confirmed: true,
+    rpm: 60,
+    tpm: 1000,
+    max_concurrency: 2,
+    weight: 1,
+    capabilities: {
+      features: ['streaming' as const],
+      input_modalities: ['text' as const],
+      output_modalities: ['text' as const],
+      limits: { context_length: 16000 },
+    },
+    parameter_overrides: { temperature: 0 },
+  }
+  vi.spyOn(api, 'get').mockImplementation(async (url) => ({
+    data: {
+      success: true,
+      data:
+        url === '/api/admin/v1/channels/protocols'
+          ? ['openai_chat']
+          : { items: [{ id: 2, name: 'gpt-4o' }] },
+    },
+  }))
+  const patch = vi
+    .spyOn(api, 'patch')
+    .mockResolvedValue({ data: { success: true, data: channel } })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  const onSaved = vi.fn()
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <ChannelMutateDrawer
+          providerId={7}
+          channel={channel}
+          onClose={() => {}}
+          onSaved={onSaved}
+        />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  const tpm = screen.getByRole('textbox', { name: 'TPM' })
+  await userEvent.clear(tpm)
+  await userEvent.type(tpm, '0')
+  await userEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+  await waitFor(() => expect(onSaved).toHaveBeenCalled())
+  expect(patch).toHaveBeenCalledWith('/api/admin/v1/channels/3', {
+    provider_id: 7,
+    model_id: 2,
+    protocol: 'openai_chat',
+    upstream_model_name: 'gpt-4o',
+    rpm: 60,
+    tpm: 0,
+    max_concurrency: 2,
+    weight: 1,
+    capabilities: channel.capabilities,
+    parameter_overrides: { temperature: 0 },
+  })
+  client.clear()
 })
 
 it('shows channels for this provider and confirms a pending mapping', async () => {

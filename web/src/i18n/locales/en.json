@@ -3813,6 +3813,7 @@
     "Model ID": "Model ID",
     "Model ID is required": "Model ID is required",
     "Model is required": "Model is required",
+    "Model is still referenced by a channel": "Model is still referenced by a channel",
     "Model Limits": "Model Limits",
     "Model limits enabled": "Model limits enabled",
     "Model List": "Model List",

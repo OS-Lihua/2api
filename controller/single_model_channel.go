@@ -12,6 +12,8 @@ import (
 	"github.com/QuantumNous/new-api/pkg/capability"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/protocol"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/gorm"
@@ -40,11 +42,15 @@ func channelView(record model.Channel) singleChannelView {
 	return singleChannelView{Channel: record, ParameterOverrides: json.RawMessage(record.ParameterOverrides)}
 }
 
+var errChannelPluginBindDenied = common.NewMessage("No permission to perform this action")
+
 func singleChannelError(c *gin.Context, err error) {
 	status := http.StatusInternalServerError
 	var message *common.Message
 	var pgError *pgconn.PgError
 	switch {
+	case errors.Is(err, errChannelPluginBindDenied):
+		status = http.StatusForbidden
 	case errors.As(err, &message):
 		status = http.StatusBadRequest
 	case errors.Is(err, gorm.ErrRecordNotFound):
@@ -130,65 +136,95 @@ func GetSingleModelChannel(c *gin.Context) {
 	common.ApiSuccess(c, channelView(record))
 }
 
-func mutateSingleModelChannel(c *gin.Context, action string) {
-	var record model.Channel
+func mutateSingleModelChannel(c *gin.Context, action model.ChannelAction) {
+	id := 0
 	if c.Param("id") != "" {
-		id, ok := providerIDParam(c)
+		var ok bool
+		id, ok = providerIDParam(c)
 		if !ok {
 			return
 		}
-		if err := model.DB.First(&record, id).Error; err != nil {
-			singleChannelError(c, err)
+	}
+	var fields map[string]json.RawMessage
+	if action == model.ChannelSave {
+		if err := common.DecodeJson(c.Request.Body, &fields); err != nil || fields == nil {
+			singleChannelError(c, common.NewMessage("Invalid parameters"))
 			return
 		}
 	}
-	if action == "save" {
-		request := singleChannelRequest{ProviderID: record.ProviderID, ModelID: record.ModelID, Protocol: record.Protocol, UpstreamModelName: record.UpstreamModelName, Capabilities: record.Capabilities, ParameterOverrides: json.RawMessage(record.ParameterOverrides), RPM: record.RPM, TPM: record.TPM, MaxConcurrency: record.MaxConcurrency, Weight: record.Weight}
-		if record.ID == 0 {
-			request.Weight = 1
-			request.ParameterOverrides = json.RawMessage(`{}`)
+	record, err := model.MutateChannel(c.Request.Context(), id, action, func(current *model.Channel) error {
+		previousProtocol := current.Protocol
+		newChannel := current.ID == 0
+		if action == model.ChannelSave {
+			request := singleChannelRequest{ProviderID: current.ProviderID, ModelID: current.ModelID, Protocol: current.Protocol, UpstreamModelName: current.UpstreamModelName, Capabilities: current.Capabilities, ParameterOverrides: json.RawMessage(current.ParameterOverrides), RPM: current.RPM, TPM: current.TPM, MaxConcurrency: current.MaxConcurrency, Weight: current.Weight}
+			if current.ID == 0 {
+				request.Weight = 1
+				request.ParameterOverrides = json.RawMessage(`{}`)
+			}
+			// A supplied declaration replaces the old declaration; omission keeps it.
+			if _, provided := fields["capabilities"]; provided {
+				request.Capabilities = nil
+			}
+			patch, err := common.Marshal(fields)
+			if err != nil {
+				return err
+			}
+			if err := common.Unmarshal(patch, &request); err != nil {
+				return common.NewMessage("Invalid parameters")
+			}
+			current.ProviderID = request.ProviderID
+			current.ModelID = request.ModelID
+			current.Protocol = request.Protocol
+			current.UpstreamModelName = request.UpstreamModelName
+			current.Capabilities = request.Capabilities
+			current.ParameterOverrides = string(request.ParameterOverrides)
+			current.RPM = request.RPM
+			current.TPM = request.TPM
+			current.MaxConcurrency = request.MaxConcurrency
+			current.Weight = request.Weight
+			if key, task := current.Protocol.TaskPluginKey(); task {
+				if _, available := jsplugin.DefaultRegistry.Get(key); !available {
+					return common.NewMessage("Task plugin is not available")
+				}
+				if newChannel || current.Protocol != previousProtocol {
+					canBind := authz.Can(c.GetInt("id"), c.GetInt("role"), authz.TaskPluginBind)
+					if c.GetBool("use_access_token") {
+						canBind = canBind && service.AccessTokenScopeGranted(c.GetStringSlice("access_token_scopes"), service.AccessTokenScopeOf(authz.TaskPluginBind))
+					}
+					if !canBind {
+						return errChannelPluginBindDenied
+					}
+				}
+			}
 		}
-		if err := common.DecodeJson(c.Request.Body, &request); err != nil {
-			common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
-			return
+		if action == model.ChannelEnable {
+			if key, ok := current.Protocol.TaskPluginKey(); ok {
+				if _, available := jsplugin.DefaultRegistry.Get(key); !available {
+					return common.NewMessage("Task plugin is not available")
+				}
+			}
 		}
-		record.ProviderID = request.ProviderID
-		record.ModelID = request.ModelID
-		record.Protocol = request.Protocol
-		record.UpstreamModelName = request.UpstreamModelName
-		record.Capabilities = request.Capabilities
-		record.ParameterOverrides = string(request.ParameterOverrides)
-		record.RPM = request.RPM
-		record.TPM = request.TPM
-		record.MaxConcurrency = request.MaxConcurrency
-		record.Weight = request.Weight
-	}
-	if key, ok := record.Protocol.TaskPluginKey(); ok {
-		if _, available := jsplugin.DefaultRegistry.Get(key); !available {
-			singleChannelError(c, common.NewMessage("Task plugin is not available"))
-			return
-		}
-	}
-	created := record.ID == 0
-	if err := model.SaveChannel(c.Request.Context(), &record, action); err != nil {
+		return nil
+	})
+	if err != nil {
 		singleChannelError(c, err)
 		return
 	}
-	auditAction := "channel." + action
-	if action == "save" {
+	auditAction := "channel." + string(action)
+	if action == model.ChannelSave {
 		auditAction = "channel.update"
-		if created {
+		if id == 0 {
 			auditAction = "channel.create"
 		}
 	}
 	recordManageAudit(c, auditAction, map[string]any{"id": record.ID, "provider_id": record.ProviderID, "model_id": record.ModelID})
-	common.ApiSuccess(c, channelView(record))
+	common.ApiSuccess(c, channelView(*record))
 }
 
-func SaveSingleModelChannel(c *gin.Context)    { mutateSingleModelChannel(c, "save") }
-func ConfirmSingleModelChannel(c *gin.Context) { mutateSingleModelChannel(c, "confirm") }
-func EnableSingleModelChannel(c *gin.Context)  { mutateSingleModelChannel(c, "enable") }
-func DisableSingleModelChannel(c *gin.Context) { mutateSingleModelChannel(c, "disable") }
+func SaveSingleModelChannel(c *gin.Context)    { mutateSingleModelChannel(c, model.ChannelSave) }
+func ConfirmSingleModelChannel(c *gin.Context) { mutateSingleModelChannel(c, model.ChannelConfirm) }
+func EnableSingleModelChannel(c *gin.Context)  { mutateSingleModelChannel(c, model.ChannelEnable) }
+func DisableSingleModelChannel(c *gin.Context) { mutateSingleModelChannel(c, model.ChannelDisable) }
 
 func DeleteSingleModelChannel(c *gin.Context) {
 	id, ok := providerIDParam(c)

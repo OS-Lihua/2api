@@ -3813,6 +3813,7 @@
     "Model ID": "ID mô hình",
     "Model ID is required": "Cần có ID mô hình",
     "Model is required": "Cần chọn mô hình",
+    "Model is still referenced by a channel": "Mô hình vẫn đang được một kênh tham chiếu",
     "Model Limits": "Giới hạn Mô hình",
     "Model limits enabled": "Đã bật giới hạn mô hình",
     "Model List": "Danh sách mô hình",
