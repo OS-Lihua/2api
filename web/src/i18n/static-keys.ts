@@ -19,6 +19,12 @@ For commercial licensing, please contact support@quantumnous.com
 // Static translation keys that don't get picked up by the t('...') regex.
 // These cover dynamic labels (e.g. constants, configs) that are passed into t at runtime.
 export const STATIC_I18N_KEYS = [
+  'Maximum attempts',
+  'Total first-byte budget (seconds)',
+  'Attempt first-byte budget (seconds)',
+  'Maximum attempts must be an integer between 1 and 5',
+  'Total first-byte budget must be an integer between 5 and 600 seconds',
+  'Attempt first-byte budget must be an integer between 1 and 600 seconds',
   'Enter an integer no greater than 9007199254740991',
   'The adjusted price is outside the supported range.',
   'This expression cannot be adjusted automatically. Keep the source price or edit it manually.',

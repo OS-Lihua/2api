@@ -239,6 +239,79 @@ func newTextGatewayFixture(t *testing.T, upstream http.HandlerFunc) textGatewayF
 	return textGatewayFixture{engine: engine, user: user, token: token, adminPAT: createWalletTestAccessToken(t, actor.Id, "request:read", "ledger:read"), userPAT: createWalletTestAccessToken(t, user.Id, "log:read"), offering: offering, channel: channel, sale: sale, purchase: purchase, fake: fake}
 }
 
+func TestGatewayBudgetManagementOptions(t *testing.T) {
+	engine, admin, _ := newAdminTestServer(t)
+	t.Setenv("GATEWAY_MAX_ATTEMPTS", "3")
+	t.Setenv("GATEWAY_TOTAL_FIRST_BYTE_SECONDS", "90")
+	t.Setenv("GATEWAY_ATTEMPT_FIRST_BYTE_SECONDS", "30")
+	common.OptionMapRWMutex.Lock()
+	previous := common.OptionMap
+	common.OptionMap = map[string]string{}
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previous
+		common.OptionMapRWMutex.Unlock()
+	})
+	model.InitOptionMap()
+	require.NoError(t, model.DB.Model(admin).Update("role", common.RoleRootUser).Error)
+	root := createWalletTestAccessToken(t, admin.Id, "option:read", "option:write")
+	readOnly := createWalletTestAccessToken(t, admin.Id, "option:read")
+	for _, key := range []string{"GatewayMaxAttempts", "GatewayTotalFirstByteSeconds", "GatewayAttemptFirstByteSeconds"} {
+		response := adminSecurityRequest(engine, root, http.MethodGet, "/api/option/", "")
+		require.Equal(t, 200, response.Code)
+		assert.Contains(t, response.Body.String(), `"key":"`+key+`"`)
+	}
+	for _, tc := range []struct{ key, value string }{
+		{"GatewayMaxAttempts", "0"}, {"GatewayMaxAttempts", "6"}, {"GatewayMaxAttempts", "1.5"},
+		{"GatewayTotalFirstByteSeconds", "4"}, {"GatewayTotalFirstByteSeconds", "601"},
+		{"GatewayAttemptFirstByteSeconds", "0"}, {"GatewayAttemptFirstByteSeconds", "601"},
+		{"GatewayAttemptFirstByteSeconds", "30s"}, {"GatewayMaxAttempts", "true"},
+	} {
+		response := adminSecurityRequest(engine, root, http.MethodPut, "/api/option/", fmt.Sprintf(`{"key":%q,"value":%q}`, tc.key, tc.value))
+		assert.Contains(t, response.Body.String(), `"success":false`, "%s=%s", tc.key, tc.value)
+	}
+	assert.Equal(t, service.GatewayAttemptPolicy{MaxAttempts: 3, TotalFirstByte: 90 * time.Second, AttemptFirstByte: 30 * time.Second}, service.GatewayPolicy())
+	body := `{"key":"GatewayMaxAttempts","value":1}`
+	assert.Equal(t, 401, adminSecurityRequest(engine, "", http.MethodPut, "/api/option/", body).Code)
+	assert.Equal(t, 403, adminSecurityRequest(engine, readOnly, http.MethodPut, "/api/option/", body).Code)
+	for _, tc := range []struct {
+		key   string
+		value int
+	}{{"GatewayMaxAttempts", 5}, {"GatewayTotalFirstByteSeconds", 61}, {"GatewayAttemptFirstByteSeconds", 12}} {
+		response := adminSecurityRequest(engine, root, http.MethodPut, "/api/option/", fmt.Sprintf(`{"key":%q,"value":%d}`, tc.key, tc.value))
+		require.Contains(t, response.Body.String(), `"success":true`, response.Body.String())
+	}
+	// Reload from PostgreSQL, with conflicting deployment defaults.
+	t.Setenv("GATEWAY_MAX_ATTEMPTS", "2")
+	model.InitOptionMap()
+	assert.Equal(t, service.GatewayAttemptPolicy{MaxAttempts: 5, TotalFirstByte: 61 * time.Second, AttemptFirstByte: 12 * time.Second}, service.GatewayPolicy())
+	response := adminSecurityRequest(engine, root, http.MethodGet, "/api/option/", "")
+	assert.Contains(t, response.Body.String(), `"key":"GatewayMaxAttempts","value":"5"`)
+	logs, _, err := model.GetAuditLogs(model.AuditLogFilter{Category: model.AuditCategoryOperation}, 0, 100, common.RoleRootUser)
+	require.NoError(t, err)
+	updates := 0
+	for _, entry := range logs {
+		if entry.Action == "option.update" && entry.Success {
+			updates++
+		}
+	}
+	assert.Equal(t, 3, updates)
+	encoded, err := common.Marshal(logs)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), root)
+	assert.NotContains(t, string(encoded), readOnly)
+	// Role changes, expiry and revocation are checked at the real management boundary.
+	require.NoError(t, model.DB.Model(admin).Update("role", common.RoleAdminUser).Error)
+	assert.Equal(t, 403, adminSecurityRequest(engine, root, http.MethodPut, "/api/option/", body).Code)
+	require.NoError(t, model.DB.Model(admin).Update("role", common.RoleRootUser).Error)
+	require.NoError(t, model.DB.Model(&model.UserAccessToken{}).Where("user_id = ?", admin.Id).Update("expires_at", time.Now().Unix()-1).Error)
+	assert.Equal(t, 401, adminSecurityRequest(engine, root, http.MethodPut, "/api/option/", body).Code)
+	require.NoError(t, model.DB.Where("user_id = ?", admin.Id).Delete(&model.UserAccessToken{}).Error)
+	assert.Equal(t, 401, adminSecurityRequest(engine, root, http.MethodGet, "/api/option/", "").Code)
+	assert.Equal(t, service.GatewayAttemptPolicy{MaxAttempts: 5, TotalFirstByte: 61 * time.Second, AttemptFirstByte: 12 * time.Second}, service.GatewayPolicy())
+}
+
 func TestTextGatewayFailoverChargesOnlyDeliveredAttempt(t *testing.T) {
 	var unavailable *gorm.DB
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -436,6 +509,10 @@ func TestTextGatewayFirstByteTimeoutCancelsUpstreamAndSwitches(t *testing.T) {
 		<-r.Context().Done()
 		close(cancelled)
 	})
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", fixture.sale.CreatedBy).Update("role", common.RoleRootUser).Error)
+	root := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "option:write")
+	updated := adminSecurityRequest(fixture.engine, root, http.MethodPut, "/api/option/", `{"key":"GatewayAttemptFirstByteSeconds","value":12}`)
+	require.Contains(t, updated.Body.String(), `"success":true`)
 	addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
@@ -447,7 +524,7 @@ func TestTextGatewayFirstByteTimeoutCancelsUpstreamAndSwitches(t *testing.T) {
 	done := make(chan struct{})
 	go func() { fixture.engine.ServeHTTP(response, request); close(done) }()
 	<-entered
-	fixture.fake.Advance(30 * time.Second)
+	fixture.fake.Advance(12 * time.Second)
 	<-done
 	<-cancelled
 	require.Equal(t, 200, response.Code, response.Body.String())
@@ -484,8 +561,12 @@ func TestTextGatewayTotalBudgetFiveSecondBoundaryAndAttemptLimit(t *testing.T) {
 				_, _ = w.Write([]byte(`{"error":{"code":"overloaded"},"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`))
 			}
 			fixture := newTextGatewayFixture(t, handler)
-			t.Setenv("GATEWAY_TOTAL_FIRST_BYTE_SECONDS", test.total)
-			t.Setenv("GATEWAY_MAX_ATTEMPTS", test.limit)
+			require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", fixture.sale.CreatedBy).Update("role", common.RoleRootUser).Error)
+			root := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "option:write")
+			for key, value := range map[string]string{"GatewayTotalFirstByteSeconds": test.total, "GatewayMaxAttempts": test.limit} {
+				updated := adminSecurityRequest(fixture.engine, root, http.MethodPut, "/api/option/", fmt.Sprintf(`{"key":%q,"value":%q}`, key, value))
+				require.Contains(t, updated.Body.String(), `"success":true`, updated.Body.String())
+			}
 			fake = fixture.fake
 			for range 4 {
 				addTextGatewayChannel(t, fixture, handler)

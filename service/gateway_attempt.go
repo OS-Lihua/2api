@@ -3,34 +3,37 @@ package service
 import (
 	"context"
 	"errors"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/clock"
+	"github.com/QuantumNous/new-api/setting"
 )
 
 // GatewayAttemptPolicy bounds actual upstream sends across the whole request.
-// Environment configuration is read once per request; it is not persisted.
+// The effective persisted configuration is frozen once per request.
 type GatewayAttemptPolicy struct {
 	MaxAttempts                      int
 	TotalFirstByte, AttemptFirstByte time.Duration
 }
 
 func GatewayPolicy() GatewayAttemptPolicy {
-	p := GatewayAttemptPolicy{3, 90 * time.Second, 30 * time.Second}
-	if n, err := strconv.Atoi(os.Getenv("GATEWAY_MAX_ATTEMPTS")); err == nil && n >= 1 && n <= 5 {
-		p.MaxAttempts = n
+	values := setting.GatewayBudgetDefaults()
+	common.OptionMapRWMutex.RLock()
+	for key := range values {
+		if raw, ok := common.OptionMap[key]; ok && setting.ValidateGatewayBudgetOption(key, raw) == nil {
+			values[key], _ = strconv.Atoi(raw)
+		}
 	}
-	if n, err := strconv.Atoi(os.Getenv("GATEWAY_TOTAL_FIRST_BYTE_SECONDS")); err == nil && n >= 5 && n <= 600 {
-		p.TotalFirstByte = time.Duration(n) * time.Second
+	common.OptionMapRWMutex.RUnlock()
+	return GatewayAttemptPolicy{
+		MaxAttempts:      values["GatewayMaxAttempts"],
+		TotalFirstByte:   time.Duration(values["GatewayTotalFirstByteSeconds"]) * time.Second,
+		AttemptFirstByte: time.Duration(values["GatewayAttemptFirstByteSeconds"]) * time.Second,
 	}
-	if n, err := strconv.Atoi(os.Getenv("GATEWAY_ATTEMPT_FIRST_BYTE_SECONDS")); err == nil && n >= 1 && n <= 600 {
-		p.AttemptFirstByte = time.Duration(n) * time.Second
-	}
-	return p
 }
 
 // GatewayExclusions is request-local. Credentials and account quota exclude a
