@@ -3,6 +3,7 @@ package relay
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -156,6 +157,130 @@ func TestMediaMultipartPreparationUsesOverriddenQuantity(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, response.(*http.Response).Body.Close())
 	assert.Equal(t, "4", received)
+}
+
+func TestMediaImagenUsesNativeWireAndCanonicalImageDelivery(t *testing.T) {
+	service.InitHttpClient()
+	var sent []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		sent, err = io.ReadAll(r.Body)
+		require.NoError(t, err)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"predictions":[{"bytesBase64Encoded":"aW1hZ2U=","mimeType":"image/png"}]}`)
+	}))
+	t.Cleanup(upstream.Close)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"public-image","prompt":"draw","n":2}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	parsed, err := helper.ParseGatewayMediaRequest(c)
+	require.NoError(t, err)
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeGemini, ChannelBaseUrl: upstream.URL, UpstreamModelName: "imagen-4.0-generate-001", ParamOverride: map[string]any{"operations": []any{map[string]any{"path": "parameters.sampleCount", "mode": "set", "value": 4}}}}, RelayMode: relayconstant.RelayModeImagesGenerations, RelayFormat: types.RelayFormatOpenAIImage, ResponseFacts: &relaycommon.ResponseFacts{}}
+	adaptor, err := GetChannelAdaptor(constant.APITypeGemini, protocol.OpenAIImages)
+	require.NoError(t, err)
+	prepared, err := adaptor.PrepareMediaRequest(c, info, parsed)
+	require.NoError(t, err)
+	assert.Equal(t, 4, *prepared.Input.ImageCount)
+	response, err := adaptor.DoPreparedRequest(c, info, prepared.Prepared)
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), ojson.GetBytes(sent, "parameters.sampleCount").Int())
+	_, apiErr := adaptor.DoResponse(c, response.(*http.Response), info)
+	require.Nil(t, apiErr)
+	assert.True(t, info.ResponseFacts.BusinessOutput)
+	require.NotNil(t, info.ResponseFacts.ImageCount)
+	assert.Equal(t, int64(1), *info.ResponseFacts.ImageCount)
+}
+
+func TestMediaNativeImageProtocolsPreserveFinalQuantities(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		apiType, channelType int
+		model                string
+		count                uint
+		response             string
+	}{
+		{"Replicate", constant.APITypeReplicate, constant.ChannelTypeReplicate, "black-forest-labs/flux-1.1-pro", 2, `{"status":"succeeded","output":["https://image.invalid/one"]}`},
+		{"Jimeng", constant.APITypeJimeng, constant.ChannelTypeJimeng, "jimeng_high_aes_general_v21_L", 1, `{"code":10000,"data":{"image_urls":["https://image.invalid/one"]}}`},
+		{"MiniMax", constant.APITypeMiniMax, constant.ChannelTypeMiniMax, "image-01", 2, `{"data":{"image_urls":["https://image.invalid/one"]},"base_resp":{"status_code":0}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(fmt.Sprintf(`{"model":"image","prompt":"draw","n":%d}`, tc.count)))
+			c.Request.Header.Set("Content-Type", "application/json")
+			parsed, err := helper.ParseGatewayMediaRequest(c)
+			require.NoError(t, err)
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: tc.channelType, ChannelBaseUrl: "https://provider.invalid", UpstreamModelName: tc.model, ApiKey: "access|secret"}, RelayMode: relayconstant.RelayModeImagesGenerations, RelayFormat: types.RelayFormatOpenAIImage, ResponseFacts: &relaycommon.ResponseFacts{}}
+			adaptor, err := GetChannelAdaptor(tc.apiType, protocol.OpenAIImages)
+			require.NoError(t, err)
+			prepared, err := adaptor.PrepareMediaRequest(c, info, parsed)
+			require.NoError(t, err)
+			assert.Equal(t, int(tc.count), *prepared.Input.ImageCount)
+			response := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(tc.response))}
+			_, apiErr := adaptor.DoResponse(c, response, info)
+			require.Nil(t, apiErr)
+			assert.True(t, info.ResponseFacts.BusinessOutput)
+			require.NotNil(t, info.ResponseFacts.ImageCount)
+			assert.Equal(t, int64(1), *info.ResponseFacts.ImageCount)
+		})
+	}
+}
+
+func TestMediaNativeSpeechProtocolsPrepareAndDeliverActualAudio(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		apiType, channelType int
+		response             string
+	}{
+		{"MiniMax", constant.APITypeMiniMax, constant.ChannelTypeMiniMax, `{"data":{"audio":"0000","status":2},"base_resp":{"status_code":0}}`},
+		{"Volcengine", constant.APITypeVolcEngine, constant.ChannelTypeVolcEngine, `{"code":3000,"data":"AAA="}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/audio/speech", strings.NewReader(`{"model":"speech","input":"hello","voice":"alloy","response_format":"pcm"}`))
+			c.Request.Header.Set("Content-Type", "application/json")
+			parsed, err := helper.ParseGatewayMediaRequest(c)
+			require.NoError(t, err)
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: tc.channelType, ChannelBaseUrl: "https://provider.invalid", UpstreamModelName: "speech-model", ApiKey: "access|secret"}, RelayMode: relayconstant.RelayModeAudioSpeech, RelayFormat: types.RelayFormatOpenAIAudio, ResponseFacts: &relaycommon.ResponseFacts{}}
+			info.OriginModelName = "speech-model"
+			adaptor, err := GetChannelAdaptor(tc.apiType, protocol.OpenAIAudioSpeech)
+			require.NoError(t, err)
+			prepared, err := adaptor.PrepareMediaRequest(c, info, parsed)
+			require.NoError(t, err)
+			assert.Equal(t, "hello", prepared.Request.(*dto.AudioRequest).Input)
+			response := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(tc.response))}
+			_, apiErr := adaptor.DoResponse(c, response, info)
+			require.Nil(t, apiErr)
+			assert.True(t, info.ResponseFacts.BusinessOutput)
+			assert.Equal(t, int64(2), info.ResponseFacts.GeneratedAudioBytes)
+		})
+	}
+}
+
+func TestMediaCloudflareTranscriptionUsesRawAudioAndCanonicalText(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	require.NoError(t, writer.WriteField("model", "transcription"))
+	file, err := writer.CreateFormFile("file", "input.wav")
+	require.NoError(t, err)
+	_, err = file.Write([]byte("audio bytes"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", &body)
+	c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+	parsed, err := helper.ParseGatewayMediaRequest(c)
+	require.NoError(t, err)
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: constant.ChannelCloudflare, ChannelBaseUrl: "https://provider.invalid", UpstreamModelName: "@cf/openai/whisper", ApiKey: "account|secret"}, RelayMode: relayconstant.RelayModeAudioTranscription, RelayFormat: types.RelayFormatOpenAIAudio, ResponseFacts: &relaycommon.ResponseFacts{}}
+	adaptor, err := GetChannelAdaptor(constant.APITypeCloudflare, protocol.OpenAIAudioTranscription)
+	require.NoError(t, err)
+	prepared, err := adaptor.PrepareMediaRequest(c, info, parsed)
+	require.NoError(t, err)
+	assert.Equal(t, "application/octet-stream", prepared.Prepared.Headers().Get("Content-Type"))
+	response := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"success":true,"result":{"text":"hello"}}`))}
+	_, apiErr := adaptor.DoResponse(c, response, info)
+	require.Nil(t, apiErr)
+	assert.True(t, info.ResponseFacts.BusinessOutput)
+	assert.Equal(t, "hello", info.ResponseFacts.GeneratedText)
 }
 
 func TestImageRequestReservesFinalQuantityBeforeUpstream(t *testing.T) {

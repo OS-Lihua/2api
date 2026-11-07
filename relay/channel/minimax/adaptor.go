@@ -61,6 +61,18 @@ func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayIn
 		}
 	}
 
+	if info.ResponseFacts != nil {
+		minimaxRequest.Model = info.UpstreamModelName
+		minimaxRequest.OutputFormat = "hex"
+		if minimaxRequest.AudioSetting == nil {
+			minimaxRequest.AudioSetting = &AudioSetting{Format: request.ResponseFormat}
+		}
+		minimaxRequest.AudioSetting.SampleRate = 24000
+		minimaxRequest.AudioSetting.Channel = 1
+		if minimaxRequest.AudioSetting.Format == "" {
+			minimaxRequest.AudioSetting.Format = "mp3"
+		}
+	}
 	jsonData, err := common.Marshal(minimaxRequest)
 	if err != nil {
 		return nil, fmt.Errorf("error marshalling minimax request: %w", err)
@@ -74,6 +86,9 @@ func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayIn
 	// Debug: log the request structure
 	// fmt.Printf("MiniMax TTS Request: %s\n", string(jsonData))
 
+	if info.ResponseFacts != nil {
+		return speechRequestBody{bytes.NewReader(jsonData)}, nil
+	}
 	return bytes.NewReader(jsonData), nil
 }
 

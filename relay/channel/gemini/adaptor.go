@@ -128,6 +128,9 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 		geminiRequest.Parameters.ImageSize = imageSize
 	}
 
+	if info.ResponseFacts != nil {
+		return imagenRequest(geminiRequest), nil
+	}
 	return geminiRequest, nil
 }
 

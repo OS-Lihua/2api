@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -203,6 +204,9 @@ func miniMaxImageHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 
+	if info.ResponseFacts != nil {
+		return openai.WriteImageResponse(c, info, resp, jsonResponse)
+	}
 	c.Writer.Header().Set("Content-Type", "application/json")
 	c.Writer.WriteHeader(resp.StatusCode)
 	if _, err := c.Writer.Write(jsonResponse); err != nil {

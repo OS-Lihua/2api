@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -187,6 +188,9 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 			return nil, fmt.Errorf("num_outputs must be an integer between 1 and %d", dto.MaxImageN)
 		}
 	}
+	if info.ResponseFacts != nil {
+		return imageRequest{"input": inputPayload}, nil
+	}
 	return map[string]any{
 		"input": inputPayload,
 	}, nil
@@ -304,6 +308,9 @@ func (a *Protocol) DoResponse(c *gin.Context, resp *http.Response, info *relayco
 		return nil, types.NewError(fmt.Errorf("replicate adaptor: encode response failed: %w", err), types.ErrorCodeBadResponseBody)
 	}
 
+	if info.ResponseFacts != nil {
+		return openai.WriteImageResponse(c, info, resp, responseBytes)
+	}
 	c.Writer.Header().Set("Content-Type", "application/json")
 	c.Writer.WriteHeader(http.StatusOK)
 	_, _ = c.Writer.Write(responseBytes)

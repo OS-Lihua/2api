@@ -2,13 +2,14 @@ package minimax
 
 import (
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -118,7 +119,7 @@ func handleTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon.Re
 
 	// Parse response
 	var minimaxResp MiniMaxTTSResponse
-	if unmarshalErr := json.Unmarshal(body, &minimaxResp); unmarshalErr != nil {
+	if unmarshalErr := common.Unmarshal(body, &minimaxResp); unmarshalErr != nil {
 		return nil, types.NewErrorWithStatusCode(
 			fmt.Errorf("failed to unmarshal minimax TTS response: %w", unmarshalErr),
 			types.ErrorCodeBadResponseBody,
@@ -145,6 +146,9 @@ func handleTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon.Re
 	}
 
 	if strings.HasPrefix(minimaxResp.Data.Audio, "http") {
+		if info.ResponseFacts != nil {
+			return nil, types.NewError(errors.New("MiniMax did not return inline audio"), types.ErrorCodeBadResponse)
+		}
 		c.Redirect(http.StatusFound, minimaxResp.Data.Audio)
 	} else {
 		// Handle hex-encoded audio data
@@ -157,6 +161,9 @@ func handleTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon.Re
 			)
 		}
 
+		if info.ResponseFacts != nil {
+			return openai.WriteAudioResponse(c, info, resp, audioData), nil
+		}
 		// Determine content type - default to mp3
 		contentType := "audio/mpeg"
 

@@ -37,6 +37,10 @@ func TestGatewayMediaMultipliersBoundNestedAndMultipartValues(t *testing.T) {
 		{`{"speed":0}`, true},
 		{`{"resolution":"999999999999999x1024"}`, true},
 		{`{"quality":"unbounded"}`, true},
+		{`{"parameters":{"sampleCount":129}}`, true},
+		{`{"input":{"width":99999999999999}}`, true},
+		{`{"aspect_ratio":"999999:1"}`, true},
+		{`{"generationConfig":{"maxOutputTokens":18446744073686646784}}`, true},
 	} {
 		t.Run(tc.body, func(t *testing.T) {
 			err := ValidateGatewayMediaMultipliers([]byte(tc.body))

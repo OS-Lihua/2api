@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -29,7 +30,14 @@ func (p *ttsProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInfo
 	if !ok {
 		return nil, fmt.Errorf("expected speech request, got %T", request)
 	}
-	return convertTTSRequest(c, info, r, VolcengineTTSApp{Cluster: "volcano_tts"})
+	body, err := convertTTSRequest(c, info, r, VolcengineTTSApp{Cluster: "volcano_tts"})
+	if err != nil {
+		return nil, err
+	}
+	if info.ResponseFacts != nil {
+		return speechRequestBody{body}, nil
+	}
+	return body, nil
 }
 
 func (p *ttsProtocol) DoResponse(c *gin.Context, response *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
@@ -38,6 +46,13 @@ func (p *ttsProtocol) DoResponse(c *gin.Context, response *http.Response, info *
 		return handleTTSResponse(c, response, info, encoding)
 	}
 	defer response.Body.Close()
+	if info.ResponseFacts != nil {
+		audio, err := io.ReadAll(response.Body)
+		if err != nil {
+			return nil, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
+		}
+		return openai.WriteAudioResponse(c, info, response, audio), nil
+	}
 	c.Header("Content-Type", getContentTypeByEncoding(encoding))
 	var buffer [32 * 1024]byte
 	for {

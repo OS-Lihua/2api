@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,21 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 )
+
+// WriteImageResponse presents an already converted OpenAI image body through
+// the same delivery, payload-counting and SSE path as a native OpenAI reply.
+func WriteImageResponse(c *gin.Context, info *relaycommon.RelayInfo, response *http.Response, body []byte) (*dto.Usage, *types.NewAPIError) {
+	canonical := *response
+	canonical.Header = response.Header.Clone()
+	canonical.Header.Set("Content-Type", "application/json")
+	canonical.Header.Del("Content-Length")
+	canonical.Body = io.NopCloser(bytes.NewReader(body))
+	canonical.ContentLength = int64(len(body))
+	if info.IsStream {
+		return OpenaiImageStreamHandler(c, info, &canonical)
+	}
+	return OpenaiImageHandler(c, info, &canonical)
+}
 
 // OpenaiImageHandler handles non-streaming OpenAI image responses
 // (generations/edits), returning the parsed usage for billing.

@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/protocol"
+	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -68,6 +69,26 @@ func (a *ChannelAdaptor) PrepareMediaRequest(c *gin.Context, info *relaycommon.R
 	if err != nil {
 		return nil, err
 	}
+	if c.GetHeader("Content-Type") == "application/octet-stream" && a.kind == protocol.OpenAIAudioTranscription {
+		if len(info.ParamOverride) > 0 {
+			return nil, fmt.Errorf("binary transcription requests cannot apply JSON parameter overrides")
+		}
+		audio := request.(*dto.AudioRequest)
+		if audio.ResponseFormat != "json" && audio.ResponseFormat != "text" {
+			return nil, fmt.Errorf("binary transcription supports JSON or text responses")
+		}
+		prepared, err := a.PrepareRequest(c, info, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		input := billingexpr.RequestInput{Headers: make(map[string]string)}
+		for key, values := range prepared.Headers() {
+			input.Headers[strings.ToLower(key)] = strings.Join(values, ",")
+		}
+		info.Request = request
+		info.IsStream = false
+		return &PreparedMediaRequest{Prepared: prepared, Request: request, Input: input}, nil
+	}
 	var form *multipart.Form
 	if !strings.HasPrefix(c.GetHeader("Content-Type"), "multipart/form-data") && (info.ChannelSetting.PassThroughBodyEnabled || model_setting.GetGlobalSettings().PassThroughRequestEnabled) {
 		var fields map[string]common.RawMessage
@@ -108,7 +129,17 @@ func (a *ChannelAdaptor) PrepareMediaRequest(c *gin.Context, info *relaycommon.R
 		return nil, err
 	}
 	result := &PreparedMediaRequest{Request: request, Input: billingexpr.RequestInput{Body: body}}
-	if a.kind == protocol.OpenAIImages {
+	if projector, ok := converted.(channel.ImageRequestProjector); a.kind == protocol.OpenAIImages && ok {
+		effective, err := projector.ProjectImageRequest(body, *request.(*dto.ImageRequest))
+		if err != nil {
+			return nil, err
+		}
+		count, err := effective.ImageCount(false)
+		if err != nil {
+			return nil, err
+		}
+		result.Request, result.Input.ImageCount = effective, &count
+	} else if a.kind == protocol.OpenAIImages {
 		var effective dto.ImageRequest
 		if err := common.Unmarshal(body, &effective); err != nil {
 			return nil, err
@@ -144,6 +175,12 @@ func (a *ChannelAdaptor) PrepareMediaRequest(c *gin.Context, info *relaycommon.R
 			return nil, err
 		}
 		result.Request, result.Input.ImageCount = &effective, &count
+	} else if projector, ok := converted.(channel.AudioRequestProjector); ok {
+		effective, err := projector.ProjectAudioRequest(body, *request.(*dto.AudioRequest))
+		if err != nil {
+			return nil, err
+		}
+		result.Request = effective
 	} else {
 		var effective dto.AudioRequest
 		if err := common.Unmarshal(body, &effective); err != nil {
@@ -213,6 +250,7 @@ func (a *ChannelAdaptor) PrepareMediaRequest(c *gin.Context, info *relaycommon.R
 	for key, values := range result.Prepared.Headers() {
 		result.Input.Headers[strings.ToLower(key)] = strings.Join(values, ",")
 	}
+	info.IsStream = parsed.Request.IsStream(c.Request)
 	info.Request = result.Request
 	return result, nil
 }

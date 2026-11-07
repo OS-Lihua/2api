@@ -26,6 +26,17 @@ type ChatRequestProjector interface {
 	ProjectChatRequest([]byte, dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error)
 }
 
+// ImageRequestProjector exposes public image quantities from native wire DTOs.
+// The native protocol owns its defaults and the meaning of overridden fields.
+type ImageRequestProjector interface {
+	ProjectImageRequest([]byte, dto.ImageRequest) (*dto.ImageRequest, error)
+}
+
+// AudioRequestProjector exposes text and media controls from native wire DTOs.
+type AudioRequestProjector interface {
+	ProjectAudioRequest([]byte, dto.AudioRequest) (*dto.AudioRequest, error)
+}
+
 // ChatOutputLimitSetter applies a validated default to a native wire body.
 type ChatOutputLimitSetter interface {
 	SetChatOutputLimit([]byte, uint) ([]byte, error)

@@ -114,8 +114,8 @@ func GatewayMediaMultipartInput(form *multipart.Form) ([]byte, error) {
 			return nil, fmt.Errorf("media scalar %s must occur once", key)
 		}
 		value := values[0]
-		switch key {
-		case "n", "batch_size", "batch_count", "num_images", "num_outputs", "max_tokens", "max_completion_tokens", "max_output_tokens", "max_new_tokens", "duration", "seconds", "duration_seconds", "speed", "parameters", "metadata":
+		switch strings.ToLower(key) {
+		case "n", "batch_size", "batch_count", "num_images", "num_outputs", "samplecount", "sample_count", "max_images", "max_tokens", "max_completion_tokens", "max_output_tokens", "max_new_tokens", "maxoutputtokens", "duration", "seconds", "duration_seconds", "speed", "width", "height", "output_quality", "output_compression", "parameters", "metadata":
 			scalars[key] = common.RawMessage(value)
 		default:
 			encoded, err := common.Marshal(value)
@@ -157,12 +157,17 @@ func ValidateGatewayMediaMultipliers(body []byte) error {
 			var ceiling int64
 			minimum := decimal.Zero
 			switch name {
-			case "n", "batch_size", "batch_count", "num_images", "num_outputs":
+			case "n", "batch_size", "batch_count", "num_images", "num_outputs", "samplecount", "sample_count", "max_images":
 				ceiling = dto.MaxImageN
-			case "max_tokens", "max_completion_tokens", "max_output_tokens", "max_new_tokens":
+			case "max_tokens", "max_completion_tokens", "max_output_tokens", "max_new_tokens", "maxoutputtokens":
 				ceiling = maxTokensLimit
 			case "duration", "seconds", "duration_seconds":
 				ceiling = relaycommon.MaxTaskDurationSeconds
+			case "width", "height":
+				ceiling = MaxGatewayImageDimension
+				minimum = decimal.NewFromInt(1)
+			case "output_quality", "output_compression":
+				ceiling = 100
 			case "speed":
 				ceiling = 4
 				minimum = decimal.New(25, -2)
@@ -176,7 +181,21 @@ func ValidateGatewayMediaMultipliers(body []byte) error {
 				default:
 					return fmt.Errorf("unsupported quality")
 				}
-			case "size", "resolution":
+			case "aspect_ratio", "aspectratio":
+				if value.Type != ojson.String {
+					return fmt.Errorf("%s must be a bounded aspect ratio", name)
+				}
+				if value.Str == "" || value.Str == "auto" {
+					continue
+				}
+				widthText, heightText, found := strings.Cut(value.Str, ":")
+				width, widthErr := strconv.ParseUint(widthText, 10, 32)
+				height, heightErr := strconv.ParseUint(heightText, 10, 32)
+				if !found || widthErr != nil || heightErr != nil || width == 0 || height == 0 || width > MaxGatewayImageDimension || height > MaxGatewayImageDimension {
+					return fmt.Errorf("%s exceeds the image dimension limit", name)
+				}
+				continue
+			case "size", "resolution", "imagesize":
 				if value.Type != ojson.String {
 					return fmt.Errorf("%s must be a bounded image size", name)
 				}

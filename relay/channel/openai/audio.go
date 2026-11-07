@@ -22,6 +22,41 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// WriteAudioResponse delivers decoded native speech through the shared OpenAI
+// audio presentation and duration accounting path, including JSON-style SSE.
+func WriteAudioResponse(c *gin.Context, info *relaycommon.RelayInfo, response *http.Response, body []byte) *dto.Usage {
+	canonical := *response
+	canonical.Header = response.Header.Clone()
+	canonical.Header.Del("Content-Length")
+	format := "mp3"
+	if request, ok := info.Request.(*dto.AudioRequest); ok && request.ResponseFormat != "" {
+		format = request.ResponseFormat
+	}
+	contentType := "application/octet-stream"
+	switch format {
+	case "mp3":
+		contentType = "audio/mpeg"
+	case "opus":
+		contentType = "audio/ogg"
+	case "wav", "flac", "aac", "pcm":
+		contentType = "audio/" + format
+	}
+	canonical.Header.Set("Content-Type", contentType)
+	canonical.Body = io.NopCloser(bytes.NewReader(body))
+	if info.IsStream {
+		chunk, err := common.Marshal(struct {
+			Type  string `json:"type"`
+			Audio string `json:"audio"`
+		}{"speech.audio.delta", base64.StdEncoding.EncodeToString(body)})
+		if err != nil {
+			return &dto.Usage{}
+		}
+		canonical.Header.Set("Content-Type", "text/event-stream")
+		canonical.Body = io.NopCloser(strings.NewReader("data: " + string(chunk) + "\n\ndata: [DONE]\n\n"))
+	}
+	return OpenaiTTSHandler(c, &canonical, info)
+}
+
 func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) *dto.Usage {
 	// the status code has been judged before, if there is a body reading failure,
 	// it should be regarded as a non-recoverable error, so it should not return err for external retry.

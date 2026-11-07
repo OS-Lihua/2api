@@ -2,7 +2,7 @@ package cloudflare
 
 import (
 	"bufio"
-	"encoding/json"
+	"bytes"
 	"io"
 	"net/http"
 	"strings"
@@ -10,6 +10,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -52,7 +53,7 @@ func cfStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 		}
 
 		var response dto.ChatCompletionsStreamResponse
-		err := json.Unmarshal([]byte(data), &response)
+		err := common.Unmarshal([]byte(data), &response)
 		if err != nil {
 			logger.LogError(c, common.LogText("error_unmarshalling_stream_response: %s", err.Error()))
 			continue
@@ -98,7 +99,7 @@ func cfHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response)
 	}
 	service.CloseResponseBodyGracefully(resp)
 	var response dto.TextResponse
-	err = json.Unmarshal(responseBody, &response)
+	err = common.Unmarshal(responseBody, &response)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
@@ -110,7 +111,7 @@ func cfHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response)
 	usage := service.ResponseText2Usage(c, responseText, info.UpstreamModelName, info.GetEstimatePromptTokens())
 	response.Usage = *usage
 	response.Id = helper.GetResponseID(c)
-	jsonResponse, err := json.Marshal(response)
+	jsonResponse, err := common.Marshal(response)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
@@ -127,7 +128,7 @@ func cfSTTHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respon
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
 	service.CloseResponseBodyGracefully(resp)
-	err = json.Unmarshal(responseBody, &cfResp)
+	err = common.Unmarshal(responseBody, &cfResp)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
@@ -136,9 +137,25 @@ func cfSTTHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respon
 		Text: cfResp.Result.Text,
 	}
 
-	jsonResponse, err := json.Marshal(audioResp)
+	jsonResponse, err := common.Marshal(audioResp)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
+	}
+	if info.ResponseFacts != nil {
+		format := "json"
+		if request, ok := info.Request.(*dto.AudioRequest); ok {
+			format = request.ResponseFormat
+		}
+		canonical := *resp
+		canonical.Header = resp.Header.Clone()
+		canonical.Header.Set("Content-Type", "application/json")
+		canonical.Header.Del("Content-Length")
+		if format == "text" {
+			jsonResponse = []byte(cfResp.Result.Text)
+			canonical.Header.Set("Content-Type", "text/plain")
+		}
+		canonical.Body = io.NopCloser(bytes.NewReader(jsonResponse))
+		return openai.OpenaiSTTHandler(c, &canonical, info, format)
 	}
 	c.Writer.Header().Set("Content-Type", "application/json")
 	c.Writer.WriteHeader(resp.StatusCode)
