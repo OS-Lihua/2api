@@ -21,6 +21,8 @@ import (
 	"github.com/QuantumNous/new-api/pkg/capability"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/money"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 
@@ -234,6 +236,53 @@ func newTextGatewayFixture(t *testing.T, upstream http.HandlerFunc) textGatewayF
 	SetApiRouter(engine)
 	SetRelayRouter(engine)
 	return textGatewayFixture{engine: engine, user: user, token: token, adminPAT: createWalletTestAccessToken(t, actor.Id, "request:read", "ledger:read"), userPAT: createWalletTestAccessToken(t, user.Id, "log:read"), offering: offering, channel: channel, sale: sale, purchase: purchase, fake: fake}
+}
+
+func TestMediaGatewayReservationIncreaseIsAtomicAndRecordsMeasuredQuantities(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("reservation API must not dispatch") })
+	request := &model.GatewayRequest{ID: "media-reservation", UserID: fixture.user.Id, TokenID: fixture.token.Id, ModelOfferingID: fixture.offering.ID, OfferingName: fixture.offering.Name, SaleCurrency: "USD", SaleFXRate: "1", Receivable: money.Amount{Currency: "USD"}, Status: "failed", UsageSource: "none"}
+	require.NoError(t, model.ReserveGateway(request, money.Amount{Nanos: 72_000_000, Currency: "USD"}, money.Amount{Nanos: 80_000_000, Currency: "USD"}))
+	ids, err := model.IncreaseGatewayReservation(request.ID, "attempt-two", money.Amount{Nanos: 72_000_000, Currency: "USD"}, money.Amount{Nanos: 80_000_000, Currency: "USD"})
+	require.NoError(t, err)
+	require.Len(t, ids, 2)
+	replayed, err := model.IncreaseGatewayReservation(request.ID, "attempt-two", money.Amount{Nanos: 72_000_000, Currency: "USD"}, money.Amount{Nanos: 80_000_000, Currency: "USD"})
+	require.NoError(t, err)
+	assert.Equal(t, ids, replayed)
+	_, err = model.IncreaseGatewayReservation(request.ID, "attempt-two", money.Amount{Nanos: 1, Currency: "USD"}, money.Amount{Nanos: 1, Currency: "USD"})
+	require.ErrorIs(t, err, model.ErrLedgerInvalidEntry)
+	_, err = model.IncreaseGatewayReservation(request.ID, "too-expensive", money.Amount{Nanos: 2_000_000_000, Currency: "USD"}, money.Amount{Nanos: 2_000_000_000, Currency: "USD"})
+	require.ErrorIs(t, err, model.ErrInsufficientWalletBalance)
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, int64(856_000_000), wallet.Balance.Nanos)
+	request.LedgerEntryIDs = ids
+	count, seconds := int64(0), "1.25"
+	request.Usage = service.GatewayRecordUsage(&dto.Usage{}, &relaycommon.ResponseFacts{ImageCount: &count, AudioInputSeconds: &seconds})
+	require.NoError(t, model.PrepareGatewaySettlement(model.GatewaySettlement{Request: *request, SaleSource: money.Amount{Currency: "USD"}}))
+	_, err = model.SettleGateway(request.ID)
+	require.NoError(t, err)
+	require.NoError(t, model.PublishGatewayRecords(request.ID))
+	replayed, err = model.IncreaseGatewayReservation(request.ID, "attempt-two", money.Amount{Nanos: 72_000_000, Currency: "USD"}, money.Amount{Nanos: 80_000_000, Currency: "USD"})
+	require.NoError(t, err)
+	assert.Subset(t, replayed, ids)
+	require.Len(t, replayed, 3, "finalization adds only the reservation release")
+	wallet, err = model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1_000_000_000), wallet.Balance.Nanos)
+	for _, endpoint := range []struct{ path, key string }{
+		{"/api/admin/v1/requests", fixture.adminPAT},
+		{"/api/requests/self", fixture.userPAT},
+	} {
+		response := walletAPIRequest(t, fixture.engine, endpoint.key, http.MethodGet, endpoint.path, "")
+		require.True(t, response.Success, response.Message)
+		require.EqualValues(t, 1, response.Data["total"])
+		usage := response.Data["items"].([]any)[0].(map[string]any)["usage"].(map[string]any)
+		assert.EqualValues(t, 0, usage["image_count"])
+		assert.Equal(t, "1.25", usage["audio_input_seconds"])
+	}
+	reconciliation, err := model.ReconcileWallets(100)
+	require.NoError(t, err)
+	assert.Empty(t, reconciliation.Mismatches)
 }
 
 func TestTextGatewayPurchaseProbesUseEffectiveProviderRequest(t *testing.T) {
