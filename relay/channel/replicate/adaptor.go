@@ -2,10 +2,10 @@ package replicate
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
@@ -25,13 +25,14 @@ import (
 	"github.com/samber/lo"
 )
 
-type Adaptor struct {
+type Protocol struct {
 }
 
-func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
+func (a *Protocol) Init(info *relaycommon.RelayInfo) {
 }
 
-func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
+func (a *Provider) RequestURL(metadata channel.ProviderMetadata) (string, error) {
+	info := metadata.ProviderRequest()
 	if info == nil {
 		return "", errors.New("replicate adaptor: relay info is nil")
 	}
@@ -42,17 +43,18 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 	if requestPath == "" {
 		return info.ChannelBaseUrl, nil
 	}
-	return relaycommon.GetFullRequestURL(info.ChannelBaseUrl, requestPath, info.ChannelType), nil
+	return channel.ProviderRequestURL(info.ChannelBaseUrl, requestPath, info.ChannelType), nil
 }
 
-func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *relaycommon.RelayInfo) error {
+func (a *Provider) SetupHeader(c *gin.Context, req *http.Header, metadata channel.ProviderMetadata) error {
+	info := metadata.ProviderRequest()
 	if info == nil {
 		return errors.New("replicate adaptor: relay info is nil")
 	}
 	if info.ApiKey == "" {
 		return errors.New("replicate adaptor: api key is required")
 	}
-	channel.SetupApiRequestHeader(info, c, req)
+	channel.SetupProviderRequestHeader(info, c, req)
 	req.Set("Authorization", "Bearer "+info.ApiKey)
 	req.Set("Prefer", "wait")
 	if req.Get("Content-Type") == "" {
@@ -64,7 +66,7 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *rel
 	return nil
 }
 
-func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.ImageRequest) (any, error) {
+func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.ImageRequest) (any, error) {
 	if info == nil {
 		return nil, errors.New("replicate adaptor: relay info is nil")
 	}
@@ -111,7 +113,7 @@ func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInf
 
 	if len(request.OutputFormat) > 0 {
 		var outputFormat string
-		if err := json.Unmarshal(request.OutputFormat, &outputFormat); err == nil && strings.TrimSpace(outputFormat) != "" {
+		if err := common.Unmarshal(request.OutputFormat, &outputFormat); err == nil && strings.TrimSpace(outputFormat) != "" {
 			inputPayload["output_format"] = outputFormat
 		}
 	}
@@ -125,7 +127,16 @@ func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInf
 	}
 
 	if info.RelayMode == relayconstant.RelayModeImagesEdits {
-		imageURL, err := uploadFileFromForm(c, info, "image", "image[]", "image_prompt")
+		metadata := channel.NewProviderMetadata(info)
+		overrides, err := channel.ResolveHeaderOverride(info, c)
+		if err != nil {
+			return nil, errors.New("replicate adaptor: invalid upload header override")
+		}
+		metadata.RequestHeaders = make(http.Header, len(overrides))
+		for name, value := range overrides {
+			metadata.RequestHeaders.Set(name, value)
+		}
+		imageURL, err := (&Provider{}).uploadFileFromForm(c, metadata, "image", "image[]", "image_prompt")
 		if err != nil {
 			return nil, err
 		}
@@ -166,16 +177,26 @@ func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInf
 		inputPayload[key] = val
 	}
 
+	if rawCount, ok := inputPayload["num_outputs"]; ok {
+		encoded, err := common.Marshal(rawCount)
+		if err != nil {
+			return nil, fmt.Errorf("invalid num_outputs: %w", err)
+		}
+		var count uint
+		if err := common.Unmarshal(encoded, &count); err != nil || count == 0 || count > dto.MaxImageN {
+			return nil, fmt.Errorf("num_outputs must be an integer between 1 and %d", dto.MaxImageN)
+		}
+	}
 	return map[string]any{
 		"input": inputPayload,
 	}, nil
 }
 
-func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
+func (a *Protocol) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
 	return channel.DoApiRequest(a, c, info, requestBody)
 }
 
-func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
+func (a *Protocol) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
 	if resp == nil {
 		return nil, types.NewError(errors.New("replicate adaptor: empty response"), types.ErrorCodeBadResponse)
 	}
@@ -291,11 +312,11 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	return usage, nil
 }
 
-func (a *Adaptor) GetModelList() []string {
+func (a *Protocol) GetModelList() []string {
 	return ModelList
 }
 
-func (a *Adaptor) GetChannelName() string {
+func (a *Protocol) GetChannelName() string {
 	return ChannelName
 }
 
@@ -397,10 +418,11 @@ func normalizeFluxDimension(value int) int {
 	return value
 }
 
-func uploadFileFromForm(c *gin.Context, info *relaycommon.RelayInfo, fieldCandidates ...string) (string, error) {
-	if info == nil {
-		return "", errors.New("replicate adaptor: relay info is nil")
+func (p *Provider) uploadFileFromForm(c *gin.Context, metadata channel.ProviderMetadata, fieldCandidates ...string) (string, error) {
+	if metadata == nil || metadata.ProviderRequest() == nil || c == nil || c.Request == nil {
+		return "", errors.New("replicate adaptor: missing upload metadata")
 	}
+	info := metadata.ProviderRequest()
 
 	mf := c.Request.MultipartForm
 	if mf == nil {
@@ -446,7 +468,7 @@ func uploadFileFromForm(c *gin.Context, info *relaycommon.RelayInfo, fieldCandid
 	writer := multipart.NewWriter(&body)
 
 	hdr := make(textproto.MIMEHeader)
-	hdr.Set("Content-Disposition", fmt.Sprintf("form-data; name=\"content\"; filename=\"%s\"", fileHeader.Filename))
+	hdr.Set("Content-Disposition", mime.FormatMediaType("form-data", map[string]string{"name": "content", "filename": fileHeader.Filename}))
 	contentType := fileHeader.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = "application/octet-stream"
@@ -465,31 +487,46 @@ func uploadFileFromForm(c *gin.Context, info *relaycommon.RelayInfo, fieldCandid
 	formContentType := writer.FormDataContentType()
 	writer.Close()
 
-	baseURL := info.ChannelBaseUrl
-	if baseURL == "" {
-		baseURL = constant.GetChannelBaseURL(constant.ChannelTypeReplicate)
-	}
-	uploadURL := relaycommon.GetFullRequestURL(baseURL, "/v1/files", info.ChannelType)
-
-	req, err := http.NewRequest(http.MethodPost, uploadURL, &body)
+	uploadMetadata := *info
+	uploadMetadata.RequestURLPath = "/v1/files"
+	uploadURL, err := p.RequestURL(&uploadMetadata)
 	if err != nil {
-		return "", fmt.Errorf("replicate adaptor: create upload request failed: %w", err)
+		return "", errors.New("replicate adaptor: invalid upload destination")
+	}
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, uploadURL, &body)
+	if err != nil {
+		return "", errors.New("replicate adaptor: invalid upload URL")
+	}
+	if err := p.SetupHeader(c, &req.Header, &uploadMetadata); err != nil {
+		return "", errors.New("replicate adaptor: invalid upload authentication")
 	}
 	req.Header.Set("Content-Type", formContentType)
-	req.Header.Set("Authorization", "Bearer "+info.ApiKey)
-
-	resp, err := service.GetHttpClient().Do(req)
+	for name, values := range info.RequestHeaders {
+		req.Header[name] = append([]string(nil), values...)
+		if strings.EqualFold(name, "Host") {
+			req.Host = req.Header.Get(name)
+		}
+	}
+	configuredClient, err := service.GetHttpClientWithProxySettings(info.ChannelSetting.Proxy, info.ChannelSetting.HTTPSettings())
 	if err != nil {
-		return "", fmt.Errorf("replicate adaptor: upload image failed: %w", err)
+		return "", errors.New("replicate adaptor: invalid upload transport configuration")
+	}
+	client := *configuredClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
+	if err != nil {
+		if c.Request.Context().Err() != nil {
+			return "", c.Request.Context().Err()
+		}
+		return "", errors.New("replicate adaptor: upload image failed")
 	}
 	defer resp.Body.Close()
-
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return "", types.NewErrorWithStatusCode(errors.New("replicate adaptor: upload image failed"), types.ErrorCodeDoRequestFailed, resp.StatusCode)
+	}
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("replicate adaptor: read upload response failed: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("replicate adaptor: upload image failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return "", errors.New("replicate adaptor: read upload response failed")
 	}
 
 	var uploadResp FileUploadResponse
@@ -502,30 +539,30 @@ func uploadFileFromForm(c *gin.Context, info *relaycommon.RelayInfo, fieldCandid
 	return uploadResp.Urls.Get, nil
 }
 
-func (a *Adaptor) ConvertOpenAIRequest(*gin.Context, *relaycommon.RelayInfo, *dto.GeneralOpenAIRequest) (any, error) {
+func (a *Protocol) ConvertOpenAIRequest(*gin.Context, *relaycommon.RelayInfo, *dto.GeneralOpenAIRequest) (any, error) {
 	return nil, errors.New("replicate adaptor: ConvertOpenAIRequest is not implemented")
 }
 
-func (a *Adaptor) ConvertRerankRequest(*gin.Context, int, dto.RerankRequest) (any, error) {
+func (a *Protocol) ConvertRerankRequest(*gin.Context, int, dto.RerankRequest) (any, error) {
 	return nil, errors.New("replicate adaptor: ConvertRerankRequest is not implemented")
 }
 
-func (a *Adaptor) ConvertEmbeddingRequest(*gin.Context, *relaycommon.RelayInfo, dto.EmbeddingRequest) (any, error) {
+func (a *Protocol) ConvertEmbeddingRequest(*gin.Context, *relaycommon.RelayInfo, dto.EmbeddingRequest) (any, error) {
 	return nil, errors.New("replicate adaptor: ConvertEmbeddingRequest is not implemented")
 }
 
-func (a *Adaptor) ConvertAudioRequest(*gin.Context, *relaycommon.RelayInfo, dto.AudioRequest) (io.Reader, error) {
+func (a *Protocol) ConvertAudioRequest(*gin.Context, *relaycommon.RelayInfo, dto.AudioRequest) (io.Reader, error) {
 	return nil, errors.New("replicate adaptor: ConvertAudioRequest is not implemented")
 }
 
-func (a *Adaptor) ConvertOpenAIResponsesRequest(*gin.Context, *relaycommon.RelayInfo, dto.OpenAIResponsesRequest) (any, error) {
+func (a *Protocol) ConvertOpenAIResponsesRequest(*gin.Context, *relaycommon.RelayInfo, dto.OpenAIResponsesRequest) (any, error) {
 	return nil, errors.New("replicate adaptor: ConvertOpenAIResponsesRequest is not implemented")
 }
 
-func (a *Adaptor) ConvertClaudeRequest(*gin.Context, *relaycommon.RelayInfo, *dto.ClaudeRequest) (any, error) {
+func (a *Protocol) ConvertClaudeRequest(*gin.Context, *relaycommon.RelayInfo, *dto.ClaudeRequest) (any, error) {
 	return nil, errors.New("replicate adaptor: ConvertClaudeRequest is not implemented")
 }
 
-func (a *Adaptor) ConvertGeminiRequest(*gin.Context, *relaycommon.RelayInfo, *dto.GeminiChatRequest) (any, error) {
+func (a *Protocol) ConvertGeminiRequest(*gin.Context, *relaycommon.RelayInfo, *dto.GeminiChatRequest) (any, error) {
 	return nil, errors.New("replicate adaptor: ConvertGeminiRequest is not implemented")
 }

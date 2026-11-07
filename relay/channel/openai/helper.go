@@ -177,7 +177,9 @@ func handleLastResponse(lastStreamData string, responseId *string, createAt *int
 	*systemFingerprint = lastStreamResponse.GetSystemFingerprint()
 	*model = lastStreamResponse.Model
 
-	if service.ValidUsage(lastStreamResponse.Usage) {
+	reportedUsage := info.UpstreamProtocol != "" && lastStreamResponse.Usage != nil &&
+		lastStreamResponse.Usage.PromptTokens >= 0 && lastStreamResponse.Usage.CompletionTokens >= 0 && lastStreamResponse.Usage.TotalTokens >= 0
+	if service.ValidUsage(lastStreamResponse.Usage) || reportedUsage {
 		*containStreamUsage = true
 		*usage = dto.MergeUsageNonZero(*usage, lastStreamResponse.Usage)
 		if !info.ShouldIncludeUsage {
