@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -36,7 +37,8 @@ func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, fo
 				if writeErr != nil {
 					info.ResponseFacts.DownstreamWriteFailed = true
 				}
-				if business && writeErr == nil {
+				var flushErr *helper.StreamFlushError
+				if business && (writeErr == nil || errors.As(writeErr, &flushErr)) {
 					info.ResponseFacts.BusinessOutput = true
 				}
 			}()
@@ -231,13 +233,15 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		usage = service.ResponseText2Usage(c, responseTextBuilder.String(), info.TokenizerModelName(), info.GetEstimatePromptTokens())
 		usage.CompletionTokens += toolCount * 7
 		if info.ResponseFacts != nil && reportedStreamUsage != nil {
-			if info.ResponseFacts.PromptTokensReported {
-				usage.PromptTokens = reportedStreamUsage.PromptTokens
+			snapshot := *reportedStreamUsage
+			if !info.ResponseFacts.PromptTokensReported {
+				snapshot.PromptTokens = usage.PromptTokens
 			}
-			if info.ResponseFacts.CompletionTokensReported {
-				usage.CompletionTokens = reportedStreamUsage.CompletionTokens
+			if !info.ResponseFacts.CompletionTokensReported {
+				snapshot.CompletionTokens = usage.CompletionTokens
 			}
-			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+			snapshot.TotalTokens = snapshot.PromptTokens + snapshot.CompletionTokens
+			usage = &snapshot
 		}
 	}
 
@@ -341,7 +345,7 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 		responseErr = types.NewOpenAIError(fmt.Errorf("upstream request failed"), types.ErrorCodeBadResponse, resp.StatusCode)
 	}
 	if responseErr != nil {
-		if info.ResponseFacts != nil && info.ResponseFacts.UsageReported {
+		if info.ResponseFacts != nil && (info.ResponseFacts.PromptTokensReported || info.ResponseFacts.CompletionTokensReported) {
 			applyProtocolUsagePostProcessing(c, info, &simpleResponse.Usage, responseBody)
 			return &simpleResponse.Usage, responseErr
 		}
@@ -407,12 +411,9 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 		if info.ResponseFacts != nil && info.ResponseFacts.PromptTokensReported {
 			promptTokens = simpleResponse.Usage.PromptTokens
 		}
-		fallbackUsage := &dto.Usage{
-			PromptTokens:     promptTokens,
-			CompletionTokens: completionTokens,
-			TotalTokens:      promptTokens + completionTokens,
-		}
-		simpleResponse.Usage = *fallbackUsage
+		simpleResponse.Usage.PromptTokens = promptTokens
+		simpleResponse.Usage.CompletionTokens = completionTokens
+		simpleResponse.Usage.TotalTokens = promptTokens + completionTokens
 		usageModified = true
 	}
 

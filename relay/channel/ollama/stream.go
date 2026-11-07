@@ -2,6 +2,7 @@ package ollama
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -146,7 +147,8 @@ func sendOllamaDelta(c *gin.Context, info *relaycommon.RelayInfo, delta dto.Chat
 	if err != nil && info.ResponseFacts != nil {
 		info.ResponseFacts.DownstreamWriteFailed = true
 	}
-	if info.ResponseFacts != nil && err == nil {
+	var flushErr *helper.StreamFlushError
+	if info.ResponseFacts != nil && (err == nil || errors.As(err, &flushErr)) {
 		for _, choice := range delta.Choices {
 			text := choice.Delta.GetContentString() + choice.Delta.GetReasoningContent()
 			for _, call := range choice.Delta.ToolCalls {
@@ -161,7 +163,7 @@ func sendOllamaDelta(c *gin.Context, info *relaycommon.RelayInfo, delta dto.Chat
 	return err
 }
 
-func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (usage *dto.Usage, responseErr *types.NewAPIError) {
 	if resp == nil || resp.Body == nil {
 		return nil, types.NewOpenAIError(fmt.Errorf("empty response"), types.ErrorCodeBadResponse, http.StatusBadRequest)
 	}
@@ -174,7 +176,20 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	defer info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
 	helper.SetEventStreamHeaders(c)
 	scanner := helper.NewStreamScanner(resp.Body)
-	usage := &dto.Usage{}
+	usage = &dto.Usage{}
+	defer func() {
+		if info.ResponseFacts == nil || info.ResponseFacts.UsageReported {
+			return
+		}
+		estimated := service.ResponseText2Usage(c, info.ResponseFacts.GeneratedText, info.TokenizerModelName(), info.GetEstimatePromptTokens())
+		if !info.ResponseFacts.PromptTokensReported {
+			usage.PromptTokens = estimated.PromptTokens
+		}
+		if !info.ResponseFacts.CompletionTokensReported {
+			usage.CompletionTokens = estimated.CompletionTokens
+		}
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	}()
 	var model = info.UpstreamModelName
 	var responseId = common.GetUUID()
 	var created = time.Now().Unix()
@@ -264,16 +279,6 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	if err := scanner.Err(); err != nil && err != io.EOF {
 		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)
 		return usage, types.NewError(fmt.Errorf("Ollama stream read failed"), types.ErrorCodeBadResponseBody)
-	}
-	if info.ResponseFacts != nil && !info.ResponseFacts.UsageReported {
-		estimated := service.ResponseText2Usage(c, info.ResponseFacts.GeneratedText, info.TokenizerModelName(), info.GetEstimatePromptTokens())
-		if !info.ResponseFacts.PromptTokensReported {
-			usage.PromptTokens = estimated.PromptTokens
-		}
-		if !info.ResponseFacts.CompletionTokensReported {
-			usage.CompletionTokens = estimated.CompletionTokens
-		}
-		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	}
 	return usage, nil
 }

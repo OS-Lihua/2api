@@ -269,6 +269,7 @@ func TestTextGatewayNativeWireOutputAndUsage(t *testing.T) {
 		name, body, contentType, status, source string
 		provider                                int
 		stream                                  bool
+		truncated                               bool
 		charge                                  int64
 	}{
 		{name: "Ollama missing output", provider: constant.ChannelTypeOllama, contentType: "application/json", body: `{"model":"upstream-model","message":{"role":"assistant","content":"Hello"},"done":true,"prompt_eval_count":10}`, status: "success", source: "estimated", charge: 21600},
@@ -281,6 +282,7 @@ func TestTextGatewayNativeWireOutputAndUsage(t *testing.T) {
 		{name: "OpenAI stream explicit zero input missing output", provider: constant.ChannelTypeOpenAI, stream: true, contentType: "text/event-stream", body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":0}}\n\ndata: [DONE]\n\n", status: "success", source: "estimated", charge: 3600},
 		{name: "OpenAI stream missing input explicit zero output", provider: constant.ChannelTypeOpenAI, stream: true, contentType: "text/event-stream", body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":0}}\n\ndata: [DONE]\n\n", status: "success", source: "estimated", charge: 16200},
 		{name: "Dify stream explicit zero input missing output", provider: constant.ChannelTypeDify, stream: true, contentType: "text/event-stream", body: "data: {\"event\":\"message\",\"answer\":\"Hello\"}\n\ndata: {\"event\":\"message_end\",\"metadata\":{\"usage\":{\"prompt_tokens\":0}}}\n\n", status: "success", source: "estimated", charge: 3600},
+		{name: "Ollama read failure after output preserves partial usage", provider: constant.ChannelTypeOllama, stream: true, truncated: true, contentType: "application/x-ndjson", body: "{\"model\":\"upstream-model\",\"message\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"done\":false,\"prompt_eval_count\":0}\n", status: "partial", source: "estimated", charge: 3600},
 		{name: "Ollama JSON", provider: constant.ChannelTypeOllama, contentType: "application/json", body: `{"model":"upstream-model","message":{"role":"assistant","content":"Hello"},"done":true,"prompt_eval_count":10,"eval_count":5}`, status: "success", source: "upstream", charge: 36000},
 		{name: "Ollama JSON explicit zero", provider: constant.ChannelTypeOllama, contentType: "application/json", body: `{"model":"upstream-model","message":{"role":"assistant","content":"Hello"},"done":true,"prompt_eval_count":0,"eval_count":0}`, status: "success", source: "upstream"},
 		{name: "Ollama JSON missing usage", provider: constant.ChannelTypeOllama, contentType: "application/json", body: `{"model":"upstream-model","message":{"role":"assistant","content":"Hello"},"done":true}`, status: "success", source: "estimated", charge: 19800},
@@ -293,6 +295,9 @@ func TestTextGatewayNativeWireOutputAndUsage(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", test.contentType)
+				if test.truncated {
+					w.Header().Set("Content-Length", fmt.Sprint(len(test.body)+100))
+				}
 				_, _ = w.Write([]byte(test.body))
 			})
 			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", test.provider).Error)
@@ -421,12 +426,18 @@ func TestTextGatewaySameGroupSpecialDiscountIsExact(t *testing.T) {
 	assert.Equal(t, int64(20001), requests[0].Receivable.Nanos)
 }
 
-func TestTextGatewayPrimaryPreparationFailureRecoversFinalIntent(t *testing.T) {
+func unavailableGatewayDatabase(t *testing.T) *gorm.DB {
+	t.Helper()
 	closed, err := sql.Open("pgx", "host=127.0.0.1 port=1 dbname=unavailable sslmode=disable")
 	require.NoError(t, err)
 	require.NoError(t, closed.Close())
 	unavailable, err := gorm.Open(postgres.New(postgres.Config{Conn: closed}), &gorm.Config{DisableAutomaticPing: true})
 	require.NoError(t, err)
+	return unavailable
+}
+
+func TestTextGatewayPrimaryPreparationFailureRecoversFinalIntent(t *testing.T) {
+	unavailable := unavailableGatewayDatabase(t)
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		model.DB = unavailable
 		w.Header().Set("Content-Type", "application/json")
@@ -898,6 +909,44 @@ func TestTextGatewayShortfallPausesUntilTopUp(t *testing.T) {
 	assert.Empty(t, reconciliation.Mismatches)
 }
 
+func TestTextGatewayPartialUsageRetainsCacheDetails(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprint(stream), func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				body := `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":100}}}`
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"prompt_tokens_details\":{\"cached_tokens\":100}}}\n\ndata: [DONE]\n\n"
+				}
+				_, _ = w.Write([]byte(body))
+			})
+			for _, owner := range []struct {
+				kind string
+				id   int
+			}{{model.PriceOwnerOffering, fixture.offering.ID}, {model.PriceOwnerChannel, fixture.channel.ID}} {
+				price := &model.PriceVersion{OwnerType: owner.kind, OwnerID: owner.id, Currency: "USD", Expression: `tier("cache", p * 2 + cr * 0.5)`, EffectiveAt: clock.Now().Unix()}
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", fmt.Sprintf(`{"model":"gateway-offering","stream":%t,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, stream))
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, "estimated", record.UsageSource)
+			assert.Equal(t, int64(100), record.Usage.PromptTokens)
+			assert.Equal(t, int64(100), record.Usage.CachedTokens)
+			assert.Equal(t, int64(45000), record.Receivable.Nanos)
+			attempts, _, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.Len(t, attempts, 1)
+			assert.Equal(t, int64(50000), attempts[0].Cost.Nanos)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(999955000), wallet.Balance.Nanos)
+		})
+	}
+}
+
 func TestTextGatewayFreeFixedPricesAndFailureCosts(t *testing.T) {
 	for _, test := range []struct {
 		name, expression, body, status, source string
@@ -910,6 +959,7 @@ func TestTextGatewayFreeFixedPricesAndFailureCosts(t *testing.T) {
 		{name: "fixed interrupted stream refunds", expression: `tier("request",fixed(0.01))`, stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n", status: "partial", source: "estimated", cost: 11000},
 		{name: "HTTP failure without usage refunds", upstreamStatus: 503, body: `{"error":{"type":"provider_error","message":"provider-secret https://secret.invalid request-body-secret"}}`, status: "failed", source: "none"},
 		{name: "HTTP failure retains reported purchase usage", upstreamStatus: 503, body: `{"error":{"type":"provider_error","message":"provider-secret"},"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, status: "failed", source: "upstream", cost: 20000},
+		{name: "HTTP failure retains partial reported purchase usage", upstreamStatus: 503, body: `{"error":{"type":"provider_error","message":"provider-secret"},"usage":{"prompt_tokens":10}}`, status: "failed", source: "estimated", cost: 10000},
 		{name: "JSON error retains reported purchase usage", body: `{"error":{"type":"provider_error","message":"provider-secret"},"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, status: "failed", source: "upstream", cost: 20000},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -1330,7 +1380,7 @@ func TestTextGatewayShortfallPersistsAndTopUpCannotBypassDebt(t *testing.T) {
 	changed.Receivable = money.Amount{Nanos: 99_999, Currency: "USD"}
 	require.NoError(t, model.PrepareGatewaySettlement(model.GatewaySettlement{Request: changed, SaleSource: changed.Receivable}))
 	logDB := model.LOG_DB
-	model.LOG_DB = logDB.Table("receivable_debt_unavailable_log")
+	model.LOG_DB = unavailableGatewayDatabase(t)
 	_, recoveryErr := model.RecoverGatewaySettlements(t.Context(), 100)
 	model.LOG_DB = logDB
 	require.Error(t, recoveryErr, "primary settlement succeeds even when log publication fails")

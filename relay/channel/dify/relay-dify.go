@@ -2,6 +2,7 @@ package dify
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -256,7 +257,8 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		if err != nil && info.ResponseFacts != nil {
 			info.ResponseFacts.DownstreamWriteFailed = true
 		}
-		if info.ResponseFacts != nil && len(openaiResponse.Choices) > 0 && err == nil {
+		var flushErr *helper.StreamFlushError
+		if info.ResponseFacts != nil && len(openaiResponse.Choices) > 0 && (err == nil || errors.As(err, &flushErr)) {
 			text := openaiResponse.Choices[0].Delta.GetContentString()
 			if text != "" {
 				info.ResponseFacts.BusinessOutput = true

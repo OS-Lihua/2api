@@ -235,6 +235,15 @@ func ResponseChunkData(c *gin.Context, resp dto.ResponsesStreamResponse, data st
 	return FlushWriter(c)
 }
 
+// StreamFlushError means the complete frame was written before flushing failed.
+// Callers can distinguish accepted business content from a partial frame write.
+type StreamFlushError struct {
+	Err error
+}
+
+func (e *StreamFlushError) Error() string { return e.Err.Error() }
+func (e *StreamFlushError) Unwrap() error { return e.Err }
+
 func StringData(c *gin.Context, str string) error {
 	if c == nil || c.Writer == nil {
 		return errors.New("context or writer is nil")
@@ -248,7 +257,10 @@ func StringData(c *gin.Context, str string) error {
 	if err := event.Render(c.Writer); err != nil {
 		return err
 	}
-	return FlushWriter(c)
+	if err := FlushWriter(c); err != nil {
+		return &StreamFlushError{Err: err}
+	}
+	return nil
 }
 
 func PingData(c *gin.Context) error {

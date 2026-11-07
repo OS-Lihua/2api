@@ -242,14 +242,14 @@ func TextGateway(c *gin.Context) {
 			attempt.EndedAt = record.EndedAt
 			attempt.Status, attempt.ErrorClass = gatewayAttemptOutcome(c, info, attemptErr)
 			record.Status = attempt.Status
-			if !info.ResponseFacts.BusinessOutput && !info.ResponseFacts.UsageReported {
+			if !info.ResponseFacts.BusinessOutput && !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && !info.ResponseFacts.CompletionTokensReported {
 				usage = nil
 			}
 			if usage == nil && info.ResponseFacts.BusinessOutput {
 				usage = &dto.Usage{PromptTokens: estimatedInput, CompletionTokens: tokenkit.Count(info.TokenizerModel, info.ResponseFacts.GeneratedText)}
 			}
 			if usage != nil {
-				if !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported {
+				if !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && info.ResponseFacts.BusinessOutput {
 					usage.PromptTokens = estimatedInput
 				}
 				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
