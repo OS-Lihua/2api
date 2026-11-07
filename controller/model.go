@@ -103,7 +103,7 @@ func init() {
 			}
 			continue
 		}
-		meta := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+		meta := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType: i,
 		}}
 		adaptor := relay.GetAdaptor(apiType)
@@ -129,7 +129,7 @@ func channelOwnerName(channelType int) string {
 	if adaptor == nil {
 		return strings.ToLower(constant.GetChannelTypeName(channelType))
 	}
-	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+	adaptor.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{
 		ChannelType: channelType,
 	}})
 	if name := strings.TrimSpace(adaptor.GetChannelName()); name != "" {

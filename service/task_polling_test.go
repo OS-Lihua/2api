@@ -65,13 +65,13 @@ func (a *taskPollingFetchAdaptor) Init(info *relaycommon.RelayInfo) {
 	defer a.mu.Unlock()
 	a.initInfo = info
 }
-func (a *taskPollingFetchAdaptor) initChannelMeta() *relaycommon.ChannelMeta {
+func (a *taskPollingFetchAdaptor) initChannelMeta() *relaycommon.ProviderMeta {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.initInfo == nil {
 		return nil
 	}
-	return a.initInfo.ChannelMeta
+	return a.initInfo.ProviderMeta
 }
 
 func (a *taskPollingFetchAdaptor) FetchTask(_ string, _ string, task *model.Task, _ string) (*http.Response, error) {
@@ -199,7 +199,7 @@ func seedTaskPollingChannel(t *testing.T, id int, disableSleep bool) {
 		Status: common.ChannelStatusEnabled,
 	}
 	if disableSleep {
-		ch.SetOtherSettings(dto.ChannelOtherSettings{DisableTaskPollingSleep: true})
+		ch.SetOtherSettings(dto.ProviderOtherSettings{DisableTaskPollingSleep: true})
 	}
 	require.NoError(t, model.DB.Create(ch).Error)
 }
@@ -260,7 +260,7 @@ func TestPollingPassesExecutingChannelTypeToAdaptor(t *testing.T) {
 	baseURL := "https://gateway.example"
 	gateway := &model.Provider{Id: channelID, Type: constant.ChannelTypeNewAPI, Name: "gateway", Key: "sk-gateway", Status: common.ChannelStatusEnabled, BaseURL: &baseURL}
 	gateway.HeaderOverride = common.GetPointer(`{"X-API-Key":"{api_key}"}`)
-	gateway.SetOtherSettings(dto.ChannelOtherSettings{DisableTaskPollingSleep: true})
+	gateway.SetOtherSettings(dto.ProviderOtherSettings{DisableTaskPollingSleep: true})
 	require.NoError(t, model.DB.Create(gateway).Error)
 	task := seedPollingTask(t, channelID, "task_gateway", "upstream_gateway")
 	taskChannels := map[int][]string{channelID: {task.GetUpstreamTaskID()}}

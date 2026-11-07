@@ -20,7 +20,7 @@ func TestFilterCandidateIDs(t *testing.T) {
 	kling := &Provider{Id: 900004, Type: constant.ChannelTypeKling, Status: common.ChannelStatusEnabled}
 	jimeng := &Provider{Id: 900005, Type: constant.ChannelTypeJimeng, Status: common.ChannelStatusEnabled}
 	matchingCustom := &Provider{Id: 900010, Type: constant.ChannelTypeAdvancedCustom, Status: common.ChannelStatusEnabled}
-	matchingCustom.SetOtherSettings(kitdto.ChannelOtherSettings{
+	matchingCustom.SetOtherSettings(kitdto.ProviderOtherSettings{
 		AdvancedCustom: &kitdto.AdvancedCustomConfig{
 			Routes: []kitdto.AdvancedCustomRoute{{
 				IncomingPath: "/v1/chat/completions",
@@ -29,7 +29,7 @@ func TestFilterCandidateIDs(t *testing.T) {
 		},
 	})
 	otherCustom := &Provider{Id: 900011, Type: constant.ChannelTypeAdvancedCustom, Status: common.ChannelStatusEnabled}
-	otherCustom.SetOtherSettings(kitdto.ChannelOtherSettings{
+	otherCustom.SetOtherSettings(kitdto.ProviderOtherSettings{
 		AdvancedCustom: &kitdto.AdvancedCustomConfig{
 			Routes: []kitdto.AdvancedCustomRoute{{
 				IncomingPath: "/v1/responses",
@@ -38,16 +38,16 @@ func TestFilterCandidateIDs(t *testing.T) {
 		},
 	})
 
-	pathFilter := dto.ChannelFilter{Kind: dto.FilterRequestPath, RequestPath: "/v1/chat/completions"}
-	emptyPathFilter := dto.ChannelFilter{Kind: dto.FilterRequestPath, RequestPath: ""}
+	pathFilter := dto.ProviderFilter{Kind: dto.FilterRequestPath, RequestPath: "/v1/chat/completions"}
+	emptyPathFilter := dto.ProviderFilter{Kind: dto.FilterRequestPath, RequestPath: ""}
 
 	tests := []struct {
 		name      string
 		ids       []int
 		modelName string
-		filters   []dto.ChannelFilter
+		filters   []dto.ProviderFilter
 		wantKept  []int
-		wantEmpty dto.ChannelFilterKind
+		wantEmpty dto.ProviderFilterKind
 	}{
 		{
 			name:      "identity keeps matching type-59 key",
@@ -104,28 +104,28 @@ func TestFilterCandidateIDs(t *testing.T) {
 			name:      "empty request path is a passthrough including missing ids",
 			ids:       []int{900003, 900010, 999999},
 			modelName: "gpt-4",
-			filters:   []dto.ChannelFilter{emptyPathFilter},
+			filters:   []dto.ProviderFilter{emptyPathFilter},
 			wantKept:  []int{900003, 900010, 999999},
 		},
 		{
 			name:      "request path keeps missing cache entry for consistency",
 			ids:       []int{900003, 999999},
 			modelName: "gpt-4",
-			filters:   []dto.ChannelFilter{pathFilter},
+			filters:   []dto.ProviderFilter{pathFilter},
 			wantKept:  []int{900003, 999999},
 		},
 		{
 			name:      "request path keeps matching type-58 and ordinary",
 			ids:       []int{900003, 900010, 900011},
 			modelName: "gpt-4",
-			filters:   []dto.ChannelFilter{pathFilter},
+			filters:   []dto.ProviderFilter{pathFilter},
 			wantKept:  []int{900003, 900010},
 		},
 		{
 			name:      "request path empties when only unmatched type-58 remains",
 			ids:       []int{900011},
 			modelName: "gpt-4",
-			filters:   []dto.ChannelFilter{pathFilter},
+			filters:   []dto.ProviderFilter{pathFilter},
 			wantKept:  []int{},
 			wantEmpty: dto.FilterRequestPath,
 		},
@@ -133,7 +133,7 @@ func TestFilterCandidateIDs(t *testing.T) {
 			name:      "intersection attributes empty set to identity after path keeps candidates",
 			ids:       []int{900001, 900010},
 			modelName: "gpt-4",
-			filters:   []dto.ChannelFilter{pathFilter, identityFilters("missing", nil)[0]},
+			filters:   []dto.ProviderFilter{pathFilter, identityFilters("missing", nil)[0]},
 			wantKept:  []int{},
 			wantEmpty: dto.FilterTaskPluginIdentity,
 		},
@@ -141,7 +141,7 @@ func TestFilterCandidateIDs(t *testing.T) {
 			name:      "intersection attributes empty set to path when path runs first",
 			ids:       []int{900011},
 			modelName: "gpt-4",
-			filters:   []dto.ChannelFilter{identityFilters("", nil)[0], pathFilter},
+			filters:   []dto.ProviderFilter{identityFilters("", nil)[0], pathFilter},
 			wantKept:  []int{},
 			wantEmpty: dto.FilterRequestPath,
 		},
@@ -181,7 +181,7 @@ func TestChannelSatisfiesFilters(t *testing.T) {
 	alpha := &Provider{Id: 1, Type: constant.ChannelTypeTaskPlugin, Setting: &alphaSetting}
 	ordinary := &Provider{Id: 2, Type: constant.ChannelTypeOpenAI}
 	custom := &Provider{Id: 3, Type: constant.ChannelTypeAdvancedCustom}
-	custom.SetOtherSettings(kitdto.ChannelOtherSettings{
+	custom.SetOtherSettings(kitdto.ProviderOtherSettings{
 		AdvancedCustom: &kitdto.AdvancedCustomConfig{
 			Routes: []kitdto.AdvancedCustomRoute{{
 				IncomingPath: "/v1/chat/completions",
@@ -192,24 +192,24 @@ func TestChannelSatisfiesFilters(t *testing.T) {
 
 	ok, kind := ProviderSatisfiesFilters(nil, "gpt-4", nil)
 	assert.False(t, ok)
-	assert.Equal(t, dto.ChannelFilterKind(""), kind)
+	assert.Equal(t, dto.ProviderFilterKind(""), kind)
 
 	ok, kind = ProviderSatisfiesFilters(alpha, "shared", identityFilters("alpha", nil))
 	require.True(t, ok)
-	assert.Equal(t, dto.ChannelFilterKind(""), kind)
+	assert.Equal(t, dto.ProviderFilterKind(""), kind)
 
 	ok, kind = ProviderSatisfiesFilters(alpha, "shared", identityFilters("beta", nil))
 	assert.False(t, ok)
 	assert.Equal(t, dto.FilterTaskPluginIdentity, kind)
 
-	ok, kind = ProviderSatisfiesFilters(ordinary, "gpt-4", []dto.ChannelFilter{{
+	ok, kind = ProviderSatisfiesFilters(ordinary, "gpt-4", []dto.ProviderFilter{{
 		Kind:        dto.FilterRequestPath,
 		RequestPath: "/v1/chat/completions",
 	}})
 	require.True(t, ok)
-	assert.Equal(t, dto.ChannelFilterKind(""), kind)
+	assert.Equal(t, dto.ProviderFilterKind(""), kind)
 
-	ok, kind = ProviderSatisfiesFilters(custom, "gpt-4", []dto.ChannelFilter{{
+	ok, kind = ProviderSatisfiesFilters(custom, "gpt-4", []dto.ProviderFilter{{
 		Kind:        dto.FilterRequestPath,
 		RequestPath: "/v1/responses",
 	}})

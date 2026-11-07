@@ -71,7 +71,7 @@ func TestOllamaChatHandlerNonStreamToolCalls(t *testing.T) {
 			}
 
 			usage, apiErr := ollamaChatHandler(c, &relaycommon.RelayInfo{
-				ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "fallback-model"},
+				ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "fallback-model"},
 			}, resp)
 			require.Nil(t, apiErr)
 			require.NotNil(t, usage)
@@ -198,7 +198,7 @@ func TestOllamaStreamHandlerDoneToolCalls(t *testing.T) {
 	}
 
 	usage, apiErr := ollamaStreamHandler(c, &relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "fallback-model"},
+		ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "fallback-model"},
 	}, resp)
 	require.Nil(t, apiErr)
 	require.NotNil(t, usage)

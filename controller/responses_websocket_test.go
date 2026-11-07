@@ -374,8 +374,8 @@ func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*web
 		ProviderInfo: model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}}
 	modelMapping := `{"ws-billing":"gpt-4o"}`
 	channel.ModelMapping = &modelMapping
-	channel.SetSetting(dto.ChannelSettings{ResponsesWebSocketEnabled: true})
-	channel.SetOtherSettings(dto.ChannelOtherSettings{AllowServiceTier: true})
+	channel.SetSetting(dto.ProviderSettings{ResponsesWebSocketEnabled: true})
+	channel.SetOtherSettings(dto.ProviderOtherSettings{AllowServiceTier: true})
 	require.NoError(t, model.DB.Create(channel).Error)
 	fixture.channel = channel
 	require.NoError(t, model.DB.Create(&model.Ability{ChannelId: channel.Id, Model: "ws-billing", Group: "default", Enabled: true}).Error)
@@ -631,7 +631,7 @@ func TestResponsesWebSocketDialsNativeResponsesChannelTypes(t *testing.T) {
 	type upstreamTarget struct {
 		Path, Authorization, QueryKey string
 	}
-	queryAuthRoute := dto.ChannelOtherSettings{AdvancedCustom: &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{
+	queryAuthRoute := dto.ProviderOtherSettings{AdvancedCustom: &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{
 		IncomingPath: "/v1/responses", UpstreamPath: "/upstream/responses",
 		Auth: &dto.AdvancedCustomRouteAuth{Type: dto.AdvancedCustomAuthTypeQuery, Name: "api_key", Value: "{api_key}"},
 	}}}}
@@ -641,7 +641,7 @@ func TestResponsesWebSocketDialsNativeResponsesChannelTypes(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		channelType   int
-		otherSettings dto.ChannelOtherSettings
+		otherSettings dto.ProviderOtherSettings
 		want          func(key string) upstreamTarget
 	}{
 		{name: "new api", channelType: constant.ChannelTypeNewAPI, want: bearer},

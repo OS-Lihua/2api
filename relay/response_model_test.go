@@ -56,7 +56,7 @@ func TestResponseModelComparisonAndLog(t *testing.T) {
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
 			info := &relaycommon.RelayInfo{
 				OriginModelName: "requested",
-				ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: "mapped", IsModelMapped: true},
+				ProviderMeta:    &relaycommon.ProviderMeta{UpstreamModelName: "mapped", IsModelMapped: true},
 			}
 			for _, name := range tc.models {
 				info.ObserveResponseModel(name)
@@ -101,7 +101,7 @@ func TestResponseModelLogOmitsUnchangedModel(t *testing.T) {
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
 			info := &relaycommon.RelayInfo{
 				OriginModelName: "requested",
-				ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: tc.upstream, IsModelMapped: tc.mapped},
+				ProviderMeta:    &relaycommon.ProviderMeta{UpstreamModelName: tc.upstream, IsModelMapped: tc.mapped},
 			}
 			info.ObserveResponseModel(tc.returned)
 			other := service.GenerateTextOtherInfo(c, info, 1, 1, 1, 0, 0, 0, 1)
@@ -123,7 +123,7 @@ func TestResponseModelEmptyExpectedNamesDoNotMatchEveryPrefix(t *testing.T) {
 		t.Run(tc.requested+"/"+tc.upstream, func(t *testing.T) {
 			info := &relaycommon.RelayInfo{
 				OriginModelName: tc.requested,
-				ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: tc.upstream},
+				ProviderMeta:    &relaycommon.ProviderMeta{UpstreamModelName: tc.upstream},
 			}
 			info.ObserveResponseModel("other")
 			require.NotNil(t, info.ResponseModel)
@@ -148,7 +148,7 @@ func TestResponseModelExpectedProviderPath(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			info := &relaycommon.RelayInfo{
 				OriginModelName: tc.requested,
-				ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: tc.upstream},
+				ProviderMeta:    &relaycommon.ProviderMeta{UpstreamModelName: tc.upstream},
 			}
 			info.ObserveResponseModel(tc.returned)
 			require.NotNil(t, info.ResponseModel)
@@ -221,7 +221,7 @@ func TestResponseModelHandlersCaptureBeforeConversion(t *testing.T) {
 			info := &relaycommon.RelayInfo{
 				OriginModelName: "requested", RelayFormat: tc.format, RelayMode: relayconstant.RelayModeChatCompletions,
 				IsStream: tc.stream, DisablePing: true, StartTime: time.Now(),
-				ChannelMeta:         &relaycommon.ChannelMeta{UpstreamModelName: "mapped"},
+				ProviderMeta:        &relaycommon.ProviderMeta{UpstreamModelName: "mapped"},
 				ThinkingContentInfo: relaycommon.ThinkingContentInfo{IsFirstThinkingContent: true},
 			}
 			usage, apiErr := tc.handler(c, info, &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(tc.body))})
@@ -240,7 +240,7 @@ func TestResponseModelHandlersCaptureBeforeConversion(t *testing.T) {
 func TestResponseModelSharedResponsesAccumulator(t *testing.T) {
 	// WebSocket turns and HTTP SSE use this same accumulator. A model-free
 	// terminal must not erase the model declared before an interrupted stream.
-	info := &relaycommon.RelayInfo{OriginModelName: "requested", ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "mapped"}}
+	info := &relaycommon.RelayInfo{OriginModelName: "requested", ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "mapped"}}
 	accumulator := service.NewResponsesUsageAccumulator(info)
 	accumulator.Observe(&dto.ResponsesStreamResponse{Type: "response.created", Response: &dto.OpenAIResponsesResponse{Model: "returned"}}, nil)
 	accumulator.Observe(&dto.ResponsesStreamResponse{Type: "response.failed", Response: &dto.OpenAIResponsesResponse{Usage: &dto.Usage{InputTokens: 2, OutputTokens: 3}}}, nil)
@@ -255,7 +255,7 @@ func TestResponseModelDoesNotRecordSynthesizedModel(t *testing.T) {
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "requested", RelayFormat: types.RelayFormatOpenAI,
-		ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "mapped"},
+		ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "mapped"},
 	}
 	_, apiErr := openai.OaiResponsesToChatBufferedStreamHandler(c, info, &http.Response{
 		StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("data: [DONE]\n\n")),

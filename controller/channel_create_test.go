@@ -87,7 +87,7 @@ func TestAddChannelReturnsCreatedIDs(t *testing.T) {
 			if channel.Type == constant.ChannelTypeVertexAi {
 				channel.Other = `{"default":"us-central1"}`
 			}
-			request, err := common.Marshal(AddChannelRequest{Mode: tc.mode, Channel: channel})
+			request, err := common.Marshal(AddProviderRequest{Mode: tc.mode, Channel: channel})
 			require.NoError(t, err)
 			response := postAddChannel(t, rootID, common.RoleRootUser, string(request))
 			require.Equal(t, http.StatusOK, response.Code)
@@ -153,7 +153,7 @@ func TestAddChannelInvalidVertexBatchDoesNotReturnResults(t *testing.T) {
 	for _, mode := range []string{"batch", "multi_to_single"} {
 		for _, key := range []string{"[]", `["", "  "]`, "[{"} {
 			t.Run(mode+"/"+key, func(t *testing.T) {
-				request, err := common.Marshal(AddChannelRequest{Mode: mode, Channel: &model.Provider{
+				request, err := common.Marshal(AddProviderRequest{Mode: mode, Channel: &model.Provider{
 					Name: "invalid-vertex-array", Type: constant.ChannelTypeVertexAi, Key: key,
 					Models: "test-model", Group: "default", Other: `{"default":"us-central1"}`,
 				}})
@@ -185,7 +185,7 @@ func TestAddChannelRollbackDoesNotReturnIDs(t *testing.T) {
 		keys[i] = fmt.Sprintf("sk-create-rollback-%02d", i)
 	}
 	keys[50] = keys[0]
-	request, err := common.Marshal(AddChannelRequest{Mode: "batch", Channel: &model.Provider{
+	request, err := common.Marshal(AddProviderRequest{Mode: "batch", Channel: &model.Provider{
 		Name: "created-id-rollback", Type: 1, Key: strings.Join(keys, "\n"), Models: "test-model", Group: "default",
 	}})
 	require.NoError(t, err)
@@ -221,7 +221,7 @@ func TestAddChannelPanicRollsBackWithoutSuccess(t *testing.T) {
 	for i := range keys {
 		keys[i] = fmt.Sprintf("sk-create-panic-%02d", i)
 	}
-	request, err := common.Marshal(AddChannelRequest{Mode: "batch", Channel: &model.Provider{
+	request, err := common.Marshal(AddProviderRequest{Mode: "batch", Channel: &model.Provider{
 		Name: "created-id-panic", Type: 1, Key: strings.Join(keys, "\n"), Models: "test-model", Group: "default",
 	}})
 	require.NoError(t, err)

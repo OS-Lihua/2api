@@ -49,8 +49,8 @@ func TestTaskPluginChannelSelectionFiltersBothCachePaths(t *testing.T) {
 	assert.Contains(t, []string{"legacy-alpha", "legacy-beta"}, selected.Name)
 }
 
-func identityFilters(key string, channelTypes []int) []dto.ChannelFilter {
-	return []dto.ChannelFilter{{
+func identityFilters(key string, channelTypes []int) []dto.ProviderFilter {
+	return []dto.ProviderFilter{{
 		Kind:                   dto.FilterTaskPluginIdentity,
 		TaskPluginKey:          key,
 		TaskPluginChannelTypes: channelTypes,
@@ -62,7 +62,7 @@ func TestSharedPluginKeysFilterBothChannelSources(t *testing.T) {
 	originalMemoryCache := common.MemoryCacheEnabled
 	common.MemoryCacheEnabled = true
 	t.Cleanup(func() { common.MemoryCacheEnabled = originalMemoryCache; InitProviderCache() })
-	filters := []dto.ChannelFilter{{Kind: dto.FilterTaskPluginIdentity, TaskPluginKey: "alpha", TaskPluginKeys: []string{"alpha", "beta"}}}
+	filters := []dto.ProviderFilter{{Kind: dto.FilterTaskPluginIdentity, TaskPluginKey: "alpha", TaskPluginKeys: []string{"alpha", "beta"}}}
 	var abilities []Ability
 	for index, key := range []string{"alpha", "beta", "unrelated"} {
 		setting := `{"task_plugin_key":"` + key + `"}`
@@ -107,7 +107,7 @@ func TestNewAPIChannelServesExtendedTaskPlugins(t *testing.T) {
 	selected, err = GetProvider("default", "shared", 0, identityFilters("beta", nil))
 	require.NoError(t, err)
 	assert.Nil(t, selected, "unbound plugins never reach the gateway channel")
-	shared := []dto.ChannelFilter{{Kind: dto.FilterTaskPluginIdentity, TaskPluginKey: "beta", TaskPluginKeys: []string{"beta", "gamma"}}}
+	shared := []dto.ProviderFilter{{Kind: dto.FilterTaskPluginIdentity, TaskPluginKey: "beta", TaskPluginKeys: []string{"beta", "gamma"}}}
 	selected, err = GetProvider("default", "shared", 0, shared)
 	require.NoError(t, err)
 	require.NotNil(t, selected)

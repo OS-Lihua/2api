@@ -707,7 +707,7 @@ func SetupContextForToken(c *gin.Context, token *model.Token, parts ...string) e
 				abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidChannelId))
 				return fmt.Errorf("invalid specific channel id")
 			}
-			service.GetChannelConstraints(c).AddPin(dto.ChannelPin{
+			service.GetChannelConstraints(c).AddPin(dto.ProviderPin{
 				ChannelId: id,
 				Source:    dto.PinSourceToken,
 				Rank:      dto.PinRankToken,

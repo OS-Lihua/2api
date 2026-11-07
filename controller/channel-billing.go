@@ -541,7 +541,7 @@ func fetchAdvancedCustomBalance(channel *model.Provider) (channelBalanceResult, 
 		RelayFormat:    types.RelayFormatOpenAI,
 		RelayMode:      relayconstant.RelayModeUnknown,
 		RequestURLPath: dto.AdvancedCustomBalancePath,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType:          constant.ChannelTypeAdvancedCustom,
 			ChannelBaseUrl:       channel.GetBaseURL(),
 			ApiKey:               key,

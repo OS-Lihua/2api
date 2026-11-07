@@ -53,7 +53,7 @@ func PrepareMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.
 
 	task.Quota = quota
 	task.BillingChannelId = task.ChannelId
-	if relayInfo.ChannelMeta != nil && relayInfo.ChannelId > 0 {
+	if relayInfo.ProviderMeta != nil && relayInfo.ChannelId > 0 {
 		task.BillingChannelId = relayInfo.ChannelId
 	}
 	return true, nil

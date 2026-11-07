@@ -297,7 +297,7 @@ func TestListModelsUsesAdvancedCustomEndpointTypesFromPricingCache(t *testing.T)
 		Group:  "default",
 		Models: "gemini-3.5-flash",
 	}
-	channel.SetOtherSettings(dto.ChannelOtherSettings{
+	channel.SetOtherSettings(dto.ProviderOtherSettings{
 		AdvancedCustom: &dto.AdvancedCustomConfig{
 			Routes: []dto.AdvancedCustomRoute{
 				{

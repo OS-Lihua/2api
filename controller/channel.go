@@ -302,7 +302,7 @@ func buildFetchModelsHeaders(channel *model.Provider, key string) (http.Header, 
 func applyFetchModelsHeaderOverrides(channel *model.Provider, key string, headers http.Header) error {
 	info := &relaycommon.RelayInfo{
 		IsChannelTest: true,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ApiKey:          key,
 			HeadersOverride: channel.GetHeaderOverride(),
 		},
@@ -696,7 +696,7 @@ func RefreshCodexChannelCredential(c *gin.Context) {
 	})
 }
 
-type AddChannelRequest struct {
+type AddProviderRequest struct {
 	Mode                      string                `json:"mode"`
 	MultiKeyMode              constant.MultiKeyMode `json:"multi_key_mode"`
 	BatchAddSetKeyPrefix2Name bool                  `json:"batch_add_set_key_prefix_2_name"`
@@ -738,7 +738,7 @@ func getVertexArrayKeys(keys string) ([]string, []int, error) {
 }
 
 func AddChannel(c *gin.Context) {
-	addChannelRequest := AddChannelRequest{}
+	addChannelRequest := AddProviderRequest{}
 	err := c.ShouldBindJSON(&addChannelRequest)
 	if err != nil {
 		common.ApiError(c, err)
@@ -938,7 +938,7 @@ func DeleteDisabledChannel(c *gin.Context) {
 	return
 }
 
-type ChannelTag struct {
+type ProviderTag struct {
 	Tag            string  `json:"tag"`
 	NewTag         *string `json:"new_tag"`
 	Priority       *int64  `json:"priority"`
@@ -951,7 +951,7 @@ type ChannelTag struct {
 }
 
 func DisableTagChannels(c *gin.Context) {
-	channelTag := ChannelTag{}
+	channelTag := ProviderTag{}
 	err := c.ShouldBindJSON(&channelTag)
 	if err != nil || channelTag.Tag == "" {
 		common.ApiErrorT(c, "Invalid parameters")
@@ -981,7 +981,7 @@ func DisableTagChannels(c *gin.Context) {
 }
 
 func EnableTagChannels(c *gin.Context) {
-	channelTag := ChannelTag{}
+	channelTag := ProviderTag{}
 	err := c.ShouldBindJSON(&channelTag)
 	if err != nil || channelTag.Tag == "" {
 		common.ApiErrorT(c, "Invalid parameters")
@@ -1004,7 +1004,7 @@ func EnableTagChannels(c *gin.Context) {
 }
 
 func EditTagChannels(c *gin.Context) {
-	channelTag := ChannelTag{}
+	channelTag := ProviderTag{}
 	err := c.ShouldBindJSON(&channelTag)
 	if err != nil {
 		common.ApiErrorT(c, "Invalid parameters")
@@ -1051,13 +1051,13 @@ func EditTagChannels(c *gin.Context) {
 	return
 }
 
-type ChannelBatch struct {
+type ProviderBatch struct {
 	Ids []int   `json:"ids"`
 	Tag *string `json:"tag"`
 }
 
 func DeleteChannelBatch(c *gin.Context) {
-	channelBatch := ChannelBatch{}
+	channelBatch := ProviderBatch{}
 	err := c.ShouldBindJSON(&channelBatch)
 	if err != nil || len(channelBatch.Ids) == 0 {
 		common.ApiErrorT(c, "Invalid parameters")
@@ -1084,23 +1084,23 @@ func DeleteChannelBatch(c *gin.Context) {
 	return
 }
 
-type PatchChannel struct {
+type PatchProvider struct {
 	model.Provider
 	MultiKeyMode *string `json:"multi_key_mode"`
 	KeyMode      *string `json:"key_mode"` // 多key模式下密钥覆盖或者追加
 }
 
-type ChannelStatusRequest struct {
+type ProviderStatusRequest struct {
 	Status int `json:"status"`
 }
 
-type ChannelStatusBatchRequest struct {
+type ProviderStatusBatchRequest struct {
 	Ids    []int `json:"ids"`
 	Status int   `json:"status"`
 }
 
 func UpdateChannel(c *gin.Context) {
-	channel := PatchChannel{}
+	channel := PatchProvider{}
 	rawBody, err := c.GetRawData()
 	if err != nil {
 		common.ApiError(c, err)
@@ -1137,7 +1137,7 @@ func UpdateChannel(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	// Preserve existing ChannelInfo to ensure multi-key channels keep correct state even if the client does not send ChannelInfo in the request.
+	// Preserve existing ProviderInfo to ensure multi-key channels keep correct state even if the client does not send channel_info in the request.
 	originChannel, err := model.GetProviderById(channel.Id, true)
 	if err != nil {
 		common.ApiError(c, err)
@@ -1164,7 +1164,7 @@ func UpdateChannel(c *gin.Context) {
 		return
 	}
 
-	// Always copy the original ChannelInfo so that fields like IsMultiKey and MultiKeySize are retained.
+	// Always copy the original ProviderInfo so that fields like IsMultiKey and MultiKeySize are retained.
 	channel.ProviderInfo = originChannel.ProviderInfo
 
 	if channelHasSensitiveChanges(&channel, originChannel, requestData) &&
@@ -1306,7 +1306,7 @@ func UpdateChannelStatus(c *gin.Context) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	req := ChannelStatusRequest{}
+	req := ProviderStatusRequest{}
 	if err := c.ShouldBindJSON(&req); err != nil || !isManageableChannelStatus(req.Status) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
@@ -1331,7 +1331,7 @@ func UpdateChannelStatus(c *gin.Context) {
 }
 
 func BatchUpdateChannelStatus(c *gin.Context) {
-	req := ChannelStatusBatchRequest{}
+	req := ProviderStatusBatchRequest{}
 	if err := c.ShouldBindJSON(&req); err != nil || len(req.Ids) == 0 || !isManageableChannelStatus(req.Status) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
@@ -1509,7 +1509,7 @@ func FetchModels(c *gin.Context) {
 }
 
 func BatchSetChannelTag(c *gin.Context) {
-	channelBatch := ChannelBatch{}
+	channelBatch := ProviderBatch{}
 	err := c.ShouldBindJSON(&channelBatch)
 	if err != nil || len(channelBatch.Ids) == 0 {
 		common.ApiErrorT(c, "Invalid parameters")

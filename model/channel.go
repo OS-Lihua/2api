@@ -54,7 +54,7 @@ type Provider struct {
 	// add after v0.8.5
 	ProviderInfo ProviderInfo `json:"channel_info" gorm:"column:channel_info;type:json"`
 
-	OtherSettings string `json:"settings" gorm:"column:settings"` // 其他设置，存储azure版本等不需要检索的信息，详见dto.ChannelOtherSettings
+	OtherSettings string `json:"settings" gorm:"column:settings"` // 其他设置，存储azure版本等不需要检索的信息，详见dto.ProviderOtherSettings
 
 	// cache info
 	Keys []string `json:"-" gorm:"-"`
@@ -729,7 +729,7 @@ func UpdateProviderStatus(channelId int, usingKey string, status int, reason str
 		defer channelStatusLock.Unlock()
 	}
 
-	// ChannelInfo stores both multi-key status and the polling cursor. Hold the
+	// ProviderInfo stores both multi-key status and the polling cursor. Hold the
 	// same per-channel lock from the first read through persistence so neither
 	// writer can save a stale JSON snapshot over the other.
 	pollingLock := GetProviderPollingLock(channelId)
@@ -964,7 +964,7 @@ func SearchTags(keyword string, group string, model string, idSort bool) ([]*str
 }
 
 func (channel *Provider) ValidateSettings() error {
-	channelParams := &dto.ChannelSettings{}
+	channelParams := &dto.ProviderSettings{}
 	if channel.Setting != nil && *channel.Setting != "" {
 		err := common.Unmarshal([]byte(*channel.Setting), channelParams)
 		if err != nil {
@@ -977,7 +977,7 @@ func (channel *Provider) ValidateSettings() error {
 	if err := channelParams.ValidateHTTPTransport(); err != nil {
 		return err
 	}
-	channelOtherSettings := &dto.ChannelOtherSettings{}
+	channelOtherSettings := &dto.ProviderOtherSettings{}
 	if channel.OtherSettings != "" {
 		err := common.UnmarshalJsonStr(channel.OtherSettings, channelOtherSettings)
 		if err != nil {
@@ -1008,8 +1008,8 @@ func (channel *Provider) ValidateSettings() error {
 	return nil
 }
 
-func (channel *Provider) GetSetting() dto.ChannelSettings {
-	setting := dto.ChannelSettings{}
+func (channel *Provider) GetSetting() dto.ProviderSettings {
+	setting := dto.ProviderSettings{}
 	if channel.Setting != nil && *channel.Setting != "" {
 		err := common.Unmarshal([]byte(*channel.Setting), &setting)
 		if err != nil {
@@ -1021,7 +1021,7 @@ func (channel *Provider) GetSetting() dto.ChannelSettings {
 	return setting
 }
 
-func (channel *Provider) SetSetting(setting dto.ChannelSettings) {
+func (channel *Provider) SetSetting(setting dto.ProviderSettings) {
 	settingBytes, err := common.Marshal(setting)
 	if err != nil {
 		common.SysLog(common.LogText("failed to marshal setting: channel_id=%d, error=%v", channel.Id, err))
@@ -1030,8 +1030,8 @@ func (channel *Provider) SetSetting(setting dto.ChannelSettings) {
 	channel.Setting = common.GetPointer[string](string(settingBytes))
 }
 
-func (channel *Provider) GetOtherSettings() dto.ChannelOtherSettings {
-	setting := dto.ChannelOtherSettings{}
+func (channel *Provider) GetOtherSettings() dto.ProviderOtherSettings {
+	setting := dto.ProviderOtherSettings{}
 	if channel.OtherSettings != "" {
 		err := common.UnmarshalJsonStr(channel.OtherSettings, &setting)
 		if err != nil {
@@ -1046,7 +1046,7 @@ func (channel *Provider) GetOtherSettings() dto.ChannelOtherSettings {
 	return setting
 }
 
-func (channel *Provider) SetOtherSettings(setting dto.ChannelOtherSettings) {
+func (channel *Provider) SetOtherSettings(setting dto.ProviderOtherSettings) {
 	settingBytes, err := common.Marshal(setting)
 	if err != nil {
 		common.SysLog(common.LogText("failed to marshal setting: channel_id=%d, error=%v", channel.Id, err))

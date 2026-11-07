@@ -53,7 +53,7 @@ func TestProcessChannelErrorUsesSnapshotWithoutLeakingChannelMetadata(t *testing
 	ctx.Set("use_channel", []string{"101"})
 	common.SetContextKey(ctx, constant.ContextKeyRequestStartTime, time.Now().Add(-time.Second))
 
-	channelSnapshot := types.ChannelError{
+	channelSnapshot := types.ProviderError{
 		ChannelId:   101,
 		ChannelType: 1,
 		ChannelName: "snapshot-channel",

@@ -188,7 +188,7 @@ func TestExtractChannelAffinityValue_RequestHeader(t *testing.T) {
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	ctx.Request.Header.Set("X-Affinity-Key", " tenant-123 ")
 
-	value := extractChannelAffinityValue(ctx, operation_setting.ChannelAffinityKeySource{
+	value := extractChannelAffinityValue(ctx, operation_setting.ProviderAffinityKeySource{
 		Type: "request_header",
 		Key:  "X-Affinity-Key",
 	})
@@ -199,11 +199,11 @@ func TestExtractChannelAffinityValue_RequestHeader(t *testing.T) {
 func TestGetPreferredChannelByAffinity_RequestHeaderKeySource(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	rule := operation_setting.ChannelAffinityRule{
+	rule := operation_setting.ProviderAffinityRule{
 		Name:       "header-affinity",
 		ModelRegex: []string{"^gpt-.*$"},
 		PathRegex:  []string{"/v1/responses"},
-		KeySources: []operation_setting.ChannelAffinityKeySource{
+		KeySources: []operation_setting.ProviderAffinityKeySource{
 			{Type: "request_header", Key: "X-Affinity-Key"},
 		},
 		IncludeRuleName:  true,
@@ -221,7 +221,7 @@ func TestGetPreferredChannelByAffinity_RequestHeaderKeySource(t *testing.T) {
 
 	setting := operation_setting.GetChannelAffinitySetting()
 	originalRules := setting.Rules
-	setting.Rules = append([]operation_setting.ChannelAffinityRule{rule}, originalRules...)
+	setting.Rules = append([]operation_setting.ProviderAffinityRule{rule}, originalRules...)
 	t.Cleanup(func() {
 		setting.Rules = originalRules
 	})
@@ -275,7 +275,7 @@ func TestChannelAffinityHitCodexTemplatePassHeadersEffective(t *testing.T) {
 	setting := operation_setting.GetChannelAffinitySetting()
 	require.NotNil(t, setting)
 
-	var codexRule *operation_setting.ChannelAffinityRule
+	var codexRule *operation_setting.ProviderAffinityRule
 	for i := range setting.Rules {
 		rule := &setting.Rules[i]
 		if strings.EqualFold(strings.TrimSpace(rule.Name), "codex cli trace") {
@@ -316,7 +316,7 @@ func TestChannelAffinityHitCodexTemplatePassHeadersEffective(t *testing.T) {
 			"Session_id": "sess-123",
 			"User-Agent": "codex-cli-test",
 		},
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ParamOverride: mergedOverride,
 			HeadersOverride: map[string]any{
 				"X-Static": "legacy-static",
@@ -406,13 +406,13 @@ func TestSessionRulesInheritOrOverrideGlobalDefault(t *testing.T) {
 				if tc.mode == "inherit" {
 					source = "global"
 				}
-				rule := operation_setting.ChannelAffinityRule{
+				rule := operation_setting.ProviderAffinityRule{
 					Name: tc.name, ModelRegex: []string{"^test-model$"},
-					KeySources:  []operation_setting.ChannelAffinityKeySource{{Type: "request_header", Key: "X-Session"}},
+					KeySources:  []operation_setting.ProviderAffinityKeySource{{Type: "request_header", Key: "X-Session"}},
 					SessionMode: tc.mode, SkipRetryOnFailure: tc.skipRetry,
 					ParamOverrideTemplate: map[string]any{"temperature": 0}, IncludeRuleName: true,
 				}
-				encoded, err := common.Marshal([]operation_setting.ChannelAffinityRule{rule})
+				encoded, err := common.Marshal([]operation_setting.ProviderAffinityRule{rule})
 				require.NoError(t, err)
 				snapshot, err := model.BuildRequestPolicy(map[string]string{"RetryTimes": "2", "channel_affinity_setting.enabled": "true", "channel_affinity_setting.session_mode": globalMode, "channel_affinity_setting.rules": string(encoded)})
 				require.NoError(t, err)

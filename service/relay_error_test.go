@@ -26,20 +26,20 @@ func TestShouldRetryRelayErrorHonorsChannelPinOnChannelError(t *testing.T) {
 	err := types.NewError(errors.New("channel failed"), types.ErrorCodeChannelNoAvailableKey)
 	for _, test := range []struct {
 		name      string
-		pin       *dto.ChannelPin
+		pin       *dto.ProviderPin
 		wantRetry bool
 	}{
 		{name: "unrestricted channel error", wantRetry: true},
 		{
 			name: "single attempt pin suppresses channel error retry",
-			pin: &dto.ChannelPin{
+			pin: &dto.ProviderPin{
 				ChannelId: 1, Source: dto.PinSourceToken, Rank: dto.PinRankToken, RetryMode: dto.PinRetrySingleAttempt,
 			},
 			wantRetry: false,
 		},
 		{
 			name: "origin task pin permits retry on the same channel",
-			pin: &dto.ChannelPin{
+			pin: &dto.ProviderPin{
 				ChannelId: 1, Source: dto.PinSourceOriginTask, Rank: dto.PinRankOriginTask, RetryMode: dto.PinRetrySameChannel,
 			},
 			wantRetry: true,
@@ -101,7 +101,7 @@ func TestProcessChannelErrorMasksDisableReasonAndNotification(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, "https://private.example.com")
 	apiErr := types.NewErrorWithStatusCode(errors.New("upstream https://private.example.com/path?token=review-token api_key:review-secret"), types.ErrorCodeChannelNoAvailableKey, http.StatusUnauthorized)
-	ProcessChannelError(c, types.ChannelError{ChannelId: channel.Id, ChannelName: channel.Name, AutoBan: true}, apiErr, nil)
+	ProcessChannelError(c, types.ProviderError{ChannelId: channel.Id, ChannelName: channel.Name, AutoBan: true}, apiErr, nil)
 	var notification WebhookPayload
 	select {
 	case payload := <-notifications:
@@ -205,7 +205,7 @@ func TestDecideRelayRetryReasons(t *testing.T) {
 		{name: "skip retry error", err: types.NewErrorWithStatusCode(errors.New("local"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry()), retries: 1, want: PolicyDecision{Action: "stop", Reason: "non_retryable_error", Source: "system"}},
 		{name: "channel error retries without budget", err: types.NewError(errors.New("no key"), types.ErrorCodeChannelNoAvailableKey), retries: 0, want: PolicyDecision{Action: "retry", Reason: "channel_error", Source: "system"}},
 		{name: "single attempt pin", err: upstream(http.StatusTooManyRequests), retries: 1, setup: func(c *gin.Context) {
-			GetChannelConstraints(c).AddPin(dto.ChannelPin{ChannelId: 1, Source: dto.PinSourceToken, Rank: dto.PinRankToken, RetryMode: dto.PinRetrySingleAttempt})
+			GetChannelConstraints(c).AddPin(dto.ProviderPin{ChannelId: 1, Source: dto.PinSourceToken, Rank: dto.PinRankToken, RetryMode: dto.PinRetrySingleAttempt})
 		}, want: PolicyDecision{Action: "stop", Reason: "pinned_channel", Source: "channel_constraint"}},
 		{name: "strict session", err: upstream(http.StatusTooManyRequests), retries: 1, setup: func(c *gin.Context) {
 			c.Set(ginKeyChannelAffinitySkipRetry, true)

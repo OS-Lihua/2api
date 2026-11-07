@@ -26,7 +26,7 @@ func shouldCloseActiveWebSocketsAfterDisable(channelId int) bool {
 }
 
 // disable & notify
-func DisableChannel(channelError types.ChannelError, reason string) {
+func DisableChannel(channelError types.ProviderError, reason string) {
 	common.SysLog(common.LogText("channel %q (#%d) failed, disabling it, reason: %s", channelError.ChannelName, channelError.ChannelId, common.LocalLogPreview(reason)))
 
 	// 检查是否启用自动禁用功能

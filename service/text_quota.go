@@ -266,7 +266,7 @@ func calculateTextQuotaSummary(ctx *gin.Context, relayInfo *relaycommon.RelayInf
 	if !summary.IsClaudeUsageSemantic && !legacyClaudeDerived {
 		summary.CacheCreationTokens12h = usage.PromptTokensDetails.CacheWrite12hTokens()
 	}
-	isOpenRouterClaudeBilling := relayInfo.ChannelMeta != nil &&
+	isOpenRouterClaudeBilling := relayInfo.ProviderMeta != nil &&
 		relayInfo.ChannelType == constant.ChannelTypeOpenRouter &&
 		summary.IsClaudeUsageSemantic
 

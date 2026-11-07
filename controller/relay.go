@@ -296,7 +296,7 @@ var upgrader = websocket.Upgrader{
 }
 
 func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam) (*model.Provider, *types.NewAPIError) {
-	if info.ChannelMeta == nil {
+	if info.ProviderMeta == nil {
 		autoBan := c.GetBool("auto_ban")
 		autoBanInt := 1
 		if !autoBan {
@@ -329,7 +329,7 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 	return channel, nil
 }
 
-func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
+func processChannelError(c *gin.Context, channelError types.ProviderError, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
 	service.ProcessChannelError(c, channelError, err, relayInfo)
 }
 

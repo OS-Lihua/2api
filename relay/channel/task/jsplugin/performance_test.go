@@ -136,7 +136,7 @@ func BenchmarkTaskPluginSubmit(b *testing.B) {
 				c.Set(pluginruntime.ContextKeyRouteRequest, protocol.RouteRequestContext)
 				c.Set(pluginruntime.ContextKeyProtocolRequest, protocol)
 				c.Set(pluginruntime.ContextKeyPinnedEndpoint, pluginruntime.PinnedEndpoint{Plugin: plugin, Protocol: protocol.Protocol, Model: modelName})
-				info := &relaycommon.RelayInfo{OriginModelName: modelName, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: modelName, ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "benchmark-task"}}
+				info := &relaycommon.RelayInfo{OriginModelName: modelName, ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: modelName, ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "benchmark-task"}}
 				adaptor := New(plugin)
 				adaptor.Init(info)
 				if taskErr := adaptor.ValidateRequestAndSetAction(c, info); taskErr != nil {

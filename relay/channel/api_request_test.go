@@ -36,7 +36,7 @@ func TestProcessHeaderOverride_ChannelTestSkipsPassthroughRules(t *testing.T) {
 
 	info := &relaycommon.RelayInfo{
 		IsChannelTest: true,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			HeadersOverride: map[string]any{
 				"*": "",
 			},
@@ -59,7 +59,7 @@ func TestProcessHeaderOverride_ChannelTestSkipsClientHeaderPlaceholder(t *testin
 
 	info := &relaycommon.RelayInfo{
 		IsChannelTest: true,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			HeadersOverride: map[string]any{
 				"X-Upstream-Trace": "{client_header:X-Trace-Id}",
 			},
@@ -83,7 +83,7 @@ func TestProcessHeaderOverride_NonTestKeepsClientHeaderPlaceholder(t *testing.T)
 
 	info := &relaycommon.RelayInfo{
 		IsChannelTest: false,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			HeadersOverride: map[string]any{
 				"X-Upstream-Trace": "{client_header:X-Trace-Id}",
 			},
@@ -110,7 +110,7 @@ func TestProcessHeaderOverride_RuntimeOverrideIsFinalHeaderMap(t *testing.T) {
 			"x-static":  "runtime-value",
 			"x-runtime": "runtime-only",
 		},
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			HeadersOverride: map[string]any{
 				"X-Static": "legacy-value",
 				"X-Legacy": "legacy-only",
@@ -138,7 +138,7 @@ func TestProcessHeaderOverride_PassthroughSkipsAcceptEncoding(t *testing.T) {
 
 	info := &relaycommon.RelayInfo{
 		IsChannelTest: false,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			HeadersOverride: map[string]any{
 				"*": "",
 			},
@@ -169,7 +169,7 @@ func TestProcessHeaderOverride_PassHeadersTemplateSetsRuntimeHeaders(t *testing.
 			"Originator": "Codex CLI",
 			"Session_id": "sess-123",
 		},
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ParamOverride: map[string]any{
 				"operations": []any{
 					map[string]any{

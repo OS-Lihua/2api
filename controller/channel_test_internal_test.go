@@ -67,7 +67,7 @@ func TestValidateChannelProxy(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			setting, err := common.Marshal(dto.ChannelSettings{Proxy: test.proxy})
+			setting, err := common.Marshal(dto.ProviderSettings{Proxy: test.proxy})
 			require.NoError(t, err)
 			channel := &model.Provider{
 				Type:    constant.ChannelTypeOpenAI,
@@ -163,7 +163,7 @@ func TestMultiprotocolGatewayEndpointTypes(t *testing.T) {
 
 func TestCopyChannelRejectsInvalidLegacyProxySettings(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	settingBytes, err := common.Marshal(dto.ChannelSettings{
+	settingBytes, err := common.Marshal(dto.ProviderSettings{
 		Proxy: "socks5://proxy.example/legacy-path",
 	})
 	require.NoError(t, err)
@@ -220,7 +220,7 @@ func TestDeleteChannelBatchReportsAndAuditsActualDeletedCount(t *testing.T) {
 	channel := &model.Provider{Name: "existing", Key: "test-key"}
 	require.NoError(t, db.Create(channel).Error)
 
-	requestBody, err := common.Marshal(ChannelBatch{Ids: []int{channel.Id, 999999}})
+	requestBody, err := common.Marshal(ProviderBatch{Ids: []int{channel.Id, 999999}})
 	require.NoError(t, err)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
@@ -287,7 +287,7 @@ func TestBuildTestLogOtherInjectsTieredInfo(t *testing.T) {
 			BillingMode: "tiered_expr",
 			ExprString:  `tier("base", p * 2)`,
 		},
-		ChannelMeta: &relaycommon.ChannelMeta{},
+		ProviderMeta: &relaycommon.ProviderMeta{},
 	}
 	priceData := types.PriceData{
 		GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1},

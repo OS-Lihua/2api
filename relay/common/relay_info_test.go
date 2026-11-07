@@ -252,7 +252,7 @@ func TestInitChannelMetaAppliesAdvancedCustomRoutePassThrough(t *testing.T) {
 	tests := []struct {
 		name            string
 		channelType     int
-		channelSetting  dto.ChannelSettings
+		channelSetting  dto.ProviderSettings
 		model           string
 		wantPassThrough bool
 		wantEffort      string
@@ -274,7 +274,7 @@ func TestInitChannelMetaAppliesAdvancedCustomRoutePassThrough(t *testing.T) {
 		{
 			name:            "channel-level pass-through still applies to converter route",
 			channelType:     constant.ChannelTypeAdvancedCustom,
-			channelSetting:  dto.ChannelSettings{PassThroughBodyEnabled: true},
+			channelSetting:  dto.ProviderSettings{PassThroughBodyEnabled: true},
 			model:           "other-model",
 			wantPassThrough: true,
 			wantEffort:      "",
@@ -295,7 +295,7 @@ func TestInitChannelMetaAppliesAdvancedCustomRoutePassThrough(t *testing.T) {
 			ctx.Set("original_model", tt.model)
 			common.SetContextKey(ctx, constant.ContextKeyChannelType, tt.channelType)
 			common.SetContextKey(ctx, constant.ContextKeyChannelSetting, tt.channelSetting)
-			common.SetContextKey(ctx, constant.ContextKeyChannelOtherSetting, dto.ChannelOtherSettings{AdvancedCustom: advancedCustom})
+			common.SetContextKey(ctx, constant.ContextKeyChannelOtherSetting, dto.ProviderOtherSettings{AdvancedCustom: advancedCustom})
 
 			info, err := GenRelayInfo(ctx, types.RelayFormatOpenAI, &dto.GeneralOpenAIRequest{Model: tt.model, ReasoningEffort: "high"}, nil)
 			require.NoError(t, err)

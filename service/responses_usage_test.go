@@ -79,7 +79,7 @@ func TestResponsesUsageAccumulatorInterruptedTextFallback(t *testing.T) {
 			name = "failed response preserves native billing usage"
 		}
 		t.Run(name, func(t *testing.T) {
-			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-4o"}}
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "gpt-4o"}}
 			info.SetEstimatePromptTokens(100)
 			accumulator := NewResponsesUsageAccumulator(info)
 			accumulator.Observe(&dto.ResponsesStreamResponse{Type: "response.output_text.delta", Delta: "hello"}, nil)
@@ -325,7 +325,7 @@ func TestResponsesUsageAccumulatorMissingUsageEstimation(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			info := &relaycommon.RelayInfo{
-				ChannelMeta:  &relaycommon.ChannelMeta{UpstreamModelName: model},
+				ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: model},
 				StreamStatus: relaycommon.NewStreamStatus(),
 			}
 			info.SetEstimatePromptTokens(100)

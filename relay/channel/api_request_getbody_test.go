@@ -223,7 +223,7 @@ func TestDoTaskApiRequest_KeepsReplayableGetBody(t *testing.T) {
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/video/generations", bytes.NewReader(payload))
 
 	info := &relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{},
+		ProviderMeta: &relaycommon.ProviderMeta{},
 	}
 
 	adaptor := &stubTaskAdaptor{baseURL: server.URL}

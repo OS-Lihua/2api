@@ -7,7 +7,7 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 )
 
-var filterEvalOrder = []dto.ChannelFilterKind{
+var filterEvalOrder = []dto.ProviderFilterKind{
 	dto.FilterRequestPath,
 	dto.FilterTaskPluginEndpoint,
 	dto.FilterTaskPluginIdentity,
@@ -17,7 +17,7 @@ var filterEvalOrder = []dto.ChannelFilterKind{
 // ProviderSatisfiesFilters reports whether ch passes every filter.
 // On false, it returns the first violated filter in filterEvalOrder for error
 // attribution.
-func ProviderSatisfiesFilters(ch *Provider, modelName string, filters []dto.ChannelFilter) (bool, dto.ChannelFilterKind) {
+func ProviderSatisfiesFilters(ch *Provider, modelName string, filters []dto.ProviderFilter) (bool, dto.ProviderFilterKind) {
 	if ch == nil {
 		return false, ""
 	}
@@ -38,7 +38,7 @@ func ProviderSatisfiesFilters(ch *Provider, modelName string, filters []dto.Chan
 // Caller must hold channelSyncLock (read lock). The input slice is never mutated.
 // A missing id in channelsIDM is kept for request_path (downstream consistency
 // error) and dropped for the other filters.
-func filterCandidateIDs(ids []int, modelName string, filters []dto.ChannelFilter) (kept []int, emptiedBy dto.ChannelFilterKind) {
+func filterCandidateIDs(ids []int, modelName string, filters []dto.ProviderFilter) (kept []int, emptiedBy dto.ProviderFilterKind) {
 	if len(ids) == 0 {
 		return ids, ""
 	}
@@ -63,8 +63,8 @@ func filterCandidateIDs(ids []int, modelName string, filters []dto.ChannelFilter
 	return kept, ""
 }
 
-func filtersByKind(filters []dto.ChannelFilter, kind dto.ChannelFilterKind) []dto.ChannelFilter {
-	var matched []dto.ChannelFilter
+func filtersByKind(filters []dto.ProviderFilter, kind dto.ProviderFilterKind) []dto.ProviderFilter {
+	var matched []dto.ProviderFilter
 	for _, filter := range filters {
 		if filter.Kind == kind {
 			matched = append(matched, filter)
@@ -73,7 +73,7 @@ func filtersByKind(filters []dto.ChannelFilter, kind dto.ChannelFilterKind) []dt
 	return matched
 }
 
-func candidatePassesKindFilters(ch *Provider, exists bool, modelName string, kind dto.ChannelFilterKind, filters []dto.ChannelFilter) bool {
+func candidatePassesKindFilters(ch *Provider, exists bool, modelName string, kind dto.ProviderFilterKind, filters []dto.ProviderFilter) bool {
 	if kind == dto.FilterRequestPath && !exists {
 		return true
 	}
@@ -88,7 +88,7 @@ func candidatePassesKindFilters(ch *Provider, exists bool, modelName string, kin
 	return true
 }
 
-func channelMatchesFilter(ch *Provider, modelName string, filter dto.ChannelFilter) bool {
+func channelMatchesFilter(ch *Provider, modelName string, filter dto.ProviderFilter) bool {
 	switch filter.Kind {
 	case dto.FilterRequestPath:
 		if filter.RequestPath == "" {

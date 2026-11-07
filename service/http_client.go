@@ -391,13 +391,13 @@ func newProxyHTTPClient(proxyURL *url.URL) (*http.Client, error) {
 
 // GetHttpClientWithProxy returns the default client or a cached proxy-enabled client.
 func GetHttpClientWithProxy(rawProxyURL string) (*http.Client, error) {
-	return GetHttpClientWithProxySettings(rawProxyURL, dto.ChannelSettings{})
+	return GetHttpClientWithProxySettings(rawProxyURL, dto.ProviderSettings{})
 }
 
 // GetHttpClientWithProxySettings returns a cached HTTP client for the proxy URL and
 // channel transport settings. Default auto + 1 shard shares the same client pool as
 // GetHttpClientWithProxy / GetHttpClient for the empty-proxy case.
-func GetHttpClientWithProxySettings(rawProxyURL string, settings dto.ChannelSettings) (*http.Client, error) {
+func GetHttpClientWithProxySettings(rawProxyURL string, settings dto.ProviderSettings) (*http.Client, error) {
 	policy := NormalizeHTTPTransportPolicy(settings)
 	trimmedProxyURL := strings.TrimSpace(rawProxyURL)
 

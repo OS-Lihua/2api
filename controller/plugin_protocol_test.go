@@ -177,7 +177,7 @@ func TestServeTaskPluginProtocolDisconnectBeforeDurableBarrierPersistsAndSettles
 			Type: constant.ChannelTypeTaskPlugin,
 			Name: "disconnect-before-durable",
 		}
-		info.ChannelMeta = &relaycommon.ChannelMeta{
+		info.ProviderMeta = &relaycommon.ProviderMeta{
 			ChannelId:   1,
 			ChannelType: constant.ChannelTypeTaskPlugin,
 		}
@@ -1816,7 +1816,7 @@ func TestServeTaskPluginImageProtocolDisconnectDuringSubmissionKeepsDurableSettl
 		info.Billing = billing
 		info.TaskRelayInfo.PublicTaskID = "task_image_disconnect"
 		info.TaskRelayInfo.LockedChannel = &model.Provider{Id: 1, Type: constant.ChannelTypeTaskPlugin, Name: "image-bridge"}
-		info.ChannelMeta = &relaycommon.ChannelMeta{ChannelId: 1, ChannelType: constant.ChannelTypeTaskPlugin}
+		info.ProviderMeta = &relaycommon.ProviderMeta{ChannelId: 1, ChannelType: constant.ChannelTypeTaskPlugin}
 		return executeTaskSubmissionWith(c, info, func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
 			close(submitStarted)
 			<-releaseSubmit

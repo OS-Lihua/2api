@@ -27,7 +27,7 @@ func mustApplyReasoningModelSuffix(t *testing.T, info *relaycommon.RelayInfo, ou
 func TestApplyReasoningModelSuffixTrimsUpstreamAndAttachesState(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "claude-3-7-sonnet-thinking",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "claude-3-7-sonnet-thinking",
 		},
 	}
@@ -41,7 +41,7 @@ func TestApplyReasoningModelSuffixTrimsUpstreamAndAttachesState(t *testing.T) {
 func TestApplyReasoningModelSuffixRetryKeepsEquivalentState(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "claude-opus-4-8-high",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "claude-opus-4-8-high",
 		},
 	}
@@ -65,7 +65,7 @@ func TestApplyReasoningModelSuffixRetryClearsStateWhenNewChannelHasNoSuffix(t *t
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "claude-3-7-sonnet",
 		Request:         req,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "claude-3-7-sonnet-thinking",
 			IsModelMapped:     true,
 		},
@@ -92,7 +92,7 @@ func TestApplyReasoningModelSuffixPassThroughDoesNotTrim(t *testing.T) {
 
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "claude-3-7-sonnet-thinking",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "claude-3-7-sonnet-thinking",
 		},
 	}
@@ -110,7 +110,7 @@ func TestApplyReasoningModelSuffixBlacklistDoesNotTrim(t *testing.T) {
 
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "claude-3-7-sonnet-thinking",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "claude-3-7-sonnet-thinking",
 		},
 	}
@@ -127,7 +127,7 @@ func TestApplyReasoningModelSuffixModifierOverridesExplicitConflict(t *testing.T
 			Model:    "claude-3-7-sonnet-thinking",
 			Thinking: &dto.Thinking{Type: "disabled"},
 		},
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "claude-3-7-sonnet-thinking",
 		},
 	}
@@ -149,7 +149,7 @@ func TestApplyReasoningModelSuffixGeminiNoThinkingWhenAdapterEnabled(t *testing.
 
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "gemini-2.5-flash-nothinking",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "gemini-2.5-flash-nothinking",
 		},
 	}
@@ -171,7 +171,7 @@ func TestApplyReasoningModelSuffixClaudeEffortTailKeptWhenAdapterDisabled(t *tes
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "claude-opus-5-5-high",
 		Request:         req,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "claude-opus-5-5-high",
 		},
 	}
@@ -185,7 +185,7 @@ func TestApplyReasoningModelSuffixClaudeEffortTailKeptWhenAdapterDisabled(t *tes
 func TestApplyReasoningModelSuffixPreservesEffortTailModelID(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "qwen-max",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "qwen-max",
 		},
 	}
@@ -198,7 +198,7 @@ func TestApplyReasoningModelSuffixPreservesEffortTailModelID(t *testing.T) {
 func TestApplyReasoningModelSuffixLeavesDeepSeekV4SuffixForAdaptor(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "deepseek-v4-chat-max",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType:       constant.ChannelTypeDeepSeek,
 			UpstreamModelName: "deepseek-v4-chat-max",
 		},
@@ -212,7 +212,7 @@ func TestApplyReasoningModelSuffixLeavesDeepSeekV4SuffixForAdaptor(t *testing.T)
 func TestApplyReasoningModelSuffixLeavesVolcengineDeepSeekThinkingForAdaptor(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "deepseek-r1-thinking",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType:       constant.ChannelTypeVolcEngine,
 			UpstreamModelName: "deepseek-r1-thinking",
 		},
@@ -226,7 +226,7 @@ func TestApplyReasoningModelSuffixLeavesVolcengineDeepSeekThinkingForAdaptor(t *
 func TestApplyReasoningModelSuffixStillParsesOpenAIEffortTail(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "gpt-5.1-high",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType:       constant.ChannelTypeOpenAI,
 			UpstreamModelName: "gpt-5.1-high",
 		},
@@ -242,7 +242,7 @@ func TestApplyReasoningModelSuffixStillParsesOpenAIEffortTail(t *testing.T) {
 func TestApplyReasoningModelSuffixLeavesUnknownOpenRouterThinkingModel(t *testing.T) {
 	openRouter := &relaycommon.RelayInfo{
 		OriginModelName: "some-model-thinking",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType:       constant.ChannelTypeOpenRouter,
 			UpstreamModelName: "some-model-thinking",
 		},
@@ -255,7 +255,7 @@ func TestApplyReasoningModelSuffixLeavesUnknownOpenRouterThinkingModel(t *testin
 func TestApplyReasoningModelSuffixLeavesVersionedQwenMaxUntouched(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "qwen3.8-max",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "qwen3.8-max",
 		},
 	}
@@ -270,7 +270,7 @@ func TestApplyReasoningModelSuffixTreatsCloudflareAtAsModelName(t *testing.T) {
 	const model = "@cf/meta/llama-3.1-8b-instruct"
 	info := &relaycommon.RelayInfo{
 		OriginModelName: model,
-		ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: model},
+		ProviderMeta:    &relaycommon.ProviderMeta{UpstreamModelName: model},
 	}
 
 	mustApplyReasoningModelSuffix(t, info)
@@ -290,7 +290,7 @@ func TestApplyReasoningModelSuffixAppliesExplicitModifierChain(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: request.Model,
 		Request:         request,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: request.Model,
 		},
 	}
@@ -318,7 +318,7 @@ func TestApplyReasoningModelSuffixRejectsUnknownModifierKey(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: request.Model,
 		Request:         request,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: request.Model,
 		},
 	}
@@ -338,7 +338,7 @@ func TestApplyReasoningModelSuffixThinkingOnOnly(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: request.Model,
 		Request:         request,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: request.Model,
 		},
 	}
@@ -356,7 +356,7 @@ func TestApplyReasoningModelSuffixThinkingOff(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: request.Model,
 		Request:         request,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: request.Model,
 		},
 	}
@@ -373,7 +373,7 @@ func TestApplyReasoningModelSuffixThinkingLegacyValuesRejected(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: request.Model,
 		Request:         request,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: request.Model,
 		},
 	}
@@ -394,7 +394,7 @@ func TestApplyReasoningModelSuffixDuplicateModifierLastWins(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: request.Model,
 		Request:         request,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: request.Model,
 		},
 	}
@@ -422,7 +422,7 @@ func TestApplyReasoningModelSuffixExactExemptionKeepsOpaqueName(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: model,
 		Request:         request,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: model,
 		},
 	}
@@ -445,7 +445,7 @@ func TestApplyReasoningModelSuffixRegexExemptionKeepsOpaqueName(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: model,
 		Request:         request,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: model,
 		},
 	}
@@ -462,7 +462,7 @@ func TestApplyReasoningModelSuffixEffortNoneDisables(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: request.Model,
 		Request:         request,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: request.Model,
 		},
 	}
@@ -491,7 +491,7 @@ func TestApplyReasoningModelSuffixPassThroughKeepsModifierBodyVerbatim(t *testin
 		OriginModelName: model,
 		Request:         request,
 		RelayFormat:     types.RelayFormatOpenAI,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: model,
 		},
 	}
@@ -519,9 +519,9 @@ func TestApplyReasoningModelSuffixChannelPassThroughKeepsModifierBodyVerbatim(t 
 	info := &relaycommon.RelayInfo{
 		OriginModelName: model,
 		Request:         request,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: model,
-			ChannelSetting:    dto.ChannelSettings{PassThroughBodyEnabled: true},
+			ChannelSetting:    dto.ProviderSettings{PassThroughBodyEnabled: true},
 		},
 	}
 
@@ -546,7 +546,7 @@ func TestApplyReasoningModelSuffixPassThroughAllowsUnknownModifier(t *testing.T)
 	info := &relaycommon.RelayInfo{
 		OriginModelName: model,
 		Request:         request,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: model,
 		},
 	}
@@ -561,7 +561,7 @@ func TestApplyReasoningModelSuffixAppliesModifiersWhenPassThroughOff(t *testing.
 	info := &relaycommon.RelayInfo{
 		OriginModelName: request.Model,
 		Request:         request,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: request.Model,
 		},
 	}
@@ -578,7 +578,7 @@ func TestApplyReasoningModelSuffixThinkingMinusOnePassthrough(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: request.Model,
 		Request:         request,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: request.Model,
 		},
 	}
@@ -597,7 +597,7 @@ func TestApplyReasoningModelSuffixThinkingMinusOnePassthrough(t *testing.T) {
 func TestApplyReasoningModelSuffixPreservesGpt51CodexMax(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "gpt-5.1-codex-max",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "gpt-5.1-codex-max",
 		},
 	}

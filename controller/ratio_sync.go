@@ -1138,10 +1138,10 @@ func GetSyncableChannels(c *gin.Context) {
 		return
 	}
 
-	var syncableChannels []dto.SyncableChannel
+	var syncableChannels []dto.SyncableProvider
 	for _, channel := range channels {
 		if channel.GetBaseURL() != "" {
-			syncableChannels = append(syncableChannels, dto.SyncableChannel{
+			syncableChannels = append(syncableChannels, dto.SyncableProvider{
 				ID:      channel.Id,
 				Name:    channel.Name,
 				BaseURL: channel.GetBaseURL(),
@@ -1151,14 +1151,14 @@ func GetSyncableChannels(c *gin.Context) {
 		}
 	}
 
-	syncableChannels = append(syncableChannels, dto.SyncableChannel{
+	syncableChannels = append(syncableChannels, dto.SyncableProvider{
 		ID:      officialRatioPresetID,
 		Name:    officialRatioPresetName,
 		BaseURL: officialRatioPresetBaseURL,
 		Status:  1,
 	})
 
-	syncableChannels = append(syncableChannels, dto.SyncableChannel{
+	syncableChannels = append(syncableChannels, dto.SyncableProvider{
 		ID:      modelsDevPresetID,
 		Name:    modelsDevPresetName,
 		BaseURL: modelsDevPresetBaseURL,

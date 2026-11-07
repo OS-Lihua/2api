@@ -97,7 +97,7 @@ func TestGoogleThroughNewAPIGateway(t *testing.T) {
 	assert.Equal(t, "https://gateway.example/google/v1beta/models/"+veo+"/operations/task_pub", query["url"])
 
 	adaptor := taskplugin.New(plugin)
-	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+	adaptor.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{
 		ChannelType: constant.ChannelTypeNewAPI, ApiKey: "sk-gateway", ChannelBaseUrl: "https://gateway.example",
 	}})
 	queryParams := map[string]any{"model": veo, "task_id": "task_pub"}

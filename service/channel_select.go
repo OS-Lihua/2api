@@ -16,14 +16,14 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func GetChannelConstraints(c *gin.Context) *dto.ChannelConstraints {
+func GetChannelConstraints(c *gin.Context) *dto.ProviderConstraints {
 	if c == nil {
-		return &dto.ChannelConstraints{}
+		return &dto.ProviderConstraints{}
 	}
-	if existing, ok := common.GetContextKeyType[*dto.ChannelConstraints](c, constant.ContextKeyChannelConstraints); ok && existing != nil {
+	if existing, ok := common.GetContextKeyType[*dto.ProviderConstraints](c, constant.ContextKeyChannelConstraints); ok && existing != nil {
 		return existing
 	}
-	constraints := &dto.ChannelConstraints{}
+	constraints := &dto.ProviderConstraints{}
 	common.SetContextKey(c, constant.ContextKeyChannelConstraints, constraints)
 	return constraints
 }
@@ -33,7 +33,7 @@ func AppendTaskPluginIdentityFilter(c *gin.Context, pluginKey string) {
 		return
 	}
 	channelTypes, pluginKeys := pinnedTaskPluginIdentities(c, pluginKey)
-	GetChannelConstraints(c).AddFilter(dto.ChannelFilter{
+	GetChannelConstraints(c).AddFilter(dto.ProviderFilter{
 		Kind:                   dto.FilterTaskPluginIdentity,
 		TaskPluginKey:          pluginKey,
 		TaskPluginChannelTypes: channelTypes,
@@ -275,19 +275,19 @@ func pinnedTaskPluginIdentities(c *gin.Context, expected string) ([]int, []strin
 	return channelTypes, []string{expected}
 }
 
-// ChannelSelectError explains why SelectChannelForRequest found no channel.
+// ProviderSelectError explains why SelectChannelForRequest found no channel.
 // Callers render it for their transport: the HTTP distributor localizes
 // MessageID with its own helpers and the Responses WebSocket relay wraps it in
 // a NewAPIError. Message is set instead of MessageID when the text is a fixed
 // error code that clients match on.
-type ChannelSelectError struct {
+type ProviderSelectError struct {
 	StatusCode int
 	Code       types.ErrorCode
 	MessageID  string
 	Params     map[string]any
 	Message    string
 	// FilterKind and Channel identify a candidate rejected by request filters.
-	FilterKind dto.ChannelFilterKind
+	FilterKind dto.ProviderFilterKind
 	Channel    *model.Provider
 	// NoAvailableChannel marks the "no channel for this group and model"
 	// outcome so the distributor can name the claiming task plugin.
@@ -300,7 +300,7 @@ type ChannelSelectError struct {
 // eligible channel; every candidate must satisfy the request's channel
 // filters. The group the channel was chosen from is returned for auto-group
 // callers. The caller still applies SetupContextForSelectedChannel.
-func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam) (*model.Provider, string, *ChannelSelectError) {
+func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam) (*model.Provider, string, *ProviderSelectError) {
 	constraints := GetChannelConstraints(c)
 	if pin, found, overridden := constraints.ResolvedPin(); found {
 		for _, lost := range overridden {
@@ -317,7 +317,7 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 			return nil, "", pinnedChannelUnavailable(pin, http.StatusForbidden, i18n.MsgDistributorChannelDisabled)
 		}
 		if ok, kind := model.ProviderSatisfiesFilters(channel, modelName, constraints.Filters); !ok {
-			return nil, "", &ChannelSelectError{
+			return nil, "", &ProviderSelectError{
 				StatusCode: http.StatusBadRequest, Code: types.ErrorCode(kind), MessageID: i18n.MsgDistributorNoAvailableChannel,
 				Params:     map[string]any{"Group": common.GetContextKeyString(c, constant.ContextKeyUsingGroup), "Model": modelName},
 				FilterKind: kind, Channel: channel,
@@ -361,7 +361,7 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 				ClearCurrentChannelAffinityCache(c)
 			}
 			if !affinityUsable && RequestPolicy(c).SessionMode == "strict" {
-				return nil, "", &ChannelSelectError{StatusCode: http.StatusServiceUnavailable, Message: "strict_session_binding_unavailable"}
+				return nil, "", &ProviderSelectError{StatusCode: http.StatusServiceUnavailable, Message: "strict_session_binding_unavailable"}
 			}
 		}
 	}
@@ -374,20 +374,20 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 			if usingGroup == "auto" {
 				showGroup = fmt.Sprintf("auto(%s)", selectGroup)
 			}
-			return nil, selectGroup, &ChannelSelectError{
+			return nil, selectGroup, &ProviderSelectError{
 				StatusCode: http.StatusServiceUnavailable, Code: types.ErrorCodeModelNotFound, MessageID: i18n.MsgDistributorGetChannelFailed,
 				Params: map[string]any{"Group": showGroup, "Model": modelName, "Error": err.Error()},
 			}
 		}
 		if channel == nil {
-			return nil, selectGroup, &ChannelSelectError{
+			return nil, selectGroup, &ProviderSelectError{
 				StatusCode: http.StatusServiceUnavailable, Code: types.ErrorCodeModelNotFound, MessageID: i18n.MsgDistributorNoAvailableChannel,
 				Params: map[string]any{"Group": usingGroup, "Model": modelName}, NoAvailableChannel: true,
 			}
 		}
 	}
 	if ok, kind := model.ProviderSatisfiesFilters(channel, modelName, constraints.Filters); !ok {
-		return nil, selectGroup, &ChannelSelectError{
+		return nil, selectGroup, &ProviderSelectError{
 			StatusCode: http.StatusServiceUnavailable, Code: types.ErrorCodeModelNotFound, MessageID: i18n.MsgDistributorNoAvailableChannel,
 			Params:     map[string]any{"Group": common.GetContextKeyString(c, constant.ContextKeyUsingGroup), "Model": modelName},
 			FilterKind: kind, Channel: channel, NoAvailableChannel: true,
@@ -398,11 +398,11 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 
 // Origin-task pins report a fixed code so task polling can tell a retired
 // channel from a malformed request.
-func pinnedChannelUnavailable(pin dto.ChannelPin, statusCode int, messageID string) *ChannelSelectError {
+func pinnedChannelUnavailable(pin dto.ProviderPin, statusCode int, messageID string) *ProviderSelectError {
 	if pin.Source == dto.PinSourceOriginTask {
-		return &ChannelSelectError{StatusCode: http.StatusBadRequest, Code: "origin_task_channel_disabled", Message: "origin_task_channel_disabled"}
+		return &ProviderSelectError{StatusCode: http.StatusBadRequest, Code: "origin_task_channel_disabled", Message: "origin_task_channel_disabled"}
 	}
-	return &ChannelSelectError{StatusCode: statusCode, MessageID: messageID}
+	return &ProviderSelectError{StatusCode: statusCode, MessageID: messageID}
 }
 
 // AppendUsedChannel records an attempted channel in the request's channel

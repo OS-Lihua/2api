@@ -63,7 +63,7 @@ func TestConvertOpenAIRequestFiltersThinkingBudgetByUpstreamModel(t *testing.T) 
 				ThinkingBudget: json.RawMessage(tt.budget),
 			}
 			info := &relaycommon.RelayInfo{
-				ChannelMeta: &relaycommon.ChannelMeta{
+				ProviderMeta: &relaycommon.ProviderMeta{
 					UpstreamModelName: tt.upstreamModel,
 				},
 			}
@@ -108,7 +108,7 @@ func TestConvertOpenAIRequestPreservesExplicitZeroForMappedQwenModel(t *testing.
 	}
 	info := &relaycommon.RelayInfo{
 		OriginModelName: clientModel,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: clientModel,
 		},
 	}
@@ -139,7 +139,7 @@ func TestConvertOpenAIRequestPreservesExplicitZeroForMappedQwenModel(t *testing.
 // channels and still end as a 500 for the client.
 func TestConvertImageRequestRejectsUnclaimedModelWithoutRetry(t *testing.T) {
 	for _, name := range []string{"wanx-style-repaint-v1", "custom-image-model"} {
-		info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: name}}
+		info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: name}}
 		_, err := (&Adaptor{}).ConvertImageRequest(nil, info, dto.ImageRequest{Model: name, Prompt: "a cat"})
 		var apiErr *types.NewAPIError
 		require.ErrorAs(t, err, &apiErr, name)
@@ -265,7 +265,7 @@ func TestConvertClaudeRequestWebSearch(t *testing.T) {
 			info := &relaycommon.RelayInfo{
 				RelayFormat:     types.RelayFormatClaude,
 				OriginModelName: tt.model,
-				ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: tt.model},
+				ProviderMeta:    &relaycommon.ProviderMeta{UpstreamModelName: tt.model},
 			}
 			adaptor := &Adaptor{}
 			adaptor.Init(info)
@@ -319,9 +319,9 @@ func TestAliResponsesWebSearchUsage(t *testing.T) {
 		`{"type":"response.completed","response":{"usage":{"x_tools":{"web_search":{"count":2}}}}}`,
 	} {
 		info := &relaycommon.RelayInfo{
-			RelayMode:   constant.RelayModeResponses,
-			RelayFormat: types.RelayFormatOpenAIResponses,
-			ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://dashscope.invalid"},
+			RelayMode:    constant.RelayModeResponses,
+			RelayFormat:  types.RelayFormatOpenAIResponses,
+			ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://dashscope.invalid"},
 		}
 		adaptor := &Adaptor{}
 		adaptor.Init(info)
@@ -388,9 +388,9 @@ func TestEmbeddingRequestByModel(t *testing.T) {
 	}
 	for _, tt := range tests {
 		info := &relaycommon.RelayInfo{
-			RelayMode:   constant.RelayModeEmbeddings,
-			RelayFormat: types.RelayFormatEmbedding,
-			ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: base, UpstreamModelName: tt.model},
+			RelayMode:    constant.RelayModeEmbeddings,
+			RelayFormat:  types.RelayFormatEmbedding,
+			ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: base, UpstreamModelName: tt.model},
 		}
 		url, err := (&Adaptor{}).GetRequestURL(info)
 		require.NoError(t, err, tt.request)
@@ -463,9 +463,9 @@ func TestMultimodalEmbeddingResponse(t *testing.T) {
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
 			info := &relaycommon.RelayInfo{
-				RelayMode:   constant.RelayModeEmbeddings,
-				RelayFormat: types.RelayFormatEmbedding,
-				ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: tt.model},
+				RelayMode:    constant.RelayModeEmbeddings,
+				RelayFormat:  types.RelayFormatEmbedding,
+				ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: tt.model},
 			}
 			info.SetEstimatePromptTokens(tt.estimate)
 			resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(tt.body))}

@@ -42,7 +42,7 @@ func TestPricingCarriesTaskUsageSchemaAndRefreshesWithPluginGeneration(t *testin
 	require.NoError(t, err)
 	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(pluginKey) })
 
-	insertPricingEndpointChannel(t, 901, constant.ChannelTypeTaskPlugin, dto.ChannelOtherSettings{})
+	insertPricingEndpointChannel(t, 901, constant.ChannelTypeTaskPlugin, dto.ProviderOtherSettings{})
 	insertPricingEndpointAbility(t, 901, "pricing-usage-model")
 	insertPricingEndpointAbility(t, 901, "ordinary-model")
 
@@ -245,7 +245,7 @@ func TestPricingSharedPluginVariantsUseEachSchemaAndExpression(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(spec.key) })
 	}
-	insertPricingEndpointChannel(t, 930, constant.ChannelTypeTaskPlugin, dto.ChannelOtherSettings{})
+	insertPricingEndpointChannel(t, 930, constant.ChannelTypeTaskPlugin, dto.ProviderOtherSettings{})
 	insertPricingEndpointAbility(t, 930, "pricing-usage-model")
 	const expression = `tier("base", u("seconds") * 0.4)`
 	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{

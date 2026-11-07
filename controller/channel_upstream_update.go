@@ -68,14 +68,14 @@ var channelUpstreamModelUpdateNotifyState = struct {
 	lastFailedChannels  int
 }{}
 
-type applyChannelUpstreamModelUpdatesRequest struct {
+type applyProviderUpstreamModelUpdatesRequest struct {
 	ID           int      `json:"id"`
 	AddModels    []string `json:"add_models"`
 	RemoveModels []string `json:"remove_models"`
 	IgnoreModels []string `json:"ignore_models"`
 }
 
-type applyAllChannelUpstreamModelUpdatesResult struct {
+type applyAllProviderUpstreamModelUpdatesResult struct {
 	ChannelID             int      `json:"channel_id"`
 	ChannelName           string   `json:"channel_name"`
 	AddedModels           []string `json:"added_models"`
@@ -84,7 +84,7 @@ type applyAllChannelUpstreamModelUpdatesResult struct {
 	RemainingRemoveModels []string `json:"remaining_remove_models"`
 }
 
-type detectChannelUpstreamModelUpdatesResult struct {
+type detectProviderUpstreamModelUpdatesResult struct {
 	ChannelID       int      `json:"channel_id"`
 	ChannelName     string   `json:"channel_name"`
 	AddModels       []string `json:"add_models"`
@@ -93,7 +93,7 @@ type detectChannelUpstreamModelUpdatesResult struct {
 	AutoAddedModels int      `json:"auto_added_models"`
 }
 
-type upstreamModelUpdateChannelSummary struct {
+type upstreamModelUpdateProviderSummary struct {
 	ChannelName string
 	AddCount    int
 	RemoveCount int
@@ -239,7 +239,7 @@ func collectPendingUpstreamModelChangesFromModels(
 	return normalizeModelNames(pendingAdd), normalizeModelNames(pendingRemove)
 }
 
-func collectPendingUpstreamModelChanges(channel *model.Provider, settings dto.ChannelOtherSettings) (pendingAddModels []string, pendingRemoveModels []string, err error) {
+func collectPendingUpstreamModelChanges(channel *model.Provider, settings dto.ProviderOtherSettings) (pendingAddModels []string, pendingRemoveModels []string, err error) {
 	upstreamModels, err := fetchChannelUpstreamModelIDs(channel)
 	if err != nil {
 		return nil, nil, err
@@ -477,7 +477,7 @@ func fetchAdvancedCustomUpstreamModelIDs(channel *model.Provider, baseURL string
 		RelayFormat:    types.RelayFormatOpenAI,
 		RelayMode:      relayconstant.RelayModeUnknown,
 		RequestURLPath: dto.AdvancedCustomModelListPath,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType:          channel.Type,
 			ChannelBaseUrl:       baseURL,
 			ApiKey:               key,
@@ -501,7 +501,7 @@ func fetchAdvancedCustomUpstreamModelIDs(channel *model.Provider, baseURL string
 	return parseOpenAIModelIDs(body)
 }
 
-func updateChannelUpstreamModelSettings(channel *model.Provider, settings dto.ChannelOtherSettings, updateModels bool) error {
+func updateChannelUpstreamModelSettings(channel *model.Provider, settings dto.ProviderOtherSettings, updateModels bool) error {
 	channel.SetOtherSettings(settings)
 	updates := map[string]any{
 		"settings": channel.OtherSettings,
@@ -514,7 +514,7 @@ func updateChannelUpstreamModelSettings(channel *model.Provider, settings dto.Ch
 
 func checkAndPersistChannelUpstreamModelUpdates(
 	channel *model.Provider,
-	settings *dto.ChannelOtherSettings,
+	settings *dto.ProviderOtherSettings,
 	force bool,
 	allowAutoApply bool,
 ) (modelsChanged bool, autoAdded int, err error) {
@@ -603,7 +603,7 @@ func buildUpstreamModelUpdateTaskNotificationContent(
 	detectedRemoveModels int,
 	autoAddedModels int,
 	failedChannelIDs []int,
-	channelSummaries []upstreamModelUpdateChannelSummary,
+	channelSummaries []upstreamModelUpdateProviderSummary,
 	addModelSamples []string,
 	removeModelSamples []string,
 ) string {
@@ -713,7 +713,7 @@ func runChannelUpstreamModelUpdateTaskOnce(ctx context.Context, force bool, allo
 	detectedAddModels := 0
 	detectedRemoveModels := 0
 	autoAddedModels := 0
-	channelSummaries := make([]upstreamModelUpdateChannelSummary, 0)
+	channelSummaries := make([]upstreamModelUpdateProviderSummary, 0)
 	addModelSamples := make([]string, 0)
 	removeModelSamples := make([]string, 0)
 	refreshNeeded := false
@@ -785,7 +785,7 @@ scanLoop:
 			detectedRemoveModels += currentRemoveCount
 			if currentAddCount > 0 || currentRemoveCount > 0 {
 				changedChannels++
-				channelSummaries = append(channelSummaries, upstreamModelUpdateChannelSummary{
+				channelSummaries = append(channelSummaries, upstreamModelUpdateProviderSummary{
 					ChannelName: channel.Name,
 					AddCount:    currentAddCount,
 					RemoveCount: currentRemoveCount,
@@ -874,7 +874,7 @@ scanLoop:
 }
 
 func ApplyChannelUpstreamModelUpdates(c *gin.Context) {
-	var req applyChannelUpstreamModelUpdatesRequest
+	var req applyProviderUpstreamModelUpdatesRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		common.ApiError(c, err)
 		return
@@ -930,7 +930,7 @@ func ApplyChannelUpstreamModelUpdates(c *gin.Context) {
 }
 
 func DetectChannelUpstreamModelUpdates(c *gin.Context) {
-	var req applyChannelUpstreamModelUpdatesRequest
+	var req applyProviderUpstreamModelUpdatesRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		common.ApiError(c, err)
 		return
@@ -962,7 +962,7 @@ func DetectChannelUpstreamModelUpdates(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
-		"data": detectChannelUpstreamModelUpdatesResult{
+		"data": detectProviderUpstreamModelUpdatesResult{
 			ChannelID:       channel.Id,
 			ChannelName:     channel.Name,
 			AddModels:       normalizeModelNames(settings.UpstreamModelUpdateLastDetectedModels),
@@ -1023,7 +1023,7 @@ func applyChannelUpstreamModelUpdates(
 	return addModels, removeModels, remainingModels, remainingRemoveModels, modelsChanged, nil
 }
 
-func collectPendingApplyUpstreamModelChanges(settings dto.ChannelOtherSettings) (pendingAddModels []string, pendingRemoveModels []string) {
+func collectPendingApplyUpstreamModelChanges(settings dto.ProviderOtherSettings) (pendingAddModels []string, pendingRemoveModels []string) {
 	return normalizeModelNames(settings.UpstreamModelUpdateLastDetectedModels), normalizeModelNames(settings.UpstreamModelUpdateLastRemovedModels)
 }
 
@@ -1041,7 +1041,7 @@ func findEnabledChannelsAfterID(lastID int, batchSize int) ([]*model.Provider, e
 }
 
 func ApplyAllChannelUpstreamModelUpdates(c *gin.Context) {
-	results := make([]applyAllChannelUpstreamModelUpdatesResult, 0)
+	results := make([]applyAllProviderUpstreamModelUpdatesResult, 0)
 	failed := make([]int, 0)
 	refreshNeeded := false
 	addedModelCount := 0
@@ -1089,7 +1089,7 @@ func ApplyAllChannelUpstreamModelUpdates(c *gin.Context) {
 			}
 			addedModelCount += len(addedModels)
 			removedModelCount += len(removedModels)
-			results = append(results, applyAllChannelUpstreamModelUpdatesResult{
+			results = append(results, applyAllProviderUpstreamModelUpdatesResult{
 				ChannelID:             channel.Id,
 				ChannelName:           channel.Name,
 				AddedModels:           addedModels,

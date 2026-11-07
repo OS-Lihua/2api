@@ -40,7 +40,7 @@ func TestClaudeStreamFinalUsageEstimatesOnlyUncountedUsage(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
 			c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
-			info := &relaycommon.RelayInfo{RelayFormat: types.RelayFormatClaude, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "claude-opus-4-8"}}
+			info := &relaycommon.RelayInfo{RelayFormat: types.RelayFormatClaude, ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "claude-opus-4-8"}}
 			info.SetEstimatePromptTokens(1200)
 			state := &ClaudeResponseInfo{Usage: &dto.Usage{}}
 			start := fmt.Sprintf(`{"type":"message_start","message":{"id":"msg_1","model":"claude-opus-4-8","usage":%s}}`, tc.startUsage)
@@ -294,8 +294,8 @@ func TestClaudeStreamFallbackCountsInterruptedToolUse(t *testing.T) {
 
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	info := &relaycommon.RelayInfo{
-		RelayFormat: types.RelayFormatClaude,
-		ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "claude-sonnet-5"},
+		RelayFormat:  types.RelayFormatClaude,
+		ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "claude-sonnet-5"},
 	}
 	info.SetEstimatePromptTokens(100)
 	HandleStreamFinalResponse(c, info, claudeInfo)
@@ -412,7 +412,7 @@ func applyOpenAIChatReasoningThroughHandlerOrder(t *testing.T, original dto.Gene
 	info := &relaycommon.RelayInfo{
 		OriginModelName: original.Model,
 		Request:         &original,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: original.Model,
 		},
 	}
@@ -481,8 +481,8 @@ func TestOpenAIChatRequestToClaudeMessages_ClaudeOpus48ThinkingUsesAdaptiveHighE
 func TestClaudeResponsePassesInputTransformationsThrough(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	info := &relaycommon.RelayInfo{
-		RelayFormat: types.RelayFormatClaude,
-		ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "claude-opus-5-5"},
+		RelayFormat:  types.RelayFormatClaude,
+		ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "claude-opus-5-5"},
 	}
 	transformations := `"input_transformations":[{"type":"thinking_dropped","path":"messages.1.content.0","reason":"prefix_binding_mismatch"}]`
 

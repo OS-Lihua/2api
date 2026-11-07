@@ -68,14 +68,14 @@ func TestDocumentPluginRunsGenericBatchArtifactChain(t *testing.T) {
 		}
 	}))
 	defer upstream.Close()
-	setting := dto.ChannelSettings{TaskPluginKey: "doc-parse"}
+	setting := dto.ProviderSettings{TaskPluginKey: "doc-parse"}
 	channel := model.Provider{Type: constant.ChannelTypeTaskPlugin, Name: "documents", Key: "unused", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "doc-parse-v1", Group: "default"}
 	channel.SetSetting(setting)
 	require.NoError(t, database.Create(&channel).Error)
 
 	adaptor := relay.GetTaskAdaptor("doc-parse")
 	require.NotNil(t, adaptor)
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: channel.Type, ChannelBaseUrl: upstream.URL, ApiKey: channel.Key, ChannelSetting: setting, UpstreamModelName: "doc-parse-v1"}, OriginModelName: "doc-parse-v1", TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_doc_parse"}}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: channel.Type, ChannelBaseUrl: upstream.URL, ApiKey: channel.Key, ChannelSetting: setting, UpstreamModelName: "doc-parse-v1"}, OriginModelName: "doc-parse-v1", TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_doc_parse"}}
 	adaptor.Init(info)
 	submitRecorder := httptest.NewRecorder()
 	submitContext, _ := gin.CreateTestContext(submitRecorder)

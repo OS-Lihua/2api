@@ -73,7 +73,7 @@ func TestStreamScannerHandler_RequestKeepAliveHandoff(t *testing.T) {
 				},
 				Body: io.NopCloser(strings.NewReader("data: chunk\n\ndata: [DONE]\n\n")),
 			}
-			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{}}
 			var received []string
 			StreamScannerHandler(c, resp, info, func(data string, _ *StreamResult) {
 				received = append(received, data)
@@ -115,7 +115,7 @@ func setupStreamTest(t *testing.T, body io.Reader) (*gin.Context, *http.Response
 	}
 
 	info := &relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{},
+		ProviderMeta: &relaycommon.ProviderMeta{},
 	}
 
 	return c, resp, info
@@ -139,7 +139,7 @@ func TestStreamScannerHandler_NilInputs(t *testing.T) {
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
 
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{}}
 
 	StreamScannerHandler(c, nil, info, func(data string, sr *StreamResult) {})
 	StreamScannerHandler(c, &http.Response{Body: io.NopCloser(strings.NewReader(""))}, info, nil)
@@ -328,8 +328,8 @@ func TestStreamScannerHandler_ClientCancelAbortsUpstreamAndReturns(t *testing.T)
 
 	resp := &http.Response{Body: pr}
 	info := &relaycommon.RelayInfo{
-		DisablePing: true,
-		ChannelMeta: &relaycommon.ChannelMeta{},
+		DisablePing:  true,
+		ProviderMeta: &relaycommon.ProviderMeta{},
 	}
 
 	var count atomic.Int64
@@ -407,7 +407,7 @@ func TestStreamScannerHandler_PingSentDuringSlowUpstream(t *testing.T) {
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 
 	resp := &http.Response{Body: pr}
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{}}
 
 	var count atomic.Int64
 	done := make(chan struct{})
@@ -449,8 +449,8 @@ func TestStreamScannerHandler_PingDisabledByRelayInfo(t *testing.T) {
 
 	resp := &http.Response{Body: io.NopCloser(strings.NewReader(buildSSEBody(5)))}
 	info := &relaycommon.RelayInfo{
-		DisablePing: true,
-		ChannelMeta: &relaycommon.ChannelMeta{},
+		DisablePing:  true,
+		ProviderMeta: &relaycommon.ProviderMeta{},
 	}
 
 	var count atomic.Int64
@@ -565,7 +565,7 @@ func TestStreamScannerHandler_StreamStatus_Timeout(t *testing.T) {
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 
 	resp := &http.Response{Body: pr}
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{}}
 
 	done := make(chan struct{})
 	go func() {

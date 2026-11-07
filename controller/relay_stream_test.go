@@ -123,7 +123,7 @@ func TestRelayKeepAliveAcrossUpstreamRetries(t *testing.T) {
 		if !assert.NoError(t, http.NewResponseController(c.Writer).SetWriteDeadline(time.Now().Add(5*time.Second))) {
 			return
 		}
-		info := &relaycommon.RelayInfo{IsStream: true, ChannelMeta: &relaycommon.ChannelMeta{}}
+		info := &relaycommon.RelayInfo{IsStream: true, ProviderMeta: &relaycommon.ProviderMeta{}}
 		for range 2 {
 			request, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, upstream.URL, strings.NewReader("{}"))
 			if !assert.NoError(t, err) {
@@ -208,7 +208,7 @@ func TestStreamKeepAlivePreservesFastHTTPFailures(t *testing.T) {
 				if !assert.NoError(t, err) {
 					return
 				}
-				info := &relaycommon.RelayInfo{IsStream: true, ChannelMeta: &relaycommon.ChannelMeta{}}
+				info := &relaycommon.RelayInfo{IsStream: true, ProviderMeta: &relaycommon.ProviderMeta{}}
 				response, err := channel.DoRequest(c, request, info)
 				if !assert.NoError(t, err) {
 					return

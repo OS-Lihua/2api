@@ -68,7 +68,7 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
 	require.NoError(t, err)
 	adaptor := New(plugin)
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example", ApiKey: string(credentials)}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example", ApiKey: string(credentials)}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
 	adaptor.Init(info)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
@@ -121,7 +121,7 @@ export function buildContentRequest(ctx){return {url:ctx.baseUrl+"/content/"+ctx
 			plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
 			require.NoError(t, err)
 			adaptor := New(plugin)
-			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: tc.channelType, ChannelBaseUrl: base, ApiKey: tc.key}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: tc.channelType, ChannelBaseUrl: base, ApiKey: tc.key}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
 			adaptor.Init(info)
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
 			c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)

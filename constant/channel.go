@@ -211,12 +211,12 @@ func GetChannelTypeName(channelType int) string {
 	return "Unknown"
 }
 
-type ChannelSpecialBase struct {
+type ProviderSpecialBase struct {
 	ClaudeBaseURL string
 	OpenAIBaseURL string
 }
 
-var ChannelSpecialBases = map[string]ChannelSpecialBase{
+var ChannelSpecialBases = map[string]ProviderSpecialBase{
 	"glm-coding-plan": {
 		ClaudeBaseURL: "https://open.bigmodel.cn/api/anthropic",
 		OpenAIBaseURL: "https://open.bigmodel.cn/api/coding/paas/v4",

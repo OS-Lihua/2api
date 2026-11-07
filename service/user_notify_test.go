@@ -164,7 +164,7 @@ func TestChannelNoticesFollowEachAdministratorsSwitch(t *testing.T) {
 	channel := &model.Provider{Name: "notice-review", Key: "fixture-key", Type: 1, Status: common.ChannelStatusEnabled, Group: "default", Models: "test-model"}
 	require.NoError(t, channel.Insert())
 
-	DisableChannel(types.ChannelError{ChannelId: channel.Id, ChannelName: channel.Name, AutoBan: true}, "upstream failed")
+	DisableChannel(types.ProviderError{ChannelId: channel.Id, ChannelName: channel.Name, AutoBan: true}, "upstream failed")
 	EnableChannel(channel.Id, "", channel.Name)
 	NotifyChannelWatchers(dto.NotifyTypeChannelTest, func(lang string) (string, string) {
 		return i18n.Translate(lang, i18n.MsgChannelTestCompletedSubject), i18n.Translate(lang, i18n.MsgChannelTestCompletedContent)

@@ -33,7 +33,7 @@ func TestShouldRetryHonorsPinRetryMode(t *testing.T) {
 	assert.True(t, service.ShouldRetryRelayError(c, openaiErr, 1))
 
 	origin := newPinRetryContext()
-	service.GetChannelConstraints(origin).AddPin(dto.ChannelPin{
+	service.GetChannelConstraints(origin).AddPin(dto.ProviderPin{
 		ChannelId: 2,
 		Source:    dto.PinSourceOriginTask,
 		Rank:      dto.PinRankOriginTask,
@@ -42,7 +42,7 @@ func TestShouldRetryHonorsPinRetryMode(t *testing.T) {
 	assert.True(t, service.ShouldRetryRelayError(origin, openaiErr, 1), "origin pin retries on the same channel")
 
 	token := newPinRetryContext()
-	service.GetChannelConstraints(token).AddPin(dto.ChannelPin{
+	service.GetChannelConstraints(token).AddPin(dto.ProviderPin{
 		ChannelId: 1,
 		Source:    dto.PinSourceToken,
 		Rank:      dto.PinRankToken,
@@ -58,7 +58,7 @@ func TestShouldRetryTaskRelayHonorsPinRetryMode(t *testing.T) {
 	assert.Equal(t, "retry", decideTaskRetry(c, taskErr, 1).Action)
 
 	origin := newPinRetryContext()
-	service.GetChannelConstraints(origin).AddPin(dto.ChannelPin{
+	service.GetChannelConstraints(origin).AddPin(dto.ProviderPin{
 		ChannelId: 2,
 		Source:    dto.PinSourceOriginTask,
 		Rank:      dto.PinRankOriginTask,
@@ -67,7 +67,7 @@ func TestShouldRetryTaskRelayHonorsPinRetryMode(t *testing.T) {
 	assert.Equal(t, "retry", decideTaskRetry(origin, taskErr, 1).Action)
 
 	token := newPinRetryContext()
-	service.GetChannelConstraints(token).AddPin(dto.ChannelPin{
+	service.GetChannelConstraints(token).AddPin(dto.ProviderPin{
 		ChannelId: 1,
 		Source:    dto.PinSourceToken,
 		Rank:      dto.PinRankToken,
@@ -79,13 +79,13 @@ func TestShouldRetryTaskRelayHonorsPinRetryMode(t *testing.T) {
 func TestSameChannelPinsMergeToStricterRetryMode(t *testing.T) {
 	c := newPinRetryContext()
 	constraints := service.GetChannelConstraints(c)
-	constraints.AddPin(dto.ChannelPin{
+	constraints.AddPin(dto.ProviderPin{
 		ChannelId: 7,
 		Source:    dto.PinSourceOriginTask,
 		Rank:      dto.PinRankOriginTask,
 		RetryMode: dto.PinRetrySameChannel,
 	})
-	constraints.AddPin(dto.ChannelPin{
+	constraints.AddPin(dto.ProviderPin{
 		ChannelId: 7,
 		Source:    dto.PinSourceToken,
 		Rank:      dto.PinRankToken,
@@ -175,11 +175,11 @@ func TestChannelAffinityRetryPriorities(t *testing.T) {
 		} {
 			t.Run(fmt.Sprintf("cache=%t/%s", cached, tc.name), func(t *testing.T) {
 				common.RetryTimes = tc.retries
-				*affinity = operation_setting.ChannelAffinitySetting{
+				*affinity = operation_setting.ProviderAffinitySetting{
 					Enabled: true, DefaultTTLSeconds: 60, MaxEntries: 100,
-					Rules: []operation_setting.ChannelAffinityRule{{
+					Rules: []operation_setting.ProviderAffinityRule{{
 						Name: t.Name(), ModelRegex: []string{"^" + modelName + "$"}, SessionMode: tc.mode,
-						KeySources: []operation_setting.ChannelAffinityKeySource{{Type: "request_header", Key: "X-Session"}},
+						KeySources: []operation_setting.ProviderAffinityKeySource{{Type: "request_header", Key: "X-Session"}},
 					}},
 				}
 				ctx := newPinRetryContext()

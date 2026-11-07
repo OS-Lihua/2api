@@ -2152,7 +2152,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 					if tc.pluginType != 0 {
 						plugin.Type = tc.pluginType
 					}
-					plugin.SetSetting(kitdto.ChannelSettings{TaskPluginKey: key})
+					plugin.SetSetting(kitdto.ProviderSettings{TaskPluginKey: key})
 					if tc.legacy {
 						plugin.Type = constant.ChannelTypeAli
 					}
@@ -2160,7 +2160,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 						plugin.ModelMapping = common.GetPointer(`{"friendly-image":"channel-route-model"}`)
 					}
 					if tc.unrelated {
-						plugin.SetSetting(kitdto.ChannelSettings{TaskPluginKey: "unrelated"})
+						plugin.SetSetting(kitdto.ProviderSettings{TaskPluginKey: "unrelated"})
 					}
 					if tc.wrongGroup {
 						plugin.Group = "another-group"
@@ -2187,7 +2187,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 							_, err := jsplugin.DefaultRegistry.Register(alternateSource, jsplugin.Options{})
 							require.NoError(t, err)
 							t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(alternateKey)) })
-							alternate.SetSetting(kitdto.ChannelSettings{TaskPluginKey: alternateKey})
+							alternate.SetSetting(kitdto.ProviderSettings{TaskPluginKey: alternateKey})
 						}
 						channels = append(channels, alternate)
 					}
@@ -2222,7 +2222,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 							if tc.pinPlugin {
 								id = plugin.Id
 							}
-							service.GetChannelConstraints(c).AddPin(dto.ChannelPin{ChannelId: id, Source: dto.PinSourceToken, Rank: dto.PinRankToken})
+							service.GetChannelConstraints(c).AddPin(dto.ProviderPin{ChannelId: id, Source: dto.PinSourceToken, Rank: dto.PinRankToken})
 						}
 					}, RouteTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), Distribute(), func(c *gin.Context) {
 						reached = true

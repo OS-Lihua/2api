@@ -489,7 +489,7 @@ func taskSubmissionRelayInfo(billing relaycommon.BillingSettler) *relaycommon.Re
 			PublicTaskID:  "task_public",
 			LockedChannel: &model.Provider{Id: 1, Type: constant.ChannelTypeTaskPlugin, Name: "plugin"},
 		},
-		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 1, ChannelType: constant.ChannelTypeTaskPlugin},
+		ProviderMeta: &relaycommon.ProviderMeta{ChannelId: 1, ChannelType: constant.ChannelTypeTaskPlugin},
 	}
 }
 

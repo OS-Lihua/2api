@@ -109,7 +109,7 @@ func GetProvider(
 	group string,
 	model string,
 	retry int,
-	filters []dto.ChannelFilter,
+	filters []dto.ProviderFilter,
 ) (*Provider, error) {
 	var abilities []Ability
 	err := DB.Where(`"group" = ? and model = ? and enabled = ?`, group, model, true).Order("priority DESC, weight DESC").Find(&abilities).Error
@@ -175,7 +175,7 @@ func GetProvider(
 // filterAbilitiesByConstraints applies the same ChannelSatisfiesFilters
 // predicate used by the memory-cache path. A failed channel lookup fails
 // closed when a task-plugin identity is required and fails open otherwise.
-func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters []dto.ChannelFilter) []Ability {
+func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters []dto.ProviderFilter) []Ability {
 	if len(abilities) == 0 {
 		return nil
 	}
@@ -213,7 +213,7 @@ func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters
 	return filtered
 }
 
-func identityFilterRequiresKey(filters []dto.ChannelFilter) bool {
+func identityFilterRequiresKey(filters []dto.ProviderFilter) bool {
 	for _, filter := range filters {
 		if filter.Kind == dto.FilterTaskPluginIdentity && filter.TaskPluginKey != "" {
 			return true

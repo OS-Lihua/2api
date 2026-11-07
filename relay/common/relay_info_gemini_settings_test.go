@@ -51,7 +51,7 @@ func TestRelayInfoConvOptionsGeminiJSONSchemaSupport(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			info := &RelayInfo{ChannelMeta: &ChannelMeta{ChannelType: tt.channelType}}
+			info := &RelayInfo{ProviderMeta: &ProviderMeta{ChannelType: tt.channelType}}
 
 			assert.Equal(t, tt.want, info.ConvOptions().Gemini.SupportsJSONSchemaModel(tt.model))
 		})

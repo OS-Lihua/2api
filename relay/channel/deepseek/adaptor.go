@@ -115,7 +115,7 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 
 func applyDeepSeekV4OpenAIThinkingSuffix(info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) error {
 	modelName := request.Model
-	if info != nil && info.ChannelMeta != nil && info.UpstreamModelName != "" {
+	if info != nil && info.ProviderMeta != nil && info.UpstreamModelName != "" {
 		modelName = info.UpstreamModelName
 	}
 	baseModel, thinkingType, effort, ok := deepSeekThinking(info, modelName)
@@ -136,7 +136,7 @@ func applyDeepSeekV4OpenAIThinkingSuffix(info *relaycommon.RelayInfo, request *d
 		request.Reasoning = nil
 	}
 	if info != nil {
-		if info.ChannelMeta != nil {
+		if info.ProviderMeta != nil {
 			info.UpstreamModelName = baseModel
 		}
 		info.SetReasoningEffort(deepSeekRunEffort(thinkingType, effort))
@@ -146,7 +146,7 @@ func applyDeepSeekV4OpenAIThinkingSuffix(info *relaycommon.RelayInfo, request *d
 
 func applyDeepSeekV4ClaudeThinkingSuffix(info *relaycommon.RelayInfo, request *dto.ClaudeRequest) error {
 	modelName := request.Model
-	if info != nil && info.ChannelMeta != nil && info.UpstreamModelName != "" {
+	if info != nil && info.ProviderMeta != nil && info.UpstreamModelName != "" {
 		modelName = info.UpstreamModelName
 	}
 	baseModel, thinkingType, effort, ok := deepSeekThinking(info, modelName)
@@ -180,7 +180,7 @@ func applyDeepSeekV4ClaudeThinkingSuffix(info *relaycommon.RelayInfo, request *d
 		request.OutputConfig = encoded
 	}
 	if info != nil {
-		if info.ChannelMeta != nil {
+		if info.ProviderMeta != nil {
 			info.UpstreamModelName = baseModel
 		}
 		info.SetReasoningEffort(deepSeekRunEffort(thinkingType, effort))
@@ -204,7 +204,7 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(_ *gin.Context, info *relaycommo
 
 func applyDeepSeekV4ResponsesThinkingSuffix(info *relaycommon.RelayInfo, request *dto.OpenAIResponsesRequest) {
 	modelName := request.Model
-	if info != nil && info.ChannelMeta != nil && info.UpstreamModelName != "" {
+	if info != nil && info.ProviderMeta != nil && info.UpstreamModelName != "" {
 		modelName = info.UpstreamModelName
 	}
 	baseModel, thinkingType, effort, ok := deepSeekThinking(info, modelName)
@@ -225,7 +225,7 @@ func applyDeepSeekV4ResponsesThinkingSuffix(info *relaycommon.RelayInfo, request
 		request.Reasoning.Effort = effort
 	}
 	if info != nil {
-		if info.ChannelMeta != nil {
+		if info.ProviderMeta != nil {
 			info.UpstreamModelName = baseModel
 		}
 		info.SetReasoningEffort(deepSeekRunEffort(thinkingType, effort))

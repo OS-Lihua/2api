@@ -65,7 +65,7 @@ func TestDoRequestReturnsUpstreamRedirectWithoutFollowing(t *testing.T) {
 
 			req, err := http.NewRequest(http.MethodPost, source.URL, bytes.NewReader([]byte("request body")))
 			require.NoError(t, err)
-			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{}}
 
 			resp, err := doRequest(ctx, req, info)
 			require.NoError(t, err)

@@ -533,7 +533,7 @@ func RouteTaskPluginEndpoint() gin.HandlerFunc {
 			return
 		}
 
-		filter := dto.ChannelFilter{Kind: dto.FilterTaskPluginEndpoint}
+		filter := dto.ProviderFilter{Kind: dto.FilterTaskPluginEndpoint}
 		for _, candidate := range endpoint.Candidates {
 			filter.TaskPluginKeys = append(filter.TaskPluginKeys, candidate.Plugin.Meta.Key)
 			filter.TaskPluginChannelTypes = append(filter.TaskPluginChannelTypes, candidate.Plugin.Meta.ChannelTypes...)
@@ -541,7 +541,7 @@ func RouteTaskPluginEndpoint() gin.HandlerFunc {
 		constraints := service.GetChannelConstraints(c)
 		filterIndex := len(constraints.Filters)
 		constraints.AddFilter(filter)
-		constraints.AddFilter(dto.ChannelFilter{Kind: dto.FilterRequestPath, RequestPath: c.Request.URL.Path})
+		constraints.AddFilter(dto.ProviderFilter{Kind: dto.FilterRequestPath, RequestPath: c.Request.URL.Path})
 		group := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
 		channel, _, selectErr := service.SelectChannelForRequest(c, request.Model, &service.RetryParam{
 			Ctx: c, ModelName: request.Model, TokenGroup: group,
@@ -558,7 +558,7 @@ func RouteTaskPluginEndpoint() gin.HandlerFunc {
 		}
 		filter.Kind = dto.FilterTaskPluginIdentity
 		filter.TaskPluginKey = endpoint.Plugin.Meta.Key
-		if pluginChannel, _ := model.ProviderSatisfiesFilters(channel, request.Model, []dto.ChannelFilter{filter}); !pluginChannel {
+		if pluginChannel, _ := model.ProviderSatisfiesFilters(channel, request.Model, []dto.ProviderFilter{filter}); !pluginChannel {
 			constraints.Filters[filterIndex].TaskPluginRelayOnly = true
 			c.Set(pluginruntime.ContextKeyRelayEndpoint, endpoint)
 			c.Set(contextKeyTaskPluginEndpointModel, *request)
@@ -1347,7 +1347,7 @@ func applyOriginTaskIntent(c *gin.Context, intent map[string]any, meta pluginrun
 	if err != nil || channel == nil || channel.Status != common.ChannelStatusEnabled {
 		return &originTaskIntentError{Code: "origin_task_channel_disabled", Message: "origin task channel is disabled", StatusCode: http.StatusBadRequest}
 	}
-	service.GetChannelConstraints(c).AddPin(dto.ChannelPin{
+	service.GetChannelConstraints(c).AddPin(dto.ProviderPin{
 		ChannelId: channel.Id,
 		Source:    dto.PinSourceOriginTask,
 		Rank:      dto.PinRankOriginTask,

@@ -33,8 +33,8 @@ func newImageTestContext(t *testing.T, body, contentType string, isStream bool) 
 		Header:     http.Header{"Content-Type": []string{contentType}},
 	}
 	info := &relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{},
-		IsStream:    isStream,
+		ProviderMeta: &relaycommon.ProviderMeta{},
+		IsStream:     isStream,
 	}
 	return c, recorder, resp, info
 }

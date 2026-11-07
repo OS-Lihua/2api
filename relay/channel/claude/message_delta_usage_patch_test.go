@@ -56,10 +56,10 @@ func TestShouldSkipClaudeMessageDeltaUsagePatch(t *testing.T) {
 
 	model_setting.GetGlobalSettings().PassThroughRequestEnabled = false
 	assert.True(t, shouldSkipClaudeMessageDeltaUsagePatch(&relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{ChannelSetting: dto.ChannelSettings{PassThroughBodyEnabled: true}},
+		ProviderMeta: &relaycommon.ProviderMeta{ChannelSetting: dto.ProviderSettings{PassThroughBodyEnabled: true}},
 	}))
 	assert.False(t, shouldSkipClaudeMessageDeltaUsagePatch(&relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{ChannelSetting: dto.ChannelSettings{PassThroughBodyEnabled: false}},
+		ProviderMeta: &relaycommon.ProviderMeta{ChannelSetting: dto.ProviderSettings{PassThroughBodyEnabled: false}},
 	}))
 }
 

@@ -118,7 +118,7 @@ func GetRandomSatisfiedProvider(
 	group string,
 	model string,
 	retry int,
-	filters []dto.ChannelFilter,
+	filters []dto.ProviderFilter,
 ) (*Provider, error) {
 	// if memory cache is disabled, get channel directly from database
 	if !common.MemoryCacheEnabled {

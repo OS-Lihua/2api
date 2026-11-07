@@ -40,7 +40,7 @@ func Distribute() func(c *gin.Context) {
 			}
 		}()
 		constraints := service.GetChannelConstraints(c)
-		constraints.AddFilter(taskdto.ChannelFilter{
+		constraints.AddFilter(taskdto.ProviderFilter{
 			Kind:        taskdto.FilterRequestPath,
 			RequestPath: c.Request.URL.Path,
 		})
@@ -99,7 +99,7 @@ func Distribute() func(c *gin.Context) {
 		}
 		if pinned || shouldSelectChannel {
 			usingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
-			var selectErr *service.ChannelSelectError
+			var selectErr *service.ProviderSelectError
 			if value, exists := c.Get(contextKeyTaskPluginEndpointSelection); exists && !pinned {
 				if selected, ok := value.(taskPluginEndpointSelection); ok && selected.Model == modelRequest.Model && selected.Channel != nil && selected.Channel.Status == common.ChannelStatusEnabled {
 					if matches, _ := model.ProviderSatisfiesFilters(selected.Channel, modelRequest.Model, constraints.Filters); matches {

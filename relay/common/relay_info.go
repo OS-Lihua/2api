@@ -55,7 +55,7 @@ type ResponsesUsageInfo struct {
 	BuiltInTools map[string]*BuildInToolInfo
 }
 
-type ChannelMeta struct {
+type ProviderMeta struct {
 	ChannelType          int
 	ChannelId            int
 	ChannelIsMultiKey    bool
@@ -68,8 +68,8 @@ type ChannelMeta struct {
 	ChannelCreateTime    int64
 	ParamOverride        map[string]any
 	HeadersOverride      map[string]any
-	ChannelSetting       dto.ChannelSettings
-	ChannelOtherSettings dto.ChannelOtherSettings
+	ChannelSetting       dto.ProviderSettings
+	ChannelOtherSettings dto.ProviderOtherSettings
 	UpstreamModelName    string
 	IsModelMapped        bool
 	SupportStreamOptions bool // 是否支持流式选项
@@ -233,7 +233,7 @@ type RelayInfo struct {
 	*ClaudeConvertInfo
 	*RerankerInfo
 	*ResponsesUsageInfo
-	*ChannelMeta
+	*ProviderMeta
 	*TaskRelayInfo
 }
 
@@ -279,7 +279,7 @@ func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
 	paramOverride := common.GetContextKeyStringMap(c, constant.ContextKeyChannelParamOverride)
 	headerOverride := common.GetContextKeyStringMap(c, constant.ContextKeyChannelHeaderOverride)
 	apiType, _ := common.ChannelType2APIType(channelType)
-	channelMeta := &ChannelMeta{
+	channelMeta := &ProviderMeta{
 		ChannelType:          channelType,
 		ChannelId:            common.GetContextKeyInt(c, constant.ContextKeyChannelId),
 		ChannelIsMultiKey:    common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey),
@@ -304,12 +304,12 @@ func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
 		channelMeta.ApiVersion = c.GetString("region")
 	}
 
-	channelSetting, ok := common.GetContextKeyType[dto.ChannelSettings](c, constant.ContextKeyChannelSetting)
+	channelSetting, ok := common.GetContextKeyType[dto.ProviderSettings](c, constant.ContextKeyChannelSetting)
 	if ok {
 		channelMeta.ChannelSetting = channelSetting
 	}
 
-	channelOtherSettings, ok := common.GetContextKeyType[dto.ChannelOtherSettings](c, constant.ContextKeyChannelOtherSetting)
+	channelOtherSettings, ok := common.GetContextKeyType[dto.ProviderOtherSettings](c, constant.ContextKeyChannelOtherSetting)
 	if ok {
 		channelMeta.ChannelOtherSettings = channelOtherSettings
 	}
@@ -327,7 +327,7 @@ func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
 		channelMeta.SupportStreamOptions = true
 	}
 
-	info.ChannelMeta = channelMeta
+	info.ProviderMeta = channelMeta
 
 	// Channel identity feeds the converter options snapshot (e.g.
 	// OpenRouterDialect); drop the cache so a cross-channel retry rebuilds it.
@@ -405,8 +405,8 @@ func (info *RelayInfo) ToString() string {
 	}
 
 	// Channel metadata (mask ApiKey)
-	if info.ChannelMeta != nil {
-		cm := info.ChannelMeta
+	if info.ProviderMeta != nil {
+		cm := info.ProviderMeta
 		fmt.Fprintf(b, "ChannelMeta{ Type: %d, Id: %d, IsMultiKey: %t, MultiKeyIndex: %d, BaseURL: %q, ApiType: %d, ApiVersion: %q, Organization: %q, CreateTime: %d, UpstreamModelName: %q, IsModelMapped: %t, SupportStreamOptions: %t, ApiKey: ***masked*** }, ",
 			cm.ChannelType, cm.ChannelId, cm.ChannelIsMultiKey, cm.ChannelMultiKeyIndex, cm.ChannelBaseUrl, cm.ApiType, cm.ApiVersion, cm.Organization, cm.ChannelCreateTime, cm.UpstreamModelName, cm.IsModelMapped, cm.SupportStreamOptions)
 	}
@@ -868,23 +868,23 @@ func (info *RelayInfo) GetBillingModelName() string {
 }
 
 func (info *RelayInfo) GetUpstreamModelName() string {
-	if info == nil || info.ChannelMeta == nil {
+	if info == nil || info.ProviderMeta == nil {
 		return ""
 	}
 	return info.UpstreamModelName
 }
 
-func (info *RelayInfo) HasChannelMeta() bool { return info != nil && info.ChannelMeta != nil }
+func (info *RelayInfo) HasChannelMeta() bool { return info != nil && info.ProviderMeta != nil }
 
 func (info *RelayInfo) GetChannelID() int {
-	if info == nil || info.ChannelMeta == nil {
+	if info == nil || info.ProviderMeta == nil {
 		return 0
 	}
 	return info.ChannelId
 }
 
 func (info *RelayInfo) GetChannelType() int {
-	if info == nil || info.ChannelMeta == nil {
+	if info == nil || info.ProviderMeta == nil {
 		return 0
 	}
 	return info.ChannelType
@@ -989,7 +989,7 @@ func (info *RelayInfo) ConvOptions() *convmeta.Options {
 		PreserveEffortTail:     model_setting.ShouldPreserveEffortTail,
 	}
 	if info != nil {
-		if info.ChannelMeta != nil {
+		if info.ProviderMeta != nil {
 			options.ToolLossPolicy = types.ConversionLossPolicy(info.ChannelOtherSettings.ToolLossPolicy)
 		}
 		info.convOptions = options
@@ -1189,7 +1189,7 @@ func SetJSONMember(doc *ojson.Doc, parent, key string, value any) error {
 // store: 数据存储授权字段，涉及用户隐私（仅 OpenAI、Responses API 支持，默认允许透传，禁用后可能导致 Codex 无法使用）
 // safety_identifier: 安全标识符，用于向 OpenAI 报告违规用户（仅 OpenAI 支持，涉及用户隐私）
 // stream_options.include_obfuscation: 响应流混淆控制字段（仅 OpenAI Responses API 支持）
-func RemoveDisabledFields(jsonData []byte, channelOtherSettings dto.ChannelOtherSettings, channelPassThroughEnabled bool) ([]byte, error) {
+func RemoveDisabledFields(jsonData []byte, channelOtherSettings dto.ProviderOtherSettings, channelPassThroughEnabled bool) ([]byte, error) {
 	if model_setting.GetGlobalSettings().PassThroughRequestEnabled || channelPassThroughEnabled {
 		return jsonData, nil
 	}
@@ -1250,7 +1250,7 @@ func RemoveDisabledFields(jsonData []byte, channelOtherSettings dto.ChannelOther
 	return doc.Bytes(), nil
 }
 
-func hasRemovableDisabledField(jsonData []byte, channelOtherSettings dto.ChannelOtherSettings) bool {
+func hasRemovableDisabledField(jsonData []byte, channelOtherSettings dto.ProviderOtherSettings) bool {
 	values := ojson.GetManyBytes(
 		jsonData,
 		"service_tier",

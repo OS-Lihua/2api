@@ -31,7 +31,7 @@ func resetPricingEndpointTestTables(t *testing.T) {
 	})
 }
 
-func insertPricingEndpointChannel(t *testing.T, channelID int, channelType int, settings dto.ChannelOtherSettings) {
+func insertPricingEndpointChannel(t *testing.T, channelID int, channelType int, settings dto.ProviderOtherSettings) {
 	t.Helper()
 	channel := &Provider{
 		Id:     channelID,
@@ -56,8 +56,8 @@ func insertPricingEndpointAbility(t *testing.T, channelID int, modelName string)
 	}).Error)
 }
 
-func pricingEndpointAdvancedCustomConfig(routes ...dto.AdvancedCustomRoute) dto.ChannelOtherSettings {
-	return dto.ChannelOtherSettings{
+func pricingEndpointAdvancedCustomConfig(routes ...dto.AdvancedCustomRoute) dto.ProviderOtherSettings {
+	return dto.ProviderOtherSettings{
 		AdvancedCustom: &dto.AdvancedCustomConfig{
 			Routes: routes,
 		},
@@ -165,7 +165,7 @@ func TestPricingModelMetadataEndpointsCanProvideEndpointWithoutChannelInference(
 func TestPricingAdvancedCustomMissingConfigFallsBackToChannelType(t *testing.T) {
 	resetPricingEndpointTestTables(t)
 
-	insertPricingEndpointChannel(t, 102, constant.ChannelTypeAdvancedCustom, dto.ChannelOtherSettings{})
+	insertPricingEndpointChannel(t, 102, constant.ChannelTypeAdvancedCustom, dto.ProviderOtherSettings{})
 	insertPricingEndpointAbility(t, 102, "gpt-4o")
 
 	byModel := pricingEndpointTypesByModel(t)
@@ -176,9 +176,9 @@ func TestPricingAdvancedCustomMissingConfigFallsBackToChannelType(t *testing.T) 
 func TestPricingNativeChannelEndpointTypesUnchanged(t *testing.T) {
 	resetPricingEndpointTestTables(t)
 
-	insertPricingEndpointChannel(t, 201, constant.ChannelTypeOpenAI, dto.ChannelOtherSettings{})
-	insertPricingEndpointChannel(t, 202, constant.ChannelTypeGemini, dto.ChannelOtherSettings{})
-	insertPricingEndpointChannel(t, 203, constant.ChannelTypeAnthropic, dto.ChannelOtherSettings{})
+	insertPricingEndpointChannel(t, 201, constant.ChannelTypeOpenAI, dto.ProviderOtherSettings{})
+	insertPricingEndpointChannel(t, 202, constant.ChannelTypeGemini, dto.ProviderOtherSettings{})
+	insertPricingEndpointChannel(t, 203, constant.ChannelTypeAnthropic, dto.ProviderOtherSettings{})
 	insertPricingEndpointAbility(t, 201, "gpt-4o")
 	insertPricingEndpointAbility(t, 202, "gemini-2.5-flash")
 	insertPricingEndpointAbility(t, 203, "claude-3-5-sonnet")

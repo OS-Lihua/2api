@@ -53,7 +53,7 @@ func TestKlingResponsesProtocol(t *testing.T) {
 		value, err := plugin.Engine.CallPath(t.Context(), decoder[0], decoder[1:], map[string]any{"model": model, "body": map[string]any{"kind": "json", "value": body}})
 		require.NoError(t, err)
 		info := &relaycommon.RelayInfo{
-			ChannelMeta:     &relaycommon.ChannelMeta{ChannelBaseUrl: "https://api-singapore.klingai.com", ApiKey: "ak|sk", UpstreamModelName: model},
+			ProviderMeta:    &relaycommon.ProviderMeta{ChannelBaseUrl: "https://api-singapore.klingai.com", ApiKey: "ak|sk", UpstreamModelName: model},
 			OriginModelName: model,
 			TaskRelayInfo:   &relaycommon.TaskRelayInfo{PublicTaskID: "task_public"},
 		}
@@ -264,7 +264,7 @@ func TestKling4(t *testing.T) {
 		value, err := plugin.Engine.CallPath(t.Context(), decoder[0], decoder[1:], map[string]any{"model": model, "body": map[string]any{"kind": "json", "value": body}})
 		require.NoError(t, err)
 		info := &relaycommon.RelayInfo{
-			ChannelMeta:     &relaycommon.ChannelMeta{ChannelBaseUrl: "https://api-singapore.klingai.com", ApiKey: "ak|sk", UpstreamModelName: model},
+			ProviderMeta:    &relaycommon.ProviderMeta{ChannelBaseUrl: "https://api-singapore.klingai.com", ApiKey: "ak|sk", UpstreamModelName: model},
 			OriginModelName: model,
 			TaskRelayInfo:   &relaycommon.TaskRelayInfo{PublicTaskID: "task_public"},
 		}

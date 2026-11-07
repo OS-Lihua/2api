@@ -1108,12 +1108,12 @@ func advancedCustomRelayInfo(config *dto.AdvancedCustomConfig) *relaycommon.Rela
 		RelayMode:       relayconstant.RelayModeChatCompletions,
 		RequestURLPath:  "/v1/chat/completions",
 		OriginModelName: "gpt-test",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ApiKey:            "sk-test",
 			ChannelBaseUrl:    "https://fallback.example",
 			ChannelType:       constant.ChannelTypeAdvancedCustom,
 			UpstreamModelName: "gpt-test",
-			ChannelOtherSettings: dto.ChannelOtherSettings{
+			ChannelOtherSettings: dto.ProviderOtherSettings{
 				AdvancedCustom: config,
 			},
 		},

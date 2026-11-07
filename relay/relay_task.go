@@ -546,7 +546,7 @@ func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
 	if adaptor == nil {
 		return nil
 	}
-	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+	adaptor.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{
 		ChannelType:     channelModel.Type,
 		ChannelId:       channelModel.Id,
 		ChannelBaseUrl:  baseURL,

@@ -41,11 +41,11 @@ func TestGetRequestURLWithAPIKey(t *testing.T) {
 			info := &relaycommon.RelayInfo{
 				IsStream:        tt.stream,
 				OriginModelName: "gemini-4-argon",
-				ChannelMeta: &relaycommon.ChannelMeta{
+				ProviderMeta: &relaycommon.ProviderMeta{
 					ApiVersion:        tt.region,
 					ApiKey:            "test-key",
 					UpstreamModelName: "gemini-4-argon",
-					ChannelOtherSettings: dto.ChannelOtherSettings{
+					ChannelOtherSettings: dto.ProviderOtherSettings{
 						VertexKeyType:   dto.VertexKeyTypeAPIKey,
 						VertexProjectID: tt.projectID,
 					},

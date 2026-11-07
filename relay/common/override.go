@@ -518,17 +518,17 @@ func buildParamOverrideAuditLine(mode, path, from, to string, value any) string 
 }
 
 func getParamOverrideMap(info *RelayInfo) map[string]any {
-	if info == nil || info.ChannelMeta == nil {
+	if info == nil || info.ProviderMeta == nil {
 		return nil
 	}
-	return info.ChannelMeta.ParamOverride
+	return info.ProviderMeta.ParamOverride
 }
 
 func getHeaderOverrideMap(info *RelayInfo) map[string]any {
-	if info == nil || info.ChannelMeta == nil {
+	if info == nil || info.ProviderMeta == nil {
 		return nil
 	}
-	return info.ChannelMeta.HeadersOverride
+	return info.ProviderMeta.HeadersOverride
 }
 
 func sanitizeHeaderOverrideMap(source map[string]any) map[string]any {
@@ -2187,9 +2187,9 @@ func BuildParamOverrideContext(info *RelayInfo) map[string]any {
 	ctx["user_group"] = info.UserGroup
 	ctx["token_group"] = info.TokenGroup
 	ctx["using_group"] = info.UsingGroup
-	if info.ChannelMeta != nil && info.ChannelMeta.UpstreamModelName != "" {
-		ctx["model"] = info.ChannelMeta.UpstreamModelName
-		ctx["upstream_model"] = info.ChannelMeta.UpstreamModelName
+	if info.ProviderMeta != nil && info.ProviderMeta.UpstreamModelName != "" {
+		ctx["model"] = info.ProviderMeta.UpstreamModelName
+		ctx["upstream_model"] = info.ProviderMeta.UpstreamModelName
 	}
 	if info.OriginModelName != "" {
 		ctx["original_model"] = info.OriginModelName

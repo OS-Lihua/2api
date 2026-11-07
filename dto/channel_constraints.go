@@ -1,10 +1,10 @@
 package dto
 
-type ChannelPinSource string
+type ProviderPinSource string
 
 const (
-	PinSourceToken      ChannelPinSource = "token"       // Rank 0, highest
-	PinSourceOriginTask ChannelPinSource = "origin_task" // Rank 10
+	PinSourceToken      ProviderPinSource = "token"       // Rank 0, highest
+	PinSourceOriginTask ProviderPinSource = "origin_task" // Rank 10
 )
 
 const (
@@ -26,24 +26,24 @@ func (m PinRetryMode) Stricter(other PinRetryMode) PinRetryMode {
 	return PinRetrySameChannel
 }
 
-type ChannelPin struct {
+type ProviderPin struct {
 	ChannelId int
-	Source    ChannelPinSource
+	Source    ProviderPinSource
 	Rank      int
 	RetryMode PinRetryMode
 }
 
-type ChannelFilterKind string
+type ProviderFilterKind string
 
 const (
-	FilterRequestPath        ChannelFilterKind = "request_path"
-	FilterTaskPluginEndpoint ChannelFilterKind = "task_plugin_endpoint"
-	FilterTaskPluginIdentity ChannelFilterKind = "task_plugin_identity"
-	FilterResponsesWebSocket ChannelFilterKind = "responses_websocket"
+	FilterRequestPath        ProviderFilterKind = "request_path"
+	FilterTaskPluginEndpoint ProviderFilterKind = "task_plugin_endpoint"
+	FilterTaskPluginIdentity ProviderFilterKind = "task_plugin_identity"
+	FilterResponsesWebSocket ProviderFilterKind = "responses_websocket"
 )
 
-type ChannelFilter struct {
-	Kind                   ChannelFilterKind
+type ProviderFilter struct {
+	Kind                   ProviderFilterKind
 	RequestPath            string
 	TaskPluginKey          string
 	TaskPluginKeys         []string
@@ -53,19 +53,19 @@ type ChannelFilter struct {
 	TaskPluginRelayOnly bool
 }
 
-type ChannelConstraints struct {
-	Pins    []ChannelPin
-	Filters []ChannelFilter
+type ProviderConstraints struct {
+	Pins    []ProviderPin
+	Filters []ProviderFilter
 }
 
-func (cc *ChannelConstraints) AddPin(p ChannelPin) {
+func (cc *ProviderConstraints) AddPin(p ProviderPin) {
 	if cc == nil {
 		return
 	}
 	cc.Pins = append(cc.Pins, p)
 }
 
-func (cc *ChannelConstraints) AddFilter(f ChannelFilter) {
+func (cc *ProviderConstraints) AddFilter(f ProviderFilter) {
 	if cc == nil {
 		return
 	}
@@ -75,12 +75,12 @@ func (cc *ChannelConstraints) AddFilter(f ChannelFilter) {
 // ResolvedPin returns the winning pin after priority resolution.
 // Lowest Rank wins. Pins that name the same channel are merged (stricter RetryMode).
 // overridden lists pins that lost to a different channel (for warn logging).
-func (cc *ChannelConstraints) ResolvedPin() (ChannelPin, bool, []ChannelPin) {
+func (cc *ProviderConstraints) ResolvedPin() (ProviderPin, bool, []ProviderPin) {
 	if cc == nil || len(cc.Pins) == 0 {
-		return ChannelPin{}, false, nil
+		return ProviderPin{}, false, nil
 	}
 
-	merged := make(map[int]ChannelPin, len(cc.Pins))
+	merged := make(map[int]ProviderPin, len(cc.Pins))
 	order := make([]int, 0, len(cc.Pins))
 	for _, pin := range cc.Pins {
 		existing, seen := merged[pin.ChannelId]
@@ -105,7 +105,7 @@ func (cc *ChannelConstraints) ResolvedPin() (ChannelPin, bool, []ChannelPin) {
 		}
 	}
 
-	var overridden []ChannelPin
+	var overridden []ProviderPin
 	for _, channelID := range order {
 		candidate := merged[channelID]
 		if candidate.ChannelId != winner.ChannelId {
@@ -115,7 +115,7 @@ func (cc *ChannelConstraints) ResolvedPin() (ChannelPin, bool, []ChannelPin) {
 	return winner, true, overridden
 }
 
-func (cc *ChannelConstraints) SuppressesRetry() bool {
+func (cc *ProviderConstraints) SuppressesRetry() bool {
 	pin, found, _ := cc.ResolvedPin()
 	return found && pin.RetryMode == PinRetrySingleAttempt
 }

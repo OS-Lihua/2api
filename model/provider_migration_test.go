@@ -9,13 +9,13 @@ import (
 	"gorm.io/gorm"
 )
 
-// legacyChannelRow creates the table that releases before the Provider rename
+// legacyProviderRow creates the table that releases before the Provider rename
 // used: the same columns and GORM indexes, stored as "channels".
-type legacyChannelRow struct {
+type legacyProviderRow struct {
 	Provider
 }
 
-func (legacyChannelRow) TableName() string { return legacyProviderTable }
+func (legacyProviderRow) TableName() string { return legacyProviderTable }
 
 type providerSchemaObject struct {
 	Name       string `gorm:"column:name"`
@@ -50,9 +50,9 @@ func TestMigrateProviderTable(t *testing.T) {
 	require.NotEmpty(t, freshObjects)
 
 	db := UseTestDatabases(t)
-	require.NoError(t, db.AutoMigrate(&legacyChannelRow{}))
+	require.NoError(t, db.AutoMigrate(&legacyProviderRow{}))
 	tag := "team-a"
-	legacy := legacyChannelRow{Provider: Provider{
+	legacy := legacyProviderRow{Provider: Provider{
 		Type:   1,
 		Key:    "sk-legacy-1\nsk-legacy-2",
 		Name:   "legacy account",
@@ -98,7 +98,7 @@ WHERE connamespace = current_schema()::regnamespace AND conname LIKE '%channels%
 
 func TestMigrateProviderTableRejectsBothTables(t *testing.T) {
 	db := UseTestDatabases(t)
-	require.NoError(t, db.AutoMigrate(&legacyChannelRow{}, &Provider{}))
+	require.NoError(t, db.AutoMigrate(&legacyProviderRow{}, &Provider{}))
 
 	err := migrateProviderTable(db)
 	require.EqualError(t, err, `both "channels" and "providers" tables exist; move the rows into "providers" and drop "channels" before starting`)

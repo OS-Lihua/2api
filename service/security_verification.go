@@ -68,7 +68,7 @@ type VerificationOperation struct {
 	Context json.RawMessage `json:"context,omitempty"`
 }
 
-type ChannelKeyReadContext struct {
+type ProviderKeyReadContext struct {
 	ChannelID int `json:"channel_id"`
 }
 
@@ -164,7 +164,7 @@ func BindVerificationOperation(operation VerificationOperation) (VerificationBin
 	var normalized any
 	switch operation.Scope {
 	case VerificationScopeChannelKeyRead:
-		var context ChannelKeyReadContext
+		var context ProviderKeyReadContext
 		if len(fields) != 1 || common.Unmarshal(fields["channel_id"], &context.ChannelID) != nil || context.ChannelID <= 0 {
 			return VerificationBinding{}, ErrVerificationContextInvalid
 		}

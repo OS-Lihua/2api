@@ -91,7 +91,7 @@ func TestXAIModeratedVideoKeepsItsCharge(t *testing.T) {
 	require.NoError(t, billing_setting.SmokeTestTaskExpr(expression, schema))
 
 	info := &relaycommon.RelayInfo{
-		ChannelMeta:     &relaycommon.ChannelMeta{ChannelBaseUrl: "https://api.x.ai", ApiKey: "xai-key", UpstreamModelName: videoModel},
+		ProviderMeta:    &relaycommon.ProviderMeta{ChannelBaseUrl: "https://api.x.ai", ApiKey: "xai-key", UpstreamModelName: videoModel},
 		OriginModelName: videoModel,
 		TaskRelayInfo:   &relaycommon.TaskRelayInfo{PublicTaskID: "task_public", Action: "image_to_video"},
 	}
@@ -553,7 +553,7 @@ func TestXAIEditSettlesOnOutputResolution(t *testing.T) {
 	schema, _ := plugin.Meta.UsageForModel(videoModel)
 	require.NoError(t, billing_setting.SmokeTestTaskExpr(expression, schema))
 	info := &relaycommon.RelayInfo{
-		ChannelMeta:     &relaycommon.ChannelMeta{ChannelBaseUrl: server.URL, ApiKey: "xai-key", UpstreamModelName: videoModel},
+		ProviderMeta:    &relaycommon.ProviderMeta{ChannelBaseUrl: server.URL, ApiKey: "xai-key", UpstreamModelName: videoModel},
 		OriginModelName: videoModel,
 		TaskRelayInfo:   &relaycommon.TaskRelayInfo{PublicTaskID: "task_public", Action: "video_extension"},
 	}

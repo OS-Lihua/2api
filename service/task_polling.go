@@ -278,7 +278,7 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	// The channel type tells plugin adaptors whether the upstream is another
 	// New API gateway, the same signal submission derives from the request.
 	info := &relaycommon.RelayInfo{}
-	info.ChannelMeta = &relaycommon.ChannelMeta{
+	info.ProviderMeta = &relaycommon.ProviderMeta{
 		ChannelType:     ch.Type,
 		ChannelId:       ch.Id,
 		ChannelBaseUrl:  baseURL,
@@ -455,7 +455,7 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 		return fmt.Errorf("video adaptor not found")
 	}
 	info := &relaycommon.RelayInfo{}
-	info.ChannelMeta = &relaycommon.ChannelMeta{
+	info.ProviderMeta = &relaycommon.ProviderMeta{
 		ChannelType:     cacheGetChannel.Type,
 		ChannelId:       cacheGetChannel.Id,
 		ChannelBaseUrl:  cacheGetChannel.GetBaseURL(),

@@ -60,7 +60,7 @@ func ShouldRetryRelayError(c *gin.Context, openaiErr *types.NewAPIError, retryTi
 	return DecideRelayRetry(c, openaiErr, retryTimes).Action == "retry"
 }
 
-func ProcessChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
+func ProcessChannelError(c *gin.Context, channelError types.ProviderError, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
 	if err == nil {
 		return
 	}

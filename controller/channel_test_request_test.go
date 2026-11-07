@@ -54,7 +54,7 @@ func convertChatCompatibilityRequest(t *testing.T, request *dto.GeneralOpenAIReq
 		Request:         request,
 		RelayFormat:     types.RelayFormatOpenAI,
 		IsStream:        request.IsStream(nil),
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType:          channelType,
 			UpstreamModelName:    request.Model,
 			SupportStreamOptions: true,
@@ -237,7 +237,7 @@ func TestDirectOpenAIResponsesKeepsExistingParameters(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "gpt-6-astra",
 		RelayFormat:     types.RelayFormatOpenAIResponses,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType:       constant.ChannelTypeOpenAI,
 			UpstreamModelName: "gpt-6-astra",
 		},
@@ -287,10 +287,10 @@ func TestCloudflareEmbeddingResponseCompatibility(t *testing.T) {
 			info := &relaycommon.RelayInfo{
 				RelayMode:   relayconstant.RelayModeEmbeddings,
 				RelayFormat: types.RelayFormatEmbedding,
-				ChannelMeta: &relaycommon.ChannelMeta{
+				ProviderMeta: &relaycommon.ProviderMeta{
 					ChannelType:       constant.ChannelCloudflare,
 					UpstreamModelName: "@cf/baai/bge-large-en-v1.5",
-					ChannelSetting:    dto.ChannelSettings{ForceFormat: tt.forceFormat},
+					ChannelSetting:    dto.ProviderSettings{ForceFormat: tt.forceFormat},
 				},
 			}
 			info.SetEstimatePromptTokens(99)

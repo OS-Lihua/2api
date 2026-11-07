@@ -33,7 +33,7 @@ func newResponsesChatTestContext(t *testing.T, body string, isStream bool) (*gin
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
 	}
 	info := &relaycommon.RelayInfo{
-		ChannelMeta:        &relaycommon.ChannelMeta{UpstreamModelName: "gpt-test"},
+		ProviderMeta:       &relaycommon.ProviderMeta{UpstreamModelName: "gpt-test"},
 		IsStream:           isStream,
 		RelayFormat:        types.RelayFormatOpenAI,
 		ShouldIncludeUsage: true,

@@ -181,8 +181,8 @@ func TestOaiResponsesStreamHandlerCompletionLifecycle(t *testing.T) {
 			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(ctx)
 			info := &relaycommon.RelayInfo{
 				OriginModelName: "gpt-4o", IsStream: true, DisablePing: true, StartTime: time.Now(),
-				RelayFormat: types.RelayFormatOpenAIResponses,
-				ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-4o"},
+				RelayFormat:  types.RelayFormatOpenAIResponses,
+				ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "gpt-4o"},
 			}
 			info.SetEstimatePromptTokens(7)
 			resp := &http.Response{StatusCode: http.StatusOK, Body: upstream, Header: http.Header{"Content-Type": {"text/event-stream"}}}
@@ -421,7 +421,7 @@ func runResponsesImageBillingStream(t *testing.T, events ...string) *relaycommon
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "gpt-5.1",
 		DisablePing:     true,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "gpt-5.1",
 		},
 	}
@@ -496,7 +496,7 @@ func TestOaiResponsesHandlersKeepCacheWriteTTLSplit(t *testing.T) {
 				OriginModelName: "gpt-6-astra",
 				IsStream:        tt.name == "stream",
 				DisablePing:     true,
-				ChannelMeta:     &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenAI, UpstreamModelName: "gpt-6-astra"},
+				ProviderMeta:    &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeOpenAI, UpstreamModelName: "gpt-6-astra"},
 			}
 			resp := &http.Response{
 				StatusCode: http.StatusOK,
@@ -531,7 +531,7 @@ func TestOaiResponsesHandlerRewritesSGLangCreatedAtToInt(t *testing.T) {
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 
 	info := &relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeSGLang},
+		ProviderMeta: &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeSGLang},
 	}
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
@@ -560,7 +560,7 @@ func TestOaiResponsesStreamHandlerRewritesSGLangCreatedAtToInt(t *testing.T) {
 
 	info := &relaycommon.RelayInfo{
 		DisablePing: true,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType:       constant.ChannelTypeSGLang,
 			UpstreamModelName: "served-model",
 		},
@@ -595,8 +595,8 @@ func TestOaiResponsesStreamHandlerKeepsNonSGLangCreatedAt(t *testing.T) {
 	c.Set(common.RequestIdKey, "openai-created-at-test")
 
 	info := &relaycommon.RelayInfo{
-		DisablePing: true,
-		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenAI, UpstreamModelName: "gpt-test"},
+		DisablePing:  true,
+		ProviderMeta: &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeOpenAI, UpstreamModelName: "gpt-test"},
 	}
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
@@ -630,8 +630,8 @@ func TestAzureHostedWebSearch(t *testing.T) {
 		for _, channelType := range []int{constant.ChannelTypeAzure, constant.ChannelTypeXinference, constant.ChannelTypeOpenAI} {
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
 			info := &relaycommon.RelayInfo{
-				RelayFormat: types.RelayFormatClaude,
-				ChannelMeta: &relaycommon.ChannelMeta{ChannelType: channelType, UpstreamModelName: "gpt-5.1"},
+				RelayFormat:  types.RelayFormatClaude,
+				ProviderMeta: &relaycommon.ProviderMeta{ChannelType: channelType, UpstreamModelName: "gpt-5.1"},
 			}
 			adaptor := &Adaptor{}
 			adaptor.Init(info)
@@ -680,7 +680,7 @@ func TestAzureHostedWebSearch(t *testing.T) {
 				OriginModelName: "gpt-5.1",
 				IsStream:        tt.name == "stream",
 				DisablePing:     true,
-				ChannelMeta:     &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeAzure, UpstreamModelName: "gpt-5.1"},
+				ProviderMeta:    &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeAzure, UpstreamModelName: "gpt-5.1"},
 			}
 			adaptor := &Adaptor{}
 			adaptor.Init(info)

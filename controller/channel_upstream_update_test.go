@@ -34,7 +34,7 @@ func newAdvancedCustomModelListChannel(baseURL string, key string, upstreamPath 
 		Key:     key,
 		BaseURL: &baseURL,
 	}
-	channel.SetOtherSettings(dto.ChannelOtherSettings{AdvancedCustom: config})
+	channel.SetOtherSettings(dto.ProviderOtherSettings{AdvancedCustom: config})
 	return channel
 }
 
@@ -263,7 +263,7 @@ func TestFetchModelsAdvancedCustomEditPreviewUsesSavedKeyAndExplicitClears(t *te
 	}
 	savedHeaderOverride := `{"X-Saved":"must-not-be-sent"}`
 	savedChannel.HeaderOverride = &savedHeaderOverride
-	savedChannel.SetSetting(dto.ChannelSettings{Proxy: "http://127.0.0.1:1"})
+	savedChannel.SetSetting(dto.ProviderSettings{Proxy: "http://127.0.0.1:1"})
 	require.NoError(t, db.Create(savedChannel).Error)
 
 	preserved, err := buildAdvancedCustomModelPreviewChannel(fetchModelsRequest{ChannelID: savedChannel.Id})
@@ -480,7 +480,7 @@ func TestApplySelectedModelChanges(t *testing.T) {
 }
 
 func TestCollectPendingApplyUpstreamModelChanges(t *testing.T) {
-	settings := dto.ChannelOtherSettings{
+	settings := dto.ProviderOtherSettings{
 		UpstreamModelUpdateLastDetectedModels: []string{" gpt-4o ", "gpt-4o", "gpt-4.1"},
 		UpstreamModelUpdateLastRemovedModels:  []string{" old-model ", "", "old-model"},
 	}
@@ -534,9 +534,9 @@ func TestCollectPendingUpstreamModelChangesFromModels_WithIgnoredRegexPatterns(t
 }
 
 func TestBuildUpstreamModelUpdateTaskNotificationContent_OmitOverflowDetails(t *testing.T) {
-	channelSummaries := make([]upstreamModelUpdateChannelSummary, 0, 12)
+	channelSummaries := make([]upstreamModelUpdateProviderSummary, 0, 12)
 	for i := range 12 {
-		channelSummaries = append(channelSummaries, upstreamModelUpdateChannelSummary{
+		channelSummaries = append(channelSummaries, upstreamModelUpdateProviderSummary{
 			ChannelName: "channel-" + string(rune('A'+i)),
 			AddCount:    i + 1,
 			RemoveCount: i,

@@ -20,7 +20,7 @@ func TestGetRequestURLForImageGeneration(t *testing.T) {
 
 	info := &relaycommon.RelayInfo{
 		RelayMode: relayconstant.RelayModeImagesGenerations,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelBaseUrl: "https://api.minimax.chat",
 		},
 	}

@@ -329,7 +329,7 @@ func alibabaObject(t *testing.T, value any) map[string]any {
 func submitAlibabaRequest(t *testing.T, plugin *jsplugin.LoadedPlugin, upstream string, request map[string]any) (map[string]any, map[string]any, string) {
 	t.Helper()
 	info := &relaycommon.RelayInfo{
-		ChannelMeta:     &relaycommon.ChannelMeta{ChannelBaseUrl: "https://dashscope.aliyuncs.com", UpstreamModelName: upstream},
+		ProviderMeta:    &relaycommon.ProviderMeta{ChannelBaseUrl: "https://dashscope.aliyuncs.com", UpstreamModelName: upstream},
 		OriginModelName: request["model"].(string),
 		TaskRelayInfo:   &relaycommon.TaskRelayInfo{PublicTaskID: "task_public"},
 	}
@@ -816,7 +816,7 @@ func TestAlibabaImageValidation(t *testing.T) {
 			_, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{"requestBody": request, "upstreamModel": tc.model})
 			require.ErrorContains(t, err, tc.message)
 			// The production validator must reject the same input before HTTP/billing.
-			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: tc.model}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: tc.model}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
 			adaptor := taskplugin.New(plugin)
 			adaptor.Init(info)
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -850,7 +850,7 @@ func TestAlibabaImageResults(t *testing.T) {
 			task := &model.Task{TaskID: "task_public", Status: model.TaskStatusSuccess, Properties: model.Properties{OriginModelName: "alias", UpstreamModelName: tc.model}}
 			task.SetData(body)
 			adaptor := taskplugin.New(plugin)
-			adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}})
+			adaptor.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{}})
 			result, err := adaptor.ParseTaskResult(task, &http.Response{StatusCode: http.StatusOK}, encoded)
 			require.NoError(t, err)
 			assert.Equal(t, "SUCCESS", result.Status)
@@ -888,7 +888,7 @@ func TestAlibabaImageResults(t *testing.T) {
 	}
 
 	t.Run("synchronous completion uses the host ID and retains result JSON", func(t *testing.T) {
-		info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "wan2.6-t2i"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_public"}}
+		info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "wan2.6-t2i"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_public"}}
 		adaptor := taskplugin.New(plugin)
 		adaptor.Init(info)
 		c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -970,7 +970,7 @@ func TestAlibabaSynchronousMultiImageAndStream(t *testing.T) {
 				name = "wan2.6-image"
 				parameters = map[string]any{"enable_interleave": true, "max_images": 3}
 			}
-			info := &relaycommon.RelayInfo{OriginModelName: name, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: name, ChannelBaseUrl: "https://dashscope.aliyuncs.com"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_sync"}}
+			info := &relaycommon.RelayInfo{OriginModelName: name, ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: name, ChannelBaseUrl: "https://dashscope.aliyuncs.com"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_sync"}}
 			adaptor := taskplugin.New(plugin)
 			adaptor.Init(info)
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -1046,7 +1046,7 @@ func TestAlibabaInterleavedStreamOutcomes(t *testing.T) {
 		return route.Path == "/api/v1/services/aigc/multimodal-generation/generation"
 	})]
 	submit := func(t *testing.T, channelType int, contentType, body string) (*taskplugin.TaskAdaptor, *relaycommon.RelayInfo, *relaychannel.TaskSubmitResponse, string) {
-		info := &relaycommon.RelayInfo{OriginModelName: "wan2.6-image", ChannelMeta: &relaycommon.ChannelMeta{ChannelType: channelType, UpstreamModelName: "wan2.6-image", ChannelBaseUrl: "https://upstream.example", ApiKey: "key"},
+		info := &relaycommon.RelayInfo{OriginModelName: "wan2.6-image", ProviderMeta: &relaycommon.ProviderMeta{ChannelType: channelType, UpstreamModelName: "wan2.6-image", ChannelBaseUrl: "https://upstream.example", ApiKey: "key"},
 			TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_public"}}
 		adaptor := taskplugin.New(plugin)
 		adaptor.Init(info)
@@ -1475,7 +1475,7 @@ func TestAlibabaOpenAIImageDecodeAndSubmission(t *testing.T) {
 			request := resolved["requestBody"].(map[string]any)
 			_, err = plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{"requestBody": request, "upstreamModel": tc.model})
 			require.ErrorContains(t, err, tc.submitErr)
-			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: tc.model}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: tc.model}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
 			adaptor := taskplugin.New(plugin)
 			adaptor.Init(info)
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -1534,7 +1534,7 @@ func TestAlibabaOpenAIImageCountDerivationAndRender(t *testing.T) {
 				// Wan models default to the asynchronous service; the synchronous response shape needs the sync mode.
 				request["metadata"] = map[string]any{"upstream_mode": "sync"}
 			}
-			info := &relaycommon.RelayInfo{OriginModelName: tc.model, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: tc.model, ChannelBaseUrl: "https://dashscope.aliyuncs.com"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_public"}}
+			info := &relaycommon.RelayInfo{OriginModelName: tc.model, ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: tc.model, ChannelBaseUrl: "https://dashscope.aliyuncs.com"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_public"}}
 			adaptor := taskplugin.New(plugin)
 			adaptor.Init(info)
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())

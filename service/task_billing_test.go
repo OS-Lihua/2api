@@ -311,7 +311,7 @@ func TestLogTaskConsumptionIncludesTieredSnapshotUsageFacts(t *testing.T) {
 		TokenId:         0,
 		OriginModelName: "wan2.5-i2v-preview",
 		UsingGroup:      "default",
-		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: channelID},
+		ProviderMeta:    &relaycommon.ProviderMeta{ChannelId: channelID},
 		TaskRelayInfo:   &relaycommon.TaskRelayInfo{Action: "GENERATE"},
 		PriceData: types.PriceData{
 			ModelPrice:     0.02,
@@ -364,7 +364,7 @@ func TestLogTaskConsumptionWithoutSnapshotKeepsRatioMode(t *testing.T) {
 		TokenId:         0,
 		OriginModelName: "test-model",
 		UsingGroup:      "default",
-		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: channelID},
+		ProviderMeta:    &relaycommon.ProviderMeta{ChannelId: channelID},
 		TaskRelayInfo:   &relaycommon.TaskRelayInfo{Action: "GENERATE"},
 		PriceData:       priceData,
 	}
@@ -413,7 +413,7 @@ func TestLogTaskConsumptionMarksInlineResultsAndDiscardedArtifacts(t *testing.T)
 			task.PrivateData.ResultDiscarded = tc.discarded
 			info := &relaycommon.RelayInfo{
 				UserId: userID, OriginModelName: "qwen-image-plus", UsingGroup: "default",
-				ChannelMeta:   &relaycommon.ChannelMeta{ChannelId: channelID},
+				ProviderMeta:  &relaycommon.ProviderMeta{ChannelId: channelID},
 				TaskRelayInfo: &relaycommon.TaskRelayInfo{Action: "text_to_image"},
 				PriceData:     types.PriceData{ModelPrice: 0.03, Quota: 100, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}},
 			}
@@ -616,7 +616,7 @@ func TestSettleMidjourneyTaskBillingRequiresPersistedTask(t *testing.T) {
 		TokenId:   tokenID,
 		TokenKey:  "sk-midjourney-unpersisted",
 		UserQuota: initialUserQuota,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelId: channelID,
 		},
 	}
@@ -650,7 +650,7 @@ func TestMidjourneyRefundRestoresEveryAccountingElementOnBillingChannel(t *testi
 		TokenKey:   "sk-midjourney",
 		UserQuota:  initialUserQuota,
 		UsingGroup: "default",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelId: billingChannelID,
 		},
 	}
@@ -721,7 +721,7 @@ func TestSettleMidjourneyTaskBillingFundingFailureClearsMarkers(t *testing.T) {
 		TokenId:   tokenID,
 		TokenKey:  "sk-midjourney-funding-failure",
 		UserQuota: initialUserQuota,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelId: channelID,
 		},
 	}
@@ -765,7 +765,7 @@ func TestSettleMidjourneyTaskBillingTokenFailureKeepsFundingRefundable(t *testin
 		TokenId:   tokenID,
 		TokenKey:  "sk-midjourney-token-failure",
 		UserQuota: initialUserQuota,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelId: channelID,
 		},
 	}

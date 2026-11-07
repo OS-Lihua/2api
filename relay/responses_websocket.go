@@ -271,7 +271,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 	}
 	common.SetContextKey(c, appconstant.ContextKeyOriginalModel, modelName)
 	common.SetContextKey(c, appconstant.ContextKeyRequestStartTime, time.Now())
-	service.GetChannelConstraints(c).AddFilter(appdto.ChannelFilter{Kind: appdto.FilterRequestPath, RequestPath: c.Request.URL.Path})
+	service.GetChannelConstraints(c).AddFilter(appdto.ProviderFilter{Kind: appdto.FilterRequestPath, RequestPath: c.Request.URL.Path})
 
 	if s.lockedChannelID != 0 {
 		if apiErr = s.restoreConnectionContext(c, modelName); apiErr != nil {
@@ -570,7 +570,7 @@ func (s *responsesWSSession) restoreConnectionContext(c *gin.Context, model stri
 		!reflect.DeepEqual(channel.GetHeaderOverride(), s.lockedContext[appconstant.ContextKeyChannelHeaderOverride]) {
 		return types.NewErrorWithStatusCode(errors.New("upstream connection settings changed; reconnect required"), types.ErrorCodeAccessDenied, http.StatusForbidden, types.ErrOptionWithSkipRetry())
 	}
-	if previous, ok := s.lockedContext[appconstant.ContextKeyChannelSetting].(dto.ChannelSettings); ok && previous.Proxy != channel.GetSetting().Proxy {
+	if previous, ok := s.lockedContext[appconstant.ContextKeyChannelSetting].(dto.ProviderSettings); ok && previous.Proxy != channel.GetSetting().Proxy {
 		return types.NewErrorWithStatusCode(errors.New("upstream proxy changed; reconnect required"), types.ErrorCodeAccessDenied, http.StatusForbidden, types.ErrOptionWithSkipRetry())
 	}
 	// An advanced custom connection was dialed through the route matched for
@@ -937,10 +937,10 @@ func checkResponsesWSModelAccess(c *gin.Context, modelName string) *types.NewAPI
 // non-retryable NewAPIError.
 func selectResponsesWSChannel(c *gin.Context, modelName string, retryParam *service.RetryParam) (*appmodel.Provider, *types.NewAPIError) {
 	constraints := service.GetChannelConstraints(c)
-	if !slices.ContainsFunc(constraints.Filters, func(filter appdto.ChannelFilter) bool {
+	if !slices.ContainsFunc(constraints.Filters, func(filter appdto.ProviderFilter) bool {
 		return filter.Kind == appdto.FilterResponsesWebSocket
 	}) {
-		constraints.AddFilter(appdto.ChannelFilter{Kind: appdto.FilterResponsesWebSocket})
+		constraints.AddFilter(appdto.ProviderFilter{Kind: appdto.FilterResponsesWebSocket})
 	}
 	channel, _, selectErr := service.SelectChannelForRequest(c, modelName, retryParam)
 	if selectErr != nil {

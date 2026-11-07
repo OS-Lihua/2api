@@ -31,7 +31,7 @@ func TestSGLangChannelProtocols(t *testing.T) {
 	assert.Equal(t, "advanced_custom", adaptor.GetChannelName())
 	assert.Contains(t, common.GetEndpointTypesByChannelType(constant.ChannelTypeSGLang, "served-model"), constant.EndpointTypeAnthropic)
 	assert.Contains(t, common.GetEndpointTypesByChannelType(constant.ChannelTypeSGLang, "served-model"), constant.EndpointTypeOpenAIResponse)
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeSGLang, ChannelBaseUrl: "https://inference.example/prefix", ApiKey: "test-key"}}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeSGLang, ChannelBaseUrl: "https://inference.example/prefix", ApiKey: "test-key"}}
 	info.ChannelOtherSettings.AdvancedCustom = common.GetAdvancedCustomPreset(constant.ChannelTypeSGLang)
 	adaptor.Init(info)
 	for _, path := range []string{"/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/responses", "/v1/messages"} {
@@ -90,7 +90,7 @@ func TestSGLangRerankRequestAndResponse(t *testing.T) {
 	}))
 	defer upstream.Close()
 	info := &relaycommon.RelayInfo{
-		ChannelMeta:    &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeSGLang, ChannelBaseUrl: upstream.URL + "/prefix", ApiKey: "test-key"},
+		ProviderMeta:   &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeSGLang, ChannelBaseUrl: upstream.URL + "/prefix", ApiKey: "test-key"},
 		RequestURLPath: "/rerank", RelayMode: relayconstant.RelayModeRerank,
 		RelayFormat:  types.RelayFormatOpenAI,
 		RerankerInfo: &relaycommon.RerankerInfo{Documents: []any{"first", "second"}, ReturnDocuments: true},
@@ -122,7 +122,7 @@ func TestSGLangRerankRejectsMalformedResults(t *testing.T) {
 	for _, body := range []string{`null`, `{}`, `[{"index":99,"score":1}]`, `[{"index":-1,"score":0}]`, `[{"index":0}]`, `[{"score":1}]`} {
 		t.Run(body, func(t *testing.T) {
 			adaptor := &advancedcustom.Adaptor{}
-			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelOtherSettings: dto.ChannelOtherSettings{AdvancedCustom: common.GetAdvancedCustomPreset(constant.ChannelTypeSGLang)}}, RequestURLPath: "/v1/rerank", RelayMode: relayconstant.RelayModeRerank, RerankerInfo: &relaycommon.RerankerInfo{Documents: []any{"only document"}}}
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelOtherSettings: dto.ProviderOtherSettings{AdvancedCustom: common.GetAdvancedCustomPreset(constant.ChannelTypeSGLang)}}, RequestURLPath: "/v1/rerank", RelayMode: relayconstant.RelayModeRerank, RerankerInfo: &relaycommon.RerankerInfo{Documents: []any{"only document"}}}
 			recorder := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(recorder)
 			usage, err := adaptor.DoResponse(c, &http.Response{Body: io.NopCloser(strings.NewReader(body))}, info)

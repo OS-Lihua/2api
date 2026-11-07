@@ -73,7 +73,7 @@ func TestTaskAdaptorRejectsDeprecatedClientResponse(t *testing.T) {
 	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
 	require.NoError(t, err)
 	adaptor := New(plugin)
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_public"}}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_public"}}
 	adaptor.Init(info)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
@@ -97,7 +97,7 @@ export function parseSubmitResponse(ctx,r){return {taskId:"1"}} export function 
 	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
 	require.NoError(t, err)
 	adaptor := New(plugin)
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
 	adaptor.Init(info)
 	var input bytes.Buffer
 	writer := multipart.NewWriter(&input)
@@ -151,7 +151,7 @@ export function parseSubmitResponse(){return {taskId:"1"}} export function build
 	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
 	require.NoError(t, err)
 	adaptor := New(plugin)
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
 	adaptor.Init(info)
 	c := newMultipartFileContext(t, "input_reference", "ref.png", "image/jpeg", []byte(fileBytes))
 	c.Set("task_request", map[string]any{"prompt": "p"})
@@ -186,7 +186,7 @@ export function parseSubmitResponse(){return {taskId:"1"}} export function build
 		plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
 		require.NoError(t, err)
 		adaptor := New(plugin)
-		info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+		info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
 		adaptor.Init(info)
 		var input bytes.Buffer
 		writer := multipart.NewWriter(&input)
@@ -251,7 +251,7 @@ export function parseSubmitResponse(){return {taskId:"1"}} export function build
 			plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
 			require.NoError(t, err)
 			adaptor := New(plugin)
-			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
 			adaptor.Init(info)
 			c := newMultipartFileContext(t, "input_reference", "ref.bin", "application/octet-stream", bytes.Repeat([]byte("x"), testCase.fileSize))
 			c.Set("task_request", map[string]any{"prompt": "p"})
@@ -298,7 +298,7 @@ export function parseSubmitResponse(){return {taskId:"1"}} export function build
 			plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
 			require.NoError(t, err)
 			adaptor := New(plugin)
-			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
 			adaptor.Init(info)
 			var input bytes.Buffer
 			writer := multipart.NewWriter(&input)
@@ -339,7 +339,7 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 	require.NoError(t, err)
 	adaptor := New(plugin)
 	info := &relaycommon.RelayInfo{
-		ChannelMeta:     &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"},
+		ProviderMeta:    &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"},
 		TaskRelayInfo:   &relaycommon.TaskRelayInfo{},
 		OriginModelName: "claimed-model",
 	}
@@ -378,7 +378,7 @@ export function buildSubmitRequest(ctx){return {url:ctx.baseUrl+"/submit"}} expo
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	c.Set(pluginruntime.ContextKeyPinnedEndpoint, pluginruntime.PinnedEndpoint{Plugin: plugin, Protocol: "openai_responses", Model: "claimed-model"})
 	c.Set(pluginruntime.ContextKeyProtocolRequest, protocolContext)
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}, OriginModelName: "claimed-model"}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}, OriginModelName: "claimed-model"}
 	adaptor := New(plugin)
 	adaptor.Init(info)
 
@@ -405,7 +405,7 @@ export function buildSubmitRequest(ctx){return {url:ctx.baseUrl+"/submit"}} expo
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	c.Set(pluginruntime.ContextKeyPinnedEndpoint, pluginruntime.PinnedEndpoint{Plugin: plugin, Protocol: "openai_responses", Model: "claimed-model"})
 	c.Set(pluginruntime.ContextKeyProtocolRequest, protocolContext)
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}, OriginModelName: "claimed-model"}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}, OriginModelName: "claimed-model"}
 	adaptor := New(plugin)
 	adaptor.Init(info)
 
@@ -428,7 +428,7 @@ export function parseSubmitResponse(){return {taskId:"one"}} export function bui
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/video/generations", nil)
 	c.Set("task_request", map[string]any{"model": "m"})
 	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, "https://private.example.com")
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://private.example.com"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}, OriginModelName: "m"}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://private.example.com"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}, OriginModelName: "m"}
 	adaptor := New(plugin)
 	adaptor.Init(info)
 
@@ -481,7 +481,7 @@ func TestTaskAdaptorJSONOrderCapability(t *testing.T) {
 			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 			c.Set(pluginruntime.ContextKeyPinnedEndpoint, pluginruntime.PinnedEndpoint{Plugin: plugin, Protocol: "openai_responses", Model: "m"})
 			c.Set(pluginruntime.ContextKeyProtocolRequest, protocolContext)
-			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}, OriginModelName: "m"}
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}, OriginModelName: "m"}
 			adaptor := New(plugin)
 			adaptor.Init(info)
 
@@ -505,7 +505,7 @@ export function buildContentRequest(ctx) {
 	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
 	require.NoError(t, err)
 	adaptor := New(plugin)
-	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example", ApiKey: "key"}})
+	adaptor.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example", ApiKey: "key"}})
 	taskData, err := common.Marshal(map[string]any{"id": "raw-upstream"})
 	require.NoError(t, err)
 	task := &model.Task{
@@ -536,7 +536,7 @@ export function parseTaskResult(){return {status:"SUCCESS"};}
 `, pluginruntime.Options{})
 	require.NoError(t, err)
 	fallback := New(withoutHook)
-	fallback.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}})
+	fallback.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"}})
 	artifacts, err = fallback.ListArtifacts(&model.Task{})
 	require.NoError(t, err)
 	assert.Nil(t, artifacts)
@@ -579,7 +579,7 @@ export function buildContentRequest(ctx) { return {url:"https://cdn.example/vide
 	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
 	require.NoError(t, err)
 	adaptor := New(plugin)
-	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}})
+	adaptor.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"}})
 	descriptor, err := adaptor.BuildContentRequest(
 		t.Context(),
 		&model.Task{TaskID: "task", Data: []byte(`{}`)},
@@ -628,7 +628,7 @@ export function buildContentRequest(ctx) {
 	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
 	require.NoError(t, err)
 	adaptor := New(plugin)
-	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: base.URL, ApiKey: "key"}})
+	adaptor.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: base.URL, ApiKey: "key"}})
 
 	descriptor, err := adaptor.BuildContentRequest(t.Context(), &model.Task{TaskID: "task", Data: []byte(`{}`)}, "video", channel.TaskArtifactClientRequest{Method: http.MethodGet})
 	require.NoError(t, err)
@@ -901,7 +901,7 @@ func TestTaskAdaptorMapsJSContract(t *testing.T) {
 	plugin, err := registry.Register(mockPlugin, pluginruntime.Options{Key: "mock-task", Version: "1.0.0"})
 	require.NoError(t, err)
 	adaptor := New(plugin)
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: server.URL, ApiKey: "secret"}, OriginModelName: "client-model", TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_public"}}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: server.URL, ApiKey: "secret"}, OriginModelName: "client-model", TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_public"}}
 	adaptor.Init(info)
 
 	recorder := httptest.NewRecorder()
@@ -1003,7 +1003,7 @@ export function parseBatchResult() { return {}; }
 				}))
 				defer server.Close()
 				info := &relaycommon.RelayInfo{
-					ChannelMeta: &relaycommon.ChannelMeta{
+					ProviderMeta: &relaycommon.ProviderMeta{
 						ChannelBaseUrl:  server.URL,
 						ApiKey:          "channel-key",
 						HeadersOverride: tc.headers,
@@ -1225,7 +1225,7 @@ export function extractUsageOnComplete(task, result, body) { return (body || {})
 		t.Helper()
 		adaptor := New(plugin)
 		info := &relaycommon.RelayInfo{
-			ChannelMeta:   &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"},
+			ProviderMeta:  &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"},
 			TaskRelayInfo: &relaycommon.TaskRelayInfo{},
 		}
 		adaptor.Init(info)
@@ -1426,7 +1426,7 @@ export function extractUsageOnComplete() { return {units: 3.5}; }
 		require.NoError(t, err)
 		adaptor := New(plugin)
 		info := &relaycommon.RelayInfo{
-			ChannelMeta:   &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"},
+			ProviderMeta:  &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"},
 			TaskRelayInfo: &relaycommon.TaskRelayInfo{},
 		}
 		adaptor.Init(info)
@@ -1482,7 +1482,7 @@ export function extractUsage(ctx) {
 	require.NoError(t, err)
 	adaptor := New(plugin)
 	info := &relaycommon.RelayInfo{
-		ChannelMeta:   &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"},
+		ProviderMeta:  &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"},
 		TaskRelayInfo: &relaycommon.TaskRelayInfo{},
 	}
 	adaptor.Init(info)
@@ -1525,7 +1525,7 @@ func TestSubmitContextExposesOriginTasks(t *testing.T) {
 	require.NoError(t, err)
 	adaptor := New(plugin)
 	info := &relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example", ApiKey: "secret"},
+		ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example", ApiKey: "secret"},
 		TaskRelayInfo: &relaycommon.TaskRelayInfo{
 			OriginTasks: []relaycommon.OriginTaskRef{{
 				TaskID:         "task_pub_1",
@@ -1557,7 +1557,7 @@ func TestSubmitContextOmitsOriginTasksWhenEmpty(t *testing.T) {
 	require.NoError(t, err)
 	adaptor := New(plugin)
 	info := &relaycommon.RelayInfo{
-		ChannelMeta:   &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example", ApiKey: "secret"},
+		ProviderMeta:  &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example", ApiKey: "secret"},
 		TaskRelayInfo: &relaycommon.TaskRelayInfo{},
 	}
 	adaptor.Init(info)
@@ -1575,7 +1575,7 @@ func TestSubmitContextOriginTasksNilDataOnInvalidJSON(t *testing.T) {
 	require.NoError(t, err)
 	adaptor := New(plugin)
 	info := &relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example", ApiKey: "secret"},
+		ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example", ApiKey: "secret"},
 		TaskRelayInfo: &relaycommon.TaskRelayInfo{
 			OriginTasks: []relaycommon.OriginTaskRef{{
 				TaskID:         "task_pub_1",
@@ -1602,7 +1602,7 @@ func TestSubmitContextExposesClientHeadersWithoutCredentials(t *testing.T) {
 	plugin, err := pluginruntime.NewRegistry().Register(mockPlugin, pluginruntime.Options{})
 	require.NoError(t, err)
 	adaptor := New(plugin)
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
 	adaptor.Init(info)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/vendor/v1/jobs", nil)
@@ -1629,7 +1629,7 @@ func TestSubmitContextNormalizesRequestBodyOnEveryCall(t *testing.T) {
 	plugin, err := pluginruntime.NewRegistry().Register(mockPlugin, pluginruntime.Options{})
 	require.NoError(t, err)
 	adaptor := New(plugin)
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
 	adaptor.Init(info)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
@@ -1650,7 +1650,7 @@ func TestTaskAdaptorRejectsRequestHostOverride(t *testing.T) {
 	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{Key: "mock-task", Version: "1.0.0"})
 	require.NoError(t, err)
 	adaptor := New(plugin)
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
 	c.Set("task_request", relaycommon.TaskSubmitReq{Prompt: "hello"})
@@ -1748,7 +1748,7 @@ func mappingOrderSubmitBody(t *testing.T, origin, mapping string) []byte {
 	require.NoError(t, err)
 	adaptor := New(plugin)
 	info := &relaycommon.RelayInfo{
-		ChannelMeta:     &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"},
+		ProviderMeta:    &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"},
 		TaskRelayInfo:   &relaycommon.TaskRelayInfo{},
 		OriginModelName: origin,
 	}
@@ -1872,7 +1872,7 @@ export function parseTaskResult(ctx, body, response){
 	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
 	require.NoError(t, err)
 	adaptor := New(plugin)
-	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: server.URL, ApiKey: "secret"}})
+	adaptor.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: server.URL, ApiKey: "secret"}})
 
 	task := &model.Task{
 		TaskID: "task_public",
@@ -1928,7 +1928,7 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
 	require.NoError(t, err)
 	adaptor := New(plugin)
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: server.URL, ApiKey: "secret"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: server.URL, ApiKey: "secret"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
 	adaptor.Init(info)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
@@ -2013,7 +2013,7 @@ export function extractUsageOnComplete(ctx,result,body){return body.usage;}
 		t.Helper()
 		info := &relaycommon.RelayInfo{
 			OriginModelName: origin,
-			ChannelMeta: &relaycommon.ChannelMeta{
+			ProviderMeta: &relaycommon.ProviderMeta{
 				UpstreamModelName: upstream, ChannelBaseUrl: "https://provider.example",
 			},
 			TaskRelayInfo: &relaycommon.TaskRelayInfo{},
@@ -2181,7 +2181,7 @@ func TestTaskSubmitStreamContract(t *testing.T) {
 		{"undeclared stream", "data: {}\n\n", "text/event-stream", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			info := &relaycommon.RelayInfo{OriginModelName: "alias", ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "document", ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "public-document"}}
+			info := &relaycommon.RelayInfo{OriginModelName: "alias", ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "document", ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "public-document"}}
 			adaptor := New(plugin)
 			adaptor.Init(info)
 			c, recorder := gin.CreateTestContext(httptest.NewRecorder())
@@ -2224,7 +2224,7 @@ func TestTaskSubmitStreamRelaysToNativeClients(t *testing.T) {
 	require.NoError(t, err)
 	const first = "data: {\"part\":\"a\",\"units\":1}\n\n"
 	nativeSubmit := func(t *testing.T, body io.Reader) (*TaskAdaptor, *relaycommon.RelayInfo, *httptest.ResponseRecorder, *channel.TaskSubmitResponse, *taskdto.TaskError) {
-		info := &relaycommon.RelayInfo{OriginModelName: "alias", ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "document", ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "public-document"}}
+		info := &relaycommon.RelayInfo{OriginModelName: "alias", ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "document", ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "public-document"}}
 		adaptor := New(plugin)
 		adaptor.Init(info)
 		recorder := httptest.NewRecorder()
@@ -2293,7 +2293,7 @@ func TestTaskSubmitStreamRelaysToNativeClients(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				info := &relaycommon.RelayInfo{OriginModelName: "alias", ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "document", ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "public-document"}}
+				info := &relaycommon.RelayInfo{OriginModelName: "alias", ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "document", ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "public-document"}}
 				adaptor := New(plugin)
 				adaptor.Init(info)
 				c, _ := gin.CreateTestContext(w)
@@ -2339,7 +2339,7 @@ func TestTaskSubmitReplyLimitFollowsRetainResult(t *testing.T) {
 		{"discarded reply", &discard, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			info := &relaycommon.RelayInfo{OriginModelName: "alias", ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "document", ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "public-document"}}
+			info := &relaycommon.RelayInfo{OriginModelName: "alias", ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "document", ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "public-document"}}
 			adaptor := New(plugin)
 			adaptor.Init(info)
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -2511,7 +2511,7 @@ export function parseTaskResult(){return {status:"SUCCESS"};}
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/submit", nil)
 	c.Set("task_request", request)
-	info := &relaycommon.RelayInfo{OriginModelName: "copy", ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "copy", ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+	info := &relaycommon.RelayInfo{OriginModelName: "copy", ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "copy", ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
 	adaptor := New(plugin)
 	adaptor.Init(info)
 	require.Nil(t, adaptor.ValidateRequestAndSetAction(c, info))
@@ -2544,7 +2544,7 @@ export function parseTaskResult(){return {status:"SUCCESS"};}
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/submit", nil)
 	c.Set("task_request", request)
-	info := &relaycommon.RelayInfo{OriginModelName: "usage", ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "usage", ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+	info := &relaycommon.RelayInfo{OriginModelName: "usage", ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "usage", ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
 	adaptor := New(plugin)
 	adaptor.Init(info)
 	require.Nil(t, adaptor.ValidateRequestAndSetAction(c, info))
@@ -2595,7 +2595,7 @@ export function parseSubmitEventDelta(ctx,event,previous) {
 			for _, frame := range tc.frames {
 				stream.WriteString("data: " + frame + "\n\n")
 			}
-			info := &relaycommon.RelayInfo{OriginModelName: "alias", ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "document", ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "public-document"}}
+			info := &relaycommon.RelayInfo{OriginModelName: "alias", ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "document", ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "public-document"}}
 			adaptor := New(plugin)
 			adaptor.Init(info)
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -2618,7 +2618,7 @@ export function parseSubmitEventDelta(ctx,event,previous) {
 	}
 
 	t.Run("invalid changes after a relayed event keep the reservation", func(t *testing.T) {
-		info := &relaycommon.RelayInfo{OriginModelName: "alias", ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "document", ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "public-document"}}
+		info := &relaycommon.RelayInfo{OriginModelName: "alias", ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "document", ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "public-document"}}
 		adaptor := New(plugin)
 		adaptor.Init(info)
 		recorder := httptest.NewRecorder()
@@ -2645,7 +2645,7 @@ export function parseSubmitEventDelta(ctx,event,previous) {
 		plugin, err := pluginruntime.CompilePlugin(undeclared, pluginruntime.Options{})
 		require.NoError(t, err)
 		require.Empty(t, plugin.Meta.RequiredCapabilities)
-		info := &relaycommon.RelayInfo{OriginModelName: "alias", ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "document", ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "public-document"}}
+		info := &relaycommon.RelayInfo{OriginModelName: "alias", ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "document", ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "public-document"}}
 		adaptor := New(plugin)
 		adaptor.Init(info)
 		c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -2731,7 +2731,7 @@ func TestTaskAdaptorChainsDoubaoThroughNewAPIUpstream(t *testing.T) {
 	adaptor := New(plugin)
 	const modelName = "doubao-seedance-1-0-pro-250528"
 	info := &relaycommon.RelayInfo{
-		ChannelMeta:     &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeNewAPI, ChannelBaseUrl: gateway.URL, ApiKey: "sk-gateway", UpstreamModelName: modelName},
+		ProviderMeta:    &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeNewAPI, ChannelBaseUrl: gateway.URL, ApiKey: "sk-gateway", UpstreamModelName: modelName},
 		OriginModelName: modelName,
 		TaskRelayInfo:   &relaycommon.TaskRelayInfo{PublicTaskID: "task_local"},
 	}
@@ -2789,7 +2789,7 @@ func TestTaskAdaptorChainsSunoBatchFetchThroughNewAPIUpstream(t *testing.T) {
 	require.NoError(t, err)
 	adaptor := New(plugin)
 	info := &relaycommon.RelayInfo{
-		ChannelMeta:     &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeNewAPI, ChannelBaseUrl: gateway.URL, ApiKey: "sk-gateway", UpstreamModelName: "suno_music"},
+		ProviderMeta:    &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeNewAPI, ChannelBaseUrl: gateway.URL, ApiKey: "sk-gateway", UpstreamModelName: "suno_music"},
 		OriginModelName: "suno_music",
 		TaskRelayInfo:   &relaycommon.TaskRelayInfo{PublicTaskID: "task_local", Action: "MUSIC"},
 	}
@@ -2889,7 +2889,7 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 			c.Set("task_request", map[string]any{"by": "route-alpha", "param": "video"})
 			c.Set("task_action", "by-route-alpha")
 			c.Set("resolved_task_model", testCase.prepared)
-			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}, OriginModelName: testCase.prepared}
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}, OriginModelName: testCase.prepared}
 			adaptor := New(beta)
 			adaptor.Init(info)
 
@@ -2937,7 +2937,7 @@ export function buildContentRequest(ctx) {
 			plugin, err := pluginruntime.NewRegistry().Register(descriptorFor(testCase.contentPath, testCase.mimeType), pluginruntime.Options{})
 			require.NoError(t, err)
 			adaptor := New(plugin)
-			adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example", ApiKey: "key"}})
+			adaptor.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example", ApiKey: "key"}})
 
 			descriptor, err := adaptor.BuildContentRequest(t.Context(), task, "video", channel.TaskArtifactClientRequest{Method: http.MethodHead})
 

@@ -94,7 +94,7 @@ func TestHailuoUsageProfilesPerModel(t *testing.T) {
 
 	t.Run("submission keeps facts outside the selected profile billable", func(t *testing.T) {
 		info := &relaycommon.RelayInfo{
-			ChannelMeta:     &relaycommon.ChannelMeta{ApiKey: "test-ak", ChannelBaseUrl: "https://api.minimax.example", UpstreamModelName: "MiniMax-Hailuo-2.3"},
+			ProviderMeta:    &relaycommon.ProviderMeta{ApiKey: "test-ak", ChannelBaseUrl: "https://api.minimax.example", UpstreamModelName: "MiniMax-Hailuo-2.3"},
 			OriginModelName: "MiniMax-Hailuo-2.3",
 			TaskRelayInfo:   &relaycommon.TaskRelayInfo{PublicTaskID: "task_public"},
 		}
@@ -133,7 +133,7 @@ func TestHailuoArtifactContentProxy(t *testing.T) {
 	defer upstream.Close()
 	adaptor := taskplugin.New(loadHailuoPlugin(t))
 	adaptor.Init(&relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{ApiKey: "test-ak", ChannelBaseUrl: upstream.URL},
+		ProviderMeta: &relaycommon.ProviderMeta{ApiKey: "test-ak", ChannelBaseUrl: upstream.URL},
 	})
 
 	for _, tc := range []struct {
@@ -602,7 +602,7 @@ func TestHailuoH3ArtifactContentProxy(t *testing.T) {
 	require.NoError(t, err)
 	adaptor := taskplugin.New(plugin)
 	adaptor.Init(&relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{ApiKey: "test-ak", ChannelBaseUrl: "https://api.minimax.example"},
+		ProviderMeta: &relaycommon.ProviderMeta{ApiKey: "test-ak", ChannelBaseUrl: "https://api.minimax.example"},
 	})
 	task := &model.Task{
 		TaskID: "task-public",
@@ -762,7 +762,7 @@ func TestHailuoThroughNewAPIGateway(t *testing.T) {
 	})
 
 	adaptor := taskplugin.New(plugin)
-	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+	adaptor.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{
 		ChannelType: constant.ChannelTypeNewAPI, ApiKey: "sk-gateway", ChannelBaseUrl: "https://gateway.example",
 	}})
 	success := map[string]any{"status_code": 0, "status_msg": "success"}

@@ -28,7 +28,7 @@ func TestChannelHasSensitiveChanges(t *testing.T) {
 	}
 
 	t.Run("non-sensitive routing fields", func(t *testing.T) {
-		updated := PatchChannel{Provider: *origin}
+		updated := PatchProvider{Provider: *origin}
 		updated.Models = "gpt-4o,gpt-4o-mini"
 		updated.Group = "vip"
 
@@ -39,14 +39,14 @@ func TestChannelHasSensitiveChanges(t *testing.T) {
 	})
 
 	t.Run("key change", func(t *testing.T) {
-		updated := PatchChannel{Provider: *origin}
+		updated := PatchProvider{Provider: *origin}
 		updated.Key = "new-key"
 
 		assert.True(t, channelHasSensitiveChanges(&updated, origin, map[string]any{"key": updated.Key}))
 	})
 
 	t.Run("base url change", func(t *testing.T) {
-		updated := PatchChannel{Provider: *origin}
+		updated := PatchProvider{Provider: *origin}
 		newBaseURL := "https://leak.example.com"
 		updated.BaseURL = &newBaseURL
 
@@ -54,7 +54,7 @@ func TestChannelHasSensitiveChanges(t *testing.T) {
 	})
 
 	t.Run("header override change", func(t *testing.T) {
-		updated := PatchChannel{Provider: *origin}
+		updated := PatchProvider{Provider: *origin}
 		newHeaderOverride := `{"X-Key":"{api_key}"}`
 		updated.HeaderOverride = &newHeaderOverride
 
@@ -62,7 +62,7 @@ func TestChannelHasSensitiveChanges(t *testing.T) {
 	})
 
 	t.Run("omitted sensitive fields do not use zero values", func(t *testing.T) {
-		updated := PatchChannel{}
+		updated := PatchProvider{}
 		updated.Id = origin.Id
 		updated.Priority = origin.Priority
 
@@ -70,20 +70,20 @@ func TestChannelHasSensitiveChanges(t *testing.T) {
 	})
 
 	t.Run("unknown field fails closed", func(t *testing.T) {
-		updated := PatchChannel{Provider: *origin}
+		updated := PatchProvider{Provider: *origin}
 
 		assert.True(t, channelHasSensitiveChanges(&updated, origin, map[string]any{"future_secret_field": "x"}))
 	})
 
 	t.Run("status is operational", func(t *testing.T) {
-		updated := PatchChannel{Provider: *origin}
+		updated := PatchProvider{Provider: *origin}
 		updated.Status = common.ChannelStatusManuallyDisabled
 
 		assert.False(t, channelHasSensitiveChanges(&updated, origin, map[string]any{"status": updated.Status}))
 	})
 
 	t.Run("read-only fields are ignored by sensitivity check", func(t *testing.T) {
-		updated := PatchChannel{Provider: *origin}
+		updated := PatchProvider{Provider: *origin}
 		updated.Balance = 99
 		updated.UsedQuota = 100
 		updated.ResponseTime = 200
@@ -97,7 +97,7 @@ func TestChannelHasSensitiveChanges(t *testing.T) {
 }
 
 func TestClearChannelReadOnlyFields(t *testing.T) {
-	channel := PatchChannel{Provider: model.Provider{
+	channel := PatchProvider{Provider: model.Provider{
 		CreatedTime:        11,
 		TestTime:           22,
 		ResponseTime:       33,
@@ -159,7 +159,7 @@ func TestChannelStatusValidation(t *testing.T) {
 }
 
 // TestChannelFieldsAreClassified guards the fail-closed sensitivity check: every
-// JSON field of PatchChannel (including the embedded model.Channel) must be listed
+// JSON field of PatchProvider (including the embedded model.Channel) must be listed
 // in channelSensitiveFields, channelNonSensitiveFields, or
 // channelOperationalFields. A newly added field that is left unclassified will
 // fail this test, forcing a conscious permission decision instead of silently
@@ -197,7 +197,7 @@ func TestChannelFieldsAreClassified(t *testing.T) {
 		return names
 	}
 
-	for _, name := range collect(reflect.TypeFor[PatchChannel]()) {
+	for _, name := range collect(reflect.TypeFor[PatchProvider]()) {
 		assert.Truef(t, classified(name),
 			"channel field %q is not classified; add it to channelSensitiveFields, channelNonSensitiveFields, channelOperationalFields, or channelReadOnlyFields in channel_authz.go", name)
 	}

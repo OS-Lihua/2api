@@ -151,9 +151,9 @@ func TestApplyChannelPinPreservesOriginTasksAndRetryMode(t *testing.T) {
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
 			common.SetContextKey(c, constant.ContextKeyOriginTasks, []*model.Task{originTask})
 			constraints := service.GetChannelConstraints(c)
-			constraints.AddPin(dto.ChannelPin{ChannelId: channel.Id, Source: dto.PinSourceOriginTask, Rank: dto.PinRankOriginTask, RetryMode: dto.PinRetrySameChannel})
+			constraints.AddPin(dto.ProviderPin{ChannelId: channel.Id, Source: dto.PinSourceOriginTask, Rank: dto.PinRankOriginTask, RetryMode: dto.PinRetrySameChannel})
 			if tc.tokenPin {
-				constraints.AddPin(dto.ChannelPin{ChannelId: channel.Id, Source: dto.PinSourceToken, Rank: dto.PinRankToken, RetryMode: dto.PinRetrySingleAttempt})
+				constraints.AddPin(dto.ProviderPin{ChannelId: channel.Id, Source: dto.PinSourceToken, Rank: dto.PinRankToken, RetryMode: dto.PinRetrySingleAttempt})
 			}
 			info := &relaycommon.RelayInfo{TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
 			require.Nil(t, tc.apply(c, info))

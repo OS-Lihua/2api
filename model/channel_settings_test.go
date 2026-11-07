@@ -16,16 +16,16 @@ import (
 func TestChannelValidateSettingsRejectsInvalidHTTPTransport(t *testing.T) {
 	tests := []struct {
 		name    string
-		setting dto.ChannelSettings
+		setting dto.ProviderSettings
 		wantErr string
 	}{
 		{
 			name:    "auto with shards is valid",
-			setting: dto.ChannelSettings{HTTPProtocol: "auto", HTTP2ConnectionShards: 4},
+			setting: dto.ProviderSettings{HTTPProtocol: "auto", HTTP2ConnectionShards: 4},
 		},
 		{
 			name:    "http1 with shards greater than one rejected",
-			setting: dto.ChannelSettings{HTTPProtocol: "http1", HTTP2ConnectionShards: 2},
+			setting: dto.ProviderSettings{HTTPProtocol: "http1", HTTP2ConnectionShards: 2},
 			wantErr: "http2_connection_shards",
 		},
 	}
@@ -85,7 +85,7 @@ func TestAdvancedCustomChannelRequiresModelListRouteOnlyWhenUpdateChecksEnabled(
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			channel := &Provider{Type: constant.ChannelTypeAdvancedCustom}
-			channel.SetOtherSettings(dto.ChannelOtherSettings{
+			channel.SetOtherSettings(dto.ProviderOtherSettings{
 				UpstreamModelUpdateCheckEnabled: tt.checksEnabled,
 				AdvancedCustom: &dto.AdvancedCustomConfig{
 					Routes: tt.routes,
@@ -125,7 +125,7 @@ func TestInferencePresetSettingsAndDatabaseRoundTrip(t *testing.T) {
 				defaults.Routes[0].UpstreamPath = "/changed-locally"
 				assert.Equal(t, "/v1/chat/completions", loaded.GetOtherSettings().AdvancedCustom.Routes[0].UpstreamPath)
 			}
-			settings := dto.ChannelOtherSettings{AdvancedCustom: &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{IncomingPath: "/v1/chat/completions", UpstreamPath: "/custom/chat", Models: []string{"allowed"}, Auth: &dto.AdvancedCustomRouteAuth{Type: "none"}}}}}
+			settings := dto.ProviderOtherSettings{AdvancedCustom: &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{IncomingPath: "/v1/chat/completions", UpstreamPath: "/custom/chat", Models: []string{"allowed"}, Auth: &dto.AdvancedCustomRouteAuth{Type: "none"}}}}}
 			channel.SetOtherSettings(settings)
 			require.NoError(t, channel.ValidateSettings())
 			require.NoError(t, table.Save(channel).Error)
@@ -144,7 +144,7 @@ func TestInferencePresetSettingsAndDatabaseRoundTrip(t *testing.T) {
 					{"/v1/messages", "allowed", true},
 					{"/v1/images/generations", "allowed", false},
 				} {
-					ok, _ := ProviderSatisfiesFilters(&loaded, tc.model, []filterdto.ChannelFilter{{Kind: filterdto.FilterRequestPath, RequestPath: tc.path}})
+					ok, _ := ProviderSatisfiesFilters(&loaded, tc.model, []filterdto.ProviderFilter{{Kind: filterdto.FilterRequestPath, RequestPath: tc.path}})
 					assert.Equal(t, tc.allowed, ok)
 				}
 				endpoints := getPricingEndpointTypesForAbility(AbilityWithProvider{ChannelType: channelType, Ability: Ability{Model: "allowed", ChannelId: loaded.Id}}, map[int]*dto.AdvancedCustomConfig{loaded.Id: actual})

@@ -77,7 +77,7 @@ func TestImageRequestReservesFinalQuantityBeforeUpstream(t *testing.T) {
 			c.Request.Header.Set("Content-Type", "application/json")
 			common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenAI)
 			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstream.URL)
-			common.SetContextKey(c, constant.ContextKeyChannelSetting, dto.ChannelSettings{PassThroughBodyEnabled: tc.passThrough})
+			common.SetContextKey(c, constant.ContextKeyChannelSetting, dto.ProviderSettings{PassThroughBodyEnabled: tc.passThrough})
 			if tc.override != nil {
 				common.SetContextKey(c, constant.ContextKeyChannelParamOverride, map[string]any{"operations": []any{map[string]any{"path": "n", "mode": "set", "value": tc.override}}})
 			}
@@ -131,9 +131,9 @@ func TestOptInSafeToolLossRejectedAsBadRequestWithAdminDiagnostics(t *testing.T)
 
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "gpt-4o",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "gpt-4o",
-			ChannelOtherSettings: dto.ChannelOtherSettings{
+			ChannelOtherSettings: dto.ProviderOtherSettings{
 				ToolLossPolicy: string(types.ConversionLossPolicySafe),
 			},
 		},
@@ -178,7 +178,7 @@ func TestUnknownModelModifierIsBadRequestWithoutRetry(t *testing.T) {
 
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "m@thinkin:on",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "m@thinkin:on",
 		},
 	}
@@ -223,7 +223,7 @@ func TestGeminiThinkingControlsConvertBestEffort(t *testing.T) {
 			RelayFormat:     types.RelayFormatOpenAI,
 			OriginModelName: "gemini-3.1-pro-preview-thinking",
 			Request:         req,
-			ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: "gemini-3.1-pro-preview"},
+			ProviderMeta:    &relaycommon.ProviderMeta{UpstreamModelName: "gemini-3.1-pro-preview"},
 		}
 		require.NoError(t, helper.ApplyReasoningModelSuffix(c, info, req))
 
@@ -250,7 +250,7 @@ func TestGeminiThinkingControlsConvertBestEffort(t *testing.T) {
 			RelayFormat:     types.RelayFormatOpenAI,
 			OriginModelName: "gemini-3.1-pro-preview-thinking",
 			Request:         req,
-			ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: "gemini-3.1-pro-preview-thinking"},
+			ProviderMeta:    &relaycommon.ProviderMeta{UpstreamModelName: "gemini-3.1-pro-preview-thinking"},
 		}
 		require.NoError(t, helper.ApplyReasoningModelSuffix(c, info, req))
 		assert.Equal(t, "gemini-3.1-pro-preview", info.UpstreamModelName)
@@ -279,7 +279,7 @@ func TestGeminiThinkingControlsConvertBestEffort(t *testing.T) {
 			RelayFormat:     types.RelayFormatGemini,
 			OriginModelName: "gemini-3.1-pro-preview",
 			Request:         req,
-			ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: "gpt-5"},
+			ProviderMeta:    &relaycommon.ProviderMeta{UpstreamModelName: "gpt-5"},
 		}
 
 		result, err := service.ConvertRequest(c, info, types.RelayFormatOpenAI, req)
