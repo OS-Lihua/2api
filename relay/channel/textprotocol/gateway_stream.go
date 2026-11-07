@@ -224,11 +224,12 @@ func gatewayStreamBusinessText(body []byte, format types.RelayFormat) string {
 		}
 	case types.RelayFormatOpenAIResponses:
 		switch root.Get("type").String() {
-		case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.function_call_arguments.delta", "response.refusal.delta":
+		case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.refusal.delta":
 			text.WriteString(root.Get("delta").String())
 		case "response.output_item.added":
-			if root.Get("item.type").String() == "function_call" {
+			if kind := root.Get("item.type").String(); kind == "function_call" || kind == "custom_tool_call" {
 				text.WriteString(root.Get("item.name").String())
+				text.WriteString(root.Get("item.input").String())
 			}
 		}
 	case types.RelayFormatClaude:

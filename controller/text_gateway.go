@@ -179,6 +179,13 @@ func TextGateway(c *gin.Context) {
 	info.SetResponsesToolState(selection.ResponsesTools)
 	selection.Conversion.Value.(dto.Request).SetModelName(info.UpstreamModelName)
 	info.RecordConversionDiagnostics(c, selection.Conversion.Diagnostics)
+	if wire, ok := selection.Conversion.Value.(*dto.GeneralOpenAIRequest); ok && info.IsStream {
+		if info.SupportStreamOptions {
+			wire.StreamOptions = &dto.StreamOptions{IncludeUsage: true}
+		} else {
+			wire.StreamOptions = nil
+		}
+	}
 	converted, err := adaptor.ConvertRequest(c, info, selection.Conversion.Value)
 	if err != nil {
 		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "The request cannot be sent to this Channel")

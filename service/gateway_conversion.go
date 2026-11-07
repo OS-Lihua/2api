@@ -19,14 +19,8 @@ import (
 // GatewayProtocolFormat maps the four public text protocols independently of Provider type.
 func GatewayProtocolFormat(kind protocol.Type) (types.RelayFormat, error) {
 	switch kind {
-	case protocol.OpenAIChat:
-		return types.RelayFormatOpenAI, nil
-	case protocol.OpenAIResponses:
-		return types.RelayFormatOpenAIResponses, nil
-	case protocol.AnthropicMessages:
-		return types.RelayFormatClaude, nil
-	case protocol.GeminiGenerate:
-		return types.RelayFormatGemini, nil
+	case protocol.OpenAIChat, protocol.OpenAIResponses, protocol.AnthropicMessages, protocol.GeminiGenerate:
+		return kind.RelayFormat()
 	default:
 		return "", fmt.Errorf("unsupported text protocol")
 	}

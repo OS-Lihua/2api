@@ -154,26 +154,7 @@ func (p *WireProtocol) relayMode(info *relaycommon.RelayInfo) int {
 
 // ProtocolRelayFormat maps only the explicit public protocol enum.
 func ProtocolRelayFormat(kind protocol.Type) (types.RelayFormat, error) {
-	switch kind {
-	case protocol.OpenAIChat:
-		return types.RelayFormatOpenAI, nil
-	case protocol.OpenAIResponses:
-		return types.RelayFormatOpenAIResponses, nil
-	case protocol.AnthropicMessages:
-		return types.RelayFormatClaude, nil
-	case protocol.GeminiGenerate, protocol.GeminiEmbed:
-		return types.RelayFormatGemini, nil
-	case protocol.OpenAIEmbeddings:
-		return types.RelayFormatEmbedding, nil
-	case protocol.OpenAIImages:
-		return types.RelayFormatOpenAIImage, nil
-	case protocol.OpenAIAudioSpeech, protocol.OpenAIAudioTranscription:
-		return types.RelayFormatOpenAIAudio, nil
-	case protocol.Rerank:
-		return types.RelayFormatRerank, nil
-	default:
-		return "", fmt.Errorf("unsupported protocol %q", kind)
-	}
+	return kind.RelayFormat()
 }
 
 func protocolRelayMode(kind protocol.Type) int {

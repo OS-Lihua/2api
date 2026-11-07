@@ -727,6 +727,53 @@ func TestTextGatewayMissingUsageIgnoresOutputCeilings(t *testing.T) {
 	}
 }
 
+func TestTextGatewayNativeCustomToolStreamCountsBusinessOutput(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"custom1\",\"type\":\"custom_tool_call\",\"call_id\":\"call1\",\"name\":\"exec\",\"input\":\"\"}}\n\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"custom1\",\"output_index\":0,\"delta\":\"echo Hello\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n"))
+	})
+	require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "openai_responses").Error)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/responses", `{"model":"gateway-offering","input":"Hello","tools":[{"type":"custom","name":"exec"}],"max_output_tokens":16,"stream":true}`)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), "echo Hello")
+	requests, _, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	assert.Equal(t, "success", requests[0].Status)
+	assert.Equal(t, int64(36000), requests[0].Receivable.Nanos)
+}
+
+func TestTextGatewayGeminiPreservesRequestedChoiceCount(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		var sent map[string]any
+		require.NoError(t, common.DecodeJson(r.Body, &sent))
+		assert.EqualValues(t, 2, sent["generationConfig"].(map[string]any)["candidateCount"])
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"},{"index":1,"content":{"role":"model","parts":[{"text":"Hi"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}`))
+	})
+	require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "gemini_generate").Error)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"n":2}`)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	requests, _, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	assert.Equal(t, 2, requests[0].ChoiceCount)
+}
+
+func TestTextGatewayStreamRequestsUpstreamUsageOnConvertedCopy(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		var sent map[string]any
+		require.NoError(t, common.DecodeJson(r.Body, &sent))
+		options, ok := sent["stream_options"].(map[string]any)
+		require.True(t, ok, "upstream usage must be requested on the actual wire DTO")
+		assert.Equal(t, true, options["include_usage"])
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n"))
+	})
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stream":true}`)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+}
+
 func TestTextGatewayConvertedStreamPreservesUsagePresence(t *testing.T) {
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -1488,10 +1535,13 @@ func TestTextGatewayPartialUsageRetainsCacheDetails(t *testing.T) {
 func TestTextGatewayFreeFixedPricesAndFailureCosts(t *testing.T) {
 	for _, test := range []struct {
 		name, expression, body, status, source string
+		protocol                               string
 		upstreamStatus                         int
 		stream                                 bool
 		charge, cost                           int64
 	}{
+		{name: "Responses failed fixed request refunds", protocol: "openai_responses", expression: `tier("request",fixed(0.01))`, body: `{"id":"resp","object":"response","status":"failed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5}}`, status: "partial", source: "upstream", cost: 20000},
+		{name: "Responses incomplete fixed request refunds", protocol: "openai_responses", expression: `tier("request",fixed(0.01))`, body: `{"id":"resp","object":"response","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5}}`, status: "partial", source: "upstream", cost: 20000},
 		{name: "explicit free request", expression: `tier("request",fixed(0))`, body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, status: "success", source: "upstream", cost: 20000},
 		{name: "fixed successful request", expression: `tier("request",fixed(0.01))`, body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, status: "success", source: "upstream", charge: 9000000, cost: 20000},
 		{name: "fixed interrupted stream refunds", expression: `tier("request",fixed(0.01))`, stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n", status: "partial", source: "estimated", cost: 11000},
@@ -1514,6 +1564,9 @@ func TestTextGatewayFreeFixedPricesAndFailureCosts(t *testing.T) {
 				}
 				_, _ = w.Write([]byte(test.body))
 			})
+			if test.protocol != "" {
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", test.protocol).Error)
+			}
 			if test.expression != "" {
 				price := &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: test.expression, EffectiveAt: clock.Now().Unix()}
 				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
