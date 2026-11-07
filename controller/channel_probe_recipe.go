@@ -157,7 +157,7 @@ func channelProbeRecipeFor(ctx context.Context, record model.Channel, feature st
 		recipe.Format = types.RelayFormatEmbedding
 		recipe.Mode = relayconstant.RelayModeEmbeddings
 	case protocol.OpenAIImages:
-		if feature != "input_text" && feature != "output_image" && feature != "max_images" {
+		if feature != "input_text" && feature != "input_image" && feature != "output_image" && feature != "max_images" {
 			return recipe, common.NewMessage("Invalid parameters")
 		}
 		count := uint(1)
@@ -172,6 +172,13 @@ func channelProbeRecipeFor(ctx context.Context, record model.Channel, feature st
 		recipe.Request = &dto.ImageRequest{Model: record.UpstreamModelName, Prompt: "A small solid red square", N: &count, ResponseFormat: "b64_json"}
 		recipe.Format = types.RelayFormatOpenAIImage
 		recipe.Mode = relayconstant.RelayModeImagesGenerations
+		if feature == "input_image" {
+			imageRequest := recipe.Request.(*dto.ImageRequest)
+			imageRequest.Prompt = "Turn the supplied red square entirely blue. Return only the edited image."
+			imageRequest.Images, _ = common.Marshal([]map[string]string{{"image_url": "data:image/png;base64," + base64.StdEncoding.EncodeToString(probeRedImage)}})
+			recipe.ExpectedText = "blue"
+			recipe.Mode = relayconstant.RelayModeImagesEdits
+		}
 	case protocol.OpenAIAudioSpeech:
 		if feature != "input_text" && feature != "output_audio" && feature != "max_duration_seconds" {
 			return recipe, common.NewMessage("Invalid parameters")
@@ -256,7 +263,7 @@ func observeChannelProbe(recipe channelProbeRecipe, kind protocol.Type, feature 
 		}
 		count := int64(0)
 		for _, entry := range entries.Array() {
-			if validProbeImage(entry.Get("b64_json").String()) {
+			if validProbeImage(entry.Get("b64_json").String()) && (feature != "input_image" || probeImageColor(entry.Get("b64_json").String(), "blue")) {
 				count++
 			}
 		}
@@ -329,7 +336,18 @@ func observeChannelProbe(recipe channelProbeRecipe, kind protocol.Type, feature 
 				}
 			}
 		}
-		if !strings.EqualFold(strings.Trim(text, " .!\n\r"), recipe.ExpectedText) {
+		if feature == "max_images" {
+			colors := strings.Split(text, ",")
+			expected := strings.Split(recipe.ExpectedText, ",")
+			if len(colors) != len(expected) {
+				return false
+			}
+			for i := range expected {
+				if !strings.EqualFold(strings.TrimSpace(colors[i]), expected[i]) {
+					return false
+				}
+			}
+		} else if !strings.EqualFold(strings.Trim(text, " .!\n\r"), recipe.ExpectedText) {
 			return false
 		}
 		if feature == "context_length" {
@@ -372,6 +390,33 @@ func probeReportedTokenCount(value gjson.Result) (int64, bool) {
 	}
 	count := value.Int()
 	return count, value.Float() == float64(count)
+}
+
+// probeImageColor checks the requested edit or reference color in decoded pixels.
+func probeImageColor(encoded, color string) bool {
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return false
+	}
+	config, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil || config.Width < 1 || config.Height < 1 || config.Width > 2048 || config.Height > 2048 {
+		return false
+	}
+	decoded, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return false
+	}
+	matched, total := 0, 0
+	for y := decoded.Bounds().Min.Y; y < decoded.Bounds().Max.Y; y++ {
+		for x := decoded.Bounds().Min.X; x < decoded.Bounds().Max.X; x++ {
+			r, g, b, a := decoded.At(x, y).RGBA()
+			total++
+			if a > 0 && (color == "blue" && b > 2*r && b > 2*g || color == "red" && r > 2*g && r > 2*b) {
+				matched++
+			}
+		}
+	}
+	return matched*4 >= total*3
 }
 
 func validProbeImage(encoded string) bool {

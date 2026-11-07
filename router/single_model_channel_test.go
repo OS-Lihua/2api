@@ -1,6 +1,7 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -30,6 +31,7 @@ import (
 	"github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -51,6 +53,10 @@ func (configuredChannelPrice) HasPurchasePrice(context.Context, *gorm.DB, *model
 
 // Exercise the management boundary with actual PAT authentication and Casbin.
 func TestSingleModelChannelAPI(t *testing.T) {
+	service.InitHttpClient()
+	previousStreamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 10
+	t.Cleanup(func() { constant.StreamingTimeout = previousStreamingTimeout })
 	model.SetChannelPurchasePriceChecker(nil)
 	t.Cleanup(func() { model.SetChannelPurchasePriceChecker(nil) })
 	previousMaster, previousRedis := common.IsMasterNode, common.RedisEnabled
@@ -216,6 +222,8 @@ func TestSingleModelChannelAPI(t *testing.T) {
 	t.Run("each capability requires evidence and safe upstream failures remain private", func(t *testing.T) {
 		imageFixture, err := os.ReadFile("../controller/probe-fixtures/red.png")
 		require.NoError(t, err)
+		blueFixture, err := os.ReadFile("../controller/probe-fixtures/blue.png")
+		require.NoError(t, err)
 		audioFixture, err := os.ReadFile("../controller/probe-fixtures/seven.wav")
 		require.NoError(t, err)
 		cases := []struct {
@@ -241,6 +249,8 @@ func TestSingleModelChannelAPI(t *testing.T) {
 			{"video input", "openai_chat", "input_video", "application/json", `{"choices":[{"message":{"content":"red"}}]}`, "passed", 200},
 			{"PDF input", "openai_chat", "input_pdf", "application/json", `{"choices":[{"message":{"content":"GWP4831"}}]}`, "passed", 200},
 			{"text output", "openai_chat", "output_text", "application/json", `{"choices":[{"message":{"content":"ok"}}]}`, "passed", 200},
+			{"image edit", "openai_images", "input_image", "application/json", fmt.Sprintf(`{"data":[{"b64_json":%q}]}`, base64.StdEncoding.EncodeToString(blueFixture)), "passed", 200},
+			{"image edit ignored", "openai_images", "input_image", "application/json", fmt.Sprintf(`{"data":[{"b64_json":%q}]}`, base64.StdEncoding.EncodeToString(imageFixture)), "inconclusive", 200},
 			{"image output", "openai_images", "output_image", "application/json", fmt.Sprintf(`{"data":[{"b64_json":%q}]}`, base64.StdEncoding.EncodeToString(imageFixture)), "passed", 200},
 			{"image response without payload", "openai_images", "output_image", "application/json", `{"data":[{"revised_prompt":"red"}]}`, "inconclusive", 200},
 			{"audio output", "openai_audio_speech", "output_audio", "audio/wav", string(audioFixture), "passed", 200},
@@ -310,22 +320,41 @@ func TestSingleModelChannelAPI(t *testing.T) {
 		defer func() { jsplugin.DefaultRegistry = previousRegistry }()
 		source := `export const meta={apiVersion:1,key:"probe",name:"Probe",version:"1.0.0",author:{name:"Test"},models:["task-probe-upstream"],fetchMode:"per_task",protocols:[{name:"openai_video"},{name:"openai_responses",supports:["stream","sync"]}]};
 export const protocols={openai_responses:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,requestBody:ctx.body.value}},renderFinal(){return {output:[{type:"message",role:"assistant",content:[{type:"output_text",text:"red"}]}]}},renderEvents(){return {events:[{type:"output",data:"streamed"}],done:true}}},openai_video:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,requestBody:ctx.body.value}},render(ctx,task){return {id:task.task_id,status:"completed"}}}};
-export function buildSubmitRequest(ctx){const body={model:ctx.upstreamModel,prompt:ctx.requestBody.prompt,seconds:4};if(ctx.requestBody.max_output_tokens!==undefined)body.max_output_tokens=ctx.requestBody.max_output_tokens;return {url:ctx.baseUrl+"/submit",method:"POST",headers:{Authorization:"Bearer "+ctx.apiKey},body:body}}
+export function buildSubmitRequest(ctx){const body={model:ctx.upstreamModel,prompt:ctx.requestBody.prompt,seconds:4};if(ctx.requestBody.max_output_tokens!==undefined)body.max_output_tokens=ctx.requestBody.max_output_tokens;if(ctx.requestBody.images!==undefined)body.images=ctx.requestBody.images;if(ctx.requestBody.input_reference!==undefined)body.input_reference=ctx.requestBody.input_reference;return {url:ctx.baseUrl+"/submit",method:"POST",headers:{Authorization:"Bearer "+ctx.apiKey},body:body}}
 export function parseSubmitResponse(ctx,r){return {taskId:r.body.id,taskData:r.body}}
 export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/poll/"+ctx.taskId,headers:{Authorization:"Bearer "+ctx.apiKey}}}
 export function parseTaskResult(ctx,body){return {status:body.status,taskId:body.id,progress:"100%"}}
 export function listArtifacts(task){return task.status==="SUCCESS"?[{key:"video",type:"video",mimeType:"video/mp4"}]:[]}
-export function buildContentRequest(ctx){return {url:ctx.baseUrl+"/content/"+ctx.upstreamTaskId,headers:{Authorization:"Bearer "+ctx.apiKey}}}`
+export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {url:ctx.data.cdn_url,credentialless:true};return {url:ctx.baseUrl+"/content/"+ctx.upstreamTaskId,headers:{Authorization:"Bearer "+ctx.apiKey}}}`
 		_, err := jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "probe"})
+		require.NoError(t, err)
+		referenceSource := strings.Replace(source, `key:"probe"`, `key:"probe-reference"`, 1)
+		referenceSource = strings.Replace(referenceSource, `protocols:[{name:"openai_video"},{name:"openai_responses",supports:["stream","sync"]}]`, `protocols:["openai_video"]`, 1)
+		referenceSource = strings.Replace(referenceSource, strings.Split(source, "\n")[1], `export const protocols={openai_video:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,requestBody:ctx.body.value}},render(ctx,task){return {id:task.task_id,status:"completed"}}}};`, 1)
+		_, err = jsplugin.DefaultRegistry.RegisterFactory(referenceSource, jsplugin.Options{Key: "probe-reference"})
+		require.NoError(t, err)
+		imageSource := strings.Replace(source, `key:"probe"`, `key:"probe-edit"`, 1)
+		imageSource = strings.Replace(imageSource, `protocols:[{name:"openai_video"},{name:"openai_responses",supports:["stream","sync"]}]`, `protocols:["openai_image"]`, 1)
+		imageSource = strings.Replace(imageSource, strings.Split(source, "\n")[1], `export const protocols={openai_image:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,requestBody:ctx.body.value}},render(){return {data:[]}}}};`, 1)
+		imageSource = strings.Replace(imageSource, `type:"video",mimeType:"video/mp4"`, `type:"image",mimeType:"image/png"`, 1)
+		_, err = jsplugin.DefaultRegistry.RegisterFactory(imageSource, jsplugin.Options{Key: "probe-edit"})
 		require.NoError(t, err)
 		video, err := os.ReadFile("../controller/probe-fixtures/red.mp4")
 		require.NoError(t, err)
+		imageArtifact := false
+		blueImage, err := os.ReadFile("../controller/probe-fixtures/blue.png")
+		require.NoError(t, err)
 		validMedia := true
+		var cdnURL string
 		var cancelProbe context.CancelFunc
 		counts := map[string]int{}
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			counts[r.URL.Path]++
-			assert.Equal(t, "Bearer secret", r.Header.Get("Authorization"))
+			if strings.HasPrefix(r.URL.Path, "/cdn/") {
+				assert.Empty(t, r.Header.Get("Authorization"))
+			} else {
+				assert.Equal(t, "Bearer secret", r.Header.Get("Authorization"))
+			}
 			switch r.URL.Path {
 			case "/submit":
 				var sent map[string]any
@@ -339,11 +368,15 @@ export function buildContentRequest(ctx){return {url:ctx.baseUrl+"/content/"+ctx
 					<-r.Context().Done()
 					return
 				}
-				_, _ = w.Write([]byte(`{"id":"private-task-123","status":"SUCCESS","private_marker":"do-not-store-task-response"}`))
-			case "/content/private-task-123":
+				_, _ = fmt.Fprintf(w, `{"id":"private-task-123","status":"SUCCESS","private_marker":"do-not-store-task-response","cdn_url":%q}`, cdnURL)
+			case "/content/private-task-123", "/cdn/private-task-123":
 				if validMedia {
 					w.Header().Set("Content-Type", "video/mp4")
-					_, _ = w.Write(video)
+					if imageArtifact {
+						_, _ = w.Write(blueImage)
+					} else {
+						_, _ = w.Write(video)
+					}
 				} else {
 					_, _ = w.Write([]byte(`{"not":"a video"}`))
 				}
@@ -381,6 +414,29 @@ export function buildContentRequest(ctx){return {url:ctx.baseUrl+"/content/"+ctx
 			}
 			assert.Equal(t, expected, result["data"].(map[string]any)["status"], result)
 		}
+		fetchSetting := system_setting.GetFetchSetting()
+		previousFetch := *fetchSetting
+		fetchSetting.EnableSSRFProtection = true
+		fetchSetting.AllowPrivateIp = true
+		fetchSetting.AllowedPorts = []string{"1-65535"}
+		t.Cleanup(func() { *fetchSetting = previousFetch })
+		cdnURL = strings.Replace(upstream.URL, "127.0.0.1", "localhost", 1) + "/cdn/private-task-123"
+		status, cdnResult := call(http.MethodPost, channelPath+"/probes", `{"capability":"output_video"}`)
+		require.Equal(t, http.StatusOK, status, cdnResult)
+		assert.Equal(t, "passed", cdnResult["data"].(map[string]any)["status"], cdnResult)
+		cdnURL = ""
+		status, editCreated := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":"task:probe-edit","upstream_model_name":"task-probe-upstream"}`, provider.Id, unified.Id))
+		require.Equal(t, http.StatusOK, status, editCreated)
+		imageArtifact = true
+		status, editResult := call(http.MethodPost, fmt.Sprintf("/api/admin/v1/channels/%v/probes", editCreated["data"].(map[string]any)["id"]), `{"capability":"input_image"}`)
+		require.Equal(t, http.StatusOK, status, editResult)
+		assert.Equal(t, "passed", editResult["data"].(map[string]any)["status"], editResult)
+		imageArtifact = false
+		status, referenceCreated := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":"task:probe-reference","upstream_model_name":"task-probe-upstream"}`, provider.Id, unified.Id))
+		require.Equal(t, http.StatusOK, status, referenceCreated)
+		status, referenceResult := call(http.MethodPost, fmt.Sprintf("/api/admin/v1/channels/%v/probes", referenceCreated["data"].(map[string]any)["id"]), `{"capability":"input_image"}`)
+		require.Equal(t, http.StatusOK, status, referenceResult)
+		assert.Equal(t, "passed", referenceResult["data"].(map[string]any)["status"], referenceResult)
 		beforeBudgetCheck := counts["/submit"]
 		for _, override := range []string{`{"parameters":{"durationSeconds":600}}`, `{"parameters":{"numberOfVideos":20}}`, `{"operations":[{"path":"parameters.durationSeconds","mode":"set","value":600}]}`} {
 			require.NoError(t, db.Model(&provider).Update("param_override", override).Error)
@@ -568,11 +624,11 @@ export function buildContentRequest(ctx){return {url:ctx.baseUrl+"/content/"+ctx
 		status, created := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":"openai_chat","upstream_model_name":"two-image-probe"}`, provider.Id, parent.Id))
 		require.Equal(t, http.StatusOK, status, created)
 		probePath := fmt.Sprintf("/api/admin/v1/channels/%v/probes", created["data"].(map[string]any)["id"])
-		for _, expected := range []string{"inconclusive", "passed"} {
+		for _, expected := range []string{"inconclusive", "passed", "passed"} {
 			status, result := call(http.MethodPost, probePath, `{"capability":"max_images"}`)
 			require.Equal(t, http.StatusOK, status, result)
 			assert.Equal(t, expected, result["data"].(map[string]any)["status"], result)
-			reply = "red,blue"
+			reply = "red, blue"
 		}
 	})
 	t.Run("Provider response repairs run before capability inspection", func(t *testing.T) {
@@ -587,6 +643,56 @@ export function buildContentRequest(ctx){return {url:ctx.baseUrl+"/content/"+ctx
 		status, result := call(http.MethodPost, fmt.Sprintf("/api/admin/v1/channels/%v/probes", created["data"].(map[string]any)["id"]), `{"capability":"input_text"}`)
 		require.Equal(t, http.StatusOK, status, result)
 		assert.Equal(t, "passed", result["data"].(map[string]any)["status"], result)
+	})
+	t.Run("native Ollama responses use the production protocol conversion", func(t *testing.T) {
+		var diagnostics bytes.Buffer
+		previousDebug := common.DebugEnabled
+		common.DebugEnabled = true
+		common.LogWriterMu.Lock()
+		previousWriter, previousErrorWriter := gin.DefaultWriter, gin.DefaultErrorWriter
+		gin.DefaultWriter, gin.DefaultErrorWriter = &diagnostics, &diagnostics
+		common.LogWriterMu.Unlock()
+		t.Cleanup(func() {
+			common.DebugEnabled = previousDebug
+			common.LogWriterMu.Lock()
+			gin.DefaultWriter, gin.DefaultErrorWriter = previousWriter, previousErrorWriter
+			common.LogWriterMu.Unlock()
+		})
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body map[string]any
+			require.NoError(t, common.DecodeJson(r.Body, &body))
+			switch r.URL.Path {
+			case "/api/chat":
+				if body["stream"] == true {
+					w.Header().Set("Content-Type", "application/x-ndjson")
+					_, _ = w.Write([]byte("{\"model\":\"ollama-probe\",\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"done\":false}\n{\"model\":\"ollama-probe\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"prompt_eval_count\":1,\"eval_count\":1}\n"))
+				} else {
+					_, _ = w.Write([]byte(`{"model":"ollama-probe","message":{"role":"assistant","content":"ok"},"done":true,"prompt_eval_count":1,"eval_count":1,"private_marker":"do-not-log-native-response"}`))
+				}
+			case "/api/embed":
+				_, _ = w.Write([]byte(`{"embeddings":[[0.2,0.4]],"prompt_eval_count":1}`))
+			default:
+				t.Errorf("unexpected native Ollama path %s", r.URL.Path)
+			}
+		}))
+		defer upstream.Close()
+		account := model.Provider{Name: "Native probe Provider", Type: constant.ChannelTypeOllama, Key: "secret", BaseURL: common.GetPointer(upstream.URL), Status: common.ChannelStatusEnabled}
+		require.NoError(t, db.Create(&account).Error)
+		for _, kind := range []string{"openai_chat", "openai_embeddings"} {
+			status, created := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":%q,"upstream_model_name":"ollama-probe"}`, account.Id, unified.Id, kind))
+			require.Equal(t, http.StatusOK, status, created)
+			probePath := fmt.Sprintf("/api/admin/v1/channels/%v/probes", created["data"].(map[string]any)["id"])
+			features := []string{"input_text"}
+			if kind == "openai_chat" {
+				features = append(features, "streaming")
+			}
+			for _, feature := range features {
+				status, result := call(http.MethodPost, probePath, fmt.Sprintf(`{"capability":%q}`, feature))
+				require.Equal(t, http.StatusOK, status, result)
+				assert.Equal(t, "passed", result["data"].(map[string]any)["status"], result)
+			}
+		}
+		assert.NotContains(t, diagnostics.String(), "do-not-log-native-response")
 	})
 	t.Run("capability narrowing and model edits stay consistent", func(t *testing.T) {
 		unified.Capabilities = capability.Set{Features: []capability.Feature{capability.Streaming, capability.ToolCalling}, InputModalities: []capability.Modality{capability.Text, capability.Image}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{ContextLength: common.GetPointer(int64(32000)), MaxOutputTokens: common.GetPointer(int64(4096)), MaxImages: common.GetPointer(int64(8)), MaxDurationSeconds: common.GetPointer(int64(60)), EmbeddingDimensions: common.GetPointer(int64(3072))}}

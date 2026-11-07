@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay"
@@ -80,7 +81,9 @@ func probeChannel(ctx context.Context, record model.Channel, provider *model.Pro
 	}
 	cleanRequest.Header.Set("Content-Type", recipe.ContentType)
 	cleanRequest.Body = io.NopCloser(bytes.NewReader(recipe.Body))
-	c := &gin.Context{Request: cleanRequest, Writer: &probeResponseWriter{header: make(http.Header)}}
+	writer := &probeResponseWriter{header: make(http.Header)}
+	c := &gin.Context{Request: cleanRequest, Writer: writer}
+	logger.SuppressPayloadLogs(c)
 	converted, err := adaptor.ConvertRequest(c, info, recipe.Request)
 	if err != nil {
 		return "inconclusive", "request_not_representable"
@@ -145,6 +148,8 @@ func probeChannel(ctx context.Context, record model.Channel, provider *model.Pro
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
 			return "failed", "upstream_rejected"
 		}
+		replay := *response
+		replay.Body = io.NopCloser(bytes.NewReader(body))
 		bounded := *response
 		bounded.Body = io.NopCloser(bytes.NewReader(body))
 		repaired, repairErr := adaptor.FixResponse(c, info, &bounded)
@@ -163,13 +168,37 @@ func probeChannel(ctx context.Context, record model.Channel, provider *model.Pro
 		if attempt+1 < attempts {
 			continue
 		}
-		if feature == "streaming" {
-			return observeProbeStream(record.Protocol, response.Header.Get("Content-Type"), body)
-		}
-		if record.Protocol != protocol.OpenAIAudioSpeech && !gjson.ValidBytes(body) {
+		writer.body.Reset()
+		_, parseErr := adaptor.DoResponse(c, &replay, info)
+		if parseErr != nil {
 			return "failed", "response_invalid"
 		}
-		if observeChannelProbe(recipe, record.Protocol, feature, body) {
+		if writer.overflow {
+			return "failed", "response_too_large"
+		}
+		normalizedKind := record.Protocol
+		switch recipe.Format {
+		case types.RelayFormatOpenAI:
+			normalizedKind = protocol.OpenAIChat
+		case types.RelayFormatEmbedding:
+			normalizedKind = protocol.OpenAIEmbeddings
+		}
+		if feature == "streaming" {
+			if info.StreamStatus != nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonEOF {
+				status, _ := observeProbeStream(record.Protocol, response.Header.Get("Content-Type"), body)
+				if status != "passed" {
+					return "inconclusive", "behavior_not_observed"
+				}
+			}
+			return observeProbeStream(normalizedKind, writer.Header().Get("Content-Type"), writer.body.Bytes())
+		}
+		observed := observeChannelProbe(recipe, normalizedKind, feature, writer.body.Bytes())
+		// Usage evidence must come from the bounded upstream response, never
+		// from a protocol handler's fallback token estimates.
+		if feature == "caching" || feature == "reasoning" || feature == "context_length" || feature == "max_output_tokens" {
+			observed = observeChannelProbe(recipe, record.Protocol, feature, body)
+		}
+		if observed {
 			if recipe.SampledLimit {
 				return "inconclusive", "limit_sample_only"
 			}

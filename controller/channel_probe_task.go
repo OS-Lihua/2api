@@ -164,7 +164,7 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 			return "failed", "request_invalid"
 		}
 	case "openai_image":
-		if result.Capability != "input_text" && result.Capability != "output_image" && result.Capability != "max_images" {
+		if result.Capability != "input_text" && result.Capability != "input_image" && result.Capability != "output_image" && result.Capability != "max_images" {
 			return "inconclusive", "request_not_representable"
 		}
 		recipeRecord := record
@@ -180,6 +180,9 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 			return "failed", "request_invalid"
 		}
 		operation = "generate"
+		if result.Capability == "input_image" {
+			operation = "edit"
+		}
 	case "openai_video":
 		switch result.Capability {
 		case "input_text", "output_video":
@@ -408,6 +411,15 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 		} else if wire == "openai_image" {
 			wanted = "image"
 		}
+	case "input_image":
+		// The final request already proved that the reference bytes survived
+		// plugin decoding and overrides. Native video returns media rather
+		// than a text answer; image edits must demonstrate the requested color.
+		if wire == "openai_video" {
+			wanted = "video"
+		} else if wire == "openai_image" {
+			wanted = "image"
+		}
 	case "max_duration_seconds":
 		wanted = "timed_media"
 	case "output_image", "max_images":
@@ -433,7 +445,7 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 		if err != nil || descriptor == nil {
 			continue
 		}
-		if !strings.HasPrefix(descriptor.URL, "data:") && pluginruntime.ValidateRequestURL(descriptor.URL, info.ChannelBaseUrl, plugin.Meta.AllowedHosts) != nil {
+		if !descriptor.Credentialless && !strings.HasPrefix(descriptor.URL, "data:") && pluginruntime.ValidateRequestURL(descriptor.URL, info.ChannelBaseUrl, plugin.Meta.AllowedHosts) != nil {
 			continue
 		}
 		payload, err := fetchProbeArtifact(ctx, provider, descriptor)
@@ -450,7 +462,8 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 			seconds, validVideo := probeVideoSeconds(payload)
 			valid = validVideo && (result.Capability != "max_duration_seconds" || seconds >= recipe.TestedValue)
 		case "image":
-			valid = validProbeImage(base64.StdEncoding.EncodeToString(payload))
+			encodedImage := base64.StdEncoding.EncodeToString(payload)
+			valid = validProbeImage(encodedImage) && (result.Capability != "input_image" || probeImageColor(encodedImage, "blue"))
 		case "audio":
 			seconds, audioValid := probeAudioSeconds(ctx, payload, artifact.MimeType)
 			valid = audioValid && (result.Capability != "max_duration_seconds" || seconds >= recipe.TestedValue)
@@ -573,6 +586,17 @@ func fetchProbeArtifact(ctx context.Context, provider *model.Provider, descripto
 	setting := provider.GetSetting()
 	client, err := service.GetHttpClientWithProxySettings(setting.Proxy, setting)
 	if err != nil {
+		return nil, errors.New("probe transport failed")
+	}
+	if descriptor.Credentialless {
+		if (descriptor.Method != http.MethodGet && descriptor.Method != http.MethodHead) || descriptor.Body != nil || len(descriptor.Headers) != 0 || validateTaskMediaURL(descriptor.URL, setting.Proxy) != nil {
+			return nil, errors.New("invalid probe artifact")
+		}
+		if setting.Proxy == "" {
+			client = service.GetSSRFProtectedHTTPClient()
+		}
+	}
+	if client == nil {
 		return nil, errors.New("probe transport failed")
 	}
 	isolated := *client
