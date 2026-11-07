@@ -3,12 +3,15 @@ package router
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"encoding/base64"
 	"fmt"
 	"image"
 	"image/png"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -27,6 +30,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay"
+	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -598,47 +602,63 @@ func TestTextGatewayCozeMetadataCompletionDoesNotEndFallbackStream(t *testing.T)
 func TestTextGatewayCozeRejectionsPreserveStatusAndProviderScope(t *testing.T) {
 	for _, stage := range []string{"create", "poll"} {
 		for _, status := range []int{400, 401, 403} {
-			t.Run(fmt.Sprint(stage, "/", status), func(t *testing.T) {
-				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
-					w.Header().Set("Content-Type", "application/json")
-					if stage == "poll" && r.Method == http.MethodPost {
-						_, _ = w.Write([]byte(`{"code":0,"data":{"id":"chat","conversation_id":"conversation"}}`))
-						return
-					}
-					w.WriteHeader(status)
-					_, _ = fmt.Fprintf(w, `{"code":%d,"msg":"Bearer private-coze-secret"}`, status)
-				})
-				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeCoze).Error)
-				sibling := *fixture.channel
-				sibling.ID, sibling.UpstreamModelName = 0, "same-account-next"
-				require.NoError(t, model.DB.Create(&sibling).Error)
-				price := *fixture.purchase
-				price.ID, price.OwnerID = 0, sibling.ID
-				require.NoError(t, model.CreatePriceVersion(t.Context(), &price, fixture.sale.CreatedBy))
-				recovered := 0
-				addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
-					recovered++
-					w.Header().Set("Content-Type", "application/json")
-					_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
-				})
-				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","user":"preview-user","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
-				attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
-				require.NoError(t, err)
-				if status == 400 {
-					require.EqualValues(t, 1, total)
-					assert.Zero(t, recovered)
-					assert.Equal(t, "invalid_request", attempts[0].ErrorClass)
-				} else {
-					require.EqualValues(t, 2, total)
-					assert.Equal(t, 1, recovered)
-					for _, a := range attempts {
-						if a.ChannelID == fixture.channel.ID {
-							assert.Equal(t, "credentials", a.ErrorClass)
+			for _, format := range []string{"json", "text", "truncated"} {
+				t.Run(fmt.Sprint(stage, "/", status, "/", format), func(t *testing.T) {
+					fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+						w.Header().Set("Content-Type", "application/json")
+						if stage == "poll" && r.Method == http.MethodPost {
+							_, _ = w.Write([]byte(`{"code":0,"data":{"id":"chat","conversation_id":"conversation"}}`))
+							return
+						}
+						if format == "truncated" {
+							w.Header().Set("Content-Length", "100")
+						}
+						w.WriteHeader(status)
+						if format != "json" {
+							_, _ = w.Write([]byte("private-coze-secret"))
+							if format == "truncated" {
+								w.(http.Flusher).Flush()
+								conn, _, err := w.(http.Hijacker).Hijack()
+								if assert.NoError(t, err) {
+									_ = conn.Close()
+								}
+							}
+							return
+						}
+						_, _ = fmt.Fprintf(w, `{"code":%d,"msg":"Bearer private-coze-secret"}`, status)
+					})
+					require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeCoze).Error)
+					sibling := *fixture.channel
+					sibling.ID, sibling.UpstreamModelName = 0, "same-account-next"
+					require.NoError(t, model.DB.Create(&sibling).Error)
+					price := *fixture.purchase
+					price.ID, price.OwnerID = 0, sibling.ID
+					require.NoError(t, model.CreatePriceVersion(t.Context(), &price, fixture.sale.CreatedBy))
+					recovered := 0
+					addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+						recovered++
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+					})
+					response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","user":"preview-user","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+					attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+					require.NoError(t, err)
+					if status == 400 {
+						require.EqualValues(t, 1, total)
+						assert.Zero(t, recovered)
+						assert.Equal(t, "invalid_request", attempts[0].ErrorClass)
+					} else {
+						require.EqualValues(t, 2, total)
+						assert.Equal(t, 1, recovered)
+						for _, a := range attempts {
+							if a.ChannelID == fixture.channel.ID {
+								assert.Equal(t, "credentials", a.ErrorClass)
+							}
 						}
 					}
-				}
-				assert.NotContains(t, response.Body.String(), "private-coze-secret")
-			})
+					assert.NotContains(t, response.Body.String(), "private-coze-secret")
+				})
+			}
 		}
 	}
 }
@@ -796,6 +816,51 @@ func TestTextGatewayBaiduTokenExpiryAndRejectionControls(t *testing.T) {
 			assert.NotContains(t, response.Body.String(), "fake+token/=")
 		})
 	}
+}
+
+// HTTP test leaves explicitly opt into the credential transport contract.
+func (transport channelProbeRoundTripper) CloneWithVerifiedTLS() http.RoundTripper { return transport }
+
+func TestBaiduTokenPreparationRejectsUntrustedTLS(t *testing.T) {
+	t.Setenv("TLS_INSECURE_SKIP_VERIFY", "true")
+	requests := 0
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		_, _ = w.Write([]byte(`{"access_token":"fake-token","expires_in":7200}`))
+	}))
+	defer server.Close()
+	client := service.GetHttpClient()
+	if client == nil {
+		service.InitHttpClient()
+		client = service.GetHttpClient()
+	}
+	original := client.Transport
+	t.Cleanup(func() { client.Transport = original })
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
+	}
+	defer transport.CloseIdleConnections()
+	client.Transport = transport
+	provider := relay.GetProviderAdapter(constant.APITypeBaidu)
+	preparer, ok := provider.(channel.ProviderAccountPreparer)
+	require.True(t, ok)
+	err := preparer.PrepareAccount(t.Context(), &channel.ProviderRequest{ApiKey: strings.Join([]string{"budget37-tls-verification", "fake"}, "|")}, func() (context.Context, error) { return t.Context(), nil })
+	require.Error(t, err)
+	var invalid x509.UnknownAuthorityError
+	assert.ErrorAs(t, err, &invalid)
+	assert.Zero(t, requests, "credentials must not reach an untrusted TLS endpoint")
+	assert.True(t, transport.TLSClientConfig.InsecureSkipVerify, "verification must not mutate the shared relay transport")
+	transport.TLSClientConfig.RootCAs = x509.NewCertPool()
+	transport.TLSClientConfig.RootCAs.AddCert(server.Certificate())
+	verified, err := service.GetVerifiedHttpClientWithProxy("")
+	require.NoError(t, err)
+	defer verified.CloseIdleConnections()
+	response, err := verified.Get(server.URL)
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	assert.Equal(t, 1, requests, "a trusted certificate remains usable")
 }
 
 func TestTextGatewayFailoverCannotExceedFrozenReservation(t *testing.T) {
@@ -2867,6 +2932,7 @@ func TestTextGatewayFreeFixedPricesAndFailureCosts(t *testing.T) {
 		{name: "fixed interrupted stream refunds", expression: `tier("request",fixed(0.01))`, stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n", status: "partial", source: "estimated", cost: 11000},
 		{name: "fixed safety stream refunds", expression: `tier("request",fixed(0.01))`, stream: true, body: "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n", status: "partial", source: "upstream", errorClass: "content_safety", cost: 20000},
 		{name: "fixed safety JSON refunds", expression: `tier("request",fixed(0.01))`, body: `{"choices":[{"message":{"content":"Hello"},"finish_reason":"content_filter"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, status: "partial", source: "upstream", errorClass: "content_safety", cost: 20000},
+		{name: "fixed native interrupted stream refunds", provider: constant.ChannelTypeCohere, expression: `tier("request",fixed(0.01))`, stream: true, body: "{\"event_type\":\"text-generation\",\"text\":\"Hello\"}\n", status: "partial", source: "estimated", errorClass: "stream_interrupted", cost: 11000},
 		{name: "fixed native safety JSON refunds", provider: constant.ChannelTypeCohere, expression: `tier("request",fixed(0.01))`, body: `{"text":"Hello","finish_reason":"ERROR_TOXIC","meta":{"billed_units":{"input_tokens":10,"output_tokens":5}}}`, status: "partial", source: "upstream", errorClass: "content_safety", cost: 20000},
 		{name: "fixed native safety stream refunds", provider: constant.ChannelTypeCohere, expression: `tier("request",fixed(0.01))`, stream: true, body: "{\"event_type\":\"text-generation\",\"text\":\"Hello\"}\n{\"is_finished\":true,\"finish_reason\":\"ERROR_TOXIC\",\"response\":{\"meta\":{\"billed_units\":{\"input_tokens\":10,\"output_tokens\":5}}}}\n", status: "partial", source: "upstream", errorClass: "content_safety", cost: 20000},
 		{name: "fixed Tencent safety stream refunds", provider: constant.ChannelTypeTencent, expression: `tier("request",fixed(0.01))`, stream: true, body: "data: {\"Choices\":[{\"Delta\":{\"Content\":\"Hello\"}}]}\n\ndata: {\"Choices\":[{\"Delta\":{},\"FinishReason\":\"content_filter\"}],\"Usage\":{\"PromptTokens\":10,\"CompletionTokens\":5,\"TotalTokens\":15}}\n\n", status: "partial", source: "upstream", errorClass: "content_safety", cost: 20000},

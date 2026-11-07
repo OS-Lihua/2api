@@ -27,12 +27,11 @@ func (p *Provider) PrepareAccount(ctx context.Context, metadata channel.Provider
 			return nil
 		}
 	}
-	settings := account.ChannelSetting.HTTPSettings()
-	settings.TLSInsecureSkipVerify = false
-	client, err := service.GetHttpClientWithProxySettings(account.ChannelSetting.Proxy, settings)
+	client, err := service.GetVerifiedHttpClientWithProxy(account.ChannelSetting.Proxy)
 	if err != nil {
 		return err
 	}
+	defer client.CloseIdleConnections()
 	if begin != nil {
 		ctx, err = begin()
 		if err != nil {

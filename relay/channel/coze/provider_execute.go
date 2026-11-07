@@ -58,13 +58,13 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 	var created CozeChatResponse
 	createdBody, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	response.Body.Close()
-	if readErr != nil {
-		return nil, readErr
-	}
 	err = common.Unmarshal(createdBody, &created)
 	if response.StatusCode >= 400 {
 		response.Body = &cozeResultBody{ReadCloser: io.NopCloser(bytes.NewReader(createdBody)), completion: created, completionBody: createdBody}
 		return response, nil
+	}
+	if readErr != nil {
+		return nil, readErr
 	}
 	if err != nil {
 		return nil, err
@@ -90,12 +90,7 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 		var completion CozeChatResponse
 		completionBody, err := io.ReadAll(response.Body)
 		response.Body.Close()
-		if err != nil {
-			return nil, err
-		}
-		if err := common.Unmarshal(completionBody, &completion); err != nil {
-			return nil, err
-		}
+		decodeErr := common.Unmarshal(completionBody, &completion)
 		if facts, _ := common.GetContextKey(c, constant.ContextKeyResponseFacts); facts != nil &&
 			(response.StatusCode >= 400 || completion.Code != 0 || completion.Data.Status == "failed" || completion.Data.Status == "canceled" || completion.Data.Status == "requires_action") {
 			if response.StatusCode < 400 {
@@ -103,6 +98,12 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 			}
 			response.Body = &cozeResultBody{ReadCloser: io.NopCloser(bytes.NewReader(completionBody)), completion: completion, completionBody: completionBody}
 			return response, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if decodeErr != nil {
+			return nil, decodeErr
 		}
 		if completion.Code != 0 {
 			return nil, fmt.Errorf("Coze chat polling failed: %s", completion.Msg)

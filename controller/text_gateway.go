@@ -195,7 +195,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		info.RequestId = run.record.ID
 	}
 	info.TokenizerModel = selection.Channel.Model.ModelName
-	info.ResponseFacts = &relaycommon.ResponseFacts{OnBusinessOutput: budget.Delivered, CanFinishStream: info.StreamStatus.CompletedNormally}
+	info.ResponseFacts = &relaycommon.ResponseFacts{OnBusinessOutput: budget.Delivered, CanFinishStream: func() bool { return info.StreamStatus.CompletedNormally() }}
 	info.BeginProviderCall = budget.Start
 	common.SetContextKey(c, constant.ContextKeyResponseFacts, info.ResponseFacts)
 	info.InitChannelMeta(c)
