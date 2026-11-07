@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { api } from '@/lib/api'
+import { requireServerSuccess } from '@/lib/server-error-message'
 
 import type {
   GetModelsParams,
@@ -166,6 +167,24 @@ export async function getVendors(params?: {
     params: params || { page_size: 1000 },
   })
   return res.data
+}
+
+// Load every existing Publisher for selectors; the management API caps each
+// page at 100 even when the caller requests more.
+export async function getAllPublishers(): Promise<Vendor[]> {
+  const publishers: Vendor[] = []
+  for (let page = 1; ; page++) {
+    const response = requireServerSuccess(
+      await getVendors({ p: page, page_size: 100 })
+    )
+    const items = response.data?.items ?? []
+    publishers.push(...items)
+    if (
+      items.length === 0 ||
+      publishers.length >= (response.data?.total ?? items.length)
+    )
+      {return publishers}
+  }
 }
 
 /**

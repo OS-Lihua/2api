@@ -36,7 +36,7 @@ func newAdminTestServer(t *testing.T) (*gin.Engine, *model.User, string) {
 	require.NoError(t, authz.Init(db))
 	user := &model.User{Username: "security-admin", Password: "unused", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "security"}
 	require.NoError(t, db.Create(user).Error)
-	token := createWalletTestAccessToken(t, user.Id, "model:read", "model:write", "channel:read", "channel:write", "channel:sensitive_write", "channel:operate", "ledger:read", "ledger:write")
+	token := createWalletTestAccessToken(t, user.Id, "model:read", "model:write", "channel:read", "channel:write", "channel:sensitive_write", "channel:operate", "ledger:read", "ledger:write", "recommendation:read", "recommendation:write")
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
 	SetApiRouter(engine)
@@ -238,9 +238,14 @@ func TestAdminAPIEveryRouteRejectsInvalidAuthority(t *testing.T) {
 	require.NoError(t, err)
 	// Denials apply to every existing resource, and to browser session access
 	// tokens as well as scoped PATs. Fixtures never reach business handlers.
-	require.NoError(t, authz.SetUserPermissions(admin.Id, authz.PermissionsMap{
-		"model": {"read": false, "write": false}, "channel": {"read": false, "write": false, "operate": false, "sensitive_write": false}, "ledger": {"read": false, "write": false},
-	}))
+	denials := authz.PermissionsMap{}
+	for _, permission := range authz.AllPermissions() {
+		if denials[permission.Resource] == nil {
+			denials[permission.Resource] = map[string]bool{}
+		}
+		denials[permission.Resource][permission.Action] = false
+	}
+	require.NoError(t, authz.SetUserPermissions(admin.Id, denials))
 	cases := []struct {
 		name, token string
 		status      int

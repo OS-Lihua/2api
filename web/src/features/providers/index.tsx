@@ -21,6 +21,7 @@ import { useTranslation } from 'react-i18next'
 
 import { SectionPageLayout } from '@/components/layout'
 import { Button } from '@/components/ui/button'
+import { RecommendationRules } from '@/features/recommendations/recommendation-rules'
 
 import { ProvidersDialogs } from './components/providers-dialogs'
 import {
@@ -47,6 +48,7 @@ export function Providers() {
       <SectionPageLayout fixedContent>
         <SectionPageLayout.Title>{t('Providers')}</SectionPageLayout.Title>
         <SectionPageLayout.Actions>
+          <RecommendationRules kind='provider' />
           <CreateProviderButton />
         </SectionPageLayout.Actions>
         <SectionPageLayout.Content>

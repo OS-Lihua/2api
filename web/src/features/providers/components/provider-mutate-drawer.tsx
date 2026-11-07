@@ -67,6 +67,7 @@ import {
 } from '@/features/channels/constants'
 import { getAdvancedCustomTemplateConfig } from '@/features/channels/lib/advanced-custom'
 import { CHANNEL_FORM_DEFAULT_VALUES } from '@/features/channels/lib/channel-form'
+import { RecommendationPicker } from '@/features/recommendations/recommendation-picker'
 import {
   ADMIN_PERMISSION_ACTIONS,
   ADMIN_PERMISSION_RESOURCES,
@@ -328,6 +329,20 @@ export function ProviderMutateDrawer(props: ProviderMutateDrawerProps) {
                     name='mode'
                     label={t('Key mode')}
                     options={translate(PROVIDER_ADD_MODE_OPTIONS)}
+                  />
+                )}
+                {!isUpdate && props.open && (
+                  <RecommendationPicker
+                    kind='provider'
+                    input={{ url: form.watch('base_url'), type }}
+                    onConfirm={(rule) => {
+                      form.setValue('name', rule.provider_name, {
+                        shouldDirty: true,
+                      })
+                      form.setValue('type', rule.provider_type, {
+                        shouldDirty: true,
+                      })
+                    }}
                   />
                 )}
                 {!isUpdate && mode === 'multi_to_single' && (
