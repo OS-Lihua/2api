@@ -165,12 +165,12 @@ func TestKeyPermissionsIdentityVisibilityAndDeletion(t *testing.T) {
 	endpoint := fmt.Sprintf("/api/token/%d/permissions", f.token.Id)
 	response := adminSecurityRequest(f.engine, pat, http.MethodPut, endpoint, fmt.Sprintf(`{"default_allow":false,"exception_ids":[%d],"revision":0}`, f.offering.ID))
 	require.Equal(t, 200, response.Code, response.Body.String())
-	f.offering.Name = "renamed-offering"
+	f.offering.Name = "namespace/renamed-offering"
 	require.NoError(t, model.SaveModelOffering(t.Context(), f.offering, "save"))
-	for _, name := range []string{"gateway-offering", "gateway-alias", "renamed-offering"} {
+	for _, name := range []string{"gateway-offering", "gateway-alias", "namespace/renamed-offering"} {
 		detail := adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, "/v1/models/"+name, "")
 		require.Equal(t, 200, detail.Code, detail.Body.String())
-		assert.Contains(t, detail.Body.String(), `"id":"renamed-offering"`)
+		assert.Contains(t, detail.Body.String(), `"id":"namespace/renamed-offering"`)
 	}
 	f.offering.Visibility = "groups"
 	f.offering.Groups = []string{"default"}

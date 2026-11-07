@@ -3,6 +3,7 @@ package controller
 import (
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/constant"
@@ -71,7 +72,7 @@ func ListOfferingModels(c *gin.Context, modelType int) {
 }
 
 func RetrieveOfferingModel(c *gin.Context, modelType int) {
-	offering, err := model.FindModelOfferingByName(c.Request.Context(), c.Param("model"))
+	offering, err := model.FindModelOfferingByName(c.Request.Context(), strings.TrimPrefix(c.Param("model"), "/"))
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		offeringModelsError(c, modelType, 404, "model_not_found", "Model not found")
 		return

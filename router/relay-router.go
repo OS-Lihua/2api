@@ -33,7 +33,7 @@ func SetRelayRouter(router *gin.Engine) {
 			}
 		})
 
-		modelsRouter.GET("/:model", func(c *gin.Context) {
+		modelsRouter.GET("/*model", func(c *gin.Context) {
 			switch {
 			case c.GetHeader("x-api-key") != "" && c.GetHeader("anthropic-version") != "":
 				controller.RetrieveOfferingModel(c, constant.ChannelTypeAnthropic)
