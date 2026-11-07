@@ -618,10 +618,45 @@ func TestTextGatewaySDKPreparationDoesNotSpendAttempt(t *testing.T) {
 	assert.EqualValues(t, 1, total)
 }
 
+func TestTextGatewaySendContextUsesSharedBudgetsInsteadOfRelayDeadline(t *testing.T) {
+	for _, providerType := range []int{constant.ChannelTypeOpenAI, constant.ChannelTypeAws} {
+		t.Run(fmt.Sprint(providerType), func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n"))
+			})
+			if providerType == constant.ChannelTypeAws {
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": providerType, "key": strings.Join([]string{"fake", "us-east-1"}, "|")}).Error)
+				require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", "amazon.nova-lite-v1:0").Error)
+			}
+			previousRelayTimeout := common.RelayTimeout
+			common.RelayTimeout = 30
+			t.Cleanup(func() { common.RelayTimeout = previousRelayTimeout })
+			client := service.GetHttpClient()
+			original, timeout := client.Transport, client.Timeout
+			client.Timeout = 30 * time.Second
+			t.Cleanup(func() { client.Transport, client.Timeout = original, timeout })
+			client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
+				_, absoluteDeadline := request.Context().Deadline()
+				assert.False(t, absoluteDeadline, "a legacy total deadline must not outlive first business delivery")
+				if providerType == constant.ChannelTypeAws {
+					return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"output":{"message":{"content":[{"text":"Hello"}]}},"usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15}}`)), Request: request}, nil
+				}
+				return original.RoundTrip(request)
+			})
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			assert.Contains(t, response.Body.String(), "Hello")
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, "success", record.Status)
+		})
+	}
+}
+
 func TestTextGatewaySDKCannotHideAdditionalSends(t *testing.T) {
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("SDK must use its own transport") })
 	t.Setenv("GATEWAY_MAX_ATTEMPTS", "1")
-	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeAws, "key": "test-bedrock-token|us-east-1"}).Error)
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeAws, "key": strings.Join([]string{"fake", "us-east-1"}, "|")}).Error)
 	require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", "amazon.nova-lite-v1:0").Error)
 	calls := 0
 	client := service.GetHttpClient()
@@ -648,7 +683,7 @@ func TestTextGatewaySDKRejectionsRetainStatusAndProviderScope(t *testing.T) {
 	}{{400, 1, "ValidationException", "invalid_request"}, {401, 2, "UnrecognizedClientException", "credentials"}, {403, 2, "AccessDeniedException", "credentials"}, {404, 3, "ResourceNotFoundException", "model_not_found"}, {429, 2, "ServiceQuotaExceededException", "account_quota"}} {
 		t.Run(fmt.Sprint(tc.status), func(t *testing.T) {
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("SDK must use its own transport") })
-			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeAws, "key": "test-bedrock-token|us-east-1"}).Error)
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeAws, "key": strings.Join([]string{"fake", "us-east-1"}, "|")}).Error)
 			require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", "amazon.nova-lite-v1:0").Error)
 			sibling := *fixture.channel
 			sibling.ID, sibling.UpstreamModelName = 0, "amazon.nova-pro-v1:0"

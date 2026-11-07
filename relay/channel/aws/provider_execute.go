@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -44,6 +45,12 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 // without sending. The returned exchange reads the host's current send context.
 func (p *Provider) PrepareExecution(c *gin.Context, metadata channel.ProviderMetadata, body io.Reader) (channel.ProviderExecution, error) {
 	request := metadata.ProviderRequest()
+	managed := false
+	if c != nil {
+		value, _ := c.Get(string(constant.ContextKeyResponseFacts))
+		facts, _ := value.(*relaycommon.ResponseFacts)
+		managed = facts != nil && facts.OnBusinessOutput != nil
+	}
 	if request.ChannelOtherSettings.AwsApiType == dto.AwsApiTypeMantle {
 		req, err := p.NewMantleRequest(c, metadata, body)
 		if err != nil {
@@ -52,6 +59,9 @@ func (p *Provider) PrepareExecution(c *gin.Context, metadata channel.ProviderMet
 		client, err := service.GetHttpClientWithProxySettings(request.ChannelSetting.Proxy, request.ChannelSetting.HTTPSettings())
 		if err != nil {
 			return nil, err
+		}
+		if managed {
+			client = channel.GatewayHTTPClient(client)
 		}
 		return func(c *gin.Context) (*http.Response, error) {
 			if c != nil && c.Request != nil {
@@ -95,12 +105,16 @@ func (p *Provider) PrepareExecution(c *gin.Context, metadata channel.ProviderMet
 			return nil, err
 		}
 	}
-	prepared := &awsPreparedInvocation{client: client, modelID: modelID, payload: payload, stream: request.IsStream && !nova}
-	if c != nil {
-		if _, tracked := c.Get(string(constant.ContextKeyResponseFacts)); tracked {
-			// The gateway owns every actual send, including SDK transports.
-			prepared.options = append(prepared.options, func(options *bedrockruntime.Options) { options.RetryMaxAttempts = 1 })
+	prepared := &awsPreparedInvocation{client: client, modelID: modelID, payload: payload, stream: request.IsStream && !nova, managed: managed}
+	if managed {
+		httpClient := client.Options().HTTPClient
+		if base, ok := httpClient.(*http.Client); ok {
+			httpClient = channel.GatewayHTTPClient(base)
 		}
+		prepared.options = append(prepared.options, func(options *bedrockruntime.Options) {
+			options.RetryMaxAttempts = 1
+			options.HTTPClient = httpClient
+		})
 	}
 	return prepared.execute, nil
 }
@@ -110,6 +124,7 @@ type awsPreparedInvocation struct {
 	modelID string
 	payload []byte
 	stream  bool
+	managed bool
 	options []func(*bedrockruntime.Options)
 }
 
@@ -118,7 +133,7 @@ func (prepared *awsPreparedInvocation) execute(c *gin.Context) (*http.Response, 
 	if c != nil && c.Request != nil {
 		parent = c.Request.Context()
 	}
-	ctx, cancel := newAwsInvokeContext(parent)
+	ctx, cancel := newAwsInvokeContext(parent, prepared.managed)
 	if !prepared.stream {
 		defer cancel()
 		output, err := prepared.client.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{ModelId: aws.String(prepared.modelID), ContentType: aws.String("application/json"), Accept: aws.String("application/json"), Body: prepared.payload}, prepared.options...)

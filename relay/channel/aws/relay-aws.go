@@ -41,8 +41,8 @@ func getAwsErrorStatusCode(err error) int {
 	return http.StatusInternalServerError
 }
 
-func newAwsInvokeContext(parent context.Context) (context.Context, context.CancelFunc) {
-	if common.RelayTimeout <= 0 {
+func newAwsInvokeContext(parent context.Context, managed ...bool) (context.Context, context.CancelFunc) {
+	if common.RelayTimeout <= 0 || len(managed) > 0 && managed[0] {
 		return context.WithCancel(parent)
 	}
 	return context.WithTimeout(parent, time.Duration(common.RelayTimeout)*time.Second)
