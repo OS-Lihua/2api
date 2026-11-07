@@ -38,7 +38,8 @@ export function getChannelProbeLabels(t: TFunction): Map<string, string> {
       `${t('Output modalities')}: ${option.label}`,
     ])
   }
-  for (const option of getCapabilityLimitOptions(t))
+  for (const option of getCapabilityLimitOptions(t)) {
     options.push([option.value, option.label])
+  }
   return new Map(options)
 }
