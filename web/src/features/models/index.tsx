@@ -25,6 +25,7 @@ import { useTranslation } from 'react-i18next'
 import { SectionPageLayout } from '@/components/layout'
 import { Button } from '@/components/ui/button'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { RecommendationRules } from '@/features/recommendations/recommendation-rules'
 import { requireServerSuccess } from '@/lib/server-error-message'
 
 import { listDeployments } from './api'
@@ -125,7 +126,12 @@ function ModelsContent() {
         stackActionsOnMobile={activeSection === 'metadata'}
       >
         <SectionPageLayout.Title>{t(meta.titleKey)}</SectionPageLayout.Title>
-        <SectionPageLayout.Actions>{actions}</SectionPageLayout.Actions>
+        <SectionPageLayout.Actions>
+          {activeSection !== 'deployments' && (
+            <RecommendationRules kind='publisher' />
+          )}
+          {actions}
+        </SectionPageLayout.Actions>
         <SectionPageLayout.Content>
           <div className='flex h-full min-h-0 flex-col gap-4'>
             <Tabs value={activeSection} onValueChange={handleSectionChange}>

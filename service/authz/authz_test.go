@@ -154,9 +154,10 @@ func TestSetUserPermissionsStoresOnlyOverrides(t *testing.T) {
 		ResourceTaskPlugin: {
 			ActionBind: false,
 		},
-		ResourceAudit:  {ActionRead: false},
-		ResourceModel:  {ActionRead: true, ActionWrite: true},
-		ResourceLedger: {ActionRead: true, ActionWrite: false},
+		ResourceAudit:          {ActionRead: false},
+		ResourceModel:          {ActionRead: true, ActionWrite: true},
+		ResourceLedger:         {ActionRead: true, ActionWrite: false},
+		ResourceRecommendation: {ActionRead: true, ActionWrite: true},
 	}, ExplicitUserPermissions(42))
 	assert.Equal(t, PermissionsMap{
 		ResourceChannel: {
@@ -188,9 +189,10 @@ func TestSetUserPermissionsStoresOnlyOverrides(t *testing.T) {
 		ResourceTaskPlugin: {
 			ActionBind: false,
 		},
-		ResourceAudit:  {ActionRead: false},
-		ResourceModel:  {ActionRead: true, ActionWrite: true},
-		ResourceLedger: {ActionRead: true, ActionWrite: false},
+		ResourceAudit:          {ActionRead: false},
+		ResourceModel:          {ActionRead: true, ActionWrite: true},
+		ResourceLedger:         {ActionRead: true, ActionWrite: false},
+		ResourceRecommendation: {ActionRead: true, ActionWrite: true},
 	}, ExplicitUserPermissions(42))
 	assert.Empty(t, ExplicitUserOverrides(42))
 }

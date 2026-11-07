@@ -24,6 +24,7 @@ import { I18nextProvider } from 'react-i18next'
 import { afterEach, expect, it, vi } from 'vitest'
 
 import { api } from '@/lib/api'
+import { useAuthStore } from '@/stores/auth-store'
 
 import type { Provider } from '../../types'
 import { ProviderMutateDrawer } from '../provider-mutate-drawer'
@@ -51,6 +52,7 @@ const stored: Provider = {
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
+  useAuthStore.getState().auth.reset()
 })
 
 function renderDrawer(currentRow?: Provider) {
@@ -109,6 +111,56 @@ it('creating a Vertex Provider sends its deployment configuration', async () => 
       other: '{"default":"us-central1"}',
     },
   })
+})
+
+it('recommendation requires confirmation and never overwrites a manual name when it arrives late', async () => {
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
+  let resolveRecommendation!: (
+    value: Awaited<ReturnType<typeof api.get>>
+  ) => void
+  const pending = new Promise<Awaited<ReturnType<typeof api.get>>>(
+    (resolve) => {
+      resolveRecommendation = resolve
+    }
+  )
+  vi.spyOn(api, 'get').mockImplementation(() => pending)
+  const post = vi.spyOn(api, 'post')
+  renderDrawer()
+  const name = screen.getByRole('textbox', { name: 'Name' })
+  await userEvent.type(name, 'My account')
+  resolveRecommendation({
+    data: {
+      success: true,
+      data: {
+        items: [
+          {
+            id: 1,
+            kind: 'provider',
+            pattern: 'api.openai.com',
+            provider_name: 'OpenAI',
+            provider_type: 1,
+            priority: 0,
+            enabled: true,
+            publisher_id: 0,
+            publisher_name: '',
+          },
+        ],
+      },
+    },
+  })
+  await userEvent.click(
+    await screen.findByRole('button', { name: 'Use recommendation' })
+  )
+  expect(name).toHaveValue('My account')
+  expect(post).not.toHaveBeenCalled()
+  await userEvent.click(
+    screen.getByRole('button', { name: 'Confirm recommendation' })
+  )
+  expect(name).toHaveValue('OpenAI')
+  expect(post).not.toHaveBeenCalled()
+  await userEvent.clear(name)
+  await userEvent.type(name, 'Manually renamed')
+  expect(name).toHaveValue('Manually renamed')
 })
 
 it('saving an edit with an empty key field keeps the stored key', async () => {

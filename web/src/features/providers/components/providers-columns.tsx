@@ -21,6 +21,7 @@ import { useTranslation } from 'react-i18next'
 
 import { StatusBadge } from '@/components/status-badge'
 import { TableId } from '@/components/table-id'
+import { Button } from '@/components/ui/button'
 import { ChannelTypeLogo } from '@/features/channels/components/channel-type-badge'
 import {
   CHANNEL_STATUS_CONFIG,
@@ -49,7 +50,18 @@ export function useProvidersColumns(): ColumnDef<Provider>[] {
       header: t('Name'),
       meta: { mobileTitle: true },
       cell: ({ row }) => (
-        <span className='font-medium'>{row.original.name}</span>
+        <div className='space-y-2'>
+          <Button
+            variant='ghost'
+            size='sm'
+            aria-expanded={row.getIsExpanded()}
+            aria-controls={`provider-channels-${row.original.id}`}
+            onClick={() => row.toggleExpanded()}
+          >
+            {row.original.name}
+          </Button>
+          <span className='sr-only'>{t('Channels')}</span>
+        </div>
       ),
       size: 200,
     },
