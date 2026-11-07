@@ -42,8 +42,8 @@ func gatewayJournalPath(requestID string) (string, error) {
 	return filepath.Join(gatewayJournalDirectory(), requestID+".json"), nil
 }
 
-func syncGatewayJournalDirectory() error {
-	directory, err := os.Open(gatewayJournalDirectory())
+func syncGatewayJournalDirectory(path string) error {
+	directory, err := os.Open(path)
 	if err != nil {
 		return err
 	}
@@ -57,9 +57,24 @@ func PreflightGatewaySettlementStorage(requestID string) error {
 	if _, err := gatewayJournalPath(requestID); err != nil {
 		return err
 	}
-	directory := gatewayJournalDirectory()
+	directory := filepath.Clean(gatewayJournalDirectory())
+	var parents []string
+	for path := directory; ; path = filepath.Dir(path) {
+		if _, err := os.Lstat(path); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		parents = append(parents, filepath.Dir(path))
+	}
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		return err
+	}
+	// Each newly created directory entry must reach its parent before funds move.
+	for i := len(parents) - 1; i >= 0; i-- {
+		if err := syncGatewayJournalDirectory(parents[i]); err != nil {
+			return err
+		}
 	}
 	info, err := os.Lstat(directory)
 	if err != nil {
@@ -87,7 +102,7 @@ func PreflightGatewaySettlementStorage(requestID string) error {
 	if err := os.Remove(probe.Name()); err != nil {
 		return err
 	}
-	return syncGatewayJournalDirectory()
+	return syncGatewayJournalDirectory(directory)
 }
 
 func readGatewaySettlementJournal(path string) (GatewaySettlement, error) {
@@ -147,6 +162,10 @@ func journalGatewaySettlement(intent GatewaySettlement) (GatewaySettlement, stri
 		return intent, "", err
 	}
 	defer os.Remove(file.Name())
+	if err := file.Chmod(0600); err != nil {
+		file.Close()
+		return intent, "", err
+	}
 	if _, err := file.Write(body); err != nil {
 		file.Close()
 		return intent, "", err
@@ -161,7 +180,7 @@ func journalGatewaySettlement(intent GatewaySettlement) (GatewaySettlement, stri
 	if err := os.Rename(file.Name(), path); err != nil {
 		return intent, "", err
 	}
-	if err := syncGatewayJournalDirectory(); err != nil {
+	if err := syncGatewayJournalDirectory(gatewayJournalDirectory()); err != nil {
 		return intent, "", err
 	}
 	return intent, path, nil
@@ -173,7 +192,7 @@ func removeGatewaySettlementJournal(path string) error {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return syncGatewayJournalDirectory()
+	return syncGatewayJournalDirectory(gatewayJournalDirectory())
 }
 
 func recoverGatewaySettlementJournals(ctx context.Context, limit int) error {
@@ -185,26 +204,35 @@ func recoverGatewaySettlementJournals(ctx context.Context, limit int) error {
 		return err
 	}
 	defer directory.Close()
-	entries, err := directory.ReadDir(limit)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return err
-	}
-	for _, entry := range entries {
+	for imported := 0; imported < limit; {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-		intent, err := readGatewaySettlementJournal(filepath.Join(gatewayJournalDirectory(), entry.Name()))
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
+		entries, err := directory.ReadDir(min(limit-imported, 100))
+		if err != nil && !errors.Is(err, io.EOF) {
 			return err
 		}
-		if err := PrepareGatewaySettlement(intent); err != nil {
-			return err
+		if len(entries) == 0 {
+			return nil
+		}
+		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			intent, err := readGatewaySettlementJournal(filepath.Join(gatewayJournalDirectory(), entry.Name()))
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if err := PrepareGatewaySettlement(intent); err != nil {
+				return err
+			}
+			imported++
 		}
 	}
 	return nil

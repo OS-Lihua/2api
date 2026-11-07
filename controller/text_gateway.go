@@ -126,25 +126,6 @@ func TextGateway(c *gin.Context) {
 			request.StreamOptions = nil
 		}
 	}
-	if request.GetMaxTokens() == 0 && (selection.Capabilities.Limits.MaxOutputTokens != nil || selection.Capabilities.Limits.ContextLength != nil) {
-		var limit int64
-		if output := selection.Capabilities.Limits.MaxOutputTokens; output != nil {
-			limit = *output
-		}
-		if context := selection.Capabilities.Limits.ContextLength; context != nil {
-			remaining := *context - int64(selection.InputTokens)
-			if limit == 0 {
-				limit = remaining
-			} else {
-				limit = min(limit, remaining)
-			}
-		}
-		if limit <= 0 {
-			gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "No output tokens fit the request context")
-			return
-		}
-		request.MaxCompletionTokens = common.GetPointer(uint(limit))
-	}
 	adaptor, err := relay.GetChannelAdaptor(info.ApiType, protocol.OpenAIChat)
 	if err != nil {
 		gatewayError(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
@@ -185,6 +166,37 @@ func TextGateway(c *gin.Context) {
 	if err != nil || !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, estimatedInput) {
 		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
 		return
+	}
+	if effective.GetMaxTokens() == 0 && (selection.Capabilities.Limits.MaxOutputTokens != nil || selection.Capabilities.Limits.ContextLength != nil) {
+		var limit int64
+		if output := selection.Capabilities.Limits.MaxOutputTokens; output != nil {
+			limit = *output
+		}
+		if context := selection.Capabilities.Limits.ContextLength; context != nil {
+			remaining := *context - int64(estimatedInput)
+			if limit == 0 {
+				limit = remaining
+			} else {
+				limit = min(limit, remaining)
+			}
+		}
+		if limit <= 0 {
+			gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "No output tokens fit the request context")
+			return
+		}
+		request.MaxCompletionTokens = common.GetPointer(uint(limit))
+		encoded, err = adaptor.SetChatOutputLimit(converted, encoded, uint(limit))
+		if err == nil {
+			effective, err = adaptor.ProjectChatRequest(info, converted, request, encoded)
+		}
+		if err != nil {
+			gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "Invalid Channel request parameters")
+			return
+		}
+		if _, err := helper.ValidateTextRequest(c, effective, relayconstant.RelayModeChatCompletions); err != nil || !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, estimatedInput) {
+			gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
+			return
+		}
 	}
 	mean, err := model.RecentOfferingOutputTokens(c.Request.Context(), offering.ID, started.UnixMilli())
 	if err != nil {

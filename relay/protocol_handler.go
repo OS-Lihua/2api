@@ -91,6 +91,25 @@ func (a *ChannelAdaptor) ProjectChatRequest(info *relaycommon.RelayInfo, convert
 	return &effective, nil
 }
 
+func (a *ChannelAdaptor) SetChatOutputLimit(converted any, body []byte, limit uint) ([]byte, error) {
+	if setter, ok := converted.(channel.ChatOutputLimitSetter); ok {
+		return setter.SetChatOutputLimit(body, limit)
+	}
+	if _, ok := converted.(*dto.GeneralOpenAIRequest); !ok {
+		return body, nil
+	}
+	var wire map[string]common.RawMessage
+	if err := common.Unmarshal(body, &wire); err != nil {
+		return nil, err
+	}
+	encoded, err := common.Marshal(limit)
+	if err != nil {
+		return nil, err
+	}
+	wire["max_completion_tokens"] = encoded
+	return common.Marshal(wire)
+}
+
 func (a *ChannelAdaptor) providerMetadata(info *relaycommon.RelayInfo) *channel.ProviderRequest {
 	metadata := channel.NewProviderMetadata(info)
 	metadata.Protocol = a.kind

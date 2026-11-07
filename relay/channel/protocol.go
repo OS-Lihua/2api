@@ -26,6 +26,11 @@ type ChatRequestProjector interface {
 	ProjectChatRequest([]byte, dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error)
 }
 
+// ChatOutputLimitSetter applies a validated default to a native wire body.
+type ChatOutputLimitSetter interface {
+	SetChatOutputLimit([]byte, uint) ([]byte, error)
+}
+
 // ProjectChatRequestControls retains public multiplier validation even when a
 // native override contains public fields that the wire service would ignore.
 func ProjectChatRequestControls(body []byte, public dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error) {

@@ -49,6 +49,29 @@ type OllamaChatRequest struct {
 	Think     json.RawMessage     `json:"think,omitempty"`
 }
 
+func (*OllamaChatRequest) SetChatOutputLimit(body []byte, limit uint) ([]byte, error) {
+	var wire map[string]common.RawMessage
+	if err := common.Unmarshal(body, &wire); err != nil {
+		return nil, err
+	}
+	options := make(map[string]common.RawMessage)
+	if raw := wire["options"]; len(raw) > 0 && string(raw) != "null" {
+		if err := common.Unmarshal(raw, &options); err != nil {
+			return nil, err
+		}
+	}
+	encoded, err := common.Marshal(limit)
+	if err != nil {
+		return nil, err
+	}
+	options["num_predict"] = encoded
+	wire["options"], err = common.Marshal(options)
+	if err != nil {
+		return nil, err
+	}
+	return common.Marshal(wire)
+}
+
 func (*OllamaChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error) {
 	var wire OllamaChatRequest
 	if err := common.Unmarshal(body, &wire); err != nil {
@@ -57,6 +80,9 @@ func (*OllamaChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpen
 	effective, err := channel.ProjectChatRequestControls(body, public)
 	if err != nil {
 		return nil, err
+	}
+	if effective.N != nil && *effective.N > 1 {
+		return nil, fmt.Errorf("Ollama supports one choice per request")
 	}
 	effective.Model, effective.Stream = wire.Model, common.GetPointer(wire.Stream)
 	if raw, ok := wire.Options["num_predict"]; ok {

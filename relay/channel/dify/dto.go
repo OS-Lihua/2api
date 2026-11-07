@@ -30,6 +30,9 @@ func (*DifyChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAI
 	if err != nil {
 		return nil, err
 	}
+	if effective.N != nil && *effective.N > 1 {
+		return nil, fmt.Errorf("Dify supports one choice per request")
+	}
 	effective.Stream = common.GetPointer(wire.ResponseMode == "streaming")
 	content := []dto.MediaContent{{Type: dto.ContentTypeText, Text: wire.Query}}
 	for _, file := range wire.Files {

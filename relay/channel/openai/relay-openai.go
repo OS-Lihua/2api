@@ -27,6 +27,17 @@ func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, fo
 		return nil
 	}
 	if info.ResponseFacts != nil {
+		if !info.ShouldIncludeUsage {
+			var fields map[string]common.RawMessage
+			if common.UnmarshalJsonStr(data, &fields) == nil && fields["usage"] != nil {
+				delete(fields, "usage")
+				encoded, err := common.Marshal(fields)
+				if err != nil {
+					return err
+				}
+				data = string(encoded)
+			}
+		}
 		var frame dto.ChatCompletionsStreamResponse
 		if common.UnmarshalJsonStr(data, &frame) == nil {
 			business := false
@@ -158,18 +169,28 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 			lastStreamData = data
 			if info.ResponseFacts != nil {
 				prompt, completion := relaycommon.ChatUsagePresence([]byte(data))
-				if prompt || completion {
-					var frame dto.ChatCompletionsStreamResponse
-					if common.UnmarshalJsonStr(data, &frame) == nil && frame.Usage != nil {
-						snapshot := *frame.Usage
-						if !prompt && reportedStreamUsage != nil {
-							snapshot.PromptTokens = reportedStreamUsage.PromptTokens
+				var frame struct {
+					Usage map[string]common.RawMessage `json:"usage"`
+				}
+				if common.UnmarshalJsonStr(data, &frame) == nil && frame.Usage != nil {
+					if !prompt {
+						delete(frame.Usage, "prompt_tokens")
+					}
+					if !completion {
+						delete(frame.Usage, "completion_tokens")
+					}
+					delete(frame.Usage, "total_tokens")
+					for key, value := range frame.Usage {
+						if strings.TrimSpace(string(value)) == "null" {
+							delete(frame.Usage, key)
 						}
-						if !completion && reportedStreamUsage != nil {
-							snapshot.CompletionTokens = reportedStreamUsage.CompletionTokens
-						}
-						snapshot.TotalTokens = snapshot.PromptTokens + snapshot.CompletionTokens
-						reportedStreamUsage = &snapshot
+					}
+					encoded, err := common.Marshal(frame.Usage)
+					if reportedStreamUsage == nil {
+						reportedStreamUsage = &dto.Usage{}
+					}
+					if err == nil && common.Unmarshal(encoded, reportedStreamUsage) == nil {
+						reportedStreamUsage.TotalTokens = reportedStreamUsage.PromptTokens + reportedStreamUsage.CompletionTokens
 						info.ResponseFacts.PromptTokensReported = info.ResponseFacts.PromptTokensReported || prompt
 						info.ResponseFacts.CompletionTokensReported = info.ResponseFacts.CompletionTokensReported || completion
 					}
