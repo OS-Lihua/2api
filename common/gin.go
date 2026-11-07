@@ -273,6 +273,7 @@ func ApiError(c *gin.Context, err error) {
 // ApiErrorStatus is ApiError with another HTTP status. fields adds response
 // fields such as a stable error code or data.
 func ApiErrorStatus(c *gin.Context, status int, err error, fields ...gin.H) {
+	SetContextKey(c, constant.ContextKeyAPIResponseSuccess, false)
 	body := gin.H{
 		"success": false,
 		"message": err.Error(),
@@ -295,6 +296,7 @@ func ApiErrorT(c *gin.Context, key string, params ...map[string]any) {
 
 // ApiSuccessT is the success counterpart of ApiErrorT.
 func ApiSuccessT(c *gin.Context, key string, data any, params ...map[string]any) {
+	SetContextKey(c, constant.ContextKeyAPIResponseSuccess, true)
 	message := NewMessage(key, params...)
 	body := gin.H{
 		"success": true,
@@ -306,6 +308,7 @@ func ApiSuccessT(c *gin.Context, key string, data any, params ...map[string]any)
 }
 
 func ApiErrorMsg(c *gin.Context, msg string) {
+	SetContextKey(c, constant.ContextKeyAPIResponseSuccess, false)
 	c.JSON(http.StatusOK, gin.H{
 		"success": false,
 		"message": msg,
@@ -313,6 +316,7 @@ func ApiErrorMsg(c *gin.Context, msg string) {
 }
 
 func ApiSuccess(c *gin.Context, data any) {
+	SetContextKey(c, constant.ContextKeyAPIResponseSuccess, true)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
@@ -323,6 +327,7 @@ func ApiSuccess(c *gin.Context, data any) {
 // ApiErrorI18n returns a translated error message based on the user's language preference
 // key is the i18n message key, args is optional template data
 func ApiErrorI18n(c *gin.Context, key string, args ...map[string]any) {
+	SetContextKey(c, constant.ContextKeyAPIResponseSuccess, false)
 	msg := TranslateMessage(c, key, args...)
 	c.JSON(http.StatusOK, gin.H{
 		"success": false,
@@ -332,6 +337,7 @@ func ApiErrorI18n(c *gin.Context, key string, args ...map[string]any) {
 
 // ApiSuccessI18n returns a translated success message based on the user's language preference
 func ApiSuccessI18n(c *gin.Context, key string, data any, args ...map[string]any) {
+	SetContextKey(c, constant.ContextKeyAPIResponseSuccess, true)
 	msg := TranslateMessage(c, key, args...)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,

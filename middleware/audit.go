@@ -2,7 +2,11 @@ package middleware
 
 import (
 	"bytes"
+	"compress/gzip"
+	"io"
+	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -116,6 +120,9 @@ var auditRouteActions = map[string]string{
 // 必然经过 AdminAuth/RootAuth，将审计兜底内聚到鉴权链路即可保证「新增接口自动留痕」，
 // 无需在路由上再单独挂一层审计中间件（避免漏挂）。
 func beginAdminAudit(c *gin.Context) *auditResponseWriter {
+	if common.GetContextKeyBool(c, constant.ContextKeyAdminAPIAudit) {
+		return nil
+	}
 	method := c.Request.Method
 	if method != "POST" && method != "PUT" && method != "PATCH" && method != "DELETE" {
 		return nil
@@ -147,7 +154,7 @@ func finishAdminAudit(c *gin.Context, writer *auditResponseWriter) {
 	operatorRole := c.GetInt("role")
 	ip := c.ClientIP()
 	status := writer.Status()
-	success := auditResponseSuccess(status, writer.body.Bytes())
+	success := auditResponseSuccess(c, status, writer.body.Bytes())
 
 	route := c.FullPath()
 	action := auditRouteActions[method+" "+route]
@@ -197,9 +204,27 @@ func auditAuthMethod(c *gin.Context) string {
 
 // auditResponseSuccess 依据 HTTP 状态码与响应体推断操作是否成功。
 // 优先解析响应 JSON 中的 success 字段；无法解析时退回到状态码判断。
-func auditResponseSuccess(status int, body []byte) bool {
+func auditResponseSuccess(c *gin.Context, status int, body []byte) bool {
 	if status >= 400 {
 		return false
+	}
+	if common.GetContextKeyBool(c, constant.ContextKeyAdminAPIAudit) {
+		if success, ok := common.GetContextKeyType[bool](c, constant.ContextKeyAPIResponseSuccess); ok {
+			return success
+		}
+	}
+	// The prefix audit also surrounds gzip and early middleware rejections.
+	// Decode only the bounded envelope; never persist the captured payload.
+	if len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b {
+		reader, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return false
+		}
+		defer reader.Close()
+		body, err = io.ReadAll(io.LimitReader(reader, 64*1024+1))
+		if err != nil || len(body) > 64*1024 {
+			return false
+		}
 	}
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
@@ -211,6 +236,80 @@ func auditResponseSuccess(status int, body []byte) bool {
 		}
 	}
 	return status < 400
+}
+
+// AdminAPISecurity surrounds all versioned admin routes, including authentication
+// and rate-limit rejections. Only route templates and numeric identifiers enter
+// the operation audit; handler payloads and raw errors are never persisted.
+func AdminAPISecurity() gin.HandlerFunc {
+	rateLimitEnabled := common.GlobalApiRateLimitEnable
+	rateLimit := GlobalAPIRateLimit()
+	return func(c *gin.Context) {
+		if c.Request.URL.Path != "/api/admin/v1" && !strings.HasPrefix(c.Request.URL.Path, "/api/admin/v1/") {
+			c.Next()
+			return
+		}
+		common.SetContextKey(c, constant.ContextKeyAdminAPIAudit, true)
+		common.SetContextKey(c, constant.ContextKeyAuditLogged, true)
+		c.Header("Cache-Control", "no-store")
+		writer := &auditResponseWriter{ResponseWriter: c.Writer, body: bytes.NewBuffer(nil), maxSize: 64 * 1024}
+		c.Writer = writer
+		completed := false
+		defer func() {
+			status := writer.Status()
+			if !completed {
+				status = http.StatusInternalServerError
+			}
+			success := completed && auditResponseSuccess(c, status, writer.body.Bytes())
+			if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead || c.Request.Method == http.MethodOptions {
+				if success {
+					return
+				}
+			}
+			userID, username, role := c.GetInt("id"), c.GetString("username"), c.GetInt("role")
+			if actor, ok := c.Get("admin_api_actor"); ok {
+				user := actor.(*model.UserBase)
+				userID, username, role = user.Id, user.Username, user.Role
+			}
+			authMethod := auditAuthMethod(c)
+			if lookup := requestAccessTokenLookup(c); lookup != nil {
+				authMethod = "access_token"
+				if lookup.user != nil {
+					userID, username, role = lookup.user.Id, lookup.user.Username, lookup.user.Role
+				}
+			}
+			params := map[string]string{}
+			for _, param := range c.Params {
+				if id, err := strconv.ParseUint(param.Value, 10, 64); err == nil {
+					params[param.Key] = strconv.FormatUint(id, 10)
+				}
+			}
+			route, method := c.FullPath(), c.Request.Method
+			action := auditRouteActions[method+" "+route]
+			if action == "" {
+				action = "generic"
+			}
+			model.RecordAuditLog(c, model.AuditLog{
+				UserId: userID, Username: username, ActorRole: role, AuthMethod: authMethod,
+				Category: model.AuditCategoryOperation, Action: action, Content: method + " " + route, Status: status, Success: success,
+				Other: model.AuditOther{Op: &model.AuditOperation{Action: action, Params: map[string]any{"method": method, "route": route}},
+					AdminInfo: &model.AuditAdminInfo{AdminID: userID, AdminUsername: username, AdminRole: role, AuthMethod: authMethod},
+					AuditInfo: &model.AuditRequestInfo{Method: method, Route: route, Path: route, Status: status, Success: success, Params: params}},
+			})
+		}()
+		// Keep the global IP limit ahead of authentication. The API group's
+		// limiter sees this marker and does not charge a second time.
+		if rateLimitEnabled {
+			rateLimit(c)
+			c.Set(adminAPIRateLimitContextKey, true)
+			if c.IsAborted() {
+				completed = true
+				return
+			}
+		}
+		AdminAuth()(c)
+		completed = true
+	}
 }
 
 const accessTokenAuditContextKey = "access_token_request_audit"
@@ -255,7 +354,7 @@ func TokenOperationAudit() gin.HandlerFunc {
 		c.Writer = writer
 		c.Next()
 		entry.Status = writer.Status()
-		entry.Success = auditResponseSuccess(entry.Status, writer.body.Bytes())
+		entry.Success = auditResponseSuccess(c, entry.Status, writer.body.Bytes())
 		if writer.body.Len() == writer.maxSize {
 			// JSON may be truncated before its success field. A completed handler
 			// supplies the result without retaining an unbounded response body.
@@ -266,8 +365,9 @@ func TokenOperationAudit() gin.HandlerFunc {
 }
 
 type accessTokenRequestAudit struct {
-	entry  model.AuditLog
-	writer *auditResponseWriter
+	finished bool
+	entry    model.AuditLog
+	writer   *auditResponseWriter
 }
 
 // AccessTokenAudit also captures public reads and rejections before route-level
@@ -280,7 +380,11 @@ func AccessTokenAudit() gin.HandlerFunc {
 			if !internal {
 				if lookup := lookupAccessToken(c, raw); lookup.user != nil {
 					beginAccessTokenAudit(c, lookup.user, lookup.ref)
-					defer finishAccessTokenAudit(c)
+					// Prefix authentication owns the outer audit writer and must
+					// finish it after gzip closes, not from this inner middleware.
+					if !common.GetContextKeyBool(c, constant.ContextKeyAdminAPIAudit) {
+						defer finishAccessTokenAudit(c)
+					}
 				}
 			}
 		}
@@ -320,10 +424,11 @@ func finishAccessTokenAudit(c *gin.Context) {
 		return
 	}
 	audit, ok := value.(*accessTokenRequestAudit)
-	if !ok {
+	if !ok || audit.finished {
 		return
 	}
+	audit.finished = true
 	audit.entry.Status = audit.writer.Status()
-	audit.entry.Success = auditResponseSuccess(audit.entry.Status, audit.writer.body.Bytes())
+	audit.entry.Success = auditResponseSuccess(c, audit.entry.Status, audit.writer.body.Bytes())
 	model.RecordAuditLog(c, audit.entry)
 }
