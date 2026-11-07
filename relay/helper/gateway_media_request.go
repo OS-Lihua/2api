@@ -214,8 +214,14 @@ func ValidateGatewayMediaMultipliers(body []byte) error {
 				if value.Type != ojson.Number {
 					return fmt.Errorf("%s must be numeric", name)
 				}
+				if len(value.Raw) > 128 {
+					return fmt.Errorf("%s exceeds numeric precision limits", name)
+				}
 				number, err := decimal.NewFromString(value.Raw)
-				if err != nil || number.LessThan(minimum) || number.GreaterThan(decimal.NewFromInt(ceiling)) {
+				if err != nil || number.Exponent() > 128 || number.Exponent() < -128 {
+					return fmt.Errorf("%s exceeds numeric precision limits", name)
+				}
+				if number.LessThan(minimum) || number.GreaterThan(decimal.NewFromInt(ceiling)) {
 					return fmt.Errorf("%s is outside the media request limit", name)
 				}
 				if name != "speed" && name != "duration" && name != "seconds" && name != "duration_seconds" && !number.Equal(number.Truncate(0)) {

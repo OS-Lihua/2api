@@ -471,9 +471,14 @@ func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayIn
 
 		writer.WriteField("model", request.Model)
 
-		formData, err2 := common.ParseMultipartFormReusable(c)
-		if err2 != nil {
-			return nil, fmt.Errorf("error parsing multipart form: %w", err2)
+		formData := c.Request.MultipartForm
+		if formData == nil {
+			var err error
+			formData, err = common.ParseMultipartFormReusable(c)
+			if err != nil {
+				return nil, fmt.Errorf("error parsing multipart form: %w", err)
+			}
+			defer formData.RemoveAll()
 		}
 
 		// 打印类似 curl 命令格式的信息

@@ -8,7 +8,10 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
+
+	"github.com/MoeForge/moego/ojson"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -278,6 +281,41 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		normalizeOpenAIUsage(responseData.Usage)
 		observeMediaUsage(info, responseData.Usage, responseBody)
 	}
+	if info.ResponseFacts != nil && decodeErr == nil {
+		duration := ojson.GetBytes(responseBody, "usage.seconds")
+		if !duration.Exists() {
+			duration = ojson.GetBytes(responseBody, "duration")
+		}
+		if duration.Exists() {
+			if duration.Type == ojson.Number && helper.ValidateGatewayMediaMultipliers([]byte(`{"duration":`+duration.Raw+`}`)) == nil {
+				seconds, err := decimal.NewFromString(duration.Raw)
+				if err == nil {
+					text := seconds.String()
+					info.ResponseFacts.AudioInputSeconds = &text
+					info.ResponseFacts.AudioInputDurationReported = true
+					if !info.ResponseFacts.PromptTokensReported {
+						if responseData.Usage == nil {
+							responseData.Usage = &dto.Usage{}
+						}
+						// Ceil the exact JSON duration before converting the bounded
+						// whole seconds to the shared audio token unit.
+						tokens, clamp := common.AudioDurationTokens(seconds.Ceil().InexactFloat64())
+						responseData.Usage.PromptTokens = tokens
+						responseData.Usage.PromptTokensDetails.AudioTokens = tokens
+						if clamp != nil {
+							info.QuotaClamp = clamp
+						}
+					}
+				}
+			} else if duration.Type == ojson.Number {
+				seconds, _ := strconv.ParseFloat(duration.Raw, 64)
+				_, clamp := common.AudioDurationTokens(seconds)
+				if clamp != nil {
+					info.QuotaClamp = clamp
+				}
+			}
+		}
+	}
 	if info.ResponseFacts != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices) {
 		return types.NewError(fmt.Errorf("upstream transcription request failed"), types.ErrorCodeBadResponse), responseData.Usage
 	}
@@ -295,13 +333,16 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		info.ResponseFacts.BusinessOutput = text != ""
 	}
 	if decodeErr == nil && responseData.Usage != nil {
-		if responseData.Usage.TotalTokens > 0 || info.UpstreamProtocol != "" {
+		if responseData.Usage.TotalTokens > 0 || info.UpstreamProtocol != "" || info.ResponseFacts != nil {
 			usage := responseData.Usage
 			if usage.PromptTokens == 0 {
 				usage.PromptTokens = usage.InputTokens
 			}
 			if usage.CompletionTokens == 0 {
 				usage.CompletionTokens = usage.OutputTokens
+			}
+			if info.ResponseFacts != nil && !info.ResponseFacts.PromptTokensReported && !info.ResponseFacts.AudioInputDurationReported {
+				usage.PromptTokens = info.GetEstimatePromptTokens()
 			}
 			return nil, usage
 		}

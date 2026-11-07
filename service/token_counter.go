@@ -66,9 +66,14 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 		return 0, nil
 	}
 	if info.RelayMode == constant2.RelayModeAudioTranscription || info.RelayMode == constant2.RelayModeAudioTranslation {
-		multiForm, err := common.ParseMultipartFormReusable(c)
-		if err != nil {
-			return 0, fmt.Errorf("error parsing multipart form: %v", err)
+		multiForm := c.Request.MultipartForm
+		if multiForm == nil {
+			var err error
+			multiForm, err = common.ParseMultipartFormReusable(c)
+			if err != nil {
+				return 0, fmt.Errorf("error parsing multipart form: %v", err)
+			}
+			defer multiForm.RemoveAll()
 		}
 		fileHeaders := multiForm.File["file"]
 		totalAudioToken := 0

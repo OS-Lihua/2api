@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -134,9 +135,58 @@ func TestMediaErrorUsageRetainedWithoutDelivery(t *testing.T) {
 			assert.Equal(t, 7, usage.PromptTokens)
 			assert.True(t, info.ResponseFacts.UsageReported)
 			assert.False(t, info.ResponseFacts.BusinessOutput)
+			if mode == relayconstant.RelayModeImagesGenerations {
+				require.NotNil(t, info.ResponseFacts.ImageCount)
+				assert.Zero(t, *info.ResponseFacts.ImageCount)
+			}
 			assert.Empty(t, recorder.Body.String())
 		})
 	}
+}
+
+func TestMediaTranscriptionDurationPresenceKeepsZeroAndBoundsInvalidReports(t *testing.T) {
+	for _, tc := range []struct {
+		duration, seconds string
+		prompt            int
+		reported, clamped bool
+	}{
+		{"0", "0", 0, true, false},
+		{"60", "60", 1000, true, false},
+		{"1.000000000000000001", "1.000000000000000001", 33, true, false},
+		{"-1", "1", 17, false, true},
+		{"1e200", "1", 17, false, true},
+	} {
+		t.Run(tc.duration, func(t *testing.T) {
+			body := `{"text":"hello","usage":{"type":"duration","seconds":` + tc.duration + `}}`
+			c, _, response, info := newImageTestContext(t, body, "application/json", false)
+			seconds := "1"
+			info.ResponseFacts = &relaycommon.ResponseFacts{AudioInputSeconds: &seconds}
+			info.SetEstimatePromptTokens(17)
+			info.RelayMode = relayconstant.RelayModeAudioTranscription
+			result, apiErr := (&Adaptor{ResponseFormat: "json"}).DoResponse(c, response, info)
+			require.Nil(t, apiErr)
+			assert.Equal(t, tc.prompt, result.(*dto.Usage).PromptTokens)
+			require.NotNil(t, info.ResponseFacts.AudioInputSeconds)
+			assert.Equal(t, tc.seconds, *info.ResponseFacts.AudioInputSeconds)
+			assert.Equal(t, tc.reported, info.ResponseFacts.AudioInputDurationReported)
+			assert.Equal(t, tc.clamped, info.QuotaClamp != nil)
+		})
+	}
+}
+
+func TestImageMoneyGatewayKeepsDeliveredFrameWhenFlushSeesCancellation(t *testing.T) {
+	previous := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previous })
+	c, recorder, response, info := newDisconnectingImageStream(t, "data: {\"type\":\"image_generation.completed\",\"b64_json\":\"first\"}\n\n", "first")
+	info.ResponseFacts = &relaycommon.ResponseFacts{}
+	common.SetContextKey(c, constant.ContextKeyResponseFacts, info.ResponseFacts)
+	_, apiErr := OpenaiImageStreamHandler(c, info, response)
+	require.Nil(t, apiErr)
+	assert.Contains(t, recorder.Body.String(), "first")
+	assert.True(t, info.ResponseFacts.BusinessOutput)
+	assert.Equal(t, int64(1), info.ResponseFacts.GeneratedImageCount)
+	assert.Nil(t, info.ResponseFacts.ImageCount, "client abort leaves the final upstream quantity unknown")
 }
 
 func TestImageExpressionUsesCompletedCountAndProtectsAbortedStreams(t *testing.T) {

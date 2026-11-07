@@ -55,6 +55,10 @@ func OpenaiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 
 	normalizeOpenAIUsage(&usageResp.Usage)
 	observeMediaUsage(info, &usageResp.Usage, responseBody)
+	count := openaiImageResponseCount(responseBody)
+	if info.ResponseFacts != nil && count <= dto.MaxImageN {
+		info.ResponseFacts.ImageCount = &count
+	}
 	if oaiError := usageResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		if info.ResponseFacts != nil {
 			return &usageResp.Usage, types.WithOpenAIError(*oaiError, resp.StatusCode)
@@ -62,12 +66,8 @@ func OpenaiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
 
-	count := openaiImageResponseCount(responseBody)
 	info.UpdateImageCount(count)
 	if info.ResponseFacts != nil {
-		if count <= dto.MaxImageN {
-			info.ResponseFacts.ImageCount = &count
-		}
 		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 			return &usageResp.Usage, types.NewError(fmt.Errorf("upstream image request failed"), types.ErrorCodeBadResponse)
 		}
@@ -214,6 +214,9 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 			if chunk.Type == "image_generation.completed" || chunk.Type == "image_edit.completed" {
 				if info.ResponseFacts == nil || openaiImageDataHasField(ojson.Parse(data), "url") || openaiImageDataHasField(ojson.Parse(data), "b64_json") {
 					completedImages++
+					if info.ResponseFacts != nil {
+						info.ResponseFacts.GeneratedImageCount = min(completedImages, int64(dto.MaxImageN))
+					}
 				}
 			}
 		}

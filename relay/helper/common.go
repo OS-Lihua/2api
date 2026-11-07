@@ -233,7 +233,13 @@ func ResponseChunkData(c *gin.Context, resp dto.ResponsesStreamResponse, data st
 	if err := event.Render(c.Writer); err != nil {
 		return err
 	}
-	return FlushWriter(c)
+	if err := FlushWriter(c); err != nil {
+		if facts, _ := common.GetContextKey(c, constant.ContextKeyResponseFacts); facts != nil {
+			return &StreamFlushError{Err: err}
+		}
+		return err
+	}
+	return nil
 }
 
 // StreamFlushError means the complete frame was written before flushing failed.

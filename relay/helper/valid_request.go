@@ -211,9 +211,13 @@ func GetAndValidOpenAIImageRequest(c *gin.Context, relayMode int) (*dto.ImageReq
 	switch relayMode {
 	case relayconstant.RelayModeImagesEdits:
 		if strings.Contains(c.Request.Header.Get("Content-Type"), "multipart/form-data") {
-			form, err := common.ParseMultipartFormReusable(c)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse image edit form request: %w", err)
+			form := c.Request.MultipartForm
+			if form == nil {
+				var err error
+				form, err = common.ParseMultipartFormReusable(c)
+				if err != nil {
+					return nil, fmt.Errorf("failed to parse image edit form request: %w", err)
+				}
 			}
 			formData := url.Values(form.Value)
 			c.Request.MultipartForm = form
