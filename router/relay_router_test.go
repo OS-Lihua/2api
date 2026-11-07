@@ -1718,13 +1718,15 @@ func TestTextGatewayInsufficientReservationStopsBeforeProvider(t *testing.T) {
 
 func TestTextGatewayLegacyModelRetainsTokenQuota(t *testing.T) {
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("legacy model must not use the new Channel") })
-	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "unknown-legacy-model", ChannelId: 999, Enabled: true}).Error)
+	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "unknown-legacy-model", ChannelId: fixture.channel.ProviderID, Enabled: true}).Error)
 	body := `{"model":"unknown-legacy-model","messages":[{"role":"user","content":"Hello"}]}`
 	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
 	assert.Equal(t, 401, response.Code, response.Body.String())
 	token, err := model.GetTokenById(fixture.token.Id)
 	require.NoError(t, err)
 	assert.Equal(t, common.TokenStatusExhausted, token.Status)
+	// Keep the registered legacy route unavailable for the unlimited-Key check.
+	require.NoError(t, model.DB.Model(&model.Ability{}).Where("model = ?", "unknown-legacy-model").Update("enabled", false).Error)
 	require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"status": common.TokenStatusEnabled, "unlimited_quota": true}).Error)
 	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
 	assert.Equal(t, 503, response.Code, response.Body.String())

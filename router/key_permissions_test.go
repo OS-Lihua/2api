@@ -142,7 +142,7 @@ func TestKeyPermissionsConcurrentEditsAndCredentialRestrictions(t *testing.T) {
 	for _, change := range []struct {
 		name  string
 		value any
-	}{{"status", common.TokenStatusDisabled}, {"status", common.TokenStatusExpired}, {"expired_time", int64(1)}, {"allow_ips", "203.0.113.0/24"}} {
+	}{{"status", common.TokenStatusDisabled}, {"status", common.TokenStatusExpired}, {"status", common.TokenStatusExhausted}, {"expired_time", int64(1)}, {"allow_ips", "203.0.113.0/24"}} {
 		require.NoError(t, model.DB.Model(f.token).Updates(map[string]any{"status": common.TokenStatusEnabled, "expired_time": -1, "allow_ips": ""}).Error)
 		require.NoError(t, model.DB.Model(f.token).Update(change.name, change.value).Error)
 		for _, path := range []string{"/v1/models", "/v1/models/gateway-alias"} {
@@ -155,6 +155,13 @@ func TestKeyPermissionsConcurrentEditsAndCredentialRestrictions(t *testing.T) {
 			assert.NotContains(t, response.Body.String(), "model_not_found")
 		}
 	}
+	require.NoError(t, model.DB.Model(f.token).Updates(map[string]any{"status": common.TokenStatusEnabled, "expired_time": -1, "allow_ips": ""}).Error)
+	require.NoError(t, model.DB.Model(f.user).Update("status", common.UserStatusDisabled).Error)
+	for _, name := range []string{"gateway-alias", "missing-offering"} {
+		response := adminSecurityRequest(f.engine, f.token.Key, http.MethodPost, "/v1/chat/completions", fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"Hello"}]}`, name))
+		assert.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
+	}
+	require.NoError(t, model.DB.Model(f.user).Update("status", common.UserStatusEnabled).Error)
 	require.NoError(t, f.token.Delete())
 	assert.Equal(t, 401, adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, "/v1/models", "").Code)
 	for _, name := range []string{"gateway-alias", "missing-offering"} {
