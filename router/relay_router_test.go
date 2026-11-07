@@ -1073,7 +1073,7 @@ func TestTextGatewayNativeResponsesFileFactsSurviveProjection(t *testing.T) {
 			}
 			assert.Zero(t, calls)
 			var attempts int64
-			require.NoError(t, model.DB.Model(&model.GatewayAttempt{}).Count(&attempts).Error)
+			require.NoError(t, model.LOG_DB.Model(&model.GatewayAttempt{}).Count(&attempts).Error)
 			assert.Zero(t, attempts)
 			wallet, err := model.GetUserWallet(fixture.user.Id)
 			require.NoError(t, err)
@@ -1516,7 +1516,7 @@ func TestTextGatewayNativeMessagesRequiresStructuredOutput(t *testing.T) {
 			require.Equal(t, 400, response.Code, response.Body.String())
 			assert.Zero(t, calls)
 			var attempts int64
-			require.NoError(t, model.DB.Model(&model.GatewayAttempt{}).Count(&attempts).Error)
+			require.NoError(t, model.LOG_DB.Model(&model.GatewayAttempt{}).Count(&attempts).Error)
 			assert.Zero(t, attempts)
 		})
 	}
@@ -1533,7 +1533,7 @@ func TestTextGatewayNativeGeminiRequiresDeclaredFeatures(t *testing.T) {
 			require.Equal(t, 400, response.Code, response.Body.String())
 			assert.Zero(t, calls)
 			var attempts int64
-			require.NoError(t, model.DB.Model(&model.GatewayAttempt{}).Count(&attempts).Error)
+			require.NoError(t, model.LOG_DB.Model(&model.GatewayAttempt{}).Count(&attempts).Error)
 			assert.Zero(t, attempts)
 		})
 	}

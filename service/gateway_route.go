@@ -80,9 +80,11 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 				reason = "capability"
 				break
 			}
-			if !mediaPrepared {
+			if !mediaPrepared && candidate.Protocol != protocol.OpenAIChat {
 				if err := PrepareGatewayMedia(c, original); err != nil {
-					return nil, &GatewayConversionError{Diagnostics: []types.ConversionDiagnostic{{Code: "request_media_unavailable", Path: "request", Message: "The request media could not be prepared", Severity: types.ConversionDiagnosticError}}}
+					reason = "conversion_loss"
+					rejected = append(rejected, types.ConversionDiagnostic{Code: "request_media_unavailable", Path: "request", Message: "The request media could not be prepared", Severity: types.ConversionDiagnosticError})
+					break
 				}
 				mediaPrepared = true
 			}
