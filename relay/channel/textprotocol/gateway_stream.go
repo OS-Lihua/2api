@@ -27,7 +27,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 	usage := &dto.Usage{}
 	meter := gatewayUsageAccumulator{format: p.format}
 	var streamErr error
-	var output strings.Builder
+	var output gatewayGeneratedOutput
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		info.StreamStatus.RequireTerminal()
 		var event any
@@ -96,8 +96,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			return
 		}
 		for _, result := range results {
-			text, writeErr := writeGatewayStreamResult(c, info, result.Value)
-			output.WriteString(text)
+			_, writeErr := writeGatewayStreamResult(c, info, result.Value, &output)
 			if writeErr != nil {
 				streamErr = writeErr
 				sr.Stop(writeErr)
@@ -118,8 +117,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			if streamErr != nil {
 				break
 			}
-			text, err := writeGatewayStreamResult(c, info, result.Value)
-			output.WriteString(text)
+			_, err := writeGatewayStreamResult(c, info, result.Value, &output)
 			streamErr = err
 		}
 	}
@@ -161,7 +159,7 @@ func gatewayUsageCounters(body []byte, format types.RelayFormat) (gjson.Result, 
 	}
 }
 
-func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value any) (string, error) {
+func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value any, output *gatewayGeneratedOutput) (string, error) {
 	event := ""
 	switch v := value.(type) {
 	case relayconvert.ChatToResponsesStreamEvent:
@@ -205,6 +203,15 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 		return "", err
 	}
 	text := gatewayStreamBusinessText(body, info.RelayFormat)
+	if info.RelayFormat == types.RelayFormatOpenAIResponses {
+		if toolText, handled := output.ObserveResponses(body); handled {
+			text = toolText
+		} else {
+			output.text.WriteString(text)
+		}
+	} else {
+		output.text.WriteString(text)
+	}
 	if text != "" {
 		info.ResponseFacts.BusinessOutput = true
 	}

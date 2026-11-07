@@ -64,9 +64,19 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 			if choice.Message.ReasoningContent != nil {
 				generated.WriteString(*choice.Message.ReasoningContent)
 			}
-			for _, tool := range choice.Message.ParseToolCalls() {
-				generated.WriteString(tool.Function.Name)
-				generated.WriteString(tool.Function.Arguments)
+			if p.format != types.RelayFormatOpenAIResponses || info.RelayFormat != types.RelayFormatOpenAIResponses {
+				for _, tool := range choice.Message.ParseToolCalls() {
+					generated.WriteString(tool.Function.Name)
+					generated.WriteString(tool.Function.Arguments)
+				}
+			}
+		}
+	}
+	if p.format == types.RelayFormatOpenAIResponses && info.RelayFormat == types.RelayFormatOpenAIResponses {
+		for _, item := range gjson.GetBytes(body, "output").Array() {
+			if name, arguments, ok := gatewayResponseTool(item); ok {
+				generated.WriteString(name)
+				generated.WriteString(arguments)
 			}
 		}
 	}

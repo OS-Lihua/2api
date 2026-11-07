@@ -728,6 +728,61 @@ func TestTextGatewayMissingUsageIgnoresOutputCeilings(t *testing.T) {
 	}
 }
 
+func TestTextGatewayResponsesToolSnapshotsDoNotDuplicateEstimatedOutput(t *testing.T) {
+	calls := 0
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"custom1\",\"type\":\"custom_tool_call\",\"name\":\"exec\",\"input\":\"\"}}\n\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"custom1\",\"output_index\":0,\"delta\":\"echo Hello\"}\n\n"))
+		if calls == 2 {
+			_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"custom1\",\"type\":\"custom_tool_call\",\"name\":\"exec\",\"input\":\"echo Hello\"}}\n\n"))
+		}
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\",\"status\":\"completed\",\"output\":[]}}\n\n"))
+	})
+	require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "openai_responses").Error)
+	var first *model.GatewayRequest
+	for range 2 {
+		response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/responses", `{"model":"gateway-offering","input":"Hello","tools":[{"type":"custom","name":"exec"}],"max_output_tokens":16,"stream":true}`)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+		require.NoError(t, err)
+		assert.Equal(t, "estimated", record.UsageSource)
+		assert.Greater(t, record.Usage.CompletionTokens, int64(0))
+		assert.Greater(t, record.Receivable.Nanos, int64(0))
+		if first == nil {
+			first = record
+			continue
+		}
+		assert.Equal(t, first.Usage.CompletionTokens, record.Usage.CompletionTokens)
+		assert.Equal(t, first.Receivable.Nanos, record.Receivable.Nanos)
+	}
+}
+
+func TestTextGatewayNativeHostedToolOutputIsBillable(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"search\",\"type\":\"web_search_call\",\"status\":\"in_progress\",\"action\":{\"type\":\"search\",\"query\":\"Hello\"}}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n"))
+				} else {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"id":"resp","status":"completed","object":"response","output":[{"id":"search","type":"web_search_call","status":"completed","action":{"type":"search","query":"Hello"}}],"usage":{"input_tokens":10,"output_tokens":5}}`))
+				}
+			})
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "openai_responses").Error)
+			body := fmt.Sprintf(`{"model":"gateway-offering","input":"Hello","tools":[{"type":"web_search_preview"}],"max_output_tokens":16,"stream":%t}`, stream)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/responses", body)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), "web_search_call")
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, "success", record.Status)
+			assert.Equal(t, int64(36000), record.Receivable.Nanos)
+		})
+	}
+}
+
 func TestTextGatewayConvertedStreamInterruptionDoesNotComplete(t *testing.T) {
 	for _, endpoint := range []struct{ path, body, failure, forbidden string }{
 		{"/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stream":true}`, `"error"`, "[DONE]"},
