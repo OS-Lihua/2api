@@ -1069,6 +1069,29 @@ func TestTextGatewayShortfallPersistsAndTopUpCannotBypassDebt(t *testing.T) {
 			assert.NotEqual(t, pending.ID, entry.RequestId)
 		}
 	}
+	// A batch cannot spend a new credit before satisfying older receivables.
+	_, err = model.PostLedgerEntries(
+		model.LedgerPosting{Account: model.UserWalletAccount(fixture.user.Id), Type: model.LedgerEntryAdjustment, Amount: money.Amount{Nanos: 1_000, Currency: "USD"}},
+		model.LedgerPosting{Account: model.UserWalletAccount(fixture.user.Id), Type: model.LedgerEntryCharge, Amount: money.Amount{Nanos: -1_000, Currency: "USD"}},
+	)
+	assert.ErrorIs(t, err, model.ErrInsufficientWalletBalance)
+	batch, err := model.PostLedgerEntries(
+		model.LedgerPosting{Account: model.UserWalletAccount(fixture.user.Id), Type: model.LedgerEntryAdjustment, Amount: money.Amount{Nanos: 40, Currency: "USD"}},
+		model.LedgerPosting{Account: model.UserWalletAccount(fixture.user.Id), Type: model.LedgerEntryRefund, Amount: money.Amount{Nanos: 60, Currency: "USD"}},
+	)
+	require.NoError(t, err)
+	funding := make(map[string]int64)
+	var allocations []int64
+	for _, entry := range batch {
+		if entry.AccountType == model.LedgerAccountUserWallet && entry.Amount.Nanos > 0 {
+			funding[fmt.Sprintf("Receivable repayment funded by ledger entry %d", entry.Id)] = entry.Amount.Nanos
+		}
+		if entry.AccountType == model.LedgerAccountUserWallet && entry.Type == model.LedgerEntryRepayment {
+			allocations = append(allocations, -entry.Amount.Nanos)
+			assert.GreaterOrEqual(t, funding[entry.Remark], -entry.Amount.Nanos, "a repayment cannot exceed its funding credit")
+		}
+	}
+	assert.Equal(t, []int64{40, 60}, allocations)
 	require.NoError(t, model.PrepareGatewaySettlement(model.GatewaySettlement{Request: concurrent, SaleSource: concurrent.Receivable}))
 
 	// Race a duplicate payment against a prepared settlement and recovery.
@@ -1105,7 +1128,7 @@ func TestTextGatewayShortfallPersistsAndTopUpCannotBypassDebt(t *testing.T) {
 	}
 	wallet, err = model.GetUserWallet(fixture.user.Id)
 	require.NoError(t, err)
-	assert.Equal(t, int64(38_400), wallet.Balance.Nanos)
+	assert.Equal(t, int64(38_500), wallet.Balance.Nanos)
 	assert.False(t, wallet.RequestsPaused)
 	outstanding, err = model.GetUserOutstanding(fixture.user.Id)
 	require.NoError(t, err)

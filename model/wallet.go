@@ -218,6 +218,11 @@ type LedgerPosting struct {
 // ErrInsufficientWalletBalance.
 func PostLedgerEntries(postings ...LedgerPosting) ([]*LedgerEntry, error) {
 	for _, posting := range postings {
+		// Debt creation belongs to the gateway settlement, and repayments are
+		// inseparable pairs generated below. Neither is a standalone adjustment.
+		if posting.Account.Type == LedgerAccountUserReceivable || posting.Type == LedgerEntryRepayment {
+			return nil, ErrLedgerInvalidEntry
+		}
 		if err := validateLedgerPosting(posting); err != nil {
 			return nil, err
 		}
@@ -334,27 +339,27 @@ func postLedgerEntries(tx *gorm.DB, postings []LedgerPosting) ([]*LedgerEntry, e
 		wallet.Balance = balance
 		wallet.UpdatedAt = now
 		entries = append(entries, entry)
-	}
-	// Sweep after the whole batch: a settlement can release its reservation
-	// and charge in one posting. All account locks were acquired up front.
-	swept := make(map[int]bool)
-	for _, posting := range postings {
-		if (posting.Account.Type != LedgerAccountUserWallet && posting.Account.Type != LedgerAccountUserReceivable) || posting.Type == LedgerEntryRepayment || swept[posting.Account.OwnerId] {
+		if posting.Type == LedgerEntryRepayment || (posting.Account.Type != LedgerAccountUserWallet && posting.Account.Type != LedgerAccountUserReceivable) {
 			continue
 		}
-		swept[posting.Account.OwnerId] = true
-		account := UserWalletAccount(posting.Account.OwnerId)
-		wallet := wallets[account]
+		user := wallets[UserWalletAccount(posting.Account.OwnerId)]
 		debt := wallets[UserReceivableAccount(posting.Account.OwnerId)]
-		payment := min(wallet.Balance.Nanos, debt.Balance.Nanos)
-		if payment > 0 {
-			paid, err := repayWalletReceivables(tx, wallet, debt, payment)
-			if err != nil {
-				return nil, err
+		// Each credit pays old debt before the next posting can spend it. The
+		// source entry remains intact and funds only its own repayment pairs.
+		if posting.Account.Type == LedgerAccountUserWallet && posting.Amount.Nanos > 0 {
+			payment := min(user.Balance.Nanos, debt.Balance.Nanos)
+			if payment > 0 {
+				paid, err := repayWalletReceivables(tx, user, debt, payment, entry.Id)
+				if err != nil {
+					return nil, err
+				}
+				entries = append(entries, paid...)
 			}
-			entries = append(entries, paid...)
 		}
-		if err := tx.Model(&Wallet{}).Where("id = ?", wallet.Id).Update("requests_paused", debt.Balance.Nanos > 0).Error; err != nil {
+		if debt.Balance.Nanos > 0 && user.Balance.Nanos > 0 {
+			return nil, fmt.Errorf("%w: unpaid receivables cannot coexist with spendable funds", ErrLedgerInvalidEntry)
+		}
+		if err := tx.Model(&Wallet{}).Where("id = ?", user.Id).Update("requests_paused", debt.Balance.Nanos > 0).Error; err != nil {
 			return nil, err
 		}
 	}
@@ -364,11 +369,7 @@ func postLedgerEntries(tx *gorm.DB, postings []LedgerPosting) ([]*LedgerEntry, e
 // repayWalletReceivables allocates funds to the oldest unpaid request first.
 // Both wallets are already locked. The paired entries retain the debt's request
 // and identify the funding wallet entry without changing the original credit.
-func repayWalletReceivables(tx *gorm.DB, wallet, debt *Wallet, available int64) ([]*LedgerEntry, error) {
-	var funding LedgerEntry
-	if err := tx.Where("wallet_id = ? AND amount_nanos > 0", wallet.Id).Order("id DESC").First(&funding).Error; err != nil {
-		return nil, err
-	}
+func repayWalletReceivables(tx *gorm.DB, wallet, debt *Wallet, available, fundingEntryID int64) ([]*LedgerEntry, error) {
 	var unpaid []struct {
 		RequestId string
 		FirstId   int64
@@ -389,8 +390,8 @@ func repayWalletReceivables(tx *gorm.DB, wallet, debt *Wallet, available int64) 
 			return nil, err
 		}
 		payment := min(available, amount.Nanos)
-		key := fmt.Sprintf("repayment:%d:%d", funding.Id, item.FirstId)
-		remark := fmt.Sprintf("Receivable repayment funded by ledger entry %d", funding.Id)
+		key := fmt.Sprintf("repayment:%d:%d", fundingEntryID, item.FirstId)
+		remark := fmt.Sprintf("Receivable repayment funded by ledger entry %d", fundingEntryID)
 		paid, err := postLedgerEntries(tx, []LedgerPosting{
 			{Account: UserWalletAccount(wallet.OwnerId), Type: LedgerEntryRepayment, Amount: money.Amount{Nanos: -payment, Currency: wallet.Balance.Currency}, RequestId: item.RequestId, IdempotencyKey: key + ":wallet", Remark: remark},
 			{Account: UserReceivableAccount(wallet.OwnerId), Type: LedgerEntryRepayment, Amount: money.Amount{Nanos: -payment, Currency: wallet.Balance.Currency}, RequestId: item.RequestId, IdempotencyKey: key + ":receivable", Remark: remark},
