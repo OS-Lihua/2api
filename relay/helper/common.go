@@ -395,6 +395,13 @@ func WriteChatResponse(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 }
 
 func Done(c *gin.Context) {
+	if value, ok := common.GetContextKey(c, constant.ContextKeyResponseFacts); ok {
+		if facts, _ := value.(*relaycommon.ResponseFacts); facts != nil && facts.OnBusinessOutput != nil {
+			if !facts.BusinessOutput || facts.CanFinishStream != nil && !facts.CanFinishStream() {
+				return
+			}
+		}
+	}
 	_ = StringData(c, "[DONE]")
 }
 

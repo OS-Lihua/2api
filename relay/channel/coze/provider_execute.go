@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
@@ -55,13 +56,25 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 		return nil, err
 	}
 	var created CozeChatResponse
-	err = common.DecodeJson(response.Body, &created)
+	createdBody, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	response.Body.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	err = common.Unmarshal(createdBody, &created)
+	if response.StatusCode >= 400 {
+		response.Body = &cozeResultBody{ReadCloser: io.NopCloser(bytes.NewReader(createdBody)), completion: created, completionBody: createdBody}
+		return response, nil
+	}
 	if err != nil {
 		return nil, err
 	}
 	if created.Code != 0 {
-		return nil, fmt.Errorf("Coze chat creation failed: %s", created.Msg)
+		rejection := types.NewOpenAIError(fmt.Errorf("Coze chat creation rejected"), types.ErrorCodeBadResponse, response.StatusCode)
+		failure := rejection.ToOpenAIError()
+		failure.Code = fmt.Sprint(created.Code)
+		rejection.RelayError = failure
+		return nil, rejection
 	}
 	query := url.Values{"conversation_id": {created.Data.ConversationId}, "chat_id": {created.Data.Id}}
 	retrieveURL := account.ChannelBaseUrl + "/v3/chat/retrieve?" + query.Encode()
@@ -84,8 +97,10 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 			return nil, err
 		}
 		if facts, _ := common.GetContextKey(c, constant.ContextKeyResponseFacts); facts != nil &&
-			(completion.Code != 0 || completion.Data.Status == "failed" || completion.Data.Status == "canceled" || completion.Data.Status == "requires_action") {
-			response.StatusCode = http.StatusBadGateway
+			(response.StatusCode >= 400 || completion.Code != 0 || completion.Data.Status == "failed" || completion.Data.Status == "canceled" || completion.Data.Status == "requires_action") {
+			if response.StatusCode < 400 {
+				response.StatusCode = http.StatusBadGateway
+			}
 			response.Body = &cozeResultBody{ReadCloser: io.NopCloser(bytes.NewReader(completionBody)), completion: completion, completionBody: completionBody}
 			return response, nil
 		}

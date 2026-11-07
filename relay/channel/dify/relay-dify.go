@@ -286,6 +286,7 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 				if status < 400 || status > 599 {
 					status = http.StatusBadGateway
 				}
+				info.StreamStatus.MarkFailed(difyResponse.Code, "upstream_error", status)
 				streamError = types.WithOpenAIError(types.OpenAIError{Message: "Upstream stream failed", Type: "upstream_error", Code: difyResponse.Code}, status)
 			}
 			sr.Stop(fmt.Errorf("dify error event"))

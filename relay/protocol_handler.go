@@ -217,6 +217,11 @@ func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayI
 		}
 	}
 	metadata := a.providerMetadata(info)
+	if preparer, ok := a.provider.(channel.ProviderAccountPreparer); ok {
+		if err := preparer.PrepareAccount(c.Request.Context(), metadata, info.BeginProviderCall); err != nil {
+			return nil, err
+		}
+	}
 	if providerNeedsPayload(a.provider) {
 		payload, err := io.ReadAll(requestBody)
 		if err != nil {

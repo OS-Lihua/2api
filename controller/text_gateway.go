@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -49,6 +50,21 @@ type textGatewayRun struct {
 
 func (run *textGatewayRun) fail(c *gin.Context, status int, code, message string) {
 	run.status, run.code, run.message = status, code, message
+}
+
+func gatewayPreparationRejection(err error, budget *service.GatewayAttemptBudget, parent context.Context, providerID int) service.GatewayAttemptResult {
+	var result service.GatewayAttemptResult
+	var rejection *types.NewAPIError
+	if !errors.As(err, &rejection) {
+		return result
+	}
+	native := rejection.ToOpenAIError()
+	code, _ := native.Code.(string)
+	result.Failure = service.ClassifyGatewayFailure(rejection.StatusCode, code, false, budget.TimedOut(), parent.Err() != nil, false, native.Type)
+	if result.Failure.ExcludeProvider {
+		result.SkippedProvider = providerID
+	}
+	return result
 }
 
 // TextGateway uses one reservation and one settlement for all actual sends.
@@ -179,7 +195,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		info.RequestId = run.record.ID
 	}
 	info.TokenizerModel = selection.Channel.Model.ModelName
-	info.ResponseFacts = &relaycommon.ResponseFacts{OnBusinessOutput: budget.Delivered}
+	info.ResponseFacts = &relaycommon.ResponseFacts{OnBusinessOutput: budget.Delivered, CanFinishStream: info.StreamStatus.CompletedNormally}
 	info.BeginProviderCall = budget.Start
 	common.SetContextKey(c, constant.ContextKeyResponseFacts, info.ResponseFacts)
 	info.InitChannelMeta(c)
@@ -347,6 +363,9 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				attempt.Status = "failed"
 			}
 			outcome := info.StreamStatus.OutcomeSnapshot()
+			if outcome.ErrorCode != "" {
+				upstreamCode = outcome.ErrorCode
+			}
 			if upstreamCode == "" {
 				upstreamCode = info.ResponseFacts.UpstreamErrorCode
 			}
@@ -449,20 +468,13 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	info.SetEstimatePromptTokens(estimatedInput)
 	encoded, err = adaptor.PrepareChatRequest(c, info, converted, encoded)
 	if err != nil {
-		var rejection *types.NewAPIError
-		if errors.As(err, &rejection) {
-			native := rejection.ToOpenAIError()
-			code, _ := native.Code.(string)
-			result.Failure = service.ClassifyGatewayFailure(rejection.StatusCode, code, false, budget.TimedOut(), parent.Context().Err() != nil, false, native.Type)
-			if result.Failure.ExcludeProvider {
-				result.SkippedProvider = selection.Channel.ProviderID
-			}
-		}
+		result = gatewayPreparationRejection(err, budget, parent.Context(), selection.Channel.ProviderID)
 		run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
 		return
 	}
 	prepared, err := adaptor.PrepareRequest(c, info, bytes.NewReader(encoded))
 	if err != nil {
+		result = gatewayPreparationRejection(err, budget, parent.Context(), selection.Channel.ProviderID)
 		run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
 		return
 	}
@@ -502,7 +514,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		transportFailed = true
 		attemptErr = types.NewError(err, types.ErrorCodeDoRequestFailed)
 		var rejection *types.NewAPIError
-		if errors.As(err, &rejection) && rejection.GetErrorCode() != types.ErrorCodeDoRequestFailed && rejection.StatusCode >= 400 && (!budget.TimedOut() || rejection.StatusCode != 500) {
+		if errors.As(err, &rejection) && rejection.GetErrorCode() != types.ErrorCodeDoRequestFailed && rejection.StatusCode >= 100 && (!budget.TimedOut() || rejection.StatusCode != 500) {
 			attemptErr = rejection
 			upstreamStatus, transportFailed = rejection.StatusCode, false
 			failure := rejection.ToOpenAIError()
@@ -564,6 +576,9 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		return
 	}
 	info.IsStream = info.IsStream || strings.HasPrefix(httpResponse.Header.Get("Content-Type"), "text/event-stream")
+	if info.IsStream {
+		httpResponse.Body = helper.GatewayStreamIdleBody(httpResponse.Body, info)
+	}
 	responseUsage, responseErr := adaptor.DoResponse(c, httpResponse, info)
 	usage, _ = responseUsage.(*dto.Usage)
 	attemptErr = responseErr
@@ -573,9 +588,6 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		upstreamCode, _ = apiError.Code.(string)
 		if upstreamCode == "" {
 			upstreamCode = apiError.Type
-		}
-		if responseErr.StatusCode >= 400 {
-			upstreamStatus = responseErr.StatusCode
 		}
 	}
 	if status, _ := gatewayAttemptOutcome(c, info, responseErr); status != "success" {

@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"context"
 	"errors"
 	"github.com/gin-gonic/gin"
 	"io"
@@ -10,6 +11,12 @@ import (
 // ErrUseHTTPTransport asks the host to use its ordinary HTTP transport after a
 // provider has determined that no SDK or WebSocket transport is required.
 var ErrUseHTTPTransport = errors.New("use ordinary provider HTTP transport")
+
+// ProviderAccountPreparer resolves account credentials before a model Attempt.
+// begin must be called immediately before upstream I/O and its context reused.
+type ProviderAccountPreparer interface {
+	PrepareAccount(context.Context, ProviderMetadata, func() (context.Context, error)) error
+}
 
 // ReplayableResponseBody retains protocol-owned metadata when the host buffers
 // an HTTP error body and installs a reader for the protocol parser.
