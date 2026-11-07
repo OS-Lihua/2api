@@ -64,6 +64,7 @@ import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { ModelPricingPanel } from '@/features/model-pricing/model-pricing-panel'
+import { RecommendationPicker } from '@/features/recommendations/recommendation-picker'
 import {
   requireServerSuccess,
   createServerError,
@@ -426,6 +427,17 @@ export function ModelMutateDrawer(props: {
                         )}
                       />
 
+                      {!isEditing && (
+                        <RecommendationPicker
+                          kind='publisher'
+                          input={{ model_name: form.watch('model_name') }}
+                          onConfirm={(rule) =>
+                            form.setValue('vendor_id', rule.publisher_id, {
+                              shouldDirty: true,
+                            })
+                          }
+                        />
+                      )}
                       <FormField
                         control={form.control}
                         name='tags'

@@ -40,6 +40,84 @@ import { ModelsDialogs } from '../components/models-dialogs'
 import { ModelsProvider } from '../components/models-provider'
 import type { Model } from '../types'
 
+it('Publisher recommendation waits for confirmation and preserves manual selection while the query is pending', async () => {
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
+  let resolveRecommendation!: (
+    value: Awaited<ReturnType<typeof api.get>>
+  ) => void
+  const pending = new Promise<Awaited<ReturnType<typeof api.get>>>(
+    (resolve) => {
+      resolveRecommendation = resolve
+    }
+  )
+  vi.spyOn(api, 'get').mockImplementation(async (path) => {
+    if (String(path).includes('/recommendations/publisher')) return pending
+    return {
+      data: {
+        success: true,
+        data: {
+          items: [
+            { id: 3, name: 'Manual publisher' },
+            { id: 4, name: 'OpenAI' },
+          ],
+        },
+      },
+    }
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <ModelMutateDrawer open onOpenChange={() => undefined} />
+    </QueryClientProvider>
+  )
+  await userEvent.type(
+    screen.getByRole('textbox', { name: /Model Name/ }),
+    'gpt-4o-q4'
+  )
+  const publisher = screen.getByRole('combobox', { name: 'Publisher' })
+  await userEvent.click(publisher)
+  await userEvent.click(
+    await screen.findByRole('option', { name: 'Manual publisher' })
+  )
+  await act(async () =>
+    resolveRecommendation({
+      data: {
+        success: true,
+        data: {
+          items: [
+            {
+              id: 7,
+              kind: 'publisher',
+              pattern: 'gpt-',
+              publisher_name: 'OpenAI',
+              publisher_id: 4,
+              provider_name: '',
+              provider_type: 0,
+              enabled: true,
+              priority: 0,
+            },
+          ],
+        },
+      },
+    })
+  )
+  expect(publisher).toHaveValue('Manual publisher')
+  await userEvent.click(
+    await screen.findByRole('button', { name: 'Use recommendation' })
+  )
+  expect(publisher).toHaveValue('Manual publisher')
+  await userEvent.click(
+    screen.getByRole('button', { name: 'Confirm recommendation' })
+  )
+  expect(publisher).toHaveValue('OpenAI')
+  expect(screen.getByRole('textbox', { name: /Model Name/ })).toHaveValue(
+    'gpt-4o-q4'
+  )
+  client.clear()
+})
+
 const model = {
   id: 7,
   model_name: 'example-model',
