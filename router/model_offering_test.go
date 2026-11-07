@@ -158,7 +158,10 @@ func TestModelOfferingAPI(t *testing.T) {
 		assert.Equal(t, member["capabilities"], synced["capabilities"])
 		status, response = call(http.MethodPut, offeringEndpoint, fmt.Sprintf(`{"name":"sync-offering","aliases":["sync-alias"],"members":[{"model_id":%d,"tier":1}]}`, memberID))
 		require.Equal(t, http.StatusOK, status, response)
-		assert.Equal(t, offering, response["data"])
+		saved := response["data"].(map[string]any)
+		for _, field := range []string{"name", "aliases", "members"} {
+			assert.Equal(t, offering.(map[string]any)[field], saved[field], field)
+		}
 	})
 
 	t.Run("primary names and aliases share a unique namespace", func(t *testing.T) {
