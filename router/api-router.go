@@ -421,6 +421,16 @@ func SetApiRouter(router *gin.Engine) {
 			modelsRoute.DELETE("/:id", controller.DeleteModelMeta)
 		}
 
+		adminV1 := apiRouter.Group("/admin/v1")
+		adminV1.Use(middleware.AdminAuth())
+		{
+			adminV1.GET("/models", controller.AdminListModels)
+			adminV1.GET("/models/:id", controller.AdminGetModel)
+			adminV1.POST("/models", controller.AdminCreateModel)
+			adminV1.PUT("/models/:id", controller.AdminUpdateModel)
+			adminV1.DELETE("/models/:id", controller.AdminDeleteModel)
+		}
+
 		// Deployments (model deployment management)
 		deploymentsRoute := apiRouter.Group("/deployments")
 		deploymentsRoute.Use(middleware.AdminAuth())

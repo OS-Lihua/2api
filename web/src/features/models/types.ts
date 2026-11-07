@@ -35,6 +35,39 @@ export interface BoundChannel {
  */
 export type ModelSquareState = 'visible' | 'unavailable' | 'hidden' | 'partial'
 
+export const MODEL_CAPABILITY_FEATURES = [
+  'streaming',
+  'tool_calling',
+  'reasoning',
+  'structured_output',
+  'caching',
+] as const
+
+export const MODEL_MODALITIES = ['text', 'image', 'audio', 'video', 'pdf'] as const
+
+export const MODEL_CAPABILITY_LIMITS = [
+  'context_length',
+  'max_output_tokens',
+  'max_images',
+  'max_duration_seconds',
+  'embedding_dimensions',
+] as const
+
+export type ModelCapabilityFeature = (typeof MODEL_CAPABILITY_FEATURES)[number]
+export type ModelModality = (typeof MODEL_MODALITIES)[number]
+export type ModelCapabilityLimit = (typeof MODEL_CAPABILITY_LIMITS)[number]
+
+/**
+ * Capabilities declared for an exact-name Model. An absent limit is not
+ * declared.
+ */
+export interface ModelCapabilities {
+  features: ModelCapabilityFeature[]
+  input_modalities: ModelModality[]
+  output_modalities: ModelModality[]
+  limits: Partial<Record<ModelCapabilityLimit, number>>
+}
+
 export interface Model {
   square_state?: ModelSquareState
   has_metadata?: boolean
@@ -52,6 +85,7 @@ export interface Model {
   created_time: number
   updated_time: number
   name_rule: number
+  capabilities?: ModelCapabilities
   // Runtime fields
   bound_channels?: BoundChannel[]
   enable_groups?: string[]

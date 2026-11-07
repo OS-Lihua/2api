@@ -25,6 +25,7 @@ import type {
   GetVendorsResponse,
   GetVendorResponse,
   Model,
+  ModelCapabilities,
   Vendor,
   SearchModelsParams,
   SyncUpstreamResponse,
@@ -121,6 +122,32 @@ export async function deleteModel(
       remove_pricing: removePricing,
     },
   })
+  return res.data
+}
+
+/**
+ * Replace an exact-name Model through the admin API. The admin API takes the
+ * full declaration, so the saved metadata is sent with the new capabilities.
+ */
+export async function updateModelCapabilities(
+  model: Model,
+  capabilities: ModelCapabilities
+): Promise<{ success: boolean; message?: string }> {
+  const res = await api.put(
+    `/api/admin/v1/models/${model.id}`,
+    {
+      name: model.model_name,
+      publisher_id: model.vendor_id ?? 0,
+      description: model.description ?? '',
+      icon: model.icon ?? '',
+      tags: model.tags ?? '',
+      endpoints: model.endpoints ?? '',
+      status: model.status,
+      sync_official: model.sync_official,
+      capabilities,
+    },
+    { skipBusinessError: true, skipErrorHandler: true }
+  )
   return res.data
 }
 
