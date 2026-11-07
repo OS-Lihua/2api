@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/protocol"
@@ -67,14 +68,17 @@ func (p *novaProtocol) DoResponse(c *gin.Context, resp *http.Response, info *rel
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
 	}
-	response, err := novaChatResponse(body, info.UpstreamModelName, helper.GetResponseID(c))
+	response, reportedUsage, err := novaChatResponse(body, info.UpstreamModelName, helper.GetResponseID(c))
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	if info.IsStream {
 		// The legacy Nova integration uses InvokeModel even for streaming clients.
 		// Emit one content chunk and the reported usage through the shared parser.
-		chunk := dto.ChatCompletionsStreamResponse{Id: response.Id, Object: "chat.completion.chunk", Created: common.GetTimestamp(), Model: response.Model, Usage: &response.Usage}
+		chunk := dto.ChatCompletionsStreamResponse{Id: response.Id, Object: "chat.completion.chunk", Created: common.GetTimestamp(), Model: response.Model}
+		if reportedUsage {
+			chunk.Usage = &response.Usage
+		}
 		choice := dto.ChatCompletionsStreamResponseChoice{Index: 0, FinishReason: common.GetPointer("stop")}
 		choice.Delta.SetContentString(response.Choices[0].Message.StringContent())
 		chunk.Choices = []dto.ChatCompletionsStreamResponseChoice{choice}
@@ -85,14 +89,21 @@ func (p *novaProtocol) DoResponse(c *gin.Context, resp *http.Response, info *rel
 		resp.Body = io.NopCloser(bytes.NewReader(append(append([]byte("data: "), encoded...), []byte("\n\ndata: [DONE]\n\n")...)))
 		return p.public.DoResponse(c, resp, info)
 	}
-	encoded, err := common.Marshal(response)
+	wire := struct {
+		*dto.OpenAITextResponse
+		Usage *dto.Usage `json:"usage,omitempty"`
+	}{OpenAITextResponse: response}
+	if reportedUsage {
+		wire.Usage = &response.Usage
+	}
+	encoded, err := common.Marshal(wire)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	resp.Body = io.NopCloser(bytes.NewReader(encoded))
 	return p.public.DoResponse(c, resp, info)
 }
-func novaChatResponse(body []byte, model, id string) (*dto.OpenAITextResponse, error) {
+func novaChatResponse(body []byte, model, id string) (*dto.OpenAITextResponse, bool, error) {
 	var response struct {
 		Output struct {
 			Message struct {
@@ -101,20 +112,24 @@ func novaChatResponse(body []byte, model, id string) (*dto.OpenAITextResponse, e
 				} `json:"content"`
 			} `json:"message"`
 		} `json:"output"`
-		Usage struct {
+		Usage *struct {
 			InputTokens  int `json:"inputTokens"`
 			OutputTokens int `json:"outputTokens"`
 			TotalTokens  int `json:"totalTokens"`
 		} `json:"usage"`
 	}
 	if err := common.Unmarshal(body, &response); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	content := ""
+	var content strings.Builder
 	for _, part := range response.Output.Message.Content {
-		content += part.Text
+		content.WriteString(part.Text)
 	}
-	return &dto.OpenAITextResponse{Id: id, Object: "chat.completion", Created: common.GetTimestamp(), Model: model,
-		Choices: []dto.OpenAITextResponseChoice{{Index: 0, Message: dto.Message{Role: "assistant", Content: content}, FinishReason: "stop"}},
-		Usage:   dto.Usage{PromptTokens: response.Usage.InputTokens, CompletionTokens: response.Usage.OutputTokens, TotalTokens: response.Usage.TotalTokens}}, nil
+	chat := &dto.OpenAITextResponse{Id: id, Object: "chat.completion", Created: common.GetTimestamp(), Model: model,
+		Choices: []dto.OpenAITextResponseChoice{{Index: 0, Message: dto.Message{Role: "assistant", Content: content.String()}, FinishReason: "stop"}},
+	}
+	if response.Usage != nil {
+		chat.Usage = dto.Usage{PromptTokens: response.Usage.InputTokens, CompletionTokens: response.Usage.OutputTokens, TotalTokens: response.Usage.TotalTokens}
+	}
+	return chat, response.Usage != nil, nil
 }

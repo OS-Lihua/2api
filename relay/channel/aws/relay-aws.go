@@ -335,7 +335,7 @@ func handleNovaRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Protocol)
 		return newAwsInvokeError(requestContext, err, "InvokeModel"), nil
 	}
 
-	response, err := novaChatResponse(awsResp.Body, info.UpstreamModelName, helper.GetResponseID(c))
+	response, _, err := novaChatResponse(awsResp.Body, info.UpstreamModelName, helper.GetResponseID(c))
 	if err != nil {
 		return types.NewError(errors.Wrap(err, "unmarshal nova response"), types.ErrorCodeBadResponseBody), nil
 	}

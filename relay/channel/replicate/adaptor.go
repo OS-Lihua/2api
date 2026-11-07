@@ -2,7 +2,6 @@ package replicate
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -113,7 +112,7 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 
 	if len(request.OutputFormat) > 0 {
 		var outputFormat string
-		if err := json.Unmarshal(request.OutputFormat, &outputFormat); err == nil && strings.TrimSpace(outputFormat) != "" {
+		if err := common.Unmarshal(request.OutputFormat, &outputFormat); err == nil && strings.TrimSpace(outputFormat) != "" {
 			inputPayload["output_format"] = outputFormat
 		}
 	}
@@ -168,6 +167,16 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 		inputPayload[key] = val
 	}
 
+	if rawCount, ok := inputPayload["num_outputs"]; ok {
+		encoded, err := common.Marshal(rawCount)
+		if err != nil {
+			return nil, fmt.Errorf("invalid num_outputs: %w", err)
+		}
+		var count uint
+		if err := common.Unmarshal(encoded, &count); err != nil || count == 0 || count > dto.MaxImageN {
+			return nil, fmt.Errorf("num_outputs must be an integer between 1 and %d", dto.MaxImageN)
+		}
+	}
 	return map[string]any{
 		"input": inputPayload,
 	}, nil

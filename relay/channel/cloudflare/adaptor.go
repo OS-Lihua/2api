@@ -91,6 +91,7 @@ func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayIn
 	defer file.Close()
 	// 打开临时文件用于保存上传的文件内容
 	requestBody := &bytes.Buffer{}
+	c.Request.Header.Set("Content-Type", "application/octet-stream")
 
 	// 将上传的文件内容复制到临时文件
 	if _, err := io.Copy(requestBody, file); err != nil {

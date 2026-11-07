@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/QuantumNous/new-api/common"
 	channelconstant "github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
@@ -56,7 +57,10 @@ func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayIn
 	if err != nil {
 		return nil, err
 	}
+	return convertTTSRequest(c, info, request, VolcengineTTSApp{AppID: appID, Token: token, Cluster: "volcano_tts"})
+}
 
+func convertTTSRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.AudioRequest, app VolcengineTTSApp) (io.Reader, error) {
 	voiceType := mapVoiceType(request.Voice)
 	speedRatio := lo.FromPtrOr(request.Speed, 0.0)
 	encoding := mapEncoding(request.ResponseFormat)
@@ -64,11 +68,7 @@ func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayIn
 	c.Set(contextKeyResponseFormat, encoding)
 
 	volcRequest := VolcengineTTSRequest{
-		App: VolcengineTTSApp{
-			AppID:   appID,
-			Token:   token,
-			Cluster: "volcano_tts",
-		},
+		App: app,
 		User: VolcengineTTSUser{
 			UID: "openai_relay_user",
 		},
@@ -87,7 +87,7 @@ func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayIn
 	}
 
 	if len(request.Metadata) > 0 {
-		if err = json.Unmarshal(request.Metadata, &volcRequest); err != nil {
+		if err := common.Unmarshal(request.Metadata, &volcRequest); err != nil {
 			return nil, fmt.Errorf("error unmarshalling metadata to volcengine request: %w", err)
 		}
 	}
@@ -98,7 +98,7 @@ func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayIn
 		info.IsStream = true
 	}
 
-	jsonData, err := json.Marshal(volcRequest)
+	jsonData, err := common.Marshal(volcRequest)
 	if err != nil {
 		return nil, fmt.Errorf("error marshalling volcengine request: %w", err)
 	}

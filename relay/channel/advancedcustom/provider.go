@@ -3,6 +3,7 @@ package advancedcustom
 import (
 	"errors"
 	"fmt"
+	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -49,7 +50,8 @@ func (a *Provider) resolveProvider(c *gin.Context, info *channel.ProviderRequest
 	if route.Converter == "" {
 		route.Converter = relayconvert.ConverterNone
 	}
-	if info.Protocol != "" && route.Converter != relayconvert.ConverterNone {
+	if info.Protocol != "" && route.Converter != relayconvert.ConverterNone &&
+		!(info.Protocol == protocol.Rerank && route.Converter == dto.AdvancedCustomConverterSGLangRerank) {
 		spec, ok := relayconvert.LookupRequestConverter(route.Converter)
 		if !ok || spec.To != info.RelayFormat {
 			return fmt.Errorf("advanced custom route converter %q does not target selected protocol %q", route.Converter, info.Protocol)

@@ -10,6 +10,12 @@ import (
 )
 
 func (p *Provider) ComposeProtocol(kind protocol.Type, generic channel.ProtocolHandler) (channel.ProtocolHandler, error) {
+	if kind == protocol.GeminiEmbed {
+		return generic, nil
+	}
+	if channel.IsNonTextProtocol(kind) {
+		return channel.ComposeNonTextProtocol(kind, generic, &Protocol{}, protocol.OpenAIEmbeddings, protocol.OpenAIImages, protocol.OpenAIAudioSpeech, protocol.OpenAIAudioTranscription, protocol.Rerank)
+	}
 	switch kind {
 	case protocol.OpenAIChat, protocol.OpenAIResponses, protocol.AnthropicMessages, protocol.GeminiGenerate:
 		return &channel.RequestRepairProtocol{Kind: kind, Public: generic, Provider: p}, nil

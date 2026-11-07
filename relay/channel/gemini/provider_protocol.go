@@ -9,6 +9,12 @@ import (
 var _ channel.ProviderProtocolComposer = (*Provider)(nil)
 
 func (p *Provider) ComposeProtocol(kind protocol.Type, generic channel.ProtocolHandler) (channel.ProtocolHandler, error) {
+	if kind == protocol.GeminiEmbed {
+		return generic, nil
+	}
+	if channel.IsNonTextProtocol(kind) {
+		return channel.ComposeNonTextProtocol(kind, generic, &Protocol{}, protocol.OpenAIImages)
+	}
 	switch kind {
 	case protocol.GeminiGenerate:
 		return generic, nil

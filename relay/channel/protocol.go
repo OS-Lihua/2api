@@ -29,6 +29,9 @@ func ComposeProviderProtocol(provider ProviderAdapter, kind protocol.Type, gener
 		if err != nil {
 			return nil, err
 		}
+		if handler == nil {
+			return nil, fmt.Errorf("provider did not supply a handler for protocol %q", kind)
+		}
 	}
 	if source, ok := provider.(ProviderUsagePolicySource); ok {
 		handler = &providerUsageProtocol{kind: kind, provider: source, handler: handler}
@@ -83,15 +86,30 @@ func (p *WireProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInf
 		return nil, err
 	}
 	mode := info.RelayMode
-	info.RelayMode = protocolRelayMode(p.Kind)
+	info.RelayMode = p.relayMode(info)
 	defer func() { info.RelayMode = mode }()
-	return p.Wire.ConvertRequest(c, info, converted)
+	converted, err = p.Wire.ConvertRequest(c, info, converted)
+	if err == nil && converted == nil {
+		return nil, fmt.Errorf("provider wire conversion for %q returned no request", p.Kind)
+	}
+	return converted, err
 }
 func (p *WireProtocol) DoResponse(c *gin.Context, response *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
 	mode := info.RelayMode
-	info.RelayMode = protocolRelayMode(p.Kind)
+	info.RelayMode = p.relayMode(info)
 	defer func() { info.RelayMode = mode }()
+	if p.SupportsCrossProtocol && p.Kind == protocol.OpenAIEmbeddings && info.RelayFormat == types.RelayFormatGemini {
+		return p.Public.DoResponse(c, response, info)
+	}
 	return p.Wire.DoResponse(c, response, info)
+}
+
+func (p *WireProtocol) relayMode(info *relaycommon.RelayInfo) int {
+	if p.Kind == protocol.OpenAIImages && info.RelayMode == relayconstant.RelayModeImagesEdits ||
+		p.Kind == protocol.OpenAIAudioTranscription && info.RelayMode == relayconstant.RelayModeAudioTranslation {
+		return info.RelayMode
+	}
+	return protocolRelayMode(p.Kind)
 }
 
 // ProtocolRelayFormat maps only the explicit public protocol enum.
@@ -103,10 +121,18 @@ func ProtocolRelayFormat(kind protocol.Type) (types.RelayFormat, error) {
 		return types.RelayFormatOpenAIResponses, nil
 	case protocol.AnthropicMessages:
 		return types.RelayFormatClaude, nil
-	case protocol.GeminiGenerate:
+	case protocol.GeminiGenerate, protocol.GeminiEmbed:
 		return types.RelayFormatGemini, nil
+	case protocol.OpenAIEmbeddings:
+		return types.RelayFormatEmbedding, nil
+	case protocol.OpenAIImages:
+		return types.RelayFormatOpenAIImage, nil
+	case protocol.OpenAIAudioSpeech, protocol.OpenAIAudioTranscription:
+		return types.RelayFormatOpenAIAudio, nil
+	case protocol.Rerank:
+		return types.RelayFormatRerank, nil
 	default:
-		return "", fmt.Errorf("unsupported text protocol %q", kind)
+		return "", fmt.Errorf("unsupported protocol %q", kind)
 	}
 }
 
@@ -116,6 +142,16 @@ func protocolRelayMode(kind protocol.Type) int {
 		return relayconstant.RelayModeResponses
 	case protocol.GeminiGenerate:
 		return relayconstant.RelayModeGemini
+	case protocol.GeminiEmbed, protocol.OpenAIEmbeddings:
+		return relayconstant.RelayModeEmbeddings
+	case protocol.OpenAIImages:
+		return relayconstant.RelayModeImagesGenerations
+	case protocol.OpenAIAudioSpeech:
+		return relayconstant.RelayModeAudioSpeech
+	case protocol.OpenAIAudioTranscription:
+		return relayconstant.RelayModeAudioTranscription
+	case protocol.Rerank:
+		return relayconstant.RelayModeRerank
 	default:
 		return relayconstant.RelayModeChatCompletions
 	}

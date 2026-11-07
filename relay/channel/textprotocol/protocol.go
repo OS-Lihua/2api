@@ -24,6 +24,11 @@ type Handler struct {
 var _ channel.ProtocolHandler = (*Handler)(nil)
 
 func New(kind protocol.Type) (channel.ProtocolHandler, error) {
+	switch kind {
+	case protocol.OpenAIChat, protocol.OpenAIResponses, protocol.AnthropicMessages, protocol.GeminiGenerate:
+	default:
+		return nil, fmt.Errorf("unsupported text protocol %q", kind)
+	}
 	format, err := channel.ProtocolRelayFormat(kind)
 	if err != nil {
 		return nil, err

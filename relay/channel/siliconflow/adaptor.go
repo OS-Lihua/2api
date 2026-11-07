@@ -19,6 +19,7 @@ import (
 )
 
 type Protocol struct {
+	audioProtocol openai.Protocol
 }
 
 func (a *Protocol) ConvertGeminiRequest(*gin.Context, *relaycommon.RelayInfo, *dto.GeminiChatRequest) (any, error) {
@@ -32,8 +33,7 @@ func (a *Protocol) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayI
 }
 
 func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.AudioRequest) (io.Reader, error) {
-	adaptor := openai.Adaptor{}
-	return adaptor.ConvertAudioRequest(c, info, request)
+	return a.audioProtocol.ConvertAudioRequest(c, info, request)
 }
 
 func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.ImageRequest) (any, error) {
@@ -59,6 +59,9 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 		}
 	}
 
+	if sfRequest.BatchSize > dto.MaxImageN {
+		return nil, fmt.Errorf("batch_size must be between 1 and %d", dto.MaxImageN)
+	}
 	return sfRequest, nil
 }
 
@@ -121,8 +124,7 @@ func (a *Protocol) DoResponse(c *gin.Context, resp *http.Response, info *relayco
 	case constant.RelayModeRerank:
 		usage, err = siliconflowRerankHandler(c, info, resp)
 	default:
-		adaptor := openai.Adaptor{}
-		usage, err = adaptor.DoResponse(c, resp, info)
+		usage, err = a.audioProtocol.DoResponse(c, resp, info)
 	}
 	return
 }

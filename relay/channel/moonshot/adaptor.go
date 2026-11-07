@@ -66,6 +66,10 @@ func (a *Provider) RequestURL(metadata channel.ProviderMetadata) (string, error)
 			return fmt.Sprintf("%s/v1/rerank", info.ChannelBaseUrl), nil
 		} else if info.RelayMode == constant.RelayModeEmbeddings {
 			return fmt.Sprintf("%s/v1/embeddings", info.ChannelBaseUrl), nil
+		} else if info.RelayMode == constant.RelayModeImagesGenerations {
+			return fmt.Sprintf("%s/v1/images/generations", info.ChannelBaseUrl), nil
+		} else if info.RelayMode == constant.RelayModeImagesEdits {
+			return fmt.Sprintf("%s/v1/images/edits", info.ChannelBaseUrl), nil
 		} else if info.RelayMode == constant.RelayModeChatCompletions {
 			return fmt.Sprintf("%s/v1/chat/completions", info.ChannelBaseUrl), nil
 		} else if info.RelayMode == constant.RelayModeCompletions {

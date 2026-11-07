@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
@@ -47,13 +48,10 @@ func (a *Provider) RequestURL(metadata channel.ProviderMetadata) (string, error)
 	info := metadata.ProviderRequest()
 	// https://cloud.baidu.com/doc/WENXINWORKSHOP/s/clntwmv7t
 	suffix := "chat/"
-	if strings.HasPrefix(info.UpstreamModelName, "Embedding") {
-		suffix = "embeddings/"
-	}
-	if strings.HasPrefix(info.UpstreamModelName, "bge-large") {
-		suffix = "embeddings/"
-	}
-	if strings.HasPrefix(info.UpstreamModelName, "tao-8k") {
+	if info.Protocol == protocol.OpenAIEmbeddings || info.Protocol == "" &&
+		(strings.HasPrefix(info.UpstreamModelName, "Embedding") ||
+			strings.HasPrefix(info.UpstreamModelName, "bge-large") ||
+			strings.HasPrefix(info.UpstreamModelName, "tao-8k")) {
 		suffix = "embeddings/"
 	}
 	switch info.UpstreamModelName {

@@ -7,6 +7,9 @@ import (
 )
 
 func (p *Provider) ComposeProtocol(kind protocol.Type, generic channel.ProtocolHandler) (channel.ProtocolHandler, error) {
+	if channel.IsNonTextProtocol(kind) {
+		return channel.ComposeNonTextProtocol(kind, generic, &Protocol{}, protocol.OpenAIEmbeddings, protocol.Rerank)
+	}
 	switch kind {
 	case protocol.OpenAIChat, protocol.OpenAIResponses, protocol.AnthropicMessages:
 		return generic, nil

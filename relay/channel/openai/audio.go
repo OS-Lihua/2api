@@ -128,7 +128,7 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		Usage *dto.Usage `json:"usage"`
 	}
 	if err := common.Unmarshal(responseBody, &responseData); err == nil && responseData.Usage != nil {
-		if responseData.Usage.TotalTokens > 0 {
+		if responseData.Usage.TotalTokens > 0 || info.UpstreamProtocol != "" {
 			usage := responseData.Usage
 			if usage.PromptTokens == 0 {
 				usage.PromptTokens = usage.InputTokens

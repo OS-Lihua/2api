@@ -15,6 +15,10 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// ProtocolHandler converts a public DTO to an upstream DTO or io.Reader. A
+// reader carries already encoded JSON, multipart or binary data; the host must
+// pass it through its replayable BodyStorage path rather than JSON-marshal it.
+// Unsupported requests must return an error, never a nil result with nil error.
 type ProtocolHandler interface {
 	ConvertRequest(c *gin.Context, info *relaycommon.RelayInfo, request any) (any, error)
 	DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError)

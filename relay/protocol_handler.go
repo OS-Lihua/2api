@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/nontextprotocol"
 	"github.com/QuantumNous/new-api/relay/channel/textprotocol"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
@@ -19,9 +21,10 @@ import (
 // ChannelAdaptor composes an account transport and an independently selected
 // wire protocol. It owns neither billing nor route selection.
 type ChannelAdaptor struct {
-	provider channel.ProviderAdapter
-	protocol channel.ProtocolHandler
-	kind     protocol.Type
+	provider       channel.ProviderAdapter
+	protocol       channel.ProtocolHandler
+	kind           protocol.Type
+	requestURLPath string
 }
 
 func GetChannelAdaptor(apiType int, upstream protocol.Type) (*ChannelAdaptor, error) {
@@ -41,11 +44,20 @@ func GetChannelAdaptor(apiType int, upstream protocol.Type) (*ChannelAdaptor, er
 }
 
 func GetProtocolHandler(kind protocol.Type) (channel.ProtocolHandler, error) {
+	if channel.IsNonTextProtocol(kind) || strings.HasPrefix(string(kind), "task:") {
+		return nontextprotocol.New(kind)
+	}
 	return textprotocol.New(kind)
 }
 
 func (a *ChannelAdaptor) ConvertRequest(c *gin.Context, info *relaycommon.RelayInfo, request any) (any, error) {
-	return a.protocol.ConvertRequest(c, info, request)
+	previousPath := info.RequestURLPath
+	a.requestURLPath = ""
+	converted, err := a.protocol.ConvertRequest(c, info, request)
+	if err == nil && (info.RequestURLPath != previousPath || a.kind == protocol.OpenAIImages) {
+		a.requestURLPath = info.RequestURLPath
+	}
+	return converted, err
 }
 
 func (a *ChannelAdaptor) providerMetadata(info *relaycommon.RelayInfo) *channel.ProviderRequest {
@@ -71,6 +83,45 @@ func (a *ChannelAdaptor) providerMetadata(info *relaycommon.RelayInfo) *channel.
 		if info.IsStream {
 			metadata.RequestURLPath = "/v1beta/models/" + info.UpstreamModelName + ":streamGenerateContent?alt=sse"
 		}
+	case protocol.OpenAIEmbeddings:
+		metadata.RelayFormat = types.RelayFormatEmbedding
+		metadata.RelayMode = relayconstant.RelayModeEmbeddings
+		metadata.RequestURLPath = "/v1/embeddings"
+	case protocol.GeminiEmbed:
+		metadata.RelayFormat = types.RelayFormatGemini
+		metadata.RelayMode = relayconstant.RelayModeEmbeddings
+		action := ":embedContent"
+		if info.IsGeminiBatchEmbedding {
+			action = ":batchEmbedContents"
+		}
+		metadata.RequestURLPath = "/v1beta/models/" + info.UpstreamModelName + action
+	case protocol.OpenAIImages:
+		metadata.RelayFormat = types.RelayFormatOpenAIImage
+		metadata.RelayMode = relayconstant.RelayModeImagesGenerations
+		metadata.RequestURLPath = "/v1/images/generations"
+		if info.RelayMode == relayconstant.RelayModeImagesEdits {
+			metadata.RelayMode = info.RelayMode
+			metadata.RequestURLPath = "/v1/images/edits"
+		}
+	case protocol.OpenAIAudioSpeech:
+		metadata.RelayFormat = types.RelayFormatOpenAIAudio
+		metadata.RelayMode = relayconstant.RelayModeAudioSpeech
+		metadata.RequestURLPath = "/v1/audio/speech"
+	case protocol.OpenAIAudioTranscription:
+		metadata.RelayFormat = types.RelayFormatOpenAIAudio
+		metadata.RelayMode = relayconstant.RelayModeAudioTranscription
+		metadata.RequestURLPath = "/v1/audio/transcriptions"
+		if info.RelayMode == relayconstant.RelayModeAudioTranslation {
+			metadata.RelayMode = info.RelayMode
+			metadata.RequestURLPath = "/v1/audio/translations"
+		}
+	case protocol.Rerank:
+		metadata.RelayFormat = types.RelayFormatRerank
+		metadata.RelayMode = relayconstant.RelayModeRerank
+		metadata.RequestURLPath = "/v1/rerank"
+	}
+	if a.requestURLPath != "" {
+		metadata.RequestURLPath = a.requestURLPath
 	}
 	return metadata
 }
@@ -99,6 +150,9 @@ func (a *ChannelAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 		if err != nil {
 			return nil, errors.New("invalid upstream request URL")
 		}
+		if channel.IsNonTextProtocol(a.kind) {
+			request.Header.Set("Content-Type", c.Request.Header.Get("Content-Type"))
+		}
 		channel.ApplyUpstreamBodyMetadata(request, requestBody)
 	}
 	if err := a.provider.SetupHeader(c, &request.Header, metadata); err != nil {
@@ -113,6 +167,9 @@ func (a *ChannelAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 		if !errors.Is(executeErr, channel.ErrUseHTTPTransport) {
 			if executeErr != nil {
 				return nil, providerRequestError(executeErr)
+			}
+			if response == nil {
+				return nil, errors.New("provider did not return an upstream response")
 			}
 			return response, nil
 		}

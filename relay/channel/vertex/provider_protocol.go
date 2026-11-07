@@ -14,6 +14,9 @@ var _ channel.ProviderProtocolComposer = (*Provider)(nil)
 var _ channel.ProviderRequestFixer = (*Provider)(nil)
 
 func (p *Provider) ComposeProtocol(kind protocol.Type, generic channel.ProtocolHandler) (channel.ProtocolHandler, error) {
+	if channel.IsNonTextProtocol(kind) {
+		return channel.ComposeNonTextProtocol(kind, generic, &Protocol{RequestMode: RequestModeGemini}, protocol.OpenAIImages)
+	}
 	switch kind {
 	case protocol.OpenAIChat, protocol.AnthropicMessages, protocol.GeminiGenerate:
 		return &channel.RequestRepairProtocol{Kind: kind, Public: generic, Provider: p}, nil

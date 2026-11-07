@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
@@ -139,13 +140,13 @@ func (a *Provider) RequestURL(metadata channel.ProviderMetadata) (string, error)
 
 	version := model_setting.GetGeminiVersionSetting(info.UpstreamModelName)
 
-	if strings.HasPrefix(info.UpstreamModelName, "imagen") {
+	if info.Protocol == protocol.OpenAIImages || info.Protocol == "" && strings.HasPrefix(info.UpstreamModelName, "imagen") {
 		return fmt.Sprintf("%s/%s/models/%s:predict", info.ChannelBaseUrl, version, info.UpstreamModelName), nil
 	}
 
-	if strings.HasPrefix(info.UpstreamModelName, "text-embedding") ||
+	if info.Protocol == protocol.GeminiEmbed || info.Protocol == "" && (strings.HasPrefix(info.UpstreamModelName, "text-embedding") ||
 		strings.HasPrefix(info.UpstreamModelName, "embedding") ||
-		strings.HasPrefix(info.UpstreamModelName, "gemini-embedding") {
+		strings.HasPrefix(info.UpstreamModelName, "gemini-embedding")) {
 		action := "embedContent"
 		if info.IsGeminiBatchEmbedding {
 			action = "batchEmbedContents"

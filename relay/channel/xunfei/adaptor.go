@@ -50,7 +50,11 @@ func (a *Provider) RequestURL(metadata channel.ProviderMetadata) (string, error)
 		return "", errors.New("invalid auth")
 	}
 	version := ""
-	if requestURL, err := url.Parse(info.RequestURLPath); err == nil {
+	clientPath := info.ClientRequestURLPath
+	if clientPath == "" {
+		clientPath = info.RequestURLPath
+	}
+	if requestURL, err := url.Parse(clientPath); err == nil {
 		version = requestURL.Query().Get("api-version")
 	}
 	if version == "" {
