@@ -767,7 +767,9 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 			gin.DefaultWriter, gin.DefaultErrorWriter = previousWriter, previousErrorWriter
 			common.LogWriterMu.Unlock()
 		})
+		var nativeCalls atomic.Int32
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			nativeCalls.Add(1)
 			var body map[string]any
 			require.NoError(t, common.DecodeJson(r.Body, &body))
 			switch r.URL.Path {
@@ -798,12 +800,14 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 		defer upstream.Close()
 		account := model.Provider{Name: "Native probe Provider", Type: constant.ChannelTypeOllama, Key: "secret", BaseURL: common.GetPointer(upstream.URL), Status: common.ChannelStatusEnabled}
 		require.NoError(t, db.Create(&account).Error)
+		chatProbePath := ""
 		for _, kind := range []string{"openai_chat", "openai_embeddings"} {
 			status, created := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":%q,"upstream_model_name":"ollama-probe"}`, account.Id, unified.Id, kind))
 			require.Equal(t, http.StatusOK, status, created)
 			probePath := fmt.Sprintf("/api/admin/v1/channels/%v/probes", created["data"].(map[string]any)["id"])
 			features := []string{"input_text"}
 			if kind == "openai_chat" {
+				chatProbePath = probePath
 				features = append(features, "streaming", "reasoning", "context_length", "max_output_tokens")
 			}
 			for _, feature := range features {
@@ -812,7 +816,36 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 				assert.Equal(t, "passed", result["data"].(map[string]any)["status"], result)
 			}
 		}
+		beforeBypass := nativeCalls.Load()
+		require.NoError(t, db.Model(&account).Update("param_override", `{"operations":[{"mode":"delete","path":"options.num_predict"},{"mode":"set","path":"max_tokens","value":1}]}`).Error)
+		for _, feature := range []string{"output_text", "max_output_tokens"} {
+			status, result := call(http.MethodPost, chatProbePath, fmt.Sprintf(`{"capability":%q}`, feature))
+			require.Equal(t, http.StatusOK, status, result)
+			assert.Equal(t, "request_invalid", result["data"].(map[string]any)["reason"], result)
+		}
+		assert.Equal(t, beforeBypass, nativeCalls.Load())
 		assert.NotContains(t, diagnostics.String(), "do-not-log-native-response")
+	})
+	t.Run("context samples reserve framing and output instead of exceeding the declared window", func(t *testing.T) {
+		parent := unified
+		parent.Id = 0
+		parent.ModelName = "context-budget-probe"
+		parent.Capabilities.Limits.ContextLength = common.GetPointer(int64(4096))
+		require.NoError(t, db.Create(&parent).Error)
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body map[string]any
+			require.NoError(t, common.DecodeJson(r.Body, &body))
+			text := body["messages"].([]any)[0].(map[string]any)["content"].(string)
+			assert.LessOrEqual(t, float64(len(text)+64)+body["max_tokens"].(float64), float64(4096))
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"GWP4831"}}],"usage":{"prompt_tokens":256,"completion_tokens":8}}`))
+		}))
+		defer upstream.Close()
+		require.NoError(t, db.Model(&provider).Update("base_url", upstream.URL).Error)
+		status, created := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":"openai_chat","upstream_model_name":"context-budget-probe"}`, provider.Id, parent.Id))
+		require.Equal(t, http.StatusOK, status, created)
+		status, result := call(http.MethodPost, fmt.Sprintf("/api/admin/v1/channels/%v/probes", created["data"].(map[string]any)["id"]), `{"capability":"context_length"}`)
+		require.Equal(t, http.StatusOK, status, result)
+		assert.Equal(t, "inconclusive", result["data"].(map[string]any)["status"], result)
 	})
 	t.Run("capability narrowing and model edits stay consistent", func(t *testing.T) {
 		unified.Capabilities = capability.Set{Features: []capability.Feature{capability.Streaming, capability.ToolCalling}, InputModalities: []capability.Modality{capability.Text, capability.Image}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{ContextLength: common.GetPointer(int64(32000)), MaxOutputTokens: common.GetPointer(int64(4096)), MaxImages: common.GetPointer(int64(8)), MaxDurationSeconds: common.GetPointer(int64(60)), EmbeddingDimensions: common.GetPointer(int64(3072))}}

@@ -110,10 +110,16 @@ func channelProbeRecipeFor(ctx context.Context, record model.Channel, feature st
 			if effective.Limits.ContextLength != nil {
 				recipe.TestedValue = min(*effective.Limits.ContextLength, 4096)
 			}
-			// Tokenization differs by Provider. Verify the retained sample against
-			// reported input/output tokens before claiming the tested boundary.
+			if recipe.TestedValue < 128 {
+				return recipe, common.NewMessage("Invalid parameters")
+			}
+			// Leave room for framing and output. A Provider's tokenizer may
+			// differ, so a small sample verifies the boundary only when actual
+			// reported usage reaches it; rejection remains inconclusive.
 			recipe.SampledLimit = effective.Limits.ContextLength != nil && *effective.Limits.ContextLength > 4096
-			chat.Messages[0].Content = "Remember code GWP4831. " + strings.Repeat("padding ", int(recipe.TestedValue)) + "What was the code at the beginning? Reply with only the code."
+			chat.MaxTokens = common.GetPointer(uint(16))
+			paddingWords := max(0, (int(recipe.TestedValue)/4-128)/8)
+			chat.Messages[0].Content = "Remember code GWP4831. " + strings.Repeat("padding ", paddingWords) + "What was the code at the beginning? Reply with only the code."
 			recipe.ExpectedText = "GWP4831"
 		case "max_output_tokens":
 			recipe.TestedValue = 64

@@ -104,6 +104,7 @@ func probeChannel(ctx context.Context, record model.Channel, provider *model.Pro
 	if err != nil {
 		return "failed", "request_invalid"
 	}
+	outputBudgetPaths := probeOutputBudgetPaths(gjson.ParseBytes(encoded))
 	info.Request = recipe.Request
 	info.ParamOverride = provider.GetParamOverride()
 	encoded, err = relaycommon.ApplyParamOverrideWithRelayInfo(encoded, info)
@@ -122,7 +123,7 @@ func probeChannel(ctx context.Context, record model.Channel, provider *model.Pro
 	if err != nil || !probeRequestWithinBudget(gjson.ParseBytes(encoded), maxCount) {
 		return "failed", "request_invalid"
 	}
-	if recipe.Format == types.RelayFormatOpenAI && !probeHasOutputBudget(gjson.ParseBytes(encoded)) {
+	if recipe.Format == types.RelayFormatOpenAI && !probeHasOutputBudget(gjson.ParseBytes(encoded), outputBudgetPaths) {
 		return "failed", "request_invalid"
 	}
 	if helper.ExceedsMaxTokensLimit(request.MaxTokens, request.MaxCompletionTokens) {
@@ -153,6 +154,9 @@ func probeChannel(ctx context.Context, record model.Channel, provider *model.Pro
 			return "failed", "response_too_large"
 		}
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			if feature == "context_length" {
+				return "inconclusive", "limit_sample_only"
+			}
 			return "failed", "upstream_rejected"
 		}
 		replay := *response
@@ -250,8 +254,19 @@ func probeRequestWithinBudget(value gjson.Result, maxCount int64) bool {
 
 // probeHasOutputBudget checks actual generation controls at known wire paths.
 // A lookalike field inside arbitrary metadata must not substitute for a cap.
-func probeHasOutputBudget(value gjson.Result) bool {
+func probeOutputBudgetPaths(value gjson.Result) []string {
+	var paths []string
 	for _, path := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens", "max_new_tokens", "maxTokens", "MaxTokens", "num_predict", "generationConfig.maxOutputTokens", "generation_config.max_output_tokens", "parameters.max_tokens", "parameters.max_new_tokens", "parameters.max_output_tokens", "parameters.maxOutputTokens", "parameter.chat.max_tokens", "inferenceConfig.maxTokens", "textGenerationConfig.maxTokenCount", "options.num_predict", "instances.0.max_tokens"} {
+		limit := value.Get(path)
+		if limit.Type == gjson.Number && limit.Float() >= 1 && limit.Float() <= 2048 && limit.Float() == float64(limit.Int()) {
+			paths = append(paths, path)
+		}
+	}
+	return paths
+}
+
+func probeHasOutputBudget(value gjson.Result, paths []string) bool {
+	for _, path := range paths {
 		limit := value.Get(path)
 		if limit.Type == gjson.Number && limit.Float() >= 1 && limit.Float() <= 2048 && limit.Float() == float64(limit.Int()) {
 			return true

@@ -232,6 +232,7 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 	if err != nil || len(encoded) > 1<<20 {
 		return "failed", "request_invalid"
 	}
+	outputBudgetPaths := probeOutputBudgetPaths(gjson.ParseBytes(encoded))
 	if !strings.HasPrefix(cleanRequest.Header.Get("Content-Type"), "multipart/") {
 		if !gjson.ValidBytes(encoded) {
 			return "failed", "request_invalid"
@@ -254,7 +255,7 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 			return "failed", "request_invalid"
 		}
 	}
-	if wire == "openai_responses" && !slices.Contains([]string{"output_image", "output_video", "output_audio", "output_pdf", "max_duration_seconds"}, result.Capability) && !probeHasOutputBudget(gjson.ParseBytes(encoded)) {
+	if wire == "openai_responses" && !slices.Contains([]string{"output_image", "output_video", "output_audio", "output_pdf", "max_duration_seconds"}, result.Capability) && !probeHasOutputBudget(gjson.ParseBytes(encoded), outputBudgetPaths) {
 		return "failed", "request_invalid"
 	}
 	if result.Capability == "input_image" && !bytes.Contains(encoded, probeRedImage) && !bytes.Contains(encoded, []byte(base64.StdEncoding.EncodeToString(probeRedImage))) {
