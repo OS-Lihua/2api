@@ -540,6 +540,84 @@ func TestTextGatewayOllamaIdleTimeoutAfterBusinessOutput(t *testing.T) {
 	assert.Equal(t, "partial", record.Status)
 }
 
+func TestTextGatewayFailoverCannotExceedFrozenReservation(t *testing.T) {
+	for _, recovery := range []bool{false, true} {
+		t.Run(fmt.Sprint("recovery=", recovery), func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) })
+			_, err := model.PostLedgerEntries(model.LedgerPosting{Account: model.UserWalletAccount(fixture.user.Id), Type: model.LedgerEntryAdjustment, Amount: money.Amount{Nanos: -999_900_000, Currency: "USD"}, Remark: "controlled failover starting balance"})
+			require.NoError(t, err)
+			largerCalls := 0
+			larger := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) { largerCalls++; w.WriteHeader(503) })
+			require.NoError(t, model.DB.Model(larger).Update("parameter_overrides", `{"n":128}`).Error)
+			if recovery {
+				addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+				})
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			assert.Zero(t, largerCalls, "a candidate cannot increase the frozen reservation after the first send")
+			_, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+			require.NoError(t, err)
+			wantAttempts, wantBalance := int64(1), int64(100_000)
+			if recovery {
+				wantAttempts, wantBalance = 2, 64_000
+				assert.Contains(t, response.Body.String(), "Recovered")
+			}
+			assert.Equal(t, wantAttempts, total)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, wantBalance, wallet.Balance.Nanos)
+			entries, _, err := model.ListLedgerEntries(wallet.Id, 0, 20)
+			require.NoError(t, err)
+			preconsumes := 0
+			for _, entry := range entries {
+				if entry.Type == model.LedgerEntryPreConsume {
+					preconsumes++
+				}
+			}
+			assert.Equal(t, 1, preconsumes)
+		})
+	}
+}
+
+func TestTextGatewayUntrackedNativeResponseIsRejectedBeforeSend(t *testing.T) {
+	calls := 0
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: conversation.message.delta\ndata: {\"content\":\"First\"}\n\nevent: conversation.chat.completed\ndata: {\"usage\":{\"input_count\":10,\"output_count\":5,\"token_count\":15}}\n\n"))
+	})
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeCoze).Error)
+	addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+	})
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","stream":true,"user":"preview-user","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	assert.Zero(t, calls)
+	assert.NotContains(t, response.Body.String(), "First")
+	assert.Contains(t, response.Body.String(), "Recovered")
+	_, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, total)
+}
+
+func TestTextGatewaySDKPreparationDoesNotSpendAttempt(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("invalid SDK credentials must not be sent") })
+	t.Setenv("GATEWAY_MAX_ATTEMPTS", "1")
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeAws).Error)
+	require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", "amazon.nova-lite-v1:0").Error)
+	addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	})
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	assert.Contains(t, response.Body.String(), "Recovered")
+	_, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, total)
+}
+
 func TestTextGatewaySDKCannotHideAdditionalSends(t *testing.T) {
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("SDK must use its own transport") })
 	t.Setenv("GATEWAY_MAX_ATTEMPTS", "1")

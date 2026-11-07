@@ -183,6 +183,7 @@ type PreparedChannelRequest struct {
 	request  *http.Request
 	metadata *channel.ProviderRequest
 	body     io.Reader
+	execute  channel.ProviderExecution
 }
 
 func (r *PreparedChannelRequest) Headers() http.Header { return r.request.Header.Clone() }
@@ -231,12 +232,27 @@ func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayI
 		return nil, errors.New("invalid provider header override")
 	}
 	metadata.RequestHeaders = request.Header.Clone()
-	return &PreparedChannelRequest{adaptor: a, request: request, metadata: metadata, body: requestBody}, nil
+	prepared := &PreparedChannelRequest{adaptor: a, request: request, metadata: metadata, body: requestBody}
+	if preparer, ok := a.provider.(channel.ProviderRequestPreparer); ok {
+		execute, err := preparer.PrepareExecution(c, metadata, requestBody)
+		if err != nil || execute == nil {
+			return nil, errors.New("provider execution preparation failed")
+		}
+		prepared.execute = execute
+	}
+	return prepared, nil
 }
 
 func (a *ChannelAdaptor) DoPreparedRequest(c *gin.Context, info *relaycommon.RelayInfo, prepared *PreparedChannelRequest) (any, error) {
 	if prepared == nil || prepared.adaptor != a {
 		return nil, errors.New("missing prepared upstream request")
+	}
+	if prepared.execute != nil {
+		response, err := prepared.execute(c)
+		if err != nil {
+			return nil, providerRequestError(err)
+		}
+		return response, nil
 	}
 	if executor, ok := a.provider.(channel.ProviderRequestExecutor); ok {
 		response, executeErr := executor.ExecuteRequest(c, prepared.metadata, prepared.body)

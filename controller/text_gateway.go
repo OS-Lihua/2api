@@ -41,6 +41,7 @@ type textGatewayRun struct {
 	saleRate      string
 	ratio         decimal.Decimal
 	saleSource    money.Amount
+	reservation   money.Amount
 	status        int
 	code, message string
 }
@@ -312,8 +313,12 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			run.fail(c, http.StatusServiceUnavailable, "billing_unavailable", "Billing is unavailable")
 			return
 		}
-		run.record, run.saleSource = record, sourceReserve
+		run.record, run.saleSource, run.reservation = record, sourceReserve, reserve
 	} else {
+		if reserve.Nanos > run.reservation.Nanos {
+			run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
+			return
+		}
 		record = run.record
 	}
 	parent := c.Request
