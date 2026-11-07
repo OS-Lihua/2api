@@ -283,12 +283,6 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"POST /api/models/":                     accessTokenScopeRule("model:write"),
 	"PUT /api/models/":                      accessTokenScopeRule("model:write"),
 	"DELETE /api/models/:id":                accessTokenScopeRule("model:write"),
-	// router/api-router.go: /api/admin/v1
-	"GET /api/admin/v1/models":        accessTokenScopeRule("model:read"),
-	"GET /api/admin/v1/models/:id":    accessTokenScopeRule("model:read"),
-	"POST /api/admin/v1/models":       accessTokenScopeRule("model:write"),
-	"PUT /api/admin/v1/models/:id":    accessTokenScopeRule("model:write"),
-	"DELETE /api/admin/v1/models/:id": accessTokenScopeRule("model:write"),
 
 	// router/api-router.go: /api/deployments
 	"GET /api/deployments/settings":                     accessTokenScopeRule("deployment:read"),
@@ -318,6 +312,7 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 var (
 	permissionRouteRulesMu sync.RWMutex
 	permissionRouteRules   = map[string]accessTokenRouteRule{}
+	permissionRoutes       = map[string]authz.Permission{}
 )
 
 // DeclareAccessTokenPermissionRoute records that the Casbin permission guarding
@@ -335,6 +330,16 @@ func DeclareAccessTokenPermissionRoute(method, fullPath string, permission authz
 		panic(fmt.Sprintf("access token route %s is declared with %s and %s", key, existing.scope, rule.scope))
 	}
 	permissionRouteRules[key] = rule
+	permissionRoutes[key] = permission
+}
+
+// PermissionRoute returns the server-declared Casbin permission for a route.
+// A scope-only declaration cannot authorize a versioned admin endpoint.
+func PermissionRoute(method, fullPath string) (authz.Permission, bool) {
+	permissionRouteRulesMu.RLock()
+	defer permissionRouteRulesMu.RUnlock()
+	permission, ok := permissionRoutes[method+" "+fullPath]
+	return permission, ok
 }
 
 // AccessTokenRouteRule returns the rule for "METHOD /full/path".
