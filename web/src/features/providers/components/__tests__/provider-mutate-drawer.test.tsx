@@ -163,6 +163,44 @@ it('recommendation requires confirmation and never overwrites a manual name when
   expect(name).toHaveValue('Manually renamed')
 })
 
+it('recommendations keep URL credentials out of requests', async () => {
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
+  const get = vi.spyOn(api, 'get').mockResolvedValue({
+    data: { success: true, data: { items: [] } },
+  })
+  const secrets = [
+    'private-user-fixture',
+    'private-pass-fixture',
+    'private-query-fixture',
+    'private-fragment-fixture',
+  ]
+  const endpoint = new URL('https://api.deepseek.com:8443/v1')
+  endpoint.username = secrets[0]!
+  endpoint.password = secrets[1]!
+  endpoint.searchParams.set('api_key', secrets[2]!)
+  endpoint.hash = secrets[3]!
+  renderDrawer()
+  await userEvent.click(screen.getByRole('textbox', { name: 'Base URL' }))
+  await userEvent.paste(endpoint.href)
+
+  await waitFor(() => {
+    const lookups = get.mock.calls.filter(
+      ([path]) => path === '/api/admin/v1/recommendations/provider'
+    )
+    expect(lookups.length).toBeGreaterThan(0)
+    const [path, config] = lookups.at(-1)!
+    const requestURI = new URL(
+      api.getUri({ url: path, ...config }),
+      'https://console.example'
+    )
+    expect(requestURI.searchParams.get('url')).toBe(endpoint.origin)
+    expect([...requestURI.searchParams.keys()].sort()).toEqual(['type', 'url'])
+    for (const secret of secrets) {
+      expect(decodeURIComponent(requestURI.href)).not.toContain(secret)
+    }
+  })
+})
+
 it('saving an edit with an empty key field keeps the stored key', async () => {
   vi.spyOn(api, 'get').mockResolvedValue({
     data: { success: true, data: stored },
