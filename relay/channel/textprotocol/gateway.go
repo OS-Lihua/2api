@@ -118,7 +118,9 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		facts.DownstreamWriteFailed = true
 		return usage, types.NewError(err, types.ErrorCodeBadResponse)
 	}
-	facts.BusinessOutput = facts.GeneratedText != ""
+	if facts.GeneratedText != "" {
+		facts.MarkBusinessOutput()
+	}
 	if p.format == types.RelayFormatOpenAIResponses {
 		status := gjson.GetBytes(body, "status").String()
 		if status != "" && status != "completed" {

@@ -213,7 +213,7 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 		output.text.WriteString(text)
 	}
 	if text != "" {
-		info.ResponseFacts.BusinessOutput = true
+		info.ResponseFacts.MarkBusinessOutput()
 	}
 	if err := helper.FlushWriter(c); err != nil {
 		info.ResponseFacts.DownstreamWriteFailed = true
