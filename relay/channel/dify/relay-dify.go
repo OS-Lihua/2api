@@ -14,6 +14,7 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -24,105 +25,94 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func uploadDifyFile(c *gin.Context, info *relaycommon.RelayInfo, user string, media dto.MediaContent) *DifyFile {
-	uploadUrl := fmt.Sprintf("%s/v1/files/upload", info.ChannelBaseUrl)
-	switch media.Type {
-	case dto.ContentTypeImageURL:
-		// Decode base64 data
-		imageMedia := media.GetImageMedia()
-		base64Data := imageMedia.Url
-		// Remove base64 prefix if exists (e.g., "data:image/jpeg;base64,")
-		if idx := strings.Index(base64Data, ","); idx != -1 {
-			base64Data = base64Data[idx+1:]
-		}
-
-		// Decode base64 string
-		decodedData, err := base64.StdEncoding.DecodeString(base64Data)
-		if err != nil {
-			common.SysLog(common.LogText("failed to decode base64: %s", err.Error()))
-			return nil
-		}
-
-		// Create temporary file
-		tempFile, err := os.CreateTemp("", "dify-upload-*")
-		if err != nil {
-			common.SysLog(common.LogText("failed to create temp file: %s", err.Error()))
-			return nil
-		}
-		defer tempFile.Close()
-		defer os.Remove(tempFile.Name())
-
-		// Write decoded data to temp file
-		if _, err := tempFile.Write(decodedData); err != nil {
-			common.SysLog(common.LogText("failed to write to temp file: %s", err.Error()))
-			return nil
-		}
-
-		// Create multipart form
-		body := &bytes.Buffer{}
-		writer := multipart.NewWriter(body)
-
-		// Add user field
-		if err := writer.WriteField("user", user); err != nil {
-			common.SysLog(common.LogText("failed to add user field: %s", err.Error()))
-			return nil
-		}
-
-		// Create form file with proper mime type
-		mimeType := imageMedia.MimeType
-		if mimeType == "" {
-			mimeType = "image/jpeg" // default mime type
-		}
-
-		// Create form file
-		part, err := writer.CreateFormFile("file", fmt.Sprintf("image.%s", strings.TrimPrefix(mimeType, "image/")))
-		if err != nil {
-			common.SysLog(common.LogText("failed to create form file: %s", err.Error()))
-			return nil
-		}
-
-		// Copy file content to form
-		if _, err = io.Copy(part, bytes.NewReader(decodedData)); err != nil {
-			common.SysLog(common.LogText("failed to copy file content: %s", err.Error()))
-			return nil
-		}
-		writer.Close()
-
-		// Create HTTP request
-		req, err := http.NewRequestWithContext(c.Request.Context(), "POST", uploadUrl, body)
-		if err != nil {
-			common.SysLog(common.LogText("failed to create request: %s", err.Error()))
-			return nil
-		}
-
-		req.Header.Set("Content-Type", writer.FormDataContentType())
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", info.ApiKey))
-
-		// Send request
-		client := service.GetHttpClient()
-		resp, err := client.Do(req)
-		if err != nil {
-			common.SysLog(common.LogText("failed to send request: %s", err.Error()))
-			return nil
-		}
-		defer resp.Body.Close()
-
-		// Parse response
-		var result struct {
-			Id string `json:"id"`
-		}
-		if err := common.DecodeJson(resp.Body, &result); err != nil {
-			common.SysLog(common.LogText("failed to decode response: %s", err.Error()))
-			return nil
-		}
-
-		return &DifyFile{
-			UploadFileId: result.Id,
-			Type:         "image",
-			TransferMode: "local_file",
-		}
+func uploadDifyFile(c *gin.Context, info *relaycommon.RelayInfo, user string, media dto.MediaContent) (*DifyFile, error) {
+	failure := errors.New("Dify file upload failed")
+	if media.Type != dto.ContentTypeImageURL {
+		return nil, failure
 	}
-	return nil
+	imageMedia := media.GetImageMedia()
+	base64Data := imageMedia.Url
+	if _, data, ok := strings.Cut(base64Data, ","); ok {
+		base64Data = data
+	}
+	decodedData, err := base64.StdEncoding.DecodeString(base64Data)
+	if err != nil {
+		return nil, failure
+	}
+	tempFile, err := os.CreateTemp("", "dify-upload-*")
+	if err != nil {
+		return nil, failure
+	}
+	defer tempFile.Close()
+	defer os.Remove(tempFile.Name())
+	if _, err := tempFile.Write(decodedData); err != nil {
+		return nil, failure
+	}
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	if err := writer.WriteField("user", user); err != nil {
+		return nil, failure
+	}
+	mimeType := imageMedia.MimeType
+	if mimeType == "" {
+		mimeType = "image/jpeg"
+	}
+	part, err := writer.CreateFormFile("file", fmt.Sprintf("image.%s", strings.TrimPrefix(mimeType, "image/")))
+	if err != nil {
+		return nil, failure
+	}
+	if _, err := io.Copy(part, bytes.NewReader(decodedData)); err != nil {
+		return nil, failure
+	}
+	if err := writer.Close(); err != nil {
+		return nil, failure
+	}
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, info.ChannelBaseUrl+"/v1/files/upload", body)
+	if err != nil {
+		return nil, failure
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+info.ApiKey)
+	client := service.GetHttpClient()
+	if info.BeginProviderCall != nil {
+		client, err = service.GetHttpClientWithProxySettings(info.ChannelSetting.Proxy, info.ChannelSetting)
+		if err != nil {
+			return nil, failure
+		}
+		ctx, err := info.BeginProviderCall()
+		if err != nil {
+			return nil, failure
+		}
+		req = req.WithContext(ctx)
+		client = channel.GatewayHTTPClient(client)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, failure
+	}
+	defer resp.Body.Close()
+	var payload struct {
+		ID   string `json:"id"`
+		Code string `json:"code"`
+		Type string `json:"type"`
+	}
+	decodeErr := common.DecodeJson(io.LimitReader(resp.Body, 1<<20), &payload)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices || payload.Code != "" {
+		rejection := types.NewOpenAIError(failure, types.ErrorCodeBadResponse, resp.StatusCode)
+		upstream := rejection.ToOpenAIError()
+		if payload.Code != "" {
+			upstream.Code = payload.Code
+		}
+		if payload.Type != "" {
+			upstream.Type = payload.Type
+		}
+		rejection.RelayError = upstream
+		return nil, rejection
+	}
+	if decodeErr != nil || payload.ID == "" {
+		return nil, failure
+	}
+	return &DifyFile{UploadFileId: payload.ID, Type: "image", TransferMode: "local_file"}, nil
 }
 
 func requestOpenAI2Dify(c *gin.Context, info *relaycommon.RelayInfo, request dto.GeneralOpenAIRequest) *DifyChatRequest {
@@ -160,12 +150,16 @@ func requestOpenAI2Dify(c *gin.Context, info *relaycommon.RelayInfo, request dto
 						// 导致 file.Type = ... 触发 nil pointer dereference
 						// 而 panic（500: "invalid memory address or nil pointer dereference"）。
 						file = &DifyFile{
-							Type:         media.MimeType,
+							Type:         "image",
 							TransferMode: "remote_url",
 							URL:          media.Url,
 						}
+					} else if info.ResponseFacts != nil {
+						// Keep inline media transient until reservation and resolve only
+						// the files retained by the effective Channel overrides.
+						file = &DifyFile{Type: "image", TransferMode: "local_file", URL: media.Url}
 					} else {
-						file = uploadDifyFile(c, info, difyReq.User, mediaContent)
+						file, _ = uploadDifyFile(c, info, difyReq.User, mediaContent)
 					}
 					if file != nil {
 						files = append(files, *file)
@@ -182,6 +176,36 @@ func requestOpenAI2Dify(c *gin.Context, info *relaycommon.RelayInfo, request dto
 	}
 	difyReq.ResponseMode = mode
 	return &difyReq
+}
+
+func (*DifyChatRequest) PrepareChatRequest(c *gin.Context, info *relaycommon.RelayInfo, body []byte) ([]byte, error) {
+	var wire DifyChatRequest
+	if err := common.Unmarshal(body, &wire); err != nil {
+		return nil, fmt.Errorf("invalid Dify chat request")
+	}
+	changed := false
+	for i, file := range wire.Files {
+		media := dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: file.URL}}
+		if file.URL == "" || media.GetImageMedia().IsRemoteImage() {
+			continue
+		}
+		if err := c.Request.Context().Err(); err != nil {
+			return nil, fmt.Errorf("Dify file upload cancelled")
+		}
+		uploaded, err := uploadDifyFile(c, info, wire.User, media)
+		if err != nil {
+			return nil, err
+		}
+		wire.Files[i], changed = *uploaded, true
+	}
+	if !changed {
+		return body, nil
+	}
+	document := ojson.NewDoc(body)
+	if err := document.Set("files", wire.Files); err != nil {
+		return nil, fmt.Errorf("invalid Dify chat request")
+	}
+	return document.Bytes(), nil
 }
 
 func streamResponseDify2OpenAI(difyResponse DifyChunkChatCompletionResponse) *dto.ChatCompletionsStreamResponse {
@@ -237,11 +261,21 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			sr.Error(err)
 			return
 		}
+		if info.ResponseFacts != nil {
+			prompt, completion := relaycommon.ChatUsagePresence([]byte(ojson.Get(data, "metadata").Raw))
+			if rawUsage := ojson.Get(data, "metadata.usage"); rawUsage.IsObject() {
+				previousPrompt, previousCompletion := usage.PromptTokens, usage.CompletionTokens
+				if err := common.UnmarshalJsonStr(rawUsage.Raw, usage); err != nil {
+					sr.Error(err)
+					return
+				}
+				usage.PromptTokens, usage.CompletionTokens = previousPrompt, previousCompletion
+			}
+			info.ResponseFacts.RecordUsage(usage, &difyResponse.MetaData.Usage, prompt, completion)
+		}
 		if difyResponse.Event == "message_end" {
-			usage = &difyResponse.MetaData.Usage
-			if info.ResponseFacts != nil {
-				info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported = relaycommon.ChatUsagePresence([]byte(ojson.Get(data, "metadata").Raw))
-				info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
+			if info.ResponseFacts == nil {
+				usage = &difyResponse.MetaData.Usage
 			}
 			info.StreamStatus.MarkCompleted()
 			sr.Done()
@@ -320,22 +354,8 @@ func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	if info.ResponseFacts != nil {
-		info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported = relaycommon.ChatUsagePresence([]byte(ojson.GetBytes(responseBody, "metadata").Raw))
-		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
-		if resp.StatusCode != http.StatusOK {
-			return &difyResponse.MetaData.Usage, nil
-		}
-		info.ResponseFacts.GeneratedText = difyResponse.Answer
-		if !info.ResponseFacts.UsageReported {
-			estimated := service.ResponseText2Usage(c, difyResponse.Answer, info.TokenizerModelName(), info.GetEstimatePromptTokens())
-			if !info.ResponseFacts.PromptTokensReported {
-				difyResponse.MetaData.Usage.PromptTokens = estimated.PromptTokens
-			}
-			if !info.ResponseFacts.CompletionTokensReported {
-				difyResponse.MetaData.Usage.CompletionTokens = estimated.CompletionTokens
-			}
-			difyResponse.MetaData.Usage.TotalTokens = difyResponse.MetaData.Usage.PromptTokens + difyResponse.MetaData.Usage.CompletionTokens
-		}
+		prompt, completion := relaycommon.ChatUsagePresence([]byte(ojson.GetBytes(responseBody, "metadata").Raw))
+		info.ResponseFacts.RecordUsage(&difyResponse.MetaData.Usage, &difyResponse.MetaData.Usage, prompt, completion)
 	}
 	fullTextResponse := dto.OpenAITextResponse{
 		Id:      difyResponse.ConversationId,
@@ -352,18 +372,15 @@ func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 		FinishReason: "stop",
 	}
 	fullTextResponse.Choices = append(fullTextResponse.Choices, choice)
+	if info.ResponseFacts != nil {
+		return helper.WriteChatResponse(c, info, resp, &fullTextResponse)
+	}
 	jsonResponse, err := common.Marshal(fullTextResponse)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	c.Writer.Header().Set("Content-Type", "application/json")
 	c.Writer.WriteHeader(resp.StatusCode)
-	_, writeErr := c.Writer.Write(jsonResponse)
-	if info.ResponseFacts != nil {
-		info.ResponseFacts.DownstreamWriteFailed = writeErr != nil
-		if writeErr == nil && difyResponse.Answer != "" {
-			info.ResponseFacts.MarkBusinessOutput()
-		}
-	}
+	_, _ = c.Writer.Write(jsonResponse)
 	return &difyResponse.MetaData.Usage, nil
 }

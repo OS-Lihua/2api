@@ -85,7 +85,8 @@ func ClassifyGatewayFailure(status int, code string, transport, timeout, cancell
 
 var ErrGatewayBudget = errors.New("gateway first byte budget exhausted")
 
-// GatewayAttemptBudget starts its timer only at the actual send boundary.
+// GatewayAttemptBudget starts at the first actual Provider call, including
+// native request preparation. Later calls reuse its deadline without resetting it.
 // Delivered must be called by the same shared delivery fact used for billing.
 type GatewayAttemptBudget struct {
 	parent    context.Context
@@ -101,6 +102,15 @@ type GatewayAttemptBudget struct {
 }
 
 func (b *GatewayAttemptBudget) Start() (context.Context, error) {
+	if err := b.parent.Err(); err != nil {
+		return nil, err
+	}
+	if b.ctx != nil {
+		if cause := context.Cause(b.ctx); cause != nil {
+			return nil, cause
+		}
+		return b.ctx, nil
+	}
 	remaining := b.remaining
 	if remaining < 5*time.Second {
 		return nil, ErrGatewayBudget
@@ -130,7 +140,8 @@ type GatewayAttemptResult struct {
 	Failure   GatewayFailure
 	Delivered bool
 	// Skipped excludes a candidate rejected by preparation, without an Attempt.
-	SkippedChannel int
+	SkippedChannel  int
+	SkippedProvider int
 }
 
 // RunGatewayAttempts owns the shared attempt count, first-byte deadline and
@@ -151,11 +162,21 @@ func RunGatewayAttempts(ctx context.Context, policy GatewayAttemptPolicy, execut
 		if budget.cancel != nil {
 			budget.cancel(nil)
 		}
+		if result.Attempt == nil && result.Failure.Class != "" && !result.Failure.Switch {
+			if len(attempts) > 0 && attempts[len(attempts)-1].FailoverDecision == "switch" {
+				attempts[len(attempts)-1].FailoverDecision = "stop"
+				attempts[len(attempts)-1].FailoverReason = result.Failure.Class
+			}
+			break
+		}
 		if result.SkippedChannel > 0 && result.Attempt == nil {
 			if exclusions.Channels[result.SkippedChannel] {
 				break
 			}
 			exclusions.Channels[result.SkippedChannel] = true
+			if result.SkippedProvider > 0 {
+				exclusions.Providers[result.SkippedProvider] = true
+			}
 			continue
 		}
 		if result.Attempt == nil {

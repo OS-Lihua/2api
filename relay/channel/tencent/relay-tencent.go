@@ -5,7 +5,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,7 +14,6 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -82,8 +80,8 @@ func streamResponseTencent2OpenAI(TencentResponse *TencentChatResponse) *dto.Cha
 	if len(TencentResponse.Choices) > 0 {
 		var choice dto.ChatCompletionsStreamResponseChoice
 		choice.Delta.SetContentString(TencentResponse.Choices[0].Delta.Content)
-		if TencentResponse.Choices[0].FinishReason == "stop" {
-			choice.FinishReason = &constant.FinishReasonStop
+		if reason := TencentResponse.Choices[0].FinishReason; reason != "" {
+			choice.FinishReason = &reason
 		}
 		response.Choices = append(response.Choices, choice)
 	}
@@ -92,6 +90,14 @@ func streamResponseTencent2OpenAI(TencentResponse *TencentChatResponse) *dto.Cha
 
 func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	var responseText strings.Builder
+	usage := &dto.Usage{}
+	defer helper.EstimateMissingChatUsage(c, info, usage)
+	if info.StreamStatus == nil {
+		info.StreamStatus = relaycommon.NewStreamStatus()
+	}
+	info.StreamStatus.RequireTerminal()
+	defer info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
+	defer service.CloseResponseBodyGracefully(resp)
 	scanner := helper.NewStreamScanner(resp.Body)
 	scanner.Split(bufio.ScanLines)
 
@@ -111,26 +117,39 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 			continue
 		}
 
+		if info.ResponseFacts != nil {
+			prompt, completion := relaycommon.NativeUsagePresence([]byte(data), "Usage.PromptTokens", "Usage.CompletionTokens", "Usage.TotalTokens")
+			reported := dto.Usage{PromptTokens: tencentResponse.Usage.PromptTokens, CompletionTokens: tencentResponse.Usage.CompletionTokens}
+			info.ResponseFacts.RecordUsage(usage, &reported, prompt, completion)
+			if tencentResponse.Error.Code != 0 {
+				return usage, types.NewError(fmt.Errorf("Tencent stream failed"), types.ErrorCodeBadResponse)
+			}
+		}
 		response := streamResponseTencent2OpenAI(&tencentResponse)
 		if len(response.Choices) != 0 {
 			responseText.WriteString(response.Choices[0].Delta.GetContentString())
 		}
 
-		err = helper.ObjectData(c, response)
-		if err != nil {
-			common.SysLog(err.Error())
+		if err := helper.SendChatChunk(c, info, response); err != nil {
+			return usage, types.NewError(err, types.ErrorCodeBadResponse)
+		}
+		for _, choice := range response.Choices {
+			if choice.FinishReason != nil {
+				info.StreamStatus.MarkCompleted()
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
+			}
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		common.SysLog(common.LogText("error reading stream: %s", err.Error()))
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)
+		return usage, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
 	}
-
 	helper.Done(c)
-
-	service.CloseResponseBodyGracefully(resp)
-
-	return service.ResponseText2Usage(c, responseText.String(), info.UpstreamModelName, info.GetEstimatePromptTokens()), nil
+	if info.ResponseFacts == nil {
+		return service.ResponseText2Usage(c, responseText.String(), info.UpstreamModelName, info.GetEstimatePromptTokens()), nil
+	}
+	return usage, nil
 }
 
 func tencentHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
@@ -140,17 +159,24 @@ func tencentHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Resp
 		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
 	service.CloseResponseBodyGracefully(resp)
-	err = json.Unmarshal(responseBody, &tencentSb)
+	err = common.Unmarshal(responseBody, &tencentSb)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
+	fullTextResponse := responseTencent2OpenAI(&tencentSb.Response)
+	if info.ResponseFacts != nil {
+		prompt, completion := relaycommon.NativeUsagePresence(responseBody, "Response.Usage.PromptTokens", "Response.Usage.CompletionTokens", "Response.Usage.TotalTokens")
+		info.ResponseFacts.RecordUsage(&fullTextResponse.Usage, &fullTextResponse.Usage, prompt, completion)
+	}
 	if tencentSb.Response.Error.Code != 0 {
-		return nil, types.WithOpenAIError(types.OpenAIError{
+		return &fullTextResponse.Usage, types.WithOpenAIError(types.OpenAIError{
 			Message: tencentSb.Response.Error.Message,
 			Code:    tencentSb.Response.Error.Code,
 		}, resp.StatusCode)
 	}
-	fullTextResponse := responseTencent2OpenAI(&tencentSb.Response)
+	if info.ResponseFacts != nil {
+		return helper.WriteChatResponse(c, info, resp, fullTextResponse)
+	}
 	jsonResponse, err := common.Marshal(fullTextResponse)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)

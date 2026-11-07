@@ -1,6 +1,7 @@
 package coze
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -8,7 +9,9 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relay/channel"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
@@ -17,8 +20,11 @@ import (
 // message-list body. The protocol parser owns extraction of its usage fields.
 type cozeResultBody struct {
 	io.ReadCloser
-	completion CozeChatResponse
+	completion     CozeChatResponse
+	completionBody []byte
 }
+
+func (body *cozeResultBody) SetReader(reader io.ReadCloser) { body.ReadCloser = reader }
 
 var _ channel.ProviderRequestExecutor = (*Provider)(nil)
 
@@ -30,6 +36,11 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 	client, err := service.GetHttpClientWithProxySettings(account.ChannelSetting.Proxy, account.ChannelSetting.HTTPSettings())
 	if err != nil {
 		return nil, err
+	}
+	if value, ok := common.GetContextKey(c, constant.ContextKeyResponseFacts); ok {
+		if facts, _ := value.(*relaycommon.ResponseFacts); facts != nil && facts.OnBusinessOutput != nil {
+			client = channel.GatewayHTTPClient(client)
+		}
 	}
 	destination, err := p.RequestURL(metadata)
 	if err != nil {
@@ -64,10 +75,19 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 			return nil, err
 		}
 		var completion CozeChatResponse
-		err = common.DecodeJson(response.Body, &completion)
+		completionBody, err := io.ReadAll(response.Body)
 		response.Body.Close()
 		if err != nil {
 			return nil, err
+		}
+		if err := common.Unmarshal(completionBody, &completion); err != nil {
+			return nil, err
+		}
+		if facts, _ := common.GetContextKey(c, constant.ContextKeyResponseFacts); facts != nil &&
+			(completion.Code != 0 || completion.Data.Status == "failed" || completion.Data.Status == "canceled" || completion.Data.Status == "requires_action") {
+			response.StatusCode = http.StatusBadGateway
+			response.Body = &cozeResultBody{ReadCloser: io.NopCloser(bytes.NewReader(completionBody)), completion: completion, completionBody: completionBody}
+			return response, nil
 		}
 		if completion.Code != 0 {
 			return nil, fmt.Errorf("Coze chat polling failed: %s", completion.Msg)
@@ -81,9 +101,17 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 			}
 			response, err := client.Do(request)
 			if err != nil {
+				if facts, _ := common.GetContextKey(c, constant.ContextKeyResponseFacts); facts != nil {
+					// Completed generation remains payable when fetching its messages fails.
+					return &http.Response{
+						StatusCode: http.StatusBadGateway,
+						Header:     make(http.Header),
+						Body:       &cozeResultBody{ReadCloser: io.NopCloser(bytes.NewReader(nil)), completion: completion, completionBody: completionBody},
+					}, nil
+				}
 				return nil, err
 			}
-			response.Body = &cozeResultBody{ReadCloser: response.Body, completion: completion}
+			response.Body = &cozeResultBody{ReadCloser: response.Body, completion: completion, completionBody: completionBody}
 			return response, nil
 		case "failed", "canceled", "requires_action":
 			return nil, fmt.Errorf("chat status: %s", completion.Data.Status)

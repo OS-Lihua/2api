@@ -1,7 +1,6 @@
 package baidu
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -124,18 +123,31 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 			sr.Error(err)
 			return
 		}
-		if baiduResponse.Usage.TotalTokens != 0 {
+		if info.ResponseFacts != nil {
+			info.StreamStatus.RequireTerminal()
+			prompt, completion := relaycommon.ChatUsagePresence([]byte(data))
+			info.ResponseFacts.RecordUsage(usage, &baiduResponse.Usage, prompt, completion)
+			if baiduResponse.ErrorMsg != "" || baiduResponse.ErrorCode != 0 {
+				sr.Stop(fmt.Errorf("Baidu stream failed"))
+				return
+			}
+		} else if baiduResponse.Usage.TotalTokens != 0 {
 			usage.TotalTokens = baiduResponse.Usage.TotalTokens
 			usage.PromptTokens = baiduResponse.Usage.PromptTokens
 			usage.CompletionTokens = baiduResponse.Usage.TotalTokens - baiduResponse.Usage.PromptTokens
 		}
 		response := streamResponseBaidu2OpenAI(&baiduResponse)
-		if err := helper.ObjectData(c, response); err != nil {
-			common.SysLog(common.LogText("error sending stream response: %s", err.Error()))
-			sr.Error(err)
+		if err := helper.SendChatChunk(c, info, response); err != nil {
+			sr.Stop(err)
+			return
+		}
+		if baiduResponse.IsEnd {
+			info.StreamStatus.MarkCompleted()
+			sr.Done()
 		}
 	})
 	service.CloseResponseBodyGracefully(resp)
+	helper.EstimateMissingChatUsage(c, info, usage)
 	return nil, usage
 }
 
@@ -146,15 +158,23 @@ func baiduHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respon
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
 	service.CloseResponseBodyGracefully(resp)
-	err = json.Unmarshal(responseBody, &baiduResponse)
+	err = common.Unmarshal(responseBody, &baiduResponse)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
-	if baiduResponse.ErrorMsg != "" {
-		return types.NewError(fmt.Errorf("%s", baiduResponse.ErrorMsg), types.ErrorCodeBadResponseBody), nil
+	if info.ResponseFacts != nil {
+		prompt, completion := relaycommon.ChatUsagePresence(responseBody)
+		info.ResponseFacts.RecordUsage(&baiduResponse.Usage, &baiduResponse.Usage, prompt, completion)
+	}
+	if baiduResponse.ErrorMsg != "" || baiduResponse.ErrorCode != 0 {
+		return types.NewError(fmt.Errorf("%s", baiduResponse.ErrorMsg), types.ErrorCodeBadResponseBody), &baiduResponse.Usage
 	}
 	fullTextResponse := responseBaidu2OpenAI(&baiduResponse)
-	jsonResponse, err := json.Marshal(fullTextResponse)
+	if info.ResponseFacts != nil {
+		usage, responseErr := helper.WriteChatResponse(c, info, resp, fullTextResponse)
+		return responseErr, usage
+	}
+	jsonResponse, err := common.Marshal(fullTextResponse)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
@@ -171,7 +191,7 @@ func baiduEmbeddingHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
 	service.CloseResponseBodyGracefully(resp)
-	err = json.Unmarshal(responseBody, &baiduResponse)
+	err = common.Unmarshal(responseBody, &baiduResponse)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
@@ -179,7 +199,7 @@ func baiduEmbeddingHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 		return types.NewError(fmt.Errorf("%s", baiduResponse.ErrorMsg), types.ErrorCodeBadResponseBody), nil
 	}
 	fullTextResponse := embeddingResponseBaidu2OpenAI(&baiduResponse)
-	jsonResponse, err := json.Marshal(fullTextResponse)
+	jsonResponse, err := common.Marshal(fullTextResponse)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}

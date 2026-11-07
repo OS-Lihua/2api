@@ -72,6 +72,24 @@ func (p *novaProtocol) DoResponse(c *gin.Context, resp *http.Response, info *rel
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
+	var reported any
+	if reportedUsage {
+		reported = &response.Usage
+	}
+	if info.ResponseFacts != nil {
+		prompt, completion := relaycommon.NativeUsagePresence(body, "usage.inputTokens", "usage.outputTokens", "usage.totalTokens")
+		fields := make(map[string]int)
+		if prompt {
+			fields["prompt_tokens"] = response.Usage.PromptTokens
+		}
+		if completion {
+			fields["completion_tokens"] = response.Usage.CompletionTokens
+		}
+		reported = nil
+		if len(fields) > 0 {
+			reported = fields
+		}
+	}
 	if info.IsStream {
 		// The legacy Nova integration uses InvokeModel even for streaming clients.
 		// Emit one content chunk and the reported usage through the shared parser.
@@ -82,7 +100,11 @@ func (p *novaProtocol) DoResponse(c *gin.Context, resp *http.Response, info *rel
 		choice := dto.ChatCompletionsStreamResponseChoice{Index: 0, FinishReason: common.GetPointer("stop")}
 		choice.Delta.SetContentString(response.Choices[0].Message.StringContent())
 		chunk.Choices = []dto.ChatCompletionsStreamResponseChoice{choice}
-		encoded, err := common.Marshal(chunk)
+		wire := struct {
+			*dto.ChatCompletionsStreamResponse
+			Usage any `json:"usage,omitempty"`
+		}{ChatCompletionsStreamResponse: &chunk, Usage: reported}
+		encoded, err := common.Marshal(wire)
 		if err != nil {
 			return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 		}
@@ -91,11 +113,8 @@ func (p *novaProtocol) DoResponse(c *gin.Context, resp *http.Response, info *rel
 	}
 	wire := struct {
 		*dto.OpenAITextResponse
-		Usage *dto.Usage `json:"usage,omitempty"`
-	}{OpenAITextResponse: response}
-	if reportedUsage {
-		wire.Usage = &response.Usage
-	}
+		Usage any `json:"usage,omitempty"`
+	}{OpenAITextResponse: response, Usage: reported}
 	encoded, err := common.Marshal(wire)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)

@@ -47,7 +47,7 @@ func (*DifyChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAI
 
 type DifyFile struct {
 	Type         string `json:"type"`
-	TransferMode string `json:"transfer_mode"`
+	TransferMode string `json:"transfer_method"`
 	URL          string `json:"url,omitempty"`
 	UploadFileId string `json:"upload_file_id,omitempty"`
 }

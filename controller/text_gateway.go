@@ -19,6 +19,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay"
+	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -179,6 +180,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	}
 	info.TokenizerModel = selection.Channel.Model.ModelName
 	info.ResponseFacts = &relaycommon.ResponseFacts{OnBusinessOutput: budget.Delivered}
+	info.BeginProviderCall = budget.Start
 	common.SetContextKey(c, constant.ContextKeyResponseFacts, info.ResponseFacts)
 	info.InitChannelMeta(c)
 	info.UpstreamModelName = selection.Channel.UpstreamModelName
@@ -335,6 +337,9 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	var estimatedCost, estimatedConverted money.Amount
 	defer func() {
 		record.EndedAt = clock.Now().UnixMilli()
+		if attempt == nil && parent.Context().Err() != nil {
+			record.Status = "cancelled"
+		}
 		if attempt != nil {
 			attempt.EndedAt = record.EndedAt
 			attempt.Status, attempt.ErrorClass = gatewayAttemptOutcome(c, info, attemptErr)
@@ -440,7 +445,22 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
 	}
+
 	info.SetEstimatePromptTokens(estimatedInput)
+	encoded, err = adaptor.PrepareChatRequest(c, info, converted, encoded)
+	if err != nil {
+		var rejection *types.NewAPIError
+		if errors.As(err, &rejection) {
+			native := rejection.ToOpenAIError()
+			code, _ := native.Code.(string)
+			result.Failure = service.ClassifyGatewayFailure(rejection.StatusCode, code, false, budget.TimedOut(), parent.Context().Err() != nil, false, native.Type)
+			if result.Failure.ExcludeProvider {
+				result.SkippedProvider = selection.Channel.ProviderID
+			}
+		}
+		run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
+		return
+	}
 	prepared, err := adaptor.PrepareRequest(c, info, bytes.NewReader(encoded))
 	if err != nil {
 		run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
@@ -506,7 +526,12 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		// Parse only bounded structured codes; provider text and URLs never leave memory.
 		raw, readErr := io.ReadAll(io.LimitReader(httpResponse.Body, 1<<20))
 		_ = httpResponse.Body.Close()
-		httpResponse.Body = io.NopCloser(bytes.NewReader(raw))
+		buffered := io.NopCloser(bytes.NewReader(raw))
+		if body, ok := httpResponse.Body.(channel.ReplayableResponseBody); ok {
+			body.SetReader(buffered)
+		} else {
+			httpResponse.Body = buffered
+		}
 		var payload struct {
 			Error any `json:"error"`
 		}
