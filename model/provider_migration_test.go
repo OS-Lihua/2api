@@ -96,6 +96,34 @@ WHERE connamespace = current_schema()::regnamespace AND conname LIKE '%channels%
 	assert.Greater(t, next.Id, legacy.Id)
 }
 
+func TestMigrateProviderTableKeepsSingleModelChannels(t *testing.T) {
+	db := UseTestDatabases(t)
+	require.NoError(t, db.AutoMigrate(&Provider{}))
+	provider := Provider{Type: 1, Key: "test-key", Name: "existing provider"}
+	require.NoError(t, db.Create(&provider).Error)
+	// The single-model Channel introduced after the Provider rename reuses
+	// the channels table name. Startup must keep both tables and their rows.
+	type singleModelChannel struct {
+		Id         int `gorm:"primaryKey"`
+		ProviderId int
+		ModelId    int
+	}
+	require.NoError(t, db.Table("channels").AutoMigrate(&singleModelChannel{}))
+	channel := singleModelChannel{ProviderId: provider.Id, ModelId: 7}
+	require.NoError(t, db.Table("channels").Create(&channel).Error)
+
+	for range 2 {
+		migrateProviderSchema(t, db)
+	}
+
+	var keptProvider Provider
+	require.NoError(t, db.First(&keptProvider, provider.Id).Error)
+	assert.Equal(t, provider.Name, keptProvider.Name)
+	var keptChannel singleModelChannel
+	require.NoError(t, db.Table("channels").First(&keptChannel, channel.Id).Error)
+	assert.Equal(t, channel, keptChannel)
+}
+
 func TestMigrateProviderTableRejectsBothTables(t *testing.T) {
 	db := UseTestDatabases(t)
 	require.NoError(t, db.AutoMigrate(&legacyProviderRow{}, &Provider{}))

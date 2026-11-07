@@ -22,8 +22,8 @@ type providerSchemaRename struct {
 
 // migrateProviderTable renames the table that stored Providers before the
 // rename, together with its sequence, indexes, and constraints, so the result
-// matches a fresh schema. Column names are unchanged. It does nothing once the
-// "channels" table is gone, so it is safe to run on every start.
+// matches a fresh schema. Column names are unchanged. A channels table with
+// provider_id belongs to the new single-model Channel and is left unchanged.
 func migrateProviderTable(db *gorm.DB) error {
 	return db.Transaction(func(tx *gorm.DB) error {
 		var tables struct {
@@ -37,6 +37,13 @@ func migrateProviderTable(db *gorm.DB) error {
 			return fmt.Errorf("inspect provider tables: %w", err)
 		}
 		if !tables.Legacy {
+			return nil
+		}
+		// The new single-model Channel table has provider_id and no account
+		// credentials. It must not be mistaken for the old Provider table.
+		if tx.Migrator().HasColumn(legacyProviderTable, "provider_id") &&
+			tx.Migrator().HasColumn(legacyProviderTable, "model_id") &&
+			!tx.Migrator().HasColumn(legacyProviderTable, "key") {
 			return nil
 		}
 		if tables.Current {
