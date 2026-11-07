@@ -16,7 +16,6 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/money"
-	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
@@ -82,6 +81,11 @@ func TextGateway(c *gin.Context) {
 	}
 	selection, err := service.SelectGatewayChannel(c, offering, request)
 	if err != nil {
+		var conversionErr *service.GatewayConversionError
+		if errors.As(err, &conversionErr) {
+			gatewayError(c, http.StatusBadRequest, "unsupported_parameter", conversionErr.Error())
+			return
+		}
 		if errors.Is(err, service.ErrGatewayCapability) {
 			gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "No Channel supports the requested capabilities")
 			return
@@ -127,7 +131,7 @@ func TextGateway(c *gin.Context) {
 			request.StreamOptions = nil
 		}
 	}
-	adaptor, err := relay.GetChannelAdaptor(info.ApiType, protocol.OpenAIChat)
+	adaptor, err := relay.GetChannelAdaptor(info.ApiType, selection.Channel.Protocol)
 	if err != nil {
 		gatewayError(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
 		return
@@ -140,6 +144,10 @@ func TextGateway(c *gin.Context) {
 	if err != nil {
 		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "The request cannot be sent to this Channel")
 		return
+	}
+	losses := service.GatewayConversionCodes(info.ConversionDiagnostics())
+	if len(losses) > 0 {
+		c.Header("X-Gateway-Conversion-Loss", strings.Join(losses, ","))
 	}
 	encoded, err := common.Marshal(converted)
 	if err != nil {
@@ -364,7 +372,7 @@ func TextGateway(c *gin.Context) {
 	attempt = &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: record.ID, ChannelID: selection.Channel.ID, ProviderID: selection.Channel.ProviderID, ModelID: selection.Channel.ModelID, MemberTier: 1,
 		StartedAt: attemptStart.UnixMilli(), FailoverDecision: "stop", FailoverReason: "single_attempt", CircuitAction: "none", RouteDiagnostics: selection.Diagnostics,
 		UsageSource: "none", PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, Cost: money.Amount{Currency: purchase.Currency}, AccountingFXRate: purchaseRate,
-		ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, ConversionLosses: []string{}}
+		ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, ConversionLosses: losses}
 	response, err := adaptor.DoPreparedRequest(c, info, prepared)
 	if err != nil {
 		attemptErr = types.NewError(err, types.ErrorCodeDoRequestFailed)

@@ -710,6 +710,30 @@ func TestTextGatewayMissingUsageIgnoresOutputCeilings(t *testing.T) {
 	}
 }
 
+func TestTextGatewaySelectsExplicitResponsesProtocol(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/v1/responses", r.URL.Path)
+		var body map[string]any
+		require.NoError(t, common.DecodeJson(r.Body, &body))
+		assert.EqualValues(t, 0, body["temperature"])
+		assert.Equal(t, false, body["parallel_tool_calls"])
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-test","object":"response","status":"completed","model":"upstream-model","output":[{"id":"msg","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hello","annotations":[]}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}`))
+	})
+	require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "openai_responses").Error)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}],"temperature":0,"parallel_tool_calls":false,"max_tokens":16}`)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), "Hello")
+	requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, int64(36000), requests[0].Receivable.Nanos)
+	attempts, _, err := model.ListGatewayAttempts(t.Context(), requests[0].ID, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, attempts, 1)
+	assert.Equal(t, int64(20000), attempts[0].Cost.Nanos)
+}
+
 func TestTextGatewayAliasBillsWalletAndRecordsAttempt(t *testing.T) {
 	calls := 0
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {

@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 )
@@ -21,15 +22,14 @@ type GatewaySelection struct {
 	InputTokens  int
 	Capabilities capability.Set
 	Diagnostics  map[string]any
+	Conversion   *relayconvert.RequestResult
 }
 
 var ErrGatewayCapability = errors.New("no Channel supports the requested capabilities")
 var ErrGatewayUnavailable = errors.New("no Channel is available")
 
-// SelectGatewayChannel considers only the current member tier and the exact
-// OpenAI Chat protocol. Ordering by Channel ID makes this single-attempt policy
-// deterministic; later route policies can replace selection without replacing
-// the shared scope, capability, transport or accounting boundaries.
+// SelectGatewayChannel preconverts candidates before any Attempt or reservation.
+// Same-protocol candidates rank before good, fair and discouraged conversions.
 func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request *dto.GeneralOpenAIRequest) (*GatewaySelection, error) {
 	ids := []int{}
 	for _, member := range offering.Members {
@@ -45,15 +45,19 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 	counts := map[string]int{}
 	excluded := []map[string]any{}
 	var selected *GatewaySelection
+	var rejected []types.ConversionDiagnostic
+	bestRank := 5
 	for _, candidate := range candidates {
 		reason := ""
 		var provider *model.Provider
 		var caps capability.Set
 		var tokens int
+		var conversion *relayconvert.RequestResult
+		rank := 0
 		switch {
 		case candidate.Status != model.ChannelEnabled || !candidate.MappingConfirmed || candidate.Model.Status != 1:
 			reason = "disabled"
-		case candidate.Protocol != protocol.OpenAIChat:
+		case candidate.Protocol != protocol.OpenAIChat && candidate.Protocol != protocol.OpenAIResponses && candidate.Protocol != protocol.AnthropicMessages && candidate.Protocol != protocol.GeminiGenerate:
 			reason = "protocol"
 		default:
 			var err error
@@ -78,6 +82,24 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 				reason = "capability"
 				break
 			}
+			info.InitChannelMeta(c)
+			info.UpstreamModelName = candidate.UpstreamModelName
+			conversion, err = PreconvertGatewayRequest(c, info, candidate.Protocol, request, offering.AcceptedConversionLosses)
+			if err != nil {
+				reason = "conversion_loss"
+				if conversion != nil {
+					rejected = append(rejected, conversion.Diagnostics...)
+				}
+				break
+			}
+			if conversion.From != conversion.To {
+				rank = 3
+				if conversion.Quality == relayconvert.RequestConverterQualityGood {
+					rank = 1
+				} else if conversion.Quality == relayconvert.RequestConverterQualityFair {
+					rank = 2
+				}
+			}
 		}
 		if reason != "" {
 			counts[reason]++
@@ -87,12 +109,16 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 			continue
 		}
 		diagnostics["eligible_count"] = diagnostics["eligible_count"].(int) + 1
-		if selected == nil {
-			selected = &GatewaySelection{Channel: candidate, Provider: provider, InputTokens: tokens, Capabilities: caps}
+		if selected == nil || rank < bestRank {
+			bestRank = rank
+			selected = &GatewaySelection{Channel: candidate, Provider: provider, InputTokens: tokens, Capabilities: caps, Conversion: conversion}
 		}
 	}
 	diagnostics["excluded_counts"], diagnostics["excluded"] = counts, excluded
 	if selected == nil {
+		if counts["conversion_loss"] > 0 {
+			return nil, &GatewayConversionError{Diagnostics: rejected}
+		}
 		if counts["capability"] > 0 {
 			return nil, ErrGatewayCapability
 		}
