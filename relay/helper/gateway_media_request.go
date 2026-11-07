@@ -116,7 +116,7 @@ func GatewayMediaMultipartInput(form *multipart.Form) ([]byte, error) {
 		}
 		value := values[0]
 		switch strings.ToLower(key) {
-		case "n", "batch_size", "batch_count", "num_images", "num_outputs", "samplecount", "sample_count", "max_images", "max_tokens", "max_completion_tokens", "max_output_tokens", "max_new_tokens", "maxoutputtokens", "duration", "seconds", "duration_seconds", "speed", "width", "height", "output_quality", "output_compression", "parameters", "metadata":
+		case "n", "batch_size", "batch_count", "num_images", "num_outputs", "samplecount", "sample_count", "max_images", "max_tokens", "max_completion_tokens", "max_output_tokens", "max_new_tokens", "maxoutputtokens", "duration", "seconds", "duration_seconds", "speed", "width", "height", "output_quality", "output_compression", "parameters", "metadata", "stream", "watermark", "prompt_extend":
 			scalars[key] = common.RawMessage(value)
 		default:
 			encoded, err := common.Marshal(value)

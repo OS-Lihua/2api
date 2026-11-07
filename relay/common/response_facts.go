@@ -44,6 +44,7 @@ type ResponseFacts struct {
 	GeneratedAudioBytes        int64
 	GeneratedImageCount        int64
 	AudioInputDurationReported bool
+	AudioOutputTokensReported  bool
 	OnBusinessOutput           func()
 }
 

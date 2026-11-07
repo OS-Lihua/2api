@@ -2,8 +2,11 @@ package relay
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -120,6 +123,8 @@ func TestMediaMultipartPreparationUsesOverriddenQuantity(t *testing.T) {
 		require.NoError(t, r.ParseMultipartForm(1<<20))
 		received = r.FormValue("n")
 		assert.Equal(t, "wire-image", r.FormValue("model"))
+		assert.Equal(t, "false", r.FormValue("stream"))
+		assert.Equal(t, "false", r.FormValue("watermark"))
 		file, _, err := r.FormFile("image")
 		require.NoError(t, err)
 		image, err := io.ReadAll(file)
@@ -133,6 +138,8 @@ func TestMediaMultipartPreparationUsesOverriddenQuantity(t *testing.T) {
 	writer := multipart.NewWriter(&body)
 	require.NoError(t, writer.WriteField("model", "image"))
 	require.NoError(t, writer.WriteField("prompt", "edit"))
+	require.NoError(t, writer.WriteField("stream", "false"))
+	require.NoError(t, writer.WriteField("watermark", "false"))
 	require.NoError(t, writer.WriteField("n", "1"))
 	part, err := writer.CreateFormFile("image", "image.png")
 	require.NoError(t, err)
@@ -158,6 +165,71 @@ func TestMediaMultipartPreparationUsesOverriddenQuantity(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, response.(*http.Response).Body.Close())
 	assert.Equal(t, "4", received)
+}
+
+func TestMediaReplicateEditsPrepareWithoutProviderCalls(t *testing.T) {
+	var picture bytes.Buffer
+	require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+	for _, invalid := range []bool{false, true} {
+		t.Run(fmt.Sprint("invalid=", invalid), func(t *testing.T) {
+			service.InitHttpClient()
+			uploads, sends := 0, 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/files" {
+					uploads++
+					_, _ = io.WriteString(w, `{"urls":{"get":"https://image.invalid/upload"}}`)
+					return
+				}
+				sends++
+				var wire struct {
+					Input struct {
+						Image string `json:"image_prompt"`
+					} `json:"input"`
+				}
+				require.NoError(t, common.DecodeJson(r.Body, &wire))
+				prefix := "data:image/png;base64,"
+				require.True(t, strings.HasPrefix(wire.Input.Image, prefix))
+				decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(wire.Input.Image, prefix))
+				require.NoError(t, err)
+				assert.Equal(t, picture.Bytes(), decoded)
+				_, _ = io.WriteString(w, `{}`)
+			}))
+			t.Cleanup(server.Close)
+			var body bytes.Buffer
+			writer := multipart.NewWriter(&body)
+			require.NoError(t, writer.WriteField("model", "image"))
+			require.NoError(t, writer.WriteField("prompt", "edit"))
+			file, err := writer.CreateFormFile("image", "input.png")
+			require.NoError(t, err)
+			_, err = file.Write(picture.Bytes())
+			require.NoError(t, err)
+			require.NoError(t, writer.Close())
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
+			c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+			parsed, err := helper.ParseGatewayMediaRequest(c)
+			require.NoError(t, err)
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeReplicate, ChannelBaseUrl: server.URL, UpstreamModelName: "black-forest-labs/flux-1.1-pro", ApiKey: "fake-replicate-key"}, RelayMode: relayconstant.RelayModeImagesEdits, RelayFormat: types.RelayFormatOpenAIImage, ResponseFacts: &relaycommon.ResponseFacts{}}
+			if invalid {
+				info.ParamOverride = map[string]any{"input": map[string]any{"num_outputs": 129}}
+			}
+			adaptor, err := GetChannelAdaptor(constant.APITypeReplicate, protocol.OpenAIImages)
+			require.NoError(t, err)
+			prepared, err := adaptor.PrepareMediaRequest(c, info, parsed)
+			assert.Zero(t, uploads)
+			assert.Zero(t, sends)
+			if invalid {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			response, err := adaptor.DoPreparedRequest(c, info, prepared.Prepared)
+			require.NoError(t, err)
+			require.NoError(t, response.(*http.Response).Body.Close())
+			assert.Equal(t, 1, sends)
+			assert.Zero(t, uploads)
+		})
+	}
 }
 
 func TestMediaImagenUsesNativeWireAndCanonicalImageDelivery(t *testing.T) {
@@ -255,6 +327,35 @@ func TestMediaNativeSpeechProtocolsPrepareAndDeliverActualAudio(t *testing.T) {
 			assert.Equal(t, int64(2), info.ResponseFacts.GeneratedAudioBytes)
 		})
 	}
+}
+
+func TestMediaTranscriptionResponseUsesEffectiveFormat(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	require.NoError(t, writer.WriteField("model", "transcription"))
+	require.NoError(t, writer.WriteField("response_format", "json"))
+	file, err := writer.CreateFormFile("file", "input.wav")
+	require.NoError(t, err)
+	_, err = file.Write([]byte("audio bytes"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", &body)
+	c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+	parsed, err := helper.ParseGatewayMediaRequest(c)
+	require.NoError(t, err)
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeOpenAI, ChannelBaseUrl: "https://provider.invalid", UpstreamModelName: "whisper-1", ParamOverride: map[string]any{"response_format": "text"}}, RelayMode: relayconstant.RelayModeAudioTranscription, RelayFormat: types.RelayFormatOpenAIAudio, ResponseFacts: &relaycommon.ResponseFacts{}}
+	adaptor, err := GetChannelAdaptor(constant.APITypeOpenAI, protocol.OpenAIAudioTranscription)
+	require.NoError(t, err)
+	prepared, err := adaptor.PrepareMediaRequest(c, info, parsed)
+	require.NoError(t, err)
+	assert.Equal(t, "text", prepared.Request.(*dto.AudioRequest).ResponseFormat)
+	_, apiErr := adaptor.DoResponse(c, &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/plain"}}, Body: io.NopCloser(strings.NewReader("hello"))}, info)
+	require.Nil(t, apiErr)
+	assert.Equal(t, "hello", recorder.Body.String())
+	assert.True(t, info.ResponseFacts.BusinessOutput)
+	assert.Equal(t, "hello", info.ResponseFacts.GeneratedText)
 }
 
 func TestMediaCloudflareTranscriptionUsesRawAudioAndCanonicalText(t *testing.T) {

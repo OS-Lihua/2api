@@ -121,6 +121,13 @@ func observeMediaUsage(info *relaycommon.RelayInfo, usage *dto.Usage, body []byt
 	if info.ResponseFacts == nil || usage == nil {
 		return
 	}
+	path := "usage.output_tokens_details.audio_tokens"
+	if raw := ojson.GetBytes(body, path).Raw; raw == "" || raw == "null" {
+		path = "usage.completion_tokens_details.audio_tokens"
+	}
+	if reported, _ := relaycommon.NativeUsagePresence(body, path, "", ""); reported {
+		info.ResponseFacts.AudioOutputTokensReported = true
+	}
 	prompt, completion := relaycommon.MediaUsagePresence(body)
 	if raw := ojson.GetBytes(body, "usage.input_tokens").Raw; prompt && raw != "" && raw != "null" {
 		usage.PromptTokens = usage.InputTokens

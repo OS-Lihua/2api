@@ -80,6 +80,19 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		observeMediaError(info, body, resp.StatusCode)
 		return usage
 	}
+	if info.ResponseFacts != nil && info.IsStream && strings.Contains(resp.Header.Get("Content-Type"), "json") {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return usage
+		}
+		usage = reportedMediaUsage(body)
+		observeMediaUsage(info, usage, body)
+		if observeMediaError(info, body, resp.StatusCode) == nil {
+			info.StreamStatus = relaycommon.NewStreamStatus()
+			info.StreamStatus.MarkFailed("", "invalid_response", http.StatusBadGateway)
+		}
+		return usage
+	}
 	usage.PromptTokens = info.GetEstimatePromptTokens()
 	usage.TotalTokens = info.GetEstimatePromptTokens()
 	for k, v := range resp.Header {
@@ -168,7 +181,10 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			} else {
 				tokens, clamp = common.QuotaRoundChecked(math.Ceil(float64(audioBytes) / 1000))
 			}
-			usage.CompletionTokens, usage.CompletionTokenDetails.AudioTokens = tokens, tokens
+			usage.CompletionTokens = tokens
+			if !info.ResponseFacts.AudioOutputTokensReported {
+				usage.CompletionTokenDetails.AudioTokens = tokens
+			}
 			if clamp != nil {
 				info.QuotaClamp = clamp
 			}

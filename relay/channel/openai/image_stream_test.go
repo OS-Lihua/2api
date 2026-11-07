@@ -2,6 +2,7 @@ package openai
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -137,13 +138,16 @@ func TestMediaErrorUsageRetainedWithoutDelivery(t *testing.T) {
 	for _, mode := range []int{relayconstant.RelayModeImagesGenerations, relayconstant.RelayModeAudioSpeech, relayconstant.RelayModeAudioTranscription} {
 		formats := []string{"json", "sse"}
 		if mode == relayconstant.RelayModeAudioSpeech {
-			formats = []string{"pcm", "sse"}
+			formats = []string{"pcm", "sse", "sse_json"}
 		}
 		if mode == relayconstant.RelayModeAudioTranscription {
 			formats = []string{"json", "text"}
 		}
 		for _, status := range []int{http.StatusOK, http.StatusServiceUnavailable} {
 			for _, format := range formats {
+				if status != http.StatusOK && format == "sse_json" {
+					continue
+				}
 				t.Run(fmt.Sprintf("%d/%d/%s", mode, status, format), func(t *testing.T) {
 					body := `{"type":"error","error":{"type":"upstream_error","code":"rate_limit_exceeded","message":"provider-secret"},"usage":{"input_tokens":7,"output_tokens":0}}`
 					contentType := "application/json"
@@ -151,12 +155,12 @@ func TestMediaErrorUsageRetainedWithoutDelivery(t *testing.T) {
 						body = "data: " + body + "\n\ndata: [DONE]\n\n"
 						contentType = "text/event-stream"
 					}
-					c, recorder, response, info := newImageTestContext(t, body, contentType, format == "sse")
+					c, recorder, response, info := newImageTestContext(t, body, contentType, strings.HasPrefix(format, "sse"))
 					response.StatusCode = status
 					info.RelayMode = mode
 					info.ResponseFacts = &relaycommon.ResponseFacts{}
 					info.Request = &dto.AudioRequest{ResponseFormat: format}
-					if format == "sse" {
+					if strings.HasPrefix(format, "sse") {
 						info.Request = &dto.AudioRequest{ResponseFormat: "pcm", StreamFormat: "sse"}
 					}
 					common.SetContextKey(c, constant.ContextKeyResponseFacts, info.ResponseFacts)
@@ -262,6 +266,23 @@ func TestMediaStreamUsageDetailsSurviveOmittedFieldsAndResetExplicitZero(t *test
 			assert.True(t, info.ResponseFacts.UsageReported)
 		})
 	}
+}
+
+func TestSpeechStreamEstimatePreservesReportedAudioZeroWithoutTotal(t *testing.T) {
+	previous := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previous })
+	body := fmt.Sprintf("data: {\"type\":\"speech.audio.delta\",\"audio\":%q}\n\ndata: {\"type\":\"speech.audio.done\",\"usage\":{\"output_tokens_details\":{\"audio_tokens\":0}}}\n\ndata: [DONE]\n\n", base64.StdEncoding.EncodeToString(make([]byte, 48000)))
+	c, _, response, info := newImageTestContext(t, body, "text/event-stream", true)
+	info.ResponseFacts = &relaycommon.ResponseFacts{}
+	info.RelayMode = relayconstant.RelayModeAudioSpeech
+	info.Request = &dto.AudioRequest{ResponseFormat: "pcm", StreamFormat: "sse"}
+	result, err := (&Adaptor{}).DoResponse(c, response, info)
+	require.Nil(t, err)
+	usage := result.(*dto.Usage)
+	assert.Equal(t, 17, usage.CompletionTokens)
+	assert.Zero(t, usage.CompletionTokenDetails.AudioTokens)
+	assert.False(t, info.ResponseFacts.CompletionTokensReported)
 }
 
 func TestMediaTranscriptionDurationPresenceKeepsZeroAndBoundsInvalidReports(t *testing.T) {

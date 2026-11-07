@@ -785,7 +785,13 @@ func (a *Protocol) DoResponse(c *gin.Context, resp *http.Response, info *relayco
 	case relayconstant.RelayModeAudioTranslation:
 		fallthrough
 	case relayconstant.RelayModeAudioTranscription:
-		err, usage = OpenaiSTTHandler(c, resp, info, a.ResponseFormat)
+		format := a.ResponseFormat
+		if info.ResponseFacts != nil {
+			if request, ok := info.Request.(*dto.AudioRequest); ok {
+				format = request.ResponseFormat
+			}
+		}
+		err, usage = OpenaiSTTHandler(c, resp, info, format)
 	case relayconstant.RelayModeImagesGenerations, relayconstant.RelayModeImagesEdits:
 		if info.IsStream {
 			usage, err = OpenaiImageStreamHandler(c, info, resp)

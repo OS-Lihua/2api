@@ -2,6 +2,7 @@ package replicate
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -127,7 +128,27 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 		inputPayload["prompt_upsampling"] = true
 	}
 
-	if info.RelayMode == relayconstant.RelayModeImagesEdits {
+	if info.RelayMode == relayconstant.RelayModeImagesEdits && info.ResponseFacts != nil {
+		fileHeader, err := imageFileFromForm(c, "image", "image[]", "image_prompt")
+		if err != nil {
+			return nil, err
+		}
+		if fileHeader == nil {
+			return nil, errors.New("replicate adaptor: image file is required for edits")
+		}
+		file, err := fileHeader.Open()
+		if err != nil {
+			return nil, errors.New("replicate adaptor: failed to open image file")
+		}
+		defer file.Close()
+		image, err := io.ReadAll(file)
+		if err != nil {
+			return nil, errors.New("replicate adaptor: failed to read image file")
+		}
+		// Replicate accepts data URIs as prediction file inputs. Send the image
+		// in the funded prediction instead of uploading during conversion.
+		inputPayload["image_prompt"] = "data:" + http.DetectContentType(image) + ";base64," + base64.StdEncoding.EncodeToString(image)
+	} else if info.RelayMode == relayconstant.RelayModeImagesEdits {
 		metadata := channel.NewProviderMetadata(info)
 		overrides, err := channel.ResolveHeaderOverride(info, c)
 		if err != nil {
@@ -189,6 +210,7 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 		}
 	}
 	if info.ResponseFacts != nil {
+		c.Request.Header.Set("Content-Type", "application/json")
 		return imageRequest{"input": inputPayload}, nil
 	}
 	return map[string]any{
@@ -425,41 +447,41 @@ func normalizeFluxDimension(value int) int {
 	return value
 }
 
+func imageFileFromForm(c *gin.Context, fieldCandidates ...string) (*multipart.FileHeader, error) {
+	mf := c.Request.MultipartForm
+	if mf == nil {
+		if _, err := c.MultipartForm(); err != nil {
+			return nil, errors.New("replicate adaptor: parse multipart form failed")
+		}
+		mf = c.Request.MultipartForm
+	}
+	if mf == nil || len(mf.File) == 0 {
+		return nil, nil
+	}
+	if len(fieldCandidates) == 0 {
+		fieldCandidates = []string{"image", "image[]", "image_prompt"}
+	}
+	for _, key := range fieldCandidates {
+		if files := mf.File[key]; len(files) > 0 {
+			return files[0], nil
+		}
+	}
+	for _, files := range mf.File {
+		if len(files) > 0 {
+			return files[0], nil
+		}
+	}
+	return nil, nil
+}
+
 func (p *Provider) uploadFileFromForm(c *gin.Context, metadata channel.ProviderMetadata, fieldCandidates ...string) (string, error) {
 	if metadata == nil || metadata.ProviderRequest() == nil || c == nil || c.Request == nil {
 		return "", errors.New("replicate adaptor: missing upload metadata")
 	}
 	info := metadata.ProviderRequest()
-
-	mf := c.Request.MultipartForm
-	if mf == nil {
-		if _, err := c.MultipartForm(); err != nil {
-			return "", fmt.Errorf("replicate adaptor: parse multipart form failed: %w", err)
-		}
-		mf = c.Request.MultipartForm
-	}
-	if mf == nil || len(mf.File) == 0 {
-		return "", nil
-	}
-
-	if len(fieldCandidates) == 0 {
-		fieldCandidates = []string{"image", "image[]", "image_prompt"}
-	}
-
-	var fileHeader *multipart.FileHeader
-	for _, key := range fieldCandidates {
-		if files := mf.File[key]; len(files) > 0 {
-			fileHeader = files[0]
-			break
-		}
-	}
-	if fileHeader == nil {
-		for _, files := range mf.File {
-			if len(files) > 0 {
-				fileHeader = files[0]
-				break
-			}
-		}
+	fileHeader, err := imageFileFromForm(c, fieldCandidates...)
+	if err != nil {
+		return "", err
 	}
 	if fileHeader == nil {
 		return "", nil
