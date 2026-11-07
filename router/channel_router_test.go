@@ -82,6 +82,7 @@ func TestProviderRoutesRequireAdminAndKeepChannelPermissions(t *testing.T) {
 	assert.Equal(t, map[string]authz.Permission{
 		"GET ":                          authz.ChannelRead,
 		"POST ":                         authz.ChannelSensitiveWrite,
+		"POST /import":                  authz.ChannelSensitiveWrite,
 		"GET /:id":                      authz.ChannelRead,
 		"PATCH /:id":                    authz.ChannelWrite,
 		"DELETE /:id":                   authz.ChannelSensitiveWrite,

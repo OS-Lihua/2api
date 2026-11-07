@@ -72,6 +72,9 @@ func registerSingleModelChannelRoutes(apiRouter *gin.RouterGroup) {
 }
 
 var singleModelChannelRoutes = []permissionRoute{
+	{http.MethodPost, "/import", authz.ChannelWrite, controller.BulkImport},
+	{http.MethodPost, "/bulk-confirm", authz.ChannelOperate, controller.BulkImport},
+	{http.MethodPost, "/bulk-enable", authz.ChannelOperate, controller.BulkImport},
 	{http.MethodGet, "", authz.ChannelRead, controller.ListSingleModelChannels},
 	{http.MethodPost, "", authz.ChannelWrite, controller.SaveSingleModelChannel},
 	{http.MethodGet, "/protocols", authz.ChannelRead, controller.ChannelProtocolOptions},
@@ -87,6 +90,7 @@ var singleModelChannelRoutes = []permissionRoute{
 }
 
 var providerPermissionRoutes = []permissionRoute{
+	{method: http.MethodPost, path: "/import", permission: authz.ChannelSensitiveWrite, handler: controller.BulkImport},
 	{method: http.MethodGet, path: "", permission: authz.ChannelRead, handler: controller.ListProviders},
 	{method: http.MethodPost, path: "", permission: authz.ChannelSensitiveWrite, handler: controller.CreateProvider},
 	{method: http.MethodGet, path: "/:id", permission: authz.ChannelRead, handler: controller.GetProvider},
