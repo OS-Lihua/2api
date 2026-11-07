@@ -1505,6 +1505,23 @@ func TestTextGatewayStreamRequestsUpstreamUsageOnConvertedCopy(t *testing.T) {
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 }
 
+func TestTextGatewayNativeMessagesRequiresStructuredOutput(t *testing.T) {
+	for _, format := range []string{`"output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}`, `"output_format":{"type":"json_schema","schema":{"type":"object"}}`} {
+		t.Run(format, func(t *testing.T) {
+			calls := 0
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { calls++; w.WriteHeader(500) })
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "anthropic_messages").Error)
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}).Error)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,`+format+`}`)
+			require.Equal(t, 400, response.Code, response.Body.String())
+			assert.Zero(t, calls)
+			var attempts int64
+			require.NoError(t, model.DB.Model(&model.GatewayAttempt{}).Count(&attempts).Error)
+			assert.Zero(t, attempts)
+		})
+	}
+}
+
 func TestTextGatewayNativeGeminiRequiresDeclaredFeatures(t *testing.T) {
 	for _, config := range []string{`"cachedContent":"cached/one"`, `"generationConfig":{"responseMimeType":"application/json","responseSchema":{"type":"OBJECT"}}`} {
 		t.Run(config, func(t *testing.T) {
@@ -1552,7 +1569,7 @@ func TestTextGatewayIndependentConvertedUsageCounters(t *testing.T) {
 		name, protocol, body, stream string
 		completion, revenue, cost    int64
 	}{
-		{"bad Responses total", "openai_responses", `{"id":"resp","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":-1}}`, `data: {"type":"response.output_text.delta","delta":"Hello","output_index":0,"content_index":0}` + "\n\ndata: " + `{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":"bad"}}}` + "\n\n", 5, 36000, 20000},
+		{"bad Responses total", "openai_responses", `{"id":"resp","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":{}}}`, `data: {"type":"response.output_text.delta","delta":"Hello","output_index":0,"content_index":0}` + "\n\ndata: " + `{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":[]}}}` + "\n\n", 5, 36000, 20000},
 		{"Gemini explicit zero", "gemini_generate", `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":0,"totalTokenCount":15}}`, "", 0, 18000, 10000},
 		{"bad Gemini total", "gemini_generate", `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":-1}}`, "", 5, 36000, 20000},
 	} {

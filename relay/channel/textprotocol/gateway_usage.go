@@ -106,6 +106,29 @@ func gatewayValidCounter(value gjson.Result) bool {
 
 func mergeGatewayUsageSnapshot(current, incoming map[string]any) {
 	for key, value := range incoming {
+		lower := strings.ToLower(key)
+		if strings.Contains(lower, "token") && !strings.HasSuffix(lower, "details") {
+			number, ok := value.(float64)
+			if !ok || number < 0 || number > 1<<31-1 || number != float64(int64(number)) {
+				continue
+			}
+			current[key] = value
+			continue
+		}
+		if strings.HasSuffix(lower, "details") {
+			_, valid := value.([]any)
+			if strings.Contains(key, "_") {
+				_, valid = value.(map[string]any)
+			}
+			if !valid {
+				continue
+			}
+		}
+		if key == "cache_creation" || key == "server_tool_use" || key == "billing_usage" {
+			if _, valid := value.(map[string]any); !valid {
+				continue
+			}
+		}
 		if fields, ok := value.(map[string]any); ok {
 			nested, _ := current[key].(map[string]any)
 			if nested == nil {
@@ -139,12 +162,6 @@ func mergeGatewayUsageSnapshot(current, incoming map[string]any) {
 			}
 			current[key] = previous
 			continue
-		}
-		if strings.Contains(strings.ToLower(key), "token") {
-			number, ok := value.(float64)
-			if !ok || number < 0 || number > 1<<31-1 || number != float64(int64(number)) {
-				continue
-			}
 		}
 		current[key] = value
 	}

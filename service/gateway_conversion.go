@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/model_setting"
+	"github.com/tidwall/gjson"
 )
 
 // GatewayProtocolFormat maps the four public text protocols independently of Provider type.
@@ -50,6 +51,12 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 	chat, ok := result.Value.(*dto.GeneralOpenAIRequest)
 	if !ok {
 		return nil, fmt.Errorf("missing text request projection")
+	}
+	if claude, ok := request.(*dto.ClaudeRequest); ok {
+		format := gjson.GetBytes(claude.OutputConfig, "format")
+		if format.Exists() && format.Type != gjson.Null || gjson.ParseBytes(claude.OutputFormat).IsObject() {
+			chat.ResponseFormat = &dto.ResponseFormat{Type: "json_object"}
+		}
 	}
 	if gemini, ok := request.(*dto.GeminiChatRequest); ok {
 		if gemini.CachedContent != "" {
