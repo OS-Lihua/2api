@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
@@ -16,6 +18,39 @@ import (
 // selected public protocol. Implementations must reject incompatible protocols.
 type ProviderProtocolComposer interface {
 	ComposeProtocol(protocol.Type, ProtocolHandler) (ProtocolHandler, error)
+}
+
+// ChatRequestProjector exposes effective validation facts from a selected native
+// wire DTO. It neither chooses a protocol nor performs transport or billing.
+type ChatRequestProjector interface {
+	ProjectChatRequest([]byte, dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error)
+}
+
+// ProjectChatRequestControls retains public multiplier validation even when a
+// native override contains public fields that the wire service would ignore.
+func ProjectChatRequestControls(body []byte, public dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error) {
+	var controls struct {
+		N                   *int  `json:"n"`
+		MaxTokens           *uint `json:"max_tokens"`
+		MaxCompletionTokens *uint `json:"max_completion_tokens"`
+		MinTokens           *uint `json:"min_tokens"`
+	}
+	if err := common.Unmarshal(body, &controls); err != nil {
+		return nil, err
+	}
+	if controls.N != nil {
+		public.N = controls.N
+	}
+	if controls.MaxTokens != nil {
+		public.MaxTokens = controls.MaxTokens
+	}
+	if controls.MaxCompletionTokens != nil {
+		public.MaxCompletionTokens = controls.MaxCompletionTokens
+	}
+	if controls.MinTokens != nil {
+		public.MinTokens = controls.MinTokens
+	}
+	return &public, nil
 }
 
 func ComposeProviderProtocol(provider ProviderAdapter, kind protocol.Type, generic ProtocolHandler) (ProtocolHandler, error) {

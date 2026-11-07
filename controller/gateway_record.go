@@ -22,6 +22,7 @@ type UserGatewayRequest struct {
 	ModelOfferingID    int                `json:"model_offering_id"`
 	OfferingName       string             `json:"offering_name"`
 	RequestedName      string             `json:"requested_name"`
+	ChoiceCount        int                `json:"choice_count"`
 	SalePriceVersionID int                `json:"sale_price_version_id"`
 	SaleCurrency       money.Currency     `json:"sale_currency"`
 	SaleFXRate         string             `json:"sale_fx_rate"`
@@ -141,7 +142,7 @@ func listGatewayRequests(c *gin.Context, self bool) {
 		users := make([]UserGatewayRequest, 0, len(items))
 		for _, item := range items {
 			users = append(users, UserGatewayRequest{ID: item.ID, UserID: item.UserID, TokenID: item.TokenID, ModelOfferingID: item.ModelOfferingID, OfferingName: item.OfferingName, RequestedName: item.RequestedName,
-				SalePriceVersionID: item.SalePriceVersionID, SaleCurrency: item.SaleCurrency, SaleFXRate: item.SaleFXRate, Usage: item.Usage, UsageSource: item.UsageSource, GroupRatio: item.GroupRatio,
+				ChoiceCount: item.ChoiceCount, SalePriceVersionID: item.SalePriceVersionID, SaleCurrency: item.SaleCurrency, SaleFXRate: item.SaleFXRate, Usage: item.Usage, UsageSource: item.UsageSource, GroupRatio: item.GroupRatio,
 				Receivable: item.Receivable, LedgerEntryIDs: item.LedgerEntryIDs, StartedAt: item.StartedAt, EndedAt: item.EndedAt, Status: item.Status, ErrorCode: item.ErrorCode})
 		}
 		payload = users

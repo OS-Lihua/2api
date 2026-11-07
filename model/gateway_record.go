@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"fmt"
+	"math/big"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/money"
@@ -32,6 +33,7 @@ type GatewayRequest struct {
 	ModelOfferingID    int            `json:"model_offering_id" gorm:"not null;index"`
 	OfferingName       string         `json:"offering_name" gorm:"type:text;not null"`
 	RequestedName      string         `json:"requested_name" gorm:"type:text;not null"`
+	ChoiceCount        int            `json:"choice_count" gorm:"not null;default:1"`
 	SalePriceVersionID int            `json:"sale_price_version_id" gorm:"not null"`
 	SaleExpression     string         `json:"sale_expression" gorm:"type:text;not null"`
 	SaleCurrency       money.Currency `json:"sale_currency" gorm:"type:char(3);not null"`
@@ -85,12 +87,13 @@ func MigrateGatewayRecords() error {
 	for _, statement := range []string{
 		`CREATE TABLE IF NOT EXISTS gateway_requests (
 		id String, user_id Int64, token_id Int64, model_offering_id Int64,
-		offering_name String, requested_name String, sale_price_version_id Int64,
+		offering_name String, requested_name String, choice_count Int64 DEFAULT 1, sale_price_version_id Int64,
 		sale_expression String, sale_currency String, sale_fx_rate String,
 		usage String, usage_source String, group_ratio String,
 		receivable_nanos Int64, receivable_currency String, ledger_entry_ids String,
 		started_at Int64, ended_at Int64, status String, error_code String
 		) ENGINE = ReplacingMergeTree() ORDER BY id`,
+		`ALTER TABLE gateway_requests ADD COLUMN IF NOT EXISTS choice_count Int64 DEFAULT 1`,
 		`CREATE TABLE IF NOT EXISTS gateway_attempts (
 		id String, request_id String, channel_id Int64, provider_id Int64,
 		model_id Int64, member_tier Int64, started_at Int64, ended_at Int64,
@@ -218,12 +221,18 @@ func RecentOfferingOutputTokens(ctx context.Context, offeringID int, at int64) (
 	if len(recent) == 0 {
 		return 1024, nil
 	}
-	var total int64
+	total := new(big.Rat)
 	for _, record := range recent {
-		if record.Usage.CompletionTokens < 0 || record.Usage.CompletionTokens > 1<<31-1 {
+		if record.Usage.CompletionTokens < 0 || record.Usage.CompletionTokens > 1<<31-1 || record.ChoiceCount < 1 {
 			return 0, fmt.Errorf("invalid recorded output usage")
 		}
-		total += record.Usage.CompletionTokens
+		total.Add(total, big.NewRat(record.Usage.CompletionTokens, int64(record.ChoiceCount)))
 	}
-	return (total + int64(len(recent)) - 1) / int64(len(recent)), nil
+	mean := total.Quo(total, big.NewRat(int64(len(recent)), 1))
+	whole, remainder := new(big.Int), new(big.Int)
+	whole.QuoRem(mean.Num(), mean.Denom(), remainder)
+	if remainder.Sign() > 0 {
+		whole.Add(whole, big.NewInt(1))
+	}
+	return whole.Int64(), nil
 }

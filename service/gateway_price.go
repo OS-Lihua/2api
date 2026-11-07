@@ -22,7 +22,23 @@ func ExactGatewayGroupRatio(group string) (decimal.Decimal, error) {
 	if configured := common.OptionMap["group_ratio_setting.group_ratio"]; configured != "" {
 		text = configured
 	}
+	specialText := common.OptionMap["GroupGroupRatio"]
+	if configured := common.OptionMap["group_ratio_setting.group_group_ratio"]; configured != "" {
+		specialText = configured
+	}
 	common.OptionMapRWMutex.RUnlock()
+	if specialText != "" {
+		var special map[string]map[string]decimal.Decimal
+		if err := common.UnmarshalJsonStr(specialText, &special); err != nil {
+			return decimal.Decimal{}, err
+		}
+		if ratio, found := special[group][group]; found {
+			if ratio.IsNegative() {
+				return decimal.Decimal{}, errors.New("invalid group discount")
+			}
+			return ratio, nil
+		}
+	}
 	if text == "" {
 		return decimal.NewFromInt(1), nil
 	}
