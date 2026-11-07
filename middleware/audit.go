@@ -107,8 +107,14 @@ var auditRouteActions = map[string]string{
 	"POST /api/admin/v1/channels/:id/disable": "channel.disable",
 
 	// Price versions and exchange rates.
-	"POST /api/admin/v1/price-versions": "price_version.create",
-	"PUT /api/admin/v1/fx-rates":        "fx_rate.save",
+	"POST /api/admin/v1/providers/import":      "bulk_import.execute",
+	"POST /api/admin/v1/channels/import":       "bulk_import.execute",
+	"POST /api/admin/v1/channels/bulk-confirm": "bulk_import.execute",
+	"POST /api/admin/v1/channels/bulk-enable":  "bulk_import.execute",
+	"POST /api/admin/v1/price-versions/import": "bulk_import.execute",
+	"POST /api/admin/v1/bulk-import":           "bulk_import.execute",
+	"POST /api/admin/v1/price-versions":        "price_version.create",
+	"PUT /api/admin/v1/fx-rates":               "fx_rate.save",
 
 	// ModelOffering management.
 	"POST /api/admin/v1/model-offerings":             "model_offering.create",
@@ -262,6 +268,25 @@ func auditResponseSuccess(c *gin.Context, status int, body []byte) bool {
 	return status < 400
 }
 
+// SetBulkImportAudit records only validated resource/action enums, numeric IDs,
+// and results. Never put submitted data, references, or raw errors in an audit.
+func SetBulkImportAudit(c *gin.Context, result *model.BulkImportResult) {
+	rows := make([]map[string]any, 0, min(len(result.Rows), 100))
+	for _, row := range result.Rows[:min(len(result.Rows), 100)] {
+		resource, action := "invalid", "invalid"
+		switch row.Resource {
+		case "providers", "channels", "price-versions":
+			resource = row.Resource
+		}
+		switch row.Action {
+		case "create", "confirm", "enable":
+			action = row.Action
+		}
+		rows = append(rows, map[string]any{"row": row.Row, "resource": resource, "action": action, "id": row.ID, "valid": row.Error == ""})
+	}
+	c.Set("admin_bulk_import_audit", map[string]any{"dry_run": result.DryRun, "valid": result.Valid, "count": len(result.Rows), "rows": rows, "truncated": len(result.Rows) > 100})
+}
+
 // AdminAPISecurity surrounds all versioned admin routes, including authentication
 // and rate-limit rejections. Only route templates and numeric identifiers enter
 // the operation audit; handler payloads and raw errors are never persisted.
@@ -313,10 +338,14 @@ func AdminAPISecurity() gin.HandlerFunc {
 			if action == "" {
 				action = "generic"
 			}
+			operationParams := map[string]any{"method": method, "route": route}
+			if batch, ok := c.Get("admin_bulk_import_audit"); ok {
+				operationParams["batch"] = batch
+			}
 			model.RecordAuditLog(c, model.AuditLog{
 				UserId: userID, Username: username, ActorRole: role, AuthMethod: authMethod,
 				Category: model.AuditCategoryOperation, Action: action, Content: method + " " + route, Status: status, Success: success,
-				Other: model.AuditOther{Op: &model.AuditOperation{Action: action, Params: map[string]any{"method": method, "route": route}},
+				Other: model.AuditOther{Op: &model.AuditOperation{Action: action, Params: operationParams},
 					AdminInfo: &model.AuditAdminInfo{AdminID: userID, AdminUsername: username, AdminRole: role, AuthMethod: authMethod},
 					AuditInfo: &model.AuditRequestInfo{Method: method, Route: route, Path: route, Status: status, Success: success, Params: params}},
 			})

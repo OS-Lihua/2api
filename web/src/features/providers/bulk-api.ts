@@ -1,0 +1,106 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { api } from '@/lib/api'
+import { requireServerSuccess } from '@/lib/server-error-message'
+
+export type ImportPreviewRow = {
+  row: number
+  resource: string
+  action: string
+  id?: number
+  status?: string
+  error?: string
+}
+
+export type ImportResult = {
+  dry_run: boolean
+  valid: boolean
+  committed: boolean
+  rows: ImportPreviewRow[]
+}
+
+export async function importBatch(
+  source: string,
+  format: string,
+  dryRun: boolean
+): Promise<ImportResult> {
+  const response = await api.post('/api/admin/v1/bulk-import', source, {
+    params: { dry_run: dryRun },
+    headers: {
+      'Content-Type': format === 'csv' ? 'text/csv' : 'application/json',
+    },
+    validateStatus: (status) => status === 200 || status === 400,
+  })
+  // Row validation failures are displayed in the preview table. Only an
+  // explicit committed result represents a successful write.
+  if (response.data.data?.rows) return response.data.data
+  requireServerSuccess(response.data)
+  return response.data.data
+}
+
+export const importExample = JSON.stringify(
+  {
+    rows: [
+      {
+        resource: 'providers',
+        action: 'create',
+        ref: 'account',
+        data: {
+          name: 'Provider account',
+          type: 1,
+          key: 'REPLACE_KEY',
+          base_url: 'https://api.example.com',
+        },
+      },
+      {
+        resource: 'channels',
+        action: 'create',
+        ref: 'channel',
+        data: {
+          provider_ref: 'account',
+          model_id: 1,
+          protocol: 'openai_chat',
+          upstream_model_name: 'example-model',
+        },
+      },
+      {
+        resource: 'channels',
+        action: 'confirm',
+        data: { channel_ref: 'channel' },
+      },
+      {
+        resource: 'price-versions',
+        action: 'create',
+        data: {
+          owner_type: 'channel',
+          owner_ref: 'channel',
+          currency: 'USD',
+          expression: 'tier("base", p * 2 + c * 8)',
+        },
+      },
+      {
+        resource: 'channels',
+        action: 'enable',
+        data: { channel_ref: 'channel' },
+      },
+    ],
+  },
+  null,
+  2
+)

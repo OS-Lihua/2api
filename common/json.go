@@ -3,6 +3,7 @@ package common
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
@@ -45,6 +46,21 @@ func Unmarshal(data []byte, v any) error {
 
 func UnmarshalJsonStr(data string, v any) error {
 	return kitutil.UnmarshalJsonStr(data, v)
+}
+
+// DecodeJsonStrict accepts exactly one JSON value and rejects unknown fields.
+// Keep decoder configuration here with the host JSON codec.
+func DecodeJsonStrict(reader io.Reader, v any) error {
+	decoder := json.NewDecoder(reader)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(v); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return fmt.Errorf("expected a single JSON value")
+	}
+	return nil
 }
 
 func DecodeJson(reader io.Reader, v any) error {

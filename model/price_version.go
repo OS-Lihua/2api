@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/money"
@@ -82,7 +81,18 @@ func InstallPriceVersionCheckers() {
 }
 
 func CreatePriceVersion(ctx context.Context, record *PriceVersion, actorID int) error {
-	if (record.OwnerType != PriceOwnerOffering && record.OwnerType != PriceOwnerChannel) || record.OwnerID <= 0 {
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := preparePriceVersion(ctx, tx, record, actorID, nil); err != nil {
+			return err
+		}
+		return tx.Omit("Creator", "Channel", "Offering").Create(record).Error
+	})
+}
+
+// preparePriceVersion validates without allocating an ID. A staged Channel
+// allows batch validation to use the same rules before any row is inserted.
+func preparePriceVersion(ctx context.Context, tx *gorm.DB, record *PriceVersion, actorID int, channel *Channel) error {
+	if (record.OwnerType != PriceOwnerOffering && record.OwnerType != PriceOwnerChannel) || (record.OwnerID <= 0 && (channel == nil || channel.ID != record.OwnerID)) {
 		return common.NewMessage("Invalid price owner")
 	}
 	if _, err := money.ParseCurrency(string(record.Currency)); err != nil {
@@ -94,38 +104,34 @@ func CreatePriceVersion(ctx context.Context, record *PriceVersion, actorID int) 
 	if strings.TrimSpace(record.Expression) == "" || len(record.Expression) > 16384 {
 		return common.NewMessage("Invalid price expression")
 	}
-	// Compile and smoke validation never calculate or persist a monetary amount.
-	if _, err := billingexpr.CompileFromCache(record.Expression); err != nil {
-		return common.NewMessage("Invalid price expression")
-	}
-	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		switch record.OwnerType {
-		case PriceOwnerOffering:
-			var owner ModelOffering
-			if err := lockForUpdate(tx).First(&owner, record.OwnerID).Error; err != nil {
-				return err
-			}
-			if err := tx.Where("offering_id = ?", owner.ID).Find(&owner.Members).Error; err != nil {
-				return err
-			}
-			if err := validatePriceExpression(ctx, tx, record.Expression, &owner, nil); err != nil {
-				return err
-			}
-			record.OfferingID, record.ChannelID = &record.OwnerID, nil
-		case PriceOwnerChannel:
-			var owner Channel
-			if err := lockForUpdate(tx).First(&owner, record.OwnerID).Error; err != nil {
-				return err
-			}
-			if err := validatePriceExpression(ctx, tx, record.Expression, nil, &owner); err != nil {
-				return err
-			}
-			record.ChannelID, record.OfferingID = &record.OwnerID, nil
+	switch record.OwnerType {
+	case PriceOwnerOffering:
+		var owner ModelOffering
+		if err := lockForUpdate(tx).First(&owner, record.OwnerID).Error; err != nil {
+			return err
 		}
-		record.ID, record.CreatedBy, record.CreatedAt = 0, actorID, clock.Now().Unix()
-		record.Creator, record.Channel, record.Offering = nil, nil, nil
-		return tx.Omit("Creator", "Channel", "Offering").Create(record).Error
-	})
+		if err := tx.Where("offering_id = ?", owner.ID).Find(&owner.Members).Error; err != nil {
+			return err
+		}
+		if err := validatePriceExpression(ctx, tx, record.Expression, &owner, nil); err != nil {
+			return err
+		}
+		record.OfferingID, record.ChannelID = &record.OwnerID, nil
+	case PriceOwnerChannel:
+		if channel == nil {
+			channel = &Channel{}
+			if err := lockForUpdate(tx).First(channel, record.OwnerID).Error; err != nil {
+				return err
+			}
+		}
+		if err := validatePriceExpression(ctx, tx, record.Expression, nil, channel); err != nil {
+			return err
+		}
+		record.ChannelID, record.OfferingID = &record.OwnerID, nil
+	}
+	record.ID, record.CreatedBy, record.CreatedAt = 0, actorID, clock.Now().Unix()
+	record.Creator, record.Channel, record.Offering = nil, nil, nil
+	return nil
 }
 
 // validatePriceExpression checks the proposed owner declaration, which may not

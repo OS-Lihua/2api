@@ -39,6 +39,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { api } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth-store'
 
+import { BulkImportDialog } from '../bulk-import-dialog'
 import { ChannelMutateDrawer } from '../channel-mutate-drawer'
 import { ProviderChannels } from '../provider-channels'
 import { ProvidersProvider } from '../providers-provider'
@@ -54,6 +55,51 @@ afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
   useAuthStore.getState().auth.reset()
+})
+
+it('previews a batch, invalidates edited previews, and confirms before committing', async () => {
+  const client = new QueryClient({
+    defaultOptions: { mutations: { retry: false } },
+  })
+  const preview = {
+    dry_run: true,
+    valid: true,
+    committed: false,
+    rows: [{ row: 1, resource: 'providers', action: 'create' }],
+  }
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValue({ data: { success: true, data: preview } })
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <BulkImportDialog open onOpenChange={() => {}} />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  const source = screen.getByRole('textbox', { name: 'Import content' })
+  const execute = screen.getByRole('button', { name: 'Execute import' })
+  expect(execute).toBeDisabled()
+  await userEvent.type(source, 'test batch')
+  await userEvent.click(screen.getByRole('button', { name: 'Preview import' }))
+  expect(await screen.findByRole('table')).toBeVisible()
+  await waitFor(() => expect(execute).toBeEnabled())
+  await userEvent.type(source, ' changed')
+  expect(execute).toBeDisabled()
+  await userEvent.click(screen.getByRole('button', { name: 'Preview import' }))
+  await waitFor(() => expect(execute).toBeEnabled())
+  await userEvent.click(execute)
+  expect(await screen.findByRole('alertdialog')).toBeVisible()
+  post.mockResolvedValue({
+    data: {
+      success: true,
+      data: { ...preview, dry_run: false, committed: true },
+    },
+  })
+  await userEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  expect(await screen.findByText('Batch imported successfully')).toBeVisible()
+  expect(source).toHaveValue('')
+  client.clear()
 })
 
 it('keyboard users expand and collapse one provider to load its channels', async () => {
