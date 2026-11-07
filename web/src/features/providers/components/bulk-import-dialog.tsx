@@ -41,6 +41,7 @@ import {
   importExample,
   type ImportPreviewRow,
   type ImportResult,
+  type ImportTarget,
 } from '../bulk-api'
 
 export function BulkImportDialog(props: {
@@ -51,13 +52,15 @@ export function BulkImportDialog(props: {
   const client = useQueryClient()
   const [source, setSource] = useState('')
   const [format, setFormat] = useState('json')
+  const [target, setTarget] = useState<ImportTarget>('bulk-import')
   const [result, setResult] = useState<ImportResult | null>(null)
   const [confirm, setConfirm] = useState(false)
   const [fileError, setFileError] = useState('')
   const [readingFile, setReadingFile] = useState(false)
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const mutation = useMutation({
-    mutationFn: (dryRun: boolean) => importBatch(source, format, dryRun),
+    mutationFn: (dryRun: boolean) =>
+      importBatch(source, format, dryRun, target),
     onSuccess: (data) => {
       setResult(data)
       setConfirm(false)
@@ -105,11 +108,49 @@ export function BulkImportDialog(props: {
       cell: (row) => (row.id ? formatNumber(row.id, locale) : '—'),
     },
     {
+      id: 'details',
+      header: t('Details'),
+      cell: (row) => {
+        const details: string[] = []
+        if (row.model_id) {
+          details.push(
+            `${t('Model ID')}: ${formatNumber(row.model_id, locale)}`
+          )
+        }
+        if (row.provider_id) {
+          details.push(
+            `${t('Provider ID')}: ${formatNumber(row.provider_id, locale)}`
+          )
+        }
+        if (row.provider_row) {
+          details.push(
+            `${t('Providers')} · ${t('Row')}: ${formatNumber(row.provider_row, locale)}`
+          )
+        }
+        if (row.protocol) details.push(row.protocol)
+        if (row.currency) details.push(row.currency)
+        if (row.owner_id) {
+          details.push(
+            `${t('Price owner ID')}: ${formatNumber(row.owner_id, locale)}`
+          )
+        }
+        if (row.owner_row) {
+          details.push(
+            `${t('Channels')} · ${t('Row')}: ${formatNumber(row.owner_row, locale)}`
+          )
+        }
+        if (row.effective_at) {
+          details.push(new Date(row.effective_at * 1000).toLocaleString(locale))
+        }
+        return details.join(' · ') || '—'
+      },
+    },
+    {
       id: 'result',
       header: t('Result'),
       cell: (row) => {
         if (row.error) return t(row.error)
-        if (row.status)
+        if (row.status) {
           return t(
             {
               pending: 'Pending confirmation',
@@ -117,6 +158,7 @@ export function BulkImportDialog(props: {
               disabled: 'Disabled',
             }[row.status] ?? row.status
           )
+        }
         return t('Valid')
       },
     },
@@ -159,6 +201,37 @@ export function BulkImportDialog(props: {
             )}
           </p>
           <Field>
+            <FieldLabel htmlFor='bulk-operation'>{t('Operation')}</FieldLabel>
+            <NativeSelect
+              id='bulk-operation'
+              value={target}
+              disabled={mutation.isPending || readingFile}
+              onChange={(event) => {
+                setTarget(event.target.value as ImportTarget)
+                setResult(null)
+              }}
+            >
+              <NativeSelectOption value='bulk-import'>
+                {t('Bulk import')}
+              </NativeSelectOption>
+              <NativeSelectOption value='providers/import'>
+                {t('Providers')}
+              </NativeSelectOption>
+              <NativeSelectOption value='channels/import'>
+                {t('Channels')}
+              </NativeSelectOption>
+              <NativeSelectOption value='price-versions/import'>
+                {t('Price versions')}
+              </NativeSelectOption>
+              <NativeSelectOption value='channels/bulk-confirm'>
+                {t('Confirm mapping')}
+              </NativeSelectOption>
+              <NativeSelectOption value='channels/bulk-enable'>
+                {t('Enable')}
+              </NativeSelectOption>
+            </NativeSelect>
+          </Field>
+          <Field>
             <FieldLabel htmlFor='bulk-format'>{t('Format')}</FieldLabel>
             <NativeSelect
               id='bulk-format'
@@ -173,10 +246,12 @@ export function BulkImportDialog(props: {
               <NativeSelectOption value='csv'>CSV</NativeSelectOption>
             </NativeSelect>
           </Field>
-          <Field>
+          <Field data-invalid={Boolean(fileError)}>
             <FieldLabel htmlFor='bulk-file'>{t('Import file')}</FieldLabel>
             <Input
               id='bulk-file'
+              aria-invalid={Boolean(fileError)}
+              aria-describedby={fileError ? 'bulk-file-error' : undefined}
               type='file'
               accept='.json,.csv,application/json,text/csv'
               disabled={mutation.isPending || readingFile}
@@ -186,7 +261,7 @@ export function BulkImportDialog(props: {
                 setResult(null)
                 if (!file) return
                 if (file.size > 2 * 1024 * 1024) {
-                  setFileError(t('Import exceeds the upload limit'))
+                  setFileError('Import exceeds the upload limit')
                   return
                 }
                 try {
@@ -205,8 +280,12 @@ export function BulkImportDialog(props: {
             />
           </Field>
           {fileError && (
-            <p role='alert' className='text-destructive text-sm'>
-              {fileError}
+            <p
+              id='bulk-file-error'
+              role='alert'
+              className='text-destructive text-sm'
+            >
+              {t(fileError)}
             </p>
           )}
           <Field>

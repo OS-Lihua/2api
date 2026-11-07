@@ -36,13 +36,24 @@ type BulkImportResult struct {
 
 // Preview deliberately includes no user supplied strings or configuration.
 type BulkImportPreview struct {
-	Row              int           `json:"row"`
-	Resource         string        `json:"resource"`
-	Action           string        `json:"action"`
-	ID               int           `json:"id,omitempty"`
-	Status           ChannelStatus `json:"status,omitempty"`
-	MappingConfirmed *bool         `json:"mapping_confirmed,omitempty"`
-	Error            string        `json:"error,omitempty"`
+	Row              int            `json:"row"`
+	Resource         string         `json:"resource"`
+	Action           string         `json:"action"`
+	ID               int            `json:"id,omitempty"`
+	Status           ChannelStatus  `json:"status,omitempty"`
+	MappingConfirmed *bool          `json:"mapping_confirmed,omitempty"`
+	Error            string         `json:"error,omitempty"`
+	ErrorCode        string         `json:"error_code,omitempty"`
+	ProviderID       int            `json:"provider_id,omitempty"`
+	ProviderRow      int            `json:"provider_row,omitempty"`
+	ModelID          int            `json:"model_id,omitempty"`
+	Protocol         protocol.Type  `json:"protocol,omitempty"`
+	ProviderType     int            `json:"provider_type,omitempty"`
+	OwnerType        string         `json:"owner_type,omitempty"`
+	OwnerID          int            `json:"owner_id,omitempty"`
+	OwnerRow         int            `json:"owner_row,omitempty"`
+	Currency         money.Currency `json:"currency,omitempty"`
+	EffectiveAt      int64          `json:"effective_at,omitempty"`
 }
 
 type BulkProviderInput struct {
@@ -135,6 +146,33 @@ func (prices bulkPrices) HasPurchasePrice(ctx context.Context, db *gorm.DB, chan
 }
 
 var errInvalidBulk = errors.New("invalid bulk import")
+var errDuplicateBulkChannel = errors.New("duplicate channel identity")
+var errDuplicateBulkPrice = errors.New("duplicate price effective time")
+
+// bulkValidationError only exposes fixed, reviewed messages. Raw decoder,
+// database, expression and capability errors can contain submitted secrets.
+func bulkValidationError(err error) (string, string) {
+	if errors.Is(err, errDuplicateBulkChannel) {
+		return "duplicate_identity", "This provider, protocol, and upstream model already have a channel"
+	}
+	if errors.Is(err, errDuplicateBulkPrice) {
+		return "duplicate_price_time", "A price version already exists at this effective time"
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return "reference_not_found", "Channel, provider, or model not found"
+	}
+	var message *common.Message
+	if errors.As(err, &message) {
+		switch message.Key {
+		case "Invalid price owner", "Invalid price currency", "Invalid price effective time", "Invalid price expression", "Invalid provider type",
+			"Invalid upstream model name", "Invalid channel protocol", "Channel limits and weight must be non-negative integers", "Parameter overrides must be a JSON object",
+			"Confirm the channel mapping before enabling", "Enable the provider before enabling its channel", "Configure a purchase price before enabling the channel", "Task plugin is not available",
+			"Task price requires an available plugin usage schema":
+			return "invalid_declaration", message.Key
+		}
+	}
+	return "invalid_fields", "Invalid import row or unmet activation requirements"
+}
 
 // ImportBatch validates before writing. dryRun executes only reads: it does not
 // insert and roll back, allocate IDs, update caches, or contact Providers.
@@ -145,6 +183,11 @@ func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID
 	}
 	result := &BulkImportResult{DryRun: dryRun, Valid: true, Rows: make([]BulkImportPreview, len(rows))}
 	err := DB.WithContext(ctx).Session(&gorm.Session{Logger: logger.Default.LogMode(logger.Silent)}).Transaction(func(tx *gorm.DB) error {
+		if dryRun {
+			if err := tx.Exec("SET TRANSACTION READ ONLY").Error; err != nil {
+				return err
+			}
+		}
 		refs := map[string]bulkReference{}
 		providers := map[int]*Provider{}
 		channels := map[int]*Channel{}
@@ -279,7 +322,7 @@ func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID
 						}
 					}
 					if count > 0 || paths[key] {
-						rowErr = errInvalidBulk
+						rowErr = errDuplicateBulkChannel
 						break
 					}
 					paths[key] = true
@@ -318,7 +361,7 @@ func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID
 				if input.OwnerType != PriceOwnerChannel {
 					channel = nil
 				}
-				if err := preparePriceVersion(ctx, tx, record, actorID, channel); err != nil {
+				if err := preparePriceVersion(ctx, tx, record, actorID, channel, !dryRun); err != nil {
 					rowErr = err
 					break
 				}
@@ -330,12 +373,12 @@ func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID
 					}
 				}
 				if count > 0 {
-					rowErr = errInvalidBulk
+					rowErr = errDuplicateBulkPrice
 					break
 				}
 				for _, price := range prices.versions {
 					if price.OwnerType == record.OwnerType && price.OwnerID == record.OwnerID && price.EffectiveAt == record.EffectiveAt {
-						rowErr = errInvalidBulk
+						rowErr = errDuplicateBulkPrice
 					}
 				}
 				mutation.price = record
@@ -343,20 +386,36 @@ func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID
 				rowErr = errInvalidBulk
 			}
 			if rowErr != nil {
-				preview.Error = "Invalid import row or unmet activation requirements"
+				preview.ErrorCode, preview.Error = bulkValidationError(rowErr)
 				result.Valid = false
 			} else {
 				mutations[i] = mutation
 				id := 0
 				if mutation.provider != nil {
+					preview.ProviderType = mutation.provider.Type
 					id = mutation.provider.Id
 					providers[id] = mutation.provider
 				}
 				if mutation.channel != nil {
+					preview.ModelID = mutation.channel.ModelID
+					preview.Protocol = mutation.channel.Protocol
+					if mutation.channel.ProviderID > 0 {
+						preview.ProviderID = mutation.channel.ProviderID
+					} else {
+						preview.ProviderRow = -mutation.channel.ProviderID
+					}
 					id = mutation.channel.ID
 					channels[id] = mutation.channel
 				}
 				if mutation.price != nil {
+					preview.OwnerType = mutation.price.OwnerType
+					preview.Currency = mutation.price.Currency
+					preview.EffectiveAt = mutation.price.EffectiveAt
+					if mutation.price.OwnerID > 0 {
+						preview.OwnerID = mutation.price.OwnerID
+					} else {
+						preview.OwnerRow = -mutation.price.OwnerID
+					}
 					prices.versions = append(prices.versions, mutation.price)
 				}
 				if row.Ref != "" {

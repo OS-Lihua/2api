@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/gin-gonic/gin"
@@ -96,6 +97,15 @@ func BulkImport(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid import file", "message_key": "Invalid import file", "data": model.BulkImportResult{DryRun: dryRun, Rows: []model.BulkImportPreview{{Row: line, Error: "Invalid import file"}}}})
 		return
 	}
+	requested := &model.BulkImportResult{DryRun: dryRun, Rows: make([]model.BulkImportPreview, len(rows))}
+	for i, row := range rows {
+		line := row.Line
+		if line == 0 {
+			line = i + 1
+		}
+		requested.Rows[i] = model.BulkImportPreview{Row: line, Resource: row.Resource, Action: row.Action, Error: "not validated"}
+	}
+	middleware.SetBulkImportAudit(c, requested)
 	for _, row := range rows {
 		expectedResource, expectedAction := "", ""
 		switch c.FullPath() {
@@ -121,8 +131,11 @@ func BulkImport(c *gin.Context) {
 			permission = authz.ChannelSensitiveWrite
 			var input model.BulkProviderInput
 			if common.DecodeJsonStrict(strings.NewReader(string(row.Data)), &input) == nil {
-				provider := model.Provider{Type: input.Type, Setting: input.Setting}
-				plugin = input.Type == constant.ChannelTypeTaskPlugin || len(provider.GetSetting().TaskPluginBindings()) > 0
+				var setting dto.ProviderSettings
+				if input.Setting != nil {
+					_ = common.UnmarshalJsonStr(*input.Setting, &setting)
+				}
+				plugin = input.Type == constant.ChannelTypeTaskPlugin || len(setting.TaskPluginBindings()) > 0
 			}
 		case "price-versions":
 			permission = authz.PricingWrite

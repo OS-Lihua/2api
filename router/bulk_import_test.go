@@ -82,6 +82,10 @@ func TestBulkImportHTTP(t *testing.T) {
 	assert.False(t, result.Committed)
 	require.Len(t, result.Rows, 5)
 	assert.Equal(t, 5, result.Rows[4].Row)
+	assert.Equal(t, 1, result.Rows[1].ProviderRow)
+	assert.Equal(t, unified.Id, result.Rows[1].ModelID)
+	assert.Equal(t, "USD", string(result.Rows[3].Currency))
+	assert.Equal(t, 2, result.Rows[3].OwnerRow)
 	assert.Equal(t, model.ChannelEnabled, result.Rows[4].Status)
 	assert.Equal(t, before, bulkBusinessState(t))
 	for _, sentinel := range []string{secret, "url-sentinel", "query-sentinel", "header-sentinel"} {
@@ -119,6 +123,22 @@ func TestBulkImportHTTP(t *testing.T) {
 	assert.False(t, result.Valid)
 	assert.NotEmpty(t, result.Rows[3].Error)
 	assert.Equal(t, before, bulkBusinessState(t))
+	t.Run("a later database rejection rolls back preceding writes", func(t *testing.T) {
+		require.NoError(t, model.DB.Exec(`CREATE FUNCTION "bulk_reject_fixture"() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.name = 'rejected-import' THEN RAISE EXCEPTION 'fixture constraint rejection'; END IF; RETURN NEW; END $$`).Error)
+		require.NoError(t, model.DB.Exec(`CREATE TRIGGER "bulk_reject_fixture" BEFORE INSERT ON "providers" FOR EACH ROW EXECUTE FUNCTION "bulk_reject_fixture"()`).Error)
+		t.Cleanup(func() {
+			require.NoError(t, model.DB.Exec(`DROP TRIGGER "bulk_reject_fixture" ON "providers"`).Error)
+			require.NoError(t, model.DB.Exec(`DROP FUNCTION "bulk_reject_fixture"()`).Error)
+		})
+		var countBefore, countAfter int64
+		require.NoError(t, model.DB.Model(&model.Provider{}).Count(&countBefore).Error)
+		batch := `{"rows":[{"resource":"providers","action":"create","data":{"name":"rolled-back-import","type":1,"key":"rollback-sentinel"}},{"resource":"providers","action":"create","data":{"name":"rejected-import","type":1,"key":"rollback-sentinel"}}]}`
+		response := adminSecurityRequest(engine, token, "POST", "/api/admin/v1/providers/import", batch)
+		require.Equal(t, 409, response.Code, response.Body.String())
+		require.NoError(t, model.DB.Model(&model.Provider{}).Count(&countAfter).Error)
+		assert.Equal(t, countBefore, countAfter)
+		assert.NotContains(t, response.Body.String(), "rollback-sentinel")
+	})
 }
 
 func TestBulkImportStrictParsingHTTP(t *testing.T) {
@@ -205,7 +225,7 @@ func TestBulkImportActivationAndUniqueIdentityHTTP(t *testing.T) {
 	confirm := `{"resource":"channels","action":"confirm","data":{"channel_ref":"c"}}`
 	enable := `{"resource":"channels","action":"enable","data":{"channel_ref":"c"}}`
 	futurePrice := fmt.Sprintf(`{"resource":"price-versions","action":"create","data":{"owner_type":"channel","owner_ref":"c","currency":"USD","expression":"tier(\"free\", fixed(0))","effective_at":%d}}`, clock.Now().Unix()+3600)
-	for _, rows := range []string{channelRow + "," + enable, channelRow + "," + confirm + "," + enable, channelRow + "," + confirm + "," + futurePrice + "," + enable, channelRow + "," + strings.Replace(channelRow,`"ref":"c"`,`"ref":"c2"`,1)} {
+	for _, rows := range []string{channelRow + "," + enable, channelRow + "," + confirm + "," + enable, channelRow + "," + confirm + "," + futurePrice + "," + enable, channelRow + "," + strings.Replace(channelRow, `"ref":"c"`, `"ref":"c2"`, 1)} {
 		before := bulkBusinessState(t)
 		for _, suffix := range []string{"?dry_run=true", ""} {
 			result := decodeBulkResponse(t, adminSecurityRequest(engine, token, "POST", "/api/admin/v1/bulk-import"+suffix, `{"rows":[`+rows+`]}`), 400)
@@ -237,12 +257,13 @@ func TestBulkImportActivationAndUniqueIdentityHTTP(t *testing.T) {
 	// Dedicated action routes work with only the existing operate scope.
 	operate := createWalletTestAccessToken(t, actor.Id, "channel:operate")
 	body := fmt.Sprintf(`{"rows":[{"resource":"channels","action":"confirm","data":{"id":%d}}]}`, channel.ID)
-	before:=bulkBusinessState(t)
- decodeBulkResponse(t,adminSecurityRequest(engine,operate,"POST","/api/admin/v1/channels/bulk-confirm?dry_run=true",body),200)
- response:=adminSecurityRequest(engine,token,"GET",fmt.Sprintf("/api/admin/v1/channels/%d",channel.ID),"")
- require.Equal(t,200,response.Code,response.Body.String());assert.Contains(t,response.Body.String(),`"mapping_confirmed":false`)
- assert.Equal(t,before,bulkBusinessState(t))
- result := decodeBulkResponse(t, adminSecurityRequest(engine, operate, "POST", "/api/admin/v1/channels/bulk-confirm", body), 200)
+	before := bulkBusinessState(t)
+	decodeBulkResponse(t, adminSecurityRequest(engine, operate, "POST", "/api/admin/v1/channels/bulk-confirm?dry_run=true", body), 200)
+	response := adminSecurityRequest(engine, token, "GET", fmt.Sprintf("/api/admin/v1/channels/%d", channel.ID), "")
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), `"mapping_confirmed":false`)
+	assert.Equal(t, before, bulkBusinessState(t))
+	result := decodeBulkResponse(t, adminSecurityRequest(engine, operate, "POST", "/api/admin/v1/channels/bulk-confirm", body), 200)
 	assert.True(t, result.Committed)
 	price := model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: channel.ID, Currency: "USD", Expression: `tier("free", fixed(0))`, EffectiveAt: clock.Now().Unix()}
 	require.NoError(t, model.CreatePriceVersion(t.Context(), &price, actor.Id))
@@ -279,6 +300,18 @@ func TestBulkImportAuthorityHTTP(t *testing.T) {
 		assert.Equal(t, tc.status, response.Code, response.Body.String())
 		assert.NotContains(t, response.Body.String(), "authority-sentinel")
 		assert.Equal(t, before, bulkBusinessState(t))
+	}
+	malformed := `{"rows":[{"resource":"providers","action":"create","data":{"name":"Invalid settings","type":1,"key":"authority-sentinel","setting":"{"}}]}`
+	for _, authority := range []struct {
+		token  string
+		status int
+	}{{write, 403}, {token, 400}} {
+		for _, suffix := range []string{"?dry_run=true", ""} {
+			before := bulkBusinessState(t)
+			response := adminSecurityRequest(engine, authority.token, "POST", "/api/admin/v1/bulk-import"+suffix, malformed)
+			require.Equal(t, authority.status, response.Code, response.Body.String())
+			assert.Equal(t, before, bulkBusinessState(t), "invalid settings must not invoke legacy repairing getters")
+		}
 	}
 	require.NoError(t, model.DB.Model(actor).Update("role", common.RoleAdminUser).Error)
 	require.NoError(t, authz.SetUserPermissions(actor.Id, authz.PermissionsMap{"channel": {"write": false, "sensitive_write": false}}))

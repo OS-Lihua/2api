@@ -26,6 +26,16 @@ export type ImportPreviewRow = {
   id?: number
   status?: string
   error?: string
+  provider_id?: number
+  provider_row?: number
+  model_id?: number
+  protocol?: string
+  provider_type?: number
+  owner_type?: string
+  owner_id?: number
+  owner_row?: number
+  currency?: string
+  effective_at?: number
 }
 
 export type ImportResult = {
@@ -35,12 +45,21 @@ export type ImportResult = {
   rows: ImportPreviewRow[]
 }
 
+export type ImportTarget =
+  | 'bulk-import'
+  | 'providers/import'
+  | 'channels/import'
+  | 'price-versions/import'
+  | 'channels/bulk-confirm'
+  | 'channels/bulk-enable'
+
 export async function importBatch(
   source: string,
   format: string,
-  dryRun: boolean
+  dryRun: boolean,
+  target: ImportTarget
 ): Promise<ImportResult> {
-  const response = await api.post('/api/admin/v1/bulk-import', source, {
+  const response = await api.post(`/api/admin/v1/${target}`, source, {
     params: { dry_run: dryRun },
     headers: {
       'Content-Type': format === 'csv' ? 'text/csv' : 'application/json',

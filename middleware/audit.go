@@ -284,7 +284,7 @@ func SetBulkImportAudit(c *gin.Context, result *model.BulkImportResult) {
 		}
 		rows = append(rows, map[string]any{"row": row.Row, "resource": resource, "action": action, "id": row.ID, "valid": row.Error == ""})
 	}
-	c.Set("admin_bulk_import_audit", map[string]any{"dry_run": result.DryRun, "valid": result.Valid, "count": len(result.Rows), "rows": rows, "truncated": len(result.Rows) > 100})
+	c.Set("admin_bulk_import_audit", map[string]any{"dry_run": result.DryRun, "committed": result.Committed, "valid": result.Valid, "count": len(result.Rows), "rows": rows, "truncated": len(result.Rows) > 100})
 }
 
 // AdminAPISecurity surrounds all versioned admin routes, including authentication

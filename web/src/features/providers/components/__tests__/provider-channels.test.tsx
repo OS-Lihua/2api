@@ -25,6 +25,7 @@ import {
   RouterProvider,
 } from '@tanstack/react-router'
 import {
+  act,
   cleanup,
   render,
   screen,
@@ -90,6 +91,17 @@ it('previews a batch, invalidates edited previews, and confirms before committin
   await waitFor(() => expect(execute).toBeEnabled())
   await userEvent.click(execute)
   expect(await screen.findByRole('alertdialog')).toBeVisible()
+  post.mockRejectedValueOnce(new Error('Commit rejected'))
+  await userEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  await waitFor(() =>
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+  )
+  expect(source).toHaveValue('test batch changed')
+  expect(
+    screen.queryByText('Batch imported successfully')
+  ).not.toBeInTheDocument()
+  await userEvent.click(execute)
+  expect(await screen.findByRole('alertdialog')).toBeVisible()
   post.mockResolvedValue({
     data: {
       success: true,
@@ -99,6 +111,160 @@ it('previews a batch, invalidates edited previews, and confirms before committin
   await userEvent.click(screen.getByRole('button', { name: 'Continue' }))
   expect(await screen.findByText('Batch imported successfully')).toBeVisible()
   expect(source).toHaveValue('')
+  client.clear()
+})
+
+it('uses resource permissions through the selected import operation', async () => {
+  const client = new QueryClient({
+    defaultOptions: { mutations: { retry: false } },
+  })
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValue({
+      data: {
+        success: true,
+        data: { dry_run: true, valid: true, committed: false, rows: [] },
+      },
+    })
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <BulkImportDialog open onOpenChange={() => {}} />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  await userEvent.type(
+    screen.getByRole('textbox', { name: 'Import content' }),
+    'batch'
+  )
+  for (const target of [
+    'price-versions/import',
+    'channels/bulk-confirm',
+    'channels/bulk-enable',
+  ]) {
+    await userEvent.selectOptions(
+      screen.getByRole('combobox', { name: 'Operation' }),
+      target
+    )
+    expect(
+      screen.getByRole('button', { name: 'Execute import' })
+    ).toBeDisabled()
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Preview import' })
+    )
+    await waitFor(() =>
+      expect(post).toHaveBeenLastCalledWith(
+        `/api/admin/v1/${target}`,
+        'batch',
+        expect.objectContaining({ params: { dry_run: true } })
+      )
+    )
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Preview import' })
+      ).toBeEnabled()
+    )
+  }
+  client.clear()
+})
+
+it('blocks execution after invalid or rejected previews and while an uploaded file is being read', async () => {
+  const client = new QueryClient({
+    defaultOptions: { mutations: { retry: false } },
+  })
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValue({
+      data: {
+        success: false,
+        data: {
+          dry_run: true,
+          valid: false,
+          committed: false,
+          rows: [
+            {
+              row: 2,
+              resource: 'channels',
+              action: 'enable',
+              error: 'Configure a purchase price before enabling the channel',
+            },
+          ],
+        },
+      },
+    })
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <BulkImportDialog open onOpenChange={() => {}} />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  const source = screen.getByRole('textbox', { name: 'Import content' })
+  await userEvent.type(source, 'draft')
+  let complete: (text: string) => void = () => {}
+  const file = new File(['batch'], 'batch.json', { type: 'application/json' })
+  Object.defineProperty(file, 'text', {
+    value: () =>
+      new Promise<string>((resolve) => {
+        complete = resolve
+      }),
+  })
+  await userEvent.upload(screen.getByLabelText('Import file'), file)
+  expect(screen.getByRole('button', { name: 'Preview import' })).toBeDisabled()
+  expect(source).toBeDisabled()
+  await act(async () => complete('uploaded draft'))
+  await waitFor(() => expect(source).toHaveValue('uploaded draft'))
+  await userEvent.click(screen.getByRole('button', { name: 'Preview import' }))
+  expect(
+    await screen.findByText(
+      'Configure a purchase price before enabling the channel'
+    )
+  ).toBeVisible()
+  expect(screen.getByRole('button', { name: 'Execute import' })).toBeDisabled()
+  post.mockRejectedValue(new Error('Request failed'))
+  await userEvent.click(screen.getByRole('button', { name: 'Preview import' }))
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Preview import' })).toBeEnabled()
+  )
+  expect(screen.getByRole('button', { name: 'Execute import' })).toBeDisabled()
+  expect(source).toHaveValue('uploaded draft')
+  expect(
+    screen.queryByText('Batch imported successfully')
+  ).not.toBeInTheDocument()
+  client.clear()
+})
+
+it('associates oversized upload errors with the file input and updates their language', async () => {
+  const client = new QueryClient({
+    defaultOptions: { mutations: { retry: false } },
+  })
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <BulkImportDialog open onOpenChange={() => {}} />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  const input = screen.getByLabelText('Import file')
+  await userEvent.upload(
+    input,
+    new File([new Uint8Array((2 << 20) + 1)], 'large.csv', { type: 'text/csv' })
+  )
+  expect(input).toHaveAttribute('aria-invalid', 'true')
+  expect(input).toHaveAccessibleDescription('Import exceeds the upload limit')
+  i18n.addResource(
+    'zh',
+    'translation',
+    'Import exceeds the upload limit',
+    '超过上传上限'
+  )
+  await act(async () => {
+    await i18n.changeLanguage('zh')
+  })
+  expect(screen.getByRole('alert')).toHaveTextContent('超过上传上限')
+  await act(async () => {
+    await i18n.changeLanguage('en')
+  })
   client.clear()
 })
 

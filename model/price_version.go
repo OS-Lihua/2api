@@ -82,7 +82,7 @@ func InstallPriceVersionCheckers() {
 
 func CreatePriceVersion(ctx context.Context, record *PriceVersion, actorID int) error {
 	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := preparePriceVersion(ctx, tx, record, actorID, nil); err != nil {
+		if err := preparePriceVersion(ctx, tx, record, actorID, nil, true); err != nil {
 			return err
 		}
 		return tx.Omit("Creator", "Channel", "Offering").Create(record).Error
@@ -91,7 +91,11 @@ func CreatePriceVersion(ctx context.Context, record *PriceVersion, actorID int) 
 
 // preparePriceVersion validates without allocating an ID. A staged Channel
 // allows batch validation to use the same rules before any row is inserted.
-func preparePriceVersion(ctx context.Context, tx *gorm.DB, record *PriceVersion, actorID int, channel *Channel) error {
+func preparePriceVersion(ctx context.Context, tx *gorm.DB, record *PriceVersion, actorID int, channel *Channel, lockOwners bool) error {
+	ownerQuery := tx
+	if lockOwners {
+		ownerQuery = lockForUpdate(tx)
+	}
 	if (record.OwnerType != PriceOwnerOffering && record.OwnerType != PriceOwnerChannel) || (record.OwnerID <= 0 && (channel == nil || channel.ID != record.OwnerID)) {
 		return common.NewMessage("Invalid price owner")
 	}
@@ -107,7 +111,7 @@ func preparePriceVersion(ctx context.Context, tx *gorm.DB, record *PriceVersion,
 	switch record.OwnerType {
 	case PriceOwnerOffering:
 		var owner ModelOffering
-		if err := lockForUpdate(tx).First(&owner, record.OwnerID).Error; err != nil {
+		if err := ownerQuery.First(&owner, record.OwnerID).Error; err != nil {
 			return err
 		}
 		if err := tx.Where("offering_id = ?", owner.ID).Find(&owner.Members).Error; err != nil {
@@ -120,7 +124,7 @@ func preparePriceVersion(ctx context.Context, tx *gorm.DB, record *PriceVersion,
 	case PriceOwnerChannel:
 		if channel == nil {
 			channel = &Channel{}
-			if err := lockForUpdate(tx).First(channel, record.OwnerID).Error; err != nil {
+			if err := ownerQuery.First(channel, record.OwnerID).Error; err != nil {
 				return err
 			}
 		}
