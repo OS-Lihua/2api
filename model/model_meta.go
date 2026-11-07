@@ -268,6 +268,9 @@ func (mi *Model) Update() error {
 	return mi.updateColumns(modelMetadataColumns)
 }
 
+// ErrModelChannelCapabilities prevents a Model edit from invalidating Channels.
+var ErrModelChannelCapabilities = common.NewMessage("Model capabilities would invalidate an existing channel")
+
 // UpdateDeclaration saves metadata and the capability declaration.
 func (mi *Model) UpdateDeclaration() error {
 	return mi.updateColumns(append(slices.Clone(modelMetadataColumns), "capabilities"))
@@ -275,6 +278,21 @@ func (mi *Model) UpdateDeclaration() error {
 
 func (mi *Model) updateColumns(columns []string) error {
 	return metadataTransaction(func(tx *gorm.DB) error {
+		if slices.Contains(columns, "capabilities") {
+			var previous Model
+			if err := lockForUpdate(tx).First(&previous, mi.Id).Error; err != nil {
+				return err
+			}
+			var channels []Channel
+			if err := tx.Where("model_id = ?", mi.Id).Find(&channels).Error; err != nil {
+				return err
+			}
+			for _, channel := range channels {
+				if _, err := channel.EffectiveCapabilities(mi.Capabilities); err != nil {
+					return ErrModelChannelCapabilities
+				}
+			}
+		}
 		if err := validateModelVendor(tx, mi.VendorID); err != nil {
 			return err
 		}

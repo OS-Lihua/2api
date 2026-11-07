@@ -236,6 +236,10 @@ func AdminUpdateModel(c *gin.Context) {
 		return
 	}
 	if err := record.UpdateDeclaration(); err != nil {
+		if errors.Is(err, model.ErrModelChannelCapabilities) {
+			common.ApiErrorStatus(c, http.StatusBadRequest, err)
+			return
+		}
 		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
 		return
 	}

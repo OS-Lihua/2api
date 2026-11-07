@@ -18,20 +18,24 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { getRouteApi } from '@tanstack/react-router'
+import { Fragment } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import {
   DISABLED_ROW_DESKTOP,
   DISABLED_ROW_MOBILE,
   DataTablePage,
+  DataTableRow,
   useDataTable,
 } from '@/components/data-table'
+import { TableRow, TableCell } from '@/components/ui/table'
 import { CHANNEL_STATUS } from '@/features/channels/constants'
 import { useTableUrlState } from '@/hooks/use-table-url-state'
 import { createServerError } from '@/lib/server-error-message'
 
 import { listProviders, providersQueryKeys } from '../api'
 import { ERROR_MESSAGES, PROVIDER_STATUS_FILTER_OPTIONS } from '../constants'
+import { ProviderChannels } from './provider-channels'
 import { useProvidersColumns } from './providers-columns'
 
 const route = getRouteApi('/_authenticated/providers/')
@@ -96,6 +100,27 @@ export function ProvidersTable() {
   return (
     <DataTablePage
       table={table}
+      hideMobile
+      renderRow={(row, helpers) => (
+        <Fragment key={row.id}>
+          <DataTableRow
+            row={row}
+            cellRenderColumns={columns}
+            getColumnClassName={(columnId) =>
+              helpers.getCellClassName(columnId)
+            }
+          />
+          {row.getIsExpanded() && (
+            <TableRow>
+              <TableCell colSpan={row.getVisibleCells().length} className='p-0'>
+                <div id={`provider-channels-${row.original.id}`}>
+                  <ProviderChannels providerId={row.original.id} />
+                </div>
+              </TableCell>
+            </TableRow>
+          )}
+        </Fragment>
+      )}
       columns={columns}
       isLoading={isLoading}
       isFetching={isFetching}
