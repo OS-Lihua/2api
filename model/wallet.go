@@ -237,10 +237,12 @@ func validateLedgerPosting(posting LedgerPosting) error {
 	if posting.Amount.Nanos == 0 {
 		return fmt.Errorf("%w: amount must not be zero", ErrLedgerInvalidEntry)
 	}
+	positive := posting.Amount.Nanos > 0
 	if posting.reversesEntryId != nil {
-		sign = reversedLedgerSign(sign)
+		// A reversal cancels its entry, so its sign is the opposite one.
+		positive = !positive
 	}
-	if sign == ledgerSignPositive && posting.Amount.Nanos < 0 || sign == ledgerSignNegative && posting.Amount.Nanos > 0 {
+	if sign == ledgerSignPositive && !positive || sign == ledgerSignNegative && positive {
 		return fmt.Errorf("%w: %s amount %d has the wrong sign", ErrLedgerInvalidEntry, posting.Type, posting.Amount.Nanos)
 	}
 	if utf8.RuneCountInString(posting.Remark) > ledgerRemarkMaxLength {
@@ -250,16 +252,6 @@ func validateLedgerPosting(posting LedgerPosting) error {
 		return fmt.Errorf("%w: reference is too long", ErrLedgerInvalidEntry)
 	}
 	return nil
-}
-
-func reversedLedgerSign(sign ledgerSign) ledgerSign {
-	switch sign {
-	case ledgerSignPositive:
-		return ledgerSignNegative
-	case ledgerSignNegative:
-		return ledgerSignPositive
-	}
-	return sign
 }
 
 func postLedgerEntries(tx *gorm.DB, postings []LedgerPosting) ([]*LedgerEntry, error) {
@@ -301,7 +293,14 @@ func postLedgerEntries(tx *gorm.DB, postings []LedgerPosting) ([]*LedgerEntry, e
 			entry.IdempotencyKey = &key
 		}
 		if err := tx.Create(entry).Error; err != nil {
-			return nil, translateLedgerWriteError(err)
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == ledgerIdempotencyKeyIndex {
+				return nil, ErrDuplicateLedgerEntry
+			}
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == ledgerReversalIndex {
+				return nil, ErrLedgerEntryAlreadyReversed
+			}
+			return nil, err
 		}
 		if err := tx.Model(&Wallet{}).Where("id = ?", wallet.Id).Updates(map[string]any{
 			"balance_nanos": balance.Nanos,
@@ -396,20 +395,6 @@ func ensureWallet(tx *gorm.DB, account LedgerAccount) (int64, error) {
 		return 0, fmt.Errorf("%w: wallet holds %s, posting is in %s", money.ErrCurrencyMismatch, existing.Balance.Currency, account.Currency)
 	}
 	return existing.Id, nil
-}
-
-func translateLedgerWriteError(err error) error {
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) || pgErr.Code != "23505" {
-		return err
-	}
-	switch pgErr.ConstraintName {
-	case ledgerIdempotencyKeyIndex:
-		return ErrDuplicateLedgerEntry
-	case ledgerReversalIndex:
-		return ErrLedgerEntryAlreadyReversed
-	}
-	return err
 }
 
 // WalletTopUp credits a user wallet. Source is the amount received; when it
@@ -580,27 +565,27 @@ func migrateWalletLedger(db *gorm.DB) error {
 		return err
 	}
 	statements := []string{
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_wallets_account ON wallets (account_type, owner_id, balance_currency)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_wallets_user_wallet ON wallets (owner_id) WHERE account_type = 'user_wallet'`,
-		`CREATE INDEX IF NOT EXISTS idx_ledger_entries_wallet_id_id ON ledger_entries (wallet_id, id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS "idx_wallets_account" ON "wallets" ("account_type", "owner_id", "balance_currency")`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS "idx_wallets_user_wallet" ON "wallets" ("owner_id") WHERE "account_type" = 'user_wallet'`,
+		`CREATE INDEX IF NOT EXISTS "idx_ledger_entries_wallet_id_id" ON "ledger_entries" ("wallet_id", "id")`,
 		`DO $$
 BEGIN
-	IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_ledger_entries_wallet' AND conrelid = 'ledger_entries'::regclass) THEN
-		ALTER TABLE ledger_entries ADD CONSTRAINT fk_ledger_entries_wallet FOREIGN KEY (wallet_id) REFERENCES wallets (id);
+	IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_ledger_entries_wallet' AND conrelid = '"ledger_entries"'::regclass) THEN
+		ALTER TABLE "ledger_entries" ADD CONSTRAINT "fk_ledger_entries_wallet" FOREIGN KEY ("wallet_id") REFERENCES "wallets" ("id");
 	END IF;
-	IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_ledger_entries_amount_nonzero' AND conrelid = 'ledger_entries'::regclass) THEN
-		ALTER TABLE ledger_entries ADD CONSTRAINT chk_ledger_entries_amount_nonzero CHECK (amount_nanos <> 0);
+	IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_ledger_entries_amount_nonzero' AND conrelid = '"ledger_entries"'::regclass) THEN
+		ALTER TABLE "ledger_entries" ADD CONSTRAINT "chk_ledger_entries_amount_nonzero" CHECK ("amount_nanos" <> 0);
 	END IF;
 END $$`,
-		`CREATE OR REPLACE FUNCTION ledger_entries_append_only() RETURNS trigger AS $$
+		`CREATE OR REPLACE FUNCTION "ledger_entries_append_only"() RETURNS trigger AS $$
 BEGIN
 	RAISE EXCEPTION 'ledger_entries is append-only; write a reversal entry instead';
 END
 $$ LANGUAGE plpgsql`,
-		`DROP TRIGGER IF EXISTS ledger_entries_append_only ON ledger_entries`,
-		`CREATE TRIGGER ledger_entries_append_only BEFORE UPDATE OR DELETE ON ledger_entries FOR EACH ROW EXECUTE FUNCTION ledger_entries_append_only()`,
-		`DROP TRIGGER IF EXISTS ledger_entries_no_truncate ON ledger_entries`,
-		`CREATE TRIGGER ledger_entries_no_truncate BEFORE TRUNCATE ON ledger_entries FOR EACH STATEMENT EXECUTE FUNCTION ledger_entries_append_only()`,
+		`DROP TRIGGER IF EXISTS "ledger_entries_append_only" ON "ledger_entries"`,
+		`CREATE TRIGGER "ledger_entries_append_only" BEFORE UPDATE OR DELETE ON "ledger_entries" FOR EACH ROW EXECUTE FUNCTION "ledger_entries_append_only"()`,
+		`DROP TRIGGER IF EXISTS "ledger_entries_no_truncate" ON "ledger_entries"`,
+		`CREATE TRIGGER "ledger_entries_no_truncate" BEFORE TRUNCATE ON "ledger_entries" FOR EACH STATEMENT EXECUTE FUNCTION "ledger_entries_append_only"()`,
 	}
 	return db.Transaction(func(tx *gorm.DB) error {
 		for _, statement := range statements {
@@ -648,14 +633,14 @@ func ReconcileWallets(batchSize int) (WalletReconciliation, error) {
 			EntryTotal             decimal.Decimal
 			ForeignCurrencyEntries int64
 		}
-		batch := DB.Model(&Wallet{}).Where("id > ?", lastId).Order("id").Limit(batchSize)
+		batch := DB.Model(&Wallet{}).Where(`"id" > ?`, lastId).Order(`"id"`).Limit(batchSize)
 		err := DB.Table("(?) AS w", batch).
-			Select(`w.id, w.account_type, w.owner_id, w.balance_nanos, w.balance_currency,
-				COALESCE(SUM(e.amount_nanos), 0) AS entry_total,
-				COUNT(e.id) FILTER (WHERE e.amount_currency <> w.balance_currency) AS foreign_currency_entries`).
-			Joins("LEFT JOIN ledger_entries e ON e.wallet_id = w.id").
-			Group("w.id, w.account_type, w.owner_id, w.balance_nanos, w.balance_currency").
-			Order("w.id").
+			Select(`w."id", w."account_type", w."owner_id", w."balance_nanos", w."balance_currency",
+				COALESCE(SUM(e."amount_nanos"), 0) AS "entry_total",
+				COUNT(e."id") FILTER (WHERE e."amount_currency" <> w."balance_currency") AS "foreign_currency_entries"`).
+			Joins(`LEFT JOIN "ledger_entries" e ON e."wallet_id" = w."id"`).
+			Group(`w."id", w."account_type", w."owner_id", w."balance_nanos", w."balance_currency"`).
+			Order(`w."id"`).
 			Scan(&rows).Error
 		if err != nil {
 			return WalletReconciliation{}, err
