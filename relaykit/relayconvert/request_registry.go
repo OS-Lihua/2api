@@ -264,7 +264,7 @@ func executeRequestSpec(c context.Context, info convmeta.Meta, from types.RelayF
 
 func executeRequestSteps(c context.Context, info convmeta.Meta, from types.RelayFormat, target types.RelayFormat, request any, converter string, quality RequestConverterQuality, specs []RequestConverterSpec) (*RequestResult, error) {
 	c, diagnosticCollector := convdiag.WithCollector(c)
-	if target != types.RelayFormatClaude {
+	if target != types.RelayFormatClaude && !(target == types.RelayFormatOpenAI && convmeta.OptionsOf(info).OpenRouterDialect) {
 		body, err := kitutil.Marshal(request)
 		if err != nil {
 			return nil, err

@@ -21,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/capability"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/money"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -723,6 +724,50 @@ func TestTextGatewayMissingUsageIgnoresOutputCeilings(t *testing.T) {
 			require.EqualValues(t, 1, total)
 			assert.Equal(t, test.prompt, requests[0].Usage.PromptTokens)
 			assert.Equal(t, "estimated", requests[0].UsageSource)
+		})
+	}
+}
+
+func TestTextGatewayOpenRouterRetainsCacheBoundaries(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		var sent map[string]any
+		require.NoError(t, common.DecodeJson(r.Body, &sent))
+		messages := sent["messages"].([]any)
+		content := messages[0].(map[string]any)["content"].([]any)
+		assert.Equal(t, map[string]any{"type": "ephemeral"}, content[0].(map[string]any)["cache_control"])
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	})
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeOpenRouter).Error)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"user","content":[{"type":"text","text":"Hello","cache_control":{"type":"ephemeral"}}]}],"max_tokens":16}`)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Empty(t, response.Header().Get("X-Gateway-Conversion-Loss"))
+}
+
+func TestGatewayRequestSnapshotKeepsOriginalAlias(t *testing.T) {
+	for _, source := range []dto.Request{
+		&dto.GeneralOpenAIRequest{Model: "public-alias"},
+		&dto.OpenAIResponsesRequest{Model: "public-alias"},
+		&dto.ClaudeRequest{Model: "public-alias"},
+		&dto.GeminiChatRequest{CachedContent: "cachedContents/original"},
+	} {
+		t.Run(fmt.Sprintf("%T", source), func(t *testing.T) {
+			snapshot, err := service.CloneGatewayRequest(source)
+			require.NoError(t, err)
+			snapshot.SetModelName("candidate-model")
+			if gemini, ok := snapshot.(*dto.GeminiChatRequest); ok {
+				gemini.CachedContent = "cachedContents/candidate"
+			}
+			switch source := source.(type) {
+			case *dto.GeneralOpenAIRequest:
+				assert.Equal(t, "public-alias", source.Model)
+			case *dto.OpenAIResponsesRequest:
+				assert.Equal(t, "public-alias", source.Model)
+			case *dto.ClaudeRequest:
+				assert.Equal(t, "public-alias", source.Model)
+			case *dto.GeminiChatRequest:
+				assert.Equal(t, "cachedContents/original", source.CachedContent)
+			}
 		})
 	}
 }

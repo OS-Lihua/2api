@@ -90,8 +90,12 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 				reason = "capability"
 				break
 			}
-			info.InitChannelMeta(c)
-			info.UpstreamModelName = candidate.UpstreamModelName
+			info.ProviderMeta = &relaycommon.ProviderMeta{
+				ChannelType: provider.Type, ChannelId: candidate.ProviderID,
+				UpstreamModelName: candidate.UpstreamModelName,
+				ChannelSetting:    provider.GetSetting(), ChannelOtherSettings: provider.GetOtherSettings(),
+			}
+			info.ChannelOtherSettings.ToolLossPolicy = string(types.ConversionLossPolicyAllow)
 			conversion, err = PreconvertGatewayRequest(c, info, candidate.Protocol, original, accepted)
 			if err != nil {
 				reason = "conversion_loss"

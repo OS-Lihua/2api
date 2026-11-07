@@ -57,6 +57,20 @@ func PreconvertGatewayRequest(ctx context.Context, info convmeta.Meta, kind prot
 	if err != nil {
 		return nil, err
 	}
+	clone, err := CloneGatewayRequest(request)
+	if err != nil {
+		return nil, err
+	}
+	result, err := relayconvert.ConvertRequest(ctx, info, format, clone)
+	if err != nil {
+		return result, err
+	}
+	return result, CheckGatewayConversionLosses(result.Diagnostics, accepted)
+}
+
+// CloneGatewayRequest isolates candidate conversion and RelayInfo normalization
+// from the original downstream request.
+func CloneGatewayRequest(request dto.Request) (dto.Request, error) {
 	var clone dto.Request
 	switch request.(type) {
 	case *dto.GeneralOpenAIRequest:
@@ -74,14 +88,13 @@ func PreconvertGatewayRequest(ctx context.Context, info convmeta.Meta, kind prot
 	if err != nil {
 		return nil, err
 	}
+	if string(body) == "null" {
+		return nil, fmt.Errorf("missing text request")
+	}
 	if err := common.Unmarshal(body, clone); err != nil {
 		return nil, err
 	}
-	result, err := relayconvert.ConvertRequest(ctx, info, format, clone)
-	if err != nil {
-		return result, err
-	}
-	return result, CheckGatewayConversionLosses(result.Diagnostics, accepted)
+	return clone, nil
 }
 
 func GatewayAcceptedConversionLosses(offering *model.ModelOffering) []string {

@@ -137,7 +137,12 @@ func TextGateway(c *gin.Context) {
 		return
 	}
 	common.SetContextKey(c, constant.ContextKeyChannelParamOverride, overrides)
-	info, err := relaycommon.GenRelayInfo(c, format, native, nil)
+	nativeSnapshot, err := service.CloneGatewayRequest(native)
+	if err != nil {
+		gatewayError(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
+		return
+	}
+	info, err := relaycommon.GenRelayInfo(c, format, nativeSnapshot, nil)
 	if err != nil {
 		gatewayError(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
 		return
