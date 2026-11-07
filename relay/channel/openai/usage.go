@@ -3,9 +3,26 @@ package openai
 import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/gin-gonic/gin"
 )
+
+func applyProtocolUsagePostProcessing(c *gin.Context, info *relaycommon.RelayInfo, usage *dto.Usage, responseBody []byte) {
+	if !channel.RepairProviderUsage(c, usage, responseBody) {
+		applyUsagePostProcessing(info, usage, responseBody)
+	}
+}
+
+func (p *Provider) RepairUsage(context *channel.ProtocolResponseContext, usage *dto.Usage, body []byte) {
+	if context.ChannelType != constant.ChannelTypeOpenAI || usage == nil || usage.PromptTokensDetails.CachedTokens != 0 {
+		return
+	}
+	if cachedTokens, ok := extractLlamaCachedTokensFromBody(body); ok {
+		usage.PromptTokensDetails.CachedTokens = cachedTokens
+	}
+}
 
 func applyUsagePostProcessing(info *relaycommon.RelayInfo, usage *dto.Usage, responseBody []byte) {
 	if info == nil || usage == nil {

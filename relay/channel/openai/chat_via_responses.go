@@ -153,7 +153,7 @@ func convertResponsesResponseForClient(c *gin.Context, info *relaycommon.RelayIn
 	}
 
 	usage := relayconvert.UsageFromResponsesUsage(response.Usage)
-	if usage == nil || usage.TotalTokens == 0 {
+	if usage == nil || usage.TotalTokens == 0 && (info.UpstreamProtocol == "" || response.Usage == nil) {
 		text := service.ExtractOutputTextFromResponses(response)
 		usage = service.ResponseText2Usage(c, text, info.UpstreamModelName, info.GetEstimatePromptTokens())
 		response.Usage = relayconvert.UsageFromChatUsage(usage)

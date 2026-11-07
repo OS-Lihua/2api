@@ -147,6 +147,9 @@ func countGeminiBillableFunctionCalls(info *relaycommon.RelayInfo, response *dto
 
 func buildUsageFromGeminiResponse(c *gin.Context, info *relaycommon.RelayInfo, response *dto.GeminiChatResponse) dto.Usage {
 	metadata := response.GetUsageMetadata()
+	if info.UpstreamProtocol != "" && metadata != nil {
+		return buildUsageFromGeminiMetadata(metadata, 0)
+	}
 	if dto.HasGeminiUsageMetadataTokens(metadata) {
 		usage := buildUsageFromGeminiMetadata(metadata, info.GetEstimatePromptTokens())
 		patchGeminiZeroCompletionUsage(c, info, &usage, geminiResponseUsageText(response), geminiResponseInlineImageCount(response))
@@ -250,9 +253,13 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		responseText.WriteString(geminiResponseUsageText(&geminiResponse))
 
 		// 更新使用量统计
-		if metadata := geminiResponse.GetUsageMetadata(); dto.HasGeminiUsageMetadataTokens(metadata) {
+		if metadata := geminiResponse.GetUsageMetadata(); dto.HasGeminiUsageMetadataTokens(metadata) || info.UpstreamProtocol != "" && metadata != nil {
 			accumulatedUsageMetadata = dto.MergeGeminiUsageMetadataNonZero(accumulatedUsageMetadata, metadata)
-			mappedUsage := buildUsageFromGeminiMetadata(accumulatedUsageMetadata, info.GetEstimatePromptTokens())
+			fallbackPromptTokens := info.GetEstimatePromptTokens()
+			if info.UpstreamProtocol != "" {
+				fallbackPromptTokens = 0
+			}
+			mappedUsage := buildUsageFromGeminiMetadata(accumulatedUsageMetadata, fallbackPromptTokens)
 			*usage = mappedUsage
 			hasBillableUsageMetadata = true
 		}
@@ -280,7 +287,7 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
 		}
 		attachEstimatedGeminiBillingUsage(usage)
-	} else {
+	} else if info.UpstreamProtocol == "" {
 		patchGeminiZeroCompletionUsage(c, info, usage, responseText.String(), imageCount)
 	}
 

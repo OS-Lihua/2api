@@ -18,7 +18,7 @@ type DispatchAdaptor struct {
 
 func (a *DispatchAdaptor) Init(info *relaycommon.RelayInfo) {
 	if strings.Contains(info.ApiKey, "|") {
-		a.Adaptor = &Adaptor{}
+		a.Adaptor = &Protocol{}
 	} else {
 		a.Adaptor = &openai.Adaptor{}
 		if info.ChannelBaseUrl == "" || info.ChannelBaseUrl == constant.ChannelBaseURLs[constant.ChannelTypeTencent] {
