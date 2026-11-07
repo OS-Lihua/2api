@@ -110,6 +110,12 @@ func (a *Protocol) DoResponse(c *gin.Context, resp *http.Response, info *relayco
 	case constant.RelayModeEmbeddings:
 		return openai.OpenaiHandler(c, info, resp)
 	case constant.RelayModeChatCompletions:
+		if info.ResponseFacts != nil {
+			if info.IsStream {
+				return openai.OaiStreamHandler(c, info, resp)
+			}
+			return openai.OpenaiHandler(c, info, resp)
+		}
 		if info.IsStream {
 			err, usage = cfStreamHandler(c, info, resp)
 		} else {

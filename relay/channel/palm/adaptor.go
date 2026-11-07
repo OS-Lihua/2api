@@ -81,8 +81,8 @@ func (a *Protocol) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, reques
 func (a *Protocol) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {
 	if info.IsStream {
 		var responseText string
-		err, responseText = palmStreamHandler(c, resp)
-		usage = service.ResponseText2Usage(c, responseText, info.UpstreamModelName, info.GetEstimatePromptTokens())
+		err, responseText = palmStreamHandler(c, info, resp)
+		usage = service.ResponseText2Usage(c, responseText, info.TokenizerModelName(), info.GetEstimatePromptTokens())
 	} else {
 		usage, err = palmHandler(c, info, resp)
 	}

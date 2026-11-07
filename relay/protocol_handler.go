@@ -72,6 +72,15 @@ func (a *ChannelAdaptor) ConvertRequest(c *gin.Context, info *relaycommon.RelayI
 	return converted, err
 }
 
+// PrepareChatRequest runs selected native preparation after the caller reserves
+// funds and freezes purchase prices, before final body/header probes are taken.
+func (a *ChannelAdaptor) PrepareChatRequest(c *gin.Context, info *relaycommon.RelayInfo, converted any, body []byte) ([]byte, error) {
+	if preparer, ok := converted.(channel.ChatRequestPreparer); ok {
+		return preparer.PrepareChatRequest(c, info, body)
+	}
+	return body, nil
+}
+
 func (a *ChannelAdaptor) ProjectChatRequest(info *relaycommon.RelayInfo, converted any, public *dto.GeneralOpenAIRequest, body []byte) (*dto.GeneralOpenAIRequest, error) {
 	if projector, ok := converted.(channel.ChatRequestProjector); ok {
 		return projector.ProjectChatRequest(body, *public)
