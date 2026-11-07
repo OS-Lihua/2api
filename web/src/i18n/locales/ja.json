@@ -2302,6 +2302,7 @@
     "Enter amount in tokens": "トークンで金額を入力",
     "Enter an absolute HTTP(S) URL without credentials, query parameters, or fragments": "認証情報、クエリパラメータ、フラグメントを含まない絶対 HTTP(S) URL を入力してください",
     "Enter an absolute http(s) URL.": "完全な http(s) URL を入力してください。",
+    "Enter an integer no greater than 9007199254740991": "9007199254740991 以下の整数を入力してください",
     "Enter an ISO date and time with a timezone offset.": "タイムゾーンのオフセットを含む ISO 形式の日時を入力してください。",
     "Enter announcement content (supports Markdown & HTML)": "アナウンス内容を入力（Markdown & HTML対応）",
     "Enter announcement content (supports Markdown/HTML)": "アナウンス内容を入力（Markdown/HTML対応）",

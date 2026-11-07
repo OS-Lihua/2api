@@ -76,6 +76,9 @@ const capabilityLimitSchema = z
   .refine((value) => value === '' || /^[1-9]\d*$/.test(value), {
     message: 'Enter a positive integer',
   })
+  .refine((value) => value === '' || Number(value) <= Number.MAX_SAFE_INTEGER, {
+    message: 'Enter an integer no greater than 9007199254740991',
+  })
 
 /**
  * Capability form. Limits are text inputs; an empty limit is not declared.

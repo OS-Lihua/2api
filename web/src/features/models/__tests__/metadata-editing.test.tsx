@@ -444,7 +444,9 @@ describe('metadata editing', () => {
           'unassigned-model'
         )
       )
-      expect(screen.getByRole('combobox', { name: 'Publisher' })).toHaveValue('')
+      expect(screen.getByRole('combobox', { name: 'Publisher' })).toHaveValue(
+        ''
+      )
       fireEvent.click(screen.getByRole('button', { name: 'Save metadata' }))
       await waitFor(() =>
         expect(put).toHaveBeenCalledWith(
@@ -676,7 +678,11 @@ describe('capability declaration', () => {
     })
     render(
       <QueryClientProvider client={client}>
-        <ModelMutateDrawer open onOpenChange={() => {}} currentRow={currentRow} />
+        <ModelMutateDrawer
+          open
+          onOpenChange={() => {}}
+          currentRow={currentRow}
+        />
       </QueryClientProvider>
     )
     return client
@@ -704,14 +710,18 @@ describe('capability declaration', () => {
     const client = renderDrawer(declared)
     const user = userEvent.setup()
     const tab = screen.getByRole('tab', { name: 'Capabilities' })
-    await waitFor(() => expect(tab).not.toHaveAttribute('aria-disabled', 'true'))
+    await waitFor(() =>
+      expect(tab).not.toHaveAttribute('aria-disabled', 'true')
+    )
     await user.click(tab)
 
     const features = await screen.findByRole('combobox', {
       name: 'Select features',
     })
     await user.click(features)
-    await user.click(await screen.findByRole('option', { name: 'Tool calling' }))
+    await user.click(
+      await screen.findByRole('option', { name: 'Tool calling' })
+    )
     await user.keyboard('{Escape}')
     await user.click(
       screen.getByRole('combobox', { name: 'Select input modalities' })
@@ -765,7 +775,9 @@ describe('capability declaration', () => {
     const client = renderDrawer(model)
     const user = userEvent.setup()
     const tab = screen.getByRole('tab', { name: 'Capabilities' })
-    await waitFor(() => expect(tab).not.toHaveAttribute('aria-disabled', 'true'))
+    await waitFor(() =>
+      expect(tab).not.toHaveAttribute('aria-disabled', 'true')
+    )
     await user.click(tab)
     const maxImages = await screen.findByRole('textbox', { name: 'Max images' })
     await user.type(maxImages, '0')
@@ -774,6 +786,114 @@ describe('capability declaration', () => {
     expect(await screen.findByText('Enter a positive integer')).toBeVisible()
     expect(maxImages).toHaveAttribute('aria-invalid', 'true')
     expect(put).not.toHaveBeenCalled()
+    client.clear()
+  })
+
+  it.each([
+    ['the first unsafe integer', '9007199254740992'],
+    ['an integer that would be rounded', '9007199254740993'],
+    ['an integer that would become Infinity', `1${'0'.repeat(309)}`],
+  ])(
+    'rejects %s in every capability limit without saving',
+    async (_, value) => {
+      vi.spyOn(api, 'get').mockImplementation(async (url) => {
+        if (url === '/api/models/7') {
+          return { data: { success: true, data: model } }
+        }
+        return { data: { success: true, data: { items: [] } } }
+      })
+      const put = vi
+        .spyOn(api, 'put')
+        .mockResolvedValue({ data: { success: true } })
+      const client = renderDrawer(model)
+      const user = userEvent.setup()
+      const tab = screen.getByRole('tab', { name: 'Capabilities' })
+      await waitFor(() =>
+        expect(tab).not.toHaveAttribute('aria-disabled', 'true')
+      )
+      await user.click(tab)
+      const labels = [
+        'Context length (tokens)',
+        'Max output tokens',
+        'Max images',
+        'Max duration (seconds)',
+        'Embedding dimensions',
+      ]
+      for (const name of labels) {
+        await user.click(screen.getByRole('textbox', { name }))
+        await user.paste(value)
+      }
+      await user.click(
+        screen.getByRole('button', { name: 'Save capabilities' })
+      )
+
+      expect(
+        await screen.findAllByText(
+          'Enter an integer no greater than 9007199254740991'
+        )
+      ).toHaveLength(5)
+      for (const name of labels) {
+        expect(screen.getByRole('textbox', { name })).toHaveAttribute(
+          'aria-invalid',
+          'true'
+        )
+      }
+      expect(put).not.toHaveBeenCalled()
+      client.clear()
+    }
+  )
+
+  it.each([
+    ['the smallest positive integer', '1', 1],
+    ['the largest safe integer', '9007199254740991', 9007199254740991],
+    ['surrounding whitespace', ' 8192 ', 8192],
+    ['an undeclared limit', ' ', undefined],
+  ])('preserves %s in every limit when saving', async (_, value, expected) => {
+    vi.spyOn(api, 'get').mockImplementation(async (url) => {
+      if (url === '/api/models/7') {
+        return { data: { success: true, data: model } }
+      }
+      return { data: { success: true, data: { items: [] } } }
+    })
+    const put = vi
+      .spyOn(api, 'put')
+      .mockResolvedValue({ data: { success: true } })
+    const client = renderDrawer(model)
+    const user = userEvent.setup()
+    const tab = screen.getByRole('tab', { name: 'Capabilities' })
+    await waitFor(() =>
+      expect(tab).not.toHaveAttribute('aria-disabled', 'true')
+    )
+    await user.click(tab)
+    for (const name of [
+      'Context length (tokens)',
+      'Max output tokens',
+      'Max images',
+      'Max duration (seconds)',
+      'Embedding dimensions',
+    ]) {
+      await user.click(screen.getByRole('textbox', { name }))
+      await user.paste(value)
+    }
+    await user.click(screen.getByRole('button', { name: 'Save capabilities' }))
+
+    await waitFor(() => expect(put).toHaveBeenCalledOnce())
+    const payload = put.mock.calls[0][1] as {
+      capabilities: Model['capabilities']
+    }
+    const expectedLimits =
+      expected === undefined
+        ? {}
+        : {
+            context_length: expected,
+            max_output_tokens: expected,
+            max_images: expected,
+            max_duration_seconds: expected,
+            embedding_dimensions: expected,
+          }
+    expect(payload.capabilities?.limits).toEqual(expectedLimits)
+    const serialized = JSON.stringify(payload)
+    expect(JSON.parse(serialized).capabilities.limits).toEqual(expectedLimits)
     client.clear()
   })
 
@@ -800,7 +920,9 @@ describe('capability declaration', () => {
     const client = renderDrawer(model)
     const user = userEvent.setup()
     const tab = screen.getByRole('tab', { name: 'Capabilities' })
-    await waitFor(() => expect(tab).not.toHaveAttribute('aria-disabled', 'true'))
+    await waitFor(() =>
+      expect(tab).not.toHaveAttribute('aria-disabled', 'true')
+    )
     await user.click(tab)
     await user.click(
       await screen.findByRole('button', { name: 'Save capabilities' })

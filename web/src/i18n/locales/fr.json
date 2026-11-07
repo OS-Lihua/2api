@@ -2302,6 +2302,7 @@
     "Enter amount in tokens": "Entrez le montant en tokens",
     "Enter an absolute HTTP(S) URL without credentials, query parameters, or fragments": "Saisissez une URL HTTP(S) absolue sans identifiants, paramètres de requête ni fragment",
     "Enter an absolute http(s) URL.": "Saisissez une URL http(s) absolue.",
+    "Enter an integer no greater than 9007199254740991": "Saisissez un entier inférieur ou égal à 9007199254740991",
     "Enter an ISO date and time with a timezone offset.": "Saisissez une date et une heure ISO avec un décalage de fuseau horaire.",
     "Enter announcement content (supports Markdown & HTML)": "Saisir le contenu de l'annonce (prend en charge Markdown et HTML)",
     "Enter announcement content (supports Markdown/HTML)": "Saisir le contenu de l'annonce (prend en charge Markdown/HTML)",

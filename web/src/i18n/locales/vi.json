@@ -2302,6 +2302,7 @@
     "Enter amount in tokens": "Nhập số lượng token",
     "Enter an absolute HTTP(S) URL without credentials, query parameters, or fragments": "Nhập URL HTTP(S) tuyệt đối không chứa thông tin xác thực, tham số truy vấn hoặc phân mảnh",
     "Enter an absolute http(s) URL.": "Hãy nhập URL http(s) đầy đủ.",
+    "Enter an integer no greater than 9007199254740991": "Nhập số nguyên không lớn hơn 9007199254740991",
     "Enter an ISO date and time with a timezone offset.": "Nhập ngày giờ ISO có độ lệch múi giờ.",
     "Enter announcement content (supports Markdown & HTML)": "Nhập nội dung thông báo (hỗ trợ Markdown & HTML)",
     "Enter announcement content (supports Markdown/HTML)": "Nhập nội dung thông báo (hỗ trợ Markdown/HTML)",

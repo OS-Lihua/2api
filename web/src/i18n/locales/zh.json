@@ -2302,6 +2302,7 @@
     "Enter amount in tokens": "输入额度（Token）",
     "Enter an absolute HTTP(S) URL without credentials, query parameters, or fragments": "请输入不含认证信息、查询参数或片段的 HTTP(S) 绝对 URL",
     "Enter an absolute http(s) URL.": "请输入完整的 http(s) URL。",
+    "Enter an integer no greater than 9007199254740991": "请输入不大于 9007199254740991 的整数",
     "Enter an ISO date and time with a timezone offset.": "请输入带时区偏移的 ISO 日期和时间。",
     "Enter announcement content (supports Markdown & HTML)": "输入公告内容（支持 Markdown 和 HTML）",
     "Enter announcement content (supports Markdown/HTML)": "输入公告内容（支持 Markdown/HTML）",

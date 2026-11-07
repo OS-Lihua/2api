@@ -2302,6 +2302,7 @@
     "Enter amount in tokens": "Enter amount in tokens",
     "Enter an absolute HTTP(S) URL without credentials, query parameters, or fragments": "Enter an absolute HTTP(S) URL without credentials, query parameters, or fragments",
     "Enter an absolute http(s) URL.": "Enter an absolute http(s) URL.",
+    "Enter an integer no greater than 9007199254740991": "Enter an integer no greater than 9007199254740991",
     "Enter an ISO date and time with a timezone offset.": "Enter an ISO date and time with a timezone offset.",
     "Enter announcement content (supports Markdown & HTML)": "Enter announcement content (supports Markdown & HTML)",
     "Enter announcement content (supports Markdown/HTML)": "Enter announcement content (supports Markdown/HTML)",
