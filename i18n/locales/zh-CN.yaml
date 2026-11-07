@@ -92,3 +92,7 @@ channel.upstream_update_added_models: "新增模型示例（展示 {{.Shown}}/{{
 channel.upstream_update_removed_models: "删除模型示例（展示 {{.Shown}}/{{.Total}}）：{{.Models}}"
 channel.upstream_update_failed_channels: "失败渠道 ID（展示 {{.Shown}}/{{.Total}}）：{{.Ids}}"
 channel.upstream_update_more_omitted: "（其余 {{.Count}} 个已省略）"
+
+# 发给 root 用户的钱包对账告警
+wallet.reconcile_mismatch_subject: "钱包对账发现 {{.Count}} 个钱包不一致"
+wallet.reconcile_mismatch_content: "有 {{.Count}} 个钱包的余额不等于账目合计。钱包 ID（显示 {{.Shown}}/{{.Count}}）：{{.Ids}}"

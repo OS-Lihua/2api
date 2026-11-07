@@ -8,6 +8,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/capability"
 
 	"github.com/gin-gonic/gin"
 )
@@ -114,6 +115,8 @@ func CreateModelMeta(c *gin.Context) {
 		common.ApiErrorT(c, "Model name cannot be empty")
 		return
 	}
+	// Capabilities are declared through /api/admin/v1/models only.
+	m.Capabilities = capability.Set{}
 	if err := model.ValidateMetadataValues(model.MetadataValues{Endpoints: m.Endpoints, Status: m.Status, NameRule: m.NameRule}); err != nil {
 		common.ApiError(c, err)
 		return
@@ -183,6 +186,13 @@ func UpdateModelMeta(c *gin.Context) {
 			return
 		}
 	}
+	// The legacy body carries no capabilities; return the stored declaration.
+	var stored model.Model
+	if err := model.DB.Select("capabilities").First(&stored, m.Id).Error; err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	m.Capabilities = stored.Capabilities
 	model.RefreshPricing()
 	m.HasMetadata = m.Id > 0
 	common.ApiSuccess(c, &m)

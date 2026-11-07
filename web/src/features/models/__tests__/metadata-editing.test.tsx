@@ -421,7 +421,7 @@ describe('metadata editing', () => {
       )
       const view = render(tree(model, true))
       await waitFor(() =>
-        expect(screen.getByRole('combobox', { name: 'Vendor' })).toHaveValue(
+        expect(screen.getByRole('combobox', { name: 'Publisher' })).toHaveValue(
           'Existing vendor'
         )
       )
@@ -444,7 +444,9 @@ describe('metadata editing', () => {
           'unassigned-model'
         )
       )
-      expect(screen.getByRole('combobox', { name: 'Vendor' })).toHaveValue('')
+      expect(screen.getByRole('combobox', { name: 'Publisher' })).toHaveValue(
+        ''
+      )
       fireEvent.click(screen.getByRole('button', { name: 'Save metadata' }))
       await waitFor(() =>
         expect(put).toHaveBeenCalledWith(
@@ -497,7 +499,7 @@ describe('metadata editing', () => {
     )
     const description = await screen.findByLabelText('Description')
     await waitFor(() => expect(description).toHaveValue('Original'))
-    expect(screen.getByRole('combobox', { name: 'Vendor' })).toHaveValue(
+    expect(screen.getByRole('combobox', { name: 'Publisher' })).toHaveValue(
       'Existing vendor'
     )
     const user = userEvent.setup()
@@ -514,7 +516,7 @@ describe('metadata editing', () => {
       screen.queryByRole('combobox', { name: 'Icon' })
     ).not.toBeInTheDocument()
     expect(screen.getByText('Gemini.Color')).toBeVisible()
-    const vendorInput = screen.getByRole('combobox', { name: 'Vendor' })
+    const vendorInput = screen.getByRole('combobox', { name: 'Publisher' })
     await user.click(vendorInput)
     await user.type(vendorInput, 'Another')
     await user.click(screen.getByRole('option', { name: 'Another vendor' }))
@@ -660,6 +662,419 @@ describe('metadata editing', () => {
     await user.click(screen.getByRole('tab', { name: 'Model metadata' }))
     expect(screen.getByLabelText('Description')).toHaveValue(
       'Unsaved metadata draft'
+    )
+    client.clear()
+  })
+})
+
+describe('capability declaration', () => {
+  function renderDrawer(currentRow: Model, onOpenChange = vi.fn()) {
+    useAuthStore.getState().auth.setUser({ id: 2, username: 'admin', role: 10 })
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <ModelMutateDrawer
+          open
+          onOpenChange={onOpenChange}
+          currentRow={currentRow}
+        />
+      </QueryClientProvider>
+    )
+    return client
+  }
+
+  it('keeps the capability draft and close warning after saving metadata', async () => {
+    let storedModel = { ...model }
+    vi.spyOn(api, 'get').mockImplementation(async (url) => {
+      if (url === '/api/models/7') {
+        return { data: { success: true, data: storedModel } }
+      }
+      return { data: { success: true, data: { items: [] } } }
+    })
+    const put = vi.spyOn(api, 'put').mockImplementation(async () => {
+      storedModel = { ...model, description: 'Saved metadata' }
+      return { data: { success: true, data: storedModel } }
+    })
+    const close = vi.fn()
+    const client = renderDrawer(model, close)
+    const user = userEvent.setup()
+    await waitFor(() =>
+      expect(screen.getByLabelText('Description')).toHaveValue('Original')
+    )
+    await user.click(screen.getByRole('tab', { name: 'Capabilities' }))
+    await user.type(
+      screen.getByRole('textbox', { name: 'Context length (tokens)' }),
+      '8192'
+    )
+    await user.click(screen.getByRole('tab', { name: 'Model metadata' }))
+    await user.clear(screen.getByLabelText('Description'))
+    await user.type(screen.getByLabelText('Description'), 'Saved metadata')
+    await user.click(screen.getByRole('button', { name: 'Save metadata' }))
+    await waitFor(() => expect(put).toHaveBeenCalledOnce())
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Save metadata' })
+      ).toBeEnabled()
+    )
+    expect(close).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('tab', { name: 'Capabilities' }))
+    expect(
+      screen.getByRole('textbox', { name: 'Context length (tokens)' })
+    ).toHaveValue('8192')
+    await user.click(screen.getAllByRole('button', { name: 'Close' })[0])
+    expect(await screen.findByRole('alertdialog')).toHaveTextContent(
+      'Discard unsaved changes?'
+    )
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(
+      screen.getByRole('textbox', { name: 'Context length (tokens)' })
+    ).toHaveValue('8192')
+    expect(close).not.toHaveBeenCalled()
+    client.clear()
+  })
+
+  it.each(['success', 'rejection'])(
+    'locks capability inputs while saving and restores editing after %s',
+    async (outcome) => {
+      vi.spyOn(api, 'get').mockImplementation(async (url) => {
+        if (url === '/api/models/7') {
+          return { data: { success: true, data: model } }
+        }
+        return { data: { success: true, data: { items: [] } } }
+      })
+      let finish!: (response: Awaited<ReturnType<typeof api.put>>) => void
+      const pending = new Promise<Awaited<ReturnType<typeof api.put>>>(
+        (resolve) => {
+          finish = resolve
+        }
+      )
+      const put = vi.spyOn(api, 'put').mockReturnValue(pending)
+      const close = vi.fn()
+      const client = renderDrawer(model, close)
+      const user = userEvent.setup()
+      await waitFor(() =>
+        expect(screen.getByLabelText('Description')).toHaveValue('Original')
+      )
+      await user.click(screen.getByRole('tab', { name: 'Capabilities' }))
+      const contextLength = screen.getByRole('textbox', {
+        name: 'Context length (tokens)',
+      })
+      await user.type(contextLength, '8192')
+      await user.click(
+        screen.getByRole('button', { name: 'Save capabilities' })
+      )
+      await waitFor(() => expect(put).toHaveBeenCalledOnce())
+      for (const input of [
+        ...screen.getAllByRole('textbox'),
+        ...screen.getAllByRole('combobox'),
+      ]) {
+        expect(input).toBeDisabled()
+      }
+      await user.type(contextLength, '9')
+      expect(contextLength).toHaveValue('8192')
+      expect(put.mock.calls[0][1]).toMatchObject({
+        capabilities: { limits: { context_length: 8192 } },
+      })
+      await act(async () => {
+        finish({
+          data: {
+            success: outcome === 'success',
+            message: 'Declaration rejected',
+          },
+        })
+      })
+      await waitFor(() =>
+        expect(
+          screen.getByRole('button', { name: 'Save capabilities' })
+        ).toBeEnabled()
+      )
+      expect(contextLength).toBeEnabled()
+      expect(contextLength).toHaveValue('8192')
+      if (outcome === 'rejection') {
+        expect(screen.getByRole('alert')).toHaveTextContent(
+          'Declaration rejected'
+        )
+      } else {
+        await user.click(screen.getAllByRole('button', { name: 'Close' })[0])
+        expect(close).toHaveBeenCalledWith(false)
+        expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+        close.mockClear()
+        await user.type(contextLength, '9')
+        expect(contextLength).toHaveValue('81929')
+      }
+      await user.click(screen.getAllByRole('button', { name: 'Close' })[0])
+      expect(await screen.findByRole('alertdialog')).toHaveTextContent(
+        'Discard unsaved changes?'
+      )
+      expect(close).not.toHaveBeenCalled()
+      client.clear()
+    }
+  )
+
+  it('saves the declared capabilities with the saved metadata through the admin API', async () => {
+    const declared = {
+      ...model,
+      capabilities: {
+        features: ['streaming' as const],
+        input_modalities: ['text' as const],
+        output_modalities: ['text' as const],
+        limits: { context_length: 8192 },
+      },
+    }
+    vi.spyOn(api, 'get').mockImplementation(async (url) => {
+      if (url === '/api/models/7') {
+        return { data: { success: true, data: declared } }
+      }
+      return { data: { success: true, data: { items: [] } } }
+    })
+    const put = vi
+      .spyOn(api, 'put')
+      .mockResolvedValue({ data: { success: true, data: { id: 7 } } })
+    const client = renderDrawer(declared)
+    const user = userEvent.setup()
+    const tab = screen.getByRole('tab', { name: 'Capabilities' })
+    await waitFor(() =>
+      expect(tab).not.toHaveAttribute('aria-disabled', 'true')
+    )
+    await user.click(tab)
+
+    const features = await screen.findByRole('combobox', {
+      name: 'Select features',
+    })
+    await user.click(features)
+    await user.click(
+      await screen.findByRole('option', { name: 'Tool calling' })
+    )
+    await user.keyboard('{Escape}')
+    await user.click(
+      screen.getByRole('combobox', { name: 'Select input modalities' })
+    )
+    await user.click(await screen.findByRole('option', { name: 'PDF' }))
+    await user.keyboard('{Escape}')
+    const contextLength = screen.getByRole('textbox', {
+      name: 'Context length (tokens)',
+    })
+    await user.clear(contextLength)
+    await user.type(contextLength, '128000')
+    await user.type(
+      screen.getByRole('textbox', { name: 'Max output tokens' }),
+      '16384'
+    )
+    await user.click(screen.getByRole('button', { name: 'Save capabilities' }))
+
+    await waitFor(() =>
+      expect(put).toHaveBeenCalledWith(
+        '/api/admin/v1/models/7',
+        {
+          name: 'example-model',
+          publisher_id: 3,
+          description: 'Original',
+          icon: '',
+          tags: '',
+          endpoints: '',
+          status: 1,
+          sync_official: 1,
+          capabilities: {
+            features: ['streaming', 'tool_calling'],
+            input_modalities: ['text', 'pdf'],
+            output_modalities: ['text'],
+            limits: { context_length: 128000, max_output_tokens: 16384 },
+          },
+        },
+        { skipBusinessError: true, skipErrorHandler: true }
+      )
+    )
+    client.clear()
+  })
+
+  it('rejects a limit that is not a positive integer without saving', async () => {
+    vi.spyOn(api, 'get').mockImplementation(async (url) => {
+      if (url === '/api/models/7') {
+        return { data: { success: true, data: model } }
+      }
+      return { data: { success: true, data: { items: [] } } }
+    })
+    const put = vi.spyOn(api, 'put')
+    const client = renderDrawer(model)
+    const user = userEvent.setup()
+    const tab = screen.getByRole('tab', { name: 'Capabilities' })
+    await waitFor(() =>
+      expect(tab).not.toHaveAttribute('aria-disabled', 'true')
+    )
+    await user.click(tab)
+    const maxImages = await screen.findByRole('textbox', { name: 'Max images' })
+    await user.type(maxImages, '0')
+    await user.click(screen.getByRole('button', { name: 'Save capabilities' }))
+
+    expect(await screen.findByText('Enter a positive integer')).toBeVisible()
+    expect(maxImages).toHaveAttribute('aria-invalid', 'true')
+    expect(put).not.toHaveBeenCalled()
+    client.clear()
+  })
+
+  it.each([
+    ['the first unsafe integer', '9007199254740992'],
+    ['an integer that would be rounded', '9007199254740993'],
+    ['an integer that would become Infinity', `1${'0'.repeat(309)}`],
+  ])(
+    'rejects %s in every capability limit without saving',
+    async (_, value) => {
+      vi.spyOn(api, 'get').mockImplementation(async (url) => {
+        if (url === '/api/models/7') {
+          return { data: { success: true, data: model } }
+        }
+        return { data: { success: true, data: { items: [] } } }
+      })
+      const put = vi
+        .spyOn(api, 'put')
+        .mockResolvedValue({ data: { success: true } })
+      const client = renderDrawer(model)
+      const user = userEvent.setup()
+      const tab = screen.getByRole('tab', { name: 'Capabilities' })
+      await waitFor(() =>
+        expect(tab).not.toHaveAttribute('aria-disabled', 'true')
+      )
+      await user.click(tab)
+      const labels = [
+        'Context length (tokens)',
+        'Max output tokens',
+        'Max images',
+        'Max duration (seconds)',
+        'Embedding dimensions',
+      ]
+      for (const name of labels) {
+        await user.click(screen.getByRole('textbox', { name }))
+        await user.paste(value)
+      }
+      await user.click(
+        screen.getByRole('button', { name: 'Save capabilities' })
+      )
+
+      expect(
+        await screen.findAllByText(
+          'Enter an integer no greater than 9007199254740991'
+        )
+      ).toHaveLength(5)
+      for (const name of labels) {
+        expect(screen.getByRole('textbox', { name })).toHaveAttribute(
+          'aria-invalid',
+          'true'
+        )
+      }
+      expect(put).not.toHaveBeenCalled()
+      client.clear()
+    }
+  )
+
+  it.each([
+    ['the smallest positive integer', '1', 1],
+    ['the largest safe integer', '9007199254740991', 9007199254740991],
+    ['surrounding whitespace', ' 8192 ', 8192],
+    ['an undeclared limit', ' ', undefined],
+  ])('preserves %s in every limit when saving', async (_, value, expected) => {
+    vi.spyOn(api, 'get').mockImplementation(async (url) => {
+      if (url === '/api/models/7') {
+        return { data: { success: true, data: model } }
+      }
+      return { data: { success: true, data: { items: [] } } }
+    })
+    const put = vi
+      .spyOn(api, 'put')
+      .mockResolvedValue({ data: { success: true } })
+    const client = renderDrawer(model)
+    const user = userEvent.setup()
+    const tab = screen.getByRole('tab', { name: 'Capabilities' })
+    await waitFor(() =>
+      expect(tab).not.toHaveAttribute('aria-disabled', 'true')
+    )
+    await user.click(tab)
+    for (const name of [
+      'Context length (tokens)',
+      'Max output tokens',
+      'Max images',
+      'Max duration (seconds)',
+      'Embedding dimensions',
+    ]) {
+      await user.click(screen.getByRole('textbox', { name }))
+      await user.paste(value)
+    }
+    await user.click(screen.getByRole('button', { name: 'Save capabilities' }))
+
+    await waitFor(() => expect(put).toHaveBeenCalledOnce())
+    const payload = put.mock.calls[0][1] as {
+      capabilities: Model['capabilities']
+    }
+    const expectedLimits =
+      expected === undefined
+        ? {}
+        : {
+            context_length: expected,
+            max_output_tokens: expected,
+            max_images: expected,
+            max_duration_seconds: expected,
+            embedding_dimensions: expected,
+          }
+    expect(payload.capabilities?.limits).toEqual(expectedLimits)
+    const serialized = JSON.stringify(payload)
+    expect(JSON.parse(serialized).capabilities.limits).toEqual(expectedLimits)
+    client.clear()
+  })
+
+  it('shows the server reason when the admin API rejects the declaration', async () => {
+    vi.spyOn(api, 'get').mockImplementation(async (url) => {
+      if (url === '/api/models/7') {
+        return { data: { success: true, data: { ...model, vendor_id: 0 } } }
+      }
+      return { data: { success: true, data: { items: [] } } }
+    })
+    const error = new AxiosError('Request failed with status code 400')
+    error.response = {
+      data: {
+        success: false,
+        message: 'Publisher is required',
+        message_key: 'Publisher is required',
+      },
+      status: 400,
+      statusText: 'Bad Request',
+      headers: {},
+      config: { headers: {} },
+    } as typeof error.response
+    vi.spyOn(api, 'put').mockRejectedValue(error)
+    const client = renderDrawer(model)
+    const user = userEvent.setup()
+    const tab = screen.getByRole('tab', { name: 'Capabilities' })
+    await waitFor(() =>
+      expect(tab).not.toHaveAttribute('aria-disabled', 'true')
+    )
+    await user.click(tab)
+    await user.click(
+      await screen.findByRole('button', { name: 'Save capabilities' })
+    )
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Publisher is required'
+    )
+    client.clear()
+  })
+
+  it('disables capabilities for a matching rule', async () => {
+    const rule = { ...model, name_rule: 1 }
+    vi.spyOn(api, 'get').mockImplementation(async (url) => {
+      if (url === '/api/models/7') {
+        return { data: { success: true, data: rule } }
+      }
+      return { data: { success: true, data: { items: [] } } }
+    })
+    const client = renderDrawer(rule)
+    expect(await screen.findByLabelText('Description')).toHaveValue('Original')
+    expect(screen.getByRole('tab', { name: 'Capabilities' })).toHaveAttribute(
+      'aria-disabled',
+      'true'
     )
     client.clear()
   })

@@ -84,6 +84,11 @@ var auditRouteActions = map[string]string{
 	"DELETE /api/models/:id":         "model.delete",
 	"POST /api/models/sync_upstream": "model.sync_upstream",
 
+	// 管理 API：模型
+	"POST /api/admin/v1/models":       "model.create",
+	"PUT /api/admin/v1/models/:id":    "model.update",
+	"DELETE /api/admin/v1/models/:id": "model.delete",
+
 	// 部署
 	"POST /api/deployments/":      "deployment.create",
 	"PUT /api/deployments/:id":    "deployment.update",
@@ -96,6 +101,11 @@ var auditRouteActions = map[string]string{
 
 	// 日志
 	"POST /api/system-task/log-cleanup": "log.cleanup_start",
+
+	// 钱包与账目
+	"POST /api/admin/v1/user-wallets/:user_id/top-ups":     "wallet.top_up",
+	"POST /api/admin/v1/user-wallets/:user_id/adjustments": "wallet.adjust",
+	"POST /api/admin/v1/ledger-entries/:id/reversal":       "wallet.reverse_entry",
 }
 
 // beginAdminAudit 在管理/root 写操作进入 handler 前包装 ResponseWriter，

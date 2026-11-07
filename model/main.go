@@ -143,6 +143,9 @@ func OpenDSN(envName string, dsn string, isLog bool) (*gorm.DB, common.DatabaseT
 }
 
 func InitDB() (err error) {
+	if err := InitSettlementCurrency(); err != nil {
+		return err
+	}
 	db, _, err := OpenDSN("SQL_DSN", os.Getenv("SQL_DSN"), false)
 	if err == nil {
 		if common.DebugEnabled {
@@ -307,6 +310,9 @@ func migrateDB() error {
 	)
 	if err != nil {
 		return err
+	}
+	if err := migrateWalletLedger(DB); err != nil {
+		return fmt.Errorf("migrate wallet ledger: %w", err)
 	}
 	if err := InitializeUserAuthVersions(); err != nil {
 		return err

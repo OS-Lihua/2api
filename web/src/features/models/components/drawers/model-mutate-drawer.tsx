@@ -81,6 +81,7 @@ import {
   type ModelFormValues,
 } from '../../lib/model-form'
 import type { Model } from '../../types'
+import { ModelCapabilitiesPanel } from '../model-capabilities-panel'
 import { ModelConnections } from '../model-connections'
 
 export function ModelMutateDrawer(props: {
@@ -109,6 +110,8 @@ export function ModelMutateDrawer(props: {
     props.initialSection === 'pricing'
   )
   const [pricingDirty, setPricingDirty] = useState(false)
+  const [capabilitiesVisited, setCapabilitiesVisited] = useState(false)
+  const [capabilitiesDirty, setCapabilitiesDirty] = useState(false)
   const [pendingPricingName, setPendingPricingName] = useState<string | null>(
     null
   )
@@ -141,6 +144,12 @@ export function ModelMutateDrawer(props: {
     enabled: props.open && isEditing,
   })
   const savedModel = modelQuery.data ?? currentRow
+  // Capabilities belong to a saved exact-name Model; rule rows only match
+  // catalog names.
+  const capabilitiesModel =
+    savedModel?.id && savedModel.name_rule === 0 && modelQuery.data
+      ? modelQuery.data
+      : null
 
   useEffect(() => {
     if (!props.open) return
@@ -148,6 +157,8 @@ export function ModelMutateDrawer(props: {
     setPricingVisited(props.initialSection === 'pricing')
     setPricingName('')
     setPricingDirty(false)
+    setCapabilitiesVisited(false)
+    setCapabilitiesDirty(false)
     setPendingPricingName(null)
     setCloseConfirm(false)
   }, [
@@ -214,7 +225,7 @@ export function ModelMutateDrawer(props: {
         queryClient.invalidateQueries({ queryKey: vendorsQueryKeys.all }),
       ])
       toast.success(t('Model metadata saved'))
-      if (!pricingDirty) props.onOpenChange(false)
+      if (!pricingDirty && !capabilitiesDirty) props.onOpenChange(false)
     },
     onError: (error) => {
       form.setError('root.server', {
@@ -234,7 +245,7 @@ export function ModelMutateDrawer(props: {
   const metadataDirty = form.formState.isDirty
   const close = (open: boolean) => {
     if (!open && isSubmitting) return
-    if (!open && (metadataDirty || pricingDirty)) {
+    if (!open && (metadataDirty || pricingDirty || capabilitiesDirty)) {
       setCloseConfirm(true)
       return
     }
@@ -262,15 +273,23 @@ export function ModelMutateDrawer(props: {
             onValueChange={(value) => {
               setSection(value)
               if (value === 'pricing') setPricingVisited(true)
+              if (value === 'capabilities') setCapabilitiesVisited(true)
             }}
             className='shrink-0 px-4'
           >
-            <TabsList className='grid w-full grid-cols-3 group-data-horizontal/tabs:h-auto'>
+            <TabsList className='grid w-full grid-cols-4 group-data-horizontal/tabs:h-auto'>
               <TabsTrigger
                 value='metadata'
                 className='h-auto min-w-0 whitespace-normal'
               >
                 {t('Model metadata')}
+              </TabsTrigger>
+              <TabsTrigger
+                value='capabilities'
+                disabled={!capabilitiesModel}
+                className='h-auto min-w-0 whitespace-normal'
+              >
+                {t('Capabilities')}
               </TabsTrigger>
               <TabsTrigger
                 value='pricing'
@@ -385,7 +404,7 @@ export function ModelMutateDrawer(props: {
                         name='vendor_id'
                         render={({ field }) => (
                           <FormItem>
-                            <FormLabel>{t('Vendor')}</FormLabel>
+                            <FormLabel>{t('Publisher')}</FormLabel>
                             <FormControl>
                               <Combobox
                                 options={vendors.map((vendor) => ({
@@ -399,7 +418,7 @@ export function ModelMutateDrawer(props: {
                                 }
                                 value={field.value ? String(field.value) : null}
                                 className='w-full'
-                                placeholder={t('Select vendor')}
+                                placeholder={t('Select publisher')}
                               />
                             </FormControl>
                             <FormMessage />
@@ -619,6 +638,22 @@ export function ModelMutateDrawer(props: {
                 </Button>
               </SheetFooter>
             </>
+          )}
+          {props.open && capabilitiesVisited && capabilitiesModel && (
+            <div
+              className={
+                section === 'capabilities'
+                  ? 'flex min-h-0 flex-1 flex-col'
+                  : 'hidden'
+              }
+            >
+              <ModelCapabilitiesPanel
+                key={capabilitiesModel.id}
+                model={capabilitiesModel}
+                onDirtyChange={setCapabilitiesDirty}
+                onClose={() => close(false)}
+              />
+            </div>
           )}
           {props.open && pricingVisited && savedModel && (
             <div
