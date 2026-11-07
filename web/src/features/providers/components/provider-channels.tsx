@@ -1,0 +1,215 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { useMutation, useQuery } from '@tanstack/react-query'
+import type { ColumnDef } from '@tanstack/react-table'
+import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
+
+import { ConfirmDialog } from '@/components/confirm-dialog'
+import { DataTablePage, useDataTable } from '@/components/data-table'
+import { ErrorState } from '@/components/error-state'
+import { StatusBadge } from '@/components/status-badge'
+import { Button } from '@/components/ui/button'
+import {
+  hasPermission,
+  ADMIN_PERMISSION_RESOURCES,
+  ADMIN_PERMISSION_ACTIONS,
+} from '@/lib/admin-permissions'
+import { useAuthStore } from '@/stores/auth-store'
+
+import {
+  channelAction,
+  channelKeys,
+  listSingleModelChannels,
+  type SingleModelChannel,
+} from '../channel-api'
+import { ChannelMutateDrawer } from './channel-mutate-drawer'
+
+export function ProviderChannels(props: { providerId: number }) {
+  const { t } = useTranslation()
+  const user = useAuthStore((state) => state.auth.user)
+  const canWrite = hasPermission(
+    user,
+    ADMIN_PERMISSION_RESOURCES.CHANNEL,
+    ADMIN_PERMISSION_ACTIONS.WRITE
+  )
+  const canOperate = hasPermission(
+    user,
+    ADMIN_PERMISSION_RESOURCES.CHANNEL,
+    ADMIN_PERMISSION_ACTIONS.OPERATE
+  )
+  const [pagination, setPagination] = useState({ pageIndex: 0, pageSize: 10 })
+  const [editing, setEditing] = useState<SingleModelChannel | null | undefined>(
+    undefined
+  )
+  const [operation, setOperation] = useState<{
+    channel: SingleModelChannel
+    action: string
+  } | null>(null)
+  const query = useQuery({
+    queryKey: channelKeys.list(props.providerId, pagination.pageIndex + 1),
+    queryFn: () =>
+      listSingleModelChannels(props.providerId, pagination.pageIndex + 1),
+  })
+  const mutation = useMutation({
+    mutationFn: async () => {
+      if (operation) await channelAction(operation.channel.id, operation.action)
+    },
+    onSuccess: async () => {
+      setOperation(null)
+      await query.refetch()
+    },
+  })
+  const columns: ColumnDef<SingleModelChannel>[] = [
+    {
+      accessorKey: 'upstream_model_name',
+      header: t('Upstream model name'),
+      meta: { mobileTitle: true },
+    },
+    { accessorKey: 'protocol', header: t('Protocol') },
+    { accessorKey: 'model_id', header: t('Model ID') },
+    {
+      accessorKey: 'status',
+      header: t('Status'),
+      cell: ({ row }) => (
+        <StatusBadge
+          label={t(
+            {
+              pending: 'Pending confirmation',
+              enabled: 'Enabled',
+              disabled: 'Disabled',
+            }[row.original.status]
+          )}
+          variant={row.original.status === 'enabled' ? 'success' : 'neutral'}
+          copyable={false}
+        />
+      ),
+    },
+    {
+      id: 'actions',
+      header: t('Actions'),
+      cell: ({ row }) => (
+        <div className='flex flex-wrap gap-2'>
+          {canWrite && (
+            <Button
+              size='sm'
+              variant='outline'
+              onClick={() => setEditing(row.original)}
+            >
+              {t('Edit')}
+            </Button>
+          )}
+          {canOperate && !row.original.mapping_confirmed && (
+            <Button
+              size='sm'
+              variant='outline'
+              onClick={() =>
+                setOperation({ channel: row.original, action: 'confirm' })
+              }
+            >
+              {t('Confirm mapping')}
+            </Button>
+          )}
+          {canOperate && row.original.mapping_confirmed && (
+            <Button
+              size='sm'
+              variant='outline'
+              onClick={() =>
+                setOperation({
+                  channel: row.original,
+                  action:
+                    row.original.status === 'enabled' ? 'disable' : 'enable',
+                })
+              }
+            >
+              {row.original.status === 'enabled' ? t('Disable') : t('Enable')}
+            </Button>
+          )}
+          {canWrite && (
+            <Button
+              size='sm'
+              variant='destructive'
+              onClick={() =>
+                setOperation({ channel: row.original, action: 'delete' })
+              }
+            >
+              {t('Delete')}
+            </Button>
+          )}
+        </div>
+      ),
+    },
+  ]
+  const { table } = useDataTable({
+    data: query.data?.items ?? [],
+    columns,
+    getRowId: (row) => String(row.id),
+    pagination,
+    onPaginationChange: setPagination,
+    manualPagination: true,
+    totalCount: query.data?.total ?? 0,
+  })
+  return (
+    <section className='space-y-3 p-4' aria-label={t('Channels')}>
+      <div className='flex items-center justify-between'>
+        <h3 className='font-semibold'>{t('Channels')}</h3>
+        {canWrite && (
+          <Button size='sm' onClick={() => setEditing(null)}>
+            {t('New Channel')}
+          </Button>
+        )}
+      </div>
+      {query.isError ? (
+        <ErrorState onRetry={() => void query.refetch()} />
+      ) : (
+        <DataTablePage
+          table={table}
+          columns={columns}
+          fixedHeight={false}
+          paginationInFooter={false}
+          compactPagination
+          isLoading={query.isLoading}
+          emptyTitle={t('No channels found')}
+        />
+      )}
+      {editing !== undefined && (
+        <ChannelMutateDrawer
+          providerId={props.providerId}
+          channel={editing ?? undefined}
+          onClose={() => setEditing(undefined)}
+          onSaved={() => {
+            setEditing(undefined)
+            void query.refetch()
+          }}
+        />
+      )}
+      <ConfirmDialog
+        open={operation !== null}
+        onOpenChange={(open) => {
+          if (!open && !mutation.isPending) setOperation(null)
+        }}
+        title={t('Confirm channel change')}
+        desc={operation?.channel.upstream_model_name ?? ''}
+        destructive={operation?.action === 'delete'}
+        isLoading={mutation.isPending}
+        handleConfirm={() => mutation.mutate()}
+      />
+    </section>
+  )
+}

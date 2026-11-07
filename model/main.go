@@ -272,6 +272,7 @@ func migrateDB() error {
 
 	err := DB.AutoMigrate(
 		&Provider{},
+		&Channel{},
 		&Token{},
 		&User{},
 		&UserSession{},

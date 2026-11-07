@@ -65,7 +65,7 @@ func modelManagementDB(t *testing.T) *gorm.DB {
 	database := model.UseTestDatabases(t)
 	model.LOG_DB = database
 	common.SetLogDatabaseType(common.DatabaseTypePostgreSQL)
-	require.NoError(t, database.AutoMigrate(&model.Model{}, &model.Vendor{}, &model.Provider{}, &model.Ability{}, &model.Option{}, &model.User{}, &model.AuditLog{}))
+	require.NoError(t, database.AutoMigrate(&model.Model{}, &model.Vendor{}, &model.Provider{}, &model.Channel{}, &model.Ability{}, &model.Option{}, &model.User{}, &model.AuditLog{}))
 	for _, value := range restoreRatios {
 		require.NoError(t, value.restore("{}"))
 	}

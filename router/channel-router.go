@@ -64,6 +64,26 @@ func registerProviderRoutes(apiRouter *gin.RouterGroup) {
 	}
 }
 
+func registerSingleModelChannelRoutes(apiRouter *gin.RouterGroup) {
+	group := apiRouter.Group("/admin/v1/channels", middleware.AdminAuth())
+	for _, route := range singleModelChannelRoutes {
+		handlePermissionRoute(group, route.method, route.path, route.permission, route.handler)
+	}
+}
+
+var singleModelChannelRoutes = []permissionRoute{
+	{http.MethodGet, "", authz.ChannelRead, controller.ListSingleModelChannels},
+	{http.MethodPost, "", authz.ChannelWrite, controller.SaveSingleModelChannel},
+	{http.MethodGet, "/protocols", authz.ChannelRead, controller.ChannelProtocolOptions},
+    {http.MethodGet, "/suggest-models", authz.ChannelRead, controller.SuggestChannelModels},
+	{http.MethodGet, "/:id", authz.ChannelRead, controller.GetSingleModelChannel},
+	{http.MethodPatch, "/:id", authz.ChannelWrite, controller.SaveSingleModelChannel},
+	{http.MethodDelete, "/:id", authz.ChannelWrite, controller.DeleteSingleModelChannel},
+	{http.MethodPost, "/:id/confirm", authz.ChannelOperate, controller.ConfirmSingleModelChannel},
+	{http.MethodPost, "/:id/enable", authz.ChannelOperate, controller.EnableSingleModelChannel},
+	{http.MethodPost, "/:id/disable", authz.ChannelOperate, controller.DisableSingleModelChannel},
+}
+
 var providerPermissionRoutes = []permissionRoute{
 	{method: http.MethodGet, path: "", permission: authz.ChannelRead, handler: controller.ListProviders},
 	{method: http.MethodPost, path: "", permission: authz.ChannelSensitiveWrite, handler: controller.CreateProvider},
