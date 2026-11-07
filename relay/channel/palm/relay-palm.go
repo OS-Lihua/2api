@@ -1,7 +1,7 @@
 package palm
 
 import (
-	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 
@@ -50,55 +50,32 @@ func streamResponsePaLM2OpenAI(palmResponse *PaLMChatResponse) *dto.ChatCompleti
 	return &response
 }
 
-func palmStreamHandler(c *gin.Context, resp *http.Response) (*types.NewAPIError, string) {
-	responseText := ""
-	responseId := helper.GetResponseID(c)
-	createdTime := common.GetTimestamp()
-	dataChan := make(chan string)
-	stopChan := make(chan bool)
-	go func() {
-		responseBody, err := io.ReadAll(resp.Body)
-		if err != nil {
-			common.SysLog(common.LogText("error reading stream response: %s", err.Error()))
-			stopChan <- true
-			return
-		}
-		service.CloseResponseBodyGracefully(resp)
-		var palmResponse PaLMChatResponse
-		err = json.Unmarshal(responseBody, &palmResponse)
-		if err != nil {
-			common.SysLog(common.LogText("error unmarshalling stream response: %s", err.Error()))
-			stopChan <- true
-			return
-		}
-		fullTextResponse := streamResponsePaLM2OpenAI(&palmResponse)
-		fullTextResponse.Id = responseId
-		fullTextResponse.Created = createdTime
-		if len(palmResponse.Candidates) > 0 {
-			responseText = palmResponse.Candidates[0].Content
-		}
-		jsonResponse, err := json.Marshal(fullTextResponse)
-		if err != nil {
-			common.SysLog(common.LogText("error marshalling stream response: %s", err.Error()))
-			stopChan <- true
-			return
-		}
-		dataChan <- string(jsonResponse)
-		stopChan <- true
-	}()
+func palmStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, string) {
+	defer service.CloseResponseBodyGracefully(resp)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeReadResponseBodyFailed), ""
+	}
+	var palmResponse PaLMChatResponse
+	if err := common.Unmarshal(body, &palmResponse); err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponseBody), ""
+	}
+	if resp.StatusCode != http.StatusOK || palmResponse.Error.Code != 0 || len(palmResponse.Candidates) == 0 {
+		return types.NewError(fmt.Errorf("PaLM response failed"), types.ErrorCodeBadResponse), ""
+	}
+	response := streamResponsePaLM2OpenAI(&palmResponse)
+	response.Id, response.Created = helper.GetResponseID(c), common.GetTimestamp()
+	if info.StreamStatus == nil {
+		info.StreamStatus = relaycommon.NewStreamStatus()
+	}
 	helper.SetEventStreamHeaders(c)
-	c.Stream(func(w io.Writer) bool {
-		select {
-		case data := <-dataChan:
-			c.Render(-1, common.CustomEvent{Data: "data: " + data})
-			return true
-		case <-stopChan:
-			c.Render(-1, common.CustomEvent{Data: "data: [DONE]"})
-			return false
-		}
-	})
-	service.CloseResponseBodyGracefully(resp)
-	return nil, responseText
+	if err := helper.SendChatChunk(c, info, response); err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponse), palmResponse.Candidates[0].Content
+	}
+	info.StreamStatus.MarkCompleted()
+	info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
+	helper.Done(c)
+	return nil, palmResponse.Candidates[0].Content
 }
 
 func palmHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
@@ -108,7 +85,7 @@ func palmHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 	}
 	service.CloseResponseBodyGracefully(resp)
 	var palmResponse PaLMChatResponse
-	err = json.Unmarshal(responseBody, &palmResponse)
+	err = common.Unmarshal(responseBody, &palmResponse)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
@@ -121,6 +98,9 @@ func palmHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 		}, resp.StatusCode)
 	}
 	fullTextResponse := responsePaLM2OpenAI(&palmResponse)
+	if info.ResponseFacts != nil {
+		return helper.WriteChatResponse(c, info, resp, fullTextResponse)
+	}
 	usage := service.ResponseText2Usage(c, palmResponse.Candidates[0].Content, info.UpstreamModelName, info.GetEstimatePromptTokens())
 	fullTextResponse.Usage = *usage
 	jsonResponse, err := common.Marshal(fullTextResponse)

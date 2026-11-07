@@ -37,6 +37,12 @@ type AudioRequestProjector interface {
 	ProjectAudioRequest([]byte, dto.AudioRequest) (*dto.AudioRequest, error)
 }
 
+// ChatRequestPreparer resolves Provider-managed request data after reservation.
+// The selected wire DTO retains its own upload and request format.
+type ChatRequestPreparer interface {
+	PrepareChatRequest(*gin.Context, *relaycommon.RelayInfo, []byte) ([]byte, error)
+}
+
 // ChatOutputLimitSetter applies a validated default to a native wire body.
 type ChatOutputLimitSetter interface {
 	SetChatOutputLimit([]byte, uint) ([]byte, error)

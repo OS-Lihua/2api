@@ -84,7 +84,9 @@ func OpenaiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 			info.ResponseFacts.DownstreamWriteFailed = true
 			return &usageResp.Usage, types.NewError(writeErr, types.ErrorCodeBadResponse)
 		}
-		info.ResponseFacts.BusinessOutput = count > 0
+		if count > 0 {
+			info.ResponseFacts.MarkBusinessOutput()
+		}
 	}
 
 	normalizeOpenAIUsage(&usageResp.Usage)
@@ -238,7 +240,7 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 		if info.ResponseFacts != nil {
 			var flushErr *helper.StreamFlushError
 			if (writeErr == nil || errors.As(writeErr, &flushErr)) && (openaiImageDataHasField(ojson.Parse(data), "url") || openaiImageDataHasField(ojson.Parse(data), "b64_json")) {
-				info.ResponseFacts.BusinessOutput = true
+				info.ResponseFacts.MarkBusinessOutput()
 			}
 			if writeErr != nil {
 				info.ResponseFacts.DownstreamWriteFailed = true
@@ -432,7 +434,7 @@ func openaiImageJSONAsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 		if info.ResponseFacts != nil {
 			var flushErr *helper.StreamFlushError
 			if writeErr == nil || errors.As(writeErr, &flushErr) {
-				info.ResponseFacts.BusinessOutput = true
+				info.ResponseFacts.MarkBusinessOutput()
 			}
 			info.ResponseFacts.DownstreamWriteFailed = writeErr != nil
 		}

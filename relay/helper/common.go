@@ -5,14 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -298,6 +301,89 @@ func ObjectData(c *gin.Context, object any) error {
 		return fmt.Errorf("error marshalling object: %w", err)
 	}
 	return StringData(c, string(jsonData))
+}
+
+// SendChatChunk records only complete business frames accepted downstream.
+// A flush failure after the frame is distinct from a partial frame write.
+func SendChatChunk(c *gin.Context, info *relaycommon.RelayInfo, response *dto.ChatCompletionsStreamResponse) error {
+	err := ObjectData(c, response)
+	facts := info.ResponseFacts
+	if facts == nil {
+		return err
+	}
+	if err != nil {
+		facts.DownstreamWriteFailed = true
+		var flushErr *StreamFlushError
+		if !errors.As(err, &flushErr) {
+			return err
+		}
+	}
+	for _, choice := range response.Choices {
+		text := choice.Delta.GetContentString() + choice.Delta.GetReasoningContent()
+		for _, call := range choice.Delta.ToolCalls {
+			text += call.Function.Name + call.Function.Arguments
+		}
+		if text != "" || len(choice.Delta.ToolCalls) > 0 {
+			facts.GeneratedText += text
+			facts.MarkBusinessOutput()
+		}
+	}
+	return err
+}
+
+// EstimateMissingChatUsage fills only counters absent from the provider facts.
+func EstimateMissingChatUsage(c *gin.Context, info *relaycommon.RelayInfo, usage *dto.Usage) {
+	facts := info.ResponseFacts
+	if facts == nil || facts.UsageReported {
+		return
+	}
+	estimated := service.ResponseText2Usage(c, facts.GeneratedText, info.TokenizerModelName(), info.GetEstimatePromptTokens())
+	if !facts.PromptTokensReported {
+		usage.PromptTokens = estimated.PromptTokens
+	}
+	if !facts.CompletionTokensReported {
+		usage.CompletionTokens = estimated.CompletionTokens
+	}
+	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+}
+
+// WriteChatResponse records delivery of an already converted native response.
+// Provider parsers must record counter presence before calling this function.
+func WriteChatResponse(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response, response *dto.OpenAITextResponse) (*dto.Usage, *types.NewAPIError) {
+	facts := info.ResponseFacts
+	if resp.StatusCode != http.StatusOK {
+		return &response.Usage, types.NewErrorWithStatusCode(errors.New("upstream request failed"), types.ErrorCodeBadResponse, resp.StatusCode)
+	}
+	var output strings.Builder
+	business := false
+	for _, choice := range response.Choices {
+		output.WriteString(choice.Message.StringContent())
+		output.WriteString(choice.Message.GetReasoningContent())
+		for _, call := range choice.Message.ParseToolCalls() {
+			business = true
+			output.WriteString(call.Function.Name)
+			output.WriteString(call.Function.Arguments)
+			output.Write(call.Custom)
+		}
+	}
+	facts.GeneratedText = output.String()
+	EstimateMissingChatUsage(c, info, &response.Usage)
+	encoded, err := common.Marshal(response)
+	if err != nil {
+		return &response.Usage, types.NewError(err, types.ErrorCodeBadResponseBody)
+	}
+	if err := c.Request.Context().Err(); err != nil {
+		return &response.Usage, types.NewError(err, types.ErrorCodeBadResponse)
+	}
+	c.Header("Content-Type", "application/json")
+	if err := service.IOCopyBytesGracefully(c, resp, encoded); err != nil {
+		facts.DownstreamWriteFailed = true
+		return &response.Usage, types.NewError(err, types.ErrorCodeBadResponse)
+	}
+	if business || facts.GeneratedText != "" {
+		facts.MarkBusinessOutput()
+	}
+	return &response.Usage, nil
 }
 
 func Done(c *gin.Context) {

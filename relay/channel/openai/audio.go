@@ -144,7 +144,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			writeErr := helper.StringData(c, data)
 			var flushErr *helper.StreamFlushError
 			if business && (writeErr == nil || errors.As(writeErr, &flushErr)) {
-				info.ResponseFacts.BusinessOutput = true
+				info.ResponseFacts.MarkBusinessOutput()
 			}
 			if writeErr != nil {
 				info.ResponseFacts.DownstreamWriteFailed = true
@@ -229,7 +229,9 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		}
 		if info.ResponseFacts != nil {
 			info.ResponseFacts.DownstreamWriteFailed = writeErr != nil || n != len(bodyBytes)
-			info.ResponseFacts.BusinessOutput = !info.ResponseFacts.DownstreamWriteFailed && len(bodyBytes) > 0
+			if !info.ResponseFacts.DownstreamWriteFailed && len(bodyBytes) > 0 {
+				info.ResponseFacts.MarkBusinessOutput()
+			}
 		}
 
 		// 计算音频时长并更新 usage
@@ -363,7 +365,9 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			text = strings.TrimSpace(string(responseBody))
 		}
 		info.ResponseFacts.GeneratedText = text
-		info.ResponseFacts.BusinessOutput = text != ""
+		if text != "" {
+			info.ResponseFacts.MarkBusinessOutput()
+		}
 	}
 	if decodeErr == nil && responseData.Usage != nil {
 		if responseData.Usage.TotalTokens > 0 || info.UpstreamProtocol != "" || info.ResponseFacts != nil {
