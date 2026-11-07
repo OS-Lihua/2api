@@ -218,7 +218,8 @@ func TestKeyPermissionsListDetailAndCall(t *testing.T) {
 	endpoint := fmt.Sprintf("/api/token/%d/permissions", f.token.Id)
 	deniedPolicy := adminSecurityRequest(f.engine, pat, http.MethodPatch, endpoint, `{"action":"deny_all","revision":0}`)
 	require.Equal(t, 200, deniedPolicy.Code, deniedPolicy.Body.String())
-	rejected := adminSecurityRequest(f.engine, pat, http.MethodPatch, endpoint, `{"action":"replace","default_allow":true,"revision":1}`)
+	// PATCH replace must not turn the denied Offering into an allow exception.
+	rejected := adminSecurityRequest(f.engine, pat, http.MethodPatch, endpoint, fmt.Sprintf(`{"action":"replace","default_allow":true,"exception_ids":[%d],"revision":1}`, f.offering.ID))
 	assert.Equal(t, 400, rejected.Code, rejected.Body.String())
 	list = adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, "/v1/models", "")
 	assert.Contains(t, list.Body.String(), `"data":[]`)
