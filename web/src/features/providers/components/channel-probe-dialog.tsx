@@ -1,4 +1,22 @@
-import { useMutation, useQuery } from '@tanstack/react-query'
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { ColumnDef } from '@tanstack/react-table'
 import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -11,49 +29,194 @@ import { Button } from '@/components/ui/button'
 import { getCapabilityFeatureOptions } from '@/features/models/constants'
 import { toIntlLocale } from '@/i18n/languages'
 
-import { listChannelProbes, runChannelProbe, type ChannelProbeResult, type SingleModelChannel } from '../channel-api'
+import {
+  channelKeys,
+  listChannelProbes,
+  runChannelProbe,
+  type ChannelProbeResult,
+  type SingleModelChannel,
+} from '../channel-api'
 
 type ProbeRow = { capability: string; result?: ChannelProbeResult }
 
-export function ChannelProbeDialog(props: { channel: SingleModelChannel; canOperate: boolean; onClose: () => void }) {
+export function ChannelProbeDialog(props: {
+  channel: SingleModelChannel
+  canOperate: boolean
+  onClose: () => void
+}) {
+  const client = useQueryClient()
   const { t, i18n } = useTranslation()
-  const query = useQuery({ queryKey: ['channel-probes', props.channel.id], queryFn: () => listChannelProbes(props.channel.id) })
-  const mutation = useMutation({ mutationFn: (capability: string) => runChannelProbe(props.channel.id, capability), onSuccess: () => query.refetch() })
-  const rows: ProbeRow[] = useMemo(() => (query.data?.capabilities ?? []).map((capability) => ({ capability, result: query.data?.results.find((result) => result.capability === capability) })), [query.data])
+  const query = useQuery({
+    queryKey: ['channel-probes', props.channel.id],
+    queryFn: () => listChannelProbes(props.channel.id),
+  })
+  const { mutate, isPending, variables } = useMutation({
+    mutationFn: (capability: string) =>
+      runChannelProbe(props.channel.id, capability),
+    onSuccess: async () => {
+      await Promise.all([
+        query.refetch(),
+        client.invalidateQueries({ queryKey: channelKeys.all }),
+      ])
+    },
+  })
+  const rows: ProbeRow[] = useMemo(
+    () =>
+      (query.data?.capabilities ?? []).map((capability) => ({
+        capability,
+        result: query.data?.results.find(
+          (result) => result.capability === capability
+        ),
+      })),
+    [query.data]
+  )
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
-  const featureLabels = useMemo(() => new Map(getCapabilityFeatureOptions(t).map((option) => [option.value as string, option.label])), [t])
-  const reasons = useMemo(() => ({
-    verified: t('Capability behavior observed'),
-    behavior_not_observed: t('Capability behavior was not observed'),
-    protocol_unavailable: t('The Provider does not support this protocol'),
-    request_not_representable: t('The probe cannot be represented in this protocol'),
-    credential_unavailable: t('No enabled Provider credential is available'),
-    request_invalid: t('The probe request is invalid'),
-    request_timeout: t('The probe timed out'),
-    transport_failed: t('The upstream connection failed'),
-    response_invalid: t('The upstream response is invalid'),
-    response_interrupted: t('The upstream response was interrupted'),
-    response_too_large: t('The upstream response exceeded the probe limit'),
-    upstream_rejected: t('The upstream rejected the probe'),
-  }) as Record<string, string>, [t])
-  const columns = useMemo<ColumnDef<ProbeRow>[]>(() => [
-    { accessorKey: 'capability', header: t('Capability'), meta: { mobileTitle: true }, cell: ({ row }) => featureLabels.get(row.original.capability) ?? row.original.capability },
-    { id: 'result', header: t('Result'), cell: ({ row }) => {
-      const status = row.original.result?.status
-      let label = t('Not tested')
-      if (status === 'passed') label = t('Success')
-      if (status === 'failed') label = t('Failed')
-      if (status === 'inconclusive') label = t('Inconclusive')
-      if (status === 'running') label = t('Testing...')
-      return <StatusBadge label={label} variant={status === 'passed' ? 'success' : 'neutral'} copyable={false} />
-    } },
-    { id: 'time', header: t('Time'), cell: ({ row }) => row.original.result?.finished_at ? new Date(row.original.result.finished_at * 1000).toLocaleString(locale) : '-' },
-    { id: 'reason', header: t('Details'), cell: ({ row }) => reasons[row.original.result?.reason ?? ''] ?? '-' },
-    { id: 'actions', header: t('Actions'), cell: ({ row }) => props.canOperate && <Button size='sm' variant='outline' aria-label={t('Probe {{capability}}', { capability: featureLabels.get(row.original.capability) ?? row.original.capability })} disabled={mutation.isPending} onClick={() => mutation.mutate(row.original.capability)}>{mutation.isPending && mutation.variables === row.original.capability ? t('Testing...') : t('Test')}</Button> },
-  ], [t, locale, featureLabels, reasons, props.canOperate, mutation.isPending, mutation.variables, mutation.mutate])
-  const { table } = useDataTable({ data: rows, columns, getRowId: (row) => row.capability })
-  return <Dialog open onOpenChange={(open) => { if (!open && !mutation.isPending) props.onClose() }} title={t('Capability probes')} description={t('Results do not change capability declarations. Test requests may incur Provider costs.')} contentClassName='sm:max-w-4xl' footer={<Button variant='outline' disabled={mutation.isPending} onClick={props.onClose}>{t('Close')}</Button>}>
-    <p className='mb-3 break-all text-sm'>{props.channel.upstream_model_name} · {props.channel.protocol}</p>
-    {query.isError ? <ErrorState onRetry={() => void query.refetch()} /> : <DataTablePage table={table} columns={columns} fixedHeight={false} paginationInFooter={false} isLoading={query.isLoading} />}
-  </Dialog>
+  const featureLabels = useMemo(
+    () =>
+      new Map(
+        getCapabilityFeatureOptions(t).map((option) => [
+          option.value as string,
+          option.label,
+        ])
+      ),
+    [t]
+  )
+  const reasons = useMemo(
+    () =>
+      ({
+        probe_interrupted: t('The probe was interrupted'),
+        verified: t('Capability behavior observed'),
+        behavior_not_observed: t('Capability behavior was not observed'),
+        protocol_unavailable: t('The Provider does not support this protocol'),
+        request_not_representable: t(
+          'The probe cannot be represented in this protocol'
+        ),
+        credential_unavailable: t(
+          'No enabled Provider credential is available'
+        ),
+        request_invalid: t('The probe request is invalid'),
+        request_timeout: t('The probe timed out'),
+        transport_failed: t('The upstream connection failed'),
+        response_invalid: t('The upstream response is invalid'),
+        response_interrupted: t('The upstream response was interrupted'),
+        response_too_large: t('The upstream response exceeded the probe limit'),
+        upstream_rejected: t('The upstream rejected the probe'),
+      }) as Record<string, string>,
+    [t]
+  )
+  const columns = useMemo<ColumnDef<ProbeRow>[]>(
+    () => [
+      {
+        accessorKey: 'capability',
+        header: t('Capability'),
+        meta: { mobileTitle: true },
+        cell: ({ row }) =>
+          featureLabels.get(row.original.capability) ?? row.original.capability,
+      },
+      {
+        id: 'result',
+        header: t('Result'),
+        cell: ({ row }) => {
+          const status = row.original.result?.status
+          let label = t('Not tested')
+          if (status === 'passed') label = t('Success')
+          if (status === 'failed') label = t('Failed')
+          if (status === 'inconclusive') label = t('Inconclusive')
+          if (status === 'running') label = t('Testing...')
+          return (
+            <StatusBadge
+              label={label}
+              variant={status === 'passed' ? 'success' : 'neutral'}
+              copyable={false}
+            />
+          )
+        },
+      },
+      {
+        id: 'time',
+        header: t('Time'),
+        cell: ({ row }) =>
+          row.original.result?.finished_at
+            ? new Date(row.original.result.finished_at * 1000).toLocaleString(
+                locale
+              )
+            : '-',
+      },
+      {
+        id: 'reason',
+        header: t('Details'),
+        cell: ({ row }) => reasons[row.original.result?.reason ?? ''] ?? '-',
+      },
+      {
+        id: 'actions',
+        header: t('Actions'),
+        cell: ({ row }) =>
+          props.canOperate && (
+            <Button
+              size='sm'
+              variant='outline'
+              aria-label={t('Probe {{capability}}', {
+                capability:
+                  featureLabels.get(row.original.capability) ??
+                  row.original.capability,
+              })}
+              disabled={isPending}
+              onClick={() => mutate(row.original.capability)}
+            >
+              {isPending && variables === row.original.capability
+                ? t('Testing...')
+                : t('Test')}
+            </Button>
+          ),
+      },
+    ],
+    [
+      t,
+      locale,
+      featureLabels,
+      reasons,
+      props.canOperate,
+      isPending,
+      variables,
+      mutate,
+    ]
+  )
+  const { table } = useDataTable({
+    data: rows,
+    columns,
+    getRowId: (row) => row.capability,
+  })
+  return (
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open && !isPending) props.onClose()
+      }}
+      title={t('Capability probes')}
+      description={t(
+        'Results do not change capability declarations. Test requests may incur Provider costs.'
+      )}
+      contentClassName='sm:max-w-4xl'
+      footer={
+        <Button variant='outline' disabled={isPending} onClick={props.onClose}>
+          {t('Close')}
+        </Button>
+      }
+    >
+      <p className='mb-3 text-sm break-all'>
+        {props.channel.upstream_model_name} · {props.channel.protocol}
+      </p>
+      {query.isError ? (
+        <ErrorState onRetry={() => void query.refetch()} />
+      ) : (
+        <DataTablePage
+          table={table}
+          columns={columns}
+          fixedHeight={false}
+          paginationInFooter={false}
+          isLoading={query.isLoading}
+        />
+      )}
+    </Dialog>
+  )
 }

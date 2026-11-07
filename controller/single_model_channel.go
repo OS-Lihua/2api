@@ -35,7 +35,8 @@ type singleChannelRequest struct {
 
 type singleChannelView struct {
 	model.Channel
-	ParameterOverrides json.RawMessage `json:"parameter_overrides"`
+	ParameterOverrides json.RawMessage           `json:"parameter_overrides"`
+	LatestProbe        *model.ChannelProbeResult `json:"latest_probe,omitempty"`
 }
 
 func channelView(record model.Channel) singleChannelView {
@@ -116,9 +117,27 @@ func ListSingleModelChannels(c *gin.Context) {
 		singleChannelError(c, err)
 		return
 	}
+	ids := make([]int, 0, len(records))
+	for _, record := range records {
+		ids = append(ids, record.ID)
+	}
+	latest := []model.ChannelProbeResult{}
+	if len(ids) > 0 {
+		latestIDs := model.DB.Model(&model.ChannelProbeResult{}).Select("MAX(id)").Where("channel_id IN ?", ids).Group("channel_id")
+		if err := model.DB.Where("id IN (?)", latestIDs).Find(&latest).Error; err != nil {
+			singleChannelError(c, err)
+			return
+		}
+	}
+	byChannel := make(map[int]*model.ChannelProbeResult, len(latest))
+	for i := range latest {
+		byChannel[latest[i].ChannelID] = &latest[i]
+	}
 	items := make([]singleChannelView, 0, len(records))
 	for _, record := range records {
-		items = append(items, channelView(record))
+		view := channelView(record)
+		view.LatestProbe = byChannel[record.ID]
+		items = append(items, view)
 	}
 	common.ApiSuccess(c, gin.H{"items": items, "total": total, "page": page.GetPage(), "page_size": page.GetPageSize()})
 }

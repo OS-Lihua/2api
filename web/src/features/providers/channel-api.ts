@@ -34,6 +34,7 @@ export interface SingleModelChannel {
   tpm: number
   max_concurrency: number
   weight: number
+  latest_probe?: ChannelProbeResult
 }
 export interface ChannelModel {
   id: number
@@ -69,11 +70,16 @@ export interface ChannelProbeResult {
 }
 export async function listChannelProbes(id: number) {
   const response = await api.get(`${path}/${id}/probes`)
-  return requireServerSuccess<{ success: boolean; data: { capabilities: string[]; results: ChannelProbeResult[] } }>(response.data).data
+  return requireServerSuccess<{
+    success: boolean
+    data: { capabilities: string[]; results: ChannelProbeResult[] }
+  }>(response.data).data
 }
 export async function runChannelProbe(id: number, capability: string) {
   const response = await api.post(`${path}/${id}/probes`, { capability })
-  return requireServerSuccess<{ success: boolean; data: ChannelProbeResult }>(response.data).data
+  return requireServerSuccess<{ success: boolean; data: ChannelProbeResult }>(
+    response.data
+  ).data
 }
 export async function channelAction(id: number, action: string) {
   const response =

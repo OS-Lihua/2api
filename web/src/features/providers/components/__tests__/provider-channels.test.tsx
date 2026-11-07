@@ -302,20 +302,83 @@ it('editing a channel clears overrides while saving zero limits and capability n
 it('opens capability probes and shows persisted results before activation', async () => {
   useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
   vi.spyOn(api, 'get').mockImplementation(async (url) => ({
-    data: { success: true, data: url.endsWith('/probes')
-      ? { capabilities: ['streaming', 'tool_calling'], results: [{ id: 1, capability: 'streaming', status: 'passed', reason: 'verified', finished_at: 1794000000 }] }
-      : { items: [{ id: 3, provider_id: 7, model_id: 2, protocol: 'openai_chat', upstream_model_name: 'probe-model', status: 'pending', mapping_confirmed: false }], total: 1 } },
+    data: {
+      success: true,
+      data: url.endsWith('/probes')
+        ? {
+            capabilities: ['streaming', 'tool_calling'],
+            results: [
+              {
+                id: 1,
+                capability: 'streaming',
+                status: 'passed',
+                reason: 'verified',
+                finished_at: 1794000000,
+              },
+            ],
+          }
+        : {
+            items: [
+              {
+                id: 3,
+                provider_id: 7,
+                model_id: 2,
+                protocol: 'openai_chat',
+                upstream_model_name: 'probe-model',
+                status: 'pending',
+                mapping_confirmed: false,
+              },
+            ],
+            total: 1,
+          },
+    },
   }))
-  const post = vi.spyOn(api, 'post').mockResolvedValue({ data: { success: true, data: { capability: 'tool_calling', status: 'inconclusive', reason: 'behavior_not_observed', finished_at: 1794000001 } } })
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  render(<I18nextProvider i18n={i18n}><QueryClientProvider client={client}><ProviderChannels providerId={7} /></QueryClientProvider></I18nextProvider>)
-  await userEvent.click(await screen.findByRole('button', { name: 'Capability probes' }))
-  await waitFor(() => expect(within(screen.getByRole('dialog', { name: 'Capability probes' })).getByText('Success')).toBeVisible())
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        capability: 'tool_calling',
+        status: 'inconclusive',
+        reason: 'behavior_not_observed',
+        finished_at: 1794000001,
+      },
+    },
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <ProviderChannels providerId={7} />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  await userEvent.click(
+    await screen.findByRole('button', { name: 'Capability probes' })
+  )
+  await waitFor(() =>
+    expect(
+      within(
+        screen.getByRole('dialog', { name: 'Capability probes' })
+      ).getByText('Success')
+    ).toBeVisible()
+  )
   const dialog = screen.getByRole('dialog', { name: 'Capability probes' })
   expect(within(dialog).getByText('Not tested')).toBeVisible()
-  await userEvent.click(within(dialog).getByRole('button', { name: 'Probe Tool calling' }))
-  await waitFor(() => expect(post).toHaveBeenCalledWith('/api/admin/v1/channels/3/probes', { capability: 'tool_calling' }))
-  expect(within(dialog).getByText('Results do not change capability declarations. Test requests may incur Provider costs.')).toBeVisible()
+  await userEvent.click(
+    within(dialog).getByRole('button', { name: 'Probe Tool calling' })
+  )
+  await waitFor(() =>
+    expect(post).toHaveBeenCalledWith('/api/admin/v1/channels/3/probes', {
+      capability: 'tool_calling',
+    })
+  )
+  expect(
+    within(dialog).getByText(
+      'Results do not change capability declarations. Test requests may incur Provider costs.'
+    )
+  ).toBeVisible()
   client.clear()
 })
 

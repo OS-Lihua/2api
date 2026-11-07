@@ -143,8 +143,86 @@ func TestSingleModelChannelAPI(t *testing.T) {
 			assert.EqualValues(t, fake.Now().Unix(), observation["finished_at"])
 			_, persisted := call(http.MethodGet, probePath+"/probes", "")
 			assert.Equal(t, observation, persisted["data"].(map[string]any)["results"].([]any)[0])
+			_, listed := call(http.MethodGet, fmt.Sprintf("/api/admin/v1/channels?provider_id=%d", provider.Id), "")
+			for _, item := range listed["data"].(map[string]any)["items"].([]any) {
+				view := item.(map[string]any)
+				if view["id"] == created["data"].(map[string]any)["id"] {
+					assert.Equal(t, observation, view["latest_probe"])
+				}
+			}
 			_, after := call(http.MethodGet, probePath, "")
 			assert.Equal(t, created["data"], after["data"])
+		}
+	})
+	t.Run("probe applies channel overrides and rejects an enlarged request budget", func(t *testing.T) {
+		calls := 0
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			var sent map[string]any
+			require.NoError(t, common.DecodeJson(r.Body, &sent))
+			assert.EqualValues(t, 0, sent["temperature"])
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"probe\":\"ok\"}"}}]}`))
+		}))
+		defer upstream.Close()
+		require.NoError(t, db.Model(&provider).Update("base_url", upstream.URL).Error)
+		status, result := call(http.MethodPatch, path, `{"parameter_overrides":{"temperature":0}}`)
+		require.Equal(t, http.StatusOK, status, result)
+		status, result = call(http.MethodPost, path+"/probes", `{"capability":"structured_output"}`)
+		require.Equal(t, http.StatusOK, status, result)
+		assert.Equal(t, "passed", result["data"].(map[string]any)["status"])
+		status, result = call(http.MethodPatch, path, `{"parameter_overrides":{"max_tokens":9999999999}}`)
+		require.Equal(t, http.StatusOK, status, result)
+		status, result = call(http.MethodPost, path+"/probes", `{"capability":"structured_output"}`)
+		require.Equal(t, http.StatusOK, status, result)
+		assert.Equal(t, "request_invalid", result["data"].(map[string]any)["reason"])
+		assert.Equal(t, 1, calls)
+		_, _ = call(http.MethodPatch, path, `{"parameter_overrides":{}}`)
+	})
+	t.Run("each capability requires evidence and safe upstream failures remain private", func(t *testing.T) {
+		cases := []struct {
+			name, protocol, feature, contentType, body, want string
+			status                                           int
+		}{
+			{"stream chunks", "openai_chat", "streaming", "text/event-stream", "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n", "passed", 200},
+			{"stream without completion", "openai_chat", "streaming", "text/event-stream", "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n", "inconclusive", 200},
+			{"tool call", "openai_chat", "tool_calling", "application/json", `{"choices":[{"message":{"tool_calls":[{"function":{"name":"probe_echo","arguments":"{\"value\":\"ok\"}"}}]}}]}`, "passed", 200},
+			{"ignored tool", "openai_chat", "tool_calling", "application/json", `{"choices":[{"message":{"content":"ok"}}]}`, "inconclusive", 200},
+			{"reasoning", "openai_chat", "reasoning", "application/json", `{"choices":[{"message":{"content":"7","reasoning_content":"Half of 14 is 7"}}]}`, "passed", 200},
+			{"cache hit", "openai_chat", "caching", "application/json", `{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens_details":{"cached_tokens":1024}}}`, "passed", 200},
+			{"cache miss", "openai_chat", "caching", "application/json", `{"choices":[{"message":{"content":"ok"}}]}`, "inconclusive", 200},
+			{"messages JSON", "anthropic_messages", "structured_output", "application/json", `{"content":[{"type":"text","text":"{\"probe\":\"ok\"}"}]}`, "passed", 200},
+			{"gemini JSON", "gemini_generate", "structured_output", "application/json", `{"candidates":[{"content":{"parts":[{"text":"{\"probe\":\"ok\"}"}]}}]}`, "passed", 200},
+			{"upstream error body", "openai_chat", "structured_output", "application/json", `{"error":{"message":"Provider secret raw-upstream-body-marker https://user:pass@example.invalid/?key=secret"}}`, "failed", 502},
+		}
+		for index, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				calls := 0
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					assert.Equal(t, "Bearer secret", r.Header.Get("Authorization"))
+					w.Header().Set("Content-Type", tc.contentType)
+					w.WriteHeader(tc.status)
+					_, _ = w.Write([]byte(tc.body))
+				}))
+				defer upstream.Close()
+				require.NoError(t, db.Model(&provider).Update("base_url", upstream.URL).Error)
+				status, created := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":%q,"upstream_model_name":"behavior-probe-%d"}`, provider.Id, unified.Id, tc.protocol, index))
+				require.Equal(t, http.StatusOK, status, created)
+				probePath := fmt.Sprintf("/api/admin/v1/channels/%v/probes", created["data"].(map[string]any)["id"])
+				status, result := call(http.MethodPost, probePath, fmt.Sprintf(`{"capability":%q}`, tc.feature))
+				require.Equal(t, http.StatusOK, status, result)
+				assert.Equal(t, tc.want, result["data"].(map[string]any)["status"], result)
+				expectedCalls := 1
+				if tc.feature == "caching" {
+					expectedCalls = 2
+				}
+				assert.Equal(t, expectedCalls, calls)
+				encoded, err := common.Marshal(result)
+				require.NoError(t, err)
+				assert.NotContains(t, string(encoded), "raw-upstream-body-marker")
+				assert.NotContains(t, string(encoded), provider.Key)
+				assert.NotContains(t, string(encoded), upstream.URL)
+			})
 		}
 	})
 	t.Run("capability narrowing and model edits stay consistent", func(t *testing.T) {
@@ -283,7 +361,7 @@ func TestSingleModelChannelAPI(t *testing.T) {
 	t.Run("PAT scopes and Casbin guard every action", func(t *testing.T) {
 		original := token
 		token = createWalletTestAccessToken(t, root.Id, "channel:read")
-		for _, action := range []struct{ method, path, body string }{{http.MethodPost, "/api/admin/v1/channels", body}, {http.MethodPatch, path, `{"weight":2}`}, {http.MethodDelete, path, ""}, {http.MethodPost, path + "/confirm", ""}, {http.MethodPost, path + "/enable", ""}, {http.MethodPost, path + "/disable", ""}} {
+		for _, action := range []struct{ method, path, body string }{{http.MethodPost, "/api/admin/v1/channels", body}, {http.MethodPatch, path, `{"weight":2}`}, {http.MethodDelete, path, ""}, {http.MethodPost, path + "/confirm", ""}, {http.MethodPost, path + "/enable", ""}, {http.MethodPost, path + "/disable", ""}, {http.MethodPost, path + "/probes", `{"capability":"streaming"}`}} {
 			status, _ := call(action.method, action.path, action.body)
 			assert.Equal(t, http.StatusForbidden, status, action)
 		}
@@ -300,6 +378,8 @@ func TestSingleModelChannelAPI(t *testing.T) {
 		token = expired
 		status, _ = call(http.MethodGet, path, "")
 		assert.Equal(t, http.StatusUnauthorized, status)
+		status, _ = call(http.MethodPost, path+"/probes", `{"capability":"streaming"}`)
+		assert.Equal(t, http.StatusUnauthorized, status)
 		bundle, err := service.CreateLoginSession(root.Id, "password", "127.0.0.1", "channel-api-test")
 		require.NoError(t, err)
 		token = bundle.AccessToken
@@ -309,6 +389,8 @@ func TestSingleModelChannelAPI(t *testing.T) {
 		require.NoError(t, err)
 		status, _ = call(http.MethodGet, path, "")
 		assert.Equal(t, http.StatusUnauthorized, status, "revoked session cannot access Channel API")
+		status, _ = call(http.MethodPost, path+"/probes", `{"capability":"streaming"}`)
+		assert.Equal(t, http.StatusUnauthorized, status)
 		token = original
 	})
 	status, _ = call(http.MethodDelete, path, "")
@@ -326,7 +408,7 @@ func TestSingleModelChannelAPI(t *testing.T) {
 		assert.NotContains(t, string(encoded), token)
 		assert.NotContains(t, string(encoded), provider.Key)
 	}
-	for _, action := range []string{"channel.create", "channel.update", "channel.confirm", "channel.enable", "channel.disable", "channel.delete"} {
+	for _, action := range []string{"channel.create", "channel.update", "channel.confirm", "channel.enable", "channel.disable", "channel.delete", "channel.probe"} {
 		assert.True(t, actions[action], action)
 	}
 }

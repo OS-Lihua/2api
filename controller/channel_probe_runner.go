@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
@@ -54,11 +55,11 @@ func probeChannel(ctx context.Context, record model.Channel, provider *model.Pro
 		request.MaxTokens = common.GetPointer(uint(2048))
 		request.Messages[0].Content = "Think through this problem, then give only the answer: if three boxes contain 2, 4 and 8 items, how many items remain after moving half of each box into a fourth box?"
 	case "caching":
-		request.Messages[0].Content = strings.Repeat("This is a synthetic cache probe with no private information. ", 160) + "Reply with ok."
+		request.Messages[0].Content = []dto.MediaContent{{Type: "text", Text: strings.Repeat("This is a synthetic cache probe with no private information. ", 160), CacheControl: []byte(`{"type":"ephemeral"}`)}, {Type: "text", Text: "Reply with ok."}}
 		request.PromptCacheKey = "gateway-capability-probe"
 	}
-	// Only trusted Provider settings determine the transport. Channel parameter
-	// overrides cannot increase the fixed probe budget or replace the test input.
+	// Provider metadata is copied from trusted configuration. The synthetic
+	// request has a fixed budget even when configured overrides are applied.
 	organization := ""
 	if provider.OpenAIOrganization != nil {
 		organization = *provider.OpenAIOrganization
@@ -82,6 +83,22 @@ func probeChannel(ctx context.Context, record model.Channel, provider *model.Pro
 		encoded, err = common.Marshal(converted)
 	}
 	if err != nil {
+		return "failed", "request_invalid"
+	}
+	info.Request = request
+	info.ParamOverride = provider.GetParamOverride()
+	encoded, err = relaycommon.ApplyParamOverrideWithRelayInfo(encoded, info)
+	if err != nil {
+		return "failed", "request_invalid"
+	}
+	if common.UnmarshalJsonStr(record.ParameterOverrides, &info.ParamOverride) != nil {
+		return "failed", "request_invalid"
+	}
+	encoded, err = relaycommon.ApplyParamOverrideWithRelayInfo(encoded, info)
+	if err != nil || !probeRequestWithinBudget(gjson.ParseBytes(encoded)) {
+		return "failed", "request_invalid"
+	}
+	if helper.ExceedsMaxTokensLimit(request.MaxTokens, request.MaxCompletionTokens) {
 		return "failed", "request_invalid"
 	}
 	attempts := 1
@@ -125,6 +142,26 @@ func probeChannel(ctx context.Context, record model.Channel, provider *model.Pro
 		}
 	}
 	return "inconclusive", "behavior_not_observed"
+}
+
+// probeRequestWithinBudget checks multiplier fields after all overrides,
+// including nested passthrough parameters, before any network operation.
+func probeRequestWithinBudget(value gjson.Result) bool {
+	valid := true
+	value.ForEach(func(key, item gjson.Result) bool {
+		if item.IsObject() || item.IsArray() {
+			valid = probeRequestWithinBudget(item)
+			return valid
+		}
+		switch key.String() {
+		case "max_tokens", "max_completion_tokens", "max_output_tokens", "maxOutputTokens":
+			valid = item.Type == gjson.Number && item.Float() >= 1 && item.Float() <= 2048 && item.Float() == float64(item.Int())
+		case "n", "candidateCount":
+			valid = item.Type == gjson.Number && item.Float() == 1
+		}
+		return valid
+	})
+	return valid
 }
 
 // probeResponseWriter isolates upstream stream headers from the management

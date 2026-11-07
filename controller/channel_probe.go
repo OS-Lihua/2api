@@ -76,5 +76,11 @@ func ListChannelProbes(c *gin.Context) {
 		singleChannelError(c, err)
 		return
 	}
+	for i := range results {
+		if results[i].Status == "running" && clock.Now().Unix()-results[i].StartedAt > 25 {
+			results[i].Status = "inconclusive"
+			results[i].Reason = "probe_interrupted"
+		}
+	}
 	common.ApiSuccess(c, gin.H{"capabilities": channelProbeCapabilities, "results": results})
 }
