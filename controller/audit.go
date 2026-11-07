@@ -148,6 +148,10 @@ func recordManageAudit(c *gin.Context, action string, params map[string]any) {
 // recordManageAuditFor 记录一条管理审计日志，日志归属于操作者；targetUserId
 // 只表示被操作用户，用于在结构化参数中保留目标上下文。
 func recordManageAuditFor(c *gin.Context, targetUserId int, action string, params map[string]any) {
+	// The versioned admin API records only route metadata after the final reply.
+	if common.GetContextKeyBool(c, constant.ContextKeyAdminAPIAudit) {
+		return
+	}
 	if params == nil {
 		params = map[string]any{}
 	}
