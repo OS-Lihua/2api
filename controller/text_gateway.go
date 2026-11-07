@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
@@ -44,11 +45,11 @@ func TextGateway(c *gin.Context) {
 	userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
 	allowed, err := service.GatewayOfferingAllowed(c, offering)
 	if err != nil {
-		gatewayError(c, http.StatusServiceUnavailable, "authorization_unavailable", "Model authorization is unavailable")
+		gatewayError(c, http.StatusServiceUnavailable, "authorization_unavailable", i18n.T(c, i18n.MsgGatewayAuthorizationUnavailable))
 		return
 	}
 	if !allowed {
-		gatewayError(c, http.StatusNotFound, "model_not_found", "Model not found")
+		gatewayError(c, http.StatusNotFound, "model_not_found", i18n.T(c, i18n.MsgGatewayModelNotFound))
 		return
 	}
 	request, err := helper.GetAndValidateTextRequest(c, relayconstant.RelayModeChatCompletions)

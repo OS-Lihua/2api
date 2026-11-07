@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
@@ -14,6 +15,11 @@ import (
 )
 
 func offeringModelsError(c *gin.Context, modelType, status int, code, message string) {
+	if code == "model_not_found" {
+		message = i18n.T(c, i18n.MsgGatewayModelNotFound)
+	} else if code == "authorization_unavailable" {
+		message = i18n.T(c, i18n.MsgGatewayAuthorizationUnavailable)
+	}
 	switch modelType {
 	case constant.ChannelTypeAnthropic:
 		kind := "api_error"
@@ -84,12 +90,21 @@ func RetrieveOfferingModel(c *gin.Context, modelType int) {
 		return
 	}
 	if modelType == constant.ChannelTypeGemini {
-		c.JSON(200, dto.GeminiModel{Name: offering.Name, DisplayName: offering.Name})
+		c.JSON(200, struct {
+			dto.GeminiModel
+			Members []model.ModelOfferingMember `json:"members"`
+		}{dto.GeminiModel{Name: offering.Name, DisplayName: offering.Name}, offering.Members})
 		return
 	}
 	if modelType == constant.ChannelTypeAnthropic {
-		c.JSON(200, dto.AnthropicModel{ID: offering.Name, DisplayName: offering.Name, Type: "model", CreatedAt: time.Unix(offering.CreatedAt, 0).UTC().Format(time.RFC3339)})
+		c.JSON(200, struct {
+			dto.AnthropicModel
+			Members []model.ModelOfferingMember `json:"members"`
+		}{dto.AnthropicModel{ID: offering.Name, DisplayName: offering.Name, Type: "model", CreatedAt: time.Unix(offering.CreatedAt, 0).UTC().Format(time.RFC3339)}, offering.Members})
 		return
 	}
-	c.JSON(200, dto.OpenAIModels{Id: offering.Name, Object: "model", Created: int(offering.CreatedAt), OwnedBy: "system"})
+	c.JSON(200, struct {
+		dto.OpenAIModels
+		Members []model.ModelOfferingMember `json:"members"`
+	}{dto.OpenAIModels{Id: offering.Name, Object: "model", Created: int(offering.CreatedAt), OwnedBy: "system"}, offering.Members})
 }

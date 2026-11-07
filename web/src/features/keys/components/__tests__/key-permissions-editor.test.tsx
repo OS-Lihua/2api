@@ -114,6 +114,30 @@ test('retains hidden exception IDs while changing the default strategy', async (
   )
 })
 
+test('reload discards unsaved edits even when the stored revision is unchanged', async () => {
+  vi.spyOn(api, 'get').mockImplementation(async (url) => ({
+    data: {
+      success: true,
+      data: url.endsWith('/permissions')
+        ? { default_allow: true, exception_ids: [], revision: 1 }
+        : [],
+    },
+  }))
+  renderEditor()
+  const policy = await screen.findByRole('combobox', { name: 'Default policy' })
+  fireEvent.change(policy, { target: { value: 'deny' } })
+  expect(policy).toHaveValue('deny')
+  fireEvent.click(screen.getByRole('button', { name: 'Reload permissions' }))
+  await waitFor(() =>
+    expect(
+      screen.getByRole('combobox', { name: 'Default policy' })
+    ).toHaveValue('allow')
+  )
+  expect(
+    screen.getByRole('button', { name: 'Save permissions' })
+  ).toBeDisabled()
+})
+
 test('failed reads show retry and never expose a save action', async () => {
   vi.spyOn(api, 'get').mockRejectedValue(new Error('network unavailable'))
   renderEditor()

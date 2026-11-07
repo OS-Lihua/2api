@@ -60,6 +60,7 @@ export function KeyPermissionsEditor(props: {
   tokenId: number
   onSaved: () => void
 }) {
+  const [reloadCount, setReloadCount] = useState(0)
   const query = useQuery({
     queryKey: ['key-permissions', props.tokenId],
     queryFn: async () => {
@@ -83,12 +84,16 @@ export function KeyPermissionsEditor(props: {
   }
   return (
     <KeyPermissionsForm
-      key={`${props.tokenId}:${query.data.permissions.revision}`}
+      key={`${props.tokenId}:${query.data.permissions.revision}:${reloadCount}`}
       tokenId={props.tokenId}
       permissions={query.data.permissions}
       choices={query.data.choices}
       onSaved={props.onSaved}
-      onReload={() => void query.refetch()}
+      onReload={() => {
+        void query.refetch().then((result) => {
+          if (result.isSuccess) setReloadCount((count) => count + 1)
+        })
+      }}
       reloading={query.isFetching}
       title={t('Key permissions')}
     />

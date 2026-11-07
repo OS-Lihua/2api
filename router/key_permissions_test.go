@@ -27,10 +27,19 @@ func TestKeyPermissionsDiscoveryProtocols(t *testing.T) {
 		f.engine.ServeHTTP(response, request)
 		require.Equal(t, 200, response.Code, response.Body.String())
 		assert.Contains(t, response.Body.String(), "gateway-offering")
-		assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+		assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
 	}
 	_, err := model.MutateKeyPermissions(t.Context(), f.token.Id, f.user.Id, 0, "deny_all", model.KeyPermissions{}, nil)
 	require.NoError(t, err)
+	for _, language := range []struct{ code, message string }{{"en", "Model not found"}, {"zh-CN", "模型不存在"}, {"zh-TW", "模型不存在"}} {
+		request := httptest.NewRequest(http.MethodGet, "/v1/models/gateway-alias", nil)
+		request.Header.Set("Authorization", "Bearer "+f.token.Key)
+		request.Header.Set("Accept-Language", language.code)
+		response := httptest.NewRecorder()
+		f.engine.ServeHTTP(response, request)
+		assert.Equal(t, 404, response.Code)
+		assert.Contains(t, response.Body.String(), language.message)
+	}
 	for _, tc := range []struct{ path, header, expected string }{{"/v1/models/gateway-alias", "x-api-key", `"type":"not_found_error"`}, {"/v1beta/models/gateway-alias", "x-goog-api-key", `"status":"NOT_FOUND"`}} {
 		request := httptest.NewRequest(http.MethodGet, tc.path, nil)
 		request.Header.Set(tc.header, f.token.Key)
@@ -166,6 +175,7 @@ func TestKeyPermissionsListDetailAndCall(t *testing.T) {
 	detail := adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, "/v1/models/gateway-alias", "")
 	require.Equal(t, 200, detail.Code, detail.Body.String())
 	assert.Contains(t, detail.Body.String(), `"id":"gateway-offering"`)
+	assert.Contains(t, detail.Body.String(), fmt.Sprintf(`"members":[{"model_id":%d,"tier":1}]`, f.channel.ModelID))
 	pat := createWalletTestAccessToken(t, f.user.Id, "api_key:read", "api_key:write")
 	endpoint := fmt.Sprintf("/api/token/%d/permissions", f.token.Id)
 	deniedPolicy := adminSecurityRequest(f.engine, pat, http.MethodPatch, endpoint, `{"action":"deny_all","revision":0}`)

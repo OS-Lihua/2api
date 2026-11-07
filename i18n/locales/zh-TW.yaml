@@ -2,6 +2,8 @@
 # 中文（繁體）翻譯檔案
 
 # Errors returned to AI clients
+gateway.model_not_found: "模型不存在"
+gateway.authorization_unavailable: "暫時無法驗證模型權限"
 common.database_error: "資料庫出錯，請聯繫管理員"
 auth.user_banned: "使用者已被封禁"
 token.get_info_failed: "獲取令牌資訊失敗，請稍後重試"
