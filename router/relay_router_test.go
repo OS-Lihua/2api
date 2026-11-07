@@ -727,6 +727,28 @@ func TestTextGatewayMissingUsageIgnoresOutputCeilings(t *testing.T) {
 	}
 }
 
+func TestTextGatewayClaudeConversionPreservesExplicitZeroScalars(t *testing.T) {
+	for _, test := range []struct{ path, body string }{
+		{"/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":0,"temperature":0,"top_p":0}`},
+		{"/v1/responses", `{"model":"gateway-offering","input":"Hello","max_output_tokens":0,"temperature":0,"top_p":0}`},
+	} {
+		t.Run(test.path, func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				var sent map[string]any
+				require.NoError(t, common.DecodeJson(r.Body, &sent))
+				assert.EqualValues(t, 0, sent["max_tokens"])
+				assert.EqualValues(t, 0, sent["temperature"])
+				assert.EqualValues(t, 0, sent["top_p"])
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"msg","type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":0}}`))
+			})
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "anthropic_messages").Error)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, test.path, test.body)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		})
+	}
+}
+
 func TestTextGatewayNativeCustomToolStreamCountsBusinessOutput(t *testing.T) {
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
