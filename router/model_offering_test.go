@@ -79,6 +79,91 @@ func TestModelOfferingAPI(t *testing.T) {
 	require.Equal(t, http.StatusOK, status, response)
 	assert.Equal(t, data, response["data"])
 
+	t.Run("metadata sync preserves offering members without Channels", func(t *testing.T) {
+		status, response := call(http.MethodPost, "/api/admin/v1/models", fmt.Sprintf(`{"name":"sync-member","publisher_id":%d,"description":"Local description","sync_official":1,"capabilities":{"features":["streaming"],"input_modalities":["text"],"output_modalities":["text"]}}`, publisher.Id))
+		require.Equal(t, http.StatusOK, status, response)
+		member := response["data"].(map[string]any)
+		memberID := int(member["id"].(float64))
+		memberEndpoint := fmt.Sprintf("/api/admin/v1/models/%d", memberID)
+		companion := model.Model{ModelName: "sync-companion", VendorID: publisher.Id, Description: "Keep companion", Status: 1, SyncOfficial: 1}
+		require.NoError(t, companion.Insert())
+		companionEndpoint := fmt.Sprintf("/api/admin/v1/models/%d", companion.Id)
+		status, response = call(http.MethodGet, companionEndpoint, "")
+		require.Equal(t, http.StatusOK, status, response)
+		companionBefore := response["data"]
+		status, response = call(http.MethodPost, "/api/admin/v1/model-offerings", fmt.Sprintf(`{"name":"sync-offering","aliases":["sync-alias"],"members":[{"model_id":%d,"tier":1}]}`, memberID))
+		require.Equal(t, http.StatusOK, status, response)
+		offering := response["data"]
+		offeringEndpoint := fmt.Sprintf("/api/admin/v1/model-offerings/%v", offering.(map[string]any)["id"])
+		var channels int64
+		require.NoError(t, db.Model(&model.Channel{}).Where("model_id = ?", memberID).Count(&channels).Error)
+		require.Zero(t, channels, "the member reference alone must protect Model identity")
+
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if strings.HasSuffix(r.URL.Path, "vendors.json") {
+				_, _ = w.Write([]byte(`[]`))
+				return
+			}
+			_, _ = w.Write([]byte(`[{"model_name":"sync-companion","description":"Must roll back","name_rule":0,"status":1},{"model_name":"sync-member","description":"Synced description","name_rule":1,"status":1,"tags":"synced"}]`))
+		}))
+		defer upstream.Close()
+		t.Setenv("SYNC_UPSTREAM_BASE", upstream.URL)
+		t.Setenv("SYNC_HTTP_RETRY", "1")
+		status, response = call(http.MethodGet, "/api/models/sync_upstream/preview?locale=en", "")
+		require.Equal(t, http.StatusOK, status, response)
+		require.Equal(t, true, response["success"], response)
+		preview := response["data"].(map[string]any)
+		versions := make(map[string]string)
+		for _, item := range preview["candidates"].([]any) {
+			candidate := item.(map[string]any)
+			versions[candidate["model_name"].(string)] = candidate["record_version"].(string)
+		}
+		require.NotEmpty(t, versions["sync-member"])
+		require.NotEmpty(t, versions["sync-companion"])
+		selection := model.MetadataSyncSelection{ModelName: "sync-member", RecordVersion: versions["sync-member"], Fields: []string{"name_rule", "description", "tags"}}
+		request := map[string]any{"locale": "en", "source_version": preview["source"].(map[string]any)["version"], "selections": []model.MetadataSyncSelection{
+			{ModelName: "sync-companion", RecordVersion: versions["sync-companion"], Fields: []string{"description"}},
+			selection,
+		}}
+		encoded, err := common.Marshal(request)
+		require.NoError(t, err)
+		status, response = call(http.MethodPost, "/api/models/sync_upstream", string(encoded))
+		require.Equal(t, http.StatusBadRequest, status, response)
+		assert.Equal(t, false, response["success"], response)
+		status, response = call(http.MethodGet, companionEndpoint, "")
+		require.Equal(t, http.StatusOK, status, response)
+		assert.Equal(t, companionBefore, response["data"], "the entire batch must roll back")
+		status, response = call(http.MethodGet, memberEndpoint, "")
+		require.Equal(t, http.StatusOK, status, response)
+		assert.Equal(t, member, response["data"], "failed sync must preserve name, Publisher, capabilities and metadata")
+		status, response = call(http.MethodGet, offeringEndpoint, "")
+		require.Equal(t, http.StatusOK, status, response)
+		assert.Equal(t, offering, response["data"], "failed sync must preserve member tiers and names")
+
+		selection.Fields = []string{"description", "tags"}
+		request["selections"] = []model.MetadataSyncSelection{selection}
+		encoded, err = common.Marshal(request)
+		require.NoError(t, err)
+		status, response = call(http.MethodPost, "/api/models/sync_upstream", string(encoded))
+		require.Equal(t, http.StatusOK, status, response)
+		require.Equal(t, true, response["success"], response)
+		status, response = call(http.MethodGet, memberEndpoint, "")
+		require.Equal(t, http.StatusOK, status, response)
+		synced := response["data"].(map[string]any)
+		assert.Equal(t, "Synced description", synced["description"])
+		assert.Equal(t, "synced", synced["tags"])
+		assert.Equal(t, member["name"], synced["name"])
+		assert.Equal(t, member["publisher_id"], synced["publisher_id"])
+		assert.Equal(t, member["capabilities"], synced["capabilities"])
+		status, response = call(http.MethodPut, offeringEndpoint, fmt.Sprintf(`{"name":"sync-offering","aliases":["sync-alias"],"members":[{"model_id":%d,"tier":1}]}`, memberID))
+		require.Equal(t, http.StatusOK, status, response)
+		saved := response["data"].(map[string]any)
+		for _, field := range []string{"name", "aliases", "members"} {
+			assert.Equal(t, offering.(map[string]any)[field], saved[field], field)
+		}
+	})
+
 	t.Run("primary names and aliases share a unique namespace", func(t *testing.T) {
 		for _, name := range []string{"public-model", "public-alias"} {
 			duplicate := fmt.Sprintf(`{"name":%q,"members":[{"model_id":%d,"tier":1}]}`, name, unified.Id)
