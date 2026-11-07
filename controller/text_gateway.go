@@ -33,11 +33,42 @@ func gatewayError(c *gin.Context, status int, code, message string) {
 	c.AbortWithStatusJSON(status, gin.H{"error": types.OpenAIError{Code: code, Type: "gateway_error", Message: message}})
 }
 
-// TextGateway dispatches only a resolved ModelOffering. Absence continues to the
-// legacy middleware; known disabled and unauthorized offerings stop here.
+// TextGateway authorizes ModelOffering requests after credential validation.
+// Only registered legacy models continue to the legacy quota and relay path.
 func TextGateway(c *gin.Context) {
 	offering := middleware.TextOffering(c)
 	if offering == nil {
+		if c.Request.Method != http.MethodPost || c.Request.URL.Path != "/v1/chat/completions" {
+			c.Next()
+			return
+		}
+		var request struct {
+			Model string `json:"model"`
+		}
+		if common.UnmarshalBodyReusable(c, &request) != nil || request.Model == "" {
+			gatewayError(c, http.StatusBadRequest, "invalid_request", "Invalid chat request")
+			return
+		}
+		var legacyModels int64
+		err := model.DB.WithContext(c.Request.Context()).Model(&model.Ability{}).Where("model = ?", request.Model).Count(&legacyModels).Error
+		if err != nil {
+			gatewayError(c, http.StatusServiceUnavailable, "authorization_unavailable", i18n.T(c, i18n.MsgGatewayAuthorizationUnavailable))
+			return
+		}
+		if legacyModels == 0 {
+			gatewayError(c, http.StatusNotFound, "model_not_found", i18n.T(c, i18n.MsgGatewayModelNotFound))
+			return
+		}
+		// Credential checks precede this fallback. A registered legacy model
+		// still requires its integer quota before entering the legacy relay.
+		if _, err := model.ValidateUserToken(c.GetString("token_key")); err != nil {
+			if errors.Is(err, model.ErrDatabase) {
+				gatewayError(c, http.StatusServiceUnavailable, "authorization_unavailable", i18n.T(c, i18n.MsgGatewayAuthorizationUnavailable))
+			} else {
+				gatewayError(c, http.StatusUnauthorized, "invalid_api_key", common.TranslateMessage(c, i18n.MsgTokenInvalid))
+			}
+			return
+		}
 		c.Next()
 		return
 	}

@@ -582,7 +582,7 @@ func TokenAuth() func(c *gin.Context) {
 			key = parts[0]
 		}
 		validateToken := model.ValidateUserToken
-		if TextOffering(c) != nil || c.Request.Method == http.MethodGet && (strings.HasPrefix(c.Request.URL.Path, "/v1/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/openai/models")) {
+		if TextOffering(c) != nil || c.Request.Method == http.MethodPost && c.Request.URL.Path == "/v1/chat/completions" || c.Request.Method == http.MethodGet && (strings.HasPrefix(c.Request.URL.Path, "/v1/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/openai/models")) {
 			validateToken = model.ValidateWalletToken
 		}
 		token, err := validateToken(key)

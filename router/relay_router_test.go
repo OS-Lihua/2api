@@ -1716,8 +1716,9 @@ func TestTextGatewayInsufficientReservationStopsBeforeProvider(t *testing.T) {
 	assert.EqualValues(t, 1, total)
 }
 
-func TestTextGatewayUnknownOfferingRetainsLegacyTokenQuota(t *testing.T) {
-	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("unknown Offering must not use the new Channel") })
+func TestTextGatewayLegacyModelRetainsTokenQuota(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("legacy model must not use the new Channel") })
+	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "unknown-legacy-model", ChannelId: 999, Enabled: true}).Error)
 	body := `{"model":"unknown-legacy-model","messages":[{"role":"user","content":"Hello"}]}`
 	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
 	assert.Equal(t, 401, response.Code, response.Body.String())

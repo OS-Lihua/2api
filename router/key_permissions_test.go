@@ -19,6 +19,36 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestKeyPermissionsHiddenAndMissingCallsAreIndistinguishable(t *testing.T) {
+	calls := 0
+	f := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { calls++ })
+	pat := createWalletTestAccessToken(t, f.user.Id, "api_key:read", "api_key:write")
+	endpoint := fmt.Sprintf("/api/token/%d/permissions", f.token.Id)
+	deny := adminSecurityRequest(f.engine, pat, http.MethodPatch, endpoint, `{"action":"deny_all","revision":0}`)
+	require.Equal(t, http.StatusOK, deny.Code, deny.Body.String())
+	var errorType, errorMessage string
+	for i, name := range []string{"gateway-alias", "missing-offering"} {
+		response := adminSecurityRequest(f.engine, f.token.Key, http.MethodPost, "/v1/chat/completions", fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"Hello"}]}`, name))
+		assert.Equal(t, http.StatusNotFound, response.Code, "%s: %s", name, response.Body.String())
+		var payload struct {
+			Error struct {
+				Code    string `json:"code"`
+				Type    string `json:"type"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+		assert.Equal(t, "model_not_found", payload.Error.Code, name)
+		if i == 0 {
+			errorType, errorMessage = payload.Error.Type, payload.Error.Message
+		} else {
+			assert.Equal(t, errorType, payload.Error.Type, name)
+			assert.Equal(t, errorMessage, payload.Error.Message, name)
+		}
+	}
+	assert.Zero(t, calls, "neither inaccessible nor nonexistent models may dispatch")
+}
+
 func TestKeyPermissionsLegacyAllowlistMigration(t *testing.T) {
 	f := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -119,9 +149,18 @@ func TestKeyPermissionsConcurrentEditsAndCredentialRestrictions(t *testing.T) {
 			response := adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, path, "")
 			assert.Contains(t, []int{401, 403}, response.Code, response.Body.String())
 		}
+		for _, name := range []string{"gateway-alias", "missing-offering"} {
+			response := adminSecurityRequest(f.engine, f.token.Key, http.MethodPost, "/v1/chat/completions", fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"Hello"}]}`, name))
+			assert.Contains(t, []int{401, 403}, response.Code, response.Body.String())
+			assert.NotContains(t, response.Body.String(), "model_not_found")
+		}
 	}
 	require.NoError(t, f.token.Delete())
 	assert.Equal(t, 401, adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, "/v1/models", "").Code)
+	for _, name := range []string{"gateway-alias", "missing-offering"} {
+		response := adminSecurityRequest(f.engine, f.token.Key, http.MethodPost, "/v1/chat/completions", fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"Hello"}]}`, name))
+		assert.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
+	}
 	for _, revoke := range []bool{false, true} {
 		credential := createWalletTestAccessToken(t, f.user.Id, "api_key:write")
 		if revoke {
