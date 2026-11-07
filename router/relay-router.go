@@ -13,6 +13,20 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func redirectModelDiscoveryTrailingSlash(c *gin.Context) {
+	path := c.Request.URL.EscapedPath()
+	if c.Request.Method == http.MethodGet && strings.HasSuffix(path, "/") {
+		target := strings.TrimSuffix(path, "/")
+		if query := c.Request.URL.RawQuery; query != "" {
+			target += "?" + query
+		}
+		c.Redirect(http.StatusMovedPermanently, target)
+		c.Abort()
+		return
+	}
+	c.Next()
+}
+
 func SetRelayRouter(router *gin.Engine) {
 	router.Use(middleware.CORS())
 	router.Use(middleware.DecompressRequestMiddleware())
@@ -21,19 +35,7 @@ func SetRelayRouter(router *gin.Engine) {
 	// https://platform.openai.com/docs/api-reference/introduction
 	modelsRouter := router.Group("/v1/models")
 	modelsRouter.Use(middleware.RouteTag("relay"))
-	modelsRouter.Use(func(c *gin.Context) {
-		path := c.Request.URL.EscapedPath()
-		if c.Request.Method == http.MethodGet && strings.HasSuffix(path, "/") {
-			target := strings.TrimSuffix(path, "/")
-			if query := c.Request.URL.RawQuery; query != "" {
-				target += "?" + query
-			}
-			c.Redirect(http.StatusMovedPermanently, target)
-			c.Abort()
-			return
-		}
-		c.Next()
-	})
+	modelsRouter.Use(redirectModelDiscoveryTrailingSlash)
 	modelsRouter.Use(middleware.DisableCache(), middleware.TokenAuth())
 	{
 		modelsRouter.GET("", func(c *gin.Context) {
@@ -61,12 +63,13 @@ func SetRelayRouter(router *gin.Engine) {
 
 	geminiRouter := router.Group("/v1beta/models")
 	geminiRouter.Use(middleware.RouteTag("relay"))
+	geminiRouter.Use(redirectModelDiscoveryTrailingSlash)
 	geminiRouter.Use(middleware.DisableCache(), middleware.TokenAuth())
 	{
 		geminiRouter.GET("", func(c *gin.Context) {
 			controller.ListOfferingModels(c, constant.ChannelTypeGemini)
 		})
-		geminiRouter.GET("/:model", func(c *gin.Context) { controller.RetrieveOfferingModel(c, constant.ChannelTypeGemini) })
+		geminiRouter.GET("/*model", func(c *gin.Context) { controller.RetrieveOfferingModel(c, constant.ChannelTypeGemini) })
 	}
 
 	geminiCompatibleRouter := router.Group("/v1beta/openai/models")

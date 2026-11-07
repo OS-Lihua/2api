@@ -82,7 +82,7 @@ func TestKeyPermissionsLegacyAllowlistMigration(t *testing.T) {
 
 func TestKeyPermissionsDiscoveryProtocols(t *testing.T) {
 	f := newTextGatewayFixture(t, func(http.ResponseWriter, *http.Request) { t.Error("unexpected dispatch") })
-	for _, path := range []string{"/v1/models/", "/v1/models/gateway-alias/"} {
+	for _, path := range []string{"/v1/models/", "/v1/models/gateway-alias/", "/v1beta/models/", "/v1beta/models/gateway-alias/"} {
 		response := adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, path+"?limit=7", "")
 		assert.Equal(t, http.StatusMovedPermanently, response.Code, response.Body.String())
 		assert.Equal(t, strings.TrimSuffix(path, "/")+"?limit=7", response.Header().Get("Location"))
@@ -223,6 +223,14 @@ func TestKeyPermissionsIdentityVisibilityAndDeletion(t *testing.T) {
 		detail := adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, "/v1/models/"+name, "")
 		require.Equal(t, 200, detail.Code, detail.Body.String())
 		assert.Contains(t, detail.Body.String(), `"id":"namespace/renamed-offering"`)
+	}
+	for _, name := range []string{"namespace/renamed-offering", "namespace%2Ftrailing%2F"} {
+		request := httptest.NewRequest(http.MethodGet, "/v1beta/models/"+name, nil)
+		request.Header.Set("x-goog-api-key", f.token.Key)
+		response := httptest.NewRecorder()
+		f.engine.ServeHTTP(response, request)
+		assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), `"name":"namespace/renamed-offering"`)
 	}
 	f.offering.Visibility = "groups"
 	f.offering.Groups = []string{"default"}
