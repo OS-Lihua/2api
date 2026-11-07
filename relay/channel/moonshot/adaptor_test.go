@@ -18,7 +18,7 @@ func TestConvertOpenAIRequestKimiK26UsesOnlyAllowedTemperature(t *testing.T) {
 		Temperature: common.GetPointer[float64](0.7),
 	}
 	info := &relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "kimi-k2.6",
 		},
 	}
@@ -37,7 +37,7 @@ func TestConvertOpenAIRequestKimiK26KeepsOmittedTemperatureOmitted(t *testing.T)
 		Model: "kimi-k2.6",
 	}
 	info := &relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "kimi-k2.6",
 		},
 	}
@@ -56,7 +56,7 @@ func TestConvertOpenAIRequestOtherMoonshotModelKeepsTemperature(t *testing.T) {
 		Temperature: common.GetPointer[float64](0.7),
 	}
 	info := &relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "kimi-k2.5",
 		},
 	}
@@ -75,9 +75,9 @@ func TestConvertOpenAIRequestOtherMoonshotModelKeepsTemperature(t *testing.T) {
 func TestResponsesRequestPassesThroughToV1Responses(t *testing.T) {
 	const body = `{"model":"kimi-k3","input":"Latest Go release?","tools":[{"type":"web_search"}],"stream":false}`
 	info := &relaycommon.RelayInfo{
-		RelayMode:   relayconstant.RelayModeResponses,
-		RelayFormat: types.RelayFormatOpenAIResponses,
-		ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://api.moonshot.invalid", UpstreamModelName: "kimi-k3"},
+		RelayMode:    relayconstant.RelayModeResponses,
+		RelayFormat:  types.RelayFormatOpenAIResponses,
+		ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://api.moonshot.invalid", UpstreamModelName: "kimi-k3"},
 	}
 	url, err := (&Adaptor{}).GetRequestURL(info)
 	require.NoError(t, err)

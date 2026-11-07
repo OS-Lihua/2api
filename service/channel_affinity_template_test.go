@@ -20,7 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func buildChannelAffinityTemplateContextForTest(meta channelAffinityMeta) *gin.Context {
+func buildChannelAffinityTemplateContextForTest(meta providerAffinityMeta) *gin.Context {
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
 	setChannelAffinityContext(ctx, meta)
@@ -28,7 +28,7 @@ func buildChannelAffinityTemplateContextForTest(meta channelAffinityMeta) *gin.C
 }
 
 func TestApplyChannelAffinityOverrideTemplate_NoTemplate(t *testing.T) {
-	ctx := buildChannelAffinityTemplateContextForTest(channelAffinityMeta{
+	ctx := buildChannelAffinityTemplateContextForTest(providerAffinityMeta{
 		RuleName: "rule-no-template",
 	})
 	base := map[string]any{
@@ -41,7 +41,7 @@ func TestApplyChannelAffinityOverrideTemplate_NoTemplate(t *testing.T) {
 }
 
 func TestApplyChannelAffinityOverrideTemplate_MergeTemplate(t *testing.T) {
-	ctx := buildChannelAffinityTemplateContextForTest(channelAffinityMeta{
+	ctx := buildChannelAffinityTemplateContextForTest(providerAffinityMeta{
 		RuleName: "rule-with-template",
 		ParamTemplate: map[string]any{
 			"temperature": 0.2,
@@ -81,7 +81,7 @@ func TestApplyChannelAffinityOverrideTemplate_MergeTemplate(t *testing.T) {
 }
 
 func TestApplyChannelAffinityOverrideTemplate_MergeOperations(t *testing.T) {
-	ctx := buildChannelAffinityTemplateContextForTest(channelAffinityMeta{
+	ctx := buildChannelAffinityTemplateContextForTest(providerAffinityMeta{
 		RuleName: "rule-with-ops-template",
 		ParamTemplate: map[string]any{
 			"operations": []map[string]any{
@@ -138,7 +138,7 @@ func TestShouldSkipRetryAfterChannelAffinityFailure(t *testing.T) {
 		{
 			name: "explicit skip retry flag in context",
 			ctx: func() *gin.Context {
-				ctx := buildChannelAffinityTemplateContextForTest(channelAffinityMeta{
+				ctx := buildChannelAffinityTemplateContextForTest(providerAffinityMeta{
 					RuleName:   "rule-explicit-flag",
 					SkipRetry:  false,
 					UsingGroup: "default",
@@ -152,7 +152,7 @@ func TestShouldSkipRetryAfterChannelAffinityFailure(t *testing.T) {
 		{
 			name: "fallback to matched rule meta",
 			ctx: func() *gin.Context {
-				return buildChannelAffinityTemplateContextForTest(channelAffinityMeta{
+				return buildChannelAffinityTemplateContextForTest(providerAffinityMeta{
 					RuleName:   "rule-skip-retry",
 					SkipRetry:  true,
 					UsingGroup: "default",
@@ -164,7 +164,7 @@ func TestShouldSkipRetryAfterChannelAffinityFailure(t *testing.T) {
 		{
 			name: "no flag and no skip retry meta",
 			ctx: func() *gin.Context {
-				return buildChannelAffinityTemplateContextForTest(channelAffinityMeta{
+				return buildChannelAffinityTemplateContextForTest(providerAffinityMeta{
 					RuleName:   "rule-no-skip-retry",
 					SkipRetry:  false,
 					UsingGroup: "default",
@@ -188,7 +188,7 @@ func TestExtractChannelAffinityValue_RequestHeader(t *testing.T) {
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	ctx.Request.Header.Set("X-Affinity-Key", " tenant-123 ")
 
-	value := extractChannelAffinityValue(ctx, operation_setting.ChannelAffinityKeySource{
+	value := extractChannelAffinityValue(ctx, operation_setting.ProviderAffinityKeySource{
 		Type: "request_header",
 		Key:  "X-Affinity-Key",
 	})
@@ -199,11 +199,11 @@ func TestExtractChannelAffinityValue_RequestHeader(t *testing.T) {
 func TestGetPreferredChannelByAffinity_RequestHeaderKeySource(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	rule := operation_setting.ChannelAffinityRule{
+	rule := operation_setting.ProviderAffinityRule{
 		Name:       "header-affinity",
 		ModelRegex: []string{"^gpt-.*$"},
 		PathRegex:  []string{"/v1/responses"},
-		KeySources: []operation_setting.ChannelAffinityKeySource{
+		KeySources: []operation_setting.ProviderAffinityKeySource{
 			{Type: "request_header", Key: "X-Affinity-Key"},
 		},
 		IncludeRuleName:  true,
@@ -221,7 +221,7 @@ func TestGetPreferredChannelByAffinity_RequestHeaderKeySource(t *testing.T) {
 
 	setting := operation_setting.GetChannelAffinitySetting()
 	originalRules := setting.Rules
-	setting.Rules = append([]operation_setting.ChannelAffinityRule{rule}, originalRules...)
+	setting.Rules = append([]operation_setting.ProviderAffinityRule{rule}, originalRules...)
 	t.Cleanup(func() {
 		setting.Rules = originalRules
 	})
@@ -253,7 +253,7 @@ func TestClearCurrentChannelAffinityCache(t *testing.T) {
 		_, _ = cache.DeleteMany([]string{cacheKeySuffix})
 	})
 
-	ctx := buildChannelAffinityTemplateContextForTest(channelAffinityMeta{
+	ctx := buildChannelAffinityTemplateContextForTest(providerAffinityMeta{
 		CacheKey:   cacheKeyFull,
 		TTLSeconds: 60,
 		RuleName:   "codex cli trace",
@@ -275,7 +275,7 @@ func TestChannelAffinityHitCodexTemplatePassHeadersEffective(t *testing.T) {
 	setting := operation_setting.GetChannelAffinitySetting()
 	require.NotNil(t, setting)
 
-	var codexRule *operation_setting.ChannelAffinityRule
+	var codexRule *operation_setting.ProviderAffinityRule
 	for i := range setting.Rules {
 		rule := &setting.Rules[i]
 		if strings.EqualFold(strings.TrimSpace(rule.Name), "codex cli trace") {
@@ -316,7 +316,7 @@ func TestChannelAffinityHitCodexTemplatePassHeadersEffective(t *testing.T) {
 			"Session_id": "sess-123",
 			"User-Agent": "codex-cli-test",
 		},
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ParamOverride: mergedOverride,
 			HeadersOverride: map[string]any{
 				"X-Static": "legacy-static",
@@ -362,7 +362,7 @@ func TestMidjourneyPolicyAcceptance(t *testing.T) {
 			ctx.Request = httptest.NewRequest(http.MethodPost, "/mj/submit/imagine", strings.NewReader(`{}`))
 			ctx.Set("channel_id", 7)
 			state := RequestPolicy(ctx)
-			state.BeginAttempt(&model.Channel{Id: 7}, "default")
+			state.BeginAttempt(&model.Provider{Id: 7}, "default")
 			response := &dto.MidjourneyResponseWithStatusCode{StatusCode: tc.status, Response: dto.MidjourneyResponse{Code: tc.code, Properties: tc.properties}}
 			accepted := RecordMidjourneyPolicyResponse(ctx, response, tc.requestErr)
 			assert.Equal(t, tc.accepted, accepted)
@@ -406,13 +406,13 @@ func TestSessionRulesInheritOrOverrideGlobalDefault(t *testing.T) {
 				if tc.mode == "inherit" {
 					source = "global"
 				}
-				rule := operation_setting.ChannelAffinityRule{
+				rule := operation_setting.ProviderAffinityRule{
 					Name: tc.name, ModelRegex: []string{"^test-model$"},
-					KeySources:  []operation_setting.ChannelAffinityKeySource{{Type: "request_header", Key: "X-Session"}},
+					KeySources:  []operation_setting.ProviderAffinityKeySource{{Type: "request_header", Key: "X-Session"}},
 					SessionMode: tc.mode, SkipRetryOnFailure: tc.skipRetry,
 					ParamOverrideTemplate: map[string]any{"temperature": 0}, IncludeRuleName: true,
 				}
-				encoded, err := common.Marshal([]operation_setting.ChannelAffinityRule{rule})
+				encoded, err := common.Marshal([]operation_setting.ProviderAffinityRule{rule})
 				require.NoError(t, err)
 				snapshot, err := model.BuildRequestPolicy(map[string]string{"RetryTimes": "2", "channel_affinity_setting.enabled": "true", "channel_affinity_setting.session_mode": globalMode, "channel_affinity_setting.rules": string(encoded)})
 				require.NoError(t, err)

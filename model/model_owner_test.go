@@ -12,7 +12,7 @@ import (
 func clearPreferredOwnerTables(t *testing.T) {
 	t.Helper()
 	require.NoError(t, DB.Exec("DELETE FROM abilities").Error)
-	require.NoError(t, DB.Exec("DELETE FROM channels").Error)
+	require.NoError(t, DB.Exec("DELETE FROM providers").Error)
 }
 
 func insertPreferredOwnerCandidate(
@@ -27,7 +27,7 @@ func insertPreferredOwnerCandidate(
 	abilityEnabled bool,
 ) {
 	t.Helper()
-	require.NoError(t, DB.Create(&Channel{
+	require.NoError(t, DB.Create(&Provider{
 		Id:     channelID,
 		Type:   channelType,
 		Key:    fmt.Sprintf("key-%d", channelID),
@@ -128,7 +128,7 @@ func TestGetPreferredModelOwnerChannelTypes(t *testing.T) {
 			clearPreferredOwnerTables(t)
 			tt.setup(t)
 
-			owners, err := GetPreferredModelOwnerChannelTypes([]string{modelName}, tt.groups)
+			owners, err := GetPreferredModelOwnerProviderTypes([]string{modelName}, tt.groups)
 			require.NoError(t, err)
 
 			got, ok := owners[modelName]

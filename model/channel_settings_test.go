@@ -16,23 +16,23 @@ import (
 func TestChannelValidateSettingsRejectsInvalidHTTPTransport(t *testing.T) {
 	tests := []struct {
 		name    string
-		setting dto.ChannelSettings
+		setting dto.ProviderSettings
 		wantErr string
 	}{
 		{
 			name:    "auto with shards is valid",
-			setting: dto.ChannelSettings{HTTPProtocol: "auto", HTTP2ConnectionShards: 4},
+			setting: dto.ProviderSettings{HTTPProtocol: "auto", HTTP2ConnectionShards: 4},
 		},
 		{
 			name:    "http1 with shards greater than one rejected",
-			setting: dto.ChannelSettings{HTTPProtocol: "http1", HTTP2ConnectionShards: 2},
+			setting: dto.ProviderSettings{HTTPProtocol: "http1", HTTP2ConnectionShards: 2},
 			wantErr: "http2_connection_shards",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			channel := &Channel{}
+			channel := &Provider{}
 			channel.SetSetting(tt.setting)
 			err := channel.ValidateSettings()
 			if tt.wantErr == "" {
@@ -84,8 +84,8 @@ func TestAdvancedCustomChannelRequiresModelListRouteOnlyWhenUpdateChecksEnabled(
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			channel := &Channel{Type: constant.ChannelTypeAdvancedCustom}
-			channel.SetOtherSettings(dto.ChannelOtherSettings{
+			channel := &Provider{Type: constant.ChannelTypeAdvancedCustom}
+			channel.SetOtherSettings(dto.ProviderOtherSettings{
 				UpstreamModelUpdateCheckEnabled: tt.checksEnabled,
 				AdvancedCustom: &dto.AdvancedCustomConfig{
 					Routes: tt.routes,
@@ -106,15 +106,15 @@ func TestAdvancedCustomChannelRequiresModelListRouteOnlyWhenUpdateChecksEnabled(
 func TestInferencePresetSettingsAndDatabaseRoundTrip(t *testing.T) {
 	db := UseTestDatabases(t)
 	table := db.Table("inference_preset_channels").Session(&gorm.Session{})
-	require.NoError(t, table.AutoMigrate(&Channel{}))
+	require.NoError(t, table.AutoMigrate(&Provider{}))
 	for _, channelType := range []int{constant.ChannelTypeVLLM, constant.ChannelTypeSGLang} {
 		t.Run(fmt.Sprint(channelType), func(t *testing.T) {
-			channel := &Channel{Type: channelType, Key: "EMPTY", Name: "inference", Status: common.ChannelStatusEnabled}
+			channel := &Provider{Type: channelType, Key: "EMPTY", Name: "inference", Status: common.ChannelStatusEnabled}
 			require.NoError(t, channel.ValidateSettings())
 			require.NotNil(t, channel.GetOtherSettings().AdvancedCustom)
 			require.NoError(t, table.Create(channel).Error)
 			for range 2 {
-				var loaded Channel
+				var loaded Provider
 				require.NoError(t, table.First(&loaded, channel.Id).Error)
 				assert.Equal(t, channelType, loaded.Type)
 				assert.Empty(t, loaded.OtherSettings)
@@ -125,12 +125,12 @@ func TestInferencePresetSettingsAndDatabaseRoundTrip(t *testing.T) {
 				defaults.Routes[0].UpstreamPath = "/changed-locally"
 				assert.Equal(t, "/v1/chat/completions", loaded.GetOtherSettings().AdvancedCustom.Routes[0].UpstreamPath)
 			}
-			settings := dto.ChannelOtherSettings{AdvancedCustom: &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{IncomingPath: "/v1/chat/completions", UpstreamPath: "/custom/chat", Models: []string{"allowed"}, Auth: &dto.AdvancedCustomRouteAuth{Type: "none"}}}}}
+			settings := dto.ProviderOtherSettings{AdvancedCustom: &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{IncomingPath: "/v1/chat/completions", UpstreamPath: "/custom/chat", Models: []string{"allowed"}, Auth: &dto.AdvancedCustomRouteAuth{Type: "none"}}}}}
 			channel.SetOtherSettings(settings)
 			require.NoError(t, channel.ValidateSettings())
 			require.NoError(t, table.Save(channel).Error)
 			for range 2 {
-				var loaded Channel
+				var loaded Provider
 				require.NoError(t, table.First(&loaded, channel.Id).Error)
 				actual := loaded.GetOtherSettings().AdvancedCustom
 				require.Equal(t, common.GetAdvancedCustomPreset(channelType), actual, "named channels must ignore editable advanced_custom overrides")
@@ -144,10 +144,10 @@ func TestInferencePresetSettingsAndDatabaseRoundTrip(t *testing.T) {
 					{"/v1/messages", "allowed", true},
 					{"/v1/images/generations", "allowed", false},
 				} {
-					ok, _ := ChannelSatisfiesFilters(&loaded, tc.model, []filterdto.ChannelFilter{{Kind: filterdto.FilterRequestPath, RequestPath: tc.path}})
+					ok, _ := ProviderSatisfiesFilters(&loaded, tc.model, []filterdto.ProviderFilter{{Kind: filterdto.FilterRequestPath, RequestPath: tc.path}})
 					assert.Equal(t, tc.allowed, ok)
 				}
-				endpoints := getPricingEndpointTypesForAbility(AbilityWithChannel{ChannelType: channelType, Ability: Ability{Model: "allowed", ChannelId: loaded.Id}}, map[int]*dto.AdvancedCustomConfig{loaded.Id: actual})
+				endpoints := getPricingEndpointTypesForAbility(AbilityWithProvider{ChannelType: channelType, Ability: Ability{Model: "allowed", ChannelId: loaded.Id}}, map[int]*dto.AdvancedCustomConfig{loaded.Id: actual})
 				expectedEndpoints := []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeOpenAIResponse, constant.EndpointTypeAnthropic, constant.EndpointTypeEmbeddings}
 				if channelType == constant.ChannelTypeSGLang {
 					expectedEndpoints = append(expectedEndpoints, constant.EndpointTypeJinaRerank)

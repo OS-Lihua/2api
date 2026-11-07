@@ -233,7 +233,7 @@ func PreviewModelPricingConversion(name string, draft PricingValues) (*ModelPric
 
 	// Inspect non-secret routing metadata so aliases cannot disguise a special
 	// settlement path as an ordinary text model.
-	var channels []Channel
+	var channels []Provider
 	candidates := DB.Model(&Ability{}).Select("channel_id").Where("model = ?", name)
 	if err := DB.Select("type", "status", "models", "model_mapping").Where("id IN (?)", candidates).Find(&channels).Error; err != nil {
 		return nil, err

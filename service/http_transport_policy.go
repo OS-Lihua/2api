@@ -30,7 +30,7 @@ func defaultHTTPTransportPolicy() HTTPTransportPolicy {
 
 // NormalizeHTTPTransportPolicy converts channel settings into a safe runtime policy.
 // Invalid stored values never panic; they clamp to defaults and warn once per bad value.
-func NormalizeHTTPTransportPolicy(settings dto.ChannelSettings) HTTPTransportPolicy {
+func NormalizeHTTPTransportPolicy(settings dto.ProviderSettings) HTTPTransportPolicy {
 	policy := defaultHTTPTransportPolicy()
 	policy.TLSInsecureSkipVerify = settings.TLSInsecureSkipVerify
 

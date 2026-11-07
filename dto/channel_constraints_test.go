@@ -9,9 +9,9 @@ import (
 
 func TestResolvedPinPriorityAndMerge(t *testing.T) {
 	t.Run("token pin beats origin pin on a different channel", func(t *testing.T) {
-		constraints := &ChannelConstraints{}
-		constraints.AddPin(ChannelPin{ChannelId: 10, Source: PinSourceOriginTask, Rank: PinRankOriginTask, RetryMode: PinRetrySameChannel})
-		constraints.AddPin(ChannelPin{ChannelId: 1, Source: PinSourceToken, Rank: PinRankToken, RetryMode: PinRetrySingleAttempt})
+		constraints := &ProviderConstraints{}
+		constraints.AddPin(ProviderPin{ChannelId: 10, Source: PinSourceOriginTask, Rank: PinRankOriginTask, RetryMode: PinRetrySameChannel})
+		constraints.AddPin(ProviderPin{ChannelId: 1, Source: PinSourceToken, Rank: PinRankToken, RetryMode: PinRetrySingleAttempt})
 
 		pin, found, overridden := constraints.ResolvedPin()
 		require.True(t, found)
@@ -24,9 +24,9 @@ func TestResolvedPinPriorityAndMerge(t *testing.T) {
 	})
 
 	t.Run("same channel pins merge to the stricter retry mode", func(t *testing.T) {
-		constraints := &ChannelConstraints{}
-		constraints.AddPin(ChannelPin{ChannelId: 7, Source: PinSourceOriginTask, Rank: PinRankOriginTask, RetryMode: PinRetrySameChannel})
-		constraints.AddPin(ChannelPin{ChannelId: 7, Source: PinSourceToken, Rank: PinRankToken, RetryMode: PinRetrySingleAttempt})
+		constraints := &ProviderConstraints{}
+		constraints.AddPin(ProviderPin{ChannelId: 7, Source: PinSourceOriginTask, Rank: PinRankOriginTask, RetryMode: PinRetrySameChannel})
+		constraints.AddPin(ProviderPin{ChannelId: 7, Source: PinSourceToken, Rank: PinRankToken, RetryMode: PinRetrySingleAttempt})
 
 		pin, found, overridden := constraints.ResolvedPin()
 		require.True(t, found)
@@ -38,7 +38,7 @@ func TestResolvedPinPriorityAndMerge(t *testing.T) {
 	})
 
 	t.Run("empty set has no pin", func(t *testing.T) {
-		pin, found, overridden := (*ChannelConstraints)(nil).ResolvedPin()
+		pin, found, overridden := (*ProviderConstraints)(nil).ResolvedPin()
 		assert.False(t, found)
 		assert.Zero(t, pin.ChannelId)
 		assert.Nil(t, overridden)

@@ -665,7 +665,7 @@ func TestAdvancedCustomValidateRoutePassThroughBody(t *testing.T) {
 
 func TestChannelSettingsHTTPTransportJSONRoundTrip(t *testing.T) {
 	legacy := `{"proxy":"http://127.0.0.1:8080","force_format":true}`
-	var settings ChannelSettings
+	var settings ProviderSettings
 	require.NoError(t, json.Unmarshal([]byte(legacy), &settings))
 	assert.Equal(t, "http://127.0.0.1:8080", settings.Proxy)
 	assert.True(t, settings.ForceFormat)
@@ -678,7 +678,7 @@ func TestChannelSettingsHTTPTransportJSONRoundTrip(t *testing.T) {
 	assert.NotContains(t, string(encoded), "http2_connection_shards")
 	assert.NotContains(t, string(encoded), "tls_insecure_skip_verify")
 
-	explicit := ChannelSettings{
+	explicit := ProviderSettings{
 		Proxy:                 "socks5://127.0.0.1:1080",
 		HTTPProtocol:          HTTPProtocolHTTP1,
 		HTTP2ConnectionShards: 1,
@@ -689,13 +689,13 @@ func TestChannelSettingsHTTPTransportJSONRoundTrip(t *testing.T) {
 	assert.Contains(t, string(encoded), `"http_protocol":"http1"`)
 	assert.Contains(t, string(encoded), `"tls_insecure_skip_verify":true`)
 
-	var decoded ChannelSettings
+	var decoded ProviderSettings
 	require.NoError(t, json.Unmarshal(encoded, &decoded))
 	assert.Equal(t, explicit.HTTPProtocol, decoded.HTTPProtocol)
 	assert.Equal(t, 1, decoded.HTTP2ConnectionShards)
 	assert.True(t, decoded.TLSInsecureSkipVerify)
 
-	sharded := ChannelSettings{HTTP2ConnectionShards: 4}
+	sharded := ProviderSettings{HTTP2ConnectionShards: 4}
 	encoded, err = json.Marshal(sharded)
 	require.NoError(t, err)
 	assert.Contains(t, string(encoded), `"http2_connection_shards":4`)
@@ -703,36 +703,36 @@ func TestChannelSettingsHTTPTransportJSONRoundTrip(t *testing.T) {
 }
 
 func TestChannelSettingsValidateHTTPTransport(t *testing.T) {
-	require.NoError(t, (&ChannelSettings{}).ValidateHTTPTransport())
-	require.NoError(t, (&ChannelSettings{HTTPProtocol: "AUTO"}).ValidateHTTPTransport())
-	require.NoError(t, (&ChannelSettings{HTTPProtocol: "http1"}).ValidateHTTPTransport())
-	require.NoError(t, (&ChannelSettings{HTTP2ConnectionShards: 8}).ValidateHTTPTransport())
+	require.NoError(t, (&ProviderSettings{}).ValidateHTTPTransport())
+	require.NoError(t, (&ProviderSettings{HTTPProtocol: "AUTO"}).ValidateHTTPTransport())
+	require.NoError(t, (&ProviderSettings{HTTPProtocol: "http1"}).ValidateHTTPTransport())
+	require.NoError(t, (&ProviderSettings{HTTP2ConnectionShards: 8}).ValidateHTTPTransport())
 
-	err := (&ChannelSettings{HTTPProtocol: "http2"}).ValidateHTTPTransport()
+	err := (&ProviderSettings{HTTPProtocol: "http2"}).ValidateHTTPTransport()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "http_protocol")
 
-	err = (&ChannelSettings{HTTP2ConnectionShards: -1}).ValidateHTTPTransport()
+	err = (&ProviderSettings{HTTP2ConnectionShards: -1}).ValidateHTTPTransport()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "http2_connection_shards")
 
-	err = (&ChannelSettings{HTTP2ConnectionShards: 9}).ValidateHTTPTransport()
+	err = (&ProviderSettings{HTTP2ConnectionShards: 9}).ValidateHTTPTransport()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "http2_connection_shards")
 
-	err = (&ChannelSettings{HTTPProtocol: "http1", HTTP2ConnectionShards: 2}).ValidateHTTPTransport()
+	err = (&ProviderSettings{HTTPProtocol: "http1", HTTP2ConnectionShards: 2}).ValidateHTTPTransport()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "http2_connection_shards")
 }
 
 func TestChannelOtherSettingsValidateToolLossPolicy(t *testing.T) {
-	require.NoError(t, (*ChannelOtherSettings)(nil).ValidateToolLossPolicy())
-	require.NoError(t, (&ChannelOtherSettings{}).ValidateToolLossPolicy())
-	require.NoError(t, (&ChannelOtherSettings{ToolLossPolicy: "allow"}).ValidateToolLossPolicy())
-	require.NoError(t, (&ChannelOtherSettings{ToolLossPolicy: "safe"}).ValidateToolLossPolicy())
-	require.NoError(t, (&ChannelOtherSettings{ToolLossPolicy: "strict"}).ValidateToolLossPolicy())
+	require.NoError(t, (*ProviderOtherSettings)(nil).ValidateToolLossPolicy())
+	require.NoError(t, (&ProviderOtherSettings{}).ValidateToolLossPolicy())
+	require.NoError(t, (&ProviderOtherSettings{ToolLossPolicy: "allow"}).ValidateToolLossPolicy())
+	require.NoError(t, (&ProviderOtherSettings{ToolLossPolicy: "safe"}).ValidateToolLossPolicy())
+	require.NoError(t, (&ProviderOtherSettings{ToolLossPolicy: "strict"}).ValidateToolLossPolicy())
 
-	err := (&ChannelOtherSettings{ToolLossPolicy: "drop"}).ValidateToolLossPolicy()
+	err := (&ProviderOtherSettings{ToolLossPolicy: "drop"}).ValidateToolLossPolicy()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "tool_loss_policy")
 }

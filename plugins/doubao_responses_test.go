@@ -87,7 +87,7 @@ func submitDoubaoImage(t *testing.T, plugin *jsplugin.LoadedPlugin, action strin
 	modelName := request["model"].(string)
 	// RelayTask copies the decode action onto the relay info before the adaptor runs.
 	info := &relaycommon.RelayInfo{
-		ChannelMeta:     &relaycommon.ChannelMeta{ChannelBaseUrl: doubaoBaseURL, UpstreamModelName: modelName},
+		ProviderMeta:    &relaycommon.ProviderMeta{ChannelBaseUrl: doubaoBaseURL, UpstreamModelName: modelName},
 		OriginModelName: modelName,
 		TaskRelayInfo:   &relaycommon.TaskRelayInfo{PublicTaskID: "task_public", Action: action},
 	}
@@ -359,7 +359,7 @@ func TestDoubaoSeedanceUsageFacts(t *testing.T) {
 			request := map[string]any{"model": tc.model, "prompt": "a cat", "seconds": float64(5)}
 			maps.Copy(request, tc.request)
 			info := &relaycommon.RelayInfo{
-				ChannelMeta:     &relaycommon.ChannelMeta{ChannelBaseUrl: doubaoBaseURL, UpstreamModelName: tc.model},
+				ProviderMeta:    &relaycommon.ProviderMeta{ChannelBaseUrl: doubaoBaseURL, UpstreamModelName: tc.model},
 				OriginModelName: tc.model,
 				TaskRelayInfo:   &relaycommon.TaskRelayInfo{PublicTaskID: "task_public", Action: "text_to_video"},
 			}
@@ -419,7 +419,7 @@ func TestDoubaoSeedanceUsageFacts(t *testing.T) {
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				info := &relaycommon.RelayInfo{
-					ChannelMeta:     &relaycommon.ChannelMeta{ChannelBaseUrl: doubaoBaseURL, UpstreamModelName: tc.model},
+					ProviderMeta:    &relaycommon.ProviderMeta{ChannelBaseUrl: doubaoBaseURL, UpstreamModelName: tc.model},
 					OriginModelName: tc.model,
 					TaskRelayInfo:   &relaycommon.TaskRelayInfo{PublicTaskID: "task_public", Action: "text_to_video"},
 				}
@@ -620,7 +620,7 @@ func TestDoubaoImageResults(t *testing.T) {
 
 	parseResponse := func(t *testing.T, model string, request map[string]any, payload map[string]any) *relaycommon.TaskInfo {
 		t.Helper()
-		info := &relaycommon.RelayInfo{OriginModelName: model, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: model, ChannelBaseUrl: doubaoBaseURL}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_public"}}
+		info := &relaycommon.RelayInfo{OriginModelName: model, ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: model, ChannelBaseUrl: doubaoBaseURL}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_public"}}
 		adaptor := taskplugin.New(plugin)
 		adaptor.Init(info)
 		c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -1014,7 +1014,7 @@ func TestDoubaoImageEndpointMappingKeepsDeclaredModel(t *testing.T) {
 			request := map[string]any{"model": declared}
 			maps.Copy(request, tc.body)
 			info := &relaycommon.RelayInfo{
-				ChannelMeta:     &relaycommon.ChannelMeta{ChannelBaseUrl: doubaoBaseURL, UpstreamModelName: endpoint},
+				ProviderMeta:    &relaycommon.ProviderMeta{ChannelBaseUrl: doubaoBaseURL, UpstreamModelName: endpoint},
 				OriginModelName: declared,
 				TaskRelayInfo:   &relaycommon.TaskRelayInfo{PublicTaskID: "task_public", Action: "text_to_image"},
 			}
@@ -1168,7 +1168,7 @@ func TestDoubaoNativeOfficialBodies(t *testing.T) {
 		request, err := decodeDoubaoImage(t, registry, plugin, map[string]any{"model": lite, "prompt": "seasons", "stream": true, "response_format": "b64_json",
 			"sequential_image_generation": "auto", "sequential_image_generation_options": map[string]any{"max_images": 3}})
 		require.NoError(t, err)
-		info := &relaycommon.RelayInfo{OriginModelName: lite, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: lite, ChannelBaseUrl: doubaoBaseURL},
+		info := &relaycommon.RelayInfo{OriginModelName: lite, ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: lite, ChannelBaseUrl: doubaoBaseURL},
 			TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_public", Action: "text_to_image"}}
 		adaptor := taskplugin.New(plugin)
 		adaptor.Init(info)

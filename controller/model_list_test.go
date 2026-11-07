@@ -38,7 +38,7 @@ func setupModelListControllerTestDB(t *testing.T) *gorm.DB {
 	gin.SetMode(gin.TestMode)
 	common.RedisEnabled = false
 	db := model.UseTestDatabases(t)
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Ability{}, &model.Model{}, &model.Vendor{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Provider{}, &model.Ability{}, &model.Model{}, &model.Vendor{}))
 	return db
 }
 
@@ -288,7 +288,7 @@ func TestListModelsUsesAdvancedCustomEndpointTypesFromPricingCache(t *testing.T)
 		Status:   common.UserStatusEnabled,
 	}).Error)
 
-	channel := &model.Channel{
+	channel := &model.Provider{
 		Id:     701,
 		Type:   constant.ChannelTypeAdvancedCustom,
 		Key:    "advanced-custom-key",
@@ -297,7 +297,7 @@ func TestListModelsUsesAdvancedCustomEndpointTypesFromPricingCache(t *testing.T)
 		Group:  "default",
 		Models: "gemini-3.5-flash",
 	}
-	channel.SetOtherSettings(dto.ChannelOtherSettings{
+	channel.SetOtherSettings(dto.ProviderOtherSettings{
 		AdvancedCustom: &dto.AdvancedCustomConfig{
 			Routes: []dto.AdvancedCustomRoute{
 				{
@@ -321,7 +321,7 @@ func TestListModelsUsesAdvancedCustomEndpointTypesFromPricingCache(t *testing.T)
 		Enabled:   true,
 	}).Error)
 
-	model.InitChannelCache()
+	model.InitProviderCache()
 	model.GetPricing()
 
 	recorder := httptest.NewRecorder()

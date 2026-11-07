@@ -251,6 +251,9 @@ func ensureUserQuotaColumns(db *gorm.DB) error {
 }
 
 func migrateDB() error {
+	if err := migrateProviderTable(DB); err != nil {
+		return err
+	}
 	if err := migrateTokenKeyUniqueness(DB); err != nil {
 		return err
 	}
@@ -268,7 +271,7 @@ func migrateDB() error {
 	}
 
 	err := DB.AutoMigrate(
-		&Channel{},
+		&Provider{},
 		&Token{},
 		&User{},
 		&UserSession{},

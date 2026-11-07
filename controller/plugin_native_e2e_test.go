@@ -90,7 +90,7 @@ func TestKlingNativeRouteSubmitPollSettleAndQuery(t *testing.T) {
 	previousLogConsume := common.LogConsumeEnabled
 	previousRedisEnabled := common.RedisEnabled
 	database := model.UseTestDatabases(t)
-	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Channel{}, &model.Task{}, &model.Log{}))
+	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Provider{}, &model.Task{}, &model.Log{}))
 	common.MemoryCacheEnabled = false
 	common.BatchUpdateEnabled = false
 	common.LogConsumeEnabled = false
@@ -136,7 +136,7 @@ func TestKlingNativeRouteSubmitPollSettleAndQuery(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	channel := model.Channel{
+	channel := model.Provider{
 		Type:    constant.ChannelTypeKling,
 		Name:    "kling-native-e2e",
 		Key:     "sk-test",
@@ -275,7 +275,7 @@ func TestDoubaoRelayedImageStreamSettlement(t *testing.T) {
 	previousRedisEnabled := common.RedisEnabled
 	previousDeadline := constant.TaskPluginProtocolTimeoutSeconds
 	database := model.UseTestDatabases(t)
-	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Channel{}, &model.Task{}, &model.Log{}))
+	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Provider{}, &model.Task{}, &model.Log{}))
 	common.MemoryCacheEnabled = false
 	common.BatchUpdateEnabled = false
 	common.LogConsumeEnabled = true
@@ -339,7 +339,7 @@ func TestDoubaoRelayedImageStreamSettlement(t *testing.T) {
 		}
 	}))
 	defer upstream.Close()
-	channel := model.Channel{Type: constant.ChannelTypeDoubaoVideo, Name: "ark-relayed-stream", Key: "ark-key", BaseURL: &upstream.URL,
+	channel := model.Provider{Type: constant.ChannelTypeDoubaoVideo, Name: "ark-relayed-stream", Key: "ark-key", BaseURL: &upstream.URL,
 		Status: common.ChannelStatusEnabled, Models: seedream, Group: "default"}
 	require.NoError(t, database.Create(&channel).Error)
 	generation := pluginruntime.DefaultRegistry.Generation()

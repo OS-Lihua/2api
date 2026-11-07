@@ -2,7 +2,7 @@ package controller
 
 import "github.com/QuantumNous/new-api/model"
 
-func channelHasSensitiveChanges(channel *PatchChannel, origin *model.Channel, requestData map[string]any) bool {
+func channelHasSensitiveChanges(channel *PatchProvider, origin *model.Provider, requestData map[string]any) bool {
 	if _, ok := requestData["type"]; ok && channel.Type != origin.Type {
 		return true
 	}
@@ -90,7 +90,7 @@ var channelReadOnlyFields = map[string]struct{}{
 	"used_quota":           {},
 }
 
-func clearChannelReadOnlyFields(channel *PatchChannel, requestData map[string]any) {
+func clearChannelReadOnlyFields(channel *PatchProvider, requestData map[string]any) {
 	if _, ok := requestData["created_time"]; ok {
 		channel.CreatedTime = 0
 	}
@@ -113,7 +113,7 @@ func clearChannelReadOnlyFields(channel *PatchChannel, requestData map[string]an
 
 // channelNonSensitiveFields lists routing / server-managed channel
 // fields a ChannelWrite admin may edit without ChannelSensitiveWrite. When a new
-// field is added to model.Channel it must be added to either this set or
+// field is added to model.Provider it must be added to either this set or
 // channelSensitiveFields or channelOperationalFields; otherwise it falls through
 // to the fail-closed branch and is treated as sensitive. The
 // TestChannelFieldsAreClassified guard test enforces this.

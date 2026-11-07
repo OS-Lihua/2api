@@ -278,7 +278,7 @@ func TestExecuteTaskSubmissionHonorsRouteRetainResult(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			events := make([]string, 0, 3)
-			database := openTaskTestDatabase(t, &model.Task{}, &model.User{}, &model.Channel{})
+			database := openTaskTestDatabase(t, &model.Task{}, &model.User{}, &model.Provider{})
 			previousDB := model.DB
 			model.DB = database
 			t.Cleanup(func() { model.DB = previousDB })
@@ -487,9 +487,9 @@ func taskSubmissionRelayInfo(billing relaycommon.BillingSettler) *relaycommon.Re
 		Billing:         billing,
 		TaskRelayInfo: &relaycommon.TaskRelayInfo{
 			PublicTaskID:  "task_public",
-			LockedChannel: &model.Channel{Id: 1, Type: constant.ChannelTypeTaskPlugin, Name: "plugin"},
+			LockedChannel: &model.Provider{Id: 1, Type: constant.ChannelTypeTaskPlugin, Name: "plugin"},
 		},
-		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 1, ChannelType: constant.ChannelTypeTaskPlugin},
+		ProviderMeta: &relaycommon.ProviderMeta{ChannelId: 1, ChannelType: constant.ChannelTypeTaskPlugin},
 	}
 }
 
@@ -505,7 +505,7 @@ func openTaskTestDatabase(t *testing.T, models ...any) *gorm.DB {
 // Uses the real submit adaptor, expression evaluator, BillingSession, task row
 // and consume log.
 func TestImmediateTaskSettlementDatabase(t *testing.T) {
-	db := openTaskTestDatabase(t, &model.User{}, &model.Channel{}, &model.Task{}, &model.Log{})
+	db := openTaskTestDatabase(t, &model.User{}, &model.Provider{}, &model.Task{}, &model.Log{})
 	oldDB, oldLogDB := model.DB, model.LOG_DB
 	oldLog := common.LogDatabaseType()
 	oldRedis, oldMemory, oldBatch, oldConsume, oldExport := common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled
@@ -556,7 +556,7 @@ export function buildQueryRequest(){throw new Error("completed submissions must 
 			initial := int(20 * common.QuotaPerUnit)
 			user := model.User{Username: fmt.Sprintf("task_user_%d", index), AffCode: fmt.Sprintf("task_aff_%d", index), Quota: initial}
 			require.NoError(t, db.Create(&user).Error)
-			ch := model.Channel{Name: "test provider", Type: constant.ChannelTypeTaskPlugin}
+			ch := model.Provider{Name: "test provider", Type: constant.ChannelTypeTaskPlugin}
 			require.NoError(t, db.Create(&ch).Error)
 			c := taskSubmissionTestContext()
 			c.Set("group", "default")

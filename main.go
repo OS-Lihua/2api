@@ -87,22 +87,22 @@ func main() {
 		common.SysLog(common.LogText("memory cache enabled"))
 		common.SysLog(common.LogText("sync frequency: %d seconds", common.SyncFrequency))
 
-		// Add panic recovery and retry for InitChannelCache
+		// Add panic recovery and retry for InitProviderCache
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					common.SysLog(common.LogText("InitChannelCache panic: %v, retrying once", r))
+					common.SysLog(common.LogText("InitProviderCache panic: %v, retrying once", r))
 					// Retry once
 					_, _, fixErr := model.FixAbility()
 					if fixErr != nil {
-						common.FatalLog(common.LogText("InitChannelCache failed: %s", fixErr.Error()))
+						common.FatalLog(common.LogText("InitProviderCache failed: %s", fixErr.Error()))
 					}
 				}
 			}()
-			model.InitChannelCache()
+			model.InitProviderCache()
 		}()
 
-		go model.SyncChannelCache(common.SyncFrequency)
+		go model.SyncProviderCache(common.SyncFrequency)
 	}
 	wsmanager.StartSubscriber(context.Background())
 

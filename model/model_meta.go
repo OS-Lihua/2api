@@ -29,7 +29,7 @@ const (
 	ModelSquarePartial     ModelSquareState = "partial"
 )
 
-type BoundChannel struct {
+type BoundProvider struct {
 	Name string `json:"name"`
 	Type int    `json:"type"`
 }
@@ -50,10 +50,10 @@ type Model struct {
 	DeletedAt          gorm.DeletedAt `json:"-" gorm:"index;uniqueIndex:uk_model_name_delete_at,priority:2"`
 	Capabilities       capability.Set `json:"capabilities" gorm:"type:jsonb"` // exact-name Models only
 
-	BoundChannels []BoundChannel `json:"bound_channels,omitempty" gorm:"-"`
-	EnableGroups  []string       `json:"enable_groups,omitempty" gorm:"-"`
-	QuotaTypes    []int          `json:"quota_types,omitempty" gorm:"-"`
-	NameRule      int            `json:"name_rule" gorm:"default:0"`
+	BoundChannels []BoundProvider `json:"bound_channels,omitempty" gorm:"-"`
+	EnableGroups  []string        `json:"enable_groups,omitempty" gorm:"-"`
+	QuotaTypes    []int           `json:"quota_types,omitempty" gorm:"-"`
+	NameRule      int             `json:"name_rule" gorm:"default:0"`
 
 	MatchedModels []string `json:"matched_models,omitempty" gorm:"-"`
 	MatchedCount  int      `json:"matched_count,omitempty" gorm:"-"`
@@ -175,9 +175,9 @@ func FillModelSquareStates(rows []*Model, configured map[string][]int, connectio
 	return nil
 }
 
-// GetConfiguredModelChannels includes disabled channels and reads no credentials.
-func GetConfiguredModelChannels() (map[string][]int, error) {
-	var channels []Channel
+// GetConfiguredModelProviders includes disabled channels and reads no credentials.
+func GetConfiguredModelProviders() (map[string][]int, error) {
+	var channels []Provider
 	if err := DB.Select("id", "models").Find(&channels).Error; err != nil {
 		return nil, err
 	}
@@ -190,9 +190,9 @@ func GetConfiguredModelChannels() (map[string][]int, error) {
 	return configured, nil
 }
 
-// SearchModelsWithChannels augments metadata with concrete configured names.
+// SearchModelsWithProviders augments metadata with concrete configured names.
 // Synthetic rows never persist and never affect the public pricing catalog.
-func SearchModelsWithChannels(keyword, vendor, status, syncOfficial string, offset, limit int) ([]*Model, int64, error) {
+func SearchModelsWithProviders(keyword, vendor, status, syncOfficial string, offset, limit int) ([]*Model, int64, error) {
 	records, _, err := SearchModels(keyword, vendor, status, syncOfficial, 0, -1)
 	if err != nil {
 		return nil, 0, err
@@ -200,7 +200,7 @@ func SearchModelsWithChannels(keyword, vendor, status, syncOfficial string, offs
 	_, filterStatus := parseModelStatusFilter(status)
 	_, filterSync := parseModelSyncFilter(syncOfficial)
 	if !filterStatus && !filterSync && (vendor == "" || vendor == "0") {
-		configured, err := GetConfiguredModelChannels()
+		configured, err := GetConfiguredModelProviders()
 		if err != nil {
 			return nil, 0, err
 		}
@@ -360,7 +360,7 @@ func DeleteModelMetadata(ids []int, removeFromChannels, removePricing bool) (Mod
 			names[record.ModelName] = struct{}{}
 		}
 		if removeFromChannels {
-			var channels []Channel
+			var channels []Provider
 			// Read only routing fields. Lock channels in a consistent order, then
 			// update models and abilities in the same transaction as metadata.
 			if err := lockForUpdate(tx).Select("id", "models", "status", "group", "priority", "weight", "tag").Order("id").Find(&channels).Error; err != nil {
@@ -378,7 +378,7 @@ func DeleteModelMetadata(ids []int, removeFromChannels, removePricing bool) (Mod
 					continue
 				}
 				channel.Models = strings.Join(remaining, ",")
-				if err := tx.Model(&Channel{}).Where("id = ?", channel.Id).Update("models", channel.Models).Error; err != nil {
+				if err := tx.Model(&Provider{}).Where("id = ?", channel.Id).Update("models", channel.Models).Error; err != nil {
 					return err
 				}
 				if err := channel.UpdateAbilities(tx); err != nil {
@@ -421,7 +421,7 @@ func DeleteModelMetadata(ids []int, removeFromChannels, removePricing bool) (Mod
 		return ModelDeleteResult{}, err
 	}
 	if result.UpdatedChannels > 0 {
-		InitChannelCache()
+		InitProviderCache()
 	}
 	RefreshPricing()
 	return result, nil
@@ -452,16 +452,16 @@ func GetAllModels(offset int, limit int) ([]*Model, error) {
 
 // ModelConnection describes an enabled route independently of catalog visibility or price.
 type ModelConnection struct {
-	AbilityWithChannel
+	AbilityWithProvider
 	ChannelName string `json:"channel_name"`
 }
 
 func GetModelConnections() ([]ModelConnection, error) {
 	var connections []ModelConnection
 	err := DB.Table("abilities").
-		Select("abilities.*, channels.type as channel_type, channels.name as channel_name").
-		Joins("JOIN channels ON abilities.channel_id = channels.id").
-		Where("abilities.enabled = ? AND channels.status = ?", true, common.ChannelStatusEnabled).
+		Select("abilities.*, providers.type as channel_type, providers.name as channel_name").
+		Joins("JOIN providers ON abilities.channel_id = providers.id").
+		Where("abilities.enabled = ? AND providers.status = ?", true, common.ChannelStatusEnabled).
 		Order("abilities.model, abilities.channel_id").
 		Scan(&connections).Error
 	return connections, err
@@ -484,7 +484,7 @@ func normalizeLookupValues(values []string) []string {
 	return normalized
 }
 
-func GetPreferredModelOwnerChannelTypes(modelNames []string, groups []string) (map[string]int, error) {
+func GetPreferredModelOwnerProviderTypes(modelNames []string, groups []string) (map[string]int, error) {
 	result := make(map[string]int)
 	modelNames = normalizeLookupValues(modelNames)
 	if len(modelNames) == 0 {
@@ -498,9 +498,9 @@ func GetPreferredModelOwnerChannelTypes(modelNames []string, groups []string) (m
 	var rows []row
 
 	query := DB.Table("abilities").
-		Select("abilities.model as model, channels.type as channel_type").
-		Joins("JOIN channels ON abilities.channel_id = channels.id").
-		Where("abilities.model IN ? AND abilities.enabled = ? AND channels.status = ?", modelNames, true, common.ChannelStatusEnabled).
+		Select("abilities.model as model, providers.type as channel_type").
+		Joins("JOIN providers ON abilities.channel_id = providers.id").
+		Where("abilities.model IN ? AND abilities.enabled = ? AND providers.status = ?", modelNames, true, common.ChannelStatusEnabled).
 		Order("COALESCE(abilities.priority, 0) DESC").
 		Order("abilities.weight DESC").
 		Order("abilities.channel_id ASC")

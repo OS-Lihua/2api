@@ -11,7 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
-type ChannelSettings struct {
+type ProviderSettings struct {
 	TaskPluginKey             string `json:"task_plugin_key,omitempty"`
 	ForceFormat               bool   `json:"force_format,omitempty"`
 	ThinkingToContent         bool   `json:"thinking_to_content,omitempty"`
@@ -39,7 +39,7 @@ type ChannelSettings struct {
 
 // BindsTaskPlugin reports whether the channel is bound to the task plugin,
 // either through the single binding or the New API extension list.
-func (s ChannelSettings) BindsTaskPlugin(key string) bool {
+func (s ProviderSettings) BindsTaskPlugin(key string) bool {
 	if key == "" {
 		return false
 	}
@@ -48,7 +48,7 @@ func (s ChannelSettings) BindsTaskPlugin(key string) bool {
 
 // TaskPluginBindings returns the sorted, de-duplicated set of task plugins the
 // channel binds through either field, so callers can compare bindings as a set.
-func (s ChannelSettings) TaskPluginBindings() []string {
+func (s ProviderSettings) TaskPluginBindings() []string {
 	bindings := make([]string, 0, len(s.TaskExtendPluginKeys)+1)
 	if s.TaskPluginKey != "" {
 		bindings = append(bindings, s.TaskPluginKey)
@@ -69,7 +69,7 @@ const (
 )
 
 // ValidateHTTPTransport validates save-time HTTP transport channel settings.
-func (s *ChannelSettings) ValidateHTTPTransport() error {
+func (s *ProviderSettings) ValidateHTTPTransport() error {
 	if s == nil {
 		return nil
 	}
@@ -109,7 +109,7 @@ const (
 	AwsApiTypeMantle      AwsApiType = "mantle"
 )
 
-type ChannelOtherSettings struct {
+type ProviderOtherSettings struct {
 	AzureResponsesVersion                 string                `json:"azure_responses_version,omitempty"`
 	VertexKeyType                         VertexKeyType         `json:"vertex_key_type,omitempty"`    // "json" or "api_key"
 	VertexProjectID                       string                `json:"vertex_project_id,omitempty"`  // 仅当 vertex_key_type=api_key 时使用；JSON 模式下从 service account 解析
@@ -142,7 +142,7 @@ type ChannelOtherSettings struct {
 	ToolLossPolicy string `json:"tool_loss_policy,omitempty"`
 }
 
-func (s *ChannelOtherSettings) IsOpenRouterEnterprise() bool {
+func (s *ProviderOtherSettings) IsOpenRouterEnterprise() bool {
 	if s == nil || s.OpenRouterEnterprise == nil {
 		return false
 	}
@@ -151,7 +151,7 @@ func (s *ChannelOtherSettings) IsOpenRouterEnterprise() bool {
 
 // ValidateToolLossPolicy validates the channel-level request-phase tool-loss
 // policy. Empty keeps the default allow policy.
-func (s *ChannelOtherSettings) ValidateToolLossPolicy() error {
+func (s *ProviderOtherSettings) ValidateToolLossPolicy() error {
 	if s == nil {
 		return nil
 	}

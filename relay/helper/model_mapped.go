@@ -12,8 +12,8 @@ import (
 )
 
 func ModelMappedHelper(c *gin.Context, info *relaycommon.RelayInfo, request dto.Request) error {
-	if info.ChannelMeta == nil {
-		info.ChannelMeta = &relaycommon.ChannelMeta{}
+	if info.ProviderMeta == nil {
+		info.ProviderMeta = &relaycommon.ProviderMeta{}
 	}
 
 	// map model name

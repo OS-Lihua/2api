@@ -22,7 +22,7 @@ import (
 // settings API. It is rebuilt from the option map on every option write, so
 // the runtime globals updated by the same write never disagree with it.
 type RequestPolicySnapshot struct {
-	Affinity        operation_setting.ChannelAffinitySetting
+	Affinity        operation_setting.ProviderAffinitySetting
 	RetryTimes      int
 	RetryCodes      []operation_setting.StatusCodeRange
 	DisableCodes    []operation_setting.StatusCodeRange

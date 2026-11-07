@@ -64,7 +64,7 @@ func fetchCodexChannelWhamData(
 		return
 	}
 
-	ch, err := model.GetChannelById(channelId, true)
+	ch, err := model.GetProviderById(channelId, true)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -77,7 +77,7 @@ func fetchCodexChannelWhamData(
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": "channel type is not Codex"})
 		return
 	}
-	if ch.ChannelInfo.IsMultiKey {
+	if ch.ProviderInfo.IsMultiKey {
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": "multi-key channel is not supported"})
 		return
 	}
@@ -132,8 +132,8 @@ func fetchCodexChannelWhamData(
 
 			encoded, encErr := common.Marshal(oauthKey)
 			if encErr == nil {
-				_ = model.DB.Model(&model.Channel{}).Where("id = ?", ch.Id).Update("key", string(encoded)).Error
-				model.InitChannelCache()
+				_ = model.DB.Model(&model.Provider{}).Where("id = ?", ch.Id).Update("key", string(encoded)).Error
+				model.InitProviderCache()
 			}
 
 			ctx2, cancel2 := context.WithTimeout(c.Request.Context(), 15*time.Second)

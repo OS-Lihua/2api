@@ -33,7 +33,7 @@ func TestFixedPriceBillingDatabase(t *testing.T) {
 	db := model.UseTestDatabases(t)
 	model.LOG_DB = db
 	common.SetLogDatabaseType(common.DatabaseTypePostgreSQL)
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Log{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Provider{}, &model.Log{}))
 	runFixedPriceAccountingCases(t, db, db)
 }
 
@@ -98,7 +98,7 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 			require.NoError(t, db.Create(&user).Error)
 			token := model.Token{UserId: user.Id, Key: fmt.Sprintf("fixed-billing-test-%d", index), Name: "fixed-billing", RemainQuota: startingQuota, Status: common.TokenStatusEnabled}
 			require.NoError(t, db.Create(&token).Error)
-			channel := model.Channel{Name: "fixed-billing", Key: "unused", Status: common.ChannelStatusEnabled}
+			channel := model.Provider{Name: "fixed-billing", Key: "unused", Status: common.ChannelStatusEnabled}
 			require.NoError(t, db.Create(&channel).Error)
 			t.Cleanup(func() {
 				require.NoError(t, logDB.Where("user_id = ?", user.Id).Delete(&model.Log{}).Error)
@@ -120,7 +120,7 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 			require.NoError(t, err)
 			snapshot := &billingexpr.BillingSnapshot{BillingMode: "tiered_expr", ExprString: tc.expression, ExprHash: billingexpr.ExprHashString(tc.expression), QuotaPerUnit: common.QuotaPerUnit, GroupRatio: group, EstimatedTier: trace.MatchedTier, EstimatedBillingUnit: trace.BillingUnit, EstimatedFixedPrice: trace.FixedPrice, EstimatedQuotaAfterGroup: reservation}
 			snapshot.EstimatedImageCount = trace.ImageCount
-			info := &relaycommon.RelayInfo{UserId: user.Id, TokenId: token.Id, TokenKey: token.Key, ChannelMeta: &relaycommon.ChannelMeta{ChannelId: channel.Id}, OriginModelName: "fixed-test", UsingGroup: "default", UserGroup: "default", UserSetting: dto.UserSetting{BillingPreference: "wallet_only"}, ForcePreConsume: true, StartTime: time.Now(), IsStream: tc.stream, RelayFormat: types.RelayFormatOpenAI, PriceData: hosttypes.PriceData{GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: group}}, TieredBillingSnapshot: snapshot, BillingRequestInput: request}
+			info := &relaycommon.RelayInfo{UserId: user.Id, TokenId: token.Id, TokenKey: token.Key, ProviderMeta: &relaycommon.ProviderMeta{ChannelId: channel.Id}, OriginModelName: "fixed-test", UsingGroup: "default", UserGroup: "default", UserSetting: dto.UserSetting{BillingPreference: "wallet_only"}, ForcePreConsume: true, StartTime: time.Now(), IsStream: tc.stream, RelayFormat: types.RelayFormatOpenAI, PriceData: hosttypes.PriceData{GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: group}}, TieredBillingSnapshot: snapshot, BillingRequestInput: request}
 			info.SetEstimatePromptTokens(tc.estimate)
 			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 			ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
@@ -894,7 +894,7 @@ func TestPostTextConsumeQuotaBillsOpenAI12hCacheWrites(t *testing.T) {
 				UsingGroup:      "default",
 				StartTime:       time.Now(),
 				RelayFormat:     types.RelayFormatOpenAIResponses,
-				ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: channelID},
+				ProviderMeta:    &relaycommon.ProviderMeta{ChannelId: channelID},
 				PriceData:       tc.price,
 			}
 			if tc.expr != "" {
@@ -924,7 +924,7 @@ func TestCalculateTextQuotaSummarySeparatesOpenRouterCacheReadFromPromptBilling(
 
 	relayInfo := &relaycommon.RelayInfo{
 		OriginModelName: "openai/gpt-4.1",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType: constant.ChannelTypeOpenRouter,
 		},
 		PriceData: hosttypes.PriceData{
@@ -961,7 +961,7 @@ func TestCalculateTextQuotaSummarySeparatesOpenRouterCacheCreationFromPromptBill
 
 	relayInfo := &relaycommon.RelayInfo{
 		OriginModelName: "openai/gpt-4.1",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType: constant.ChannelTypeOpenRouter,
 		},
 		PriceData: hosttypes.PriceData{
@@ -997,7 +997,7 @@ func TestCalculateTextQuotaSummaryKeepsPrePRClaudeOpenRouterBilling(t *testing.T
 	relayInfo := &relaycommon.RelayInfo{
 		FinalRequestRelayFormat: types.RelayFormatClaude,
 		OriginModelName:         "anthropic/claude-3.7-sonnet",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType: constant.ChannelTypeOpenRouter,
 		},
 		PriceData: hosttypes.PriceData{
@@ -1632,7 +1632,7 @@ func TestPostTextConsumeQuotaLogsMissingUsageAsStructuredContent(t *testing.T) {
 		OriginModelName: "missing-usage-model",
 		UsingGroup:      "default",
 		StartTime:       time.Now(),
-		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: channelID},
+		ProviderMeta:    &relaycommon.ProviderMeta{ChannelId: channelID},
 		PriceData:       hosttypes.PriceData{ModelRatio: 1, CompletionRatio: 1, GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1}},
 	}
 

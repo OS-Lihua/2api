@@ -47,7 +47,7 @@ func TestPrepareResponsesRequestRetainsConvertedAdaptor(t *testing.T) {
 	common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeAdvancedCustom)
 	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, server.URL)
 	common.SetContextKey(c, constant.ContextKeyChannelKey, "test-key")
-	common.SetContextKey(c, constant.ContextKeyChannelOtherSetting, dto.ChannelOtherSettings{
+	common.SetContextKey(c, constant.ContextKeyChannelOtherSetting, dto.ProviderOtherSettings{
 		AdvancedCustom: &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{
 			IncomingPath: "/v1/responses", UpstreamPath: "/v1/chat/completions", Converter: relayconvert.ConverterOpenAIResponsesToOpenAIChat,
 		}}},
@@ -171,7 +171,7 @@ func TestTextRequestViaResponsesConvertsClaudeDirectly(t *testing.T) {
 		RelayFormat:            relaytypes.RelayFormatClaude,
 		OriginModelName:        "gpt-5.6-sol",
 		RequestConversionChain: []relaytypes.RelayFormat{relaytypes.RelayFormatClaude},
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType:       constant.ChannelTypeOpenAI,
 			ChannelBaseUrl:    server.URL,
 			ApiKey:            "test-key",
@@ -247,8 +247,8 @@ func TestApplySystemPromptIfNeededSkipsToolLoadingMessages(t *testing.T) {
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
 			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 			info := &relaycommon.RelayInfo{
-				ChannelMeta: &relaycommon.ChannelMeta{
-					ChannelSetting: dto.ChannelSettings{
+				ProviderMeta: &relaycommon.ProviderMeta{
+					ChannelSetting: dto.ProviderSettings{
 						SystemPrompt:         "Answer in English.",
 						SystemPromptOverride: true,
 					},

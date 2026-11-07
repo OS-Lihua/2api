@@ -2063,11 +2063,11 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 		common.IsMasterNode = previousMaster
 		common.MemoryCacheEnabled, common.RedisEnabled = previousCache, previousRedis
 		if model.DB != nil {
-			model.InitChannelCache()
+			model.InitProviderCache()
 		}
 	})
 	database := model.UseTestDatabases(t)
-	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}))
+	require.NoError(t, database.AutoMigrate(&model.Provider{}, &model.Ability{}, &model.Task{}))
 
 	for _, memoryCache := range []bool{false, true} {
 		t.Run(fmt.Sprintf("memory_cache=%t", memoryCache), func(t *testing.T) {
@@ -2120,7 +2120,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 				{name: "rejected shared candidate still allows another plugin", pluginOnly: true, shared: true, decoderRejects: true, pluginPriority: 20, wantPlugin: true},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
-					for _, table := range []any{&model.Ability{}, &model.Channel{}, &model.Task{}} {
+					for _, table := range []any{&model.Ability{}, &model.Provider{}, &model.Task{}} {
 						require.NoError(t, database.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(table).Error)
 					}
 					key := "channel-route-test"
@@ -2144,15 +2144,15 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 						require.NoError(t, err)
 						t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(key)) })
 					}
-					ordinary := &model.Channel{Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Name: "ordinary", Key: "ordinary-key", Group: "route-test", Models: modelName, Priority: common.GetPointer(tc.ordinaryPriority + 1)}
+					ordinary := &model.Provider{Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Name: "ordinary", Key: "ordinary-key", Group: "route-test", Models: modelName, Priority: common.GetPointer(tc.ordinaryPriority + 1)}
 					if tc.ordinaryType != 0 {
 						ordinary.Type = tc.ordinaryType
 					}
-					plugin := &model.Channel{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Name: "plugin", Key: "plugin-key", Group: "route-test", Models: modelName, Priority: &tc.pluginPriority}
+					plugin := &model.Provider{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Name: "plugin", Key: "plugin-key", Group: "route-test", Models: modelName, Priority: &tc.pluginPriority}
 					if tc.pluginType != 0 {
 						plugin.Type = tc.pluginType
 					}
-					plugin.SetSetting(kitdto.ChannelSettings{TaskPluginKey: key})
+					plugin.SetSetting(kitdto.ProviderSettings{TaskPluginKey: key})
 					if tc.legacy {
 						plugin.Type = constant.ChannelTypeAli
 					}
@@ -2160,7 +2160,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 						plugin.ModelMapping = common.GetPointer(`{"friendly-image":"channel-route-model"}`)
 					}
 					if tc.unrelated {
-						plugin.SetSetting(kitdto.ChannelSettings{TaskPluginKey: "unrelated"})
+						plugin.SetSetting(kitdto.ProviderSettings{TaskPluginKey: "unrelated"})
 					}
 					if tc.wrongGroup {
 						plugin.Group = "another-group"
@@ -2171,12 +2171,12 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 					if tc.disabled {
 						plugin.Status = common.ChannelStatusManuallyDisabled
 					}
-					channels := []*model.Channel{plugin}
+					channels := []*model.Provider{plugin}
 					if !tc.pluginOnly {
 						channels = append(channels, ordinary)
 					}
 					if tc.originPin || tc.retry || tc.shared {
-						alternate := &model.Channel{Type: ordinary.Type, Status: common.ChannelStatusEnabled, Name: "alternate", Key: "alternate-key", Group: "route-test", Models: modelName}
+						alternate := &model.Provider{Type: ordinary.Type, Status: common.ChannelStatusEnabled, Name: "alternate", Key: "alternate-key", Group: "route-test", Models: modelName}
 						if tc.wantPlugin {
 							alternate.Type = plugin.Type
 							alternate.SetSetting(plugin.GetSetting())
@@ -2187,7 +2187,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 							_, err := jsplugin.DefaultRegistry.Register(alternateSource, jsplugin.Options{})
 							require.NoError(t, err)
 							t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(alternateKey)) })
-							alternate.SetSetting(kitdto.ChannelSettings{TaskPluginKey: alternateKey})
+							alternate.SetSetting(kitdto.ProviderSettings{TaskPluginKey: alternateKey})
 						}
 						channels = append(channels, alternate)
 					}
@@ -2197,7 +2197,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 					if tc.originPin {
 						require.NoError(t, database.Create(&model.Task{TaskID: "task-route-origin", UserId: 7, ChannelId: channels[len(channels)-1].Id, Platform: constant.TaskPlatform(key), Status: model.TaskStatusSuccess}).Error)
 					}
-					model.InitChannelCache()
+					model.InitProviderCache()
 					body := []byte(fmt.Sprintf(`{"model":%q,"prompt":"a cat","size":"1024x1024","stream":%t}`, modelName, tc.stream))
 					contentType := "application/json"
 					if tc.multipart {
@@ -2222,7 +2222,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 							if tc.pinPlugin {
 								id = plugin.Id
 							}
-							service.GetChannelConstraints(c).AddPin(dto.ChannelPin{ChannelId: id, Source: dto.PinSourceToken, Rank: dto.PinRankToken})
+							service.GetChannelConstraints(c).AddPin(dto.ProviderPin{ChannelId: id, Source: dto.PinSourceToken, Rank: dto.PinRankToken})
 						}
 					}, RouteTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), Distribute(), func(c *gin.Context) {
 						reached = true
@@ -2384,14 +2384,14 @@ func TestPrepareTaskPluginRouteDecodesEverySharedSubmitCandidate(t *testing.T) {
 // or keeps the alias, and a rejection names the client's model.
 func TestPrepareTaskPluginRouteMatchesChannelAliases(t *testing.T) {
 	setupTaskPluginRouteDB(t)
-	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}))
-	require.NoError(t, model.DB.Create(&model.Channel{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: "key",
+	require.NoError(t, model.DB.AutoMigrate(&model.Provider{}))
+	require.NoError(t, model.DB.Create(&model.Provider{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: "key",
 		Models:       "scoped-alias,outside-alias,shared-alias",
 		ModelMapping: common.GetPointer(`{"scoped-alias":"scoped-model","outside-alias":"other-model","shared-alias":"shared-model"}`)}).Error)
 	// Replace any cached alias view, so the routes' generation builds its own
 	// from this channel.
-	model.InitChannelCache()
-	t.Cleanup(model.InitChannelCache)
+	model.InitProviderCache()
+	t.Cleanup(model.InitProviderCache)
 	shared := `[{method: "POST", path: "/probe/v1/shared", type: "submit", decode: "createJob", render: "jobStatus"}]`
 	router := sharedTaskPluginRouteRouter(t,
 		compileTaskRoutePlugin(t, sharedRouteTestPluginSource("alias-scoped", `["scoped-model", "other-model"]`, `[

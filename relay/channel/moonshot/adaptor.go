@@ -90,7 +90,7 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 }
 
 func getUpstreamModelName(info *relaycommon.RelayInfo, fallback string) string {
-	if info != nil && info.ChannelMeta != nil && info.UpstreamModelName != "" {
+	if info != nil && info.ProviderMeta != nil && info.UpstreamModelName != "" {
 		return info.UpstreamModelName
 	}
 	return fallback

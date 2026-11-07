@@ -21,7 +21,7 @@ func SecureVerificationRequired() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"success": false, "code": "SECURITY_CONTEXT_INVALID", "message": service.ErrVerificationContextInvalid.Error()})
 			return
 		}
-		context, err := common.Marshal(service.ChannelKeyReadContext{ChannelID: channelID})
+		context, err := common.Marshal(service.ProviderKeyReadContext{ChannelID: channelID})
 		if err != nil {
 			c.AbortWithStatus(http.StatusInternalServerError)
 			return

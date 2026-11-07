@@ -119,7 +119,7 @@ func GetModelSupportEndpointTypes(model string) []constant.EndpointType {
 	return make([]constant.EndpointType, 0)
 }
 
-func getPricingEndpointTypesForAbility(ability AbilityWithChannel, advancedCustomConfigs map[int]*dto.AdvancedCustomConfig) []constant.EndpointType {
+func getPricingEndpointTypesForAbility(ability AbilityWithProvider, advancedCustomConfigs map[int]*dto.AdvancedCustomConfig) []constant.EndpointType {
 	if ability.ChannelType != constant.ChannelTypeAdvancedCustom {
 		return common.GetEndpointTypesByChannelType(ability.ChannelType, ability.Model)
 	}
@@ -133,11 +133,11 @@ func getPricingEndpointTypesForAbility(ability AbilityWithChannel, advancedCusto
 // updatePricingLock is held, and nests channelSyncLock.RLock. This defines the
 // global lock order updatePricingLock -> channelSyncLock: any code path holding
 // channelSyncLock must release it before touching the pricing cache (see
-// InitChannelCache / CacheUpdateChannel), otherwise it deadlocks.
+// InitProviderCache / CacheUpdateProvider), otherwise it deadlocks.
 // The returned configs are pointers shared with the channel cache; they are
 // replaced wholesale on update and never mutated in place, so reading them after
 // RUnlock is safe.
-func loadPricingAdvancedCustomConfigs(enableAbilities []AbilityWithChannel) map[int]*dto.AdvancedCustomConfig {
+func loadPricingAdvancedCustomConfigs(enableAbilities []AbilityWithProvider) map[int]*dto.AdvancedCustomConfig {
 	channelIDs := make([]int, 0)
 	seen := make(map[int]struct{})
 	for _, ability := range enableAbilities {
@@ -167,7 +167,7 @@ func loadPricingAdvancedCustomConfigs(enableAbilities []AbilityWithChannel) map[
 	}
 
 	for _, channelID := range channelIDs {
-		channel, err := CacheGetChannel(channelID)
+		channel, err := CacheGetProvider(channelID)
 		if err != nil {
 			common.SysLog(common.LogText("load advanced custom channel settings error: channel_id=%d, error=%v", channelID, err))
 			continue
@@ -191,7 +191,7 @@ func appendPricingEndpoint(endpoints []string, endpoint string) []string {
 
 func updatePricing() {
 	//modelRatios := common.GetModelRatios()
-	enableAbilities, err := GetAllEnableAbilityWithChannels()
+	enableAbilities, err := GetAllEnableAbilityWithProviders()
 	if err != nil {
 		common.SysLog(common.LogText("GetAllEnableAbilityWithChannels error: %v", err))
 		return

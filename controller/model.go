@@ -103,7 +103,7 @@ func init() {
 			}
 			continue
 		}
-		meta := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+		meta := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType: i,
 		}}
 		adaptor := relay.GetAdaptor(apiType)
@@ -129,7 +129,7 @@ func channelOwnerName(channelType int) string {
 	if adaptor == nil {
 		return strings.ToLower(constant.GetChannelTypeName(channelType))
 	}
-	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+	adaptor.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{
 		ChannelType: channelType,
 	}})
 	if name := strings.TrimSpace(adaptor.GetChannelName()); name != "" {
@@ -139,7 +139,7 @@ func channelOwnerName(channelType int) string {
 }
 
 func getPreferredModelOwners(modelNames []string, groups []string) map[string]string {
-	channelTypes, err := model.GetPreferredModelOwnerChannelTypes(modelNames, groups)
+	channelTypes, err := model.GetPreferredModelOwnerProviderTypes(modelNames, groups)
 	if err != nil {
 		common.SysLog(common.LogText("GetPreferredModelOwnerChannelTypes error: %v", err))
 		return map[string]string{}

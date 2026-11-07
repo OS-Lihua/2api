@@ -39,7 +39,7 @@ func TestVLLMStatusPartialFailureAndCredentials(t *testing.T) {
 	defer upstream.Close()
 	base := upstream.URL + "/prefix/"
 	override := `{"X-Source":"status-panel"}`
-	channel := &model.Channel{Type: constant.ChannelTypeVLLM, BaseURL: &base, Key: "test-vllm-key", HeaderOverride: &override}
+	channel := &model.Provider{Type: constant.ChannelTypeVLLM, BaseURL: &base, Key: "test-vllm-key", HeaderOverride: &override}
 	status, err := fetchInferenceStatus(context.Background(), channel)
 	require.NoError(t, err)
 	assert.Equal(t, 200, status.Endpoints["/health"].Status)
@@ -59,11 +59,11 @@ func TestVLLMStatusPartialFailureAndCredentials(t *testing.T) {
 func TestVLLMStatusRejectsInvalidTargetsAndRedirects(t *testing.T) {
 	service.InitHttpClient()
 	for _, base := range []string{"", "file:///etc/passwd", "http://user:secret@localhost", "http://localhost?key=secret"} {
-		_, err := fetchInferenceStatus(context.Background(), &model.Channel{Type: constant.ChannelTypeVLLM, BaseURL: &base})
+		_, err := fetchInferenceStatus(context.Background(), &model.Provider{Type: constant.ChannelTypeVLLM, BaseURL: &base})
 		require.Error(t, err)
 		assert.NotContains(t, err.Error(), "secret")
 	}
-	_, err := fetchInferenceStatus(context.Background(), &model.Channel{Type: constant.ChannelTypeOllama})
+	_, err := fetchInferenceStatus(context.Background(), &model.Provider{Type: constant.ChannelTypeOllama})
 	require.Error(t, err)
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Error("redirect must not forward channel credentials")
@@ -74,7 +74,7 @@ func TestVLLMStatusRejectsInvalidTargetsAndRedirects(t *testing.T) {
 		http.Redirect(w, r, target.URL, http.StatusFound)
 	}))
 	defer upstream.Close()
-	status, err := fetchInferenceStatus(context.Background(), &model.Channel{Type: constant.ChannelTypeVLLM, BaseURL: &upstream.URL, Key: "EMPTY"})
+	status, err := fetchInferenceStatus(context.Background(), &model.Provider{Type: constant.ChannelTypeVLLM, BaseURL: &upstream.URL, Key: "EMPTY"})
 	require.NoError(t, err)
 	for _, endpoint := range status.Endpoints {
 		assert.Equal(t, inferenceEndpointStatus{Status: 302, Error: "http_error"}, endpoint)
@@ -96,7 +96,7 @@ func TestVLLMStatusInvalidAndOversizedResponses(t *testing.T) {
 		}
 	}))
 	defer upstream.Close()
-	channel := &model.Channel{Type: constant.ChannelTypeVLLM, BaseURL: &upstream.URL, Key: "EMPTY"}
+	channel := &model.Provider{Type: constant.ChannelTypeVLLM, BaseURL: &upstream.URL, Key: "EMPTY"}
 	status, err := fetchInferenceStatus(context.Background(), channel)
 	require.NoError(t, err)
 	assert.Equal(t, 503, status.Endpoints["/health"].Status)
@@ -143,7 +143,7 @@ func TestVLLMStatusLive(t *testing.T) {
 		t.Skip("NEW_API_VLLM_TEST_URL is not configured")
 	}
 	service.InitHttpClient()
-	status, err := fetchInferenceStatus(context.Background(), &model.Channel{
+	status, err := fetchInferenceStatus(context.Background(), &model.Provider{
 		Type: constant.ChannelTypeVLLM, BaseURL: &base, Key: os.Getenv("NEW_API_VLLM_TEST_KEY"),
 	})
 	require.NoError(t, err)
@@ -177,7 +177,7 @@ func TestSGLangStatusUsesDocumentedEndpointsAndRedactsServerConfiguration(t *tes
 		}
 	}))
 	defer upstream.Close()
-	status, err := fetchInferenceStatus(context.Background(), &model.Channel{Type: constant.ChannelTypeSGLang, BaseURL: &upstream.URL, Key: "test-key"})
+	status, err := fetchInferenceStatus(context.Background(), &model.Provider{Type: constant.ChannelTypeSGLang, BaseURL: &upstream.URL, Key: "test-key"})
 	require.NoError(t, err)
 	assert.Equal(t, "0.5.19", status.Version)
 	require.Len(t, status.Models, 1)

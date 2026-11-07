@@ -27,14 +27,14 @@ func ApplyReasoningModelSuffix(c *gin.Context, info *relaycommon.RelayInfo, outb
 		return nil
 	}
 	if model_setting.GetGlobalSettings().PassThroughRequestEnabled ||
-		info.ChannelMeta != nil && info.ChannelSetting.PassThroughBodyEnabled {
+		info.ProviderMeta != nil && info.ChannelSetting.PassThroughBodyEnabled {
 		return nil
 	}
 
 	opts := info.ConvOptions()
 	origin := info.GetOriginModelName()
 	upstream := ""
-	if info.ChannelMeta != nil {
+	if info.ProviderMeta != nil {
 		upstream = info.UpstreamModelName
 	}
 	originParsed, err := parseRequestModelName(origin, opts)
@@ -70,7 +70,7 @@ func ApplyReasoningModelSuffix(c *gin.Context, info *relaycommon.RelayInfo, outb
 		}
 		info.ReasoningConversion = reasoning.StateFromIntent(selected.intent)
 	}
-	if info.ChannelMeta != nil {
+	if info.ProviderMeta != nil {
 		info.UpstreamModelName = selected.base
 	}
 

@@ -28,7 +28,7 @@ func setupChannelSelectAutoGroupsTest(t *testing.T) *gorm.DB {
 	originalMaxTokenAutoGroups := setting.GetMaxTokenAutoGroups()
 
 	db := model.UseTestDatabases(t)
-	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	require.NoError(t, db.AutoMigrate(&model.Provider{}, &model.Ability{}))
 	common.MemoryCacheEnabled = true
 	common.RetryTimes = 0
 
@@ -47,8 +47,8 @@ func setupChannelSelectAutoGroupsTest(t *testing.T) *gorm.DB {
 		require.NoError(t, setting.UpdateMaxTokenAutoGroups(fmt.Sprintf("%d", originalMaxTokenAutoGroups)))
 
 		if originalMemoryCacheEnabled && originalDB != nil &&
-			originalDB.Migrator().HasTable(&model.Channel{}) && originalDB.Migrator().HasTable(&model.Ability{}) {
-			model.InitChannelCache()
+			originalDB.Migrator().HasTable(&model.Provider{}) && originalDB.Migrator().HasTable(&model.Ability{}) {
+			model.InitProviderCache()
 		}
 		sqlDB, err := db.DB()
 		if err == nil {
@@ -63,7 +63,7 @@ func createChannelSelectAutoGroupsChannel(t *testing.T, db *gorm.DB, id int, gro
 	t.Helper()
 	priority := int64(0)
 	weight := uint(100)
-	require.NoError(t, db.Create(&model.Channel{
+	require.NoError(t, db.Create(&model.Provider{
 		Id:       id,
 		Type:     constant.ChannelTypeOpenAI,
 		Key:      fmt.Sprintf("key-%d", id),
@@ -89,7 +89,7 @@ func TestCacheGetRandomSatisfiedChannelUsesTokenAutoGroupsWhenGlobalAutoIsEmpty(
 	const modelName = "auto-groups-runtime-model"
 	createChannelSelectAutoGroupsChannel(t, db, 2101, "vip", modelName)
 	createChannelSelectAutoGroupsChannel(t, db, 2102, "default", modelName)
-	model.InitChannelCache()
+	model.InitProviderCache()
 
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())

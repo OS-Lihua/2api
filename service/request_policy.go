@@ -86,7 +86,7 @@ func (s *RequestPolicyState) Events() []PolicyEvent {
 	return slices.Clone(s.events)
 }
 
-func (s *RequestPolicyState) BeginAttempt(channel *model.Channel, group string) {
+func (s *RequestPolicyState) BeginAttempt(channel *model.Provider, group string) {
 	s.Attempts++
 	s.Successful = false
 	s.OutcomeRecorded = false
@@ -146,7 +146,7 @@ func MarkRequestPolicySuccess(c *gin.Context, stream *relaycommon.StreamStatus) 
 
 // Rules explicitly inherit the global default or override it. Rules without a
 // mode retain their legacy retry behavior until an administrator changes them.
-func EffectiveSessionMode(setting *operation_setting.ChannelAffinitySetting, rule operation_setting.ChannelAffinityRule) (mode, source string) {
+func EffectiveSessionMode(setting *operation_setting.ProviderAffinitySetting, rule operation_setting.ProviderAffinityRule) (mode, source string) {
 	if rule.SessionMode == "inherit" {
 		if setting.SessionMode != "" {
 			return setting.SessionMode, "global"

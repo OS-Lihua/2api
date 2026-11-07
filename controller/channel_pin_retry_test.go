@@ -33,7 +33,7 @@ func TestShouldRetryHonorsPinRetryMode(t *testing.T) {
 	assert.True(t, service.ShouldRetryRelayError(c, openaiErr, 1))
 
 	origin := newPinRetryContext()
-	service.GetChannelConstraints(origin).AddPin(dto.ChannelPin{
+	service.GetChannelConstraints(origin).AddPin(dto.ProviderPin{
 		ChannelId: 2,
 		Source:    dto.PinSourceOriginTask,
 		Rank:      dto.PinRankOriginTask,
@@ -42,7 +42,7 @@ func TestShouldRetryHonorsPinRetryMode(t *testing.T) {
 	assert.True(t, service.ShouldRetryRelayError(origin, openaiErr, 1), "origin pin retries on the same channel")
 
 	token := newPinRetryContext()
-	service.GetChannelConstraints(token).AddPin(dto.ChannelPin{
+	service.GetChannelConstraints(token).AddPin(dto.ProviderPin{
 		ChannelId: 1,
 		Source:    dto.PinSourceToken,
 		Rank:      dto.PinRankToken,
@@ -58,7 +58,7 @@ func TestShouldRetryTaskRelayHonorsPinRetryMode(t *testing.T) {
 	assert.Equal(t, "retry", decideTaskRetry(c, taskErr, 1).Action)
 
 	origin := newPinRetryContext()
-	service.GetChannelConstraints(origin).AddPin(dto.ChannelPin{
+	service.GetChannelConstraints(origin).AddPin(dto.ProviderPin{
 		ChannelId: 2,
 		Source:    dto.PinSourceOriginTask,
 		Rank:      dto.PinRankOriginTask,
@@ -67,7 +67,7 @@ func TestShouldRetryTaskRelayHonorsPinRetryMode(t *testing.T) {
 	assert.Equal(t, "retry", decideTaskRetry(origin, taskErr, 1).Action)
 
 	token := newPinRetryContext()
-	service.GetChannelConstraints(token).AddPin(dto.ChannelPin{
+	service.GetChannelConstraints(token).AddPin(dto.ProviderPin{
 		ChannelId: 1,
 		Source:    dto.PinSourceToken,
 		Rank:      dto.PinRankToken,
@@ -79,13 +79,13 @@ func TestShouldRetryTaskRelayHonorsPinRetryMode(t *testing.T) {
 func TestSameChannelPinsMergeToStricterRetryMode(t *testing.T) {
 	c := newPinRetryContext()
 	constraints := service.GetChannelConstraints(c)
-	constraints.AddPin(dto.ChannelPin{
+	constraints.AddPin(dto.ProviderPin{
 		ChannelId: 7,
 		Source:    dto.PinSourceOriginTask,
 		Rank:      dto.PinRankOriginTask,
 		RetryMode: dto.PinRetrySameChannel,
 	})
-	constraints.AddPin(dto.ChannelPin{
+	constraints.AddPin(dto.ProviderPin{
 		ChannelId: 7,
 		Source:    dto.PinSourceToken,
 		Rank:      dto.PinRankToken,
@@ -144,7 +144,7 @@ func TestChannelAffinityRetryPriorities(t *testing.T) {
 		priority int64
 		group    string
 	}{{24, 4, "default"}, {27, 3, "default"}, {30, 2, "default"}, {34, 4, "vip"}, {37, 3, "vip"}} {
-		channel := model.Channel{
+		channel := model.Provider{
 			Id: spec.id, Name: fmt.Sprintf("channel-%d", spec.id), Type: constant.ChannelTypeOpenAI,
 			Key: "test-only", Status: common.ChannelStatusEnabled, Models: modelName, Group: spec.group,
 			Priority: common.GetPointer(spec.priority), Weight: common.GetPointer(uint(1)),
@@ -154,7 +154,7 @@ func TestChannelAffinityRetryPriorities(t *testing.T) {
 	}
 	for _, cached := range []bool{false, true} {
 		common.MemoryCacheEnabled = cached
-		model.InitChannelCache()
+		model.InitProviderCache()
 		for _, tc := range []struct {
 			name, mode string
 			binding    int
@@ -175,11 +175,11 @@ func TestChannelAffinityRetryPriorities(t *testing.T) {
 		} {
 			t.Run(fmt.Sprintf("cache=%t/%s", cached, tc.name), func(t *testing.T) {
 				common.RetryTimes = tc.retries
-				*affinity = operation_setting.ChannelAffinitySetting{
+				*affinity = operation_setting.ProviderAffinitySetting{
 					Enabled: true, DefaultTTLSeconds: 60, MaxEntries: 100,
-					Rules: []operation_setting.ChannelAffinityRule{{
+					Rules: []operation_setting.ProviderAffinityRule{{
 						Name: t.Name(), ModelRegex: []string{"^" + modelName + "$"}, SessionMode: tc.mode,
-						KeySources: []operation_setting.ChannelAffinityKeySource{{Type: "request_header", Key: "X-Session"}},
+						KeySources: []operation_setting.ProviderAffinityKeySource{{Type: "request_header", Key: "X-Session"}},
 					}},
 				}
 				ctx := newPinRetryContext()
@@ -239,7 +239,7 @@ func TestRequestPolicyRoutingDatabase(t *testing.T) {
 		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(string(previousRatios)))
 	})
 	// Channel 1 holds the session binding but is no longer usable.
-	channels := []model.Channel{
+	channels := []model.Provider{
 		{Id: 1, Name: "A", Type: 1, Key: "test-only", Status: common.ChannelStatusAutoDisabled, Models: "policy-test", Group: "default", Priority: common.GetPointer(int64(10))},
 		{Id: 2, Name: "B", Type: 1, Key: "test-only", Status: common.ChannelStatusEnabled, Models: "policy-test", Group: "default", Priority: common.GetPointer(int64(5))},
 	}
@@ -263,7 +263,7 @@ func TestRequestPolicyRoutingDatabase(t *testing.T) {
 			} {
 				t.Run(fmt.Sprintf("cache=%t/keep=%t/global=%s/rule=%s", cached, keep, tc.globalMode, tc.ruleMode), func(t *testing.T) {
 					common.MemoryCacheEnabled = cached
-					model.InitChannelCache()
+					model.InitProviderCache()
 					snapshot, err := model.BuildRequestPolicy(map[string]string{
 						"channel_affinity_setting.enabled":                  "true",
 						"channel_affinity_setting.session_mode":             tc.globalMode,

@@ -176,7 +176,7 @@ func mustConvertResponsesToGemini(t *testing.T, req dto.OpenAIResponsesRequest) 
 	t.Helper()
 	info := &relaycommon.RelayInfo{
 		OriginModelName: req.Model,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: req.Model,
 		},
 	}
@@ -201,7 +201,7 @@ func TestConvertEmbeddingRequestRejectsContentParts(t *testing.T) {
 	imagePart := map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://example.com/cat.png"}}
 	textPart := map[string]any{"type": "text", "text": "a cat"}
 	for _, input := range []any{[]any{"a cat", imagePart}, []any{textPart}} {
-		info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gemini-embedding-001"}}
+		info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "gemini-embedding-001"}}
 		_, err := (&Adaptor{}).ConvertEmbeddingRequest(nil, info, dto.EmbeddingRequest{Model: "gemini-embedding-001", Input: input})
 		var apiErr *types.NewAPIError
 		require.ErrorAs(t, err, &apiErr)
@@ -209,7 +209,7 @@ func TestConvertEmbeddingRequestRejectsContentParts(t *testing.T) {
 		assert.True(t, types.IsSkipRetryError(apiErr))
 	}
 
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gemini-embedding-001"}}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "gemini-embedding-001"}}
 	got, err := (&Adaptor{}).ConvertEmbeddingRequest(nil, info, dto.EmbeddingRequest{Model: "gemini-embedding-001", Input: []any{"a cat", "a dog"}})
 	require.NoError(t, err)
 	wire, err := common.Marshal(got)

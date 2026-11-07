@@ -139,7 +139,7 @@ func AppendResponseModelLogInfo(relayInfo *relaycommon.RelayInfo, other *model.L
 	observation := relayInfo.ResponseModel
 	if observation.ReturnedModel == observation.RequestedModel &&
 		(observation.UpstreamModel == "" || observation.UpstreamModel == observation.RequestedModel) &&
-		(relayInfo.ChannelMeta == nil || !relayInfo.IsModelMapped) {
+		(relayInfo.ProviderMeta == nil || !relayInfo.IsModelMapped) {
 		return
 	}
 	other.SetPublic("response_model", *observation)

@@ -37,12 +37,12 @@ var (
 	channelAffinityCache     *cachex.HybridCache[int]
 
 	channelAffinityUsageCacheStatsOnce  sync.Once
-	channelAffinityUsageCacheStatsCache *cachex.HybridCache[ChannelAffinityUsageCacheCounters]
+	channelAffinityUsageCacheStatsCache *cachex.HybridCache[ProviderAffinityUsageCacheCounters]
 
 	channelAffinityRegexCache sync.Map // map[string]*regexp.Regexp
 )
 
-type channelAffinityMeta struct {
+type providerAffinityMeta struct {
 	CacheKey       string
 	TTLSeconds     int
 	RuleName       string
@@ -58,7 +58,7 @@ type channelAffinityMeta struct {
 	RequestPath    string
 }
 
-type ChannelAffinityStatsContext struct {
+type ProviderAffinityStatsContext struct {
 	RuleName       string
 	UsingGroup     string
 	KeyFingerprint string
@@ -71,7 +71,7 @@ const (
 	cacheTokenRateModeMixed                      = "mixed"
 )
 
-type ChannelAffinityCacheStats struct {
+type ProviderAffinityCacheStats struct {
 	Enabled       bool           `json:"enabled"`
 	Total         int            `json:"total"`
 	Unknown       int            `json:"unknown"`
@@ -110,10 +110,10 @@ func getChannelAffinityCache() *cachex.HybridCache[int] {
 	return channelAffinityCache
 }
 
-func GetChannelAffinityCacheStats() ChannelAffinityCacheStats {
+func GetChannelAffinityCacheStats() ProviderAffinityCacheStats {
 	setting := operation_setting.GetChannelAffinitySetting()
 	if setting == nil {
-		return ChannelAffinityCacheStats{
+		return ProviderAffinityCacheStats{
 			Enabled:    false,
 			Total:      0,
 			Unknown:    0,
@@ -126,7 +126,7 @@ func GetChannelAffinityCacheStats() ChannelAffinityCacheStats {
 	mainAlgo, _ := cache.Algorithm()
 
 	rules := setting.Rules
-	ruleByName := make(map[string]operation_setting.ChannelAffinityRule, len(rules))
+	ruleByName := make(map[string]operation_setting.ProviderAffinityRule, len(rules))
 	for _, r := range rules {
 		name := strings.TrimSpace(r.Name)
 		if name == "" {
@@ -187,7 +187,7 @@ func GetChannelAffinityCacheStats() ChannelAffinityCacheStats {
 		byRuleName[ruleName]++
 	}
 
-	return ChannelAffinityCacheStats{
+	return ProviderAffinityCacheStats{
 		Enabled:       setting.Enabled,
 		Total:         total,
 		Unknown:       unknown,
@@ -223,7 +223,7 @@ func ClearChannelAffinityCacheByRuleName(ruleName string) (int, error) {
 		return 0, common.NewMessage("Channel affinity settings are not initialized")
 	}
 
-	var matchedRule *operation_setting.ChannelAffinityRule
+	var matchedRule *operation_setting.ProviderAffinityRule
 	for i := range setting.Rules {
 		r := &setting.Rules[i]
 		if strings.TrimSpace(r.Name) != ruleName {
@@ -288,7 +288,7 @@ func matchAnyIncludeFold(patterns []string, s string) bool {
 	return false
 }
 
-func extractChannelAffinityValue(c *gin.Context, src operation_setting.ChannelAffinityKeySource) string {
+func extractChannelAffinityValue(c *gin.Context, src operation_setting.ProviderAffinityKeySource) string {
 	switch src.Type {
 	case "context_int":
 		if src.Key == "" {
@@ -336,7 +336,7 @@ func extractChannelAffinityValue(c *gin.Context, src operation_setting.ChannelAf
 	}
 }
 
-func buildChannelAffinityCacheKeySuffix(rule operation_setting.ChannelAffinityRule, modelName string, usingGroup string, affinityValue string) string {
+func buildChannelAffinityCacheKeySuffix(rule operation_setting.ProviderAffinityRule, modelName string, usingGroup string, affinityValue string) string {
 	parts := make([]string, 0, 4)
 	if rule.IncludeRuleName && rule.Name != "" {
 		parts = append(parts, rule.Name)
@@ -351,7 +351,7 @@ func buildChannelAffinityCacheKeySuffix(rule operation_setting.ChannelAffinityRu
 	return strings.Join(parts, ":")
 }
 
-func setChannelAffinityContext(c *gin.Context, meta channelAffinityMeta) {
+func setChannelAffinityContext(c *gin.Context, meta providerAffinityMeta) {
 	c.Set(ginKeyChannelAffinityCacheKey, meta.CacheKey)
 	c.Set(ginKeyChannelAffinityTTLSeconds, meta.TTLSeconds)
 	c.Set(ginKeyChannelAffinityMeta, meta)
@@ -374,37 +374,37 @@ func getChannelAffinityContext(c *gin.Context) (string, int, bool) {
 	return key, ttlSeconds, true
 }
 
-func getChannelAffinityMeta(c *gin.Context) (channelAffinityMeta, bool) {
+func getChannelAffinityMeta(c *gin.Context) (providerAffinityMeta, bool) {
 	anyMeta, ok := c.Get(ginKeyChannelAffinityMeta)
 	if !ok {
-		return channelAffinityMeta{}, false
+		return providerAffinityMeta{}, false
 	}
-	meta, ok := anyMeta.(channelAffinityMeta)
+	meta, ok := anyMeta.(providerAffinityMeta)
 	if !ok {
-		return channelAffinityMeta{}, false
+		return providerAffinityMeta{}, false
 	}
 	return meta, true
 }
 
-func GetChannelAffinityStatsContext(c *gin.Context) (ChannelAffinityStatsContext, bool) {
+func GetChannelAffinityStatsContext(c *gin.Context) (ProviderAffinityStatsContext, bool) {
 	if c == nil {
-		return ChannelAffinityStatsContext{}, false
+		return ProviderAffinityStatsContext{}, false
 	}
 	meta, ok := getChannelAffinityMeta(c)
 	if !ok {
-		return ChannelAffinityStatsContext{}, false
+		return ProviderAffinityStatsContext{}, false
 	}
 	ruleName := strings.TrimSpace(meta.RuleName)
 	keyFp := strings.TrimSpace(meta.KeyFingerprint)
 	usingGroup := strings.TrimSpace(meta.UsingGroup)
 	if ruleName == "" || keyFp == "" {
-		return ChannelAffinityStatsContext{}, false
+		return ProviderAffinityStatsContext{}, false
 	}
 	ttlSeconds := int64(meta.TTLSeconds)
 	if ttlSeconds <= 0 {
-		return ChannelAffinityStatsContext{}, false
+		return ProviderAffinityStatsContext{}, false
 	}
-	return ChannelAffinityStatsContext{
+	return ProviderAffinityStatsContext{
 		RuleName:       ruleName,
 		UsingGroup:     usingGroup,
 		KeyFingerprint: keyFp,
@@ -494,7 +494,7 @@ func extractParamOperations(value any) ([]any, bool) {
 	}
 }
 
-func appendChannelAffinityTemplateAdminInfo(c *gin.Context, meta channelAffinityMeta) {
+func appendChannelAffinityTemplateAdminInfo(c *gin.Context, meta providerAffinityMeta) {
 	if c == nil {
 		return
 	}
@@ -573,7 +573,7 @@ func GetPreferredChannelByAffinity(c *gin.Context, modelName string, usingGroup 
 			continue
 		}
 		var affinityValue string
-		var usedSource operation_setting.ChannelAffinityKeySource
+		var usedSource operation_setting.ProviderAffinityKeySource
 		for _, src := range rule.KeySources {
 			affinityValue = extractChannelAffinityValue(c, src)
 			if affinityValue != "" {
@@ -596,7 +596,7 @@ func GetPreferredChannelByAffinity(c *gin.Context, modelName string, usingGroup 
 		cacheKeyFull := channelAffinityCacheNamespace + ":" + cacheKeySuffix
 		state.SessionMode, state.SessionModeSource = EffectiveSessionMode(setting, rule)
 		state.RuleName = rule.Name
-		setChannelAffinityContext(c, channelAffinityMeta{
+		setChannelAffinityContext(c, providerAffinityMeta{
 			CacheKey:       cacheKeyFull,
 			TTLSeconds:     ttlSeconds,
 			RuleName:       rule.Name,
@@ -758,7 +758,7 @@ func RecordChannelAffinity(c *gin.Context, channelID int) {
 	}
 }
 
-type ChannelAffinityUsageCacheStats struct {
+type ProviderAffinityUsageCacheStats struct {
 	RuleName            string `json:"rule_name"`
 	UsingGroup          string `json:"using_group"`
 	KeyFingerprint      string `json:"key_fp"`
@@ -776,7 +776,7 @@ type ChannelAffinityUsageCacheStats struct {
 	LastSeenAt           int64 `json:"last_seen_at"`
 }
 
-type ChannelAffinityUsageCacheCounters struct {
+type ProviderAffinityUsageCacheCounters struct {
 	CachedTokenRateMode string `json:"cached_token_rate_mode"`
 
 	Hit           int64 `json:"hit"`
@@ -806,14 +806,14 @@ func ObserveChannelAffinityUsageCacheFromContext(c *gin.Context, usage *dto.Usag
 	observeChannelAffinityUsageCache(statsCtx, usage, cachedTokenRateMode)
 }
 
-func GetChannelAffinityUsageCacheStats(ruleName, usingGroup, keyFp string) ChannelAffinityUsageCacheStats {
+func GetChannelAffinityUsageCacheStats(ruleName, usingGroup, keyFp string) ProviderAffinityUsageCacheStats {
 	ruleName = strings.TrimSpace(ruleName)
 	usingGroup = strings.TrimSpace(usingGroup)
 	keyFp = strings.TrimSpace(keyFp)
 
 	entryKey := channelAffinityUsageCacheEntryKey(ruleName, usingGroup, keyFp)
 	if entryKey == "" {
-		return ChannelAffinityUsageCacheStats{
+		return ProviderAffinityUsageCacheStats{
 			RuleName:       ruleName,
 			UsingGroup:     usingGroup,
 			KeyFingerprint: keyFp,
@@ -823,13 +823,13 @@ func GetChannelAffinityUsageCacheStats(ruleName, usingGroup, keyFp string) Chann
 	cache := getChannelAffinityUsageCacheStatsCache()
 	v, found, err := cache.Get(entryKey)
 	if err != nil || !found {
-		return ChannelAffinityUsageCacheStats{
+		return ProviderAffinityUsageCacheStats{
 			RuleName:       ruleName,
 			UsingGroup:     usingGroup,
 			KeyFingerprint: keyFp,
 		}
 	}
-	return ChannelAffinityUsageCacheStats{
+	return ProviderAffinityUsageCacheStats{
 		CachedTokenRateMode:  v.CachedTokenRateMode,
 		RuleName:             ruleName,
 		UsingGroup:           usingGroup,
@@ -846,7 +846,7 @@ func GetChannelAffinityUsageCacheStats(ruleName, usingGroup, keyFp string) Chann
 	}
 }
 
-func observeChannelAffinityUsageCache(statsCtx ChannelAffinityStatsContext, usage *dto.Usage, cachedTokenRateMode string) {
+func observeChannelAffinityUsageCache(statsCtx ProviderAffinityStatsContext, usage *dto.Usage, cachedTokenRateMode string) {
 	entryKey := channelAffinityUsageCacheEntryKey(statsCtx.RuleName, statsCtx.UsingGroup, statsCtx.KeyFingerprint)
 	if entryKey == "" {
 		return
@@ -870,7 +870,7 @@ func observeChannelAffinityUsageCache(statsCtx ChannelAffinityStatsContext, usag
 	}
 	next := prev
 	if !found {
-		next = ChannelAffinityUsageCacheCounters{}
+		next = ProviderAffinityUsageCacheCounters{}
 	}
 	currentMode := normalizeCachedTokenRateMode(cachedTokenRateMode)
 	if currentMode != "" {
@@ -982,7 +982,7 @@ func usageTotalTokens(usage *dto.Usage) int {
 	return 0
 }
 
-func getChannelAffinityUsageCacheStatsCache() *cachex.HybridCache[ChannelAffinityUsageCacheCounters] {
+func getChannelAffinityUsageCacheStatsCache() *cachex.HybridCache[ProviderAffinityUsageCacheCounters] {
 	channelAffinityUsageCacheStatsOnce.Do(func() {
 		setting := operation_setting.GetChannelAffinitySetting()
 		capacity := 100_000
@@ -996,15 +996,15 @@ func getChannelAffinityUsageCacheStatsCache() *cachex.HybridCache[ChannelAffinit
 			}
 		}
 
-		channelAffinityUsageCacheStatsCache = cachex.NewHybridCache[ChannelAffinityUsageCacheCounters](cachex.HybridCacheConfig[ChannelAffinityUsageCacheCounters]{
+		channelAffinityUsageCacheStatsCache = cachex.NewHybridCache[ProviderAffinityUsageCacheCounters](cachex.HybridCacheConfig[ProviderAffinityUsageCacheCounters]{
 			Namespace: cachex.Namespace(channelAffinityUsageCacheStatsNamespace),
 			Redis:     common.RDB,
 			RedisEnabled: func() bool {
 				return common.RedisEnabled && common.RDB != nil
 			},
-			RedisCodec: cachex.JSONCodec[ChannelAffinityUsageCacheCounters]{},
-			Memory: func() *hot.HotCache[string, ChannelAffinityUsageCacheCounters] {
-				return hot.NewHotCache[string, ChannelAffinityUsageCacheCounters](hot.LRU, capacity).
+			RedisCodec: cachex.JSONCodec[ProviderAffinityUsageCacheCounters]{},
+			Memory: func() *hot.HotCache[string, ProviderAffinityUsageCacheCounters] {
+				return hot.NewHotCache[string, ProviderAffinityUsageCacheCounters](hot.LRU, capacity).
 					WithTTL(time.Duration(defaultTTLSeconds) * time.Second).
 					WithJanitor().
 					Build()

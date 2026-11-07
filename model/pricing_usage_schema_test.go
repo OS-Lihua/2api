@@ -42,7 +42,7 @@ func TestPricingCarriesTaskUsageSchemaAndRefreshesWithPluginGeneration(t *testin
 	require.NoError(t, err)
 	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(pluginKey) })
 
-	insertPricingEndpointChannel(t, 901, constant.ChannelTypeTaskPlugin, dto.ChannelOtherSettings{})
+	insertPricingEndpointChannel(t, 901, constant.ChannelTypeTaskPlugin, dto.ProviderOtherSettings{})
 	insertPricingEndpointAbility(t, 901, "pricing-usage-model")
 	insertPricingEndpointAbility(t, 901, "ordinary-model")
 
@@ -79,7 +79,7 @@ func TestPricingAliasCarriesPluginUsageSchemaAndTailExpr(t *testing.T) {
 	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(pluginKey) })
 
 	mapping := `{"alias-model":"pricing-usage-model"}`
-	channel := &Channel{
+	channel := &Provider{
 		Id:           910,
 		Type:         constant.ChannelTypeTaskPlugin,
 		Key:          "key-910",
@@ -91,7 +91,7 @@ func TestPricingAliasCarriesPluginUsageSchemaAndTailExpr(t *testing.T) {
 	require.NoError(t, DB.Create(channel).Error)
 	insertPricingEndpointAbility(t, 910, "alias-model")
 	insertPricingEndpointAbility(t, 910, "pricing-usage-model")
-	InitChannelCache()
+	InitProviderCache()
 
 	saved := map[string]string{}
 	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
@@ -118,7 +118,7 @@ func TestPricingAliasCarriesPluginUsageSchemaAndTailExpr(t *testing.T) {
 	assert.Equal(t, `u("seconds")`, pricing["pricing-usage-model"].BillingExpr)
 
 	ownMapping := `{"alias-own-expr":"pricing-usage-model"}`
-	own := &Channel{
+	own := &Provider{
 		Id:           911,
 		Type:         constant.ChannelTypeTaskPlugin,
 		Key:          "key-911",
@@ -129,7 +129,7 @@ func TestPricingAliasCarriesPluginUsageSchemaAndTailExpr(t *testing.T) {
 	}
 	require.NoError(t, DB.Create(own).Error)
 	insertPricingEndpointAbility(t, 911, "alias-own-expr")
-	InitChannelCache()
+	InitProviderCache()
 	InvalidatePricingCache()
 
 	refreshed := pricingByModel(GetPricing())
@@ -173,7 +173,7 @@ export function parseTaskResult(){return {};}
 		`{"ambiguous-alias":"profile-video"}`,
 	} {
 		id := 920 + index
-		require.NoError(t, DB.Create(&Channel{
+		require.NoError(t, DB.Create(&Provider{
 			Id: id, Type: constant.ChannelTypeTaskPlugin, Status: 1, Name: fmt.Sprintf("channel-%d", id),
 			Models: "profile-image,profile-video,image-alias,video-alias,ambiguous-alias", ModelMapping: &mapping,
 		}).Error)
@@ -181,7 +181,7 @@ export function parseTaskResult(){return {};}
 			insertPricingEndpointAbility(t, id, name)
 		}
 	}
-	InitChannelCache()
+	InitProviderCache()
 	pricing := pricingByModel(GetPricing())
 	names := []string{"profile-image", "profile-video", "image-alias", "video-alias", "ambiguous-alias"}
 	snapshot, err := GetModelPricingSnapshot(names)
@@ -245,7 +245,7 @@ func TestPricingSharedPluginVariantsUseEachSchemaAndExpression(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(spec.key) })
 	}
-	insertPricingEndpointChannel(t, 930, constant.ChannelTypeTaskPlugin, dto.ChannelOtherSettings{})
+	insertPricingEndpointChannel(t, 930, constant.ChannelTypeTaskPlugin, dto.ProviderOtherSettings{})
 	insertPricingEndpointAbility(t, 930, "pricing-usage-model")
 	const expression = `tier("base", u("seconds") * 0.4)`
 	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{

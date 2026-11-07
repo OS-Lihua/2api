@@ -64,3 +64,36 @@ func assertChannelRoutePermission(t *testing.T, method string, path string, perm
 	}
 	t.Fatalf("route %s %s not found", method, path)
 }
+
+func TestProviderRoutesRequireAdminAndKeepChannelPermissions(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	require.NotPanics(t, func() {
+		registerProviderRoutes(engine.Group("/api"))
+	})
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/admin/v1/providers", nil))
+	assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+
+	permissions := map[string]authz.Permission{}
+	for _, route := range providerPermissionRoutes {
+		permissions[route.method+" "+route.path] = route.permission
+	}
+	assert.Equal(t, map[string]authz.Permission{
+		"GET ":                          authz.ChannelRead,
+		"POST ":                         authz.ChannelSensitiveWrite,
+		"GET /:id":                      authz.ChannelRead,
+		"PATCH /:id":                    authz.ChannelWrite,
+		"DELETE /:id":                   authz.ChannelSensitiveWrite,
+		"POST /:id/enable":              authz.ChannelOperate,
+		"POST /:id/disable":             authz.ChannelOperate,
+		"POST /:id/balance":             authz.ChannelOperate,
+		"GET /:id/keys":                 authz.ChannelOperate,
+		"POST /:id/keys/enable":         authz.ChannelOperate,
+		"POST /:id/keys/disable":        authz.ChannelOperate,
+		"DELETE /:id/keys/disabled":     authz.ChannelOperate,
+		"POST /:id/keys/:index/enable":  authz.ChannelOperate,
+		"POST /:id/keys/:index/disable": authz.ChannelOperate,
+		"DELETE /:id/keys/:index":       authz.ChannelOperate,
+	}, permissions)
+}

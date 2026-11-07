@@ -30,7 +30,7 @@ type DifferenceItem struct {
 	Confidence map[string]bool `json:"confidence"`
 }
 
-type SyncableChannel struct {
+type SyncableProvider struct {
 	ID      int    `json:"id"`
 	Name    string `json:"name"`
 	BaseURL string `json:"base_url"`

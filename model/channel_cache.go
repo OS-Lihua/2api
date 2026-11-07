@@ -18,21 +18,21 @@ import (
 )
 
 var group2model2channels map[string]map[string][]int // enabled channel
-var channelsIDM map[int]*Channel                     // all channels include disabled
+var channelsIDM map[int]*Provider                    // all channels include disabled
 // channel2advancedCustomConfig caches parsed Advanced Custom (type 58) configs so
 // path-aware selection avoids re-parsing JSON per request. Refreshed on full sync.
 var channel2advancedCustomConfig map[int]*kitdto.AdvancedCustomConfig
 var channelSyncLock sync.RWMutex
 
-func InitChannelCache() {
+func InitProviderCache() {
 	if !common.MemoryCacheEnabled {
 		InvalidatePricingCache()
 		rebuildTaskAliasView()
 		return
 	}
-	newChannelId2channel := make(map[int]*Channel)
+	newChannelId2channel := make(map[int]*Provider)
 	newChannel2advancedCustomConfig := make(map[int]*kitdto.AdvancedCustomConfig)
-	var channels []*Channel
+	var channels []*Provider
 	DB.Find(&channels)
 	for _, channel := range channels {
 		newChannelId2channel[channel.Id] = channel
@@ -82,13 +82,13 @@ func InitChannelCache() {
 	group2model2channels = newGroup2model2channels
 	//channelsIDM = newChannelId2channel
 	for i, channel := range newChannelId2channel {
-		if channel.ChannelInfo.IsMultiKey {
+		if channel.ProviderInfo.IsMultiKey {
 			channel.Keys = channel.GetKeys()
-			if channel.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling {
+			if channel.ProviderInfo.MultiKeyMode == constant.MultiKeyModePolling {
 				if oldChannel, ok := channelsIDM[i]; ok {
 					// 存在旧的渠道，如果是多key且轮询，保留轮询索引信息
-					if oldChannel.ChannelInfo.IsMultiKey && oldChannel.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling {
-						channel.ChannelInfo.MultiKeyPollingIndex = oldChannel.ChannelInfo.MultiKeyPollingIndex
+					if oldChannel.ProviderInfo.IsMultiKey && oldChannel.ProviderInfo.MultiKeyMode == constant.MultiKeyModePolling {
+						channel.ProviderInfo.MultiKeyPollingIndex = oldChannel.ProviderInfo.MultiKeyPollingIndex
 					}
 				}
 			}
@@ -106,23 +106,23 @@ func InitChannelCache() {
 	common.SysLog(common.LogText("channels synced from database"))
 }
 
-func SyncChannelCache(frequency int) {
+func SyncProviderCache(frequency int) {
 	for {
 		time.Sleep(time.Duration(frequency) * time.Second)
 		common.SysLog(common.LogText("syncing channels from database"))
-		InitChannelCache()
+		InitProviderCache()
 	}
 }
 
-func GetRandomSatisfiedChannel(
+func GetRandomSatisfiedProvider(
 	group string,
 	model string,
 	retry int,
-	filters []dto.ChannelFilter,
-) (*Channel, error) {
+	filters []dto.ProviderFilter,
+) (*Provider, error) {
 	// if memory cache is disabled, get channel directly from database
 	if !common.MemoryCacheEnabled {
-		return GetChannel(group, model, retry, filters)
+		return GetProvider(group, model, retry, filters)
 	}
 
 	channelSyncLock.RLock()
@@ -169,7 +169,7 @@ func GetRandomSatisfiedChannel(
 
 	// get the priority for the given retry number
 	var sumWeight = 0
-	var targetChannels []*Channel
+	var targetChannels []*Provider
 	for _, channelId := range channels {
 		if channel, ok := channelsIDM[channelId]; ok {
 			if channel.GetPriority() == targetPriority {
@@ -216,9 +216,9 @@ func GetRandomSatisfiedChannel(
 	return nil, errors.New("channel not found")
 }
 
-func CacheGetChannel(id int) (*Channel, error) {
+func CacheGetProvider(id int) (*Provider, error) {
 	if !common.MemoryCacheEnabled {
-		return GetChannelById(id, true)
+		return GetProviderById(id, true)
 	}
 	channelSyncLock.RLock()
 	defer channelSyncLock.RUnlock()
@@ -230,13 +230,13 @@ func CacheGetChannel(id int) (*Channel, error) {
 	return c, nil
 }
 
-func CacheGetChannelInfo(id int) (*ChannelInfo, error) {
+func CacheGetProviderInfo(id int) (*ProviderInfo, error) {
 	if !common.MemoryCacheEnabled {
-		channel, err := GetChannelById(id, true)
+		channel, err := GetProviderById(id, true)
 		if err != nil {
 			return nil, err
 		}
-		return &channel.ChannelInfo, nil
+		return &channel.ProviderInfo, nil
 	}
 	channelSyncLock.RLock()
 	defer channelSyncLock.RUnlock()
@@ -245,10 +245,10 @@ func CacheGetChannelInfo(id int) (*ChannelInfo, error) {
 	if !ok {
 		return nil, fmt.Errorf("channel #%d no longer exists", id)
 	}
-	return &c.ChannelInfo, nil
+	return &c.ProviderInfo, nil
 }
 
-func CacheUpdateChannelStatus(id int, status int) {
+func CacheUpdateProviderStatus(id int, status int) {
 	if !common.MemoryCacheEnabled {
 		return
 	}
@@ -273,7 +273,7 @@ func CacheUpdateChannelStatus(id int, status int) {
 	}
 }
 
-func CacheUpdateChannel(channel *Channel) {
+func CacheUpdateProvider(channel *Provider) {
 	if !common.MemoryCacheEnabled {
 		return
 	}
@@ -284,10 +284,10 @@ func CacheUpdateChannel(channel *Channel) {
 	}
 
 	if channelsIDM == nil {
-		channelsIDM = make(map[int]*Channel)
+		channelsIDM = make(map[int]*Provider)
 	}
 	if oldChannel, ok := channelsIDM[channel.Id]; ok {
-		logger.LogDebug(nil, "CacheUpdateChannel before: id=%d, name=%s, status=%d, polling_index=%d", channel.Id, channel.Name, channel.Status, oldChannel.ChannelInfo.MultiKeyPollingIndex)
+		logger.LogDebug(nil, "CacheUpdateProvider before: id=%d, name=%s, status=%d, polling_index=%d", channel.Id, channel.Name, channel.Status, oldChannel.ProviderInfo.MultiKeyPollingIndex)
 	}
 	channelsIDM[channel.Id] = channel
 	if channel2advancedCustomConfig == nil {
@@ -299,7 +299,7 @@ func CacheUpdateChannel(channel *Channel) {
 			channel2advancedCustomConfig[channel.Id] = config
 		}
 	}
-	logger.LogDebug(nil, "CacheUpdateChannel after: id=%d, name=%s, status=%d, polling_index=%d", channel.Id, channel.Name, channel.Status, channel.ChannelInfo.MultiKeyPollingIndex)
+	logger.LogDebug(nil, "CacheUpdateProvider after: id=%d, name=%s, status=%d, polling_index=%d", channel.Id, channel.Name, channel.Status, channel.ProviderInfo.MultiKeyPollingIndex)
 	// Lock ordering: do NOT hold channelSyncLock while calling
 	// InvalidatePricingCache. GetPricing acquires updatePricingLock first and then
 	// channelSyncLock.RLock (via loadPricingAdvancedCustomConfigs); acquiring

@@ -74,7 +74,7 @@ func TestGeminiChatStreamHandlerClaudeFirstFrameUsesUpstreamUsage(t *testing.T) 
 	info := &relaycommon.RelayInfo{
 		RelayFormat:     types.RelayFormatClaude,
 		OriginModelName: "gemini-2.5-flash",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "gemini-2.5-flash",
 		},
 		ClaudeConvertInfo: &relaycommon.ClaudeConvertInfo{
@@ -153,7 +153,7 @@ func TestGeminiChatHandlerCompletionTokensExcludeToolUsePromptTokens(t *testing.
 	info := &relaycommon.RelayInfo{
 		RelayFormat:     types.RelayFormatGemini,
 		OriginModelName: "gemini-3-flash-preview",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "gemini-3-flash-preview",
 		},
 	}
@@ -207,7 +207,7 @@ func TestGeminiStreamHandlerCompletionTokensExcludeToolUsePromptTokens(t *testin
 
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "gemini-3-flash-preview",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "gemini-3-flash-preview",
 		},
 	}
@@ -260,7 +260,7 @@ func TestGeminiTextGenerationHandlerPromptTokensIncludeToolUsePromptTokens(t *te
 
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "gemini-3-flash-preview",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "gemini-3-flash-preview",
 		},
 	}
@@ -311,7 +311,7 @@ func TestGeminiChatHandlerUsesEstimatedPromptTokensWhenUsagePromptMissing(t *tes
 	info := &relaycommon.RelayInfo{
 		RelayFormat:     types.RelayFormatGemini,
 		OriginModelName: "gemini-3-flash-preview",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "gemini-3-flash-preview",
 		},
 	}
@@ -365,7 +365,7 @@ func TestGeminiStreamHandlerUsesEstimatedPromptTokensWhenUsagePromptMissing(t *t
 
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "gemini-3-flash-preview",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "gemini-3-flash-preview",
 		},
 	}
@@ -418,7 +418,7 @@ func TestGeminiTextGenerationHandlerUsesEstimatedPromptTokensWhenUsagePromptMiss
 
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "gemini-3-flash-preview",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "gemini-3-flash-preview",
 		},
 	}
@@ -469,7 +469,7 @@ func TestGeminiChatHandlerMissingUsageMetadataBuildsEstimatedBillingUsage(t *tes
 	info := &relaycommon.RelayInfo{
 		RelayFormat:     types.RelayFormatGemini,
 		OriginModelName: "gemini-3-flash-preview",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "gemini-3-flash-preview",
 		},
 	}
@@ -518,7 +518,7 @@ func TestGeminiStreamHandlerPromptOnlyUsageMetadataEstimatesCompletionTokens(t *
 
 			info := &relaycommon.RelayInfo{
 				OriginModelName: "gemini-3-flash-preview",
-				ChannelMeta: &relaycommon.ChannelMeta{
+				ProviderMeta: &relaycommon.ProviderMeta{
 					UpstreamModelName: "gemini-3-flash-preview",
 				},
 			}
@@ -576,7 +576,7 @@ func TestGeminiChatHandlerPromptOnlyUsageMetadataEstimatesCompletionTokens(t *te
 	info := &relaycommon.RelayInfo{
 		RelayFormat:     types.RelayFormatGemini,
 		OriginModelName: "gemini-3-flash-preview",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "gemini-3-flash-preview",
 		},
 	}
@@ -628,7 +628,7 @@ func TestGeminiStreamHandlerEmptyUsageMetadataBuildsEstimatedBillingUsage(t *tes
 
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "gemini-3-flash-preview",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "gemini-3-flash-preview",
 		},
 	}
@@ -732,7 +732,7 @@ func TestGeminiHandlersCountGroundingQueries(t *testing.T) {
 			c.Request = httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-3.7-flash:generateContent", nil)
 			info := &relaycommon.RelayInfo{
 				OriginModelName: "gemini-3.7-flash",
-				ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: "gemini-3.7-flash"},
+				ProviderMeta:    &relaycommon.ProviderMeta{UpstreamModelName: "gemini-3.7-flash"},
 			}
 			var apiErr *types.NewAPIError
 			if tt.stream {

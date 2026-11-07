@@ -42,7 +42,7 @@ type testResult struct {
 	newAPIError *types.NewAPIError
 }
 
-func normalizeChannelTestEndpoint(channel *model.Channel, endpointType string) string {
+func normalizeChannelTestEndpoint(channel *model.Provider, endpointType string) string {
 	normalized := strings.TrimSpace(endpointType)
 	if normalized != "" {
 		return normalized
@@ -70,7 +70,7 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
 	return rootUser.Id, nil
 }
 
-func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool) testResult {
+func testChannel(ctx context.Context, channel *model.Provider, testUserID int, testModel string, endpointType string, isStream bool) testResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -666,7 +666,7 @@ func validateTestResponseBody(respBody []byte, isStream bool) error {
 	return nil
 }
 
-func shouldUseStreamForAutomaticChannelTest(channel *model.Channel) bool {
+func shouldUseStreamForAutomaticChannelTest(channel *model.Provider) bool {
 	return channel != nil && channel.Type == constant.ChannelTypeCodex
 }
 
@@ -699,7 +699,7 @@ func detectErrorMessageFromJSONBytes(jsonBytes []byte) string {
 	return message
 }
 
-func buildTestRequest(model string, endpointType string, channel *model.Channel, isStream bool) dto.Request {
+func buildTestRequest(model string, endpointType string, channel *model.Provider, isStream bool) dto.Request {
 	testResponsesInput := json.RawMessage(`[{"role":"user","content":"hi"}]`)
 
 	// 根据端点类型构建不同的测试请求
@@ -849,16 +849,16 @@ func TestChannel(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	channel, err := model.CacheGetChannel(channelId)
+	channel, err := model.CacheGetProvider(channelId)
 	if err != nil {
-		channel, err = model.GetChannelById(channelId, true)
+		channel, err = model.GetProviderById(channelId, true)
 		if err != nil {
 			common.ApiError(c, err)
 			return
 		}
 	}
 	//defer func() {
-	//	if channel.ChannelInfo.IsMultiKey {
+	//	if channel.ProviderInfo.IsMultiKey {
 	//		go func() { _ = channel.SaveChannelInfo() }()
 	//	}
 	//}()
@@ -908,9 +908,9 @@ func TestChannel(c *gin.Context) {
 	})
 }
 
-// channelTestSummary records the outcome of one channel test cycle so the
+// providerTestSummary records the outcome of one channel test cycle so the
 // system task can persist a per-run result for history.
-type channelTestSummary struct {
+type providerTestSummary struct {
 	Tested    int `json:"tested"`
 	Succeeded int `json:"succeeded"`
 	Failed    int `json:"failed"`
@@ -918,8 +918,8 @@ type channelTestSummary struct {
 	Enabled   int `json:"enabled"`
 }
 
-func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, testUserID int, allowDisable bool, disableThreshold int64) channelTestSummary {
-	summary := channelTestSummary{}
+func testChannelForHealthCheck(ctx context.Context, channel *model.Provider, testUserID int, allowDisable bool, disableThreshold int64) providerTestSummary {
+	summary := providerTestSummary{}
 	isChannelEnabled := channel.Status == common.ChannelStatusEnabled
 	tik := time.Now()
 	result := testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel))
@@ -956,7 +956,7 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
 	}
 
 	if allowDisable && isChannelEnabled && shouldBanChannel && channel.GetAutoBan() {
-		processChannelError(result.context, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, nil)
+		processChannelError(result.context, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ProviderInfo.IsMultiKey, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, nil)
 		summary.Disabled++
 	}
 
@@ -974,11 +974,11 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
 // summary counts and the progress reporter remain serialized.
 func runChannelTestWorkers(
 	ctx context.Context,
-	channels []*model.Channel,
+	channels []*model.Provider,
 	concurrency int,
-	run func(context.Context, *model.Channel) channelTestSummary,
+	run func(context.Context, *model.Provider) providerTestSummary,
 	report func(processed, total int),
-) channelTestSummary {
+) providerTestSummary {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -987,12 +987,12 @@ func runChannelTestWorkers(
 		report(0, total)
 	}
 	if total == 0 {
-		return channelTestSummary{}
+		return providerTestSummary{}
 	}
 
 	workerCount := min(operation_setting.NormalizeChannelTestConcurrency(concurrency), total)
-	jobs := make(chan *model.Channel)
-	results := make(chan channelTestSummary)
+	jobs := make(chan *model.Provider)
+	results := make(chan providerTestSummary)
 
 	var workers sync.WaitGroup
 	workers.Add(workerCount)
@@ -1011,7 +1011,7 @@ func runChannelTestWorkers(
 						return
 					}
 
-					result := channelTestSummary{}
+					result := providerTestSummary{}
 					if channel != nil && channel.Status != common.ChannelStatusManuallyDisabled {
 						result = run(ctx, channel)
 					}
@@ -1046,7 +1046,7 @@ func runChannelTestWorkers(
 		close(results)
 	}()
 
-	summary := channelTestSummary{}
+	summary := providerTestSummary{}
 	processed := 0
 	for result := range results {
 		summary.Tested += result.Tested
@@ -1065,7 +1065,7 @@ func runChannelTestWorkers(
 // performChannelTests runs channel health checks with the configured bounded
 // concurrency and honors cancellation when a system-task runner loses its
 // lease.
-func performChannelTests(ctx context.Context, channels []*model.Channel, testUserID int, allowDisable bool, concurrency int, report func(processed, total int)) channelTestSummary {
+func performChannelTests(ctx context.Context, channels []*model.Provider, testUserID int, allowDisable bool, concurrency int, report func(processed, total int)) providerTestSummary {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1077,7 +1077,7 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
 		ctx,
 		channels,
 		concurrency,
-		func(ctx context.Context, channel *model.Channel) channelTestSummary {
+		func(ctx context.Context, channel *model.Provider) providerTestSummary {
 			return testChannelForHealthCheck(ctx, channel, testUserID, allowDisable, disableThreshold)
 		},
 		report,
@@ -1093,14 +1093,14 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
 // is set, the administrators who receive channel notices are notified on
 // completion. Cross-instance execution is guarded by the system task per-type
 // lock, so no process-local guard is needed.
-func runChannelTestTask(ctx context.Context, mode string, notify bool, report func(processed, total int)) (channelTestSummary, error) {
+func runChannelTestTask(ctx context.Context, mode string, notify bool, report func(processed, total int)) (providerTestSummary, error) {
 	testUserID, err := resolveChannelTestUserID(nil)
 	if err != nil {
-		return channelTestSummary{}, err
+		return providerTestSummary{}, err
 	}
-	channels, err := model.GetAllChannels(0, 0, true, false)
+	channels, err := model.GetAllProviders(0, 0, true, false)
 	if err != nil {
-		return channelTestSummary{}, err
+		return providerTestSummary{}, err
 	}
 	if strings.TrimSpace(mode) == "" {
 		mode = operation_setting.GetMonitorSetting().ChannelTestMode
@@ -1117,8 +1117,8 @@ func runChannelTestTask(ctx context.Context, mode string, notify bool, report fu
 	return summary, nil
 }
 
-func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*model.Channel {
-	selected := make([]*model.Channel, 0, len(channels))
+func selectChannelsForAutomaticTest(channels []*model.Provider, mode string) []*model.Provider {
+	selected := make([]*model.Provider, 0, len(channels))
 	for _, channel := range channels {
 		if channel.Status == common.ChannelStatusManuallyDisabled {
 			continue
@@ -1138,7 +1138,7 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*m
 // test loop inline. If any channel_test task is already active, the manual run is
 // rejected so the caller does not mistake a scheduled run for this manual one.
 func TestAllChannels(c *gin.Context) {
-	task, created, err := service.EnqueueSystemTask(model.SystemTaskTypeChannelTest, channelTestTaskPayload{
+	task, created, err := service.EnqueueSystemTask(model.SystemTaskTypeChannelTest, providerTestTaskPayload{
 		Mode:   operation_setting.ChannelTestModeScheduledAll,
 		Notify: true,
 	})

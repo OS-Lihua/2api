@@ -240,7 +240,7 @@ func FetchUpstreamRatios(c *gin.Context) {
 		for _, id64 := range req.ChannelIDs {
 			intIds = append(intIds, int(id64))
 		}
-		dbChannels, err := model.GetChannelsByIds(intIds)
+		dbChannels, err := model.GetProvidersByIds(intIds)
 		if err != nil {
 			logger.LogError(c.Request.Context(), common.LogText("failed to query channels: %s", err.Error()))
 			common.ApiErrorStatus(c, http.StatusInternalServerError, common.NewMessage("Failed to query channels"))
@@ -332,7 +332,7 @@ func FetchUpstreamRatios(c *gin.Context) {
 
 			// OpenRouter requires Bearer token auth
 			if isOpenRouter && chItem.ID != 0 {
-				dbCh, err := model.GetChannelById(chItem.ID, true)
+				dbCh, err := model.GetProviderById(chItem.ID, true)
 				if err != nil {
 					ch <- upstreamResult{Name: uniqueName, Err: "failed to get channel key: " + err.Error()}
 					return
@@ -1129,7 +1129,7 @@ func convertModelsDevToRatioData(reader io.Reader) (map[string]any, error) {
 }
 
 func GetSyncableChannels(c *gin.Context) {
-	channels, err := model.GetAllChannels(0, 0, true, false)
+	channels, err := model.GetAllProviders(0, 0, true, false)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -1138,10 +1138,10 @@ func GetSyncableChannels(c *gin.Context) {
 		return
 	}
 
-	var syncableChannels []dto.SyncableChannel
+	var syncableChannels []dto.SyncableProvider
 	for _, channel := range channels {
 		if channel.GetBaseURL() != "" {
-			syncableChannels = append(syncableChannels, dto.SyncableChannel{
+			syncableChannels = append(syncableChannels, dto.SyncableProvider{
 				ID:      channel.Id,
 				Name:    channel.Name,
 				BaseURL: channel.GetBaseURL(),
@@ -1151,14 +1151,14 @@ func GetSyncableChannels(c *gin.Context) {
 		}
 	}
 
-	syncableChannels = append(syncableChannels, dto.SyncableChannel{
+	syncableChannels = append(syncableChannels, dto.SyncableProvider{
 		ID:      officialRatioPresetID,
 		Name:    officialRatioPresetName,
 		BaseURL: officialRatioPresetBaseURL,
 		Status:  1,
 	})
 
-	syncableChannels = append(syncableChannels, dto.SyncableChannel{
+	syncableChannels = append(syncableChannels, dto.SyncableProvider{
 		ID:      modelsDevPresetID,
 		Name:    modelsDevPresetName,
 		BaseURL: modelsDevPresetBaseURL,

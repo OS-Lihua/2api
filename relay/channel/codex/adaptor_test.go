@@ -16,7 +16,7 @@ import (
 func TestGetRequestURLAlphaSearch(t *testing.T) {
 	adaptor := &Adaptor{}
 	info := &relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType:    constant.ChannelTypeCodex,
 			ChannelBaseUrl: "https://chatgpt.com",
 		},
@@ -33,8 +33,8 @@ func TestGetRequestURLAlphaSearch(t *testing.T) {
 func TestConvertOpenAIResponsesRequestDropsPenalties(t *testing.T) {
 	adaptor := &Adaptor{}
 	info := &relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeCodex},
-		RelayMode:   relayconstant.RelayModeResponses,
+		ProviderMeta: &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeCodex},
+		RelayMode:    relayconstant.RelayModeResponses,
 	}
 
 	converted, err := adaptor.ConvertOpenAIResponsesRequest(nil, info, dto.OpenAIResponsesRequest{

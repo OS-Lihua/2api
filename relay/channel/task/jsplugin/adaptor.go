@@ -1363,7 +1363,7 @@ func (a *TaskAdaptor) BuildContentRequest(ctx context.Context, task *model.Task,
 // headerOverrideInfo carries the channel's Request Header Override for a
 // request built outside the client request, with {api_key} set to key.
 func (a *TaskAdaptor) headerOverrideInfo(key string) *relaycommon.RelayInfo {
-	return &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+	return &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{
 		ApiKey:          key,
 		HeadersOverride: relaycommon.GetEffectiveHeaderOverride(a.info),
 	}}
@@ -1471,9 +1471,9 @@ func (a *TaskAdaptor) channelType() int {
 
 // channelSetting is the executing channel's settings when the adaptor runs
 // with channel metadata; zero otherwise.
-func (a *TaskAdaptor) channelSetting() kitdto.ChannelSettings {
+func (a *TaskAdaptor) channelSetting() kitdto.ProviderSettings {
 	if a.info == nil || !a.info.HasChannelMeta() {
-		return kitdto.ChannelSettings{}
+		return kitdto.ProviderSettings{}
 	}
 	return a.info.ChannelSetting
 }

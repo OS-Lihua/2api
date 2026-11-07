@@ -75,7 +75,7 @@ func (d taskPluginSubmitDiagnostics) cancelled(stage string, attempt int) {
 	)
 }
 
-func (d taskPluginSubmitDiagnostics) attempt(attempt int, channel *model.Channel, locked bool) {
+func (d taskPluginSubmitDiagnostics) attempt(attempt int, channel *model.Provider, locked bool) {
 	if d.pluginKey == "" || channel == nil {
 		return
 	}
@@ -109,7 +109,7 @@ func (d taskPluginSubmitDiagnostics) attemptSucceeded(attempt int, result *relay
 	)
 }
 
-func (d taskPluginSubmitDiagnostics) attemptFailed(attempt int, channel *model.Channel, taskErr *dto.TaskError, willRetry bool) {
+func (d taskPluginSubmitDiagnostics) attemptFailed(attempt int, channel *model.Provider, taskErr *dto.TaskError, willRetry bool) {
 	if d.pluginKey == "" || channel == nil || taskErr == nil {
 		return
 	}

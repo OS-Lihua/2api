@@ -117,7 +117,7 @@ func TestChannelNoticesFollowEachAdministratorsSwitch(t *testing.T) {
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
-	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.User{}))
+	require.NoError(t, database.AutoMigrate(&model.Provider{}, &model.Ability{}, &model.User{}))
 	common.MemoryCacheEnabled, common.RedisEnabled = false, false
 	constant.NotifyLimitCount = 100
 
@@ -161,10 +161,10 @@ func TestChannelNoticesFollowEachAdministratorsSwitch(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, database.Create(&model.User{Username: user.name, Role: user.role, Status: user.status, Setting: string(setting), AffCode: user.name}).Error)
 	}
-	channel := &model.Channel{Name: "notice-review", Key: "fixture-key", Type: 1, Status: common.ChannelStatusEnabled, Group: "default", Models: "test-model"}
+	channel := &model.Provider{Name: "notice-review", Key: "fixture-key", Type: 1, Status: common.ChannelStatusEnabled, Group: "default", Models: "test-model"}
 	require.NoError(t, channel.Insert())
 
-	DisableChannel(types.ChannelError{ChannelId: channel.Id, ChannelName: channel.Name, AutoBan: true}, "upstream failed")
+	DisableChannel(types.ProviderError{ChannelId: channel.Id, ChannelName: channel.Name, AutoBan: true}, "upstream failed")
 	EnableChannel(channel.Id, "", channel.Name)
 	NotifyChannelWatchers(dto.NotifyTypeChannelTest, func(lang string) (string, string) {
 		return i18n.Translate(lang, i18n.MsgChannelTestCompletedSubject), i18n.Translate(lang, i18n.MsgChannelTestCompletedContent)

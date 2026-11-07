@@ -241,13 +241,13 @@ type SyncTaskQueryParams struct {
 func InitTask(platform constant.TaskPlatform, relayInfo *commonRelay.RelayInfo) *Task {
 	properties := Properties{}
 	privateData := TaskPrivateData{}
-	if relayInfo != nil && relayInfo.ChannelMeta != nil {
+	if relayInfo != nil && relayInfo.ProviderMeta != nil {
 		// A New API channel may rotate between several gateway tokens, so the
 		// task keeps the key that submitted it and polls with the same identity.
-		if relayInfo.ChannelMeta.ChannelType == constant.ChannelTypeGemini ||
-			relayInfo.ChannelMeta.ChannelType == constant.ChannelTypeVertexAi ||
-			relayInfo.ChannelMeta.ChannelType == constant.ChannelTypeNewAPI {
-			privateData.Key = relayInfo.ChannelMeta.ApiKey
+		if relayInfo.ProviderMeta.ChannelType == constant.ChannelTypeGemini ||
+			relayInfo.ProviderMeta.ChannelType == constant.ChannelTypeVertexAi ||
+			relayInfo.ProviderMeta.ChannelType == constant.ChannelTypeNewAPI {
+			privateData.Key = relayInfo.ProviderMeta.ApiKey
 		}
 		if relayInfo.UpstreamModelName != "" {
 			properties.UpstreamModelName = relayInfo.UpstreamModelName

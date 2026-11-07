@@ -1546,7 +1546,7 @@ func TestApplyParamOverrideConditionByUserAndGPTModel(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			info := &RelayInfo{
 				UserId: tt.userID,
-				ChannelMeta: &ChannelMeta{
+				ProviderMeta: &ProviderMeta{
 					ParamOverride:     paramOverride,
 					UpstreamModelName: tt.model,
 				},
@@ -2165,7 +2165,7 @@ func TestApplyParamOverrideConditionsObjectShorthand(t *testing.T) {
 
 func TestApplyParamOverrideWithRelayInfoSyncRuntimeHeaders(t *testing.T) {
 	info := &RelayInfo{
-		ChannelMeta: &ChannelMeta{
+		ProviderMeta: &ProviderMeta{
 			ParamOverride: map[string]any{
 				"operations": []any{
 					map[string]any{
@@ -2212,7 +2212,7 @@ func TestApplyParamOverrideWithRelayInfoMixedLegacyAndOperations(t *testing.T) {
 		RequestHeaders: map[string]string{
 			"Originator": "Codex CLI",
 		},
-		ChannelMeta: &ChannelMeta{
+		ProviderMeta: &ProviderMeta{
 			ParamOverride: map[string]any{
 				"temperature": 0.2,
 				"operations": []any{
@@ -2247,7 +2247,7 @@ func TestApplyParamOverrideWithRelayInfoMixedLegacyAndOperations(t *testing.T) {
 
 func TestApplyParamOverrideWithRelayInfoMoveAndCopyHeaders(t *testing.T) {
 	info := &RelayInfo{
-		ChannelMeta: &ChannelMeta{
+		ProviderMeta: &ProviderMeta{
 			ParamOverride: map[string]any{
 				"operations": []any{
 					map[string]any{
@@ -2286,7 +2286,7 @@ func TestApplyParamOverrideWithRelayInfoMoveAndCopyHeaders(t *testing.T) {
 
 func TestApplyParamOverrideWithRelayInfoSetHeaderMapRewritesAnthropicBeta(t *testing.T) {
 	info := &RelayInfo{
-		ChannelMeta: &ChannelMeta{
+		ProviderMeta: &ProviderMeta{
 			ParamOverride: map[string]any{
 				"operations": []any{
 					map[string]any{
@@ -2324,7 +2324,7 @@ func TestGetEffectiveHeaderOverrideUsesRuntimeOverrideAsFinalResult(t *testing.T
 		RuntimeHeadersOverride: map[string]any{
 			"x-runtime": "runtime-only",
 		},
-		ChannelMeta: &ChannelMeta{
+		ProviderMeta: &ProviderMeta{
 			HeadersOverride: map[string]any{
 				"X-Static":  "static-value",
 				"X-Deleted": "should-not-exist",
@@ -2348,7 +2348,7 @@ func TestRemoveDisabledFieldsSkipWhenChannelPassThroughEnabled(t *testing.T) {
 		"store":true,
 		"stream_options":{"include_obfuscation":false}
 	}`
-	settings := dto.ChannelOtherSettings{}
+	settings := dto.ProviderOtherSettings{}
 
 	out, err := RemoveDisabledFields([]byte(input), settings, true)
 	if err != nil {
@@ -2369,7 +2369,7 @@ func TestRemoveDisabledFieldsSkipWhenGlobalPassThroughEnabled(t *testing.T) {
 		"safety_identifier":"user-123",
 		"stream_options":{"include_obfuscation":false}
 	}`
-	settings := dto.ChannelOtherSettings{}
+	settings := dto.ProviderOtherSettings{}
 
 	out, err := RemoveDisabledFields([]byte(input), settings, false)
 	if err != nil {
@@ -2388,7 +2388,7 @@ func TestRemoveDisabledFieldsDefaultFiltering(t *testing.T) {
 		"store":true,
 		"stream_options":{"include_obfuscation":false}
 	}`
-	settings := dto.ChannelOtherSettings{}
+	settings := dto.ProviderOtherSettings{}
 
 	out, err := RemoveDisabledFields([]byte(input), settings, false)
 	if err != nil {
@@ -2402,7 +2402,7 @@ func TestRemoveDisabledFieldsDefaultFiltering(t *testing.T) {
 func TestRemoveDisabledFieldsKeepsNestedKeyOrder(t *testing.T) {
 	input := `{"service_tier":"flex","response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object","properties":{"reasoning":{"type":"string"},"answer":{"type":"string"}}}}},"stream_options":{"include_usage":true,"include_obfuscation":false}}`
 
-	out, err := RemoveDisabledFields([]byte(input), dto.ChannelOtherSettings{}, false)
+	out, err := RemoveDisabledFields([]byte(input), dto.ProviderOtherSettings{}, false)
 
 	require.NoError(t, err)
 	assert.Equal(t, `{"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object","properties":{"reasoning":{"type":"string"},"answer":{"type":"string"}}}}},"stream_options":{"include_usage":true}}`, string(out))
@@ -2413,7 +2413,7 @@ func TestRemoveDisabledFieldsKeepsNestedKeyOrder(t *testing.T) {
 func TestRemoveDisabledFieldsKeepsUntouchedBytes(t *testing.T) {
 	input := `{"model":"m","service_tier":"flex","temperature":1.0,"max_tokens":1e3,"stop":["<|end|>"],"service\u005ftier":"priority","stream_options":{"include_obfuscation":false}}`
 
-	out, err := RemoveDisabledFields([]byte(input), dto.ChannelOtherSettings{}, false)
+	out, err := RemoveDisabledFields([]byte(input), dto.ProviderOtherSettings{}, false)
 
 	require.NoError(t, err)
 	assert.Equal(t, `{"model":"m","temperature":1.0,"max_tokens":1e3,"stop":["<|end|>"]}`, string(out))
@@ -2421,7 +2421,7 @@ func TestRemoveDisabledFieldsKeepsUntouchedBytes(t *testing.T) {
 
 func TestRemoveDisabledFieldsNoControlledFieldsKeepsBody(t *testing.T) {
 	input := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
-	settings := dto.ChannelOtherSettings{}
+	settings := dto.ProviderOtherSettings{}
 
 	out, err := RemoveDisabledFields([]byte(input), settings, false)
 	if err != nil {
@@ -2435,7 +2435,7 @@ func TestRemoveDisabledFieldsAllowInferenceGeo(t *testing.T) {
 		"inference_geo":"eu",
 		"store":true
 	}`
-	settings := dto.ChannelOtherSettings{
+	settings := dto.ProviderOtherSettings{
 		AllowInferenceGeo: true,
 	}
 
@@ -2451,7 +2451,7 @@ func TestRemoveDisabledFieldsAllowSpeed(t *testing.T) {
 		"speed":"fast",
 		"store":true
 	}`
-	settings := dto.ChannelOtherSettings{
+	settings := dto.ProviderOtherSettings{
 		AllowSpeed: true,
 	}
 
@@ -2470,7 +2470,7 @@ func TestApplyParamOverrideWithRelayInfoRecordsOperationAuditInDebugMode(t *test
 	})
 
 	info := &RelayInfo{
-		ChannelMeta: &ChannelMeta{
+		ProviderMeta: &ProviderMeta{
 			ParamOverride: map[string]any{
 				"operations": []any{
 					map[string]any{
@@ -2526,7 +2526,7 @@ func TestApplyParamOverrideWithRelayInfoRecordsOnlyKeyOperationsWhenDebugDisable
 	})
 
 	info := &RelayInfo{
-		ChannelMeta: &ChannelMeta{
+		ProviderMeta: &ProviderMeta{
 			ParamOverride: map[string]any{
 				"operations": []any{
 					map[string]any{
@@ -2569,7 +2569,7 @@ func TestApplyParamOverrideWithRelayInfoRecordsConversationBodyOperationsWhenDeb
 	})
 
 	info := &RelayInfo{
-		ChannelMeta: &ChannelMeta{
+		ProviderMeta: &ProviderMeta{
 			ParamOverride: map[string]any{
 				"operations": []any{
 					map[string]any{
@@ -2746,7 +2746,7 @@ func TestApplyParamOverrideWithRelayInfoSynchronizesReasoningEffort(t *testing.T
 			info := &RelayInfo{
 				RelayFormat:     tt.relayFormat,
 				ReasoningEffort: tt.initialEffort,
-				ChannelMeta: &ChannelMeta{ParamOverride: map[string]any{
+				ProviderMeta: &ProviderMeta{ParamOverride: map[string]any{
 					"operations": []any{tt.operation},
 				}},
 			}
@@ -2766,7 +2766,7 @@ func TestReasoningEffortOverrideIsAuditedWithoutDebugMode(t *testing.T) {
 	})
 	info := &RelayInfo{
 		RelayFormat: types.RelayFormatOpenAIResponses,
-		ChannelMeta: &ChannelMeta{ParamOverride: map[string]any{
+		ProviderMeta: &ProviderMeta{ParamOverride: map[string]any{
 			"operations": []any{
 				map[string]any{"mode": "set", "path": "reasoning.effort", "value": "max"},
 			},

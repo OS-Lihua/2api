@@ -54,7 +54,7 @@ func convertChatCompatibilityRequest(t *testing.T, request *dto.GeneralOpenAIReq
 		Request:         request,
 		RelayFormat:     types.RelayFormatOpenAI,
 		IsStream:        request.IsStream(nil),
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType:          channelType,
 			UpstreamModelName:    request.Model,
 			SupportStreamOptions: true,
@@ -98,7 +98,7 @@ func TestChannelTestOpenAIChatCompatibility(t *testing.T) {
 		{name: "o series", model: "o3-mini", upstream: "o3-mini", channelType: constant.ChannelTypeAzure, wantLimit: "max_completion_tokens"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			request, ok := buildTestRequest(tt.model, tt.endpoint, &model.Channel{}, tt.stream).(*dto.GeneralOpenAIRequest)
+			request, ok := buildTestRequest(tt.model, tt.endpoint, &model.Provider{}, tt.stream).(*dto.GeneralOpenAIRequest)
 			require.True(t, ok)
 			encoded := convertChatCompatibilityRequest(t, request, tt.channelType, map[string]string{tt.model: tt.upstream})
 			want := map[string]any{
@@ -237,7 +237,7 @@ func TestDirectOpenAIResponsesKeepsExistingParameters(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "gpt-6-astra",
 		RelayFormat:     types.RelayFormatOpenAIResponses,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType:       constant.ChannelTypeOpenAI,
 			UpstreamModelName: "gpt-6-astra",
 		},
@@ -287,10 +287,10 @@ func TestCloudflareEmbeddingResponseCompatibility(t *testing.T) {
 			info := &relaycommon.RelayInfo{
 				RelayMode:   relayconstant.RelayModeEmbeddings,
 				RelayFormat: types.RelayFormatEmbedding,
-				ChannelMeta: &relaycommon.ChannelMeta{
+				ProviderMeta: &relaycommon.ProviderMeta{
 					ChannelType:       constant.ChannelCloudflare,
 					UpstreamModelName: "@cf/baai/bge-large-en-v1.5",
-					ChannelSetting:    dto.ChannelSettings{ForceFormat: tt.forceFormat},
+					ChannelSetting:    dto.ProviderSettings{ForceFormat: tt.forceFormat},
 				},
 			}
 			info.SetEstimatePromptTokens(99)

@@ -39,7 +39,7 @@ func TestThinkingSuffixUpstreamFields(t *testing.T) {
 		{model: "deepseek-v4-pro-max", upstream: "deepseek-v4-pro-max"},
 	}
 	newInfo := func(model string) *relaycommon.RelayInfo {
-		return &relaycommon.RelayInfo{OriginModelName: model, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: model}}
+		return &relaycommon.RelayInfo{OriginModelName: model, ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: model}}
 	}
 	for _, tt := range tests {
 		t.Run(tt.model, func(t *testing.T) {
@@ -95,7 +95,7 @@ func TestServerSideSearchBillingKeys(t *testing.T) {
 		{types.RelayFormatOpenAI, constant.RelayModeChatCompletions},
 		{types.RelayFormatOpenAIResponses, constant.RelayModeResponses},
 	} {
-		info := &relaycommon.RelayInfo{RelayFormat: tc.format, RelayMode: tc.mode, ChannelMeta: &relaycommon.ChannelMeta{}}
+		info := &relaycommon.RelayInfo{RelayFormat: tc.format, RelayMode: tc.mode, ProviderMeta: &relaycommon.ProviderMeta{}}
 		(&Adaptor{}).Init(info)
 		assert.Equal(t, SearchToolPriceKey, info.WebSearchBillingKey, tc.format)
 		assert.Equal(t, FetchToolPriceKey, info.WebFetchBillingKey, tc.format)
@@ -115,7 +115,7 @@ func TestServerSideSearchBillingKeys(t *testing.T) {
 			OriginModelName: "gpt-5.1-codex",
 			RelayFormat:     types.RelayFormatOpenAIResponses,
 			RelayMode:       constant.RelayModeResponses,
-			ChannelMeta:     &relaycommon.ChannelMeta{},
+			ProviderMeta:    &relaycommon.ProviderMeta{},
 		}
 		(&Adaptor{}).Init(info)
 		for range 3 {
@@ -193,7 +193,7 @@ func TestModelModifiersUpstreamFields(t *testing.T) {
 				info := &relaycommon.RelayInfo{
 					OriginModelName: tt.model,
 					RelayFormat:     format,
-					ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: tt.model},
+					ProviderMeta:    &relaycommon.ProviderMeta{UpstreamModelName: tt.model},
 				}
 				var sent []byte
 				switch format {

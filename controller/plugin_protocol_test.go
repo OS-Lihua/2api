@@ -172,12 +172,12 @@ func TestServeTaskPluginProtocolDisconnectBeforeDurableBarrierPersistsAndSettles
 	deps.submit = func(c *gin.Context, info *relaycommon.RelayInfo) (*taskSubmissionOutcome, *dto.TaskError) {
 		info.Billing = billing
 		info.TaskRelayInfo.PublicTaskID = "task_disconnect_persisted"
-		info.TaskRelayInfo.LockedChannel = &model.Channel{
+		info.TaskRelayInfo.LockedChannel = &model.Provider{
 			Id:   1,
 			Type: constant.ChannelTypeTaskPlugin,
 			Name: "disconnect-before-durable",
 		}
-		info.ChannelMeta = &relaycommon.ChannelMeta{
+		info.ProviderMeta = &relaycommon.ProviderMeta{
 			ChannelId:   1,
 			ChannelType: constant.ChannelTypeTaskPlugin,
 		}
@@ -241,14 +241,14 @@ func TestServeTaskPluginProtocolDisconnectDuringTerminalSettlementStopsOnlyObser
 	previousDB := model.DB
 	previousMemoryCache := common.MemoryCacheEnabled
 	database := model.UseTestDatabases(t)
-	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Task{}))
+	require.NoError(t, database.AutoMigrate(&model.Provider{}, &model.Task{}))
 	common.MemoryCacheEnabled = false
 	t.Cleanup(func() {
 		model.DB = previousDB
 		common.MemoryCacheEnabled = previousMemoryCache
 	})
 	baseURL := "https://example.com"
-	channel := model.Channel{
+	channel := model.Provider{
 		Type:    constant.ChannelTypeTaskPlugin,
 		Name:    "terminal-settlement",
 		Key:     "test-key",
@@ -1815,8 +1815,8 @@ func TestServeTaskPluginImageProtocolDisconnectDuringSubmissionKeepsDurableSettl
 	deps.submit = func(c *gin.Context, info *relaycommon.RelayInfo) (*taskSubmissionOutcome, *dto.TaskError) {
 		info.Billing = billing
 		info.TaskRelayInfo.PublicTaskID = "task_image_disconnect"
-		info.TaskRelayInfo.LockedChannel = &model.Channel{Id: 1, Type: constant.ChannelTypeTaskPlugin, Name: "image-bridge"}
-		info.ChannelMeta = &relaycommon.ChannelMeta{ChannelId: 1, ChannelType: constant.ChannelTypeTaskPlugin}
+		info.TaskRelayInfo.LockedChannel = &model.Provider{Id: 1, Type: constant.ChannelTypeTaskPlugin, Name: "image-bridge"}
+		info.ProviderMeta = &relaycommon.ProviderMeta{ChannelId: 1, ChannelType: constant.ChannelTypeTaskPlugin}
 		return executeTaskSubmissionWith(c, info, func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
 			close(submitStarted)
 			<-releaseSubmit

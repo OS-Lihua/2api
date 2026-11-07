@@ -175,7 +175,7 @@ func newGeminiResponsesRelayInfo(isStream bool) *relaycommon.RelayInfo {
 		RequestURLPath:  "/v1/responses",
 		DisablePing:     true,
 		OriginModelName: "gemini-test",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "gemini-test",
 		},
 	}

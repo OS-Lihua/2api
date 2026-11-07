@@ -89,7 +89,7 @@ func ResolveOriginTask(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskErr
 	}
 
 	// 锁定到原始任务的渠道（重试时复用同一渠道，轮换 key）
-	ch, err := model.GetChannelById(originTask.ChannelId, true)
+	ch, err := model.GetProviderById(originTask.ChannelId, true)
 	if err != nil {
 		return service.TaskErrorWrapperLocal(err, "channel_not_found", http.StatusBadRequest)
 	}
@@ -176,7 +176,7 @@ func ApplyChannelPin(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskError
 	if !found || pin.RetryMode != dto.PinRetrySameChannel {
 		return nil
 	}
-	ch, err := model.CacheGetChannel(pin.ChannelId)
+	ch, err := model.CacheGetProvider(pin.ChannelId)
 	if err != nil {
 		return service.TaskErrorWrapperLocal(err, "origin_task_channel_disabled", http.StatusBadRequest)
 	}
@@ -529,7 +529,7 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 // 仅当渠道类型为 Gemini 或 Vertex 时触发；其他渠道或出错时返回 nil。
 // 当非 OpenAI Video API 时，还会构建自定义格式的响应体。
 func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
-	channelModel, err := model.GetChannelById(task.ChannelId, true)
+	channelModel, err := model.GetProviderById(task.ChannelId, true)
 	if err != nil {
 		return nil
 	}
@@ -546,7 +546,7 @@ func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
 	if adaptor == nil {
 		return nil
 	}
-	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+	adaptor.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{
 		ChannelType:     channelModel.Type,
 		ChannelId:       channelModel.Id,
 		ChannelBaseUrl:  baseURL,

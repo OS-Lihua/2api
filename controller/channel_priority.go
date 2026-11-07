@@ -10,7 +10,7 @@ import (
 )
 
 func GetChannelPriorityOrder(c *gin.Context) {
-	order, err := model.GetChannelPriorityOrder()
+	order, err := model.GetProviderPriorityOrder()
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -19,14 +19,14 @@ func GetChannelPriorityOrder(c *gin.Context) {
 }
 
 func ReorderChannelPriority(c *gin.Context) {
-	var move model.ChannelPriorityMove
+	var move model.ProviderPriorityMove
 	if err := common.DecodeJson(c.Request.Body, &move); err != nil {
 		common.ApiErrorT(c, "Invalid channel priority move")
 		return
 	}
-	order, err := model.ReorderChannelPriority(move)
+	order, err := model.ReorderProviderPriority(move)
 	if err != nil {
-		if errors.Is(err, model.ErrChannelPriorityConflict) || errors.Is(err, model.ErrChannelPriorityInvalid) || errors.Is(err, model.ErrChannelPriorityRange) {
+		if errors.Is(err, model.ErrChannelPriorityConflict) || errors.Is(err, model.ErrChannelPriorityInvalid) || errors.Is(err, model.ErrProviderPriorityRange) {
 			common.ApiErrorT(c, err.Error())
 		} else {
 			common.ApiError(c, err)
@@ -34,7 +34,7 @@ func ReorderChannelPriority(c *gin.Context) {
 		return
 	}
 	if !move.Preview && len(order.Changes) > 0 {
-		model.InitChannelCache()
+		model.InitProviderCache()
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": order})
 }

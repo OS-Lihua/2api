@@ -51,7 +51,7 @@ func TestDispatchAdaptorInit(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{
 				ChannelType:    constant.ChannelTypeTencent,
 				ApiKey:         tt.apiKey,
 				ChannelBaseUrl: tt.baseURL,

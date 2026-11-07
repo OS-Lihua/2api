@@ -45,7 +45,7 @@ func listModelsMeta(c *gin.Context, keyword, vendor string) {
 	}
 	search := model.SearchModels
 	if c.Query("include_channel_models") == "true" {
-		search = model.SearchModelsWithChannels
+		search = model.SearchModelsWithProviders
 	}
 	modelsMeta, total, err := search(keyword, vendor, c.Query("status"), c.Query("sync_official"), offset, limit)
 	if err != nil {
@@ -258,7 +258,7 @@ func enrichModels(models []*model.Model) error {
 	if len(models) == 0 {
 		return nil
 	}
-	configured, err := model.GetConfiguredModelChannels()
+	configured, err := model.GetConfiguredModelProviders()
 	if err != nil {
 		return err
 	}
@@ -288,7 +288,7 @@ func enrichModels(models []*model.Model) error {
 		if metadata == nil {
 			continue
 		}
-		channels := make(map[int]model.BoundChannel)
+		channels := make(map[int]model.BoundProvider)
 		groups := make(map[string]bool)
 		names := make(map[string]bool)
 		endpoints := make(map[string]bool)
@@ -300,7 +300,7 @@ func enrichModels(models []*model.Model) error {
 			}
 			names[name] = true
 			groups[connection.Group] = true
-			channels[connection.ChannelId] = model.BoundChannel{Name: connection.ChannelName, Type: connection.ChannelType}
+			channels[connection.ChannelId] = model.BoundProvider{Name: connection.ChannelName, Type: connection.ChannelType}
 			for _, endpoint := range model.GetModelSupportEndpointTypes(name) {
 				endpoints[string(endpoint)] = true
 			}

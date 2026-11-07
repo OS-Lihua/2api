@@ -26,7 +26,7 @@ func TestConvertClaudeRequestTreatsZeroMaxTokensAsUnset(t *testing.T) {
 		},
 	}
 	info := &relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "claude-sonnet-4-5",
 		},
 	}
@@ -57,7 +57,7 @@ func TestConvertClaudeRequestPreservesNativeClaudeCodeThinking(t *testing.T) {
 	}
 	info := &relaycommon.RelayInfo{
 		OriginModelName: req.Model,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: req.Model,
 		},
 	}
@@ -85,7 +85,7 @@ func TestConvertClaudeRequestPreservesMessageOutputConfig(t *testing.T) {
 	require.NoError(t, common.UnmarshalJsonStr(body, &req))
 	info := &relaycommon.RelayInfo{
 		OriginModelName: req.Model,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: req.Model,
 		},
 	}
@@ -120,7 +120,7 @@ func TestConvertClaudeRequestZeroMaxTokensStillRaisesThinkingBudget(t *testing.T
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "claude-3-7-sonnet-thinking",
 		Request:         original,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "claude-3-7-sonnet-thinking",
 		},
 	}
@@ -148,7 +148,7 @@ func TestConvertClaudeRequestDoesNotOverwriteTrimmedUpstreamModelName(t *testing
 		},
 	}
 	info := &relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "claude-3-7-sonnet",
 		},
 	}
@@ -201,7 +201,7 @@ func TestConvertClaudeRequestForwardsThinkingBlockBinding(t *testing.T) {
 			info := &relaycommon.RelayInfo{
 				OriginModelName: tt.model,
 				Request:         &original,
-				ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: tt.model},
+				ProviderMeta:    &relaycommon.ProviderMeta{UpstreamModelName: tt.model},
 			}
 			// Same steps as the Claude handler before the adaptor converts.
 			outbound, err := common.DeepCopy(&original)
@@ -230,7 +230,7 @@ func TestSetupRequestHeaderForwardsEveryAnthropicBetaValue(t *testing.T) {
 	c.Request.Header.Add("anthropic-beta", "thinking-binding-controls-2026-08-01")
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "claude-opus-5-5",
-		ChannelMeta:     &relaycommon.ChannelMeta{ApiKey: "sk-test"},
+		ProviderMeta:    &relaycommon.ProviderMeta{ApiKey: "sk-test"},
 	}
 
 	header := http.Header{}
@@ -241,7 +241,7 @@ func TestSetupRequestHeaderForwardsEveryAnthropicBetaValue(t *testing.T) {
 func geminiToClaudeInfo() *relaycommon.RelayInfo {
 	return &relaycommon.RelayInfo{
 		OriginModelName: "claude-3-7-sonnet",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "claude-3-7-sonnet",
 		},
 	}

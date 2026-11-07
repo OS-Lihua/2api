@@ -15,7 +15,7 @@ import (
 func TestGetRequestURLAlphaSearch(t *testing.T) {
 	adaptor := &Adaptor{}
 	info := &relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType:    constant.ChannelTypeSub2API,
 			ChannelBaseUrl: "https://sub2api.example",
 		},
@@ -31,7 +31,7 @@ func TestGetRequestURLAlphaSearch(t *testing.T) {
 func TestAdaptorInheritsNewAPIResponsesCompactSupport(t *testing.T) {
 	adaptor := &Adaptor{}
 	info := &relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType:    constant.ChannelTypeSub2API,
 			ChannelBaseUrl: "https://sub2api.example",
 		},
@@ -65,7 +65,7 @@ func TestConvertClaudeRequestPreservesAdaptiveThinkingForCompatibleModel(t *test
 	}
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "gpt-5.6-sol",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType: constant.ChannelTypeSub2API,
 		},
 	}

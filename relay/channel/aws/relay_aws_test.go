@@ -95,7 +95,7 @@ func newAwsTestRelayInfo() *relaycommon.RelayInfo {
 		OriginModelName:    awsTestModel,
 		RelayFormat:        relaytypes.RelayFormatOpenAI,
 		ShouldIncludeUsage: true,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: awsTestModel,
 		},
 	}
@@ -165,7 +165,7 @@ func TestDoAwsClientRequest_AppliesRuntimeHeaderOverrideToAnthropicBeta(t *testi
 		RuntimeHeadersOverride: map[string]any{
 			"anthropic-beta": "computer-use-2025-01-24",
 		},
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ApiKey:            "access-key|secret-key|us-east-1",
 			UpstreamModelName: "claude-3-5-sonnet-20240620",
 		},
@@ -199,7 +199,7 @@ func TestDoAwsClientRequest_ForwardsThinkingBlockBindingAndBetaList(t *testing.T
 
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "claude-opus-5-5",
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ApiKey:            "access-key|secret-key|us-east-1",
 			UpstreamModelName: "claude-opus-5-5",
 		},
@@ -228,7 +228,7 @@ func TestBuildAwsRequestBodyPassThroughDropsRepeatedModelAndStream(t *testing.T)
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"a","stream":true,"max_tokens":8,"stream":false,"model":"b"}`))
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{}}
 	info.ChannelSetting.PassThroughBodyEnabled = true
 
 	body, err := buildAwsRequestBody(c, info, nil)
@@ -281,7 +281,7 @@ func TestDoAwsClientRequest_PreservesSafeguards(t *testing.T) {
 					OriginModelName: "claude-sonnet-5",
 					IsStream:        stream,
 					RelayFormat:     relaytypes.RelayFormatClaude,
-					ChannelMeta: &relaycommon.ChannelMeta{
+					ProviderMeta: &relaycommon.ProviderMeta{
 						ApiKey:            "access-key|secret-key|us-east-1",
 						UpstreamModelName: "global.anthropic.claude-sonnet-5",
 					},

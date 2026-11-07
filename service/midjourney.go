@@ -53,7 +53,7 @@ func PrepareMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.
 
 	task.Quota = quota
 	task.BillingChannelId = task.ChannelId
-	if relayInfo.ChannelMeta != nil && relayInfo.ChannelId > 0 {
+	if relayInfo.ProviderMeta != nil && relayInfo.ChannelId > 0 {
 		task.BillingChannelId = relayInfo.ChannelId
 	}
 	return true, nil
@@ -115,7 +115,7 @@ func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason s
 
 	billingChannelId := task.GetBillingChannelId()
 	model.UpdateUserUsedQuota(task.UserId, -quota)
-	model.UpdateChannelUsedQuota(billingChannelId, -quota)
+	model.UpdateProviderUsedQuota(billingChannelId, -quota)
 	other := model.NewLogOther()
 	other.SetPublic("task_id", task.MjId)
 	other.SetPublic("reason", reason)

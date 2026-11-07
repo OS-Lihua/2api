@@ -66,14 +66,14 @@ func parseStatusFilter(statusParam string) int {
 	}
 }
 
-func clearChannelInfo(channel *model.Channel) {
-	if channel.ChannelInfo.IsMultiKey {
-		channel.ChannelInfo.MultiKeyDisabledReason = nil
-		channel.ChannelInfo.MultiKeyDisabledTime = nil
+func clearChannelInfo(channel *model.Provider) {
+	if channel.ProviderInfo.IsMultiKey {
+		channel.ProviderInfo.MultiKeyDisabledReason = nil
+		channel.ProviderInfo.MultiKeyDisabledTime = nil
 	}
 }
 
-func channelIDsFromChannels(channels []*model.Channel) []int {
+func channelIDsFromChannels(channels []*model.Provider) []int {
 	ids := make([]int, 0, len(channels))
 	for _, channel := range channels {
 		if channel != nil && channel.Id > 0 {
@@ -87,8 +87,8 @@ func closeActiveChannelWebSockets(channelIDs []int) {
 	service.CloseActiveWebSocketsForChannels(channelIDs, service.ChannelDisabledCloseReason)
 }
 
-func hasEnabledMultiKey(channel *model.Channel) bool {
-	if channel == nil || !channel.ChannelInfo.IsMultiKey {
+func hasEnabledMultiKey(channel *model.Provider) bool {
+	if channel == nil || !channel.ProviderInfo.IsMultiKey {
 		return true
 	}
 	keys := channel.GetKeys()
@@ -96,18 +96,18 @@ func hasEnabledMultiKey(channel *model.Channel) bool {
 		return false
 	}
 	for i := range keys {
-		if channel.ChannelInfo.MultiKeyStatusList == nil {
+		if channel.ProviderInfo.MultiKeyStatusList == nil {
 			return true
 		}
-		if status, ok := channel.ChannelInfo.MultiKeyStatusList[i]; !ok || status == common.ChannelStatusEnabled {
+		if status, ok := channel.ProviderInfo.MultiKeyStatusList[i]; !ok || status == common.ChannelStatusEnabled {
 			return true
 		}
 	}
 	return false
 }
 
-func disableMultiKeyChannelIfUnavailable(channel *model.Channel) bool {
-	if channel == nil || !channel.ChannelInfo.IsMultiKey || hasEnabledMultiKey(channel) {
+func disableMultiKeyChannelIfUnavailable(channel *model.Provider) bool {
+	if channel == nil || !channel.ProviderInfo.IsMultiKey || hasEnabledMultiKey(channel) {
 		return false
 	}
 	if channel.Status != common.ChannelStatusEnabled {
@@ -115,18 +115,18 @@ func disableMultiKeyChannelIfUnavailable(channel *model.Channel) bool {
 	}
 	channel.Status = common.ChannelStatusManuallyDisabled
 	info := channel.GetOtherInfo()
-	info["status_reason"] = model.ChannelStatusReasonAllKeysDisabled
+	info["status_reason"] = model.ProviderStatusReasonAllKeysDisabled
 	info["status_time"] = common.GetTimestamp()
 	channel.SetOtherInfo(info)
 	return true
 }
 
-func restoreMultiKeyChannelIfAvailable(channel *model.Channel) {
+func restoreMultiKeyChannelIfAvailable(channel *model.Provider) {
 	if channel.Status != common.ChannelStatusManuallyDisabled || !hasEnabledMultiKey(channel) {
 		return
 	}
 	info := channel.GetOtherInfo()
-	if info["status_reason"] != model.ChannelStatusReasonAllKeysDisabled {
+	if info["status_reason"] != model.ProviderStatusReasonAllKeysDisabled {
 		return
 	}
 	channel.Status = common.ChannelStatusEnabled
@@ -146,8 +146,8 @@ func applyChannelStatusFilter(query *gorm.DB, statusFilter int) *gorm.DB {
 }
 
 func buildChannelListQuery(group string, statusFilter int, typeFilter int) *gorm.DB {
-	query := model.DB.Model(&model.Channel{})
-	query = model.ApplyChannelGroupFilter(query, group)
+	query := model.DB.Model(&model.Provider{})
+	query = model.ApplyProviderGroupFilter(query, group)
 	query = applyChannelStatusFilter(query, statusFilter)
 	if typeFilter >= 0 {
 		query = query.Where("type = ?", typeFilter)
@@ -190,11 +190,11 @@ func GetChannelDefaultBaseURLs(c *gin.Context) {
 
 func GetAllChannels(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
-	channelData := make([]*model.Channel, 0)
+	channelData := make([]*model.Provider, 0)
 	idSort, _ := strconv.ParseBool(c.Query("id_sort"))
-	sortOptions := model.NewChannelSortOptions(c.Query("sort_by"), c.Query("sort_order"), idSort)
+	sortOptions := model.NewProviderSortOptions(c.Query("sort_by"), c.Query("sort_order"), idSort)
 	enableTagMode, _ := strconv.ParseBool(c.Query("tag_mode"))
-	groupFilter := model.NormalizeChannelGroupFilter(c.Query("group"))
+	groupFilter := model.NormalizeProviderGroupFilter(c.Query("group"))
 	statusParam := c.Query("status")
 	// statusFilter: -1 all, 1 enabled, 0 disabled (include auto & manual)
 	statusFilter := parseStatusFilter(statusParam)
@@ -210,13 +210,13 @@ func GetAllChannels(c *gin.Context) {
 	var total int64
 
 	if enableTagMode {
-		tags, err := model.GetPaginatedChannelTags(buildChannelListQuery(groupFilter, statusFilter, typeFilter), pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+		tags, err := model.GetPaginatedProviderTags(buildChannelListQuery(groupFilter, statusFilter, typeFilter), pageInfo.GetStartIdx(), pageInfo.GetPageSize())
 		if err != nil {
 			common.SysError(common.LogText("failed to get paginated tags: %s", err.Error()))
 			common.ApiErrorT(c, "Failed to fetch tags. Please try again later")
 			return
 		}
-		total, err = model.CountChannelTags(buildChannelListQuery(groupFilter, statusFilter, typeFilter))
+		total, err = model.CountProviderTags(buildChannelListQuery(groupFilter, statusFilter, typeFilter))
 		if err != nil {
 			common.SysError(common.LogText("failed to count tags: %s", err.Error()))
 			common.ApiErrorT(c, "Failed to count tags. Please try again later")
@@ -226,7 +226,7 @@ func GetAllChannels(c *gin.Context) {
 			if tag == nil || *tag == "" {
 				continue
 			}
-			var tagChannels []*model.Channel
+			var tagChannels []*model.Provider
 			err := sortOptions.Apply(buildChannelListQuery(groupFilter, statusFilter, typeFilter).Where("tag = ?", *tag)).
 				Omit("key").
 				Find(&tagChannels).Error
@@ -284,7 +284,7 @@ func GetAllChannels(c *gin.Context) {
 	return
 }
 
-func buildFetchModelsHeaders(channel *model.Channel, key string) (http.Header, error) {
+func buildFetchModelsHeaders(channel *model.Provider, key string) (http.Header, error) {
 	var headers http.Header
 	switch channel.Type {
 	case constant.ChannelTypeAnthropic:
@@ -299,10 +299,10 @@ func buildFetchModelsHeaders(channel *model.Channel, key string) (http.Header, e
 	return headers, nil
 }
 
-func applyFetchModelsHeaderOverrides(channel *model.Channel, key string, headers http.Header) error {
+func applyFetchModelsHeaderOverrides(channel *model.Provider, key string, headers http.Header) error {
 	info := &relaycommon.RelayInfo{
 		IsChannelTest: true,
-		ChannelMeta: &relaycommon.ChannelMeta{
+		ProviderMeta: &relaycommon.ProviderMeta{
 			ApiKey:          key,
 			HeadersOverride: channel.GetHeaderOverride(),
 		},
@@ -325,7 +325,7 @@ func FetchUpstreamModels(c *gin.Context) {
 		return
 	}
 
-	channel, err := model.GetChannelById(id, true)
+	channel, err := model.GetProviderById(id, true)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -367,9 +367,9 @@ func SearchChannels(c *gin.Context) {
 	statusParam := c.Query("status")
 	statusFilter := parseStatusFilter(statusParam)
 	idSort, _ := strconv.ParseBool(c.Query("id_sort"))
-	sortOptions := model.NewChannelSortOptions(c.Query("sort_by"), c.Query("sort_order"), idSort)
+	sortOptions := model.NewProviderSortOptions(c.Query("sort_by"), c.Query("sort_order"), idSort)
 	enableTagMode, _ := strconv.ParseBool(c.Query("tag_mode"))
-	channelData := make([]*model.Channel, 0)
+	channelData := make([]*model.Provider, 0)
 	if enableTagMode {
 		tags, err := model.SearchTags(keyword, group, modelKeyword, idSort)
 		if err != nil {
@@ -378,7 +378,7 @@ func SearchChannels(c *gin.Context) {
 		}
 		for _, tag := range tags {
 			if tag != nil && *tag != "" {
-				var tagChannels []*model.Channel
+				var tagChannels []*model.Provider
 				err := sortOptions.Apply(buildChannelListQuery(group, -1, -1).Where("tag = ?", *tag)).
 					Omit("key").
 					Find(&tagChannels).Error
@@ -390,7 +390,7 @@ func SearchChannels(c *gin.Context) {
 			}
 		}
 	} else {
-		channels, err := model.SearchChannels(keyword, group, modelKeyword, idSort, sortOptions)
+		channels, err := model.SearchProviders(keyword, group, modelKeyword, idSort, sortOptions)
 		if err != nil {
 			common.ApiError(c, err)
 			return
@@ -399,7 +399,7 @@ func SearchChannels(c *gin.Context) {
 	}
 
 	if statusFilter == common.ChannelStatusEnabled || statusFilter == 0 {
-		filtered := make([]*model.Channel, 0, len(channelData))
+		filtered := make([]*model.Provider, 0, len(channelData))
 		for _, ch := range channelData {
 			if statusFilter == common.ChannelStatusEnabled && ch.Status != common.ChannelStatusEnabled {
 				continue
@@ -427,7 +427,7 @@ func SearchChannels(c *gin.Context) {
 	}
 
 	if typeFilter >= 0 {
-		filtered := make([]*model.Channel, 0, len(channelData))
+		filtered := make([]*model.Provider, 0, len(channelData))
 		for _, ch := range channelData {
 			if ch.Type == typeFilter {
 				filtered = append(filtered, ch)
@@ -473,7 +473,7 @@ func GetChannel(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	channel, err := model.GetChannelById(id, false)
+	channel, err := model.GetProviderById(id, false)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -499,7 +499,7 @@ func GetChannelKey(c *gin.Context) {
 	}
 
 	// 获取渠道信息（包含密钥）
-	channel, err := model.GetChannelById(channelId, true)
+	channel, err := model.GetProviderById(channelId, true)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		common.ApiErrorT(c, "Channel does not exist")
 		return
@@ -526,7 +526,7 @@ func GetChannelKey(c *gin.Context) {
 const maxTaskExtendPluginKeys = 32
 
 // validateChannel 通用的渠道校验函数
-func validateChannel(channel *model.Channel, isAdd bool) error {
+func validateChannel(channel *model.Provider, isAdd bool) error {
 	if channel == nil {
 		return fmt.Errorf("channel cannot be empty")
 	}
@@ -696,11 +696,11 @@ func RefreshCodexChannelCredential(c *gin.Context) {
 	})
 }
 
-type AddChannelRequest struct {
+type AddProviderRequest struct {
 	Mode                      string                `json:"mode"`
 	MultiKeyMode              constant.MultiKeyMode `json:"multi_key_mode"`
 	BatchAddSetKeyPrefix2Name bool                  `json:"batch_add_set_key_prefix_2_name"`
-	Channel                   *model.Channel        `json:"channel"`
+	Channel                   *model.Provider       `json:"channel"`
 }
 
 func getVertexArrayKeys(keys string) ([]string, []int, error) {
@@ -738,7 +738,7 @@ func getVertexArrayKeys(keys string) ([]string, []int, error) {
 }
 
 func AddChannel(c *gin.Context) {
-	addChannelRequest := AddChannelRequest{}
+	addChannelRequest := AddProviderRequest{}
 	err := c.ShouldBindJSON(&addChannelRequest)
 	if err != nil {
 		common.ApiError(c, err)
@@ -771,15 +771,15 @@ func AddChannel(c *gin.Context) {
 	inputIndices := make([]int, 0)
 	switch addChannelRequest.Mode {
 	case "multi_to_single":
-		addChannelRequest.Channel.ChannelInfo.IsMultiKey = true
-		addChannelRequest.Channel.ChannelInfo.MultiKeyMode = addChannelRequest.MultiKeyMode
+		addChannelRequest.Channel.ProviderInfo.IsMultiKey = true
+		addChannelRequest.Channel.ProviderInfo.MultiKeyMode = addChannelRequest.MultiKeyMode
 		if addChannelRequest.Channel.Type == constant.ChannelTypeVertexAi && addChannelRequest.Channel.GetOtherSettings().VertexKeyType != dto.VertexKeyTypeAPIKey {
 			array, indices, err := getVertexArrayKeys(addChannelRequest.Channel.Key)
 			if err != nil {
 				common.ApiError(c, err)
 				return
 			}
-			addChannelRequest.Channel.ChannelInfo.MultiKeySize = len(array)
+			addChannelRequest.Channel.ProviderInfo.MultiKeySize = len(array)
 			addChannelRequest.Channel.Key = strings.Join(array, "\n")
 			inputIndices = indices
 		} else {
@@ -792,7 +792,7 @@ func AddChannel(c *gin.Context) {
 				cleanKeys = append(cleanKeys, key)
 				inputIndices = append(inputIndices, i)
 			}
-			addChannelRequest.Channel.ChannelInfo.MultiKeySize = len(cleanKeys)
+			addChannelRequest.Channel.ProviderInfo.MultiKeySize = len(cleanKeys)
 			addChannelRequest.Channel.Key = strings.Join(cleanKeys, "\n")
 		}
 		keys = []string{addChannelRequest.Channel.Key}
@@ -818,7 +818,7 @@ func AddChannel(c *gin.Context) {
 		return
 	}
 
-	channels := make([]model.Channel, 0, len(keys))
+	channels := make([]model.Provider, 0, len(keys))
 	channelInputIndices := make([][]int, 0, len(keys))
 	for i, key := range keys {
 		if key == "" {
@@ -840,7 +840,7 @@ func AddChannel(c *gin.Context) {
 			channelInputIndices = append(channelInputIndices, []int{inputIndices[i]})
 		}
 	}
-	err = model.BatchInsertChannels(channels)
+	err = model.BatchInsertProviders(channels)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -879,19 +879,19 @@ func DeleteChannel(c *gin.Context) {
 	channelName := ""
 	channelProxy := ""
 	channelLookupFailed := false
-	if existing, err := model.GetChannelById(id, false); err == nil && existing != nil {
+	if existing, err := model.GetProviderById(id, false); err == nil && existing != nil {
 		channelName = existing.Name
 		channelProxy = existing.GetSetting().Proxy
 	} else {
 		channelLookupFailed = true
 	}
-	channel := model.Channel{Id: id}
+	channel := model.Provider{Id: id}
 	err := channel.Delete()
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	model.InitChannelCache()
+	model.InitProviderCache()
 	if channelLookupFailed {
 		service.ResetProxyClientCache()
 	} else {
@@ -911,18 +911,18 @@ func DeleteChannel(c *gin.Context) {
 
 func DeleteDisabledChannel(c *gin.Context) {
 	var ids []int
-	if err := model.DB.Model(&model.Channel{}).
+	if err := model.DB.Model(&model.Provider{}).
 		Where("status = ? or status = ?", common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled).
 		Pluck("id", &ids).Error; err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	rows, err := model.DeleteDisabledChannel()
+	rows, err := model.DeleteDisabledProvider()
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	model.InitChannelCache()
+	model.InitProviderCache()
 	if rows > 0 {
 		service.ResetProxyClientCache()
 	}
@@ -938,7 +938,7 @@ func DeleteDisabledChannel(c *gin.Context) {
 	return
 }
 
-type ChannelTag struct {
+type ProviderTag struct {
 	Tag            string  `json:"tag"`
 	NewTag         *string `json:"new_tag"`
 	Priority       *int64  `json:"priority"`
@@ -951,24 +951,24 @@ type ChannelTag struct {
 }
 
 func DisableTagChannels(c *gin.Context) {
-	channelTag := ChannelTag{}
+	channelTag := ProviderTag{}
 	err := c.ShouldBindJSON(&channelTag)
 	if err != nil || channelTag.Tag == "" {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	channels, err := model.GetChannelsByTag(channelTag.Tag, false, false)
+	channels, err := model.GetProvidersByTag(channelTag.Tag, false, false)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
 	ids := channelIDsFromChannels(channels)
-	err = model.DisableChannelByTag(channelTag.Tag)
+	err = model.DisableProviderByTag(channelTag.Tag)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	model.InitChannelCache()
+	model.InitProviderCache()
 	recordManageAudit(c, "channel.tag_disable", map[string]any{
 		"tag": channelTag.Tag,
 	})
@@ -981,18 +981,18 @@ func DisableTagChannels(c *gin.Context) {
 }
 
 func EnableTagChannels(c *gin.Context) {
-	channelTag := ChannelTag{}
+	channelTag := ProviderTag{}
 	err := c.ShouldBindJSON(&channelTag)
 	if err != nil || channelTag.Tag == "" {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	err = model.EnableChannelByTag(channelTag.Tag)
+	err = model.EnableProviderByTag(channelTag.Tag)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	model.InitChannelCache()
+	model.InitProviderCache()
 	recordManageAudit(c, "channel.tag_enable", map[string]any{
 		"tag": channelTag.Tag,
 	})
@@ -1004,7 +1004,7 @@ func EnableTagChannels(c *gin.Context) {
 }
 
 func EditTagChannels(c *gin.Context) {
-	channelTag := ChannelTag{}
+	channelTag := ProviderTag{}
 	err := c.ShouldBindJSON(&channelTag)
 	if err != nil {
 		common.ApiErrorT(c, "Invalid parameters")
@@ -1035,12 +1035,12 @@ func EditTagChannels(c *gin.Context) {
 		}
 		channelTag.HeaderOverride = common.GetPointer[string](trimmed)
 	}
-	err = model.EditChannelByTag(channelTag.Tag, channelTag.NewTag, channelTag.ModelMapping, channelTag.Models, channelTag.Groups, channelTag.Priority, channelTag.Weight, channelTag.ParamOverride, channelTag.HeaderOverride)
+	err = model.EditProviderByTag(channelTag.Tag, channelTag.NewTag, channelTag.ModelMapping, channelTag.Models, channelTag.Groups, channelTag.Priority, channelTag.Weight, channelTag.ParamOverride, channelTag.HeaderOverride)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	model.InitChannelCache()
+	model.InitProviderCache()
 	recordManageAudit(c, "channel.tag_edit", map[string]any{
 		"tag": channelTag.Tag,
 	})
@@ -1051,24 +1051,24 @@ func EditTagChannels(c *gin.Context) {
 	return
 }
 
-type ChannelBatch struct {
+type ProviderBatch struct {
 	Ids []int   `json:"ids"`
 	Tag *string `json:"tag"`
 }
 
 func DeleteChannelBatch(c *gin.Context) {
-	channelBatch := ChannelBatch{}
+	channelBatch := ProviderBatch{}
 	err := c.ShouldBindJSON(&channelBatch)
 	if err != nil || len(channelBatch.Ids) == 0 {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	deletedCount, err := model.BatchDeleteChannels(channelBatch.Ids)
+	deletedCount, err := model.BatchDeleteProviders(channelBatch.Ids)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	model.InitChannelCache()
+	model.InitProviderCache()
 	if deletedCount > 0 {
 		service.ResetProxyClientCache()
 	}
@@ -1084,23 +1084,23 @@ func DeleteChannelBatch(c *gin.Context) {
 	return
 }
 
-type PatchChannel struct {
-	model.Channel
+type PatchProvider struct {
+	model.Provider
 	MultiKeyMode *string `json:"multi_key_mode"`
 	KeyMode      *string `json:"key_mode"` // 多key模式下密钥覆盖或者追加
 }
 
-type ChannelStatusRequest struct {
+type ProviderStatusRequest struct {
 	Status int `json:"status"`
 }
 
-type ChannelStatusBatchRequest struct {
+type ProviderStatusBatchRequest struct {
 	Ids    []int `json:"ids"`
 	Status int   `json:"status"`
 }
 
 func UpdateChannel(c *gin.Context) {
-	channel := PatchChannel{}
+	channel := PatchProvider{}
 	rawBody, err := c.GetRawData()
 	if err != nil {
 		common.ApiError(c, err)
@@ -1133,12 +1133,12 @@ func UpdateChannel(c *gin.Context) {
 	baseURLFromPluginDefault := channel.Type == constant.ChannelTypeTaskPlugin &&
 		(channel.BaseURL == nil || strings.TrimSpace(*channel.BaseURL) == "")
 	// 使用统一的校验函数
-	if err := validateChannel(&channel.Channel, false); err != nil {
+	if err := validateChannel(&channel.Provider, false); err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	// Preserve existing ChannelInfo to ensure multi-key channels keep correct state even if the client does not send ChannelInfo in the request.
-	originChannel, err := model.GetChannelById(channel.Id, true)
+	// Preserve existing ProviderInfo to ensure multi-key channels keep correct state even if the client does not send channel_info in the request.
+	originChannel, err := model.GetProviderById(channel.Id, true)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -1164,8 +1164,8 @@ func UpdateChannel(c *gin.Context) {
 		return
 	}
 
-	// Always copy the original ChannelInfo so that fields like IsMultiKey and MultiKeySize are retained.
-	channel.ChannelInfo = originChannel.ChannelInfo
+	// Always copy the original ProviderInfo so that fields like IsMultiKey and MultiKeySize are retained.
+	channel.ProviderInfo = originChannel.ProviderInfo
 
 	if channelHasSensitiveChanges(&channel, originChannel, requestData) &&
 		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite) {
@@ -1175,11 +1175,11 @@ func UpdateChannel(c *gin.Context) {
 
 	// If the request explicitly specifies a new MultiKeyMode, apply it on top of the original info.
 	if channel.MultiKeyMode != nil && *channel.MultiKeyMode != "" {
-		channel.ChannelInfo.MultiKeyMode = constant.MultiKeyMode(*channel.MultiKeyMode)
+		channel.ProviderInfo.MultiKeyMode = constant.MultiKeyMode(*channel.MultiKeyMode)
 	}
 
 	// 处理多key模式下的密钥追加/覆盖逻辑
-	if channel.KeyMode != nil && channel.ChannelInfo.IsMultiKey {
+	if channel.KeyMode != nil && channel.ProviderInfo.IsMultiKey {
 		switch *channel.KeyMode {
 		case "append":
 			// 追加模式：将新密钥添加到现有密钥列表
@@ -1260,7 +1260,7 @@ func UpdateChannel(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	model.InitChannelCache()
+	model.InitProviderCache()
 	if proxyChanged {
 		service.InvalidateProxyClient(originProxy)
 	}
@@ -1291,7 +1291,7 @@ func UpdateChannel(c *gin.Context) {
 	}
 	recordManageAudit(c, "channel.update", updateAudit)
 	channel.Key = ""
-	clearChannelInfo(&channel.Channel)
+	clearChannelInfo(&channel.Provider)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
@@ -1306,14 +1306,14 @@ func UpdateChannelStatus(c *gin.Context) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	req := ChannelStatusRequest{}
+	req := ProviderStatusRequest{}
 	if err := c.ShouldBindJSON(&req); err != nil || !isManageableChannelStatus(req.Status) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	changed := model.UpdateChannelStatus(id, "", req.Status, "manual operation")
+	changed := model.UpdateProviderStatus(id, "", req.Status, "manual operation")
 	if changed {
-		model.InitChannelCache()
+		model.InitProviderCache()
 		if req.Status != common.ChannelStatusEnabled {
 			closeActiveChannelWebSockets([]int{id})
 		}
@@ -1331,7 +1331,7 @@ func UpdateChannelStatus(c *gin.Context) {
 }
 
 func BatchUpdateChannelStatus(c *gin.Context) {
-	req := ChannelStatusBatchRequest{}
+	req := ProviderStatusBatchRequest{}
 	if err := c.ShouldBindJSON(&req); err != nil || len(req.Ids) == 0 || !isManageableChannelStatus(req.Status) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
@@ -1339,7 +1339,7 @@ func BatchUpdateChannelStatus(c *gin.Context) {
 	changedCount := 0
 	var disabledIDs []int
 	for _, id := range req.Ids {
-		if model.UpdateChannelStatus(id, "", req.Status, "manual batch operation") {
+		if model.UpdateProviderStatus(id, "", req.Status, "manual batch operation") {
 			changedCount++
 			if req.Status != common.ChannelStatusEnabled {
 				disabledIDs = append(disabledIDs, id)
@@ -1347,7 +1347,7 @@ func BatchUpdateChannelStatus(c *gin.Context) {
 		}
 	}
 	if changedCount > 0 {
-		model.InitChannelCache()
+		model.InitProviderCache()
 	}
 	if len(disabledIDs) > 0 {
 		closeActiveChannelWebSockets(disabledIDs)
@@ -1389,10 +1389,10 @@ type fetchModelsRequest struct {
 	Proxy          *string `json:"proxy"`
 }
 
-func buildAdvancedCustomModelPreviewChannel(req fetchModelsRequest) (*model.Channel, error) {
-	var channel *model.Channel
+func buildAdvancedCustomModelPreviewChannel(req fetchModelsRequest) (*model.Provider, error) {
+	var channel *model.Provider
 	if req.ChannelID > 0 {
-		savedChannel, err := model.GetChannelById(req.ChannelID, true)
+		savedChannel, err := model.GetProviderById(req.ChannelID, true)
 		if err != nil {
 			return nil, err
 		}
@@ -1405,7 +1405,7 @@ func buildAdvancedCustomModelPreviewChannel(req fetchModelsRequest) (*model.Chan
 		if key != "" {
 			key = strings.Split(key, "\n")[0]
 		}
-		channel = &model.Channel{
+		channel = &model.Provider{
 			Type: req.Type,
 			Key:  key,
 		}
@@ -1468,7 +1468,7 @@ func FetchModels(c *gin.Context) {
 		return
 	}
 
-	var channel *model.Channel
+	var channel *model.Provider
 	if req.Type == constant.ChannelTypeAdvancedCustom || req.ChannelID > 0 {
 		var err error
 		channel, err = buildAdvancedCustomModelPreviewChannel(req)
@@ -1489,7 +1489,7 @@ func FetchModels(c *gin.Context) {
 		if req.Type != constant.ChannelTypeCodex {
 			key = strings.Split(key, "\n")[0]
 		}
-		channel = &model.Channel{
+		channel = &model.Provider{
 			Type:    req.Type,
 			Key:     key,
 			BaseURL: &baseURL,
@@ -1509,18 +1509,18 @@ func FetchModels(c *gin.Context) {
 }
 
 func BatchSetChannelTag(c *gin.Context) {
-	channelBatch := ChannelBatch{}
+	channelBatch := ProviderBatch{}
 	err := c.ShouldBindJSON(&channelBatch)
 	if err != nil || len(channelBatch.Ids) == 0 {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	err = model.BatchSetChannelTag(channelBatch.Ids, channelBatch.Tag)
+	err = model.BatchSetProviderTag(channelBatch.Ids, channelBatch.Tag)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	model.InitChannelCache()
+	model.InitProviderCache()
 	recordManageAudit(c, "channel.tag_batch_set", map[string]any{
 		"count": len(channelBatch.Ids),
 	})
@@ -1539,7 +1539,7 @@ func GetTagModels(c *gin.Context) {
 		return
 	}
 
-	channels, err := model.GetChannelsByTag(tag, false, false) // idSort=false, selectAll=false
+	channels, err := model.GetProvidersByTag(tag, false, false) // idSort=false, selectAll=false
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -1592,7 +1592,7 @@ func CopyChannel(c *gin.Context) {
 	}
 
 	// fetch original channel with key
-	origin, err := model.GetChannelById(id, true)
+	origin, err := model.GetProviderById(id, true)
 	if err != nil {
 		common.SysError(common.LogText("failed to get channel by id: %s", err.Error()))
 		common.ApiErrorT(c, "Failed to fetch channel. Please try again later")
@@ -1628,7 +1628,7 @@ func CopyChannel(c *gin.Context) {
 		common.ApiErrorT(c, "Failed to copy channel. Please try again later")
 		return
 	}
-	model.InitChannelCache()
+	model.InitProviderCache()
 	recordManageAudit(c, "channel.copy", map[string]any{
 		"sourceId": id,
 		"id":       clone.Id,
@@ -1678,13 +1678,13 @@ func ManageMultiKeys(c *gin.Context) {
 		return
 	}
 
-	channel, err := model.GetChannelById(request.ChannelId, true)
+	channel, err := model.GetProviderById(request.ChannelId, true)
 	if err != nil {
 		common.ApiErrorT(c, "Channel does not exist")
 		return
 	}
 
-	if !channel.ChannelInfo.IsMultiKey {
+	if !channel.ProviderInfo.IsMultiKey {
 		common.ApiErrorT(c, "This channel is not in multi-key mode")
 		return
 	}
@@ -1704,7 +1704,7 @@ func ManageMultiKeys(c *gin.Context) {
 		})
 	}
 
-	lock := model.GetChannelPollingLock(channel.Id)
+	lock := model.GetProviderPollingLock(channel.Id)
 	lock.Lock()
 	defer lock.Unlock()
 
@@ -1732,8 +1732,8 @@ func ManageMultiKeys(c *gin.Context) {
 			var disabledTime int64
 			var reason string
 
-			if channel.ChannelInfo.MultiKeyStatusList != nil {
-				if s, exists := channel.ChannelInfo.MultiKeyStatusList[i]; exists {
+			if channel.ProviderInfo.MultiKeyStatusList != nil {
+				if s, exists := channel.ProviderInfo.MultiKeyStatusList[i]; exists {
 					status = s
 				}
 			}
@@ -1749,11 +1749,11 @@ func ManageMultiKeys(c *gin.Context) {
 			}
 
 			if status != 1 {
-				if channel.ChannelInfo.MultiKeyDisabledTime != nil {
-					disabledTime = channel.ChannelInfo.MultiKeyDisabledTime[i]
+				if channel.ProviderInfo.MultiKeyDisabledTime != nil {
+					disabledTime = channel.ProviderInfo.MultiKeyDisabledTime[i]
 				}
-				if channel.ChannelInfo.MultiKeyDisabledReason != nil {
-					reason = channel.ChannelInfo.MultiKeyDisabledReason[i]
+				if channel.ProviderInfo.MultiKeyDisabledReason != nil {
+					reason = channel.ProviderInfo.MultiKeyDisabledReason[i]
 				}
 			}
 
@@ -1827,22 +1827,22 @@ func ManageMultiKeys(c *gin.Context) {
 		}
 
 		keyIndex := *request.KeyIndex
-		if keyIndex < 0 || keyIndex >= channel.ChannelInfo.MultiKeySize {
+		if keyIndex < 0 || keyIndex >= channel.ProviderInfo.MultiKeySize {
 			common.ApiErrorT(c, "Key index out of range")
 			return
 		}
 
-		if channel.ChannelInfo.MultiKeyStatusList == nil {
-			channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
+		if channel.ProviderInfo.MultiKeyStatusList == nil {
+			channel.ProviderInfo.MultiKeyStatusList = make(map[int]int)
 		}
-		if channel.ChannelInfo.MultiKeyDisabledTime == nil {
-			channel.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64)
+		if channel.ProviderInfo.MultiKeyDisabledTime == nil {
+			channel.ProviderInfo.MultiKeyDisabledTime = make(map[int]int64)
 		}
-		if channel.ChannelInfo.MultiKeyDisabledReason == nil {
-			channel.ChannelInfo.MultiKeyDisabledReason = make(map[int]string)
+		if channel.ProviderInfo.MultiKeyDisabledReason == nil {
+			channel.ProviderInfo.MultiKeyDisabledReason = make(map[int]string)
 		}
 
-		channel.ChannelInfo.MultiKeyStatusList[keyIndex] = 2 // disabled
+		channel.ProviderInfo.MultiKeyStatusList[keyIndex] = 2 // disabled
 
 		shouldCloseWebSocket := disableMultiKeyChannelIfUnavailable(channel)
 		err = channel.Update()
@@ -1850,7 +1850,7 @@ func ManageMultiKeys(c *gin.Context) {
 			common.ApiError(c, err)
 			return
 		}
-		model.InitChannelCache()
+		model.InitProviderCache()
 		if shouldCloseWebSocket {
 			closeActiveChannelWebSockets([]int{channel.Id})
 		}
@@ -1864,20 +1864,20 @@ func ManageMultiKeys(c *gin.Context) {
 		}
 
 		keyIndex := *request.KeyIndex
-		if keyIndex < 0 || keyIndex >= channel.ChannelInfo.MultiKeySize {
+		if keyIndex < 0 || keyIndex >= channel.ProviderInfo.MultiKeySize {
 			common.ApiErrorT(c, "Key index out of range")
 			return
 		}
 
 		// 从状态列表中删除该密钥的记录，使其回到默认启用状态
-		if channel.ChannelInfo.MultiKeyStatusList != nil {
-			delete(channel.ChannelInfo.MultiKeyStatusList, keyIndex)
+		if channel.ProviderInfo.MultiKeyStatusList != nil {
+			delete(channel.ProviderInfo.MultiKeyStatusList, keyIndex)
 		}
-		if channel.ChannelInfo.MultiKeyDisabledTime != nil {
-			delete(channel.ChannelInfo.MultiKeyDisabledTime, keyIndex)
+		if channel.ProviderInfo.MultiKeyDisabledTime != nil {
+			delete(channel.ProviderInfo.MultiKeyDisabledTime, keyIndex)
 		}
-		if channel.ChannelInfo.MultiKeyDisabledReason != nil {
-			delete(channel.ChannelInfo.MultiKeyDisabledReason, keyIndex)
+		if channel.ProviderInfo.MultiKeyDisabledReason != nil {
+			delete(channel.ProviderInfo.MultiKeyDisabledReason, keyIndex)
 		}
 		restoreMultiKeyChannelIfAvailable(channel)
 
@@ -1887,20 +1887,20 @@ func ManageMultiKeys(c *gin.Context) {
 			return
 		}
 
-		model.InitChannelCache()
+		model.InitProviderCache()
 		common.ApiSuccessT(c, "Key enabled", nil)
 		return
 
 	case "enable_all_keys":
 		// 清空所有禁用状态，使所有密钥回到默认启用状态
 		var enabledCount int
-		if channel.ChannelInfo.MultiKeyStatusList != nil {
-			enabledCount = len(channel.ChannelInfo.MultiKeyStatusList)
+		if channel.ProviderInfo.MultiKeyStatusList != nil {
+			enabledCount = len(channel.ProviderInfo.MultiKeyStatusList)
 		}
 
-		channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
-		channel.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64)
-		channel.ChannelInfo.MultiKeyDisabledReason = make(map[int]string)
+		channel.ProviderInfo.MultiKeyStatusList = make(map[int]int)
+		channel.ProviderInfo.MultiKeyDisabledTime = make(map[int]int64)
+		channel.ProviderInfo.MultiKeyDisabledReason = make(map[int]string)
 		restoreMultiKeyChannelIfAvailable(channel)
 
 		err = channel.Update()
@@ -1909,32 +1909,32 @@ func ManageMultiKeys(c *gin.Context) {
 			return
 		}
 
-		model.InitChannelCache()
+		model.InitProviderCache()
 		common.ApiSuccessT(c, "Enabled {{count}} keys", nil, map[string]any{"count": enabledCount})
 		return
 
 	case "disable_all_keys":
 		// 禁用所有启用的密钥
-		if channel.ChannelInfo.MultiKeyStatusList == nil {
-			channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
+		if channel.ProviderInfo.MultiKeyStatusList == nil {
+			channel.ProviderInfo.MultiKeyStatusList = make(map[int]int)
 		}
-		if channel.ChannelInfo.MultiKeyDisabledTime == nil {
-			channel.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64)
+		if channel.ProviderInfo.MultiKeyDisabledTime == nil {
+			channel.ProviderInfo.MultiKeyDisabledTime = make(map[int]int64)
 		}
-		if channel.ChannelInfo.MultiKeyDisabledReason == nil {
-			channel.ChannelInfo.MultiKeyDisabledReason = make(map[int]string)
+		if channel.ProviderInfo.MultiKeyDisabledReason == nil {
+			channel.ProviderInfo.MultiKeyDisabledReason = make(map[int]string)
 		}
 
 		var disabledCount int
-		for i := 0; i < channel.ChannelInfo.MultiKeySize; i++ {
+		for i := 0; i < channel.ProviderInfo.MultiKeySize; i++ {
 			status := 1 // default enabled
-			if s, exists := channel.ChannelInfo.MultiKeyStatusList[i]; exists {
+			if s, exists := channel.ProviderInfo.MultiKeyStatusList[i]; exists {
 				status = s
 			}
 
 			// 只禁用当前启用的密钥
 			if status == 1 {
-				channel.ChannelInfo.MultiKeyStatusList[i] = 2 // disabled
+				channel.ProviderInfo.MultiKeyStatusList[i] = 2 // disabled
 				disabledCount++
 			}
 		}
@@ -1950,7 +1950,7 @@ func ManageMultiKeys(c *gin.Context) {
 			common.ApiError(c, err)
 			return
 		}
-		model.InitChannelCache()
+		model.InitProviderCache()
 		if shouldCloseWebSocket {
 			closeActiveChannelWebSockets([]int{channel.Id})
 		}
@@ -1964,7 +1964,7 @@ func ManageMultiKeys(c *gin.Context) {
 		}
 
 		keyIndex := *request.KeyIndex
-		if keyIndex < 0 || keyIndex >= channel.ChannelInfo.MultiKeySize {
+		if keyIndex < 0 || keyIndex >= channel.ProviderInfo.MultiKeySize {
 			common.ApiErrorT(c, "Key index out of range")
 			return
 		}
@@ -1985,18 +1985,18 @@ func ManageMultiKeys(c *gin.Context) {
 			remainingKeys = append(remainingKeys, key)
 
 			// 保留其他密钥的状态信息，重新索引
-			if channel.ChannelInfo.MultiKeyStatusList != nil {
-				if status, exists := channel.ChannelInfo.MultiKeyStatusList[i]; exists && status != 1 {
+			if channel.ProviderInfo.MultiKeyStatusList != nil {
+				if status, exists := channel.ProviderInfo.MultiKeyStatusList[i]; exists && status != 1 {
 					newStatusList[newIndex] = status
 				}
 			}
-			if channel.ChannelInfo.MultiKeyDisabledTime != nil {
-				if t, exists := channel.ChannelInfo.MultiKeyDisabledTime[i]; exists {
+			if channel.ProviderInfo.MultiKeyDisabledTime != nil {
+				if t, exists := channel.ProviderInfo.MultiKeyDisabledTime[i]; exists {
 					newDisabledTime[newIndex] = t
 				}
 			}
-			if channel.ChannelInfo.MultiKeyDisabledReason != nil {
-				if r, exists := channel.ChannelInfo.MultiKeyDisabledReason[i]; exists {
+			if channel.ProviderInfo.MultiKeyDisabledReason != nil {
+				if r, exists := channel.ProviderInfo.MultiKeyDisabledReason[i]; exists {
 					newDisabledReason[newIndex] = r
 				}
 			}
@@ -2010,10 +2010,10 @@ func ManageMultiKeys(c *gin.Context) {
 
 		// Update channel with remaining keys
 		channel.Key = strings.Join(remainingKeys, "\n")
-		channel.ChannelInfo.MultiKeySize = len(remainingKeys)
-		channel.ChannelInfo.MultiKeyStatusList = newStatusList
-		channel.ChannelInfo.MultiKeyDisabledTime = newDisabledTime
-		channel.ChannelInfo.MultiKeyDisabledReason = newDisabledReason
+		channel.ProviderInfo.MultiKeySize = len(remainingKeys)
+		channel.ProviderInfo.MultiKeyStatusList = newStatusList
+		channel.ProviderInfo.MultiKeyDisabledTime = newDisabledTime
+		channel.ProviderInfo.MultiKeyDisabledReason = newDisabledReason
 
 		shouldCloseWebSocket := disableMultiKeyChannelIfUnavailable(channel)
 		err = channel.Update()
@@ -2021,7 +2021,7 @@ func ManageMultiKeys(c *gin.Context) {
 			common.ApiError(c, err)
 			return
 		}
-		model.InitChannelCache()
+		model.InitProviderCache()
 		if shouldCloseWebSocket {
 			closeActiveChannelWebSockets([]int{channel.Id})
 		}
@@ -2039,8 +2039,8 @@ func ManageMultiKeys(c *gin.Context) {
 		newIndex := 0
 		for i, key := range keys {
 			status := 1 // default enabled
-			if channel.ChannelInfo.MultiKeyStatusList != nil {
-				if s, exists := channel.ChannelInfo.MultiKeyStatusList[i]; exists {
+			if channel.ProviderInfo.MultiKeyStatusList != nil {
+				if s, exists := channel.ProviderInfo.MultiKeyStatusList[i]; exists {
 					status = s
 				}
 			}
@@ -2053,13 +2053,13 @@ func ManageMultiKeys(c *gin.Context) {
 				// 保留非自动禁用密钥的状态信息，重新索引
 				if status != 1 {
 					newStatusList[newIndex] = status
-					if channel.ChannelInfo.MultiKeyDisabledTime != nil {
-						if t, exists := channel.ChannelInfo.MultiKeyDisabledTime[i]; exists {
+					if channel.ProviderInfo.MultiKeyDisabledTime != nil {
+						if t, exists := channel.ProviderInfo.MultiKeyDisabledTime[i]; exists {
 							newDisabledTime[newIndex] = t
 						}
 					}
-					if channel.ChannelInfo.MultiKeyDisabledReason != nil {
-						if r, exists := channel.ChannelInfo.MultiKeyDisabledReason[i]; exists {
+					if channel.ProviderInfo.MultiKeyDisabledReason != nil {
+						if r, exists := channel.ProviderInfo.MultiKeyDisabledReason[i]; exists {
 							newDisabledReason[newIndex] = r
 						}
 					}
@@ -2075,10 +2075,10 @@ func ManageMultiKeys(c *gin.Context) {
 
 		// Update channel with remaining keys
 		channel.Key = strings.Join(remainingKeys, "\n")
-		channel.ChannelInfo.MultiKeySize = len(remainingKeys)
-		channel.ChannelInfo.MultiKeyStatusList = newStatusList
-		channel.ChannelInfo.MultiKeyDisabledTime = newDisabledTime
-		channel.ChannelInfo.MultiKeyDisabledReason = newDisabledReason
+		channel.ProviderInfo.MultiKeySize = len(remainingKeys)
+		channel.ProviderInfo.MultiKeyStatusList = newStatusList
+		channel.ProviderInfo.MultiKeyDisabledTime = newDisabledTime
+		channel.ProviderInfo.MultiKeyDisabledReason = newDisabledReason
 
 		shouldCloseWebSocket := disableMultiKeyChannelIfUnavailable(channel)
 		err = channel.Update()
@@ -2086,7 +2086,7 @@ func ManageMultiKeys(c *gin.Context) {
 			common.ApiError(c, err)
 			return
 		}
-		model.InitChannelCache()
+		model.InitProviderCache()
 		if shouldCloseWebSocket {
 			closeActiveChannelWebSockets([]int{channel.Id})
 		}
@@ -2127,7 +2127,7 @@ func OllamaPullModel(c *gin.Context) {
 	}
 
 	// 获取渠道信息
-	channel, err := model.GetChannelById(req.ChannelID, true)
+	channel, err := model.GetProviderById(req.ChannelID, true)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{
 			"success": false,
@@ -2190,7 +2190,7 @@ func OllamaPullModelStream(c *gin.Context) {
 	}
 
 	// 获取渠道信息
-	channel, err := model.GetChannelById(req.ChannelID, true)
+	channel, err := model.GetProviderById(req.ChannelID, true)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{
 			"success": false,
@@ -2272,7 +2272,7 @@ func OllamaDeleteModel(c *gin.Context) {
 	}
 
 	// 获取渠道信息
-	channel, err := model.GetChannelById(req.ChannelID, true)
+	channel, err := model.GetProviderById(req.ChannelID, true)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{
 			"success": false,
@@ -2322,7 +2322,7 @@ func OllamaVersion(c *gin.Context) {
 		return
 	}
 
-	channel, err := model.GetChannelById(id, true)
+	channel, err := model.GetProviderById(id, true)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{
 			"success": false,

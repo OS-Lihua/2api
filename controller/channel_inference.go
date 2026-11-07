@@ -61,7 +61,7 @@ func getInferenceChannelStatus(c *gin.Context, channelType int) {
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid channel id"})
 		return
 	}
-	channel, err := model.GetChannelById(id, true)
+	channel, err := model.GetProviderById(id, true)
 	if err != nil || channel == nil {
 		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "Channel not found"})
 		return
@@ -80,7 +80,7 @@ func getInferenceChannelStatus(c *gin.Context, channelType int) {
 
 // fetchInferenceStatus reads only fixed paths on an operator-configured channel.
 // Each endpoint can fail independently; upstream errors never echo credentials.
-func fetchInferenceStatus(ctx context.Context, channel *model.Channel) (*inferenceStatus, error) {
+func fetchInferenceStatus(ctx context.Context, channel *model.Provider) (*inferenceStatus, error) {
 	if channel.Type != constant.ChannelTypeVLLM && channel.Type != constant.ChannelTypeSGLang {
 		return nil, errors.New("This operation is only supported for vLLM or SGLang channels")
 	}

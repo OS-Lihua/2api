@@ -280,17 +280,17 @@ func TestHTTPClientCachePolicyAndCompatibility(t *testing.T) {
 
 	compat, err := GetHttpClientWithProxy("")
 	require.NoError(t, err)
-	aware, err := GetHttpClientWithProxySettings("", dto.ChannelSettings{})
+	aware, err := GetHttpClientWithProxySettings("", dto.ProviderSettings{})
 	require.NoError(t, err)
 	assert.Same(t, defaultClient, compat)
 	assert.Same(t, compat, aware)
 	assert.Same(t, GetHttpClient(), aware)
 
-	http1, err := GetHttpClientWithProxySettings("", dto.ChannelSettings{HTTPProtocol: dto.HTTPProtocolHTTP1})
+	http1, err := GetHttpClientWithProxySettings("", dto.ProviderSettings{HTTPProtocol: dto.HTTPProtocolHTTP1})
 	require.NoError(t, err)
 	assert.NotSame(t, aware, http1)
 
-	sharded, err := GetHttpClientWithProxySettings("", dto.ChannelSettings{HTTP2ConnectionShards: 4})
+	sharded, err := GetHttpClientWithProxySettings("", dto.ProviderSettings{HTTP2ConnectionShards: 4})
 	require.NoError(t, err)
 	assert.NotSame(t, aware, sharded)
 	assert.NotSame(t, http1, sharded)
@@ -303,17 +303,17 @@ func TestHTTPClientCachePolicyAndCompatibility(t *testing.T) {
 	require.NoError(t, err)
 	assert.Same(t, clientA, clientAlias, "canonical proxy aliases must share the default policy client")
 
-	proxyHTTP1, err := GetHttpClientWithProxySettings(proxyA, dto.ChannelSettings{HTTPProtocol: dto.HTTPProtocolHTTP1})
+	proxyHTTP1, err := GetHttpClientWithProxySettings(proxyA, dto.ProviderSettings{HTTPProtocol: dto.HTTPProtocolHTTP1})
 	require.NoError(t, err)
 	assert.NotSame(t, clientA, proxyHTTP1)
 
-	insecure, err := GetHttpClientWithProxySettings("", dto.ChannelSettings{TLSInsecureSkipVerify: true})
+	insecure, err := GetHttpClientWithProxySettings("", dto.ProviderSettings{TLSInsecureSkipVerify: true})
 	require.NoError(t, err)
 	assert.NotSame(t, aware, insecure, "skip-verify channels must not share the verifying client")
-	insecureHTTP1, err := GetHttpClientWithProxySettings("", dto.ChannelSettings{HTTPProtocol: dto.HTTPProtocolHTTP1, TLSInsecureSkipVerify: true})
+	insecureHTTP1, err := GetHttpClientWithProxySettings("", dto.ProviderSettings{HTTPProtocol: dto.HTTPProtocolHTTP1, TLSInsecureSkipVerify: true})
 	require.NoError(t, err)
 	assert.NotSame(t, http1, insecureHTTP1)
-	proxyInsecure, err := GetHttpClientWithProxySettings(proxyA, dto.ChannelSettings{TLSInsecureSkipVerify: true})
+	proxyInsecure, err := GetHttpClientWithProxySettings(proxyA, dto.ProviderSettings{TLSInsecureSkipVerify: true})
 	require.NoError(t, err)
 	assert.NotSame(t, clientA, proxyInsecure)
 }
@@ -345,20 +345,20 @@ func TestChannelTLSInsecureSkipVerifyAcceptsUntrustedUpstream(t *testing.T) {
 	}))
 	t.Cleanup(connectProxy.Close)
 
-	skip := dto.ChannelSettings{TLSInsecureSkipVerify: true}
+	skip := dto.ProviderSettings{TLSInsecureSkipVerify: true}
 	testCases := []struct {
 		name      string
 		proxy     string
-		settings  dto.ChannelSettings
+		settings  dto.ProviderSettings
 		wantProto int // zero means certificate verification must fail
 	}{
-		{name: "default direct verifies", settings: dto.ChannelSettings{}},
-		{name: "default proxy verifies", proxy: connectProxy.URL, settings: dto.ChannelSettings{}},
-		{name: "http1 verifies", settings: dto.ChannelSettings{HTTPProtocol: dto.HTTPProtocolHTTP1}},
+		{name: "default direct verifies", settings: dto.ProviderSettings{}},
+		{name: "default proxy verifies", proxy: connectProxy.URL, settings: dto.ProviderSettings{}},
+		{name: "http1 verifies", settings: dto.ProviderSettings{HTTPProtocol: dto.HTTPProtocolHTTP1}},
 		{name: "skip direct", settings: skip, wantProto: 2},
 		{name: "skip proxy", proxy: connectProxy.URL, settings: skip, wantProto: 2},
-		{name: "skip http1", settings: dto.ChannelSettings{HTTPProtocol: dto.HTTPProtocolHTTP1, TLSInsecureSkipVerify: true}, wantProto: 1},
-		{name: "skip sharded", settings: dto.ChannelSettings{HTTP2ConnectionShards: 3, TLSInsecureSkipVerify: true}, wantProto: 2},
+		{name: "skip http1", settings: dto.ProviderSettings{HTTPProtocol: dto.HTTPProtocolHTTP1, TLSInsecureSkipVerify: true}, wantProto: 1},
+		{name: "skip sharded", settings: dto.ProviderSettings{HTTP2ConnectionShards: 3, TLSInsecureSkipVerify: true}, wantProto: 2},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -390,7 +390,7 @@ func TestHTTPClientCacheConcurrentGetOrCreate(t *testing.T) {
 		i := i
 		go func() {
 			defer wg.Done()
-			client, err := GetHttpClientWithProxySettings(proxyURL, dto.ChannelSettings{HTTP2ConnectionShards: 3})
+			client, err := GetHttpClientWithProxySettings(proxyURL, dto.ProviderSettings{HTTP2ConnectionShards: 3})
 			errs[i] = err
 			results[i] = client
 		}()
@@ -440,22 +440,22 @@ func TestInvalidateProxyClientClosesAllPolicyVariants(t *testing.T) {
 	proxyURL := "http://invalidate-proxy.example:8080"
 	defaultClient, err := GetHttpClientWithProxy(proxyURL)
 	require.NoError(t, err)
-	http1Client, err := GetHttpClientWithProxySettings(proxyURL, dto.ChannelSettings{HTTPProtocol: dto.HTTPProtocolHTTP1})
+	http1Client, err := GetHttpClientWithProxySettings(proxyURL, dto.ProviderSettings{HTTPProtocol: dto.HTTPProtocolHTTP1})
 	require.NoError(t, err)
-	shardedClient, err := GetHttpClientWithProxySettings(proxyURL, dto.ChannelSettings{HTTP2ConnectionShards: 2})
+	shardedClient, err := GetHttpClientWithProxySettings(proxyURL, dto.ProviderSettings{HTTP2ConnectionShards: 2})
 	require.NoError(t, err)
-	insecureClient, err := GetHttpClientWithProxySettings(proxyURL, dto.ChannelSettings{TLSInsecureSkipVerify: true})
+	insecureClient, err := GetHttpClientWithProxySettings(proxyURL, dto.ProviderSettings{TLSInsecureSkipVerify: true})
 	require.NoError(t, err)
 
 	InvalidateProxyClient(proxyURL)
 
 	afterDefault, err := GetHttpClientWithProxy(proxyURL)
 	require.NoError(t, err)
-	afterHTTP1, err := GetHttpClientWithProxySettings(proxyURL, dto.ChannelSettings{HTTPProtocol: dto.HTTPProtocolHTTP1})
+	afterHTTP1, err := GetHttpClientWithProxySettings(proxyURL, dto.ProviderSettings{HTTPProtocol: dto.HTTPProtocolHTTP1})
 	require.NoError(t, err)
-	afterSharded, err := GetHttpClientWithProxySettings(proxyURL, dto.ChannelSettings{HTTP2ConnectionShards: 2})
+	afterSharded, err := GetHttpClientWithProxySettings(proxyURL, dto.ProviderSettings{HTTP2ConnectionShards: 2})
 	require.NoError(t, err)
-	afterInsecure, err := GetHttpClientWithProxySettings(proxyURL, dto.ChannelSettings{TLSInsecureSkipVerify: true})
+	afterInsecure, err := GetHttpClientWithProxySettings(proxyURL, dto.ProviderSettings{TLSInsecureSkipVerify: true})
 	require.NoError(t, err)
 
 	assert.NotSame(t, defaultClient, afterDefault)
@@ -467,29 +467,29 @@ func TestInvalidateProxyClientClosesAllPolicyVariants(t *testing.T) {
 func TestResetProxyClientCacheKeepsDefaultPointerAndRecreatesVariants(t *testing.T) {
 	defaultClient := initDefaultHTTPClientFixture(t)
 
-	http1Client, err := GetHttpClientWithProxySettings("", dto.ChannelSettings{HTTPProtocol: dto.HTTPProtocolHTTP1})
+	http1Client, err := GetHttpClientWithProxySettings("", dto.ProviderSettings{HTTPProtocol: dto.HTTPProtocolHTTP1})
 	require.NoError(t, err)
-	shardedClient, err := GetHttpClientWithProxySettings("", dto.ChannelSettings{HTTP2ConnectionShards: 3})
+	shardedClient, err := GetHttpClientWithProxySettings("", dto.ProviderSettings{HTTP2ConnectionShards: 3})
 	require.NoError(t, err)
 	proxyClient, err := GetHttpClientWithProxy("http://reset-proxy.example:8080")
 	require.NoError(t, err)
-	insecureClient, err := GetHttpClientWithProxySettings("", dto.ChannelSettings{TLSInsecureSkipVerify: true})
+	insecureClient, err := GetHttpClientWithProxySettings("", dto.ProviderSettings{TLSInsecureSkipVerify: true})
 	require.NoError(t, err)
 
 	ResetProxyClientCache()
 
 	assert.Same(t, defaultClient, GetHttpClient(), "default httpClient pointer must stay stable across reset")
-	aware, err := GetHttpClientWithProxySettings("", dto.ChannelSettings{})
+	aware, err := GetHttpClientWithProxySettings("", dto.ProviderSettings{})
 	require.NoError(t, err)
 	assert.Same(t, defaultClient, aware)
 
-	afterHTTP1, err := GetHttpClientWithProxySettings("", dto.ChannelSettings{HTTPProtocol: dto.HTTPProtocolHTTP1})
+	afterHTTP1, err := GetHttpClientWithProxySettings("", dto.ProviderSettings{HTTPProtocol: dto.HTTPProtocolHTTP1})
 	require.NoError(t, err)
-	afterSharded, err := GetHttpClientWithProxySettings("", dto.ChannelSettings{HTTP2ConnectionShards: 3})
+	afterSharded, err := GetHttpClientWithProxySettings("", dto.ProviderSettings{HTTP2ConnectionShards: 3})
 	require.NoError(t, err)
 	afterProxy, err := GetHttpClientWithProxy("http://reset-proxy.example:8080")
 	require.NoError(t, err)
-	afterInsecure, err := GetHttpClientWithProxySettings("", dto.ChannelSettings{TLSInsecureSkipVerify: true})
+	afterInsecure, err := GetHttpClientWithProxySettings("", dto.ProviderSettings{TLSInsecureSkipVerify: true})
 	require.NoError(t, err)
 	assert.NotSame(t, http1Client, afterHTTP1)
 	assert.NotSame(t, shardedClient, afterSharded)
@@ -510,7 +510,7 @@ func TestResetProxyClientCacheClosesDefaultIdlePool(t *testing.T) {
 
 	assert.Same(t, defaultClient, GetHttpClient())
 	assert.GreaterOrEqual(t, tracker.closes.Load(), int32(1), "reset must close idle connections on the stable default client")
-	aware, err := GetHttpClientWithProxySettings("", dto.ChannelSettings{})
+	aware, err := GetHttpClientWithProxySettings("", dto.ProviderSettings{})
 	require.NoError(t, err)
 	assert.Same(t, defaultClient, aware)
 }
@@ -533,7 +533,7 @@ func TestResetProxyClientCacheConcurrentWithGetHttpClient(t *testing.T) {
 	}
 	wg.Wait()
 	assert.NotNil(t, GetHttpClient())
-	aware, err := GetHttpClientWithProxySettings("", dto.ChannelSettings{})
+	aware, err := GetHttpClientWithProxySettings("", dto.ProviderSettings{})
 	require.NoError(t, err)
 	assert.Same(t, GetHttpClient(), aware)
 }
@@ -570,12 +570,12 @@ func TestCloseIdleConnectionsRedialsHTTP2(t *testing.T) {
 }
 
 func TestNormalizeHTTPTransportPolicyClampsWithoutPanic(t *testing.T) {
-	assert.Equal(t, defaultHTTPTransportPolicy(), NormalizeHTTPTransportPolicy(dto.ChannelSettings{}))
-	assert.Equal(t, HTTPTransportPolicy{Protocol: dto.HTTPProtocolAuto, Shards: 1}, NormalizeHTTPTransportPolicy(dto.ChannelSettings{HTTPProtocol: "AUTO"}))
-	assert.Equal(t, HTTPTransportPolicy{Protocol: dto.HTTPProtocolHTTP1, Shards: 1}, NormalizeHTTPTransportPolicy(dto.ChannelSettings{HTTPProtocol: "HTTP1", HTTP2ConnectionShards: 8}))
-	assert.Equal(t, HTTPTransportPolicy{Protocol: dto.HTTPProtocolAuto, Shards: 1}, NormalizeHTTPTransportPolicy(dto.ChannelSettings{HTTPProtocol: "http3"}))
-	assert.Equal(t, HTTPTransportPolicy{Protocol: dto.HTTPProtocolAuto, Shards: 1}, NormalizeHTTPTransportPolicy(dto.ChannelSettings{HTTP2ConnectionShards: -3}))
-	assert.Equal(t, HTTPTransportPolicy{Protocol: dto.HTTPProtocolAuto, Shards: 8}, NormalizeHTTPTransportPolicy(dto.ChannelSettings{HTTP2ConnectionShards: 99}))
+	assert.Equal(t, defaultHTTPTransportPolicy(), NormalizeHTTPTransportPolicy(dto.ProviderSettings{}))
+	assert.Equal(t, HTTPTransportPolicy{Protocol: dto.HTTPProtocolAuto, Shards: 1}, NormalizeHTTPTransportPolicy(dto.ProviderSettings{HTTPProtocol: "AUTO"}))
+	assert.Equal(t, HTTPTransportPolicy{Protocol: dto.HTTPProtocolHTTP1, Shards: 1}, NormalizeHTTPTransportPolicy(dto.ProviderSettings{HTTPProtocol: "HTTP1", HTTP2ConnectionShards: 8}))
+	assert.Equal(t, HTTPTransportPolicy{Protocol: dto.HTTPProtocolAuto, Shards: 1}, NormalizeHTTPTransportPolicy(dto.ProviderSettings{HTTPProtocol: "http3"}))
+	assert.Equal(t, HTTPTransportPolicy{Protocol: dto.HTTPProtocolAuto, Shards: 1}, NormalizeHTTPTransportPolicy(dto.ProviderSettings{HTTP2ConnectionShards: -3}))
+	assert.Equal(t, HTTPTransportPolicy{Protocol: dto.HTTPProtocolAuto, Shards: 8}, NormalizeHTTPTransportPolicy(dto.ProviderSettings{HTTP2ConnectionShards: 99}))
 }
 
 // serveHTTP2ProbePeer can withhold PING acknowledgements without sending FIN or

@@ -26,20 +26,20 @@ func TestShouldRetryRelayErrorHonorsChannelPinOnChannelError(t *testing.T) {
 	err := types.NewError(errors.New("channel failed"), types.ErrorCodeChannelNoAvailableKey)
 	for _, test := range []struct {
 		name      string
-		pin       *dto.ChannelPin
+		pin       *dto.ProviderPin
 		wantRetry bool
 	}{
 		{name: "unrestricted channel error", wantRetry: true},
 		{
 			name: "single attempt pin suppresses channel error retry",
-			pin: &dto.ChannelPin{
+			pin: &dto.ProviderPin{
 				ChannelId: 1, Source: dto.PinSourceToken, Rank: dto.PinRankToken, RetryMode: dto.PinRetrySingleAttempt,
 			},
 			wantRetry: false,
 		},
 		{
 			name: "origin task pin permits retry on the same channel",
-			pin: &dto.ChannelPin{
+			pin: &dto.ProviderPin{
 				ChannelId: 1, Source: dto.PinSourceOriginTask, Rank: dto.PinRankOriginTask, RetryMode: dto.PinRetrySameChannel,
 			},
 			wantRetry: true,
@@ -76,11 +76,11 @@ func TestProcessChannelErrorMasksDisableReasonAndNotification(t *testing.T) {
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
-	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.User{}))
+	require.NoError(t, database.AutoMigrate(&model.Provider{}, &model.Ability{}, &model.User{}))
 	common.MemoryCacheEnabled, common.RedisEnabled = false, false
 	common.AutomaticDisableChannelEnabled, constant.ErrorLogEnabled = true, false
 	constant.NotifyLimitCount = 10
-	channel := &model.Channel{Name: "relay-review", Key: "fixture-key", Type: 1, Status: common.ChannelStatusEnabled, Group: "default", Models: "test-model"}
+	channel := &model.Provider{Name: "relay-review", Key: "fixture-key", Type: 1, Status: common.ChannelStatusEnabled, Group: "default", Models: "test-model"}
 	require.NoError(t, channel.Insert())
 	notifications := make(chan []byte, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -101,7 +101,7 @@ func TestProcessChannelErrorMasksDisableReasonAndNotification(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, "https://private.example.com")
 	apiErr := types.NewErrorWithStatusCode(errors.New("upstream https://private.example.com/path?token=review-token api_key:review-secret"), types.ErrorCodeChannelNoAvailableKey, http.StatusUnauthorized)
-	ProcessChannelError(c, types.ChannelError{ChannelId: channel.Id, ChannelName: channel.Name, AutoBan: true}, apiErr, nil)
+	ProcessChannelError(c, types.ProviderError{ChannelId: channel.Id, ChannelName: channel.Name, AutoBan: true}, apiErr, nil)
 	var notification WebhookPayload
 	select {
 	case payload := <-notifications:
@@ -109,7 +109,7 @@ func TestProcessChannelErrorMasksDisableReasonAndNotification(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("automatic channel-disable notification was not delivered")
 	}
-	loaded, err := model.GetChannelById(channel.Id, true)
+	loaded, err := model.GetProviderById(channel.Id, true)
 	require.NoError(t, err)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, loaded.Status)
 	wantReason := "status_code=401, upstream https://***.com/***?token=*** api_key:***"
@@ -205,7 +205,7 @@ func TestDecideRelayRetryReasons(t *testing.T) {
 		{name: "skip retry error", err: types.NewErrorWithStatusCode(errors.New("local"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry()), retries: 1, want: PolicyDecision{Action: "stop", Reason: "non_retryable_error", Source: "system"}},
 		{name: "channel error retries without budget", err: types.NewError(errors.New("no key"), types.ErrorCodeChannelNoAvailableKey), retries: 0, want: PolicyDecision{Action: "retry", Reason: "channel_error", Source: "system"}},
 		{name: "single attempt pin", err: upstream(http.StatusTooManyRequests), retries: 1, setup: func(c *gin.Context) {
-			GetChannelConstraints(c).AddPin(dto.ChannelPin{ChannelId: 1, Source: dto.PinSourceToken, Rank: dto.PinRankToken, RetryMode: dto.PinRetrySingleAttempt})
+			GetChannelConstraints(c).AddPin(dto.ProviderPin{ChannelId: 1, Source: dto.PinSourceToken, Rank: dto.PinRankToken, RetryMode: dto.PinRetrySingleAttempt})
 		}, want: PolicyDecision{Action: "stop", Reason: "pinned_channel", Source: "channel_constraint"}},
 		{name: "strict session", err: upstream(http.StatusTooManyRequests), retries: 1, setup: func(c *gin.Context) {
 			c.Set(ginKeyChannelAffinitySkipRetry, true)
@@ -234,7 +234,7 @@ func TestRequestPolicyEventsReachLogAdminInfo(t *testing.T) {
 	c.Set("auto_ban", true)
 	c.Set("channel_id", 7)
 	state := RequestPolicy(c)
-	state.BeginAttempt(&model.Channel{Id: 7}, "default")
+	state.BeginAttempt(&model.Provider{Id: 7}, "default")
 	apiErr := types.NewOpenAIError(errors.New("invalid credential"), types.ErrorCodeBadResponseStatusCode, http.StatusUnauthorized)
 	RecordPolicyFailure(c, 7, apiErr, DecideRelayRetry(c, apiErr, 0))
 
@@ -253,7 +253,7 @@ func TestRequestPolicyEventsReachLogAdminInfo(t *testing.T) {
 	RecordPolicyFailure(c, 7, apiErr, DecideRelayRetry(c, apiErr, 0))
 	assert.Equal(t, "key_disable_requested", state.Events()[4].Health)
 
-	state.BeginAttempt(&model.Channel{Id: 8}, "default")
+	state.BeginAttempt(&model.Provider{Id: 8}, "default")
 	c.Set("channel_id", 8)
 	MarkRequestPolicySuccess(c, nil)
 	MarkRequestPolicySuccess(c, nil)

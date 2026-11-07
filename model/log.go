@@ -559,7 +559,7 @@ func GetAllLogs(filter LogFilter, startIdx int, num int) (logs []*Log, total int
 		if common.MemoryCacheEnabled {
 			// Cache get channel
 			for _, channelId := range channelIds.Items() {
-				if cacheChannel, err := CacheGetChannel(channelId); err == nil {
+				if cacheChannel, err := CacheGetProvider(channelId); err == nil {
 					channels = append(channels, struct {
 						Id   int    `gorm:"column:id"`
 						Name string `gorm:"column:name"`
@@ -571,7 +571,7 @@ func GetAllLogs(filter LogFilter, startIdx int, num int) (logs []*Log, total int
 			}
 		} else {
 			// Bulk query channels from DB
-			if err = DB.Table("channels").Select("id, name").Where("id IN ?", channelIds.Items()).Find(&channels).Error; err != nil {
+			if err = DB.Table("providers").Select("id, name").Where("id IN ?", channelIds.Items()).Find(&channels).Error; err != nil {
 				return logs, total, err
 			}
 		}
@@ -630,7 +630,7 @@ func StreamAllLogs(ctx context.Context, filter LogFilter, role int, fn func(*Log
 		if log.ChannelId != 0 {
 			name, ok := channelNames[log.ChannelId]
 			if !ok {
-				if channel, err := CacheGetChannel(log.ChannelId); err == nil {
+				if channel, err := CacheGetProvider(log.ChannelId); err == nil {
 					name = channel.Name
 				}
 				channelNames[log.ChannelId] = name
