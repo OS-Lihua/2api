@@ -155,7 +155,7 @@ func sendOllamaDelta(c *gin.Context, info *relaycommon.RelayInfo, delta dto.Chat
 				text += call.Function.Name + call.Function.Arguments
 			}
 			if text != "" || len(choice.Delta.ToolCalls) > 0 {
-				info.ResponseFacts.BusinessOutput = true
+				info.ResponseFacts.MarkBusinessOutput()
 				info.ResponseFacts.GeneratedText += text
 			}
 		}
@@ -435,7 +435,7 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	if info.ResponseFacts != nil {
 		info.ResponseFacts.DownstreamWriteFailed = writeErr != nil
 		if writeErr == nil && resp.StatusCode == http.StatusOK && info.ResponseFacts.GeneratedText != "" {
-			info.ResponseFacts.BusinessOutput = true
+			info.ResponseFacts.MarkBusinessOutput()
 		}
 	}
 	return usage, nil

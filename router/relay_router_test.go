@@ -236,6 +236,56 @@ func newTextGatewayFixture(t *testing.T, upstream http.HandlerFunc) textGatewayF
 	return textGatewayFixture{engine: engine, user: user, token: token, adminPAT: createWalletTestAccessToken(t, actor.Id, "request:read", "ledger:read"), userPAT: createWalletTestAccessToken(t, user.Id, "log:read"), offering: offering, channel: channel, sale: sale, purchase: purchase, fake: fake}
 }
 
+func TestTextGatewayFailoverChargesOnlyDeliveredAttempt(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"code":"overloaded","message":"private provider-secret"},"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`))
+	})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	}))
+	t.Cleanup(server.Close)
+	provider := &model.Provider{Name: "Recovery Provider", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Key: "recovery-secret", BaseURL: &server.URL}
+	require.NoError(t, model.DB.Create(provider).Error)
+	channel := &model.Channel{ProviderID: provider.Id, ModelID: fixture.channel.ModelID, Protocol: "openai_chat", UpstreamModelName: "recovery-model", ParameterOverrides: `{}`, MappingConfirmed: true, Status: model.ChannelEnabled, Weight: 1}
+	require.NoError(t, model.DB.Create(channel).Error)
+	purchase := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: channel.ID, Currency: "USD", Expression: `tier("base", p + c * 2)`, EffectiveAt: clock.Now().Unix() - 1}
+	require.NoError(t, model.CreatePriceVersion(t.Context(), purchase, fixture.sale.CreatedBy))
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), "Recovered")
+	assert.NotContains(t, response.Body.String(), "secret")
+	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, int64(36000), record.Receivable.Nanos)
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, total)
+	costs := map[int]int64{}
+	for _, attempt := range attempts {
+		costs[attempt.ChannelID] = attempt.Cost.Nanos
+		if attempt.ChannelID == fixture.channel.ID {
+			assert.Equal(t, "upstream_unavailable", attempt.ErrorClass)
+			assert.Equal(t, "switch", attempt.FailoverDecision)
+		}
+	}
+	assert.Equal(t, map[int]int64{fixture.channel.ID: 7000, channel.ID: 20000}, costs)
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, int64(999964000), wallet.Balance.Nanos)
+	entries, _, err := model.ListLedgerEntries(wallet.Id, 0, 20)
+	require.NoError(t, err)
+	assert.Len(t, entries, 4)
+	var payables model.Wallet
+	require.NoError(t, model.DB.Where("account_type = ? AND owner_id = ?", model.ProviderPayableAccount(provider.Id, "USD").Type, provider.Id).First(&payables).Error)
+	assert.Equal(t, int64(20000), payables.Balance.Nanos)
+	reconciliation, err := model.ReconcileWallets(100)
+	require.NoError(t, err)
+	assert.Empty(t, reconciliation.Mismatches)
+}
+
 func TestTextGatewayPurchaseProbesUseEffectiveProviderRequest(t *testing.T) {
 	var sent map[string]any
 	var sentHeader string

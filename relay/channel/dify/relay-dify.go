@@ -261,7 +261,7 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		if info.ResponseFacts != nil && len(openaiResponse.Choices) > 0 && (err == nil || errors.As(err, &flushErr)) {
 			text := openaiResponse.Choices[0].Delta.GetContentString()
 			if text != "" {
-				info.ResponseFacts.BusinessOutput = true
+				info.ResponseFacts.MarkBusinessOutput()
 				info.ResponseFacts.GeneratedText += text
 			}
 		}
@@ -345,7 +345,7 @@ func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 	if info.ResponseFacts != nil {
 		info.ResponseFacts.DownstreamWriteFailed = writeErr != nil
 		if writeErr == nil && difyResponse.Answer != "" {
-			info.ResponseFacts.BusinessOutput = true
+			info.ResponseFacts.MarkBusinessOutput()
 		}
 	}
 	return &difyResponse.MetaData.Usage, nil

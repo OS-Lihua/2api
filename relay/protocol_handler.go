@@ -253,7 +253,7 @@ func (a *ChannelAdaptor) DoPreparedRequest(c *gin.Context, info *relaycommon.Rel
 	if prepared.request.URL == nil {
 		return nil, errors.New("provider did not supply an upstream destination")
 	}
-	response, err := channel.DoRequest(c, prepared.request, info)
+	response, err := channel.DoRequest(c, prepared.request.WithContext(c.Request.Context()), info)
 	if err != nil {
 		return nil, providerRequestError(err)
 	}

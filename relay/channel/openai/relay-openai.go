@@ -50,7 +50,7 @@ func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, fo
 				}
 				var flushErr *helper.StreamFlushError
 				if business && (writeErr == nil || errors.As(writeErr, &flushErr)) {
-					info.ResponseFacts.BusinessOutput = true
+					info.ResponseFacts.MarkBusinessOutput()
 				}
 			}()
 		}
@@ -489,7 +489,7 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 			return &simpleResponse.Usage, types.NewError(writeErr, types.ErrorCodeBadResponse)
 		}
 		if info.ResponseFacts.GeneratedText != "" {
-			info.ResponseFacts.BusinessOutput = true
+			info.ResponseFacts.MarkBusinessOutput()
 		}
 	}
 

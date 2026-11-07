@@ -33,6 +33,16 @@ type ResponseFacts struct {
 	BusinessOutput           bool
 	DownstreamWriteFailed    bool
 	GeneratedText            string
+	OnBusinessOutput         func()
+}
+
+// MarkBusinessOutput records accepted content and disarms first-byte budgets.
+// Metadata and keep-alive writers must not call this method.
+func (facts *ResponseFacts) MarkBusinessOutput() {
+	facts.BusinessOutput = true
+	if facts.OnBusinessOutput != nil {
+		facts.OnBusinessOutput()
+	}
 }
 
 func (info *RelayInfo) TokenizerModelName() string {
