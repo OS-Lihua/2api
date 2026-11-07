@@ -297,7 +297,7 @@ func TestSingleModelChannelAPI(t *testing.T) {
 	t.Run("interrupted observations recover persistently in the list and details", func(t *testing.T) {
 		fake := clock.UseFake(t, time.Date(2026, 11, 7, 20, 0, 0, 0, time.UTC))
 		var channel model.Channel
-		require.NoError(t, db.Where("provider_id = ?", provider.Id).Order("id").First(&channel).Error)
+		require.NoError(t, db.Preload("Model").Preload("Provider").Where("provider_id = ?", provider.Id).Order("id").First(&channel).Error)
 		result := model.ChannelProbeResult{ConfigurationHash: channel.ProbeConfigurationHash(), ChannelID: channel.ID, Capability: "streaming", Protocol: channel.Protocol, StartedAt: fake.Now().Unix() - 96, DeadlineAt: fake.Now().Unix() - 1, Status: "running", ActorID: root.Id}
 		require.NoError(t, db.Create(&result).Error)
 		status, listed := call(http.MethodGet, fmt.Sprintf("/api/admin/v1/channels?provider_id=%d", provider.Id), "")
@@ -325,8 +325,8 @@ export function buildSubmitRequest(ctx){const body={model:ctx.upstreamModel,prom
 export function parseSubmitResponse(ctx,r){return {taskId:r.body.id,taskData:r.body}}
 export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/poll/"+ctx.taskId,headers:{Authorization:"Bearer "+ctx.apiKey}}}
 export function parseTaskResult(ctx,body){return {status:body.status,taskId:body.id,progress:"100%"}}
-export function listArtifacts(task){return task.status==="SUCCESS"?[{key:"video",type:"video",mimeType:"video/mp4"}]:[]}
-export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {url:ctx.data.cdn_url,credentialless:true};return {url:ctx.baseUrl+"/content/"+ctx.upstreamTaskId,headers:{Authorization:"Bearer "+ctx.apiKey}}}`
+export function listArtifacts(task){if(task.status!=="SUCCESS")return [];const out=[{key:"video",type:"video",mimeType:"video/mp4"}];if(task.data&&task.data.preview)out.push({key:"preview",type:"image",mimeType:"image/png"});return out}
+export function buildContentRequest(ctx){if(ctx.artifactKey==="preview")return {url:ctx.baseUrl+"/preview/"+ctx.upstreamTaskId,headers:{Authorization:"Bearer "+ctx.apiKey}};if(ctx.data&&ctx.data.cdn_url)return {url:ctx.data.cdn_url,credentialless:true};return {url:ctx.baseUrl+"/content/"+ctx.upstreamTaskId,headers:{Authorization:"Bearer "+ctx.apiKey}}}`
 		_, err := jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "probe"})
 		require.NoError(t, err)
 		textSource := strings.Replace(source, `key:"probe"`, `key:"probe-text"`, 1)
@@ -351,6 +351,7 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 		blueImage, err := os.ReadFile("../controller/probe-fixtures/blue.png")
 		require.NoError(t, err)
 		validMedia := true
+		includePreview, bluePreview := false, false
 		numericMode := false
 		cacheMode := false
 		cacheSubmits := 0
@@ -388,7 +389,15 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 				if cacheMode && cacheSubmits >= 2 {
 					cached = 12
 				}
-				_, _ = fmt.Fprintf(w, `{"id":"private-task-123","status":"SUCCESS","private_marker":"do-not-store-task-response","cdn_url":%q,"usage":{"input_tokens_details":{"cached_tokens":%d}}}`, cdnURL, cached)
+				_, _ = fmt.Fprintf(w, `{"id":"private-task-123","status":"SUCCESS","private_marker":"do-not-store-task-response","cdn_url":%q,"preview":%t,"usage":{"input_tokens_details":{"cached_tokens":%d}}}`, cdnURL, includePreview, cached)
+			case "/preview/private-task-123":
+				if bluePreview {
+					_, _ = w.Write(blueImage)
+				} else {
+					red, err := os.ReadFile("../controller/probe-fixtures/red.png")
+					require.NoError(t, err)
+					_, _ = w.Write(red)
+				}
 			case "/content/private-task-123", "/cdn/private-task-123":
 				if validMedia {
 					w.Header().Set("Content-Type", "video/mp4")
@@ -460,9 +469,16 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 		imageArtifact = false
 		status, referenceCreated := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":"task:probe-reference","upstream_model_name":"task-probe-upstream"}`, provider.Id, unified.Id))
 		require.Equal(t, http.StatusOK, status, referenceCreated)
-		status, referenceResult := call(http.MethodPost, fmt.Sprintf("/api/admin/v1/channels/%v/probes", referenceCreated["data"].(map[string]any)["id"]), `{"capability":"input_image"}`)
-		require.Equal(t, http.StatusOK, status, referenceResult)
-		assert.Equal(t, "passed", referenceResult["data"].(map[string]any)["status"], referenceResult)
+		for _, tc := range []struct {
+			preview, blue bool
+			expected      string
+		}{{false, false, "inconclusive"}, {true, true, "inconclusive"}, {true, false, "passed"}} {
+			includePreview, bluePreview = tc.preview, tc.blue
+			status, referenceResult := call(http.MethodPost, fmt.Sprintf("/api/admin/v1/channels/%v/probes", referenceCreated["data"].(map[string]any)["id"]), `{"capability":"input_image"}`)
+			require.Equal(t, http.StatusOK, status, referenceResult)
+			assert.Equal(t, tc.expected, referenceResult["data"].(map[string]any)["status"], referenceResult)
+		}
+		includePreview = false
 		status, textCreated := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":"task:probe-text","upstream_model_name":"task-probe-upstream"}`, provider.Id, unified.Id))
 		require.Equal(t, http.StatusOK, status, textCreated)
 		textProbePath := fmt.Sprintf("/api/admin/v1/channels/%v/probes", textCreated["data"].(map[string]any)["id"])
@@ -594,6 +610,17 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 		require.Equal(t, http.StatusOK, status, restored)
 		_, current := call(http.MethodGet, path+"/probes", "")
 		assert.NotEmpty(t, current["data"].(map[string]any)["results"])
+		require.NoError(t, db.Model(&provider).Update("base_url", upstream.URL+"/changed-destination").Error)
+		_, stale = call(http.MethodGet, path+"/probes", "")
+		assert.Empty(t, stale["data"].(map[string]any)["results"])
+		require.NoError(t, db.Model(&provider).Update("base_url", upstream.URL).Error)
+		_, current = call(http.MethodGet, path+"/probes", "")
+		assert.NotEmpty(t, current["data"].(map[string]any)["results"])
+		previousProviderOverride := provider.ParamOverride
+		require.NoError(t, db.Model(&provider).Update("param_override", `{"temperature":0.5}`).Error)
+		_, stale = call(http.MethodGet, path+"/probes", "")
+		assert.Empty(t, stale["data"].(map[string]any)["results"])
+		require.NoError(t, db.Model(&provider).Update("param_override", previousProviderOverride).Error)
 		parentDeclaration := unified.Capabilities
 		changedDeclaration := parentDeclaration
 		changedDeclaration.Limits.MaxOutputTokens = common.GetPointer(int64(128))

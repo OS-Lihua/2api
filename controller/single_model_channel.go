@@ -117,7 +117,7 @@ func ListSingleModelChannels(c *gin.Context) {
 		return
 	}
 	records := []model.Channel{}
-	if err := query.Preload("Model").Order("id").Offset(page.GetStartIdx()).Limit(page.GetPageSize()).Find(&records).Error; err != nil {
+	if err := query.Preload("Model").Preload("Provider").Order("id").Offset(page.GetStartIdx()).Limit(page.GetPageSize()).Find(&records).Error; err != nil {
 		singleChannelError(c, err)
 		return
 	}

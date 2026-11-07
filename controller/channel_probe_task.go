@@ -194,6 +194,7 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 			recipe.TestedValue = probeDuration
 			recipe.SampledLimit = sampledDuration
 		case "input_image":
+			body["prompt"] = "Create a static video showing only the supplied reference, without changing it."
 			body["input_reference"] = "data:image/png;base64," + base64.StdEncoding.EncodeToString(probeRedImage)
 		default:
 			return "inconclusive", "request_not_representable"
@@ -420,11 +421,10 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 			wanted = "image"
 		}
 	case "input_image":
-		// The final request already proved that the reference bytes survived
-		// plugin decoding and overrides. Native video returns media rather
-		// than a text answer; image edits must demonstrate the requested color.
+		// Require a completed video and a preview demonstrating the reference
+		// color; acceptance of reference bytes alone cannot prove their use.
 		if wire == "openai_video" {
-			wanted = "video"
+			wanted = "reference_video"
 		} else if wire == "openai_image" {
 			wanted = "image"
 		}
@@ -441,8 +441,13 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 		return "inconclusive", "behavior_not_observed"
 	}
 	observed := int64(0)
+	videoObserved, referenceObserved := false, false
 	for _, artifact := range artifacts {
-		if wanted == "timed_media" {
+		if wanted == "reference_video" {
+			if artifact.Type != "video" && artifact.Type != "image" || artifact.Type == "video" && videoObserved || artifact.Type == "image" && referenceObserved {
+				continue
+			}
+		} else if wanted == "timed_media" {
 			if artifact.Type != "video" && artifact.Type != "audio" {
 				continue
 			}
@@ -462,7 +467,7 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 		}
 		valid := false
 		mediaKind := wanted
-		if wanted == "timed_media" {
+		if wanted == "timed_media" || wanted == "reference_video" {
 			mediaKind = artifact.Type
 		}
 		switch mediaKind {
@@ -471,7 +476,11 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 			valid = validVideo && (result.Capability != "max_duration_seconds" || seconds >= recipe.TestedValue)
 		case "image":
 			encodedImage := base64.StdEncoding.EncodeToString(payload)
-			valid = validProbeImage(encodedImage) && (result.Capability != "input_image" || probeImageColor(encodedImage, "blue"))
+			color := "blue"
+			if wanted == "reference_video" {
+				color = "red"
+			}
+			valid = validProbeImage(encodedImage) && (result.Capability != "input_image" || probeImageColor(encodedImage, color))
 		case "audio":
 			seconds, audioValid := probeAudioSeconds(ctx, payload, artifact.MimeType)
 			valid = audioValid && (result.Capability != "max_duration_seconds" || seconds >= recipe.TestedValue)
@@ -480,10 +489,19 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 		}
 		if valid {
 			observed++
+			if mediaKind == "video" {
+				videoObserved = true
+			}
+			if mediaKind == "image" {
+				referenceObserved = true
+			}
 		}
 		if observed >= 2 {
 			break
 		}
+	}
+	if wanted == "reference_video" && (!videoObserved || !referenceObserved) {
+		return "inconclusive", "behavior_not_observed"
 	}
 	if observed > 0 {
 		if recipe.SampledLimit {

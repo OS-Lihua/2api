@@ -7,6 +7,8 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/protocol"
+	"maps"
+	"slices"
 )
 
 // RecoverInterruptedChannelProbes finalizes observations left by a process
@@ -18,8 +20,13 @@ func RecoverInterruptedChannelProbes(ctx context.Context) error {
 
 // ProbeConfigurationHash binds observations to the Channel configuration that
 // generated them without persisting parameter contents in the observation.
+// Model and Provider associations must be loaded before computing this hash.
 func (c Channel) ProbeConfigurationHash() string {
-	payload, _ := common.Marshal([]any{c.ProviderID, c.ModelID, c.Protocol, c.UpstreamModelName, c.ParameterOverrides, c.Capabilities, c.Model.Capabilities})
+	statuses := make([][2]int, 0, len(c.Provider.ProviderInfo.MultiKeyStatusList))
+	for _, index := range slices.Sorted(maps.Keys(c.Provider.ProviderInfo.MultiKeyStatusList)) {
+		statuses = append(statuses, [2]int{index, c.Provider.ProviderInfo.MultiKeyStatusList[index]})
+	}
+	payload, _ := common.Marshal([]any{c.ProviderID, c.ModelID, c.Protocol, c.UpstreamModelName, c.ParameterOverrides, c.Capabilities, c.Model.Capabilities, c.Provider.Type, c.Provider.GetBaseURL(), c.Provider.Key, c.Provider.OpenAIOrganization, c.Provider.Setting, c.Provider.OtherSettings, c.Provider.ParamOverride, c.Provider.HeaderOverride, c.Provider.ProviderInfo.IsMultiKey, statuses})
 	return fmt.Sprintf("%x", sha256.Sum256(payload))
 }
 

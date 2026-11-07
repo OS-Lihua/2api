@@ -36,7 +36,7 @@ func RunChannelProbe(c *gin.Context) {
 		return
 	}
 	var record model.Channel
-	if err := model.DB.WithContext(c.Request.Context()).Preload("Model").First(&record, id).Error; err != nil {
+	if err := model.DB.WithContext(c.Request.Context()).Preload("Model").Preload("Provider").First(&record, id).Error; err != nil {
 		singleChannelError(c, err)
 		return
 	}
@@ -81,7 +81,7 @@ func ListChannelProbes(c *gin.Context) {
 		return
 	}
 	var record model.Channel
-	if err := model.DB.Preload("Model").First(&record, id).Error; err != nil {
+	if err := model.DB.Preload("Model").Preload("Provider").First(&record, id).Error; err != nil {
 		singleChannelError(c, err)
 		return
 	}
