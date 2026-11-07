@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/capability"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -89,6 +90,20 @@ func TestGatewayMediaMultipartValidatesEveryMultiplierBeforeParsing(t *testing.T
 			assert.Equal(t, []string{"1"}, c.Request.MultipartForm.Value["n"])
 		})
 	}
+}
+
+func TestGatewayMediaMultipliersRespectModelAndChannelLimits(t *testing.T) {
+	images, output, seconds := int64(2), int64(16), int64(30)
+	limits := capability.Limits{MaxImages: &images, MaxOutputTokens: &output, MaxDurationSeconds: &seconds}
+	for _, body := range []string{
+		`{"n":3}`, `{"parameters":{"sampleCount":3}}`, `{"max_new_tokens":17}`, `{"generationConfig":{"maxOutputTokens":17}}`, `{"metadata":{"duration":31}}`,
+	} {
+		require.Error(t, ValidateGatewayMediaMultipliers([]byte(body), limits), body)
+	}
+	require.NoError(t, ValidateGatewayMediaMultipliers([]byte(`{"n":2,"max_new_tokens":0,"duration":30}`), limits))
+	zero := int64(0)
+	limits.MaxOutputTokens = &zero
+	require.Error(t, ValidateGatewayMediaMultipliers([]byte(`{"max_new_tokens":1}`), limits))
 }
 
 func TestLegacyDalleValidationAndPricesRemainCompatible(t *testing.T) {

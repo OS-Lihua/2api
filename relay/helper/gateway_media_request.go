@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/capability"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/gin-gonic/gin"
@@ -135,7 +136,10 @@ const MaxGatewayImageDimension = 4096
 // ValidateGatewayMediaMultipliers validates the original and final wire JSON.
 // It traverses provider parameters and metadata too; callers of multipart paths
 // must pass their scalar fields as JSON before conversion and after overrides.
-func ValidateGatewayMediaMultipliers(body []byte) error {
+func ValidateGatewayMediaMultipliers(body []byte, declared ...capability.Limits) error {
+	if len(declared) > 1 {
+		return fmt.Errorf("multiple media capability limits")
+	}
 	if !ojson.ValidBytes(body) {
 		return fmt.Errorf("invalid media request")
 	}
@@ -211,6 +215,20 @@ func ValidateGatewayMediaMultipliers(body []byte) error {
 				continue
 			}
 			if ceiling > 0 {
+				if len(declared) == 1 {
+					var limit *int64
+					switch name {
+					case "n", "batch_size", "batch_count", "num_images", "num_outputs", "samplecount", "sample_count", "max_images":
+						limit = declared[0].MaxImages
+					case "max_tokens", "max_completion_tokens", "max_output_tokens", "max_new_tokens", "maxoutputtokens":
+						limit = declared[0].MaxOutputTokens
+					case "duration", "seconds", "duration_seconds":
+						limit = declared[0].MaxDurationSeconds
+					}
+					if limit != nil {
+						ceiling = min(ceiling, *limit)
+					}
+				}
 				if value.Type != ojson.Number {
 					return fmt.Errorf("%s must be numeric", name)
 				}

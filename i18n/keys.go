@@ -35,6 +35,12 @@ const (
 	MsgDistributorNoAvailableChannelTaskPlugin = "distributor.no_available_channel_task_plugin"
 	MsgDistributorInvalidParseModel            = "distributor.invalid_request_parse_model"
 
+	MsgGatewayInvalidMediaRequest      = "gateway.invalid_media_request"
+	MsgGatewayAuthorizationUnavailable = "gateway.authorization_unavailable"
+	MsgGatewayModelNotFound            = "gateway.model_not_found"
+	MsgGatewayPriceUnavailable         = "gateway.price_unavailable"
+	MsgGatewayMediaRequestFailed       = "gateway.media_request_failed"
+
 	MsgQuotaUserInsufficient             = "quota.user_insufficient"
 	MsgQuotaPreConsumeInsufficient       = "quota.pre_consume_insufficient"
 	MsgQuotaSubscriptionInsufficient     = "quota.subscription_insufficient"

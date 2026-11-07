@@ -121,6 +121,9 @@ export function RequestUsageFacts(props: {
       </span>
     )
   }
+  const durationFormatter = new Intl.NumberFormat(locale, {
+    maximumSignificantDigits: 9,
+  })
   return (
     <div className='space-y-1 text-xs'>
       {props.source !== 'none' && (
@@ -137,14 +140,18 @@ export function RequestUsageFacts(props: {
       {props.usage.audio_input_seconds !== undefined && (
         <div className='tabular-nums'>
           {t('Input audio duration')}:{' '}
-          {formatNumber(Number(props.usage.audio_input_seconds), locale)}{' '}
+          <span title={props.usage.audio_input_seconds}>
+            {durationFormatter.format(Number(props.usage.audio_input_seconds))}
+          </span>{' '}
           {t('seconds')}
         </div>
       )}
       {props.usage.audio_output_seconds !== undefined && (
         <div className='tabular-nums'>
           {t('Output audio duration')}:{' '}
-          {formatNumber(Number(props.usage.audio_output_seconds), locale)}{' '}
+          <span title={props.usage.audio_output_seconds}>
+            {durationFormatter.format(Number(props.usage.audio_output_seconds))}
+          </span>{' '}
           {t('seconds')}
         </div>
       )}

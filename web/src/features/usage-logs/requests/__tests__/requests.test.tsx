@@ -32,7 +32,11 @@ import i18next from 'i18next'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
 import fr from '@/i18n/locales/fr.json'
+import ja from '@/i18n/locales/ja.json'
+import ru from '@/i18n/locales/ru.json'
+import viLocale from '@/i18n/locales/vi.json'
 import zhTW from '@/i18n/locales/zh-TW.json'
+import zh from '@/i18n/locales/zh.json'
 import { api } from '@/lib/api'
 import { createAppQueryClient } from '@/lib/query-client'
 import { useAuthStore } from '@/stores/auth-store'
@@ -125,8 +129,9 @@ beforeEach(() => {
 afterEach(async () => {
   cleanup()
   await i18next.changeLanguage('en')
-  i18next.removeResourceBundle('fr', 'translation')
-  i18next.removeResourceBundle('zhTW', 'translation')
+  for (const language of ['fr', 'zhTW', 'zhCN', 'ja', 'ru', 'vi']) {
+    i18next.removeResourceBundle(language, 'translation')
+  }
   client.clear()
   api.defaults.adapter = originalAdapter
   useAuthStore.getState().auth.reset()
@@ -642,8 +647,18 @@ it('shows actual media quantities including zero in request rows and attempts wi
   const user = userEvent.setup()
   renderRequests()
   expect(await screen.findByText('Image count: 0')).toBeVisible()
-  expect(screen.getByText('Input audio duration: 1.25 seconds')).toBeVisible()
-  expect(screen.getByText('Output audio duration: 0 seconds')).toBeVisible()
+  expect(
+    screen.getByText(
+      (_, element) =>
+        element?.textContent === 'Input audio duration: 1.25 seconds'
+    )
+  ).toBeVisible()
+  expect(
+    screen.getByText(
+      (_, element) =>
+        element?.textContent === 'Output audio duration: 0 seconds'
+    )
+  ).toBeVisible()
   expect(screen.queryByText('Total tokens: 0')).not.toBeInTheDocument()
   await user.click(
     screen.getByRole('button', {
@@ -653,8 +668,57 @@ it('shows actual media quantities including zero in request rows and attempts wi
   const drawer = await screen.findByRole('dialog', { name: 'Request attempts' })
   expect(await within(drawer).findByText('Image count: 0')).toBeVisible()
   expect(
-    within(drawer).getByText('Input audio duration: 1.25 seconds')
+    within(drawer).getByText(
+      (_, element) =>
+        element?.textContent === 'Input audio duration: 1.25 seconds'
+    )
   ).toBeVisible()
+})
+
+it('preserves nonzero measured audio duration and reacts to all interface locales', async () => {
+  const seconds = '0.0000416666666667'
+  api.defaults.adapter = async (config) => ({
+    config,
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+    data: {
+      success: true,
+      data: {
+        items: [{ ...request, usage: { audio_input_seconds: seconds } }],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      },
+    },
+  })
+  for (const [language, resource] of [
+    ['fr', fr],
+    ['zhCN', zh],
+    ['zhTW', zhTW],
+    ['ja', ja],
+    ['ru', ru],
+    ['vi', viLocale],
+  ] as const) {
+    i18next.addResourceBundle(language, 'translation', resource.translation)
+  }
+  renderRequests()
+  expect(await screen.findByText('0.0000416666667')).toBeVisible()
+  for (const [language, value] of [
+    ['en', '0.0000416666667'],
+    ['zhCN', '0.0000416666667'],
+    ['zhTW', '0.0000416666667'],
+    ['fr', '0,0000416666667'],
+    ['ru', '0,0000416666667'],
+    ['ja', '0.0000416666667'],
+    ['vi', '0,0000416666667'],
+    ['bad_locale', '0.0000416666667'],
+  ]) {
+    await act(async () => {
+      await i18next.changeLanguage(language)
+    })
+    expect(screen.getByTitle(seconds)).toHaveTextContent(value)
+  }
 })
 
 it('updates the exact charge separators when the interface language changes', async () => {

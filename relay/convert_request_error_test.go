@@ -100,6 +100,7 @@ func TestMediaPreparationValidatesAndSendsFinalQuantity(t *testing.T) {
 			require.NoError(t, err)
 			assert.Empty(t, sent, "preparation must not dispatch")
 			assert.Equal(t, tc.count, *prepared.Input.ImageCount)
+			assert.Equal(t, tc.count, info.RequestedImageCount(), "abort protection uses the actual submitted quantity")
 			response, err := adaptor.DoPreparedRequest(c, info, prepared.Prepared)
 			require.NoError(t, err)
 			require.NoError(t, response.(*http.Response).Body.Close())

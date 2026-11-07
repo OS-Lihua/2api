@@ -250,6 +250,9 @@ func (a *ChannelAdaptor) PrepareMediaRequest(c *gin.Context, info *relaycommon.R
 	for key, values := range result.Prepared.Headers() {
 		result.Input.Headers[strings.ToLower(key)] = strings.Join(values, ",")
 	}
+	if result.Input.ImageCount != nil {
+		info.ImageRequestCount = *result.Input.ImageCount
+	}
 	info.IsStream = parsed.Request.IsStream(c.Request)
 	info.Request = result.Request
 	return result, nil

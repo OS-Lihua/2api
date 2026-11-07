@@ -235,6 +235,15 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 		}
 	})
 
+	if info.ResponseFacts != nil && info.StreamStatus != nil {
+		info.StreamStatus.RequireTerminal()
+		if completedImages > 0 && info.StreamStatus.IsNormalEnd() && !info.StreamStatus.HasErrors() {
+			info.StreamStatus.MarkCompleted()
+		} else {
+			info.StreamStatus.MarkIncomplete("missing_image_completion")
+		}
+	}
+
 	// StreamScannerHandler consumes the upstream [DONE]; re-emit it so the
 	// client still receives a terminal data: [DONE].
 	if info.StreamStatus != nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone {

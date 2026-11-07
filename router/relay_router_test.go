@@ -238,34 +238,28 @@ func newTextGatewayFixture(t *testing.T, upstream http.HandlerFunc) textGatewayF
 	return textGatewayFixture{engine: engine, user: user, token: token, adminPAT: createWalletTestAccessToken(t, actor.Id, "request:read", "ledger:read"), userPAT: createWalletTestAccessToken(t, user.Id, "log:read"), offering: offering, channel: channel, sale: sale, purchase: purchase, fake: fake}
 }
 
-func TestMediaGatewayReservationIncreaseIsAtomicAndRecordsMeasuredQuantities(t *testing.T) {
+func TestMediaGatewayRecordsMeasuredQuantitiesWithSingleReservationAndSettlement(t *testing.T) {
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("reservation API must not dispatch") })
 	request := &model.GatewayRequest{ID: "media-reservation", UserID: fixture.user.Id, TokenID: fixture.token.Id, ModelOfferingID: fixture.offering.ID, OfferingName: fixture.offering.Name, SaleCurrency: "USD", SaleFXRate: "1", Receivable: money.Amount{Currency: "USD"}, Status: "failed", UsageSource: "none"}
-	require.NoError(t, model.ReserveGateway(request, money.Amount{Nanos: 72_000_000, Currency: "USD"}, money.Amount{Nanos: 80_000_000, Currency: "USD"}))
-	ids, err := model.IncreaseGatewayReservation(request.ID, "attempt-two", money.Amount{Nanos: 72_000_000, Currency: "USD"}, money.Amount{Nanos: 80_000_000, Currency: "USD"})
-	require.NoError(t, err)
-	require.Len(t, ids, 2)
-	replayed, err := model.IncreaseGatewayReservation(request.ID, "attempt-two", money.Amount{Nanos: 72_000_000, Currency: "USD"}, money.Amount{Nanos: 80_000_000, Currency: "USD"})
-	require.NoError(t, err)
-	assert.Equal(t, ids, replayed)
-	_, err = model.IncreaseGatewayReservation(request.ID, "attempt-two", money.Amount{Nanos: 1, Currency: "USD"}, money.Amount{Nanos: 1, Currency: "USD"})
-	require.ErrorIs(t, err, model.ErrLedgerInvalidEntry)
-	_, err = model.IncreaseGatewayReservation(request.ID, "too-expensive", money.Amount{Nanos: 2_000_000_000, Currency: "USD"}, money.Amount{Nanos: 2_000_000_000, Currency: "USD"})
-	require.ErrorIs(t, err, model.ErrInsufficientWalletBalance)
+	require.NoError(t, model.ReserveGateway(request, money.Amount{Nanos: 72_000_000, Currency: "USD"}, money.Amount{Nanos: 72_000_000, Currency: "USD"}))
+	ids := request.LedgerEntryIDs
+	require.Len(t, ids, 1)
+	require.Error(t, model.ReserveGateway(request, money.Amount{Nanos: 72_000_000, Currency: "USD"}, money.Amount{Nanos: 72_000_000, Currency: "USD"}))
 	wallet, err := model.GetUserWallet(fixture.user.Id)
 	require.NoError(t, err)
-	assert.Equal(t, int64(856_000_000), wallet.Balance.Nanos)
-	request.LedgerEntryIDs = ids
+	assert.Equal(t, int64(928_000_000), wallet.Balance.Nanos)
 	count, seconds := int64(0), "1.25"
 	request.Usage = service.GatewayRecordUsage(&dto.Usage{}, &relaycommon.ResponseFacts{ImageCount: &count, AudioInputSeconds: &seconds})
 	require.NoError(t, model.PrepareGatewaySettlement(model.GatewaySettlement{Request: *request, SaleSource: money.Amount{Currency: "USD"}}))
-	_, err = model.SettleGateway(request.ID)
+	settled, err := model.SettleGateway(request.ID)
 	require.NoError(t, err)
 	require.NoError(t, model.PublishGatewayRecords(request.ID))
-	replayed, err = model.IncreaseGatewayReservation(request.ID, "attempt-two", money.Amount{Nanos: 72_000_000, Currency: "USD"}, money.Amount{Nanos: 80_000_000, Currency: "USD"})
+	replayed, err := model.SettleGateway(request.ID)
 	require.NoError(t, err)
-	assert.Subset(t, replayed, ids)
-	require.Len(t, replayed, 3, "finalization adds only the reservation release")
+	require.NoError(t, model.PublishGatewayRecords(request.ID))
+	assert.Equal(t, settled.LedgerEntryIDs, replayed.LedgerEntryIDs)
+	assert.Subset(t, replayed.LedgerEntryIDs, ids)
+	require.Len(t, replayed.LedgerEntryIDs, 2, "finalization adds only the reservation release")
 	wallet, err = model.GetUserWallet(fixture.user.Id)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1_000_000_000), wallet.Balance.Nanos)

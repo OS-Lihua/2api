@@ -3,6 +3,11 @@
 
 # Errors returned to AI clients
 common.database_error: "資料庫出錯，請聯繫管理員"
+gateway.invalid_media_request: "媒體請求無效"
+gateway.authorization_unavailable: "權限驗證暫時無法使用"
+gateway.model_not_found: "對外模型不存在"
+gateway.price_unavailable: "對外模型價格暫時無法使用"
+gateway.media_request_failed: "媒體請求失敗"
 auth.user_banned: "使用者已被封禁"
 token.get_info_failed: "獲取令牌資訊失敗，請稍後重試"
 token.invalid: "無效的令牌"
