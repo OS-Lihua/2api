@@ -79,6 +79,8 @@ var singleModelChannelRoutes = []permissionRoute{
 	{http.MethodPost, "", authz.ChannelWrite, controller.SaveSingleModelChannel},
 	{http.MethodGet, "/protocols", authz.ChannelRead, controller.ChannelProtocolOptions},
 	{http.MethodGet, "/suggest-models", authz.ChannelRead, controller.SuggestChannelModels},
+	{http.MethodPost, "/:id/probes", authz.ChannelOperate, controller.RunChannelProbe},
+	{http.MethodGet, "/:id/probes", authz.ChannelRead, controller.ListChannelProbes},
 	{http.MethodGet, "/:id", authz.ChannelRead, controller.GetSingleModelChannel},
 	{http.MethodPatch, "/:id", authz.ChannelWrite, controller.SaveSingleModelChannel},
 	{http.MethodDelete, "/:id", authz.ChannelWrite, controller.DeleteSingleModelChannel},

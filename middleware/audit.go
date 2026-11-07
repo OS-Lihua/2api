@@ -104,6 +104,7 @@ var auditRouteActions = map[string]string{
 	"DELETE /api/admin/v1/channels/:id":       "channel.delete",
 	"POST /api/admin/v1/channels/:id/confirm": "channel.confirm",
 	"POST /api/admin/v1/channels/:id/enable":  "channel.enable",
+	"POST /api/admin/v1/channels/:id/probes":  "channel.probe",
 	"POST /api/admin/v1/channels/:id/disable": "channel.disable",
 
 	// Price versions and exchange rates.

@@ -34,6 +34,7 @@ export interface SingleModelChannel {
   tpm: number
   max_concurrency: number
   weight: number
+  latest_probe?: ChannelProbeResult
 }
 export interface ChannelModel {
   id: number
@@ -57,6 +58,33 @@ export async function listSingleModelChannels(
     success: boolean
     data: { items: SingleModelChannel[]; total: number }
   }>(response.data).data
+}
+export interface ChannelProbeResult {
+  id: number
+  capability: string
+  protocol: string
+  started_at: number
+  finished_at: number
+  status: 'running' | 'passed' | 'failed' | 'inconclusive'
+  reason: string
+  tested_value?: number
+}
+export async function listChannelProbes(id: number) {
+  const response = await api.get(`${path}/${id}/probes`)
+  return requireServerSuccess<{
+    success: boolean
+    data: { capabilities: string[]; results: ChannelProbeResult[] }
+  }>(response.data).data
+}
+export async function runChannelProbe(id: number, capability: string) {
+  const response = await api.post(
+    `${path}/${id}/probes`,
+    { capability },
+    { timeout: 100_000 }
+  )
+  return requireServerSuccess<{ success: boolean; data: ChannelProbeResult }>(
+    response.data
+  ).data
 }
 export async function channelAction(id: number, action: string) {
   const response =
