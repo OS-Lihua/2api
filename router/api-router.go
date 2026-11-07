@@ -319,6 +319,14 @@ func SetApiRouter(router *gin.Engine) {
 			redemptionRoute.DELETE("/:id", controller.DeleteRedemption)
 		}
 		handlePermissionRoute(apiRouter.Group("", middleware.DisableCache(), middleware.AdminAuth()), http.MethodGet, "/audit", authz.AuditRead, controller.GetAuditLogs)
+
+		// Wallets and ledger entries. Each balance change writes a ledger entry.
+		walletAdminRoute := apiRouter.Group("/admin/v1", middleware.DisableCache(), middleware.AdminAuth())
+		handlePermissionRoute(walletAdminRoute, http.MethodGet, "/user-wallets/:user_id", authz.LedgerRead, controller.GetUserWallet)
+		handlePermissionRoute(walletAdminRoute, http.MethodGet, "/user-wallets/:user_id/entries", authz.LedgerRead, controller.GetUserWalletEntries)
+		handlePermissionRoute(walletAdminRoute, http.MethodPost, "/user-wallets/:user_id/top-ups", authz.LedgerWrite, controller.CreateUserWalletTopUp)
+		handlePermissionRoute(walletAdminRoute, http.MethodPost, "/user-wallets/:user_id/adjustments", authz.LedgerWrite, controller.CreateUserWalletAdjustment)
+		handlePermissionRoute(walletAdminRoute, http.MethodPost, "/ledger-entries/:id/reversal", authz.LedgerWrite, controller.ReverseLedgerEntry)
 		apiRouter.GET("/audit/self", middleware.DisableCache(), middleware.UserAuth(), controller.GetAuditLogs)
 		logRoute := apiRouter.Group("/log")
 		logRoute.GET("/", middleware.AdminAuth(), controller.GetAllLogs)

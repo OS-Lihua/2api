@@ -115,3 +115,9 @@ const (
 	MsgChannelUpstreamUpdateFailedChannels  = "channel.upstream_update_failed_channels"
 	MsgChannelUpstreamUpdateMoreOmitted     = "channel.upstream_update_more_omitted"
 )
+
+// Wallet reconciliation alerts sent to the root user
+const (
+	MsgWalletReconcileMismatchSubject = "wallet.reconcile_mismatch_subject"
+	MsgWalletReconcileMismatchContent = "wallet.reconcile_mismatch_content"
+)

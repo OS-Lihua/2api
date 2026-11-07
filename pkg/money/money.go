@@ -4,8 +4,9 @@
 // Amount is the stored form. Value is the unrounded form used during
 // calculation. Every operation rejects a currency mismatch and any result
 // outside the int64 range of 10^-9 units instead of truncating it. A Value
-// becomes an Amount in one of two ways: Receivable rounds up to 10^-9, and
-// Cost requires the exact value.
+// becomes an Amount in one of three ways: Receivable rounds a user charge up
+// to 10^-9, Credit rounds a user credit down to 10^-9, and Cost rounds a
+// purchase cost to the nearest 10^-9.
 package money
 
 import (
@@ -50,10 +51,11 @@ func ParseCurrency(code string) (Currency, error) {
 
 // Amount is a stored amount: Nanos counts 10^-9 units of Currency. Embed it in
 // a GORM model with `gorm:"embedded;embeddedPrefix:<name>_"` to get a bigint
-// and a char(3) column.
+// and a char(3) column. In JSON, Nanos is a string so that JavaScript clients
+// do not lose precision above 2^53.
 type Amount struct {
-	Nanos    int64    `gorm:"type:bigint;not null"`
-	Currency Currency `gorm:"type:char(3);not null"`
+	Nanos    int64    `json:"nanos,string" gorm:"type:bigint;not null"`
+	Currency Currency `json:"currency" gorm:"type:char(3);not null"`
 }
 
 // NewAmount validates the currency code.
@@ -181,6 +183,21 @@ func NewRate(from Currency, to Currency, rate decimal.Decimal) (Rate, error) {
 	return Rate{from: from, to: to, rate: rate}, nil
 }
 
+// From returns the source currency of r.
+func (r Rate) From() Currency {
+	return r.from
+}
+
+// To returns the target currency of r.
+func (r Rate) To() Currency {
+	return r.to
+}
+
+// Decimal returns the exact rate: one unit of From buys Decimal units of To.
+func (r Rate) Decimal() decimal.Decimal {
+	return r.rate
+}
+
 // Convert returns v in the target currency of rate. v must be in the source
 // currency of rate.
 func (v Value) Convert(rate Rate) (Value, error) {
@@ -202,6 +219,13 @@ func (v Value) Receivable() (Amount, error) {
 // the rounding must not drift in one direction across many entries.
 func (v Value) Cost() (Amount, error) {
 	return amountFromNanos(v.amount.Shift(Scale).Round(0), v)
+}
+
+// Credit writes an amount the platform credits to a user, such as a top-up
+// converted from another currency: v rounded down (toward negative infinity)
+// to 10^-9, so the platform never credits more than the calculated value.
+func (v Value) Credit() (Amount, error) {
+	return amountFromNanos(v.amount.Shift(Scale).Floor(), v)
 }
 
 func amountFromNanos(nanos decimal.Decimal, v Value) (Amount, error) {

@@ -563,6 +563,10 @@ const AUDIT_TEMPLATES: Record<string, string> = {
   // Logs
   'log.clear': 'Cleared historical logs',
   'log.cleanup_start': 'Log cleanup task started.',
+  // Wallets and ledger
+  'wallet.top_up': 'Credited a top-up to a user wallet',
+  'wallet.adjust': 'Adjusted a user wallet balance',
+  'wallet.reverse_entry': 'Reversed a ledger entry',
   // Generic middleware fallback
   generic: '{{method}} {{route}}',
 }

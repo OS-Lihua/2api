@@ -101,6 +101,11 @@ var auditRouteActions = map[string]string{
 
 	// 日志
 	"POST /api/system-task/log-cleanup": "log.cleanup_start",
+
+	// 钱包与账目
+	"POST /api/admin/v1/user-wallets/:user_id/top-ups":     "wallet.top_up",
+	"POST /api/admin/v1/user-wallets/:user_id/adjustments": "wallet.adjust",
+	"POST /api/admin/v1/ledger-entries/:id/reversal":       "wallet.reverse_entry",
 }
 
 // beginAdminAudit 在管理/root 写操作进入 handler 前包装 ResponseWriter，
