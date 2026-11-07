@@ -189,6 +189,7 @@ func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID
 			}
 		}
 		refs := map[string]bulkReference{}
+		sourceRows := map[int]int{}
 		providers := map[int]*Provider{}
 		channels := map[int]*Channel{}
 		paths := map[string]bool{}
@@ -402,7 +403,7 @@ func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID
 					if mutation.channel.ProviderID > 0 {
 						preview.ProviderID = mutation.channel.ProviderID
 					} else {
-						preview.ProviderRow = -mutation.channel.ProviderID
+						preview.ProviderRow = sourceRows[mutation.channel.ProviderID]
 					}
 					id = mutation.channel.ID
 					channels[id] = mutation.channel
@@ -414,9 +415,12 @@ func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID
 					if mutation.price.OwnerID > 0 {
 						preview.OwnerID = mutation.price.OwnerID
 					} else {
-						preview.OwnerRow = -mutation.price.OwnerID
+						preview.OwnerRow = sourceRows[mutation.price.OwnerID]
 					}
 					prices.versions = append(prices.versions, mutation.price)
+				}
+				if mutation.create && id < 0 {
+					sourceRows[id] = line
 				}
 				if row.Ref != "" {
 					refs[row.Ref] = bulkReference{resource: row.Resource, id: id}

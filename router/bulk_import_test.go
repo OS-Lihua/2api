@@ -166,6 +166,26 @@ func TestBulkImportStrictParsingHTTP(t *testing.T) {
 	engine.ServeHTTP(recorder, request)
 	result = decodeBulkResponse(t, recorder, 200)
 	assert.True(t, result.Committed)
+	t.Run("CSV references use physical source lines including multiline cells", func(t *testing.T) {
+		var file bytes.Buffer
+		csvWriter := csv.NewWriter(&file)
+		providerData := "{\n\"name\":\"CSV account\",\"type\":1,\"key\":\"csv-sentinel\"}"
+		channelData := fmt.Sprintf(`{"provider_ref":"p","model_id":%d,"protocol":"openai_chat","upstream_model_name":"csv-reference-model"}`, unified.Id)
+		priceData := `{"owner_type":"channel","owner_ref":"c","currency":"USD","expression":"p * 2"}`
+		require.NoError(t, csvWriter.WriteAll([][]string{{"resource", "action", "ref", "data"}, {"providers", "create", "p", providerData}, {"channels", "create", "c", channelData}, {"price-versions", "create", "", priceData}}))
+		request := httptest.NewRequest("POST", "/api/admin/v1/bulk-import?dry_run=true", strings.NewReader(file.String()))
+		request.Header.Set("Authorization", "Bearer "+token)
+		request.Header.Set("Content-Type", "text/csv")
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		result := decodeBulkResponse(t, response, 200)
+		require.Len(t, result.Rows, 3)
+		assert.Equal(t, 2, result.Rows[0].Row)
+		assert.Equal(t, 4, result.Rows[1].Row)
+		assert.Equal(t, 5, result.Rows[2].Row)
+		assert.Equal(t, 2, result.Rows[1].ProviderRow)
+		assert.Equal(t, 4, result.Rows[2].OwnerRow)
+	})
 	for _, tc := range []struct {
 		name, format, body string
 		status             int
