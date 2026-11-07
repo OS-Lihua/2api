@@ -647,7 +647,7 @@ type GeminiEmbeddingRequest struct {
 	Content              GeminiChatContent `json:"content"`
 	TaskType             string            `json:"taskType,omitempty"`
 	Title                string            `json:"title,omitempty"`
-	OutputDimensionality int               `json:"outputDimensionality,omitempty"`
+	OutputDimensionality *int              `json:"outputDimensionality,omitempty"`
 }
 
 func (r *GeminiEmbeddingRequest) IsStream(c *http.Request) bool {

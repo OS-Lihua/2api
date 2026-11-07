@@ -144,12 +144,13 @@ func geminiEmbeddingToOpenAI(info *relaycommon.RelayInfo, request any) (any, err
 		return nil, fmt.Errorf("empty Gemini embedding batch")
 	}
 	inputs := make([]string, 0, len(items))
-	dimensions := 0
+	var dimensions *int
 	for i, item := range items {
 		if item == nil || item.TaskType != "" || item.Title != "" {
 			return nil, fmt.Errorf("Gemini taskType and title cannot be converted to OpenAI embeddings")
 		}
-		if i > 0 && dimensions != item.OutputDimensionality {
+		if i > 0 && (dimensions == nil && item.OutputDimensionality != nil ||
+			dimensions != nil && (item.OutputDimensionality == nil || *dimensions != *item.OutputDimensionality)) {
 			return nil, fmt.Errorf("embedding batch dimensions must match")
 		}
 		dimensions = item.OutputDimensionality
@@ -165,11 +166,7 @@ func geminiEmbeddingToOpenAI(info *relaycommon.RelayInfo, request any) (any, err
 		}
 		inputs = append(inputs, strings.Join(parts, "\n"))
 	}
-	r := dto.EmbeddingRequest{Model: info.UpstreamModelName, Input: inputs}
-	if dimensions != 0 {
-		r.Dimensions = &dimensions
-	}
-	return r, nil
+	return dto.EmbeddingRequest{Model: info.UpstreamModelName, Input: inputs, Dimensions: dimensions}, nil
 }
 
 func (p *Handler) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {

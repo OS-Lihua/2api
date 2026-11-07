@@ -2,6 +2,7 @@ package relay
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"math"
@@ -507,8 +508,11 @@ func TestChannelProtocolGeminiEmbeddingSelectsSingleOrBatch(t *testing.T) {
 		request                          any
 	}{
 		{"OpenAI batch with explicit zero", "batchEmbedContents", `{"requests":[{"model":"models/dense-v1","content":{"parts":[{"text":"hello"}]},"outputDimensionality":0}]}`, `{"embeddings":[{"values":[0.1,0.2]}],"usageMetadata":{"promptTokenCount":0}}`, relaytypes.RelayFormatEmbedding, dto.EmbeddingRequest{Model: "dense-v1", Input: "hello", Dimensions: &zeroDimensions}},
-		{"native single", "embedContent", `{"model":"models/dense-v1","content":{"parts":[{"text":"hello"}]},"outputDimensionality":4}`, `{"embedding":{"values":[0.1,0.2]},"usageMetadata":{"promptTokenCount":0}}`, relaytypes.RelayFormatGemini, &dto.GeminiEmbeddingRequest{Content: dto.GeminiChatContent{Parts: []dto.GeminiPart{{Text: "hello"}}}, OutputDimensionality: 4}},
-		{"native batch", "batchEmbedContents", `{"requests":[{"model":"models/dense-v1","content":{"parts":[{"text":"hello"}]},"outputDimensionality":4}]}`, `{"embeddings":[{"values":[0.1,0.2]}],"usageMetadata":{"promptTokenCount":0}}`, relaytypes.RelayFormatGemini, &dto.GeminiBatchEmbeddingRequest{Requests: []*dto.GeminiEmbeddingRequest{{Content: dto.GeminiChatContent{Parts: []dto.GeminiPart{{Text: "hello"}}}, OutputDimensionality: 4}}}},
+		{"native single", "embedContent", `{"model":"models/dense-v1","content":{"parts":[{"text":"hello"}]},"outputDimensionality":4}`, `{"embedding":{"values":[0.1,0.2]},"usageMetadata":{"promptTokenCount":0}}`, relaytypes.RelayFormatGemini, json.RawMessage(`{"content":{"parts":[{"text":"hello"}]},"outputDimensionality":4}`)},
+		{"native batch", "batchEmbedContents", `{"requests":[{"model":"models/dense-v1","content":{"parts":[{"text":"hello"}]},"outputDimensionality":4}]}`, `{"embeddings":[{"values":[0.1,0.2]}],"usageMetadata":{"promptTokenCount":0}}`, relaytypes.RelayFormatGemini, json.RawMessage(`{"requests":[{"content":{"parts":[{"text":"hello"}]},"outputDimensionality":4}]}`)},
+		{"native single zero", "embedContent", `{"model":"models/dense-v1","content":{"parts":[{"text":"hello"}]},"outputDimensionality":0}`, `{"embedding":{"values":[0.1,0.2]},"usageMetadata":{"promptTokenCount":0}}`, relaytypes.RelayFormatGemini, json.RawMessage(`{"content":{"parts":[{"text":"hello"}]},"outputDimensionality":0}`)},
+		{"native single absent", "embedContent", `{"model":"models/dense-v1","content":{"parts":[{"text":"hello"}]}}`, `{"embedding":{"values":[0.1,0.2]},"usageMetadata":{"promptTokenCount":0}}`, relaytypes.RelayFormatGemini, json.RawMessage(`{"content":{"parts":[{"text":"hello"}]}}`)},
+		{"native batch zero", "batchEmbedContents", `{"requests":[{"model":"models/dense-v1","content":{"parts":[{"text":"hello"}]},"outputDimensionality":0}]}`, `{"embeddings":[{"values":[0.1,0.2]}],"usageMetadata":{"promptTokenCount":0}}`, relaytypes.RelayFormatGemini, json.RawMessage(`{"requests":[{"content":{"parts":[{"text":"hello"}]},"outputDimensionality":0}]}`)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -530,7 +534,16 @@ func TestChannelProtocolGeminiEmbeddingSelectsSingleOrBatch(t *testing.T) {
 			info.SetEstimatePromptTokens(11)
 			adaptor, err := GetChannelAdaptor(constant.APITypeGemini, protocol.GeminiEmbed)
 			require.NoError(t, err)
-			request, err := adaptor.ConvertRequest(c, info, tc.request)
+			input := tc.request
+			if raw, ok := input.(json.RawMessage); ok {
+				if tc.action == "embedContent" {
+					input = &dto.GeminiEmbeddingRequest{}
+				} else {
+					input = &dto.GeminiBatchEmbeddingRequest{}
+				}
+				require.NoError(t, common.Unmarshal(raw, input))
+			}
+			request, err := adaptor.ConvertRequest(c, info, input)
 			require.NoError(t, err)
 			encoded, err := common.Marshal(request)
 			require.NoError(t, err)
@@ -548,6 +561,189 @@ func TestChannelProtocolGeminiEmbeddingSelectsSingleOrBatch(t *testing.T) {
 				require.Len(t, delivered.Data, 1)
 				assert.Equal(t, []float64{0.1, 0.2}, delivered.Data[0].Embedding)
 			}
+		})
+	}
+}
+
+func TestChannelProtocolReplicateEditUploadUsesProviderTransport(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Fail(t, "request bypassed the configured Provider proxy")
+		http.Error(w, "unexpected direct request", http.StatusBadGateway)
+	}))
+	defer backend.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "Bearer admin-override", r.Header.Get("Authorization"))
+		assert.Equal(t, "present", r.Header.Get("X-Provider-Header"))
+		assert.Contains(t, r.RequestURI, backend.URL)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/files":
+			if !assert.NoError(t, r.ParseMultipartForm(1<<20)) {
+				return
+			}
+			defer r.MultipartForm.RemoveAll()
+			file, _, err := r.FormFile("content")
+			if !assert.NoError(t, err) {
+				return
+			}
+			defer file.Close()
+			payload, err := io.ReadAll(file)
+			assert.NoError(t, err)
+			assert.Equal(t, "image-bytes", string(payload))
+			_, _ = io.WriteString(w, `{"urls":{"get":"https://files.example.test/input.png"}}`)
+		case "/v1/models/black-forest-labs/flux-schnell/predictions":
+			var request struct {
+				Input map[string]any `json:"input"`
+			}
+			assert.NoError(t, common.DecodeJson(r.Body, &request))
+			assert.Equal(t, "https://files.example.test/input.png", request.Input["image_prompt"])
+			_, _ = io.WriteString(w, `{"status":"succeeded","output":["https://example.test/image.png"]}`)
+		default:
+			assert.Fail(t, "unexpected upstream path", r.URL.Path)
+		}
+	}))
+	defer proxy.Close()
+	c, info, recorder := newReplicateEditFixture(t, backend.URL, proxy.URL)
+	info.HeadersOverride = map[string]any{"Authorization": "Bearer admin-override", "X-Provider-Header": "present"}
+	adaptor, err := GetChannelAdaptor(constant.APITypeReplicate, protocol.OpenAIImages)
+	require.NoError(t, err)
+	converted, err := adaptor.ConvertRequest(c, info, dto.ImageRequest{Model: "black-forest-labs/flux-schnell", Prompt: "a tree"})
+	require.NoError(t, err)
+	encoded, err := common.Marshal(converted)
+	require.NoError(t, err)
+	response, err := adaptor.DoRequest(c, info, strings.NewReader(string(encoded)))
+	require.NoError(t, err)
+	_, apiErr := adaptor.DoResponse(c, response.(*http.Response), info)
+	require.Nil(t, apiErr)
+	assert.Contains(t, recorder.Body.String(), "https://example.test/image.png")
+}
+
+func newReplicateEditFixture(t *testing.T, baseURL, proxyURL string) (*gin.Context, *relaycommon.RelayInfo, *httptest.ResponseRecorder) {
+	t.Helper()
+	var incoming bytes.Buffer
+	writer := multipart.NewWriter(&incoming)
+	require.NoError(t, writer.WriteField("prompt", "a tree"))
+	part, err := writer.CreateFormFile("image", "input.png")
+	require.NoError(t, err)
+	_, err = io.WriteString(part, "image-bytes")
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/edits", &incoming)
+	c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+	t.Cleanup(func() {
+		if c.Request.MultipartForm != nil {
+			_ = c.Request.MultipartForm.RemoveAll()
+		}
+	})
+	info := &relaycommon.RelayInfo{RelayMode: relayconstant.RelayModeImagesEdits, RelayFormat: relaytypes.RelayFormatOpenAIImage,
+		OriginModelName: "black-forest-labs/flux-schnell", RequestURLPath: "/v1/images/edits", ProviderMeta: &relaycommon.ProviderMeta{
+			ChannelType: constant.ChannelTypeReplicate, ApiType: constant.APITypeReplicate, ChannelBaseUrl: baseURL, ApiKey: "provider-key", UpstreamModelName: "black-forest-labs/flux-schnell", ChannelSetting: dto.ProviderSettings{Proxy: proxyURL},
+		}}
+	return c, info, recorder
+}
+
+func TestChannelProtocolReplicateUploadRedactsErrorsAndCancels(t *testing.T) {
+	t.Run("URL secret", func(t *testing.T) {
+		c, info, _ := newReplicateEditFixture(t, "http://[invalid/?api_key=url-secret", "")
+		adaptor, err := GetChannelAdaptor(constant.APITypeReplicate, protocol.OpenAIImages)
+		require.NoError(t, err)
+		_, err = adaptor.ConvertRequest(c, info, dto.ImageRequest{Model: info.UpstreamModelName, Prompt: "a tree"})
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "url-secret")
+		assert.NotContains(t, err.Error(), "provider-key")
+	})
+	t.Run("upstream error body", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, "upstream-key-secret")
+		}))
+		defer server.Close()
+		c, info, _ := newReplicateEditFixture(t, server.URL, "")
+		adaptor, err := GetChannelAdaptor(constant.APITypeReplicate, protocol.OpenAIImages)
+		require.NoError(t, err)
+		_, err = adaptor.ConvertRequest(c, info, dto.ImageRequest{Model: info.UpstreamModelName, Prompt: "a tree"})
+		require.Error(t, err)
+		var apiErr *relaytypes.NewAPIError
+		require.ErrorAs(t, err, &apiErr)
+		assert.Equal(t, http.StatusUnauthorized, apiErr.StatusCode)
+		assert.NotContains(t, err.Error(), "upstream-key-secret")
+	})
+	t.Run("cancel upload", func(t *testing.T) {
+		started, stopped := make(chan struct{}), make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			close(started)
+			<-r.Context().Done()
+			close(stopped)
+		}))
+		defer server.Close()
+		c, info, _ := newReplicateEditFixture(t, server.URL, "")
+		ctx, cancel := context.WithCancel(c.Request.Context())
+		defer cancel()
+		c.Request = c.Request.WithContext(ctx)
+		adaptor, err := GetChannelAdaptor(constant.APITypeReplicate, protocol.OpenAIImages)
+		require.NoError(t, err)
+		result := make(chan error, 1)
+		go func() {
+			_, err := adaptor.ConvertRequest(c, info, dto.ImageRequest{Model: info.UpstreamModelName, Prompt: "a tree"})
+			result <- err
+		}()
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("upload did not reach the Provider")
+		}
+		cancel()
+		select {
+		case err := <-result:
+			require.ErrorIs(t, err, context.Canceled)
+		case <-time.After(2 * time.Second):
+			t.Fatal("upload ignored request cancellation")
+		}
+		select {
+		case <-stopped:
+		case <-time.After(2 * time.Second):
+			t.Fatal("upstream upload remained open")
+		}
+	})
+}
+
+func TestChannelProtocolGeminiToOpenAIEmbeddingRetainsDimensionPresence(t *testing.T) {
+	for _, tc := range []struct{ name, input, want string }{
+		{"zero", `{"content":{"parts":[{"text":"hello"}]},"outputDimensionality":0}`, `{"model":"dense-v1","input":["hello"],"dimensions":0}`},
+		{"absent", `{"content":{"parts":[{"text":"hello"}]}}`, `{"model":"dense-v1","input":["hello"]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "/v1/embeddings", r.URL.Path)
+				body, err := io.ReadAll(r.Body)
+				assert.NoError(t, err)
+				assert.JSONEq(t, tc.want, string(body))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2]}],"usage":{"prompt_tokens":0,"total_tokens":0}}`)
+			}))
+			defer server.Close()
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1beta/models/dense-v1:embedContent", strings.NewReader(tc.input))
+			c.Request.Header.Set("Content-Type", "application/json")
+			info := &relaycommon.RelayInfo{RelayMode: relayconstant.RelayModeGemini, RelayFormat: relaytypes.RelayFormatGemini, OriginModelName: "dense-v1", RequestURLPath: c.Request.URL.Path,
+				ProviderMeta: &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeOpenAI, ApiType: constant.APITypeOpenAI, ChannelBaseUrl: server.URL, ApiKey: "provider-key", UpstreamModelName: "dense-v1"}}
+			var input dto.GeminiEmbeddingRequest
+			require.NoError(t, common.UnmarshalJsonStr(tc.input, &input))
+			adaptor, err := GetChannelAdaptor(constant.APITypeOpenAI, protocol.OpenAIEmbeddings)
+			require.NoError(t, err)
+			request, err := adaptor.ConvertRequest(c, info, &input)
+			require.NoError(t, err)
+			encoded, err := common.Marshal(request)
+			require.NoError(t, err)
+			response, err := adaptor.DoRequest(c, info, strings.NewReader(string(encoded)))
+			require.NoError(t, err)
+			_, apiErr := adaptor.DoResponse(c, response.(*http.Response), info)
+			require.Nil(t, apiErr)
+			assert.JSONEq(t, `{"embedding":{"values":[0.1,0.2]},"usageMetadata":{"promptTokenCount":0}}`, recorder.Body.String())
 		})
 	}
 }

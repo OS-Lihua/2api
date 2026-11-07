@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
@@ -126,7 +127,16 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 	}
 
 	if info.RelayMode == relayconstant.RelayModeImagesEdits {
-		imageURL, err := uploadFileFromForm(c, info, "image", "image[]", "image_prompt")
+		metadata := channel.NewProviderMetadata(info)
+		overrides, err := channel.ResolveHeaderOverride(info, c)
+		if err != nil {
+			return nil, errors.New("replicate adaptor: invalid upload header override")
+		}
+		metadata.RequestHeaders = make(http.Header, len(overrides))
+		for name, value := range overrides {
+			metadata.RequestHeaders.Set(name, value)
+		}
+		imageURL, err := (&Provider{}).uploadFileFromForm(c, metadata, "image", "image[]", "image_prompt")
 		if err != nil {
 			return nil, err
 		}
@@ -408,10 +418,11 @@ func normalizeFluxDimension(value int) int {
 	return value
 }
 
-func uploadFileFromForm(c *gin.Context, info *relaycommon.RelayInfo, fieldCandidates ...string) (string, error) {
-	if info == nil {
-		return "", errors.New("replicate adaptor: relay info is nil")
+func (p *Provider) uploadFileFromForm(c *gin.Context, metadata channel.ProviderMetadata, fieldCandidates ...string) (string, error) {
+	if metadata == nil || metadata.ProviderRequest() == nil || c == nil || c.Request == nil {
+		return "", errors.New("replicate adaptor: missing upload metadata")
 	}
+	info := metadata.ProviderRequest()
 
 	mf := c.Request.MultipartForm
 	if mf == nil {
@@ -457,7 +468,7 @@ func uploadFileFromForm(c *gin.Context, info *relaycommon.RelayInfo, fieldCandid
 	writer := multipart.NewWriter(&body)
 
 	hdr := make(textproto.MIMEHeader)
-	hdr.Set("Content-Disposition", fmt.Sprintf("form-data; name=\"content\"; filename=\"%s\"", fileHeader.Filename))
+	hdr.Set("Content-Disposition", mime.FormatMediaType("form-data", map[string]string{"name": "content", "filename": fileHeader.Filename}))
 	contentType := fileHeader.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = "application/octet-stream"
@@ -476,31 +487,46 @@ func uploadFileFromForm(c *gin.Context, info *relaycommon.RelayInfo, fieldCandid
 	formContentType := writer.FormDataContentType()
 	writer.Close()
 
-	baseURL := info.ChannelBaseUrl
-	if baseURL == "" {
-		baseURL = constant.GetChannelBaseURL(constant.ChannelTypeReplicate)
-	}
-	uploadURL := relaycommon.GetFullRequestURL(baseURL, "/v1/files", info.ChannelType)
-
-	req, err := http.NewRequest(http.MethodPost, uploadURL, &body)
+	uploadMetadata := *info
+	uploadMetadata.RequestURLPath = "/v1/files"
+	uploadURL, err := p.RequestURL(&uploadMetadata)
 	if err != nil {
-		return "", fmt.Errorf("replicate adaptor: create upload request failed: %w", err)
+		return "", errors.New("replicate adaptor: invalid upload destination")
+	}
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, uploadURL, &body)
+	if err != nil {
+		return "", errors.New("replicate adaptor: invalid upload URL")
+	}
+	if err := p.SetupHeader(c, &req.Header, &uploadMetadata); err != nil {
+		return "", errors.New("replicate adaptor: invalid upload authentication")
 	}
 	req.Header.Set("Content-Type", formContentType)
-	req.Header.Set("Authorization", "Bearer "+info.ApiKey)
-
-	resp, err := service.GetHttpClient().Do(req)
+	for name, values := range info.RequestHeaders {
+		req.Header[name] = append([]string(nil), values...)
+		if strings.EqualFold(name, "Host") {
+			req.Host = req.Header.Get(name)
+		}
+	}
+	configuredClient, err := service.GetHttpClientWithProxySettings(info.ChannelSetting.Proxy, info.ChannelSetting.HTTPSettings())
 	if err != nil {
-		return "", fmt.Errorf("replicate adaptor: upload image failed: %w", err)
+		return "", errors.New("replicate adaptor: invalid upload transport configuration")
+	}
+	client := *configuredClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
+	if err != nil {
+		if c.Request.Context().Err() != nil {
+			return "", c.Request.Context().Err()
+		}
+		return "", errors.New("replicate adaptor: upload image failed")
 	}
 	defer resp.Body.Close()
-
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return "", types.NewErrorWithStatusCode(errors.New("replicate adaptor: upload image failed"), types.ErrorCodeDoRequestFailed, resp.StatusCode)
+	}
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("replicate adaptor: read upload response failed: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("replicate adaptor: upload image failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return "", errors.New("replicate adaptor: read upload response failed")
 	}
 
 	var uploadResp FileUploadResponse
