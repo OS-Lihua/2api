@@ -14,6 +14,7 @@ import (
 )
 
 const redisRateLimitNamespace = "rateLimit:v2"
+const adminAPIRateLimitContextKey = "admin_api_rate_limit_checked"
 
 // Redis rate limiting intentionally uses a fixed window. The single Lua script
 // makes increment, expiry, and the limit decision atomic, while retaining the
@@ -182,7 +183,12 @@ func GlobalWebRateLimit(frontendFS static.ServeFileSystem) func(c *gin.Context) 
 
 func GlobalAPIRateLimit() func(c *gin.Context) {
 	if common.GlobalApiRateLimitEnable {
-		return rateLimitFactory(common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration, "GA")
+		limiter := rateLimitFactory(common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration, "GA")
+		return func(c *gin.Context) {
+			if !c.GetBool(adminAPIRateLimitContextKey) {
+				limiter(c)
+			}
+		}
 	}
 	return defNext
 }

@@ -13,7 +13,9 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -51,6 +53,31 @@ func adminSecurityRequest(engine http.Handler, token, method, path, body string)
 	recorder := httptest.NewRecorder()
 	engine.ServeHTTP(recorder, request)
 	return recorder
+}
+
+func TestAdminAPIRateLimitStillPrecedesAuthentication(t *testing.T) {
+	_, _, token := newAdminTestServer(t)
+	previousEnable, previousNum, previousDuration, previousRedis, previousRDB := common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration, common.RedisEnabled, common.RDB
+	t.Cleanup(func() {
+		common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration, common.RedisEnabled, common.RDB = previousEnable, previousNum, previousDuration, previousRedis, previousRDB
+	})
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration, common.RedisEnabled, common.RDB = true, 1, 60, true, client
+	engine := gin.New()
+	SetApiRouter(engine)
+	assert.Equal(t, http.StatusUnauthorized, adminSecurityRequest(engine, "", http.MethodPost, "/api/admin/v1/models", `{}`).Code)
+	assert.Equal(t, http.StatusTooManyRequests, adminSecurityRequest(engine, "", http.MethodPost, "/api/admin/v1/models", `{}`).Code)
+	server.FlushAll()
+	assert.Equal(t, http.StatusOK, adminSecurityRequest(engine, token, http.MethodGet, "/api/admin/v1/models", "").Code, "the authenticated request must count only once")
+	assert.Equal(t, http.StatusTooManyRequests, adminSecurityRequest(engine, token, http.MethodGet, "/api/admin/v1/models", "").Code)
+	logs, total, err := model.GetAuditLogs(model.AuditLogFilter{Category: model.AuditCategoryOperation}, 0, 10, common.RoleRootUser)
+	require.NoError(t, err)
+	require.EqualValues(t, 3, total)
+	for _, entry := range logs {
+		assert.False(t, entry.Success)
+	}
 }
 
 func TestAdminAPIAuditsCompressedSuccess(t *testing.T) {

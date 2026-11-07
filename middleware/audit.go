@@ -242,6 +242,8 @@ func auditResponseSuccess(c *gin.Context, status int, body []byte) bool {
 // and rate-limit rejections. Only route templates and numeric identifiers enter
 // the operation audit; handler payloads and raw errors are never persisted.
 func AdminAPISecurity() gin.HandlerFunc {
+	rateLimitEnabled := common.GlobalApiRateLimitEnable
+	rateLimit := GlobalAPIRateLimit()
 	return func(c *gin.Context) {
 		if c.Request.URL.Path != "/api/admin/v1" && !strings.HasPrefix(c.Request.URL.Path, "/api/admin/v1/") {
 			c.Next()
@@ -295,6 +297,16 @@ func AdminAPISecurity() gin.HandlerFunc {
 					AuditInfo: &model.AuditRequestInfo{Method: method, Route: route, Path: route, Status: status, Success: success, Params: params}},
 			})
 		}()
+		// Keep the global IP limit ahead of authentication. The API group's
+		// limiter sees this marker and does not charge a second time.
+		if rateLimitEnabled {
+			rateLimit(c)
+			c.Set(adminAPIRateLimitContextKey, true)
+			if c.IsAborted() {
+				completed = true
+				return
+			}
+		}
 		AdminAuth()(c)
 		completed = true
 	}
