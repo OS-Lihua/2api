@@ -62,9 +62,9 @@ func ClassifyGatewayFailure(status int, code string, transport, timeout, cancell
 		return GatewayFailure{Class: "context_length"}
 	case code == "content_filter" || code == "content_policy_violation" || code == "safety" || kind == "content_policy_violation" || kind == "content_filter":
 		return GatewayFailure{Class: "content_safety"}
-	case code == "insufficient_quota" || code == "insufficient_balance" || code == "credit_balance_too_low" || code == "billing_hard_limit_reached" || code == "ServiceQuotaExceededException":
+	case code == "baidu:17" || code == "insufficient_quota" || code == "insufficient_balance" || code == "credit_balance_too_low" || code == "billing_hard_limit_reached" || code == "ServiceQuotaExceededException":
 		return GatewayFailure{Class: "account_quota", Switch: true, ExcludeProvider: true}
-	case code == "invalid_client" || code == "unauthorized_client" || status == 401 || status == 403 || code == "invalid_api_key" || code == "authentication_error" || kind == "authentication_error":
+	case code == "baidu:110" || code == "baidu:111" || code == "invalid_client" || code == "unauthorized_client" || status == 401 || status == 403 || code == "invalid_api_key" || code == "authentication_error" || kind == "authentication_error":
 		return GatewayFailure{Class: "credentials", Switch: true, ExcludeProvider: true}
 	case code == "stream_idle_timeout":
 		return GatewayFailure{Class: "stream_interrupted", Switch: true}

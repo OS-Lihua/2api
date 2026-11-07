@@ -823,9 +823,18 @@ func (transport channelProbeRoundTripper) CloneWithVerifiedTLS() http.RoundTripp
 
 func TestBaiduTokenPreparationRejectsUntrustedTLS(t *testing.T) {
 	t.Setenv("TLS_INSECURE_SKIP_VERIFY", "true")
+	logPath := captureGatewayDebugLog(t)
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("the model cannot run after TLS verification failure")
+	})
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeBaidu, "key": t.Name() + "|fake"}).Error)
 	requests := 0
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++
+		if r.URL.Path == "/redirect" {
+			http.Redirect(w, r, "/capture", http.StatusTemporaryRedirect)
+			return
+		}
 		_, _ = w.Write([]byte(`{"access_token":"fake-token","expires_in":7200}`))
 	}))
 	defer server.Close()
@@ -850,6 +859,17 @@ func TestBaiduTokenPreparationRejectsUntrustedTLS(t *testing.T) {
 	require.Error(t, err)
 	var invalid x509.UnknownAuthorityError
 	assert.ErrorAs(t, err, &invalid)
+	legacy := relay.GetProviderAdapter(constant.APITypeBaidu)
+	_, err = legacy.RequestURL(&channel.ProviderRequest{ApiKey: t.Name() + "-legacy|fake", ChannelBaseUrl: server.URL, UpstreamModelName: "ERNIE-Bot"})
+	require.Error(t, err, "legacy cache misses must use the same verified token source")
+	gatewayResponse := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	assert.GreaterOrEqual(t, gatewayResponse.Code, 400)
+	logged, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(logged), "category=certificate_verification_failed")
+	assert.Contains(t, string(logged), fmt.Sprintf("provider=%d", fixture.channel.ProviderID))
+	assert.Contains(t, string(logged), gatewayResponse.Header().Get(common.RequestIdKey))
+	assert.NotContains(t, string(logged), t.Name()+"|fake")
 	assert.Zero(t, requests, "credentials must not reach an untrusted TLS endpoint")
 	assert.True(t, transport.TLSClientConfig.InsecureSkipVerify, "verification must not mutate the shared relay transport")
 	transport.TLSClientConfig.RootCAs = x509.NewCertPool()
@@ -861,6 +881,87 @@ func TestBaiduTokenPreparationRejectsUntrustedTLS(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, response.Body.Close())
 	assert.Equal(t, 1, requests, "a trusted certificate remains usable")
+	redirected, err := verified.PostForm(server.URL+"/redirect", url.Values{"client_secret": {"fake"}})
+	require.NoError(t, err)
+	require.NoError(t, redirected.Body.Close())
+	assert.Equal(t, http.StatusTemporaryRedirect, redirected.StatusCode)
+	assert.Equal(t, 2, requests, "credential request bodies must not follow redirects")
+}
+
+func TestTextGatewayBaiduNativeRejectionsExcludeProvider(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, code := range []int{17, 110, 111} {
+			t.Run(fmt.Sprint("stream=", stream, "/code=", code), func(t *testing.T) {
+				calls := 0
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					if r.URL.Path == "/oauth/2.0/token" {
+						_, _ = w.Write([]byte(`{"access_token":"fake-token","expires_in":7200}`))
+						return
+					}
+					calls++
+					if stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = fmt.Fprintf(w, "data: {\"error_code\":%d,\"error_msg\":\"private-baidu-error\"}\n\n", code)
+					} else {
+						_, _ = fmt.Fprintf(w, `{"error_code":%d,"error_msg":"private-baidu-error"}`, code)
+					}
+				})
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeBaidu, "key": t.Name() + "|fake"}).Error)
+				sibling := *fixture.channel
+				sibling.ID, sibling.UpstreamModelName = 0, "same-account-next"
+				require.NoError(t, model.DB.Create(&sibling).Error)
+				price := *fixture.purchase
+				price.ID, price.OwnerID = 0, sibling.ID
+				require.NoError(t, model.CreatePriceVersion(t.Context(), &price, fixture.sale.CreatedBy))
+				var provider model.Provider
+				require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
+				endpoint, err := url.Parse(*provider.BaseURL)
+				require.NoError(t, err)
+				client := service.GetHttpClient()
+				original := client.Transport
+				t.Cleanup(func() { client.Transport = original })
+				client.Transport = channelProbeRoundTripper(func(r *http.Request) (*http.Response, error) {
+					if r.URL.Host != "aip.baidubce.com" {
+						return original.RoundTrip(r)
+					}
+					copyRequest := r.Clone(r.Context())
+					copyURL := *r.URL
+					copyURL.Scheme, copyURL.Host = endpoint.Scheme, endpoint.Host
+					copyRequest.URL, copyRequest.Host = &copyURL, endpoint.Host
+					return original.RoundTrip(copyRequest)
+				})
+				recovered := 0
+				addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+					recovered++
+					if stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n"))
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+				})
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", fmt.Sprintf(`{"model":"gateway-alias","stream":%t,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, stream))
+				assert.Equal(t, 1, calls)
+				assert.Equal(t, 1, recovered)
+				assert.Contains(t, response.Body.String(), "Recovered")
+				assert.NotContains(t, response.Body.String(), "private-baidu-error")
+				attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, 2, total)
+				for _, a := range attempts {
+					if a.ChannelID == fixture.channel.ID {
+						expected := "credentials"
+						if code == 17 {
+							expected = "account_quota"
+						}
+						assert.Equal(t, expected, a.ErrorClass)
+					}
+				}
+			})
+		}
+	}
 }
 
 func TestTextGatewayFailoverCannotExceedFrozenReservation(t *testing.T) {

@@ -2,6 +2,7 @@ package baidu
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -130,6 +131,7 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 			prompt, completion := relaycommon.ChatUsagePresence([]byte(data))
 			info.ResponseFacts.RecordUsage(usage, &baiduResponse.Usage, prompt, completion)
 			if baiduResponse.ErrorMsg != "" || baiduResponse.ErrorCode != 0 {
+				info.StreamStatus.MarkFailed(fmt.Sprintf("baidu:%d", baiduResponse.ErrorCode), "upstream_error", 0)
 				sr.Stop(fmt.Errorf("Baidu stream failed"))
 				return
 			}
@@ -169,6 +171,9 @@ func baiduHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respon
 		info.ResponseFacts.RecordUsage(&baiduResponse.Usage, &baiduResponse.Usage, prompt, completion)
 	}
 	if baiduResponse.ErrorMsg != "" || baiduResponse.ErrorCode != 0 {
+		if info.ResponseFacts != nil {
+			return types.WithOpenAIError(types.OpenAIError{Message: "Baidu request failed", Type: "upstream_error", Code: fmt.Sprintf("baidu:%d", baiduResponse.ErrorCode)}, resp.StatusCode), &baiduResponse.Usage
+		}
 		return types.NewError(fmt.Errorf("%s", baiduResponse.ErrorMsg), types.ErrorCodeBadResponseBody), &baiduResponse.Usage
 	}
 	fullTextResponse := responseBaidu2OpenAI(&baiduResponse)
@@ -218,13 +223,13 @@ func getBaiduAccessToken(apiKey string) (string, error) {
 			// soon this will expire
 			if clock.Now().Add(time.Hour).After(accessToken.ExpiresAt) {
 				go func() {
-					_, _ = getBaiduAccessTokenHelper(context.Background(), service.GetHttpClient(), apiKey)
+					_, _ = refreshBaiduAccessToken(apiKey)
 				}()
 			}
 			return accessToken.AccessToken, nil
 		}
 	}
-	accessToken, err := getBaiduAccessTokenHelper(context.Background(), service.GetHttpClient(), apiKey)
+	accessToken, err := refreshBaiduAccessToken(apiKey)
 	if err != nil {
 		return "", err
 	}
@@ -232,6 +237,20 @@ func getBaiduAccessToken(apiKey string) (string, error) {
 		return "", errors.New("getBaiduAccessToken return a nil token")
 	}
 	return (*accessToken).AccessToken, nil
+}
+
+func refreshBaiduAccessToken(apiKey string) (*BaiduAccessToken, error) {
+	client, err := service.GetVerifiedHttpClientWithProxy("")
+	if err != nil {
+		return nil, err
+	}
+	defer client.CloseIdleConnections()
+	token, err := getBaiduAccessTokenHelper(context.Background(), client, apiKey)
+	var certificateFailure *tls.CertificateVerificationError
+	if errors.As(err, &certificateFailure) {
+		common.SysError(common.LogText("Provider credential security failure provider_type=baidu category=certificate_verification_failed"))
+	}
+	return token, err
 }
 
 func getBaiduAccessTokenHelper(ctx context.Context, client *http.Client, apiKey string) (*BaiduAccessToken, error) {

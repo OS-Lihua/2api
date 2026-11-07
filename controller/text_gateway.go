@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net/http"
@@ -52,7 +53,11 @@ func (run *textGatewayRun) fail(c *gin.Context, status int, code, message string
 	run.status, run.code, run.message = status, code, message
 }
 
-func gatewayPreparationRejection(err error, budget *service.GatewayAttemptBudget, parent context.Context, providerID int) service.GatewayAttemptResult {
+func gatewayPreparationRejection(err error, budget *service.GatewayAttemptBudget, parent context.Context, providerID int, requestID string) service.GatewayAttemptResult {
+	var certificateFailure *tls.CertificateVerificationError
+	if errors.As(err, &certificateFailure) {
+		logger.LogError(parent, common.LogText("Provider credential security failure request=%q provider=%d category=certificate_verification_failed", requestID, providerID))
+	}
 	var result service.GatewayAttemptResult
 	var rejection *types.NewAPIError
 	if !errors.As(err, &rejection) {
@@ -468,13 +473,13 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	info.SetEstimatePromptTokens(estimatedInput)
 	encoded, err = adaptor.PrepareChatRequest(c, info, converted, encoded)
 	if err != nil {
-		result = gatewayPreparationRejection(err, budget, parent.Context(), selection.Channel.ProviderID)
+		result = gatewayPreparationRejection(err, budget, parent.Context(), selection.Channel.ProviderID, info.RequestId)
 		run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
 		return
 	}
 	prepared, err := adaptor.PrepareRequest(c, info, bytes.NewReader(encoded))
 	if err != nil {
-		result = gatewayPreparationRejection(err, budget, parent.Context(), selection.Channel.ProviderID)
+		result = gatewayPreparationRejection(err, budget, parent.Context(), selection.Channel.ProviderID, info.RequestId)
 		run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
 		return
 	}

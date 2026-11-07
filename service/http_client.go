@@ -427,6 +427,7 @@ func GetVerifiedHttpClientWithProxy(rawProxyURL string) (*http.Client, error) {
 	default:
 		return nil, fmt.Errorf("transport cannot enforce certificate verification")
 	}
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 	return &client, nil
 }
 
