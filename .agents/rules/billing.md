@@ -10,9 +10,19 @@ Mandatory conventions for quota, pricing, pre-consume, settlement, refund, and u
 
 - A stored amount is `money.Amount`: `int64` in 10⁻⁹ units of the currency plus an ISO 4217 code. Embed it with `gorm:"embedded;embeddedPrefix:<name>_"` to get a `bigint` and a `char(3)` column. Do not store amounts as `float`, `numeric`, or `int` quota.
 - Calculate with `money.Value` (exact decimal): `Add`, `Sub`, `MulQuantity`, `MulUnitPrice`, and `Convert` with a `money.Rate`. Do not route amounts through `float64`, and do not build `money.Amount` from `decimal.IntPart()` or a bare cast.
-- Do not round during calculation. Round only when writing: `Value.Receivable` rounds a user charge up to 10⁻⁹; `Value.Cost` rounds a purchase cost to the nearest 10⁻⁹, halves away from zero, so costs reconcile with provider invoices without drifting in one direction.
+- Do not round during calculation. Round only when writing: `Value.Receivable` rounds a user charge up to 10⁻⁹; `Value.Credit` rounds a user credit, such as a top-up converted from another currency, down to 10⁻⁹; `Value.Cost` rounds a purchase cost to the nearest 10⁻⁹, halves away from zero, so costs reconcile with provider invoices without drifting in one direction.
 - Every operation returns `money.ErrOverflow` outside the `int64` range of 10⁻⁹ units and `money.ErrCurrencyMismatch` for different currencies. Reject the operation on these errors; never clamp, saturate, or truncate. Converting to another currency requires an explicit `money.Rate`.
 - On PostgreSQL, `SUM` of an amount column returns `numeric`; scan it into `decimal.Decimal` and sum one currency at a time.
+
+**Wallets and ledger entries:** The `wallets` and `ledger_entries` tables in the primary database are the only source of amounts. Accounts are a user wallet (one per user, in `SETTLEMENT_CURRENCY`), platform revenue (one per currency), and a Provider payable (per Provider and currency).
+
+- Change a balance only through `model.PostLedgerEntries`, `model.TopUpWallet`, or `model.ReverseLedgerEntry`. They lock each wallet with `lockForUpdate` in ID order and write the entries and balances in one transaction. Never update `wallets.balance_nanos` directly.
+- Ledger entries are append-only: a database trigger rejects `UPDATE`, `DELETE`, and `TRUNCATE`. Correct a mistake with a reversal entry; an entry is reversed at most once and a reversal cannot be reversed.
+- Each entry is non-zero and its sign must match its type and account: on a user wallet, top-up, pre-consume release, refund, and opening balance are positive, pre-consume and charge are negative, and an adjustment may be either; on platform revenue and Provider payable accounts, charge is positive and refund negative. A reversal has the opposite sign.
+- A posting that would make a user wallet negative fails with `model.ErrInsufficientWalletBalance`. Use `IdempotencyKey` for postings that must happen once, such as one pre-consume per request or one credit per payment reference.
+- A top-up in another currency records the source amount and the exchange rate on the entry and credits the converted amount rounded down with `Value.Credit`.
+- The `wallet_reconcile` system task checks that every balance equals the sum of its entries on the interval in `WALLET_RECONCILE_INTERVAL_MINUTES` (default 60), measured on `pkg/clock`. A mismatch fails the run and notifies the root user.
+- Until the data migration command moves legacy balances into opening-balance entries, the `int` quota paths do not post to the ledger; do not mirror quota changes into wallets.
 - The safety invariants below still apply: bound every billing multiplier before it reaches a calculation, and never let arithmetic or input produce a credit.
 
 **Billing safety invariants:** Quota/billing code MUST never produce a negative charge (a credit) from arithmetic overflow or unvalidated input. Apply defense in depth:

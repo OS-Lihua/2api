@@ -198,17 +198,18 @@ func TestValueWrite(t *testing.T) {
 		value          string
 		wantReceivable int64
 		wantCost       int64
+		wantCredit     int64
 	}{
-		{name: "exact", value: "1.5", wantReceivable: 1_500_000_000, wantCost: 1_500_000_000},
-		{name: "zero", value: "0", wantReceivable: 0, wantCost: 0},
+		{name: "exact", value: "1.5", wantReceivable: 1_500_000_000, wantCost: 1_500_000_000, wantCredit: 1_500_000_000},
+		{name: "zero", value: "0", wantReceivable: 0, wantCost: 0, wantCredit: 0},
 		// 7 tokens at $0.0375 per 1M tokens.
-		{name: "half fraction", value: "0.0000002625", wantReceivable: 263, wantCost: 263},
-		{name: "fraction below half", value: "0.0000000024", wantReceivable: 3, wantCost: 2},
-		{name: "smallest positive fraction", value: "0.0000000000001", wantReceivable: 1, wantCost: 0},
-		{name: "negative half fraction", value: "-0.0000002625", wantReceivable: -262, wantCost: -263},
-		{name: "maximum", value: maxUnits, wantReceivable: math.MaxInt64, wantCost: math.MaxInt64},
-		{name: "minimum", value: "-9223372036.854775808", wantReceivable: math.MinInt64, wantCost: math.MinInt64},
-		{name: "fraction below the maximum", value: "9223372036.8547758061", wantReceivable: math.MaxInt64, wantCost: math.MaxInt64 - 1},
+		{name: "half fraction", value: "0.0000002625", wantReceivable: 263, wantCost: 263, wantCredit: 262},
+		{name: "fraction below half", value: "0.0000000024", wantReceivable: 3, wantCost: 2, wantCredit: 2},
+		{name: "smallest positive fraction", value: "0.0000000000001", wantReceivable: 1, wantCost: 0, wantCredit: 0},
+		{name: "negative half fraction", value: "-0.0000002625", wantReceivable: -262, wantCost: -263, wantCredit: -263},
+		{name: "maximum", value: maxUnits, wantReceivable: math.MaxInt64, wantCost: math.MaxInt64, wantCredit: math.MaxInt64},
+		{name: "minimum", value: "-9223372036.854775808", wantReceivable: math.MinInt64, wantCost: math.MinInt64, wantCredit: math.MinInt64},
+		{name: "fraction below the maximum", value: "9223372036.8547758061", wantReceivable: math.MaxInt64, wantCost: math.MaxInt64 - 1, wantCredit: math.MaxInt64 - 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -221,6 +222,10 @@ func TestValueWrite(t *testing.T) {
 			cost, err := v.Cost()
 			require.NoError(t, err)
 			assert.Equal(t, money.Amount{Nanos: tt.wantCost, Currency: "USD"}, cost)
+
+			credit, err := v.Credit()
+			require.NoError(t, err)
+			assert.Equal(t, money.Amount{Nanos: tt.wantCredit, Currency: "USD"}, credit)
 		})
 	}
 }

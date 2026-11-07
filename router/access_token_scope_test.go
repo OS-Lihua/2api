@@ -77,6 +77,12 @@ var accessTokenExemptRoutes = []string{
 var accessTokenHelperRoutes = map[string]authz.Permission{
 	"GET /api/task_plugin_options": authz.TaskPluginBind,
 	"GET /api/audit":               authz.AuditRead,
+
+	"GET /api/admin/v1/user-wallets/:user_id":              authz.LedgerRead,
+	"GET /api/admin/v1/user-wallets/:user_id/entries":      authz.LedgerRead,
+	"POST /api/admin/v1/user-wallets/:user_id/top-ups":     authz.LedgerWrite,
+	"POST /api/admin/v1/user-wallets/:user_id/adjustments": authz.LedgerWrite,
+	"POST /api/admin/v1/ledger-entries/:id/reversal":       authz.LedgerWrite,
 }
 
 func newAccessTokenScopeTestEngine(t *testing.T) *gin.Engine {
