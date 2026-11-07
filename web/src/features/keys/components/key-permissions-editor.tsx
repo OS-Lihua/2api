@@ -40,7 +40,10 @@ import {
 } from '@/components/ui/form'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { handleServerError } from '@/lib/handle-server-error'
-import { requireServerSuccess } from '@/lib/server-error-message'
+import {
+  getServerErrorMessage,
+  requireServerSuccess,
+} from '@/lib/server-error-message'
 
 import {
   getKeyOfferings,
@@ -74,25 +77,36 @@ export function KeyPermissionsEditor(props: {
   })
   const { t } = useTranslation()
   if (query.isPending) return <LoadingState />
-  if (query.isError || !query.data?.permissions || !query.data.choices) {
+  if (!query.data?.permissions || !query.data.choices) {
     return <ErrorState onRetry={() => void query.refetch()} />
   }
+  const reloadPermissions = () => {
+    void query.refetch().then((result) => {
+      if (result.isSuccess) setReloadCount((count) => count + 1)
+    })
+  }
   return (
-    <KeyPermissionsForm
-      key={`${props.tokenId}:${query.data.permissions.revision}:${reloadCount}`}
-      tokenId={props.tokenId}
-      permissions={query.data.permissions}
-      choices={query.data.choices}
-      onSaved={props.onSaved}
-      onDirtyChange={props.onDirtyChange}
-      onReload={() => {
-        void query.refetch().then((result) => {
-          if (result.isSuccess) setReloadCount((count) => count + 1)
-        })
-      }}
-      reloading={query.isFetching}
-      title={t('Key permissions')}
-    />
+    <>
+      {query.isError && (
+        <ErrorState
+          className='min-h-0 py-3'
+          title={t('Failed to get token permissions')}
+          description={getServerErrorMessage(query.error)}
+          onRetry={reloadPermissions}
+        />
+      )}
+      <KeyPermissionsForm
+        key={`${props.tokenId}:${query.data.permissions.revision}:${reloadCount}`}
+        tokenId={props.tokenId}
+        permissions={query.data.permissions}
+        choices={query.data.choices}
+        onSaved={props.onSaved}
+        onDirtyChange={props.onDirtyChange}
+        onReload={reloadPermissions}
+        reloading={query.isFetching}
+        title={t('Key permissions')}
+      />
+    </>
   )
 }
 

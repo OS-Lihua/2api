@@ -25,14 +25,18 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
-function renderEditor() {
+function renderEditor(onDirtyChange?: (dirty: boolean) => void) {
   client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
   return render(
     <QueryClientProvider client={client}>
       <I18nextProvider i18n={i18n}>
-        <KeyPermissionsEditor tokenId={7} onSaved={() => undefined} />
+        <KeyPermissionsEditor
+          tokenId={7}
+          onSaved={() => undefined}
+          onDirtyChange={onDirtyChange}
+        />
       </I18nextProvider>
     </QueryClientProvider>
   )
@@ -136,6 +140,45 @@ test('reload discards unsaved edits even when the stored revision is unchanged',
   expect(
     screen.getByRole('button', { name: 'Save permissions' })
   ).toBeDisabled()
+})
+
+test('failed reload keeps the unsaved policy until a successful retry', async () => {
+  let failReads = false
+  const dirty = vi.fn()
+  vi.spyOn(api, 'get').mockImplementation(async (url) => {
+    if (failReads) throw new Error('network unavailable')
+    return {
+      data: {
+        success: true,
+        data: url.endsWith('/permissions')
+          ? { default_allow: true, exception_ids: [], revision: 1 }
+          : [],
+      },
+    }
+  })
+  renderEditor(dirty)
+  const policy = await screen.findByRole('combobox', { name: 'Default policy' })
+  fireEvent.change(policy, { target: { value: 'deny' } })
+  await waitFor(() => expect(dirty).toHaveBeenLastCalledWith(true))
+  failReads = true
+  fireEvent.click(screen.getByRole('button', { name: 'Reload permissions' }))
+  const retry = await screen.findByRole('button', { name: 'Retry' })
+  expect(screen.getByRole('combobox', { name: 'Default policy' })).toHaveValue(
+    'deny'
+  )
+  expect(screen.getByRole('button', { name: 'Save permissions' })).toBeEnabled()
+  expect(dirty).toHaveBeenLastCalledWith(true)
+  failReads = false
+  fireEvent.click(retry)
+  await waitFor(() =>
+    expect(
+      screen.getByRole('combobox', { name: 'Default policy' })
+    ).toHaveValue('allow')
+  )
+  expect(
+    screen.getByRole('button', { name: 'Save permissions' })
+  ).toBeDisabled()
+  await waitFor(() => expect(dirty).toHaveBeenLastCalledWith(false))
 })
 
 test('failed reads show retry and never expose a save action', async () => {
