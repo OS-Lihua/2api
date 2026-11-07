@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/capability"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"gorm.io/gorm"
 )
@@ -107,77 +108,13 @@ func MutateChannel(ctx context.Context, id int, action ChannelAction, change fun
 		if err := lockForUpdate(tx).First(&provider, record.ProviderID).Error; err != nil {
 			return err
 		}
-		if record.ID != 0 {
-			record.CreatedAt = previous.CreatedAt
-			record.MappingConfirmed = previous.MappingConfirmed
-			record.Status = previous.Status
-			if record.ModelID != previous.ModelID || record.ProviderID != previous.ProviderID || record.Protocol != previous.Protocol || record.UpstreamModelName != previous.UpstreamModelName {
-				record.MappingConfirmed = false
-				record.Status = ChannelPending
-			}
-		} else {
-			record.Status = ChannelPending
-			record.MappingConfirmed = false
-			record.CreatedAt = common.GetTimestamp()
-		}
-		record.UpstreamModelName = strings.TrimSpace(record.UpstreamModelName)
-		if record.UpstreamModelName == "" || utf8.RuneCountInString(record.UpstreamModelName) > 256 {
-			return common.NewMessage("Invalid upstream model name")
-		}
-		if err := record.Protocol.Validate(); err != nil {
-			return common.NewMessage("Invalid channel protocol")
-		}
-		if record.RPM < 0 || record.TPM < 0 || record.MaxConcurrency < 0 || record.Weight < 0 {
-			return common.NewMessage("Channel limits and weight must be non-negative integers")
-		}
-		if record.Capabilities != nil {
-			normalized, err := record.Capabilities.Normalize()
-			if err != nil {
-				return err
-			}
-			record.Capabilities = &normalized
-		}
-		if _, err := record.EffectiveCapabilities(unified.Capabilities); err != nil {
+		channelPrices.RLock()
+		checker := channelPrices.checker
+		channelPrices.RUnlock()
+		if err := validateChannelMutation(ctx, tx, record, previous, action, unified, provider, checker); err != nil {
 			return err
 		}
-		var overrides map[string]any
-		if err := common.UnmarshalJsonStr(record.ParameterOverrides, &overrides); err != nil || overrides == nil {
-			return common.NewMessage("Parameter overrides must be a JSON object")
-		}
-		switch action {
-		case ChannelConfirm:
-			if !record.MappingConfirmed {
-				record.Status = ChannelDisabled
-			}
-			record.MappingConfirmed = true
-		case ChannelEnable:
-			record.Status = ChannelEnabled
-		case ChannelSave:
-		default:
-			return errors.New("unknown channel action")
-		}
-		if record.Status == ChannelEnabled {
-			if !record.MappingConfirmed {
-				return common.NewMessage("Confirm the channel mapping before enabling")
-			}
-			if provider.Status != common.ChannelStatusEnabled {
-				return common.NewMessage("Enable the provider before enabling its channel")
-			}
-			channelPrices.RLock()
-			checker := channelPrices.checker
-			channelPrices.RUnlock()
-			configured := false
-			if checker != nil {
-				var err error
-				configured, err = checker.HasPurchasePrice(ctx, tx, record)
-				if err != nil {
-					return err
-				}
-			}
-			if !configured {
-				return common.NewMessage("Configure a purchase price before enabling the channel")
-			}
-		}
+
 		record.UpdatedAt = common.GetTimestamp()
 		if record.ID == 0 {
 			return tx.Omit("Provider", "Model").Create(record).Error
@@ -185,6 +122,85 @@ func MutateChannel(ctx context.Context, id int, action ChannelAction, change fun
 		return tx.Omit("Provider", "Model").Save(record).Error
 	})
 	return record, err
+}
+
+// validateChannelMutation applies the same state and declaration rules to
+// persisted mutations and a batch's in-memory preview.
+func validateChannelMutation(ctx context.Context, tx *gorm.DB, record *Channel, previous Channel, action ChannelAction, unified Model, provider Provider, checker ChannelPurchasePriceChecker) error {
+	if record.ID != 0 {
+		record.CreatedAt = previous.CreatedAt
+		record.MappingConfirmed = previous.MappingConfirmed
+		record.Status = previous.Status
+		if record.ModelID != previous.ModelID || record.ProviderID != previous.ProviderID || record.Protocol != previous.Protocol || record.UpstreamModelName != previous.UpstreamModelName {
+			record.MappingConfirmed = false
+			record.Status = ChannelPending
+		}
+	} else {
+		record.Status = ChannelPending
+		record.MappingConfirmed = false
+		record.CreatedAt = common.GetTimestamp()
+	}
+	record.UpstreamModelName = strings.TrimSpace(record.UpstreamModelName)
+	if record.UpstreamModelName == "" || utf8.RuneCountInString(record.UpstreamModelName) > 256 {
+		return common.NewMessage("Invalid upstream model name")
+	}
+	if key, task := record.Protocol.TaskPluginKey(); task {
+		if _, available := jsplugin.DefaultRegistry.Get(key); !available {
+			return common.NewMessage("Task plugin is not available")
+		}
+	}
+	if err := record.Protocol.Validate(); err != nil {
+		return common.NewMessage("Invalid channel protocol")
+	}
+	if record.RPM < 0 || record.TPM < 0 || record.MaxConcurrency < 0 || record.Weight < 0 {
+		return common.NewMessage("Channel limits and weight must be non-negative integers")
+	}
+	if record.Capabilities != nil {
+		normalized, err := record.Capabilities.Normalize()
+		if err != nil {
+			return err
+		}
+		record.Capabilities = &normalized
+	}
+	if _, err := record.EffectiveCapabilities(unified.Capabilities); err != nil {
+		return err
+	}
+	var overrides map[string]any
+	if err := common.UnmarshalJsonStr(record.ParameterOverrides, &overrides); err != nil || overrides == nil {
+		return common.NewMessage("Parameter overrides must be a JSON object")
+	}
+	switch action {
+	case ChannelConfirm:
+		if !record.MappingConfirmed {
+			record.Status = ChannelDisabled
+		}
+		record.MappingConfirmed = true
+	case ChannelEnable:
+		record.Status = ChannelEnabled
+	case ChannelSave:
+	default:
+		return errors.New("unknown channel action")
+	}
+	if record.Status == ChannelEnabled {
+		if !record.MappingConfirmed {
+			return common.NewMessage("Confirm the channel mapping before enabling")
+		}
+		if provider.Status != common.ChannelStatusEnabled {
+			return common.NewMessage("Enable the provider before enabling its channel")
+		}
+		configured := false
+		if checker != nil {
+			var err error
+			configured, err = checker.HasPurchasePrice(ctx, tx, record)
+			if err != nil {
+				return err
+			}
+		}
+		if !configured {
+			return common.NewMessage("Configure a purchase price before enabling the channel")
+		}
+	}
+	return nil
 }
 
 // EffectiveCapabilities validates a narrowing and inherits undeclared numeric

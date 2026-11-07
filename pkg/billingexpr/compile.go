@@ -2,6 +2,7 @@ package billingexpr
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"strings"
 	"sync"
@@ -193,6 +194,41 @@ func compileEntryFromCacheByHash(exprStr, hash string) (*cachedEntry, error) {
 	}
 	cacheMu.RUnlock()
 
+	entry, err := compileEntry(exprStr)
+	if err != nil {
+		return nil, err
+	}
+	cacheMu.Lock()
+	if len(cache) >= maxCacheSize {
+		cache = make(map[string]*cachedEntry, 64)
+	}
+	cache[hash] = entry
+	cacheMu.Unlock()
+	return entry, nil
+}
+
+// CompiledExpression can validate and evaluate a draft without changing the
+// runtime expression cache. A compiled expression is safe for concurrent runs.
+type CompiledExpression struct{ entry *cachedEntry }
+
+func Compile(expression string) (*CompiledExpression, error) {
+	entry, err := compileEntry(expression)
+	if err != nil {
+		return nil, err
+	}
+	return &CompiledExpression{entry: entry}, nil
+}
+
+func (expression *CompiledExpression) UsageKeys() map[string]bool {
+	return maps.Clone(expression.entry.usedUsageKeys)
+}
+func (expression *CompiledExpression) UsesFixedPricing() bool { return expression.entry.fixedPricing }
+func (expression *CompiledExpression) Run(params TokenParams, request RequestInput) (float64, TraceResult, error) {
+	entry := expression.entry
+	return runProgram(entry.prog, entry.requestRules, entry.usedVars, params, request)
+}
+
+func compileEntry(exprStr string) (*cachedEntry, error) {
 	version, body := ParseExprVersion(exprStr)
 	// Validate before optimization so unreachable fixed-price branches cannot
 	// bypass validation or a host's unsupported-protocol checks.
@@ -226,13 +262,6 @@ func compileEntryFromCacheByHash(exprStr, hash string) (*cachedEntry, error) {
 		version:       version,
 		fixedPricing:  fixedPricing,
 	}
-	cacheMu.Lock()
-	if len(cache) >= maxCacheSize {
-		cache = make(map[string]*cachedEntry, 64)
-	}
-	cache[hash] = entry
-	cacheMu.Unlock()
-
 	return entry, nil
 }
 

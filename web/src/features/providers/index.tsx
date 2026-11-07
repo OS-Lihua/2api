@@ -23,6 +23,7 @@ import { SectionPageLayout } from '@/components/layout'
 import { Button } from '@/components/ui/button'
 import { RecommendationRules } from '@/features/recommendations/recommendation-rules'
 
+import { BulkImportButton } from './components/bulk-import-dialog'
 import { ProvidersDialogs } from './components/providers-dialogs'
 import {
   ProvidersProvider,
@@ -49,6 +50,7 @@ export function Providers() {
         <SectionPageLayout.Title>{t('Providers')}</SectionPageLayout.Title>
         <SectionPageLayout.Actions>
           <RecommendationRules kind='provider' />
+          <BulkImportButton />
           <CreateProviderButton />
         </SectionPageLayout.Actions>
         <SectionPageLayout.Content>
