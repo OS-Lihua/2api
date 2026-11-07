@@ -2389,6 +2389,7 @@
     "Enter the complete URL, supports": "完全なURLを入力、サポート",
     "Enter the Coze agent ID": "CozeエージェントIDを入力",
     "Enter the Discovery URL or Issuer URL first": "先に Discovery URL または Issuer URL を入力してください",
+    "Enter the full base URL to replace the hidden credentials": "非表示の認証情報を置き換えるには完全なベース URL を入力してください",
     "Enter the full URL of your Gotify server": "Gotifyサーバーの完全なURLを入力",
     "Enter the key; one key per line": "キーを入力（1 行に 1 つ）",
     "Enter the knowledge base ID": "ナレッジベースIDを入力",

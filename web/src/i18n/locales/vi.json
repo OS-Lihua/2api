@@ -2389,6 +2389,7 @@
     "Enter the complete URL, supports": "Nhập địa chỉ URL hoàn chỉnh, hỗ trợ",
     "Enter the Coze agent ID": "Nhập ID tác nhân Coze",
     "Enter the Discovery URL or Issuer URL first": "Vui lòng nhập Discovery URL hoặc Issuer URL trước",
+    "Enter the full base URL to replace the hidden credentials": "Nhập URL gốc đầy đủ để thay thông tin xác thực đã ẩn",
     "Enter the full URL of your Gotify server": "Nhập URL đầy đủ của máy chủ Gotify của bạn",
     "Enter the key; one key per line": "Nhập khóa, mỗi dòng một khóa",
     "Enter the knowledge base ID": "Nhập ID cơ sở tri thức",
