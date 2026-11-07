@@ -5,12 +5,35 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
-// InspectCacheControls reports explicit cache boundaries that the target text
-// protocol cannot express, even when an extended DTO retains the JSON member.
-func InspectCacheControls(ctx context.Context, value any, path string, from, to types.RelayFormat) {
+type cacheBoundary struct {
+	path     string
+	identity string
+}
+
+// InspectCacheControls permits a supported cache boundary only when the
+// converted request actually retained it. Provider identity alone is insufficient.
+func InspectCacheControls(ctx context.Context, source, target any, from, to types.RelayFormat, supportsBoundaries bool) {
+	retained := map[string]int{}
+	if supportsBoundaries {
+		for _, boundary := range cacheBoundaries(target, "") {
+			retained[boundary.identity]++
+		}
+	}
+	for _, boundary := range cacheBoundaries(source, "") {
+		if retained[boundary.identity] > 0 {
+			retained[boundary.identity]--
+			continue
+		}
+		Add(ctx, types.ConversionDiagnostic{Code: "cache_control_dropped", Path: boundary.path, Message: "The target request did not retain this cache_control boundary", Severity: types.ConversionDiagnosticWarning, From: from, To: to})
+	}
+}
+
+func cacheBoundaries(value any, path string) []cacheBoundary {
+	var boundaries []cacheBoundary
 	switch value := value.(type) {
 	case map[string]any:
 		keys := make([]string, 0, len(value))
@@ -24,18 +47,32 @@ func InspectCacheControls(ctx context.Context, value any, path string, from, to 
 				child = path + "." + key
 			}
 			if key == "cache_control" && value[key] != nil {
-				Add(ctx, types.ConversionDiagnostic{Code: "cache_control_dropped", Path: child, Message: "The target protocol cannot express explicit cache_control boundaries", Severity: types.ConversionDiagnosticWarning, From: from, To: to})
+				encoded, err := kitutil.Marshal(value[key])
+				if err != nil {
+					encoded = []byte("invalid")
+				}
+				anchor, _ := value["text"].(string)
+				if name, ok := value["name"].(string); ok {
+					anchor = "tool:" + name
+				}
+				if function, ok := value["function"].(map[string]any); ok {
+					if name, ok := function["name"].(string); ok {
+						anchor = "tool:" + name
+					}
+				}
+				boundaries = append(boundaries, cacheBoundary{path: child, identity: string(encoded) + "\x00" + anchor})
 				continue
 			}
-			// Schema properties and opaque tool inputs are user data, not controls.
+			// Schemas, metadata and opaque tool inputs are data, not controls.
 			if key == "properties" || key == "input" || key == "arguments" || key == "parameters" || key == "input_schema" || key == "metadata" || key == "responseSchema" || key == "responseJsonSchema" {
 				continue
 			}
-			InspectCacheControls(ctx, value[key], child, from, to)
+			boundaries = append(boundaries, cacheBoundaries(value[key], child)...)
 		}
 	case []any:
 		for i, child := range value {
-			InspectCacheControls(ctx, child, fmt.Sprintf("%s[%d]", path, i), from, to)
+			boundaries = append(boundaries, cacheBoundaries(child, fmt.Sprintf("%s[%d]", path, i))...)
 		}
 	}
+	return boundaries
 }

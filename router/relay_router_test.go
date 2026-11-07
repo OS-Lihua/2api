@@ -728,6 +728,91 @@ func TestTextGatewayMissingUsageIgnoresOutputCeilings(t *testing.T) {
 	}
 }
 
+func TestTextGatewayConvertedStreamInterruptionDoesNotComplete(t *testing.T) {
+	for _, endpoint := range []struct{ path, body, failure, forbidden string }{
+		{"/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stream":true}`, `"error"`, "[DONE]"},
+		{"/v1/responses", `{"model":"gateway-offering","input":"Hello","max_output_tokens":16,"stream":true}`, "event: response.failed", "event: response.completed"},
+		{"/v1/messages", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stream":true}`, "event: error", "event: message_stop"},
+		{"/v1beta/models/gateway-offering:streamGenerateContent?alt=sse", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16}}`, `"UNAVAILABLE"`, `"finishReason":"STOP"`},
+	} {
+		t.Run(endpoint.path, func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}\n\n"))
+			})
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "openai_responses").Error)
+			price := &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("request",fixed(0.01))`, EffectiveAt: clock.Now().Unix()}
+			require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, endpoint.path, endpoint.body)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), "Hello")
+			assert.Contains(t, response.Body.String(), endpoint.failure)
+			assert.NotContains(t, response.Body.String(), endpoint.forbidden)
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, "partial", record.Status)
+			assert.Zero(t, record.Receivable.Nanos)
+			attempts, _, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.Len(t, attempts, 1)
+			assert.Equal(t, int64(11000), attempts[0].Cost.Nanos)
+			assert.Equal(t, int64(9), attempts[0].Usage.PromptTokens)
+			assert.Equal(t, int64(1), attempts[0].Usage.CompletionTokens)
+		})
+	}
+}
+
+func TestTextGatewayRejectsInvalidProviderSettingsWithoutMutation(t *testing.T) {
+	for _, column := range []string{"setting", "settings"} {
+		t.Run(column, func(t *testing.T) {
+			calls := 0
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { calls++; w.WriteHeader(500) })
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update(column, "{").Error)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			assert.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+			assert.Zero(t, calls)
+			provider, err := model.GetProviderById(fixture.channel.ProviderID, true)
+			require.NoError(t, err)
+			if column == "setting" {
+				require.NotNil(t, provider.Setting)
+				assert.Equal(t, "{", *provider.Setting)
+			} else {
+				assert.Equal(t, "{", provider.OtherSettings)
+			}
+			_, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+			require.NoError(t, err)
+			assert.Zero(t, total)
+		})
+	}
+}
+
+func TestTextGatewayOpenRouterSystemCacheRequiresActualPreservation(t *testing.T) {
+	for _, test := range []struct {
+		upstream string
+		status   int
+	}{{"upstream-model", 400}, {"anthropic/claude-3-7-sonnet", 200}} {
+		t.Run(test.upstream, func(t *testing.T) {
+			calls := 0
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeOpenRouter).Error)
+			require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", test.upstream).Error)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/messages", `{"model":"gateway-offering","system":[{"type":"text","text":"System instructions","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			require.Equal(t, test.status, response.Code, response.Body.String())
+			if test.status == 400 {
+				assert.Zero(t, calls)
+				assert.Contains(t, response.Body.String(), "cache_control")
+			} else {
+				assert.Equal(t, 1, calls)
+				assert.Empty(t, response.Header().Get("X-Gateway-Conversion-Loss"))
+			}
+		})
+	}
+}
+
 func TestTextGatewayOpenRouterRetainsCacheBoundaries(t *testing.T) {
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		var sent map[string]any

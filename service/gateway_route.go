@@ -90,10 +90,23 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 				reason = "capability"
 				break
 			}
+			var providerSettings dto.ProviderSettings
+			if provider.Setting != nil && *provider.Setting != "" && common.UnmarshalJsonStr(*provider.Setting, &providerSettings) != nil {
+				reason = "configuration"
+				break
+			}
+			var otherSettings dto.ProviderOtherSettings
+			if provider.OtherSettings != "" && common.UnmarshalJsonStr(provider.OtherSettings, &otherSettings) != nil {
+				reason = "configuration"
+				break
+			}
+			if preset := common.GetAdvancedCustomPreset(provider.Type); preset != nil {
+				otherSettings.AdvancedCustom = preset
+			}
 			info.ProviderMeta = &relaycommon.ProviderMeta{
 				ChannelType: provider.Type, ChannelId: candidate.ProviderID,
 				UpstreamModelName: candidate.UpstreamModelName,
-				ChannelSetting:    provider.GetSetting(), ChannelOtherSettings: provider.GetOtherSettings(),
+				ChannelSetting:    providerSettings, ChannelOtherSettings: otherSettings,
 			}
 			info.ChannelOtherSettings.ToolLossPolicy = string(types.ConversionLossPolicyAllow)
 			conversion, err = PreconvertGatewayRequest(c, info, candidate.Protocol, original, accepted)

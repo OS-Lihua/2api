@@ -106,7 +106,12 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		}
 	})
 	info.StreamStatus.RequireTerminal()
-	if streamErr == nil && info.StreamStatus.IsNormalEnd() && !info.StreamStatus.ResponseFailed() {
+	outcome := info.StreamStatus.OutcomeSnapshot()
+	terminal := outcome.Response == relaycommon.ResponseOutcomeCompleted || outcome.Response == relaycommon.ResponseOutcomeUnknown && outcome.EndReason == relaycommon.StreamEndReasonDone
+	if streamErr == nil && (!info.StreamStatus.IsNormalEnd() || outcome.HasErrors || !terminal) {
+		streamErr = errors.New("upstream stream did not complete")
+	}
+	if streamErr == nil {
 		results, err := relayconvert.FinalizeStreamResponse(c, info, state)
 		streamErr = err
 		for _, result := range results {

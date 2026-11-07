@@ -10,7 +10,7 @@ import (
 
 // InspectRequestParameters reports cache and output-schema controls that the
 // converter actually omitted. It observes wire DTOs rather than converting them.
-func InspectRequestParameters(ctx context.Context, source, target any, from, to types.RelayFormat) error {
+func InspectRequestParameters(ctx context.Context, source, target any, from, to types.RelayFormat, openRouter bool) error {
 	beforeBody, err := kitutil.Marshal(source)
 	if err != nil {
 		return err
@@ -26,6 +26,7 @@ func InspectRequestParameters(ctx context.Context, source, target any, from, to 
 	if err := kitutil.Unmarshal(afterBody, &after); err != nil {
 		return err
 	}
+	InspectCacheControls(ctx, before, after, from, to, to == types.RelayFormatClaude || to == types.RelayFormatOpenAI && openRouter)
 	for _, key := range []string{"prompt_cache_key", "prompt_cache_options", "prompt_cache_retention", "cachedContent"} {
 		if before[key] != nil && after[key] == nil {
 			Add(ctx, types.ConversionDiagnostic{Code: "cache_parameter_dropped", Path: key, Message: "The target request omitted this cache parameter", Severity: types.ConversionDiagnosticWarning, From: from, To: to})

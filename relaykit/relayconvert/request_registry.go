@@ -16,7 +16,6 @@ import (
 	oaichat "github.com/QuantumNous/new-api/relaykit/relayconvert/internal/oai_chat"
 	oairesponses "github.com/QuantumNous/new-api/relaykit/relayconvert/internal/oai_responses"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/internal/toolconv"
-	"github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
@@ -264,17 +263,6 @@ func executeRequestSpec(c context.Context, info convmeta.Meta, from types.RelayF
 
 func executeRequestSteps(c context.Context, info convmeta.Meta, from types.RelayFormat, target types.RelayFormat, request any, converter string, quality RequestConverterQuality, specs []RequestConverterSpec) (*RequestResult, error) {
 	c, diagnosticCollector := convdiag.WithCollector(c)
-	if target != types.RelayFormatClaude && !(target == types.RelayFormatOpenAI && convmeta.OptionsOf(info).OpenRouterDialect) {
-		body, err := kitutil.Marshal(request)
-		if err != nil {
-			return nil, err
-		}
-		var value any
-		if err := kitutil.Unmarshal(body, &value); err != nil {
-			return nil, err
-		}
-		convdiag.InspectCacheControls(c, value, "", from, target)
-	}
 	current, tools, err := toolconv.ExtractRequest(from, request)
 	if err != nil {
 		return nil, err
@@ -292,7 +280,7 @@ func executeRequestSteps(c context.Context, info convmeta.Meta, from types.Relay
 	tools.Model = convmeta.UpstreamModelName(info)
 	current, toolDiagnostics, err := toolconv.AttachRequest(target, current, tools, convmeta.OptionsOf(info))
 	if err == nil {
-		err = convdiag.InspectRequestParameters(c, request, current, from, target)
+		err = convdiag.InspectRequestParameters(c, request, current, from, target, convmeta.OptionsOf(info).OpenRouterDialect)
 	}
 	diagnostics := append(diagnosticCollector.Diagnostics(), toolDiagnostics...)
 	for i := range diagnostics {

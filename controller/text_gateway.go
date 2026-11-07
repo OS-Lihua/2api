@@ -31,9 +31,13 @@ import (
 
 func gatewayError(c *gin.Context, status int, code, message string) {
 	kind, _ := middleware.TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
+	streaming := c.Writer.Written() && strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream")
+	var payload gin.H
+	event := ""
 	switch kind {
 	case protocol.AnthropicMessages:
-		c.AbortWithStatusJSON(status, gin.H{"type": "error", "error": gin.H{"type": code, "message": message}})
+		payload = gin.H{"type": "error", "error": gin.H{"type": code, "message": message}}
+		event = "error"
 	case protocol.GeminiGenerate:
 		googleStatus := "UNAVAILABLE"
 		if status == http.StatusBadRequest {
@@ -42,9 +46,31 @@ func gatewayError(c *gin.Context, status int, code, message string) {
 		if status == http.StatusNotFound {
 			googleStatus = "NOT_FOUND"
 		}
-		c.AbortWithStatusJSON(status, gin.H{"error": gin.H{"code": status, "status": googleStatus, "message": message, "details": []gin.H{{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": code, "domain": "gateway"}}}})
+		payload = gin.H{"error": gin.H{"code": status, "status": googleStatus, "message": message, "details": []gin.H{{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": code, "domain": "gateway"}}}}
 	default:
-		c.AbortWithStatusJSON(status, gin.H{"error": types.OpenAIError{Code: code, Type: "gateway_error", Message: message}})
+		protocolError := types.OpenAIError{Code: code, Type: "gateway_error", Message: message}
+		payload = gin.H{"error": protocolError}
+		if kind == protocol.OpenAIResponses && streaming {
+			event = "response.failed"
+			payload = gin.H{"type": event, "response": gin.H{"id": helper.GetResponseID(c), "object": "response", "status": "failed", "output": []any{}, "error": protocolError}}
+		}
+	}
+	if !streaming {
+		c.AbortWithStatusJSON(status, payload)
+		return
+	}
+	encoded, err := common.Marshal(payload)
+	if err == nil {
+		if event == "" {
+			err = helper.StringData(c, string(encoded))
+		} else {
+			err = helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: event}, string(encoded))
+		}
+	}
+	if err != nil {
+		if facts, ok := common.GetContextKeyType[*relaycommon.ResponseFacts](c, constant.ContextKeyResponseFacts); ok {
+			facts.DownstreamWriteFailed = true
+		}
 	}
 }
 
@@ -239,7 +265,11 @@ func TextGateway(c *gin.Context) {
 		return
 	}
 	common.SetContextKey(c, constant.ContextKeyOriginalModel, info.TokenizerModel)
-	estimatedInput, err := service.CountRequestToken(c, effective.GetTokenCountMeta(), info)
+	// Every effective request above is a Chat projection. Its framing estimate
+	// must not vary with the downstream presentation protocol.
+	counterInfo := *info
+	counterInfo.RelayFormat = types.RelayFormatOpenAI
+	estimatedInput, err := service.CountRequestToken(c, effective.GetTokenCountMeta(), &counterInfo)
 	if err != nil || !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, estimatedInput) {
 		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
 		return
@@ -473,7 +503,7 @@ func TextGateway(c *gin.Context) {
 	result, responseErr := adaptor.DoResponse(c, httpResponse, info)
 	usage, _ = result.(*dto.Usage)
 	attemptErr = responseErr
-	if responseErr != nil && !c.Writer.Written() {
+	if responseErr != nil && (!c.Writer.Written() || info.IsStream && !info.ResponseFacts.DownstreamWriteFailed && c.Request.Context().Err() == nil) {
 		gatewayError(c, http.StatusBadGateway, "upstream_error", "Upstream response failed")
 	}
 }
