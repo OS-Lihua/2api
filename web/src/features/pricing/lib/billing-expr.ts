@@ -238,6 +238,7 @@ export type ParamHeaderCondition = {
   path: string
   mode: string
   value: string
+  literalType?: 'string' | 'number' | 'boolean'
 }
 
 export type TimeCondition = {
@@ -500,11 +501,15 @@ function tryParseRequestCondition(expr: string): RequestCondition | null {
   if (m) {
     const parsedValue = parseExprLiteral(m[3])
     if (parsedValue === null) return null
+    let literalType: ParamHeaderCondition['literalType'] = 'boolean'
+    if (m[3].trim().startsWith('"')) literalType = 'string'
+    else if (NUMERIC_LITERAL_REGEX.test(m[3].trim())) literalType = 'number'
     return {
       source: m[1] as 'param' | 'header',
       path: m[2],
       mode: MATCH_EQ,
-      value: String(parsedValue),
+      value: parsedValue,
+      literalType,
     }
   }
 
@@ -768,6 +773,7 @@ export function normalizeCondition(
     path: phCond?.path || '',
     mode,
     value: phCond?.value == null ? '' : String(phCond.value),
+    ...(phCond?.literalType ? { literalType: phCond.literalType } : {}),
   }
 }
 
@@ -775,7 +781,12 @@ export function normalizeCondition(
 // Editor: build expression strings
 // ---------------------------------------------------------------------------
 
-function buildExprLiteral(mode: string, value: string): string {
+function buildExprLiteral(
+  mode: string,
+  value: string,
+  literalType?: ParamHeaderCondition['literalType']
+): string {
+  if (literalType === 'string') return JSON.stringify(value)
   const text = String(value || '').trim()
   if (mode === MATCH_CONTAINS) return JSON.stringify(text)
   if (text === 'true' || text === 'false') return text
@@ -850,8 +861,26 @@ function buildRequestConditionExpr(cond: RequestCondition): string {
       return `${sourceExpr} != nil && ${sourceExpr} ${opMap[normalized.mode]} ${numText}`
     }
     case MATCH_EQ:
-    default:
-      return `${sourceExpr} == ${buildExprLiteral(normalized.mode, normalized.value)}`
+    default: {
+      const value = normalized.value.trim()
+      if (
+        normalized.literalType === 'number' &&
+        !NUMERIC_LITERAL_REGEX.test(value)
+      ) {
+        return ''
+      }
+      if (
+        normalized.literalType === 'boolean' &&
+        value !== 'true' &&
+        value !== 'false'
+      ) {
+        return ''
+      }
+      const literalType =
+        normalized.literalType ??
+        (normalized.source === 'header' ? 'string' : undefined)
+      return `${sourceExpr} == ${buildExprLiteral(normalized.mode, normalized.value, literalType)}`
+    }
   }
 }
 
