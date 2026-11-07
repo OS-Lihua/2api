@@ -52,6 +52,11 @@ func TestKeyPermissionsLegacyAllowlistMigration(t *testing.T) {
 
 func TestKeyPermissionsDiscoveryProtocols(t *testing.T) {
 	f := newTextGatewayFixture(t, func(http.ResponseWriter, *http.Request) { t.Error("unexpected dispatch") })
+	for _, path := range []string{"/v1/models/", "/v1/models/gateway-alias/"} {
+		response := adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, path+"?limit=7", "")
+		assert.Equal(t, http.StatusMovedPermanently, response.Code, response.Body.String())
+		assert.Equal(t, strings.TrimSuffix(path, "/")+"?limit=7", response.Header().Get("Location"))
+	}
 	for _, tc := range []struct{ path, header, field string }{{"/v1/models/gateway-alias", "x-api-key", "type"}, {"/v1beta/models/gateway-alias", "x-goog-api-key", "name"}} {
 		request := httptest.NewRequest(http.MethodGet, tc.path, nil)
 		request.Header.Set(tc.header, f.token.Key)
@@ -166,8 +171,9 @@ func TestKeyPermissionsIdentityVisibilityAndDeletion(t *testing.T) {
 	response := adminSecurityRequest(f.engine, pat, http.MethodPut, endpoint, fmt.Sprintf(`{"default_allow":false,"exception_ids":[%d],"revision":0}`, f.offering.ID))
 	require.Equal(t, 200, response.Code, response.Body.String())
 	f.offering.Name = "namespace/renamed-offering"
+	f.offering.Aliases = append(f.offering.Aliases, "namespace/trailing/")
 	require.NoError(t, model.SaveModelOffering(t.Context(), f.offering, "save"))
-	for _, name := range []string{"gateway-offering", "gateway-alias", "namespace/renamed-offering"} {
+	for _, name := range []string{"gateway-offering", "gateway-alias", "namespace/renamed-offering", "namespace%2Ftrailing%2F"} {
 		detail := adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, "/v1/models/"+name, "")
 		require.Equal(t, 200, detail.Code, detail.Body.String())
 		assert.Contains(t, detail.Body.String(), `"id":"namespace/renamed-offering"`)

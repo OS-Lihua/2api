@@ -1,6 +1,7 @@
 package router
 
 import (
+	"net/http"
 	"strings"
 
 	"github.com/QuantumNous/new-api/constant"
@@ -20,6 +21,19 @@ func SetRelayRouter(router *gin.Engine) {
 	// https://platform.openai.com/docs/api-reference/introduction
 	modelsRouter := router.Group("/v1/models")
 	modelsRouter.Use(middleware.RouteTag("relay"))
+	modelsRouter.Use(func(c *gin.Context) {
+		path := c.Request.URL.EscapedPath()
+		if c.Request.Method == http.MethodGet && strings.HasSuffix(path, "/") {
+			target := strings.TrimSuffix(path, "/")
+			if query := c.Request.URL.RawQuery; query != "" {
+				target += "?" + query
+			}
+			c.Redirect(http.StatusMovedPermanently, target)
+			c.Abort()
+			return
+		}
+		c.Next()
+	})
 	modelsRouter.Use(middleware.DisableCache(), middleware.TokenAuth())
 	{
 		modelsRouter.GET("", func(c *gin.Context) {
