@@ -66,6 +66,9 @@ func gatewayPreparationRejection(err error, budget *service.GatewayAttemptBudget
 	native := rejection.ToOpenAIError()
 	code, _ := native.Code.(string)
 	result.Failure = service.ClassifyGatewayFailure(rejection.StatusCode, code, false, budget.TimedOut(), parent.Err() != nil, false, native.Type)
+	if result.Failure.Class == "credentials" {
+		logger.LogError(parent, common.LogText("Provider credential authentication rejected request=%q provider=%d category=credentials_rejected", requestID, providerID))
+	}
 	if result.Failure.ExcludeProvider {
 		result.SkippedProvider = providerID
 	}

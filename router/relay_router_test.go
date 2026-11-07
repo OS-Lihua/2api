@@ -756,6 +756,7 @@ func TestTextGatewayBaiduTokenExpiryAndRejectionControls(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			tokens, models := 0, 0
+			logPath := captureGatewayDebugLog(t)
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				if r.URL.Path == "/oauth/2.0/token" {
@@ -774,6 +775,12 @@ func TestTextGatewayBaiduTokenExpiryAndRejectionControls(t *testing.T) {
 				_, _ = w.Write([]byte(`{"result":"Hello","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
 			})
 			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeBaidu, "key": "expiry37-" + t.Name() + "|fake"}).Error)
+			if test.reject != "" {
+				addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+				})
+			}
 			var provider model.Provider
 			require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
 			endpoint, err := url.Parse(*provider.BaseURL)
@@ -801,6 +808,20 @@ func TestTextGatewayBaiduTokenExpiryAndRejectionControls(t *testing.T) {
 				assert.Equal(t, 200, response.Code, response.Body.String())
 				assert.Equal(t, 2, tokens)
 				assert.Equal(t, 2, models)
+			} else if test.reject != "" {
+				assert.Equal(t, 1, tokens)
+				assert.Zero(t, models)
+				assert.Contains(t, response.Body.String(), "Recovered")
+				logged, err := os.ReadFile(logPath)
+				require.NoError(t, err)
+				assert.Contains(t, string(logged), "category=credentials_rejected")
+				assert.Contains(t, string(logged), fmt.Sprintf("provider=%d", fixture.channel.ProviderID))
+				assert.Contains(t, string(logged), response.Header().Get(common.RequestIdKey))
+				assert.NotContains(t, string(logged), "private-token-secret")
+				assert.NotContains(t, string(logged), "expiry37-"+t.Name()+"|fake")
+				_, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+				require.NoError(t, err)
+				assert.EqualValues(t, 1, total)
 			} else {
 				assert.Equal(t, 1, tokens)
 				assert.Zero(t, models)
