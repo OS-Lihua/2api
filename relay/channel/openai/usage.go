@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relay/channel"
@@ -8,6 +9,24 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/gin-gonic/gin"
 )
+
+// observeMediaUsage preserves each reported counter, including explicit zero,
+// across OpenAI-compatible image and audio response envelopes.
+func observeMediaUsage(info *relaycommon.RelayInfo, usage *dto.Usage, body []byte) {
+	if info.ResponseFacts == nil || usage == nil {
+		return
+	}
+	prompt, completion := relaycommon.MediaUsagePresence(body)
+	if prompt && ojson.GetBytes(body, "usage.input_tokens").Exists() {
+		usage.PromptTokens = usage.InputTokens
+	}
+	if completion && ojson.GetBytes(body, "usage.output_tokens").Exists() {
+		usage.CompletionTokens = usage.OutputTokens
+	}
+	info.ResponseFacts.PromptTokensReported = info.ResponseFacts.PromptTokensReported || prompt
+	info.ResponseFacts.CompletionTokensReported = info.ResponseFacts.CompletionTokensReported || completion
+	info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
+}
 
 func applyProtocolUsagePostProcessing(c *gin.Context, info *relaycommon.RelayInfo, usage *dto.Usage, responseBody []byte) {
 	if !channel.RepairProviderUsage(c, usage, responseBody) {

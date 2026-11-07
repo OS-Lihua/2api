@@ -33,6 +33,9 @@ func (a *ChannelAdaptor) PrepareMediaRequest(c *gin.Context, info *relaycommon.R
 	if parsed.Protocol != a.kind {
 		return nil, fmt.Errorf("media protocol mismatch")
 	}
+	if contentType := parsed.Input.Headers["content-type"]; contentType != "" {
+		c.Request.Header.Set("Content-Type", contentType)
+	}
 	var request dto.Request
 	switch original := parsed.Request.(type) {
 	case *dto.ImageRequest:
@@ -149,7 +152,13 @@ func (a *ChannelAdaptor) PrepareMediaRequest(c *gin.Context, info *relaycommon.R
 		if effective.Model != info.UpstreamModelName {
 			return nil, fmt.Errorf("audio model override is not allowed")
 		}
+		if a.kind == protocol.OpenAIAudioSpeech && (effective.Input == "" || effective.Voice == "") {
+			return nil, fmt.Errorf("speech input and voice are required")
+		}
 		result.Request = &effective
+	}
+	if result.Request.IsStream(c.Request) != parsed.Request.IsStream(c.Request) {
+		return nil, fmt.Errorf("media stream mode override is not allowed")
 	}
 	result.Input.Body = body
 	if form != nil {
@@ -204,5 +213,6 @@ func (a *ChannelAdaptor) PrepareMediaRequest(c *gin.Context, info *relaycommon.R
 	for key, values := range result.Prepared.Headers() {
 		result.Input.Headers[strings.ToLower(key)] = strings.Join(values, ",")
 	}
+	info.Request = result.Request
 	return result, nil
 }

@@ -84,6 +84,9 @@ func TestImageMoneyGatewayReportsPayloadAndUsageFacts(t *testing.T) {
 }
 
 func TestMediaAudioGatewayReportsDeliveryAndExplicitZero(t *testing.T) {
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previousTimeout })
 	for _, tc := range []struct {
 		name, body         string
 		mode               int
@@ -92,6 +95,8 @@ func TestMediaAudioGatewayReportsDeliveryAndExplicitZero(t *testing.T) {
 	}{
 		{"speech PCM", strings.Repeat("x", 48000), relayconstant.RelayModeAudioSpeech, "pcm", true, false},
 		{"empty speech", "", relayconstant.RelayModeAudioSpeech, "pcm", false, false},
+		{"speech SSE", "data: {\"type\":\"speech.audio.delta\",\"audio\":\"eHg=\"}\n\ndata: {\"type\":\"speech.audio.done\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}\n\ndata: [DONE]\n\n", relayconstant.RelayModeAudioSpeech, "pcm_sse", true, true},
+		{"speech metadata SSE", "data: {\"type\":\"speech.audio.done\"}\n\ndata: [DONE]\n\n", relayconstant.RelayModeAudioSpeech, "pcm_sse", false, false},
 		{"transcription zero", `{"text":"hello","usage":{"input_tokens":0,"output_tokens":0}}`, relayconstant.RelayModeAudioTranscription, "json", true, true},
 		{"transcription without usage", `{"text":"hello"}`, relayconstant.RelayModeAudioTranscription, "json", true, false},
 		{"empty transcription", `{"text":""}`, relayconstant.RelayModeAudioTranscription, "json", false, false},
@@ -101,11 +106,35 @@ func TestMediaAudioGatewayReportsDeliveryAndExplicitZero(t *testing.T) {
 			info.RelayMode = tc.mode
 			info.ResponseFacts = &relaycommon.ResponseFacts{}
 			info.Request = &dto.AudioRequest{ResponseFormat: tc.format}
+			if tc.format == "pcm_sse" {
+				info.IsStream = true
+				info.Request = &dto.AudioRequest{ResponseFormat: "pcm", StreamFormat: "sse"}
+			}
 			_, apiErr := (&Adaptor{ResponseFormat: tc.format}).DoResponse(c, response, info)
 			require.Nil(t, apiErr)
-			assert.Equal(t, tc.body, recorder.Body.String())
+			if tc.format != "pcm_sse" {
+				assert.Equal(t, tc.body, recorder.Body.String())
+			}
 			assert.Equal(t, tc.business, info.ResponseFacts.BusinessOutput)
 			assert.Equal(t, tc.reported, info.ResponseFacts.UsageReported)
+		})
+	}
+}
+
+func TestMediaErrorUsageRetainedWithoutDelivery(t *testing.T) {
+	for _, mode := range []int{relayconstant.RelayModeImagesGenerations, relayconstant.RelayModeAudioSpeech, relayconstant.RelayModeAudioTranscription} {
+		t.Run(fmt.Sprint(mode), func(t *testing.T) {
+			c, recorder, response, info := newImageTestContext(t, `{"error":{"type":"upstream_error","message":"private"},"usage":{"input_tokens":7,"output_tokens":0}}`, "application/json", false)
+			response.StatusCode = http.StatusServiceUnavailable
+			info.RelayMode = mode
+			info.ResponseFacts = &relaycommon.ResponseFacts{}
+			result, _ := (&Adaptor{ResponseFormat: "json"}).DoResponse(c, response, info)
+			require.NotNil(t, result)
+			usage := result.(*dto.Usage)
+			assert.Equal(t, 7, usage.PromptTokens)
+			assert.True(t, info.ResponseFacts.UsageReported)
+			assert.False(t, info.ResponseFacts.BusinessOutput)
+			assert.Empty(t, recorder.Body.String())
 		})
 	}
 }

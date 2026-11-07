@@ -66,6 +66,10 @@ type ResponseFacts struct {
 	// ImageCount is the bounded payload count, including an empty response.
 	// Nil means that an actual count is not yet known.
 	ImageCount *int64
+	// Media duration strings are finite decimal quantities, never money.
+	AudioInputSeconds   *string
+	AudioOutputSeconds  *string
+	GeneratedAudioBytes int64
 }
 
 func (info *RelayInfo) TokenizerModelName() string {

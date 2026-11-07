@@ -613,6 +613,50 @@ it('shows missing optional usage and charge fields without inventing zero usage 
   expect(within(drawer).queryByText('Purchase cost')).not.toBeInTheDocument()
 })
 
+it('shows actual media quantities including zero in request rows and attempts without inventing token usage', async () => {
+  api.defaults.adapter = async (config) => ({
+    config,
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+    data: {
+      success: true,
+      data: {
+        items: [
+          {
+            ...(config.url?.endsWith('/attempts') ? attempt : request),
+            usage: {
+              image_count: 0,
+              audio_input_seconds: '1.25',
+              audio_output_seconds: '0',
+            },
+            usage_source: 'none',
+          },
+        ],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      },
+    },
+  })
+  const user = userEvent.setup()
+  renderRequests()
+  expect(await screen.findByText('Image count: 0')).toBeVisible()
+  expect(screen.getByText('Input audio duration: 1.25 seconds')).toBeVisible()
+  expect(screen.getByText('Output audio duration: 0 seconds')).toBeVisible()
+  expect(screen.queryByText('Total tokens: 0')).not.toBeInTheDocument()
+  await user.click(
+    screen.getByRole('button', {
+      name: `View attempts for request ${requestId}`,
+    })
+  )
+  const drawer = await screen.findByRole('dialog', { name: 'Request attempts' })
+  expect(await within(drawer).findByText('Image count: 0')).toBeVisible()
+  expect(
+    within(drawer).getByText('Input audio duration: 1.25 seconds')
+  ).toBeVisible()
+})
+
 it('updates the exact charge separators when the interface language changes', async () => {
   i18next.addResourceBundle('fr', 'translation', fr.translation)
   i18next.addResourceBundle('zhTW', 'translation', zhTW.translation)

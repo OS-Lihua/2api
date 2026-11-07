@@ -18,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/tokenkit"
 
 	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
 )
 
 func getImageToken(c *gin.Context, fileMeta *types.FileMeta, model string, stream bool) (int, error) {
@@ -85,6 +86,10 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 			}
 			if info.ResponseFacts != nil && (math.IsNaN(duration) || math.IsInf(duration, 0) || duration < 0 || duration > relaycommon.MaxTaskDurationSeconds) {
 				return 0, errors.New("audio duration exceeds the request limit")
+			}
+			if info.ResponseFacts != nil {
+				seconds := decimal.NewFromFloat(duration).String()
+				info.ResponseFacts.AudioInputSeconds = &seconds
 			}
 			tokens, clamp := common.AudioDurationTokens(duration)
 			if clamp != nil {

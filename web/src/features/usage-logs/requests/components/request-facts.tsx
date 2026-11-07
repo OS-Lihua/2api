@@ -110,7 +110,11 @@ export function RequestUsageFacts(props: {
 }) {
   const { t, i18n } = useTranslation()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
-  if (!props.usage || props.source === 'none') {
+  const hasMediaQuantities =
+    props.usage?.image_count !== undefined ||
+    props.usage?.audio_input_seconds !== undefined ||
+    props.usage?.audio_output_seconds !== undefined
+  if (!props.usage || (props.source === 'none' && !hasMediaQuantities)) {
     return (
       <span className='text-muted-foreground text-xs'>
         {t('No usage available')}
@@ -119,11 +123,32 @@ export function RequestUsageFacts(props: {
   }
   return (
     <div className='space-y-1 text-xs'>
-      <div className='tabular-nums'>
-        {t('Input')}: {formatNumber(props.usage.prompt_tokens, locale)} ·{' '}
-        {t('Output')}: {formatNumber(props.usage.completion_tokens, locale)}
-      </div>
-      {props.usage.total_tokens !== undefined && (
+      {props.source !== 'none' && (
+        <div className='tabular-nums'>
+          {t('Input')}: {formatNumber(props.usage.prompt_tokens, locale)} ·{' '}
+          {t('Output')}: {formatNumber(props.usage.completion_tokens, locale)}
+        </div>
+      )}
+      {props.usage.image_count !== undefined && (
+        <div className='tabular-nums'>
+          {t('Image count')}: {formatNumber(props.usage.image_count, locale)}
+        </div>
+      )}
+      {props.usage.audio_input_seconds !== undefined && (
+        <div className='tabular-nums'>
+          {t('Input audio duration')}:{' '}
+          {formatNumber(Number(props.usage.audio_input_seconds), locale)}{' '}
+          {t('seconds')}
+        </div>
+      )}
+      {props.usage.audio_output_seconds !== undefined && (
+        <div className='tabular-nums'>
+          {t('Output audio duration')}:{' '}
+          {formatNumber(Number(props.usage.audio_output_seconds), locale)}{' '}
+          {t('seconds')}
+        </div>
+      )}
+      {props.source !== 'none' && props.usage.total_tokens !== undefined && (
         <div className='text-muted-foreground'>
           {t('Total tokens')}: {formatNumber(props.usage.total_tokens, locale)}
         </div>

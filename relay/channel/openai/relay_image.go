@@ -37,7 +37,12 @@ func OpenaiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 
+	normalizeOpenAIUsage(&usageResp.Usage)
+	observeMediaUsage(info, &usageResp.Usage, responseBody)
 	if oaiError := usageResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
+		if info.ResponseFacts != nil {
+			return &usageResp.Usage, types.WithOpenAIError(*oaiError, resp.StatusCode)
+		}
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
 
@@ -47,10 +52,7 @@ func OpenaiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 		if count <= dto.MaxImageN {
 			info.ResponseFacts.ImageCount = &count
 		}
-		info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported = relaycommon.MediaUsagePresence(responseBody)
-		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-			normalizeOpenAIUsage(&usageResp.Usage)
 			return &usageResp.Usage, types.NewError(fmt.Errorf("upstream image request failed"), types.ErrorCodeBadResponse)
 		}
 	}
@@ -177,6 +179,7 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 			normalizeOpenAIUsage(&chunk.Usage)
 			if info.ResponseFacts != nil {
 				prompt, completion := relaycommon.MediaUsagePresence(raw)
+				observeMediaUsage(info, &chunk.Usage, raw)
 				if prompt {
 					usage.PromptTokens = chunk.Usage.PromptTokens
 					usage.PromptTokensDetails = chunk.Usage.PromptTokensDetails
@@ -319,10 +322,14 @@ func openaiImageJSONAsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 	if err := common.Unmarshal(responseBody, &usageResp); err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
+	normalizeOpenAIUsage(&usageResp.Usage)
+	observeMediaUsage(info, &usageResp.Usage, responseBody)
 	if oaiError := usageResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
+		if info.ResponseFacts != nil {
+			return &usageResp.Usage, types.WithOpenAIError(*oaiError, resp.StatusCode)
+		}
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
-	normalizeOpenAIUsage(&usageResp.Usage)
 	applyUsagePostProcessing(info, &usageResp.Usage, responseBody)
 
 	info.UpdateImageCount(openaiImageResponseCount(responseBody))
@@ -331,8 +338,7 @@ func openaiImageJSONAsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 		if count <= dto.MaxImageN {
 			info.ResponseFacts.ImageCount = &count
 		}
-		info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported = relaycommon.MediaUsagePresence(responseBody)
-		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
+		observeMediaUsage(info, &usageResp.Usage, responseBody)
 	}
 
 	helper.SetEventStreamHeaders(c)

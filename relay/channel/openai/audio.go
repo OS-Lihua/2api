@@ -2,6 +2,8 @@ package openai
 
 import (
 	"bytes"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -17,6 +19,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
 )
 
 func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) *dto.Usage {
@@ -28,6 +31,21 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	// and can be terminated directly.
 	defer service.CloseResponseBodyGracefully(resp)
 	usage := &dto.Usage{}
+	if info.ResponseFacts != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices) {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return usage
+		}
+		var envelope struct {
+			Usage dto.Usage `json:"usage"`
+		}
+		if common.Unmarshal(body, &envelope) == nil {
+			usage = &envelope.Usage
+			normalizeOpenAIUsage(usage)
+			observeMediaUsage(info, usage, body)
+		}
+		return usage
+	}
 	usage.PromptTokens = info.GetEstimatePromptTokens()
 	usage.TotalTokens = info.GetEstimatePromptTokens()
 	for k, v := range resp.Header {
@@ -38,7 +56,79 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	}
 	c.Writer.WriteHeader(resp.StatusCode)
 
-	if info.IsStream {
+	if info.IsStream && info.ResponseFacts != nil {
+		var audioBytes int64
+		helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+			var chunk struct {
+				Type  string     `json:"type"`
+				Audio string     `json:"audio"`
+				Delta string     `json:"delta"`
+				Usage *dto.Usage `json:"usage"`
+			}
+			if err := common.UnmarshalJsonStr(data, &chunk); err != nil {
+				sr.Stop(err)
+				return
+			}
+			if chunk.Usage != nil {
+				normalizeOpenAIUsage(chunk.Usage)
+				prompt, completion := relaycommon.MediaUsagePresence([]byte(data))
+				observeMediaUsage(info, chunk.Usage, []byte(data))
+				if prompt {
+					usage.PromptTokens, usage.PromptTokensDetails = chunk.Usage.PromptTokens, chunk.Usage.PromptTokensDetails
+				}
+				if completion {
+					usage.CompletionTokens, usage.CompletionTokenDetails = chunk.Usage.CompletionTokens, chunk.Usage.CompletionTokenDetails
+				}
+			}
+			var business bool
+			if chunk.Type == "speech.audio.delta" {
+				encoded := chunk.Audio
+				if encoded == "" {
+					encoded = chunk.Delta
+				}
+				audio, err := base64.StdEncoding.DecodeString(encoded)
+				if err != nil || int64(len(audio)) > math.MaxInt64-audioBytes {
+					sr.Stop(errors.New("invalid speech audio chunk"))
+					return
+				}
+				audioBytes += int64(len(audio))
+				business = len(audio) > 0
+			}
+			writeErr := helper.StringData(c, data)
+			var flushErr *helper.StreamFlushError
+			if business && (writeErr == nil || errors.As(writeErr, &flushErr)) {
+				info.ResponseFacts.BusinessOutput = true
+			}
+			if writeErr != nil {
+				info.ResponseFacts.DownstreamWriteFailed = true
+				sr.Stop(writeErr)
+			}
+		})
+		info.ResponseFacts.GeneratedAudioBytes = audioBytes
+		if request, ok := info.Request.(*dto.AudioRequest); ok && request.ResponseFormat == "pcm" {
+			seconds := decimal.NewFromInt(audioBytes).Div(decimal.NewFromInt(48000)).String()
+			info.ResponseFacts.AudioOutputSeconds = &seconds
+		}
+		if !info.ResponseFacts.CompletionTokensReported && audioBytes > 0 {
+			var tokens int
+			var clamp *common.QuotaClamp
+			if request, ok := info.Request.(*dto.AudioRequest); ok && request.ResponseFormat == "pcm" {
+				tokens, clamp = common.AudioDurationTokens(float64(audioBytes) / 48000)
+			} else {
+				tokens, clamp = common.QuotaRoundChecked(math.Ceil(float64(audioBytes) / 1000))
+			}
+			usage.CompletionTokens, usage.CompletionTokenDetails.AudioTokens = tokens, tokens
+			if clamp != nil {
+				info.QuotaClamp = clamp
+			}
+		}
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+		if info.StreamStatus != nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone {
+			if err := helper.StringData(c, "[DONE]"); err != nil {
+				info.ResponseFacts.DownstreamWriteFailed = true
+			}
+		}
+	} else if info.IsStream {
 		helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 			if service.SundaySearch(data, "usage") {
 				var simpleResponse dto.SimpleResponse
@@ -98,7 +188,14 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			duration, durationErr = common.GetAudioDuration(c.Request.Context(), reader, ext)
 		}
 
+		if info.ResponseFacts != nil {
+			info.ResponseFacts.GeneratedAudioBytes = int64(len(bodyBytes))
+		}
 		usage.PromptTokensDetails.TextTokens = usage.PromptTokens
+		if info.ResponseFacts != nil && durationErr == nil && !math.IsNaN(duration) && !math.IsInf(duration, 0) && duration >= 0 {
+			seconds := decimal.NewFromFloat(duration).String()
+			info.ResponseFacts.AudioOutputSeconds = &seconds
+		}
 
 		if durationErr != nil {
 			logger.LogWarn(c, common.LogText("failed to get audio duration: %v", durationErr))
@@ -142,6 +239,10 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		Text  string     `json:"text"`
 	}
 	decodeErr := common.Unmarshal(responseBody, &responseData)
+	if decodeErr == nil && responseData.Usage != nil {
+		normalizeOpenAIUsage(responseData.Usage)
+		observeMediaUsage(info, responseData.Usage, responseBody)
+	}
 	if info.ResponseFacts != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices) {
 		return types.NewError(fmt.Errorf("upstream transcription request failed"), types.ErrorCodeBadResponse), responseData.Usage
 	}

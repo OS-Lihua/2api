@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/money"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/shopspring/decimal"
@@ -207,9 +208,15 @@ func exactGatewayTokens(usage *dto.Usage, used map[string]bool) (map[string]deci
 		"cr": cr, "cc": cc, "cc1h": cc1h, "cc12h": cc12h, "img": img, "img_cr": imgCR, "img_o": imgO, "ai": ai, "ao": ao}, nil
 }
 
-func GatewayRecordUsage(usage *dto.Usage) model.GatewayUsage {
+func GatewayRecordUsage(usage *dto.Usage, facts ...*relaycommon.ResponseFacts) model.GatewayUsage {
 	if usage == nil {
 		return model.GatewayUsage{}
 	}
-	return model.GatewayUsage{PromptTokens: int64(usage.PromptTokens), CompletionTokens: int64(usage.CompletionTokens), TotalTokens: int64(usage.PromptTokens) + int64(usage.CompletionTokens), CachedTokens: int64(usage.PromptTokensDetails.CachedTokens), CacheCreationTokens: int64(usage.PromptTokensDetails.CacheCreationTokensTotal()), CacheCreation12hTokens: int64(usage.PromptTokensDetails.CacheWrite12hTokens()), ImageInputTokens: int64(usage.PromptTokensDetails.ImageTokens), AudioInputTokens: int64(usage.PromptTokensDetails.AudioTokens), ImageOutputTokens: int64(usage.CompletionTokenDetails.ImageTokens), AudioOutputTokens: int64(usage.CompletionTokenDetails.AudioTokens)}
+	record := model.GatewayUsage{PromptTokens: int64(usage.PromptTokens), CompletionTokens: int64(usage.CompletionTokens), TotalTokens: int64(usage.PromptTokens) + int64(usage.CompletionTokens), CachedTokens: int64(usage.PromptTokensDetails.CachedTokens), CacheCreationTokens: int64(usage.PromptTokensDetails.CacheCreationTokensTotal()), CacheCreation12hTokens: int64(usage.PromptTokensDetails.CacheWrite12hTokens()), ImageInputTokens: int64(usage.PromptTokensDetails.ImageTokens), AudioInputTokens: int64(usage.PromptTokensDetails.AudioTokens), ImageOutputTokens: int64(usage.CompletionTokenDetails.ImageTokens), AudioOutputTokens: int64(usage.CompletionTokenDetails.AudioTokens)}
+	if len(facts) > 0 && facts[0] != nil {
+		record.ImageCount = facts[0].ImageCount
+		record.AudioInputSeconds = facts[0].AudioInputSeconds
+		record.AudioOutputSeconds = facts[0].AudioOutputSeconds
+	}
+	return record
 }
