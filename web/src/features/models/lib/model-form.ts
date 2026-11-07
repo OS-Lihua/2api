@@ -18,7 +18,14 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { z } from 'zod'
 
-import type { Model } from '../types'
+import {
+  MODEL_CAPABILITY_FEATURES,
+  MODEL_CAPABILITY_LIMITS,
+  MODEL_MODALITIES,
+  type Model,
+  type ModelCapabilities,
+  type ModelCapabilityLimit,
+} from '../types'
 import { parseModelTags as parseTagsFromUtils } from './model-utils'
 
 // ============================================================================
@@ -57,6 +64,66 @@ export const MODEL_FORM_DEFAULT_VALUES: ModelFormValues = {
   sync_official: true,
   enable_groups: [],
   quota_types: [],
+}
+
+// ============================================================================
+// Capability Form Schema
+// ============================================================================
+
+const capabilityLimitSchema = z
+  .string()
+  .trim()
+  .refine((value) => value === '' || /^[1-9]\d*$/.test(value), {
+    message: 'Enter a positive integer',
+  })
+
+/**
+ * Capability form. Limits are text inputs; an empty limit is not declared.
+ */
+export const capabilityFormSchema = z.object({
+  features: z.array(z.enum(MODEL_CAPABILITY_FEATURES)),
+  input_modalities: z.array(z.enum(MODEL_MODALITIES)),
+  output_modalities: z.array(z.enum(MODEL_MODALITIES)),
+  limits: z.object(
+    Object.fromEntries(
+      MODEL_CAPABILITY_LIMITS.map((limit) => [limit, capabilityLimitSchema])
+    ) as Record<ModelCapabilityLimit, typeof capabilityLimitSchema>
+  ),
+})
+
+export type CapabilityFormValues = z.infer<typeof capabilityFormSchema>
+
+export function transformCapabilitiesToFormValues(
+  capabilities: ModelCapabilities | undefined
+): CapabilityFormValues {
+  const limits = Object.fromEntries(
+    MODEL_CAPABILITY_LIMITS.map((limit) => {
+      const value = capabilities?.limits?.[limit]
+      return [limit, value === undefined ? '' : String(value)]
+    })
+  ) as Record<ModelCapabilityLimit, string>
+  return {
+    features: capabilities?.features ?? [],
+    input_modalities: capabilities?.input_modalities ?? [],
+    output_modalities: capabilities?.output_modalities ?? [],
+    limits,
+  }
+}
+
+export function transformFormValuesToCapabilities(
+  values: CapabilityFormValues
+): ModelCapabilities {
+  const limits: ModelCapabilities['limits'] = {}
+  for (const limit of MODEL_CAPABILITY_LIMITS) {
+    const value = values.limits[limit].trim()
+    if (value !== '') limits[limit] = Number(value)
+  }
+  return {
+    features: values.features,
+    input_modalities: values.input_modalities,
+    output_modalities: values.output_modalities,
+    limits,
+  }
 }
 
 // ============================================================================

@@ -18,7 +18,14 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import type { TFunction } from 'i18next'
 
-import type { NameRule, ModelStatus, SyncSource } from './types'
+import type {
+  ModelCapabilityFeature,
+  ModelCapabilityLimit,
+  ModelModality,
+  NameRule,
+  ModelStatus,
+  SyncSource,
+} from './types'
 
 // ============================================================================
 // Pagination
@@ -29,6 +36,42 @@ export const DEFAULT_PAGE_SIZE = 20
 // ============================================================================
 // Name Rule Options
 // ============================================================================
+
+export function getCapabilityFeatureOptions(
+  t: TFunction
+): { value: ModelCapabilityFeature; label: string }[] {
+  return [
+    { value: 'streaming', label: t('Streaming') },
+    { value: 'tool_calling', label: t('Tool calling') },
+    { value: 'reasoning', label: t('Reasoning') },
+    { value: 'structured_output', label: t('Structured output') },
+    { value: 'caching', label: t('Caching') },
+  ]
+}
+
+export function getModalityOptions(
+  t: TFunction
+): { value: ModelModality; label: string }[] {
+  return [
+    { value: 'text', label: t('Text') },
+    { value: 'image', label: t('Image') },
+    { value: 'audio', label: t('Audio') },
+    { value: 'video', label: t('Video') },
+    { value: 'pdf', label: t('PDF') },
+  ]
+}
+
+export function getCapabilityLimitOptions(
+  t: TFunction
+): { value: ModelCapabilityLimit; label: string }[] {
+  return [
+    { value: 'context_length', label: t('Context length (tokens)') },
+    { value: 'max_output_tokens', label: t('Max output tokens') },
+    { value: 'max_images', label: t('Max images') },
+    { value: 'max_duration_seconds', label: t('Max duration (seconds)') },
+    { value: 'embedding_dimensions', label: t('Embedding dimensions') },
+  ]
+}
 
 export function getNameRuleOptions(t: TFunction) {
   return [

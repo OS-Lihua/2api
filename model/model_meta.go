@@ -2,11 +2,13 @@ package model
 
 import (
 	"errors"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/capability"
 
 	"gorm.io/gorm"
 )
@@ -33,19 +35,21 @@ type BoundChannel struct {
 }
 
 type Model struct {
-	Id                 int            `json:"id"`
-	ModelName          string         `json:"model_name" gorm:"size:128;not null;uniqueIndex:uk_model_name_delete_at,priority:1"`
-	Description        string         `json:"description,omitempty" gorm:"type:text"`
-	Icon               string         `json:"icon,omitempty" gorm:"type:varchar(128)"`
-	Tags               string         `json:"tags,omitempty" gorm:"type:varchar(255)"`
-	VendorID           int            `json:"vendor_id,omitempty" gorm:"index"`
-	Endpoints          string         `json:"endpoints,omitempty" gorm:"type:text"`
-	SupportedEndpoints []string       `json:"supported_endpoints,omitempty" gorm:"-"`
-	Status             int            `json:"status" gorm:"default:1"`
-	SyncOfficial       int            `json:"sync_official" gorm:"default:1"`
-	CreatedTime        int64          `json:"created_time" gorm:"bigint"`
-	UpdatedTime        int64          `json:"updated_time" gorm:"bigint"`
-	DeletedAt          gorm.DeletedAt `json:"-" gorm:"index;uniqueIndex:uk_model_name_delete_at,priority:2"`
+	Id                 int      `json:"id"`
+	ModelName          string   `json:"model_name" gorm:"size:128;not null;uniqueIndex:uk_model_name_delete_at,priority:1"`
+	Description        string   `json:"description,omitempty" gorm:"type:text"`
+	Icon               string   `json:"icon,omitempty" gorm:"type:varchar(128)"`
+	Tags               string   `json:"tags,omitempty" gorm:"type:varchar(255)"`
+	VendorID           int      `json:"vendor_id,omitempty" gorm:"index"`
+	Endpoints          string   `json:"endpoints,omitempty" gorm:"type:text"`
+	SupportedEndpoints []string `json:"supported_endpoints,omitempty" gorm:"-"`
+	// Capabilities applies to exact-name Models only; rule rows leave it empty.
+	Capabilities capability.Set `json:"capabilities" gorm:"type:jsonb"`
+	Status       int            `json:"status" gorm:"default:1"`
+	SyncOfficial int            `json:"sync_official" gorm:"default:1"`
+	CreatedTime  int64          `json:"created_time" gorm:"bigint"`
+	UpdatedTime  int64          `json:"updated_time" gorm:"bigint"`
+	DeletedAt    gorm.DeletedAt `json:"-" gorm:"index;uniqueIndex:uk_model_name_delete_at,priority:2"`
 
 	BoundChannels []BoundChannel `json:"bound_channels,omitempty" gorm:"-"`
 	EnableGroups  []string       `json:"enable_groups,omitempty" gorm:"-"`
@@ -258,15 +262,57 @@ func IsModelNameDuplicated(id int, name string) (bool, error) {
 	return cnt > 0, err
 }
 
+var modelMetadataColumns = []string{"model_name", "description", "icon", "tags", "vendor_id", "endpoints", "status", "sync_official", "name_rule", "updated_time"}
+
+// Update saves metadata and leaves the capability declaration unchanged.
 func (mi *Model) Update() error {
+	return mi.updateColumns(modelMetadataColumns)
+}
+
+// UpdateDeclaration saves metadata and the capability declaration.
+func (mi *Model) UpdateDeclaration() error {
+	return mi.updateColumns(append(slices.Clone(modelMetadataColumns), "capabilities"))
+}
+
+func (mi *Model) updateColumns(columns []string) error {
 	return metadataTransaction(func(tx *gorm.DB) error {
 		if err := validateModelVendor(tx, mi.VendorID); err != nil {
 			return err
 		}
 		mi.UpdatedTime = common.GetTimestamp()
-		return tx.Model(&Model{}).Where("id = ?", mi.Id).
-			Select("model_name", "description", "icon", "tags", "vendor_id", "endpoints", "status", "sync_official", "name_rule", "updated_time").Updates(mi).Error
+		return tx.Model(&Model{}).Where("id = ?", mi.Id).Select(columns).Updates(mi).Error
 	})
+}
+
+// GetExactModel returns a Model by ID. Rule rows only match catalog names and
+// are not Models, so they are reported as gorm.ErrRecordNotFound.
+func GetExactModel(id int) (*Model, error) {
+	var record Model
+	if err := DB.Where("id = ? AND name_rule = ?", id, NameRuleExact).First(&record).Error; err != nil {
+		return nil, err
+	}
+	return &record, nil
+}
+
+// SearchExactModels lists exact-name Models. publisherID 0 matches every
+// Publisher.
+func SearchExactModels(keyword string, publisherID int, offset, limit int) ([]*Model, int64, error) {
+	db := DB.Model(&Model{}).Where("name_rule = ?", NameRuleExact)
+	if keyword != "" {
+		db = db.Where("model_name ILIKE ?", "%"+keyword+"%")
+	}
+	if publisherID != 0 {
+		db = db.Where("vendor_id = ?", publisherID)
+	}
+	var total int64
+	if err := db.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	models := []*Model{}
+	if err := db.Order("id DESC").Offset(offset).Limit(limit).Find(&models).Error; err != nil {
+		return nil, 0, err
+	}
+	return models, total, nil
 }
 
 func (mi *Model) Delete() error {
