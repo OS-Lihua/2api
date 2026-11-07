@@ -16,7 +16,20 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { useQueryClient } from '@tanstack/react-query'
+import { useTranslation } from 'react-i18next'
+
+import {
+  deleteDisabledMultiKeys,
+  deleteMultiKey,
+  disableAllMultiKeys,
+  disableMultiKey,
+  enableAllMultiKeys,
+  enableMultiKey,
+  getMultiKeyStatus,
+} from '../api'
 import { CHANNEL_TYPE_VLLM, CHANNEL_TYPE_SGLANG } from '../constants'
+import { channelsQueryKeys } from '../lib'
 import { useChannels } from './channels-provider'
 import { BalanceQueryDialog } from './dialogs/balance-query-dialog'
 import { ChannelTestDialog } from './dialogs/channel-test-dialog'
@@ -24,13 +37,28 @@ import { CopyChannelDialog } from './dialogs/copy-channel-dialog'
 import { EditTagDialog } from './dialogs/edit-tag-dialog'
 import { FetchModelsDialog } from './dialogs/fetch-models-dialog'
 import { InferenceStatusDialog } from './dialogs/inference-status-dialog'
-import { MultiKeyManageDialog } from './dialogs/multi-key-manage-dialog'
+import {
+  type MultiKeyApi,
+  MultiKeyManageDialog,
+} from './dialogs/multi-key-manage-dialog'
 import { OllamaModelsDialog } from './dialogs/ollama-models-dialog'
 import { TagBatchEditDialog } from './dialogs/tag-batch-edit-dialog'
 import { UpstreamUpdateDialog } from './dialogs/upstream-update-dialog'
 import { ChannelMutateDrawer } from './drawers/channel-mutate-drawer'
 
+const channelMultiKeyApi: MultiKeyApi = {
+  getStatus: getMultiKeyStatus,
+  enable: enableMultiKey,
+  disable: disableMultiKey,
+  remove: deleteMultiKey,
+  enableAll: enableAllMultiKeys,
+  disableAll: disableAllMultiKeys,
+  deleteDisabled: deleteDisabledMultiKeys,
+}
+
 export function ChannelsDialogs() {
+  const { t } = useTranslation()
+  const queryClient = useQueryClient()
   const { open, setOpen, currentRow, upstream } = useChannels()
 
   return (
@@ -91,6 +119,14 @@ export function ChannelsDialogs() {
       <MultiKeyManageDialog
         open={open === 'multi-key-manage'}
         onOpenChange={(v) => !v && setOpen(null)}
+        target={currentRow}
+        keyApi={channelMultiKeyApi}
+        description={t(
+          'Manage multi-key status and configuration for this channel'
+        )}
+        onKeysChanged={() =>
+          queryClient.invalidateQueries({ queryKey: channelsQueryKeys.lists() })
+        }
       />
 
       {/* Tag Batch Edit Dialog */}

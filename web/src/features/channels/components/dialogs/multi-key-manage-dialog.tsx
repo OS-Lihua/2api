@@ -16,7 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useQueryClient } from '@tanstack/react-query'
 import { Loader2, RefreshCw, Trash2, Power, PowerOff } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -45,40 +44,63 @@ import { handleServerError } from '@/lib/handle-server-error'
 import { getServerMessage } from '@/lib/server-error-message'
 import { useAuthStore } from '@/stores/auth-store'
 
-import {
-  getMultiKeyStatus,
-  enableMultiKey,
-  disableMultiKey,
-  deleteMultiKey,
-  enableAllMultiKeys,
-  disableAllMultiKeys,
-  deleteDisabledMultiKeys,
-} from '../../api'
 import { MULTI_KEY_FILTER_OPTIONS } from '../../constants'
 import {
-  channelsQueryKeys,
   formatTimestamp,
   getMultiKeyStatusConfig,
   getMultiKeyConfirmMessage,
   isDestructiveAction,
 } from '../../lib'
-import type { KeyStatus, MultiKeyConfirmAction } from '../../types'
-import { useChannels } from '../channels-provider'
+import type {
+  KeyStatus,
+  MultiKeyConfirmAction,
+  MultiKeyStatusResponse,
+} from '../../types'
 import { StatisticsCard } from './multi-key-statistics-card'
 import { MultiKeyTableRowActions } from './multi-key-table-row-actions'
+
+type MultiKeyActionResponse = { success: boolean; message?: string }
+
+/** Key operations of one multi-key credential owner, addressed by its ID. */
+export type MultiKeyApi = {
+  getStatus: (
+    id: number,
+    page: number,
+    pageSize: number,
+    status?: number
+  ) => Promise<MultiKeyStatusResponse>
+  enable: (id: number, keyIndex: number) => Promise<MultiKeyActionResponse>
+  disable: (id: number, keyIndex: number) => Promise<MultiKeyActionResponse>
+  remove: (id: number, keyIndex: number) => Promise<MultiKeyActionResponse>
+  enableAll: (id: number) => Promise<MultiKeyActionResponse>
+  disableAll: (id: number) => Promise<MultiKeyActionResponse>
+  deleteDisabled: (id: number) => Promise<MultiKeyActionResponse>
+}
+
+export type MultiKeyTarget = {
+  id: number
+  name: string
+  channel_info?: { multi_key_mode?: string }
+}
 
 type MultiKeyManageDialogProps = {
   open: boolean
   onOpenChange: (open: boolean) => void
+  target: MultiKeyTarget | null
+  keyApi: MultiKeyApi
+  description: string
+  onKeysChanged: () => void
 }
 
 export function MultiKeyManageDialog({
   open,
   onOpenChange,
+  target: currentRow,
+  keyApi,
+  description,
+  onKeysChanged,
 }: MultiKeyManageDialogProps) {
   const { t } = useTranslation()
-  const { currentRow } = useChannels()
-  const queryClient = useQueryClient()
   const currentUser = useAuthStore((s) => s.auth.user)
   const canEditSensitive = hasPermission(
     currentUser,
@@ -122,7 +144,7 @@ export function MultiKeyManageDialog({
 
     setIsLoading(true)
     try {
-      const response = await getMultiKeyStatus(
+      const response = await keyApi.getStatus(
         currentRow.id,
         page,
         size,
@@ -178,22 +200,22 @@ export function MultiKeyManageDialog({
 
       // Execute the appropriate action
       if (type === 'enable' && keyIndex !== undefined) {
-        response = await enableMultiKey(currentRow.id, keyIndex)
+        response = await keyApi.enable(currentRow.id, keyIndex)
       } else if (type === 'disable' && keyIndex !== undefined) {
-        response = await disableMultiKey(currentRow.id, keyIndex)
+        response = await keyApi.disable(currentRow.id, keyIndex)
       } else if (type === 'delete' && keyIndex !== undefined) {
-        response = await deleteMultiKey(currentRow.id, keyIndex)
+        response = await keyApi.remove(currentRow.id, keyIndex)
       } else if (type === 'enable-all') {
-        response = await enableAllMultiKeys(currentRow.id)
+        response = await keyApi.enableAll(currentRow.id)
       } else if (type === 'disable-all') {
-        response = await disableAllMultiKeys(currentRow.id)
+        response = await keyApi.disableAll(currentRow.id)
       } else if (type === 'delete-disabled') {
-        response = await deleteDisabledMultiKeys(currentRow.id)
+        response = await keyApi.deleteDisabled(currentRow.id)
       }
 
       if (response?.success) {
         toast.success(getServerMessage(response) || t('Operation successful'))
-        queryClient.invalidateQueries({ queryKey: channelsQueryKeys.lists() })
+        onKeysChanged()
 
         // Reload data - reset to page 1 for bulk actions
         const isBulkAction = type.includes('all') || type === 'delete-disabled'
@@ -259,9 +281,7 @@ export function MultiKeyManageDialog({
             )}
           </>
         }
-        description={t(
-          'Manage multi-key status and configuration for this channel'
-        )}
+        description={description}
         contentClassName='flex max-h-[min(90dvh,var(--dialog-available-height))] max-w-5xl flex-col'
         titleClassName='flex items-center gap-2'
         contentHeight='min(72vh, 720px)'
