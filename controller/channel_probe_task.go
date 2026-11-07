@@ -184,6 +184,8 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 		operation = "generate"
 		if result.Capability == "input_image" {
 			operation = "edit"
+			delete(body, "images")
+			body["image"] = "data:image/png;base64," + base64.StdEncoding.EncodeToString(probeRedImage)
 		}
 	case "openai_video":
 		switch result.Capability {

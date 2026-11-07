@@ -19,7 +19,7 @@ func RecoverInterruptedChannelProbes(ctx context.Context) error {
 // ProbeConfigurationHash binds observations to the Channel configuration that
 // generated them without persisting parameter contents in the observation.
 func (c Channel) ProbeConfigurationHash() string {
-	payload, _ := common.Marshal([]any{c.ProviderID, c.ModelID, c.Protocol, c.UpstreamModelName, c.ParameterOverrides, c.Capabilities})
+	payload, _ := common.Marshal([]any{c.ProviderID, c.ModelID, c.Protocol, c.UpstreamModelName, c.ParameterOverrides, c.Capabilities, c.Model.Capabilities})
 	return fmt.Sprintf("%x", sha256.Sum256(payload))
 }
 

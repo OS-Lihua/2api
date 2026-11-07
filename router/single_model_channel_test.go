@@ -321,7 +321,7 @@ func TestSingleModelChannelAPI(t *testing.T) {
 		defer func() { jsplugin.DefaultRegistry = previousRegistry }()
 		source := `export const meta={apiVersion:1,key:"probe",name:"Probe",version:"1.0.0",author:{name:"Test"},models:["task-probe-upstream"],fetchMode:"per_task",protocols:[{name:"openai_video"},{name:"openai_responses",supports:["stream","sync"]}]};
 export const protocols={openai_responses:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,requestBody:ctx.body.value}},renderFinal(){return {output:[{type:"message",role:"assistant",content:[{type:"output_text",text:"red",annotations:[],logprobs:[]}]}]}},renderEvents(){return {events:[{type:"output",data:"streamed"}],done:true}}},openai_video:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,requestBody:ctx.body.value}},render(ctx,task){return {id:task.task_id,status:"completed"}}}};
-export function buildSubmitRequest(ctx){const body={model:ctx.upstreamModel,prompt:ctx.requestBody.prompt,seconds:4};if(ctx.requestBody.max_output_tokens!==undefined)body.max_output_tokens=ctx.requestBody.max_output_tokens;if(ctx.requestBody.images!==undefined)body.images=ctx.requestBody.images;if(ctx.requestBody.input_reference!==undefined)body.input_reference=ctx.requestBody.input_reference;return {url:ctx.baseUrl+"/submit",method:"POST",headers:{Authorization:"Bearer "+ctx.apiKey},body:body}}
+export function buildSubmitRequest(ctx){const body={model:ctx.upstreamModel,prompt:ctx.requestBody.prompt,seconds:4};if(ctx.requestBody.max_output_tokens!==undefined)body.max_output_tokens=ctx.requestBody.max_output_tokens;if(ctx.requestBody.image!==undefined)body.image=ctx.requestBody.image;if(ctx.requestBody.images!==undefined)body.images=ctx.requestBody.images;if(ctx.requestBody.input_reference!==undefined)body.input_reference=ctx.requestBody.input_reference;return {url:ctx.baseUrl+"/submit",method:"POST",headers:{Authorization:"Bearer "+ctx.apiKey},body:body}}
 export function parseSubmitResponse(ctx,r){return {taskId:r.body.id,taskData:r.body}}
 export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/poll/"+ctx.taskId,headers:{Authorization:"Bearer "+ctx.apiKey}}}
 export function parseTaskResult(ctx,body){return {status:body.status,taskId:body.id,progress:"100%"}}
@@ -510,6 +510,41 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 		_, after := call(http.MethodGet, channelPath, "")
 		assert.Equal(t, created["data"], after["data"])
 	})
+	t.Run("installed image edit decoders forward the reference through their native request", func(t *testing.T) {
+		previousRegistry := jsplugin.DefaultRegistry
+		jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+		defer func() { jsplugin.DefaultRegistry = previousRegistry }()
+		previousToken := token
+		token = createWalletTestAccessToken(t, root.Id, "channel:read", "channel:write", "channel:operate", "task_plugin:bind")
+		defer func() { token = previousToken }()
+		for _, tc := range []struct{ key, model string }{{"alibaba", "qwen-image-edit"}, {"doubao", "doubao-seedream-5-0-pro-260628"}} {
+			t.Run(tc.key, func(t *testing.T) {
+				source, err := os.ReadFile("../plugins/tasks/" + tc.key + "/plugin.js")
+				require.NoError(t, err)
+				_, err = jsplugin.DefaultRegistry.RegisterFactory(string(source), jsplugin.Options{Key: tc.key})
+				require.NoError(t, err)
+				var calls atomic.Int32
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					body, err := io.ReadAll(r.Body)
+					require.NoError(t, err)
+					image, err := os.ReadFile("../controller/probe-fixtures/red.png")
+					require.NoError(t, err)
+					assert.Contains(t, string(body), base64.StdEncoding.EncodeToString(image))
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(`{"error":"synthetic rejection after decoding"}`))
+				}))
+				defer upstream.Close()
+				require.NoError(t, db.Model(&provider).Update("base_url", upstream.URL).Error)
+				status, created := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":%q,"upstream_model_name":%q}`, provider.Id, unified.Id, "task:"+tc.key, tc.model))
+				require.Equal(t, http.StatusOK, status, created)
+				status, result := call(http.MethodPost, fmt.Sprintf("/api/admin/v1/channels/%v/probes", created["data"].(map[string]any)["id"]), `{"capability":"input_image"}`)
+				require.Equal(t, http.StatusOK, status, result)
+				assert.Equal(t, "upstream_rejected", result["data"].(map[string]any)["reason"], result)
+				assert.EqualValues(t, 1, calls.Load())
+			})
+		}
+	})
 	t.Run("one active probe per channel prevents duplicate upstream work", func(t *testing.T) {
 		started := make(chan struct{})
 		release := make(chan struct{})
@@ -559,6 +594,17 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.cdn_url)return {u
 		require.Equal(t, http.StatusOK, status, restored)
 		_, current := call(http.MethodGet, path+"/probes", "")
 		assert.NotEmpty(t, current["data"].(map[string]any)["results"])
+		parentDeclaration := unified.Capabilities
+		changedDeclaration := parentDeclaration
+		changedDeclaration.Limits.MaxOutputTokens = common.GetPointer(int64(128))
+		parentJSON, err := common.Marshal(changedDeclaration)
+		require.NoError(t, err)
+		require.NoError(t, db.Model(&unified).Update("capabilities", string(parentJSON)).Error)
+		_, stale = call(http.MethodGet, path+"/probes", "")
+		assert.Empty(t, stale["data"].(map[string]any)["results"])
+		parentJSON, err = common.Marshal(parentDeclaration)
+		require.NoError(t, err)
+		require.NoError(t, db.Model(&unified).Update("capabilities", string(parentJSON)).Error)
 		status, edited = call(http.MethodPatch, path, `{"parameter_overrides":{"metadata":{"probe_config_marker":"changed"}}}`)
 		require.Equal(t, http.StatusOK, status, edited)
 		_, stale = call(http.MethodGet, path+"/probes", "")
