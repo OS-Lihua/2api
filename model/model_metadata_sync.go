@@ -262,6 +262,13 @@ func ApplyMetadataSync(updates []MetadataSyncUpdate, upstreamVendors map[string]
 				}
 				result.CreatedModels = append(result.CreatedModels, update.ModelName)
 			} else {
+				if _, changesRule := fields["name_rule"]; changesRule {
+					candidate := *locals[update.ModelName]
+					candidate.NameRule = update.Values.NameRule
+					if err := candidate.validateChannelDeclarations(tx, false); err != nil {
+						return err
+					}
+				}
 				if err := tx.Model(&Model{}).Where("id = ?", locals[update.ModelName].Id).Updates(fields).Error; err != nil {
 					return err
 				}

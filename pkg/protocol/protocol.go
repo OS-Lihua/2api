@@ -5,6 +5,7 @@ package protocol
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -23,7 +24,12 @@ const (
 	Rerank                   Type = "rerank"
 )
 
-var pluginKey = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
+var pluginKey = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,29}$`)
+
+// Builtins returns the supported non-task protocols in display order.
+var builtinTypes = []Type{OpenAIChat, OpenAIResponses, AnthropicMessages, GeminiGenerate, OpenAIEmbeddings, GeminiEmbed, OpenAIImages, OpenAIAudioSpeech, OpenAIAudioTranscription, Rerank}
+
+func Builtins() []Type { return slices.Clone(builtinTypes) }
 
 func (t Type) TaskPluginKey() (string, bool) {
 	key, ok := strings.CutPrefix(string(t), "task:")
@@ -31,8 +37,7 @@ func (t Type) TaskPluginKey() (string, bool) {
 }
 
 func (t Type) Validate() error {
-	switch t {
-	case OpenAIChat, OpenAIResponses, AnthropicMessages, GeminiGenerate, OpenAIEmbeddings, GeminiEmbed, OpenAIImages, OpenAIAudioSpeech, OpenAIAudioTranscription, Rerank:
+	if slices.Contains(builtinTypes, t) {
 		return nil
 	}
 	if _, ok := t.TaskPluginKey(); ok {
