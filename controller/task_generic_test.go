@@ -29,7 +29,7 @@ func setupGenericTaskTest(t *testing.T) *model.Task {
 	originalDB := model.DB
 	previousRedisEnabled := common.RedisEnabled
 	common.RedisEnabled = false
-	database := openTaskTestDatabase(t, &model.Task{}, &model.Channel{}, &model.User{})
+	database := openTaskTestDatabase(t, &model.Task{}, &model.Provider{}, &model.User{})
 	model.DB = database
 	t.Cleanup(func() {
 		model.DB = originalDB
@@ -41,7 +41,7 @@ func setupGenericTaskTest(t *testing.T) *model.Task {
 		Role: common.RoleCommonUser, Group: "default",
 	}).Error)
 	baseURL := "https://example.com"
-	require.NoError(t, database.Create(&model.Channel{
+	require.NoError(t, database.Create(&model.Provider{
 		Id: 1, Name: "artifact", Key: "key", BaseURL: &baseURL, Status: common.ChannelStatusEnabled,
 	}).Error)
 	task := &model.Task{
@@ -368,7 +368,7 @@ func TestDisabledArtifactStorePreservesPluginUpstreamContent(t *testing.T) {
 	common.MemoryCacheEnabled = false
 	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
 
-	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", task.ChannelId).Updates(map[string]any{
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", task.ChannelId).Updates(map[string]any{
 		"type":            constant.ChannelTypeGemini,
 		"key":             "provider-key",
 		"base_url":        upstream.URL,
@@ -442,7 +442,7 @@ func TestTaskArtifactContentFollowsHailuoRetrieveLink(t *testing.T) {
 	common.MemoryCacheEnabled = false
 	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
 
-	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", task.ChannelId).Updates(map[string]any{
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", task.ChannelId).Updates(map[string]any{
 		"type":     constant.ChannelTypeMiniMax,
 		"key":      "provider-key",
 		"base_url": upstream.URL,

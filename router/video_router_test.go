@@ -27,7 +27,7 @@ func TestGetOpenAIVideoRouteRendersJimengTask(t *testing.T) {
 		common.RedisEnabled = previousRedisEnabled
 	})
 	database := model.UseTestDatabases(t)
-	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Task{}))
+	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Token{}, &model.Provider{}, &model.Task{}))
 
 	require.NoError(t, database.Create(&model.User{
 		Id:          91,
@@ -47,7 +47,7 @@ func TestGetOpenAIVideoRouteRendersJimengTask(t *testing.T) {
 		ExpiredTime:    -1,
 		UnlimitedQuota: true,
 	}).Error)
-	require.NoError(t, database.Create(&model.Channel{
+	require.NoError(t, database.Create(&model.Provider{
 		Id:     17,
 		Type:   constant.ChannelTypeJimeng,
 		Key:    "unused",
@@ -141,7 +141,7 @@ func TestGetOpenAIVideoRouteRendersJimengTask(t *testing.T) {
 
 func TestGetOpenAIVideoRouteHandsNativeXAITaskToPluginQuery(t *testing.T) {
 	setupRelayRouterTestDB(t)
-	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Task{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.Provider{}, &model.Task{}))
 	require.NoError(t, model.DB.Create(&model.User{Id: 92, Username: "xai-fetch-user", Status: common.UserStatusEnabled, Group: "default", Quota: 100}).Error)
 	require.NoError(t, model.DB.Create(&model.Token{UserId: 92, Key: "xaifetch", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}).Error)
 	for taskID, requestPath := range map[string]string{"task_xai_native": "/v1/videos/generations", "task_xai_pinned": "/xai/v1/videos/generations", "task_xai_openai": "/v1/videos"} {

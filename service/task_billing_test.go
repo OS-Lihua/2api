@@ -48,7 +48,7 @@ func TestMain(m *testing.M) {
 		&model.User{},
 		&model.Token{},
 		&model.Log{},
-		&model.Channel{},
+		&model.Provider{},
 		&model.Midjourney{},
 		&model.TopUp{},
 		&model.UserSubscription{},
@@ -74,7 +74,7 @@ func truncate(t *testing.T) {
 		model.DB.Exec("DELETE FROM users")
 		model.DB.Exec("DELETE FROM tokens")
 		model.ClearTestLogTable("logs")
-		model.DB.Exec("DELETE FROM channels")
+		model.DB.Exec("DELETE FROM providers")
 		model.DB.Exec("DELETE FROM midjourneys")
 		model.DB.Exec("DELETE FROM top_ups")
 		model.DB.Exec("DELETE FROM user_subscriptions")
@@ -119,7 +119,7 @@ func seedSubscription(t *testing.T, id int, userId int, amountTotal int64, amoun
 
 func seedChannel(t *testing.T, id int) {
 	t.Helper()
-	ch := &model.Channel{Id: id, Name: "test_channel", Key: "sk-test", Status: common.ChannelStatusEnabled}
+	ch := &model.Provider{Id: id, Name: "test_channel", Key: "sk-test", Status: common.ChannelStatusEnabled}
 	require.NoError(t, model.DB.Create(ch).Error)
 }
 
@@ -129,7 +129,7 @@ func seedChargedAccounting(t *testing.T, userID, channelID, tokenID, quota, requ
 		"used_quota":    quota,
 		"request_count": requestCount,
 	}).Error)
-	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", channelID).
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", channelID).
 		Update("used_quota", quota).Error)
 	if tokenID > 0 {
 		require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).
@@ -529,7 +529,7 @@ func getUserUsageAccounting(t *testing.T, id int) (int, int) {
 
 func getChannelUsedQuota(t *testing.T, id int) int64 {
 	t.Helper()
-	var channel model.Channel
+	var channel model.Provider
 	require.NoError(t, model.DB.Select("used_quota").Where("id = ?", id).First(&channel).Error)
 	return channel.UsedQuota
 }

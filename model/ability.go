@@ -25,16 +25,16 @@ type Ability struct {
 	Tag       *string `json:"tag" gorm:"index"`
 }
 
-type AbilityWithChannel struct {
+type AbilityWithProvider struct {
 	Ability
 	ChannelType int `json:"channel_type"`
 }
 
-func GetAllEnableAbilityWithChannels() ([]AbilityWithChannel, error) {
-	var abilities []AbilityWithChannel
+func GetAllEnableAbilityWithProviders() ([]AbilityWithProvider, error) {
+	var abilities []AbilityWithProvider
 	err := DB.Table("abilities").
-		Select("abilities.*, channels.type as channel_type").
-		Joins("left join channels on abilities.channel_id = channels.id").
+		Select("abilities.*, providers.type as channel_type").
+		Joins("left join providers on abilities.channel_id = providers.id").
 		Where("abilities.enabled = ?", true).
 		Scan(&abilities).Error
 	return abilities, err
@@ -105,12 +105,12 @@ func getChannelQuery(group string, model string, retry int) (*gorm.DB, error) {
 	return channelQuery, nil
 }
 
-func GetChannel(
+func GetProvider(
 	group string,
 	model string,
 	retry int,
 	filters []dto.ChannelFilter,
-) (*Channel, error) {
+) (*Provider, error) {
 	var abilities []Ability
 	err := DB.Where(`"group" = ? and model = ? and enabled = ?`, group, model, true).Order("priority DESC, weight DESC").Find(&abilities).Error
 	if err != nil {
@@ -148,7 +148,7 @@ func GetChannel(
 			return ability.Priority == nil && targetPriority == 0 || ability.Priority != nil && *ability.Priority == targetPriority
 		})
 	}
-	channel := Channel{}
+	channel := Provider{}
 	if len(abilities) > 0 {
 		// Randomly choose one
 		weightSum := uint(0)
@@ -190,7 +190,7 @@ func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters
 		channelIds = append(channelIds, ability.ChannelId)
 	}
 
-	var channels []*Channel
+	var channels []*Provider
 	if err := DB.Where("id IN ?", channelIds).Find(&channels).Error; err != nil {
 		if identityFilterRequiresKey(filters) {
 			return nil
@@ -198,7 +198,7 @@ func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters
 		return abilities
 	}
 
-	channelsByID := make(map[int]*Channel, len(channels))
+	channelsByID := make(map[int]*Provider, len(channels))
 	for _, channel := range channels {
 		channelsByID[channel.Id] = channel
 	}
@@ -206,7 +206,7 @@ func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters
 	filtered := make([]Ability, 0, len(abilities))
 	for _, ability := range abilities {
 		channel := channelsByID[ability.ChannelId]
-		if ok, _ := ChannelSatisfiesFilters(channel, modelName, filters); ok {
+		if ok, _ := ProviderSatisfiesFilters(channel, modelName, filters); ok {
 			filtered = append(filtered, ability)
 		}
 	}
@@ -222,7 +222,7 @@ func identityFilterRequiresKey(filters []dto.ChannelFilter) bool {
 	return false
 }
 
-func (channel *Channel) AddAbilities(tx *gorm.DB) error {
+func (channel *Provider) AddAbilities(tx *gorm.DB) error {
 	models_ := strings.Split(channel.Models, ",")
 	groups_ := strings.Split(channel.Group, ",")
 	abilitySet := make(map[string]struct{})
@@ -263,13 +263,13 @@ func (channel *Channel) AddAbilities(tx *gorm.DB) error {
 	return nil
 }
 
-func (channel *Channel) DeleteAbilities() error {
+func (channel *Provider) DeleteAbilities() error {
 	return DB.Where("channel_id = ?", channel.Id).Delete(&Ability{}).Error
 }
 
 // UpdateAbilities updates abilities of this channel.
 // Make sure the channel is completed before calling this function.
-func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
+func (channel *Provider) UpdateAbilities(tx *gorm.DB) error {
 	isNewTx := false
 	// 如果没有传入事务，创建新的事务
 	if tx == nil {
@@ -375,9 +375,9 @@ func FixAbility() (int, int, error) {
 		common.SysLog(common.LogText("Truncate abilities failed: %s", err.Error()))
 		return 0, 0, err
 	}
-	var channels []*Channel
+	var channels []*Provider
 	// Find all channels
-	err := DB.Model(&Channel{}).Find(&channels).Error
+	err := DB.Model(&Provider{}).Find(&channels).Error
 	if err != nil {
 		return 0, 0, err
 	}
@@ -387,7 +387,7 @@ func FixAbility() (int, int, error) {
 	successCount := 0
 	failCount := 0
 	for _, chunk := range lo.Chunk(channels, 50) {
-		ids := lo.Map(chunk, func(c *Channel, _ int) int { return c.Id })
+		ids := lo.Map(chunk, func(c *Provider, _ int) int { return c.Id })
 		// Delete all abilities of this channel
 		err = DB.Where("channel_id IN ?", ids).Delete(&Ability{}).Error
 		if err != nil {
@@ -406,6 +406,6 @@ func FixAbility() (int, int, error) {
 			}
 		}
 	}
-	InitChannelCache()
+	InitProviderCache()
 	return successCount, failCount, nil
 }

@@ -2852,12 +2852,12 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 	model.DB = database
 	t.Cleanup(func() {
 		model.DB = previousDB
-		model.InitChannelCache()
+		model.InitProviderCache()
 	})
-	require.NoError(t, database.AutoMigrate(&model.Channel{}))
-	require.NoError(t, database.Create(&model.Channel{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: "key",
+	require.NoError(t, database.AutoMigrate(&model.Provider{}))
+	require.NoError(t, database.Create(&model.Provider{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: "key",
 		Models: "claimed-alias", ModelMapping: common.GetPointer(`{"claimed-alias":"claimed-model"}`)}).Error)
-	model.InitChannelCache()
+	model.InitProviderCache()
 	for _, testCase := range []struct {
 		name, betaModel, prepared string
 		wantError                 bool

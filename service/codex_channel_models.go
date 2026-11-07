@@ -11,11 +11,11 @@ import (
 	"github.com/QuantumNous/new-api/model"
 )
 
-func FetchCodexChannelModels(channel *model.Channel) ([]string, error) {
+func FetchCodexChannelModels(channel *model.Provider) ([]string, error) {
 	if channel == nil || channel.Type != constant.ChannelTypeCodex {
 		return nil, fmt.Errorf("channel type is not Codex")
 	}
-	if channel.ChannelInfo.IsMultiKey {
+	if channel.ProviderInfo.IsMultiKey {
 		return nil, fmt.Errorf("codex channel does not support multi-key model discovery")
 	}
 
@@ -48,7 +48,7 @@ func FetchCodexChannelModels(channel *model.Channel) ([]string, error) {
 
 func fetchCodexChannelModels(
 	ctx context.Context,
-	channel *model.Channel,
+	channel *model.Provider,
 	baseURL string,
 	client *http.Client,
 	clientVersion string,

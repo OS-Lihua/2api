@@ -144,7 +144,7 @@ func TestChannelAffinityRetryPriorities(t *testing.T) {
 		priority int64
 		group    string
 	}{{24, 4, "default"}, {27, 3, "default"}, {30, 2, "default"}, {34, 4, "vip"}, {37, 3, "vip"}} {
-		channel := model.Channel{
+		channel := model.Provider{
 			Id: spec.id, Name: fmt.Sprintf("channel-%d", spec.id), Type: constant.ChannelTypeOpenAI,
 			Key: "test-only", Status: common.ChannelStatusEnabled, Models: modelName, Group: spec.group,
 			Priority: common.GetPointer(spec.priority), Weight: common.GetPointer(uint(1)),
@@ -154,7 +154,7 @@ func TestChannelAffinityRetryPriorities(t *testing.T) {
 	}
 	for _, cached := range []bool{false, true} {
 		common.MemoryCacheEnabled = cached
-		model.InitChannelCache()
+		model.InitProviderCache()
 		for _, tc := range []struct {
 			name, mode string
 			binding    int
@@ -239,7 +239,7 @@ func TestRequestPolicyRoutingDatabase(t *testing.T) {
 		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(string(previousRatios)))
 	})
 	// Channel 1 holds the session binding but is no longer usable.
-	channels := []model.Channel{
+	channels := []model.Provider{
 		{Id: 1, Name: "A", Type: 1, Key: "test-only", Status: common.ChannelStatusAutoDisabled, Models: "policy-test", Group: "default", Priority: common.GetPointer(int64(10))},
 		{Id: 2, Name: "B", Type: 1, Key: "test-only", Status: common.ChannelStatusEnabled, Models: "policy-test", Group: "default", Priority: common.GetPointer(int64(5))},
 	}
@@ -263,7 +263,7 @@ func TestRequestPolicyRoutingDatabase(t *testing.T) {
 			} {
 				t.Run(fmt.Sprintf("cache=%t/keep=%t/global=%s/rule=%s", cached, keep, tc.globalMode, tc.ruleMode), func(t *testing.T) {
 					common.MemoryCacheEnabled = cached
-					model.InitChannelCache()
+					model.InitProviderCache()
 					snapshot, err := model.BuildRequestPolicy(map[string]string{
 						"channel_affinity_setting.enabled":                  "true",
 						"channel_affinity_setting.session_mode":             tc.globalMode,

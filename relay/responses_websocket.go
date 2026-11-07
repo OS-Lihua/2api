@@ -296,7 +296,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 	} else {
 		retry := &service.RetryParam{Ctx: c, TokenGroup: common.GetContextKeyString(c, appconstant.ContextKeyUsingGroup), ModelName: modelName, RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0)}
 		for ; retry.GetRetry() <= common.RetryTimes; retry.IncreaseRetry() {
-			var channel *appmodel.Channel
+			var channel *appmodel.Provider
 			channel, apiErr = selectResponsesWSChannel(c, modelName, retry)
 			if apiErr != nil {
 				return apiErr
@@ -332,7 +332,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				info.LastError = apiErr
 				decision := service.DecideRelayRetry(c, apiErr, common.RetryTimes-retry.GetRetry())
 				service.RecordPolicyFailure(c, channel.Id, apiErr, decision)
-				service.ProcessChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, info.ApiKey, channel.GetAutoBan()), apiErr, info)
+				service.ProcessChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ProviderInfo.IsMultiKey, info.ApiKey, channel.GetAutoBan()), apiErr, info)
 				if decision.Action == "retry" {
 					continue
 				}
@@ -551,14 +551,14 @@ func responsesWSErrorEndsRequest(event responsesWSErrorEvent, streamID, response
 func (s *responsesWSSession) restoreConnectionContext(c *gin.Context, model string) *types.NewAPIError {
 	// The channel type is not rechecked: a locked channel keeps its type, and
 	// the FilterResponsesWebSocket rules were applied when it was selected.
-	channel, err := appmodel.CacheGetChannel(s.lockedChannelID)
+	channel, err := appmodel.CacheGetProvider(s.lockedChannelID)
 	if err != nil || channel == nil || channel.Status != common.ChannelStatusEnabled || !channel.GetSetting().ResponsesWebSocketEnabled {
 		return types.NewErrorWithStatusCode(errors.New("Responses WebSocket is disabled for this channel"), types.ErrorCode(appdto.FilterResponsesWebSocket), http.StatusForbidden, types.ErrOptionWithSkipRetry())
 	}
 	keyEnabled := channel.Key == s.lockedKey
-	if channel.ChannelInfo.IsMultiKey {
+	if channel.ProviderInfo.IsMultiKey {
 		keys := channel.GetKeys()
-		status := channel.ChannelInfo.MultiKeyStatusList[s.lockedKeyIndex]
+		status := channel.ProviderInfo.MultiKeyStatusList[s.lockedKeyIndex]
 		keyEnabled = s.lockedKeyIndex >= 0 && s.lockedKeyIndex < len(keys) && keys[s.lockedKeyIndex] == s.lockedKey && (status == 0 || status == common.ChannelStatusEnabled)
 	}
 	if !keyEnabled {
@@ -596,7 +596,7 @@ func (s *responsesWSSession) restoreConnectionContext(c *gin.Context, model stri
 			group = s.lockedGroup
 			common.SetContextKey(c, appconstant.ContextKeyAutoGroup, group)
 		}
-		if !appmodel.IsChannelEnabledForGroupModel(group, model, s.lockedChannelID) {
+		if !appmodel.IsProviderEnabledForGroupModel(group, model, s.lockedChannelID) {
 			return types.NewErrorWithStatusCode(errors.New("the connection channel is no longer allowed for this group and model"), types.ErrorCodeAccessDenied, http.StatusForbidden, types.ErrOptionWithSkipRetry())
 		}
 	}
@@ -935,7 +935,7 @@ func checkResponsesWSModelAccess(c *gin.Context, modelName string) *types.NewAPI
 // selectResponsesWSChannel narrows the shared HTTP selection to channels that
 // speak the Responses WebSocket protocol and renders its outcome as a
 // non-retryable NewAPIError.
-func selectResponsesWSChannel(c *gin.Context, modelName string, retryParam *service.RetryParam) (*appmodel.Channel, *types.NewAPIError) {
+func selectResponsesWSChannel(c *gin.Context, modelName string, retryParam *service.RetryParam) (*appmodel.Provider, *types.NewAPIError) {
 	constraints := service.GetChannelConstraints(c)
 	if !slices.ContainsFunc(constraints.Filters, func(filter appdto.ChannelFilter) bool {
 		return filter.Kind == appdto.FilterResponsesWebSocket

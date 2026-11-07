@@ -40,7 +40,7 @@ func TestMain(m *testing.M) {
 		&TwoFA{},
 		&TwoFABackupCode{},
 		&Log{},
-		&Channel{},
+		&Provider{},
 		&QuotaData{},
 		&Ability{},
 		&TopUp{},
@@ -77,7 +77,7 @@ func truncateTables(t *testing.T) {
 		DB.Exec("DELETE FROM user_oauth_bindings")
 		DB.Exec("DELETE FROM users")
 		ClearTestLogTable("logs")
-		DB.Exec("DELETE FROM channels")
+		DB.Exec("DELETE FROM providers")
 		DB.Exec("DELETE FROM quota_data")
 		DB.Exec("DELETE FROM abilities")
 		DB.Exec("DELETE FROM top_ups")

@@ -37,7 +37,7 @@ func setupRelayChannelDB(t *testing.T) *gorm.DB {
 	sqlDB, err := database.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
-	require.NoError(t, database.AutoMigrate(&model.Channel{}))
+	require.NoError(t, database.AutoMigrate(&model.Provider{}))
 	common.MemoryCacheEnabled = false
 	t.Cleanup(func() {
 		model.DB = previousDB
@@ -57,7 +57,7 @@ func TestRealtimeFetchAppliesChannelHeaderOverrides(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	headerOverride := `{"X-API-Key":"{api_key}"}`
-	channel := &model.Channel{
+	channel := &model.Provider{
 		Name: "realtime-header-override", Type: constant.ChannelTypeGemini,
 		Key: "channel-key", BaseURL: &server.URL, HeaderOverride: &headerOverride,
 	}
@@ -103,7 +103,7 @@ func TestRealtimeFetchRefundsTaskItFindsFailed(t *testing.T) {
 		_, _ = w.Write([]byte(`{"name":"operations/task-1","done":true,"error":{"code":3,"message":"blocked by safety"}}`))
 	}))
 	t.Cleanup(server.Close)
-	channel := &model.Channel{Name: "realtime-refund", Type: constant.ChannelTypeGemini, Key: "channel-key", BaseURL: &server.URL}
+	channel := &model.Provider{Name: "realtime-refund", Type: constant.ChannelTypeGemini, Key: "channel-key", BaseURL: &server.URL}
 	require.NoError(t, database.Create(channel).Error)
 	require.NoError(t, database.Create(&model.User{Id: 7, Username: "realtime-owner", Quota: 100}).Error)
 	task := &model.Task{
@@ -130,7 +130,7 @@ func TestRealtimeFetchRefundsTaskItFindsFailed(t *testing.T) {
 
 func TestApplyChannelPinPreservesOriginTasksAndRetryMode(t *testing.T) {
 	database := setupRelayChannelDB(t)
-	channel := &model.Channel{Name: "origin-channel", Key: "sk-test", Status: common.ChannelStatusEnabled, Type: constant.ChannelTypeDoubaoVideo}
+	channel := &model.Provider{Name: "origin-channel", Key: "sk-test", Status: common.ChannelStatusEnabled, Type: constant.ChannelTypeDoubaoVideo}
 	require.NoError(t, database.Create(channel).Error)
 	originTask := &model.Task{
 		TaskID: "task-lock", ChannelId: channel.Id, Action: "text_to_video", Status: model.TaskStatusSuccess,
@@ -160,7 +160,7 @@ func TestApplyChannelPinPreservesOriginTasksAndRetryMode(t *testing.T) {
 			if tc.tokenPin {
 				assert.Nil(t, info.LockedChannel)
 			} else {
-				locked, ok := info.LockedChannel.(*model.Channel)
+				locked, ok := info.LockedChannel.(*model.Provider)
 				require.True(t, ok)
 				require.NotNil(t, locked)
 				assert.Equal(t, channel.Id, locked.Id)

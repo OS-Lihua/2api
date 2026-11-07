@@ -131,7 +131,7 @@ export function parseTaskResult() { return {}; }
 	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(pluginKey) })
 
 	mapping := `{"alias-model":"declared-model"}`
-	require.NoError(t, model.DB.Create(&model.Channel{
+	require.NoError(t, model.DB.Create(&model.Provider{
 		Id:           1,
 		Type:         54,
 		Key:          "key-1",
@@ -141,7 +141,7 @@ export function parseTaskResult() { return {}; }
 		Models:       "alias-model,declared-model",
 		ModelMapping: &mapping,
 	}).Error)
-	model.InitChannelCache()
+	model.InitProviderCache()
 
 	saved := map[string]string{}
 	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {

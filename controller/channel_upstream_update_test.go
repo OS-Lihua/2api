@@ -18,7 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newAdvancedCustomModelListChannel(baseURL string, key string, upstreamPath string, auth *dto.AdvancedCustomRouteAuth) *model.Channel {
+func newAdvancedCustomModelListChannel(baseURL string, key string, upstreamPath string, auth *dto.AdvancedCustomRouteAuth) *model.Provider {
 	config := &dto.AdvancedCustomConfig{
 		Routes: []dto.AdvancedCustomRoute{
 			{
@@ -29,7 +29,7 @@ func newAdvancedCustomModelListChannel(baseURL string, key string, upstreamPath 
 			},
 		},
 	}
-	channel := &model.Channel{
+	channel := &model.Provider{
 		Type:    constant.ChannelTypeAdvancedCustom,
 		Key:     key,
 		BaseURL: &baseURL,
@@ -118,7 +118,7 @@ func TestFetchAdvancedCustomModelsUsesEnabledSavedMultiKey(t *testing.T) {
 	defer server.Close()
 
 	channel := newAdvancedCustomModelListChannel(server.URL, "disabled-key\nenabled-key", "/v1/models", nil)
-	channel.ChannelInfo = model.ChannelInfo{
+	channel.ProviderInfo = model.ProviderInfo{
 		IsMultiKey: true,
 		MultiKeyStatusList: map[int]int{
 			0: common.ChannelStatusManuallyDisabled,
@@ -187,7 +187,7 @@ func TestFetchOrdinaryOpenAIModelsKeepsExistingEmptyDataBehavior(t *testing.T) {
 	defer server.Close()
 
 	baseURL := server.URL
-	channel := &model.Channel{
+	channel := &model.Provider{
 		Type:    constant.ChannelTypeOpenAI,
 		Key:     "ordinary-key",
 		BaseURL: &baseURL,
@@ -254,7 +254,7 @@ func TestFetchModelsAdvancedCustomEditPreviewUsesSavedKeyAndExplicitClears(t *te
 	savedChannel := newAdvancedCustomModelListChannel("http://127.0.0.1:1", "disabled-saved-key\nenabled-saved-key", "/saved/models", nil)
 	savedChannel.Name = "saved advanced channel"
 	savedChannel.Models = "old-model"
-	savedChannel.ChannelInfo = model.ChannelInfo{
+	savedChannel.ProviderInfo = model.ProviderInfo{
 		IsMultiKey: true,
 		MultiKeyStatusList: map[int]int{
 			0: common.ChannelStatusManuallyDisabled,
@@ -353,7 +353,7 @@ func TestFailedAdvancedCustomDetectionDoesNotStageFullRemoval(t *testing.T) {
 	require.Empty(t, settings.UpstreamModelUpdateLastDetectedModels)
 	require.Empty(t, settings.UpstreamModelUpdateLastRemovedModels)
 
-	reloaded, err := model.GetChannelById(channel.Id, true)
+	reloaded, err := model.GetProviderById(channel.Id, true)
 	require.NoError(t, err)
 	persistedSettings := reloaded.GetOtherSettings()
 	require.Empty(t, persistedSettings.UpstreamModelUpdateLastDetectedModels)
@@ -406,7 +406,7 @@ func TestFetchNewAPIModelsUsesOpenAIContract(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	baseURL := server.URL
-	channel := &model.Channel{
+	channel := &model.Provider{
 		Type:    constant.ChannelTypeNewAPI,
 		Key:     "new-api-key",
 		BaseURL: &baseURL,
@@ -497,7 +497,7 @@ func TestNormalizeChannelModelMapping(t *testing.T) {
 		"": "invalid",
 		"invalid-target": ""
 	}`
-	channel := &model.Channel{
+	channel := &model.Provider{
 		ModelMapping: &modelMapping,
 	}
 

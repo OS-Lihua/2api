@@ -16,12 +16,12 @@ import (
 func setupSub2APIBalanceTest(t *testing.T) {
 	t.Helper()
 	database := model.UseTestDatabases(t)
-	require.NoError(t, database.AutoMigrate(&model.Channel{}))
+	require.NoError(t, database.AutoMigrate(&model.Provider{}))
 }
 
-func newSub2APITestChannel(t *testing.T, serverURL string) *model.Channel {
+func newSub2APITestChannel(t *testing.T, serverURL string) *model.Provider {
 	t.Helper()
-	channel := &model.Channel{
+	channel := &model.Provider{
 		Type:    constant.ChannelTypeSub2API,
 		BaseURL: &serverURL,
 		Key:     "sk-test",
@@ -102,7 +102,7 @@ func TestUpdateChannelSub2APIBalanceUnlimitedSubscription(t *testing.T) {
 	_, err := updateChannelSub2APIBalance(channel)
 	require.EqualError(t, err, "Sub2API /v1/usage reports an unlimited subscription without a finite balance")
 
-	stored := model.Channel{}
+	stored := model.Provider{}
 	require.NoError(t, model.DB.First(&stored, channel.Id).Error)
 	assert.InDelta(t, 12.5, stored.Balance, 1e-9)
 }
@@ -124,7 +124,7 @@ func TestUpdateChannelSub2APIBalanceNegativeWalletBalance(t *testing.T) {
 func TestUpdateChannelSub2APIBalanceMissingBaseURL(t *testing.T) {
 	setupSub2APIBalanceTest(t)
 	empty := ""
-	channel := &model.Channel{BaseURL: &empty, Key: "sk-test"}
+	channel := &model.Provider{BaseURL: &empty, Key: "sk-test"}
 	_, err := updateChannelSub2APIBalance(channel)
 	require.Error(t, err)
 }

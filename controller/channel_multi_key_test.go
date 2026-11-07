@@ -24,7 +24,7 @@ func TestMultiKeyEnableRestoresOnlyExhaustedChannels(t *testing.T) {
 	database := model.UseTestDatabases(t)
 	model.LOG_DB = database
 	common.SetLogDatabaseType(common.DatabaseTypePostgreSQL)
-	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.User{}, &model.Log{}, &model.AuditLog{}))
+	require.NoError(t, database.AutoMigrate(&model.Provider{}, &model.Ability{}, &model.User{}, &model.Log{}, &model.AuditLog{}))
 	root := &model.User{Username: "multi-key-review-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled}
 	require.NoError(t, database.Create(root).Error)
 	t.Cleanup(func() { require.NoError(t, database.Unscoped().Delete(root).Error) })
@@ -45,20 +45,20 @@ func TestMultiKeyEnableRestoresOnlyExhaustedChannels(t *testing.T) {
 				t.Run(fmt.Sprintf("cache=%t/%s/%s", cacheEnabled, action, tc.name), func(t *testing.T) {
 					common.MemoryCacheEnabled = cacheEnabled
 					tag := t.Name()
-					channel := &model.Channel{Name: t.Name(), Type: 1, Key: "key-one\nkey-two", Status: tc.initialStatus, Models: "test-model", Group: "default", Tag: &tag,
-						ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyStatusList: map[int]int{1: common.ChannelStatusManuallyDisabled}},
+					channel := &model.Provider{Name: t.Name(), Type: 1, Key: "key-one\nkey-two", Status: tc.initialStatus, Models: "test-model", Group: "default", Tag: &tag,
+						ProviderInfo: model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyStatusList: map[int]int{1: common.ChannelStatusManuallyDisabled}},
 					}
 					require.NoError(t, channel.Insert())
 					t.Cleanup(func() {
 						require.NoError(t, channel.Delete())
-						model.InitChannelCache()
+						model.InitProviderCache()
 					})
 					for _, operation := range []string{"disable_key", action} {
 						if operation == action {
 							if tc.manualOverride == "status" {
-								model.UpdateChannelStatus(channel.Id, "", common.ChannelStatusManuallyDisabled, "manual operation")
+								model.UpdateProviderStatus(channel.Id, "", common.ChannelStatusManuallyDisabled, "manual operation")
 							} else if tc.manualOverride == "tag" {
-								require.NoError(t, model.DisableChannelByTag(tag))
+								require.NoError(t, model.DisableProviderByTag(tag))
 							}
 						}
 						payload, err := common.Marshal(MultiKeyManageRequest{ChannelId: channel.Id, Action: operation, KeyIndex: common.GetPointer(0)})
@@ -76,12 +76,12 @@ func TestMultiKeyEnableRestoresOnlyExhaustedChannels(t *testing.T) {
 						require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &result))
 						require.True(t, result.Success, recorder.Body.String())
 					}
-					loaded, err := model.GetChannelById(channel.Id, true)
+					loaded, err := model.GetProviderById(channel.Id, true)
 					require.NoError(t, err)
 					assert.Equal(t, tc.wantStatus, loaded.Status)
-					assert.NotContains(t, loaded.ChannelInfo.MultiKeyStatusList, 0)
-					assert.NotContains(t, loaded.ChannelInfo.MultiKeyDisabledReason, 0)
-					assert.NotContains(t, loaded.ChannelInfo.MultiKeyDisabledTime, 0)
+					assert.NotContains(t, loaded.ProviderInfo.MultiKeyStatusList, 0)
+					assert.NotContains(t, loaded.ProviderInfo.MultiKeyDisabledReason, 0)
+					assert.NotContains(t, loaded.ProviderInfo.MultiKeyDisabledTime, 0)
 					var ability model.Ability
 					require.NoError(t, database.Where("channel_id = ?", channel.Id).First(&ability).Error)
 					assert.Equal(t, tc.wantStatus == common.ChannelStatusEnabled, ability.Enabled)

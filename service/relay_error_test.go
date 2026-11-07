@@ -76,11 +76,11 @@ func TestProcessChannelErrorMasksDisableReasonAndNotification(t *testing.T) {
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
-	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.User{}))
+	require.NoError(t, database.AutoMigrate(&model.Provider{}, &model.Ability{}, &model.User{}))
 	common.MemoryCacheEnabled, common.RedisEnabled = false, false
 	common.AutomaticDisableChannelEnabled, constant.ErrorLogEnabled = true, false
 	constant.NotifyLimitCount = 10
-	channel := &model.Channel{Name: "relay-review", Key: "fixture-key", Type: 1, Status: common.ChannelStatusEnabled, Group: "default", Models: "test-model"}
+	channel := &model.Provider{Name: "relay-review", Key: "fixture-key", Type: 1, Status: common.ChannelStatusEnabled, Group: "default", Models: "test-model"}
 	require.NoError(t, channel.Insert())
 	notifications := make(chan []byte, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -109,7 +109,7 @@ func TestProcessChannelErrorMasksDisableReasonAndNotification(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("automatic channel-disable notification was not delivered")
 	}
-	loaded, err := model.GetChannelById(channel.Id, true)
+	loaded, err := model.GetProviderById(channel.Id, true)
 	require.NoError(t, err)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, loaded.Status)
 	wantReason := "status_code=401, upstream https://***.com/***?token=*** api_key:***"
@@ -234,7 +234,7 @@ func TestRequestPolicyEventsReachLogAdminInfo(t *testing.T) {
 	c.Set("auto_ban", true)
 	c.Set("channel_id", 7)
 	state := RequestPolicy(c)
-	state.BeginAttempt(&model.Channel{Id: 7}, "default")
+	state.BeginAttempt(&model.Provider{Id: 7}, "default")
 	apiErr := types.NewOpenAIError(errors.New("invalid credential"), types.ErrorCodeBadResponseStatusCode, http.StatusUnauthorized)
 	RecordPolicyFailure(c, 7, apiErr, DecideRelayRetry(c, apiErr, 0))
 
@@ -253,7 +253,7 @@ func TestRequestPolicyEventsReachLogAdminInfo(t *testing.T) {
 	RecordPolicyFailure(c, 7, apiErr, DecideRelayRetry(c, apiErr, 0))
 	assert.Equal(t, "key_disable_requested", state.Events()[4].Health)
 
-	state.BeginAttempt(&model.Channel{Id: 8}, "default")
+	state.BeginAttempt(&model.Provider{Id: 8}, "default")
 	c.Set("channel_id", 8)
 	MarkRequestPolicySuccess(c, nil)
 	MarkRequestPolicySuccess(c, nil)

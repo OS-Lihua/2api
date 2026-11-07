@@ -21,7 +21,7 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-type Channel struct {
+type Provider struct {
 	Id                 int     `json:"id"`
 	Type               int     `json:"type" gorm:"default:0"`
 	Key                string  `json:"key" gorm:"not null"`
@@ -52,7 +52,7 @@ type Channel struct {
 	HeaderOverride    *string `json:"header_override" gorm:"type:text"`
 	Remark            *string `json:"remark" gorm:"type:varchar(255)" validate:"max=255"`
 	// add after v0.8.5
-	ChannelInfo ChannelInfo `json:"channel_info" gorm:"type:json"`
+	ProviderInfo ProviderInfo `json:"channel_info" gorm:"column:channel_info;type:json"`
 
 	OtherSettings string `json:"settings" gorm:"column:settings"` // 其他设置，存储azure版本等不需要检索的信息，详见dto.ChannelOtherSettings
 
@@ -60,9 +60,9 @@ type Channel struct {
 	Keys []string `json:"-" gorm:"-"`
 }
 
-const ChannelStatusReasonAllKeysDisabled = "All keys are disabled"
+const ProviderStatusReasonAllKeysDisabled = "All keys are disabled"
 
-type ChannelInfo struct {
+type ProviderInfo struct {
 	IsMultiKey             bool                  `json:"is_multi_key"`                        // 是否多Key模式
 	MultiKeySize           int                   `json:"multi_key_size"`                      // 多Key模式下的Key数量
 	MultiKeyStatusList     map[int]int           `json:"multi_key_status_list"`               // key状态列表，key index -> status
@@ -72,7 +72,7 @@ type ChannelInfo struct {
 	MultiKeyMode           constant.MultiKeyMode `json:"multi_key_mode"`
 }
 
-type ChannelSortOptions struct {
+type ProviderSortOptions struct {
 	SortBy    string
 	SortOrder string
 	IDSort    bool
@@ -87,7 +87,7 @@ var channelSortColumns = map[string]string{
 	"test_time":     "test_time",
 }
 
-func NewChannelSortOptions(sortBy string, sortOrder string, idSort bool) ChannelSortOptions {
+func NewProviderSortOptions(sortBy string, sortOrder string, idSort bool) ProviderSortOptions {
 	normalizedSortBy := strings.ToLower(strings.TrimSpace(sortBy))
 	normalizedSortOrder := strings.ToLower(strings.TrimSpace(sortOrder))
 	if _, ok := channelSortColumns[normalizedSortBy]; !ok {
@@ -97,14 +97,14 @@ func NewChannelSortOptions(sortBy string, sortOrder string, idSort bool) Channel
 		normalizedSortOrder = "desc"
 	}
 
-	return ChannelSortOptions{
+	return ProviderSortOptions{
 		SortBy:    normalizedSortBy,
 		SortOrder: normalizedSortOrder,
 		IDSort:    idSort,
 	}
 }
 
-func (options ChannelSortOptions) Apply(query *gorm.DB) *gorm.DB {
+func (options ProviderSortOptions) Apply(query *gorm.DB) *gorm.DB {
 	if columnName, ok := channelSortColumns[options.SortBy]; ok {
 		column := clause.Column{Name: columnName}
 		if columnName == "priority" {
@@ -128,16 +128,16 @@ func (options ChannelSortOptions) Apply(query *gorm.DB) *gorm.DB {
 	}).Order(clause.OrderByColumn{Column: clause.Column{Name: "id"}, Desc: true})
 }
 
-func resolveChannelSortOptions(idSort bool, sortOptions []ChannelSortOptions) ChannelSortOptions {
+func resolveChannelSortOptions(idSort bool, sortOptions []ProviderSortOptions) ProviderSortOptions {
 	if len(sortOptions) == 0 {
-		return NewChannelSortOptions("", "", idSort)
+		return NewProviderSortOptions("", "", idSort)
 	}
 	options := sortOptions[0]
 	options.IDSort = options.IDSort || idSort
 	return options
 }
 
-func NormalizeChannelGroupFilter(group string) string {
+func NormalizeProviderGroupFilter(group string) string {
 	group = strings.TrimSpace(group)
 	if group == "" || strings.EqualFold(group, "all") || strings.EqualFold(group, "null") {
 		return ""
@@ -154,8 +154,8 @@ func channelGroupFilterPattern(group string) string {
 	return "%," + group + ",%"
 }
 
-func ApplyChannelGroupFilter(query *gorm.DB, group string) *gorm.DB {
-	group = NormalizeChannelGroupFilter(group)
+func ApplyProviderGroupFilter(query *gorm.DB, group string) *gorm.DB {
+	group = NormalizeProviderGroupFilter(group)
 	if group == "" {
 		return query
 	}
@@ -165,7 +165,7 @@ func ApplyChannelGroupFilter(query *gorm.DB, group string) *gorm.DB {
 // Value implements driver.Valuer interface
 // 必须返回 string 而非 []byte:PG simple protocol 下 []byte 参数按 bytea
 // 编码,写 json 列会触发 SQLSTATE 22P02。
-func (c ChannelInfo) Value() (driver.Value, error) {
+func (c ProviderInfo) Value() (driver.Value, error) {
 	b, err := common.Marshal(&c)
 	if err != nil {
 		return nil, err
@@ -174,11 +174,11 @@ func (c ChannelInfo) Value() (driver.Value, error) {
 }
 
 // Scan implements sql.Scanner interface
-func (c *ChannelInfo) Scan(value any) error {
+func (c *ProviderInfo) Scan(value any) error {
 	return common.Unmarshal(jsonScanBytes(value), c)
 }
 
-func (channel *Channel) GetKeys() []string {
+func (channel *Provider) GetKeys() []string {
 	if channel.Key == "" {
 		return []string{}
 	}
@@ -202,9 +202,9 @@ func (channel *Channel) GetKeys() []string {
 	return keys
 }
 
-func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
+func (channel *Provider) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 	// If not in multi-key mode, return the original key string directly.
-	if !channel.ChannelInfo.IsMultiKey {
+	if !channel.ProviderInfo.IsMultiKey {
 		return channel.Key, 0, nil
 	}
 
@@ -215,11 +215,11 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		return "", 0, types.NewError(errors.New("no keys available"), types.ErrorCodeChannelNoAvailableKey)
 	}
 
-	lock := GetChannelPollingLock(channel.Id)
+	lock := GetProviderPollingLock(channel.Id)
 	lock.Lock()
 	defer lock.Unlock()
 
-	statusList := channel.ChannelInfo.MultiKeyStatusList
+	statusList := channel.ProviderInfo.MultiKeyStatusList
 	// helper to get key status, default to enabled when missing
 	getStatus := func(idx int) int {
 		if statusList == nil {
@@ -245,7 +245,7 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		return "", 0, types.NewError(errors.New("no enabled keys"), types.ErrorCodeChannelNoAvailableKey)
 	}
 
-	switch channel.ChannelInfo.MultiKeyMode {
+	switch channel.ProviderInfo.MultiKeyMode {
 	case constant.MultiKeyModeRandom:
 		// Randomly pick one enabled key
 		selectedIdx := enabledIdx[rand.Intn(len(enabledIdx))]
@@ -253,16 +253,16 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 	case constant.MultiKeyModePolling:
 		// Use channel-specific lock to ensure thread-safe polling
 
-		channelInfo, err := CacheGetChannelInfo(channel.Id)
+		channelInfo, err := CacheGetProviderInfo(channel.Id)
 		if err != nil {
 			return "", 0, types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 		}
 		defer func() {
 			if common.DebugEnabled {
-				logger.LogDebug(nil, "channel %d polling index: %d", channel.Id, channel.ChannelInfo.MultiKeyPollingIndex)
+				logger.LogDebug(nil, "channel %d polling index: %d", channel.Id, channel.ProviderInfo.MultiKeyPollingIndex)
 			}
 			if !common.MemoryCacheEnabled {
-				_ = channel.SaveChannelInfo()
+				_ = channel.SaveProviderInfo()
 			} else {
 				// CacheUpdateChannel(channel)
 			}
@@ -276,7 +276,7 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 			idx := (start + i) % len(keys)
 			if getStatus(idx) == common.ChannelStatusEnabled {
 				// update polling index for next call (point to the next position)
-				channel.ChannelInfo.MultiKeyPollingIndex = (idx + 1) % len(keys)
+				channel.ProviderInfo.MultiKeyPollingIndex = (idx + 1) % len(keys)
 				return keys[idx], idx, nil
 			}
 		}
@@ -288,18 +288,18 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 	}
 }
 
-func (channel *Channel) SaveChannelInfo() error {
-	return DB.Model(channel).Update("channel_info", channel.ChannelInfo).Error
+func (channel *Provider) SaveProviderInfo() error {
+	return DB.Model(channel).Update("channel_info", channel.ProviderInfo).Error
 }
 
-func (channel *Channel) GetModels() []string {
+func (channel *Provider) GetModels() []string {
 	if channel.Models == "" {
 		return []string{}
 	}
 	return strings.Split(strings.Trim(channel.Models, ","), ",")
 }
 
-func (channel *Channel) GetGroups() []string {
+func (channel *Provider) GetGroups() []string {
 	if channel.Group == "" {
 		return []string{}
 	}
@@ -310,7 +310,7 @@ func (channel *Channel) GetGroups() []string {
 	return groups
 }
 
-func (channel *Channel) GetOtherInfo() map[string]any {
+func (channel *Provider) GetOtherInfo() map[string]any {
 	otherInfo := make(map[string]any)
 	if channel.OtherInfo != "" {
 		err := common.Unmarshal([]byte(channel.OtherInfo), &otherInfo)
@@ -321,7 +321,7 @@ func (channel *Channel) GetOtherInfo() map[string]any {
 	return otherInfo
 }
 
-func (channel *Channel) SetOtherInfo(otherInfo map[string]any) {
+func (channel *Provider) SetOtherInfo(otherInfo map[string]any) {
 	otherInfoBytes, err := json.Marshal(otherInfo)
 	if err != nil {
 		common.SysLog(common.LogText("failed to marshal other info: channel_id=%d, tag=%s, name=%s, error=%v", channel.Id, channel.GetTag(), channel.Name, err))
@@ -330,32 +330,32 @@ func (channel *Channel) SetOtherInfo(otherInfo map[string]any) {
 	channel.OtherInfo = string(otherInfoBytes)
 }
 
-func (channel *Channel) GetTag() string {
+func (channel *Provider) GetTag() string {
 	if channel.Tag == nil {
 		return ""
 	}
 	return *channel.Tag
 }
 
-func (channel *Channel) SetTag(tag string) {
+func (channel *Provider) SetTag(tag string) {
 	channel.Tag = &tag
 }
 
-func (channel *Channel) GetAutoBan() bool {
+func (channel *Provider) GetAutoBan() bool {
 	if channel.AutoBan == nil {
 		return false
 	}
 	return *channel.AutoBan == 1
 }
 
-func (channel *Channel) Save() error {
+func (channel *Provider) Save() error {
 	return DB.Save(channel).Error
 }
 
 // saveStatusState persists only the fields owned by the channel status flow.
 // Keeping this allowlist here prevents a stale channel snapshot from
 // overwriting credentials, accounting counters, or channel configuration.
-func (channel *Channel) saveStatusState() error {
+func (channel *Provider) saveStatusState() error {
 	if channel.Id == 0 {
 		return errors.New("channel ID is 0")
 	}
@@ -363,14 +363,14 @@ func (channel *Channel) saveStatusState() error {
 		"status":     channel.Status,
 		"other_info": channel.OtherInfo,
 	}
-	if channel.ChannelInfo.IsMultiKey {
-		updates["channel_info"] = channel.ChannelInfo
+	if channel.ProviderInfo.IsMultiKey {
+		updates["channel_info"] = channel.ProviderInfo
 	}
-	return DB.Model(&Channel{}).Where("id = ?", channel.Id).Updates(updates).Error
+	return DB.Model(&Provider{}).Where("id = ?", channel.Id).Updates(updates).Error
 }
 
-func GetAllChannels(startIdx int, num int, selectAll bool, idSort bool, sortOptions ...ChannelSortOptions) ([]*Channel, error) {
-	var channels []*Channel
+func GetAllProviders(startIdx int, num int, selectAll bool, idSort bool, sortOptions ...ProviderSortOptions) ([]*Provider, error) {
+	var channels []*Provider
 	var err error
 	order := resolveChannelSortOptions(idSort, sortOptions)
 	if selectAll {
@@ -381,8 +381,8 @@ func GetAllChannels(startIdx int, num int, selectAll bool, idSort bool, sortOpti
 	return channels, err
 }
 
-func GetChannelsByTag(tag string, idSort bool, selectAll bool, sortOptions ...ChannelSortOptions) ([]*Channel, error) {
-	var channels []*Channel
+func GetProvidersByTag(tag string, idSort bool, selectAll bool, sortOptions ...ProviderSortOptions) ([]*Provider, error) {
+	var channels []*Provider
 	order := resolveChannelSortOptions(idSort, sortOptions)
 	query := order.Apply(DB.Where("tag = ?", tag))
 	if !selectAll {
@@ -392,17 +392,17 @@ func GetChannelsByTag(tag string, idSort bool, selectAll bool, sortOptions ...Ch
 	return channels, err
 }
 
-func SearchChannels(keyword string, group string, model string, idSort bool, sortOptions ...ChannelSortOptions) ([]*Channel, error) {
-	var channels []*Channel
+func SearchProviders(keyword string, group string, model string, idSort bool, sortOptions ...ProviderSortOptions) ([]*Provider, error) {
+	var channels []*Provider
 	order := resolveChannelSortOptions(idSort, sortOptions)
 
 	// 构造基础查询
-	baseQuery := DB.Model(&Channel{}).Omit("key")
+	baseQuery := DB.Model(&Provider{}).Omit("key")
 
 	// 构造WHERE子句
 	whereClause := `(id = ? OR name LIKE ? OR "key" = ? OR "base_url" LIKE ?) AND "models" LIKE ?`
 	args := []any{common.String2Int(keyword), "%" + keyword + "%", keyword, "%" + keyword + "%", "%" + model + "%"}
-	baseQuery = ApplyChannelGroupFilter(baseQuery.Where(whereClause, args...), group)
+	baseQuery = ApplyProviderGroupFilter(baseQuery.Where(whereClause, args...), group)
 
 	// 执行查询
 	err := order.Apply(baseQuery).Find(&channels).Error
@@ -412,7 +412,7 @@ func SearchChannels(keyword string, group string, model string, idSort bool, sor
 	return channels, nil
 }
 
-// GetChannelById loads a channel directly from the database, bypassing the
+// GetProviderById loads a channel directly from the database, bypassing the
 // in-memory channel cache.
 //
 // WARNING: do NOT call this on request hot paths (middleware, distribution,
@@ -421,8 +421,8 @@ func SearchChannels(keyword string, group string, model string, idSort bool, sor
 // in-memory cache and falls back to this function automatically when
 // MemoryCacheEnabled is false. Direct use is appropriate only where fresh DB
 // state is required, e.g. admin CRUD, channel testing, or cache (re)building.
-func GetChannelById(id int, selectAll bool) (*Channel, error) {
-	channel := &Channel{Id: id}
+func GetProviderById(id int, selectAll bool) (*Provider, error) {
+	channel := &Provider{Id: id}
 	var err error = nil
 	if selectAll {
 		err = DB.First(channel, "id = ?", id).Error
@@ -435,7 +435,7 @@ func GetChannelById(id int, selectAll bool) (*Channel, error) {
 	return channel, nil
 }
 
-func BatchInsertChannels(channels []Channel) error {
+func BatchInsertProviders(channels []Provider) error {
 	if len(channels) == 0 {
 		return nil
 	}
@@ -466,7 +466,7 @@ func BatchInsertChannels(channels []Channel) error {
 	return tx.Commit().Error
 }
 
-func BatchDeleteChannels(ids []int) (int64, error) {
+func BatchDeleteProviders(ids []int) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
@@ -477,7 +477,7 @@ func BatchDeleteChannels(ids []int) (int64, error) {
 	}
 	var deletedCount int64
 	for _, chunk := range lo.Chunk(ids, 200) {
-		result := tx.Where("id in (?)", chunk).Delete(&Channel{})
+		result := tx.Where("id in (?)", chunk).Delete(&Provider{})
 		if result.Error != nil {
 			tx.Rollback()
 			return 0, result.Error
@@ -494,21 +494,21 @@ func BatchDeleteChannels(ids []int) (int64, error) {
 	return deletedCount, nil
 }
 
-func (channel *Channel) GetPriority() int64 {
+func (channel *Provider) GetPriority() int64 {
 	if channel.Priority == nil {
 		return 0
 	}
 	return *channel.Priority
 }
 
-func (channel *Channel) GetWeight() int {
+func (channel *Provider) GetWeight() int {
 	if channel.Weight == nil {
 		return 0
 	}
 	return int(*channel.Weight)
 }
 
-func (channel *Channel) GetBaseURL() string {
+func (channel *Provider) GetBaseURL() string {
 	if channel.BaseURL == nil {
 		return ""
 	}
@@ -519,21 +519,21 @@ func (channel *Channel) GetBaseURL() string {
 	return url
 }
 
-func (channel *Channel) GetModelMapping() string {
+func (channel *Provider) GetModelMapping() string {
 	if channel.ModelMapping == nil {
 		return ""
 	}
 	return *channel.ModelMapping
 }
 
-func (channel *Channel) GetStatusCodeMapping() string {
+func (channel *Provider) GetStatusCodeMapping() string {
 	if channel.StatusCodeMapping == nil {
 		return ""
 	}
 	return *channel.StatusCodeMapping
 }
 
-func (channel *Channel) Insert() error {
+func (channel *Provider) Insert() error {
 	var err error
 	err = DB.Create(channel).Error
 	if err != nil {
@@ -543,15 +543,15 @@ func (channel *Channel) Insert() error {
 	return err
 }
 
-func (channel *Channel) Update() error {
+func (channel *Provider) Update() error {
 	// If this is a multi-key channel, recalculate MultiKeySize based on the current key list to avoid inconsistency after editing keys
-	if channel.ChannelInfo.IsMultiKey {
+	if channel.ProviderInfo.IsMultiKey {
 		var keyStr string
 		if channel.Key != "" {
 			keyStr = channel.Key
 		} else {
 			// If key is not provided, read the existing key from the database
-			if existing, err := GetChannelById(channel.Id, true); err == nil {
+			if existing, err := GetProviderById(channel.Id, true); err == nil {
 				keyStr = existing.Key
 			}
 		}
@@ -572,12 +572,12 @@ func (channel *Channel) Update() error {
 				keys = strings.Split(strings.Trim(keyStr, "\n"), "\n")
 			}
 		}
-		channel.ChannelInfo.MultiKeySize = len(keys)
+		channel.ProviderInfo.MultiKeySize = len(keys)
 		// Clean up status data that exceeds the new key count to prevent index out of range
-		if channel.ChannelInfo.MultiKeyStatusList != nil {
-			for idx := range channel.ChannelInfo.MultiKeyStatusList {
-				if idx >= channel.ChannelInfo.MultiKeySize {
-					delete(channel.ChannelInfo.MultiKeyStatusList, idx)
+		if channel.ProviderInfo.MultiKeyStatusList != nil {
+			for idx := range channel.ProviderInfo.MultiKeyStatusList {
+				if idx >= channel.ProviderInfo.MultiKeySize {
+					delete(channel.ProviderInfo.MultiKeyStatusList, idx)
 				}
 			}
 		}
@@ -592,8 +592,8 @@ func (channel *Channel) Update() error {
 	return err
 }
 
-func (channel *Channel) UpdateResponseTime(responseTime int64) {
-	err := DB.Model(channel).Select("response_time", "test_time").Updates(Channel{
+func (channel *Provider) UpdateResponseTime(responseTime int64) {
+	err := DB.Model(channel).Select("response_time", "test_time").Updates(Provider{
 		TestTime:     common.GetTimestamp(),
 		ResponseTime: int(responseTime),
 	}).Error
@@ -602,8 +602,8 @@ func (channel *Channel) UpdateResponseTime(responseTime int64) {
 	}
 }
 
-func (channel *Channel) UpdateBalance(balance float64) {
-	err := DB.Model(channel).Select("balance_updated_time", "balance").Updates(Channel{
+func (channel *Provider) UpdateBalance(balance float64) {
+	err := DB.Model(channel).Select("balance_updated_time", "balance").Updates(Provider{
 		BalanceUpdatedTime: common.GetTimestamp(),
 		Balance:            balance,
 	}).Error
@@ -612,7 +612,7 @@ func (channel *Channel) UpdateBalance(balance float64) {
 	}
 }
 
-func (channel *Channel) Delete() error {
+func (channel *Provider) Delete() error {
 	var err error
 	err = DB.Delete(channel).Error
 	if err != nil {
@@ -627,8 +627,8 @@ var channelStatusLock sync.Mutex
 // channelPollingLocks stores locks for each channel.id to ensure thread-safe polling
 var channelPollingLocks sync.Map
 
-// GetChannelPollingLock returns or creates a mutex for the given channel ID
-func GetChannelPollingLock(channelId int) *sync.Mutex {
+// GetProviderPollingLock returns or creates a mutex for the given channel ID
+func GetProviderPollingLock(channelId int) *sync.Mutex {
 	if lock, exists := channelPollingLocks.Load(channelId); exists {
 		return lock.(*sync.Mutex)
 	}
@@ -638,11 +638,11 @@ func GetChannelPollingLock(channelId int) *sync.Mutex {
 	return actual.(*sync.Mutex)
 }
 
-// CleanupChannelPollingLocks removes locks for channels that no longer exist
+// CleanupProviderPollingLocks removes locks for channels that no longer exist
 // This is optional and can be called periodically to prevent memory leaks
-func CleanupChannelPollingLocks() {
+func CleanupProviderPollingLocks() {
 	var activeChannelIds []int
-	DB.Model(&Channel{}).Pluck("id", &activeChannelIds)
+	DB.Model(&Provider{}).Pluck("id", &activeChannelIds)
 
 	activeChannelSet := make(map[int]bool)
 	for _, id := range activeChannelIds {
@@ -658,7 +658,7 @@ func CleanupChannelPollingLocks() {
 	})
 }
 
-func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason string) {
+func handlerMultiKeyUpdate(channel *Provider, usingKey string, status int, reason string) {
 	keys := channel.GetKeys()
 	if len(keys) == 0 {
 		channel.Status = status
@@ -682,26 +682,26 @@ func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason
 			channel.SetOtherInfo(info)
 			return
 		}
-		if channel.ChannelInfo.MultiKeyStatusList == nil {
-			channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
+		if channel.ProviderInfo.MultiKeyStatusList == nil {
+			channel.ProviderInfo.MultiKeyStatusList = make(map[int]int)
 		}
 		if status == common.ChannelStatusEnabled {
-			delete(channel.ChannelInfo.MultiKeyStatusList, keyIndex)
+			delete(channel.ProviderInfo.MultiKeyStatusList, keyIndex)
 		} else {
-			channel.ChannelInfo.MultiKeyStatusList[keyIndex] = status
-			if channel.ChannelInfo.MultiKeyDisabledReason == nil {
-				channel.ChannelInfo.MultiKeyDisabledReason = make(map[int]string)
+			channel.ProviderInfo.MultiKeyStatusList[keyIndex] = status
+			if channel.ProviderInfo.MultiKeyDisabledReason == nil {
+				channel.ProviderInfo.MultiKeyDisabledReason = make(map[int]string)
 			}
-			if channel.ChannelInfo.MultiKeyDisabledTime == nil {
-				channel.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64)
+			if channel.ProviderInfo.MultiKeyDisabledTime == nil {
+				channel.ProviderInfo.MultiKeyDisabledTime = make(map[int]int64)
 			}
-			channel.ChannelInfo.MultiKeyDisabledReason[keyIndex] = reason
-			channel.ChannelInfo.MultiKeyDisabledTime[keyIndex] = common.GetTimestamp()
+			channel.ProviderInfo.MultiKeyDisabledReason[keyIndex] = reason
+			channel.ProviderInfo.MultiKeyDisabledTime[keyIndex] = common.GetTimestamp()
 		}
-		if !hasEnabledMultiKey(keys, channel.ChannelInfo.MultiKeyStatusList) {
+		if !hasEnabledMultiKey(keys, channel.ProviderInfo.MultiKeyStatusList) {
 			channel.Status = common.ChannelStatusAutoDisabled
 			info := channel.GetOtherInfo()
-			info["status_reason"] = ChannelStatusReasonAllKeysDisabled
+			info["status_reason"] = ProviderStatusReasonAllKeysDisabled
 			info["status_time"] = common.GetTimestamp()
 			channel.SetOtherInfo(info)
 		} else if status == common.ChannelStatusEnabled {
@@ -723,7 +723,7 @@ func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
 	return false
 }
 
-func UpdateChannelStatus(channelId int, usingKey string, status int, reason string) bool {
+func UpdateProviderStatus(channelId int, usingKey string, status int, reason string) bool {
 	if common.MemoryCacheEnabled {
 		channelStatusLock.Lock()
 		defer channelStatusLock.Unlock()
@@ -732,21 +732,21 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 	// ChannelInfo stores both multi-key status and the polling cursor. Hold the
 	// same per-channel lock from the first read through persistence so neither
 	// writer can save a stale JSON snapshot over the other.
-	pollingLock := GetChannelPollingLock(channelId)
+	pollingLock := GetProviderPollingLock(channelId)
 	pollingLock.Lock()
 	defer pollingLock.Unlock()
 
 	if common.MemoryCacheEnabled {
-		channelCache, _ := CacheGetChannel(channelId)
+		channelCache, _ := CacheGetProvider(channelId)
 		if channelCache == nil {
 			return false
 		}
-		if channelCache.ChannelInfo.IsMultiKey {
+		if channelCache.ProviderInfo.IsMultiKey {
 			beforeStatus := channelCache.Status
 			// 如果是多Key模式，更新缓存中的状态
 			handlerMultiKeyUpdate(channelCache, usingKey, status, reason)
 			if beforeStatus != channelCache.Status {
-				CacheUpdateChannelStatus(channelId, channelCache.Status)
+				CacheUpdateProviderStatus(channelId, channelCache.Status)
 			}
 			//CacheUpdateChannel(channelCache)
 			//return true
@@ -755,7 +755,7 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 			if channelCache.Status == status {
 				return false
 			}
-			CacheUpdateChannelStatus(channelId, status)
+			CacheUpdateProviderStatus(channelId, status)
 		}
 	}
 
@@ -768,20 +768,20 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 			}
 		}
 	}()
-	channel, err := GetChannelById(channelId, true)
+	channel, err := GetProviderById(channelId, true)
 	if err != nil {
 		return false
 	} else {
 		// A manual channel operation must replace the exhaustion reason even
 		// when the status value is already manually disabled.
-		overridesKeyExhaustion := channel.ChannelInfo.IsMultiKey && usingKey == "" &&
-			status == common.ChannelStatusManuallyDisabled && reason != ChannelStatusReasonAllKeysDisabled &&
-			channel.GetOtherInfo()["status_reason"] == ChannelStatusReasonAllKeysDisabled
+		overridesKeyExhaustion := channel.ProviderInfo.IsMultiKey && usingKey == "" &&
+			status == common.ChannelStatusManuallyDisabled && reason != ProviderStatusReasonAllKeysDisabled &&
+			channel.GetOtherInfo()["status_reason"] == ProviderStatusReasonAllKeysDisabled
 		if channel.Status == status && !overridesKeyExhaustion {
 			return false
 		}
 
-		if channel.ChannelInfo.IsMultiKey {
+		if channel.ProviderInfo.IsMultiKey {
 			beforeStatus := channel.Status
 			handlerMultiKeyUpdate(channel, usingKey, status, reason)
 			if beforeStatus != channel.Status {
@@ -804,8 +804,8 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 	return true
 }
 
-func EnableChannelByTag(tag string) error {
-	err := DB.Model(&Channel{}).Where("tag = ?", tag).Update("status", common.ChannelStatusEnabled).Error
+func EnableProviderByTag(tag string) error {
+	err := DB.Model(&Provider{}).Where("tag = ?", tag).Update("status", common.ChannelStatusEnabled).Error
 	if err != nil {
 		return err
 	}
@@ -813,21 +813,21 @@ func EnableChannelByTag(tag string) error {
 	return err
 }
 
-func DisableChannelByTag(tag string) error {
+func DisableProviderByTag(tag string) error {
 	// Explicit tag-level disable also cancels automatic restoration for
 	// channels that were already disabled because all keys were unavailable.
-	var channels []Channel
+	var channels []Provider
 	if err := DB.Where("tag = ?", tag).Find(&channels).Error; err != nil {
 		return err
 	}
 	for _, channel := range channels {
-		if channel.ChannelInfo.IsMultiKey && channel.GetOtherInfo()["status_reason"] == ChannelStatusReasonAllKeysDisabled {
-			if !UpdateChannelStatus(channel.Id, "", common.ChannelStatusManuallyDisabled, "manual tag operation") {
+		if channel.ProviderInfo.IsMultiKey && channel.GetOtherInfo()["status_reason"] == ProviderStatusReasonAllKeysDisabled {
+			if !UpdateProviderStatus(channel.Id, "", common.ChannelStatusManuallyDisabled, "manual tag operation") {
 				return fmt.Errorf("failed to disable channel #%d by tag", channel.Id)
 			}
 		}
 	}
-	err := DB.Model(&Channel{}).Where("tag = ?", tag).Update("status", common.ChannelStatusManuallyDisabled).Error
+	err := DB.Model(&Provider{}).Where("tag = ?", tag).Update("status", common.ChannelStatusManuallyDisabled).Error
 	if err != nil {
 		return err
 	}
@@ -835,8 +835,8 @@ func DisableChannelByTag(tag string) error {
 	return err
 }
 
-func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *string, group *string, priority *int64, weight *uint, paramOverride *string, headerOverride *string) error {
-	updateData := Channel{}
+func EditProviderByTag(tag string, newTag *string, modelMapping *string, models *string, group *string, priority *int64, weight *uint, paramOverride *string, headerOverride *string) error {
+	updateData := Provider{}
 	shouldReCreateAbilities := false
 	updatedTag := tag
 	// 如果 newTag 不为空且不等于 tag，则更新 tag
@@ -868,12 +868,12 @@ func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *
 		updateData.HeaderOverride = headerOverride
 	}
 
-	err := DB.Model(&Channel{}).Where("tag = ?", tag).Updates(updateData).Error
+	err := DB.Model(&Provider{}).Where("tag = ?", tag).Updates(updateData).Error
 	if err != nil {
 		return err
 	}
 	if shouldReCreateAbilities {
-		channels, err := GetChannelsByTag(updatedTag, false, false)
+		channels, err := GetProvidersByTag(updatedTag, false, false)
 		if err == nil {
 			for _, channel := range channels {
 				err = channel.UpdateAbilities(nil)
@@ -891,7 +891,7 @@ func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *
 	return nil
 }
 
-func UpdateChannelUsedQuota(id int, quota int) {
+func UpdateProviderUsedQuota(id int, quota int) {
 	if common.BatchUpdateEnabled {
 		addNewRecord(BatchUpdateTypeChannelUsedQuota, id, quota)
 		return
@@ -900,27 +900,27 @@ func UpdateChannelUsedQuota(id int, quota int) {
 }
 
 func updateChannelUsedQuota(id int, quota int) {
-	err := DB.Model(&Channel{}).Where("id = ?", id).Update("used_quota", gorm.Expr("used_quota + ?", quota)).Error
+	err := DB.Model(&Provider{}).Where("id = ?", id).Update("used_quota", gorm.Expr("used_quota + ?", quota)).Error
 	if err != nil {
 		common.SysLog(common.LogText("failed to update channel used quota: channel_id=%d, delta_quota=%d, error=%v", id, quota, err))
 	}
 }
 
-func DeleteChannelByStatus(status int64) (int64, error) {
-	result := DB.Where("status = ?", status).Delete(&Channel{})
+func DeleteProviderByStatus(status int64) (int64, error) {
+	result := DB.Where("status = ?", status).Delete(&Provider{})
 	return result.RowsAffected, result.Error
 }
 
-func DeleteDisabledChannel() (int64, error) {
-	result := DB.Where("status = ? or status = ?", common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled).Delete(&Channel{})
+func DeleteDisabledProvider() (int64, error) {
+	result := DB.Where("status = ? or status = ?", common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled).Delete(&Provider{})
 	return result.RowsAffected, result.Error
 }
 
 func GetPaginatedTags(offset int, limit int) ([]*string, error) {
-	return GetPaginatedChannelTags(DB.Model(&Channel{}), offset, limit)
+	return GetPaginatedProviderTags(DB.Model(&Provider{}), offset, limit)
 }
 
-func GetPaginatedChannelTags(query *gorm.DB, offset int, limit int) ([]*string, error) {
+func GetPaginatedProviderTags(query *gorm.DB, offset int, limit int) ([]*string, error) {
 	var tags []*string
 	err := query.
 		Select("DISTINCT tag").
@@ -940,12 +940,12 @@ func SearchTags(keyword string, group string, model string, idSort bool) ([]*str
 	}
 
 	// 构造基础查询
-	baseQuery := DB.Model(&Channel{}).Omit("key")
+	baseQuery := DB.Model(&Provider{}).Omit("key")
 
 	// 构造WHERE子句
 	whereClause := `(id = ? OR name LIKE ? OR "key" = ? OR "base_url" LIKE ?) AND "models" LIKE ?`
 	args := []any{common.String2Int(keyword), "%" + keyword + "%", keyword, "%" + keyword + "%", "%" + model + "%"}
-	baseQuery = ApplyChannelGroupFilter(baseQuery.Where(whereClause, args...), group)
+	baseQuery = ApplyProviderGroupFilter(baseQuery.Where(whereClause, args...), group)
 
 	subQuery := baseQuery.
 		Select("tag").
@@ -963,7 +963,7 @@ func SearchTags(keyword string, group string, model string, idSort bool) ([]*str
 	return tags, nil
 }
 
-func (channel *Channel) ValidateSettings() error {
+func (channel *Provider) ValidateSettings() error {
 	channelParams := &dto.ChannelSettings{}
 	if channel.Setting != nil && *channel.Setting != "" {
 		err := common.Unmarshal([]byte(*channel.Setting), channelParams)
@@ -1008,7 +1008,7 @@ func (channel *Channel) ValidateSettings() error {
 	return nil
 }
 
-func (channel *Channel) GetSetting() dto.ChannelSettings {
+func (channel *Provider) GetSetting() dto.ChannelSettings {
 	setting := dto.ChannelSettings{}
 	if channel.Setting != nil && *channel.Setting != "" {
 		err := common.Unmarshal([]byte(*channel.Setting), &setting)
@@ -1021,7 +1021,7 @@ func (channel *Channel) GetSetting() dto.ChannelSettings {
 	return setting
 }
 
-func (channel *Channel) SetSetting(setting dto.ChannelSettings) {
+func (channel *Provider) SetSetting(setting dto.ChannelSettings) {
 	settingBytes, err := common.Marshal(setting)
 	if err != nil {
 		common.SysLog(common.LogText("failed to marshal setting: channel_id=%d, error=%v", channel.Id, err))
@@ -1030,7 +1030,7 @@ func (channel *Channel) SetSetting(setting dto.ChannelSettings) {
 	channel.Setting = common.GetPointer[string](string(settingBytes))
 }
 
-func (channel *Channel) GetOtherSettings() dto.ChannelOtherSettings {
+func (channel *Provider) GetOtherSettings() dto.ChannelOtherSettings {
 	setting := dto.ChannelOtherSettings{}
 	if channel.OtherSettings != "" {
 		err := common.UnmarshalJsonStr(channel.OtherSettings, &setting)
@@ -1046,7 +1046,7 @@ func (channel *Channel) GetOtherSettings() dto.ChannelOtherSettings {
 	return setting
 }
 
-func (channel *Channel) SetOtherSettings(setting dto.ChannelOtherSettings) {
+func (channel *Provider) SetOtherSettings(setting dto.ChannelOtherSettings) {
 	settingBytes, err := common.Marshal(setting)
 	if err != nil {
 		common.SysLog(common.LogText("failed to marshal setting: channel_id=%d, error=%v", channel.Id, err))
@@ -1055,7 +1055,7 @@ func (channel *Channel) SetOtherSettings(setting dto.ChannelOtherSettings) {
 	channel.OtherSettings = string(settingBytes)
 }
 
-func (channel *Channel) GetParamOverride() map[string]any {
+func (channel *Provider) GetParamOverride() map[string]any {
 	paramOverride := make(map[string]any)
 	if channel.ParamOverride != nil && *channel.ParamOverride != "" {
 		err := common.Unmarshal([]byte(*channel.ParamOverride), &paramOverride)
@@ -1066,7 +1066,7 @@ func (channel *Channel) GetParamOverride() map[string]any {
 	return paramOverride
 }
 
-func (channel *Channel) GetHeaderOverride() map[string]any {
+func (channel *Provider) GetHeaderOverride() map[string]any {
 	headerOverride := make(map[string]any)
 	if channel.HeaderOverride != nil && *channel.HeaderOverride != "" {
 		err := common.Unmarshal([]byte(*channel.HeaderOverride), &headerOverride)
@@ -1077,13 +1077,13 @@ func (channel *Channel) GetHeaderOverride() map[string]any {
 	return headerOverride
 }
 
-func GetChannelsByIds(ids []int) ([]*Channel, error) {
-	var channels []*Channel
+func GetProvidersByIds(ids []int) ([]*Provider, error) {
+	var channels []*Provider
 	err := DB.Where("id in (?)", ids).Find(&channels).Error
 	return channels, err
 }
 
-func BatchSetChannelTag(ids []int, tag *string) error {
+func BatchSetProviderTag(ids []int, tag *string) error {
 	// 开启事务
 	tx := DB.Begin()
 	if tx.Error != nil {
@@ -1091,14 +1091,14 @@ func BatchSetChannelTag(ids []int, tag *string) error {
 	}
 
 	// 更新标签
-	err := tx.Model(&Channel{}).Where("id in (?)", ids).Update("tag", tag).Error
+	err := tx.Model(&Provider{}).Where("id in (?)", ids).Update("tag", tag).Error
 	if err != nil {
 		tx.Rollback()
 		return err
 	}
 
 	// update ability status
-	channels, err := GetChannelsByIds(ids)
+	channels, err := GetProvidersByIds(ids)
 	if err != nil {
 		tx.Rollback()
 		return err
@@ -1116,27 +1116,27 @@ func BatchSetChannelTag(ids []int, tag *string) error {
 	return tx.Commit().Error
 }
 
-// CountAllChannels returns total channels in DB
-func CountAllChannels() (int64, error) {
+// CountAllProviders returns total channels in DB
+func CountAllProviders() (int64, error) {
 	var total int64
-	err := DB.Model(&Channel{}).Count(&total).Error
+	err := DB.Model(&Provider{}).Count(&total).Error
 	return total, err
 }
 
 // CountAllTags returns number of non-empty distinct tags
 func CountAllTags() (int64, error) {
-	return CountChannelTags(DB.Model(&Channel{}))
+	return CountProviderTags(DB.Model(&Provider{}))
 }
 
-func CountChannelTags(query *gorm.DB) (int64, error) {
+func CountProviderTags(query *gorm.DB) (int64, error) {
 	var total int64
 	err := query.Where("tag is not null AND tag != ''").Distinct("tag").Count(&total).Error
 	return total, err
 }
 
 // Get channels of specified type with pagination
-func GetChannelsByType(startIdx int, num int, idSort bool, channelType int) ([]*Channel, error) {
-	var channels []*Channel
+func GetProvidersByType(startIdx int, num int, idSort bool, channelType int) ([]*Provider, error) {
+	var channels []*Provider
 	order := "priority desc"
 	if idSort {
 		order = "id desc"
@@ -1146,20 +1146,20 @@ func GetChannelsByType(startIdx int, num int, idSort bool, channelType int) ([]*
 }
 
 // Count channels of specific type
-func CountChannelsByType(channelType int) (int64, error) {
+func CountProvidersByType(channelType int) (int64, error) {
 	var count int64
-	err := DB.Model(&Channel{}).Where("type = ?", channelType).Count(&count).Error
+	err := DB.Model(&Provider{}).Where("type = ?", channelType).Count(&count).Error
 	return count, err
 }
 
 // Return map[type]count for all channels
-func CountChannelsGroupByType() (map[int64]int64, error) {
+func CountProvidersGroupByType() (map[int64]int64, error) {
 	type result struct {
 		Type  int64 `gorm:"column:type"`
 		Count int64 `gorm:"column:count"`
 	}
 	var results []result
-	err := DB.Model(&Channel{}).Select("type, count(*) as count").Group("type").Find(&results).Error
+	err := DB.Model(&Provider{}).Select("type, count(*) as count").Group("type").Find(&results).Error
 	if err != nil {
 		return nil, err
 	}

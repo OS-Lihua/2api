@@ -616,12 +616,12 @@ func SetTaskPluginStatus(c *gin.Context) {
 					}
 					continue
 				}
-				if model.UpdateChannelStatus(channel.Id, "", common.ChannelStatusManuallyDisabled, "task plugin disabled") {
+				if model.UpdateProviderStatus(channel.Id, "", common.ChannelStatusManuallyDisabled, "task plugin disabled") {
 					disabledChannels++
 				}
 			}
 			if unboundChannels > 0 {
-				model.InitChannelCache()
+				model.InitProviderCache()
 			}
 		}
 	}

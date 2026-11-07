@@ -24,7 +24,7 @@ export function parseTaskResult() { return {}; }
 	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister("channel-validation") })
 	baseURL := "https://example.com"
 
-	channel := &model.Channel{Type: constant.ChannelTypeTaskPlugin, BaseURL: &baseURL}
+	channel := &model.Provider{Type: constant.ChannelTypeTaskPlugin, BaseURL: &baseURL}
 	require.ErrorContains(t, validateChannel(channel, false), "task plugin key is required")
 
 	missing := `{"task_plugin_key":"missing"}`
@@ -56,14 +56,14 @@ export function parseTaskResult() { return {}; }
 
 	empty := "  "
 	for _, baseURL := range []*string{nil, &empty} {
-		channel := &model.Channel{Type: constant.ChannelTypeTaskPlugin, Key: "sk", Setting: &bound, BaseURL: baseURL}
+		channel := &model.Provider{Type: constant.ChannelTypeTaskPlugin, Key: "sk", Setting: &bound, BaseURL: baseURL}
 		require.NoError(t, validateChannel(channel, true))
 		require.NotNil(t, channel.BaseURL)
 		assert.Equal(t, "http://127.0.0.1:8000", *channel.BaseURL, "normalized plugin default is persisted onto the channel")
 	}
 
 	explicit := "https://override.example.com"
-	channel := &model.Channel{Type: constant.ChannelTypeTaskPlugin, Setting: &bound, BaseURL: &explicit}
+	channel := &model.Provider{Type: constant.ChannelTypeTaskPlugin, Setting: &bound, BaseURL: &explicit}
 	require.NoError(t, validateChannel(channel, false))
 	assert.Equal(t, explicit, *channel.BaseURL, "an administrator value is never replaced by the plugin default")
 }
@@ -99,7 +99,7 @@ export function parseTaskResult() { return {}; }
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			setting := tc.setting
-			channel := &model.Channel{Type: constant.ChannelTypeNewAPI, BaseURL: &baseURL, Setting: &setting}
+			channel := &model.Provider{Type: constant.ChannelTypeNewAPI, BaseURL: &baseURL, Setting: &setting}
 			err := validateChannel(channel, false)
 			if tc.wantErr == "" {
 				require.NoError(t, err)
@@ -110,6 +110,6 @@ export function parseTaskResult() { return {}; }
 	}
 
 	setting := `{"task_extend_plugin_keys":["gateway-ext-a"]}`
-	channel := &model.Channel{Type: constant.ChannelTypeOpenAI, Setting: &setting}
+	channel := &model.Provider{Type: constant.ChannelTypeOpenAI, Setting: &setting}
 	require.ErrorContains(t, validateChannel(channel, false), "only supported on New API channels")
 }

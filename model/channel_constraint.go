@@ -14,10 +14,10 @@ var filterEvalOrder = []dto.ChannelFilterKind{
 	dto.FilterResponsesWebSocket,
 }
 
-// ChannelSatisfiesFilters reports whether ch passes every filter.
+// ProviderSatisfiesFilters reports whether ch passes every filter.
 // On false, it returns the first violated filter in filterEvalOrder for error
 // attribution.
-func ChannelSatisfiesFilters(ch *Channel, modelName string, filters []dto.ChannelFilter) (bool, dto.ChannelFilterKind) {
+func ProviderSatisfiesFilters(ch *Provider, modelName string, filters []dto.ChannelFilter) (bool, dto.ChannelFilterKind) {
 	if ch == nil {
 		return false, ""
 	}
@@ -73,7 +73,7 @@ func filtersByKind(filters []dto.ChannelFilter, kind dto.ChannelFilterKind) []dt
 	return matched
 }
 
-func candidatePassesKindFilters(ch *Channel, exists bool, modelName string, kind dto.ChannelFilterKind, filters []dto.ChannelFilter) bool {
+func candidatePassesKindFilters(ch *Provider, exists bool, modelName string, kind dto.ChannelFilterKind, filters []dto.ChannelFilter) bool {
 	if kind == dto.FilterRequestPath && !exists {
 		return true
 	}
@@ -88,7 +88,7 @@ func candidatePassesKindFilters(ch *Channel, exists bool, modelName string, kind
 	return true
 }
 
-func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilter) bool {
+func channelMatchesFilter(ch *Provider, modelName string, filter dto.ChannelFilter) bool {
 	switch filter.Kind {
 	case dto.FilterRequestPath:
 		if filter.RequestPath == "" {

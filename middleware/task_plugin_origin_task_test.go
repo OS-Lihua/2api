@@ -25,15 +25,15 @@ func setupOriginTaskDB(t *testing.T) {
 	t.Helper()
 	previousDB := model.DB
 	database := model.UseTestDatabases(t)
-	require.NoError(t, database.AutoMigrate(&model.Task{}, &model.Channel{}))
+	require.NoError(t, database.AutoMigrate(&model.Task{}, &model.Provider{}))
 	t.Cleanup(func() {
 		model.DB = previousDB
 	})
 }
 
-func insertOriginTaskChannel(t *testing.T, status int) *model.Channel {
+func insertOriginTaskChannel(t *testing.T, status int) *model.Provider {
 	t.Helper()
-	channel := &model.Channel{
+	channel := &model.Provider{
 		Name:   "origin-channel",
 		Key:    "sk-origin",
 		Status: status,

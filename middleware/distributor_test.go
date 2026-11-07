@@ -21,7 +21,7 @@ import (
 )
 
 func TestChannelMatchesExpectedTaskPluginUsesGenericChannelSetting(t *testing.T) {
-	channel := &model.Channel{Type: constant.ChannelTypeTaskPlugin}
+	channel := &model.Provider{Type: constant.ChannelTypeTaskPlugin}
 	channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "generic-alpha"})
 
 	assert.True(t, channelMatchesExpectedTaskPlugin(nil, channel, "generic-alpha"))
@@ -44,11 +44,11 @@ func TestChannelMatchesExpectedTaskPluginUsesPinnedLegacyIndex(t *testing.T) {
 		Generation: pinnedGeneration,
 		Plugin:     alpha,
 	})
-	channel := &model.Channel{Type: constant.ChannelTypeKling}
+	channel := &model.Provider{Type: constant.ChannelTypeKling}
 
 	assert.True(t, channelMatchesExpectedTaskPlugin(c, channel, "legacy-alpha"))
 	assert.False(t, channelMatchesExpectedTaskPlugin(c, channel, "legacy-beta"))
-	assert.False(t, channelMatchesExpectedTaskPlugin(c, &model.Channel{Type: constant.ChannelTypeJimeng}, "legacy-alpha"))
+	assert.False(t, channelMatchesExpectedTaskPlugin(c, &model.Provider{Type: constant.ChannelTypeJimeng}, "legacy-alpha"))
 }
 
 func TestChannelMatchesExpectedTaskPluginRejectsUnindexedLegacyChannel(t *testing.T) {
@@ -62,13 +62,13 @@ func TestChannelMatchesExpectedTaskPluginRejectsUnindexedLegacyChannel(t *testin
 		Plugin:     plugin,
 	})
 
-	assert.False(t, channelMatchesExpectedTaskPlugin(c, &model.Channel{Type: constant.ChannelTypeJimeng}, "legacy-alpha"))
-	assert.False(t, channelMatchesExpectedTaskPlugin(c, &model.Channel{Type: 0}, "legacy-alpha"))
-	assert.True(t, channelMatchesExpectedTaskPlugin(c, &model.Channel{Type: constant.ChannelTypeJimeng}, ""))
-	assert.False(t, channelMatchesExpectedTaskPlugin(nil, &model.Channel{Type: constant.ChannelTypeKling}, "legacy-alpha"))
+	assert.False(t, channelMatchesExpectedTaskPlugin(c, &model.Provider{Type: constant.ChannelTypeJimeng}, "legacy-alpha"))
+	assert.False(t, channelMatchesExpectedTaskPlugin(c, &model.Provider{Type: 0}, "legacy-alpha"))
+	assert.True(t, channelMatchesExpectedTaskPlugin(c, &model.Provider{Type: constant.ChannelTypeJimeng}, ""))
+	assert.False(t, channelMatchesExpectedTaskPlugin(nil, &model.Provider{Type: constant.ChannelTypeKling}, "legacy-alpha"))
 
 	c.Set("expected_task_plugin_key", "legacy-alpha")
-	setupErr := SetupContextForSelectedChannel(c, &model.Channel{Type: constant.ChannelTypeJimeng}, "task-model")
+	setupErr := SetupContextForSelectedChannel(c, &model.Provider{Type: constant.ChannelTypeJimeng}, "task-model")
 	require.NotNil(t, setupErr)
 	assert.Contains(t, setupErr.Error(), "does not match")
 }
@@ -94,11 +94,11 @@ func TestSharedEndpointRebindsToSelectedLegacyProvider(t *testing.T) {
 	})
 	c.Set("expected_task_plugin_key", candidates[0].Plugin.Meta.Key)
 
-	geminiChannel := &model.Channel{Id: 1, Type: constant.ChannelTypeGemini}
-	vertexChannel := &model.Channel{Id: 2, Type: constant.ChannelTypeVertexAi}
+	geminiChannel := &model.Provider{Id: 1, Type: constant.ChannelTypeGemini}
+	vertexChannel := &model.Provider{Id: 2, Type: constant.ChannelTypeVertexAi}
 	assert.True(t, channelMatchesExpectedTaskPlugin(c, geminiChannel, candidates[0].Plugin.Meta.Key))
 	assert.True(t, channelMatchesExpectedTaskPlugin(c, vertexChannel, candidates[0].Plugin.Meta.Key))
-	assert.False(t, channelMatchesExpectedTaskPlugin(c, &model.Channel{Type: constant.ChannelTypeKling}, candidates[0].Plugin.Meta.Key))
+	assert.False(t, channelMatchesExpectedTaskPlugin(c, &model.Provider{Type: constant.ChannelTypeKling}, candidates[0].Plugin.Meta.Key))
 
 	require.Nil(t, SetupContextForSelectedChannel(c, vertexChannel, "task-model"))
 	pinnedValue, exists := c.Get(jsplugin.ContextKeyPinnedEndpoint)
@@ -302,7 +302,7 @@ func TestSharedEndpointRebindsToSelectedType61Plugin(t *testing.T) {
 	c.Set(jsplugin.ContextKeyPinnedPlugin, jsplugin.PinnedPlugin{Generation: generation, Plugin: candidates[0].Plugin})
 	c.Set(jsplugin.ContextKeyPinnedEndpoint, jsplugin.PinnedEndpoint{Generation: generation, Plugin: candidates[0].Plugin, Protocol: candidates[0].Protocol, Operation: candidates[0].Operation, Model: "task-model", Candidates: candidates})
 	c.Set("expected_task_plugin_key", "alpha")
-	channel := &model.Channel{Id: 2, Type: constant.ChannelTypeTaskPlugin}
+	channel := &model.Provider{Id: 2, Type: constant.ChannelTypeTaskPlugin}
 	channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "unrelated"})
 	assert.False(t, channelMatchesExpectedTaskPlugin(c, channel, "alpha"))
 	channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "beta"})
@@ -335,7 +335,7 @@ export function parseTaskResult() { return {}; }
 	c.Set(jsplugin.ContextKeyPinnedPlugin, jsplugin.PinnedPlugin{Generation: generation, Plugin: candidates[0].Plugin})
 	c.Set(jsplugin.ContextKeyPinnedRoute, jsplugin.PinnedRoute{Generation: generation, Plugin: candidates[0].Plugin, Route: candidates[0].Route, Candidates: candidates})
 	c.Set("expected_task_plugin_key", "route-alpha")
-	channel := &model.Channel{Id: 3, Type: constant.ChannelTypeTaskPlugin}
+	channel := &model.Provider{Id: 3, Type: constant.ChannelTypeTaskPlugin}
 	channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "unrelated"})
 	assert.False(t, channelMatchesExpectedTaskPlugin(c, channel, "route-alpha"))
 	channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "route-beta"})
@@ -351,14 +351,14 @@ export function parseTaskResult() { return {}; }
 }
 
 func TestChannelMatchesExpectedTaskPluginUsesNewAPIExtensions(t *testing.T) {
-	channel := &model.Channel{Type: constant.ChannelTypeNewAPI}
+	channel := &model.Provider{Type: constant.ChannelTypeNewAPI}
 	channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "single", TaskExtendPluginKeys: []string{"ext-alpha", "ext-beta"}})
 
 	assert.True(t, channelMatchesExpectedTaskPlugin(nil, channel, "ext-alpha"))
 	assert.True(t, channelMatchesExpectedTaskPlugin(nil, channel, "single"), "the single key stays valid on a New API channel")
 	assert.False(t, channelMatchesExpectedTaskPlugin(nil, channel, "ext-gamma"))
 	assert.True(t, channelMatchesExpectedTaskPlugin(nil, channel, ""), "requests without a pinned plugin still use the gateway")
-	assert.False(t, channelMatchesExpectedTaskPlugin(nil, &model.Channel{Type: constant.ChannelTypeNewAPI}, "ext-alpha"))
+	assert.False(t, channelMatchesExpectedTaskPlugin(nil, &model.Provider{Type: constant.ChannelTypeNewAPI}, "ext-alpha"))
 }
 
 func TestSharedEndpointRebindsToBoundNewAPIExtension(t *testing.T) {
@@ -383,7 +383,7 @@ func TestSharedEndpointRebindsToBoundNewAPIExtension(t *testing.T) {
 		return c
 	}
 
-	channel := &model.Channel{Id: 3, Type: constant.ChannelTypeNewAPI}
+	channel := &model.Provider{Id: 3, Type: constant.ChannelTypeNewAPI}
 	channel.SetSetting(dto.ChannelSettings{TaskExtendPluginKeys: []string{"unrelated"}})
 	assert.False(t, channelMatchesExpectedTaskPlugin(pin("alpha"), channel, "alpha"))
 

@@ -260,7 +260,7 @@ type responsesWSBillingTest struct {
 	httpDone     chan struct{}
 	user         *model.User
 	token        *model.Token
-	channel      *model.Channel
+	channel      *model.Provider
 	client       *websocket.Conn
 	done         chan struct{}
 	upstreamDone chan struct{}
@@ -336,7 +336,7 @@ func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*web
 		"group_ratio_setting.group_ratio": `{"default":1}`,
 		"perf_metrics_setting.enabled":    "true",
 	}))
-	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.Provider{}, &model.Ability{}))
 	require.NoError(t, model.LOG_DB.AutoMigrate(&model.Log{}))
 	require.NoError(t, model.DB.Model(user).Updates(map[string]any{"quota": 100000, "setting": `{"billing_preference":"wallet_only"}`}).Error)
 	require.NoError(t, model.DB.Model(token).Update("remain_quota", 3000).Error)
@@ -370,8 +370,8 @@ func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*web
 		handle(ws, r)
 	}))
 	t.Cleanup(upstream.Close)
-	channel := &model.Channel{Name: "responses-ws-upstream", Key: "upstream-first\nupstream-second", Status: common.ChannelStatusEnabled, Type: constant.ChannelTypeOpenAI, Group: "default", Models: "ws-billing", BaseURL: &upstream.URL,
-		ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}}
+	channel := &model.Provider{Name: "responses-ws-upstream", Key: "upstream-first\nupstream-second", Status: common.ChannelStatusEnabled, Type: constant.ChannelTypeOpenAI, Group: "default", Models: "ws-billing", BaseURL: &upstream.URL,
+		ProviderInfo: model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}}
 	modelMapping := `{"ws-billing":"gpt-4o"}`
 	channel.ModelMapping = &modelMapping
 	channel.SetSetting(dto.ChannelSettings{ResponsesWebSocketEnabled: true})
@@ -1001,7 +1001,7 @@ func TestResponsesHTTPHealthCountsFinalResult(t *testing.T) {
 				_, _ = fmt.Fprint(w, `{"id":"completed","status":"completed","usage":{"input_tokens":1000,"output_tokens":1,"total_tokens":1001}}`)
 			}))
 			t.Cleanup(upstream.Close)
-			require.NoError(t, model.DB.Model(&model.Channel{}).Where("name = ?", "responses-ws-upstream").Update("base_url", upstream.URL).Error)
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("name = ?", "responses-ws-upstream").Update("base_url", upstream.URL).Error)
 			request, err := http.NewRequest(http.MethodPost, fixture.gatewayURL+"/v1/responses", strings.NewReader(`{"model":"ws-billing","input":"hello"}`))
 			require.NoError(t, err)
 			request.Header.Set("Authorization", "Bearer sk-"+fixture.token.Key)

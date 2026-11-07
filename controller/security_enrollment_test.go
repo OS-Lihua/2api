@@ -1009,8 +1009,8 @@ func TestSecurityEnrollmentPasskeyProofProtectsChannelKeyRead(t *testing.T) {
 	user, identity := setupSecurityEnrollmentTest(t)
 	require.NoError(t, model.DB.Model(user).Update("role", common.RoleRootUser).Error)
 	require.NoError(t, model.PublishUserAuthCache(user.Id))
-	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}))
-	for _, channel := range []model.Channel{
+	require.NoError(t, model.DB.AutoMigrate(&model.Provider{}))
+	for _, channel := range []model.Provider{
 		{Id: 123, Name: "first", Key: "first-channel-secret", Type: 1, Status: 1},
 		{Id: 456, Name: "second", Key: "second-channel-secret", Type: 1, Status: 1},
 	} {
@@ -1741,7 +1741,7 @@ func TestSecurityEnrollmentNeverTrustsSessionForFirstFactor(t *testing.T) {
 
 func TestSecurityEnrollmentMissingTargetsAreBusinessErrors(t *testing.T) {
 	_, identity := setupSecurityEnrollmentTest(t)
-	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.Provider{}))
 	for _, target := range []struct {
 		path, message string
 		handler       gin.HandlerFunc
@@ -1768,7 +1768,7 @@ func TestSecurityEnrollmentMissingTargetsAreBusinessErrors(t *testing.T) {
 			assert.Contains(t, invalid.Body.String(), `"success":false`)
 		}
 		require.NoError(t, model.DB.Callback().Query().Before("gorm:query").Register("target_query_failure", func(tx *gorm.DB) {
-			if tx.Statement.Table == "users" || tx.Statement.Table == "channels" {
+			if tx.Statement.Table == "users" || tx.Statement.Table == "providers" {
 				tx.AddError(errors.New("private database failure"))
 			}
 		}))

@@ -25,7 +25,7 @@ func setupChannelCreateTest(t *testing.T) int {
 	database := model.UseTestDatabases(t)
 	model.LOG_DB = database
 	common.SetLogDatabaseType(common.DatabaseTypePostgreSQL)
-	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.User{}, &model.Log{}, &model.AuditLog{}))
+	require.NoError(t, database.AutoMigrate(&model.Provider{}, &model.Ability{}, &model.User{}, &model.Log{}, &model.AuditLog{}))
 	root := &model.User{Username: "channel-create-review-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled}
 	require.NoError(t, database.Create(root).Error)
 	t.Cleanup(func() { require.NoError(t, database.Unscoped().Delete(root).Error) })
@@ -72,15 +72,15 @@ func TestAddChannelReturnsCreatedIDs(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			name := "created-id-" + tc.name
-			existing := &model.Channel{Name: name, Type: 1, Key: firstKey, Models: "test-model", Group: "default"}
+			existing := &model.Provider{Name: name, Type: 1, Key: firstKey, Models: "test-model", Group: "default"}
 			require.NoError(t, existing.Insert())
 			t.Cleanup(func() {
 				var ids []int
-				require.NoError(t, model.DB.Model(&model.Channel{}).Where("name = ?", name).Pluck("id", &ids).Error)
-				_, err := model.BatchDeleteChannels(ids)
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("name = ?", name).Pluck("id", &ids).Error)
+				_, err := model.BatchDeleteProviders(ids)
 				require.NoError(t, err)
 			})
-			channel := &model.Channel{Name: name, Type: tc.channelType, Key: tc.key, Models: "test-model", Group: "default", OtherSettings: tc.settings}
+			channel := &model.Provider{Name: name, Type: tc.channelType, Key: tc.key, Models: "test-model", Group: "default", OtherSettings: tc.settings}
 			if channel.Type == 0 {
 				channel.Type = constant.ChannelTypeOpenAI
 			}
@@ -109,14 +109,14 @@ func TestAddChannelReturnsCreatedIDs(t *testing.T) {
 			require.NotNil(t, result.Data.IDs, "empty creations must return an array, not null")
 			require.Len(t, result.Data.IDs, len(tc.wantKeys))
 			assert.NotContains(t, result.Data.IDs, existing.Id)
-			var created []model.Channel
+			var created []model.Provider
 			require.NoError(t, model.DB.Where("name = ? AND id <> ?", name, existing.Id).Order("id").Find(&created).Error)
 			require.Len(t, created, len(tc.wantKeys))
 			for i, channel := range created {
 				assert.Positive(t, result.Data.IDs[i])
 				assert.Equal(t, channel.Id, result.Data.IDs[i])
 				assert.Equal(t, tc.wantKeys[i], channel.Key)
-				assert.Equal(t, tc.mode == "multi_to_single", channel.ChannelInfo.IsMultiKey)
+				assert.Equal(t, tc.mode == "multi_to_single", channel.ProviderInfo.IsMultiKey)
 			}
 			require.NotNil(t, result.Data.Results, "empty creations must return an empty results array")
 			require.Len(t, result.Data.Results, len(tc.wantInputIndices))
@@ -131,7 +131,7 @@ func TestAddChannelReturnsCreatedIDs(t *testing.T) {
 				results = append(results, map[string]int{"input_index": inputIndex, "channel_id": created[channelIndex].Id})
 			}
 			if tc.mode == "multi_to_single" && len(created) == 1 {
-				assert.Equal(t, len(tc.wantInputIndices), created[0].ChannelInfo.MultiKeySize)
+				assert.Equal(t, len(tc.wantInputIndices), created[0].ProviderInfo.MultiKeySize)
 			}
 			data := map[string]any{"ids": result.Data.IDs, "results": results}
 			if len(created) == 1 {
@@ -153,7 +153,7 @@ func TestAddChannelInvalidVertexBatchDoesNotReturnResults(t *testing.T) {
 	for _, mode := range []string{"batch", "multi_to_single"} {
 		for _, key := range []string{"[]", `["", "  "]`, "[{"} {
 			t.Run(mode+"/"+key, func(t *testing.T) {
-				request, err := common.Marshal(AddChannelRequest{Mode: mode, Channel: &model.Channel{
+				request, err := common.Marshal(AddChannelRequest{Mode: mode, Channel: &model.Provider{
 					Name: "invalid-vertex-array", Type: constant.ChannelTypeVertexAi, Key: key,
 					Models: "test-model", Group: "default", Other: `{"default":"us-central1"}`,
 				}})
@@ -166,7 +166,7 @@ func TestAddChannelInvalidVertexBatchDoesNotReturnResults(t *testing.T) {
 				assert.NotEmpty(t, result["message"])
 				assert.NotContains(t, result, "data")
 				var count int64
-				require.NoError(t, model.DB.Model(&model.Channel{}).Where("name = ?", "invalid-vertex-array").Count(&count).Error)
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("name = ?", "invalid-vertex-array").Count(&count).Error)
 				assert.Zero(t, count)
 			})
 		}
@@ -178,14 +178,14 @@ func TestAddChannelRollbackDoesNotReturnIDs(t *testing.T) {
 	// Force a real database error in the second chunk, after the first 50 rows
 	// received IDs. This constraint exists only in the isolated test database.
 	const indexName = "channel_create_test_unique_key"
-	require.NoError(t, model.DB.Exec("CREATE UNIQUE INDEX "+indexName+` ON channels ("key")`).Error)
-	t.Cleanup(func() { require.NoError(t, model.DB.Migrator().DropIndex(&model.Channel{}, indexName)) })
+	require.NoError(t, model.DB.Exec("CREATE UNIQUE INDEX "+indexName+` ON providers ("key")`).Error)
+	t.Cleanup(func() { require.NoError(t, model.DB.Migrator().DropIndex(&model.Provider{}, indexName)) })
 	keys := make([]string, 51)
 	for i := range keys[:50] {
 		keys[i] = fmt.Sprintf("sk-create-rollback-%02d", i)
 	}
 	keys[50] = keys[0]
-	request, err := common.Marshal(AddChannelRequest{Mode: "batch", Channel: &model.Channel{
+	request, err := common.Marshal(AddChannelRequest{Mode: "batch", Channel: &model.Provider{
 		Name: "created-id-rollback", Type: 1, Key: strings.Join(keys, "\n"), Models: "test-model", Group: "default",
 	}})
 	require.NoError(t, err)
@@ -197,7 +197,7 @@ func TestAddChannelRollbackDoesNotReturnIDs(t *testing.T) {
 	assert.NotEmpty(t, result["message"])
 	assert.NotContains(t, result, "data")
 	var channels, abilities int64
-	require.NoError(t, model.DB.Model(&model.Channel{}).Where("name = ?", "created-id-rollback").Count(&channels).Error)
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("name = ?", "created-id-rollback").Count(&channels).Error)
 	require.NoError(t, model.DB.Model(&model.Ability{}).Count(&abilities).Error)
 	assert.Zero(t, channels)
 	assert.Zero(t, abilities)
@@ -209,7 +209,7 @@ func TestAddChannelPanicRollsBackWithoutSuccess(t *testing.T) {
 	channelCreates := 0
 	const callback = "test:channel-create-panic"
 	require.NoError(t, database.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
-		if tx.Statement.Table == "channels" {
+		if tx.Statement.Table == "providers" {
 			channelCreates++
 			if channelCreates == 2 {
 				panic("second channel chunk failed")
@@ -221,7 +221,7 @@ func TestAddChannelPanicRollsBackWithoutSuccess(t *testing.T) {
 	for i := range keys {
 		keys[i] = fmt.Sprintf("sk-create-panic-%02d", i)
 	}
-	request, err := common.Marshal(AddChannelRequest{Mode: "batch", Channel: &model.Channel{
+	request, err := common.Marshal(AddChannelRequest{Mode: "batch", Channel: &model.Provider{
 		Name: "created-id-panic", Type: 1, Key: strings.Join(keys, "\n"), Models: "test-model", Group: "default",
 	}})
 	require.NoError(t, err)
@@ -230,7 +230,7 @@ func TestAddChannelPanicRollsBackWithoutSuccess(t *testing.T) {
 	}, "a rolled-back transaction must not reach the success response")
 	assert.Equal(t, 2, channelCreates)
 	var channels, abilities int64
-	require.NoError(t, database.Model(&model.Channel{}).Where("name = ?", "created-id-panic").Count(&channels).Error)
+	require.NoError(t, database.Model(&model.Provider{}).Where("name = ?", "created-id-panic").Count(&channels).Error)
 	require.NoError(t, database.Model(&model.Ability{}).Count(&abilities).Error)
 	assert.Zero(t, channels)
 	assert.Zero(t, abilities)

@@ -32,7 +32,7 @@ func TestChannelValidateSettingsRejectsInvalidHTTPTransport(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			channel := &Channel{}
+			channel := &Provider{}
 			channel.SetSetting(tt.setting)
 			err := channel.ValidateSettings()
 			if tt.wantErr == "" {
@@ -84,7 +84,7 @@ func TestAdvancedCustomChannelRequiresModelListRouteOnlyWhenUpdateChecksEnabled(
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			channel := &Channel{Type: constant.ChannelTypeAdvancedCustom}
+			channel := &Provider{Type: constant.ChannelTypeAdvancedCustom}
 			channel.SetOtherSettings(dto.ChannelOtherSettings{
 				UpstreamModelUpdateCheckEnabled: tt.checksEnabled,
 				AdvancedCustom: &dto.AdvancedCustomConfig{
@@ -106,15 +106,15 @@ func TestAdvancedCustomChannelRequiresModelListRouteOnlyWhenUpdateChecksEnabled(
 func TestInferencePresetSettingsAndDatabaseRoundTrip(t *testing.T) {
 	db := UseTestDatabases(t)
 	table := db.Table("inference_preset_channels").Session(&gorm.Session{})
-	require.NoError(t, table.AutoMigrate(&Channel{}))
+	require.NoError(t, table.AutoMigrate(&Provider{}))
 	for _, channelType := range []int{constant.ChannelTypeVLLM, constant.ChannelTypeSGLang} {
 		t.Run(fmt.Sprint(channelType), func(t *testing.T) {
-			channel := &Channel{Type: channelType, Key: "EMPTY", Name: "inference", Status: common.ChannelStatusEnabled}
+			channel := &Provider{Type: channelType, Key: "EMPTY", Name: "inference", Status: common.ChannelStatusEnabled}
 			require.NoError(t, channel.ValidateSettings())
 			require.NotNil(t, channel.GetOtherSettings().AdvancedCustom)
 			require.NoError(t, table.Create(channel).Error)
 			for range 2 {
-				var loaded Channel
+				var loaded Provider
 				require.NoError(t, table.First(&loaded, channel.Id).Error)
 				assert.Equal(t, channelType, loaded.Type)
 				assert.Empty(t, loaded.OtherSettings)
@@ -130,7 +130,7 @@ func TestInferencePresetSettingsAndDatabaseRoundTrip(t *testing.T) {
 			require.NoError(t, channel.ValidateSettings())
 			require.NoError(t, table.Save(channel).Error)
 			for range 2 {
-				var loaded Channel
+				var loaded Provider
 				require.NoError(t, table.First(&loaded, channel.Id).Error)
 				actual := loaded.GetOtherSettings().AdvancedCustom
 				require.Equal(t, common.GetAdvancedCustomPreset(channelType), actual, "named channels must ignore editable advanced_custom overrides")
@@ -144,10 +144,10 @@ func TestInferencePresetSettingsAndDatabaseRoundTrip(t *testing.T) {
 					{"/v1/messages", "allowed", true},
 					{"/v1/images/generations", "allowed", false},
 				} {
-					ok, _ := ChannelSatisfiesFilters(&loaded, tc.model, []filterdto.ChannelFilter{{Kind: filterdto.FilterRequestPath, RequestPath: tc.path}})
+					ok, _ := ProviderSatisfiesFilters(&loaded, tc.model, []filterdto.ChannelFilter{{Kind: filterdto.FilterRequestPath, RequestPath: tc.path}})
 					assert.Equal(t, tc.allowed, ok)
 				}
-				endpoints := getPricingEndpointTypesForAbility(AbilityWithChannel{ChannelType: channelType, Ability: Ability{Model: "allowed", ChannelId: loaded.Id}}, map[int]*dto.AdvancedCustomConfig{loaded.Id: actual})
+				endpoints := getPricingEndpointTypesForAbility(AbilityWithProvider{ChannelType: channelType, Ability: Ability{Model: "allowed", ChannelId: loaded.Id}}, map[int]*dto.AdvancedCustomConfig{loaded.Id: actual})
 				expectedEndpoints := []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeOpenAIResponse, constant.EndpointTypeAnthropic, constant.EndpointTypeEmbeddings}
 				if channelType == constant.ChannelTypeSGLang {
 					expectedEndpoints = append(expectedEndpoints, constant.EndpointTypeJinaRerank)

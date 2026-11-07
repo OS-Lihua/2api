@@ -19,7 +19,7 @@ func TestJSONColumnValuersReturnString(t *testing.T) {
 	}{
 		{
 			name:   "ChannelInfo",
-			valuer: ChannelInfo{IsMultiKey: true, MultiKeySize: 2},
+			valuer: ProviderInfo{IsMultiKey: true, MultiKeySize: 2},
 			want:   `{"is_multi_key":true,"multi_key_size":2,"multi_key_status_list":null,"multi_key_polling_index":0,"multi_key_mode":""}`,
 		},
 		{
@@ -77,7 +77,7 @@ func TestJSONColumnScannersAcceptStringAndBytes(t *testing.T) {
 
 	for _, kind := range []string{"bytes", "string"} {
 		t.Run(kind, func(t *testing.T) {
-			var info ChannelInfo
+			var info ProviderInfo
 			require.NoError(t, info.Scan(toInput(kind, `{"is_multi_key":true,"multi_key_size":2}`)))
 			assert.True(t, info.IsMultiKey)
 			assert.Equal(t, 2, info.MultiKeySize)

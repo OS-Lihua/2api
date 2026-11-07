@@ -28,7 +28,7 @@ func setupTaskPluginBindChannelTest(t *testing.T) {
 	sqlDB, err := database.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
-	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.Log{}, &model.AuditLog{}, &model.User{}))
+	require.NoError(t, database.AutoMigrate(&model.Provider{}, &model.Ability{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.Log{}, &model.AuditLog{}, &model.User{}))
 	require.NoError(t, authz.Init(database))
 	t.Cleanup(func() {
 		common.IsMasterNode = wasMaster
@@ -97,7 +97,7 @@ export function parseTaskResult() { return {}; }
 
 	baseURL := "https://example.com"
 	setting := `{"task_plugin_key":"channel-bind-update"}`
-	channel := model.Channel{
+	channel := model.Provider{
 		Type:    constant.ChannelTypeTaskPlugin,
 		Status:  common.ChannelStatusEnabled,
 		Name:    "existing-plugin",
@@ -148,7 +148,7 @@ export function parseTaskResult() { return {}; }
 
 	filled := postAddChannel(t, 1, common.RoleRootUser, body("bind-default-url"))
 	require.Contains(t, filled.Body.String(), `"success":true`)
-	var created model.Channel
+	var created model.Provider
 	require.NoError(t, model.DB.Where("name = ?", "bind-default-url").First(&created).Error)
 	require.NotNil(t, created.BaseURL)
 	assert.Equal(t, "http://10.0.0.5:8000", *created.BaseURL, "the normalized plugin default is stored on the channel row")
@@ -198,7 +198,7 @@ export function parseTaskResult() { return {}; }
 
 	baseURL := "https://gateway.example"
 	setting := `{"task_extend_plugin_keys":["gateway-bind"]}`
-	channel := model.Channel{Type: constant.ChannelTypeNewAPI, Status: common.ChannelStatusEnabled, Name: "existing-gateway", Models: "gateway-doc", Group: "default", Key: "sk", BaseURL: &baseURL, Setting: &setting}
+	channel := model.Provider{Type: constant.ChannelTypeNewAPI, Status: common.ChannelStatusEnabled, Name: "existing-gateway", Models: "gateway-doc", Group: "default", Key: "sk", BaseURL: &baseURL, Setting: &setting}
 	require.NoError(t, channel.Insert())
 	update := func(name, setting string) string {
 		return fmt.Sprintf(`{"id":%d,"type":60,"name":%q,"key":"sk","models":"gateway-doc","group":"default","base_url":"https://gateway.example","setting":%q}`, channel.Id, name, setting)
@@ -211,7 +211,7 @@ export function parseTaskResult() { return {}; }
 	rootRebound := putUpdateChannel(t, 1, common.RoleRootUser, update("renamed-gateway", `{"task_extend_plugin_keys":[]}`))
 	assert.Contains(t, rootRebound.Body.String(), `"success":true`)
 
-	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("setting", setting).Error)
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", channel.Id).Update("setting", setting).Error)
 	copyChannel := func(userID, role int) *httptest.ResponseRecorder {
 		recorder := httptest.NewRecorder()
 		context, _ := gin.CreateTestContext(recorder)

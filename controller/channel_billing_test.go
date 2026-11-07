@@ -167,7 +167,7 @@ func TestUpdateChannelNewAPIBalanceUsesTheSmallerRemainingQuota(t *testing.T) {
 			}))
 			defer server.Close()
 			baseURL := server.URL + "/"
-			channel := &model.Channel{Type: constant.ChannelTypeNewAPI, BaseURL: &baseURL, Key: "sk-upstream", Name: "new-api-upstream"}
+			channel := &model.Provider{Type: constant.ChannelTypeNewAPI, BaseURL: &baseURL, Key: "sk-upstream", Name: "new-api-upstream"}
 			require.NoError(t, model.DB.Create(channel).Error)
 
 			result, err := updateChannelBalance(channel)

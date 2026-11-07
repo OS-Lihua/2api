@@ -362,7 +362,7 @@ func TestMidjourneyPolicyAcceptance(t *testing.T) {
 			ctx.Request = httptest.NewRequest(http.MethodPost, "/mj/submit/imagine", strings.NewReader(`{}`))
 			ctx.Set("channel_id", 7)
 			state := RequestPolicy(ctx)
-			state.BeginAttempt(&model.Channel{Id: 7}, "default")
+			state.BeginAttempt(&model.Provider{Id: 7}, "default")
 			response := &dto.MidjourneyResponseWithStatusCode{StatusCode: tc.status, Response: dto.MidjourneyResponse{Code: tc.code, Properties: tc.properties}}
 			accepted := RecordMidjourneyPolicyResponse(ctx, response, tc.requestErr)
 			assert.Equal(t, tc.accepted, accepted)

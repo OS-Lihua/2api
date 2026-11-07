@@ -7,7 +7,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 )
 
-func IsChannelEnabledForGroupModel(group string, modelName string, channelID int) bool {
+func IsProviderEnabledForGroupModel(group string, modelName string, channelID int) bool {
 	if group == "" || modelName == "" || channelID <= 0 {
 		return false
 	}
@@ -32,12 +32,12 @@ func IsChannelEnabledForGroupModel(group string, modelName string, channelID int
 	return false
 }
 
-func IsChannelEnabledForAnyGroupModel(groups []string, modelName string, channelID int) bool {
+func IsProviderEnabledForAnyGroupModel(groups []string, modelName string, channelID int) bool {
 	if len(groups) == 0 {
 		return false
 	}
 	for _, g := range groups {
-		if IsChannelEnabledForGroupModel(g, modelName, channelID) {
+		if IsProviderEnabledForGroupModel(g, modelName, channelID) {
 			return true
 		}
 	}

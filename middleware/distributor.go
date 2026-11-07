@@ -33,7 +33,7 @@ type ModelRequest struct {
 
 func Distribute() func(c *gin.Context) {
 	return func(c *gin.Context) {
-		var channel *model.Channel
+		var channel *model.Provider
 		defer func() {
 			if c.Writer.Status() >= 400 {
 				service.RecordRequestPolicyTermination(c, types.NewErrorWithStatusCode(errors.New("request rejected"), types.ErrorCodeInvalidRequest, c.Writer.Status(), types.ErrOptionWithSkipRetry()))
@@ -102,7 +102,7 @@ func Distribute() func(c *gin.Context) {
 			var selectErr *service.ChannelSelectError
 			if value, exists := c.Get(contextKeyTaskPluginEndpointSelection); exists && !pinned {
 				if selected, ok := value.(taskPluginEndpointSelection); ok && selected.Model == modelRequest.Model && selected.Channel != nil && selected.Channel.Status == common.ChannelStatusEnabled {
-					if matches, _ := model.ChannelSatisfiesFilters(selected.Channel, modelRequest.Model, constraints.Filters); matches {
+					if matches, _ := model.ProviderSatisfiesFilters(selected.Channel, modelRequest.Model, constraints.Filters); matches {
 						channel = selected.Channel
 					}
 				}
@@ -161,7 +161,7 @@ func noAvailableChannelMessage(c *gin.Context, group, modelName string) string {
 	return i18n.T(c, i18n.MsgDistributorNoAvailableChannel, map[string]any{"Group": group, "Model": modelName})
 }
 
-func channelMatchesExpectedTaskPlugin(c *gin.Context, channel *model.Channel, expected string) bool {
+func channelMatchesExpectedTaskPlugin(c *gin.Context, channel *model.Provider, expected string) bool {
 	if channel == nil {
 		return false
 	}
@@ -222,7 +222,7 @@ func pinnedCandidatePlugins(c *gin.Context) (*jsplugin.RoutingGeneration, []*jsp
 
 // pinnedEndpointCandidateForChannel returns the index, among
 // pinnedCandidatePlugins, of the candidate that executes on channel.
-func pinnedEndpointCandidateForChannel(c *gin.Context, channel *model.Channel, expected string) (int, bool) {
+func pinnedEndpointCandidateForChannel(c *gin.Context, channel *model.Provider, expected string) (int, bool) {
 	if c == nil || channel == nil || expected == "" {
 		return -1, false
 	}
@@ -583,7 +583,7 @@ func getTaskOriginModelName(c *gin.Context) string {
 	return ""
 }
 
-func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string) *types.NewAPIError {
+func SetupContextForSelectedChannel(c *gin.Context, channel *model.Provider, modelName string) *types.NewAPIError {
 	c.Set("original_model", modelName) // for retry
 	expectedPlugin := c.GetString("expected_task_plugin_key")
 	if channel == nil {
@@ -672,7 +672,7 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	if newAPIError != nil {
 		return newAPIError
 	}
-	if channel.ChannelInfo.IsMultiKey {
+	if channel.ProviderInfo.IsMultiKey {
 		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)
 		common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, index)
 	} else {

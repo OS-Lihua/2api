@@ -65,7 +65,7 @@ func modelManagementDB(t *testing.T) *gorm.DB {
 	database := model.UseTestDatabases(t)
 	model.LOG_DB = database
 	common.SetLogDatabaseType(common.DatabaseTypePostgreSQL)
-	require.NoError(t, database.AutoMigrate(&model.Model{}, &model.Vendor{}, &model.Channel{}, &model.Ability{}, &model.Option{}, &model.User{}, &model.AuditLog{}))
+	require.NoError(t, database.AutoMigrate(&model.Model{}, &model.Vendor{}, &model.Provider{}, &model.Ability{}, &model.Option{}, &model.User{}, &model.AuditLog{}))
 	for _, value := range restoreRatios {
 		require.NoError(t, value.restore("{}"))
 	}
@@ -236,7 +236,7 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 			}
 		})
 	}
-	require.NoError(t, (&model.Channel{Name: "Mapped image", Models: "conversion-alias", Type: 1, ModelMapping: common.GetPointer(`{"conversion-alias":"conversion-hop","conversion-hop":"gpt-image-2"}`)}).Insert())
+	require.NoError(t, (&model.Provider{Name: "Mapped image", Models: "conversion-alias", Type: 1, ModelMapping: common.GetPointer(`{"conversion-alias":"conversion-hop","conversion-hop":"gpt-image-2"}`)}).Insert())
 	preview, err := model.PreviewModelPricingConversion("conversion-alias", model.PricingValues{"ModelPrice": float64(1)})
 	require.NoError(t, err)
 	assert.Equal(t, `tier("image", fixed(1)) * image_count`, preview.Expression)
@@ -295,7 +295,7 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 		assert.Equal(t, model.CacheWriteOpenAITTL, openai.CacheWriteMode)
 		assert.Equal(t, `tier("base", p * 10 + c * 50 + cr * 1 + cc * 12.5 + cc12h * 25)`, openai.Expression)
 		// The billing name remains authoritative for cache terms.
-		require.NoError(t, (&model.Channel{Name: "Cache alias", Type: 1, Models: "opaque-cache-alias", ModelMapping: common.GetPointer(`{"opaque-cache-alias":"claude-sonnet-4-6"}`)}).Insert())
+		require.NoError(t, (&model.Provider{Name: "Cache alias", Type: 1, Models: "opaque-cache-alias", ModelMapping: common.GetPointer(`{"opaque-cache-alias":"claude-sonnet-4-6"}`)}).Insert())
 		alias, err := model.PreviewModelPricingConversion("opaque-cache-alias", model.PricingValues{"ModelRatio": 2.0})
 		require.NoError(t, err)
 		assert.Equal(t, `tier("base", p * 4 + c * 4)`, alias.Expression)
@@ -341,7 +341,7 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 		require.NoError(t, err)
 		assert.Contains(t, conflicting.UnsupportedReason, "Gemini and OpenAI audio prices differ")
 		aliName := "z-image-media-conversion"
-		require.NoError(t, (&model.Channel{Name: aliName, Models: aliName, Type: 17, Status: common.ChannelStatusEnabled}).Insert())
+		require.NoError(t, (&model.Provider{Name: aliName, Models: aliName, Type: 17, Status: common.ChannelStatusEnabled}).Insert())
 		aliConversion, err := model.PreviewModelPricingConversion(aliName, model.PricingValues{"ModelPrice": 0.04})
 		require.NoError(t, err)
 		require.Empty(t, aliConversion.UnsupportedReason)
@@ -407,7 +407,7 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 		}
 		for _, channelType := range []int{20, 58} {
 			name := fmt.Sprintf("gemini-3.5-flash-media-%d", channelType)
-			require.NoError(t, (&model.Channel{Name: name, Models: name, Type: channelType}).Insert())
+			require.NoError(t, (&model.Provider{Name: name, Models: name, Type: channelType}).Insert())
 			require.NoError(t, db.Create(&model.Model{ModelName: name, Endpoints: `{"custom-text":"/v1/custom"}`}).Error)
 			converted, err := model.PreviewModelPricingConversion(name, model.PricingValues{"ModelRatio": 0.75, "CompletionRatio": 6.0, "CacheRatio": 0.1})
 			require.NoError(t, err)
@@ -445,7 +445,7 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 			}
 		})
 	}
-	sora := &model.Channel{Name: "Opaque video route", Models: "opaque-video-route", Type: constant.ChannelTypeSora, Group: "a,b"}
+	sora := &model.Provider{Name: "Opaque video route", Models: "opaque-video-route", Type: constant.ChannelTypeSora, Group: "a,b"}
 	require.NoError(t, sora.Insert())
 	video, err := model.PreviewModelPricingConversion("opaque-video-route", model.PricingValues{"ModelPrice": 1.0})
 	require.NoError(t, err)
@@ -486,16 +486,16 @@ export function parseTaskResult() { return {}; }
 			require.NoError(t, records[i].Insert())
 			ids = append(ids, records[i].Id)
 		}
-		active := model.Channel{Name: "Square active", Type: 1, Key: "fixture", Group: "default", Status: common.ChannelStatusEnabled,
+		active := model.Provider{Name: "Square active", Type: 1, Key: "fixture", Group: "default", Status: common.ChannelStatusEnabled,
 			Models: "square-visible,square-hidden,square-bare,square-partial-on,square-partial-hidden,square-hidden-child,square-hidden-override,square-prefix-ending,square-contains-ending"}
-		inactive := model.Channel{Name: "Square inactive", Type: 1, Key: "fixture", Group: "default", Status: common.ChannelStatusManuallyDisabled,
+		inactive := model.Provider{Name: "Square inactive", Type: 1, Key: "fixture", Group: "default", Status: common.ChannelStatusManuallyDisabled,
 			Models: "square-disabled,square-partial-off,square-off-child"}
-		for _, channel := range []*model.Channel{&active, &inactive} {
+		for _, channel := range []*model.Provider{&active, &inactive} {
 			require.NoError(t, channel.Insert())
 		}
 		t.Cleanup(func() {
 			require.NoError(t, db.Where("channel_id IN ?", []int{active.Id, inactive.Id}).Delete(&model.Ability{}).Error)
-			require.NoError(t, db.Where("id IN ?", []int{active.Id, inactive.Id}).Delete(&model.Channel{}).Error)
+			require.NoError(t, db.Where("id IN ?", []int{active.Id, inactive.Id}).Delete(&model.Provider{}).Error)
 			require.NoError(t, db.Unscoped().Where("id IN ?", ids).Delete(&model.Model{}).Error)
 			model.RefreshPricing()
 		})
@@ -642,14 +642,14 @@ export function parseTaskResult() { return {}; }
 		for _, item := range []*model.Model{&exact, &catalog, &rule} {
 			require.NoError(t, item.Insert())
 		}
-		active := model.Channel{Name: "Listing active", Type: 1, Key: "fixture", Models: "listing-exact, listing-new,listing-rule-child,listing-new, ,", Group: "default", Status: common.ChannelStatusEnabled}
-		inactive := model.Channel{Name: "Listing inactive", Type: 1, Key: "fixture", Models: "listing-new,listing-disabled", Group: "default", Status: common.ChannelStatusManuallyDisabled}
-		for _, channel := range []*model.Channel{&active, &inactive} {
+		active := model.Provider{Name: "Listing active", Type: 1, Key: "fixture", Models: "listing-exact, listing-new,listing-rule-child,listing-new, ,", Group: "default", Status: common.ChannelStatusEnabled}
+		inactive := model.Provider{Name: "Listing inactive", Type: 1, Key: "fixture", Models: "listing-new,listing-disabled", Group: "default", Status: common.ChannelStatusManuallyDisabled}
+		for _, channel := range []*model.Provider{&active, &inactive} {
 			require.NoError(t, channel.Insert())
 		}
 		t.Cleanup(func() {
 			require.NoError(t, db.Where("channel_id IN ?", []int{active.Id, inactive.Id}).Delete(&model.Ability{}).Error)
-			require.NoError(t, db.Where("id IN ?", []int{active.Id, inactive.Id}).Delete(&model.Channel{}).Error)
+			require.NoError(t, db.Where("id IN ?", []int{active.Id, inactive.Id}).Delete(&model.Provider{}).Error)
 			require.NoError(t, db.Unscoped().Where("model_name LIKE ?", "listing-%").Delete(&model.Model{}).Error)
 			model.RefreshPricing()
 		})
@@ -731,7 +731,7 @@ export function parseTaskResult() { return {}; }
 		require.Len(t, after.Data.Items, 1)
 		assert.False(t, after.Data.Items[0].HasMetadata)
 		require.NoError(t, db.Callback().Query().Before("gorm:query").Register("fail_listing_channels", func(tx *gorm.DB) {
-			if tx.Statement.Table == "channels" {
+			if tx.Statement.Table == "providers" {
 				tx.AddError(errors.New("channel lookup failed"))
 			}
 		}))
@@ -880,8 +880,8 @@ export function parseTaskResult() { return {}; }
 		assert.EqualValues(t, 1, count)
 	})
 	t.Run("metadata_keeps_pricing_and_channel_identity", func(t *testing.T) {
-		active := model.Channel{Name: "Active route", Type: 1, Status: common.ChannelStatusEnabled}
-		disabled := model.Channel{Name: "Disabled route", Type: 1, Status: common.ChannelStatusManuallyDisabled}
+		active := model.Provider{Name: "Active route", Type: 1, Status: common.ChannelStatusEnabled}
+		disabled := model.Provider{Name: "Disabled route", Type: 1, Status: common.ChannelStatusManuallyDisabled}
 		require.NoError(t, db.Create(&active).Error)
 		require.NoError(t, db.Create(&disabled).Error)
 		require.NoError(t, db.Create(&[]model.Ability{
@@ -894,7 +894,7 @@ export function parseTaskResult() { return {}; }
 		rule := &model.Model{ModelName: "matrix-hidden-", NameRule: model.NameRulePrefix}
 		enrichModels([]*model.Model{exact, rule})
 		assert.Equal(t, []string{"available"}, exact.EnableGroups)
-		assert.Equal(t, []model.BoundChannel{{Name: "Active route", Type: 1}}, exact.BoundChannels)
+		assert.Equal(t, []model.BoundProvider{{Name: "Active route", Type: 1}}, exact.BoundChannels)
 		assert.Equal(t, []string{"matrix-hidden-unpriced"}, rule.MatchedModels)
 		assert.Empty(t, exact.Endpoints, "inferred endpoints must not become stored configuration")
 		priceBefore, err := model.GetModelPricingSnapshot([]string{"matrix-hidden-unpriced"})
@@ -1051,7 +1051,7 @@ func TestVendorManagementDatabase(t *testing.T) {
 	db := modelManagementDB(t)
 
 	t.Run("pricing_reads_keep_default_brands_without_writing_vendors", func(t *testing.T) {
-		channel := model.Channel{Name: "Vendor fixture", Type: 1, Status: common.ChannelStatusEnabled}
+		channel := model.Provider{Name: "Vendor fixture", Type: 1, Status: common.ChannelStatusEnabled}
 		require.NoError(t, db.Create(&channel).Error)
 		require.NoError(t, db.Create(&model.Ability{Model: "gemini-vendor-fixture", Group: "default", ChannelId: channel.Id, Enabled: true}).Error)
 		model.RefreshPricing()
@@ -1102,7 +1102,7 @@ func TestVendorManagementDatabase(t *testing.T) {
 		require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{{ModelName: one.ModelName, ExpectedVersion: priceBefore.Entries[0].Version, Pricing: model.PricingValues{"ModelPrice": float64(0.25)}}}))
 		priceBefore, err = model.GetModelPricingSnapshot([]string{one.ModelName})
 		require.NoError(t, err)
-		channel := model.Channel{Name: "Unchanged vendor channel", Type: 1, Status: common.ChannelStatusEnabled}
+		channel := model.Provider{Name: "Unchanged vendor channel", Type: 1, Status: common.ChannelStatusEnabled}
 		require.NoError(t, db.Create(&channel).Error)
 		ability := model.Ability{Model: one.ModelName, Group: "default", ChannelId: channel.Id, Enabled: true}
 		require.NoError(t, db.Create(&ability).Error)
@@ -1217,7 +1217,7 @@ func TestVendorManagementDatabase(t *testing.T) {
 		priceAfter, err := model.GetModelPricingSnapshot([]string{one.ModelName})
 		require.NoError(t, err)
 		assert.Equal(t, priceBefore.Entries[0], priceAfter.Entries[0], "assignment and merge preserve model pricing")
-		var retainedChannel model.Channel
+		var retainedChannel model.Provider
 		require.NoError(t, db.First(&retainedChannel, channel.Id).Error)
 		assert.Equal(t, channel.Name, retainedChannel.Name)
 		assert.Equal(t, channel.Status, retainedChannel.Status)
@@ -1261,7 +1261,7 @@ func TestModelDeletionDatabase(t *testing.T) {
 	}
 	metadataOnly := model.Model{ModelName: "metadata-only", Status: 1}
 	require.NoError(t, metadataOnly.Insert())
-	channel := model.Channel{Name: "Retained channel", Type: 1, Key: "fixture-key", Models: metadataOnly.ModelName, Group: "default", Status: common.ChannelStatusEnabled}
+	channel := model.Provider{Name: "Retained channel", Type: 1, Key: "fixture-key", Models: metadataOnly.ModelName, Group: "default", Status: common.ChannelStatusEnabled}
 	require.NoError(t, db.Create(&channel).Error)
 	require.NoError(t, channel.UpdateAbilities(db))
 	recorder := modelManagementRequest(t, func(c *gin.Context) {
@@ -1270,7 +1270,7 @@ func TestModelDeletionDatabase(t *testing.T) {
 	}, http.MethodDelete, "/api/models/"+strconv.Itoa(metadataOnly.Id), nil, &response)
 	require.True(t, response.Success, recorder.Body.String())
 	assert.Equal(t, model.ModelDeleteResult{DeletedCount: 1}, response.Data)
-	var retained model.Channel
+	var retained model.Provider
 	require.NoError(t, db.First(&retained, channel.Id).Error)
 	assert.Equal(t, channel.Models, retained.Models)
 	var count int64
@@ -1286,7 +1286,7 @@ func TestModelDeletionDatabase(t *testing.T) {
 			require.NoError(t, second.Insert())
 			mapping := `{"` + name + `":"upstream-name"}`
 			priority, weight := int64(7), uint(9)
-			channels := []model.Channel{
+			channels := []model.Provider{
 				{Name: "Enabled", Type: 1, Key: "fixture-key", Models: name + "," + name + "-keep," + second.ModelName, Group: "default,vip", Status: common.ChannelStatusEnabled, ModelMapping: &mapping, Priority: &priority, Weight: &weight},
 				{Name: "Disabled", Type: 1, Models: name + ",prefix-" + name, Group: "disabled-group", Status: common.ChannelStatusManuallyDisabled},
 				{Name: "Last model", Type: 1, Models: name, Group: "last-model-group", Status: common.ChannelStatusEnabled},
@@ -1297,8 +1297,8 @@ func TestModelDeletionDatabase(t *testing.T) {
 				require.NoError(t, channels[i].UpdateAbilities(db))
 			}
 			common.MemoryCacheEnabled = true
-			model.InitChannelCache()
-			cached, err := model.GetRandomSatisfiedChannel("default", name, 0, nil)
+			model.InitProviderCache()
+			cached, err := model.GetRandomSatisfiedProvider("default", name, 0, nil)
 			require.NoError(t, err)
 			require.NotNil(t, cached)
 			baseline, err := model.GetModelPricingSnapshot([]string{name})
@@ -1315,7 +1315,7 @@ func TestModelDeletionDatabase(t *testing.T) {
 				require.NoError(t, db.Model(&model.Model{}).Where("id IN ?", []int{first.Id, second.Id}).Count(&count).Error)
 				assert.EqualValues(t, 2, count)
 				for _, original := range channels {
-					var after model.Channel
+					var after model.Provider
 					require.NoError(t, db.First(&after, original.Id).Error)
 					assert.Equal(t, original, after)
 				}
@@ -1334,18 +1334,18 @@ func TestModelDeletionDatabase(t *testing.T) {
 			assert.Zero(t, result)
 			require.NoError(t, db.Callback().Delete().Remove("fail_model_deletion"))
 			for _, original := range channels {
-				var after model.Channel
+				var after model.Provider
 				require.NoError(t, db.First(&after, original.Id).Error)
 				assert.Equal(t, original, after)
 			}
-			cached, err = model.GetRandomSatisfiedChannel("default", name, 0, nil)
+			cached, err = model.GetRandomSatisfiedProvider("default", name, 0, nil)
 			require.NoError(t, err)
 			require.NotNil(t, cached)
 			recorder := modelManagementRequest(t, BatchDeleteModelMeta, http.MethodPost, "/api/models/delete", body, &response)
 			require.True(t, response.Success, recorder.Body.String())
 			assert.Equal(t, model.ModelDeleteResult{DeletedCount: 2, UpdatedChannels: 3}, response.Data)
 			for i, original := range channels {
-				var after model.Channel
+				var after model.Provider
 				require.NoError(t, db.First(&after, original.Id).Error)
 				original.Models = []string{name + "-keep", "prefix-" + name, "", strings.ToUpper(name)}[i]
 				assert.Equal(t, original, after, "only the model list changes")
@@ -1367,10 +1367,10 @@ func TestModelDeletionDatabase(t *testing.T) {
 				}
 			}
 			for _, group := range []string{"default", "vip", "last-model-group"} {
-				cached, _ = model.GetRandomSatisfiedChannel(group, name, 0, nil)
+				cached, _ = model.GetRandomSatisfiedProvider(group, name, 0, nil)
 				assert.Nil(t, cached)
 			}
-			cached, err = model.GetRandomSatisfiedChannel("default", name+"-keep", 0, nil)
+			cached, err = model.GetRandomSatisfiedProvider("default", name+"-keep", 0, nil)
 			require.NoError(t, err)
 			require.NotNil(t, cached)
 			pricingAfter, err := model.GetModelPricingSnapshot([]string{name, second.ModelName})
@@ -1388,10 +1388,10 @@ func TestModelDeletionDatabase(t *testing.T) {
 			metadata := model.Model{ModelName: name, NameRule: model.NameRuleExact, Status: 1}
 			require.NoError(t, metadata.Insert())
 			keep := name + "-keep"
-			channel := model.Channel{Name: "Independent pricing removal", Type: 1, Models: name + "," + keep, Group: "pricing-removal", Status: common.ChannelStatusEnabled}
+			channel := model.Provider{Name: "Independent pricing removal", Type: 1, Models: name + "," + keep, Group: "pricing-removal", Status: common.ChannelStatusEnabled}
 			require.NoError(t, db.Create(&channel).Error)
 			require.NoError(t, channel.UpdateAbilities(db))
-			model.InitChannelCache()
+			model.InitProviderCache()
 			baseline, err := model.GetModelPricingSnapshot([]string{name, keep})
 			require.NoError(t, err)
 			pricing := model.PricingValues{"ModelRatio": float64(1), "ModelPrice": float64(0), "CompletionRatio": float64(2), "CacheRatio": float64(0.1), "CreateCacheRatio": float64(1.25), "ImageRatio": float64(3), "AudioRatio": float64(4), "AudioCompletionRatio": float64(5), "billing_setting.billing_mode": "tiered_expr", "billing_setting.billing_expr": `tier("base", p * 2 + c * 4)`}
@@ -1432,7 +1432,7 @@ func TestModelDeletionDatabase(t *testing.T) {
 			assert.Equal(t, billing_setting.BillingModeTieredExpr, billing_setting.GetBillingMode(name), "failed deletion must not publish new runtime pricing")
 			var retained model.Model
 			require.NoError(t, db.First(&retained, metadata.Id).Error)
-			var channelAfter model.Channel
+			var channelAfter model.Provider
 			require.NoError(t, db.First(&channelAfter, channel.Id).Error)
 			assert.Equal(t, channel.Models, channelAfter.Models)
 			_, err = model.DeleteModelMetadata([]int{metadata.Id, 999999}, removeChannels, true)

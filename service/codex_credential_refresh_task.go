@@ -65,7 +65,7 @@ func runCodexCredentialAutoRefreshOnce() {
 
 	offset := 0
 	for {
-		var channels []*model.Channel
+		var channels []*model.Provider
 		err := model.DB.
 			Select("id", "name", "key", "status", "channel_info").
 			Where("type = ? AND (status = ? OR status = ?)",
@@ -91,7 +91,7 @@ func runCodexCredentialAutoRefreshOnce() {
 				continue
 			}
 			scanned++
-			if ch.ChannelInfo.IsMultiKey {
+			if ch.ProviderInfo.IsMultiKey {
 				continue
 			}
 
@@ -136,7 +136,7 @@ func runCodexCredentialAutoRefreshOnce() {
 					logger.LogWarn(ctx, common.LogText("codex credential auto-refresh: InitChannelCache panic: %v", r))
 				}
 			}()
-			model.InitChannelCache()
+			model.InitProviderCache()
 		}()
 	}
 

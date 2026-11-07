@@ -14,12 +14,12 @@ import (
 func TestFilterCandidateIDs(t *testing.T) {
 	alphaSetting := `{"task_plugin_key":"alpha"}`
 	betaSetting := `{"task_plugin_key":"beta"}`
-	alpha := &Channel{Id: 900001, Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Setting: &alphaSetting}
-	beta := &Channel{Id: 900002, Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Setting: &betaSetting}
-	ordinary := &Channel{Id: 900003, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled}
-	kling := &Channel{Id: 900004, Type: constant.ChannelTypeKling, Status: common.ChannelStatusEnabled}
-	jimeng := &Channel{Id: 900005, Type: constant.ChannelTypeJimeng, Status: common.ChannelStatusEnabled}
-	matchingCustom := &Channel{Id: 900010, Type: constant.ChannelTypeAdvancedCustom, Status: common.ChannelStatusEnabled}
+	alpha := &Provider{Id: 900001, Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Setting: &alphaSetting}
+	beta := &Provider{Id: 900002, Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Setting: &betaSetting}
+	ordinary := &Provider{Id: 900003, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled}
+	kling := &Provider{Id: 900004, Type: constant.ChannelTypeKling, Status: common.ChannelStatusEnabled}
+	jimeng := &Provider{Id: 900005, Type: constant.ChannelTypeJimeng, Status: common.ChannelStatusEnabled}
+	matchingCustom := &Provider{Id: 900010, Type: constant.ChannelTypeAdvancedCustom, Status: common.ChannelStatusEnabled}
 	matchingCustom.SetOtherSettings(kitdto.ChannelOtherSettings{
 		AdvancedCustom: &kitdto.AdvancedCustomConfig{
 			Routes: []kitdto.AdvancedCustomRoute{{
@@ -28,7 +28,7 @@ func TestFilterCandidateIDs(t *testing.T) {
 			}},
 		},
 	})
-	otherCustom := &Channel{Id: 900011, Type: constant.ChannelTypeAdvancedCustom, Status: common.ChannelStatusEnabled}
+	otherCustom := &Provider{Id: 900011, Type: constant.ChannelTypeAdvancedCustom, Status: common.ChannelStatusEnabled}
 	otherCustom.SetOtherSettings(kitdto.ChannelOtherSettings{
 		AdvancedCustom: &kitdto.AdvancedCustomConfig{
 			Routes: []kitdto.AdvancedCustomRoute{{
@@ -149,7 +149,7 @@ func TestFilterCandidateIDs(t *testing.T) {
 
 	channelSyncLock.Lock()
 	previous := channelsIDM
-	channelsIDM = map[int]*Channel{
+	channelsIDM = map[int]*Provider{
 		900001: alpha,
 		900002: beta,
 		900003: ordinary,
@@ -178,9 +178,9 @@ func TestFilterCandidateIDs(t *testing.T) {
 
 func TestChannelSatisfiesFilters(t *testing.T) {
 	alphaSetting := `{"task_plugin_key":"alpha"}`
-	alpha := &Channel{Id: 1, Type: constant.ChannelTypeTaskPlugin, Setting: &alphaSetting}
-	ordinary := &Channel{Id: 2, Type: constant.ChannelTypeOpenAI}
-	custom := &Channel{Id: 3, Type: constant.ChannelTypeAdvancedCustom}
+	alpha := &Provider{Id: 1, Type: constant.ChannelTypeTaskPlugin, Setting: &alphaSetting}
+	ordinary := &Provider{Id: 2, Type: constant.ChannelTypeOpenAI}
+	custom := &Provider{Id: 3, Type: constant.ChannelTypeAdvancedCustom}
 	custom.SetOtherSettings(kitdto.ChannelOtherSettings{
 		AdvancedCustom: &kitdto.AdvancedCustomConfig{
 			Routes: []kitdto.AdvancedCustomRoute{{
@@ -190,26 +190,26 @@ func TestChannelSatisfiesFilters(t *testing.T) {
 		},
 	})
 
-	ok, kind := ChannelSatisfiesFilters(nil, "gpt-4", nil)
+	ok, kind := ProviderSatisfiesFilters(nil, "gpt-4", nil)
 	assert.False(t, ok)
 	assert.Equal(t, dto.ChannelFilterKind(""), kind)
 
-	ok, kind = ChannelSatisfiesFilters(alpha, "shared", identityFilters("alpha", nil))
+	ok, kind = ProviderSatisfiesFilters(alpha, "shared", identityFilters("alpha", nil))
 	require.True(t, ok)
 	assert.Equal(t, dto.ChannelFilterKind(""), kind)
 
-	ok, kind = ChannelSatisfiesFilters(alpha, "shared", identityFilters("beta", nil))
+	ok, kind = ProviderSatisfiesFilters(alpha, "shared", identityFilters("beta", nil))
 	assert.False(t, ok)
 	assert.Equal(t, dto.FilterTaskPluginIdentity, kind)
 
-	ok, kind = ChannelSatisfiesFilters(ordinary, "gpt-4", []dto.ChannelFilter{{
+	ok, kind = ProviderSatisfiesFilters(ordinary, "gpt-4", []dto.ChannelFilter{{
 		Kind:        dto.FilterRequestPath,
 		RequestPath: "/v1/chat/completions",
 	}})
 	require.True(t, ok)
 	assert.Equal(t, dto.ChannelFilterKind(""), kind)
 
-	ok, kind = ChannelSatisfiesFilters(custom, "gpt-4", []dto.ChannelFilter{{
+	ok, kind = ProviderSatisfiesFilters(custom, "gpt-4", []dto.ChannelFilter{{
 		Kind:        dto.FilterRequestPath,
 		RequestPath: "/v1/responses",
 	}})

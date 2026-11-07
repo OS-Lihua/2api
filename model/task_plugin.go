@@ -15,22 +15,22 @@ import (
 	"gorm.io/gorm/schema"
 )
 
-type TaskPluginChannelRef struct {
+type TaskPluginProviderRef struct {
 	Id   int    `json:"id"`
 	Name string `json:"name"`
 	Type int    `json:"type"`
 }
 
-func GetTaskPluginUsage(key string) ([]TaskPluginChannelRef, int64, error) {
-	var channels []Channel
+func GetTaskPluginUsage(key string) ([]TaskPluginProviderRef, int64, error) {
+	var channels []Provider
 	boundTypes := []int{constant.ChannelTypeTaskPlugin, constant.ChannelTypeNewAPI}
 	if err := DB.Where("type IN ? AND status = ?", boundTypes, common.ChannelStatusEnabled).Find(&channels).Error; err != nil {
 		return nil, 0, err
 	}
-	refs := make([]TaskPluginChannelRef, 0)
+	refs := make([]TaskPluginProviderRef, 0)
 	for _, channel := range channels {
 		if channel.GetSetting().BindsTaskPlugin(key) {
-			refs = append(refs, TaskPluginChannelRef{Id: channel.Id, Name: channel.Name, Type: channel.Type})
+			refs = append(refs, TaskPluginProviderRef{Id: channel.Id, Name: channel.Name, Type: channel.Type})
 		}
 	}
 	var inFlight int64
@@ -42,7 +42,7 @@ func GetTaskPluginUsage(key string) ([]TaskPluginChannelRef, int64, error) {
 // whether the channel changed. A New API gateway channel keeps serving its other
 // plugins and its ordinary traffic.
 func UnbindTaskPlugin(channelID int, key string) (bool, error) {
-	channel, err := GetChannelById(channelID, false)
+	channel, err := GetProviderById(channelID, false)
 	if err != nil {
 		return false, err
 	}
@@ -55,7 +55,7 @@ func UnbindTaskPlugin(channelID int, key string) (bool, error) {
 	}
 	setting.TaskExtendPluginKeys = slices.DeleteFunc(setting.TaskExtendPluginKeys, func(bound string) bool { return bound == key })
 	channel.SetSetting(setting)
-	return true, DB.Model(&Channel{}).Where("id = ?", channelID).Update("setting", channel.Setting).Error
+	return true, DB.Model(&Provider{}).Where("id = ?", channelID).Update("setting", channel.Setting).Error
 }
 
 // LongText is an unbounded text column for plugin payloads. A `size:` tag

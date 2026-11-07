@@ -31,11 +31,11 @@ func TestChannelPriorityPlan(t *testing.T) {
 		{"lower safe bound", []int64{-maxSortablePriority, 0}, 2, 1, "after", map[int]int64{1: -maxSortablePriority + 1, 2: -maxSortablePriority}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			items := make([]ChannelPriority, len(tc.values))
+			items := make([]ProviderPriority, len(tc.values))
 			for i, value := range tc.values {
-				items[i] = ChannelPriority{ID: i + 1, Priority: &value}
+				items[i] = ProviderPriority{ID: i + 1, Priority: &value}
 			}
-			changes, err := planChannelPriorityMove(items, ChannelPriorityMove{ID: tc.id, TargetID: tc.target, Position: tc.position})
+			changes, err := planChannelPriorityMove(items, ProviderPriorityMove{ID: tc.id, TargetID: tc.target, Position: tc.position})
 			require.NoError(t, err)
 			got := map[int]int64{}
 			for _, change := range changes {
@@ -45,16 +45,16 @@ func TestChannelPriorityPlan(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
-	_, err := planChannelPriorityMove([]ChannelPriority{{ID: 1}, {ID: 2}}, ChannelPriorityMove{ID: 1, TargetID: 2, Position: "invalid"})
+	_, err := planChannelPriorityMove([]ProviderPriority{{ID: 1}, {ID: 2}}, ProviderPriorityMove{ID: 1, TargetID: 2, Position: "invalid"})
 	assert.ErrorIs(t, err, ErrChannelPriorityInvalid)
 }
 
 func TestChannelPriorityDatabase(t *testing.T) {
 	db := UseTestDatabases(t)
-	require.NoError(t, db.AutoMigrate(&Channel{}, &Ability{}))
+	require.NoError(t, db.AutoMigrate(&Provider{}, &Ability{}))
 	high, low, zero := int64(100), int64(99), int64(0)
 	w1, w2, w3, w4 := uint(11), uint(22), uint(33), uint(44)
-	channels := []Channel{
+	channels := []Provider{
 		{Name: "high", Priority: &high, Weight: &w1, Key: "preserved", Status: 1},
 		{Name: "low", Priority: &low, Weight: &w2, Status: 1},
 		{Name: "peer", Priority: &low, Weight: &w3, Status: 1},
@@ -66,17 +66,17 @@ func TestChannelPriorityDatabase(t *testing.T) {
 			require.NoError(t, db.Create(&Ability{Group: group, Model: "test", ChannelId: channel.Id, Priority: channel.Priority, Weight: uint(*channel.Weight), Enabled: true}).Error)
 		}
 	}
-	initial, err := GetChannelPriorityOrder()
+	initial, err := GetProviderPriorityOrder()
 	require.NoError(t, err)
-	move := ChannelPriorityMove{Revision: initial.Revision, ID: channels[3].Id, TargetID: channels[1].Id, Position: "before", Preview: true}
-	preview, err := ReorderChannelPriority(move)
+	move := ProviderPriorityMove{Revision: initial.Revision, ID: channels[3].Id, TargetID: channels[1].Id, Position: "before", Preview: true}
+	preview, err := ReorderProviderPriority(move)
 	require.NoError(t, err)
 	require.Len(t, preview.Changes, 2)
-	unchanged, err := GetChannelPriorityOrder()
+	unchanged, err := GetProviderPriorityOrder()
 	require.NoError(t, err)
 	assert.Equal(t, initial, unchanged, "preview does not persist")
 	move.Preview = false
-	applied, err := ReorderChannelPriority(move)
+	applied, err := ReorderProviderPriority(move)
 	require.NoError(t, err)
 	assert.Equal(t, preview, applied)
 	for _, change := range applied.Changes {
@@ -88,17 +88,17 @@ func TestChannelPriorityDatabase(t *testing.T) {
 			assert.True(t, ability.Enabled)
 		}
 	}
-	var saved Channel
+	var saved Provider
 	require.NoError(t, db.First(&saved, channels[0].Id).Error)
 	assert.Equal(t, "preserved", saved.Key)
 	assert.Equal(t, channels[0].Weight, saved.Weight)
-	_, err = ReorderChannelPriority(move)
+	_, err = ReorderProviderPriority(move)
 	assert.ErrorIs(t, err, ErrChannelPriorityConflict)
-	undo := ChannelPriorityMove{Revision: applied.Revision}
+	undo := ProviderPriorityMove{Revision: applied.Revision}
 	for _, change := range applied.Changes {
-		undo.Restore = append(undo.Restore, ChannelPriorityChange{ID: change.ID, Previous: change.Priority, Priority: change.Previous})
+		undo.Restore = append(undo.Restore, ProviderPriorityChange{ID: change.ID, Previous: change.Priority, Priority: change.Previous})
 	}
-	restored, err := ReorderChannelPriority(undo)
+	restored, err := ReorderProviderPriority(undo)
 	require.NoError(t, err)
 	assert.Equal(t, initial.Items, restored.Items)
 	assert.Equal(t, initial.Revision, restored.Revision)
@@ -106,7 +106,7 @@ func TestChannelPriorityDatabase(t *testing.T) {
 	errorsCh := make(chan error, 2)
 	var workers sync.WaitGroup
 	for range 2 {
-		workers.Go(func() { <-start; _, moveErr := ReorderChannelPriority(move); errorsCh <- moveErr })
+		workers.Go(func() { <-start; _, moveErr := ReorderProviderPriority(move); errorsCh <- moveErr })
 	}
 	close(start)
 	workers.Wait()
@@ -122,7 +122,7 @@ func TestChannelPriorityDatabase(t *testing.T) {
 	}
 	assert.Equal(t, 1, succeeded)
 	assert.Equal(t, 1, conflicted)
-	_, err = ReorderChannelPriority(undo)
+	_, err = ReorderProviderPriority(undo)
 	require.NoError(t, err)
 	// An ability write failure must roll back every channel change too.
 	require.NoError(t, db.Callback().Update().Before("gorm:update").Register("priority_test_failure", func(tx *gorm.DB) {
@@ -130,27 +130,27 @@ func TestChannelPriorityDatabase(t *testing.T) {
 			tx.AddError(errors.New("forced routing write failure"))
 		}
 	}))
-	_, err = ReorderChannelPriority(move)
+	_, err = ReorderProviderPriority(move)
 	require.ErrorContains(t, err, "forced routing write failure")
 	require.NoError(t, db.Callback().Update().Remove("priority_test_failure"))
-	unchanged, err = GetChannelPriorityOrder()
+	unchanged, err = GetProviderPriorityOrder()
 	require.NoError(t, err)
 	assert.Equal(t, initial, unchanged)
 	// Null priority is an effective zero and undo must restore the null itself.
-	require.NoError(t, db.Model(&Channel{}).Where("id = ?", channels[3].Id).Update("priority", nil).Error)
-	nullable, err := GetChannelPriorityOrder()
+	require.NoError(t, db.Model(&Provider{}).Where("id = ?", channels[3].Id).Update("priority", nil).Error)
+	nullable, err := GetProviderPriorityOrder()
 	require.NoError(t, err)
-	var sorted []ChannelPriority
-	require.NoError(t, NewChannelSortOptions("priority", "asc", false).Apply(db.Model(&Channel{}).Select("id", "priority")).Find(&sorted).Error)
+	var sorted []ProviderPriority
+	require.NoError(t, NewProviderSortOptions("priority", "asc", false).Apply(db.Model(&Provider{}).Select("id", "priority")).Find(&sorted).Error)
 	assert.Equal(t, []int{channels[3].Id, channels[2].Id, channels[1].Id, channels[0].Id}, []int{sorted[0].ID, sorted[1].ID, sorted[2].ID, sorted[3].ID})
 	move.Revision = nullable.Revision
-	applied, err = ReorderChannelPriority(move)
+	applied, err = ReorderProviderPriority(move)
 	require.NoError(t, err)
-	undo = ChannelPriorityMove{Revision: applied.Revision}
+	undo = ProviderPriorityMove{Revision: applied.Revision}
 	for _, change := range applied.Changes {
-		undo.Restore = append(undo.Restore, ChannelPriorityChange{ID: change.ID, Previous: change.Priority, Priority: change.Previous})
+		undo.Restore = append(undo.Restore, ProviderPriorityChange{ID: change.ID, Previous: change.Priority, Priority: change.Previous})
 	}
-	restored, err = ReorderChannelPriority(undo)
+	restored, err = ReorderProviderPriority(undo)
 	require.NoError(t, err)
 	assert.Equal(t, nullable.Items, restored.Items)
 }

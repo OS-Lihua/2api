@@ -113,7 +113,7 @@ func buildTaskAliasView(generation *jsplugin.RoutingGeneration) *taskAliasView {
 		return view
 	}
 
-	var channels []Channel
+	var channels []Provider
 	err := DB.Select("id", "type", "models", "model_mapping").
 		Where("status = ?", common.ChannelStatusEnabled).
 		Find(&channels).Error

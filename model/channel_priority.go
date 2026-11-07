@@ -15,60 +15,60 @@ const maxSortablePriority int64 = 1<<53 - 1
 
 var ErrChannelPriorityConflict = errors.New("Channel priorities changed. Refresh and try again.")
 var ErrChannelPriorityInvalid = errors.New("Invalid channel priority move")
-var ErrChannelPriorityRange = errors.New("Channel priority is outside the sortable range")
+var ErrProviderPriorityRange = errors.New("Channel priority is outside the sortable range")
 
-type ChannelPriority struct {
+type ProviderPriority struct {
 	ID       int    `json:"id"`
 	Priority *int64 `json:"priority"`
 }
 
-func (item ChannelPriority) value() int64 {
+func (item ProviderPriority) value() int64 {
 	if item.Priority == nil {
 		return 0
 	}
 	return *item.Priority
 }
 
-type ChannelPriorityChange struct {
+type ProviderPriorityChange struct {
 	ID       int    `json:"id"`
 	Previous *int64 `json:"previous"`
 	Priority *int64 `json:"priority"`
 }
 
-type ChannelPriorityOrder struct {
-	Revision string                  `json:"revision"`
-	Items    []ChannelPriority       `json:"items"`
-	Changes  []ChannelPriorityChange `json:"changes"`
+type ProviderPriorityOrder struct {
+	Revision string                   `json:"revision"`
+	Items    []ProviderPriority       `json:"items"`
+	Changes  []ProviderPriorityChange `json:"changes"`
 }
 
-type ChannelPriorityMove struct {
-	Revision string                  `json:"revision"`
-	ID       int                     `json:"id"`
-	TargetID int                     `json:"target_id"`
-	Position string                  `json:"position"` // before / after use descending priority order
-	Preview  bool                    `json:"preview"`
-	Restore  []ChannelPriorityChange `json:"restore,omitempty"`
+type ProviderPriorityMove struct {
+	Revision string                   `json:"revision"`
+	ID       int                      `json:"id"`
+	TargetID int                      `json:"target_id"`
+	Position string                   `json:"position"` // before / after use descending priority order
+	Preview  bool                     `json:"preview"`
+	Restore  []ProviderPriorityChange `json:"restore,omitempty"`
 }
 
-func channelPriorityRevision(items []ChannelPriority) string {
+func channelPriorityRevision(items []ProviderPriority) string {
 	data, _ := common.Marshal(items)
 	return fmt.Sprintf("%x", sha256.Sum256(data))
 }
 
-func GetChannelPriorityOrder() (ChannelPriorityOrder, error) {
-	result := ChannelPriorityOrder{Items: []ChannelPriority{}, Changes: []ChannelPriorityChange{}}
-	err := DB.Model(&Channel{}).Select("id", "priority").Order("id").Find(&result.Items).Error
+func GetProviderPriorityOrder() (ProviderPriorityOrder, error) {
+	result := ProviderPriorityOrder{Items: []ProviderPriority{}, Changes: []ProviderPriorityChange{}}
+	err := DB.Model(&Provider{}).Select("id", "priority").Order("id").Find(&result.Items).Error
 	result.Revision = channelPriorityRevision(result.Items)
 	return result, err
 }
 
-// ReorderChannelPriority updates only priorities, including the routing copy in
+// ReorderProviderPriority updates only priorities, including the routing copy in
 // abilities. A snapshot check also protects preview/commit and undo from stale
 // clients; row locks serialize concurrent reorders.
-func ReorderChannelPriority(move ChannelPriorityMove) (ChannelPriorityOrder, error) {
-	result := ChannelPriorityOrder{Items: []ChannelPriority{}, Changes: []ChannelPriorityChange{}}
+func ReorderProviderPriority(move ProviderPriorityMove) (ProviderPriorityOrder, error) {
+	result := ProviderPriorityOrder{Items: []ProviderPriority{}, Changes: []ProviderPriorityChange{}}
 	err := DB.Transaction(func(tx *gorm.DB) error {
-		query := tx.Model(&Channel{}).Select("id", "priority").Order("id")
+		query := tx.Model(&Provider{}).Select("id", "priority").Order("id")
 		if !move.Preview {
 			query = lockForUpdate(query)
 		}
@@ -83,7 +83,7 @@ func ReorderChannelPriority(move ChannelPriorityMove) (ChannelPriorityOrder, err
 			return err
 		}
 		result.Changes = changes
-		byID := make(map[int]*ChannelPriority, len(result.Items))
+		byID := make(map[int]*ProviderPriority, len(result.Items))
 		for i := range result.Items {
 			byID[result.Items[i].ID] = &result.Items[i]
 		}
@@ -92,7 +92,7 @@ func ReorderChannelPriority(move ChannelPriorityMove) (ChannelPriorityOrder, err
 			if move.Preview {
 				continue
 			}
-			if err := tx.Model(&Channel{}).Where("id = ?", change.ID).Update("priority", change.Priority).Error; err != nil {
+			if err := tx.Model(&Provider{}).Where("id = ?", change.ID).Update("priority", change.Priority).Error; err != nil {
 				return err
 			}
 			if err := tx.Model(&Ability{}).Where("channel_id = ?", change.ID).Update("priority", change.Priority).Error; err != nil {
@@ -107,12 +107,12 @@ func ReorderChannelPriority(move ChannelPriorityMove) (ChannelPriorityOrder, err
 
 // Equal-priority channels remain together. Opening a slot shifts the shorter
 // contiguous run of occupied integer priorities, measured by affected channels.
-func planChannelPriorityMove(items []ChannelPriority, move ChannelPriorityMove) ([]ChannelPriorityChange, error) {
-	changes := []ChannelPriorityChange{}
-	byID := make(map[int]ChannelPriority, len(items))
+func planChannelPriorityMove(items []ProviderPriority, move ProviderPriorityMove) ([]ProviderPriorityChange, error) {
+	changes := []ProviderPriorityChange{}
+	byID := make(map[int]ProviderPriority, len(items))
 	for _, item := range items {
 		if item.value() < -maxSortablePriority || item.value() > maxSortablePriority {
-			return nil, ErrChannelPriorityRange
+			return nil, ErrProviderPriorityRange
 		}
 		byID[item.ID] = item
 	}
@@ -201,7 +201,7 @@ func planChannelPriorityMove(items []ChannelPriority, move ChannelPriorityMove) 
 			}
 			canUp, canDown := up >= 0 && index > 0, down < len(levels) && index < len(levels)
 			if !canUp && !canDown {
-				return nil, ErrChannelPriorityRange
+				return nil, ErrProviderPriorityRange
 			}
 			if canUp && (!canDown || upCost < downCost) {
 				for id, value := range values {
@@ -230,7 +230,7 @@ func planChannelPriorityMove(items []ChannelPriority, move ChannelPriorityMove) 
 	for _, entry := range items {
 		value := values[entry.ID]
 		if value != entry.value() {
-			changes = append(changes, ChannelPriorityChange{ID: entry.ID, Previous: entry.Priority, Priority: &value})
+			changes = append(changes, ProviderPriorityChange{ID: entry.ID, Previous: entry.Priority, Priority: &value})
 		}
 	}
 	return changes, nil

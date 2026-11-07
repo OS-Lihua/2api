@@ -151,7 +151,7 @@ func applySelectedModelChanges(originModels []string, addModels []string, remove
 	return subtractModelNames(mergeModelNames(originModels, normalizedAdd), normalizedRemove)
 }
 
-func normalizeChannelModelMapping(channel *model.Channel) map[string]string {
+func normalizeChannelModelMapping(channel *model.Provider) map[string]string {
 	if channel == nil || channel.ModelMapping == nil {
 		return nil
 	}
@@ -239,7 +239,7 @@ func collectPendingUpstreamModelChangesFromModels(
 	return normalizeModelNames(pendingAdd), normalizeModelNames(pendingRemove)
 }
 
-func collectPendingUpstreamModelChanges(channel *model.Channel, settings dto.ChannelOtherSettings) (pendingAddModels []string, pendingRemoveModels []string, err error) {
+func collectPendingUpstreamModelChanges(channel *model.Provider, settings dto.ChannelOtherSettings) (pendingAddModels []string, pendingRemoveModels []string, err error) {
 	upstreamModels, err := fetchChannelUpstreamModelIDs(channel)
 	if err != nil {
 		return nil, nil, err
@@ -334,7 +334,7 @@ func sanitizeAdvancedCustomRequestError(err error, key string, requestURL string
 	return errors.New(message)
 }
 
-func getFetchModelsResponseBody(method string, requestURL string, channel *model.Channel, headers http.Header) ([]byte, error) {
+func getFetchModelsResponseBody(method string, requestURL string, channel *model.Provider, headers http.Header) ([]byte, error) {
 	request, err := http.NewRequest(method, requestURL, nil)
 	if err != nil {
 		return nil, err
@@ -363,7 +363,7 @@ func getFetchModelsResponseBody(method string, requestURL string, channel *model
 	return io.ReadAll(response.Body)
 }
 
-func fetchChannelUpstreamModelIDs(channel *model.Channel) ([]string, error) {
+func fetchChannelUpstreamModelIDs(channel *model.Provider) ([]string, error) {
 	if channel.Type == constant.ChannelTypeTaskPlugin {
 		plugin, ok := jsplugin.DefaultRegistry.Get(channel.GetSetting().TaskPluginKey)
 		if !ok {
@@ -466,7 +466,7 @@ func fetchChannelUpstreamModelIDs(channel *model.Channel) ([]string, error) {
 	return normalizeModelNames(ids), nil
 }
 
-func fetchAdvancedCustomUpstreamModelIDs(channel *model.Channel, baseURL string) ([]string, error) {
+func fetchAdvancedCustomUpstreamModelIDs(channel *model.Provider, baseURL string) ([]string, error) {
 	key, _, apiErr := channel.GetNextEnabledKey()
 	if apiErr != nil {
 		return nil, fmt.Errorf("failed to get channel key: %w", apiErr)
@@ -501,7 +501,7 @@ func fetchAdvancedCustomUpstreamModelIDs(channel *model.Channel, baseURL string)
 	return parseOpenAIModelIDs(body)
 }
 
-func updateChannelUpstreamModelSettings(channel *model.Channel, settings dto.ChannelOtherSettings, updateModels bool) error {
+func updateChannelUpstreamModelSettings(channel *model.Provider, settings dto.ChannelOtherSettings, updateModels bool) error {
 	channel.SetOtherSettings(settings)
 	updates := map[string]any{
 		"settings": channel.OtherSettings,
@@ -509,11 +509,11 @@ func updateChannelUpstreamModelSettings(channel *model.Channel, settings dto.Cha
 	if updateModels {
 		updates["models"] = channel.Models
 	}
-	return model.DB.Model(&model.Channel{}).Where("id = ?", channel.Id).Updates(updates).Error
+	return model.DB.Model(&model.Provider{}).Where("id = ?", channel.Id).Updates(updates).Error
 }
 
 func checkAndPersistChannelUpstreamModelUpdates(
-	channel *model.Channel,
+	channel *model.Provider,
 	settings *dto.ChannelOtherSettings,
 	force bool,
 	allowAutoApply bool,
@@ -569,7 +569,7 @@ func refreshChannelRuntimeCache() {
 					common.SysLog(common.LogText("InitChannelCache panic: %v", r))
 				}
 			}()
-			model.InitChannelCache()
+			model.InitProviderCache()
 		}()
 	}
 }
@@ -721,7 +721,7 @@ func runChannelUpstreamModelUpdateTaskOnce(ctx context.Context, force bool, allo
 	// Count the enabled channels up front so progress can be reported as a
 	// percentage; a count error is non-fatal (progress just won't show a %).
 	var totalChannels int64
-	if err := model.DB.Model(&model.Channel{}).Where("status = ?", common.ChannelStatusEnabled).Count(&totalChannels).Error; err != nil {
+	if err := model.DB.Model(&model.Provider{}).Where("status = ?", common.ChannelStatusEnabled).Count(&totalChannels).Error; err != nil {
 		totalChannels = 0
 	}
 	processed := 0
@@ -732,7 +732,7 @@ scanLoop:
 		if ctx != nil && ctx.Err() != nil {
 			break
 		}
-		var channels []*model.Channel
+		var channels []*model.Provider
 		query := model.DB.
 			Select(channelUpstreamModelUpdateSelectFields).
 			Where("status = ?", common.ChannelStatusEnabled).
@@ -887,7 +887,7 @@ func ApplyChannelUpstreamModelUpdates(c *gin.Context) {
 		return
 	}
 
-	channel, err := model.GetChannelById(req.ID, true)
+	channel, err := model.GetProviderById(req.ID, true)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -943,7 +943,7 @@ func DetectChannelUpstreamModelUpdates(c *gin.Context) {
 		return
 	}
 
-	channel, err := model.GetChannelById(req.ID, true)
+	channel, err := model.GetProviderById(req.ID, true)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -974,7 +974,7 @@ func DetectChannelUpstreamModelUpdates(c *gin.Context) {
 }
 
 func applyChannelUpstreamModelUpdates(
-	channel *model.Channel,
+	channel *model.Provider,
 	addModelsInput []string,
 	ignoreModelsInput []string,
 	removeModelsInput []string,
@@ -1027,8 +1027,8 @@ func collectPendingApplyUpstreamModelChanges(settings dto.ChannelOtherSettings) 
 	return normalizeModelNames(settings.UpstreamModelUpdateLastDetectedModels), normalizeModelNames(settings.UpstreamModelUpdateLastRemovedModels)
 }
 
-func findEnabledChannelsAfterID(lastID int, batchSize int) ([]*model.Channel, error) {
-	var channels []*model.Channel
+func findEnabledChannelsAfterID(lastID int, batchSize int) ([]*model.Provider, error) {
+	var channels []*model.Provider
 	query := model.DB.
 		Select(channelUpstreamModelUpdateSelectFields).
 		Where("status = ?", common.ChannelStatusEnabled).

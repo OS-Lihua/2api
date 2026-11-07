@@ -14,7 +14,7 @@ func setupChannelStatusTest(t *testing.T) {
 	t.Helper()
 	truncateTables(t)
 	require.NoError(t, DB.Exec("DELETE FROM abilities").Error)
-	require.NoError(t, DB.Exec("DELETE FROM channels").Error)
+	require.NoError(t, DB.Exec("DELETE FROM providers").Error)
 
 	memoryCacheEnabled := common.MemoryCacheEnabled
 	common.MemoryCacheEnabled = false
@@ -26,11 +26,11 @@ func setupChannelStatusTest(t *testing.T) {
 func TestUpdateChannelStatusPersistsMultiKeyState(t *testing.T) {
 	setupChannelStatusTest(t)
 
-	channel := Channel{
+	channel := Provider{
 		Name:   "multi-key-status",
 		Key:    "key-a\nkey-b",
 		Status: common.ChannelStatusEnabled,
-		ChannelInfo: ChannelInfo{
+		ProviderInfo: ProviderInfo{
 			IsMultiKey:           true,
 			MultiKeySize:         2,
 			MultiKeyMode:         constant.MultiKeyModePolling,
@@ -39,42 +39,42 @@ func TestUpdateChannelStatusPersistsMultiKeyState(t *testing.T) {
 	}
 	require.NoError(t, DB.Create(&channel).Error)
 
-	changed := UpdateChannelStatus(channel.Id, "key-a", common.ChannelStatusAutoDisabled, "provider rejected key")
+	changed := UpdateProviderStatus(channel.Id, "key-a", common.ChannelStatusAutoDisabled, "provider rejected key")
 	require.True(t, changed)
 
-	var stored Channel
+	var stored Provider
 	require.NoError(t, DB.First(&stored, channel.Id).Error)
 	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
-	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
-	assert.Equal(t, "provider rejected key", stored.ChannelInfo.MultiKeyDisabledReason[0])
-	assert.NotZero(t, stored.ChannelInfo.MultiKeyDisabledTime[0])
-	assert.Equal(t, 1, stored.ChannelInfo.MultiKeyPollingIndex)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ProviderInfo.MultiKeyStatusList[0])
+	assert.Equal(t, "provider rejected key", stored.ProviderInfo.MultiKeyDisabledReason[0])
+	assert.NotZero(t, stored.ProviderInfo.MultiKeyDisabledTime[0])
+	assert.Equal(t, 1, stored.ProviderInfo.MultiKeyPollingIndex)
 }
 
 func TestSaveStatusStateFromSingleKeySnapshotPreservesUnownedColumns(t *testing.T) {
 	setupChannelStatusTest(t)
 
-	channel := Channel{
-		Name:        "single-key-status",
-		Key:         "original-key",
-		Status:      common.ChannelStatusEnabled,
-		Models:      "original-model",
-		Group:       "default",
-		UsedQuota:   100,
-		ChannelInfo: ChannelInfo{},
+	channel := Provider{
+		Name:         "single-key-status",
+		Key:          "original-key",
+		Status:       common.ChannelStatusEnabled,
+		Models:       "original-model",
+		Group:        "default",
+		UsedQuota:    100,
+		ProviderInfo: ProviderInfo{},
 	}
 	require.NoError(t, DB.Create(&channel).Error)
 
-	stale, err := GetChannelById(channel.Id, true)
+	stale, err := GetProviderById(channel.Id, true)
 	require.NoError(t, err)
 
-	concurrentChannelInfo := ChannelInfo{
+	concurrentChannelInfo := ProviderInfo{
 		IsMultiKey:           true,
 		MultiKeySize:         2,
 		MultiKeyMode:         constant.MultiKeyModePolling,
 		MultiKeyPollingIndex: 1,
 	}
-	require.NoError(t, DB.Model(&Channel{}).Where("id = ?", channel.Id).Updates(map[string]any{
+	require.NoError(t, DB.Model(&Provider{}).Where("id = ?", channel.Id).Updates(map[string]any{
 		"key":          "rotated-key",
 		"used_quota":   gorm.Expr("used_quota + ?", 250),
 		"models":       "concurrent-model",
@@ -88,13 +88,13 @@ func TestSaveStatusStateFromSingleKeySnapshotPreservesUnownedColumns(t *testing.
 	})
 	require.NoError(t, stale.saveStatusState())
 
-	var stored Channel
+	var stored Provider
 	require.NoError(t, DB.First(&stored, channel.Id).Error)
 	assert.Equal(t, common.ChannelStatusManuallyDisabled, stored.Status)
 	assert.Equal(t, "rotated-key", stored.Key)
 	assert.Equal(t, int64(350), stored.UsedQuota)
 	assert.Equal(t, "concurrent-model", stored.Models)
-	assert.Equal(t, concurrentChannelInfo, stored.ChannelInfo)
+	assert.Equal(t, concurrentChannelInfo, stored.ProviderInfo)
 
 	otherInfo := stored.GetOtherInfo()
 	assert.Equal(t, "manual operation", otherInfo["status_reason"])

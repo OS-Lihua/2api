@@ -2,7 +2,7 @@ package controller
 
 import "github.com/QuantumNous/new-api/model"
 
-func channelHasSensitiveChanges(channel *PatchChannel, origin *model.Channel, requestData map[string]any) bool {
+func channelHasSensitiveChanges(channel *PatchChannel, origin *model.Provider, requestData map[string]any) bool {
 	if _, ok := requestData["type"]; ok && channel.Type != origin.Type {
 		return true
 	}

@@ -87,7 +87,7 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 		if len(taskIds) == 0 {
 			continue
 		}
-		midjourneyChannel, err := model.CacheGetChannel(channelId)
+		midjourneyChannel, err := model.CacheGetProvider(channelId)
 		if err != nil {
 			logger.LogError(ctx, common.LogText("CacheGetChannel: %v", err))
 			err := model.MjBulkUpdate(taskIds, map[string]any{

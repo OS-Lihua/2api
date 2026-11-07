@@ -53,7 +53,7 @@ func exportedRequestIds(lines []map[string]any) []any {
 // from 400 days ago.
 func seedExportLogs(t *testing.T, mainDB *gorm.DB, logDB *gorm.DB, now int64) {
 	t.Helper()
-	require.NoError(t, mainDB.Create(&model.Channel{Id: 9, Name: "primary"}).Error)
+	require.NoError(t, mainDB.Create(&model.Provider{Id: 9, Name: "primary"}).Error)
 	logs := []model.Log{
 		{UserId: 1, Username: "alice", CreatedAt: now - 3600, Type: model.LogTypeConsume, ModelName: "gpt-a", ChannelId: 9, Quota: 10, RequestId: "a-1", Other: `{"admin_info":{"use_channel":["9"]}}`},
 		{UserId: 2, Username: "bob", CreatedAt: now - 1800, Type: model.LogTypeConsume, ModelName: "gpt-b", ChannelId: 9, Quota: 20, RequestId: "b-1"},
@@ -99,7 +99,7 @@ func TestLogExportDatabases(t *testing.T) {
 				mainDB, _ = newAuditTestDatabase(t, "postgres")
 			}
 			useLogExportDatabases(t, mainDB, db, tc.typ)
-			require.NoError(t, mainDB.AutoMigrate(&model.Channel{}))
+			require.NoError(t, mainDB.AutoMigrate(&model.Provider{}))
 			if tc.kind == "clickhouse" {
 				t.Setenv("LOG_SQL_DSN", isolatedDSN)
 				require.NoError(t, model.InitLogDB())
@@ -139,7 +139,7 @@ func TestLogExportRules(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db, _ := newAuditTestDatabase(t, "postgres")
 	useLogExportDatabases(t, db, db, common.DatabaseTypePostgreSQL)
-	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Log{}, &model.QuotaData{}))
+	require.NoError(t, db.AutoMigrate(&model.Provider{}, &model.Log{}, &model.QuotaData{}))
 	now := time.Now().Unix()
 	seedExportLogs(t, db, db, now)
 	logSetting := operation_setting.GetLogSetting()

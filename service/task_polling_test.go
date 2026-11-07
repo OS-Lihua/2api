@@ -191,7 +191,7 @@ func TestRedactVideoResponseBodyKeepsUntouchedBytes(t *testing.T) {
 
 func seedTaskPollingChannel(t *testing.T, id int, disableSleep bool) {
 	t.Helper()
-	ch := &model.Channel{
+	ch := &model.Provider{
 		Id:     id,
 		Type:   constant.ChannelTypeKling,
 		Name:   "polling_channel",
@@ -258,7 +258,7 @@ func TestPollingPassesExecutingChannelTypeToAdaptor(t *testing.T) {
 	truncate(t)
 	const channelID = 112
 	baseURL := "https://gateway.example"
-	gateway := &model.Channel{Id: channelID, Type: constant.ChannelTypeNewAPI, Name: "gateway", Key: "sk-gateway", Status: common.ChannelStatusEnabled, BaseURL: &baseURL}
+	gateway := &model.Provider{Id: channelID, Type: constant.ChannelTypeNewAPI, Name: "gateway", Key: "sk-gateway", Status: common.ChannelStatusEnabled, BaseURL: &baseURL}
 	gateway.HeaderOverride = common.GetPointer(`{"X-API-Key":"{api_key}"}`)
 	gateway.SetOtherSettings(dto.ChannelOtherSettings{DisableTaskPollingSleep: true})
 	require.NoError(t, model.DB.Create(gateway).Error)
@@ -670,7 +670,7 @@ func TestUpdateSunoTasksStalePollsRefundExactlyOnce(t *testing.T) {
 	seedUser(t, userID, initialUserQuota)
 	seedToken(t, tokenID, userID, "sk-suno-refund-once", initialTokenQuota)
 	baseURL := "https://suno.invalid"
-	require.NoError(t, model.DB.Create(&model.Channel{
+	require.NoError(t, model.DB.Create(&model.Provider{
 		Id:      channelID,
 		Type:    constant.ChannelTypeSunoAPI,
 		Name:    "suno_refund_once",
@@ -971,7 +971,7 @@ func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 			const initialQuota, preConsumed, tokenRemain = 10_000, 4_000, 7_000
 			seedUser(t, userID, initialQuota)
 			seedToken(t, tokenID, userID, "sk-poll-class", tokenRemain)
-			ch := &model.Channel{Id: channelID, Type: constant.ChannelTypeKling, Name: "poll", Key: "sk-test", Status: common.ChannelStatusEnabled}
+			ch := &model.Provider{Id: channelID, Type: constant.ChannelTypeKling, Name: "poll", Key: "sk-test", Status: common.ChannelStatusEnabled}
 
 			if testCase.maxFailures > 0 {
 				previous := constant.TaskPollMaxFailures

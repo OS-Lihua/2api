@@ -86,7 +86,7 @@ func (s *RequestPolicyState) Events() []PolicyEvent {
 	return slices.Clone(s.events)
 }
 
-func (s *RequestPolicyState) BeginAttempt(channel *model.Channel, group string) {
+func (s *RequestPolicyState) BeginAttempt(channel *model.Provider, group string) {
 	s.Attempts++
 	s.Successful = false
 	s.OutcomeRecorded = false
