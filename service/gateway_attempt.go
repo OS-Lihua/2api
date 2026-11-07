@@ -55,10 +55,6 @@ func ClassifyGatewayFailure(status int, code string, transport, timeout, cancell
 		return GatewayFailure{Class: "context_length"}
 	case code == "content_filter" || code == "content_policy_violation" || code == "safety":
 		return GatewayFailure{Class: "content_safety"}
-	case timeout:
-		return GatewayFailure{Class: "first_byte_timeout", Switch: true}
-	case transport:
-		return GatewayFailure{Class: "connection_failed", Switch: true}
 	case code == "insufficient_quota" || code == "insufficient_balance" || code == "credit_balance_too_low" || code == "billing_hard_limit_reached":
 		return GatewayFailure{Class: "account_quota", Switch: true, ExcludeProvider: true}
 	case status == 401 || status == 403 || code == "invalid_api_key" || code == "authentication_error":
@@ -71,6 +67,10 @@ func ClassifyGatewayFailure(status int, code string, transport, timeout, cancell
 		return GatewayFailure{Class: "upstream_unavailable", Switch: true}
 	case status == 400 || status == 413 || status == 422:
 		return GatewayFailure{Class: "invalid_request"}
+	case timeout:
+		return GatewayFailure{Class: "first_byte_timeout", Switch: true}
+	case transport:
+		return GatewayFailure{Class: "connection_failed", Switch: true}
 	default:
 		return GatewayFailure{Class: "upstream_error"}
 	}

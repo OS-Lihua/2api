@@ -12,6 +12,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestGatewayKnownRejectionSurvivesBudgetCancellation(t *testing.T) {
+	for _, test := range []struct {
+		status           int
+		code, class      string
+		provider, change bool
+	}{
+		{401, "", "credentials", true, true}, {403, "", "credentials", true, true},
+		{400, "", "invalid_request", false, false}, {413, "", "invalid_request", false, false}, {422, "", "invalid_request", false, false},
+		{429, "insufficient_quota", "account_quota", true, true}, {404, "model_not_found", "model_not_found", false, true},
+		{200, "content_filter", "content_safety", false, false}, {200, "context_length_exceeded", "context_length", false, false},
+	} {
+		t.Run(test.class, func(t *testing.T) {
+			failure := service.ClassifyGatewayFailure(test.status, test.code, false, true, false, false)
+			assert.Equal(t, test.class, failure.Class)
+			assert.Equal(t, test.change, failure.Switch)
+			assert.Equal(t, test.provider, failure.ExcludeProvider)
+		})
+	}
+}
+
 func TestGatewaySkippedCandidatesAndTiersShareTheSendBudget(t *testing.T) {
 	fake := clock.UseFake(t, time.Unix(100, 0))
 	calls := 0
