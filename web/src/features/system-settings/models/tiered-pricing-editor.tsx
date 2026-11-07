@@ -648,12 +648,11 @@ function RuleGroupCard({
       <div className='flex items-center gap-2'>
         <Label className='text-xs'>{t('Multiplier')}</Label>
         <DraftNumberInput
+          aria-label={t('Multiplier')}
           min={0}
           step={0.000001}
           value={group.multiplier}
-          onValueChange={(value) =>
-            onChange({ ...group, multiplier: String(value) })
-          }
+          onDraftChange={(value) => onChange({ ...group, multiplier: value })}
           className='w-32'
           placeholder='1.0'
         />

@@ -618,6 +618,130 @@ it('keeps the version prefix at the start when adding visual request rules', asy
   )
 })
 
+it.each([
+  ['an empty', ''],
+  ['an exact decimal', '1.000000000000000001'],
+])(
+  'preserves %s multiplier draft instead of silently changing its value',
+  async (_label, draft) => {
+    mockPrices()
+    const post = vi
+      .spyOn(api, 'post')
+      .mockResolvedValue({ data: { success: true, data: version } })
+    renderPage(true)
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: 'New price version' }))
+    const dialog = await screen.findByRole('dialog', {
+      name: 'New price version',
+    })
+    await user.type(
+      within(dialog).getByRole('combobox', { name: 'Price owner ID' }),
+      '9'
+    )
+    await user.tab()
+    await user.click(
+      within(dialog).getByRole('button', { name: 'Add rule group' })
+    )
+    await user.type(
+      within(dialog).getByPlaceholderText('service_tier'),
+      'service_tier'
+    )
+    await user.type(within(dialog).getByPlaceholderText('Value'), 'fast')
+    const multiplier = within(dialog).getByRole('textbox', {
+      name: 'Multiplier',
+    })
+    await user.type(multiplier, '2')
+    await user.clear(multiplier)
+    if (draft) await user.type(multiplier, draft)
+    await user.click(
+      within(dialog).getByRole('button', { name: 'Create price version' })
+    )
+    if (!draft) {
+      expect(
+        await within(dialog).findByText(
+          'Complete the invalid expression fields before saving.'
+        )
+      ).toBeVisible()
+      expect(post).not.toHaveBeenCalled()
+      expect(multiplier).toHaveValue('')
+      await user.type(multiplier, '0')
+      await user.click(
+        within(dialog).getByRole('button', { name: 'Create price version' })
+      )
+    }
+    await waitFor(() =>
+      expect(post).toHaveBeenCalledWith(
+        '/api/admin/v1/price-versions',
+        expect.objectContaining({
+          expression: expect.stringContaining(
+            `param("service_tier") == "fast" ? ${draft || '0'} : 1`
+          ),
+        })
+      )
+    )
+  }
+)
+
+it.each([
+  ['param', '"1"'],
+  ['param', '"true"'],
+  ['param', '1'],
+  ['param', 'true'],
+  ['param', '1.000000000000000001'],
+  ['header', '"1"'],
+])(
+  'preserves %s condition literal %s when editing its multiplier and saving',
+  async (sourceKind, literal) => {
+    mockPrices()
+    const post = vi
+      .spyOn(api, 'post')
+      .mockResolvedValue({ data: { success: true, data: version } })
+    renderPage(true)
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: 'New price version' }))
+    const dialog = await screen.findByRole('dialog', {
+      name: 'New price version',
+    })
+    await user.type(
+      within(dialog).getByRole('combobox', { name: 'Price owner ID' }),
+      '9'
+    )
+    await user.tab()
+    await user.click(
+      within(dialog).getByRole('combobox', { name: 'Editor mode' })
+    )
+    await user.click(
+      await screen.findByRole('option', { name: 'Expression editor' })
+    )
+    await user.clear(within(dialog).getByLabelText('Billing expression'))
+    await user.type(
+      within(dialog).getByLabelText('Billing expression'),
+      `v1:(tier("base", p * 1 + c * 0)) * (${sourceKind}("tier") == ${literal} ? 2 : 1)`
+    )
+    await user.click(
+      within(dialog).getByRole('combobox', { name: 'Editor mode' })
+    )
+    await user.click(
+      await screen.findByRole('option', { name: 'Visual editor' })
+    )
+    await user.clear(within(dialog).getByPlaceholderText('1.0'))
+    await user.type(within(dialog).getByPlaceholderText('1.0'), '3')
+    await user.click(
+      within(dialog).getByRole('button', { name: 'Create price version' })
+    )
+    await waitFor(() =>
+      expect(post).toHaveBeenCalledWith(
+        '/api/admin/v1/price-versions',
+        expect.objectContaining({
+          expression: expect.stringContaining(
+            `${sourceKind}("tier") == ${literal} ? 3 : 1`
+          ),
+        })
+      )
+    )
+  }
+)
+
 it('keeps native request-rule expressions visually editable while retaining the exact raw source', async () => {
   mockPrices()
   const post = vi
@@ -652,7 +776,7 @@ it('keeps native request-rule expressions visually editable while retaining the 
     within(dialog).getByRole('textbox', { name: 'Input price' })
   ).toHaveValue('0.123456789012345678')
   expect(within(dialog).getByPlaceholderText('Value')).toHaveValue('fast')
-  expect(within(dialog).getByPlaceholderText('1.0')).toHaveValue(2)
+  expect(within(dialog).getByPlaceholderText('1.0')).toHaveValue('2')
   await user.click(
     within(dialog).getByRole('combobox', { name: 'Editor mode' })
   )
