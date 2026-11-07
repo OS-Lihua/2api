@@ -73,7 +73,7 @@ func (a *ChannelAdaptor) ConvertRequest(c *gin.Context, info *relaycommon.RelayI
 	return converted, err
 }
 
-func (a *ChannelAdaptor) ProjectChatRequest(info *relaycommon.RelayInfo, converted any, public *dto.GeneralOpenAIRequest, body []byte) (*dto.GeneralOpenAIRequest, error) {
+func (a *ChannelAdaptor) ProjectChatRequest(c *gin.Context, info *relaycommon.RelayInfo, converted any, public *dto.GeneralOpenAIRequest, body []byte) (*dto.GeneralOpenAIRequest, error) {
 	if projector, ok := converted.(channel.ChatRequestProjector); ok {
 		return projector.ProjectChatRequest(body, *public)
 	}
@@ -97,7 +97,7 @@ func (a *ChannelAdaptor) ProjectChatRequest(info *relaycommon.RelayInfo, convert
 		if err := common.Unmarshal(body, native); err != nil {
 			return nil, err
 		}
-		effective, err := service.GatewayChatProjection(nil, native)
+		effective, err := service.GatewayChatProjection(c, native)
 		if err != nil {
 			return nil, err
 		}

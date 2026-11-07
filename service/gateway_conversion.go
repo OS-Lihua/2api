@@ -42,6 +42,11 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 	if err != nil {
 		return nil, err
 	}
+	for _, diagnostic := range result.Diagnostics {
+		if diagnostic.Code == "unsupported_media_type" && diagnostic.Severity == types.ConversionDiagnosticError {
+			return nil, fmt.Errorf("request media cannot be represented for validation")
+		}
+	}
 	chat, ok := result.Value.(*dto.GeneralOpenAIRequest)
 	if !ok {
 		return nil, fmt.Errorf("missing text request projection")

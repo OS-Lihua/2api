@@ -96,7 +96,7 @@ func ResponseGeminiChat2OpenAI(id string, created int64, response *dto.GeminiCha
 			FinishReason: types.FinishReasonStop,
 		}
 		if len(candidate.Content.Parts) > 0 {
-			var content strings.Builder
+			var content, reasoning strings.Builder
 			var inlineGrow int
 			for _, part := range candidate.Content.Parts {
 				if part.InlineData != nil {
@@ -137,7 +137,7 @@ func ResponseGeminiChat2OpenAI(id string, created int64, response *dto.GeminiCha
 						toolCalls = append(toolCalls, *call)
 					}
 				} else if part.Thought {
-					choice.Message.ReasoningContent = &part.Text
+					reasoning.WriteString(part.Text)
 				} else {
 					if part.ExecutableCode != nil {
 						writeSep()
@@ -160,6 +160,10 @@ func ResponseGeminiChat2OpenAI(id string, created int64, response *dto.GeminiCha
 			if len(toolCalls) > 0 {
 				choice.Message.SetToolCalls(toolCalls)
 				isToolCall = true
+			}
+			if reasoning.Len() > 0 {
+				text := reasoning.String()
+				choice.Message.ReasoningContent = &text
 			}
 			choice.Message.SetStringContent(content.String())
 		}

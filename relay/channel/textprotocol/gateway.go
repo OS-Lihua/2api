@@ -59,7 +59,8 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	facts.UsageReported = facts.PromptTokensReported && facts.CompletionTokensReported
 	var generated strings.Builder
 	nativeMessages := p.format == types.RelayFormatClaude && info.RelayFormat == types.RelayFormatClaude
-	if chat, ok := canonical.Value.(*dto.OpenAITextResponse); ok && !nativeMessages {
+	nativeGemini := p.format == types.RelayFormatGemini && info.RelayFormat == types.RelayFormatGemini
+	if chat, ok := canonical.Value.(*dto.OpenAITextResponse); ok && !nativeMessages && !nativeGemini {
 		for _, choice := range chat.Choices {
 			generated.WriteString(choice.Message.StringContent())
 			if choice.Message.ReasoningContent != nil {
@@ -84,6 +85,13 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	if nativeMessages {
 		for _, block := range gjson.GetBytes(body, "content").Array() {
 			generated.WriteString(gatewayMessagesBlockText(block))
+		}
+	}
+	if nativeGemini {
+		for _, candidate := range gjson.GetBytes(body, "candidates").Array() {
+			for _, part := range candidate.Get("content.parts").Array() {
+				generated.WriteString(gatewayGeminiPartText(part))
+			}
 		}
 	}
 	facts.GeneratedText = generated.String()

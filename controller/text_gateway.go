@@ -98,6 +98,12 @@ func TextGateway(c *gin.Context) {
 	if pathName != "" {
 		native.SetModelName(pathName)
 	}
+	if _, chat := native.(*dto.GeneralOpenAIRequest); !chat {
+		if err := service.PrepareGatewayMedia(c, native); err != nil {
+			gatewayError(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
+			return
+		}
+	}
 	request, err := service.GatewayChatProjection(c, native)
 	if err != nil {
 		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "The request cannot be converted")
@@ -244,7 +250,7 @@ func TextGateway(c *gin.Context) {
 			return
 		}
 	}
-	effective, err := adaptor.ProjectChatRequest(info, converted, request, encoded)
+	effective, err := adaptor.ProjectChatRequest(c, info, converted, request, encoded)
 	if err != nil {
 		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "Invalid Channel request parameters")
 		return
@@ -294,7 +300,7 @@ func TextGateway(c *gin.Context) {
 		request.MaxCompletionTokens = common.GetPointer(uint(limit))
 		encoded, err = adaptor.SetChatOutputLimit(converted, encoded, uint(limit))
 		if err == nil {
-			effective, err = adaptor.ProjectChatRequest(info, converted, request, encoded)
+			effective, err = adaptor.ProjectChatRequest(c, info, converted, request, encoded)
 		}
 		if err != nil {
 			gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "Invalid Channel request parameters")

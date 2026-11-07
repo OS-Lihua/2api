@@ -149,6 +149,18 @@ func gatewayResponseTool(item gjson.Result) (string, string, bool) {
 	}
 }
 
+func gatewayGeminiPartText(part gjson.Result) string {
+	var text strings.Builder
+	text.WriteString(part.Get("text").String())
+	if part.Get("functionCall").Exists() {
+		text.WriteString(part.Get("functionCall.name").String())
+		text.WriteString(part.Get("functionCall.args").Raw)
+	}
+	text.WriteString(part.Get("executableCode.code").String())
+	text.WriteString(part.Get("codeExecutionResult.output").String())
+	return text.String()
+}
+
 func gatewayMessagesBlockText(block gjson.Result) string {
 	switch block.Get("type").String() {
 	case "text":

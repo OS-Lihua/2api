@@ -257,11 +257,7 @@ func gatewayStreamBusinessText(body []byte, format types.RelayFormat) string {
 	case types.RelayFormatGemini:
 		for _, candidate := range root.Get("candidates").Array() {
 			for _, part := range candidate.Get("content.parts").Array() {
-				text.WriteString(part.Get("text").String())
-				if part.Get("functionCall").Exists() {
-					text.WriteString(part.Get("functionCall.name").String())
-					text.WriteString(part.Get("functionCall.args").Raw)
-				}
+				text.WriteString(gatewayGeminiPartText(part))
 			}
 		}
 	default:

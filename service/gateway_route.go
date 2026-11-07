@@ -54,7 +54,7 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 	var selected *GatewaySelection
 	var rejected []types.ConversionDiagnostic
 	bestRank := 5
-	mediaPrepared := false
+	_, mediaPrepared := c.Get(gatewayMediaContextKey)
 	for _, candidate := range candidates {
 		reason := ""
 		var provider *model.Provider
