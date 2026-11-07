@@ -71,7 +71,7 @@ func GatewayFX(ctx context.Context, from money.Currency) (*money.Rate, string, e
 
 // GatewayPrice evaluates one frozen expression and applies the exact discount
 // and frozen accounting quote. Rounding belongs to the caller's ledger boundary.
-func GatewayPrice(price *model.PriceVersion, usage *dto.Usage, request billingexpr.RequestInput, at time.Time, ratio decimal.Decimal, rate *money.Rate) (money.Value, money.Value, billingexpr.MoneyTraceResult, error) {
+func GatewayPrice(price *model.PriceVersion, usage *dto.Usage, request billingexpr.RequestInput, at time.Time, ratio decimal.Decimal, rate *money.Rate, actualImageCount ...int) (money.Value, money.Value, billingexpr.MoneyTraceResult, error) {
 	used, err := billingexpr.MoneyUsedVars(price.Expression)
 	if err != nil {
 		return money.Value{}, money.Value{}, billingexpr.MoneyTraceResult{}, err
@@ -80,7 +80,14 @@ func GatewayPrice(price *model.PriceVersion, usage *dto.Usage, request billingex
 	if err != nil {
 		return money.Value{}, money.Value{}, billingexpr.MoneyTraceResult{}, err
 	}
-	value, trace, err := billingexpr.RunMoneyExpr(price.Expression, billingexpr.MoneyInput{TokenQuantities: quantities, Request: request, Time: at}, price.Currency)
+	input := billingexpr.MoneyInput{TokenQuantities: quantities, Request: request, Time: at}
+	if len(actualImageCount) > 1 {
+		return money.Value{}, money.Value{}, billingexpr.MoneyTraceResult{}, errors.New("multiple actual image counts")
+	}
+	if len(actualImageCount) == 1 {
+		input.ImageCount = &actualImageCount[0]
+	}
+	value, trace, err := billingexpr.RunMoneyExpr(price.Expression, input, price.Currency)
 	if err != nil {
 		return money.Value{}, money.Value{}, trace, err
 	}

@@ -83,13 +83,18 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 			if err != nil {
 				return 0, fmt.Errorf("error getting audio duration: %v", err)
 			}
-			// duration 来自用户上传文件的元数据，可被伪造成天文数字或负数。
-			// 负值会让 token 估算变成负数（低估预扣费），先钳到 0 再转换。
-			if duration < 0 {
-				duration = 0
+			if info.ResponseFacts != nil && (math.IsNaN(duration) || math.IsInf(duration, 0) || duration < 0 || duration > relaycommon.MaxTaskDurationSeconds) {
+				return 0, errors.New("audio duration exceeds the request limit")
 			}
-			// 一分钟 1000 token，与 $price / minute 对齐。
-			totalAudioToken += common.QuotaRound(math.Ceil(duration) / 60.0 * 1000)
+			tokens, clamp := common.AudioDurationTokens(duration)
+			if clamp != nil {
+				info.QuotaClamp = clamp
+			}
+			// Sum in the same bounded domain as each file's conversion.
+			totalAudioToken, clamp = common.QuotaFromFloatChecked(float64(totalAudioToken) + float64(tokens))
+			if clamp != nil {
+				info.QuotaClamp = clamp
+			}
 		}
 		return totalAudioToken, nil
 	}

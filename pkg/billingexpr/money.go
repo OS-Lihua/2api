@@ -29,6 +29,9 @@ import (
 // A zero Time uses pkg/clock.Now when the evaluation starts.
 type MoneyInput struct {
 	Tokens map[string]int64
+	// ImageCount overrides the request estimate with a bounded actual payload
+	// count, including zero. It never changes frozen param("n") probes.
+	ImageCount *int
 	// TokenQuantities overrides whole counts for exact weighted cache quantities,
 	// such as the 1.6 short-write units used by an unpriced one-hour cache write.
 	TokenQuantities map[string]decimal.Decimal
@@ -134,7 +137,12 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 		if input.Request.ImageCount != nil {
 			imageCount = *input.Request.ImageCount
 		}
-		if imageCount < 1 || imageCount > dto.MaxImageN {
+		if input.ImageCount != nil {
+			imageCount = *input.ImageCount
+			if imageCount < 0 || imageCount > dto.MaxImageN {
+				return money.Value{}, trace, fmt.Errorf("actual image_count must be between 0 and %d", dto.MaxImageN)
+			}
+		} else if imageCount < 1 || imageCount > dto.MaxImageN {
 			return money.Value{}, trace, fmt.Errorf("image_count must be between 1 and %d", dto.MaxImageN)
 		}
 		trace.ImageCount = &imageCount

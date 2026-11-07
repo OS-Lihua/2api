@@ -249,6 +249,28 @@ func TestMoneyExprPreservesImageCountCompatibility(t *testing.T) {
 	}
 }
 
+func TestMoneyExprActualMediaQuantitiesKeepRequestProbesFrozen(t *testing.T) {
+	requested := 3
+	for _, actual := range []int{0, 1, 2} {
+		amount, trace, err := billingexpr.RunMoneyExpr(`tier("image", fixed(0.04)) * image_count * (param("n") == 3 ? 2 : 1)`, billingexpr.MoneyInput{
+			ImageCount: &actual,
+			Request:    billingexpr.RequestInput{ImageCount: &requested, Body: []byte(`{"n":3}`)},
+		}, "USD")
+		require.NoError(t, err)
+		want := []string{"0 USD", "0.08 USD", "0.16 USD"}
+		assert.Equal(t, want[actual], amount.String())
+		require.NotNil(t, trace.ImageCount)
+		assert.Equal(t, actual, *trace.ImageCount)
+	}
+	for _, count := range []int{-1, 129} {
+		_, _, err := billingexpr.RunMoneyExpr(`tier("image", fixed(0.04)) * image_count`, billingexpr.MoneyInput{ImageCount: &count}, "USD")
+		require.Error(t, err)
+	}
+	amount, _, err := billingexpr.RunMoneyExpr(`tier("audio", p * 2 + ai * 3 + ao * 15)`, billingexpr.MoneyInput{Tokens: map[string]int64{"p": 100, "ai": 1000, "ao": 2000}}, "USD")
+	require.NoError(t, err)
+	assert.Equal(t, "0.0332 USD", amount.String())
+}
+
 func TestMoneyExprRoundsOnlyAtWriteAndKeepsLegacyEvaluation(t *testing.T) {
 	amount, _, err := billingexpr.RunMoneyExpr(`p * 0.001499999999999999997 / 3`, billingexpr.MoneyInput{Tokens: map[string]int64{"p": 1}}, "USD")
 	require.NoError(t, err)

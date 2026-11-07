@@ -14,6 +14,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/gin-gonic/gin"
 )
 
@@ -65,6 +66,20 @@ func (a *ChannelAdaptor) PrepareMediaRequest(c *gin.Context, info *relaycommon.R
 		return nil, err
 	}
 	var form *multipart.Form
+	if !strings.HasPrefix(c.GetHeader("Content-Type"), "multipart/form-data") && (info.ChannelSetting.PassThroughBodyEnabled || model_setting.GetGlobalSettings().PassThroughRequestEnabled) {
+		var fields map[string]common.RawMessage
+		if err := common.Unmarshal(parsed.Input.Body, &fields); err != nil {
+			return nil, err
+		}
+		fields["model"], err = common.Marshal(info.UpstreamModelName)
+		if err != nil {
+			return nil, err
+		}
+		body, err = common.Marshal(fields)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if strings.HasPrefix(c.GetHeader("Content-Type"), "multipart/form-data") {
 		_, parameters, parseErr := mime.ParseMediaType(c.GetHeader("Content-Type"))
 		if parseErr != nil {
@@ -103,6 +118,15 @@ func (a *ChannelAdaptor) PrepareMediaRequest(c *gin.Context, info *relaycommon.R
 			return nil, err
 		}
 		effective.N = common.GetPointer(uint(count))
+		var providerParameters struct {
+			Parameters *dto.ImageBillingParameters `json:"parameters"`
+		}
+		if err := common.Unmarshal(body, &providerParameters); err != nil {
+			return nil, err
+		}
+		if parameters := providerParameters.Parameters; parameters != nil && parameters.N != nil && *parameters.N != uint(count) {
+			return nil, fmt.Errorf("provider image count differs from n")
+		}
 		// Preserve native/provider fields while normalizing an explicit zero.
 		var fields map[string]common.RawMessage
 		if err := common.Unmarshal(body, &fields); err != nil {

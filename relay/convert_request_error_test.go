@@ -60,6 +60,8 @@ func TestMediaPreparationValidatesAndSendsFinalQuantity(t *testing.T) {
 		{"provider override", `{"model":"image","prompt":"draw","n":1}`, 4, 4, false},
 		{"oversized override", `{"model":"image","prompt":"draw","n":1}`, 129, 0, true},
 		{"nested bypass", `{"model":"image","prompt":"draw","parameters":{"n":129}}`, nil, 0, true},
+		{"passthrough", `{"model":"image","prompt":"draw","n":2,"parameters":{"n":2},"provider_extension":true}`, nil, 2, false},
+		{"conflicting passthrough", `{"model":"image","prompt":"draw","n":2,"parameters":{"n":4}}`, nil, 0, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var sent []byte
@@ -80,6 +82,9 @@ func TestMediaPreparationValidatesAndSendsFinalQuantity(t *testing.T) {
 			}
 			require.NoError(t, err)
 			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeOpenAI, ChannelBaseUrl: upstream.URL, UpstreamModelName: "wire-image"}, RelayMode: relayconstant.RelayModeImagesGenerations, RelayFormat: types.RelayFormatOpenAIImage}
+			if strings.Contains(tc.name, "passthrough") {
+				info.ChannelSetting.PassThroughBodyEnabled = true
+			}
 			if tc.override != nil {
 				info.ParamOverride = map[string]any{"operations": []any{map[string]any{"path": "n", "mode": "set", "value": tc.override}}}
 			}
@@ -99,6 +104,9 @@ func TestMediaPreparationValidatesAndSendsFinalQuantity(t *testing.T) {
 			require.NoError(t, response.(*http.Response).Body.Close())
 			assert.Equal(t, int64(tc.count), ojson.GetBytes(sent, "n").Int())
 			assert.Equal(t, "wire-image", ojson.GetBytes(sent, "model").String())
+			if tc.name == "passthrough" {
+				assert.True(t, ojson.GetBytes(sent, "provider_extension").Bool())
+			}
 		})
 	}
 }
