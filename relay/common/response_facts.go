@@ -9,22 +9,7 @@ import (
 // ChatUsagePresence reports bounded base counters independently. A reported
 // zero remains authoritative even when the other counter needs estimation.
 func ChatUsagePresence(body []byte) (prompt, completion bool) {
-	var response struct {
-		Usage *struct {
-			PromptTokens     *int64 `json:"prompt_tokens"`
-			CompletionTokens *int64 `json:"completion_tokens"`
-			TotalTokens      *int64 `json:"total_tokens"`
-		} `json:"usage"`
-	}
-	if common.Unmarshal(body, &response) != nil || response.Usage == nil {
-		return false, false
-	}
-	usage := response.Usage
-	if usage.TotalTokens != nil && (*usage.TotalTokens < 0 || *usage.TotalTokens > 1<<31-1) {
-		return false, false
-	}
-	return usage.PromptTokens != nil && *usage.PromptTokens >= 0 && *usage.PromptTokens <= 1<<31-1,
-		usage.CompletionTokens != nil && *usage.CompletionTokens >= 0 && *usage.CompletionTokens <= 1<<31-1
+	return NativeUsagePresence(body, "usage.prompt_tokens", "usage.completion_tokens", "usage.total_tokens")
 }
 
 // ResponseFacts separates upstream-reported zero usage from a local estimate,
@@ -50,10 +35,11 @@ func (facts *ResponseFacts) MarkBusinessOutput() {
 }
 
 // NativeUsagePresence applies the Chat counter bounds to provider field names.
-// The provider parser still owns the envelope and the counter values.
-func NativeUsagePresence(body []byte, promptPath, completionPath, totalPath string) (bool, bool) {
-	var present [3]bool
-	for i, path := range []string{promptPath, completionPath, totalPath} {
+// The provider parser still owns the envelope and the counter values. A bad
+// total cannot invalidate independently valid input or output counters.
+func NativeUsagePresence(body []byte, promptPath, completionPath, _ string) (bool, bool) {
+	var present [2]bool
+	for i, path := range []string{promptPath, completionPath} {
 		if path == "" {
 			continue
 		}
@@ -63,9 +49,6 @@ func NativeUsagePresence(body []byte, promptPath, completionPath, totalPath stri
 		}
 		var count int64
 		if common.UnmarshalJsonStr(raw, &count) != nil || count < 0 || count > 1<<31-1 {
-			if i == 2 {
-				return false, false
-			}
 			continue
 		}
 		present[i] = true

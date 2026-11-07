@@ -93,6 +93,14 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 			}
 			response, err := client.Do(request)
 			if err != nil {
+				if facts, _ := common.GetContextKey(c, constant.ContextKeyResponseFacts); facts != nil {
+					// Completed generation remains payable when fetching its messages fails.
+					return &http.Response{
+						StatusCode: http.StatusBadGateway,
+						Header:     make(http.Header),
+						Body:       &cozeResultBody{ReadCloser: io.NopCloser(bytes.NewReader(nil)), completion: completion, completionBody: completionBody},
+					}, nil
+				}
 				return nil, err
 			}
 			response.Body = &cozeResultBody{ReadCloser: response.Body, completion: completion, completionBody: completionBody}
