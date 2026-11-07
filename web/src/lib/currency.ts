@@ -85,6 +85,44 @@ import {
   type CurrencyDisplayType,
 } from '@/stores/system-config-store'
 
+export interface MoneyAmount {
+  nanos: string
+  currency: string
+}
+
+/** Format currency-bearing nanos without passing the amount through a float. */
+export function formatMoneyAmount(
+  amount: MoneyAmount | null | undefined,
+  locale?: Intl.LocalesArgument
+): string {
+  if (
+    !amount ||
+    typeof amount.nanos !== 'string' ||
+    !/^-?\d+$/.test(amount.nanos) ||
+    !/^[A-Z]{3}$/.test(amount.currency)
+  ) {
+    return '-'
+  }
+
+  const nanos = BigInt(amount.nanos)
+  const absolute = nanos < 0n ? -nanos : nanos
+  const integer = absolute / 1_000_000_000n
+  const fraction = (absolute % 1_000_000_000n)
+    .toString()
+    .padStart(9, '0')
+    .replace(/0+$/, '')
+  const formatter = new Intl.NumberFormat(locale, { maximumFractionDigits: 0 })
+  const decimalFormatter = new Intl.NumberFormat(locale)
+  const decimal =
+    decimalFormatter.formatToParts(1.1).find((part) => part.type === 'decimal')
+      ?.value ?? '.'
+  const minus =
+    decimalFormatter.formatToParts(-1).find((part) => part.type === 'minusSign')
+      ?.value ?? '-'
+  const number = `${nanos < 0n ? minus : ''}${formatter.format(integer)}${fraction ? decimal + fraction : ''}`
+  return `${number} ${amount.currency}`
+}
+
 export interface CurrencyFormatOptions {
   /** Fraction digits to use when |value| >= 1 */
   digitsLarge?: number

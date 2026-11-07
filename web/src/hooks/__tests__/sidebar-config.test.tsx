@@ -202,6 +202,30 @@ describe('audit log sidebar entry', () => {
   })
 })
 
+it('shows Request logs alongside legacy logs and respects the usage-log visibility setting', () => {
+  const visible = sidebarFor({ console: { enabled: true, log: true } })
+  const items = visible.result.current.flatMap((group) => group.items)
+  expect(items).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        title: 'Request logs',
+        url: '/usage-logs/requests',
+      }),
+      expect.objectContaining({
+        title: 'Usage Logs',
+        url: '/usage-logs/common',
+      }),
+      expect.objectContaining({ title: 'Task Logs', url: '/usage-logs/task' }),
+    ])
+  )
+  const hidden = sidebarFor({ console: { enabled: true, log: false } })
+  expect(
+    hidden.result.current
+      .flatMap((group) => group.items)
+      .map((item) => item.title)
+  ).not.toContain('Request logs')
+})
+
 describe('model pricing badge', () => {
   function issue(modelName: string, pluginKey: string): ModelPricingIssue {
     return {

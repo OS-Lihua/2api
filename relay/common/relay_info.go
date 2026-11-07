@@ -127,7 +127,11 @@ type RelayInfo struct {
 	RelayFormat         types.RelayFormat
 	// UpstreamProtocol is set only by the explicit Channel adapter entry point.
 	// Legacy relays leave it empty and retain their existing usage fallbacks.
-	UpstreamProtocol  protocol.Type
+	UpstreamProtocol protocol.Type
+	// ResponseFacts is populated by protocol handlers when exact wallet billing
+	// needs usage presence and business delivery separately from transport status.
+	ResponseFacts     *ResponseFacts
+	TokenizerModel    string
 	SendResponseCount int
 	// ClaudeToChatStreamState / ChatToGeminiStreamState hold per-attempt
 	// stream converters. InitChannelMeta nils them so a retry cannot resume a

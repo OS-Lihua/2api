@@ -9,6 +9,26 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// hasReportedChatUsage requires both base counters to be present. An empty
+// object means missing usage, whereas an explicitly reported pair of zeros is
+// authoritative. Protocol handlers use this only for exact wallet billing.
+func hasReportedChatUsage(body []byte) bool {
+	var response struct {
+		Usage *struct {
+			PromptTokens     *int64 `json:"prompt_tokens"`
+			CompletionTokens *int64 `json:"completion_tokens"`
+			TotalTokens      *int64 `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if common.Unmarshal(body, &response) != nil || response.Usage == nil {
+		return false
+	}
+	usage := response.Usage
+	return usage.PromptTokens != nil && *usage.PromptTokens >= 0 && *usage.PromptTokens <= 1<<31-1 &&
+		usage.CompletionTokens != nil && *usage.CompletionTokens >= 0 && *usage.CompletionTokens <= 1<<31-1 &&
+		(usage.TotalTokens == nil || *usage.TotalTokens >= 0 && *usage.TotalTokens <= 1<<31-1)
+}
+
 func applyProtocolUsagePostProcessing(c *gin.Context, info *relaycommon.RelayInfo, usage *dto.Usage, responseBody []byte) {
 	if !channel.RepairProviderUsage(c, usage, responseBody) {
 		applyUsagePostProcessing(info, usage, responseBody)

@@ -93,6 +93,35 @@ func GetModelOffering(ctx context.Context, id int) (*ModelOffering, error) {
 	return &record, nil
 }
 
+// FindModelOfferingByName resolves both primary names and aliases, including
+// disabled offerings. Callers must never send a known but inaccessible name to
+// legacy routing.
+func FindModelOfferingByName(ctx context.Context, name string) (*ModelOffering, error) {
+	var entry ModelOfferingName
+	if err := DB.WithContext(ctx).First(&entry, "name = ?", name).Error; err != nil {
+		return nil, err
+	}
+	return GetModelOffering(ctx, entry.OfferingID)
+}
+
+// OfferingChannelsQuery applies member identity and the shared scope contract.
+// Provider and Channel inclusions form a union; exclusions always win, including
+// when an included target has been deleted.
+func OfferingChannelsQuery(db *gorm.DB, offering *ModelOffering, modelIDs []int) *gorm.DB {
+	query := db.Model(&Channel{}).Where("model_id IN ?", modelIDs)
+	scope := offering.ChannelScope
+	if len(scope.IncludeProviderIDs)+len(scope.IncludeChannelIDs) > 0 {
+		query = query.Where("(provider_id IN ? OR id IN ?)", scope.IncludeProviderIDs, scope.IncludeChannelIDs)
+	}
+	if len(scope.ExcludeProviderIDs) > 0 {
+		query = query.Where("provider_id NOT IN ?", scope.ExcludeProviderIDs)
+	}
+	if len(scope.ExcludeChannelIDs) > 0 {
+		query = query.Where("id NOT IN ?", scope.ExcludeChannelIDs)
+	}
+	return query
+}
+
 // SaveModelOffering replaces a declaration atomically, including its names and
 // members. Renaming reserves the old primary name as an alias in the same
 // transaction. The activation actions always use the locked current declaration.

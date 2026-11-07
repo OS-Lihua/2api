@@ -432,6 +432,7 @@ func SetApiRouter(router *gin.Engine) {
 
 		registerModelOfferingRoutes(apiRouter)
 		registerPricingRoutes(apiRouter)
+		registerGatewayRecordRoutes(apiRouter)
 		adminV1 := apiRouter.Group("/admin/v1")
 		adminV1.Use(middleware.AdminAuth())
 		{

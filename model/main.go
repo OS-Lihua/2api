@@ -185,7 +185,7 @@ func InitLogDB() (err error) {
 		LOG_DB = DB
 		common.SetLogDatabaseType(common.DatabaseTypePostgreSQL)
 		if common.IsMasterNode {
-			return MigrateAuditLogs()
+			return migrateLOGDB()
 		}
 		return
 	}
@@ -321,8 +321,8 @@ func migrateDB() error {
 	if err := MigratePricing(DB); err != nil {
 		return fmt.Errorf("migrate pricing: %w", err)
 	}
-	if err := migrateWalletLedger(DB); err != nil {
-		return fmt.Errorf("migrate wallet ledger: %w", err)
+	if err := MigrateGatewayBilling(DB); err != nil {
+		return fmt.Errorf("migrate gateway billing: %w", err)
 	}
 	if err := InitializeUserAuthVersions(); err != nil {
 		return err
@@ -337,6 +337,9 @@ func migrateDB() error {
 }
 
 func migrateLOGDB() error {
+	if err := MigrateGatewayRecords(); err != nil {
+		return err
+	}
 	if err := MigrateAuditLogs(); err != nil {
 		return err
 	}

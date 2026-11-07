@@ -34,16 +34,14 @@ import {
   useUsageLogsContext,
 } from './components/usage-logs-provider'
 import { UsageLogsTable } from './components/usage-logs-table'
-import {
-  isUsageLogsSectionId,
-  USAGE_LOGS_DEFAULT_SECTION,
-  type UsageLogsSectionId,
-} from './section-registry'
+import { RequestLogs } from './requests'
+import type { UsageLogsSectionId } from './section-registry'
+import type { LogCategory } from './types'
 
 const route = getRouteApi('/_authenticated/usage-logs/$section')
 const TASK_LOG_SECTIONS = ['drawing', 'task'] as const
 
-const SECTION_META: Record<UsageLogsSectionId, { titleKey: string }> = {
+const SECTION_META: Record<LogCategory, { titleKey: string }> = {
   common: {
     titleKey: 'Common Logs',
   },
@@ -59,10 +57,10 @@ function UsageLogsContent() {
   const { t } = useTranslation()
   const navigate = useNavigate()
   const params = route.useParams()
-  const activeCategory: UsageLogsSectionId =
-    params.section && isUsageLogsSectionId(params.section)
+  const activeCategory: LogCategory =
+    params.section === 'drawing' || params.section === 'task'
       ? params.section
-      : USAGE_LOGS_DEFAULT_SECTION
+      : 'common'
   const {
     selectedUserId,
     userInfoDialogOpen,
@@ -92,8 +90,9 @@ function UsageLogsContent() {
           if (!('url' in item) || typeof item.url !== 'string') return null
           return item.url.split('/').pop() ?? null
         })
-        .filter((section): section is UsageLogsSectionId =>
-          Boolean(section && isUsageLogsSectionId(section))
+        .filter(
+          (section): section is LogCategory =>
+            section === 'drawing' || section === 'task'
         ),
     [filteredTabGroups]
   )
@@ -186,6 +185,8 @@ function UsageLogsContent() {
 }
 
 export function UsageLogs() {
+  const params = route.useParams()
+  if (params.section === 'requests') return <RequestLogs />
   return (
     <UsageLogsProvider>
       <UsageLogsContent />

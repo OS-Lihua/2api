@@ -21,9 +21,24 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, forceFormat bool, thinkToContent bool) error {
+func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, forceFormat bool, thinkToContent bool) (writeErr error) {
 	if data == "" {
 		return nil
+	}
+	if info.ResponseFacts != nil {
+		var frame dto.ChatCompletionsStreamResponse
+		if common.UnmarshalJsonStr(data, &frame) == nil {
+			business := false
+			for _, choice := range frame.Choices {
+				business = business || choice.Delta.GetContentString() != "" || choice.Delta.GetReasoningContent() != "" || len(choice.Delta.ToolCalls) > 0
+			}
+			written := max(0, c.Writer.Size())
+			defer func() {
+				if business && (writeErr == nil || c.Writer.Size() > written) {
+					info.ResponseFacts.BusinessOutput = true
+				}
+			}()
+		}
 	}
 
 	if !forceFormat && !thinkToContent {
@@ -122,6 +137,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	var secondLastStreamData string // 保留倒数第二个stream data；部分兼容网关把完整usage放在倒数第二个事件
 	seenStreamToolCalls := make(map[string]struct{})
 	var streamFunctionCallNames []string
+	var reportedStreamUsage *dto.Usage
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		if lastStreamData != "" {
@@ -136,6 +152,12 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 			}
 
 			lastStreamData = data
+			if info.ResponseFacts != nil && hasReportedChatUsage([]byte(data)) {
+				var frame dto.ChatCompletionsStreamResponse
+				if common.UnmarshalJsonStr(data, &frame) == nil {
+					reportedStreamUsage = frame.Usage
+				}
+			}
 			observeStreamChoices(info, data, seenStreamToolCalls, &streamFunctionCallNames)
 			if err := processTokenData(info, data, &responseTextBuilder, &toolCount); err != nil {
 				logger.LogError(c, common.LogText("error processing stream token data: %s", err.Error()))
@@ -182,8 +204,16 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		}
 	}
 
+	if info.ResponseFacts != nil {
+		containStreamUsage = reportedStreamUsage != nil
+		info.ResponseFacts.UsageReported = containStreamUsage
+		info.ResponseFacts.GeneratedText = responseTextBuilder.String()
+		if containStreamUsage {
+			usage = reportedStreamUsage
+		}
+	}
 	if !containStreamUsage {
-		usage = service.ResponseText2Usage(c, responseTextBuilder.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
+		usage = service.ResponseText2Usage(c, responseTextBuilder.String(), info.TokenizerModelName(), info.GetEstimatePromptTokens())
 		usage.CompletionTokens += toolCount * 7
 	}
 
@@ -254,7 +284,11 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	defer service.CloseResponseBodyGracefully(resp)
 
 	var simpleResponse dto.OpenAITextResponse
-	responseBody, err := io.ReadAll(resp.Body)
+	var body io.Reader = resp.Body
+	if info.ResponseFacts != nil && resp.StatusCode != http.StatusOK {
+		body = io.LimitReader(body, 1<<20)
+	}
+	responseBody, err := io.ReadAll(body)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
@@ -272,8 +306,21 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 
+	if info.ResponseFacts != nil {
+		info.ResponseFacts.UsageReported = hasReportedChatUsage(responseBody)
+	}
+	var responseErr *types.NewAPIError
 	if oaiError := simpleResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
-		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
+		responseErr = types.WithOpenAIError(*oaiError, resp.StatusCode)
+	} else if info.ResponseFacts != nil && resp.StatusCode != http.StatusOK {
+		responseErr = types.NewOpenAIError(fmt.Errorf("upstream request failed"), types.ErrorCodeBadResponse, resp.StatusCode)
+	}
+	if responseErr != nil {
+		if info.ResponseFacts != nil && info.ResponseFacts.UsageReported {
+			applyProtocolUsagePostProcessing(c, info, &simpleResponse.Usage, responseBody)
+			return &simpleResponse.Usage, responseErr
+		}
+		return nil, responseErr
 	}
 
 	info.ObserveResponseModel(simpleResponse.Model)
@@ -298,11 +345,26 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	}
 
 	usageModified := false
-	if simpleResponse.Usage.PromptTokens == 0 && (info.UpstreamProtocol == "" || !ojson.GetBytes(responseBody, "usage").IsObject()) {
+	reportedUsage := ojson.GetBytes(responseBody, "usage").IsObject()
+	if info.ResponseFacts != nil {
+		reportedUsage = hasReportedChatUsage(responseBody)
+		info.ResponseFacts.UsageReported = reportedUsage
+		var output strings.Builder
+		for _, choice := range simpleResponse.Choices {
+			output.WriteString(choice.Message.StringContent())
+			output.WriteString(choice.Message.GetReasoningContent())
+			for _, call := range choice.Message.ParseToolCalls() {
+				output.WriteString(call.Function.Name)
+				output.WriteString(call.Function.Arguments)
+			}
+		}
+		info.ResponseFacts.GeneratedText = output.String()
+	}
+	if (simpleResponse.Usage.PromptTokens == 0 && (info.UpstreamProtocol == "" || !reportedUsage)) || info.ResponseFacts != nil && !reportedUsage {
 		completionTokens := simpleResponse.Usage.CompletionTokens
 		if completionTokens == 0 {
 			for _, choice := range simpleResponse.Choices {
-				ctkm := tokenkit.Count(info.UpstreamModelName, choice.Message.StringContent()+choice.Message.GetReasoningContent())
+				ctkm := tokenkit.Count(info.TokenizerModelName(), choice.Message.StringContent()+choice.Message.GetReasoningContent())
 				completionTokens += ctkm
 			}
 		}
@@ -360,6 +422,9 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	}
 
 	service.IOCopyBytesGracefully(c, resp, responseBody)
+	if info.ResponseFacts != nil && c.Writer.Size() > 0 && info.ResponseFacts.GeneratedText != "" {
+		info.ResponseFacts.BusinessOutput = true
+	}
 
 	return &simpleResponse.Usage, nil
 }

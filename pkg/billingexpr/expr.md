@@ -240,6 +240,48 @@ the actual values to `other`. An explicit zero price is present in these fields.
 Older snapshots and logs need no migration. The expression remains the sole
 pricing configuration.
 
+### Currency Evaluation
+
+Sale and purchase price versions use
+`RunMoneyExpr(expression, MoneyInput, currency)`, which returns an unrounded
+`money.Value` and `MoneyTraceResult`. Each token coefficient is a price per
+1,000,000 tokens in the supplied currency. `fixed(amount)` is a price per
+request in that currency. There is no quota conversion on this path.
+`RunExpr`, `TokenParams`, and the legacy quota rules below retain their existing
+interfaces and behavior.
+
+`MoneyInput.Tokens` contains normalized `int64` counts for `p`, `c`, `len`,
+`cr`, `cc`, `cc1h`, `cc12h`, `img`, `img_cr`, `img_o`, `ai`, and `ao`.
+Normalization belongs to the caller and uses the same variable-presence and
+cache rules described above. `MoneyUsedVars(expression)` returns the cached
+source identifiers, including unselected branches, without float optimization;
+use this set to normalize inputs for currency evaluation. `TokenQuantities`
+optionally overrides individual counts with exact decimals, including the 1.6
+short-write units for an omitted
+one-hour cache-write price. Counts must be non-negative and at most `MaxInt64`.
+
+The evaluator preserves numeric source tokens and request JSON numbers,
+including grouped literals, scientific notation, and coefficients with 18
+decimal places. It validates the existing v1 grammar, then executes a separate
+program with exact arithmetic. Division remains rational, so `1 / 3 * 3`
+returns exactly `1`. Powers must have an exact rational result. Decimal
+exponents and powers must stay within the expression memory budget. Negative
+charges, invalid arithmetic, and amounts outside the `money.Amount` range fail
+instead of being clamped.
+
+`MoneyInput.Time` freezes all standard time probes for an evaluation. A zero
+value captures `pkg/clock.Now()` once. Empty and invalid timezones use UTC.
+Request bodies and headers stay in the evaluation environment; they are not
+stored in compiled programs or returned in traces. Traces contain the billing
+unit, matched tier, an optional exact `FixedPrice` string (including `"0"`), and
+request-rule multipliers as exact strings. Skipped rules remain unmatched, and
+canonical condition text retains its exact numeric literals.
+
+The caller applies group discounts and explicit FX rates with `pkg/money`
+after evaluation. Calculations do not round. Write the final amount with
+`Value.Receivable`, `Value.Credit`, or `Value.Cost` according to the ledger entry.
+A repeating value formats as an exact fraction until that write boundary.
+
 ### Request Rules (appended after `|||`)
 
 Request-conditional multipliers are appended to the expression after a `|||` separator:
@@ -547,7 +589,7 @@ This enables future evolution without breaking existing expressions.
 
 | Layer | Files |
 |-------|-------|
-| Expression engine | `pkg/billingexpr/compile.go`, `run.go`, `settle.go`, `round.go`, `types.go` |
+| Expression engine | `pkg/billingexpr/compile.go`, `run.go`, `money.go`, `settle.go`, `round.go`, `types.go` |
 | Storage | `setting/billing_setting/tiered_billing.go` |
 | Pre-consume | `relay/helper/price.go`, `relay/helper/billing_expr_request.go` |
 | Settlement | `service/tiered_settle.go`, `service/quota.go` |

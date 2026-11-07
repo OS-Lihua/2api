@@ -120,12 +120,13 @@ func SettlementCurrency() money.Currency {
 // Wallet holds the balance of one account. The balance always equals the
 // sum of the wallet's ledger entries; only ledger postings change it.
 type Wallet struct {
-	Id          int64             `json:"id" gorm:"primaryKey"`
-	AccountType LedgerAccountType `json:"account_type" gorm:"type:varchar(32);not null"`
-	OwnerId     int               `json:"owner_id" gorm:"not null"`
-	Balance     money.Amount      `json:"balance" gorm:"embedded;embeddedPrefix:balance_"`
-	CreatedAt   int64             `json:"created_at" gorm:"bigint;not null"`
-	UpdatedAt   int64             `json:"updated_at" gorm:"bigint;not null"`
+	Id             int64             `json:"id" gorm:"primaryKey"`
+	AccountType    LedgerAccountType `json:"account_type" gorm:"type:varchar(32);not null"`
+	OwnerId        int               `json:"owner_id" gorm:"not null"`
+	Balance        money.Amount      `json:"balance" gorm:"embedded;embeddedPrefix:balance_"`
+	CreatedAt      int64             `json:"created_at" gorm:"bigint;not null"`
+	UpdatedAt      int64             `json:"updated_at" gorm:"bigint;not null"`
+	RequestsPaused bool              `json:"requests_paused" gorm:"not null;default:false"`
 }
 
 // LedgerEntry is one append-only change to a wallet. The database rejects
@@ -312,10 +313,11 @@ func postLedgerEntries(tx *gorm.DB, postings []LedgerPosting) ([]*LedgerEntry, e
 			}
 			return nil, err
 		}
-		if err := tx.Model(&Wallet{}).Where("id = ?", wallet.Id).Updates(map[string]any{
-			"balance_nanos": balance.Nanos,
-			"updated_at":    now,
-		}).Error; err != nil {
+		updates := map[string]any{"balance_nanos": balance.Nanos, "updated_at": now}
+		if wallet.AccountType == LedgerAccountUserWallet && posting.Type == LedgerEntryTopUp && balance.Nanos > 0 {
+			updates["requests_paused"] = false
+		}
+		if err := tx.Model(&Wallet{}).Where("id = ?", wallet.Id).Updates(updates).Error; err != nil {
 			return nil, err
 		}
 		wallet.Balance = balance

@@ -141,20 +141,7 @@ func validatePriceExpression(ctx context.Context, db *gorm.DB, expression string
 		for _, member := range offering.Members {
 			ids = append(ids, member.ModelID)
 		}
-		query := db.Where("model_id IN ?", ids)
-		scope := offering.ChannelScope
-		// Provider and Channel inclusions form a union. Exclusions always win.
-		// Keep missing include IDs restrictive rather than inferring all Channels.
-		if len(scope.IncludeProviderIDs)+len(scope.IncludeChannelIDs) > 0 {
-			query = query.Where("(provider_id IN ? OR id IN ?)", scope.IncludeProviderIDs, scope.IncludeChannelIDs)
-		}
-		if len(scope.ExcludeProviderIDs) > 0 {
-			query = query.Where("provider_id NOT IN ?", scope.ExcludeProviderIDs)
-		}
-		if len(scope.ExcludeChannelIDs) > 0 {
-			query = query.Where("id NOT IN ?", scope.ExcludeChannelIDs)
-		}
-		if err := query.Order("id").Find(&channels).Error; err != nil {
+		if err := OfferingChannelsQuery(db, offering, ids).Order("id").Find(&channels).Error; err != nil {
 			return err
 		}
 	}
