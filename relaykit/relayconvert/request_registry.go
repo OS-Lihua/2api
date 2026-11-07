@@ -16,6 +16,7 @@ import (
 	oaichat "github.com/QuantumNous/new-api/relaykit/relayconvert/internal/oai_chat"
 	oairesponses "github.com/QuantumNous/new-api/relaykit/relayconvert/internal/oai_responses"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/internal/toolconv"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
@@ -170,6 +171,26 @@ func ConvertRequest(c context.Context, info convmeta.Meta, target types.RelayFor
 		}, nil
 	}
 
+	if req, ok := request.(*dto.OpenAIResponsesRequest); ok {
+		var diagnostics []types.ConversionDiagnostic
+		fields := []struct {
+			name    string
+			present bool
+		}{
+			{"previous_response_id", strings.TrimSpace(req.PreviousResponseID) != ""},
+			{"conversation", len(req.Conversation) > 0 && string(req.Conversation) != "null"},
+			{"prompt", len(req.Prompt) > 0 && string(req.Prompt) != "null"},
+			{"context_management", len(req.ContextManagement) > 0 && string(req.ContextManagement) != "null"},
+		}
+		for _, field := range fields {
+			if field.present {
+				diagnostics = append(diagnostics, types.ConversionDiagnostic{Code: "stateful_field_unsupported", Path: field.name, Message: "Stateful Responses fields require the Responses protocol", Severity: types.ConversionDiagnosticError, From: from, To: target})
+			}
+		}
+		if len(diagnostics) > 0 {
+			return &RequestResult{From: from, To: target, Diagnostics: diagnostics}, &types.ConversionLossError{Diagnostics: diagnostics}
+		}
+	}
 	spec, ok := lookupRequestRoute(from, target)
 	if !ok {
 		return nil, fmt.Errorf("request converter from %s to %s is not registered", from, target)
@@ -243,6 +264,17 @@ func executeRequestSpec(c context.Context, info convmeta.Meta, from types.RelayF
 
 func executeRequestSteps(c context.Context, info convmeta.Meta, from types.RelayFormat, target types.RelayFormat, request any, converter string, quality RequestConverterQuality, specs []RequestConverterSpec) (*RequestResult, error) {
 	c, diagnosticCollector := convdiag.WithCollector(c)
+	if target != types.RelayFormatClaude {
+		body, err := kitutil.Marshal(request)
+		if err != nil {
+			return nil, err
+		}
+		var value any
+		if err := kitutil.Unmarshal(body, &value); err != nil {
+			return nil, err
+		}
+		convdiag.InspectCacheControls(c, value, "", from, target)
+	}
 	current, tools, err := toolconv.ExtractRequest(from, request)
 	if err != nil {
 		return nil, err

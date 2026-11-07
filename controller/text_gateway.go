@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/money"
+	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
@@ -29,7 +30,22 @@ import (
 )
 
 func gatewayError(c *gin.Context, status int, code, message string) {
-	c.AbortWithStatusJSON(status, gin.H{"error": types.OpenAIError{Code: code, Type: "gateway_error", Message: message}})
+	kind, _ := middleware.TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
+	switch kind {
+	case protocol.AnthropicMessages:
+		c.AbortWithStatusJSON(status, gin.H{"type": "error", "error": gin.H{"type": code, "message": message}})
+	case protocol.GeminiGenerate:
+		googleStatus := "UNAVAILABLE"
+		if status == http.StatusBadRequest {
+			googleStatus = "INVALID_ARGUMENT"
+		}
+		if status == http.StatusNotFound {
+			googleStatus = "NOT_FOUND"
+		}
+		c.AbortWithStatusJSON(status, gin.H{"error": gin.H{"code": status, "status": googleStatus, "message": message, "details": []gin.H{{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": code, "domain": "gateway"}}}})
+	default:
+		c.AbortWithStatusJSON(status, gin.H{"error": types.OpenAIError{Code: code, Type: "gateway_error", Message: message}})
+	}
 }
 
 // TextGateway dispatches only a resolved ModelOffering. Absence continues to the
@@ -46,10 +62,24 @@ func TextGateway(c *gin.Context) {
 		gatewayError(c, http.StatusNotFound, "model_not_found", "Model not found")
 		return
 	}
-	request, err := helper.GetAndValidateTextRequest(c, relayconstant.RelayModeChatCompletions)
+	kind, pathName := middleware.TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
+	format, _ := service.GatewayProtocolFormat(kind)
+	native, err := helper.GetAndValidateRequest(c, format)
 	if err != nil {
-		gatewayError(c, http.StatusBadRequest, "invalid_request", "Invalid chat request")
+		gatewayError(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
 		return
+	}
+	if pathName != "" {
+		native.SetModelName(pathName)
+	}
+	request, err := service.GatewayChatProjection(c, native)
+	if err != nil {
+		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "The request cannot be converted")
+		return
+	}
+	request.Stream = common.GetPointer(native.IsStream(c.Request))
+	if pathName != "" {
+		request.Model = pathName
 	}
 	requestedName := request.Model
 	if c.GetBool("token_model_limit_enabled") {
@@ -79,7 +109,7 @@ func TextGateway(c *gin.Context) {
 		gatewayError(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
 		return
 	}
-	selection, err := service.SelectGatewayChannel(c, offering, request)
+	selection, err := service.SelectGatewayChannel(c, offering, request, native)
 	if err != nil {
 		var conversionErr *service.GatewayConversionError
 		if errors.As(err, &conversionErr) {
@@ -105,7 +135,11 @@ func TextGateway(c *gin.Context) {
 		return
 	}
 	common.SetContextKey(c, constant.ContextKeyChannelParamOverride, overrides)
-	info := relaycommon.GenRelayInfoOpenAI(c, request)
+	info, err := relaycommon.GenRelayInfo(c, format, native, nil)
+	if err != nil {
+		gatewayError(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
+		return
+	}
 	info.StartTime, info.RequestId = started, c.GetString(common.RequestIdKey)
 	if info.RequestId == "" {
 		info.RequestId = common.NewRequestId()
@@ -118,6 +152,7 @@ func TextGateway(c *gin.Context) {
 	info.UpstreamModelName = selection.Channel.UpstreamModelName
 	info.IsModelMapped = true
 	request.Model = info.UpstreamModelName
+	native.SetModelName(info.UpstreamModelName)
 	input, err := helper.ResolveIncomingBillingExprRequestInput(c, info)
 	if err != nil {
 		gatewayError(c, http.StatusBadRequest, "invalid_request", "Invalid chat request")
@@ -140,7 +175,7 @@ func TextGateway(c *gin.Context) {
 		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
 		return
 	}
-	converted, err := adaptor.ConvertRequest(c, info, request)
+	converted, err := adaptor.ConvertRequest(c, info, native)
 	if err != nil {
 		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "The request cannot be sent to this Channel")
 		return

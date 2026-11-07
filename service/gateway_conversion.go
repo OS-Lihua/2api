@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
@@ -29,6 +30,29 @@ func GatewayProtocolFormat(kind protocol.Type) (types.RelayFormat, error) {
 	}
 }
 
+// GatewayChatProjection exposes token and capability facts for validation only.
+// The native DTO remains the source of the actual candidate conversion.
+func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.GeneralOpenAIRequest, error) {
+	if chat, ok := request.(*dto.GeneralOpenAIRequest); ok {
+		return chat, nil
+	}
+	if responses, ok := request.(*dto.OpenAIResponsesRequest); ok {
+		copy := *responses
+		copy.PreviousResponseID = ""
+		copy.Conversation, copy.Prompt, copy.ContextManagement = nil, nil, nil
+		request = &copy
+	}
+	result, err := relayconvert.ConvertRequest(ctx, nil, types.RelayFormatOpenAI, request)
+	if err != nil {
+		return nil, err
+	}
+	chat, ok := result.Value.(*dto.GeneralOpenAIRequest)
+	if !ok {
+		return nil, fmt.Errorf("missing text request projection")
+	}
+	return chat, nil
+}
+
 // PreconvertGatewayRequest performs no transport or accounting. Every diagnostic
 // requires explicit consent; converter errors (including stateful fields) cannot
 // be waived by an accepted diagnostic code.
@@ -37,7 +61,27 @@ func PreconvertGatewayRequest(ctx context.Context, info convmeta.Meta, kind prot
 	if err != nil {
 		return nil, err
 	}
-	result, err := relayconvert.ConvertRequest(ctx, info, format, request)
+	var clone dto.Request
+	switch request.(type) {
+	case *dto.GeneralOpenAIRequest:
+		clone = &dto.GeneralOpenAIRequest{}
+	case *dto.OpenAIResponsesRequest:
+		clone = &dto.OpenAIResponsesRequest{}
+	case *dto.ClaudeRequest:
+		clone = &dto.ClaudeRequest{}
+	case *dto.GeminiChatRequest:
+		clone = &dto.GeminiChatRequest{}
+	default:
+		return nil, fmt.Errorf("unsupported text request")
+	}
+	body, err := common.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	if err := common.Unmarshal(body, clone); err != nil {
+		return nil, err
+	}
+	result, err := relayconvert.ConvertRequest(ctx, info, format, clone)
 	if err != nil {
 		return result, err
 	}

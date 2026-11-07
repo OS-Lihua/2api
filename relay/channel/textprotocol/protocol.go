@@ -41,7 +41,10 @@ func (p *Handler) ConvertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 func (p *Handler) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
 	info.FinalRequestRelayFormat = p.format
 	info.UpstreamProtocol = p.kind
-	if info.ResponseFacts != nil && !info.IsStream && (p.kind != protocol.OpenAIChat || info.RelayFormat != types.RelayFormatOpenAI) {
+	if info.ResponseFacts != nil && (p.kind != protocol.OpenAIChat || info.RelayFormat != types.RelayFormatOpenAI) {
+		if info.IsStream {
+			return p.gatewayStreamResponse(c, resp, info)
+		}
 		return p.gatewayJSONResponse(c, resp, info)
 	}
 	switch p.kind {

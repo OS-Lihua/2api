@@ -30,7 +30,11 @@ var ErrGatewayUnavailable = errors.New("no Channel is available")
 
 // SelectGatewayChannel preconverts candidates before any Attempt or reservation.
 // Same-protocol candidates rank before good, fair and discouraged conversions.
-func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request *dto.GeneralOpenAIRequest) (*GatewaySelection, error) {
+func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request *dto.GeneralOpenAIRequest, native ...dto.Request) (*GatewaySelection, error) {
+	original := dto.Request(request)
+	if len(native) > 0 {
+		original = native[0]
+	}
 	ids := []int{}
 	for _, member := range offering.Members {
 		if member.Tier == 1 {
@@ -84,7 +88,7 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 			}
 			info.InitChannelMeta(c)
 			info.UpstreamModelName = candidate.UpstreamModelName
-			conversion, err = PreconvertGatewayRequest(c, info, candidate.Protocol, request, offering.AcceptedConversionLosses)
+			conversion, err = PreconvertGatewayRequest(c, info, candidate.Protocol, original, offering.AcceptedConversionLosses)
 			if err != nil {
 				reason = "conversion_loss"
 				if conversion != nil {
