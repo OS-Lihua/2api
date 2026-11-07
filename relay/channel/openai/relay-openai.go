@@ -364,8 +364,16 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 		completionTokens := simpleResponse.Usage.CompletionTokens
 		if completionTokens == 0 {
 			for _, choice := range simpleResponse.Choices {
-				ctkm := tokenkit.Count(info.TokenizerModelName(), choice.Message.StringContent()+choice.Message.GetReasoningContent())
-				completionTokens += ctkm
+				var output strings.Builder
+				output.WriteString(choice.Message.StringContent())
+				output.WriteString(choice.Message.GetReasoningContent())
+				if info.ResponseFacts != nil {
+					for _, call := range choice.Message.ParseToolCalls() {
+						output.WriteString(call.Function.Name)
+						output.WriteString(call.Function.Arguments)
+					}
+				}
+				completionTokens += tokenkit.Count(info.TokenizerModelName(), output.String())
 			}
 		}
 		fallbackUsage := &dto.Usage{
@@ -421,9 +429,15 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 		responseBody = geminiRespStr
 	}
 
-	service.IOCopyBytesGracefully(c, resp, responseBody)
-	if info.ResponseFacts != nil && c.Writer.Size() > 0 && info.ResponseFacts.GeneratedText != "" {
-		info.ResponseFacts.BusinessOutput = true
+	writeErr := service.IOCopyBytesGracefully(c, resp, responseBody)
+	if info.ResponseFacts != nil {
+		if writeErr != nil {
+			info.ResponseFacts.DownstreamWriteFailed = true
+			return &simpleResponse.Usage, types.NewError(writeErr, types.ErrorCodeBadResponse)
+		}
+		if info.ResponseFacts.GeneratedText != "" {
+			info.ResponseFacts.BusinessOutput = true
+		}
 	}
 
 	return &simpleResponse.Usage, nil

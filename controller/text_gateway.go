@@ -227,7 +227,7 @@ func TextGateway(c *gin.Context) {
 			}
 			if usage != nil {
 				if !info.ResponseFacts.UsageReported {
-					usage.PromptTokens = max(estimatedInput, effective.GetTokenCountMeta().MaxTokens)
+					usage.PromptTokens = estimatedInput
 				}
 				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 				attempt.Usage, attempt.UsageSource = service.GatewayRecordUsage(usage), "estimated"
@@ -362,6 +362,9 @@ func TextGateway(c *gin.Context) {
 func gatewayAttemptOutcome(c *gin.Context, info *relaycommon.RelayInfo, err *types.NewAPIError) (string, string) {
 	if c.Request.Context().Err() != nil {
 		return "cancelled", "client_cancelled"
+	}
+	if info.ResponseFacts.DownstreamWriteFailed {
+		return "failed", "downstream_write_failed"
 	}
 	if err != nil {
 		if info.ResponseFacts.BusinessOutput {
