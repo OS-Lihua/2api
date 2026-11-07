@@ -80,7 +80,7 @@ func TestModelOfferingAPI(t *testing.T) {
 	assert.Equal(t, data, response["data"])
 
 	t.Run("metadata sync preserves offering members without Channels", func(t *testing.T) {
-		status, response := call(http.MethodPost, "/api/admin/v1/models", fmt.Sprintf(`{"name":"sync-member","publisher_id":%d,"description":"Local description","sync_official":1,"capabilities":{"streaming":true,"input_modalities":["text"],"output_modalities":["text"]}}`, publisher.Id))
+		status, response := call(http.MethodPost, "/api/admin/v1/models", fmt.Sprintf(`{"name":"sync-member","publisher_id":%d,"description":"Local description","sync_official":1,"capabilities":{"features":["streaming"],"input_modalities":["text"],"output_modalities":["text"]}}`, publisher.Id))
 		require.Equal(t, http.StatusOK, status, response)
 		member := response["data"].(map[string]any)
 		memberID := int(member["id"].(float64))
