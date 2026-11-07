@@ -117,6 +117,7 @@ func TestMediaAudioGatewayReportsDeliveryAndExplicitZero(t *testing.T) {
 			info.ResponseFacts = &relaycommon.ResponseFacts{}
 			info.Request = &dto.AudioRequest{ResponseFormat: tc.format}
 			if tc.format == "pcm_sse" {
+				response.Header.Set("Content-Type", "text/event-stream")
 				info.IsStream = true
 				info.Request = &dto.AudioRequest{ResponseFormat: "pcm", StreamFormat: "sse"}
 			}
