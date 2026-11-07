@@ -221,7 +221,17 @@ func SearchUserTokens(userId int, keyword string, token string, offset int, limi
 	return tokens, total, nil
 }
 
-func ValidateUserToken(key string) (token *Token, err error) {
+func ValidateUserToken(key string) (*Token, error) {
+	return validateUserToken(key, true)
+}
+
+// ValidateWalletToken preserves all credential restrictions. Only the retired
+// quota balance check is replaced by the gateway wallet reservation.
+func ValidateWalletToken(key string) (*Token, error) {
+	return validateUserToken(key, false)
+}
+
+func validateUserToken(key string, checkQuota bool) (token *Token, err error) {
 	if key == "" {
 		return nil, ErrTokenNotProvided
 	}
@@ -242,7 +252,7 @@ func ValidateUserToken(key string) (token *Token, err error) {
 			}
 			return token, ErrTokenInvalid
 		}
-		if !token.UnlimitedQuota && token.RemainQuota <= 0 {
+		if checkQuota && !token.UnlimitedQuota && token.RemainQuota <= 0 {
 			if !common.RedisEnabled {
 				token.Status = common.TokenStatusExhausted
 				err := token.SelectUpdate()

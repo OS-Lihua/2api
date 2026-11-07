@@ -71,6 +71,7 @@ func SetRelayRouter(router *gin.Engine) {
 	relayV1Router := router.Group("/v1")
 	relayV1Router.Use(middleware.RouteTag("relay"))
 	relayV1Router.Use(middleware.SystemPerformanceCheck())
+	relayV1Router.Use(middleware.ResolveTextOffering())
 	relayV1Router.Use(middleware.TokenAuth())
 	{
 		// Responses WebSocket route. Channel selection happens after the first
@@ -89,6 +90,7 @@ func SetRelayRouter(router *gin.Engine) {
 	{
 		//http router
 		httpRouter := relayV1Router.Group("")
+		httpRouter.Use(controller.TextGateway)
 		httpRouter.Use(middleware.Distribute())
 
 		// claude related routes

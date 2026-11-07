@@ -113,10 +113,16 @@ func usesRequestProbe(node ast.Node) bool {
 type cachedEntry struct {
 	prog          *vm.Program
 	usedVars      map[string]bool
+	sourceVars    map[string]bool
 	usedUsageKeys map[string]bool
 	requestRules  []RequestRuleTrace
 	version       int
 	fixedPricing  bool
+
+	moneyOnce         sync.Once
+	moneyProgram      *vm.Program
+	moneyRequestRules []MoneyRequestRuleTrace
+	moneyErr          error
 }
 
 var (
@@ -236,6 +242,13 @@ func compileEntry(exprStr string) (*cachedEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("expr compile error: %w", err)
 	}
+	sourceVars := make(map[string]bool)
+	ast.Find(tree.Node, func(node ast.Node) bool {
+		if identifier, ok := node.(*ast.IdentifierNode); ok {
+			sourceVars[identifier.Value] = true
+		}
+		return false
+	})
 	fixedPricing := ast.Find(tree.Node, func(node ast.Node) bool {
 		identifier, ok := node.(*ast.IdentifierNode)
 		return ok && identifier.Value == "fixed"
@@ -257,6 +270,7 @@ func compileEntry(exprStr string) (*cachedEntry, error) {
 	entry := &cachedEntry{
 		prog:          prog,
 		usedVars:      extractUsedVars(prog),
+		sourceVars:    sourceVars,
 		usedUsageKeys: extractUsedUsageKeys(prog),
 		requestRules:  patcher.requestRules,
 		version:       version,

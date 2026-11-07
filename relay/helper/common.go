@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -235,6 +236,15 @@ func ResponseChunkData(c *gin.Context, resp dto.ResponsesStreamResponse, data st
 	return FlushWriter(c)
 }
 
+// StreamFlushError means the complete frame was written before flushing failed.
+// Callers can distinguish accepted business content from a partial frame write.
+type StreamFlushError struct {
+	Err error
+}
+
+func (e *StreamFlushError) Error() string { return e.Err.Error() }
+func (e *StreamFlushError) Unwrap() error { return e.Err }
+
 func StringData(c *gin.Context, str string) error {
 	if c == nil || c.Writer == nil {
 		return errors.New("context or writer is nil")
@@ -244,8 +254,18 @@ func StringData(c *gin.Context, str string) error {
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
 
-	c.Render(-1, common.CustomEvent{Data: "data: " + str})
-	return FlushWriter(c)
+	if facts, _ := common.GetContextKey(c, constant.ContextKeyResponseFacts); facts == nil {
+		c.Render(-1, common.CustomEvent{Data: "data: " + str})
+		return FlushWriter(c)
+	}
+	event := common.CustomEvent{Data: "data: " + str}
+	if err := event.Render(c.Writer); err != nil {
+		return err
+	}
+	if err := FlushWriter(c); err != nil {
+		return &StreamFlushError{Err: err}
+	}
+	return nil
 }
 
 func PingData(c *gin.Context) error {

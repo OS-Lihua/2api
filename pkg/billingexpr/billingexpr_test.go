@@ -4,12 +4,300 @@ import (
 	"math"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/clock"
+	"github.com/QuantumNous/new-api/pkg/money"
+	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMoneyExprKeepsSourceDecimals(t *testing.T) {
+	for _, expression := range []string{
+		`tier("base", p * 0.123456789123456789)`,
+		`v1:tier("精确", p * ((0.123456789123456789)))`,
+		`tier("base", p * 123_456_789.123456789e-9)`,
+	} {
+		t.Run(expression, func(t *testing.T) {
+			amount, trace, err := billingexpr.RunMoneyExpr(expression, billingexpr.MoneyInput{Tokens: map[string]int64{"p": 1_000_000}}, "CNY")
+			require.NoError(t, err)
+			assert.Equal(t, "0.123456789123456789 CNY", amount.String())
+			assert.Equal(t, billingexpr.BillingUnitToken, trace.BillingUnit)
+		})
+	}
+}
+
+func TestMoneyExprFixedPricesBranchesAndRequestMultipliers(t *testing.T) {
+	const expression = `(len <= 32000 ? tier("request", fixed((0.010000000000000001))) : tier("cache", p * 2 + c * 8 + cr * 0.3 + cc * 3.75 + cc1h * 6 + cc12h * 2)) * (param("fast") == true && has(header("X-Mode"), "fast") ? 1.234567891234567891 : 1) * (header("skip") == "yes" ? 3 : 1)`
+	for _, tc := range []struct {
+		name, want, tier string
+		tokens           map[string]int64
+		fixed            bool
+	}{
+		{"request", "0.012345678912345680144567891234567891 USD", "request", map[string]int64{}, true},
+		{"normalized cache inputs", "0.004203703669653703668855 USD", "cache", map[string]int64{"len": 32001, "p": 1000, "c": 100, "cr": 200, "cc": 100, "cc1h": 25, "cc12h": 10}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			amount, trace, err := billingexpr.RunMoneyExpr(expression, billingexpr.MoneyInput{
+				Tokens:  tc.tokens,
+				Request: billingexpr.RequestInput{Body: []byte(`{"fast":true}`), Headers: map[string]string{" X-Mode ": " fast-enabled "}},
+			}, "USD")
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, amount.String())
+			assert.Equal(t, tc.tier, trace.MatchedTier)
+			assert.Equal(t, []billingexpr.MoneyRequestRuleTrace{
+				{Cond: `param("fast") == true && has(header("X-Mode"), "fast")`, Multiplier: "1.234567891234567891", Matched: true},
+				{Cond: `header("skip") == "yes"`, Multiplier: "3", Matched: false},
+			}, trace.RequestRules)
+			if tc.fixed {
+				assert.Equal(t, billingexpr.BillingUnitRequest, trace.BillingUnit)
+				require.NotNil(t, trace.FixedPrice)
+				assert.Equal(t, "0.010000000000000001", *trace.FixedPrice)
+			} else {
+				assert.Equal(t, billingexpr.BillingUnitToken, trace.BillingUnit)
+				assert.Nil(t, trace.FixedPrice)
+			}
+		})
+	}
+	amount, trace, err := billingexpr.RunMoneyExpr(`tier("free", fixed(0))`, billingexpr.MoneyInput{Tokens: map[string]int64{"p": 1000}}, "USD")
+	require.NoError(t, err)
+	assert.Equal(t, "0 USD", amount.String())
+	require.NotNil(t, trace.FixedPrice)
+	assert.Equal(t, "0", *trace.FixedPrice)
+}
+
+func TestMoneyExprRequestNumbersStayExact(t *testing.T) {
+	for _, tc := range []struct {
+		name, expression, body, want string
+	}{
+		{"decimal quantity", `p * param("rate")`, `{"rate":0.123456789123456789}`, "0.123456789123456789 USD"},
+		{"integer above float precision", `param("count") == 9007199254740993 ? p : 0`, `{"count":9007199254740993}`, "1 USD"},
+		{"nested array number", `p * param("rates")[1]`, `{"rates":[0,0.123456789123456789]}`, "0.123456789123456789 USD"},
+		{"missing number fallback", `p * (param("missing") ?? 0.25)`, `{}`, "0.25 USD"},
+		{"empty path returns nil", `param("   ") == nil ? p : 0`, `{"":12}`, "1 USD"},
+		{"JSON path array length", `param("messages.#") > 2 ? p * 0.5 : 0`, `{"messages":[1,2,3]}`, "0.5 USD"},
+		{"numeric membership", `param("rate") in [0.123456789123456789, 0.5] ? p : 0`, `{"rate":0.123456789123456789}`, "1 USD"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			amount, _, err := billingexpr.RunMoneyExpr(tc.expression, billingexpr.MoneyInput{Tokens: map[string]int64{"p": 1_000_000}, Request: billingexpr.RequestInput{Body: []byte(tc.body)}}, "USD")
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, amount.String())
+		})
+	}
+}
+
+func TestMoneyExprFreezesTimeProbes(t *testing.T) {
+	frozen := time.Date(2026, time.November, 7, 22, 11, 0, 0, time.UTC)
+	fake := clock.UseFake(t, frozen)
+	const expression = `p * (hour("UTC") == 22 && minute("") == 11 && weekday("Asia/Shanghai") == 0 && month("UTC") == 11 && day("Asia/Shanghai") == 8 && hour("invalid-zone") == 22 ? 1.5 : 1)`
+	for _, tc := range []struct {
+		name string
+		time time.Time
+		want string
+	}{
+		{"clock default", time.Time{}, "1.5 USD"},
+		{"frozen context", frozen, "1.5 USD"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			amount, trace, err := billingexpr.RunMoneyExpr(expression, billingexpr.MoneyInput{Tokens: map[string]int64{"p": 1_000_000}, Time: tc.time}, "USD")
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, amount.String())
+			require.Len(t, trace.RequestRules, 1)
+			assert.True(t, trace.RequestRules[0].Matched)
+		})
+	}
+	fake.Advance(time.Hour)
+	amount, _, err := billingexpr.RunMoneyExpr(expression, billingexpr.MoneyInput{Tokens: map[string]int64{"p": 1_000_000}, Time: frozen}, "USD")
+	require.NoError(t, err)
+	assert.Equal(t, "1.5 USD", amount.String())
+	amount, _, err = billingexpr.RunMoneyExpr(expression, billingexpr.MoneyInput{Tokens: map[string]int64{"p": 1_000_000}}, "USD")
+	require.NoError(t, err)
+	assert.Equal(t, "1 USD", amount.String())
+}
+
+func TestMoneyExprSupportsExactWeightedCacheQuantities(t *testing.T) {
+	amount, _, err := billingexpr.RunMoneyExpr(`tier("cache", cc * 3.75)`, billingexpr.MoneyInput{
+		Tokens:          map[string]int64{"cc": 99},
+		TokenQuantities: map[string]decimal.Decimal{"cc": decimal.RequireFromString("1.6")},
+	}, "USD")
+	require.NoError(t, err)
+	assert.Equal(t, "0.000006 USD", amount.String())
+	for _, quantity := range []string{"-0.1", "9223372036854775808"} {
+		_, _, err := billingexpr.RunMoneyExpr(`cc * 3.75`, billingexpr.MoneyInput{TokenQuantities: map[string]decimal.Decimal{"cc": decimal.RequireFromString(quantity)}}, "USD")
+		require.Error(t, err)
+	}
+}
+
+func TestMoneyExprExactArithmeticAndMath(t *testing.T) {
+	for _, tc := range []struct {
+		name, expression, want string
+		tokens                 map[string]int64
+	}{
+		{"division cancels exactly", `p * 0.123456789123456789 / 3 * 3`, "0.123456789123456789 USD", map[string]int64{"p": 1_000_000}},
+		{"repeating quotient", `p / 3`, "1/3 USD", map[string]int64{"p": 1_000_000}},
+		{"math helpers", `max(p - cr, 0) * 2 + min(c, 100) * 3 + abs(-cc) + ceil(ai / 3) + floor(ao / 3)`, "0.000309 USD", map[string]int64{"p": 10, "cr": 20, "c": 120, "cc": 5, "ai": 4, "ao": 8}},
+		{"integer rule modulo", `5 % (param("fast") == true ? 2 : 1)`, "0.000001 USD", nil},
+		{"local decimal binding", `let price = 0.123456789123456789; tier("local", p * price)`, "0.123456789123456789 USD", map[string]int64{"p": 1_000_000}},
+		{"integer powers", `p * ((-2) ^ 2)`, "4 USD", map[string]int64{"p": 1_000_000}},
+		{"negative powers", `p * (10 ^ -3)`, "0.001 USD", map[string]int64{"p": 1_000_000}},
+		{"exact rational power", `p * (4 ^ 0.5)`, "2 USD", map[string]int64{"p": 1_000_000}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			amount, _, err := billingexpr.RunMoneyExpr(tc.expression, billingexpr.MoneyInput{Tokens: tc.tokens, Request: billingexpr.RequestInput{Body: []byte(`{"fast":true}`)}}, "USD")
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, amount.String())
+		})
+	}
+}
+
+func TestMoneyExprRejectsInvalidCharges(t *testing.T) {
+	for _, tc := range []struct {
+		name, expression, message string
+		tokens                    map[string]int64
+	}{
+		{"negative result", `p * -2`, "non-negative", map[string]int64{"p": 1}},
+		{"negative unused token", `p`, "non-negative", map[string]int64{"cr": -1}},
+		{"zero divisor", `p / param("zero")`, "division by zero", map[string]int64{"p": 1}},
+		{"non-finite literal", `p * 1e309`, "expr compile error", nil},
+		{"negative fixed unselected", `true ? tier("ok", p) : tier("bad", fixed(-0.1))`, "fixed price", nil},
+		{"mixed fixed and tokens", `tier("bad", fixed(0.01) + p)`, "fixed pricing requires", nil},
+		{"reserved legacy callback", `_trace(0, true, 1)`, "reserved", nil},
+		{"dynamic power exceeds evaluation budget", `p * (2 ^ param("power"))`, "memory budget", nil},
+		{"decimal exponent exceeds evaluation budget", `p * param("tiny")`, "memory budget", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := billingexpr.RunMoneyExpr(tc.expression, billingexpr.MoneyInput{Tokens: tc.tokens, Request: billingexpr.RequestInput{Body: []byte(`{"zero":0,"power":600000,"tiny":1e-1000001}`)}}, "USD")
+			require.ErrorContains(t, err, tc.message)
+		})
+	}
+	for _, expression := range []string{`tier("huge", fixed(9223372036.854775808))`, `p * 1e308`} {
+		_, _, err := billingexpr.RunMoneyExpr(expression, billingexpr.MoneyInput{Tokens: map[string]int64{"p": 1_000_000}}, "USD")
+		require.ErrorIs(t, err, money.ErrOverflow)
+	}
+	amount, _, err := billingexpr.RunMoneyExpr(`tier("max", fixed(9223372036.854775807))`, billingexpr.MoneyInput{}, "USD")
+	require.NoError(t, err)
+	assert.Equal(t, "9223372036.854775807 USD", amount.String())
+	_, _, err = billingexpr.RunMoneyExpr(`p`, billingexpr.MoneyInput{}, "usd")
+	require.ErrorIs(t, err, money.ErrInvalidCurrency)
+}
+
+func TestMoneyExprPreservesOrdinaryV1NumericForms(t *testing.T) {
+	for _, tc := range []struct{ name, expression, want string }{
+		{"base-prefixed literals", `p * (0x10 + 0b10 + 0o10)`, "26 USD"},
+		{"integer conversion", `p * int(param("count"))`, "2 USD"},
+		{"integer helper argument", `repeat("x", 2) == "xx" ? p : 0`, "1 USD"},
+		{"integer conversion helper argument", `repeat("x", int(param("count"))) == "xx" ? p : 0`, "1 USD"},
+		{"integer request factor helper argument", `repeat("x", (param("count") > 2 ? 2 : 1)) == "xx" ? p : 0`, "1 USD"},
+		{"decimal header conversion", `p * float(header("price"))`, "0.123456789123456789 USD"},
+		{"numeric string probe", `has(param("rate"), "0.123456789123456789") ? p : 0`, "1 USD"},
+		{"numeric string conversion", `string(param("rate")) == "0.123456789123456789" ? p : 0`, "1 USD"},
+		{"JSON string number", `p * fromJSON(header("json")).rate`, "0.123456789123456789 USD"},
+		{"sum", `sum([p * 0.1, p * 0.2])`, "0.3 USD"},
+		{"sum predicate", `p * sum([1, 2], # * 0.1)`, "0.3 USD"},
+		{"mean", `p * mean([0.1, 0.2])`, "0.15 USD"},
+		{"median", `p * median([0.1, 0.2, 0.3, 0.4])`, "0.25 USD"},
+		{"explicit rounding", `p * round(0.5)`, "1 USD"},
+		{"integer range", `p * sum(1..3)`, "6 USD"},
+		{"array predicate", `all([1, 2, 3], # >= 1) ? p : 0`, "1 USD"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			amount, _, err := billingexpr.RunMoneyExpr(tc.expression, billingexpr.MoneyInput{
+				Tokens:  map[string]int64{"p": 1_000_000},
+				Request: billingexpr.RequestInput{Body: []byte(`{"count":2.9,"rate":0.123456789123456789}`), Headers: map[string]string{"price": "0.123456789123456789", "json": `{"rate":0.123456789123456789}`}},
+			}, "USD")
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, amount.String())
+		})
+	}
+}
+
+func TestMoneyExprRuleTracesKeepExactConditionsAndSkippedRules(t *testing.T) {
+	const expression = `(param("gate") == true ? p * (param("price") > 0.123456789123456789 ? 2.234567891234567891 : 1) : p) * (param("factor") == true ? 2 : 1.5)`
+	for _, tc := range []struct {
+		body, want string
+		matched    bool
+	}{
+		{`{"gate":false,"price":0.123456789123456790,"factor":false}`, "1.5 USD", false},
+		{`{"gate":true,"price":0.123456789123456790,"factor":true}`, "4.469135782469135782 USD", true},
+		{`{"gate":false,"price":0.123456789123456790,"factor":false}`, "1.5 USD", false},
+	} {
+		amount, trace, err := billingexpr.RunMoneyExpr(expression, billingexpr.MoneyInput{Tokens: map[string]int64{"p": 1_000_000}, Request: billingexpr.RequestInput{Body: []byte(tc.body)}}, "USD")
+		require.NoError(t, err)
+		assert.Equal(t, tc.want, amount.String())
+		assert.Equal(t, []billingexpr.MoneyRequestRuleTrace{{Cond: `param("price") > 0.123456789123456789`, Multiplier: "2.234567891234567891", Matched: tc.matched}}, trace.RequestRules)
+	}
+}
+
+func TestMoneyExprPreservesImageCountCompatibility(t *testing.T) {
+	const expression = `tier("image", fixed(0.04)) * image_count`
+	amount, trace, err := billingexpr.RunMoneyExpr(expression, billingexpr.MoneyInput{}, "USD")
+	require.NoError(t, err)
+	assert.Equal(t, "0.04 USD", amount.String())
+	require.NotNil(t, trace.ImageCount)
+	assert.Equal(t, 1, *trace.ImageCount)
+	count := 2
+	amount, trace, err = billingexpr.RunMoneyExpr(expression, billingexpr.MoneyInput{Request: billingexpr.RequestInput{ImageCount: &count}}, "USD")
+	require.NoError(t, err)
+	assert.Equal(t, "0.08 USD", amount.String())
+	assert.Equal(t, 2, *trace.ImageCount)
+	for _, count := range []int{-1, 0, 129} {
+		_, _, err := billingexpr.RunMoneyExpr(expression, billingexpr.MoneyInput{Request: billingexpr.RequestInput{ImageCount: &count}}, "USD")
+		require.ErrorContains(t, err, "image_count")
+	}
+}
+
+func TestMoneyExprRoundsOnlyAtWriteAndKeepsLegacyEvaluation(t *testing.T) {
+	amount, _, err := billingexpr.RunMoneyExpr(`p * 0.001499999999999999997 / 3`, billingexpr.MoneyInput{Tokens: map[string]int64{"p": 1}}, "USD")
+	require.NoError(t, err)
+	assert.Equal(t, "0.000000000499999999999999999 USD", amount.String())
+	cost, err := amount.Cost()
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), cost.Nanos)
+	charge, err := amount.Receivable()
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), charge.Nanos)
+
+	amount, _, err = billingexpr.RunMoneyExpr(`p / 3`, billingexpr.MoneyInput{Tokens: map[string]int64{"p": 1_000_000}}, "USD")
+	require.NoError(t, err)
+	discounted, err := money.MulUnitPrice(decimal.RequireFromString("0.3"), amount)
+	require.NoError(t, err)
+	assert.Equal(t, "0.1 USD", discounted.String())
+
+	for _, tc := range []struct {
+		expression, want string
+		legacy           float64
+	}{
+		{`tier("base", p * 2.5 + c * 15)`, "0.004 USD", 4000},
+		{`tier("request", fixed(0.01))`, "0.01 USD", 10000},
+	} {
+		amount, _, err := billingexpr.RunMoneyExpr(tc.expression, billingexpr.MoneyInput{Tokens: map[string]int64{"p": 1000, "c": 100}}, "USD")
+		require.NoError(t, err)
+		assert.Equal(t, tc.want, amount.String())
+		legacy, _, err := billingexpr.RunExpr(tc.expression, billingexpr.TokenParams{P: 1000, C: 100})
+		require.NoError(t, err)
+		assert.Equal(t, tc.legacy, legacy)
+	}
+}
+
+func TestMoneyUsedVarsKeepsSourceCacheDimensions(t *testing.T) {
+	const expression = `0.123456789123456789 == 0.123456789123456788 ? tier("plain", p) : tier("cache", p + cr * 0.1)`
+	used, err := billingexpr.MoneyUsedVars(expression)
+	require.NoError(t, err)
+	assert.True(t, used["cr"])
+	amount, trace, err := billingexpr.RunMoneyExpr(expression, billingexpr.MoneyInput{Tokens: map[string]int64{"p": 800, "cr": 200}}, "USD")
+	require.NoError(t, err)
+	assert.Equal(t, "0.00082 USD", amount.String())
+	assert.Equal(t, "cache", trace.MatchedTier)
+	used["cr"] = false
+	used, err = billingexpr.MoneyUsedVars(expression)
+	require.NoError(t, err)
+	assert.True(t, used["cr"])
+	_, err = billingexpr.MoneyUsedVars(`p +`)
+	require.ErrorContains(t, err, "expr compile error")
+}
 
 func TestFixedPriceBranches(t *testing.T) {
 	const expression = `(len <= 32000 ? tier("short", fixed(0.01)) : tier("long", p * 2 + c * 8)) * (param("fast") == true ? 2 : 1)`
@@ -71,7 +359,7 @@ func TestFixedPriceQuotaBoundariesAndUnsupportedTaskSnapshots(t *testing.T) {
 		{"normal group", `tier("request", fixed(0.01))`, 1.5, 7500, false},
 		{"free group", `tier("request", fixed(0.01))`, 0, 0, false},
 		{"explicit free price", `tier("free", fixed(0))`, 1, 0, false},
-		{"oversized price saturates instead of crediting", `tier("huge", fixed(1e20))`, 1, math.MaxInt32, true},
+		{"oversized price saturates instead of crediting", `tier("huge", fixed(1e20))`, 1, common.MaxQuota, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			snap := &billingexpr.BillingSnapshot{ExprString: tc.expression, ExprHash: billingexpr.ExprHashString(tc.expression), GroupRatio: tc.group, QuotaPerUnit: 500000}

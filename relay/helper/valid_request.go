@@ -342,6 +342,17 @@ func GetAndValidateTextRequest(c *gin.Context, relayMode int) (*dto.GeneralOpenA
 		return nil, err
 	}
 
+	return ValidateTextRequest(c, textRequest, relayMode)
+}
+
+// MaxChatCompletionsN bounds the number of generated choices before pricing or
+// forwarding, including a Channel's parameter overrides.
+const MaxChatCompletionsN = 128
+
+func ValidateTextRequest(c *gin.Context, textRequest *dto.GeneralOpenAIRequest, relayMode int) (*dto.GeneralOpenAIRequest, error) {
+	if textRequest.N != nil && (*textRequest.N < 1 || *textRequest.N > MaxChatCompletionsN) {
+		return nil, errors.New("n is invalid")
+	}
 	if relayMode == relayconstant.RelayModeModerations && textRequest.Model == "" {
 		textRequest.Model = "text-moderation-latest"
 	}

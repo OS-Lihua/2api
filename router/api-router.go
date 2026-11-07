@@ -432,6 +432,7 @@ func SetApiRouter(router *gin.Engine) {
 
 		registerModelOfferingRoutes(apiRouter)
 		registerPricingRoutes(apiRouter)
+		registerGatewayRecordRoutes(apiRouter)
 		bulk := apiRouter.Group("/admin/v1", middleware.AdminAuth())
 		handlePermissionRoute(bulk, http.MethodPost, "/bulk-import", authz.ChannelWrite, controller.BulkImport)
 		adminV1 := apiRouter.Group("/admin/v1")

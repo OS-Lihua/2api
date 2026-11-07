@@ -581,7 +581,11 @@ func TokenAuth() func(c *gin.Context) {
 			parts = strings.Split(key, "-")
 			key = parts[0]
 		}
-		token, err := model.ValidateUserToken(key)
+		validateToken := model.ValidateUserToken
+		if TextOffering(c) != nil {
+			validateToken = model.ValidateWalletToken
+		}
+		token, err := validateToken(key)
 		if token != nil {
 			id := c.GetInt("id")
 			if id == 0 {

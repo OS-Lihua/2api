@@ -2,6 +2,7 @@ package money_test
 
 import (
 	"math"
+	"math/big"
 	"testing"
 
 	"github.com/QuantumNous/new-api/model"
@@ -157,6 +158,37 @@ func TestValueArithmetic(t *testing.T) {
 			assert.Equal(t, tt.want, got.String())
 		})
 	}
+}
+
+func TestValueRationalArithmetic(t *testing.T) {
+	third, err := money.NewRationalValue(big.NewRat(1, 3), "USD")
+	require.NoError(t, err)
+	assert.Equal(t, "1/3 USD", third.String())
+
+	whole, err := third.MulQuantity(3)
+	require.NoError(t, err)
+	assert.Equal(t, "1 USD", whole.String())
+
+	// An intermediate decimal division rounded to 16 places loses this digit.
+	belowHalf, ok := new(big.Rat).SetString("499999999999999999/1000000000000000000000000000")
+	require.True(t, ok)
+	fraction, err := money.NewRationalValue(belowHalf, "USD")
+	require.NoError(t, err)
+	cost, err := fraction.Cost()
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), cost.Nanos)
+	charge, err := fraction.Receivable()
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), charge.Nanos)
+
+	discounted, err := money.MulUnitPrice(decimal.RequireFromString("0.3"), third)
+	require.NoError(t, err)
+	assert.Equal(t, "0.1 USD", discounted.String())
+	rate, err := money.NewRate("USD", "CNY", decimal.RequireFromString("7.2"))
+	require.NoError(t, err)
+	converted, err := third.Convert(rate)
+	require.NoError(t, err)
+	assert.Equal(t, "2.4 CNY", converted.String())
 }
 
 func TestValueConvert(t *testing.T) {

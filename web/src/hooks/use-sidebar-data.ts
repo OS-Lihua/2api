@@ -104,6 +104,11 @@ export function useSidebarData(badges: SidebarBadges = {}): SidebarData {
             icon: ClipboardList,
           },
           {
+            title: t('Request logs'),
+            url: '/usage-logs/requests',
+            icon: FileText,
+          },
+          {
             title: t('Task Logs'),
             url: '/usage-logs/task',
             activeUrls: ['/usage-logs/drawing'],

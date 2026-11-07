@@ -380,7 +380,7 @@ func TestReconcileWalletsReportsBalanceThatDiffersFromEntries(t *testing.T) {
 
 	result, err := ReconcileWallets(2)
 	require.NoError(t, err)
-	assert.Equal(t, int64(4), result.CheckedWallets)
+	assert.Equal(t, int64(7), result.CheckedWallets)
 	assert.Empty(t, result.Mismatches)
 
 	// Simulate a balance written outside the ledger.
@@ -390,7 +390,7 @@ func TestReconcileWalletsReportsBalanceThatDiffersFromEntries(t *testing.T) {
 
 	result, err = ReconcileWallets(2)
 	require.NoError(t, err)
-	assert.Equal(t, int64(4), result.CheckedWallets)
+	assert.Equal(t, int64(7), result.CheckedWallets)
 	require.Len(t, result.Mismatches, 1)
 	mismatch := result.Mismatches[0]
 	assert.Equal(t, wallet.Id, mismatch.WalletId)
@@ -440,7 +440,7 @@ func TestConcurrentChargesKeepBalanceEqualToEntries(t *testing.T) {
 
 	result, err := ReconcileWallets(100)
 	require.NoError(t, err)
-	assert.Equal(t, int64(2), result.CheckedWallets)
+	assert.Equal(t, int64(3), result.CheckedWallets)
 	assert.Empty(t, result.Mismatches)
 }
 
