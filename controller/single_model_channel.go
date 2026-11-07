@@ -61,7 +61,7 @@ func singleChannelError(c *gin.Context, err error) {
 		if pgError.Code == "23505" {
 			status = http.StatusConflict
 			err = common.NewMessage("This provider, protocol, and upstream model already have a channel")
-		} else if pgError.Code == "23503" {
+		} else if pgError.Code == "23503" || pgError.Code == "23001" {
 			status = http.StatusConflict
 			err = common.NewMessage("The channel is still referenced")
 		} else {

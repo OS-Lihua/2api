@@ -41,7 +41,9 @@ import {
 import { useTranslation } from 'react-i18next'
 
 import type { SidebarBadges, SidebarData } from '@/components/layout/types'
+import { hasPermission } from '@/lib/admin-permissions'
 import { ROLE } from '@/lib/roles'
+import { useAuthStore } from '@/stores/auth-store'
 
 /**
  * Root navigation groups for the application sidebar.
@@ -51,6 +53,8 @@ import { ROLE } from '@/lib/roles'
  */
 export function useSidebarData(badges: SidebarBadges = {}): SidebarData {
   const { t } = useTranslation()
+  const user = useAuthStore((state) => state.auth.user)
+  const canReadPricing = hasPermission(user, 'pricing', 'read')
 
   return {
     navGroups: [
@@ -148,6 +152,25 @@ export function useSidebarData(badges: SidebarBadges = {}): SidebarData {
             url: '/models/metadata',
             icon: Box,
           },
+          {
+            title: t('Model offerings'),
+            url: '/model-offerings',
+            icon: Box,
+          },
+          ...(canReadPricing
+            ? [
+                {
+                  title: t('Price versions'),
+                  url: '/price-versions' as const,
+                  icon: CreditCard,
+                },
+                {
+                  title: t('Exchange rates'),
+                  url: '/fx-rates' as const,
+                  icon: CreditCard,
+                },
+              ]
+            : []),
           {
             title: t('Users'),
             url: '/users',

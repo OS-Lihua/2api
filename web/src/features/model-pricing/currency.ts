@@ -23,6 +23,7 @@ export type PricingCurrency = {
   label: string
   symbol: string
   exchangeRate: number
+  native?: boolean
 }
 
 export const USD_PRICING_CURRENCY: PricingCurrency = {

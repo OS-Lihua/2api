@@ -61,6 +61,10 @@ interface MultiSelectProps {
   placeholder?: string
   className?: string
   allowCreate?: boolean
+  /** Commit a custom-value draft on blur or when dismissing suggestions. */
+  commitOnBlur?: boolean
+  /** Reports unfinished input so forms can protect it when closing. */
+  onDraftChange?: (value: string) => void
   /**
    * Label shown for the "create" item in the dropdown.
    * Supports the `{{value}}` placeholder which is replaced with the typed input.
@@ -71,6 +75,9 @@ interface MultiSelectProps {
   emptyText?: string
   /** Optional `id` to wire labels/aria-describedby to the input. */
   id?: string
+  'aria-invalid'?: React.AriaAttributes['aria-invalid']
+  'aria-describedby'?: string
+  'data-form-root'?: string
   /** Disable the entire control. */
   disabled?: boolean
   /**
@@ -110,7 +117,7 @@ function splitDraft(value: string): { completed: string[]; draft: string } {
  * MultiSelect — tags/chips style multi-select built on Base UI Combobox.
  *
  * Behaviour:
- * - Search filters built-in options (Base UI handles fuzzy filtering).
+ * - Search matches option labels and values, ignoring case.
  * - When `allowCreate` is true, custom values can be added inline:
  *   - Type and press Enter / "," to add a single value.
  *   - Paste a comma- (or newline-) separated list to add many at once.
@@ -134,6 +141,11 @@ export function MultiSelect(props: MultiSelectProps) {
   const [inputValue, setInputValue] = React.useState('')
   const [open, setOpen] = React.useState(false)
   const [expanded, setExpanded] = React.useState(false)
+
+  const onDraftChange = props.onDraftChange
+  React.useEffect(() => {
+    onDraftChange?.(inputValue)
+  }, [inputValue, onDraftChange])
 
   const selectedSet = React.useMemo(
     () => new Set(props.selected),
@@ -211,6 +223,22 @@ export function MultiSelect(props: MultiSelectProps) {
     [props]
   )
 
+  const commitDraft = () => {
+    if (
+      !props.commitOnBlur ||
+      !props.allowCreate ||
+      props.disabled ||
+      !trimmedInput
+    ) {
+      return
+    }
+    const option = props.options.find(
+      (item) => item.value === trimmedInput || item.label === trimmedInput
+    )
+    addValues([option?.value ?? trimmedInput])
+    setInputValue('')
+  }
+
   const handleInputValueChange = (value: string) => {
     if (!props.allowCreate) {
       setInputValue(value)
@@ -274,6 +302,7 @@ export function MultiSelect(props: MultiSelectProps) {
   )
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Escape') commitDraft()
     // Enter without a highlighted option commits the typed value.
     if (event.key === 'Enter' && props.allowCreate && canCreate) {
       // Only fire when Base UI has no highlighted item to select. We rely on
@@ -295,10 +324,37 @@ export function MultiSelect(props: MultiSelectProps) {
     <Combobox
       multiple
       items={items}
+      filter={(value, query) => {
+        const term = query.trim().toLowerCase()
+        return (
+          value.toLowerCase().includes(term) ||
+          (labelMap.get(value) ?? value).toLowerCase().includes(term)
+        )
+      }}
       value={props.selected}
-      onValueChange={handleValueChange}
+      onValueChange={(next, details) => {
+        if (
+          props.commitOnBlur &&
+          props.allowCreate &&
+          details.reason === 'escape-key'
+        ) {
+          details.cancel()
+          details.allowPropagation()
+          return
+        }
+        handleValueChange(next)
+      }}
       inputValue={inputValue}
-      onInputValueChange={handleInputValueChange}
+      onInputValueChange={(value, details) => {
+        if (
+          props.commitOnBlur &&
+          props.allowCreate &&
+          details.reason !== 'input-change'
+        ) {
+          return
+        }
+        handleInputValueChange(value)
+      }}
       open={open}
       onOpenChange={setOpen}
       disabled={props.disabled}
@@ -405,12 +461,16 @@ export function MultiSelect(props: MultiSelectProps) {
         </ComboboxValue>
         <ComboboxChipsInput
           id={props.id}
+          aria-invalid={props['aria-invalid']}
+          aria-describedby={props['aria-describedby']}
+          data-form-root={props['data-form-root']}
           placeholder={
             props.selected.length === 0 && !props.renderSelectedSummary
               ? placeholder
               : undefined
           }
           onKeyDown={handleKeyDown}
+          onBlur={commitDraft}
           onPaste={handlePaste}
           aria-label={placeholder}
         />

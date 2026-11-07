@@ -36,7 +36,7 @@ func newAdminTestServer(t *testing.T) (*gin.Engine, *model.User, string) {
 	require.NoError(t, authz.Init(db))
 	user := &model.User{Username: "security-admin", Password: "unused", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "security"}
 	require.NoError(t, db.Create(user).Error)
-	token := createWalletTestAccessToken(t, user.Id, "model:read", "model:write", "channel:read", "channel:write", "channel:sensitive_write", "channel:operate", "ledger:read", "ledger:write", "recommendation:read", "recommendation:write")
+	token := createWalletTestAccessToken(t, user.Id, "model:read", "model:write", "channel:read", "channel:write", "channel:sensitive_write", "channel:operate", "ledger:read", "ledger:write", "recommendation:read", "recommendation:write", "pricing:read", "pricing:write")
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
 	SetApiRouter(engine)

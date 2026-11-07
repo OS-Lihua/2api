@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { flattenBinary } from './display'
 import { compileBillingExpression } from './parser'
+import { unwrapExpressionParens } from './structure'
 import {
   TIME_FUNCTIONS,
   type ExpressionNode,
@@ -140,12 +141,15 @@ function readVisualCondition(node: ExpressionNode): VisualCondition | null {
   }
 }
 
-function readVisualPricing(node: ExpressionNode): VisualPricingNode | null {
+function readVisualPricing(
+  node: ExpressionNode,
+  source: string
+): VisualPricingNode | null {
   const identity = { id: `pricing-${node.start}-${node.end}`, origin: node }
   if (node.kind === 'conditional') {
     const condition = readVisualCondition(node.condition)
-    const yes = readVisualPricing(node.yes)
-    const no = readVisualPricing(node.no)
+    const yes = readVisualPricing(node.yes, source)
+    const no = readVisualPricing(node.no, source)
     return condition && yes && no
       ? { ...identity, kind: 'branch', condition, yes, no }
       : null
@@ -171,7 +175,9 @@ function readVisualPricing(node: ExpressionNode): VisualPricingNode | null {
       label: node.args[0].value,
       prices,
       billingUnit: 'request',
-      fixedPrice: String(body.args[0].value),
+      fixedPrice: unwrapExpressionParens(
+        source.slice(body.args[0].start, body.args[0].end)
+      ),
     }
   }
   for (const term of flattenBinary(node.args[1], '+')) {
@@ -191,7 +197,9 @@ function readVisualPricing(node: ExpressionNode): VisualPricingNode | null {
     if (prices.some((price) => price.variable === variable)) return null
     prices.push({
       variable: term.left.name,
-      value: String(term.right.value),
+      value: unwrapExpressionParens(
+        source.slice(term.right.start, term.right.end)
+      ),
       origin: term,
     })
   }
@@ -222,10 +230,23 @@ export function parseVisualBillingDocument(
   const compiled = compileBillingExpression(source)
   if (compiled.status !== 'ready') return null
   const pricing = imageCountPricingRoot(compiled.ast) ?? compiled.ast
-  const root = readVisualPricing(pricing)
+  const root = readVisualPricing(pricing, source)
   if (!root) return null
   const document = { source, root, imageCount: pricing !== compiled.ast }
   return serializeVisualBillingDocument(document).ok ? document : null
+}
+
+function writeNumericLiteral(
+  source: string,
+  node: ExpressionNode,
+  value: string
+): string {
+  const original = source.slice(node.start, node.end)
+  const literal = unwrapExpressionParens(original)
+  const offset = original.indexOf(literal)
+  return (
+    original.slice(0, offset) + value + original.slice(offset + literal.length)
+  )
 }
 
 /** Reuse untouched source spans instead of rewriting whitespace, labels or price order. */
@@ -409,10 +430,7 @@ function writeVisualPricing(
         price.args[0].kind === 'literal'
       ) {
         const amount = price.args[0]
-        const text =
-          value === amount.value
-            ? source.slice(amount.start, amount.end)
-            : node.fixedPrice
+        const text = writeNumericLiteral(source, amount, node.fixedPrice)
         priceText = patchSource(source, price, [{ node: amount, text }])
       }
       return patchSource(source, origin, [
@@ -442,10 +460,7 @@ function writeVisualPricing(
       price.origin?.kind === 'binary' &&
       price.origin.right.kind === 'literal'
     ) {
-      const text =
-        value === price.origin.right.value
-          ? source.slice(price.origin.right.start, price.origin.right.end)
-          : price.value
+      const text = writeNumericLiteral(source, price.origin.right, price.value)
       valuePatches.push({ node: price.origin.right, text })
       terms.push(
         patchSource(source, price.origin, [{ node: price.origin.right, text }])
