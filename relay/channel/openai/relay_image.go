@@ -2,6 +2,7 @@ package openai
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -40,10 +41,28 @@ func OpenaiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
 
-	info.UpdateImageCount(openaiImageResponseCount(responseBody))
+	count := openaiImageResponseCount(responseBody)
+	info.UpdateImageCount(count)
+	if info.ResponseFacts != nil {
+		if count <= dto.MaxImageN {
+			info.ResponseFacts.ImageCount = &count
+		}
+		info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported = relaycommon.MediaUsagePresence(responseBody)
+		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			normalizeOpenAIUsage(&usageResp.Usage)
+			return &usageResp.Usage, types.NewError(fmt.Errorf("upstream image request failed"), types.ErrorCodeBadResponse)
+		}
+	}
 
-	// 写入新的 response body
-	service.IOCopyBytesGracefully(c, resp, responseBody)
+	writeErr := service.IOCopyBytesGracefully(c, resp, responseBody)
+	if info.ResponseFacts != nil {
+		if writeErr != nil {
+			info.ResponseFacts.DownstreamWriteFailed = true
+			return &usageResp.Usage, types.NewError(writeErr, types.ErrorCodeBadResponse)
+		}
+		info.ResponseFacts.BusinessOutput = count > 0
+	}
 
 	normalizeOpenAIUsage(&usageResp.Usage)
 	applyUsagePostProcessing(info, &usageResp.Usage, responseBody)
@@ -156,15 +175,41 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 		}
 		if err := common.Unmarshal(raw, &chunk); err == nil {
 			normalizeOpenAIUsage(&chunk.Usage)
-			if service.ValidUsage(&chunk.Usage) {
+			if info.ResponseFacts != nil {
+				prompt, completion := relaycommon.MediaUsagePresence(raw)
+				if prompt {
+					usage.PromptTokens = chunk.Usage.PromptTokens
+					usage.PromptTokensDetails = chunk.Usage.PromptTokensDetails
+				}
+				if completion {
+					usage.CompletionTokens = chunk.Usage.CompletionTokens
+					usage.CompletionTokenDetails = chunk.Usage.CompletionTokenDetails
+				}
+				info.ResponseFacts.PromptTokensReported = info.ResponseFacts.PromptTokensReported || prompt
+				info.ResponseFacts.CompletionTokensReported = info.ResponseFacts.CompletionTokensReported || completion
+				info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
+				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+			} else if service.ValidUsage(&chunk.Usage) {
 				usage = &chunk.Usage
 			}
 			if chunk.Type == "image_generation.completed" || chunk.Type == "image_edit.completed" {
-				completedImages++
+				if info.ResponseFacts == nil || openaiImageDataHasField(ojson.Parse(data), "url") || openaiImageDataHasField(ojson.Parse(data), "b64_json") {
+					completedImages++
+				}
 			}
 		}
-		if err := writeOpenaiImageStreamChunk(c, raw); err != nil {
-			sr.Stop(err)
+		writeErr := writeOpenaiImageStreamChunk(c, raw)
+		if info.ResponseFacts != nil {
+			var flushErr *helper.StreamFlushError
+			if (writeErr == nil || errors.As(writeErr, &flushErr)) && (openaiImageDataHasField(ojson.Parse(data), "url") || openaiImageDataHasField(ojson.Parse(data), "b64_json")) {
+				info.ResponseFacts.BusinessOutput = true
+			}
+			if writeErr != nil {
+				info.ResponseFacts.DownstreamWriteFailed = true
+			}
+		}
+		if writeErr != nil {
+			sr.Stop(writeErr)
 		}
 	})
 
@@ -187,6 +232,9 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 			info.StreamStatus.EndReason == relaycommon.StreamEndReasonEOF
 		if upstreamFinished || completedImages > int64(info.RequestedImageCount()) {
 			info.UpdateImageCount(completedImages)
+			if info.ResponseFacts != nil && completedImages <= dto.MaxImageN {
+				info.ResponseFacts.ImageCount = &completedImages
+			}
 		}
 	}
 	return usage, nil
@@ -278,6 +326,14 @@ func openaiImageJSONAsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 	applyUsagePostProcessing(info, &usageResp.Usage, responseBody)
 
 	info.UpdateImageCount(openaiImageResponseCount(responseBody))
+	if info.ResponseFacts != nil {
+		count := openaiImageResponseCount(responseBody)
+		if count <= dto.MaxImageN {
+			info.ResponseFacts.ImageCount = &count
+		}
+		info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported = relaycommon.MediaUsagePresence(responseBody)
+		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
+	}
 
 	helper.SetEventStreamHeaders(c)
 	c.Status(http.StatusOK)
@@ -329,7 +385,15 @@ func openaiImageJSONAsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 				return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 			}
 		}
-		if writeErr := helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: "image_generation.completed"}, payload.String()); writeErr != nil {
+		writeErr := helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: "image_generation.completed"}, payload.String())
+		if info.ResponseFacts != nil {
+			var flushErr *helper.StreamFlushError
+			if writeErr == nil || errors.As(writeErr, &flushErr) {
+				info.ResponseFacts.BusinessOutput = true
+			}
+			info.ResponseFacts.DownstreamWriteFailed = writeErr != nil
+		}
+		if writeErr != nil {
 			if info != nil && info.StreamStatus != nil {
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, writeErr)
 			}

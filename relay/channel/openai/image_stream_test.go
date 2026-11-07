@@ -39,6 +39,50 @@ func newImageTestContext(t *testing.T, body, contentType string, isStream bool) 
 	return c, recorder, resp, info
 }
 
+func TestImageMoneyGatewayReportsPayloadAndUsageFacts(t *testing.T) {
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previousTimeout })
+	for _, tc := range []struct {
+		name, body string
+		count      int64
+		reported   bool
+	}{
+		{"object", `{"data":{"url":"image"},"usage":{"input_tokens":0,"output_tokens":0}}`, 1, true},
+		{"split", `{"data":[{"url":"image"},{"b64_json":"image"}]}`, 1, false},
+		{"no payload", `{"data":[{"revised_prompt":"text"}]}`, 0, false},
+	} {
+		for _, mode := range []string{"json", "json_sse", "sse"} {
+			t.Run(fmt.Sprintf("%s/%s", tc.name, mode), func(t *testing.T) {
+				body, contentType := tc.body, "application/json"
+				if mode == "sse" {
+					body = "data: {\"type\":\"image_generation.completed\""
+					if tc.count > 0 {
+						body += ",\"b64_json\":\"image\""
+					}
+					if tc.reported {
+						body += ",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}"
+					}
+					body += "}\n\ndata: [DONE]\n\n"
+					contentType = "text/event-stream"
+				}
+				c, recorder, resp, info := newImageTestContext(t, body, contentType, mode != "json")
+				info.ResponseFacts = &relaycommon.ResponseFacts{}
+				info.RelayMode = relayconstant.RelayModeImagesGenerations
+				_, apiErr := (&Adaptor{}).DoResponse(c, resp, info)
+				require.Nil(t, apiErr)
+				if mode == "json" {
+					assert.Equal(t, tc.body, recorder.Body.String())
+				}
+				require.NotNil(t, info.ResponseFacts.ImageCount)
+				assert.Equal(t, tc.count, *info.ResponseFacts.ImageCount)
+				assert.Equal(t, tc.count > 0, info.ResponseFacts.BusinessOutput)
+				assert.Equal(t, tc.reported, info.ResponseFacts.UsageReported)
+			})
+		}
+	}
+}
+
 func TestImageExpressionUsesCompletedCountAndProtectsAbortedStreams(t *testing.T) {
 	oldTimeout := constant.StreamingTimeout
 	constant.StreamingTimeout = 30
