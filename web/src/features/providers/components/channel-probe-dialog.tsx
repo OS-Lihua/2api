@@ -26,8 +26,8 @@ import { Dialog } from '@/components/dialog'
 import { ErrorState } from '@/components/error-state'
 import { StatusBadge } from '@/components/status-badge'
 import { Button } from '@/components/ui/button'
-import { getCapabilityFeatureOptions } from '@/features/models/constants'
 import { toIntlLocale } from '@/i18n/languages'
+import { formatNumber } from '@/lib/format'
 
 import {
   channelKeys,
@@ -36,6 +36,7 @@ import {
   type ChannelProbeResult,
   type SingleModelChannel,
 } from '../channel-api'
+import { getChannelProbeLabels } from '../lib/channel-probes'
 
 type ProbeRow = { capability: string; result?: ChannelProbeResult }
 
@@ -71,19 +72,16 @@ export function ChannelProbeDialog(props: {
     [query.data]
   )
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
-  const featureLabels = useMemo(
-    () =>
-      new Map(
-        getCapabilityFeatureOptions(t).map((option) => [
-          option.value as string,
-          option.label,
-        ])
-      ),
-    [t]
-  )
+  const featureLabels = useMemo(() => getChannelProbeLabels(t), [t])
   const reasons = useMemo(
     () =>
       ({
+        task_pending: t(
+          'The Provider task did not finish within the probe budget'
+        ),
+        limit_sample_only: t(
+          'Only a smaller sample was tested; the declared limit is not verified'
+        ),
         probe_interrupted: t('The probe was interrupted'),
         verified: t('Capability behavior observed'),
         behavior_not_observed: t('Capability behavior was not observed'),
@@ -148,6 +146,14 @@ export function ChannelProbeDialog(props: {
         cell: ({ row }) => reasons[row.original.result?.reason ?? ''] ?? '-',
       },
       {
+        id: 'tested_value',
+        header: t('Tested value'),
+        cell: ({ row }) =>
+          row.original.result?.tested_value
+            ? formatNumber(row.original.result.tested_value, locale)
+            : '-',
+      },
+      {
         id: 'actions',
         header: t('Actions'),
         cell: ({ row }) =>
@@ -206,6 +212,11 @@ export function ChannelProbeDialog(props: {
       <p className='mb-3 text-sm break-all'>
         {props.channel.upstream_model_name} · {props.channel.protocol}
       </p>
+      {props.channel.protocol.startsWith('task:') && (
+        <p className='text-muted-foreground mb-3 text-sm'>
+          {t('An unfinished Provider task may continue after the probe ends.')}
+        </p>
+      )}
       {query.isError ? (
         <ErrorState onRetry={() => void query.refetch()} />
       ) : (

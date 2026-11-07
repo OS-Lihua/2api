@@ -1,6 +1,7 @@
 package vertex
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -214,7 +215,11 @@ func (a *Provider) SetupHeader(c *gin.Context, req *http.Header, metadata channe
 	}
 	channel.SetupProviderRequestHeader(info, c, req)
 	if info.ChannelOtherSettings.VertexKeyType != dto.VertexKeyTypeAPIKey {
-		accessToken, err := getProviderAccessToken(a, info)
+		requestCtx := context.Background()
+		if c != nil && c.Request != nil {
+			requestCtx = c.Request.Context()
+		}
+		accessToken, err := getProviderAccessTokenWithContext(requestCtx, a, info)
 		if err != nil {
 			return err
 		}

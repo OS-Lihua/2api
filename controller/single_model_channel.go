@@ -95,6 +95,10 @@ func ChannelProtocolOptions(c *gin.Context) {
 }
 
 func ListSingleModelChannels(c *gin.Context) {
+	if err := model.RecoverInterruptedChannelProbes(c.Request.Context()); err != nil {
+		singleChannelError(c, err)
+		return
+	}
 	query := model.DB.Model(&model.Channel{})
 	for _, name := range []string{"provider_id", "model_id"} {
 		if raw := c.Query(name); raw != "" {

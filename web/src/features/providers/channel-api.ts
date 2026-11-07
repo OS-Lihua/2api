@@ -67,6 +67,7 @@ export interface ChannelProbeResult {
   finished_at: number
   status: 'running' | 'passed' | 'failed' | 'inconclusive'
   reason: string
+  tested_value?: number
 }
 export async function listChannelProbes(id: number) {
   const response = await api.get(`${path}/${id}/probes`)
@@ -76,7 +77,11 @@ export async function listChannelProbes(id: number) {
   }>(response.data).data
 }
 export async function runChannelProbe(id: number, capability: string) {
-  const response = await api.post(`${path}/${id}/probes`, { capability })
+  const response = await api.post(
+    `${path}/${id}/probes`,
+    { capability },
+    { timeout: 100_000 }
+  )
   return requireServerSuccess<{ success: boolean; data: ChannelProbeResult }>(
     response.data
   ).data

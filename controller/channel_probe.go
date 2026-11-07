@@ -3,14 +3,19 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgconn"
 	"net/http"
 	"slices"
 	"time"
 )
+
+const channelProbeTimeout = 90 * time.Second
+const channelProbeSaveTimeout = 5 * time.Second
 
 // RunChannelProbe is an explicit admin operation, including for pending or
 // disabled Channels. It never runs the user billing or automatic health path.
@@ -40,18 +45,28 @@ func RunChannelProbe(c *gin.Context) {
 		singleChannelError(c, err)
 		return
 	}
-	result := model.ChannelProbeResult{ChannelID: id, Capability: feature, Protocol: record.Protocol, StartedAt: clock.Now().Unix(), Status: "running", Reason: "", ActorID: c.GetInt("id")}
-	if err := model.DB.Create(&result).Error; err != nil {
+	if err := model.RecoverInterruptedChannelProbes(c.Request.Context()); err != nil {
 		singleChannelError(c, err)
 		return
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+	startedAt := clock.Now().Unix()
+	result := model.ChannelProbeResult{ChannelID: id, Capability: feature, Protocol: record.Protocol, StartedAt: startedAt, DeadlineAt: startedAt + int64((channelProbeTimeout+channelProbeSaveTimeout)/time.Second), Status: "running", Reason: "", ActorID: c.GetInt("id")}
+	if err := model.DB.Create(&result).Error; err != nil {
+		var conflict *pgconn.PgError
+		if errors.As(err, &conflict) && conflict.Code == "23505" {
+			common.ApiErrorStatus(c, http.StatusConflict, common.NewMessage("A capability probe is already running for this Channel"))
+			return
+		}
+		singleChannelError(c, err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), channelProbeTimeout)
 	defer cancel()
-	result.Status, result.Reason = probeChannel(ctx, record, provider, feature)
+	result.Status, result.Reason = probeChannel(ctx, record, provider, &result)
 	result.FinishedAt = clock.Now().Unix()
-	saveCtx, saveCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+	saveCtx, saveCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), channelProbeSaveTimeout)
 	defer saveCancel()
-	if err := model.DB.WithContext(saveCtx).Model(&result).Select("status", "reason", "finished_at").Updates(&result).Error; err != nil {
+	if err := model.DB.WithContext(saveCtx).Model(&result).Select("status", "reason", "finished_at", "tested_value").Updates(&result).Error; err != nil {
 		singleChannelError(c, err)
 		return
 	}
@@ -70,17 +85,15 @@ func ListChannelProbes(c *gin.Context) {
 		singleChannelError(c, err)
 		return
 	}
+	if err := model.RecoverInterruptedChannelProbes(c.Request.Context()); err != nil {
+		singleChannelError(c, err)
+		return
+	}
 	results := []model.ChannelProbeResult{}
 	latestIDs := model.DB.Model(&model.ChannelProbeResult{}).Select("MAX(id)").Where("channel_id = ?", id).Group("capability")
 	if err := model.DB.Where("id IN (?)", latestIDs).Order("capability").Find(&results).Error; err != nil {
 		singleChannelError(c, err)
 		return
-	}
-	for i := range results {
-		if results[i].Status == "running" && clock.Now().Unix()-results[i].StartedAt > 25 {
-			results[i].Status = "inconclusive"
-			results[i].Reason = "probe_interrupted"
-		}
 	}
 	common.ApiSuccess(c, gin.H{"capabilities": channelProbeCapabilities, "results": results})
 }

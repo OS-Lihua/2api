@@ -370,9 +370,13 @@ it('opens capability probes and shows persisted results before activation', asyn
     within(dialog).getByRole('button', { name: 'Probe Tool calling' })
   )
   await waitFor(() =>
-    expect(post).toHaveBeenCalledWith('/api/admin/v1/channels/3/probes', {
-      capability: 'tool_calling',
-    })
+    expect(post).toHaveBeenCalledWith(
+      '/api/admin/v1/channels/3/probes',
+      {
+        capability: 'tool_calling',
+      },
+      { timeout: 100_000 }
+    )
   )
   expect(
     within(dialog).getByText(

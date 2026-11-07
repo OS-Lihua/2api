@@ -22,23 +22,12 @@ import (
 
 // ChannelProbeCapabilities lists request features that can be observed with
 // bounded synthetic requests. Results describe observations, not declarations.
-var channelProbeCapabilities = []string{"streaming", "tool_calling", "reasoning", "structured_output", "caching"}
+var channelProbeCapabilities = []string{"streaming", "tool_calling", "reasoning", "structured_output", "caching", "input_text", "input_image", "input_audio", "input_video", "input_pdf", "output_text", "output_image", "output_audio", "output_video", "output_pdf", "context_length", "max_output_tokens", "max_images", "max_duration_seconds", "embedding_dimensions"}
 
 // ProbeChannel uses the same Provider/Protocol composition as production calls.
 // No caller headers, user identity, wallet or accounting state enter the call.
-func probeChannel(ctx context.Context, record model.Channel, provider *model.Provider, feature string) (string, string) {
-	apiType, supported := common.ChannelType2APIType(provider.Type)
-	if !supported {
-		return "inconclusive", "protocol_unavailable"
-	}
-	adaptor, err := relay.GetChannelAdaptor(apiType, record.Protocol)
-	if err != nil {
-		return "inconclusive", "protocol_unavailable"
-	}
-	key, index, keyErr := provider.GetNextEnabledKey()
-	if keyErr != nil {
-		return "failed", "credential_unavailable"
-	}
+func probeChannel(ctx context.Context, record model.Channel, provider *model.Provider, result *model.ChannelProbeResult) (string, string) {
+	feature := result.Capability
 	request := &dto.GeneralOpenAIRequest{Model: record.UpstreamModelName, Messages: []dto.Message{{Role: "user", Content: "Reply with ok."}}, MaxTokens: common.GetPointer(uint(64))}
 	switch feature {
 	case "streaming":
@@ -58,21 +47,41 @@ func probeChannel(ctx context.Context, record model.Channel, provider *model.Pro
 		request.Messages[0].Content = []dto.MediaContent{{Type: "text", Text: strings.Repeat("This is a synthetic cache probe with no private information. ", 160), CacheControl: []byte(`{"type":"ephemeral"}`)}, {Type: "text", Text: "Reply with ok."}}
 		request.PromptCacheKey = "gateway-capability-probe"
 	}
+	if _, task := record.Protocol.TaskPluginKey(); task {
+		return probeTaskChannel(ctx, record, provider, result, request)
+	}
+	apiType, supported := common.ChannelType2APIType(provider.Type)
+	if !supported {
+		return "inconclusive", "protocol_unavailable"
+	}
+	adaptor, err := relay.GetChannelAdaptor(apiType, record.Protocol)
+	if err != nil {
+		return "inconclusive", "protocol_unavailable"
+	}
+	key, index, keyErr := provider.GetNextEnabledKey()
+	if keyErr != nil {
+		return "failed", "credential_unavailable"
+	}
+	recipe, err := channelProbeRecipeFor(ctx, record, feature, request)
+	if err != nil {
+		return "inconclusive", "request_not_representable"
+	}
+	result.TestedValue = recipe.TestedValue
 	// Provider metadata is copied from trusted configuration. The synthetic
 	// request has a fixed budget even when configured overrides are applied.
 	organization := ""
 	if provider.OpenAIOrganization != nil {
 		organization = *provider.OpenAIOrganization
 	}
-	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: provider.Type, ChannelId: provider.Id, ChannelIsMultiKey: provider.ProviderInfo.IsMultiKey, ChannelMultiKeyIndex: index, ChannelBaseUrl: provider.GetBaseURL(), ApiType: apiType, ApiKey: key, Organization: organization, ChannelCreateTime: provider.CreatedTime, HeadersOverride: provider.GetHeaderOverride(), ChannelSetting: provider.GetSetting(), ChannelOtherSettings: provider.GetOtherSettings(), UpstreamModelName: record.UpstreamModelName}, DisablePing: true, OriginModelName: record.UpstreamModelName, RelayFormat: types.RelayFormatOpenAI, IsStream: feature == "streaming", IsChannelTest: true}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: provider.Type, ChannelId: provider.Id, ChannelIsMultiKey: provider.ProviderInfo.IsMultiKey, ChannelMultiKeyIndex: index, ChannelBaseUrl: provider.GetBaseURL(), ApiType: apiType, ApiKey: key, Organization: organization, ChannelCreateTime: provider.CreatedTime, HeadersOverride: provider.GetHeaderOverride(), ChannelSetting: provider.GetSetting(), ChannelOtherSettings: provider.GetOtherSettings(), UpstreamModelName: record.UpstreamModelName}, DisablePing: true, OriginModelName: record.UpstreamModelName, RelayFormat: recipe.Format, RelayMode: recipe.Mode, IsStream: feature == "streaming", IsChannelTest: true}
 	cleanRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", nil)
 	if err != nil {
 		return "failed", "request_invalid"
 	}
-	cleanRequest.Header.Set("Content-Type", "application/json")
-	cleanRequest.Body = http.NoBody
+	cleanRequest.Header.Set("Content-Type", recipe.ContentType)
+	cleanRequest.Body = io.NopCloser(bytes.NewReader(recipe.Body))
 	c := &gin.Context{Request: cleanRequest, Writer: &probeResponseWriter{header: make(http.Header)}}
-	converted, err := adaptor.ConvertRequest(c, info, request)
+	converted, err := adaptor.ConvertRequest(c, info, recipe.Request)
 	if err != nil {
 		return "inconclusive", "request_not_representable"
 	}
@@ -85,17 +94,25 @@ func probeChannel(ctx context.Context, record model.Channel, provider *model.Pro
 	if err != nil {
 		return "failed", "request_invalid"
 	}
-	info.Request = request
+	info.Request = recipe.Request
 	info.ParamOverride = provider.GetParamOverride()
 	encoded, err = relaycommon.ApplyParamOverrideWithRelayInfo(encoded, info)
 	if err != nil {
 		return "failed", "request_invalid"
 	}
+	info.ParamOverride = nil
 	if common.UnmarshalJsonStr(record.ParameterOverrides, &info.ParamOverride) != nil {
 		return "failed", "request_invalid"
 	}
 	encoded, err = relaycommon.ApplyParamOverrideWithRelayInfo(encoded, info)
-	if err != nil || !probeRequestWithinBudget(gjson.ParseBytes(encoded)) {
+	maxCount := int64(1)
+	if record.Protocol == protocol.OpenAIImages {
+		maxCount = 2
+	}
+	if err != nil || !probeRequestWithinBudget(gjson.ParseBytes(encoded), maxCount) {
+		return "failed", "request_invalid"
+	}
+	if recipe.Format == types.RelayFormatOpenAI && !probeHasOutputBudget(gjson.ParseBytes(encoded)) {
 		return "failed", "request_invalid"
 	}
 	if helper.ExceedsMaxTokensLimit(request.MaxTokens, request.MaxCompletionTokens) {
@@ -134,10 +151,13 @@ func probeChannel(ctx context.Context, record model.Channel, provider *model.Pro
 		if feature == "streaming" {
 			return observeProbeStream(record.Protocol, response.Header.Get("Content-Type"), body)
 		}
-		if !gjson.ValidBytes(body) {
+		if record.Protocol != protocol.OpenAIAudioSpeech && !gjson.ValidBytes(body) {
 			return "failed", "response_invalid"
 		}
-		if observeProbeJSON(record.Protocol, feature, body) {
+		if observeChannelProbe(recipe, record.Protocol, feature, body) {
+			if recipe.SampledLimit {
+				return "inconclusive", "limit_sample_only"
+			}
 			return "passed", "verified"
 		}
 	}
@@ -146,17 +166,19 @@ func probeChannel(ctx context.Context, record model.Channel, provider *model.Pro
 
 // probeRequestWithinBudget checks multiplier fields after all overrides,
 // including nested passthrough parameters, before any network operation.
-func probeRequestWithinBudget(value gjson.Result) bool {
+func probeRequestWithinBudget(value gjson.Result, maxCount int64) bool {
 	valid := true
 	value.ForEach(func(key, item gjson.Result) bool {
 		if item.IsObject() || item.IsArray() {
-			valid = probeRequestWithinBudget(item)
+			valid = probeRequestWithinBudget(item, maxCount)
 			return valid
 		}
 		switch key.String() {
-		case "max_tokens", "max_completion_tokens", "max_output_tokens", "maxOutputTokens":
+		case "max_tokens", "max_completion_tokens", "max_output_tokens", "maxOutputTokens", "max_new_tokens", "maxTokens", "MaxTokens", "num_predict", "maxTokenCount":
 			valid = item.Type == gjson.Number && item.Float() >= 1 && item.Float() <= 2048 && item.Float() == float64(item.Int())
-		case "n", "candidateCount":
+		case "n", "batch_size", "batch_count", "num_images", "num_outputs", "sampleCount":
+			valid = item.Type == gjson.Number && item.Float() >= 1 && item.Float() <= float64(maxCount) && item.Float() == float64(item.Int())
+		case "candidateCount":
 			valid = item.Type == gjson.Number && item.Float() == 1
 		}
 		return valid
@@ -164,14 +186,40 @@ func probeRequestWithinBudget(value gjson.Result) bool {
 	return valid
 }
 
+// probeHasOutputBudget checks actual generation controls at known wire paths.
+// A lookalike field inside arbitrary metadata must not substitute for a cap.
+func probeHasOutputBudget(value gjson.Result) bool {
+	for _, path := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens", "max_new_tokens", "maxTokens", "MaxTokens", "num_predict", "generationConfig.maxOutputTokens", "generation_config.max_output_tokens", "parameters.max_tokens", "parameters.max_new_tokens", "parameters.max_output_tokens", "parameters.maxOutputTokens", "parameter.chat.max_tokens", "inferenceConfig.maxTokens", "textGenerationConfig.maxTokenCount", "options.num_predict", "instances.0.max_tokens"} {
+		limit := value.Get(path)
+		if limit.Type == gjson.Number && limit.Float() >= 1 && limit.Float() <= 2048 && limit.Float() == float64(limit.Int()) {
+			return true
+		}
+	}
+	return false
+}
+
 // probeResponseWriter isolates upstream stream headers from the management
 // response. Probe calls read the upstream body directly and never relay output.
 type probeResponseWriter struct {
 	bufferedResponseWriter
-	header http.Header
+	header   http.Header
+	maxBytes int
+	overflow bool
 }
 
 func (w *probeResponseWriter) Header() http.Header { return w.header }
+func (w *probeResponseWriter) Write(data []byte) (int, error) {
+	limit := w.maxBytes
+	if limit == 0 {
+		limit = 1 << 20
+	}
+	if w.body.Len()+len(data) > limit {
+		w.overflow = true
+		return 0, io.ErrShortWrite
+	}
+	return w.body.Write(data)
+}
+func (w *probeResponseWriter) WriteString(text string) (int, error) { return w.Write([]byte(text)) }
 
 // observeProbeJSON checks evidence in the selected wire protocol. Usage is read
 // only to observe caching/reasoning; it is never fabricated or billed.

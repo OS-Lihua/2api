@@ -26,7 +26,6 @@ import { DataTablePage, useDataTable } from '@/components/data-table'
 import { ErrorState } from '@/components/error-state'
 import { StatusBadge } from '@/components/status-badge'
 import { Button } from '@/components/ui/button'
-import { getCapabilityFeatureOptions } from '@/features/models/constants'
 import { toIntlLocale } from '@/i18n/languages'
 import {
   hasPermission,
@@ -41,18 +40,14 @@ import {
   listSingleModelChannels,
   type SingleModelChannel,
 } from '../channel-api'
+import { getChannelProbeLabels } from '../lib/channel-probes'
 import { ChannelMutateDrawer } from './channel-mutate-drawer'
 import { ChannelProbeDialog } from './channel-probe-dialog'
 
 export function ProviderChannels(props: { providerId: number }) {
   const { t, i18n } = useTranslation()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
-  const featureLabels = new Map(
-    getCapabilityFeatureOptions(t).map((option) => [
-      option.value as string,
-      option.label,
-    ])
-  )
+  const featureLabels = getChannelProbeLabels(t)
   const user = useAuthStore((state) => state.auth.user)
   const canWrite = hasPermission(
     user,
