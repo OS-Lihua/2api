@@ -179,19 +179,21 @@ export function AttemptsDrawer(props: {
         showCloseButton={false}
         className={sideDrawerContentClassName('sm:max-w-2xl')}
       >
-        <SheetClose
-          render={
-            <Button
-              variant='ghost'
-              size='icon-sm'
-              className='absolute top-3 right-3'
-              aria-label={t('Close')}
-            />
-          }
+        <SheetHeader
+          className={sideDrawerHeaderClassName('relative pr-12 sm:pr-14')}
         >
-          <X aria-hidden='true' />
-        </SheetClose>
-        <SheetHeader className={sideDrawerHeaderClassName('pr-12 sm:pr-14')}>
+          <SheetClose
+            render={
+              <Button
+                variant='ghost'
+                size='icon-sm'
+                className='absolute top-3 right-3'
+                aria-label={t('Close')}
+              />
+            }
+          >
+            <X aria-hidden='true' />
+          </SheetClose>
           <SheetTitle>{t('Request attempts')}</SheetTitle>
           <SheetDescription>
             {t('Upstream calls recorded for this request.')}

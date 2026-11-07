@@ -249,7 +249,7 @@ func TextGateway(c *gin.Context) {
 				usage = &dto.Usage{PromptTokens: estimatedInput, CompletionTokens: tokenkit.Count(info.TokenizerModel, info.ResponseFacts.GeneratedText)}
 			}
 			if usage != nil {
-				if !info.ResponseFacts.UsageReported {
+				if !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported {
 					usage.PromptTokens = estimatedInput
 				}
 				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens

@@ -235,7 +235,8 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		if difyResponse.Event == "message_end" {
 			usage = &difyResponse.MetaData.Usage
 			if info.ResponseFacts != nil {
-				info.ResponseFacts.UsageReported = relaycommon.HasReportedChatUsage([]byte(ojson.Get(data, "metadata").Raw))
+				info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported = relaycommon.ChatUsagePresence([]byte(ojson.Get(data, "metadata").Raw))
+				info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 			}
 			info.StreamStatus.MarkCompleted()
 			sr.Done()
@@ -269,7 +270,14 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	helper.Done(c)
 	if info.ResponseFacts != nil {
 		if !info.ResponseFacts.UsageReported {
-			usage = service.ResponseText2Usage(c, info.ResponseFacts.GeneratedText, info.TokenizerModelName(), info.GetEstimatePromptTokens())
+			estimated := service.ResponseText2Usage(c, info.ResponseFacts.GeneratedText, info.TokenizerModelName(), info.GetEstimatePromptTokens())
+			if !info.ResponseFacts.PromptTokensReported {
+				usage.PromptTokens = estimated.PromptTokens
+			}
+			if !info.ResponseFacts.CompletionTokensReported {
+				usage.CompletionTokens = estimated.CompletionTokens
+			}
+			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 		}
 	} else {
 		if usage.TotalTokens == 0 {
@@ -293,13 +301,21 @@ func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	if info.ResponseFacts != nil {
-		info.ResponseFacts.UsageReported = relaycommon.HasReportedChatUsage([]byte(ojson.GetBytes(responseBody, "metadata").Raw))
+		info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported = relaycommon.ChatUsagePresence([]byte(ojson.GetBytes(responseBody, "metadata").Raw))
+		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 		if resp.StatusCode != http.StatusOK {
 			return &difyResponse.MetaData.Usage, nil
 		}
 		info.ResponseFacts.GeneratedText = difyResponse.Answer
 		if !info.ResponseFacts.UsageReported {
-			difyResponse.MetaData.Usage = *service.ResponseText2Usage(c, difyResponse.Answer, info.TokenizerModelName(), info.GetEstimatePromptTokens())
+			estimated := service.ResponseText2Usage(c, difyResponse.Answer, info.TokenizerModelName(), info.GetEstimatePromptTokens())
+			if !info.ResponseFacts.PromptTokensReported {
+				difyResponse.MetaData.Usage.PromptTokens = estimated.PromptTokens
+			}
+			if !info.ResponseFacts.CompletionTokensReported {
+				difyResponse.MetaData.Usage.CompletionTokens = estimated.CompletionTokens
+			}
+			difyResponse.MetaData.Usage.TotalTokens = difyResponse.MetaData.Usage.PromptTokens + difyResponse.MetaData.Usage.CompletionTokens
 		}
 	}
 	fullTextResponse := dto.OpenAITextResponse{

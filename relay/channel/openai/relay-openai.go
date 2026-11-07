@@ -32,9 +32,11 @@ func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, fo
 			for _, choice := range frame.Choices {
 				business = business || choice.Delta.GetContentString() != "" || choice.Delta.GetReasoningContent() != "" || len(choice.Delta.ToolCalls) > 0
 			}
-			written := max(0, c.Writer.Size())
 			defer func() {
-				if business && (writeErr == nil || c.Writer.Size() > written) {
+				if writeErr != nil {
+					info.ResponseFacts.DownstreamWriteFailed = true
+				}
+				if business && writeErr == nil {
 					info.ResponseFacts.BusinessOutput = true
 				}
 			}()
@@ -152,10 +154,23 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 			}
 
 			lastStreamData = data
-			if info.ResponseFacts != nil && relaycommon.HasReportedChatUsage([]byte(data)) {
-				var frame dto.ChatCompletionsStreamResponse
-				if common.UnmarshalJsonStr(data, &frame) == nil {
-					reportedStreamUsage = frame.Usage
+			if info.ResponseFacts != nil {
+				prompt, completion := relaycommon.ChatUsagePresence([]byte(data))
+				if prompt || completion {
+					var frame dto.ChatCompletionsStreamResponse
+					if common.UnmarshalJsonStr(data, &frame) == nil && frame.Usage != nil {
+						snapshot := *frame.Usage
+						if !prompt && reportedStreamUsage != nil {
+							snapshot.PromptTokens = reportedStreamUsage.PromptTokens
+						}
+						if !completion && reportedStreamUsage != nil {
+							snapshot.CompletionTokens = reportedStreamUsage.CompletionTokens
+						}
+						snapshot.TotalTokens = snapshot.PromptTokens + snapshot.CompletionTokens
+						reportedStreamUsage = &snapshot
+						info.ResponseFacts.PromptTokensReported = info.ResponseFacts.PromptTokensReported || prompt
+						info.ResponseFacts.CompletionTokensReported = info.ResponseFacts.CompletionTokensReported || completion
+					}
 				}
 			}
 			observeStreamChoices(info, data, seenStreamToolCalls, &streamFunctionCallNames)
@@ -205,7 +220,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	}
 
 	if info.ResponseFacts != nil {
-		containStreamUsage = reportedStreamUsage != nil
+		containStreamUsage = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 		info.ResponseFacts.UsageReported = containStreamUsage
 		info.ResponseFacts.GeneratedText = responseTextBuilder.String()
 		if containStreamUsage {
@@ -215,6 +230,15 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	if !containStreamUsage {
 		usage = service.ResponseText2Usage(c, responseTextBuilder.String(), info.TokenizerModelName(), info.GetEstimatePromptTokens())
 		usage.CompletionTokens += toolCount * 7
+		if info.ResponseFacts != nil && reportedStreamUsage != nil {
+			if info.ResponseFacts.PromptTokensReported {
+				usage.PromptTokens = reportedStreamUsage.PromptTokens
+			}
+			if info.ResponseFacts.CompletionTokensReported {
+				usage.CompletionTokens = reportedStreamUsage.CompletionTokens
+			}
+			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+		}
 	}
 
 	applyProtocolUsagePostProcessing(c, info, usage, common.StringToByteSlice(usageFrame))
@@ -307,7 +331,8 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	}
 
 	if info.ResponseFacts != nil {
-		info.ResponseFacts.UsageReported = relaycommon.HasReportedChatUsage(responseBody)
+		info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported = relaycommon.ChatUsagePresence(responseBody)
+		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 	}
 	var responseErr *types.NewAPIError
 	if oaiError := simpleResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
@@ -347,7 +372,7 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	usageModified := false
 	reportedUsage := ojson.GetBytes(responseBody, "usage").IsObject()
 	if info.ResponseFacts != nil {
-		reportedUsage = relaycommon.HasReportedChatUsage(responseBody)
+		reportedUsage = info.ResponseFacts.UsageReported
 		info.ResponseFacts.UsageReported = reportedUsage
 		var output strings.Builder
 		for _, choice := range simpleResponse.Choices {
@@ -363,7 +388,7 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	}
 	if (simpleResponse.Usage.PromptTokens == 0 && (info.UpstreamProtocol == "" || !reportedUsage)) || info.ResponseFacts != nil && !reportedUsage {
 		completionTokens := simpleResponse.Usage.CompletionTokens
-		if completionTokens == 0 {
+		if completionTokens == 0 && (info.ResponseFacts == nil || !info.ResponseFacts.CompletionTokensReported) {
 			for _, choice := range simpleResponse.Choices {
 				var output strings.Builder
 				output.WriteString(choice.Message.StringContent())
@@ -378,10 +403,14 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 				completionTokens += tokenkit.Count(info.TokenizerModelName(), output.String())
 			}
 		}
+		promptTokens := info.GetEstimatePromptTokens()
+		if info.ResponseFacts != nil && info.ResponseFacts.PromptTokensReported {
+			promptTokens = simpleResponse.Usage.PromptTokens
+		}
 		fallbackUsage := &dto.Usage{
-			PromptTokens:     info.GetEstimatePromptTokens(),
+			PromptTokens:     promptTokens,
 			CompletionTokens: completionTokens,
-			TotalTokens:      info.GetEstimatePromptTokens() + completionTokens,
+			TotalTokens:      promptTokens + completionTokens,
 		}
 		simpleResponse.Usage = *fallbackUsage
 		usageModified = true

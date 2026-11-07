@@ -202,12 +202,21 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		created = toUnix(chunk.CreatedAt)
 
 		if chunk.PromptEvalCount != nil || chunk.EvalCount != nil {
-			usage.PromptTokens = lo.FromPtr(chunk.PromptEvalCount)
-			usage.CompletionTokens = lo.FromPtr(chunk.EvalCount)
-			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
-			if info.ResponseFacts != nil {
-				info.ResponseFacts.UsageReported = true
+			if info.ResponseFacts == nil {
+				usage.PromptTokens = lo.FromPtr(chunk.PromptEvalCount)
+				usage.CompletionTokens = lo.FromPtr(chunk.EvalCount)
+			} else {
+				if count := chunk.PromptEvalCount; count != nil && *count >= 0 && *count <= 1<<31-1 {
+					usage.PromptTokens = *count
+					info.ResponseFacts.PromptTokensReported = true
+				}
+				if count := chunk.EvalCount; count != nil && *count >= 0 && *count <= 1<<31-1 {
+					usage.CompletionTokens = *count
+					info.ResponseFacts.CompletionTokensReported = true
+				}
+				info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 			}
+			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 		}
 		if delta, hasPayload := buildOllamaStreamDelta(&chunk, responseId, created, model, &toolCallIndex); hasPayload {
 			if err := sendOllamaDelta(c, info, delta); err != nil {
@@ -220,7 +229,14 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		info.StreamStatus.MarkCompleted()
 		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 		if info.ResponseFacts != nil && !info.ResponseFacts.UsageReported {
-			usage = service.ResponseText2Usage(c, info.ResponseFacts.GeneratedText, info.TokenizerModelName(), info.GetEstimatePromptTokens())
+			estimated := service.ResponseText2Usage(c, info.ResponseFacts.GeneratedText, info.TokenizerModelName(), info.GetEstimatePromptTokens())
+			if !info.ResponseFacts.PromptTokensReported {
+				usage.PromptTokens = estimated.PromptTokens
+			}
+			if !info.ResponseFacts.CompletionTokensReported {
+				usage.CompletionTokens = estimated.CompletionTokens
+			}
+			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 		}
 		finishReason := chunk.DoneReason
 		if finishReason == "" {
@@ -250,7 +266,14 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		return usage, types.NewError(fmt.Errorf("Ollama stream read failed"), types.ErrorCodeBadResponseBody)
 	}
 	if info.ResponseFacts != nil && !info.ResponseFacts.UsageReported {
-		usage = service.ResponseText2Usage(c, info.ResponseFacts.GeneratedText, info.TokenizerModelName(), info.GetEstimatePromptTokens())
+		estimated := service.ResponseText2Usage(c, info.ResponseFacts.GeneratedText, info.TokenizerModelName(), info.GetEstimatePromptTokens())
+		if !info.ResponseFacts.PromptTokensReported {
+			usage.PromptTokens = estimated.PromptTokens
+		}
+		if !info.ResponseFacts.CompletionTokensReported {
+			usage.CompletionTokens = estimated.CompletionTokens
+		}
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	}
 	return usage, nil
 }
@@ -368,7 +391,9 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		msg.ReasoningContent = &rc
 	}
 	if info.ResponseFacts != nil {
-		info.ResponseFacts.UsageReported = lastChunk.PromptEvalCount != nil || lastChunk.EvalCount != nil
+		info.ResponseFacts.PromptTokensReported = lastChunk.PromptEvalCount != nil && *lastChunk.PromptEvalCount >= 0 && *lastChunk.PromptEvalCount <= 1<<31-1
+		info.ResponseFacts.CompletionTokensReported = lastChunk.EvalCount != nil && *lastChunk.EvalCount >= 0 && *lastChunk.EvalCount <= 1<<31-1
+		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 		var output strings.Builder
 		output.WriteString(content)
 		output.WriteString(msg.GetReasoningContent())
@@ -378,7 +403,14 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		}
 		info.ResponseFacts.GeneratedText = output.String()
 		if !info.ResponseFacts.UsageReported {
-			usage = service.ResponseText2Usage(c, output.String(), info.TokenizerModelName(), info.GetEstimatePromptTokens())
+			estimated := service.ResponseText2Usage(c, output.String(), info.TokenizerModelName(), info.GetEstimatePromptTokens())
+			if !info.ResponseFacts.PromptTokensReported {
+				usage.PromptTokens = estimated.PromptTokens
+			}
+			if !info.ResponseFacts.CompletionTokensReported {
+				usage.CompletionTokens = estimated.CompletionTokens
+			}
+			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 		}
 	}
 	full := dto.OpenAITextResponse{
