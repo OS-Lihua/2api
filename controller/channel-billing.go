@@ -14,10 +14,8 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/advancedcustom"
-	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	relayconstant "github.com/QuantumNous/new-api/relay/constant"
-	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -537,18 +535,13 @@ func updateChannelNewAPIBalance(channel *model.Provider) (float64, error) {
 
 func fetchAdvancedCustomBalance(channel *model.Provider) (providerBalanceResult, error) {
 	key := strings.TrimSpace(channel.Key)
-	info := &relaycommon.RelayInfo{
-		RelayFormat:    types.RelayFormatOpenAI,
-		RelayMode:      relayconstant.RelayModeUnknown,
-		RequestURLPath: dto.AdvancedCustomBalancePath,
-		ProviderMeta: &relaycommon.ProviderMeta{
-			ChannelType:          constant.ChannelTypeAdvancedCustom,
-			ChannelBaseUrl:       channel.GetBaseURL(),
-			ApiKey:               key,
-			ChannelOtherSettings: channel.GetOtherSettings(),
-		},
+	metadata := &relaychannel.ProviderRequest{
+		ChannelType:          constant.ChannelTypeAdvancedCustom,
+		ChannelBaseUrl:       channel.GetBaseURL(),
+		ApiKey:               key,
+		ChannelOtherSettings: relaychannel.ProviderAccountSettings{AdvancedCustom: channel.GetOtherSettings().AdvancedCustom},
 	}
-	requestURL, headers, err := (&advancedcustom.Adaptor{}).BuildBalanceRequest(info)
+	requestURL, headers, err := (&advancedcustom.Provider{}).BuildBalanceRequest(metadata)
 	if err != nil {
 		return providerBalanceResult{}, sanitizeFetchModelsError(err, key)
 	}

@@ -41,7 +41,7 @@ func getZhipuToken(apikey string) string {
 
 	split := strings.Split(apikey, ".")
 	if len(split) != 2 {
-		common.SysLog(common.LogText("invalid zhipu key: %s", apikey))
+		common.SysLog(common.LogText("invalid zhipu key"))
 		return ""
 	}
 

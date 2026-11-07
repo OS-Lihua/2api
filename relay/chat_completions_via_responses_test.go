@@ -6,10 +6,12 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/protocol"
 	openaichannel "github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
@@ -21,6 +23,165 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestChannelProtocolSelectsConversionIndependentlyOfProvider(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		apiType     int
+		channelType int
+		upstream    protocol.Type
+		path        string
+		authHeader  string
+		auth        string
+		response    string
+		bodyField   string
+	}{
+		{"deepseek chat", constant.APITypeDeepSeek, constant.ChannelTypeDeepSeek, protocol.OpenAIChat, "/v1/chat/completions", "Authorization", "Bearer provider-key", `{"id":"chat_1","object":"chat.completion","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`, "messages"},
+		{"deepseek messages", constant.APITypeDeepSeek, constant.ChannelTypeDeepSeek, protocol.AnthropicMessages, "/anthropic/v1/messages", "Authorization", "Bearer provider-key", `{"id":"msg_1","type":"message","role":"assistant","model":"test-model","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":2}}`, "messages"},
+		{"deepseek responses", constant.APITypeDeepSeek, constant.ChannelTypeDeepSeek, protocol.OpenAIResponses, "/responses", "Authorization", "Bearer provider-key", `{"id":"resp_1","object":"response","status":"completed","model":"test-model","output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}`, "input"},
+		{"openai messages", constant.APITypeOpenAI, constant.ChannelTypeOpenAI, protocol.AnthropicMessages, "/v1/messages", "Authorization", "Bearer provider-key", `{"id":"msg_1","type":"message","role":"assistant","model":"test-model","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":2}}`, "messages"},
+		{"openai gemini", constant.APITypeOpenAI, constant.ChannelTypeOpenAI, protocol.GeminiGenerate, "/v1beta/models/test-model:generateContent", "Authorization", "Bearer provider-key", `{"candidates":[{"content":{"parts":[{"text":"ok"}],"role":"model"},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2,"totalTokenCount":5}}`, "contents"},
+		{"azure chat", constant.APITypeOpenAI, constant.ChannelTypeAzure, protocol.OpenAIChat, "/openai/deployments/test-model/chat/completions", "api-key", "provider-key", `{"id":"chat_1","object":"chat.completion","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`, "messages"},
+		{"custom header", constant.APITypeAdvancedCustom, constant.ChannelTypeAdvancedCustom, protocol.OpenAIChat, "/merchant/chat", "X-Provider-Secret", "provider-key", `{"id":"chat_1","object":"chat.completion","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`, "messages"},
+		{"openai chat", constant.APITypeOpenAI, constant.ChannelTypeOpenAI, protocol.OpenAIChat, "/v1/chat/completions", "Authorization", "Bearer provider-key", `{"id":"chat_1","object":"chat.completion","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`, "messages"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			captured := make(chan []byte, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, tc.path, r.URL.Path)
+				assert.Equal(t, tc.auth, r.Header.Get(tc.authHeader))
+				if tc.channelType == constant.ChannelTypeAzure {
+					assert.Equal(t, constant.AzureDefaultAPIVersion, r.URL.Query().Get("api-version"))
+				}
+				assert.Empty(t, r.Header.Get("Cookie"))
+				body, err := io.ReadAll(r.Body)
+				assert.NoError(t, err)
+				captured <- body
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tc.response)
+			}))
+			defer server.Close()
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}"))
+			c.Request.Header.Set("Content-Type", "application/json")
+			info := &relaycommon.RelayInfo{
+				RelayMode:              relayconstant.RelayModeChatCompletions,
+				RelayFormat:            relaytypes.RelayFormatOpenAI,
+				OriginModelName:        "test-model",
+				RequestURLPath:         "/v1/chat/completions",
+				RequestConversionChain: []relaytypes.RelayFormat{relaytypes.RelayFormatOpenAI},
+				ProviderMeta:           &relaycommon.ProviderMeta{ChannelType: tc.channelType, ApiType: tc.apiType, ChannelBaseUrl: server.URL, ApiKey: "provider-key", UpstreamModelName: "test-model"},
+			}
+			if tc.apiType == constant.APITypeAdvancedCustom {
+				info.ChannelOtherSettings.AdvancedCustom = &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{
+					IncomingPath: "/v1/chat/completions", UpstreamPath: "/merchant/chat", Converter: relayconvert.ConverterNone,
+					Auth: &dto.AdvancedCustomRouteAuth{Type: dto.AdvancedCustomAuthTypeHeader, Name: "X-Provider-Secret", Value: "{api_key}"},
+				}}}
+			}
+			adaptor, err := GetChannelAdaptor(tc.apiType, tc.upstream)
+			require.NoError(t, err)
+			zero := 0.0
+			request, err := adaptor.ConvertRequest(c, info, &dto.GeneralOpenAIRequest{Model: "test-model", Messages: []dto.Message{{Role: "user", Content: "hello"}}, Temperature: &zero})
+			require.NoError(t, err)
+			body, err := common.Marshal(request)
+			require.NoError(t, err)
+			response, err := adaptor.DoRequest(c, info, strings.NewReader(string(body)))
+			require.NoError(t, err)
+			usage, apiErr := adaptor.DoResponse(c, response.(*http.Response), info)
+			require.Nil(t, apiErr)
+			require.IsType(t, &dto.Usage{}, usage)
+			assert.Equal(t, 3, usage.(*dto.Usage).PromptTokens)
+			assert.Equal(t, 2, usage.(*dto.Usage).CompletionTokens)
+			assert.Contains(t, recorder.Body.String(), "ok")
+			var upstreamBody map[string]any
+			require.NoError(t, common.Unmarshal(<-captured, &upstreamBody))
+			assert.Contains(t, upstreamBody, tc.bodyField)
+			if tc.upstream == protocol.GeminiGenerate {
+				require.Contains(t, upstreamBody, "generationConfig")
+				assert.Equal(t, float64(0), upstreamBody["generationConfig"].(map[string]any)["temperature"])
+			} else {
+				assert.Equal(t, float64(0), upstreamBody["temperature"])
+			}
+		})
+	}
+}
+
+func TestChannelProtocolPreservesReportedZeroUsage(t *testing.T) {
+	originalTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = originalTimeout })
+	for _, tc := range []struct {
+		name     string
+		protocol protocol.Type
+		stream   bool
+		response string
+	}{
+		{"chat JSON", protocol.OpenAIChat, false, `{"id":"chat_1","object":"chat.completion","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`},
+		{"responses JSON", protocol.OpenAIResponses, false, `{"id":"resp_1","object":"response","status":"completed","model":"test-model","output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}`},
+		{"chat SSE", protocol.OpenAIChat, true, "data: {\"id\":\"chat_1\",\"object\":\"chat.completion.chunk\",\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: {\"id\":\"chat_1\",\"object\":\"chat.completion.chunk\",\"model\":\"test-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\ndata: [DONE]\n\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if tc.stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+				}
+				_, _ = io.WriteString(w, tc.response)
+			}))
+			defer server.Close()
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}"))
+			c.Request.Header.Set("Content-Type", "application/json")
+			info := &relaycommon.RelayInfo{
+				RelayMode: relayconstant.RelayModeChatCompletions, RelayFormat: relaytypes.RelayFormatOpenAI,
+				OriginModelName: "test-model", RequestURLPath: "/v1/chat/completions",
+				RequestConversionChain: []relaytypes.RelayFormat{relaytypes.RelayFormatOpenAI},
+				ProviderMeta:           &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeOpenAI, ApiType: constant.APITypeOpenAI, ChannelBaseUrl: server.URL, ApiKey: "provider-key", UpstreamModelName: "test-model"},
+			}
+			info.IsStream = tc.stream
+			info.ShouldIncludeUsage = true
+			info.SetEstimatePromptTokens(100)
+			adaptor, err := GetChannelAdaptor(constant.APITypeOpenAI, tc.protocol)
+			require.NoError(t, err)
+			request, err := adaptor.ConvertRequest(c, info, &dto.GeneralOpenAIRequest{Model: "test-model", Stream: &tc.stream, Messages: []dto.Message{{Role: "user", Content: "hello"}}})
+			require.NoError(t, err)
+			encoded, err := common.Marshal(request)
+			require.NoError(t, err)
+			response, err := adaptor.DoRequest(c, info, strings.NewReader(string(encoded)))
+			require.NoError(t, err)
+			usage, apiErr := adaptor.DoResponse(c, response.(*http.Response), info)
+			require.Nil(t, apiErr)
+			require.IsType(t, &dto.Usage{}, usage)
+			assert.Zero(t, usage.(*dto.Usage).PromptTokens)
+			assert.Zero(t, usage.(*dto.Usage).CompletionTokens)
+			assert.Zero(t, usage.(*dto.Usage).TotalTokens)
+			if tc.stream {
+				assert.Contains(t, recorder.Body.String(), `"total_tokens":0`)
+			} else {
+				var delivered dto.OpenAITextResponse
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &delivered))
+				assert.Zero(t, delivered.Usage.TotalTokens)
+			}
+		})
+	}
+}
+
+func TestChannelProtocolDoesNotExposeDestinationSecrets(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}"))
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{
+		ChannelType: constant.ChannelTypeOpenAI, ChannelBaseUrl: "http://[invalid/?api_key=key-secret&session=url-secret",
+		ApiKey: "key-secret", UpstreamModelName: "test-model",
+	}}
+	adaptor, err := GetChannelAdaptor(constant.APITypeOpenAI, protocol.OpenAIChat)
+	require.NoError(t, err)
+	_, err = adaptor.DoRequest(c, info, strings.NewReader("{}"))
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "key-secret")
+	assert.NotContains(t, err.Error(), "url-secret")
+}
 
 func TestPrepareResponsesRequestRetainsConvertedAdaptor(t *testing.T) {
 	type capturedRequest struct {

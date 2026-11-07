@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/protocol"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
@@ -124,7 +125,10 @@ type RelayInfo struct {
 	UserEmail           string
 	UserQuota           int
 	RelayFormat         types.RelayFormat
-	SendResponseCount   int
+	// UpstreamProtocol is set only by the explicit Channel adapter entry point.
+	// Legacy relays leave it empty and retain their existing usage fallbacks.
+	UpstreamProtocol  protocol.Type
+	SendResponseCount int
 	// ClaudeToChatStreamState / ChatToGeminiStreamState hold per-attempt
 	// stream converters. InitChannelMeta nils them so a retry cannot resume a
 	// dirty converter (advanced tool index / finalized).
