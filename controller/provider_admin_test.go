@@ -68,11 +68,16 @@ func newProviderAdminEngine(t *testing.T) *gin.Engine {
 // credential, whatever the route.
 func callProviderAPI(t *testing.T, engine *gin.Engine, method, path, body string) providerAPIReply {
 	t.Helper()
+	return callProviderAPIStatus(t, engine, http.StatusOK, method, path, body)
+}
+
+func callProviderAPIStatus(t *testing.T, engine *gin.Engine, wantStatus int, method, path, body string) providerAPIReply {
+	t.Helper()
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(method, "/api/admin/v1/providers"+path, strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	engine.ServeHTTP(recorder, request)
-	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	require.Equal(t, wantStatus, recorder.Code, recorder.Body.String())
 	for _, secret := range []string{"sk-provider", `"key":`, "key_preview"} {
 		assert.NotContains(t, recorder.Body.String(), secret, "%s %s", method, path)
 	}
@@ -140,7 +145,7 @@ func TestProviderAdminAPIManagesProviderWithWriteOnlyKeys(t *testing.T) {
 
 	deleted := callProviderAPI(t, engine, http.MethodDelete, path, "")
 	require.True(t, deleted.Success, deleted.Message)
-	missing := callProviderAPI(t, engine, http.MethodGet, path, "")
+	missing := callProviderAPIStatus(t, engine, http.StatusNotFound, http.MethodGet, path, "")
 	assert.False(t, missing.Success)
 }
 
@@ -168,7 +173,7 @@ func TestProviderAdminAPIRefreshesBalance(t *testing.T) {
 	assert.InDelta(t, 1.5, storedProvider(t, provider.Id).Balance, 1e-9)
 }
 
-func TestProviderAdminAPIForwardsLegacyValidationErrors(t *testing.T) {
+func TestProviderAdminAPIRejectsInvalidRequestsWithBadRequest(t *testing.T) {
 	engine := newProviderAdminEngine(t)
 	provider := &model.Provider{Type: constant.ChannelTypeOpenAI, Key: providerKeyA, Name: "single key account", Models: "gpt-test", Group: "default"}
 	require.NoError(t, provider.Insert())
@@ -184,7 +189,7 @@ func TestProviderAdminAPIForwardsLegacyValidationErrors(t *testing.T) {
 		{name: "invalid id", method: http.MethodGet, path: "/abc", body: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			reply := callProviderAPI(t, engine, tc.method, tc.path, tc.body)
+			reply := callProviderAPIStatus(t, engine, http.StatusBadRequest, tc.method, tc.path, tc.body)
 			assert.False(t, reply.Success)
 			assert.NotEmpty(t, reply.Message)
 		})

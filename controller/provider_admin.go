@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -18,7 +19,8 @@ import (
 // The /api/admin/v1/providers handlers reuse the /api/channel handlers so both
 // APIs keep the same validation, permission checks, cache refresh, and audit
 // records until the legacy routes are removed. The credential is write-only:
-// no response of this API contains a key or a part of one.
+// no response of this API contains a key or a part of one. A rejected request
+// answers 400, a missing Provider 404, and an internal failure 500.
 
 // providerView is a Provider as this API returns it. The shallower Key field
 // hides the embedded credential and is always empty, so it is omitted.
@@ -52,9 +54,14 @@ type legacyProviderReply struct {
 	Raw     string          `json:"raw_response"`
 }
 
-// forward writes the reply unchanged; failures keep the legacy message fields.
+// forward writes the reply body unchanged, so failures keep the legacy
+// message fields. A failure the legacy handler sent as 200 becomes 400.
 func (reply *legacyProviderReply) forward(c *gin.Context) {
-	c.Data(reply.status, "application/json; charset=utf-8", reply.body)
+	status := reply.status
+	if !reply.Success && status < http.StatusBadRequest {
+		status = http.StatusBadRequest
+	}
+	c.Data(status, "application/json; charset=utf-8", reply.body)
 }
 
 type bufferedResponseWriter struct {
@@ -104,7 +111,7 @@ func runLegacyProviderHandler(c *gin.Context, handler gin.HandlerFunc, body any,
 func providerIDParam(c *gin.Context) (int, bool) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
-		common.ApiErrorT(c, "Invalid parameters")
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
 		return 0, false
 	}
 	return id, true
@@ -112,8 +119,12 @@ func providerIDParam(c *gin.Context) (int, bool) {
 
 func respondProvider(c *gin.Context, id int) {
 	provider, err := model.GetProviderById(id, false)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		common.ApiErrorStatus(c, http.StatusNotFound, common.NewMessage("Channel does not exist"))
+		return
+	}
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
 		return
 	}
 	clearChannelInfo(provider)
@@ -130,7 +141,7 @@ func ListProviders(c *gin.Context) {
 	if value := c.Query("type"); value != "" {
 		parsed, err := strconv.Atoi(value)
 		if err != nil {
-			common.ApiErrorT(c, "Invalid parameters")
+			common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
 			return
 		}
 		typeFilter = parsed
@@ -143,14 +154,14 @@ func ListProviders(c *gin.Context) {
 
 	var total int64
 	if err := query.Session(&gorm.Session{}).Count(&total).Error; err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
 		return
 	}
 	providers := make([]*model.Provider, 0)
 	if err := sortOptions.Apply(query).Omit("key").
 		Limit(pageInfo.GetPageSize()).Offset(pageInfo.GetStartIdx()).
 		Find(&providers).Error; err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
 		return
 	}
 	items := make([]providerView, 0, len(providers))
@@ -180,11 +191,11 @@ func GetProvider(c *gin.Context) {
 func CreateProvider(c *gin.Context) {
 	var request createProviderRequest
 	if err := c.ShouldBindJSON(&request); err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorStatus(c, http.StatusBadRequest, err)
 		return
 	}
 	if len(request.Provider) == 0 {
-		common.ApiErrorT(c, "Invalid parameters")
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
 		return
 	}
 	if request.Mode == "" {
@@ -197,7 +208,7 @@ func CreateProvider(c *gin.Context) {
 		"channel":                         request.Provider,
 	}, nil)
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
 		return
 	}
 	if !reply.Success {
@@ -208,7 +219,7 @@ func CreateProvider(c *gin.Context) {
 		IDs []int `json:"ids"`
 	}
 	if err := common.Unmarshal(reply.Data, &created); err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
 		return
 	}
 	common.ApiSuccess(c, gin.H{"ids": created.IDs})
@@ -224,7 +235,7 @@ func UpdateProvider(c *gin.Context) {
 	}
 	var fields map[string]json.RawMessage
 	if err := c.ShouldBindJSON(&fields); err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorStatus(c, http.StatusBadRequest, err)
 		return
 	}
 	if fields == nil {
@@ -233,7 +244,7 @@ func UpdateProvider(c *gin.Context) {
 	fields["id"] = json.RawMessage(strconv.Itoa(id))
 	reply, err := runLegacyProviderHandler(c, UpdateChannel, fields, nil)
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
 		return
 	}
 	if !reply.Success {
@@ -250,7 +261,7 @@ func DeleteProvider(c *gin.Context) {
 	}
 	reply, err := runLegacyProviderHandler(c, DeleteChannel, nil, gin.Params{{Key: "id", Value: strconv.Itoa(id)}})
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
 		return
 	}
 	reply.forward(c)
@@ -263,7 +274,7 @@ func setProviderStatus(c *gin.Context, status int) {
 	}
 	reply, err := runLegacyProviderHandler(c, UpdateChannelStatus, ProviderStatusRequest{Status: status}, gin.Params{{Key: "id", Value: strconv.Itoa(id)}})
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
 		return
 	}
 	if !reply.Success {
@@ -291,7 +302,7 @@ func RefreshProviderBalance(c *gin.Context) {
 	}
 	reply, err := runLegacyProviderHandler(c, UpdateChannelBalance, nil, gin.Params{{Key: "id", Value: strconv.Itoa(id)}})
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
 		return
 	}
 	if !reply.Success {
@@ -313,7 +324,7 @@ func manageProviderKeys(c *gin.Context, request MultiKeyManageRequest) (*legacyP
 	request.ChannelId = id
 	reply, err := runLegacyProviderHandler(c, ManageMultiKeys, request, nil)
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
 		return nil, false
 	}
 	if !reply.Success {
@@ -332,7 +343,7 @@ func ListProviderKeys(c *gin.Context) {
 	if value := c.Query("status"); value != "" {
 		status, err := strconv.Atoi(value)
 		if err != nil {
-			common.ApiErrorT(c, "Invalid parameters")
+			common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
 			return
 		}
 		request.Status = &status
@@ -343,7 +354,7 @@ func ListProviderKeys(c *gin.Context) {
 	}
 	var keyStatus MultiKeyStatusResponse
 	if err := common.Unmarshal(reply.Data, &keyStatus); err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
 		return
 	}
 	keys := make([]providerKeyView, 0, len(keyStatus.Keys))
@@ -370,7 +381,7 @@ func providerKeyAction(action string, perKey bool) gin.HandlerFunc {
 		if perKey {
 			index, err := strconv.Atoi(c.Param("index"))
 			if err != nil || index < 0 {
-				common.ApiErrorT(c, "Invalid parameters")
+				common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
 				return
 			}
 			request.KeyIndex = &index
