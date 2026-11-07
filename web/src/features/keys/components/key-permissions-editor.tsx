@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -50,15 +50,10 @@ import {
   type KeyPermissions,
 } from '../api'
 
-const schema = z.object({
-  default_allow: z.boolean(),
-  exception_ids: z.array(z.number().int().positive()).max(1000),
-  revision: z.number().int().nonnegative(),
-})
-
 export function KeyPermissionsEditor(props: {
   tokenId: number
   onSaved: () => void
+  onDirtyChange?: (dirty: boolean) => void
 }) {
   const [reloadCount, setReloadCount] = useState(0)
   const query = useQuery({
@@ -89,6 +84,7 @@ export function KeyPermissionsEditor(props: {
       permissions={query.data.permissions}
       choices={query.data.choices}
       onSaved={props.onSaved}
+      onDirtyChange={props.onDirtyChange}
       onReload={() => {
         void query.refetch().then((result) => {
           if (result.isSuccess) setReloadCount((count) => count + 1)
@@ -105,6 +101,7 @@ function KeyPermissionsForm(props: {
   permissions: KeyPermissions
   choices: KeyOfferingChoice[]
   onSaved: () => void
+  onDirtyChange?: (dirty: boolean) => void
   onReload: () => void
   reloading: boolean
   title: string
@@ -112,10 +109,30 @@ function KeyPermissionsForm(props: {
   const { t } = useTranslation()
   const client = useQueryClient()
   const [confirm, setConfirm] = useState(false)
+  const schema = useMemo(
+    () =>
+      z.object({
+        default_allow: z.boolean(),
+        exception_ids: z
+          .array(z.number().int().positive())
+          .max(
+            1000,
+            t('Select at most {{max}} Offering exceptions', { max: 1000 })
+          ),
+        revision: z.number().int().nonnegative(),
+      }),
+    [t]
+  )
   const form = useForm<KeyPermissions>({
     resolver: zodResolver(schema),
     defaultValues: props.permissions,
   })
+  const dirty = form.formState.isDirty
+  const onDirtyChange = props.onDirtyChange
+  useEffect(() => {
+    onDirtyChange?.(dirty)
+    return () => onDirtyChange?.(false)
+  }, [dirty, onDirtyChange])
   const allow = form.watch('default_allow')
   const choices = props.choices.map((choice) => ({
     value: String(choice.id),

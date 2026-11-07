@@ -112,6 +112,7 @@ export function ApiKeysMutateDrawer({
   const { triggerRefresh } = useApiKeys()
   const { status, loading: statusLoading } = useStatus()
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [permissionsDirty, setPermissionsDirty] = useState(false)
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [initializedTarget, setInitializedTarget] = useState<string | null>(
     null
@@ -279,6 +280,12 @@ export function ApiKeysMutateDrawer({
   }, [groups, form, selectedGroup])
 
   const onSubmit = async (data: ApiKeyFormValues) => {
+    if (permissionsDirty) {
+      toast.error(
+        t('Save or reload Key permissions before saving other settings.')
+      )
+      return
+    }
     setIsSubmitting(true)
     try {
       const basePayload = transformFormDataToPayload(data)
@@ -665,6 +672,7 @@ export function ApiKeysMutateDrawer({
                 <KeyPermissionsEditor
                   tokenId={currentRow.id}
                   onSaved={triggerRefresh}
+                  onDirtyChange={setPermissionsDirty}
                 />
               ) : (
                 <p className='text-muted-foreground text-sm'>
@@ -759,6 +767,13 @@ export function ApiKeysMutateDrawer({
           </form>
         </Form>
         <SheetFooter className={sideDrawerFooterClassName()}>
+          {permissionsDirty && (
+            <p role='status' className='text-muted-foreground text-xs'>
+              {t(
+                'Save or reload Key permissions before saving other settings.'
+              )}
+            </p>
+          )}
           <SheetClose
             render={<Button variant='outline' className='w-full sm:w-auto' />}
           >
@@ -767,7 +782,7 @@ export function ApiKeysMutateDrawer({
           <Button
             type='button'
             onClick={form.handleSubmit(onSubmit, onInvalid)}
-            disabled={!isFormInitialized || isSubmitting}
+            disabled={!isFormInitialized || isSubmitting || permissionsDirty}
             className='w-full sm:w-auto'
           >
             {isSubmitting ? t('Saving...') : t('Save changes')}

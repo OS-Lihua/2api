@@ -13,6 +13,8 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -154,6 +156,11 @@ func TestKeyPermissionsAdminAndSessionAuthorization(t *testing.T) {
 
 func TestKeyPermissionsIdentityVisibilityAndDeletion(t *testing.T) {
 	f := newTextGatewayFixture(t, func(http.ResponseWriter, *http.Request) { t.Error("unexpected dispatch") })
+	cache := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: cache.Addr()})
+	oldEnabled, oldClient := common.RedisEnabled, common.RDB
+	common.RedisEnabled, common.RDB = true, client
+	t.Cleanup(func() { common.RedisEnabled, common.RDB = oldEnabled, oldClient; require.NoError(t, client.Close()) })
 	pat := createWalletTestAccessToken(t, f.user.Id, "api_key:read", "api_key:write")
 	endpoint := fmt.Sprintf("/api/token/%d/permissions", f.token.Id)
 	response := adminSecurityRequest(f.engine, pat, http.MethodPut, endpoint, fmt.Sprintf(`{"default_allow":false,"exception_ids":[%d],"revision":0}`, f.offering.ID))
@@ -229,6 +236,23 @@ func TestKeyPermissionsListDetailAndCall(t *testing.T) {
 	call = adminSecurityRequest(f.engine, f.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}]}`)
 	assert.Equal(t, 200, call.Code, call.Body.String())
 	assert.Equal(t, 1, calls)
+	// A default-allow Key uses exceptions to deny exactly these identities.
+	opened = adminSecurityRequest(f.engine, pat, http.MethodPut, endpoint, fmt.Sprintf(`{"default_allow":true,"exception_ids":[%d],"revision":2}`, f.offering.ID))
+	require.Equal(t, 200, opened.Code, opened.Body.String())
+	for _, path := range []string{"/v1/models/gateway-offering", "/v1/models/gateway-alias"} {
+		response := adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, path, "")
+		assert.Equal(t, 404, response.Code, response.Body.String())
+	}
+	list = adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, "/v1/models", "")
+	assert.Contains(t, list.Body.String(), `"data":[]`)
+	call = adminSecurityRequest(f.engine, f.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}]}`)
+	assert.Equal(t, 404, call.Code, call.Body.String())
+	assert.Equal(t, 1, calls)
+	records := adminSecurityRequest(f.engine, f.userPAT, http.MethodGet, "/api/requests/self", "")
+	require.Equal(t, 200, records.Code, records.Body.String())
+	var logged walletAPIResponse
+	require.NoError(t, common.Unmarshal(records.Body.Bytes(), &logged))
+	assert.EqualValues(t, 1, logged.Data["total"], "denied calls must not create billable request records")
 }
 
 func TestKeyPermissionsOperations(t *testing.T) {
@@ -265,6 +289,21 @@ func TestKeyPermissionsOperations(t *testing.T) {
 	assert.Equal(t, http.StatusConflict, stale.Code, stale.Body.String())
 	readOnly := createWalletTestAccessToken(t, f.user.Id, "api_key:read")
 	assert.Equal(t, 403, adminSecurityRequest(f.engine, readOnly, http.MethodPatch, endpoint, `{"action":"allow_all"}`).Code)
+	entries, _, err := model.GetAuditLogs(model.AuditLogFilter{UserId: f.user.Id, Category: model.AuditCategorySecurity}, 0, 100, common.RoleRootUser)
+	require.NoError(t, err)
+	var success, failure bool
+	for _, entry := range entries {
+		if entry.Action == "token.permissions.update" {
+			success = success || entry.Success
+			failure = failure || !entry.Success
+		}
+	}
+	assert.True(t, success, "successful permission changes must leave audit events")
+	assert.True(t, failure, "rejected stale writes must leave audit events")
+	encoded, err := common.Marshal(entries)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), pat)
+	assert.NotContains(t, string(encoded), f.token.Key)
 }
 
 func TestKeyPermissionsDefaultAndOwnership(t *testing.T) {
@@ -294,4 +333,11 @@ func TestKeyPermissionsDefaultAndOwnership(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, denied.Code)
 	assert.Equal(t, missing.Code, denied.Code)
 	assert.JSONEq(t, missing.Body.String(), denied.Body.String())
+	for _, method := range []string{http.MethodPut, http.MethodPatch} {
+		body := fmt.Sprintf(`{"action":"deny_all","default_allow":false,"exception_ids":[],"revision":0,"user_id":%d,"token_id":%d}`, f.user.Id, f.token.Id)
+		denied = adminSecurityRequest(f.engine, otherPAT, method, endpoint, body)
+		missing = adminSecurityRequest(f.engine, otherPAT, method, "/api/token/999999/permissions", body)
+		assert.Equal(t, 404, denied.Code, denied.Body.String())
+		assert.JSONEq(t, missing.Body.String(), denied.Body.String())
+	}
 }

@@ -356,6 +356,19 @@ describe('API key expiry across editing sessions', () => {
       await waitFor(() => expect(screen.getByLabelText('Time')).toBeEnabled())
 
       if (finish === 'save') {
+        const policy = await screen.findByRole('combobox', {
+          name: 'Default policy',
+        })
+        fireEvent.change(policy, { target: { value: 'deny' } })
+        await waitFor(() =>
+          expect(findButton('Save changes', true)).toBeDisabled()
+        )
+        fireEvent.click(
+          screen.getByRole('button', { name: 'Reload permissions' })
+        )
+        await waitFor(() =>
+          expect(findButton('Save changes', true)).toBeEnabled()
+        )
         fireEvent.click(findButton('Save changes', true))
         await waitFor(() => expect(put).toHaveBeenCalled())
         expect(put.mock.calls[0][1]).toMatchObject({
