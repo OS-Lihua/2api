@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -921,6 +922,73 @@ func TestAsyncTaskRecoveryDoesNotStarveLaterTerminalFacts(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tc.wallet, wallet.Balance.Nanos)
 		})
+	}
+}
+
+func TestAsyncTaskUncertainSubmissionKeepsOneReservationWithoutRetry(t *testing.T) {
+	var calls atomic.Int32
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, err := io.Copy(io.Discard, r.Body)
+		assert.NoError(t, err)
+		connection, _, err := w.(http.Hijacker).Hijack()
+		if !assert.NoError(t, err) {
+			return
+		}
+		// The vendor has accepted the complete body, but its reply is lost.
+		assert.NoError(t, connection.Close())
+	})
+	var fallbackCalls atomic.Int32
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"duplicate-job","status":"queued"}`))
+	}))
+	t.Cleanup(fallback.Close)
+	provider := &model.Provider{Name: "Uncertain task fallback", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Key: "fallback-fixture-key", BaseURL: &fallback.URL}
+	require.NoError(t, model.DB.Create(provider).Error)
+	var fallbackModel model.Model
+	require.NoError(t, model.DB.First(&fallbackModel, fixture.channel.ModelID).Error)
+	fallbackModel.Id, fallbackModel.ModelName = 0, "sora-2-pro"
+	require.NoError(t, model.DB.Create(&fallbackModel).Error)
+	fixture.offering.Members = append(fixture.offering.Members, model.ModelOfferingMember{ModelID: fallbackModel.Id, Tier: 2})
+	require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+	channel := &model.Channel{ProviderID: provider.Id, ModelID: fallbackModel.Id, Protocol: "task:sora", UpstreamModelName: "sora-2-pro", MappingConfirmed: true, Status: model.ChannelEnabled, Weight: 1, ParameterOverrides: `{}`}
+	require.NoError(t, model.DB.Create(channel).Error)
+	require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: channel.ID, Currency: "USD", Expression: `tier("video", u("seconds") * 0.05)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+	assert.Equal(t, 502, response.Code)
+	assert.Zero(t, fallbackCalls.Load(), "a possibly accepted task must never be submitted to a fallback Provider")
+	assert.EqualValues(t, 1, calls.Load(), "an indeterminate submission must not create another vendor task")
+	fixture.fake.Advance(365 * 24 * time.Hour)
+	service.RunTaskPollingOnce(t.Context(), nil)
+	_, err := service.RecoverGatewayTasks(t.Context(), 100)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, calls.Load(), "unknown upstream identity must not be polled")
+	var tasks []model.Task
+	require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Find(&tasks).Error)
+	require.Len(t, tasks, 1)
+	require.NotNil(t, tasks[0].PrivateData.Gateway)
+	assert.False(t, tasks[0].PrivateData.Gateway.Accepted)
+	assert.Empty(t, tasks[0].PrivateData.Key)
+	requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, "submission_unknown", requests[0].Status)
+	var wallet model.Wallet
+	require.NoError(t, model.DB.Where("account_type = ? AND owner_id = ?", model.LedgerAccountUserWallet, fixture.user.Id).Take(&wallet).Error)
+	assert.EqualValues(t, 640000000, wallet.Balance.Nanos)
+	for _, entry := range []struct {
+		kind  model.LedgerEntryType
+		count int64
+	}{
+		{model.LedgerEntryPreConsume, 1},
+		{model.LedgerEntryPreConsumeRelease, 0},
+		{model.LedgerEntryCharge, 0},
+	} {
+		var count int64
+		require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id = ? AND account_type = ? AND type = ?", requests[0].ID, model.LedgerAccountUserWallet, entry.kind).Count(&count).Error)
+		assert.Equal(t, entry.count, count)
 	}
 }
 

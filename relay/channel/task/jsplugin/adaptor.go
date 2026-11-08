@@ -12,12 +12,14 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptrace"
 	"net/textproto"
 	"net/url"
 	"reflect"
 	"regexp"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -149,7 +151,8 @@ type TaskAdaptor struct {
 	// the relayed events of a submission whose stream stopped before the
 	// upstream finished it, or whose result the plugin could not read: the
 	// task then settles at the reserved quota.
-	keepReservation bool
+	keepReservation   bool
+	submissionWritten atomic.Bool
 }
 
 func New(plugin *pluginruntime.LoadedPlugin) *TaskAdaptor { return &TaskAdaptor{plugin: plugin} }
@@ -578,6 +581,13 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, bod
 		c.Request.Method = strings.ToUpper(a.submit.Method)
 		defer func() { c.Request.Method = originalMethod }()
 	}
+	a.submissionWritten.Store(false)
+	if info.BeginProviderCall != nil {
+		originalRequest := c.Request
+		trace := &httptrace.ClientTrace{WroteHeaders: func() { a.submissionWritten.Store(true) }}
+		c.Request = originalRequest.WithContext(httptrace.WithClientTrace(originalRequest.Context(), trace))
+		defer func() { c.Request = originalRequest }()
+	}
 	resp, err := channel.DoTaskApiRequest(a, c, info, body)
 	if release != nil {
 		if err != nil || resp == nil {
@@ -587,6 +597,13 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, bod
 		}
 	}
 	return resp, err
+}
+
+// SubmissionMayHaveBeenAccepted prevents replay after a transport error once
+// submission headers were written. Credential exchanges and hook fetches do not
+// set this flag because they cannot establish acceptance of the task submission.
+func (a *TaskAdaptor) SubmissionMayHaveBeenAccepted() bool {
+	return a.submissionWritten.Load()
 }
 
 // deadlineBody releases the deadline of a relayed submission's upstream

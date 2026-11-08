@@ -289,6 +289,12 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 		if err != nil || response == nil {
 			result.Failure = service.ClassifyGatewayFailure(0, "", true, budget.TimedOut(), parent.Context().Err() != nil, false)
 			attempt.ErrorClass = result.Failure.Class
+			if adaptor.SubmissionMayHaveBeenAccepted() {
+				upstreamAccepted = true
+				result.Delivered = true
+				attempt.Status = "submission_unknown"
+				lastStatus, lastCode = 502, "task_submission_unknown"
+			}
 			return
 		}
 		defer response.Body.Close()
