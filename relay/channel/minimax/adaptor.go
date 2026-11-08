@@ -54,6 +54,16 @@ func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayIn
 		OutputFormat: outputFormat,
 	}
 
+	if info.ResponseFacts != nil {
+		minimaxRequest.Model = info.UpstreamModelName
+		minimaxRequest.OutputFormat = "hex"
+		minimaxRequest.AudioSetting.SampleRate = 24000
+		minimaxRequest.AudioSetting.Channel = 1
+		if minimaxRequest.AudioSetting.Format == "" {
+			minimaxRequest.AudioSetting.Format = "mp3"
+		}
+	}
+
 	// 同步扩展字段的厂商自定义metadata
 	if len(request.Metadata) > 0 {
 		var err error
@@ -67,18 +77,6 @@ func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayIn
 		}
 	}
 
-	if info.ResponseFacts != nil {
-		minimaxRequest.Model = info.UpstreamModelName
-		minimaxRequest.OutputFormat = "hex"
-		if minimaxRequest.AudioSetting == nil {
-			minimaxRequest.AudioSetting = &AudioSetting{Format: request.ResponseFormat}
-		}
-		minimaxRequest.AudioSetting.SampleRate = 24000
-		minimaxRequest.AudioSetting.Channel = 1
-		if minimaxRequest.AudioSetting.Format == "" {
-			minimaxRequest.AudioSetting.Format = "mp3"
-		}
-	}
 	jsonData, err := common.Marshal(minimaxRequest)
 	if err != nil {
 		return nil, fmt.Errorf("error marshalling minimax request: %w", err)

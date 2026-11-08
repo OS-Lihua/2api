@@ -4788,6 +4788,10 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 		hold           int64
 		extra          string
 	}{
+		{name: "MiniMax metadata sample rate", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"audio_setting":{"sample_rate":48000}}`, reject: true},
+		{name: "MiniMax metadata channel", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"audio_setting":{"channel":2}}`, reject: true},
+		{name: "MiniMax metadata transport", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"output_format":"url"}`, reject: true},
+		{name: "MiniMax metadata model", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"model":"different-model"}`, reject: true},
 		{name: "MiniMax metadata output positive", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"max_new_tokens":16}`, reject: true},
 		{name: "MiniMax metadata output zero", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"max_new_tokens":0}`, reject: true},
 		{name: "MiniMax valid metadata", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"language_boost":"English"}`},
