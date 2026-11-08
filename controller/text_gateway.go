@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"slices"
 	"strings"
@@ -20,10 +21,8 @@ import (
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/pkg/protocol"
-	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -258,20 +257,34 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		}
 		run.sale, run.saleFX, run.saleRate, run.ratio = sale, saleFX, saleRate, ratio
 	}
-	selection, err := service.SelectGatewayChannel(c, offering, request, service.GatewaySelectionOptions{Native: native, Exclusions: exclusions})
+	selection, preparedChat, err := gatewayChatRoute(c, run, offering, request, native, kind, started, exclusions)
 	if err != nil {
 		var conversionErr *service.GatewayConversionError
 		if errors.As(err, &conversionErr) {
 			run.fail(c, http.StatusBadRequest, "unsupported_parameter", conversionErr.Error())
 			return
 		}
-		if errors.Is(err, service.ErrGatewayCapability) {
+		if errors.Is(err, service.ErrGatewayCapability) || errors.Is(err, service.ErrGatewayConversion) {
 			run.fail(c, http.StatusBadRequest, "unsupported_parameter", "No Channel supports the requested capabilities")
+			return
+		}
+		if errors.Is(err, service.ErrGatewayPriceUnavailable) {
+			run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 			return
 		}
 		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
 		return
 	}
+	c.Header("X-Gateway-Conversion-Loss", strings.Join(selection.ConversionLosses, ","))
+	contactedProvider := false
+	defer func() {
+		ctx := context.WithoutCancel(c.Request.Context())
+		if result.Attempt != nil && result.Attempt.UsageSource != "none" {
+			_ = selection.Permit.Release(ctx, contactedProvider, result.Attempt.Usage.TotalTokens)
+		} else {
+			_ = selection.Permit.Release(ctx, contactedProvider)
+		}
+	}()
 	stopProbe := service.ChannelHealth.KeepAlive(c.Request.Context(), selection.Admission)
 	defer stopProbe()
 	defer func() {
@@ -282,28 +295,8 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			result.SkippedChannel = selection.Channel.ID
 		}
 	}()
-	if setupErr := middleware.SetupContextForSelectedChannel(c, selection.Provider, selection.Channel.Model.ModelName); setupErr != nil {
-		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
-		return
-	}
-	// Account credentials and headers come from Provider; model identity and
-	// parameter overrides come only from the selected single-model Channel.
-	var overrides map[string]any
-	if err := common.UnmarshalJsonStr(selection.Channel.ParameterOverrides, &overrides); err != nil {
-		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "Invalid Channel settings")
-		return
-	}
-	common.SetContextKey(c, constant.ContextKeyChannelParamOverride, overrides)
-	nativeSnapshot, err := service.CloneGatewayRequest(native)
-	if err != nil {
-		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
-		return
-	}
-	info, err := relaycommon.GenRelayInfo(c, format, nativeSnapshot, nil)
-	if err != nil {
-		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
-		return
-	}
+	maps.Copy(c.Keys, preparedChat.Context.Keys)
+	info := preparedChat.Info
 	info.StartTime, info.RequestId = started, c.GetString(common.RequestIdKey)
 	if info.RequestId == "" {
 		info.RequestId = common.NewRequestId()
@@ -324,153 +317,29 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		}
 		budget.Delivered()
 	}, CanFinishStream: func() bool { return info.StreamStatus.CompletedNormally() }}
-	info.BeginProviderCall = budget.Start
-	common.SetContextKey(c, constant.ContextKeyResponseFacts, info.ResponseFacts)
-	info.InitChannelMeta(c)
-	info.ChannelOtherSettings.ToolLossPolicy = string(types.ConversionLossPolicyAllow)
-	info.UpstreamModelName = selection.Channel.UpstreamModelName
-	info.IsModelMapped = true
-	request.Model = info.UpstreamModelName
-	input, err := helper.ResolveIncomingBillingExprRequestInput(c, info)
-	if err != nil {
-		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid chat request")
-		return
-	}
-	if info.IsStream {
-		info.ShouldIncludeUsage = request.StreamOptions == nil || request.StreamOptions.IncludeUsage
-		if info.SupportStreamOptions {
-			request.StreamOptions = &dto.StreamOptions{IncludeUsage: true}
-		} else {
-			request.StreamOptions = nil
-		}
-	}
-	adaptor, err := relay.GetChannelAdaptor(info.ApiType, selection.Channel.Protocol)
-	if err != nil {
-		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
-		return
-	}
-	if _, err := helper.ValidateTextRequest(c, request, relayconstant.RelayModeChatCompletions, kind != protocol.OpenAIChat); err != nil || !service.GatewayCapabilitiesMatch(request, selection.Capabilities, selection.InputTokens) {
-		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
-		return
-	}
-	info.SetResponsesToolState(selection.ResponsesTools)
-	selection.Conversion.Value.(dto.Request).SetModelName(info.UpstreamModelName)
-	info.RecordConversionDiagnostics(c, selection.Conversion.Diagnostics)
-	if wire, ok := selection.Conversion.Value.(*dto.GeneralOpenAIRequest); ok && info.IsStream {
-		if info.SupportStreamOptions {
-			wire.StreamOptions = &dto.StreamOptions{IncludeUsage: true}
-		} else {
-			wire.StreamOptions = nil
-		}
-	}
-	converted, err := adaptor.ConvertRequest(c, info, selection.Conversion.Value)
-	if err != nil {
-		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "The request cannot be sent to this Channel")
-		return
-	}
-	diagnostics := append(selection.Conversion.Diagnostics, info.ConversionDiagnostics()...)
-	if err := service.CheckGatewayConversionLosses(diagnostics, service.GatewayAcceptedConversionLosses(offering)); err != nil || info.ConversionDiagnosticsTruncated() {
-		run.fail(c, http.StatusBadRequest, "unsupported_parameter", (&service.GatewayConversionError{Diagnostics: diagnostics}).Error())
-		return
-	}
-	losses := service.GatewayConversionCodes(diagnostics)
-	if !c.Writer.Written() {
-		c.Writer.Header().Del("X-Gateway-Conversion-Loss")
-	}
-	if len(losses) > 0 {
-		c.Header("X-Gateway-Conversion-Loss", strings.Join(losses, ","))
-	}
-	encoded, err := common.Marshal(converted)
-	if err != nil {
-		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid chat request")
-		return
-	}
-	if len(info.ParamOverride) > 0 {
-		encoded, err = relaycommon.ApplyParamOverrideWithRelayInfo(encoded, info)
+	committedKey := false
+	info.BeginProviderCall = func() (context.Context, error) {
+		ctx, err := budget.Start()
 		if err != nil {
-			run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "Invalid Channel settings")
-			return
+			return nil, err
 		}
-	}
-	effective, err := adaptor.ProjectChatRequest(c, info, converted, request, encoded)
-	if err != nil {
-		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Invalid Channel request parameters")
-		return
-	}
-	boundDefault := request.MaxTokens == nil && request.MaxCompletionTokens == nil
-	for _, key := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens", "generationConfig", "generation_config"} {
-		if _, overridden := info.ParamOverride[key]; overridden {
-			boundDefault = false
-		}
-	}
-	if boundDefault && (selection.Capabilities.Limits.MaxOutputTokens != nil || selection.Capabilities.Limits.ContextLength != nil) {
-		// Converter defaults are provisional until effective input has been
-		// counted; the bounded value is written back to the actual wire below.
-		effective.MaxTokens, effective.MaxCompletionTokens = nil, nil
-	}
-	if _, err := helper.ValidateTextRequest(c, effective, relayconstant.RelayModeChatCompletions, selection.Channel.Protocol == protocol.OpenAIResponses); err != nil || effective.Model != selection.Channel.UpstreamModelName || effective.IsStream(c.Request) != info.IsStream || !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, selection.InputTokens) {
-		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
-		return
-	}
-	common.SetContextKey(c, constant.ContextKeyOriginalModel, info.TokenizerModel)
-	// Every effective request above is a Chat projection. Its framing estimate
-	// must not vary with the downstream presentation protocol.
-	counterInfo := *info
-	counterInfo.RelayFormat = types.RelayFormatOpenAI
-	estimatedInput, err := service.CountRequestToken(c, effective.GetTokenCountMeta(), &counterInfo, service.GatewayRequestTokenOptions(c))
-	if err != nil || !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, estimatedInput) {
-		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
-		return
-	}
-	if boundDefault && (selection.Capabilities.Limits.MaxOutputTokens != nil || selection.Capabilities.Limits.ContextLength != nil) {
-		var limit int64
-		if output := selection.Capabilities.Limits.MaxOutputTokens; output != nil {
-			limit = *output
-		}
-		if context := selection.Capabilities.Limits.ContextLength; context != nil {
-			remaining := *context - int64(estimatedInput)
-			if limit == 0 {
-				limit = remaining
-			} else {
-				limit = min(limit, remaining)
+		if !committedKey {
+			if err := selection.Provider.CommitRouteKey(ctx, info.ApiKey, info.ChannelMultiKeyIndex); err != nil {
+				return nil, err
 			}
+			committedKey = true
+		} else if err := selection.Provider.ValidateRouteKey(ctx, info.ApiKey, info.ChannelMultiKeyIndex); err != nil {
+			return nil, err
 		}
-		if limit <= 0 {
-			run.fail(c, http.StatusBadRequest, "unsupported_parameter", "No output tokens fit the request context")
-			return
-		}
-		request.MaxCompletionTokens = common.GetPointer(uint(limit))
-		encoded, err = adaptor.SetChatOutputLimit(converted, encoded, uint(limit))
-		if err == nil {
-			effective, err = adaptor.ProjectChatRequest(c, info, converted, request, encoded)
-		}
-		if err != nil {
-			run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Invalid Channel request parameters")
-			return
-		}
-		if _, err := helper.ValidateTextRequest(c, effective, relayconstant.RelayModeChatCompletions, selection.Channel.Protocol == protocol.OpenAIResponses); err != nil || !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, estimatedInput) {
-			run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
-			return
-		}
+		contactedProvider = true
+		return ctx, nil
 	}
-	mean, err := model.RecentOfferingOutputTokens(c.Request.Context(), offering.ID, started.UnixMilli())
-	if err != nil {
-		run.fail(c, http.StatusServiceUnavailable, "billing_unavailable", "Billing is unavailable")
-		return
-	}
-	if effective.MaxTokens != nil || effective.MaxCompletionTokens != nil {
-		mean = min(mean, int64(effective.GetMaxTokens()))
-	}
-	if limit := selection.Capabilities.Limits.MaxOutputTokens; limit != nil {
-		mean = min(mean, *limit)
-	}
-	choiceCount := 1
-	if effective.N != nil {
-		choiceCount = *effective.N
-	}
+	common.SetContextKey(c, constant.ContextKeyResponseFacts, info.ResponseFacts)
+	input := preparedChat.SaleInput
+	request = preparedChat.Request
+	adaptor, converted, encoded := preparedChat.Adaptor, preparedChat.Converted, preparedChat.Encoded
+	estimatedInput, estimatedUsage, choiceCount := selection.InputTokens, preparedChat.Usage, preparedChat.Choices
 	info.ResponseFacts.ExpectedChoices = choiceCount
-	mean *= int64(choiceCount)
-	estimatedUsage := &dto.Usage{PromptTokens: estimatedInput, CompletionTokens: int(mean), TotalTokens: estimatedInput + int(mean)}
 	sourceValue, reserveValue, _, err := service.GatewayPrice(sale, estimatedUsage, input, started, ratio, saleFX)
 	if err != nil {
 		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
@@ -550,6 +419,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			}
 			failure := service.ClassifyGatewayFailure(upstreamStatus, upstreamCode, transportFailed, budget.TimedOut(), parent.Context().Err() != nil, info.ResponseFacts.DownstreamWriteFailed, upstreamType)
 			if attempt.Status == "success" {
+				service.RecordGatewayChannelAffinity(c, selection)
 				failure = service.GatewayFailure{}
 			}
 			if attempt.Status != "success" {
@@ -752,16 +622,43 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
 	}
-	attempt = &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: record.ID, ChannelID: selection.Channel.ID, ProviderID: selection.Channel.ProviderID, ModelID: selection.Channel.ModelID, MemberTier: 1,
-		StartedAt: attemptStart.UnixMilli(), FailoverDecision: "stop", FailoverReason: "single_attempt", CircuitAction: "none", RouteDiagnostics: selection.Diagnostics,
-		UsageSource: "none", PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, Cost: money.Amount{Currency: purchase.Currency}, AccountingFXRate: purchaseRate,
-		ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, ConversionLosses: losses}
-	attemptContext, budgetErr := budget.Start()
-	if budgetErr != nil {
-		attempt = nil
-		run.fail(c, http.StatusServiceUnavailable, "budget_exhausted", "Upstream request failed")
+	comparison, err := service.GatewayComparisonCost(c.Request.Context(), costEstimate)
+	if err != nil {
+		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
 	}
+	profitable, err := service.GatewayRouteProfitAllowed(comparison, reserveValue, offering.MinimumMarginRate)
+	if err != nil {
+		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
+		return
+	}
+	selection.LossFallback = false
+	if !profitable {
+		if offering.AllowLossFallback {
+			selection.LossFallback, err = selection.LossFallbackAllowed(c.Request.Context(), comparison, offering.MinimumMarginRate)
+		}
+		if err != nil || !selection.LossFallback {
+			run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
+			return
+		}
+	}
+	selection.Diagnostics["estimated_cost"] = comparison.String()
+	selection.Diagnostics["loss_fallback"] = selection.LossFallback
+	attempt = &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: record.ID, ChannelID: selection.Channel.ID, ProviderID: selection.Channel.ProviderID, ModelID: selection.Channel.ModelID, MemberTier: selection.Tier,
+		StartedAt: attemptStart.UnixMilli(), FailoverDecision: "stop", FailoverReason: "single_attempt", CircuitAction: "none", RouteDiagnostics: selection.Diagnostics,
+		UsageSource: "none", PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, Cost: money.Amount{Currency: purchase.Currency}, AccountingFXRate: purchaseRate,
+		ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, ConversionLosses: selection.ConversionLosses}
+	attemptContext, budgetErr := info.BeginProviderCall()
+	if budgetErr != nil {
+		attempt = nil
+		if errors.Is(budgetErr, service.ErrGatewayBudget) || parent.Context().Err() != nil {
+			run.fail(c, http.StatusServiceUnavailable, "budget_exhausted", "Upstream request failed")
+		} else {
+			run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
+		}
+		return
+	}
+	contactedProvider = true
 	c.Request = parent.WithContext(attemptContext)
 	defer budget.Delivered()
 	sentAt = clock.Now()

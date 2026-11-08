@@ -11,6 +11,7 @@ import (
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/cachex"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -548,6 +549,20 @@ func ApplyChannelAffinityOverrideTemplate(c *gin.Context, paramOverride map[stri
 }
 
 func GetPreferredChannelByAffinity(c *gin.Context, modelName string, usingGroup string) (int, bool) {
+	return getPreferredChannelByAffinity(c, modelName, usingGroup, "")
+}
+
+// GetPreferredGatewayChannelByAffinity always isolates users, offerings and
+// tiers, even when a legacy session rule omits optional cache-key dimensions.
+func GetPreferredGatewayChannelByAffinity(c *gin.Context, offeringID, tier int, name string) (int, bool) {
+	delete(c.Keys, ginKeyChannelAffinityCacheKey)
+	delete(c.Keys, ginKeyChannelAffinityTTLSeconds)
+	delete(c.Keys, ginKeyChannelAffinityMeta)
+	namespace := "gateway:" + strconv.Itoa(c.GetInt("id")) + ":" + strconv.Itoa(offeringID) + ":" + strconv.Itoa(tier) + ":"
+	return getPreferredChannelByAffinity(c, name, common.GetContextKeyString(c, constant.ContextKeyUserGroup), namespace)
+}
+
+func getPreferredChannelByAffinity(c *gin.Context, modelName, usingGroup, namespace string) (int, bool) {
 	setting := operation_setting.GetChannelAffinitySetting()
 	state := RequestPolicy(c)
 	if setting == nil || !setting.Enabled {
@@ -592,7 +607,7 @@ func GetPreferredChannelByAffinity(c *gin.Context, modelName string, usingGroup 
 		if ttlSeconds <= 0 {
 			ttlSeconds = setting.DefaultTTLSeconds
 		}
-		cacheKeySuffix := buildChannelAffinityCacheKeySuffix(rule, modelName, usingGroup, affinityValue)
+		cacheKeySuffix := namespace + buildChannelAffinityCacheKeySuffix(rule, modelName, usingGroup, affinityValue)
 		cacheKeyFull := channelAffinityCacheNamespace + ":" + cacheKeySuffix
 		state.SessionMode, state.SessionModeSource = EffectiveSessionMode(setting, rule)
 		state.RuleName = rule.Name
@@ -727,6 +742,20 @@ func AppendChannelAffinityAdminInfo(c *gin.Context, other *model.LogOther) {
 }
 
 func RecordChannelAffinity(c *gin.Context, channelID int) {
+	recordChannelAffinity(c, channelID, true)
+}
+
+// RecordGatewayChannelAffinity records a Channel ID, never a Provider ID from
+// the legacy channel_id context field.
+func RecordGatewayChannelAffinity(c *gin.Context, selection *GatewaySelection) {
+	if !selection.hasAffinity {
+		return
+	}
+	setChannelAffinityContext(c, selection.affinity)
+	recordChannelAffinity(c, selection.Channel.ID, false)
+}
+
+func recordChannelAffinity(c *gin.Context, channelID int, switchOnSuccess bool) {
 	if channelID <= 0 {
 		return
 	}
@@ -737,7 +766,7 @@ func RecordChannelAffinity(c *gin.Context, channelID int) {
 	if setting == nil || !setting.Enabled {
 		return
 	}
-	if setting.SwitchOnSuccess && c != nil {
+	if switchOnSuccess && setting.SwitchOnSuccess && c != nil {
 		if successChannelID := c.GetInt("channel_id"); successChannelID > 0 {
 			channelID = successChannelID
 		}

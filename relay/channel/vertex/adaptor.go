@@ -206,24 +206,46 @@ func (a *Provider) RequestURL(metadata channel.ProviderMetadata) (string, error)
 }
 
 func (a *Provider) SetupHeader(c *gin.Context, req *http.Header, metadata channel.ProviderMetadata) error {
+	deferred, err := a.PreviewHeaders(c, req, metadata)
+	if err != nil || len(deferred) == 0 {
+		return err
+	}
+	// Legacy protocol callers prepare their account here. Gateway callers have
+	// already prepared it after reservation through ProviderAccountPreparer.
+	ctx := context.Background()
+	if c != nil && c.Request != nil {
+		ctx = c.Request.Context()
+	}
+	a.accessToken, err = getProviderAccessTokenWithContext(ctx, a, metadata.ProviderRequest(), nil)
+	if err != nil {
+		return err
+	}
+	req.Set("Authorization", "Bearer "+a.accessToken)
+	return nil
+}
+
+func (a *Provider) PreviewHeaders(c *gin.Context, req *http.Header, metadata channel.ProviderMetadata) ([]string, error) {
 	info := metadata.ProviderRequest()
 	a.initRequestMode(info)
-	if info.ChannelOtherSettings.VertexKeyType != dto.VertexKeyTypeAPIKey {
+	serviceAccount := info.ChannelOtherSettings.VertexKeyType != dto.VertexKeyTypeAPIKey
+	if serviceAccount {
 		if err := common.Unmarshal([]byte(info.ApiKey), &a.AccountCredentials); err != nil {
-			return errors.New("failed to decode credentials file")
+			return nil, errors.New("failed to decode credentials file")
 		}
 	}
 	channel.SetupProviderRequestHeader(info, c, req)
-	if info.ChannelOtherSettings.VertexKeyType != dto.VertexKeyTypeAPIKey {
-		requestCtx := context.Background()
-		if c != nil && c.Request != nil {
-			requestCtx = c.Request.Context()
+	var deferred []string
+	if serviceAccount {
+		token := a.accessToken
+		if token == "" {
+			token, _ = cachedProviderAccessToken(info)
 		}
-		accessToken, err := getProviderAccessTokenWithContext(requestCtx, a, info)
-		if err != nil {
-			return err
+		if token == "" {
+			req.Del("Authorization")
+			deferred = []string{"authorization"}
+		} else {
+			req.Set("Authorization", "Bearer "+token)
 		}
-		req.Set("Authorization", "Bearer "+accessToken)
 	}
 	if a.AccountCredentials.ProjectID != "" {
 		req.Set("x-goog-user-project", a.AccountCredentials.ProjectID)
@@ -231,7 +253,7 @@ func (a *Provider) SetupHeader(c *gin.Context, req *http.Header, metadata channe
 	if info.Protocol == protocol.AnthropicMessages || info.Protocol == "" && strings.Contains(info.UpstreamModelName, "claude") {
 		claude.CommonProviderClaudeHeadersOperation(c, req, info)
 	}
-	return nil
+	return deferred, nil
 }
 
 func (a *Protocol) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) (any, error) {

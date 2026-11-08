@@ -27,15 +27,16 @@ import (
 // providerView explicitly lists readable fields. Adapter configuration, upstream
 // errors, and credentials are write-only, including custom authentication headers.
 type providerView struct {
-	ID                 int     `json:"id"`
-	Type               int     `json:"type"`
-	Name               string  `json:"name"`
-	Status             int     `json:"status"`
-	BaseURL            *string `json:"base_url"`
-	Balance            float64 `json:"balance"`
-	BalanceUpdatedTime int64   `json:"balance_updated_time"`
-	CreatedTime        int64   `json:"created_time"`
-	Remark             *string `json:"remark"`
+	ID                 int                       `json:"id"`
+	Type               int                       `json:"type"`
+	Name               string                    `json:"name"`
+	Status             int                       `json:"status"`
+	BaseURL            *string                   `json:"base_url"`
+	Balance            float64                   `json:"balance"`
+	BalanceUpdatedTime int64                     `json:"balance_updated_time"`
+	CreatedTime        int64                     `json:"created_time"`
+	Remark             *string                   `json:"remark"`
+	RouteLimits        model.ProviderRouteLimits `json:"route_limits"`
 	Info               struct {
 		IsMultiKey   bool                  `json:"is_multi_key"`
 		MultiKeySize int                   `json:"multi_key_size"`
@@ -49,6 +50,7 @@ func readableProvider(provider *model.Provider) providerView {
 		BaseURL: readableProviderURL(provider.BaseURL), Balance: provider.Balance,
 		BalanceUpdatedTime: provider.BalanceUpdatedTime, CreatedTime: provider.CreatedTime, Remark: provider.Remark,
 	}
+	view.RouteLimits = provider.ProviderInfo.RouteLimits
 	view.Info.IsMultiKey = provider.ProviderInfo.IsMultiKey
 	view.Info.MultiKeySize = provider.ProviderInfo.MultiKeySize
 	view.Info.MultiKeyMode = provider.ProviderInfo.MultiKeyMode
