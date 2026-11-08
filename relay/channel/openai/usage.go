@@ -97,19 +97,39 @@ func mergeMediaTokenDetails(usage *dto.Usage, body []byte) {
 // Provider's message or other error details into downstream output or logs.
 func observeMediaError(info *relaycommon.RelayInfo, body []byte, status int) *types.OpenAIError {
 	var envelope struct {
-		Type  any `json:"type"`
-		Code  any `json:"code"`
-		Error any `json:"error"`
+		Type  json.RawMessage `json:"type"`
+		Code  json.RawMessage `json:"code"`
+		Error json.RawMessage `json:"error"`
 	}
 	if common.Unmarshal(body, &envelope) != nil {
 		return nil
 	}
-	fault := dto.GetOpenAIError(envelope.Error)
-	if fault == nil {
-		kind, _ := envelope.Type.(string)
+	var fault *types.OpenAIError
+	if len(envelope.Error) > 0 && string(envelope.Error) != "null" {
+		var nested struct {
+			Type json.RawMessage `json:"type"`
+			Code json.RawMessage `json:"code"`
+		}
+		if common.Unmarshal(envelope.Error, &nested) == nil {
+			var kind, code string
+			_ = common.Unmarshal(nested.Type, &kind)
+			_ = common.Unmarshal(nested.Code, &code)
+			fault = &types.OpenAIError{Type: kind, Code: code}
+		} else {
+			kind := "unknown_error"
+			var message string
+			if common.Unmarshal(envelope.Error, &message) == nil {
+				kind = "error"
+			}
+			fault = &types.OpenAIError{Type: kind}
+		}
+	} else {
+		var kind, code string
+		_ = common.Unmarshal(envelope.Type, &kind)
+		_ = common.Unmarshal(envelope.Code, &code)
 		switch strings.ToLower(strings.TrimSpace(kind)) {
 		case "error", "upstream_error":
-			fault = &types.OpenAIError{Type: kind, Code: envelope.Code}
+			fault = &types.OpenAIError{Type: kind, Code: code}
 		default:
 			return nil
 		}
@@ -119,7 +139,7 @@ func observeMediaError(info *relaycommon.RelayInfo, body []byte, status int) *ty
 	}
 	code, _ := fault.Code.(string)
 	info.StreamStatus.MarkFailed(code, fault.Type, status)
-	return &types.OpenAIError{Type: fault.Type, Code: fault.Code}
+	return fault
 }
 
 // observeMediaUsage preserves each reported counter, including explicit zero,

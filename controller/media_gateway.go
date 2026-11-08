@@ -433,7 +433,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	}
 	facts := info.ResponseFacts
 	generated := facts.BusinessOutput || facts.GeneratedImageCount > 0 || facts.GeneratedAudioBytes > 0 || facts.GeneratedText != "" || facts.ImageCount != nil && *facts.ImageCount > 0
-	if !facts.PromptTokensReported && !facts.AudioInputDurationReported && (generated || facts.CompletionTokensReported || facts.AudioInputDurationInvalid) {
+	if !facts.PromptTokensReported && !facts.AudioInputDurationReported && (generated || facts.CompletionTokensReported || facts.AudioInputTokensReported || facts.TextInputTokensReported || facts.AudioOutputTokensReported || facts.AudioInputDurationInvalid) {
 		usage.PromptTokens = inputTokens
 		if run.parsed.Protocol == protocol.OpenAIAudioTranscription {
 			usage.PromptTokensDetails.AudioTokens = inputTokens
@@ -441,6 +441,16 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	}
 	if !facts.CompletionTokensReported && facts.GeneratedText != "" {
 		usage.CompletionTokens = tokenkit.Count(info.TokenizerModel, facts.GeneratedText)
+	}
+	if !facts.PromptTokensReported && (facts.TextInputTokensReported || facts.AudioInputTokensReported) {
+		tokens, clamp := common.QuotaFromFloatChecked(float64(int64(usage.PromptTokensDetails.TextTokens) + int64(usage.PromptTokensDetails.AudioTokens)))
+		usage.PromptTokens = max(usage.PromptTokens, tokens)
+		if clamp != nil {
+			info.QuotaClamp = clamp
+		}
+	}
+	if !facts.CompletionTokensReported && facts.AudioOutputTokensReported {
+		usage.CompletionTokens = usage.CompletionTokenDetails.AudioTokens
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	attempt.Usage = service.GatewayRecordUsage(usage, facts)
