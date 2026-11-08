@@ -1171,9 +1171,16 @@ func UpdateChannelStatus(c *gin.Context) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	changed := model.UpdateProviderStatus(id, "", req.Status, "manual operation")
+	changed, err := model.UpdateProviderStatusWithError(id, "", req.Status, "manual operation")
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, model.ErrProviderStatusConflict) {
+			status = http.StatusConflict
+		}
+		common.ApiErrorStatus(c, status, common.NewMessage("Failed to update provider"))
+		return
+	}
 	if changed {
-		model.InitProviderCache()
 		if req.Status != common.ChannelStatusEnabled {
 			closeActiveChannelWebSockets([]int{id})
 		}
@@ -1198,19 +1205,30 @@ func BatchUpdateChannelStatus(c *gin.Context) {
 	}
 	changedCount := 0
 	var disabledIDs []int
+	var updateErr error
 	for _, id := range req.Ids {
-		if model.UpdateProviderStatus(id, "", req.Status, "manual batch operation") {
+		changed, err := model.UpdateProviderStatusWithError(id, "", req.Status, "manual batch operation")
+		if err != nil {
+			updateErr = err
+			break
+		}
+		if changed {
 			changedCount++
 			if req.Status != common.ChannelStatusEnabled {
 				disabledIDs = append(disabledIDs, id)
 			}
 		}
 	}
-	if changedCount > 0 {
-		model.InitProviderCache()
-	}
 	if len(disabledIDs) > 0 {
 		closeActiveChannelWebSockets(disabledIDs)
+	}
+	if updateErr != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(updateErr, model.ErrProviderStatusConflict) {
+			status = http.StatusConflict
+		}
+		common.ApiErrorStatus(c, status, common.NewMessage("Failed to update provider"), gin.H{"data": changedCount})
+		return
 	}
 	recordManageAudit(c, "channel.status_update_batch", map[string]any{
 		"count":  changedCount,

@@ -721,7 +721,16 @@ func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
 	return false
 }
 
+var ErrProviderStatusConflict = errors.New("provider changed during status update")
+
 func UpdateProviderStatus(channelId int, usingKey string, status int, reason string, selectedIndex ...int) bool {
+	changed, _ := UpdateProviderStatusWithError(channelId, usingKey, status, reason, selectedIndex...)
+	return changed
+}
+
+// UpdateProviderStatusWithError distinguishes an idempotent no-op from a
+// rejected or failed write so management replies can report the actual outcome.
+func UpdateProviderStatusWithError(channelId int, usingKey string, status int, reason string, selectedIndex ...int) (bool, error) {
 	if common.MemoryCacheEnabled {
 		channelStatusLock.Lock()
 		defer channelStatusLock.Unlock()
@@ -763,7 +772,7 @@ func UpdateProviderStatus(channelId int, usingKey string, status int, reason str
 				return nil
 			}
 		} else {
-			if usingKey != "" && channel.Key != usingKey {
+			if usingKey != "" && (channel.Key != usingKey || len(selectedIndex) > 0 && selectedIndex[0] != 0) {
 				return nil
 			}
 			info := channel.GetOtherInfo()
@@ -788,7 +797,7 @@ func UpdateProviderStatus(channelId int, usingKey string, status int, reason str
 			return result.Error
 		}
 		if result.RowsAffected != 1 {
-			return nil
+			return ErrProviderStatusConflict
 		}
 		if beforeStatus != channel.Status {
 			if err := tx.Model(&Ability{}).Where("channel_id = ?", channelId).Update("enabled", channel.Status == common.ChannelStatusEnabled).Error; err != nil {
@@ -801,12 +810,12 @@ func UpdateProviderStatus(channelId int, usingKey string, status int, reason str
 	})
 	if err != nil {
 		common.SysLog(common.LogText("failed to update channel status: channel_id=%d, status=%d, error=%v", channelId, status, err))
-		return false
+		return false, err
 	}
 	if changed && common.MemoryCacheEnabled {
 		cacheProviderStatusTransition(beforeProvider, committedProvider)
 	}
-	return changed
+	return changed, nil
 }
 
 func EnableProviderByTag(tag string) error {

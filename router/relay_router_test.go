@@ -334,16 +334,31 @@ func TestGatewayBudgetManagementOptions(t *testing.T) {
 }
 
 func TestTextGatewayAutomaticallyDisablesSelectedProviderKey(t *testing.T) {
-	for _, rotated := range []bool{false, true} {
-		t.Run(fmt.Sprint("rotated=", rotated), func(t *testing.T) { testGatewayAutomaticDisable(t, rotated) })
+	for _, tc := range []struct {
+		name   string
+		rotate bool
+		single bool
+	}{
+		{"unchanged", false, false},
+		{"rotated", true, false},
+		{"removed slot", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) { testGatewayAutomaticDisable(t, tc.rotate, tc.single) })
 	}
 }
 
-func testGatewayAutomaticDisable(t *testing.T, rotated bool) {
+func testGatewayAutomaticDisable(t *testing.T, rotated, single bool) {
 	var selectedProviderID int
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		if rotated {
 			if err := model.DB.Model(&model.Provider{}).Where("id = ?", selectedProviderID).Update("key", "replacement-secret").Error; err != nil {
+				t.Error(err)
+			}
+		}
+		if single {
+			if err := model.DB.Model(&model.Provider{}).Where("id = ?", selectedProviderID).Updates(map[string]any{
+				"key": strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), "channel_info": model.ProviderInfo{},
+			}).Error; err != nil {
 				t.Error(err)
 			}
 		}
@@ -370,7 +385,7 @@ func testGatewayAutomaticDisable(t *testing.T, rotated bool) {
 	stored, err := model.GetProviderById(provider.Id, true)
 	require.NoError(t, err)
 	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
-	if rotated {
+	if rotated || single {
 		assert.Empty(t, stored.ProviderInfo.MultiKeyStatusList)
 	} else {
 		assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ProviderInfo.MultiKeyStatusList[1])
@@ -390,7 +405,7 @@ func testGatewayAutomaticDisable(t *testing.T, rotated bool) {
 	for _, entry := range logs {
 		if entry.Action == "provider.auto_disable" {
 			found = true
-			assert.Equal(t, !rotated, entry.Success, "audit reports the actual Key transition outcome")
+			assert.Equal(t, !rotated && !single, entry.Success, "audit reports the actual Key transition outcome")
 		}
 	}
 	assert.True(t, found)
@@ -567,6 +582,32 @@ func TestTextGatewayFailedAutoDisablePreservesCachedProvider(t *testing.T) {
 				assert.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
 			}
 			assert.EqualValues(t, 2, calls.Load(), "a rolled-back transition must not remove the cached Provider or its only Key")
+			var admin model.User
+			require.NoError(t, model.DB.Where("username = ?", "security-admin").First(&admin).Error)
+			adminPAT := createWalletTestAccessToken(t, admin.Id, "channel:operate")
+			manual := adminSecurityRequest(fixture.engine, adminPAT, http.MethodPost, fmt.Sprintf("/api/admin/v1/providers/%d/disable", provider.Id), "")
+			assert.Equal(t, http.StatusInternalServerError, manual.Code, manual.Body.String())
+			assert.Contains(t, manual.Body.String(), `"success":false`)
+			batch := adminSecurityRequest(fixture.engine, adminPAT, http.MethodPost, "/api/channel/status/batch", fmt.Sprintf(`{"ids":[%d],"status":2}`, provider.Id))
+			assert.Equal(t, http.StatusInternalServerError, batch.Code, batch.Body.String())
+			assert.Contains(t, batch.Body.String(), `"success":false`)
+			operations, _, err := model.GetAuditLogs(model.AuditLogFilter{Category: model.AuditCategoryOperation}, 0, 100, common.RoleRootUser)
+			require.NoError(t, err)
+			foundManual, foundBatch := false, false
+			for _, entry := range operations {
+				if strings.Contains(entry.Content, "/providers/:id/disable") {
+					foundManual = true
+					assert.False(t, entry.Success)
+					assert.Equal(t, http.StatusInternalServerError, entry.Status)
+				}
+				if strings.Contains(entry.Content, "/api/channel/status/batch") {
+					foundBatch = true
+					assert.False(t, entry.Success)
+					assert.Equal(t, http.StatusInternalServerError, entry.Status)
+				}
+			}
+			assert.True(t, foundManual)
+			assert.True(t, foundBatch)
 			stored, err := model.GetProviderById(provider.Id, true)
 			require.NoError(t, err)
 			assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
@@ -637,6 +678,9 @@ func TestTextGatewayManualDisableWinsOverOldFailure(t *testing.T) {
 			} else {
 				read := adminSecurityRequest(engine, adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/providers/%d", provider.Id), "")
 				assert.Contains(t, read.Body.String(), `"status":2`, "manual Provider disable must remain manual")
+				repeat := adminSecurityRequest(engine, adminPAT, http.MethodPost, path, "")
+				assert.Equal(t, http.StatusOK, repeat.Code, repeat.Body.String())
+				assert.Contains(t, repeat.Body.String(), `"success":true`, "an idempotent manual operation remains successful")
 			}
 			logs, _, err := model.GetAuditLogs(model.AuditLogFilter{Category: model.AuditCategorySecurity}, 0, 100, common.RoleRootUser)
 			require.NoError(t, err)
