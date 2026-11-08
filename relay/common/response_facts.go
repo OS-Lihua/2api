@@ -23,6 +23,11 @@ type ResponseFacts struct {
 	DownstreamWriteFailed    bool
 	GeneratedText            string
 	OnBusinessOutput         func()
+	CanFinishStream          func() bool `json:"-"`
+	UpstreamErrorCode        string
+	// StreamPrelude belongs only to this Attempt and is never persisted. Hold
+	// metadata until business output commits its protocol and loss headers.
+	StreamPrelude []byte `json:"-"`
 }
 
 // MarkBusinessOutput records accepted content and disarms first-byte budgets.

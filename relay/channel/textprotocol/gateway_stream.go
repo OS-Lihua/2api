@@ -3,7 +3,6 @@ package textprotocol
 import (
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strings"
 
@@ -50,6 +49,11 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			sr.Stop(err)
 			return
 		}
+		if observeGatewayError(info, []byte(data)) {
+			streamErr = errors.New("upstream stream failed")
+			sr.Stop(streamErr)
+			return
+		}
 		var event any
 		switch p.format {
 		case types.RelayFormatOpenAI:
@@ -66,6 +70,10 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			sr.Stop(err)
 			return
 		}
+		safety := observeGatewaySafety(info, []byte(data), p.format)
+		if p.format == types.RelayFormatOpenAIResponses {
+			service.ObserveResponsesOutcome(info, event.(*dto.ResponsesStreamResponse))
+		}
 		results, err := relayconvert.ConvertStreamResponseChunk(c, info, state, event)
 		if err != nil {
 			streamErr = err
@@ -73,8 +81,6 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			return
 		}
 		switch p.format {
-		case types.RelayFormatOpenAIResponses:
-			service.ObserveResponsesOutcome(info, event.(*dto.ResponsesStreamResponse))
 		case types.RelayFormatClaude:
 			if gjson.Get(data, "type").String() == "message_stop" {
 				info.StreamStatus.MarkCompleted()
@@ -92,8 +98,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 				}
 			}
 		}
-		upstreamError := gjson.Get(data, "error")
-		if upstreamError.Exists() && upstreamError.Type != gjson.Null || gjson.Get(data, "type").String() == "error" || info.StreamStatus.ResponseFailed() {
+		if info.StreamStatus.ResponseFailed() {
 			streamErr = errors.New("upstream stream failed")
 			sr.Stop(streamErr)
 			return
@@ -102,22 +107,26 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			if _, err := writeGatewayStreamResult(c, info, json.RawMessage(normalized), &output); err != nil {
 				streamErr = err
 				sr.Stop(err)
-			}
-			return
-		}
-		for _, result := range results {
-			_, writeErr := writeGatewayStreamResult(c, info, result.Value, &output)
-			if writeErr != nil {
-				streamErr = writeErr
-				sr.Stop(writeErr)
 				return
 			}
+		} else {
+			for _, result := range results {
+				_, writeErr := writeGatewayStreamResult(c, info, result.Value, &output)
+				if writeErr != nil {
+					streamErr = writeErr
+					sr.Stop(writeErr)
+					return
+				}
+			}
+		}
+		if safety {
+			info.StreamStatus.MarkFailed("content_filter", "", 0)
+			streamErr = errors.New("upstream content safety rejection")
+			sr.Stop(streamErr)
 		}
 	})
 	info.StreamStatus.RequireTerminal()
-	outcome := info.StreamStatus.OutcomeSnapshot()
-	terminal := outcome.Response == relaycommon.ResponseOutcomeCompleted || outcome.Response == relaycommon.ResponseOutcomeUnknown && outcome.EndReason == relaycommon.StreamEndReasonDone
-	if streamErr == nil && (!info.StreamStatus.IsNormalEnd() || outcome.HasErrors || !terminal) {
+	if streamErr == nil && !info.StreamStatus.CompletedNormally() {
 		streamErr = errors.New("upstream stream did not complete")
 	}
 	if streamErr == nil {
@@ -206,15 +215,21 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 	if err := c.Request.Context().Err(); err != nil {
 		return "", err
 	}
-	n, err := c.Writer.Write([]byte(frame))
-	if err != nil || n != len(frame) {
-		info.ResponseFacts.DownstreamWriteFailed = true
-		if err == nil {
-			err = io.ErrShortWrite
-		}
-		return "", err
-	}
 	text := gatewayStreamBusinessText(body, info.RelayFormat)
+	if info.RelayFormat == types.RelayFormatOpenAIResponses {
+		var probe gatewayGeneratedOutput
+		if value, handled := probe.ObserveResponses(body); handled {
+			text = value
+		}
+	}
+	writeErr := helper.WriteGatewayStreamFrame(c, info.ResponseFacts, frame, text != "")
+	if writeErr != nil {
+		info.ResponseFacts.DownstreamWriteFailed = true
+		var flushErr *helper.StreamFlushError
+		if !errors.As(writeErr, &flushErr) {
+			return "", writeErr
+		}
+	}
 	if info.RelayFormat == types.RelayFormatOpenAIResponses {
 		if toolText, handled := output.ObserveResponses(body); handled {
 			text = toolText
@@ -227,11 +242,7 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 	if text != "" {
 		info.ResponseFacts.MarkBusinessOutput()
 	}
-	if err := helper.FlushWriter(c); err != nil {
-		info.ResponseFacts.DownstreamWriteFailed = true
-		return text, &helper.StreamFlushError{Err: err}
-	}
-	return text, nil
+	return text, writeErr
 }
 
 func gatewayStreamBusinessText(body []byte, format types.RelayFormat) string {

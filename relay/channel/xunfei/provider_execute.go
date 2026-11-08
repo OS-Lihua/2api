@@ -11,6 +11,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
@@ -65,6 +66,9 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 		cancel()
 		if handshake != nil && handshake.Body != nil {
 			handshake.Body.Close()
+		}
+		if handshake != nil && handshake.StatusCode >= 400 {
+			return nil, types.NewOpenAIError(fmt.Errorf("Xunfei WebSocket connection failed"), types.ErrorCodeBadResponse, handshake.StatusCode)
 		}
 		return nil, fmt.Errorf("Xunfei WebSocket connection failed")
 	}

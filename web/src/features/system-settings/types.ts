@@ -227,6 +227,9 @@ export type ContentSettings = {
 }
 
 export type ModelSettings = {
+  GatewayMaxAttempts: number
+  GatewayTotalFirstByteSeconds: number
+  GatewayAttemptFirstByteSeconds: number
   'global.pass_through_request_enabled': boolean
   'global.accepted_conversion_losses': string
   'global.thinking_model_blacklist': string

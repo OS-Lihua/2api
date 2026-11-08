@@ -186,6 +186,7 @@ export function useSettingsForm<T extends FieldValues>({
   onSubmit,
   compareValues,
   defaultValues,
+  resetOptions,
   ...formOptions
 }: SettingsFormOptions<T>) {
   const expandedDefaults = useMemo(
@@ -193,7 +194,11 @@ export function useSettingsForm<T extends FieldValues>({
     [defaultValues]
   )
 
-  const form = useForm<T>({ ...formOptions, defaultValues: expandedDefaults })
+  const form = useForm<T>({
+    ...formOptions,
+    resetOptions,
+    defaultValues: expandedDefaults,
+  })
 
   const defaultValuesRef = useRef<T>((expandedDefaults ?? ({} as T)) as T)
   const baselineRef = useRef<Record<string, unknown>>(
@@ -219,8 +224,8 @@ export function useSettingsForm<T extends FieldValues>({
     baselineRef.current = flattened
     defaultValuesRef.current = expandedDefaults as T
     serializedDefaultsRef.current = serialized
-    form.reset(expandedDefaults as T)
-  }, [expandedDefaults, form])
+    form.reset(expandedDefaults as T, resetOptions)
+  }, [expandedDefaults, form, resetOptions])
 
   const defaultCompare = (a: unknown, b: unknown): boolean => {
     if (a === b) return true

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -19,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
+	"golang.org/x/net/http/httpguts"
 )
 
 // ChannelAdaptor composes an account transport and an independently selected
@@ -238,6 +240,7 @@ type PreparedChannelRequest struct {
 	request  *http.Request
 	metadata *channel.ProviderRequest
 	body     io.Reader
+	execute  channel.ProviderExecution
 }
 
 func (r *PreparedChannelRequest) Headers() http.Header { return r.request.Header.Clone() }
@@ -254,7 +257,17 @@ func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayI
 	if c == nil || c.Request == nil || info == nil || info.ProviderMeta == nil {
 		return nil, errors.New("missing upstream request metadata")
 	}
+	if strings.TrimSpace(info.ChannelSetting.Proxy) != "" {
+		if _, _, err := common.ParseProxyURLRuntime(info.ChannelSetting.Proxy); err != nil {
+			return nil, errors.New("invalid provider proxy URL")
+		}
+	}
 	metadata := a.providerMetadata(info)
+	if preparer, ok := a.provider.(channel.ProviderAccountPreparer); ok {
+		if err := preparer.PrepareAccount(c.Request.Context(), metadata, info.BeginProviderCall); err != nil {
+			return nil, err
+		}
+	}
 	if providerNeedsPayload(a.provider) {
 		payload, err := io.ReadAll(requestBody)
 		if err != nil {
@@ -271,8 +284,20 @@ func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayI
 	request := &http.Request{Header: make(http.Header)}
 	if requestURL != "" {
 		request, err = http.NewRequestWithContext(c.Request.Context(), c.Request.Method, requestURL, requestBody)
-		if err != nil {
+		if err != nil || request.URL.Hostname() == "" {
 			return nil, errors.New("invalid upstream request URL")
+		}
+		if port := request.URL.Port(); port != "" {
+			number, err := strconv.Atoi(port)
+			if err != nil || number < 1 || number > 65535 {
+				return nil, errors.New("invalid upstream destination port")
+			}
+		}
+		request.URL.Scheme = strings.ToLower(request.URL.Scheme)
+		_, hasExecutor := a.provider.(channel.ProviderRequestExecutor)
+		sdkWebsocket := hasExecutor && (request.URL.Scheme == "ws" || request.URL.Scheme == "wss")
+		if request.URL.Scheme != "http" && request.URL.Scheme != "https" && !sdkWebsocket {
+			return nil, errors.New("invalid upstream request URL scheme")
 		}
 		if channel.IsNonTextProtocol(a.kind) {
 			request.Header.Set("Content-Type", c.Request.Header.Get("Content-Type"))
@@ -285,13 +310,41 @@ func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayI
 	if err := channel.ApplyHeaderOverride(info, c, request); err != nil {
 		return nil, errors.New("invalid provider header override")
 	}
+	for name, values := range request.Header {
+		if !httpguts.ValidHeaderFieldName(name) {
+			return nil, errors.New("invalid upstream header name")
+		}
+		for _, value := range values {
+			if !httpguts.ValidHeaderFieldValue(value) {
+				return nil, errors.New("invalid upstream header value")
+			}
+		}
+	}
+	if request.Header.Get("Host") != "" && !httpguts.ValidHostHeader(request.Host) {
+		return nil, errors.New("invalid upstream host override")
+	}
 	metadata.RequestHeaders = request.Header.Clone()
-	return &PreparedChannelRequest{adaptor: a, request: request, metadata: metadata, body: requestBody}, nil
+	prepared := &PreparedChannelRequest{adaptor: a, request: request, metadata: metadata, body: requestBody}
+	if preparer, ok := a.provider.(channel.ProviderRequestPreparer); ok {
+		execute, err := preparer.PrepareExecution(c, metadata, requestBody)
+		if err != nil || execute == nil {
+			return nil, errors.New("provider execution preparation failed")
+		}
+		prepared.execute = execute
+	}
+	return prepared, nil
 }
 
 func (a *ChannelAdaptor) DoPreparedRequest(c *gin.Context, info *relaycommon.RelayInfo, prepared *PreparedChannelRequest) (any, error) {
 	if prepared == nil || prepared.adaptor != a {
 		return nil, errors.New("missing prepared upstream request")
+	}
+	if prepared.execute != nil {
+		response, err := prepared.execute(c)
+		if err != nil {
+			return nil, providerRequestError(err)
+		}
+		return response, nil
 	}
 	if executor, ok := a.provider.(channel.ProviderRequestExecutor); ok {
 		response, executeErr := executor.ExecuteRequest(c, prepared.metadata, prepared.body)
@@ -308,7 +361,7 @@ func (a *ChannelAdaptor) DoPreparedRequest(c *gin.Context, info *relaycommon.Rel
 	if prepared.request.URL == nil {
 		return nil, errors.New("provider did not supply an upstream destination")
 	}
-	response, err := channel.DoRequest(c, prepared.request, info)
+	response, err := channel.DoRequest(c, prepared.request.WithContext(c.Request.Context()), info)
 	if err != nil {
 		return nil, providerRequestError(err)
 	}
@@ -318,9 +371,10 @@ func (a *ChannelAdaptor) DoPreparedRequest(c *gin.Context, info *relaycommon.Rel
 func providerRequestError(err error) *types.NewAPIError {
 	var apiErr *types.NewAPIError
 	if errors.As(err, &apiErr) {
+		failure := apiErr.ToOpenAIError()
 		redacted := *apiErr
 		redacted.Err = errors.New("upstream request failed")
-		redacted.RelayError = nil
+		redacted.RelayError = types.OpenAIError{Message: "upstream request failed", Type: failure.Type, Code: failure.Code}
 		redacted.Metadata = nil
 		return &redacted
 	}

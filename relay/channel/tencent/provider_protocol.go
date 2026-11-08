@@ -37,7 +37,7 @@ func (p *tencentProtocol) ConvertRequest(c *gin.Context, info *relaycommon.Relay
 		if p.kind != protocol.OpenAIChat {
 			return nil, fmt.Errorf("Tencent TC3 requires explicitly selected OpenAI Chat protocol")
 		}
-		wire := channel.WireProtocol{Kind: p.kind, Public: p.public, Wire: p.native}
+		wire := channel.WireProtocol{Kind: p.kind, Public: p.public, Wire: p.native, ReportsGatewayFacts: true}
 		return wire.ConvertRequest(c, info, request)
 	}
 	converted, err := p.public.ConvertRequest(c, info, request)

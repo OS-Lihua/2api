@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -248,6 +249,36 @@ type StreamFlushError struct {
 func (e *StreamFlushError) Error() string { return e.Err.Error() }
 func (e *StreamFlushError) Unwrap() error { return e.Err }
 
+// WriteGatewayStreamFrame holds an Attempt's prelude until its first business
+// frame. A failed candidate cannot commit stale protocol IDs or loss headers.
+func WriteGatewayStreamFrame(c *gin.Context, facts *relaycommon.ResponseFacts, frame string, business bool) error {
+	if err := c.Request.Context().Err(); err != nil {
+		return err
+	}
+	if facts != nil && facts.OnBusinessOutput != nil && !facts.BusinessOutput {
+		if !business {
+			if len(facts.StreamPrelude)+len(frame) > 1<<20 {
+				return errors.New("upstream stream prelude exceeds limit")
+			}
+			facts.StreamPrelude = append(facts.StreamPrelude, frame...)
+			return nil
+		}
+		frame = string(facts.StreamPrelude) + frame
+		facts.StreamPrelude = nil
+	}
+	n, err := c.Writer.Write([]byte(frame))
+	if err != nil {
+		return err
+	}
+	if n != len(frame) {
+		return io.ErrShortWrite
+	}
+	if err := FlushWriter(c); err != nil {
+		return &StreamFlushError{Err: err}
+	}
+	return nil
+}
+
 func StringData(c *gin.Context, str string) error {
 	if c == nil || c.Writer == nil {
 		return errors.New("context or writer is nil")
@@ -260,6 +291,16 @@ func StringData(c *gin.Context, str string) error {
 	if facts, _ := common.GetContextKey(c, constant.ContextKeyResponseFacts); facts == nil {
 		c.Render(-1, common.CustomEvent{Data: "data: " + str})
 		return FlushWriter(c)
+	}
+	if facts, ok := common.GetContextKeyType[*relaycommon.ResponseFacts](c, constant.ContextKeyResponseFacts); ok && facts != nil && facts.OnBusinessOutput != nil {
+		var chunk dto.ChatCompletionsStreamResponse
+		if common.UnmarshalJsonStr(str, &chunk) == nil && (chunk.Choices != nil || chunk.Usage != nil) {
+			business := false
+			for _, choice := range chunk.Choices {
+				business = business || choice.Delta.GetContentString() != "" || choice.Delta.GetReasoningContent() != "" || len(choice.Delta.ToolCalls) > 0
+			}
+			return WriteGatewayStreamFrame(c, facts, "data: "+str+"\n\n", business)
+		}
 	}
 	event := common.CustomEvent{Data: "data: " + str}
 	if err := event.Render(c.Writer); err != nil {
@@ -280,6 +321,9 @@ func PingData(c *gin.Context) error {
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
 
+	if facts, ok := common.GetContextKeyType[*relaycommon.ResponseFacts](c, constant.ContextKeyResponseFacts); ok && facts != nil && facts.OnBusinessOutput != nil && !facts.BusinessOutput {
+		return nil
+	}
 	if _, err := c.Writer.Write([]byte(": PING\n\n")); err != nil {
 		return fmt.Errorf("write ping data failed: %w", err)
 	}
@@ -300,8 +344,16 @@ func ObjectData(c *gin.Context, object any) error {
 // SendChatChunk records only complete business frames accepted downstream.
 // A flush failure after the frame is distinct from a partial frame write.
 func SendChatChunk(c *gin.Context, info *relaycommon.RelayInfo, response *dto.ChatCompletionsStreamResponse) error {
-	err := ObjectData(c, response)
 	facts := info.ResponseFacts
+	if facts != nil && facts.OnBusinessOutput != nil {
+		for _, choice := range response.Choices {
+			if choice.FinishReason != nil && *choice.FinishReason == constant.FinishReasonContentFilter {
+				info.PerformanceBusinessRejection = true
+				info.StreamStatus.MarkFailed("content_filter", "", 0)
+			}
+		}
+	}
+	err := ObjectData(c, response)
 	if facts == nil {
 		return err
 	}
@@ -321,6 +373,9 @@ func SendChatChunk(c *gin.Context, info *relaycommon.RelayInfo, response *dto.Ch
 			facts.GeneratedText += text
 			facts.MarkBusinessOutput()
 		}
+	}
+	if err == nil && facts.OnBusinessOutput != nil && info.PerformanceBusinessRejection {
+		return errors.New("upstream content safety rejection")
 	}
 	return err
 }
@@ -351,6 +406,9 @@ func WriteChatResponse(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	var output strings.Builder
 	business := false
 	for _, choice := range response.Choices {
+		if facts.OnBusinessOutput != nil && choice.FinishReason == constant.FinishReasonContentFilter {
+			info.PerformanceBusinessRejection = true
+		}
 		output.WriteString(choice.Message.StringContent())
 		output.WriteString(choice.Message.GetReasoningContent())
 		for _, call := range choice.Message.ParseToolCalls() {
@@ -381,6 +439,13 @@ func WriteChatResponse(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 }
 
 func Done(c *gin.Context) {
+	if value, ok := common.GetContextKey(c, constant.ContextKeyResponseFacts); ok {
+		if facts, _ := value.(*relaycommon.ResponseFacts); facts != nil && facts.OnBusinessOutput != nil {
+			if !facts.BusinessOutput || facts.CanFinishStream != nil && !facts.CanFinishStream() {
+				return
+			}
+		}
+	}
 	_ = StringData(c, "[DONE]")
 }
 

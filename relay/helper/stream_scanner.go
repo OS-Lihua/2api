@@ -129,8 +129,10 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		writer.stop()
 	}
 
-	// 无条件新建 StreamStatus
-	info.StreamStatus = relaycommon.NewStreamStatus()
+	managed := info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil
+	if info.StreamStatus == nil || !managed {
+		info.StreamStatus = relaycommon.NewStreamStatus()
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -139,13 +141,19 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	var (
 		stopChan    = make(chan bool, 3) // 增加缓冲区避免阻塞
 		scanner     = NewStreamScanner(resp.Body)
-		ticker      = time.NewTicker(streamingTimeout)
+		ticker      *time.Ticker
+		timeout     <-chan time.Time
 		pingTicker  *time.Ticker
 		writeMutex  sync.Mutex     // Mutex to protect concurrent writes
 		wg          sync.WaitGroup // 用于等待所有 goroutine 退出
 		cleanupOnce sync.Once
 		stopOnce    sync.Once
 	)
+
+	if !managed {
+		ticker = time.NewTicker(streamingTimeout)
+		timeout = ticker.C
+	}
 
 	stop := func() {
 		stopOnce.Do(func() {
@@ -178,7 +186,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				_ = resp.Body.Close()
 			}
 
-			ticker.Stop()
+			if ticker != nil {
+				ticker.Stop()
+			}
 			if pingTicker != nil {
 				pingTicker.Stop()
 			}
@@ -294,9 +304,15 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			default:
 			}
 
-			ticker.Reset(streamingTimeout)
+			if ticker != nil {
+				ticker.Reset(streamingTimeout)
+			}
 			data := scanner.Text()
-			logger.LogDebug(c, "stream scanner data: %s", data)
+			if info.ResponseFacts != nil {
+				logger.LogDebug(c, "stream scanner line: bytes=%d", len(data))
+			} else {
+				logger.LogDebug(c, "stream scanner data: %s", data)
+			}
 
 			data, hasDataPrefix := strings.CutPrefix(data, "data:")
 			data = strings.TrimSpace(data)
@@ -331,6 +347,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		}
 		if err := scanner.Err(); err != nil {
 			if err != io.EOF {
+				if info.ResponseFacts != nil {
+					err = errors.New("upstream stream read failed")
+				}
 				logger.LogError(c, common.LogText("scanner error: %s", err.Error()))
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)
 			}
@@ -340,7 +359,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 
 	// 主循环等待完成或超时
 	select {
-	case <-ticker.C:
+	case <-timeout:
 		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
 	case <-stopChan:
 		// EndReason already set by the goroutine that triggered stopChan

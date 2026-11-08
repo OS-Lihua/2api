@@ -30,12 +30,23 @@ type GatewaySelection struct {
 var ErrGatewayCapability = errors.New("no Channel supports the requested capabilities")
 var ErrGatewayUnavailable = errors.New("no Channel is available")
 
+// GatewaySelectionOptions keeps the native sending source separate from its
+// validation projection and excludes candidates rejected by previous attempts.
+type GatewaySelectionOptions struct {
+	Native     dto.Request
+	Exclusions *GatewayExclusions
+}
+
 // SelectGatewayChannel preconverts candidates before any Attempt or reservation.
 // Same-protocol candidates rank before good, fair and discouraged conversions.
-func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request *dto.GeneralOpenAIRequest, native ...dto.Request) (*GatewaySelection, error) {
+func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request *dto.GeneralOpenAIRequest, options ...GatewaySelectionOptions) (*GatewaySelection, error) {
 	original := dto.Request(request)
-	if len(native) > 0 {
-		original = native[0]
+	var failures *GatewayExclusions
+	if len(options) > 0 {
+		if options[0].Native != nil {
+			original = options[0].Native
+		}
+		failures = options[0].Exclusions
 	}
 	ids := []int{}
 	for _, member := range offering.Members {
@@ -56,6 +67,10 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 	bestRank := 5
 	_, mediaPrepared := c.Get(gatewayMediaContextKey)
 	for _, candidate := range candidates {
+		if failures != nil && (failures.Channels[candidate.ID] || failures.Providers[candidate.ProviderID]) {
+			counts["already_failed"]++
+			continue
+		}
 		reason := ""
 		var provider *model.Provider
 		var caps capability.Set

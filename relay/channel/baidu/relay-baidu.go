@@ -1,6 +1,8 @@
 package baidu
 
 import (
+	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/clock"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -128,6 +131,7 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 			prompt, completion := relaycommon.ChatUsagePresence([]byte(data))
 			info.ResponseFacts.RecordUsage(usage, &baiduResponse.Usage, prompt, completion)
 			if baiduResponse.ErrorMsg != "" || baiduResponse.ErrorCode != 0 {
+				info.StreamStatus.MarkFailed(fmt.Sprintf("baidu:%d", baiduResponse.ErrorCode), "upstream_error", 0)
 				sr.Stop(fmt.Errorf("Baidu stream failed"))
 				return
 			}
@@ -167,6 +171,9 @@ func baiduHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respon
 		info.ResponseFacts.RecordUsage(&baiduResponse.Usage, &baiduResponse.Usage, prompt, completion)
 	}
 	if baiduResponse.ErrorMsg != "" || baiduResponse.ErrorCode != 0 {
+		if info.ResponseFacts != nil {
+			return types.WithOpenAIError(types.OpenAIError{Message: "Baidu request failed", Type: "upstream_error", Code: fmt.Sprintf("baidu:%d", baiduResponse.ErrorCode)}, resp.StatusCode), &baiduResponse.Usage
+		}
 		return types.NewError(fmt.Errorf("%s", baiduResponse.ErrorMsg), types.ErrorCodeBadResponseBody), &baiduResponse.Usage
 	}
 	fullTextResponse := responseBaidu2OpenAI(&baiduResponse)
@@ -214,15 +221,15 @@ func getBaiduAccessToken(apiKey string) (string, error) {
 		var accessToken BaiduAccessToken
 		if accessToken, ok = val.(BaiduAccessToken); ok {
 			// soon this will expire
-			if time.Now().Add(time.Hour).After(accessToken.ExpiresAt) {
+			if clock.Now().Add(time.Hour).After(accessToken.ExpiresAt) {
 				go func() {
-					_, _ = getBaiduAccessTokenHelper(apiKey)
+					_, _ = refreshBaiduAccessToken(apiKey)
 				}()
 			}
 			return accessToken.AccessToken, nil
 		}
 	}
-	accessToken, err := getBaiduAccessTokenHelper(apiKey)
+	accessToken, err := refreshBaiduAccessToken(apiKey)
 	if err != nil {
 		return "", err
 	}
@@ -232,36 +239,59 @@ func getBaiduAccessToken(apiKey string) (string, error) {
 	return (*accessToken).AccessToken, nil
 }
 
-func getBaiduAccessTokenHelper(apiKey string) (*BaiduAccessToken, error) {
+func refreshBaiduAccessToken(apiKey string) (*BaiduAccessToken, error) {
+	client, err := service.GetVerifiedHttpClientWithProxy("")
+	if err != nil {
+		return nil, err
+	}
+	defer client.CloseIdleConnections()
+	token, err := getBaiduAccessTokenHelper(context.Background(), client, apiKey)
+	var certificateFailure *tls.CertificateVerificationError
+	if errors.As(err, &certificateFailure) {
+		common.SysError(common.LogText("Provider credential security failure provider_type=baidu category=certificate_verification_failed"))
+	}
+	return token, err
+}
+
+func getBaiduAccessTokenHelper(ctx context.Context, client *http.Client, apiKey string) (*BaiduAccessToken, error) {
 	parts := strings.Split(apiKey, "|")
 	if len(parts) != 2 {
 		return nil, errors.New("invalid baidu apikey")
 	}
 	values := url.Values{"grant_type": {"client_credentials"}, "client_id": {parts[0]}, "client_secret": {parts[1]}}
-	req, err := http.NewRequest(http.MethodPost, "https://aip.baidubce.com/oauth/2.0/token", strings.NewReader(values.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://aip.baidubce.com/oauth/2.0/token", strings.NewReader(values.Encode()))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Add("Accept", "application/json")
-	res, err := service.GetHttpClient().Do(req)
+	res, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer res.Body.Close()
 
 	var accessToken BaiduAccessToken
-	err = common.DecodeJson(res.Body, &accessToken)
-	if err != nil {
-		return nil, err
+	err = common.DecodeJson(io.LimitReader(res.Body, 1<<20), &accessToken)
+	if res.StatusCode >= 400 || accessToken.Error != "" {
+		rejection := types.NewOpenAIError(errors.New("Baidu token request rejected"), types.ErrorCodeBadResponse, res.StatusCode)
+		failure := rejection.ToOpenAIError()
+		if accessToken.Error != "" {
+			failure.Code = accessToken.Error
+		}
+		rejection.RelayError = failure
+		return nil, rejection
 	}
-	if accessToken.Error != "" {
-		return nil, errors.New(accessToken.Error + ": " + accessToken.ErrorDescription)
+	if err != nil {
+		return nil, errors.New("invalid Baidu token response")
+	}
+	if accessToken.ExpiresIn <= 0 || accessToken.ExpiresIn > (1<<63-1)/int64(time.Second) {
+		return nil, errors.New("invalid Baidu token expiry")
 	}
 	if accessToken.AccessToken == "" {
 		return nil, errors.New("getBaiduAccessTokenHelper get empty access token")
 	}
-	accessToken.ExpiresAt = time.Now().Add(time.Duration(accessToken.ExpiresIn) * time.Second)
+	accessToken.ExpiresAt = clock.Now().Add(time.Duration(accessToken.ExpiresIn) * time.Second)
 	baiduTokenStore.Store(apiKey, accessToken)
 	return &accessToken, nil
 }

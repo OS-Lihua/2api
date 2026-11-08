@@ -2,7 +2,10 @@ package controller
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
 	"errors"
+	"io"
 	"net/http"
 	"slices"
 	"strings"
@@ -18,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay"
+	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -32,6 +36,12 @@ import (
 func gatewayError(c *gin.Context, status int, code, message string) {
 	kind, _ := middleware.TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
 	streaming := c.Writer.Written() && strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream")
+	if c.Writer.Written() && !streaming {
+		return
+	}
+	if facts, ok := common.GetContextKeyType[*relaycommon.ResponseFacts](c, constant.ContextKeyResponseFacts); ok && facts != nil && facts.DownstreamWriteFailed {
+		return
+	}
 	var payload gin.H
 	event := ""
 	switch kind {
@@ -74,9 +84,93 @@ func gatewayError(c *gin.Context, status int, code, message string) {
 	}
 }
 
+type textGatewayRun struct {
+	record        *model.GatewayRequest
+	sale          *model.PriceVersion
+	saleFX        *money.Rate
+	saleRate      string
+	ratio         decimal.Decimal
+	saleSource    money.Amount
+	reservation   money.Amount
+	status        int
+	code, message string
+}
+
+func (run *textGatewayRun) fail(c *gin.Context, status int, code, message string) {
+	run.status, run.code, run.message = status, code, message
+}
+
+func gatewayChannelPurchaseSnapshot(ctx context.Context, channelID int, at time.Time) (*model.PriceVersion, *money.Rate, string, error) {
+	price, err := model.CurrentPriceVersion(ctx, model.DB, model.PriceOwnerChannel, channelID, at.Unix())
+	if err != nil {
+		return nil, nil, "", err
+	}
+	fx, rate, err := service.GatewayFX(ctx, price.Currency)
+	return price, fx, rate, err
+}
+
+func gatewayPreparationRejection(err error, budget *service.GatewayAttemptBudget, parent context.Context, providerID int, requestID string) service.GatewayAttemptResult {
+	var certificateFailure *tls.CertificateVerificationError
+	if errors.As(err, &certificateFailure) {
+		logger.LogError(parent, common.LogText("Provider credential security failure request=%q provider=%d category=certificate_verification_failed", requestID, providerID))
+	}
+	var result service.GatewayAttemptResult
+	var rejection *types.NewAPIError
+	if !errors.As(err, &rejection) {
+		return result
+	}
+	native := rejection.ToOpenAIError()
+	code, _ := native.Code.(string)
+	result.Failure = service.ClassifyGatewayFailure(rejection.StatusCode, code, false, budget.TimedOut(), parent.Err() != nil, false, native.Type)
+	if result.Failure.Class == "credentials" {
+		logger.LogError(parent, common.LogText("Provider credential authentication rejected request=%q provider=%d category=credentials_rejected", requestID, providerID))
+	}
+	if result.Failure.ExcludeProvider {
+		result.SkippedProvider = providerID
+	}
+	return result
+}
+
+// TextGateway uses one reservation and one settlement for all actual sends.
+func TextGateway(c *gin.Context) {
+	if middleware.TextOffering(c) == nil {
+		c.Next()
+		return
+	}
+	run := &textGatewayRun{}
+	parent := c.Request
+	attempts := service.RunGatewayAttempts(parent.Context(), service.GatewayPolicy(), func(budget *service.GatewayAttemptBudget, exclusions *service.GatewayExclusions) service.GatewayAttemptResult {
+		previousStatus, previousCode, previousMessage := run.status, run.code, run.message
+		run.status, run.code, run.message = 0, "", ""
+		result := runTextGatewayAttempt(c, run, budget, exclusions)
+		if result.Attempt == nil && result.SkippedChannel == 0 && run.code == "channel_unavailable" && previousCode != "" {
+			run.status, run.code, run.message = previousStatus, previousCode, previousMessage
+		}
+		return result
+	})
+	c.Request = parent
+	if run.record != nil {
+		run.record.EndedAt = clock.Now().UnixMilli()
+		intent := model.GatewaySettlement{Request: *run.record, Attempts: attempts, SaleSource: run.saleSource}
+		if err := model.PrepareGatewaySettlement(intent); err != nil {
+			logger.LogError(parent.Context(), "gateway settlement preparation failed for request "+run.record.ID)
+		} else if _, err := model.SettleGateway(run.record.ID); err != nil {
+			logger.LogError(parent.Context(), "gateway settlement pending for request "+run.record.ID)
+		} else if err := model.PublishGatewayRecords(run.record.ID); err != nil {
+			logger.LogError(parent.Context(), "gateway record delivery pending for request "+run.record.ID)
+		}
+	}
+	if parent.Context().Err() != nil {
+		return
+	}
+	if run.status != 0 {
+		gatewayError(c, run.status, run.code, run.message)
+	}
+}
+
 // TextGateway dispatches only a resolved ModelOffering. Absence continues to the
 // legacy middleware; known disabled and unauthorized offerings stop here.
-func TextGateway(c *gin.Context) {
+func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.GatewayAttemptBudget, exclusions *service.GatewayExclusions) (result service.GatewayAttemptResult) {
 	offering := middleware.TextOffering(c)
 	if offering == nil {
 		c.Next()
@@ -85,14 +179,14 @@ func TextGateway(c *gin.Context) {
 	c.Abort()
 	userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
 	if !offering.Enabled || offering.Visibility == "groups" && !slices.Contains(offering.Groups, userGroup) {
-		gatewayError(c, http.StatusNotFound, "model_not_found", "Model not found")
+		run.fail(c, http.StatusNotFound, "model_not_found", "Model not found")
 		return
 	}
 	kind, pathName := middleware.TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
 	format, _ := service.GatewayProtocolFormat(kind)
 	native, err := helper.GetAndValidateRequest(c, format)
 	if err != nil {
-		gatewayError(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
+		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
 		return
 	}
 	if pathName != "" {
@@ -100,13 +194,13 @@ func TextGateway(c *gin.Context) {
 	}
 	if _, chat := native.(*dto.GeneralOpenAIRequest); !chat {
 		if err := service.PrepareGatewayMedia(c, native); err != nil {
-			gatewayError(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
+			run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
 			return
 		}
 	}
 	request, err := service.GatewayChatProjection(c, native)
 	if err != nil {
-		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "The request cannot be converted")
+		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "The request cannot be converted")
 		return
 	}
 	projection := *request
@@ -120,7 +214,7 @@ func TextGateway(c *gin.Context) {
 		limits, _ := c.Get("token_model_limit")
 		allowed, _ := limits.(map[string]bool)
 		if !allowed[requestedName] && !allowed[offering.Name] {
-			gatewayError(c, http.StatusNotFound, "model_not_found", "Model not found")
+			run.fail(c, http.StatusNotFound, "model_not_found", "Model not found")
 			return
 		}
 	}
@@ -128,55 +222,64 @@ func TextGateway(c *gin.Context) {
 	if started.IsZero() {
 		started = clock.Now()
 	}
-	sale, err := model.CurrentPriceVersion(c.Request.Context(), model.DB, model.PriceOwnerOffering, offering.ID, started.Unix())
-	if err != nil {
-		gatewayError(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
-		return
+	sale, saleFX, saleRate, ratio := run.sale, run.saleFX, run.saleRate, run.ratio
+	if sale == nil {
+		sale, err = model.CurrentPriceVersion(c.Request.Context(), model.DB, model.PriceOwnerOffering, offering.ID, started.Unix())
+		if err != nil {
+			run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
+			return
+		}
+		saleFX, saleRate, err = service.GatewayFX(c.Request.Context(), sale.Currency)
+		if err != nil {
+			run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
+			return
+		}
+		ratio, err = service.ExactGatewayGroupRatio(userGroup)
+		if err != nil {
+			run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
+			return
+		}
+		run.sale, run.saleFX, run.saleRate, run.ratio = sale, saleFX, saleRate, ratio
 	}
-	saleFX, saleRate, err := service.GatewayFX(c.Request.Context(), sale.Currency)
-	if err != nil {
-		gatewayError(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
-		return
-	}
-	ratio, err := service.ExactGatewayGroupRatio(userGroup)
-	if err != nil {
-		gatewayError(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
-		return
-	}
-	selection, err := service.SelectGatewayChannel(c, offering, request, native)
+	selection, err := service.SelectGatewayChannel(c, offering, request, service.GatewaySelectionOptions{Native: native, Exclusions: exclusions})
 	if err != nil {
 		var conversionErr *service.GatewayConversionError
 		if errors.As(err, &conversionErr) {
-			gatewayError(c, http.StatusBadRequest, "unsupported_parameter", conversionErr.Error())
+			run.fail(c, http.StatusBadRequest, "unsupported_parameter", conversionErr.Error())
 			return
 		}
 		if errors.Is(err, service.ErrGatewayCapability) {
-			gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "No Channel supports the requested capabilities")
+			run.fail(c, http.StatusBadRequest, "unsupported_parameter", "No Channel supports the requested capabilities")
 			return
 		}
-		gatewayError(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
+		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
 		return
 	}
+	defer func() {
+		if result.Attempt == nil && (run.code == "unsupported_parameter" || run.code == "channel_unavailable" || run.code == "price_unavailable" || run.code == "upstream_error") {
+			result.SkippedChannel = selection.Channel.ID
+		}
+	}()
 	if setupErr := middleware.SetupContextForSelectedChannel(c, selection.Provider, selection.Channel.Model.ModelName); setupErr != nil {
-		gatewayError(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
+		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
 		return
 	}
 	// Account credentials and headers come from Provider; model identity and
 	// parameter overrides come only from the selected single-model Channel.
 	var overrides map[string]any
 	if err := common.UnmarshalJsonStr(selection.Channel.ParameterOverrides, &overrides); err != nil {
-		gatewayError(c, http.StatusServiceUnavailable, "channel_unavailable", "Invalid Channel settings")
+		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "Invalid Channel settings")
 		return
 	}
 	common.SetContextKey(c, constant.ContextKeyChannelParamOverride, overrides)
 	nativeSnapshot, err := service.CloneGatewayRequest(native)
 	if err != nil {
-		gatewayError(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
+		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
 		return
 	}
 	info, err := relaycommon.GenRelayInfo(c, format, nativeSnapshot, nil)
 	if err != nil {
-		gatewayError(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
+		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
 		return
 	}
 	info.StartTime, info.RequestId = started, c.GetString(common.RequestIdKey)
@@ -184,8 +287,15 @@ func TextGateway(c *gin.Context) {
 		info.RequestId = common.NewRequestId()
 		c.Header(common.RequestIdKey, info.RequestId)
 	}
+	if run.record != nil {
+		info.RequestId = run.record.ID
+	}
 	info.TokenizerModel = selection.Channel.Model.ModelName
-	info.ResponseFacts = &relaycommon.ResponseFacts{}
+	if info.StreamStatus == nil {
+		info.StreamStatus = relaycommon.NewStreamStatus()
+	}
+	info.ResponseFacts = &relaycommon.ResponseFacts{OnBusinessOutput: budget.Delivered, CanFinishStream: func() bool { return info.StreamStatus.CompletedNormally() }}
+	info.BeginProviderCall = budget.Start
 	common.SetContextKey(c, constant.ContextKeyResponseFacts, info.ResponseFacts)
 	info.InitChannelMeta(c)
 	info.ChannelOtherSettings.ToolLossPolicy = string(types.ConversionLossPolicyAllow)
@@ -194,7 +304,7 @@ func TextGateway(c *gin.Context) {
 	request.Model = info.UpstreamModelName
 	input, err := helper.ResolveIncomingBillingExprRequestInput(c, info)
 	if err != nil {
-		gatewayError(c, http.StatusBadRequest, "invalid_request", "Invalid chat request")
+		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid chat request")
 		return
 	}
 	if info.IsStream {
@@ -207,11 +317,11 @@ func TextGateway(c *gin.Context) {
 	}
 	adaptor, err := relay.GetChannelAdaptor(info.ApiType, selection.Channel.Protocol)
 	if err != nil {
-		gatewayError(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
+		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
 		return
 	}
 	if _, err := helper.ValidateTextRequest(c, request, relayconstant.RelayModeChatCompletions); err != nil || !service.GatewayCapabilitiesMatch(request, selection.Capabilities, selection.InputTokens) {
-		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
+		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
 		return
 	}
 	info.SetResponsesToolState(selection.ResponsesTools)
@@ -226,33 +336,36 @@ func TextGateway(c *gin.Context) {
 	}
 	converted, err := adaptor.ConvertRequest(c, info, selection.Conversion.Value)
 	if err != nil {
-		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "The request cannot be sent to this Channel")
+		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "The request cannot be sent to this Channel")
 		return
 	}
 	diagnostics := append(selection.Conversion.Diagnostics, info.ConversionDiagnostics()...)
 	if err := service.CheckGatewayConversionLosses(diagnostics, service.GatewayAcceptedConversionLosses(offering)); err != nil || info.ConversionDiagnosticsTruncated() {
-		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", (&service.GatewayConversionError{Diagnostics: diagnostics}).Error())
+		run.fail(c, http.StatusBadRequest, "unsupported_parameter", (&service.GatewayConversionError{Diagnostics: diagnostics}).Error())
 		return
 	}
 	losses := service.GatewayConversionCodes(diagnostics)
+	if !c.Writer.Written() {
+		c.Writer.Header().Del("X-Gateway-Conversion-Loss")
+	}
 	if len(losses) > 0 {
 		c.Header("X-Gateway-Conversion-Loss", strings.Join(losses, ","))
 	}
 	encoded, err := common.Marshal(converted)
 	if err != nil {
-		gatewayError(c, http.StatusBadRequest, "invalid_request", "Invalid chat request")
+		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid chat request")
 		return
 	}
 	if len(info.ParamOverride) > 0 {
 		encoded, err = relaycommon.ApplyParamOverrideWithRelayInfo(encoded, info)
 		if err != nil {
-			gatewayError(c, http.StatusServiceUnavailable, "channel_unavailable", "Invalid Channel settings")
+			run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "Invalid Channel settings")
 			return
 		}
 	}
 	effective, err := adaptor.ProjectChatRequest(c, info, converted, request, encoded)
 	if err != nil {
-		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "Invalid Channel request parameters")
+		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Invalid Channel request parameters")
 		return
 	}
 	boundDefault := request.MaxTokens == nil && request.MaxCompletionTokens == nil
@@ -267,7 +380,7 @@ func TextGateway(c *gin.Context) {
 		effective.MaxTokens, effective.MaxCompletionTokens = nil, nil
 	}
 	if _, err := helper.ValidateTextRequest(c, effective, relayconstant.RelayModeChatCompletions); err != nil || effective.Model != selection.Channel.UpstreamModelName || effective.IsStream(c.Request) != info.IsStream || !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, selection.InputTokens) {
-		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
+		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
 		return
 	}
 	common.SetContextKey(c, constant.ContextKeyOriginalModel, info.TokenizerModel)
@@ -277,7 +390,7 @@ func TextGateway(c *gin.Context) {
 	counterInfo.RelayFormat = types.RelayFormatOpenAI
 	estimatedInput, err := service.CountRequestToken(c, effective.GetTokenCountMeta(), &counterInfo)
 	if err != nil || !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, estimatedInput) {
-		gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
+		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
 		return
 	}
 	if boundDefault && (selection.Capabilities.Limits.MaxOutputTokens != nil || selection.Capabilities.Limits.ContextLength != nil) {
@@ -294,7 +407,7 @@ func TextGateway(c *gin.Context) {
 			}
 		}
 		if limit <= 0 {
-			gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "No output tokens fit the request context")
+			run.fail(c, http.StatusBadRequest, "unsupported_parameter", "No output tokens fit the request context")
 			return
 		}
 		request.MaxCompletionTokens = common.GetPointer(uint(limit))
@@ -303,17 +416,17 @@ func TextGateway(c *gin.Context) {
 			effective, err = adaptor.ProjectChatRequest(c, info, converted, request, encoded)
 		}
 		if err != nil {
-			gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "Invalid Channel request parameters")
+			run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Invalid Channel request parameters")
 			return
 		}
 		if _, err := helper.ValidateTextRequest(c, effective, relayconstant.RelayModeChatCompletions); err != nil || !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, estimatedInput) {
-			gatewayError(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
+			run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
 			return
 		}
 	}
 	mean, err := model.RecentOfferingOutputTokens(c.Request.Context(), offering.ID, started.UnixMilli())
 	if err != nil {
-		gatewayError(c, http.StatusServiceUnavailable, "billing_unavailable", "Billing is unavailable")
+		run.fail(c, http.StatusServiceUnavailable, "billing_unavailable", "Billing is unavailable")
 		return
 	}
 	if limit := effective.GetMaxTokens(); limit > 0 {
@@ -330,30 +443,44 @@ func TextGateway(c *gin.Context) {
 	estimatedUsage := &dto.Usage{PromptTokens: estimatedInput, CompletionTokens: int(mean), TotalTokens: estimatedInput + int(mean)}
 	sourceValue, reserveValue, _, err := service.GatewayPrice(sale, estimatedUsage, input, started, ratio, saleFX)
 	if err != nil {
-		gatewayError(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
+		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
 		return
 	}
 	reserve, err := reserveValue.Receivable()
 	if err != nil {
-		gatewayError(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
+		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
 		return
 	}
 	sourceReserve, err := sourceValue.Receivable()
 	if err != nil {
-		gatewayError(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
+		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
 		return
 	}
 	record := &model.GatewayRequest{ID: info.RequestId, UserID: c.GetInt("id"), TokenID: c.GetInt("token_id"), ModelOfferingID: offering.ID, OfferingName: offering.Name, RequestedName: requestedName,
 		ChoiceCount: choiceCount, SalePriceVersionID: sale.ID, SaleExpression: sale.Expression, SaleCurrency: sale.Currency, SaleFXRate: saleRate, GroupRatio: ratio.String(),
 		Receivable: money.Amount{Currency: model.SettlementCurrency()}, StartedAt: started.UnixMilli(), UsageSource: "none", Status: "failed", LedgerEntryIDs: []string{}}
-	if err := model.ReserveGateway(record, reserve, sourceReserve); err != nil {
-		if errors.Is(err, model.ErrInsufficientWalletBalance) {
-			gatewayError(c, http.StatusPaymentRequired, "insufficient_balance", "Insufficient wallet balance")
+	if run.record == nil {
+		if err := model.ReserveGateway(record, reserve, sourceReserve); err != nil {
+			if errors.Is(err, model.ErrInsufficientWalletBalance) {
+				run.fail(c, http.StatusPaymentRequired, "insufficient_balance", "Insufficient wallet balance")
+				return
+			}
+			run.fail(c, http.StatusServiceUnavailable, "billing_unavailable", "Billing is unavailable")
 			return
 		}
-		gatewayError(c, http.StatusServiceUnavailable, "billing_unavailable", "Billing is unavailable")
-		return
+		run.record, run.saleSource, run.reservation = record, sourceReserve, reserve
+	} else {
+		if reserve.Nanos > run.reservation.Nanos {
+			run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
+			return
+		}
+		record = run.record
 	}
+	parent := c.Request
+	defer func() { c.Request = parent }()
+	var upstreamStatus int
+	var upstreamCode, upstreamType string
+	var transportFailed bool
 	var attempt *model.GatewayAttempt
 	var usage *dto.Usage
 	var attemptErr *types.NewAPIError
@@ -363,18 +490,53 @@ func TextGateway(c *gin.Context) {
 	var estimatedCost, estimatedConverted money.Amount
 	defer func() {
 		record.EndedAt = clock.Now().UnixMilli()
+		if attempt == nil && parent.Context().Err() != nil {
+			record.Status = "cancelled"
+		}
 		if attempt != nil {
 			attempt.EndedAt = record.EndedAt
 			attempt.Status, attempt.ErrorClass = gatewayAttemptOutcome(c, info, attemptErr)
+			if budget.TimedOut() && parent.Context().Err() == nil {
+				attempt.Status = "failed"
+			}
+			outcome := info.StreamStatus.OutcomeSnapshot()
+			if outcome.ErrorCode != "" {
+				upstreamCode = outcome.ErrorCode
+			}
+			if upstreamCode == "" {
+				upstreamCode = info.ResponseFacts.UpstreamErrorCode
+			}
+			if upstreamType == "" {
+				upstreamType = outcome.ErrorType
+			}
+			if outcome.ErrorStatus >= 400 {
+				upstreamStatus = outcome.ErrorStatus
+			}
+			if info.PerformanceBusinessRejection {
+				upstreamCode = "content_filter"
+			}
+			failure := service.ClassifyGatewayFailure(upstreamStatus, upstreamCode, transportFailed, budget.TimedOut(), parent.Context().Err() != nil, info.ResponseFacts.DownstreamWriteFailed, upstreamType)
+			if attempt.Status == "success" {
+				failure = service.GatewayFailure{}
+			}
+			if attempt.Status != "success" {
+				attempt.ErrorClass = failure.Class
+			}
+			if info.IsStream && attempt.Status != "success" && failure.Class == "upstream_error" && !failure.Switch && !info.ResponseFacts.DownstreamWriteFailed && parent.Context().Err() == nil && upstreamStatus == 200 {
+				failure = service.GatewayFailure{Class: "stream_interrupted", Switch: true}
+				attempt.ErrorClass = failure.Class
+			}
+			result = service.GatewayAttemptResult{Attempt: attempt, Failure: failure, Delivered: info.ResponseFacts.BusinessOutput}
+
 			record.Status = attempt.Status
-			if !info.ResponseFacts.BusinessOutput && !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && !info.ResponseFacts.CompletionTokensReported {
+			if !info.ResponseFacts.BusinessOutput && info.ResponseFacts.GeneratedText == "" && !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && !info.ResponseFacts.CompletionTokensReported {
 				usage = nil
 			}
-			if usage == nil && info.ResponseFacts.BusinessOutput {
+			if usage == nil && (info.ResponseFacts.BusinessOutput || info.ResponseFacts.GeneratedText != "") {
 				usage = &dto.Usage{PromptTokens: estimatedInput, CompletionTokens: tokenkit.Count(info.TokenizerModel, info.ResponseFacts.GeneratedText)}
 			}
 			if usage != nil {
-				if !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && info.ResponseFacts.BusinessOutput {
+				if !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && (info.ResponseFacts.BusinessOutput || info.ResponseFacts.GeneratedText != "") {
 					usage.PromptTokens = estimatedInput
 				}
 				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
@@ -396,6 +558,7 @@ func TextGateway(c *gin.Context) {
 				}
 			}
 			if info.ResponseFacts.BusinessOutput {
+				record.ChoiceCount = choiceCount
 				record.Usage, record.UsageSource = attempt.Usage, attempt.UsageSource
 				source, receivable, trace, priceErr := service.GatewayPrice(sale, usage, input, started, ratio, saleFX)
 				if trace.BillingUnit == billingexpr.BillingUnitRequest && attempt.Status != "success" {
@@ -419,50 +582,37 @@ func TextGateway(c *gin.Context) {
 				}
 			}
 		}
-		intent := model.GatewaySettlement{Request: *record, Attempt: attempt, SaleSource: sourceReserve}
-		if err := model.PrepareGatewaySettlement(intent); err != nil {
-			logger.LogError(c.Request.Context(), "gateway settlement preparation failed for request "+record.ID)
-			return
-		}
-		if _, err := model.SettleGateway(record.ID); err != nil {
-			logger.LogError(c.Request.Context(), "gateway settlement pending for request "+record.ID)
-			return
-		}
-		if err := model.PublishGatewayRecords(record.ID); err != nil {
-			logger.LogError(c.Request.Context(), "gateway record delivery pending for request "+record.ID)
-		}
+		run.saleSource = sourceReserve
+
 	}()
 	if c.Request.Context().Err() != nil {
 		record.Status = "cancelled"
 		return
 	}
-	attemptStart := clock.Now()
-	purchase, err = model.CurrentPriceVersion(c.Request.Context(), model.DB, model.PriceOwnerChannel, selection.Channel.ID, attemptStart.Unix())
-	if err != nil {
-		gatewayError(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
+	// Admission checks avoid Provider preparation I/O without a usable purchase price.
+	if _, _, _, err = gatewayChannelPurchaseSnapshot(c.Request.Context(), selection.Channel.ID, clock.Now()); err != nil {
+		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
 	}
-	var purchaseRate string
-	purchaseFX, purchaseRate, err = service.GatewayFX(c.Request.Context(), purchase.Currency)
-	if err != nil {
-		gatewayError(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
-		return
-	}
-	attempt = &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: record.ID, ChannelID: selection.Channel.ID, ProviderID: selection.Channel.ProviderID, ModelID: selection.Channel.ModelID, MemberTier: 1,
-		StartedAt: attemptStart.UnixMilli(), FailoverDecision: "stop", FailoverReason: "single_attempt", CircuitAction: "none", RouteDiagnostics: selection.Diagnostics,
-		UsageSource: "none", PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, Cost: money.Amount{Currency: purchase.Currency}, AccountingFXRate: purchaseRate,
-		ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, ConversionLosses: losses}
 	info.SetEstimatePromptTokens(estimatedInput)
 	encoded, err = adaptor.PrepareChatRequest(c, info, converted, encoded)
 	if err != nil {
-		attemptErr = types.NewError(errors.New("upstream preparation failed"), types.ErrorCodeDoRequestFailed)
-		gatewayError(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
+		result = gatewayPreparationRejection(err, budget, parent.Context(), selection.Channel.ProviderID, info.RequestId)
+		run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
 		return
 	}
 	prepared, err := adaptor.PrepareRequest(c, info, bytes.NewReader(encoded))
 	if err != nil {
-		attemptErr = types.NewError(err, types.ErrorCodeDoRequestFailed)
-		gatewayError(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
+		result = gatewayPreparationRejection(err, budget, parent.Context(), selection.Channel.ProviderID, info.RequestId)
+		run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
+		return
+	}
+	// Preparation shares the budget but is not part of the model Attempt or its purchase snapshot.
+	attemptStart := clock.Now()
+	var purchaseRate string
+	purchase, purchaseFX, purchaseRate, err = gatewayChannelPurchaseSnapshot(c.Request.Context(), selection.Channel.ID, attemptStart)
+	if err != nil {
+		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
 	}
 	purchaseInput = billingexpr.RequestInput{Body: append([]byte(nil), encoded...), Headers: make(map[string]string)}
@@ -471,64 +621,144 @@ func TextGateway(c *gin.Context) {
 	}
 	costEstimate, convertedEstimate, _, err := service.GatewayPrice(purchase, estimatedUsage, purchaseInput, attemptStart, decimal.NewFromInt(1), purchaseFX)
 	if err != nil {
-		gatewayError(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
+		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
 	}
 	estimatedCost, err = costEstimate.Cost()
 	if err != nil {
-		gatewayError(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
+		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
 	}
 	estimatedConverted, err = convertedEstimate.Cost()
 	if err != nil {
-		gatewayError(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
+		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
 	}
+	attempt = &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: record.ID, ChannelID: selection.Channel.ID, ProviderID: selection.Channel.ProviderID, ModelID: selection.Channel.ModelID, MemberTier: 1,
+		StartedAt: attemptStart.UnixMilli(), FailoverDecision: "stop", FailoverReason: "single_attempt", CircuitAction: "none", RouteDiagnostics: selection.Diagnostics,
+		UsageSource: "none", PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, Cost: money.Amount{Currency: purchase.Currency}, AccountingFXRate: purchaseRate,
+		ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, ConversionLosses: losses}
+	attemptContext, budgetErr := budget.Start()
+	if budgetErr != nil {
+		attempt = nil
+		run.fail(c, http.StatusServiceUnavailable, "budget_exhausted", "Upstream request failed")
+		return
+	}
+	c.Request = parent.WithContext(attemptContext)
+	defer budget.Delivered()
 	response, err := adaptor.DoPreparedRequest(c, info, prepared)
 	if err != nil {
+		transportFailed = true
 		attemptErr = types.NewError(err, types.ErrorCodeDoRequestFailed)
-		gatewayError(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
+		var rejection *types.NewAPIError
+		if errors.As(err, &rejection) && rejection.GetErrorCode() != types.ErrorCodeDoRequestFailed && rejection.StatusCode >= 100 && (!budget.TimedOut() || rejection.StatusCode != 500) {
+			attemptErr = rejection
+			upstreamStatus, transportFailed = rejection.StatusCode, false
+			failure := rejection.ToOpenAIError()
+			upstreamCode, _ = failure.Code.(string)
+			if upstreamCode == "" {
+				upstreamCode = string(rejection.GetErrorCode())
+			}
+			upstreamType = failure.Type
+		}
+		run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
 		return
 	}
 	httpResponse, ok := response.(*http.Response)
 	if !ok || httpResponse == nil {
 		attemptErr = types.NewError(errors.New("missing upstream response"), types.ErrorCodeBadResponse)
-		gatewayError(c, http.StatusBadGateway, "upstream_error", "Invalid upstream response")
+		run.fail(c, http.StatusBadGateway, "upstream_error", "Invalid upstream response")
 		return
 	}
+	upstreamStatus = httpResponse.StatusCode
 	if httpResponse.StatusCode != http.StatusOK {
+		// Parse only bounded structured codes; provider text and URLs never leave memory.
+		raw, readErr := io.ReadAll(io.LimitReader(httpResponse.Body, 1<<20))
+		_ = httpResponse.Body.Close()
+		buffered := io.NopCloser(bytes.NewReader(raw))
+		if body, ok := httpResponse.Body.(channel.ReplayableResponseBody); ok {
+			body.SetReader(buffered)
+		} else {
+			httpResponse.Body = buffered
+		}
+		var payload struct {
+			Error any `json:"error"`
+		}
+		if readErr == nil && common.Unmarshal(raw, &payload) == nil {
+			switch failure := payload.Error.(type) {
+			case string:
+				upstreamCode = failure
+			case map[string]any:
+				upstreamType, _ = failure["type"].(string)
+				upstreamCode, _ = failure["code"].(string)
+				if upstreamCode == "" {
+					upstreamCode, _ = failure["type"].(string)
+				}
+			}
+		}
+
 		// Error bodies use the same protocol parser to preserve reported usage
 		// without forwarding Provider error text or treating it as output.
 		stream := info.IsStream
 		info.IsStream = false
-		result, _ := adaptor.DoResponse(c, httpResponse, info)
-		usage, _ = result.(*dto.Usage)
+		responseUsage, responseFailure := adaptor.DoResponse(c, httpResponse, info)
+		usage, _ = responseUsage.(*dto.Usage)
+		if responseFailure != nil {
+			failure := responseFailure.ToOpenAIError()
+			if upstreamCode == "" {
+				upstreamCode, _ = failure.Code.(string)
+			}
+			if upstreamType == "" {
+				upstreamType = failure.Type
+			}
+		}
 		info.IsStream = stream
 		attemptErr = types.NewErrorWithStatusCode(errors.New("upstream request failed"), types.ErrorCodeBadResponse, httpResponse.StatusCode)
 		status := httpResponse.StatusCode
 		if status < 400 || status > 599 {
 			status = http.StatusBadGateway
 		}
-		gatewayError(c, status, "upstream_error", "Upstream request failed")
+		run.fail(c, status, "upstream_error", "Upstream request failed")
 		return
 	}
 	info.IsStream = info.IsStream || strings.HasPrefix(httpResponse.Header.Get("Content-Type"), "text/event-stream")
-	result, responseErr := adaptor.DoResponse(c, httpResponse, info)
-	usage, _ = result.(*dto.Usage)
-	attemptErr = responseErr
-	if responseErr != nil && (!c.Writer.Written() || info.IsStream && !info.ResponseFacts.DownstreamWriteFailed && c.Request.Context().Err() == nil) {
-		gatewayError(c, http.StatusBadGateway, "upstream_error", "Upstream response failed")
+	if info.IsStream {
+		httpResponse.Body = helper.GatewayStreamIdleBody(httpResponse.Body, info)
 	}
+	responseUsage, responseErr := adaptor.DoResponse(c, httpResponse, info)
+	usage, _ = responseUsage.(*dto.Usage)
+	attemptErr = responseErr
+	if responseErr != nil {
+		apiError := responseErr.ToOpenAIError()
+		upstreamType = apiError.Type
+		upstreamCode, _ = apiError.Code.(string)
+		if upstreamCode == "" {
+			upstreamCode = apiError.Type
+		}
+	}
+	if status, _ := gatewayAttemptOutcome(c, info, responseErr); status != "success" {
+		run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream response failed")
+	}
+	if responseErr != nil && !c.Writer.Written() {
+		run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream response failed")
+	}
+	return
 }
 
-// gatewayAttemptOutcome classifies facts without persisting provider messages.
-// It is independent of any future failover policy.
+// gatewayAttemptOutcome distinguishes accepted business content from protocol
+// framing, downstream failures and incomplete upstream streams.
 func gatewayAttemptOutcome(c *gin.Context, info *relaycommon.RelayInfo, err *types.NewAPIError) (string, string) {
 	if c.Request.Context().Err() != nil {
 		return "cancelled", "client_cancelled"
 	}
 	if info.ResponseFacts.DownstreamWriteFailed {
 		return "failed", "downstream_write_failed"
+	}
+	if info.PerformanceBusinessRejection {
+		if info.ResponseFacts.BusinessOutput {
+			return "partial", "content_safety"
+		}
+		return "failed", "content_safety"
 	}
 	if err != nil {
 		if info.ResponseFacts.BusinessOutput {
@@ -537,8 +767,7 @@ func gatewayAttemptOutcome(c *gin.Context, info *relaycommon.RelayInfo, err *typ
 		return "failed", "upstream_error"
 	}
 	if info.IsStream {
-		outcome := info.StreamStatus.OutcomeSnapshot()
-		if outcome.Response == relaycommon.ResponseOutcomeFailed || outcome.Response == relaycommon.ResponseOutcomeIncomplete || outcome.HasErrors || !info.StreamStatus.IsNormalEnd() || outcome.ExpectsTerminal && outcome.Response == relaycommon.ResponseOutcomeUnknown && outcome.EndReason != relaycommon.StreamEndReasonDone {
+		if !info.StreamStatus.CompletedNormally() {
 			if info.ResponseFacts.BusinessOutput {
 				return "partial", "stream_interrupted"
 			}

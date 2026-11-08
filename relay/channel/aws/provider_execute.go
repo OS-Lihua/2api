@@ -8,8 +8,10 @@ import (
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -19,6 +21,7 @@ import (
 )
 
 var _ channel.ProviderRequestExecutor = (*Provider)(nil)
+var _ channel.ProviderRequestPreparer = (*Provider)(nil)
 
 type awsStreamBody struct {
 	*io.PipeReader
@@ -31,7 +34,23 @@ func (body *awsStreamBody) Close() error {
 }
 
 func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetadata, body io.Reader) (*http.Response, error) {
+	execute, err := p.PrepareExecution(c, metadata, body)
+	if err != nil {
+		return nil, err
+	}
+	return execute(c)
+}
+
+// PrepareExecution validates SDK configuration and freezes the final wire body
+// without sending. The returned exchange reads the host's current send context.
+func (p *Provider) PrepareExecution(c *gin.Context, metadata channel.ProviderMetadata, body io.Reader) (channel.ProviderExecution, error) {
 	request := metadata.ProviderRequest()
+	managed := false
+	if c != nil {
+		value, _ := c.Get(string(constant.ContextKeyResponseFacts))
+		facts, _ := value.(*relaycommon.ResponseFacts)
+		managed = facts != nil && facts.OnBusinessOutput != nil
+	}
 	if request.ChannelOtherSettings.AwsApiType == dto.AwsApiTypeMantle {
 		req, err := p.NewMantleRequest(c, metadata, body)
 		if err != nil {
@@ -41,7 +60,15 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 		if err != nil {
 			return nil, err
 		}
-		return client.Do(req)
+		if managed {
+			client = channel.GatewayHTTPClient(client)
+		}
+		return func(c *gin.Context) (*http.Response, error) {
+			if c != nil && c.Request != nil {
+				req = req.WithContext(c.Request.Context())
+			}
+			return client.Do(req)
+		}, nil
 	}
 	switch request.ChannelOtherSettings.AwsApiType {
 	case "", dto.AwsApiTypeInvokeModel:
@@ -78,14 +105,38 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 			return nil, err
 		}
 	}
+	prepared := &awsPreparedInvocation{client: client, modelID: modelID, payload: payload, stream: request.IsStream && !nova, managed: managed}
+	if managed {
+		httpClient := client.Options().HTTPClient
+		if base, ok := httpClient.(*http.Client); ok {
+			httpClient = channel.GatewayHTTPClient(base)
+		}
+		prepared.options = append(prepared.options, func(options *bedrockruntime.Options) {
+			options.RetryMaxAttempts = 1
+			options.HTTPClient = httpClient
+		})
+	}
+	return prepared.execute, nil
+}
+
+type awsPreparedInvocation struct {
+	client  *bedrockruntime.Client
+	modelID string
+	payload []byte
+	stream  bool
+	managed bool
+	options []func(*bedrockruntime.Options)
+}
+
+func (prepared *awsPreparedInvocation) execute(c *gin.Context) (*http.Response, error) {
 	parent := context.Background()
 	if c != nil && c.Request != nil {
 		parent = c.Request.Context()
 	}
-	ctx, cancel := newAwsInvokeContext(parent)
-	if !request.IsStream || nova {
+	ctx, cancel := newAwsInvokeContext(parent, prepared.managed)
+	if !prepared.stream {
 		defer cancel()
-		output, err := client.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{ModelId: aws.String(modelID), ContentType: aws.String("application/json"), Accept: aws.String("application/json"), Body: payload})
+		output, err := prepared.client.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{ModelId: aws.String(prepared.modelID), ContentType: aws.String("application/json"), Accept: aws.String("application/json"), Body: prepared.payload}, prepared.options...)
 		if err != nil {
 			return nil, newAwsInvokeError(parent, err, "InvokeModel")
 		}
@@ -93,7 +144,7 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 		response.Header.Set("Content-Type", "application/json")
 		return response, nil
 	}
-	output, err := client.InvokeModelWithResponseStream(ctx, &bedrockruntime.InvokeModelWithResponseStreamInput{ModelId: aws.String(modelID), ContentType: aws.String("application/json"), Accept: aws.String("application/json"), Body: payload})
+	output, err := prepared.client.InvokeModelWithResponseStream(ctx, &bedrockruntime.InvokeModelWithResponseStreamInput{ModelId: aws.String(prepared.modelID), ContentType: aws.String("application/json"), Accept: aws.String("application/json"), Body: prepared.payload}, prepared.options...)
 	if err != nil {
 		cancel()
 		return nil, newAwsInvokeError(parent, err, "InvokeModelWithResponseStream")

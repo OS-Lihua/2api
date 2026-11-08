@@ -18,6 +18,54 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+// observeGatewayError preserves structured protocol facts for the shared
+// failure classifier. Raw provider messages never leave the parser.
+func observeGatewayError(info *relaycommon.RelayInfo, body []byte) bool {
+	root := gjson.ParseBytes(body)
+	failure := root.Get("error")
+	if (!failure.Exists() || failure.Type == gjson.Null) && root.Get("type").String() != "error" {
+		return false
+	}
+	if !failure.IsObject() {
+		failure = root
+	}
+	code, kind := failure.Get("code").String(), failure.Get("type").String()
+	if code == "" {
+		code = kind
+	}
+	status := 0
+	if value := failure.Get("code"); value.Type == gjson.Number && value.Int() >= 400 && value.Int() <= 599 {
+		status = int(value.Int())
+	}
+	info.StreamStatus.MarkFailed(code, kind, status)
+	return true
+}
+
+// observeGatewaySafety records protocol rejection semantics independently of
+// any content included in the same response. Delivery still controls charging.
+func observeGatewaySafety(info *relaycommon.RelayInfo, body []byte, format types.RelayFormat) bool {
+	root := gjson.ParseBytes(body)
+	rejected := false
+	switch format {
+	case types.RelayFormatGemini:
+		rejected = root.Get("promptFeedback.blockReason").String() != ""
+		for _, candidate := range root.Get("candidates").Array() {
+			switch candidate.Get("finishReason").String() {
+			case "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT":
+				rejected = true
+			}
+		}
+	case types.RelayFormatOpenAI:
+		for _, choice := range root.Get("choices").Array() {
+			rejected = rejected || choice.Get("finish_reason").String() == "content_filter"
+		}
+	case types.RelayFormatClaude:
+		rejected = root.Get("stop_reason").String() == "refusal" || root.Get("delta.stop_reason").String() == "refusal"
+	}
+	info.PerformanceBusinessRejection = info.PerformanceBusinessRejection || rejected
+	return rejected
+}
+
 // gatewayJSONResponse uses the shared conversion registry and preserves the
 // delivery/presence contract of the money gateway across all four protocols.
 func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
@@ -42,6 +90,11 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	if err != nil {
 		return usage, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
+	protocolError := observeGatewayError(info, body)
+	if resp.StatusCode != http.StatusOK || protocolError {
+		return usage, types.NewError(fmt.Errorf("upstream response failed"), types.ErrorCodeBadResponse)
+	}
+	observeGatewaySafety(info, body, p.format)
 	var response any
 	switch p.kind {
 	case protocol.OpenAIChat:
@@ -105,10 +158,6 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		usage.CompletionTokens = tokenkit.Count(info.TokenizerModelName(), facts.GeneratedText)
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
-	upstreamError := gjson.GetBytes(body, "error")
-	if resp.StatusCode != http.StatusOK || upstreamError.Exists() && upstreamError.Type != gjson.Null {
-		return usage, types.NewError(fmt.Errorf("upstream response failed"), types.ErrorCodeBadResponse)
-	}
 	converted, err := relayconvert.ConvertResponse(c, info, info.RelayFormat, response)
 	if err != nil {
 		return usage, types.NewError(err, types.ErrorCodeBadResponseBody)
