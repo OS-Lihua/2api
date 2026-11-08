@@ -54,10 +54,14 @@ type ResponsesWSGateway func(*gin.Context, *ResponsesWSCall) (bool, *types.NewAP
 // These callbacks and probe values are transient and must never be persisted.
 type NativeWSLifecycle struct {
 	Protocol          protocol.Type
+	TransportOnly     bool
+	OriginalBody      []byte
+	ConnectionReady   func()
 	StartedAt         time.Time
 	Budget            *service.GatewayAttemptBudget
 	OutputAudio       bool
 	InputUsage        *dto.Usage
+	EstimateInput     func([]byte) (*dto.Usage, error)
 	Capabilities      capability.Set
 	Validate          func(billingexpr.RequestInput, billingexpr.RequestInput, *dto.Usage) error
 	Prepare           func(*gin.Context, *relaycommon.RelayInfo) (*relaychannel.PreparedWssRequest, error)

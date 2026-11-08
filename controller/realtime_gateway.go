@@ -38,15 +38,17 @@ import (
 // Response also owns the handshake; metadata alone never creates a sale.
 // Financial workers wait for the existing native transport's single owner.
 type realtimeGatewayResponse struct {
-	session           *realtimeGatewaySession
-	call              *relay.ResponsesWSCall
-	steps             chan *realtimeGatewayAttempt
-	finalized         chan struct{}
-	apiErr            *types.NewAPIError
-	last              realtimeGatewayCompletion
-	established       bool
-	terminalDelivered bool
-	finishing         bool
+	session                     *realtimeGatewaySession
+	call                        *relay.ResponsesWSCall
+	steps                       chan *realtimeGatewayAttempt
+	finalized                   chan struct{}
+	apiErr                      *types.NewAPIError
+	last                        realtimeGatewayCompletion
+	established                 bool
+	terminalDelivered           bool
+	finishing                   bool
+	conversationInput           *dto.Usage
+	tokenizerModel, inputFormat string
 }
 
 type realtimeGatewayAttempt struct {
@@ -147,7 +149,7 @@ func RealtimeGateway(c *gin.Context) {
 		runner: newResponsesWSRequestRunner(c), auth: newResponsesWSRequestRunner(c, true),
 		offeringID: offering.ID, model: c.Query("model"),
 		active: map[string]*realtimeGatewayAttempt{}, completed: map[string]bool{},
-		defaults: []byte(`{}`), vadTurns: map[string]*realtimeVADTurn{}, inputFormat: "pcm16", outputFormat: "pcm16",
+		defaults: []byte(`{}`), vadTurns: map[string]*realtimeVADTurn{}, inputFormat: "pcm16", outputFormat: "pcm16", configPending: true,
 	}
 	session.authID = c.GetString(common.RequestIdKey)
 	if session.authID == "" {
@@ -156,14 +158,13 @@ func RealtimeGateway(c *gin.Context) {
 	session.authBody, _ = common.Marshal(map[string]string{"model": session.model})
 	defer cancelRequests()
 	defer cancel(nil)
-	session.initial = session.begin([]byte(`{}`), &dto.Usage{}, c.GetTime(middleware.TextGatewayStartedAtKey))
+	session.initial = session.begin([]byte(`{}`), nil, &dto.Usage{}, c.GetTime(middleware.TextGatewayStartedAtKey))
 	first, apiErr := session.next(session.initial)
 	if apiErr != nil {
 		gatewayError(c, apiErr.StatusCode, string(apiErr.GetErrorCode()), apiErr.Error())
 		session.workers.Wait()
 		return
 	}
-	session.pending = first
 	client, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		session.finish(first, realtimeGatewayCompletion{apiErr: types.NewError(err, types.ErrorCodeInvalidRequest)})
@@ -185,7 +186,7 @@ func RealtimeGateway(c *gin.Context) {
 		transportInfo.RealtimePeerClosed = session.peerClosed
 		nativeContext := c.Copy()
 		nativeContext.Request = c.Request.WithContext(ioContext)
-		first.stopTimeout = context.AfterFunc(first.context, func() { cancel(service.ErrGatewayBudget) })
+		first.stopTimeout = context.AfterFunc(first.context, func() { cancel(context.Cause(first.context)) })
 		_, exchangeErr := relay.ExchangeRealtime(nativeContext, &transportInfo, first.prepared, func() {
 			session.channelID, session.providerID, session.providerType = first.channelID, first.providerID, first.info.ChannelType
 			session.tokenizerModel = first.info.TokenizerModelName()
@@ -193,6 +194,9 @@ func RealtimeGateway(c *gin.Context) {
 			session.keyIndex, session.upstreamModel = first.info.ChannelMultiKeyIndex, first.info.UpstreamModelName
 			session.identity = first.prepared.Identity()
 			first.response.established = true
+			if first.response.call.Native.ConnectionReady != nil {
+				first.response.call.Native.ConnectionReady()
+			}
 			first.response.call.Native.Budget.Pause()
 		})
 		if !first.response.established {
@@ -200,7 +204,6 @@ func RealtimeGateway(c *gin.Context) {
 			session.finish(first, realtimeGatewayCompletion{apiErr: exchangeErr})
 			first, apiErr = session.next(session.initial)
 			if apiErr == nil {
-				session.pending = first
 				continue
 			}
 		}
@@ -211,6 +214,7 @@ func RealtimeGateway(c *gin.Context) {
 		if errors.Is(context.Cause(ioContext), service.ErrGatewayBudget) {
 			completion.apiErr = types.NewError(service.ErrGatewayBudget, types.ErrorCodeDoRequestFailed)
 		}
+		session.finish(first, completion)
 		if session.pending != nil {
 			session.finish(session.pending, completion)
 			session.pending = nil
@@ -228,7 +232,7 @@ func RealtimeGateway(c *gin.Context) {
 	}
 }
 
-func (session *realtimeGatewaySession) begin(body []byte, input *dto.Usage, startedAt time.Time) *realtimeGatewayResponse {
+func (session *realtimeGatewaySession) begin(body, original []byte, input *dto.Usage, startedAt time.Time) *realtimeGatewayResponse {
 	session.sequence++
 	requestID := fmt.Sprintf("%s-rt-%d", session.authID, session.sequence)
 	response := &realtimeGatewayResponse{session: session, steps: make(chan *realtimeGatewayAttempt), finalized: make(chan struct{}), established: session.channelID != 0}
@@ -246,8 +250,25 @@ func (session *realtimeGatewaySession) begin(body []byte, input *dto.Usage, star
 		close(response.finalized)
 		return response
 	}
-	call.Native = &relay.NativeWSLifecycle{Protocol: protocol.OpenAIRealtime, StartedAt: startedAt, InputUsage: service.GatewayUsageSnapshot(input), Prepare: response.prepare, CreatePayload: response.payload,
+	response.conversationInput = session.defaultInput(false)
+	instructions := session.instructionTokens()
+	response.conversationInput.PromptTokens -= instructions
+	response.conversationInput.PromptTokensDetails.TextTokens -= instructions
+	response.tokenizerModel, response.inputFormat = session.tokenizerModel, session.inputFormat
+	if session.channelID != 0 {
+		var err error
+		input, err = response.estimateInput(projection)
+		if err != nil {
+			response.apiErr = types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest)
+			close(response.finalized)
+			return response
+		}
+	}
+	call.Native = &relay.NativeWSLifecycle{Protocol: protocol.OpenAIRealtime, TransportOnly: session.channelID == 0, OriginalBody: append([]byte(nil), original...), StartedAt: startedAt, InputUsage: service.GatewayUsageSnapshot(input), EstimateInput: response.estimateInput, Prepare: response.prepare, CreatePayload: response.payload,
 		Exchange: response.exchange, Established: response.connected, TerminalDelivered: response.delivered, SaleInput: response.saleInput, PurchaseInput: response.purchaseInput}
+	if !call.Native.TransportOnly && session.sequence == 2 {
+		call.Native.Budget = session.initial.call.Native.Budget
+	}
 	response.call = call
 	session.responses = append(session.responses, response)
 	session.workers.Go(func() {
@@ -277,6 +298,52 @@ func (session *realtimeGatewaySession) next(response *realtimeGatewayResponse) (
 	}
 }
 
+func (response *realtimeGatewayResponse) estimateInput(body []byte) (*dto.Usage, error) {
+	input := service.GatewayUsageSnapshot(response.conversationInput)
+	value := ojson.ParseBytes(body)
+	items := value.Get("input")
+	if items.Exists() && items.Type != ojson.Null || value.Get("conversation").String() == "none" {
+		input = &dto.Usage{}
+		if items.Exists() && items.Type != ojson.Null && !items.IsArray() {
+			return nil, errors.New("Realtime input must be an array")
+		}
+		for _, item := range items.Array() {
+			switch item.Get("type").String() {
+			case "function_call":
+				input.PromptTokens += tokenkit.Count(response.tokenizerModel, item.Get("name").String()+item.Get("arguments").String())
+			case "function_call_output":
+				input.PromptTokens += tokenkit.Count(response.tokenizerModel, item.Get("output").String())
+			case "message", "":
+				for _, part := range item.Get("content").Array() {
+					switch part.Get("type").String() {
+					case "input_text", "text":
+						input.PromptTokens += tokenkit.Count(response.tokenizerModel, part.Get("text").String())
+					case "input_audio":
+						audio, err := base64.StdEncoding.DecodeString(part.Get("audio").String())
+						if err != nil {
+							return nil, errors.New("Invalid Realtime input audio")
+						}
+						tokens := service.CountRealtimeAudioTokens(int64(len(audio)), response.inputFormat, true)
+						input.PromptTokens += tokens
+						input.PromptTokensDetails.AudioTokens += tokens
+					default:
+						return nil, errors.New("Unsupported Realtime input content")
+					}
+				}
+			default:
+				return nil, errors.New("Unsupported Realtime input item")
+			}
+		}
+	}
+	input.PromptTokens += tokenkit.Count(response.tokenizerModel, value.Get("instructions").String())
+	for _, tool := range value.Get("tools").Array() {
+		input.PromptTokens += tokenkit.Count(response.tokenizerModel, tool.Raw)
+	}
+	input.PromptTokensDetails.TextTokens = input.PromptTokens - input.PromptTokensDetails.AudioTokens
+	input.TotalTokens = input.PromptTokens
+	return input, nil
+}
+
 func (response *realtimeGatewayResponse) prepare(c *gin.Context, info *relaycommon.RelayInfo) (*relaychannel.PreparedWssRequest, error) {
 	prepared, err := relay.PrepareNativeWebSocketRequest(c, info, protocol.OpenAIRealtime)
 	if err != nil {
@@ -292,7 +359,19 @@ func (response *realtimeGatewayResponse) payload(body []byte) ([]byte, error) {
 	if err := document.Delete("model"); err != nil {
 		return nil, err
 	}
+	eventID := document.Get("event_id")
+	if err := document.Delete("event_id"); err != nil {
+		return nil, err
+	}
 	event := ojson.NewDoc([]byte(`{"type":"response.create"}`))
+	if eventID.Exists() {
+		if eventID.Type != ojson.String {
+			return nil, errors.New("event_id must be a string")
+		}
+		if err := event.SetRawBytes("event_id", []byte(eventID.Raw)); err != nil {
+			return nil, err
+		}
+	}
 	if err := event.SetRawBytes("response", document.Bytes()); err != nil {
 		return nil, err
 	}
@@ -309,7 +388,7 @@ func (response *realtimeGatewayResponse) purchaseInput() billingexpr.RequestInpu
 
 func (response *realtimeGatewayResponse) exchange(c *gin.Context, info *relaycommon.RelayInfo, channelID, providerID int, prepared *relaychannel.PreparedWssRequest, payload []byte) (*dto.Usage, *types.NewAPIError) {
 	attempt := &realtimeGatewayAttempt{channelID: channelID, providerID: providerID, info: info, prepared: prepared, context: c.Request.Context(), reply: make(chan realtimeGatewayCompletion, 1), response: response,
-		saleInput: billingexpr.RequestInput{Body: response.call.Body, Headers: info.RequestHeaders}, purchaseInput: billingexpr.RequestInput{Body: payload, Headers: map[string]string{}}, input: response.call.Native.InputUsage}
+		saleInput: billingexpr.RequestInput{Body: response.call.Native.OriginalBody, Headers: info.RequestHeaders}, purchaseInput: billingexpr.RequestInput{Body: payload, Headers: map[string]string{}}, input: response.call.Native.InputUsage}
 	for name, values := range prepared.Headers() {
 		attempt.purchaseInput.Headers[strings.ToLower(name)] = strings.Join(values, ",")
 	}
@@ -416,9 +495,8 @@ func (session *realtimeGatewaySession) requestAt(raw []byte, startedAt time.Time
 		additional := service.CountRealtimeAudioTokens(nextBytes, session.inputFormat, true) - service.CountRealtimeAudioTokens(session.audioBytes, session.inputFormat, true)
 		input.PromptTokens += additional
 		input.PromptTokensDetails.AudioTokens += additional
-		_, apiErr := session.admitGeneration(session.defaults, input, startedAt)
-		if apiErr != nil {
-			return nil, apiErr
+		if maximum := session.capabilities.Limits.ContextLength; maximum != nil && int64(input.PromptTokens) > *maximum {
+			return nil, types.NewErrorWithStatusCode(errors.New("Channel context limit exceeded"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
 		}
 		session.audioBytes = nextBytes
 		return raw, nil
@@ -456,65 +534,21 @@ func (session *realtimeGatewaySession) requestAt(raw []byte, startedAt time.Time
 	if err := helper.ValidateRealtimeMultipliers(document.Bytes()); err != nil {
 		return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest)
 	}
-	input := session.defaultInput(false)
-	if value := body.Get("input"); value.Exists() {
-		var text strings.Builder
-		for _, item := range value.Array() {
-			for _, content := range item.Get("content").Array() {
-				text.WriteString(content.Get("text").String())
-			}
-		}
-		input.PromptTokens = tokenkit.Count(session.pendingModel(), text.String()) + session.instructionTokens()
-		input.PromptTokensDetails.AudioTokens = 0
-	}
-	attempt, apiErr := session.admitGeneration(document.Bytes(), input, startedAt)
-	if apiErr != nil {
-		return nil, apiErr
-	}
-	effective := ojson.NewDoc(document.Bytes())
-	_ = effective.Set("model", attempt.info.UpstreamModelName)
-	wire, err := relaycommon.ApplyParamOverrideWithRelayInfo(effective.Bytes(), attempt.info)
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeInvalidRequest)
-	}
-	wire, err = helper.NormalizeRealtimeRequestLimits(wire, attempt.response.call.Native.Capabilities, input.PromptTokens)
-	if err != nil {
-		return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest)
-	}
-	outputs := ojson.GetBytes(wire, "output_modalities")
-	if !outputs.Exists() {
-		outputs = ojson.GetBytes(wire, "modalities")
-	}
-	attempt.response.call.Native.OutputAudio = !outputs.Exists() && slices.Contains(attempt.response.call.Native.Capabilities.OutputModalities, capability.Audio)
-	for _, output := range outputs.Array() {
-		if !slices.Contains(attempt.response.call.Native.Capabilities.OutputModalities, capability.Modality(output.String())) {
-			return nil, types.NewErrorWithStatusCode(errors.New("Output modality is not supported on this connection"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
-		}
-		if output.String() == "audio" {
-			attempt.response.call.Native.OutputAudio = true
-		}
-	}
-	var projected dto.OpenAIResponsesRequest
-	if common.Unmarshal(wire, &projected) != nil || projected.Model != attempt.info.UpstreamModelName || !service.GatewayResponsesCapabilitiesMatch(&projected, attempt.response.call.Native.Capabilities, input.PromptTokens) {
-		return nil, types.NewErrorWithStatusCode(errors.New("Realtime parameters exceed the connection capabilities"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
-	}
-	payload, err := attempt.response.payload(wire)
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeInvalidRequest)
-	}
 	if eventID := ojson.GetBytes(raw, "event_id"); eventID.Exists() {
 		if eventID.Type != ojson.String {
 			return nil, types.NewErrorWithStatusCode(errors.New("event_id must be a string"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
 		}
-		event := ojson.NewDoc(payload)
-		if err = event.SetRawBytes("event_id", []byte(eventID.Raw)); err != nil {
+		if err := document.SetRawBytes("event_id", []byte(eventID.Raw)); err != nil {
 			return nil, types.NewError(err, types.ErrorCodeInvalidRequest)
 		}
-		payload = event.Bytes()
 	}
-	original := ojson.NewDoc(document.Bytes())
-	_ = original.Set("model", session.model)
-	attempt.saleInput.Body = original.Bytes()
+	attempt, apiErr := session.admitGeneration(document.Bytes(), raw, session.defaultInput(false), startedAt)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	input := service.GatewayUsageSnapshot(attempt.response.call.Native.InputUsage)
+	// Send the payload already converted, bounded and priced before reserve.
+	payload := attempt.purchaseInput.Body
 	attempt.purchaseInput.Body = payload
 	attempt.input = service.GatewayUsageSnapshot(input)
 	if err = attempt.response.call.Native.Validate(attempt.saleInput, attempt.purchaseInput, input); err != nil {
@@ -527,13 +561,13 @@ func (session *realtimeGatewaySession) requestAt(raw []byte, startedAt time.Time
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
 	}
 	if attempt.stopTimeout == nil {
-		attempt.stopTimeout = context.AfterFunc(attempt.context, func() { session.cancel(service.ErrGatewayBudget) })
+		attempt.stopTimeout = context.AfterFunc(attempt.context, func() { session.cancel(context.Cause(attempt.context)) })
 	}
-	attempt.defaultConversation = ojson.GetBytes(wire, "conversation").String() != "none"
+	attempt.defaultConversation = ojson.GetBytes(payload, "response.conversation").String() != "none"
 	session.pending, session.awaiting = nil, attempt
 	return payload, nil
 }
-func (session *realtimeGatewaySession) admitGeneration(body []byte, input *dto.Usage, startedAt time.Time) (*realtimeGatewayAttempt, *types.NewAPIError) {
+func (session *realtimeGatewaySession) admitGeneration(body, original []byte, input *dto.Usage, startedAt time.Time) (*realtimeGatewayAttempt, *types.NewAPIError) {
 	if session.pending != nil {
 		return session.pending, nil
 	}
@@ -549,7 +583,7 @@ func (session *realtimeGatewaySession) admitGeneration(body []byte, input *dto.U
 			return nil, types.NewError(context.Cause(session.context), types.ErrorCodeDoRequestFailed)
 		}
 	}
-	response := session.begin(body, input, startedAt)
+	response := session.begin(body, original, input, startedAt)
 	attempt, apiErr := session.next(response)
 	if apiErr != nil {
 		return nil, apiErr
@@ -565,10 +599,6 @@ func (session *realtimeGatewaySession) authorize(c *gin.Context) *types.NewAPIEr
 		return types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound)
 	}
 	return authorizeWebSocketOffering(c, session.model)
-}
-
-func (session *realtimeGatewaySession) pendingModel() string {
-	return session.tokenizerModel
 }
 
 func (session *realtimeGatewaySession) instructionTokens() int {
@@ -713,6 +743,7 @@ func (session *realtimeGatewaySession) event(raw []byte) ([]byte, [][]byte, *typ
 		value := ojson.GetBytes(raw, "session")
 		var commands [][]byte
 		if kind == "session.created" {
+			session.configPending = false
 			settings, apiErr := session.prepareSessionSettings([]byte(value.Raw), true)
 			if apiErr != nil {
 				return nil, nil, apiErr

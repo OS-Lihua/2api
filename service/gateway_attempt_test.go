@@ -425,6 +425,43 @@ func TestGatewaySkippedCandidatesAndTiersShareTheSendBudget(t *testing.T) {
 	assert.Equal(t, 2, attempts[1].MemberTier)
 }
 
+func TestGatewayNativeTransportBudget(t *testing.T) {
+	t.Run("handshakes consume the shared maximum", func(t *testing.T) {
+		clock.UseFake(t, time.Unix(100, 0))
+		calls := 0
+		attempts := service.RunGatewayAttempts(t.Context(), service.GatewayAttemptPolicy{MaxAttempts: 3, TotalFirstByte: 90 * time.Second, AttemptFirstByte: 30 * time.Second}, func(b *service.GatewayAttemptBudget, e *service.GatewayExclusions) service.GatewayAttemptResult {
+			calls++
+			_, err := b.Start()
+			require.NoError(t, err)
+			for id := range calls - 1 {
+				assert.True(t, e.Channels[id+1])
+			}
+			return service.GatewayAttemptResult{TransportAttempt: true, SkippedChannel: calls, Failure: service.GatewayFailure{Class: "connection", Switch: true}}
+		})
+		assert.Equal(t, 3, calls)
+		assert.Empty(t, attempts, "Connection setup does not create model-generation records")
+	})
+	t.Run("metadata wait retains handshake expenditure", func(t *testing.T) {
+		fake := clock.UseFake(t, time.Unix(100, 0))
+		service.RunGatewayAttempts(t.Context(), service.GatewayAttemptPolicy{MaxAttempts: 3, TotalFirstByte: 20 * time.Second, AttemptFirstByte: 30 * time.Second}, func(b *service.GatewayAttemptBudget, e *service.GatewayExclusions) service.GatewayAttemptResult {
+			ctx, err := b.Start()
+			require.NoError(t, err)
+			fake.Advance(4 * time.Second)
+			b.Pause()
+			fake.Advance(time.Hour)
+			require.NoError(t, ctx.Err())
+			resumed, err := b.Start()
+			require.NoError(t, err)
+			assert.NoError(t, resumed.Err())
+			fake.Advance(16*time.Second - time.Nanosecond)
+			require.NoError(t, ctx.Err())
+			fake.Advance(time.Nanosecond)
+			assert.ErrorIs(t, context.Cause(ctx), service.ErrGatewayBudget)
+			return service.GatewayAttemptResult{TransportAttempt: true, Established: true}
+		})
+	})
+}
+
 func TestGatewayBudgetExcludesPreparationAndStopsAfterDelivery(t *testing.T) {
 	fake := clock.UseFake(t, time.Unix(100, 0))
 	calls := 0

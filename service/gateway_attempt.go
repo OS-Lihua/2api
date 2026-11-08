@@ -183,13 +183,16 @@ func (b *GatewayAttemptBudget) TimedOut() bool {
 }
 
 type GatewayAttemptResult struct {
-	Attempt     *model.GatewayAttempt
-	Failure     GatewayFailure
-	Delivered   bool
-	Established bool
-	FirstByte   time.Duration
-	RetryAfter  string
-	HealthLease string
+	// TransportAttempt counts a native handshake against the same attempt
+	// budget without creating a model-generation accounting record.
+	TransportAttempt bool
+	Attempt          *model.GatewayAttempt
+	Failure          GatewayFailure
+	Delivered        bool
+	Established      bool
+	FirstByte        time.Duration
+	RetryAfter       string
+	HealthLease      string
 	// Skipped excludes a candidate rejected by preparation, without an Attempt.
 	SkippedChannel  int
 	SkippedProvider int
@@ -205,9 +208,13 @@ func RunGatewayAttempts(ctx context.Context, policy GatewayAttemptPolicy, execut
 	exclusions := &GatewayExclusions{Channels: map[int]bool{}, Providers: map[int]bool{}}
 	remaining := policy.TotalFirstByte
 	attempts := []model.GatewayAttempt{}
-	for len(attempts) < policy.MaxAttempts && ctx.Err() == nil && remaining >= 5*time.Second {
+	dispatched := 0
+	for dispatched < policy.MaxAttempts && ctx.Err() == nil && remaining >= 5*time.Second {
 		budget := &GatewayAttemptBudget{parent: ctx, policy: policy, remaining: remaining}
 		result := execute(budget, exclusions)
+		if result.Attempt != nil || result.TransportAttempt {
+			dispatched++
+		}
 		budget.Delivered()
 		remaining -= budget.elapsed
 		if budget.cancel != nil {
@@ -218,6 +225,9 @@ func RunGatewayAttempts(ctx context.Context, policy GatewayAttemptPolicy, execut
 				attempts[len(attempts)-1].FailoverDecision = "stop"
 				attempts[len(attempts)-1].FailoverReason = result.Failure.Class
 			}
+			break
+		}
+		if result.TransportAttempt && (result.Established || !result.Failure.Switch || dispatched >= policy.MaxAttempts) {
 			break
 		}
 		if result.SkippedChannel > 0 && result.Attempt == nil {
@@ -257,7 +267,7 @@ func RunGatewayAttempts(ctx context.Context, policy GatewayAttemptPolicy, execut
 			attempt.FailoverReason = "connection_established"
 		case ctx.Err() != nil:
 			attempt.FailoverReason = "client_cancelled"
-		case len(attempts)+1 >= policy.MaxAttempts && canSwitch:
+		case dispatched >= policy.MaxAttempts && canSwitch:
 			attempt.FailoverReason = "attempt_limit"
 		case remaining < 5*time.Second && canSwitch:
 			attempt.FailoverReason = "first_byte_budget"

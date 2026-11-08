@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/capability"
+	"github.com/QuantumNous/new-api/pkg/channelhealth"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/pkg/protocol"
@@ -75,6 +76,49 @@ func authorizeWebSocketOffering(c *gin.Context, requested string) *types.NewAPIE
 	return nil
 }
 
+// runRealtimeTransportAttempt opens the native session through the shared Route,
+// health and attempt budget. Session setup does not generate a response. Each
+// subsequent response reserves its known input and output plan before inference.
+func runRealtimeTransportAttempt(c *gin.Context, call *relay.ResponsesWSCall, run *textGatewayRun, info *relaycommon.RelayInfo, selection *service.GatewaySelection, budget *service.GatewayAttemptBudget, stopProbe func()) (result service.GatewayAttemptResult) {
+	prepared, err := call.Prepare(c, info)
+	if err != nil {
+		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "Invalid Channel settings")
+		return
+	}
+	ctx, err := budget.Start()
+	if err != nil {
+		run.fail(c, http.StatusGatewayTimeout, "first_byte_budget", "First byte budget exhausted")
+		return
+	}
+	call.Native.ConnectionReady = func() {
+		stopProbe()
+		_ = service.ChannelHealth.Release(context.WithoutCancel(ctx), selection.Admission)
+	}
+	parent := c.Request
+	c.Request = parent.WithContext(ctx)
+	_, apiErr := call.Exchange(c, info, selection.Channel.ID, selection.Provider.Id, prepared, nil)
+	c.Request = parent
+	result.TransportAttempt, result.Established = true, call.Established()
+	if call.Established() {
+		result.Failure.Class = "connection_established"
+		return
+	}
+	status, code, errorType := prepared.HandshakeStatus(), "", ""
+	if apiErr != nil {
+		native := apiErr.ToOpenAIError()
+		code, _ = native.Code.(string)
+		errorType = native.Type
+	}
+	result.Failure = service.ClassifyGatewayFailure(status, code, true, budget.TimedOut(), parent.Context().Err() != nil, false, errorType)
+	recordGatewayProviderFailure(c, info, selection, result.Failure)
+	_, _ = service.ChannelHealth.Record(context.WithoutCancel(ctx), channelhealth.Sample{AttemptID: common.NewRequestId(), ChannelID: selection.Channel.ID, ProviderFailure: result.Failure.Switch, RateLimited: result.Failure.Class == "rate_limited", RetryAfter: prepared.RetryAfter(), Lease: selection.Admission.Lease})
+	if result.Failure.ExcludeProvider {
+		result.SkippedProvider = selection.Provider.Id
+	}
+	run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream connection failed")
+	return
+}
+
 func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, run *textGatewayRun, budget *service.GatewayAttemptBudget, exclusions *service.GatewayExclusions) (result service.GatewayAttemptResult) {
 	run.status, run.code, run.message = 0, "", ""
 	offering := middleware.TextOffering(c)
@@ -104,6 +148,9 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	request := &dto.GeneralOpenAIRequest{Model: call.Request.Model, Stream: common.GetPointer(true), MaxCompletionTokens: call.Request.MaxOutputTokens}
 	request.Messages = []dto.Message{{Role: "user", Content: string(call.Request.Input)}}
 	if call.Native != nil {
+		if call.Established() && call.Native.Budget != nil {
+			budget = call.Native.Budget
+		}
 		call.Native.Budget = budget
 	}
 	if call.Protocol() == protocol.OpenAIRealtime && billingexpr.UsesFixedPricingByHash(run.sale.Expression, billingexpr.ExprHashString(run.sale.Expression)) {
@@ -186,10 +233,16 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		budget.Delivered()
 	}}
 	common.SetContextKey(c, constant.ContextKeyResponseFacts, info.ResponseFacts)
+	if call.Native != nil && call.Native.TransportOnly {
+		return runRealtimeTransportAttempt(c, call, run, info, selection, budget, stopProbe)
+	}
 	saleInput, err := helper.ResolveIncomingBillingExprRequestInput(c, info)
 	if err != nil {
 		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid Responses request")
 		return
+	}
+	if call.Native != nil && len(call.Native.OriginalBody) > 0 {
+		saleInput.Body = call.Native.OriginalBody
 	}
 	// Channel overrides must not change the connection's native model identity.
 	document := ojson.NewDoc(call.Body)
@@ -205,6 +258,14 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	info.ParamOverride = overrides
 	body, err := relaycommon.ApplyParamOverrideWithRelayInfo(document.Bytes(), info)
 	if err == nil && call.Protocol() == protocol.OpenAIRealtime {
+		if call.Native.EstimateInput != nil {
+			call.Native.InputUsage, err = call.Native.EstimateInput(body)
+			if err != nil {
+				run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Invalid Realtime input")
+				return
+			}
+			inputTokens = &call.Native.InputUsage.PromptTokens
+		}
 		knownInput := 0
 		if inputTokens != nil {
 			knownInput = *inputTokens
@@ -280,8 +341,16 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		if !outputs.Exists() {
 			outputs = ojson.GetBytes(body, "modalities")
 		}
+		if outputs.Exists() && !outputs.IsArray() {
+			run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Output modalities must be an array")
+			return
+		}
 		call.Native.OutputAudio = !outputs.Exists() && slices.Contains(selection.Capabilities.OutputModalities, capability.Audio)
 		for _, output := range outputs.Array() {
+			if output.Type != ojson.String || !slices.Contains(selection.Capabilities.OutputModalities, capability.Modality(output.String())) {
+				run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Output modality is not supported on this connection")
+				return
+			}
 			if output.String() == "audio" {
 				call.Native.OutputAudio = true
 			}
@@ -289,6 +358,16 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		if call.Native.OutputAudio {
 			estimated.CompletionTokenDetails.AudioTokens = int(mean)
 		}
+	}
+	prepared, err := call.Prepare(c, info)
+	if err != nil {
+		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "Upstream connection settings are unavailable")
+		return
+	}
+	payload, err := call.CreatePayload(body)
+	if err != nil {
+		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid Responses request")
+		return
 	}
 	source, reserveValue, _, err := service.GatewayPrice(run.sale, estimated, input, started, run.ratio, run.saleFX)
 	reserve, reserveErr := reserveValue.Receivable()
@@ -316,11 +395,6 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
 		return
 	}
-	prepared, err := call.Prepare(c, info)
-	if err != nil {
-		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "Upstream connection settings are unavailable")
-		return
-	}
 	attemptStart := clock.Now()
 	purchase, purchaseFX, rate, err := gatewayChannelPurchaseSnapshot(c.Request.Context(), selection.Channel.ID, attemptStart)
 	if err != nil {
@@ -329,11 +403,6 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	}
 	if call.Protocol() == protocol.OpenAIRealtime && billingexpr.UsesFixedPricingByHash(purchase.Expression, billingexpr.ExprHashString(purchase.Expression)) {
 		run.fail(c, http.StatusBadRequest, "unsupported_pricing", "Fixed pricing is not supported for Realtime")
-		return
-	}
-	payload, err := call.CreatePayload(body)
-	if err != nil {
-		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid Responses request")
 		return
 	}
 	purchaseInput := billingexpr.RequestInput{Body: payload, Headers: map[string]string{}}
@@ -368,17 +437,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 				return quoteErr
 			}
 			if required.Nanos > run.reservation.Nanos {
-				additional, additionalErr := required.Sub(run.reservation)
-				if additionalErr != nil {
-					return additionalErr
-				}
-				wallet, walletErr := model.GetUserWallet(run.record.UserID)
-				if walletErr != nil {
-					return walletErr
-				}
-				if wallet.RequestsPaused || additional.Nanos > wallet.Balance.Nanos {
-					return model.ErrInsufficientWalletBalance
-				}
+				return model.ErrInsufficientWalletBalance
 			}
 			original, converted, _, quoteErr := service.GatewayPrice(purchase, probe, purchaseRequest, attemptStart, decimal.NewFromInt(1), purchaseFX)
 			if quoteErr != nil {
@@ -493,7 +552,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		if info.ResponseFacts.BusinessOutput {
 			saleUsage := service.GatewayUsageSnapshot(usage)
 			saleUsageSource := attempt.UsageSource
-			if attempt.Status == "partial" || !call.TerminalDelivered() {
+			if !info.ResponseFacts.CompletionTokensReported && (attempt.Status == "partial" || !call.TerminalDelivered()) {
 				delivered := tokenkit.Count(info.TokenizerModel, info.ResponseFacts.GeneratedText)
 				if info.ResponseFacts.DeliveredOutputTokens != nil {
 					delivered = *info.ResponseFacts.DeliveredOutputTokens
