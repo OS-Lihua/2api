@@ -304,6 +304,7 @@ func TestAsyncTaskTerminalAccountingKeepsAcceptedIdentityAndFrozenPrices(t *test
 	}{
 		{"success", "completed", "2", 820000000, 180000000, 100000000, 0},
 		{"failure", "failed", "2", 1000000000, 0, 100000000, 0},
+		{"explicit failed zero", "failed", "0", 1000000000, 0, 0, 0},
 		{"cancelled", "cancelled", "2", 1000000000, 0, 100000000, 0},
 		{"shortfall", "completed", "20", 0, 1800000000, 1000000000, 800000000},
 	} {
@@ -919,6 +920,119 @@ func TestAsyncTaskRecoveryDoesNotStarveLaterTerminalFacts(t *testing.T) {
 			wallet, err := model.GetUserWallet(fixture.user.Id)
 			require.NoError(t, err)
 			assert.Equal(t, tc.wallet, wallet.Balance.Nanos)
+		})
+	}
+}
+
+func TestAsyncTaskEvaluationFailuresUseExistingGatewayReconciliation(t *testing.T) {
+	for _, tc := range []struct {
+		name, sale, purchase, status               string
+		currency                                   money.Currency
+		salePending, costPending, convertedPending bool
+		wallet, charge, payable                    int64
+	}{
+		{"sale overflow", `u("seconds") == 2 ? tier("overflow", 10000000000) : tier("video", u("seconds") * 0.1)`, `tier("video", u("seconds") * 0.05)`, "completed", "USD", true, false, false, 640000000, 0, 100000000},
+		{"purchase overflow", `tier("video", u("seconds") * 0.1)`, `u("seconds") == 2 ? tier("overflow", 10000000000) : tier("video", u("seconds") * 0.05)`, "completed", "USD", false, true, true, 820000000, 180000000, 0},
+		{"purchase FX overflow", `tier("video", u("seconds") * 0.1)`, `u("seconds") == 2 ? tier("higher", 10) : tier("video", u("seconds") * 0.05)`, "completed", "EUR", false, false, true, 820000000, 180000000, 10000000000},
+		{"failed without actual usage", `tier("video", u("seconds") * 0.1)`, `tier("video", u("seconds") * 0.05)`, "failed", "USD", false, true, true, 1000000000, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			submits := 0
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method == http.MethodGet {
+					id := strings.TrimPrefix(r.URL.Path, "/v1/videos/")
+					if tc.status == "failed" {
+						_, _ = fmt.Fprintf(w, `{"id":%q,"status":"failed"}`, id)
+					} else {
+						_, _ = fmt.Fprintf(w, `{"id":%q,"status":%q,"seconds":"2"}`, id, tc.status)
+					}
+					return
+				}
+				submits++
+				_, _ = fmt.Fprintf(w, `{"id":"private-job-%d","status":"queued"}`, submits)
+			})
+			if tc.currency == "EUR" {
+				_, err := model.SaveFXRate(t.Context(), "EUR", "USD", "1000000000", "0", fixture.sale.CreatedBy)
+				require.NoError(t, err)
+			}
+			fixture.fake.Advance(time.Second)
+			for _, price := range []*model.PriceVersion{
+				{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: tc.sale, EffectiveAt: clock.Now().Unix()},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: tc.currency, Expression: tc.purchase, EffectiveAt: clock.Now().Unix()},
+			} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			body := `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", body)
+			require.Equal(t, 200, response.Code, response.Body.String())
+			service.RunTaskPollingOnce(t.Context(), nil)
+			_, err := service.RecoverGatewayTasks(t.Context(), 100)
+			assert.ErrorIs(t, err, model.ErrGatewayEvaluationPending)
+			requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, "settlement_pending", requests[0].Status)
+			assert.Equal(t, tc.salePending, requests[0].SalePending)
+			assert.Equal(t, tc.charge, requests[0].Receivable.Nanos)
+			stale, staleTotal, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id, Status: "pending"}, 0, 10)
+			require.NoError(t, err)
+			assert.Empty(t, stale)
+			assert.Zero(t, staleTotal, "pending accounting supersedes its older submission record")
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), requests[0].ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, tc.costPending, attempts[0].CostPending)
+			assert.Equal(t, tc.convertedPending, attempts[0].ConvertedCostPending)
+			assert.Equal(t, tc.payable, attempts[0].Cost.Nanos)
+			for _, view := range []struct {
+				key, path string
+				admin     bool
+			}{
+				{fixture.userPAT, "/api/requests/self?status=settlement_pending", false},
+				{fixture.adminPAT, "/api/admin/v1/requests/" + requests[0].ID + "/attempts", true},
+			} {
+				response := adminSecurityRequest(fixture.engine, view.key, http.MethodGet, view.path, "")
+				require.Equal(t, 200, response.Code)
+				var page struct {
+					Data struct {
+						Items []map[string]any
+						Total int64
+					}
+				}
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &page))
+				require.Len(t, page.Data.Items, 1)
+				assert.EqualValues(t, 1, page.Data.Total)
+				if view.admin {
+					assert.Equal(t, tc.costPending, page.Data.Items[0]["cost_pending"] == true)
+					assert.Equal(t, tc.convertedPending, page.Data.Items[0]["converted_cost_pending"] == true)
+				} else {
+					assert.Equal(t, tc.salePending, page.Data.Items[0]["sale_pending"] == true)
+					assert.NotContains(t, page.Data.Items[0], "cost_pending")
+				}
+			}
+			for _, account := range []struct {
+				kind  model.LedgerAccountType
+				owner int
+				nanos int64
+			}{
+				{model.LedgerAccountUserWallet, fixture.user.Id, tc.wallet},
+				{model.LedgerAccountProviderPayable, fixture.channel.ProviderID, tc.payable},
+			} {
+				var wallet model.Wallet
+				require.NoError(t, model.DB.Where("account_type = ? AND owner_id = ?", account.kind, account.owner).Take(&wallet).Error)
+				assert.Equal(t, account.nanos, wallet.Balance.Nanos)
+			}
+			_, err = model.TopUpWallet(model.WalletTopUp{UserId: fixture.user.Id, Source: money.Amount{Nanos: 100000000, Currency: "USD"}, Reference: "pending-task-credit"})
+			require.NoError(t, err)
+			response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", body)
+			if tc.salePending {
+				assert.Equal(t, 402, response.Code, "a credit must not bypass unknown sale accounting")
+				assert.Equal(t, 1, submits)
+			} else {
+				assert.Equal(t, 200, response.Code, "pending procurement must not freeze known user funds")
+				assert.Equal(t, 2, submits)
+			}
 		})
 	}
 }

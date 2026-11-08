@@ -76,11 +76,14 @@ func GatewayPrice(price *model.PriceVersion, usage *dto.Usage, request billingex
 	if err != nil {
 		return money.Value{}, money.Value{}, billingexpr.MoneyTraceResult{}, err
 	}
-	quantities, err := exactGatewayTokens(usage, used)
-	if err != nil {
-		return money.Value{}, money.Value{}, billingexpr.MoneyTraceResult{}, err
+	var quantities map[string]decimal.Decimal
+	if request.Usage == nil {
+		quantities, err = exactGatewayTokens(usage, used)
+		if err != nil {
+			return money.Value{}, money.Value{}, billingexpr.MoneyTraceResult{}, err
+		}
 	}
-	value, trace, err := billingexpr.RunMoneyExpr(price.Expression, billingexpr.MoneyInput{TokenQuantities: quantities, Request: request, Time: at}, price.Currency)
+	value, trace, err := billingexpr.RunMoneyExpr(price.Expression, billingexpr.MoneyInput{TaskUsage: request.Usage != nil, TokenQuantities: quantities, Request: request, Time: at}, price.Currency)
 	if err != nil {
 		return money.Value{}, money.Value{}, trace, err
 	}

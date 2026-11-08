@@ -130,8 +130,22 @@ func PublishGatewayTask(task *model.Task) error {
 // task. It replays the existing immutable settlement lifecycle on every retry.
 func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 	snapshot := task.PrivateData.Gateway
-	if snapshot == nil {
-		return fmt.Errorf("task has no gateway snapshot")
+	if snapshot == nil || snapshot.Settlement.Request.UserID != task.UserId {
+		return fmt.Errorf("task billing identity is inconsistent")
+	}
+	if task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure {
+		return fmt.Errorf("task is not terminal")
+	}
+	var billing model.GatewayBilling
+	if err := model.DB.WithContext(ctx).Select("phase").Where("request_id = ? AND user_id = ?", snapshot.Settlement.Request.ID, task.UserId).Take(&billing).Error; err != nil {
+		return err
+	}
+	if billing.Phase != "reserved" {
+		// Prepared facts are immutable, including unresolved evaluations.
+		if _, err := model.SettleGateway(snapshot.Settlement.Request.ID); err != nil {
+			return err
+		}
+		return model.PublishGatewayRecords(snapshot.Settlement.Request.ID)
 	}
 	intent := snapshot.Settlement
 	request := &intent.Request
@@ -142,6 +156,9 @@ func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 	intent.Attempt = &acceptedAttempt
 	attempt := intent.Attempt
 	facts := maps.Clone(snapshot.Facts)
+	if facts == nil {
+		facts = make(map[string]any)
+	}
 	maps.Copy(facts, snapshot.CompletionFacts)
 	request.EndedAt = clock.Now().UnixMilli()
 	request.Status = "failed"
@@ -163,76 +180,81 @@ func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 			attempt.UsageSource = "estimated"
 		}
 	}
-	at := time.UnixMilli(request.StartedAt)
 	if task.Status == model.TaskStatusSuccess {
-		source, _, err := billingexpr.RunMoneyExpr(request.SaleExpression, billingexpr.MoneyInput{TaskUsage: true, Request: billingexpr.RequestInput{Usage: facts}, Time: at}, request.SaleCurrency)
-		if err != nil {
-			return err
-		}
-		ratio, err := decimal.NewFromString(request.GroupRatio)
-		if err != nil {
-			return err
-		}
-		source, err = money.MulUnitPrice(ratio, source)
-		if err != nil {
-			return err
-		}
-		intent.SaleSource, err = source.Receivable()
-		if err != nil {
-			return err
-		}
-		receivable := source
+		request.Status, attempt.Status = "success", "success"
+		ratio, saleErr := decimal.NewFromString(request.GroupRatio)
+		var fx *money.Rate
 		if request.SaleCurrency != model.SettlementCurrency() {
-			rate, parseErr := decimal.NewFromString(request.SaleFXRate)
-			if parseErr != nil {
-				return parseErr
+			rate, err := decimal.NewFromString(request.SaleFXRate)
+			if err == nil {
+				quote, quoteErr := money.NewRate(request.SaleCurrency, model.SettlementCurrency(), rate)
+				fx, err = &quote, quoteErr
 			}
-			fx, rateErr := money.NewRate(request.SaleCurrency, model.SettlementCurrency(), rate)
-			if rateErr != nil {
-				return rateErr
+			saleErr = errors.Join(saleErr, err)
+		}
+		trace := billingexpr.MoneyTraceResult{Currency: request.SaleCurrency}
+		if saleErr == nil {
+			price := &model.PriceVersion{Expression: request.SaleExpression, Currency: request.SaleCurrency}
+			source, converted, evaluated, err := GatewayPrice(price, nil, billingexpr.RequestInput{Usage: facts}, time.UnixMilli(request.StartedAt), ratio, fx)
+			trace, saleErr = evaluated, err
+			if saleErr == nil {
+				intent.SaleSource, saleErr = source.Receivable()
 			}
-			receivable, err = source.Convert(fx)
-			if err != nil {
-				return err
+			if saleErr == nil {
+				request.Receivable, saleErr = converted.Receivable()
 			}
 		}
-		request.Receivable, err = receivable.Receivable()
-		if err != nil {
-			return err
+		trace.MatchedTier = ""
+		intent.SaleTrace = &trace
+		if saleErr != nil {
+			request.SalePending = true
+			request.Receivable = money.Amount{Currency: model.SettlementCurrency()}
+			intent.SaleEvaluationFailed = true
 		}
-		request.Status = "success"
-		attempt.Status = "success"
 	}
-	// A failed task is free to the user; any completion facts reported by the
-	// Provider still incur its purchase price.
-	if task.Status == model.TaskStatusSuccess || len(snapshot.CompletionFacts) > 0 {
-		cost, _, err := billingexpr.RunMoneyExpr(attempt.PurchaseExpression, billingexpr.MoneyInput{TaskUsage: true, Request: billingexpr.RequestInput{Usage: facts}, Time: time.UnixMilli(attempt.StartedAt)}, attempt.Cost.Currency)
-		if err != nil {
-			return err
+	// Failed delivery owes no sale. Procurement uses reported quantities;
+	// requested quantities cannot confirm what an unsuccessful Provider billed.
+	costFacts := facts
+	if task.Status == model.TaskStatusFailure {
+		costFacts = maps.Clone(snapshot.CompletionFacts)
+		if costFacts == nil {
+			costFacts = make(map[string]any)
 		}
-		attempt.Cost, err = cost.Cost()
-		if err != nil {
-			return err
-		}
-		converted := cost
-		if attempt.Cost.Currency != model.SettlementCurrency() {
-			rate, parseErr := decimal.NewFromString(attempt.AccountingFXRate)
-			if parseErr != nil {
-				return parseErr
-			}
-			fx, rateErr := money.NewRate(attempt.Cost.Currency, model.SettlementCurrency(), rate)
-			if rateErr != nil {
-				return rateErr
-			}
-			converted, err = cost.Convert(fx)
-			if err != nil {
-				return err
+		for name, value := range facts {
+			switch value.(type) {
+			case string, bool:
+				costFacts[name] = value
 			}
 		}
-		attempt.ConvertedCost, err = converted.Cost()
-		if err != nil {
-			return err
+	}
+	var purchaseFX *money.Rate
+	var fxErr error
+	if attempt.Cost.Currency != model.SettlementCurrency() {
+		rate, err := decimal.NewFromString(attempt.AccountingFXRate)
+		fxErr = err
+		if err == nil {
+			quote, err := money.NewRate(attempt.Cost.Currency, model.SettlementCurrency(), rate)
+			purchaseFX, fxErr = &quote, err
 		}
+	}
+	purchase := &model.PriceVersion{Expression: attempt.PurchaseExpression, Currency: attempt.Cost.Currency}
+	cost, converted, trace, priceErr := GatewayPrice(purchase, nil, billingexpr.RequestInput{Usage: costFacts}, time.UnixMilli(attempt.StartedAt), decimal.NewFromInt(1), purchaseFX)
+	trace.MatchedTier = ""
+	intent.AttemptTrace = map[string]billingexpr.MoneyTraceResult{attempt.ID: trace}
+	originalCost, originalErr := cost.Cost()
+	attempt.CostPending = originalErr != nil || originalCost.Currency != purchase.Currency
+	if !attempt.CostPending {
+		attempt.Cost = originalCost
+	}
+	convertedCost, convertedErr := converted.Cost()
+	attempt.ConvertedCostPending = fxErr != nil || convertedErr != nil || convertedCost.Currency != model.SettlementCurrency()
+	if !attempt.ConvertedCostPending {
+		attempt.ConvertedCost = convertedCost
+	}
+	intent.EvaluationFailed = intent.SaleEvaluationFailed || priceErr != nil || attempt.CostPending || attempt.ConvertedCostPending
+	if intent.EvaluationFailed {
+		request.Status = "settlement_pending"
+		request.ErrorCode = "billing_evaluation_failed"
 	}
 	if len(snapshot.PreviousAttempts) > 0 {
 		intent.Attempts = append(append([]model.GatewayAttempt(nil), snapshot.PreviousAttempts...), *attempt)
