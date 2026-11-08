@@ -14,7 +14,7 @@ func ChatUsagePresence(body []byte) (prompt, completion bool) {
 
 // ResponseFacts separates upstream-reported zero usage from a local estimate,
 // and business output from protocol framing and keep-alive pings. It contains
-// transient output only; callers must never persist GeneratedText.
+// transient source and delivered output only; callers must never persist either.
 type ResponseFacts struct {
 	UsageReported            bool
 	PromptTokensReported     bool
@@ -24,6 +24,8 @@ type ResponseFacts struct {
 	ExpectedChoices          int `json:"-"`
 	DownstreamWriteFailed    bool
 	GeneratedText            string
+	SourceGeneratedText      string `json:"-"`
+	SourceOutputObserved     bool   `json:"-"`
 	OnBusinessOutput         func()
 	CanFinishStream          func() bool `json:"-"`
 	UpstreamErrorCode        string

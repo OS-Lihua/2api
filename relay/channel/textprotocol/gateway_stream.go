@@ -35,6 +35,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 	meter := gatewayUsageAccumulator{format: p.format, context: c}
 	var streamErr error
 	var output gatewayGeneratedOutput
+	var sourceOutput gatewayGeneratedOutput
 	expectedChoices := max(1, info.ResponseFacts.ExpectedChoices)
 	choices := map[int]gatewayStreamChoice{}
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
@@ -80,6 +81,12 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			sr.Stop(err)
 			return
 		}
+		if p.format == types.RelayFormatOpenAIResponses {
+			sourceOutput.ObserveResponses(normalized)
+		} else {
+			sourceOutput.text.WriteString(gatewayStreamBusinessText(normalized, p.format))
+		}
+		info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || sourceOutput.String() != "" || gatewayMediaOutput(normalized, p.format)
 		safety := observeGatewaySafety(info, []byte(data), p.format)
 		if p.format == types.RelayFormatOpenAIResponses {
 			service.ObserveResponsesOutcome(info, event.(*dto.ResponsesStreamResponse))
@@ -206,6 +213,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			}
 		}
 	}
+	info.ResponseFacts.SourceGeneratedText = sourceOutput.String()
 	info.ResponseFacts.GeneratedText = output.String()
 	if !info.ResponseFacts.PromptTokensReported {
 		usage.PromptTokens = max(usage.PromptTokens, info.GetEstimatePromptTokens())

@@ -3508,6 +3508,9 @@ func TestTextGatewayIndependentConvertedUsageCounters(t *testing.T) {
 		name, protocol, body, stream string
 		completion, revenue, cost    int64
 	}{
+		{"Chat independent cache write", "openai_chat", `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"completion_tokens":5,"prompt_tokens_details":{"cache_write_tokens":100}}}`, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":5,\"prompt_tokens_details\":{\"cache_write_tokens\":100}}}\n\ndata: [DONE]\n\n", 5, 198000, 110000},
+		{"Chat cache write explicit zero", "openai_chat", `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":5,"prompt_tokens_details":{"cache_write_tokens":100}}}`, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cache_write_tokens\":100}}}\n\ndata: [DONE]\n\n", 5, 18000, 10000},
+		{"Responses independent cache write", "openai_responses", `{"id":"resp","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"output_tokens":5,"input_tokens_details":{"cache_write_tokens":100}}}`, "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"output_tokens\":5,\"input_tokens_details\":{\"cache_write_tokens\":100}}}}\n\n", 5, 198000, 110000},
 		{"bad Responses total", "openai_responses", `{"id":"resp","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":{}}}`, `data: {"type":"response.output_text.delta","delta":"Hello","output_index":0,"content_index":0}` + "\n\ndata: " + `{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":[]}}}` + "\n\n", 5, 36000, 20000},
 		{"Responses independent thoughts", "openai_responses", `{"id":"resp","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens_details":{"reasoning_tokens":100}}}`, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\",\"output_index\":0,\"content_index\":0}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens_details\":{\"reasoning_tokens\":100}}}}\n\n", 100, 378000, 210000},
 		{"Gemini independent audio", "gemini_generate", `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokensDetails":[{"modality":"AUDIO","tokenCount":100}]}}`, "", 100, 378000, 210000},
@@ -3541,7 +3544,14 @@ func TestTextGatewayIndependentConvertedUsageCounters(t *testing.T) {
 				} else {
 					assert.Equal(t, "upstream", record.UsageSource)
 				}
-				assert.Equal(t, int64(10), record.Usage.PromptTokens)
+				prompt := int64(10)
+				switch test.name {
+				case "Chat independent cache write", "Responses independent cache write":
+					prompt = 100
+				case "Chat cache write explicit zero":
+					prompt = 0
+				}
+				assert.Equal(t, prompt, record.Usage.PromptTokens)
 				assert.Equal(t, test.completion, record.Usage.CompletionTokens)
 				assert.Equal(t, test.revenue, record.Receivable.Nanos)
 				attempts, _, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
@@ -4192,6 +4202,45 @@ func TestTextGatewayAllChoicesMustFinishBeforeNormalEOF(t *testing.T) {
 	}
 }
 
+func TestTextGatewayBufferedGenerationRetainsPurchaseEstimate(t *testing.T) {
+	for _, source := range []struct{ protocol, path, request, generated, broken, recovered string }{
+		{"openai_chat", "/v1/chat/completions", `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, `{"choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":"stop"}]}`, `{"choices":"invalid"}`, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Recovered\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n"},
+		{"openai_responses", "/v1/responses", `{"model":"gateway-offering","stream":true,"input":"Hello","max_output_tokens":16}`, `{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}]}}`, `{"type":"response.output_text.delta","output_index":"invalid"}`, "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Recovered\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n"},
+		{"gemini_generate", "/v1beta/models/gateway-offering:streamGenerateContent?alt=sse", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16}}`, `{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}]}`, `{"candidates":"invalid"}`, "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Recovered\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5}}\n\n"},
+	} {
+		t.Run(source.protocol, func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprintf(w, "data: %s\n\ndata: %s\n\n", source.generated, source.broken)
+			})
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", source.protocol).Error)
+			second := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte(source.recovered))
+			})
+			require.NoError(t, model.DB.Model(second).Update("protocol", source.protocol).Error)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, source.path, source.request)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), "Recovered")
+			assert.NotContains(t, response.Body.String(), "Hello")
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(36000), record.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 2, total)
+			for _, attempt := range attempts {
+				if attempt.ChannelID == fixture.channel.ID {
+					assert.Equal(t, "estimated", attempt.UsageSource)
+					assert.Equal(t, int64(9), attempt.Usage.PromptTokens)
+					assert.Equal(t, int64(1), attempt.Usage.CompletionTokens)
+					assert.Equal(t, int64(11000), attempt.Cost.Nanos)
+				}
+			}
+		})
+	}
+}
+
 func TestTextGatewaySuccessfulTerminalWaitsForTransportValidation(t *testing.T) {
 	for _, source := range []struct{ protocol, path, request, prefix, terminal, broken, forbidden string }{
 		{"openai_chat", "/v1/chat/completions", `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, `{"choices":[{"index":0,"delta":{"content":"Hello"}}]}`, `{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`, `{"choices":"invalid"}`, `"finish_reason":"stop"`},
@@ -4649,6 +4698,8 @@ func TestTextGatewayStrictConversionLosses(t *testing.T) {
 		name, path, body, upstream, code, parameter string
 		hard                                        bool
 	}{
+		{"Gemini video sampling", "/v1beta/models/gateway-offering:generateContent", `{"contents":[{"role":"user","parts":[{"fileData":{"mimeType":"video/mp4","fileUri":"https://example.com/a.mp4"},"videoMetadata":{"startOffset":"10s","endOffset":"20s","fps":1}}]}],"generationConfig":{"maxOutputTokens":16}}`, "openai_chat", "request_parameter_dropped", "videoMetadata", false},
+		{"Gemini part media resolution", "/v1beta/models/gateway-offering:generateContent", fmt.Sprintf(`{"contents":[{"role":"user","parts":[{"inlineData":{"mimeType":"image/png","data":%q},"mediaResolution":{"level":"MEDIA_RESOLUTION_HIGH"}}]}],"generationConfig":{"maxOutputTokens":16}}`, base64.StdEncoding.EncodeToString(image)), "openai_chat", "request_parameter_dropped", "mediaResolution", false},
 		{"Gemini media resolution", "/v1beta/models/gateway-offering:generateContent", fmt.Sprintf(`{"contents":[{"role":"user","parts":[{"inlineData":{"mimeType":"image/png","data":%q}}]}],"generationConfig":{"maxOutputTokens":16,"mediaResolution":"MEDIA_RESOLUTION_HIGH"}}`, base64.StdEncoding.EncodeToString(image)), "openai_chat", "request_parameter_dropped", "mediaResolution", false},
 		{"stop string", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stop":"END"}`, "openai_responses", "request_parameter_dropped", "stop", false},
 		{"stop list", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stop":["END"]}`, "openai_responses", "request_parameter_dropped", "stop", false},
@@ -4682,7 +4733,10 @@ func TestTextGatewayStrictConversionLosses(t *testing.T) {
 				})
 				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", test.upstream).Error)
 				caps := capability.Set{Features: []capability.Feature{capability.Streaming, capability.ToolCalling, capability.Caching, capability.StructuredOutput}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}
-				if test.name == "Gemini media resolution" {
+				if test.name == "Gemini video sampling" {
+					caps.InputModalities = append(caps.InputModalities, capability.Video)
+				}
+				if test.name == "Gemini media resolution" || test.name == "Gemini part media resolution" {
 					caps.InputModalities = append(caps.InputModalities, capability.Image)
 				}
 				if test.name == "Gemini output modalities" {

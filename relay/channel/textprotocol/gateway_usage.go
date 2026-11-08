@@ -115,7 +115,7 @@ func (a *gatewayUsageAccumulator) Observe(body []byte) (*dto.Usage, error) {
 	// An explicit base zero remains authoritative even with inconsistent details.
 	if _, present := a.snapshot[promptKey]; !present && a.format != types.RelayFormatClaude {
 		details := usage.PromptTokensDetails
-		usage.PromptTokens = max(usage.PromptTokens, details.CachedTokens, details.TextTokens+details.ImageTokens+details.AudioTokens)
+		usage.PromptTokens = max(usage.PromptTokens, details.CachedTokens+details.CacheCreationTokensTotal(), details.TextTokens+details.ImageTokens+details.AudioTokens)
 	}
 	if _, present := a.snapshot[completionKey]; !present {
 		details := usage.CompletionTokenDetails

@@ -94,6 +94,14 @@ func GeminiGenerateContentRequestToOpenAIChat(ctx context.Context, geminiRequest
 				}
 				mediaContents = append(mediaContents, mediaContent)
 			} else if part.InlineData != nil || part.FileData != nil {
+				for _, control := range []struct {
+					name  string
+					value []byte
+				}{{"mediaResolution", part.MediaResolution}, {"mediaProcessing", part.MediaProcessing}, {"videoMetadata", part.VideoMetadata}} {
+					if len(control.value) > 0 && string(control.value) != "null" {
+						convdiag.Add(ctx, types.ConversionDiagnostic{Code: "request_parameter_dropped", Path: fmt.Sprintf("contents[%d].parts[%d].%s", contentIndex, partIndex, control.name), Message: "The target request omitted the media processing control", Severity: types.ConversionDiagnosticWarning})
+					}
+				}
 				mediaContent, reason := geminiMediaToChatContent(part.InlineData, part.FileData)
 				if reason != "" {
 					kind := "inlineData"

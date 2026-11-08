@@ -531,22 +531,39 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			result = service.GatewayAttemptResult{Attempt: attempt, Failure: failure, Delivered: info.ResponseFacts.BusinessOutput}
 
 			record.Status = attempt.Status
-			if !info.ResponseFacts.BusinessOutput && info.ResponseFacts.GeneratedText == "" && !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && !info.ResponseFacts.CompletionTokensReported && !info.ResponseFacts.IndependentUsageReported {
+			if !info.ResponseFacts.BusinessOutput && !info.ResponseFacts.SourceOutputObserved && info.ResponseFacts.GeneratedText == "" && !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && !info.ResponseFacts.CompletionTokensReported && !info.ResponseFacts.IndependentUsageReported {
 				usage = nil
 			}
 			if usage == nil && (info.ResponseFacts.BusinessOutput || info.ResponseFacts.GeneratedText != "") {
 				usage = &dto.Usage{PromptTokens: estimatedInput, CompletionTokens: tokenkit.Count(info.TokenizerModel, info.ResponseFacts.GeneratedText)}
 			}
+			purchaseUsage := usage
 			if usage != nil {
 				if !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && (info.ResponseFacts.BusinessOutput || info.ResponseFacts.GeneratedText != "") {
 					usage.PromptTokens = max(usage.PromptTokens, estimatedInput)
 				}
 				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
-				attempt.Usage, attempt.UsageSource = service.GatewayRecordUsage(usage), "estimated"
+				copy := *usage
+				purchaseUsage = &copy
+			}
+			if info.ResponseFacts.SourceOutputObserved {
+				if purchaseUsage == nil {
+					purchaseUsage = &dto.Usage{}
+				}
+				if !info.ResponseFacts.PromptTokensReported {
+					purchaseUsage.PromptTokens = max(purchaseUsage.PromptTokens, estimatedInput)
+				}
+				if !info.ResponseFacts.CompletionTokensReported {
+					purchaseUsage.CompletionTokens = max(purchaseUsage.CompletionTokens, tokenkit.Count(info.TokenizerModelName(), info.ResponseFacts.SourceGeneratedText))
+				}
+			}
+			if purchaseUsage != nil {
+				purchaseUsage.TotalTokens = purchaseUsage.PromptTokens + purchaseUsage.CompletionTokens
+				attempt.Usage, attempt.UsageSource = service.GatewayRecordUsage(purchaseUsage), "estimated"
 				if info.ResponseFacts.UsageReported {
 					attempt.UsageSource = "upstream"
 				}
-				cost, converted, _, priceErr := service.GatewayPrice(purchase, usage, purchaseInput, time.UnixMilli(attempt.StartedAt), decimal.NewFromInt(1), purchaseFX)
+				cost, converted, _, priceErr := service.GatewayPrice(purchase, purchaseUsage, purchaseInput, time.UnixMilli(attempt.StartedAt), decimal.NewFromInt(1), purchaseFX)
 				if priceErr == nil {
 					attempt.Cost, priceErr = cost.Cost()
 				}
@@ -561,7 +578,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			}
 			if info.ResponseFacts.BusinessOutput {
 				record.ChoiceCount = choiceCount
-				record.Usage, record.UsageSource = attempt.Usage, attempt.UsageSource
+				record.Usage, record.UsageSource = service.GatewayRecordUsage(usage), attempt.UsageSource
 				source, receivable, trace, priceErr := service.GatewayPrice(sale, usage, input, started, ratio, saleFX)
 				if trace.BillingUnit == billingexpr.BillingUnitRequest && attempt.Status != "success" {
 					source, _ = money.ParseValue("0", sale.Currency)

@@ -168,6 +168,8 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 			generated.WriteString(choice.Get("message.audio.transcript").String())
 		}
 	}
+	facts.SourceGeneratedText = generated.String()
+	facts.SourceOutputObserved = facts.SourceGeneratedText != "" || gatewayMediaOutput(body, p.format)
 	facts.GeneratedText = generated.String()
 	if !facts.PromptTokensReported {
 		usage.PromptTokens = max(usage.PromptTokens, info.GetEstimatePromptTokens())
