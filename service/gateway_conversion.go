@@ -44,7 +44,9 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 	if chat, ok := request.(*dto.GeneralOpenAIRequest); ok {
 		return chat, nil
 	}
+	requiresTextInput := false
 	if responses, ok := request.(*dto.OpenAIResponsesRequest); ok {
+		requiresTextInput = gjson.GetBytes(responses.Prompt, "id").String() != "" || responses.PreviousResponseID != "" || len(responses.Conversation) > 0 && string(responses.Conversation) != "null"
 		copy := *responses
 		copy.PreviousResponseID = ""
 		copy.Conversation, copy.Prompt, copy.ContextManagement = nil, nil, nil
@@ -57,16 +59,86 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 	projectionMedia := map[string]dto.MediaContent{}
 	var referencedMedia []dto.MediaContent
 	references := map[string]bool{}
+	if responses, ok := request.(*dto.OpenAIResponsesRequest); ok {
+		for _, input := range gjson.ParseBytes(responses.Input).Array() {
+			parts := input.Get("content").Array()
+			switch input.Get("type").String() {
+			case "function_call_output", "custom_tool_call_output":
+				parts = input.Get("output").Array()
+			case "input_image", "input_file":
+				parts = []gjson.Result{input}
+			}
+			for _, part := range parts {
+				fields := part
+				if file := part.Get("file"); file.IsObject() {
+					fields = file
+				}
+				id := fields.Get("file_id").String()
+				if id == "" {
+					continue
+				}
+				switch part.Get("type").String() {
+				case "input_file":
+					referencedMedia = append(referencedMedia, dto.MediaContent{Type: dto.ContentTypeFile, File: &dto.MessageFile{FileName: "reference.pdf", FileData: id}})
+				case "input_image":
+					referencedMedia = append(referencedMedia, dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: id, Detail: part.Get("detail").String(), MimeType: "image/png"}})
+				default:
+					continue
+				}
+				references[id] = true
+			}
+		}
+		if c, ok := ctx.(*gin.Context); ok {
+			c.Set(gatewayNativeMediaReferencesKey, references)
+		}
+	}
 	if claude, ok := request.(*dto.ClaudeRequest); ok {
+		type nativeBlock struct {
+			dto.ClaudeMediaMessage
+			path   string
+			nested bool
+		}
+		var mediaBlocks []nativeBlock
 		for i, message := range claude.Messages {
 			blocks, _ := message.ParseContent()
 			for j, block := range blocks {
-				if block.Type != "document" || block.Source == nil || block.Source.Type != "url" || block.Source.Url == "" {
+				mediaBlocks = append(mediaBlocks, nativeBlock{ClaudeMediaMessage: block, path: fmt.Sprintf("messages[%d].content[%d]", i, j)})
+			}
+		}
+		for index := 0; index < len(mediaBlocks); index++ {
+			block := mediaBlocks[index]
+			if block.Type == "tool_result" && !block.IsStringContent() {
+				for i, part := range block.ParseMediaContent() {
+					mediaBlocks = append(mediaBlocks, nativeBlock{ClaudeMediaMessage: part, path: fmt.Sprintf("%s.content[%d]", block.path, i), nested: true})
+				}
+			}
+			if block.Source == nil {
+				continue
+			}
+			var media dto.MediaContent
+			reference := ""
+			if block.Type == "document" && block.Source.Type == "url" {
+				reference = block.Source.Url
+				media = dto.MediaContent{Type: dto.ContentTypeFile, File: &dto.MessageFile{FileName: "reference.pdf", FileData: reference}}
+			} else if block.Source.Type == "file" && block.Source.FileID != nil {
+				reference = *block.Source.FileID
+				switch block.Type {
+				case "document":
+					media = dto.MediaContent{Type: dto.ContentTypeFile, File: &dto.MessageFile{FileName: "reference.pdf", FileData: reference}}
+				case "image":
+					media = dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: reference, MimeType: "image/png"}}
+				default:
 					continue
 				}
-				uri := block.Source.Url
-				projectionMedia[fmt.Sprintf("messages[%d].content[%d].source", i, j)] = dto.MediaContent{Type: dto.ContentTypeFile, File: &dto.MessageFile{FileName: "reference.pdf", FileData: uri}}
-				references[uri] = true
+			}
+			if reference == "" {
+				continue
+			}
+			references[reference] = true
+			if block.nested {
+				referencedMedia = append(referencedMedia, media)
+			} else {
+				projectionMedia[block.path+".source"] = media
 			}
 		}
 		if c, ok := ctx.(*gin.Context); ok {
@@ -167,6 +239,7 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 	if !ok {
 		return nil, fmt.Errorf("missing text request projection")
 	}
+	chat.RequiresTextInput = requiresTextInput
 	if len(chat.Tools) == 0 {
 		var nativeTools []byte
 		switch native := request.(type) {

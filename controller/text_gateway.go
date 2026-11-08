@@ -39,7 +39,7 @@ func gatewayError(c *gin.Context, status int, code, message string) {
 	if c.Writer.Written() && !streaming {
 		return
 	}
-	if facts, ok := common.GetContextKeyType[*relaycommon.ResponseFacts](c, constant.ContextKeyResponseFacts); ok && facts != nil && facts.DownstreamWriteFailed {
+	if facts, ok := common.GetContextKeyType[*relaycommon.ResponseFacts](c, constant.ContextKeyResponseFacts); ok && facts != nil && (facts.DownstreamWriteFailed || facts.TerminalDelivered) {
 		return
 	}
 	var payload gin.H
@@ -140,6 +140,10 @@ func gatewayPreparationRejection(err error, budget *service.GatewayAttemptBudget
 
 // TextGateway uses one reservation and one settlement for all actual sends.
 func TextGateway(c *gin.Context) {
+	if middleware.TextOfferingMissing(c) {
+		gatewayError(c, http.StatusNotFound, "model_not_found", "Model not found")
+		return
+	}
 	if middleware.TextOffering(c) == nil {
 		c.Next()
 		return
@@ -346,7 +350,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
 		return
 	}
-	if _, err := helper.ValidateTextRequest(c, request, relayconstant.RelayModeChatCompletions); err != nil || !service.GatewayCapabilitiesMatch(request, selection.Capabilities, selection.InputTokens) {
+	if _, err := helper.ValidateTextRequest(c, request, relayconstant.RelayModeChatCompletions, kind != protocol.OpenAIChat); err != nil || !service.GatewayCapabilitiesMatch(request, selection.Capabilities, selection.InputTokens) {
 		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
 		return
 	}
@@ -405,7 +409,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		// counted; the bounded value is written back to the actual wire below.
 		effective.MaxTokens, effective.MaxCompletionTokens = nil, nil
 	}
-	if _, err := helper.ValidateTextRequest(c, effective, relayconstant.RelayModeChatCompletions); err != nil || effective.Model != selection.Channel.UpstreamModelName || effective.IsStream(c.Request) != info.IsStream || !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, selection.InputTokens) {
+	if _, err := helper.ValidateTextRequest(c, effective, relayconstant.RelayModeChatCompletions, selection.Channel.Protocol == protocol.OpenAIResponses); err != nil || effective.Model != selection.Channel.UpstreamModelName || effective.IsStream(c.Request) != info.IsStream || !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, selection.InputTokens) {
 		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
 		return
 	}
@@ -445,7 +449,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Invalid Channel request parameters")
 			return
 		}
-		if _, err := helper.ValidateTextRequest(c, effective, relayconstant.RelayModeChatCompletions); err != nil || !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, estimatedInput) {
+		if _, err := helper.ValidateTextRequest(c, effective, relayconstant.RelayModeChatCompletions, selection.Channel.Protocol == protocol.OpenAIResponses); err != nil || !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, estimatedInput) {
 			run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
 			return
 		}

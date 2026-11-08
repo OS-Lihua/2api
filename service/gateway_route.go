@@ -28,6 +28,7 @@ type GatewaySelection struct {
 	Conversion     *relayconvert.RequestResult
 	ResponsesTools *convmeta.ResponsesToolState
 	Admission      channelhealth.Admission
+	conversionRank int
 }
 
 var ErrGatewayCapability = errors.New("no Channel supports the requested capabilities")
@@ -40,8 +41,9 @@ type GatewaySelectionOptions struct {
 	Exclusions *GatewayExclusions
 }
 
-// SelectGatewayChannel preconverts eligible candidates before any Attempt or
-// reservation, then applies protocol and health ordering with atomic probe admission.
+// SelectGatewayChannel preconverts candidates before any Attempt or reservation.
+// Protocol and conversion quality rank before runtime health ordering; the
+// shared health manager owns admission and recovery probe claims.
 func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request *dto.GeneralOpenAIRequest, options ...GatewaySelectionOptions) (*GatewaySelection, error) {
 	original := dto.Request(request)
 	var failures *GatewayExclusions
@@ -65,10 +67,9 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 	counts := map[string]int{}
 	excluded := []map[string]any{}
 	accepted := GatewayAcceptedConversionLosses(offering)
+	eligible := []*GatewaySelection{}
 	var rejected []types.ConversionDiagnostic
 	_, mediaPrepared := c.Get(gatewayMediaContextKey)
-	eligible := []*GatewaySelection{}
-	conversionRanks := map[int]int{}
 	for _, candidate := range candidates {
 		if failures != nil && (failures.Channels[candidate.ID] || failures.Providers[candidate.ProviderID]) {
 			counts["already_failed"]++
@@ -165,8 +166,7 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 			continue
 		}
 		diagnostics["eligible_count"] = diagnostics["eligible_count"].(int) + 1
-		conversionRanks[candidate.ID] = rank
-		eligible = append(eligible, &GatewaySelection{Channel: candidate, Provider: provider, InputTokens: tokens, Capabilities: caps, Conversion: conversion, ResponsesTools: responsesTools})
+		eligible = append(eligible, &GatewaySelection{Channel: candidate, Provider: provider, InputTokens: tokens, Capabilities: caps, Conversion: conversion, ResponsesTools: responsesTools, conversionRank: rank})
 	}
 	diagnostics["excluded_counts"], diagnostics["excluded"] = counts, excluded
 	if len(eligible) == 0 {
@@ -187,7 +187,7 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 		return nil, ErrGatewayUnavailable
 	}
 	slices.SortStableFunc(eligible, func(a, b *GatewaySelection) int {
-		if order := cmp.Compare(conversionRanks[a.Channel.ID], conversionRanks[b.Channel.ID]); order != 0 {
+		if order := cmp.Compare(a.conversionRank, b.conversionRank); order != 0 {
 			return order
 		}
 		left, right := health[a.Channel.ID], health[b.Channel.ID]
@@ -228,7 +228,7 @@ func GatewayCapabilitiesMatch(request *dto.GeneralOpenAIRequest, caps capability
 	}
 	tools := len(request.Tools) > 0 || len(request.Functions) > 0
 	caching := request.PromptCacheKey != "" || len(request.PromptCacheOptions) > 0 || len(request.PromptCacheRetention) > 0
-	textInput := request.Prompt != nil || request.Input != nil || request.Instruction != ""
+	textInput := request.RequiresTextInput || request.Prompt != nil || request.Input != nil || request.Instruction != ""
 	for _, message := range request.Messages {
 		calls := message.ParseToolCalls()
 		tools = tools || len(message.Tools) > 0 || len(calls) > 0 || message.Role == "tool"

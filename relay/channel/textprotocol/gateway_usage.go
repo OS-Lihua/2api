@@ -57,6 +57,24 @@ func (a *gatewayUsageAccumulator) Observe(body []byte) (*dto.Usage, error) {
 		a.snapshot = map[string]any{}
 	}
 	mergeGatewayUsageSnapshot(a.snapshot, incoming)
+	var schema any
+	switch a.format {
+	case types.RelayFormatClaude:
+		schema = &dto.ClaudeUsage{}
+	case types.RelayFormatGemini:
+		schema = &dto.GeminiUsageMetadata{}
+	default:
+		schema = &dto.Usage{}
+	}
+	for key, value := range a.snapshot {
+		field, err := common.Marshal(map[string]any{key: value})
+		if err != nil {
+			return nil, err
+		}
+		if common.Unmarshal(field, schema) != nil {
+			delete(a.snapshot, key)
+		}
+	}
 	encoded, err := common.Marshal(a.snapshot)
 	if err != nil {
 		return nil, err
@@ -192,7 +210,7 @@ func gatewayValidCounter(value gjson.Result) bool {
 func mergeGatewayUsageSnapshot(current, incoming map[string]any) {
 	for key, value := range incoming {
 		lower := strings.ToLower(key)
-		if strings.Contains(lower, "token") && !strings.HasSuffix(lower, "details") {
+		if strings.Contains(lower, "token") && !strings.HasSuffix(lower, "details") || strings.HasSuffix(lower, "_requests") {
 			number, ok := value.(float64)
 			if !ok || number < 0 || number > 1<<31-1 || number != float64(int64(number)) {
 				continue
