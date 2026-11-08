@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
@@ -35,6 +36,9 @@ func responsesWSGateway(c *gin.Context, call *relay.ResponsesWSCall) (bool, *typ
 			return true, types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound)
 		}
 		return false, nil
+	}
+	if call.LegacyConnection {
+		return true, types.NewErrorWithStatusCode(errors.New("Connection billing identity changed; reconnect required"), "connection_locked", http.StatusConflict)
 	}
 	group := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
 	if !offering.Enabled || offering.Visibility == "groups" && !slices.Contains(offering.Groups, group) {
@@ -86,7 +90,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	request := &dto.GeneralOpenAIRequest{Model: call.Request.Model, Stream: common.GetPointer(true), MaxCompletionTokens: call.Request.MaxOutputTokens}
 	request.Messages = []dto.Message{{Role: "user", Content: string(call.Request.Input)}}
 	selection, err := service.SelectGatewayProtocolChannel(c, offering, request, service.GatewayChannelRequirements{
-		Protocol: protocol.OpenAIResponses, ChannelID: call.LockedChannelID, ResponsesWebSocket: true,
+		Protocol: protocol.OpenAIResponses, ChannelID: call.LockedChannelID, Responses: &call.Request, ResponsesWebSocket: true,
 	}, exclusions)
 	if err != nil {
 		status, code := http.StatusServiceUnavailable, "channel_unavailable"
@@ -120,32 +124,57 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	info.RequestId, info.StartTime = c.GetString(common.RequestIdKey), started
 	info.ResponseFacts = &relaycommon.ResponseFacts{OnBusinessOutput: budget.Delivered}
 	common.SetContextKey(c, constant.ContextKeyResponseFacts, info.ResponseFacts)
-	// Channel overrides must not change the connection's native model identity.
-	var fields map[string]any
-	if err = common.Unmarshal(call.Body, &fields); err != nil {
+	saleInput, err := helper.ResolveIncomingBillingExprRequestInput(c, info)
+	if err != nil {
 		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid Responses request")
 		return
 	}
-	fields["model"] = info.UpstreamModelName
+	// Channel overrides must not change the connection's native model identity.
+	document := ojson.NewDoc(call.Body)
+	if err = document.Set("model", info.UpstreamModelName); err != nil {
+		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid Responses request")
+		return
+	}
 	var overrides map[string]any
 	if err = common.UnmarshalJsonStr(selection.Channel.ParameterOverrides, &overrides); err != nil {
 		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "Invalid Channel settings")
 		return
 	}
-	for key, value := range overrides {
-		fields[key] = value
-	}
-	body, err := common.Marshal(fields)
+	info.ParamOverride = overrides
+	body, err := relaycommon.ApplyParamOverrideWithRelayInfo(document.Bytes(), info)
 	var effective dto.OpenAIResponsesRequest
-	if err != nil || common.Unmarshal(body, &effective) != nil || effective.Model != info.UpstreamModelName || helper.ExceedsMaxTokensLimit(effective.MaxOutputTokens) {
+	if err != nil || common.Unmarshal(body, &effective) != nil || effective.Model != info.UpstreamModelName || helper.ValidateResponsesMultipliers(body) != nil || !service.GatewayResponsesCapabilitiesMatch(&effective, selection.Capabilities, 0) {
 		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Invalid Channel request parameters")
 		return
 	}
 	// Count native input rather than treating max_output_tokens as usage.
 	estimatedInput, err := service.CountRequestToken(c, effective.GetTokenCountMeta(), info)
-	if err != nil {
-		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid Responses request")
+	if err != nil || !service.GatewayResponsesCapabilitiesMatch(&effective, selection.Capabilities, estimatedInput) {
+		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
 		return
+	}
+	if effective.MaxOutputTokens == nil || *effective.MaxOutputTokens == 0 {
+		var limit int64
+		if maximum := selection.Capabilities.Limits.MaxOutputTokens; maximum != nil {
+			limit = *maximum
+		}
+		if contextLength := selection.Capabilities.Limits.ContextLength; contextLength != nil {
+			remaining := *contextLength - int64(estimatedInput)
+			if limit == 0 {
+				limit = remaining
+			} else {
+				limit = min(limit, remaining)
+			}
+		}
+		if limit > 0 {
+			document = ojson.NewDoc(body)
+			if err = document.Set("max_output_tokens", limit); err != nil {
+				run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid Responses request")
+				return
+			}
+			body = document.Bytes()
+			effective.MaxOutputTokens = common.GetPointer(uint(limit))
+		}
 	}
 	info.SetEstimatePromptTokens(estimatedInput)
 	mean, err := model.RecentOfferingOutputTokens(c.Request.Context(), offering.ID, started.UnixMilli())
@@ -166,10 +195,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel context limit exceeded")
 		return
 	}
-	input := billingexpr.RequestInput{Body: call.Body, Headers: map[string]string{}}
-	for key, values := range c.Request.Header {
-		input.Headers[strings.ToLower(key)] = strings.Join(values, ",")
-	}
+	input := saleInput
 	estimated := &dto.Usage{PromptTokens: estimatedInput, CompletionTokens: int(mean), TotalTokens: estimatedInput + int(mean)}
 	source, reserveValue, _, err := service.GatewayPrice(run.sale, estimated, input, started, run.ratio, run.saleFX)
 	reserve, reserveErr := reserveValue.Receivable()
@@ -206,7 +232,12 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
 	}
-	purchaseInput := billingexpr.RequestInput{Body: body, Headers: map[string]string{}}
+	payload, err := call.CreatePayload(body)
+	if err != nil {
+		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid Responses request")
+		return
+	}
+	purchaseInput := billingexpr.RequestInput{Body: payload, Headers: map[string]string{}}
 	for key, values := range prepared.Headers() {
 		purchaseInput.Headers[strings.ToLower(key)] = strings.Join(values, ",")
 	}
@@ -215,11 +246,6 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	_, convertedErr := convertedEstimate.Cost()
 	if priceErr != nil || costErr != nil || convertedErr != nil {
 		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
-		return
-	}
-	payload, err := call.CreatePayload(body)
-	if err != nil {
-		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid Responses request")
 		return
 	}
 	attemptContext, err := budget.Start()
@@ -254,7 +280,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	result = service.GatewayAttemptResult{Attempt: attempt, Failure: failure, Delivered: call.Established(), HealthLease: selection.Admission.Lease}
 	run.record.Status = attempt.Status
 	if usage != nil {
-		if !info.ResponseFacts.UsageReported && !info.ResponseFacts.BusinessOutput && info.ResponseFacts.GeneratedText == "" {
+		if !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && !info.ResponseFacts.CompletionTokensReported && !info.ResponseFacts.BusinessOutput && info.ResponseFacts.GeneratedText == "" {
 			usage = nil
 		}
 	}
@@ -280,9 +306,11 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		}
 		if info.ResponseFacts.BusinessOutput {
 			saleUsage := service.GatewayUsageSnapshot(usage)
+			saleUsageSource := attempt.UsageSource
 			if attempt.Status == "partial" && info.ResponseFacts.CompletionTokensReported {
 				delivered := tokenkit.Count(info.TokenizerModel, info.ResponseFacts.GeneratedText)
 				if delivered < saleUsage.CompletionTokens {
+					saleUsageSource = "estimated"
 					saleUsage.CompletionTokens, saleUsage.OutputTokens = delivered, delivered
 					saleUsage.TotalTokens = saleUsage.PromptTokens + delivered
 					saleUsage.CompletionTokenDetails = dto.OutputTokenDetails{}
@@ -290,7 +318,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 				}
 			}
 			run.saleUsage = saleUsage
-			run.record.Usage, run.record.UsageSource = service.GatewayRecordUsage(saleUsage), attempt.UsageSource
+			run.record.Usage, run.record.UsageSource = service.GatewayRecordUsage(saleUsage), saleUsageSource
 			source, receivable, saleTrace, priceErr := service.GatewayPrice(run.sale, saleUsage, input, started, run.ratio, run.saleFX)
 			saleTrace.MatchedTier = ""
 			run.saleTrace = &saleTrace

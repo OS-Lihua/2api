@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -37,21 +38,34 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 	}
 	if event.Response != nil {
 		a.info.ObserveResponseModel(event.Response.Model)
+		if event.Response.Usage != nil {
+			ApplyResponsesUsage(a.usage, event.Response.Usage, []byte(ojson.GetBytes(raw, "response.usage").Raw))
+			if facts := a.info.ResponseFacts; facts != nil {
+				prompt, completion := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens", "response.usage.output_tokens", "response.usage.total_tokens")
+				reported := relayconvert.NormalizeResponsesUsage(event.Response.Usage)
+				facts.RecordUsage(a.usage, reported, prompt, completion)
+			}
+		}
 	}
 	a.started = true
 	ObserveResponsesOutcome(a.info, event)
 	switch event.Type {
 	case "response.completed", "response.done", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
 		if event.Response != nil {
-			ApplyResponsesUsage(a.usage, event.Response.Usage)
-			if facts := a.info.ResponseFacts; facts != nil && event.Response.Usage != nil {
-				prompt, completion := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens", "response.usage.output_tokens", "response.usage.total_tokens")
-				reported := *a.usage
-				facts.RecordUsage(a.usage, &reported, prompt, completion)
-			}
 			if a.outputText.Len() == 0 {
 				// Some upstreams carry the output only on the terminal event.
 				a.outputText.WriteString(relayconvert.ExtractOutputTextFromResponses(event.Response))
+				for _, output := range event.Response.Output {
+					if output.Type == dto.BuildInCallFunctionCall {
+						a.outputText.WriteString(output.Name)
+						var arguments string
+						if common.Unmarshal(output.Arguments, &arguments) == nil {
+							a.outputText.WriteString(arguments)
+						} else {
+							a.outputText.Write(output.Arguments)
+						}
+					}
+				}
 			}
 		}
 		// Vendor counts are cumulative on the terminal event and replace the
@@ -160,7 +174,7 @@ func ObserveResponsesOutcome(info *relaycommon.RelayInfo, event *dto.ResponsesSt
 	}
 }
 
-func ApplyResponsesUsage(dst *dto.Usage, src *dto.Usage) {
+func ApplyResponsesUsage(dst *dto.Usage, src *dto.Usage, rawUsage ...[]byte) {
 	if dst == nil || src == nil {
 		return
 	}
@@ -174,8 +188,31 @@ func ApplyResponsesUsage(dst *dto.Usage, src *dto.Usage) {
 	}
 	incoming.PromptCacheHitTokens = src.PromptCacheHitTokens
 	dto.MergeUsageNonZero(dst, incoming)
+	if len(rawUsage) > 0 && len(rawUsage[0]) > 0 {
+		// These upstream counters are cumulative snapshots. Replace each valid
+		// present field, including zero; absent fields keep the earlier fact.
+		fields := map[string]*int{
+			"input_tokens_details.cached_tokens":      &dst.PromptTokensDetails.CachedTokens,
+			"input_tokens_details.cache_write_tokens": &dst.PromptTokensDetails.CacheWriteTokens,
+			"input_tokens_details.text_tokens":        &dst.PromptTokensDetails.TextTokens,
+			"input_tokens_details.image_tokens":       &dst.PromptTokensDetails.ImageTokens,
+			"input_tokens_details.audio_tokens":       &dst.PromptTokensDetails.AudioTokens,
+			"output_tokens_details.text_tokens":       &dst.CompletionTokenDetails.TextTokens,
+			"output_tokens_details.image_tokens":      &dst.CompletionTokenDetails.ImageTokens,
+			"output_tokens_details.audio_tokens":      &dst.CompletionTokenDetails.AudioTokens,
+			"output_tokens_details.reasoning_tokens":  &dst.CompletionTokenDetails.ReasoningTokens,
+		}
+		for path, destination := range fields {
+			if valid, _ := relaycommon.NativeUsagePresence(rawUsage[0], path, "", ""); valid {
+				*destination = int(ojson.GetBytes(rawUsage[0], path).Int())
+			}
+		}
+		if dst.InputTokensDetails != nil {
+			*dst.InputTokensDetails = dst.PromptTokensDetails.Clone()
+		}
+	}
 	outputDetails := dst.CompletionTokenDetails
-	if outputDetails != (dto.OutputTokenDetails{}) {
+	if outputDetails != (dto.OutputTokenDetails{}) || dst.OutputTokensDetails != nil {
 		dst.OutputTokensDetails = &outputDetails
 	}
 }

@@ -51,6 +51,7 @@ type ResponsesWSGateway func(*gin.Context, *ResponsesWSCall) (bool, *types.NewAP
 type ResponsesWSCall struct {
 	Request             dto.OpenAIResponsesRequest
 	Body                []byte
+	LegacyConnection    bool
 	LockedChannelID     int
 	LockedProviderID    int
 	LockedUpstreamModel string
@@ -80,6 +81,9 @@ func (call *ResponsesWSCall) Prepare(c *gin.Context, info *relaycommon.RelayInfo
 // The caller reserves funds and freezes the Attempt before calling Exchange.
 func (call *ResponsesWSCall) Exchange(c *gin.Context, info *relaycommon.RelayInfo, channelID, providerID int, prepared *relaychannel.PreparedWssRequest, payload []byte) (*dto.Usage, *types.NewAPIError) {
 	s := call.session
+	if s.lockedChannelID != 0 {
+		return nil, newResponsesWSInvalidRequestError(errors.New("connection billing identity changed; reconnect required"))
+	}
 	if s.gatewayChannelID != 0 && (s.gatewayChannelID != channelID || s.gatewayProviderID != providerID || s.gatewayUpstreamModel != info.UpstreamModelName) {
 		return nil, newResponsesWSInvalidRequestError(errors.New("upstream connection identity changed; reconnect required"))
 	}
@@ -325,7 +329,7 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
 		c.Request.Body = io.NopCloser(bytes.NewReader(create.Body))
 		c.Request.ContentLength = int64(len(create.Body))
 		if s.gateway != nil {
-			call := &ResponsesWSCall{Request: create.Request, Body: create.Body, LockedChannelID: s.gatewayChannelID,
+			call := &ResponsesWSCall{Request: create.Request, Body: create.Body, LegacyConnection: s.lockedChannelID != 0, LockedChannelID: s.gatewayChannelID,
 				LockedProviderID: s.gatewayProviderID, LockedUpstreamModel: s.gatewayUpstreamModel, session: s, state: state, create: create}
 			if handled, gatewayErr := s.gateway(c, call); handled {
 				return gatewayErr
@@ -1003,6 +1007,9 @@ func normalizeResponsesWSCreateEvent(message []byte, event responsesWSCreateEven
 	}
 	payload := doc.Bytes()
 	if err := common.Unmarshal(payload, &create.Request); err != nil {
+		return create, err
+	}
+	if err := helper.ValidateResponsesMultipliers(payload); err != nil {
 		return create, err
 	}
 	if helper.ExceedsMaxTokensLimit(create.Request.MaxOutputTokens) {

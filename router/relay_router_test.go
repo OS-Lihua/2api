@@ -369,14 +369,28 @@ func TestResponsesWSGatewaySettlesLogicalRequests(t *testing.T) {
 		require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
 		_, raw, err := client.ReadMessage()
 		require.NoError(t, err)
-		assert.Contains(t, string(raw), fmt.Sprintf(`"id":"response-%d"`, i), "%s", raw)
-		assert.Equal(t, "upstream-model", <-received)
-		// Read records through the same management API used by the drawer.
+		require.Contains(t, string(raw), fmt.Sprintf(`"id":"response-%d"`, i), "%s", raw)
+		select {
+		case modelName := <-received:
+			assert.Equal(t, "upstream-model", modelName)
+		case <-time.After(5 * time.Second):
+			t.Fatal("Provider did not receive the logical request")
+		}
+		// Wait for the committed records before starting the next request.
 		var records []model.GatewayRequest
 		require.Eventually(t, func() bool {
 			var err error
 			records, _, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
-			return err == nil && len(records) == i+1
+			if err != nil || len(records) != i+1 {
+				return false
+			}
+			for _, record := range records {
+				_, count, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+				if err != nil || count != 1 || record.Status == "settlement_pending" {
+					return false
+				}
+			}
+			return true
 		}, 5*time.Second, 10*time.Millisecond)
 	}
 	require.NoError(t, client.Close())

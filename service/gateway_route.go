@@ -34,6 +34,7 @@ var ErrGatewayUnavailable = errors.New("no Channel is available")
 type GatewayChannelRequirements struct {
 	Protocol           protocol.Type
 	ChannelID          int
+	Responses          *dto.OpenAIResponsesRequest
 	ResponsesWebSocket bool
 }
 
@@ -86,18 +87,22 @@ func SelectGatewayProtocolChannel(c *gin.Context, offering *model.ModelOffering,
 				break
 			}
 			caps, err = candidate.EffectiveCapabilities(candidate.Model.Capabilities)
-			if err != nil || !GatewayCapabilitiesMatch(request, caps, 0) {
+			if err != nil || requirements.Responses == nil && !GatewayCapabilitiesMatch(request, caps, 0) || requirements.Responses != nil && !GatewayResponsesCapabilitiesMatch(requirements.Responses, caps, 0) {
 				reason = "capability"
 				break
 			}
 			common.SetContextKey(c, constant.ContextKeyOriginalModel, candidate.Model.ModelName)
 			info := relaycommon.GenRelayInfoOpenAI(c, request)
 			info.TokenizerModel = candidate.Model.ModelName
-			tokens, err = CountRequestToken(c, request.GetTokenCountMeta(), info)
+			meta := request.GetTokenCountMeta()
+			if requirements.Responses != nil {
+				meta = requirements.Responses.GetTokenCountMeta()
+			}
+			tokens, err = CountRequestToken(c, meta, info)
 			if err != nil {
 				return nil, errors.New("could not estimate input tokens")
 			}
-			if !GatewayCapabilitiesMatch(request, caps, tokens) {
+			if requirements.Responses == nil && !GatewayCapabilitiesMatch(request, caps, tokens) || requirements.Responses != nil && !GatewayResponsesCapabilitiesMatch(requirements.Responses, caps, tokens) {
 				reason = "capability"
 				break
 			}
@@ -156,6 +161,52 @@ func SelectGatewayProtocolChannel(c *gin.Context, offering *model.ModelOffering,
 	diagnostics["probe"] = admission.Lease != ""
 	selected.Diagnostics = diagnostics
 	return selected, nil
+}
+
+// GatewayResponsesCapabilitiesMatch checks native request features without
+// converting stateful Responses fields through another wire protocol.
+func GatewayResponsesCapabilitiesMatch(request *dto.OpenAIResponsesRequest, caps capability.Set, inputTokens int) bool {
+	projection := &dto.GeneralOpenAIRequest{Model: request.Model, Stream: common.GetPointer(true), MaxCompletionTokens: request.MaxOutputTokens}
+	if len(request.Tools) > 0 && string(request.Tools) != "[]" && string(request.Tools) != "null" {
+		projection.Tools = make([]dto.ToolCallRequest, 1)
+	}
+	if request.Reasoning != nil {
+		projection.ReasoningEffort = request.Reasoning.Effort
+		if projection.ReasoningEffort == "" {
+			projection.ReasoningEffort = "medium"
+		}
+	}
+	if len(request.PromptCacheKey) > 0 {
+		projection.PromptCacheKey = string(request.PromptCacheKey)
+	}
+	projection.PromptCacheOptions, projection.PromptCacheRetention = request.PromptCacheOptions, request.PromptCacheRetention
+	var text struct {
+		Format *dto.ResponseFormat `json:"format"`
+	}
+	if len(request.Text) > 0 && common.Unmarshal(request.Text, &text) != nil {
+		return false
+	}
+	projection.ResponseFormat = text.Format
+	if !GatewayCapabilitiesMatch(projection, caps, inputTokens) {
+		return false
+	}
+	var images int64
+	for _, file := range request.GetTokenCountMeta().Files {
+		modality := capability.PDF
+		switch file.FileType {
+		case types.FileTypeImage:
+			modality = capability.Image
+			images++
+		case types.FileTypeAudio:
+			modality = capability.Audio
+		case types.FileTypeVideo:
+			modality = capability.Video
+		}
+		if !slices.Contains(caps.InputModalities, modality) {
+			return false
+		}
+	}
+	return caps.Limits.MaxImages == nil || images <= *caps.Limits.MaxImages
 }
 
 // GatewayCapabilitiesMatch checks the same declaration before and after

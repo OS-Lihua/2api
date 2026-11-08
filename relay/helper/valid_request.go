@@ -134,6 +134,49 @@ func ExceedsMaxTokensLimit(values ...*uint) bool {
 	return false
 }
 
+// ValidateResponsesMultipliers bounds compatible passthrough token limits too.
+// Responses has one output response; a vendor n>1 cannot silently multiply it.
+func ValidateResponsesMultipliers(body []byte) error {
+	var request struct {
+		Model               string            `json:"model"`
+		N                   *int              `json:"n"`
+		MaxTokens           *uint             `json:"max_tokens"`
+		MaxCompletionTokens *uint             `json:"max_completion_tokens"`
+		MaxOutputTokens     *uint             `json:"max_output_tokens"`
+		MinTokens           *uint             `json:"min_tokens"`
+		Parameters          common.RawMessage `json:"parameters"`
+	}
+	if err := common.Unmarshal(body, &request); err != nil {
+		return err
+	}
+	if request.N != nil && *request.N != 1 {
+		return errors.New("n must be 1 for Responses")
+	}
+	if ExceedsMaxTokensLimit(request.MaxTokens, request.MaxCompletionTokens, request.MaxOutputTokens, request.MinTokens) {
+		return errors.New("max_tokens is invalid")
+	}
+	if len(request.Parameters) > 0 && string(request.Parameters) != "null" {
+		// Only the known compatible container is interpreted; request content
+		// and tool schemas are never searched for similarly named properties.
+		var nested struct {
+			N                   *int  `json:"n"`
+			MaxTokens           *uint `json:"max_tokens"`
+			MaxCompletionTokens *uint `json:"max_completion_tokens"`
+			MaxOutputTokens     *uint `json:"max_output_tokens"`
+		}
+		if err := common.Unmarshal(request.Parameters, &nested); err != nil {
+			return err
+		}
+		if nested.N != nil && *nested.N != 1 {
+			return errors.New("parameters.n must be 1 for Responses")
+		}
+		if ExceedsMaxTokensLimit(nested.MaxTokens, nested.MaxCompletionTokens, nested.MaxOutputTokens) {
+			return errors.New("parameters.max_tokens is invalid")
+		}
+	}
+	return nil
+}
+
 func GetAndValidateResponsesRequest(c *gin.Context) (*dto.OpenAIResponsesRequest, error) {
 	request := &dto.OpenAIResponsesRequest{}
 	err := common.UnmarshalBodyReusable(c, request)
