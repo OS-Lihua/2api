@@ -895,16 +895,86 @@ func TestRealtimeGatewayRejectsFixedPricingBeforeReservation(t *testing.T) {
 	}
 }
 
-func TestRealtimeGatewayRejectsUnknownInitialVADState(t *testing.T) {
-	for _, body := range []string{`{}`, `{"modalities":["text"]}`, `{"type":"realtime","audio":{"input":{}}}`} {
-		t.Run(body, func(t *testing.T) {
-			var calls atomic.Int32
+func TestRealtimeGatewayRechecksAccessAfterHandshake(t *testing.T) {
+	for _, change := range []string{"token", "user", "offering", "channel", "provider", "key"} {
+		t.Run(change, func(t *testing.T) {
+			var forwarded atomic.Int32
+			done := make(chan struct{})
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				defer close(done)
 				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
 				if !assert.NoError(t, err) {
 					return
 				}
 				defer peer.Close()
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"modalities":["text"],"turn_detection":null}}`))) {
+					return
+				}
+				for {
+					_, _, err := peer.ReadMessage()
+					if err != nil {
+						return
+					}
+					forwarded.Add(1)
+					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"input_audio_buffer.cleared"}`))) {
+						return
+					}
+				}
+			})
+			client := dialRealtimeGateway(t, fixture)
+			_, _, err := client.ReadMessage()
+			require.NoError(t, err)
+			frame := `{"type":"response.create","response":{"input":[],"conversation":"none"}}`
+			switch change {
+			case "token":
+				require.NoError(t, model.DB.Model(fixture.token).Update("status", common.TokenStatusDisabled).Error)
+				frame = `{"type":"input_audio_buffer.clear"}`
+			case "user":
+				require.NoError(t, model.DB.Model(fixture.user).Update("status", common.UserStatusDisabled).Error)
+				frame = `{"type":"input_audio_buffer.clear"}`
+			case "offering":
+				require.NoError(t, model.DB.Model(fixture.offering).Update("enabled", false).Error)
+				frame = `{"type":"input_audio_buffer.clear"}`
+			case "channel":
+				require.NoError(t, model.DB.Model(fixture.channel).Update("status", model.ChannelDisabled).Error)
+			case "provider":
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("status", common.ChannelStatusManuallyDisabled).Error)
+			case "key":
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("key", "replacement-after-handshake").Error)
+			}
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(frame)))
+			_, reply, err := client.ReadMessage()
+			require.NoError(t, err)
+			assert.Equal(t, "error", ojson.GetBytes(reply, "type").String())
+			require.NoError(t, client.Close())
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Revoked access did not release the Provider connection")
+			}
+			assert.Zero(t, forwarded.Load(), "Revoked control or changed pinned route cannot reach Provider")
+			var count int64
+			require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Where("user_id = ?", fixture.user.Id).Count(&count).Error)
+			assert.Zero(t, count, "Revoked request cannot reserve")
+		})
+	}
+}
+
+func TestRealtimeGatewayRejectsUnknownInitialVADState(t *testing.T) {
+	for _, body := range []string{`{}`, `{"modalities":["text"]}`, `{"type":"realtime","audio":{"input":{}}}`} {
+		t.Run(body, func(t *testing.T) {
+			var calls atomic.Int32
+			release := make(chan struct{}, 1)
+			defer close(release)
+			done := make(chan struct{})
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				defer close(done)
+				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if !assert.NoError(t, err) {
+					return
+				}
+				defer peer.Close()
+				<-release
 				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":`+body+`}`))) {
 					return
 				}
@@ -916,10 +986,17 @@ func TestRealtimeGatewayRejectsUnknownInitialVADState(t *testing.T) {
 				}
 			})
 			client := dialRealtimeGateway(t, fixture)
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"input_audio_buffer.clear"}`)))
+			release <- struct{}{}
 			_, reply, err := client.ReadMessage()
 			require.NoError(t, err)
 			assert.Equal(t, "error", ojson.GetBytes(reply, "type").String(), "Unknown initial detection state cannot open the financial generation gate")
 			require.NoError(t, client.Close())
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Unknown bootstrap did not close the Provider connection")
+			}
 			assert.Zero(t, calls.Load())
 			var count int64
 			require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Where("user_id = ?", fixture.user.Id).Count(&count).Error)
