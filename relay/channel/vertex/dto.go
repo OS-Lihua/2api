@@ -3,10 +3,13 @@ package vertex
 import (
 	"encoding/json"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 )
 
 type VertexAIClaudeRequest struct {
+	model            string
 	AnthropicVersion string              `json:"anthropic_version"`
 	Messages         []dto.ClaudeMessage `json:"messages"`
 	System           any                 `json:"system,omitempty"`
@@ -23,8 +26,21 @@ type VertexAIClaudeRequest struct {
 	//Metadata         json.RawMessage     `json:"metadata,omitempty"`
 }
 
+func (*VertexAIClaudeRequest) ChatOutputLimit(body []byte) (*uint, error) {
+	var request VertexAIClaudeRequest
+	if err := common.Unmarshal(body, &request); err != nil {
+		return nil, err
+	}
+	return request.MaxTokens, nil
+}
+
+func (request *VertexAIClaudeRequest) SetChatOutputLimit(body []byte, limit uint) ([]byte, error) {
+	return channel.SetClaudeOutputLimit(body, request.model, limit)
+}
+
 func copyRequest(req *dto.ClaudeRequest, version string) *VertexAIClaudeRequest {
 	return &VertexAIClaudeRequest{
+		model:            req.Model,
 		AnthropicVersion: version,
 		System:           req.System,
 		Messages:         req.Messages,

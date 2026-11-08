@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
@@ -22,13 +23,14 @@ import (
 // PreparedMediaRequest carries the validated wire and transient price probes.
 // Prepared is populated only after transport and account preparation.
 type PreparedMediaRequest struct {
-	Prepared            *PreparedChannelRequest
-	Request             dto.Request
-	Input               billingexpr.RequestInput
-	Body                []byte
-	ContentType         string
-	nativeAudio         bool
-	MinimumOutputTokens int
+	Prepared                   *PreparedChannelRequest
+	Request                    dto.Request
+	Input                      billingexpr.RequestInput
+	Body                       []byte
+	ContentType                string
+	nativeAudio                bool
+	speechOutputLimitSupported bool
+	MinimumOutputTokens        int
 }
 
 // PrepareMediaRequest validates the final media wire and prepares its transport.
@@ -49,11 +51,11 @@ func (a *ChannelAdaptor) PrepareMediaRequest(c *gin.Context, info *relaycommon.R
 	return result, nil
 }
 
-// SetMediaOutputLimit installs a bounded default in the public speech wire.
-// Native audio projections must reject limits they cannot send to the Provider.
+// SetMediaOutputLimit installs a bounded default only for a declared speech
+// dialect with a token control. Native projections reject unsupported limits.
 func (a *ChannelAdaptor) SetMediaOutputLimit(prepared *PreparedMediaRequest, limit int64) error {
 	request, ok := prepared.Request.(*dto.AudioRequest)
-	if a.kind != protocol.OpenAIAudioSpeech || !ok || prepared.nativeAudio || limit <= 0 {
+	if a.kind != protocol.OpenAIAudioSpeech || !ok || prepared.nativeAudio || !prepared.speechOutputLimitSupported || limit <= 0 {
 		return fmt.Errorf("speech output limit cannot be sent to this Channel")
 	}
 	var fields map[string]common.RawMessage
@@ -169,7 +171,7 @@ func (a *ChannelAdaptor) PrepareMediaWire(c *gin.Context, info *relaycommon.Rela
 	if err := helper.ValidateGatewayMediaMultipliers(body); err != nil {
 		return nil, err
 	}
-	result := &PreparedMediaRequest{Request: request, Input: billingexpr.RequestInput{Body: body}}
+	result := &PreparedMediaRequest{Request: request, Input: billingexpr.RequestInput{Body: body}, speechOutputLimitSupported: info.ChannelType == constant.ChannelTypeVLLM}
 	if projector, ok := converted.(channel.ImageRequestProjector); a.kind == protocol.OpenAIImages && ok {
 		effective, err := projector.ProjectImageRequest(body, *request.(*dto.ImageRequest))
 		if err != nil {
@@ -233,6 +235,12 @@ func (a *ChannelAdaptor) PrepareMediaWire(c *gin.Context, info *relaycommon.Rela
 		}
 		if a.kind == protocol.OpenAIAudioSpeech && (effective.Input == "" || effective.Voice == "") {
 			return nil, fmt.Errorf("speech input and voice are required")
+		}
+		if a.kind == protocol.OpenAIAudioSpeech && len(effective.MaxNewTokens) > 0 {
+			var limit uint
+			if !result.speechOutputLimitSupported || common.Unmarshal(effective.MaxNewTokens, &limit) != nil || limit == 0 {
+				return nil, fmt.Errorf("speech output limit is not supported by this Channel")
+			}
 		}
 		result.Request = &effective
 	}

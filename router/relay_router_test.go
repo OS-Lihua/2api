@@ -2771,6 +2771,15 @@ func TestTextGatewayFailureClassificationAndProviderScope(t *testing.T) {
 	}
 }
 
+func setGatewayVertexClaudeProvider(t *testing.T, fixture textGatewayFixture) {
+	t.Helper()
+	var provider model.Provider
+	require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
+	provider.SetOtherSettings(dto.ProviderOtherSettings{VertexKeyType: dto.VertexKeyTypeAPIKey})
+	require.NoError(t, model.DB.Model(&provider).Updates(map[string]any{"type": constant.ChannelTypeVertexAi, "settings": provider.OtherSettings}).Error)
+	require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", "claude-sonnet-4-5").Error)
+}
+
 func addTextGatewayChannel(t *testing.T, fixture textGatewayFixture, upstream http.HandlerFunc) *model.Channel {
 	t.Helper()
 	server := httptest.NewServer(upstream)
@@ -5586,15 +5595,22 @@ func TestMediaGatewayEnforcesCapabilityLimitsOnEffectiveAudioFields(t *testing.T
 		output, context, duration int64
 		status                    int
 		wireLimit                 string
+		provider                  int
 	}{
-		{"request output limit", `,"max_new_tokens":17`, "", 16, 0, 0, 400, ""},
-		{"Provider output override", "", `{"max_new_tokens":17}`, 16, 0, 0, 400, ""},
-		{"duration multiplier", `,"metadata":{"duration":31}`, "", 0, 0, 30, 400, ""},
-		{"remaining context", `,"max_new_tokens":6`, "", 0, 10, 0, 400, ""},
-		{"explicit zero output", `,"max_new_tokens":0`, "", 16, 0, 0, 200, "0"},
-		{"default output cap", "", "", 16, 0, 0, 200, "16"},
-		{"default remaining context", "", "", 0, 10, 0, 200, "5"},
-		{"no remaining output", "", "", 0, 5, 0, 400, ""},
+		{name: "request output limit", extra: `,"max_new_tokens":17`, output: 16, status: 400, provider: constant.ChannelTypeVLLM},
+		{name: "Provider output override", override: `{"max_new_tokens":17}`, output: 16, status: 400, provider: constant.ChannelTypeVLLM},
+		{name: "duration multiplier", extra: `,"metadata":{"duration":31}`, duration: 30, status: 400, provider: constant.ChannelTypeVLLM},
+		{name: "remaining context", extra: `,"max_new_tokens":6`, context: 10, status: 400, provider: constant.ChannelTypeVLLM},
+		{name: "vLLM zero outside protocol range", extra: `,"max_new_tokens":0`, output: 16, status: 400, provider: constant.ChannelTypeVLLM},
+		{name: "default output cap", output: 16, status: 200, wireLimit: "16", provider: constant.ChannelTypeVLLM},
+		{name: "default remaining context", context: 10, status: 200, wireLimit: "5", provider: constant.ChannelTypeVLLM},
+		{name: "no remaining output", context: 5, status: 400, provider: constant.ChannelTypeVLLM},
+		{name: "official default output cap", output: 16, status: 400, provider: constant.ChannelTypeOpenAI},
+		{name: "official remaining context", context: 10, status: 400, provider: constant.ChannelTypeOpenAI},
+		{name: "official explicit extension", extra: `,"max_new_tokens":16`, status: 400, provider: constant.ChannelTypeOpenAI},
+		{name: "official explicit zero", extra: `,"max_new_tokens":0`, status: 400, provider: constant.ChannelTypeOpenAI},
+		{name: "official ordinary speech", status: 200, provider: constant.ChannelTypeOpenAI},
+		{name: "vLLM ordinary speech", status: 200, provider: constant.ChannelTypeVLLM},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
@@ -5608,6 +5624,7 @@ func TestMediaGatewayEnforcesCapabilityLimitsOnEffectiveAudioFields(t *testing.T
 				w.Header().Set("Content-Type", "audio/pcm")
 				_, _ = w.Write(make([]byte, 48000))
 			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", tc.provider).Error)
 			var unified model.Model
 			require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
 			if tc.output > 0 {
@@ -5639,6 +5656,36 @@ func TestMediaGatewayEnforcesCapabilityLimitsOnEffectiveAudioFields(t *testing.T
 			}
 		})
 	}
+}
+
+func TestMediaGatewaySpeechCapContinuesToCompatibleCandidate(t *testing.T) {
+	var officialCalls, compatibleCalls atomic.Int64
+	fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
+		officialCalls.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+	})
+	compatible := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+		compatibleCalls.Add(1)
+		var body dto.AudioRequest
+		require.NoError(t, common.DecodeJson(r.Body, &body))
+		assert.Equal(t, "16", string(body.MaxNewTokens))
+		w.Header().Set("Content-Type", "audio/pcm")
+		_, _ = w.Write(make([]byte, 24000))
+	})
+	require.NoError(t, model.DB.Model(compatible).Update("protocol", protocol.OpenAIAudioSpeech).Error)
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", compatible.ProviderID).Update("type", constant.ChannelTypeVLLM).Error)
+	var unified model.Model
+	require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+	unified.Capabilities.Limits.MaxOutputTokens = common.GetPointer(int64(16))
+	require.NoError(t, model.DB.Model(&unified).Update("capabilities", unified.Capabilities).Error)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", `{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm"}`)
+	require.Equal(t, http.StatusOK, response.Code)
+	assert.Zero(t, officialCalls.Load())
+	assert.EqualValues(t, 1, compatibleCalls.Load())
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, compatible.ID, attempts[0].ChannelID)
 }
 
 func TestMediaGatewayFreezesForeignCostAndRecoversWithoutLosingDebt(t *testing.T) {
@@ -7005,15 +7052,18 @@ func TestTextGatewayDefaultOutputLimitPreservesExplicitZero(t *testing.T) {
 		name, clientField, wirePath string
 		upstream                    protocol.Type
 		preservesZero               bool
+		vertex                      bool
 	}{
-		{"Chat max tokens", "max_tokens", "max_tokens", protocol.OpenAIChat, true},
-		{"Chat completion tokens", "max_completion_tokens", "max_completion_tokens", protocol.OpenAIChat, true},
-		{"Gemini max tokens", "max_tokens", "generationConfig.maxOutputTokens", protocol.GeminiGenerate, true},
-		{"Gemini completion tokens", "max_completion_tokens", "generationConfig.maxOutputTokens", protocol.GeminiGenerate, true},
-		{"Responses max tokens", "max_tokens", "max_output_tokens", protocol.OpenAIResponses, true},
-		{"Responses completion tokens", "max_completion_tokens", "max_output_tokens", protocol.OpenAIResponses, true},
-		{"Claude max tokens cannot preserve zero", "max_tokens", "max_tokens", protocol.AnthropicMessages, false},
-		{"Claude completion tokens cannot preserve zero", "max_completion_tokens", "max_tokens", protocol.AnthropicMessages, false},
+		{"Chat max tokens", "max_tokens", "max_tokens", protocol.OpenAIChat, true, false},
+		{"Chat completion tokens", "max_completion_tokens", "max_completion_tokens", protocol.OpenAIChat, true, false},
+		{"Gemini max tokens", "max_tokens", "generationConfig.maxOutputTokens", protocol.GeminiGenerate, true, false},
+		{"Gemini completion tokens", "max_completion_tokens", "generationConfig.maxOutputTokens", protocol.GeminiGenerate, true, false},
+		{"Responses max tokens", "max_tokens", "max_output_tokens", protocol.OpenAIResponses, true, false},
+		{"Responses completion tokens", "max_completion_tokens", "max_output_tokens", protocol.OpenAIResponses, true, false},
+		{"Claude max tokens cannot preserve zero", "max_tokens", "max_tokens", protocol.AnthropicMessages, false, false},
+		{"Claude completion tokens cannot preserve zero", "max_completion_tokens", "max_tokens", protocol.AnthropicMessages, false, false},
+		{"Vertex Claude max tokens cannot preserve zero", "max_tokens", "max_tokens", protocol.AnthropicMessages, false, true},
+		{"Vertex Claude completion tokens cannot preserve zero", "max_completion_tokens", "max_tokens", protocol.AnthropicMessages, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls atomic.Int64
@@ -7058,6 +7108,9 @@ func TestTextGatewayDefaultOutputLimitPreservesExplicitZero(t *testing.T) {
 			unified.Capabilities.Limits.MaxOutputTokens = common.GetPointer(int64(16_384))
 			require.NoError(t, model.DB.Model(&unified).Update("capabilities", unified.Capabilities).Error)
 			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", tc.upstream).Error)
+			if tc.vertex {
+				setGatewayVertexClaudeProvider(t, fixture)
+			}
 			_, err := model.PostLedgerEntries(model.LedgerPosting{Account: model.UserWalletAccount(fixture.user.Id), Type: model.LedgerEntryAdjustment, Amount: money.Amount{Nanos: -999_900_000, Currency: "USD"}, Remark: "explicit zero input-only wallet"})
 			require.NoError(t, err)
 			before, err := model.GetUserWallet(fixture.user.Id)
@@ -7211,10 +7264,12 @@ func TestTextGatewayDefaultOutputLimitFitsRemainingContext(t *testing.T) {
 	for _, test := range []struct {
 		name, field, path, response string
 		upstream                    protocol.Type
+		vertex                      bool
 	}{
-		{"Claude converted limit", "max_tokens", "max_tokens", `{"id":"bounded","type":"message","role":"assistant","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":9,"output_tokens":1}}`, protocol.AnthropicMessages},
-		{"Responses converted limit", "max_output_tokens", "max_output_tokens", `{"id":"bounded","object":"response","status":"completed","output":[{"type":"message","id":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"OK","annotations":[]}]}],"usage":{"input_tokens":9,"output_tokens":1,"total_tokens":10}}`, protocol.OpenAIResponses},
-		{"Gemini converted limit", "maxOutputTokens", "generationConfig.maxOutputTokens", `{"candidates":[{"content":{"parts":[{"text":"OK"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":1,"totalTokenCount":10}}`, protocol.GeminiGenerate},
+		{"Claude converted limit", "max_tokens", "max_tokens", `{"id":"bounded","type":"message","role":"assistant","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":9,"output_tokens":1}}`, protocol.AnthropicMessages, false},
+		{"Responses converted limit", "max_output_tokens", "max_output_tokens", `{"id":"bounded","object":"response","status":"completed","output":[{"type":"message","id":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"OK","annotations":[]}]}],"usage":{"input_tokens":9,"output_tokens":1,"total_tokens":10}}`, protocol.OpenAIResponses, false},
+		{"Gemini converted limit", "maxOutputTokens", "generationConfig.maxOutputTokens", `{"candidates":[{"content":{"parts":[{"text":"OK"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":1,"totalTokenCount":10}}`, protocol.GeminiGenerate, false},
+		{"Vertex Claude converted limit", "max_tokens", "max_tokens", `{"id":"bounded","type":"message","role":"assistant","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":9,"output_tokens":1}}`, protocol.AnthropicMessages, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var sent map[string]any
@@ -7226,9 +7281,15 @@ func TestTextGatewayDefaultOutputLimitFitsRemainingContext(t *testing.T) {
 			caps := capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{MaxOutputTokens: common.GetPointer(int64(16))}}
 			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
 			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", test.upstream).Error)
+			if test.vertex {
+				setGatewayVertexClaudeProvider(t, fixture)
+			}
 			price := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: fmt.Sprintf(`param(%q) == 16 ? tier("bounded",fixed(0.000001)) : tier("unbounded",fixed(0.000002))`, test.path), EffectiveAt: clock.Now().Unix()}
 			require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}]}`)
+			if test.vertex {
+				assert.EqualValues(t, 16, sent["max_tokens"], "Vertex wire must carry the validated output cap")
+			}
 			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 			wire := sent
 			if test.upstream == protocol.GeminiGenerate {
