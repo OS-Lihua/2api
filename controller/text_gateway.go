@@ -53,6 +53,15 @@ func (run *textGatewayRun) fail(c *gin.Context, status int, code, message string
 	run.status, run.code, run.message = status, code, message
 }
 
+func gatewayChannelPurchaseSnapshot(ctx context.Context, channelID int, at time.Time) (*model.PriceVersion, *money.Rate, string, error) {
+	price, err := model.CurrentPriceVersion(ctx, model.DB, model.PriceOwnerChannel, channelID, at.Unix())
+	if err != nil {
+		return nil, nil, "", err
+	}
+	fx, rate, err := service.GatewayFX(ctx, price.Currency)
+	return price, fx, rate, err
+}
+
 func gatewayPreparationRejection(err error, budget *service.GatewayAttemptBudget, parent context.Context, providerID int, requestID string) service.GatewayAttemptResult {
 	var certificateFailure *tls.CertificateVerificationError
 	if errors.As(err, &certificateFailure) {
@@ -463,15 +472,8 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		record.Status = "cancelled"
 		return
 	}
-	attemptStart := clock.Now()
-	purchase, err = model.CurrentPriceVersion(c.Request.Context(), model.DB, model.PriceOwnerChannel, selection.Channel.ID, attemptStart.Unix())
-	if err != nil {
-		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
-		return
-	}
-	var purchaseRate string
-	purchaseFX, purchaseRate, err = service.GatewayFX(c.Request.Context(), purchase.Currency)
-	if err != nil {
+	// Admission checks avoid Provider preparation I/O without a usable purchase price.
+	if _, _, _, err = gatewayChannelPurchaseSnapshot(c.Request.Context(), selection.Channel.ID, clock.Now()); err != nil {
 		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
 	}
@@ -487,6 +489,14 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	if err != nil {
 		result = gatewayPreparationRejection(err, budget, parent.Context(), selection.Channel.ProviderID, info.RequestId)
 		run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
+		return
+	}
+	// Preparation shares the budget but is not part of the model Attempt or its purchase snapshot.
+	attemptStart := clock.Now()
+	var purchaseRate string
+	purchase, purchaseFX, purchaseRate, err = gatewayChannelPurchaseSnapshot(c.Request.Context(), selection.Channel.ID, attemptStart)
+	if err != nil {
+		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
 	}
 	purchaseInput = billingexpr.RequestInput{Body: append([]byte(nil), encoded...), Headers: make(map[string]string)}

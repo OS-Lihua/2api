@@ -1113,6 +1113,51 @@ func TestTextGatewayFirstByteBudgetIsNotShortenedByIdleTimeout(t *testing.T) {
 	assert.Equal(t, "success", record.Status)
 }
 
+func TestTextGatewayPurchaseSnapshotStartsAfterAccountPreparation(t *testing.T) {
+	var fixture textGatewayFixture
+	fixture = newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/oauth/2.0/token" {
+			fixture.fake.Advance(10 * time.Second)
+			_, _ = w.Write([]byte(`{"access_token":"fake-token","expires_in":7200}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":"Hello","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	})
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeBaidu, "key": t.Name() + "|fake"}).Error)
+	started := clock.Now()
+	later := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("tokens",p * 3 + c * 4)`, EffectiveAt: started.Add(5 * time.Second).Unix()}
+	require.NoError(t, model.CreatePriceVersion(t.Context(), later, fixture.sale.CreatedBy))
+	var provider model.Provider
+	require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
+	endpoint, err := url.Parse(*provider.BaseURL)
+	require.NoError(t, err)
+	client := service.GetHttpClient()
+	original := client.Transport
+	t.Cleanup(func() { client.Transport = original })
+	client.Transport = channelProbeRoundTripper(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host != "aip.baidubce.com" {
+			return original.RoundTrip(r)
+		}
+		copyRequest := r.Clone(r.Context())
+		copyURL := *r.URL
+		copyURL.Scheme, copyURL.Host = endpoint.Scheme, endpoint.Host
+		copyRequest.URL, copyRequest.Host = &copyURL, endpoint.Host
+		return original.RoundTrip(copyRequest)
+	})
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, later.ID, attempts[0].PurchasePriceVersionID)
+	assert.Equal(t, started.Add(10*time.Second).UnixMilli(), attempts[0].StartedAt)
+	assert.EqualValues(t, 50_000, attempts[0].Cost.Nanos)
+	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+	require.NoError(t, err)
+	assert.EqualValues(t, 36_000, record.Receivable.Nanos)
+}
+
 func TestTextGatewayFailoverCannotExceedFrozenReservation(t *testing.T) {
 	for _, recovery := range []bool{false, true} {
 		t.Run(fmt.Sprint("recovery=", recovery), func(t *testing.T) {
