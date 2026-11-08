@@ -159,8 +159,12 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 	if !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, tokens) {
 		return nil, service.ErrGatewayCapability
 	}
-	if limit := effective.GetMaxTokens(); limit > 0 {
-		mean = min(mean, int64(limit))
+	effectiveOutputLimit = effective.MaxCompletionTokens
+	if effectiveOutputLimit == nil {
+		effectiveOutputLimit = effective.MaxTokens
+	}
+	if effectiveOutputLimit != nil {
+		mean = min(mean, int64(*effectiveOutputLimit))
 	}
 	if limit := selection.Capabilities.Limits.MaxOutputTokens; limit != nil {
 		mean = min(mean, *limit)

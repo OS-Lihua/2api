@@ -4783,12 +4783,15 @@ func TestTextGatewayDefaultOutputLimitPreservesExplicitZero(t *testing.T) {
 			unified.Capabilities.Limits.MaxOutputTokens = common.GetPointer(int64(16_384))
 			require.NoError(t, model.DB.Model(&unified).Update("capabilities", unified.Capabilities).Error)
 			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", tc.upstream).Error)
+			_, err := model.PostLedgerEntries(model.LedgerPosting{Account: model.UserWalletAccount(fixture.user.Id), Type: model.LedgerEntryAdjustment, Amount: money.Amount{Nanos: -999_900_000, Currency: "USD"}, Remark: "explicit zero input-only wallet"})
+			require.NoError(t, err)
 			before, err := model.GetUserWallet(fixture.user.Id)
 			require.NoError(t, err)
 			body := fmt.Sprintf(`{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],%q:0}`, tc.clientField)
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
 			assert.GreaterOrEqual(t, response.Code, http.StatusBadRequest, response.Body.String())
 			if tc.preservesZero {
+				assert.NotEqual(t, http.StatusPaymentRequired, response.Code, response.Body.String())
 				require.EqualValues(t, 1, calls.Load())
 				assert.EqualValues(t, 0, <-observed, "explicit zero must reach the Provider unchanged, which can reject its protocol range")
 			} else {
@@ -4801,6 +4804,88 @@ func TestTextGatewayDefaultOutputLimitPreservesExplicitZero(t *testing.T) {
 			after, err := model.GetUserWallet(fixture.user.Id)
 			require.NoError(t, err)
 			assert.Equal(t, before.Balance.Nanos, after.Balance.Nanos)
+		})
+	}
+}
+
+func TestTextGatewayOutputEstimateRespectsEffectiveLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name, fields, overrides, estimate string
+		cap, tpm                          int64
+		reserve                           int64
+		history, blocked                  bool
+	}{
+		{name: "zero without cap", fields: `,"max_tokens":0`, tpm: 9, reserve: 16_200, estimate: "0.000009 USD"},
+		{name: "zero bounds recent mean", fields: `,"max_tokens":0`, cap: 16, tpm: 9, reserve: 16_200, estimate: "0.000009 USD", history: true},
+		{name: "completion zero takes precedence", fields: `,"max_tokens":16,"max_completion_tokens":0`, tpm: 9, reserve: 16_200, estimate: "0.000009 USD"},
+		{name: "effective override zero", fields: `,"max_tokens":16`, overrides: `{"max_tokens":0}`, tpm: 9, reserve: 16_200, estimate: "0.000009 USD"},
+		{name: "zero still counts input for TPM", fields: `,"max_tokens":0`, tpm: 8, blocked: true},
+		{name: "missing limit keeps default mean", tpm: 1033, reserve: 3_702_600, estimate: "0.002057 USD"},
+		{name: "injected cap bounds default mean", cap: 16, tpm: 25, reserve: 73_800, estimate: "0.000041 USD"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int64
+			seed := tc.history
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				if seed {
+					_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+					return
+				}
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, `{"error":{"message":"Request rejected by Provider","type":"invalid_request_error","code":"invalid_parameter"}}`)
+			})
+			if tc.history {
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				seed = false
+				calls.Store(0)
+				fixture.fake.Advance(time.Minute)
+			}
+			if tc.cap > 0 {
+				var unified model.Model
+				require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+				unified.Capabilities.Limits.MaxOutputTokens = common.GetPointer(tc.cap)
+				require.NoError(t, model.DB.Model(&unified).Update("capabilities", unified.Capabilities).Error)
+			}
+			changes := map[string]any{"tpm": tc.tpm}
+			if tc.overrides != "" {
+				changes["parameter_overrides"] = tc.overrides
+			}
+			require.NoError(t, model.DB.Model(fixture.channel).Updates(changes).Error)
+			before, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			body := `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}]` + tc.fields + `}`
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+			id := response.Header().Get(common.RequestIdKey)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), id, 0, 10)
+			require.NoError(t, err)
+			var entries []model.LedgerEntry
+			require.NoError(t, model.DB.Where("request_id = ?", id).Find(&entries).Error)
+			if tc.blocked {
+				assert.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+				assert.Zero(t, calls.Load())
+				assert.Zero(t, total)
+				assert.Empty(t, entries)
+			} else {
+				require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+				assert.EqualValues(t, 1, calls.Load())
+				require.EqualValues(t, 1, total)
+				assert.Equal(t, tc.estimate, attempts[0].RouteDiagnostics["estimated_cost"])
+				require.Len(t, entries, 2)
+				amounts := map[model.LedgerEntryType]money.Amount{}
+				for _, entry := range entries {
+					amounts[entry.Type] = entry.Amount
+				}
+				assert.Equal(t, map[model.LedgerEntryType]money.Amount{
+					model.LedgerEntryPreConsume:        {Nanos: -tc.reserve, Currency: "USD"},
+					model.LedgerEntryPreConsumeRelease: {Nanos: tc.reserve, Currency: "USD"},
+				}, amounts)
+			}
+			after, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, before.Balance, after.Balance)
 		})
 	}
 }
