@@ -3,6 +3,7 @@ package model
 import (
 	"cmp"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"fmt"
 	"math/big"
@@ -137,7 +138,10 @@ func CheckPriceMargins(ctx context.Context, tx *gorm.DB, proposal *PriceVersion,
 			if fx != nil && (fx.ToCurrency != SettlementCurrency() || sale.Currency != fx.FromCurrency && purchase.Currency != fx.FromCurrency) {
 				continue
 			}
-			fingerprint = append(fingerprint, offering, channel, sale, purchase)
+			// Bind private overrides without returning their contents. The outer
+			// confirmation MAC prevents offline guesses of configuration values.
+			overridesDigest := sha256.Sum256([]byte(channel.ParameterOverrides))
+			fingerprint = append(fingerprint, offering, channel, sale, purchase, fmt.Sprintf("%x", overridesDigest))
 			switch {
 			case saleErr != nil:
 			case purchaseErr != nil:
@@ -217,12 +221,26 @@ func CheckPriceMargins(ctx context.Context, tx *gorm.DB, proposal *PriceVersion,
 	// Include the exact proposal and evaluated estimates. A stale confirmation
 	// cannot authorize a different price, FX quote or affected combination.
 	fingerprint = append(fingerprint, proposal, fx, report.Estimates)
-	encoded, err := common.Marshal(fingerprint)
+	revision, err := marginConfirmationRevision("price", fingerprint)
 	if err != nil {
 		return nil, err
 	}
-	report.Revision = fmt.Sprintf("%x", sha256.Sum256(encoded))
+	report.Revision = revision
 	return report, nil
+}
+
+// marginConfirmationRevision binds a confirmation to its complete financial
+// context. Reuse the shared session secret with a separate message domain;
+// raw import credentials and private configuration never leave this function.
+func marginConfirmationRevision(domain string, value any) (string, error) {
+	encoded, err := common.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	mac := hmac.New(sha256.New, []byte(common.SessionSecret))
+	_, _ = mac.Write([]byte("gateway-margin-confirmation:" + domain + "\x00"))
+	_, _ = mac.Write(encoded)
+	return fmt.Sprintf("%x", mac.Sum(nil)), nil
 }
 
 func marginPriceVersion(ctx context.Context, tx *gorm.DB, owner string, id int, at int64, staged []*PriceVersion) (*PriceVersion, error) {

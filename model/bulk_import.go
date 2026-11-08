@@ -2,7 +2,6 @@ package model
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
@@ -474,11 +473,14 @@ func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID
 				marginReport.Estimates = append(marginReport.Estimates, report.Estimates...)
 				marginReport.RequiresConfirmation = marginReport.RequiresConfirmation || report.RequiresConfirmation
 			}
-			encoded, err := common.Marshal(revisions)
+			revision, err := marginConfirmationRevision("batch", struct {
+				Rows   []BulkImportRow
+				Prices []string
+			}{Rows: rows, Prices: revisions})
 			if err != nil {
 				return err
 			}
-			marginReport.Revision = fmt.Sprintf("%x", sha256.Sum256(encoded))
+			marginReport.Revision = revision
 			result.MarginCheck = marginReport
 			if !dryRun && marginReport.RequiresConfirmation && approval.Revision != marginReport.Revision {
 				return &MarginConfirmationError{Report: marginReport}

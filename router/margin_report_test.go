@@ -18,6 +18,54 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestMarginBulkDraftBindingHTTP(t *testing.T) {
+	for _, change := range []string{"draft", "stored channel overrides"} {
+		t.Run(change, func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(http.ResponseWriter, *http.Request) {})
+			require.NoError(t, model.DB.AutoMigrate(&model.ChannelProbeResult{}))
+			manager := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "pricing:write", "channel:write", "channel:read", "channel:operate")
+			source := fmt.Sprintf(`{"rows":[{"resource":"channels","action":"create","data":{"provider_id":%d,"model_id":%d,"protocol":"openai_chat","upstream_model_name":"extra-channel","parameter_overrides":{"temperature":0.1}}},{"resource":"channels","action":"confirm","data":{"id":%d}},{"resource":"price-versions","action":"create","data":{"owner_type":"channel","owner_id":%d,"currency":"USD","expression":"tier(\"purchase\",fixed(2))"}},{"resource":"price-versions","action":"create","data":{"owner_type":"model_offering","owner_id":%d,"currency":"USD","expression":"tier(\"sale\",fixed(1))"}}]}`, fixture.channel.ProviderID, fixture.channel.ModelID, fixture.channel.ID, fixture.channel.ID, fixture.offering.ID)
+			preview := adminSecurityRequest(fixture.engine, manager, http.MethodPost, "/api/admin/v1/bulk-import?dry_run=true", source)
+			require.Equal(t, http.StatusOK, preview.Code, preview.Body.String())
+			var reply struct {
+				Data struct {
+					MarginCheck model.PriceMarginReport `json:"margin_check"`
+				} `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(preview.Body.Bytes(), &reply))
+			approval := reply.Data.MarginCheck
+			if change == "draft" {
+				source = strings.Replace(source, `"temperature":0.1`, `"temperature":0.2`, 1)
+			} else {
+				updated := adminSecurityRequest(fixture.engine, manager, http.MethodPatch, fmt.Sprintf("/api/admin/v1/channels/%d", fixture.channel.ID), `{"parameter_overrides":{"temperature":0.2}}`)
+				require.Equal(t, http.StatusOK, updated.Code, updated.Body.String())
+			}
+			request := httptest.NewRequest(http.MethodPost, "/api/admin/v1/bulk-import", strings.NewReader(source))
+			request.Header.Set("Authorization", "Bearer "+manager)
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("X-Margin-Confirmation", approval.Revision)
+			request.Header.Set("X-Margin-Effective-At", strconv.FormatInt(approval.EffectiveAt, 10))
+			rejected := httptest.NewRecorder()
+			fixture.engine.ServeHTTP(rejected, request)
+			require.Equal(t, http.StatusConflict, rejected.Code, rejected.Body.String())
+			var refreshed struct {
+				Data model.PriceMarginReport `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(rejected.Body.Bytes(), &refreshed))
+			assert.NotEqual(t, approval.Revision, refreshed.Data.Revision)
+			listed := adminSecurityRequest(fixture.engine, manager, http.MethodGet, "/api/admin/v1/channels", "")
+			require.Equal(t, http.StatusOK, listed.Code, listed.Body.String())
+			var channels struct {
+				Data struct {
+					Total int `json:"total"`
+				} `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(listed.Body.Bytes(), &channels))
+			assert.Equal(t, 1, channels.Data.Total, "rejected batch must not create its extra Channel")
+		})
+	}
+}
+
 func TestMarginBulkConfirmationHTTP(t *testing.T) {
 	fixture := newTextGatewayFixture(t, func(http.ResponseWriter, *http.Request) {})
 	manager := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "pricing:write", "channel:write", "channel:operate")
