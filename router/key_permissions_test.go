@@ -1,7 +1,9 @@
 package router
 
 import (
+	"bytes"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -19,6 +21,7 @@ import (
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 func TestKeyPermissionsHiddenAndMissingCallsAreIndistinguishable(t *testing.T) {
@@ -309,8 +312,13 @@ func TestKeyPermissionsIdentityVisibilityAndDeletion(t *testing.T) {
 	assert.Contains(t, response.Body.String(), `"exception_ids":[]`)
 	// A transient cache outage during revocation must not revive a cached Key
 	// once Redis becomes readable again.
+	var databaseLog bytes.Buffer
+	previousLogger := model.DB.Logger
+	model.DB.Logger = gormlogger.New(log.New(&databaseLog, "", 0), gormlogger.Config{LogLevel: gormlogger.Info, ParameterizedQueries: false})
 	warm := adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, "/v1/models", "")
+	model.DB.Logger = previousLogger
 	require.Equal(t, http.StatusOK, warm.Code, warm.Body.String())
+	assert.NotContains(t, databaseLog.String(), f.token.Key, "credential lookups must not expose usable Keys through SQL logging")
 	cache.SetError("cache unavailable")
 	revoked := adminSecurityRequest(f.engine, pat, http.MethodDelete, fmt.Sprintf("/api/token/%d", f.token.Id), "")
 	require.Equal(t, http.StatusOK, revoked.Code, revoked.Body.String())

@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/bytedance/gopkg/util/gopool"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 type Token struct {
@@ -322,7 +323,10 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 		// Don't return error - fall through to DB
 	}
 	token = &Token{}
-	if err = DB.Where(`"key" = ?`, key).First(token).Error; err != nil {
+	// This query binds a usable credential. Keep it out of SQL traces even
+	// when an operator enables unparameterized debug logging.
+	query := DB.Session(&gorm.Session{Logger: DB.Logger.LogMode(gormlogger.Silent)})
+	if err = query.Where(`"key" = ?`, key).First(token).Error; err != nil {
 		return nil, err
 	}
 	if common.RedisEnabled {
