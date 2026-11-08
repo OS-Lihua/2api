@@ -447,6 +447,8 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				if run.attemptTrace == nil {
 					run.attemptTrace = make(map[string]billingexpr.MoneyTraceResult)
 				}
+				// Tier names can be computed from credential-bearing probes.
+				costTrace.MatchedTier = ""
 				run.attemptTrace[attempt.ID] = costTrace
 				originalCost, originalErr := cost.Cost()
 				attempt.CostPending = originalErr != nil || originalCost.Currency != purchase.Currency
@@ -487,6 +489,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				}
 				run.saleUsage = service.GatewayUsageSnapshot(saleUsage)
 				source, receivable, trace, priceErr := service.GatewayPrice(sale, saleUsage, input, started, ratio, saleFX)
+				trace.MatchedTier = ""
 				run.saleTrace = &trace
 				if attempt.Status != "success" && (trace.BillingUnit == billingexpr.BillingUnitRequest || billingexpr.UsesOnlyFixedPricing(sale.Expression)) {
 					source, _ = money.ParseValue("0", sale.Currency)

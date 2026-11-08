@@ -4149,10 +4149,10 @@ func TestTextGatewayEvaluationFailureRetainsPendingAccounting(t *testing.T) {
 		reservation             int64
 	}{
 		{"mixed pricing condition failure", model.PriceOwnerOffering, `(len == 9 || 1 / (len - 10) > 0) ? tier("request",fixed(0.01)) : tier("tokens",p + c)`, 9000000},
-		{"sale overflow", model.PriceOwnerOffering, `(header("Content-Type") == "application/json" && len != 9) ? tier("overflow",p * (param("rate") ?? 1) + c * 10000000000000000) : tier("base",p * 2 + c * 4)`, 73800},
+		{"sale overflow", model.PriceOwnerOffering, `(header("Content-Type") == "application/json" && len != 9) ? tier(header("Authorization"),p * (param("rate") ?? 1) + c * 10000000000000000) : tier("base",p * 2 + c * 4)`, 73800},
 		{"sale evaluation", model.PriceOwnerOffering, `len == 9 ? tier("base",p * 2 + c * 4) : tier("invalid",p / (len - 10))`, 73800},
 		{"purchase conversion overflow", model.PriceOwnerChannel, `len == 9 ? tier("base",p * 0.5 + c) : tier("expensive",p * 500000000000000)`, 73800},
-		{"purchase overflow", model.PriceOwnerChannel, `len == 9 ? tier("base",p + c * 2) : tier("overflow",p * 1000000000000000 + c * 4)`, 73800},
+		{"purchase overflow", model.PriceOwnerChannel, `len == 9 ? tier("base",p + c * 2) : tier(header("Authorization"),p * 1000000000000000 + c * 4)`, 73800},
 		{"purchase evaluation", model.PriceOwnerChannel, `len == 9 ? tier("base",p + c * 2) : tier("invalid",p / (len - 10))`, 73800},
 	} {
 		t.Run(test.name, func(t *testing.T) {
