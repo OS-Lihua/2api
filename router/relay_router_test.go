@@ -5912,10 +5912,23 @@ func TestMediaGatewaySpeechJSONWithoutAudioReleasesFixedFee(t *testing.T) {
 
 func TestMediaGatewayTruncatedSpeechSafetyErrorDoesNotRetry(t *testing.T) {
 	for _, kind := range []protocol.Type{protocol.OpenAIAudioSpeech, protocol.OpenAIAudioTranscription} {
-		for _, badType := range []string{"", "123", "1e400", "1e400-valid"} {
+		for _, badType := range []string{"", "123", "1e400", "1e400-valid", "sse-1000", "sse-0"} {
+			if strings.HasPrefix(badType, "sse-") && kind != protocol.OpenAIAudioSpeech {
+				continue
+			}
 			t.Run(fmt.Sprintf("%s/badType=%s", kind, badType), func(t *testing.T) {
 				var secondCalls atomic.Int64
 				fixture := newMediaGatewayFixture(t, kind, func(w http.ResponseWriter, r *http.Request) {
+					if strings.HasPrefix(badType, "sse-") {
+						output := 1000
+						if badType == "sse-0" {
+							output = 0
+						}
+						body := fmt.Sprintf(`{"error":{"code":"content_filter"},"usage":{"input_tokens":0,"output_tokens":%d},"tail":`, output)
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = io.WriteString(w, "data: "+body+"\n\n")
+						return
+					}
 					body := `{"error":{"code":"content_filter","type":"invalid_request_error"},"usage":{"input_tokens":0,"output_tokens":0},`
 					if badType != "" {
 						body += `"type":` + strings.TrimSuffix(badType, "-valid") + `,`
@@ -5937,6 +5950,10 @@ func TestMediaGatewayTruncatedSpeechSafetyErrorDoesNotRetry(t *testing.T) {
 					_, _ = w.Write(make([]byte, 48000))
 				})
 				require.NoError(t, model.DB.Model(fallback).Update("protocol", kind).Error)
+				if strings.HasPrefix(badType, "sse-") {
+					fixture.fake.Advance(time.Second)
+					require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("audio",ao)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+				}
 				var response *httptest.ResponseRecorder
 				if kind == protocol.OpenAIAudioTranscription {
 					request := mediaMultipartRequest(t, "/v1/audio/transcriptions", map[string]string{"model": "gateway-alias"}, "file", mediaWAV(t, 8000, 16000, make([]byte, 16000)))
@@ -5944,7 +5961,11 @@ func TestMediaGatewayTruncatedSpeechSafetyErrorDoesNotRetry(t *testing.T) {
 					response = httptest.NewRecorder()
 					fixture.engine.ServeHTTP(response, request)
 				} else {
-					response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", `{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm"}`)
+					extra := ""
+					if strings.HasPrefix(badType, "sse-") {
+						extra = `,"stream_format":"sse"`
+					}
+					response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", fmt.Sprintf(`{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm"%s}`, extra))
 				}
 				assert.GreaterOrEqual(t, response.Code, 400)
 				assert.Zero(t, secondCalls.Load())
@@ -5952,22 +5973,34 @@ func TestMediaGatewayTruncatedSpeechSafetyErrorDoesNotRetry(t *testing.T) {
 				require.NoError(t, err)
 				require.EqualValues(t, 1, total)
 				assert.Equal(t, "content_safety", attempts[0].ErrorClass)
+				if strings.HasPrefix(badType, "sse-") {
+					output := int64(1000)
+					if badType == "sse-0" {
+						output = 0
+					}
+					assert.Equal(t, output, attempts[0].Usage.AudioOutputTokens)
+					assert.Equal(t, output*1000, attempts[0].Cost.Nanos)
+				}
 			})
 		}
 	}
 }
 
 func TestMediaGatewayImageSafetyErrorIgnoresBadSibling(t *testing.T) {
-	for _, event := range []bool{false, true} {
+	for _, event := range []string{"false", "true", "broken", "broken-zero"} {
 		for _, stream := range []bool{false, true} {
 			for _, short := range []bool{false, true} {
-				if event && (!stream || short) {
+				if event != "false" && (!stream || short) {
 					continue
 				}
-				t.Run(fmt.Sprintf("stream=%t/short=%t/event=%t", stream, short, event), func(t *testing.T) {
+				t.Run(fmt.Sprintf("stream=%t/short=%t/event=%s", stream, short, event), func(t *testing.T) {
+					output := int64(1000)
+					if event == "broken-zero" {
+						output = 0
+					}
 					var secondCalls atomic.Int64
 					fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
-						body := `{"error":{"code":"content_filter","extra":1e400},"usage":{"input_tokens":0,"output_tokens":1000}}`
+						body := fmt.Sprintf(`{"error":{"code":"content_filter","extra":1e400},"usage":{"input_tokens":0,"output_tokens":%d}}`, output)
 						if short {
 							body = strings.TrimSuffix(body, "}") + `,"unfinished":`
 						}
@@ -5975,8 +6008,11 @@ func TestMediaGatewayImageSafetyErrorIgnoresBadSibling(t *testing.T) {
 						if short {
 							w.Header().Set("Content-Length", strconv.Itoa(len(body)+1))
 						}
-						if event {
+						if event != "false" {
 							body = strings.TrimSuffix(body, "}") + `,"type":123}`
+							if strings.HasPrefix(event, "broken") {
+								body = strings.TrimSuffix(body, "}") + `,"tail":`
+							}
 							w.Header().Set("Content-Type", "text/event-stream")
 							body = "data: " + body + "\n\ndata: [DONE]\n\n"
 						}
@@ -5997,8 +6033,8 @@ func TestMediaGatewayImageSafetyErrorIgnoresBadSibling(t *testing.T) {
 					require.NoError(t, err)
 					require.EqualValues(t, 1, total)
 					assert.Equal(t, "content_safety", attempts[0].ErrorClass)
-					assert.EqualValues(t, 1000, attempts[0].Usage.CompletionTokens)
-					assert.EqualValues(t, 1_000_000, attempts[0].Cost.Nanos)
+					assert.EqualValues(t, output, attempts[0].Usage.CompletionTokens)
+					assert.EqualValues(t, output*1000, attempts[0].Cost.Nanos)
 				})
 			}
 		}

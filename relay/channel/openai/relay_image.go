@@ -216,23 +216,24 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 			sr.Error(fmt.Errorf("%s", extractOpenAIImageStreamErrorMessage(raw)))
 		}
 		if info.ResponseFacts != nil {
-			if !ojson.ValidBytes(raw) {
-				sr.Stop(errors.New("invalid image stream event"))
-				return
-			}
-			reported := reportedMediaUsage(raw)
-			prompt, completion := relaycommon.MediaUsagePresence(raw)
-			observeMediaUsage(info, reported, raw)
+			eventFacts := mediaResponseEnvelope(raw)
+			reported := reportedMediaUsage(eventFacts)
+			prompt, completion := relaycommon.MediaUsagePresence(eventFacts)
+			observeMediaUsage(info, reported, eventFacts)
 			if prompt {
 				usage.PromptTokens = reported.PromptTokens
 			}
 			if completion {
 				usage.CompletionTokens = reported.CompletionTokens
 			}
-			mergeMediaTokenDetails(usage, raw)
+			mergeMediaTokenDetails(usage, eventFacts)
 			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
-			if observeMediaError(info, raw, resp.StatusCode) != nil {
+			if observeMediaError(info, eventFacts, resp.StatusCode) != nil {
 				sr.Stop(errors.New("upstream image stream failed"))
+				return
+			}
+			if !ojson.ValidBytes(raw) {
+				sr.Stop(errors.New("invalid image stream event"))
 				return
 			}
 		}

@@ -296,24 +296,25 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		var completed bool
 		helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 			eventBody := []byte(data)
-			if !ojson.ValidBytes(eventBody) {
-				sr.Stop(errors.New("invalid speech stream event"))
-				return
-			}
-			if raw := ojson.GetBytes(eventBody, "usage"); raw.Exists() && raw.Raw != "null" {
-				reported := reportedMediaUsage(eventBody)
-				prompt, completion := relaycommon.MediaUsagePresence(eventBody)
-				observeMediaUsage(info, reported, eventBody)
+			eventFacts := mediaResponseEnvelope(eventBody)
+			if raw := ojson.GetBytes(eventFacts, "usage"); raw.Exists() && raw.Raw != "null" {
+				reported := reportedMediaUsage(eventFacts)
+				prompt, completion := relaycommon.MediaUsagePresence(eventFacts)
+				observeMediaUsage(info, reported, eventFacts)
 				if prompt {
 					usage.PromptTokens = reported.PromptTokens
 				}
 				if completion {
 					usage.CompletionTokens = reported.CompletionTokens
 				}
-				mergeMediaTokenDetails(usage, eventBody)
+				mergeMediaTokenDetails(usage, eventFacts)
 			}
-			if observeMediaError(info, eventBody, resp.StatusCode) != nil {
+			if observeMediaError(info, eventFacts, resp.StatusCode) != nil {
 				sr.Stop(errors.New("upstream speech stream failed"))
+				return
+			}
+			if !ojson.ValidBytes(eventBody) {
+				sr.Stop(errors.New("invalid speech stream event"))
 				return
 			}
 			var chunk struct {
