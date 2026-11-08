@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/capability"
 	"github.com/QuantumNous/new-api/pkg/channelhealth"
+	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -199,7 +200,37 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 	for i, candidate := range eligible {
 		channelIDs[i] = candidate.Channel.ID
 	}
-	admission, err := ChannelHealth.Acquire(c.Request.Context(), channelIDs)
+	var admission channelhealth.Admission
+	availableBand := false
+	firstBandEnd := 0
+	for start := 0; start < len(eligible); {
+		end := start + 1
+		for end < len(eligible) && eligible[end].conversionRank == eligible[start].conversionRank {
+			end++
+		}
+		if start == 0 {
+			firstBandEnd = end
+		}
+		available := false
+		for _, candidate := range eligible[start:end] {
+			snapshot := health[candidate.Channel.ID]
+			available = available || snapshot.Circuit == "closed" || snapshot.RetryAt <= clock.Now().UnixMilli()
+		}
+		if available {
+			availableBand = true
+			admission, err = ChannelHealth.Acquire(c.Request.Context(), channelIDs[start:end])
+			if err != nil {
+				return nil, ErrGatewayUnavailable
+			}
+			if admission.ChannelID != 0 {
+				break
+			}
+		}
+		start = end
+	}
+	if admission.ChannelID == 0 && !availableBand {
+		admission, err = ChannelHealth.Acquire(c.Request.Context(), channelIDs[:firstBandEnd])
+	}
 	if err != nil || admission.ChannelID == 0 {
 		return nil, ErrGatewayUnavailable
 	}

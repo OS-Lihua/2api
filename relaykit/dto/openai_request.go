@@ -801,6 +801,7 @@ func (m *Message) ParseContent() []MediaContent {
 			continue
 		}
 
+		firstMedia := len(contentList)
 		switch contentType {
 		case ContentTypeText:
 			if text, ok := contentItem["text"].(string); ok {
@@ -880,6 +881,14 @@ func (m *Message) ParseContent() []MediaContent {
 						Url: videoUrl,
 					},
 				})
+			}
+		}
+		if control, exists := contentItem["cache_control"]; exists {
+			encoded, err := kitutil.Marshal(control)
+			if err == nil {
+				for index := firstMedia; index < len(contentList); index++ {
+					contentList[index].CacheControl = encoded
+				}
 			}
 		}
 	}

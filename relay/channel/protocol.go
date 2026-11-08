@@ -107,6 +107,12 @@ func ConvertProtocolRequest(c *gin.Context, info *relaycommon.RelayInfo, kind pr
 	return result.Value, nil
 }
 
+// NativeResponseGateway presents a provider's canonical Chat response through
+// the shared gateway conversion, delivery and accounting implementation.
+type NativeResponseGateway interface {
+	DoNativeResponse(*gin.Context, *http.Response, *relaycommon.RelayInfo, ProtocolHandler) (any, *types.NewAPIError)
+}
+
 // WireProtocol composes a public DTO conversion with an explicitly declared
 // provider wire dialect. The dialect owns its response parser and usage facts.
 // It never receives or calls the legacy Adaptor interface.
@@ -118,13 +124,16 @@ type WireProtocol struct {
 	// ReportsGatewayFacts confirms that the native Chat writer records actual
 	// business delivery, write failures and usage presence for money settlement.
 	ReportsGatewayFacts bool
+	// PublicResponse declares that the wire body already uses Kind's public DTO.
+	PublicResponse bool
 }
 
 func (p *WireProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInfo, request any) (any, error) {
 	if p.Kind == protocol.OpenAIChat && info.ResponseFacts != nil && !p.ReportsGatewayFacts {
 		return nil, fmt.Errorf("native protocol does not report gateway response facts")
 	}
-	if !p.SupportsCrossProtocol {
+	managed := info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil
+	if !p.SupportsCrossProtocol && !(managed && p.Kind == protocol.OpenAIChat) {
 		format, err := ProtocolRelayFormat(p.Kind)
 		if err != nil {
 			return nil, err
@@ -137,6 +146,11 @@ func (p *WireProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInf
 	if err != nil {
 		return nil, err
 	}
+	if managed && p.Kind == protocol.OpenAIChat && !p.PublicResponse {
+		if chat, ok := converted.(*dto.GeneralOpenAIRequest); ok && chat.N != nil && *chat.N > 1 {
+			return nil, fmt.Errorf("native Provider cannot represent multiple output choices (n)")
+		}
+	}
 	mode := info.RelayMode
 	info.RelayMode = p.relayMode(info)
 	defer func() { info.RelayMode = mode }()
@@ -147,6 +161,16 @@ func (p *WireProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInf
 	return converted, err
 }
 func (p *WireProtocol) DoResponse(c *gin.Context, response *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
+	if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+		if p.PublicResponse {
+			return p.Public.DoResponse(c, response, info)
+		}
+		if p.Kind == protocol.OpenAIChat {
+			if gateway, ok := p.Public.(NativeResponseGateway); ok {
+				return gateway.DoNativeResponse(c, response, info, p.Wire)
+			}
+		}
+	}
 	mode := info.RelayMode
 	info.RelayMode = p.relayMode(info)
 	defer func() { info.RelayMode = mode }()

@@ -20,16 +20,26 @@ import (
 
 func requestOpenAI2Cohere(textRequest dto.GeneralOpenAIRequest) *CohereRequest {
 	cohereReq := CohereRequest{
-		Model:       textRequest.Model,
-		ChatHistory: []ChatHistory{},
-		Message:     "",
-		Stream:      lo.FromPtrOr(textRequest.Stream, false),
-		MaxTokens:   textRequest.GetMaxTokens(),
+		Model:            textRequest.Model,
+		ChatHistory:      []ChatHistory{},
+		Message:          "",
+		Stream:           lo.FromPtrOr(textRequest.Stream, false),
+		MaxTokens:        textRequest.GetMaxTokens(),
+		Temperature:      textRequest.Temperature,
+		P:                textRequest.TopP,
+		K:                textRequest.TopK,
+		FrequencyPenalty: textRequest.FrequencyPenalty,
+		PresencePenalty:  textRequest.PresencePenalty,
+		Seed:             textRequest.Seed,
+		StopSequences:    textRequest.Stop,
 	}
 	if common.CohereSafetySetting != "NONE" {
 		cohereReq.SafetyMode = common.CohereSafetySetting
 	}
-	if cohereReq.MaxTokens == 0 {
+	if stop, ok := textRequest.Stop.(string); ok {
+		cohereReq.StopSequences = []string{stop}
+	}
+	if textRequest.MaxTokens == nil && textRequest.MaxCompletionTokens == nil {
 		cohereReq.MaxTokens = 4000
 	}
 	for _, msg := range textRequest.Messages {
@@ -76,7 +86,7 @@ func stopReasonCohere2OpenAI(reason string) string {
 	case "ERROR_TOXIC":
 		return constant.FinishReasonContentFilter
 	case "MAX_TOKENS":
-		return "max_tokens"
+		return "length"
 	default:
 		return reason
 	}

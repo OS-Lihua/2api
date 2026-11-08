@@ -187,6 +187,9 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 }
 
 func recordCozeStreamUsage(info *relaycommon.RelayInfo, usage *dto.Usage, data string) error {
+	if info.ResponseFacts != nil {
+		data = string(relaycommon.SanitizeNativeUsage([]byte(data), "usage"))
+	}
 	var chatData CozeChatResponseData
 	if err := common.UnmarshalJsonStr(data, &chatData); err != nil {
 		return err
@@ -262,6 +265,9 @@ func checkIfChatComplete(a *Protocol, c *gin.Context, info *relaycommon.RelayInf
 	// 解析 resp 到 CozeChatResponse
 	var cozeResponse CozeChatResponse
 	responseBody, err := io.ReadAll(resp.Body)
+	if info.ResponseFacts != nil {
+		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "data.usage")
+	}
 	if err != nil {
 		return fmt.Errorf("read response body failed: %w", err), false
 	}

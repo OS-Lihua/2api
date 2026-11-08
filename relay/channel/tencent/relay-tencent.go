@@ -99,20 +99,36 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 	defer info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
 	defer service.CloseResponseBodyGracefully(resp)
 	scanner := helper.NewStreamScanner(resp.Body)
-	scanner.Split(bufio.ScanLines)
+	managed := info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil
+	if managed {
+		scanner = helper.NewSSEEventScanner(resp.Body, info.ResponseFacts)
+	} else {
+		scanner.Split(bufio.ScanLines)
+	}
 
 	helper.SetEventStreamHeaders(c)
 
 	for scanner.Scan() {
 		data := scanner.Text()
-		if len(data) < 5 || !strings.HasPrefix(data, "data:") {
-			continue
+		if managed {
+			event := helper.ParseSSEEvent(data)
+			if !event.HasData {
+				continue
+			}
+			data = string(relaycommon.SanitizeNativeUsage([]byte(event.Data), "Usage"))
+		} else {
+			if len(data) < 5 || !strings.HasPrefix(data, "data:") {
+				continue
+			}
+			data = strings.TrimPrefix(data, "data:")
 		}
-		data = strings.TrimPrefix(data, "data:")
 
 		var tencentResponse TencentChatResponse
 		err := common.Unmarshal([]byte(data), &tencentResponse)
 		if err != nil {
+			if managed {
+				return usage, types.NewError(fmt.Errorf("invalid Tencent stream event"), types.ErrorCodeBadResponseBody)
+			}
 			common.SysLog(common.LogText("error unmarshalling stream response: %s", err.Error()))
 			continue
 		}
@@ -141,6 +157,21 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 		}
 	}
 
+	if managed && len(info.ResponseFacts.UnterminatedStreamData) > 0 {
+		partial := relaycommon.SanitizeNativeUsage(info.ResponseFacts.UnterminatedStreamData, "Usage")
+		info.ResponseFacts.UnterminatedStreamData = nil
+		var reported TencentChatResponse
+		if common.Unmarshal(partial, &reported) == nil {
+			prompt, completion := relaycommon.NativeUsagePresence(partial, "Usage.PromptTokens", "Usage.CompletionTokens", "Usage.TotalTokens")
+			counts := dto.Usage{PromptTokens: reported.Usage.PromptTokens, CompletionTokens: reported.Usage.CompletionTokens}
+			info.ResponseFacts.RecordUsage(usage, &counts, prompt, completion)
+			for _, choice := range streamResponseTencent2OpenAI(&reported).Choices {
+				text := choice.Delta.GetContentString() + choice.Delta.GetReasoningContent()
+				info.ResponseFacts.SourceGeneratedText += text
+				info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || text != ""
+			}
+		}
+	}
 	if err := scanner.Err(); err != nil {
 		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)
 		return usage, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
@@ -159,6 +190,9 @@ func tencentHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Resp
 		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
 	service.CloseResponseBodyGracefully(resp)
+	if info.ResponseFacts != nil {
+		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "Response.Usage")
+	}
 	err = common.Unmarshal(responseBody, &tencentSb)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)

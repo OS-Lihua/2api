@@ -90,7 +90,11 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 		var completion CozeChatResponse
 		completionBody, err := io.ReadAll(response.Body)
 		response.Body.Close()
-		decodeErr := common.Unmarshal(completionBody, &completion)
+		decodeBody := completionBody
+		if facts, _ := common.GetContextKey(c, constant.ContextKeyResponseFacts); facts != nil {
+			decodeBody = relaycommon.SanitizeNativeUsage(decodeBody, "data.usage")
+		}
+		decodeErr := common.Unmarshal(decodeBody, &completion)
 		if facts, _ := common.GetContextKey(c, constant.ContextKeyResponseFacts); facts != nil &&
 			(response.StatusCode >= 400 || completion.Code != 0 || completion.Data.Status == "failed" || completion.Data.Status == "canceled" || completion.Data.Status == "requires_action") {
 			if response.StatusCode < 400 {

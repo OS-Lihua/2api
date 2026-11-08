@@ -39,11 +39,8 @@ func requestOpenAI2Baidu(request dto.GeneralOpenAIRequest) *BaiduChatRequest {
 		EnableCitation: false,
 		UserId:         request.User,
 	}
-	if request.GetMaxTokens() != 0 {
+	if request.MaxTokens != nil || request.MaxCompletionTokens != nil {
 		maxTokens := int(request.GetMaxTokens())
-		if request.GetMaxTokens() == 1 {
-			maxTokens = 2
-		}
 		baiduRequest.MaxOutputTokens = &maxTokens
 	}
 	for _, message := range request.Messages {
@@ -120,6 +117,9 @@ func embeddingResponseBaidu2OpenAI(response *BaiduEmbeddingResponse) *dto.OpenAI
 func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, *dto.Usage) {
 	usage := &dto.Usage{}
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+		if info.ResponseFacts != nil {
+			data = string(relaycommon.SanitizeNativeUsage([]byte(data), "usage"))
+		}
 		var baiduResponse BaiduChatStreamResponse
 		if err := common.Unmarshal([]byte(data), &baiduResponse); err != nil {
 			common.SysLog(common.LogText("error unmarshalling stream response: %s", err.Error()))
@@ -128,8 +128,10 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 		}
 		if info.ResponseFacts != nil {
 			info.StreamStatus.RequireTerminal()
-			prompt, completion := relaycommon.ChatUsagePresence([]byte(data))
-			info.ResponseFacts.RecordUsage(usage, &baiduResponse.Usage, prompt, completion)
+			if err := info.ResponseFacts.RecordChatUsage(usage, []byte(data), "usage"); err != nil {
+				sr.Error(err)
+				return
+			}
 			if baiduResponse.ErrorMsg != "" || baiduResponse.ErrorCode != 0 {
 				info.StreamStatus.MarkFailed(fmt.Sprintf("baidu:%d", baiduResponse.ErrorCode), "upstream_error", 0)
 				sr.Stop(fmt.Errorf("Baidu stream failed"))
@@ -151,12 +153,11 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 		}
 	})
 	if info.ResponseFacts != nil && len(info.ResponseFacts.UnterminatedStreamData) > 0 {
-		partial := info.ResponseFacts.UnterminatedStreamData
+		partial := relaycommon.SanitizeNativeUsage(info.ResponseFacts.UnterminatedStreamData, "usage")
 		info.ResponseFacts.UnterminatedStreamData = nil
 		var reported BaiduChatStreamResponse
 		if common.Unmarshal(partial, &reported) == nil {
-			prompt, completion := relaycommon.ChatUsagePresence(partial)
-			info.ResponseFacts.RecordUsage(usage, &reported.Usage, prompt, completion)
+			_ = info.ResponseFacts.RecordChatUsage(usage, partial, "usage")
 			if reported.Result != "" {
 				info.ResponseFacts.SourceGeneratedText += reported.Result
 				info.ResponseFacts.SourceOutputObserved = true
@@ -175,13 +176,17 @@ func baiduHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respon
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
 	service.CloseResponseBodyGracefully(resp)
+	if info.ResponseFacts != nil {
+		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "usage")
+	}
 	err = common.Unmarshal(responseBody, &baiduResponse)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
 	if info.ResponseFacts != nil {
-		prompt, completion := relaycommon.ChatUsagePresence(responseBody)
-		info.ResponseFacts.RecordUsage(&baiduResponse.Usage, &baiduResponse.Usage, prompt, completion)
+		if err := info.ResponseFacts.RecordChatUsage(&baiduResponse.Usage, responseBody, "usage"); err != nil {
+			return types.NewError(err, types.ErrorCodeBadResponseBody), nil
+		}
 	}
 	if baiduResponse.ErrorMsg != "" || baiduResponse.ErrorCode != 0 {
 		if info.ResponseFacts != nil {

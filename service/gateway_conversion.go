@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 
@@ -44,6 +45,21 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 	if chat, ok := request.(*dto.GeneralOpenAIRequest); ok {
 		var files []dto.MediaContent
 		references := map[string]bool{}
+		if c, ok := ctx.(*gin.Context); ok {
+			if previous, found := c.Get(gatewayNativeMediaReferencesKey); found {
+				if stored, ok := previous.(map[string]bool); ok {
+					maps.Copy(references, stored)
+				}
+			}
+		}
+		represented := map[string]int{}
+		for _, message := range chat.Messages {
+			for _, part := range message.ParseContent() {
+				if file := part.GetFile(); part.Type == dto.ContentTypeFile && file != nil && file.FileData != "" {
+					represented[file.FileData]++
+				}
+			}
+		}
 		for _, message := range chat.Messages {
 			for _, part := range message.ParseContent() {
 				file := part.GetFile()
@@ -51,6 +67,10 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 					continue
 				}
 				references[file.FileId] = true
+				if represented[file.FileId] > 0 {
+					represented[file.FileId]--
+					continue
+				}
 				files = append(files, dto.MediaContent{Type: dto.ContentTypeFile, File: &dto.MessageFile{FileName: "reference.pdf", FileData: file.FileId}})
 			}
 		}

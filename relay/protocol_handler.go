@@ -93,7 +93,7 @@ func (a *ChannelAdaptor) ProjectChatRequest(c *gin.Context, info *relaycommon.Re
 		if err := common.Unmarshal(body, &effective); err != nil {
 			return nil, err
 		}
-		return &effective, nil
+		return service.GatewayChatProjection(c, &effective)
 	}
 	var native dto.Request
 	switch converted.(type) {

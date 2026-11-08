@@ -4,6 +4,9 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+	"strings"
 )
 
 // ChatUsagePresence reports bounded base counters independently. A reported
@@ -72,6 +75,41 @@ func NativeUsagePresence(body []byte, promptPath, completionPath, _ string) (boo
 	return present[0], present[1]
 }
 
+// SanitizeNativeUsage removes only invalid numeric usage fields before a
+// provider DTO is decoded. Unrelated broken totals/details cannot erase bases.
+func SanitizeNativeUsage(body []byte, path string) []byte {
+	usage := gjson.GetBytes(body, path)
+	if !usage.Exists() {
+		return body
+	}
+	if !usage.IsObject() {
+		body, _ = sjson.DeleteBytes(body, path)
+		return body
+	}
+	paths := []string{path}
+	for index := 0; index < len(paths); index++ {
+		prefix := paths[index]
+		for key, value := range gjson.GetBytes(body, prefix).Map() {
+			field := prefix + "." + key
+			name := strings.ToLower(key)
+			if strings.HasSuffix(name, "tokens") || strings.HasSuffix(name, "count") {
+				if valid, _ := NativeUsagePresence(body, field, "", ""); !valid {
+					body, _ = sjson.DeleteBytes(body, field)
+				}
+				continue
+			}
+			if strings.HasSuffix(name, "_details") && !value.IsObject() {
+				body, _ = sjson.DeleteBytes(body, field)
+				continue
+			}
+			if value.IsObject() {
+				paths = append(paths, field)
+			}
+		}
+	}
+	return body
+}
+
 // RecordUsage merges independently reported base counters, including explicit
 // zero. Missing or invalid fields cannot erase an earlier valid stream counter.
 func (facts *ResponseFacts) RecordUsage(usage, reported *dto.Usage, prompt, completion bool) {
@@ -90,6 +128,42 @@ func (facts *ResponseFacts) RecordUsage(usage, reported *dto.Usage, prompt, comp
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	facts.UsageReported = facts.PromptTokensReported && facts.CompletionTokensReported
+}
+
+// RecordChatUsage merges a native usage object with Chat counter names.
+// Omitted detail fields retain their preceding snapshot; explicit zeros reset it.
+func (facts *ResponseFacts) RecordChatUsage(usage *dto.Usage, body []byte, path string) error {
+	raw := gjson.GetBytes(body, path)
+	if !raw.IsObject() {
+		return nil
+	}
+	prompt, completion := NativeUsagePresence(body, path+".prompt_tokens", path+".completion_tokens", "")
+	paths := []string{path}
+	for index := 0; index < len(paths) && !facts.IndependentUsageReported; index++ {
+		prefix := paths[index]
+		for key, value := range gjson.GetBytes(body, prefix).Map() {
+			if prefix == path && (key == "prompt_tokens" || key == "completion_tokens" || key == "total_tokens") {
+				continue
+			}
+			field := prefix + "." + key
+			if value.IsObject() {
+				paths = append(paths, field)
+				continue
+			}
+			if strings.Contains(strings.ToLower(key), "token") {
+				valid, _ := NativeUsagePresence(body, field, "", "")
+				facts.IndependentUsageReported = facts.IndependentUsageReported || valid
+			}
+		}
+	}
+	previousPrompt, previousCompletion := usage.PromptTokens, usage.CompletionTokens
+	if err := common.UnmarshalJsonStr(raw.Raw, usage); err != nil {
+		return err
+	}
+	reported := *usage
+	usage.PromptTokens, usage.CompletionTokens = previousPrompt, previousCompletion
+	facts.RecordUsage(usage, &reported, prompt, completion)
+	return nil
 }
 
 func (info *RelayInfo) TokenizerModelName() string {

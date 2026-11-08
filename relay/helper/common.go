@@ -280,6 +280,9 @@ func WriteGatewayStreamFrame(c *gin.Context, facts *relaycommon.ResponseFacts, f
 	if n != len(frame) {
 		return io.ErrShortWrite
 	}
+	if facts != nil && business {
+		facts.MarkBusinessOutput()
+	}
 	if err := FlushWriter(c); err != nil {
 		return &StreamFlushError{Err: err}
 	}

@@ -244,19 +244,6 @@ func streamResponseDify2OpenAI(difyResponse DifyChunkChatCompletionResponse) *dt
 	return &response
 }
 
-func recordDifyStreamUsage(info *relaycommon.RelayInfo, usage *dto.Usage, data string, reported *dto.Usage) error {
-	prompt, completion := relaycommon.ChatUsagePresence([]byte(ojson.Get(data, "metadata").Raw))
-	if rawUsage := ojson.Get(data, "metadata.usage"); rawUsage.IsObject() {
-		previousPrompt, previousCompletion := usage.PromptTokens, usage.CompletionTokens
-		if err := common.UnmarshalJsonStr(rawUsage.Raw, usage); err != nil {
-			return err
-		}
-		usage.PromptTokens, usage.CompletionTokens = previousPrompt, previousCompletion
-	}
-	info.ResponseFacts.RecordUsage(usage, reported, prompt, completion)
-	return nil
-}
-
 func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	var responseText string
 	usage := &dto.Usage{}
@@ -265,6 +252,9 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	helper.SetEventStreamHeaders(c)
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		info.StreamStatus.RequireTerminal()
+		if info.ResponseFacts != nil {
+			data = string(relaycommon.SanitizeNativeUsage([]byte(data), "metadata.usage"))
+		}
 		var difyResponse DifyChunkChatCompletionResponse
 		if err := common.Unmarshal([]byte(data), &difyResponse); err != nil {
 			if info.ResponseFacts != nil {
@@ -275,7 +265,7 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			return
 		}
 		if info.ResponseFacts != nil {
-			if err := recordDifyStreamUsage(info, usage, data, &difyResponse.MetaData.Usage); err != nil {
+			if err := info.ResponseFacts.RecordChatUsage(usage, []byte(data), "metadata.usage"); err != nil {
 				sr.Error(err)
 				return
 			}
@@ -311,7 +301,7 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			}
 		}
 		err := helper.ObjectData(c, openaiResponse)
-		if err != nil && info.ResponseFacts != nil {
+		if err != nil && info.ResponseFacts != nil && !errors.Is(err, helper.ErrGatewayStreamPreludeLimit) {
 			info.ResponseFacts.DownstreamWriteFailed = true
 		}
 		var flushErr *helper.StreamFlushError
@@ -327,11 +317,11 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		}
 	})
 	if info.ResponseFacts != nil && len(info.ResponseFacts.UnterminatedStreamData) > 0 {
-		partial := info.ResponseFacts.UnterminatedStreamData
+		partial := relaycommon.SanitizeNativeUsage(info.ResponseFacts.UnterminatedStreamData, "metadata.usage")
 		info.ResponseFacts.UnterminatedStreamData = nil
 		var reported DifyChunkChatCompletionResponse
 		if common.Unmarshal(partial, &reported) == nil {
-			_ = recordDifyStreamUsage(info, usage, string(partial), &reported.MetaData.Usage)
+			_ = info.ResponseFacts.RecordChatUsage(usage, partial, "metadata.usage")
 			if (reported.Event == "message" || reported.Event == "agent_message") && reported.Answer != "" {
 				info.ResponseFacts.SourceGeneratedText += reported.Answer
 				info.ResponseFacts.SourceOutputObserved = true
@@ -369,13 +359,17 @@ func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	service.CloseResponseBodyGracefully(resp)
+	if info.ResponseFacts != nil {
+		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "metadata.usage")
+	}
 	err = common.Unmarshal(responseBody, &difyResponse)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	if info.ResponseFacts != nil {
-		prompt, completion := relaycommon.ChatUsagePresence([]byte(ojson.GetBytes(responseBody, "metadata").Raw))
-		info.ResponseFacts.RecordUsage(&difyResponse.MetaData.Usage, &difyResponse.MetaData.Usage, prompt, completion)
+		if err := info.ResponseFacts.RecordChatUsage(&difyResponse.MetaData.Usage, responseBody, "metadata.usage"); err != nil {
+			return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+		}
 	}
 	fullTextResponse := dto.OpenAITextResponse{
 		Id:      difyResponse.ConversationId,
