@@ -981,9 +981,8 @@ func UpdateChannel(c *gin.Context) {
 	}
 	clearChannelReadOnlyFields(&channel, requestData)
 
-	canBindPlugins := authz.Can(c.GetInt("id"), c.GetInt("role"), authz.TaskPluginBind)
-	canWriteSensitive := authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite)
-	if channel.Type == constant.ChannelTypeTaskPlugin && !canBindPlugins {
+	if channel.Type == constant.ChannelTypeTaskPlugin &&
+		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.TaskPluginBind) {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "task plugin channels require the task_plugin.bind permission",
@@ -1006,6 +1005,13 @@ func UpdateChannel(c *gin.Context) {
 	}
 	defer edit.Rollback()
 	originChannel := edit.Provider
+	canBindPlugins := authz.Can(c.GetInt("id"), c.GetInt("role"), authz.TaskPluginBind)
+	canWriteSensitive := authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite)
+	if !authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelWrite) ||
+		channel.Type == constant.ChannelTypeTaskPlugin && !canBindPlugins {
+		common.ApiErrorT(c, "Unauthorized, insufficient privileges")
+		return
+	}
 	originProxy := originChannel.GetSetting().Proxy
 	proxyChanged := false
 	_, settingProvided := requestData["setting"]
@@ -1598,6 +1604,12 @@ func ManageMultiKeys(c *gin.Context) {
 	}
 	if err != nil {
 		common.ApiErrorT(c, "Channel does not exist")
+		return
+	}
+	if !authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelOperate) ||
+		multiKeyActionRequiresSensitiveWrite(request.Action) &&
+			!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite) {
+		common.ApiErrorT(c, "Unauthorized, insufficient privileges")
 		return
 	}
 	if !channel.ProviderInfo.IsMultiKey {
