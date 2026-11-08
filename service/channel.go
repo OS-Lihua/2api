@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -27,16 +28,24 @@ func shouldCloseActiveWebSocketsAfterDisable(channelId int) bool {
 
 // disable & notify
 func DisableChannel(channelError types.ProviderError, reason string, selectedIndex ...int) bool {
-	return disableProvider(channelError, reason, false, selectedIndex...)
+	return disableProvider(channelError, reason, false, false, selectedIndex...)
 }
 
 // DisableProvider handles account-wide failures while retaining the credential
 // that produced the failure as a precondition of the transition.
 func DisableProvider(channelError types.ProviderError, reason string, selectedIndex ...int) bool {
-	return disableProvider(channelError, reason, true, selectedIndex...)
+	return disableProvider(channelError, reason, true, false, selectedIndex...)
 }
 
-func disableProvider(channelError types.ProviderError, reason string, providerWide bool, selectedIndex ...int) bool {
+var gatewayDisableNoticeSlots = make(chan struct{}, 64)
+
+// DisableGatewayProvider commits the status transition before returning, while
+// delivering its best-effort notice independently of request failover.
+func DisableGatewayProvider(channelError types.ProviderError, reason string, providerWide bool, selectedIndex ...int) bool {
+	return disableProvider(channelError, reason, providerWide, true, selectedIndex...)
+}
+
+func disableProvider(channelError types.ProviderError, reason string, providerWide, asyncNotice bool, selectedIndex ...int) bool {
 	common.SysLog(common.LogText("channel %q (#%d) failed, disabling it, reason: %s", channelError.ChannelName, channelError.ChannelId, common.LocalLogPreview(reason)))
 
 	// 检查是否启用自动禁用功能
@@ -56,9 +65,27 @@ func disableProvider(channelError types.ProviderError, reason string, providerWi
 			CloseActiveWebSocketsForChannel(channelError.ChannelId, ChannelDisabledCloseReason)
 		}
 		params := map[string]any{"Name": channelError.ChannelName, "Id": channelError.ChannelId, "Reason": reason}
-		NotifyChannelWatchers(formatNotifyType(channelError.ChannelId, common.ChannelStatusAutoDisabled), func(lang string) (string, string) {
-			return i18n.Translate(lang, i18n.MsgChannelNotifyDisabledSubject, params), i18n.Translate(lang, i18n.MsgChannelNotifyDisabledContent, params)
-		})
+		notifyType := formatNotifyType(channelError.ChannelId, common.ChannelStatusAutoDisabled)
+		notify := func() {
+			NotifyChannelWatchers(notifyType, func(lang string) (string, string) {
+				return i18n.Translate(lang, i18n.MsgChannelNotifyDisabledSubject, params), i18n.Translate(lang, i18n.MsgChannelNotifyDisabledContent, params)
+			})
+		}
+		if !asyncNotice {
+			notify()
+			return success
+		}
+		// Bound queued and running notices together. The job retains only safe
+		// notice fields, never the ProviderError containing the failed Key.
+		select {
+		case gatewayDisableNoticeSlots <- struct{}{}:
+			common.RelayCtxGo(context.Background(), func() {
+				defer func() { <-gatewayDisableNoticeSlots }()
+				notify()
+			})
+		default:
+			common.SysLog(common.LogText("gateway Provider disable notice skipped: notification queue is full, provider_id=%d", channelError.ChannelId))
+		}
 	}
 	return success
 }
