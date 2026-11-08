@@ -352,23 +352,6 @@ func (channel *Provider) Save() error {
 	return DB.Save(channel).Error
 }
 
-// saveStatusState persists only the fields owned by the channel status flow.
-// Keeping this allowlist here prevents a stale channel snapshot from
-// overwriting credentials, accounting counters, or channel configuration.
-func (channel *Provider) saveStatusState() error {
-	if channel.Id == 0 {
-		return errors.New("channel ID is 0")
-	}
-	updates := map[string]any{
-		"status":     channel.Status,
-		"other_info": channel.OtherInfo,
-	}
-	if channel.ProviderInfo.IsMultiKey {
-		updates["channel_info"] = channel.ProviderInfo
-	}
-	return DB.Model(&Provider{}).Where("id = ?", channel.Id).Updates(updates).Error
-}
-
 func GetAllProviders(startIdx int, num int, selectAll bool, idSort bool, sortOptions ...ProviderSortOptions) ([]*Provider, error) {
 	var channels []*Provider
 	var err error
@@ -738,83 +721,80 @@ func UpdateProviderStatus(channelId int, usingKey string, status int, reason str
 		defer channelStatusLock.Unlock()
 	}
 
-	// ProviderInfo stores both multi-key status and the polling cursor. Hold the
-	// same per-channel lock from the first read through persistence so neither
-	// writer can save a stale JSON snapshot over the other.
 	pollingLock := GetProviderPollingLock(channelId)
 	pollingLock.Lock()
 	defer pollingLock.Unlock()
 
-	if common.MemoryCacheEnabled {
-		channelCache, _ := CacheGetProvider(channelId)
-		if channelCache == nil {
-			return false
+	changed := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		// Keep the stored JSON, including NULL and legacy shapes, for the CAS.
+		// Comparing the decoded/re-encoded ProviderInfo would reject legacy rows.
+		var snapshot struct {
+			Provider
+			StoredInfo *string `gorm:"column:stored_info"`
 		}
-		if channelCache.ProviderInfo.IsMultiKey {
-			beforeStatus := channelCache.Status
-			// 如果是多Key模式，更新缓存中的状态
-			if !handlerMultiKeyUpdate(channelCache, usingKey, status, reason, selectedIndex...) {
-				return false
-			}
-			if beforeStatus != channelCache.Status {
-				CacheUpdateProviderStatus(channelId, channelCache.Status)
-			}
-			//CacheUpdateProvider(channelCache)
-			//return true
-		} else {
-			// 如果缓存渠道存在，且状态已是目标状态，直接返回
-			if channelCache.Status == status {
-				return false
-			}
-			CacheUpdateProviderStatus(channelId, status)
+		if err := tx.Model(&Provider{}).Select(`*, "channel_info"::text AS "stored_info"`).First(&snapshot, "id = ?", channelId).Error; err != nil {
+			return err
 		}
-	}
-
-	shouldUpdateAbilities := false
-	defer func() {
-		if shouldUpdateAbilities {
-			err := UpdateAbilityStatus(channelId, status == common.ChannelStatusEnabled)
-			if err != nil {
-				common.SysLog(common.LogText("failed to update ability status: channel_id=%d, error=%v", channelId, err))
-			}
-		}
-	}()
-	channel, err := GetProviderById(channelId, true)
-	if err != nil {
-		return false
-	} else {
-		// A manual channel operation must replace the exhaustion reason even
-		// when the status value is already manually disabled.
+		channel := &snapshot.Provider
+		beforeStatus, beforeOtherInfo := channel.Status, channel.OtherInfo
 		overridesKeyExhaustion := channel.ProviderInfo.IsMultiKey && usingKey == "" &&
 			status == common.ChannelStatusManuallyDisabled && reason != ProviderStatusReasonAllKeysDisabled &&
 			channel.GetOtherInfo()["status_reason"] == ProviderStatusReasonAllKeysDisabled
 		if channel.Status == status && !overridesKeyExhaustion {
-			return false
+			return nil
 		}
 
 		if channel.ProviderInfo.IsMultiKey {
-			beforeStatus := channel.Status
 			if !handlerMultiKeyUpdate(channel, usingKey, status, reason, selectedIndex...) {
-				return false
-			}
-			if beforeStatus != channel.Status {
-				shouldUpdateAbilities = true
+				return nil
 			}
 		} else {
+			if usingKey != "" && channel.Key != usingKey {
+				return nil
+			}
 			info := channel.GetOtherInfo()
 			info["status_reason"] = reason
 			info["status_time"] = common.GetTimestamp()
 			channel.SetOtherInfo(info)
 			channel.Status = status
-			shouldUpdateAbilities = true
 		}
-		err = channel.saveStatusState()
-		if err != nil {
-			common.SysLog(common.LogText("failed to update channel status: channel_id=%d, status=%d, error=%v", channel.Id, status, err))
-			return false
+
+		// PostgreSQL rechecks these conditions after waiting for a concurrent
+		// editor. A stale failure cannot transfer its status to replacement keys
+		// or overwrite another node's key status or polling state.
+		updates := map[string]any{"status": channel.Status, "other_info": channel.OtherInfo}
+		if channel.ProviderInfo.IsMultiKey {
+			updates["channel_info"] = channel.ProviderInfo
 		}
+		result := tx.Model(&Provider{}).
+			Where(`"id" = ? AND "key" = ? AND "status" = ? AND COALESCE("other_info", '') = ? AND "channel_info"::jsonb IS NOT DISTINCT FROM CAST(? AS jsonb)`,
+				channelId, channel.Key, beforeStatus, beforeOtherInfo, snapshot.StoredInfo).
+			Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return nil
+		}
+		if beforeStatus != channel.Status {
+			if err := tx.Model(&Ability{}).Where("channel_id = ?", channelId).Update("enabled", channel.Status == common.ChannelStatusEnabled).Error; err != nil {
+				return err
+			}
+		}
+		changed = true
+		return nil
+	})
+	if err != nil {
+		common.SysLog(common.LogText("failed to update channel status: channel_id=%d, status=%d, error=%v", channelId, status, err))
+		return false
 	}
-	return true
+	if changed && common.MemoryCacheEnabled {
+		// Publish only committed state, refreshing from the database rather than
+		// mutating an object that a concurrent management edit may have replaced.
+		InitProviderCache()
+	}
+	return changed
 }
 
 func EnableProviderByTag(tag string) error {

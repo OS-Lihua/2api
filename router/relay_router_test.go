@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -393,6 +394,201 @@ func testGatewayAutomaticDisable(t *testing.T, rotated bool) {
 		}
 	}
 	assert.True(t, found)
+}
+
+func TestTextGatewayReplacementKeySurvivesConcurrentAutoDisable(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		t.Run(fmt.Sprint("cache=", cached), func(t *testing.T) {
+			testGatewayReplacementKeySurvivesConcurrentAutoDisable(t, cached)
+		})
+	}
+}
+
+func testGatewayReplacementKeySurvivesConcurrentAutoDisable(t *testing.T, cached bool) {
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	arrived := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	var calls atomic.Int32
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if call := calls.Add(1); call > 1 {
+			expectedKey := "spare-test-key"
+			if call == 3 {
+				expectedKey = "replacement-test-key"
+			}
+			assert.Equal(t, "Bearer "+expectedKey, r.Header.Get("Authorization"))
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"replacement","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+			return
+		}
+		assert.Equal(t, "Bearer old-test-key", r.Header.Get("Authorization"))
+		close(arrived)
+		select {
+		case <-release:
+			w.WriteHeader(http.StatusUnauthorized)
+		case <-r.Context().Done():
+		}
+	})
+	previous := common.AutomaticDisableChannelEnabled
+	common.AutomaticDisableChannelEnabled = true
+	t.Cleanup(func() { common.AutomaticDisableChannelEnabled = previous })
+	provider, err := model.GetProviderById(fixture.channel.ProviderID, true)
+	require.NoError(t, err)
+	provider.Key = "old-test-key\nspare-test-key"
+	provider.AutoBan = common.GetPointer(1)
+	provider.ProviderInfo = model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}
+	require.NoError(t, model.DB.Model(provider).Select("key", "auto_ban", "channel_info").Updates(provider).Error)
+	common.MemoryCacheEnabled = cached
+	model.InitProviderCache()
+	var admin model.User
+	require.NoError(t, model.DB.Where("username = ?", "security-admin").First(&admin).Error)
+	require.NoError(t, model.DB.Model(&admin).Update("role", common.RoleRootUser).Error)
+	adminPAT := createWalletTestAccessToken(t, admin.Id, "channel:read", "channel:write", "channel:sensitive_write", "channel:operate")
+	gatewayDone := make(chan *httptest.ResponseRecorder, 1)
+	defer func() {
+		cancel()
+		releaseOnce.Do(func() { close(release) })
+		select {
+		case <-gatewayDone:
+		case <-time.After(5 * time.Second):
+		}
+	}()
+	go func() {
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)).WithContext(ctx)
+		request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		fixture.engine.ServeHTTP(response, request)
+		gatewayDone <- response
+	}()
+	select {
+	case <-arrived:
+	case <-ctx.Done():
+		t.Fatal("gateway did not reach Provider")
+	}
+	lock := model.DB.WithContext(ctx).Begin()
+	require.NoError(t, lock.Error)
+	defer lock.Rollback()
+	defer releaseOnce.Do(func() { close(release) })
+	var lockedID, lockerPID int
+	require.NoError(t, lock.Raw(`SELECT "id" FROM "providers" WHERE "id" = ? FOR UPDATE`, provider.Id).Scan(&lockedID).Error)
+	require.Equal(t, provider.Id, lockedID)
+	require.NoError(t, lock.Raw("SELECT pg_backend_pid()").Scan(&lockerPID).Error)
+	adminDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		request := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/v1/providers/%d", provider.Id), strings.NewReader(`{"key":"replacement-test-key\nspare-test-key","key_mode":"replace"}`)).WithContext(ctx)
+		request.Header.Set("Authorization", "Bearer "+adminPAT)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		fixture.engine.ServeHTTP(response, request)
+		adminDone <- response
+	}()
+	// PostgreSQL lock waits establish order through the public management and
+	// gateway requests. No production callback or wall-clock delay is involved.
+	var adminPID int
+	for adminPID == 0 && ctx.Err() == nil {
+		select {
+		case response := <-adminDone:
+			t.Fatalf("management request completed before locking: HTTP %d %s", response.Code, response.Body.String())
+		default:
+		}
+		require.NoError(t, model.DB.WithContext(ctx).Raw(`SELECT COALESCE(min(pid), 0) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND ? = ANY(pg_blocking_pids(pid))`, lockerPID).Scan(&adminPID).Error)
+	}
+	require.NotZero(t, adminPID, "management replacement must wait behind the external row lock")
+	releaseOnce.Do(func() { close(release) })
+	var statusPID int
+	for statusPID == 0 && ctx.Err() == nil {
+		require.NoError(t, model.DB.WithContext(ctx).Raw(`SELECT COALESCE(min(pid), 0) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> ? AND (? = ANY(pg_blocking_pids(pid)) OR ? = ANY(pg_blocking_pids(pid)))`, adminPID, lockerPID, adminPID).Scan(&statusPID).Error)
+	}
+	require.NotZero(t, statusPID, "automatic disable must wait behind the management replacement")
+	require.NoError(t, lock.Commit().Error)
+	select {
+	case response := <-adminDone:
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		require.Contains(t, response.Body.String(), `"success":true`)
+	case <-ctx.Done():
+		t.Fatal("management replacement did not complete")
+	}
+	select {
+	case response := <-gatewayDone:
+		gatewayDone <- response
+	case <-ctx.Done():
+		t.Fatal("gateway did not complete")
+	}
+	keys := adminSecurityRequest(fixture.engine, adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/providers/%d/keys", provider.Id), "")
+	require.Equal(t, http.StatusOK, keys.Code)
+	assert.Contains(t, keys.Body.String(), `"auto_disabled_count":0`, "a failure for the old Key must not disable its replacement")
+	logs, _, err := model.GetAuditLogs(model.AuditLogFilter{Category: model.AuditCategorySecurity}, 0, 100, common.RoleRootUser)
+	require.NoError(t, err)
+	found := false
+	for _, entry := range logs {
+		if entry.Action == "provider.auto_disable" {
+			found = true
+			assert.False(t, entry.Success, "replacement committed before the status write; old Key transition cannot claim success")
+		}
+	}
+	assert.True(t, found)
+	// The cursor already advanced past slot zero for the failed request.
+	// One full polling cycle must still visit the replacement.
+	for range 2 {
+		next := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+		assert.Equal(t, http.StatusOK, next.Code, next.Body.String())
+	}
+	assert.EqualValues(t, 3, calls.Load(), "replacement must remain selectable, including from the cache")
+}
+
+func TestTextGatewayFailedAutoDisablePreservesCachedProvider(t *testing.T) {
+	for _, multi := range []bool{false, true} {
+		t.Run(fmt.Sprint("multi=", multi), func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				assert.Equal(t, "Bearer provider-secret", r.Header.Get("Authorization"))
+				w.WriteHeader(http.StatusUnauthorized)
+			})
+			previous := common.AutomaticDisableChannelEnabled
+			common.AutomaticDisableChannelEnabled = true
+			t.Cleanup(func() { common.AutomaticDisableChannelEnabled = previous })
+			provider, err := model.GetProviderById(fixture.channel.ProviderID, true)
+			require.NoError(t, err)
+			provider.AutoBan = common.GetPointer(1)
+			provider.ProviderInfo = model.ProviderInfo{IsMultiKey: multi, MultiKeySize: 1, MultiKeyMode: constant.MultiKeyModePolling}
+			require.NoError(t, model.DB.Model(provider).Select("auto_ban", "channel_info").Updates(provider).Error)
+			// Exercise rollback of both Provider and legacy capability state. The
+			// database rejects the capability write after the Provider update.
+			require.NoError(t, model.DB.Create(&model.Ability{ChannelId: provider.Id, Group: "default", Model: "legacy-model", Enabled: true}).Error)
+			require.NoError(t, model.DB.Exec(`CREATE FUNCTION reject_health_status() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'health status write rejected'; END $$`).Error)
+			require.NoError(t, model.DB.Exec(`CREATE TRIGGER reject_health_status BEFORE UPDATE ON "abilities" FOR EACH ROW EXECUTE FUNCTION reject_health_status()`).Error)
+			common.MemoryCacheEnabled = true
+			model.InitProviderCache()
+			for range 2 {
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+				assert.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
+			}
+			assert.EqualValues(t, 2, calls.Load(), "a rolled-back transition must not remove the cached Provider or its only Key")
+			stored, err := model.GetProviderById(provider.Id, true)
+			require.NoError(t, err)
+			assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+			assert.Empty(t, stored.ProviderInfo.MultiKeyStatusList)
+			var ability model.Ability
+			require.NoError(t, model.DB.Where("channel_id = ?", provider.Id).First(&ability).Error)
+			assert.True(t, ability.Enabled)
+			logs, _, err := model.GetAuditLogs(model.AuditLogFilter{Category: model.AuditCategorySecurity}, 0, 100, common.RoleRootUser)
+			require.NoError(t, err)
+			attempts := 0
+			for _, entry := range logs {
+				if entry.Action == "provider.auto_disable" {
+					attempts++
+					assert.False(t, entry.Success)
+				}
+			}
+			assert.Equal(t, 2, attempts)
+			encoded, err := common.Marshal(logs)
+			require.NoError(t, err)
+			assert.NotContains(t, string(encoded), provider.Key)
+		})
+	}
 }
 
 func TestTextGatewayCircuitUsesProviderFailuresEvenAtAttemptLimit(t *testing.T) {
