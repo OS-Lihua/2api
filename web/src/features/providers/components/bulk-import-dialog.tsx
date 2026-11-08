@@ -32,6 +32,12 @@ import { Field, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Textarea } from '@/components/ui/textarea'
+import { MarginConfirmationRequired } from '@/features/pricing-management/api'
+import {
+  MarginConfirmation,
+  MarginEstimates,
+} from '@/features/pricing-management/components/margin-estimates'
+import type { MarginCheck } from '@/features/pricing-management/types'
 import { toIntlLocale } from '@/i18n/languages'
 import { formatNumber } from '@/lib/format'
 import { handleServerError } from '@/lib/handle-server-error'
@@ -55,14 +61,16 @@ export function BulkImportDialog(props: {
   const [target, setTarget] = useState<ImportTarget>('bulk-import')
   const [result, setResult] = useState<ImportResult | null>(null)
   const [confirm, setConfirm] = useState(false)
+  const [approval, setApproval] = useState<MarginCheck | null>(null)
   const [fileError, setFileError] = useState('')
   const [readingFile, setReadingFile] = useState(false)
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const mutation = useMutation({
-    mutationFn: (dryRun: boolean) =>
-      importBatch(source, format, dryRun, target),
+    mutationFn: (input: { dryRun: boolean; approval?: MarginCheck }) =>
+      importBatch(source, format, input.dryRun, target, input.approval),
     onSuccess: (data) => {
       setResult(data)
+      setApproval(null)
       setConfirm(false)
       if (data.committed) {
         setSource('')
@@ -72,6 +80,11 @@ export function BulkImportDialog(props: {
       }
     },
     onError: (error) => {
+      if (error instanceof MarginConfirmationRequired) {
+        setApproval(error.report)
+        setConfirm(true)
+        return
+      }
       setConfirm(false)
       handleServerError(error)
     },
@@ -163,6 +176,7 @@ export function BulkImportDialog(props: {
       },
     },
   ]
+  const marginReport = approval ?? result?.margin_check
   const canExecute =
     result?.dry_run && result.valid && !mutation.isPending && !readingFile
   return (
@@ -183,7 +197,7 @@ export function BulkImportDialog(props: {
               disabled={!source.trim() || mutation.isPending || readingFile}
               onClick={() => {
                 setResult(null)
-                mutation.mutate(true)
+                mutation.mutate({ dryRun: true })
               }}
             >
               {t('Preview import')}
@@ -332,6 +346,9 @@ export function BulkImportDialog(props: {
                   ? t('Batch imported successfully')
                   : t('Import preview')}
               </p>
+              {result.margin_check && (
+                <MarginEstimates estimates={result.margin_check.estimates} />
+              )}
               <StaticDataTable
                 columns={columns}
                 data={result.rows}
@@ -341,8 +358,18 @@ export function BulkImportDialog(props: {
           )}
         </div>
       </Dialog>
+      {confirm && marginReport?.requires_confirmation && (
+        <MarginConfirmation
+          report={marginReport}
+          isPending={mutation.isPending}
+          onCancel={() => setConfirm(false)}
+          onConfirm={() =>
+            mutation.mutate({ dryRun: false, approval: marginReport })
+          }
+        />
+      )}
       <ConfirmDialog
-        open={confirm}
+        open={confirm && !marginReport?.requires_confirmation}
         onOpenChange={(open) => {
           if (!mutation.isPending) setConfirm(open)
         }}
@@ -351,7 +378,9 @@ export function BulkImportDialog(props: {
           'The server will validate every row again. Any failure rolls back the whole batch.'
         )}
         isLoading={mutation.isPending}
-        handleConfirm={() => mutation.mutate(false)}
+        handleConfirm={() =>
+          mutation.mutate({ dryRun: false, approval: result?.margin_check })
+        }
       />
     </>
   )

@@ -11,6 +11,9 @@ type RequestInput struct {
 	Headers map[string]string
 	Body    []byte
 	Usage   map[string]any
+	// DeferredHeaders names headers resolved by account I/O after reservation.
+	// Exact pricing must fail if an evaluated condition needs one of them.
+	DeferredHeaders []string
 	// ImageCount is a validated billing quantity, separate from the frozen
 	// request's n. Settlement can replace it with the actual returned count.
 	ImageCount *int

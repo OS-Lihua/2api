@@ -18,6 +18,13 @@ type ProviderAccountPreparer interface {
 	PrepareAccount(context.Context, ProviderMetadata, func() (context.Context, error)) error
 }
 
+// ProviderHeaderPreviewer projects headers without account I/O. Providers whose
+// SetupHeader may perform I/O must implement it and name any deferred headers.
+// Deferred values must never be replaced with fabricated pricing probes.
+type ProviderHeaderPreviewer interface {
+	PreviewHeaders(*gin.Context, *http.Header, ProviderMetadata) ([]string, error)
+}
+
 // ReplayableResponseBody retains protocol-owned metadata when the host buffers
 // an HTTP error body and installs a reader for the protocol parser.
 type ReplayableResponseBody interface{ SetReader(io.ReadCloser) }

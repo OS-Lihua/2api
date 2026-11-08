@@ -277,6 +277,19 @@ unit, matched tier, an optional exact `FixedPrice` string (including `"0"`), and
 request-rule multipliers as exact strings. Skipped rules remain unmatched, and
 canonical condition text retains its exact numeric literals.
 
+The exact trace also includes `Currency`, `UnroundedAmount` and evaluated
+`Conditions`. `UnroundedAmount` is the source-currency rational result before
+group discounts, FX and posting-rounding, and remains available when converting
+that result to `money.Value` overflows. It is reconciliation evidence, not a
+postable replacement for `money.Amount`. Conditions preserve boolean pricing
+decisions without storing request-body or header values. An evaluation that
+fails before producing a number has no unrounded result.
+
+A ModelOffering gateway retains failed monetary evaluations in its existing
+settlement intent and exposes pending amounts explicitly. Known Provider costs
+still post once in their original currency even if sales or accounting FX
+cannot be evaluated. The legacy quota fallback rules below remain separate.
+
 The caller applies group discounts and explicit FX rates with `pkg/money`
 after evaluation. Calculations do not round. Write the final amount with
 `Value.Receivable`, `Value.Credit`, or `Value.Cost` according to the ledger entry.
