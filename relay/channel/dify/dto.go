@@ -18,6 +18,10 @@ type DifyChatRequest struct {
 	Files            []DifyFile     `json:"files"`
 }
 
+func (*DifyChatRequest) ChatRequestCapabilities() channel.NativeChatCapabilities {
+	return channel.NativeChatCapabilities{Parameters: []string{"user"}, ContentTypes: []string{dto.ContentTypeText, dto.ContentTypeImageURL}}
+}
+
 func (*DifyChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error) {
 	var wire DifyChatRequest
 	if err := common.Unmarshal(body, &wire); err != nil {

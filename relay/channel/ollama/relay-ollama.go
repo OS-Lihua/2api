@@ -106,8 +106,8 @@ func openAIChatToOllamaChat(c *gin.Context, r *dto.GeneralOpenAIRequest) (*Ollam
 	if r.Seed != nil {
 		chatReq.Options["seed"] = int(lo.FromPtr(r.Seed))
 	}
-	if mt := r.GetMaxTokens(); mt != 0 {
-		chatReq.Options["num_predict"] = int(mt)
+	if r.MaxTokens != nil || r.MaxCompletionTokens != nil {
+		chatReq.Options["num_predict"] = int(r.GetMaxTokens())
 	}
 
 	if r.Stop != nil {

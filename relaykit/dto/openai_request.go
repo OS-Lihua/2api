@@ -705,23 +705,17 @@ func (m *Message) StringContent() string {
 	switch m.Content.(type) {
 	case string:
 		return m.Content.(string)
-	case []any:
+	default:
+		content := *m
+		content.parsedContent = nil
 		var contentStr strings.Builder
-		for _, contentItem := range m.Content.([]any) {
-			contentMap, ok := contentItem.(map[string]any)
-			if !ok {
-				continue
-			}
-			if contentMap["type"] == ContentTypeText {
-				if subStr, ok := contentMap["text"].(string); ok {
-					contentStr.WriteString(subStr)
-				}
+		for _, part := range content.ParseContent() {
+			if part.Type == ContentTypeText {
+				contentStr.WriteString(part.Text)
 			}
 		}
 		return contentStr.String()
 	}
-
-	return ""
 }
 
 func (m *Message) SetNullContent() {

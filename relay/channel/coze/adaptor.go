@@ -47,6 +47,13 @@ func (a *Protocol) ConvertOpenAIRequest(c *gin.Context, info *common.RelayInfo, 
 	if request == nil {
 		return nil, errors.New("request is nil")
 	}
+	if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+		for _, message := range request.Messages {
+			if message.Role != "user" && message.Role != "assistant" {
+				return nil, fmt.Errorf("Coze cannot represent message role %s", message.Role)
+			}
+		}
+	}
 	return convertCozeChatRequest(c, *request), nil
 }
 

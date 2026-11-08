@@ -151,12 +151,34 @@ func (p *WireProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInf
 			return nil, fmt.Errorf("native Provider cannot represent multiple output choices (n)")
 		}
 	}
+	publicChat, _ := converted.(*dto.GeneralOpenAIRequest)
 	mode := info.RelayMode
 	info.RelayMode = p.relayMode(info)
 	defer func() { info.RelayMode = mode }()
 	converted, err = p.Wire.ConvertRequest(c, info, converted)
 	if err == nil && converted == nil {
 		return nil, fmt.Errorf("provider wire conversion for %q returned no request", p.Kind)
+	}
+	if err == nil && managed && p.Kind == protocol.OpenAIChat && !p.PublicResponse && publicChat != nil {
+		contract, ok := converted.(NativeChatRequestContract)
+		if !ok {
+			return nil, fmt.Errorf("native request does not declare retained parameters")
+		}
+		projector, ok := converted.(ChatRequestProjector)
+		if !ok {
+			return nil, fmt.Errorf("native request does not expose its effective wire projection")
+		}
+		encoded, err := common.Marshal(converted)
+		if err != nil {
+			return nil, err
+		}
+		actual, err := projector.ProjectChatRequest(encoded, *publicChat)
+		if err != nil {
+			return nil, err
+		}
+		if err := DiagnoseNativeChatRequest(c, info, publicChat, contract.ChatRequestCapabilities(), actual); err != nil {
+			return nil, err
+		}
 	}
 	return converted, err
 }

@@ -49,6 +49,10 @@ type OllamaChatRequest struct {
 	Think     json.RawMessage     `json:"think,omitempty"`
 }
 
+func (*OllamaChatRequest) ChatRequestCapabilities() channel.NativeChatCapabilities {
+	return channel.NativeChatCapabilities{Parameters: []string{"max_tokens", "max_completion_tokens", "temperature", "top_p", "top_k", "frequency_penalty", "presence_penalty", "seed", "stop", "tools", "response_format", "reasoning_effort", "think", "reasoning"}, ContentTypes: []string{dto.ContentTypeText, dto.ContentTypeImageURL}}
+}
+
 func (*OllamaChatRequest) SetChatOutputLimit(body []byte, limit uint) ([]byte, error) {
 	var wire map[string]common.RawMessage
 	if err := common.Unmarshal(body, &wire); err != nil {
@@ -85,6 +89,22 @@ func (*OllamaChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpen
 		return nil, fmt.Errorf("Ollama supports one choice per request")
 	}
 	effective.Model, effective.Stream = wire.Model, common.GetPointer(wire.Stream)
+	effective.MaxTokens, effective.MaxCompletionTokens = nil, nil
+	effective.Temperature, effective.TopP, effective.FrequencyPenalty, effective.PresencePenalty, effective.Seed = nil, nil, nil, nil, nil
+	effective.TopK, effective.Stop = nil, nil
+	options := make(map[string]any)
+	for key, target := range map[string]string{"temperature": "temperature", "top_p": "top_p", "top_k": "top_k", "frequency_penalty": "frequency_penalty", "presence_penalty": "presence_penalty", "seed": "seed", "stop": "stop"} {
+		if value, exists := wire.Options[key]; exists {
+			options[target] = value
+		}
+	}
+	encoded, err := common.Marshal(options)
+	if err != nil {
+		return nil, err
+	}
+	if err := common.Unmarshal(encoded, effective); err != nil {
+		return nil, err
+	}
 	if raw, ok := wire.Options["num_predict"]; ok {
 		encoded, err := common.Marshal(raw)
 		if err != nil {
@@ -112,6 +132,7 @@ func (*OllamaChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpen
 		}
 		effective.Messages = append(effective.Messages, projected)
 	}
+	effective.Tools = nil
 	if wire.Tools != nil {
 		encoded, err := common.Marshal(wire.Tools)
 		if err != nil {
@@ -121,6 +142,9 @@ func (*OllamaChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpen
 			return nil, err
 		}
 	}
+	effective.ReasoningEffort = ""
+	effective.Think = wire.Think
+	effective.Reasoning = nil
 	if len(wire.Think) > 0 {
 		var enabled bool
 		if common.Unmarshal(wire.Think, &enabled) == nil {
@@ -132,8 +156,31 @@ func (*OllamaChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpen
 			return nil, fmt.Errorf("invalid Ollama reasoning setting")
 		}
 	}
+	if len(public.Reasoning) > 0 {
+		encoded, err := common.Marshal(dto.Reasoning{Effort: effective.ReasoningEffort})
+		if err != nil {
+			return nil, err
+		}
+		effective.Reasoning = encoded
+	}
+	effective.ResponseFormat = nil
 	if wire.Format != nil && wire.Format != "" {
-		effective.ResponseFormat = &dto.ResponseFormat{Type: "json_schema"}
+		if text, ok := wire.Format.(string); ok && text == "json" {
+			effective.ResponseFormat = &dto.ResponseFormat{Type: "json_object"}
+		} else {
+			var schema dto.FormatJsonSchema
+			if public.ResponseFormat != nil && public.ResponseFormat.Type == "json_schema" {
+				if err := common.Unmarshal(public.ResponseFormat.JsonSchema, &schema); err != nil {
+					return nil, err
+				}
+			}
+			schema.Schema = wire.Format
+			encoded, err := common.Marshal(schema)
+			if err != nil {
+				return nil, err
+			}
+			effective.ResponseFormat = &dto.ResponseFormat{Type: "json_schema", JsonSchema: encoded}
+		}
 	}
 	return effective, nil
 }

@@ -32,8 +32,8 @@ var baiduTokenStore sync.Map
 func requestOpenAI2Baidu(request dto.GeneralOpenAIRequest) *BaiduChatRequest {
 	baiduRequest := BaiduChatRequest{
 		Temperature:    request.Temperature,
-		TopP:           lo.FromPtrOr(request.TopP, 0),
-		PenaltyScore:   lo.FromPtrOr(request.FrequencyPenalty, 0),
+		TopP:           request.TopP,
+		PenaltyScore:   request.FrequencyPenalty,
 		Stream:         lo.FromPtrOr(request.Stream, false),
 		DisableSearch:  false,
 		EnableCitation: false,
@@ -43,9 +43,13 @@ func requestOpenAI2Baidu(request dto.GeneralOpenAIRequest) *BaiduChatRequest {
 		maxTokens := int(request.GetMaxTokens())
 		baiduRequest.MaxOutputTokens = &maxTokens
 	}
+	var system strings.Builder
 	for _, message := range request.Messages {
 		if message.Role == "system" {
-			baiduRequest.System = message.StringContent()
+			if system.Len() > 0 {
+				system.WriteByte('\n')
+			}
+			system.WriteString(message.StringContent())
 		} else {
 			baiduRequest.Messages = append(baiduRequest.Messages, BaiduMessage{
 				Role:    message.Role,
@@ -53,6 +57,7 @@ func requestOpenAI2Baidu(request dto.GeneralOpenAIRequest) *BaiduChatRequest {
 			})
 		}
 	}
+	baiduRequest.System = system.String()
 	return &baiduRequest
 }
 
@@ -64,6 +69,9 @@ func responseBaidu2OpenAI(response *BaiduChatResponse) *dto.OpenAITextResponse {
 			Content: response.Result,
 		},
 		FinishReason: "stop",
+	}
+	if response.IsTruncated {
+		choice.FinishReason = "length"
 	}
 	fullTextResponse := dto.OpenAITextResponse{
 		Id:      response.Id,
@@ -80,6 +88,9 @@ func streamResponseBaidu2OpenAI(baiduResponse *BaiduChatStreamResponse) *dto.Cha
 	choice.Delta.SetContentString(baiduResponse.Result)
 	if baiduResponse.IsEnd {
 		choice.FinishReason = &constant.FinishReasonStop
+		if baiduResponse.IsTruncated {
+			choice.FinishReason = common.GetPointer("length")
+		}
 	}
 	response := dto.ChatCompletionsStreamResponse{
 		Id:      baiduResponse.Id,

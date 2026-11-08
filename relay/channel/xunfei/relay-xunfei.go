@@ -17,7 +17,6 @@ import (
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
-	"github.com/samber/lo"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -50,8 +49,11 @@ func requestOpenAI2Xunfei(request dto.GeneralOpenAIRequest, xunfeiAppId string, 
 	xunfeiRequest.Header.AppId = xunfeiAppId
 	xunfeiRequest.Parameter.Chat.Domain = domain
 	xunfeiRequest.Parameter.Chat.Temperature = request.Temperature
-	xunfeiRequest.Parameter.Chat.TopK = lo.FromPtrOr(request.N, 0)
-	xunfeiRequest.Parameter.Chat.MaxTokens = request.GetMaxTokens()
+	xunfeiRequest.Parameter.Chat.TopK = request.TopK
+	xunfeiRequest.Parameter.Chat.MaxTokens = request.MaxTokens
+	if request.MaxCompletionTokens != nil {
+		xunfeiRequest.Parameter.Chat.MaxTokens = request.MaxCompletionTokens
+	}
 	xunfeiRequest.Payload.Message.Text = messages
 	return &xunfeiRequest
 }

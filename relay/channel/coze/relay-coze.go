@@ -21,13 +21,16 @@ import (
 
 func convertCozeChatRequest(c *gin.Context, request dto.GeneralOpenAIRequest) *CozeChatRequest {
 	var messages []CozeEnterMessage
-	// 将 request的messages的role为user的content转换为CozeMessage
 	for _, message := range request.Messages {
-		if message.Role == "user" {
+		if message.Role == "user" || message.Role == "assistant" {
+			messageType := "question"
+			if message.Role == "assistant" {
+				messageType = "answer"
+			}
 			messages = append(messages, CozeEnterMessage{
-				Role:    "user",
-				Content: message.Content,
-				// TODO: support more content type
+				Role:        message.Role,
+				Type:        messageType,
+				Content:     message.StringContent(),
 				ContentType: "text",
 			})
 		}

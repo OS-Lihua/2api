@@ -36,7 +36,34 @@ func (p *sparkProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayIn
 	if err != nil {
 		return nil, err
 	}
-	return p.wire.ConvertRequest(c, info, req)
+	wire, err := p.wire.ConvertRequest(c, info, req)
+	if err != nil {
+		return nil, err
+	}
+	if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+		if chat, ok := req.(*dto.GeneralOpenAIRequest); ok {
+			contract, ok := wire.(channel.NativeChatRequestContract)
+			if !ok {
+				return nil, fmt.Errorf("native request does not declare retained parameters")
+			}
+			projector, ok := wire.(channel.ChatRequestProjector)
+			if !ok {
+				return nil, fmt.Errorf("native request does not expose its effective wire projection")
+			}
+			encoded, err := common.Marshal(wire)
+			if err != nil {
+				return nil, err
+			}
+			actual, err := projector.ProjectChatRequest(encoded, *chat)
+			if err != nil {
+				return nil, err
+			}
+			if err := channel.DiagnoseNativeChatRequest(c, info, chat, contract.ChatRequestCapabilities(), actual); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return wire, nil
 }
 func (p *sparkProtocol) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
 	if resp == nil || resp.Body == nil {

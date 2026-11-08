@@ -60,17 +60,40 @@ func (p *novaProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInf
 	if info.ChannelOtherSettings.AwsApiType == dto.AwsApiTypeMantle {
 		return nil, fmt.Errorf("AWS Mantle does not support Nova")
 	}
-	return convertToNovaRequest(chat), nil
+	wire := convertToNovaRequest(chat)
+	if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+		encoded, err := common.Marshal(wire)
+		if err != nil {
+			return nil, err
+		}
+		actual, err := wire.ProjectChatRequest(encoded, *chat)
+		if err != nil {
+			return nil, err
+		}
+		if err := channel.DiagnoseNativeChatRequest(c, info, chat, wire.ChatRequestCapabilities(), actual); err != nil {
+			return nil, err
+		}
+	}
+	return wire, nil
 }
 func (p *novaProtocol) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
+	body, readErr := io.ReadAll(resp.Body)
+	usage := &dto.Usage{}
+	if info.ResponseFacts != nil {
+		body = relaycommon.SanitizeNativeUsage(body, "usage")
+		info.ResponseFacts.RecordNativeUsage(usage, body, "usage.inputTokens", "usage.outputTokens")
 	}
 	response, reportedUsage, err := novaChatResponse(body, info.UpstreamModelName, helper.GetResponseID(c))
+	if err == nil && info.ResponseFacts != nil {
+		info.ResponseFacts.SourceGeneratedText = response.Choices[0].Message.StringContent()
+		info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceGeneratedText != ""
+	}
+	if readErr != nil {
+		return usage, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
+	}
 	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+		return usage, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	var reported any
 	if reportedUsage {
@@ -97,7 +120,7 @@ func (p *novaProtocol) DoResponse(c *gin.Context, resp *http.Response, info *rel
 		if reportedUsage {
 			chunk.Usage = &response.Usage
 		}
-		choice := dto.ChatCompletionsStreamResponseChoice{Index: 0, FinishReason: common.GetPointer("stop")}
+		choice := dto.ChatCompletionsStreamResponseChoice{Index: 0, FinishReason: common.GetPointer(response.Choices[0].FinishReason)}
 		choice.Delta.SetContentString(response.Choices[0].Message.StringContent())
 		chunk.Choices = []dto.ChatCompletionsStreamResponseChoice{choice}
 		wire := struct {
@@ -125,7 +148,8 @@ func (p *novaProtocol) DoResponse(c *gin.Context, resp *http.Response, info *rel
 }
 func novaChatResponse(body []byte, model, id string) (*dto.OpenAITextResponse, bool, error) {
 	var response struct {
-		Output struct {
+		StopReason string `json:"stopReason"`
+		Output     struct {
 			Message struct {
 				Content []struct {
 					Text string `json:"text"`
@@ -145,8 +169,17 @@ func novaChatResponse(body []byte, model, id string) (*dto.OpenAITextResponse, b
 	for _, part := range response.Output.Message.Content {
 		content.WriteString(part.Text)
 	}
+	finishReason := "stop"
+	switch response.StopReason {
+	case "max_tokens":
+		finishReason = "length"
+	case "content_filtered", "guardrail_intervened":
+		finishReason = "content_filter"
+	case "tool_use":
+		finishReason = "tool_calls"
+	}
 	chat := &dto.OpenAITextResponse{Id: id, Object: "chat.completion", Created: common.GetTimestamp(), Model: model,
-		Choices: []dto.OpenAITextResponseChoice{{Index: 0, Message: dto.Message{Role: "assistant", Content: content.String()}, FinishReason: "stop"}},
+		Choices: []dto.OpenAITextResponseChoice{{Index: 0, Message: dto.Message{Role: "assistant", Content: content.String()}, FinishReason: finishReason}},
 	}
 	if response.Usage != nil {
 		chat.Usage = dto.Usage{PromptTokens: response.Usage.InputTokens, CompletionTokens: response.Usage.OutputTokens, TotalTokens: response.Usage.TotalTokens}

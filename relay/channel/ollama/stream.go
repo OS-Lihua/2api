@@ -257,7 +257,7 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		if finishReason == "" {
 			finishReason = "stop"
 		}
-		if toolCallIndex > 0 {
+		if toolCallIndex > 0 && finishReason == "stop" {
 			finishReason = constant.FinishReasonToolCalls
 		}
 		// emit stop delta
@@ -384,7 +384,7 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	if finishReason == "" {
 		finishReason = "stop"
 	}
-	if len(toolCalls) > 0 {
+	if len(toolCalls) > 0 && finishReason == "stop" {
 		finishReason = constant.FinishReasonToolCalls
 	}
 

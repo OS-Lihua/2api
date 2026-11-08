@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 )
 
@@ -66,6 +67,32 @@ type NovaMessage struct {
 
 type NovaContent struct {
 	Text string `json:"text"`
+}
+
+func (*NovaRequest) ChatRequestCapabilities() channel.NativeChatCapabilities {
+	return channel.NativeChatCapabilities{Parameters: []string{"max_tokens", "max_completion_tokens", "temperature", "top_p", "top_k", "stop"}, ContentTypes: []string{dto.ContentTypeText}}
+}
+
+func (*NovaRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error) {
+	var wire NovaRequest
+	if err := common.Unmarshal(body, &wire); err != nil {
+		return nil, err
+	}
+	public.Messages = nil
+	for _, message := range wire.Messages {
+		var text strings.Builder
+		for _, part := range message.Content {
+			text.WriteString(part.Text)
+		}
+		public.Messages = append(public.Messages, dto.Message{Role: message.Role, Content: text.String()})
+	}
+	public.MaxTokens, public.MaxCompletionTokens = nil, nil
+	public.Temperature, public.TopP, public.TopK, public.Stop = nil, nil, nil, nil
+	if config := wire.InferenceConfig; config != nil {
+		public.MaxCompletionTokens = config.MaxTokens
+		public.Temperature, public.TopP, public.TopK, public.Stop = config.Temperature, config.TopP, config.TopK, config.StopSequences
+	}
+	return &public, nil
 }
 
 type NovaRequest struct {

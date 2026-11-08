@@ -85,6 +85,13 @@ func (a *ChannelAdaptor) PrepareChatRequest(c *gin.Context, info *relaycommon.Re
 }
 
 func (a *ChannelAdaptor) ProjectChatRequest(c *gin.Context, info *relaycommon.RelayInfo, converted any, public *dto.GeneralOpenAIRequest, body []byte) (*dto.GeneralOpenAIRequest, error) {
+	if contract, ok := converted.(channel.NativeChatRequestContract); ok {
+		var err error
+		public, err = channel.ProjectNativeChatParameters(body, *public, converted, contract.ChatRequestCapabilities())
+		if err != nil {
+			return nil, err
+		}
+	}
 	if projector, ok := converted.(channel.ChatRequestProjector); ok {
 		return projector.ProjectChatRequest(body, *public)
 	}
@@ -118,12 +125,7 @@ func (a *ChannelAdaptor) ProjectChatRequest(c *gin.Context, info *relaycommon.Re
 		}
 		return effective, nil
 	}
-	if len(info.ParamOverride) > 0 {
-		return nil, errors.New("native request overrides require a wire projection")
-	}
-	// An unchanged native conversion retains the already validated public facts.
-	effective := *public
-	return &effective, nil
+	return nil, errors.New("native request requires an effective wire projection")
 }
 
 func (a *ChannelAdaptor) SetChatOutputLimit(converted any, body []byte, limit uint) ([]byte, error) {

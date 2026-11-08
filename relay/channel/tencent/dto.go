@@ -1,5 +1,34 @@
 package tencent
 
+import (
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+)
+
+func (*TencentChatRequest) ChatRequestCapabilities() channel.NativeChatCapabilities {
+	return channel.NativeChatCapabilities{Parameters: []string{"temperature", "top_p"}, ContentTypes: []string{dto.ContentTypeText}}
+}
+
+func (*TencentChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error) {
+	var wire TencentChatRequest
+	if err := common.Unmarshal(body, &wire); err != nil {
+		return nil, err
+	}
+	if wire.Model != nil {
+		public.Model = *wire.Model
+	}
+	public.Stream = wire.Stream
+	public.TopP, public.Temperature = wire.TopP, wire.Temperature
+	public.Messages = nil
+	for _, message := range wire.Messages {
+		if message != nil {
+			public.Messages = append(public.Messages, dto.Message{Role: message.Role, Content: message.Content})
+		}
+	}
+	return &public, nil
+}
+
 type TencentMessage struct {
 	Role    string `json:"Role"`
 	Content string `json:"Content"`

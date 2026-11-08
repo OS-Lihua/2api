@@ -154,7 +154,19 @@ func (prepared *awsPreparedInvocation) execute(c *gin.Context) (*http.Response, 
 	ctx, cancel := newAwsInvokeContext(parent, prepared.managed)
 	if !prepared.stream {
 		defer cancel()
-		output, err := prepared.client.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{ModelId: aws.String(prepared.modelID), ContentType: aws.String("application/json"), Accept: aws.String("application/json"), Body: prepared.payload}, prepared.options...)
+		options := append([]func(*bedrockruntime.Options){}, prepared.options...)
+		var capture *awsJSONResponseCapture
+		if prepared.managed {
+			capture = &awsJSONResponseCapture{}
+			options = append(options, func(options *bedrockruntime.Options) {
+				capture.client = options.HTTPClient
+				options.HTTPClient = capture
+			})
+		}
+		output, err := prepared.client.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{ModelId: aws.String(prepared.modelID), ContentType: aws.String("application/json"), Accept: aws.String("application/json"), Body: prepared.payload}, options...)
+		if capture != nil && capture.response != nil && capture.readErr != nil {
+			return capture.response, nil
+		}
 		if err != nil {
 			return nil, prepared.failure(parent, err, "InvokeModel")
 		}

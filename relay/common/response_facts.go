@@ -151,6 +151,20 @@ func (facts *ResponseFacts) RecordUsage(usage, reported *dto.Usage, prompt, comp
 	facts.UsageReported = facts.PromptTokensReported && facts.CompletionTokensReported
 }
 
+// RecordNativeUsage retains independently valid base counters before decoding
+// a provider envelope or reporting its transport error.
+func (facts *ResponseFacts) RecordNativeUsage(usage *dto.Usage, body []byte, promptPath, completionPath string) {
+	prompt, completion := NativeUsagePresence(body, promptPath, completionPath, "")
+	reported := dto.Usage{}
+	if prompt {
+		reported.PromptTokens = int(gjson.GetBytes(body, promptPath).Int())
+	}
+	if completion {
+		reported.CompletionTokens = int(gjson.GetBytes(body, completionPath).Int())
+	}
+	facts.RecordUsage(usage, &reported, prompt, completion)
+}
+
 // RecordChatUsage merges a native usage object with Chat counter names.
 // Omitted detail fields retain their preceding snapshot; explicit zeros reset it.
 func (facts *ResponseFacts) RecordChatUsage(usage *dto.Usage, body []byte, path string) error {

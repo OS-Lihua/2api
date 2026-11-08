@@ -3,8 +3,27 @@ package zhipu
 import (
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 )
+
+func (*ZhipuRequest) ChatRequestCapabilities() channel.NativeChatCapabilities {
+	return channel.NativeChatCapabilities{Parameters: []string{"temperature", "top_p"}, ContentTypes: []string{dto.ContentTypeText}}
+}
+
+func (*ZhipuRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error) {
+	var wire ZhipuRequest
+	if err := common.Unmarshal(body, &wire); err != nil {
+		return nil, err
+	}
+	public.Temperature, public.TopP = wire.Temperature, wire.TopP
+	public.Messages = nil
+	for _, message := range wire.Prompt {
+		public.Messages = append(public.Messages, dto.Message{Role: message.Role, Content: message.Content})
+	}
+	return &public, nil
+}
 
 type ZhipuMessage struct {
 	Role    string `json:"role"`
@@ -14,7 +33,7 @@ type ZhipuMessage struct {
 type ZhipuRequest struct {
 	Prompt      []ZhipuMessage `json:"prompt"`
 	Temperature *float64       `json:"temperature,omitempty"`
-	TopP        float64        `json:"top_p,omitempty"`
+	TopP        *float64       `json:"top_p,omitempty"`
 	RequestId   string         `json:"request_id,omitempty"`
 	Incremental bool           `json:"incremental,omitempty"`
 }

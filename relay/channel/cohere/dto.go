@@ -24,6 +24,10 @@ type CohereRequest struct {
 	SafetyMode       string        `json:"safety_mode,omitempty"`
 }
 
+func (*CohereRequest) ChatRequestCapabilities() channel.NativeChatCapabilities {
+	return channel.NativeChatCapabilities{Parameters: []string{"max_tokens", "max_completion_tokens", "temperature", "top_p", "top_k", "frequency_penalty", "presence_penalty", "seed", "stop"}, ContentTypes: []string{dto.ContentTypeText}}
+}
+
 func (r *CohereRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error) {
 	var wire CohereRequest
 	if err := common.Unmarshal(body, &wire); err != nil {

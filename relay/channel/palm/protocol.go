@@ -28,6 +28,13 @@ func (a *Protocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInfo, r
 			return nil, fmt.Errorf("PaLM generateMessage does not support output token limits or tools")
 		}
 		wire := &PaLMChatRequest{Temperature: request.Temperature, CandidateCount: request.N, TopP: request.TopP}
+		if request.TopK != nil {
+			if *request.TopK < 0 {
+				return nil, fmt.Errorf("invalid PaLM top_k")
+			}
+			value := uint(*request.TopK)
+			wire.TopK = &value
+		}
 		for _, message := range request.Messages {
 			if message.Role != "user" && message.Role != "assistant" {
 				return nil, fmt.Errorf("PaLM generateMessage does not support message role %q", message.Role)

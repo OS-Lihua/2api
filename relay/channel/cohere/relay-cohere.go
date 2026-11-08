@@ -42,8 +42,14 @@ func requestOpenAI2Cohere(textRequest dto.GeneralOpenAIRequest) *CohereRequest {
 	if textRequest.MaxTokens == nil && textRequest.MaxCompletionTokens == nil {
 		cohereReq.MaxTokens = 4000
 	}
-	for _, msg := range textRequest.Messages {
-		if msg.Role == "user" {
+	lastUser := -1
+	for index, message := range textRequest.Messages {
+		if message.Role == "user" {
+			lastUser = index
+		}
+	}
+	for index, msg := range textRequest.Messages {
+		if index == lastUser {
 			cohereReq.Message = msg.StringContent()
 		} else {
 			var role string
@@ -108,8 +114,12 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	helper.SetEventStreamHeaders(c)
 	for scanner.Scan() {
 		info.SetFirstResponseTime()
+		body := scanner.Bytes()
+		if info.ResponseFacts != nil {
+			body = relaycommon.SanitizeNativeUsage(body, "response.meta.billed_units")
+		}
 		var cohereResp CohereResponse
-		if err := common.Unmarshal(scanner.Bytes(), &cohereResp); err != nil {
+		if err := common.Unmarshal(body, &cohereResp); err != nil {
 			if info.ResponseFacts == nil {
 				continue
 			}
@@ -118,7 +128,7 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		if cohereResp.Response != nil {
 			reported := dto.Usage{PromptTokens: cohereResp.Response.Meta.BilledUnits.InputTokens, CompletionTokens: cohereResp.Response.Meta.BilledUnits.OutputTokens}
 			if info.ResponseFacts != nil {
-				prompt, completion := relaycommon.NativeUsagePresence(scanner.Bytes(), "response.meta.billed_units.input_tokens", "response.meta.billed_units.output_tokens", "")
+				prompt, completion := relaycommon.NativeUsagePresence(body, "response.meta.billed_units.input_tokens", "response.meta.billed_units.output_tokens", "")
 				info.ResponseFacts.RecordUsage(usage, &reported, prompt, completion)
 			} else {
 				*usage = reported
@@ -160,20 +170,30 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 
 func cohereHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	createdTime := common.GetTimestamp()
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
-	}
+	responseBody, readErr := io.ReadAll(resp.Body)
 	service.CloseResponseBodyGracefully(resp)
-	var cohereResp CohereResponseResult
-	err = common.Unmarshal(responseBody, &cohereResp)
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
-	}
 	usage := dto.Usage{}
-	usage.PromptTokens = cohereResp.Meta.BilledUnits.InputTokens
-	usage.CompletionTokens = cohereResp.Meta.BilledUnits.OutputTokens
-	usage.TotalTokens = cohereResp.Meta.BilledUnits.InputTokens + cohereResp.Meta.BilledUnits.OutputTokens
+	if info.ResponseFacts != nil {
+		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "meta.billed_units")
+		info.ResponseFacts.RecordNativeUsage(&usage, responseBody, "meta.billed_units.input_tokens", "meta.billed_units.output_tokens")
+	}
+	var cohereResp CohereResponseResult
+	err := common.Unmarshal(responseBody, &cohereResp)
+	if err == nil && info.ResponseFacts != nil {
+		info.ResponseFacts.SourceGeneratedText = cohereResp.Text
+		info.ResponseFacts.SourceOutputObserved = cohereResp.Text != ""
+	}
+	if readErr != nil {
+		return &usage, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
+	}
+	if err != nil {
+		return &usage, types.NewError(err, types.ErrorCodeBadResponseBody)
+	}
+	if info.ResponseFacts == nil {
+		usage.PromptTokens = cohereResp.Meta.BilledUnits.InputTokens
+		usage.CompletionTokens = cohereResp.Meta.BilledUnits.OutputTokens
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	}
 
 	var openaiResp dto.OpenAITextResponse
 	openaiResp.Id = cohereResp.ResponseId
