@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"image"
 	"image/png"
@@ -1323,7 +1324,12 @@ func TestTextGatewayRouteAffinityIsScopedAndCannotBypassProfit(t *testing.T) {
 			fixture.draw.Store(tc.draw)
 			if tc.name == "profit rejection" {
 				require.NoError(t, model.DB.Model(fixture.offering).Update("allow_loss_fallback", false).Error)
-				require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("request",fixed(2))`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+				price := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("request",fixed(2))`, EffectiveAt: clock.Now().Unix()}
+				err := model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy)
+				var confirmation *model.MarginConfirmationError
+				require.ErrorAs(t, err, &confirmation)
+				price.MarginConfirmation = confirmation.Report.Revision
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
 			}
 			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, tc.offering)))
 			request.Header.Set("Authorization", "Bearer "+tc.key)
@@ -1487,7 +1493,13 @@ func TestTextGatewayRouteFiltersProfitBeforeChoosing(t *testing.T) {
 				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("request",fixed(` + tc.first + `))`, EffectiveAt: clock.Now().Unix()},
 				{OwnerType: model.PriceOwnerChannel, OwnerID: second.ID, Currency: "USD", Expression: `tier("request",fixed(` + tc.second + `))`, EffectiveAt: clock.Now().Unix()},
 			} {
-				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+				err := model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy)
+				var confirmation *model.MarginConfirmationError
+				if errors.As(err, &confirmation) {
+					price.MarginConfirmation = confirmation.Report.Revision
+					err = model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy)
+				}
+				require.NoError(t, err)
 			}
 			require.NoError(t, model.DB.Model(fixture.offering).Updates(map[string]any{"minimum_margin_rate": tc.margin, "allow_loss_fallback": tc.fallback}).Error)
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
