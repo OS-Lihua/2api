@@ -1513,9 +1513,10 @@ func TestAsyncTaskRejectedAttemptsPreserveErrorsAndUnknownCosts(t *testing.T) {
 				var provider model.Provider
 				require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
 				assert.Equal(t, common.ChannelStatusAutoDisabled, provider.Status)
-				var audits []model.AuditLog
-				require.NoError(t, model.LOG_DB.Where("action = ?", "provider.auto_disable").Find(&audits).Error)
+				audits, _, err := model.GetAuditLogs(model.AuditLogFilter{UserId: fixture.user.Id, Category: model.AuditCategorySecurity}, 0, 100, common.RoleRootUser)
+				require.NoError(t, err)
 				require.Len(t, audits, 1)
+				assert.Equal(t, "provider.auto_disable", audits[0].Action)
 				assert.True(t, audits[0].Success)
 				encoded, err := common.Marshal(audits)
 				require.NoError(t, err)
