@@ -24,6 +24,7 @@ import {
   RequestMoney,
   RequestOutcome,
   RequestTime,
+  RequestUsageFacts,
 } from './request-facts'
 
 export function RequestSummary(props: {
@@ -83,6 +84,7 @@ export function RequestSummary(props: {
           </dd>
         </div>
       </dl>
+      <RequestUsageFacts usage={request.usage} source={request.usage_source} />
       {request.error_code && (
         <p className='text-destructive text-xs break-words'>
           {request.error_code}

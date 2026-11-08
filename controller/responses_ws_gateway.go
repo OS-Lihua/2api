@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
@@ -122,7 +123,15 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	info.UpstreamModelName, info.TokenizerModel = selection.Channel.UpstreamModelName, selection.Channel.Model.ModelName
 	info.IsModelMapped, info.IsStream = true, true
 	info.RequestId, info.StartTime = c.GetString(common.RequestIdKey), started
-	info.ResponseFacts = &relaycommon.ResponseFacts{OnBusinessOutput: budget.Delivered}
+	info.StreamStatus = relaycommon.NewStreamStatus()
+	var sentAt time.Time
+	var firstByte time.Duration
+	info.ResponseFacts = &relaycommon.ResponseFacts{OnBusinessOutput: func() {
+		if firstByte == 0 && !sentAt.IsZero() {
+			firstByte = max(clock.Now().Sub(sentAt), time.Nanosecond)
+		}
+		budget.Delivered()
+	}}
 	common.SetContextKey(c, constant.ContextKeyResponseFacts, info.ResponseFacts)
 	saleInput, err := helper.ResolveIncomingBillingExprRequestInput(c, info)
 	if err != nil {
@@ -148,6 +157,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		return
 	}
 	// Count native input rather than treating max_output_tokens as usage.
+	common.SetContextKey(c, constant.ContextKeyOriginalModel, info.TokenizerModel)
 	estimatedInput, err := service.CountRequestToken(c, effective.GetTokenCountMeta(), info)
 	if err != nil || !service.GatewayResponsesCapabilitiesMatch(&effective, selection.Capabilities, estimatedInput) {
 		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
@@ -259,25 +269,56 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	attempt := &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: run.record.ID, ChannelID: selection.Channel.ID, ProviderID: selection.Channel.ProviderID, ModelID: selection.Channel.ModelID, MemberTier: 1,
 		StartedAt: attemptStart.UnixMilli(), UsageSource: "none", PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, AccountingFXRate: rate,
 		Cost: money.Amount{Currency: purchase.Currency}, ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, RouteDiagnostics: selection.Diagnostics, ConversionLosses: []string{}}
+	sentAt = clock.Now()
 	usage, apiErr := call.Exchange(c, info, selection.Channel.ID, selection.Channel.ProviderID, prepared, payload)
 	// The Attempt context may be expired while the client is still present.
 	// Classify against the parent before deciding cancellation accounting.
 	c.Request = parent
 	attempt.EndedAt = clock.Now().UnixMilli()
 	attempt.Status, attempt.ErrorClass = gatewayAttemptOutcome(c, info, apiErr)
-	status, code := 0, ""
+	outcome := info.StreamStatus.OutcomeSnapshot()
+	status, code, errorType := 0, outcome.ErrorCode, outcome.ErrorType
+	if call.Established() {
+		status = http.StatusOK
+	}
+	if outcome.ErrorStatus >= 400 {
+		status = outcome.ErrorStatus
+	}
 	if apiErr != nil {
 		status = apiErr.StatusCode
-		code, _ = apiErr.ToOpenAIError().Code.(string)
+		native := apiErr.ToOpenAIError()
+		code, _ = native.Code.(string)
+		errorType = native.Type
 	}
-	failure := service.ClassifyGatewayFailure(status, code, apiErr != nil, budget.TimedOut(), parent.Context().Err() != nil, info.ResponseFacts.DownstreamWriteFailed)
+	cancelled := parent.Context().Err() != nil && !call.TerminalDelivered() || outcome.Response == relaycommon.ResponseOutcomeCancelled
+	if call.TerminalDelivered() && !info.ResponseFacts.DownstreamWriteFailed {
+		attempt.Status = "failed"
+		if info.ResponseFacts.BusinessOutput {
+			attempt.Status = "partial"
+			if info.StreamStatus.CompletedNormally() {
+				attempt.Status = "success"
+			}
+		}
+	}
+	if outcome.Response == relaycommon.ResponseOutcomeCancelled {
+		attempt.Status = "cancelled"
+	}
+	if outcome.Response == relaycommon.ResponseOutcomeIncomplete && outcome.IncompleteReason == "max_output_tokens" && outcome.EndReason == relaycommon.StreamEndReasonDone && !outcome.HasErrors && !info.ResponseFacts.DownstreamWriteFailed && info.ResponseFacts.BusinessOutput && !cancelled {
+		attempt.Status = "success"
+	}
+	if outcome.IncompleteReason == "content_filter" {
+		code = "content_filter"
+	}
+	transportFailed := apiErr != nil || outcome.EndReason == relaycommon.StreamEndReasonScannerErr || outcome.EndReason == relaycommon.StreamEndReasonTimeout
+	failure := service.ClassifyGatewayFailure(status, code, transportFailed, budget.TimedOut(), cancelled, info.ResponseFacts.DownstreamWriteFailed, errorType)
 	if attempt.Status == "success" {
 		failure = service.GatewayFailure{}
 	}
 	if attempt.Status != "success" {
 		attempt.ErrorClass = failure.Class
 	}
-	result = service.GatewayAttemptResult{Attempt: attempt, Failure: failure, Delivered: call.Established(), HealthLease: selection.Admission.Lease}
+	recordGatewayProviderFailure(c, info, selection, failure)
+	result = service.GatewayAttemptResult{Attempt: attempt, Failure: failure, Delivered: call.Established(), HealthLease: selection.Admission.Lease, FirstByte: firstByte, RetryAfter: prepared.RetryAfter()}
 	run.record.Status = attempt.Status
 	if usage != nil {
 		if !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && !info.ResponseFacts.CompletionTokensReported && !info.ResponseFacts.BusinessOutput && info.ResponseFacts.GeneratedText == "" {
@@ -303,6 +344,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		run.attemptTrace[attempt.ID] = trace
 		if priceErr != nil || attempt.CostPending || attempt.ConvertedCostPending {
 			run.evaluationFailed = true
+			run.record.ErrorCode = "billing_evaluation_failed"
 		}
 		if info.ResponseFacts.BusinessOutput {
 			saleUsage := service.GatewayUsageSnapshot(usage)
@@ -335,6 +377,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 				run.record.Receivable = money.Amount{Currency: model.SettlementCurrency()}
 				run.record.SalePending = true
 				run.evaluationFailed, run.saleEvaluationFailed = true, true
+				run.record.ErrorCode = "billing_evaluation_failed"
 			}
 		}
 	}

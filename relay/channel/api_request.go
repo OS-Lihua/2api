@@ -413,14 +413,17 @@ func DoWssRequest(a ProviderTransport, c *gin.Context, info *common.RelayInfo, r
 // PreparedWssRequest holds transient Provider credentials only at the transport
 // boundary. Pricing probes receive copies; no prepared request is persisted.
 type PreparedWssRequest struct {
-	url      string
-	header   http.Header
-	dialer   websocket.Dialer
-	identity [32]byte
+	url        string
+	header     http.Header
+	dialer     websocket.Dialer
+	identity   [32]byte
+	managed    bool
+	retryAfter string
 }
 
 func (request *PreparedWssRequest) Headers() http.Header { return request.header.Clone() }
 func (request *PreparedWssRequest) Identity() [32]byte   { return request.identity }
+func (request *PreparedWssRequest) RetryAfter() string   { return request.retryAfter }
 
 // PrepareWssRequest performs no Provider I/O.
 func PrepareWssRequest(a ProviderTransport, c *gin.Context, info *common.RelayInfo) (*PreparedWssRequest, error) {
@@ -463,7 +466,7 @@ func PrepareWssRequest(a ProviderTransport, c *gin.Context, info *common.RelayIn
 	_ = targetHeader.Write(&identity)
 	identity.WriteString(info.ChannelSetting.Proxy)
 	identity.WriteString(fmt.Sprint(info.ChannelSetting.TLSInsecureSkipVerify))
-	return &PreparedWssRequest{url: fullRequestURL, header: targetHeader, dialer: dialer, identity: sha256.Sum256(identity.Bytes())}, nil
+	return &PreparedWssRequest{url: fullRequestURL, header: targetHeader, dialer: dialer, identity: sha256.Sum256(identity.Bytes()), managed: info.ResponseFacts != nil}, nil
 }
 
 func DoPreparedWssRequest(c *gin.Context, request *PreparedWssRequest) (*websocket.Conn, error) {
@@ -472,8 +475,21 @@ func DoPreparedWssRequest(c *gin.Context, request *PreparedWssRequest) (*websock
 		statusCode := http.StatusInternalServerError
 		if resp != nil {
 			statusCode = resp.StatusCode
+			request.retryAfter = resp.Header.Get("Retry-After")
 			if resp.Body != nil {
-				_ = resp.Body.Close()
+				defer resp.Body.Close()
+				if request.managed {
+					raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+					var payload struct {
+						Error struct {
+							Code string `json:"code"`
+							Type string `json:"type"`
+						} `json:"error"`
+					}
+					if readErr == nil && common2.Unmarshal(raw, &payload) == nil && len(payload.Error.Code) <= 128 && len(payload.Error.Type) <= 128 && (payload.Error.Code != "" || payload.Error.Type != "") {
+						return nil, types.WithOpenAIError(types.OpenAIError{Message: "Upstream WebSocket handshake rejected", Code: payload.Error.Code, Type: payload.Error.Type}, statusCode)
+					}
+				}
 			}
 		}
 		return nil, types.NewErrorWithStatusCode(fmt.Errorf("dial failed to %s: %w", common.SanitizeURLForLog(request.url), redactUpstreamURLError(err)), types.ErrorCodeDoRequestFailed, statusCode)

@@ -121,7 +121,7 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 	}
 	if a.usage.CompletionTokens == 0 && (facts == nil || !facts.CompletionTokensReported) {
 		if output := a.outputText.String(); output != "" {
-			a.usage.CompletionTokens = tokenkit.Count(a.info.GetUpstreamModelName(), output)
+			a.usage.CompletionTokens = tokenkit.Count(a.info.TokenizerModelName(), output)
 		}
 	}
 	// Upstream bills the prompt as soon as it starts generating, so a stream

@@ -20,8 +20,12 @@ func TestResponsesUsageAccumulatorPreservesExplicitZero(t *testing.T) {
 	}
 	info.SetEstimatePromptTokens(100)
 	accumulator := NewResponsesUsageAccumulator(info)
+	initial := []byte(`{"type":"response.created","response":{"status":"in_progress","usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110,"input_tokens_details":{"cached_tokens":20,"audio_tokens":5},"output_tokens_details":{"audio_tokens":2}}}}`)
+	var initialEvent dto.ResponsesStreamResponse
+	require.NoError(t, common.Unmarshal(initial, &initialEvent))
+	accumulator.Observe(&initialEvent, initial)
 	accumulator.Observe(&dto.ResponsesStreamResponse{Type: "response.output_text.delta", Delta: "hello"}, nil)
-	raw := []byte(`{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+	raw := []byte(`{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0,"input_tokens_details":{"cached_tokens":0,"audio_tokens":0},"output_tokens_details":{"audio_tokens":0}}}}`)
 	var event dto.ResponsesStreamResponse
 	require.NoError(t, common.Unmarshal(raw, &event))
 	accumulator.Observe(&event, raw)
@@ -30,7 +34,24 @@ func TestResponsesUsageAccumulatorPreservesExplicitZero(t *testing.T) {
 	assert.Zero(t, usage.PromptTokens)
 	assert.Zero(t, usage.CompletionTokens)
 	assert.True(t, info.ResponseFacts.UsageReported)
+	assert.Zero(t, usage.PromptTokensDetails.CachedTokens)
+	assert.Zero(t, usage.PromptTokensDetails.AudioTokens)
+	assert.Zero(t, usage.CompletionTokenDetails.AudioTokens)
 	assert.Same(t, usage, accumulator.Finish())
+}
+
+func TestResponsesUsageAccumulatorEstimatesTerminalFunctionCall(t *testing.T) {
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "gpt-4o"}, StreamStatus: relaycommon.NewStreamStatus(), ResponseFacts: &relaycommon.ResponseFacts{}}
+	info.SetEstimatePromptTokens(100)
+	accumulator := NewResponsesUsageAccumulator(info)
+	raw := []byte(`{"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","name":"lookup","arguments":"{\"city\":\"Paris\"}"}]}}`)
+	var event dto.ResponsesStreamResponse
+	require.NoError(t, common.Unmarshal(raw, &event))
+	accumulator.Observe(&event, raw)
+	usage := accumulator.Finish()
+	assert.Equal(t, 100, usage.PromptTokens)
+	assert.Equal(t, tokenkit.Count("gpt-4o", `lookup{"city":"Paris"}`), usage.CompletionTokens)
+	assert.False(t, info.ResponseFacts.UsageReported)
 }
 
 func TestResponsesUsageAccumulatorTerminalAccounting(t *testing.T) {

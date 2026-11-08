@@ -113,6 +113,8 @@ func (call *ResponsesWSCall) Exchange(c *gin.Context, info *relaycommon.RelayInf
 // Established includes a successful handshake followed by a failed generation.
 func (call *ResponsesWSCall) Established() bool { return call.session.gatewayChannelID != 0 }
 
+func (call *ResponsesWSCall) TerminalDelivered() bool { return call.state.terminalDelivered }
+
 func (call *ResponsesWSCall) CreatePayload(body []byte) ([]byte, error) {
 	return buildResponsesWSCreateEvent(body, call.create.Generate, call.create.StreamID)
 }
@@ -157,11 +159,12 @@ type responsesWSControl struct {
 // Only the request worker reads or changes billing state. Socket readers pass
 // bounded messages to it; cancellation never performs an independent refund.
 type responsesWSCallState struct {
-	inbox     chan responsesWSMessage
-	controls  chan responsesWSControl
-	done      chan struct{}
-	terminal  *responsesWSMessage
-	finishing atomic.Bool
+	inbox             chan responsesWSMessage
+	controls          chan responsesWSControl
+	done              chan struct{}
+	terminal          *responsesWSMessage
+	finishing         atomic.Bool
+	terminalDelivered bool
 	// A nonzero closeCode ends the connection after this request.
 	closeCode   int
 	closeReason string
@@ -557,6 +560,8 @@ func (s *responsesWSSession) receive(c *gin.Context, state *responsesWSCallState
 							state.finishing.Store(true)
 							if err := s.deliver(info, incoming, &event.ResponsesStreamResponse); err != nil {
 								state.closeCode = websocket.CloseInternalServerErr
+							} else {
+								state.terminalDelivered = true
 							}
 						} else {
 							state.terminal = &incoming
@@ -599,6 +604,8 @@ func (s *responsesWSSession) receive(c *gin.Context, state *responsesWSCallState
 					state.finishing.Store(true)
 					if err := s.deliver(info, incoming, &event.ResponsesStreamResponse); err != nil {
 						state.closeCode = websocket.CloseInternalServerErr
+					} else {
+						state.terminalDelivered = true
 					}
 				} else {
 					state.terminal = &incoming

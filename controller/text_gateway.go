@@ -438,27 +438,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				failure = service.GatewayFailure{Class: "stream_interrupted", Switch: true}
 				attempt.ErrorClass = failure.Class
 			}
-			if common.AutomaticDisableChannelEnabled && selection.Provider.GetAutoBan() && (failure.Class == "credentials" || failure.Class == "account_quota") {
-				index := info.ChannelMultiKeyIndex
-				providerError := types.ProviderError{ChannelId: selection.Channel.ProviderID, ChannelName: selection.Provider.Name,
-					IsMultiKey: info.ChannelIsMultiKey, UsingKey: info.ApiKey, AutoBan: true}
-				const reason = "Provider rejected authentication or account quota"
-				targetScope := "key"
-				if failure.Class == "account_quota" {
-					targetScope = "provider"
-				}
-				changed := service.DisableGatewayProvider(providerError, reason, failure.Class == "account_quota", index)
-				actorRole := c.GetInt("role")
-				if actorRole == 0 {
-					if actor, err := model.GetUserCache(c.GetInt("id")); err == nil {
-						actorRole = actor.Role
-					}
-				}
-				model.RecordAuditLog(c, model.AuditLog{UserId: c.GetInt("id"), ActorRole: actorRole, AuthMethod: "api_token", Category: model.AuditCategorySecurity,
-					Action: "provider.auto_disable", Success: changed, Content: reason,
-					Other: model.AuditOther{Op: &model.AuditOperation{Action: "provider.auto_disable"}, RootInfo: model.AuditFields{
-						"provider_id": selection.Channel.ProviderID, "channel_id": selection.Channel.ID, "key_index": index, "error_class": failure.Class, "target_scope": targetScope}}})
-			}
+			recordGatewayProviderFailure(c, info, selection, failure)
 			result = service.GatewayAttemptResult{Attempt: attempt, Failure: failure, Delivered: info.ResponseFacts.BusinessOutput,
 				FirstByte: firstByte, HealthLease: selection.Admission.Lease}
 			if failure.Class == "rate_limited" {
@@ -722,6 +702,32 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream response failed")
 	}
 	return
+}
+
+// recordGatewayProviderFailure shares atomic Provider checks and excludes
+// usable credentials from the audit event for every gateway transport.
+func recordGatewayProviderFailure(c *gin.Context, info *relaycommon.RelayInfo, selection *service.GatewaySelection, failure service.GatewayFailure) {
+	if !common.AutomaticDisableChannelEnabled || !selection.Provider.GetAutoBan() || failure.Class != "credentials" && failure.Class != "account_quota" {
+		return
+	}
+	index := info.ChannelMultiKeyIndex
+	providerError := types.ProviderError{ChannelId: selection.Channel.ProviderID, ChannelName: selection.Provider.Name, IsMultiKey: info.ChannelIsMultiKey, UsingKey: info.ApiKey, AutoBan: true}
+	const reason = "Provider rejected authentication or account quota"
+	targetScope := "key"
+	if failure.Class == "account_quota" {
+		targetScope = "provider"
+	}
+	changed := service.DisableGatewayProvider(providerError, reason, failure.Class == "account_quota", index)
+	actorRole := c.GetInt("role")
+	if actorRole == 0 {
+		if actor, err := model.GetUserCache(c.GetInt("id")); err == nil {
+			actorRole = actor.Role
+		}
+	}
+	model.RecordAuditLog(c, model.AuditLog{UserId: c.GetInt("id"), ActorRole: actorRole, AuthMethod: "api_token", Category: model.AuditCategorySecurity,
+		Action: "provider.auto_disable", Success: changed, Content: reason,
+		Other: model.AuditOther{Op: &model.AuditOperation{Action: "provider.auto_disable"}, RootInfo: model.AuditFields{
+			"provider_id": selection.Channel.ProviderID, "channel_id": selection.Channel.ID, "key_index": index, "error_class": failure.Class, "target_scope": targetScope}}})
 }
 
 // gatewayAttemptOutcome distinguishes accepted business content from protocol

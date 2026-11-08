@@ -30,6 +30,13 @@ export interface RequestUsage {
   prompt_tokens?: number
   completion_tokens?: number
   total_tokens?: number
+  cached_tokens?: number
+  cache_creation_tokens?: number
+  cache_creation_12h_tokens?: number
+  image_input_tokens?: number
+  audio_input_tokens?: number
+  image_output_tokens?: number
+  audio_output_tokens?: number
 }
 export interface RequestLog {
   id: string

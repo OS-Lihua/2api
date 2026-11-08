@@ -122,6 +122,15 @@ export function RequestUsageFacts(props: {
       </span>
     )
   }
+  const details: [string, number | undefined][] = [
+    [t('Cached tokens'), props.usage.cached_tokens],
+    [t('Cache write tokens'), props.usage.cache_creation_tokens],
+    [t('12-hour cache write tokens'), props.usage.cache_creation_12h_tokens],
+    [t('Image input tokens'), props.usage.image_input_tokens],
+    [t('Audio input tokens'), props.usage.audio_input_tokens],
+    [t('Image output tokens'), props.usage.image_output_tokens],
+    [t('Audio output tokens'), props.usage.audio_output_tokens],
+  ]
   return (
     <div className='space-y-1 text-xs'>
       <div className='tabular-nums'>
@@ -132,6 +141,13 @@ export function RequestUsageFacts(props: {
         <div className='text-muted-foreground'>
           {t('Total tokens')}: {formatNumber(props.usage.total_tokens, locale)}
         </div>
+      )}
+      {details.map(([label, quantity]) =>
+        typeof quantity === 'number' && Number.isFinite(quantity) ? (
+          <div key={label} className='text-muted-foreground tabular-nums'>
+            {label}: {formatNumber(quantity, locale)}
+          </div>
+        ) : null
       )}
       {props.source === 'estimated' && (
         <Badge variant='outline'>{t('Estimated')}</Badge>

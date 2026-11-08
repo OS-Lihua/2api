@@ -140,6 +140,61 @@ function renderRequests() {
   )
 }
 
+it('shows cache and audio quantities for a WebSocket request and its attempt', async () => {
+  api.defaults.adapter = async (config) => ({
+    config,
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+    data: {
+      success: true,
+      data: {
+        items: [
+          new URL(api.getUri(config), 'http://localhost').pathname.endsWith(
+            '/attempts'
+          )
+            ? {
+                ...attempt,
+                usage_source: 'upstream',
+                usage: {
+                  ...attempt.usage,
+                  cached_tokens: 12,
+                  audio_input_tokens: 24,
+                  audio_output_tokens: 18,
+                },
+              }
+            : {
+                ...request,
+                usage_source: 'upstream',
+                usage: {
+                  ...request.usage,
+                  cached_tokens: 12,
+                  audio_input_tokens: 24,
+                  audio_output_tokens: 18,
+                },
+              },
+        ],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      },
+    },
+  })
+  const user = userEvent.setup()
+  renderRequests()
+  await user.click(
+    await screen.findByRole('button', {
+      name: `View attempts for request ${requestId}`,
+    })
+  )
+  const drawer = await screen.findByRole('dialog', { name: 'Request attempts' })
+  expect(await within(drawer).findByText(attempt.id)).toBeVisible()
+  expect(within(drawer).getAllByText('Cached tokens: 12')).toHaveLength(2)
+  expect(within(drawer).getAllByText('Audio input tokens: 24')).toHaveLength(2)
+  expect(within(drawer).getAllByText('Audio output tokens: 18')).toHaveLength(2)
+  expect(within(drawer).queryByText('Estimated')).not.toBeInTheDocument()
+})
+
 it('shows a precise charge and estimated usage, opens the real self attempt, and closes with Escape', async () => {
   const user = userEvent.setup()
   renderRequests()
@@ -159,7 +214,7 @@ it('shows a precise charge and estimated usage, opens the real self attempt, and
   expect(within(drawer).getByText('9007199254740995')).toBeVisible()
   expect(within(drawer).getByText('1.000000001')).toBeVisible()
   expect(within(drawer).getByText('unsupported_parameter')).toBeVisible()
-  expect(within(drawer).getByText('Estimated')).toBeVisible()
+  expect(within(drawer).getAllByText('Estimated')).toHaveLength(2)
   expect(urls.map((url) => url.pathname)).toEqual([
     '/api/requests/self',
     `/api/requests/self/${requestId}/attempts`,

@@ -306,6 +306,196 @@ func assertTextGatewayLedger(t *testing.T, request model.GatewayRequest, expecte
 	assert.Empty(t, reconciliation.Mismatches)
 }
 
+func dialResponsesGateway(t *testing.T, fixture textGatewayFixture) *websocket.Conn {
+	t.Helper()
+	require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", protocol.OpenAIResponses).Error)
+	var provider model.Provider
+	require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
+	provider.SetSetting(dto.ProviderSettings{ResponsesWebSocketEnabled: true})
+	require.NoError(t, model.DB.Model(&provider).Update("setting", provider.Setting).Error)
+	gateway := httptest.NewServer(fixture.engine)
+	t.Cleanup(gateway.Close)
+	client, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(gateway.URL, "http")+"/v1/responses", http.Header{"Authorization": {"Bearer sk-" + fixture.token.Key}})
+	if response != nil {
+		require.NoError(t, response.Body.Close())
+	}
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+	return client
+}
+
+func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
+	for _, tc := range []struct {
+		name, terminal, source, status   string
+		sale, cost                       int64
+		delta, cancel, disconnect, probe bool
+	}{
+		{name: "partial usage without delivery", terminal: `{"type":"response.failed","response":{"id":"active","status":"failed","error":{"code":"server_error"},"usage":{"input_tokens":1000}}}`, source: "none", status: "failed", cost: 1_000_000},
+		{name: "terminal function call without usage", terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"function_call","name":"hello","arguments":""}]}}`, source: "estimated", status: "success", sale: 5400, cost: 3000},
+		{name: "purchase probes use final wire and Provider header", terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010}}}`, source: "upstream", status: "success", sale: 1_836_000, cost: 510_000, probe: true},
+		{name: "cancel retains complete reported usage", terminal: `{"type":"response.cancelled","response":{"id":"active","status":"cancelled","usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010}}}`, source: "upstream", status: "cancelled", sale: 1_836_000, cost: 1_020_000, delta: true, cancel: true},
+		{name: "disconnect settles generated output once", source: "estimated", status: "cancelled", sale: 5400, cost: 3000, delta: true, disconnect: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstreamDone := make(chan struct{})
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if !assert.NoError(t, err) {
+					return
+				}
+				defer peer.Close()
+				defer close(upstreamDone)
+				_, _, err = peer.ReadMessage()
+				if !assert.NoError(t, err) {
+					return
+				}
+				if tc.delta {
+					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"active","status":"in_progress"}}`))) {
+						return
+					}
+					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","delta":"hello"}`))) {
+						return
+					}
+				}
+				if tc.disconnect {
+					_, _, _ = peer.ReadMessage()
+					return
+				}
+				if tc.cancel {
+					_, control, err := peer.ReadMessage()
+					if !assert.NoError(t, err) {
+						return
+					}
+					assert.JSONEq(t, `{"type":"response.cancel","response_id":"active"}`, string(control))
+				}
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(tc.terminal))) {
+					return
+				}
+				_, _, _ = peer.ReadMessage()
+			})
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("model_name", "gpt-4o").Error)
+			if tc.probe {
+				price := *fixture.purchase
+				price.ID = 0
+				price.EffectiveAt = clock.Now().Unix() + 1
+				price.Expression = `param("type") == "response.create" && header("x-provider-tier") == "purchase" ? tier("wire", p * 0.5 + c) : tier("wrong", p + c * 2)`
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("header_override", `{"X-Provider-Tier":"purchase"}`).Error)
+				require.NoError(t, model.CreatePriceVersion(t.Context(), &price, fixture.sale.CreatedBy))
+				fixture.fake.Advance(2 * time.Second)
+			}
+			client := dialResponsesGateway(t, fixture)
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","input":"hello","max_output_tokens":16}`)))
+			require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+			if tc.delta {
+				for range 2 {
+					_, _, err := client.ReadMessage()
+					require.NoError(t, err)
+				}
+			}
+			if tc.cancel {
+				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.cancel","response_id":"active"}`)))
+			}
+			if !tc.disconnect {
+				_, raw, err := client.ReadMessage()
+				require.NoError(t, err)
+				assert.JSONEq(t, tc.terminal, string(raw))
+			}
+			require.NoError(t, client.Close())
+			select {
+			case <-upstreamDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("upstream work survived client closure")
+			}
+			var records []model.GatewayRequest
+			require.Eventually(t, func() bool {
+				var err error
+				records, _, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+				if err != nil || len(records) != 1 || records[0].Status == "settlement_pending" {
+					return false
+				}
+				_, count, err := model.ListGatewayAttempts(t.Context(), records[0].ID, 0, 10)
+				return err == nil && count == 1
+			}, 5*time.Second, 10*time.Millisecond)
+			record := records[0]
+			assert.Equal(t, tc.status, record.Status)
+			assert.Equal(t, tc.source, record.UsageSource)
+			assert.Equal(t, tc.sale, record.Receivable.Nanos)
+			assertTextGatewayLedger(t, record, tc.cost)
+			attempts, _, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			assert.Equal(t, tc.cost, attempts[0].Cost.Nanos)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1_000_000_000)-tc.sale, wallet.Balance.Nanos)
+			_, err = model.RecoverGatewaySettlements(t.Context(), 100)
+			require.NoError(t, err)
+			assertTextGatewayLedger(t, record, tc.cost)
+		})
+	}
+}
+
+func TestResponsesWSGatewayRejectsLegacyConnectionReuse(t *testing.T) {
+	var moneyCalls, legacyCalls atomic.Int32
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		moneyCalls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	require.NoError(t, model.DB.AutoMigrate(&model.Ability{}, &model.Log{}))
+	previousRatios := ratio_setting.ModelRatio2JSONString()
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4o":1}`))
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(previousRatios)) })
+	require.NoError(t, model.DB.Model(fixture.user).Updates(map[string]any{"quota": 1_000_000, "setting": `{"billing_preference":"wallet_only"}`}).Error)
+	require.NoError(t, model.DB.Model(fixture.token).Update("unlimited_quota", true).Error)
+	legacyDone := make(chan struct{})
+	legacyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if !assert.NoError(t, err) {
+			return
+		}
+		defer peer.Close()
+		defer close(legacyDone)
+		for {
+			_, _, err := peer.ReadMessage()
+			if err != nil {
+				return
+			}
+			index := legacyCalls.Add(1)
+			if err := peer.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":"legacy-%d","status":"completed","usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}}}`, index))); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(legacyServer.Close)
+	legacy := &model.Provider{Name: "Legacy WS Provider", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Key: "legacy-secret", BaseURL: &legacyServer.URL, Models: "gpt-4o", Group: "default"}
+	legacy.SetSetting(dto.ProviderSettings{ResponsesWebSocketEnabled: true})
+	require.NoError(t, model.DB.Create(legacy).Error)
+	require.NoError(t, model.DB.Create(&model.Ability{ChannelId: legacy.Id, Model: "gpt-4o", Group: "default", Enabled: true}).Error)
+	client := dialResponsesGateway(t, fixture)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-4o","input":"hello"}`)))
+	_, raw, err := client.ReadMessage()
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"id":"legacy-1"`)
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","input":"hello"}`)))
+	_, raw, err = client.ReadMessage()
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"status":409`)
+	require.NoError(t, client.Close())
+	select {
+	case <-legacyDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("legacy Provider connection did not stop")
+	}
+	assert.Equal(t, int32(1), legacyCalls.Load())
+	assert.Zero(t, moneyCalls.Load())
+	_, count, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+	require.NoError(t, err)
+	assert.Zero(t, count)
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1_000_000_000), wallet.Balance.Nanos)
+}
+
 func TestResponsesWSGatewaySettlesLogicalRequests(t *testing.T) {
 	var connections atomic.Int32
 	received := make(chan string, 2)
