@@ -56,8 +56,8 @@ type VolcengineTTSReqInfo struct {
 	Operation       string                   `json:"operation"`
 	Model           string                   `json:"model,omitempty"`
 	TextType        string                   `json:"text_type,omitempty"`
-	SilenceDuration float64                  `json:"silence_duration,omitempty"`
-	WithTimestamp   interface{}              `json:"with_timestamp,omitempty"`
+	SilenceDuration *float64                 `json:"silence_duration,omitempty"`
+	WithTimestamp   any                      `json:"with_timestamp,omitempty"`
 	ExtraParam      *VolcengineTTSExtraParam `json:"extra_param,omitempty"`
 }
 

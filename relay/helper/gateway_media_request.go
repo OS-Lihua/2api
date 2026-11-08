@@ -116,7 +116,7 @@ func GatewayMediaMultipartInput(form *multipart.Form) ([]byte, error) {
 		}
 		value := values[0]
 		switch strings.ToLower(key) {
-		case "n", "batch_size", "batch_count", "num_images", "num_outputs", "samplecount", "sample_count", "max_images", "max_tokens", "max_completion_tokens", "max_output_tokens", "max_new_tokens", "maxoutputtokens", "duration", "seconds", "duration_seconds", "speed", "width", "height", "output_quality", "output_compression", "parameters", "metadata", "stream", "watermark", "prompt_extend":
+		case "n", "batch_size", "batch_count", "num_images", "num_outputs", "samplecount", "sample_count", "max_images", "max_tokens", "max_completion_tokens", "max_output_tokens", "max_new_tokens", "maxoutputtokens", "duration", "seconds", "duration_seconds", "silence_duration", "speed", "width", "height", "output_quality", "output_compression", "parameters", "metadata", "stream", "watermark", "prompt_extend":
 			scalars[key] = common.RawMessage(value)
 		default:
 			encoded, err := common.Marshal(value)
@@ -167,6 +167,8 @@ func ValidateGatewayMediaMultipliers(body []byte, declared ...capability.Limits)
 				ceiling = maxTokensLimit
 			case "duration", "seconds", "duration_seconds":
 				ceiling = relaycommon.MaxTaskDurationSeconds
+			case "silence_duration":
+				ceiling = relaycommon.MaxTaskDurationSeconds * 1000
 			case "width", "height":
 				ceiling = MaxGatewayImageDimension
 				minimum = decimal.NewFromInt(1)
@@ -224,6 +226,14 @@ func ValidateGatewayMediaMultipliers(body []byte, declared ...capability.Limits)
 						limit = declared[0].MaxOutputTokens
 					case "duration", "seconds", "duration_seconds":
 						limit = declared[0].MaxDurationSeconds
+					case "silence_duration":
+						if seconds := declared[0].MaxDurationSeconds; seconds != nil {
+							if *seconds < 0 {
+								return fmt.Errorf("invalid media duration limit")
+							}
+							milliseconds := min(int64(relaycommon.MaxTaskDurationSeconds), *seconds) * 1000
+							limit = &milliseconds
+						}
 					}
 					if limit != nil {
 						ceiling = min(ceiling, *limit)
@@ -242,7 +252,7 @@ func ValidateGatewayMediaMultipliers(body []byte, declared ...capability.Limits)
 				if number.LessThan(minimum) || number.GreaterThan(decimal.NewFromInt(ceiling)) {
 					return fmt.Errorf("%s is outside the media request limit", name)
 				}
-				if name != "speed" && name != "duration" && name != "seconds" && name != "duration_seconds" && !number.Equal(number.Truncate(0)) {
+				if name != "speed" && name != "duration" && name != "seconds" && name != "duration_seconds" && name != "silence_duration" && !number.Equal(number.Truncate(0)) {
 					return fmt.Errorf("%s must be an integer", name)
 				}
 				continue

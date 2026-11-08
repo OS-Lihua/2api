@@ -236,6 +236,10 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 			limits.MaxOutputTokens = &remaining
 		}
 	}
+	if limits.MaxOutputTokens != nil && run.parsed.Protocol != protocol.OpenAIAudioSpeech {
+		run.status, run.code = 400, "unsupported_parameter"
+		return skipped
+	}
 	if audio, ok := prepared.Request.(*dto.AudioRequest); ok && run.parsed.Protocol == protocol.OpenAIAudioSpeech && len(audio.MaxNewTokens) == 0 && limits.MaxOutputTokens != nil {
 		if err := adaptor.SetMediaOutputLimit(prepared, *limits.MaxOutputTokens); err != nil {
 			run.status, run.code = 400, "unsupported_parameter"
@@ -252,7 +256,12 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		run.code = "billing_unavailable"
 		return result
 	}
+	mean = max(mean, int64(prepared.MinimumOutputTokens))
 	if limit := limits.MaxOutputTokens; limit != nil {
+		if int64(prepared.MinimumOutputTokens) > *limit {
+			run.status, run.code = 400, "unsupported_parameter"
+			return skipped
+		}
 		mean = min(mean, *limit)
 	}
 	if audio, ok := prepared.Request.(*dto.AudioRequest); ok && len(audio.MaxNewTokens) > 0 {
@@ -509,6 +518,10 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		run.record.UsageSource = attempt.UsageSource
 	} else {
 		billable := *facts
+		if billable.AudioOutputSeconds != nil {
+			zero := "0"
+			billable.AudioOutputSeconds = &zero
+		}
 		if facts.ImageCount != nil {
 			zero := int64(0)
 			billable.ImageCount = &zero

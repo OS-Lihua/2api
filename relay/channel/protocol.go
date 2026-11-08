@@ -37,6 +37,12 @@ type AudioRequestProjector interface {
 	ProjectAudioRequest([]byte, dto.AudioRequest) (*dto.AudioRequest, error)
 }
 
+// AudioOutputBudgetProjector exposes an output estimate implied by native
+// controls. It is used for reservation and never represents measured usage.
+type AudioOutputBudgetProjector interface {
+	MinimumAudioOutputTokens([]byte) (int, error)
+}
+
 // ChatRequestPreparer resolves Provider-managed request data after reservation.
 // The selected wire DTO retains its own upload and request format.
 type ChatRequestPreparer interface {

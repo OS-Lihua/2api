@@ -486,6 +486,13 @@ func openaiImageJSONAsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 		}
 		emitted++
 	}
+	if info.ResponseFacts != nil && emitted == 0 {
+		if info.StreamStatus == nil {
+			info.StreamStatus = relaycommon.NewStreamStatus()
+		}
+		info.StreamStatus.MarkIncomplete("missing_image_completion")
+		return &usageResp.Usage, nil
+	}
 	if err := writeOpenaiImageStreamDone(c); err != nil {
 		if info != nil && info.ResponseFacts != nil {
 			info.ResponseFacts.DownstreamWriteFailed = true

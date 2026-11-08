@@ -52,7 +52,13 @@ func (p *ttsProtocol) DoResponse(c *gin.Context, response *http.Response, info *
 	if info.ResponseFacts != nil {
 		audio, err := io.ReadAll(response.Body)
 		if err != nil {
-			return nil, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
+			usage := openai.EstimateGeneratedSpeech(c, info, audio, false)
+			if info.StreamStatus == nil {
+				info.StreamStatus = relaycommon.NewStreamStatus()
+			}
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)
+			info.StreamStatus.MarkIncomplete("incomplete_audio_response")
+			return usage, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
 		}
 		return openai.WriteAudioResponse(c, info, response, audio), nil
 	}

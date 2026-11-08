@@ -22,12 +22,13 @@ import (
 // PreparedMediaRequest carries the validated wire and transient price probes.
 // Prepared is populated only after transport and account preparation.
 type PreparedMediaRequest struct {
-	Prepared    *PreparedChannelRequest
-	Request     dto.Request
-	Input       billingexpr.RequestInput
-	Body        []byte
-	ContentType string
-	nativeAudio bool
+	Prepared            *PreparedChannelRequest
+	Request             dto.Request
+	Input               billingexpr.RequestInput
+	Body                []byte
+	ContentType         string
+	nativeAudio         bool
+	MinimumOutputTokens int
 }
 
 // PrepareMediaRequest validates the final media wire and prepares its transport.
@@ -234,6 +235,12 @@ func (a *ChannelAdaptor) PrepareMediaWire(c *gin.Context, info *relaycommon.Rela
 			return nil, fmt.Errorf("speech input and voice are required")
 		}
 		result.Request = &effective
+	}
+	if projector, ok := converted.(channel.AudioOutputBudgetProjector); ok {
+		result.MinimumOutputTokens, err = projector.MinimumAudioOutputTokens(body)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if result.Request.IsStream(c.Request) != parsed.Request.IsStream(c.Request) {
 		return nil, fmt.Errorf("media stream mode override is not allowed")
