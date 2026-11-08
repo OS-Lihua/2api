@@ -2,7 +2,6 @@ package controller
 
 import (
 	"bytes"
-	"errors"
 	"io"
 	"net/http"
 	"sync"
@@ -13,7 +12,7 @@ import (
 
 // gatewayDeliveryWriter keeps pre-business framing private until the serving
 // Model is known. An abandoned Attempt cannot commit headers for its successor.
-// Content is held only in request memory and bounded before delivery.
+// Content is held only in request memory until the parser confirms delivery.
 type gatewayDeliveryWriter struct {
 	gin.ResponseWriter
 	mu        sync.Mutex
@@ -31,10 +30,6 @@ func (w *gatewayDeliveryWriter) Write(data []byte) (int, error) {
 	}
 	if w.committed {
 		return w.ResponseWriter.Write(data)
-	}
-	if w.pending.Len()+len(data) > 1<<20 {
-		w.err = errors.New("gateway response framing exceeds delivery buffer")
-		return 0, w.err
 	}
 	return w.pending.Write(data)
 }
