@@ -566,13 +566,10 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 					IsMultiKey: info.ChannelIsMultiKey, UsingKey: info.ApiKey, AutoBan: true}
 				const reason = "Provider rejected authentication or account quota"
 				targetScope := "key"
-				var changed bool
 				if failure.Class == "account_quota" {
 					targetScope = "provider"
-					changed = service.DisableProvider(providerError, reason, index)
-				} else {
-					changed = service.DisableChannel(providerError, reason, index)
 				}
+				changed := service.DisableGatewayProvider(providerError, reason, failure.Class == "account_quota", index)
 				actorRole := c.GetInt("role")
 				if actorRole == 0 {
 					if actor, err := model.GetUserCache(c.GetInt("id")); err == nil {
