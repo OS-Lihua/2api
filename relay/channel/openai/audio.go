@@ -260,20 +260,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			}
 			resp.Header.Set("Content-Type", contentType)
 		} else {
-			usageBody := body
-			if !ojson.ValidBytes(body) {
-				recovered := map[string]common.RawMessage{}
-				for _, name := range []string{"usage", "error", "type", "code"} {
-					if raw := ojson.GetBytes(body, name); raw.Exists() && ojson.Valid(raw.Raw) {
-						recovered[name] = common.RawMessage(raw.Raw)
-					}
-				}
-				if len(recovered) > 0 {
-					if encoded, err := common.Marshal(recovered); err == nil {
-						usageBody = encoded
-					}
-				}
-			}
+			usageBody := mediaResponseEnvelope(body)
 			usage = reportedMediaUsage(usageBody)
 			observeMediaUsage(info, usage, usageBody)
 			normalizeSpeechOutputUsage(info, usage)

@@ -5924,6 +5924,44 @@ func TestMediaGatewayTruncatedSpeechSafetyErrorDoesNotRetry(t *testing.T) {
 	}
 }
 
+func TestMediaGatewayImageSafetyErrorIgnoresBadSibling(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, short := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%t/short=%t", stream, short), func(t *testing.T) {
+				var secondCalls atomic.Int64
+				fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
+					body := `{"error":{"code":"content_filter","extra":1e400},"usage":{"input_tokens":0,"output_tokens":1000}}`
+					if short {
+						body = strings.TrimSuffix(body, "}") + `,"unfinished":`
+					}
+					w.Header().Set("Content-Type", "application/json")
+					if short {
+						w.Header().Set("Content-Length", strconv.Itoa(len(body)+1))
+					}
+					_, _ = io.WriteString(w, body)
+				})
+				fallback := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+					secondCalls.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"data":[{"url":"https://image.invalid/one"}]}`)
+				})
+				require.NoError(t, model.DB.Model(fallback).Update("protocol", protocol.OpenAIImages).Error)
+				fixture.fake.Advance(time.Second)
+				require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("tokens",p+c)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", fmt.Sprintf(`{"model":"gateway-alias","prompt":"draw","stream":%t}`, stream))
+				assert.GreaterOrEqual(t, response.Code, 400)
+				assert.Zero(t, secondCalls.Load())
+				attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, total)
+				assert.Equal(t, "content_safety", attempts[0].ErrorClass)
+				assert.EqualValues(t, 1000, attempts[0].Usage.CompletionTokens)
+				assert.EqualValues(t, 1_000_000, attempts[0].Cost.Nanos)
+			})
+		}
+	}
+}
+
 func TestMediaGatewaySpeechCapContinuesToCompatibleCandidate(t *testing.T) {
 	var officialCalls, compatibleCalls atomic.Int64
 	fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
@@ -6326,8 +6364,10 @@ func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.
 		short, zero       bool
 		output, audioZero bool
 		badFormat         string
+		inputAudioZero    bool
 	}{
 		{kind: protocol.OpenAIImages}, {kind: protocol.OpenAIAudioSpeech}, {kind: protocol.OpenAIAudioTranscription},
+		{kind: protocol.OpenAIAudioTranscription, inputAudioZero: true},
 		{kind: protocol.OpenAIAudioTranscription, duration: true, seconds: "60"},
 		{kind: protocol.OpenAIAudioTranscription, duration: true, seconds: "0"},
 		{kind: protocol.OpenAIAudioTranscription, duration: true, seconds: "1e200"},
@@ -6342,7 +6382,7 @@ func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.
 			if stream && kind == protocol.OpenAIAudioTranscription || tc.badFormat != "" && !stream {
 				continue
 			}
-			t.Run(fmt.Sprintf("%s/stream=%t/duration=%t/seconds=%s/short=%t/zero=%t/output=%t/audioZero=%t/format=%s", kind, stream, tc.duration, tc.seconds, tc.short, tc.zero, tc.output, tc.audioZero, tc.badFormat), func(t *testing.T) {
+			t.Run(fmt.Sprintf("%s/stream=%t/duration=%t/seconds=%s/short=%t/zero=%t/output=%t/audioZero=%t/format=%s/inputAudioZero=%t", kind, stream, tc.duration, tc.seconds, tc.short, tc.zero, tc.output, tc.audioZero, tc.badFormat, tc.inputAudioZero), func(t *testing.T) {
 				firstCalls, secondCalls := 0, 0
 				fixture := newMediaGatewayFixture(t, kind, func(w http.ResponseWriter, r *http.Request) {
 					firstCalls++
@@ -6353,6 +6393,9 @@ func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.
 							details = `,"output_tokens_details":{"audio_tokens":0}`
 						}
 						body = `{"error":{"type":"upstream_error","code":"rate_limit_exceeded","message":"provider-secret"},"usage":{"input_tokens":0,"output_tokens":1000` + details + `}}`
+					}
+					if tc.inputAudioZero {
+						body = `{"error":{"code":"rate_limit_exceeded"},"usage":{"input_token_details":{"audio_tokens":0}}}`
 					}
 					if tc.duration {
 						body = fmt.Sprintf(`{"error":{"code":"rate_limit_exceeded","message":"provider-secret"},"usage":{"type":"duration","seconds":%s}}`, tc.seconds)
@@ -6414,6 +6457,9 @@ func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.
 					expectedCost, expectedSale = 20_000_000, 36_000_000
 				}
 				firstPurchase := `tier("tokens",p)`
+				if tc.inputAudioZero {
+					firstPurchase = `tier("audio",ai)`
+				}
 				if tc.output {
 					firstPurchase = `tier("audio",ao)`
 				}
@@ -6457,6 +6503,10 @@ func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.
 				}
 				if tc.zero || tc.audioZero {
 					firstCost = 0
+				}
+				if tc.inputAudioZero {
+					firstCost = 0
+					assert.Zero(t, attempts[0].Usage.AudioInputTokens)
 				}
 				if tc.duration {
 					expectedSeconds := tc.seconds

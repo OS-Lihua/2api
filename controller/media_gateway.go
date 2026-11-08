@@ -435,7 +435,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	generated := facts.BusinessOutput || facts.GeneratedImageCount > 0 || facts.GeneratedAudioBytes > 0 || facts.GeneratedText != "" || facts.ImageCount != nil && *facts.ImageCount > 0
 	if !facts.PromptTokensReported && !facts.AudioInputDurationReported && (generated || facts.CompletionTokensReported || facts.AudioInputTokensReported || facts.TextInputTokensReported || facts.AudioOutputTokensReported || facts.AudioInputDurationInvalid) {
 		usage.PromptTokens = inputTokens
-		if run.parsed.Protocol == protocol.OpenAIAudioTranscription {
+		if run.parsed.Protocol == protocol.OpenAIAudioTranscription && !facts.AudioInputTokensReported {
 			usage.PromptTokensDetails.AudioTokens = inputTokens
 		}
 	}
@@ -450,7 +450,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		}
 	}
 	if !facts.CompletionTokensReported && facts.AudioOutputTokensReported {
-		usage.CompletionTokens = usage.CompletionTokenDetails.AudioTokens
+		usage.CompletionTokens = max(usage.CompletionTokens, usage.CompletionTokenDetails.AudioTokens)
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	attempt.Usage = service.GatewayRecordUsage(usage, facts)

@@ -93,6 +93,26 @@ func mergeMediaTokenDetails(usage *dto.Usage, body []byte) {
 	}
 }
 
+// mediaResponseEnvelope retains independently complete classification and usage
+// fields from a truncated response, without treating them as a valid payload.
+func mediaResponseEnvelope(body []byte) []byte {
+	if ojson.ValidBytes(body) {
+		return body
+	}
+	recovered := map[string]common.RawMessage{}
+	for _, name := range []string{"usage", "error", "type", "code"} {
+		if raw := ojson.GetBytes(body, name); raw.Exists() && ojson.Valid(raw.Raw) {
+			recovered[name] = common.RawMessage(raw.Raw)
+		}
+	}
+	if len(recovered) > 0 {
+		if encoded, err := common.Marshal(recovered); err == nil {
+			return encoded
+		}
+	}
+	return body
+}
+
 // observeMediaError keeps structured classification facts without copying a
 // Provider's message or other error details into downstream output or logs.
 func observeMediaError(info *relaycommon.RelayInfo, body []byte, status int) *types.OpenAIError {

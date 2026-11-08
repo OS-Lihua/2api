@@ -42,37 +42,46 @@ func WriteImageResponse(c *gin.Context, info *relaycommon.RelayInfo, response *h
 func OpenaiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
 
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
+	responseBody, readErr := io.ReadAll(resp.Body)
+	if readErr != nil && info.ResponseFacts == nil {
+		return nil, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
-
+	count := openaiImageResponseCount(responseBody)
+	if info.ResponseFacts != nil && count <= dto.MaxImageN {
+		info.ResponseFacts.ImageCount = &count
+	}
 	var usageResp dto.SimpleResponse
+	var err error
 	if info.ResponseFacts != nil {
+		factsBody := mediaResponseEnvelope(responseBody)
+		usageResp.Usage = *reportedMediaUsage(factsBody)
+		observeMediaUsage(info, &usageResp.Usage, factsBody)
+		if readErr != nil {
+			if info.StreamStatus == nil {
+				info.StreamStatus = relaycommon.NewStreamStatus()
+			}
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, readErr)
+			info.StreamStatus.MarkIncomplete("incomplete_image_response")
+		}
+		if fault := observeMediaError(info, factsBody, resp.StatusCode); fault != nil {
+			return &usageResp.Usage, types.WithOpenAIError(*fault, resp.StatusCode)
+		}
 		var envelope struct {
-			Error any `json:"error"`
+			Error json.RawMessage `json:"error"`
 		}
 		err = common.Unmarshal(responseBody, &envelope)
-		usageResp.Error = envelope.Error
-		usageResp.Usage = *reportedMediaUsage(responseBody)
 	} else {
 		err = common.Unmarshal(responseBody, &usageResp)
 	}
 	if err != nil {
+		if info.ResponseFacts != nil {
+			return &usageResp.Usage, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		}
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 
 	normalizeOpenAIUsage(&usageResp.Usage)
 	observeMediaUsage(info, &usageResp.Usage, responseBody)
-	count := openaiImageResponseCount(responseBody)
-	if info.ResponseFacts != nil && count <= dto.MaxImageN {
-		info.ResponseFacts.ImageCount = &count
-	}
-	if info.ResponseFacts != nil {
-		if fault := observeMediaError(info, responseBody, resp.StatusCode); fault != nil {
-			return &usageResp.Usage, types.WithOpenAIError(*fault, resp.StatusCode)
-		}
-	}
 	if oaiError := usageResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		if info.ResponseFacts != nil {
 			return &usageResp.Usage, types.WithOpenAIError(*oaiError, resp.StatusCode)
@@ -80,6 +89,9 @@ func OpenaiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
 
+	if readErr != nil {
+		return &usageResp.Usage, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
+	}
 	info.UpdateImageCount(count)
 	if info.ResponseFacts != nil {
 		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
@@ -373,41 +385,54 @@ func openaiImageJSONAsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 	defer service.CloseResponseBodyGracefully(resp)
 
 	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
+	readErr := err
+	if readErr != nil && info.ResponseFacts == nil {
+		return nil, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
 
+	count := openaiImageResponseCount(responseBody)
+	if info.ResponseFacts != nil && count <= dto.MaxImageN {
+		info.ResponseFacts.ImageCount = &count
+	}
 	// Only decode usage/error. Do not Unmarshal data[] into dto.ImageResponse —
 	// b64_json values are large and would be copied into Go strings then
 	// re-marshaled for each SSE event.
 	var usageResp dto.SimpleResponse
 	var decodeErr error
 	if info.ResponseFacts != nil {
+		factsBody := mediaResponseEnvelope(responseBody)
+		usageResp.Usage = *reportedMediaUsage(factsBody)
+		observeMediaUsage(info, &usageResp.Usage, factsBody)
+		if readErr != nil {
+			if info.StreamStatus == nil {
+				info.StreamStatus = relaycommon.NewStreamStatus()
+			}
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, readErr)
+			info.StreamStatus.MarkIncomplete("incomplete_image_response")
+		}
+		if fault := observeMediaError(info, factsBody, resp.StatusCode); fault != nil {
+			return &usageResp.Usage, types.WithOpenAIError(*fault, resp.StatusCode)
+		}
 		var envelope struct {
-			Error any `json:"error"`
+			Error json.RawMessage `json:"error"`
 		}
 		decodeErr = common.Unmarshal(responseBody, &envelope)
-		usageResp.Error = envelope.Error
-		usageResp.Usage = *reportedMediaUsage(responseBody)
 	} else {
 		decodeErr = common.Unmarshal(responseBody, &usageResp)
 	}
 	if decodeErr != nil {
+		if info.ResponseFacts != nil {
+			return &usageResp.Usage, types.NewOpenAIError(decodeErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		}
 		return nil, types.NewOpenAIError(decodeErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	normalizeOpenAIUsage(&usageResp.Usage)
 	observeMediaUsage(info, &usageResp.Usage, responseBody)
-	count := openaiImageResponseCount(responseBody)
-	if info.ResponseFacts != nil {
-		if count <= dto.MaxImageN {
-			info.ResponseFacts.ImageCount = &count
-		}
-		if fault := observeMediaError(info, responseBody, resp.StatusCode); fault != nil {
-			return &usageResp.Usage, types.WithOpenAIError(*fault, resp.StatusCode)
-		}
-	}
 	if oaiError := usageResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
+	}
+	if readErr != nil {
+		return &usageResp.Usage, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
 	applyUsagePostProcessing(info, &usageResp.Usage, responseBody)
 	info.UpdateImageCount(count)
