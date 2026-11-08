@@ -672,6 +672,8 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		run.fail(c, http.StatusBadGateway, "upstream_error", "Invalid upstream response")
 		return
 	}
+	// This header describes local conversion facts, including an empty loss set.
+	httpResponse.Header.Del("X-Gateway-Conversion-Loss")
 	upstreamStatus = httpResponse.StatusCode
 	if httpResponse.StatusCode != http.StatusOK {
 		// Parse only bounded structured codes; provider text and URLs never leave memory.

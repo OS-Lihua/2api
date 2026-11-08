@@ -3330,6 +3330,68 @@ func TestTextGatewayNativeGeminiInlineAudioAvoidsChatCodecRestrictions(t *testin
 	assert.Contains(t, response.Body.String(), "Hello")
 }
 
+func TestTextGatewayNativeGeminiToolResultMediaRetainsValidationFacts(t *testing.T) {
+	image, err := os.ReadFile("../controller/probe-fixtures/red.png")
+	require.NoError(t, err)
+	encoded := base64.StdEncoding.EncodeToString(image)
+	previous, previousNotStream := constant.GetMediaToken, constant.GetMediaTokenNotStream
+	constant.GetMediaToken, constant.GetMediaTokenNotStream = true, true
+	t.Cleanup(func() { constant.GetMediaToken, constant.GetMediaTokenNotStream = previous, previousNotStream })
+	for _, reference := range []bool{false, true} {
+		for _, test := range []struct {
+			name    string
+			image   bool
+			context int64
+			status  int
+		}{{"native", true, 100000, http.StatusOK}, {"missing capability", false, 100000, http.StatusBadRequest}, {"exceeds context", true, 128, http.StatusBadRequest}} {
+			t.Run(fmt.Sprintf("reference=%t/%s", reference, test.name), func(t *testing.T) {
+				reads, calls := 0, 0
+				asset := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { reads++; w.WriteHeader(http.StatusTeapot) }))
+				t.Cleanup(asset.Close)
+				media := fmt.Sprintf(`{"inlineData":{"mimeType":"image/png","data":%q}}`, encoded)
+				if reference {
+					media = fmt.Sprintf(`{"fileData":{"mimeType":"image/png","fileUri":%q}}`, asset.URL)
+				}
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					var sent dto.GeminiChatRequest
+					require.NoError(t, common.DecodeJson(r.Body, &sent))
+					require.Len(t, sent.Contents, 2)
+					require.NotNil(t, sent.Contents[1].Parts[0].FunctionResponse)
+					var parts []dto.GeminiPart
+					require.NoError(t, common.Unmarshal(sent.Contents[1].Parts[0].FunctionResponse.Parts, &parts))
+					require.Len(t, parts, 1)
+					if reference {
+						require.NotNil(t, parts[0].FileData)
+						assert.Equal(t, asset.URL, parts[0].FileData.FileUri)
+					} else {
+						require.NotNil(t, parts[0].InlineData)
+						assert.Equal(t, encoded, parts[0].InlineData.Data)
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}`))
+				})
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "gemini_generate").Error)
+				caps := capability.Set{Features: []capability.Feature{capability.ToolCalling}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{ContextLength: &test.context}}
+				if test.image {
+					caps.InputModalities = append(caps.InputModalities, capability.Image)
+				}
+				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+				body := fmt.Sprintf(`{"contents":[{"role":"model","parts":[{"functionCall":{"name":"inspect","args":{}}}]},{"role":"user","parts":[{"functionResponse":{"name":"inspect","response":{"ok":true},"parts":[%s]}}]}],"generationConfig":{"maxOutputTokens":16}}`, media)
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1beta/models/gateway-offering:generateContent", body)
+				assert.Equal(t, test.status, response.Code, response.Body.String())
+				assert.Zero(t, reads)
+				if test.status == http.StatusOK {
+					assert.Equal(t, 1, calls)
+					assert.Contains(t, response.Body.String(), "Hello")
+				} else {
+					assert.Zero(t, calls)
+				}
+			})
+		}
+	}
+}
+
 func TestTextGatewayNativeGeminiMediaReferencesRetainValidationFacts(t *testing.T) {
 	for _, media := range []struct {
 		name, mime string
@@ -3598,6 +3660,82 @@ func TestTextGatewayNativeChatReasoningAndRefusalAreBusinessOutput(t *testing.T)
 				assert.Equal(t, "success", record.Status)
 				assert.Equal(t, int64(36000), record.Receivable.Nanos)
 			})
+		}
+	}
+}
+
+func TestTextGatewayRefusalSurvivesProtocolConversion(t *testing.T) {
+	for _, source := range []struct{ protocol, body, events string }{
+		{"openai_chat", `{"choices":[{"message":{"role":"assistant","content":null,"refusal":"Cannot comply"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`, "data: {\"choices\":[{\"index\":0,\"delta\":{\"refusal\":\"Cannot comply\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n"},
+		{"openai_responses", `{"id":"resp","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"Cannot comply"}]}],"usage":{"input_tokens":10,"output_tokens":5}}`, "data: {\"type\":\"response.refusal.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Cannot comply\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"Cannot comply\"}]}],\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n"},
+	} {
+		for _, target := range []struct{ name, path, body string }{
+			{"chat", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stream":%t}`},
+			{"responses", "/v1/responses", `{"model":"gateway-offering","input":"Hello","max_output_tokens":16,"stream":%t}`},
+			{"messages", "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stream":%t}`},
+			{"gemini", "/v1beta/models/gateway-offering:generateContent", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16}}`},
+		} {
+			for _, stream := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/stream=%t", source.protocol, target.name, stream), func(t *testing.T) {
+					fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+						if stream {
+							w.Header().Set("Content-Type", "text/event-stream")
+							_, _ = w.Write([]byte(source.events))
+							return
+						}
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = w.Write([]byte(source.body))
+					})
+					require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", source.protocol).Error)
+					path, body := target.path, target.body
+					if target.name == "gemini" {
+						if stream {
+							path = "/v1beta/models/gateway-offering:streamGenerateContent?alt=sse"
+						}
+					} else {
+						body = fmt.Sprintf(body, stream)
+					}
+					response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, body)
+					require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+					assert.Contains(t, response.Body.String(), "Cannot comply")
+					if target.name == "chat" || target.name == "responses" {
+						assert.Contains(t, response.Body.String(), `"refusal":"Cannot comply"`)
+						if stream {
+							var refusal strings.Builder
+							for line := range strings.SplitSeq(response.Body.String(), "\n") {
+								data, found := strings.CutPrefix(line, "data: ")
+								if !found || data == "[DONE]" {
+									continue
+								}
+								if target.name == "chat" {
+									var event dto.ChatCompletionsStreamResponse
+									require.NoError(t, common.UnmarshalJsonStr(data, &event))
+									for _, choice := range event.Choices {
+										if choice.Delta.Refusal != nil {
+											refusal.WriteString(*choice.Delta.Refusal)
+										}
+									}
+								} else {
+									var event dto.ResponsesStreamResponse
+									require.NoError(t, common.UnmarshalJsonStr(data, &event))
+									if event.Type == "response.refusal.delta" {
+										refusal.WriteString(event.Delta)
+									}
+								}
+							}
+							assert.Equal(t, "Cannot comply", refusal.String())
+						}
+					}
+					record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+					require.NoError(t, err)
+					assert.Equal(t, "success", record.Status)
+					assert.Equal(t, int64(36000), record.Receivable.Nanos)
+					attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+					require.NoError(t, err)
+					require.EqualValues(t, 1, total)
+					assert.Equal(t, int64(20000), attempts[0].Cost.Nanos)
+				})
+			}
 		}
 	}
 }
@@ -4017,6 +4155,44 @@ func TestTextGatewayFailoverPublishesActualConversionLossHeader(t *testing.T) {
 	}
 }
 
+func TestTextGatewayProviderCannotOverrideConversionLossHeader(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, loss := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%t/loss=%t", stream, loss), func(t *testing.T) {
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("X-Gateway-Conversion-Loss", "other")
+					if stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = w.Write([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n"))
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+				})
+				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", capability.Set{Features: []capability.Feature{capability.Streaming, capability.Caching}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}).Error)
+				content, expected := `"Hello"`, ""
+				if loss {
+					content, expected = `[{"type":"text","text":"Hello","cache_control":{"type":"ephemeral"}}]`, "cache_control_dropped"
+					fixture.offering.AcceptedConversionLosses = []string{expected}
+					require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+				}
+				body := fmt.Sprintf(`{"model":"gateway-offering","stream":%t,"messages":[{"role":"user","content":%s}],"max_tokens":16}`, stream, content)
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/messages", body)
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				assert.Equal(t, expected, response.Result().Header.Get("X-Gateway-Conversion-Loss"))
+				attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, total)
+				if loss {
+					assert.Equal(t, []string{expected}, attempts[0].ConversionLosses)
+				} else {
+					assert.Empty(t, attempts[0].ConversionLosses)
+				}
+			})
+		}
+	}
+}
+
 func TestTextGatewayStreamConversionFacts(t *testing.T) {
 	for _, downstream := range []struct{ name, path, body, frame string }{
 		{"chat", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stream":true}`, `"choices"`},
@@ -4060,6 +4236,8 @@ func TestTextGatewayStrictConversionLosses(t *testing.T) {
 		name, path, body, upstream, code, parameter string
 		hard                                        bool
 	}{
+		{"stop string", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stop":"END"}`, "openai_responses", "request_parameter_dropped", "stop", false},
+		{"stop list", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stop":["END"]}`, "openai_responses", "request_parameter_dropped", "stop", false},
 		{"sampling controls", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"seed":123,"frequency_penalty":1,"logit_bias":{"42":-100}}`, "anthropic_messages", "request_parameter_dropped", "seed", false},
 		{"Gemini safety settings", "/v1beta/models/gateway-offering:generateContent", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16},"safetySettings":[{"category":"HARM_CATEGORY_HATE_SPEECH","threshold":"BLOCK_LOW_AND_ABOVE"}]}`, "openai_chat", "safety_settings_dropped", "safetySettings", false},
 		{"multiple choices", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"n":2}`, "anthropic_messages", "candidate_count_dropped", "n", false},

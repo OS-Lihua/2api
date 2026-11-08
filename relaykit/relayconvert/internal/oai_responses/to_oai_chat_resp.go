@@ -104,6 +104,20 @@ func ResponsesResponseToChatCompletionsResponse(resp *dto.OpenAIResponsesRespons
 		Role:    "assistant",
 		Content: text,
 	}
+	var refusal strings.Builder
+	for _, output := range resp.Output {
+		if output.Type != responsesOutputTypeMessage || output.Role != "" && output.Role != "assistant" {
+			continue
+		}
+		for _, content := range output.Content {
+			if content.Type == "refusal" && content.Refusal != nil {
+				refusal.WriteString(*content.Refusal)
+			}
+		}
+	}
+	if refusal.Len() > 0 {
+		msg.Refusal = kitutil.GetPointer(refusal.String())
+	}
 	if annotations, err := responsesAnnotationsToChat(resp); err != nil {
 		return nil, nil, err
 	} else if len(annotations) > 0 {

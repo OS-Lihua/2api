@@ -156,7 +156,6 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	}
 	if p.format == types.RelayFormatOpenAI && info.RelayFormat == types.RelayFormatOpenAI {
 		for _, choice := range gjson.GetBytes(body, "choices").Array() {
-			generated.WriteString(choice.Get("message.refusal").String())
 			generated.WriteString(choice.Get("message.audio.transcript").String())
 		}
 	}

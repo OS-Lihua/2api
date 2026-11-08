@@ -36,6 +36,7 @@ func InspectRequestParameters(ctx context.Context, source, target any, from, to 
 			{"temperature", "temperature", "temperature", "generationConfig.temperature"},
 			{"top_p", "top_p", "top_p", "generationConfig.topP"},
 			{"top_k", "", "top_k", "generationConfig.topK"},
+			{"stop", "", "stop_sequences", "generationConfig.stopSequences"},
 			{"seed", "", "", "generationConfig.seed"},
 			{"presence_penalty", "presence_penalty", "", "generationConfig.presencePenalty"},
 			{"frequency_penalty", "frequency_penalty", "", "generationConfig.frequencyPenalty"},
@@ -56,7 +57,22 @@ func InspectRequestParameters(ctx context.Context, source, target any, from, to 
 				continue
 			}
 			value := requestParameterAt(before, path)
-			if value != nil && !reflect.DeepEqual(value, requestParameterAt(after, paths[toIndex])) {
+			afterValue := requestParameterAt(after, paths[toIndex])
+			if paths[0] == "stop" {
+				if text, ok := value.(string); ok {
+					value = []any{text}
+				}
+				if text, ok := afterValue.(string); ok {
+					afterValue = []any{text}
+				}
+				beforeStops, _ := value.([]any)
+				afterStops, _ := afterValue.([]any)
+				if from == types.RelayFormatGemini && to == types.RelayFormatOpenAI && len(afterStops) > 0 && len(afterStops) < len(beforeStops) && reflect.DeepEqual(beforeStops[:len(afterStops)], afterStops) {
+					// The converter already reports stop_sequences_truncated.
+					continue
+				}
+			}
+			if value != nil && !reflect.DeepEqual(value, afterValue) {
 				Add(ctx, types.ConversionDiagnostic{Code: "request_parameter_dropped", Path: path, Message: "The target request did not retain this request parameter", Severity: types.ConversionDiagnosticWarning, From: from, To: to})
 			}
 		}

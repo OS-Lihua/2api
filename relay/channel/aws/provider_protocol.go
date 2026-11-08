@@ -109,6 +109,7 @@ func (p *novaProtocol) DoResponse(c *gin.Context, resp *http.Response, info *rel
 			return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 		}
 		resp.Body = io.NopCloser(bytes.NewReader(append(append([]byte("data: "), encoded...), []byte("\n\ndata: [DONE]\n\n")...)))
+		resp.Header.Set("Content-Type", "text/event-stream")
 		return p.public.DoResponse(c, resp, info)
 	}
 	wire := struct {

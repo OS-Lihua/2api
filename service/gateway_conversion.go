@@ -55,6 +55,7 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 		return nil, err
 	}
 	projectionMedia := map[string]dto.MediaContent{}
+	var referencedMedia []dto.MediaContent
 	references := map[string]bool{}
 	if gemini, ok := request.(*dto.GeminiChatRequest); ok {
 		if c, ok := ctx.(*gin.Context); ok {
@@ -64,39 +65,74 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 				}
 			}
 		}
+		type mediaPart struct {
+			dto.GeminiPart
+			path   string
+			nested bool
+		}
+		var parts []mediaPart
 		for i, content := range gemini.Contents {
 			for j, part := range content.Parts {
-				if part.InlineData != nil && part.InlineData.Data != "" {
-					mime := strings.ToLower(part.InlineData.MimeType)
-					path := fmt.Sprintf("contents[%d].parts[%d].inlineData", i, j)
-					switch {
-					case strings.HasPrefix(mime, "audio/"):
-						projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeInputAudio, InputAudio: &dto.MessageInputAudio{Data: part.InlineData.Data, Format: strings.TrimPrefix(mime, "audio/")}}
-					case strings.HasPrefix(mime, "image/"):
-						projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: "data:" + mime + ";base64," + part.InlineData.Data, Detail: "auto", MimeType: mime}}
+				path := fmt.Sprintf("contents[%d].parts[%d]", i, j)
+				parts = append(parts, mediaPart{GeminiPart: part, path: path})
+				if part.FunctionResponse != nil && len(part.FunctionResponse.Parts) > 0 {
+					var nested []dto.GeminiPart
+					if err := common.Unmarshal(part.FunctionResponse.Parts, &nested); err != nil {
+						return nil, fmt.Errorf("invalid Gemini function response parts: %w", err)
+					}
+					for k, child := range nested {
+						parts = append(parts, mediaPart{GeminiPart: child, path: fmt.Sprintf("%s.functionResponse.parts[%d]", path, k), nested: true})
 					}
 				}
-				if part.FileData == nil || part.FileData.FileUri == "" {
-					continue
+			}
+		}
+		for _, part := range parts {
+			path := part.path + ".inlineData"
+			if part.InlineData != nil && part.InlineData.Data != "" {
+				mime := strings.ToLower(part.InlineData.MimeType)
+				switch {
+				case strings.HasPrefix(mime, "audio/"):
+					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeInputAudio, InputAudio: &dto.MessageInputAudio{Data: part.InlineData.Data, Format: strings.TrimPrefix(mime, "audio/")}}
+				case strings.HasPrefix(mime, "image/"):
+					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: "data:" + mime + ";base64," + part.InlineData.Data, Detail: "auto", MimeType: mime}}
+				case strings.HasPrefix(mime, "video/"):
+					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeVideoUrl, VideoUrl: &dto.MessageVideoUrl{Url: "data:" + mime + ";base64," + part.InlineData.Data}}
+				case mime == "application/pdf":
+					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeFile, File: &dto.MessageFile{FileName: "document.pdf", FileData: "data:application/pdf;base64," + part.InlineData.Data}}
 				}
+			}
+			if part.FileData != nil && part.FileData.FileUri != "" {
 				references[part.FileData.FileUri] = true
 				mime := strings.ToLower(part.FileData.MimeType)
-				path := fmt.Sprintf("contents[%d].parts[%d].fileData", i, j)
+				path = part.path + ".fileData"
 				switch {
 				case strings.HasPrefix(mime, "image/"):
 					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: part.FileData.FileUri, Detail: "auto", MimeType: mime}}
 				case strings.HasPrefix(mime, "audio/"):
 					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeInputAudio, InputAudio: &dto.MessageInputAudio{Data: part.FileData.FileUri, Format: strings.TrimPrefix(mime, "audio/")}}
+				case strings.HasPrefix(mime, "video/"):
+					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeVideoUrl, VideoUrl: &dto.MessageVideoUrl{Url: part.FileData.FileUri}}
 				case mime == "application/pdf":
 					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeFile, File: &dto.MessageFile{FileName: "reference.pdf", FileData: part.FileData.FileUri}}
 				}
+			}
+			if part.nested {
+				media, represented := projectionMedia[path]
+				if !represented {
+					return nil, fmt.Errorf("tool result media cannot be represented for validation")
+				}
+				if media.Type == dto.ContentTypeImageURL && part.InlineData != nil && !slices.Contains([]string{"image/png", "image/jpeg", "image/webp", "image/gif"}, strings.ToLower(part.InlineData.MimeType)) {
+					if source := media.ToFileSource(); source != nil {
+						references[source.GetRawData()] = true
+					}
+				}
+				referencedMedia = append(referencedMedia, media)
 			}
 		}
 		if c, ok := ctx.(*gin.Context); ok {
 			c.Set(gatewayNativeMediaReferencesKey, references)
 		}
 	}
-	var referencedMedia []dto.MediaContent
 	for _, diagnostic := range result.Diagnostics {
 		if (diagnostic.Code == "unsupported_media_type" || diagnostic.Code == "unsupported_media_source") && diagnostic.Severity == types.ConversionDiagnosticError {
 			if media, represented := projectionMedia[diagnostic.Path]; represented {

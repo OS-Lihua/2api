@@ -120,6 +120,15 @@ func GeminiGenerateContentRequestToOpenAIChat(ctx context.Context, geminiRequest
 				}
 				toolCalls = append(toolCalls, toolCall)
 			} else if part.FunctionResponse != nil {
+				var parts []dto.GeminiPart
+				if len(part.FunctionResponse.Parts) > 0 {
+					if err := kitutil.Unmarshal(part.FunctionResponse.Parts, &parts); err != nil {
+						return nil, fmt.Errorf("invalid Gemini function response parts: %w", err)
+					}
+				}
+				if len(parts) > 0 {
+					convdiag.Add(ctx, types.ConversionDiagnostic{Code: "tool_result_media_dropped", Path: fmt.Sprintf("contents[%d].parts[%d].functionResponse.parts", contentIndex, partIndex), Message: "The target request omitted the tool result media", Severity: types.ConversionDiagnosticWarning})
+				}
 				toolMessage := dto.Message{
 					Role:       "tool",
 					ToolCallId: callHistory.match(part.FunctionResponse),

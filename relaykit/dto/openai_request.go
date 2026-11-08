@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -225,7 +226,7 @@ func (r *GeneralOpenAIRequest) GetTokenCountMeta() *types.TokenCountMeta {
 				dynamicTools = append(dynamicTools, messageTools...)
 			}
 		}
-		if message.Content != nil {
+		if message.Content != nil || message.Refusal != nil {
 			if message.Name != nil {
 				tokenCountMeta.NameCount++
 				texts = append(texts, *message.Name)
@@ -498,6 +499,7 @@ type Message struct {
 	Prefix           *bool           `json:"prefix,omitempty"`
 	ReasoningContent *string         `json:"reasoning_content,omitempty"`
 	Reasoning        *string         `json:"reasoning,omitempty"`
+	Refusal          *string         `json:"refusal,omitempty"`
 	ToolCalls        json.RawMessage `json:"tool_calls,omitempty"`
 	ToolCallId       string          `json:"tool_call_id,omitempty"`
 	// Tools carries Kimi K3 dynamic tool loading declarations on a system message.
@@ -694,6 +696,11 @@ func (m *Message) SetToolCalls(toolCalls any) {
 }
 
 func (m *Message) StringContent() string {
+	if m.Refusal != nil && *m.Refusal != "" {
+		copy := *m
+		copy.Refusal = nil
+		return copy.StringContent() + *m.Refusal
+	}
 	switch m.Content.(type) {
 	case string:
 		return m.Content.(string)
@@ -740,6 +747,11 @@ func (m *Message) IsStringContent() bool {
 }
 
 func (m *Message) ParseContent() []MediaContent {
+	if m.Refusal != nil && *m.Refusal != "" {
+		copy := *m
+		copy.Refusal = nil
+		return append(slices.Clone(copy.ParseContent()), MediaContent{Type: ContentTypeText, Text: *m.Refusal})
+	}
 	if m.Content == nil {
 		return nil
 	}
