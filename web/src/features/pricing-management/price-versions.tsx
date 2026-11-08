@@ -146,7 +146,7 @@ export function PriceVersions() {
     totalCount: query.data?.total ?? 0,
   })
   return (
-    <SectionPageLayout fixedContent>
+    <SectionPageLayout fixedContent={!showMargins}>
       <SectionPageLayout.Title>{t('Price versions')}</SectionPageLayout.Title>
       <SectionPageLayout.Actions>
         <Button
@@ -168,6 +168,7 @@ export function PriceVersions() {
           <section
             className='mb-4 space-y-3'
             aria-label={t('Estimated channel margins')}
+            tabIndex={0}
           >
             <p className='text-muted-foreground text-sm'>
               {t(
@@ -225,6 +226,7 @@ export function PriceVersions() {
           />
         )}
         <DataTablePage
+          fixedHeight={!showMargins}
           table={table}
           columns={columns}
           isLoading={query.isLoading}

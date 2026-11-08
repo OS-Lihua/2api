@@ -3235,6 +3235,7 @@
     "Historical capitalization": "Historical capitalization",
     "Historical tokens": "Historical tokens",
     "Historical Usage": "Historical Usage",
+    "Historical usage lacks complete token details": "Historical usage lacks complete token details",
     "History of MjProxy-style image tasks.": "History of MjProxy-style image tasks.",
     "Hit criteria: If cached tokens exist in usage, it counts as a hit.": "Hit criteria: If cached tokens exist in usage, it counts as a hit.",
     "Hit Rate": "Hit Rate",

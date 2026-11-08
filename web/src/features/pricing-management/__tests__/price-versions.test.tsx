@@ -126,6 +126,51 @@ function mockPrices(forbiddenPath?: string) {
   })
 }
 
+it('keeps all thirty margin combinations and price history reachable through the page scroll region', async () => {
+  const amount = { nanos: '1', currency: 'USD' }
+  vi.spyOn(api, 'get').mockImplementation(async (url) => {
+    if (url === '/api/admin/v1/price-versions/margins') {
+      return {
+        data: {
+          success: true,
+          data: {
+            estimates: Array.from({ length: 30 }, (_, index) => ({
+              model_offering_id: 9,
+              channel_id: 100 + index,
+              provider_id: 41,
+              samples: 2,
+              revenue: amount,
+              cost: amount,
+              margin: amount,
+              negative: index === 29,
+              status: 'estimated',
+            })),
+          },
+        },
+      }
+    }
+    return { data: { success: true, data: { items: [version], total: 1 } } }
+  })
+  renderPage()
+  const toggle = screen.getByRole('button', {
+    name: 'Estimated channel margins',
+  })
+  await userEvent.click(toggle)
+  expect(toggle).toHaveAttribute('aria-expanded', 'true')
+  const region = screen.getByRole('region', {
+    name: 'Estimated channel margins',
+  })
+  const table = await within(region).findByRole('table')
+  expect(within(table).getAllByRole('row')).toHaveLength(31)
+  expect(within(table).getByText('#129')).toBeVisible()
+  region.focus()
+  expect(region).toHaveFocus()
+  const filter = screen.getByRole('button', { name: 'Apply owner filter' })
+  filter.focus()
+  expect(filter).toHaveFocus()
+  expect(screen.getByText(version.expression)).toBeVisible()
+})
+
 it('requires an explicit loss confirmation and resubmits the exact rejected draft and server revision', async () => {
   mockPrices()
   const report = {

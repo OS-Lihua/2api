@@ -307,6 +307,19 @@ func marginFX(ctx context.Context, tx *gorm.DB, from money.Currency, proposal *F
 	return &rate, err
 }
 
+// marginLegacyUsage reconstructs only basic text quantities. Older record
+// projections omit cache semantics, TTL and overlapping modality details; those
+// facts cannot be recovered by treating their missing fields as explicit zero.
+func marginLegacyUsage(usage GatewayUsage) *dto.Usage {
+	if usage.CachedTokens != 0 || usage.CacheCreationTokens != 0 || usage.CacheCreation12hTokens != 0 || usage.ImageInputTokens != 0 || usage.AudioInputTokens != 0 || usage.ImageOutputTokens != 0 || usage.AudioOutputTokens != 0 {
+		return nil
+	}
+	if usage.PromptTokens < 0 || usage.CompletionTokens < 0 || usage.PromptTokens > 1<<31-1 || usage.CompletionTokens > 1<<31-1 || usage.TotalTokens != usage.PromptTokens+usage.CompletionTokens {
+		return nil
+	}
+	return &dto.Usage{PromptTokens: int(usage.PromptTokens), CompletionTokens: int(usage.CompletionTokens), TotalTokens: int(usage.TotalTokens)}
+}
+
 // meanPriceValue normalizes each quantitative snapshot before taking an exact
 // rational mean. The expression then selects its tier using that mean.
 func meanPriceValue(ctx context.Context, tx *gorm.DB, price *PriceVersion, offeringID int, at time.Time) (money.Value, int, string, error) {
@@ -320,6 +333,10 @@ func meanPriceValue(ctx context.Context, tx *gorm.DB, price *PriceVersion, offer
 		}
 	}
 	quantities := map[string]*big.Rat{}
+	needsUsage := false
+	for _, key := range []string{"p", "c", "len", "cr", "cc", "cc1h", "cc12h", "img", "img_cr", "img_o", "ai", "ao"} {
+		needsUsage = needsUsage || used[key]
+	}
 	samples := 0
 	// Installations and isolated admin fixtures can configure prices before the
 	// first gateway lifecycle is created. Such token estimates remain unknown.
@@ -330,15 +347,30 @@ func meanPriceValue(ctx context.Context, tx *gorm.DB, price *PriceVersion, offer
 		if err != nil {
 			return money.Value{}, 0, "", err
 		}
-		var usages, channelUsages []*dto.Usage
+		// All Channel prices use the same Offering workload. Procurement keeps
+		// its source quantities; it must not inherit the delivered sale usage.
+		type usageSample struct {
+			usage   *dto.Usage
+			choices int64
+			weight  *big.Rat
+		}
+		var usages []usageSample
 		for _, record := range records {
 			var intent GatewaySettlement
 			if err := common.UnmarshalJsonStr(record.Settlement, &intent); err != nil {
 				return money.Value{}, 0, "", err
 			}
+			choices := int64(max(intent.Request.ChoiceCount, 1))
 			if price.OwnerType == PriceOwnerOffering {
-				if intent.SaleUsage != nil {
-					usages = append(usages, intent.SaleUsage)
+				usage := intent.SaleUsage
+				if usage == nil {
+					usage = marginLegacyUsage(intent.Request.Usage)
+				}
+				if usage == nil && needsUsage {
+					return money.Value{}, len(records), "usage_details_unavailable", nil
+				}
+				if usage != nil {
+					usages = append(usages, usageSample{usage, choices, big.NewRat(1, 1)})
 				}
 				continue
 			}
@@ -346,22 +378,27 @@ func meanPriceValue(ctx context.Context, tx *gorm.DB, price *PriceVersion, offer
 			if intent.Attempt != nil {
 				attempts = []GatewayAttempt{*intent.Attempt}
 			}
+			if len(attempts) == 0 && needsUsage {
+				return money.Value{}, len(records), "usage_details_unavailable", nil
+			}
 			for _, attempt := range attempts {
 				usage := intent.AttemptUsage[attempt.ID]
 				if usage == nil {
+					usage = marginLegacyUsage(attempt.Usage)
+				}
+				if usage == nil {
+					if needsUsage {
+						return money.Value{}, len(records), "usage_details_unavailable", nil
+					}
 					continue
 				}
-				usages = append(usages, usage)
-				if attempt.ChannelID == price.OwnerID {
-					channelUsages = append(channelUsages, usage)
-				}
+				// Weight each request once even if it needed several Attempts.
+				usages = append(usages, usageSample{usage, choices, big.NewRat(1, int64(len(attempts)))})
 			}
 		}
-		if len(channelUsages) > 0 {
-			usages = channelUsages
-		}
-		for _, usage := range usages {
-			normalized, err := billingexpr.MoneyTokenQuantities(usage, used)
+		weight := new(big.Rat)
+		for _, sample := range usages {
+			normalized, err := billingexpr.MoneyTokenQuantities(sample.usage, used)
 			if err != nil {
 				return money.Value{}, 0, "", err
 			}
@@ -369,9 +406,19 @@ func meanPriceValue(ctx context.Context, tx *gorm.DB, price *PriceVersion, offer
 				if quantities[key] == nil {
 					quantities[key] = new(big.Rat)
 				}
-				quantities[key].Add(quantities[key], value.Rat())
+				quantity := new(big.Rat).Mul(value.Rat(), sample.weight)
+				if key == "c" || key == "img_o" || key == "ao" {
+					quantity.Quo(quantity, big.NewRat(sample.choices, 1))
+				}
+				quantities[key].Add(quantities[key], quantity)
 			}
-			samples++
+			weight.Add(weight, sample.weight)
+		}
+		if weight.Sign() > 0 {
+			for _, value := range quantities {
+				value.Quo(value, weight)
+			}
+			samples = len(records)
 		}
 	}
 	if samples == 0 {
@@ -380,10 +427,6 @@ func meanPriceValue(ctx context.Context, tx *gorm.DB, price *PriceVersion, offer
 			case "p", "c", "len", "cr", "cc", "cc1h", "cc12h", "img", "img_cr", "img_o", "ai", "ao":
 				return money.Value{}, 0, "no_usage_history", nil
 			}
-		}
-	} else {
-		for _, value := range quantities {
-			value.Quo(value, big.NewRat(int64(samples), 1))
 		}
 	}
 	value, _, err := billingexpr.RunMoneyExpr(price.Expression, billingexpr.MoneyInput{RationalTokenQuantities: quantities, Time: at}, price.Currency)

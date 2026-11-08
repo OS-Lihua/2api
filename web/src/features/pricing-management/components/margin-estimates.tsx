@@ -109,6 +109,9 @@ export function MarginEstimates(props: { estimates: MarginEstimate[] }) {
                 return t('Missing purchase price')
               }
               if (row.status === 'missing_fx') return t('Missing exchange rate')
+              if (row.status === 'usage_details_unavailable') {
+                return t('Historical usage lacks complete token details')
+              }
               if (row.status === 'no_usage_history') {
                 return t('No usage in the last seven days')
               }

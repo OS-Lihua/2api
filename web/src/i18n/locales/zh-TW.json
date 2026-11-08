@@ -3235,6 +3235,7 @@
     "Historical capitalization": "歷史大小寫",
     "Historical tokens": "歷史權杖",
     "Historical Usage": "歷史使用情況",
+    "Historical usage lacks complete token details": "歷史用量缺少完整的 token 明細",
     "History of MjProxy-style image tasks.": "MjProxy 風格圖像任務歷史。",
     "Hit criteria: If cached tokens exist in usage, it counts as a hit.": "命中判定：usage 中存在 cached tokens 即視為命中。",
     "Hit Rate": "命中率",

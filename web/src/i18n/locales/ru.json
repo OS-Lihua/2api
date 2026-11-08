@@ -3235,6 +3235,7 @@
     "Historical capitalization": "Исторический регистр",
     "Historical tokens": "Предыдущие токены",
     "Historical Usage": "История использования",
+    "Historical usage lacks complete token details": "В истории нет полных данных о токенах",
     "History of MjProxy-style image tasks.": "История задач генерации изображений в стиле MjProxy.",
     "Hit criteria: If cached tokens exist in usage, it counts as a hit.": "Критерий попадания: если в usage есть кэшированные токены, это считается попаданием.",
     "Hit Rate": "Частота попаданий",

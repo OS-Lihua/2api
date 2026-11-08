@@ -224,6 +224,154 @@ func TestMarginMixedCurrencyHTTP(t *testing.T) {
 	assert.Contains(t, response.Body.String(), "Cannot combine amounts in different currencies")
 }
 
+func TestMarginCacheAndChoiceWorkloadHTTP(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(http.ResponseWriter, *http.Request) {})
+	common.OptionMapRWMutex.Lock()
+	common.OptionMap["GroupRatio"] = `{"default":1}`
+	common.OptionMapRWMutex.Unlock()
+	expression := "p + cr * 2 + cc * 3 + cc1h * 4 + c * 5"
+	for _, price := range []*model.PriceVersion{
+		{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: expression, EffectiveAt: clock.Now().Unix()},
+		{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: expression, EffectiveAt: clock.Now().Unix()},
+	} {
+		require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+	}
+	for index, tc := range []struct{ choices, prompt, read, short, long, delivered, generated int }{
+		{2, 10, 20, 30, 40, 200, 400},
+		{1, 30, 40, 50, 60, 50, 100},
+	} {
+		zero := money.Amount{Currency: "USD"}
+		request := model.GatewayRequest{ID: fmt.Sprintf("cache-choice-%d", index), UserID: fixture.user.Id, ModelOfferingID: fixture.offering.ID, ChoiceCount: tc.choices, StartedAt: clock.Now().UnixMilli(), Status: "partial", SaleCurrency: "USD", SaleFXRate: "1", Receivable: zero}
+		require.NoError(t, model.ReserveGateway(&request, zero, zero))
+		saleUsage := &dto.Usage{UsageSemantic: "anthropic", PromptTokens: tc.prompt, CompletionTokens: tc.delivered, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: tc.read}, ClaudeCacheCreation5mTokens: tc.short, ClaudeCacheCreation1hTokens: tc.long}
+		sourceUsage := *saleUsage
+		sourceUsage.CompletionTokens = tc.generated
+		attempt := model.GatewayAttempt{ID: request.ID + "-attempt", RequestID: request.ID, ChannelID: fixture.channel.ID, ProviderID: fixture.channel.ProviderID, Status: "failed", Cost: zero, ConvertedCost: zero, AccountingFXRate: "1"}
+		require.NoError(t, model.PrepareGatewaySettlement(model.GatewaySettlement{Request: request, Attempts: []model.GatewayAttempt{attempt}, SaleSource: zero, SaleUsage: saleUsage, AttemptUsage: map[string]*dto.Usage{attempt.ID: &sourceUsage}}))
+		_, err := model.SettleGateway(request.ID)
+		require.NoError(t, err)
+	}
+	manager := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "pricing:read")
+	response := adminSecurityRequest(fixture.engine, manager, http.MethodGet, "/api/admin/v1/price-versions/margins", "")
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var reply struct {
+		Data model.PriceMarginReport `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &reply))
+	require.Len(t, reply.Data.Estimates, 1)
+	estimate := reply.Data.Estimates[0]
+	require.NotNil(t, estimate.Revenue)
+	require.NotNil(t, estimate.Cost)
+	assert.EqualValues(t, 775000, estimate.Revenue.Nanos)
+	assert.EqualValues(t, 1150000, estimate.Cost.Nanos)
+	assert.True(t, estimate.Negative)
+}
+
+func TestMarginLegacyUsageHTTP(t *testing.T) {
+	for _, cached := range []int64{0, 100} {
+		t.Run(fmt.Sprintf("cached_%d", cached), func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(http.ResponseWriter, *http.Request) {})
+			common.OptionMapRWMutex.Lock()
+			common.OptionMap["GroupRatio"] = `{"default":1}`
+			common.OptionMapRWMutex.Unlock()
+			sale := &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("sale",fixed(1))`, EffectiveAt: clock.Now().Unix()}
+			require.NoError(t, model.CreatePriceVersion(t.Context(), sale, fixture.sale.CreatedBy))
+			purchase := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: "p * 2", EffectiveAt: clock.Now().Unix()}
+			require.NoError(t, model.CreatePriceVersion(t.Context(), purchase, fixture.sale.CreatedBy))
+			zero := money.Amount{Currency: "USD"}
+			usage := model.GatewayUsage{PromptTokens: 1000000, TotalTokens: 1000000, CachedTokens: cached}
+			request := model.GatewayRequest{ID: "legacy-normal-success", UserID: fixture.user.Id, ModelOfferingID: fixture.offering.ID, ChoiceCount: 1, StartedAt: clock.Now().Add(-time.Hour).UnixMilli(), Status: "success", Usage: usage, SaleCurrency: "USD", SaleFXRate: "1", Receivable: money.Amount{Nanos: 1000000000, Currency: "USD"}}
+			require.NoError(t, model.ReserveGateway(&request, zero, zero))
+			attempt := model.GatewayAttempt{ID: "legacy-normal-attempt", RequestID: request.ID, ChannelID: fixture.channel.ID, ProviderID: fixture.channel.ProviderID, Status: "success", Usage: usage, Cost: money.Amount{Nanos: 2000000000, Currency: "USD"}, ConvertedCost: money.Amount{Nanos: 2000000000, Currency: "USD"}, AccountingFXRate: "1"}
+			// This is the pre-#51 immutable intent shape: normal successes did
+			// not include SaleUsage or AttemptUsage DTO snapshots.
+			require.NoError(t, model.PrepareGatewaySettlement(model.GatewaySettlement{Request: request, Attempts: []model.GatewayAttempt{attempt}, SaleSource: request.Receivable}))
+			_, err := model.SettleGateway(request.ID)
+			require.NoError(t, err)
+			fixture.fake.Advance(time.Second)
+			manager := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "pricing:read", "pricing:write")
+			draft := fmt.Sprintf(`{"owner_type":"channel","owner_id":%d,"currency":"USD","expression":"p * 2"}`, fixture.channel.ID)
+			response := adminSecurityRequest(fixture.engine, manager, http.MethodPost, "/api/admin/v1/price-versions", draft)
+			if cached > 0 {
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				var reply struct {
+					MarginCheck model.PriceMarginReport `json:"margin_check"`
+				}
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &reply))
+				require.Len(t, reply.MarginCheck.Estimates, 1)
+				assert.Equal(t, "usage_details_unavailable", reply.MarginCheck.Estimates[0].Status)
+				assert.Nil(t, reply.MarginCheck.Estimates[0].Cost)
+				return
+			}
+			require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
+			var reply struct {
+				Data model.PriceMarginReport `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &reply))
+			require.Len(t, reply.Data.Estimates, 1)
+			estimate := reply.Data.Estimates[0]
+			require.NotNil(t, estimate.Revenue)
+			require.NotNil(t, estimate.Cost)
+			assert.EqualValues(t, 1000000000, estimate.Revenue.Nanos)
+			assert.EqualValues(t, 2000000000, estimate.Cost.Nanos)
+			assert.True(t, estimate.Negative)
+		})
+	}
+}
+
+func TestMarginOfferingWorkloadHTTP(t *testing.T) {
+	calls := 0
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+		prompt := 10000
+		if calls > 0 {
+			prompt = 100
+		}
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, err := fmt.Fprintf(w, `{"choices":[{"message":{"content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":%d,"completion_tokens":0,"total_tokens":%d}}`, prompt, prompt)
+		assert.NoError(t, err)
+	})
+	common.OptionMapRWMutex.Lock()
+	common.OptionMap["GroupRatio"] = `{"default":1}`
+	common.OptionMapRWMutex.Unlock()
+	sale := &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: "p * 10", EffectiveAt: clock.Now().Unix()}
+	require.NoError(t, model.CreatePriceVersion(t.Context(), sale, fixture.sale.CreatedBy))
+	purchase := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: "p * 0.1", EffectiveAt: clock.Now().Unix()}
+	require.NoError(t, model.CreatePriceVersion(t.Context(), purchase, fixture.sale.CreatedBy))
+	body := `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`
+	first := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", body)
+	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+	second := *fixture.channel
+	second.ID = 0
+	second.UpstreamModelName = "second-workload"
+	require.NoError(t, model.DB.Create(&second).Error)
+	purchase = &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: second.ID, Currency: "USD", Expression: "p * 2.5", EffectiveAt: clock.Now().Unix()}
+	require.NoError(t, model.CreatePriceVersion(t.Context(), purchase, fixture.sale.CreatedBy))
+	require.NoError(t, model.DB.Model(fixture.channel).Update("status", model.ChannelDisabled).Error)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", body)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.Equal(t, 2, calls)
+	fixture.fake.Advance(time.Second)
+	manager := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "pricing:read", "pricing:write")
+	draft := fmt.Sprintf(`{"owner_type":"model_offering","owner_id":%d,"currency":"USD","expression":"p * 1.5"}`, fixture.offering.ID)
+	denied := adminSecurityRequest(fixture.engine, manager, http.MethodPost, "/api/admin/v1/price-versions", draft)
+	assert.Equal(t, http.StatusConflict, denied.Code, denied.Body.String())
+	var reply struct {
+		Data model.PriceMarginReport `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(denied.Body.Bytes(), &reply))
+	require.Len(t, reply.Data.Estimates, 2)
+	for _, estimate := range reply.Data.Estimates {
+		require.NotNil(t, estimate.Revenue)
+		require.NotNil(t, estimate.Cost)
+		assert.EqualValues(t, 7575000, estimate.Revenue.Nanos)
+		if estimate.ChannelID == second.ID {
+			assert.EqualValues(t, 12625000, estimate.Cost.Nanos)
+			assert.True(t, estimate.Negative)
+		}
+	}
+}
+
 func TestMarginGuardUsesGatewayUsage(t *testing.T) {
 	for _, tc := range []struct {
 		name, body, expression string

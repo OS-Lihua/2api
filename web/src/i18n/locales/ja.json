@@ -3235,6 +3235,7 @@
     "Historical capitalization": "以前の大文字・小文字",
     "Historical tokens": "過去のトークン",
     "Historical Usage": "履歴使用状況",
+    "Historical usage lacks complete token details": "過去の使用量のトークン詳細が不足しています",
     "History of MjProxy-style image tasks.": "MjProxyスタイルの画像タスクの履歴。",
     "Hit criteria: If cached tokens exist in usage, it counts as a hit.": "ヒット判定：usage に cached tokens が存在すればヒットとみなします。",
     "Hit Rate": "ヒット率",
