@@ -661,9 +661,11 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Provider, mod
 	}
 	common.SetContextKey(c, constant.ContextKeyChannelParamOverride, paramOverride)
 	common.SetContextKey(c, constant.ContextKeyChannelHeaderOverride, headerOverride)
-	if nil != channel.OpenAIOrganization && *channel.OpenAIOrganization != "" {
-		common.SetContextKey(c, constant.ContextKeyChannelOrganization, *channel.OpenAIOrganization)
+	organization := ""
+	if channel.OpenAIOrganization != nil {
+		organization = *channel.OpenAIOrganization
 	}
+	common.SetContextKey(c, constant.ContextKeyChannelOrganization, organization)
 	common.SetContextKey(c, constant.ContextKeyChannelAutoBan, channel.GetAutoBan())
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
@@ -674,17 +676,21 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Provider, mod
 	}
 	if channel.ProviderInfo.IsMultiKey {
 		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)
-		common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, index)
 	} else {
 		// 必须设置为 false，否则在重试到单个 key 的时候会导致日志显示错误
 		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, false)
 	}
+	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, index)
 	// c.Request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", key))
 	common.SetContextKey(c, constant.ContextKeyChannelKey, key)
 	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, channel.GetBaseURL())
 
 	common.SetContextKey(c, constant.ContextKeySystemPromptOverride, false)
 
+	// Provider-specific values must not survive a switch to another account.
+	for _, key := range []string{"api_version", "region", "plugin", "bot_id"} {
+		c.Set(key, "")
+	}
 	// TODO: api_version统一
 	switch channel.Type {
 	case constant.ChannelTypeAzure:

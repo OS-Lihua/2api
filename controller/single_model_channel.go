@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/capability"
+	"github.com/QuantumNous/new-api/pkg/channelhealth"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/service"
@@ -37,6 +38,7 @@ type singleChannelView struct {
 	model.Channel
 	ParameterOverrides json.RawMessage           `json:"parameter_overrides"`
 	LatestProbe        *model.ChannelProbeResult `json:"latest_probe,omitempty"`
+	Health             *channelhealth.Snapshot   `json:"health,omitempty"`
 }
 
 func channelView(record model.Channel) singleChannelView {
@@ -137,9 +139,14 @@ func ListSingleModelChannels(c *gin.Context) {
 	for i := range latest {
 		byChannel[latest[i].ChannelID] = &latest[i]
 	}
+	health, healthErr := service.ChannelHealth.Snapshots(c.Request.Context(), ids)
 	items := make([]singleChannelView, 0, len(records))
 	for _, record := range records {
 		view := channelView(record)
+		if healthErr == nil {
+			snapshot := health[record.ID]
+			view.Health = &snapshot
+		}
 		view.LatestProbe = byChannel[record.ID]
 		if view.LatestProbe != nil && view.LatestProbe.ConfigurationHash != record.ProbeConfigurationHash() {
 			view.LatestProbe = nil
@@ -159,7 +166,13 @@ func GetSingleModelChannel(c *gin.Context) {
 		singleChannelError(c, err)
 		return
 	}
-	common.ApiSuccess(c, channelView(record))
+	health, err := service.ChannelHealth.Snapshots(c.Request.Context(), []int{id})
+	view := channelView(record)
+	if err == nil {
+		snapshot := health[id]
+		view.Health = &snapshot
+	}
+	common.ApiSuccess(c, view)
 }
 
 func mutateSingleModelChannel(c *gin.Context, action model.ChannelAction) {

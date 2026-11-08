@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -81,8 +80,8 @@ func streamResponseTencent2OpenAI(TencentResponse *TencentChatResponse) *dto.Cha
 	if len(TencentResponse.Choices) > 0 {
 		var choice dto.ChatCompletionsStreamResponseChoice
 		choice.Delta.SetContentString(TencentResponse.Choices[0].Delta.Content)
-		if TencentResponse.Choices[0].FinishReason == "stop" {
-			choice.FinishReason = &constant.FinishReasonStop
+		if reason := TencentResponse.Choices[0].FinishReason; reason != "" {
+			choice.FinishReason = &reason
 		}
 		response.Choices = append(response.Choices, choice)
 	}

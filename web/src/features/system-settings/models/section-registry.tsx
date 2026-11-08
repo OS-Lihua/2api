@@ -20,6 +20,7 @@ import { IoNetDeploymentSettingsSection } from '../integrations/ionet-deployment
 import type { ModelSettings } from '../types'
 import { createSectionRegistry } from '../utils/section-registry'
 import { ClaudeSettingsCard } from './claude-settings-card'
+import { GatewayBudgetSettings } from './gateway-budget-settings'
 import { GeminiSettingsCard } from './gemini-settings-card'
 import { GlobalSettingsCard } from './global-settings-card'
 import { GrokSettingsCard } from './grok-settings-card'
@@ -64,6 +65,20 @@ const MODELS_SECTIONS = [
     ),
   },
 
+  {
+    id: 'failover',
+    titleKey: 'Failover budgets',
+    build: (settings: ModelSettings) => (
+      <GatewayBudgetSettings
+        defaultValues={{
+          GatewayMaxAttempts: settings.GatewayMaxAttempts,
+          GatewayTotalFirstByteSeconds: settings.GatewayTotalFirstByteSeconds,
+          GatewayAttemptFirstByteSeconds:
+            settings.GatewayAttemptFirstByteSeconds,
+        }}
+      />
+    ),
+  },
   {
     id: 'gemini',
     titleKey: 'Gemini',

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -160,11 +161,29 @@ func BulkImport(c *gin.Context) {
 		}
 	}
 	recordManageAudit(c, "bulk_import.execute", map[string]any{"count": len(rows), "dry_run": dryRun})
-	result, err := model.ImportBatch(c.Request.Context(), rows, dryRun, c.GetInt("id"))
+	approval := model.BulkMarginApproval{Revision: c.GetHeader("X-Margin-Confirmation")}
+	if text := c.GetHeader("X-Margin-Effective-At"); text != "" {
+		at, err := strconv.ParseInt(text, 10, 64)
+		if err != nil || at <= 0 || at > model.MaxPriceEffectiveAt {
+			common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
+			return
+		}
+		approval.EffectiveAt = at
+	}
+	if approval.Revision != "" && len(approval.Revision) != 64 {
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
+		return
+	}
+	result, err := model.ImportBatch(c.Request.Context(), rows, dryRun, c.GetInt("id"), approval)
 	if result != nil {
 		middleware.SetBulkImportAudit(c, result)
 	}
 	if err != nil {
+		var marginError *model.MarginConfirmationError
+		if errors.As(err, &marginError) {
+			pricingError(c, err)
+			return
+		}
 		common.ApiErrorStatus(c, 409, common.NewMessage("Bulk import could not be committed"))
 		return
 	}

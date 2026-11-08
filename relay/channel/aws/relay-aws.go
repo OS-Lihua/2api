@@ -26,7 +26,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	bedrockruntimeTypes "github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
+	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/auth/bearer"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // getAwsErrorStatusCode extracts HTTP status code from AWS SDK error
@@ -40,8 +42,8 @@ func getAwsErrorStatusCode(err error) int {
 	return http.StatusInternalServerError
 }
 
-func newAwsInvokeContext(parent context.Context) (context.Context, context.CancelFunc) {
-	if common.RelayTimeout <= 0 {
+func newAwsInvokeContext(parent context.Context, managed ...bool) (context.Context, context.CancelFunc) {
+	if common.RelayTimeout <= 0 || len(managed) > 0 && managed[0] {
 		return context.WithCancel(parent)
 	}
 	return context.WithTimeout(parent, time.Duration(common.RelayTimeout)*time.Second)
@@ -52,12 +54,19 @@ func newAwsInvokeError(requestContext context.Context, err error, operation stri
 	if requestContext.Err() != nil {
 		options = append(options, types.ErrOptionWithSkipRetry())
 	}
-	return types.NewOpenAIError(
+	rejection := types.NewOpenAIError(
 		errors.Wrap(err, operation),
 		types.ErrorCodeAwsInvokeError,
 		getAwsErrorStatusCode(err),
 		options...,
 	)
+	var upstream smithy.APIError
+	if errors.As(err, &upstream) {
+		failure := rejection.ToOpenAIError()
+		failure.Code = upstream.ErrorCode()
+		rejection.RelayError = failure
+	}
+	return rejection
 }
 
 func newAwsClient(c *gin.Context, info *relaycommon.RelayInfo) (*bedrockruntime.Client, error) {
@@ -72,6 +81,11 @@ func (a *Provider) NewClient(metadata channel.ProviderMetadata) (*bedrockruntime
 	}
 
 	awsSecret := strings.Split(info.ApiKey, "|")
+	for _, part := range awsSecret {
+		if strings.TrimSpace(part) == "" {
+			return nil, errors.New("invalid aws secret key")
+		}
+	}
 	var client *bedrockruntime.Client
 	switch len(awsSecret) {
 	case 2:
@@ -95,6 +109,11 @@ func (a *Provider) NewClient(metadata channel.ProviderMetadata) (*bedrockruntime
 		return nil, errors.New("invalid aws secret key")
 	}
 
+	for label := range strings.SplitSeq(client.Options().Region, ".") {
+		if !smithyhttp.ValidHostLabel(label) {
+			return nil, errors.New("invalid aws region")
+		}
+	}
 	return client, nil
 }
 

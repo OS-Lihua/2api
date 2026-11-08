@@ -45,7 +45,11 @@ type ResponseFacts struct {
 	GeneratedImageCount        int64
 	AudioInputDurationReported bool
 	AudioOutputTokensReported  bool
+	GeneratedOutputTokens      *int
+	UpstreamRetryAfter         string // Transient; only the parsed cooldown may enter records.
 	OnBusinessOutput           func()
+	CanFinishStream            func() bool `json:"-"`
+	UpstreamErrorCode          string
 }
 
 // MarkBusinessOutput records accepted content and disarms first-byte budgets.

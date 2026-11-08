@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/QuantumNous/new-api/pkg/protocol"
@@ -101,19 +102,21 @@ func (a *Provider) RequestURL(metadata channel.ProviderMetadata) (string, error)
 		suffix += strings.ToLower(info.UpstreamModelName)
 	}
 	fullRequestURL := fmt.Sprintf("%s/rpc/2.0/ai_custom/v1/wenxinworkshop/%s", info.ChannelBaseUrl, suffix)
-	var accessToken string
+	accessToken := a.accessToken
 	var err error
-	if accessToken, err = getBaiduAccessToken(info.ApiKey); err != nil {
+	if accessToken == "" {
+		accessToken, err = getBaiduAccessToken(info.ApiKey)
+	}
+	if err != nil {
 		return "", err
 	}
-	fullRequestURL += "?access_token=" + accessToken
+	fullRequestURL += "?access_token=" + url.QueryEscape(accessToken)
 	return fullRequestURL, nil
 }
 
 func (a *Provider) SetupHeader(c *gin.Context, req *http.Header, metadata channel.ProviderMetadata) error {
 	info := metadata.ProviderRequest()
 	channel.SetupProviderRequestHeader(info, c, req)
-	req.Set("Authorization", "Bearer "+info.ApiKey)
 	return nil
 }
 

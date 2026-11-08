@@ -1,9 +1,12 @@
 package model
 
 import (
+	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
+	"slices"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/money"
@@ -30,6 +33,7 @@ type GatewayUsage struct {
 }
 
 type GatewayRequest struct {
+	SalePending        bool           `json:"sale_pending,omitempty" gorm:"-"`
 	ID                 string         `json:"id" gorm:"type:varchar(64);primaryKey"`
 	UserID             int            `json:"user_id" gorm:"not null;index"`
 	TokenID            int            `json:"token_id" gorm:"not null;index"`
@@ -55,6 +59,8 @@ type GatewayRequest struct {
 func (GatewayRequest) TableName() string { return "gateway_requests" }
 
 type GatewayAttempt struct {
+	CostPending            bool           `json:"cost_pending,omitempty" gorm:"-"`
+	ConvertedCostPending   bool           `json:"converted_cost_pending,omitempty" gorm:"-"`
 	ID                     string         `json:"id" gorm:"type:varchar(64);primaryKey"`
 	RequestID              string         `json:"request_id" gorm:"type:varchar(64);not null;index"`
 	ChannelID              int            `json:"channel_id" gorm:"not null"`
@@ -132,38 +138,90 @@ type GatewayRequestFilter struct {
 	StartedBefore   int64
 }
 
+func (filter GatewayRequestFilter) apply(query *gorm.DB, pending bool) *gorm.DB {
+	for _, field := range []struct {
+		name     string
+		value    int64
+		operator string
+	}{
+		{"user_id", int64(filter.UserID), "="},
+		{"token_id", int64(filter.TokenID), "="},
+		{"model_offering_id", int64(filter.ModelOfferingID), "="},
+		{"started_at", filter.StartedAfter, ">="},
+		{"started_at", filter.StartedBefore, "<="},
+	} {
+		if field.value <= 0 {
+			continue
+		}
+		column := `"` + field.name + `"`
+		if pending && field.name != "user_id" {
+			column = fmt.Sprintf(`(NULLIF("settlement", '')::jsonb -> 'request' ->> '%s')::bigint`, field.name)
+		}
+		query = query.Where(column+" "+field.operator+" ?", field.value)
+	}
+	if filter.Status == "" {
+		return query
+	}
+	if !pending {
+		return query.Where(`"status" = ?`, filter.Status)
+	}
+	if filter.Status != "settlement_pending" {
+		return query.Where("1 = 0")
+	}
+	return query
+}
+
 func ListGatewayRequests(ctx context.Context, filter GatewayRequestFilter, offset, limit int) ([]GatewayRequest, int64, error) {
-	query := gatewayRecordQuery(ctx, &GatewayRequest{}, "gateway_requests")
-	if filter.UserID > 0 {
-		query = query.Where("user_id = ?", filter.UserID)
-	}
-	if filter.TokenID > 0 {
-		query = query.Where("token_id = ?", filter.TokenID)
-	}
-	if filter.ModelOfferingID > 0 {
-		query = query.Where("model_offering_id = ?", filter.ModelOfferingID)
-	}
-	if filter.Status != "" {
-		query = query.Where("status = ?", filter.Status)
-	}
-	if filter.StartedAfter > 0 {
-		query = query.Where("started_at >= ?", filter.StartedAfter)
-	}
-	if filter.StartedBefore > 0 {
-		query = query.Where("started_at <= ?", filter.StartedBefore)
-	}
+	query := filter.apply(gatewayRecordQuery(ctx, &GatewayRequest{}, "gateway_requests"), false)
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
+	pendingQuery := filter.apply(gatewayPendingAccounting(DB.WithContext(ctx)), true)
+	var pendingTotal int64
+	if err := pendingQuery.Count(&pendingTotal).Error; err != nil {
+		return nil, 0, err
+	}
 	items := []GatewayRequest{}
-	err := query.Order("started_at DESC, id DESC").Offset(offset).Limit(limit).Find(&items).Error
-	return items, total, err
+	if pendingTotal == 0 {
+		err := query.Order("started_at DESC, id DESC").Offset(offset).Limit(limit).Find(&items).Error
+		return items, total, err
+	}
+	if err := query.Order("started_at DESC, id DESC").Limit(offset + limit).Find(&items).Error; err != nil {
+		return nil, 0, err
+	}
+	var pendingRows []struct{ RequestData string }
+	if err := pendingQuery.Select(`(NULLIF("settlement", '')::jsonb -> 'request')::text AS "request_data"`).Order(`(NULLIF("settlement", '')::jsonb -> 'request' ->> 'started_at')::bigint DESC, "request_id" DESC`).Limit(offset + limit).Scan(&pendingRows).Error; err != nil {
+		return nil, 0, err
+	}
+	for _, row := range pendingRows {
+		var request GatewayRequest
+		if err := common.UnmarshalJsonStr(row.RequestData, &request); err != nil {
+			return nil, 0, err
+		}
+		request.Status = "settlement_pending"
+		items = append(items, request)
+	}
+	slices.SortFunc(items, func(a, b GatewayRequest) int {
+		if order := cmp.Compare(b.StartedAt, a.StartedAt); order != 0 {
+			return order
+		}
+		return cmp.Compare(b.ID, a.ID)
+	})
+	total += pendingTotal
+	return items[min(offset, len(items)):min(offset+limit, len(items))], total, nil
 }
 
 // GetGatewayRequest applies the ownership predicate in the database, including
 // for an attempts read. A cross-user identifier is indistinguishable from missing.
 func GetGatewayRequest(ctx context.Context, id string, ownerID int) (*GatewayRequest, error) {
+	intent, pendingErr := gatewayPendingSettlement(ctx, id, ownerID)
+	if pendingErr == nil {
+		return &intent.Request, nil
+	}
+	if !errors.Is(pendingErr, gorm.ErrRecordNotFound) {
+		return nil, pendingErr
+	}
 	query := gatewayRecordQuery(ctx, &GatewayRequest{}, "gateway_requests").Where("id = ?", id)
 	if ownerID > 0 {
 		query = query.Where("user_id = ?", ownerID)
@@ -174,6 +232,17 @@ func GetGatewayRequest(ctx context.Context, id string, ownerID int) (*GatewayReq
 }
 
 func ListGatewayAttempts(ctx context.Context, requestID string, offset, limit int) ([]GatewayAttempt, int64, error) {
+	intent, pendingErr := gatewayPendingSettlement(ctx, requestID, 0)
+	if pendingErr == nil {
+		attempts := intent.Attempts
+		if intent.Attempt != nil {
+			attempts = []GatewayAttempt{*intent.Attempt}
+		}
+		return attempts[min(offset, len(attempts)):min(offset+limit, len(attempts))], int64(len(attempts)), nil
+	}
+	if !errors.Is(pendingErr, gorm.ErrRecordNotFound) {
+		return nil, 0, pendingErr
+	}
 	query := gatewayRecordQuery(ctx, &GatewayAttempt{}, "gateway_attempts").Where("request_id = ?", requestID)
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
@@ -182,6 +251,25 @@ func ListGatewayAttempts(ctx context.Context, requestID string, offset, limit in
 	items := []GatewayAttempt{}
 	err := query.Order("started_at, id").Offset(offset).Limit(limit).Find(&items).Error
 	return items, total, err
+}
+
+// gatewayPendingSettlement exposes unsettled quantitative facts through the
+// existing record APIs without publishing estimates as finalized log records.
+func gatewayPendingSettlement(ctx context.Context, id string, ownerID int) (*GatewaySettlement, error) {
+	query := gatewayPendingAccounting(DB.WithContext(ctx)).Where(`"request_id" = ?`, id)
+	if ownerID > 0 {
+		query = query.Where("user_id = ?", ownerID)
+	}
+	var row GatewayBilling
+	if err := query.Take(&row).Error; err != nil {
+		return nil, err
+	}
+	var intent GatewaySettlement
+	if err := common.UnmarshalJsonStr(row.Settlement, &intent); err != nil {
+		return nil, err
+	}
+	intent.Request.Status = "settlement_pending"
+	return &intent, nil
 }
 
 func appendGatewayRecord(record any) error {

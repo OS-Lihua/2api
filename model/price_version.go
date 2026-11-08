@@ -23,19 +23,21 @@ const (
 // coefficients are per million tokens; task expressions return currency units.
 // Nullable foreign keys retain owners and prevent deletion of price history.
 type PriceVersion struct {
-	ID          int            `json:"id" gorm:"primaryKey"`
-	OwnerType   string         `json:"owner_type" gorm:"type:varchar(20);not null;uniqueIndex:idx_price_owner_effective"`
-	OwnerID     int            `json:"owner_id" gorm:"not null;uniqueIndex:idx_price_owner_effective"`
-	OfferingID  *int           `json:"-" gorm:"index"`
-	Offering    *ModelOffering `json:"-" gorm:"foreignKey:OfferingID;constraint:OnDelete:RESTRICT"`
-	ChannelID   *int           `json:"-" gorm:"index"`
-	Channel     *Channel       `json:"-" gorm:"foreignKey:ChannelID;constraint:OnDelete:RESTRICT"`
-	Currency    money.Currency `json:"currency" gorm:"type:char(3);not null;check:price_currency_valid,currency ~ '^[A-Z]{3}$'"`
-	Expression  string         `json:"expression" gorm:"type:text;not null;check:price_expression_bounded,octet_length(expression) BETWEEN 1 AND 16384"`
-	EffectiveAt int64          `json:"effective_at" gorm:"not null;uniqueIndex:idx_price_owner_effective;check:price_effective_valid,effective_at BETWEEN 1 AND 253402300799"`
-	CreatedBy   int            `json:"created_by" gorm:"not null"`
-	Creator     *User          `json:"-" gorm:"foreignKey:CreatedBy;constraint:OnDelete:RESTRICT"`
-	CreatedAt   int64          `json:"created_at" gorm:"not null;autoCreateTime:false"`
+	MarginConfirmation string             `json:"-" gorm:"-"`
+	MarginCheck        *PriceMarginReport `json:"margin_check,omitempty" gorm:"-"`
+	ID                 int                `json:"id" gorm:"primaryKey"`
+	OwnerType          string             `json:"owner_type" gorm:"type:varchar(20);not null;uniqueIndex:idx_price_owner_effective"`
+	OwnerID            int                `json:"owner_id" gorm:"not null;uniqueIndex:idx_price_owner_effective"`
+	OfferingID         *int               `json:"-" gorm:"index"`
+	Offering           *ModelOffering     `json:"-" gorm:"foreignKey:OfferingID;constraint:OnDelete:RESTRICT"`
+	ChannelID          *int               `json:"-" gorm:"index"`
+	Channel            *Channel           `json:"-" gorm:"foreignKey:ChannelID;constraint:OnDelete:RESTRICT"`
+	Currency           money.Currency     `json:"currency" gorm:"type:char(3);not null;check:price_currency_valid,currency ~ '^[A-Z]{3}$'"`
+	Expression         string             `json:"expression" gorm:"type:text;not null;check:price_expression_bounded,octet_length(expression) BETWEEN 1 AND 16384"`
+	EffectiveAt        int64              `json:"effective_at" gorm:"not null;uniqueIndex:idx_price_owner_effective;check:price_effective_valid,effective_at BETWEEN 1 AND 253402300799"`
+	CreatedBy          int                `json:"created_by" gorm:"not null"`
+	Creator            *User              `json:"-" gorm:"foreignKey:CreatedBy;constraint:OnDelete:RESTRICT"`
+	CreatedAt          int64              `json:"created_at" gorm:"not null;autoCreateTime:false"`
 }
 
 // CurrentPriceVersion uses the latest effective time, with equal-time writes
@@ -82,9 +84,20 @@ func InstallPriceVersionCheckers() {
 
 func CreatePriceVersion(ctx context.Context, record *PriceVersion, actorID int) error {
 	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`SELECT pg_advisory_xact_lock(510033)`).Error; err != nil {
+			return err
+		}
 		if err := preparePriceVersion(ctx, tx, record, actorID, nil, true); err != nil {
 			return err
 		}
+		report, err := CheckPriceMargins(ctx, tx, record, nil, true)
+		if err != nil {
+			return err
+		}
+		if report.RequiresConfirmation && record.MarginConfirmation != report.Revision {
+			return &MarginConfirmationError{Report: report}
+		}
+		record.MarginCheck = report
 		return tx.Omit("Creator", "Channel", "Offering").Create(record).Error
 	})
 }

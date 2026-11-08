@@ -11,6 +11,7 @@ import (
 
 func registerGatewayRecordRoutes(api *gin.RouterGroup) {
 	admin := api.Group("/admin/v1", middleware.DisableCache(), middleware.AdminAuth())
+	handlePermissionRoute(admin, http.MethodGet, "/reports/margin", authz.LedgerRead, controller.GetMarginReport)
 	handlePermissionRoute(admin, http.MethodGet, "/requests", authz.RequestRead, controller.ListGatewayRequests)
 	handlePermissionRoute(admin, http.MethodGet, "/requests/:id/attempts", authz.RequestRead, controller.ListGatewayAttempts)
 	self := api.Group("/requests/self", middleware.DisableCache(), middleware.UserAuth())

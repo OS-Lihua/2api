@@ -196,10 +196,45 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 					}
 				}
 			}
+			if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+				var envelope struct {
+					Error common.RawMessage `json:"error"`
+				}
+				if common.UnmarshalJsonStr(data, &envelope) == nil && len(envelope.Error) > 0 && strings.TrimSpace(string(envelope.Error)) != "null" {
+					var failure struct {
+						Code   any    `json:"code"`
+						Type   string `json:"type"`
+						Status int    `json:"status"`
+					}
+					_ = common.Unmarshal(envelope.Error, &failure)
+					info.ResponseFacts.UpstreamErrorCode, _ = failure.Code.(string)
+					if info.ResponseFacts.UpstreamErrorCode == "" {
+						info.ResponseFacts.UpstreamErrorCode = failure.Type
+					}
+					if info.ResponseFacts.UpstreamErrorCode == "" {
+						info.ResponseFacts.UpstreamErrorCode = "upstream_error"
+					}
+					info.StreamStatus.MarkFailed(info.ResponseFacts.UpstreamErrorCode, failure.Type, failure.Status)
+					lastStreamData = ""
+					sr.Stop(errors.New("upstream stream failed"))
+					return
+				}
+			}
 			observeStreamChoices(info, data, seenStreamToolCalls, &streamFunctionCallNames)
 			if err := processTokenData(info, data, &responseTextBuilder, &toolCount); err != nil {
+				if info.ResponseFacts != nil {
+					err = errors.New("invalid upstream stream data")
+				}
 				logger.LogError(c, common.LogText("error processing stream token data: %s", err.Error()))
+				if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+					lastStreamData = ""
+					sr.Stop(err)
+					return
+				}
 				sr.Error(err)
+			}
+			if info.PerformanceBusinessRejection && info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+				sr.Stop(errors.New("upstream content safety rejection"))
 			}
 		}
 	})
@@ -210,7 +245,11 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	shouldSendLastResp := true
 	if err := handleLastResponse(lastStreamData, &responseId, &createAt, &systemFingerprint, &model, &usage,
 		&containStreamUsage, info, &shouldSendLastResp); err != nil {
-		logger.LogError(c, common.LogText("error handling last response: %s, lastStreamData: [%s]", err.Error(), lastStreamData))
+		if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+			logger.LogError(c, common.LogText("invalid upstream stream response"))
+		} else {
+			logger.LogError(c, common.LogText("error handling last response: %s, lastStreamData: [%s]", err.Error(), lastStreamData))
+		}
 	}
 
 	// 部分兼容网关把完整的累计usage附在倒数第二个事件上，随后发送一个空的最后事件。
@@ -242,17 +281,19 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		}
 	}
 
+	generatedUsage := service.ResponseText2Usage(c, responseTextBuilder.String(), info.TokenizerModelName(), info.GetEstimatePromptTokens())
+	generatedUsage.CompletionTokens += toolCount * 7
 	if info.ResponseFacts != nil {
 		containStreamUsage = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 		info.ResponseFacts.UsageReported = containStreamUsage
 		info.ResponseFacts.GeneratedText = responseTextBuilder.String()
+		info.ResponseFacts.GeneratedOutputTokens = &generatedUsage.CompletionTokens
 		if containStreamUsage {
 			usage = reportedStreamUsage
 		}
 	}
 	if !containStreamUsage {
-		usage = service.ResponseText2Usage(c, responseTextBuilder.String(), info.TokenizerModelName(), info.GetEstimatePromptTokens())
-		usage.CompletionTokens += toolCount * 7
+		usage = generatedUsage
 		if info.ResponseFacts != nil && reportedStreamUsage != nil {
 			snapshot := *reportedStreamUsage
 			if !info.ResponseFacts.PromptTokensReported {
@@ -272,6 +313,9 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		info.CountBillableToolCall(dto.BuildInCallFunctionCall, name)
 	}
 
+	if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil && (!info.ResponseFacts.BusinessOutput || !info.StreamStatus.CompletedNormally()) {
+		return usage, nil
+	}
 	HandleFinalResponse(c, info, lastStreamData, responseId, createAt, model, systemFingerprint, usage, containStreamUsage)
 
 	return usage, nil
@@ -288,6 +332,9 @@ func observeStreamChoices(info *relaycommon.RelayInfo, data string, seen map[str
 		if choice.FinishReason != nil && *choice.FinishReason != "" {
 			if *choice.FinishReason == constant.FinishReasonContentFilter {
 				info.PerformanceBusinessRejection = true
+				if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+					info.StreamStatus.MarkFailed("content_filter", "", 0)
+				}
 			}
 			info.StreamStatus.MarkCompleted()
 		}
@@ -341,7 +388,9 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
-	logger.LogDebug(c, "upstream response body: %s", responseBody)
+	if info.ResponseFacts == nil || info.ResponseFacts.OnBusinessOutput == nil {
+		logger.LogDebug(c, "upstream response body: %s", responseBody)
+	}
 	// Unmarshal to simpleResponse
 	if !channel.ProviderResponseWasRepaired(c) && info.ChannelType == constant.ChannelTypeOpenRouter && info.ChannelOtherSettings.IsOpenRouterEnterprise() {
 		responseBody, err = (&Provider{}).unwrapEnterpriseResponse(responseBody)
@@ -360,7 +409,7 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 	}
 	var responseErr *types.NewAPIError
-	if oaiError := simpleResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
+	if oaiError := simpleResponse.GetOpenAIError(); oaiError != nil && (oaiError.Type != "" || info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil) {
 		responseErr = types.WithOpenAIError(*oaiError, resp.StatusCode)
 	} else if info.ResponseFacts != nil && resp.StatusCode != http.StatusOK {
 		responseErr = types.NewOpenAIError(fmt.Errorf("upstream request failed"), types.ErrorCodeBadResponse, resp.StatusCode)

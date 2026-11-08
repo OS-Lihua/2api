@@ -15,6 +15,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestMoneyOverflowRetainsExactResultWithoutRequestContent(t *testing.T) {
+	for _, test := range []struct{ body, amount string }{
+		{`{"rate":2,"secret":"private-request"}`, "2500000000000001/50000"},
+		{`{"rate":3,"secret":"private-request"}`, "5000000000000003/100000"},
+	} {
+		t.Run(test.amount, func(t *testing.T) {
+			_, trace, err := billingexpr.RunMoneyExpr(`p * (param("rate") ?? 1) + c * 10000000000000000`, billingexpr.MoneyInput{
+				Tokens: map[string]int64{"p": 10, "c": 5}, Request: billingexpr.RequestInput{Body: []byte(test.body)},
+			}, "USD")
+			require.ErrorIs(t, err, money.ErrOverflow)
+			assert.Equal(t, test.amount, trace.UnroundedAmount)
+			assert.Equal(t, money.Currency("USD"), trace.Currency)
+			encoded, err := common.Marshal(trace)
+			require.NoError(t, err)
+			assert.NotContains(t, string(encoded), "private-request")
+		})
+	}
+}
+
 func TestMoneyExprKeepsSourceDecimals(t *testing.T) {
 	for _, expression := range []string{
 		`tier("base", p * 0.123456789123456789)`,

@@ -118,6 +118,7 @@ type cachedEntry struct {
 	requestRules  []RequestRuleTrace
 	version       int
 	fixedPricing  bool
+	fixedOnly     bool
 
 	moneyOnce         sync.Once
 	moneyProgram      *vm.Program
@@ -258,6 +259,22 @@ func compileEntry(exprStr string) (*cachedEntry, error) {
 			return nil, fmt.Errorf("expr compile error: %w", err)
 		}
 	}
+	fixedOnly := fixedPricing && ast.Find(tree.Node, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallNode)
+		if !ok {
+			return false
+		}
+		callee, ok := call.Callee.(*ast.IdentifierNode)
+		if !ok || callee.Value != "tier" || len(call.Arguments) != 2 {
+			return false
+		}
+		price, ok := call.Arguments[1].(*ast.CallNode)
+		if !ok {
+			return true
+		}
+		function, ok := price.Callee.(*ast.IdentifierNode)
+		return !ok || function.Value != "fixed"
+	}) == nil
 	patcher := &requestRulePatcher{}
 	prog, err := expr.Compile(body, expr.Env(getCompileEnv(version)), expr.Patch(patcher), expr.AsFloat64())
 	if patcher.restrictedIdentifier != "" {
@@ -275,6 +292,7 @@ func compileEntry(exprStr string) (*cachedEntry, error) {
 		requestRules:  patcher.requestRules,
 		version:       version,
 		fixedPricing:  fixedPricing,
+		fixedOnly:     fixedOnly,
 	}
 	return entry, nil
 }
