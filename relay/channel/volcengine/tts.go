@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/MoeForge/moego/base64"
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -144,55 +145,49 @@ func getContentTypeByEncoding(encoding string) string {
 }
 
 func handleTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, encoding string) (usage any, err *types.NewAPIError) {
-	body, readErr := io.ReadAll(resp.Body)
-	if readErr != nil {
-		return nil, types.NewErrorWithStatusCode(
-			errors.New("failed to read volcengine response"),
-			types.ErrorCodeReadResponseBodyFailed,
-			http.StatusInternalServerError,
-		)
-	}
 	defer resp.Body.Close()
-
+	body, readErr := io.ReadAll(resp.Body)
+	var audioData []byte
+	if info.ResponseFacts != nil {
+		var encoded string
+		if raw := ojson.GetBytes(body, "data").Raw; raw != "" && common.UnmarshalJsonStr(raw, &encoded) == nil {
+			if decoded, decodeErr := base64.StdEncoding.DecodeString(encoded); decodeErr == nil && len(decoded) > 0 {
+				audioData = decoded
+				usage = openai.EstimateGeneratedSpeech(c, info, audioData, true)
+			}
+		}
+	}
+	if readErr != nil {
+		if info.ResponseFacts != nil {
+			if info.StreamStatus == nil {
+				info.StreamStatus = relaycommon.NewStreamStatus()
+			}
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, readErr)
+			info.StreamStatus.MarkIncomplete("incomplete_audio_response")
+		}
+		return usage, types.NewErrorWithStatusCode(errors.New("failed to read volcengine response"), types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
+	}
 	var volcResp VolcengineTTSResponse
 	if unmarshalErr := common.Unmarshal(body, &volcResp); unmarshalErr != nil {
-		return nil, types.NewErrorWithStatusCode(
-			errors.New("failed to parse volcengine response"),
-			types.ErrorCodeBadResponseBody,
-			http.StatusInternalServerError,
-		)
+		return usage, types.NewErrorWithStatusCode(errors.New("failed to parse volcengine response"), types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
-
 	if volcResp.Code != 3000 {
-		return nil, types.NewErrorWithStatusCode(
-			errors.New(volcResp.Message),
-			types.ErrorCodeBadResponse,
-			http.StatusBadRequest,
-		)
+		return usage, types.NewErrorWithStatusCode(errors.New(volcResp.Message), types.ErrorCodeBadResponse, http.StatusBadRequest)
 	}
-
-	audioData, decodeErr := base64.StdEncoding.DecodeString(volcResp.Data)
-	if decodeErr != nil {
-		return nil, types.NewErrorWithStatusCode(
-			errors.New("failed to decode audio data"),
-			types.ErrorCodeBadResponseBody,
-			http.StatusInternalServerError,
-		)
+	if audioData == nil {
+		var decodeErr error
+		audioData, decodeErr = base64.StdEncoding.DecodeString(volcResp.Data)
+		if decodeErr != nil {
+			return usage, types.NewErrorWithStatusCode(errors.New("failed to decode audio data"), types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		}
 	}
-
 	if info.ResponseFacts != nil {
 		return openai.WriteAudioResponse(c, info, resp, audioData), nil
 	}
 	contentType := getContentTypeByEncoding(encoding)
 	c.Header("Content-Type", contentType)
 	c.Data(http.StatusOK, contentType, audioData)
-
-	usage = &dto.Usage{
-		PromptTokens:     info.GetEstimatePromptTokens(),
-		CompletionTokens: 0,
-		TotalTokens:      info.GetEstimatePromptTokens(),
-	}
-
+	usage = &dto.Usage{PromptTokens: info.GetEstimatePromptTokens(), CompletionTokens: 0, TotalTokens: info.GetEstimatePromptTokens()}
 	return usage, nil
 }
 

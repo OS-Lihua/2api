@@ -100,7 +100,7 @@ func mediaResponseEnvelope(body []byte) []byte {
 		return body
 	}
 	recovered := map[string]common.RawMessage{}
-	for _, name := range []string{"usage", "error", "type", "code"} {
+	for _, name := range []string{"usage", "error", "type", "code", "duration"} {
 		if raw := ojson.GetBytes(body, name); raw.Exists() && ojson.Valid(raw.Raw) {
 			recovered[name] = common.RawMessage(raw.Raw)
 		}

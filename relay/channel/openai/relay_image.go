@@ -215,39 +215,38 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 			// EndReason. HasErrors() flags the failure for logging/handling.
 			sr.Error(fmt.Errorf("%s", extractOpenAIImageStreamErrorMessage(raw)))
 		}
+		if info.ResponseFacts != nil {
+			if !ojson.ValidBytes(raw) {
+				sr.Stop(errors.New("invalid image stream event"))
+				return
+			}
+			reported := reportedMediaUsage(raw)
+			prompt, completion := relaycommon.MediaUsagePresence(raw)
+			observeMediaUsage(info, reported, raw)
+			if prompt {
+				usage.PromptTokens = reported.PromptTokens
+			}
+			if completion {
+				usage.CompletionTokens = reported.CompletionTokens
+			}
+			mergeMediaTokenDetails(usage, raw)
+			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+			if observeMediaError(info, raw, resp.StatusCode) != nil {
+				sr.Stop(errors.New("upstream image stream failed"))
+				return
+			}
+		}
 		var chunk struct {
 			Type  string          `json:"type"`
 			Usage json.RawMessage `json:"usage"`
 		}
 		if err := common.Unmarshal(raw, &chunk); err == nil {
-			var reported dto.Usage
-			if info.ResponseFacts != nil {
-				reported = *reportedMediaUsage(raw)
-			} else {
+			if info.ResponseFacts == nil {
+				var reported dto.Usage
 				_ = common.Unmarshal(chunk.Usage, &reported)
 				normalizeOpenAIUsage(&reported)
-			}
-			if info.ResponseFacts != nil {
-				prompt, completion := relaycommon.MediaUsagePresence(raw)
-				observeMediaUsage(info, &reported, raw)
-				if prompt {
-					usage.PromptTokens = reported.PromptTokens
-				}
-				if completion {
-					usage.CompletionTokens = reported.CompletionTokens
-				}
-				mergeMediaTokenDetails(usage, raw)
-				info.ResponseFacts.PromptTokensReported = info.ResponseFacts.PromptTokensReported || prompt
-				info.ResponseFacts.CompletionTokensReported = info.ResponseFacts.CompletionTokensReported || completion
-				info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
-				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
-			} else if service.ValidUsage(&reported) {
-				usage = &reported
-			}
-			if info.ResponseFacts != nil {
-				if fault := observeMediaError(info, raw, resp.StatusCode); fault != nil {
-					sr.Stop(errors.New("upstream image stream failed"))
-					return
+				if service.ValidUsage(&reported) {
+					usage = &reported
 				}
 			}
 			if chunk.Type == "image_generation.completed" || chunk.Type == "image_edit.completed" {

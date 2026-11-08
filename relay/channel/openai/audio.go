@@ -528,9 +528,9 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, responseFormat string) (*types.NewAPIError, *dto.Usage) {
 	defer service.CloseResponseBodyGracefully(resp)
 
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError), nil
+	responseBody, readErr := io.ReadAll(resp.Body)
+	if readErr != nil && info.ResponseFacts == nil {
+		return types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError), nil
 	}
 	structured := responseFormat != "text" && responseFormat != "srt" && responseFormat != "vtt" || strings.Contains(resp.Header.Get("Content-Type"), "json")
 	var responseData struct {
@@ -538,19 +538,20 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		Text  string     `json:"text"`
 	}
 	var decodeErr error
+	factsBody := responseBody
 	if info.ResponseFacts != nil {
 		if structured {
+			factsBody = mediaResponseEnvelope(responseBody)
+			responseData.Usage = reportedMediaUsage(factsBody)
+			observeMediaUsage(info, responseData.Usage, factsBody)
 			var envelope struct {
-				Usage json.RawMessage `json:"usage"`
-				Text  string          `json:"text"`
+				Text json.RawMessage `json:"text"`
 			}
 			decodeErr = common.Unmarshal(responseBody, &envelope)
-			responseData.Text = envelope.Text
-			if decodeErr == nil {
-				info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported = relaycommon.MediaUsagePresence(responseBody)
-				info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
-				if len(envelope.Usage) > 0 && string(envelope.Usage) != "null" {
-					responseData.Usage = reportedMediaUsage(responseBody)
+			if raw := ojson.GetBytes(responseBody, "text").Raw; raw != "" && raw != "null" {
+				textErr := common.UnmarshalJsonStr(raw, &responseData.Text)
+				if decodeErr == nil {
+					decodeErr = textErr
 				}
 			}
 		}
@@ -559,12 +560,12 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	}
 	if decodeErr == nil && responseData.Usage != nil {
 		normalizeOpenAIUsage(responseData.Usage)
-		observeMediaUsage(info, responseData.Usage, responseBody)
+		observeMediaUsage(info, responseData.Usage, factsBody)
 	}
-	if info.ResponseFacts != nil && structured && decodeErr == nil {
-		duration := ojson.GetBytes(responseBody, "usage.seconds")
+	if info.ResponseFacts != nil && structured {
+		duration := ojson.GetBytes(factsBody, "usage.seconds")
 		if !duration.Exists() {
-			duration = ojson.GetBytes(responseBody, "duration")
+			duration = ojson.GetBytes(factsBody, "duration")
 		}
 		if duration.Exists() {
 			info.ResponseFacts.AudioInputDurationInvalid = true
@@ -583,7 +584,9 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 						// whole seconds to the shared audio token unit.
 						tokens, clamp := common.AudioDurationTokens(seconds.Ceil().InexactFloat64())
 						responseData.Usage.PromptTokens = tokens
-						responseData.Usage.PromptTokensDetails.AudioTokens = tokens
+						if !info.ResponseFacts.AudioInputTokensReported {
+							responseData.Usage.PromptTokensDetails.AudioTokens = tokens
+						}
 						if clamp != nil {
 							info.QuotaClamp = clamp
 						}
@@ -598,8 +601,15 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			}
 		}
 	}
+	if info.ResponseFacts != nil && readErr != nil {
+		if info.StreamStatus == nil {
+			info.StreamStatus = relaycommon.NewStreamStatus()
+		}
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, readErr)
+		info.StreamStatus.MarkIncomplete("incomplete_transcription_response")
+	}
 	if info.ResponseFacts != nil && structured {
-		if fault := observeMediaError(info, responseBody, resp.StatusCode); fault != nil {
+		if fault := observeMediaError(info, factsBody, resp.StatusCode); fault != nil {
 			return types.WithOpenAIError(*fault, resp.StatusCode), responseData.Usage
 		}
 	}
@@ -612,6 +622,12 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			text = strings.TrimSpace(string(responseBody))
 		}
 		info.ResponseFacts.GeneratedText = text
+	}
+	if readErr != nil {
+		return types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError), responseData.Usage
+	}
+	if info.ResponseFacts != nil && structured && decodeErr != nil {
+		return types.NewOpenAIError(decodeErr, types.ErrorCodeBadResponseBody, http.StatusBadGateway), responseData.Usage
 	}
 	writeErr := service.IOCopyBytesGracefully(c, resp, responseBody)
 	if info.ResponseFacts != nil {
