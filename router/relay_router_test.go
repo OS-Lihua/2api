@@ -5683,9 +5683,11 @@ func TestMediaGatewayVLLMPCMUsesEffectiveSampleRate(t *testing.T) {
 		delivered bool
 	}{
 		{"complete", 50, "3", true}, {"short", 50, "3", false}, {"sse", 50, "3", true}, {"cancel", 33, "2", true}, {"client", 50, "3", true}, {"header", 17, "0.75", true},
+		{"sse_format", 17, "1", true}, {"sse_changing_format", 33, "2", true}, {"sse_format_interrupt", 17, "1", true},
+		{"headers_zero", 0, "3", true}, {"headers_reported", 1000, "3", true}, {"headers_short_zero", 0, "3", false}, {"headers_short_reported", 1000, "3", false},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
-			stream := tc.mode == "sse" || tc.mode == "cancel"
+			stream := strings.HasPrefix(tc.mode, "sse") || tc.mode == "cancel"
 			fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
 				var body map[string]common.RawMessage
 				require.NoError(t, common.DecodeJson(r.Body, &body))
@@ -5696,8 +5698,22 @@ func TestMediaGatewayVLLMPCMUsesEffectiveSampleRate(t *testing.T) {
 					if tc.mode == "cancel" {
 						size = 32000
 					}
-					_, _ = fmt.Fprintf(w, "data: {\"type\":\"speech.audio.delta\",\"audio\":%q}\n\n", base64.StdEncoding.EncodeToString(make([]byte, size)))
+					extra := ""
+					if tc.mode == "sse_format" || tc.mode == "sse_format_interrupt" {
+						size = 96000
+						extra = `,"sample_rate":24000,"channels":2`
+					}
+					if tc.mode == "sse_changing_format" {
+						extra = `,"sample_rate":24000,"channels":1`
+					}
+					_, _ = fmt.Fprintf(w, "data: {\"type\":\"speech.audio.delta\",\"audio\":%q%s}\n\n", base64.StdEncoding.EncodeToString(make([]byte, size)), extra)
 					w.(http.Flusher).Flush()
+					if tc.mode == "sse_format_interrupt" {
+						return
+					}
+					if tc.mode == "sse_changing_format" {
+						_, _ = fmt.Fprintf(w, "data: {\"type\":\"speech.audio.delta\",\"sample_rate\":48000,\"channels\":1,\"audio\":%q}\n\n", base64.StdEncoding.EncodeToString(make([]byte, 96000)))
+					}
 					if tc.mode == "cancel" {
 						<-r.Context().Done()
 						return
@@ -5710,7 +5726,14 @@ func TestMediaGatewayVLLMPCMUsesEffectiveSampleRate(t *testing.T) {
 					w.Header().Set("X-Audio-Sample-Rate", "16000")
 					w.Header().Set("X-Audio-Channels", "2")
 				}
-				if tc.mode == "short" {
+				if strings.HasPrefix(tc.mode, "headers_") {
+					w.Header().Set("X-VLLM-OMNI-INPUT-TOKENS", "0")
+					w.Header().Set("X-VLLM-OMNI-OUTPUT-TOKENS", strconv.FormatInt(tc.tokens, 10))
+					w.Header().Set("X-VLLM-OMNI-TOTAL-TOKENS", "-1")
+					w.Header().Set("X-VLLM-OMNI-INPUT-TEXT-TOKENS", "0")
+					w.Header().Set("X-VLLM-OMNI-INPUT-AUDIO-TOKENS", "0")
+				}
+				if strings.Contains(tc.mode, "short") {
 					w.Header().Set("Content-Length", "48001")
 				}
 				_, _ = w.Write(make([]byte, 48000))
@@ -5768,6 +5791,29 @@ func TestMediaGatewayVLLMPCMUsesEffectiveSampleRate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMediaGatewaySpeechJSONWithoutAudioReleasesFixedFee(t *testing.T) {
+	fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"error":null,"usage":{"input_tokens":0,"output_tokens":0}}`)
+	})
+	fixture.fake.Advance(time.Second)
+	require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("audio",ao)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", `{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm"}`)
+	assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+	assert.NotContains(t, response.Body.String(), `"usage"`)
+	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+	require.NoError(t, err)
+	assert.Zero(t, record.Receivable.Nanos)
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Zero(t, attempts[0].Cost.Nanos)
+	assert.Zero(t, attempts[0].Usage.AudioOutputTokens)
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
 }
 
 func TestMediaGatewaySpeechCapContinuesToCompatibleCandidate(t *testing.T) {

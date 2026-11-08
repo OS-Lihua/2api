@@ -132,6 +132,17 @@ func TestMediaAudioGatewayReportsDeliveryAndExplicitZero(t *testing.T) {
 	}
 }
 
+func TestLegacySpeechPCMUsesRequestSampleRate(t *testing.T) {
+	body := strings.Repeat("x", 48000)
+	c, recorder, response, info := newImageTestContext(t, body, "audio/pcm", false)
+	info.ChannelType = constant.ChannelTypeVLLM
+	info.Request = &dto.AudioRequest{ResponseFormat: "pcm", SampleRate: common.GetPointer(8000)}
+	usage := OpenaiTTSHandler(c, response, info)
+	assert.Equal(t, body, recorder.Body.String())
+	assert.Equal(t, 50, usage.CompletionTokenDetails.AudioTokens)
+	assert.Nil(t, info.ResponseFacts, "legacy relay must keep its existing billing path")
+}
+
 func TestMediaErrorUsageRetainedWithoutDelivery(t *testing.T) {
 	previousTimeout := constant.StreamingTimeout
 	constant.StreamingTimeout = 30

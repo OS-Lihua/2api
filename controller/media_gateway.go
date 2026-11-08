@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -533,8 +534,12 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		if info.IsStream && run.parsed.Protocol == protocol.OpenAIAudioSpeech && estimateDelivered {
 			output, clamp := common.QuotaRoundChecked(math.Ceil(float64(facts.DeliveredAudioBytes) / 1000))
 			if audio, ok := prepared.Request.(*dto.AudioRequest); ok && audio.ResponseFormat == "pcm" {
-				output, clamp = common.AudioDurationTokens(float64(facts.DeliveredAudioBytes) / float64(facts.AudioPCMBytesPerSecond()))
 				seconds := decimal.NewFromInt(facts.DeliveredAudioBytes).Div(decimal.NewFromInt(facts.AudioPCMBytesPerSecond())).String()
+				if facts.DeliveredAudioSeconds != nil {
+					seconds = *facts.DeliveredAudioSeconds
+				}
+				duration, _ := strconv.ParseFloat(seconds, 64)
+				output, clamp = common.AudioDurationTokens(duration)
 				billableFacts.AudioOutputSeconds = &seconds
 			}
 			if clamp != nil {

@@ -457,6 +457,9 @@ func (a *Protocol) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.Rel
 }
 
 func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.AudioRequest) (io.Reader, error) {
+	if request.SampleRate != nil && (*request.SampleRate <= 0 || *request.SampleRate > 1<<31-1) {
+		return nil, fmt.Errorf("invalid audio sample rate")
+	}
 	a.ResponseFormat = request.ResponseFormat
 	if info.RelayMode == relayconstant.RelayModeAudioSpeech {
 		jsonData, err := common.Marshal(request)
