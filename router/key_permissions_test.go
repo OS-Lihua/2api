@@ -180,9 +180,12 @@ func TestKeyPermissionsConcurrentEditsAndCredentialRestrictions(t *testing.T) {
 	endpoint := fmt.Sprintf("/api/token/%d/permissions", f.token.Id)
 	var group sync.WaitGroup
 	codes := make(chan int, 2)
-	for range 2 {
+	for _, update := range []struct{ method, body string }{
+		{http.MethodPut, `{"default_allow":false,"exception_ids":[],"revision":0}`},
+		{http.MethodPatch, `{"action":"deny_all","revision":0}`},
+	} {
 		group.Go(func() {
-			codes <- adminSecurityRequest(f.engine, pat, http.MethodPatch, endpoint, `{"action":"deny_all","revision":0}`).Code
+			codes <- adminSecurityRequest(f.engine, pat, update.method, endpoint, update.body).Code
 		})
 	}
 	group.Wait()
