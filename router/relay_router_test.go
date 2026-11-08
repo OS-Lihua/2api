@@ -4806,6 +4806,8 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 		{name: "Volcengine explicit silence zero", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, durationLimit: 1, extra: `,"metadata":{"request":{"silence_duration":0}}`},
 		{name: "Volcengine silence reservation", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"request":{"silence_duration":120000}}`, hold: 18_000_000},
 		{name: "Volcengine override silence reservation", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, overrides: `{"operations":[{"path":"request.silence_duration","mode":"set","value":120000}]}`, hold: 18_000_000},
+		{name: "Volcengine unsupported output override", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, overrides: `{"max_new_tokens":16}`, reject: true},
+		{name: "Volcengine unsupported nested output override", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, overrides: `{"operations":[{"path":"request.max_new_tokens","mode":"set","value":16}]}`, reject: true},
 		{name: "MiniMax unsupported output override", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, overrides: `{"max_new_tokens":16}`, reject: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

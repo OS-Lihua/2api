@@ -87,16 +87,37 @@ func (p *Provider) PrepareRequestBody(_ *gin.Context, metadata channel.ProviderM
 	if account.Protocol != protocol.OpenAIAudioSpeech {
 		return body, nil
 	}
-	var request VolcengineTTSRequest
-	if err := common.Unmarshal(body, &request); err != nil {
+	var fields map[string]common.RawMessage
+	if err := common.Unmarshal(body, &fields); err != nil {
 		return nil, err
+	}
+	if fields == nil {
+		return nil, errors.New("invalid Volcengine speech request")
+	}
+	var app map[string]common.RawMessage
+	if raw := fields["app"]; len(raw) > 0 {
+		if err := common.Unmarshal(raw, &app); err != nil {
+			return nil, err
+		}
+	}
+	if app == nil {
+		app = make(map[string]common.RawMessage)
 	}
 	appID, token, err := parseVolcengineAuth(account.ApiKey)
 	if err != nil {
 		return nil, err
 	}
-	request.App.AppID, request.App.Token = appID, token
-	return common.Marshal(request)
+	for name, value := range map[string]string{"appid": appID, "token": token} {
+		app[name], err = common.Marshal(value)
+		if err != nil {
+			return nil, err
+		}
+	}
+	fields["app"], err = common.Marshal(app)
+	if err != nil {
+		return nil, err
+	}
+	return common.Marshal(fields)
 }
 
 func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetadata, body io.Reader) (*http.Response, error) {
