@@ -2,10 +2,12 @@ package channel
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -480,7 +482,44 @@ func PrepareWssTransport(c *gin.Context, info *common.RelayInfo, fullRequestURL 
 }
 
 func DoPreparedWssRequest(c *gin.Context, request *PreparedWssRequest) (*websocket.Conn, error) {
-	targetConn, resp, err := request.dialer.DialContext(c.Request.Context(), request.url, request.header)
+	ctx := c.Request.Context()
+	dialer := request.dialer
+	networkDial := dialer.NetDialContext
+	if networkDial == nil {
+		networkDial = (&net.Dialer{}).DialContext
+		if dialer.NetDial != nil {
+			networkDial = func(_ context.Context, network, address string) (net.Conn, error) {
+				return request.dialer.NetDial(network, address)
+			}
+		}
+	}
+	var stopCancellation func() bool
+	watchHandshake := func(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+		return func(dialContext context.Context, network, address string) (net.Conn, error) {
+			connection, err := dial(dialContext, network, address)
+			if err == nil {
+				stopCancellation = context.AfterFunc(ctx, func() { _ = connection.Close() })
+			}
+			return connection, err
+		}
+	}
+	dialer.NetDialContext = watchHandshake(networkDial)
+	if dialer.NetDialTLSContext != nil {
+		dialer.NetDialTLSContext = watchHandshake(dialer.NetDialTLSContext)
+	}
+	// Gorilla applies context deadlines to the handshake, but cancellation after
+	// TCP connect also needs to close the connection while reading HTTP headers.
+	targetConn, resp, err := dialer.DialContext(ctx, request.url, request.header)
+	if stopCancellation != nil {
+		stopCancellation()
+	}
+	if ctx.Err() != nil {
+		if targetConn != nil {
+			_ = targetConn.Close()
+			targetConn = nil
+		}
+		err = context.Cause(ctx)
+	}
 	if resp != nil {
 		request.statusCode = resp.StatusCode
 	}

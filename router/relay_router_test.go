@@ -567,6 +567,118 @@ func dialRealtimeGateway(t *testing.T, fixture textGatewayFixture) *websocket.Co
 	return client
 }
 
+func TestRealtimeGatewayHandshakeFailoverLocksWinningProvider(t *testing.T) {
+	var rejected, accepted atomic.Int32
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		rejected.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"code":"insufficient_quota","type":"insufficient_quota"}}`)
+	})
+	require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", protocol.OpenAIRealtime).Error)
+	winner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		accepted.Add(1)
+		assert.Equal(t, "Bearer winning-key", r.Header.Get("Authorization"))
+		peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if !assert.NoError(t, err) {
+			return
+		}
+		defer peer.Close()
+		if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"modalities":["text"],"turn_detection":null}}`))) {
+			return
+		}
+		if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
+			return
+		}
+		for _, raw := range []string{`{"type":"response.created","response":{"id":"winner","status":"in_progress","conversation_id":null}}`, `{"type":"response.text.delta","response_id":"winner","delta":"hello","output_index":0}`, `{"type":"response.done","response":{"id":"winner","status":"completed","conversation_id":null,"usage":{"input_tokens":1000,"output_tokens":10}}}`} {
+			if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(raw))) {
+				return
+			}
+		}
+		_, _, _ = peer.ReadMessage()
+	}))
+	defer winner.Close()
+	provider := &model.Provider{Name: "Winning Provider", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Key: "winning-key", BaseURL: &winner.URL}
+	require.NoError(t, model.DB.Create(provider).Error)
+	var channels []model.Channel
+	for _, providerID := range []int{fixture.channel.ProviderID, provider.Id} {
+		channel := *fixture.channel
+		channel.ID, channel.ProviderID, channel.Protocol = 0, providerID, protocol.OpenAIRealtime
+		if providerID == fixture.channel.ProviderID {
+			channel.UpstreamModelName = "unavailable-sibling"
+		}
+		require.NoError(t, model.DB.Create(&channel).Error)
+		price := *fixture.purchase
+		price.ID, price.OwnerID = 0, channel.ID
+		require.NoError(t, model.CreatePriceVersion(t.Context(), &price, fixture.sale.CreatedBy))
+		channels = append(channels, channel)
+	}
+	client := dialRealtimeGateway(t, fixture)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, _, err := client.ReadMessage()
+	require.NoError(t, err)
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"conversation":"none","input":[],"output_modalities":["text"]}}`)))
+	for {
+		_, raw, err := client.ReadMessage()
+		require.NoError(t, err)
+		if ojson.GetBytes(raw, "type").String() == "response.done" {
+			break
+		}
+	}
+	require.NoError(t, client.Close())
+	assert.Equal(t, int32(1), rejected.Load(), "An account quota failure excludes sibling Channels on that Provider")
+	assert.Equal(t, int32(1), accepted.Load())
+	var records []model.GatewayRequest
+	require.Eventually(t, func() bool {
+		var count int64
+		var err error
+		records, count, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+		return err == nil && count == 1 && len(records) == 1 && records[0].Status == "success"
+	}, 5*time.Second, 10*time.Millisecond)
+	attempts, count, err := model.ListGatewayAttempts(t.Context(), records[0].ID, 0, 10)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), count)
+	require.Len(t, attempts, 1)
+	assert.Equal(t, channels[1].ID, attempts[0].ChannelID)
+	assert.Equal(t, provider.Id, attempts[0].ProviderID)
+	assertTextGatewayLedger(t, records[0], 1_020_000)
+}
+
+func TestRealtimeGatewayDisconnectCancelsUpstreamHandshake(t *testing.T) {
+	started, canceled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	defer close(release)
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		select {
+		case <-r.Context().Done():
+			close(canceled)
+		case <-release:
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	})
+	require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", protocol.OpenAIRealtime).Error)
+	server := newRealtimeGatewayServer(t, fixture.engine)
+	connection, err := net.DialTimeout("tcp", strings.TrimPrefix(server.URL, "http://"), time.Second)
+	require.NoError(t, err)
+	defer connection.Close()
+	_, err = fmt.Fprintf(connection, "GET /v1/realtime?model=gateway-alias HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: %s\r\nAuthorization: Bearer sk-%s\r\n\r\n", strings.TrimPrefix(server.URL, "http://"), base64.StdEncoding.EncodeToString(make([]byte, 16)), fixture.token.Key)
+	require.NoError(t, err)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Upstream handshake did not start")
+	}
+	require.NoError(t, connection.Close())
+	select {
+	case <-canceled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Client disconnect did not cancel the upstream handshake")
+	}
+	var generations int64
+	require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Where("user_id = ?", fixture.user.Id).Count(&generations).Error)
+	assert.Zero(t, generations)
+}
+
 func TestRealtimeGatewayRejectsFixedPricingBeforeReservation(t *testing.T) {
 	for _, owner := range []string{"sale", "purchase"} {
 		t.Run(owner, func(t *testing.T) {

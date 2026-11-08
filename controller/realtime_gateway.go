@@ -165,13 +165,12 @@ func RealtimeGateway(c *gin.Context) {
 		session.workers.Wait()
 		return
 	}
-	client, err := upgrader.Upgrade(c.Writer, c.Request, nil)
-	if err != nil {
-		session.finish(first, realtimeGatewayCompletion{apiErr: types.NewError(err, types.ErrorCodeInvalidRequest)})
-		session.workers.Wait()
-		return
-	}
-	defer client.Close()
+	var client *websocket.Conn
+	defer func() {
+		if client != nil {
+			_ = client.Close()
+		}
+	}()
 	for {
 		transportInfo := *first.info
 		transportInfo.ClientWs = client
@@ -185,19 +184,29 @@ func RealtimeGateway(c *gin.Context) {
 		transportInfo.RealtimeBusinessOutput = session.businessOutput
 		transportInfo.RealtimePeerClosed = session.peerClosed
 		nativeContext := c.Copy()
-		nativeContext.Request = c.Request.WithContext(ioContext)
-		first.stopTimeout = context.AfterFunc(first.context, func() { cancel(context.Cause(first.context)) })
-		_, exchangeErr := relay.ExchangeRealtime(nativeContext, &transportInfo, first.prepared, func() {
+		nativeContext.Request = c.Request.WithContext(first.context)
+		_, exchangeErr := relay.ExchangeRealtime(nativeContext, &transportInfo, first.prepared, func() error {
 			session.channelID, session.providerID, session.providerType = first.channelID, first.providerID, first.info.ChannelType
 			session.tokenizerModel = first.info.TokenizerModelName()
 			session.capabilities = first.response.call.Native.Capabilities
 			session.keyIndex, session.upstreamModel = first.info.ChannelMultiKeyIndex, first.info.UpstreamModelName
 			session.identity = first.prepared.Identity()
 			first.response.established = true
+			var upgradeErr error
+			client, upgradeErr = upgrader.Upgrade(c.Writer, c.Request, nil)
+			if upgradeErr != nil {
+				session.clientGone = true
+				cancelRequests()
+				return upgradeErr
+			}
+			transportInfo.ClientWs = client
+			nativeContext.Request = c.Request.WithContext(ioContext)
+			first.stopTimeout = context.AfterFunc(first.context, func() { cancel(context.Cause(first.context)) })
 			if first.response.call.Native.ConnectionReady != nil {
 				first.response.call.Native.ConnectionReady()
 			}
 			first.response.call.Native.Budget.Pause()
+			return nil
 		})
 		if !first.response.established {
 			session.pending = nil
@@ -206,6 +215,12 @@ func RealtimeGateway(c *gin.Context) {
 			if apiErr == nil {
 				continue
 			}
+			if client == nil && c.Request.Context().Err() == nil {
+				gatewayError(c, apiErr.StatusCode, string(apiErr.GetErrorCode()), apiErr.Error())
+			}
+			cancelRequests()
+			session.workers.Wait()
+			return
 		}
 		if session.clientGone {
 			cancelRequests()

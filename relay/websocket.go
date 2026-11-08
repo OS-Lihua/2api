@@ -43,13 +43,13 @@ func WssHelper(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
 }
 
 // ExchangeRealtime uses the existing native transport with a prepared account.
-func ExchangeRealtime(c *gin.Context, info *relaycommon.RelayInfo, prepared *relaychannel.PreparedWssRequest, connected func()) (any, *types.NewAPIError) {
+func ExchangeRealtime(c *gin.Context, info *relaycommon.RelayInfo, prepared *relaychannel.PreparedWssRequest, connected func() error) (any, *types.NewAPIError) {
 	return exchangeRealtime(c, info, prepared, connected)
 }
 
 // exchangeRealtime is the native session transport shared by legacy and wallet
 // requests. The caller owns the request's reservation and final settlement.
-func exchangeRealtime(c *gin.Context, info *relaycommon.RelayInfo, prepared *relaychannel.PreparedWssRequest, connected func()) (any, *types.NewAPIError) {
+func exchangeRealtime(c *gin.Context, info *relaycommon.RelayInfo, prepared *relaychannel.PreparedWssRequest, connected func() error) (any, *types.NewAPIError) {
 	if prepared == nil {
 		info.InitChannelMeta(c)
 	}
@@ -77,6 +77,11 @@ func exchangeRealtime(c *gin.Context, info *relaycommon.RelayInfo, prepared *rel
 	}
 	info.TargetWs = target
 	defer target.Close()
+	if connected != nil {
+		if err := connected(); err != nil {
+			return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
+		}
+	}
 	var closeOnce sync.Once
 	unregister := wsmanager.Register(info.ChannelId, wsmanager.KindRealtime, func(reason string) {
 		closeOnce.Do(func() {
@@ -89,9 +94,6 @@ func exchangeRealtime(c *gin.Context, info *relaycommon.RelayInfo, prepared *rel
 		})
 	})
 	defer unregister()
-	if connected != nil {
-		connected()
-	}
 	var usage any
 	var apiErr *types.NewAPIError
 	if prepared != nil {
