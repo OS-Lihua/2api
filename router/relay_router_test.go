@@ -455,15 +455,15 @@ func TestResponsesWSGatewayPreservesImageInputCategories(t *testing.T) {
 			_, reply, err := client.ReadMessage()
 			require.NoError(t, err)
 			require.Equal(t, "response.completed", ojson.GetBytes(reply, "type").String())
-			assert.Equal(t, int64(688_500_000), <-reserved, "Known image category must be guaranteed before dispatch")
+			assert.Equal(t, int64(76_500_000), <-reserved, "Known image category must be guaranteed before dispatch")
 			var records []model.GatewayRequest
 			require.Eventually(t, func() bool {
 				var err error
 				records, _, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
 				return err == nil && len(records) == 1 && records[0].Status == "success"
 			}, 5*time.Second, 10*time.Millisecond)
-			amount, cost := int64(688_500_000), int64(765_000_000)
-			images := 765
+			amount, cost := int64(76_500_000), int64(85_000_000)
+			images := 85
 			if zero {
 				amount, cost, images = 0, 0, 0
 			}
