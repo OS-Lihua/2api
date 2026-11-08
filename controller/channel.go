@@ -122,7 +122,7 @@ func disableMultiKeyChannelIfUnavailable(channel *model.Provider) bool {
 }
 
 func restoreMultiKeyChannelIfAvailable(channel *model.Provider) {
-	if channel.Status != common.ChannelStatusManuallyDisabled || !hasEnabledMultiKey(channel) {
+	if (channel.Status != common.ChannelStatusManuallyDisabled && channel.Status != common.ChannelStatusAutoDisabled) || !hasEnabledMultiKey(channel) {
 		return
 	}
 	info := channel.GetOtherInfo()
