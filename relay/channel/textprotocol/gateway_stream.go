@@ -152,6 +152,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		if resp.StatusCode != http.StatusOK {
 			return
 		}
+		output.sourceTerminal = gatewaySuccessfulTerminal(normalized, p.format)
 		if p.format == info.RelayFormat {
 			if _, err := writeGatewayStreamResult(c, info, json.RawMessage(normalized), &output); err != nil {
 				streamErr = err
@@ -281,22 +282,8 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 			return "", err
 		}
 	}
-	terminal := false
-	switch info.RelayFormat {
-	case types.RelayFormatClaude:
-		terminal = event == "message_stop" || event == "message_delta" && gjson.GetBytes(body, "delta.stop_reason").String() != ""
-	case types.RelayFormatOpenAIResponses:
-		terminal = event == "response.completed" || event == "response.done"
-	case types.RelayFormatOpenAI:
-		for _, choice := range gjson.GetBytes(body, "choices").Array() {
-			terminal = terminal || choice.Get("finish_reason").String() != "" || choice.Get("delta.audio.expires_at").Type == gjson.Number
-		}
-	case types.RelayFormatGemini:
-		for _, candidate := range gjson.GetBytes(body, "candidates").Array() {
-			terminal = terminal || candidate.Get("finishReason").String() != ""
-		}
-	}
-	if terminal && !output.terminalReady && !info.PerformanceBusinessRejection {
+	terminal := gatewaySuccessfulTerminal(body, info.RelayFormat)
+	if (terminal || output.sourceTerminal || len(output.pendingTerminal) > 0) && !output.terminalReady && !info.PerformanceBusinessRejection {
 		// Terminal snapshots can contain complete image or audio payloads.
 		if output.terminalBytes+len(body) > 64<<20 {
 			return "", helper.ErrGatewayStreamPreludeLimit
@@ -351,6 +338,31 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 		info.ResponseFacts.MarkBusinessOutput()
 	}
 	return text, writeErr
+}
+
+func gatewaySuccessfulTerminal(body []byte, format types.RelayFormat) bool {
+	root := gjson.ParseBytes(body)
+	switch format {
+	case types.RelayFormatClaude:
+		event := root.Get("type").String()
+		return event == "message_stop" || event == "message_delta" && root.Get("delta.stop_reason").String() != ""
+	case types.RelayFormatOpenAIResponses:
+		event := root.Get("type").String()
+		return event == "response.completed" || event == "response.done"
+	case types.RelayFormatOpenAI:
+		for _, choice := range root.Get("choices").Array() {
+			if choice.Get("finish_reason").String() != "" || choice.Get("delta.audio.expires_at").Type == gjson.Number {
+				return true
+			}
+		}
+	case types.RelayFormatGemini:
+		for _, candidate := range root.Get("candidates").Array() {
+			if candidate.Get("finishReason").String() != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func gatewayStreamBusinessText(body []byte, format types.RelayFormat) string {

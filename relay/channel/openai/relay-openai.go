@@ -223,17 +223,19 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		}
 	}
 
+	generatedUsage := service.ResponseText2Usage(c, responseTextBuilder.String(), info.TokenizerModelName(), info.GetEstimatePromptTokens())
+	generatedUsage.CompletionTokens += toolCount * 7
 	if info.ResponseFacts != nil {
 		containStreamUsage = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 		info.ResponseFacts.UsageReported = containStreamUsage
 		info.ResponseFacts.GeneratedText = responseTextBuilder.String()
+		info.ResponseFacts.GeneratedOutputTokens = &generatedUsage.CompletionTokens
 		if containStreamUsage {
 			usage = reportedStreamUsage
 		}
 	}
 	if !containStreamUsage {
-		usage = service.ResponseText2Usage(c, responseTextBuilder.String(), info.TokenizerModelName(), info.GetEstimatePromptTokens())
-		usage.CompletionTokens += toolCount * 7
+		usage = generatedUsage
 		if info.ResponseFacts != nil && reportedStreamUsage != nil {
 			snapshot := *reportedStreamUsage
 			if !info.ResponseFacts.PromptTokensReported {

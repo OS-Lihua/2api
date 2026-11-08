@@ -17,6 +17,7 @@ type gatewayToolOutput struct{ name, arguments string }
 type gatewayGeneratedOutput struct {
 	pendingTerminal []json.RawMessage
 	terminalBytes   int
+	sourceTerminal  bool
 	terminalReady   bool
 	text            strings.Builder
 	parts           map[string]*strings.Builder

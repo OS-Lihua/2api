@@ -108,6 +108,50 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		return usage, types.NewError(fmt.Errorf("upstream returned JSON for a stream request"), types.ErrorCodeBadResponse)
 	}
 	observeGatewaySafety(info, body, p.format)
+	var sourceOutput gatewayGeneratedOutput
+	root := gjson.ParseBytes(body)
+	switch p.format {
+	case types.RelayFormatOpenAIResponses:
+		for index, item := range root.Get("output").Array() {
+			sourceOutput.ObserveItem(int64(index), item)
+		}
+	case types.RelayFormatClaude:
+		for _, block := range root.Get("content").Array() {
+			sourceOutput.text.WriteString(gatewayMessagesBlockText(block))
+		}
+	case types.RelayFormatGemini:
+		for _, candidate := range root.Get("candidates").Array() {
+			for _, part := range candidate.Get("content.parts").Array() {
+				sourceOutput.text.WriteString(gatewayGeminiPartText(part))
+			}
+		}
+	case types.RelayFormatOpenAI:
+		for _, choice := range root.Get("choices").Array() {
+			message := choice.Get("message")
+			content := message.Get("content")
+			if content.Type == gjson.String {
+				sourceOutput.text.WriteString(content.String())
+			} else {
+				for _, part := range content.Array() {
+					sourceOutput.text.WriteString(part.Get("text").String())
+				}
+			}
+			reasoning := message.Get("reasoning_content")
+			if !reasoning.Exists() {
+				reasoning = message.Get("reasoning")
+			}
+			sourceOutput.text.WriteString(reasoning.String())
+			sourceOutput.text.WriteString(message.Get("refusal").String())
+			sourceOutput.text.WriteString(message.Get("audio.transcript").String())
+			for _, tool := range message.Get("tool_calls").Array() {
+				for _, path := range []string{"function.name", "function.arguments", "custom.name", "custom.input"} {
+					sourceOutput.text.WriteString(tool.Get(path).String())
+				}
+			}
+		}
+	}
+	facts.SourceGeneratedText = sourceOutput.String()
+	facts.SourceOutputObserved = facts.SourceGeneratedText != "" || gatewayMediaOutput(body, p.format)
 	var response any
 	switch p.kind {
 	case protocol.OpenAIChat:
@@ -168,8 +212,6 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 			generated.WriteString(choice.Get("message.audio.transcript").String())
 		}
 	}
-	facts.SourceGeneratedText = generated.String()
-	facts.SourceOutputObserved = facts.SourceGeneratedText != "" || gatewayMediaOutput(body, p.format)
 	facts.GeneratedText = generated.String()
 	if !facts.PromptTokensReported {
 		usage.PromptTokens = max(usage.PromptTokens, info.GetEstimatePromptTokens())

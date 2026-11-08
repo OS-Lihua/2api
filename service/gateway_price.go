@@ -200,6 +200,30 @@ func exactGatewayTokens(usage *dto.Usage, used map[string]bool) (map[string]deci
 		"cr": cr, "cc": cc, "cc1h": cc1h, "cc12h": cc12h, "img": img, "img_cr": imgCR, "img_o": imgO, "ai": ai, "ao": ao}, nil
 }
 
+// GatewayUsageSnapshot retains quantitative pricing facts without provider
+// extensions, request content or arbitrary source/semantic strings.
+func GatewayUsageSnapshot(usage *dto.Usage) *dto.Usage {
+	if usage == nil {
+		return nil
+	}
+	snapshot := *usage
+	snapshot.Cost, snapshot.BillingUsage = nil, nil
+	snapshot.UsageSource = ""
+	if snapshot.UsageSemantic != "anthropic" {
+		snapshot.UsageSemantic = ""
+	}
+	snapshot.PromptTokensDetails = usage.PromptTokensDetails.Clone()
+	if usage.InputTokensDetails != nil {
+		details := usage.InputTokensDetails.Clone()
+		snapshot.InputTokensDetails = &details
+	}
+	if usage.OutputTokensDetails != nil {
+		details := *usage.OutputTokensDetails
+		snapshot.OutputTokensDetails = &details
+	}
+	return &snapshot
+}
+
 func GatewayRecordUsage(usage *dto.Usage) model.GatewayUsage {
 	if usage == nil {
 		return model.GatewayUsage{}

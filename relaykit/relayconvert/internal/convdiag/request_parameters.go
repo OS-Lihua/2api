@@ -35,8 +35,8 @@ func InspectRequestParameters(ctx context.Context, source, target any, from, to 
 		for _, paths := range [][4]string{
 			{"temperature", "temperature", "temperature", "generationConfig.temperature"},
 			{"top_p", "top_p", "top_p", "generationConfig.topP"},
-			{"top_k", "", "top_k", "generationConfig.topK"},
-			{"stop", "", "stop_sequences", "generationConfig.stopSequences"},
+			{"top_k", "top_k", "top_k", "generationConfig.topK"},
+			{"stop", "stop", "stop_sequences", "generationConfig.stopSequences"},
 			{"seed", "", "", "generationConfig.seed"},
 			{"presence_penalty", "presence_penalty", "", "generationConfig.presencePenalty"},
 			{"frequency_penalty", "frequency_penalty", "", "generationConfig.frequencyPenalty"},
