@@ -43,12 +43,15 @@ export function RequestIdentifier(props: { value: string; label: string }) {
   )
 }
 
-export function RequestMoney(props: { amount?: MoneyAmount }) {
-  const { i18n } = useTranslation()
+export function RequestMoney(props: {
+  amount?: MoneyAmount
+  pending?: boolean
+}) {
+  const { t, i18n } = useTranslation()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   return (
     <span className='font-mono text-xs break-all whitespace-normal tabular-nums'>
-      {formatMoneyAmount(props.amount, locale)}
+      {props.pending ? t('Pending') : formatMoneyAmount(props.amount, locale)}
     </span>
   )
 }

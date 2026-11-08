@@ -454,6 +454,10 @@ func TestAsyncTaskRemixRetainsOriginalProviderAfterChannelEdit(t *testing.T) {
 	replacement := &model.Provider{Name: "Replacement task account", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Key: "replacement-secret", BaseURL: &other.URL}
 	require.NoError(t, model.DB.Create(replacement).Error)
 	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"provider_id": replacement.Id, "upstream_model_name": "different-model"}).Error)
+	expensive := fmt.Sprintf(`{"model":"gateway-alias","prompt":"A longer green bird","action":"remix","seconds":"20","origin_task_ids":[%q]}`, original.TaskID)
+	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", expensive)
+	require.Equal(t, 402, response.Code, response.Body.String())
+	assert.Equal(t, 1, calls, "explicit remix quantities must be funded before dispatch")
 	body := fmt.Sprintf(`{"model":"gateway-alias","prompt":"A green bird","action":"remix","origin_task_ids":[%q]}`, original.TaskID)
 	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", body)
 	require.Equal(t, 200, response.Code, response.Body.String())

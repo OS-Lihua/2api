@@ -740,7 +740,7 @@ it('shows pending task facts in the existing request view and preserves explicit
     },
   })
   renderRequests()
-  expect(await screen.findByText('Pending')).toBeVisible()
+  expect(await screen.findAllByText('Pending')).toHaveLength(2)
   const usage = screen.getByRole('group', { name: 'Task usage' })
   expect(within(usage).getByText('seconds')).toBeVisible()
   expect(within(usage).getByText('2.5')).toBeVisible()
@@ -749,3 +749,77 @@ it('shows pending task facts in the existing request view and preserves explicit
   expect(within(usage).getByText('720x1280')).toBeVisible()
   expect(within(usage).queryByText('Total tokens')).not.toBeInTheDocument()
 })
+
+it.each(['pending', 'submission_unknown'])(
+  'shows %s task amounts as pending and preserves explicit zero after completion',
+  async (status) => {
+    useAuthStore.getState().auth.setUser({
+      id: 7,
+      username: 'admin',
+      role: 10,
+      permissions: { admin_permissions: { request: { read: true } } },
+    })
+    let completed = false
+    api.defaults.adapter = async (config) => {
+      const attempts = new URL(
+        api.getUri(config),
+        'http://localhost'
+      ).pathname.endsWith('/attempts')
+      const currentStatus = completed ? 'success' : status
+      return {
+        config,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        data: {
+          success: true,
+          data: {
+            items: attempts
+              ? [
+                  {
+                    ...internalAttempt,
+                    status: currentStatus,
+                    cost: { nanos: '0', currency: 'EUR' },
+                    converted_cost: { nanos: '0', currency: 'USD' },
+                  },
+                ]
+              : [
+                  {
+                    ...request,
+                    status: currentStatus,
+                    receivable: { nanos: '0', currency: 'USD' },
+                  },
+                ],
+            total: 1,
+            page: 1,
+            page_size: 20,
+          },
+        },
+      }
+    }
+    const user = userEvent.setup()
+    renderRequests()
+    await screen.findByText('chat-standard')
+    expect(screen.queryByText('0 USD')).not.toBeInTheDocument()
+    await user.click(
+      screen.getByRole('button', {
+        name: `View attempts for request ${requestId}`,
+      })
+    )
+    let drawer = await screen.findByRole('dialog', { name: 'Request attempts' })
+    await within(drawer).findByText(internalAttempt.id)
+    expect(within(drawer).queryByText('0 USD')).not.toBeInTheDocument()
+    expect(within(drawer).queryByText('0 EUR')).not.toBeInTheDocument()
+    await user.click(within(drawer).getByRole('button', { name: 'Close' }))
+    completed = true
+    await user.click(screen.getByRole('button', { name: 'Search' }))
+    expect(await screen.findByText('0 USD')).toBeVisible()
+    await user.click(
+      screen.getByRole('button', {
+        name: `View attempts for request ${requestId}`,
+      })
+    )
+    drawer = await screen.findByRole('dialog', { name: 'Request attempts' })
+    expect(await within(drawer).findByText('0 EUR')).toBeVisible()
+  }
+)

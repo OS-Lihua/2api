@@ -58,7 +58,13 @@ export function RequestSummary(props: {
         <div>
           <dt className='text-muted-foreground'>{t('Charge')}</dt>
           <dd className='mt-1'>
-            <RequestMoney amount={request.receivable} />
+            <RequestMoney
+              amount={request.receivable}
+              pending={
+                request.status === 'pending' ||
+                request.status === 'submission_unknown'
+              }
+            />
           </dd>
         </div>
         {fields.map(([label, value]) => (
