@@ -878,8 +878,14 @@ func TestBaiduTokenPreparationRejectsUntrustedTLS(t *testing.T) {
 	require.True(t, ok)
 	err := preparer.PrepareAccount(t.Context(), &channel.ProviderRequest{ApiKey: strings.Join([]string{"budget37-tls-verification", "fake"}, "|")}, func() (context.Context, error) { return t.Context(), nil })
 	require.Error(t, err)
-	var invalid x509.UnknownAuthorityError
+	var invalid *tls.CertificateVerificationError
 	assert.ErrorAs(t, err, &invalid)
+	untrusted, err := service.GetVerifiedHttpClientWithProxy("")
+	require.NoError(t, err)
+	_, err = untrusted.Get(server.URL)
+	untrusted.CloseIdleConnections()
+	var unknownAuthority x509.UnknownAuthorityError
+	assert.ErrorAs(t, err, &unknownAuthority)
 	legacy := relay.GetProviderAdapter(constant.APITypeBaidu)
 	_, err = legacy.RequestURL(&channel.ProviderRequest{ApiKey: t.Name() + "-legacy|fake", ChannelBaseUrl: server.URL, UpstreamModelName: "ERNIE-Bot"})
 	require.Error(t, err, "legacy cache misses must use the same verified token source")
