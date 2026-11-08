@@ -98,7 +98,8 @@ func TestKeyPermissionsLegacyAllowlistMigration(t *testing.T) {
 
 func TestKeyPermissionsDiscoveryProtocols(t *testing.T) {
 	f := newTextGatewayFixture(t, func(http.ResponseWriter, *http.Request) { t.Error("unexpected dispatch") })
-	f.offering.Aliases = append(f.offering.Aliases, "*gateway-alias")
+	require.NoError(t, model.DB.AutoMigrate(&model.Task{}))
+	f.offering.Aliases = append(f.offering.Aliases, "*gateway-alias", "gateway-alias/operations/task_sample")
 	require.NoError(t, model.SaveModelOffering(t.Context(), f.offering, "save"))
 	t.Setenv("TRUSTED_PROXIES", "")
 	source, err := plugins.Source("google")
@@ -117,7 +118,7 @@ func TestKeyPermissionsDiscoveryProtocols(t *testing.T) {
 		assert.Equal(t, http.StatusMovedPermanently, response.Code, response.Body.String())
 		assert.Equal(t, strings.TrimSuffix(path, "/")+"?limit=7", response.Header().Get("Location"))
 	}
-	for _, tc := range []struct{ path, header, field string }{{"/v1/models/gateway-alias", "x-api-key", "type"}, {"/v1beta/models/gateway-alias", "x-goog-api-key", "name"}, {"/v1beta/models/%2Agateway-alias", "x-goog-api-key", "name"}} {
+	for _, tc := range []struct{ path, header, field string }{{"/v1/models/gateway-alias", "x-api-key", "type"}, {"/v1beta/models/gateway-alias", "x-goog-api-key", "name"}, {"/v1beta/models/%2Agateway-alias", "x-goog-api-key", "name"}, {"/v1beta/models/gateway-alias%2Foperations%2Ftask_sample", "x-goog-api-key", "name"}} {
 		request := httptest.NewRequest(http.MethodGet, tc.path, nil)
 		request.Header.Set(tc.header, f.token.Key)
 		request.Header.Set("anthropic-version", "2023-06-01")
@@ -138,7 +139,7 @@ func TestKeyPermissionsDiscoveryProtocols(t *testing.T) {
 		assert.Equal(t, 404, response.Code)
 		assert.Contains(t, response.Body.String(), language.message)
 	}
-	for _, tc := range []struct{ path, header, expected string }{{"/v1/models/gateway-alias", "x-api-key", `"type":"not_found_error"`}, {"/v1beta/models/gateway-alias", "x-goog-api-key", `"status":"NOT_FOUND"`}, {"/v1beta/models/%2Agateway-alias", "x-goog-api-key", `"status":"NOT_FOUND"`}, {"/v1beta/models/%2Amissing", "x-goog-api-key", `"status":"NOT_FOUND"`}} {
+	for _, tc := range []struct{ path, header, expected string }{{"/v1/models/gateway-alias", "x-api-key", `"type":"not_found_error"`}, {"/v1beta/models/gateway-alias", "x-goog-api-key", `"status":"NOT_FOUND"`}, {"/v1beta/models/%2Agateway-alias", "x-goog-api-key", `"status":"NOT_FOUND"`}, {"/v1beta/models/%2Amissing", "x-goog-api-key", `"status":"NOT_FOUND"`}, {"/v1beta/models/gateway-alias%2Foperations%2Ftask_sample", "x-goog-api-key", `"status":"NOT_FOUND"`}, {"/v1beta/models/missing%2Foperations%2Ftask_sample", "x-goog-api-key", `"status":"NOT_FOUND"`}} {
 		request := httptest.NewRequest(http.MethodGet, tc.path, nil)
 		request.Header.Set(tc.header, f.token.Key)
 		request.Header.Set("anthropic-version", "2023-06-01")

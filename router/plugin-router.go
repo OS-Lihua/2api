@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -645,10 +646,14 @@ func parseRoutePattern(routePath string) []routePatternSegment {
 	return segments
 }
 
-func routeMatchesPath(pattern, path string) bool {
+func routeMatchesPath(pattern, escapedPath string) bool {
 	segments := parseRoutePattern(pattern)
 	index := 0
-	for part := range strings.SplitSeq(strings.TrimPrefix(path, "/"), "/") {
+	for encodedPart := range strings.SplitSeq(strings.TrimPrefix(escapedPath, "/"), "/") {
+		part, err := url.PathUnescape(encodedPart)
+		if err != nil {
+			return false
+		}
 		if index >= len(segments) {
 			return false
 		}

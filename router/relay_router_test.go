@@ -157,6 +157,7 @@ func TestGeminiRelayHandsLongRunningPredictionToPluginRoute(t *testing.T) {
 	}{
 		{method: http.MethodPost, path: "/v1beta/models/veo-3.1-generate-preview:predictLongRunning", toPlugin: true},
 		{method: http.MethodGet, path: "/v1beta/models/veo-3.1-generate-preview/operations/task_sample", toPlugin: true},
+		{method: http.MethodGet, path: "/v1beta/models/veo-3.1-generate-preview/oper%61tions/task_sample", toPlugin: true},
 		{method: http.MethodPost, path: "/v1beta/models/gemini-2.5-flash:generateContent"},
 	} {
 		t.Run(testCase.path, func(t *testing.T) {
