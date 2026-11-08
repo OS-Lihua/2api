@@ -1335,6 +1335,9 @@ func (r *OpenAIResponsesRequest) ParseInput() []MediaInput {
 								fileUrl = url
 							}
 						}
+						if fileUrl == "" {
+							fileUrl, _ = item["file_data"].(string)
+						}
 						mediaInputs = append(mediaInputs, MediaInput{Type: "input_file", FileUrl: fileUrl})
 					}
 				}

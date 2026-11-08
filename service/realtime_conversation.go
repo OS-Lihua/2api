@@ -52,6 +52,9 @@ type RealtimeConversation struct {
 	model, inputFormat                        string
 	items                                     map[string]realtimeConversationItem
 	outputs                                   map[string]realtimeConversationOutput
+	additions, calibrated, calibratedAt       realtimeInputQuantity
+	calibrationValid                          bool
+	epoch                                     uint64
 	current                                   realtimeInputQuantity
 	identityBytes, limit                      int
 	audioBytes                                int64
@@ -69,6 +72,33 @@ func NewRealtimeConversation(c *gin.Context, model string) *RealtimeConversation
 
 func (conversation *RealtimeConversation) Pending() bool { return conversation.pendingID != "" }
 
+func (conversation *RealtimeConversation) changeInput(previous, next realtimeInputQuantity) {
+	conversation.current = conversation.current.subtract(previous).add(next)
+	delta := next.subtract(previous)
+	if delta.total < 0 || delta.audio < 0 || delta.image < 0 || delta.audioItems < 0 || delta.imageItems < 0 {
+		conversation.epoch++
+		conversation.calibrationValid = false
+		conversation.additions = realtimeInputQuantity{}
+		return
+	}
+	conversation.additions = conversation.additions.add(delta)
+}
+
+func (conversation *RealtimeConversation) inputQuantity() realtimeInputQuantity {
+	quantity := conversation.current
+	if !conversation.calibrationValid {
+		return quantity
+	}
+	calibrated := conversation.calibrated.add(conversation.additions.subtract(conversation.calibratedAt))
+	quantity.total = max(quantity.total, calibrated.total)
+	quantity.audio = max(quantity.audio, calibrated.audio)
+	quantity.image = max(quantity.image, calibrated.image)
+	quantity.audioItems = max(quantity.audioItems, calibrated.audioItems)
+	quantity.imageItems = max(quantity.imageItems, calibrated.imageItems)
+	quantity.total = max(quantity.total, quantity.audio+quantity.image)
+	return quantity
+}
+
 func (conversation *RealtimeConversation) store(id string, item realtimeConversationItem) error {
 	if id == "" {
 		return errors.New("Realtime conversation item has no identity")
@@ -79,12 +109,14 @@ func (conversation *RealtimeConversation) store(id string, item realtimeConversa
 		}
 		conversation.identityBytes += len(id) + 256
 	}
+	before, after := realtimeInputQuantity{}, realtimeInputQuantity{}
 	if previous, exists := conversation.items[id]; exists && previous.accepted && previous.response == "" {
-		conversation.current = conversation.current.subtract(previous.quantity)
+		before = previous.quantity
 	}
 	if item.accepted && item.response == "" {
-		conversation.current = conversation.current.add(item.quantity)
+		after = item.quantity
 	}
+	conversation.changeInput(before, after)
 	conversation.items[id] = item
 	return nil
 }
@@ -238,7 +270,7 @@ func (conversation *RealtimeConversation) Observe(raw []byte, client bool) ([]by
 			item.quantity.audio = min(previous.audio, int(milliseconds/50))
 			item.quantity.total = item.quantity.audio + item.quantity.image
 			if item.accepted && item.response == "" {
-				conversation.current = conversation.current.subtract(previous).add(item.quantity)
+				conversation.changeInput(previous, item.quantity)
 			}
 			conversation.items[id] = item
 			if output, exists := conversation.outputs[item.response]; exists {
@@ -246,7 +278,7 @@ func (conversation *RealtimeConversation) Observe(raw []byte, client bool) ([]by
 				output.quantity.total -= previous.total - item.quantity.total
 				output.quantity.audio -= previous.audio - item.quantity.audio
 				if output.defaultConversation {
-					conversation.current = conversation.current.subtract(previousOutput).add(output.quantity)
+					conversation.changeInput(previousOutput, output.quantity)
 				}
 				conversation.outputs[item.response] = output
 			}
@@ -271,7 +303,7 @@ func (conversation *RealtimeConversation) remove(id string) {
 		return
 	}
 	if item.accepted && item.response == "" {
-		conversation.current = conversation.current.subtract(item.quantity)
+		conversation.changeInput(item.quantity, realtimeInputQuantity{})
 	}
 	if output, exists := conversation.outputs[item.response]; exists {
 		previous := output.quantity
@@ -281,7 +313,7 @@ func (conversation *RealtimeConversation) remove(id string) {
 		output.quantity.audioItems = max(0, output.quantity.audioItems-item.quantity.audioItems)
 		output.quantity.imageItems = max(0, output.quantity.imageItems-item.quantity.imageItems)
 		if output.defaultConversation {
-			conversation.current = conversation.current.subtract(previous).add(output.quantity)
+			conversation.changeInput(previous, output.quantity)
 		}
 		conversation.outputs[item.response] = output
 	}
@@ -292,7 +324,29 @@ func (conversation *RealtimeConversation) remove(id string) {
 // Complete reuses the existing native response counter's measured quantities.
 // Default-conversation output becomes subsequent input; out-of-band output is
 // retained only for explicit item references.
-func (conversation *RealtimeConversation) Complete(result *relaycommon.RealtimeResponseFacts, defaultConversation bool) error {
+func (conversation *RealtimeConversation) Complete(result *relaycommon.RealtimeResponseFacts, defaultConversation bool, observations ...RealtimeInputObservation) error {
+	if len(observations) > 0 && observations[0].defaultInput && observations[0].epoch == conversation.epoch && result.Facts != nil && result.Facts.PromptTokensReported {
+		observation := observations[0]
+		quantity := observation.base
+		quantity.total = max(quantity.total, max(0, result.Usage.PromptTokens-observation.configuration))
+		quantity.audio = max(quantity.audio, result.Usage.PromptTokensDetails.AudioTokens)
+		quantity.image = max(quantity.image, result.Usage.PromptTokensDetails.ImageTokens)
+		if quantity.audio > 0 {
+			quantity.audioItems = max(1, quantity.audioItems)
+		}
+		if quantity.image > 0 {
+			quantity.imageItems = max(1, quantity.imageItems)
+		}
+		quantity = quantity.add(conversation.additions.subtract(observation.additions))
+		current := conversation.inputQuantity()
+		quantity.total = max(quantity.total, current.total)
+		quantity.audio = max(quantity.audio, current.audio)
+		quantity.image = max(quantity.image, current.image)
+		quantity.audioItems = max(quantity.audioItems, current.audioItems)
+		quantity.imageItems = max(quantity.imageItems, current.imageItems)
+		quantity.total = max(quantity.total, quantity.audio+quantity.image)
+		conversation.calibrated, conversation.calibratedAt, conversation.calibrationValid = quantity, conversation.additions, true
+	}
 	if _, exists := conversation.outputs[result.ID]; !exists {
 		if len(result.ID)+128 > conversation.limit-conversation.identityBytes {
 			return errors.New("Realtime conversation identity budget exceeded")
@@ -349,18 +403,20 @@ func (conversation *RealtimeConversation) Complete(result *relaycommon.RealtimeR
 	if edited {
 		quantity = retained
 	}
+	before, after := realtimeInputQuantity{}, realtimeInputQuantity{}
 	if previous, exists := conversation.outputs[result.ID]; exists && previous.defaultConversation {
-		conversation.current = conversation.current.subtract(previous.quantity)
+		before = previous.quantity
 	}
 	if defaultConversation {
-		conversation.current = conversation.current.add(quantity)
+		after = quantity
 	}
+	conversation.changeInput(before, after)
 	conversation.outputs[result.ID] = realtimeConversationOutput{quantity: quantity, defaultConversation: defaultConversation}
 	return nil
 }
 
 func (conversation *RealtimeConversation) Usage(buffered bool) *dto.Usage {
-	quantity := conversation.current
+	quantity := conversation.inputQuantity()
 	if buffered {
 		audio := conversation.bufferedAudio + CountRealtimeAudioTokens(conversation.audioBytes, conversation.inputFormat, true)
 		quantity = quantity.add(realtimeInputQuantity{total: audio, audio: audio})
@@ -368,17 +424,42 @@ func (conversation *RealtimeConversation) Usage(buffered bool) *dto.Usage {
 	return quantity.usage()
 }
 
+type RealtimeInputObservation struct {
+	epoch           uint64
+	base, additions realtimeInputQuantity
+	configuration   int
+	defaultInput    bool
+}
+
+// Observation is a constant-size receipt for an immutable input plan. A later
+// destructive edit invalidates its aggregate evidence rather than reallocating
+// reported totals to individual items.
+func (snapshot *RealtimeInputSnapshot) Observation(wire []byte) RealtimeInputObservation {
+	body := ojson.GetBytes(wire, "response")
+	if !body.IsObject() {
+		body = ojson.ParseBytes(wire)
+	}
+	input := body.Get("input")
+	configuration := tokenkit.Count(snapshot.model, body.Get("instructions").String())
+	for _, tool := range body.Get("tools").Array() {
+		configuration += tokenkit.Count(snapshot.model, tool.Raw)
+	}
+	return RealtimeInputObservation{epoch: snapshot.epoch, base: snapshot.conversation, additions: snapshot.additions, configuration: configuration, defaultInput: !input.Exists() || input.Type == ojson.Null}
+}
+
 // RealtimeInputSnapshot is immutable while a financial worker prepares a
 // candidate. References and default context use the same frozen quantities.
 type RealtimeInputSnapshot struct {
 	context            *gin.Context
 	model, inputFormat string
+	epoch              uint64
+	additions          realtimeInputQuantity
 	conversation       realtimeInputQuantity
 	items              map[string]realtimeConversationItem
 }
 
 func (conversation *RealtimeConversation) Snapshot() *RealtimeInputSnapshot {
-	return &RealtimeInputSnapshot{context: conversation.context.Copy(), model: conversation.model, inputFormat: conversation.inputFormat, conversation: conversation.current, items: maps.Clone(conversation.items)}
+	return &RealtimeInputSnapshot{context: conversation.context.Copy(), model: conversation.model, inputFormat: conversation.inputFormat, conversation: conversation.inputQuantity(), epoch: conversation.epoch, additions: conversation.additions, items: maps.Clone(conversation.items)}
 }
 
 func (snapshot *RealtimeInputSnapshot) Estimate(body []byte) (*dto.Usage, error) {

@@ -18,6 +18,30 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestRealtimeConversationRefinesAggregateInputWithoutDoubleCounting(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("GET", "/v1/realtime", nil)
+	conversation := NewRealtimeConversation(c, "gpt-4o")
+	_, err := conversation.Observe([]byte(`{"type":"conversation.item.created","item":{"id":"seed","type":"message","role":"user","content":[{"type":"input_text","text":" hello hello"}]}}`), false)
+	require.NoError(t, err)
+	observation := conversation.Snapshot().Observation([]byte(`{"type":"response.create","response":{}}`))
+	for _, test := range []struct {
+		id           string
+		prompt, want int
+	}{{"a", 20000, 20001}, {"b", 30000, 30002}, {"b", 30000, 30002}} {
+		result := &relaycommon.RealtimeResponseFacts{ID: test.id, Usage: &dto.Usage{PromptTokens: test.prompt, CompletionTokens: 1}, Facts: &relaycommon.ResponseFacts{PromptTokensReported: true, GeneratedText: "Hi"}}
+		require.NoError(t, conversation.Complete(result, true, observation))
+		assert.Equal(t, test.want, conversation.Usage(false).PromptTokens)
+	}
+	explicit := conversation.Snapshot().Observation([]byte(`{"response":{"input":[]}}`))
+	require.NoError(t, conversation.Complete(&relaycommon.RealtimeResponseFacts{ID: "explicit", Usage: &dto.Usage{PromptTokens: 90000, CompletionTokens: 1}, Facts: &relaycommon.ResponseFacts{PromptTokensReported: true}}, false, explicit))
+	assert.Equal(t, 30002, conversation.Usage(false).PromptTokens)
+	_, err = conversation.Observe([]byte(`{"type":"conversation.item.deleted","item_id":"seed"}`), false)
+	require.NoError(t, err)
+	require.NoError(t, conversation.Complete(&relaycommon.RealtimeResponseFacts{ID: "late", Usage: &dto.Usage{PromptTokens: 50000}, Facts: &relaycommon.ResponseFacts{PromptTokensReported: true}}, false, observation))
+	assert.Equal(t, 2, conversation.Usage(false).PromptTokens, "A destructive acknowledgement invalidates old aggregate input evidence")
+}
+
 func TestRealtimeConversationFreezesItemsAcrossDeletionAndAudioTruncation(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest("GET", "/v1/realtime", nil)

@@ -46,6 +46,7 @@ type realtimeGatewayResponse struct {
 	established       bool
 	terminalDelivered bool
 	finishing         bool
+	inputObservation  service.RealtimeInputObservation
 	inputSnapshot     *service.RealtimeInputSnapshot
 }
 
@@ -594,6 +595,7 @@ func (session *realtimeGatewaySession) admitGeneration(body, original []byte, in
 	}
 	// Preparation has frozen quantities and wire payload before reservation.
 	// The financial receipt no longer needs the complete item inventory.
+	response.inputObservation = response.inputSnapshot.Observation(attempt.purchaseInput.Body)
 	response.inputSnapshot = nil
 	response.call.Native.EstimateInput = nil
 	session.pending = attempt
@@ -802,7 +804,7 @@ func (session *realtimeGatewaySession) event(raw []byte) ([]byte, [][]byte, *typ
 			session.configEventID, session.requiredConfig = "", false
 		}
 		document := ojson.NewDoc([]byte(`{}`))
-		for _, field := range []string{"instructions", "tools", "tool_choice", "temperature", "modalities", "output_modalities", "max_output_tokens"} {
+		for _, field := range []string{"instructions", "tools", "tool_choice", "temperature", "reasoning", "modalities", "output_modalities", "max_output_tokens"} {
 			if property := value.Get(field); property.Exists() {
 				_ = document.SetRawBytes(field, []byte(property.Raw))
 			}
@@ -974,7 +976,7 @@ func (session *realtimeGatewaySession) response(result *relaycommon.RealtimeResp
 	}
 	session.completed[result.ID] = true
 	delete(session.active, result.ID)
-	trackingErr := session.conversation.Complete(result, attempt.defaultConversation)
+	trackingErr := session.conversation.Complete(result, attempt.defaultConversation, attempt.response.inputObservation)
 	session.finish(attempt, realtimeGatewayCompletion{result: result, terminalDelivered: result.Outcome.EndReason == relaycommon.StreamEndReasonDone && !result.Facts.DownstreamWriteFailed})
 	if trackingErr != nil {
 		return types.NewError(trackingErr, types.ErrorCodeBadResponse)

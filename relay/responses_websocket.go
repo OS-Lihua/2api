@@ -103,6 +103,14 @@ func (call *ResponsesWSCall) EstimateInput(c *gin.Context, info *relaycommon.Rel
 	if len(request.Conversation) > 0 && ojson.GetBytes(request.Conversation, "@this").Type != ojson.Null {
 		return nil, errors.New("Unknown conversation context; provide complete input")
 	}
+	for _, item := range ojson.GetBytes(request.Input, "@this").Array() {
+		for _, part := range item.Get("content").Array() {
+			kind := part.Get("type").String()
+			if (kind == "input_image" || kind == "input_file") && part.Get("file_id").Exists() {
+				return nil, errors.New("Unknown file content; provide complete input")
+			}
+		}
+	}
 	meta := request.GetTokenCountMeta()
 	usage, err := service.CountRequestUsage(c, meta, info)
 	if err != nil {
@@ -124,7 +132,9 @@ func (call *ResponsesWSCall) EstimateInput(c *gin.Context, info *relaycommon.Rel
 		images += previous.ImageCount
 	}
 	for _, item := range ojson.GetBytes(request.Input, "@this").Array() {
-		if item.Get("type").String() != "item_reference" {
+		kind := item.Get("type").String()
+		reference := kind == "item_reference" || kind == "" && item.Get("id").Type == ojson.String && !item.Get("content").Exists() && !item.Get("role").Exists()
+		if !reference {
 			continue
 		}
 		known := call.session.items[item.Get("id").String()]
@@ -381,6 +391,7 @@ type responsesWSSession struct {
 
 	// These fields belong to the serial request worker and describe the actual
 	// established connection. Per-request token/user data is never stored here.
+	completed       map[string]bool
 	items           map[string]*dto.Usage
 	contexts        map[string]relaycommon.ResponsesInputFacts
 	contextBytes    int
@@ -704,6 +715,24 @@ func (s *responsesWSSession) receive(c *gin.Context, state *responsesWSCallState
 	var pendingControl []byte
 	var sentControl []byte
 	var responseID string
+	defer func() {
+		if responseID == "" || s.completed[responseID] {
+			return
+		}
+		maximum := appconstant.MaxRequestBodyMB
+		if maximum <= 0 {
+			maximum = 128
+		}
+		if s.contextBytes+len(responseID)+64 > maximum<<20 {
+			state.closeCode = websocket.CloseMessageTooBig
+			return
+		}
+		if s.completed == nil {
+			s.completed = map[string]bool{}
+		}
+		s.completed[responseID] = true
+		s.contextBytes += len(responseID) + 64
+	}()
 	for {
 		select {
 		case incoming := <-state.inbox:
@@ -730,15 +759,26 @@ func (s *responsesWSSession) receive(c *gin.Context, state *responsesWSCallState
 					}
 					continue
 				}
-				// A repeated terminal from the previous response must never finish
-				// a subsequent request on this persistent connection.
-				if event.Response != nil && event.Response.ID != "" && event.Response.ID == s.lastResponseID {
+				// Bind the active response and discard any completed identity's replay.
+				id := ojson.GetBytes(incoming.body, "response_id").String()
+				if event.Response != nil && event.Response.ID != "" {
+					id = event.Response.ID
+				}
+				if id != "" && s.completed[id] {
 					continue
+				}
+				if event.Type != "error" && id != "" {
+					if responseID != "" && responseID != id {
+						info.StreamStatus.MarkFailed("unexpected_response_identity", "", 0)
+						state.closeCode = websocket.CloseInternalServerErr
+						return accumulator.Finish(), types.NewError(errors.New("Unexpected Responses identity"), types.ErrorCodeBadResponse)
+					}
+					responseID = id
 				}
 				if event.Type == "error" {
 					var rejection responsesWSErrorEvent
 					_ = common.Unmarshal(incoming.body, &rejection)
-					if rejection.ResponseID != "" && rejection.ResponseID == s.lastResponseID {
+					if rejection.ResponseID != "" && s.completed[rejection.ResponseID] {
 						continue
 					}
 					terminal, ambiguous, controlError := responsesWSErrorEndsRequest(rejection, create.StreamID, responseID, sentControl)
