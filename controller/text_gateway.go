@@ -140,6 +140,10 @@ func gatewayPreparationRejection(err error, budget *service.GatewayAttemptBudget
 
 // TextGateway uses one reservation and one settlement for all actual sends.
 func TextGateway(c *gin.Context) {
+	if middleware.TextOfferingMissing(c) {
+		gatewayError(c, http.StatusNotFound, "model_not_found", "Model not found")
+		return
+	}
 	if middleware.TextOffering(c) == nil {
 		c.Next()
 		return

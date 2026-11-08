@@ -14,6 +14,7 @@ import (
 )
 
 const textOfferingContextKey = "text_gateway_offering"
+const textOfferingMissingContextKey = "text_gateway_offering_missing"
 const TextGatewayStartedAtKey = "text_gateway_started_at"
 
 // ResolveTextOffering runs before token validation so a wallet request does not
@@ -39,6 +40,12 @@ func ResolveTextOffering() gin.HandlerFunc {
 		}
 		offering, err := model.FindModelOfferingByName(c.Request.Context(), name)
 		if errors.Is(err, gorm.ErrRecordNotFound) {
+			legacy, legacyErr := model.LegacyModelConfigured(c.Request.Context(), name)
+			if legacyErr != nil {
+				abortWithOpenAiMessage(c, http.StatusInternalServerError, "Could not resolve model")
+				return
+			}
+			c.Set(textOfferingMissingContextKey, !legacy)
 			c.Next()
 			return
 		}
@@ -75,6 +82,12 @@ func TextGatewayEndpoint(method, path string) (protocol.Type, string) {
 		}
 	}
 	return "", ""
+}
+
+// TextOfferingMissing retains failed resolution until after credential checks.
+// A configured legacy model continues through its existing quota and relay path.
+func TextOfferingMissing(c *gin.Context) bool {
+	return c.GetBool(textOfferingMissingContextKey)
 }
 
 func TextOffering(c *gin.Context) *model.ModelOffering {

@@ -5383,69 +5383,82 @@ func TestTextGatewayNativeFileIDsRetainMediaFacts(t *testing.T) {
 	for _, source := range []struct {
 		name, protocol, path, request, response string
 		modality                                capability.Modality
+		tool                                    bool
 	}{
-		{"Responses PDF", "openai_responses", "/v1/responses", `{"model":"gateway-offering","input":[{"role":"user","content":[{"type":"input_file","file_id":"file_existing","filename":"report.pdf"}]}],"max_output_tokens":16}`, `{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5}}`, capability.PDF},
-		{"Responses image", "openai_responses", "/v1/responses", `{"model":"gateway-offering","input":[{"role":"user","content":[{"type":"input_image","file_id":"file_existing"}]}],"max_output_tokens":16}`, `{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5}}`, capability.Image},
-		{"Messages PDF", "anthropic_messages", "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"user","content":[{"type":"document","source":{"type":"file","file_id":"file_existing"}}]}],"max_tokens":16}`, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`, capability.PDF},
-		{"Messages image", "anthropic_messages", "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"user","content":[{"type":"image","source":{"type":"file","file_id":"file_existing"}}]}],"max_tokens":16}`, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`, capability.Image},
+		{"Responses PDF", "openai_responses", "/v1/responses", `{"model":"gateway-offering","input":[{"role":"user","content":[{"type":"input_file","file_id":"file_existing","filename":"report.pdf"}]}],"max_output_tokens":16}`, `{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5}}`, capability.PDF, false},
+		{"Responses image", "openai_responses", "/v1/responses", `{"model":"gateway-offering","input":[{"role":"user","content":[{"type":"input_image","file_id":"file_existing"}]}],"max_output_tokens":16}`, `{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5}}`, capability.Image, false},
+		{"Messages PDF", "anthropic_messages", "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"user","content":[{"type":"document","source":{"type":"file","file_id":"file_existing"}}]}],"max_tokens":16}`, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`, capability.PDF, false},
+		{"Messages image", "anthropic_messages", "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"user","content":[{"type":"image","source":{"type":"file","file_id":"file_existing"}}]}],"max_tokens":16}`, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`, capability.Image, false},
+		{"Responses tool image", "openai_responses", "/v1/responses", `{"model":"gateway-offering","input":[{"type":"function_call","call_id":"call","name":"inspect","arguments":"{}"},{"type":"function_call_output","call_id":"call","output":[{"type":"input_image","file_id":"file_existing"}]}],"max_output_tokens":16}`, `{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5}}`, capability.Image, true},
+		{"Responses custom tool image", "openai_responses", "/v1/responses", `{"model":"gateway-offering","input":[{"type":"custom_tool_call","call_id":"call","name":"inspect","input":"inspect"},{"type":"custom_tool_call_output","call_id":"call","output":[{"type":"input_image","file_id":"file_existing"}]}],"max_output_tokens":16}`, `{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5}}`, capability.Image, true},
+		{"Responses tool PDF", "openai_responses", "/v1/responses", `{"model":"gateway-offering","input":[{"type":"function_call","call_id":"call","name":"inspect","arguments":"{}"},{"type":"function_call_output","call_id":"call","output":[{"type":"input_file","file_id":"file_existing","filename":"report.pdf"}]}],"max_output_tokens":16}`, `{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5}}`, capability.PDF, true},
+		{"Messages tool image", "anthropic_messages", "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call","name":"inspect","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call","content":[{"type":"image","source":{"type":"file","file_id":"file_existing"}}]}]}],"max_tokens":16}`, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`, capability.Image, true},
+		{"Messages tool PDF", "anthropic_messages", "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call","name":"inspect","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call","content":[{"type":"document","source":{"type":"file","file_id":"file_existing"}}]}]}],"max_tokens":16}`, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`, capability.PDF, true},
 	} {
-		for _, scenario := range []string{"missing modality", "small context", "native", "too many images"} {
-			if scenario == "too many images" && source.modality != capability.Image {
-				continue
-			}
-			t.Run(source.name+"/"+scenario, func(t *testing.T) {
-				calls := 0
-				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
-					calls++
-					var sent map[string]any
-					require.NoError(t, common.DecodeJson(r.Body, &sent))
-					body, err := common.Marshal(sent)
-					require.NoError(t, err)
-					assert.Contains(t, string(body), `"file_id":"file_existing"`)
-					if source.protocol == "anthropic_messages" {
-						assert.Contains(t, r.Header.Get("Anthropic-Beta"), "files-api-2025-04-14")
-					}
-					w.Header().Set("Content-Type", "application/json")
-					_, _ = io.WriteString(w, source.response)
-				})
-				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", source.protocol).Error)
+		t.Run(source.name, func(t *testing.T) {
+			calls := 0
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				var sent map[string]any
+				require.NoError(t, common.DecodeJson(r.Body, &sent))
+				body, err := common.Marshal(sent)
+				require.NoError(t, err)
+				assert.Contains(t, string(body), `"file_id":"file_existing"`)
 				if source.protocol == "anthropic_messages" {
-					require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeAnthropic).Error)
+					assert.Contains(t, r.Header.Get("Anthropic-Beta"), "files-api-2025-04-14")
 				}
-				caps := capability.Set{InputModalities: []capability.Modality{source.modality}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{ContextLength: common.GetPointer(int64(100000))}}
-				if scenario == "missing modality" {
-					caps.InputModalities = []capability.Modality{capability.Text}
-				} else if scenario == "small context" {
-					caps.Limits.ContextLength = common.GetPointer(int64(32))
-				} else if scenario == "too many images" {
-					caps.Limits.MaxImages = common.GetPointer(int64(1))
-				}
-				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
-				body := source.request
-				if scenario == "too many images" {
-					part := `{"type":"input_image","file_id":"file_existing"}`
-					if source.protocol == "anthropic_messages" {
-						part = `{"type":"image","source":{"type":"file","file_id":"file_existing"}}`
-					}
-					body = strings.Replace(body, part, part+","+part, 1)
-				}
-				request := httptest.NewRequest(http.MethodPost, source.path, strings.NewReader(body))
-				request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
-				request.Header.Set("Content-Type", "application/json")
-				if source.protocol == "anthropic_messages" {
-					request.Header.Set("Anthropic-Beta", "files-api-2025-04-14")
-				}
-				response := httptest.NewRecorder()
-				fixture.engine.ServeHTTP(response, request)
-				if scenario == "native" {
-					assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
-					assert.Equal(t, 1, calls)
-				} else {
-					assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
-					assert.Zero(t, calls)
-				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, source.response)
 			})
-		}
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", source.protocol).Error)
+			if source.protocol == "anthropic_messages" {
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeAnthropic).Error)
+			}
+			for _, scenario := range []string{"missing modality", "small context", "native", "too many images"} {
+				if scenario == "too many images" && source.modality != capability.Image {
+					continue
+				}
+				t.Run(scenario, func(t *testing.T) {
+					calls = 0
+					caps := capability.Set{InputModalities: []capability.Modality{source.modality}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{ContextLength: common.GetPointer(int64(100000))}}
+					if scenario == "missing modality" {
+						caps.InputModalities = []capability.Modality{capability.Text}
+					} else if scenario == "small context" {
+						caps.Limits.ContextLength = common.GetPointer(int64(32))
+					} else if scenario == "too many images" {
+						caps.Limits.MaxImages = common.GetPointer(int64(1))
+					}
+					if source.tool {
+						caps.Features = []capability.Feature{capability.ToolCalling}
+						caps.InputModalities = append(caps.InputModalities, capability.Text)
+					}
+					require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+					body := source.request
+					if scenario == "too many images" {
+						part := `{"type":"input_image","file_id":"file_existing"}`
+						if source.protocol == "anthropic_messages" {
+							part = `{"type":"image","source":{"type":"file","file_id":"file_existing"}}`
+						}
+						body = strings.Replace(body, part, part+","+part, 1)
+					}
+					request := httptest.NewRequest(http.MethodPost, source.path, strings.NewReader(body))
+					request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+					request.Header.Set("Content-Type", "application/json")
+					if source.protocol == "anthropic_messages" {
+						request.Header.Set("Anthropic-Beta", "files-api-2025-04-14")
+					}
+					response := httptest.NewRecorder()
+					fixture.engine.ServeHTTP(response, request)
+					if scenario == "native" {
+						assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+						assert.Equal(t, 1, calls)
+					} else {
+						assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+						assert.Zero(t, calls)
+					}
+				})
+			}
+		})
 	}
 }
 
@@ -5483,7 +5496,7 @@ func TestTextGatewayMalformedToolDetailsRetainValidUsage(t *testing.T) {
 }
 
 func TestTextGatewayNativeResponsesTemplateUsesNativeValidation(t *testing.T) {
-	for _, scenario := range []string{"native", "missing text", "invalid output override", "cross protocol"} {
+	for _, scenario := range []string{"native", "native without input", "missing text", "invalid output override", "cross protocol"} {
 		t.Run(scenario, func(t *testing.T) {
 			calls := 0
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -5505,14 +5518,77 @@ func TestTextGatewayNativeResponsesTemplateUsesNativeValidation(t *testing.T) {
 			if scenario == "invalid output override" {
 				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", `{"max_output_tokens":2147483647}`).Error)
 			}
-			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/responses", `{"model":"gateway-offering","input":[],"prompt":{"id":"pmpt_existing","variables":{"topic":"Hello"}},"max_output_tokens":16}`)
-			if scenario == "native" {
+			body := `{"model":"gateway-offering","input":[],"prompt":{"id":"pmpt_existing","variables":{"topic":"Hello"}},"max_output_tokens":16}`
+			if scenario == "native without input" {
+				body = strings.Replace(body, `"input":[],`, "", 1)
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/responses", body)
+			if scenario == "native" || scenario == "native without input" {
 				assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
 				assert.Equal(t, 1, calls)
 			} else {
 				assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
 				assert.Zero(t, calls)
 			}
+		})
+	}
+}
+
+func TestTextGatewayHiddenAndMissingNamesPreserveWalletCredentials(t *testing.T) {
+	for _, source := range []struct {
+		name, path, body string
+	}{
+		{"Chat", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`},
+		{"Responses", "/v1/responses", `{"model":"gateway-offering","input":"Hello","max_output_tokens":16}`},
+		{"Messages", "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`},
+		{"Gemini", "/v1beta/models/gateway-offering:generateContent", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16}}`},
+	} {
+		t.Run(source.name, func(t *testing.T) {
+			calls := 0
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+			})
+			require.NoError(t, model.DB.Model(fixture.offering).Updates(map[string]any{"visibility": "groups", "groups": `["other"]`}).Error)
+			hidden := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, source.path, source.body)
+			missingPath := strings.ReplaceAll(source.path, "gateway-offering", "missing-offering")
+			missingBody := strings.ReplaceAll(source.body, "gateway-offering", "missing-offering")
+			missing := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, missingPath, missingBody)
+			assert.Equal(t, http.StatusNotFound, hidden.Code, hidden.Body.String())
+			assert.Equal(t, http.StatusNotFound, missing.Code, missing.Body.String())
+			assert.JSONEq(t, hidden.Body.String(), missing.Body.String())
+			assert.Zero(t, calls)
+			token, err := model.GetTokenById(fixture.token.Id)
+			require.NoError(t, err)
+			assert.Equal(t, common.TokenStatusEnabled, token.Status, "unknown names must not retire a valid wallet credential")
+			for _, state := range []struct {
+				name    string
+				changes map[string]any
+				status  int
+			}{
+				{"disabled", map[string]any{"status": common.TokenStatusDisabled}, http.StatusUnauthorized},
+				{"expired", map[string]any{"expired_time": common.GetTimestamp() - 1}, http.StatusUnauthorized},
+				{"IP denied", map[string]any{"allow_ips": "10.0.0.0/8"}, http.StatusForbidden},
+			} {
+				t.Run(state.name, func(t *testing.T) {
+					require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"status": common.TokenStatusEnabled, "expired_time": -1, "allow_ips": ""}).Error)
+					require.NoError(t, model.DB.Model(fixture.token).Updates(state.changes).Error)
+					response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, missingPath, missingBody)
+					assert.Equal(t, state.status, response.Code, response.Body.String())
+				})
+			}
+			require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"status": common.TokenStatusEnabled, "expired_time": -1, "allow_ips": ""}).Error)
+			invalid := adminSecurityRequest(fixture.engine, "invalid-credential", http.MethodPost, missingPath, missingBody)
+			assert.Equal(t, http.StatusUnauthorized, invalid.Code, invalid.Body.String())
+			require.NoError(t, model.DB.Model(fixture.offering).Update("visibility", "all").Error)
+			valid := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, source.path, source.body)
+			assert.Equal(t, http.StatusOK, valid.Code, valid.Body.String())
+			assert.Equal(t, 1, calls)
+			require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "legacy-only", ChannelId: fixture.channel.ProviderID, Enabled: true}).Error)
+			legacy := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, strings.ReplaceAll(source.path, "gateway-offering", "legacy-only"), strings.ReplaceAll(source.body, "gateway-offering", "legacy-only"))
+			assert.Equal(t, http.StatusUnauthorized, legacy.Code, "configured legacy models must still enforce legacy quota")
+			assert.Equal(t, 1, calls)
 		})
 	}
 }
