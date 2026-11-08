@@ -38,6 +38,10 @@ func applySpeechUsageHeaders(info *relaycommon.RelayInfo, usage *dto.Usage, head
 	if info.ChannelType != constant.ChannelTypeVLLM {
 		return
 	}
+	hadInput, hadOutput := false, false
+	if info.ResponseFacts != nil {
+		hadInput, hadOutput = info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported
+	}
 	for _, counter := range []struct {
 		header        string
 		target        *int
@@ -48,6 +52,9 @@ func applySpeechUsageHeaders(info *relaycommon.RelayInfo, usage *dto.Usage, head
 		{"X-VLLM-OMNI-INPUT-TEXT-TOKENS", &usage.PromptTokensDetails.TextTokens, false, false},
 		{"X-VLLM-OMNI-INPUT-AUDIO-TOKENS", &usage.PromptTokensDetails.AudioTokens, false, false},
 	} {
+		if hadOutput && counter.output || hadInput && !counter.output {
+			continue
+		}
 		value, err := strconv.ParseInt(headers.Get(counter.header), 10, 32)
 		if err != nil || value < 0 {
 			continue
@@ -184,11 +191,20 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			}
 		}
 	}
-	if info.ResponseFacts != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices || info.IsStream && strings.Contains(resp.Header.Get("Content-Type"), "json")) {
+	if info.ResponseFacts != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices || strings.Contains(resp.Header.Get("Content-Type"), "json")) {
 		body, readErr := io.ReadAll(resp.Body)
-		usage = reportedMediaUsage(body)
-		observeMediaUsage(info, usage, body)
+		usageBody := body
+		if !ojson.ValidBytes(body) {
+			if raw := ojson.GetBytes(body, "usage"); raw.IsObject() && ojson.Valid(raw.Raw) {
+				if encoded, err := common.Marshal(map[string]common.RawMessage{"usage": common.RawMessage(raw.Raw)}); err == nil {
+					usageBody = encoded
+				}
+			}
+		}
+		usage = reportedMediaUsage(usageBody)
+		observeMediaUsage(info, usage, usageBody)
 		normalizeSpeechOutputUsage(info, usage)
+		applySpeechUsageHeaders(info, usage, resp.Header)
 		fault := observeMediaError(info, body, resp.StatusCode)
 		if info.StreamStatus == nil {
 			info.StreamStatus = relaycommon.NewStreamStatus()
@@ -218,15 +234,35 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		var encodedAudio bytes.Buffer
 		var completed bool
 		helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
-			var chunk struct {
-				Type       string          `json:"type"`
-				Audio      string          `json:"audio"`
-				Delta      string          `json:"delta"`
-				Usage      json.RawMessage `json:"usage"`
-				SampleRate *int            `json:"sample_rate"`
-				Channels   *int            `json:"channels"`
+			eventBody := []byte(data)
+			if !ojson.ValidBytes(eventBody) {
+				sr.Stop(errors.New("invalid speech stream event"))
+				return
 			}
-			if err := common.UnmarshalJsonStr(data, &chunk); err != nil {
+			if raw := ojson.GetBytes(eventBody, "usage"); raw.Exists() && raw.Raw != "null" {
+				reported := reportedMediaUsage(eventBody)
+				prompt, completion := relaycommon.MediaUsagePresence(eventBody)
+				observeMediaUsage(info, reported, eventBody)
+				if prompt {
+					usage.PromptTokens = reported.PromptTokens
+				}
+				if completion {
+					usage.CompletionTokens = reported.CompletionTokens
+				}
+				mergeMediaTokenDetails(usage, eventBody)
+			}
+			if observeMediaError(info, eventBody, resp.StatusCode) != nil {
+				sr.Stop(errors.New("upstream speech stream failed"))
+				return
+			}
+			var chunk struct {
+				Type       string `json:"type"`
+				Audio      string `json:"audio"`
+				Delta      string `json:"delta"`
+				SampleRate *int   `json:"sample_rate"`
+				Channels   *int   `json:"channels"`
+			}
+			if err := common.Unmarshal(eventBody, &chunk); err != nil {
 				sr.Stop(errors.New("invalid speech stream event"))
 				return
 			}
@@ -241,22 +277,6 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 					}
 					*field.target = *field.source
 				}
-			}
-			if len(chunk.Usage) > 0 && string(chunk.Usage) != "null" {
-				reported := reportedMediaUsage([]byte(data))
-				prompt, completion := relaycommon.MediaUsagePresence([]byte(data))
-				observeMediaUsage(info, reported, []byte(data))
-				if prompt {
-					usage.PromptTokens = reported.PromptTokens
-				}
-				if completion {
-					usage.CompletionTokens = reported.CompletionTokens
-				}
-				mergeMediaTokenDetails(usage, []byte(data))
-			}
-			if observeMediaError(info, []byte(data), resp.StatusCode) != nil {
-				sr.Stop(errors.New("upstream speech stream failed"))
-				return
 			}
 			if chunk.Type == "speech.audio.done" {
 				if audioBytes == 0 {
@@ -375,24 +395,10 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
 		// 读取响应体到缓冲区
 		bodyBytes, err := io.ReadAll(resp.Body)
-		structuredResponse := info.ResponseFacts != nil && strings.Contains(resp.Header.Get("Content-Type"), "json") && ojson.ValidBytes(bodyBytes)
-		if structuredResponse {
-			usage = reportedMediaUsage(bodyBytes)
-			observeMediaUsage(info, usage, bodyBytes)
-			normalizeSpeechOutputUsage(info, usage)
-			if observeMediaError(info, bodyBytes, resp.StatusCode) == nil {
-				if info.StreamStatus == nil {
-					info.StreamStatus = relaycommon.NewStreamStatus()
-				}
-				info.StreamStatus.MarkFailed("", "invalid_response", http.StatusBadGateway)
-			}
-		}
 		if err != nil {
 			logger.LogError(c, common.LogText("failed to read TTS response body: %v", err))
 			if info.ResponseFacts != nil {
-				if !structuredResponse {
-					usage = EstimateGeneratedSpeech(c, info, bodyBytes, false)
-				}
+				usage = EstimateGeneratedSpeech(c, info, bodyBytes, false)
 				if info.StreamStatus == nil {
 					info.StreamStatus = relaycommon.NewStreamStatus()
 				}
@@ -401,13 +407,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			} else {
 				c.Writer.WriteHeaderNow()
 			}
-			if !structuredResponse {
-				applySpeechUsageHeaders(info, usage, resp.Header)
-			}
-			return usage
-		}
-
-		if structuredResponse {
+			applySpeechUsageHeaders(info, usage, resp.Header)
 			return usage
 		}
 		// 写入响应到客户端
