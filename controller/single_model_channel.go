@@ -140,15 +140,13 @@ func ListSingleModelChannels(c *gin.Context) {
 		byChannel[latest[i].ChannelID] = &latest[i]
 	}
 	health, healthErr := service.ChannelHealth.Snapshots(c.Request.Context(), ids)
-	if healthErr != nil {
-		common.ApiErrorStatus(c, http.StatusServiceUnavailable, common.NewMessage("Channel health is unavailable"))
-		return
-	}
 	items := make([]singleChannelView, 0, len(records))
 	for _, record := range records {
 		view := channelView(record)
-		snapshot := health[record.ID]
-		view.Health = &snapshot
+		if healthErr == nil {
+			snapshot := health[record.ID]
+			view.Health = &snapshot
+		}
 		view.LatestProbe = byChannel[record.ID]
 		if view.LatestProbe != nil && view.LatestProbe.ConfigurationHash != record.ProbeConfigurationHash() {
 			view.LatestProbe = nil
@@ -169,13 +167,11 @@ func GetSingleModelChannel(c *gin.Context) {
 		return
 	}
 	health, err := service.ChannelHealth.Snapshots(c.Request.Context(), []int{id})
-	if err != nil {
-		common.ApiErrorStatus(c, http.StatusServiceUnavailable, common.NewMessage("Channel health is unavailable"))
-		return
-	}
 	view := channelView(record)
-	snapshot := health[id]
-	view.Health = &snapshot
+	if err == nil {
+		snapshot := health[id]
+		view.Health = &snapshot
+	}
 	common.ApiSuccess(c, view)
 }
 

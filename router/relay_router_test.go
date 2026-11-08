@@ -42,6 +42,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/websocket"
@@ -497,6 +498,63 @@ func TestGatewayBudgetManagementOptions(t *testing.T) {
 	require.NoError(t, model.DB.Where("user_id = ?", admin.Id).Delete(&model.UserAccessToken{}).Error)
 	assert.Equal(t, 401, adminSecurityRequest(engine, root, http.MethodGet, "/api/option/", "").Code)
 	assert.Equal(t, service.GatewayAttemptPolicy{MaxAttempts: 5, TotalFirstByte: 61 * time.Second, AttemptFirstByte: 12 * time.Second}, service.GatewayPolicy())
+}
+
+func TestTextGatewayFailoverCompletesWhileDisableNoticeIsPending(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"Available Provider"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	})
+	noticeStarted, releaseNotice, noticeFinished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(noticeStarted)
+		<-releaseNotice
+		w.WriteHeader(http.StatusNoContent)
+		close(noticeFinished)
+	}))
+	defer server.Close()
+	defer releaseOnce.Do(func() { close(releaseNotice) })
+	previousDisable, previousNotifyLimit := common.AutomaticDisableChannelEnabled, constant.NotifyLimitCount
+	common.AutomaticDisableChannelEnabled, constant.NotifyLimitCount = true, 100
+	fetch := system_setting.GetFetchSetting()
+	previousFetch, previousWorker := *fetch, system_setting.WorkerUrl
+	fetch.EnableSSRFProtection, system_setting.WorkerUrl = false, ""
+	t.Cleanup(func() {
+		common.AutomaticDisableChannelEnabled, constant.NotifyLimitCount = previousDisable, previousNotifyLimit
+		*fetch, system_setting.WorkerUrl = previousFetch, previousWorker
+	})
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("auto_ban", 1).Error)
+	settings, err := common.Marshal(dto.UserSetting{NotifyType: dto.NotifyTypeWebhook, WebhookUrl: server.URL, ChannelNotifyEnabled: common.GetPointer(true)})
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("username = ?", "security-admin").Update("setting", string(settings)).Error)
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	}()
+	select {
+	case <-noticeStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("automatic disable did not dispatch its notification")
+	}
+	select {
+	case response := <-done:
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), "Available Provider")
+	case <-time.After(5 * time.Second):
+		releaseOnce.Do(func() { close(releaseNotice) })
+		<-done
+		t.Fatal("notification delivery blocked failover")
+	}
+	releaseOnce.Do(func() { close(releaseNotice) })
+	select {
+	case <-noticeFinished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("automatic disable notification did not finish")
+	}
 }
 
 func TestTextGatewayAutomaticallyDisablesSelectedProviderKey(t *testing.T) {
@@ -1620,6 +1678,26 @@ func TestTextGatewaySingleKeyFailoverCapturesCurrentSlot(t *testing.T) {
 		}
 	}
 	assert.True(t, found)
+}
+
+func TestChannelManagementReadsSurviveUnavailableRuntimeHealth(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("management reads must not contact the Provider")
+	})
+	require.NoError(t, model.DB.AutoMigrate(&model.ChannelProbeResult{}))
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	require.NoError(t, client.Close())
+	service.ChannelHealth = channelhealth.New(client)
+	for _, path := range []string{fmt.Sprintf("/api/admin/v1/channels/%d", fixture.channel.ID), "/api/admin/v1/channels"} {
+		assert.Equal(t, http.StatusUnauthorized, adminSecurityRequest(fixture.engine, "", http.MethodGet, path, "").Code)
+		assert.Equal(t, http.StatusForbidden, adminSecurityRequest(fixture.engine, fixture.userPAT, http.MethodGet, path, "").Code)
+		response := adminSecurityRequest(fixture.engine, fixture.adminPAT, http.MethodGet, path, "")
+		assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), `"provider_id":`)
+		assert.NotContains(t, response.Body.String(), `"health":`)
+		assert.NotContains(t, response.Body.String(), "provider-secret")
+	}
 }
 
 func TestTextGatewayCircuitUsesProviderFailuresEvenAtAttemptLimit(t *testing.T) {

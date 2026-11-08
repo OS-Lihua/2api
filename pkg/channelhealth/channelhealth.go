@@ -46,31 +46,25 @@ type observation struct {
 	FirstByte int64
 }
 type state struct {
-	RetryAt         int64
-	Failures, Trips int
-	Lease           string
-	LeaseUntil      int64
-	Recent          []observation
+	RetryAt           int64
+	Failures, Trips   int
+	Lease             string
+	LeaseUntil        int64
+	Recent            []observation
+	completedAttempts []string
 }
 
 // Manager uses process memory for one node or optimistic Redis transactions for
 // all nodes. Redis errors fail admission closed, avoiding independent probes.
-type seenEvent struct {
-	id      string
-	expires int64
-}
-
+// Deduplication retains the last 100 completed Attempt identities per Channel.
 type Manager struct {
-	client    *redis.Client
-	mu        sync.Mutex
-	states    map[int]*state
-	seen      map[string]int64
-	seenQueue []seenEvent
-	seenHead  int
+	client *redis.Client
+	mu     sync.Mutex
+	states map[int]*state
 }
 
 func New(client *redis.Client) *Manager {
-	return &Manager{client: client, states: map[int]*state{}, seen: map[string]int64{}}
+	return &Manager{client: client, states: map[int]*state{}}
 }
 
 // transact watches every candidate together, so choosing the earliest circuit
@@ -83,28 +77,18 @@ func (m *Manager) transact(ctx context.Context, ids []int, event string, apply f
 	if m.client == nil {
 		m.mu.Lock()
 		defer m.mu.Unlock()
-		now := clock.Now().UnixMilli()
-		for m.seenHead < len(m.seenQueue) && m.seenQueue[m.seenHead].expires <= now {
-			event := m.seenQueue[m.seenHead]
-			if m.seen[event.id] == event.expires {
-				delete(m.seen, event.id)
-			}
-			m.seenHead++
-		}
-		if m.seenHead > 1024 && m.seenHead > len(m.seenQueue)/2 {
-			m.seenQueue = slices.Clone(m.seenQueue[m.seenHead:])
-			m.seenHead = 0
-		}
 		for _, id := range ids {
 			if m.states[id] == nil {
 				m.states[id] = &state{}
 			}
 		}
-		until, exists := m.seen[event]
-		duplicate := event != "" && exists && until > now
+		current := m.states[ids[0]]
+		duplicate := event != "" && slices.Contains(current.completedAttempts, event)
 		if apply(m.states, duplicate) && event != "" {
-			m.seen[event] = now + int64(7*24*time.Hour/time.Millisecond)
-			m.seenQueue = append(m.seenQueue, seenEvent{id: event, expires: m.seen[event]})
+			current.completedAttempts = append(current.completedAttempts, event)
+			if len(current.completedAttempts) > 100 {
+				current.completedAttempts = slices.Clone(current.completedAttempts[len(current.completedAttempts)-100:])
+			}
 		}
 		return nil
 	}
@@ -113,14 +97,25 @@ func (m *Manager) transact(ctx context.Context, ids []int, event string, apply f
 		keys = append(keys, "gateway:channel-health:"+strconv.Itoa(id))
 	}
 	eventKey := "gateway:channel-health:attempt:" + event
+	ringKey := "gateway:channel-health:attempts:" + strconv.Itoa(ids[0])
 	if event != "" {
-		keys = append(keys, eventKey)
+		keys = append(keys, ringKey, eventKey)
 	}
 	for range 64 {
 		err := m.client.Watch(ctx, func(tx *redis.Tx) error {
+			reads := make([]*redis.StringCmd, len(keys))
+			_, err := tx.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+				for i, key := range keys {
+					reads[i] = pipe.Get(ctx, key)
+				}
+				return nil
+			})
+			if err != nil && !errors.Is(err, redis.Nil) {
+				return err
+			}
 			states := map[int]*state{}
 			for i, id := range ids {
-				raw, err := tx.Get(ctx, keys[i]).Bytes()
+				raw, err := reads[i].Bytes()
 				if err != nil && !errors.Is(err, redis.Nil) {
 					return err
 				}
@@ -132,18 +127,35 @@ func (m *Manager) transact(ctx context.Context, ids []int, event string, apply f
 				}
 				states[id] = current
 			}
-			duplicate := false
+			var completed []string
+			duplicate, evicted := false, ""
 			if event != "" {
-				exists, err := tx.Exists(ctx, eventKey).Result()
-				if err != nil {
+				raw, err := reads[len(ids)].Bytes()
+				if err != nil && !errors.Is(err, redis.Nil) {
 					return err
 				}
-				duplicate = exists > 0
+				if len(raw) > 0 {
+					if err := common.Unmarshal(raw, &completed); err != nil {
+						return errors.New("invalid Channel health Attempt history")
+					}
+				}
+				legacy := reads[len(ids)+1]
+				if err := legacy.Err(); err != nil && !errors.Is(err, redis.Nil) {
+					return err
+				}
+				duplicate = slices.Contains(completed, event) || legacy.Err() == nil
 			}
 			if !apply(states, duplicate) {
 				return nil
 			}
-			_, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			if event != "" {
+				completed = append(completed, event)
+				if len(completed) > 100 {
+					evicted = completed[0]
+					completed = completed[len(completed)-100:]
+				}
+			}
+			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 				for i, id := range ids {
 					raw, err := common.Marshal(states[id])
 					if err != nil {
@@ -156,7 +168,17 @@ func (m *Manager) transact(ctx context.Context, ids []int, event string, apply f
 					pipe.Set(ctx, keys[i], raw, expiration)
 				}
 				if event != "" {
+					raw, err := common.Marshal(completed)
+					if err != nil {
+						return err
+					}
+					// Keep the ring separate so older nodes cannot erase it while
+					// rewriting Channel state. Legacy readers still see recent IDs.
+					pipe.Set(ctx, ringKey, raw, 7*24*time.Hour)
 					pipe.Set(ctx, eventKey, "1", 7*24*time.Hour)
+					if evicted != "" {
+						pipe.Del(ctx, "gateway:channel-health:attempt:"+evicted)
+					}
 				}
 				return nil
 			})
@@ -333,8 +355,8 @@ func RetryAfter(value string, now time.Time) (time.Duration, bool) {
 	return 0, false
 }
 
-// Record consumes an actual completed Attempt once. Recovery and settlement do
-// not call this API; the idempotency key also protects accidental duplicate use.
+// Record consumes an actual completed Attempt. Recovery and settlement do not
+// call this API; recent Attempt identities protect accidental duplicate use.
 func (m *Manager) Record(ctx context.Context, sample Sample) (string, error) {
 	if sample.AttemptID == "" || sample.ChannelID <= 0 {
 		return "none", errors.New("actual Attempt identity required")
@@ -347,7 +369,8 @@ func (m *Manager) Record(ctx context.Context, sample Sample) (string, error) {
 		}
 		s := states[sample.ChannelID]
 		now := clock.Now()
-		if sample.Lease != "" && s.Lease == sample.Lease {
+		ownsLease := sample.Lease != "" && s.Lease == sample.Lease
+		if ownsLease {
 			s.Lease, s.LeaseUntil = "", 0
 		}
 		if !sample.Success && !sample.ProviderFailure {
@@ -360,6 +383,11 @@ func (m *Manager) Record(ctx context.Context, sample Sample) (string, error) {
 		s.Recent = append(s.Recent, observation{At: now.UnixMilli(), Success: sample.Success, FirstByte: firstByte})
 		if len(s.Recent) > 100 {
 			s.Recent = slices.Clone(s.Recent[len(s.Recent)-100:])
+		}
+		// Fence obsolete probes and successes that predate a trip. Ordinary
+		// in-flight failures still update cooldowns, including Retry-After.
+		if !ownsLease && (sample.Lease != "" || sample.Success && s.Trips > 0) {
+			return true
 		}
 		if sample.Success {
 			if s.Trips > 0 {
