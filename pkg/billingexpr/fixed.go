@@ -19,6 +19,13 @@ func UsesFixedPricingByHash(expression, hash string) bool {
 	return err == nil && entry.fixedPricing
 }
 
+// UsesOnlyFixedPricing reports whether every pricing leaf is per request,
+// including branches whose conditions fail or are optimized away.
+func UsesOnlyFixedPricing(expression string) bool {
+	entry, err := compileEntryFromCacheByHash(expression, ExprHashString(expression))
+	return err == nil && entry.fixedOnly
+}
+
 func containsPricingMarker(node ast.Node) bool {
 	return ast.Find(node, func(part ast.Node) bool {
 		identifier, ok := part.(*ast.IdentifierNode)

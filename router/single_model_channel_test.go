@@ -65,6 +65,7 @@ func TestSingleModelChannelAPI(t *testing.T) {
 	db := model.UseTestDatabases(t)
 	require.NoError(t, i18n.Init())
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.UserAccessToken{}, &model.Option{}, &model.Provider{}, &model.Channel{}, &model.ChannelProbeResult{}, &model.Ability{}, &model.TaskPlugin{}, &model.Model{}, &model.Vendor{}, &model.Wallet{}, &model.LedgerEntry{}))
+	require.NoError(t, model.MigrateGatewayBilling(db))
 	require.NoError(t, model.MigrateAuditLogs())
 	require.NoError(t, model.EnsureLegacyAccessTokenRetireAt(time.Now().Unix()))
 	require.NoError(t, authz.Init(db))

@@ -22,6 +22,7 @@ type ResponseFacts struct {
 	BusinessOutput           bool
 	DownstreamWriteFailed    bool
 	GeneratedText            string
+	GeneratedOutputTokens    *int
 	OnBusinessOutput         func()
 	CanFinishStream          func() bool `json:"-"`
 	UpstreamErrorCode        string
