@@ -111,9 +111,6 @@ func TestMediaAudioGatewayReportsDeliveryAndExplicitZero(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c, recorder, response, info := newImageTestContext(t, tc.body, "application/json", false)
 			info.RelayMode = tc.mode
-			if tc.mode == relayconstant.RelayModeAudioSpeech && tc.format == "pcm" {
-				response.Header.Set("Content-Type", "audio/pcm")
-			}
 			if tc.format == "text" {
 				response.Header.Set("Content-Type", "text/plain")
 			}

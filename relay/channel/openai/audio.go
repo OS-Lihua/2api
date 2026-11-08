@@ -38,21 +38,30 @@ func applySpeechUsageHeaders(info *relaycommon.RelayInfo, usage *dto.Usage, head
 	if info.ChannelType != constant.ChannelTypeVLLM {
 		return
 	}
-	hadInput, hadOutput := false, false
-	if info.ResponseFacts != nil {
-		hadInput, hadOutput = info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported
-	}
 	for _, counter := range []struct {
-		header        string
-		target        *int
-		input, output bool
+		header string
+		target *int
+		output bool
 	}{
-		{"X-VLLM-OMNI-INPUT-TOKENS", &usage.PromptTokens, true, false},
-		{"X-VLLM-OMNI-OUTPUT-TOKENS", &usage.CompletionTokens, false, true},
-		{"X-VLLM-OMNI-INPUT-TEXT-TOKENS", &usage.PromptTokensDetails.TextTokens, false, false},
-		{"X-VLLM-OMNI-INPUT-AUDIO-TOKENS", &usage.PromptTokensDetails.AudioTokens, false, false},
+		{"X-VLLM-OMNI-INPUT-TOKENS", &usage.PromptTokens, false},
+		{"X-VLLM-OMNI-OUTPUT-TOKENS", &usage.CompletionTokens, true},
+		{"X-VLLM-OMNI-INPUT-TEXT-TOKENS", &usage.PromptTokensDetails.TextTokens, false},
+		{"X-VLLM-OMNI-INPUT-AUDIO-TOKENS", &usage.PromptTokensDetails.AudioTokens, false},
 	} {
-		if hadOutput && counter.output || hadInput && !counter.output {
+		var reported *bool
+		if facts := info.ResponseFacts; facts != nil {
+			switch counter.header {
+			case "X-VLLM-OMNI-INPUT-TOKENS":
+				reported = &facts.PromptTokensReported
+			case "X-VLLM-OMNI-OUTPUT-TOKENS":
+				reported = &facts.CompletionTokensReported
+			case "X-VLLM-OMNI-INPUT-TEXT-TOKENS":
+				reported = &facts.TextInputTokensReported
+			case "X-VLLM-OMNI-INPUT-AUDIO-TOKENS":
+				reported = &facts.AudioInputTokensReported
+			}
+		}
+		if reported != nil && *reported {
 			continue
 		}
 		value, err := strconv.ParseInt(headers.Get(counter.header), 10, 32)
@@ -60,23 +69,45 @@ func applySpeechUsageHeaders(info *relaycommon.RelayInfo, usage *dto.Usage, head
 			continue
 		}
 		*counter.target = int(value)
-		if counter.output {
+		if counter.output && (info.ResponseFacts == nil || !info.ResponseFacts.AudioOutputTokensReported) {
 			usage.CompletionTokenDetails.AudioTokens = int(value)
-		}
-		if info.ResponseFacts != nil {
-			if counter.input {
-				info.ResponseFacts.PromptTokensReported = true
-			}
-			if counter.output {
-				info.ResponseFacts.CompletionTokensReported = true
+			if info.ResponseFacts != nil {
 				info.ResponseFacts.AudioOutputTokensReported = true
 			}
+		}
+		if reported != nil {
+			*reported = true
 		}
 	}
 	if info.ResponseFacts != nil {
 		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+}
+
+// speechAudioPayload requires the selected format's payload evidence before
+// accepting audio with an incorrect JSON MIME, and excludes JSON-like bodies.
+func speechAudioPayload(ctx context.Context, body []byte, format string, facts *relaycommon.ResponseFacts) bool {
+	if len(body) == 0 || ojson.ValidBytes(body) {
+		return false
+	}
+	payload := bytes.TrimSpace(body)
+	if len(payload) == 0 {
+		return false
+	}
+	first := payload[0]
+	if first == '{' || first == '[' || first == '"' || first == '-' || first >= '0' && first <= '9' || bytes.HasPrefix(payload, []byte("true")) || bytes.HasPrefix(payload, []byte("false")) || bytes.HasPrefix(payload, []byte("null")) {
+		return false
+	}
+	if format != "pcm" {
+		duration, err := speechAudioDuration(ctx, body, format, facts)
+		return err == nil && !math.IsNaN(duration) && !math.IsInf(duration, 0) && duration > 0
+	}
+	channels := int64(1)
+	if facts != nil && facts.AudioOutputChannels > 0 && facts.AudioOutputChannels <= 1<<31-1 {
+		channels = int64(facts.AudioOutputChannels)
+	}
+	return int64(len(body))%(channels*2) == 0
 }
 
 func speechAudioDuration(ctx context.Context, audio []byte, format string, facts *relaycommon.ResponseFacts) (float64, error) {
@@ -191,32 +222,53 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			}
 		}
 	}
+	var bufferedAudio []byte
+	var bufferedAudioErr error
+	var audioBuffered bool
 	if info.ResponseFacts != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices || strings.Contains(resp.Header.Get("Content-Type"), "json")) {
 		body, readErr := io.ReadAll(resp.Body)
-		usageBody := body
-		if !ojson.ValidBytes(body) {
-			if raw := ojson.GetBytes(body, "usage"); raw.IsObject() && ojson.Valid(raw.Raw) {
-				if encoded, err := common.Marshal(map[string]common.RawMessage{"usage": common.RawMessage(raw.Raw)}); err == nil {
-					usageBody = encoded
+		if resp.StatusCode == http.StatusOK && !info.IsStream && speechAudioPayload(c.Request.Context(), body, audioFormat, formatFacts) {
+			bufferedAudio, bufferedAudioErr, audioBuffered = body, readErr, true
+			resp.Header = resp.Header.Clone()
+			contentType := "audio/" + audioFormat
+			if audioFormat == "mp3" {
+				contentType = "audio/mpeg"
+			} else if audioFormat == "opus" {
+				contentType = "audio/ogg"
+			}
+			resp.Header.Set("Content-Type", contentType)
+		} else {
+			usageBody := body
+			if !ojson.ValidBytes(body) {
+				recovered := map[string]common.RawMessage{}
+				for _, name := range []string{"usage", "error", "type", "code"} {
+					if raw := ojson.GetBytes(body, name); raw.Exists() && ojson.Valid(raw.Raw) {
+						recovered[name] = common.RawMessage(raw.Raw)
+					}
+				}
+				if len(recovered) > 0 {
+					if encoded, err := common.Marshal(recovered); err == nil {
+						usageBody = encoded
+					}
 				}
 			}
+			usage = reportedMediaUsage(usageBody)
+			observeMediaUsage(info, usage, usageBody)
+			normalizeSpeechOutputUsage(info, usage)
+			applySpeechUsageHeaders(info, usage, resp.Header)
+			fault := observeMediaError(info, usageBody, resp.StatusCode)
+			if info.StreamStatus == nil {
+				info.StreamStatus = relaycommon.NewStreamStatus()
+			}
+			if readErr != nil {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, readErr)
+				info.StreamStatus.MarkIncomplete("incomplete_audio_response")
+			}
+			if fault == nil && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+				info.StreamStatus.MarkFailed("", "invalid_response", http.StatusBadGateway)
+			}
+			return usage
 		}
-		usage = reportedMediaUsage(usageBody)
-		observeMediaUsage(info, usage, usageBody)
-		normalizeSpeechOutputUsage(info, usage)
-		applySpeechUsageHeaders(info, usage, resp.Header)
-		fault := observeMediaError(info, body, resp.StatusCode)
-		if info.StreamStatus == nil {
-			info.StreamStatus = relaycommon.NewStreamStatus()
-		}
-		if readErr != nil {
-			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, readErr)
-			info.StreamStatus.MarkIncomplete("incomplete_audio_response")
-		}
-		if fault == nil && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
-			info.StreamStatus.MarkFailed("", "invalid_response", http.StatusBadGateway)
-		}
-		return usage
 	}
 	usage.PromptTokens = info.GetEstimatePromptTokens()
 	usage.TotalTokens = info.GetEstimatePromptTokens()
@@ -394,7 +446,10 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	} else {
 		common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
 		// 读取响应体到缓冲区
-		bodyBytes, err := io.ReadAll(resp.Body)
+		bodyBytes, err := bufferedAudio, bufferedAudioErr
+		if !audioBuffered {
+			bodyBytes, err = io.ReadAll(resp.Body)
+		}
 		if err != nil {
 			logger.LogError(c, common.LogText("failed to read TTS response body: %v", err))
 			if info.ResponseFacts != nil {

@@ -127,6 +127,12 @@ func observeMediaUsage(info *relaycommon.RelayInfo, usage *dto.Usage, body []byt
 	if info.ResponseFacts == nil || usage == nil {
 		return
 	}
+	for _, prefix := range []string{"usage.input_token_details", "usage.input_tokens_details", "usage.prompt_tokens_details"} {
+		text, _ := relaycommon.NativeUsagePresence(body, prefix+".text_tokens", "", "")
+		audio, _ := relaycommon.NativeUsagePresence(body, prefix+".audio_tokens", "", "")
+		info.ResponseFacts.TextInputTokensReported = info.ResponseFacts.TextInputTokensReported || text
+		info.ResponseFacts.AudioInputTokensReported = info.ResponseFacts.AudioInputTokensReported || audio
+	}
 	path := "usage.output_tokens_details.audio_tokens"
 	if raw := ojson.GetBytes(body, path).Raw; raw == "" || raw == "null" {
 		path = "usage.completion_tokens_details.audio_tokens"
