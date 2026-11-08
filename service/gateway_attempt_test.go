@@ -101,6 +101,45 @@ func TestChannelHealthSharedProbeAndAttemptIdempotency(t *testing.T) {
 	}
 }
 
+func TestChannelHealthRecentReplayAcrossNodesAndLegacyKeys(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	first, second := channelhealth.New(client), channelhealth.New(client)
+	// This persisted key is the deduplication format used before bounded history.
+	require.NoError(t, client.Set(t.Context(), "gateway:channel-health:attempt:legacy", "1", 7*24*time.Hour).Err())
+	_, err := first.Record(t.Context(), channelhealth.Sample{AttemptID: "legacy", ChannelID: 1, ProviderFailure: true})
+	require.NoError(t, err)
+	states, err := first.Snapshots(t.Context(), []int{1})
+	require.NoError(t, err)
+	assert.Zero(t, states[1].Samples)
+
+	sample := channelhealth.Sample{AttemptID: "recent", ChannelID: 1, ProviderFailure: true}
+	var workers sync.WaitGroup
+	results := make(chan error, 2)
+	start := make(chan struct{})
+	for _, node := range []*channelhealth.Manager{first, second} {
+		workers.Go(func() {
+			<-start
+			_, err := node.Record(t.Context(), sample)
+			results <- err
+		})
+	}
+	close(start)
+	workers.Wait()
+	for range 2 {
+		require.NoError(t, <-results)
+	}
+	states, err = second.Snapshots(t.Context(), []int{1})
+	require.NoError(t, err)
+	assert.Equal(t, 1, states[1].Samples)
+	assert.Equal(t, 1, states[1].Failures)
+	// An older node must still recognize a recently completed new-node Attempt.
+	seen, err := client.Exists(t.Context(), "gateway:channel-health:attempt:recent").Result()
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, seen)
+}
+
 func TestChannelHealthRetryAfterAndEarliestLayerProbe(t *testing.T) {
 	for _, shared := range []bool{false, true} {
 		t.Run(fmt.Sprint(shared), func(t *testing.T) {
@@ -227,6 +266,114 @@ func TestChannelHealthLongRetryAfterStillRequiresSharedProbe(t *testing.T) {
 				assert.Zero(t, blocked.ChannelID)
 			}
 		})
+	}
+}
+
+func TestChannelHealthInflightRateLimitExtendsCooldownAfterTrip(t *testing.T) {
+	for _, shared := range []bool{false, true} {
+		for _, activeProbe := range []bool{false, true} {
+			t.Run(fmt.Sprintf("redis=%t/probe=%t", shared, activeProbe), func(t *testing.T) {
+				fake := clock.UseFake(t, time.Unix(1000, 0))
+				var client *redis.Client
+				if shared {
+					server := miniredis.RunT(t)
+					client = redis.NewClient(&redis.Options{Addr: server.Addr()})
+					t.Cleanup(func() { require.NoError(t, client.Close()) })
+				}
+				manager := channelhealth.New(client)
+				ordinary, err := manager.Acquire(t.Context(), []int{1})
+				require.NoError(t, err)
+				require.Empty(t, ordinary.Lease)
+				_, err = manager.Record(t.Context(), channelhealth.Sample{AttemptID: "trip", ChannelID: 1, ProviderFailure: true, RateLimited: true, RetryAfter: "60"})
+				require.NoError(t, err)
+				wantCircuit := "open"
+				if activeProbe {
+					probe, err := manager.Acquire(t.Context(), []int{1})
+					require.NoError(t, err)
+					require.NotEmpty(t, probe.Lease)
+					wantCircuit = "half_open"
+				}
+				fake.Advance(time.Second)
+				_, err = manager.Record(t.Context(), channelhealth.Sample{AttemptID: "inflight-429", ChannelID: 1, ProviderFailure: true, RateLimited: true, RetryAfter: "172800", Lease: ordinary.Lease})
+				require.NoError(t, err)
+				states, err := manager.Snapshots(t.Context(), []int{1})
+				require.NoError(t, err)
+				assert.Equal(t, clock.Now().Add(48*time.Hour).UnixMilli(), states[1].RetryAt)
+				assert.Equal(t, wantCircuit, states[1].Circuit)
+				if activeProbe {
+					blocked, err := manager.Acquire(t.Context(), []int{1})
+					require.NoError(t, err)
+					assert.Zero(t, blocked.ChannelID)
+				}
+			})
+		}
+	}
+}
+
+func TestChannelHealthStaleCompletionCannotChangeCurrentCircuit(t *testing.T) {
+	for _, shared := range []bool{false, true} {
+		for _, tc := range []struct {
+			name, retryAfter         string
+			oldProbe, success, close bool
+		}{
+			{name: "success started before trip", success: true},
+			{name: "superseded probe success", oldProbe: true, success: true},
+			{name: "superseded probe failure", oldProbe: true},
+			{name: "superseded probe rate limit", oldProbe: true, retryAfter: "172800"},
+			{name: "superseded failure after recovery", oldProbe: true, close: true},
+		} {
+			t.Run(fmt.Sprintf("redis=%t/%s", shared, tc.name), func(t *testing.T) {
+				fake := clock.UseFake(t, time.Unix(1000, 0))
+				var client *redis.Client
+				if shared {
+					server := miniredis.RunT(t)
+					client = redis.NewClient(&redis.Options{Addr: server.Addr()})
+					t.Cleanup(func() { require.NoError(t, client.Close()) })
+				}
+				first := channelhealth.New(client)
+				second := first
+				if shared {
+					second = channelhealth.New(client)
+				}
+				_, err := first.Record(t.Context(), channelhealth.Sample{AttemptID: "trip", ChannelID: 1, ProviderFailure: true, RateLimited: true})
+				require.NoError(t, err)
+				stale := channelhealth.Sample{AttemptID: "late", ChannelID: 1, Success: tc.success, ProviderFailure: !tc.success,
+					RateLimited: tc.retryAfter != "", RetryAfter: tc.retryAfter}
+				if tc.oldProbe {
+					old, err := first.Acquire(t.Context(), []int{1})
+					require.NoError(t, err)
+					stale.Lease = old.Lease
+					fake.Advance(24 * time.Hour)
+				}
+				current, err := second.Acquire(t.Context(), []int{1})
+				require.NoError(t, err)
+				require.NotEmpty(t, current.Lease)
+				if tc.close {
+					_, err = second.Record(t.Context(), channelhealth.Sample{AttemptID: "recovery", ChannelID: 1, Success: true, Lease: current.Lease})
+					require.NoError(t, err)
+				}
+				before, err := second.Snapshots(t.Context(), []int{1})
+				require.NoError(t, err)
+				action, err := first.Record(t.Context(), stale)
+				require.NoError(t, err)
+				assert.Equal(t, "none", action)
+				after, err := second.Snapshots(t.Context(), []int{1})
+				require.NoError(t, err)
+				assert.Equal(t, before[1].Circuit, after[1].Circuit)
+				assert.Equal(t, before[1].RetryAt, after[1].RetryAt)
+				assert.Equal(t, before[1].Failures, after[1].Failures)
+				if !tc.close {
+					blocked, err := first.Acquire(t.Context(), []int{1})
+					require.NoError(t, err)
+					assert.Zero(t, blocked.ChannelID, "the current probe still owns admission")
+					_, err = second.Record(t.Context(), channelhealth.Sample{AttemptID: "recovery", ChannelID: 1, Success: true, Lease: current.Lease})
+					require.NoError(t, err)
+					closed, err := first.Snapshots(t.Context(), []int{1})
+					require.NoError(t, err)
+					assert.Equal(t, "closed", closed[1].Circuit)
+				}
+			})
+		}
 	}
 }
 
