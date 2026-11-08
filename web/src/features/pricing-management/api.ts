@@ -24,6 +24,7 @@ import { api } from '@/lib/api'
 import { requireServerSuccess } from '@/lib/server-error-message'
 
 import type {
+  MarginCheck,
   ApiResult,
   FxQuote,
   FxRate,
@@ -63,9 +64,37 @@ export async function getFxQuote(
   return requireServerSuccess<ApiResult<FxQuote>>(response.data).data
 }
 
+export class MarginConfirmationRequired extends Error {
+  constructor(public readonly report: MarginCheck) {
+    super('Negative margin requires confirmation')
+  }
+}
+
+export function throwMarginConfirmation(error: unknown): never {
+  if (
+    isAxiosError(error) &&
+    error.response?.status === 409 &&
+    error.response.data?.message_key === 'Negative margin requires confirmation'
+  ) {
+    throw new MarginConfirmationRequired(
+      error.response.data.data as MarginCheck
+    )
+  }
+  throw error
+}
+
+export async function listMarginEstimates(): Promise<MarginCheck> {
+  const response = await api.get(`${priceVersionsPath}/margins`)
+  return requireServerSuccess<ApiResult<MarginCheck>>(response.data).data
+}
+
 export async function saveFxRate(payload: FxRateInput): Promise<void> {
-  const response = await api.put(fxRatesPath, payload)
-  requireServerSuccess(response.data)
+  try {
+    const response = await api.put(fxRatesPath, payload)
+    requireServerSuccess(response.data)
+  } catch (error) {
+    throwMarginConfirmation(error)
+  }
 }
 
 export async function getCurrentPrice(
@@ -86,8 +115,12 @@ export async function getCurrentPrice(
 export async function createPriceVersion(
   payload: PriceVersionInput
 ): Promise<void> {
-  const response = await api.post(priceVersionsPath, payload)
-  requireServerSuccess(response.data)
+  try {
+    const response = await api.post(priceVersionsPath, payload)
+    requireServerSuccess(response.data)
+  } catch (error) {
+    throwMarginConfirmation(error)
+  }
 }
 
 export async function getPriceOwners(

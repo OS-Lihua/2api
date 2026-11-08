@@ -113,9 +113,8 @@ func TextGateway(c *gin.Context) {
 		if run.evaluationFailed {
 			run.record.Status = "settlement_pending"
 		}
-		intent := model.GatewaySettlement{Request: *run.record, Attempts: attempts, SaleSource: run.saleSource, EvaluationFailed: run.evaluationFailed, SaleEvaluationFailed: run.saleEvaluationFailed}
+		intent := model.GatewaySettlement{Request: *run.record, Attempts: attempts, SaleSource: run.saleSource, EvaluationFailed: run.evaluationFailed, SaleEvaluationFailed: run.saleEvaluationFailed, SaleUsage: run.saleUsage, AttemptUsage: run.attemptUsage}
 		if run.evaluationFailed {
-			intent.SaleUsage, intent.AttemptUsage = run.saleUsage, run.attemptUsage
 			intent.SaleTrace, intent.AttemptTrace = run.saleTrace, run.attemptTrace
 		}
 		if err := model.PrepareGatewaySettlement(intent); err != nil {

@@ -117,6 +117,7 @@ const URL_TO_CONFIG_MAP: Record<string, { section: string; module: string }> = {
   '/models': { section: 'admin', module: 'models' },
   '/model-offerings': { section: 'admin', module: 'models' },
   '/price-versions': { section: 'admin', module: 'models' },
+  '/margin-reports': { section: 'admin', module: 'models' },
   '/fx-rates': { section: 'admin', module: 'models' },
   '/models/metadata': { section: 'admin', module: 'models' },
   '/models/deployments': { section: 'admin', module: 'models' },

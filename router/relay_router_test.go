@@ -2103,7 +2103,7 @@ func TestTextGatewayCozeRejectionsPreserveStatusAndProviderScope(t *testing.T) {
 func TestTextGatewayBaiduTokenPreparationUsesSharedBudgetAndCancellation(t *testing.T) {
 	for _, cancelDownstream := range []bool{false, true} {
 		t.Run(fmt.Sprint("cancel=", cancelDownstream), func(t *testing.T) {
-			entered, cancelled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			entered, cancelled, release := make(chan struct{}), make(chan struct{}), make(chan struct{}, 1)
 			defer close(release)
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 				_, _ = io.Copy(io.Discard, r.Body)
@@ -2160,14 +2160,14 @@ func TestTextGatewayBaiduTokenPreparationUsesSharedBudgetAndCancellation(t *test
 				fixture.fake.Advance(30 * time.Second)
 			}
 			select {
-			case <-done:
+			case <-cancelled:
 			case <-time.After(10 * time.Second):
 				cancel()
 				release <- struct{}{}
 				<-done
 				t.Fatal("token preparation ignored cancellation or the shared budget")
 			}
-			<-cancelled
+			<-done
 			_, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
 			require.NoError(t, err)
 			if cancelDownstream {
