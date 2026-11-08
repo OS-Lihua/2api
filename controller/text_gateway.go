@@ -442,11 +442,27 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			}
 			if info.ResponseFacts.BusinessOutput {
 				record.ChoiceCount = choiceCount
+				saleUsage := usage
 				record.Usage, record.UsageSource = attempt.Usage, attempt.UsageSource
-				source, receivable, trace, priceErr := service.GatewayPrice(sale, usage, input, started, ratio, saleFX)
+				if info.IsStream && attempt.Status == "partial" && failure.Class == "stream_interrupted" && usage != nil {
+					// Procurement retains reported usage; an interrupted delivery bills only generated text.
+					delivered := tokenkit.Count(info.TokenizerModel, info.ResponseFacts.GeneratedText)
+					if delivered < usage.CompletionTokens {
+						snapshot := *usage
+						snapshot.CompletionTokens = delivered
+						snapshot.TotalTokens = snapshot.PromptTokens + delivered
+						snapshot.OutputTokens = delivered
+						snapshot.CompletionTokenDetails = dto.OutputTokenDetails{}
+						snapshot.OutputTokensDetails = nil
+						saleUsage = &snapshot
+						record.Usage, record.UsageSource = service.GatewayRecordUsage(saleUsage), "estimated"
+					}
+				}
+				source, receivable, trace, priceErr := service.GatewayPrice(sale, saleUsage, input, started, ratio, saleFX)
 				if trace.BillingUnit == billingexpr.BillingUnitRequest && attempt.Status != "success" {
 					source, _ = money.ParseValue("0", sale.Currency)
 					receivable, _ = money.ParseValue("0", model.SettlementCurrency())
+					priceErr = nil
 				}
 				if priceErr == nil {
 					record.Receivable, priceErr = receivable.Receivable()

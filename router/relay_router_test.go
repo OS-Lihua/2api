@@ -253,6 +253,46 @@ func newTextGatewayFixture(t *testing.T, upstream http.HandlerFunc) textGatewayF
 	return textGatewayFixture{engine: engine, user: user, token: token, adminPAT: createWalletTestAccessToken(t, actor.Id, "request:read", "ledger:read"), userPAT: createWalletTestAccessToken(t, user.Id, "log:read"), offering: offering, channel: channel, sale: sale, purchase: purchase, fake: fake}
 }
 
+func assertTextGatewayLedger(t *testing.T, request model.GatewayRequest, expectedCost int64) {
+	t.Helper()
+	var entries []model.LedgerEntry
+	require.NoError(t, model.DB.Where("request_id = ?", request.ID).Find(&entries).Error)
+	var charged, revenue, payable, reserved, released int64
+	var reservations, charges, revenues int
+	for _, entry := range entries {
+		assert.Equal(t, money.Currency("USD"), entry.Amount.Currency)
+		switch entry.AccountType {
+		case model.LedgerAccountUserWallet:
+			switch entry.Type {
+			case model.LedgerEntryPreConsume:
+				reserved += entry.Amount.Nanos
+				reservations++
+			case model.LedgerEntryPreConsumeRelease:
+				released += entry.Amount.Nanos
+			case model.LedgerEntryCharge:
+				charged += entry.Amount.Nanos
+				charges++
+			}
+		case model.LedgerAccountPlatformRevenue:
+			revenue += entry.Amount.Nanos
+			revenues++
+		case model.LedgerAccountProviderPayable:
+			payable += entry.Amount.Nanos
+			assert.NotEmpty(t, entry.AttemptId)
+		}
+	}
+	assert.LessOrEqual(t, reservations, 1)
+	assert.LessOrEqual(t, charges, 1)
+	assert.LessOrEqual(t, revenues, 1)
+	assert.Equal(t, -reserved, released)
+	assert.Equal(t, -request.Receivable.Nanos, charged)
+	assert.Equal(t, request.Receivable.Nanos, revenue)
+	assert.Equal(t, expectedCost, payable)
+	reconciliation, err := model.ReconcileWallets(100)
+	require.NoError(t, err)
+	assert.Empty(t, reconciliation.Mismatches)
+}
+
 func TestGatewayBudgetManagementOptions(t *testing.T) {
 	engine, admin, _ := newAdminTestServer(t)
 	t.Setenv("GATEWAY_MAX_ATTEMPTS", "3")
@@ -362,6 +402,7 @@ func TestTextGatewayFailoverChargesOnlyDeliveredAttempt(t *testing.T) {
 	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
 	require.NoError(t, err)
 	assert.Equal(t, int64(36000), record.Receivable.Nanos)
+	assertTextGatewayLedger(t, *record, 27000)
 	attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
 	require.NoError(t, err)
 	require.EqualValues(t, 2, total)
@@ -2826,19 +2867,21 @@ func TestTextGatewayNoOutputFailureReleasesReservation(t *testing.T) {
 	wallet, err := model.GetUserWallet(fixture.user.Id)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1_000_000_000), wallet.Balance.Nanos)
+	assertTextGatewayLedger(t, requests[0], 0)
 }
 
 func TestTextGatewayJSONAndStreamUsage(t *testing.T) {
 	for _, test := range []struct {
-		name       string
-		stream     bool
-		body       string
-		status     string
-		source     string
-		prompt     int64
-		completion int64
-		receivable int64
-		cost       int64
+		name          string
+		stream        bool
+		body          string
+		status        string
+		source        string
+		prompt        int64
+		completion    int64
+		receivable    int64
+		cost          int64
+		attemptSource string
 	}{
 		{name: "JSON reported zero", body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`, status: "success", source: "upstream"},
 		{name: "JSON missing usage", body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}]}`, status: "success", source: "estimated", prompt: 9, completion: 1, receivable: 19800, cost: 11000},
@@ -2846,6 +2889,11 @@ func TestTextGatewayJSONAndStreamUsage(t *testing.T) {
 		{name: "SSE cumulative usage before trailing frames", stream: true, body: "data: {\"id\":\"stream\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: {\"choices\":[]}\n\ndata: {\"choices\":[]}\n\ndata: [DONE]\n\n", status: "success", source: "upstream", prompt: 10, completion: 5, receivable: 36000, cost: 20000},
 		{name: "SSE reported zero", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\ndata: [DONE]\n\n", status: "success", source: "upstream"},
 		{name: "SSE missing usage", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", status: "success", source: "estimated", prompt: 9, completion: 1, receivable: 19800, cost: 11000},
+		{name: "JSON explicit zero input estimates only output", body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0}}`, status: "success", source: "estimated", completion: 1, receivable: 3600, cost: 2000},
+		{name: "JSON explicit zero output estimates only input", body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"completion_tokens":0}}`, status: "success", source: "estimated", prompt: 9, receivable: 16200, cost: 9000},
+		{name: "JSON reasoning is generated output", body: `{"choices":[{"message":{"role":"assistant","reasoning_content":"Hello"},"finish_reason":"stop"}]}`, status: "success", source: "estimated", prompt: 9, completion: 1, receivable: 19800, cost: 11000},
+		{name: "SSE interrupted explicit zero stays authoritative", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\n", status: "partial", source: "upstream"},
+		{name: "SSE interrupted reported usage bills delivered output", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n", status: "partial", source: "estimated", attemptSource: "upstream", prompt: 10, completion: 1, receivable: 21600, cost: 20000},
 		{name: "SSE interrupted after output", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n", status: "partial", source: "estimated", prompt: 9, completion: 1, receivable: 19800, cost: 11000},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -2876,11 +2924,16 @@ func TestTextGatewayJSONAndStreamUsage(t *testing.T) {
 			attempts, _, err := model.ListGatewayAttempts(t.Context(), requests[0].ID, 0, 10)
 			require.NoError(t, err)
 			require.Len(t, attempts, 1)
-			assert.Equal(t, test.source, attempts[0].UsageSource)
+			attemptSource := test.attemptSource
+			if attemptSource == "" {
+				attemptSource = test.source
+			}
+			assert.Equal(t, attemptSource, attempts[0].UsageSource)
 			assert.Equal(t, test.cost, attempts[0].Cost.Nanos)
 			wallet, err := model.GetUserWallet(fixture.user.Id)
 			require.NoError(t, err)
 			assert.Equal(t, int64(1_000_000_000)-test.receivable, wallet.Balance.Nanos)
+			assertTextGatewayLedger(t, requests[0], test.cost)
 		})
 	}
 }
@@ -2962,9 +3015,12 @@ func (w cancelOnOutputWriter) WriteString(body string) (int, error) {
 func TestTextGatewayCancellationReleasesOrChargesReportedUsage(t *testing.T) {
 	for _, test := range []struct {
 		name, body, source string
+		expression         string
 		provider           int
 		charge, cost       int64
 	}{
+		{name: "OpenAI missing usage", provider: constant.ChannelTypeOpenAI, source: "estimated", charge: 19800, cost: 11000, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[]}\n\n"},
+		{name: "OpenAI fixed cancellation refunds", provider: constant.ChannelTypeOpenAI, expression: `tier("request",fixed(0.01))`, source: "upstream", cost: 20000, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: {\"choices\":[]}\n\n"},
 		{name: "OpenAI", provider: constant.ChannelTypeOpenAI, source: "upstream", charge: 36000, cost: 20000, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: {\"choices\":[]}\n\n"},
 		{name: "Cohere", provider: constant.ChannelTypeCohere, source: "estimated", charge: 19800, cost: 11000, body: "{\"text\":\"Hello\"}\n"},
 		{name: "Dify", provider: constant.ChannelTypeDify, source: "upstream", charge: 36000, cost: 20000, body: "data: {\"event\":\"message\",\"answer\":\"Hello\",\"metadata\":{\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}}\n\n"},
@@ -2984,6 +3040,10 @@ func TestTextGatewayCancellationReleasesOrChargesReportedUsage(t *testing.T) {
 					close(cancelled)
 				})
 				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", test.provider).Error)
+				if test.expression != "" {
+					price := &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: test.expression, EffectiveAt: clock.Now().Unix()}
+					require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+				}
 				addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
 					t.Error("downstream cancellation must not dispatch another Provider")
 				})
@@ -3011,6 +3071,11 @@ func TestTextGatewayCancellationReleasesOrChargesReportedUsage(t *testing.T) {
 				assert.Equal(t, "client_cancelled", attempts[0].ErrorClass)
 				wallet, err := model.GetUserWallet(fixture.user.Id)
 				require.NoError(t, err)
+				if output {
+					assertTextGatewayLedger(t, requests[0], test.cost)
+				} else {
+					assertTextGatewayLedger(t, requests[0], 0)
+				}
 				if output {
 					assert.Equal(t, test.source, attempts[0].UsageSource)
 					assert.Equal(t, test.charge, requests[0].Receivable.Nanos)
@@ -3252,6 +3317,7 @@ func TestTextGatewayFreeFixedPricesAndFailureCosts(t *testing.T) {
 	}{
 		{name: "explicit free request", expression: `tier("request",fixed(0))`, body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, status: "success", source: "upstream", cost: 20000},
 		{name: "fixed successful request", expression: `tier("request",fixed(0.01))`, body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, status: "success", source: "upstream", charge: 9000000, cost: 20000},
+		{name: "fixed interrupted overflowing branch still refunds", expression: `len == 10 ? tier("overflow",fixed(10000000000)) : tier("request",fixed(0.01))`, stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n", status: "partial", source: "upstream", cost: 20000},
 		{name: "fixed interrupted stream refunds", expression: `tier("request",fixed(0.01))`, stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n", status: "partial", source: "estimated", cost: 11000},
 		{name: "fixed safety stream refunds", expression: `tier("request",fixed(0.01))`, stream: true, body: "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n", status: "partial", source: "upstream", errorClass: "content_safety", cost: 20000},
 		{name: "fixed safety JSON refunds", expression: `tier("request",fixed(0.01))`, body: `{"choices":[{"message":{"content":"Hello"},"finish_reason":"content_filter"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, status: "partial", source: "upstream", errorClass: "content_safety", cost: 20000},
@@ -3317,6 +3383,7 @@ func TestTextGatewayFreeFixedPricesAndFailureCosts(t *testing.T) {
 			wallet, err := model.GetUserWallet(fixture.user.Id)
 			require.NoError(t, err)
 			assert.Equal(t, int64(1000000000)-test.charge, wallet.Balance.Nanos)
+			assertTextGatewayLedger(t, request, test.cost)
 			if test.name == "explicit free request" {
 				entries, total, err := model.ListLedgerEntries(wallet.Id, 0, 10)
 				require.NoError(t, err)
