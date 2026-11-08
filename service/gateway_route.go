@@ -16,6 +16,8 @@ import (
 )
 
 type GatewaySelection struct {
+	MemberTier   int
+	Fallback     string
 	Channel      model.Channel
 	Provider     *model.Provider
 	InputTokens  int
@@ -26,14 +28,54 @@ type GatewaySelection struct {
 var ErrGatewayCapability = errors.New("no Channel supports the requested capabilities")
 var ErrGatewayUnavailable = errors.New("no Channel is available")
 
-// SelectGatewayChannel considers only the current member tier and the exact
-// OpenAI Chat protocol. Ordering by Channel ID makes this single-attempt policy
-// deterministic; later route policies can replace selection without replacing
-// the shared scope, capability, transport or accounting boundaries.
+// SelectGatewayChannel exhausts each member tier before advancing. Request-local
+// exclusions retain the current tier across preparation and actual sends; the
+// caller keeps the same attempt runner, reservation and first-byte budget.
 func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request *dto.GeneralOpenAIRequest, failures ...*GatewayExclusions) (*GatewaySelection, error) {
+	exclusions := &GatewayExclusions{Channels: map[int]bool{}, Providers: map[int]bool{}}
+	if len(failures) > 0 && failures[0] != nil {
+		exclusions = failures[0]
+	}
+	tiers := []int{}
+	firstModelID := 0
+	for _, member := range offering.Members {
+		if member.Tier >= max(1, exclusions.MemberTier) {
+			tiers = append(tiers, member.Tier)
+		}
+		if member.Tier == 1 && (firstModelID == 0 || member.ModelID < firstModelID) {
+			firstModelID = member.ModelID
+		}
+	}
+	slices.Sort(tiers)
+	tiers = slices.Compact(tiers)
+	lastErr := ErrGatewayUnavailable
+	for _, tier := range tiers {
+		exclusions.MemberTier = tier
+		selection, err := selectGatewayTier(c, offering, request, tier, exclusions)
+		if err != nil {
+			if !errors.Is(err, ErrGatewayCapability) && !errors.Is(err, ErrGatewayUnavailable) {
+				return nil, err
+			}
+			lastErr = err
+			continue
+		}
+		selection.MemberTier = tier
+		if tier > 1 {
+			var first model.Model
+			if err := model.DB.WithContext(c.Request.Context()).First(&first, firstModelID).Error; err != nil {
+				return nil, err
+			}
+			selection.Fallback = first.ModelName + "->" + selection.Channel.Model.ModelName
+		}
+		return selection, nil
+	}
+	return nil, lastErr
+}
+
+func selectGatewayTier(c *gin.Context, offering *model.ModelOffering, request *dto.GeneralOpenAIRequest, tier int, failures *GatewayExclusions) (*GatewaySelection, error) {
 	ids := []int{}
 	for _, member := range offering.Members {
-		if member.Tier == 1 {
+		if member.Tier == tier {
 			ids = append(ids, member.ModelID)
 		}
 	}
@@ -46,7 +88,7 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 	excluded := []map[string]any{}
 	var selected *GatewaySelection
 	for _, candidate := range candidates {
-		if len(failures) > 0 && (failures[0].Channels[candidate.ID] || failures[0].Providers[candidate.ProviderID]) {
+		if failures.Channels[candidate.ID] || failures.Providers[candidate.ProviderID] {
 			counts["already_failed"]++
 			continue
 		}

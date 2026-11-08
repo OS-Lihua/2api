@@ -518,7 +518,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
 	}
-	attempt = &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: record.ID, ChannelID: selection.Channel.ID, ProviderID: selection.Channel.ProviderID, ModelID: selection.Channel.ModelID, MemberTier: 1,
+	attempt = &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: record.ID, ChannelID: selection.Channel.ID, ProviderID: selection.Channel.ProviderID, ModelID: selection.Channel.ModelID, MemberTier: selection.MemberTier,
 		StartedAt: attemptStart.UnixMilli(), FailoverDecision: "stop", FailoverReason: "single_attempt", CircuitAction: "none", RouteDiagnostics: selection.Diagnostics,
 		UsageSource: "none", PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, Cost: money.Amount{Currency: purchase.Currency}, AccountingFXRate: purchaseRate,
 		ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, ConversionLosses: []string{}}
@@ -605,9 +605,40 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		run.fail(c, status, "upstream_error", "Upstream request failed")
 		return
 	}
+	originalWriter := c.Writer
+	originalHeaders := originalWriter.Header().Clone()
+	delivery := &gatewayDeliveryWriter{ResponseWriter: originalWriter}
+	c.Writer = delivery
+	info.ResponseFacts.OnBusinessOutput = func() {
+		err := delivery.commit(c)
+		var flushErr *helper.StreamFlushError
+		if err != nil {
+			info.ResponseFacts.DownstreamWriteFailed = true
+			if !errors.As(err, &flushErr) {
+				info.ResponseFacts.BusinessOutput = false
+				return
+			}
+		}
+		budget.Delivered()
+	}
+	defer func() {
+		c.Writer = originalWriter
+		delete(c.Keys, "event_stream_headers_set")
+		if !info.ResponseFacts.BusinessOutput && !originalWriter.Written() {
+			clear(originalWriter.Header())
+			for key, values := range originalHeaders {
+				originalWriter.Header()[key] = values
+			}
+		}
+	}()
 	info.IsStream = info.IsStream || strings.HasPrefix(httpResponse.Header.Get("Content-Type"), "text/event-stream")
 	if info.IsStream {
 		httpResponse.Body = helper.GatewayStreamIdleBody(httpResponse.Body, info)
+	}
+	if selection.Fallback != "" {
+		c.Header("X-Model-Fallback", selection.Fallback)
+	} else {
+		c.Writer.Header().Del("X-Model-Fallback")
 	}
 	responseUsage, responseErr := adaptor.DoResponse(c, httpResponse, info)
 	usage, _ = responseUsage.(*dto.Usage)
