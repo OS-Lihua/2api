@@ -138,6 +138,7 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 		if info.ResponseFacts != nil {
 			info.ResponseFacts.RecordNativeUsage(usage, []byte(data), "usage.prompt_tokens", "usage.completion_tokens")
 			data = string(relaycommon.SanitizeNativeUsage([]byte(data), "usage"))
+			_ = info.ResponseFacts.RecordChatUsage(usage, []byte(data), "usage")
 		}
 		var baiduResponse BaiduChatStreamResponse
 		if err := common.Unmarshal([]byte(data), &baiduResponse); err != nil {
@@ -175,6 +176,7 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 	if info.ResponseFacts != nil && len(info.ResponseFacts.UnterminatedStreamData) > 0 {
 		info.ResponseFacts.RecordNativeUsage(usage, info.ResponseFacts.UnterminatedStreamData, "usage.prompt_tokens", "usage.completion_tokens")
 		partial := relaycommon.SanitizeNativeUsage(info.ResponseFacts.UnterminatedStreamData, "usage")
+		_ = info.ResponseFacts.RecordChatUsage(usage, partial, "usage")
 		info.ResponseFacts.UnterminatedStreamData = nil
 		var reported BaiduChatStreamResponse
 		if common.Unmarshal(partial, &reported) == nil {
@@ -199,6 +201,7 @@ func baiduHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respon
 		knownUsage = &baiduResponse.Usage
 		info.ResponseFacts.RecordNativeUsage(knownUsage, responseBody, "usage.prompt_tokens", "usage.completion_tokens")
 		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "usage")
+		_ = info.ResponseFacts.RecordChatUsage(knownUsage, responseBody, "usage")
 	}
 	err := common.Unmarshal(responseBody, &baiduResponse)
 	if err != nil {
@@ -214,7 +217,7 @@ func baiduHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respon
 	}
 	if readErr != nil {
 		if info.ResponseFacts != nil {
-			info.ResponseFacts.RecordChatSource(responseBaidu2OpenAI(&baiduResponse))
+			info.ResponseFacts.RecordChatSource(responseBaidu2OpenAI(&baiduResponse), info.TokenizerModelName())
 		}
 		return types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed), knownUsage
 	}

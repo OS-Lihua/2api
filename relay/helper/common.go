@@ -464,7 +464,7 @@ func WriteChatResponse(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	if resp.StatusCode != http.StatusOK {
 		return &response.Usage, types.NewErrorWithStatusCode(errors.New("upstream request failed"), types.ErrorCodeBadResponse, resp.StatusCode)
 	}
-	facts.RecordChatSource(response)
+	facts.RecordChatSource(response, info.TokenizerModelName())
 	var output strings.Builder
 	business := false
 	for _, choice := range response.Choices {
@@ -483,6 +483,10 @@ func WriteChatResponse(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	}
 	facts.GeneratedText = output.String()
 	EstimateMissingChatUsage(c, info, &response.Usage)
+	if !facts.CompletionTokensReported && facts.SourceOutputTokens != nil {
+		response.Usage.CompletionTokens = *facts.SourceOutputTokens
+		response.Usage.TotalTokens = response.Usage.PromptTokens + response.Usage.CompletionTokens
+	}
 	encoded, err := common.Marshal(response)
 	if err != nil {
 		return &response.Usage, types.NewError(err, types.ErrorCodeBadResponseBody)
@@ -493,6 +497,7 @@ func WriteChatResponse(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	if err := WriteGatewayJSONResponse(c, resp, facts, encoded, business || facts.GeneratedText != ""); err != nil {
 		return &response.Usage, types.NewError(err, types.ErrorCodeBadResponse)
 	}
+	facts.GeneratedOutputTokens = facts.SourceOutputTokens
 	return &response.Usage, nil
 }
 

@@ -30,10 +30,17 @@ func (body *cozeResultBody) ResponseError() *types.NewAPIError { return body.fai
 
 func (body *cozeResultBody) SetReader(reader io.ReadCloser) { body.ReadCloser = reader }
 
+func cozeSourceFailure(response *http.Response, completion CozeChatResponse, body []byte, failure *types.NewAPIError) *http.Response {
+	response.Body = &cozeResultBody{ReadCloser: io.NopCloser(bytes.NewReader(nil)), completion: completion, completionBody: body, failure: failure}
+	return response
+}
+
 var _ channel.ProviderRequestExecutor = (*Provider)(nil)
 
 func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetadata, body io.Reader) (*http.Response, error) {
 	account := metadata.ProviderRequest()
+	factsValue, _ := common.GetContextKey(c, constant.ContextKeyResponseFacts)
+	managed := factsValue != nil
 	if account.IsStream {
 		return nil, channel.ErrUseHTTPTransport
 	}
@@ -67,9 +74,15 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 		return response, nil
 	}
 	if readErr != nil {
+		if managed {
+			return cozeSourceFailure(response, created, createdBody, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)), nil
+		}
 		return nil, readErr
 	}
 	if err != nil {
+		if managed {
+			return cozeSourceFailure(response, created, createdBody, types.NewError(err, types.ErrorCodeBadResponseBody)), nil
+		}
 		return nil, err
 	}
 	if created.Code != 0 {
@@ -77,17 +90,27 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 		failure := rejection.ToOpenAIError()
 		failure.Code = fmt.Sprint(created.Code)
 		rejection.RelayError = failure
+		if managed {
+			return cozeSourceFailure(response, created, createdBody, rejection), nil
+		}
 		return nil, rejection
 	}
 	query := url.Values{"conversation_id": {created.Data.ConversationId}, "chat_id": {created.Data.Id}}
 	retrieveURL := account.ChannelBaseUrl + "/v3/chat/retrieve?" + query.Encode()
+	lastResponse, lastCompletion, lastBody := response, created, createdBody
 	for {
 		poll, err := p.newChatRequest(c, metadata, http.MethodGet, retrieveURL, nil)
 		if err != nil {
+			if managed {
+				return cozeSourceFailure(lastResponse, lastCompletion, lastBody, types.NewError(err, types.ErrorCodeDoRequestFailed)), nil
+			}
 			return nil, err
 		}
 		response, err := client.Do(poll)
 		if err != nil {
+			if managed {
+				return cozeSourceFailure(lastResponse, lastCompletion, lastBody, types.NewError(err, types.ErrorCodeDoRequestFailed)), nil
+			}
 			return nil, err
 		}
 		var completion CozeChatResponse
@@ -98,6 +121,7 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 			decodeBody = relaycommon.SanitizeNativeUsage(decodeBody, "data.usage")
 		}
 		decodeErr := common.Unmarshal(decodeBody, &completion)
+		lastResponse, lastCompletion, lastBody = response, completion, completionBody
 		if facts, _ := common.GetContextKey(c, constant.ContextKeyResponseFacts); facts != nil &&
 			(response.StatusCode >= 400 || completion.Code != 0 || completion.Data.Status == "failed" || completion.Data.Status == "canceled" || completion.Data.Status == "requires_action") {
 			if response.StatusCode < 400 {
@@ -114,6 +138,9 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 			return nil, err
 		}
 		if decodeErr != nil {
+			if facts, _ := common.GetContextKey(c, constant.ContextKeyResponseFacts); facts != nil {
+				return cozeSourceFailure(response, completion, completionBody, types.NewError(decodeErr, types.ErrorCodeBadResponseBody)), nil
+			}
 			return nil, decodeErr
 		}
 		if completion.Code != 0 {
@@ -124,6 +151,9 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 			destination := account.ChannelBaseUrl + "/v3/chat/message/list?" + query.Encode()
 			request, err := p.newChatRequest(c, metadata, http.MethodGet, destination, nil)
 			if err != nil {
+				if facts, _ := common.GetContextKey(c, constant.ContextKeyResponseFacts); facts != nil {
+					return cozeSourceFailure(response, completion, completionBody, types.NewError(err, types.ErrorCodeDoRequestFailed)), nil
+				}
 				return nil, err
 			}
 			response, err := client.Do(request)
@@ -147,13 +177,24 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 		select {
 		case <-c.Request.Context().Done():
 			timer.Stop()
+			if managed {
+				return cozeSourceFailure(lastResponse, lastCompletion, lastBody, types.NewError(c.Request.Context().Err(), types.ErrorCodeDoRequestFailed)), nil
+			}
 			return nil, c.Request.Context().Err()
 		case <-timer.C:
 		}
 	}
 }
 func (p *Provider) newChatRequest(c *gin.Context, metadata channel.ProviderMetadata, method, destination string, body io.Reader) (*http.Request, error) {
-	request, err := http.NewRequestWithContext(c.Request.Context(), method, destination, body)
+	ctx := c.Request.Context()
+	if method == http.MethodGet && metadata.ProviderRequest().BeginFollowupCall != nil {
+		var err error
+		ctx, err = metadata.ProviderRequest().BeginFollowupCall()
+		if err != nil {
+			return nil, err
+		}
+	}
+	request, err := http.NewRequestWithContext(ctx, method, destination, body)
 	if err != nil {
 		return nil, err
 	}

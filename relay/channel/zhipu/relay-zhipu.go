@@ -174,6 +174,7 @@ func zhipuStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 			if info.ResponseFacts != nil {
 				info.ResponseFacts.RecordNativeUsage(usage, []byte(data), "usage.prompt_tokens", "usage.completion_tokens")
 				data = string(relaycommon.SanitizeNativeUsage([]byte(data), "usage"))
+				_ = info.ResponseFacts.RecordChatUsage(usage, []byte(data), "usage")
 			}
 			if err := common.UnmarshalJsonStr(data, &meta); err != nil {
 				if info.ResponseFacts == nil {
@@ -217,6 +218,7 @@ func zhipuHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respon
 		knownUsage = &zhipuResponse.Data.Usage
 		info.ResponseFacts.RecordNativeUsage(knownUsage, responseBody, "data.usage.prompt_tokens", "data.usage.completion_tokens")
 		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "data.usage")
+		_ = info.ResponseFacts.RecordChatUsage(knownUsage, responseBody, "data.usage")
 	}
 	err := common.Unmarshal(responseBody, &zhipuResponse)
 	if err != nil {
@@ -231,7 +233,7 @@ func zhipuHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respon
 	}
 	if readErr != nil {
 		if info.ResponseFacts != nil {
-			info.ResponseFacts.RecordChatSource(responseZhipu2OpenAI(&zhipuResponse))
+			info.ResponseFacts.RecordChatSource(responseZhipu2OpenAI(&zhipuResponse), info.TokenizerModelName())
 		}
 		return knownUsage, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}

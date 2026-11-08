@@ -310,6 +310,7 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		reasoningBuilder strings.Builder
 		lastChunk        ollamaChatStreamChunk
 		parsedAny        bool
+		parsingErr       error
 		toolCallIndex    int
 		toolCalls        []dto.ToolCallResponse
 	)
@@ -324,6 +325,7 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		}
 		var ck ollamaChatStreamChunk
 		if err := common.Unmarshal([]byte(ln), &ck); err != nil {
+			parsingErr = err
 			if len(lines) == 1 {
 				if readErr != nil {
 					return knownUsage, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
@@ -465,13 +467,19 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		}},
 		Usage: *usage,
 	}
+	if info.ResponseFacts != nil {
+		info.ResponseFacts.RecordChatSource(&full, info.TokenizerModelName())
+	}
 	if readErr != nil {
-		if info.ResponseFacts != nil {
-			info.ResponseFacts.RecordChatSource(&full)
-		}
 		return usage, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
 	if info.ResponseFacts != nil {
+		if parsingErr != nil {
+			return usage, types.NewError(parsingErr, types.ErrorCodeBadResponseBody)
+		}
+		if !lastChunk.Done {
+			return usage, types.NewError(fmt.Errorf("Ollama response did not complete"), types.ErrorCodeBadResponseBody)
+		}
 		return helper.WriteChatResponse(c, info, resp, &full)
 	}
 	out, _ := common.Marshal(full)

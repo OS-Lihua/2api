@@ -70,7 +70,7 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 	}
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return &usage, types.NewError(err, types.ErrorCodeBadResponseBody)
+		return &usage, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
 	}
 	var response dto.OpenAITextResponse
 	var cozeResponse CozeChatDetailResponse

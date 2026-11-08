@@ -351,20 +351,26 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		budget.Delivered()
 	}, CanFinishStream: func() bool { return info.StreamStatus.CompletedNormally() }}
 	committedKey := false
+	selectedProvider, selectedKey, selectedKeyIndex := selection.Provider, info.ApiKey, info.ChannelMultiKeyIndex
+	var providerCallRejected error
 	info.BeginProviderCall = func() (context.Context, error) {
 		ctx, err := budget.Start()
 		if err != nil {
+			providerCallRejected = err
 			return nil, err
 		}
 		if !committedKey {
-			if err := selection.Provider.CommitRouteKey(ctx, info.ApiKey, info.ChannelMultiKeyIndex); err != nil {
+			if err := selectedProvider.CommitRouteKey(ctx, selectedKey, selectedKeyIndex); err != nil {
+				providerCallRejected = err
 				return nil, err
 			}
 			committedKey = true
-		} else if err := selection.Provider.ValidateRouteKey(ctx, info.ApiKey, info.ChannelMultiKeyIndex); err != nil {
+		} else if err := selectedProvider.ValidateRouteKey(ctx, selectedKey, selectedKeyIndex); err != nil {
+			providerCallRejected = err
 			return nil, err
 		}
 		if _, err := budget.Start(); err != nil {
+			providerCallRejected = err
 			return nil, err
 		}
 		contactedProvider = true
@@ -454,6 +460,14 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				upstreamCode = "content_filter"
 			}
 			failure := service.ClassifyGatewayFailure(upstreamStatus, upstreamCode, transportFailed, budget.TimedOut(), parent.Context().Err() != nil, info.ResponseFacts.DownstreamWriteFailed, upstreamType)
+			localRejection := providerCallRejected != nil
+			if localRejection && parent.Context().Err() == nil && !info.ResponseFacts.DownstreamWriteFailed {
+				if errors.Is(providerCallRejected, service.ErrGatewayBudget) {
+					failure = service.GatewayFailure{Class: "first_byte_timeout", Switch: true}
+				} else {
+					failure = service.GatewayFailure{Class: "channel_unavailable", Switch: true, ExcludeProvider: true}
+				}
+			}
 			if attempt.Status == "success" {
 				service.RecordGatewayChannelAffinity(c, selection)
 				failure = service.GatewayFailure{}
@@ -487,7 +501,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 						"provider_id": selection.Channel.ProviderID, "channel_id": selection.Channel.ID, "key_index": index, "error_class": failure.Class, "target_scope": targetScope}}})
 			}
 			result = service.GatewayAttemptResult{Attempt: attempt, Failure: failure, Delivered: info.ResponseFacts.BusinessOutput,
-				FirstByte: firstByte, HealthLease: selection.Admission.Lease}
+				FirstByte: firstByte, HealthLease: selection.Admission.Lease, LocalRejection: localRejection}
 			if failure.Class == "rate_limited" {
 				result.RetryAfter = retryAfter
 				if result.RetryAfter == "" {

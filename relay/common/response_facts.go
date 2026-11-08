@@ -4,6 +4,7 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 	"strings"
@@ -67,9 +68,11 @@ type ResponseFacts struct {
 
 // RecordChatSource retains generated facts when a native transport fails after
 // returning a decodable response. It does not confirm downstream delivery.
-func (facts *ResponseFacts) RecordChatSource(response *dto.OpenAITextResponse) {
+func (facts *ResponseFacts) RecordChatSource(response *dto.OpenAITextResponse, model string) {
 	var text strings.Builder
+	tokens := 0
 	for _, choice := range response.Choices {
+		start := text.Len()
 		text.WriteString(choice.Message.StringContent())
 		text.WriteString(choice.Message.GetReasoningContent())
 		for _, call := range choice.Message.ParseToolCalls() {
@@ -78,8 +81,10 @@ func (facts *ResponseFacts) RecordChatSource(response *dto.OpenAITextResponse) {
 			text.WriteString(call.Function.Arguments)
 			text.Write(call.Custom)
 		}
+		tokens += tokenkit.Count(model, text.String()[start:])
 	}
 	facts.SourceGeneratedText = text.String()
+	facts.SourceOutputTokens = &tokens
 	facts.SourceOutputObserved = facts.SourceOutputObserved || facts.SourceGeneratedText != ""
 }
 

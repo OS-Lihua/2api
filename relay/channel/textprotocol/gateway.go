@@ -182,11 +182,17 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		return usage, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	var generated strings.Builder
+	var choiceTokens *int
 	nativeMessages := p.format == types.RelayFormatClaude && info.RelayFormat == types.RelayFormatClaude
 	nativeGemini := p.format == types.RelayFormatGemini && info.RelayFormat == types.RelayFormatGemini
 	nativeResponses := p.format == types.RelayFormatOpenAIResponses && info.RelayFormat == types.RelayFormatOpenAIResponses
 	if chat, ok := canonical.Value.(*dto.OpenAITextResponse); ok && !nativeMessages && !nativeGemini && !nativeResponses {
-		for _, choice := range chat.Choices {
+		if len(chat.Choices) > 1 {
+			count := 0
+			choiceTokens = &count
+		}
+		for index, choice := range chat.Choices {
+			start := generated.Len()
 			generated.WriteString(choice.Message.StringContent())
 			generated.WriteString(choice.Message.GetReasoningContent())
 			if p.format != types.RelayFormatOpenAIResponses || info.RelayFormat != types.RelayFormatOpenAIResponses {
@@ -196,6 +202,16 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 					generated.WriteString(gjson.GetBytes(tool.Custom, "name").String())
 					generated.WriteString(gjson.GetBytes(tool.Custom, "input").String())
 				}
+			}
+			if choiceTokens != nil {
+				part := generated.String()[start:]
+				if p.format == types.RelayFormatOpenAI && info.RelayFormat == types.RelayFormatOpenAI {
+					audio := gjson.GetBytes(body, "choices").Array()
+					if index < len(audio) {
+						part += audio[index].Get("message.audio.transcript").String()
+					}
+				}
+				*choiceTokens += tokenkit.Count(info.TokenizerModelName(), part)
 			}
 		}
 	}
@@ -212,9 +228,18 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		}
 	}
 	if nativeGemini {
-		for _, candidate := range gjson.GetBytes(body, "candidates").Array() {
+		candidates := gjson.GetBytes(body, "candidates").Array()
+		if len(candidates) > 1 {
+			count := 0
+			choiceTokens = &count
+		}
+		for _, candidate := range candidates {
+			start := generated.Len()
 			for _, part := range candidate.Get("content.parts").Array() {
 				generated.WriteString(gatewayGeminiPartText(part))
+			}
+			if choiceTokens != nil {
+				*choiceTokens += tokenkit.Count(info.TokenizerModelName(), generated.String()[start:])
 			}
 		}
 	}
@@ -227,8 +252,12 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	if !facts.PromptTokensReported {
 		usage.PromptTokens = max(usage.PromptTokens, info.GetEstimatePromptTokens())
 	}
+	generatedTokens := tokenkit.Count(info.TokenizerModelName(), facts.GeneratedText)
+	if choiceTokens != nil {
+		generatedTokens = *choiceTokens
+	}
 	if !facts.CompletionTokensReported {
-		usage.CompletionTokens = max(usage.CompletionTokens, tokenkit.Count(info.TokenizerModelName(), facts.GeneratedText))
+		usage.CompletionTokens = max(usage.CompletionTokens, generatedTokens)
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	converted, err := relayconvert.ConvertResponse(c, info, info.RelayFormat, response)
@@ -256,6 +285,7 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	if err := helper.WriteGatewayJSONResponse(c, resp, facts, encoded, business); err != nil {
 		return usage, types.NewError(err, types.ErrorCodeBadResponse)
 	}
+	facts.GeneratedOutputTokens = &generatedTokens
 	if p.format == types.RelayFormatOpenAIResponses {
 		status := gjson.GetBytes(body, "status").String()
 		if status != "" && status != "completed" && !budgetEnd {

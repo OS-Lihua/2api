@@ -52,13 +52,19 @@ func streamResponsePaLM2OpenAI(palmResponse *PaLMChatResponse) *dto.ChatCompleti
 
 func palmStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, string) {
 	defer service.CloseResponseBodyGracefully(resp)
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return types.NewError(err, types.ErrorCodeReadResponseBodyFailed), ""
-	}
+	body, readErr := io.ReadAll(resp.Body)
 	var palmResponse PaLMChatResponse
 	if err := common.Unmarshal(body, &palmResponse); err != nil {
+		if readErr != nil {
+			return types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed), ""
+		}
 		return types.NewError(err, types.ErrorCodeBadResponseBody), ""
+	}
+	if readErr != nil {
+		if info.ResponseFacts != nil {
+			info.ResponseFacts.RecordChatSource(responsePaLM2OpenAI(&palmResponse), info.TokenizerModelName())
+		}
+		return types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed), ""
 	}
 	if resp.StatusCode != http.StatusOK || palmResponse.Error.Code != 0 || len(palmResponse.Candidates) == 0 {
 		return types.NewError(fmt.Errorf("PaLM response failed"), types.ErrorCodeBadResponse), ""
@@ -100,7 +106,7 @@ func palmHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 	fullTextResponse := responsePaLM2OpenAI(&palmResponse)
 	if readErr != nil {
 		if info.ResponseFacts != nil {
-			info.ResponseFacts.RecordChatSource(fullTextResponse)
+			info.ResponseFacts.RecordChatSource(fullTextResponse, info.TokenizerModelName())
 		}
 		return &fullTextResponse.Usage, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}

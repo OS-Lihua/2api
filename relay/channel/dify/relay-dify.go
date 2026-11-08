@@ -259,6 +259,7 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		if info.ResponseFacts != nil {
 			info.ResponseFacts.RecordNativeUsage(usage, []byte(data), "metadata.usage.prompt_tokens", "metadata.usage.completion_tokens")
 			data = string(relaycommon.SanitizeNativeUsage([]byte(data), "metadata.usage"))
+			_ = info.ResponseFacts.RecordChatUsage(usage, []byte(data), "metadata.usage")
 		}
 		var difyResponse DifyChunkChatCompletionResponse
 		if err := common.Unmarshal([]byte(data), &difyResponse); err != nil {
@@ -326,6 +327,7 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	if info.ResponseFacts != nil && len(info.ResponseFacts.UnterminatedStreamData) > 0 {
 		info.ResponseFacts.RecordNativeUsage(usage, info.ResponseFacts.UnterminatedStreamData, "metadata.usage.prompt_tokens", "metadata.usage.completion_tokens")
 		partial := relaycommon.SanitizeNativeUsage(info.ResponseFacts.UnterminatedStreamData, "metadata.usage")
+		_ = info.ResponseFacts.RecordChatUsage(usage, partial, "metadata.usage")
 		info.ResponseFacts.UnterminatedStreamData = nil
 		var reported DifyChunkChatCompletionResponse
 		if common.Unmarshal(partial, &reported) == nil {
@@ -368,6 +370,7 @@ func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 		knownUsage = &difyResponse.MetaData.Usage
 		info.ResponseFacts.RecordNativeUsage(knownUsage, responseBody, "metadata.usage.prompt_tokens", "metadata.usage.completion_tokens")
 		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "metadata.usage")
+		_ = info.ResponseFacts.RecordChatUsage(knownUsage, responseBody, "metadata.usage")
 	}
 	err := common.Unmarshal(responseBody, &difyResponse)
 	if err != nil {
@@ -398,7 +401,7 @@ func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 	fullTextResponse.Choices = append(fullTextResponse.Choices, choice)
 	if readErr != nil {
 		if info.ResponseFacts != nil {
-			info.ResponseFacts.RecordChatSource(&fullTextResponse)
+			info.ResponseFacts.RecordChatSource(&fullTextResponse, info.TokenizerModelName())
 		}
 		return knownUsage, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
 	}
