@@ -14,6 +14,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
@@ -40,6 +41,38 @@ func gatewayError(c *gin.Context, status int, code, message string) {
 	}
 	if facts, ok := common.GetContextKeyType[*relaycommon.ResponseFacts](c, constant.ContextKeyResponseFacts); ok && facts != nil && (facts.DownstreamWriteFailed || facts.TerminalDelivered) {
 		return
+	}
+	key := ""
+	switch message {
+	case "Model not found":
+		key = "gateway.model_not_found"
+	case "Invalid text request":
+		key = "gateway.invalid_text_request"
+	case "The request cannot be converted":
+		key = "gateway.cannot_convert_request"
+	case "No Channel supports the requested capabilities":
+		key = "gateway.unsupported_capabilities"
+	case "Channel price is unavailable":
+		key = "gateway.channel_price_unavailable"
+	case "No Channel is available":
+		key = "gateway.channel_unavailable"
+	case "Model price is unavailable":
+		key = "gateway.model_price_unavailable"
+	case "Insufficient wallet balance":
+		key = "gateway.insufficient_balance"
+	case "Billing is unavailable":
+		key = "gateway.billing_unavailable"
+	case "Upstream request failed":
+		key = "gateway.upstream_request_failed"
+	case "Invalid upstream response":
+		key = "gateway.invalid_upstream_response"
+	case "Upstream response failed":
+		key = "gateway.upstream_response_failed"
+	}
+	if key != "" {
+		message = i18n.T(c, key)
+	} else if parameters, ok := strings.CutPrefix(message, "Unsupported parameters: "); ok {
+		message = i18n.T(c, i18n.MsgGatewayUnsupportedParameters, map[string]any{"Parameters": parameters})
 	}
 	var payload gin.H
 	event := ""

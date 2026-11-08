@@ -7803,6 +7803,64 @@ func TestTextGatewayBaiduRetainsAllSystemPrompts(t *testing.T) {
 	assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
 }
 
+func TestTextGatewayErrorsRespectReaderLanguage(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	previousLanguage := common.DefaultLanguage
+	common.DefaultLanguage = i18n.LangZhTW
+	t.Cleanup(func() { common.DefaultLanguage = previousLanguage })
+	for _, language := range []struct{ header, requestFailure, responseFailure string }{
+		{"en", "Upstream request failed", "Upstream response failed"},
+		{"zh-CN", "上游请求失败", "上游响应失败"},
+		{"zh-TW", "上游請求失敗", "上游回應失敗"},
+		{"", "上游請求失敗", "上游回應失敗"},
+	} {
+		for _, stream := range []bool{false, true} {
+			for _, endpoint := range []struct{ name, path, body string }{
+				{"Chat", "/v1/chat/completions", fmt.Sprintf(`{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"stream":%t,"max_tokens":16}`, stream)},
+				{"Responses", "/v1/responses", fmt.Sprintf(`{"model":"gateway-offering","input":"Hello","stream":%t,"max_output_tokens":16}`, stream)},
+				{"Messages", "/v1/messages", fmt.Sprintf(`{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"stream":%t,"max_tokens":16}`, stream)},
+				{"Gemini", "/v1beta/models/gateway-offering:generateContent", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16}}`},
+			} {
+				t.Run(fmt.Sprintf("%s/%s/stream=%t", language.header, endpoint.name, stream), func(t *testing.T) {
+					fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+						if stream {
+							w.Header().Set("Content-Type", "text/event-stream")
+							_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"provider-private-error\",\"code\":\"server_error\"}}\n\n")
+							return
+						}
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusServiceUnavailable)
+						_, _ = io.WriteString(w, `{"error":{"message":"provider-private-error","type":"server_error"}}`)
+					})
+					path := endpoint.path
+					if stream && endpoint.name == "Gemini" {
+						path = "/v1beta/models/gateway-offering:streamGenerateContent?alt=sse"
+					}
+					request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(endpoint.body))
+					request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+					request.Header.Set("Content-Type", "application/json")
+					if language.header != "" {
+						request.Header.Set("Accept-Language", language.header)
+					}
+					response := httptest.NewRecorder()
+					fixture.engine.ServeHTTP(response, request)
+					expected := language.requestFailure
+					if stream {
+						expected = language.responseFailure
+						assert.Equal(t, http.StatusOK, response.Code)
+						assert.NotContains(t, response.Body.String(), "[DONE]")
+					} else {
+						assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+					}
+					assert.Contains(t, response.Body.String(), expected)
+					assert.Contains(t, response.Body.String(), "upstream_error")
+					assert.NotContains(t, response.Body.String(), "provider-private-error")
+				})
+			}
+		}
+	}
+}
+
 func TestTextGatewayExplicitZeroOutputReservesOnlyInput(t *testing.T) {
 	for _, endpoint := range []struct{ name, path, body string }{
 		{"Chat", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":0}`},
