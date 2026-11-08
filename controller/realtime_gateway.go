@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"net/http"
 	"slices"
 	"strings"
@@ -38,17 +37,16 @@ import (
 // Response also owns the handshake; metadata alone never creates a sale.
 // Financial workers wait for the existing native transport's single owner.
 type realtimeGatewayResponse struct {
-	session                     *realtimeGatewaySession
-	call                        *relay.ResponsesWSCall
-	steps                       chan *realtimeGatewayAttempt
-	finalized                   chan struct{}
-	apiErr                      *types.NewAPIError
-	last                        realtimeGatewayCompletion
-	established                 bool
-	terminalDelivered           bool
-	finishing                   bool
-	conversationInput           *dto.Usage
-	tokenizerModel, inputFormat string
+	session           *realtimeGatewaySession
+	call              *relay.ResponsesWSCall
+	steps             chan *realtimeGatewayAttempt
+	finalized         chan struct{}
+	apiErr            *types.NewAPIError
+	last              realtimeGatewayCompletion
+	established       bool
+	terminalDelivered bool
+	finishing         bool
+	inputSnapshot     *service.RealtimeInputSnapshot
 }
 
 type realtimeGatewayAttempt struct {
@@ -106,15 +104,11 @@ type realtimeGatewaySession struct {
 	tokenizerModel                                string
 	identity                                      [32]byte
 	defaults                                      []byte
-	inputText                                     strings.Builder
+	conversation                                  *service.RealtimeConversation
 	clientGone                                    bool
 	queued                                        []realtimeQueuedRequest
 	configPending                                 bool
 	capabilities                                  capability.Set
-	inputFormat, outputFormat                     string
-	audioBytes                                    int64
-	bufferedAudioTokens, inputAudioTokens         int
-	assistantTokens, assistantAudioTokens         int
 	commitPending                                 bool
 	vadPath                                       string
 	autoResponse, autoInterrupt                   bool
@@ -124,6 +118,7 @@ type realtimeGatewaySession struct {
 	vadType, nextVADType                          string
 	vadTurns                                      map[string]*realtimeVADTurn
 	autoPending                                   bool
+	vadBytes                                      int
 	queuedBytes                                   int
 }
 
@@ -150,7 +145,7 @@ func RealtimeGateway(c *gin.Context) {
 		runner: newResponsesWSRequestRunner(c), auth: newResponsesWSRequestRunner(c, true),
 		offeringID: offering.ID, model: c.Query("model"),
 		active: map[string]*realtimeGatewayAttempt{}, completed: map[string]bool{},
-		defaults: []byte(`{}`), vadTurns: map[string]*realtimeVADTurn{}, inputFormat: "pcm16", outputFormat: "pcm16", configPending: true,
+		defaults: []byte(`{}`), vadTurns: map[string]*realtimeVADTurn{}, conversation: service.NewRealtimeConversation(c, ""), configPending: true,
 	}
 	session.authID = c.GetString(common.RequestIdKey)
 	if session.authID == "" {
@@ -189,6 +184,7 @@ func RealtimeGateway(c *gin.Context) {
 		_, exchangeErr := relay.ExchangeRealtime(nativeContext, &transportInfo, first.prepared, func() error {
 			session.channelID, session.providerID, session.providerType = first.channelID, first.providerID, first.info.ChannelType
 			session.tokenizerModel = first.info.TokenizerModelName()
+			session.conversation = service.NewRealtimeConversation(c, session.tokenizerModel)
 			session.capabilities = first.response.call.Native.Capabilities
 			session.keyIndex, session.upstreamModel = first.info.ChannelMultiKeyIndex, first.info.UpstreamModelName
 			session.identity = first.prepared.Identity()
@@ -266,21 +262,17 @@ func (session *realtimeGatewaySession) begin(body, original []byte, input *dto.U
 		close(response.finalized)
 		return response
 	}
-	response.conversationInput = session.defaultInput(false)
-	instructions := session.instructionTokens()
-	response.conversationInput.PromptTokens -= instructions
-	response.conversationInput.PromptTokensDetails.TextTokens -= instructions
-	response.tokenizerModel, response.inputFormat = session.tokenizerModel, session.inputFormat
+	response.inputSnapshot = session.conversation.Snapshot()
 	if session.channelID != 0 {
 		var err error
-		input, err = response.estimateInput(projection)
+		input, err = response.inputSnapshot.Estimate(projection)
 		if err != nil {
 			response.apiErr = types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest)
 			close(response.finalized)
 			return response
 		}
 	}
-	call.Native = &relay.NativeWSLifecycle{Protocol: protocol.OpenAIRealtime, TransportOnly: session.channelID == 0, OriginalBody: append([]byte(nil), original...), StartedAt: startedAt, InputUsage: service.GatewayUsageSnapshot(input), EstimateInput: response.estimateInput, Prepare: response.prepare, CreatePayload: response.payload,
+	call.Native = &relay.NativeWSLifecycle{Protocol: protocol.OpenAIRealtime, TransportOnly: session.channelID == 0, OriginalBody: append([]byte(nil), original...), StartedAt: startedAt, InputUsage: service.GatewayUsageSnapshot(input), EstimateInput: response.inputSnapshot.Estimate, Prepare: response.prepare, CreatePayload: response.payload,
 		Exchange: response.exchange, Established: response.connected, TerminalDelivered: response.delivered, SaleInput: response.saleInput, PurchaseInput: response.purchaseInput}
 	if !call.Native.TransportOnly && session.sequence == 2 {
 		call.Native.Budget = session.initial.call.Native.Budget
@@ -312,52 +304,6 @@ func (session *realtimeGatewaySession) next(response *realtimeGatewayResponse) (
 	case <-session.context.Done():
 		return nil, types.NewError(context.Cause(session.context), types.ErrorCodeDoRequestFailed)
 	}
-}
-
-func (response *realtimeGatewayResponse) estimateInput(body []byte) (*dto.Usage, error) {
-	input := service.GatewayUsageSnapshot(response.conversationInput)
-	value := ojson.ParseBytes(body)
-	items := value.Get("input")
-	if items.Exists() && items.Type != ojson.Null || value.Get("conversation").String() == "none" {
-		input = &dto.Usage{}
-		if items.Exists() && items.Type != ojson.Null && !items.IsArray() {
-			return nil, errors.New("Realtime input must be an array")
-		}
-		for _, item := range items.Array() {
-			switch item.Get("type").String() {
-			case "function_call":
-				input.PromptTokens += tokenkit.Count(response.tokenizerModel, item.Get("name").String()+item.Get("arguments").String())
-			case "function_call_output":
-				input.PromptTokens += tokenkit.Count(response.tokenizerModel, item.Get("output").String())
-			case "message", "":
-				for _, part := range item.Get("content").Array() {
-					switch part.Get("type").String() {
-					case "input_text", "text":
-						input.PromptTokens += tokenkit.Count(response.tokenizerModel, part.Get("text").String())
-					case "input_audio":
-						audio, err := base64.StdEncoding.DecodeString(part.Get("audio").String())
-						if err != nil {
-							return nil, errors.New("Invalid Realtime input audio")
-						}
-						tokens := service.CountRealtimeAudioTokens(int64(len(audio)), response.inputFormat, true)
-						input.PromptTokens += tokens
-						input.PromptTokensDetails.AudioTokens += tokens
-					default:
-						return nil, errors.New("Unsupported Realtime input content")
-					}
-				}
-			default:
-				return nil, errors.New("Unsupported Realtime input item")
-			}
-		}
-	}
-	input.PromptTokens += tokenkit.Count(response.tokenizerModel, value.Get("instructions").String())
-	for _, tool := range value.Get("tools").Array() {
-		input.PromptTokens += tokenkit.Count(response.tokenizerModel, tool.Raw)
-	}
-	input.PromptTokensDetails.TextTokens = input.PromptTokens - input.PromptTokensDetails.AudioTokens
-	input.TotalTokens = input.PromptTokens
-	return input, nil
 }
 
 func (response *realtimeGatewayResponse) prepare(c *gin.Context, info *relaycommon.RelayInfo) (*relaychannel.PreparedWssRequest, error) {
@@ -469,7 +415,7 @@ func (session *realtimeGatewaySession) requestAt(raw []byte, startedAt time.Time
 		}
 	}
 	kind := ojson.GetBytes(raw, "type").String()
-	if (session.awaiting != nil || session.configPending || session.commitPending) && kind != "response.cancel" {
+	if (session.awaiting != nil || session.configPending || session.commitPending || session.conversation.Pending()) && kind != "response.cancel" {
 		maximum := constant.MaxRequestBodyMB
 		if maximum <= 0 {
 			maximum = 128
@@ -494,41 +440,23 @@ func (session *realtimeGatewaySession) requestAt(raw []byte, startedAt time.Time
 		session.configPending = true
 		return command.Bytes(), nil
 	}
+	if kind == "input_audio_buffer.append" && !slices.Contains(session.capabilities.InputModalities, capability.Audio) {
+		return nil, types.NewErrorWithStatusCode(errors.New("Audio input is not supported on this connection"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
+	}
+	observed, observeErr := session.conversation.Observe(raw, true)
+	if observeErr != nil {
+		return nil, types.NewErrorWithStatusCode(observeErr, types.ErrorCodeInvalidRequest, http.StatusBadRequest)
+	}
+	raw = observed
 	if kind == "input_audio_buffer.append" {
-		if !slices.Contains(session.capabilities.InputModalities, capability.Audio) {
-			return nil, types.NewErrorWithStatusCode(errors.New("Audio input is not supported on this connection"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
-		}
-		value := ojson.GetBytes(raw, "audio")
-		if value.Type != ojson.String {
-			return nil, types.NewErrorWithStatusCode(errors.New("audio must contain base64 data"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
-		}
-		audio, decodeErr := base64.StdEncoding.DecodeString(value.String())
-		if decodeErr != nil || int64(len(audio)) > math.MaxInt64-session.audioBytes {
-			return nil, types.NewErrorWithStatusCode(errors.New("Invalid Realtime audio buffer"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
-		}
-		nextBytes := session.audioBytes + int64(len(audio))
 		input := session.defaultInput(true)
-		additional := service.CountRealtimeAudioTokens(nextBytes, session.inputFormat, true) - service.CountRealtimeAudioTokens(session.audioBytes, session.inputFormat, true)
-		input.PromptTokens += additional
-		input.PromptTokensDetails.AudioTokens += additional
 		if maximum := session.capabilities.Limits.ContextLength; maximum != nil && int64(input.PromptTokens) > *maximum {
 			return nil, types.NewErrorWithStatusCode(errors.New("Channel context limit exceeded"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
 		}
-		session.audioBytes = nextBytes
 		return raw, nil
 	}
 	if kind == "input_audio_buffer.commit" {
 		session.commitPending = true
-		return raw, nil
-	}
-	if kind == "input_audio_buffer.clear" {
-		session.audioBytes, session.bufferedAudioTokens = 0, 0
-		return raw, nil
-	}
-	if kind == "conversation.item.create" {
-		for _, content := range ojson.GetBytes(raw, "item.content").Array() {
-			session.inputText.WriteString(content.Get("text").String())
-		}
 		return raw, nil
 	}
 	if kind != "response.create" {
@@ -589,8 +517,10 @@ func (session *realtimeGatewaySession) admitGeneration(body, original []byte, in
 	}
 	// Completed receipts finish posting before another admission. Responses
 	// that are still generating remain concurrent on this connection.
+	retained := session.responses[:0]
 	for _, previous := range session.responses {
 		if !previous.finishing {
+			retained = append(retained, previous)
 			continue
 		}
 		select {
@@ -599,11 +529,17 @@ func (session *realtimeGatewaySession) admitGeneration(body, original []byte, in
 			return nil, types.NewError(context.Cause(session.context), types.ErrorCodeDoRequestFailed)
 		}
 	}
+	clear(session.responses[len(retained):])
+	session.responses = retained
 	response := session.begin(body, original, input, startedAt)
 	attempt, apiErr := session.next(response)
 	if apiErr != nil {
 		return nil, apiErr
 	}
+	// Preparation has frozen quantities and wire payload before reservation.
+	// The financial receipt no longer needs the complete item inventory.
+	response.inputSnapshot = nil
+	response.call.Native.EstimateInput = nil
 	session.pending = attempt
 	attempt.response.call.Native.Budget.Pause()
 	return attempt, nil
@@ -626,12 +562,12 @@ func (session *realtimeGatewaySession) instructionTokens() int {
 }
 
 func (session *realtimeGatewaySession) defaultInput(buffered bool) *dto.Usage {
-	audio := session.inputAudioTokens + session.assistantAudioTokens
-	if buffered {
-		audio += session.bufferedAudioTokens + service.CountRealtimeAudioTokens(session.audioBytes, session.inputFormat, true)
-	}
-	text := tokenkit.Count(session.tokenizerModel, session.inputText.String()) + session.instructionTokens() + session.assistantTokens - session.assistantAudioTokens
-	return &dto.Usage{PromptTokens: text + audio, TotalTokens: text + audio, PromptTokensDetails: dto.InputTokenDetails{TextTokens: text, AudioTokens: audio}}
+	input := session.conversation.Usage(buffered)
+	instructions := session.instructionTokens()
+	input.PromptTokens += instructions
+	input.PromptTokensDetails.TextTokens += instructions
+	input.TotalTokens = input.PromptTokens
+	return input
 }
 
 // prepareSessionSettings keeps native VAD detection while moving inference and
@@ -756,6 +692,9 @@ func (session *realtimeGatewaySession) activeDefault() bool {
 }
 
 func (session *realtimeGatewaySession) event(raw []byte) ([]byte, [][]byte, *types.NewAPIError) {
+	if _, err := session.conversation.Observe(raw, false); err != nil {
+		return nil, nil, types.NewError(err, types.ErrorCodeBadResponse)
+	}
 	kind := ojson.GetBytes(raw, "type").String()
 	switch kind {
 	case "session.created", "session.updated":
@@ -785,23 +724,6 @@ func (session *realtimeGatewaySession) event(raw []byte) ([]byte, [][]byte, *typ
 				return nil, nil, types.NewError(errors.New("Upstream automatic generation could not be controlled"), types.ErrorCodeBadResponse)
 			}
 			session.configPending = false
-		}
-		for _, direction := range []string{"input", "output"} {
-			format := value.Get(direction + "_audio_format")
-			if native := value.Get("audio." + direction + ".format.type"); native.Exists() {
-				format = native
-			}
-			if normalized, valid := service.NormalizeRealtimeAudioFormat(format.String()); valid {
-				if direction == "input" {
-					if normalized != session.inputFormat {
-						session.bufferedAudioTokens += service.CountRealtimeAudioTokens(session.audioBytes, session.inputFormat, true)
-						session.audioBytes = 0
-					}
-					session.inputFormat = normalized
-				} else {
-					session.outputFormat = normalized
-				}
-			}
 		}
 		document := ojson.NewDoc([]byte(`{}`))
 		for _, field := range []string{"instructions", "tools", "tool_choice", "temperature", "modalities", "output_modalities", "max_output_tokens"} {
@@ -847,6 +769,14 @@ func (session *realtimeGatewaySession) event(raw []byte) ([]byte, [][]byte, *typ
 		}
 		turn := session.vadTurns[id]
 		if turn == nil {
+			maximum := constant.MaxRequestBodyMB
+			if maximum <= 0 {
+				maximum = 128
+			}
+			if len(id)+128 > maximum<<20-session.vadBytes {
+				return nil, nil, types.NewError(errors.New("Realtime turn identity budget exceeded"), types.ErrorCodeBadResponse)
+			}
+			session.vadBytes += len(id) + 128
 			turn = &realtimeVADTurn{}
 			session.vadTurns[id] = turn
 		}
@@ -878,8 +808,6 @@ func (session *realtimeGatewaySession) event(raw []byte) ([]byte, [][]byte, *typ
 		}
 		if kind == "input_audio_buffer.committed" && !turn.committed {
 			turn.committed, session.commitPending = true, false
-			session.inputAudioTokens += session.bufferedAudioTokens + service.CountRealtimeAudioTokens(session.audioBytes, session.inputFormat, true)
-			session.audioBytes, session.bufferedAudioTokens = 0, 0
 		}
 		if session.autoResponse && turn.stopped && turn.committed && !turn.generated {
 			turn.generated = true
@@ -898,7 +826,8 @@ func (session *realtimeGatewaySession) event(raw []byte) ([]byte, [][]byte, *typ
 		commands, apiErr := session.releaseQueuedRequests()
 		return raw, commands, apiErr
 	}
-	return raw, nil, nil
+	commands, apiErr := session.releaseQueuedRequests()
+	return raw, commands, apiErr
 }
 
 func (session *realtimeGatewaySession) afterResponse() ([][]byte, *types.NewAPIError) {
@@ -916,7 +845,7 @@ func (session *realtimeGatewaySession) afterResponse() ([][]byte, *types.NewAPIE
 }
 func (session *realtimeGatewaySession) releaseQueuedRequests() ([][]byte, *types.NewAPIError) {
 	var commands [][]byte
-	for len(session.queued) > 0 && session.awaiting == nil && !session.configPending && !session.commitPending {
+	for len(session.queued) > 0 && session.awaiting == nil && !session.configPending && !session.commitPending && !session.conversation.Pending() {
 		queued := session.queued[0]
 		session.queued[0] = realtimeQueuedRequest{}
 		session.queued = session.queued[1:]
@@ -942,16 +871,10 @@ func (session *realtimeGatewaySession) response(result *relaycommon.RealtimeResp
 	}
 	session.completed[result.ID] = true
 	delete(session.active, result.ID)
-	if attempt.defaultConversation {
-		generated := result.Usage.CompletionTokens
-		audio := result.Usage.CompletionTokenDetails.AudioTokens
-		if result.Facts.GeneratedOutputTokens != nil {
-			generated = max(generated, *result.Facts.GeneratedOutputTokens)
-			audio = max(audio, *result.Facts.GeneratedOutputTokens-tokenkit.Count(session.tokenizerModel, result.Facts.GeneratedText))
-		}
-		session.assistantTokens += generated
-		session.assistantAudioTokens += min(audio, generated)
-	}
+	trackingErr := session.conversation.Complete(result, attempt.defaultConversation)
 	session.finish(attempt, realtimeGatewayCompletion{result: result, terminalDelivered: result.Outcome.EndReason == relaycommon.StreamEndReasonDone && !result.Facts.DownstreamWriteFailed})
+	if trackingErr != nil {
+		return types.NewError(trackingErr, types.ErrorCodeBadResponse)
+	}
 	return nil
 }

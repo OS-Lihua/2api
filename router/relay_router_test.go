@@ -732,87 +732,141 @@ func TestRealtimeGatewayRejectsFixedPricingBeforeReservation(t *testing.T) {
 }
 
 func TestRealtimeGatewayReservesKnownResponseInstructions(t *testing.T) {
-	var calls atomic.Int32
-	release := make(chan struct{})
-	defer close(release)
-	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
-		peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
-		if !assert.NoError(t, err) {
-			return
-		}
-		defer peer.Close()
-		if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"modalities":["text"],"turn_detection":null}}`))) {
-			return
-		}
-		_, create, err := peer.ReadMessage()
-		if err != nil {
-			return
-		} // A rejected generation closes without sending.
-		assert.Equal(t, strings.Repeat(" hello", 600), ojson.GetBytes(create, "response.instructions").String())
-		calls.Add(1)
-		if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"funded","conversation_id":null,"status":"in_progress"}}`))) {
-			return
-		}
-		<-release
-	})
-	encoded, err := common.Marshal(map[string]string{"instructions": strings.Repeat(" hello", 600)})
-	require.NoError(t, err)
-	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": protocol.OpenAIRealtime, "parameter_overrides": string(encoded)}).Error)
-	price := *fixture.sale
-	price.ID, price.EffectiveAt, price.Expression = 0, clock.Now().Unix()+1, `param("response.conversation") == "none" ? tier("input", p * 1000) : tier("wrong", p)`
-	require.NoError(t, model.CreatePriceVersion(t.Context(), &price, fixture.sale.CreatedBy))
-	fixture.fake.Advance(2 * time.Second)
-	var clients []*websocket.Conn
-	for range 2 {
-		server := newRealtimeGatewayServer(t, fixture.engine)
-		client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/v1/realtime?model=gateway-alias", http.Header{"Authorization": {"Bearer sk-" + fixture.token.Key}})
-		require.NoError(t, err)
-		defer client.Close()
-		_, _, err = client.ReadMessage()
-		require.NoError(t, err)
-		clients = append(clients, client)
-	}
-	var shadows int64
-	require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Where("user_id = ?", fixture.user.Id).Count(&shadows).Error)
-	assert.Zero(t, shadows, "Session setup has no logical response")
-	outcomes := make(chan bool, 2)
-	for _, client := range clients {
-		require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"conversation":"none","input":[],"instructions":"`+strings.Repeat(" hello", 300)+`"}}`)))
-		go func() {
-			for {
-				_, raw, err := client.ReadMessage()
-				if err != nil {
-					outcomes <- false
+	for _, source := range []string{"instructions", "conversation", "reference", "image"} {
+		t.Run(source, func(t *testing.T) {
+			var calls atomic.Int32
+			release := make(chan struct{})
+			defer close(release)
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if !assert.NoError(t, err) {
 					return
 				}
-				switch ojson.GetBytes(raw, "type").String() {
-				case "response.created":
-					outcomes <- true
-					return
-				case "error":
-					outcomes <- false
+				defer peer.Close()
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"modalities":["text"],"turn_detection":null}}`))) {
 					return
 				}
+				var create []byte
+				for {
+					_, create, err = peer.ReadMessage()
+					if err != nil {
+						return
+					}
+					if ojson.GetBytes(create, "type").String() != "conversation.item.create" {
+						break
+					}
+					reply := ojson.NewDoc([]byte(`{"type":"conversation.item.created"}`))
+					if !assert.NoError(t, reply.SetRawBytes("item", []byte(ojson.GetBytes(create, "item").Raw))) {
+						return
+					}
+					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, reply.Bytes())) {
+						return
+					}
+				}
+				assert.Equal(t, "response.create", ojson.GetBytes(create, "type").String())
+				if source == "instructions" {
+					assert.Equal(t, strings.Repeat(" hello", 600), ojson.GetBytes(create, "response.instructions").String())
+				}
+				if source == "image" {
+					assert.Contains(t, ojson.GetBytes(create, "response.input.0.content.1.image_url").String(), "data:image/png;base64,")
+				}
+				calls.Add(1)
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"funded","conversation_id":null,"status":"in_progress"}}`))) {
+					return
+				}
+				<-release
+			})
+			overrides := map[string]string{}
+			if source == "instructions" {
+				overrides["instructions"] = strings.Repeat(" hello", 600)
 			}
-		}()
-	}
-	accepted := 0
-	for range 2 {
-		select {
-		case funded := <-outcomes:
-			if funded {
-				accepted++
+			encoded, err := common.Marshal(overrides)
+			require.NoError(t, err)
+			require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": protocol.OpenAIRealtime, "parameter_overrides": string(encoded)}).Error)
+			if source == "image" {
+				var unified model.Model
+				require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+				unified.Capabilities.InputModalities = append(unified.Capabilities.InputModalities, capability.Image)
+				require.NoError(t, model.DB.Model(&unified).Select("capabilities").Updates(&unified).Error)
 			}
-		case <-time.After(5 * time.Second):
-			t.Fatal("Native admission did not finish")
-		}
+			price := *fixture.sale
+			price.ID, price.EffectiveAt, price.Expression = 0, clock.Now().Unix()+1, `param("response.conversation") == "none" ? tier("input", p * 1000 + img * 0) : tier("wrong", p)`
+			require.NoError(t, model.CreatePriceVersion(t.Context(), &price, fixture.sale.CreatedBy))
+			purchase := *fixture.purchase
+			purchase.ID, purchase.EffectiveAt, purchase.Expression = 0, clock.Now().Unix()+1, `tier("input",p)`
+			require.NoError(t, model.CreatePriceVersion(t.Context(), &purchase, fixture.sale.CreatedBy))
+			fixture.fake.Advance(2 * time.Second)
+			var clients []*websocket.Conn
+			for range 2 {
+				server := newRealtimeGatewayServer(t, fixture.engine)
+				client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/v1/realtime?model=gateway-alias", http.Header{"Authorization": {"Bearer sk-" + fixture.token.Key}})
+				require.NoError(t, err)
+				defer client.Close()
+				_, _, err = client.ReadMessage()
+				require.NoError(t, err)
+				if source != "instructions" && source != "image" {
+					require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"conversation.item.create","item":{"id":"history","type":"message","role":"user","content":[{"type":"input_text","text":"`+strings.Repeat(" hello", 600)+`"}]}}`)))
+					_, ack, err := client.ReadMessage()
+					require.NoError(t, err)
+					require.Equal(t, "conversation.item.created", ojson.GetBytes(ack, "type").String())
+				}
+				clients = append(clients, client)
+			}
+			var shadows int64
+			require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Where("user_id = ?", fixture.user.Id).Count(&shadows).Error)
+			assert.Zero(t, shadows, "Session setup has no logical response")
+			outcomes := make(chan bool, 2)
+			for _, client := range clients {
+				create := `{"type":"response.create","response":{"conversation":"none"}}`
+				if source == "instructions" {
+					create = `{"type":"response.create","response":{"conversation":"none","input":[],"instructions":"` + strings.Repeat(" hello", 300) + `"}}`
+				}
+				if source == "reference" {
+					create = `{"type":"response.create","response":{"conversation":"none","input":[{"type":"item_reference","id":"history"}]}}`
+				}
+				if source == "image" {
+					var picture bytes.Buffer
+					require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+					create = fmt.Sprintf(`{"type":"response.create","response":{"conversation":"none","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"%s"},{"type":"input_image","image_url":"data:image/png;base64,%s"}]}]}}`, strings.Repeat(" hello", 600), base64.StdEncoding.EncodeToString(picture.Bytes()))
+				}
+				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(create)))
+				go func() {
+					for {
+						_, raw, err := client.ReadMessage()
+						if err != nil {
+							outcomes <- false
+							return
+						}
+						switch ojson.GetBytes(raw, "type").String() {
+						case "response.created":
+							outcomes <- true
+							return
+						case "error":
+							outcomes <- false
+							return
+						}
+					}
+				}()
+			}
+			accepted := 0
+			for range 2 {
+				select {
+				case funded := <-outcomes:
+					if funded {
+						accepted++
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("Native admission did not finish")
+				}
+			}
+			assert.Equal(t, 1, accepted, "The same available balance cannot fund two native generations")
+			assert.Equal(t, int32(1), calls.Load())
+			var funded []model.GatewayBilling
+			require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Find(&funded).Error)
+			require.Equal(t, 1, len(funded))
+			assert.Equal(t, int64(540_000_000), funded[0].Reservation.Nanos)
+		})
 	}
-	assert.Equal(t, 1, accepted, "The same available balance cannot fund two native generations")
-	assert.Equal(t, int32(1), calls.Load())
-	var funded []model.GatewayBilling
-	require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Find(&funded).Error)
-	require.Equal(t, 1, len(funded))
-	assert.Equal(t, int64(540_000_000), funded[0].Reservation.Nanos)
 }
 
 func TestRealtimeGatewayAutomaticVAD(t *testing.T) {
@@ -1161,7 +1215,7 @@ func TestRealtimeGatewayConcurrentResponses(t *testing.T) {
 		var count int64
 		var err error
 		records, count, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
-		return err == nil && count == 2 && records[0].Status != "settlement_pending" && records[1].Status != "settlement_pending"
+		return err == nil && count == 2 && len(records) == 2 && records[0].Status != "settlement_pending" && records[1].Status != "settlement_pending"
 	}, 5*time.Second, 10*time.Millisecond)
 	var sale int64
 	for _, record := range records {

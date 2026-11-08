@@ -1,6 +1,7 @@
 package service
 
 import (
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -11,9 +12,76 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/tokenkit"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRealtimeConversationFreezesItemsAcrossDeletionAndAudioTruncation(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("GET", "/v1/realtime", nil)
+	conversation := NewRealtimeConversation(c, "gpt-4o")
+	_, err := conversation.Observe([]byte(`{"type":"conversation.item.create","item":{"id":"input","type":"message","role":"user","content":[{"type":"input_text","text":" hello hello"}]}}`), true)
+	require.NoError(t, err)
+	assert.True(t, conversation.Pending())
+	assert.Zero(t, conversation.Usage(false).PromptTokens, "Only acknowledged items enter default context")
+	_, err = conversation.Observe([]byte(`{"type":"conversation.item.created","item":{"id":"input","type":"message","role":"user","content":[{"type":"input_text","text":" hello hello"}]}}`), false)
+	require.NoError(t, err)
+	assert.False(t, conversation.Pending())
+	snapshot := conversation.Snapshot()
+	usage, err := snapshot.Estimate([]byte(`{"conversation":"none"}`))
+	require.NoError(t, err)
+	assert.Equal(t, 2, usage.PromptTokens, "Out-of-band membership does not replace default input")
+	usage, err = snapshot.Estimate([]byte(`{"input":[]}`))
+	require.NoError(t, err)
+	assert.Zero(t, usage.PromptTokens)
+	_, err = conversation.Observe([]byte(`{"type":"conversation.item.delete","item_id":"input"}`), true)
+	require.NoError(t, err)
+	assert.Equal(t, 2, conversation.Usage(false).PromptTokens, "Deletion waits for native acknowledgement")
+	_, err = conversation.Observe([]byte(`{"type":"conversation.item.deleted","item_id":"input"}`), false)
+	require.NoError(t, err)
+	usage, err = snapshot.Estimate([]byte(`{"input":[{"type":"item_reference","id":"input"}]}`))
+	require.NoError(t, err)
+	assert.Equal(t, 2, usage.PromptTokens, "An admitted plan retains its frozen input")
+	_, err = conversation.Snapshot().Estimate([]byte(`{"input":[{"type":"item_reference","id":"input"}]}`))
+	require.Error(t, err)
+	assert.Zero(t, conversation.Usage(false).PromptTokens)
+
+	_, err = conversation.Observe([]byte(`{"type":"response.output_item.done","response_id":"r","item":{"id":"voice","type":"message","role":"assistant","content":[{"type":"audio","transcript":" hello hello"}]}}`), false)
+	require.NoError(t, err)
+	result := &relaycommon.RealtimeResponseFacts{ID: "r", Facts: &relaycommon.ResponseFacts{}, Usage: &dto.Usage{CompletionTokens: 12, CompletionTokenDetails: dto.OutputTokenDetails{AudioTokens: 10}}}
+	require.NoError(t, conversation.Complete(result, true))
+	snapshot = conversation.Snapshot()
+	assert.Equal(t, 12, conversation.Usage(false).PromptTokens)
+	_, err = conversation.Observe([]byte(`{"type":"conversation.item.truncate","item_id":"voice","content_index":0,"audio_end_ms":250}`), true)
+	require.NoError(t, err)
+	assert.Equal(t, 12, conversation.Usage(false).PromptTokens)
+	_, err = conversation.Observe([]byte(`{"type":"conversation.item.truncated","item_id":"voice","content_index":0,"audio_end_ms":250}`), false)
+	require.NoError(t, err)
+	assert.Equal(t, 5, conversation.Usage(false).PromptTokens)
+	assert.Equal(t, 5, conversation.Usage(false).PromptTokensDetails.AudioTokens)
+	usage, err = snapshot.Estimate([]byte(`{"input":[{"type":"item_reference","id":"voice"}]}`))
+	require.NoError(t, err)
+	assert.Equal(t, 12, usage.PromptTokens)
+	usage, err = conversation.Snapshot().Estimate([]byte(`{"input":[{"type":"item_reference","id":"voice"}]}`))
+	require.NoError(t, err)
+	assert.Equal(t, 5, usage.PromptTokens)
+	_, err = conversation.Observe([]byte(`{"type":"conversation.item.deleted","item_id":"voice"}`), false)
+	require.NoError(t, err)
+	assert.Zero(t, conversation.Usage(false).PromptTokens)
+	appendAudio := []byte(`{"type":"input_audio_buffer.append","audio":"` + base64.StdEncoding.EncodeToString(make([]byte, 4800)) + `"}`)
+	_, err = conversation.Observe(appendAudio, true)
+	require.NoError(t, err)
+	_, err = conversation.Observe([]byte(`{"type":"input_audio_buffer.committed","item_id":"turn1"}`), false)
+	require.NoError(t, err)
+	_, err = conversation.Observe(appendAudio, true)
+	require.NoError(t, err)
+	_, err = conversation.Observe([]byte(`{"type":"input_audio_buffer.committed","item_id":"turn1"}`), false)
+	require.NoError(t, err)
+	_, err = conversation.Observe([]byte(`{"type":"input_audio_buffer.committed","item_id":"turn2"}`), false)
+	require.NoError(t, err)
+	assert.Equal(t, 2, conversation.Usage(false).PromptTokensDetails.AudioTokens, "A duplicate commit cannot consume the next audio turn")
+}
 
 func TestResponsesUsageRejectsInvalidCumulativeFieldsAndRetainsCacheLifetimeZero(t *testing.T) {
 	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "gpt-4o"}, StreamStatus: relaycommon.NewStreamStatus(), ResponseFacts: &relaycommon.ResponseFacts{}}
