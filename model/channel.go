@@ -59,13 +59,26 @@ type Provider struct {
 
 	OtherSettings string `json:"settings" gorm:"column:settings"` // 其他设置，存储azure版本等不需要检索的信息，详见dto.ProviderOtherSettings
 
+	RouteLimits *ProviderRouteLimits `json:"route_limits,omitempty" gorm:"-"`
 	// cache info
 	Keys []string `json:"-" gorm:"-"`
 }
 
 const ProviderStatusReasonAllKeysDisabled = "All keys are disabled"
 
+type ProviderRouteLimits struct {
+	RPM            int64 `json:"rpm"`
+	TPM            int64 `json:"tpm"`
+	MaxConcurrency int64 `json:"max_concurrency"`
+}
+
+func (limits ProviderRouteLimits) Valid() bool {
+	return limits.RPM >= 0 && limits.TPM >= 0 && limits.MaxConcurrency >= 0 &&
+		limits.RPM <= 1_000_000_000 && limits.TPM <= 1_000_000_000_000 && limits.MaxConcurrency <= 1_000_000
+}
+
 type ProviderInfo struct {
+	RouteLimits            ProviderRouteLimits   `json:"route_limits"`
 	IsMultiKey             bool                  `json:"is_multi_key"`                        // 是否多Key模式
 	MultiKeySize           int                   `json:"multi_key_size"`                      // 多Key模式下的Key数量
 	MultiKeyStatusList     map[int]int           `json:"multi_key_status_list"`               // key状态列表，key index -> status
@@ -206,6 +219,17 @@ func (channel *Provider) GetKeys() []string {
 }
 
 func (channel *Provider) GetNextEnabledKey() (string, int, *types.NewAPIError) {
+	return channel.nextEnabledKey(true)
+}
+
+// PreviewEnabledKey uses the authoritative Route snapshot without advancing a
+// cursor or reading the legacy cache. Only the selected candidate commits it.
+func (channel *Provider) PreviewEnabledKey() (string, int, *types.NewAPIError) {
+	snapshot := *channel
+	return snapshot.nextEnabledKey(false)
+}
+
+func (channel *Provider) nextEnabledKey(advance bool) (string, int, *types.NewAPIError) {
 	// If not in multi-key mode, return the original key string directly.
 	if !channel.ProviderInfo.IsMultiKey {
 		return channel.Key, 0, nil
@@ -256,11 +280,18 @@ func (channel *Provider) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 	case constant.MultiKeyModePolling:
 		// Use channel-specific lock to ensure thread-safe polling
 
-		channelInfo, err := CacheGetProviderInfo(channel.Id)
-		if err != nil {
-			return "", 0, types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+		channelInfo := &channel.ProviderInfo
+		if advance {
+			var err error
+			channelInfo, err = CacheGetProviderInfo(channel.Id)
+			if err != nil {
+				return "", 0, types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+			}
 		}
 		defer func() {
+			if !advance {
+				return
+			}
 			if common.DebugEnabled {
 				logger.LogDebug(nil, "channel %d polling index: %d", channel.Id, channel.ProviderInfo.MultiKeyPollingIndex)
 			}
@@ -289,6 +320,48 @@ func (channel *Provider) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		// Unknown mode, default to first enabled key (or original key string)
 		return keys[enabledIdx[0]], enabledIdx[0], nil
 	}
+}
+
+// CommitRouteKey rechecks the exact Provider credential and slot under the
+// existing row lock, then advances only the selected polling cursor.
+func (channel *Provider) CommitRouteKey(ctx context.Context, key string, index int) error {
+	return channel.checkRouteKey(ctx, key, index, true)
+}
+
+// ValidateRouteKey rechecks a prepared credential before each Provider call,
+// without advancing a polling cursor already committed for this selection.
+func (channel *Provider) ValidateRouteKey(ctx context.Context, key string, index int) error {
+	return channel.checkRouteKey(ctx, key, index, false)
+}
+
+func (channel *Provider) checkRouteKey(ctx context.Context, key string, index int, advancePolling bool) error {
+	return providerCredentialSession().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current Provider
+		if err := lockForUpdate(tx).First(&current, channel.Id).Error; err != nil {
+			return err
+		}
+		if current.Status != common.ChannelStatusEnabled || current.Key != channel.Key {
+			return ErrProviderStatusConflict
+		}
+		keys := current.GetKeys()
+		if !current.ProviderInfo.IsMultiKey {
+			if index != 0 || key != current.Key {
+				return ErrProviderStatusConflict
+			}
+			return nil
+		}
+		if index < 0 || index >= len(keys) || keys[index] != key {
+			return ErrProviderStatusConflict
+		}
+		if status, exists := current.ProviderInfo.MultiKeyStatusList[index]; exists && status != common.ChannelStatusEnabled {
+			return ErrProviderStatusConflict
+		}
+		if !advancePolling || current.ProviderInfo.MultiKeyMode != constant.MultiKeyModePolling {
+			return nil
+		}
+		return tx.Model(&Provider{}).Where("id = ?", current.Id).
+			Update("channel_info", gorm.Expr(`jsonb_set("channel_info"::jsonb, '{multi_key_polling_index}', to_jsonb(?::integer), true)::json`, (index+1)%len(keys))).Error
+	})
 }
 
 // SaveProviderInfo persists the polling cursor without replacing credential

@@ -34,8 +34,10 @@ type MoneyInput struct {
 	// TokenQuantities overrides whole counts for exact weighted cache quantities,
 	// such as the 1.6 short-write units used by an unpriced one-hour cache write.
 	TokenQuantities map[string]decimal.Decimal
-	Request         RequestInput
-	Time            time.Time
+	// RationalTokenQuantities preserves exact means for pricing estimates.
+	RationalTokenQuantities map[string]*big.Rat
+	Request                 RequestInput
+	Time                    time.Time
 }
 
 // MoneyRequestRuleTrace preserves a request multiplier as an exact source decimal.
@@ -153,8 +155,14 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 			}
 			return exactJSON(ojson.GetBytes(input.Request.Body, path))
 		},
-		"header": func(key string) string {
-			return headers[strings.ToLower(strings.TrimSpace(key))]
+		"header": func(key string) (string, error) {
+			key = strings.ToLower(strings.TrimSpace(key))
+			for _, deferred := range input.Request.DeferredHeaders {
+				if strings.EqualFold(key, strings.TrimSpace(deferred)) {
+					return "", fmt.Errorf("pricing header is unavailable before account preparation")
+				}
+			}
+			return headers[key], nil
 		},
 		"has": func(source any, substr string) bool {
 			return source != nil && substr != "" && strings.Contains(exactString(source), substr)
@@ -241,6 +249,12 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 			return money.Value{}, trace, fmt.Errorf("%s must be between 0 and %d", name, int64(math.MaxInt64))
 		}
 		quantities[name] = number
+	}
+	for name, quantity := range input.RationalTokenQuantities {
+		if quantity == nil || quantity.Sign() < 0 || quantity.Cmp(big.NewRat(math.MaxInt64, 1)) > 0 {
+			return money.Value{}, trace, fmt.Errorf("%s has an invalid rational quantity", name)
+		}
+		quantities[name] = new(big.Rat).Set(quantity)
 	}
 	for _, name := range []string{"p", "c", "len", "cr", "cc", "cc1h", "cc12h", "img", "img_cr", "img_o", "ai", "ao"} {
 		env[name] = big.NewRat(input.Tokens[name], 1)

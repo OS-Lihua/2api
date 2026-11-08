@@ -388,6 +388,39 @@ export function ProviderMutateDrawer(props: ProviderMutateDrawerProps) {
                     options={translate(PROVIDER_KEY_MODE_OPTIONS)}
                   />
                 )}
+                <div
+                  className='grid gap-4 sm:grid-cols-3'
+                  role='group'
+                  aria-label={t('Rate limits')}
+                >
+                  {(['rpm', 'tpm', 'max_concurrency'] as const).map((name) => (
+                    <FormField
+                      key={name}
+                      control={form.control}
+                      name={name}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>
+                            {t(
+                              {
+                                rpm: 'RPM',
+                                tpm: 'TPM',
+                                max_concurrency: 'Max concurrency',
+                              }[name]
+                            )}
+                          </FormLabel>
+                          <FormControl>
+                            <Input inputMode='numeric' {...field} />
+                          </FormControl>
+                          <FormDescription>
+                            {t('0 means unlimited')}
+                          </FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  ))}
+                </div>
                 <FormField
                   control={form.control}
                   name='remark'

@@ -27,11 +27,24 @@ import type {
   ProviderAddMode,
   UpdateProviderPayload,
 } from '../types'
+import { channelFormSchema as routeChannelFormSchema } from './channel-form'
 
 export function getProviderFormSchema(t: TFunction, isUpdate: boolean) {
   return z
     .object({
       type: z.number().int().positive(),
+      rpm: routeChannelFormSchema.shape.rpm.refine(
+        (value) => Number(value) <= 1_000_000_000,
+        t('Invalid parameters')
+      ),
+      tpm: routeChannelFormSchema.shape.tpm.refine(
+        (value) => Number(value) <= 1_000_000_000_000,
+        t('Invalid parameters')
+      ),
+      max_concurrency: routeChannelFormSchema.shape.max_concurrency.refine(
+        (value) => Number(value) <= 1_000_000,
+        t('Invalid parameters')
+      ),
       name: z.string().trim().min(1, t('Name is required')),
       base_url: z.string().trim(),
       remark: z.string().trim().max(255),
@@ -88,6 +101,9 @@ export type ProviderFormValues = z.infer<
 
 export const PROVIDER_FORM_DEFAULT_VALUES: ProviderFormValues = {
   type: 1,
+  rpm: '0',
+  tpm: '0',
+  max_concurrency: '0',
   name: '',
   base_url: '',
   remark: '',
@@ -106,6 +122,9 @@ export function providerToFormValues(provider: Provider): ProviderFormValues {
   return {
     ...PROVIDER_FORM_DEFAULT_VALUES,
     type: provider.type,
+    rpm: String(provider.route_limits?.rpm ?? 0),
+    tpm: String(provider.route_limits?.tpm ?? 0),
+    max_concurrency: String(provider.route_limits?.max_concurrency ?? 0),
     name: provider.name,
     base_url: provider.base_url ?? '',
     remark: provider.remark ?? '',
@@ -125,6 +144,17 @@ export function toCreateProviderPayload(
     },
   }
   if (values.base_url) payload.provider.base_url = values.base_url
+  if (
+    Number(values.rpm) ||
+    Number(values.tpm) ||
+    Number(values.max_concurrency)
+  ) {
+    payload.provider.route_limits = {
+      rpm: Number(values.rpm),
+      tpm: Number(values.tpm),
+      max_concurrency: Number(values.max_concurrency),
+    }
+  }
   if (values.remark) payload.provider.remark = values.remark
   Object.assign(payload.provider, toAdapterConfiguration(values))
   if (values.mode === 'multi_to_single') {
@@ -164,6 +194,18 @@ export function toUpdateProviderPayload(
     base_url: values.base_url,
     remark: values.remark,
     ...toAdapterConfiguration(values),
+  }
+  if (
+    provider.route_limits ||
+    Number(values.rpm) ||
+    Number(values.tpm) ||
+    Number(values.max_concurrency)
+  ) {
+    payload.route_limits = {
+      rpm: Number(values.rpm),
+      tpm: Number(values.tpm),
+      max_concurrency: Number(values.max_concurrency),
+    }
   }
   if (values.key.trim() === '') return payload
   payload.key = values.key

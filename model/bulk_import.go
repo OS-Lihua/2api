@@ -28,10 +28,11 @@ type BulkImportRow struct {
 }
 
 type BulkImportResult struct {
-	DryRun    bool                `json:"dry_run"`
-	Valid     bool                `json:"valid"`
-	Committed bool                `json:"committed"`
-	Rows      []BulkImportPreview `json:"rows"`
+	MarginCheck *PriceMarginReport  `json:"margin_check,omitempty"`
+	DryRun      bool                `json:"dry_run"`
+	Valid       bool                `json:"valid"`
+	Committed   bool                `json:"committed"`
+	Rows        []BulkImportPreview `json:"rows"`
 }
 
 // Preview deliberately includes no user supplied strings or configuration.
@@ -177,12 +178,31 @@ func bulkValidationError(err error) (string, string) {
 // ImportBatch validates before writing. dryRun executes only reads: it does not
 // insert and roll back, allocate IDs, update caches, or contact Providers.
 // Execution revalidates against locked rows in the same transaction as writes.
-func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID int) (*BulkImportResult, error) {
+type BulkMarginApproval struct {
+	Revision    string
+	EffectiveAt int64
+}
+
+func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID int, approvals ...BulkMarginApproval) (*BulkImportResult, error) {
+	approval := BulkMarginApproval{}
+	if len(approvals) > 0 {
+		approval = approvals[0]
+	}
+	if len(approvals) > 1 || approval.EffectiveAt < 0 || approval.EffectiveAt > MaxPriceEffectiveAt {
+		return nil, errInvalidBulk
+	}
 	if len(rows) == 0 || len(rows) > MaxBulkImportRows {
 		return nil, errInvalidBulk
 	}
 	result := &BulkImportResult{DryRun: dryRun, Valid: true, Rows: make([]BulkImportPreview, len(rows))}
 	err := DB.WithContext(ctx).Session(&gorm.Session{Logger: logger.Default.LogMode(logger.Silent)}).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`SELECT pg_advisory_xact_lock(510033)`).Error; err != nil {
+			return err
+		}
+		effectiveAt := approval.EffectiveAt
+		if effectiveAt == 0 {
+			effectiveAt = clock.Now().Unix()
+		}
 		if dryRun {
 			if err := tx.Exec("SET TRANSACTION READ ONLY").Error; err != nil {
 				return err
@@ -352,7 +372,7 @@ func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID
 					rowErr = errInvalidBulk
 					break
 				}
-				at := clock.Now().Unix()
+				at := effectiveAt
 				if input.EffectiveAt != nil {
 					at = *input.EffectiveAt
 				}
@@ -431,7 +451,42 @@ func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID
 			}
 			result.Rows[i] = preview
 		}
-		if !result.Valid || dryRun {
+		if !result.Valid {
+			return nil
+		}
+		catalog := MarginPriceCatalog{Prices: prices.versions}
+		for _, channel := range channels {
+			catalog.Channels = append(catalog.Channels, channel)
+		}
+		if len(catalog.Prices) > 0 {
+			marginReport := &PriceMarginReport{EffectiveAt: effectiveAt, Estimates: []MarginEstimate{}}
+			var revisions []string
+			for _, mutation := range mutations {
+				if mutation.price == nil {
+					continue
+				}
+				report, err := CheckPriceMargins(ctx, tx, mutation.price, nil, !dryRun, catalog)
+				if err != nil {
+					return err
+				}
+				revisions = append(revisions, report.Revision)
+				marginReport.Estimates = append(marginReport.Estimates, report.Estimates...)
+				marginReport.RequiresConfirmation = marginReport.RequiresConfirmation || report.RequiresConfirmation
+			}
+			revision, err := marginConfirmationRevision("batch", struct {
+				Rows   []BulkImportRow
+				Prices []string
+			}{Rows: rows, Prices: revisions})
+			if err != nil {
+				return err
+			}
+			marginReport.Revision = revision
+			result.MarginCheck = marginReport
+			if !dryRun && marginReport.RequiresConfirmation && approval.Revision != marginReport.Revision {
+				return &MarginConfirmationError{Report: marginReport}
+			}
+		}
+		if dryRun {
 			return nil
 		}
 		ids := map[int]int{}

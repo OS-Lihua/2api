@@ -56,7 +56,12 @@ export interface RequestLog {
   error_code?: string
 }
 export interface RouteDiagnostics {
-  method: 'single_channel'
+  method: 'single_channel' | 'cost' | 'weight' | 'latency'
+  score?: string
+  estimated_cost?: string
+  estimated_receivable?: string
+  affinity_hit?: boolean
+  loss_fallback?: boolean
   candidate_count: number
   eligible_count: number
   excluded_counts: Record<string, number>
