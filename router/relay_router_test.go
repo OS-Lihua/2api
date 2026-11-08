@@ -5467,32 +5467,76 @@ func TestTextGatewayDefaultOutputLimitFitsRemainingContext(t *testing.T) {
 		{"Responses converted limit", "max_output_tokens", "max_output_tokens", `{"id":"bounded","object":"response","status":"completed","output":[{"type":"message","id":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"OK","annotations":[]}]}],"usage":{"input_tokens":9,"output_tokens":1,"total_tokens":10}}`, protocol.OpenAIResponses},
 		{"Gemini converted limit", "maxOutputTokens", "generationConfig.maxOutputTokens", `{"candidates":[{"content":{"parts":[{"text":"OK"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":1,"totalTokenCount":10}}`, protocol.GeminiGenerate},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			var sent map[string]any
-			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
-				require.NoError(t, common.DecodeJson(r.Body, &sent))
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.WriteString(w, test.response)
+		for _, counters := range []string{"reported", "explicit zero", "missing"} {
+			t.Run(test.name+"/"+counters, func(t *testing.T) {
+				body := []byte(test.response)
+				if counters != "reported" {
+					var response map[string]any
+					require.NoError(t, common.Unmarshal(body, &response))
+					usageKey, promptKey, completionKey := "usage", "input_tokens", "output_tokens"
+					if test.upstream == protocol.GeminiGenerate {
+						usageKey, promptKey, completionKey = "usageMetadata", "promptTokenCount", "candidatesTokenCount"
+					}
+					if counters == "missing" {
+						delete(response, usageKey)
+					} else {
+						response[usageKey] = map[string]any{promptKey: 0, completionKey: 0}
+					}
+					var err error
+					body, err = common.Marshal(response)
+					require.NoError(t, err)
+				}
+				var sent map[string]any
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					if err := common.DecodeJson(r.Body, &sent); !assert.NoError(t, err) {
+						w.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write(body)
+				})
+				caps := capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{MaxOutputTokens: common.GetPointer(int64(16))}}
+				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", test.upstream).Error)
+				price := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: fmt.Sprintf(`param(%q) == 16 ? tier("bounded",fixed(0.000001)) : tier("unbounded",fixed(0.000002))`, test.path), EffectiveAt: clock.Now().Unix()}
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}]}`)
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				wire := sent
+				if test.upstream == protocol.GeminiGenerate {
+					config, ok := sent["generationConfig"].(map[string]any)
+					require.True(t, ok)
+					wire = config
+				}
+				assert.EqualValues(t, 16, wire[test.field], "the actual upstream body must carry the validated limit")
+				attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, total)
+				assert.Equal(t, "0.000001 USD", attempts[0].RouteDiagnostics["estimated_cost"], "procurement probes must use the same bounded wire body")
+				assert.Contains(t, response.Body.String(), "OK")
+				assert.Equal(t, "success", attempts[0].Status)
+				assert.EqualValues(t, 1000, attempts[0].Cost.Nanos)
+				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+				require.NoError(t, err)
+				if counters == "missing" {
+					assert.Equal(t, "estimated", record.UsageSource)
+					assert.Equal(t, "estimated", attempts[0].UsageSource)
+				} else {
+					assert.Equal(t, "upstream", record.UsageSource)
+					assert.Equal(t, "upstream", attempts[0].UsageSource)
+				}
+				if counters == "explicit zero" {
+					assert.Zero(t, record.Usage.PromptTokens)
+					assert.Zero(t, record.Usage.CompletionTokens)
+					assert.Zero(t, record.Receivable.Nanos)
+				} else {
+					assert.EqualValues(t, 9, record.Usage.PromptTokens)
+					assert.EqualValues(t, 1, record.Usage.CompletionTokens)
+					assert.EqualValues(t, 19800, record.Receivable.Nanos)
+				}
+				assertTextGatewayLedger(t, *record, 1000)
 			})
-			caps := capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{MaxOutputTokens: common.GetPointer(int64(16))}}
-			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
-			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", test.upstream).Error)
-			price := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: fmt.Sprintf(`param(%q) == 16 ? tier("bounded",fixed(0.000001)) : tier("unbounded",fixed(0.000002))`, test.path), EffectiveAt: clock.Now().Unix()}
-			require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
-			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}]}`)
-			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
-			wire := sent
-			if test.upstream == protocol.GeminiGenerate {
-				config, ok := sent["generationConfig"].(map[string]any)
-				require.True(t, ok)
-				wire = config
-			}
-			assert.EqualValues(t, 16, wire[test.field], "the actual upstream body must carry the validated limit")
-			attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
-			require.NoError(t, err)
-			require.EqualValues(t, 1, total)
-			assert.Equal(t, "0.000001 USD", attempts[0].RouteDiagnostics["estimated_cost"], "procurement probes must use the same bounded wire body")
-		})
+		}
 	}
 }
 
@@ -6663,6 +6707,7 @@ func TestTextGatewayMetadataPrefixIsNotDeliveredBusinessOutput(t *testing.T) {
 	for _, test := range []struct {
 		name     string
 		provider int
+		upstream protocol.Type
 		body     string
 		stream   bool
 		nilError bool
@@ -6671,6 +6716,9 @@ func TestTextGatewayMetadataPrefixIsNotDeliveredBusinessOutput(t *testing.T) {
 		{name: "OpenAI", provider: constant.ChannelTypeOpenAI, body: `{"id":"chat-test","object":"chat.completion","model":"upstream-model","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`},
 		{name: "Ollama", provider: constant.ChannelTypeOllama, body: `{"model":"upstream-model","message":{"role":"assistant","content":"Hello"},"done":true,"prompt_eval_count":10,"eval_count":5}`},
 		{name: "Dify", provider: constant.ChannelTypeDify, body: `{"answer":"Hello","conversation_id":"chat-test","metadata":{"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}}`},
+		{name: "Converted Claude", provider: constant.ChannelTypeOpenAI, upstream: protocol.AnthropicMessages, body: `{"id":"converted","type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`},
+		{name: "Converted Responses", provider: constant.ChannelTypeOpenAI, upstream: protocol.OpenAIResponses, body: `{"id":"converted","object":"response","status":"completed","output":[{"type":"message","id":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hello","annotations":[]}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}`},
+		{name: "Converted Gemini", provider: constant.ChannelTypeOpenAI, upstream: protocol.GeminiGenerate, body: `{"candidates":[{"content":{"parts":[{"text":"Hello"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}`},
 		{name: "Dify short write without error", provider: constant.ChannelTypeDify, nilError: true, body: `{"answer":"Hello","conversation_id":"chat-test","metadata":{"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}}`},
 		{name: "Cohere", provider: constant.ChannelTypeCohere, body: `{"text":"Hello","meta":{"billed_units":{"input_tokens":10,"output_tokens":5}}}`},
 		{name: "Dify stream", provider: constant.ChannelTypeDify, stream: true, body: "data: {\"event\":\"message\",\"answer\":\"Hello\",\"metadata\":{\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}}\n\n"},
@@ -6685,9 +6733,12 @@ func TestTextGatewayMetadataPrefixIsNotDeliveredBusinessOutput(t *testing.T) {
 				_, _ = w.Write([]byte(test.body))
 			})
 			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", test.provider).Error)
-			addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+			backup := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
 				t.Error("downstream write failures must not dispatch another Provider")
 			})
+			if test.upstream != "" {
+				require.NoError(t, model.DB.Model(&model.Channel{}).Where("id IN ?", []int{fixture.channel.ID, backup.ID}).Update("protocol", test.upstream).Error)
+			}
 			fixture.offering.RouteMethod = "weight"
 			require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
 			recorder := httptest.NewRecorder()

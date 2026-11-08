@@ -475,6 +475,11 @@ func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 
 	fullTextResponse.Usage = usage
 
+	if facts := info.ResponseFacts; facts != nil && info.RelayFormat == types.RelayFormatOpenAI {
+		facts.PromptTokensReported, facts.CompletionTokensReported = relaycommon.NativeUsagePresence(responseBody, "usageMetadata.promptTokenCount", "usageMetadata.candidatesTokenCount", "usageMetadata.totalTokenCount")
+		facts.UsageReported = facts.PromptTokensReported && facts.CompletionTokensReported
+		return helper.WriteChatResponse(c, info, resp, fullTextResponse)
+	}
 	switch info.RelayFormat {
 	case types.RelayFormatOpenAI:
 		responseBody, err = common.Marshal(fullTextResponse)

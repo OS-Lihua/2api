@@ -384,10 +384,12 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		claudeInfo.Usage.ClaudeCacheCreation1hTokens = claudeResponse.Usage.GetCacheCreation1hTokens()
 	}
 	var responseData []byte
+	var chatResponse *dto.OpenAITextResponse
 	switch info.RelayFormat {
 	case types.RelayFormatOpenAI:
 		openaiResponse := ResponseClaude2OpenAI(&claudeResponse)
 		openaiResponse.Usage = buildOpenAIStyleUsageFromClaudeUsage(claudeInfo.Usage)
+		chatResponse = openaiResponse
 		responseData, err = common.Marshal(openaiResponse)
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeBadResponseBody)
@@ -434,6 +436,19 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		recordClaudeServerToolUse(info, claudeResponse.Usage.ServerToolUse)
 	}
 
+	if facts := info.ResponseFacts; facts != nil && chatResponse != nil {
+		facts.PromptTokensReported, facts.CompletionTokensReported = relaycommon.NativeUsagePresence(data, "usage.input_tokens", "usage.output_tokens", "usage.total_tokens")
+		facts.UsageReported = facts.PromptTokensReported && facts.CompletionTokensReported
+		_, responseErr := helper.WriteChatResponse(c, info, httpResp, chatResponse)
+		if !facts.PromptTokensReported {
+			claudeInfo.Usage.PromptTokens = chatResponse.Usage.PromptTokens
+		}
+		if !facts.CompletionTokensReported {
+			claudeInfo.Usage.CompletionTokens = chatResponse.Usage.CompletionTokens
+		}
+		claudeInfo.Usage.TotalTokens = claudeInfo.Usage.PromptTokens + claudeInfo.Usage.CompletionTokens
+		return responseErr
+	}
 	service.IOCopyBytesGracefully(c, httpResp, responseData)
 	return nil
 }
