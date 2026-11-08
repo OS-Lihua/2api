@@ -61,6 +61,7 @@ type MoneyTraceResult struct {
 	UnroundedAmount     string                  `json:"unrounded_amount,omitempty"`
 	Conditions          []MoneyConditionTrace   `json:"conditions,omitempty"`
 	ImageCount          *int                    `json:"image_count,omitempty"`
+	FixedPricePerImage  bool                    `json:"fixed_price_per_image,omitempty"`
 	ImageQuantityPriced bool                    `json:"image_quantity_priced,omitempty"`
 	BillingUnit         BillingUnit             `json:"billing_unit"`
 	FixedPrice          *string                 `json:"fixed_price,omitempty"`
@@ -100,13 +101,14 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 			trace.MatchedTier = name
 			return amount
 		},
-		"_money_fixed": func(value any, text string) (*big.Rat, error) {
+		"_money_fixed": func(value any, text string, perImage bool) (*big.Rat, error) {
 			amount, err := exactNumber(value)
 			if err != nil {
 				return nil, err
 			}
 			trace.BillingUnit = BillingUnitRequest
 			trace.FixedPrice = &text
+			trace.FixedPricePerImage = perImage
 			return new(big.Rat).Mul(amount, big.NewRat(1_000_000, 1)), nil
 		},
 		"_money_image_quantity": func(value any) any {
@@ -302,7 +304,7 @@ func compileMoneyProgram(body string, env map[string]any) (*vm.Program, []MoneyR
 		}
 		return false
 	})
-	program, err := expr.Compile(body, expr.Env(env), expr.Patch(&moneyPatcher{imageMultipliers: imagePriceMultipliers(tree.Node), literals: literals, literalText: literalText, rules: rules, conditions: conditions, conditionals: conditionals}), expr.Optimize(false), expr.AsAny())
+	program, err := expr.Compile(body, expr.Env(env), expr.Patch(&moneyPatcher{imagePricing: imagePricing(tree.Node), literals: literals, literalText: literalText, rules: rules, conditions: conditions, conditionals: conditionals}), expr.Optimize(false), expr.AsAny())
 	if err != nil {
 		return nil, nil, fmt.Errorf("expr compile error: %w", err)
 	}
@@ -320,12 +322,12 @@ func (literals moneyConditionLiterals) Visit(node *ast.Node) {
 }
 
 type moneyPatcher struct {
-	literals         map[file.Location]*big.Rat
-	literalText      map[file.Location]string
-	rules            map[file.Location]int
-	conditions       map[file.Location]string
-	conditionals     map[file.Location]string
-	imageMultipliers map[file.Location]bool
+	literals     map[file.Location]*big.Rat
+	literalText  map[file.Location]string
+	rules        map[file.Location]int
+	conditions   map[file.Location]string
+	conditionals map[file.Location]string
+	imagePricing imagePricePlan
 }
 
 func (p *moneyPatcher) Visit(node *ast.Node) {
@@ -338,7 +340,7 @@ func (p *moneyPatcher) Visit(node *ast.Node) {
 		if callee, ok := part.Callee.(*ast.IdentifierNode); ok && callee.Value == "fixed" {
 			ast.Patch(node, &ast.CallNode{
 				Callee:    &ast.IdentifierNode{Value: "_money_fixed"},
-				Arguments: []ast.Node{part.Arguments[0], &ast.StringNode{Value: p.literalText[part.Arguments[0].Location()]}},
+				Arguments: []ast.Node{part.Arguments[0], &ast.StringNode{Value: p.literalText[part.Arguments[0].Location()]}, &ast.BoolNode{Value: p.imagePricing.fixedImagePrices[part.Location()]}},
 			})
 		}
 	case *ast.ConditionalNode:
@@ -375,7 +377,7 @@ func (p *moneyPatcher) Visit(node *ast.Node) {
 			part.Property = &ast.CallNode{Callee: &ast.IdentifierNode{Value: "_money_index"}, Arguments: []ast.Node{part.Property}}
 		}
 	case *ast.BinaryNode:
-		if imageOnLeft, ok := p.imageMultipliers[part.Location()]; ok {
+		if imageOnLeft, ok := p.imagePricing.multipliers[part.Location()]; ok {
 			quantity := &part.Right
 			if imageOnLeft {
 				quantity = &part.Left

@@ -44,6 +44,7 @@ import (
 	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/alicebob/miniredis/v2"
@@ -4485,6 +4486,48 @@ func TestMediaGatewayAbortedImageStreamKeepsFinalWireReservationEstimate(t *test
 	assert.Equal(t, int64(80_000_000), attempts[0].Cost.Nanos)
 }
 
+func TestMediaGatewayKeepAliveFailureDoesNotBlameProvider(t *testing.T) {
+	for _, flush := range []bool{false, true} {
+		t.Run(fmt.Sprintf("flush=%t", flush), func(t *testing.T) {
+			pingFailed := make(chan struct{})
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, "data: {\"type\":\"image_generation.completed\",\"url\":\"https://image.invalid/image.png\"}\n\n")
+				w.(http.Flusher).Flush()
+				select {
+				case <-pingFailed:
+					_, _ = io.WriteString(w, "data: [DONE]\n\n")
+				case <-r.Context().Done():
+				}
+			})
+			settings := operation_setting.GetGeneralSetting()
+			previousEnabled, previousInterval := settings.PingIntervalEnabled, settings.PingIntervalSeconds
+			settings.PingIntervalEnabled, settings.PingIntervalSeconds = true, 1
+			t.Cleanup(func() { settings.PingIntervalEnabled, settings.PingIntervalSeconds = previousEnabled, previousInterval })
+			request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gateway-alias","prompt":"draw","stream":true}`))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			response := httptest.NewRecorder()
+			fixture.engine.ServeHTTP(&mediaFrameFailureWriter{ResponseRecorder: response, failPing: pingFailed, failPingFlush: flush}, request.WithContext(ctx))
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.NotEqual(t, "success", record.Status)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, "downstream_write_failed", attempts[0].ErrorClass)
+			assert.Equal(t, int64(20_000_000), attempts[0].Cost.Nanos)
+			view := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/channels/%d", fixture.channel.ID), "")
+			require.True(t, view.Success, view.Message)
+			health := view.Data["health"].(map[string]any)
+			assert.Zero(t, health["samples"])
+			assert.Zero(t, health["failures"])
+		})
+	}
+}
+
 func TestMediaGatewayIncompleteMediaStreamsDoNotChargeFixedRequest(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -4497,6 +4540,8 @@ func TestMediaGatewayIncompleteMediaStreamsDoNotChargeFixedRequest(t *testing.T)
 		{"image count in failed condition", protocol.OpenAIImages, `image_count >= 0 && (len != 7 || 1 / (len - 7) > 0) ? tier("first",fixed(0.01)) : tier("second",fixed(0.02))`},
 		{"image count in condition", protocol.OpenAIImages, `image_count > 0 ? tier("first",fixed(0.01)) : tier("second",fixed(0.02))`},
 		{"image count arithmetic in condition", protocol.OpenAIImages, `image_count * 2 > 0 ? tier("first",fixed(0.01)) : tier("second",fixed(0.02))`},
+		{"selected request multiplier error", protocol.OpenAIImages, `(len == 7 ? tier("request",fixed(0.01)) : tier("tokens",p + c)) * (param("n") == 1 && 1 / (len - 7) > 0 ? 2 : 1)`},
+		{"mixed image request multiplier error", protocol.OpenAIImages, `(len == 7 ? tier("request",fixed(0.01)) : tier("images",fixed(0.02)) * image_count) * (param("n") == 1 && 1 / (len - 7) > 0 ? 2 : 1)`},
 		{"mixed request and image tiers", protocol.OpenAIImages, `len == 7 ? tier("request",fixed(0.01)) : tier("images",fixed(0.02)) * image_count`},
 	} {
 		kind := tc.kind
@@ -4520,7 +4565,7 @@ func TestMediaGatewayIncompleteMediaStreamsDoNotChargeFixedRequest(t *testing.T)
 				} {
 					require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
 				}
-				path, body := "/v1/images/generations", `{"model":"gateway-alias","prompt":"draw","stream":true}`
+				path, body := "/v1/images/generations", `{"model":"gateway-alias","prompt":"draw","n":1,"stream":true}`
 				if kind == protocol.OpenAIAudioSpeech {
 					path, body = "/v1/audio/speech", `{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm","stream_format":"sse"}`
 				}
@@ -6055,10 +6100,21 @@ type mediaFrameFailureWriter struct {
 	failDone      bool
 	failDoneFlush bool
 	doneWritten   bool
+	failPing      chan struct{}
+	failPingFlush bool
+	pingWritten   bool
 }
 
 func (w *mediaFrameFailureWriter) Write(body []byte) (int, error) {
 	text := string(body)
+	if w.failPing != nil && strings.Contains(text, ": PING") {
+		w.pingWritten = true
+		if !w.failPingFlush {
+			close(w.failPing)
+			w.failPing = nil
+			return 0, io.ErrClosedPipe
+		}
+	}
 	if strings.HasPrefix(text, "data: ") && strings.Contains(text, `"type":"image_generation.completed"`) {
 		w.frames++
 		if w.failFrame > 0 && w.frames == w.failFrame {
@@ -6079,6 +6135,11 @@ func (w *mediaFrameFailureWriter) WriteString(body string) (int, error) {
 }
 
 func (w *mediaFrameFailureWriter) FlushError() error {
+	if w.failPing != nil && w.pingWritten && w.failPingFlush {
+		close(w.failPing)
+		w.failPing = nil
+		return io.ErrClosedPipe
+	}
 	if w.failDoneFlush && w.doneWritten {
 		return io.ErrClosedPipe
 	}

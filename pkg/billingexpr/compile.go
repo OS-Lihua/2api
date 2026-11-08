@@ -294,7 +294,7 @@ func compileEntry(exprStr string) (*cachedEntry, error) {
 		version:          version,
 		fixedPricing:     fixedPricing,
 		fixedOnly:        fixedOnly,
-		fixedRequestOnly: fixedOnly && len(imagePriceMultipliers(tree.Node)) == 0,
+		fixedRequestOnly: fixedOnly && len(imagePricing(tree.Node).multipliers) == 0,
 	}
 	return entry, nil
 }

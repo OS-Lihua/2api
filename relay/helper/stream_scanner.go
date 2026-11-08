@@ -232,6 +232,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 						writeMutex.Lock()
 						defer writeMutex.Unlock()
 						err = PingData(c)
+						if err != nil {
+							info.ResponseFacts.DownstreamWriteFailed = true
+						}
 					}()
 					if err != nil {
 						logger.LogError(c, common.LogText("ping data error: %s", err.Error()))

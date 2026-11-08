@@ -267,15 +267,15 @@ func TestMoneyExprPreservesImageCountCompatibility(t *testing.T) {
 		require.ErrorContains(t, err, "image_count")
 	}
 	for _, tc := range []struct {
-		name, expression, amount   string
-		quantity, fixedRequestOnly bool
+		name, expression, amount                  string
+		quantity, fixedRequestOnly, fixedPerImage bool
 	}{
-		{"condition", `image_count > 0 ? tier("a",fixed(0.01)) : tier("b",fixed(0.02))`, "0.01 USD", false, true},
-		{"condition arithmetic", `image_count * 2 > 0 ? tier("a",fixed(0.01)) : tier("b",fixed(0.02))`, "0.01 USD", false, true},
-		{"right multiplier", `tier("image",fixed(0.02)) * image_count`, "0.04 USD", true, false},
-		{"left multiplier", `image_count * tier("image",fixed(0.02))`, "0.04 USD", true, false},
-		{"selected request", `len == 7 ? tier("request",fixed(0.01)) : tier("image",fixed(0.02)) * image_count`, "0.01 USD", false, false},
-		{"selected images", `len == 7 ? tier("image",fixed(0.02)) * image_count : tier("request",fixed(0.01))`, "0.04 USD", true, false},
+		{"condition", `image_count > 0 ? tier("a",fixed(0.01)) : tier("b",fixed(0.02))`, "0.01 USD", false, true, false},
+		{"condition arithmetic", `image_count * 2 > 0 ? tier("a",fixed(0.01)) : tier("b",fixed(0.02))`, "0.01 USD", false, true, false},
+		{"right multiplier", `tier("image",fixed(0.02)) * image_count`, "0.04 USD", true, false, true},
+		{"left multiplier", `image_count * tier("image",fixed(0.02))`, "0.04 USD", true, false, true},
+		{"selected request", `len == 7 ? tier("request",fixed(0.01)) : tier("image",fixed(0.02)) * image_count`, "0.01 USD", false, false, false},
+		{"selected images", `len == 7 ? tier("image",fixed(0.02)) * image_count : tier("request",fixed(0.01))`, "0.04 USD", true, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			amount, trace, err := billingexpr.RunMoneyExpr(tc.expression, billingexpr.MoneyInput{Tokens: map[string]int64{"len": 7}, ImageCount: &count}, "USD")
@@ -283,8 +283,15 @@ func TestMoneyExprPreservesImageCountCompatibility(t *testing.T) {
 			assert.Equal(t, tc.amount, amount.String())
 			assert.Equal(t, tc.quantity, trace.ImageQuantityPriced)
 			assert.Equal(t, tc.fixedRequestOnly, billingexpr.UsesOnlyFixedRequestPricing(tc.expression))
+			assert.Equal(t, tc.fixedPerImage, trace.FixedPricePerImage)
 		})
 	}
+	const interruptedQuantity = `tier("image",fixed(0.01)) * (param("n") == 1 && 1 / (len - 7) > 0 ? 2 : 1) * image_count`
+	_, trace, err = billingexpr.RunMoneyExpr(interruptedQuantity, billingexpr.MoneyInput{Tokens: map[string]int64{"len": 7}, ImageCount: &count, Request: billingexpr.RequestInput{Body: []byte(`{"n":1}`)}}, "USD")
+	require.Error(t, err)
+	require.NotNil(t, trace.FixedPrice)
+	assert.True(t, trace.FixedPricePerImage, "a later quantity factor still belongs to the selected fixed price")
+	assert.False(t, trace.ImageQuantityPriced, "the failing request factor prevented quantity evaluation")
 }
 
 func TestMoneyExprActualMediaQuantitiesKeepRequestProbesFrozen(t *testing.T) {

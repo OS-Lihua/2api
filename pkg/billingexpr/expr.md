@@ -286,8 +286,10 @@ by the host's existing 1000-tokens-per-minute convention before evaluation.
 `MoneyTraceResult.ImageCount` records the image quantity available to the
 expression, including condition probes. `ImageQuantityPriced` separately reports
 whether the executed price multiplied by that quantity; condition-only uses do
-not turn a fixed request fee into a per-image price. The host can waive a failed
-request's evaluated fixed fee without discarding charges for delivered images.
+not turn a fixed request fee into a per-image price. `FixedPricePerImage` records
+the selected fixed leaf's unit before later factors run, including a quantity
+factor not reached because another multiplier failed. The host can waive a
+failed request's evaluated fixed fee without discarding charges for delivered images.
 `UsesOnlyFixedRequestPricing` identifies expressions whose leaves are all fixed
 request fees and have no image quantity factors, so a failed request owes zero
 even when a condition fails before choosing a leaf.
