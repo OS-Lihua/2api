@@ -153,6 +153,14 @@ func MarginReport(ctx context.Context, filter MarginFilter, offset, limit int) (
 							total.SalePending++
 						}
 					} else {
+						if !attempt.CostPending {
+							if _, err := money.ParseCurrency(string(attempt.Cost.Currency)); err != nil {
+								return err
+							}
+							if _, known := total.original[attempt.Cost.Currency]; !known {
+								total.original[attempt.Cost.Currency] = decimal.Zero
+							}
+						}
 						if !attempt.CostPending && !attempt.ConvertedCostPending && attempt.ConvertedCost.Currency != SettlementCurrency() {
 							return money.ErrCurrencyMismatch
 						}

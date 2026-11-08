@@ -49,6 +49,16 @@ export function MarginEstimates(props: { estimates: MarginEstimate[] }) {
           cell: (row) => `#${row.channel_id}`,
         },
         {
+          id: 'margin',
+          header: t('Gross margin'),
+          cell: (row) => (
+            <RequestMoney
+              amount={row.margin ?? undefined}
+              pending={!row.margin}
+            />
+          ),
+        },
+        {
           id: 'provider',
           header: t('Provider ID'),
           cell: (row) => `#${row.provider_id}`,
@@ -73,16 +83,6 @@ export function MarginEstimates(props: { estimates: MarginEstimate[] }) {
           header: t('Purchase cost'),
           cell: (row) => (
             <RequestMoney amount={row.cost ?? undefined} pending={!row.cost} />
-          ),
-        },
-        {
-          id: 'margin',
-          header: t('Gross margin'),
-          cell: (row) => (
-            <RequestMoney
-              amount={row.margin ?? undefined}
-              pending={!row.margin}
-            />
           ),
         },
         {

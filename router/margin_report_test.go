@@ -142,6 +142,7 @@ func TestMarginPendingAccountingHTTP(t *testing.T) {
 	}{
 		{name: "unknown sale retains known procurement", salePending: true, original: 1000000000, converted: 2000000000},
 		{name: "unknown procurement retains known sale", costPending: true},
+		{name: "explicit free procurement remains known zero", original: 0, converted: 0},
 		{name: "frozen conversion retains independent rounding", original: 1, converted: 1},
 		{name: "unknown conversion retains original payable", fxPending: true, original: 1000000000},
 	} {
@@ -189,7 +190,7 @@ func TestMarginPendingAccountingHTTP(t *testing.T) {
 			assert.Equal(t, tc.salePending, row.SalePending > 0)
 			assert.Equal(t, tc.costPending, row.CostPending > 0)
 			assert.Equal(t, tc.fxPending, row.ConvertedCostPending > 0)
-			if tc.original > 0 {
+			if !tc.costPending {
 				require.Len(t, row.OriginalCosts, 1)
 				assert.EqualValues(t, tc.original, row.OriginalCosts[0].Nanos)
 			}

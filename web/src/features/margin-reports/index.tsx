@@ -120,6 +120,21 @@ export function MarginReports() {
     { accessorKey: 'provider_id', header: t('Provider ID') },
     { accessorKey: 'date', header: t('Date') },
     {
+      id: 'margin',
+      header: t('Gross margin'),
+      cell: ({ row }) => (
+        <div>
+          <RequestMoney
+            amount={row.original.margin ?? undefined}
+            pending={!row.original.margin}
+          />
+          {!row.original.margin && (
+            <span className='block text-xs'>{t('Incomplete accounting')}</span>
+          )}
+        </div>
+      ),
+    },
+    {
       id: 'revenue',
       header: t('Known revenue'),
       cell: ({ row }) => (
@@ -141,7 +156,7 @@ export function MarginReports() {
     },
     {
       id: 'outstanding',
-      header: t('Outstanding'),
+      header: t('Known outstanding'),
       cell: ({ row }) => <RequestMoney amount={row.original.outstanding} />,
     },
     {
@@ -157,21 +172,6 @@ export function MarginReports() {
           {row.original.original_costs.map((amount) => (
             <RequestMoney key={amount.currency} amount={amount} />
           ))}
-        </div>
-      ),
-    },
-    {
-      id: 'margin',
-      header: t('Gross margin'),
-      cell: ({ row }) => (
-        <div>
-          <RequestMoney
-            amount={row.original.margin ?? undefined}
-            pending={!row.original.margin}
-          />
-          {!row.original.margin && (
-            <span className='block text-xs'>{t('Incomplete accounting')}</span>
-          )}
         </div>
       ),
     },

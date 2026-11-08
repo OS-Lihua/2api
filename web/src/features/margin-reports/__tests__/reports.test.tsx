@@ -67,6 +67,12 @@ it('shows known amounts separately from unfinished margin and applies dimension 
   expect(
     screen.getByRole('columnheader', { name: 'Known revenue' })
   ).toBeInTheDocument()
+  const headers = screen
+    .getAllByRole('columnheader')
+    .map((header) => header.textContent)
+  expect(headers.indexOf('Gross margin')).toBeLessThan(
+    headers.indexOf('Known revenue')
+  )
   const user = userEvent.setup()
   await user.type(screen.getByRole('textbox', { name: 'Provider ID' }), '41')
   await user.type(screen.getByLabelText('From date'), '2025-01-02')

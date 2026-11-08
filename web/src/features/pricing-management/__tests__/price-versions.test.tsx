@@ -179,6 +179,12 @@ it('requires an explicit loss confirmation and resubmits the exact rejected draf
     name: 'Negative margin requires confirmation',
   })
   expect(post).toHaveBeenCalledTimes(1)
+  expect(
+    within(approval)
+      .getAllByRole('columnheader')
+      .slice(0, 3)
+      .map((header) => header.textContent)
+  ).toContain('Gross margin')
   await user.click(
     within(approval).getByRole('button', { name: 'Confirm loss' })
   )
