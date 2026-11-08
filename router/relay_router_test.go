@@ -2079,14 +2079,14 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 		{name: "OpenAI missing input retains output beyond budget", provider: constant.ChannelTypeOpenAI, body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"completion_tokens":1000}}`, source: "estimated", prompt: 9, completion: 1000, charge: 3616200, cost: 2009000},
 		{name: "Cohere HTTP failure preserves cost", upstreamStatus: http.StatusServiceUnavailable, httpStatus: http.StatusServiceUnavailable, status: "failed", source: "none", body: `{"text":"Hello","meta":{"billed_units":{"input_tokens":10,"output_tokens":5}}}`, cost: 20000},
 		{name: "Cohere interrupted stream", stream: true, status: "partial", body: "{\"text\":\"Hello\"}\n", source: "estimated", prompt: 9, completion: 1, charge: 19800, cost: 11000},
-		{name: "Cohere failed terminal", stream: true, status: "partial", body: "{\"text\":\"Hello\"}\n{\"is_finished\":true,\"finish_reason\":\"ERROR\",\"response\":{\"meta\":{\"billed_units\":{\"input_tokens\":10,\"output_tokens\":5}}}}\n", source: "upstream", prompt: 10, completion: 5, charge: 36000, cost: 20000},
+		{name: "Cohere failed terminal", stream: true, status: "partial", body: "{\"text\":\"Hello\"}\n{\"is_finished\":true,\"finish_reason\":\"ERROR\",\"response\":{\"meta\":{\"billed_units\":{\"input_tokens\":10,\"output_tokens\":5}}}}\n", source: "estimated", prompt: 10, completion: 1, charge: 21600, cost: 20000},
 		{name: "Cohere invalid input retains output", body: `{"text":"Hello","meta":{"billed_units":{"input_tokens":-1,"output_tokens":5}}}`, source: "estimated", prompt: 9, completion: 5, charge: 34200, cost: 19000},
 		{name: "Dify error reports cost", provider: constant.ChannelTypeDify, stream: true, status: "failed", source: "none", body: "data: {\"event\":\"error\",\"metadata\":{\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}}\n\n", cost: 20000},
-		{name: "Dify error after output preserves counters", provider: constant.ChannelTypeDify, stream: true, status: "partial", source: "upstream", body: "data: {\"event\":\"message\",\"answer\":\"Hello\",\"metadata\":{\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":5}}}\n\ndata: {\"event\":\"error\"}\n\n", completion: 5, charge: 18000, cost: 10000},
+		{name: "Dify error after output preserves counters", provider: constant.ChannelTypeDify, stream: true, status: "partial", source: "estimated", body: "data: {\"event\":\"message\",\"answer\":\"Hello\",\"metadata\":{\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":5}}}\n\ndata: {\"event\":\"error\"}\n\n", completion: 1, charge: 3600, cost: 10000},
 		{name: "Ollama HTTP failure preserves cost", provider: constant.ChannelTypeOllama, upstreamStatus: http.StatusServiceUnavailable, httpStatus: http.StatusServiceUnavailable, status: "failed", source: "none", body: `{"message":{"role":"assistant","content":"Hello"},"prompt_eval_count":10,"eval_count":5}`, cost: 20000},
 		{name: "Coze list failure preserves cost", provider: constant.ChannelTypeCoze, status: "failed", source: "none", httpStatus: http.StatusBadGateway, body: `{"code":1,"data":[],"msg":"Hello"}`, cost: 20000},
 		{name: "Coze polling failure preserves cost", provider: constant.ChannelTypeCoze, status: "failed", cozeStatus: "failed", source: "none", httpStatus: http.StatusBadGateway, body: `{}`, cost: 20000},
-		{name: "Zhipu failed terminal preserves counters", provider: constant.ChannelTypeZhipu, key: "test.secret", stream: true, status: "partial", body: "data:Hello\nmeta:{\"task_status\":\"FAIL\",\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n", source: "upstream", prompt: 10, completion: 5, charge: 36000, cost: 20000},
+		{name: "Zhipu failed terminal preserves counters", provider: constant.ChannelTypeZhipu, key: "test.secret", stream: true, status: "partial", body: "data:Hello\nmeta:{\"task_status\":\"FAIL\",\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n", source: "estimated", prompt: 10, completion: 1, charge: 21600, cost: 20000},
 		{name: "Tencent interrupted stream", provider: constant.ChannelTypeTencent, key: "1|test-id|test-secret", stream: true, status: "partial", body: "data: {\"Choices\":[{\"Delta\":{\"Content\":\"Hello\"}}],\"Usage\":{\"PromptTokens\":0}}\n\n", source: "estimated", completion: 1, charge: 3600, cost: 2000},
 		{name: "Cohere stream", stream: true, body: "{\"event_type\":\"text-generation\",\"text\":\"Hello\"}\n{\"is_finished\":true,\"finish_reason\":\"COMPLETE\",\"response\":{\"meta\":{\"billed_units\":{\"input_tokens\":10,\"output_tokens\":5}}}}\n", source: "upstream", prompt: 10, completion: 5, charge: 36000, cost: 20000},
 		{name: "Baidu JSON", provider: constant.ChannelTypeBaidu, key: "test-key|test-secret", body: `{"result":"Hello","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, source: "upstream", prompt: 10, completion: 5, charge: 36000, cost: 20000},
@@ -2892,6 +2892,8 @@ func TestTextGatewayJSONAndStreamUsage(t *testing.T) {
 		{name: "JSON explicit zero input estimates only output", body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0}}`, status: "success", source: "estimated", completion: 1, receivable: 3600, cost: 2000},
 		{name: "JSON explicit zero output estimates only input", body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"completion_tokens":0}}`, status: "success", source: "estimated", prompt: 9, receivable: 16200, cost: 9000},
 		{name: "JSON reasoning is generated output", body: `{"choices":[{"message":{"role":"assistant","reasoning_content":"Hello"},"finish_reason":"stop"}]}`, status: "success", source: "estimated", prompt: 9, completion: 1, receivable: 19800, cost: 11000},
+		{name: "SSE interrupted reported tool uses complete local estimate", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_test\",\"type\":\"function\",\"function\":{\"name\":\"Hello\",\"arguments\":\"\"}}]}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":100}}\n\n", status: "partial", source: "estimated", attemptSource: "upstream", prompt: 10, completion: 8, receivable: 46800, cost: 210000},
+		{name: "SSE interrupted tool keeps complete local estimate", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_test\",\"type\":\"function\",\"function\":{\"name\":\"Hello\",\"arguments\":\"\"}}]}}]}\n\n", status: "partial", source: "estimated", prompt: 9, completion: 8, receivable: 45000, cost: 25000},
 		{name: "SSE interrupted explicit zero stays authoritative", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\n", status: "partial", source: "upstream"},
 		{name: "SSE interrupted reported usage bills delivered output", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n", status: "partial", source: "estimated", attemptSource: "upstream", prompt: 10, completion: 1, receivable: 21600, cost: 20000},
 		{name: "SSE interrupted after output", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n", status: "partial", source: "estimated", prompt: 9, completion: 1, receivable: 19800, cost: 11000},
@@ -3317,6 +3319,7 @@ func TestTextGatewayFreeFixedPricesAndFailureCosts(t *testing.T) {
 	}{
 		{name: "explicit free request", expression: `tier("request",fixed(0))`, body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, status: "success", source: "upstream", cost: 20000},
 		{name: "fixed successful request", expression: `tier("request",fixed(0.01))`, body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, status: "success", source: "upstream", charge: 9000000, cost: 20000},
+		{name: "fixed interrupted condition failure still refunds", expression: `(len == 9 || 1 / (len - 10) > 0) ? tier("a",fixed(0.01)) : tier("b",fixed(0.02))`, stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n", status: "partial", source: "upstream", cost: 20000},
 		{name: "fixed interrupted overflowing branch still refunds", expression: `len == 10 ? tier("overflow",fixed(10000000000)) : tier("request",fixed(0.01))`, stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n", status: "partial", source: "upstream", cost: 20000},
 		{name: "fixed interrupted stream refunds", expression: `tier("request",fixed(0.01))`, stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n", status: "partial", source: "estimated", cost: 11000},
 		{name: "fixed safety stream refunds", expression: `tier("request",fixed(0.01))`, stream: true, body: "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n", status: "partial", source: "upstream", errorClass: "content_safety", cost: 20000},
@@ -4092,6 +4095,101 @@ func TestTextGatewayDifyUploadsAfterReservation(t *testing.T) {
 				}
 				assert.Equal(t, int64(999_964_000), wallet.Balance.Nanos)
 			}
+		})
+	}
+}
+
+func TestTextGatewayEvaluationFailureRetainsPendingAccounting(t *testing.T) {
+	for _, test := range []struct {
+		name, owner, expression string
+		reservation             int64
+	}{
+		{"mixed pricing condition failure", model.PriceOwnerOffering, `(len == 9 || 1 / (len - 10) > 0) ? tier("request",fixed(0.01)) : tier("tokens",p + c)`, 9000000},
+		{"sale overflow", model.PriceOwnerOffering, `len == 9 ? tier("base",p * 2 + c * 4) : tier("overflow",p * 1000000000000000 + c * 4)`, 73800},
+		{"sale evaluation", model.PriceOwnerOffering, `len == 9 ? tier("base",p * 2 + c * 4) : tier("invalid",p / (len - 10))`, 73800},
+		{"purchase overflow", model.PriceOwnerChannel, `len == 9 ? tier("base",p + c * 2) : tier("overflow",p * 1000000000000000 + c * 4)`, 73800},
+		{"purchase evaluation", model.PriceOwnerChannel, `len == 9 ? tier("base",p + c * 2) : tier("invalid",p / (len - 10))`, 73800},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+			})
+			ownerID := fixture.offering.ID
+			if test.owner == model.PriceOwnerChannel {
+				ownerID = fixture.channel.ID
+			}
+			price := &model.PriceVersion{OwnerType: test.owner, OwnerID: ownerID, Currency: "USD", Expression: test.expression, EffectiveAt: clock.Now().Unix()}
+			require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			healthy := model.GatewayRequest{ID: "zz-healthy-pending", UserID: fixture.user.Id, SaleFXRate: "1", SaleCurrency: "USD", Receivable: money.Amount{Currency: "USD"}, Status: "failed"}
+			zero := money.Amount{Currency: "USD"}
+			require.NoError(t, model.ReserveGateway(&healthy, zero, zero))
+			body := `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			id := response.Header().Get(common.RequestIdKey)
+			var lifecycle model.GatewayBilling
+			require.NoError(t, model.DB.First(&lifecycle, "request_id = ?", id).Error)
+			require.Equal(t, "evaluation_failed", lifecycle.Phase, "the reservation must never become a finalized replacement for an unknown actual amount")
+			view := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests?status=settlement_pending", "")
+			require.True(t, view.Success, view.Message)
+			items := view.Data["items"].([]any)
+			require.Len(t, items, 1)
+			item := items[0].(map[string]any)
+			assert.Equal(t, id, item["id"])
+			assert.Equal(t, "settlement_pending", item["status"])
+			assert.Equal(t, "billing_evaluation_failed", item["error_code"])
+			requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			require.Len(t, requests, 1)
+			assert.Equal(t, int64(10), requests[0].Usage.PromptTokens)
+			assert.Equal(t, int64(5), requests[0].Usage.CompletionTokens)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), id, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, int64(10), attempts[0].Usage.PromptTokens)
+			assert.Equal(t, "upstream", attempts[0].UsageSource)
+			if test.owner == model.PriceOwnerOffering {
+				assert.Equal(t, int64(20000), attempts[0].Cost.Nanos)
+			}
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1000000000)-test.reservation, wallet.Balance.Nanos)
+			_, err = model.TopUpWallet(model.WalletTopUp{UserId: fixture.user.Id, Source: money.Amount{Nanos: 1000, Currency: "USD"}, Reference: "pending-credit"})
+			require.NoError(t, err)
+			blocked := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+			assert.Equal(t, http.StatusPaymentRequired, blocked.Code, blocked.Body.String())
+			assert.Equal(t, 1, calls)
+			walletView := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/user-wallets/%d", fixture.user.Id), "")
+			require.True(t, walletView.Success, walletView.Message)
+			assert.Equal(t, true, walletView.Data["requests_paused"])
+			self := walletAPIRequest(t, fixture.engine, fixture.userPAT, http.MethodGet, "/api/requests/self/"+id+"/attempts", "")
+			require.True(t, self.Success, self.Message)
+			selfAttempt := self.Data["items"].([]any)[0].(map[string]any)
+			assert.NotContains(t, selfAttempt, "cost")
+			assert.NotContains(t, selfAttempt, "purchase_expression")
+			other := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "log:read")
+			denied := adminSecurityRequest(fixture.engine, other, http.MethodGet, "/api/requests/self/"+id+"/attempts", "")
+			assert.Equal(t, http.StatusNotFound, denied.Code, denied.Body.String())
+			require.NoError(t, model.PrepareGatewaySettlement(model.GatewaySettlement{Request: healthy, SaleSource: zero}))
+			completed, err := model.RecoverGatewaySettlements(t.Context(), 1)
+			assert.Equal(t, 1, completed, "an older unresolved evaluation must not starve recoverable settlements")
+			assert.ErrorIs(t, err, model.ErrGatewayEvaluationPending)
+			for range 2 {
+				completed, err := model.RecoverGatewaySettlements(t.Context(), 100)
+				assert.Zero(t, completed)
+				assert.Error(t, err, "unresolved evaluations must remain visible to the recovery operator")
+			}
+			var postings []model.LedgerEntry
+			require.NoError(t, model.DB.Where("request_id = ?", id).Find(&postings).Error)
+			require.Len(t, postings, 1)
+			assert.Equal(t, model.LedgerEntryPreConsume, postings[0].Type)
+			reconciliation, err := model.ReconcileWallets(100)
+			require.NoError(t, err)
+			assert.Empty(t, reconciliation.Mismatches)
 		})
 	}
 }

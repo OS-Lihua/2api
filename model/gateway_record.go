@@ -1,9 +1,12 @@
 package model
 
 import (
+	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
+	"slices"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/money"
@@ -153,14 +156,55 @@ func ListGatewayRequests(ctx context.Context, filter GatewayRequestFilter, offse
 	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
+	var pendingRows []GatewayBilling
+	pendingQuery := DB.WithContext(ctx).Where("phase = ?", "evaluation_failed")
+	if filter.UserID > 0 {
+		pendingQuery = pendingQuery.Where("user_id = ?", filter.UserID)
+	}
+	if err := pendingQuery.Find(&pendingRows).Error; err != nil {
+		return nil, 0, err
+	}
+	pending := []GatewayRequest{}
+	for _, row := range pendingRows {
+		var intent GatewaySettlement
+		if err := common.UnmarshalJsonStr(row.Settlement, &intent); err != nil {
+			return nil, 0, err
+		}
+		r := intent.Request
+		if filter.TokenID > 0 && r.TokenID != filter.TokenID || filter.ModelOfferingID > 0 && r.ModelOfferingID != filter.ModelOfferingID || filter.Status != "" && r.Status != filter.Status || filter.StartedAfter > 0 && r.StartedAt < filter.StartedAfter || filter.StartedBefore > 0 && r.StartedAt > filter.StartedBefore {
+			continue
+		}
+		pending = append(pending, r)
+	}
 	items := []GatewayRequest{}
-	err := query.Order("started_at DESC, id DESC").Offset(offset).Limit(limit).Find(&items).Error
-	return items, total, err
+	if len(pending) == 0 {
+		err := query.Order("started_at DESC, id DESC").Offset(offset).Limit(limit).Find(&items).Error
+		return items, total, err
+	}
+	if err := query.Order("started_at DESC, id DESC").Limit(offset + limit).Find(&items).Error; err != nil {
+		return nil, 0, err
+	}
+	items = append(items, pending...)
+	slices.SortFunc(items, func(a, b GatewayRequest) int {
+		if order := cmp.Compare(b.StartedAt, a.StartedAt); order != 0 {
+			return order
+		}
+		return cmp.Compare(b.ID, a.ID)
+	})
+	total += int64(len(pending))
+	return items[min(offset, len(items)):min(offset+limit, len(items))], total, nil
 }
 
 // GetGatewayRequest applies the ownership predicate in the database, including
 // for an attempts read. A cross-user identifier is indistinguishable from missing.
 func GetGatewayRequest(ctx context.Context, id string, ownerID int) (*GatewayRequest, error) {
+	intent, pendingErr := gatewayEvaluationSettlement(ctx, id, ownerID)
+	if pendingErr == nil {
+		return &intent.Request, nil
+	}
+	if !errors.Is(pendingErr, gorm.ErrRecordNotFound) {
+		return nil, pendingErr
+	}
 	query := gatewayRecordQuery(ctx, &GatewayRequest{}, "gateway_requests").Where("id = ?", id)
 	if ownerID > 0 {
 		query = query.Where("user_id = ?", ownerID)
@@ -171,6 +215,17 @@ func GetGatewayRequest(ctx context.Context, id string, ownerID int) (*GatewayReq
 }
 
 func ListGatewayAttempts(ctx context.Context, requestID string, offset, limit int) ([]GatewayAttempt, int64, error) {
+	intent, pendingErr := gatewayEvaluationSettlement(ctx, requestID, 0)
+	if pendingErr == nil {
+		attempts := intent.Attempts
+		if intent.Attempt != nil {
+			attempts = []GatewayAttempt{*intent.Attempt}
+		}
+		return attempts[min(offset, len(attempts)):min(offset+limit, len(attempts))], int64(len(attempts)), nil
+	}
+	if !errors.Is(pendingErr, gorm.ErrRecordNotFound) {
+		return nil, 0, pendingErr
+	}
 	query := gatewayRecordQuery(ctx, &GatewayAttempt{}, "gateway_attempts").Where("request_id = ?", requestID)
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
@@ -179,6 +234,24 @@ func ListGatewayAttempts(ctx context.Context, requestID string, offset, limit in
 	items := []GatewayAttempt{}
 	err := query.Order("started_at, id").Offset(offset).Limit(limit).Find(&items).Error
 	return items, total, err
+}
+
+// gatewayEvaluationSettlement exposes unresolved quantitative facts through the
+// existing record APIs without publishing estimates as finalized log records.
+func gatewayEvaluationSettlement(ctx context.Context, id string, ownerID int) (*GatewaySettlement, error) {
+	query := DB.WithContext(ctx).Where("request_id = ? AND phase = ?", id, "evaluation_failed")
+	if ownerID > 0 {
+		query = query.Where("user_id = ?", ownerID)
+	}
+	var row GatewayBilling
+	if err := query.Take(&row).Error; err != nil {
+		return nil, err
+	}
+	var intent GatewaySettlement
+	if err := common.UnmarshalJsonStr(row.Settlement, &intent); err != nil {
+		return nil, err
+	}
+	return &intent, nil
 }
 
 func appendGatewayRecord(record any) error {

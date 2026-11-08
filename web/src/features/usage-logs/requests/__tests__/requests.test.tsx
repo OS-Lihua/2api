@@ -443,6 +443,18 @@ it('applies supported identity and millisecond date filters and resets them', as
   ).toHaveValue('')
 })
 
+it('filters unresolved settlements through the existing request status selector', async () => {
+  const user = userEvent.setup()
+  renderRequests()
+  await screen.findByText('chat-standard')
+  await user.click(screen.getByRole('combobox', { name: 'Request status' }))
+  await user.click(await screen.findByRole('option', { name: 'Settlement pending' }))
+  await user.click(screen.getByRole('button', { name: 'Search' }))
+  await waitFor(() =>
+    expect(urls.at(-1)?.searchParams.get('status')).toBe('settlement_pending')
+  )
+})
+
 it('paginates actual request pages and retains the active server-side filters', async () => {
   useAuthStore.getState().auth.setUser({
     id: 7,

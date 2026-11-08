@@ -92,7 +92,7 @@ func listGatewayRequests(c *gin.Context, self bool) {
 		return
 	}
 	filter := model.GatewayRequestFilter{Status: c.Query("status")}
-	if filter.Status != "" && !slices.Contains([]string{"success", "failed", "cancelled", "partial"}, filter.Status) {
+	if filter.Status != "" && !slices.Contains([]string{"success", "failed", "cancelled", "partial", "settlement_pending"}, filter.Status) {
 		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid request"))
 		return
 	}

@@ -38,15 +38,16 @@ func gatewayError(c *gin.Context, status int, code, message string) {
 }
 
 type textGatewayRun struct {
-	record        *model.GatewayRequest
-	sale          *model.PriceVersion
-	saleFX        *money.Rate
-	saleRate      string
-	ratio         decimal.Decimal
-	saleSource    money.Amount
-	reservation   money.Amount
-	status        int
-	code, message string
+	record           *model.GatewayRequest
+	sale             *model.PriceVersion
+	saleFX           *money.Rate
+	saleRate         string
+	ratio            decimal.Decimal
+	saleSource       money.Amount
+	reservation      money.Amount
+	evaluationFailed bool
+	status           int
+	code, message    string
 }
 
 func (run *textGatewayRun) fail(c *gin.Context, status int, code, message string) {
@@ -104,7 +105,10 @@ func TextGateway(c *gin.Context) {
 	c.Request = parent
 	if run.record != nil {
 		run.record.EndedAt = clock.Now().UnixMilli()
-		intent := model.GatewaySettlement{Request: *run.record, Attempts: attempts, SaleSource: run.saleSource}
+		if run.evaluationFailed {
+			run.record.Status = "settlement_pending"
+		}
+		intent := model.GatewaySettlement{Request: *run.record, Attempts: attempts, SaleSource: run.saleSource, EvaluationFailed: run.evaluationFailed}
 		if err := model.PrepareGatewaySettlement(intent); err != nil {
 			logger.LogError(parent.Context(), "gateway settlement preparation failed for request "+run.record.ID)
 		} else if _, err := model.SettleGateway(run.record.ID); err != nil {
@@ -370,7 +374,6 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	var purchase *model.PriceVersion
 	var purchaseFX *money.Rate
 	var purchaseInput billingexpr.RequestInput
-	var estimatedCost, estimatedConverted money.Amount
 	defer func() {
 		record.EndedAt = clock.Now().UnixMilli()
 		if attempt == nil && parent.Context().Err() != nil {
@@ -435,8 +438,9 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 					attempt.ConvertedCost, priceErr = converted.Cost()
 				}
 				if priceErr != nil {
-					attempt.Cost, attempt.ConvertedCost = estimatedCost, estimatedConverted
-					attempt.UsageSource = "estimated"
+					attempt.Cost = money.Amount{Currency: purchase.Currency}
+					attempt.ConvertedCost = money.Amount{Currency: model.SettlementCurrency()}
+					run.evaluationFailed = true
 					record.ErrorCode = "billing_evaluation_failed"
 				}
 			}
@@ -444,9 +448,12 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				record.ChoiceCount = choiceCount
 				saleUsage := usage
 				record.Usage, record.UsageSource = attempt.Usage, attempt.UsageSource
-				if info.IsStream && attempt.Status == "partial" && failure.Class == "stream_interrupted" && usage != nil {
+				if info.IsStream && attempt.Status == "partial" && info.ResponseFacts.CompletionTokensReported && usage != nil {
 					// Procurement retains reported usage; an interrupted delivery bills only generated text.
 					delivered := tokenkit.Count(info.TokenizerModel, info.ResponseFacts.GeneratedText)
+					if info.ResponseFacts.GeneratedOutputTokens != nil {
+						delivered = *info.ResponseFacts.GeneratedOutputTokens
+					}
 					if delivered < usage.CompletionTokens {
 						snapshot := *usage
 						snapshot.CompletionTokens = delivered
@@ -459,7 +466,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 					}
 				}
 				source, receivable, trace, priceErr := service.GatewayPrice(sale, saleUsage, input, started, ratio, saleFX)
-				if trace.BillingUnit == billingexpr.BillingUnitRequest && attempt.Status != "success" {
+				if attempt.Status != "success" && (trace.BillingUnit == billingexpr.BillingUnitRequest || billingexpr.UsesOnlyFixedPricing(sale.Expression)) {
 					source, _ = money.ParseValue("0", sale.Currency)
 					receivable, _ = money.ParseValue("0", model.SettlementCurrency())
 					priceErr = nil
@@ -475,8 +482,8 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 					}
 				}
 				if priceErr != nil {
-					record.Receivable = reserve
-					record.UsageSource = "estimated"
+					record.Receivable = money.Amount{Currency: model.SettlementCurrency()}
+					run.evaluationFailed = true
 					record.ErrorCode = "billing_evaluation_failed"
 				}
 			}
@@ -524,13 +531,11 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
 	}
-	estimatedCost, err = costEstimate.Cost()
-	if err != nil {
+	if _, err = costEstimate.Cost(); err != nil {
 		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
 	}
-	estimatedConverted, err = convertedEstimate.Cost()
-	if err != nil {
+	if _, err = convertedEstimate.Cost(); err != nil {
 		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
 	}
