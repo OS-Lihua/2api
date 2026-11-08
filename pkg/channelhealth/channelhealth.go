@@ -244,13 +244,23 @@ func (m *Manager) Acquire(ctx context.Context, ids []int) (Admission, error) {
 		admission = Admission{}
 		now := clock.Now().UnixMilli()
 		earliest := 0
+		allOpen, activeLease := true, false
 		for _, id := range ids {
 			if states[id].Trips == 0 {
+				allOpen = false
 				continue
+			}
+			if states[id].Lease != "" && states[id].LeaseUntil > now {
+				activeLease = true
 			}
 			if earliest == 0 || states[id].RetryAt < states[earliest].RetryAt || states[id].RetryAt == states[earliest].RetryAt && id < earliest {
 				earliest = id
 			}
+		}
+		// A late ordinary 429 can move the active probe behind another circuit.
+		// Its lease still excludes another probe in this all-open candidate set.
+		if allOpen && activeLease {
+			return false
 		}
 		probe := earliest != 0 && states[earliest].RetryAt <= now && (states[earliest].Lease == "" || states[earliest].LeaseUntil <= now)
 		if !probe {
