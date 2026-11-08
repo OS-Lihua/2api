@@ -443,17 +443,19 @@ it('applies supported identity and millisecond date filters and resets them', as
   ).toHaveValue('')
 })
 
-it.each([true, false])(
-  'shows unresolved amounts distinctly from a known zero charge (sale_pending=%s)',
-  async (salePending) => {
-    useAuthStore
-      .getState()
-      .auth.setUser({
-        id: 7,
-        username: 'admin',
-        role: 10,
-        permissions: { admin_permissions: { request: { read: true } } },
-      })
+it.each([
+  { salePending: true, costPending: true },
+  { salePending: false, costPending: true },
+  { salePending: false, costPending: false },
+])(
+  'shows unresolved amounts distinctly from known amounts (sale_pending=$salePending cost_pending=$costPending)',
+  async ({ salePending, costPending }) => {
+    useAuthStore.getState().auth.setUser({
+      id: 7,
+      username: 'admin',
+      role: 10,
+      permissions: { admin_permissions: { request: { read: true } } },
+    })
     api.defaults.adapter = async (config) => {
       const url = new URL(api.getUri(config), 'http://localhost')
       return {
@@ -468,8 +470,13 @@ it.each([true, false])(
               ? [
                   {
                     ...internalAttempt,
-                    cost_pending: true,
-                    cost: { nanos: '0', currency: 'EUR' },
+                    cost_pending: costPending,
+                    converted_cost_pending: true,
+                    accounting_fx_rate: '2',
+                    cost: {
+                      nanos: costPending ? '0' : '5000000000000000000',
+                      currency: 'EUR',
+                    },
                     converted_cost: { nanos: '0', currency: 'USD' },
                   },
                 ]
@@ -506,9 +513,12 @@ it.each([true, false])(
     })
     await within(drawer).findByText(attempt.id)
     expect(within(drawer).queryByText('0 EUR')).not.toBeInTheDocument()
+    if (!costPending) {
+      expect(within(drawer).getByText('5,000,000,000 EUR')).toBeVisible()
+    }
     expect(
       within(drawer).getAllByText('Settlement pending').length
-    ).toBeGreaterThanOrEqual(3)
+    ).toBeGreaterThanOrEqual(2)
     if (salePending) {
       expect(within(drawer).queryByText('0 USD')).not.toBeInTheDocument()
     } else {

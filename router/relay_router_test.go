@@ -4151,6 +4151,7 @@ func TestTextGatewayEvaluationFailureRetainsPendingAccounting(t *testing.T) {
 		{"mixed pricing condition failure", model.PriceOwnerOffering, `(len == 9 || 1 / (len - 10) > 0) ? tier("request",fixed(0.01)) : tier("tokens",p + c)`, 9000000},
 		{"sale overflow", model.PriceOwnerOffering, `(header("Content-Type") == "application/json" && len != 9) ? tier("overflow",p * (param("rate") ?? 1) + c * 10000000000000000) : tier("base",p * 2 + c * 4)`, 73800},
 		{"sale evaluation", model.PriceOwnerOffering, `len == 9 ? tier("base",p * 2 + c * 4) : tier("invalid",p / (len - 10))`, 73800},
+		{"purchase conversion overflow", model.PriceOwnerChannel, `len == 9 ? tier("base",p * 0.5 + c) : tier("expensive",p * 500000000000000)`, 73800},
 		{"purchase overflow", model.PriceOwnerChannel, `len == 9 ? tier("base",p + c * 2) : tier("overflow",p * 1000000000000000 + c * 4)`, 73800},
 		{"purchase evaluation", model.PriceOwnerChannel, `len == 9 ? tier("base",p + c * 2) : tier("invalid",p / (len - 10))`, 73800},
 	} {
@@ -4159,13 +4160,23 @@ func TestTextGatewayEvaluationFailureRetainsPendingAccounting(t *testing.T) {
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 				calls++
 				w.Header().Set("Content-Type", "application/json")
+				if test.name == "purchase conversion overflow" && calls > 1 {
+					_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":1}}`))
+					return
+				}
 				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":2,"cached_tokens_details":{"text_tokens":1,"image_tokens":1},"image_tokens":2},"completion_tokens_details":{"reasoning_tokens":1},"cost":{"credential":"quantitative-secret"},"usage_source":"quantitative-secret","usage_semantic":"quantitative-secret"}}`))
 			})
 			ownerID := fixture.offering.ID
 			if test.owner == model.PriceOwnerChannel {
 				ownerID = fixture.channel.ID
 			}
-			price := &model.PriceVersion{OwnerType: test.owner, OwnerID: ownerID, Currency: "USD", Expression: test.expression, EffectiveAt: clock.Now().Unix()}
+			currency := money.Currency("USD")
+			if test.name == "purchase conversion overflow" {
+				currency = "EUR"
+				_, err := model.SaveFXRate(t.Context(), "EUR", "USD", "2", "0.02", fixture.sale.CreatedBy)
+				require.NoError(t, err)
+			}
+			price := &model.PriceVersion{OwnerType: test.owner, OwnerID: ownerID, Currency: currency, Expression: test.expression, EffectiveAt: clock.Now().Unix()}
 			require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
 			healthy := model.GatewayRequest{ID: "zz-healthy-pending", UserID: fixture.user.Id, SaleFXRate: "1", SaleCurrency: "USD", Receivable: money.Amount{Currency: "USD"}, Status: "failed"}
 			zero := money.Amount{Currency: "USD"}
@@ -4213,7 +4224,11 @@ func TestTextGatewayEvaluationFailureRetainsPendingAccounting(t *testing.T) {
 			adminAttempts := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests/"+id+"/attempts", "")
 			require.True(t, adminAttempts.Success, adminAttempts.Message)
 			adminAttempt := adminAttempts.Data["items"].([]any)[0].(map[string]any)
-			if test.owner == model.PriceOwnerChannel {
+			if test.name == "purchase conversion overflow" {
+				assert.NotEqual(t, true, adminAttempt["cost_pending"])
+				assert.Equal(t, true, adminAttempt["converted_cost_pending"])
+				assert.Equal(t, map[string]any{"nanos": "5000000000000000000", "currency": "EUR"}, adminAttempt["cost"])
+			} else if test.owner == model.PriceOwnerChannel {
 				assert.Equal(t, true, adminAttempt["cost_pending"])
 			} else {
 				assert.NotEqual(t, true, adminAttempt["cost_pending"])
@@ -4281,6 +4296,7 @@ func TestTextGatewayEvaluationFailureRetainsPendingAccounting(t *testing.T) {
 			selfAttempt := self.Data["items"].([]any)[0].(map[string]any)
 			assert.NotContains(t, selfAttempt, "cost")
 			assert.NotContains(t, selfAttempt, "cost_pending")
+			assert.NotContains(t, selfAttempt, "converted_cost_pending")
 			assert.NotContains(t, selfAttempt, "purchase_expression")
 			other := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "log:read")
 			denied := adminSecurityRequest(fixture.engine, other, http.MethodGet, "/api/requests/self/"+id+"/attempts", "")
@@ -4313,6 +4329,11 @@ func TestTextGatewayEvaluationFailureRetainsPendingAccounting(t *testing.T) {
 				require.Len(t, postings, 2, "known Provider costs must be posted even while the sale needs reconciliation")
 				assert.Equal(t, model.LedgerAccountProviderPayable, postings[1].AccountType)
 				assert.Equal(t, int64(20000), postings[1].Amount.Nanos)
+			} else if test.name == "purchase conversion overflow" {
+				require.Len(t, postings, 5)
+				assert.Equal(t, model.LedgerAccountProviderPayable, postings[4].AccountType)
+				assert.Equal(t, money.Amount{Nanos: 5000000000000000000, Currency: "EUR"}, postings[4].Amount)
+				assert.Equal(t, "2", postings[4].FxRate.Decimal.String())
 			} else {
 				require.Len(t, postings, 4)
 			}

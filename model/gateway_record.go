@@ -57,6 +57,7 @@ func (GatewayRequest) TableName() string { return "gateway_requests" }
 
 type GatewayAttempt struct {
 	CostPending            bool           `json:"cost_pending,omitempty" gorm:"-"`
+	ConvertedCostPending   bool           `json:"converted_cost_pending,omitempty" gorm:"-"`
 	ID                     string         `json:"id" gorm:"type:varchar(64);primaryKey"`
 	RequestID              string         `json:"request_id" gorm:"type:varchar(64);not null;index"`
 	ChannelID              int            `json:"channel_id" gorm:"not null"`

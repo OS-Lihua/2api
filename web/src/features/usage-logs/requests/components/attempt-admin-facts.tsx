@@ -62,7 +62,7 @@ export function AttemptAdminFacts(props: { attempt: RequestAttempt }) {
           <dd className='mt-1'>
             <RequestMoney
               amount={attempt.converted_cost}
-              pending={attempt.cost_pending}
+              pending={attempt.cost_pending || attempt.converted_cost_pending}
             />
           </dd>
         </div>

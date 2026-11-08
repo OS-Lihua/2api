@@ -448,16 +448,17 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 					run.attemptTrace = make(map[string]billingexpr.MoneyTraceResult)
 				}
 				run.attemptTrace[attempt.ID] = costTrace
-				if priceErr == nil {
-					attempt.Cost, priceErr = cost.Cost()
+				originalCost, originalErr := cost.Cost()
+				attempt.CostPending = originalErr != nil || originalCost.Currency != purchase.Currency
+				if !attempt.CostPending {
+					attempt.Cost = originalCost
 				}
-				if priceErr == nil {
-					attempt.ConvertedCost, priceErr = converted.Cost()
+				convertedCost, convertedErr := converted.Cost()
+				attempt.ConvertedCostPending = convertedErr != nil || convertedCost.Currency != model.SettlementCurrency()
+				if !attempt.ConvertedCostPending {
+					attempt.ConvertedCost = convertedCost
 				}
-				if priceErr != nil {
-					attempt.CostPending = true
-					attempt.Cost = money.Amount{Currency: purchase.Currency}
-					attempt.ConvertedCost = money.Amount{Currency: model.SettlementCurrency()}
+				if priceErr != nil || attempt.CostPending || attempt.ConvertedCostPending {
 					run.evaluationFailed = true
 					record.ErrorCode = "billing_evaluation_failed"
 				}
