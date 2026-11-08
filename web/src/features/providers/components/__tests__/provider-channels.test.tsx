@@ -701,6 +701,11 @@ it('shows runtime circuit health separately from persistent Channel status', asy
     </I18nextProvider>
   )
   expect(await screen.findByText('Circuit open')).toBeVisible()
+  expect(screen.getByRole('region', { name: 'Channels' })).toHaveClass(
+    'max-w-[calc(100vw-3rem)]',
+    'md:max-w-none',
+    'whitespace-normal'
+  )
   expect(screen.getByText('Enabled')).toBeVisible()
   expect(screen.getByText('Recent success rate')).toBeVisible()
   expect(screen.getByText('50%')).toBeVisible()

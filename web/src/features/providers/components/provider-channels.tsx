@@ -262,7 +262,10 @@ export function ProviderChannels(props: { providerId: number }) {
     totalCount: query.data?.total ?? 0,
   })
   return (
-    <section className='space-y-3 p-4' aria-label={t('Channels')}>
+    <section
+      className='w-full max-w-[calc(100vw-3rem)] space-y-3 p-4 whitespace-normal md:max-w-none'
+      aria-label={t('Channels')}
+    >
       <div className='flex items-center justify-between'>
         <h3 className='font-semibold'>{t('Channels')}</h3>
         {canWrite && (
