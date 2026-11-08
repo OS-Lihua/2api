@@ -151,6 +151,25 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 	if !ok {
 		return nil, fmt.Errorf("missing text request projection")
 	}
+	if len(chat.Tools) == 0 {
+		var nativeTools []byte
+		switch native := request.(type) {
+		case *dto.OpenAIResponsesRequest:
+			nativeTools = native.Tools
+		case *dto.ClaudeRequest:
+			nativeTools, err = common.Marshal(native.Tools)
+			if err != nil {
+				return nil, err
+			}
+		case *dto.GeminiChatRequest:
+			nativeTools = native.Tools
+		}
+		if tools := gjson.ParseBytes(nativeTools).Array(); len(tools) > 0 {
+			// Retain a native tool capability fact omitted by the Chat encoder.
+			// This validation projection is never the upstream send source.
+			chat.Tools = []dto.ToolCallRequest{{Type: tools[0].Get("type").String(), Native: []byte(tools[0].Raw)}}
+		}
+	}
 	if len(chat.PromptCacheOptions) == 0 {
 		for _, diagnostic := range result.Diagnostics {
 			if diagnostic.Code != "cache_control_dropped" {

@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/png"
@@ -4053,6 +4054,134 @@ func TestTextGatewayChatInputDetailsReachPurchaseAccounting(t *testing.T) {
 			assert.Equal(t, int64(1), attempts[0].Usage.ImageInputTokens)
 			assert.Equal(t, int64(10000), attempts[0].Cost.Nanos)
 		})
+	}
+}
+
+type gatewayFailingFlushWriter struct{ *httptest.ResponseRecorder }
+
+func (w gatewayFailingFlushWriter) FlushError() error { return io.ErrClosedPipe }
+
+func TestTextGatewayJSONFlushFailurePreservesCostAndRefundsFixedPrice(t *testing.T) {
+	for _, source := range []struct{ protocol, path, request, response string }{
+		{"openai_chat", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`},
+		{"openai_responses", "/v1/responses", `{"model":"gateway-offering","input":"Hello","max_output_tokens":16}`, `{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5}}`},
+		{"anthropic_messages", "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`},
+		{"gemini_generate", "/v1beta/models/gateway-offering:generateContent", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16}}`, `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}`},
+	} {
+		t.Run(source.protocol, func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, source.response)
+			})
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", source.protocol).Error)
+			price := &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("request",fixed(0.01))`, EffectiveAt: clock.Now().Unix()}
+			require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+				t.Error("downstream flush failure must not switch Provider")
+			})
+			request := httptest.NewRequest(http.MethodPost, source.path, strings.NewReader(source.request))
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			fixture.engine.ServeHTTP(gatewayFailingFlushWriter{recorder}, request)
+			assert.Contains(t, recorder.Body.String(), "Hello")
+			record, err := model.GetGatewayRequest(t.Context(), recorder.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, "failed", record.Status)
+			assert.Zero(t, record.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, "downstream_write_failed", attempts[0].ErrorClass)
+			assert.Equal(t, int64(20000), attempts[0].Cost.Nanos)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1_000_000_000), wallet.Balance.Nanos)
+		})
+	}
+}
+
+func TestTextGatewayResponsesContentFilterNeverSwitches(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, output := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%t/output=%t", stream, output), func(t *testing.T) {
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					body := `{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[],"usage":{"input_tokens":10,"output_tokens":5}}`
+					if output && !stream {
+						body = `{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5}}`
+					}
+					if stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						if output {
+							_, _ = io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}\n\n")
+						}
+						_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.incomplete\",\"response\":%s}\n\n", body)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, body)
+				})
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "openai_responses").Error)
+				price := &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("request",fixed(0.01))`, EffectiveAt: clock.Now().Unix()}
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+				calls := 0
+				second := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Recovered"}]}],"usage":{"input_tokens":10,"output_tokens":5}}`)
+				})
+				require.NoError(t, model.DB.Model(second).Update("protocol", "openai_responses").Error)
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/responses", fmt.Sprintf(`{"model":"gateway-offering","stream":%t,"input":"Hello","max_output_tokens":16}`, stream))
+				assert.Zero(t, calls, "content safety rejection must stop immediately")
+				assert.NotContains(t, response.Body.String(), "Recovered")
+				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+				require.NoError(t, err)
+				assert.Zero(t, record.Receivable.Nanos)
+				attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, total)
+				assert.Equal(t, "content_safety", attempts[0].ErrorClass)
+				assert.Equal(t, "stop", attempts[0].FailoverDecision)
+				assert.Equal(t, int64(20000), attempts[0].Cost.Nanos)
+			})
+		}
+	}
+}
+
+func TestTextGatewayNativeHostedToolsRequireToolCapability(t *testing.T) {
+	for _, tools := range []string{`[{"type":"code_interpreter","container":{"type":"auto"}}]`, `[{"type":"file_search","vector_store_ids":["vs_test"]}]`} {
+		for _, declaration := range []string{"model", "channel", "enabled"} {
+			t.Run(tools+"/"+declaration, func(t *testing.T) {
+				calls := 0
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					var sent struct {
+						Tools json.RawMessage `json:"tools"`
+					}
+					require.NoError(t, common.DecodeJson(r.Body, &sent))
+					assert.JSONEq(t, tools, string(sent.Tools))
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5}}`)
+				})
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "openai_responses").Error)
+				caps := capability.Set{Features: []capability.Feature{capability.Streaming, capability.ToolCalling}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}
+				if declaration == "model" {
+					caps.Features = []capability.Feature{capability.Streaming}
+				}
+				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+				if declaration == "channel" {
+					require.NoError(t, model.DB.Model(fixture.channel).Update("capabilities", capability.Set{Features: []capability.Feature{capability.Streaming}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}).Error)
+				}
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/responses", fmt.Sprintf(`{"model":"gateway-offering","input":"Hello","tools":%s,"max_output_tokens":16}`, tools))
+				if declaration == "enabled" {
+					assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+					assert.Equal(t, 1, calls)
+				} else {
+					assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+					assert.Zero(t, calls)
+				}
+			})
+		}
 	}
 }
 

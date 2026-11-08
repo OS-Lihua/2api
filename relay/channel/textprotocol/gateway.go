@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -68,6 +69,11 @@ func observeGatewaySafety(info *relaycommon.RelayInfo, body []byte, format types
 		for _, choice := range root.Get("choices").Array() {
 			rejected = rejected || choice.Get("finish_reason").String() == "content_filter"
 		}
+	case types.RelayFormatOpenAIResponses:
+		if response := root.Get("response"); response.IsObject() {
+			root = response
+		}
+		rejected = root.Get("incomplete_details.reason").String() == "content_filter"
 	case types.RelayFormatClaude:
 		rejected = root.Get("stop_reason").String() == "refusal" || root.Get("delta.stop_reason").String() == "refusal"
 	}
@@ -125,6 +131,7 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	}
 	facts.SourceGeneratedText = sourceOutput.String()
 	facts.SourceOutputObserved = facts.SourceGeneratedText != "" || gatewayMediaOutput(body, p.format)
+	observeGatewaySafety(info, body, p.format)
 	meter := gatewayUsageAccumulator{format: p.format, context: c}
 	usage, err := meter.Observe(body)
 	if err != nil {
@@ -151,7 +158,6 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	if info.IsStream {
 		return usage, types.NewError(fmt.Errorf("upstream returned JSON for a stream request"), types.ErrorCodeBadResponse)
 	}
-	observeGatewaySafety(info, body, p.format)
 	var response any
 	switch p.kind {
 	case protocol.OpenAIChat:
@@ -238,11 +244,26 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		}
 		return usage, types.NewError(fmt.Errorf("upstream response contained no business output"), types.ErrorCodeBadResponse)
 	}
-	if err := service.IOCopyBytesGracefully(c, resp, encoded); err != nil {
+	for key, values := range resp.Header {
+		if len(values) > 0 && service.ShouldCopyUpstreamHeader(c, key, values) {
+			c.Writer.Header().Set(key, values[0])
+		}
+	}
+	c.Writer.Header().Set("Content-Length", fmt.Sprint(len(encoded)))
+	c.Writer.WriteHeader(resp.StatusCode)
+	written, writeErr := c.Writer.Write(encoded)
+	if writeErr == nil && written != len(encoded) {
+		writeErr = io.ErrShortWrite
+	}
+	if writeErr != nil {
+		facts.DownstreamWriteFailed = true
+		return usage, types.NewError(writeErr, types.ErrorCodeBadResponse)
+	}
+	facts.MarkBusinessOutput()
+	if err := helper.FlushWriter(c); err != nil {
 		facts.DownstreamWriteFailed = true
 		return usage, types.NewError(err, types.ErrorCodeBadResponse)
 	}
-	facts.MarkBusinessOutput()
 	if p.format == types.RelayFormatOpenAIResponses {
 		status := gjson.GetBytes(body, "status").String()
 		if status != "" && status != "completed" {
