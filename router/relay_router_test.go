@@ -2895,6 +2895,7 @@ func TestTextGatewayJSONAndStreamUsage(t *testing.T) {
 		{name: "SSE interrupted reported tool uses complete local estimate", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_test\",\"type\":\"function\",\"function\":{\"name\":\"Hello\",\"arguments\":\"\"}}]}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":100}}\n\n", status: "partial", source: "estimated", attemptSource: "upstream", prompt: 10, completion: 8, receivable: 46800, cost: 210000},
 		{name: "SSE interrupted tool keeps complete local estimate", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_test\",\"type\":\"function\",\"function\":{\"name\":\"Hello\",\"arguments\":\"\"}}]}}]}\n\n", status: "partial", source: "estimated", prompt: 9, completion: 8, receivable: 45000, cost: 25000},
 		{name: "SSE interrupted explicit zero stays authoritative", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\n", status: "partial", source: "upstream"},
+		{name: "SSE explicit upstream failure bills delivered output", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: {\"error\":{\"code\":\"overloaded\",\"type\":\"server_error\",\"status\":503}}\n\n", status: "partial", source: "estimated", attemptSource: "upstream", prompt: 10, completion: 1, receivable: 21600, cost: 20000},
 		{name: "SSE interrupted reported usage bills delivered output", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n", status: "partial", source: "estimated", attemptSource: "upstream", prompt: 10, completion: 1, receivable: 21600, cost: 20000},
 		{name: "SSE interrupted after output", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n", status: "partial", source: "estimated", prompt: 9, completion: 1, receivable: 19800, cost: 11000},
 	} {
@@ -3021,6 +3022,7 @@ func TestTextGatewayCancellationReleasesOrChargesReportedUsage(t *testing.T) {
 		provider           int
 		charge, cost       int64
 	}{
+		{name: "OpenAI partial usage", provider: constant.ChannelTypeOpenAI, source: "estimated", charge: 19800, cost: 209000, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":{\"completion_tokens\":100}}\n\ndata: {\"choices\":[]}\n\n"},
 		{name: "OpenAI missing usage", provider: constant.ChannelTypeOpenAI, source: "estimated", charge: 19800, cost: 11000, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[]}\n\n"},
 		{name: "OpenAI fixed cancellation refunds", provider: constant.ChannelTypeOpenAI, expression: `tier("request",fixed(0.01))`, source: "upstream", cost: 20000, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: {\"choices\":[]}\n\n"},
 		{name: "OpenAI", provider: constant.ChannelTypeOpenAI, source: "upstream", charge: 36000, cost: 20000, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: {\"choices\":[]}\n\n"},
@@ -4126,6 +4128,11 @@ func TestTextGatewayProcurementEvaluationCannotHoldFailedDeliveryFunds(t *testin
 	record, err := model.GetGatewayRequest(t.Context(), id, fixture.user.Id)
 	require.NoError(t, err)
 	assert.Zero(t, record.Receivable.Nanos)
+	assert.False(t, record.SalePending, "a failed delivery has a known zero charge even when procurement is unresolved")
+	adminAttempts := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests/"+id+"/attempts", "")
+	require.True(t, adminAttempts.Success, adminAttempts.Message)
+	adminAttempt := adminAttempts.Data["items"].([]any)[0].(map[string]any)
+	assert.Equal(t, true, adminAttempt["cost_pending"])
 	var entries []model.LedgerEntry
 	require.NoError(t, model.DB.Where("request_id = ?", id).Find(&entries).Error)
 	require.Len(t, entries, 2)
@@ -4142,7 +4149,7 @@ func TestTextGatewayEvaluationFailureRetainsPendingAccounting(t *testing.T) {
 		reservation             int64
 	}{
 		{"mixed pricing condition failure", model.PriceOwnerOffering, `(len == 9 || 1 / (len - 10) > 0) ? tier("request",fixed(0.01)) : tier("tokens",p + c)`, 9000000},
-		{"sale overflow", model.PriceOwnerOffering, `(header("Content-Type") == "application/json" && len != 9) ? tier("overflow",p * 1000000000000000 + c * 4) : tier("base",p * 2 + c * 4)`, 73800},
+		{"sale overflow", model.PriceOwnerOffering, `(header("Content-Type") == "application/json" && len != 9) ? tier("overflow",p * (param("rate") ?? 1) + c * 10000000000000000) : tier("base",p * 2 + c * 4)`, 73800},
 		{"sale evaluation", model.PriceOwnerOffering, `len == 9 ? tier("base",p * 2 + c * 4) : tier("invalid",p / (len - 10))`, 73800},
 		{"purchase overflow", model.PriceOwnerChannel, `len == 9 ? tier("base",p + c * 2) : tier("overflow",p * 1000000000000000 + c * 4)`, 73800},
 		{"purchase evaluation", model.PriceOwnerChannel, `len == 9 ? tier("base",p + c * 2) : tier("invalid",p / (len - 10))`, 73800},
@@ -4163,7 +4170,7 @@ func TestTextGatewayEvaluationFailureRetainsPendingAccounting(t *testing.T) {
 			healthy := model.GatewayRequest{ID: "zz-healthy-pending", UserID: fixture.user.Id, SaleFXRate: "1", SaleCurrency: "USD", Receivable: money.Amount{Currency: "USD"}, Status: "failed"}
 			zero := money.Amount{Currency: "USD"}
 			require.NoError(t, model.ReserveGateway(&healthy, zero, zero))
-			body := `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`
+			body := `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"rate":2}`
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
 			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 			id := response.Header().Get(common.RequestIdKey)
@@ -4188,6 +4195,7 @@ func TestTextGatewayEvaluationFailureRetainsPendingAccounting(t *testing.T) {
 				conditions, ok := trace["conditions"].([]any)
 				require.True(t, ok)
 				assert.Contains(t, conditions, map[string]any{"cond": `header("Content-Type") == "application/json"`, "matched": true})
+				assert.Equal(t, "2500000000000001/50000", trace["unrounded_amount"], "the exact failed amount must retain the numeric rate without persisting the request")
 			}
 			view := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests?status=settlement_pending", "")
 			require.True(t, view.Success, view.Message)
@@ -4197,6 +4205,39 @@ func TestTextGatewayEvaluationFailureRetainsPendingAccounting(t *testing.T) {
 			assert.Equal(t, id, item["id"])
 			assert.Equal(t, "settlement_pending", item["status"])
 			assert.Equal(t, "billing_evaluation_failed", item["error_code"])
+			if test.owner == model.PriceOwnerOffering {
+				assert.Equal(t, true, item["sale_pending"])
+			} else {
+				assert.NotEqual(t, true, item["sale_pending"])
+			}
+			adminAttempts := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests/"+id+"/attempts", "")
+			require.True(t, adminAttempts.Success, adminAttempts.Message)
+			adminAttempt := adminAttempts.Data["items"].([]any)[0].(map[string]any)
+			if test.owner == model.PriceOwnerChannel {
+				assert.Equal(t, true, adminAttempt["cost_pending"])
+			} else {
+				assert.NotEqual(t, true, adminAttempt["cost_pending"])
+			}
+			selfRequests := walletAPIRequest(t, fixture.engine, fixture.userPAT, http.MethodGet, "/api/requests/self?status=settlement_pending", "")
+			require.True(t, selfRequests.Success, selfRequests.Message)
+			selfRequest := selfRequests.Data["items"].([]any)[0].(map[string]any)
+			assert.Equal(t, item["sale_pending"], selfRequest["sale_pending"])
+			assert.NotContains(t, selfRequest, "cost_pending")
+			query := fmt.Sprintf("status=settlement_pending&token_id=%d&model_offering_id=%d&started_after=%d&started_before=%d", fixture.token.Id, fixture.offering.ID, clock.Now().UnixMilli(), clock.Now().UnixMilli())
+			filtered := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests?"+query, "")
+			require.True(t, filtered.Success, filtered.Message)
+			assert.EqualValues(t, 1, filtered.Data["total"])
+			for _, query := range []string{
+				"status=success",
+				fmt.Sprintf("token_id=%d", fixture.token.Id+1),
+				fmt.Sprintf("model_offering_id=%d", fixture.offering.ID+1),
+				fmt.Sprintf("started_after=%d", clock.Now().UnixMilli()+1),
+				fmt.Sprintf("started_before=%d", clock.Now().UnixMilli()-1),
+			} {
+				filtered := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests?"+query, "")
+				require.True(t, filtered.Success, filtered.Message)
+				assert.Zero(t, filtered.Data["total"], query)
+			}
 			requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
 			require.NoError(t, err)
 			require.EqualValues(t, 1, total)
@@ -4239,6 +4280,7 @@ func TestTextGatewayEvaluationFailureRetainsPendingAccounting(t *testing.T) {
 			require.True(t, self.Success, self.Message)
 			selfAttempt := self.Data["items"].([]any)[0].(map[string]any)
 			assert.NotContains(t, selfAttempt, "cost")
+			assert.NotContains(t, selfAttempt, "cost_pending")
 			assert.NotContains(t, selfAttempt, "purchase_expression")
 			other := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "log:read")
 			denied := adminSecurityRequest(fixture.engine, other, http.MethodGet, "/api/requests/self/"+id+"/attempts", "")
@@ -4252,10 +4294,25 @@ func TestTextGatewayEvaluationFailureRetainsPendingAccounting(t *testing.T) {
 				assert.Zero(t, completed)
 				assert.Error(t, err, "unresolved evaluations must remain visible to the recovery operator")
 			}
+			count := 2
+			if test.owner == model.PriceOwnerChannel {
+				count = 3
+			}
+			firstPage := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests?page=1&page_size=1", "")
+			require.True(t, firstPage.Success, firstPage.Message)
+			assert.EqualValues(t, count, firstPage.Data["total"])
+			require.Len(t, firstPage.Data["items"].([]any), 1)
+			lastPage := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/requests?page=%d&page_size=1", count), "")
+			require.True(t, lastPage.Success, lastPage.Message)
+			assert.EqualValues(t, count, lastPage.Data["total"])
+			require.Len(t, lastPage.Data["items"].([]any), 1)
+			assert.Equal(t, healthy.ID, lastPage.Data["items"].([]any)[0].(map[string]any)["id"])
 			var postings []model.LedgerEntry
 			require.NoError(t, model.DB.Where("request_id = ?", id).Order("id").Find(&postings).Error)
 			if test.owner == model.PriceOwnerOffering {
-				require.Len(t, postings, 1)
+				require.Len(t, postings, 2, "known Provider costs must be posted even while the sale needs reconciliation")
+				assert.Equal(t, model.LedgerAccountProviderPayable, postings[1].AccountType)
+				assert.Equal(t, int64(20000), postings[1].Amount.Nanos)
 			} else {
 				require.Len(t, postings, 4)
 			}

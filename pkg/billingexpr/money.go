@@ -52,12 +52,14 @@ type MoneyConditionTrace struct {
 // MoneyTraceResult contains billing metadata without request bodies or headers.
 // FixedPrice is present even for an explicitly free request-priced leaf.
 type MoneyTraceResult struct {
-	Conditions   []MoneyConditionTrace   `json:"conditions,omitempty"`
-	ImageCount   *int                    `json:"image_count,omitempty"`
-	BillingUnit  BillingUnit             `json:"billing_unit"`
-	FixedPrice   *string                 `json:"fixed_price,omitempty"`
-	MatchedTier  string                  `json:"matched_tier"`
-	RequestRules []MoneyRequestRuleTrace `json:"request_rules,omitempty"`
+	Currency        money.Currency          `json:"currency,omitempty"`
+	UnroundedAmount string                  `json:"unrounded_amount,omitempty"`
+	Conditions      []MoneyConditionTrace   `json:"conditions,omitempty"`
+	ImageCount      *int                    `json:"image_count,omitempty"`
+	BillingUnit     BillingUnit             `json:"billing_unit"`
+	FixedPrice      *string                 `json:"fixed_price,omitempty"`
+	MatchedTier     string                  `json:"matched_tier"`
+	RequestRules    []MoneyRequestRuleTrace `json:"request_rules,omitempty"`
 }
 
 // MoneyUsedVars returns source identifiers for exact token normalization. It
@@ -75,7 +77,7 @@ func MoneyUsedVars(expression string) (map[string]bool, error) {
 // per million tokens; fixed prices are per request. It never evaluates a price
 // with RunExpr or converts through legacy quota units.
 func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) (money.Value, MoneyTraceResult, error) {
-	trace := MoneyTraceResult{BillingUnit: BillingUnitToken}
+	trace := MoneyTraceResult{BillingUnit: BillingUnitToken, Currency: currency}
 	// Reuse the public language's grammar and diagnostics, but never execute its
 	// floating-point program to calculate currency.
 	entry, err := compileEntryFromCacheByHash(expression, ExprHashString(expression))
@@ -196,7 +198,9 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 	if number.Sign() < 0 {
 		return money.Value{}, trace, fmt.Errorf("expr result must be non-negative")
 	}
-	amount, err := money.NewRationalValue(new(big.Rat).Quo(number, big.NewRat(1_000_000, 1)), currency)
+	unrounded := new(big.Rat).Quo(number, big.NewRat(1_000_000, 1))
+	trace.UnroundedAmount = unrounded.RatString()
+	amount, err := money.NewRationalValue(unrounded, currency)
 	return amount, trace, err
 }
 

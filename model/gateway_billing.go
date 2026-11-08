@@ -48,11 +48,19 @@ type GatewaySettlement struct {
 	PostedSaleSource     money.Amount                            `json:"posted_sale_source"`
 }
 
-// HasGatewayEvaluationPending reports unresolved monetary evaluations. Credits
+func gatewayPendingAccounting(db *gorm.DB) *gorm.DB {
+	return db.Model(&GatewayBilling{}).Where(`"phase" IN ?`, []string{"settlement_pending", "evaluation_failed"})
+}
+
+func gatewayPendingSales(db *gorm.DB, userID int) *gorm.DB {
+	return gatewayPendingAccounting(db).Where(`"user_id" = ? AND ("phase" = ? OR NULLIF("settlement", '')::jsonb ->> 'sale_evaluation_failed' = 'true')`, userID, "settlement_pending")
+}
+
+// HasPendingGatewaySale reports sales awaiting valuation or posting. Credits
 // cannot make their reserved funds safe to spend before reconciliation.
-func HasGatewayEvaluationPending(ctx context.Context, userID int) (bool, error) {
+func HasPendingGatewaySale(ctx context.Context, userID int) (bool, error) {
 	var count int64
-	err := DB.WithContext(ctx).Model(&GatewayBilling{}).Where(`user_id = ? AND phase = ? AND NULLIF("settlement", '')::jsonb ->> 'sale_evaluation_failed' = 'true'`, userID, "evaluation_failed").Count(&count).Error
+	err := gatewayPendingSales(DB.WithContext(ctx), userID).Count(&count).Error
 	return count > 0, err
 }
 
@@ -84,7 +92,7 @@ func ReserveGateway(request *GatewayRequest, reservation, source money.Amount) e
 		}
 		wallet := wallets[account]
 		var unresolved int64
-		if err := tx.Model(&GatewayBilling{}).Where(`user_id = ? AND phase = ? AND NULLIF("settlement", '')::jsonb ->> 'sale_evaluation_failed' = 'true'`, request.UserID, "evaluation_failed").Count(&unresolved).Error; err != nil {
+		if err := gatewayPendingSales(tx, request.UserID).Count(&unresolved).Error; err != nil {
 			return err
 		}
 		if unresolved > 0 || wallet.RequestsPaused || wallets[UserReceivableAccount(request.UserID)].Balance.Nanos > 0 || wallet.Balance.Nanos < reservation.Nanos {
@@ -141,11 +149,7 @@ func PrepareGatewaySettlement(settlement GatewaySettlement) error {
 		if row.Phase != "reserved" {
 			return nil
 		}
-		phase := "settlement_pending"
-		if settlement.SaleEvaluationFailed {
-			phase = "evaluation_failed"
-		}
-		return tx.Model(&row).Updates(map[string]any{"settlement": string(encoded), "phase": phase, "updated_at": clock.Now().UnixMilli()}).Error
+		return tx.Model(&row).Updates(map[string]any{"settlement": string(encoded), "phase": "settlement_pending", "updated_at": clock.Now().UnixMilli()}).Error
 	})
 	if err != nil {
 		return err
@@ -178,7 +182,7 @@ func SettleGateway(requestID string) (*GatewayRequest, error) {
 			return err
 		}
 		request := &intent.Request
-		if request.ID != row.RequestID || request.UserID != row.UserID || request.Receivable.Currency != SettlementCurrency() || request.Receivable.Nanos < 0 {
+		if request.ID != row.RequestID || request.UserID != row.UserID || request.Receivable.Currency != SettlementCurrency() || request.Receivable.Nanos < 0 || intent.SaleEvaluationFailed && (!request.SalePending || request.Receivable.Nanos != 0) {
 			return ErrLedgerInvalidEntry
 		}
 		var original GatewayRequest
@@ -207,9 +211,12 @@ func SettleGateway(requestID string) (*GatewayRequest, error) {
 		if err != nil {
 			return err
 		}
-		available, err := wallets[account].Balance.Add(row.Reservation)
-		if err != nil {
-			return err
+		available := money.Amount{Currency: SettlementCurrency()}
+		if !intent.SaleEvaluationFailed {
+			available, err = wallets[account].Balance.Add(row.Reservation)
+			if err != nil {
+				return err
+			}
 		}
 		if intent.ReceivableDue.Currency == "" {
 			intent.ReceivableDue = request.Receivable
@@ -242,7 +249,7 @@ func SettleGateway(requestID string) (*GatewayRequest, error) {
 			}
 		}
 		postings := []LedgerPosting{}
-		if row.Reservation.Nanos > 0 {
+		if row.Reservation.Nanos > 0 && !intent.SaleEvaluationFailed {
 			postings = append(postings, LedgerPosting{Account: account, Type: LedgerEntryPreConsumeRelease, Amount: row.Reservation, RequestId: requestID, IdempotencyKey: "gateway:" + requestID + ":release"})
 		}
 		if collected > 0 {

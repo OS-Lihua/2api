@@ -162,7 +162,7 @@ func GetUserWallet(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	pending, err := model.HasGatewayEvaluationPending(c.Request.Context(), user.Id)
+	pending, err := model.HasPendingGatewaySale(c.Request.Context(), user.Id)
 	if err != nil {
 		common.ApiError(c, err)
 		return
