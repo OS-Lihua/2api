@@ -318,9 +318,16 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		if ln == "" {
 			continue
 		}
+		if info.ResponseFacts != nil {
+			info.ResponseFacts.RecordNativeUsage(knownUsage, []byte(ln), "prompt_eval_count", "eval_count")
+			ln = string(relaycommon.SanitizeNativeUsage([]byte(ln), ""))
+		}
 		var ck ollamaChatStreamChunk
 		if err := common.Unmarshal([]byte(ln), &ck); err != nil {
 			if len(lines) == 1 {
+				if readErr != nil {
+					return knownUsage, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
+				}
 				return knownUsage, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 			}
 			continue
@@ -354,7 +361,13 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 
 	if !parsedAny {
 		var single ollamaChatStreamChunk
+		if info.ResponseFacts != nil {
+			body = relaycommon.SanitizeNativeUsage(body, "")
+		}
 		if err := common.Unmarshal(body, &single); err != nil {
+			if readErr != nil {
+				return knownUsage, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
+			}
 			return knownUsage, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 		}
 		lastChunk = single

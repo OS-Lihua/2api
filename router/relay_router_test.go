@@ -4412,6 +4412,12 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 		charge, cost       int64
 		purchase           *model.GatewayUsage
 	}{
+		{name: "Ollama JSON bad output preserves generated estimate", provider: constant.ChannelTypeOllama, body: `{"message":{"role":"assistant","content":"Hello"},"done":true,"done_reason":"stop","prompt_eval_count":1000,"eval_count":{}}`, source: "estimated", prompt: 1000, completion: 1, charge: 1803600, cost: 1002000},
+		{name: "Cohere malformed content preserves counters", stream: true, body: "{\"text\":{},\"response\":{\"meta\":{\"billed_units\":{\"input_tokens\":1000,\"output_tokens\":100}}}}\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1200000},
+		{name: "Dify malformed status preserves counters", provider: constant.ChannelTypeDify, stream: true, body: "data: {\"event\":\"message_end\",\"status\":{},\"metadata\":{\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":100}}}\n\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1200000},
+		{name: "Baidu malformed terminal preserves counters", provider: constant.ChannelTypeBaidu, key: "malformed-baidu|test-secret", stream: true, body: "data: {\"is_end\":{},\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":100}}\n\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1200000},
+		{name: "Tencent malformed choices preserves counters", provider: constant.ChannelTypeTencent, key: "1|test-id|test-secret", stream: true, body: "data: {\"Choices\":{},\"Usage\":{\"PromptTokens\":1000,\"CompletionTokens\":100}}\n\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1200000},
+		{name: "Coze malformed completion preserves counters", provider: constant.ChannelTypeCoze, stream: true, body: "event: conversation.chat.completed\ndata: {\"id\":1,\"usage\":{\"input_count\":1000,\"output_count\":100}}\n\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1200000},
 		{name: "Ollama stream bad output preserves input", provider: constant.ChannelTypeOllama, stream: true, body: "{\"message\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"prompt_eval_count\":1000,\"eval_count\":{},\"done\":true,\"done_reason\":\"stop\"}\n", source: "estimated", prompt: 1000, completion: 1, charge: 1803600, cost: 1002000},
 		{name: "Zhipu stream bad total preserves bases", provider: constant.ChannelTypeZhipu, key: "test.secret", stream: true, body: "data:Hello\nmeta:{\"task_status\":\"SUCCESS\",\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":100,\"total_tokens\":{}}}\n", source: "upstream", prompt: 1000, completion: 100, charge: 2160000, cost: 1200000},
 		{name: "Coze completed polling read error keeps counters", provider: constant.ChannelTypeCoze, shortCozePoll: true, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 20000, body: `{}`},
@@ -7966,44 +7972,116 @@ func TestTextGatewayBedrockClaudeUsesFinalWireForPurchase(t *testing.T) {
 	assert.Equal(t, int64(20000000), attempts[0].Cost.Nanos)
 }
 
-func TestTextGatewayPurchaseSnapshotFollowsCredentialWait(t *testing.T) {
+func TestTextGatewayVertexClaudePreservesActualWire(t *testing.T) {
+	calls := 0
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var body map[string]json.RawMessage
+		require.NoError(t, common.DecodeJson(r.Body, &body))
+		assert.JSONEq(t, `"vertex-2023-10-16"`, string(body["anthropic_version"]))
+		assert.Contains(t, body, "output_format")
+		assert.JSONEq(t, `{"user_id":"native-user"}`, string(body["metadata"]))
+		assert.NotContains(t, body, "model")
+		assert.JSONEq(t, `32`, string(body["max_tokens"]))
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`)
+		_, _ = io.WriteString(w, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`)
 	})
-	started := clock.Now()
-	later := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("later",p * 3 + c)`, EffectiveAt: started.Add(5 * time.Second).Unix()}
-	require.NoError(t, model.CreatePriceVersion(t.Context(), later, fixture.sale.CreatedBy))
-	locked := model.DB.Begin()
-	require.NoError(t, locked.Error)
-	t.Cleanup(func() { locked.Rollback() })
+	private, err := rsa.GenerateKey(cryptorand.Reader, 2048)
+	require.NoError(t, err)
+	der, err := x509.MarshalPKCS8PrivateKey(private)
+	require.NoError(t, err)
+	credentials, err := common.Marshal(map[string]string{"project_id": "gw36-native-vertex", "client_email": "vertex@example.invalid", "private_key": string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})), "private_key_id": "gw36-native"})
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeVertexAi, "key": string(credentials), "other": `{"default":"us-central1"}`}).Error)
+	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": string(protocol.AnthropicMessages), "upstream_model_name": "claude-3-5-sonnet-20240620"}).Error)
+	caps := capability.Set{Features: []capability.Feature{capability.StructuredOutput}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{MaxOutputTokens: common.GetPointer(int64(32))}}
+	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
 	var provider model.Provider
-	require.NoError(t, locked.Clauses(clause.Locking{Strength: "UPDATE"}).First(&provider, fixture.channel.ProviderID).Error)
-	var response *httptest.ResponseRecorder
-	done := make(chan struct{})
-	go func() {
-		response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
-		close(done)
-	}()
-	require.Eventually(t, func() bool {
-		var waiting bool
-		err := model.DB.Raw(`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid())`).Scan(&waiting).Error
-		return err == nil && waiting
-	}, 10*time.Second, 10*time.Millisecond, "request must reach the real Provider row lock")
-	fixture.fake.Advance(10 * time.Second)
-	require.NoError(t, locked.Commit().Error)
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("request did not finish after credential unlock")
-	}
+	require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
+	endpoint, err := url.Parse(*provider.BaseURL)
+	require.NoError(t, err)
+	client := service.GetHttpClient()
+	transport := client.Transport
+	t.Cleanup(func() { client.Transport = transport })
+	client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Host == "www.googleapis.com" && request.URL.Path == "/oauth2/v4/token" {
+			return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"access_token":"fixture-only-vertex","expires_in":3600}`))}, nil
+		}
+		copied := request.Clone(request.Context())
+		target := *request.URL
+		target.Scheme, target.Host = endpoint.Scheme, endpoint.Host
+		copied.URL, copied.Host = &target, endpoint.Host
+		return transport.RoundTrip(copied)
+	})
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"metadata":{"user_id":"native-user"},"output_format":{"type":"json_schema","schema":{"type":"object"}}}`)
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Equal(t, 1, calls)
 	attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, total)
-	assert.Equal(t, later.ID, attempts[0].PurchasePriceVersionID)
-	assert.Equal(t, started.Add(10*time.Second).UnixMilli(), attempts[0].StartedAt)
-	assert.Equal(t, int64(35000), attempts[0].Cost.Nanos)
+	assert.Equal(t, int64(20000), attempts[0].Cost.Nanos)
+}
+
+func TestTextGatewayPurchaseSnapshotFollowsCredentialWait(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		total  int
+		wait   time.Duration
+		status int
+	}{{"fresh price after wait", 90, 10 * time.Second, http.StatusOK}, {"remaining budget below five seconds", 10, 7 * time.Second, http.StatusServiceUnavailable}} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`)
+			})
+			require.NoError(t, model.UpdateOption("GatewayTotalFirstByteSeconds", strconv.Itoa(test.total)))
+			walletBefore, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			started := clock.Now()
+			later := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("later",p * 3 + c)`, EffectiveAt: started.Add(5 * time.Second).Unix()}
+			require.NoError(t, model.CreatePriceVersion(t.Context(), later, fixture.sale.CreatedBy))
+			locked := model.DB.Begin()
+			require.NoError(t, locked.Error)
+			t.Cleanup(func() { locked.Rollback() })
+			var provider model.Provider
+			require.NoError(t, locked.Clauses(clause.Locking{Strength: "UPDATE"}).First(&provider, fixture.channel.ProviderID).Error)
+			var response *httptest.ResponseRecorder
+			done := make(chan struct{})
+			go func() {
+				response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+				close(done)
+			}()
+			require.Eventually(t, func() bool {
+				var waiting bool
+				err := model.DB.Raw(`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid())`).Scan(&waiting).Error
+				return err == nil && waiting
+			}, 10*time.Second, 10*time.Millisecond, "request must reach the real Provider row lock")
+			fixture.fake.Advance(test.wait)
+			require.NoError(t, locked.Commit().Error)
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("request did not finish after credential unlock")
+			}
+			require.Equal(t, test.status, response.Code, response.Body.String())
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+			require.NoError(t, err)
+			if test.status != http.StatusOK {
+				assert.Zero(t, calls)
+				assert.Zero(t, total)
+				after, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, walletBefore.Balance, after.Balance)
+				return
+			}
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, later.ID, attempts[0].PurchasePriceVersionID)
+			assert.Equal(t, started.Add(10*time.Second).UnixMilli(), attempts[0].StartedAt)
+			assert.Equal(t, int64(35000), attempts[0].Cost.Nanos)
+		})
+	}
 }
 
 func TestTextGatewayNativeFailuresRetainClassificationAndCosts(t *testing.T) {
@@ -8017,6 +8095,12 @@ func TestTextGatewayNativeFailuresRetainClassificationAndCosts(t *testing.T) {
 	}{
 		{"Nova truncated account quota", constant.ChannelTypeAws, "test-access|test-secret|us-east-1", "amazon.nova-lite-v1:0", "", `{"message":"Account quota exceeded"}`, "account_quota", true, http.StatusBadRequest, 0},
 		{"Claude truncated account quota", constant.ChannelTypeAws, "test-access|test-secret|us-east-1", "anthropic.claude-3-haiku-20240307-v1:0", string(protocol.AnthropicMessages), `{"message":"Account quota exceeded"}`, "account_quota", true, http.StatusBadRequest, 0},
+		{"Dify truncated JSON transport", constant.ChannelTypeDify, "", "", "", `{"metadata":{"usage":{"prompt_tokens":10,"completion_tokens":5}},"answer":"Hel`, "connection_failed", true, http.StatusOK, 20000},
+		{"Baidu truncated JSON transport", constant.ChannelTypeBaidu, "truncated-baidu|test-secret", "", "", `{"usage":{"prompt_tokens":10,"completion_tokens":5},"result":"Hel`, "connection_failed", true, http.StatusOK, 20000},
+		{"Tencent truncated JSON transport", constant.ChannelTypeTencent, "1|test-id|test-secret", "", "", `{"Response":{"Usage":{"PromptTokens":10,"CompletionTokens":5},"Choices":[`, "connection_failed", true, http.StatusOK, 20000},
+		{"Zhipu truncated JSON transport", constant.ChannelTypeZhipu, "test.secret", "", "", `{"success":true,"data":{"usage":{"prompt_tokens":10,"completion_tokens":5},"choices":[`, "connection_failed", true, http.StatusOK, 20000},
+		{"Ollama truncated JSON transport", constant.ChannelTypeOllama, "", "", "", `{"prompt_eval_count":10,"eval_count":5,"message":{"content":"Hel`, "connection_failed", true, http.StatusOK, 20000},
+		{"PaLM truncated JSON transport", constant.ChannelTypePaLM, "test-palm", "", "", `{"candidates":[{"content":"Hel`, "connection_failed", true, http.StatusOK, 0},
 		{"Dify transport", constant.ChannelTypeDify, "", "", "", `{"answer":"Hello","metadata":{"usage":{"prompt_tokens":10,"completion_tokens":5}}}`, "connection_failed", true, http.StatusOK, 20000},
 		{"Baidu transport", constant.ChannelTypeBaidu, "failure-baidu|test-secret", "", "", `{"result":"Hello","usage":{"prompt_tokens":10,"completion_tokens":5}}`, "connection_failed", true, http.StatusOK, 20000},
 		{"Nova account quota", constant.ChannelTypeAws, "test-access|test-secret|us-east-1", "amazon.nova-lite-v1:0", "", `{"message":"Account quota exceeded"}`, "account_quota", false, http.StatusBadRequest, 0},
@@ -8045,7 +8129,7 @@ func TestTextGatewayNativeFailuresRetainClassificationAndCosts(t *testing.T) {
 			}
 			if test.provider == constant.ChannelTypeBaidu {
 				routeBaiduRequestsToFixture(t, fixture)
-			} else if test.provider == constant.ChannelTypeAws {
+			} else if test.provider == constant.ChannelTypeAws || test.provider == constant.ChannelTypePaLM {
 				routeNativeRequestsToFixture(t, fixture)
 			}
 			addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
@@ -8059,7 +8143,11 @@ func TestTextGatewayNativeFailuresRetainClassificationAndCosts(t *testing.T) {
 			if test.protocol == string(protocol.AnthropicMessages) {
 				path = "/v1/messages"
 			}
-			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			requestBody := `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`
+			if test.provider == constant.ChannelTypePaLM {
+				requestBody = `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}]}`
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, requestBody)
 			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 			assert.Contains(t, response.Body.String(), "Recovered")
 			assert.Equal(t, 1, firstCalls)

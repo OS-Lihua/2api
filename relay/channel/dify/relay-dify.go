@@ -257,6 +257,7 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			return
 		}
 		if info.ResponseFacts != nil {
+			info.ResponseFacts.RecordNativeUsage(usage, []byte(data), "metadata.usage.prompt_tokens", "metadata.usage.completion_tokens")
 			data = string(relaycommon.SanitizeNativeUsage([]byte(data), "metadata.usage"))
 		}
 		var difyResponse DifyChunkChatCompletionResponse
@@ -369,6 +370,9 @@ func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 	}
 	err := common.Unmarshal(responseBody, &difyResponse)
 	if err != nil {
+		if readErr != nil {
+			return knownUsage, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
+		}
 		return knownUsage, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	if info.ResponseFacts != nil {

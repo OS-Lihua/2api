@@ -195,6 +195,7 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 
 func recordCozeStreamUsage(info *relaycommon.RelayInfo, usage *dto.Usage, data string) error {
 	if info.ResponseFacts != nil {
+		info.ResponseFacts.RecordNativeUsage(usage, []byte(data), "usage.input_count", "usage.output_count")
 		data = string(relaycommon.SanitizeNativeUsage([]byte(data), "usage"))
 	}
 	var chatData CozeChatResponseData

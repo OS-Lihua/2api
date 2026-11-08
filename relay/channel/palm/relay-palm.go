@@ -84,6 +84,9 @@ func palmHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 	var palmResponse PaLMChatResponse
 	err := common.Unmarshal(responseBody, &palmResponse)
 	if err != nil {
+		if readErr != nil {
+			return nil, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
+		}
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	if palmResponse.Error.Code != 0 || len(palmResponse.Candidates) == 0 {

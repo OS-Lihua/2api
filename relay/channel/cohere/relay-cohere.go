@@ -123,6 +123,7 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		info.SetFirstResponseTime()
 		body := scanner.Bytes()
 		if info.ResponseFacts != nil {
+			info.ResponseFacts.RecordNativeUsage(usage, body, "response.meta.billed_units.input_tokens", "response.meta.billed_units.output_tokens")
 			body = relaycommon.SanitizeNativeUsage(body, "response.meta.billed_units")
 		}
 		var cohereResp CohereResponse

@@ -364,6 +364,9 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		} else if err := selection.Provider.ValidateRouteKey(ctx, info.ApiKey, info.ChannelMultiKeyIndex); err != nil {
 			return nil, err
 		}
+		if _, err := budget.Start(); err != nil {
+			return nil, err
+		}
 		contactedProvider = true
 		return ctx, nil
 	}
@@ -694,7 +697,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		StartedAt: attemptStart.UnixMilli(), FailoverDecision: "stop", FailoverReason: "single_attempt", CircuitAction: "none", RouteDiagnostics: selection.Diagnostics,
 		UsageSource: "none", PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, Cost: money.Amount{Currency: purchase.Currency}, AccountingFXRate: purchaseRate,
 		ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, ConversionLosses: selection.ConversionLosses}
-	if attemptContext.Err() != nil {
+	if _, err := budget.Start(); err != nil {
 		attempt = nil
 		run.fail(c, http.StatusServiceUnavailable, "budget_exhausted", "Upstream request failed")
 		return

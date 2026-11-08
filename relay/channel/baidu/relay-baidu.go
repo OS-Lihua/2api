@@ -136,6 +136,7 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 			return
 		}
 		if info.ResponseFacts != nil {
+			info.ResponseFacts.RecordNativeUsage(usage, []byte(data), "usage.prompt_tokens", "usage.completion_tokens")
 			data = string(relaycommon.SanitizeNativeUsage([]byte(data), "usage"))
 		}
 		var baiduResponse BaiduChatStreamResponse
@@ -200,6 +201,9 @@ func baiduHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respon
 	}
 	err := common.Unmarshal(responseBody, &baiduResponse)
 	if err != nil {
+		if readErr != nil {
+			return types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed), knownUsage
+		}
 		return types.NewError(err, types.ErrorCodeBadResponseBody), knownUsage
 	}
 	if info.ResponseFacts != nil {

@@ -115,6 +115,7 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 			if !event.HasData {
 				continue
 			}
+			info.ResponseFacts.RecordNativeUsage(usage, []byte(event.Data), "Usage.PromptTokens", "Usage.CompletionTokens")
 			data = string(relaycommon.SanitizeNativeUsage([]byte(event.Data), "Usage"))
 		} else {
 			if len(data) < 5 || !strings.HasPrefix(data, "data:") {
@@ -195,6 +196,9 @@ func tencentHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Resp
 	}
 	err := common.Unmarshal(responseBody, &tencentSb)
 	if err != nil {
+		if readErr != nil {
+			return knownUsage, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
+		}
 		return knownUsage, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	fullTextResponse := responseTencent2OpenAI(&tencentSb.Response)

@@ -220,6 +220,9 @@ func zhipuHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respon
 	}
 	err := common.Unmarshal(responseBody, &zhipuResponse)
 	if err != nil {
+		if readErr != nil {
+			return knownUsage, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
+		}
 		return knownUsage, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	if info.ResponseFacts != nil {
