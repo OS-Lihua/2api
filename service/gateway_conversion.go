@@ -165,6 +165,14 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 			}
 			if block.nested && (block.Type == "image" || block.Type == "document") {
 				source := block.Source
+				if block.Type == "document" && source.Type == "text" {
+					text, ok := source.Data.(string)
+					if !ok {
+						return nil, fmt.Errorf("tool result document text cannot be represented for validation")
+					}
+					referencedMedia = append(referencedMedia, dto.MediaContent{Type: dto.ContentTypeText, Text: text, CacheControl: block.CacheControl})
+					continue
+				}
 				reference := source.Url
 				if source.Type == "file" && source.FileID != nil {
 					reference = *source.FileID

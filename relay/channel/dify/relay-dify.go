@@ -310,6 +310,11 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 				nodeToken += 1
 			}
 		}
+		if info.ResponseFacts != nil && len(openaiResponse.Choices) > 0 {
+			text := openaiResponse.Choices[0].Delta.GetContentString() + openaiResponse.Choices[0].Delta.GetReasoningContent()
+			info.ResponseFacts.SourceGeneratedText += text
+			info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || text != ""
+		}
 		err := helper.ObjectData(c, openaiResponse)
 		if err != nil && info.ResponseFacts != nil {
 			info.ResponseFacts.DownstreamWriteFailed = true

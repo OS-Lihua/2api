@@ -3509,6 +3509,9 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 		{name: "Tencent TokenHub JSON", provider: constant.ChannelTypeTencent, body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, source: "upstream", prompt: 10, completion: 5, charge: 36000, cost: 20000},
 		{name: "Coze JSON", provider: constant.ChannelTypeCoze, body: `{"code":0,"data":[{"type":"answer","role":"assistant","content":"Hello"}]}`, source: "upstream", prompt: 10, completion: 5, charge: 36000, cost: 20000},
 		{name: "Coze stream", provider: constant.ChannelTypeCoze, stream: true, body: "event: conversation.message.delta\ndata: {\"content\":\"Hello\"}\n\nevent: conversation.chat.completed\ndata: {\"usage\":{\"input_count\":10,\"output_count\":5,\"token_count\":15}}\n\n", source: "upstream", prompt: 10, completion: 5, charge: 36000, cost: 20000},
+		{name: "Coze unfinished delta retains source prefix", provider: constant.ChannelTypeCoze, stream: true, status: "partial", body: "event: conversation.message.delta\ndata: {\"type\":\"answer\",\"content_type\":\"text\",\"content\":\"Hello\"}\n\nevent: conversation.message.delta\ndata: {\"type\":\"answer\",\"content_type\":\"text\",\"content\":\" world\"}", source: "estimated", prompt: 9, completion: 1, charge: 19800, cost: 13000, purchase: &model.GatewayUsage{PromptTokens: 9, CompletionTokens: 2}},
+		{name: "Dify unfinished delta retains source prefix", provider: constant.ChannelTypeDify, stream: true, status: "partial", body: "data: {\"event\":\"message\",\"answer\":\"Hello\"}\n\ndata: {\"event\":\"message\",\"answer\":\" world\"}", source: "estimated", prompt: 13, completion: 1, charge: 27000, cost: 17000, purchase: &model.GatewayUsage{PromptTokens: 13, CompletionTokens: 2}},
+		{name: "Baidu unfinished delta retains source prefix", provider: constant.ChannelTypeBaidu, key: "source-prefix-baidu|test-secret", stream: true, status: "partial", body: "data: {\"result\":\"Hello\",\"is_end\":false}\n\ndata: {\"result\":\" world\",\"is_end\":false}", source: "estimated", prompt: 9, completion: 1, charge: 19800, cost: 13000, purchase: &model.GatewayUsage{PromptTokens: 9, CompletionTokens: 2}},
 		{name: "Nova missing usage", provider: constant.ChannelTypeAws, key: "test-access|test-secret|us-east-1", upstreamModel: "amazon.nova-lite-v1:0", body: `{"output":{"message":{"content":[{"text":"Hello"}]}},"stopReason":"end_turn"}`, source: "estimated", prompt: 9, completion: 1, charge: 19800, cost: 11000},
 		{name: "Nova missing input", provider: constant.ChannelTypeAws, key: "test-access|test-secret|us-east-1", upstreamModel: "amazon.nova-lite-v1:0", body: `{"output":{"message":{"content":[{"text":"Hello"}]}},"usage":{"outputTokens":5},"stopReason":"end_turn"}`, source: "estimated", prompt: 9, completion: 5, charge: 34200, cost: 19000},
 		{name: "Nova stream missing output", provider: constant.ChannelTypeAws, key: "test-access|test-secret|us-east-1", upstreamModel: "amazon.nova-lite-v1:0", stream: true, body: `{"output":{"message":{"content":[{"text":"Hello"}]}},"usage":{"inputTokens":0},"stopReason":"end_turn"}`, source: "estimated", completion: 1, charge: 3600, cost: 2000},
@@ -5815,6 +5818,33 @@ func TestTextGatewayNativeChatFileReferencesStayInValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTextGatewayNativeNestedTextDocumentsRemainText(t *testing.T) {
+	calls := 0
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var sent dto.ClaudeRequest
+		require.NoError(t, common.DecodeJson(r.Body, &sent))
+		require.Len(t, sent.Messages, 2)
+		blocks, err := sent.Messages[1].ParseContent()
+		require.NoError(t, err)
+		require.Len(t, blocks, 1)
+		nested := blocks[0].ParseMediaContent()
+		require.Len(t, nested, 1)
+		require.NotNil(t, nested[0].Source)
+		assert.Equal(t, "document", nested[0].Type)
+		assert.Equal(t, "text", nested[0].Source.Type)
+		assert.Equal(t, "SGVsbG8=", nested[0].Source.Data, "plain-text document data stays literal on the native wire")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`)
+	})
+	require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", protocol.AnthropicMessages).Error)
+	body := `{"model":"gateway-offering","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"inspect","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","source":{"type":"text","media_type":"text/plain","data":"SGVsbG8="}}]}]}],"max_tokens":16}`
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/messages", body)
+	assert.Equal(t, http.StatusOK, response.Code)
+	assert.Equal(t, 1, calls)
+	assert.Contains(t, response.Body.String(), "Hello")
 }
 
 func TestTextGatewayNativeNestedPDFAndMixedImagesKeepMediaFacts(t *testing.T) {
