@@ -5,6 +5,7 @@ import (
 	"math"
 
 	"github.com/expr-lang/expr/ast"
+	"github.com/expr-lang/expr/file"
 )
 
 // UsesFixedPricing includes unselected branches, even when compilation later
@@ -19,11 +20,45 @@ func UsesFixedPricingByHash(expression, hash string) bool {
 	return err == nil && entry.fixedPricing
 }
 
-// UsesOnlyFixedPricing reports whether every pricing leaf is per request,
+// UsesOnlyFixedPricing reports whether every pricing leaf uses fixed(),
 // including branches whose conditions fail or are optimized away.
 func UsesOnlyFixedPricing(expression string) bool {
 	entry, err := compileEntryFromCacheByHash(expression, ExprHashString(expression))
 	return err == nil && entry.fixedOnly
+}
+
+// UsesOnlyFixedRequestPricing excludes image quantity multipliers from fixed
+// pricing, while allowing image_count to select a request-priced branch.
+func UsesOnlyFixedRequestPricing(expression string) bool {
+	entry, err := compileEntryFromCacheByHash(expression, ExprHashString(expression))
+	return err == nil && entry.fixedRequestOnly
+}
+
+// imagePriceMultipliers identifies pricing factors, never condition probes.
+// The value records which operand carries the image quantity.
+func imagePriceMultipliers(node ast.Node) map[file.Location]bool {
+	multipliers := make(map[file.Location]bool)
+	pending := []ast.Node{node}
+	for len(pending) > 0 {
+		part := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		switch part := part.(type) {
+		case *ast.ConditionalNode:
+			pending = append(pending, part.Exp1, part.Exp2)
+		case *ast.BinaryNode:
+			if part.Operator != "*" {
+				continue
+			}
+			if left, ok := part.Left.(*ast.IdentifierNode); ok && left.Value == "image_count" && containsPricingMarker(part.Right) {
+				multipliers[part.Location()] = true
+			}
+			if right, ok := part.Right.(*ast.IdentifierNode); ok && right.Value == "image_count" && containsPricingMarker(part.Left) {
+				multipliers[part.Location()] = false
+			}
+			pending = append(pending, part.Left, part.Right)
+		}
+	}
+	return multipliers
 }
 
 func containsPricingMarker(node ast.Node) bool {

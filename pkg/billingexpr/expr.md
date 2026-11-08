@@ -283,6 +283,15 @@ does not change `RunExpr` or task usage expressions. Audio `ai`/`ao` quantities
 retain their per-million-token semantics; measured audio seconds are normalized
 by the host's existing 1000-tokens-per-minute convention before evaluation.
 
+`MoneyTraceResult.ImageCount` records the image quantity available to the
+expression, including condition probes. `ImageQuantityPriced` separately reports
+whether the executed price multiplied by that quantity; condition-only uses do
+not turn a fixed request fee into a per-image price. The host can waive a failed
+request's evaluated fixed fee without discarding charges for delivered images.
+`UsesOnlyFixedRequestPricing` identifies expressions whose leaves are all fixed
+request fees and have no image quantity factors, so a failed request owes zero
+even when a condition fails before choosing a leaf.
+
 `MoneyInput.Time` freezes all standard time probes for an evaluation. A zero
 value captures `pkg/clock.Now()` once. Empty and invalid timezones use UTC.
 Request bodies and headers stay in the evaluation environment; they are not

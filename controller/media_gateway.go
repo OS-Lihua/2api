@@ -427,6 +427,9 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		if outcome.ErrorStatus >= 400 {
 			status = outcome.ErrorStatus
 		}
+		if status == http.StatusOK && code == "" && outcome.Response == relaycommon.ResponseOutcomeIncomplete && !budget.TimedOut() && parent.Context().Err() == nil && !info.ResponseFacts.DownstreamWriteFailed {
+			code = "stream_interrupted"
+		}
 		transport = transport || outcome.EndReason == relaycommon.StreamEndReasonScannerErr
 	}
 	facts := info.ResponseFacts
@@ -553,7 +556,11 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		source, receivable, trace, priceErr := service.GatewayPrice(run.sale, saleUsage, saleInput, run.started, run.ratio, run.saleFX, saleCount...)
 		trace.MatchedTier = ""
 		run.saleTrace = &trace
-		if attempt.Status != "success" && trace.ImageCount == nil && (trace.BillingUnit == billingexpr.BillingUnitRequest || billingexpr.UsesOnlyFixedPricing(run.sale.Expression)) {
+		fixedRequest := trace.BillingUnit == billingexpr.BillingUnitRequest && !trace.ImageQuantityPriced
+		if trace.UnroundedAmount == "" {
+			fixedRequest = billingexpr.UsesOnlyFixedRequestPricing(run.sale.Expression)
+		}
+		if attempt.Status != "success" && fixedRequest {
 			source, _ = money.ParseValue("0", run.sale.Currency)
 			receivable, _ = money.ParseValue("0", model.SettlementCurrency())
 			priceErr = nil

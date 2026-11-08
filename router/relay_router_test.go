@@ -4494,6 +4494,10 @@ func TestMediaGatewayIncompleteMediaStreamsDoNotChargeFixedRequest(t *testing.T)
 		{"image fixed", protocol.OpenAIImages, `tier("request",fixed(0.01))`},
 		{"speech fixed", protocol.OpenAIAudioSpeech, `tier("request",fixed(0.01))`},
 		{"image failed pricing condition", protocol.OpenAIImages, `(len != 7 || 1 / (len - 7) > 0) ? tier("first",fixed(0.01)) : tier("second",fixed(0.02))`},
+		{"image count in failed condition", protocol.OpenAIImages, `image_count >= 0 && (len != 7 || 1 / (len - 7) > 0) ? tier("first",fixed(0.01)) : tier("second",fixed(0.02))`},
+		{"image count in condition", protocol.OpenAIImages, `image_count > 0 ? tier("first",fixed(0.01)) : tier("second",fixed(0.02))`},
+		{"image count arithmetic in condition", protocol.OpenAIImages, `image_count * 2 > 0 ? tier("first",fixed(0.01)) : tier("second",fixed(0.02))`},
+		{"mixed request and image tiers", protocol.OpenAIImages, `len == 7 ? tier("request",fixed(0.01)) : tier("images",fixed(0.02)) * image_count`},
 	} {
 		kind := tc.kind
 		for _, done := range []bool{false, true} {
@@ -4897,6 +4901,12 @@ func TestMediaGatewayInterruptedSpeechBillsDeliveredAudioAndRetainsProcurement(t
 	require.NoError(t, err)
 	require.EqualValues(t, 1, total)
 	assert.Equal(t, int64(10_000_000), attempts[0].Cost.Nanos)
+	assert.Equal(t, "stream_interrupted", attempts[0].ErrorClass)
+	healthView := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/channels/%d", fixture.channel.ID), "")
+	require.True(t, healthView.Success, healthView.Message)
+	health := healthView.Data["health"].(map[string]any)
+	assert.EqualValues(t, 1, health["samples"])
+	assert.EqualValues(t, 1, health["failures"])
 	assert.Equal(t, int64(1000), attempts[0].Usage.AudioOutputTokens)
 	assert.Equal(t, "upstream", attempts[0].UsageSource)
 	var lifecycle model.GatewayBilling

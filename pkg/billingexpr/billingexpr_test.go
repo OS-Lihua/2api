@@ -266,6 +266,25 @@ func TestMoneyExprPreservesImageCountCompatibility(t *testing.T) {
 		_, _, err := billingexpr.RunMoneyExpr(expression, billingexpr.MoneyInput{Request: billingexpr.RequestInput{ImageCount: &count}}, "USD")
 		require.ErrorContains(t, err, "image_count")
 	}
+	for _, tc := range []struct {
+		name, expression, amount   string
+		quantity, fixedRequestOnly bool
+	}{
+		{"condition", `image_count > 0 ? tier("a",fixed(0.01)) : tier("b",fixed(0.02))`, "0.01 USD", false, true},
+		{"condition arithmetic", `image_count * 2 > 0 ? tier("a",fixed(0.01)) : tier("b",fixed(0.02))`, "0.01 USD", false, true},
+		{"right multiplier", `tier("image",fixed(0.02)) * image_count`, "0.04 USD", true, false},
+		{"left multiplier", `image_count * tier("image",fixed(0.02))`, "0.04 USD", true, false},
+		{"selected request", `len == 7 ? tier("request",fixed(0.01)) : tier("image",fixed(0.02)) * image_count`, "0.01 USD", false, false},
+		{"selected images", `len == 7 ? tier("image",fixed(0.02)) * image_count : tier("request",fixed(0.01))`, "0.04 USD", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			amount, trace, err := billingexpr.RunMoneyExpr(tc.expression, billingexpr.MoneyInput{Tokens: map[string]int64{"len": 7}, ImageCount: &count}, "USD")
+			require.NoError(t, err)
+			assert.Equal(t, tc.amount, amount.String())
+			assert.Equal(t, tc.quantity, trace.ImageQuantityPriced)
+			assert.Equal(t, tc.fixedRequestOnly, billingexpr.UsesOnlyFixedRequestPricing(tc.expression))
+		})
+	}
 }
 
 func TestMoneyExprActualMediaQuantitiesKeepRequestProbesFrozen(t *testing.T) {
@@ -280,6 +299,7 @@ func TestMoneyExprActualMediaQuantitiesKeepRequestProbesFrozen(t *testing.T) {
 		assert.Equal(t, want[actual], amount.String())
 		require.NotNil(t, trace.ImageCount)
 		assert.Equal(t, actual, *trace.ImageCount)
+		assert.True(t, trace.ImageQuantityPriced)
 	}
 	for _, count := range []int{-1, 129} {
 		_, _, err := billingexpr.RunMoneyExpr(`tier("image", fixed(0.04)) * image_count`, billingexpr.MoneyInput{ImageCount: &count}, "USD")

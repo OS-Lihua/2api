@@ -57,14 +57,15 @@ type MoneyConditionTrace struct {
 // MoneyTraceResult contains billing metadata without request bodies or headers.
 // FixedPrice is present even for an explicitly free request-priced leaf.
 type MoneyTraceResult struct {
-	Currency        money.Currency          `json:"currency,omitempty"`
-	UnroundedAmount string                  `json:"unrounded_amount,omitempty"`
-	Conditions      []MoneyConditionTrace   `json:"conditions,omitempty"`
-	ImageCount      *int                    `json:"image_count,omitempty"`
-	BillingUnit     BillingUnit             `json:"billing_unit"`
-	FixedPrice      *string                 `json:"fixed_price,omitempty"`
-	MatchedTier     string                  `json:"matched_tier"`
-	RequestRules    []MoneyRequestRuleTrace `json:"request_rules,omitempty"`
+	Currency            money.Currency          `json:"currency,omitempty"`
+	UnroundedAmount     string                  `json:"unrounded_amount,omitempty"`
+	Conditions          []MoneyConditionTrace   `json:"conditions,omitempty"`
+	ImageCount          *int                    `json:"image_count,omitempty"`
+	ImageQuantityPriced bool                    `json:"image_quantity_priced,omitempty"`
+	BillingUnit         BillingUnit             `json:"billing_unit"`
+	FixedPrice          *string                 `json:"fixed_price,omitempty"`
+	MatchedTier         string                  `json:"matched_tier"`
+	RequestRules        []MoneyRequestRuleTrace `json:"request_rules,omitempty"`
 }
 
 // MoneyUsedVars returns source identifiers for exact token normalization. It
@@ -107,6 +108,10 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 			trace.BillingUnit = BillingUnitRequest
 			trace.FixedPrice = &text
 			return new(big.Rat).Mul(amount, big.NewRat(1_000_000, 1)), nil
+		},
+		"_money_image_quantity": func(value any) any {
+			trace.ImageQuantityPriced = true
+			return value
 		},
 		"param": func(path string) (any, error) {
 			path = strings.TrimSpace(path)
@@ -232,7 +237,7 @@ func compileMoneyProgram(body string, env map[string]any) (*vm.Program, []MoneyR
 	literalText := make(map[file.Location]string)
 	for _, token := range tokens {
 		switch token.Value {
-		case "_money_fixed", "_money_rule", "_money_condition", "_money_builtin", "_money_binary", "_money_unary", "_money_index":
+		case "_money_fixed", "_money_rule", "_money_condition", "_money_builtin", "_money_binary", "_money_unary", "_money_index", "_money_image_quantity":
 			if token.Kind == lexer.Identifier {
 				return nil, nil, fmt.Errorf("expr compile error: identifier %q is reserved for internal use", token.Value)
 			}
@@ -297,7 +302,7 @@ func compileMoneyProgram(body string, env map[string]any) (*vm.Program, []MoneyR
 		}
 		return false
 	})
-	program, err := expr.Compile(body, expr.Env(env), expr.Patch(&moneyPatcher{literals: literals, literalText: literalText, rules: rules, conditions: conditions, conditionals: conditionals}), expr.Optimize(false), expr.AsAny())
+	program, err := expr.Compile(body, expr.Env(env), expr.Patch(&moneyPatcher{imageMultipliers: imagePriceMultipliers(tree.Node), literals: literals, literalText: literalText, rules: rules, conditions: conditions, conditionals: conditionals}), expr.Optimize(false), expr.AsAny())
 	if err != nil {
 		return nil, nil, fmt.Errorf("expr compile error: %w", err)
 	}
@@ -315,11 +320,12 @@ func (literals moneyConditionLiterals) Visit(node *ast.Node) {
 }
 
 type moneyPatcher struct {
-	literals     map[file.Location]*big.Rat
-	literalText  map[file.Location]string
-	rules        map[file.Location]int
-	conditions   map[file.Location]string
-	conditionals map[file.Location]string
+	literals         map[file.Location]*big.Rat
+	literalText      map[file.Location]string
+	rules            map[file.Location]int
+	conditions       map[file.Location]string
+	conditionals     map[file.Location]string
+	imageMultipliers map[file.Location]bool
 }
 
 func (p *moneyPatcher) Visit(node *ast.Node) {
@@ -369,6 +375,13 @@ func (p *moneyPatcher) Visit(node *ast.Node) {
 			part.Property = &ast.CallNode{Callee: &ast.IdentifierNode{Value: "_money_index"}, Arguments: []ast.Node{part.Property}}
 		}
 	case *ast.BinaryNode:
+		if imageOnLeft, ok := p.imageMultipliers[part.Location()]; ok {
+			quantity := &part.Right
+			if imageOnLeft {
+				quantity = &part.Left
+			}
+			*quantity = &ast.CallNode{Callee: &ast.IdentifierNode{Value: "_money_image_quantity"}, Arguments: []ast.Node{*quantity}}
+		}
 		switch part.Operator {
 		case "..":
 			part.Left = &ast.CallNode{Callee: &ast.IdentifierNode{Value: "_money_index"}, Arguments: []ast.Node{part.Left}}
