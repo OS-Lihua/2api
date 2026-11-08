@@ -7,7 +7,7 @@ export const meta = {
     en: "Kuaishou Kling video generation (text-to-video and image-to-video)",
     zh: "快手可灵视频生成（文生视频、图生视频）",
   },
-  version: "1.2.0",
+  version: "1.3.0",
   author: { name: "QuantumNous" },
   channelTypes: [50],
   models: ["kling-v2-5-turbo", "kling-v2-6", "kling-v3", "kling-4.0"],
@@ -506,7 +506,7 @@ export const native = {
     const entry = Object.assign(
       { status: statusMap[task.status] || "submitted", create_time: task.created_at * 1000, update_time: (task.updated_at || task.created_at) * 1000 },
       kling4Entry(result),
-      { id: task.task_id },
+      { id: task.task_id }
     );
     if (task.status === "FAILURE" && entry.status !== "failed") {
       entry.status = "failed";
@@ -523,6 +523,40 @@ export const native = {
 // protocols add the prompt, first frame, mode and the aspect ratio nearest the
 // size; image-to-video has no aspect ratio. They always send mode and
 // duration, at Kling's defaults when absent.
+export function extractCapabilities(ctx) {
+  const req = ctx.requestBody || {};
+  const input = [];
+  let imageCount = 0;
+  let knownImages = true;
+  if (usesKling4(ctx, req)) {
+    const body = kling4Submission(ctx).body;
+    if (trimmed(body.prompt)) input.push("text");
+    for (const item of body.contents || []) {
+      if (!item || typeof item !== "object") continue;
+      if (item.type === "prompt") input.push("text");
+      else if (item.type === "element") {
+        input.push("image", "video");
+        knownImages = false;
+      } else if (KLING4_VIDEO_INPUTS.includes(item.type)) input.push("video");
+      else if (["first_frame", "last_frame", "feature_image", "reference_image"].includes(item.type)) {
+        input.push("image");
+        imageCount++;
+      } else {
+        input.push("image", "audio", "video", "text", "pdf");
+        knownImages = false;
+      }
+    }
+  } else {
+    const source = req.vendorBody || req.metadata || {};
+    if (trimmed(req.prompt || source.prompt) || trimmed(source.negative_prompt)) input.push("text");
+    if (req.image || source.image || source.image_tail) input.push("image");
+    imageCount = [req.image || source.image, source.image_tail].filter(Boolean).length;
+  }
+  const result = { input_modalities: input, output_modalities: ["video"] };
+  if (knownImages) result.image_count = imageCount;
+  return result;
+}
+
 export function buildSubmitRequest(ctx) {
   const req = ctx.requestBody;
   if (usesKling4(ctx, req)) {
@@ -548,7 +582,8 @@ export function buildSubmitRequest(ctx) {
     if (req.prompt) body.prompt = req.prompt;
     if (req.image) body.image = req.image;
     if (req.mode) body.mode = req.mode;
-    if (action === "text_to_video" && req.size !== undefined && req.size !== null && req.size !== "") body.aspect_ratio = aspectRatio(sizeDimensions(req.size), KLING_ASPECT_RATIOS);
+    if (action === "text_to_video" && req.size !== undefined && req.size !== null && req.size !== "")
+      body.aspect_ratio = aspectRatio(sizeDimensions(req.size), KLING_ASPECT_RATIOS);
     Object.assign(body, metadata);
     body.model_name = model;
     body.mode = klingMode(body.mode);

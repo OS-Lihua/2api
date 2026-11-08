@@ -33,9 +33,11 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 const contextKeyTaskPluginEndpointModel = "task_plugin_endpoint_model_request"
+const contextKeyTaskNativeOfferingModel = "task_native_offering_model"
 
 const contextKeyTaskPluginEndpointSelection = "task_plugin_endpoint_channel_selection"
 
@@ -113,6 +115,63 @@ func NativeRouteCredential(pluginKeys ...string) gin.HandlerFunc {
 // PrepareTaskPluginRoute resolves and executes the pinned declarative route.
 // Query requests terminate here so channel distribution and billing are never
 // entered; submit requests continue through the remaining route handlers.
+// ResolveTaskPluginOffering finds the requested Offering in a native model
+// carrier after authentication and before candidate preparation.
+func ResolveTaskPluginOffering() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if TextOffering(c) != nil {
+			c.Next()
+			return
+		}
+		value, _ := c.Get(pluginruntime.ContextKeyPinnedRoute)
+		pinned, ok := value.(pluginruntime.PinnedRoute)
+		if !ok || pinned.Plugin == nil {
+			c.Next()
+			return
+		}
+		requestContext, err := buildTaskPluginRouteRequest(c)
+		if err != nil {
+			c.Next()
+			return
+		}
+		candidates := pinned.Candidates
+		if len(candidates) == 0 {
+			candidates = []pluginruntime.RouteBinding{{Plugin: pinned.Plugin, Route: pinned.Route}}
+		}
+		for _, binding := range candidates {
+			if binding.Route.Decode == "" {
+				continue
+			}
+			probe := requestContext
+			probe.Params = pluginruntime.RouteParams(c.Params, binding.Route)
+			value, err := binding.Plugin.Engine.CallPath(c.Request.Context(), "native", []string{binding.Route.Decode}, probe.JSValueFor(binding.Plugin.Meta))
+			if err != nil {
+				continue
+			}
+			intent, ok := value.(map[string]any)
+			if !ok || intent["kind"] != string(pluginruntime.RouteTypeSubmit) {
+				continue
+			}
+			name, ok := intent["model"].(string)
+			if !ok || strings.TrimSpace(name) == "" {
+				continue
+			}
+			offering, err := model.FindModelOfferingByName(c.Request.Context(), name)
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				continue
+			}
+			if err != nil {
+				abortTaskPluginRouteError(c, http.StatusServiceUnavailable)
+				return
+			}
+			c.Set(textOfferingContextKey, offering)
+			c.Set(contextKeyTaskNativeOfferingModel, name)
+			break
+		}
+		c.Next()
+	}
+}
+
 func PrepareTaskPluginRoute() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedRoute)
@@ -205,6 +264,9 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 		if bodyValue, isObject := bodyObject["value"].(map[string]any); isObject {
 			claimedModel, _ = bodyValue["model"].(string)
 		}
+		if name := c.GetString(contextKeyTaskNativeOfferingModel); name != "" {
+			claimedModel = name
+		}
 		hookStarted := time.Now()
 		var (
 			accepted         []pluginruntime.RouteBinding
@@ -219,17 +281,29 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 		type routePreparation struct {
 			binding       pluginruntime.RouteBinding
 			upstreamModel string
+			declaredModel string
 		}
 		var preparations []routePreparation
+		offering := TextOffering(c)
+		var modelIDs []int
+		declaredModels := make(map[int]string)
+		if offering != nil {
+			for _, member := range offering.Members {
+				modelIDs = append(modelIDs, member.ModelID)
+			}
+			var definitions []model.Model
+			if err := model.DB.Select("id", "model_name").Where("id IN ?", modelIDs).Find(&definitions).Error; err != nil {
+				abortTaskPluginRouteError(c, http.StatusServiceUnavailable)
+				return
+			}
+			for _, definition := range definitions {
+				declaredModels[definition.Id] = definition.ModelName
+			}
+		}
 		for _, binding := range eligible {
-			offering := TextOffering(c)
 			if offering == nil {
 				preparations = append(preparations, routePreparation{binding: binding})
 				continue
-			}
-			modelIDs := make([]int, 0, len(offering.Members))
-			for _, member := range offering.Members {
-				modelIDs = append(modelIDs, member.ModelID)
 			}
 			var channels []model.Channel
 			if err := model.OfferingChannelsQuery(model.DB, offering, modelIDs).Where("channels.protocol = ? AND channels.status = ? AND channels.mapping_confirmed = ?", "task:"+binding.Plugin.Meta.Key, model.ChannelEnabled, true).
@@ -239,7 +313,7 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 				return
 			}
 			for _, channel := range channels {
-				preparations = append(preparations, routePreparation{binding: binding, upstreamModel: channel.UpstreamModelName})
+				preparations = append(preparations, routePreparation{binding: binding, upstreamModel: channel.UpstreamModelName, declaredModel: declaredModels[channel.ModelID]})
 			}
 		}
 		if len(preparations) == 0 && TextOffering(c) != nil {
@@ -251,14 +325,12 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 			candidateContext := requestContext
 			candidateContext.Params = pluginruntime.RouteParams(c.Params, candidate.Route)
 			gatewayModel := preparation.upstreamModel
-			if gatewayModel != "" {
-				if bodyValue, ok := bodyObject["value"].(map[string]any); ok {
-					body := maps.Clone(bodyObject)
-					value := maps.Clone(bodyValue)
-					value["model"] = gatewayModel
-					body["value"] = value
-					candidateContext.Body = body
-				}
+			if bodyValue, ok := bodyObject["value"].(map[string]any); ok && gatewayModel != "" && bodyValue["model"] != nil {
+				body := maps.Clone(bodyObject)
+				value := maps.Clone(bodyValue)
+				value["model"] = gatewayModel
+				body["value"] = value
+				candidateContext.Body = body
 				if len(candidateContext.BodyText) > 0 {
 					override := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ParamOverride: map[string]any{"model": gatewayModel}}}
 					raw, err := relaycommon.ApplyParamOverrideWithRelayInfo(candidateContext.BodyText, override)
@@ -285,6 +357,9 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 					lookupModel = gatewayModel
 				}
 				_, _, allowed = model.ResolveTaskPluginModel(pinned.Generation, lookupModel, candidate.Route.Models)
+				if !allowed && preparation.declaredModel != "" {
+					_, _, allowed = model.ResolveTaskPluginModel(pinned.Generation, preparation.declaredModel, candidate.Route.Models)
+				}
 			}
 			if !allowed {
 				reason, detail = "model_not_allowed", fmt.Sprintf("model %q is not allowed on this route", claimedModel)
@@ -298,6 +373,15 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 				} else {
 					result, _ = value.(map[string]any)
 					bodyText = text
+					if gatewayModel != "" && result["kind"] == string(pluginruntime.RouteTypeSubmit) {
+						validationModel := gatewayModel
+						if _, _, owned := model.ResolveTaskPluginModel(pinned.Generation, validationModel, candidate.Plugin.Meta.Models); !owned {
+							validationModel = preparation.declaredModel
+						}
+						result = maps.Clone(result)
+						result["model"] = validationModel
+						value = result
+					}
 					intent, reason, detail = checkTaskPluginRouteIntent(pinned.Generation, candidate, value)
 					if reason == "" && gatewayModel != "" && intent.kind == string(pluginruntime.RouteTypeSubmit) {
 						result = maps.Clone(result)

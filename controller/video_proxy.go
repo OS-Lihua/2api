@@ -104,6 +104,13 @@ func VideoProxy(c *gin.Context) {
 				}
 				if adaptorErr != nil {
 					logger.LogWarn(c.Request.Context(), common.LogText("Failed to resolve plugin video content for task %s: %v", taskID, adaptorErr))
+					if task.PrivateData.Gateway != nil && !strings.HasPrefix(strings.TrimSpace(task.GetResultURL()), "data:") {
+						writeTaskMediaProxyError(c, &taskMediaProxyError{
+							status: http.StatusServiceUnavailable, code: "artifact_plugin_unavailable",
+							message: "Artifact channel is unavailable", err: adaptorErr,
+						})
+						return
+					}
 					descriptor = nil
 				}
 				break
@@ -210,7 +217,16 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		}
 	}
 
-	channel, err := service.GatewayTaskProviderIdentity(task)
+	var channel *model.Provider
+	if task.PrivateData.Gateway != nil && descriptor.Authorize == nil {
+		var keyIndex int
+		channel, keyIndex, err = service.GatewayTaskProviderWithContext(c.Request.Context(), task)
+		if err == nil {
+			descriptor.Authorize = service.GatewayTaskCredentialCheck(task, channel.Key, keyIndex)
+		}
+	} else {
+		channel, err = service.GatewayTaskProviderIdentity(task)
+	}
 	if err != nil {
 		return &taskMediaProxyError{
 			status: http.StatusServiceUnavailable, code: "artifact_plugin_unavailable",

@@ -37,6 +37,7 @@ import (
 	"github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -55,7 +56,7 @@ func newAsyncTaskFixture(t *testing.T, upstream http.HandlerFunc) textGatewayFix
 	require.NoError(t, err)
 	fixture := newTextGatewayFixture(t, upstream)
 	require.NoError(t, model.DB.AutoMigrate(&model.Task{}))
-	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Updates(map[string]any{"model_name": "sora-2", "capabilities": capability.Set{Features: []capability.Feature{capability.Streaming}, InputModalities: []capability.Modality{capability.Text, capability.Image}, OutputModalities: []capability.Modality{capability.Video}}}).Error)
+	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Updates(map[string]any{"model_name": "sora-2", "capabilities": capability.Set{Features: []capability.Feature{capability.Streaming}, InputModalities: []capability.Modality{capability.Text, capability.Image, capability.Video}, OutputModalities: []capability.Modality{capability.Video}}}).Error)
 	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:sora", "upstream_model_name": "sora-2"}).Error)
 	for _, price := range []*model.PriceVersion{
 		{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("video", u("seconds") * 0.1)`, EffectiveAt: clock.Now().Unix()},
@@ -1504,6 +1505,332 @@ func TestAsyncTaskNativeDecodeKeepsLaterCompatibleModel(t *testing.T) {
 	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/doubao/api/v3/images/generations", `{"model":"gateway-alias","prompt":"A bird","size":"2K","output_format":"png"}`)
 	assert.Equal(t, 503, response.Code, response.Body.String())
 	assert.EqualValues(t, 1, calls.Load())
+}
+
+func TestAsyncTaskVideoFallbackCannotBypassDisabledProvider(t *testing.T) {
+	var downloads, redirected atomic.Int32
+	var redirect atomic.Bool
+	entered, release := make(chan struct{}), make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	defer releaseOnce()
+	media := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloads.Add(1)
+		assert.Empty(t, r.Header.Get("Authorization"))
+		if redirect.Load() && r.URL.Path == "/movie.mp4" {
+			close(entered)
+			<-release
+			w.Header().Set("Location", "/redirected.mp4")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		if r.URL.Path == "/redirected.mp4" {
+			redirected.Add(1)
+		}
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("synthetic-video"))
+	}))
+	t.Cleanup(media.Close)
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			_, _ = fmt.Fprintf(w, `{"id":"movie","status":"succeeded","content":{"video_url":%q},"usage":{"completion_tokens":20}}`, media.URL+"/movie.mp4")
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"movie"}`))
+	})
+	fetch := system_setting.GetFetchSetting()
+	previousFetch, previousWorker := *fetch, system_setting.WorkerUrl
+	fetch.EnableSSRFProtection, system_setting.WorkerUrl = false, ""
+	t.Cleanup(func() { *fetch, system_setting.WorkerUrl = previousFetch, previousWorker })
+	source, err := plugins.Source("doubao")
+	require.NoError(t, err)
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "doubao"})
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:doubao", "upstream_model_name": "doubao-seedance-1-0-pro-250528"}).Error)
+	fixture.fake.Advance(time.Second)
+	for _, price := range []*model.PriceVersion{
+		{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("video", u("tokens") * 0.1 / 1000000)`, EffectiveAt: clock.Now().Unix()},
+		{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("video", u("tokens") * 0.05 / 1000000)`, EffectiveAt: clock.Now().Unix()},
+	} {
+		require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+	}
+	SetVideoRouter(fixture.engine)
+	SetTaskPluginProtocolRouter(fixture.engine)
+	builder := newPluginGenerationBuilder(fixture.engine.Routes(), nil, productionPluginRouteHandlers)
+	require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(builder.prepare))
+	dispatcher := &pluginRouteDispatcher{registry: jsplugin.DefaultRegistry}
+	fixture.engine.NoRoute(dispatcher.dispatch)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/doubao", `{"model":"gateway-alias","prompt":"A bird","duration":4,"resolution":"720p"}`)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	service.RunTaskPollingOnce(t.Context(), nil)
+	var task model.Task
+	require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
+	require.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
+	require.Equal(t, media.URL+"/movie.mp4", task.GetResultURL())
+	path := "/v1/videos/" + task.TaskID + "/content"
+	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodGet, path, "")
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.Equal(t, "synthetic-video", response.Body.String())
+	assert.EqualValues(t, 1, downloads.Load())
+	fullData := string(task.Data)
+	// Older snapshots may retain the result URL without an artifact projection.
+	require.NoError(t, model.DB.Model(&model.Task{}).Where("id = ?", task.ID).Update("data", "{}").Error)
+	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodGet, path, "")
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.EqualValues(t, 2, downloads.Load())
+	before, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	redirect.Store(true)
+	finished := make(chan *httptest.ResponseRecorder, 1)
+	go func() { finished <- adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodGet, path, "") }()
+	select {
+	case <-entered:
+	case early := <-finished:
+		require.FailNowf(t, "content request returned before reaching its redirect", "%d %s", early.Code, early.Body.String())
+	}
+	admin := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "channel:operate")
+	response = adminSecurityRequest(fixture.engine, admin, http.MethodPost, fmt.Sprintf("/api/admin/v1/providers/%d/disable", fixture.channel.ProviderID), "")
+	require.Equal(t, 200, response.Code, response.Body.String())
+	releaseOnce()
+	response = <-finished
+	assert.Equal(t, 502, response.Code, response.Body.String())
+	assert.Zero(t, redirected.Load(), "fallback redirects must recheck the same original credential")
+	require.NoError(t, model.DB.Model(&model.Task{}).Where("id = ?", task.ID).Update("data", fullData).Error)
+	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodGet, path, "")
+	assert.Equal(t, 503, response.Code, response.Body.String())
+	assert.EqualValues(t, 3, downloads.Load(), "a rejected original Provider must not fall through to a URL without authority")
+	task.PrivateData.ResultURL = "data:video/mp4;base64," + base64.StdEncoding.EncodeToString([]byte("synthetic-video"))
+	require.NoError(t, model.DB.Model(&model.Task{}).Where("id = ?", task.ID).Update("private_data", task.PrivateData).Error)
+	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodGet, path, "")
+	assert.Equal(t, 200, response.Code, response.Body.String())
+	assert.Equal(t, "synthetic-video", response.Body.String())
+	assert.EqualValues(t, 3, downloads.Load(), "local results require no Provider call")
+	after, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, before.Balance, after.Balance)
+}
+
+func TestAsyncTaskFirstTailAndReferenceRequireDeclaredInputs(t *testing.T) {
+	for _, test := range []struct {
+		name, plugin, model, path, body, result, quantity string
+		input                                             capability.Modality
+	}{
+		{"start-end2video", "vidu", "viduq3-turbo", "/vidu/ent/v2/start-end2video", `{"model":"gateway-alias","prompt":"A bird","images":["https://image.invalid/first.png","https://image.invalid/last.png"],"duration":4,"resolution":"720p"}`, `{"task_id":"vidu-job","state":"created"}`, "duration", capability.Image},
+		{"reference2video", "vidu", "viduq3-turbo", "/vidu/ent/v2/reference2video", `{"model":"gateway-alias","prompt":"A bird","images":["https://image.invalid/first.png","https://image.invalid/last.png"],"duration":4,"resolution":"720p"}`, `{"task_id":"vidu-job","state":"created"}`, "duration", capability.Image},
+		{"jimeng-first-tail", "jimeng", "jimeng_i2v_first_tail_v30", "/jimeng/api/common/v3/submit_task_v2", `{"req_key":"gateway-alias","prompt":"A bird","image_urls":["https://image.invalid/first.png","https://image.invalid/last.png"],"frames":121}`, `{"code":10000,"data":{"task_id":"jimeng-job"}}`, "seconds", capability.Image},
+		{"xai-audio-reference", "xai", "grok-imagine-video-1.5", "/xai/v1/videos/generations", `{"model":"gateway-alias","prompt":"A bird","duration":4,"reference_audios":[{"voice_id":"synthetic-voice"}]}`, `{"request_id":"xai-job"}`, "seconds", capability.Audio},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if test.plugin == "jimeng" {
+					var body map[string]any
+					require.NoError(t, common.DecodeJson(r.Body, &body))
+					assert.Equal(t, test.model, body["req_key"])
+					assert.NotContains(t, body, "model")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(test.result))
+			})
+			source, err := plugins.Source(test.plugin)
+			require.NoError(t, err)
+			jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+			_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: test.plugin})
+			require.NoError(t, err)
+			caps := capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Video}}
+			modelName := test.model
+			if test.plugin == "jimeng" {
+				modelName = "jimeng_vgfm_t2v_l20"
+			}
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Updates(map[string]any{"model_name": modelName, "capabilities": caps}).Error)
+			require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:" + test.plugin, "upstream_model_name": test.model}).Error)
+			if test.plugin == "jimeng" {
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("key", "synthetic-ak|synthetic-sk").Error)
+			}
+			fixture.fake.Advance(time.Second)
+			for _, price := range []*model.PriceVersion{
+				{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: fmt.Sprintf(`tier("video", u(%q) * 0.1)`, test.quantity), EffectiveAt: clock.Now().Unix()},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: fmt.Sprintf(`tier("video", u(%q) * 0.05)`, test.quantity), EffectiveAt: clock.Now().Unix()},
+			} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			builder := newPluginGenerationBuilder(fixture.engine.Routes(), nil, productionPluginRouteHandlers)
+			require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(builder.prepare))
+			dispatcher := &pluginRouteDispatcher{registry: jsplugin.DefaultRegistry}
+			fixture.engine.NoRoute(dispatcher.dispatch)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, test.path, test.body)
+			assert.Equal(t, 400, response.Code, response.Body.String())
+			assert.Zero(t, calls.Load())
+			var reservations int64
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
+			assert.Zero(t, reservations)
+			caps.InputModalities = append(caps.InputModalities, test.input)
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+			response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, test.path, test.body)
+			require.Equal(t, 200, response.Code, response.Body.String())
+			assert.EqualValues(t, 1, calls.Load())
+			if test.plugin == "jimeng" {
+				var task model.Task
+				require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
+				queryPath, queryBody := "/jimeng/api/common/v3/get_result_v2", fmt.Sprintf(`{"req_key":"gateway-alias","task_id":%q}`, task.TaskID)
+				for range 2 {
+					response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, queryPath, queryBody)
+					require.Equal(t, 200, response.Code, response.Body.String())
+				}
+				foreign := &model.User{Username: "native-task-foreign", Status: common.UserStatusEnabled, Role: common.RoleCommonUser, Group: "default", AuthVersion: 1}
+				require.NoError(t, model.DB.Create(foreign).Error)
+				foreignKey := &model.Token{UserId: foreign.Id, Key: "nativetaskforeign", Status: common.TokenStatusEnabled, ExpiredTime: -1}
+				require.NoError(t, model.DB.Create(foreignKey).Error)
+				response = adminSecurityRequest(fixture.engine, foreignKey.Key, http.MethodPost, queryPath, queryBody)
+				assert.Equal(t, 200, response.Code, response.Body.String())
+				var unavailable map[string]any
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &unavailable))
+				assert.Equal(t, map[string]any{"status": "not_found"}, unavailable["data"])
+				for _, updates := range []map[string]any{{"status": common.TokenStatusDisabled}, {"status": common.TokenStatusEnabled, "expired_time": 1}} {
+					require.NoError(t, model.DB.Model(fixture.token).Updates(updates).Error)
+					response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, queryPath, queryBody)
+					assert.Equal(t, 401, response.Code, response.Body.String())
+				}
+				require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"status": common.TokenStatusEnabled, "expired_time": -1}).Error)
+				assert.EqualValues(t, 1, calls.Load(), "native queries must not resubmit the accepted task")
+			}
+			if test.input == capability.Image {
+				maximum := int64(1)
+				caps.Limits.MaxImages = &maximum
+				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+				response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, test.path, test.body)
+				assert.Equal(t, 400, response.Code, response.Body.String())
+				assert.EqualValues(t, 1, calls.Load(), "frame and reference counts must respect the effective image limit")
+				caps.Limits.MaxImages = nil
+				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+			}
+			narrowed := capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Video}}
+			require.NoError(t, model.DB.Model(fixture.channel).Update("capabilities", narrowed).Error)
+			response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, test.path, test.body)
+			assert.Equal(t, 400, response.Code, response.Body.String())
+			assert.EqualValues(t, 1, calls.Load(), "a Channel may narrow its Model's input capabilities")
+		})
+	}
+}
+
+func TestAsyncTaskNativeModelCarriersResolveOffering(t *testing.T) {
+	for _, test := range []struct {
+		plugin, model, path, body, result, quantity string
+		output                                      capability.Modality
+	}{
+		{"vertex-ai", "veo-3.0-generate-001", "/vertex-ai/v1/projects/client/locations/us-central1/publishers/google/models/gateway-alias:predictLongRunning", `{"instances":[{"prompt":"A bird"}],"parameters":{"durationSeconds":4,"resolution":"720p"}}`, `{"name":"projects/provider/locations/us-central1/publishers/google/models/veo-3.0-generate-001/operations/private-job"}`, "seconds", capability.Video},
+		{"sunoapi", "suno_music", "/suno/submit/music", `{"prompt":"A bird"}`, `{"code":"success","data":"private-song-job"}`, "clips", capability.Audio},
+	} {
+		t.Run(test.plugin, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				var body map[string]any
+				require.NoError(t, common.DecodeJson(r.Body, &body))
+				assert.NotContains(t, body, "model")
+				if test.plugin == "vertex-ai" {
+					assert.Contains(t, r.URL.Path, "/models/"+test.model+":predictLongRunning")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(test.result))
+			})
+			source, err := plugins.Source(test.plugin)
+			require.NoError(t, err)
+			jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+			_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: test.plugin})
+			require.NoError(t, err)
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Updates(map[string]any{"model_name": test.model, "capabilities": capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{test.output}}}).Error)
+			require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:" + test.plugin, "upstream_model_name": test.model}).Error)
+			if test.plugin == "vertex-ai" {
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeNewAPI).Error)
+			}
+			if test.plugin == "sunoapi" {
+				require.NoError(t, model.DB.Create(&model.ModelOfferingName{Name: test.model, OfferingID: fixture.offering.ID}).Error)
+			}
+			fixture.fake.Advance(time.Second)
+			for _, price := range []*model.PriceVersion{
+				{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: fmt.Sprintf(`tier("task",u(%q)*0.1)`, test.quantity), EffectiveAt: clock.Now().Unix()},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: fmt.Sprintf(`tier("task",u(%q)*0.05)`, test.quantity), EffectiveAt: clock.Now().Unix()},
+			} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			builder := newPluginGenerationBuilder(fixture.engine.Routes(), nil, productionPluginRouteHandlers)
+			require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(builder.prepare))
+			dispatcher := &pluginRouteDispatcher{registry: jsplugin.DefaultRegistry}
+			fixture.engine.NoRoute(dispatcher.dispatch)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, test.path, test.body)
+			require.Equal(t, 200, response.Code, response.Body.String())
+			assert.EqualValues(t, 1, calls.Load())
+			var reservations int64
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
+			assert.EqualValues(t, 1, reservations)
+		})
+	}
+}
+
+func TestAsyncTaskNativeLegacySubmissionStillRequiresLegacyQuota(t *testing.T) {
+	var calls atomic.Int32
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"id":"unexpected"}`))
+	})
+	source, err := plugins.Source("doubao")
+	require.NoError(t, err)
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "doubao"})
+	require.NoError(t, err)
+	builder := newPluginGenerationBuilder(fixture.engine.Routes(), nil, productionPluginRouteHandlers)
+	require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(builder.prepare))
+	dispatcher := &pluginRouteDispatcher{registry: jsplugin.DefaultRegistry}
+	fixture.engine.NoRoute(dispatcher.dispatch)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/doubao/api/v3/contents/generations/tasks", `{"model":"doubao-seedance-1-0-pro-250528","content":[{"type":"text","text":"A bird"}]}`)
+	assert.Equal(t, 401, response.Code, response.Body.String())
+	assert.Zero(t, calls.Load())
+	var reservations int64
+	require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
+	assert.Zero(t, reservations)
+}
+
+func TestAsyncTaskCapabilitiesMustBeKnownAndPureBeforeAdmission(t *testing.T) {
+	for _, test := range []struct{ name, hook string }{
+		{"missing", ""},
+		{"unknown-modality", `export function extractCapabilities() { return {input_modalities:["opaque"],output_modalities:["video"]}; }`},
+		{"missing-input", `export function extractCapabilities() { return {output_modalities:["video"]}; }`},
+		{"unknown-image-count", `export function extractCapabilities(ctx) { const facts=ignoredCapabilities(ctx); delete facts.image_count; return facts; }`},
+		{"provider-io", `export function extractCapabilities(ctx) { utils.fetch({url:ctx.baseUrl+"/preflight",method:"GET"}); return {input_modalities:["text"],output_modalities:["video"]}; }`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				_, _ = w.Write([]byte(`{"id":"unexpected"}`))
+			})
+			source, err := plugins.Source("sora")
+			require.NoError(t, err)
+			updated := strings.Replace(source, "export function extractCapabilities(ctx)", "function ignoredCapabilities(ctx)", 1)
+			require.NotEqual(t, source, updated)
+			jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+			_, err = jsplugin.DefaultRegistry.RegisterFactory(updated+"\n"+test.hook, jsplugin.Options{Key: "sora"})
+			require.NoError(t, err)
+			body := `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`
+			if test.name == "unknown-image-count" {
+				var unified model.Model
+				require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+				maximum := int64(1)
+				unified.Capabilities.Limits.MaxImages = &maximum
+				require.NoError(t, model.DB.Model(&unified).Update("capabilities", unified.Capabilities).Error)
+				body = `{"model":"gateway-alias","prompt":"A bird","seconds":"4","input_reference":"https://image.invalid/first.png"}`
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", body)
+			assert.Equal(t, 400, response.Code, response.Body.String())
+			assert.Zero(t, calls.Load())
+			var reservations int64
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
+			assert.Zero(t, reservations)
+		})
+	}
 }
 
 func TestAsyncTaskRouteEnforcesTokenFactsAndOutputModality(t *testing.T) {

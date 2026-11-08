@@ -37,7 +37,7 @@ export const meta = {
     en: "Google Veo and Gemini Omni Flash video generation on Vertex AI (text-to-video and image-to-video)",
     zh: "Google Veo 与 Gemini Omni Flash 视频生成（文生视频、图生视频），Vertex AI 版本",
   },
-  version: "1.2.0",
+  version: "1.3.0",
   channelTypes: [41],
   author: { name: "QuantumNous" },
   models: [
@@ -415,6 +415,14 @@ export const native = {
     return { error: { code: error.httpStatus, message: error.message } };
   },
 };
+
+export function extractCapabilities(ctx) {
+  const req = ctx.requestBody || {};
+  const input = [];
+  if (trimmed(req.prompt)) input.push("text");
+  if ((req.images || []).length) input.push("image");
+  return { input_modalities: input, output_modalities: ["video"], image_count: (req.images || []).length ? 1 : 0 };
+}
 
 export function buildSubmitRequest(ctx) {
   if (ctx.authError) throw new Error(ctx.authError);

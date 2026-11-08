@@ -621,6 +621,20 @@ func TaskOriginAuth() gin.HandlerFunc {
 	}
 }
 
+// LegacyTaskSubmissionAuth restores the legacy funding check after a native
+// decoder has established that the submission does not use a ModelOffering.
+func LegacyTaskSubmissionAuth() gin.HandlerFunc {
+	authenticate := TokenAuth()
+	return func(c *gin.Context) {
+		if TextOffering(c) != nil {
+			c.Next()
+			return
+		}
+		c.Set(taskReadAuthKey, false)
+		authenticate(c)
+	}
+}
+
 func TokenAuth() func(c *gin.Context) {
 	return func(c *gin.Context) {
 		// 先检测是否为ws

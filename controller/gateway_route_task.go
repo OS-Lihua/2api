@@ -122,36 +122,6 @@ func prepareGatewayTaskRoute(c *gin.Context, selection *service.GatewaySelection
 	if err := adaptor.DecodeRequestAndSetAction(candidate, info); err != nil {
 		return nil, service.ErrGatewayCapability
 	}
-	output := capability.Modality("")
-	switch constant.NormalizeTaskAction(info.Action) {
-	case constant.TaskActionTextToVideo, constant.TaskActionImageToVideo, constant.TaskActionFirstTailToVideo, constant.TaskActionReferenceToVideo, constant.TaskActionRemix:
-		output = capability.Video
-	case "text_to_image", "image_to_image":
-		output = capability.Image
-	case "MUSIC", "music":
-		output = capability.Audio
-	case "LYRICS", "lyrics":
-		output = capability.Text
-	}
-	if value, exists := candidate.Get(jsplugin.ContextKeyPinnedEndpoint); exists {
-		if endpoint, ok := value.(jsplugin.PinnedEndpoint); ok {
-			switch endpoint.Protocol {
-			case "openai_image":
-				output = capability.Image
-			case "openai_video":
-				output = capability.Video
-			}
-		}
-	}
-	if output != "" && !slices.Contains(selection.Capabilities.OutputModalities, output) {
-		return nil, service.ErrGatewayCapability
-	}
-	if strings.HasPrefix(info.Action, "text_to_") && !slices.Contains(selection.Capabilities.InputModalities, capability.Text) {
-		return nil, service.ErrGatewayCapability
-	}
-	if strings.HasPrefix(info.Action, "image_to_") && !slices.Contains(selection.Capabilities.InputModalities, capability.Image) {
-		return nil, service.ErrGatewayCapability
-	}
 	if len(overrides) > 0 {
 		body, exists := candidate.Get("task_request")
 		if !exists {
@@ -185,6 +155,19 @@ func prepareGatewayTaskRoute(c *gin.Context, selection *service.GatewaySelection
 		candidate.Set("task_request", effective)
 		candidate.Set(jsplugin.ContextKeyRequestBodyText, json.RawMessage(encoded))
 	}
+	required, err := adaptor.RequestCapabilities(candidate, info)
+	if err != nil {
+		return nil, service.ErrGatewayCapability
+	}
+	if _, err := required.Capabilities.Narrow(selection.Capabilities); err != nil {
+		return nil, service.ErrGatewayCapability
+	}
+	if maximum := selection.Capabilities.Limits.MaxImages; maximum != nil {
+		hasImages := slices.Contains(required.Capabilities.InputModalities, capability.Image) || slices.Contains(required.Capabilities.OutputModalities, capability.Image)
+		if required.ImageCount == nil && hasImages || required.ImageCount != nil && *required.ImageCount > *maximum {
+			return nil, service.ErrGatewayCapability
+		}
+	}
 	facts, err := adaptor.ExtractUsageFactsValidated(candidate, info)
 	if err != nil {
 		return nil, service.ErrGatewayCapability
@@ -215,9 +198,6 @@ func prepareGatewayTaskRoute(c *gin.Context, selection *service.GatewaySelection
 			return nil, service.ErrGatewayCapability
 		}
 		if field.Unit == "second" && selection.Capabilities.Limits.MaxDurationSeconds != nil && quantity.GreaterThan(decimal.NewFromInt(*selection.Capabilities.Limits.MaxDurationSeconds)) {
-			return nil, service.ErrGatewayCapability
-		}
-		if name == "image_count" && selection.Capabilities.Limits.MaxImages != nil && quantity.GreaterThan(decimal.NewFromInt(*selection.Capabilities.Limits.MaxImages)) {
 			return nil, service.ErrGatewayCapability
 		}
 	}

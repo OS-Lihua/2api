@@ -222,7 +222,7 @@ export const meta = {
     en: "Alibaba Cloud Bailian image and video generation (Wan, Qwen-Image, Z-Image)",
     zh: "阿里云百炼图片与视频生成（万相、千问图像、Z-Image）",
   },
-  version: "1.5.0",
+  version: "1.6.0",
   author: { name: "QuantumNous" },
   channelTypes: [17],
   // Literal metadata also supports the dashboard's static script preview.
@@ -1065,6 +1065,42 @@ function dashScopeHeaders(ctx, asynchronous) {
   if (asynchronous) headers["X-DashScope-Async"] = "enable";
   if (headerValue(ctx, "X-DashScope-OssResourceResolve") === "enable") headers["X-DashScope-OssResourceResolve"] = "enable";
   return headers;
+}
+
+export function extractCapabilities(ctx) {
+  if (imageModel(ctx)) {
+    const converted = convertImage(ctx);
+    const streaming =
+      converted.body.parameters.stream === true || (converted.synchronous && converted.body.parameters.enable_interleave === true && streamsInterleave(ctx));
+    return {
+      features: streaming ? ["streaming"] : [],
+      input_modalities: converted.inputImages ? ["text", "image"] : ["text"],
+      output_modalities: ["image"],
+      image_count: imageEstimate(ctx, converted).image_count,
+    };
+  }
+  const source = convert(ctx).input;
+  const input = [];
+  let imageCount = [source.img_url, source.image_url, source.first_frame_url, source.last_frame_url].filter(Boolean).length;
+  let knownImages = true;
+  if (trimmed(source.prompt) || trimmed(source.negative_prompt)) input.push("text");
+  if (source.img_url || source.image_url || source.first_frame_url || source.last_frame_url) input.push("image");
+  if (source.audio_url) input.push("audio");
+  for (const media of source.media || []) {
+    if (["first_frame", "last_frame", "reference_image"].includes(media.type)) {
+      input.push("image");
+      imageCount++;
+    } else if (["driving_audio", "reference_audio"].includes(media.type)) input.push("audio");
+    else if (["first_clip", "reference_video"].includes(media.type)) input.push("video");
+    // Opaque files and links have no verifiable media type before submission.
+    else {
+      input.push("image", "audio", "video", "text", "pdf");
+      knownImages = false;
+    }
+  }
+  const result = { input_modalities: input, output_modalities: ["video"] };
+  if (knownImages) result.image_count = imageCount;
+  return result;
 }
 
 export function buildSubmitRequest(ctx) {

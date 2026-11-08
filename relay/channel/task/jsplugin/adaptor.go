@@ -30,6 +30,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/capability"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
@@ -38,6 +39,11 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
+
+type TaskRequestCapabilities struct {
+	Capabilities capability.Set `json:"-"`
+	ImageCount   *int64         `json:"image_count,omitempty"`
+}
 
 type requestDescriptor struct {
 	ResponseType   string            `json:"responseType"`
@@ -204,15 +210,17 @@ func (a *TaskAdaptor) DecodeRequestAndSetAction(c *gin.Context, info *relaycommo
 				if requestContext, valid := requestValue.(pluginruntime.RouteRequestContext); valid {
 					requestContext.Params = pluginruntime.RouteParams(c.Params, pinned.Route)
 					if c.GetBool("task_gateway_endpoint") {
+						rewriteBodyModel := false
 						if body, ok := requestContext.Body.(map[string]any); ok {
-							if value, ok := body["value"].(map[string]any); ok {
+							if value, ok := body["value"].(map[string]any); ok && value["model"] != nil {
 								body, value = maps.Clone(body), maps.Clone(value)
 								value["model"] = info.UpstreamModelName
 								body["value"] = value
 								requestContext.Body = body
+								rewriteBodyModel = true
 							}
 						}
-						if len(requestContext.BodyText) > 0 {
+						if rewriteBodyModel && len(requestContext.BodyText) > 0 {
 							override := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ParamOverride: map[string]any{"model": info.UpstreamModelName}}}
 							raw, err := relaycommon.ApplyParamOverrideWithRelayInfo(requestContext.BodyText, override)
 							if err != nil {
@@ -231,7 +239,7 @@ func (a *TaskAdaptor) DecodeRequestAndSetAction(c *gin.Context, info *relaycommo
 					served, _, owned := model.ResolveTaskPluginModel(pinned.Generation, resolvedModel, a.plugin.Meta.Models)
 					modelMatches := owned && served == c.GetString("resolved_task_model")
 					if c.GetBool("task_gateway_endpoint") {
-						modelMatches = owned && strings.EqualFold(served, info.UpstreamModelName)
+						modelMatches = resolvedModel == info.OriginModelName || strings.EqualFold(resolvedModel, info.UpstreamModelName)
 					}
 					if callErr != nil || !resolvedOK || kind != string(pluginruntime.RouteTypeSubmit) || !modelMatches {
 						return service.TaskErrorWrapperLocal(fmt.Errorf("final task plugin decoder rejected the pinned model"), "plugin_request_invalid", http.StatusBadRequest)
@@ -299,6 +307,45 @@ func (a *TaskAdaptor) ExtractUsageFacts(c *gin.Context, info *relaycommon.RelayI
 		return nil
 	}
 	return facts
+}
+
+// RequestCapabilities describes the effective request without Provider I/O.
+func (a *TaskAdaptor) RequestCapabilities(c *gin.Context, info *relaycommon.RelayInfo) (TaskRequestCapabilities, error) {
+	if !a.hasHook(c.Request.Context(), "extractCapabilities") {
+		return TaskRequestCapabilities{}, fmt.Errorf("plugin must describe request capabilities")
+	}
+	value, err := a.plugin.Engine.Call(c.Request.Context(), "extractCapabilities", a.taskRequestContext(c, info))
+	if err != nil {
+		return TaskRequestCapabilities{}, fmt.Errorf("plugin capability hook failed")
+	}
+	fields, ok := value.(map[string]any)
+	if !ok {
+		return TaskRequestCapabilities{}, fmt.Errorf("plugin capability hook must return an object")
+	}
+	for name, field := range fields {
+		if field == nil || name != "features" && name != "input_modalities" && name != "output_modalities" && name != "image_count" {
+			return TaskRequestCapabilities{}, fmt.Errorf("plugin capability hook returned an unknown or null field")
+		}
+	}
+	encoded, err := common.Marshal(fields)
+	if err != nil {
+		return TaskRequestCapabilities{}, err
+	}
+	var required TaskRequestCapabilities
+	if err := common.Unmarshal(encoded, &required); err != nil {
+		return TaskRequestCapabilities{}, fmt.Errorf("plugin capability hook returned invalid counts")
+	}
+	if err := common.Unmarshal(encoded, &required.Capabilities); err != nil {
+		return TaskRequestCapabilities{}, fmt.Errorf("plugin capability hook returned invalid capabilities")
+	}
+	if fields["input_modalities"] == nil || fields["output_modalities"] == nil || len(required.Capabilities.OutputModalities) == 0 {
+		return TaskRequestCapabilities{}, fmt.Errorf("plugin capability hook must describe input and output modalities")
+	}
+	if required.ImageCount != nil && (*required.ImageCount < 0 || *required.ImageCount > 1<<53-1) {
+		return TaskRequestCapabilities{}, fmt.Errorf("plugin capability image count must be a nonnegative safe integer")
+	}
+	required.Capabilities, err = required.Capabilities.Normalize()
+	return required, err
 }
 
 func (a *TaskAdaptor) ExtractUsageFactsValidated(c *gin.Context, info *relaycommon.RelayInfo) (map[string]any, error) {

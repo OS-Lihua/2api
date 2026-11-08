@@ -370,8 +370,8 @@ func CompilePlugin(source string, options Options) (*LoadedPlugin, error) {
 			return nil, fmt.Errorf("plugin %s is missing required export %q", meta.Key, hook)
 		}
 	}
-	artifactHooks := make(map[string]bool, 2)
-	for _, hook := range []string{"listArtifacts", "buildContentRequest"} {
+	optionalHooks := make(map[string]bool, 3)
+	for _, hook := range []string{"extractCapabilities", "listArtifacts", "buildContentRequest"} {
 		if !engine.HasExport(hook) {
 			continue
 		}
@@ -382,9 +382,9 @@ func CompilePlugin(source string, options Options) (*LoadedPlugin, error) {
 		if !callable {
 			return nil, fmt.Errorf("plugin %s export %q is not a function", meta.Key, hook)
 		}
-		artifactHooks[hook] = true
+		optionalHooks[hook] = true
 	}
-	if artifactHooks["listArtifacts"] != artifactHooks["buildContentRequest"] {
+	if optionalHooks["listArtifacts"] != optionalHooks["buildContentRequest"] {
 		return nil, fmt.Errorf("plugin %s must export listArtifacts and buildContentRequest together", meta.Key)
 	}
 	for _, route := range meta.Routes {

@@ -7,7 +7,7 @@ export const meta = {
     en: "Google Veo video generation on the Gemini API (text-to-video and image-to-video)",
     zh: "Google Veo 视频生成（文生视频、图生视频），Gemini API 版本",
   },
-  version: "1.2.0",
+  version: "1.3.0",
   author: { name: "QuantumNous" },
   channelTypes: [24],
   models: ["veo-3.0-generate-001", "veo-3.0-fast-generate-001", "veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"],
@@ -241,6 +241,14 @@ export const native = {
     return { error: { code: error.httpStatus, message: error.message } };
   },
 };
+
+export function extractCapabilities(ctx) {
+  const instance = converted(ctx).body.instances[0];
+  const input = [];
+  if (trimmed(instance.prompt)) input.push("text");
+  if (instance.image) input.push("image");
+  return { input_modalities: input, output_modalities: ["video"], image_count: instance.image ? 1 : 0 };
+}
 
 export function buildSubmitRequest(ctx) {
   const result = converted(ctx);

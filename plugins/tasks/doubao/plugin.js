@@ -303,7 +303,7 @@ export const meta = {
     en: "Volcengine Doubao Seedance video generation and Seedream image generation",
     zh: "火山引擎豆包 Seedance 视频生成与 Seedream 图片生成",
   },
-  version: "1.4.0",
+  version: "1.5.0",
   author: { name: "QuantumNous" },
   channelTypes: [54, 45], // VolcEngine-type channels serve Ark video models with the same wire format
   models: Object.keys(VIDEO_MODELS).concat(Object.keys(IMAGE_MODELS)),
@@ -798,6 +798,41 @@ export const native = {
     return { error: { code: ERROR_CODES[error.httpStatus] || "InternalServiceError", message: error.message } };
   },
 };
+
+export function extractCapabilities(ctx) {
+  if (imageTask(ctx)) {
+    const converted = convertImage(ctx);
+    return {
+      features: converted.body.stream === true ? ["streaming"] : [],
+      input_modalities: converted.action === "image_to_image" ? ["text", "image"] : ["text"],
+      output_modalities: ["image"],
+      image_count: converted.facts.images_up_to_1_5k + converted.facts.images_above_1_5k,
+    };
+  }
+  const req = ctx.requestBody || {};
+  const source = req.vendorBody || req.metadata || {};
+  const input = [];
+  let imageCount = req.vendorBody ? 0 : (req.images || []).length;
+  let knownImages = true;
+  if (trimmed(req.prompt)) input.push("text");
+  if (!req.vendorBody && (req.images || []).length) input.push("image");
+  for (const item of source.content || []) {
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "text") input.push("text");
+    else if (item.type === "image_url") {
+      input.push("image");
+      imageCount++;
+    } else if (item.type === "audio_url") input.push("audio");
+    else if (item.type === "video_url" || item.type === "draft_task") input.push("video");
+    else {
+      input.push("image", "audio", "video", "text", "pdf");
+      knownImages = false;
+    }
+  }
+  const result = { input_modalities: input, output_modalities: ["video"] };
+  if (knownImages) result.image_count = imageCount;
+  return result;
+}
 
 export function buildSubmitRequest(ctx) {
   if (imageTask(ctx)) {

@@ -96,6 +96,15 @@ export declare function buildQueryRequest(ctx: TaskQueryContext): RequestDescrip
 export declare function buildBatchQueryRequest(ctx: BatchQueryContext, tasks: readonly TaskQueryContext[]): RequestDescriptor;
 export declare function parseTaskResult(ctx: TaskQueryContext, body: unknown, response: HookHTTPResponse): NormalizedTaskResult;
 export declare function parseBatchResult(ctx: BatchQueryContext, body: unknown, response: HookHTTPResponse): readonly (NormalizedTaskResult & {taskId: string; data?: unknown; state?: unknown})[];
+export interface RequestCapabilities {
+  features?: readonly ("streaming" | "tool_calling" | "reasoning" | "structured_output" | "caching")[];
+  input_modalities: readonly ("text" | "image" | "audio" | "video" | "pdf")[];
+  output_modalities: readonly ("text" | "image" | "audio" | "video" | "pdf")[];
+  /** Generated image upper bound for image output; otherwise input image count. Omit when unknown. */
+  image_count?: number;
+}
+/** Required for ModelOffering routing. Pure facts after parameter overrides; no fetch, token exchange or file resolution. */
+export declare function extractCapabilities(ctx: DriverContext): RequestCapabilities;
 export declare function extractUsage(ctx: DriverContext & {usagePurpose?: "facts" | "billing_ratios"}): Readonly<Record<string, string | number | boolean>> | null;
 export declare function extractUsageOnSubmit(ctx: DriverContext, taskData: unknown): Readonly<Record<string, string | number | boolean>> | null;
 export declare function extractUsageOnComplete(task: TaskQueryContext, result: NormalizedTaskResult, data: unknown): Readonly<Record<string, string | number | boolean>> | null;

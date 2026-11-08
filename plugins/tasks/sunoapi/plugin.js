@@ -9,7 +9,7 @@ export const meta = {
     en: "SunoAPI project music and lyrics generation",
     zh: "SunoAPI 项目 音乐与歌词生成",
   },
-  version: "1.1.0",
+  version: "1.2.0",
   author: { name: "QuantumNous" },
   channelTypes: [36],
   models: ["suno_music", "suno_lyrics"],
@@ -105,6 +105,11 @@ function validateAndNormalize(ctx) {
     throw new Error("invalid_action");
   }
   return { action: action, body: body };
+}
+
+export function extractCapabilities(ctx) {
+  const normalized = validateAndNormalize(ctx);
+  return { input_modalities: ["text"], output_modalities: [normalized.action === "MUSIC" ? "audio" : "text"], image_count: 0 };
 }
 
 export function buildSubmitRequest(ctx) {

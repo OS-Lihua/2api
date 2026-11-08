@@ -145,7 +145,7 @@ func productionPluginRouteHandlers(generation *jsplugin.RoutingGeneration, group
 			c.Writer.Status(),
 		)
 	}
-	auth := middleware.TokenAuth()
+	auth := middleware.TaskOriginAuth()
 	if group.Method == http.MethodGet || group.Method == http.MethodHead {
 		auth = middleware.TaskReadAuth()
 	}
@@ -155,8 +155,10 @@ func productionPluginRouteHandlers(generation *jsplugin.RoutingGeneration, group
 		middleware.NativeRouteCredential(keys...),
 		auth,
 		middleware.SystemPerformanceCheck(),
+		middleware.ResolveTaskPluginOffering(),
 		middleware.ModelRequestRateLimit(),
 		middleware.PrepareTaskPluginRoute(),
+		middleware.LegacyTaskSubmissionAuth(),
 		func(c *gin.Context) {
 			if middleware.TextOffering(c) != nil && c.GetBool("task_gateway_endpoint") {
 				controller.TaskGateway(c)

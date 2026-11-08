@@ -7,7 +7,7 @@ export const meta = {
     en: "Volcengine Jimeng video generation (text-to-video, image-to-video, and first-and-last-frame)",
     zh: "火山引擎即梦视频生成（文生视频、图生视频、首尾帧）",
   },
-  version: "1.2.0",
+  version: "1.3.0",
   author: { name: "QuantumNous" },
   channelTypes: [51],
   models: ["jimeng_vgfm_t2v_l20"],
@@ -299,6 +299,15 @@ function decodeImageCount(req, hasInputReferenceFile) {
 // The body is signed, so it is sent as the text the signature covers.
 // Jimeng reports no usage, so the request is the bill: a req_key the plugin
 // cannot price is refused before it is sent.
+export function extractCapabilities(ctx) {
+  const req = ctx.requestBody || {};
+  const input = [];
+  if (trimmed(req.prompt || (req.vendorBody || {}).prompt)) input.push("text");
+  const imageCount = req.vendorBody ? vendorImageCount(req.vendorBody) : submitImageCount(req);
+  if (imageCount) input.push("image");
+  return { input_modalities: input, output_modalities: ["video"], image_count: imageCount };
+}
+
 export function buildSubmitRequest(ctx) {
   const req = ctx.requestBody || {};
   const url = endpoint(ctx, "CVSync2AsyncSubmitTask");
