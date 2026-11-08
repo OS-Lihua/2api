@@ -168,6 +168,12 @@ func (a *ChannelAdaptor) PrepareMediaWire(c *gin.Context, info *relaycommon.Rela
 			return nil, err
 		}
 	}
+	if preparer, ok := a.provider.(channel.ProviderRequestBodyPreparer); ok {
+		body, err = preparer.PrepareRequestBody(c, a.providerMetadata(info), body)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if err := helper.ValidateGatewayMediaMultipliers(body); err != nil {
 		return nil, err
 	}

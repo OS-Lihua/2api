@@ -33,6 +33,12 @@ type ReplayableResponseBody interface{ SetReader(io.ReadCloser) }
 // must finish before the host starts an Attempt and its send budget.
 type ProviderExecution func(*gin.Context) (*http.Response, error)
 
+// ProviderRequestBodyPreparer resolves Provider-owned body fields without I/O.
+// Pricing and transport must use the resulting effective body.
+type ProviderRequestBodyPreparer interface {
+	PrepareRequestBody(*gin.Context, ProviderMetadata, []byte) ([]byte, error)
+}
+
 type ProviderRequestPreparer interface {
 	PrepareExecution(*gin.Context, ProviderMetadata, io.Reader) (ProviderExecution, error)
 }

@@ -4773,6 +4773,7 @@ func TestMediaGatewayImagenEditSkipsUnsupportedCandidate(t *testing.T) {
 func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T) {
 	audio := make([]byte, 48000)
 	for _, tc := range []struct {
+		purchaseBody   bool
 		name           string
 		provider       int
 		kind           protocol.Type
@@ -4784,6 +4785,8 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 		hold           int64
 		extra          string
 	}{
+		{name: "Volcengine purchase body", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, purchaseBody: true},
+		{name: "Volcengine purchase body override", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, purchaseBody: true, overrides: `{"operations":[{"path":"app.appid","mode":"set","value":""},{"path":"app.token","mode":"set","value":"client-token"}]}`},
 		{name: "MiniMax short PCM", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, short: true},
 		{name: "Volcengine short PCM", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, short: true},
 		{name: "MiniMax PCM", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech},
@@ -4828,6 +4831,10 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 					assert.Equal(t, float64(1), settings["channel"])
 					encoded = fmt.Sprintf(`{"data":{"audio":%q,"status":2},"base_resp":{"status_code":0}}`, strings.Repeat("00", len(audio)))
 				} else {
+					if tc.purchaseBody {
+						assert.Equal(t, "access", body["app"].(map[string]any)["appid"])
+						assert.Equal(t, "secret", body["app"].(map[string]any)["token"])
+					}
 					assert.Equal(t, float64(24000), body["audio"].(map[string]any)["rate"])
 					if strings.Contains(tc.name, "explicit silence zero") {
 						assert.Equal(t, float64(0), body["request"].(map[string]any)["silence_duration"])
@@ -4859,6 +4866,9 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 			if tc.kind == protocol.OpenAIAudioTranscription {
 				upstream = "@cf/openai/whisper"
 				sale, cost = `tier("audio",ai * 10)`, `tier("audio",ai * 7)`
+			}
+			if tc.purchaseBody {
+				cost = `param("app.appid") == "" || param("app.token") == "" ? tier("empty",fixed(0)) : tier("account",fixed(0.00002))`
 			}
 			overrides := tc.overrides
 			if overrides == "" {
@@ -4930,7 +4940,17 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
 			require.NoError(t, err)
 			require.EqualValues(t, 1, total)
-			assert.Equal(t, int64(119_000), attempts[0].Cost.Nanos)
+			wantCost := int64(119_000)
+			if tc.purchaseBody {
+				wantCost = 20_000
+			}
+			assert.Equal(t, wantCost, attempts[0].Cost.Nanos)
+			if tc.purchaseBody {
+				data, err := common.Marshal(attempts[0])
+				require.NoError(t, err)
+				assert.NotContains(t, string(data), "secret")
+				assert.NotContains(t, string(data), "client-token")
+			}
 			wallet, err := model.GetUserWallet(fixture.user.Id)
 			require.NoError(t, err)
 			assert.Equal(t, int64(999_847_000), wallet.Balance.Nanos)

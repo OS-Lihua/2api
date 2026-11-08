@@ -22,7 +22,7 @@ import (
 )
 
 // ttsProtocol owns the speech DTO and audio response; credentials and the
-// WebSocket connection belong to Provider.ExecuteRequest.
+// WebSocket connection belong to Provider.
 type ttsProtocol struct{}
 
 const contextKeyDecodedSpeechResponse = "volcengine_decoded_speech_response"
@@ -82,6 +82,23 @@ func (p *ttsProtocol) DoResponse(c *gin.Context, response *http.Response, info *
 	return &dto.Usage{PromptTokens: info.GetEstimatePromptTokens(), TotalTokens: info.GetEstimatePromptTokens()}, nil
 }
 
+func (p *Provider) PrepareRequestBody(_ *gin.Context, metadata channel.ProviderMetadata, body []byte) ([]byte, error) {
+	account := metadata.ProviderRequest()
+	if account.Protocol != protocol.OpenAIAudioSpeech {
+		return body, nil
+	}
+	var request VolcengineTTSRequest
+	if err := common.Unmarshal(body, &request); err != nil {
+		return nil, err
+	}
+	appID, token, err := parseVolcengineAuth(account.ApiKey)
+	if err != nil {
+		return nil, err
+	}
+	request.App.AppID, request.App.Token = appID, token
+	return common.Marshal(request)
+}
+
 func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetadata, body io.Reader) (*http.Response, error) {
 	account := metadata.ProviderRequest()
 	if account.Protocol != protocol.OpenAIAudioSpeech {
@@ -92,16 +109,7 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 	if err != nil {
 		return nil, err
 	}
-	var request VolcengineTTSRequest
-	if err = common.Unmarshal(payload, &request); err != nil {
-		return nil, err
-	}
-	appID, token, err := parseVolcengineAuth(account.ApiKey)
-	if err != nil {
-		return nil, err
-	}
-	request.App.AppID, request.App.Token = appID, token
-	payload, err = common.Marshal(request)
+	payload, err = p.PrepareRequestBody(c, metadata, payload)
 	if err != nil {
 		return nil, err
 	}
