@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net"
@@ -199,6 +200,65 @@ func GetStepUpIdentity(c *gin.Context) (service.AuthIdentity, bool) {
 	}
 	identity, ok := value.(service.AuthIdentity)
 	return identity, ok && identity.UserID > 0 && identity.SessionID != ""
+}
+
+// AuthorizeDashboardMutation rechecks the original credential and current user
+// under the mutation transaction; it never falls back to another credential.
+func AuthorizeDashboardMutation(tx *gorm.DB, c *gin.Context, permissions ...authz.Permission) bool {
+	raw, ok := authorizationToken(c.GetHeader("Authorization"))
+	if !ok {
+		return false
+	}
+	var user *model.User
+	if c.GetBool("access_token_legacy") {
+		identity, ok := GetAuthIdentity(c)
+		if !ok {
+			return false
+		}
+		var err error
+		user, err = model.ValidateLegacyAccessTokenWithTx(tx, identity, raw)
+		if err != nil {
+			return false
+		}
+	} else {
+		identity, ok := GetStepUpIdentity(c)
+		if !ok || identity.UserID != c.GetInt("id") {
+			return false
+		}
+		tokenID, pat := model.ParseAccessTokenSessionID(identity.SessionID)
+		if !pat {
+			parsed, internal, err := service.ParseDashboardAccessToken(raw)
+			if err != nil || !internal || parsed != identity {
+				return false
+			}
+		}
+		if err := model.ValidateAuthSessionWithTx(tx, identity); err != nil {
+			return false
+		}
+		if pat {
+			var token model.UserAccessToken
+			if err := tx.Where(`"id" = ? AND "user_id" = ?`, tokenID, identity.UserID).First(&token).Error; err != nil {
+				return false
+			}
+			if subtle.ConstantTimeCompare([]byte(token.TokenHash), []byte(model.AccessTokenFingerprint(raw))) != 1 {
+				return false
+			}
+			for _, permission := range permissions {
+				if !service.AccessTokenScopeGranted(token.GetScopes(), service.AccessTokenScopeOf(permission)) {
+					return false
+				}
+			}
+		}
+		user = &model.User{}
+		if err := tx.Select("id", "role", "status").First(user, identity.UserID).Error; err != nil {
+			return false
+		}
+	}
+	c.Set("role", user.Role)
+	if user.Status != common.UserStatusEnabled || user.Role < common.RoleAdminUser {
+		return false
+	}
+	return authz.CanWithTx(tx, user.Id, user.Role, permissions...)
 }
 
 func authenticateDashboardRequest(c *gin.Context) (*model.UserBase, service.AuthIdentity, bool, error) {
