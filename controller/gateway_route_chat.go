@@ -134,6 +134,9 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 	}
 	converted, err := adaptor.ConvertRequest(candidate, info, conversion.Value)
 	if err != nil {
+		if diagnostics := info.ConversionDiagnostics(); len(diagnostics) > 0 {
+			return nil, &service.GatewayConversionError{Diagnostics: diagnostics}
+		}
 		return nil, service.ErrGatewayConversion
 	}
 	encoded, err := common.Marshal(converted)
@@ -166,6 +169,11 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 		effectiveOutputLimit = effective.MaxTokens
 	}
 	if requestedOutputLimit != nil && *requestedOutputLimit == 0 && (effectiveOutputLimit == nil || *effectiveOutputLimit != 0) {
+		parameter := "max_tokens"
+		if original.MaxCompletionTokens != nil {
+			parameter = "max_completion_tokens"
+		}
+		info.RecordConversionDiagnostics(candidate, []types.ConversionDiagnostic{{Code: "request_parameter_dropped", Path: parameter, Message: "The final native request must preserve the explicit zero output limit", Severity: types.ConversionDiagnosticError}})
 		return nil, &service.GatewayConversionError{Diagnostics: info.ConversionDiagnostics()}
 	}
 	common.SetContextKey(candidate, constant.ContextKeyOriginalModel, info.TokenizerModel)

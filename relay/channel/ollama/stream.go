@@ -313,11 +313,17 @@ func ollamaSourceResponse(lines []string, index int) *dto.OpenAITextResponse {
 		}
 		for _, raw := range gjson.Get(line, "message.tool_calls").Array() {
 			var call OllamaToolCall
-			if common.UnmarshalJsonStr(raw.Raw, &call) != nil {
+			name := raw.Get("function.name")
+			nameValid := name.Type == gjson.String && common.UnmarshalJsonStr(name.Raw, &call.Function.Name) == nil
+			argumentsErr := common.UnmarshalUseNumber([]byte(raw.Get("function.arguments").Raw), &call.Function.Arguments)
+			if !nameValid && argumentsErr != nil {
 				continue
 			}
 			var converted []dto.ToolCallResponse
 			converted, index = ollamaToolCallsToOpenAI([]OllamaToolCall{call}, index, true)
+			if argumentsErr != nil {
+				converted[0].Function.Arguments = ""
+			}
 			calls = append(calls, converted...)
 		}
 	}
@@ -347,7 +353,15 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		lines = []string{raw}
 	}
 	if info.ResponseFacts != nil {
-		info.ResponseFacts.RecordChatSource(ollamaSourceResponse(lines, 0), info.TokenizerModelName())
+		sourceLines := lines
+		if len(lines) > 1 {
+			first, _, _ := strings.Cut(strings.TrimSpace(raw), "\n")
+			var firstJSON common.RawMessage
+			if common.UnmarshalJsonStr(first, &firstJSON) != nil {
+				sourceLines = []string{raw}
+			}
+		}
+		info.ResponseFacts.RecordChatSource(ollamaSourceResponse(sourceLines, 0), info.TokenizerModelName())
 	}
 	var (
 		aggContent       strings.Builder

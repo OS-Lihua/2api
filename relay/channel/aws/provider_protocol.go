@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 var _ channel.ProviderProtocolComposer = (*Provider)(nil)
@@ -94,12 +95,13 @@ func (p *novaProtocol) DoResponse(c *gin.Context, resp *http.Response, info *rel
 	if info.ResponseFacts != nil {
 		body = relaycommon.SanitizeNativeUsage(body, "usage")
 		info.ResponseFacts.RecordNativeUsage(usage, body, "usage.inputTokens", "usage.outputTokens")
+		var text strings.Builder
+		for _, part := range gjson.GetBytes(body, "output.message.content").Array() {
+			text.WriteString(relaycommon.SourceText(part.Get("text")))
+		}
+		info.ResponseFacts.RecordChatSource(&dto.OpenAITextResponse{Choices: []dto.OpenAITextResponseChoice{{Message: dto.Message{Role: "assistant", Content: text.String()}}}}, info.TokenizerModelName())
 	}
 	response, reportedUsage, err := novaChatResponse(body, info.UpstreamModelName, helper.GetResponseID(c))
-	if err == nil && info.ResponseFacts != nil {
-		info.ResponseFacts.SourceGeneratedText = response.Choices[0].Message.StringContent()
-		info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceGeneratedText != ""
-	}
 	if captured, ok := resp.Body.(channel.ResponseErrorCarrier); ok && captured.ResponseError() != nil {
 		return usage, captured.ResponseError()
 	}

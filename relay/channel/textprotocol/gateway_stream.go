@@ -77,11 +77,6 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		case types.RelayFormatGemini:
 			event = &dto.GeminiChatResponse{}
 		}
-		if err := common.Unmarshal(normalized, event); err != nil {
-			streamErr = err
-			sr.Stop(err)
-			return
-		}
 		if p.format == types.RelayFormatOpenAIResponses {
 			sourceOutput.ObserveResponses(normalized)
 		} else {
@@ -94,6 +89,11 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		}
 		info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || sourceOutput.String() != "" || gatewayMediaOutput(normalized, p.format)
 		safety := observeGatewaySafety(info, []byte(data), p.format)
+		if err := common.Unmarshal(normalized, event); err != nil {
+			streamErr = err
+			sr.Stop(err)
+			return
+		}
 		if p.format == types.RelayFormatOpenAIResponses {
 			service.ObserveResponsesOutcome(info, event.(*dto.ResponsesStreamResponse))
 		}
@@ -479,11 +479,11 @@ func gatewayStreamBusinessText(body []byte, format types.RelayFormat) string {
 	case types.RelayFormatOpenAIResponses:
 		switch root.Get("type").String() {
 		case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.refusal.delta":
-			text.WriteString(root.Get("delta").String())
+			text.WriteString(relaycommon.SourceText(root.Get("delta")))
 		case "response.output_item.added":
 			if kind := root.Get("item.type").String(); kind == "function_call" || kind == "custom_tool_call" {
-				text.WriteString(root.Get("item.name").String())
-				text.WriteString(root.Get("item.input").String())
+				text.WriteString(relaycommon.SourceText(root.Get("item.name")))
+				text.WriteString(relaycommon.SourceText(root.Get("item.input")))
 			}
 		}
 	case types.RelayFormatClaude:
@@ -492,7 +492,7 @@ func gatewayStreamBusinessText(body []byte, format types.RelayFormat) string {
 		}
 		if root.Get("type").String() == "content_block_delta" {
 			for _, key := range []string{"text", "thinking", "partial_json"} {
-				text.WriteString(root.Get("delta." + key).String())
+				text.WriteString(relaycommon.SourceText(root.Get("delta." + key)))
 			}
 		}
 	case types.RelayFormatGemini:

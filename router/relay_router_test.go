@@ -4443,6 +4443,21 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 		{name: "independent stream source Cohere retains prior fragments", provider: constant.ChannelTypeCohere, stream: true, body: "{\"event_type\":\"text-generation\",\"text\":\"Hello\"}\n{\"event_type\":\"text-generation\",\"is_finished\":{},\"text\":\"World\"}\n", status: "partial", source: "estimated", prompt: 9, completion: 1, charge: 19800, cost: 13000},
 		{name: "independent stream source Ollama tools preserve structure", provider: constant.ChannelTypeOllama, stream: true, body: "{\"model\":{},\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"f\",\"arguments\":{}}}]},\"done\":false}\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 18000},
 		{name: "independent stream source Ollama tools keep prior indices", provider: constant.ChannelTypeOllama, stream: true, body: "{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"Hello\",\"arguments\":{}}}]},\"done\":false}\n{\"model\":{},\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"g\",\"arguments\":{}}}]},\"done\":false}\n", status: "partial", source: "estimated", prompt: 9, completion: 9, charge: 48600, purchaseExpression: `tier("output",c*2)`, cost: 36000},
+		{name: "independent source Ollama malformed tool id", provider: constant.ChannelTypeOllama, body: `{"message":{"tool_calls":[{"id":{},"function":{"name":"f","arguments":{}}}]},"done":true}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 4000},
+		{name: "independent stream source Ollama malformed tool id", provider: constant.ChannelTypeOllama, stream: true, body: "{\"message\":{\"tool_calls\":[{\"id\":{},\"function\":{\"name\":\"f\",\"arguments\":{}}}]},\"done\":false}\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 18000},
+		{name: "independent source Ollama partial pretty JSON", provider: constant.ChannelTypeOllama, shortBody: true, body: "{\n  \"message\": {\n    \"role\": \"assistant\",\n    \"content\": \"Hello\"\n  },\n  \"done\":", status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 2000},
+		{name: "independent source Nova malformed stop", provider: constant.ChannelTypeAws, key: "test-access|test-secret|us-east-1", upstreamModel: "amazon.nova-lite-v1:0", body: `{"output":{"message":{"content":[{"text":"Hello"}]}},"stopReason":{}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 2000},
+		{name: "independent source Nova truncated root", provider: constant.ChannelTypeAws, key: "test-access|test-secret|us-east-1", upstreamModel: "amazon.nova-lite-v1:0", shortBody: true, body: `{"output":{"message":{"content":[{"text":"Hello"}]}},"stopReason":`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 2000},
+		{name: "independent stream source Coze malformed id", provider: constant.ChannelTypeCoze, stream: true, body: "event: conversation.message.delta\ndata: {\"id\":1,\"content\":\"Hello\",\"reasoning_content\":\"World\"}\n\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 4000},
+		{name: "independent unterminated source Coze malformed id", provider: constant.ChannelTypeCoze, stream: true, body: "event: conversation.message.delta\ndata: {\"id\":1,\"content\":\"Hello\",\"reasoning_content\":\"World\"}", status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 4000},
+		{name: "independent stream source Chat malformed created", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "openai_chat", stream: true, body: "data: {\"created\":{},\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}\n\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 2000},
+		{name: "invalid source Chat incomplete string", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "openai_chat", shortBody: true, body: `{"choices":[{"message":{"content":"Hello`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 0},
+		{name: "invalid source Responses incomplete string", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "openai_responses", shortBody: true, body: `{"output":[{"type":"message","content":[{"type":"output_text","text":"Hello`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 0},
+		{name: "invalid source Messages numeric text", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "anthropic_messages", body: `{"id":"msg","type":"message","role":"assistant","content":[{"type":"text","text":123}],"stop_reason":"end_turn"}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 0},
+		{name: "invalid total exponent preserves JSON bases", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "openai_chat", body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":100,"total_tokens":1e400}}`, source: "upstream", prompt: 1000, completion: 100, charge: 2160000, cost: 1200000},
+		{name: "invalid total exponent preserves stream bases", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "openai_chat", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":100,\"total_tokens\":1e400}}\n\ndata: [DONE]\n\n", source: "upstream", prompt: 1000, completion: 100, charge: 2160000, cost: 1200000},
+		{name: "Coze unfinished completed snapshot is not another delta", provider: constant.ChannelTypeCoze, stream: true, body: "event: conversation.message.delta\ndata: {\"id\":\"m1\",\"content\":\"Hello\"}\n\nevent: conversation.message.completed\ndata: {\"id\":\"m1\",\"content\":\"Hello\"}", status: "partial", source: "estimated", prompt: 9, completion: 1, charge: 19800, purchaseExpression: `tier("output",c*2)`, cost: 2000},
+		{name: "Coze unfinished completed snapshot retains new suffix", provider: constant.ChannelTypeCoze, stream: true, body: "event: conversation.message.delta\ndata: {\"id\":\"m1\",\"content\":\"Hello\"}\n\nevent: conversation.message.completed\ndata: {\"id\":\"m1\",\"content\":\"HelloWorld\"}", status: "partial", source: "estimated", prompt: 9, completion: 1, charge: 19800, purchaseExpression: `tier("output",c*2)`, cost: 4000},
 		{name: "Cohere failed JSON is not successful output", provider: constant.ChannelTypeCohere, body: `{"text":"Hello","finish_reason":"ERROR","meta":{"billed_units":{"input_tokens":10,"output_tokens":5}}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 20000},
 		{name: "Cohere failed JSON keeps source estimate", provider: constant.ChannelTypeCohere, body: `{"text":"Hello","finish_reason":"ERROR"}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
 		{name: "Ollama pretty JSON remains valid", provider: constant.ChannelTypeOllama, body: "{\n\"message\":{\"content\":\"Hello\"},\n\"done\":true,\n\"prompt_eval_count\":1000,\n\"eval_count\":100\n}", source: "upstream", prompt: 1000, completion: 100, charge: 2160000, cost: 1200000},
@@ -5129,28 +5144,129 @@ func TestTextGatewayNativeStreamCancellationPreservesPurchase(t *testing.T) {
 	}
 }
 
+func TestTextGatewayConversionLossSaveFailureKeepsPriorPolicy(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("settings update must not contact Provider") })
+	key := "global.accepted_conversion_losses"
+	require.NoError(t, model.UpdateOption(key, `["request_parameter_dropped"]`))
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", fixture.sale.CreatedBy).Update("role", common.RoleRootUser).Error)
+	token := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "option:write", "option:read")
+	require.NoError(t, model.DB.Exec(`CREATE FUNCTION gw36_reject_loss_policy() RETURNS trigger LANGUAGE plpgsql AS $gw36$ BEGIN RAISE EXCEPTION 'fixture option write rejected' USING ERRCODE = '55000'; END; $gw36$`).Error)
+	require.NoError(t, model.DB.Exec(`CREATE TRIGGER gw36_loss_reject BEFORE UPDATE ON "options" FOR EACH ROW WHEN (OLD."key" = 'global.accepted_conversion_losses') EXECUTE FUNCTION gw36_reject_loss_policy()`).Error)
+	t.Cleanup(func() {
+		require.NoError(t, model.DB.Exec(`DROP TRIGGER gw36_loss_reject ON "options"`).Error)
+		require.NoError(t, model.DB.Exec(`DROP FUNCTION gw36_reject_loss_policy()`).Error)
+		require.NoError(t, model.UpdateOption(key, "[]"))
+	})
+	response := adminSecurityRequest(fixture.engine, token, http.MethodPut, "/api/option/", `{"key":"global.accepted_conversion_losses","value":"[]"}`)
+	var result struct {
+		Success bool `json:"success"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+	assert.False(t, result.Success, response.Body.String())
+	var stored model.Option
+	require.NoError(t, model.DB.Where(&model.Option{Key: key}).First(&stored).Error)
+	assert.Equal(t, `["request_parameter_dropped"]`, stored.Value)
+	assert.Contains(t, service.GatewayAcceptedConversionLosses(fixture.offering), "request_parameter_dropped")
+}
+
+func TestTextGatewayNativeHistoryRetainsExactNumbers(t *testing.T) {
+	for _, kind := range []string{"anthropic_messages", "gemini_generate"} {
+		t.Run(kind, func(t *testing.T) {
+			calls := 0
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				body, err := io.ReadAll(r.Body)
+				require.NoError(t, err)
+				assert.Contains(t, string(body), "9007199254740993")
+				assert.NotContains(t, string(body), "9007199254740992")
+				w.Header().Set("Content-Type", "application/json")
+				if kind == "anthropic_messages" {
+					_, _ = io.WriteString(w, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`)
+				} else {
+					_, _ = io.WriteString(w, `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}`)
+				}
+			})
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", kind).Error)
+			caps := capability.Set{Features: []capability.Feature{capability.ToolCalling}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+			path := "/v1/messages"
+			body := `{"model":"gateway-offering","max_tokens":16,"messages":[{"role":"user","content":"Lookup"},{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"lookup","input":{"id":9007199254740993}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"found"}]}]}`
+			if kind == "gemini_generate" {
+				path = "/v1beta/models/gateway-offering:generateContent"
+				body = `{"contents":[{"role":"user","parts":[{"text":"Lookup"}]},{"role":"model","parts":[{"functionCall":{"name":"lookup","args":{"id":9007199254740993}}}]},{"role":"user","parts":[{"functionResponse":{"name":"lookup","response":{"result":"found"}}}]}],"generationConfig":{"maxOutputTokens":16}}`
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, body)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Equal(t, 1, calls)
+		})
+	}
+}
+
+func TestTextGatewayGeminiMediaResolutionControlsContext(t *testing.T) {
+	picture, err := os.ReadFile("../controller/probe-fixtures/red.png")
+	require.NoError(t, err)
+	for _, test := range []struct {
+		name, global, part string
+		allowed            bool
+	}{{"low", "MEDIA_RESOLUTION_LOW", "", true}, {"ultra", "MEDIA_RESOLUTION_ULTRA_HIGH", "", false}, {"part overrides global", "MEDIA_RESOLUTION_ULTRA_HIGH", "MEDIA_RESOLUTION_LOW", true}} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"candidatesTokenCount":0}}`)
+			})
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "gemini_generate").Error)
+			caps := capability.Set{InputModalities: []capability.Modality{capability.Image}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{ContextLength: common.GetPointer(int64(512))}}
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Updates(map[string]any{"model_name": "gemini-3.7-flash", "capabilities": caps}).Error)
+			part := ""
+			if test.part != "" {
+				part = fmt.Sprintf(`,"mediaResolution":{"level":%q}`, test.part)
+			}
+			body := fmt.Sprintf(`{"contents":[{"role":"user","parts":[{"inlineData":{"mimeType":"image/png","data":%q}%s}]}],"generationConfig":{"maxOutputTokens":16,"mediaResolution":%q}}`, base64.StdEncoding.EncodeToString(picture), part, test.global)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1beta/models/gateway-offering:generateContent", body)
+			if test.allowed {
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				assert.Equal(t, 1, calls)
+				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+				require.NoError(t, err)
+				assert.GreaterOrEqual(t, record.Usage.PromptTokens, int64(280))
+				assert.Less(t, record.Usage.PromptTokens, int64(512))
+			} else {
+				assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+				assert.Zero(t, calls)
+			}
+		})
+	}
+}
+
 func TestTextGatewayNativeZeroLimitReturnsLossReason(t *testing.T) {
 	for _, field := range []string{"max_tokens", "max_completion_tokens"} {
 		for _, accepted := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/accepted=%t", field, accepted), func(t *testing.T) {
-				calls := 0
-				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { calls++ })
-				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeDify).Error)
-				if accepted {
-					fixture.offering.AcceptedConversionLosses = []string{"request_parameter_dropped"}
-					require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
-				}
-				body := fmt.Sprintf(`{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],%q:0}`, field)
-				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", body)
-				assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
-				assert.Contains(t, response.Body.String(), "unsupported_parameter")
-				assert.Contains(t, response.Body.String(), field)
-				assert.Contains(t, response.Body.String(), "The native request did not retain this request parameter")
-				assert.Zero(t, calls)
-				_, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
-				require.NoError(t, err)
-				assert.Zero(t, total)
-			})
+			for _, provider := range []int{constant.ChannelTypeDify, constant.ChannelTypeOpenAI} {
+				t.Run(fmt.Sprintf("%s/accepted=%t/provider=%d", field, accepted, provider), func(t *testing.T) {
+					calls := 0
+					fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { calls++ })
+					require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", provider).Error)
+					if provider == constant.ChannelTypeOpenAI {
+						require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", fmt.Sprintf(`{%q:16}`, field)).Error)
+					}
+					if accepted {
+						fixture.offering.AcceptedConversionLosses = []string{"request_parameter_dropped"}
+						require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+					}
+					body := fmt.Sprintf(`{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],%q:0}`, field)
+					response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", body)
+					assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+					assert.Contains(t, response.Body.String(), "unsupported_parameter")
+					assert.Contains(t, response.Body.String(), field)
+					assert.Contains(t, response.Body.String(), "The final native request must preserve the explicit zero output limit")
+					assert.Zero(t, calls)
+					_, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+					require.NoError(t, err)
+					assert.Zero(t, total)
+				})
+			}
 		}
 	}
 }
@@ -5368,13 +5484,16 @@ func TestTextGatewaySparkPreservesNativeCounterPresence(t *testing.T) {
 	constant.StreamingTimeout = 60
 	t.Cleanup(func() { constant.StreamingTimeout = previousTimeout })
 	for _, test := range []struct {
-		name, counters     string
-		before             string
-		failed             bool
-		interrupted        bool
-		malformedHeader    bool
-		prompt, completion int
+		name, counters          string
+		before                  string
+		failed                  bool
+		interrupted             bool
+		malformedHeader         bool
+		badSID, cancelAfterRead bool
+		prompt, completion      int
 	}{
+		{name: "bad sid retains independent text", failed: true, badSID: true},
+		{name: "read then cancel retains counters", failed: true, cancelAfterRead: true, counters: `,"usage":{"text":{"prompt_tokens":10,"completion_tokens":5}}`, prompt: 10, completion: 5},
 		{name: "malformed header keeps native usage", failed: true, malformedHeader: true, counters: `,"usage":{"text":{"prompt_tokens":10,"completion_tokens":5}}`, prompt: 10, completion: 5},
 		{name: "bad total keeps native bases", counters: `,"usage":{"text":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":{}}}`, prompt: 10, completion: 5},
 		{name: "interrupted native source", failed: true, interrupted: true},
@@ -5386,7 +5505,7 @@ func TestTextGatewaySparkPreservesNativeCounterPresence(t *testing.T) {
 		{name: "reported zero", counters: `,"usage":{"text":{"prompt_tokens":0,"completion_tokens":0}}`},
 	} {
 		for _, stream := range []bool{false, true} {
-			if test.interrupted && stream {
+			if test.interrupted && stream || test.cancelAfterRead && !stream {
 				continue
 			}
 			t.Run(fmt.Sprintf("%s/stream=%t", test.name, stream), func(t *testing.T) {
@@ -5406,6 +5525,12 @@ func TestTextGatewaySparkPreservesNativeCounterPresence(t *testing.T) {
 				if test.malformedHeader {
 					body = strings.Replace(body, `"code":10014`, `"code":{}`, 1)
 				}
+				if test.badSID {
+					body = strings.Replace(body, `"code":10014`, `"code":0,"sid":{}`, 1)
+				}
+				if test.cancelAfterRead {
+					body = strings.Replace(body, `"code":10014`, `"code":0`, 1)
+				}
 				response := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
 				if test.interrupted {
 					reader, writer := io.Pipe()
@@ -5415,8 +5540,14 @@ func TestTextGatewaySparkPreservesNativeCounterPresence(t *testing.T) {
 						_ = writer.CloseWithError(io.ErrUnexpectedEOF)
 					}()
 				}
+				if test.cancelAfterRead {
+					ctx, cancel := context.WithCancel(c.Request.Context())
+					t.Cleanup(cancel)
+					c.Request = c.Request.WithContext(ctx)
+					response.Body = &gatewayCancelOnReadBody{ReadCloser: response.Body, cancel: cancel}
+				}
 				result, apiErr := adaptor.DoResponse(c, response, info)
-				if test.interrupted {
+				if test.interrupted || test.badSID {
 					assert.Equal(t, "Hello", info.ResponseFacts.SourceGeneratedText)
 					assert.True(t, info.ResponseFacts.SourceOutputObserved)
 				}
@@ -5427,7 +5558,11 @@ func TestTextGatewaySparkPreservesNativeCounterPresence(t *testing.T) {
 				}
 				usage, ok := result.(*dto.Usage)
 				require.True(t, ok, "reported Provider usage survives native errors")
-				assert.Equal(t, test.prompt, usage.PromptTokens)
+				expectedPrompt := test.prompt
+				if test.badSID && stream {
+					expectedPrompt = 9
+				}
+				assert.Equal(t, expectedPrompt, usage.PromptTokens)
 				assert.Equal(t, test.completion, usage.CompletionTokens)
 				if test.failed && (!stream || test.before == "") {
 					assert.NotContains(t, recorder.Body.String(), "Hello")
@@ -9534,6 +9669,44 @@ func TestTextGatewayJSONFlushFailurePreservesCostAndRefundsFixedPrice(t *testing
 			wallet, err := model.GetUserWallet(fixture.user.Id)
 			require.NoError(t, err)
 			assert.Equal(t, int64(1_000_000_000), wallet.Balance.Nanos)
+		})
+	}
+}
+
+func TestTextGatewayMalformedSafetyFrameNeverSwitches(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"id\":{},\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0}}\n\n")
+	})
+	calls := 0
+	addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"Recovered"},"finish_reason":"stop"}]}`)
+	})
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	assert.Zero(t, calls)
+	assert.NotContains(t, response.Body.String(), "Recovered")
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, "content_safety", attempts[0].ErrorClass)
+	assert.Equal(t, "stop", attempts[0].FailoverDecision)
+	assert.EqualValues(t, 10000, attempts[0].Cost.Nanos)
+}
+
+func TestTextGatewayNativeComposerReturnsParameterReasons(t *testing.T) {
+	for _, test := range []struct{ field, extra string }{{"tools", `"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]`}, {"response_format", `"response_format":{"type":"json_object"}`}} {
+		t.Run(test.field, func(t *testing.T) {
+			calls := 0
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { calls++ })
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeCohere).Error)
+			caps := capability.Set{Features: []capability.Feature{capability.ToolCalling, capability.StructuredOutput}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", fmt.Sprintf(`{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],%s}`, test.extra))
+			assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), test.field)
+			assert.Contains(t, response.Body.String(), "The native Cohere request cannot represent this parameter")
+			assert.Zero(t, calls)
 		})
 	}
 }

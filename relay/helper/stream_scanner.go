@@ -62,7 +62,9 @@ func NewSSEEventScanner(reader io.Reader, facts *relaycommon.ResponseFacts) *buf
 	scanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
 		advance, token, err := splitSSEEvents(data, atEOF)
 		if err != nil && facts != nil {
-			facts.UnterminatedStreamData = []byte(ParseSSEEvent(string(data)).Data)
+			event := ParseSSEEvent(string(data))
+			facts.UnterminatedStreamData = []byte(event.Data)
+			facts.UnterminatedStreamEvent = event.Event
 		}
 		return advance, token, err
 	})

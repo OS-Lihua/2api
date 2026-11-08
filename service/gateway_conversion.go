@@ -124,6 +124,7 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 	}
 	preservedImageReferences := false
 	projectionMedia := map[string]dto.MediaContent{}
+	geminiImageDetails := map[string][]string{}
 	var referencedMedia []dto.MediaContent
 	references := map[string]bool{}
 	if responses, ok := request.(*dto.OpenAIResponsesRequest); ok {
@@ -275,6 +276,16 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 			}
 		}
 		for _, part := range parts {
+			detail := string(gemini.GenerationConfig.MediaResolution)
+			var resolution struct {
+				Level string `json:"level"`
+			}
+			if len(part.MediaResolution) > 0 && common.Unmarshal(part.MediaResolution, &resolution) == nil && resolution.Level != "" {
+				detail = resolution.Level
+			}
+			if detail == "" {
+				detail = "auto"
+			}
 			path := part.path + ".inlineData"
 			if part.InlineData != nil && part.InlineData.Data != "" {
 				mime := strings.ToLower(part.InlineData.MimeType)
@@ -282,7 +293,7 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 				case strings.HasPrefix(mime, "audio/"):
 					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeInputAudio, InputAudio: &dto.MessageInputAudio{Data: part.InlineData.Data, Format: strings.TrimPrefix(mime, "audio/")}}
 				case strings.HasPrefix(mime, "image/"):
-					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: "data:" + mime + ";base64," + part.InlineData.Data, Detail: "auto", MimeType: mime}}
+					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: "data:" + mime + ";base64," + part.InlineData.Data, Detail: detail, MimeType: mime}}
 				case strings.HasPrefix(mime, "video/"):
 					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeVideoUrl, VideoUrl: &dto.MessageVideoUrl{Url: "data:" + mime + ";base64," + part.InlineData.Data}}
 				case mime == "application/pdf":
@@ -295,13 +306,19 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 				path = part.path + ".fileData"
 				switch {
 				case strings.HasPrefix(mime, "image/"):
-					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: part.FileData.FileUri, Detail: "auto", MimeType: mime}}
+					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: part.FileData.FileUri, Detail: detail, MimeType: mime}}
 				case strings.HasPrefix(mime, "audio/"):
 					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeInputAudio, InputAudio: &dto.MessageInputAudio{Data: part.FileData.FileUri, Format: strings.TrimPrefix(mime, "audio/")}}
 				case strings.HasPrefix(mime, "video/"):
 					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeVideoUrl, VideoUrl: &dto.MessageVideoUrl{Url: part.FileData.FileUri}}
 				case mime == "application/pdf":
 					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeFile, File: &dto.MessageFile{FileName: "reference.pdf", FileData: part.FileData.FileUri}}
+				}
+			}
+			if !part.nested {
+				if media, ok := projectionMedia[path]; ok && media.GetImageMedia() != nil {
+					image := media.GetImageMedia()
+					geminiImageDetails[image.Url] = append(geminiImageDetails[image.Url], detail)
 				}
 			}
 			if part.nested {
@@ -343,6 +360,22 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 		return nil, fmt.Errorf("missing text request projection")
 	}
 	chat.RequiresTextInput = requiresTextInput
+	for i := range chat.Messages {
+		media := chat.Messages[i].ParseContent()
+		changed := false
+		for j := range media {
+			if image := media[j].GetImageMedia(); image != nil && len(geminiImageDetails[image.Url]) > 0 {
+				details := geminiImageDetails[image.Url]
+				image.Detail = details[0]
+				media[j].ImageUrl = image
+				geminiImageDetails[image.Url] = details[1:]
+				changed = true
+			}
+		}
+		if changed {
+			chat.Messages[i].SetMediaContent(media)
+		}
+	}
 	if native, ok := request.(*dto.ClaudeRequest); ok {
 		chat.RequiresToolCalling = len(gjson.ParseBytes(native.McpServers).Array()) > 0
 	}

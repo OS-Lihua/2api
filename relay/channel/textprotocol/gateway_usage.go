@@ -49,7 +49,7 @@ func (a *gatewayUsageAccumulator) Observe(body []byte) (*dto.Usage, error) {
 	}
 	incoming := map[string]any{}
 	if raw.Exists() && raw.Type != gjson.Null {
-		if err := common.UnmarshalJsonStr(raw.Raw, &incoming); err != nil || incoming == nil {
+		if err := common.UnmarshalUseNumber([]byte(raw.Raw), &incoming); err != nil || incoming == nil {
 			return nil, nil
 		}
 	}
@@ -211,11 +211,11 @@ func mergeGatewayUsageSnapshot(current, incoming map[string]any) {
 	for key, value := range incoming {
 		lower := strings.ToLower(key)
 		if strings.Contains(lower, "token") && !strings.HasSuffix(lower, "details") || strings.HasSuffix(lower, "_requests") {
-			number, ok := value.(float64)
-			if !ok || number < 0 || number > 1<<31-1 || number != float64(int64(number)) {
+			encoded, err := common.Marshal(value)
+			if err != nil || !gatewayValidCounter(gjson.ParseBytes(encoded)) {
 				continue
 			}
-			current[key] = value
+			current[key] = float64(gjson.ParseBytes(encoded).Int())
 			continue
 		}
 		if strings.HasSuffix(lower, "details") {

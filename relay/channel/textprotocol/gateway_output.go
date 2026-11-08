@@ -99,12 +99,12 @@ func (o *gatewayGeneratedOutput) ObserveResponses(body []byte) (string, bool) {
 		if strings.HasPrefix(kind, "response.reasoning_text") {
 			category = "reasoning"
 		}
-		text := root.Get("delta").String()
+		text := relaycommon.SourceText(root.Get("delta"))
 		delta := strings.HasSuffix(kind, ".delta")
 		if !delta {
-			text = root.Get("text").String()
+			text = relaycommon.SourceText(root.Get("text"))
 			if value := root.Get("refusal"); value.Exists() {
-				text = value.String()
+				text = relaycommon.SourceText(value)
 			}
 		}
 		o.mergePart(fmt.Sprintf("%d/%s/%d", index, category, partIndex), text, delta)
@@ -126,12 +126,12 @@ func (o *gatewayGeneratedOutput) ObserveResponses(body []byte) (string, bool) {
 	case "response.output_item.added", "response.output_item.done":
 		return o.ObserveItem(index, root.Get("item")), true
 	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.function_call_arguments.done", "response.custom_tool_call_input.done":
-		arguments := root.Get("delta").String()
+		arguments := relaycommon.SourceText(root.Get("delta"))
 		delta := strings.HasSuffix(kind, ".delta")
 		if !delta {
-			arguments = root.Get("arguments").String()
+			arguments = relaycommon.SourceText(root.Get("arguments"))
 			if value := root.Get("input"); value.Exists() {
-				arguments = value.String()
+				arguments = relaycommon.SourceText(value)
 			}
 		}
 		id := root.Get("item_id").String()
@@ -232,19 +232,19 @@ func (o *gatewayGeneratedOutput) String() string {
 
 func gatewayResponsesContentText(part gjson.Result) string {
 	if value := part.Get("refusal"); value.Type == gjson.String {
-		return value.String()
+		return relaycommon.SourceText(value)
 	}
-	return part.Get("text").String()
+	return relaycommon.SourceText(part.Get("text"))
 }
 
 func gatewayResponseTool(item gjson.Result) (string, string, bool) {
 	kind := item.Get("type").String()
-	name := item.Get("name").String()
+	name := relaycommon.SourceText(item.Get("name"))
 	switch kind {
 	case "function_call":
-		return name, item.Get("arguments").String(), true
+		return name, relaycommon.SourceText(item.Get("arguments")), true
 	case "custom_tool_call":
-		return name, item.Get("input").String(), true
+		return name, relaycommon.SourceText(item.Get("input")), true
 	case "web_search_call", "file_search_call", "computer_call", "code_interpreter_call", "mcp_call", "local_shell_call":
 		if name == "" {
 			name = strings.TrimSuffix(kind, "_call")
@@ -264,7 +264,7 @@ func gatewayResponseTool(item gjson.Result) (string, string, bool) {
 func gatewayMediaOutput(body []byte, format types.RelayFormat) bool {
 	if format == types.RelayFormatOpenAIResponses {
 		root := gjson.ParseBytes(body)
-		if root.Get("type").String() == "response.image_generation_call.partial_image" && root.Get("partial_image_b64").String() != "" {
+		if root.Get("type").String() == "response.image_generation_call.partial_image" && relaycommon.SourceText(root.Get("partial_image_b64")) != "" {
 			return true
 		}
 		items := root.Get("output").Array()
@@ -281,7 +281,7 @@ func gatewayMediaOutput(body []byte, format types.RelayFormat) bool {
 	}
 	if format == types.RelayFormatOpenAI {
 		for _, choice := range gjson.GetBytes(body, "choices").Array() {
-			if choice.Get("message.audio.data").String() != "" || choice.Get("delta.audio.data").String() != "" {
+			if relaycommon.SourceText(choice.Get("message.audio.data")) != "" || relaycommon.SourceText(choice.Get("delta.audio.data")) != "" {
 				return true
 			}
 		}
@@ -292,7 +292,7 @@ func gatewayMediaOutput(body []byte, format types.RelayFormat) bool {
 	}
 	for _, candidate := range gjson.GetBytes(body, "candidates").Array() {
 		for _, part := range candidate.Get("content.parts").Array() {
-			if part.Get("inlineData.data").String() != "" {
+			if relaycommon.SourceText(part.Get("inlineData.data")) != "" {
 				return true
 			}
 		}
@@ -302,24 +302,24 @@ func gatewayMediaOutput(body []byte, format types.RelayFormat) bool {
 
 func gatewayGeminiPartText(part gjson.Result) string {
 	var text strings.Builder
-	text.WriteString(part.Get("text").String())
+	text.WriteString(relaycommon.SourceText(part.Get("text")))
 	if part.Get("functionCall").Exists() {
-		text.WriteString(part.Get("functionCall.name").String())
+		text.WriteString(relaycommon.SourceText(part.Get("functionCall.name")))
 		text.WriteString(part.Get("functionCall.args").Raw)
 	}
-	text.WriteString(part.Get("executableCode.code").String())
-	text.WriteString(part.Get("codeExecutionResult.output").String())
+	text.WriteString(relaycommon.SourceText(part.Get("executableCode.code")))
+	text.WriteString(relaycommon.SourceText(part.Get("codeExecutionResult.output")))
 	return text.String()
 }
 
 func gatewayMessagesBlockText(block gjson.Result) string {
 	switch block.Get("type").String() {
 	case "text":
-		return block.Get("text").String()
+		return relaycommon.SourceText(block.Get("text"))
 	case "thinking":
-		return block.Get("thinking").String()
+		return relaycommon.SourceText(block.Get("thinking"))
 	case "tool_use", "server_tool_use", "mcp_tool_use":
-		text := block.Get("name").String()
+		text := relaycommon.SourceText(block.Get("name"))
 		input := block.Get("input")
 		// An empty initial object is a placeholder before input_json_delta.
 		if input.Exists() && input.Type != gjson.Null && input.Raw != "{}" {

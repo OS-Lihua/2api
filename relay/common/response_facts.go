@@ -25,20 +25,29 @@ func ChatStreamBusinessText(body []byte) string {
 	return text.String()
 }
 
+// SourceText accepts only an independently complete JSON string.
+func SourceText(value gjson.Result) string {
+	var text string
+	if value.Type != gjson.String || common.UnmarshalJsonStr(value.Raw, &text) != nil {
+		return ""
+	}
+	return text
+}
+
 // ChatStreamChoiceBusinessText preserves the content within one independent output.
 func ChatStreamChoiceBusinessText(choice gjson.Result) string {
 	var text strings.Builder
-	text.WriteString(choice.Get("delta.content").String())
+	text.WriteString(SourceText(choice.Get("delta.content")))
 	if reasoning := choice.Get("delta.reasoning_content"); reasoning.Exists() {
-		text.WriteString(reasoning.String())
+		text.WriteString(SourceText(reasoning))
 	} else {
-		text.WriteString(choice.Get("delta.reasoning").String())
+		text.WriteString(SourceText(choice.Get("delta.reasoning")))
 	}
-	text.WriteString(choice.Get("delta.refusal").String())
-	text.WriteString(choice.Get("delta.audio.transcript").String())
+	text.WriteString(SourceText(choice.Get("delta.refusal")))
+	text.WriteString(SourceText(choice.Get("delta.audio.transcript")))
 	for _, tool := range choice.Get("delta.tool_calls").Array() {
 		for _, field := range []string{"function.name", "function.arguments", "custom.name", "custom.input"} {
-			text.WriteString(tool.Get(field).String())
+			text.WriteString(SourceText(tool.Get(field)))
 		}
 	}
 	return text.String()
@@ -63,6 +72,7 @@ type ResponseFacts struct {
 	GeneratedOutputTokens    *int
 	OutputLimitObserved      bool   `json:"-"`
 	UnterminatedStreamData   []byte `json:"-"`
+	UnterminatedStreamEvent  string `json:"-"`
 	UpstreamRetryAfter       string // Transient; only the parsed cooldown may enter records.
 	OnBusinessOutput         func()
 	CanFinishStream          func() bool `json:"-"`
@@ -209,19 +219,26 @@ func (facts *ResponseFacts) RecordNativeUsage(usage *dto.Usage, body []byte, pro
 
 // NativeTextSource extracts independently valid text without decoding unrelated
 // native fields. Each candidate remains a separate tokenizer input.
-func NativeTextSource(body []byte, choicesPath, textPath string) *dto.OpenAITextResponse {
+func NativeTextSource(body []byte, choicesPath string, textPaths ...string) *dto.OpenAITextResponse {
 	choices := []gjson.Result{gjson.ParseBytes(body)}
 	if choicesPath != "" {
 		choices = gjson.GetBytes(body, choicesPath).Array()
 	}
 	var source dto.OpenAITextResponse
 	for i, choice := range choices {
-		raw := choice.Get(textPath)
-		var text string
-		if raw.Type != gjson.String || common.UnmarshalJsonStr(raw.Raw, &text) != nil {
-			continue
+		var text strings.Builder
+		found := false
+		for _, path := range textPaths {
+			raw := choice.Get(path)
+			var part string
+			if raw.Type == gjson.String && common.UnmarshalJsonStr(raw.Raw, &part) == nil {
+				text.WriteString(part)
+				found = true
+			}
 		}
-		source.Choices = append(source.Choices, dto.OpenAITextResponseChoice{Index: i, Message: dto.Message{Role: "assistant", Content: text}})
+		if found {
+			source.Choices = append(source.Choices, dto.OpenAITextResponseChoice{Index: i, Message: dto.Message{Role: "assistant", Content: text.String()}})
+		}
 	}
 	return &source
 }

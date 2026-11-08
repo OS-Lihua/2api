@@ -50,16 +50,7 @@ func UnmarshalJsonStr(data string, v any) error {
 
 // UnmarshalUseNumber preserves numeric literals for exact JSON comparisons.
 func UnmarshalUseNumber(data []byte, v any) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	if err := decoder.Decode(v); err != nil {
-		return err
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		return fmt.Errorf("expected a single JSON value")
-	}
-	return nil
+	return kitutil.UnmarshalUseNumber(data, v)
 }
 
 // DecodeJsonStrict accepts exactly one JSON value and rejects unknown fields.

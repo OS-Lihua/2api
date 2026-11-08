@@ -349,8 +349,16 @@ func RecordNativeStreamSource(c *gin.Context, info *relaycommon.RelayInfo, sourc
 	text := relaycommon.ChatStreamBusinessText(body)
 	info.ResponseFacts.SourceGeneratedText += text
 	info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || text != ""
-	if recorder, ok := c.Writer.(interface{ RecordChatStreamSource([]byte) }); ok {
-		recorder.RecordChatStreamSource(body)
+	for writer := http.ResponseWriter(c.Writer); writer != nil; {
+		if recorder, ok := writer.(interface{ RecordChatStreamSource([]byte) }); ok {
+			recorder.RecordChatStreamSource(body)
+			break
+		}
+		wrapper, ok := writer.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			break
+		}
+		writer = wrapper.Unwrap()
 	}
 }
 

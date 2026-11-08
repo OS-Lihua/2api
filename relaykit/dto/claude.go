@@ -50,6 +50,16 @@ type ClaudeMediaMessage struct {
 	ToolUseId string `json:"tool_use_id,omitempty"`
 }
 
+func (c *ClaudeMediaMessage) UnmarshalJSON(data []byte) error {
+	type fields ClaudeMediaMessage
+	var value fields
+	if err := kitutil.UnmarshalUseNumber(data, &value); err != nil {
+		return err
+	}
+	*c = ClaudeMediaMessage(value)
+	return nil
+}
+
 func (c *ClaudeMediaMessage) SetText(s string) {
 	c.Text = &s
 }
@@ -271,7 +281,7 @@ func (c *ClaudeRequest) UnmarshalJSON(data []byte) error {
 		requestFields
 		Tools json.RawMessage `json:"tools,omitempty"`
 	}
-	if err := kitutil.Unmarshal(data, &fields); err != nil {
+	if err := kitutil.UnmarshalUseNumber(data, &fields); err != nil {
 		return err
 	}
 	*c = ClaudeRequest(fields.requestFields)

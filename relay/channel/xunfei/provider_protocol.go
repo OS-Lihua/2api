@@ -82,6 +82,9 @@ func (p *sparkProtocol) DoResponse(c *gin.Context, resp *http.Response, info *re
 			raw := scanner.Bytes()
 			if info.ResponseFacts != nil {
 				recordSparkUsage(raw, reportedUsage)
+				for _, choice := range relaycommon.NativeTextSource(raw, "payload.choices.text", "content").Choices {
+					content.WriteString(choice.Message.StringContent())
+				}
 				raw = relaycommon.SanitizeNativeUsage(raw, "payload.usage.text")
 			}
 			if err := common.Unmarshal(raw, &last); err != nil {
@@ -92,7 +95,7 @@ func (p *sparkProtocol) DoResponse(c *gin.Context, resp *http.Response, info *re
 				responseErr = types.NewError(fmt.Errorf("Xunfei response error %d", last.Header.Code), types.ErrorCodeBadResponseBody)
 				break
 			}
-			if len(last.Payload.Choices.Text) > 0 {
+			if info.ResponseFacts == nil && len(last.Payload.Choices.Text) > 0 {
 				content.WriteString(last.Payload.Choices.Text[0].Content)
 			}
 			usage.PromptTokens += last.Payload.Usage.Text.PromptTokens
@@ -138,7 +141,10 @@ func (p *sparkProtocol) DoResponse(c *gin.Context, resp *http.Response, info *re
 	}
 	original := resp.Body
 	reader, writer := io.Pipe()
+	var sourceText strings.Builder
+	finished := make(chan struct{})
 	go func() {
+		defer close(finished)
 		defer original.Close()
 		defer writer.Close()
 		scanner := helper.NewStreamScanner(original)
@@ -147,6 +153,9 @@ func (p *sparkProtocol) DoResponse(c *gin.Context, resp *http.Response, info *re
 			raw := scanner.Bytes()
 			if info.ResponseFacts != nil {
 				recordSparkUsage(raw, reportedUsage)
+				for _, choice := range relaycommon.NativeTextSource(raw, "payload.choices.text", "content").Choices {
+					sourceText.WriteString(choice.Message.StringContent())
+				}
 				raw = relaycommon.SanitizeNativeUsage(raw, "payload.usage.text")
 			}
 			var frame XunfeiChatResponse
@@ -211,7 +220,31 @@ func (p *sparkProtocol) DoResponse(c *gin.Context, resp *http.Response, info *re
 	}()
 	resp.Body = &sparkTranslatedBody{PipeReader: reader, source: original}
 	resp.Header.Set("Content-Type", "text/event-stream")
-	return p.public.DoResponse(c, resp, info)
+	value, failure := p.public.DoResponse(c, resp, info)
+	_ = resp.Body.Close()
+	<-finished
+	if info.ResponseFacts != nil {
+		usage, _ := value.(*dto.Usage)
+		if usage == nil {
+			usage = &dto.Usage{}
+		}
+		promptTokens, prompt := reportedUsage["prompt_tokens"]
+		completionTokens, completion := reportedUsage["completion_tokens"]
+		estimatedPrompt, estimatedCompletion := usage.PromptTokens, usage.CompletionTokens
+		info.ResponseFacts.RecordUsage(usage, &dto.Usage{PromptTokens: promptTokens, CompletionTokens: completionTokens}, prompt, completion)
+		if !info.ResponseFacts.PromptTokensReported {
+			usage.PromptTokens = estimatedPrompt
+		}
+		if !info.ResponseFacts.CompletionTokensReported {
+			usage.CompletionTokens = estimatedCompletion
+		}
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+		if sourceText.Len() > 0 {
+			info.ResponseFacts.RecordChatSource(&dto.OpenAITextResponse{Choices: []dto.OpenAITextResponseChoice{{Message: dto.Message{Role: "assistant", Content: sourceText.String()}}}}, info.TokenizerModelName())
+		}
+		return usage, failure
+	}
+	return value, failure
 }
 
 func recordSparkUsage(body []byte, reported map[string]int) {

@@ -83,6 +83,8 @@ func (s *StreamStatus) SetEndReason(reason StreamEndReason, err error) {
 		return
 	}
 	s.endOnce.Do(func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 		s.EndReason = reason
 		s.EndError = err
 	})
@@ -214,6 +216,8 @@ func (s *StreamStatus) IsNormalEnd() bool {
 	if s == nil {
 		return true
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.EndReason == StreamEndReasonDone ||
 		s.EndReason == StreamEndReasonEOF ||
 		s.EndReason == StreamEndReasonHandlerStop
@@ -237,15 +241,16 @@ func (s *StreamStatus) Summary() string {
 	if s == nil {
 		return "StreamStatus<nil>"
 	}
-	b := &strings.Builder{}
-	fmt.Fprintf(b, "reason=%s", s.EndReason)
-	if s.EndError != nil {
-		fmt.Fprintf(b, " end_error=%q", s.EndError.Error())
-	}
 	s.mu.Lock()
-	if s.ErrorCount > 0 {
-		fmt.Fprintf(b, " soft_errors=%d", s.ErrorCount)
-	}
+	reason, endError, errorCount := s.EndReason, s.EndError, s.ErrorCount
 	s.mu.Unlock()
+	b := &strings.Builder{}
+	fmt.Fprintf(b, "reason=%s", reason)
+	if endError != nil {
+		fmt.Fprintf(b, " end_error=%q", endError.Error())
+	}
+	if errorCount > 0 {
+		fmt.Fprintf(b, " soft_errors=%d", errorCount)
+	}
 	return b.String()
 }

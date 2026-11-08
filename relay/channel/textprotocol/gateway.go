@@ -114,22 +114,22 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 			message := choice.Get("message")
 			content := message.Get("content")
 			if content.Type == gjson.String {
-				sourceOutput.text.WriteString(content.String())
+				sourceOutput.text.WriteString(relaycommon.SourceText(content))
 			} else {
 				for _, part := range content.Array() {
-					sourceOutput.text.WriteString(part.Get("text").String())
+					sourceOutput.text.WriteString(relaycommon.SourceText(part.Get("text")))
 				}
 			}
 			reasoning := message.Get("reasoning_content")
 			if !reasoning.Exists() {
 				reasoning = message.Get("reasoning")
 			}
-			sourceOutput.text.WriteString(reasoning.String())
-			sourceOutput.text.WriteString(message.Get("refusal").String())
-			sourceOutput.text.WriteString(message.Get("audio.transcript").String())
+			sourceOutput.text.WriteString(relaycommon.SourceText(reasoning))
+			sourceOutput.text.WriteString(relaycommon.SourceText(message.Get("refusal")))
+			sourceOutput.text.WriteString(relaycommon.SourceText(message.Get("audio.transcript")))
 			for _, tool := range message.Get("tool_calls").Array() {
 				for _, path := range []string{"function.name", "function.arguments", "custom.name", "custom.input"} {
-					sourceOutput.text.WriteString(tool.Get(path).String())
+					sourceOutput.text.WriteString(relaycommon.SourceText(tool.Get(path)))
 				}
 			}
 			sourceTokens += tokenkit.Count(info.TokenizerModelName(), sourceOutput.text.String()[start:])
