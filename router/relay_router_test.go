@@ -5158,7 +5158,11 @@ func TestTextGatewayCancellationReleasesOrChargesReportedUsage(t *testing.T) {
 				select {
 				case <-entered:
 				case <-done:
-					t.Fatalf("request finished before cancellation target: status=%d body=%s", recorder.Code, recorder.Body.String())
+					select {
+					case <-entered:
+					default:
+						t.Fatalf("request finished before cancellation target: status=%d body=%s", recorder.Code, recorder.Body.String())
+					}
 				case <-time.After(10 * time.Second):
 					cancel()
 					t.Fatal("cancellation target did not start")
