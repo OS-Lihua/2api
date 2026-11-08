@@ -37,7 +37,7 @@ func SetRelayRouter(router *gin.Engine) {
 	modelsRouter := router.Group("/v1/models")
 	modelsRouter.Use(middleware.RouteTag("relay"))
 	modelsRouter.Use(redirectModelDiscoveryTrailingSlash)
-	modelsRouter.Use(middleware.DisableCache(), middleware.TokenAuth())
+	modelsRouter.Use(middleware.DisableCache(), middleware.GatewayTokenAuth())
 	{
 		modelsRouter.GET("", func(c *gin.Context) {
 			switch {
@@ -77,7 +77,7 @@ func SetRelayRouter(router *gin.Engine) {
 	})
 	geminiRouter.Use(middleware.RouteTag("relay"))
 	geminiRouter.Use(redirectModelDiscoveryTrailingSlash)
-	geminiRouter.Use(middleware.DisableCache(), middleware.TokenAuth())
+	geminiRouter.Use(middleware.DisableCache(), middleware.GatewayTokenAuth())
 	{
 		geminiRouter.GET("", func(c *gin.Context) {
 			controller.ListOfferingModels(c, constant.ChannelTypeGemini)
@@ -87,7 +87,7 @@ func SetRelayRouter(router *gin.Engine) {
 
 	geminiCompatibleRouter := router.Group("/v1beta/openai/models")
 	geminiCompatibleRouter.Use(middleware.RouteTag("relay"))
-	geminiCompatibleRouter.Use(middleware.DisableCache(), middleware.TokenAuth())
+	geminiCompatibleRouter.Use(middleware.DisableCache(), middleware.GatewayTokenAuth())
 	{
 		geminiCompatibleRouter.GET("", func(c *gin.Context) {
 			controller.ListOfferingModels(c, constant.ChannelTypeOpenAI)

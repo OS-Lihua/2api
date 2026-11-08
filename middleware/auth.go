@@ -538,6 +538,16 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 }
 
 func TokenAuth() func(c *gin.Context) {
+	return tokenAuth(false)
+}
+
+// GatewayTokenAuth verifies credentials before Offering resolution without using
+// retired integer quota. A legacy fallback must check its quota before dispatch.
+func GatewayTokenAuth() func(c *gin.Context) {
+	return tokenAuth(true)
+}
+
+func tokenAuth(walletCredential bool) func(c *gin.Context) {
 	return func(c *gin.Context) {
 		// 先检测是否为ws
 		applyWebSocketSubprotocolAuthorization(c.Request.Header)
@@ -582,7 +592,7 @@ func TokenAuth() func(c *gin.Context) {
 			key = parts[0]
 		}
 		validateToken := model.ValidateUserToken
-		if TextOffering(c) != nil || c.Request.Method == http.MethodPost && c.Request.URL.Path == "/v1/chat/completions" || c.Request.Method == http.MethodGet && (strings.HasPrefix(c.Request.URL.Path, "/v1/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/openai/models")) {
+		if walletCredential || TextOffering(c) != nil || c.Request.Method == http.MethodPost && c.Request.URL.Path == "/v1/chat/completions" || c.Request.Method == http.MethodGet && (strings.HasPrefix(c.Request.URL.Path, "/v1/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/openai/models")) {
 			validateToken = model.ValidateWalletToken
 		}
 		token, err := validateToken(key)
