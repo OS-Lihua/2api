@@ -3698,6 +3698,8 @@ func TestTextGatewayDifyMetadataDoesNotBecomeBillableReasoning(t *testing.T) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
 			})
+			fixture.offering.RouteMethod = "weight"
+			require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
 			assert.NotContains(t, response.Body.String(), "internal-workflow")
 			assert.NotContains(t, response.Body.String(), "internal-node")
@@ -3746,6 +3748,8 @@ func TestTextGatewayDifyStreamErrorsRespectFailureScope(t *testing.T) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
 			})
+			fixture.offering.RouteMethod = "weight"
+			require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
 			assert.Equal(t, 1, failedCalls, "invalid requests stop; account failures exclude the Provider")
 			assert.Equal(t, tc.sends-1, recoveryCalls)
@@ -5141,6 +5145,8 @@ func TestTextGatewayCancellationReleasesOrChargesReportedUsage(t *testing.T) {
 				addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
 					t.Error("downstream cancellation must not dispatch another Provider")
 				})
+				fixture.offering.RouteMethod = "weight"
+				require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
 				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
 				request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)).WithContext(ctx)
@@ -5149,7 +5155,14 @@ func TestTextGatewayCancellationReleasesOrChargesReportedUsage(t *testing.T) {
 				recorder := httptest.NewRecorder()
 				done := make(chan struct{})
 				go func() { fixture.engine.ServeHTTP(cancelOnOutputWriter{recorder, cancel}, request); close(done) }()
-				<-entered
+				select {
+				case <-entered:
+				case <-done:
+					t.Fatalf("request finished before cancellation target: status=%d body=%s", recorder.Code, recorder.Body.String())
+				case <-time.After(10 * time.Second):
+					cancel()
+					t.Fatal("cancellation target did not start")
+				}
 				if !output {
 					cancel()
 				}
