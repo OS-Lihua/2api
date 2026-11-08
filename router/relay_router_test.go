@@ -881,6 +881,98 @@ func TestRealtimeGatewayRejectsFixedPricingBeforeReservation(t *testing.T) {
 	}
 }
 
+func TestRealtimeGatewayRecoversControlErrorsAndAcceptsLockedModel(t *testing.T) {
+	for _, scenario := range []string{"same model", "config error", "commit error"} {
+		t.Run(scenario, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if !assert.NoError(t, err) {
+					return
+				}
+				defer peer.Close()
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"modalities":["text"],"turn_detection":null}}`))) {
+					return
+				}
+				for {
+					_, raw, err := peer.ReadMessage()
+					if err != nil {
+						return
+					}
+					kind := ojson.GetBytes(raw, "type").String()
+					if kind == "input_audio_buffer.commit" || ojson.GetBytes(raw, "session.temperature").Exists() {
+						reply := ojson.NewDoc([]byte(`{"type":"error","error":{"type":"invalid_request_error","code":"invalid_value","message":"Rejected control"}}`))
+						if !assert.NoError(t, reply.Set("error.event_id", ojson.GetBytes(raw, "event_id").String())) {
+							return
+						}
+						if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, reply.Bytes())) {
+							return
+						}
+						continue
+					}
+					if kind == "session.update" {
+						assert.False(t, ojson.GetBytes(raw, "session.model").Exists())
+						reply := ojson.NewDoc([]byte(`{"type":"session.updated"}`))
+						if !assert.NoError(t, reply.SetRawBytes("session", []byte(ojson.GetBytes(raw, "session").Raw))) {
+							return
+						}
+						if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, reply.Bytes())) {
+							return
+						}
+						continue
+					}
+					assert.Equal(t, "response.create", kind)
+					assert.False(t, ojson.GetBytes(raw, "response.model").Exists())
+					calls.Add(1)
+					for _, reply := range []string{`{"type":"response.created","response":{"id":"recovered","conversation_id":null,"status":"in_progress"}}`, `{"type":"response.text.delta","response_id":"recovered","delta":"hello"}`, `{"type":"response.done","response":{"id":"recovered","conversation_id":null,"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}`} {
+						if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(reply))) {
+							return
+						}
+					}
+				}
+			})
+			client := dialRealtimeGateway(t, fixture)
+			_, _, err := client.ReadMessage()
+			require.NoError(t, err)
+			if scenario != "same model" {
+				control := `{"type":"session.update","event_id":"bad-config","session":{"temperature":999}}`
+				if scenario == "commit error" {
+					control = `{"type":"input_audio_buffer.commit","event_id":"bad-commit"}`
+				}
+				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(control)))
+				_, reply, err := client.ReadMessage()
+				require.NoError(t, err)
+				require.Equal(t, "error", ojson.GetBytes(reply, "type").String())
+			}
+			update := `{"type":"session.update","event_id":"valid-config","session":{"instructions":"Use text"}}`
+			if scenario == "same model" {
+				update = `{"type":"session.update","session":{"model":"gateway-alias","instructions":"Use text"}}`
+			}
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(update)))
+			_, reply, err := client.ReadMessage()
+			require.NoError(t, err)
+			require.Equal(t, "session.updated", ojson.GetBytes(reply, "type").String())
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"model":"gateway-alias","input":[],"conversation":"none"}}`)))
+			for {
+				_, reply, err := client.ReadMessage()
+				require.NoError(t, err)
+				if ojson.GetBytes(reply, "type").String() == "response.done" {
+					break
+				}
+			}
+			require.NoError(t, client.Close())
+			assert.Equal(t, int32(1), calls.Load())
+			var records []model.GatewayRequest
+			require.Eventually(t, func() bool {
+				var err error
+				records, _, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+				return err == nil && len(records) == 1 && records[0].Status == "success"
+			}, 5*time.Second, 10*time.Millisecond)
+			assertTextGatewayLedger(t, records[0], 3000)
+		})
+	}
+}
+
 func TestRealtimeGatewayRejectsUnsupportedNativeInputsBeforeReservation(t *testing.T) {
 	for _, source := range []string{"explicit audio", "conversation image", "image reference", "two image references"} {
 		t.Run(source, func(t *testing.T) {

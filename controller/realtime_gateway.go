@@ -107,6 +107,8 @@ type realtimeGatewaySession struct {
 	conversation                                  *service.RealtimeConversation
 	clientGone                                    bool
 	queued                                        []realtimeQueuedRequest
+	configEventID, commitEventID                  string
+	requiredConfig                                bool
 	configPending                                 bool
 	capabilities                                  capability.Set
 	commitPending                                 bool
@@ -423,9 +425,13 @@ func (session *realtimeGatewaySession) requestAt(raw []byte, startedAt time.Time
 	if apiErr := session.auth(authRequest, session.authID, session.authorize); apiErr != nil {
 		return nil, apiErr
 	}
+	hasModel := false
 	for _, path := range []string{"model", "session.model", "response.model"} {
-		if ojson.GetBytes(raw, path).Exists() {
-			return nil, types.NewErrorWithStatusCode(errors.New("Connection model is locked"), "connection_locked", http.StatusConflict)
+		if model := ojson.GetBytes(raw, path); model.Exists() {
+			if model.Type != ojson.String || model.String() != session.model {
+				return nil, types.NewErrorWithStatusCode(errors.New("Connection model is locked"), "connection_locked", http.StatusConflict)
+			}
+			hasModel = true
 		}
 	}
 	kind := ojson.GetBytes(raw, "type").String()
@@ -442,6 +448,31 @@ func (session *realtimeGatewaySession) requestAt(raw []byte, startedAt time.Time
 		session.queuedBytes += len(raw)
 		return nil, nil
 	}
+	originalRaw := raw
+	if hasModel {
+		cleaned := ojson.NewDoc(append([]byte(nil), raw...))
+		for _, path := range []string{"model", "session.model", "response.model"} {
+			if cleaned.Get(path).Exists() {
+				if err := cleaned.Delete(path); err != nil {
+					return nil, types.NewError(err, types.ErrorCodeInvalidRequest)
+				}
+			}
+		}
+		raw = cleaned.Bytes()
+	}
+	if kind == "session.update" || kind == "input_audio_buffer.commit" {
+		command := ojson.NewDoc(append([]byte(nil), raw...))
+		eventID := command.Get("event_id")
+		if eventID.Exists() && eventID.Type != ojson.String {
+			return nil, types.NewErrorWithStatusCode(errors.New("event_id must be a string"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
+		}
+		if eventID.String() == "" {
+			if err := command.Set("event_id", "event_"+common.GetUUID()[:24]); err != nil {
+				return nil, types.NewError(err, types.ErrorCodeInvalidRequest)
+			}
+		}
+		raw = command.Bytes()
+	}
 	if kind == "session.update" {
 		settings, apiErr := session.prepareSessionSettings([]byte(ojson.GetBytes(raw, "session").Raw), false)
 		if apiErr != nil {
@@ -452,6 +483,7 @@ func (session *realtimeGatewaySession) requestAt(raw []byte, startedAt time.Time
 			return nil, types.NewError(err, types.ErrorCodeInvalidRequest)
 		}
 		session.configPending = true
+		session.configEventID = ojson.GetBytes(raw, "event_id").String()
 		return command.Bytes(), nil
 	}
 	if kind == "input_audio_buffer.append" && !slices.Contains(session.capabilities.InputModalities, capability.Audio) {
@@ -471,6 +503,7 @@ func (session *realtimeGatewaySession) requestAt(raw []byte, startedAt time.Time
 	}
 	if kind == "input_audio_buffer.commit" {
 		session.commitPending = true
+		session.commitEventID = ojson.GetBytes(raw, "event_id").String()
 		return raw, nil
 	}
 	if kind != "response.create" {
@@ -500,7 +533,7 @@ func (session *realtimeGatewaySession) requestAt(raw []byte, startedAt time.Time
 			return nil, types.NewError(err, types.ErrorCodeInvalidRequest)
 		}
 	}
-	attempt, apiErr := session.admitGeneration(document.Bytes(), raw, session.defaultInput(false), startedAt)
+	attempt, apiErr := session.admitGeneration(document.Bytes(), originalRaw, session.defaultInput(false), startedAt)
 	if apiErr != nil {
 		return nil, apiErr
 	}
@@ -727,6 +760,11 @@ func (session *realtimeGatewaySession) event(raw []byte) ([]byte, [][]byte, *typ
 				if err := command.SetRawBytes("session", settings); err != nil {
 					return nil, nil, types.NewError(err, types.ErrorCodeBadResponse)
 				}
+				session.configEventID = "event_" + common.GetUUID()[:24]
+				if err := command.Set("event_id", session.configEventID); err != nil {
+					return nil, nil, types.NewError(err, types.ErrorCodeBadResponse)
+				}
+				session.requiredConfig = true
 				commands = append(commands, command.Bytes())
 				session.configPending = true
 			}
@@ -740,6 +778,7 @@ func (session *realtimeGatewaySession) event(raw []byte) ([]byte, [][]byte, *typ
 				return nil, nil, types.NewError(errors.New("Upstream automatic generation could not be controlled"), types.ErrorCodeBadResponse)
 			}
 			session.configPending = false
+			session.configEventID, session.requiredConfig = "", false
 		}
 		document := ojson.NewDoc([]byte(`{}`))
 		for _, field := range []string{"instructions", "tools", "tool_choice", "temperature", "modalities", "output_modalities", "max_output_tokens"} {
@@ -761,6 +800,19 @@ func (session *realtimeGatewaySession) event(raw []byte) ([]byte, [][]byte, *typ
 		}
 		queued, apiErr := session.releaseQueuedRequests()
 		return presented.Bytes(), append(commands, queued...), apiErr
+	case "error":
+		id := ojson.GetBytes(raw, "error.event_id").String()
+		if id != "" && id == session.configEventID {
+			if session.requiredConfig {
+				return nil, nil, types.NewError(errors.New("Upstream automatic generation could not be controlled"), types.ErrorCodeBadResponse)
+			}
+			session.configPending, session.pendingDetection = false, false
+			session.configEventID = ""
+		}
+		if id != "" && id == session.commitEventID {
+			session.commitPending = false
+			session.commitEventID = ""
+		}
 	case "response.created":
 		id := ojson.GetBytes(raw, "response.id").String()
 		if id == "" || session.awaiting == nil || session.active[id] != nil || session.completed[id] {
@@ -824,6 +876,7 @@ func (session *realtimeGatewaySession) event(raw []byte) ([]byte, [][]byte, *typ
 		}
 		if kind == "input_audio_buffer.committed" && !turn.committed {
 			turn.committed, session.commitPending = true, false
+			session.commitEventID = ""
 		}
 		if session.autoResponse && turn.stopped && turn.committed && !turn.generated {
 			turn.generated = true
