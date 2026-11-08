@@ -3527,7 +3527,7 @@ func TestTextGatewayRecordOwnershipAndPermissionScopes(t *testing.T) {
 	assert.NotContains(t, admin.Body.String(), "provider-secret")
 	assert.NotContains(t, admin.Body.String(), "secret-request-body")
 	assert.NotContains(t, admin.Body.String(), "http://127.0.0.1")
-	for _, query := range []string{"page=0", "page_size=-1", "page_size=101", "model_offering_id=0", "started_after=-1", "status=settlement_pending"} {
+	for _, query := range []string{"page=0", "page_size=-1", "page_size=101", "model_offering_id=0", "started_after=-1", "status=unknown"} {
 		assert.Equal(t, 400, adminSecurityRequest(fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests?"+query, "").Code, query)
 	}
 }
@@ -4099,13 +4099,50 @@ func TestTextGatewayDifyUploadsAfterReservation(t *testing.T) {
 	}
 }
 
+func TestTextGatewayProcurementEvaluationCannotHoldFailedDeliveryFunds(t *testing.T) {
+	calls := 0
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":{"code":"overloaded"},"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":1}}`))
+	})
+	price := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `len == 9 ? tier("base",p + c * 2) : tier("invalid",p / (len - 10))`, EffectiveAt: clock.Now().Unix()}
+	require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+	body := `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`
+	failed := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+	require.Equal(t, http.StatusServiceUnavailable, failed.Code, failed.Body.String())
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1000000000), wallet.Balance.Nanos, "an unknown platform cost cannot consume the failed request's funds")
+	resumed := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+	assert.Equal(t, http.StatusOK, resumed.Code, resumed.Body.String())
+	assert.Equal(t, 2, calls)
+	id := failed.Header().Get(common.RequestIdKey)
+	record, err := model.GetGatewayRequest(t.Context(), id, fixture.user.Id)
+	require.NoError(t, err)
+	assert.Zero(t, record.Receivable.Nanos)
+	var entries []model.LedgerEntry
+	require.NoError(t, model.DB.Where("request_id = ?", id).Find(&entries).Error)
+	require.Len(t, entries, 2)
+	var released int64
+	for _, entry := range entries {
+		released += entry.Amount.Nanos
+	}
+	assert.Zero(t, released)
+}
+
 func TestTextGatewayEvaluationFailureRetainsPendingAccounting(t *testing.T) {
 	for _, test := range []struct {
 		name, owner, expression string
 		reservation             int64
 	}{
 		{"mixed pricing condition failure", model.PriceOwnerOffering, `(len == 9 || 1 / (len - 10) > 0) ? tier("request",fixed(0.01)) : tier("tokens",p + c)`, 9000000},
-		{"sale overflow", model.PriceOwnerOffering, `len == 9 ? tier("base",p * 2 + c * 4) : tier("overflow",p * 1000000000000000 + c * 4)`, 73800},
+		{"sale overflow", model.PriceOwnerOffering, `(header("Content-Type") == "application/json" && len != 9) ? tier("overflow",p * 1000000000000000 + c * 4) : tier("base",p * 2 + c * 4)`, 73800},
 		{"sale evaluation", model.PriceOwnerOffering, `len == 9 ? tier("base",p * 2 + c * 4) : tier("invalid",p / (len - 10))`, 73800},
 		{"purchase overflow", model.PriceOwnerChannel, `len == 9 ? tier("base",p + c * 2) : tier("overflow",p * 1000000000000000 + c * 4)`, 73800},
 		{"purchase evaluation", model.PriceOwnerChannel, `len == 9 ? tier("base",p + c * 2) : tier("invalid",p / (len - 10))`, 73800},
@@ -4115,7 +4152,7 @@ func TestTextGatewayEvaluationFailureRetainsPendingAccounting(t *testing.T) {
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 				calls++
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":2,"cached_tokens_details":{"text_tokens":1,"image_tokens":1},"image_tokens":2},"completion_tokens_details":{"reasoning_tokens":1},"cost":{"credential":"quantitative-secret"},"usage_source":"quantitative-secret","usage_semantic":"quantitative-secret"}}`))
 			})
 			ownerID := fixture.offering.ID
 			if test.owner == model.PriceOwnerChannel {
@@ -4133,6 +4170,25 @@ func TestTextGatewayEvaluationFailureRetainsPendingAccounting(t *testing.T) {
 			var lifecycle model.GatewayBilling
 			require.NoError(t, model.DB.First(&lifecycle, "request_id = ?", id).Error)
 			require.Equal(t, "evaluation_failed", lifecycle.Phase, "the reservation must never become a finalized replacement for an unknown actual amount")
+			var stored map[string]any
+			require.NoError(t, common.UnmarshalJsonStr(lifecycle.Settlement, &stored))
+			saleUsage, ok := stored["sale_usage"].(map[string]any)
+			require.True(t, ok, "unresolved pricing retains quantitative usage beyond the log summary")
+			assert.Equal(t, map[string]any{"text_tokens": float64(1), "image_tokens": float64(1)}, saleUsage["prompt_tokens_details"].(map[string]any)["cached_tokens_details"])
+			assert.Equal(t, float64(1), saleUsage["completion_tokens_details"].(map[string]any)["reasoning_tokens"])
+			assert.NotContains(t, saleUsage, "cost")
+			assert.NotContains(t, stored, "body")
+			assert.NotContains(t, stored, "headers")
+			assert.NotContains(t, lifecycle.Settlement, "quantitative-secret")
+			assert.NotContains(t, lifecycle.Settlement, fixture.token.Key)
+			assert.NotContains(t, lifecycle.Settlement, "provider-secret")
+			if test.name == "sale overflow" {
+				trace, ok := stored["sale_trace"].(map[string]any)
+				require.True(t, ok)
+				conditions, ok := trace["conditions"].([]any)
+				require.True(t, ok)
+				assert.Contains(t, conditions, map[string]any{"cond": `header("Content-Type") == "application/json"`, "matched": true})
+			}
 			view := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests?status=settlement_pending", "")
 			require.True(t, view.Success, view.Message)
 			items := view.Data["items"].([]any)
@@ -4157,15 +4213,28 @@ func TestTextGatewayEvaluationFailureRetainsPendingAccounting(t *testing.T) {
 			}
 			wallet, err := model.GetUserWallet(fixture.user.Id)
 			require.NoError(t, err)
-			assert.Equal(t, int64(1000000000)-test.reservation, wallet.Balance.Nanos)
+			deducted := test.reservation
+			if test.owner == model.PriceOwnerChannel {
+				deducted = 36000
+			}
+			assert.Equal(t, int64(1000000000)-deducted, wallet.Balance.Nanos)
 			_, err = model.TopUpWallet(model.WalletTopUp{UserId: fixture.user.Id, Source: money.Amount{Nanos: 1000, Currency: "USD"}, Reference: "pending-credit"})
 			require.NoError(t, err)
 			blocked := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
-			assert.Equal(t, http.StatusPaymentRequired, blocked.Code, blocked.Body.String())
-			assert.Equal(t, 1, calls)
+			if test.owner == model.PriceOwnerOffering {
+				assert.Equal(t, http.StatusPaymentRequired, blocked.Code, blocked.Body.String())
+				assert.Equal(t, 1, calls)
+			} else {
+				assert.Equal(t, http.StatusOK, blocked.Code, blocked.Body.String())
+				assert.Equal(t, 2, calls, "platform cost reconciliation does not create a user debt")
+			}
 			walletView := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/user-wallets/%d", fixture.user.Id), "")
 			require.True(t, walletView.Success, walletView.Message)
-			assert.Equal(t, true, walletView.Data["requests_paused"])
+			if test.owner == model.PriceOwnerOffering {
+				assert.Equal(t, true, walletView.Data["requests_paused"])
+			} else {
+				assert.NotEqual(t, true, walletView.Data["requests_paused"])
+			}
 			self := walletAPIRequest(t, fixture.engine, fixture.userPAT, http.MethodGet, "/api/requests/self/"+id+"/attempts", "")
 			require.True(t, self.Success, self.Message)
 			selfAttempt := self.Data["items"].([]any)[0].(map[string]any)
@@ -4184,8 +4253,12 @@ func TestTextGatewayEvaluationFailureRetainsPendingAccounting(t *testing.T) {
 				assert.Error(t, err, "unresolved evaluations must remain visible to the recovery operator")
 			}
 			var postings []model.LedgerEntry
-			require.NoError(t, model.DB.Where("request_id = ?", id).Find(&postings).Error)
-			require.Len(t, postings, 1)
+			require.NoError(t, model.DB.Where("request_id = ?", id).Order("id").Find(&postings).Error)
+			if test.owner == model.PriceOwnerOffering {
+				require.Len(t, postings, 1)
+			} else {
+				require.Len(t, postings, 4)
+			}
 			assert.Equal(t, model.LedgerEntryPreConsume, postings[0].Type)
 			reconciliation, err := model.ReconcileWallets(100)
 			require.NoError(t, err)

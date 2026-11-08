@@ -30,6 +30,7 @@ type GatewayUsage struct {
 }
 
 type GatewayRequest struct {
+	SalePending        bool           `json:"sale_pending,omitempty" gorm:"-"`
 	ID                 string         `json:"id" gorm:"type:varchar(64);primaryKey"`
 	UserID             int            `json:"user_id" gorm:"not null;index"`
 	TokenID            int            `json:"token_id" gorm:"not null;index"`
@@ -55,6 +56,7 @@ type GatewayRequest struct {
 func (GatewayRequest) TableName() string { return "gateway_requests" }
 
 type GatewayAttempt struct {
+	CostPending            bool           `json:"cost_pending,omitempty" gorm:"-"`
 	ID                     string         `json:"id" gorm:"type:varchar(64);primaryKey"`
 	RequestID              string         `json:"request_id" gorm:"type:varchar(64);not null;index"`
 	ChannelID              int            `json:"channel_id" gorm:"not null"`

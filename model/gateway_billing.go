@@ -8,8 +8,10 @@ import (
 	"strconv"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/money"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/shopspring/decimal"
 	"gorm.io/gorm"
 )
@@ -32,20 +34,25 @@ type GatewayBilling struct {
 var ErrGatewayEvaluationPending = errors.New("gateway billing evaluation requires reconciliation")
 
 type GatewaySettlement struct {
-	EvaluationFailed bool             `json:"evaluation_failed,omitempty"`
-	Request          GatewayRequest   `json:"request"`
-	Attempt          *GatewayAttempt  `json:"attempt,omitempty"`
-	Attempts         []GatewayAttempt `json:"attempts,omitempty"`
-	SaleSource       money.Amount     `json:"sale_source"`
-	ReceivableDue    money.Amount     `json:"receivable_due"`
-	PostedSaleSource money.Amount     `json:"posted_sale_source"`
+	SaleTrace            *billingexpr.MoneyTraceResult           `json:"sale_trace,omitempty"`
+	AttemptTrace         map[string]billingexpr.MoneyTraceResult `json:"attempt_trace,omitempty"`
+	SaleUsage            *dto.Usage                              `json:"sale_usage,omitempty"`
+	AttemptUsage         map[string]*dto.Usage                   `json:"attempt_usage,omitempty"`
+	SaleEvaluationFailed bool                                    `json:"sale_evaluation_failed,omitempty"`
+	EvaluationFailed     bool                                    `json:"evaluation_failed,omitempty"`
+	Request              GatewayRequest                          `json:"request"`
+	Attempt              *GatewayAttempt                         `json:"attempt,omitempty"`
+	Attempts             []GatewayAttempt                        `json:"attempts,omitempty"`
+	SaleSource           money.Amount                            `json:"sale_source"`
+	ReceivableDue        money.Amount                            `json:"receivable_due"`
+	PostedSaleSource     money.Amount                            `json:"posted_sale_source"`
 }
 
 // HasGatewayEvaluationPending reports unresolved monetary evaluations. Credits
 // cannot make their reserved funds safe to spend before reconciliation.
 func HasGatewayEvaluationPending(ctx context.Context, userID int) (bool, error) {
 	var count int64
-	err := DB.WithContext(ctx).Model(&GatewayBilling{}).Where("user_id = ? AND phase = ?", userID, "evaluation_failed").Count(&count).Error
+	err := DB.WithContext(ctx).Model(&GatewayBilling{}).Where(`user_id = ? AND phase = ? AND NULLIF("settlement", '')::jsonb ->> 'sale_evaluation_failed' = 'true'`, userID, "evaluation_failed").Count(&count).Error
 	return count > 0, err
 }
 
@@ -77,7 +84,7 @@ func ReserveGateway(request *GatewayRequest, reservation, source money.Amount) e
 		}
 		wallet := wallets[account]
 		var unresolved int64
-		if err := tx.Model(&GatewayBilling{}).Where("user_id = ? AND phase = ?", request.UserID, "evaluation_failed").Count(&unresolved).Error; err != nil {
+		if err := tx.Model(&GatewayBilling{}).Where(`user_id = ? AND phase = ? AND NULLIF("settlement", '')::jsonb ->> 'sale_evaluation_failed' = 'true'`, request.UserID, "evaluation_failed").Count(&unresolved).Error; err != nil {
 			return err
 		}
 		if unresolved > 0 || wallet.RequestsPaused || wallets[UserReceivableAccount(request.UserID)].Balance.Nanos > 0 || wallet.Balance.Nanos < reservation.Nanos {
@@ -135,7 +142,7 @@ func PrepareGatewaySettlement(settlement GatewaySettlement) error {
 			return nil
 		}
 		phase := "settlement_pending"
-		if settlement.EvaluationFailed {
+		if settlement.SaleEvaluationFailed {
 			phase = "evaluation_failed"
 		}
 		return tx.Model(&row).Updates(map[string]any{"settlement": string(encoded), "phase": phase, "updated_at": clock.Now().UnixMilli()}).Error
@@ -151,6 +158,7 @@ func PrepareGatewaySettlement(settlement GatewaySettlement) error {
 // remains in the user's receivable account until subsequent credits pay it.
 func SettleGateway(requestID string) (*GatewayRequest, error) {
 	var result GatewayRequest
+	var pending bool
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		var row GatewayBilling
 		if err := lockForUpdate(tx).First(&row, "request_id = ?", requestID).Error; err != nil {
@@ -280,12 +288,20 @@ func SettleGateway(requestID string) (*GatewayRequest, error) {
 		if err != nil {
 			return err
 		}
-		if err := tx.Model(&row).Updates(map[string]any{"request_data": string(encoded), "settlement": string(finalized), "phase": "settled", "updated_at": clock.Now().UnixMilli()}).Error; err != nil {
+		phase := "settled"
+		if intent.EvaluationFailed {
+			phase = "evaluation_failed"
+			pending = true
+		}
+		if err := tx.Model(&row).Updates(map[string]any{"request_data": string(encoded), "settlement": string(finalized), "phase": phase, "updated_at": clock.Now().UnixMilli()}).Error; err != nil {
 			return err
 		}
 		result = *request
 		return nil
 	})
+	if err == nil && pending {
+		return &result, ErrGatewayEvaluationPending
+	}
 	return &result, err
 }
 
@@ -344,6 +360,9 @@ func RecoverGatewaySettlements(ctx context.Context, limit int) (int, error) {
 			return completed, ctx.Err()
 		}
 		if _, err := SettleGateway(row.RequestID); err != nil {
+			if errors.Is(err, ErrGatewayEvaluationPending) {
+				continue
+			}
 			return completed, fmt.Errorf("gateway settlement %s: %w", row.RequestID, err)
 		}
 		if err := PublishGatewayRecords(row.RequestID); err != nil {
