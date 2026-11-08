@@ -64,6 +64,7 @@ type realtimeGatewayAttempt struct {
 	input                 *dto.Usage
 	response              *realtimeGatewayResponse
 	defaultConversation   bool
+	interruptRequested    bool
 }
 
 type realtimeGatewayCompletion struct {
@@ -79,7 +80,7 @@ type realtimeQueuedRequest struct {
 	startedAt time.Time
 }
 
-type realtimeVADTurn struct{ stopped, committed, generated bool }
+type realtimeVADTurn struct{ started, stopped, committed, generated bool }
 
 type realtimeGatewaySession struct {
 	context                                       context.Context
@@ -650,7 +651,10 @@ func (session *realtimeGatewaySession) prepareSessionSettings(raw []byte, initia
 	}
 	for _, path := range []string{"turn_detection.idle_timeout_ms", "audio.input.turn_detection.idle_timeout_ms"} {
 		if timeout := value.Get(path); timeout.Exists() && timeout.Type != ojson.Null {
-			return nil, types.NewErrorWithStatusCode(errors.New("idle_timeout_ms is not supported on this connection"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
+			var milliseconds int64
+			if common.UnmarshalJsonStr(timeout.Raw, &milliseconds) != nil || milliseconds <= 0 || milliseconds > (1<<31)-1 {
+				return nil, types.NewErrorWithStatusCode(errors.New("idle_timeout_ms must be a positive integer"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
+			}
 		}
 	}
 	if err := helper.ValidateRealtimeMultipliers(raw); err != nil {
@@ -821,13 +825,22 @@ func (session *realtimeGatewaySession) event(raw []byte) ([]byte, [][]byte, *typ
 		return presented.Bytes(), append(commands, queued...), apiErr
 	case "response.created":
 		id := ojson.GetBytes(raw, "response.id").String()
-		if id == "" || session.awaiting == nil {
+		if id == "" || session.awaiting == nil || session.active[id] != nil || session.completed[id] {
 			return nil, nil, types.NewError(errors.New("Unexpected Realtime response identity"), types.ErrorCodeBadResponse)
 		}
-		session.active[id], session.awaiting = session.awaiting, nil
-		commands, apiErr := session.releaseQueuedRequests()
-		return raw, commands, apiErr
-	case "input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped", "input_audio_buffer.committed":
+		attempt := session.awaiting
+		session.active[id], session.awaiting = attempt, nil
+		var commands [][]byte
+		if attempt.interruptRequested {
+			command, err := common.Marshal(map[string]string{"type": "response.cancel", "response_id": id})
+			if err != nil {
+				return nil, nil, types.NewError(err, types.ErrorCodeBadResponse)
+			}
+			commands = append(commands, command)
+		}
+		queued, apiErr := session.releaseQueuedRequests()
+		return raw, append(commands, queued...), apiErr
+	case "input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped", "input_audio_buffer.timeout_triggered", "input_audio_buffer.committed":
 		id := ojson.GetBytes(raw, "item_id").String()
 		if id == "" {
 			return nil, nil, types.NewError(errors.New("Realtime audio event has no item identity"), types.ErrorCodeBadResponse)
@@ -838,8 +851,15 @@ func (session *realtimeGatewaySession) event(raw []byte) ([]byte, [][]byte, *typ
 			session.vadTurns[id] = turn
 		}
 		if kind == "input_audio_buffer.speech_started" {
+			if turn.started {
+				return raw, nil, nil
+			}
+			turn.started = true
 			var commands [][]byte
 			if session.autoInterrupt {
+				if session.awaiting != nil && session.awaiting.defaultConversation {
+					session.awaiting.interruptRequested = true
+				}
 				for responseID, attempt := range session.active {
 					if !attempt.defaultConversation {
 						continue
@@ -853,7 +873,7 @@ func (session *realtimeGatewaySession) event(raw []byte) ([]byte, [][]byte, *typ
 			}
 			return raw, commands, nil
 		}
-		if kind == "input_audio_buffer.speech_stopped" {
+		if kind == "input_audio_buffer.speech_stopped" || kind == "input_audio_buffer.timeout_triggered" {
 			turn.stopped = true
 		}
 		if kind == "input_audio_buffer.committed" && !turn.committed {

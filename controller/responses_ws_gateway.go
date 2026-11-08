@@ -552,7 +552,8 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		if info.ResponseFacts.BusinessOutput {
 			saleUsage := service.GatewayUsageSnapshot(usage)
 			saleUsageSource := attempt.UsageSource
-			if !info.ResponseFacts.CompletionTokensReported && (attempt.Status == "partial" || !call.TerminalDelivered()) {
+			completeOnDisconnect := info.ResponseFacts.CompletionTokensReported && info.ResponseFacts.DownstreamWriteFailed && outcome.Response == relaycommon.ResponseOutcomeCompleted
+			if !completeOnDisconnect && (attempt.Status == "partial" || !call.TerminalDelivered()) {
 				delivered := tokenkit.Count(info.TokenizerModel, info.ResponseFacts.GeneratedText)
 				if info.ResponseFacts.DeliveredOutputTokens != nil {
 					delivered = *info.ResponseFacts.DeliveredOutputTokens

@@ -338,6 +338,7 @@ func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 		{name: "terminal function call without usage", terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"function_call","name":"hello","arguments":""}]}}`, source: "estimated", status: "success", sale: 5400, cost: 3000},
 		{name: "purchase probes use final wire and Provider header", terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010}}}`, source: "upstream", status: "success", sale: 1_836_000, cost: 510_000, probe: true},
 		{name: "client credentials never become Provider authentication", terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":1000,"output_tokens":10}}}`, source: "upstream", status: "success", sale: 1_836_000, cost: 1_020_000, credentials: true},
+		{name: "upstream failure caps delivery and retains reported purchase", terminal: `{"type":"response.failed","response":{"id":"active","status":"failed","error":{"code":"server_error"},"usage":{"input_tokens":1000,"output_tokens":10}}}`, source: "estimated", status: "partial", sale: 1_803_600, cost: 1_020_000, delta: true},
 		{name: "cancel retains complete reported usage", terminal: `{"type":"response.cancelled","response":{"id":"active","status":"cancelled","usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010}}}`, source: "upstream", status: "cancelled", sale: 1_836_000, cost: 1_020_000, delta: true, cancel: true},
 		{name: "disconnect settles generated output once", source: "estimated", status: "cancelled", sale: 5400, cost: 3000, delta: true, disconnect: true},
 	} {
@@ -802,128 +803,277 @@ func TestRealtimeGatewayReservesKnownResponseInstructions(t *testing.T) {
 }
 
 func TestRealtimeGatewayAutomaticVAD(t *testing.T) {
-	var fixture textGatewayFixture
-	upstreamDone := make(chan struct{})
-	inputAudio := base64.StdEncoding.EncodeToString(make([]byte, 48000))
-	outputAudio := base64.StdEncoding.EncodeToString(make([]byte, 9600))
-	fixture = newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
-		peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
-		if !assert.NoError(t, err) {
-			return
-		}
-		defer peer.Close()
-		defer close(upstreamDone)
-		if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"model":"upstream-model","modalities":["text","audio"],"input_audio_format":"pcm16","output_audio_format":"pcm16","max_response_output_tokens":512,"turn_detection":{"type":"server_vad","create_response":true,"interrupt_response":true}}}`))) {
-			return
-		}
-		_, configure, err := peer.ReadMessage()
-		if !assert.NoError(t, err) {
-			return
-		}
-		if !assert.Equal(t, "session.update", ojson.GetBytes(configure, "type").String()) {
-			return
-		}
-		assert.Equal(t, "false", ojson.GetBytes(configure, "session.turn_detection.create_response").Raw)
-		assert.Equal(t, "false", ojson.GetBytes(configure, "session.turn_detection.interrupt_response").Raw)
-		if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.updated","session":{"model":"upstream-model","modalities":["text","audio"],"input_audio_format":"pcm16","output_audio_format":"pcm16","max_response_output_tokens":512,"turn_detection":{"type":"server_vad","create_response":false,"interrupt_response":false}}}`))) {
-			return
-		}
-		_, appendAudio, err := peer.ReadMessage()
-		if !assert.NoError(t, err) {
-			return
-		}
-		assert.Equal(t, "input_audio_buffer.append", ojson.GetBytes(appendAudio, "type").String())
-		var provisional int64
-		if !assert.NoError(t, model.DB.Model(&model.GatewayBilling{}).Where("user_id = ?", fixture.user.Id).Count(&provisional).Error) {
-			return
-		}
-		assert.Zero(t, provisional, "Audio buffering must not create a shadow response reservation")
-		for _, raw := range []string{
-			`{"type":"input_audio_buffer.speech_started","item_id":"voice-input","audio_start_ms":0}`,
-			`{"type":"input_audio_buffer.speech_stopped","item_id":"voice-input","audio_end_ms":1000}`,
-			`{"type":"input_audio_buffer.committed","item_id":"voice-input"}`,
-		} {
-			if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(raw))) {
-				return
+	for _, shape := range []string{"beta", "ga"} {
+		t.Run(shape, func(t *testing.T) {
+			created := ojson.NewDoc([]byte(`{"type":"session.created","session":{"model":"upstream-model","modalities":["text","audio"],"input_audio_format":"pcm16","output_audio_format":"pcm16","max_response_output_tokens":512,"turn_detection":{"type":"server_vad","create_response":true,"interrupt_response":true,"idle_timeout_ms":6000}}}`))
+			detectionPath := "session.turn_detection"
+			if shape == "ga" {
+				created = ojson.NewDoc([]byte(`{"type":"session.created","session":{"type":"realtime","model":"upstream-model","output_modalities":["audio"],"max_output_tokens":512,"audio":{"input":{"format":{"type":"audio/pcm","rate":24000},"turn_detection":{"type":"server_vad","create_response":true,"interrupt_response":true,"idle_timeout_ms":6000}},"output":{"format":{"type":"audio/pcm","rate":24000}}}}}`))
+				detectionPath = "session.audio.input.turn_detection"
 			}
-		}
-		_, create, err := peer.ReadMessage()
-		if !assert.NoError(t, err) {
-			return
-		}
-		assert.Equal(t, "response.create", ojson.GetBytes(create, "type").String())
-		assert.Equal(t, "512", ojson.GetBytes(create, "response.max_output_tokens").Raw)
-		var billing model.GatewayBilling
-		if !assert.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).First(&billing).Error) {
-			return
-		}
-		assert.Equal(t, "reserved", billing.Phase)
-		for _, raw := range []string{
-			`{"type":"response.created","response":{"id":"voice-response","status":"in_progress","conversation_id":"conversation"}}`,
-			`{"type":"response.audio.delta","response_id":"voice-response","output_index":0,"delta":"` + outputAudio + `"}`,
-			`{"type":"response.done","response":{"id":"voice-response","status":"completed","conversation_id":"conversation","usage":{"input_tokens":10,"output_tokens":4,"input_token_details":{"text_tokens":0,"audio_tokens":10,"cached_tokens":0},"output_token_details":{"text_tokens":0,"audio_tokens":4}}}}`,
-		} {
-			if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(raw))) {
-				return
+			updated := ojson.NewDoc(append([]byte(nil), created.Bytes()...))
+			require.NoError(t, updated.Set("type", "session.updated"))
+			require.NoError(t, updated.Set(detectionPath+".create_response", false))
+			require.NoError(t, updated.Set(detectionPath+".interrupt_response", false))
+			var fixture textGatewayFixture
+			upstreamDone := make(chan struct{})
+			inputAudio := base64.StdEncoding.EncodeToString(make([]byte, 48000))
+			outputAudio := base64.StdEncoding.EncodeToString(make([]byte, 9600))
+			fixture = newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if !assert.NoError(t, err) {
+					return
+				}
+				defer peer.Close()
+				defer close(upstreamDone)
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, created.Bytes())) {
+					return
+				}
+				_, configure, err := peer.ReadMessage()
+				if !assert.NoError(t, err) {
+					return
+				}
+				if !assert.Equal(t, "session.update", ojson.GetBytes(configure, "type").String()) {
+					return
+				}
+				assert.Equal(t, "false", ojson.GetBytes(configure, detectionPath+".create_response").Raw)
+				assert.Equal(t, "false", ojson.GetBytes(configure, detectionPath+".interrupt_response").Raw)
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, updated.Bytes())) {
+					return
+				}
+				_, appendAudio, err := peer.ReadMessage()
+				if !assert.NoError(t, err) {
+					return
+				}
+				assert.Equal(t, "input_audio_buffer.append", ojson.GetBytes(appendAudio, "type").String())
+				var provisional int64
+				if !assert.NoError(t, model.DB.Model(&model.GatewayBilling{}).Where("user_id = ?", fixture.user.Id).Count(&provisional).Error) {
+					return
+				}
+				assert.Zero(t, provisional, "Audio buffering must not create a shadow response reservation")
+				for _, raw := range []string{
+					`{"type":"input_audio_buffer.speech_started","item_id":"voice-input","audio_start_ms":0}`,
+					`{"type":"input_audio_buffer.speech_stopped","item_id":"voice-input","audio_end_ms":1000}`,
+					`{"type":"input_audio_buffer.committed","item_id":"voice-input"}`,
+				} {
+					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(raw))) {
+						return
+					}
+				}
+				_, create, err := peer.ReadMessage()
+				if !assert.NoError(t, err) {
+					return
+				}
+				assert.Equal(t, "response.create", ojson.GetBytes(create, "type").String())
+				assert.Equal(t, "512", ojson.GetBytes(create, "response.max_output_tokens").Raw)
+				var billing model.GatewayBilling
+				if !assert.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).First(&billing).Error) {
+					return
+				}
+				assert.Equal(t, "reserved", billing.Phase)
+				for _, raw := range []string{
+					`{"type":"response.created","response":{"id":"voice-response","status":"in_progress","conversation_id":"conversation"}}`,
+					`{"type":"response.audio.delta","response_id":"voice-response","output_index":0,"delta":"` + outputAudio + `"}`,
+					`{"type":"response.done","response":{"id":"voice-response","status":"completed","conversation_id":"conversation","usage":{"input_tokens":10,"output_tokens":4,"input_token_details":{"text_tokens":0,"audio_tokens":10,"cached_tokens":0},"output_token_details":{"text_tokens":0,"audio_tokens":4}}}}`,
+				} {
+					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(raw))) {
+						return
+					}
+				}
+				_, silence, err := peer.ReadMessage()
+				if !assert.NoError(t, err) {
+					return
+				}
+				assert.Equal(t, "input_audio_buffer.append", ojson.GetBytes(silence, "type").String())
+				for _, raw := range []string{`{"type":"input_audio_buffer.timeout_triggered","event_id":"idle-event","item_id":"idle-input","audio_start_ms":1200,"audio_end_ms":7200}`, `{"type":"input_audio_buffer.committed","item_id":"idle-input"}`, `{"type":"input_audio_buffer.timeout_triggered","event_id":"idle-event","item_id":"idle-input","audio_start_ms":1200,"audio_end_ms":7200}`} {
+					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(raw))) {
+						return
+					}
+				}
+				_, create, err = peer.ReadMessage()
+				if !assert.NoError(t, err) {
+					return
+				}
+				assert.Equal(t, "response.create", ojson.GetBytes(create, "type").String())
+				var idleReservation model.GatewayBilling
+				if !assert.NoError(t, model.DB.Where("user_id = ? AND phase = ?", fixture.user.Id, "reserved").First(&idleReservation).Error) {
+					return
+				}
+				assert.Equal(t, int64(221_400), idleReservation.Reservation.Nanos)
+				for _, raw := range []string{`{"type":"response.created","response":{"id":"idle-response","status":"in_progress","conversation_id":"conversation"}}`, `{"type":"response.audio.delta","response_id":"idle-response","output_index":0,"delta":"` + base64.StdEncoding.EncodeToString(make([]byte, 4800)) + `"}`, `{"type":"response.done","response":{"id":"idle-response","status":"completed","conversation_id":"conversation","usage":{"input_tokens":74,"output_tokens":2,"input_token_details":{"text_tokens":0,"audio_tokens":74},"output_token_details":{"text_tokens":0,"audio_tokens":2}}}}`} {
+					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(raw))) {
+						return
+					}
+				}
+				_, _, _ = peer.ReadMessage()
+			})
+			var unified model.Model
+			require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+			unified.Capabilities.InputModalities = []capability.Modality{capability.Text, capability.Audio}
+			unified.Capabilities.OutputModalities = []capability.Modality{capability.Text, capability.Audio}
+			require.NoError(t, model.DB.Save(&unified).Error)
+			for _, change := range []struct {
+				price      *model.PriceVersion
+				expression string
+			}{{fixture.sale, `tier("voice", ai * 3 + ao * 6)`}, {fixture.purchase, `tier("voice", ai * 2 + ao * 4)`}} {
+				version := *change.price
+				version.ID, version.EffectiveAt, version.Expression = 0, clock.Now().Unix()+1, change.expression
+				require.NoError(t, model.CreatePriceVersion(t.Context(), &version, fixture.sale.CreatedBy))
 			}
-		}
-		_, _, _ = peer.ReadMessage()
-	})
-	var unified model.Model
-	require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
-	unified.Capabilities.InputModalities = []capability.Modality{capability.Text, capability.Audio}
-	unified.Capabilities.OutputModalities = []capability.Modality{capability.Text, capability.Audio}
-	require.NoError(t, model.DB.Save(&unified).Error)
-	for _, change := range []struct {
-		price      *model.PriceVersion
-		expression string
-	}{{fixture.sale, `tier("voice", ai * 3 + ao * 6)`}, {fixture.purchase, `tier("voice", ai * 2 + ao * 4)`}} {
-		version := *change.price
-		version.ID, version.EffectiveAt, version.Expression = 0, clock.Now().Unix()+1, change.expression
-		require.NoError(t, model.CreatePriceVersion(t.Context(), &version, fixture.sale.CreatedBy))
+			fixture.fake.Advance(2 * time.Second)
+			client := dialRealtimeGateway(t, fixture)
+			for range 2 {
+				_, metadata, err := client.ReadMessage()
+				require.NoError(t, err)
+				assert.Equal(t, "true", ojson.GetBytes(metadata, detectionPath+".create_response").Raw)
+				assert.Equal(t, "true", ojson.GetBytes(metadata, detectionPath+".interrupt_response").Raw)
+			}
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"input_audio_buffer.append","audio":"`+inputAudio+`"}`)))
+			require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+			for completed := 0; completed < 2; {
+				_, raw, err := client.ReadMessage()
+				require.NoError(t, err)
+				if ojson.GetBytes(raw, "type").String() == "error" {
+					t.Fatalf("automatic response rejected: %s", ojson.GetBytes(raw, "error.code").String())
+				}
+				if ojson.GetBytes(raw, "type").String() == "response.done" {
+					completed++
+					if completed == 1 {
+						fixture.fake.Advance(7 * time.Second)
+						require.Eventually(t, func() bool {
+							mean, err := model.RecentOfferingOutputTokens(t.Context(), fixture.offering.ID, clock.Now().UnixMilli())
+							return err == nil && mean == 4
+						}, 5*time.Second, 10*time.Millisecond)
+						require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"input_audio_buffer.append","audio":"`+base64.StdEncoding.EncodeToString(make([]byte, 288000))+`"}`)))
+					}
+				}
+			}
+			require.NoError(t, client.Close())
+			select {
+			case <-upstreamDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("VAD upstream survived client close")
+			}
+			var records []model.GatewayRequest
+			require.Eventually(t, func() bool {
+				var count int64
+				var err error
+				records, count, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+				if err != nil || count != 2 || len(records) != 2 {
+					return false
+				}
+				for _, record := range records {
+					if record.Status != "success" {
+						return false
+					}
+					_, count, err = model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+					if err != nil || count != 1 {
+						return false
+					}
+				}
+				return true
+			}, 5*time.Second, 10*time.Millisecond)
+			for _, record := range records {
+				assert.Equal(t, "upstream", record.UsageSource)
+				if record.Usage.AudioOutputTokens == 4 {
+					assert.Equal(t, int64(10), record.Usage.AudioInputTokens)
+					assert.Equal(t, int64(48600), record.Receivable.Nanos)
+					assertTextGatewayLedger(t, record, 36000)
+				} else {
+					assert.Equal(t, int64(2), record.Usage.AudioOutputTokens)
+					assert.Equal(t, int64(74), record.Usage.AudioInputTokens)
+					assert.Equal(t, int64(210600), record.Receivable.Nanos)
+					assertTextGatewayLedger(t, record, 156000)
+				}
+			}
+		})
 	}
-	fixture.fake.Advance(2 * time.Second)
-	client := dialRealtimeGateway(t, fixture)
-	for range 2 {
-		_, metadata, err := client.ReadMessage()
-		require.NoError(t, err)
-		assert.Equal(t, "true", ojson.GetBytes(metadata, "session.turn_detection.create_response").Raw)
-		assert.Equal(t, "true", ojson.GetBytes(metadata, "session.turn_detection.interrupt_response").Raw)
+}
+
+func TestRealtimeGatewayVADInterruptsOnlyDefaultConversation(t *testing.T) {
+	for _, conversation := range []string{"auto", "none"} {
+		t.Run(conversation, func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if !assert.NoError(t, err) {
+					return
+				}
+				defer peer.Close()
+				if !assert.NoError(t, peer.SetReadDeadline(time.Now().Add(4*time.Second))) {
+					return
+				}
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"modalities":["text"],"turn_detection":{"type":"server_vad","create_response":false,"interrupt_response":true}}}`))) {
+					return
+				}
+				if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
+					return
+				}
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.updated","session":{"modalities":["text"],"turn_detection":{"type":"server_vad","create_response":false,"interrupt_response":false}}}`))) {
+					return
+				}
+				if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
+					return
+				}
+				if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
+					return
+				}
+				started := []byte(`{"type":"input_audio_buffer.speech_started","item_id":"barge-in","audio_start_ms":0}`)
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, started)) {
+					return
+				}
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"active","status":"in_progress"}}`))) {
+					return
+				}
+				status := "completed"
+				if conversation == "auto" {
+					_, cancel, err := peer.ReadMessage()
+					if !assert.NoError(t, err) {
+						return
+					}
+					assert.JSONEq(t, `{"type":"response.cancel","response_id":"active"}`, string(cancel))
+					status = "cancelled"
+				}
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, started)) {
+					return
+				}
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"active","status":"`+status+`","usage":{"input_tokens":10,"output_tokens":0}}}`))) {
+					return
+				}
+				_, _, err = peer.ReadMessage()
+				assert.Error(t, err, "A duplicate speech event must not issue another cancellation")
+			})
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", protocol.OpenAIRealtime).Error)
+			var unified model.Model
+			require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+			unified.Capabilities.InputModalities = []capability.Modality{capability.Text, capability.Audio}
+			require.NoError(t, model.DB.Save(&unified).Error)
+			client := dialRealtimeGateway(t, fixture)
+			require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+			for range 2 {
+				_, _, err := client.ReadMessage()
+				require.NoError(t, err)
+			}
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"input_audio_buffer.append","audio":"`+base64.StdEncoding.EncodeToString(make([]byte, 48000))+`"}`)))
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"conversation":"`+conversation+`","input":[],"output_modalities":["text"]}}`)))
+			for {
+				_, raw, err := client.ReadMessage()
+				require.NoError(t, err)
+				if ojson.GetBytes(raw, "type").String() == "response.done" {
+					break
+				}
+			}
+			require.NoError(t, client.Close())
+			var records []model.GatewayRequest
+			require.Eventually(t, func() bool {
+				var count int64
+				var err error
+				records, count, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+				return err == nil && count == 1 && len(records) == 1 && records[0].Status != "settlement_pending"
+			}, 5*time.Second, 10*time.Millisecond)
+			assert.Zero(t, records[0].Receivable.Nanos)
+			assertTextGatewayLedger(t, records[0], 10000)
+		})
 	}
-	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"input_audio_buffer.append","audio":"`+inputAudio+`"}`)))
-	for {
-		_, raw, err := client.ReadMessage()
-		require.NoError(t, err)
-		if ojson.GetBytes(raw, "type").String() == "error" {
-			t.Fatalf("automatic response rejected: %s", ojson.GetBytes(raw, "error.code").String())
-		}
-		if ojson.GetBytes(raw, "type").String() == "response.done" {
-			break
-		}
-	}
-	require.NoError(t, client.Close())
-	select {
-	case <-upstreamDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("VAD upstream survived client close")
-	}
-	var records []model.GatewayRequest
-	require.Eventually(t, func() bool {
-		var count int64
-		var err error
-		records, count, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
-		if err != nil || count != 1 || len(records) != 1 || records[0].Status == "settlement_pending" {
-			return false
-		}
-		_, count, err = model.ListGatewayAttempts(t.Context(), records[0].ID, 0, 10)
-		return err == nil && count == 1
-	}, 5*time.Second, 10*time.Millisecond)
-	assert.Equal(t, "success", records[0].Status)
-	assert.Equal(t, "upstream", records[0].UsageSource)
-	assert.Equal(t, int64(10), records[0].Usage.AudioInputTokens)
-	assert.Equal(t, int64(4), records[0].Usage.AudioOutputTokens)
-	assert.Equal(t, int64(48600), records[0].Receivable.Nanos)
-	assertTextGatewayLedger(t, records[0], 36000)
 }
 
 func TestRealtimeGatewayConcurrentResponses(t *testing.T) {
