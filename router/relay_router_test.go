@@ -591,6 +591,116 @@ func TestTextGatewayFailedAutoDisablePreservesCachedProvider(t *testing.T) {
 	}
 }
 
+func TestTextGatewayManualDisableWinsOverOldFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		multi bool
+		key   bool
+	}{
+		{"single Provider", false, false},
+		{"multi Provider", true, false},
+		{"multi Key", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var engine *gin.Engine
+			var adminPAT, path string
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				response := adminSecurityRequest(engine, adminPAT, http.MethodPost, path, "")
+				assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				assert.Contains(t, response.Body.String(), `"success":true`)
+				w.WriteHeader(http.StatusUnauthorized)
+			})
+			engine = fixture.engine
+			previous := common.AutomaticDisableChannelEnabled
+			common.AutomaticDisableChannelEnabled = true
+			t.Cleanup(func() { common.AutomaticDisableChannelEnabled = previous })
+			provider, err := model.GetProviderById(fixture.channel.ProviderID, true)
+			require.NoError(t, err)
+			provider.AutoBan = common.GetPointer(1)
+			provider.ProviderInfo = model.ProviderInfo{IsMultiKey: tc.multi, MultiKeySize: 1, MultiKeyMode: constant.MultiKeyModePolling}
+			require.NoError(t, model.DB.Model(provider).Select("auto_ban", "channel_info").Updates(provider).Error)
+			var admin model.User
+			require.NoError(t, model.DB.Where("username = ?", "security-admin").First(&admin).Error)
+			adminPAT = createWalletTestAccessToken(t, admin.Id, "channel:read", "channel:operate")
+			path = fmt.Sprintf("/api/admin/v1/providers/%d/disable", provider.Id)
+			if tc.key {
+				path = fmt.Sprintf("/api/admin/v1/providers/%d/keys/0/disable", provider.Id)
+			}
+			common.MemoryCacheEnabled = true
+			model.InitProviderCache()
+			response := adminSecurityRequest(engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			assert.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
+			if tc.key {
+				keys := adminSecurityRequest(engine, adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/providers/%d/keys", provider.Id), "")
+				assert.Contains(t, keys.Body.String(), `"manual_disabled_count":1`)
+				assert.Contains(t, keys.Body.String(), `"auto_disabled_count":0`)
+			} else {
+				read := adminSecurityRequest(engine, adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/providers/%d", provider.Id), "")
+				assert.Contains(t, read.Body.String(), `"status":2`, "manual Provider disable must remain manual")
+			}
+			logs, _, err := model.GetAuditLogs(model.AuditLogFilter{Category: model.AuditCategorySecurity}, 0, 100, common.RoleRootUser)
+			require.NoError(t, err)
+			found := false
+			for _, entry := range logs {
+				if entry.Action == "provider.auto_disable" {
+					found = true
+					assert.False(t, entry.Success)
+				}
+			}
+			assert.True(t, found)
+		})
+	}
+}
+
+func TestTextGatewayAutoDisablePublishesOnlyTargetCache(t *testing.T) {
+	var calls atomic.Int32
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		if call == 1 {
+			assert.Equal(t, "Bearer provider-secret", r.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		expected := "spare-secret"
+		if call == 3 {
+			expected = "unrelated-secret"
+		}
+		assert.Equal(t, "Bearer "+expected, r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"cached","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	})
+	previous := common.AutomaticDisableChannelEnabled
+	common.AutomaticDisableChannelEnabled = true
+	t.Cleanup(func() { common.AutomaticDisableChannelEnabled = previous })
+	provider, err := model.GetProviderById(fixture.channel.ProviderID, true)
+	require.NoError(t, err)
+	provider.Key = "provider-secret\nspare-secret"
+	provider.AutoBan = common.GetPointer(1)
+	provider.ProviderInfo = model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}
+	require.NoError(t, model.DB.Model(provider).Select("key", "auto_ban", "channel_info").Updates(provider).Error)
+	unrelated := &model.Provider{Name: "Unrelated cached Provider", Key: "unrelated-secret", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, BaseURL: provider.BaseURL, Models: "legacy-model", Group: "default"}
+	require.NoError(t, model.DB.Create(unrelated).Error)
+	require.NoError(t, model.DB.Create(&model.Ability{ChannelId: unrelated.Id, Group: "default", Model: "legacy-model", Enabled: true}).Error)
+	common.MemoryCacheEnabled = true
+	model.InitProviderCache()
+	// A database fault makes a global capability reload fail immediately after
+	// the key transition commits. Only this test's isolated schema is changed.
+	require.NoError(t, model.DB.Exec(`CREATE FUNCTION hide_health_abilities() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN ALTER TABLE "abilities" RENAME TO "health_abilities_unavailable"; RETURN NEW; END $$`).Error)
+	require.NoError(t, model.DB.Exec(`CREATE TRIGGER hide_health_abilities AFTER UPDATE OF "channel_info" ON "providers" FOR EACH ROW EXECUTE FUNCTION hide_health_abilities()`).Error)
+	require.NotPanics(t, func() {
+		response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+		assert.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
+	})
+	require.NoError(t, model.DB.Exec(`DROP TRIGGER hide_health_abilities ON "providers"`).Error)
+	require.NoError(t, model.DB.Exec(`ALTER TABLE "health_abilities_unavailable" RENAME TO "abilities"`).Error)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.NoError(t, model.DB.Model(fixture.channel).Update("provider_id", unrelated.Id).Error)
+	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.EqualValues(t, 3, calls.Load(), "target's spare Key and unrelated Provider must remain selectable")
+}
+
 func TestTextGatewayCircuitUsesProviderFailuresEvenAtAttemptLimit(t *testing.T) {
 	for _, shared := range []bool{false, true} {
 		t.Run(fmt.Sprint("redis=", shared), func(t *testing.T) { testGatewayCircuit(t, shared) })

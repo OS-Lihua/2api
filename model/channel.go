@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand"
 	"slices"
 	"strings"
@@ -673,6 +674,11 @@ func handlerMultiKeyUpdate(channel *Provider, usingKey string, status int, reaso
 			channel.SetOtherInfo(info)
 			return true
 		}
+		if status == common.ChannelStatusAutoDisabled {
+			if current, exists := channel.ProviderInfo.MultiKeyStatusList[keyIndex]; exists && current != common.ChannelStatusEnabled {
+				return false
+			}
+		}
 		if channel.ProviderInfo.MultiKeyStatusList == nil {
 			channel.ProviderInfo.MultiKeyStatusList = make(map[int]int)
 		}
@@ -726,6 +732,7 @@ func UpdateProviderStatus(channelId int, usingKey string, status int, reason str
 	defer pollingLock.Unlock()
 
 	changed := false
+	var beforeProvider, committedProvider *Provider
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		// Keep the stored JSON, including NULL and legacy shapes, for the CAS.
 		// Comparing the decoded/re-encoded ProviderInfo would reject legacy rows.
@@ -737,6 +744,12 @@ func UpdateProviderStatus(channelId int, usingKey string, status int, reason str
 			return err
 		}
 		channel := &snapshot.Provider
+		if status == common.ChannelStatusAutoDisabled && channel.Status != common.ChannelStatusEnabled {
+			return nil
+		}
+		before := *channel
+		before.ProviderInfo.MultiKeyStatusList = maps.Clone(channel.ProviderInfo.MultiKeyStatusList)
+		beforeProvider = &before
 		beforeStatus, beforeOtherInfo := channel.Status, channel.OtherInfo
 		overridesKeyExhaustion := channel.ProviderInfo.IsMultiKey && usingKey == "" &&
 			status == common.ChannelStatusManuallyDisabled && reason != ProviderStatusReasonAllKeysDisabled &&
@@ -782,6 +795,7 @@ func UpdateProviderStatus(channelId int, usingKey string, status int, reason str
 				return err
 			}
 		}
+		committedProvider = channel
 		changed = true
 		return nil
 	})
@@ -790,9 +804,7 @@ func UpdateProviderStatus(channelId int, usingKey string, status int, reason str
 		return false
 	}
 	if changed && common.MemoryCacheEnabled {
-		// Publish only committed state, refreshing from the database rather than
-		// mutating an object that a concurrent management edit may have replaced.
-		InitProviderCache()
+		cacheProviderStatusTransition(beforeProvider, committedProvider)
 	}
 	return changed
 }

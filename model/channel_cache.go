@@ -3,7 +3,9 @@ package model
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -254,6 +256,49 @@ func CacheUpdateProviderStatus(id int, status int) {
 	}
 	channelSyncLock.Lock()
 	defer channelSyncLock.Unlock()
+	cacheUpdateProviderStatus(id, status)
+}
+
+// cacheProviderStatusTransition publishes a committed transition only while the
+// cache still represents its original credentials and status. A management
+// refresh that has already published a newer state must win.
+func cacheProviderStatusTransition(before, after *Provider) {
+	channelSyncLock.Lock()
+	defer channelSyncLock.Unlock()
+	cached, ok := channelsIDM[after.Id]
+	if !ok || cached.Key != before.Key || cached.Status != before.Status || cached.OtherInfo != before.OtherInfo ||
+		!maps.Equal(cached.ProviderInfo.MultiKeyStatusList, before.ProviderInfo.MultiKeyStatusList) {
+		return
+	}
+	updated := *cached
+	updated.OtherInfo = after.OtherInfo
+	updated.ProviderInfo.MultiKeyStatusList = after.ProviderInfo.MultiKeyStatusList
+	updated.ProviderInfo.MultiKeyDisabledReason = after.ProviderInfo.MultiKeyDisabledReason
+	updated.ProviderInfo.MultiKeyDisabledTime = after.ProviderInfo.MultiKeyDisabledTime
+	channelsIDM[after.Id] = &updated
+	cacheUpdateProviderStatus(after.Id, after.Status)
+	if after.Status != common.ChannelStatusEnabled {
+		return
+	}
+	// An enabled Provider may have been absent from the selectable index.
+	for _, group := range updated.GetGroups() {
+		if group2model2channels == nil {
+			group2model2channels = make(map[string]map[string][]int)
+		}
+		if group2model2channels[group] == nil {
+			group2model2channels[group] = make(map[string][]int)
+		}
+		for _, name := range updated.GetModels() {
+			ids := group2model2channels[group][name]
+			if !slices.Contains(ids, after.Id) {
+				group2model2channels[group][name] = append(ids, after.Id)
+			}
+		}
+	}
+}
+
+// Caller holds channelSyncLock.
+func cacheUpdateProviderStatus(id int, status int) {
 	if channel, ok := channelsIDM[id]; ok {
 		channel.Status = status
 	}
