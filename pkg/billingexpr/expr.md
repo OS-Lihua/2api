@@ -320,8 +320,9 @@ without request probes remain recoverable from their quantitative facts alone.
 
 This durable mode requires every `param()` / `header()` call to be enclosed by
 an independent, self-contained boolean predicate. Predicates that depend on
-local variables or collection-predicate pointers cannot be captured separately
-and are rejected at save time. For example, a header predicate combined with
+local variables or collection-predicate pointers cannot be captured separately;
+aliases of request-probe functions are also rejected at save time. For example,
+a header predicate combined with
 `u("seconds") > 2` is supported: only the header decision is frozen. A direct
 comparison between a private probe and mutable usage, or a raw probe used as an
 amount, cannot be replayed without retaining input values and is rejected by

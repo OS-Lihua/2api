@@ -89,6 +89,9 @@ func moneyBooleanExpressions(node ast.Node) map[file.Location]ast.Node {
 }
 
 func moneyRequestProbe(node ast.Node) bool {
+	if name, ok := node.(*ast.IdentifierNode); ok {
+		return name.Value == "param" || name.Value == "header"
+	}
 	call, ok := node.(*ast.CallNode)
 	if !ok {
 		return false

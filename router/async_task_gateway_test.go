@@ -1114,6 +1114,7 @@ func TestAsyncTaskPricingRejectsUnsafeDurableProbes(t *testing.T) {
 			`tier("video", u("seconds") * (param("rate") ?? 0.1))`,
 			`u("seconds") < (param("threshold") ?? 3) ? tier("low", u("seconds") * 0.1) : tier("high", u("seconds") * 0.2)`,
 			`let flag = u("seconds") > 2; header("x-mode") == (flag ? "fast" : "slow") ? tier("a", u("seconds") * 0.2) : tier("b", u("seconds") * 0.1)`,
+			`let read = header; has(read("x-mode"), "fast") ? tier("a", u("seconds") * 0.2) : tier("b", u("seconds") * 0.1)`,
 		} {
 			body, err := common.Marshal(map[string]any{"owner_type": owner.kind, "owner_id": owner.id, "currency": "USD", "expression": expression, "effective_at": clock.Now().Unix() + int64(i+1)})
 			require.NoError(t, err)
