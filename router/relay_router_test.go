@@ -987,6 +987,7 @@ func TestTextGatewayRouteVertexOAuthWaitsForReservationAndBudget(t *testing.T) {
 	original := client.Transport
 	t.Cleanup(func() { client.Transport = original })
 	delay := time.Duration(0)
+	disableDuringOAuth := ""
 	client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
 		if request.URL.Host == "www.googleapis.com" && request.URL.Path == "/oauth2/v4/token" {
 			oauthCalls.Add(1)
@@ -995,6 +996,15 @@ func TestTextGatewayRouteVertexOAuthWaitsForReservationAndBudget(t *testing.T) {
 			assert.Positive(t, wallet.Balance.Nanos, "the funded case retains spendable balance")
 			assert.Less(t, wallet.Balance.Nanos, int64(1_000_000_000), "OAuth must follow reservation")
 			fixture.fake.Advance(delay)
+			if disableDuringOAuth == "provider" {
+				require.NoError(t, quiet.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("status", common.ChannelStatusManuallyDisabled).Error)
+			}
+			if disableDuringOAuth == "key" {
+				var current model.Provider
+				require.NoError(t, quiet.First(&current, fixture.channel.ProviderID).Error)
+				current.ProviderInfo.MultiKeyStatusList = map[int]int{0: common.ChannelStatusManuallyDisabled}
+				require.NoError(t, quiet.Model(&current).Update("channel_info", current.ProviderInfo).Error)
+			}
 			return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"access_token":"route39-oauth-fixture","expires_in":3600}`))}, nil
 		}
 		return original.RoundTrip(request)
@@ -1019,6 +1029,29 @@ func TestTextGatewayRouteVertexOAuthWaitsForReservationAndBudget(t *testing.T) {
 	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
 	assert.Equal(t, 503, response.Code, response.Body.String())
 	assert.EqualValues(t, 1, modelCalls.Load())
+	for _, target := range []string{"provider", "key"} {
+		credentials["private_key_id"] = "disabled-during-oauth-" + target
+		encoded, err = common.Marshal(credentials)
+		require.NoError(t, err)
+		providerInfo := model.ProviderInfo{}
+		if target == "key" {
+			providerInfo = model.ProviderInfo{IsMultiKey: true, MultiKeySize: 1, MultiKeyMode: constant.MultiKeyModePolling}
+		}
+		require.NoError(t, quiet.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"key": string(encoded), "status": common.ChannelStatusEnabled, "channel_info": providerInfo}).Error)
+		require.NoError(t, model.UpdateOption("GatewayTotalFirstByteSeconds", "90"))
+		disableDuringOAuth, delay = target, 0
+		before, err := model.GetUserWallet(fixture.user.Id)
+		require.NoError(t, err)
+		response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+		assert.Equal(t, http.StatusServiceUnavailable, response.Code, "%s disabled during OAuth: %s", target, response.Body.String())
+		assert.EqualValues(t, 1, modelCalls.Load(), target)
+		_, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+		require.NoError(t, err)
+		assert.Zero(t, total, target)
+		after, err := model.GetUserWallet(fixture.user.Id)
+		require.NoError(t, err)
+		assert.Equal(t, before.Balance, after.Balance, target)
+	}
 }
 
 func TestTextGatewayRouteRateLimitsUseCompletedUsageAndResetWindow(t *testing.T) {

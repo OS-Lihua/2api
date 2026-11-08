@@ -325,6 +325,16 @@ func (channel *Provider) nextEnabledKey(advance bool) (string, int, *types.NewAP
 // CommitRouteKey rechecks the exact Provider credential and slot under the
 // existing row lock, then advances only the selected polling cursor.
 func (channel *Provider) CommitRouteKey(ctx context.Context, key string, index int) error {
+	return channel.checkRouteKey(ctx, key, index, true)
+}
+
+// ValidateRouteKey rechecks a prepared credential before each Provider call,
+// without advancing a polling cursor already committed for this selection.
+func (channel *Provider) ValidateRouteKey(ctx context.Context, key string, index int) error {
+	return channel.checkRouteKey(ctx, key, index, false)
+}
+
+func (channel *Provider) checkRouteKey(ctx context.Context, key string, index int, advancePolling bool) error {
 	return providerCredentialSession().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var current Provider
 		if err := lockForUpdate(tx).First(&current, channel.Id).Error; err != nil {
@@ -346,7 +356,7 @@ func (channel *Provider) CommitRouteKey(ctx context.Context, key string, index i
 		if status, exists := current.ProviderInfo.MultiKeyStatusList[index]; exists && status != common.ChannelStatusEnabled {
 			return ErrProviderStatusConflict
 		}
-		if current.ProviderInfo.MultiKeyMode != constant.MultiKeyModePolling {
+		if !advancePolling || current.ProviderInfo.MultiKeyMode != constant.MultiKeyModePolling {
 			return nil
 		}
 		return tx.Model(&Provider{}).Where("id = ?", current.Id).

@@ -250,6 +250,8 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				return nil, err
 			}
 			committedKey = true
+		} else if err := selection.Provider.ValidateRouteKey(ctx, info.ApiKey, info.ChannelMultiKeyIndex); err != nil {
+			return nil, err
 		}
 		contactedProvider = true
 		return ctx, nil
