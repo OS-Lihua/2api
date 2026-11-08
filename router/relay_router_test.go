@@ -593,6 +593,55 @@ func TestTextGatewayModelFallbackFinalFilterDeterminesStatus(t *testing.T) {
 	}
 }
 
+func TestTextGatewayModelFallbackExhaustsAllSameTierMembersFirst(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		_, _ = io.WriteString(w, `{"error":{"code":"overloaded"}}`)
+	})
+	lowerCalls := 0
+	addTextGatewayMember(t, fixture, 2, func(w http.ResponseWriter, r *http.Request) { lowerCalls++ })
+	sibling := addTextGatewayMember(t, fixture, 1, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Same tier answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+	})
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), "Same tier answer")
+	assert.Zero(t, lowerCalls)
+	assert.Empty(t, response.Result().Header.Get("X-Model-Fallback"))
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, total)
+	for _, attempt := range attempts {
+		assert.Equal(t, 1, attempt.MemberTier)
+		if attempt.Status == "success" {
+			assert.Equal(t, sibling.ModelID, attempt.ModelID)
+		}
+	}
+}
+
+func TestTextGatewayModelFallbackCapabilityExclusionsDoNotSpendAttempt(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("an incapable Model must not be called") })
+	fallback := addTextGatewayMember(t, fixture, 3, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Lower model"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+	})
+	common.OptionMapRWMutex.Lock()
+	common.OptionMap["GatewayMaxAttempts"] = "1"
+	common.OptionMapRWMutex.Unlock()
+	caps := capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{MaxOutputTokens: common.GetPointer(int64(1))}}
+	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, fallback.ModelID, attempts[0].ModelID)
+	assert.Equal(t, 3, attempts[0].MemberTier)
+	assert.NotEmpty(t, response.Result().Header.Get("X-Model-Fallback"))
+}
+
 func TestTextGatewayModelFallbackKeepsProviderExclusionsAndScope(t *testing.T) {
 	for _, scoped := range []bool{false, true} {
 		t.Run(fmt.Sprint("exclude lower provider=", scoped), func(t *testing.T) {
