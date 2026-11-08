@@ -25,6 +25,8 @@ func TestRealtimeConversationRefinesAggregateInputWithoutDoubleCounting(t *testi
 	_, err := conversation.Observe([]byte(`{"type":"conversation.item.created","item":{"id":"seed","type":"message","role":"user","content":[{"type":"input_text","text":" hello hello"}]}}`), false)
 	require.NoError(t, err)
 	observation := conversation.Snapshot().Observation([]byte(`{"type":"response.create","response":{}}`))
+	_, err = conversation.Observe([]byte(`{"type":"response.output_item.done","response_id":"a","item":{"id":"a-output","type":"message","role":"assistant","content":[{"type":"text","text":"Hi"}]}}`), false)
+	require.NoError(t, err)
 	for _, test := range []struct {
 		id           string
 		prompt, want int
@@ -33,13 +35,16 @@ func TestRealtimeConversationRefinesAggregateInputWithoutDoubleCounting(t *testi
 		require.NoError(t, conversation.Complete(result, true, observation))
 		assert.Equal(t, test.want, conversation.Usage(false).PromptTokens)
 	}
+	_, err = conversation.Observe([]byte(`{"type":"conversation.item.deleted","item_id":"a-output"}`), false)
+	require.NoError(t, err)
+	assert.Equal(t, 30001, conversation.Usage(false).PromptTokens, "Editing a later output cannot discard known input that preceded it")
 	explicit := conversation.Snapshot().Observation([]byte(`{"response":{"input":[]}}`))
 	require.NoError(t, conversation.Complete(&relaycommon.RealtimeResponseFacts{ID: "explicit", Usage: &dto.Usage{PromptTokens: 90000, CompletionTokens: 1}, Facts: &relaycommon.ResponseFacts{PromptTokensReported: true}}, false, explicit))
-	assert.Equal(t, 30002, conversation.Usage(false).PromptTokens)
+	assert.Equal(t, 30001, conversation.Usage(false).PromptTokens)
 	_, err = conversation.Observe([]byte(`{"type":"conversation.item.deleted","item_id":"seed"}`), false)
 	require.NoError(t, err)
 	require.NoError(t, conversation.Complete(&relaycommon.RealtimeResponseFacts{ID: "late", Usage: &dto.Usage{PromptTokens: 50000}, Facts: &relaycommon.ResponseFacts{PromptTokensReported: true}}, false, observation))
-	assert.Equal(t, 2, conversation.Usage(false).PromptTokens, "A destructive acknowledgement invalidates old aggregate input evidence")
+	assert.Equal(t, 1, conversation.Usage(false).PromptTokens, "A destructive acknowledgement invalidates old aggregate input evidence")
 }
 
 func TestRealtimeConversationFreezesItemsAcrossDeletionAndAudioTruncation(t *testing.T) {
