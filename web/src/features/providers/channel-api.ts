@@ -20,6 +20,16 @@ import type { ModelCapabilities } from '@/features/models/types'
 import { api } from '@/lib/api'
 import { requireServerSuccess } from '@/lib/server-error-message'
 
+export interface ChannelHealth {
+  circuit: 'closed' | 'open' | 'half_open'
+  retry_at: number
+  failures: number
+  samples: number
+  success_rate: number
+  first_byte_ms: number
+  first_byte_samples: number
+}
+
 export interface SingleModelChannel {
   id: number
   provider_id: number
@@ -35,6 +45,7 @@ export interface SingleModelChannel {
   max_concurrency: number
   weight: number
   latest_probe?: ChannelProbeResult
+  health?: ChannelHealth
 }
 export interface ChannelModel {
   id: number

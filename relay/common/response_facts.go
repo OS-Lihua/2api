@@ -23,6 +23,7 @@ type ResponseFacts struct {
 	DownstreamWriteFailed    bool
 	GeneratedText            string
 	GeneratedOutputTokens    *int
+	UpstreamRetryAfter       string // Transient; only the parsed cooldown may enter records.
 	OnBusinessOutput         func()
 	CanFinishStream          func() bool `json:"-"`
 	UpstreamErrorCode        string
