@@ -30,7 +30,7 @@ export function MarginEstimates(props: { estimates: MarginEstimate[] }) {
   const { t, i18n } = useTranslation()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   return (
-    <div className='space-y-3'>
+    <div className='min-w-0 space-y-3'>
       <p className='text-muted-foreground text-sm'>
         {t(
           'Sale estimates use the lowest applicable group discount multiplier.'
