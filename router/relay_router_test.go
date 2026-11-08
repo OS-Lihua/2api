@@ -3,10 +3,13 @@ package router
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
 	"encoding/base64"
+	"encoding/pem"
 	"fmt"
 	"image"
 	"image/png"
@@ -828,6 +831,112 @@ func TestTextGatewayAutoDisablePublishesOnlyTargetCache(t *testing.T) {
 	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
 	assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
 	assert.EqualValues(t, 3, calls.Load(), "target's spare Key and unrelated Provider must remain selectable")
+}
+
+func TestTextGatewayRouteRejectsUnsafeDefaultOutputBeforeSending(t *testing.T) {
+	var calls atomic.Int32
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	})
+	var unified model.Model
+	require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+	unified.Capabilities.Limits.MaxOutputTokens = common.GetPointer(int64(1<<31 - 1))
+	require.NoError(t, model.DB.Model(&unified).Update("capabilities", unified.Capabilities).Error)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}]}`)
+	assert.Equal(t, 400, response.Code, response.Body.String())
+	assert.Zero(t, calls.Load())
+}
+
+func TestTextGatewayRouteOccupiedProbeContinuesToNextTier(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("occupied probe must not be sent")
+		w.WriteHeader(503)
+	})
+	second := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"Lower tier"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+	})
+	var unified model.Model
+	require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+	unified.Id = 0
+	unified.ModelName = "gpt-5a-probe-secondary"
+	require.NoError(t, model.DB.Create(&unified).Error)
+	require.NoError(t, model.DB.Model(second).Update("model_id", unified.Id).Error)
+	fixture.offering.Members = append(fixture.offering.Members, model.ModelOfferingMember{ModelID: unified.Id, Tier: 2})
+	require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+	for index := range 5 {
+		_, err := service.ChannelHealth.Record(t.Context(), channelhealth.Sample{AttemptID: fmt.Sprint("occupied-", index), ChannelID: fixture.channel.ID, ProviderFailure: true})
+		require.NoError(t, err)
+	}
+	lease, err := service.ChannelHealth.Acquire(t.Context(), []int{fixture.channel.ID})
+	require.NoError(t, err)
+	require.NotEmpty(t, lease.Lease)
+	defer service.ChannelHealth.Release(t.Context(), lease)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, second.ID, attempts[0].ChannelID)
+	assert.Equal(t, 2, attempts[0].MemberTier)
+}
+
+func TestTextGatewayRouteVertexOAuthWaitsForReservationAndBudget(t *testing.T) {
+	var oauthCalls, modelCalls atomic.Int32
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		modelCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	})
+	private, err := rsa.GenerateKey(cryptorand.Reader, 2048)
+	require.NoError(t, err)
+	der, err := x509.MarshalPKCS8PrivateKey(private)
+	require.NoError(t, err)
+	credentials := map[string]string{"project_id": "route39-project", "client_email": "route39@example.invalid", "private_key": string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})), "private_key_id": "initial"}
+	encoded, err := common.Marshal(credentials)
+	require.NoError(t, err)
+	quiet := model.DB.Session(&gorm.Session{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
+	require.NoError(t, quiet.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeVertexAi, "key": string(encoded), "other": `{"default":"us-central1"}`}).Error)
+	_, err = model.PostLedgerEntries(model.LedgerPosting{Account: model.UserWalletAccount(fixture.user.Id), Type: model.LedgerEntryAdjustment, Amount: money.Amount{Nanos: -1_000_000_000, Currency: "USD"}, Remark: "empty route wallet"})
+	require.NoError(t, err)
+	client := service.GetHttpClient()
+	original := client.Transport
+	t.Cleanup(func() { client.Transport = original })
+	delay := time.Duration(0)
+	client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Host == "www.googleapis.com" && request.URL.Path == "/oauth2/v4/token" {
+			oauthCalls.Add(1)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Positive(t, wallet.Balance.Nanos, "the funded case retains spendable balance")
+			assert.Less(t, wallet.Balance.Nanos, int64(1_000_000_000), "OAuth must follow reservation")
+			fixture.fake.Advance(delay)
+			return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"access_token":"route39-oauth-fixture","expires_in":3600}`))}, nil
+		}
+		return original.RoundTrip(request)
+	})
+	body := `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+	assert.Equal(t, 402, response.Code, response.Body.String())
+	assert.Zero(t, oauthCalls.Load())
+	assert.Zero(t, modelCalls.Load())
+	_, err = model.TopUpWallet(model.WalletTopUp{UserId: fixture.user.Id, Source: money.Amount{Nanos: 1_000_000_000, Currency: "USD"}, Reference: "vertex-funded"})
+	require.NoError(t, err)
+	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.EqualValues(t, 1, oauthCalls.Load())
+	assert.EqualValues(t, 1, modelCalls.Load())
+	credentials["private_key_id"] = "budget"
+	encoded, err = common.Marshal(credentials)
+	require.NoError(t, err)
+	require.NoError(t, quiet.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("key", string(encoded)).Error)
+	require.NoError(t, model.UpdateOption("GatewayTotalFirstByteSeconds", "10"))
+	delay = 6 * time.Second
+	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+	assert.Equal(t, 503, response.Code, response.Body.String())
+	assert.EqualValues(t, 1, modelCalls.Load())
 }
 
 func TestTextGatewayRouteRateLimitsUseCompletedUsageAndResetWindow(t *testing.T) {

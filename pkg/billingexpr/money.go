@@ -110,8 +110,14 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 			}
 			return exactJSON(ojson.GetBytes(input.Request.Body, path))
 		},
-		"header": func(key string) string {
-			return headers[strings.ToLower(strings.TrimSpace(key))]
+		"header": func(key string) (string, error) {
+			key = strings.ToLower(strings.TrimSpace(key))
+			for _, deferred := range input.Request.DeferredHeaders {
+				if strings.EqualFold(key, strings.TrimSpace(deferred)) {
+					return "", fmt.Errorf("pricing header is unavailable before account preparation")
+				}
+			}
+			return headers[key], nil
 		},
 		"has": func(source any, substr string) bool {
 			return source != nil && substr != "" && strings.Contains(exactString(source), substr)

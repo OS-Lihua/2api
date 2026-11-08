@@ -137,6 +137,9 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 		if err != nil {
 			return nil, service.ErrGatewayCapability
 		}
+		if _, err = helper.ValidateTextRequest(candidate, effective, relayconstant.RelayModeChatCompletions); err != nil || !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, tokens) {
+			return nil, service.ErrGatewayCapability
+		}
 	}
 	if limit := effective.GetMaxTokens(); limit > 0 {
 		mean = min(mean, int64(limit))
@@ -156,11 +159,11 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 	}
 	mean *= int64(choices)
 	usage := &dto.Usage{PromptTokens: tokens, CompletionTokens: int(mean), TotalTokens: tokens + int(mean)}
-	headers, err := adaptor.PreviewHeaders(candidate, info, bytes.NewReader(encoded))
+	headers, deferredHeaders, err := adaptor.PreviewHeaders(candidate, info, bytes.NewReader(encoded))
 	if err != nil {
 		return nil, service.ErrGatewayUnavailable
 	}
-	purchaseInput := billingexpr.RequestInput{Body: encoded, Headers: map[string]string{}}
+	purchaseInput := billingexpr.RequestInput{Body: encoded, Headers: map[string]string{}, DeferredHeaders: deferredHeaders}
 	for key, values := range headers {
 		purchaseInput.Headers[strings.ToLower(key)] = strings.Join(values, ",")
 	}

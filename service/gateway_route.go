@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"errors"
-	"io"
 	"math/big"
 	"math/rand/v2"
 	"slices"
@@ -11,7 +10,6 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/capability"
@@ -19,7 +17,6 @@ import (
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/pkg/protocol"
-	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
@@ -82,85 +79,6 @@ var ErrGatewayUnavailable = errors.New("no Channel is available")
 // GatewayRouteRandomSource is a context key for an optional bounded random
 // source. Production uses math/rand/v2; HTTP tests can supply exact draws.
 const GatewayRouteRandomSource = "gateway_route_random_source"
-
-// SelectGatewayChannel preserves the Chat entry point while sharing Route
-// selection with other protocol entry points through SelectGatewayRoute.
-func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request *dto.GeneralOpenAIRequest, failures ...*GatewayExclusions) (*GatewaySelection, error) {
-	at := clock.Now()
-	sale, err := model.CurrentPriceVersion(c.Request.Context(), model.DB, model.PriceOwnerOffering, offering.ID, at.Unix())
-	if err != nil {
-		return nil, ErrGatewayUnavailable
-	}
-	fx, _, err := GatewayFX(c.Request.Context(), sale.Currency)
-	if err != nil {
-		return nil, ErrGatewayUnavailable
-	}
-	ratio, err := ExactGatewayGroupRatio(common.GetContextKeyString(c, constant.ContextKeyUserGroup))
-	if err != nil {
-		return nil, ErrGatewayUnavailable
-	}
-	mean, err := model.RecentOfferingOutputTokens(c.Request.Context(), offering.ID, at.UnixMilli())
-	if err != nil {
-		return nil, ErrGatewayUnavailable
-	}
-	body, err := common.GetRequestBody(c)
-	if err != nil {
-		return nil, ErrGatewayUnavailable
-	}
-	_, _ = body.Seek(0, io.SeekStart)
-	raw, err := io.ReadAll(body.(io.Reader))
-	_, _ = body.Seek(0, io.SeekStart)
-	if err != nil {
-		return nil, ErrGatewayUnavailable
-	}
-	input := billingexpr.RequestInput{Body: raw, Headers: map[string]string{}}
-	for key, values := range c.Request.Header {
-		input.Headers[strings.ToLower(key)] = strings.Join(values, ",")
-	}
-	route := GatewayRouteInput{Sale: sale, SaleFX: fx, Ratio: ratio, StartedAt: at}
-	if len(failures) > 0 {
-		route.Failures = failures[0]
-	}
-	route.Prepare = func(selection *GatewaySelection) (*GatewayRouteFacts, error) {
-		if selection.Channel.Protocol != protocol.OpenAIChat {
-			return nil, ErrGatewayConversion
-		}
-		if !GatewayCapabilitiesMatch(request, selection.Capabilities, 0) {
-			return nil, ErrGatewayCapability
-		}
-		common.SetContextKey(c, constant.ContextKeyOriginalModel, selection.Channel.Model.ModelName)
-		info := relaycommon.GenRelayInfoOpenAI(c, request)
-		info.TokenizerModel = selection.Channel.Model.ModelName
-		tokens, err := CountRequestToken(c, request.GetTokenCountMeta(), info)
-		if err != nil {
-			return nil, ErrGatewayUnavailable
-		}
-		if !GatewayCapabilitiesMatch(request, selection.Capabilities, tokens) {
-			return nil, ErrGatewayCapability
-		}
-		selection.InputTokens = tokens
-		output := mean
-		if limit := request.GetMaxTokens(); limit > 0 {
-			output = min(output, int64(limit))
-		}
-		if limit := selection.Capabilities.Limits.MaxOutputTokens; limit != nil {
-			output = min(output, *limit)
-		}
-		if limit := selection.Capabilities.Limits.ContextLength; limit != nil {
-			output = min(output, *limit-int64(tokens))
-		}
-		n := 1
-		if request.N != nil {
-			n = *request.N
-		}
-		if output < 0 || n < 1 || n > 128 || output > ((1<<31)-1)/int64(n) {
-			return nil, ErrGatewayCapability
-		}
-		output *= int64(n)
-		return &GatewayRouteFacts{Usage: &dto.Usage{PromptTokens: tokens, CompletionTokens: int(output), TotalTokens: tokens + int(output)}, SaleInput: input, PurchaseInput: input}, nil
-	}
-	return SelectGatewayRoute(c, offering, route)
-}
 
 func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input GatewayRouteInput) (*GatewaySelection, error) {
 	if input.Sale == nil || input.Prepare == nil || input.Ratio.IsNegative() {
@@ -417,8 +335,14 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 				ordered[i] = selection.Channel.ID
 			}
 			admission, err := ChannelHealth.Acquire(c.Request.Context(), ordered)
-			if err != nil || admission.ChannelID == 0 {
+			if err != nil {
 				return nil, ErrGatewayUnavailable
+			}
+			if admission.ChannelID == 0 {
+				for _, selection := range ranked {
+					reject(selection.Channel.ID, "circuit_open")
+				}
+				break
 			}
 			index := slices.IndexFunc(ranked, func(selection *GatewaySelection) bool { return selection.Channel.ID == admission.ChannelID })
 			selected := ranked[index]

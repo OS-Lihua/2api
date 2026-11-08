@@ -209,15 +209,15 @@ func (a *ChannelAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 
 // PreviewHeaders builds transient pricing probes without constructing a URL,
 // acquiring account tokens, or preparing an execution.
-func (a *ChannelAdaptor) PreviewHeaders(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (http.Header, error) {
+func (a *ChannelAdaptor) PreviewHeaders(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (http.Header, []string, error) {
 	if c == nil || c.Request == nil || info == nil || info.ProviderMeta == nil {
-		return nil, errors.New("missing upstream request metadata")
+		return nil, nil, errors.New("missing upstream request metadata")
 	}
 	metadata := a.providerMetadata(info)
 	if providerNeedsPayload(a.provider) {
 		payload, err := io.ReadAll(requestBody)
 		if err != nil {
-			return nil, errors.New("could not read upstream request")
+			return nil, nil, errors.New("could not read upstream request")
 		}
 		metadata.Payload = payload
 	}
@@ -226,10 +226,11 @@ func (a *ChannelAdaptor) PreviewHeaders(c *gin.Context, info *relaycommon.RelayI
 		request.Header.Set("Content-Type", c.Request.Header.Get("Content-Type"))
 	}
 	channel.ApplyUpstreamBodyMetadata(request, requestBody)
-	if err := a.prepareHeaders(c, info, request, metadata); err != nil {
-		return nil, err
+	deferred, err := a.prepareHeaders(c, info, request, metadata, true)
+	if err != nil {
+		return nil, nil, err
 	}
-	return request.Header.Clone(), nil
+	return request.Header.Clone(), deferred, nil
 }
 
 func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (*PreparedChannelRequest, error) {
@@ -283,7 +284,7 @@ func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayI
 		}
 		channel.ApplyUpstreamBodyMetadata(request, requestBody)
 	}
-	if err := a.prepareHeaders(c, info, request, metadata); err != nil {
+	if _, err := a.prepareHeaders(c, info, request, metadata, false); err != nil {
 		return nil, err
 	}
 	metadata.RequestHeaders = request.Header.Clone()
@@ -298,27 +299,40 @@ func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayI
 	return prepared, nil
 }
 
-func (a *ChannelAdaptor) prepareHeaders(c *gin.Context, info *relaycommon.RelayInfo, request *http.Request, metadata *channel.ProviderRequest) error {
-	if err := a.provider.SetupHeader(c, &request.Header, metadata); err != nil {
-		return errors.New("provider authentication failed")
+func (a *ChannelAdaptor) prepareHeaders(c *gin.Context, info *relaycommon.RelayInfo, request *http.Request, metadata *channel.ProviderRequest, preview bool) ([]string, error) {
+	var deferred []string
+	var err error
+	if projector, ok := a.provider.(channel.ProviderHeaderPreviewer); ok && preview {
+		deferred, err = projector.PreviewHeaders(c, &request.Header, metadata)
+	} else {
+		err = a.provider.SetupHeader(c, &request.Header, metadata)
+	}
+	if err != nil {
+		return nil, errors.New("provider authentication failed")
 	}
 	if err := channel.ApplyHeaderOverride(info, c, request); err != nil {
-		return errors.New("invalid provider header override")
+		return nil, errors.New("invalid provider header override")
+	}
+	unresolved := deferred[:0]
+	for _, name := range deferred {
+		if _, overridden := request.Header[http.CanonicalHeaderKey(name)]; !overridden {
+			unresolved = append(unresolved, name)
+		}
 	}
 	for name, values := range request.Header {
 		if !httpguts.ValidHeaderFieldName(name) {
-			return errors.New("invalid upstream header name")
+			return nil, errors.New("invalid upstream header name")
 		}
 		for _, value := range values {
 			if !httpguts.ValidHeaderFieldValue(value) {
-				return errors.New("invalid upstream header value")
+				return nil, errors.New("invalid upstream header value")
 			}
 		}
 	}
 	if request.Header.Get("Host") != "" && !httpguts.ValidHostHeader(request.Host) {
-		return errors.New("invalid upstream host override")
+		return nil, errors.New("invalid upstream host override")
 	}
-	return nil
+	return unresolved, nil
 }
 
 func (a *ChannelAdaptor) DoPreparedRequest(c *gin.Context, info *relaycommon.RelayInfo, prepared *PreparedChannelRequest) (any, error) {
