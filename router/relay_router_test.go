@@ -5991,6 +5991,9 @@ func TestMediaGatewaySpeechJSONWithoutAudioReleasesFixedFee(t *testing.T) {
 		tpm                            bool
 		inputText                      int64
 	}{
+		{name: "audio MIME incomplete error", body: `{"error":`, contentType: "audio/pcm"},
+		{name: "audio MIME incomplete error short", body: `{"error":`, contentType: "audio/pcm", short: true},
+		{name: "audio MIME incomplete message", body: `{"error":{"message":"provider-secret`, contentType: "application/octet-stream"},
 		{name: "audio MIME partial zero", body: `{"usage":{"input_tokens":0,"output_tokens":0},"tail":`, contentType: "audio/pcm"},
 		{name: "audio MIME short partial zero", body: `{"usage":{"input_tokens":0,"output_tokens":0},"error":`, contentType: "audio/pcm", short: true},
 		{name: "audio MIME partial usage", body: `{"usage":{"input_tokens":0,"output_tokens":1000},"tail":`, contentType: "audio/mpeg", output: 1000},

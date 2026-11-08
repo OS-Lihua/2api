@@ -89,8 +89,21 @@ func applySpeechUsageHeaders(info *relaycommon.RelayInfo, usage *dto.Usage, head
 
 // speechAudioPayload requires the selected format's payload evidence before
 // accepting audio with an incorrect JSON MIME, and excludes JSON-like bodies.
+func mediaJSONObjectPrefix(body []byte) bool {
+	payload := bytes.TrimSpace(body)
+	if len(payload) == 0 || payload[0] != '{' {
+		return false
+	}
+	colon := bytes.IndexByte(payload, ':')
+	if colon <= 1 {
+		return false
+	}
+	var key string
+	return common.Unmarshal(payload[1:colon], &key) == nil
+}
+
 func speechAudioPayload(ctx context.Context, body []byte, format string, facts *relaycommon.ResponseFacts) bool {
-	if len(body) == 0 || ojson.ValidBytes(body) {
+	if len(body) == 0 || ojson.ValidBytes(body) || mediaJSONObjectPrefix(body) {
 		return false
 	}
 	payload := bytes.TrimSpace(body)
@@ -105,12 +118,6 @@ func speechAudioPayload(ctx context.Context, body []byte, format string, facts *
 		}
 		if int64(len(body))%(channels*2) != 0 {
 			return false
-		}
-		if colon := bytes.IndexByte(payload, ':'); first == '{' && colon > 1 {
-			var key string
-			if common.Unmarshal(payload[1:colon], &key) == nil {
-				return false
-			}
 		}
 		binary := !utf8.Valid(body)
 		for _, value := range body {
@@ -486,7 +493,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			factsBody := mediaResponseEnvelope(bodyBytes)
 			reported := reportedMediaUsage(factsBody)
 			fault := observeMediaError(info, factsBody, resp.StatusCode)
-			if fault != nil || !bytes.Equal(factsBody, bodyBytes) || ojson.ValidBytes(bodyBytes) && ojson.ParseBytes(bodyBytes).IsObject() {
+			if fault != nil || mediaJSONObjectPrefix(bodyBytes) || !bytes.Equal(factsBody, bodyBytes) || ojson.ValidBytes(bodyBytes) && ojson.ParseBytes(bodyBytes).IsObject() {
 				observeMediaUsage(info, reported, factsBody)
 				normalizeSpeechOutputUsage(info, reported)
 				applySpeechUsageHeaders(info, reported, resp.Header)
