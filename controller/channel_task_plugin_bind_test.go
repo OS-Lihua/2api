@@ -9,8 +9,10 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -20,6 +22,8 @@ import (
 func setupTaskPluginBindChannelTest(t *testing.T) {
 	t.Helper()
 	wasMaster := common.IsMasterNode
+	previousSecret := common.SessionSecret
+	common.SessionSecret = "plugin-bind-session-fixture-secret"
 	common.IsMasterNode = true
 	previousRedisEnabled := common.RedisEnabled
 	common.RedisEnabled = false
@@ -28,9 +32,16 @@ func setupTaskPluginBindChannelTest(t *testing.T) {
 	sqlDB, err := database.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
-	require.NoError(t, database.AutoMigrate(&model.Provider{}, &model.Ability{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.Log{}, &model.AuditLog{}, &model.User{}))
+	require.NoError(t, database.AutoMigrate(&model.Provider{}, &model.Ability{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.Log{}, &model.AuditLog{}, &model.User{}, &model.UserSession{}))
 	require.NoError(t, authz.Init(database))
+	for _, user := range []model.User{
+		{Username: "plugin-bind-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AuthVersion: 1, AffCode: "bindroot"},
+		{Username: "plugin-bind-admin", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, AuthVersion: 1, AffCode: "bindadmin"},
+	} {
+		require.NoError(t, database.Create(&user).Error)
+	}
 	t.Cleanup(func() {
+		common.SessionSecret = previousSecret
 		common.IsMasterNode = wasMaster
 		common.RedisEnabled = previousRedisEnabled
 		model.DB = originalDB
@@ -163,13 +174,15 @@ export function parseTaskResult() { return {}; }
 func putUpdateChannel(t *testing.T, userID, role int, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
+	session, err := service.CreateLoginSession(userID, service.VerificationMethodPassword, "127.0.0.1", "plugin-bind-fixture")
+	require.NoError(t, err)
+	engine := gin.New()
+	engine.PUT("/api/channel/", middleware.AdminAuth(), middleware.RequirePermission(authz.ChannelWrite), UpdateChannel)
+	request := httptest.NewRequest(http.MethodPut, "/api/channel/", strings.NewReader(body))
+	request.Header.Set("Authorization", "Bearer "+session.AccessToken)
+	request.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
-	context, _ := gin.CreateTestContext(recorder)
-	context.Set("id", userID)
-	context.Set("role", role)
-	context.Request = httptest.NewRequest(http.MethodPut, "/api/channel", strings.NewReader(body))
-	context.Request.Header.Set("Content-Type", "application/json")
-	UpdateChannel(context)
+	engine.ServeHTTP(recorder, request)
 	return recorder
 }
 

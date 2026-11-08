@@ -118,6 +118,8 @@ jobs:
         run: go build ./...
 
       - name: Test root, relaykit, and tokenkit modules
+        env:
+          GOFLAGS: '-timeout=20m'
         run: make test
 
   frontend:

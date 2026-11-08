@@ -1,14 +1,47 @@
 package authz
 
-import "slices"
+import (
+	"slices"
 
-import "github.com/casbin/casbin/v2"
+	"github.com/casbin/casbin/v2"
+	casbinmodel "github.com/casbin/casbin/v2/model"
+	"gorm.io/gorm"
+)
 
 // Can reports whether the subject may perform the permission. A superuser role
 // short-circuits to allow. Otherwise a per-user override wins, then the union of
 // the subject's role baselines applies.
 func Can(userID int, systemRole int, permission Permission) bool {
+	return subjectPermissionAllowed(currentEnforcer(), userID, resolveSubjectRoles(userID, systemRole), permission)
+}
+
+// CanWithTx reads the authoritative policy in the mutation transaction instead
+// of accepting another node's grant until the next memory-policy refresh.
+func CanWithTx(tx *gorm.DB, userID int, systemRole int, permissions ...Permission) bool {
 	roles := resolveSubjectRoles(userID, systemRole)
+	if len(roles) == 0 {
+		return false
+	}
+	if slices.ContainsFunc(roles, isSuperuserRole) {
+		return true
+	}
+	policyModel, err := casbinmodel.NewModelFromString(modelText)
+	if err != nil {
+		return false
+	}
+	e, err := casbin.NewSyncedEnforcer(policyModel, newGormAdapter(tx))
+	if err != nil {
+		return false
+	}
+	for _, permission := range permissions {
+		if !subjectPermissionAllowed(e, userID, roles, permission) {
+			return false
+		}
+	}
+	return true
+}
+
+func subjectPermissionAllowed(e *casbin.SyncedEnforcer, userID int, roles []string, permission Permission) bool {
 	if len(roles) == 0 {
 		return false
 	}
@@ -19,7 +52,6 @@ func Can(userID int, systemRole int, permission Permission) bool {
 		return false
 	}
 
-	e := currentEnforcer()
 	if e == nil {
 		return false
 	}
