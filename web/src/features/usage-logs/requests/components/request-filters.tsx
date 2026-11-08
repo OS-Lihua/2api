@@ -132,6 +132,7 @@ export function RequestFilterBar(props: {
               value: 'submission_unknown',
               label: t('Task submission outcome unknown'),
             },
+            { value: 'settlement_pending', label: t('Settlement pending') },
           ]}
           onValueChange={(value) =>
             setDraft({

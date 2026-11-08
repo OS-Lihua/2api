@@ -61,6 +61,7 @@ export function RequestSummary(props: {
             <RequestMoney
               amount={request.receivable}
               pending={
+                request.sale_pending ||
                 request.status === 'pending' ||
                 request.status === 'submission_unknown'
               }

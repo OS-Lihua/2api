@@ -16,6 +16,7 @@ import (
 // UserGatewayRequest is an allowlist. Future procurement and route fields on
 // the stored record cannot accidentally become visible to the request owner.
 type UserGatewayRequest struct {
+	SalePending        bool               `json:"sale_pending,omitempty"`
 	ID                 string             `json:"id"`
 	UserID             int                `json:"user_id"`
 	TokenID            int                `json:"token_id"`
@@ -92,7 +93,7 @@ func listGatewayRequests(c *gin.Context, self bool) {
 		return
 	}
 	filter := model.GatewayRequestFilter{Status: c.Query("status")}
-	if filter.Status != "" && !slices.Contains([]string{"success", "failed", "cancelled", "partial", "pending", "submission_unknown"}, filter.Status) {
+	if filter.Status != "" && !slices.Contains([]string{"success", "failed", "cancelled", "partial", "settlement_pending", "pending", "submission_unknown"}, filter.Status) {
 		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid request"))
 		return
 	}
@@ -141,7 +142,7 @@ func listGatewayRequests(c *gin.Context, self bool) {
 	if self {
 		users := make([]UserGatewayRequest, 0, len(items))
 		for _, item := range items {
-			users = append(users, UserGatewayRequest{ID: item.ID, UserID: item.UserID, TokenID: item.TokenID, ModelOfferingID: item.ModelOfferingID, OfferingName: item.OfferingName, RequestedName: item.RequestedName,
+			users = append(users, UserGatewayRequest{SalePending: item.SalePending, ID: item.ID, UserID: item.UserID, TokenID: item.TokenID, ModelOfferingID: item.ModelOfferingID, OfferingName: item.OfferingName, RequestedName: item.RequestedName,
 				ChoiceCount: item.ChoiceCount, SalePriceVersionID: item.SalePriceVersionID, SaleCurrency: item.SaleCurrency, SaleFXRate: item.SaleFXRate, Usage: item.Usage, UsageSource: item.UsageSource, GroupRatio: item.GroupRatio,
 				Receivable: item.Receivable, LedgerEntryIDs: item.LedgerEntryIDs, StartedAt: item.StartedAt, EndedAt: item.EndedAt, Status: item.Status, ErrorCode: item.ErrorCode})
 		}

@@ -46,14 +46,23 @@ type MoneyRequestRuleTrace struct {
 	Matched    bool   `json:"matched"`
 }
 
+// MoneyConditionTrace freezes a pricing decision without retaining probe values.
+type MoneyConditionTrace struct {
+	Cond    string `json:"cond"`
+	Matched bool   `json:"matched"`
+}
+
 // MoneyTraceResult contains billing metadata without request bodies or headers.
 // FixedPrice is present even for an explicitly free request-priced leaf.
 type MoneyTraceResult struct {
-	ImageCount   *int                    `json:"image_count,omitempty"`
-	BillingUnit  BillingUnit             `json:"billing_unit"`
-	FixedPrice   *string                 `json:"fixed_price,omitempty"`
-	MatchedTier  string                  `json:"matched_tier"`
-	RequestRules []MoneyRequestRuleTrace `json:"request_rules,omitempty"`
+	Currency        money.Currency          `json:"currency,omitempty"`
+	UnroundedAmount string                  `json:"unrounded_amount,omitempty"`
+	Conditions      []MoneyConditionTrace   `json:"conditions,omitempty"`
+	ImageCount      *int                    `json:"image_count,omitempty"`
+	BillingUnit     BillingUnit             `json:"billing_unit"`
+	FixedPrice      *string                 `json:"fixed_price,omitempty"`
+	MatchedTier     string                  `json:"matched_tier"`
+	RequestRules    []MoneyRequestRuleTrace `json:"request_rules,omitempty"`
 }
 
 // MoneyUsedVars returns source identifiers for exact token normalization. It
@@ -71,7 +80,7 @@ func MoneyUsedVars(expression string) (map[string]bool, error) {
 // per million tokens; fixed prices are per request. It never evaluates a price
 // with RunExpr or converts through legacy quota units.
 func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) (money.Value, MoneyTraceResult, error) {
-	trace := MoneyTraceResult{BillingUnit: BillingUnitToken}
+	trace := MoneyTraceResult{BillingUnit: BillingUnitToken, Currency: currency}
 	// Reuse the public language's grammar and diagnostics, but never execute its
 	// floating-point program to calculate currency.
 	entry, err := compileEntryFromCacheByHash(expression, ExprHashString(expression))
@@ -143,6 +152,14 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 		},
 		"has": func(source any, substr string) bool {
 			return source != nil && substr != "" && strings.Contains(exactString(source), substr)
+		},
+		"_money_condition": func(condition string, value any) (bool, error) {
+			matched, ok := value.(bool)
+			if !ok {
+				return false, fmt.Errorf("pricing condition must be boolean")
+			}
+			trace.Conditions = append(trace.Conditions, MoneyConditionTrace{Cond: condition, Matched: matched})
+			return matched, nil
 		},
 		"_money_rule": func(index int, matched bool, multiplier, fallback any) any {
 			if matched {
@@ -223,6 +240,7 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 	if !input.TaskUsage && !entry.sourceVars["u"] {
 		number = new(big.Rat).Quo(number, big.NewRat(1_000_000, 1))
 	}
+	trace.UnroundedAmount = number.RatString()
 	amount, err := money.NewRationalValue(number, currency)
 	return amount, trace, err
 }
@@ -239,7 +257,7 @@ func compileMoneyProgram(body string, env map[string]any) (*vm.Program, []MoneyR
 	literalText := make(map[file.Location]string)
 	for _, token := range tokens {
 		switch token.Value {
-		case "_money_fixed", "_money_rule", "_money_builtin", "_money_binary", "_money_unary", "_money_index":
+		case "_money_fixed", "_money_rule", "_money_condition", "_money_builtin", "_money_binary", "_money_unary", "_money_index":
 			if token.Kind == lexer.Identifier {
 				return nil, nil, fmt.Errorf("expr compile error: identifier %q is reserved for internal use", token.Value)
 			}
@@ -289,7 +307,22 @@ func compileMoneyProgram(body string, env map[string]any) (*vm.Program, []MoneyR
 		}
 		return false
 	})
-	program, err := expr.Compile(body, expr.Env(env), expr.Patch(&moneyPatcher{literals: literals, literalText: literalText, rules: rules}), expr.Optimize(false), expr.AsAny())
+	conditions := make(map[file.Location]string)
+	conditionals := make(map[file.Location]string)
+	ast.Find(tree.Node, func(node ast.Node) bool {
+		switch part := node.(type) {
+		case *ast.ConditionalNode:
+			ast.Walk(&part.Cond, moneyConditionLiterals(literalText))
+			conditionals[part.Location()] = part.Cond.String()
+		case *ast.BinaryNode:
+			switch part.Operator {
+			case "==", "!=", "<", ">", "<=", ">=", "in":
+				conditions[part.Location()] = part.String()
+			}
+		}
+		return false
+	})
+	program, err := expr.Compile(body, expr.Env(env), expr.Patch(&moneyPatcher{literals: literals, literalText: literalText, rules: rules, conditions: conditions, conditionals: conditionals}), expr.Optimize(false), expr.AsAny())
 	if err != nil {
 		return nil, nil, fmt.Errorf("expr compile error: %w", err)
 	}
@@ -307,9 +340,11 @@ func (literals moneyConditionLiterals) Visit(node *ast.Node) {
 }
 
 type moneyPatcher struct {
-	literals    map[file.Location]*big.Rat
-	literalText map[file.Location]string
-	rules       map[file.Location]int
+	literals     map[file.Location]*big.Rat
+	literalText  map[file.Location]string
+	rules        map[file.Location]int
+	conditions   map[file.Location]string
+	conditionals map[file.Location]string
 }
 
 func (p *moneyPatcher) Visit(node *ast.Node) {
@@ -326,6 +361,9 @@ func (p *moneyPatcher) Visit(node *ast.Node) {
 			})
 		}
 	case *ast.ConditionalNode:
+		if condition, ok := p.conditionals[part.Location()]; ok {
+			part.Cond = &ast.CallNode{Callee: &ast.IdentifierNode{Value: "_money_condition"}, Arguments: []ast.Node{&ast.StringNode{Value: condition}, part.Cond}}
+		}
 		if index, ok := p.rules[part.Location()]; ok {
 			ast.Patch(node, &ast.CallNode{
 				Callee:    &ast.IdentifierNode{Value: "_money_rule"},
@@ -361,10 +399,14 @@ func (p *moneyPatcher) Visit(node *ast.Node) {
 			part.Left = &ast.CallNode{Callee: &ast.IdentifierNode{Value: "_money_index"}, Arguments: []ast.Node{part.Left}}
 			part.Right = &ast.CallNode{Callee: &ast.IdentifierNode{Value: "_money_index"}, Arguments: []ast.Node{part.Right}}
 		case "+", "-", "*", "/", "%", "^", "**", "==", "!=", "<", ">", "<=", ">=", "in":
-			ast.Patch(node, &ast.CallNode{
+			var replacement ast.Node = &ast.CallNode{
 				Callee:    &ast.IdentifierNode{Value: "_money_binary"},
 				Arguments: []ast.Node{&ast.StringNode{Value: part.Operator}, part.Left, part.Right},
-			})
+			}
+			if condition, ok := p.conditions[part.Location()]; ok {
+				replacement = &ast.CallNode{Callee: &ast.IdentifierNode{Value: "_money_condition"}, Arguments: []ast.Node{&ast.StringNode{Value: condition}, replacement}}
+			}
+			ast.Patch(node, replacement)
 		}
 	}
 }

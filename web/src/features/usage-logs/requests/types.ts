@@ -48,6 +48,7 @@ export interface RequestLog {
   usage_source?: UsageSource
   group_ratio?: string
   receivable?: MoneyAmount
+  sale_pending?: boolean
   ledger_entry_ids?: string[]
   started_at: number
   ended_at?: number
@@ -77,6 +78,8 @@ export interface RequestAttempt {
   member_tier?: number
   purchase_price_version_id?: number
   cost?: MoneyAmount
+  cost_pending?: boolean
+  converted_cost_pending?: boolean
   accounting_fx_rate?: string
   converted_cost?: MoneyAmount
   failover_decision?: string

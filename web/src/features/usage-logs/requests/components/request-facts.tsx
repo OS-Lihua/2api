@@ -51,7 +51,9 @@ export function RequestMoney(props: {
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   return (
     <span className='font-mono text-xs break-all whitespace-normal tabular-nums'>
-      {props.pending ? t('Pending') : formatMoneyAmount(props.amount, locale)}
+      {props.pending
+        ? t('Settlement pending')
+        : formatMoneyAmount(props.amount, locale)}
     </span>
   )
 }

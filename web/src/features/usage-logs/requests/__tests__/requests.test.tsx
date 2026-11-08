@@ -443,6 +443,104 @@ it('applies supported identity and millisecond date filters and resets them', as
   ).toHaveValue('')
 })
 
+it.each([
+  { salePending: true, costPending: true },
+  { salePending: false, costPending: true },
+  { salePending: false, costPending: false },
+])(
+  'shows unresolved amounts distinctly from known amounts (sale_pending=$salePending cost_pending=$costPending)',
+  async ({ salePending, costPending }) => {
+    useAuthStore.getState().auth.setUser({
+      id: 7,
+      username: 'admin',
+      role: 10,
+      permissions: { admin_permissions: { request: { read: true } } },
+    })
+    api.defaults.adapter = async (config) => {
+      const url = new URL(api.getUri(config), 'http://localhost')
+      return {
+        config,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        data: {
+          success: true,
+          data: {
+            items: url.pathname.endsWith('/attempts')
+              ? [
+                  {
+                    ...internalAttempt,
+                    cost_pending: costPending,
+                    converted_cost_pending: true,
+                    accounting_fx_rate: '2',
+                    cost: {
+                      nanos: costPending ? '0' : '5000000000000000000',
+                      currency: 'EUR',
+                    },
+                    converted_cost: { nanos: '0', currency: 'USD' },
+                  },
+                ]
+              : [
+                  {
+                    ...request,
+                    status: 'settlement_pending',
+                    sale_pending: salePending,
+                    receivable: { nanos: '0', currency: 'USD' },
+                  },
+                ],
+            total: 1,
+            page: 1,
+            page_size: 20,
+          },
+        },
+      }
+    }
+    const user = userEvent.setup()
+    renderRequests()
+    await screen.findByText('chat-standard')
+    if (salePending) {
+      expect(screen.queryByText('0 USD')).not.toBeInTheDocument()
+    } else {
+      expect(screen.getByText('0 USD')).toBeVisible()
+    }
+    await user.click(
+      screen.getByRole('button', {
+        name: `View attempts for request ${requestId}`,
+      })
+    )
+    const drawer = await screen.findByRole('dialog', {
+      name: 'Request attempts',
+    })
+    await within(drawer).findByText(attempt.id)
+    expect(within(drawer).queryByText('0 EUR')).not.toBeInTheDocument()
+    if (!costPending) {
+      expect(within(drawer).getByText('5,000,000,000 EUR')).toBeVisible()
+    }
+    expect(
+      within(drawer).getAllByText('Settlement pending').length
+    ).toBeGreaterThanOrEqual(2)
+    if (salePending) {
+      expect(within(drawer).queryByText('0 USD')).not.toBeInTheDocument()
+    } else {
+      expect(within(drawer).getByText('0 USD')).toBeVisible()
+    }
+  }
+)
+
+it('filters unresolved settlements through the existing request status selector', async () => {
+  const user = userEvent.setup()
+  renderRequests()
+  await screen.findByText('chat-standard')
+  await user.click(screen.getByRole('combobox', { name: 'Request status' }))
+  await user.click(
+    await screen.findByRole('option', { name: 'Settlement pending' })
+  )
+  await user.click(screen.getByRole('button', { name: 'Search' }))
+  await waitFor(() =>
+    expect(urls.at(-1)?.searchParams.get('status')).toBe('settlement_pending')
+  )
+})
+
 it('paginates actual request pages and retains the active server-side filters', async () => {
   useAuthStore.getState().auth.setUser({
     id: 7,
@@ -740,7 +838,8 @@ it('shows pending task facts in the existing request view and preserves explicit
     },
   })
   renderRequests()
-  expect(await screen.findAllByText('Pending')).toHaveLength(2)
+  expect(await screen.findByText('Pending')).toBeVisible()
+  expect(screen.getByText('Settlement pending')).toBeVisible()
   const usage = screen.getByRole('group', { name: 'Task usage' })
   expect(within(usage).getByText('seconds')).toBeVisible()
   expect(within(usage).getByText('2.5')).toBeVisible()

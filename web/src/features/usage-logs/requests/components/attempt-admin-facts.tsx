@@ -53,13 +53,23 @@ export function AttemptAdminFacts(props: { attempt: RequestAttempt }) {
         <div>
           <dt className='text-muted-foreground'>{t('Purchase cost')}</dt>
           <dd className='mt-1'>
-            <RequestMoney amount={attempt.cost} pending={pending} />
+            <RequestMoney
+              amount={attempt.cost}
+              pending={pending || attempt.cost_pending}
+            />
           </dd>
         </div>
         <div>
           <dt className='text-muted-foreground'>{t('Converted cost')}</dt>
           <dd className='mt-1'>
-            <RequestMoney amount={attempt.converted_cost} pending={pending} />
+            <RequestMoney
+              amount={attempt.converted_cost}
+              pending={
+                pending ||
+                attempt.cost_pending ||
+                attempt.converted_cost_pending
+              }
+            />
           </dd>
         </div>
       </dl>
