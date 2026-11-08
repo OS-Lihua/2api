@@ -324,8 +324,13 @@ func mergeNativeSourceFacts(info, native *relaycommon.RelayInfo, writer *nativeR
 		}
 		count := tokenkit.Count(info.TokenizerModelName(), facts.SourceGeneratedText) + len(writer.source.chatTools)*7
 		facts.SourceOutputTokens = &count
-	} else if facts.SourceGeneratedText == "" {
-		facts.SourceGeneratedText = source.SourceGeneratedText
+	} else {
+		if facts.SourceGeneratedText == "" {
+			facts.SourceGeneratedText = source.SourceGeneratedText
+		}
+		if source.SourceOutputTokens != nil {
+			facts.SourceOutputTokens = source.SourceOutputTokens
+		}
 	}
 	if !writer.stream && source.SourceOutputTokens != nil {
 		facts.SourceOutputTokens = source.SourceOutputTokens

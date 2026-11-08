@@ -89,6 +89,7 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	body, readErr := io.ReadAll(resp.Body)
 	facts := info.ResponseFacts
 	var sourceOutput gatewayGeneratedOutput
+	sourceTokens := 0
 	root := gjson.ParseBytes(body)
 	switch p.format {
 	case types.RelayFormatOpenAIResponses:
@@ -101,12 +102,15 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		}
 	case types.RelayFormatGemini:
 		for _, candidate := range root.Get("candidates").Array() {
+			start := sourceOutput.text.Len()
 			for _, part := range candidate.Get("content.parts").Array() {
 				sourceOutput.text.WriteString(gatewayGeminiPartText(part))
 			}
+			sourceTokens += tokenkit.Count(info.TokenizerModelName(), sourceOutput.text.String()[start:])
 		}
 	case types.RelayFormatOpenAI:
 		for _, choice := range root.Get("choices").Array() {
+			start := sourceOutput.text.Len()
 			message := choice.Get("message")
 			content := message.Get("content")
 			if content.Type == gjson.String {
@@ -128,9 +132,14 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 					sourceOutput.text.WriteString(tool.Get(path).String())
 				}
 			}
+			sourceTokens += tokenkit.Count(info.TokenizerModelName(), sourceOutput.text.String()[start:])
 		}
 	}
 	facts.SourceGeneratedText = sourceOutput.String()
+	if p.format != types.RelayFormatOpenAI && p.format != types.RelayFormatGemini {
+		sourceTokens = tokenkit.Count(info.TokenizerModelName(), facts.SourceGeneratedText)
+	}
+	facts.SourceOutputTokens = &sourceTokens
 	facts.SourceOutputObserved = facts.SourceGeneratedText != "" || gatewayMediaOutput(body, p.format)
 	observeGatewaySafety(info, body, p.format)
 	meter := gatewayUsageAccumulator{format: p.format, context: c}
@@ -182,15 +191,12 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		return usage, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	var generated strings.Builder
-	var choiceTokens *int
+	generatedTokens := 0
 	nativeMessages := p.format == types.RelayFormatClaude && info.RelayFormat == types.RelayFormatClaude
 	nativeGemini := p.format == types.RelayFormatGemini && info.RelayFormat == types.RelayFormatGemini
 	nativeResponses := p.format == types.RelayFormatOpenAIResponses && info.RelayFormat == types.RelayFormatOpenAIResponses
 	if chat, ok := canonical.Value.(*dto.OpenAITextResponse); ok && !nativeMessages && !nativeGemini && !nativeResponses {
-		if len(chat.Choices) > 1 {
-			count := 0
-			choiceTokens = &count
-		}
+		sourceChoices := root.Get("choices").Array()
 		for index, choice := range chat.Choices {
 			start := generated.Len()
 			generated.WriteString(choice.Message.StringContent())
@@ -203,16 +209,10 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 					generated.WriteString(gjson.GetBytes(tool.Custom, "input").String())
 				}
 			}
-			if choiceTokens != nil {
-				part := generated.String()[start:]
-				if p.format == types.RelayFormatOpenAI && info.RelayFormat == types.RelayFormatOpenAI {
-					audio := gjson.GetBytes(body, "choices").Array()
-					if index < len(audio) {
-						part += audio[index].Get("message.audio.transcript").String()
-					}
-				}
-				*choiceTokens += tokenkit.Count(info.TokenizerModelName(), part)
+			if p.format == types.RelayFormatOpenAI && info.RelayFormat == types.RelayFormatOpenAI && index < len(sourceChoices) {
+				generated.WriteString(sourceChoices[index].Get("message.audio.transcript").String())
 			}
+			generatedTokens += tokenkit.Count(info.TokenizerModelName(), generated.String()[start:])
 		}
 	}
 	if nativeResponses {
@@ -228,33 +228,20 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		}
 	}
 	if nativeGemini {
-		candidates := gjson.GetBytes(body, "candidates").Array()
-		if len(candidates) > 1 {
-			count := 0
-			choiceTokens = &count
-		}
-		for _, candidate := range candidates {
+		for _, candidate := range gjson.GetBytes(body, "candidates").Array() {
 			start := generated.Len()
 			for _, part := range candidate.Get("content.parts").Array() {
 				generated.WriteString(gatewayGeminiPartText(part))
 			}
-			if choiceTokens != nil {
-				*choiceTokens += tokenkit.Count(info.TokenizerModelName(), generated.String()[start:])
-			}
-		}
-	}
-	if p.format == types.RelayFormatOpenAI && info.RelayFormat == types.RelayFormatOpenAI {
-		for _, choice := range gjson.GetBytes(body, "choices").Array() {
-			generated.WriteString(choice.Get("message.audio.transcript").String())
+			generatedTokens += tokenkit.Count(info.TokenizerModelName(), generated.String()[start:])
 		}
 	}
 	facts.GeneratedText = generated.String()
+	if nativeResponses || nativeMessages {
+		generatedTokens = tokenkit.Count(info.TokenizerModelName(), facts.GeneratedText)
+	}
 	if !facts.PromptTokensReported {
 		usage.PromptTokens = max(usage.PromptTokens, info.GetEstimatePromptTokens())
-	}
-	generatedTokens := tokenkit.Count(info.TokenizerModelName(), facts.GeneratedText)
-	if choiceTokens != nil {
-		generatedTokens = *choiceTokens
 	}
 	if !facts.CompletionTokensReported {
 		usage.CompletionTokens = max(usage.CompletionTokens, generatedTokens)

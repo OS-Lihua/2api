@@ -72,16 +72,18 @@ func (facts *ResponseFacts) RecordChatSource(response *dto.OpenAITextResponse, m
 	var text strings.Builder
 	tokens := 0
 	for _, choice := range response.Choices {
-		start := text.Len()
-		text.WriteString(choice.Message.StringContent())
-		text.WriteString(choice.Message.GetReasoningContent())
+		var output strings.Builder
+		output.WriteString(choice.Message.StringContent())
+		output.WriteString(choice.Message.GetReasoningContent())
 		for _, call := range choice.Message.ParseToolCalls() {
 			facts.SourceOutputObserved = true
-			text.WriteString(call.Function.Name)
-			text.WriteString(call.Function.Arguments)
-			text.Write(call.Custom)
+			output.WriteString(call.Function.Name)
+			output.WriteString(call.Function.Arguments)
+			output.Write(call.Custom)
 		}
-		tokens += tokenkit.Count(model, text.String()[start:])
+		candidate := output.String()
+		text.WriteString(candidate)
+		tokens += tokenkit.Count(model, candidate)
 	}
 	facts.SourceGeneratedText = text.String()
 	facts.SourceOutputTokens = &tokens

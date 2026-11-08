@@ -33,6 +33,13 @@ type ChatRequestProjector interface {
 	ProjectChatRequest([]byte, dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error)
 }
 
+// ChatRequestFinalizer applies local wire changes after parameter and header
+// overrides, before effective validation, route pricing and reservation.
+// Implementations must perform no upstream I/O and remain idempotent.
+type ChatRequestFinalizer interface {
+	FinalizeChatRequest(*gin.Context, *relaycommon.RelayInfo, []byte) ([]byte, error)
+}
+
 // ChatRequestPreparer resolves Provider-managed request data after reservation.
 // The selected wire DTO retains its own upload and request format.
 type ChatRequestPreparer interface {

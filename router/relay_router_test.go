@@ -4629,6 +4629,247 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 	}
 }
 
+func TestTextGatewayOllamaRetainsMediaAndToolHistory(t *testing.T) {
+	var picture bytes.Buffer
+	require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+	encodedImage := base64.StdEncoding.EncodeToString(picture.Bytes())
+	for _, test := range []struct {
+		name, messages, expected string
+	}{
+		{"PNG", fmt.Sprintf(`[{"role":"user","content":[{"type":"text","text":"Hello"},{"type":"image_url","image_url":{"url":"data:image/png;base64,%s"}}]}]`, encodedImage), fmt.Sprintf(`[{"role":"user","content":"Hello","images":[%q]}]`, encodedImage)},
+		{"tool history", `[{"role":"user","content":"Weather"},{"role":"assistant","content":"","reasoning_content":"Plan","tool_calls":[{"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{\"city\":\"Paris\"}"}}]},{"role":"tool","tool_call_id":"call_weather","content":"Sunny"},{"role":"user","content":"Summarize"}]`, `[{"role":"user","content":"Weather"},{"role":"assistant","thinking":"Plan","tool_calls":[{"id":"call_weather","function":{"name":"weather","arguments":{"city":"Paris"}}}]},{"role":"tool","content":"Sunny","tool_call_id":"call_weather","tool_name":"weather"},{"role":"user","content":"Summarize"}]`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls atomic.Int32
+			var sent struct {
+				Messages json.RawMessage `json:"messages"`
+			}
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				require.NoError(t, common.DecodeJson(r.Body, &sent))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"message":{"role":"assistant","content":"Hello"},"done":true,"prompt_eval_count":10,"eval_count":5}`)
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeOllama).Error)
+			var unified model.Model
+			require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+			unified.Capabilities.InputModalities = append(unified.Capabilities.InputModalities, capability.Image)
+			unified.Capabilities.Features = append(unified.Capabilities.Features, capability.Reasoning)
+			require.NoError(t, model.DB.Model(&unified).Update("capabilities", unified.Capabilities).Error)
+			body := fmt.Sprintf(`{"model":"gateway-alias","messages":%s,"max_tokens":16}`, test.messages)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", body)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.EqualValues(t, 1, calls.Load())
+			assert.Empty(t, response.Header().Get("X-Gateway-Conversion-Loss"))
+			assert.JSONEq(t, test.expected, string(sent.Messages))
+		})
+	}
+}
+
+func TestTextGatewayAWSFinalBetaMatchesWireRouteAndPurchase(t *testing.T) {
+	for _, clientBeta := range []string{"", "stale-client-beta"} {
+		t.Run(fmt.Sprintf("client_beta=%q", clientBeta), func(t *testing.T) {
+			var awsCalls, spareCalls atomic.Int32
+			wireBodies := make(chan []byte, 1)
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				awsCalls.Add(1)
+				body, err := io.ReadAll(r.Body)
+				assert.NoError(t, err)
+				wireBodies <- body
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`)
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeAws, "key": "test-access|test-secret|us-east-1"}).Error)
+			require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": protocol.AnthropicMessages, "upstream_model_name": "anthropic.claude-3-haiku-20240307-v1:0", "parameter_overrides": `{"operations":[{"mode":"set_header","path":"anthropic-beta","value":"final-beta, second-beta"}]}`}).Error)
+			routeNativeRequestsToFixture(t, fixture)
+			spare := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+				spareCalls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Spare"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`)
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", spare.ProviderID).Update("type", constant.ChannelTypeAnthropic).Error)
+			require.NoError(t, model.DB.Model(spare).Updates(map[string]any{"protocol": protocol.AnthropicMessages, "upstream_model_name": "claude-haiku-4-5"}).Error)
+			require.NoError(t, model.DB.Model(fixture.offering).Update("route_method", "cost").Error)
+			for _, price := range []*model.PriceVersion{
+				{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("request",fixed(0.01))`, EffectiveAt: clock.Now().Unix()},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `param("anthropic_beta.0") == "final-beta" && param("anthropic_beta.1") == "second-beta" && header("anthropic-beta") == "final-beta, second-beta" ? tier("wire",fixed(0.003)) : tier("stale",fixed(0.007))`, EffectiveAt: clock.Now().Unix()},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: spare.ID, Currency: "USD", Expression: `tier("spare",fixed(0.004))`, EffectiveAt: clock.Now().Unix()},
+			} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"temperature":0,"metadata":{"user_id":"native-user"}}`))
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			request.Header.Set("Content-Type", "application/json")
+			if clientBeta != "" {
+				request.Header.Set("anthropic-beta", clientBeta)
+			}
+			response := httptest.NewRecorder()
+			fixture.engine.ServeHTTP(response, request)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			require.EqualValues(t, 1, awsCalls.Load(), "route pricing must inspect the final AWS body before selecting the cheaper Channel")
+			assert.Zero(t, spareCalls.Load())
+			var body map[string]common.RawMessage
+			require.NoError(t, common.Unmarshal(<-wireBodies, &body))
+			assert.JSONEq(t, `["final-beta","second-beta"]`, string(body["anthropic_beta"]))
+			assert.JSONEq(t, `"bedrock-2023-05-31"`, string(body["anthropic_version"]))
+			assert.JSONEq(t, `{"user_id":"native-user"}`, string(body["metadata"]))
+			assert.Equal(t, "0", string(body["temperature"]))
+			assert.NotContains(t, body, "model")
+			assert.NotContains(t, body, "stream")
+			requests := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests", "")
+			require.True(t, requests.Success, requests.Message)
+			require.EqualValues(t, 1, requests.Data["total"])
+			record := requests.Data["items"].([]any)[0].(map[string]any)
+			assert.Equal(t, response.Header().Get(common.RequestIdKey), record["id"])
+			assert.Equal(t, "upstream", record["usage_source"])
+			attempts := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests/"+record["id"].(string)+"/attempts", "")
+			require.True(t, attempts.Success, attempts.Message)
+			require.EqualValues(t, 1, attempts.Data["total"])
+			attempt := attempts.Data["items"].([]any)[0].(map[string]any)
+			assert.EqualValues(t, fixture.channel.ID, attempt["channel_id"])
+			assert.Equal(t, map[string]any{"nanos": "3000000", "currency": "USD"}, attempt["cost"])
+		})
+	}
+}
+
+func TestTextGatewayAWSAlternateTokenFieldRejectedBeforeProvider(t *testing.T) {
+	for _, tc := range []struct{ name, settings, key, alternate string }{
+		{"InvokeModel unbounded alternate", `{"aws_api_type":"invoke_model"}`, "test-access|test-secret|us-east-1", "4294967296"},
+		{"Mantle unbounded alternate", `{"aws_api_type":"mantle","aws_key_type":"api_key"}`, "test-mantle-key|us-east-1", "4294967296"},
+		{"InvokeModel unsupported alternate", `{"aws_api_type":"invoke_model"}`, "test-access|test-secret|us-east-1", "16"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Unexpected"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`)
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeAws, "key": tc.key, "settings": tc.settings}).Error)
+			require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": protocol.AnthropicMessages, "upstream_model_name": "claude-haiku-4-5-20251001", "parameter_overrides": `{"max_tokens":16,"max_tokens_to_sample":` + tc.alternate + `}`}).Error)
+			routeNativeRequestsToFixture(t, fixture)
+			if strings.Contains(tc.settings, `"mantle"`) {
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("base_url", "https://bedrock-mantle.us-east-1.api.aws").Error)
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+			assert.Zero(t, calls.Load(), "unsupported or unbounded alternate fields must fail before Provider contact")
+			requests := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests", "")
+			require.True(t, requests.Success, requests.Message)
+			assert.Zero(t, requests.Data["total"])
+		})
+	}
+}
+
+func TestTextGatewayAWSMantleFinalModelAndCappedBodyDriveRouteAndPurchase(t *testing.T) {
+	var mantleCalls, spareCalls atomic.Int32
+	wireBodies := make(chan []byte, 1)
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		mantleCalls.Add(1)
+		assert.Equal(t, "/anthropic/v1/messages", r.URL.Path)
+		body, err := io.ReadAll(r.Body)
+		assert.NoError(t, err)
+		wireBodies <- body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`)
+	})
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeAws, "key": "test-mantle-key|us-east-1", "settings": `{"aws_api_type":"mantle","aws_key_type":"api_key"}`}).Error)
+	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": protocol.AnthropicMessages, "upstream_model_name": "claude-haiku-4-5-20251001"}).Error)
+	routeNativeRequestsToFixture(t, fixture)
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("base_url", "https://bedrock-mantle.us-east-1.api.aws").Error)
+	caps := capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}
+	caps.Limits.MaxOutputTokens = common.GetPointer(int64(32))
+	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+	spare := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+		spareCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Spare"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`)
+	})
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", spare.ProviderID).Update("type", constant.ChannelTypeAnthropic).Error)
+	require.NoError(t, model.DB.Model(spare).Updates(map[string]any{"protocol": protocol.AnthropicMessages, "upstream_model_name": "claude-haiku-4-5"}).Error)
+	require.NoError(t, model.DB.Model(fixture.offering).Update("route_method", "cost").Error)
+	for _, price := range []*model.PriceVersion{
+		{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("request",fixed(0.01))`, EffectiveAt: clock.Now().Unix()},
+		{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `param("model") == "anthropic.claude-haiku-4-5" && param("max_tokens") == 32 ? tier("wire",fixed(0.003)) : tier("stale",fixed(0.007))`, EffectiveAt: clock.Now().Unix()},
+		{OwnerType: model.PriceOwnerChannel, OwnerID: spare.ID, Currency: "USD", Expression: `tier("spare",fixed(0.004))`, EffectiveAt: clock.Now().Unix()},
+	} {
+		require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+	}
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"temperature":0,"stream":false,"metadata":{"user_id":"native-user"}}`)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.EqualValues(t, 1, mantleCalls.Load(), "the canonical Mantle model must be available before route selection")
+	assert.Zero(t, spareCalls.Load())
+	var body map[string]common.RawMessage
+	require.NoError(t, common.Unmarshal(<-wireBodies, &body))
+	assert.JSONEq(t, `"anthropic.claude-haiku-4-5"`, string(body["model"]))
+	assert.Equal(t, "32", string(body["max_tokens"]), "a later SetChatOutputLimit must retain the finalized model")
+	assert.Equal(t, "false", string(body["stream"]))
+	assert.Equal(t, "0", string(body["temperature"]))
+	assert.JSONEq(t, `{"user_id":"native-user"}`, string(body["metadata"]))
+	assert.NotContains(t, body, "anthropic_version")
+	assert.NotContains(t, body, "anthropic_beta")
+	requests := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests", "")
+	require.True(t, requests.Success, requests.Message)
+	require.EqualValues(t, 1, requests.Data["total"])
+	record := requests.Data["items"].([]any)[0].(map[string]any)
+	assert.Equal(t, response.Header().Get(common.RequestIdKey), record["id"])
+	attempts := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests/"+record["id"].(string)+"/attempts", "")
+	require.True(t, attempts.Success, attempts.Message)
+	require.EqualValues(t, 1, attempts.Data["total"])
+	attempt := attempts.Data["items"].([]any)[0].(map[string]any)
+	assert.EqualValues(t, fixture.channel.ID, attempt["channel_id"])
+	assert.Equal(t, map[string]any{"nanos": "3000000", "currency": "USD"}, attempt["cost"])
+}
+
+func TestAWSMantleStreamingCapabilityProbeUsesActualProviderMetadata(t *testing.T) {
+	var calls atomic.Int32
+	wireBodies := make(chan []byte, 1)
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		assert.Equal(t, "/anthropic/v1/messages", r.URL.Path)
+		body, err := io.ReadAll(r.Body)
+		assert.NoError(t, err)
+		wireBodies <- body
+		var request struct {
+			Stream bool `json:"stream"`
+		}
+		if !assert.NoError(t, common.Unmarshal(body, &request)) || !request.Stream {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"message_start\",\"message\":{\"id\":\"probe\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\ndata: {\"type\":\"message_stop\"}\n\n")
+	})
+	require.NoError(t, model.DB.AutoMigrate(&model.ChannelProbeResult{}))
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeAws, "key": "test-mantle-key|us-east-1", "settings": `{"aws_api_type":"mantle","aws_key_type":"api_key"}`}).Error)
+	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": protocol.AnthropicMessages, "upstream_model_name": "claude-haiku-4-5-20251001"}).Error)
+	routeNativeRequestsToFixture(t, fixture)
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("base_url", "https://bedrock-mantle.us-east-1.api.aws").Error)
+	operator := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "channel:read", "channel:operate")
+	path := fmt.Sprintf("/api/admin/v1/channels/%d/probes", fixture.channel.ID)
+	probe := walletAPIRequest(t, fixture.engine, operator, http.MethodPost, path, `{"capability":"streaming"}`)
+	require.True(t, probe.Success, probe.Message)
+	assert.Equal(t, "passed", probe.Data["status"])
+	assert.Equal(t, string(protocol.AnthropicMessages), probe.Data["protocol"])
+	require.EqualValues(t, 1, calls.Load())
+	var body map[string]common.RawMessage
+	require.NoError(t, common.Unmarshal(<-wireBodies, &body))
+	assert.JSONEq(t, `"anthropic.claude-haiku-4-5"`, string(body["model"]))
+	assert.Equal(t, "true", string(body["stream"]), "a streaming probe must send stream=true to Mantle")
+	assert.Equal(t, "64", string(body["max_tokens"]))
+	assert.NotContains(t, body, "anthropic_version")
+	assert.NotContains(t, body, "anthropic_beta")
+	persisted := walletAPIRequest(t, fixture.engine, operator, http.MethodGet, path, "")
+	require.True(t, persisted.Success, persisted.Message)
+	results := persisted.Data["results"].([]any)
+	require.Len(t, results, 1)
+	assert.Equal(t, "passed", results[0].(map[string]any)["status"])
+	requests := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests", "")
+	require.True(t, requests.Success, requests.Message)
+	assert.Zero(t, requests.Data["total"], "capability probes must not create billed gateway Requests")
+}
+
 func TestTextGatewayPaLMJSONPreservesCandidateCount(t *testing.T) {
 	for _, modelCase := range []struct {
 		name   string
@@ -4706,6 +4947,73 @@ func TestTextGatewayPaLMJSONPreservesCandidateCount(t *testing.T) {
 	}
 }
 
+func TestTextGatewayPaLMCandidatePricingUsesIndependentEstimates(t *testing.T) {
+	var sent struct {
+		CandidateCount int `json:"candidateCount"`
+	}
+	calls := 0
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		assert.NoError(t, common.DecodeJson(r.Body, &sent))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"candidates":[{"content":"Hello"},{"content":"World"}]}`)
+	})
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypePaLM).Error)
+	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("model_name", "chat-bison-001").Error)
+	for _, price := range []*model.PriceVersion{
+		{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("output", c * 4)`, EffectiveAt: clock.Now().Unix()},
+		{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("output", c * 2)`, EffectiveAt: clock.Now().Unix()},
+	} {
+		require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+	}
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","n":2,"stream":false,"messages":[{"role":"user","content":"Hello"}]}`)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, 2, sent.CandidateCount)
+	var result dto.OpenAITextResponse
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+	require.Len(t, result.Choices, 2)
+	assert.Equal(t, "Hello", result.Choices[0].Message.StringContent())
+	assert.Equal(t, "World", result.Choices[1].Message.StringContent())
+	requests := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests", "")
+	require.True(t, requests.Success, requests.Message)
+	items := requests.Data["items"].([]any)
+	require.Len(t, items, 1)
+	record := items[0].(map[string]any)
+	assert.EqualValues(t, 2, record["choice_count"])
+	assert.Equal(t, "estimated", record["usage_source"])
+	// The configured estimator counts Hello and World as two tokens each.
+	// Independent candidates must not be retokenized as the single word HelloWorld.
+	assert.EqualValues(t, 4, record["usage"].(map[string]any)["completion_tokens"])
+	assert.Equal(t, map[string]any{"nanos": "14400", "currency": "USD"}, record["receivable"])
+	attempts := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests/"+record["id"].(string)+"/attempts", "")
+	require.True(t, attempts.Success, attempts.Message)
+	items = attempts.Data["items"].([]any)
+	require.Len(t, items, 1)
+	attempt := items[0].(map[string]any)
+	assert.Equal(t, "estimated", attempt["usage_source"])
+	assert.EqualValues(t, 4, attempt["usage"].(map[string]any)["completion_tokens"])
+	assert.Equal(t, map[string]any{"nanos": "8000", "currency": "USD"}, attempt["cost"])
+}
+
+func TestTextGatewayPaLMStreamingOverrideRejectsMultipleCandidates(t *testing.T) {
+	var calls atomic.Int32
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"candidates":[{"content":"Hello"},{"content":"World"}]}`)
+	})
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypePaLM).Error)
+	require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", `{"candidateCount":2}`).Error)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", `{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}]}`)
+	assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+	assert.Zero(t, calls.Load())
+	requests := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests", "")
+	require.True(t, requests.Success, requests.Message)
+	assert.Zero(t, requests.Data["total"])
+
+}
+
 type gatewayCancelOnCloseBody struct {
 	io.ReadCloser
 	cancel context.CancelFunc
@@ -4715,6 +5023,64 @@ func (body *gatewayCancelOnCloseBody) Close() error {
 	err := body.ReadCloser.Close()
 	body.cancel()
 	return err
+}
+
+type gatewayCancelOnReadBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (body *gatewayCancelOnReadBody) Read(buffer []byte) (int, error) {
+	n, err := body.ReadCloser.Read(buffer)
+	if n > 0 {
+		body.cancel()
+	}
+	return n, err
+}
+
+func TestTextGatewayNativeStreamCancellationPreservesPurchase(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	var calls atomic.Int32
+	fixture := newTextGatewayFixtureWithNativeLosses(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data:Hello\n")
+	})
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeZhipu, "key": "test.secret"}).Error)
+	require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("output", c * 2)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+	client := service.GetHttpClient()
+	original := client.Transport
+	t.Cleanup(func() { client.Transport = original })
+	client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
+		response, err := original.RoundTrip(request)
+		if err == nil {
+			response.Body = &gatewayCancelOnReadBody{ReadCloser: response.Body, cancel: cancel}
+		}
+		return response, err
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/"+"chat/"+"completions", strings.NewReader(`{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)).WithContext(ctx)
+	request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	fixture.engine.ServeHTTP(response, request)
+	require.ErrorIs(t, ctx.Err(), context.Canceled)
+	assert.EqualValues(t, 1, calls.Load())
+	assert.NotContains(t, response.Body.String(), "Hello")
+	requests := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests", "")
+	require.True(t, requests.Success, requests.Message)
+	items := requests.Data["items"].([]any)
+	require.Len(t, items, 1)
+	record := items[0].(map[string]any)
+	assert.Equal(t, map[string]any{"nanos": "0", "currency": "USD"}, record["receivable"])
+	attempts := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests/"+record["id"].(string)+"/attempts", "")
+	require.True(t, attempts.Success, attempts.Message)
+	items = attempts.Data["items"].([]any)
+	require.Len(t, items, 1)
+	attempt := items[0].(map[string]any)
+	assert.Equal(t, "estimated", attempt["usage_source"])
+	assert.EqualValues(t, 1, attempt["usage"].(map[string]any)["completion_tokens"])
+	assert.Equal(t, map[string]any{"nanos": "2000", "currency": "USD"}, attempt["cost"])
 }
 
 func TestTextGatewayNativeJSONCancellationPreservesPurchase(t *testing.T) {
@@ -6028,6 +6394,26 @@ func TestTextGatewayConvertedStreamInterruptionDoesNotComplete(t *testing.T) {
 			assert.Equal(t, int64(1), attempts[0].Usage.CompletionTokens)
 		})
 	}
+}
+
+func TestTextGatewayLegacyProxySettingsRemainUsable(t *testing.T) {
+	var proxyCalls atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+	}))
+	t.Cleanup(proxy.Close)
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("the configured proxy must handle the Provider request")
+	})
+	setting, err := common.Marshal(map[string]string{"proxy": proxy.URL + "/legacy?old=1#fragment"})
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("setting", string(setting)).Error)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.EqualValues(t, 1, proxyCalls.Load())
+	assert.Contains(t, response.Body.String(), "Hello")
 }
 
 func TestTextGatewayRejectsInvalidProviderSettingsWithoutMutation(t *testing.T) {
@@ -8421,16 +8807,17 @@ func TestTextGatewayNativeSystemPromptsRetainAllInstructions(t *testing.T) {
 						Text string `json:"text"`
 					}
 					require.NoError(t, common.Unmarshal(body.System, &system))
-					require.Len(t, system, 2)
+					require.Len(t, system, 3)
 					assert.Equal(t, "first", system[0].Text)
 					assert.Equal(t, "second", system[1].Text)
+					assert.Equal(t, "third", system[2].Text)
 					require.Len(t, body.Messages, 1)
 					assert.Equal(t, "user", body.Messages[0].Role)
 					_, _ = io.WriteString(w, `{"output":{"message":{"content":[{"text":"Hello"}]}},"stopReason":"end_turn","usage":{"inputTokens":10,"outputTokens":5}}`)
 				} else {
 					var system string
 					require.NoError(t, common.Unmarshal(body.System, &system))
-					assert.Equal(t, "first\nsecond", system)
+					assert.Equal(t, "first\nsecond\nthird", system)
 					_, _ = io.WriteString(w, `{"result":"Hello","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
 				}
 			})
@@ -8442,7 +8829,7 @@ func TestTextGatewayNativeSystemPromptsRetainAllInstructions(t *testing.T) {
 				require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", "amazon.nova-lite-v1:0").Error)
 				routeNativeRequestsToFixture(t, fixture)
 			}
-			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"system","content":"first"},{"role":"system","content":"second"},{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"system","content":"first"},{"role":"system","content":"second"},{"role":"system","content":"third"},{"role":"user","content":"Hello"}],"max_tokens":16}`)
 			assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
 		})
 	}
