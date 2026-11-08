@@ -249,6 +249,10 @@ type StreamFlushError struct {
 func (e *StreamFlushError) Error() string { return e.Err.Error() }
 func (e *StreamFlushError) Unwrap() error { return e.Err }
 
+// ErrGatewayStreamPreludeLimit is an upstream framing failure before any
+// downstream write. It must remain eligible for pre-business failover.
+var ErrGatewayStreamPreludeLimit = errors.New("upstream stream prelude exceeds limit")
+
 // WriteGatewayStreamFrame holds an Attempt's prelude until its first business
 // frame. A failed candidate cannot commit stale protocol IDs or loss headers.
 func WriteGatewayStreamFrame(c *gin.Context, facts *relaycommon.ResponseFacts, frame string, business bool) error {
@@ -258,7 +262,7 @@ func WriteGatewayStreamFrame(c *gin.Context, facts *relaycommon.ResponseFacts, f
 	if facts != nil && facts.OnBusinessOutput != nil && !facts.BusinessOutput {
 		if !business {
 			if len(facts.StreamPrelude)+len(frame) > 1<<20 {
-				return errors.New("upstream stream prelude exceeds limit")
+				return ErrGatewayStreamPreludeLimit
 			}
 			facts.StreamPrelude = append(facts.StreamPrelude, frame...)
 			return nil
@@ -358,7 +362,9 @@ func SendChatChunk(c *gin.Context, info *relaycommon.RelayInfo, response *dto.Ch
 		return err
 	}
 	if err != nil {
-		facts.DownstreamWriteFailed = true
+		if !errors.Is(err, ErrGatewayStreamPreludeLimit) {
+			facts.DownstreamWriteFailed = true
+		}
 		var flushErr *StreamFlushError
 		if !errors.As(err, &flushErr) {
 			return err

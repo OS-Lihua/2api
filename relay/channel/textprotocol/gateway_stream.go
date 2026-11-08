@@ -29,6 +29,8 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 	meter := gatewayUsageAccumulator{format: p.format}
 	var streamErr error
 	var output gatewayGeneratedOutput
+	expectedChoices := max(1, info.ResponseFacts.ExpectedChoices)
+	choices := map[int]bool{}
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		info.StreamStatus.RequireTerminal()
 		measured, err := meter.Observe([]byte(data))
@@ -87,22 +89,30 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			if gjson.Get(data, "type").String() == "message_stop" {
 				info.StreamStatus.MarkCompleted()
 			}
-		case types.RelayFormatOpenAI:
-			for _, choice := range gjson.Get(data, "choices").Array() {
-				if choice.Get("finish_reason").String() != "" {
-					info.StreamStatus.MarkCompleted()
-				}
+		case types.RelayFormatOpenAI, types.RelayFormatGemini:
+			path, terminal := "choices", "finish_reason"
+			if p.format == types.RelayFormatGemini {
+				path, terminal = "candidates", "finishReason"
 			}
-		case types.RelayFormatGemini:
-			for _, candidate := range gjson.Get(data, "candidates").Array() {
-				if candidate.Get("finishReason").String() != "" {
-					info.StreamStatus.MarkCompleted()
+			for i, choice := range gjson.Get(data, path).Array() {
+				index := i
+				if value := choice.Get("index"); value.Exists() {
+					index = int(value.Int())
 				}
+				if index < 0 || index >= expectedChoices {
+					streamErr = errors.New("invalid upstream choice index")
+					sr.Stop(streamErr)
+					return
+				}
+				choices[index] = choices[index] || choice.Get(terminal).String() != ""
 			}
 		}
 		if info.StreamStatus.ResponseFailed() {
 			streamErr = errors.New("upstream stream failed")
 			sr.Stop(streamErr)
+			return
+		}
+		if resp.StatusCode != http.StatusOK {
 			return
 		}
 		if p.format == info.RelayFormat {
@@ -128,8 +138,23 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		}
 	})
 	info.StreamStatus.RequireTerminal()
+	if p.format == types.RelayFormatOpenAI || p.format == types.RelayFormatGemini {
+		ended := info.StreamStatus.OutcomeSnapshot().EndReason
+		complete := len(choices) == expectedChoices
+		for _, finished := range choices {
+			complete = complete && (finished || ended == relaycommon.StreamEndReasonDone)
+		}
+		if complete {
+			info.StreamStatus.MarkCompleted()
+		} else if ended == relaycommon.StreamEndReasonDone {
+			info.StreamStatus.MarkFailed("stream_interrupted", "", 0)
+		}
+	}
 	if streamErr == nil && !info.StreamStatus.CompletedNormally() {
 		streamErr = errors.New("upstream stream did not complete")
+	}
+	if resp.StatusCode != http.StatusOK {
+		streamErr = errors.New("upstream response failed")
 	}
 	if streamErr == nil {
 		results, err := relayconvert.FinalizeStreamResponse(c, info, state)
@@ -237,7 +262,9 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 	business := text != "" || gatewayMediaOutput(body, info.RelayFormat)
 	writeErr := helper.WriteGatewayStreamFrame(c, info.ResponseFacts, frame, business)
 	if writeErr != nil {
-		info.ResponseFacts.DownstreamWriteFailed = true
+		if !errors.Is(writeErr, helper.ErrGatewayStreamPreludeLimit) {
+			info.ResponseFacts.DownstreamWriteFailed = true
+		}
 		var flushErr *helper.StreamFlushError
 		if !errors.As(writeErr, &flushErr) {
 			return "", writeErr

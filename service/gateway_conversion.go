@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/model_setting"
+	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
 
@@ -25,6 +26,16 @@ func GatewayProtocolFormat(kind protocol.Type) (types.RelayFormat, error) {
 	default:
 		return "", fmt.Errorf("unsupported text protocol")
 	}
+}
+
+const gatewayNativeMediaReferencesKey = "gateway_native_media_references"
+
+// GatewayRequestTokenOptions keeps native references and opaque image codecs
+// out of forced downloads or decoding. Their upstream representation is intact.
+func GatewayRequestTokenOptions(c *gin.Context) RequestTokenOptions {
+	references, _ := c.Get(gatewayNativeMediaReferencesKey)
+	native, _ := references.(map[string]bool)
+	return RequestTokenOptions{UseDeclaredMediaTypes: true, NativeReferences: native}
 }
 
 // GatewayChatProjection exposes token and capability facts for validation only.
@@ -44,15 +55,36 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 		return nil, err
 	}
 	projectionMedia := map[string]dto.MediaContent{}
+	references := map[string]bool{}
 	if gemini, ok := request.(*dto.GeminiChatRequest); ok {
+		if c, ok := ctx.(*gin.Context); ok {
+			if previous, found := c.Get(gatewayNativeMediaReferencesKey); found {
+				if stored, ok := previous.(map[string]bool); ok && stored != nil {
+					references = stored
+				}
+			}
+		}
 		for i, content := range gemini.Contents {
 			for j, part := range content.Parts {
+				if part.InlineData != nil && part.InlineData.Data != "" {
+					mime := strings.ToLower(part.InlineData.MimeType)
+					path := fmt.Sprintf("contents[%d].parts[%d].inlineData", i, j)
+					switch {
+					case strings.HasPrefix(mime, "audio/"):
+						projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeInputAudio, InputAudio: &dto.MessageInputAudio{Data: part.InlineData.Data, Format: strings.TrimPrefix(mime, "audio/")}}
+					case strings.HasPrefix(mime, "image/"):
+						projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: "data:" + mime + ";base64," + part.InlineData.Data, Detail: "auto", MimeType: mime}}
+					}
+				}
 				if part.FileData == nil || part.FileData.FileUri == "" {
 					continue
 				}
+				references[part.FileData.FileUri] = true
 				mime := strings.ToLower(part.FileData.MimeType)
 				path := fmt.Sprintf("contents[%d].parts[%d].fileData", i, j)
 				switch {
+				case strings.HasPrefix(mime, "image/"):
+					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: part.FileData.FileUri, Detail: "auto", MimeType: mime}}
 				case strings.HasPrefix(mime, "audio/"):
 					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeInputAudio, InputAudio: &dto.MessageInputAudio{Data: part.FileData.FileUri, Format: strings.TrimPrefix(mime, "audio/")}}
 				case mime == "application/pdf":
@@ -60,11 +92,19 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 				}
 			}
 		}
+		if c, ok := ctx.(*gin.Context); ok {
+			c.Set(gatewayNativeMediaReferencesKey, references)
+		}
 	}
 	var referencedMedia []dto.MediaContent
 	for _, diagnostic := range result.Diagnostics {
 		if (diagnostic.Code == "unsupported_media_type" || diagnostic.Code == "unsupported_media_source") && diagnostic.Severity == types.ConversionDiagnosticError {
 			if media, represented := projectionMedia[diagnostic.Path]; represented {
+				if media.Type == dto.ContentTypeImageURL {
+					if source := media.ToFileSource(); source != nil {
+						references[source.GetRawData()] = true
+					}
+				}
 				referencedMedia = append(referencedMedia, media)
 				continue
 			}

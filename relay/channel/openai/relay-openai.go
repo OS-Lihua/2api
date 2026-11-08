@@ -45,7 +45,7 @@ func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, fo
 				business = business || choice.Delta.GetContentString() != "" || choice.Delta.GetReasoningContent() != "" || len(choice.Delta.ToolCalls) > 0
 			}
 			defer func() {
-				if writeErr != nil {
+				if writeErr != nil && !errors.Is(writeErr, helper.ErrGatewayStreamPreludeLimit) {
 					info.ResponseFacts.DownstreamWriteFailed = true
 				}
 				var flushErr *helper.StreamFlushError

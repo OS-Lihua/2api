@@ -198,6 +198,23 @@ func gatewayResponseTool(item gjson.Result) (string, string, bool) {
 }
 
 func gatewayMediaOutput(body []byte, format types.RelayFormat) bool {
+	if format == types.RelayFormatOpenAIResponses {
+		root := gjson.ParseBytes(body)
+		if root.Get("type").String() == "response.image_generation_call.partial_image" && root.Get("partial_image_b64").String() != "" {
+			return true
+		}
+		items := root.Get("output").Array()
+		items = append(items, root.Get("response.output").Array()...)
+		if item := root.Get("item"); item.Exists() {
+			items = append(items, item)
+		}
+		for _, item := range items {
+			if item.Get("type").String() == "image_generation_call" && item.Get("result").Type == gjson.String && item.Get("result").String() != "" {
+				return true
+			}
+		}
+		return false
+	}
 	if format == types.RelayFormatOpenAI {
 		for _, choice := range gjson.GetBytes(body, "choices").Array() {
 			if choice.Get("message.audio.data").String() != "" || choice.Get("delta.audio.data").String() != "" {

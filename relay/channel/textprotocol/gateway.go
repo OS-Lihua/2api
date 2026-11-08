@@ -95,6 +95,9 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	if resp.StatusCode != http.StatusOK || protocolError {
 		return usage, types.NewError(fmt.Errorf("upstream response failed"), types.ErrorCodeBadResponse)
 	}
+	if info.IsStream {
+		return usage, types.NewError(fmt.Errorf("upstream returned JSON for a stream request"), types.ErrorCodeBadResponse)
+	}
 	observeGatewaySafety(info, body, p.format)
 	var response any
 	switch p.kind {

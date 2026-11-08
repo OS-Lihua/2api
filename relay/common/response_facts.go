@@ -21,6 +21,7 @@ type ResponseFacts struct {
 	CompletionTokensReported bool
 	IndependentUsageReported bool
 	BusinessOutput           bool
+	ExpectedChoices          int `json:"-"`
 	DownstreamWriteFailed    bool
 	GeneratedText            string
 	OnBusinessOutput         func()

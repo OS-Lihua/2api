@@ -2,7 +2,9 @@ package textprotocol
 
 import (
 	"fmt"
+	"mime"
 	"net/http"
+	"strings"
 
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
@@ -42,7 +44,9 @@ func (p *Handler) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	info.FinalRequestRelayFormat = p.format
 	info.UpstreamProtocol = p.kind
 	if info.ResponseFacts != nil {
-		if info.IsStream {
+		contentType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+		jsonResponse := contentType == "application/json" || strings.HasSuffix(contentType, "+json")
+		if contentType == "text/event-stream" || info.IsStream && !jsonResponse {
 			return p.gatewayStreamResponse(c, resp, info)
 		}
 		return p.gatewayJSONResponse(c, resp, info)

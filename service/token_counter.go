@@ -57,6 +57,7 @@ func EstimateRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *rela
 // MIME discovery. Native file references are not downloadable client assets.
 type RequestTokenOptions struct {
 	UseDeclaredMediaTypes bool
+	NativeReferences      map[string]bool
 }
 
 // CountRequestToken counts request tokens regardless of the billing estimation
@@ -137,7 +138,7 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 		if file.Source == nil {
 			continue
 		}
-		if len(options) > 0 && options[0].UseDeclaredMediaTypes && file.FileType != "" && file.FileType != types.FileTypeImage {
+		if len(options) > 0 && options[0].UseDeclaredMediaTypes && (file.FileType != "" && file.FileType != types.FileTypeImage || options[0].NativeReferences[file.Source.GetRawData()]) {
 			continue
 		}
 
@@ -160,6 +161,10 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 	for i, file := range meta.Files {
 		switch file.FileType {
 		case types.FileTypeImage:
+			if len(options) > 0 && file.Source != nil && options[0].NativeReferences[file.Source.GetRawData()] {
+				tkm += tokenkit.ImageTokens(model, tokenkit.Image{Detail: file.Detail})
+				continue
+			}
 			token, err := getImageToken(c, file, model, info.IsStream)
 			if err != nil {
 				return 0, fmt.Errorf("error counting image token, media index[%d], identifier[%s], err: %v", i, file.GetIdentifier(), err)

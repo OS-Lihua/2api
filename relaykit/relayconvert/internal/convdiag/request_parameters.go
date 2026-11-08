@@ -2,6 +2,7 @@ package convdiag
 
 import (
 	"context"
+	"reflect"
 	"slices"
 	"strings"
 
@@ -9,8 +10,8 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
-// InspectRequestParameters reports cache and output-schema controls that the
-// converter actually omitted. It observes wire DTOs rather than converting them.
+// InspectRequestParameters reports generation, cache and output controls that
+// the converter omitted or changed. It compares public wire DTO semantics.
 func InspectRequestParameters(ctx context.Context, source, target any, from, to types.RelayFormat, openRouter bool) error {
 	beforeBody, err := kitutil.Marshal(source)
 	if err != nil {
@@ -26,6 +27,39 @@ func InspectRequestParameters(ctx context.Context, source, target any, from, to 
 	}
 	if err := kitutil.Unmarshal(afterBody, &after); err != nil {
 		return err
+	}
+	formats := map[types.RelayFormat]int{types.RelayFormatOpenAI: 0, types.RelayFormatOpenAIResponses: 1, types.RelayFormatClaude: 2, types.RelayFormatGemini: 3}
+	fromIndex, fromKnown := formats[from]
+	toIndex, toKnown := formats[to]
+	if fromKnown && toKnown {
+		for _, paths := range [][4]string{
+			{"temperature", "temperature", "temperature", "generationConfig.temperature"},
+			{"top_p", "top_p", "top_p", "generationConfig.topP"},
+			{"top_k", "", "top_k", "generationConfig.topK"},
+			{"seed", "", "", "generationConfig.seed"},
+			{"presence_penalty", "presence_penalty", "", "generationConfig.presencePenalty"},
+			{"frequency_penalty", "frequency_penalty", "", "generationConfig.frequencyPenalty"},
+			{"logit_bias", "", "", ""},
+			{"logprobs", "", "", "generationConfig.responseLogprobs"},
+			{"top_logprobs", "top_logprobs", "", "generationConfig.logprobs"},
+			{"min_p", "min_p", "", ""},
+			{"repetition_penalty", "repetition_penalty", "", ""},
+			{"store", "store", "", ""},
+			{"service_tier", "service_tier", "service_tier", ""},
+			{"user", "user", "metadata.user_id", ""},
+			{"safety_identifier", "safety_identifier", "", ""},
+			{"prediction", "", "", ""},
+			{"verbosity", "text.verbosity", "", ""},
+		} {
+			path := paths[fromIndex]
+			if path == "" {
+				continue
+			}
+			value := requestParameterAt(before, path)
+			if value != nil && !reflect.DeepEqual(value, requestParameterAt(after, paths[toIndex])) {
+				Add(ctx, types.ConversionDiagnostic{Code: "request_parameter_dropped", Path: path, Message: "The target request did not retain this request parameter", Severity: types.ConversionDiagnosticWarning, From: from, To: to})
+			}
+		}
 	}
 	InspectCacheControls(ctx, before, after, from, to, to == types.RelayFormatClaude || to == types.RelayFormatOpenAI && openRouter)
 	if !slices.Equal(requestOutputModalities(before, from), requestOutputModalities(after, to)) {

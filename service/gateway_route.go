@@ -106,7 +106,7 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 			common.SetContextKey(c, constant.ContextKeyOriginalModel, candidate.Model.ModelName)
 			info := relaycommon.GenRelayInfoOpenAI(c, request)
 			info.TokenizerModel = candidate.Model.ModelName
-			tokens, err = CountRequestToken(c, request.GetTokenCountMeta(), info, RequestTokenOptions{UseDeclaredMediaTypes: true})
+			tokens, err = CountRequestToken(c, request.GetTokenCountMeta(), info, GatewayRequestTokenOptions(c))
 			if err != nil {
 				return nil, errors.New("could not estimate input tokens")
 			}
@@ -188,8 +188,14 @@ func GatewayCapabilitiesMatch(request *dto.GeneralOpenAIRequest, caps capability
 		return false
 	}
 	tools := len(request.Tools) > 0 || len(request.Functions) > 0
+	textInput := request.Prompt != nil || request.Input != nil || request.Instruction != ""
 	for _, message := range request.Messages {
-		tools = tools || len(message.Tools) > 0 || len(message.ParseToolCalls()) > 0 || message.Role == "tool"
+		calls := message.ParseToolCalls()
+		tools = tools || len(message.Tools) > 0 || len(calls) > 0 || message.Role == "tool"
+		textInput = textInput || message.GetReasoningContent() != "" || len(calls) > 0
+		for _, part := range message.ParseContent() {
+			textInput = textInput || part.Type == dto.ContentTypeText && part.Text != ""
+		}
 	}
 	if tools && !slices.Contains(caps.Features, capability.ToolCalling) {
 		return false
@@ -203,7 +209,7 @@ func GatewayCapabilitiesMatch(request *dto.GeneralOpenAIRequest, caps capability
 	if (request.PromptCacheKey != "" || len(request.PromptCacheOptions) > 0 || len(request.PromptCacheRetention) > 0) && !slices.Contains(caps.Features, capability.Caching) {
 		return false
 	}
-	if !slices.Contains(caps.InputModalities, capability.Text) {
+	if textInput && !slices.Contains(caps.InputModalities, capability.Text) {
 		return false
 	}
 	outputs := []capability.Modality{capability.Text}

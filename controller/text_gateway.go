@@ -389,7 +389,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	// must not vary with the downstream presentation protocol.
 	counterInfo := *info
 	counterInfo.RelayFormat = types.RelayFormatOpenAI
-	estimatedInput, err := service.CountRequestToken(c, effective.GetTokenCountMeta(), &counterInfo, service.RequestTokenOptions{UseDeclaredMediaTypes: true})
+	estimatedInput, err := service.CountRequestToken(c, effective.GetTokenCountMeta(), &counterInfo, service.GatewayRequestTokenOptions(c))
 	if err != nil || !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, estimatedInput) {
 		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
 		return
@@ -440,6 +440,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	if effective.N != nil {
 		choiceCount = *effective.N
 	}
+	info.ResponseFacts.ExpectedChoices = choiceCount
 	mean *= int64(choiceCount)
 	estimatedUsage := &dto.Usage{PromptTokens: estimatedInput, CompletionTokens: int(mean), TotalTokens: estimatedInput + int(mean)}
 	sourceValue, reserveValue, _, err := service.GatewayPrice(sale, estimatedUsage, input, started, ratio, saleFX)
@@ -507,7 +508,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			if upstreamCode == "" {
 				upstreamCode = info.ResponseFacts.UpstreamErrorCode
 			}
-			if upstreamType == "" {
+			if outcome.ErrorType != "" {
 				upstreamType = outcome.ErrorType
 			}
 			if outcome.ErrorStatus >= 400 {
