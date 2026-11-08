@@ -392,7 +392,7 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 
 // GatewayResponsesCapabilitiesMatch checks native request features without
 // converting stateful Responses fields through another wire protocol.
-func GatewayResponsesCapabilitiesMatch(request *dto.OpenAIResponsesRequest, caps capability.Set, inputTokens int) bool {
+func GatewayResponsesCapabilitiesMatch(request *dto.OpenAIResponsesRequest, caps capability.Set, inputTokens int, nativeModalities ...bool) bool {
 	projection := &dto.GeneralOpenAIRequest{Model: request.Model, Stream: common.GetPointer(true), MaxCompletionTokens: request.MaxOutputTokens}
 	if len(request.Tools) > 0 && string(request.Tools) != "[]" && string(request.Tools) != "null" {
 		projection.Tools = make([]dto.ToolCallRequest, 1)
@@ -414,7 +414,7 @@ func GatewayResponsesCapabilitiesMatch(request *dto.OpenAIResponsesRequest, caps
 		return false
 	}
 	projection.ResponseFormat = text.Format
-	if !GatewayCapabilitiesMatch(projection, caps, inputTokens) {
+	if !GatewayCapabilitiesMatch(projection, caps, inputTokens, nativeModalities...) {
 		return false
 	}
 	var images int64
@@ -619,7 +619,7 @@ func gatewayWeightedChoice(c *gin.Context, candidates []*GatewaySelection) int {
 }
 
 // GatewayCapabilitiesMatch checks original and effective protocol facts.
-func GatewayCapabilitiesMatch(request *dto.GeneralOpenAIRequest, caps capability.Set, inputTokens int) bool {
+func GatewayCapabilitiesMatch(request *dto.GeneralOpenAIRequest, caps capability.Set, inputTokens int, nativeModalities ...bool) bool {
 	if request.Stream != nil && *request.Stream && !slices.Contains(caps.Features, capability.Streaming) {
 		return false
 	}
@@ -639,7 +639,7 @@ func GatewayCapabilitiesMatch(request *dto.GeneralOpenAIRequest, caps capability
 	if (request.PromptCacheKey != "" || len(request.PromptCacheOptions) > 0 || len(request.PromptCacheRetention) > 0) && !slices.Contains(caps.Features, capability.Caching) {
 		return false
 	}
-	if !slices.Contains(caps.InputModalities, capability.Text) || !slices.Contains(caps.OutputModalities, capability.Text) {
+	if (len(nativeModalities) == 0 || !nativeModalities[0]) && (!slices.Contains(caps.InputModalities, capability.Text) || !slices.Contains(caps.OutputModalities, capability.Text)) {
 		return false
 	}
 	var outputs []capability.Modality

@@ -677,8 +677,10 @@ func TestResponsesWSGatewayResolvesItemReferences(t *testing.T) {
 }
 
 func TestResponsesWSGatewayValidatesNativeFileSources(t *testing.T) {
-	for _, source := range []string{"image ID", "file ID", "file data", "unsupported file data"} {
+	for _, source := range []string{"image ID", "file ID", "file data", "unsupported file data", "tool image ID", "tool file ID"} {
 		t.Run(source, func(t *testing.T) {
+			tool := strings.HasPrefix(source, "tool ")
+			source = strings.TrimPrefix(source, "tool ")
 			var calls atomic.Int32
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
@@ -711,7 +713,11 @@ func TestResponsesWSGatewayValidatesNativeFileSources(t *testing.T) {
 			}
 			client := dialResponsesGateway(t, fixture)
 			require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
-			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","input":[{"role":"user","content":[`+part+`]}],"max_output_tokens":1}`)))
+			input := `[{"role":"user","content":[` + part + `]}]`
+			if tool {
+				input = `[{"type":"function_call","name":"read_file","call_id":"call_A","arguments":"{}"},{"type":"function_call_output","call_id":"call_A","output":[` + part + `]}]`
+			}
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","input":`+input+`,"max_output_tokens":1}`)))
 			_, reply, err := client.ReadMessage()
 			require.NoError(t, err)
 			if source != "file data" {
@@ -794,6 +800,57 @@ func TestResponsesWSGatewayRejectsOlderTerminalReplays(t *testing.T) {
 	assert.Equal(t, int64(367_200), records[index].Receivable.Nanos)
 	assertTextGatewayLedger(t, records[index], 204_000)
 	require.NoError(t, client.Close())
+}
+
+func TestResponsesWSGatewayBoundsOutputIdentityState(t *testing.T) {
+	previous := constant.MaxRequestBodyMB
+	constant.MaxRequestBodyMB = 1
+	t.Cleanup(func() { constant.MaxRequestBodyMB = previous })
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if !assert.NoError(t, err) {
+			return
+		}
+		defer peer.Close()
+		if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
+			return
+		}
+		frames := []string{`{"type":"response.created","response":{"id":"bounded","status":"in_progress"}}`, `{"type":"response.output_text.delta","response_id":"bounded","item_id":"text","delta":"Hi"}`}
+		for _, prefix := range []string{"a", "b"} {
+			frames = append(frames, `{"type":"response.output_text.delta","response_id":"bounded","item_id":"`+strings.Repeat(prefix, 600_000)+`","delta":""}`)
+		}
+		frames = append(frames, `{"type":"response.output_text.delta","response_id":"bounded","item_id":"text","delta":"UNBOUNDED"}`, `{"type":"response.completed","response":{"id":"bounded","status":"completed"}}`)
+		for _, frame := range frames {
+			if err := peer.WriteMessage(websocket.TextMessage, []byte(frame)); err != nil {
+				return
+			}
+		}
+		_, _, _ = peer.ReadMessage()
+	})
+	client := dialResponsesGateway(t, fixture)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","input":"Hi","max_output_tokens":16}`)))
+	late, completed := false, false
+	for {
+		_, raw, err := client.ReadMessage()
+		if err != nil {
+			break
+		}
+		late = late || bytes.Contains(raw, []byte("UNBOUNDED"))
+		completed = completed || ojson.GetBytes(raw, "type").String() == "response.completed"
+	}
+	assert.False(t, late, "Cumulative identity budget closes the original owner before further frames")
+	assert.False(t, completed)
+	require.NoError(t, client.Close())
+	var records []model.GatewayRequest
+	require.Eventually(t, func() bool {
+		var err error
+		records, _, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+		return err == nil && len(records) == 1 && records[0].Status != "settlement_pending"
+	}, 5*time.Second, 10*time.Millisecond)
+	assert.Equal(t, "partial", records[0].Status)
+	assert.Equal(t, int64(5400), records[0].Receivable.Nanos)
+	assertTextGatewayLedger(t, records[0], 3000)
 }
 
 func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
@@ -1483,7 +1540,7 @@ func TestRealtimeGatewayFreezesInheritedReasoning(t *testing.T) {
 }
 
 func TestRealtimeGatewayRetainsReportedInputForNextResponse(t *testing.T) {
-	for _, scenario := range []string{"default", "none default", "explicit replacement", "deleted before done"} {
+	for _, scenario := range []string{"default", "none default", "explicit replacement", "deleted before done", "audio details only"} {
 		t.Run(scenario, func(t *testing.T) {
 			var calls atomic.Int32
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1504,6 +1561,12 @@ func TestRealtimeGatewayRetainsReportedInputForNextResponse(t *testing.T) {
 					if kind == "conversation.item.create" {
 						reply := `{"type":"conversation.item.created","item":` + ojson.GetBytes(raw, "item").Raw + `}`
 						if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(reply))) {
+							return
+						}
+						continue
+					}
+					if kind == "input_audio_buffer.commit" {
+						if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"input_audio_buffer.committed","item_id":"known-input"}`))) {
 							return
 						}
 						continue
@@ -1530,15 +1593,29 @@ func TestRealtimeGatewayRetainsReportedInputForNextResponse(t *testing.T) {
 						p = 10
 					}
 					terminal := fmt.Sprintf(`{"type":"response.done","response":{"id":%q,"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"text","text":"Hi"}]}],"usage":{"input_tokens":%d,"output_tokens":1}}}`, id, p)
+					if index == 1 && scenario == "audio details only" {
+						terminal = fmt.Sprintf(`{"type":"response.done","response":{"id":%q,"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"text","text":"Hi"}]}],"usage":{"output_tokens":1,"input_token_details":{"audio_tokens":20000}}}}`, id)
+					}
 					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(terminal))) {
 						return
 					}
 				}
 			})
+			if scenario == "audio details only" {
+				var unified model.Model
+				require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+				unified.Capabilities.InputModalities = append(unified.Capabilities.InputModalities, capability.Audio)
+				require.NoError(t, model.DB.Model(&unified).Select("capabilities").Updates(&unified).Error)
+			}
 			client := dialRealtimeGateway(t, fixture)
 			_, _, err := client.ReadMessage()
 			require.NoError(t, err)
-			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"conversation.item.create","item":{"id":"known-input","type":"message","role":"user","content":[{"type":"input_text","text":"`+strings.Repeat(" hello", 600)+`"}]}}`)))
+			if scenario == "audio details only" {
+				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"input_audio_buffer.append","audio":"`+base64.StdEncoding.EncodeToString(make([]byte, 48000))+`"}`)))
+				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"input_audio_buffer.commit"}`)))
+			} else {
+				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"conversation.item.create","item":{"id":"known-input","type":"message","role":"user","content":[{"type":"input_text","text":"`+strings.Repeat(" hello", 600)+`"}]}}`)))
+			}
 			_, _, err = client.ReadMessage()
 			require.NoError(t, err)
 			first := `{"type":"response.create","response":{}}`
@@ -1568,7 +1645,7 @@ func TestRealtimeGatewayRetainsReportedInputForNextResponse(t *testing.T) {
 			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{}}`)))
 			_, raw, err := client.ReadMessage()
 			require.NoError(t, err)
-			if scenario == "default" || scenario == "none default" {
+			if scenario == "default" || scenario == "none default" || scenario == "audio details only" {
 				assert.Equal(t, "error", ojson.GetBytes(raw, "type").String())
 				assert.Equal(t, int32(1), calls.Load())
 			} else {
@@ -1580,6 +1657,124 @@ func TestRealtimeGatewayRetainsReportedInputForNextResponse(t *testing.T) {
 			require.NoError(t, client.Close())
 		})
 	}
+}
+
+func TestRealtimeGatewayAcceptsAudioOnlyOutput(t *testing.T) {
+	var calls atomic.Int32
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if !assert.NoError(t, err) {
+			return
+		}
+		defer peer.Close()
+		if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"modalities":["audio"],"output_audio_format":"pcm16","turn_detection":null}}`))) {
+			return
+		}
+		if _, _, err := peer.ReadMessage(); err != nil {
+			return
+		}
+		calls.Add(1)
+		for _, frame := range []string{`{"type":"response.created","response":{"id":"audio-only","status":"in_progress"}}`, `{"type":"response.audio.delta","response_id":"audio-only","delta":"` + base64.StdEncoding.EncodeToString(make([]byte, 4800)) + `"}`, `{"type":"response.done","response":{"id":"audio-only","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"output_token_details":{"audio_tokens":2,"text_tokens":0}}}}`} {
+			if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(frame))) {
+				return
+			}
+		}
+		_, _, _ = peer.ReadMessage()
+	})
+	var unified model.Model
+	require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+	unified.Capabilities.OutputModalities = []capability.Modality{capability.Audio}
+	require.NoError(t, model.DB.Model(&unified).Select("capabilities").Updates(&unified).Error)
+	client := dialRealtimeGateway(t, fixture)
+	_, _, err := client.ReadMessage()
+	require.NoError(t, err)
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Hi"}]}],"output_modalities":["audio"]}}`)))
+	_, raw, err := client.ReadMessage()
+	require.NoError(t, err)
+	require.Equal(t, "response.created", ojson.GetBytes(raw, "type").String())
+	for range 2 {
+		_, _, err := client.ReadMessage()
+		require.NoError(t, err)
+	}
+	assert.Equal(t, int32(1), calls.Load())
+	require.NoError(t, client.Close())
+}
+
+func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("Legacy Realtime must not use the wallet Channel")
+	})
+	require.NoError(t, model.DB.AutoMigrate(&model.Ability{}, &model.Log{}))
+	oldModel, oldCompletion, oldPrice := ratio_setting.ModelRatio2JSONString(), ratio_setting.CompletionRatio2JSONString(), ratio_setting.ModelPrice2JSONString()
+	require.NoError(t, model.DB.Model(fixture.token).Update("unlimited_quota", true).Error)
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4o":1}`))
+	require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(`{"gpt-4o":1}`))
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{}`))
+	t.Cleanup(func() {
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(oldModel))
+		require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(oldCompletion))
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(oldPrice))
+	})
+	require.NoError(t, model.DB.Model(fixture.user).Updates(map[string]any{"quota": 1_000_000, "setting": `{"billing_preference":"wallet_only"}`}).Error)
+	done := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(done)
+		peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if !assert.NoError(t, err) {
+			return
+		}
+		defer peer.Close()
+		if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"turn_detection":null}}`))) {
+			return
+		}
+		if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
+			return
+		}
+		if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.updated","session":{"turn_detection":null}}`))) {
+			return
+		}
+		if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
+			return
+		}
+		for _, raw := range []string{`{"type":"response.created","response":{"id":"legacy-text","status":"in_progress"}}`, `{"type":"response.function_call_arguments.delta","response_id":"legacy-text","delta":"` + strings.Repeat(" hello", 20) + `"}`, `{"type":"response.done","response":{"id":"legacy-text","status":"completed"}}`} {
+			if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(raw))) {
+				return
+			}
+		}
+		_, _, _ = peer.ReadMessage()
+	}))
+	t.Cleanup(upstream.Close)
+	provider := &model.Provider{Name: "Legacy realtime text", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Key: "legacy-text-key", BaseURL: &upstream.URL, Models: "gpt-4o", Group: "default"}
+	require.NoError(t, model.DB.Create(provider).Error)
+	require.NoError(t, model.DB.Create(&model.Ability{ChannelId: provider.Id, Model: "gpt-4o", Group: "default", Enabled: true}).Error)
+	gateway := newRealtimeGatewayServer(t, fixture.engine)
+	client, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(gateway.URL, "http")+"/v1/realtime?model=gpt-4o", http.Header{"Authorization": {"Bearer sk-" + fixture.token.Key}})
+	if response != nil && response.Body != nil {
+		require.NoError(t, response.Body.Close())
+	}
+	require.NoError(t, err)
+	defer client.Close()
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, _, err = client.ReadMessage()
+	require.NoError(t, err)
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.update","session":{"instructions":"`+strings.Repeat(" hello", 600)+`"}}`)))
+	_, _, err = client.ReadMessage()
+	require.NoError(t, err)
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"output_modalities":["text"]}}`)))
+	for range 3 {
+		_, _, err = client.ReadMessage()
+		require.NoError(t, err)
+	}
+	require.NoError(t, client.Close())
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Legacy text connection did not release")
+	}
+	require.Eventually(t, func() bool {
+		var user model.User
+		return model.DB.First(&user, fixture.user.Id).Error == nil && user.UsedQuota == 558
+	}, 5*time.Second, 10*time.Millisecond, "600 input +20 output at ratio1/group0.9 must charge 558, not minimum1")
 }
 
 func TestRealtimeGatewayRejectsUnknownInitialVADState(t *testing.T) {

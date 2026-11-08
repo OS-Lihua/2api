@@ -20,15 +20,16 @@ import (
 type RealtimeUsageResult = relaycommon.RealtimeResponseFacts
 
 type realtimeResponseUsage struct {
-	info                *relaycommon.RelayInfo
-	accumulator         *ResponsesUsageAccumulator
-	input               *dto.Usage
-	audioBytes          int64
-	deliveredAudioBytes int64
-	audioReported       bool
-	inputAudioReported  bool
-	inputImageReported  bool
-	outputAudioFormat   string
+	info                                  *relaycommon.RelayInfo
+	accumulator                           *ResponsesUsageAccumulator
+	input                                 *dto.Usage
+	audioBytes                            int64
+	deliveredAudioBytes                   int64
+	inputTextReported, outputTextReported bool
+	audioReported                         bool
+	inputAudioReported                    bool
+	inputImageReported                    bool
+	outputAudioFormat                     string
 }
 
 // RealtimeUsageAccumulator correlates native response IDs, including concurrent
@@ -179,6 +180,12 @@ func (accumulator *RealtimeUsageAccumulator) Observe(raw []byte, input *dto.Usag
 		return nil, err
 	}
 	if event.Response != nil && event.Response.Usage != nil {
+		if valid, _ := relaycommon.NativeUsagePresence(normalized, "response.usage.input_tokens_details.text_tokens", "", ""); valid {
+			state.inputTextReported = true
+		}
+		if valid, _ := relaycommon.NativeUsagePresence(normalized, "response.usage.output_tokens_details.text_tokens", "", ""); valid {
+			state.outputTextReported = true
+		}
 		if valid, _ := relaycommon.NativeUsagePresence(normalized, "response.usage.output_tokens_details.audio_tokens", "", ""); valid {
 			state.audioReported = true
 		}
@@ -208,6 +215,9 @@ func (accumulator *RealtimeUsageAccumulator) Observe(raw []byte, input *dto.Usag
 	state.accumulator.Observe(event, normalized)
 	if delivered {
 		state.accumulator.RecordDelivery(event, normalized)
+	}
+	if err := state.accumulator.Err(); err != nil {
+		return nil, err
 	}
 	if delivered && realtimeBusinessOutput(event) {
 		state.info.ResponseFacts.MarkBusinessOutput()
@@ -252,6 +262,27 @@ func (accumulator *RealtimeUsageAccumulator) finish(id string, state *realtimeRe
 	if !state.inputImageReported && state.input.PromptTokensDetails.ImageTokens > 0 && (!facts.PromptTokensReported || usage.PromptTokens > 0) {
 		usage.PromptTokensDetails.ImageTokens = min(state.input.PromptTokensDetails.ImageTokens, max(0, usage.PromptTokens-usage.PromptTokensDetails.AudioTokens))
 		estimated = true
+	}
+	facts.InputDetailsReported = state.inputTextReported || state.inputAudioReported || state.inputImageReported
+	if !facts.PromptTokensReported && (usage.PromptTokens > 0 || generated > 0 || state.audioBytes > 0 || facts.InputDetailsReported) {
+		knownText := usage.PromptTokensDetails.TextTokens
+		if !state.inputTextReported {
+			knownText = max(knownText, max(0, state.input.PromptTokens-state.input.PromptTokensDetails.AudioTokens-state.input.PromptTokensDetails.ImageTokens))
+		}
+		usage.PromptTokens = max(usage.PromptTokens, knownText+usage.PromptTokensDetails.AudioTokens+usage.PromptTokensDetails.ImageTokens)
+	}
+	if !state.inputTextReported {
+		usage.PromptTokensDetails.TextTokens = max(0, usage.PromptTokens-usage.PromptTokensDetails.AudioTokens-usage.PromptTokensDetails.ImageTokens)
+	}
+	if !facts.CompletionTokensReported {
+		knownText := usage.CompletionTokenDetails.TextTokens
+		if !state.outputTextReported {
+			knownText = max(knownText, text)
+		}
+		usage.CompletionTokens = max(usage.CompletionTokens, knownText+usage.CompletionTokenDetails.AudioTokens+usage.CompletionTokenDetails.ImageTokens)
+	}
+	if !state.outputTextReported {
+		usage.CompletionTokenDetails.TextTokens = max(0, usage.CompletionTokens-usage.CompletionTokenDetails.AudioTokens-usage.CompletionTokenDetails.ImageTokens)
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	if estimated {

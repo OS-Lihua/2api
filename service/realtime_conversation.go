@@ -344,7 +344,7 @@ func (conversation *RealtimeConversation) remove(id string) {
 func (conversation *RealtimeConversation) Complete(result *relaycommon.RealtimeResponseFacts, defaultConversation bool, observations ...RealtimeInputObservation) error {
 	output := conversation.outputs[result.ID]
 	evidence := output.evidence
-	if len(observations) > 0 && observations[0].defaultInput && observations[0].epoch == conversation.epoch && result.Facts != nil && result.Facts.PromptTokensReported {
+	if len(observations) > 0 && observations[0].defaultInput && observations[0].epoch == conversation.epoch && result.Facts != nil && (result.Facts.PromptTokensReported || result.Facts.InputDetailsReported) {
 		observation := observations[0]
 		quantity := observation.base
 		quantity.total = max(quantity.total, max(0, result.Usage.PromptTokens-observation.configuration))
@@ -502,6 +502,9 @@ func (snapshot *RealtimeInputSnapshot) estimate(body []byte, caps *capability.Se
 		}
 	}
 	if caps != nil {
+		if quantity.total-quantity.audio-quantity.image > 0 && !slices.Contains(caps.InputModalities, capability.Text) {
+			return nil, errors.New("Realtime input modality is not supported on this connection")
+		}
 		if quantity.audioItems > 0 && !slices.Contains(caps.InputModalities, capability.Audio) || quantity.imageItems > 0 && !slices.Contains(caps.InputModalities, capability.Image) {
 			return nil, errors.New("Realtime input modality is not supported on this connection")
 		}

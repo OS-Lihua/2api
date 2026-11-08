@@ -103,12 +103,9 @@ func (call *ResponsesWSCall) EstimateInput(c *gin.Context, info *relaycommon.Rel
 	if len(request.Conversation) > 0 && ojson.GetBytes(request.Conversation, "@this").Type != ojson.Null {
 		return nil, errors.New("Unknown conversation context; provide complete input")
 	}
-	for _, item := range ojson.GetBytes(request.Input, "@this").Array() {
-		for _, part := range item.Get("content").Array() {
-			kind := part.Get("type").String()
-			if (kind == "input_image" || kind == "input_file") && part.Get("file_id").Exists() {
-				return nil, errors.New("Unknown file content; provide complete input")
-			}
+	for _, part := range request.ParseInput() {
+		if part.FileID != "" {
+			return nil, errors.New("Unknown file content; provide complete input")
 		}
 	}
 	meta := request.GetTokenCountMeta()
@@ -801,6 +798,10 @@ func (s *responsesWSSession) receive(c *gin.Context, state *responsesWSCallState
 							info.StreamStatus.MarkFailed(code, rejection.Error.Type, rejection.Status)
 						}
 						accumulator.Observe(&event.ResponsesStreamResponse, incoming.body)
+						if err := accumulator.Err(); err != nil {
+							state.closeCode = websocket.CloseInternalServerErr
+							return accumulator.Finish(), types.NewError(err, types.ErrorCodeBadResponse)
+						}
 						info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 						s.lastResponseID = responseID
 						if info.ResponseFacts != nil {
@@ -840,6 +841,10 @@ func (s *responsesWSSession) receive(c *gin.Context, state *responsesWSCallState
 					}
 				}
 				accumulator.Observe(&event.ResponsesStreamResponse, incoming.body)
+				if err := accumulator.Err(); err != nil {
+					state.closeCode = websocket.CloseInternalServerErr
+					return accumulator.Finish(), types.NewError(err, types.ErrorCodeBadResponse)
+				}
 			}
 			switch event.Type {
 			case "response.completed", "response.done", "response.incomplete", "response.failed", "response.cancelled", "response.canceled":
@@ -922,6 +927,9 @@ func (s *responsesWSSession) deliver(info *relaycommon.RelayInfo, incoming respo
 		return err
 	}
 	accumulator.RecordDelivery(event, incoming.body)
+	if err := accumulator.Err(); err != nil {
+		return err
+	}
 	business := false
 	switch event.Type {
 	case "response.output_text.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.refusal.delta", "response.audio.delta", "response.output_audio.delta":

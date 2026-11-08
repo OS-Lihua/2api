@@ -99,7 +99,7 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 			originalTokens = original.Usage.PromptTokens
 		}
 	}
-	if err != nil || !service.GatewayResponsesCapabilitiesMatch(&call.Request, selection.Capabilities, originalTokens) {
+	if err != nil || !service.GatewayResponsesCapabilitiesMatch(&call.Request, selection.Capabilities, originalTokens, call.Protocol() == protocol.OpenAIRealtime) {
 		return nil, service.ErrGatewayCapability
 	}
 	document := ojson.NewDoc(append([]byte(nil), call.Body...))
@@ -126,8 +126,9 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 			inputUsage = info.ResponsesInputFacts.Usage
 		}
 	}
+	nativeModalities := call.Protocol() == protocol.OpenAIRealtime
 	var effective dto.OpenAIResponsesRequest
-	if err != nil || common.Unmarshal(body, &effective) != nil || effective.Model != info.UpstreamModelName || helper.ValidateResponsesMultipliers(body) != nil || !service.GatewayResponsesCapabilitiesMatch(&effective, selection.Capabilities, inputUsage.PromptTokens) {
+	if err != nil || common.Unmarshal(body, &effective) != nil || effective.Model != info.UpstreamModelName || helper.ValidateResponsesMultipliers(body) != nil || !service.GatewayResponsesCapabilitiesMatch(&effective, selection.Capabilities, inputUsage.PromptTokens, nativeModalities) {
 		return nil, service.ErrGatewayCapability
 	}
 	if effective.MaxOutputTokens == nil && call.Protocol() == protocol.OpenAIResponses {
@@ -152,7 +153,7 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 			effective.MaxOutputTokens = common.GetPointer(uint(limit))
 		}
 	}
-	if !service.GatewayResponsesCapabilitiesMatch(&effective, selection.Capabilities, inputUsage.PromptTokens) {
+	if !service.GatewayResponsesCapabilitiesMatch(&effective, selection.Capabilities, inputUsage.PromptTokens, nativeModalities) {
 		return nil, service.ErrGatewayCapability
 	}
 	if effective.MaxOutputTokens != nil {

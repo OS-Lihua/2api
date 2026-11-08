@@ -18,6 +18,43 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestRealtimeUsageRetainsIndependentDetailsAndMissingText(t *testing.T) {
+	for _, test := range []struct {
+		name, usage                                              string
+		input, prompt, completion, audio, image, textIn, textOut int
+	}{
+		{name: "missing usage text", input: 600, prompt: 600, completion: 20, textIn: 600, textOut: 20},
+		{name: "explicit text zero", usage: `,"usage":{"input_tokens":600,"output_tokens":20,"input_token_details":{"text_tokens":0},"output_token_details":{"text_tokens":0}}`, input: 600, prompt: 600, completion: 20},
+		{name: "independent audio", usage: `,"usage":{"output_tokens":20,"input_token_details":{"audio_tokens":20000}}`, input: 10, prompt: 20000, completion: 20, audio: 20000, textOut: 20},
+		{name: "independent image", usage: `,"usage":{"output_tokens":20,"input_token_details":{"image_tokens":10000}}`, input: 85, prompt: 10000, completion: 20, image: 10000, textOut: 20},
+		{name: "explicit total zero", usage: `,"usage":{"input_tokens":0,"output_tokens":20,"input_token_details":{"audio_tokens":20000}}`, input: 10, prompt: 0, completion: 20, audio: 20000, textOut: 20},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			info := &relaycommon.RelayInfo{TokenizerModel: "gpt-4o", OutputAudioFormat: "pcm16"}
+			counter := NewRealtimeUsageAccumulator(info)
+			input := &dto.Usage{PromptTokens: test.input}
+			if test.audio > 0 {
+				input.PromptTokensDetails.AudioTokens = test.input
+			} else if test.image > 0 {
+				input.PromptTokensDetails.ImageTokens = test.input
+			}
+			_, err := counter.Observe([]byte(`{"type":"response.created","response":{"id":"details","status":"in_progress"}}`), input, true)
+			require.NoError(t, err)
+			_, err = counter.Observe([]byte(`{"type":"response.function_call_arguments.delta","response_id":"details","delta":"`+strings.Repeat(" hello", 20)+`"}`), nil, true)
+			require.NoError(t, err)
+			result, err := counter.Observe([]byte(`{"type":"response.done","response":{"id":"details","status":"completed"`+test.usage+`}}`), nil, true)
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.Equal(t, test.prompt, result.Usage.PromptTokens)
+			assert.Equal(t, test.completion, result.Usage.CompletionTokens)
+			assert.Equal(t, test.audio, result.Usage.PromptTokensDetails.AudioTokens)
+			assert.Equal(t, test.image, result.Usage.PromptTokensDetails.ImageTokens)
+			assert.Equal(t, test.textIn, result.Usage.PromptTokensDetails.TextTokens)
+			assert.Equal(t, test.textOut, result.Usage.CompletionTokenDetails.TextTokens)
+		})
+	}
+}
+
 func TestRealtimeConversationRefinesAggregateInputWithoutDoubleCounting(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest("GET", "/v1/realtime", nil)

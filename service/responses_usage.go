@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -24,22 +25,53 @@ type responseOutputState struct {
 }
 
 type ResponsesUsageAccumulator struct {
-	info               *relaycommon.RelayInfo
-	usage              *dto.Usage
-	outputText         strings.Builder
-	outputs            map[string]*responseOutputState
-	terminalOutputSeen bool
-	delivered          *ResponsesUsageAccumulator
-	imageCounter       relaycommon.ImageGenerationCallCounter
-	itemBytes          int
-	imageInputReported bool
-	imageCommitted     bool
-	started            bool
-	finished           bool
+	retainedBytes, retainedLimit int
+	budgetErr                    error
+	discarded                    responseOutputState
+	info                         *relaycommon.RelayInfo
+	usage                        *dto.Usage
+	outputText                   strings.Builder
+	outputs                      map[string]*responseOutputState
+	terminalOutputSeen           bool
+	delivered                    *ResponsesUsageAccumulator
+	imageCounter                 relaycommon.ImageGenerationCallCounter
+	itemBytes                    int
+	imageInputReported           bool
+	imageCommitted               bool
+	started                      bool
+	finished                     bool
 }
 
 func NewResponsesUsageAccumulator(info *relaycommon.RelayInfo) *ResponsesUsageAccumulator {
-	return &ResponsesUsageAccumulator{info: info, usage: &dto.Usage{}, outputs: map[string]*responseOutputState{}}
+	maximum := constant.MaxRequestBodyMB
+	if maximum <= 0 {
+		maximum = 128
+	}
+	return &ResponsesUsageAccumulator{retainedLimit: maximum << 20, info: info, usage: &dto.Usage{}, outputs: map[string]*responseOutputState{}}
+}
+
+// Err reports a cumulative resource violation to the existing stream owner.
+func (a *ResponsesUsageAccumulator) Err() error {
+	if a.budgetErr != nil {
+		return a.budgetErr
+	}
+	if a.delivered != nil {
+		return a.delivered.Err()
+	}
+	return nil
+}
+
+func (a *ResponsesUsageAccumulator) recordText(text string) {
+	if a.budgetErr != nil {
+		return
+	}
+	if len(text) > a.retainedLimit-a.retainedBytes {
+		a.budgetErr = errors.New("Responses output memory budget exceeded")
+		a.info.StreamStatus.RecordError("Responses output memory budget exceeded")
+		return
+	}
+	a.retainedBytes += len(text)
+	a.outputText.WriteString(text)
 }
 
 // DecodeResponsesStreamEvent decodes protocol framing independently from usage.
@@ -97,7 +129,7 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 				if output.Type == dto.BuildInCallFunctionCall || output.Type == "custom_tool_call" {
 					a.observeToolOutput(&output, &i)
 				} else if !state.textSeen {
-					a.outputText.WriteString(relayconvert.ExtractOutputTextFromResponses(&dto.OpenAIResponsesResponse{Output: []dto.ResponsesOutput{output}}))
+					a.recordText(relayconvert.ExtractOutputTextFromResponses(&dto.OpenAIResponsesResponse{Output: []dto.ResponsesOutput{output}}))
 				}
 			}
 			a.terminalOutputSeen = true
@@ -122,10 +154,10 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 		if event.Type == "response.output_text.delta" || event.Type == "response.refusal.delta" {
 			a.outputState(event.ItemID, event.OutputIndex).textSeen = true
 		}
-		a.outputText.WriteString(event.Delta)
+		a.recordText(event.Delta)
 	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
 		a.outputState(event.ItemID, event.OutputIndex).payloadSeen = true
-		a.outputText.WriteString(event.Delta)
+		a.recordText(event.Delta)
 	case "response.output_item.added":
 		a.observeToolOutput(event.Item, event.OutputIndex)
 	case dto.ResponsesOutputTypeItemDone:
@@ -194,6 +226,25 @@ func (a *ResponsesUsageAccumulator) outputState(id string, index *int) *response
 	if index != nil {
 		indexKey = fmt.Sprintf("index:%d", *index)
 	}
+	if a.budgetErr != nil {
+		return &a.discarded
+	}
+	keys := []string{idKey, indexKey}
+	if idKey == "" && indexKey == "" {
+		keys = []string{"unknown"}
+	}
+	additional := 0
+	for _, key := range keys {
+		if key != "" && a.outputs[key] == nil {
+			additional += len(key) + 64
+		}
+	}
+	if additional > a.retainedLimit-a.retainedBytes {
+		a.budgetErr = errors.New("Responses output identity budget exceeded")
+		a.info.StreamStatus.RecordError("Responses output identity budget exceeded")
+		return &a.discarded
+	}
+	a.retainedBytes += additional
 	state := a.outputs[idKey]
 	if state == nil {
 		state = a.outputs[indexKey]
@@ -222,7 +273,7 @@ func (a *ResponsesUsageAccumulator) observeToolOutput(item *dto.ResponsesOutput,
 	}
 	state := a.outputState(item.ID, index)
 	if !state.nameSeen && item.Name != "" {
-		a.outputText.WriteString(item.Name)
+		a.recordText(item.Name)
 		state.nameSeen = true
 	}
 	payload := item.Arguments
@@ -232,7 +283,7 @@ func (a *ResponsesUsageAccumulator) observeToolOutput(item *dto.ResponsesOutput,
 	if !state.payloadSeen && len(payload) > 0 {
 		var text string
 		if common.Unmarshal(payload, &text) == nil {
-			a.outputText.WriteString(text)
+			a.recordText(text)
 		} else {
 			a.outputText.Write(payload)
 		}

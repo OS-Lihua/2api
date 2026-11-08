@@ -89,11 +89,19 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			data = string(rewriteSGLangResponsesCreatedAt(info, []byte(data), "response.created_at", streamResponse.Response.CreatedAt))
 		}
 		accumulator.Observe(streamResponse, common.StringToByteSlice(data))
+		if err := accumulator.Err(); err != nil {
+			sr.Stop(err)
+			return
+		}
 		if err := helper.ResponseChunkData(c, *streamResponse, data); err != nil {
 			sr.Stop(err)
 			return
 		}
 		accumulator.RecordDelivery(streamResponse, common.StringToByteSlice(data))
+		if err := accumulator.Err(); err != nil {
+			sr.Stop(err)
+			return
+		}
 		if (streamResponse.Type == "response.completed" || streamResponse.Type == "response.done") &&
 			streamResponse.Response != nil && info.StreamStatus.ResponseOutcome() == string(relaycommon.ResponseOutcomeCompleted) {
 			sr.Done()
@@ -102,7 +110,11 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 
 	common.SetContextKey(c, constant.ContextKeyResponseStreamStatus, info.StreamStatus)
 	info.StreamStatus.RequireTerminal()
-	return accumulator.Finish(), nil
+	usage := accumulator.Finish()
+	if err := accumulator.Err(); err != nil {
+		return usage, types.NewError(err, types.ErrorCodeBadResponse)
+	}
+	return usage, nil
 }
 
 func rewriteSGLangResponsesCreatedAt(info *relaycommon.RelayInfo, payload []byte, path string, createdAt dto.IntValue) []byte {

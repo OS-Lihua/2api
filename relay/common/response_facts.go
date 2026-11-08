@@ -36,6 +36,7 @@ type ResponsesInputFacts struct {
 type ResponseFacts struct {
 	UsageEstimated           bool
 	UsageReported            bool
+	InputDetailsReported     bool
 	PromptTokensReported     bool
 	CompletionTokensReported bool
 	BusinessOutput           bool
