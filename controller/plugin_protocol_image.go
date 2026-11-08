@@ -88,6 +88,13 @@ func serveTaskPluginImageProtocol(c *gin.Context, pinned pluginruntime.PinnedEnd
 		respondTaskPluginImageError(c, taskErr)
 		return
 	}
+	if outcome != nil && outcome.Task != nil && outcome.Task.PrivateData.Gateway != nil {
+		if value, exists := c.Get(pluginruntime.ContextKeyPinnedEndpoint); exists {
+			if selected, ok := value.(pluginruntime.PinnedEndpoint); ok && selected.Plugin != nil && selected.Generation == pinned.Generation && selected.Protocol == pinned.Protocol {
+				pinned = selected
+			}
+		}
+	}
 	if outcome == nil || outcome.Task == nil || outcome.Task.Platform != constant.TaskPlatform(pinned.Plugin.Meta.Key) {
 		logger.LogError(c, common.LogText("task protocol submission returned an invalid durable outcome"))
 		respondPluginProtocolError(c, http.StatusInternalServerError, "task_protocol_error", "Task protocol request failed")

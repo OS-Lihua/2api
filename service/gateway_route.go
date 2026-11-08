@@ -60,6 +60,10 @@ type GatewayRouteFacts struct {
 // GatewayRouteInput lets protocol owners prepare their DTO while sharing all
 // status, health, profit, affinity and scoring decisions in this Route.
 type GatewayRouteInput struct {
+	// Accepted task continuations retain their original Channel and Provider
+	// even if the Channel's configuration later points at another Provider.
+	PinnedChannelID          int
+	PinnedProviderID         int
 	Tier                     int
 	Protocol                 protocol.Type
 	AcceptedConversionLosses []string
@@ -101,6 +105,15 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 	db := model.DB.WithContext(c.Request.Context())
 	if err := model.OfferingChannelsQuery(db, offering, ids).Preload("Model").Order("id").Find(&candidates).Error; err != nil {
 		return nil, err
+	}
+	if input.PinnedChannelID != 0 || input.PinnedProviderID != 0 {
+		if input.PinnedChannelID <= 0 || input.PinnedProviderID <= 0 {
+			return nil, ErrGatewayUnavailable
+		}
+		candidates = slices.DeleteFunc(candidates, func(candidate model.Channel) bool { return candidate.ID != input.PinnedChannelID })
+		for i := range candidates {
+			candidates[i].ProviderID = input.PinnedProviderID
+		}
 	}
 	providerIDs := make([]int, 0, len(candidates))
 	channelIDs := make([]int, 0, len(candidates))
@@ -185,6 +198,9 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 				reason, stage := "preparation", 6
 				if errors.Is(err, ErrGatewayCapability) {
 					reason, stage = "capability", 4
+				}
+				if errors.Is(err, ErrGatewayPriceUnavailable) {
+					reason, stage = "price_unavailable", 7
 				}
 				if errors.Is(err, ErrGatewayConversion) {
 					reason, stage = "conversion_loss", 5

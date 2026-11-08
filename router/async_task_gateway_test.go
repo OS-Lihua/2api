@@ -31,6 +31,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/money"
+	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/service"
@@ -1434,6 +1435,163 @@ func TestAsyncTaskRemixCredentialFailureDisablesOnlySelectedOriginalKey(t *testi
 	assert.Equal(t, common.ChannelStatusEnabled, provider.Status)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, provider.ProviderInfo.MultiKeyStatusList[1])
 	assert.NotEqual(t, common.ChannelStatusAutoDisabled, provider.ProviderInfo.MultiKeyStatusList[0])
+}
+
+func TestAsyncTaskRouteDefersPluginFetchUntilAfterReservation(t *testing.T) {
+	var preparationCalls, submissionCalls atomic.Int32
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/prepare" {
+			preparationCalls.Add(1)
+			var reservations int64
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
+			assert.EqualValues(t, 1, reservations)
+			_, _ = w.Write([]byte(`{"ready":true}`))
+			return
+		}
+		submissionCalls.Add(1)
+		_, _ = w.Write([]byte(`{"id":"prepared-job","status":"queued"}`))
+	})
+	source, err := plugins.Source("sora")
+	require.NoError(t, err)
+	source = strings.Replace(source, "export function buildSubmitRequest(ctx) {", `export function buildSubmitRequest(ctx) {
+ utils.fetch({url: ctx.baseUrl + "/prepare"});`, 1)
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "sora"})
+	require.NoError(t, err)
+	_, err = model.PostLedgerEntries(model.LedgerPosting{Account: model.UserWalletAccount(fixture.user.Id), Type: model.LedgerEntryAdjustment, Amount: money.Amount{Nanos: -1000000000, Currency: "USD"}, IdempotencyKey: "task-fetch-empty-wallet"})
+	require.NoError(t, err)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+	assert.Equal(t, 402, response.Code, response.Body.String())
+	assert.Zero(t, preparationCalls.Load())
+	assert.Zero(t, submissionCalls.Load())
+	_, err = model.TopUpWallet(model.WalletTopUp{UserId: fixture.user.Id, Source: money.Amount{Nanos: 1000000000, Currency: "USD"}, Reference: "task-fetch-fund"})
+	require.NoError(t, err)
+	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.EqualValues(t, 1, preparationCalls.Load())
+	assert.EqualValues(t, 1, submissionCalls.Load())
+}
+
+func TestAsyncTaskRouteEnforcesDurationAndConcurrentAdmission(t *testing.T) {
+	for _, concurrent := range []bool{false, true} {
+		t.Run(fmt.Sprintf("concurrent_%t", concurrent), func(t *testing.T) {
+			entered, release := make(chan struct{}), make(chan struct{})
+			var calls atomic.Int32
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				if calls.Add(1) == 1 && concurrent {
+					close(entered)
+					<-release
+				}
+				_, _ = w.Write([]byte(`{"id":"admitted-job","status":"queued"}`))
+			})
+			var once sync.Once
+			t.Cleanup(func() { once.Do(func() { close(release) }) })
+			if !concurrent {
+				var unified model.Model
+				require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+				limit := int64(2)
+				unified.Capabilities.Limits.MaxDurationSeconds = &limit
+				require.NoError(t, model.DB.Model(&unified).Update("capabilities", unified.Capabilities).Error)
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+				assert.Equal(t, 400, response.Code, response.Body.String())
+				assert.Zero(t, calls.Load())
+				var reserved int64
+				require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&reserved).Error)
+				assert.Zero(t, reserved)
+				return
+			}
+			require.NoError(t, model.DB.Model(fixture.channel).Update("max_concurrency", 1).Error)
+			finished := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				finished <- adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+			}()
+			select {
+			case <-entered:
+			case response := <-finished:
+				t.Fatalf("submission returned before Provider was entered: %d %s", response.Code, response.Body.String())
+			case <-t.Context().Done():
+				t.Fatal(t.Context().Err())
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"Another bird","seconds":"4"}`)
+			assert.Equal(t, 503, response.Code, response.Body.String())
+			assert.EqualValues(t, 1, calls.Load())
+			once.Do(func() { close(release) })
+			response = <-finished
+			require.Equal(t, 200, response.Code, response.Body.String())
+			response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"Later bird","seconds":"4"}`)
+			require.Equal(t, 200, response.Code, response.Body.String())
+			assert.EqualValues(t, 2, calls.Load(), "the selected permit must be released once submission is accepted")
+		})
+	}
+}
+
+func TestAsyncTaskRouteUsesEffectivePurchaseCostAndProfit(t *testing.T) {
+	for _, tc := range []struct {
+		allowLoss, secondPlugin bool
+		path                    string
+	}{{false, false, "/v1/tasks/sora"}, {true, false, "/v1/tasks/sora"}, {false, true, "/v1/videos"}, {false, true, "/v1/responses"}} {
+		t.Run(fmt.Sprintf("allow_loss_%t_second_plugin_%t%s", tc.allowLoss, tc.secondPlugin, tc.path), func(t *testing.T) {
+			firstCalls, secondCalls := 0, 0
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				firstCalls++
+				_, _ = w.Write([]byte(`{"id":"expensive-job","status":"queued"}`))
+			})
+			second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				secondCalls++
+				_, _ = w.Write([]byte(`{"id":"cheap-job","status":"queued"}`))
+			}))
+			t.Cleanup(second.Close)
+			provider := &model.Provider{Name: "Cheap task Provider", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Key: "cheap-secret", BaseURL: &second.URL}
+			require.NoError(t, model.DB.Create(provider).Error)
+			channelProtocol := "task:sora"
+			if tc.secondPlugin {
+				source, err := plugins.Source("sora")
+				require.NoError(t, err)
+				source = strings.Replace(source, `key: "sora"`, `key: "cheapsora"`, 1)
+				source = strings.Replace(source, `channelTypes: [55, 1],`, `channelTypes: [],`, 1)
+				_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "cheapsora"})
+				require.NoError(t, err)
+				channelProtocol = "task:cheapsora"
+				SetTaskPluginProtocolRouter(fixture.engine)
+			}
+			channel := &model.Channel{ProviderID: provider.Id, ModelID: fixture.channel.ModelID, Protocol: protocol.Type(channelProtocol), UpstreamModelName: "sora-2", MappingConfirmed: true, Status: model.ChannelEnabled, Weight: 1, ParameterOverrides: `{}`}
+			require.NoError(t, model.DB.Create(channel).Error)
+			fixture.fake.Advance(time.Second)
+			for _, price := range []*model.PriceVersion{
+				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("video", u("seconds") * 0.2)`, EffectiveAt: clock.Now().Unix()},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: channel.ID, Currency: "USD", Expression: `tier("video", u("seconds") * 0.01)`, EffectiveAt: clock.Now().Unix()},
+			} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			require.NoError(t, model.DB.Model(fixture.offering).Updates(map[string]any{"route_method": "cost", "allow_loss_fallback": tc.allowLoss}).Error)
+			body := `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`
+			if tc.path == "/v1/responses" {
+				body = `{"model":"gateway-alias","input":"A bird","background":true,"seconds":"4"}`
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, tc.path, body)
+			require.Equal(t, 200, response.Code, response.Body.String())
+			assert.Zero(t, firstCalls, "Route must exclude the lossmaking Channel before submission")
+			assert.Equal(t, 1, secondCalls)
+			if tc.secondPlugin {
+				var task model.Task
+				require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
+				assert.Equal(t, constant.TaskPlatform("cheapsora"), task.Platform)
+			}
+			requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), requests[0].ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, channel.ID, attempts[0].ChannelID)
+			assert.Equal(t, "cost", attempts[0].RouteDiagnostics["method"])
+			var entries []model.LedgerEntry
+			require.NoError(t, model.DB.Where("request_id = ? AND type = ?", requests[0].ID, model.LedgerEntryPreConsume).Find(&entries).Error)
+			require.Len(t, entries, 1)
+			assert.EqualValues(t, -360000000, entries[0].Amount.Nanos)
+		})
+	}
 }
 
 func TestAsyncTaskHealthAdmissionSkipsCoolingChannel(t *testing.T) {

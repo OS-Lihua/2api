@@ -29,6 +29,7 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
@@ -198,10 +199,28 @@ func (a *TaskAdaptor) DecodeRequestAndSetAction(c *gin.Context, info *relaycommo
 	// On a native path several plugins declare, the channel may have bound a
 	// plugin other than the one that prepared the request; it decodes again.
 	if pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedRoute); exists {
-		if pinned, ok := pinnedValue.(pluginruntime.PinnedRoute); ok && len(pinned.Candidates) > 1 && pinned.Plugin == a.plugin {
+		if pinned, ok := pinnedValue.(pluginruntime.PinnedRoute); ok && (len(pinned.Candidates) > 1 || c.GetBool("task_gateway_endpoint")) && pinned.Plugin == a.plugin {
 			if requestValue, present := c.Get(pluginruntime.ContextKeyRouteRequest); present {
 				if requestContext, valid := requestValue.(pluginruntime.RouteRequestContext); valid {
 					requestContext.Params = pluginruntime.RouteParams(c.Params, pinned.Route)
+					if c.GetBool("task_gateway_endpoint") {
+						if body, ok := requestContext.Body.(map[string]any); ok {
+							if value, ok := body["value"].(map[string]any); ok {
+								body, value = maps.Clone(body), maps.Clone(value)
+								value["model"] = info.UpstreamModelName
+								body["value"] = value
+								requestContext.Body = body
+							}
+						}
+						if len(requestContext.BodyText) > 0 {
+							override := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ParamOverride: map[string]any{"model": info.UpstreamModelName}}}
+							raw, err := relaycommon.ApplyParamOverrideWithRelayInfo(requestContext.BodyText, override)
+							if err != nil {
+								return service.TaskErrorWrapperLocal(fmt.Errorf("invalid task request"), "plugin_request_invalid", http.StatusBadRequest)
+							}
+							requestContext.BodyText = raw
+						}
+					}
 					resolvedValue, requestBodyText, callErr := a.plugin.Engine.CallPathWithMemberJSON(
 						context.WithoutCancel(c.Request.Context()), 0, a.plugin.Meta.JSONTextMember("requestBody"),
 						"native", []string{pinned.Route.Decode}, requestContext.JSValueFor(a.plugin.Meta),
@@ -210,7 +229,11 @@ func (a *TaskAdaptor) DecodeRequestAndSetAction(c *gin.Context, info *relaycommo
 					kind, _ := resolved["kind"].(string)
 					resolvedModel, _ := resolved["model"].(string)
 					served, _, owned := model.ResolveTaskPluginModel(pinned.Generation, resolvedModel, a.plugin.Meta.Models)
-					if callErr != nil || !resolvedOK || kind != string(pluginruntime.RouteTypeSubmit) || !owned || served != c.GetString("resolved_task_model") {
+					modelMatches := owned && served == c.GetString("resolved_task_model")
+					if c.GetBool("task_gateway_endpoint") {
+						modelMatches = owned && strings.EqualFold(served, info.UpstreamModelName)
+					}
+					if callErr != nil || !resolvedOK || kind != string(pluginruntime.RouteTypeSubmit) || !modelMatches {
 						return service.TaskErrorWrapperLocal(fmt.Errorf("final task plugin decoder rejected the pinned model"), "plugin_request_invalid", http.StatusBadRequest)
 					}
 					if _, forbidden := resolved["renderer"]; forbidden {
@@ -354,6 +377,72 @@ func (a *TaskAdaptor) BuildRequestHeader(c *gin.Context, req *http.Request, _ *r
 		req.Header.Set("Content-Type", c.Request.Header.Get("Content-Type"))
 	}
 	return nil
+}
+
+// PreviewBillingRequestInput projects descriptor pricing fields without exchanging
+// credentials, resolving files, or enabling utils.fetch. The descriptor is never
+// cached: reserved preparation must build it again with authoritative credentials.
+func (a *TaskAdaptor) PreviewBillingRequestInput(c *gin.Context, info *relaycommon.RelayInfo) (billingexpr.RequestInput, error) {
+	ctx := a.taskRequestContext(c, info)
+	descriptor, err := a.requestDescriptor(c.Request.Context(), "buildSubmitRequest", ctx)
+	if err != nil {
+		return billingexpr.RequestInput{}, err
+	}
+	if err := pluginruntime.ValidateRequestURL(descriptor.URL, info.ChannelBaseUrl, a.plugin.Meta.AllowedHosts); err != nil {
+		return billingexpr.RequestInput{}, err
+	}
+	var encoded []byte
+	if descriptor.BodyType == "multipart" {
+		fields := map[string][]string{}
+		for _, part := range descriptor.Parts {
+			if part.FileRef == "" {
+				fields[part.Name] = append(fields[part.Name], fmt.Sprint(part.Value))
+			}
+		}
+		values := map[string]any{}
+		for name, entries := range fields {
+			if len(entries) == 1 {
+				values[name] = entries[0]
+			} else {
+				values[name] = entries
+			}
+		}
+		encoded, err = common.Marshal(values)
+	} else if descriptor.BodyText != nil {
+		encoded = descriptor.BodyText
+	} else if body, ok := descriptor.Body.(string); ok {
+		encoded = []byte(body)
+	} else if descriptor.Body != nil {
+		encoded, err = common.Marshal(descriptor.Body)
+	}
+	if err != nil {
+		return billingexpr.RequestInput{}, err
+	}
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, descriptor.URL, bytes.NewReader(encoded))
+	if err != nil {
+		return billingexpr.RequestInput{}, err
+	}
+	for name, value := range descriptor.Headers {
+		req.Header.Set(name, value)
+	}
+	if err := channel.ApplyHeaderOverride(info, c, req); err != nil {
+		return billingexpr.RequestInput{}, err
+	}
+	input := billingexpr.RequestInput{Body: encoded, Headers: map[string]string{}}
+	for name, values := range req.Header {
+		input.Headers[name] = strings.Join(values, ",")
+	}
+	if info.ChannelType != constant.ChannelTypeNewAPI && a.plugin.Meta.Auth.Type != "" && a.plugin.Meta.Auth.Type != "none" && a.plugin.Meta.Auth.Type != "api_key" {
+		// An explicit override resolves the header independently of OAuth.
+		resolved := false
+		for name := range info.HeadersOverride {
+			resolved = resolved || strings.EqualFold(name, "Authorization")
+		}
+		if !resolved {
+			input.DeferredHeaders = []string{"Authorization"}
+		}
+	}
+	return input, nil
 }
 
 func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayInfo) (io.Reader, error) {

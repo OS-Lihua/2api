@@ -323,6 +323,14 @@ func serveTaskPluginProtocol(
 		respondPluginProtocolSubmissionError(c, taskErr)
 		return
 	}
+	if outcome != nil && outcome.Task != nil && outcome.Task.PrivateData.Gateway != nil {
+		if value, exists := c.Get(pluginruntime.ContextKeyPinnedEndpoint); exists {
+			if selected, ok := value.(pluginruntime.PinnedEndpoint); ok && selected.Plugin != nil && selected.Generation == pinned.Generation && selected.Protocol == pinned.Protocol {
+				pinned = selected
+				pluginKey = selected.Plugin.Meta.Key
+			}
+		}
+	}
 	if outcome == nil || outcome.Task == nil || outcome.RelayInfo == nil ||
 		outcome.Task.UserId != relayInfo.UserId ||
 		outcome.Task.Platform != constant.TaskPlatform(pinned.Plugin.Meta.Key) {

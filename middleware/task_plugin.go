@@ -576,18 +576,24 @@ func RouteTaskPluginEndpoint() gin.HandlerFunc {
 			if requestPath == "/v1/video/generations" {
 				requestPath = "/v1/videos"
 			}
+			var bindings []pluginruntime.ProtocolBinding
 			for _, channel := range channels {
 				pluginKey := strings.TrimPrefix(string(channel.Protocol), "task:")
 				for _, binding := range generation.LookupEndpointCandidates(c.Request.Method, requestPath, channel.UpstreamModelName) {
-					if binding.Plugin.Meta.Key != pluginKey {
-						continue
+					if binding.Plugin.Meta.Key == pluginKey && !slices.ContainsFunc(bindings, func(existing pluginruntime.ProtocolBinding) bool {
+						return existing.Plugin == binding.Plugin && existing.Model == binding.Model
+					}) {
+						bindings = append(bindings, binding)
 					}
-					pinned := pluginruntime.PinnedEndpoint{Generation: generation, Plugin: binding.Plugin, Protocol: binding.Protocol, Operation: binding.Operation, Model: request.Model, MappedModel: channel.UpstreamModelName, Candidates: []pluginruntime.ProtocolBinding{binding}}
-					c.Set(pluginruntime.ContextKeyPinnedEndpoint, pinned)
-					c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Generation: generation, Plugin: binding.Plugin})
-					c.Next()
-					return
 				}
+			}
+			if len(bindings) > 0 {
+				binding := bindings[0]
+				pinned := pluginruntime.PinnedEndpoint{Generation: generation, Plugin: binding.Plugin, Protocol: binding.Protocol, Operation: binding.Operation, Model: request.Model, MappedModel: binding.Model, Candidates: bindings}
+				c.Set(pluginruntime.ContextKeyPinnedEndpoint, pinned)
+				c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Generation: generation, Plugin: binding.Plugin})
+				c.Next()
+				return
 			}
 			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, "Task Channel is unavailable")
 			return
@@ -940,6 +946,9 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 			candidateContext := protocolContext
 			candidateContext.Protocol = candidate.Protocol
 			candidateContext.Operation = candidate.Operation.Name
+			if TextOffering(c) != nil {
+				candidateContext.UpstreamModel = candidate.Model
+			}
 			// Parsing belongs to durable submission; disconnecting only stops
 			// the later Responses observation.
 			resolvedValue, requestBodyText, callErr := candidate.Plugin.Engine.CallPathWithMemberJSON(
