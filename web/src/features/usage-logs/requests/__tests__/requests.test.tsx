@@ -709,3 +709,43 @@ it('clears the previous request attempts while another request is loading', asyn
   })
   expect(await within(drawer).findByText('No attempts recorded')).toBeVisible()
 })
+
+it('shows pending task facts in the existing request view and preserves explicit zero and boolean facts', async () => {
+  api.defaults.adapter = async (config) => ({
+    config,
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+    data: {
+      success: true,
+      data: {
+        items: [
+          {
+            ...request,
+            status: 'pending',
+            usage: {
+              task_facts: {
+                seconds: 2.5,
+                tokens: 0,
+                audio: false,
+                size: '720x1280',
+              },
+            },
+          },
+        ],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      },
+    },
+  })
+  renderRequests()
+  expect(await screen.findByText('Pending')).toBeVisible()
+  const usage = screen.getByRole('group', { name: 'Task usage' })
+  expect(within(usage).getByText('seconds')).toBeVisible()
+  expect(within(usage).getByText('2.5')).toBeVisible()
+  expect(within(usage).getByText('0')).toBeVisible()
+  expect(within(usage).getByText('No')).toBeVisible()
+  expect(within(usage).getByText('720x1280')).toBeVisible()
+  expect(within(usage).queryByText('Total tokens')).not.toBeInTheDocument()
+})

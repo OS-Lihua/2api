@@ -216,7 +216,7 @@ func initTaskArtifactAdaptor(task *model.Task) (relaychannel.TaskAdaptor, error)
 	if task == nil || !taskHasPluginExecution(task) {
 		return nil, errTaskArtifactPluginUnavailable
 	}
-	channelModel, err := model.CacheGetProvider(task.ChannelId)
+	channelModel, err := service.GatewayTaskProvider(task)
 	if err != nil {
 		return nil, fmt.Errorf("%w: channel unavailable", errTaskArtifactPluginUnavailable)
 	}
@@ -224,9 +224,9 @@ func initTaskArtifactAdaptor(task *model.Task) (relaychannel.TaskAdaptor, error)
 	if adaptor == nil {
 		return nil, errTaskArtifactPluginUnavailable
 	}
-	pluginKey := task.PrivateData.Key
-	if pluginKey == "" {
-		pluginKey = channelModel.Key
+	pluginKey := channelModel.Key
+	if task.PrivateData.Gateway == nil && task.PrivateData.Key != "" {
+		pluginKey = task.PrivateData.Key
 	}
 	baseURL := channelModel.GetBaseURL()
 	if baseURL == "" {

@@ -537,6 +537,20 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 	}
 }
 
+const taskReadAuthKey = "task_read_auth"
+
+// TaskReadAuth validates credentials without requiring legacy quota for an
+// operation that only reads an existing task. Ownership is checked by handlers.
+func TaskReadAuth() gin.HandlerFunc {
+	authenticate := TokenAuth()
+	return func(c *gin.Context) {
+		if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
+			c.Set(taskReadAuthKey, true)
+		}
+		authenticate(c)
+	}
+}
+
 func TokenAuth() func(c *gin.Context) {
 	return func(c *gin.Context) {
 		// 先检测是否为ws
@@ -582,7 +596,7 @@ func TokenAuth() func(c *gin.Context) {
 			key = parts[0]
 		}
 		validateToken := model.ValidateUserToken
-		if TextOffering(c) != nil {
+		if TextOffering(c) != nil || c.GetBool(taskReadAuthKey) {
 			validateToken = model.ValidateWalletToken
 		}
 		token, err := validateToken(key)

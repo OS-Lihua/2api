@@ -590,7 +590,10 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Provider, mod
 		logTaskPluginChannelDecision(c, nil, modelName, "channel_rejected", "nil_channel")
 		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
-	if expectedPlugin != "" && !channelMatchesExpectedTaskPlugin(c, channel, expectedPlugin) {
+	// ModelOffering task Channels bind the plugin through their protocol;
+	// legacy Provider bindings apply only to legacy task distribution.
+	gatewayTask := TextOffering(c) != nil && c.GetBool("task_gateway_channel_selected")
+	if !gatewayTask && expectedPlugin != "" && !channelMatchesExpectedTaskPlugin(c, channel, expectedPlugin) {
 		logTaskPluginChannelDecision(c, channel, modelName, "channel_rejected", "identity_mismatch")
 		return types.NewError(
 			errors.New("selected channel does not match the pinned task plugin"),
@@ -598,7 +601,7 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Provider, mod
 			types.ErrOptionWithSkipRetry(),
 		)
 	}
-	if index, matched := pinnedEndpointCandidateForChannel(c, channel, expectedPlugin); matched {
+	if index, matched := pinnedEndpointCandidateForChannel(c, channel, expectedPlugin); !gatewayTask && matched {
 		previousPlugin := ""
 		var selected *jsplugin.LoadedPlugin
 		var generation *jsplugin.RoutingGeneration

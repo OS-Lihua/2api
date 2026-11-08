@@ -210,7 +210,7 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		}
 	}
 
-	channel, err := model.CacheGetProvider(task.ChannelId)
+	channel, err := service.GatewayTaskProvider(task)
 	if err != nil {
 		return &taskMediaProxyError{
 			status: http.StatusServiceUnavailable, code: "artifact_plugin_unavailable",

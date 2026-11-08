@@ -84,6 +84,9 @@ func sweepTimedOutTasks(ctx context.Context) {
 	timedOutCount := 0
 
 	for _, task := range tasks {
+		if task.PrivateData.Gateway != nil && !task.PrivateData.Gateway.Accepted {
+			continue
+		}
 		isLegacy := task.SubmitTime > 0 && task.SubmitTime < model.TaskRefundLegacyCutoff
 
 		oldStatus := task.Status
@@ -109,6 +112,10 @@ func sweepTimedOutTasks(ctx context.Context) {
 			continue
 		}
 		timedOutCount++
+		if task.PrivateData.Gateway != nil {
+			finalizeTerminalTask(ctx, nil, task, nil)
+			continue
+		}
 		if !isLegacy && task.Quota != 0 {
 			RefundTaskQuota(ctx, task, reason)
 		}
@@ -147,6 +154,14 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 	summary.UnfinishedTasks = len(allTasks)
 	platformTask := make(map[constant.TaskPlatform][]*model.Task)
 	for _, t := range allTasks {
+		if t.PrivateData.Gateway != nil {
+			if t.PrivateData.Gateway.Accepted {
+				if err := UpdateGatewayTask(ctx, t); err != nil {
+					logger.LogError(ctx, "Gateway task polling remains pending for task "+t.TaskID)
+				}
+			}
+			continue
+		}
 		platformTask[t.Platform] = append(platformTask[t.Platform], t)
 	}
 
@@ -168,6 +183,9 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 		taskM := make(map[string]*model.Task)
 		nullTaskIds := make([]int64, 0)
 		for _, task := range tasks {
+			if task.PrivateData.Gateway != nil && !task.PrivateData.Gateway.Accepted {
+				continue
+			}
 			upstreamID := task.GetUpstreamTaskID()
 			if upstreamID == "" {
 				// 统计失败的未完成任务
@@ -236,7 +254,7 @@ func UpdateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, task
 	return nil
 }
 
-func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, channelId int, taskIds []string, taskM map[string]*model.Task) error {
+func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, channelId int, taskIds []string, taskM map[string]*model.Task, pinned ...*model.Provider) error {
 	logger.LogInfo(ctx, common.LogText("channel #%d has %d unfinished tasks", channelId, len(taskIds)))
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -244,7 +262,13 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	if len(taskIds) == 0 {
 		return nil
 	}
-	ch, err := model.CacheGetProvider(channelId)
+	var ch *model.Provider
+	var err error
+	if len(pinned) > 0 {
+		ch = pinned[0]
+	} else {
+		ch, err = model.CacheGetProvider(channelId)
+	}
 	if err != nil {
 		common.SysLog(common.LogText("CacheGetProvider: %v", err))
 		// Collect DB primary key IDs for bulk update (taskIds are upstream IDs, not task_id column values)
@@ -376,6 +400,9 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 
 		isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 		terminalTransition := isDone && snap.Status != task.Status
+		if terminalTransition && task.PrivateData.Gateway != nil {
+			task.PrivateData.Gateway.CompletionFacts = responseItem.TaskInfo.UsageFacts
+		}
 		won, updateErr := task.UpdateWithStatus(snap.Status)
 		if updateErr != nil {
 			common.SysLog(common.LogText("UpdateSunoTask task error: %s", updateErr.Error()))
@@ -613,6 +640,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 	if isDone && snap.Status != task.Status {
+		if task.PrivateData.Gateway != nil {
+			task.PrivateData.Gateway.CompletionFacts = taskResult.UsageFacts
+		}
 		won, err := task.UpdateWithStatus(snap.Status)
 		if err != nil {
 			logger.LogError(ctx, common.LogText("UpdateWithStatus failed for task %s: %s", task.TaskID, err.Error()))
@@ -640,6 +670,12 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 // finalizeTerminalTask 终态统一收尾（状态 CAS 赢家调用，恰好一次）：采样 + 结算 + 失败兜底退款。
 func finalizeTerminalTask(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, taskResult *relaycommon.TaskInfo) {
 	perfmetrics.RecordTaskResult(task, taskResult)
+	if task.PrivateData.Gateway != nil {
+		if err := SettleGatewayTask(ctx, task); err != nil {
+			logger.LogError(ctx, "Gateway task settlement remains pending for task "+task.TaskID)
+		}
+		return
+	}
 	billingSettled := settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
 	if task.Status == model.TaskStatusFailure && !billingSettled && task.Quota != 0 {
 		RefundTaskQuota(ctx, task, task.FailReason)

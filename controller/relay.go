@@ -500,6 +500,9 @@ func RelayTask(c *gin.Context) {
 // come from c.Request.Context: native task endpoints use the client context,
 // while the Responses bridge supplies an independently bounded context.
 func executeTaskSubmission(c *gin.Context, relayInfo *relaycommon.RelayInfo) (*taskSubmissionOutcome, *taskdto.TaskError) {
+	if middleware.TextOffering(c) != nil {
+		return submitGatewayTask(c)
+	}
 	return executeTaskSubmissionWith(c, relayInfo, relay.RelayTaskSubmit)
 }
 
@@ -767,7 +770,10 @@ func presentTaskSubmission(c *gin.Context, outcome *taskSubmissionOutcome) {
 		diagnostics.present(outcome.Task, "native_stream")
 		return
 	}
-	otherRatios := outcome.RelayInfo.PriceData.OtherRatios()
+	otherRatios := map[string]float64{}
+	if outcome.Task.PrivateData.Gateway == nil {
+		otherRatios = outcome.RelayInfo.PriceData.OtherRatios()
+	}
 	if otherRatios == nil {
 		otherRatios = map[string]float64{}
 	}

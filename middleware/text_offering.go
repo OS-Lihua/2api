@@ -23,26 +23,36 @@ func ResolveTextOffering() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		c.Set(TextGatewayStartedAtKey, clock.Now())
-		var request struct {
-			Model string `json:"model"`
-		}
-		if common.UnmarshalBodyReusable(c, &request) != nil || request.Model == "" {
-			c.Next()
-			return
-		}
-		offering, err := model.FindModelOfferingByName(c.Request.Context(), request.Model)
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			c.Next()
-			return
-		}
-		if err != nil {
-			abortWithOpenAiMessage(c, http.StatusInternalServerError, "Could not resolve model")
-			return
-		}
-		c.Set(textOfferingContextKey, offering)
-		c.Next()
+		resolveOffering(c)
 	}
+}
+
+// ResolveTaskOffering resolves a task's public model before TokenAuth checks
+// funding. Authorization still runs after the token's identity checks.
+func ResolveTaskOffering() gin.HandlerFunc {
+	return resolveOffering
+}
+
+func resolveOffering(c *gin.Context) {
+	c.Set(TextGatewayStartedAtKey, clock.Now())
+	var request struct {
+		Model string `json:"model"`
+	}
+	if common.UnmarshalBodyReusable(c, &request) != nil || request.Model == "" {
+		c.Next()
+		return
+	}
+	offering, err := model.FindModelOfferingByName(c.Request.Context(), request.Model)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		c.Next()
+		return
+	}
+	if err != nil {
+		abortWithOpenAiMessage(c, http.StatusInternalServerError, "Could not resolve model")
+		return
+	}
+	c.Set(textOfferingContextKey, offering)
+	c.Next()
 }
 
 func TextOffering(c *gin.Context) *model.ModelOffering {

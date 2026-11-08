@@ -812,7 +812,7 @@ func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy str
 // FetchTaskWithContext bounds management and request-scoped polling while the
 // background poller keeps its existing lifecycle through FetchTask.
 func (a *TaskAdaptor) FetchTaskWithContext(requestCtx context.Context, baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
-	if task != nil && task.PrivateData.Key != "" {
+	if task != nil && task.PrivateData.Gateway == nil && task.PrivateData.Key != "" {
 		key = task.PrivateData.Key
 	}
 	ctx, err := a.queryContextWithContext(requestCtx, task, key, baseURL, proxy)
@@ -830,12 +830,25 @@ func (a *TaskAdaptor) FetchTaskWithContext(requestCtx context.Context, baseURL, 
 // request descriptors may use, through the channel's proxy like poll requests.
 func (a *TaskAdaptor) hookFetcher(baseURL, proxy string) pluginruntime.Fetcher {
 	return func(ctx context.Context, request pluginruntime.FetchRequest) (pluginruntime.FetchResponse, error) {
+		if a.info != nil && a.info.BeginProviderCall != nil {
+			budgetContext, err := a.info.BeginProviderCall()
+			if err != nil {
+				return pluginruntime.FetchResponse{}, err
+			}
+			bounded, cancel := context.WithCancel(ctx)
+			stop := context.AfterFunc(budgetContext, cancel)
+			defer func() { stop(); cancel() }()
+			ctx = bounded
+		}
 		if err := pluginruntime.ValidateRequestURL(request.URL, baseURL, a.plugin.Meta.AllowedHosts); err != nil {
 			return pluginruntime.FetchResponse{}, err
 		}
 		client, err := service.GetHttpClientWithProxySettings(proxy, a.channelSetting())
 		if err != nil {
 			return pluginruntime.FetchResponse{}, err
+		}
+		if a.info != nil && a.info.BeginProviderCall != nil {
+			client = channel.GatewayHTTPClient(client)
 		}
 		// A redirect reaches the plugin as it is; fetching its location is a
 		// new request, checked and counted again.
@@ -1104,7 +1117,7 @@ func (a *TaskAdaptor) ParseTaskResultWithContext(requestCtx context.Context, tas
 		input = decoded
 	}
 	key, baseURL, proxy := a.queryCredentials()
-	if task != nil && task.PrivateData.Key != "" {
+	if task != nil && task.PrivateData.Gateway == nil && task.PrivateData.Key != "" {
 		key = task.PrivateData.Key
 	}
 	ctx, err := a.queryContextWithContext(requestCtx, task, key, baseURL, proxy)
@@ -1464,7 +1477,7 @@ func (a *TaskAdaptor) queryContextWithContext(requestCtx context.Context, task *
 			}
 			ctx["state"] = state
 		}
-		if task.PrivateData.Key != "" {
+		if task.PrivateData.Gateway == nil && task.PrivateData.Key != "" {
 			key = task.PrivateData.Key
 		}
 	}

@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/money"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 )
@@ -109,9 +110,10 @@ func (m Properties) Value() (driver.Value, error) {
 }
 
 type TaskPrivateData struct {
-	Key            string `json:"key,omitempty"`
-	UpstreamTaskID string `json:"upstream_task_id,omitempty"` // 上游真实 task ID
-	ResultURL      string `json:"result_url,omitempty"`       // 任务成功后的结果 URL（视频地址等）
+	Gateway        *TaskGatewaySnapshot `json:"gateway,omitempty"`
+	Key            string               `json:"key,omitempty"`
+	UpstreamTaskID string               `json:"upstream_task_id,omitempty"` // 上游真实 task ID
+	ResultURL      string               `json:"result_url,omitempty"`       // 任务成功后的结果 URL（视频地址等）
 	// Execution records safe, immutable request provenance. It lives next to
 	// other private task state so public task DTOs cannot expose it by accident.
 	Execution *TaskExecutionSnapshot `json:"execution,omitempty"`
@@ -136,6 +138,20 @@ type TaskPrivateData struct {
 	// and every retrieval surface treats the task as not found. The zero
 	// value keeps historical rows retained and retrievable.
 	ResultDiscarded bool `json:"result_discarded,omitempty"`
+}
+
+// TaskGatewaySnapshot freezes the accepted Channel and quantitative billing
+// facts. Request bodies, credentials, and generated content stay out of it.
+type TaskGatewaySnapshot struct {
+	Accepted         bool              `json:"accepted"`
+	ProviderType     int               `json:"provider_type"`
+	ChannelID        int               `json:"channel_id"`
+	ProviderID       int               `json:"provider_id"`
+	Settlement       GatewaySettlement `json:"settlement"`
+	Facts            map[string]any    `json:"facts"`
+	CompletionFacts  map[string]any    `json:"completion_facts,omitempty"`
+	PreviousAttempts []GatewayAttempt  `json:"previous_attempts,omitempty"`
+	SaleSource       money.Amount      `json:"sale_source"`
 }
 
 type TaskExecutionSnapshot struct {
@@ -214,7 +230,7 @@ func (p TaskPrivateData) Value() (driver.Value, error) {
 		p.Execution == nil && p.BillingSource == "" && p.SubscriptionId == 0 &&
 		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil &&
 		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 &&
-		!p.ResultDiscarded {
+		!p.ResultDiscarded && p.Gateway == nil {
 		return nil, nil
 	}
 	// 同 Properties.Value:string 避免 PG simple protocol 的 bytea 编码。
@@ -401,6 +417,17 @@ func HasUnfinishedSyncTasks() bool {
 		Limit(1).
 		Pluck("id", &id).Error
 	return err == nil && id != 0
+}
+
+// RecoverableGatewayTasks returns terminal tasks whose primary billing intent
+// still needs preparation or posting after a process restart.
+func RecoverableGatewayTasks(ctx context.Context, limit int) ([]Task, error) {
+	var tasks []Task
+	err := DB.WithContext(ctx).Model(&Task{}).
+		Joins(`JOIN "gateway_billings" ON "gateway_billings"."request_id" = "tasks"."private_data"->'gateway'->'settlement'->'request'->>'id'`).
+		Where(`"gateway_billings"."phase" <> ?`, "settled").
+		Order(`"tasks"."id"`).Limit(limit).Find(&tasks).Error
+	return tasks, err
 }
 
 func GetByOnlyTaskId(taskId string) (*Task, bool, error) {

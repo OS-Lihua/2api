@@ -7,7 +7,7 @@ export const meta = {
     en: "OpenAI Sora video generation (text-to-video, image-to-video, and remix)",
     zh: "OpenAI Sora 视频生成（文生视频、图生视频、remix）",
   },
-  version: "1.1.0",
+  version: "1.1.1",
   channelTypes: [55, 1], // OpenAI-type channels natively serve sora with the same wire format
   author: { name: "QuantumNous" },
   models: ["sora-2", "sora-2-pro"],
@@ -92,8 +92,19 @@ function requestValues(req, model) {
   return values;
 }
 
+function videoDuration(req) {
+  let raw = req.seconds;
+  if (raw === undefined) raw = req.duration;
+  if (raw === undefined) raw = 4;
+  const seconds = Number(raw);
+  if ((typeof raw !== "number" && typeof raw !== "string") || !String(raw).trim() || !Number.isFinite(seconds) || seconds <= 0 || seconds > 3600)
+    throw new Error("seconds must be between 1 and 3600");
+  return seconds;
+}
+
 export function buildSubmitRequest(ctx) {
   const req = ctx.requestBody || {};
+  videoDuration(req);
   if (!String(req.prompt || "").trim()) throw new Error("field prompt is required");
   const action = ctx.action === "remix" ? "remix" : ctx.action;
   const headers = { Authorization: "Bearer " + ctx.apiKey };
@@ -127,15 +138,19 @@ export function parseSubmitResponse(ctx, resp) {
 export function extractUsage(ctx) {
   if (ctx.action === "remix") return {};
   const req = ctx.requestBody || {};
-  let seconds = Number(req.seconds || req.duration || 4);
-  if (!Number.isFinite(seconds) || seconds <= 0) seconds = 4;
-  return { seconds: Math.min(seconds, 3600), size: req.size || "720x1280" };
+  return { seconds: videoDuration(req), size: req.size || "720x1280" };
 }
 
 export function extractUsageOnComplete(task, taskResult, body) {
   const facts = {};
-  const seconds = Number((body || {}).seconds || (body || {}).duration || 0);
-  if (Number.isFinite(seconds) && seconds > 0) facts.seconds = Math.min(seconds, 3600);
+  const data = body || {};
+  const raw = data.seconds === undefined ? data.duration : data.seconds;
+  if (raw !== undefined) {
+    const seconds = Number(raw);
+    if ((typeof raw !== "number" && typeof raw !== "string") || !String(raw).trim() || !Number.isFinite(seconds) || seconds < 0 || seconds > 3600)
+      throw new Error("completed seconds must be between 0 and 3600");
+    facts.seconds = seconds;
+  }
   const size = trimmed((body || {}).size);
   if (["720x1280", "1280x720", "1792x1024", "1024x1792"].includes(size)) facts.size = size;
   return facts;

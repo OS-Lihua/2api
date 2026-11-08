@@ -135,7 +135,7 @@ func productionPluginRouteHandlers(generation *jsplugin.RoutingGeneration, group
 			binding.Route.Method,
 			binding.Route.Type,
 		)
-		c.Next()
+		middleware.ResolveTaskOffering()(c)
 		logger.LogDebug(
 			c,
 			"task_plugin subsystem=router event=route_complete generation=%d plugin=%q method=%q status=%d",
@@ -145,14 +145,25 @@ func productionPluginRouteHandlers(generation *jsplugin.RoutingGeneration, group
 			c.Writer.Status(),
 		)
 	}
+	auth := middleware.TokenAuth()
+	if group.Method == http.MethodGet || group.Method == http.MethodHead {
+		auth = middleware.TaskReadAuth()
+	}
+	distribute := middleware.Distribute()
 	return []gin.HandlerFunc{
 		pinRoute,
 		middleware.NativeRouteCredential(keys...),
-		middleware.TokenAuth(),
+		auth,
 		middleware.SystemPerformanceCheck(),
 		middleware.ModelRequestRateLimit(),
 		middleware.PrepareTaskPluginRoute(),
-		middleware.Distribute(),
+		func(c *gin.Context) {
+			if middleware.TextOffering(c) != nil && c.GetBool("task_gateway_endpoint") {
+				controller.TaskGateway(c)
+				return
+			}
+			distribute(c)
+		},
 		controller.RelayTask,
 	}
 }

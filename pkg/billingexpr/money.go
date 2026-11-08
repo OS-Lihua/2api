@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,7 +29,9 @@ import (
 // MoneyInput carries normalized whole token counts and frozen request context.
 // A zero Time uses pkg/clock.Now when the evaluation starts.
 type MoneyInput struct {
-	Tokens map[string]int64
+	// TaskUsage selects canonical task units, including constant task prices.
+	TaskUsage bool
+	Tokens    map[string]int64
 	// TokenQuantities overrides whole counts for exact weighted cache quantities,
 	// such as the 1.6 short-write units used by an unpriced one-hour cache write.
 	TokenQuantities map[string]decimal.Decimal
@@ -75,6 +78,9 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 	if err != nil {
 		return money.Value{}, trace, err
 	}
+	if input.TaskUsage && entry.sourceVars["fixed"] {
+		return money.Value{}, trace, fmt.Errorf("fixed pricing is not supported for task usage expressions")
+	}
 	headers := normalizeHeaders(input.Request.Headers)
 	now := input.Time
 	if now.IsZero() {
@@ -93,6 +99,37 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 			trace.BillingUnit = BillingUnitRequest
 			trace.FixedPrice = &text
 			return new(big.Rat).Mul(amount, big.NewRat(1_000_000, 1)), nil
+		},
+		"u": func(key string) (any, error) {
+			value, exists := input.Request.Usage[key]
+			if !exists {
+				return nil, fmt.Errorf("usage fact %q is missing", key)
+			}
+			switch number := value.(type) {
+			case string, bool:
+				return value, nil
+			case json.Number:
+				parsed, err := decimal.NewFromString(string(number))
+				if err != nil || parsed.IsNegative() {
+					return nil, fmt.Errorf("invalid usage fact %q", key)
+				}
+				return exactDecimal(parsed)
+			case float64:
+				if math.IsNaN(number) || math.IsInf(number, 0) || number < 0 {
+					return nil, fmt.Errorf("invalid usage fact %q", key)
+				}
+				parsed, err := decimal.NewFromString(strconv.FormatFloat(number, 'g', -1, 64))
+				if err != nil {
+					return nil, err
+				}
+				return exactDecimal(parsed)
+			default:
+				quantity, err := exactNumber(value)
+				if err != nil || quantity.Sign() < 0 {
+					return nil, fmt.Errorf("invalid usage fact %q", key)
+				}
+				return quantity, nil
+			}
 		},
 		"param": func(path string) (any, error) {
 			path = strings.TrimSpace(path)
@@ -181,7 +218,12 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 	if number.Sign() < 0 {
 		return money.Value{}, trace, fmt.Errorf("expr result must be non-negative")
 	}
-	amount, err := money.NewRationalValue(new(big.Rat).Quo(number, big.NewRat(1_000_000, 1)), currency)
+	// Task expressions already return a price in canonical usage units.
+	// Token expressions return a price per million tokens.
+	if !input.TaskUsage && !entry.sourceVars["u"] {
+		number = new(big.Rat).Quo(number, big.NewRat(1_000_000, 1))
+	}
+	amount, err := money.NewRationalValue(number, currency)
 	return amount, trace, err
 }
 

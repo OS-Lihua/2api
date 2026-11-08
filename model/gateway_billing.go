@@ -48,6 +48,19 @@ func MigrateGatewayBilling(db *gorm.DB) error {
 // ReserveGateway writes the request lifecycle and reservation in one primary
 // transaction. Reusing a request ID cannot dispatch another Provider attempt.
 func ReserveGateway(request *GatewayRequest, reservation, source money.Amount) error {
+	return reserveGateway(request, reservation, source, nil)
+}
+
+// ReserveGatewayTask persists task recovery identity and the single reservation
+// in the same primary transaction, before any Provider I/O.
+func ReserveGatewayTask(request *GatewayRequest, reservation, source money.Amount, task *Task) error {
+	if task == nil || task.UserId != request.UserID || task.PrivateData.Gateway == nil || task.PrivateData.Key != "" {
+		return ErrLedgerInvalidEntry
+	}
+	return reserveGateway(request, reservation, source, task)
+}
+
+func reserveGateway(request *GatewayRequest, reservation, source money.Amount, task *Task) error {
 	if request.ID == "" || request.UserID <= 0 || reservation.Currency != SettlementCurrency() || reservation.Nanos < 0 {
 		return ErrLedgerInvalidEntry
 	}
@@ -89,7 +102,14 @@ func ReserveGateway(request *GatewayRequest, reservation, source money.Amount) e
 		if err != nil {
 			return err
 		}
-		return tx.Model(&row).Update("request_data", string(encoded)).Error
+		if err := tx.Model(&row).Update("request_data", string(encoded)).Error; err != nil {
+			return err
+		}
+		if task != nil {
+			task.PrivateData.Gateway.Settlement.Request = *request
+			return tx.Create(task).Error
+		}
+		return nil
 	})
 }
 
@@ -265,6 +285,31 @@ func SettleGateway(requestID string) (*GatewayRequest, error) {
 		return nil
 	})
 	return &result, err
+}
+
+// PublishPendingGatewayRecords exposes accepted task state without finalizing
+// funds. The primary lifecycle lock orders pending delivery before final rows.
+func PublishPendingGatewayRecords(intent GatewaySettlement) error {
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var row GatewayBilling
+		if err := lockForUpdate(tx).First(&row, "request_id = ?", intent.Request.ID).Error; err != nil {
+			return err
+		}
+		if row.Phase != "reserved" {
+			return nil
+		}
+		for i := range intent.Attempts {
+			if err := appendGatewayRecord(&intent.Attempts[i]); err != nil {
+				return err
+			}
+		}
+		if intent.Attempt != nil {
+			if err := appendGatewayRecord(intent.Attempt); err != nil {
+				return err
+			}
+		}
+		return appendGatewayRecord(&intent.Request)
+	})
 }
 
 // PublishGatewayRecords delivers finalized rows at least once. Stable primary

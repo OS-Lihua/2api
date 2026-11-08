@@ -282,6 +282,15 @@ after evaluation. Calculations do not round. Write the final amount with
 `Value.Receivable`, `Value.Credit`, or `Value.Cost` according to the ledger entry.
 A repeating value formats as an exact fraction until that write boundary.
 
+Task prices use this same evaluator. `u("key")` reads numeric, boolean, or enum
+facts from `MoneyInput.Request.Usage`, preserving explicit zero and false.
+A missing referenced fact fails evaluation. Expressions containing `u()` already
+return currency amounts in canonical task units and are not divided by one
+million. Set `MoneyInput.TaskUsage` for task evaluation, including constant task
+prices; this mode rejects `fixed()`. The host validates plugin schema and unit
+bounds before evaluation and supplies the same completed fact vector to sale
+and purchase expressions.
+
 ### Request Rules (appended after `|||`)
 
 Request-conditional multipliers are appended to the expression after a `|||` separator:

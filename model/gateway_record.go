@@ -14,16 +14,17 @@ import (
 // GatewayUsage contains measured quantities only. Provider extensions and raw
 // response data never enter request records.
 type GatewayUsage struct {
-	PromptTokens           int64 `json:"prompt_tokens"`
-	CompletionTokens       int64 `json:"completion_tokens"`
-	TotalTokens            int64 `json:"total_tokens"`
-	CachedTokens           int64 `json:"cached_tokens,omitempty"`
-	CacheCreationTokens    int64 `json:"cache_creation_tokens,omitempty"`
-	CacheCreation12hTokens int64 `json:"cache_creation_12h_tokens,omitempty"`
-	ImageInputTokens       int64 `json:"image_input_tokens,omitempty"`
-	AudioInputTokens       int64 `json:"audio_input_tokens,omitempty"`
-	ImageOutputTokens      int64 `json:"image_output_tokens,omitempty"`
-	AudioOutputTokens      int64 `json:"audio_output_tokens,omitempty"`
+	TaskFacts              map[string]any `json:"task_facts,omitempty"`
+	PromptTokens           int64          `json:"prompt_tokens"`
+	CompletionTokens       int64          `json:"completion_tokens"`
+	TotalTokens            int64          `json:"total_tokens"`
+	CachedTokens           int64          `json:"cached_tokens,omitempty"`
+	CacheCreationTokens    int64          `json:"cache_creation_tokens,omitempty"`
+	CacheCreation12hTokens int64          `json:"cache_creation_12h_tokens,omitempty"`
+	ImageInputTokens       int64          `json:"image_input_tokens,omitempty"`
+	AudioInputTokens       int64          `json:"audio_input_tokens,omitempty"`
+	ImageOutputTokens      int64          `json:"image_output_tokens,omitempty"`
+	AudioOutputTokens      int64          `json:"audio_output_tokens,omitempty"`
 }
 
 type GatewayRequest struct {
@@ -183,7 +184,7 @@ func ListGatewayAttempts(ctx context.Context, requestID string, offset, limit in
 
 func appendGatewayRecord(record any) error {
 	if !common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
-		return LOG_DB.Clauses(clause.OnConflict{DoNothing: true}).Create(record).Error
+		return LOG_DB.Clauses(clause.OnConflict{UpdateAll: true}).Create(record).Error
 	}
 	// ClickHouse's native String binder does not accept defined string types.
 	// Override just the storage fields; quantities remain exact int64 nanos.
