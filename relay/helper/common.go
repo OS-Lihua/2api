@@ -286,6 +286,44 @@ func WriteGatewayStreamFrame(c *gin.Context, facts *relaycommon.ResponseFacts, f
 	return nil
 }
 
+// WriteGatewayJSONResponse records complete business writes and checks the
+// error-aware flush boundary for both generic and native protocol writers.
+func WriteGatewayJSONResponse(c *gin.Context, resp *http.Response, facts *relaycommon.ResponseFacts, body []byte, business bool) error {
+	if err := c.Request.Context().Err(); err != nil {
+		return err
+	}
+	if resp != nil {
+		for name, values := range resp.Header {
+			if len(values) > 0 && service.ShouldCopyUpstreamHeader(c, name, values) {
+				c.Writer.Header().Set(name, values[0])
+			}
+		}
+	}
+	c.Header("Content-Type", "application/json")
+	c.Header("Content-Length", fmt.Sprint(len(body)))
+	status := http.StatusOK
+	if resp != nil {
+		status = resp.StatusCode
+	}
+	c.Writer.WriteHeader(status)
+	written, err := c.Writer.Write(body)
+	if err == nil && written != len(body) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		facts.DownstreamWriteFailed = true
+		return err
+	}
+	if business {
+		facts.MarkBusinessOutput()
+	}
+	if err := FlushWriter(c); err != nil {
+		facts.DownstreamWriteFailed = true
+		return err
+	}
+	return nil
+}
+
 func StringData(c *gin.Context, str string) error {
 	if c == nil || c.Writer == nil {
 		return errors.New("context or writer is nil")
@@ -300,10 +338,18 @@ func StringData(c *gin.Context, str string) error {
 		return FlushWriter(c)
 	}
 	if facts, ok := common.GetContextKeyType[*relaycommon.ResponseFacts](c, constant.ContextKeyResponseFacts); ok && facts != nil && facts.OnBusinessOutput != nil {
+		if str == "[DONE]" {
+			err := WriteGatewayStreamFrame(c, nil, "data: [DONE]\n\n", false)
+			if err != nil {
+				facts.DownstreamWriteFailed = true
+			}
+			return err
+		}
 		var chunk dto.ChatCompletionsStreamResponse
 		if common.UnmarshalJsonStr(str, &chunk) == nil && (chunk.Choices != nil || chunk.Usage != nil) {
 			business := false
 			for _, choice := range chunk.Choices {
+				facts.OutputLimitObserved = facts.OutputLimitObserved || choice.FinishReason != nil && *choice.FinishReason == "length"
 				business = business || choice.Delta.GetContentString() != "" || choice.Delta.GetReasoningContent() != "" || len(choice.Delta.ToolCalls) > 0
 			}
 			return WriteGatewayStreamFrame(c, facts, "data: "+str+"\n\n", business)
@@ -415,6 +461,7 @@ func WriteChatResponse(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	var output strings.Builder
 	business := false
 	for _, choice := range response.Choices {
+		facts.OutputLimitObserved = facts.OutputLimitObserved || choice.FinishReason == "length"
 		if facts.OnBusinessOutput != nil && choice.FinishReason == constant.FinishReasonContentFilter {
 			info.PerformanceBusinessRejection = true
 		}
@@ -436,13 +483,8 @@ func WriteChatResponse(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	if err := c.Request.Context().Err(); err != nil {
 		return &response.Usage, types.NewError(err, types.ErrorCodeBadResponse)
 	}
-	c.Header("Content-Type", "application/json")
-	if err := service.IOCopyBytesGracefully(c, resp, encoded); err != nil {
-		facts.DownstreamWriteFailed = true
+	if err := WriteGatewayJSONResponse(c, resp, facts, encoded, business || facts.GeneratedText != ""); err != nil {
 		return &response.Usage, types.NewError(err, types.ErrorCodeBadResponse)
-	}
-	if business || facts.GeneratedText != "" {
-		facts.MarkBusinessOutput()
 	}
 	return &response.Usage, nil
 }

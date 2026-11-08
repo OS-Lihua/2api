@@ -29,6 +29,7 @@ type ResponseFacts struct {
 	SourceOutputObserved     bool   `json:"-"`
 	SourceOutputTokens       *int   `json:"-"`
 	GeneratedOutputTokens    *int
+	OutputLimitObserved      bool   `json:"-"`
 	UnterminatedStreamData   []byte `json:"-"`
 	UpstreamRetryAfter       string // Transient; only the parsed cooldown may enter records.
 	OnBusinessOutput         func()

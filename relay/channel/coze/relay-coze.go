@@ -34,7 +34,7 @@ func convertCozeChatRequest(c *gin.Context, request dto.GeneralOpenAIRequest) *C
 	}
 	user := request.User
 	if len(user) == 0 {
-		user = json.RawMessage(helper.GetResponseID(c))
+		user, _ = common.Marshal(helper.GetResponseID(c))
 	}
 	cozeRequest := &CozeChatRequest{
 		BotId:              c.GetString("bot_id"),
@@ -116,6 +116,10 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
 	scanner := helper.NewStreamScanner(resp.Body)
+	managed := info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil
+	if managed {
+		scanner = helper.NewSSEEventScanner(resp.Body, info.ResponseFacts)
+	}
 	helper.SetEventStreamHeaders(c)
 	if info.StreamStatus == nil {
 		info.StreamStatus = relaycommon.NewStreamStatus()
@@ -127,6 +131,15 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 	id := helper.GetResponseID(c)
 	var responseText, currentEvent, currentData string
 	for scanner.Scan() {
+		if managed {
+			event := helper.ParseSSEEvent(scanner.Text())
+			if event.Event != "" && event.HasData {
+				if err := handleCozeEvent(c, event.Event, event.Data, &responseText, usage, id, info); err != nil {
+					return usage, types.NewError(err, types.ErrorCodeBadResponse)
+				}
+			}
+			continue
+		}
 		line := scanner.Text()
 		if line == "" {
 			if currentEvent != "" && currentData != "" {
@@ -143,7 +156,21 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 			currentData = strings.TrimSpace(data)
 		}
 	}
-	if currentEvent != "" && currentData != "" {
+	if managed && len(info.ResponseFacts.UnterminatedStreamData) > 0 {
+		partial := info.ResponseFacts.UnterminatedStreamData
+		_ = recordCozeStreamUsage(info, usage, string(partial))
+		var message CozeChatV3MessageDetail
+		if common.Unmarshal(partial, &message) == nil {
+			var content string
+			if common.Unmarshal(message.Content, &content) == nil {
+				text := content + message.ReasoningContent
+				info.ResponseFacts.SourceGeneratedText += text
+				info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || text != ""
+			}
+		}
+		info.ResponseFacts.UnterminatedStreamData = nil
+	}
+	if !managed && currentEvent != "" && currentData != "" {
 		if err := handleCozeEvent(c, currentEvent, currentData, &responseText, usage, id, info); err != nil {
 			return usage, types.NewError(err, types.ErrorCodeBadResponse)
 		}
@@ -159,19 +186,26 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 	return usage, nil
 }
 
+func recordCozeStreamUsage(info *relaycommon.RelayInfo, usage *dto.Usage, data string) error {
+	var chatData CozeChatResponseData
+	if err := common.UnmarshalJsonStr(data, &chatData); err != nil {
+		return err
+	}
+	reported := dto.Usage{PromptTokens: chatData.Usage.InputCount, CompletionTokens: chatData.Usage.OutputCount, TotalTokens: chatData.Usage.TokenCount}
+	if info.ResponseFacts != nil {
+		prompt, completion := relaycommon.NativeUsagePresence([]byte(data), "usage.input_count", "usage.output_count", "usage.token_count")
+		info.ResponseFacts.RecordUsage(usage, &reported, prompt, completion)
+	} else {
+		*usage = reported
+	}
+	return nil
+}
+
 func handleCozeEvent(c *gin.Context, event string, data string, responseText *string, usage *dto.Usage, id string, info *relaycommon.RelayInfo) error {
 	switch event {
 	case "conversation.chat.completed", "conversation.chat.failed", "conversation.chat.canceled", "error":
-		var chatData CozeChatResponseData
-		if err := common.UnmarshalJsonStr(data, &chatData); err != nil {
+		if err := recordCozeStreamUsage(info, usage, data); err != nil {
 			return err
-		}
-		reported := dto.Usage{PromptTokens: chatData.Usage.InputCount, CompletionTokens: chatData.Usage.OutputCount, TotalTokens: chatData.Usage.TokenCount}
-		if info.ResponseFacts != nil {
-			prompt, completion := relaycommon.NativeUsagePresence([]byte(data), "usage.input_count", "usage.output_count", "usage.token_count")
-			info.ResponseFacts.RecordUsage(usage, &reported, prompt, completion)
-		} else {
-			*usage = reported
 		}
 		if event != "conversation.chat.completed" {
 			return fmt.Errorf("Coze stream failed")

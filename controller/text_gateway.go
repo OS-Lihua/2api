@@ -530,7 +530,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				attempt.Status = "failed"
 			}
 			outcome := info.StreamStatus.OutcomeSnapshot()
-			normalBudget := outcome.OutputLimitReached() && attemptErr == nil && (!info.IsStream || info.StreamStatus.CompletedNormally())
+			normalBudget := (outcome.OutputLimitReached() || info.ResponseFacts.OutputLimitObserved) && attemptErr == nil && (!info.IsStream || info.StreamStatus.CompletedNormally())
 			if outcome.ErrorCode != "" {
 				upstreamCode = outcome.ErrorCode
 			}
@@ -901,7 +901,7 @@ func gatewayAttemptOutcome(c *gin.Context, info *relaycommon.RelayInfo, err *typ
 			return "failed", "stream_interrupted"
 		}
 	}
-	if info.StreamStatus.OutcomeSnapshot().OutputLimitReached() {
+	if info.StreamStatus.OutcomeSnapshot().OutputLimitReached() || info.ResponseFacts.OutputLimitObserved {
 		return "partial", "output_limit"
 	}
 	if !info.ResponseFacts.BusinessOutput {

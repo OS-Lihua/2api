@@ -150,6 +150,19 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 			sr.Done()
 		}
 	})
+	if info.ResponseFacts != nil && len(info.ResponseFacts.UnterminatedStreamData) > 0 {
+		partial := info.ResponseFacts.UnterminatedStreamData
+		info.ResponseFacts.UnterminatedStreamData = nil
+		var reported BaiduChatStreamResponse
+		if common.Unmarshal(partial, &reported) == nil {
+			prompt, completion := relaycommon.ChatUsagePresence(partial)
+			info.ResponseFacts.RecordUsage(usage, &reported.Usage, prompt, completion)
+			if reported.Result != "" {
+				info.ResponseFacts.SourceGeneratedText += reported.Result
+				info.ResponseFacts.SourceOutputObserved = true
+			}
+		}
+	}
 	service.CloseResponseBodyGracefully(resp)
 	helper.EstimateMissingChatUsage(c, info, usage)
 	return nil, usage

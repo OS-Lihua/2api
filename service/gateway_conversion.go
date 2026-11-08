@@ -42,7 +42,27 @@ func GatewayRequestTokenOptions(c *gin.Context) RequestTokenOptions {
 // The native DTO remains the source of the actual candidate conversion.
 func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.GeneralOpenAIRequest, error) {
 	if chat, ok := request.(*dto.GeneralOpenAIRequest); ok {
-		return chat, nil
+		var files []dto.MediaContent
+		references := map[string]bool{}
+		for _, message := range chat.Messages {
+			for _, part := range message.ParseContent() {
+				file := part.GetFile()
+				if part.Type != dto.ContentTypeFile || file == nil || file.FileId == "" || file.FileData != "" {
+					continue
+				}
+				references[file.FileId] = true
+				files = append(files, dto.MediaContent{Type: dto.ContentTypeFile, File: &dto.MessageFile{FileName: "reference.pdf", FileData: file.FileId}})
+			}
+		}
+		if len(files) == 0 {
+			return chat, nil
+		}
+		if c, ok := ctx.(*gin.Context); ok {
+			c.Set(gatewayNativeMediaReferencesKey, references)
+		}
+		projection := *chat
+		projection.Messages = append(slices.Clone(chat.Messages), dto.Message{Role: "user", Content: files})
+		return &projection, nil
 	}
 	requiresTextInput := false
 	if responses, ok := request.(*dto.OpenAIResponsesRequest); ok {
@@ -52,7 +72,33 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 		copy.Conversation, copy.Prompt, copy.ContextManagement = nil, nil, nil
 		request = &copy
 	}
-	result, err := relayconvert.ConvertRequest(gatewayConversionContext(ctx), nil, types.RelayFormatOpenAI, request)
+	projectionRequest := request
+	if claude, ok := request.(*dto.ClaudeRequest); ok {
+		projection := *claude
+		projection.Messages = slices.Clone(claude.Messages)
+		for i, message := range claude.Messages {
+			blocks, err := message.ParseContent()
+			if err != nil {
+				continue
+			}
+			blocks = slices.Clone(blocks)
+			for j, block := range blocks {
+				if block.Type != "tool_result" || block.IsStringContent() {
+					continue
+				}
+				content := []dto.ClaudeMediaMessage{}
+				for _, part := range block.ParseMediaContent() {
+					if part.Type != "image" && part.Type != "document" {
+						content = append(content, part)
+					}
+				}
+				blocks[j].Content = content
+			}
+			projection.Messages[i].Content = blocks
+		}
+		projectionRequest = &projection
+	}
+	result, err := relayconvert.ConvertRequest(gatewayConversionContext(ctx), nil, types.RelayFormatOpenAI, projectionRequest)
 	if err != nil {
 		return nil, err
 	}
@@ -115,6 +161,30 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 				}
 			}
 			if block.Source == nil {
+				continue
+			}
+			if block.nested && (block.Type == "image" || block.Type == "document") {
+				source := block.Source
+				reference := source.Url
+				if source.Type == "file" && source.FileID != nil {
+					reference = *source.FileID
+				} else if source.Type == "base64" {
+					if data, ok := source.Data.(string); ok && data != "" {
+						reference = "data:" + source.MediaType + ";base64," + data
+					}
+				}
+				if reference == "" {
+					return nil, fmt.Errorf("tool result media cannot be represented for validation")
+				}
+				if source.Type == "file" || source.Type == "url" {
+					references[reference] = true
+				}
+				media := dto.MediaContent{Type: dto.ContentTypeFile, File: &dto.MessageFile{FileName: "reference.pdf", FileData: reference}}
+				if block.Type == "image" {
+					media = dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: reference, MimeType: source.MediaType}}
+				}
+				media.CacheControl = block.CacheControl
+				referencedMedia = append(referencedMedia, media)
 				continue
 			}
 			var media dto.MediaContent
