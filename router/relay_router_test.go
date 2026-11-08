@@ -4312,33 +4312,51 @@ func TestTextGatewayBufferedGenerationRetainsPurchaseEstimate(t *testing.T) {
 }
 
 func TestTextGatewayPartialSaleUsesDeliveredOutput(t *testing.T) {
-	for _, path := range []string{"/v1/responses", "/v1/chat/completions"} {
-		t.Run(path, func(t *testing.T) {
-			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "text/event-stream")
-				_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello Undelivered\"}]}],\"usage\":{\"input_tokens\":10,\"output_tokens\":100}}}\n\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":\"invalid\"}\n\n"))
+	for _, source := range []struct{ protocol, path string }{
+		{"openai_responses", "/v1/responses"},
+		{"openai_responses", "/v1/chat/completions"},
+		{"openai_chat", "/v1/chat/completions"},
+	} {
+		for _, independent := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/%s/independent=%t", source.protocol, source.path, independent), func(t *testing.T) {
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					if source.protocol == "openai_chat" {
+						usage := `{"prompt_tokens":10,"completion_tokens":100}`
+						if independent {
+							usage = `{"prompt_tokens":10,"completion_tokens_details":{"reasoning_tokens":100}}`
+						}
+						_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":%s}\n\n", usage)
+						return
+					}
+					usage := `{"input_tokens":10,"output_tokens":100}`
+					if independent {
+						usage = `{"input_tokens":10,"output_tokens_details":{"reasoning_tokens":100}}`
+					}
+					_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello Undelivered\"}]}],\"usage\":%s}}\n\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":\"invalid\"}\n\n", usage)
+				})
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", source.protocol).Error)
+				request := `{"model":"gateway-offering","stream":true,"input":"Hello","max_output_tokens":16}`
+				if source.path == "/v1/chat/completions" {
+					request = `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`
+				}
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, source.path, request)
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				assert.Contains(t, response.Body.String(), "Hello")
+				assert.NotContains(t, response.Body.String(), "Undelivered")
+				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, "partial", record.Status)
+				assert.Equal(t, "estimated", record.UsageSource)
+				assert.Equal(t, int64(1), record.Usage.CompletionTokens)
+				assert.Equal(t, int64(21600), record.Receivable.Nanos)
+				attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, total)
+				assert.Equal(t, int64(100), attempts[0].Usage.CompletionTokens)
+				assert.Equal(t, int64(210000), attempts[0].Cost.Nanos)
 			})
-			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "openai_responses").Error)
-			request := `{"model":"gateway-offering","stream":true,"input":"Hello","max_output_tokens":16}`
-			if path == "/v1/chat/completions" {
-				request = `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`
-			}
-			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, request)
-			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
-			assert.Contains(t, response.Body.String(), "Hello")
-			assert.NotContains(t, response.Body.String(), "Undelivered")
-			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
-			require.NoError(t, err)
-			assert.Equal(t, "partial", record.Status)
-			assert.Equal(t, "estimated", record.UsageSource)
-			assert.Equal(t, int64(1), record.Usage.CompletionTokens)
-			assert.Equal(t, int64(21600), record.Receivable.Nanos)
-			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
-			require.NoError(t, err)
-			require.EqualValues(t, 1, total)
-			assert.Equal(t, int64(100), attempts[0].Usage.CompletionTokens)
-			assert.Equal(t, int64(210000), attempts[0].Cost.Nanos)
-		})
+		}
 	}
 }
 
