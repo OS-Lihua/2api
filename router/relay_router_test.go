@@ -48,6 +48,7 @@ import (
 	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
@@ -341,7 +342,7 @@ func dialResponsesGateway(t *testing.T, fixture textGatewayFixture) *websocket.C
 }
 
 func TestResponsesWSGatewayRechecksControlAuthorization(t *testing.T) {
-	for _, change := range []string{"token", "user", "offering"} {
+	for _, change := range []string{"token", "expired token", "user", "offering", "limited cancel"} {
 		t.Run(change, func(t *testing.T) {
 			var controls atomic.Int32
 			done := make(chan struct{})
@@ -369,6 +370,17 @@ func TestResponsesWSGatewayRechecksControlAuthorization(t *testing.T) {
 				}
 				_, _, _ = peer.ReadMessage()
 			})
+			if change == "limited cancel" {
+				enabled, duration, total, success, redis := setting.ModelRequestRateLimitEnabled, setting.ModelRequestRateLimitDurationMinutes, setting.ModelRequestRateLimitCount, setting.ModelRequestRateLimitSuccessCount, common.RedisEnabled
+				t.Cleanup(func() {
+					setting.ModelRequestRateLimitEnabled, setting.ModelRequestRateLimitDurationMinutes, setting.ModelRequestRateLimitCount, setting.ModelRequestRateLimitSuccessCount, common.RedisEnabled = enabled, duration, total, success, redis
+				})
+				setting.ModelRequestRateLimitEnabled = true
+				setting.ModelRequestRateLimitDurationMinutes = 1
+				setting.ModelRequestRateLimitCount = 1
+				setting.ModelRequestRateLimitSuccessCount = 1
+				common.RedisEnabled = false
+			}
 			client := dialResponsesGateway(t, fixture)
 			require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
 			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","input":"Hello","max_output_tokens":16}`)))
@@ -377,6 +389,8 @@ func TestResponsesWSGatewayRechecksControlAuthorization(t *testing.T) {
 				require.NoError(t, err)
 			}
 			switch change {
+			case "expired token":
+				require.NoError(t, model.DB.Model(fixture.token).Update("expired_time", int64(1)).Error)
 			case "token":
 				require.NoError(t, model.DB.Model(fixture.token).Update("status", common.TokenStatusDisabled).Error)
 			case "user":
@@ -387,14 +401,20 @@ func TestResponsesWSGatewayRechecksControlAuthorization(t *testing.T) {
 			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.cancel","response_id":"cancel-target"}`)))
 			_, reply, err := client.ReadMessage()
 			require.NoError(t, err)
-			assert.Equal(t, "error", ojson.GetBytes(reply, "type").String())
+			want := int32(0)
+			kind := "error"
+			if change == "limited cancel" {
+				want = 1
+				kind = "response.cancelled"
+			}
+			assert.Equal(t, kind, ojson.GetBytes(reply, "type").String())
 			require.NoError(t, client.Close())
 			select {
 			case <-done:
 			case <-time.After(5 * time.Second):
 				t.Fatal("Revoked control did not release Provider socket")
 			}
-			assert.Zero(t, controls.Load())
+			assert.Equal(t, want, controls.Load())
 			require.Eventually(t, func() bool {
 				records, _, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
 				if err != nil || len(records) != 1 {
@@ -408,8 +428,8 @@ func TestResponsesWSGatewayRechecksControlAuthorization(t *testing.T) {
 }
 
 func TestResponsesWSGatewayPreservesImageInputCategories(t *testing.T) {
-	for _, zero := range []bool{false, true} {
-		t.Run(fmt.Sprint("reported zero=", zero), func(t *testing.T) {
+	for _, scenario := range []string{"missing usage", "reported zero", "base only", "failed input"} {
+		t.Run(scenario, func(t *testing.T) {
 			var fixture textGatewayFixture
 			reserved := make(chan int64, 1)
 			fixture = newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -427,10 +447,17 @@ func TestResponsesWSGatewayPreservesImageInputCategories(t *testing.T) {
 				}
 				reserved <- billing.Reservation.Nanos
 				usage := ""
-				if zero {
+				kind, status, output := "response.completed", "completed", `[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi"}]}]`
+				switch scenario {
+				case "reported zero":
 					usage = `,"usage":{"input_tokens":85,"output_tokens":1,"input_tokens_details":{"image_tokens":0}}`
+				case "base only":
+					usage = `,"usage":{"input_tokens":85,"output_tokens":1}`
+				case "failed input":
+					kind, status, output = "response.failed", "failed", `[]`
+					usage = `,"usage":{"input_tokens":85,"output_tokens":0},"error":{"code":"server_error","type":"server_error"}`
 				}
-				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"image-result","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi"}]}]`+usage+`}}`))) {
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"`+kind+`","response":{"id":"image-result","status":"`+status+`","output":`+output+usage+`}}`))) {
 					return
 				}
 				_, _, _ = peer.ReadMessage()
@@ -454,19 +481,33 @@ func TestResponsesWSGatewayPreservesImageInputCategories(t *testing.T) {
 			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(body)))
 			_, reply, err := client.ReadMessage()
 			require.NoError(t, err)
-			require.Equal(t, "response.completed", ojson.GetBytes(reply, "type").String())
+			kind, status := "response.completed", "success"
+			if scenario == "failed input" {
+				kind, status = "response.failed", "failed"
+			}
+			require.Equal(t, kind, ojson.GetBytes(reply, "type").String())
 			assert.Equal(t, int64(76_500_000), <-reserved, "Known image category must be guaranteed before dispatch")
 			var records []model.GatewayRequest
 			require.Eventually(t, func() bool {
 				var err error
 				records, _, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
-				return err == nil && len(records) == 1 && records[0].Status == "success"
+				return err == nil && len(records) == 1 && records[0].Status == status
 			}, 5*time.Second, 10*time.Millisecond)
 			amount, cost := int64(76_500_000), int64(85_000_000)
 			images := 85
-			if zero {
-				amount, cost, images = 0, 0, 0
+			source := "estimated"
+			if scenario == "reported zero" {
+				amount, cost, images, source = 0, 0, 0, "upstream"
 			}
+			if scenario == "failed input" {
+				amount, images, source = 0, 0, "none"
+				attempts, _, err := model.ListGatewayAttempts(t.Context(), records[0].ID, 0, 10)
+				require.NoError(t, err)
+				require.Len(t, attempts, 1)
+				assert.EqualValues(t, 85, attempts[0].Usage.ImageInputTokens)
+				assert.Equal(t, "estimated", attempts[0].UsageSource)
+			}
+			assert.Equal(t, source, records[0].UsageSource)
 			assert.EqualValues(t, images, records[0].Usage.ImageInputTokens)
 			assert.Equal(t, amount, records[0].Receivable.Nanos)
 			assertTextGatewayLedger(t, records[0], cost)
@@ -476,42 +517,158 @@ func TestResponsesWSGatewayPreservesImageInputCategories(t *testing.T) {
 }
 
 func TestResponsesWSGatewayReservesKnownHistory(t *testing.T) {
-	var calls atomic.Int32
-	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
-		peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
-		if !assert.NoError(t, err) {
-			return
-		}
-		defer peer.Close()
-		for {
-			if _, _, err := peer.ReadMessage(); err != nil {
-				return
+	for _, scenario := range []string{"insufficient funds", "larger reported input", "missing usage", "unknown reference"} {
+		t.Run(scenario, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if !assert.NoError(t, err) {
+					return
+				}
+				defer peer.Close()
+				for {
+					if _, _, err := peer.ReadMessage(); err != nil {
+						return
+					}
+					index := calls.Add(1)
+					usage := `,"usage":{"input_tokens":0,"output_tokens":0}`
+					if scenario == "larger reported input" && index == 1 {
+						usage = `,"usage":{"input_tokens":20000,"output_tokens":1}`
+					}
+					if index == 2 && scenario == "missing usage" {
+						usage = ""
+					}
+					reply := fmt.Sprintf(`{"type":"response.completed","response":{"id":"context-%d","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi"}]}]%s}}`, index, usage)
+					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(reply))) {
+						return
+					}
+				}
+			})
+			client := dialResponsesGateway(t, fixture)
+			require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+			body := `{"type":"response.create","model":"gateway-alias","input":"` + strings.Repeat(" hello", 600) + `","max_output_tokens":1}`
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(body)))
+			_, _, err := client.ReadMessage()
+			require.NoError(t, err)
+			require.Eventually(t, func() bool {
+				records, _, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+				return err == nil && len(records) == 1 && records[0].Status == "success"
+			}, 5*time.Second, 10*time.Millisecond)
+			if scenario == "insufficient funds" || scenario == "larger reported input" {
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				remaining := int64(1_000_000)
+				if scenario == "larger reported input" {
+					remaining = 10_000_000
+				}
+				require.NoError(t, model.DB.Model(wallet).Update("balance_nanos", remaining).Error)
 			}
-			index := calls.Add(1)
-			reply := fmt.Sprintf(`{"type":"response.completed","response":{"id":"context-%d","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi"}]}],"usage":{"input_tokens":0,"output_tokens":0}}}`, index)
-			if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(reply))) {
-				return
+			previous := "context-1"
+			if scenario == "unknown reference" {
+				previous = "unknown-on-this-connection"
 			}
-		}
-	})
-	client := dialResponsesGateway(t, fixture)
-	body := `{"type":"response.create","model":"gateway-alias","input":"` + strings.Repeat("hello ", 600) + `","max_output_tokens":1}`
-	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(body)))
-	_, _, err := client.ReadMessage()
-	require.NoError(t, err)
-	require.Eventually(t, func() bool {
-		records, _, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
-		return err == nil && len(records) == 1 && records[0].Status == "success"
-	}, 5*time.Second, 10*time.Millisecond)
-	wallet, err := model.GetUserWallet(fixture.user.Id)
-	require.NoError(t, err)
-	require.NoError(t, model.DB.Model(wallet).Update("balance_nanos", 1_000_000).Error)
-	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","previous_response_id":"context-1","input":"Hi","max_output_tokens":1}`)))
-	_, reply, err := client.ReadMessage()
-	require.NoError(t, err)
-	assert.Equal(t, "error", ojson.GetBytes(reply, "type").String(), "Known 600-token history cannot be financed by a short-input reservation")
-	require.NoError(t, client.Close())
-	assert.Equal(t, int32(1), calls.Load())
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","previous_response_id":"`+previous+`","input":"Hi","max_output_tokens":1}`)))
+			_, reply, err := client.ReadMessage()
+			require.NoError(t, err)
+			if scenario == "missing usage" {
+				assert.Equal(t, "response.completed", ojson.GetBytes(reply, "type").String())
+				var records []model.GatewayRequest
+				require.Eventually(t, func() bool {
+					var err error
+					records, _, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+					return err == nil && len(records) == 2 && records[0].Status == "success" && records[1].Status == "success"
+				}, 5*time.Second, 10*time.Millisecond)
+				index := slices.IndexFunc(records, func(record model.GatewayRequest) bool { return record.Usage.PromptTokens == 602 })
+				require.NotEqual(t, -1, index, "Current input includes 600 known input tokens, one generated token and one new token")
+				assert.Equal(t, int64(1_087_200), records[index].Receivable.Nanos)
+				assertTextGatewayLedger(t, records[index], 604_000)
+				assert.Equal(t, int32(2), calls.Load())
+			} else {
+				assert.Equal(t, "error", ojson.GetBytes(reply, "type").String(), "History must be known and covered by the original reservation")
+				assert.Equal(t, int32(1), calls.Load())
+			}
+			require.NoError(t, client.Close())
+		})
+	}
+}
+
+func TestResponsesWSGatewayResolvesItemReferences(t *testing.T) {
+	for _, scenario := range []string{"insufficient funds", "missing usage", "unknown item", "conversation"} {
+		t.Run(scenario, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if !assert.NoError(t, err) {
+					return
+				}
+				defer peer.Close()
+				for {
+					_, raw, err := peer.ReadMessage()
+					if err != nil {
+						return
+					}
+					index := calls.Add(1)
+					text, usage := strings.Repeat(" hello", 600), `,"usage":{"input_tokens":0,"output_tokens":0}`
+					if index == 2 {
+						text, usage = "Hi", ""
+						if scenario == "missing usage" {
+							assert.Equal(t, "msg-A", ojson.GetBytes(raw, "input.0.id").String())
+						}
+					}
+					id := "msg-A"
+					if index == 2 {
+						id = "msg-B"
+					}
+					reply := fmt.Sprintf(`{"type":"response.completed","response":{"id":"ref-response-%d","status":"completed","output":[{"id":%q,"type":"message","role":"assistant","content":[{"type":"output_text","text":%q}]}]%s}}`, index, id, text, usage)
+					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(reply))) {
+						return
+					}
+				}
+			})
+			client := dialResponsesGateway(t, fixture)
+			require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","input":"Hi","max_output_tokens":1024}`)))
+			_, _, err := client.ReadMessage()
+			require.NoError(t, err)
+			require.Eventually(t, func() bool {
+				records, _, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+				return err == nil && len(records) == 1 && records[0].Status == "success"
+			}, 5*time.Second, 10*time.Millisecond)
+			if scenario == "insufficient funds" {
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				require.NoError(t, model.DB.Model(wallet).Update("balance_nanos", 1_000_000).Error)
+			}
+			id := "msg-A"
+			if scenario == "unknown item" {
+				id = "unknown-item"
+			}
+			body := `{"type":"response.create","model":"gateway-alias","input":[{"type":"item_reference","id":"` + id + `"}],"max_output_tokens":1}`
+			if scenario == "conversation" {
+				body = `{"type":"response.create","model":"gateway-alias","conversation":"external-conversation","input":"Hi","max_output_tokens":1}`
+			}
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(body)))
+			_, reply, err := client.ReadMessage()
+			require.NoError(t, err)
+			if scenario != "missing usage" {
+				assert.Equal(t, "error", ojson.GetBytes(reply, "type").String())
+				assert.Equal(t, int32(1), calls.Load())
+			} else {
+				assert.Equal(t, "response.completed", ojson.GetBytes(reply, "type").String())
+				var records []model.GatewayRequest
+				require.Eventually(t, func() bool {
+					var err error
+					records, _, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+					return err == nil && len(records) == 2 && records[0].Status == "success" && records[1].Status == "success"
+				}, 5*time.Second, 10*time.Millisecond)
+				index := slices.IndexFunc(records, func(record model.GatewayRequest) bool { return record.Usage.PromptTokens == 600 })
+				require.NotEqual(t, -1, index)
+				assert.Equal(t, int64(1_083_600), records[index].Receivable.Nanos)
+				assertTextGatewayLedger(t, records[index], 602_000)
+			}
+			require.NoError(t, client.Close())
+		})
+	}
 }
 
 func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {

@@ -92,9 +92,17 @@ type ResponsesWSCall struct {
 	create              responsesWSCreateRequest
 }
 
+// SetControlAuthenticator validates controls without admitting a generation.
+func (call *ResponsesWSCall) SetControlAuthenticator(runner ResponsesWSRequestRunner) {
+	call.state.controlRunner = runner
+}
+
 // EstimateInput resolves quantities known on this connection. Per-request
 // configuration is billed now but does not enter previous_response_id history.
 func (call *ResponsesWSCall) EstimateInput(c *gin.Context, info *relaycommon.RelayInfo, request *dto.OpenAIResponsesRequest, caps capability.Set) (*relaycommon.ResponsesInputFacts, error) {
+	if len(request.Conversation) > 0 && ojson.GetBytes(request.Conversation, "@this").Type != ojson.Null {
+		return nil, errors.New("Unknown conversation context; provide complete input")
+	}
 	meta := request.GetTokenCountMeta()
 	usage, err := service.CountRequestUsage(c, meta, info)
 	if err != nil {
@@ -106,19 +114,33 @@ func (call *ResponsesWSCall) EstimateInput(c *gin.Context, info *relaycommon.Rel
 			images++
 		}
 	}
+	var inherited []*dto.Usage
 	if request.PreviousResponseID != "" {
 		previous, ok := call.session.contexts[request.PreviousResponseID]
 		if !ok {
 			return nil, errors.New("Unknown response context; provide complete input")
 		}
-		total := usage.PromptTokens + previous.Context.PromptTokens
+		inherited = append(inherited, previous.Context)
+		images += previous.ImageCount
+	}
+	for _, item := range ojson.GetBytes(request.Input, "@this").Array() {
+		if item.Get("type").String() != "item_reference" {
+			continue
+		}
+		known := call.session.items[item.Get("id").String()]
+		if known == nil {
+			return nil, errors.New("Unknown response item; provide complete input")
+		}
+		inherited = append(inherited, known)
+	}
+	for _, previous := range inherited {
+		total := usage.PromptTokens + previous.PromptTokens
 		if total < usage.PromptTokens {
 			return nil, errors.New("Response context exceeds token limits")
 		}
 		usage.PromptTokens = total
-		usage.PromptTokensDetails.ImageTokens += previous.Context.PromptTokensDetails.ImageTokens
-		usage.PromptTokensDetails.AudioTokens += previous.Context.PromptTokensDetails.AudioTokens
-		images += previous.ImageCount
+		usage.PromptTokensDetails.ImageTokens += previous.PromptTokensDetails.ImageTokens
+		usage.PromptTokensDetails.AudioTokens += previous.PromptTokensDetails.AudioTokens
 	}
 	if images > 0 && (!slices.Contains(caps.InputModalities, capability.Image) || caps.Limits.MaxImages != nil && int64(images) > *caps.Limits.MaxImages) {
 		return nil, service.ErrGatewayCapability
@@ -200,6 +222,13 @@ func (call *ResponsesWSCall) Exchange(c *gin.Context, info *relaycommon.RelayInf
 			call.state.closeCode = websocket.CloseMessageTooBig
 		} else {
 			contextUsage := service.GatewayUsageSnapshot(input.Context)
+			if usage != nil {
+				configuration := max(0, input.Usage.PromptTokens-input.Context.PromptTokens)
+				contextUsage.PromptTokens = max(contextUsage.PromptTokens, max(0, usage.PromptTokens-configuration))
+				contextUsage.PromptTokensDetails.ImageTokens = max(contextUsage.PromptTokensDetails.ImageTokens, usage.PromptTokensDetails.ImageTokens)
+				contextUsage.PromptTokensDetails.AudioTokens = max(contextUsage.PromptTokensDetails.AudioTokens, usage.PromptTokensDetails.AudioTokens)
+				contextUsage.PromptTokensDetails.TextTokens = contextUsage.PromptTokens - contextUsage.PromptTokensDetails.ImageTokens - contextUsage.PromptTokensDetails.AudioTokens
+			}
 			generated := 0
 			if info.ResponseFacts != nil {
 				generated = tokenkit.Count(info.TokenizerModelName(), info.ResponseFacts.GeneratedText)
@@ -217,6 +246,20 @@ func (call *ResponsesWSCall) Exchange(c *gin.Context, info *relaycommon.RelayInf
 					s.contextBytes += len(id) + 256
 				}
 				s.contexts[id] = relaycommon.ResponsesInputFacts{Context: contextUsage, ImageCount: input.ImageCount}
+				for itemID, item := range info.ResponsesItemUsage {
+					if s.items[itemID] != nil {
+						continue
+					}
+					if s.contextBytes+len(itemID)+128 > maximum<<20 {
+						call.state.closeCode = websocket.CloseMessageTooBig
+						break
+					}
+					if s.items == nil {
+						s.items = map[string]*dto.Usage{}
+					}
+					s.contextBytes += len(itemID) + 128
+					s.items[itemID] = service.GatewayUsageSnapshot(item)
+				}
 			} else {
 				call.state.closeCode = websocket.CloseMessageTooBig
 			}
@@ -294,6 +337,7 @@ type responsesWSControl struct {
 // Only the request worker reads or changes billing state. Socket readers pass
 // bounded messages to it; cancellation never performs an independent refund.
 type responsesWSCallState struct {
+	controlRunner     ResponsesWSRequestRunner
 	authorizeControl  func(*gin.Context) *types.NewAPIError
 	inbox             chan responsesWSMessage
 	controls          chan responsesWSControl
@@ -337,6 +381,7 @@ type responsesWSSession struct {
 
 	// These fields belong to the serial request worker and describe the actual
 	// established connection. Per-request token/user data is never stored here.
+	items           map[string]*dto.Usage
 	contexts        map[string]relaycommon.ResponsesInputFacts
 	contextBytes    int
 	lastResponseID  string
@@ -632,7 +677,11 @@ func (s *responsesWSSession) authorizeControl(state *responsesWSCallState, creat
 	request.Body = io.NopCloser(bytes.NewReader(create.Body))
 	request.ContentLength = int64(len(create.Body))
 	request.Header.Set("Content-Type", "application/json")
-	return s.runner(request, common.NewRequestId(), func(c *gin.Context) *types.NewAPIError {
+	runner := state.controlRunner
+	if runner == nil {
+		runner = s.runner
+	}
+	return runner(request, common.NewRequestId(), func(c *gin.Context) *types.NewAPIError {
 		if state.authorizeControl != nil {
 			return state.authorizeControl(c)
 		}

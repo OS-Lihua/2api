@@ -6,6 +6,7 @@ import (
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
@@ -30,6 +31,7 @@ type ResponsesUsageAccumulator struct {
 	terminalOutputSeen bool
 	delivered          *ResponsesUsageAccumulator
 	imageCounter       relaycommon.ImageGenerationCallCounter
+	itemBytes          int
 	imageInputReported bool
 	imageCommitted     bool
 	started            bool
@@ -90,6 +92,7 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 	case "response.completed", "response.done", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
 		if event.Response != nil && !a.terminalOutputSeen {
 			for i, output := range event.Response.Output {
+				a.rememberOutputItem(&output)
 				state := a.outputState(output.ID, &i)
 				if output.Type == dto.BuildInCallFunctionCall || output.Type == "custom_tool_call" {
 					a.observeToolOutput(&output, &i)
@@ -129,6 +132,7 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 		if event.Item == nil {
 			return
 		}
+		a.rememberOutputItem(event.Item)
 		a.observeToolOutput(event.Item, event.OutputIndex)
 		switch event.Item.Type {
 		case dto.BuildInCallWebSearchCall, dto.BuildInCallFileSearchCall, dto.BuildInCallFunctionCall:
@@ -139,6 +143,47 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 			}
 		}
 	}
+}
+
+func (a *ResponsesUsageAccumulator) rememberOutputItem(item *dto.ResponsesOutput) {
+	if a.info.ResponsesInputFacts == nil || item == nil || item.ID == "" {
+		return
+	}
+	if item.Type != "message" && item.Type != "function_call" && item.Type != "custom_tool_call" {
+		return
+	}
+	for _, part := range item.Content {
+		if part.Type != "output_text" && part.Type != "input_text" {
+			return
+		}
+	}
+	body, err := common.Marshal([]dto.ResponsesOutput{*item})
+	if err != nil {
+		return
+	}
+	request := dto.OpenAIResponsesRequest{Input: body}
+	meta := request.GetTokenCountMeta()
+	if len(meta.Files) > 0 {
+		return
+	}
+	tokens := tokenkit.Count(a.info.TokenizerModelName(), meta.CombineText)
+	if old := a.info.ResponsesItemUsage[item.ID]; old != nil && old.PromptTokens >= tokens {
+		return
+	}
+	maximum := constant.MaxRequestBodyMB
+	if maximum <= 0 {
+		maximum = 128
+	}
+	if a.info.ResponsesItemUsage[item.ID] == nil {
+		if a.itemBytes+len(item.ID)+128 > maximum<<20 {
+			return
+		}
+		a.itemBytes += len(item.ID) + 128
+	}
+	if a.info.ResponsesItemUsage == nil {
+		a.info.ResponsesItemUsage = map[string]*dto.Usage{}
+	}
+	a.info.ResponsesItemUsage[item.ID] = &dto.Usage{PromptTokens: tokens, TotalTokens: tokens, PromptTokensDetails: dto.InputTokenDetails{TextTokens: tokens}}
 }
 
 func (a *ResponsesUsageAccumulator) outputState(id string, index *int) *responseOutputState {
@@ -248,8 +293,11 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 	if a.usage.PromptTokens == 0 && billsPrompt && (facts == nil || !facts.PromptTokensReported) {
 		a.usage.PromptTokens = a.info.GetEstimatePromptTokens()
 	}
-	if input := a.info.ResponsesInputFacts; input != nil && billsPrompt && !a.imageInputReported && (facts == nil || !facts.PromptTokensReported || a.usage.PromptTokens > 0) {
+	if input := a.info.ResponsesInputFacts; input != nil && (billsPrompt || a.usage.PromptTokens > 0) && !a.imageInputReported && (facts == nil || !facts.PromptTokensReported || a.usage.PromptTokens > 0) {
 		a.usage.PromptTokensDetails.ImageTokens = min(a.usage.PromptTokens, input.Usage.PromptTokensDetails.ImageTokens)
+		if facts != nil && a.usage.PromptTokensDetails.ImageTokens > 0 {
+			facts.UsageEstimated = true
+		}
 	}
 	a.usage.TotalTokens = a.usage.PromptTokens + a.usage.CompletionTokens
 	if a.usage.BillingUsage != nil {

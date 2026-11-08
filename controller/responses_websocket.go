@@ -129,7 +129,12 @@ func ResponsesWebSocket(c *gin.Context) {
 	}
 	defer ws.Close()
 
-	if apiError := relay.ResponsesWebSocketHelper(c, ws, runner, responsesWSGateway); apiError != nil {
+	authenticator := newResponsesWSRequestRunner(c, true)
+	gateway := func(ctx *gin.Context, call *relay.ResponsesWSCall) (bool, *types.NewAPIError) {
+		call.SetControlAuthenticator(authenticator)
+		return responsesWSGateway(ctx, call)
+	}
+	if apiError := relay.ResponsesWebSocketHelper(c, ws, runner, gateway); apiError != nil {
 		logger.LogError(c, common.LogText("responses websocket relay error: %s", common.LocalLogPreview(apiError.Error())))
 		apiError.SetMessage(common.MessageWithRequestId(apiError.Error(), requestID))
 		helper.WssError(c, ws, apiError.ToOpenAIError(common.UpstreamAddresses(c)...))

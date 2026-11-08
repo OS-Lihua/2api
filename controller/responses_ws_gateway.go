@@ -448,7 +448,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	if usage != nil {
 		observedUsage = usage
 		attempt.Usage, attempt.UsageSource = service.GatewayRecordUsage(usage), "estimated"
-		if info.ResponseFacts.UsageReported {
+		if info.ResponseFacts.UsageReported && !info.ResponseFacts.UsageEstimated {
 			attempt.UsageSource = "upstream"
 		}
 		cost, converted, trace, priceErr := service.GatewayPrice(purchase, usage, purchaseInput, attemptStart, decimal.NewFromInt(1), purchaseFX)
