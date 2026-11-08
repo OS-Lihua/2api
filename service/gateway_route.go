@@ -338,6 +338,7 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 				return nil, ErrGatewayUnavailable
 			}
 			if admission.ChannelID == 0 {
+				lastStage = max(lastStage, 6)
 				for _, selection := range ranked {
 					reject(selection.Channel.ID, "circuit_open")
 				}

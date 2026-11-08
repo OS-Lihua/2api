@@ -908,37 +908,61 @@ func TestTextGatewayRouteRejectsUnsafeDefaultOutputBeforeSending(t *testing.T) {
 }
 
 func TestTextGatewayRouteOccupiedProbeContinuesToNextTier(t *testing.T) {
-	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
-		t.Error("occupied probe must not be sent")
-		w.WriteHeader(503)
-	})
-	second := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"Lower tier"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
-	})
-	var unified model.Model
-	require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
-	unified.Id = 0
-	unified.ModelName = "gpt-5a-probe-secondary"
-	require.NoError(t, model.DB.Create(&unified).Error)
-	require.NoError(t, model.DB.Model(second).Update("model_id", unified.Id).Error)
-	fixture.offering.Members = append(fixture.offering.Members, model.ModelOfferingMember{ModelID: unified.Id, Tier: 2})
-	require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
-	for index := range 5 {
-		_, err := service.ChannelHealth.Record(t.Context(), channelhealth.Sample{AttemptID: fmt.Sprint("occupied-", index), ChannelID: fixture.channel.ID, ProviderFailure: true})
-		require.NoError(t, err)
+	for _, test := range []struct {
+		name          string
+		busyLowerTier bool
+		status        int
+	}{
+		{"available lower tier", false, http.StatusOK},
+		{"busy lower tier after capability rejection", true, http.StatusServiceUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				t.Error("occupied or incapable candidate must not be sent")
+				w.WriteHeader(503)
+			})
+			second := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"Lower tier"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+			})
+			var unified model.Model
+			require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+			unified.Id = 0
+			unified.ModelName = "gpt-5a-probe-secondary"
+			require.NoError(t, model.DB.Create(&unified).Error)
+			require.NoError(t, model.DB.Model(second).Update("model_id", unified.Id).Error)
+			fixture.offering.Members = append(fixture.offering.Members, model.ModelOfferingMember{ModelID: unified.Id, Tier: 2})
+			require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+			occupiedID := fixture.channel.ID
+			if test.busyLowerTier {
+				occupiedID = second.ID
+				unified.Capabilities.InputModalities = []capability.Modality{capability.Image}
+				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", unified.Capabilities).Error)
+			}
+			for index := range 5 {
+				_, err := service.ChannelHealth.Record(t.Context(), channelhealth.Sample{AttemptID: fmt.Sprint("occupied-", index), ChannelID: occupiedID, ProviderFailure: true})
+				require.NoError(t, err)
+			}
+			lease, err := service.ChannelHealth.Acquire(t.Context(), []int{occupiedID})
+			require.NoError(t, err)
+			require.NotEmpty(t, lease.Lease)
+			defer service.ChannelHealth.Release(t.Context(), lease)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			require.Equal(t, test.status, response.Code, response.Body.String())
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+			require.NoError(t, err)
+			if test.busyLowerTier {
+				assert.Zero(t, total)
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
+				return
+			}
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, second.ID, attempts[0].ChannelID)
+			assert.Equal(t, 2, attempts[0].MemberTier)
+		})
 	}
-	lease, err := service.ChannelHealth.Acquire(t.Context(), []int{fixture.channel.ID})
-	require.NoError(t, err)
-	require.NotEmpty(t, lease.Lease)
-	defer service.ChannelHealth.Release(t.Context(), lease)
-	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
-	require.Equal(t, 200, response.Code, response.Body.String())
-	attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
-	require.NoError(t, err)
-	require.EqualValues(t, 1, total)
-	assert.Equal(t, second.ID, attempts[0].ChannelID)
-	assert.Equal(t, 2, attempts[0].MemberTier)
 }
 
 func TestTextGatewayRouteVertexOAuthWaitsForReservationAndBudget(t *testing.T) {
