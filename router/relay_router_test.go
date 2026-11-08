@@ -4635,9 +4635,12 @@ func TestTextGatewayOllamaRetainsMediaAndToolHistory(t *testing.T) {
 	encodedImage := base64.StdEncoding.EncodeToString(picture.Bytes())
 	for _, test := range []struct {
 		name, messages, expected string
+		rejected                 bool
 	}{
-		{"PNG", fmt.Sprintf(`[{"role":"user","content":[{"type":"text","text":"Hello"},{"type":"image_url","image_url":{"url":"data:image/png;base64,%s"}}]}]`, encodedImage), fmt.Sprintf(`[{"role":"user","content":"Hello","images":[%q]}]`, encodedImage)},
-		{"tool history", `[{"role":"user","content":"Weather"},{"role":"assistant","content":"","reasoning_content":"Plan","tool_calls":[{"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{\"city\":\"Paris\"}"}}]},{"role":"tool","tool_call_id":"call_weather","content":"Sunny"},{"role":"user","content":"Summarize"}]`, `[{"role":"user","content":"Weather"},{"role":"assistant","thinking":"Plan","tool_calls":[{"id":"call_weather","function":{"name":"weather","arguments":{"city":"Paris"}}}]},{"role":"tool","content":"Sunny","tool_call_id":"call_weather","tool_name":"weather"},{"role":"user","content":"Summarize"}]`},
+		{name: "PNG", messages: fmt.Sprintf(`[{"role":"user","content":[{"type":"text","text":"Hello"},{"type":"image_url","image_url":{"url":"data:image/png;base64,%s"}}]}]`, encodedImage), expected: fmt.Sprintf(`[{"role":"user","content":"Hello","images":[%q]}]`, encodedImage)},
+		{name: "tool history", messages: `[{"role":"user","content":"Weather"},{"role":"assistant","content":"","reasoning_content":"Plan","tool_calls":[{"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{\"city\":\"Paris\"}"}}]},{"role":"tool","tool_call_id":"call_weather","content":"Sunny"},{"role":"user","content":"Summarize"}]`, expected: `[{"role":"user","content":"Weather"},{"role":"assistant","thinking":"Plan","tool_calls":[{"id":"call_weather","function":{"name":"weather","arguments":{"city":"Paris"}}}]},{"role":"tool","content":"Sunny","tool_call_id":"call_weather","tool_name":"weather"},{"role":"user","content":"Summarize"}]`},
+		{name: "tool argument whitespace and object order", messages: `[{"role":"user","content":"Weather"},{"role":"assistant","content":"","tool_calls":[{"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{\"z\": [1, {\"label\": \"Paris\"}], \"city\": \"Paris\"}"}}]},{"role":"tool","tool_call_id":"call_weather","content":"Sunny"},{"role":"user","content":"Summarize"}]`, expected: `[{"role":"user","content":"Weather"},{"role":"assistant","tool_calls":[{"id":"call_weather","function":{"name":"weather","arguments":{"city":"Paris","z":[1,{"label":"Paris"}]}}}]},{"role":"tool","content":"Sunny","tool_call_id":"call_weather","tool_name":"weather"},{"role":"user","content":"Summarize"}]`},
+		{name: "changed numeric tool argument remains a loss", messages: `[{"role":"user","content":"Lookup"},{"role":"assistant","content":"","tool_calls":[{"id":"call_lookup","type":"function","function":{"name":"lookup","arguments":"{\"id\":9007199254740993}"}}]},{"role":"tool","tool_call_id":"call_lookup","content":"Found"},{"role":"user","content":"Summarize"}]`, rejected: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var calls atomic.Int32
@@ -4658,6 +4661,11 @@ func TestTextGatewayOllamaRetainsMediaAndToolHistory(t *testing.T) {
 			require.NoError(t, model.DB.Model(&unified).Update("capabilities", unified.Capabilities).Error)
 			body := fmt.Sprintf(`{"model":"gateway-alias","messages":%s,"max_tokens":16}`, test.messages)
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", body)
+			if test.rejected {
+				assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+				assert.Zero(t, calls.Load())
+				return
+			}
 			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 			assert.EqualValues(t, 1, calls.Load())
 			assert.Empty(t, response.Header().Get("X-Gateway-Conversion-Loss"))

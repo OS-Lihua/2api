@@ -445,14 +445,18 @@ func EstimateMissingChatUsage(c *gin.Context, info *relaycommon.RelayInfo, usage
 	if facts == nil || facts.UsageReported {
 		return
 	}
-	estimated := service.ResponseText2Usage(c, facts.GeneratedText, info.TokenizerModelName(), info.GetEstimatePromptTokens())
+	common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
 	if !facts.PromptTokensReported {
-		usage.PromptTokens = estimated.PromptTokens
+		usage.PromptTokens = info.GetEstimatePromptTokens()
 	}
 	if !facts.CompletionTokensReported {
-		usage.CompletionTokens = estimated.CompletionTokens
-		if facts.GeneratedOutputTokens != nil {
+		switch {
+		case facts.SourceOutputTokens != nil:
+			usage.CompletionTokens = *facts.SourceOutputTokens
+		case facts.GeneratedOutputTokens != nil:
 			usage.CompletionTokens = *facts.GeneratedOutputTokens
+		default:
+			usage.CompletionTokens = service.ResponseText2Usage(c, facts.GeneratedText, info.TokenizerModelName(), info.GetEstimatePromptTokens()).CompletionTokens
 		}
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
@@ -476,10 +480,6 @@ func WriteChatResponse(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	}
 	facts.GeneratedText = facts.SourceGeneratedText
 	EstimateMissingChatUsage(c, info, &response.Usage)
-	if !facts.CompletionTokensReported && facts.SourceOutputTokens != nil {
-		response.Usage.CompletionTokens = *facts.SourceOutputTokens
-		response.Usage.TotalTokens = response.Usage.PromptTokens + response.Usage.CompletionTokens
-	}
 	encoded, err := common.Marshal(response)
 	if err != nil {
 		return &response.Usage, types.NewError(err, types.ErrorCodeBadResponseBody)

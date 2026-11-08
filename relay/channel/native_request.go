@@ -234,9 +234,25 @@ func nativeChatMessageSemantics(messages []dto.Message) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	var value any
-	if err := common.Unmarshal(body, &value); err != nil {
+	var value []map[string]any
+	if err := common.UnmarshalUseNumber(body, &value); err != nil {
 		return nil, err
+	}
+	for _, message := range value {
+		calls, _ := message["tool_calls"].([]any)
+		for _, call := range calls {
+			tool, _ := call.(map[string]any)
+			function, _ := tool["function"].(map[string]any)
+			arguments, ok := function["arguments"].(string)
+			if !ok {
+				continue
+			}
+			// Compare valid argument JSON by value without changing the request.
+			var decoded any
+			if common.UnmarshalUseNumber([]byte(arguments), &decoded) == nil {
+				function["arguments"] = decoded
+			}
+		}
 	}
 	return value, nil
 }
