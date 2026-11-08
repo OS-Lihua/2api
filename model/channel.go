@@ -415,10 +415,11 @@ func SearchProviders(keyword string, group string, model string, idSort bool, so
 // ProviderEdit keeps the current Provider locked until its configuration and
 // abilities commit together. Callers must defer Rollback after beginning an edit.
 type ProviderEdit struct {
-	Provider *Provider
-	tx       *gorm.DB
-	id       int
-	key      string
+	Provider  *Provider
+	Authorize func() bool `json:"-"`
+	tx        *gorm.DB
+	id        int
+	key       string
 }
 
 // Credential predicates and Provider writes must stay out of SQL logs even
@@ -617,6 +618,9 @@ func (edit *ProviderEdit) Commit(channel *Provider) error {
 	if err := channel.UpdateAbilities(edit.tx); err != nil {
 		return err
 	}
+	if edit.Authorize != nil && !edit.Authorize() {
+		return ErrProviderMutationForbidden
+	}
 	return edit.tx.Commit().Error
 }
 
@@ -763,7 +767,10 @@ func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
 	return false
 }
 
-var ErrProviderStatusConflict = errors.New("provider changed during status update")
+var (
+	ErrProviderStatusConflict    = errors.New("provider changed during status update")
+	ErrProviderMutationForbidden = errors.New("Unauthorized, insufficient privileges")
+)
 
 // ProviderStatusChange keeps the failed credential identity separate from the
 // scope of the transition. KeyIndex also pins a credential whose value is empty.
@@ -773,6 +780,7 @@ type ProviderStatusChange struct {
 	UsingKey     string
 	KeyIndex     *int
 	ProviderWide bool
+	Authorize    func() bool `json:"-"`
 }
 
 func UpdateProviderStatus(channelId int, usingKey string, status int, reason string, selectedIndex ...int) bool {
@@ -806,7 +814,14 @@ func ApplyProviderStatus(channelId int, change ProviderStatusChange) (bool, erro
 
 	changed := false
 	var beforeProvider, committedProvider *Provider
-	err := providerCredentialSession().Transaction(func(tx *gorm.DB) error {
+	err := providerCredentialSession().Transaction(func(tx *gorm.DB) (err error) {
+		// Validate current caller permissions after any row/ability lock wait,
+		// before committing or publishing an otherwise successful transition.
+		defer func() {
+			if err == nil && change.Authorize != nil && !change.Authorize() {
+				err = ErrProviderMutationForbidden
+			}
+		}()
 		// Keep the stored JSON, including NULL and legacy shapes, for the CAS.
 		// Comparing the decoded/re-encoded ProviderInfo would reject legacy rows.
 		var snapshot struct {
@@ -883,35 +898,29 @@ func ApplyProviderStatus(channelId int, change ProviderStatusChange) (bool, erro
 	return changed, nil
 }
 
-func EnableProviderByTag(tag string) error {
-	err := DB.Model(&Provider{}).Where("tag = ?", tag).Update("status", common.ChannelStatusEnabled).Error
-	if err != nil {
-		return err
-	}
-	err = UpdateAbilityStatusByTag(tag, true)
-	return err
+func EnableProviderByTag(tag string, authorize ...func() bool) error {
+	return updateProviderStatusByTag(tag, common.ChannelStatusEnabled, authorize)
 }
 
-func DisableProviderByTag(tag string) error {
-	// Explicit tag-level disable also cancels automatic restoration for
-	// channels that were already disabled because all keys were unavailable.
-	var channels []Provider
-	if err := DB.Where("tag = ?", tag).Find(&channels).Error; err != nil {
+func DisableProviderByTag(tag string, authorize ...func() bool) error {
+	return updateProviderStatusByTag(tag, common.ChannelStatusManuallyDisabled, authorize)
+}
+
+func updateProviderStatusByTag(tag string, status int, authorize []func() bool) error {
+	var ids []int
+	if err := DB.Model(&Provider{}).Where(`"tag" = ?`, tag).Order("id").Pluck("id", &ids).Error; err != nil {
 		return err
 	}
-	for _, channel := range channels {
-		if channel.ProviderInfo.IsMultiKey && channel.GetOtherInfo()["status_reason"] == ProviderStatusReasonAllKeysDisabled {
-			if !UpdateProviderStatus(channel.Id, "", common.ChannelStatusManuallyDisabled, "manual tag operation") {
-				return fmt.Errorf("failed to disable channel #%d by tag", channel.Id)
-			}
+	change := ProviderStatusChange{Status: status, Reason: "manual tag operation"}
+	if len(authorize) > 0 {
+		change.Authorize = authorize[0]
+	}
+	for _, id := range ids {
+		if _, err := ApplyProviderStatus(id, change); err != nil {
+			return err
 		}
 	}
-	err := DB.Model(&Provider{}).Where("tag = ?", tag).Update("status", common.ChannelStatusManuallyDisabled).Error
-	if err != nil {
-		return err
-	}
-	err = UpdateAbilityStatusByTag(tag, false)
-	return err
+	return nil
 }
 
 func EditProviderByTag(tag string, newTag *string, modelMapping *string, models *string, group *string, priority *int64, weight *uint, paramOverride *string, headerOverride *string) error {

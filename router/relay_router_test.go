@@ -1026,87 +1026,112 @@ func TestTextGatewayManagementEditPreservesCommittedKeyDisable(t *testing.T) {
 }
 
 func TestProviderSensitiveEditRechecksPermissionAfterLock(t *testing.T) {
-	for _, operation := range []string{"replace", "delete", "name", "disable"} {
-		t.Run(operation, func(t *testing.T) {
-			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("unexpected upstream call") })
-			provider, err := model.GetProviderById(fixture.channel.ProviderID, true)
-			require.NoError(t, err)
-			provider.Key = "permission-first-key\npermission-spare-key"
-			provider.ProviderInfo = model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}
-			require.NoError(t, model.DB.Model(provider).Select("key", "channel_info").Updates(provider).Error)
-			admin := &model.User{Username: "locked-sensitive-editor", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "lockedit"}
-			require.NoError(t, model.DB.Create(admin).Error)
-			permission := authz.ChannelSensitiveWrite
-			if operation == "name" {
-				permission = authz.ChannelWrite
-			} else if operation == "disable" {
-				permission = authz.ChannelOperate
-			}
-			require.NoError(t, authz.SetUserPermissions(admin.Id, authz.PermissionsMap{permission.Resource: {permission.Action: true}}))
-			require.True(t, authz.Can(admin.Id, admin.Role, permission))
-			pat := createWalletTestAccessToken(t, admin.Id, "channel:read", "channel:write", "channel:sensitive_write", "channel:operate")
-			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-			defer cancel()
-			lock := model.DB.WithContext(ctx).Begin()
-			require.NoError(t, lock.Error)
-			defer lock.Rollback()
-			var lockedID, lockerPID int
-			require.NoError(t, lock.Raw(`SELECT "id" FROM "providers" WHERE "id" = ? FOR UPDATE`, provider.Id).Scan(&lockedID).Error)
-			require.NoError(t, lock.Raw("SELECT pg_backend_pid()").Scan(&lockerPID).Error)
-			done := make(chan *httptest.ResponseRecorder, 1)
-			go func() {
-				method, path, body := http.MethodPatch, fmt.Sprintf("/api/admin/v1/providers/%d", provider.Id), `{"key":"permission-replacement-key\npermission-spare-key","key_mode":"replace"}`
-				if operation == "delete" {
-					method, path, body = http.MethodDelete, fmt.Sprintf("/api/admin/v1/providers/%d/keys/0", provider.Id), ""
-				} else if operation == "name" {
-					body = `{"name":"Revoked edited Provider"}`
-				} else if operation == "disable" {
-					method, path, body = http.MethodPost, fmt.Sprintf("/api/admin/v1/providers/%d/keys/0/disable", provider.Id), ""
+	for _, operation := range []string{"replace", "delete", "name", "disable", "provider", "batch", "tag"} {
+		for _, lockTable := range []string{"providers", "abilities"} {
+			t.Run(operation+"/"+lockTable, func(t *testing.T) {
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("unexpected upstream call") })
+				provider, err := model.GetProviderById(fixture.channel.ProviderID, true)
+				require.NoError(t, err)
+				provider.Key = "permission-first-key\npermission-spare-key"
+				provider.ProviderInfo = model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}
+				provider.Tag = common.GetPointer("permission-lock-tag")
+				require.NoError(t, model.DB.Model(provider).Select("key", "channel_info", "tag").Updates(provider).Error)
+				require.NoError(t, model.DB.Create(&model.Ability{ChannelId: provider.Id, Group: "default", Model: "permission-lock-model", Enabled: true}).Error)
+				var following *model.Provider
+				if operation == "batch" {
+					following = &model.Provider{Name: "Following Provider", Key: "following-permission-key", Status: common.ChannelStatusEnabled}
+					require.NoError(t, model.DB.Create(following).Error)
 				}
-				request := httptest.NewRequest(method, path, strings.NewReader(body)).WithContext(ctx)
-				request.Header.Set("Authorization", "Bearer "+pat)
-				request.Header.Set("Content-Type", "application/json")
-				response := httptest.NewRecorder()
-				fixture.engine.ServeHTTP(response, request)
-				done <- response
-			}()
-			var waitingPID int
-			for waitingPID == 0 && ctx.Err() == nil {
+				admin := &model.User{Username: "locked-sensitive-editor", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "lockedit"}
+				require.NoError(t, model.DB.Create(admin).Error)
+				permission := authz.ChannelSensitiveWrite
+				if operation == "name" {
+					permission = authz.ChannelWrite
+				} else if operation == "disable" || operation == "provider" || operation == "batch" || operation == "tag" {
+					permission = authz.ChannelOperate
+				}
+				require.NoError(t, authz.SetUserPermissions(admin.Id, authz.PermissionsMap{permission.Resource: {permission.Action: true}}))
+				require.True(t, authz.Can(admin.Id, admin.Role, permission))
+				pat := createWalletTestAccessToken(t, admin.Id, "channel:read", "channel:write", "channel:sensitive_write", "channel:operate")
+				ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+				defer cancel()
+				lock := model.DB.WithContext(ctx).Begin()
+				require.NoError(t, lock.Error)
+				defer lock.Rollback()
+				var lockedID, lockerPID int
+				if lockTable == "providers" {
+					require.NoError(t, lock.Raw(`SELECT "id" FROM "providers" WHERE "id" = ? FOR UPDATE`, provider.Id).Scan(&lockedID).Error)
+				} else {
+					require.NoError(t, lock.Raw(`SELECT "channel_id" FROM "abilities" WHERE "channel_id" = ? FOR UPDATE`, provider.Id).Scan(&lockedID).Error)
+				}
+				require.NoError(t, lock.Raw("SELECT pg_backend_pid()").Scan(&lockerPID).Error)
+				done := make(chan *httptest.ResponseRecorder, 1)
+				go func() {
+					method, path, body := http.MethodPatch, fmt.Sprintf("/api/admin/v1/providers/%d", provider.Id), `{"key":"permission-replacement-key\npermission-spare-key","key_mode":"replace"}`
+					if operation == "delete" {
+						method, path, body = http.MethodDelete, fmt.Sprintf("/api/admin/v1/providers/%d/keys/0", provider.Id), ""
+					} else if operation == "name" {
+						body = `{"name":"Revoked edited Provider"}`
+					} else if operation == "disable" {
+						method, path, body = http.MethodPost, fmt.Sprintf("/api/admin/v1/providers/%d/keys/0/disable", provider.Id), ""
+					} else if operation == "provider" {
+						method, path, body = http.MethodPost, fmt.Sprintf("/api/admin/v1/providers/%d/disable", provider.Id), ""
+					} else if operation == "batch" {
+						method, path, body = http.MethodPost, "/api/channel/status/batch", fmt.Sprintf(`{"ids":[%d,%d],"status":2}`, provider.Id, following.Id)
+					} else if operation == "tag" {
+						method, path, body = http.MethodPost, "/api/channel/tag/disabled", `{"tag":"permission-lock-tag"}`
+					}
+					request := httptest.NewRequest(method, path, strings.NewReader(body)).WithContext(ctx)
+					request.Header.Set("Authorization", "Bearer "+pat)
+					request.Header.Set("Content-Type", "application/json")
+					response := httptest.NewRecorder()
+					fixture.engine.ServeHTTP(response, request)
+					done <- response
+				}()
+				var waitingPID int
+				for waitingPID == 0 && ctx.Err() == nil {
+					select {
+					case response := <-done:
+						t.Fatalf("sensitive request completed before locking: HTTP %d %s", response.Code, response.Body.String())
+					default:
+					}
+					require.NoError(t, model.DB.WithContext(ctx).Raw(`SELECT COALESCE(min(pid), 0) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND ? = ANY(pg_blocking_pids(pid))`, lockerPID).Scan(&waitingPID).Error)
+				}
+				require.NotZero(t, waitingPID)
+				require.NoError(t, authz.SetUserPermissions(admin.Id, authz.PermissionsMap{permission.Resource: {permission.Action: false}}))
+				require.NoError(t, authz.ReloadPolicy())
+				require.False(t, authz.Can(admin.Id, admin.Role, permission))
+				require.NoError(t, lock.Commit().Error)
 				select {
 				case response := <-done:
-					t.Fatalf("sensitive request completed before locking: HTTP %d %s", response.Code, response.Body.String())
-				default:
+					assert.Contains(t, response.Body.String(), `"success":false`, "revoked permission must prevent the queued credential mutation")
+				case <-ctx.Done():
+					t.Fatal("sensitive request did not complete")
 				}
-				require.NoError(t, model.DB.WithContext(ctx).Raw(`SELECT COALESCE(min(pid), 0) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND ? = ANY(pg_blocking_pids(pid))`, lockerPID).Scan(&waitingPID).Error)
-			}
-			require.NotZero(t, waitingPID)
-			require.NoError(t, authz.SetUserPermissions(admin.Id, authz.PermissionsMap{permission.Resource: {permission.Action: false}}))
-			require.NoError(t, authz.ReloadPolicy())
-			require.False(t, authz.Can(admin.Id, admin.Role, permission))
-			require.NoError(t, lock.Commit().Error)
-			select {
-			case response := <-done:
-				assert.Contains(t, response.Body.String(), `"success":false`, "revoked permission must prevent the queued credential mutation")
-			case <-ctx.Done():
-				t.Fatal("sensitive request did not complete")
-			}
-			stored, err := model.GetProviderById(provider.Id, true)
-			require.NoError(t, err)
-			assert.Equal(t, provider.Key, stored.Key)
-			assert.Equal(t, provider.Name, stored.Name)
-			assert.Empty(t, stored.ProviderInfo.MultiKeyStatusList)
-			assert.Equal(t, 2, stored.ProviderInfo.MultiKeySize)
-			logs, _, err := model.GetAuditLogs(model.AuditLogFilter{Category: model.AuditCategoryOperation}, 0, 100, common.RoleRootUser)
-			require.NoError(t, err)
-			found := false
-			for _, entry := range logs {
-				if entry.UserId == admin.Id {
-					found = true
-					assert.False(t, entry.Success)
+				stored, err := model.GetProviderById(provider.Id, true)
+				require.NoError(t, err)
+				assert.Equal(t, provider.Key, stored.Key)
+				assert.Equal(t, provider.Name, stored.Name)
+				assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+				assert.Empty(t, stored.ProviderInfo.MultiKeyStatusList)
+				assert.Equal(t, 2, stored.ProviderInfo.MultiKeySize)
+				if following != nil {
+					next, err := model.GetProviderById(following.Id, true)
+					require.NoError(t, err)
+					assert.Equal(t, common.ChannelStatusEnabled, next.Status, "revocation must stop the remaining batch targets")
 				}
-			}
-			assert.True(t, found)
-		})
+				logs, _, err := model.GetAuditLogs(model.AuditLogFilter{Category: model.AuditCategoryOperation}, 0, 100, common.RoleRootUser)
+				require.NoError(t, err)
+				found := false
+				for _, entry := range logs {
+					if entry.UserId == admin.Id {
+						found = true
+						assert.False(t, entry.Success)
+					}
+				}
+				assert.True(t, found)
+			})
+		}
 	}
 }
 

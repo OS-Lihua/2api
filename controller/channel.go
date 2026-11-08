@@ -823,7 +823,9 @@ func DisableTagChannels(c *gin.Context) {
 		return
 	}
 	ids := channelIDsFromChannels(channels)
-	err = model.DisableProviderByTag(channelTag.Tag)
+	err = model.DisableProviderByTag(channelTag.Tag, func() bool {
+		return authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelOperate)
+	})
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -847,7 +849,9 @@ func EnableTagChannels(c *gin.Context) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	err = model.EnableProviderByTag(channelTag.Tag)
+	err = model.EnableProviderByTag(channelTag.Tag, func() bool {
+		return authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelOperate)
+	})
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -1023,9 +1027,9 @@ func UpdateChannel(c *gin.Context) {
 	// Changing which plugins a channel binds needs the bind permission on any
 	// channel type; resubmitting an unchanged New API binding list does not, so
 	// administrators without it can still edit the rest of a gateway channel.
-	if settingProvided &&
-		!slices.Equal(channel.GetSetting().TaskPluginBindings(), originChannel.GetSetting().TaskPluginBindings()) &&
-		!canBindPlugins {
+	bindingChanged := settingProvided &&
+		!slices.Equal(channel.GetSetting().TaskPluginBindings(), originChannel.GetSetting().TaskPluginBindings())
+	if bindingChanged && !canBindPlugins {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "task plugin channels require the task_plugin.bind permission",
@@ -1036,7 +1040,8 @@ func UpdateChannel(c *gin.Context) {
 	// Always copy the original ProviderInfo so that fields like IsMultiKey and MultiKeySize are retained.
 	channel.ProviderInfo = originChannel.ProviderInfo
 
-	if channelHasSensitiveChanges(&channel, originChannel, requestData) && !canWriteSensitive {
+	sensitiveChanged := channelHasSensitiveChanges(&channel, originChannel, requestData)
+	if sensitiveChanged && !canWriteSensitive {
 		common.ApiErrorT(c, "Unauthorized, insufficient privileges")
 		return
 	}
@@ -1123,6 +1128,12 @@ func UpdateChannel(c *gin.Context) {
 			// 覆盖模式：直接使用新密钥（默认行为，不需要特殊处理）
 		}
 	}
+	requiresBind := channel.Type == constant.ChannelTypeTaskPlugin || bindingChanged
+	edit.Authorize = func() bool {
+		return authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelWrite) &&
+			(!sensitiveChanged || authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite)) &&
+			(!requiresBind || authz.Can(c.GetInt("id"), c.GetInt("role"), authz.TaskPluginBind))
+	}
 	err = edit.Commit(&channel.Provider)
 	if err != nil {
 		common.ApiError(c, err)
@@ -1179,11 +1190,16 @@ func UpdateChannelStatus(c *gin.Context) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	changed, err := model.UpdateProviderStatusWithError(id, "", req.Status, "manual operation")
+	changed, err := model.ApplyProviderStatus(id, model.ProviderStatusChange{
+		Status: req.Status, Reason: "manual operation",
+		Authorize: func() bool { return authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelOperate) },
+	})
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, model.ErrProviderStatusConflict) {
 			status = http.StatusConflict
+		} else if errors.Is(err, model.ErrProviderMutationForbidden) {
+			status = http.StatusForbidden
 		}
 		recordFailedManageAudit(c, "channel.status_update", map[string]any{"id": id, "status": req.Status, "changed": false}, status)
 		common.ApiErrorStatus(c, status, common.NewMessage("Failed to update provider"))
@@ -1216,8 +1232,12 @@ func BatchUpdateChannelStatus(c *gin.Context) {
 	var committedIDs, disabledIDs []int
 	var updateErr error
 	failedID := 0
+	change := model.ProviderStatusChange{
+		Status: req.Status, Reason: "manual batch operation",
+		Authorize: func() bool { return authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelOperate) },
+	}
 	for _, id := range req.Ids {
-		changed, err := model.UpdateProviderStatusWithError(id, "", req.Status, "manual batch operation")
+		changed, err := model.ApplyProviderStatus(id, change)
 		if err != nil {
 			updateErr = err
 			failedID = id
@@ -1238,6 +1258,8 @@ func BatchUpdateChannelStatus(c *gin.Context) {
 		status := http.StatusInternalServerError
 		if errors.Is(updateErr, model.ErrProviderStatusConflict) {
 			status = http.StatusConflict
+		} else if errors.Is(updateErr, model.ErrProviderMutationForbidden) {
+			status = http.StatusForbidden
 		}
 		recordFailedManageAudit(c, "channel.status_update_batch", map[string]any{
 			"committed_ids": committedIDs, "failed_id": failedID, "status": req.Status, "count": changedCount, "total": len(req.Ids),
@@ -1611,6 +1633,12 @@ func ManageMultiKeys(c *gin.Context) {
 			!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite) {
 		common.ApiErrorT(c, "Unauthorized, insufficient privileges")
 		return
+	}
+	if edit != nil {
+		edit.Authorize = func() bool {
+			return authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelOperate) &&
+				(!multiKeyActionRequiresSensitiveWrite(request.Action) || authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite))
+		}
 	}
 	if !channel.ProviderInfo.IsMultiKey {
 		common.ApiErrorT(c, "This channel is not in multi-key mode")
