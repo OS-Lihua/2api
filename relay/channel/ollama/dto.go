@@ -76,7 +76,7 @@ func (*OllamaChatRequest) SetChatOutputLimit(body []byte, limit uint) ([]byte, e
 	return common.Marshal(wire)
 }
 
-func (*OllamaChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error) {
+func (request *OllamaChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error) {
 	var wire OllamaChatRequest
 	if err := common.Unmarshal(body, &wire); err != nil {
 		return nil, err
@@ -117,12 +117,39 @@ func (*OllamaChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpen
 		effective.MaxCompletionTokens = &limit
 	}
 	effective.Messages = make([]dto.Message, 0, len(wire.Messages))
-	for _, message := range wire.Messages {
+	for index, message := range wire.Messages {
 		content := []dto.MediaContent{{Type: dto.ContentTypeText, Text: message.Content}}
-		for _, image := range message.Images {
-			content = append(content, dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: "data:image/jpeg;base64," + image}})
+		var originalImages []dto.MediaContent
+		if len(message.Images) > 0 && index < len(public.Messages) {
+			for _, part := range public.Messages[index].ParseContent() {
+				if part.Type == dto.ContentTypeImageURL {
+					originalImages = append(originalImages, part)
+				}
+			}
 		}
-		projected := dto.Message{Role: message.Role, Content: content}
+		for imageIndex, image := range message.Images {
+			part := dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: "data:image/jpeg;base64," + image}}
+			// Preserve the resolved image's identity only while its wire bytes match.
+			if index < len(request.Messages) && imageIndex < len(request.Messages[index].Images) && imageIndex < len(originalImages) && image == request.Messages[index].Images[imageIndex] {
+				part = originalImages[imageIndex]
+			}
+			content = append(content, part)
+		}
+		projected := dto.Message{Role: message.Role, Content: content, ToolCallId: message.ToolCallID}
+		if message.ToolName != "" && index < len(public.Messages) && public.Messages[index].Name != nil {
+			projected.Name = common.GetPointer(message.ToolName)
+		}
+		if len(message.Thinking) > 0 {
+			var thinking string
+			if err := common.Unmarshal(message.Thinking, &thinking); err != nil {
+				return nil, err
+			}
+			if index < len(public.Messages) && public.Messages[index].ReasoningContent == nil && public.Messages[index].Reasoning != nil {
+				projected.Reasoning = &thinking
+			} else {
+				projected.ReasoningContent = &thinking
+			}
+		}
 		if len(message.ToolCalls) > 0 {
 			calls, _ := ollamaToolCallsToOpenAI(message.ToolCalls, 0, false)
 			projected.ToolCalls, err = common.Marshal(calls)

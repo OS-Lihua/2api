@@ -9,16 +9,53 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/gin-gonic/gin"
 	"github.com/tidwall/sjson"
 )
 
-// AwsClaudeRequest preserves the complete Messages DTO while adding Bedrock's
-// envelope. Model identity and streaming remain SDK transport parameters.
+// AwsClaudeRequest preserves the complete Messages DTO. Finalization selects
+// Mantle JSON or the InvokeModel envelope using the actual Provider metadata.
 type AwsClaudeRequest struct {
 	Request          *dto.ClaudeRequest
 	AnthropicVersion string
 	AnthropicBeta    json.RawMessage
+	mantle           bool
+}
+
+var _ channel.ChatRequestFinalizer = (*AwsClaudeRequest)(nil)
+var _ channel.NativeRequestProjector = (*AwsClaudeRequest)(nil)
+
+func (wire *AwsClaudeRequest) FinalizeChatRequest(c *gin.Context, info *relaycommon.RelayInfo, body []byte) ([]byte, error) {
+	metadata := channel.NewProviderMetadata(info)
+	headers := make(http.Header)
+	if err := (&Provider{}).SetupHeader(c, &headers, metadata); err != nil {
+		return nil, err
+	}
+	overrides, err := channel.ResolveHeaderOverride(info, c)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range overrides {
+		headers.Set(key, value)
+	}
+	metadata.RequestHeaders = headers
+	wire.mantle = metadata.ChannelOtherSettings.AwsApiType == dto.AwsApiTypeMantle
+	if wire.mantle {
+		request, err := decodeAwsClaudeRequest(body)
+		if err != nil {
+			return nil, err
+		}
+		if request.Model != "" && request.Model != metadata.UpstreamModelName && request.Model != mantleModelName(metadata.UpstreamModelName) {
+			return nil, errors.New("AWS Mantle model does not match the selected model")
+		}
+		if request.Stream != nil && *request.Stream != metadata.IsStream {
+			return nil, errors.New("AWS Mantle streaming does not match the selected request")
+		}
+	}
+	return finalizeAwsClaudeBody(body, metadata, wire.Request.Stream)
 }
 
 func (request *AwsClaudeRequest) MarshalJSON() ([]byte, error) {
@@ -47,20 +84,30 @@ func (wire *AwsClaudeRequest) ProjectNativeRequest(body []byte) (dto.Request, er
 	if err := common.Unmarshal(body, &envelope); err != nil {
 		return nil, err
 	}
-	if _, present := envelope["model"]; present {
-		return nil, errors.New("Bedrock model identity belongs to the SDK request")
-	}
-	if _, present := envelope["stream"]; present {
-		return nil, errors.New("Bedrock streaming belongs to the SDK request")
-	}
-	var request dto.ClaudeRequest
-	if err := common.Unmarshal(body, &request); err != nil {
+	request, err := decodeAwsClaudeRequest(body)
+	if err != nil {
 		return nil, err
+	}
+	if wire.mantle {
+		if wire.Request == nil || request.Model != mantleModelName(wire.Request.Model) {
+			return nil, errors.New("AWS Mantle model does not match the selected model")
+		}
+		stream := wire.Request.Stream != nil && *wire.Request.Stream
+		if (request.Stream != nil && *request.Stream) != stream {
+			return nil, errors.New("AWS Mantle streaming does not match the selected request")
+		}
+	} else {
+		if _, present := envelope["model"]; present {
+			return nil, errors.New("Bedrock model identity belongs to the SDK request")
+		}
+		if _, present := envelope["stream"]; present {
+			return nil, errors.New("Bedrock streaming belongs to the SDK request")
+		}
 	}
 	if wire.Request != nil {
 		request.Model = wire.Request.Model
 	}
-	return &request, nil
+	return request, nil
 }
 
 // The legacy transport retains its established field set and serialization.
@@ -104,22 +151,74 @@ func formatRequest(requestBody io.Reader, requestHeader http.Header) (*legacyAws
 	return &request, nil
 }
 
-func newAwsClaudeRequest(request *dto.ClaudeRequest, headers http.Header) (*AwsClaudeRequest, error) {
-	wire := &AwsClaudeRequest{Request: request, AnthropicVersion: "bedrock-2023-05-31"}
+func decodeAwsClaudeRequest(body []byte) (*dto.ClaudeRequest, error) {
+	var request dto.ClaudeRequest
+	if err := common.Unmarshal(body, &request); err != nil {
+		return nil, err
+	}
+	if helper.ExceedsMaxTokensLimit(request.MaxTokens, request.MaxTokensToSample) {
+		return nil, errors.New("AWS Claude max token limit is invalid")
+	}
+	if request.MaxTokensToSample != nil {
+		return nil, errors.New("AWS Messages does not support max_tokens_to_sample")
+	}
+	return &request, nil
+}
+
+// finalizeAwsClaudeBody preserves native fields while resolving the exact wire
+// envelope. It is also used for synthetic probes that carry no Gin metadata.
+func finalizeAwsClaudeBody(body []byte, metadata *channel.ProviderRequest, stream *bool) ([]byte, error) {
+	request, err := decodeAwsClaudeRequest(body)
+	if err != nil {
+		return nil, err
+	}
+	var fields map[string]common.RawMessage
+	if err := common.Unmarshal(body, &fields); err != nil {
+		return nil, err
+	}
+	if fields == nil {
+		return nil, errors.New("AWS Claude request must be a JSON object")
+	}
+	if metadata.ChannelOtherSettings.AwsApiType == dto.AwsApiTypeMantle {
+		model := mantleModelName(metadata.UpstreamModelName)
+		delete(fields, "anthropic_version")
+		delete(fields, "anthropic_beta")
+		fields["model"], err = common.Marshal(model)
+		if err != nil {
+			return nil, err
+		}
+		if request.Stream == nil && (metadata.IsStream || stream != nil) {
+			fields["stream"], err = common.Marshal(metadata.IsStream)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return common.Marshal(fields)
+	}
+	if _, present := fields["model"]; present {
+		return nil, errors.New("Bedrock model identity belongs to the SDK request")
+	}
+	if _, present := fields["stream"]; present {
+		return nil, errors.New("Bedrock streaming belongs to the SDK request")
+	}
+	fields["anthropic_version"], err = common.Marshal("bedrock-2023-05-31")
+	if err != nil {
+		return nil, err
+	}
+	delete(fields, "anthropic_beta")
 	var betas []string
-	for beta := range strings.SplitSeq(headers.Get("anthropic-beta"), ",") {
+	for beta := range strings.SplitSeq(metadata.RequestHeaders.Get("anthropic-beta"), ",") {
 		if beta = strings.TrimSpace(beta); beta != "" {
 			betas = append(betas, beta)
 		}
 	}
 	if len(betas) > 0 {
-		var err error
-		wire.AnthropicBeta, err = common.Marshal(betas)
+		fields["anthropic_beta"], err = common.Marshal(betas)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return wire, nil
+	return common.Marshal(fields)
 }
 
 // NovaMessage Nova模型使用messages-v1格式

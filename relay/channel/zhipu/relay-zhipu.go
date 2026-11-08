@@ -231,7 +231,7 @@ func zhipuHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respon
 	}
 	if readErr != nil {
 		if info.ResponseFacts != nil {
-			info.ResponseFacts.RecordChatSource(responseZhipu2OpenAI(&zhipuResponse))
+			info.ResponseFacts.RecordChatSource(responseZhipu2OpenAI(&zhipuResponse), info.TokenizerModelName())
 		}
 		return knownUsage, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}

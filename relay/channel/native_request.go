@@ -197,6 +197,7 @@ func nativeChatMessageSemantics(messages []dto.Message) (any, error) {
 		}
 	}
 	grouped := make([]dto.Message, 0, len(normalized))
+	var merged strings.Builder
 	for _, message := range normalized {
 		if len(grouped) > 0 && message.Role == "system" && grouped[len(grouped)-1].Role == "system" {
 			before, after := grouped[len(grouped)-1], message
@@ -212,11 +213,22 @@ func nativeChatMessageSemantics(messages []dto.Message) (any, error) {
 				return nil, err
 			}
 			if previousOK && textOK && string(beforeBody) == string(afterBody) {
-				grouped[len(grouped)-1].Content = previousText + "\n" + text
+				if merged.Len() == 0 {
+					merged.WriteString(previousText)
+				}
+				merged.WriteByte('\n')
+				merged.WriteString(text)
 				continue
 			}
 		}
+		if merged.Len() > 0 {
+			grouped[len(grouped)-1].Content = merged.String()
+			merged.Reset()
+		}
 		grouped = append(grouped, message)
+	}
+	if merged.Len() > 0 {
+		grouped[len(grouped)-1].Content = merged.String()
 	}
 	body, err := common.Marshal(grouped)
 	if err != nil {

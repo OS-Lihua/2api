@@ -55,8 +55,35 @@ func (p *Provider) PrepareExecution(c *gin.Context, metadata channel.ProviderMet
 		facts, _ = value.(*relaycommon.ResponseFacts)
 		managed = facts != nil && facts.OnBusinessOutput != nil
 	}
-	if request.ChannelOtherSettings.AwsApiType == dto.AwsApiTypeMantle {
-		req, err := p.NewMantleRequest(c, metadata, body)
+	payload, err := io.ReadAll(body)
+	if err != nil {
+		return nil, err
+	}
+	mantle := request.ChannelOtherSettings.AwsApiType == dto.AwsApiTypeMantle
+	if request.Protocol == protocol.AnthropicMessages || mantle {
+		claude, err := decodeAwsClaudeRequest(payload)
+		if err != nil {
+			return nil, err
+		}
+		if managed && mantle && (claude.Stream != nil && *claude.Stream) != request.IsStream {
+			return nil, errors.New("AWS Mantle streaming does not match the prepared request")
+		}
+		if managed || mantle {
+			finalized, err := finalizeAwsClaudeBody(payload, request, nil)
+			if err != nil {
+				return nil, err
+			}
+			if managed {
+				if !bytes.Equal(finalized, payload) {
+					return nil, errors.New("AWS Claude body does not match the prepared request")
+				}
+			} else {
+				payload = finalized
+			}
+		}
+	}
+	if mantle {
+		req, err := p.NewMantleRequest(c, metadata, bytes.NewReader(payload))
 		if err != nil {
 			return nil, err
 		}
@@ -94,10 +121,6 @@ func (p *Provider) PrepareExecution(c *gin.Context, metadata channel.ProviderMet
 	regionPrefix := getAwsRegionPrefix(client.Options().Region)
 	if awsModelCanCrossRegion(modelID, regionPrefix) {
 		modelID = awsModelCrossRegion(modelID, regionPrefix)
-	}
-	payload, err := io.ReadAll(body)
-	if err != nil {
-		return nil, err
 	}
 	if !nova && !managed {
 		wire, err := formatRequest(bytes.NewReader(payload), request.RequestHeaders)

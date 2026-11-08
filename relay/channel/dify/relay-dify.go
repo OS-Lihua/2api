@@ -398,7 +398,7 @@ func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 	fullTextResponse.Choices = append(fullTextResponse.Choices, choice)
 	if readErr != nil {
 		if info.ResponseFacts != nil {
-			info.ResponseFacts.RecordChatSource(&fullTextResponse)
+			info.ResponseFacts.RecordChatSource(&fullTextResponse, info.TokenizerModelName())
 		}
 		return knownUsage, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
 	}

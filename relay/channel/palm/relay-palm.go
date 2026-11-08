@@ -100,7 +100,7 @@ func palmHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 	fullTextResponse := responsePaLM2OpenAI(&palmResponse)
 	if readErr != nil {
 		if info.ResponseFacts != nil {
-			info.ResponseFacts.RecordChatSource(fullTextResponse)
+			info.ResponseFacts.RecordChatSource(fullTextResponse, info.TokenizerModelName())
 		}
 		return &fullTextResponse.Usage, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}

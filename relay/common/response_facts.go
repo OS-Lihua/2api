@@ -4,6 +4,7 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 	"strings"
@@ -67,19 +68,25 @@ type ResponseFacts struct {
 
 // RecordChatSource retains generated facts when a native transport fails after
 // returning a decodable response. It does not confirm downstream delivery.
-func (facts *ResponseFacts) RecordChatSource(response *dto.OpenAITextResponse) {
+func (facts *ResponseFacts) RecordChatSource(response *dto.OpenAITextResponse, model string) {
 	var text strings.Builder
+	tokens := 0
 	for _, choice := range response.Choices {
-		text.WriteString(choice.Message.StringContent())
-		text.WriteString(choice.Message.GetReasoningContent())
+		var output strings.Builder
+		output.WriteString(choice.Message.StringContent())
+		output.WriteString(choice.Message.GetReasoningContent())
 		for _, call := range choice.Message.ParseToolCalls() {
 			facts.SourceOutputObserved = true
-			text.WriteString(call.Function.Name)
-			text.WriteString(call.Function.Arguments)
-			text.Write(call.Custom)
+			output.WriteString(call.Function.Name)
+			output.WriteString(call.Function.Arguments)
+			output.Write(call.Custom)
 		}
+		candidate := output.String()
+		text.WriteString(candidate)
+		tokens += tokenkit.Count(model, candidate)
 	}
 	facts.SourceGeneratedText = text.String()
+	facts.SourceOutputTokens = &tokens
 	facts.SourceOutputObserved = facts.SourceOutputObserved || facts.SourceGeneratedText != ""
 }
 

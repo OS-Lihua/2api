@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -76,6 +77,13 @@ func (a *ChannelAdaptor) ConvertRequest(c *gin.Context, info *relaycommon.RelayI
 	return converted, err
 }
 
+func (a *ChannelAdaptor) FinalizeChatRequest(c *gin.Context, info *relaycommon.RelayInfo, converted any, body []byte) ([]byte, error) {
+	if finalizer, ok := converted.(channel.ChatRequestFinalizer); ok {
+		return finalizer.FinalizeChatRequest(c, info, body)
+	}
+	return body, nil
+}
+
 // PrepareChatRequest runs selected native preparation after the caller reserves
 // funds and freezes purchase prices, before final body/header probes are taken.
 func (a *ChannelAdaptor) PrepareChatRequest(c *gin.Context, info *relaycommon.RelayInfo, converted any, body []byte) ([]byte, error) {
@@ -108,7 +116,16 @@ func (a *ChannelAdaptor) ProjectChatRequest(c *gin.Context, info *relaycommon.Re
 		}
 	}
 	if projector, ok := converted.(channel.ChatRequestProjector); ok {
-		return projector.ProjectChatRequest(body, *public)
+		effective, err := projector.ProjectChatRequest(body, *public)
+		if err != nil {
+			return nil, err
+		}
+		if contract, ok := converted.(channel.NativeChatRequestContract); ok && effective.N != nil && *effective.N > 1 {
+			if info.IsStream || !slices.Contains(contract.ChatRequestCapabilities().Parameters, "n") {
+				return nil, errors.New("native Provider cannot represent multiple output choices (n)")
+			}
+		}
+		return effective, nil
 	}
 	switch converted.(type) {
 	case dto.GeneralOpenAIRequest, *dto.GeneralOpenAIRequest:

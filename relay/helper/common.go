@@ -7,7 +7,6 @@ import (
 	"io"
 	"maps"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -332,14 +331,6 @@ func StringData(c *gin.Context, str string) error {
 		return errors.New("context or writer is nil")
 	}
 
-	if requestContextDone(c) {
-		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
-	}
-
-	if facts, _ := common.GetContextKey(c, constant.ContextKeyResponseFacts); facts == nil {
-		c.Render(-1, common.CustomEvent{Data: "data: " + str})
-		return FlushWriter(c)
-	}
 	if facts, ok := common.GetContextKeyType[*relaycommon.ResponseFacts](c, constant.ContextKeyResponseFacts); ok && facts != nil && facts.OnBusinessOutput != nil {
 		if str == "[DONE]" {
 			err := WriteGatewayStreamFrame(c, nil, "data: [DONE]\n\n", false)
@@ -360,6 +351,13 @@ func StringData(c *gin.Context, str string) error {
 			facts.SourceOutputObserved = facts.SourceOutputObserved || text != "" || business
 			return WriteGatewayStreamFrame(c, facts, "data: "+str+"\n\n", business)
 		}
+	}
+	if requestContextDone(c) {
+		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
+	}
+	if facts, _ := common.GetContextKey(c, constant.ContextKeyResponseFacts); facts == nil {
+		c.Render(-1, common.CustomEvent{Data: "data: " + str})
+		return FlushWriter(c)
 	}
 	event := common.CustomEvent{Data: "data: " + str}
 	if err := event.Render(c.Writer); err != nil {
@@ -453,6 +451,9 @@ func EstimateMissingChatUsage(c *gin.Context, info *relaycommon.RelayInfo, usage
 	}
 	if !facts.CompletionTokensReported {
 		usage.CompletionTokens = estimated.CompletionTokens
+		if facts.GeneratedOutputTokens != nil {
+			usage.CompletionTokens = *facts.GeneratedOutputTokens
+		}
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 }
@@ -464,24 +465,17 @@ func WriteChatResponse(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	if resp.StatusCode != http.StatusOK {
 		return &response.Usage, types.NewErrorWithStatusCode(errors.New("upstream request failed"), types.ErrorCodeBadResponse, resp.StatusCode)
 	}
-	facts.RecordChatSource(response)
-	var output strings.Builder
+	facts.RecordChatSource(response, info.TokenizerModelName())
 	business := false
 	for _, choice := range response.Choices {
 		facts.OutputLimitObserved = facts.OutputLimitObserved || choice.FinishReason == "length"
 		if facts.OnBusinessOutput != nil && choice.FinishReason == constant.FinishReasonContentFilter {
 			info.PerformanceBusinessRejection = true
 		}
-		output.WriteString(choice.Message.StringContent())
-		output.WriteString(choice.Message.GetReasoningContent())
-		for _, call := range choice.Message.ParseToolCalls() {
-			business = true
-			output.WriteString(call.Function.Name)
-			output.WriteString(call.Function.Arguments)
-			output.Write(call.Custom)
-		}
+		business = business || len(choice.Message.ParseToolCalls()) > 0
 	}
-	facts.GeneratedText = output.String()
+	facts.GeneratedText = facts.SourceGeneratedText
+	facts.GeneratedOutputTokens = facts.SourceOutputTokens
 	EstimateMissingChatUsage(c, info, &response.Usage)
 	encoded, err := common.Marshal(response)
 	if err != nil {

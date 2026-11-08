@@ -467,7 +467,7 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	}
 	if readErr != nil {
 		if info.ResponseFacts != nil {
-			info.ResponseFacts.RecordChatSource(&full)
+			info.ResponseFacts.RecordChatSource(&full, info.TokenizerModelName())
 		}
 		return usage, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
