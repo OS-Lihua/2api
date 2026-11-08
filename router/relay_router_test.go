@@ -475,6 +475,44 @@ func dialRealtimeGateway(t *testing.T, fixture textGatewayFixture) *websocket.Co
 	return client
 }
 
+func TestRealtimeGatewayRejectsFixedPricingBeforeReservation(t *testing.T) {
+	for _, owner := range []string{"sale", "purchase"} {
+		t.Run(owner, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.WriteHeader(http.StatusInternalServerError)
+			})
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", protocol.OpenAIRealtime).Error)
+			price := *fixture.sale
+			if owner == "purchase" {
+				price = *fixture.purchase
+			}
+			price.ID, price.EffectiveAt, price.Expression = 0, clock.Now().Unix()+1, `tier("unsupported", fixed(0))`
+			require.NoError(t, model.CreatePriceVersion(t.Context(), &price, fixture.sale.CreatedBy))
+			fixture.fake.Advance(2 * time.Second)
+			server := newRealtimeGatewayServer(t, fixture.engine)
+			client, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/v1/realtime?model=gateway-alias", http.Header{"Authorization": {"Bearer sk-" + fixture.token.Key}})
+			if client != nil {
+				require.NoError(t, client.Close())
+			}
+			require.Error(t, err)
+			require.NotNil(t, response)
+			assert.GreaterOrEqual(t, response.StatusCode, http.StatusBadRequest)
+			require.NoError(t, response.Body.Close())
+			assert.Zero(t, calls.Load())
+			var lifecycles, postings int64
+			require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Where("user_id = ?", fixture.user.Id).Count(&lifecycles).Error)
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&postings).Error)
+			assert.Zero(t, lifecycles)
+			assert.Zero(t, postings)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1_000_000_000), wallet.Balance.Nanos)
+		})
+	}
+}
+
 func TestRealtimeGatewayAutomaticVAD(t *testing.T) {
 	var fixture textGatewayFixture
 	upstreamDone := make(chan struct{})
@@ -581,7 +619,7 @@ func TestRealtimeGatewayAutomaticVAD(t *testing.T) {
 		var count int64
 		var err error
 		records, count, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
-		if err != nil || count != 1 || records[0].Status == "settlement_pending" {
+		if err != nil || count != 1 || len(records) != 1 || records[0].Status == "settlement_pending" {
 			return false
 		}
 		_, count, err = model.ListGatewayAttempts(t.Context(), records[0].ID, 0, 10)

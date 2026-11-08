@@ -144,6 +144,19 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		run.fail(c, http.StatusConflict, "connection_locked", "Upstream connection settings changed; reconnect required")
 		return
 	}
+	if call.Protocol() == protocol.OpenAIRealtime {
+		// Validate the current purchase rule before touching the wallet. The
+		// attempt still freezes its price and FX at the actual transport start.
+		price, err := model.CurrentPriceVersion(c.Request.Context(), model.DB, model.PriceOwnerChannel, selection.Channel.ID, clock.Now().Unix())
+		if err != nil {
+			run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
+			return
+		}
+		if billingexpr.UsesFixedPricingByHash(price.Expression, billingexpr.ExprHashString(price.Expression)) {
+			run.fail(c, http.StatusBadRequest, "unsupported_pricing", "Fixed pricing is not supported for Realtime")
+			return
+		}
+	}
 	var pinnedKey []int
 	if call.LockedChannelID != 0 {
 		pinnedKey = []int{call.LockedKeyIndex}
