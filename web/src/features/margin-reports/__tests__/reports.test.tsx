@@ -63,7 +63,13 @@ it('shows known amounts separately from unfinished margin and applies dimension 
       <MarginReports />
     </QueryClientProvider>
   )
-  expect(await screen.findByText('Incomplete accounting')).toBeInTheDocument()
+  const result = await screen.findByText('Incomplete accounting')
+  expect(result).toBeInTheDocument()
+  const pageScroll = result.closest('main')?.querySelector('.overflow-auto')
+  expect(pageScroll).toContainElement(result)
+  expect(pageScroll).toContainElement(
+    screen.getByRole('button', { name: 'Apply filters' })
+  )
   expect(
     screen.getByRole('columnheader', { name: 'Known revenue' })
   ).toBeInTheDocument()

@@ -307,17 +307,32 @@ func marginFX(ctx context.Context, tx *gorm.DB, from money.Currency, proposal *F
 	return &rate, err
 }
 
-// marginLegacyUsage reconstructs only basic text quantities. Older record
-// projections omit cache semantics, TTL and overlapping modality details; those
-// facts cannot be recovered by treating their missing fields as explicit zero.
-func marginLegacyUsage(usage GatewayUsage) *dto.Usage {
-	if usage.CachedTokens != 0 || usage.CacheCreationTokens != 0 || usage.CacheCreation12hTokens != 0 || usage.ImageInputTokens != 0 || usage.AudioInputTokens != 0 || usage.ImageOutputTokens != 0 || usage.AudioOutputTokens != 0 {
+// marginLegacyUsage reconstructs quantities only when the expression does not
+// depend on missing cache semantics, TTL or overlapping modality details. Known
+// output counters remain usable even when the input cache breakdown is unknown.
+func marginLegacyUsage(usage GatewayUsage, used map[string]bool) *dto.Usage {
+	hasCache := usage.CachedTokens != 0 || usage.CacheCreationTokens != 0 || usage.CacheCreation12hTokens != 0
+	if (used["p"] || used["len"]) && hasCache {
+		return nil
+	}
+	if (used["cc"] || used["cc1h"]) && usage.CacheCreationTokens != 0 {
+		return nil
+	}
+	if used["img_cr"] && usage.CachedTokens != 0 && usage.ImageInputTokens != 0 {
 		return nil
 	}
 	if usage.PromptTokens < 0 || usage.CompletionTokens < 0 || usage.PromptTokens > 1<<31-1 || usage.CompletionTokens > 1<<31-1 || usage.TotalTokens != usage.PromptTokens+usage.CompletionTokens {
 		return nil
 	}
-	return &dto.Usage{PromptTokens: int(usage.PromptTokens), CompletionTokens: int(usage.CompletionTokens), TotalTokens: int(usage.TotalTokens)}
+	return &dto.Usage{
+		PromptTokens: int(usage.PromptTokens), CompletionTokens: int(usage.CompletionTokens), TotalTokens: int(usage.TotalTokens),
+		PromptTokensDetails: dto.InputTokenDetails{
+			CachedTokens: int(usage.CachedTokens), CacheWriteTokens: int(usage.CacheCreationTokens),
+			CacheWriteTokensDetails: &dto.CacheWriteTokenDetails{TTL12hTokens: int(usage.CacheCreation12hTokens)},
+			ImageTokens:             int(usage.ImageInputTokens), AudioTokens: int(usage.AudioInputTokens),
+		},
+		CompletionTokenDetails: dto.OutputTokenDetails{ImageTokens: int(usage.ImageOutputTokens), AudioTokens: int(usage.AudioOutputTokens)},
+	}
 }
 
 // meanPriceValue normalizes each quantitative snapshot before taking an exact
@@ -364,7 +379,7 @@ func meanPriceValue(ctx context.Context, tx *gorm.DB, price *PriceVersion, offer
 			if price.OwnerType == PriceOwnerOffering {
 				usage := intent.SaleUsage
 				if usage == nil {
-					usage = marginLegacyUsage(intent.Request.Usage)
+					usage = marginLegacyUsage(intent.Request.Usage, used)
 				}
 				if usage == nil && needsUsage {
 					return money.Value{}, len(records), "usage_details_unavailable", nil
@@ -384,7 +399,7 @@ func meanPriceValue(ctx context.Context, tx *gorm.DB, price *PriceVersion, offer
 			for _, attempt := range attempts {
 				usage := intent.AttemptUsage[attempt.ID]
 				if usage == nil {
-					usage = marginLegacyUsage(attempt.Usage)
+					usage = marginLegacyUsage(attempt.Usage, used)
 				}
 				if usage == nil {
 					if needsUsage {

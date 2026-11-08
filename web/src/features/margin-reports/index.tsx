@@ -209,10 +209,10 @@ export function MarginReports() {
       `${row.model_offering_id}:${row.channel_id}:${row.provider_id}:${row.date}`,
   })
   return (
-    <SectionPageLayout fixedContent>
+    <SectionPageLayout>
       <SectionPageLayout.Title>{t('Margin reports')}</SectionPageLayout.Title>
       <SectionPageLayout.Content>
-        <div className='flex h-full min-h-0 flex-col gap-3'>
+        <div className='flex flex-col gap-3'>
           <p className='text-muted-foreground text-sm'>
             {t(
               'Revenue includes unpaid receivables once. Each attempt contributes its cost. Revenue belongs to the final attempt. Dates use request start time; the end date is exclusive.'
@@ -302,13 +302,13 @@ export function MarginReports() {
             />
           ) : (
             <DataTablePage
+              fixedHeight={false}
               table={table}
               columns={columns}
               isLoading={query.isPending}
               isFetching={query.isFetching}
               toolbarProps={null}
               emptyTitle={t('No margin records')}
-              className='h-auto min-h-0 flex-1'
             />
           )}
         </div>
