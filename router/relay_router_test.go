@@ -436,6 +436,44 @@ func TestTextGatewayModelFallbackPreservesConnectionWriteDeadline(t *testing.T) 
 	}
 }
 
+func TestTextGatewayModelFallbackAllowsLargeFirstBusinessFrames(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprint("stream=", stream), func(t *testing.T) {
+			content := strings.Repeat("a", (1<<20)+1)
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(503)
+				_, _ = io.WriteString(w, `{"error":{"code":"overloaded"}}`)
+			})
+			fallback := addTextGatewayMember(t, fixture, 2, func(w http.ResponseWriter, r *http.Request) {
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n", content)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"content":%q},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, content)
+			})
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", fmt.Sprintf(`{"model":"gateway-alias","stream":%t,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, stream))
+			require.Equal(t, 200, response.Code)
+			assert.True(t, strings.Contains(response.Body.String(), content), "the complete first business frame must be delivered")
+			assert.NotEmpty(t, response.Result().Header.Get("X-Model-Fallback"))
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(36000), record.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 2, total)
+			for _, attempt := range attempts {
+				if attempt.ChannelID == fallback.ID {
+					assert.Equal(t, "success", attempt.Status)
+					assert.Equal(t, int64(20000), attempt.Cost.Nanos)
+				}
+			}
+		})
+	}
+}
+
 func TestTextGatewayModelFallbackStreamHeaderDescribesDeliveredModel(t *testing.T) {
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
