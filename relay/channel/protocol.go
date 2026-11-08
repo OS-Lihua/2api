@@ -115,9 +115,15 @@ type WireProtocol struct {
 	Public                ProtocolHandler
 	Wire                  ProtocolHandler
 	SupportsCrossProtocol bool
+	// ReportsGatewayFacts confirms that the native Chat writer records actual
+	// business delivery, write failures and usage presence for money settlement.
+	ReportsGatewayFacts bool
 }
 
 func (p *WireProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInfo, request any) (any, error) {
+	if p.Kind == protocol.OpenAIChat && info.ResponseFacts != nil && !p.ReportsGatewayFacts {
+		return nil, fmt.Errorf("native protocol does not report gateway response facts")
+	}
 	if !p.SupportsCrossProtocol {
 		format, err := ProtocolRelayFormat(p.Kind)
 		if err != nil {

@@ -14,7 +14,7 @@ func (p *Provider) ComposeProtocol(kind protocol.Type, generic channel.ProtocolH
 	}
 	switch kind {
 	case protocol.OpenAIChat, protocol.OpenAIResponses:
-		return &channel.WireProtocol{Kind: kind, Public: generic, Wire: &Protocol{}}, nil
+		return &channel.WireProtocol{Kind: kind, Public: generic, Wire: &Protocol{}, ReportsGatewayFacts: true}, nil
 	default:
 		return nil, fmt.Errorf("cloudflare does not support text protocol %q", kind)
 	}

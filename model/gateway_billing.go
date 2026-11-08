@@ -30,11 +30,12 @@ type GatewayBilling struct {
 }
 
 type GatewaySettlement struct {
-	Request          GatewayRequest  `json:"request"`
-	Attempt          *GatewayAttempt `json:"attempt,omitempty"`
-	SaleSource       money.Amount    `json:"sale_source"`
-	ReceivableDue    money.Amount    `json:"receivable_due"`
-	PostedSaleSource money.Amount    `json:"posted_sale_source"`
+	Request          GatewayRequest   `json:"request"`
+	Attempt          *GatewayAttempt  `json:"attempt,omitempty"`
+	Attempts         []GatewayAttempt `json:"attempts,omitempty"`
+	SaleSource       money.Amount     `json:"sale_source"`
+	ReceivableDue    money.Amount     `json:"receivable_due"`
+	PostedSaleSource money.Amount     `json:"posted_sale_source"`
 }
 
 func MigrateGatewayBilling(db *gorm.DB) error {
@@ -157,11 +158,20 @@ func SettleGateway(requestID string) (*GatewayRequest, error) {
 		request.LedgerEntryIDs = original.LedgerEntryIDs
 		account := UserWalletAccount(row.UserID)
 		accounts := []LedgerPosting{{Account: account}, {Account: PlatformRevenueAccount(SettlementCurrency())}}
+		attempts := intent.Attempts
 		if intent.Attempt != nil {
-			if intent.Attempt.RequestID != row.RequestID || intent.Attempt.Cost.Nanos < 0 {
+			if len(attempts) != 0 {
 				return ErrLedgerInvalidEntry
 			}
-			accounts = append(accounts, LedgerPosting{Account: ProviderPayableAccount(intent.Attempt.ProviderID, intent.Attempt.Cost.Currency)})
+			attempts = []GatewayAttempt{*intent.Attempt}
+		}
+		seen := map[string]bool{}
+		for _, attempt := range attempts {
+			if attempt.ID == "" || seen[attempt.ID] || attempt.RequestID != row.RequestID || attempt.ProviderID <= 0 || attempt.Cost.Nanos < 0 {
+				return ErrLedgerInvalidEntry
+			}
+			seen[attempt.ID] = true
+			accounts = append(accounts, LedgerPosting{Account: ProviderPayableAccount(attempt.ProviderID, attempt.Cost.Currency)})
 		}
 		wallets, err := lockLedgerWallets(tx, accounts)
 		if err != nil {
@@ -218,7 +228,10 @@ func SettleGateway(requestID string) (*GatewayRequest, error) {
 		if request.Receivable.Nanos > 0 {
 			postings = append(postings, LedgerPosting{Account: PlatformRevenueAccount(request.Receivable.Currency), Type: LedgerEntryCharge, Amount: request.Receivable, RequestId: requestID, IdempotencyKey: "gateway:" + requestID + ":revenue", sourceAmount: &intent.SaleSource, fxRate: decimal.NewNullDecimal(saleRate)})
 		}
-		if attempt := intent.Attempt; attempt != nil && attempt.Cost.Nanos > 0 {
+		for _, attempt := range attempts {
+			if attempt.Cost.Nanos == 0 {
+				continue
+			}
 			rate, err := decimal.NewFromString(attempt.AccountingFXRate)
 			if err != nil {
 				return err
@@ -271,6 +284,11 @@ func PublishGatewayRecords(requestID string) error {
 		var intent GatewaySettlement
 		if err := common.UnmarshalJsonStr(row.Settlement, &intent); err != nil {
 			return err
+		}
+		for i := range intent.Attempts {
+			if err := appendGatewayRecord(&intent.Attempts[i]); err != nil {
+				return err
+			}
 		}
 		if intent.Attempt != nil {
 			if err := appendGatewayRecord(intent.Attempt); err != nil {

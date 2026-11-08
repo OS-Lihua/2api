@@ -30,7 +30,7 @@ var ErrGatewayUnavailable = errors.New("no Channel is available")
 // OpenAI Chat protocol. Ordering by Channel ID makes this single-attempt policy
 // deterministic; later route policies can replace selection without replacing
 // the shared scope, capability, transport or accounting boundaries.
-func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request *dto.GeneralOpenAIRequest) (*GatewaySelection, error) {
+func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request *dto.GeneralOpenAIRequest, failures ...*GatewayExclusions) (*GatewaySelection, error) {
 	ids := []int{}
 	for _, member := range offering.Members {
 		if member.Tier == 1 {
@@ -46,6 +46,10 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 	excluded := []map[string]any{}
 	var selected *GatewaySelection
 	for _, candidate := range candidates {
+		if len(failures) > 0 && (failures[0].Channels[candidate.ID] || failures[0].Providers[candidate.ProviderID]) {
+			counts["already_failed"]++
+			continue
+		}
 		reason := ""
 		var provider *model.Provider
 		var caps capability.Set

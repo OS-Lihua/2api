@@ -23,6 +23,8 @@ type ResponseFacts struct {
 	DownstreamWriteFailed    bool
 	GeneratedText            string
 	OnBusinessOutput         func()
+	CanFinishStream          func() bool `json:"-"`
+	UpstreamErrorCode        string
 }
 
 // MarkBusinessOutput records accepted content and disarms first-byte budgets.

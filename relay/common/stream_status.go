@@ -215,6 +215,20 @@ func (s *StreamStatus) IsNormalEnd() bool {
 		s.EndReason == StreamEndReasonHandlerStop
 }
 
+// CompletedNormally requires both a clean transport end and the terminal
+// protocol fact when that protocol declares one. EOF alone is not completion.
+func (s *StreamStatus) CompletedNormally() bool {
+	if s == nil {
+		return true
+	}
+	outcome := s.OutcomeSnapshot()
+	normal := outcome.EndReason == StreamEndReasonDone || outcome.EndReason == StreamEndReasonEOF || outcome.EndReason == StreamEndReasonHandlerStop
+	if !normal || outcome.HasErrors || outcome.Response == ResponseOutcomeFailed || outcome.Response == ResponseOutcomeIncomplete || outcome.Response == ResponseOutcomeCancelled {
+		return false
+	}
+	return !outcome.ExpectsTerminal || outcome.Response == ResponseOutcomeCompleted || outcome.Response == ResponseOutcomeUnknown && outcome.EndReason == StreamEndReasonDone
+}
+
 func (s *StreamStatus) Summary() string {
 	if s == nil {
 		return "StreamStatus<nil>"

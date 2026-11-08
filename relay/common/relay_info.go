@@ -1,6 +1,7 @@
 package common
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -130,6 +131,9 @@ type RelayInfo struct {
 	UpstreamProtocol protocol.Type
 	// ResponseFacts is populated by protocol handlers when exact wallet billing
 	// needs usage presence and business delivery separately from transport status.
+	// BeginProviderCall starts the shared deadline immediately before native
+	// preparation contacts the Provider, without creating a model Attempt.
+	BeginProviderCall func() (context.Context, error) `json:"-"`
 	ResponseFacts     *ResponseFacts
 	TokenizerModel    string
 	SendResponseCount int

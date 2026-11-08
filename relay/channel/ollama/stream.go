@@ -273,7 +273,9 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			}
 		}
 		// send [DONE]
-		helper.Done(c)
+		if info.ResponseFacts == nil || info.ResponseFacts.OnBusinessOutput == nil || info.ResponseFacts.BusinessOutput {
+			helper.Done(c)
+		}
 		break
 	}
 	if err := scanner.Err(); err != nil && err != io.EOF {
@@ -420,6 +422,9 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			}
 			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 		}
+	}
+	if info.ResponseFacts != nil && resp.StatusCode != http.StatusOK {
+		return usage, types.NewErrorWithStatusCode(fmt.Errorf("upstream request failed"), types.ErrorCodeBadResponse, resp.StatusCode)
 	}
 	full := dto.OpenAITextResponse{
 		Id:      common.GetUUID(),
