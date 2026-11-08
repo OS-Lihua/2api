@@ -16,18 +16,49 @@ import (
 // HTTP SSE and WebSocket transports feed the same events into it, then settle
 // Finish's usage through the normal text billing path, including interrupted
 // streams. Observe and Finish must be called by the same stream owner.
+type responseOutputState struct {
+	nameSeen    bool
+	payloadSeen bool
+	textSeen    bool
+}
+
 type ResponsesUsageAccumulator struct {
-	info           *relaycommon.RelayInfo
-	usage          *dto.Usage
-	outputText     strings.Builder
-	imageCounter   relaycommon.ImageGenerationCallCounter
-	imageCommitted bool
-	started        bool
-	finished       bool
+	info               *relaycommon.RelayInfo
+	usage              *dto.Usage
+	outputText         strings.Builder
+	outputs            map[string]*responseOutputState
+	terminalOutputSeen bool
+	imageCounter       relaycommon.ImageGenerationCallCounter
+	imageCommitted     bool
+	started            bool
+	finished           bool
 }
 
 func NewResponsesUsageAccumulator(info *relaycommon.RelayInfo) *ResponsesUsageAccumulator {
-	return &ResponsesUsageAccumulator{info: info, usage: &dto.Usage{}}
+	return &ResponsesUsageAccumulator{info: info, usage: &dto.Usage{}, outputs: map[string]*responseOutputState{}}
+}
+
+// DecodeResponsesStreamEvent decodes protocol framing independently from usage.
+// A malformed counter cannot discard another valid counter or business output.
+func DecodeResponsesStreamEvent(raw []byte) (*dto.ResponsesStreamResponse, error) {
+	body := raw
+	reported := ojson.GetBytes(raw, "response.usage")
+	if reported.Exists() {
+		document := ojson.NewDoc(raw)
+		if err := document.Delete("response.usage"); err != nil {
+			return nil, err
+		}
+		body = document.Bytes()
+	}
+	var event dto.ResponsesStreamResponse
+	if err := common.Unmarshal(body, &event); err != nil {
+		return nil, err
+	}
+	if event.Response != nil && reported.IsObject() {
+		event.Response.Usage = &dto.Usage{}
+		ApplyResponsesUsage(event.Response.Usage, &dto.Usage{}, []byte(reported.Raw))
+	}
+	return &event, nil
 }
 
 // Observe feeds one decoded stream event. raw is the same event's wire bytes;
@@ -42,8 +73,8 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 			ApplyResponsesUsage(a.usage, event.Response.Usage, []byte(ojson.GetBytes(raw, "response.usage").Raw))
 			if facts := a.info.ResponseFacts; facts != nil {
 				prompt, completion := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens", "response.usage.output_tokens", "response.usage.total_tokens")
-				reported := relayconvert.NormalizeResponsesUsage(event.Response.Usage)
-				facts.RecordUsage(a.usage, reported, prompt, completion)
+				reported := *a.usage
+				facts.RecordUsage(a.usage, &reported, prompt, completion)
 			}
 		}
 	}
@@ -51,22 +82,16 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 	ObserveResponsesOutcome(a.info, event)
 	switch event.Type {
 	case "response.completed", "response.done", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
-		if event.Response != nil {
-			if a.outputText.Len() == 0 {
-				// Some upstreams carry the output only on the terminal event.
-				a.outputText.WriteString(relayconvert.ExtractOutputTextFromResponses(event.Response))
-				for _, output := range event.Response.Output {
-					if output.Type == dto.BuildInCallFunctionCall {
-						a.outputText.WriteString(output.Name)
-						var arguments string
-						if common.Unmarshal(output.Arguments, &arguments) == nil {
-							a.outputText.WriteString(arguments)
-						} else {
-							a.outputText.Write(output.Arguments)
-						}
-					}
+		if event.Response != nil && !a.terminalOutputSeen {
+			for i, output := range event.Response.Output {
+				state := a.outputState(output.ID, &i)
+				if output.Type == dto.BuildInCallFunctionCall || output.Type == "custom_tool_call" {
+					a.observeToolOutput(&output, &i)
+				} else if !state.textSeen {
+					a.outputText.WriteString(relayconvert.ExtractOutputTextFromResponses(&dto.OpenAIResponsesResponse{Output: []dto.ResponsesOutput{output}}))
 				}
 			}
+			a.terminalOutputSeen = true
 		}
 		// Vendor counts are cumulative on the terminal event and replace the
 		// web_search_call items counted from output_item.done.
@@ -84,15 +109,21 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 		}
 		a.imageCounter.Commit(a.info)
 		a.imageCommitted = true
-	case "response.output_text.delta", "response.function_call_arguments.delta",
-		"response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.refusal.delta":
-		// Every delta kind here is generated output that upstream bills as
-		// output tokens, so all of them feed the missing-usage estimate.
+	case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.refusal.delta":
+		if event.Type == "response.output_text.delta" || event.Type == "response.refusal.delta" {
+			a.outputState(event.ItemID, event.OutputIndex).textSeen = true
+		}
 		a.outputText.WriteString(event.Delta)
+	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
+		a.outputState(event.ItemID, event.OutputIndex).payloadSeen = true
+		a.outputText.WriteString(event.Delta)
+	case "response.output_item.added":
+		a.observeToolOutput(event.Item, event.OutputIndex)
 	case dto.ResponsesOutputTypeItemDone:
 		if event.Item == nil {
 			return
 		}
+		a.observeToolOutput(event.Item, event.OutputIndex)
 		switch event.Item.Type {
 		case dto.BuildInCallWebSearchCall, dto.BuildInCallFileSearchCall, dto.BuildInCallFunctionCall:
 			a.info.CountBillableToolCall(event.Item.Type, event.Item.Name)
@@ -101,6 +132,60 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 				a.imageCounter.Observe(event.Item, event.OutputIndex)
 			}
 		}
+	}
+}
+
+func (a *ResponsesUsageAccumulator) outputState(id string, index *int) *responseOutputState {
+	idKey, indexKey := "", ""
+	if id != "" {
+		idKey = "id:" + id
+	}
+	if index != nil {
+		indexKey = fmt.Sprintf("index:%d", *index)
+	}
+	state := a.outputs[idKey]
+	if state == nil {
+		state = a.outputs[indexKey]
+	}
+	if state == nil && (index == nil || *index == 0) {
+		state = a.outputs["unknown"]
+	}
+	if state == nil {
+		state = &responseOutputState{}
+	}
+	if idKey != "" {
+		a.outputs[idKey] = state
+	}
+	if indexKey != "" {
+		a.outputs[indexKey] = state
+	}
+	if idKey == "" && indexKey == "" {
+		a.outputs["unknown"] = state
+	}
+	return state
+}
+
+func (a *ResponsesUsageAccumulator) observeToolOutput(item *dto.ResponsesOutput, index *int) {
+	if item == nil || item.Type != dto.BuildInCallFunctionCall && item.Type != "custom_tool_call" {
+		return
+	}
+	state := a.outputState(item.ID, index)
+	if !state.nameSeen && item.Name != "" {
+		a.outputText.WriteString(item.Name)
+		state.nameSeen = true
+	}
+	payload := item.Arguments
+	if item.Type == "custom_tool_call" {
+		payload = item.Input
+	}
+	if !state.payloadSeen && len(payload) > 0 {
+		var text string
+		if common.Unmarshal(payload, &text) == nil {
+			a.outputText.WriteString(text)
+		} else {
+			a.outputText.Write(payload)
+		}
+		state.payloadSeen = true
 	}
 }
 
@@ -179,37 +264,83 @@ func ApplyResponsesUsage(dst *dto.Usage, src *dto.Usage, rawUsage ...[]byte) {
 		return
 	}
 	incoming := relayconvert.NormalizeResponsesUsage(src)
-	if src.InputTokensDetails != nil {
-		inputDetails := src.InputTokensDetails.Clone()
-		incoming.InputTokensDetails = &inputDetails
-	}
-	if src.OutputTokensDetails != nil {
-		incoming.CompletionTokenDetails = *src.OutputTokensDetails
-	}
-	incoming.PromptCacheHitTokens = src.PromptCacheHitTokens
-	dto.MergeUsageNonZero(dst, incoming)
 	if len(rawUsage) > 0 && len(rawUsage[0]) > 0 {
-		// These upstream counters are cumulative snapshots. Replace each valid
-		// present field, including zero; absent fields keep the earlier fact.
+		raw := rawUsage[0]
+		// Validate before merging: an invalid later snapshot cannot replace
+		// an earlier authoritative count or create an accounting failure.
 		fields := map[string]*int{
-			"input_tokens_details.cached_tokens":      &dst.PromptTokensDetails.CachedTokens,
-			"input_tokens_details.cache_write_tokens": &dst.PromptTokensDetails.CacheWriteTokens,
-			"input_tokens_details.text_tokens":        &dst.PromptTokensDetails.TextTokens,
-			"input_tokens_details.image_tokens":       &dst.PromptTokensDetails.ImageTokens,
-			"input_tokens_details.audio_tokens":       &dst.PromptTokensDetails.AudioTokens,
-			"output_tokens_details.text_tokens":       &dst.CompletionTokenDetails.TextTokens,
-			"output_tokens_details.image_tokens":      &dst.CompletionTokenDetails.ImageTokens,
-			"output_tokens_details.audio_tokens":      &dst.CompletionTokenDetails.AudioTokens,
-			"output_tokens_details.reasoning_tokens":  &dst.CompletionTokenDetails.ReasoningTokens,
+			"input_tokens":                                     &dst.PromptTokens,
+			"output_tokens":                                    &dst.CompletionTokens,
+			"prompt_cache_hit_tokens":                          &dst.PromptCacheHitTokens,
+			"input_tokens_details.cached_tokens":               &dst.PromptTokensDetails.CachedTokens,
+			"input_tokens_details.cached_creation_tokens":      &dst.PromptTokensDetails.CachedCreationTokens,
+			"input_tokens_details.cache_write_tokens":          &dst.PromptTokensDetails.CacheWriteTokens,
+			"input_tokens_details.cache_creation_input_tokens": &dst.PromptTokensDetails.CacheCreationInputTokens,
+			"input_tokens_details.text_tokens":                 &dst.PromptTokensDetails.TextTokens,
+			"input_tokens_details.image_tokens":                &dst.PromptTokensDetails.ImageTokens,
+			"input_tokens_details.audio_tokens":                &dst.PromptTokensDetails.AudioTokens,
+			"output_tokens_details.text_tokens":                &dst.CompletionTokenDetails.TextTokens,
+			"output_tokens_details.image_tokens":               &dst.CompletionTokenDetails.ImageTokens,
+			"output_tokens_details.audio_tokens":               &dst.CompletionTokenDetails.AudioTokens,
+			"output_tokens_details.reasoning_tokens":           &dst.CompletionTokenDetails.ReasoningTokens,
+		}
+		if ojson.GetBytes(raw, "input_tokens_details.cache_write_tokens_details").IsObject() {
+			if dst.PromptTokensDetails.CacheWriteTokensDetails == nil {
+				dst.PromptTokensDetails.CacheWriteTokensDetails = &dto.CacheWriteTokenDetails{}
+			}
+			fields["input_tokens_details.cache_write_tokens_details.ttl_12h_tokens"] = &dst.PromptTokensDetails.CacheWriteTokensDetails.TTL12hTokens
+			fields["input_tokens_details.cache_write_tokens_details.ttl_30m_tokens"] = &dst.PromptTokensDetails.CacheWriteTokensDetails.TTL30mTokens
 		}
 		for path, destination := range fields {
-			if valid, _ := relaycommon.NativeUsagePresence(rawUsage[0], path, "", ""); valid {
-				*destination = int(ojson.GetBytes(rawUsage[0], path).Int())
+			if valid, _ := relaycommon.NativeUsagePresence(raw, path, "", ""); valid {
+				*destination = int(ojson.GetBytes(raw, path).Int())
 			}
 		}
-		if dst.InputTokensDetails != nil {
-			*dst.InputTokensDetails = dst.PromptTokensDetails.Clone()
+		if ojson.GetBytes(raw, "input_tokens_details.cached_tokens_details").IsObject() {
+			if dst.PromptTokensDetails.CachedTokensDetails == nil {
+				dst.PromptTokensDetails.CachedTokensDetails = &dto.CachedTokenDetails{}
+			}
+			details := dst.PromptTokensDetails.CachedTokensDetails
+			for path, destination := range map[string]**int{
+				"input_tokens_details.cached_tokens_details.text_tokens":  &details.TextTokens,
+				"input_tokens_details.cached_tokens_details.image_tokens": &details.ImageTokens,
+				"input_tokens_details.cached_tokens_details.audio_tokens": &details.AudioTokens,
+			} {
+				if valid, _ := relaycommon.NativeUsagePresence(raw, path, "", ""); valid {
+					count := int(ojson.GetBytes(raw, path).Int())
+					*destination = &count
+				}
+			}
 		}
+		dst.InputTokens, dst.OutputTokens = dst.PromptTokens, dst.CompletionTokens
+		dst.TotalTokens = dst.PromptTokens + dst.CompletionTokens
+		if incoming.UsageSemantic != "" {
+			dst.UsageSemantic = incoming.UsageSemantic
+		}
+		if incoming.UsageSource != "" {
+			dst.UsageSource = incoming.UsageSource
+		}
+		if dst.InputTokensDetails != nil || ojson.GetBytes(raw, "input_tokens_details").IsObject() {
+			details := dst.PromptTokensDetails.Clone()
+			dst.InputTokensDetails = &details
+		}
+		if dst.OutputTokensDetails != nil || ojson.GetBytes(raw, "output_tokens_details").IsObject() {
+			details := dst.CompletionTokenDetails
+			dst.OutputTokensDetails = &details
+		}
+		if incoming.BillingUsage != nil || dst.BillingUsage != nil {
+			dst.BillingUsage = dto.NewOpenAIResponsesBillingUsage(dst)
+		}
+	} else {
+		if src.InputTokensDetails != nil {
+			details := src.InputTokensDetails.Clone()
+			incoming.InputTokensDetails = &details
+		}
+		if src.OutputTokensDetails != nil {
+			incoming.CompletionTokenDetails = *src.OutputTokensDetails
+		}
+		incoming.PromptCacheHitTokens = src.PromptCacheHitTokens
+		dto.MergeUsageNonZero(dst, incoming)
 	}
 	outputDetails := dst.CompletionTokenDetails
 	if outputDetails != (dto.OutputTokenDetails{}) || dst.OutputTokensDetails != nil {

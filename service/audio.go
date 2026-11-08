@@ -13,23 +13,14 @@ func parseAudio(audioBase64 string, format string) (duration float64, err error)
 		return 0, fmt.Errorf("base64 decode error: %v", err)
 	}
 
-	var samplesCount int
-	var sampleRate int
+	return realtimeAudioDuration(int64(len(audioData)), format), nil
+}
 
-	switch format {
-	case "pcm16":
-		samplesCount = len(audioData) / 2 // 16位 = 2字节每样本
-		sampleRate = 24000                // 24kHz
-	case "g711_ulaw", "g711_alaw":
-		samplesCount = len(audioData) // 8位 = 1字节每样本
-		sampleRate = 8000             // 8kHz
-	default:
-		samplesCount = len(audioData) // 8位 = 1字节每样本
-		sampleRate = 8000             // 8kHz
+func realtimeAudioDuration(byteCount int64, format string) float64 {
+	if format == "pcm16" {
+		return float64(byteCount/2) / 24000
 	}
-
-	duration = float64(samplesCount) / float64(sampleRate)
-	return duration, nil
+	return float64(byteCount) / 8000
 }
 
 func DecodeBase64AudioData(audioBase64 string) (string, error) {

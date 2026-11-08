@@ -583,7 +583,7 @@ func getTaskOriginModelName(c *gin.Context) string {
 	return ""
 }
 
-func SetupContextForSelectedChannel(c *gin.Context, channel *model.Provider, modelName string) *types.NewAPIError {
+func SetupContextForSelectedChannel(c *gin.Context, channel *model.Provider, modelName string, pinnedKey ...int) *types.NewAPIError {
 	c.Set("original_model", modelName) // for retry
 	expectedPlugin := c.GetString("expected_task_plugin_key")
 	if channel == nil {
@@ -670,9 +670,29 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Provider, mod
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
-	key, index, newAPIError := channel.GetNextEnabledKey()
-	if newAPIError != nil {
-		return newAPIError
+	var key string
+	var index int
+	if len(pinnedKey) > 0 {
+		index = pinnedKey[0]
+		if channel.ProviderInfo.IsMultiKey {
+			keys := channel.GetKeys()
+			status, configured := channel.ProviderInfo.MultiKeyStatusList[index]
+			if index < 0 || index >= len(keys) || configured && status != common.ChannelStatusEnabled {
+				return types.NewError(errors.New("the upstream connection credential is no longer enabled"), types.ErrorCodeChannelNoAvailableKey, types.ErrOptionWithSkipRetry())
+			}
+			key = keys[index]
+		} else {
+			if index != 0 {
+				return types.NewError(errors.New("upstream credential identity changed"), types.ErrorCodeChannelNoAvailableKey, types.ErrOptionWithSkipRetry())
+			}
+			key = channel.Key
+		}
+	} else {
+		var newAPIError *types.NewAPIError
+		key, index, newAPIError = channel.GetNextEnabledKey()
+		if newAPIError != nil {
+			return newAPIError
+		}
 	}
 	if channel.ProviderInfo.IsMultiKey {
 		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)

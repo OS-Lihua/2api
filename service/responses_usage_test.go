@@ -1,7 +1,10 @@
 package service
 
 import (
+	"strings"
 	"testing"
+
+	"github.com/MoeForge/moego/base64"
 
 	"github.com/QuantumNous/new-api/common"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -11,6 +14,119 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestResponsesUsageRejectsInvalidCumulativeFieldsAndRetainsCacheLifetimeZero(t *testing.T) {
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "gpt-4o"}, StreamStatus: relaycommon.NewStreamStatus(), ResponseFacts: &relaycommon.ResponseFacts{}}
+	accumulator := NewResponsesUsageAccumulator(info)
+	for _, raw := range []string{
+		`{"type":"response.created","response":{"usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110,"input_tokens_details":{"cache_write_tokens":100,"cache_write_tokens_details":{"ttl_12h_tokens":100,"ttl_30m_tokens":0}}}}}`,
+		`{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":100,"output_tokens":2147483648,"total_tokens":2147483748,"input_tokens_details":{"cache_write_tokens":100,"cache_write_tokens_details":{"ttl_12h_tokens":0,"ttl_30m_tokens":100}}}}}`,
+	} {
+		var event dto.ResponsesStreamResponse
+		require.NoError(t, common.UnmarshalJsonStr(raw, &event))
+		accumulator.Observe(&event, []byte(raw))
+	}
+	usage := accumulator.Finish()
+	assert.Equal(t, 100, usage.PromptTokens)
+	assert.Equal(t, 10, usage.CompletionTokens)
+	assert.Equal(t, 110, usage.TotalTokens)
+	require.NotNil(t, usage.PromptTokensDetails.CacheWriteTokensDetails)
+	assert.Zero(t, usage.PromptTokensDetails.CacheWriteTokensDetails.TTL12hTokens)
+	assert.Equal(t, 100, usage.PromptTokensDetails.CacheWriteTokensDetails.TTL30mTokens)
+	assert.True(t, info.ResponseFacts.UsageReported)
+}
+
+func TestResponsesUsageEstimatesMixedAndCustomTools(t *testing.T) {
+	for _, tc := range []struct{ name, delta, terminal, output string }{
+		{name: "text and terminal function", delta: `{"type":"response.output_text.delta","output_index":0,"delta":"hello "}`, terminal: `{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello "}]},{"type":"function_call","name":"lookup","arguments":"{}"}]}}`, output: "hello lookup{}"},
+		{name: "terminal custom tool", terminal: `{"type":"response.completed","response":{"status":"completed","output":[{"type":"custom_tool_call","name":"apply_patch","input":"hello"}]}}`, output: "apply_patchhello"},
+		{name: "custom tool delta and terminal", delta: `{"type":"response.custom_tool_call_input.delta","output_index":0,"delta":"hello"}`, terminal: `{"type":"response.completed","response":{"status":"completed","output":[{"type":"custom_tool_call","name":"apply_patch","input":"hello"}]}}`, output: "helloapply_patch"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &relaycommon.RelayInfo{TokenizerModel: "gpt-4o", ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "gpt-4o"}, StreamStatus: relaycommon.NewStreamStatus(), ResponseFacts: &relaycommon.ResponseFacts{}}
+			info.SetEstimatePromptTokens(10)
+			accumulator := NewResponsesUsageAccumulator(info)
+			for _, raw := range []string{tc.delta, tc.terminal} {
+				if raw == "" {
+					continue
+				}
+				var event dto.ResponsesStreamResponse
+				require.NoError(t, common.UnmarshalJsonStr(raw, &event))
+				accumulator.Observe(&event, []byte(raw))
+			}
+			usage := accumulator.Finish()
+			assert.Equal(t, 10, usage.PromptTokens)
+			assert.Equal(t, tc.output, info.ResponseFacts.GeneratedText)
+			assert.Equal(t, tokenkit.Count("gpt-4o", tc.output), usage.CompletionTokens)
+			assert.False(t, info.ResponseFacts.UsageReported)
+		})
+	}
+}
+
+func TestRealtimeUsageCorrelatesConcurrentResponses(t *testing.T) {
+	info := &relaycommon.RelayInfo{TokenizerModel: "gpt-4o", ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "upstream"}, OutputAudioFormat: "pcm16", ResponseFacts: &relaycommon.ResponseFacts{}}
+	accumulator := NewRealtimeUsageAccumulator(info)
+	for _, id := range []string{"a", "b"} {
+		result, err := accumulator.Observe([]byte(`{"type":"response.created","response":{"id":"`+id+`","status":"in_progress"}}`), &dto.Usage{PromptTokens: 10}, true)
+		require.NoError(t, err)
+		assert.Nil(t, result)
+	}
+	_, err := accumulator.Observe([]byte(`{"type":"response.output_text.delta","response_id":"a","delta":"hello"}`), nil, true)
+	require.NoError(t, err)
+	audio := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("x", 24000)))
+	for range 2 {
+		_, err := accumulator.Observe([]byte(`{"type":"response.output_audio.delta","response_id":"b","delta":"`+audio+`"}`), nil, true)
+		require.NoError(t, err)
+	}
+	b := []byte(`{"type":"response.done","response":{"id":"b","status":"completed","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0,"input_token_details":{"audio_tokens":0},"output_token_details":{"audio_tokens":0}}}}`)
+	result, err := accumulator.Observe(b, nil, true)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, "b", result.ID)
+	assert.Zero(t, result.Usage.PromptTokens)
+	assert.Zero(t, result.Usage.CompletionTokens)
+	assert.Zero(t, result.Usage.CompletionTokenDetails.AudioTokens)
+	assert.Equal(t, "upstream", result.Usage.UsageSource)
+	assert.Equal(t, 13, *result.Facts.GeneratedOutputTokens)
+	assert.True(t, result.Facts.BusinessOutput)
+	a := []byte(`{"type":"response.done","response":{"id":"a","status":"completed","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"input_token_details":{"cached_tokens":3,"audio_tokens":4},"output_token_details":{"audio_tokens":1}}}}`)
+	result, err = accumulator.Observe(a, nil, true)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, "a", result.ID)
+	assert.Equal(t, 10, result.Usage.PromptTokens)
+	assert.Equal(t, 2, result.Usage.CompletionTokens)
+	assert.Equal(t, 3, result.Usage.PromptTokensDetails.CachedTokens)
+	assert.Equal(t, 4, result.Usage.PromptTokensDetails.AudioTokens)
+	assert.Equal(t, 1, result.Usage.CompletionTokenDetails.AudioTokens)
+	result, err = accumulator.Observe(a, nil, true)
+	require.NoError(t, err)
+	assert.Nil(t, result, "replayed cumulative terminal cannot produce another settlement quantity")
+	assert.Empty(t, accumulator.Finish())
+}
+
+func TestRealtimeUsageEstimatesMissingAudioAcrossChunkBoundaries(t *testing.T) {
+	info := &relaycommon.RelayInfo{TokenizerModel: "gpt-4o", ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "upstream"}, OutputAudioFormat: "pcm16"}
+	accumulator := NewRealtimeUsageAccumulator(info)
+	_, err := accumulator.Observe([]byte(`{"type":"response.created","response":{"id":"audio","status":"in_progress"}}`), &dto.Usage{PromptTokens: 5, PromptTokensDetails: dto.InputTokenDetails{AudioTokens: 4}}, true)
+	require.NoError(t, err)
+	audio := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("x", 24000)))
+	for range 2 {
+		_, err = accumulator.Observe([]byte(`{"type":"response.output_audio.delta","response_id":"audio","delta":"`+audio+`"}`), nil, false)
+		require.NoError(t, err)
+	}
+	_, err = accumulator.Observe([]byte(`{"type":"response.output_audio_transcript.delta","response_id":"audio","delta":"hello"}`), nil, false)
+	require.NoError(t, err)
+	results := accumulator.Finish()
+	require.Len(t, results, 1)
+	assert.Equal(t, 5, results[0].Usage.PromptTokens)
+	assert.Equal(t, 4, results[0].Usage.PromptTokensDetails.AudioTokens)
+	assert.Equal(t, 13, results[0].Usage.CompletionTokens)
+	assert.Equal(t, 13, results[0].Usage.CompletionTokenDetails.AudioTokens)
+	assert.Equal(t, "estimated", results[0].Usage.UsageSource)
+	assert.False(t, results[0].Facts.BusinessOutput, "failed writes preserve procurement evidence without claiming delivery")
+	assert.Empty(t, accumulator.Finish())
+}
 
 func TestResponsesUsageAccumulatorPreservesExplicitZero(t *testing.T) {
 	info := &relaycommon.RelayInfo{
@@ -315,7 +431,7 @@ func TestResponsesUsageAccumulatorMissingUsageEstimation(t *testing.T) {
 				{Type: dto.ResponsesOutputTypeItemDone, Item: &dto.ResponsesOutput{Type: dto.BuildInCallFunctionCall, Name: "shell"}},
 			},
 			wantPrompt:     100,
-			wantCompletion: tokenkit.Count(model, summary+arguments),
+			wantCompletion: tokenkit.Count(model, summary+arguments+"shell"),
 		},
 		{
 			name: "created only then disconnect bills the prompt",

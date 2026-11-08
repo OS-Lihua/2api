@@ -419,11 +419,13 @@ type PreparedWssRequest struct {
 	identity   [32]byte
 	managed    bool
 	retryAfter string
+	statusCode int
 }
 
 func (request *PreparedWssRequest) Headers() http.Header { return request.header.Clone() }
 func (request *PreparedWssRequest) Identity() [32]byte   { return request.identity }
 func (request *PreparedWssRequest) RetryAfter() string   { return request.retryAfter }
+func (request *PreparedWssRequest) HandshakeStatus() int { return request.statusCode }
 
 // PrepareWssRequest performs no Provider I/O.
 func PrepareWssRequest(a ProviderTransport, c *gin.Context, info *common.RelayInfo) (*PreparedWssRequest, error) {
@@ -431,17 +433,25 @@ func PrepareWssRequest(a ProviderTransport, c *gin.Context, info *common.RelayIn
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", err)
 	}
-	fullRequestURL = toWebSocketURL(fullRequestURL)
-	if targetURL, parseErr := url.Parse(fullRequestURL); parseErr == nil {
-		common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, targetURL.Scheme+"://"+targetURL.Host)
-	}
 	targetHeader := http.Header{}
 	err = a.SetupRequestHeader(c, &targetHeader, info)
 	if err != nil {
 		return nil, fmt.Errorf("setup request header failed: %w", err)
 	}
-	// 在 SetupRequestHeader 之后应用 Header Override，确保用户设置优先级最高
-	// 这样可以覆盖默认的 Authorization header 设置
+	return PrepareWssTransport(c, info, fullRequestURL, targetHeader)
+}
+
+// PrepareWssTransport shares the existing socket dialer with independently
+// selected native protocols. It performs no I/O and owns its header copy.
+func PrepareWssTransport(c *gin.Context, info *common.RelayInfo, fullRequestURL string, targetHeader http.Header) (*PreparedWssRequest, error) {
+	fullRequestURL = toWebSocketURL(fullRequestURL)
+	targetURL, err := url.Parse(fullRequestURL)
+	if err != nil || targetURL.Hostname() == "" || targetURL.Scheme != "ws" && targetURL.Scheme != "wss" {
+		return nil, errors.New("invalid upstream WebSocket URL")
+	}
+	common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, targetURL.Scheme+"://"+targetURL.Host)
+	targetHeader = targetHeader.Clone()
+	// Apply the configured Provider header overrides after authentication.
 	headerOverride, err := processHeaderOverride(info, c)
 	if err != nil {
 		return nil, err
@@ -471,6 +481,9 @@ func PrepareWssRequest(a ProviderTransport, c *gin.Context, info *common.RelayIn
 
 func DoPreparedWssRequest(c *gin.Context, request *PreparedWssRequest) (*websocket.Conn, error) {
 	targetConn, resp, err := request.dialer.DialContext(c.Request.Context(), request.url, request.header)
+	if resp != nil {
+		request.statusCode = resp.StatusCode
+	}
 	if err != nil {
 		statusCode := http.StatusInternalServerError
 		if resp != nil {

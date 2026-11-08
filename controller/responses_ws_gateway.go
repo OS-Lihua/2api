@@ -109,11 +109,15 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 			result.SkippedChannel = selection.Channel.ID
 		}
 	}()
-	if call.LockedChannelID != 0 && (selection.Channel.ProviderID != call.LockedProviderID || selection.Channel.UpstreamModelName != call.LockedUpstreamModel) {
+	if call.LockedChannelID != 0 && (selection.Channel.ProviderID != call.LockedProviderID || selection.Provider.Type != call.LockedProviderType || selection.Channel.UpstreamModelName != call.LockedUpstreamModel) {
 		run.fail(c, http.StatusConflict, "connection_locked", "Upstream connection settings changed; reconnect required")
 		return
 	}
-	if apiErr := middleware.SetupContextForSelectedChannel(c, selection.Provider, selection.Channel.Model.ModelName); apiErr != nil {
+	var pinnedKey []int
+	if call.LockedChannelID != 0 {
+		pinnedKey = []int{call.LockedKeyIndex}
+	}
+	if apiErr := middleware.SetupContextForSelectedChannel(c, selection.Provider, selection.Channel.Model.ModelName, pinnedKey...); apiErr != nil {
 		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
 		return
 	}

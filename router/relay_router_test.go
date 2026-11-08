@@ -328,17 +328,24 @@ func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 	for _, tc := range []struct {
 		name, terminal, source, status   string
 		sale, cost                       int64
+		credentials                      bool
 		delta, cancel, disconnect, probe bool
 	}{
 		{name: "partial usage without delivery", terminal: `{"type":"response.failed","response":{"id":"active","status":"failed","error":{"code":"server_error"},"usage":{"input_tokens":1000}}}`, source: "none", status: "failed", cost: 1_000_000},
+		{name: "valid base counters with invalid total", terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":"invalid"}}}`, source: "upstream", status: "success", sale: 1_836_000, cost: 1_020_000},
 		{name: "terminal function call without usage", terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"function_call","name":"hello","arguments":""}]}}`, source: "estimated", status: "success", sale: 5400, cost: 3000},
 		{name: "purchase probes use final wire and Provider header", terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010}}}`, source: "upstream", status: "success", sale: 1_836_000, cost: 510_000, probe: true},
+		{name: "client credentials never become Provider authentication", terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":1000,"output_tokens":10}}}`, source: "upstream", status: "success", sale: 1_836_000, cost: 1_020_000, credentials: true},
 		{name: "cancel retains complete reported usage", terminal: `{"type":"response.cancelled","response":{"id":"active","status":"cancelled","usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010}}}`, source: "upstream", status: "cancelled", sale: 1_836_000, cost: 1_020_000, delta: true, cancel: true},
 		{name: "disconnect settles generated output once", source: "estimated", status: "cancelled", sale: 5400, cost: 3000, delta: true, disconnect: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			upstreamDone := make(chan struct{})
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				if tc.credentials {
+					assert.Equal(t, "Bearer provider-secret", r.Header.Get("Authorization"))
+					assert.Empty(t, r.Header.Get("Sec-WebSocket-Protocol"))
+				}
 				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
 				if !assert.NoError(t, err) {
 					return
@@ -382,6 +389,9 @@ func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("header_override", `{"X-Provider-Tier":"purchase"}`).Error)
 				require.NoError(t, model.CreatePriceVersion(t.Context(), &price, fixture.sale.CreatedBy))
 				fixture.fake.Advance(2 * time.Second)
+			}
+			if tc.credentials {
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("header_override", `{"Authorization":"{client_header:Authorization}","Sec-WebSocket-Protocol":"{client_header:Sec-WebSocket-Protocol}","*":""}`).Error)
 			}
 			client := dialResponsesGateway(t, fixture)
 			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","input":"hello","max_output_tokens":16}`)))
@@ -542,7 +552,9 @@ func TestResponsesWSGatewaySettlesLogicalRequests(t *testing.T) {
 	var provider model.Provider
 	require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
 	provider.SetSetting(dto.ProviderSettings{ResponsesWebSocketEnabled: true})
-	require.NoError(t, model.DB.Model(&provider).Update("setting", provider.Setting).Error)
+	provider.Key = "provider-secret\nspare-secret"
+	provider.ProviderInfo = model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}
+	require.NoError(t, model.DB.Model(&provider).Select("key", "channel_info", "setting").Updates(&provider).Error)
 	gateway := httptest.NewServer(fixture.engine)
 	defer gateway.Close()
 	client, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(gateway.URL, "http")+"/v1/responses", http.Header{"Authorization": {"Bearer sk-" + fixture.token.Key}})

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/nontextprotocol"
@@ -198,6 +199,58 @@ type PreparedChannelRequest struct {
 }
 
 func (r *PreparedChannelRequest) Headers() http.Header { return r.request.Header.Clone() }
+
+// PrepareNativeWebSocketRequest composes the selected Provider account with
+// the native wire protocol and the existing WebSocket dialer. Client credentials
+// are removed after authentication, before Provider header templates run.
+func PrepareNativeWebSocketRequest(c *gin.Context, info *relaycommon.RelayInfo, kind protocol.Type) (*channel.PreparedWssRequest, error) {
+	if kind != protocol.OpenAIResponses {
+		return nil, errors.New("unsupported native WebSocket protocol")
+	}
+	provider := GetProviderAdapter(info.ApiType)
+	if provider == nil {
+		return nil, errors.New("unsupported Provider transport")
+	}
+	providerContext := c.Copy()
+	providerContext.Request = c.Request.Clone(c.Request.Context())
+	credentialHeaders := []string{"Authorization", "X-API-Key", "X-Goog-API-Key", "Mj-API-Secret", "Cookie", "Proxy-Authorization", "Sec-WebSocket-Protocol"}
+	transportInfo := *info
+	providerMetadata := *info.ProviderMeta
+	headers := relaycommon.GetEffectiveHeaderOverride(info)
+	for name, value := range headers {
+		template, ok := value.(string)
+		if !ok {
+			continue
+		}
+		for _, credential := range credentialHeaders {
+			if strings.EqualFold(strings.TrimSpace(template), "{client_header:"+credential+"}") {
+				delete(headers, name)
+				break
+			}
+		}
+	}
+	providerMetadata.HeadersOverride = headers
+	transportInfo.ProviderMeta = &providerMetadata
+	transportInfo.UseRuntimeHeadersOverride, transportInfo.RuntimeHeadersOverride = true, headers
+	for _, name := range credentialHeaders {
+		providerContext.Request.Header.Del(name)
+	}
+	providerContext.Request.URL.RawQuery = ""
+	providerContext.Request.RequestURI = providerContext.Request.URL.RequestURI()
+	adaptor := &ChannelAdaptor{provider: provider, kind: kind}
+	prepared, err := adaptor.PrepareRequest(providerContext, &transportInfo, strings.NewReader(""))
+	if err != nil {
+		return nil, err
+	}
+	if prepared.request.URL == nil {
+		return nil, errors.New("Provider has no native WebSocket endpoint")
+	}
+	socket, err := channel.PrepareWssTransport(providerContext, &transportInfo, prepared.request.URL.String(), prepared.Headers())
+	if err == nil {
+		common.SetContextKey(c, constant.ContextKeyUpstreamRequestOrigin, common.GetContextKeyString(providerContext, constant.ContextKeyUpstreamRequestOrigin))
+	}
+	return socket, err
+}
 
 func (a *ChannelAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
 	prepared, err := a.PrepareRequest(c, info, requestBody)

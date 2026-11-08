@@ -245,6 +245,20 @@ func CountTokenInput(input any, model string) int {
 	return CountTokenInput(fmt.Sprintf("%v", input), model)
 }
 
+func CountRealtimeAudioTokens(byteCount int64, audioFormat string, input bool) int {
+	if byteCount <= 0 {
+		return 0
+	}
+	return realtimeAudioTokenCount(realtimeAudioDuration(byteCount, audioFormat), input)
+}
+
+func realtimeAudioTokenCount(duration float64, input bool) int {
+	if input {
+		return common.QuotaFromFloat(duration / 60 * 100 / 0.06)
+	}
+	return common.QuotaFromFloat(duration / 60 * 200 / 0.24)
+}
+
 func CountAudioTokenInput(audioBase64 string, audioFormat string) (int, error) {
 	if audioBase64 == "" {
 		return 0, nil
@@ -254,7 +268,7 @@ func CountAudioTokenInput(audioBase64 string, audioFormat string) (int, error) {
 		return 0, err
 	}
 	// duration 来自用户提供的音频元数据，饱和转换防止 int 回绕
-	return common.QuotaFromFloat(duration / 60 * 100 / 0.06), nil
+	return realtimeAudioTokenCount(duration, true), nil
 }
 
 func CountAudioTokenOutput(audioBase64 string, audioFormat string) (int, error) {
@@ -266,5 +280,5 @@ func CountAudioTokenOutput(audioBase64 string, audioFormat string) (int, error) 
 		return 0, err
 	}
 	// duration 来自上游返回的音频元数据，饱和转换防止 int 回绕
-	return common.QuotaFromFloat(duration / 60 * 200 / 0.24), nil
+	return realtimeAudioTokenCount(duration, false), nil
 }

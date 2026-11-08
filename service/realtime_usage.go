@@ -1,0 +1,222 @@
+package service
+
+import (
+	"errors"
+	"math"
+	"slices"
+	"strings"
+
+	"github.com/MoeForge/moego/base64"
+	"github.com/MoeForge/moego/ojson"
+	"github.com/QuantumNous/new-api/constant"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/tokenkit"
+)
+
+// RealtimeUsageResult contains one native response's quantitative facts. Raw
+// events, audio and generated text never belong in a durable settlement intent.
+type RealtimeUsageResult = relaycommon.RealtimeResponseFacts
+
+type realtimeResponseUsage struct {
+	info               *relaycommon.RelayInfo
+	accumulator        *ResponsesUsageAccumulator
+	input              *dto.Usage
+	audioBytes         int64
+	audioReported      bool
+	inputAudioReported bool
+}
+
+// RealtimeUsageAccumulator correlates native response IDs, including concurrent
+// conversation:none responses. It reuses Responses counter normalization and
+// presence handling; it does not reserve, price, post or publish anything.
+// A single transport owner must call Observe and Finish.
+type RealtimeUsageAccumulator struct {
+	info          *relaycommon.RelayInfo
+	active        map[string]*realtimeResponseUsage
+	completed     map[string]bool
+	identityBytes int
+	identityLimit int
+}
+
+func NewRealtimeUsageAccumulator(info *relaycommon.RelayInfo) *RealtimeUsageAccumulator {
+	maximum := constant.MaxRequestBodyMB
+	if maximum <= 0 {
+		maximum = 128
+	}
+	return &RealtimeUsageAccumulator{info: info, active: map[string]*realtimeResponseUsage{}, completed: map[string]bool{}, identityLimit: maximum << 20}
+}
+
+// Observe records one upstream event after the downstream write has either
+// succeeded or failed. delivered never means merely buffered or parsed.
+// input is the known native conversation/input estimate at response creation;
+// declared output budgets are not input usage.
+func (accumulator *RealtimeUsageAccumulator) Observe(raw []byte, input *dto.Usage, delivered bool) (*RealtimeUsageResult, error) {
+	kind := ojson.GetBytes(raw, "type").String()
+	if !strings.HasPrefix(kind, "response.") {
+		return nil, nil
+	}
+	id := ojson.GetBytes(raw, "response.id").String()
+	if id == "" {
+		id = ojson.GetBytes(raw, "response_id").String()
+	}
+	if id == "" {
+		return nil, errors.New("Realtime response event has no response identity")
+	}
+	if accumulator.completed[id] {
+		return nil, nil
+	}
+	state := accumulator.active[id]
+	if state == nil {
+		// Retain completed IDs for the session so a late terminal can never
+		// charge again. Bound this identity inventory by the existing body
+		// memory budget instead of silently evicting financial identities.
+		if len(id)+64 > accumulator.identityLimit-accumulator.identityBytes {
+			return nil, errors.New("Realtime response identity budget exceeded")
+		}
+		accumulator.identityBytes += len(id) + 64
+		info := &relaycommon.RelayInfo{TokenizerModel: accumulator.info.TokenizerModelName(),
+			ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: accumulator.info.GetUpstreamModelName()},
+			StreamStatus: relaycommon.NewStreamStatus(), ResponseFacts: &relaycommon.ResponseFacts{}}
+		info.ResponseFacts.OnBusinessOutput = func() {
+			if accumulator.info.ResponseFacts != nil {
+				accumulator.info.ResponseFacts.MarkBusinessOutput()
+			}
+		}
+		if input == nil {
+			input = &dto.Usage{}
+		}
+		info.SetEstimatePromptTokens(input.PromptTokens)
+		state = &realtimeResponseUsage{info: info, accumulator: NewResponsesUsageAccumulator(info), input: GatewayUsageSnapshot(input)}
+		accumulator.active[id] = state
+	}
+	document := ojson.NewDoc(raw)
+	for _, field := range []struct{ old, current string }{
+		{"response.usage.input_token_details", "response.usage.input_tokens_details"},
+		{"response.usage.output_token_details", "response.usage.output_tokens_details"},
+	} {
+		if value := ojson.GetBytes(raw, field.old); value.Exists() {
+			if err := document.SetRawBytes(field.current, []byte(value.Raw)); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if kind == "response.text.delta" {
+		if err := document.Set("type", "response.output_text.delta"); err != nil {
+			return nil, err
+		}
+	}
+	if reason := ojson.GetBytes(raw, "response.status_details.reason"); reason.Type == ojson.String {
+		if err := document.Set("response.incomplete_details.reason", reason.String()); err != nil {
+			return nil, err
+		}
+	}
+	if failure := ojson.GetBytes(raw, "response.status_details.error"); failure.IsObject() {
+		if err := document.SetRawBytes("response.error", []byte(failure.Raw)); err != nil {
+			return nil, err
+		}
+	}
+	normalized := document.Bytes()
+	event, err := DecodeResponsesStreamEvent(normalized)
+	if err != nil {
+		return nil, err
+	}
+	if event.Response != nil && event.Response.Usage != nil {
+		if valid, _ := relaycommon.NativeUsagePresence(normalized, "response.usage.output_tokens_details.audio_tokens", "", ""); valid {
+			state.audioReported = true
+		}
+		if valid, _ := relaycommon.NativeUsagePresence(normalized, "response.usage.input_tokens_details.audio_tokens", "", ""); valid {
+			state.inputAudioReported = true
+		}
+	}
+	if kind == "response.audio.delta" || kind == "response.output_audio.delta" {
+		audio, err := base64.StdEncoding.DecodeString(event.Delta)
+		if err != nil {
+			return nil, errors.New("invalid Realtime audio delta")
+		}
+		if int64(len(audio)) > math.MaxInt64-state.audioBytes {
+			return nil, errors.New("Realtime audio quantity overflow")
+		}
+		state.audioBytes += int64(len(audio))
+	}
+	state.accumulator.Observe(event, normalized)
+	if delivered && realtimeBusinessOutput(event) {
+		state.info.ResponseFacts.MarkBusinessOutput()
+	}
+	if kind != "response.done" {
+		return nil, nil
+	}
+	state.info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
+	result := accumulator.finish(id, state)
+	return &result, nil
+}
+
+func (accumulator *RealtimeUsageAccumulator) finish(id string, state *realtimeResponseUsage) RealtimeUsageResult {
+	usage := state.accumulator.Finish()
+	facts := state.info.ResponseFacts
+	text := tokenkit.Count(state.info.TokenizerModelName(), facts.GeneratedText)
+	audio := CountRealtimeAudioTokens(state.audioBytes, accumulator.info.OutputAudioFormat, false)
+	generated := text + audio
+	facts.GeneratedOutputTokens = &generated
+	estimated := !facts.UsageReported
+	if !facts.CompletionTokensReported {
+		usage.CompletionTokens = max(usage.CompletionTokens, generated)
+	}
+	if !facts.PromptTokensReported && generated > 0 {
+		usage.PromptTokens = state.input.PromptTokens
+	}
+	if !state.audioReported && audio > 0 && (!facts.CompletionTokensReported || usage.CompletionTokens > 0) {
+		usage.CompletionTokenDetails.AudioTokens = min(audio, usage.CompletionTokens)
+		estimated = true
+	}
+	if !state.inputAudioReported && state.input.PromptTokensDetails.AudioTokens > 0 && (!facts.PromptTokensReported || usage.PromptTokens > 0) {
+		usage.PromptTokensDetails.AudioTokens = min(state.input.PromptTokensDetails.AudioTokens, usage.PromptTokens)
+		estimated = true
+	}
+	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	if estimated {
+		usage.UsageSource = "estimated"
+	} else {
+		usage.UsageSource = "upstream"
+	}
+	delete(accumulator.active, id)
+	accumulator.completed[id] = true
+	return RealtimeUsageResult{ID: id, Usage: usage, Facts: facts, Outcome: state.info.StreamStatus.OutcomeSnapshot()}
+}
+
+// Finish preserves the evidence for every still-active response on disconnect.
+// Calling it again produces no additional quantitative results.
+func (accumulator *RealtimeUsageAccumulator) Finish() []RealtimeUsageResult {
+	ids := make([]string, 0, len(accumulator.active))
+	for id := range accumulator.active {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	results := make([]RealtimeUsageResult, 0, len(ids))
+	for _, id := range ids {
+		results = append(results, accumulator.finish(id, accumulator.active[id]))
+	}
+	return results
+}
+
+func realtimeBusinessOutput(event *dto.ResponsesStreamResponse) bool {
+	switch event.Type {
+	case "response.output_text.delta", "response.text.delta", "response.audio.delta", "response.output_audio.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.reasoning_text.delta", "response.reasoning_summary_text.delta", "response.refusal.delta":
+		return event.Delta != ""
+	case "response.output_item.added", "response.output_item.done":
+		return event.Item != nil && (event.Item.Name != "" || len(event.Item.Arguments) > 0 || event.Item.Result != "")
+	}
+	if event.Response != nil {
+		for _, output := range event.Response.Output {
+			if output.Name != "" || len(output.Arguments) > 0 || output.Result != "" {
+				return true
+			}
+			for _, content := range output.Content {
+				if content.Text != "" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}

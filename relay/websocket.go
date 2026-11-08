@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/pkg/wsmanager"
+	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -15,47 +16,62 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-func WssHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
-	info.InitChannelMeta(c)
+func WssHelper(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
+	usage, apiErr := exchangeRealtime(c, info, nil, nil)
+	if apiErr == nil {
+		service.PostWssConsumeQuota(c, info, info.UpstreamModelName, usage.(*dto.RealtimeUsage), nil)
+	}
+	return apiErr
+}
 
+// exchangeRealtime is the native session transport shared by legacy and wallet
+// requests. The caller owns the request's reservation and final settlement.
+func exchangeRealtime(c *gin.Context, info *relaycommon.RelayInfo, prepared *relaychannel.PreparedWssRequest, connected func()) (any, *types.NewAPIError) {
+	if prepared == nil {
+		info.InitChannelMeta(c)
+	}
 	adaptor := GetAdaptor(info.ApiType)
 	if adaptor == nil {
-		return types.NewError(fmt.Errorf("invalid api type: %d", info.ApiType), types.ErrorCodeInvalidApiType, types.ErrOptionWithSkipRetry())
+		return nil, types.NewError(fmt.Errorf("invalid api type: %d", info.ApiType), types.ErrorCodeInvalidApiType, types.ErrOptionWithSkipRetry())
 	}
 	adaptor.Init(info)
-	//var requestBody io.Reader
-	//firstWssRequest, _ := c.Get("first_wss_request")
-	//requestBody = bytes.NewBuffer(firstWssRequest.([]byte))
-
-	statusCodeMappingStr := c.GetString("status_code_mapping")
-	resp, err := adaptor.DoRequest(c, info, nil)
+	var target *websocket.Conn
+	var err error
+	if prepared == nil {
+		var response any
+		response, err = adaptor.DoRequest(c, info, nil)
+		if response != nil {
+			target, _ = response.(*websocket.Conn)
+		}
+	} else {
+		target, err = relaychannel.DoPreparedWssRequest(c, prepared)
+	}
 	if err != nil {
-		return types.NewError(err, types.ErrorCodeDoRequestFailed)
+		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
 	}
-
-	if resp != nil {
-		info.TargetWs = resp.(*websocket.Conn)
-		defer info.TargetWs.Close()
-		var closeOnce sync.Once
-		unregister := wsmanager.Register(info.ChannelId, wsmanager.KindRealtime, func(reason string) {
-			closeOnce.Do(func() {
-				deadline := time.Now().Add(time.Second)
-				closeMessage := websocket.FormatCloseMessage(websocket.ClosePolicyViolation, reason)
-				_ = info.ClientWs.WriteControl(websocket.CloseMessage, closeMessage, deadline)
-				_ = info.TargetWs.WriteControl(websocket.CloseMessage, closeMessage, deadline)
-				_ = info.ClientWs.Close()
-				_ = info.TargetWs.Close()
-			})
+	if target == nil {
+		return nil, types.NewError(fmt.Errorf("missing upstream WebSocket connection"), types.ErrorCodeBadResponse)
+	}
+	info.TargetWs = target
+	defer target.Close()
+	var closeOnce sync.Once
+	unregister := wsmanager.Register(info.ChannelId, wsmanager.KindRealtime, func(reason string) {
+		closeOnce.Do(func() {
+			deadline := time.Now().Add(time.Second)
+			message := websocket.FormatCloseMessage(websocket.ClosePolicyViolation, reason)
+			_ = info.ClientWs.WriteControl(websocket.CloseMessage, message, deadline)
+			_ = target.WriteControl(websocket.CloseMessage, message, deadline)
+			_ = info.ClientWs.Close()
+			_ = target.Close()
 		})
-		defer unregister()
+	})
+	defer unregister()
+	if connected != nil {
+		connected()
 	}
-
-	usage, newAPIError := adaptor.DoResponse(c, nil, info)
-	if newAPIError != nil {
-		// reset status code 重置状态码
-		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
-		return newAPIError
+	usage, apiErr := adaptor.DoResponse(c, nil, info)
+	if apiErr != nil {
+		service.ResetStatusCode(apiErr, c.GetString("status_code_mapping"))
 	}
-	service.PostWssConsumeQuota(c, info, info.UpstreamModelName, usage.(*dto.RealtimeUsage), nil)
-	return nil
+	return usage, apiErr
 }

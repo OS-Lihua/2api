@@ -21,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	appmodel "github.com/QuantumNous/new-api/model"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
+	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/pkg/wsmanager"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -53,6 +54,8 @@ type ResponsesWSCall struct {
 	Body                []byte
 	LegacyConnection    bool
 	LockedChannelID     int
+	LockedKeyIndex      int
+	LockedProviderType  int
 	LockedProviderID    int
 	LockedUpstreamModel string
 	session             *responsesWSSession
@@ -62,12 +65,7 @@ type ResponsesWSCall struct {
 
 // Prepare uses the existing Provider transport without sending any bytes.
 func (call *ResponsesWSCall) Prepare(c *gin.Context, info *relaycommon.RelayInfo) (*relaychannel.PreparedWssRequest, error) {
-	adaptor := GetAdaptor(info.ApiType)
-	if adaptor == nil {
-		return nil, errors.New("unsupported Provider transport")
-	}
-	adaptor.Init(info)
-	prepared, err := relaychannel.PrepareWssRequest(adaptor, c, info)
+	prepared, err := PrepareNativeWebSocketRequest(c, info, protocol.OpenAIResponses)
 	if err != nil {
 		return nil, err
 	}
@@ -99,6 +97,7 @@ func (call *ResponsesWSCall) Exchange(c *gin.Context, info *relaycommon.RelayInf
 			return nil, types.NewError(context.Canceled, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
 		}
 		s.gatewayChannelID, s.gatewayProviderID, s.gatewayUpstreamModel = channelID, providerID, info.UpstreamModelName
+		s.gatewayKeyIndex, s.gatewayProviderType = info.ChannelMultiKeyIndex, info.ChannelType
 		s.gatewayTransportIdentity = prepared.Identity()
 		s.registerChannelClose(providerID)
 		s.startTargetReader(target)
@@ -177,6 +176,8 @@ type responsesWSSession struct {
 	runner                   ResponsesWSRequestRunner
 	gateway                  ResponsesWSGateway
 	gatewayChannelID         int
+	gatewayKeyIndex          int
+	gatewayProviderType      int
 	gatewayProviderID        int
 	gatewayTransportIdentity [32]byte
 	gatewayUpstreamModel     string
@@ -333,7 +334,7 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
 		c.Request.ContentLength = int64(len(create.Body))
 		if s.gateway != nil {
 			call := &ResponsesWSCall{Request: create.Request, Body: create.Body, LegacyConnection: s.lockedChannelID != 0, LockedChannelID: s.gatewayChannelID,
-				LockedProviderID: s.gatewayProviderID, LockedUpstreamModel: s.gatewayUpstreamModel, session: s, state: state, create: create}
+				LockedProviderID: s.gatewayProviderID, LockedKeyIndex: s.gatewayKeyIndex, LockedProviderType: s.gatewayProviderType, LockedUpstreamModel: s.gatewayUpstreamModel, session: s, state: state, create: create}
 			if handled, gatewayErr := s.gateway(c, call); handled {
 				return gatewayErr
 			}
@@ -481,7 +482,9 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 	}
 
 	usage, receiveErr := s.receive(c, state, info, create)
-	ConsumeResponsesQuota(c, info, usage)
+	if receiveErr == nil {
+		ConsumeResponsesQuota(c, info, usage)
+	}
 	return receiveErr
 }
 
@@ -514,9 +517,12 @@ func (s *responsesWSSession) receive(c *gin.Context, state *responsesWSCallState
 				dto.ResponsesStreamResponse
 				StreamID string `json:"stream_id"`
 			}
-			if err := common.Unmarshal(incoming.body, &event); err != nil {
+			decoded, decodeErr := service.DecodeResponsesStreamEvent(incoming.body)
+			if decodeErr != nil {
 				info.StreamStatus.RecordError("invalid upstream websocket event")
 			} else {
+				event.ResponsesStreamResponse = *decoded
+				event.StreamID = ojson.GetBytes(incoming.body, "stream_id").String()
 				if event.Type != "error" && event.StreamID != "" && event.StreamID != create.StreamID {
 					if err := s.writeClient(incoming.kind, incoming.body); err != nil {
 						s.shutdown(websocket.CloseInternalServerErr, "")
@@ -666,7 +672,7 @@ func (s *responsesWSSession) deliver(info *relaycommon.RelayInfo, incoming respo
 	}
 	business := false
 	switch event.Type {
-	case "response.output_text.delta", "response.function_call_arguments.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.refusal.delta", "response.audio.delta", "response.output_audio.delta":
+	case "response.output_text.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.refusal.delta", "response.audio.delta", "response.output_audio.delta":
 		business = event.Delta != ""
 	case "response.output_item.added", "response.output_item.done":
 		business = event.Item != nil && (event.Item.Name != "" || len(event.Item.Arguments) > 0 || event.Item.Result != "")

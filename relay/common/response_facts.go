@@ -12,6 +12,15 @@ func ChatUsagePresence(body []byte) (prompt, completion bool) {
 	return NativeUsagePresence(body, "usage.prompt_tokens", "usage.completion_tokens", "usage.total_tokens")
 }
 
+// RealtimeResponseFacts is transient evidence for one native response. The
+// lifecycle stores quantitative usage and frozen pricing, never this object.
+type RealtimeResponseFacts struct {
+	ID      string
+	Usage   *dto.Usage
+	Facts   *ResponseFacts
+	Outcome StreamOutcome
+}
+
 // ResponseFacts separates upstream-reported zero usage from a local estimate,
 // and business output from protocol framing and keep-alive pings. It contains
 // transient output only; callers must never persist GeneratedText.

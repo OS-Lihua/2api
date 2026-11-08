@@ -38,6 +38,7 @@ var responsesWSTestUserSequence atomic.Int64
 
 func setupResponsesWSRequestTest(t *testing.T) (*model.User, *model.Token) {
 	t.Helper()
+	require.NoError(t, i18n.Init())
 	previousRedis := common.RedisEnabled
 	previousRDB := common.RDB
 	previousMaster, previousMemory := common.IsMasterNode, common.MemoryCacheEnabled
@@ -161,8 +162,12 @@ func TestResponsesWSRequestRunnerRefreshesBillingContextAndCleansBody(t *testing
 		assert.Equal(t, "ws-second", c.GetString(common.RequestIdKey))
 		_, leaked := c.Get("previous_turn")
 		assert.False(t, leaked)
-		_, leaked = c.Get(common.KeyBodyStorage)
-		assert.False(t, leaked)
+		currentStorage, err := common.GetBodyStorage(c)
+		require.NoError(t, err)
+		assert.NotSame(t, storage, currentStorage)
+		body, err := currentStorage.Bytes()
+		require.NoError(t, err)
+		assert.JSONEq(t, `{"input":"second"}`, string(body))
 		return nil
 	}))
 }

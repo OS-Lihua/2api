@@ -612,6 +612,60 @@ func newTestWebSocketPair(t *testing.T) (*websocket.Conn, *websocket.Conn, func(
 	return target, serverConn, cleanup
 }
 
+func TestRealtimeTransportDeduplicatesNativeResponseUsage(t *testing.T) {
+	client, gatewayClient, closeClient := newTestWebSocketPair(t)
+	defer closeClient()
+	gatewayTarget, provider, closeTarget := newTestWebSocketPair(t)
+	defer closeTarget()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime?model=public", nil)
+	info := relaycommon.GenRelayInfoWs(c, gatewayClient)
+	info.ProviderMeta = &relaycommon.ProviderMeta{ApiType: constant.APITypeOpenAI, ChannelType: constant.ChannelTypeOpenAI, UpstreamModelName: "gpt-4o"}
+	info.TargetWs = gatewayTarget
+	info.TokenizerModel = "gpt-4o"
+	info.UsePrice = true // The legacy transport fixture must not access quota storage.
+	info.ResponseFacts = &relaycommon.ResponseFacts{}
+	type outcome struct {
+		usage *dto.RealtimeUsage
+		err   *types.NewAPIError
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		adaptor := GetAdaptor(constant.APITypeOpenAI)
+		adaptor.Init(info)
+		usage, err := adaptor.DoResponse(c, nil, info)
+		converted, _ := usage.(*dto.RealtimeUsage)
+		done <- outcome{converted, err}
+	}()
+	events := []string{
+		`{"type":"response.output_text.delta","response_id":"a","delta":"hello"}`,
+		`{"type":"response.done","response":{"id":"a","status":"completed","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"input_token_details":{"text_tokens":6,"audio_tokens":4,"cached_tokens":3},"output_token_details":{"text_tokens":1,"audio_tokens":1}}}}`,
+		`{"type":"response.done","response":{"id":"a","status":"completed","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}`,
+		`{"type":"response.done","response":{"id":"b","status":"completed","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`,
+	}
+	for _, event := range events {
+		require.NoError(t, provider.WriteMessage(websocket.TextMessage, []byte(event)))
+	}
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+	for range len(events) {
+		_, _, err := client.ReadMessage()
+		require.NoError(t, err)
+	}
+	require.NoError(t, provider.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second)))
+	select {
+	case result := <-done:
+		require.Nil(t, result.err)
+		require.NotNil(t, result.usage)
+		assert.Equal(t, 10, result.usage.InputTokens)
+		assert.Equal(t, 2, result.usage.OutputTokens)
+		assert.Equal(t, 4, result.usage.InputTokenDetails.AudioTokens)
+		assert.Equal(t, 3, result.usage.InputTokenDetails.CachedTokens)
+		assert.Equal(t, 1, result.usage.OutputTokenDetails.AudioTokens)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Realtime transport did not stop")
+	}
+}
+
 func TestResponsesWSGatewayTransportKeepsOneConnection(t *testing.T) {
 	var connections atomic.Int32
 	upstreamDone := make(chan struct{})
