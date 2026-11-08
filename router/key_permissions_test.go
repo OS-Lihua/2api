@@ -324,6 +324,10 @@ func TestKeyPermissionsIdentityVisibilityAndDeletion(t *testing.T) {
 		call := adminSecurityRequest(f.engine, f.token.Key, http.MethodPost, "/v1/chat/completions", fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"Hello"}]}`, name))
 		assert.Equal(t, http.StatusUnauthorized, call.Code, call.Body.String())
 	}
+	for _, path := range []string{"/api/usage/token/", "/api/log/token"} {
+		response := adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, path, "")
+		assert.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
+	}
 }
 
 func TestKeyPermissionsListDetailAndCall(t *testing.T) {

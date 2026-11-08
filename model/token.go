@@ -235,17 +235,7 @@ func validateUserToken(key string, checkQuota bool) (token *Token, err error) {
 	if key == "" {
 		return nil, ErrTokenNotProvided
 	}
-	token, err = GetTokenByKey(key, false)
-	if err == nil && common.RedisEnabled {
-		// Cache invalidation can fail while a credential mutation still commits.
-		// Recheck identity restrictions in the primary database, while retaining
-		// the atomic quota counters used by the legacy relay.
-		cachedToken := token
-		token, err = GetTokenByKey(key, true)
-		if err == nil && token.Id == cachedToken.Id {
-			token.RemainQuota, token.UsedQuota = cachedToken.RemainQuota, cachedToken.UsedQuota
-		}
-	}
+	token, err = GetTokenCredential(key)
 	if err == nil {
 		if token.Status == common.TokenStatusExhausted ||
 			token.Status == common.TokenStatusExpired ||
@@ -299,6 +289,27 @@ func GetTokenById(id int) (*Token, error) {
 	var err error = nil
 	err = DB.First(&token, "id = ?", id).Error
 	return &token, err
+}
+
+// GetTokenCredential reads identity restrictions from the primary database even
+// when invalidation failed during a committed mutation. Atomic quota counters
+// for the same Key remain sourced from Redis for legacy authentication.
+func GetTokenCredential(key string) (*Token, error) {
+	if key == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var cachedToken *Token
+	if common.RedisEnabled {
+		cachedToken, _ = cacheGetTokenByKey(key)
+	}
+	token, err := GetTokenByKey(key, true)
+	if err != nil {
+		return nil, err
+	}
+	if cachedToken != nil && token.Id == cachedToken.Id {
+		token.RemainQuota, token.UsedQuota = cachedToken.RemainQuota, cachedToken.UsedQuota
+	}
+	return token, nil
 }
 
 func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
