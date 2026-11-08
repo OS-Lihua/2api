@@ -65,6 +65,24 @@ type ResponseFacts struct {
 	StreamHeaders map[string][]string `json:"-"`
 }
 
+// RecordChatSource retains generated facts when a native transport fails after
+// returning a decodable response. It does not confirm downstream delivery.
+func (facts *ResponseFacts) RecordChatSource(response *dto.OpenAITextResponse) {
+	var text strings.Builder
+	for _, choice := range response.Choices {
+		text.WriteString(choice.Message.StringContent())
+		text.WriteString(choice.Message.GetReasoningContent())
+		for _, call := range choice.Message.ParseToolCalls() {
+			facts.SourceOutputObserved = true
+			text.WriteString(call.Function.Name)
+			text.WriteString(call.Function.Arguments)
+			text.Write(call.Custom)
+		}
+	}
+	facts.SourceGeneratedText = text.String()
+	facts.SourceOutputObserved = facts.SourceOutputObserved || facts.SourceGeneratedText != ""
+}
+
 // MarkBusinessOutput records accepted content and disarms first-byte budgets.
 // Metadata and keep-alive writers must not call this method.
 func (facts *ResponseFacts) MarkBusinessOutput() {

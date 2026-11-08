@@ -8,6 +8,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/protocol"
+	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -146,6 +147,10 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	facts.IndependentUsageReported = meter.ReportedCounters()
 	if readErr != nil {
 		return usage, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
+	}
+	if captured, ok := resp.Body.(channel.ResponseErrorCarrier); ok && captured.ResponseError() != nil {
+		observeGatewayError(info, body)
+		return usage, captured.ResponseError()
 	}
 	normalized, err := meter.NormalizedBody(body)
 	if err != nil {

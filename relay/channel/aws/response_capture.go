@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/aws/aws-sdk-go-v2/aws"
 )
 
@@ -41,6 +42,7 @@ func (capture *awsJSONResponseCapture) Do(request *http.Request) (*http.Response
 type awsJSONSourceBody struct {
 	*bytes.Reader
 	readErr error
+	failure *types.NewAPIError
 }
 
 func (body *awsJSONSourceBody) Read(target []byte) (int, error) {
@@ -50,4 +52,6 @@ func (body *awsJSONSourceBody) Read(target []byte) (int, error) {
 	}
 	return n, err
 }
+func (body *awsJSONSourceBody) ResponseError() *types.NewAPIError { return body.failure }
+
 func (*awsJSONSourceBody) Close() error { return nil }

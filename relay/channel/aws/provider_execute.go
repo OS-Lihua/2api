@@ -168,7 +168,14 @@ func (prepared *awsPreparedInvocation) execute(c *gin.Context) (*http.Response, 
 			return capture.response, nil
 		}
 		if err != nil {
-			return nil, prepared.failure(parent, err, "InvokeModel")
+			failure := prepared.failure(parent, err, "InvokeModel")
+			if prepared.managed && capture != nil && capture.response != nil {
+				if body, ok := capture.response.Body.(*awsJSONSourceBody); ok {
+					body.failure = failure
+				}
+				return capture.response, nil
+			}
+			return nil, failure
 		}
 		response := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(output.Body))}
 		response.Header.Set("Content-Type", "application/json")

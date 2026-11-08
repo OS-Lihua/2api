@@ -8,7 +8,12 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/tidwall/sjson"
 )
+
+func (*BaiduChatRequest) SetChatOutputLimit(body []byte, limit uint) ([]byte, error) {
+	return sjson.SetBytes(body, "max_output_tokens", limit)
+}
 
 func (*BaiduChatRequest) ChatRequestCapabilities() channel.NativeChatCapabilities {
 	return channel.NativeChatCapabilities{Parameters: []string{"max_tokens", "max_completion_tokens", "temperature", "top_p", "frequency_penalty", "user"}, ContentTypes: []string{dto.ContentTypeText}}

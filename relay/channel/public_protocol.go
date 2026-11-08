@@ -14,6 +14,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// ResponseErrorCarrier preserves a transport adapter's failure while the
+// protocol extracts received source usage before returning that failure.
+type ResponseErrorCarrier interface {
+	ResponseError() *types.NewAPIError
+}
+
 // PublicProtocol applies the shared normalization for the selected public DTO.
 // Explicit scalar zero values remain present on the new protocol path.
 type PublicProtocol struct {

@@ -458,8 +458,8 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		run.fail(c, http.StatusServiceUnavailable, "billing_unavailable", "Billing is unavailable")
 		return
 	}
-	if limit := effective.GetMaxTokens(); limit > 0 {
-		mean = min(mean, int64(limit))
+	if effective.MaxTokens != nil || effective.MaxCompletionTokens != nil {
+		mean = min(mean, int64(effective.GetMaxTokens()))
 	}
 	if limit := selection.Capabilities.Limits.MaxOutputTokens; limit != nil {
 		mean = min(mean, *limit)

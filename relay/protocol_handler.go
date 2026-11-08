@@ -142,7 +142,7 @@ func (a *ChannelAdaptor) SetChatOutputLimit(converted any, body []byte, limit ui
 	case *dto.GeminiChatRequest, dto.GeminiChatRequest:
 		key = "generationConfig"
 	default:
-		return body, nil
+		return nil, errors.New("native request cannot enforce the output limit")
 	}
 	var wire map[string]common.RawMessage
 	if err := common.Unmarshal(body, &wire); err != nil {

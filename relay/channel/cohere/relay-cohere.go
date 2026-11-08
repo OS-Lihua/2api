@@ -104,6 +104,7 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	createdTime := common.GetTimestamp()
 	usage := &dto.Usage{}
 	var responseText strings.Builder
+	finished := false
 	if info.StreamStatus == nil {
 		info.StreamStatus = relaycommon.NewStreamStatus()
 	}
@@ -113,6 +114,12 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	scanner := helper.NewStreamScanner(resp.Body)
 	helper.SetEventStreamHeaders(c)
 	for scanner.Scan() {
+		if strings.TrimSpace(scanner.Text()) == "" {
+			continue
+		}
+		if finished {
+			return usage, types.NewError(fmt.Errorf("Cohere stream contains data after completion"), types.ErrorCodeBadResponseBody)
+		}
 		info.SetFirstResponseTime()
 		body := scanner.Bytes()
 		if info.ResponseFacts != nil {
@@ -154,7 +161,7 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			}
 			info.StreamStatus.MarkCompleted()
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
-			break
+			finished = true
 		}
 	}
 	if err := scanner.Err(); err != nil {

@@ -206,18 +206,27 @@ func zhipuStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 
 func zhipuHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	var zhipuResponse ZhipuResponse
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
-	}
+	responseBody, readErr := io.ReadAll(resp.Body)
 	service.CloseResponseBodyGracefully(resp)
-	err = common.Unmarshal(responseBody, &zhipuResponse)
+	var knownUsage *dto.Usage
+	if info.ResponseFacts != nil {
+		knownUsage = &zhipuResponse.Data.Usage
+		info.ResponseFacts.RecordNativeUsage(knownUsage, responseBody, "data.usage.prompt_tokens", "data.usage.completion_tokens")
+		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "data.usage")
+	}
+	err := common.Unmarshal(responseBody, &zhipuResponse)
 	if err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		return knownUsage, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	if info.ResponseFacts != nil {
 		prompt, completion := relaycommon.NativeUsagePresence(responseBody, "data.usage.prompt_tokens", "data.usage.completion_tokens", "data.usage.total_tokens")
 		info.ResponseFacts.RecordUsage(&zhipuResponse.Data.Usage, &zhipuResponse.Data.Usage, prompt, completion)
+	}
+	if readErr != nil {
+		if info.ResponseFacts != nil {
+			info.ResponseFacts.RecordChatSource(responseZhipu2OpenAI(&zhipuResponse))
+		}
+		return knownUsage, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
 	if !zhipuResponse.Success {
 		return &zhipuResponse.Data.Usage, types.WithOpenAIError(types.OpenAIError{

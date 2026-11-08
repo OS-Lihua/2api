@@ -185,22 +185,28 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 
 func tencentHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	var tencentSb TencentChatResponseSB
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
-	}
+	responseBody, readErr := io.ReadAll(resp.Body)
 	service.CloseResponseBodyGracefully(resp)
+	var knownUsage *dto.Usage
 	if info.ResponseFacts != nil {
+		knownUsage = &dto.Usage{}
+		info.ResponseFacts.RecordNativeUsage(knownUsage, responseBody, "Response.Usage.PromptTokens", "Response.Usage.CompletionTokens")
 		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "Response.Usage")
 	}
-	err = common.Unmarshal(responseBody, &tencentSb)
+	err := common.Unmarshal(responseBody, &tencentSb)
 	if err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		return knownUsage, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	fullTextResponse := responseTencent2OpenAI(&tencentSb.Response)
 	if info.ResponseFacts != nil {
 		prompt, completion := relaycommon.NativeUsagePresence(responseBody, "Response.Usage.PromptTokens", "Response.Usage.CompletionTokens", "Response.Usage.TotalTokens")
 		info.ResponseFacts.RecordUsage(&fullTextResponse.Usage, &fullTextResponse.Usage, prompt, completion)
+	}
+	if readErr != nil {
+		if info.ResponseFacts != nil {
+			info.ResponseFacts.RecordChatSource(fullTextResponse)
+		}
+		return &fullTextResponse.Usage, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
 	if tencentSb.Response.Error.Code != 0 {
 		return &fullTextResponse.Usage, types.WithOpenAIError(types.OpenAIError{

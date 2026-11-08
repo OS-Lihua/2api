@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/tidwall/sjson"
 )
 
 type AwsClaudeRequest struct {
@@ -93,6 +94,14 @@ func (*NovaRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAIRequ
 		public.Temperature, public.TopP, public.TopK, public.Stop = config.Temperature, config.TopP, config.TopK, config.StopSequences
 	}
 	return &public, nil
+}
+
+func (*NovaRequest) SetChatOutputLimit(body []byte, limit uint) ([]byte, error) {
+	return sjson.SetBytes(body, "inferenceConfig.maxTokens", limit)
+}
+
+func (*AwsClaudeRequest) SetChatOutputLimit(body []byte, limit uint) ([]byte, error) {
+	return sjson.SetBytes(body, "max_tokens", limit)
 }
 
 type NovaRequest struct {

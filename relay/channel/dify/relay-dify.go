@@ -252,6 +252,10 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	helper.SetEventStreamHeaders(c)
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		info.StreamStatus.RequireTerminal()
+		if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil && info.StreamStatus.CompletedNormally() {
+			sr.Error(errors.New("Dify stream contains data after completion"))
+			return
+		}
 		if info.ResponseFacts != nil {
 			data = string(relaycommon.SanitizeNativeUsage([]byte(data), "metadata.usage"))
 		}
@@ -275,7 +279,9 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 				usage = &difyResponse.MetaData.Usage
 			}
 			info.StreamStatus.MarkCompleted()
-			sr.Done()
+			if info.ResponseFacts == nil || info.ResponseFacts.OnBusinessOutput == nil {
+				sr.Done()
+			}
 			return
 		} else if difyResponse.Event == "error" {
 			if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
@@ -353,18 +359,17 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 
 func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	var difyResponse DifyChatCompletionResponse
-	responseBody, err := io.ReadAll(resp.Body)
-
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
-	}
+	responseBody, readErr := io.ReadAll(resp.Body)
 	service.CloseResponseBodyGracefully(resp)
+	var knownUsage *dto.Usage
 	if info.ResponseFacts != nil {
+		knownUsage = &difyResponse.MetaData.Usage
+		info.ResponseFacts.RecordNativeUsage(knownUsage, responseBody, "metadata.usage.prompt_tokens", "metadata.usage.completion_tokens")
 		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "metadata.usage")
 	}
-	err = common.Unmarshal(responseBody, &difyResponse)
+	err := common.Unmarshal(responseBody, &difyResponse)
 	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+		return knownUsage, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	if info.ResponseFacts != nil {
 		if err := info.ResponseFacts.RecordChatUsage(&difyResponse.MetaData.Usage, responseBody, "metadata.usage"); err != nil {
@@ -386,6 +391,12 @@ func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 		FinishReason: "stop",
 	}
 	fullTextResponse.Choices = append(fullTextResponse.Choices, choice)
+	if readErr != nil {
+		if info.ResponseFacts != nil {
+			info.ResponseFacts.RecordChatSource(&fullTextResponse)
+		}
+		return knownUsage, types.NewError(readErr, types.ErrorCodeBadResponseBody)
+	}
 	if info.ResponseFacts != nil {
 		return helper.WriteChatResponse(c, info, resp, &fullTextResponse)
 	}

@@ -4,7 +4,12 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/tidwall/sjson"
 )
+
+func (*XunfeiChatRequest) SetChatOutputLimit(body []byte, limit uint) ([]byte, error) {
+	return sjson.SetBytes(body, "parameter.chat.max_tokens", limit)
+}
 
 func (*XunfeiChatRequest) ChatRequestCapabilities() channel.NativeChatCapabilities {
 	return channel.NativeChatCapabilities{Parameters: []string{"max_tokens", "max_completion_tokens", "temperature", "top_k"}, ContentTypes: []string{dto.ContentTypeText}}

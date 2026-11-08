@@ -89,6 +89,9 @@ func (p *novaProtocol) DoResponse(c *gin.Context, resp *http.Response, info *rel
 		info.ResponseFacts.SourceGeneratedText = response.Choices[0].Message.StringContent()
 		info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceGeneratedText != ""
 	}
+	if captured, ok := resp.Body.(channel.ResponseErrorCarrier); ok && captured.ResponseError() != nil {
+		return usage, captured.ResponseError()
+	}
 	if readErr != nil {
 		return usage, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
 	}
