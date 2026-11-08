@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/money"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"gorm.io/gorm"
 )
 
 type TaskStatus string
@@ -560,6 +561,15 @@ func (t *Task) Snapshot() taskSnapshot {
 		PluginState:  t.PrivateData.PluginState,
 		PollFailures: t.PrivateData.PollFailures,
 	}
+}
+
+// BeforeSave excludes a discarded response from both task creation and later
+// updates. The in-memory data remains available for its one-time response.
+func (t *Task) BeforeSave(tx *gorm.DB) error {
+	if t.PrivateData.ResultDiscarded {
+		tx.Statement.Omits = append(tx.Statement.Omits, "data")
+	}
+	return nil
 }
 
 func (Task *Task) Update() error {

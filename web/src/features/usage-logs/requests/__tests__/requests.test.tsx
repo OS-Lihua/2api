@@ -753,6 +753,7 @@ it('shows pending task facts in the existing request view and preserves explicit
 it.each(['pending', 'submission_unknown'])(
   'shows %s task amounts as pending and preserves explicit zero after completion',
   async (status) => {
+    client.setDefaultOptions({ queries: { retry: false, staleTime: Infinity } })
     useAuthStore.getState().auth.setUser({
       id: 7,
       username: 'admin',

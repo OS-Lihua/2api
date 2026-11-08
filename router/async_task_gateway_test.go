@@ -923,6 +923,70 @@ func TestAsyncTaskRecoveryDoesNotStarveLaterTerminalFacts(t *testing.T) {
 	}
 }
 
+func TestAsyncTaskImmediateImagesReturnOnceWithoutPersistingResults(t *testing.T) {
+	for _, path := range []string{"/doubao/api/v3/images/generations", "/v1/images/generations"} {
+		t.Run(path, func(t *testing.T) {
+			calls := 0
+			const imageURL = "https://artifact.invalid/retention-image.png"
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				assert.Equal(t, "/api/v3/images/generations", r.URL.Path)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"model":"doubao-seedream-5-0-pro-260628","data":[{"url":%q,"size":"2048x2048"}],"usage":{"generated_images":1}}`, imageURL)
+			})
+			source, err := plugins.Source("doubao")
+			require.NoError(t, err)
+			jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+			_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "doubao"})
+			require.NoError(t, err)
+			require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:doubao", "upstream_model_name": "doubao-seedream-5-0-pro-260628"}).Error)
+			fixture.fake.Advance(time.Second)
+			for _, price := range []*model.PriceVersion{
+				{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("image", (u("images_up_to_1_5k") + u("images_above_1_5k")) * 0.1)`, EffectiveAt: clock.Now().Unix()},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("image", (u("images_up_to_1_5k") + u("images_above_1_5k")) * 0.05)`, EffectiveAt: clock.Now().Unix()},
+			} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			SetTaskPluginProtocolRouter(fixture.engine)
+			builder := newPluginGenerationBuilder(fixture.engine.Routes(), nil, productionPluginRouteHandlers)
+			require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(builder.prepare))
+			dispatcher := &pluginRouteDispatcher{registry: jsplugin.DefaultRegistry}
+			fixture.engine.NoRoute(dispatcher.dispatch)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, `{"model":"gateway-alias","prompt":"A bird","size":"2K","response_format":"url"}`)
+			require.Equal(t, 200, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), imageURL, "the client must receive the complete result once")
+			var task model.Task
+			require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
+			assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
+			assert.True(t, task.PrivateData.ResultDiscarded)
+			assert.Empty(t, task.Data, "inline image responses must not be stored")
+			query := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodGet, "/v1/tasks/"+task.TaskID, "")
+			assert.Equal(t, 200, query.Code, "task metadata remains available without the discarded result")
+			var metadata map[string]any
+			require.NoError(t, common.Unmarshal(query.Body.Bytes(), &metadata))
+			assert.NotContains(t, metadata, "data")
+			query = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodGet, "/v1/tasks/"+task.TaskID+"/artifacts", "")
+			require.Equal(t, 200, query.Code)
+			var artifacts struct {
+				Items []struct{ Key string } `json:"artifacts"`
+			}
+			require.NoError(t, common.Unmarshal(query.Body.Bytes(), &artifacts))
+			assert.Empty(t, artifacts.Items, "discarded results must not expose retrievable artifacts")
+			assert.Equal(t, 1, calls)
+			requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, "success", requests[0].Status)
+			assert.EqualValues(t, 90000000, requests[0].Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), requests[0].ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.EqualValues(t, 50000000, attempts[0].Cost.Nanos)
+			assert.Equal(t, money.Currency("USD"), attempts[0].Cost.Currency)
+		})
+	}
+}
+
 func TestAsyncTaskRejectsUnboundedDurationBeforeReservation(t *testing.T) {
 	calls := 0
 	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {

@@ -322,6 +322,7 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 				pending.FailReason = "Task failed"
 			}
 		}
+		applyTaskResultRetention(c, pending, parsed.Immediate)
 		// Publish acceptance only after the shared runner finalizes its Attempt.
 		// Once visible to pollers, submission must never save this stale row again.
 		accepted = pending
