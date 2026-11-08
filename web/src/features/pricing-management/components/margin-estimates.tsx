@@ -30,82 +30,94 @@ export function MarginEstimates(props: { estimates: MarginEstimate[] }) {
   const { t, i18n } = useTranslation()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   return (
-    <StaticDataTable
-      data={props.estimates}
-      getRowKey={(row, index) =>
-        `${row.model_offering_id}:${row.channel_id}:${index}`
-      }
-      getRowClassName={(row) => (row.negative ? 'text-destructive' : undefined)}
-      tableProps={{ 'aria-label': t('Estimated channel margins') }}
-      columns={[
-        {
-          id: 'offering',
-          header: t('Model Offering ID'),
-          cell: (row) => `#${row.model_offering_id}`,
-        },
-        {
-          id: 'channel',
-          header: t('Channel ID'),
-          cell: (row) => `#${row.channel_id}`,
-        },
-        {
-          id: 'margin',
-          header: t('Gross margin'),
-          cell: (row) => (
-            <RequestMoney
-              amount={row.margin ?? undefined}
-              pending={!row.margin}
-            />
-          ),
-        },
-        {
-          id: 'provider',
-          header: t('Provider ID'),
-          cell: (row) => `#${row.provider_id}`,
-        },
-        {
-          id: 'samples',
-          header: t('Usage samples'),
-          cell: (row) => formatNumber(row.samples, locale),
-        },
-        {
-          id: 'revenue',
-          header: t('Revenue'),
-          cell: (row) => (
-            <RequestMoney
-              amount={row.revenue ?? undefined}
-              pending={!row.revenue}
-            />
-          ),
-        },
-        {
-          id: 'cost',
-          header: t('Purchase cost'),
-          cell: (row) => (
-            <RequestMoney amount={row.cost ?? undefined} pending={!row.cost} />
-          ),
-        },
-        {
-          id: 'status',
-          header: t('Status'),
-          cell: (row) => {
-            if (row.negative) return t('Sale price below purchase price')
-            if (row.status === 'estimated') return t('Estimated')
-            if (row.status === 'missing_sale_price') {
-              return t('Missing sale price')
-            }
-            if (row.status === 'missing_purchase_price') {
-              return t('Missing purchase price')
-            }
-            if (row.status === 'missing_fx') return t('Missing exchange rate')
-            if (row.status === 'no_usage_history') {
-              return t('No usage in the last seven days')
-            }
-            return t('Insufficient pricing facts')
+    <div className='space-y-3'>
+      <p className='text-muted-foreground text-sm'>
+        {t(
+          'Sale estimates use the lowest applicable group discount multiplier.'
+        )}
+      </p>
+      <StaticDataTable
+        data={props.estimates}
+        getRowKey={(row, index) =>
+          `${row.model_offering_id}:${row.channel_id}:${index}`
+        }
+        getRowClassName={(row) =>
+          row.negative ? 'text-destructive' : undefined
+        }
+        tableProps={{ 'aria-label': t('Estimated channel margins') }}
+        columns={[
+          {
+            id: 'offering',
+            header: t('Model Offering ID'),
+            cell: (row) => `#${row.model_offering_id}`,
           },
-        },
-      ]}
-    />
+          {
+            id: 'channel',
+            header: t('Channel ID'),
+            cell: (row) => `#${row.channel_id}`,
+          },
+          {
+            id: 'margin',
+            header: t('Gross margin'),
+            cell: (row) => (
+              <RequestMoney
+                amount={row.margin ?? undefined}
+                pending={!row.margin}
+              />
+            ),
+          },
+          {
+            id: 'provider',
+            header: t('Provider ID'),
+            cell: (row) => `#${row.provider_id}`,
+          },
+          {
+            id: 'samples',
+            header: t('Usage samples'),
+            cell: (row) => formatNumber(row.samples, locale),
+          },
+          {
+            id: 'revenue',
+            header: t('Revenue'),
+            cell: (row) => (
+              <RequestMoney
+                amount={row.revenue ?? undefined}
+                pending={!row.revenue}
+              />
+            ),
+          },
+          {
+            id: 'cost',
+            header: t('Purchase cost'),
+            cell: (row) => (
+              <RequestMoney
+                amount={row.cost ?? undefined}
+                pending={!row.cost}
+              />
+            ),
+          },
+          {
+            id: 'status',
+            header: t('Status'),
+            cell: (row) => {
+              if (row.negative) return t('Sale price below purchase price')
+              if (row.status === 'estimated') return t('Estimated')
+              if (row.status === 'missing_sale_price') {
+                return t('Missing sale price')
+              }
+              if (row.status === 'missing_purchase_price') {
+                return t('Missing purchase price')
+              }
+              if (row.status === 'missing_fx') return t('Missing exchange rate')
+              if (row.status === 'no_usage_history') {
+                return t('No usage in the last seven days')
+              }
+              return t('Insufficient pricing facts')
+            },
+          },
+        ]}
+      />
+    </div>
   )
 }
 

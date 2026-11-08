@@ -65,7 +65,11 @@ func CheckPriceMargins(ctx context.Context, tx *gorm.DB, proposal *PriceVersion,
 		copy.ID, copy.CreatedBy, copy.CreatedAt = 0, 0, 0
 		copy.MarginCheck = nil
 		proposal = &copy
-		at = time.Unix(proposal.EffectiveAt, 0)
+		// Backdated versions can affect new requests, whose counterpart prices
+		// are current. Planned versions use their future effective instant.
+		if effectiveAt := time.Unix(proposal.EffectiveAt, 0); effectiveAt.After(at) {
+			at = effectiveAt
+		}
 		report.EffectiveAt = proposal.EffectiveAt
 	}
 	if fx != nil {
@@ -85,8 +89,26 @@ func CheckPriceMargins(ctx context.Context, tx *gorm.DB, proposal *PriceVersion,
 	if err := query.Find(&offerings).Error; err != nil {
 		return nil, err
 	}
-	var fingerprint []any
+	fingerprint := []any{SettlementCurrency()}
 	for _, offering := range offerings {
+		groups := offering.Groups
+		if offering.Visibility != "groups" {
+			groups = nil
+		}
+		discounts, err := ExactGroupDiscounts(groups)
+		if err != nil {
+			return nil, err
+		}
+		// All-user offerings also admit unconfigured groups at the identity
+		// discount. Use the lowest eligible sale discount to expose any loss.
+		discount := decimal.NewFromInt(1)
+		hasDiscount := offering.Visibility != "groups"
+		for _, ratio := range discounts {
+			if !hasDiscount || ratio.LessThan(discount) {
+				discount = ratio
+			}
+			hasDiscount = true
+		}
 		ids := make([]int, len(offering.Members))
 		for i := range offering.Members {
 			ids[i] = offering.Members[i].ModelID
@@ -141,7 +163,7 @@ func CheckPriceMargins(ctx context.Context, tx *gorm.DB, proposal *PriceVersion,
 			// Bind private overrides without returning their contents. The outer
 			// confirmation MAC prevents offline guesses of configuration values.
 			overridesDigest := sha256.Sum256([]byte(channel.ParameterOverrides))
-			fingerprint = append(fingerprint, offering, channel, sale, purchase, fmt.Sprintf("%x", overridesDigest))
+			fingerprint = append(fingerprint, offering, channel, sale, purchase, fmt.Sprintf("%x", overridesDigest), discount.String())
 			switch {
 			case saleErr != nil:
 			case purchaseErr != nil:
@@ -182,6 +204,10 @@ func CheckPriceMargins(ctx context.Context, tx *gorm.DB, proposal *PriceVersion,
 					estimate.Status = purchaseStatus
 					break
 				}
+				saleValue, err = money.MulUnitPrice(discount, saleValue)
+				if err != nil {
+					return nil, err
+				}
 				if saleRate != nil {
 					saleValue, err = saleValue.Convert(*saleRate)
 					if err != nil {
@@ -218,9 +244,10 @@ func CheckPriceMargins(ctx context.Context, tx *gorm.DB, proposal *PriceVersion,
 			report.Estimates = append(report.Estimates, estimate)
 		}
 	}
-	// Include the exact proposal and evaluated estimates. A stale confirmation
-	// cannot authorize a different price, FX quote or affected combination.
-	fingerprint = append(fingerprint, proposal, fx, report.Estimates)
+	// Bind the draft and financial configuration, not moving usage statistics.
+	// Every write still recomputes its estimate; normal traffic cannot revoke
+	// an explicit loss approval for the same price and configuration.
+	fingerprint = append(fingerprint, proposal, fx)
 	revision, err := marginConfirmationRevision("price", fingerprint)
 	if err != nil {
 		return nil, err

@@ -67,7 +67,11 @@ func TestMarginBulkDraftBindingHTTP(t *testing.T) {
 }
 
 func TestMarginBulkConfirmationHTTP(t *testing.T) {
-	fixture := newTextGatewayFixture(t, func(http.ResponseWriter, *http.Request) {})
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, err := fmt.Fprint(w, `{"choices":[{"message":{"content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+		assert.NoError(t, err)
+	})
 	manager := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "pricing:write", "channel:write", "channel:operate")
 	source := fmt.Sprintf(`{"rows":[{"resource":"channels","action":"confirm","data":{"id":%d}},{"resource":"price-versions","action":"create","data":{"owner_type":"channel","owner_id":%d,"currency":"USD","expression":"tier(\"purchase\",fixed(2))"}},{"resource":"price-versions","action":"create","data":{"owner_type":"model_offering","owner_id":%d,"currency":"USD","expression":"tier(\"sale\",fixed(1))"}}]}`, fixture.channel.ID, fixture.channel.ID, fixture.offering.ID)
 	preview := adminSecurityRequest(fixture.engine, manager, http.MethodPost, "/api/admin/v1/bulk-import?dry_run=true", source)
@@ -85,6 +89,8 @@ func TestMarginBulkConfirmationHTTP(t *testing.T) {
 	rejected := adminSecurityRequest(fixture.engine, manager, http.MethodPost, "/api/admin/v1/bulk-import", source)
 	require.Equal(t, http.StatusConflict, rejected.Code, rejected.Body.String())
 	fixture.fake.Advance(3 * time.Second)
+	traffic := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	require.Equal(t, http.StatusOK, traffic.Code, traffic.Body.String())
 	request := httptest.NewRequest(http.MethodPost, "/api/admin/v1/bulk-import", strings.NewReader(source))
 	request.Header.Set("Authorization", "Bearer "+manager)
 	request.Header.Set("Content-Type", "application/json")
@@ -100,6 +106,105 @@ func TestMarginBulkConfirmationHTTP(t *testing.T) {
 	}
 	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &committed))
 	assert.True(t, committed.Data.Committed)
+}
+
+func TestMarginPriceConfirmationContextHTTP(t *testing.T) {
+	for _, change := range []string{"new usage", "new current purchase price", "new planned purchase price", "sale discount", "special sale discount", "precise sale discount"} {
+		t.Run(change, func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, err := fmt.Fprint(w, `{"choices":[{"message":{"content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+				assert.NoError(t, err)
+			})
+			if change == "special sale discount" {
+				common.OptionMapRWMutex.Lock()
+				common.OptionMap["GroupRatio"] = `{"default":0.9,"excluded":0.1}`
+				common.OptionMap["GroupGroupRatio"] = `{"default":{"default":0.5}}`
+				common.OptionMapRWMutex.Unlock()
+				fixture.offering.Visibility, fixture.offering.Groups = "groups", []string{"default"}
+				require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+			}
+			if change == "precise sale discount" {
+				common.OptionMapRWMutex.Lock()
+				common.OptionMap["GroupRatio"] = `{"default":0.900000000000000001}`
+				common.OptionMapRWMutex.Unlock()
+			}
+			body := `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`
+			traffic := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", body)
+			require.Equal(t, http.StatusOK, traffic.Code, traffic.Body.String())
+			manager := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "pricing:read", "pricing:write")
+			expression := `tier("sale",fixed(0.000001))`
+			if strings.Contains(change, "sale discount") {
+				expression = `p * 1.05 + c * 2.1`
+			}
+			draft := map[string]any{"owner_type": "model_offering", "owner_id": fixture.offering.ID, "currency": "USD", "expression": expression}
+			if change == "new planned purchase price" {
+				draft["effective_at"] = clock.Now().Unix() + 120
+			}
+			encoded, err := common.Marshal(draft)
+			require.NoError(t, err)
+			warning := adminSecurityRequest(fixture.engine, manager, http.MethodPost, "/api/admin/v1/price-versions", string(encoded))
+			require.Equal(t, http.StatusConflict, warning.Code, warning.Body.String())
+			var initial struct {
+				Data model.PriceMarginReport `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(warning.Body.Bytes(), &initial))
+			require.Len(t, initial.Data.Estimates, 1)
+			if strings.Contains(change, "sale discount") {
+				estimate := initial.Data.Estimates[0]
+				require.NotNil(t, estimate.Revenue)
+				require.NotNil(t, estimate.Cost)
+				require.NotNil(t, estimate.Margin)
+				revenue, margin := int64(18900), int64(-1100)
+				if change == "special sale discount" {
+					revenue, margin = 10500, -9500
+				}
+				if change == "precise sale discount" {
+					revenue = 18901
+				}
+				assert.Equal(t, revenue, estimate.Revenue.Nanos)
+				assert.EqualValues(t, 20000, estimate.Cost.Nanos)
+				assert.Equal(t, margin, estimate.Margin.Nanos)
+				return
+			}
+			fixture.fake.Advance(2 * time.Second)
+			var purchase model.PriceVersion
+			if change == "new usage" {
+				traffic = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", body)
+				require.Equal(t, http.StatusOK, traffic.Code, traffic.Body.String())
+			} else {
+				purchaseTime := clock.Now().Unix()
+				if change == "new planned purchase price" {
+					purchaseTime += 30
+				}
+				updated := adminSecurityRequest(fixture.engine, manager, http.MethodPost, "/api/admin/v1/price-versions", fmt.Sprintf(`{"owner_type":"channel","owner_id":%d,"currency":"USD","expression":"p * 1.1 + c * 2.2","effective_at":%d}`, fixture.channel.ID, purchaseTime))
+				require.Equal(t, http.StatusOK, updated.Code, updated.Body.String())
+				var reply struct {
+					Data model.PriceVersion `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(updated.Body.Bytes(), &reply))
+				purchase = reply.Data
+			}
+			draft["effective_at"], draft["margin_confirmation"] = initial.Data.EffectiveAt, initial.Data.Revision
+			encoded, err = common.Marshal(draft)
+			require.NoError(t, err)
+			confirmed := adminSecurityRequest(fixture.engine, manager, http.MethodPost, "/api/admin/v1/price-versions", string(encoded))
+			if change == "new usage" {
+				require.Equal(t, http.StatusOK, confirmed.Code, confirmed.Body.String())
+				return
+			}
+			require.Equal(t, http.StatusConflict, confirmed.Code, confirmed.Body.String())
+			var refreshed struct {
+				Data model.PriceMarginReport `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(confirmed.Body.Bytes(), &refreshed))
+			require.Len(t, refreshed.Data.Estimates, 1)
+			assert.NotEqual(t, initial.Data.Revision, refreshed.Data.Revision)
+			assert.Equal(t, purchase.ID, refreshed.Data.Estimates[0].PurchasePriceVersionID)
+			require.NotNil(t, refreshed.Data.Estimates[0].Cost)
+			assert.EqualValues(t, 22000, refreshed.Data.Estimates[0].Cost.Nanos)
+		})
+	}
 }
 
 func TestMarginMixedCurrencyHTTP(t *testing.T) {
