@@ -55,6 +55,26 @@ func NewStreamScanner(reader io.Reader, maxBytes ...int) *bufio.Scanner {
 	return scanner
 }
 
+// NewSSEEventScanner shares event framing and retains incomplete source data
+// for procurement observers without presenting it as a delivered event.
+func NewSSEEventScanner(reader io.Reader, facts *relaycommon.ResponseFacts) *bufio.Scanner {
+	scanner := NewStreamScanner(reader)
+	scanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
+		advance, token, err := splitSSEEvents(data, atEOF)
+		if err != nil && facts != nil {
+			facts.UnterminatedStreamData = []byte(ParseSSEEvent(string(data)).Data)
+		}
+		return advance, token, err
+	})
+	return scanner
+}
+
+type SSEEvent struct {
+	Event   string
+	Data    string
+	HasData bool
+}
+
 // splitSSEEvents confirms the blank line that terminates an SSE event. EOF
 // cannot complete a pending data event; comments without data may be discarded.
 func splitSSEEvents(data []byte, atEOF bool) (int, []byte, error) {
@@ -79,7 +99,7 @@ func splitSSEEvents(data []byte, atEOF bool) (int, []byte, error) {
 		lineStart, index = next, next
 	}
 	if atEOF {
-		if _, hasData := sseEventData(string(data)); hasData {
+		if ParseSSEEvent(string(data)).HasData {
 			return 0, nil, io.ErrUnexpectedEOF
 		}
 		return len(data), nil, nil
@@ -87,25 +107,31 @@ func splitSSEEvents(data []byte, atEOF bool) (int, []byte, error) {
 	return 0, nil, nil
 }
 
-func sseEventData(event string) (string, bool) {
+// ParseSSEEvent joins data fields and retains the event name of one record.
+func ParseSSEEvent(event string) SSEEvent {
 	event = strings.TrimPrefix(event, "\xef\xbb\xbf")
 	event = strings.ReplaceAll(event, "\r\n", "\n")
 	event = strings.ReplaceAll(event, "\r", "\n")
 	var data strings.Builder
-	hasData := false
+	result := SSEEvent{}
 	for line := range strings.SplitSeq(event, "\n") {
 		field, value, _ := strings.Cut(line, ":")
+		value = strings.TrimPrefix(value, " ")
+		if field == "event" {
+			result.Event = value
+			continue
+		}
 		if field != "data" {
 			continue
 		}
-		value = strings.TrimPrefix(value, " ")
-		if hasData {
+		if result.HasData {
 			data.WriteByte('\n')
 		}
 		data.WriteString(value)
-		hasData = true
+		result.HasData = true
 	}
-	return data.String(), hasData
+	result.Data = data.String()
+	return result
 }
 
 func copyCodexSSEHeaders(c *gin.Context, resp *http.Response) {
@@ -259,14 +285,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	defer cleanup()
 
 	if managed {
-		scanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
-			advance, token, err := splitSSEEvents(data, atEOF)
-			if err != nil {
-				partial, _ := sseEventData(string(data))
-				info.ResponseFacts.UnterminatedStreamData = []byte(partial)
-			}
-			return advance, token, err
-		})
+		scanner = NewSSEEventScanner(resp.Body, info.ResponseFacts)
 	} else {
 		scanner.Split(bufio.ScanLines)
 	}
@@ -385,11 +404,11 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			}
 
 			if managed {
-				var hasData bool
-				data, hasData = sseEventData(data)
-				if !hasData {
+				event := ParseSSEEvent(data)
+				if !event.HasData {
 					continue
 				}
+				data = event.Data
 			} else {
 				var hasDataPrefix bool
 				data, hasDataPrefix = strings.CutPrefix(data, "data:")

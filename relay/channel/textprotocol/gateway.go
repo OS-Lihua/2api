@@ -248,26 +248,7 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		}
 		return usage, types.NewError(fmt.Errorf("upstream response contained no business output"), types.ErrorCodeBadResponse)
 	}
-	for key, values := range resp.Header {
-		if len(values) > 0 && service.ShouldCopyUpstreamHeader(c, key, values) {
-			c.Writer.Header().Set(key, values[0])
-		}
-	}
-	c.Writer.Header().Set("Content-Length", fmt.Sprint(len(encoded)))
-	c.Writer.WriteHeader(resp.StatusCode)
-	written, writeErr := c.Writer.Write(encoded)
-	if writeErr == nil && written != len(encoded) {
-		writeErr = io.ErrShortWrite
-	}
-	if writeErr != nil {
-		facts.DownstreamWriteFailed = true
-		return usage, types.NewError(writeErr, types.ErrorCodeBadResponse)
-	}
-	if business {
-		facts.MarkBusinessOutput()
-	}
-	if err := helper.FlushWriter(c); err != nil {
-		facts.DownstreamWriteFailed = true
+	if err := helper.WriteGatewayJSONResponse(c, resp, facts, encoded, business); err != nil {
 		return usage, types.NewError(err, types.ErrorCodeBadResponse)
 	}
 	if p.format == types.RelayFormatOpenAIResponses {

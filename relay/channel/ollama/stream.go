@@ -438,14 +438,11 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		}},
 		Usage: *usage,
 	}
-	out, _ := common.Marshal(full)
-	writeErr := service.IOCopyBytesGracefully(c, resp, out)
 	if info.ResponseFacts != nil {
-		info.ResponseFacts.DownstreamWriteFailed = writeErr != nil
-		if writeErr == nil && resp.StatusCode == http.StatusOK && info.ResponseFacts.GeneratedText != "" {
-			info.ResponseFacts.MarkBusinessOutput()
-		}
+		return helper.WriteChatResponse(c, info, resp, &full)
 	}
+	out, _ := common.Marshal(full)
+	_ = service.IOCopyBytesGracefully(c, resp, out)
 	return usage, nil
 }
 

@@ -244,6 +244,19 @@ func streamResponseDify2OpenAI(difyResponse DifyChunkChatCompletionResponse) *dt
 	return &response
 }
 
+func recordDifyStreamUsage(info *relaycommon.RelayInfo, usage *dto.Usage, data string, reported *dto.Usage) error {
+	prompt, completion := relaycommon.ChatUsagePresence([]byte(ojson.Get(data, "metadata").Raw))
+	if rawUsage := ojson.Get(data, "metadata.usage"); rawUsage.IsObject() {
+		previousPrompt, previousCompletion := usage.PromptTokens, usage.CompletionTokens
+		if err := common.UnmarshalJsonStr(rawUsage.Raw, usage); err != nil {
+			return err
+		}
+		usage.PromptTokens, usage.CompletionTokens = previousPrompt, previousCompletion
+	}
+	info.ResponseFacts.RecordUsage(usage, reported, prompt, completion)
+	return nil
+}
+
 func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	var responseText string
 	usage := &dto.Usage{}
@@ -262,16 +275,10 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			return
 		}
 		if info.ResponseFacts != nil {
-			prompt, completion := relaycommon.ChatUsagePresence([]byte(ojson.Get(data, "metadata").Raw))
-			if rawUsage := ojson.Get(data, "metadata.usage"); rawUsage.IsObject() {
-				previousPrompt, previousCompletion := usage.PromptTokens, usage.CompletionTokens
-				if err := common.UnmarshalJsonStr(rawUsage.Raw, usage); err != nil {
-					sr.Error(err)
-					return
-				}
-				usage.PromptTokens, usage.CompletionTokens = previousPrompt, previousCompletion
+			if err := recordDifyStreamUsage(info, usage, data, &difyResponse.MetaData.Usage); err != nil {
+				sr.Error(err)
+				return
 			}
-			info.ResponseFacts.RecordUsage(usage, &difyResponse.MetaData.Usage, prompt, completion)
 		}
 		if difyResponse.Event == "message_end" {
 			if info.ResponseFacts == nil {
@@ -319,6 +326,18 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			sr.Stop(fmt.Errorf("Dify stream delivery failed"))
 		}
 	})
+	if info.ResponseFacts != nil && len(info.ResponseFacts.UnterminatedStreamData) > 0 {
+		partial := info.ResponseFacts.UnterminatedStreamData
+		info.ResponseFacts.UnterminatedStreamData = nil
+		var reported DifyChunkChatCompletionResponse
+		if common.Unmarshal(partial, &reported) == nil {
+			_ = recordDifyStreamUsage(info, usage, string(partial), &reported.MetaData.Usage)
+			if (reported.Event == "message" || reported.Event == "agent_message") && reported.Answer != "" {
+				info.ResponseFacts.SourceGeneratedText += reported.Answer
+				info.ResponseFacts.SourceOutputObserved = true
+			}
+		}
+	}
 	if info.ResponseFacts == nil || info.ResponseFacts.OnBusinessOutput == nil || info.ResponseFacts.BusinessOutput && info.StreamStatus.CompletedNormally() {
 		helper.Done(c)
 	}
