@@ -176,6 +176,7 @@ func RealtimeGateway(c *gin.Context) {
 		transportInfo.RealtimeEventHandler = session.event
 		transportInfo.RealtimeAfterResponse = session.afterResponse
 		transportInfo.RealtimeResponseHandler = session.response
+		transportInfo.RealtimeOutputAudioFormat = session.outputAudioFormat
 		transportInfo.RealtimeInputUsage = session.inputUsage
 		transportInfo.RealtimeBusinessOutput = session.businessOutput
 		transportInfo.RealtimePeerClosed = session.peerClosed
@@ -272,7 +273,7 @@ func (session *realtimeGatewaySession) begin(body, original []byte, input *dto.U
 			return response
 		}
 	}
-	call.Native = &relay.NativeWSLifecycle{Protocol: protocol.OpenAIRealtime, TransportOnly: session.channelID == 0, OriginalBody: append([]byte(nil), original...), StartedAt: startedAt, InputUsage: service.GatewayUsageSnapshot(input), EstimateInput: response.inputSnapshot.Estimate, Prepare: response.prepare, CreatePayload: response.payload,
+	call.Native = &relay.NativeWSLifecycle{Protocol: protocol.OpenAIRealtime, TransportOnly: session.channelID == 0, OriginalBody: append([]byte(nil), original...), StartedAt: startedAt, InputUsage: service.GatewayUsageSnapshot(input), EstimateInput: response.inputSnapshot.EstimateForCapabilities, Prepare: response.prepare, CreatePayload: response.payload,
 		Exchange: response.exchange, Established: response.connected, TerminalDelivered: response.delivered, SaleInput: response.saleInput, PurchaseInput: response.purchaseInput}
 	if !call.Native.TransportOnly && session.sequence == 2 {
 		call.Native.Budget = session.initial.call.Native.Budget
@@ -384,6 +385,19 @@ func (session *realtimeGatewaySession) finish(attempt *realtimeGatewayAttempt, c
 	completion.saleInput, completion.purchaseInput = attempt.saleInput, attempt.purchaseInput
 	attempt.reply <- completion
 }
+func (session *realtimeGatewaySession) outputAudioFormat(id string) string {
+	attempt := session.active[id]
+	if attempt == nil {
+		return ""
+	}
+	format := ojson.GetBytes(attempt.purchaseInput.Body, "response.audio.output.format.type")
+	if !format.Exists() {
+		format = ojson.GetBytes(attempt.purchaseInput.Body, "response.output_audio_format")
+	}
+	normalized, _ := service.NormalizeRealtimeAudioFormat(format.String())
+	return normalized
+}
+
 func (session *realtimeGatewaySession) inputUsage(id string) *dto.Usage {
 	if attempt := session.active[id]; attempt != nil {
 		return attempt.input

@@ -3,12 +3,14 @@ package service
 import (
 	"errors"
 	"maps"
+	"slices"
 	"strings"
 
 	"github.com/MoeForge/moego/base64"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/capability"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -16,18 +18,18 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-type realtimeInputQuantity struct{ total, audio, image int }
+type realtimeInputQuantity struct{ total, audio, image, audioItems, imageItems int }
 
 func (quantity realtimeInputQuantity) usage() *dto.Usage {
 	return &dto.Usage{PromptTokens: quantity.total, TotalTokens: quantity.total, PromptTokensDetails: dto.InputTokenDetails{TextTokens: quantity.total - quantity.audio - quantity.image, AudioTokens: quantity.audio, ImageTokens: quantity.image}}
 }
 
 func (quantity realtimeInputQuantity) add(other realtimeInputQuantity) realtimeInputQuantity {
-	return realtimeInputQuantity{quantity.total + other.total, quantity.audio + other.audio, quantity.image + other.image}
+	return realtimeInputQuantity{quantity.total + other.total, quantity.audio + other.audio, quantity.image + other.image, quantity.audioItems + other.audioItems, quantity.imageItems + other.imageItems}
 }
 
 func (quantity realtimeInputQuantity) subtract(other realtimeInputQuantity) realtimeInputQuantity {
-	return realtimeInputQuantity{quantity.total - other.total, quantity.audio - other.audio, quantity.image - other.image}
+	return realtimeInputQuantity{quantity.total - other.total, quantity.audio - other.audio, quantity.image - other.image, quantity.audioItems - other.audioItems, quantity.imageItems - other.imageItems}
 }
 
 type realtimeConversationItem struct {
@@ -35,6 +37,8 @@ type realtimeConversationItem struct {
 	response       string
 	accepted       bool
 	audioCommitted bool
+	deleted        bool
+	truncatedAtMS  *int64
 }
 type realtimeConversationOutput struct {
 	quantity            realtimeInputQuantity
@@ -170,6 +174,7 @@ func (conversation *RealtimeConversation) Observe(raw []byte, client bool) ([]by
 		tokens := conversation.bufferedAudio + CountRealtimeAudioTokens(conversation.audioBytes, conversation.inputFormat, true)
 		item.quantity.total += tokens - item.quantity.audio
 		item.quantity.audio = tokens
+		item.quantity.audioItems = 1
 		item.accepted, item.audioCommitted = true, true
 		if err := conversation.store(id, item); err != nil {
 			return nil, err
@@ -182,6 +187,9 @@ func (conversation *RealtimeConversation) Observe(raw []byte, client bool) ([]by
 			return raw, nil
 		}
 		previous, exists := conversation.items[id]
+		if previous.deleted {
+			return raw, nil
+		}
 		response := previous.response
 		if value := ojson.GetBytes(raw, "response_id"); value.Exists() {
 			response = value.String()
@@ -199,7 +207,11 @@ func (conversation *RealtimeConversation) Observe(raw []byte, client bool) ([]by
 				quantity.audio = previous.quantity.audio
 			}
 		}
-		if err := conversation.store(id, realtimeConversationItem{quantity: quantity, response: response, accepted: true, audioCommitted: previous.audioCommitted}); err != nil {
+		if previous.truncatedAtMS != nil {
+			quantity.audio = min(quantity.audio, int(*previous.truncatedAtMS/50))
+			quantity.total = quantity.audio + quantity.image
+		}
+		if err := conversation.store(id, realtimeConversationItem{quantity: quantity, response: response, accepted: true, audioCommitted: previous.audioCommitted, truncatedAtMS: previous.truncatedAtMS}); err != nil {
 			return nil, err
 		}
 		if id == conversation.pendingID {
@@ -218,6 +230,10 @@ func (conversation *RealtimeConversation) Observe(raw []byte, client bool) ([]by
 			if common.UnmarshalJsonStr(ojson.GetBytes(raw, "audio_end_ms").Raw, &milliseconds) != nil || milliseconds < 0 || milliseconds > (1<<31)-1 {
 				return nil, errors.New("Invalid Realtime audio truncation")
 			}
+			if item.truncatedAtMS != nil {
+				milliseconds = min(milliseconds, *item.truncatedAtMS)
+			}
+			item.truncatedAtMS = &milliseconds
 			previous := item.quantity
 			item.quantity.audio = min(previous.audio, int(milliseconds/50))
 			item.quantity.total = item.quantity.audio + item.quantity.image
@@ -251,7 +267,7 @@ func (conversation *RealtimeConversation) Observe(raw []byte, client bool) ([]by
 
 func (conversation *RealtimeConversation) remove(id string) {
 	item, exists := conversation.items[id]
-	if !exists {
+	if !exists || item.deleted {
 		return
 	}
 	if item.accepted && item.response == "" {
@@ -267,8 +283,8 @@ func (conversation *RealtimeConversation) remove(id string) {
 		}
 		conversation.outputs[item.response] = output
 	}
-	delete(conversation.items, id)
-	conversation.identityBytes -= len(id) + 256
+	item.deleted, item.accepted = true, false
+	conversation.items[id] = item
 }
 
 // Complete reuses the existing native response counter's measured quantities.
@@ -288,6 +304,43 @@ func (conversation *RealtimeConversation) Complete(result *relaycommon.RealtimeR
 		audio = max(audio, *result.Facts.GeneratedOutputTokens-tokenkit.Count(conversation.model, result.Facts.GeneratedText))
 	}
 	quantity := realtimeInputQuantity{total: generated, audio: min(audio, generated)}
+	if audio > 0 {
+		quantity.audioItems = 1
+	}
+	ids := []string{}
+	edited, audioItems := false, 0
+	for id, item := range conversation.items {
+		if item.response != result.ID {
+			continue
+		}
+		ids = append(ids, id)
+		edited = edited || item.deleted || item.truncatedAtMS != nil
+		audioItems += item.quantity.audioItems
+	}
+	retained := realtimeInputQuantity{}
+	for _, id := range ids {
+		item := conversation.items[id]
+		if item.deleted {
+			continue
+		}
+		if len(ids) == 1 {
+			quantity.audioItems = max(quantity.audioItems, item.quantity.audioItems)
+			quantity.imageItems = item.quantity.imageItems
+			item.quantity = quantity
+		} else if item.quantity.audioItems > 0 && audioItems == 1 {
+			item.quantity.total += quantity.audio - item.quantity.audio
+			item.quantity.audio = quantity.audio
+		}
+		if item.truncatedAtMS != nil {
+			item.quantity.audio = min(item.quantity.audio, int(*item.truncatedAtMS/50))
+			item.quantity.total = item.quantity.audio + item.quantity.image
+		}
+		conversation.items[id] = item
+		retained = retained.add(item.quantity)
+	}
+	if edited {
+		quantity = retained
+	}
 	if previous, exists := conversation.outputs[result.ID]; exists && previous.defaultConversation {
 		conversation.current = conversation.current.subtract(previous.quantity)
 	}
@@ -295,17 +348,6 @@ func (conversation *RealtimeConversation) Complete(result *relaycommon.RealtimeR
 		conversation.current = conversation.current.add(quantity)
 	}
 	conversation.outputs[result.ID] = realtimeConversationOutput{quantity: quantity, defaultConversation: defaultConversation}
-	ids := []string{}
-	for id, item := range conversation.items {
-		if item.response == result.ID {
-			ids = append(ids, id)
-		}
-	}
-	if len(ids) == 1 {
-		item := conversation.items[ids[0]]
-		item.quantity = quantity
-		conversation.items[ids[0]] = item
-	}
 	return nil
 }
 
@@ -323,23 +365,31 @@ func (conversation *RealtimeConversation) Usage(buffered bool) *dto.Usage {
 type RealtimeInputSnapshot struct {
 	context            *gin.Context
 	model, inputFormat string
-	conversation       *dto.Usage
+	conversation       realtimeInputQuantity
 	items              map[string]realtimeConversationItem
 }
 
 func (conversation *RealtimeConversation) Snapshot() *RealtimeInputSnapshot {
-	return &RealtimeInputSnapshot{context: conversation.context.Copy(), model: conversation.model, inputFormat: conversation.inputFormat, conversation: conversation.Usage(false), items: maps.Clone(conversation.items)}
+	return &RealtimeInputSnapshot{context: conversation.context.Copy(), model: conversation.model, inputFormat: conversation.inputFormat, conversation: conversation.current, items: maps.Clone(conversation.items)}
 }
 
 func (snapshot *RealtimeInputSnapshot) Estimate(body []byte) (*dto.Usage, error) {
-	input := GatewayUsageSnapshot(snapshot.conversation)
+	return snapshot.estimate(body, nil)
+}
+
+func (snapshot *RealtimeInputSnapshot) EstimateForCapabilities(body []byte, caps capability.Set) (*dto.Usage, error) {
+	return snapshot.estimate(body, &caps)
+}
+
+func (snapshot *RealtimeInputSnapshot) estimate(body []byte, caps *capability.Set) (*dto.Usage, error) {
+	quantity := snapshot.conversation
 	value := ojson.ParseBytes(body)
 	items := value.Get("input")
 	if items.Exists() && items.Type != ojson.Null {
 		if !items.IsArray() {
 			return nil, errors.New("Realtime input must be an array")
 		}
-		quantity := realtimeInputQuantity{}
+		quantity = realtimeInputQuantity{}
 		for _, item := range items.Array() {
 			part, err := snapshot.countItem(item)
 			if err != nil {
@@ -347,8 +397,16 @@ func (snapshot *RealtimeInputSnapshot) Estimate(body []byte) (*dto.Usage, error)
 			}
 			quantity = quantity.add(part)
 		}
-		input = quantity.usage()
 	}
+	if caps != nil {
+		if quantity.audioItems > 0 && !slices.Contains(caps.InputModalities, capability.Audio) || quantity.imageItems > 0 && !slices.Contains(caps.InputModalities, capability.Image) {
+			return nil, errors.New("Realtime input modality is not supported on this connection")
+		}
+		if maximum := caps.Limits.MaxImages; maximum != nil && int64(quantity.imageItems) > *maximum {
+			return nil, errors.New("Realtime image count limit exceeded")
+		}
+	}
+	input := quantity.usage()
 	input.PromptTokens += tokenkit.Count(snapshot.model, value.Get("instructions").String())
 	for _, tool := range value.Get("tools").Array() {
 		input.PromptTokens += tokenkit.Count(snapshot.model, tool.Raw)
@@ -382,6 +440,7 @@ func (snapshot *RealtimeInputSnapshot) countItem(item ojson.Result) (realtimeInp
 			case "input_text", "text", "output_text":
 				quantity.total += tokenkit.Count(snapshot.model, part.Get("text").String())
 			case "input_audio":
+				quantity.audioItems++
 				if audio := part.Get("audio"); audio.Exists() && audio.Type != ojson.Null {
 					decoded, err := base64.StdEncoding.DecodeString(audio.String())
 					if err != nil {
@@ -391,8 +450,10 @@ func (snapshot *RealtimeInputSnapshot) countItem(item ojson.Result) (realtimeInp
 					quantity.total += tokens
 					quantity.audio += tokens
 				}
-			case "audio", "output_audio": // Output audio bytes come from the shared response counter.
+			case "audio", "output_audio": // Output bytes come from the shared response counter.
+				quantity.audioItems++
 			case "input_image":
+				quantity.imageItems++
 				url := part.Get("image_url").String()
 				if strings.TrimSpace(url) == "" {
 					return quantity, errors.New("Invalid Realtime input image")

@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"slices"
 	"strings"
@@ -96,7 +97,25 @@ func (accumulator *RealtimeUsageAccumulator) Observe(raw []byte, input *dto.Usag
 		}
 		info.SetEstimatePromptTokens(input.PromptTokens)
 		state = &realtimeResponseUsage{info: info, accumulator: NewResponsesUsageAccumulator(info), input: GatewayUsageSnapshot(input), outputAudioFormat: accumulator.info.OutputAudioFormat}
+		if callback := accumulator.info.RealtimeOutputAudioFormat; callback != nil {
+			if format := callback(id); format != "" {
+				state.outputAudioFormat = format
+			}
+		}
 		accumulator.active[id] = state
+	}
+	if kind == "response.created" {
+		format := ojson.GetBytes(raw, "response.audio.output.format.type")
+		if !format.Exists() {
+			format = ojson.GetBytes(raw, "response.output_audio_format")
+		}
+		if format.Exists() {
+			normalized, valid := NormalizeRealtimeAudioFormat(format.String())
+			if !valid {
+				return nil, errors.New("Unsupported Realtime response audio format")
+			}
+			state.outputAudioFormat = normalized
+		}
 	}
 	document := ojson.NewDoc(raw)
 	for _, field := range []struct{ old, current string }{
@@ -109,9 +128,39 @@ func (accumulator *RealtimeUsageAccumulator) Observe(raw []byte, input *dto.Usag
 			}
 		}
 	}
-	if kind == "response.text.delta" {
+	if kind == "response.text.delta" || kind == "response.audio_transcript.delta" || kind == "response.output_audio_transcript.delta" {
 		if err := document.Set("type", "response.output_text.delta"); err != nil {
 			return nil, err
+		}
+	}
+	if kind == "response.audio_transcript.done" || kind == "response.output_audio_transcript.done" {
+		var index *int
+		if value := ojson.GetBytes(raw, "output_index"); value.Exists() {
+			parsed := int(value.Int())
+			index = &parsed
+		}
+		transcript := ""
+		if !state.accumulator.outputState(ojson.GetBytes(raw, "item_id").String(), index).textSeen {
+			transcript = ojson.GetBytes(raw, "transcript").String()
+		}
+		if err := document.Set("type", "response.output_text.delta"); err != nil {
+			return nil, err
+		}
+		if err := document.Set("delta", transcript); err != nil {
+			return nil, err
+		}
+	}
+	for outputIndex, output := range ojson.GetBytes(raw, "response.output").Array() {
+		for contentIndex, content := range output.Get("content").Array() {
+			if transcript := content.Get("transcript"); transcript.Type == ojson.String {
+				path := fmt.Sprintf("response.output.%d.content.%d", outputIndex, contentIndex)
+				if err := document.Set(path+".type", "output_text"); err != nil {
+					return nil, err
+				}
+				if err := document.Set(path+".text", transcript.String()); err != nil {
+					return nil, err
+				}
+			}
 		}
 	}
 	if reason := ojson.GetBytes(raw, "response.status_details.reason"); reason.Type == ojson.String {

@@ -107,25 +107,26 @@ type RelayInfo struct {
 	// aliases never participate in channel selection or upstream routing.
 	BillingModelName string
 
-	RequestURLPath          string
-	RequestHeaders          map[string]string
-	ShouldIncludeUsage      bool
-	DisablePing             bool // 是否禁止向下游发送自定义 Ping
-	ClientWs                *websocket.Conn
-	TargetWs                *websocket.Conn
-	InputAudioFormat        string
-	OutputAudioFormat       string
-	RealtimeTools           []dto.RealTimeTool
-	RealtimeRequestHandler  func([]byte) ([]byte, *types.NewAPIError)           `json:"-"`
-	RealtimeResponseHandler func(*RealtimeResponseFacts) *types.NewAPIError     `json:"-"`
-	RealtimeEventHandler    func([]byte) ([]byte, [][]byte, *types.NewAPIError) `json:"-"`
-	RealtimeAfterResponse   func() ([][]byte, *types.NewAPIError)               `json:"-"`
-	RealtimeInputUsage      func(string) *dto.Usage                             `json:"-"`
-	RealtimeBusinessOutput  func(string)                                        `json:"-"`
-	RealtimePeerClosed      func(bool)                                          `json:"-"`
-	IsFirstRequest          bool
-	AudioUsage              bool
-	ReasoningEffort         string
+	RequestURLPath            string
+	RequestHeaders            map[string]string
+	ShouldIncludeUsage        bool
+	DisablePing               bool // 是否禁止向下游发送自定义 Ping
+	ClientWs                  *websocket.Conn
+	TargetWs                  *websocket.Conn
+	InputAudioFormat          string
+	OutputAudioFormat         string
+	RealtimeTools             []dto.RealTimeTool
+	RealtimeRequestHandler    func([]byte) ([]byte, *types.NewAPIError)           `json:"-"`
+	RealtimeResponseHandler   func(*RealtimeResponseFacts) *types.NewAPIError     `json:"-"`
+	RealtimeEventHandler      func([]byte) ([]byte, [][]byte, *types.NewAPIError) `json:"-"`
+	RealtimeAfterResponse     func() ([][]byte, *types.NewAPIError)               `json:"-"`
+	RealtimeOutputAudioFormat func(string) string                                 `json:"-"`
+	RealtimeInputUsage        func(string) *dto.Usage                             `json:"-"`
+	RealtimeBusinessOutput    func(string)                                        `json:"-"`
+	RealtimePeerClosed        func(bool)                                          `json:"-"`
+	IsFirstRequest            bool
+	AudioUsage                bool
+	ReasoningEffort           string
 	// ReasoningConversion is the suffix-derived reasoning intent attached
 	// after model mapping. Converters read it via ReasoningState().
 	ReasoningConversion *dto.ReasoningConversionState

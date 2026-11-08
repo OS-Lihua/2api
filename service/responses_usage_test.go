@@ -69,6 +69,23 @@ func TestRealtimeConversationFreezesItemsAcrossDeletionAndAudioTruncation(t *tes
 	_, err = conversation.Observe([]byte(`{"type":"conversation.item.deleted","item_id":"voice"}`), false)
 	require.NoError(t, err)
 	assert.Zero(t, conversation.Usage(false).PromptTokens)
+	for _, edit := range []struct {
+		name, frame string
+		expected    int
+	}{
+		{"delete before terminal", `{"type":"conversation.item.deleted","item_id":"voice"}`, 0},
+		{"truncate before terminal", `{"type":"conversation.item.truncated","item_id":"voice","content_index":0,"audio_end_ms":250}`, 5},
+	} {
+		t.Run(edit.name, func(t *testing.T) {
+			conversation := NewRealtimeConversation(c, "gpt-4o")
+			_, err := conversation.Observe([]byte(`{"type":"response.output_item.added","response_id":"r","item":{"id":"voice","type":"message","role":"assistant","content":[{"type":"audio"}]}}`), false)
+			require.NoError(t, err)
+			_, err = conversation.Observe([]byte(edit.frame), false)
+			require.NoError(t, err)
+			require.NoError(t, conversation.Complete(result, true))
+			assert.Equal(t, edit.expected, conversation.Usage(false).PromptTokens, "Late model completion cannot undo an acknowledged context edit")
+		})
+	}
 	appendAudio := []byte(`{"type":"input_audio_buffer.append","audio":"` + base64.StdEncoding.EncodeToString(make([]byte, 4800)) + `"}`)
 	_, err = conversation.Observe(appendAudio, true)
 	require.NoError(t, err)
@@ -81,6 +98,32 @@ func TestRealtimeConversationFreezesItemsAcrossDeletionAndAudioTruncation(t *tes
 	_, err = conversation.Observe([]byte(`{"type":"input_audio_buffer.committed","item_id":"turn2"}`), false)
 	require.NoError(t, err)
 	assert.Equal(t, 2, conversation.Usage(false).PromptTokensDetails.AudioTokens, "A duplicate commit cannot consume the next audio turn")
+}
+
+func TestRealtimeUsageFreezesResponseCodecAndCountsTranscript(t *testing.T) {
+	for _, kind := range []string{"response.audio_transcript.delta", "response.output_audio_transcript.delta"} {
+		t.Run(kind, func(t *testing.T) {
+			info := &relaycommon.RelayInfo{TokenizerModel: "gpt-4o", ProviderMeta: &relaycommon.ProviderMeta{}, OutputAudioFormat: "pcm16", StreamStatus: relaycommon.NewStreamStatus(), ResponseFacts: &relaycommon.ResponseFacts{}}
+			accumulator := NewRealtimeUsageAccumulator(info)
+			for _, raw := range []string{
+				`{"type":"response.created","response":{"id":"voice","audio":{"output":{"format":{"type":"audio/pcmu"}}}}}`,
+				`{"type":"response.output_audio.delta","response_id":"voice","item_id":"item","output_index":0,"delta":"` + base64.StdEncoding.EncodeToString(make([]byte, 8000)) + `"}`,
+				`{"type":"` + kind + `","response_id":"voice","item_id":"item","output_index":0,"delta":" hello hello"}`,
+			} {
+				_, err := accumulator.Observe([]byte(raw), &dto.Usage{}, true)
+				require.NoError(t, err)
+			}
+			result, err := accumulator.Observe([]byte(`{"type":"response.done","response":{"id":"voice","status":"completed","output":[{"id":"item","type":"message","content":[{"type":"audio","transcript":" hello hello"}]}]}}`), &dto.Usage{}, true)
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.Equal(t, 20, result.Usage.CompletionTokenDetails.AudioTokens)
+			assert.Equal(t, 22, result.Usage.CompletionTokens)
+			require.NotNil(t, result.Facts.GeneratedOutputTokens)
+			assert.Equal(t, 22, *result.Facts.GeneratedOutputTokens)
+			require.NotNil(t, result.Facts.DeliveredOutputTokens)
+			assert.Equal(t, 22, *result.Facts.DeliveredOutputTokens)
+		})
+	}
 }
 
 func TestRealtimeUsageRetainsEstimatedImagesAndExplicitZero(t *testing.T) {
@@ -215,7 +258,7 @@ func TestRealtimeUsageEstimatesMissingAudioAcrossChunkBoundaries(t *testing.T) {
 	require.Len(t, results, 1)
 	assert.Equal(t, 5, results[0].Usage.PromptTokens)
 	assert.Equal(t, 4, results[0].Usage.PromptTokensDetails.AudioTokens)
-	assert.Equal(t, 20, results[0].Usage.CompletionTokens)
+	assert.Equal(t, 21, results[0].Usage.CompletionTokens) // 20 audio tokens plus one transcript token.
 	assert.Equal(t, 20, results[0].Usage.CompletionTokenDetails.AudioTokens)
 	assert.Equal(t, "estimated", results[0].Usage.UsageSource)
 	assert.False(t, results[0].Facts.BusinessOutput, "failed writes preserve procurement evidence without claiming delivery")

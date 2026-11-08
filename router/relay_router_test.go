@@ -535,7 +535,7 @@ func TestWebSocketGatewayTerminalWriteFailurePreservesCompleteUsage(t *testing.T
 				if native == protocol.OpenAIRealtime {
 					session := `{"type":"session.created","session":{"modalities":["text"],"turn_detection":null}}`
 					if test.audio {
-						session = `{"type":"session.created","session":{"modalities":["text","audio"],"output_audio_format":"g711_ulaw","turn_detection":null}}`
+						session = `{"type":"session.created","session":{"modalities":["text","audio"],"output_audio_format":"pcm16","turn_detection":null}}`
 					}
 					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(session))) {
 						return
@@ -586,7 +586,7 @@ func TestWebSocketGatewayTerminalWriteFailurePreservesCompleteUsage(t *testing.T
 				path, create = "/v1/realtime", `{"type":"response.create","response":{"conversation":"none","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],"output_modalities":["text"],"max_output_tokens":16}}`
 			}
 			if test.audio {
-				create = strings.ReplaceAll(create, `"output_modalities":["text"]`, `"output_modalities":["audio"]`)
+				create = strings.ReplaceAll(create, `"output_modalities":["text"]`, `"output_modalities":["audio"],"audio":{"output":{"format":{"type":"audio/pcmu"}}}`)
 			}
 			client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+path+"?model=gateway-alias", http.Header{"Authorization": {"Bearer sk-" + fixture.token.Key}})
 			require.NoError(t, err)
@@ -877,6 +877,87 @@ func TestRealtimeGatewayRejectsFixedPricingBeforeReservation(t *testing.T) {
 			wallet, err := model.GetUserWallet(fixture.user.Id)
 			require.NoError(t, err)
 			assert.Equal(t, int64(1_000_000_000), wallet.Balance.Nanos)
+		})
+	}
+}
+
+func TestRealtimeGatewayRejectsUnsupportedNativeInputsBeforeReservation(t *testing.T) {
+	for _, source := range []string{"explicit audio", "conversation image", "image reference", "two image references"} {
+		t.Run(source, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if !assert.NoError(t, err) {
+					return
+				}
+				defer peer.Close()
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"modalities":["text"],"turn_detection":null}}`))) {
+					return
+				}
+				for {
+					_, raw, err := peer.ReadMessage()
+					if err != nil {
+						return
+					}
+					if ojson.GetBytes(raw, "type").String() == "conversation.item.create" {
+						reply := ojson.NewDoc([]byte(`{"type":"conversation.item.created"}`))
+						if !assert.NoError(t, reply.SetRawBytes("item", []byte(ojson.GetBytes(raw, "item").Raw))) {
+							return
+						}
+						if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, reply.Bytes())) {
+							return
+						}
+						continue
+					}
+					calls.Add(1)
+					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"unsupported","status":"in_progress","conversation_id":null}}`))) {
+						return
+					}
+				}
+			})
+			if source == "two image references" {
+				var unified model.Model
+				require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+				unified.Capabilities.InputModalities = append(unified.Capabilities.InputModalities, capability.Image)
+				unified.Capabilities.Limits.MaxImages = common.GetPointer(int64(1))
+				require.NoError(t, model.DB.Model(&unified).Select("capabilities").Updates(&unified).Error)
+			}
+			client := dialRealtimeGateway(t, fixture)
+			_, _, err := client.ReadMessage()
+			require.NoError(t, err)
+			if source != "explicit audio" {
+				count := 1
+				if source == "two image references" {
+					count = 2
+				}
+				var picture bytes.Buffer
+				require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+				for index := range count {
+					body := fmt.Sprintf(`{"type":"conversation.item.create","item":{"id":"image%d","type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,%s"}]}}`, index, base64.StdEncoding.EncodeToString(picture.Bytes()))
+					require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(body)))
+					_, ack, err := client.ReadMessage()
+					require.NoError(t, err)
+					require.Equal(t, "conversation.item.created", ojson.GetBytes(ack, "type").String())
+				}
+			}
+			create := `{"type":"response.create","response":{"conversation":"none"}}`
+			switch source {
+			case "explicit audio":
+				create = `{"type":"response.create","response":{"input":[{"type":"message","role":"user","content":[{"type":"input_audio","audio":""}]}]}}`
+			case "image reference":
+				create = `{"type":"response.create","response":{"input":[{"type":"item_reference","id":"image0"}]}}`
+			case "two image references":
+				create = `{"type":"response.create","response":{"input":[{"type":"item_reference","id":"image0"},{"type":"item_reference","id":"image1"}]}}`
+			}
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(create)))
+			_, reply, err := client.ReadMessage()
+			require.NoError(t, err)
+			assert.Equal(t, "error", ojson.GetBytes(reply, "type").String())
+			require.NoError(t, client.Close())
+			assert.Zero(t, calls.Load())
+			var reservations int64
+			require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Where("user_id = ?", fixture.user.Id).Count(&reservations).Error)
+			assert.Zero(t, reservations)
 		})
 	}
 }

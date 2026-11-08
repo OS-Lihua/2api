@@ -61,7 +61,7 @@ type NativeWSLifecycle struct {
 	Budget            *service.GatewayAttemptBudget
 	OutputAudio       bool
 	InputUsage        *dto.Usage
-	EstimateInput     func([]byte) (*dto.Usage, error)
+	EstimateInput     func([]byte, capability.Set) (*dto.Usage, error)
 	Capabilities      capability.Set
 	Validate          func(billingexpr.RequestInput, billingexpr.RequestInput, *dto.Usage) error
 	Prepare           func(*gin.Context, *relaycommon.RelayInfo) (*relaychannel.PreparedWssRequest, error)

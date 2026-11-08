@@ -108,7 +108,7 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 	}
 	inputUsage := &dto.Usage{}
 	if call.Native != nil && call.Native.EstimateInput != nil {
-		inputUsage, err = call.Native.EstimateInput(body)
+		inputUsage, err = call.Native.EstimateInput(body, selection.Capabilities)
 		if err == nil {
 			body, err = helper.NormalizeRealtimeRequestLimits(body, selection.Capabilities, inputUsage.PromptTokens)
 		}
@@ -163,6 +163,16 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 	estimated := service.GatewayUsageSnapshot(inputUsage)
 	estimated.CompletionTokens, estimated.TotalTokens = int(mean), estimated.PromptTokens+int(mean)
 	if call.Protocol() == protocol.OpenAIRealtime {
+		for _, path := range []string{"audio.output.format.type", "output_audio_format"} {
+			if format := ojson.GetBytes(body, path); format.Exists() {
+				if _, valid := service.NormalizeRealtimeAudioFormat(format.String()); format.Type != ojson.String || !valid {
+					return nil, service.ErrGatewayCapability
+				}
+			}
+		}
+		if rate := ojson.GetBytes(body, "audio.output.format.rate"); rate.Exists() && (rate.Type != ojson.Number || rate.Raw != "24000") {
+			return nil, service.ErrGatewayCapability
+		}
 		outputs := ojson.GetBytes(body, "output_modalities")
 		if !outputs.Exists() {
 			outputs = ojson.GetBytes(body, "modalities")
