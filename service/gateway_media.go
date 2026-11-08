@@ -39,7 +39,7 @@ func SelectGatewayMediaChannel(c *gin.Context, offering *model.ModelOffering, ki
 	diagnostics := map[string]any{"method": "single_channel", "candidate_count": len(candidates), "eligible_count": 0}
 	counts := map[string]int{}
 	excluded := []map[string]any{}
-	var selected *GatewaySelection
+	var eligible []*GatewaySelection
 	for _, candidate := range candidates {
 		reason := ""
 		var provider *model.Provider
@@ -71,19 +71,57 @@ func SelectGatewayMediaChannel(c *gin.Context, offering *model.ModelOffering, ki
 			continue
 		}
 		diagnostics["eligible_count"] = diagnostics["eligible_count"].(int) + 1
-		if selected == nil {
-			selected = &GatewaySelection{Channel: candidate, Provider: provider, Capabilities: caps}
-		}
+		eligible = append(eligible, &GatewaySelection{Channel: candidate, Provider: provider, Capabilities: caps})
 	}
 	diagnostics["excluded_counts"], diagnostics["excluded"] = counts, excluded
-	if selected == nil {
+	if len(eligible) == 0 {
 		if counts["capability"] > 0 {
 			return nil, ErrGatewayCapability
 		}
 		return nil, ErrGatewayUnavailable
 	}
-	selected.Diagnostics = diagnostics
-	return selected, nil
+	// Keep member tiers distinct; health admission owns the probe lease.
+	for len(eligible) > 0 {
+		tier := tiers[eligible[0].Channel.ModelID]
+		end := 0
+		for end < len(eligible) && tiers[eligible[end].Channel.ModelID] == tier {
+			end++
+		}
+		group := eligible[:end]
+		channelIDs := make([]int, len(group))
+		for i, candidate := range group {
+			channelIDs[i] = candidate.Channel.ID
+		}
+		health, err := ChannelHealth.Snapshots(c.Request.Context(), channelIDs)
+		if err != nil {
+			return nil, ErrGatewayUnavailable
+		}
+		slices.SortStableFunc(group, func(a, b *GatewaySelection) int {
+			left, right := health[a.Channel.ID], health[b.Channel.ID]
+			if order := cmp.Compare(right.SuccessRate, left.SuccessRate); order != 0 {
+				return order
+			}
+			return cmp.Compare(left.FirstByteMillis, right.FirstByteMillis)
+		})
+		for i, candidate := range group {
+			channelIDs[i] = candidate.Channel.ID
+		}
+		admission, err := ChannelHealth.Acquire(c.Request.Context(), channelIDs)
+		if err != nil {
+			return nil, ErrGatewayUnavailable
+		}
+		for _, candidate := range group {
+			if candidate.Channel.ID == admission.ChannelID {
+				candidate.Admission = admission
+				diagnostics["health"] = health[candidate.Channel.ID]
+				diagnostics["probe"] = admission.Lease != ""
+				candidate.Diagnostics = diagnostics
+				return candidate, nil
+			}
+		}
+		eligible = eligible[end:]
+	}
+	return nil, ErrGatewayUnavailable
 }
 
 // GatewayMediaCapabilitiesMatch is applied to both original and effective DTOs.
