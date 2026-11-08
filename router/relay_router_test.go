@@ -4061,6 +4061,144 @@ type gatewayFailingFlushWriter struct{ *httptest.ResponseRecorder }
 
 func (w gatewayFailingFlushWriter) FlushError() error { return io.ErrClosedPipe }
 
+func TestTextGatewayNativeFileIDsRetainMediaFacts(t *testing.T) {
+	for _, source := range []struct {
+		name, protocol, path, request, response string
+		modality                                capability.Modality
+	}{
+		{"Responses PDF", "openai_responses", "/v1/responses", `{"model":"gateway-offering","input":[{"role":"user","content":[{"type":"input_file","file_id":"file_existing","filename":"report.pdf"}]}],"max_output_tokens":16}`, `{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5}}`, capability.PDF},
+		{"Responses image", "openai_responses", "/v1/responses", `{"model":"gateway-offering","input":[{"role":"user","content":[{"type":"input_image","file_id":"file_existing"}]}],"max_output_tokens":16}`, `{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5}}`, capability.Image},
+		{"Messages PDF", "anthropic_messages", "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"user","content":[{"type":"document","source":{"type":"file","file_id":"file_existing"}}]}],"max_tokens":16}`, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`, capability.PDF},
+		{"Messages image", "anthropic_messages", "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"user","content":[{"type":"image","source":{"type":"file","file_id":"file_existing"}}]}],"max_tokens":16}`, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`, capability.Image},
+	} {
+		for _, scenario := range []string{"missing modality", "small context", "native", "too many images"} {
+			if scenario == "too many images" && source.modality != capability.Image {
+				continue
+			}
+			t.Run(source.name+"/"+scenario, func(t *testing.T) {
+				calls := 0
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					var sent map[string]any
+					require.NoError(t, common.DecodeJson(r.Body, &sent))
+					body, err := common.Marshal(sent)
+					require.NoError(t, err)
+					assert.Contains(t, string(body), `"file_id":"file_existing"`)
+					if source.protocol == "anthropic_messages" {
+						assert.Contains(t, r.Header.Get("Anthropic-Beta"), "files-api-2025-04-14")
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, source.response)
+				})
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", source.protocol).Error)
+				if source.protocol == "anthropic_messages" {
+					require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeAnthropic).Error)
+				}
+				caps := capability.Set{InputModalities: []capability.Modality{source.modality}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{ContextLength: common.GetPointer(int64(100000))}}
+				if scenario == "missing modality" {
+					caps.InputModalities = []capability.Modality{capability.Text}
+				} else if scenario == "small context" {
+					caps.Limits.ContextLength = common.GetPointer(int64(32))
+				} else if scenario == "too many images" {
+					caps.Limits.MaxImages = common.GetPointer(int64(1))
+				}
+				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+				body := source.request
+				if scenario == "too many images" {
+					part := `{"type":"input_image","file_id":"file_existing"}`
+					if source.protocol == "anthropic_messages" {
+						part = `{"type":"image","source":{"type":"file","file_id":"file_existing"}}`
+					}
+					body = strings.Replace(body, part, part+","+part, 1)
+				}
+				request := httptest.NewRequest(http.MethodPost, source.path, strings.NewReader(body))
+				request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+				request.Header.Set("Content-Type", "application/json")
+				if source.protocol == "anthropic_messages" {
+					request.Header.Set("Anthropic-Beta", "files-api-2025-04-14")
+				}
+				response := httptest.NewRecorder()
+				fixture.engine.ServeHTTP(response, request)
+				if scenario == "native" {
+					assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+					assert.Equal(t, 1, calls)
+				} else {
+					assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+					assert.Zero(t, calls)
+				}
+			})
+		}
+	}
+}
+
+func TestTextGatewayMalformedToolDetailsRetainValidUsage(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				usage := `{"input_tokens":1000,"output_tokens":100,"server_tool_use":{"web_search_requests":"bad","web_fetch_requests":2}}`
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = fmt.Fprintf(w, "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg\",\"role\":\"assistant\",\"content\":[],\"usage\":%s}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n", usage)
+				} else {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprintf(w, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":%s}`, usage)
+				}
+			})
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "anthropic_messages").Error)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/messages", fmt.Sprintf(`{"model":"gateway-offering","stream":%t,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, stream))
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), "Hello")
+			assert.NotContains(t, response.Body.String(), `"bad"`)
+			assert.Contains(t, response.Body.String(), `"web_fetch_requests":2`)
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(2160000), record.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, "upstream", attempts[0].UsageSource)
+			assert.Equal(t, int64(1000), attempts[0].Usage.PromptTokens)
+			assert.Equal(t, int64(100), attempts[0].Usage.CompletionTokens)
+			assert.Equal(t, int64(1200000), attempts[0].Cost.Nanos)
+		})
+	}
+}
+
+func TestTextGatewayNativeResponsesTemplateUsesNativeValidation(t *testing.T) {
+	for _, scenario := range []string{"native", "missing text", "invalid output override", "cross protocol"} {
+		t.Run(scenario, func(t *testing.T) {
+			calls := 0
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				var sent struct {
+					Prompt json.RawMessage `json:"prompt"`
+				}
+				require.NoError(t, common.DecodeJson(r.Body, &sent))
+				assert.JSONEq(t, `{"id":"pmpt_existing","variables":{"topic":"Hello"}}`, string(sent.Prompt))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5}}`)
+			})
+			if scenario != "cross protocol" {
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "openai_responses").Error)
+			}
+			if scenario == "missing text" {
+				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", capability.Set{InputModalities: []capability.Modality{capability.Image}, OutputModalities: []capability.Modality{capability.Text}}).Error)
+			}
+			if scenario == "invalid output override" {
+				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", `{"max_output_tokens":2147483647}`).Error)
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/responses", `{"model":"gateway-offering","input":[],"prompt":{"id":"pmpt_existing","variables":{"topic":"Hello"}},"max_output_tokens":16}`)
+			if scenario == "native" {
+				assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				assert.Equal(t, 1, calls)
+			} else {
+				assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+				assert.Zero(t, calls)
+			}
+		})
+	}
+}
+
 func TestTextGatewayResponsesBudgetTerminalIsNotTransportFailure(t *testing.T) {
 	for _, target := range []struct {
 		name, path, request, terminal string
@@ -4323,6 +4461,10 @@ func TestTextGatewayResponsesContentFilterNeverSwitches(t *testing.T) {
 				})
 				require.NoError(t, model.DB.Model(second).Update("protocol", "openai_responses").Error)
 				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/responses", fmt.Sprintf(`{"model":"gateway-offering","stream":%t,"input":"Hello","max_output_tokens":16}`, stream))
+				if stream && output {
+					assert.Equal(t, 1, strings.Count(response.Body.String(), "event: response.incomplete"))
+					assert.NotContains(t, response.Body.String(), "event: response.failed")
+				}
 				assert.Zero(t, calls, "content safety rejection must stop immediately")
 				assert.NotContains(t, response.Body.String(), "Recovered")
 				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)

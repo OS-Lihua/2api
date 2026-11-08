@@ -189,7 +189,7 @@ func GatewayCapabilitiesMatch(request *dto.GeneralOpenAIRequest, caps capability
 	}
 	tools := len(request.Tools) > 0 || len(request.Functions) > 0
 	caching := request.PromptCacheKey != "" || len(request.PromptCacheOptions) > 0 || len(request.PromptCacheRetention) > 0
-	textInput := request.Prompt != nil || request.Input != nil || request.Instruction != ""
+	textInput := request.RequiresTextInput || request.Prompt != nil || request.Input != nil || request.Instruction != ""
 	for _, message := range request.Messages {
 		calls := message.ParseToolCalls()
 		tools = tools || len(message.Tools) > 0 || len(calls) > 0 || message.Role == "tool"

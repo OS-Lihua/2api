@@ -375,6 +375,9 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 	if business {
 		info.ResponseFacts.MarkBusinessOutput()
 	}
+	if writeErr == nil && info.ResponseFacts.BusinessOutput && info.PerformanceBusinessRejection && info.RelayFormat == types.RelayFormatOpenAIResponses && event == "response.incomplete" {
+		info.ResponseFacts.TerminalDelivered = true
+	}
 	return text, writeErr
 }
 

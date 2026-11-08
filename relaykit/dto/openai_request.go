@@ -135,6 +135,7 @@ type GeneralOpenAIRequest struct {
 
 	// Internal conversion state; never serialized to an upstream protocol.
 	ReasoningConversion *ReasoningConversionState `json:"-"`
+	RequiresTextInput   bool                      `json:"-"`
 }
 
 func (r GeneralOpenAIRequest) MarshalJSON() ([]byte, error) {
