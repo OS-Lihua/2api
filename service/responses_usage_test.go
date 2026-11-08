@@ -12,6 +12,27 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestResponsesUsageAccumulatorPreservesExplicitZero(t *testing.T) {
+	info := &relaycommon.RelayInfo{
+		ProviderMeta:  &relaycommon.ProviderMeta{UpstreamModelName: "gpt-4o"},
+		StreamStatus:  relaycommon.NewStreamStatus(),
+		ResponseFacts: &relaycommon.ResponseFacts{},
+	}
+	info.SetEstimatePromptTokens(100)
+	accumulator := NewResponsesUsageAccumulator(info)
+	accumulator.Observe(&dto.ResponsesStreamResponse{Type: "response.output_text.delta", Delta: "hello"}, nil)
+	raw := []byte(`{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+	var event dto.ResponsesStreamResponse
+	require.NoError(t, common.Unmarshal(raw, &event))
+	accumulator.Observe(&event, raw)
+	accumulator.Observe(&event, raw)
+	usage := accumulator.Finish()
+	assert.Zero(t, usage.PromptTokens)
+	assert.Zero(t, usage.CompletionTokens)
+	assert.True(t, info.ResponseFacts.UsageReported)
+	assert.Same(t, usage, accumulator.Finish())
+}
+
 func TestResponsesUsageAccumulatorTerminalAccounting(t *testing.T) {
 	operation_setting.SetToolPriceForTest("responses_priced_fn", 5)
 	t.Cleanup(func() { operation_setting.DeleteToolPriceForTest("responses_priced_fn") })

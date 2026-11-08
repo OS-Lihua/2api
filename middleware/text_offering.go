@@ -3,6 +3,7 @@ package middleware
 import (
 	"errors"
 	"net/http"
+	"slices"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -17,9 +18,12 @@ const TextGatewayStartedAtKey = "text_gateway_started_at"
 // ResolveTextOffering runs before token validation so a wallet request does not
 // mutate the token's retired quota status. It does not authorize the offering;
 // the normal token checks and the gateway's visibility check still apply.
-func ResolveTextOffering() gin.HandlerFunc {
+func ResolveTextOffering(paths ...string) gin.HandlerFunc {
+	if len(paths) == 0 {
+		paths = []string{"/v1/chat/completions"}
+	}
 	return func(c *gin.Context) {
-		if c.Request.Method != http.MethodPost || c.Request.URL.Path != "/v1/chat/completions" {
+		if c.Request.Method != http.MethodPost || !slices.Contains(paths, c.Request.URL.Path) {
 			c.Next()
 			return
 		}

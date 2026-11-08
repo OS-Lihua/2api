@@ -1,0 +1,317 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"slices"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/clock"
+	"github.com/QuantumNous/new-api/pkg/money"
+	"github.com/QuantumNous/new-api/pkg/protocol"
+	"github.com/QuantumNous/new-api/relay"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/tokenkit"
+	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
+)
+
+// responsesWSGateway composes the ordinary request middleware, shared Attempt
+// runner and GatewayBilling lifecycle around one response.create.
+func responsesWSGateway(c *gin.Context, call *relay.ResponsesWSCall) (bool, *types.NewAPIError) {
+	offering := middleware.TextOffering(c)
+	if offering == nil {
+		if call.Established() {
+			return true, types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound)
+		}
+		return false, nil
+	}
+	group := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
+	if !offering.Enabled || offering.Visibility == "groups" && !slices.Contains(offering.Groups, group) {
+		return true, types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound)
+	}
+	if c.GetBool("token_model_limit_enabled") {
+		raw, _ := c.Get("token_model_limit")
+		limits, _ := raw.(map[string]bool)
+		if !limits[call.Request.Model] && !limits[offering.Name] {
+			return true, types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound)
+		}
+	}
+	run := &textGatewayRun{}
+	parent := c.Request
+	attempts := service.RunGatewayAttempts(parent.Context(), service.GatewayPolicy(), func(budget *service.GatewayAttemptBudget, exclusions *service.GatewayExclusions) service.GatewayAttemptResult {
+		return runResponsesWSGatewayAttempt(c, call, run, budget, exclusions)
+	})
+	c.Request = parent
+	run.settle(parent.Context(), attempts)
+	if run.status != 0 {
+		return true, types.NewErrorWithStatusCode(errors.New(run.message), types.ErrorCode(run.code), run.status, types.ErrOptionWithSkipRetry())
+	}
+	return true, nil
+}
+
+func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, run *textGatewayRun, budget *service.GatewayAttemptBudget, exclusions *service.GatewayExclusions) (result service.GatewayAttemptResult) {
+	run.status, run.code, run.message = 0, "", ""
+	offering := middleware.TextOffering(c)
+	started := c.GetTime(middleware.TextGatewayStartedAtKey)
+	if started.IsZero() {
+		started = clock.Now()
+	}
+	if run.sale == nil {
+		var err error
+		run.sale, err = model.CurrentPriceVersion(c.Request.Context(), model.DB, model.PriceOwnerOffering, offering.ID, started.Unix())
+		if err == nil {
+			run.saleFX, run.saleRate, err = service.GatewayFX(c.Request.Context(), run.sale.Currency)
+		}
+		if err == nil {
+			run.ratio, err = service.ExactGatewayGroupRatio(common.GetContextKeyString(c, constant.ContextKeyUserGroup))
+		}
+		if err != nil {
+			run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
+			return
+		}
+	}
+	// The projection is used only for shared capability admission. The native
+	// Responses body, including state references, is sent without conversion.
+	request := &dto.GeneralOpenAIRequest{Model: call.Request.Model, Stream: common.GetPointer(true), MaxCompletionTokens: call.Request.MaxOutputTokens}
+	request.Messages = []dto.Message{{Role: "user", Content: string(call.Request.Input)}}
+	selection, err := service.SelectGatewayProtocolChannel(c, offering, request, service.GatewayChannelRequirements{
+		Protocol: protocol.OpenAIResponses, ChannelID: call.LockedChannelID, ResponsesWebSocket: true,
+	}, exclusions)
+	if err != nil {
+		status, code := http.StatusServiceUnavailable, "channel_unavailable"
+		if errors.Is(err, service.ErrGatewayCapability) {
+			status, code = http.StatusBadRequest, "unsupported_parameter"
+		}
+		run.fail(c, status, code, "No Channel is available")
+		return
+	}
+	stopProbe := service.ChannelHealth.KeepAlive(c.Request.Context(), selection.Admission)
+	defer stopProbe()
+	defer func() {
+		if result.Attempt == nil {
+			_ = service.ChannelHealth.Release(context.WithoutCancel(c.Request.Context()), selection.Admission)
+			result.SkippedChannel = selection.Channel.ID
+		}
+	}()
+	if call.LockedChannelID != 0 && (selection.Channel.ProviderID != call.LockedProviderID || selection.Channel.UpstreamModelName != call.LockedUpstreamModel) {
+		run.fail(c, http.StatusConflict, "connection_locked", "Upstream connection settings changed; reconnect required")
+		return
+	}
+	if apiErr := middleware.SetupContextForSelectedChannel(c, selection.Provider, selection.Channel.Model.ModelName); apiErr != nil {
+		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
+		return
+	}
+	common.SetContextKey(c, constant.ContextKeyOriginalModel, call.Request.Model)
+	info := relaycommon.GenRelayInfoResponses(c, &call.Request)
+	info.InitChannelMeta(c)
+	info.UpstreamModelName, info.TokenizerModel = selection.Channel.UpstreamModelName, selection.Channel.Model.ModelName
+	info.IsModelMapped, info.IsStream = true, true
+	info.RequestId, info.StartTime = c.GetString(common.RequestIdKey), started
+	info.ResponseFacts = &relaycommon.ResponseFacts{OnBusinessOutput: budget.Delivered}
+	common.SetContextKey(c, constant.ContextKeyResponseFacts, info.ResponseFacts)
+	// Channel overrides must not change the connection's native model identity.
+	var fields map[string]any
+	if err = common.Unmarshal(call.Body, &fields); err != nil {
+		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid Responses request")
+		return
+	}
+	fields["model"] = info.UpstreamModelName
+	var overrides map[string]any
+	if err = common.UnmarshalJsonStr(selection.Channel.ParameterOverrides, &overrides); err != nil {
+		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "Invalid Channel settings")
+		return
+	}
+	for key, value := range overrides {
+		fields[key] = value
+	}
+	body, err := common.Marshal(fields)
+	var effective dto.OpenAIResponsesRequest
+	if err != nil || common.Unmarshal(body, &effective) != nil || effective.Model != info.UpstreamModelName || helper.ExceedsMaxTokensLimit(effective.MaxOutputTokens) {
+		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Invalid Channel request parameters")
+		return
+	}
+	// Count native input rather than treating max_output_tokens as usage.
+	estimatedInput, err := service.CountRequestToken(c, effective.GetTokenCountMeta(), info)
+	if err != nil {
+		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid Responses request")
+		return
+	}
+	info.SetEstimatePromptTokens(estimatedInput)
+	mean, err := model.RecentOfferingOutputTokens(c.Request.Context(), offering.ID, started.UnixMilli())
+	if err != nil {
+		run.fail(c, http.StatusServiceUnavailable, "billing_unavailable", "Billing is unavailable")
+		return
+	}
+	if limit := effective.MaxOutputTokens; limit != nil && *limit > 0 {
+		mean = min(mean, int64(*limit))
+	}
+	if limit := selection.Capabilities.Limits.MaxOutputTokens; limit != nil {
+		mean = min(mean, *limit)
+	}
+	if limit := selection.Capabilities.Limits.ContextLength; limit != nil {
+		mean = min(mean, *limit-int64(estimatedInput))
+	}
+	if mean < 0 {
+		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel context limit exceeded")
+		return
+	}
+	input := billingexpr.RequestInput{Body: call.Body, Headers: map[string]string{}}
+	for key, values := range c.Request.Header {
+		input.Headers[strings.ToLower(key)] = strings.Join(values, ",")
+	}
+	estimated := &dto.Usage{PromptTokens: estimatedInput, CompletionTokens: int(mean), TotalTokens: estimatedInput + int(mean)}
+	source, reserveValue, _, err := service.GatewayPrice(run.sale, estimated, input, started, run.ratio, run.saleFX)
+	reserve, reserveErr := reserveValue.Receivable()
+	sourceReserve, sourceErr := source.Receivable()
+	if err != nil || reserveErr != nil || sourceErr != nil {
+		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Model price is unavailable")
+		return
+	}
+	if run.record == nil {
+		record := &model.GatewayRequest{ID: info.RequestId, UserID: c.GetInt("id"), TokenID: c.GetInt("token_id"), ModelOfferingID: offering.ID, OfferingName: offering.Name, RequestedName: call.Request.Model,
+			ChoiceCount: 1, SalePriceVersionID: run.sale.ID, SaleExpression: run.sale.Expression, SaleCurrency: run.sale.Currency, SaleFXRate: run.saleRate, GroupRatio: run.ratio.String(),
+			Receivable: money.Amount{Currency: model.SettlementCurrency()}, StartedAt: started.UnixMilli(), UsageSource: "none", Status: "failed", LedgerEntryIDs: []string{}}
+		if err = model.ReserveGateway(record, reserve, sourceReserve); err != nil {
+			if errors.Is(err, model.ErrInsufficientWalletBalance) {
+				run.fail(c, http.StatusPaymentRequired, "insufficient_balance", "Insufficient wallet balance")
+			} else {
+				run.fail(c, http.StatusServiceUnavailable, "billing_unavailable", "Billing is unavailable")
+			}
+			return
+		}
+		run.record, run.reservation, run.saleSource = record, reserve, sourceReserve
+	} else if reserve.Nanos > run.reservation.Nanos {
+		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
+		return
+	}
+	prepared, err := call.Prepare(c, info)
+	if err != nil {
+		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "Upstream connection settings are unavailable")
+		return
+	}
+	attemptStart := clock.Now()
+	purchase, purchaseFX, rate, err := gatewayChannelPurchaseSnapshot(c.Request.Context(), selection.Channel.ID, attemptStart)
+	if err != nil {
+		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
+		return
+	}
+	purchaseInput := billingexpr.RequestInput{Body: body, Headers: map[string]string{}}
+	for key, values := range prepared.Headers() {
+		purchaseInput.Headers[strings.ToLower(key)] = strings.Join(values, ",")
+	}
+	costEstimate, convertedEstimate, _, priceErr := service.GatewayPrice(purchase, estimated, purchaseInput, attemptStart, decimal.NewFromInt(1), purchaseFX)
+	_, costErr := costEstimate.Cost()
+	_, convertedErr := convertedEstimate.Cost()
+	if priceErr != nil || costErr != nil || convertedErr != nil {
+		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
+		return
+	}
+	payload, err := call.CreatePayload(body)
+	if err != nil {
+		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid Responses request")
+		return
+	}
+	attemptContext, err := budget.Start()
+	if err != nil {
+		run.fail(c, http.StatusServiceUnavailable, "budget_exhausted", "Upstream request failed")
+		return
+	}
+	parent := c.Request
+	c.Request = parent.WithContext(attemptContext)
+	defer func() { c.Request = parent }()
+	attempt := &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: run.record.ID, ChannelID: selection.Channel.ID, ProviderID: selection.Channel.ProviderID, ModelID: selection.Channel.ModelID, MemberTier: 1,
+		StartedAt: attemptStart.UnixMilli(), UsageSource: "none", PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, AccountingFXRate: rate,
+		Cost: money.Amount{Currency: purchase.Currency}, ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, RouteDiagnostics: selection.Diagnostics, ConversionLosses: []string{}}
+	usage, apiErr := call.Exchange(c, info, selection.Channel.ID, selection.Channel.ProviderID, prepared, payload)
+	// The Attempt context may be expired while the client is still present.
+	// Classify against the parent before deciding cancellation accounting.
+	c.Request = parent
+	attempt.EndedAt = clock.Now().UnixMilli()
+	attempt.Status, attempt.ErrorClass = gatewayAttemptOutcome(c, info, apiErr)
+	status, code := 0, ""
+	if apiErr != nil {
+		status = apiErr.StatusCode
+		code, _ = apiErr.ToOpenAIError().Code.(string)
+	}
+	failure := service.ClassifyGatewayFailure(status, code, apiErr != nil, budget.TimedOut(), parent.Context().Err() != nil, info.ResponseFacts.DownstreamWriteFailed)
+	if attempt.Status == "success" {
+		failure = service.GatewayFailure{}
+	}
+	if attempt.Status != "success" {
+		attempt.ErrorClass = failure.Class
+	}
+	result = service.GatewayAttemptResult{Attempt: attempt, Failure: failure, Delivered: call.Established(), HealthLease: selection.Admission.Lease}
+	run.record.Status = attempt.Status
+	if usage != nil {
+		if !info.ResponseFacts.UsageReported && !info.ResponseFacts.BusinessOutput && info.ResponseFacts.GeneratedText == "" {
+			usage = nil
+		}
+	}
+	if usage != nil {
+		attempt.Usage, attempt.UsageSource = service.GatewayRecordUsage(usage), "estimated"
+		if info.ResponseFacts.UsageReported {
+			attempt.UsageSource = "upstream"
+		}
+		cost, converted, trace, priceErr := service.GatewayPrice(purchase, usage, purchaseInput, attemptStart, decimal.NewFromInt(1), purchaseFX)
+		trace.MatchedTier = ""
+		attempt.Cost, err = cost.Cost()
+		attempt.CostPending = err != nil || attempt.Cost.Currency != purchase.Currency
+		attempt.ConvertedCost, err = converted.Cost()
+		attempt.ConvertedCostPending = err != nil || attempt.ConvertedCost.Currency != model.SettlementCurrency()
+		if run.attemptUsage == nil {
+			run.attemptUsage = make(map[string]*dto.Usage)
+			run.attemptTrace = make(map[string]billingexpr.MoneyTraceResult)
+		}
+		run.attemptUsage[attempt.ID] = service.GatewayUsageSnapshot(usage)
+		run.attemptTrace[attempt.ID] = trace
+		if priceErr != nil || attempt.CostPending || attempt.ConvertedCostPending {
+			run.evaluationFailed = true
+		}
+		if info.ResponseFacts.BusinessOutput {
+			saleUsage := service.GatewayUsageSnapshot(usage)
+			if attempt.Status == "partial" && info.ResponseFacts.CompletionTokensReported {
+				delivered := tokenkit.Count(info.TokenizerModel, info.ResponseFacts.GeneratedText)
+				if delivered < saleUsage.CompletionTokens {
+					saleUsage.CompletionTokens, saleUsage.OutputTokens = delivered, delivered
+					saleUsage.TotalTokens = saleUsage.PromptTokens + delivered
+					saleUsage.CompletionTokenDetails = dto.OutputTokenDetails{}
+					saleUsage.OutputTokensDetails = nil
+				}
+			}
+			run.saleUsage = saleUsage
+			run.record.Usage, run.record.UsageSource = service.GatewayRecordUsage(saleUsage), attempt.UsageSource
+			source, receivable, saleTrace, priceErr := service.GatewayPrice(run.sale, saleUsage, input, started, run.ratio, run.saleFX)
+			saleTrace.MatchedTier = ""
+			run.saleTrace = &saleTrace
+			if attempt.Status != "success" && (saleTrace.BillingUnit == billingexpr.BillingUnitRequest || billingexpr.UsesOnlyFixedPricing(run.sale.Expression)) {
+				source, _ = money.ParseValue("0", run.sale.Currency)
+				receivable, _ = money.ParseValue("0", model.SettlementCurrency())
+				priceErr = nil
+			}
+			run.record.Receivable, err = receivable.Receivable()
+			if err == nil && priceErr == nil {
+				run.saleSource, err = source.Receivable()
+			}
+			if err != nil || priceErr != nil {
+				run.record.Receivable = money.Amount{Currency: model.SettlementCurrency()}
+				run.record.SalePending = true
+				run.evaluationFailed, run.saleEvaluationFailed = true, true
+			}
+		}
+	}
+	if attempt.Status != "success" && apiErr != nil {
+		run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream response failed")
+	}
+	return
+}

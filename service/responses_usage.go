@@ -44,6 +44,11 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 	case "response.completed", "response.done", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
 		if event.Response != nil {
 			ApplyResponsesUsage(a.usage, event.Response.Usage)
+			if facts := a.info.ResponseFacts; facts != nil && event.Response.Usage != nil {
+				prompt, completion := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens", "response.usage.output_tokens", "response.usage.total_tokens")
+				reported := *a.usage
+				facts.RecordUsage(a.usage, &reported, prompt, completion)
+			}
 			if a.outputText.Len() == 0 {
 				// Some upstreams carry the output only on the terminal event.
 				a.outputText.WriteString(relayconvert.ExtractOutputTextFromResponses(event.Response))
@@ -96,7 +101,11 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 		a.imageCounter.Commit(a.info)
 		a.imageCommitted = true
 	}
-	if a.usage.CompletionTokens == 0 {
+	facts := a.info.ResponseFacts
+	if facts != nil {
+		facts.GeneratedText = a.outputText.String()
+	}
+	if a.usage.CompletionTokens == 0 && (facts == nil || !facts.CompletionTokensReported) {
 		if output := a.outputText.String(); output != "" {
 			a.usage.CompletionTokens = tokenkit.Count(a.info.GetUpstreamModelName(), output)
 		}
@@ -105,7 +114,7 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 	// that produced any event but no usage still owes its input tokens unless
 	// upstream reported an explicit failure.
 	billsPrompt := a.usage.CompletionTokens != 0 || (a.started && !a.info.StreamStatus.ResponseFailed())
-	if a.usage.PromptTokens == 0 && billsPrompt {
+	if a.usage.PromptTokens == 0 && billsPrompt && (facts == nil || !facts.PromptTokensReported) {
 		a.usage.PromptTokens = a.info.GetEstimatePromptTokens()
 	}
 	a.usage.TotalTokens = a.usage.PromptTokens + a.usage.CompletionTokens

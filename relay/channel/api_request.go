@@ -1,6 +1,8 @@
 package channel
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -401,6 +403,27 @@ func DoFormRequest(a ProviderTransport, c *gin.Context, info *common.RelayInfo, 
 // request context, and reports a rejected handshake as a *types.NewAPIError
 // carrying the upstream status code (types.NewError preserves it).
 func DoWssRequest(a ProviderTransport, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*websocket.Conn, error) {
+	prepared, err := PrepareWssRequest(a, c, info)
+	if err != nil {
+		return nil, err
+	}
+	return DoPreparedWssRequest(c, prepared)
+}
+
+// PreparedWssRequest holds transient Provider credentials only at the transport
+// boundary. Pricing probes receive copies; no prepared request is persisted.
+type PreparedWssRequest struct {
+	url      string
+	header   http.Header
+	dialer   websocket.Dialer
+	identity [32]byte
+}
+
+func (request *PreparedWssRequest) Headers() http.Header { return request.header.Clone() }
+func (request *PreparedWssRequest) Identity() [32]byte   { return request.identity }
+
+// PrepareWssRequest performs no Provider I/O.
+func PrepareWssRequest(a ProviderTransport, c *gin.Context, info *common.RelayInfo) (*PreparedWssRequest, error) {
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", err)
@@ -435,7 +458,16 @@ func DoWssRequest(a ProviderTransport, c *gin.Context, info *common.RelayInfo, r
 	if info.ChannelSetting.TLSInsecureSkipVerify {
 		dialer.TLSClientConfig = common2.InsecureTLSConfig
 	}
-	targetConn, resp, err := dialer.DialContext(c.Request.Context(), fullRequestURL, targetHeader)
+	var identity bytes.Buffer
+	identity.WriteString(fullRequestURL)
+	_ = targetHeader.Write(&identity)
+	identity.WriteString(info.ChannelSetting.Proxy)
+	identity.WriteString(fmt.Sprint(info.ChannelSetting.TLSInsecureSkipVerify))
+	return &PreparedWssRequest{url: fullRequestURL, header: targetHeader, dialer: dialer, identity: sha256.Sum256(identity.Bytes())}, nil
+}
+
+func DoPreparedWssRequest(c *gin.Context, request *PreparedWssRequest) (*websocket.Conn, error) {
+	targetConn, resp, err := request.dialer.DialContext(c.Request.Context(), request.url, request.header)
 	if err != nil {
 		statusCode := http.StatusInternalServerError
 		if resp != nil {
@@ -444,7 +476,7 @@ func DoWssRequest(a ProviderTransport, c *gin.Context, info *common.RelayInfo, r
 				_ = resp.Body.Close()
 			}
 		}
-		return nil, types.NewErrorWithStatusCode(fmt.Errorf("dial failed to %s: %w", common.SanitizeURLForLog(fullRequestURL), redactUpstreamURLError(err)), types.ErrorCodeDoRequestFailed, statusCode)
+		return nil, types.NewErrorWithStatusCode(fmt.Errorf("dial failed to %s: %w", common.SanitizeURLForLog(request.url), redactUpstreamURLError(err)), types.ErrorCodeDoRequestFailed, statusCode)
 	}
 	return targetConn, nil
 }

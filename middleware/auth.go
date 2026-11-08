@@ -642,7 +642,10 @@ func TokenAuth() func(c *gin.Context) {
 			key = parts[0]
 		}
 		validateToken := model.ValidateUserToken
-		if TextOffering(c) != nil {
+		// The handshake has no billable request yet. Each response.create
+		// revalidates credentials and chooses wallet or legacy quota billing.
+		responsesHandshake := c.Request.Method == http.MethodGet && c.Request.URL.Path == "/v1/responses" && strings.EqualFold(c.GetHeader("Upgrade"), "websocket")
+		if TextOffering(c) != nil || responsesHandshake {
 			validateToken = model.ValidateWalletToken
 		}
 		token, err := validateToken(key)

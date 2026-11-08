@@ -612,6 +612,85 @@ func newTestWebSocketPair(t *testing.T) (*websocket.Conn, *websocket.Conn, func(
 	return target, serverConn, cleanup
 }
 
+func TestResponsesWSGatewayTransportKeepsOneConnection(t *testing.T) {
+	var connections atomic.Int32
+	upstreamDone := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if !assert.NoError(t, err) {
+			return
+		}
+		connections.Add(1)
+		defer peer.Close()
+		defer close(upstreamDone)
+		_, _, err = peer.ReadMessage()
+		if !assert.NoError(t, err) {
+			return
+		}
+		_ = peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"first","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`))
+		_, _, _ = peer.ReadMessage()
+	}))
+	defer upstream.Close()
+	client, server, cleanup := newTestWebSocketPair(t)
+	defer cleanup()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	results := make(chan *dto.Usage, 1)
+	done := make(chan struct{})
+	runner := func(request *http.Request, _ string, handle func(*gin.Context) *types.NewAPIError) *types.NewAPIError {
+		requestContext, _ := gin.CreateTestContext(httptest.NewRecorder())
+		requestContext.Request = request
+		return handle(requestContext)
+	}
+	go func() {
+		defer close(done)
+		ResponsesWebSocketHelper(c, server, runner, func(c *gin.Context, call *ResponsesWSCall) (bool, *types.NewAPIError) {
+			info := &relaycommon.RelayInfo{RelayMode: relayconstant.RelayModeResponses, RequestURLPath: "/v1/responses", ResponseFacts: &relaycommon.ResponseFacts{},
+				ProviderMeta: &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeOpenAI, ApiType: constant.APITypeOpenAI, ChannelBaseUrl: upstream.URL, UpstreamModelName: "native", ApiKey: "provider-secret"}}
+			prepared, err := call.Prepare(c, info)
+			if err != nil {
+				return true, newResponsesWSInvalidRequestError(err)
+			}
+			payload, err := call.CreatePayload([]byte(`{"model":"native","input":"hi"}`))
+			if err != nil {
+				return true, newResponsesWSInvalidRequestError(err)
+			}
+			channelID := 10
+			if call.LockedChannelID != 0 {
+				channelID = 11
+			}
+			usage, apiErr := call.Exchange(c, info, channelID, 20, prepared, payload)
+			if apiErr == nil {
+				results <- usage
+			}
+			return true, apiErr
+		})
+	}()
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"public","input":"hi"}`)))
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, raw, err := client.ReadMessage()
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"id":"first"`)
+	usage := <-results
+	assert.Zero(t, usage.TotalTokens)
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"public","input":"next"}`)))
+	_, raw, err = client.ReadMessage()
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), "upstream connection identity changed")
+	require.NoError(t, client.Close())
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("gateway did not stop")
+	}
+	select {
+	case <-upstreamDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream did not stop")
+	}
+	assert.Equal(t, int32(1), connections.Load())
+}
+
 func TestResponsesWSMessageSizeLimit(t *testing.T) {
 	previous := constant.MaxRequestBodyMB
 	constant.MaxRequestBodyMB = 1

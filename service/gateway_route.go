@@ -31,7 +31,19 @@ var ErrGatewayUnavailable = errors.New("no Channel is available")
 
 // SelectGatewayChannel applies scope and capability filters before runtime
 // health ordering and atomically claims any selected half-open probe.
+type GatewayChannelRequirements struct {
+	Protocol           protocol.Type
+	ChannelID          int
+	ResponsesWebSocket bool
+}
+
 func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request *dto.GeneralOpenAIRequest, failures ...*GatewayExclusions) (*GatewaySelection, error) {
+	return SelectGatewayProtocolChannel(c, offering, request, GatewayChannelRequirements{Protocol: protocol.OpenAIChat}, failures...)
+}
+
+// SelectGatewayProtocolChannel uses the shared candidate and health admission
+// path for a native transport. ChannelID constrains an established connection.
+func SelectGatewayProtocolChannel(c *gin.Context, offering *model.ModelOffering, request *dto.GeneralOpenAIRequest, requirements GatewayChannelRequirements, failures ...*GatewayExclusions) (*GatewaySelection, error) {
 	ids := []int{}
 	for _, member := range offering.Members {
 		if member.Tier == 1 {
@@ -58,13 +70,19 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 		switch {
 		case candidate.Status != model.ChannelEnabled || !candidate.MappingConfirmed || candidate.Model.Status != 1:
 			reason = "disabled"
-		case candidate.Protocol != protocol.OpenAIChat:
+		case requirements.ChannelID != 0 && candidate.ID != requirements.ChannelID:
+			reason = "connection_locked"
+		case candidate.Protocol != requirements.Protocol:
 			reason = "protocol"
 		default:
 			var err error
 			provider, err = model.CacheGetProvider(candidate.ProviderID)
 			if err != nil || provider == nil || provider.Status != common.ChannelStatusEnabled {
 				reason = "disabled"
+				break
+			}
+			if requirements.ResponsesWebSocket && !provider.GetSetting().ResponsesWebSocketEnabled {
+				reason = "protocol"
 				break
 			}
 			caps, err = candidate.EffectiveCapabilities(candidate.Model.Capabilities)

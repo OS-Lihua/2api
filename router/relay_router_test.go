@@ -44,6 +44,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/go-redis/redis/v8"
+	"github.com/gorilla/websocket"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
@@ -302,6 +303,113 @@ func assertTextGatewayLedger(t *testing.T, request model.GatewayRequest, expecte
 	reconciliation, err := model.ReconcileWallets(100)
 	require.NoError(t, err)
 	assert.Empty(t, reconciliation.Mismatches)
+}
+
+func TestResponsesWSGatewaySettlesLogicalRequests(t *testing.T) {
+	var connections atomic.Int32
+	received := make(chan string, 2)
+	upstreamDone := make(chan struct{})
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		ws, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if !assert.NoError(t, err) {
+			return
+		}
+		connections.Add(1)
+		defer ws.Close()
+		defer close(upstreamDone)
+		assert.Equal(t, "Bearer provider-secret", r.Header.Get("Authorization"))
+		assert.Empty(t, r.Header.Get("Sec-WebSocket-Protocol"))
+		for i := range 2 {
+			_, raw, err := ws.ReadMessage()
+			if !assert.NoError(t, err) {
+				return
+			}
+			var event struct {
+				Model    string `json:"model"`
+				Previous string `json:"previous_response_id"`
+			}
+			if !assert.NoError(t, common.Unmarshal(raw, &event)) {
+				return
+			}
+			received <- event.Model
+			if i == 1 {
+				assert.Equal(t, "response-0", event.Previous)
+				_ = ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"response-0","status":"completed","usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010}}}`))
+			}
+			usage := `"input_tokens":1000,"output_tokens":10,"total_tokens":1010`
+			if i == 1 {
+				usage = `"input_tokens":0,"output_tokens":0,"total_tokens":0`
+			}
+			terminal := fmt.Sprintf(`{"type":"response.completed","response":{"id":"response-%d","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{%s}}}`, i, usage)
+			if !assert.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(terminal))) {
+				return
+			}
+		}
+		_, _, _ = ws.ReadMessage()
+	})
+	require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", protocol.OpenAIResponses).Error)
+	var provider model.Provider
+	require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
+	provider.SetSetting(dto.ProviderSettings{ResponsesWebSocketEnabled: true})
+	require.NoError(t, model.DB.Model(&provider).Update("setting", provider.Setting).Error)
+	gateway := httptest.NewServer(fixture.engine)
+	defer gateway.Close()
+	client, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(gateway.URL, "http")+"/v1/responses", http.Header{"Authorization": {"Bearer sk-" + fixture.token.Key}})
+	if response != nil {
+		defer response.Body.Close()
+	}
+	require.NoError(t, err, "wallet requests must not depend on retired token quota")
+	defer client.Close()
+	for i, name := range []string{"gateway-alias", "gateway-offering"} {
+		previous := ""
+		if i == 1 {
+			previous = `,"previous_response_id":"response-0"`
+		}
+		require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.create","model":%q,"input":"hello","max_output_tokens":16%s}`, name, previous))))
+		require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+		_, raw, err := client.ReadMessage()
+		require.NoError(t, err)
+		assert.Contains(t, string(raw), fmt.Sprintf(`"id":"response-%d"`, i), "%s", raw)
+		assert.Equal(t, "upstream-model", <-received)
+		// Read records through the same management API used by the drawer.
+		var records []model.GatewayRequest
+		require.Eventually(t, func() bool {
+			var err error
+			records, _, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+			return err == nil && len(records) == i+1
+		}, 5*time.Second, 10*time.Millisecond)
+	}
+	require.NoError(t, client.Close())
+	select {
+	case <-upstreamDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream session did not stop")
+	}
+	assert.Equal(t, int32(1), connections.Load())
+	records, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, total)
+	for _, record := range records {
+		expectedSale, expectedCost := int64(1_836_000), int64(1_020_000)
+		if record.RequestedName == "gateway-offering" {
+			expectedSale, expectedCost = 0, 0
+		}
+		assert.Equal(t, expectedSale, record.Receivable.Nanos)
+		assert.Equal(t, "upstream", record.UsageSource)
+		assertTextGatewayLedger(t, record, expectedCost)
+		attempts, count, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+		require.NoError(t, err)
+		require.EqualValues(t, 1, count)
+		assert.Equal(t, fixture.channel.ID, attempts[0].ChannelID)
+		assert.Equal(t, expectedCost, attempts[0].Cost.Nanos)
+		response := adminSecurityRequest(fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests/"+record.ID+"/attempts", "")
+		assert.Equal(t, http.StatusOK, response.Code)
+		assert.NotContains(t, response.Body.String(), "provider-secret")
+		assert.NotContains(t, response.Body.String(), fixture.token.Key)
+	}
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, int64(998_164_000), wallet.Balance.Nanos)
 }
 
 func TestGatewayBudgetManagementOptions(t *testing.T) {

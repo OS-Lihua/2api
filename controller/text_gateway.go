@@ -108,24 +108,7 @@ func TextGateway(c *gin.Context) {
 		return result
 	})
 	c.Request = parent
-	if run.record != nil {
-		run.record.EndedAt = clock.Now().UnixMilli()
-		if run.evaluationFailed {
-			run.record.Status = "settlement_pending"
-		}
-		intent := model.GatewaySettlement{Request: *run.record, Attempts: attempts, SaleSource: run.saleSource, EvaluationFailed: run.evaluationFailed, SaleEvaluationFailed: run.saleEvaluationFailed}
-		if run.evaluationFailed {
-			intent.SaleUsage, intent.AttemptUsage = run.saleUsage, run.attemptUsage
-			intent.SaleTrace, intent.AttemptTrace = run.saleTrace, run.attemptTrace
-		}
-		if err := model.PrepareGatewaySettlement(intent); err != nil {
-			logger.LogError(parent.Context(), "gateway settlement preparation failed for request "+run.record.ID)
-		} else if _, err := model.SettleGateway(run.record.ID); err != nil {
-			logger.LogError(parent.Context(), "gateway settlement pending for request "+run.record.ID)
-		} else if err := model.PublishGatewayRecords(run.record.ID); err != nil {
-			logger.LogError(parent.Context(), "gateway record delivery pending for request "+run.record.ID)
-		}
-	}
+	run.settle(parent.Context(), attempts)
 	if parent.Context().Err() != nil {
 		return
 	}
@@ -135,6 +118,28 @@ func TextGateway(c *gin.Context) {
 		} else if !c.Writer.Written() {
 			gatewayError(c, run.status, run.code, run.message)
 		}
+	}
+}
+
+func (run *textGatewayRun) settle(ctx context.Context, attempts []model.GatewayAttempt) {
+	if run.record == nil {
+		return
+	}
+	run.record.EndedAt = clock.Now().UnixMilli()
+	if run.evaluationFailed {
+		run.record.Status = "settlement_pending"
+	}
+	intent := model.GatewaySettlement{Request: *run.record, Attempts: attempts, SaleSource: run.saleSource, EvaluationFailed: run.evaluationFailed, SaleEvaluationFailed: run.saleEvaluationFailed}
+	if run.evaluationFailed {
+		intent.SaleUsage, intent.AttemptUsage = run.saleUsage, run.attemptUsage
+		intent.SaleTrace, intent.AttemptTrace = run.saleTrace, run.attemptTrace
+	}
+	if err := model.PrepareGatewaySettlement(intent); err != nil {
+		logger.LogError(ctx, "gateway settlement preparation failed for request "+run.record.ID)
+	} else if _, err := model.SettleGateway(run.record.ID); err != nil {
+		logger.LogError(ctx, "gateway settlement pending for request "+run.record.ID)
+	} else if err := model.PublishGatewayRecords(run.record.ID); err != nil {
+		logger.LogError(ctx, "gateway record delivery pending for request "+run.record.ID)
 	}
 }
 
