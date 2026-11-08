@@ -32,6 +32,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/tokenkit"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
@@ -76,6 +77,7 @@ type NativeWSLifecycle struct {
 // ResponsesWSCall exposes one logical request. Only non-secret Channel
 // identity survives between calls; credentials stay in the Provider transport.
 type ResponsesWSCall struct {
+	AuthorizeControl    func(*gin.Context) *types.NewAPIError
 	Native              *NativeWSLifecycle
 	Request             dto.OpenAIResponsesRequest
 	Body                []byte
@@ -88,6 +90,52 @@ type ResponsesWSCall struct {
 	session             *responsesWSSession
 	state               *responsesWSCallState
 	create              responsesWSCreateRequest
+}
+
+// EstimateInput resolves quantities known on this connection. Per-request
+// configuration is billed now but does not enter previous_response_id history.
+func (call *ResponsesWSCall) EstimateInput(c *gin.Context, info *relaycommon.RelayInfo, request *dto.OpenAIResponsesRequest, caps capability.Set) (*relaycommon.ResponsesInputFacts, error) {
+	meta := request.GetTokenCountMeta()
+	usage, err := service.CountRequestUsage(c, meta, info)
+	if err != nil {
+		return nil, err
+	}
+	images := 0
+	for _, file := range meta.Files {
+		if file.FileType == types.FileTypeImage {
+			images++
+		}
+	}
+	if request.PreviousResponseID != "" {
+		previous, ok := call.session.contexts[request.PreviousResponseID]
+		if !ok {
+			return nil, errors.New("Unknown response context; provide complete input")
+		}
+		total := usage.PromptTokens + previous.Context.PromptTokens
+		if total < usage.PromptTokens {
+			return nil, errors.New("Response context exceeds token limits")
+		}
+		usage.PromptTokens = total
+		usage.PromptTokensDetails.ImageTokens += previous.Context.PromptTokensDetails.ImageTokens
+		usage.PromptTokensDetails.AudioTokens += previous.Context.PromptTokensDetails.AudioTokens
+		images += previous.ImageCount
+	}
+	if images > 0 && (!slices.Contains(caps.InputModalities, capability.Image) || caps.Limits.MaxImages != nil && int64(images) > *caps.Limits.MaxImages) {
+		return nil, service.ErrGatewayCapability
+	}
+	if usage.PromptTokensDetails.AudioTokens > 0 && !slices.Contains(caps.InputModalities, capability.Audio) {
+		return nil, service.ErrGatewayCapability
+	}
+	usage.TotalTokens = usage.PromptTokens
+	usage.PromptTokensDetails.TextTokens = usage.PromptTokens - usage.PromptTokensDetails.ImageTokens - usage.PromptTokensDetails.AudioTokens
+	contextUsage := service.GatewayUsageSnapshot(usage)
+	inputOnly := *request
+	inputOnly.Instructions, inputOnly.Metadata, inputOnly.Text, inputOnly.ToolChoice, inputOnly.Prompt, inputOnly.Tools = nil, nil, nil, nil, nil, nil
+	model := common.GetContextKeyString(c, appconstant.ContextKeyOriginalModel)
+	contextUsage.PromptTokens += tokenkit.Count(model, inputOnly.GetTokenCountMeta().CombineText) - tokenkit.Count(model, meta.CombineText)
+	contextUsage.TotalTokens = contextUsage.PromptTokens
+	contextUsage.PromptTokensDetails.TextTokens = contextUsage.PromptTokens - contextUsage.PromptTokensDetails.ImageTokens - contextUsage.PromptTokensDetails.AudioTokens
+	return &relaycommon.ResponsesInputFacts{Usage: usage, Context: contextUsage, ImageCount: images}, nil
 }
 
 // Prepare uses the existing Provider transport without sending any bytes.
@@ -112,6 +160,7 @@ func (call *ResponsesWSCall) Exchange(c *gin.Context, info *relaycommon.RelayInf
 		return call.Native.Exchange(c, info, channelID, providerID, prepared, payload)
 	}
 	s := call.session
+	call.state.authorizeControl = call.AuthorizeControl
 	if s.lockedChannelID != 0 {
 		return nil, newResponsesWSInvalidRequestError(errors.New("connection billing identity changed; reconnect required"))
 	}
@@ -139,7 +188,41 @@ func (call *ResponsesWSCall) Exchange(c *gin.Context, info *relaycommon.RelayInf
 		call.state.closeCode = websocket.CloseInternalServerErr
 		return nil, types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
 	}
-	return s.receive(c, call.state, info, call.create)
+	previousID := s.lastResponseID
+	usage, apiErr := s.receive(c, call.state, info, call.create)
+	if input := info.ResponsesInputFacts; input != nil && s.lastResponseID != "" && s.lastResponseID != previousID {
+		id := s.lastResponseID
+		maximum := appconstant.MaxRequestBodyMB
+		if maximum <= 0 {
+			maximum = 128
+		}
+		if s.contextBytes+len(id)+256 > maximum<<20 {
+			call.state.closeCode = websocket.CloseMessageTooBig
+		} else {
+			contextUsage := service.GatewayUsageSnapshot(input.Context)
+			generated := 0
+			if info.ResponseFacts != nil {
+				generated = tokenkit.Count(info.TokenizerModelName(), info.ResponseFacts.GeneratedText)
+			}
+			if usage != nil {
+				generated = max(generated, usage.CompletionTokens)
+			}
+			if total := contextUsage.PromptTokens + generated; total >= contextUsage.PromptTokens {
+				contextUsage.PromptTokens, contextUsage.TotalTokens = total, total
+				contextUsage.PromptTokensDetails.TextTokens += generated
+				if s.contexts == nil {
+					s.contexts = map[string]relaycommon.ResponsesInputFacts{}
+				}
+				if _, exists := s.contexts[id]; !exists {
+					s.contextBytes += len(id) + 256
+				}
+				s.contexts[id] = relaycommon.ResponsesInputFacts{Context: contextUsage, ImageCount: input.ImageCount}
+			} else {
+				call.state.closeCode = websocket.CloseMessageTooBig
+			}
+		}
+	}
+	return usage, apiErr
 }
 
 // Established includes a successful handshake followed by a failed generation.
@@ -211,6 +294,7 @@ type responsesWSControl struct {
 // Only the request worker reads or changes billing state. Socket readers pass
 // bounded messages to it; cancellation never performs an independent refund.
 type responsesWSCallState struct {
+	authorizeControl  func(*gin.Context) *types.NewAPIError
 	inbox             chan responsesWSMessage
 	controls          chan responsesWSControl
 	done              chan struct{}
@@ -253,6 +337,8 @@ type responsesWSSession struct {
 
 	// These fields belong to the serial request worker and describe the actual
 	// established connection. Per-request token/user data is never stored here.
+	contexts        map[string]relaycommon.ResponsesInputFacts
+	contextBytes    int
 	lastResponseID  string
 	lockedModel     string
 	lockedChannelID int
@@ -541,6 +627,19 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 	return receiveErr
 }
 
+func (s *responsesWSSession) authorizeControl(state *responsesWSCallState, create responsesWSCreateRequest) *types.NewAPIError {
+	request := s.request.Clone(s.ctx)
+	request.Body = io.NopCloser(bytes.NewReader(create.Body))
+	request.ContentLength = int64(len(create.Body))
+	request.Header.Set("Content-Type", "application/json")
+	return s.runner(request, common.NewRequestId(), func(c *gin.Context) *types.NewAPIError {
+		if state.authorizeControl != nil {
+			return state.authorizeControl(c)
+		}
+		return nil
+	})
+}
+
 func (s *responsesWSSession) receive(c *gin.Context, state *responsesWSCallState, info *relaycommon.RelayInfo, create responsesWSCreateRequest) (*dto.Usage, *types.NewAPIError) {
 	accumulator := service.NewResponsesUsageAccumulator(info)
 	info.StreamStatus = relaycommon.NewStreamStatus()
@@ -675,6 +774,11 @@ func (s *responsesWSSession) receive(c *gin.Context, state *responsesWSCallState
 				s.shutdown(websocket.CloseInternalServerErr, "")
 			}
 			if accepted && pendingControl != nil {
+				if apiErr := s.authorizeControl(state, create); apiErr != nil {
+					info.StreamStatus.MarkCancelled()
+					state.closeCode = websocket.ClosePolicyViolation
+					return accumulator.Finish(), apiErr
+				}
 				if err := s.writeTarget(websocket.TextMessage, pendingControl); err != nil {
 					s.shutdown(websocket.CloseInternalServerErr, "")
 				}
@@ -682,6 +786,11 @@ func (s *responsesWSSession) receive(c *gin.Context, state *responsesWSCallState
 				pendingControl = nil
 			}
 		case control := <-state.controls:
+			if apiErr := s.authorizeControl(state, create); apiErr != nil {
+				info.StreamStatus.MarkCancelled()
+				state.closeCode = websocket.ClosePolicyViolation
+				return accumulator.Finish(), apiErr
+			}
 			if pendingControl != nil || sentControl != nil {
 				s.sendError(control.eventID, control.streamID, newResponsesWSInvalidRequestError(errors.New("a response control event is already pending")))
 				continue

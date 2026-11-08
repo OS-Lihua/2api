@@ -41,6 +41,14 @@ func responsesWSGateway(c *gin.Context, call *relay.ResponsesWSCall) (bool, *typ
 	if call.LegacyConnection {
 		return true, types.NewErrorWithStatusCode(errors.New("Connection billing identity changed; reconnect required"), "connection_locked", http.StatusConflict)
 	}
+	lockedOfferingID := middleware.TextOffering(c).ID
+	call.AuthorizeControl = func(control *gin.Context) *types.NewAPIError {
+		offering := middleware.TextOffering(control)
+		if offering == nil || offering.ID != lockedOfferingID {
+			return types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound)
+		}
+		return authorizeWebSocketOffering(control, call.Request.Model)
+	}
 	if apiErr := authorizeWebSocketOffering(c, call.Request.Model); apiErr != nil {
 		return true, apiErr
 	}

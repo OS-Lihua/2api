@@ -340,6 +340,180 @@ func dialResponsesGateway(t *testing.T, fixture textGatewayFixture) *websocket.C
 	return client
 }
 
+func TestResponsesWSGatewayRechecksControlAuthorization(t *testing.T) {
+	for _, change := range []string{"token", "user", "offering"} {
+		t.Run(change, func(t *testing.T) {
+			var controls atomic.Int32
+			done := make(chan struct{})
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				defer close(done)
+				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if !assert.NoError(t, err) {
+					return
+				}
+				defer peer.Close()
+				if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
+					return
+				}
+				for _, frame := range []string{`{"type":"response.created","response":{"id":"cancel-target","status":"in_progress"}}`, `{"type":"response.output_text.delta","response_id":"cancel-target","item_id":"message","output_index":0,"delta":"Hi"}`} {
+					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(frame))) {
+						return
+					}
+				}
+				if _, _, err := peer.ReadMessage(); err != nil {
+					return
+				}
+				controls.Add(1)
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.cancelled","response":{"id":"cancel-target","status":"cancelled"}}`))) {
+					return
+				}
+				_, _, _ = peer.ReadMessage()
+			})
+			client := dialResponsesGateway(t, fixture)
+			require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","input":"Hello","max_output_tokens":16}`)))
+			for range 2 {
+				_, _, err := client.ReadMessage()
+				require.NoError(t, err)
+			}
+			switch change {
+			case "token":
+				require.NoError(t, model.DB.Model(fixture.token).Update("status", common.TokenStatusDisabled).Error)
+			case "user":
+				require.NoError(t, model.DB.Model(fixture.user).Update("status", common.UserStatusDisabled).Error)
+			case "offering":
+				require.NoError(t, model.DB.Model(fixture.offering).Update("enabled", false).Error)
+			}
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.cancel","response_id":"cancel-target"}`)))
+			_, reply, err := client.ReadMessage()
+			require.NoError(t, err)
+			assert.Equal(t, "error", ojson.GetBytes(reply, "type").String())
+			require.NoError(t, client.Close())
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Revoked control did not release Provider socket")
+			}
+			assert.Zero(t, controls.Load())
+			require.Eventually(t, func() bool {
+				records, _, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+				if err != nil || len(records) != 1 {
+					return false
+				}
+				attempts, _, err := model.ListGatewayAttempts(t.Context(), records[0].ID, 0, 10)
+				return err == nil && len(attempts) == 1 && attempts[0].Status == "cancelled" && attempts[0].ErrorClass == "client_cancelled"
+			}, 5*time.Second, 10*time.Millisecond)
+		})
+	}
+}
+
+func TestResponsesWSGatewayPreservesImageInputCategories(t *testing.T) {
+	for _, zero := range []bool{false, true} {
+		t.Run(fmt.Sprint("reported zero=", zero), func(t *testing.T) {
+			var fixture textGatewayFixture
+			reserved := make(chan int64, 1)
+			fixture = newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if !assert.NoError(t, err) {
+					return
+				}
+				defer peer.Close()
+				if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
+					return
+				}
+				var billing model.GatewayBilling
+				if !assert.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).First(&billing).Error) {
+					return
+				}
+				reserved <- billing.Reservation.Nanos
+				usage := ""
+				if zero {
+					usage = `,"usage":{"input_tokens":85,"output_tokens":1,"input_tokens_details":{"image_tokens":0}}`
+				}
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"image-result","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi"}]}]`+usage+`}}`))) {
+					return
+				}
+				_, _, _ = peer.ReadMessage()
+			})
+			var unified model.Model
+			require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+			unified.ModelName = "gpt-4o"
+			unified.Capabilities.InputModalities = append(unified.Capabilities.InputModalities, capability.Image)
+			require.NoError(t, model.DB.Model(&unified).Select("model_name", "capabilities").Updates(&unified).Error)
+			for _, owner := range []string{model.PriceOwnerOffering, model.PriceOwnerChannel} {
+				id := fixture.offering.ID
+				if owner == model.PriceOwnerChannel {
+					id = fixture.channel.ID
+				}
+				require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: owner, OwnerID: id, Currency: "USD", Expression: `tier("image",img * 1000)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+			}
+			client := dialResponsesGateway(t, fixture)
+			var picture bytes.Buffer
+			require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+			body := `{"type":"response.create","model":"gateway-alias","input":[{"role":"user","content":[{"type":"input_image","detail":"low","image_url":"data:image/png;base64,` + base64.StdEncoding.EncodeToString(picture.Bytes()) + `"}]}],"max_output_tokens":1}`
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(body)))
+			_, reply, err := client.ReadMessage()
+			require.NoError(t, err)
+			require.Equal(t, "response.completed", ojson.GetBytes(reply, "type").String())
+			assert.Equal(t, int64(688_500_000), <-reserved, "Known image category must be guaranteed before dispatch")
+			var records []model.GatewayRequest
+			require.Eventually(t, func() bool {
+				var err error
+				records, _, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+				return err == nil && len(records) == 1 && records[0].Status == "success"
+			}, 5*time.Second, 10*time.Millisecond)
+			amount, cost := int64(688_500_000), int64(765_000_000)
+			images := 765
+			if zero {
+				amount, cost, images = 0, 0, 0
+			}
+			assert.EqualValues(t, images, records[0].Usage.ImageInputTokens)
+			assert.Equal(t, amount, records[0].Receivable.Nanos)
+			assertTextGatewayLedger(t, records[0], cost)
+			require.NoError(t, client.Close())
+		})
+	}
+}
+
+func TestResponsesWSGatewayReservesKnownHistory(t *testing.T) {
+	var calls atomic.Int32
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if !assert.NoError(t, err) {
+			return
+		}
+		defer peer.Close()
+		for {
+			if _, _, err := peer.ReadMessage(); err != nil {
+				return
+			}
+			index := calls.Add(1)
+			reply := fmt.Sprintf(`{"type":"response.completed","response":{"id":"context-%d","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi"}]}],"usage":{"input_tokens":0,"output_tokens":0}}}`, index)
+			if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(reply))) {
+				return
+			}
+		}
+	})
+	client := dialResponsesGateway(t, fixture)
+	body := `{"type":"response.create","model":"gateway-alias","input":"` + strings.Repeat("hello ", 600) + `","max_output_tokens":1}`
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(body)))
+	_, _, err := client.ReadMessage()
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		records, _, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+		return err == nil && len(records) == 1 && records[0].Status == "success"
+	}, 5*time.Second, 10*time.Millisecond)
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Model(wallet).Update("balance_nanos", 1_000_000).Error)
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","previous_response_id":"context-1","input":"Hi","max_output_tokens":1}`)))
+	_, reply, err := client.ReadMessage()
+	require.NoError(t, err)
+	assert.Equal(t, "error", ojson.GetBytes(reply, "type").String(), "Known 600-token history cannot be financed by a short-input reservation")
+	require.NoError(t, client.Close())
+	assert.Equal(t, int32(1), calls.Load())
+}
+
 func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 	for _, tc := range []struct {
 		name, terminal, source, status   string

@@ -93,7 +93,11 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 		originalTokens = call.Native.InputUsage.PromptTokens
 	} else {
 		common.SetContextKey(candidate, constant.ContextKeyOriginalModel, info.TokenizerModel)
-		originalTokens, err = service.CountRequestToken(candidate, call.Request.GetTokenCountMeta(), info)
+		var original *relaycommon.ResponsesInputFacts
+		original, err = call.EstimateInput(candidate, info, &call.Request, selection.Capabilities)
+		if err == nil {
+			originalTokens = original.Usage.PromptTokens
+		}
 	}
 	if err != nil || !service.GatewayResponsesCapabilitiesMatch(&call.Request, selection.Capabilities, originalTokens) {
 		return nil, service.ErrGatewayCapability
@@ -117,7 +121,10 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 		if common.Unmarshal(body, &effective) != nil {
 			return nil, service.ErrGatewayCapability
 		}
-		inputUsage.PromptTokens, err = service.CountRequestToken(candidate, effective.GetTokenCountMeta(), info)
+		info.ResponsesInputFacts, err = call.EstimateInput(candidate, info, &effective, selection.Capabilities)
+		if err == nil {
+			inputUsage = info.ResponsesInputFacts.Usage
+		}
 	}
 	var effective dto.OpenAIResponsesRequest
 	if err != nil || common.Unmarshal(body, &effective) != nil || effective.Model != info.UpstreamModelName || helper.ValidateResponsesMultipliers(body) != nil || !service.GatewayResponsesCapabilitiesMatch(&effective, selection.Capabilities, inputUsage.PromptTokens) {

@@ -22,6 +22,14 @@ type RealtimeResponseFacts struct {
 	StreamStatus *StreamStatus
 }
 
+// ResponsesInputFacts freezes billable input and reusable conversation quantities.
+// Context excludes configuration that the Responses protocol does not inherit.
+type ResponsesInputFacts struct {
+	Usage      *dto.Usage
+	Context    *dto.Usage
+	ImageCount int
+}
+
 // ResponseFacts separates upstream-reported zero usage from a local estimate,
 // and business output from protocol framing and keep-alive pings. It contains
 // transient output only; callers must never persist GeneratedText.

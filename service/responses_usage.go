@@ -30,6 +30,7 @@ type ResponsesUsageAccumulator struct {
 	terminalOutputSeen bool
 	delivered          *ResponsesUsageAccumulator
 	imageCounter       relaycommon.ImageGenerationCallCounter
+	imageInputReported bool
 	imageCommitted     bool
 	started            bool
 	finished           bool
@@ -71,6 +72,10 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 	if event.Response != nil {
 		a.info.ObserveResponseModel(event.Response.Model)
 		if event.Response.Usage != nil {
+			image, _ := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens_details.image_tokens", "", "")
+			if image || len(raw) == 0 && event.Response.Usage.PromptTokensDetails.ImageTokens > 0 {
+				a.imageInputReported = true
+			}
 			ApplyResponsesUsage(a.usage, event.Response.Usage, []byte(ojson.GetBytes(raw, "response.usage").Raw))
 			if facts := a.info.ResponseFacts; facts != nil {
 				prompt, completion := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens", "response.usage.output_tokens", "response.usage.total_tokens")
@@ -242,6 +247,9 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 	billsPrompt := a.usage.CompletionTokens != 0 || (a.started && !a.info.StreamStatus.ResponseFailed())
 	if a.usage.PromptTokens == 0 && billsPrompt && (facts == nil || !facts.PromptTokensReported) {
 		a.usage.PromptTokens = a.info.GetEstimatePromptTokens()
+	}
+	if input := a.info.ResponsesInputFacts; input != nil && billsPrompt && !a.imageInputReported && (facts == nil || !facts.PromptTokensReported || a.usage.PromptTokens > 0) {
+		a.usage.PromptTokensDetails.ImageTokens = min(a.usage.PromptTokens, input.Usage.PromptTokensDetails.ImageTokens)
 	}
 	a.usage.TotalTokens = a.usage.PromptTokens + a.usage.CompletionTokens
 	if a.usage.BillingUsage != nil {
