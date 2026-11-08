@@ -3,6 +3,7 @@ package channel
 import (
 	"fmt"
 	"net/http"
+	"slices"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/protocol"
@@ -153,11 +154,6 @@ func (p *WireProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInf
 	if err != nil {
 		return nil, err
 	}
-	if managed && p.Kind == protocol.OpenAIChat && !p.PublicResponse {
-		if chat, ok := converted.(*dto.GeneralOpenAIRequest); ok && chat.N != nil && *chat.N > 1 {
-			return nil, fmt.Errorf("native Provider cannot represent multiple output choices (n)")
-		}
-	}
 	publicChat, _ := converted.(*dto.GeneralOpenAIRequest)
 	mode := info.RelayMode
 	info.RelayMode = p.relayMode(info)
@@ -171,6 +167,10 @@ func (p *WireProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInf
 		if !ok {
 			return nil, fmt.Errorf("native request does not declare retained parameters")
 		}
+		capabilities := contract.ChatRequestCapabilities()
+		if publicChat.N != nil && *publicChat.N > 1 && (info.IsStream || !slices.Contains(capabilities.Parameters, "n")) {
+			return nil, fmt.Errorf("native Provider cannot represent multiple output choices (n)")
+		}
 		projector, ok := converted.(ChatRequestProjector)
 		if !ok {
 			return nil, fmt.Errorf("native request does not expose its effective wire projection")
@@ -183,7 +183,7 @@ func (p *WireProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInf
 		if err != nil {
 			return nil, err
 		}
-		if err := DiagnoseNativeChatRequest(c, info, publicChat, contract.ChatRequestCapabilities(), actual); err != nil {
+		if err := DiagnoseNativeChatRequest(c, info, publicChat, capabilities, actual); err != nil {
 			return nil, err
 		}
 	}

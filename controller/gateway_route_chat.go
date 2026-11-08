@@ -39,19 +39,10 @@ type gatewayPreparedChat struct {
 }
 
 func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection, original *dto.GeneralOpenAIRequest, native dto.Request, kind protocol.Type, accepted []string, started time.Time, mean int64) (*gatewayPreparedChat, error) {
+	if err := selection.Provider.ValidateSettings(); err != nil {
+		return nil, service.ErrGatewayUnavailable
+	}
 	candidate := c.Copy()
-	if selection.Provider.Setting != nil && *selection.Provider.Setting != "" {
-		var settings dto.ProviderSettings
-		if common.UnmarshalJsonStr(*selection.Provider.Setting, &settings) != nil {
-			return nil, service.ErrGatewayUnavailable
-		}
-	}
-	if selection.Provider.OtherSettings != "" {
-		var settings dto.ProviderOtherSettings
-		if common.UnmarshalJsonStr(selection.Provider.OtherSettings, &settings) != nil {
-			return nil, service.ErrGatewayUnavailable
-		}
-	}
 	if setupErr := middleware.SetupContextForGatewayCandidate(candidate, selection.Provider, selection.Channel.Model.ModelName); setupErr != nil {
 		return nil, service.ErrGatewayUnavailable
 	}
