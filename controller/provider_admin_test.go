@@ -293,6 +293,39 @@ func TestProviderAdminAPIManagesProviderWithWriteOnlyKeys(t *testing.T) {
 	assert.False(t, missing.Success)
 }
 
+func TestProviderAdminAPIEnablesKeysAfterAutomaticExhaustion(t *testing.T) {
+	engine := newProviderAdminEngine(t)
+	for _, endpoint := range []string{"/keys/0/enable", "/keys/enable"} {
+		for _, manualDisable := range []bool{false, true} {
+			t.Run(endpoint+"/manual="+common.Interface2String(manualDisable), func(t *testing.T) {
+				provider := &model.Provider{Name: t.Name(), Type: constant.ChannelTypeOpenAI, Key: providerKeyA + "\n" + providerKeyB,
+					Status: common.ChannelStatusEnabled, Models: "test-model", Group: "default",
+					ProviderInfo: model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2}}
+				require.NoError(t, provider.Insert())
+				for index, key := range []string{providerKeyA, providerKeyB} {
+					changed, err := model.ApplyProviderStatus(provider.Id, model.ProviderStatusChange{
+						Status: common.ChannelStatusAutoDisabled, UsingKey: key, KeyIndex: &index, Reason: "authentication rejected"})
+					require.NoError(t, err)
+					require.True(t, changed)
+				}
+				path := "/" + common.Interface2String(provider.Id)
+				before := callProviderAPI(t, engine, http.MethodGet, path, "")
+				require.EqualValues(t, common.ChannelStatusAutoDisabled, before.Data["status"])
+				wantStatus := common.ChannelStatusEnabled
+				if manualDisable {
+					require.True(t, callProviderAPI(t, engine, http.MethodPost, path+"/disable", "").Success)
+					wantStatus = common.ChannelStatusManuallyDisabled
+				}
+				require.True(t, callProviderAPI(t, engine, http.MethodPost, path+endpoint, "").Success)
+				after := callProviderAPI(t, engine, http.MethodGet, path, "")
+				assert.EqualValues(t, wantStatus, after.Data["status"])
+				keys := callProviderAPI(t, engine, http.MethodGet, path+"/keys", "")
+				assert.Greater(t, keys.Data["enabled_count"].(float64), float64(0))
+			})
+		}
+	}
+}
+
 func TestProviderAdminAPIKeepsAccountSecretsWriteOnly(t *testing.T) {
 	engine := newProviderAdminEngine(t)
 	headers := `{"Authorization":"Bearer fixture-header-secret","x-api-key":"fixture-api-secret","X-Custom":"fixture-custom-secret"}`
