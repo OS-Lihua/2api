@@ -294,13 +294,21 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 			eligible = append(eligible, selection)
 		}
 		lossFallback := false
+		probeCandidates := eligible
 		if len(eligible) == 0 && len(unprofitable) > 0 && offering.AllowLossFallback {
 			slices.SortStableFunc(unprofitable, func(a, b *GatewaySelection) int { order, _ := a.EstimatedCost.Compare(b.EstimatedCost); return order })
+			probeCandidates = unprofitable
 			eligible = unprofitable[:1]
 			lossFallback = true
 		}
 		if len(eligible) == 0 {
 			continue
+		}
+		// Quality limits selection, but cannot hide another valid candidate's
+		// active probe from Manager's atomic fence.
+		probeFence := make([]int, len(probeCandidates))
+		for i, selection := range probeCandidates {
+			probeFence[i] = selection.Channel.ID
 		}
 		// Protocol preparation supplies an ordering quality; affinity cannot restore
 		// a rejected candidate or cross a protocol-quality boundary.
@@ -327,7 +335,7 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 			for i, selection := range ranked {
 				ordered[i] = selection.Channel.ID
 			}
-			admission, err := ChannelHealth.Acquire(c.Request.Context(), ordered)
+			admission, err := ChannelHealth.AcquireWithProbeFence(c.Request.Context(), ordered, probeFence)
 			if err != nil {
 				return nil, ErrGatewayUnavailable
 			}
@@ -349,6 +357,7 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 				}
 				reject(selected.Channel.ID, reason)
 				lastStage = max(lastStage, 6)
+				probeFence = slices.DeleteFunc(probeFence, func(id int) bool { return id == selected.Channel.ID })
 				ranked = slices.Delete(ranked, index, index+1)
 				continue
 			}

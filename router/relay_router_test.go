@@ -967,63 +967,83 @@ func TestTextGatewayRouteOccupiedProbeContinuesToNextTier(t *testing.T) {
 }
 
 func TestTextGatewayAllOpenProbeRemainsExclusiveAfterRetryOrderChanges(t *testing.T) {
-	for _, shared := range []bool{false, true} {
-		t.Run(fmt.Sprintf("redis=%t", shared), func(t *testing.T) {
-			var calls atomic.Int32
-			upstream := func(w http.ResponseWriter, r *http.Request) {
-				calls.Add(1)
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
-			}
-			fixture := newTextGatewayFixture(t, upstream)
-			second := addTextGatewayChannel(t, fixture, upstream)
-			manager := service.ChannelHealth
-			observer := manager
-			if shared {
-				server := miniredis.RunT(t)
-				client := redis.NewClient(&redis.Options{Addr: server.Addr()})
-				t.Cleanup(func() { require.NoError(t, client.Close()) })
-				manager, observer = channelhealth.New(client), channelhealth.New(client)
-				service.ChannelHealth = manager
-			}
-			ctx := t.Context()
-			ordinary, err := observer.Acquire(ctx, []int{fixture.channel.ID})
-			require.NoError(t, err)
-			require.Empty(t, ordinary.Lease)
-			for _, sample := range []channelhealth.Sample{
-				{AttemptID: "open-one", ChannelID: fixture.channel.ID, ProviderFailure: true, RateLimited: true, RetryAfter: "60"},
-				{AttemptID: "open-two", ChannelID: second.ID, ProviderFailure: true, RateLimited: true, RetryAfter: "120"},
-			} {
-				_, err = observer.Record(ctx, sample)
+	for _, tc := range []struct {
+		name          string
+		first, second protocol.Type
+		recoverFirst  bool
+	}{
+		{name: "same protocol", first: protocol.OpenAIChat, second: protocol.OpenAIChat},
+		{name: "converted lease holder", first: protocol.OpenAIResponses, second: protocol.OpenAIChat},
+		{name: "native lease holder", first: protocol.OpenAIChat, second: protocol.OpenAIResponses, recoverFirst: true},
+	} {
+		for _, shared := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/redis=%t", tc.name, shared), func(t *testing.T) {
+				var calls atomic.Int32
+				upstream := func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					if strings.HasSuffix(r.URL.Path, "/responses") {
+						_, _ = io.WriteString(w, `{"id":"recovered","object":"response","status":"completed","output":[{"type":"message","id":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Recovered","annotations":[]}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}`)
+						return
+					}
+					_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+				}
+				fixture := newTextGatewayFixture(t, upstream)
+				second := addTextGatewayChannel(t, fixture, upstream)
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", tc.first).Error)
+				require.NoError(t, model.DB.Model(second).Update("protocol", tc.second).Error)
+				manager := service.ChannelHealth
+				observer := manager
+				if shared {
+					server := miniredis.RunT(t)
+					client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+					t.Cleanup(func() { require.NoError(t, client.Close()) })
+					manager, observer = channelhealth.New(client), channelhealth.New(client)
+					service.ChannelHealth = manager
+				}
+				ctx := t.Context()
+				ordinary, err := observer.Acquire(ctx, []int{fixture.channel.ID})
 				require.NoError(t, err)
-			}
-			probe, err := observer.Acquire(ctx, []int{fixture.channel.ID, second.ID})
-			require.NoError(t, err)
-			require.Equal(t, fixture.channel.ID, probe.ChannelID)
-			require.NotEmpty(t, probe.Lease)
-			defer observer.Release(ctx, probe)
-			_, err = observer.Record(ctx, channelhealth.Sample{AttemptID: "late-ordinary", ChannelID: fixture.channel.ID,
-				ProviderFailure: true, RateLimited: true, RetryAfter: "172800", Lease: ordinary.Lease})
-			require.NoError(t, err)
-			body := `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`
-			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
-			require.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
-			assert.Zero(t, calls.Load())
-			_, total, err := model.ListGatewayAttempts(ctx, response.Header().Get(common.RequestIdKey), 0, 10)
-			require.NoError(t, err)
-			assert.Zero(t, total)
-			wallet, err := model.GetUserWallet(fixture.user.Id)
-			require.NoError(t, err)
-			assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
-			require.NoError(t, observer.Release(ctx, probe))
-			response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
-			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
-			attempts, total, err := model.ListGatewayAttempts(ctx, response.Header().Get(common.RequestIdKey), 0, 10)
-			require.NoError(t, err)
-			require.EqualValues(t, 1, total)
-			assert.Equal(t, second.ID, attempts[0].ChannelID)
-			assert.EqualValues(t, 1, calls.Load())
-		})
+				require.Empty(t, ordinary.Lease)
+				for _, sample := range []channelhealth.Sample{
+					{AttemptID: "open-one", ChannelID: fixture.channel.ID, ProviderFailure: true, RateLimited: true, RetryAfter: "60"},
+					{AttemptID: "open-two", ChannelID: second.ID, ProviderFailure: true, RateLimited: true, RetryAfter: "120"},
+				} {
+					_, err = observer.Record(ctx, sample)
+					require.NoError(t, err)
+				}
+				probe, err := observer.Acquire(ctx, []int{fixture.channel.ID, second.ID})
+				require.NoError(t, err)
+				require.Equal(t, fixture.channel.ID, probe.ChannelID)
+				require.NotEmpty(t, probe.Lease)
+				defer observer.Release(ctx, probe)
+				_, err = observer.Record(ctx, channelhealth.Sample{AttemptID: "late-ordinary", ChannelID: fixture.channel.ID,
+					ProviderFailure: true, RateLimited: true, RetryAfter: "172800", Lease: ordinary.Lease})
+				require.NoError(t, err)
+				body := `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+				require.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+				assert.Zero(t, calls.Load())
+				_, total, err := model.ListGatewayAttempts(ctx, response.Header().Get(common.RequestIdKey), 0, 10)
+				require.NoError(t, err)
+				assert.Zero(t, total)
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
+				require.NoError(t, observer.Release(ctx, probe))
+				response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				attempts, total, err := model.ListGatewayAttempts(ctx, response.Header().Get(common.RequestIdKey), 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, total)
+				expected := second.ID
+				if tc.recoverFirst {
+					expected = fixture.channel.ID
+				}
+				assert.Equal(t, expected, attempts[0].ChannelID, "probe selection must retain native protocol priority")
+				assert.EqualValues(t, 1, calls.Load())
+			})
+		}
 	}
 }
 
@@ -1289,24 +1309,22 @@ func TestTextGatewayRouteFiltersConversionLossBeforeSending(t *testing.T) {
 			unified.Capabilities.Limits.MaxOutputTokens = common.GetPointer(tc.limit)
 			require.NoError(t, model.DB.Model(&unified).Update("capabilities", unified.Capabilities).Error)
 			beforeCalls := calls.Load()
-			var beforeAttempts int64
-			require.NoError(t, model.DB.Model(&model.GatewayAttempt{}).Count(&beforeAttempts).Error)
 			before, err := model.GetUserWallet(fixture.user.Id)
 			require.NoError(t, err)
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"reasoning":{"max_tokens":1024}}`)
 			require.Equal(t, tc.status, response.Code, response.Body.String())
-			var afterAttempts int64
-			require.NoError(t, model.DB.Model(&model.GatewayAttempt{}).Count(&afterAttempts).Error)
+			_, attemptCount, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+			require.NoError(t, err)
 			if tc.status == http.StatusBadRequest {
 				assert.Equal(t, beforeCalls, calls.Load(), "an impossible thinking/output pair must fail before Provider I/O")
-				assert.Equal(t, beforeAttempts, afterAttempts)
+				assert.Zero(t, attemptCount)
 				after, err := model.GetUserWallet(fixture.user.Id)
 				require.NoError(t, err)
 				assert.Equal(t, before.Balance.Nanos, after.Balance.Nanos)
 				return
 			}
 			assert.Equal(t, beforeCalls+1, calls.Load())
-			assert.Equal(t, beforeAttempts+1, afterAttempts)
+			assert.EqualValues(t, 1, attemptCount)
 			var wire dto.ClaudeRequest
 			require.NoError(t, common.Unmarshal(outbound.Load().([]byte), &wire))
 			require.NotNil(t, wire.MaxTokens)
@@ -4776,8 +4794,8 @@ func TestTextGatewayDefaultOutputLimitPreservesExplicitZero(t *testing.T) {
 			} else {
 				assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
 				assert.Zero(t, calls.Load(), "a conversion that replaces explicit zero must fail before Provider I/O")
-				var attempts int64
-				require.NoError(t, model.DB.Model(&model.GatewayAttempt{}).Count(&attempts).Error)
+				_, attempts, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+				require.NoError(t, err)
 				assert.Zero(t, attempts)
 			}
 			after, err := model.GetUserWallet(fixture.user.Id)

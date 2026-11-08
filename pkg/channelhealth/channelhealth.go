@@ -238,20 +238,34 @@ func (m *Manager) Snapshots(ctx context.Context, ids []int) (map[int]Snapshot, e
 // circuit receives one recovery probe before normal health ordering. If all
 // circuits are open, only the earliest can probe, including before cooldown.
 func (m *Manager) Acquire(ctx context.Context, ids []int) (Admission, error) {
+	return m.AcquireWithProbeFence(ctx, ids, nil)
+}
+
+// AcquireWithProbeFence selects only from ids, while active leases in probeFence
+// also exclude another probe when every selectable circuit is open. Route uses
+// the full validated pool as the fence and its preferred quality group as ids.
+// Both sets are checked in the same memory lock or Redis transaction.
+func (m *Manager) AcquireWithProbeFence(ctx context.Context, ids, probeFence []int) (Admission, error) {
+	watched := slices.Clone(ids)
+	for _, id := range probeFence {
+		if !slices.Contains(watched, id) {
+			watched = append(watched, id)
+		}
+	}
 	admission := Admission{}
 	lease := common.NewRequestId()
-	err := m.transact(ctx, ids, "", func(states map[int]*state, _ bool) bool {
+	err := m.transact(ctx, watched, "", func(states map[int]*state, _ bool) bool {
 		admission = Admission{}
 		now := clock.Now().UnixMilli()
 		earliest := 0
-		allOpen, activeLease := true, false
+		allOpen := true
+		activeLease := slices.ContainsFunc(watched, func(id int) bool {
+			return states[id].Lease != "" && states[id].LeaseUntil > now
+		})
 		for _, id := range ids {
 			if states[id].Trips == 0 {
 				allOpen = false
 				continue
-			}
-			if states[id].Lease != "" && states[id].LeaseUntil > now {
-				activeLease = true
 			}
 			if earliest == 0 || states[id].RetryAt < states[earliest].RetryAt || states[id].RetryAt == states[earliest].RetryAt && id < earliest {
 				earliest = id
