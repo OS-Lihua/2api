@@ -501,7 +501,9 @@ func (session *realtimeGatewaySession) requestAt(raw []byte, startedAt time.Time
 		}
 		return nil, types.NewErrorWithStatusCode(errors.New("Realtime price cannot be evaluated"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
 	}
-	if _, err = attempt.info.BeginProviderCall(); err != nil {
+	// Credential preparation completed before the purchase snapshot. Resume
+	// the same budget here without another blocking preparation step.
+	if _, err = attempt.response.call.Native.Budget.Start(); err != nil {
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
 	}
 	if attempt.stopTimeout == nil {

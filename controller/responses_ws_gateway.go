@@ -277,6 +277,14 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
 		return
 	}
+	attemptContext, err := info.BeginProviderCall()
+	if err != nil {
+		run.fail(c, http.StatusServiceUnavailable, "budget_exhausted", "Upstream request failed")
+		return
+	}
+	// Credential locking is preparation. Freeze purchase facts after it, and
+	// count Provider contact only when the prepared exchange starts.
+	contactedProvider = false
 	attemptStart := clock.Now()
 	purchase, purchaseFX, rate, err := gatewayChannelPurchaseSnapshot(c.Request.Context(), selection.Channel.ID, attemptStart)
 	if err != nil {
@@ -349,7 +357,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 			return quoteErr
 		}
 	}
-	attemptContext, err := info.BeginProviderCall()
+	attemptContext, err = budget.Start()
 	if err != nil {
 		run.fail(c, http.StatusServiceUnavailable, "budget_exhausted", "Upstream request failed")
 		return
@@ -357,10 +365,11 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	parent := c.Request
 	c.Request = parent.WithContext(attemptContext)
 	defer func() { c.Request = parent }()
-	attempt := &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: run.record.ID, ChannelID: selection.Channel.ID, ProviderID: selection.Channel.ProviderID, ModelID: selection.Channel.ModelID, MemberTier: 1,
+	attempt := &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: run.record.ID, ChannelID: selection.Channel.ID, ProviderID: selection.Channel.ProviderID, ModelID: selection.Channel.ModelID, MemberTier: selection.Tier,
 		StartedAt: attemptStart.UnixMilli(), UsageSource: "none", PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, AccountingFXRate: rate,
 		Cost: money.Amount{Currency: purchase.Currency}, ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, RouteDiagnostics: selection.Diagnostics, ConversionLosses: []string{}}
 	sentAt = clock.Now()
+	contactedProvider = true
 	usage, apiErr := call.Exchange(c, info, selection.Channel.ID, selection.Channel.ProviderID, prepared, payload)
 	// The Attempt context may be expired while the client is still present.
 	// Classify against the parent before deciding cancellation accounting.

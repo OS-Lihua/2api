@@ -53,6 +53,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/websocket"
+	"gorm.io/gorm/clause"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
@@ -580,6 +581,69 @@ func dialRealtimeGateway(t *testing.T, fixture textGatewayFixture) *websocket.Co
 	return client
 }
 
+func TestRealtimeGatewayFreezesPurchaseAfterCredentialLockWait(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if !assert.NoError(t, err) {
+			return
+		}
+		defer peer.Close()
+		if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"modalities":["text"],"turn_detection":null}}`))) {
+			return
+		}
+		if _, _, err = peer.ReadMessage(); !assert.NoError(t, err) {
+			return
+		}
+		for _, raw := range []string{`{"type":"response.created","response":{"id":"priced","status":"in_progress","conversation_id":null}}`, `{"type":"response.text.delta","response_id":"priced","delta":"hello","output_index":0}`, `{"type":"response.done","response":{"id":"priced","status":"completed","conversation_id":null,"usage":{"input_tokens":1000,"output_tokens":10}}}`} {
+			if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(raw))) {
+				return
+			}
+		}
+		_, _, _ = peer.ReadMessage()
+	})
+	require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", protocol.OpenAIRealtime).Error)
+	future := *fixture.purchase
+	future.ID, future.EffectiveAt, future.Expression = 0, clock.Now().Unix()+1, `tier("new",p * 0.5 + c)`
+	require.NoError(t, model.CreatePriceVersion(t.Context(), &future, fixture.sale.CreatedBy))
+	client := dialRealtimeGateway(t, fixture)
+	_, _, err := client.ReadMessage()
+	require.NoError(t, err)
+	tx := model.DB.WithContext(t.Context()).Begin()
+	require.NoError(t, tx.Error)
+	t.Cleanup(func() { _ = tx.Rollback().Error })
+	var provider model.Provider
+	require.NoError(t, tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&provider, fixture.channel.ProviderID).Error)
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"conversation":"none","input":[],"output_modalities":["text"]}}`)))
+	require.Eventually(t, func() bool {
+		var waiting int64
+		err := model.DB.Table("pg_stat_activity").Where(`"datname" = current_database() AND "wait_event_type" = ? AND "query" LIKE ?`, "Lock", "%providers%FOR UPDATE%").Count(&waiting).Error
+		return err == nil && waiting > 0
+	}, 5*time.Second, 10*time.Millisecond)
+	fixture.fake.Advance(2 * time.Second)
+	require.NoError(t, tx.Commit().Error)
+	for {
+		_, raw, err := client.ReadMessage()
+		require.NoError(t, err)
+		if ojson.GetBytes(raw, "type").String() == "response.done" {
+			break
+		}
+	}
+	require.NoError(t, client.Close())
+	var records []model.GatewayRequest
+	require.Eventually(t, func() bool {
+		var count int64
+		records, count, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+		return err == nil && count == 1 && len(records) == 1 && records[0].Status == "success"
+	}, 5*time.Second, 10*time.Millisecond)
+	attempts, count, err := model.ListGatewayAttempts(t.Context(), records[0].ID, 0, 10)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), count)
+	require.Len(t, attempts, 1)
+	assert.Equal(t, future.ID, attempts[0].PurchasePriceVersionID)
+	assert.GreaterOrEqual(t, attempts[0].StartedAt, future.EffectiveAt*1000)
+	assert.Equal(t, int64(510_000), attempts[0].ConvertedCost.Nanos)
+}
+
 func TestRealtimeGatewayHandshakeFailoverLocksWinningProvider(t *testing.T) {
 	var rejected, accepted atomic.Int32
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -614,12 +678,21 @@ func TestRealtimeGatewayHandshakeFailoverLocksWinningProvider(t *testing.T) {
 	defer winner.Close()
 	provider := &model.Provider{Name: "Winning Provider", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Key: "winning-key", BaseURL: &winner.URL}
 	require.NoError(t, model.DB.Create(provider).Error)
+	var fallbackModel model.Model
+	require.NoError(t, model.DB.First(&fallbackModel, fixture.channel.ModelID).Error)
+	fallbackModel.Id, fallbackModel.ModelName = 0, "websocket-fallback-model"
+	require.NoError(t, model.DB.Create(&fallbackModel).Error)
+	fixture.offering.RouteMethod = "latency"
+	fixture.offering.Members = append(fixture.offering.Members, model.ModelOfferingMember{ModelID: fallbackModel.Id, Tier: 2})
+	require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
 	var channels []model.Channel
 	for _, providerID := range []int{fixture.channel.ProviderID, provider.Id} {
 		channel := *fixture.channel
 		channel.ID, channel.ProviderID, channel.Protocol = 0, providerID, protocol.OpenAIRealtime
 		if providerID == fixture.channel.ProviderID {
 			channel.UpstreamModelName = "unavailable-sibling"
+		} else {
+			channel.ModelID = fallbackModel.Id
 		}
 		require.NoError(t, model.DB.Create(&channel).Error)
 		price := *fixture.purchase
@@ -655,6 +728,7 @@ func TestRealtimeGatewayHandshakeFailoverLocksWinningProvider(t *testing.T) {
 	require.Len(t, attempts, 1)
 	assert.Equal(t, channels[1].ID, attempts[0].ChannelID)
 	assert.Equal(t, provider.Id, attempts[0].ProviderID)
+	assert.Equal(t, 2, attempts[0].MemberTier)
 	assertTextGatewayLedger(t, records[0], 1_020_000)
 }
 
