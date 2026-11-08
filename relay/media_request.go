@@ -19,18 +19,37 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// PreparedMediaRequest binds the validated effective quantities to the exact
-// transport prepared without I/O. Input is transient purchase-price context.
+// PreparedMediaRequest carries the validated wire and transient price probes.
+// Prepared is populated only after transport and account preparation.
 type PreparedMediaRequest struct {
-	Prepared *PreparedChannelRequest
-	Request  dto.Request
-	Input    billingexpr.RequestInput
+	Prepared    *PreparedChannelRequest
+	Request     dto.Request
+	Input       billingexpr.RequestInput
+	Body        []byte
+	ContentType string
 }
 
-// PrepareMediaRequest uses the production Provider/protocol composition and
-// validates the final body after parameter overrides, before any reservation
-// or dispatch. It never calls the legacy quota chain.
+// PrepareMediaRequest validates the final media wire and prepares its transport.
+// Gateway callers use PrepareMediaWire first so funding precedes account I/O.
 func (a *ChannelAdaptor) PrepareMediaRequest(c *gin.Context, info *relaycommon.RelayInfo, parsed *helper.GatewayMediaRequest) (*PreparedMediaRequest, error) {
+	result, err := a.PrepareMediaWire(c, info, parsed)
+	if err != nil {
+		return nil, err
+	}
+	result.Prepared, err = a.PrepareRequest(c, info, bytes.NewReader(result.Body))
+	if err != nil {
+		return nil, err
+	}
+	result.Input.Headers = make(map[string]string)
+	for key, values := range result.Prepared.Headers() {
+		result.Input.Headers[strings.ToLower(key)] = strings.Join(values, ",")
+	}
+	return result, nil
+}
+
+// PrepareMediaWire converts and validates the effective media body without
+// preparing account credentials. The host funds it before transport preparation.
+func (a *ChannelAdaptor) PrepareMediaWire(c *gin.Context, info *relaycommon.RelayInfo, parsed *helper.GatewayMediaRequest) (*PreparedMediaRequest, error) {
 	if parsed.Protocol != a.kind {
 		return nil, fmt.Errorf("media protocol mismatch")
 	}
@@ -77,17 +96,9 @@ func (a *ChannelAdaptor) PrepareMediaRequest(c *gin.Context, info *relaycommon.R
 		if audio.ResponseFormat != "json" && audio.ResponseFormat != "text" {
 			return nil, fmt.Errorf("binary transcription supports JSON or text responses")
 		}
-		prepared, err := a.PrepareRequest(c, info, bytes.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		input := billingexpr.RequestInput{Headers: make(map[string]string)}
-		for key, values := range prepared.Headers() {
-			input.Headers[strings.ToLower(key)] = strings.Join(values, ",")
-		}
 		info.Request = request
 		info.IsStream = false
-		return &PreparedMediaRequest{Prepared: prepared, Request: request, Input: input}, nil
+		return &PreparedMediaRequest{Request: request, Body: body, ContentType: c.GetHeader("Content-Type")}, nil
 	}
 	var form *multipart.Form
 	if !strings.HasPrefix(c.GetHeader("Content-Type"), "multipart/form-data") && (info.ChannelSetting.PassThroughBodyEnabled || model_setting.GetGlobalSettings().PassThroughRequestEnabled) {
@@ -242,14 +253,7 @@ func (a *ChannelAdaptor) PrepareMediaRequest(c *gin.Context, info *relaycommon.R
 		body = encoded.Bytes()
 		c.Request.Header.Set("Content-Type", writer.FormDataContentType())
 	}
-	result.Prepared, err = a.PrepareRequest(c, info, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	result.Input.Headers = make(map[string]string)
-	for key, values := range result.Prepared.Headers() {
-		result.Input.Headers[strings.ToLower(key)] = strings.Join(values, ",")
-	}
+	result.Body, result.ContentType = body, c.GetHeader("Content-Type")
 	if result.Input.ImageCount != nil {
 		info.ImageRequestCount = *result.Input.ImageCount
 	}

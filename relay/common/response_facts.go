@@ -42,6 +42,7 @@ type ResponseFacts struct {
 	AudioInputSeconds          *string
 	AudioOutputSeconds         *string
 	GeneratedAudioBytes        int64
+	DeliveredAudioBytes        int64
 	GeneratedImageCount        int64
 	AudioInputDurationReported bool
 	AudioOutputTokensReported  bool

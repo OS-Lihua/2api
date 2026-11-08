@@ -104,7 +104,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	c.Writer.WriteHeader(resp.StatusCode)
 
 	if info.IsStream && info.ResponseFacts != nil {
-		var audioBytes int64
+		var audioBytes, deliveredAudioBytes int64
 		var completed bool
 		helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 			var chunk struct {
@@ -137,6 +137,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 				completed = true
 			}
 			var business bool
+			var chunkBytes int64
 			if chunk.Type == "speech.audio.delta" {
 				encoded := chunk.Audio
 				if encoded == "" {
@@ -147,12 +148,14 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 					sr.Stop(errors.New("invalid speech audio chunk"))
 					return
 				}
-				audioBytes += int64(len(audio))
+				chunkBytes = int64(len(audio))
+				audioBytes += chunkBytes
 				business = len(audio) > 0
 			}
 			writeErr := helper.StringData(c, data)
 			var flushErr *helper.StreamFlushError
 			if business && (writeErr == nil || errors.As(writeErr, &flushErr)) {
+				deliveredAudioBytes += chunkBytes
 				info.ResponseFacts.MarkBusinessOutput()
 			}
 			if writeErr != nil {
@@ -169,6 +172,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			}
 		}
 		info.ResponseFacts.GeneratedAudioBytes = audioBytes
+		info.ResponseFacts.DeliveredAudioBytes = deliveredAudioBytes
 		if request, ok := info.Request.(*dto.AudioRequest); ok && request.ResponseFormat == "pcm" {
 			seconds := decimal.NewFromInt(audioBytes).Div(decimal.NewFromInt(48000)).String()
 			info.ResponseFacts.AudioOutputSeconds = &seconds
