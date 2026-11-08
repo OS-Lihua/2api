@@ -445,9 +445,6 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				FirstByte: firstByte, HealthLease: selection.Admission.Lease}
 			if failure.Class == "rate_limited" {
 				result.RetryAfter = retryAfter
-				if result.RetryAfter == "" {
-					result.RetryAfter = "0"
-				}
 			}
 
 			record.Status = attempt.Status

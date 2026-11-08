@@ -20,6 +20,7 @@ type Sample struct {
 	AttemptID                string
 	ChannelID                int
 	Success, ProviderFailure bool
+	RateLimited              bool
 	FirstByte                time.Duration
 	RetryAfter               string
 	Lease                    string
@@ -99,7 +100,8 @@ func (m *Manager) transact(ctx context.Context, ids []int, event string, apply f
 				m.states[id] = &state{}
 			}
 		}
-		duplicate := event != "" && m.seen[event] > now
+		until, exists := m.seen[event]
+		duplicate := event != "" && exists && until > now
 		if apply(m.states, duplicate) && event != "" {
 			m.seen[event] = now + int64(7*24*time.Hour/time.Millisecond)
 			m.seenQueue = append(m.seenQueue, seenEvent{id: event, expires: m.seen[event]})
@@ -148,7 +150,7 @@ func (m *Manager) transact(ctx context.Context, ids []int, event string, apply f
 						return err
 					}
 					expiration := 24 * time.Hour
-					if states[id].RetryAt > 0 {
+					if states[id].Trips > 0 {
 						expiration = 0
 					}
 					pipe.Set(ctx, keys[i], raw, expiration)
@@ -174,10 +176,10 @@ func (m *Manager) Snapshots(ctx context.Context, ids []int) (map[int]Snapshot, e
 		for _, id := range ids {
 			s := states[id]
 			snapshot := Snapshot{Circuit: "closed", RetryAt: s.RetryAt, Failures: s.Failures, SuccessRate: 1}
-			if s.RetryAt > 0 {
+			if s.Trips > 0 {
 				snapshot.Circuit = "open"
 			}
-			if s.LeaseUntil > clock.Now().UnixMilli() {
+			if s.Lease != "" && s.LeaseUntil > clock.Now().UnixMilli() {
 				snapshot.Circuit = "half_open"
 			}
 			successes := 0
@@ -221,17 +223,17 @@ func (m *Manager) Acquire(ctx context.Context, ids []int) (Admission, error) {
 		now := clock.Now().UnixMilli()
 		earliest := 0
 		for _, id := range ids {
-			if states[id].RetryAt == 0 {
+			if states[id].Trips == 0 {
 				continue
 			}
 			if earliest == 0 || states[id].RetryAt < states[earliest].RetryAt || states[id].RetryAt == states[earliest].RetryAt && id < earliest {
 				earliest = id
 			}
 		}
-		probe := earliest != 0 && states[earliest].RetryAt <= now && states[earliest].LeaseUntil <= now
+		probe := earliest != 0 && states[earliest].RetryAt <= now && (states[earliest].Lease == "" || states[earliest].LeaseUntil <= now)
 		if !probe {
 			for _, id := range ids {
-				if states[id].RetryAt == 0 {
+				if states[id].Trips == 0 {
 					admission.ChannelID = id
 					return false
 				}
@@ -241,7 +243,7 @@ func (m *Manager) Acquire(ctx context.Context, ids []int) (Admission, error) {
 			return false
 		}
 		s := states[earliest]
-		if s.LeaseUntil > now {
+		if s.Lease != "" && s.LeaseUntil > now {
 			return false
 		}
 		// Covers the maximum managed first-byte budget plus delivery/idle time;
@@ -312,22 +314,23 @@ func (m *Manager) Release(ctx context.Context, admission Admission) error {
 }
 
 // RetryAfter accepts both RFC HTTP dates and integer delta seconds. Invalid or
-// excessive values use the normal exponential cooldown. No raw header is kept.
-func RetryAfter(value string, now time.Time) time.Duration {
+// overflowing values use the normal exponential cooldown. The validity flag
+// preserves explicit zero and elapsed dates as immediate shared probes.
+func RetryAfter(value string, now time.Time) (time.Duration, bool) {
 	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "+") || strings.HasPrefix(value, "-") {
+		return 0, false
+	}
 	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
-		if seconds > 0 && seconds <= 86400 {
-			return time.Duration(seconds) * time.Second
+		if seconds >= 0 && seconds <= int64((1<<63-1)/time.Second) {
+			return time.Duration(seconds) * time.Second, true
 		}
-		return 0
+		return 0, false
 	}
 	if at, err := http.ParseTime(value); err == nil {
-		delay := at.Sub(now)
-		if delay > 0 && delay <= 24*time.Hour {
-			return delay
-		}
+		return max(at.Sub(now), 0), true
 	}
-	return 0
+	return 0, false
 }
 
 // Record consumes an actual completed Attempt once. Recovery and settlement do
@@ -359,7 +362,7 @@ func (m *Manager) Record(ctx context.Context, sample Sample) (string, error) {
 			s.Recent = slices.Clone(s.Recent[len(s.Recent)-100:])
 		}
 		if sample.Success {
-			if s.RetryAt > 0 {
+			if s.Trips > 0 {
 				action = "closed"
 			}
 			s.Failures, s.Trips, s.RetryAt = 0, 0, 0
@@ -367,10 +370,10 @@ func (m *Manager) Record(ctx context.Context, sample Sample) (string, error) {
 			return true
 		}
 		s.Failures++
-		if s.Failures >= 5 || s.RetryAt > 0 || sample.RetryAfter != "" {
+		if s.Failures >= 5 || s.Trips > 0 || sample.RateLimited || sample.RetryAfter != "" {
 			s.Trips = min(s.Trips+1, 5)
 			cooldown := min(time.Minute*time.Duration(1<<(s.Trips-1)), 10*time.Minute)
-			if delay := RetryAfter(sample.RetryAfter, now); delay > 0 {
+			if delay, valid := RetryAfter(sample.RetryAfter, now); valid {
 				cooldown = delay
 			}
 			s.RetryAt = now.Add(cooldown).UnixMilli()

@@ -129,7 +129,7 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 			selected = candidate
 			continue
 		}
-		if health[candidate.Channel.ID].RetryAt > 0 {
+		if health[candidate.Channel.ID].Circuit != "closed" {
 			counts["circuit_open"]++
 		}
 	}

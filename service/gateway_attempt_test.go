@@ -122,6 +122,9 @@ func TestChannelHealthRetryAfterAndEarliestLayerProbe(t *testing.T) {
 				delay  time.Duration
 			}{
 				{1, "120", 2 * time.Minute}, {2, clock.Now().Add(90 * time.Second).Format(http.TimeFormat), 90 * time.Second},
+				{8, "172800", 48 * time.Hour}, {9, clock.Now().Add(48 * time.Hour).Format(http.TimeFormat), 48 * time.Hour},
+				{10, "+1", time.Minute}, {14, "-0", time.Minute},
+				{11, "0", 0}, {12, clock.Now().Add(-time.Second).Format(http.TimeFormat), 0},
 				{3, "private-provider-secret", time.Minute}, {4, "999999999999999999999", time.Minute}, {5, "-1", time.Minute},
 			} {
 				_, err := first.Record(t.Context(), channelhealth.Sample{AttemptID: fmt.Sprint(tc.id), ChannelID: tc.id, ProviderFailure: true, RetryAfter: tc.header})
@@ -187,21 +190,44 @@ func TestChannelHealthProbeLeaseSurvivesLongResponseAndExpiresAfterCrash(t *test
 }
 
 func TestChannelHealthLongRetryAfterStillRequiresSharedProbe(t *testing.T) {
-	fake := clock.UseFake(t, time.Unix(100, 0))
-	server := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
-	t.Cleanup(func() { require.NoError(t, client.Close()) })
-	first, second := channelhealth.New(client), channelhealth.New(client)
-	_, err := first.Record(t.Context(), channelhealth.Sample{AttemptID: "long-429", ChannelID: 1, ProviderFailure: true, RetryAfter: "86400"})
-	require.NoError(t, err)
-	server.FastForward(48 * time.Hour)
-	fake.Advance(48 * time.Hour)
-	probe, err := first.Acquire(t.Context(), []int{1})
-	require.NoError(t, err)
-	require.NotEmpty(t, probe.Lease, "a long idle cooldown cannot turn an open circuit into unbounded normal admission")
-	blocked, err := second.Acquire(t.Context(), []int{1})
-	require.NoError(t, err)
-	assert.Zero(t, blocked.ChannelID)
+	for _, tc := range []struct {
+		name    string
+		start   int64
+		header  string
+		advance time.Duration
+	}{
+		{"long idle cooldown", 100, "86400", 48 * time.Hour}, {"zero delay at epoch", 0, "0", 0}, {"zero delay before epoch", -1, "0", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := clock.UseFake(t, time.Unix(tc.start, 0))
+			server := miniredis.RunT(t)
+			client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+			t.Cleanup(func() { require.NoError(t, client.Close()) })
+			for _, backend := range []*redis.Client{nil, client} {
+				fake.Set(time.Unix(tc.start, 0))
+				first := channelhealth.New(backend)
+				second := first
+				if backend != nil {
+					second = channelhealth.New(backend)
+				}
+				_, err := first.Record(t.Context(), channelhealth.Sample{AttemptID: "long-429", ChannelID: 1, ProviderFailure: true, RateLimited: true, RetryAfter: tc.header})
+				require.NoError(t, err)
+				if backend != nil {
+					server.FastForward(tc.advance)
+				}
+				fake.Advance(tc.advance)
+				states, err := first.Snapshots(t.Context(), []int{1})
+				require.NoError(t, err)
+				assert.Equal(t, "open", states[1].Circuit)
+				probe, err := first.Acquire(t.Context(), []int{1})
+				require.NoError(t, err)
+				require.NotEmpty(t, probe.Lease, "cooldown expiry still requires a shared recovery probe")
+				blocked, err := second.Acquire(t.Context(), []int{1})
+				require.NoError(t, err)
+				assert.Zero(t, blocked.ChannelID)
+			}
+		})
+	}
 }
 
 func TestGatewayKnownRejectionSurvivesBudgetCancellation(t *testing.T) {

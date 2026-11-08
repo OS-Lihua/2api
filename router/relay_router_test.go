@@ -475,6 +475,48 @@ func testGatewayCircuit(t *testing.T, shared bool) {
 	assert.Zero(t, health[fixture.channel.ID].Failures)
 }
 
+func TestTextGatewayRateLimitCooldownHonorsHeader(t *testing.T) {
+	for _, tc := range []struct {
+		name, header string
+		delay        time.Duration
+	}{
+		{"long seconds", "172800", 48 * time.Hour}, {"long HTTP date", "date", 48 * time.Hour},
+		{"zero", "0", 0}, {"elapsed HTTP date", "past", 0}, {"invalid sign", "+1", time.Minute}, {"missing", "", time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			header := tc.header
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				if header != "" {
+					w.Header().Set("Retry-After", header)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"error":{"code":"rate_limit_exceeded"}}`))
+			})
+			if tc.header == "date" {
+				header = fixture.fake.Now().Add(tc.delay).UTC().Format(http.TimeFormat)
+			}
+			if tc.header == "past" {
+				header = fixture.fake.Now().Add(-time.Second).UTC().Format(http.TimeFormat)
+			}
+			t.Setenv("GATEWAY_MAX_ATTEMPTS", "1")
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			require.Equal(t, 429, response.Code, response.Body.String())
+			details := adminSecurityRequest(fixture.engine, fixture.adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/channels/%d", fixture.channel.ID), "")
+			require.Equal(t, 200, details.Code, details.Body.String())
+			var view struct {
+				Data struct {
+					Health channelhealth.Snapshot `json:"health"`
+				} `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(details.Body.Bytes(), &view))
+			assert.Equal(t, "open", view.Data.Health.Circuit)
+			assert.Equal(t, fixture.fake.Now().Add(tc.delay).UnixMilli(), view.Data.Health.RetryAt)
+			assert.Equal(t, 1, view.Data.Health.Samples)
+		})
+	}
+}
+
 func TestTextGatewayHealthOrdersByCompletedBusinessLatency(t *testing.T) {
 	var fixture textGatewayFixture
 	firstCalls, secondCalls := 0, 0
