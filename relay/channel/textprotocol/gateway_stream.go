@@ -14,7 +14,6 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
-	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -88,7 +87,9 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		} else {
 			sourceOutput.text.WriteString(gatewayStreamBusinessText(normalized, p.format))
 			if p.format == types.RelayFormatOpenAI {
-				sourceOutput.ObserveChatTools(normalized)
+				sourceOutput.ObserveChat(normalized)
+			} else if p.format == types.RelayFormatGemini {
+				sourceOutput.ObserveGemini(normalized)
 			}
 		}
 		info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || sourceOutput.String() != "" || gatewayMediaOutput(normalized, p.format)
@@ -206,7 +207,9 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			} else {
 				sourceOutput.text.WriteString(gatewayStreamBusinessText(normalized, p.format))
 				if p.format == types.RelayFormatOpenAI {
-					sourceOutput.ObserveChatTools(normalized)
+					sourceOutput.ObserveChat(normalized)
+				} else if p.format == types.RelayFormatGemini {
+					sourceOutput.ObserveGemini(normalized)
 				}
 			}
 			info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || sourceOutput.String() != "" || gatewayMediaOutput(normalized, p.format)
@@ -271,14 +274,18 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 	}
 	info.ResponseFacts.SourceGeneratedText = sourceOutput.String()
 	info.ResponseFacts.GeneratedText = output.String()
-	if p.format == types.RelayFormatOpenAI {
-		// Preserve the Chat estimator's structural tokens for each tool call.
-		sourceTokens := tokenkit.Count(info.TokenizerModelName(), sourceOutput.String()) + len(sourceOutput.chatTools)*7
+	if p.format == types.RelayFormatOpenAI || p.format == types.RelayFormatGemini {
+		sourceTokens := sourceOutput.TextTokenEstimate(info.TokenizerModelName())
+		if p.format == types.RelayFormatOpenAI {
+			sourceTokens += len(sourceOutput.chatTools) * 7
+		}
 		info.ResponseFacts.SourceOutputTokens = &sourceTokens
 	}
-	generatedTokens := tokenkit.Count(info.TokenizerModelName(), output.String())
+	generatedTokens := output.TextTokenEstimate(info.TokenizerModelName())
 	if p.format == types.RelayFormatOpenAI && info.RelayFormat == types.RelayFormatOpenAI {
 		generatedTokens += len(output.chatTools) * 7
+	}
+	if info.RelayFormat == types.RelayFormatOpenAI || info.RelayFormat == types.RelayFormatGemini {
 		info.ResponseFacts.GeneratedOutputTokens = &generatedTokens
 	}
 	if !info.ResponseFacts.PromptTokensReported {
@@ -419,7 +426,9 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 		}
 	}
 	if info.RelayFormat == types.RelayFormatOpenAI {
-		output.ObserveChatTools(generatedBody)
+		output.ObserveChat(generatedBody)
+	} else if info.RelayFormat == types.RelayFormatGemini {
+		output.ObserveGemini(generatedBody)
 	}
 	if info.RelayFormat == types.RelayFormatOpenAIResponses {
 		if toolText, handled := output.ObserveResponses(body); handled {

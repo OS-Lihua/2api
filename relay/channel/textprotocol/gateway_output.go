@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"strings"
 
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/tokenkit"
 
 	"github.com/tidwall/gjson"
 )
@@ -24,15 +26,52 @@ type gatewayGeneratedOutput struct {
 	partOrder       []string
 	tools           map[string]gatewayToolOutput
 	chatTools       map[[2]int64]struct{}
+	choiceText      map[int64]*strings.Builder
 	order           []string
 }
 
-func (o *gatewayGeneratedOutput) ObserveChatTools(body []byte) {
+func (o *gatewayGeneratedOutput) appendChoice(index int64, text string) {
+	if o.choiceText == nil {
+		o.choiceText = map[int64]*strings.Builder{}
+	}
+	if o.choiceText[index] == nil {
+		o.choiceText[index] = &strings.Builder{}
+	}
+	o.choiceText[index].WriteString(text)
+}
+
+func (o *gatewayGeneratedOutput) TextTokenEstimate(model string) int {
+	if len(o.choiceText) == 0 {
+		return tokenkit.Count(model, o.String())
+	}
+	count := 0
+	for _, part := range o.choiceText {
+		count += tokenkit.Count(model, part.String())
+	}
+	return count
+}
+
+func (o *gatewayGeneratedOutput) ObserveGemini(body []byte) {
+	for i, candidate := range gjson.GetBytes(body, "candidates").Array() {
+		index := int64(i)
+		if value := candidate.Get("index"); value.Exists() {
+			index = value.Int()
+		}
+		var text strings.Builder
+		for _, part := range candidate.Get("content.parts").Array() {
+			text.WriteString(gatewayGeminiPartText(part))
+		}
+		o.appendChoice(index, text.String())
+	}
+}
+
+func (o *gatewayGeneratedOutput) ObserveChat(body []byte) {
 	for i, choice := range gjson.GetBytes(body, "choices").Array() {
 		index := int64(i)
 		if reported := choice.Get("index"); reported.Exists() {
 			index = reported.Int()
 		}
+		o.appendChoice(index, relaycommon.ChatStreamChoiceBusinessText(choice))
 		for j, tool := range choice.Get("delta.tool_calls").Array() {
 			toolIndex := int64(j)
 			if reported := tool.Get("index"); reported.Exists() {

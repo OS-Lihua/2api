@@ -29,10 +29,16 @@ func gatewayMediaIdentity(source types.FileSource) gatewayMediaSource {
 // the ordinary file loader initially chose its disk cache.
 func PrepareGatewayMedia(c *gin.Context, request dto.Request) error {
 	prepared := map[gatewayMediaSource]gatewayMediaContent{}
+	_, nativeMessages := request.(*dto.ClaudeRequest)
 	for _, file := range request.GetTokenCountMeta().Files {
 		source := file.Source
 		if source == nil {
 			continue
+		}
+		if nativeMessages && file.FileType == types.FileTypeFile {
+			if _, reference := source.(*types.URLSource); reference {
+				continue
+			}
 		}
 		identity := gatewayMediaIdentity(source)
 		if _, exists := prepared[identity]; exists {

@@ -305,6 +305,10 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	}
 	raw := string(body)
 	lines := strings.Split(raw, "\n")
+	var complete common.RawMessage
+	if common.Unmarshal(body, &complete) == nil {
+		lines = []string{raw}
+	}
 	var (
 		aggContent       strings.Builder
 		reasoningBuilder strings.Builder
@@ -372,6 +376,7 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			}
 			return knownUsage, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 		}
+		parsingErr = nil
 		lastChunk = single
 		if single.Message != nil {
 			if len(single.Message.Thinking) > 0 {
@@ -427,9 +432,7 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		msg.ReasoningContent = &rc
 	}
 	if info.ResponseFacts != nil {
-		info.ResponseFacts.PromptTokensReported = lastChunk.PromptEvalCount != nil && *lastChunk.PromptEvalCount >= 0 && *lastChunk.PromptEvalCount <= 1<<31-1
-		info.ResponseFacts.CompletionTokensReported = lastChunk.EvalCount != nil && *lastChunk.EvalCount >= 0 && *lastChunk.EvalCount <= 1<<31-1
-		info.ResponseFacts.RecordUsage(usage, usage, info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported)
+		usage = knownUsage
 		if resp.StatusCode != http.StatusOK {
 			return usage, types.NewErrorWithStatusCode(fmt.Errorf("upstream request failed"), types.ErrorCodeBadResponse, resp.StatusCode)
 		}

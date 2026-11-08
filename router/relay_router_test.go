@@ -4424,6 +4424,13 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 		{name: "Baidu malformed cache JSON preserves independent counters", provider: constant.ChannelTypeBaidu, key: "cache-json-malformed-baidu|test-secret", body: `{"result":{},"usage":{"prompt_tokens_details":{"cached_tokens":1000}}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1000000, purchaseExpression: `tier("cache",cr*1)`},
 		{name: "Zhipu malformed cache JSON preserves independent counters", provider: constant.ChannelTypeZhipu, key: "test.secret", body: `{"success":{},"data":{"usage":{"prompt_tokens_details":{"cached_tokens":1000}}}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1000000, purchaseExpression: `tier("cache",cr*1)`},
 		{name: "Zhipu malformed cache stream preserves independent counters", provider: constant.ChannelTypeZhipu, key: "test.secret", stream: true, body: "meta:{\"task_status\":{},\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":1000}}}\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1000000, purchaseExpression: `tier("cache",cr*1)`},
+		{name: "Cohere failed JSON is not successful output", provider: constant.ChannelTypeCohere, body: `{"text":"Hello","finish_reason":"ERROR","meta":{"billed_units":{"input_tokens":10,"output_tokens":5}}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 20000},
+		{name: "Cohere failed JSON keeps source estimate", provider: constant.ChannelTypeCohere, body: `{"text":"Hello","finish_reason":"ERROR"}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
+		{name: "Ollama pretty JSON remains valid", provider: constant.ChannelTypeOllama, body: "{\n\"message\":{\"content\":\"Hello\"},\n\"done\":true,\n\"prompt_eval_count\":1000,\n\"eval_count\":100\n}", source: "upstream", prompt: 1000, completion: 100, charge: 2160000, cost: 1200000},
+		{name: "Ollama malformed terminal retains accumulated bases", provider: constant.ChannelTypeOllama, body: "{\"message\":{\"content\":\"Hello\"},\"done\":false}\n{\"done\":true,\"prompt_eval_count\":1000,\"eval_count\":100,\"message\":{\"content\":{}}}", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1200000},
+		{name: "PaLM malformed filter read error keeps source", provider: constant.ChannelTypePaLM, shortBody: true, body: `{"candidates":[{"content":"Hello"}],"filters":[{"reason":{}}]}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
+		{name: "PaLM stream malformed filter read error keeps source", provider: constant.ChannelTypePaLM, stream: true, shortBody: true, body: `{"candidates":[{"content":"Hello"}],"filters":[{"reason":{}}]}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
+		{name: "Coze message read error keeps generated source", provider: constant.ChannelTypeCoze, cozePollBody: `{"code":0,"data":{"status":"completed"}}`, shortBody: true, body: `{"code":0,"data":[{"type":"answer","content":"Hello","content_type":"text"}]}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
 		{name: "Coze malformed creation preserves counters", provider: constant.ChannelTypeCoze, cozeCreateBody: `{"code":0,"data":{"id":1,"usage":{"input_count":1000,"output_count":100}}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1200000},
 		{name: "Coze malformed polling preserves counters", provider: constant.ChannelTypeCoze, cozePollBody: `{"code":0,"data":{"status":"completed","id":1,"usage":{"input_count":1000,"output_count":100}}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1200000},
 		{name: "Dify malformed cache preserves independent counters", provider: constant.ChannelTypeDify, stream: true, body: "data: {\"event\":\"message_end\",\"status\":{},\"metadata\":{\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":1000}}}}\n\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1000000, purchaseExpression: `tier("cache",cr*1)`},
@@ -5175,6 +5182,54 @@ func TestTextGatewayCozeCompletedUsageSurvivesMessageFetchFailure(t *testing.T) 
 			reconciliation, err := model.ReconcileWallets(100)
 			require.NoError(t, err)
 			assert.Empty(t, reconciliation.Mismatches)
+		})
+	}
+}
+
+func TestTextGatewayCozePollingKeepsIndependentSnapshots(t *testing.T) {
+	for _, test := range []struct {
+		name, second       string
+		created            bool
+		prompt, completion int64
+	}{{"missing", ``, false, 1000, 100}, {"explicit input zero", `,"usage":{"input_count":0}`, false, 0, 100}, {"explicit output zero", `,"usage":{"output_count":0}`, false, 1000, 0}, {"creation survives missing", ``, true, 1000, 100}} {
+		t.Run(test.name, func(t *testing.T) {
+			polls := 0
+			var fixture textGatewayFixture
+			fixture = newTextGatewayFixtureWithNativeLosses(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/v3/chat":
+					body := `{"code":0,"data":{"id":"chat","conversation_id":"conversation"}}`
+					if test.created {
+						body = `{"code":0,"data":{"id":"chat","conversation_id":"conversation","usage":{"input_count":1000,"output_count":100}}}`
+					}
+					_, _ = io.WriteString(w, body)
+				case "/v3/chat/retrieve":
+					polls++
+					if polls == 1 && !test.created {
+						_, _ = io.WriteString(w, `{"code":0,"data":{"status":"in_progress","usage":{"input_count":1000,"output_count":100}}}`)
+						return
+					}
+					require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("status", common.ChannelStatusManuallyDisabled).Error)
+					_, _ = fmt.Fprintf(w, `{"code":0,"data":{"status":"in_progress"%s}}`, test.second)
+				case "/v3/chat/message/list":
+					t.Error("disabled Provider cannot fetch messages")
+				}
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeCoze).Error)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}]}`)
+			assert.GreaterOrEqual(t, response.Code, 400, response.Body.String())
+			expectedPolls := 2
+			if test.created {
+				expectedPolls = 1
+			}
+			assert.Equal(t, expectedPolls, polls)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, test.prompt, attempts[0].Usage.PromptTokens)
+			assert.Equal(t, test.completion, attempts[0].Usage.CompletionTokens)
+			assert.Equal(t, test.prompt*1000+test.completion*2000, attempts[0].Cost.Nanos)
 		})
 	}
 }
@@ -9268,42 +9323,85 @@ func TestTextGatewayFailoverDiscardsProviderStateHeaders(t *testing.T) {
 }
 
 func TestTextGatewayNativeMessagesURLDocumentRetainsValidationFacts(t *testing.T) {
-	for _, scenario := range []string{"missing capability", "small context", "native"} {
-		t.Run(scenario, func(t *testing.T) {
-			downloads := 0
-			document := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { downloads++; _, _ = io.WriteString(w, "%PDF-1.7") }))
-			t.Cleanup(document.Close)
-			uri := document.URL + "/document.pdf"
-			calls := 0
-			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
-				calls++
-				var sent map[string]any
-				require.NoError(t, common.DecodeJson(r.Body, &sent))
-				body, err := common.Marshal(sent)
-				require.NoError(t, err)
-				assert.Contains(t, string(body), uri)
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.WriteString(w, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`)
+	for _, nested := range []bool{false, true} {
+		for _, scenario := range []string{"missing capability", "small context", "native"} {
+			t.Run(fmt.Sprintf("nested=%t/%s", nested, scenario), func(t *testing.T) {
+				downloads := 0
+				document := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { downloads++; _, _ = io.WriteString(w, "%PDF-1.7") }))
+				t.Cleanup(document.Close)
+				uri := document.URL + "/document.pdf"
+				calls := 0
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					var sent map[string]any
+					require.NoError(t, common.DecodeJson(r.Body, &sent))
+					body, err := common.Marshal(sent)
+					require.NoError(t, err)
+					assert.Contains(t, string(body), uri)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`)
+				})
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "anthropic_messages").Error)
+				caps := capability.Set{InputModalities: []capability.Modality{capability.PDF}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{ContextLength: common.GetPointer(int64(10000))}}
+				if scenario == "missing capability" {
+					caps.InputModalities = []capability.Modality{capability.Text}
+				}
+				if scenario == "small context" {
+					caps.Limits.ContextLength = common.GetPointer(int64(1000))
+				}
+				if nested {
+					caps.Features = []capability.Feature{capability.ToolCalling}
+					caps.InputModalities = append(caps.InputModalities, capability.Text)
+				}
+				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+				body := fmt.Sprintf(`{"model":"gateway-offering","messages":[{"role":"user","content":[{"type":"document","source":{"type":"url","url":%q}}]}],"max_tokens":16}`, uri)
+				if nested {
+					body = fmt.Sprintf(`{"model":"gateway-offering","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call","name":"inspect","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call","content":[{"type":"document","source":{"type":"url","url":%q}}]}]}],"max_tokens":16}`, uri)
+				}
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/messages", body)
+				assert.Zero(t, downloads, "native document reference must remain Provider-owned")
+				if scenario == "native" {
+					assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+					assert.Equal(t, 1, calls)
+				} else {
+					assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+					assert.Zero(t, calls)
+				}
 			})
-			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "anthropic_messages").Error)
-			caps := capability.Set{InputModalities: []capability.Modality{capability.PDF}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{ContextLength: common.GetPointer(int64(10000))}}
-			if scenario == "missing capability" {
-				caps.InputModalities = []capability.Modality{capability.Text}
-			}
-			if scenario == "small context" {
-				caps.Limits.ContextLength = common.GetPointer(int64(1000))
-			}
-			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
-			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/messages", fmt.Sprintf(`{"model":"gateway-offering","messages":[{"role":"user","content":[{"type":"document","source":{"type":"url","url":%q}}]}],"max_tokens":16}`, uri))
-			assert.Zero(t, downloads, "native document reference must remain Provider-owned")
-			if scenario == "native" {
-				assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
-				assert.Equal(t, 1, calls)
-			} else {
-				assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
-				assert.Zero(t, calls)
-			}
-		})
+		}
+	}
+}
+
+func TestTextGatewayStreamChoiceEstimatesKeepBoundaries(t *testing.T) {
+	for _, upstream := range []string{"openai_chat", "gemini_generate"} {
+		for _, modelCase := range []struct {
+			name   string
+			tokens int64
+		}{{"gpt-4o", 2}, {"text-bison-001", 4}} {
+			t.Run(upstream+"/"+modelCase.name, func(t *testing.T) {
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					if upstream == "openai_chat" {
+						_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}},{\"index\":1,\"delta\":{\"content\":\"c\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"b\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"},{\"index\":1,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10}}\n\ndata: [DONE]\n\n")
+					} else {
+						_, _ = io.WriteString(w, "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"a\"}]}},{\"index\":1,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"c\"}]}}]}\n\ndata: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"b\"}]}}]}\n\ndata: {\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"},{\"index\":1,\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10}}\n\n")
+					}
+				})
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", upstream).Error)
+				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("model_name", modelCase.name).Error)
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","stream":true,"n":2,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				require.Contains(t, response.Body.String(), "[DONE]")
+				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, modelCase.tokens, record.Usage.CompletionTokens)
+				attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, total)
+				assert.Equal(t, modelCase.tokens, attempts[0].Usage.CompletionTokens)
+				assert.Equal(t, int64(10000)+modelCase.tokens*2000, attempts[0].Cost.Nanos)
+			})
+		}
 	}
 }
 
@@ -11175,6 +11273,7 @@ func TestTextGatewayFreeFixedPricesAndFailureCosts(t *testing.T) {
 		{name: "fixed safety stream refunds", expression: `tier("request",fixed(0.01))`, stream: true, body: "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n", status: "partial", source: "upstream", errorClass: "content_safety", cost: 20000},
 		{name: "fixed safety JSON refunds", expression: `tier("request",fixed(0.01))`, body: `{"choices":[{"message":{"content":"Hello"},"finish_reason":"content_filter"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, status: "partial", source: "upstream", errorClass: "content_safety", cost: 20000},
 		{name: "fixed native interrupted stream refunds", provider: constant.ChannelTypeCohere, expression: `tier("request",fixed(0.01))`, stream: true, body: "{\"event_type\":\"text-generation\",\"text\":\"Hello\"}\n", status: "partial", source: "estimated", errorClass: "stream_interrupted", cost: 11000},
+		{name: "fixed native failure JSON refunds", provider: constant.ChannelTypeCohere, expression: `tier("request",fixed(0.01))`, body: `{"text":"Hello","finish_reason":"ERROR","meta":{"billed_units":{"input_tokens":10,"output_tokens":5}}}`, status: "failed", source: "upstream", errorClass: "upstream_error", cost: 20000},
 		{name: "fixed native safety JSON refunds", provider: constant.ChannelTypeCohere, expression: `tier("request",fixed(0.01))`, body: `{"text":"Hello","finish_reason":"ERROR_TOXIC","meta":{"billed_units":{"input_tokens":10,"output_tokens":5}}}`, status: "partial", source: "upstream", errorClass: "content_safety", cost: 20000},
 		{name: "fixed native safety stream refunds", provider: constant.ChannelTypeCohere, expression: `tier("request",fixed(0.01))`, stream: true, body: "{\"event_type\":\"text-generation\",\"text\":\"Hello\"}\n{\"is_finished\":true,\"finish_reason\":\"ERROR_TOXIC\",\"response\":{\"meta\":{\"billed_units\":{\"input_tokens\":10,\"output_tokens\":5}}}}\n", status: "partial", source: "upstream", errorClass: "content_safety", cost: 20000},
 		{name: "fixed Tencent safety stream refunds", provider: constant.ChannelTypeTencent, expression: `tier("request",fixed(0.01))`, stream: true, body: "data: {\"Choices\":[{\"Delta\":{\"Content\":\"Hello\"}}]}\n\ndata: {\"Choices\":[{\"Delta\":{},\"FinishReason\":\"content_filter\"}],\"Usage\":{\"PromptTokens\":10,\"CompletionTokens\":5,\"TotalTokens\":15}}\n\n", status: "partial", source: "upstream", errorClass: "content_safety", cost: 20000},
