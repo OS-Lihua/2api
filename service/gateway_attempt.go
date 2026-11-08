@@ -111,6 +111,9 @@ func (b *GatewayAttemptBudget) Start() (context.Context, error) {
 		if cause := context.Cause(b.ctx); cause != nil {
 			return nil, cause
 		}
+		if b.remaining-clock.Now().Sub(b.started) < 5*time.Second {
+			return nil, ErrGatewayBudget
+		}
 		return b.ctx, nil
 	}
 	remaining := b.remaining
