@@ -42,14 +42,25 @@ import { splitBillingExprAndRequestRules } from '@/features/pricing/lib/billing-
 import { TieredPricingEditor } from '@/features/system-settings/models/tiered-pricing-editor'
 import { getServerErrorMessage } from '@/lib/server-error-message'
 
-import { createPriceVersion, getPriceOwners, pricingKeys } from '../api'
+import {
+  createPriceVersion,
+  getPriceOwners,
+  MarginConfirmationRequired,
+  pricingKeys,
+} from '../api'
 import { priceFormSchema, type PriceFormValues } from '../lib/forms'
+import type { MarginCheck, PriceVersionInput } from '../types'
 import { CurrencyInput } from './currency-input'
+import { MarginConfirmation } from './margin-estimates'
 
 export function PriceDialog(props: { onClose: () => void }) {
   const { t } = useTranslation()
   const client = useQueryClient()
   const [discard, setDiscard] = useState(false)
+  const [approval, setApproval] = useState<{
+    draft: PriceVersionInput
+    report: MarginCheck
+  } | null>(null)
   const formElement = useRef<HTMLFormElement>(null)
   const form = useForm<PriceFormValues>({
     resolver: zodResolver(priceFormSchema(t)),
@@ -72,23 +83,19 @@ export function PriceDialog(props: { onClose: () => void }) {
     refetchOnMount: 'always',
   })
   const mutation = useMutation({
-    mutationFn: (values: PriceFormValues) =>
-      createPriceVersion({
-        owner_type: values.owner_type,
-        owner_id: Number(values.owner_id),
-        currency: values.currency,
-        expression: values.expression,
-        ...(values.activation === 'scheduled' && values.effective_at
-          ? { effective_at: Math.floor(values.effective_at.getTime() / 1000) }
-          : {}),
-      }),
+    mutationFn: createPriceVersion,
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: pricingKeys.prices })
       toast.success(t('Price version created'))
       props.onClose()
     },
-    onError: (error) =>
-      form.setError('root', { message: getServerErrorMessage(error) }),
+    onError: (error, draft) => {
+      if (error instanceof MarginConfirmationRequired) {
+        setApproval({ draft, report: error.report })
+        return
+      }
+      form.setError('root', { message: getServerErrorMessage(error) })
+    },
   })
   const requestClose = () => {
     if (mutation.isPending) return
@@ -149,7 +156,19 @@ export function PriceDialog(props: { onClose: () => void }) {
                 })
                 return
               }
-              mutation.mutate(values)
+              mutation.mutate({
+                owner_type: values.owner_type,
+                owner_id: Number(values.owner_id),
+                currency: values.currency,
+                expression: values.expression,
+                ...(values.activation === 'scheduled' && values.effective_at
+                  ? {
+                      effective_at: Math.floor(
+                        values.effective_at.getTime() / 1000
+                      ),
+                    }
+                  : {}),
+              })
             })}
           >
             <fieldset disabled={mutation.isPending} className='space-y-4'>
@@ -299,6 +318,20 @@ export function PriceDialog(props: { onClose: () => void }) {
           </form>
         </Form>
       </Dialog>
+      {approval && (
+        <MarginConfirmation
+          report={approval.report}
+          isPending={mutation.isPending}
+          onCancel={() => setApproval(null)}
+          onConfirm={() =>
+            mutation.mutate({
+              ...approval.draft,
+              effective_at: approval.report.effective_at,
+              margin_confirmation: approval.report.revision,
+            })
+          }
+        />
+      )}
       <ConfirmDialog
         open={discard}
         onOpenChange={setDiscard}

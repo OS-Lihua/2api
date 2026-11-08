@@ -15,6 +15,7 @@ func registerPricingRoutes(api *gin.RouterGroup) {
 		{http.MethodPost, "/price-versions/import", authz.PricingWrite, controller.BulkImport},
 		{http.MethodGet, "/price-versions", authz.PricingRead, controller.ListPriceVersions},
 		{http.MethodPost, "/price-versions", authz.PricingWrite, controller.CreatePriceVersion},
+		{http.MethodGet, "/price-versions/margins", authz.PricingRead, controller.ListMarginEstimates},
 		{http.MethodGet, "/price-versions/current", authz.PricingRead, controller.GetCurrentPriceVersion},
 		{http.MethodGet, "/price-versions/:id", authz.PricingRead, controller.GetPriceVersion},
 		{http.MethodGet, "/fx-rates", authz.PricingRead, controller.ListFXRates},

@@ -16,8 +16,29 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import type { MoneyAmount } from '@/lib/currency'
+
+export interface MarginEstimate {
+  model_offering_id: number
+  channel_id: number
+  provider_id: number
+  samples: number
+  revenue: MoneyAmount | null
+  cost: MoneyAmount | null
+  margin: MoneyAmount | null
+  negative: boolean
+  status: string
+}
+export interface MarginCheck {
+  revision: string
+  effective_at?: number
+  requires_confirmation: boolean
+  estimates: MarginEstimate[]
+}
+
 export type OwnerType = 'model_offering' | 'channel'
 export interface PriceVersionInput {
+  margin_confirmation?: string
   owner_type: OwnerType
   owner_id: number
   currency: string
@@ -43,6 +64,7 @@ export interface PriceListParams {
   owner_id?: number
 }
 export interface FxRateInput {
+  margin_confirmation?: string
   from_currency: string
   to_currency: string
   rate: string

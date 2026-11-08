@@ -126,6 +126,128 @@ function mockPrices(forbiddenPath?: string) {
   })
 }
 
+it('keeps all thirty margin combinations and price history reachable through the page scroll region', async () => {
+  const amount = { nanos: '1', currency: 'USD' }
+  vi.spyOn(api, 'get').mockImplementation(async (url) => {
+    if (url === '/api/admin/v1/price-versions/margins') {
+      return {
+        data: {
+          success: true,
+          data: {
+            estimates: Array.from({ length: 30 }, (_, index) => ({
+              model_offering_id: 9,
+              channel_id: 100 + index,
+              provider_id: 41,
+              samples: 2,
+              revenue: amount,
+              cost: amount,
+              margin: amount,
+              negative: index === 29,
+              status: 'estimated',
+            })),
+          },
+        },
+      }
+    }
+    return { data: { success: true, data: { items: [version], total: 1 } } }
+  })
+  renderPage()
+  const toggle = screen.getByRole('button', {
+    name: 'Estimated channel margins',
+  })
+  await userEvent.click(toggle)
+  expect(toggle).toHaveAttribute('aria-expanded', 'true')
+  const region = screen.getByRole('region', {
+    name: 'Estimated channel margins',
+  })
+  const table = await within(region).findByRole('table')
+  expect(within(table).getAllByRole('row')).toHaveLength(31)
+  expect(within(table).getByText('#129')).toBeVisible()
+  region.focus()
+  expect(region).toHaveFocus()
+  const filter = screen.getByRole('button', { name: 'Apply owner filter' })
+  const pageScroll = region.closest('main')?.querySelector('.overflow-auto')
+  expect(pageScroll).toContainElement(region)
+  expect(pageScroll).toContainElement(filter)
+  filter.focus()
+  expect(filter).toHaveFocus()
+  expect(screen.getByText(version.expression)).toBeVisible()
+})
+
+it('requires an explicit loss confirmation and resubmits the exact rejected draft and server revision', async () => {
+  mockPrices()
+  const report = {
+    revision: 'frozen-margin',
+    effective_at: 1800000000,
+    requires_confirmation: true,
+    estimates: [
+      {
+        model_offering_id: 9,
+        channel_id: 12,
+        provider_id: 3,
+        samples: 7,
+        status: 'estimated',
+        negative: true,
+        revenue: { nanos: '1000000000', currency: 'USD' },
+        cost: { nanos: '2000000000', currency: 'USD' },
+        margin: { nanos: '-1000000000', currency: 'USD' },
+      },
+    ],
+  }
+  const post = vi
+    .spyOn(api, 'post')
+    .mockRejectedValueOnce(
+      Object.assign(new AxiosError('Conflict'), {
+        response: {
+          status: 409,
+          data: {
+            success: false,
+            message_key: 'Negative margin requires confirmation',
+            data: report,
+          },
+        },
+      })
+    )
+    .mockResolvedValue({ data: { success: true, data: version } })
+  renderPage(true)
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: 'New price version' }))
+  const dialog = await screen.findByRole('dialog', {
+    name: 'New price version',
+  })
+  await user.type(
+    within(dialog).getByRole('combobox', { name: 'Price owner ID' }),
+    '9'
+  )
+  await user.tab()
+  await user.click(
+    within(dialog).getByRole('button', { name: 'Create price version' })
+  )
+  const approval = await screen.findByRole('alertdialog', {
+    name: 'Negative margin requires confirmation',
+  })
+  expect(post).toHaveBeenCalledTimes(1)
+  expect(
+    within(approval)
+      .getAllByRole('columnheader')
+      .slice(0, 3)
+      .map((header) => header.textContent)
+  ).toContain('Gross margin')
+  await user.click(
+    within(approval).getByRole('button', { name: 'Confirm loss' })
+  )
+  await waitFor(() =>
+    expect(post).toHaveBeenLastCalledWith(
+      '/api/admin/v1/price-versions',
+      expect.objectContaining({
+        owner_id: 9,
+        effective_at: 1800000000,
+        margin_confirmation: 'frozen-margin',
+      })
+    )
+  )
+})
+
 it('creates the explicitly displayed zero price without requiring an unrelated input edit', async () => {
   mockPrices()
   const post = vi
