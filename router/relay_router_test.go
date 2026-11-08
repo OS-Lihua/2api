@@ -895,6 +895,39 @@ func TestRealtimeGatewayRejectsFixedPricingBeforeReservation(t *testing.T) {
 	}
 }
 
+func TestRealtimeGatewayRejectsUnknownInitialVADState(t *testing.T) {
+	for _, body := range []string{`{}`, `{"modalities":["text"]}`, `{"type":"realtime","audio":{"input":{}}}`} {
+		t.Run(body, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if !assert.NoError(t, err) {
+					return
+				}
+				defer peer.Close()
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":`+body+`}`))) {
+					return
+				}
+				for {
+					if _, _, err := peer.ReadMessage(); err != nil {
+						return
+					}
+					calls.Add(1)
+				}
+			})
+			client := dialRealtimeGateway(t, fixture)
+			_, reply, err := client.ReadMessage()
+			require.NoError(t, err)
+			assert.Equal(t, "error", ojson.GetBytes(reply, "type").String(), "Unknown initial detection state cannot open the financial generation gate")
+			require.NoError(t, client.Close())
+			assert.Zero(t, calls.Load())
+			var count int64
+			require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Where("user_id = ?", fixture.user.Id).Count(&count).Error)
+			assert.Zero(t, count)
+		})
+	}
+}
+
 func TestRealtimeGatewayRequiresConfirmedAutomaticSuppression(t *testing.T) {
 	for _, sessionBody := range []string{`{}`, `{"turn_detection":{}}`, `{"turn_detection":{"create_response":false}}`} {
 		t.Run(sessionBody, func(t *testing.T) {
@@ -956,7 +989,7 @@ func TestRealtimeGatewayRequiresConfirmedAutomaticSuppression(t *testing.T) {
 }
 
 func TestRealtimeGatewayRecoversControlErrorsAndAcceptsLockedModel(t *testing.T) {
-	for _, scenario := range []string{"same model", "config error", "commit error", "response error"} {
+	for _, scenario := range []string{"same model", "config error", "commit error", "response error", "rate rejection", "quota rejection", "credentials rejection", "server rejection"} {
 		t.Run(scenario, func(t *testing.T) {
 			var calls atomic.Int32
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -976,6 +1009,22 @@ func TestRealtimeGatewayRecoversControlErrorsAndAcceptsLockedModel(t *testing.T)
 					kind := ojson.GetBytes(raw, "type").String()
 					if kind == "input_audio_buffer.commit" || ojson.GetBytes(raw, "session.temperature").Exists() || ojson.GetBytes(raw, "response.tools").Exists() {
 						reply := ojson.NewDoc([]byte(`{"type":"error","error":{"type":"invalid_request_error","code":"invalid_value","message":"Rejected control"}}`))
+						code, kind := "", ""
+						switch scenario {
+						case "rate rejection":
+							code, kind = "rate_limit_exceeded", "rate_limit_error"
+						case "quota rejection":
+							code, kind = "insufficient_quota", "insufficient_quota"
+						case "credentials rejection":
+							code, kind = "invalid_api_key", "authentication_error"
+						case "server rejection":
+							code, kind = "server_error", "server_error"
+						}
+						if code != "" {
+							if !assert.NoError(t, reply.Set("error.code", code)) || !assert.NoError(t, reply.Set("error.type", kind)) {
+								return
+							}
+						}
 						if !assert.NoError(t, reply.Set("error.event_id", ojson.GetBytes(raw, "event_id").String())) {
 							return
 						}
@@ -1013,13 +1062,30 @@ func TestRealtimeGatewayRecoversControlErrorsAndAcceptsLockedModel(t *testing.T)
 				if scenario == "commit error" {
 					control = `{"type":"input_audio_buffer.commit","event_id":"bad-commit"}`
 				}
-				if scenario == "response error" {
+				if scenario == "response error" || strings.HasSuffix(scenario, "rejection") {
 					control = `{"type":"response.create","event_id":"bad-response","response":{"input":[],"conversation":"none","tools":[{"type":"function","name":"bad","parameters":{"type":"invalid"}}]}}`
 				}
 				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(control)))
 				_, reply, err := client.ReadMessage()
 				require.NoError(t, err)
 				require.Equal(t, "error", ojson.GetBytes(reply, "type").String())
+			}
+			if strings.HasSuffix(scenario, "rejection") {
+				var records []model.GatewayRequest
+				require.Eventually(t, func() bool {
+					var err error
+					records, _, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+					return err == nil && len(records) == 1 && records[0].Status == "failed"
+				}, 5*time.Second, 10*time.Millisecond)
+				attempts, count, err := model.ListGatewayAttempts(t.Context(), records[0].ID, 0, 10)
+				require.NoError(t, err)
+				require.Equal(t, int64(1), count)
+				require.Len(t, attempts, 1)
+				expected := map[string]string{"rate rejection": "rate_limited", "quota rejection": "account_quota", "credentials rejection": "credentials", "server rejection": "upstream_unavailable"}
+				assert.Equal(t, expected[scenario], attempts[0].ErrorClass)
+				assertTextGatewayLedger(t, records[0], 0)
+				require.NoError(t, client.Close())
+				return
 			}
 			update := `{"type":"session.update","event_id":"valid-config","session":{"instructions":"Use text"}}`
 			if scenario == "same model" {

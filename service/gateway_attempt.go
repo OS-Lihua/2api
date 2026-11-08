@@ -85,7 +85,7 @@ func ClassifyGatewayFailure(status int, code string, transport, timeout, cancell
 		return GatewayFailure{Class: "model_not_found", Switch: true}
 	case status == 429 || code == "rate_limit_exceeded" || code == "ThrottlingException":
 		return GatewayFailure{Class: "rate_limited", Switch: true}
-	case status == 500 || status == 502 || status == 503 || status == 504 || status == 529 || code == "overloaded" || code == "overloaded_error":
+	case status == 500 || status == 502 || status == 503 || status == 504 || status == 529 || code == "server_error" || kind == "server_error" || code == "overloaded" || code == "overloaded_error":
 		return GatewayFailure{Class: "upstream_unavailable", Switch: true}
 	case status == 400 || status == 413 || status == 422 || code == "invalid_request_error" || kind == "invalid_request_error" || code == "ValidationException":
 		return GatewayFailure{Class: "invalid_request"}

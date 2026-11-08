@@ -674,7 +674,7 @@ func (session *realtimeGatewaySession) prepareSessionSettings(raw []byte, initia
 	detection := value.Get(path)
 	if !detection.Exists() {
 		if initial {
-			return []byte(`{}`), nil
+			return nil, types.NewError(errors.New("Upstream automatic generation state is unknown"), types.ErrorCodeBadResponse)
 		}
 		return raw, nil
 	}
@@ -833,7 +833,15 @@ func (session *realtimeGatewaySession) event(raw []byte) ([]byte, [][]byte, *typ
 		if id != "" && session.awaiting != nil && id == session.awaiting.eventID {
 			attempt := session.awaiting
 			session.awaiting = nil
-			session.finish(attempt, realtimeGatewayCompletion{apiErr: types.NewErrorWithStatusCode(errors.New("Realtime response was rejected"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)})
+			code, kind := "", ""
+			if value := ojson.GetBytes(raw, "error.code"); value.Type == ojson.String {
+				code = value.String()
+			}
+			if value := ojson.GetBytes(raw, "error.type"); value.Type == ojson.String {
+				kind = value.String()
+			}
+			apiErr := types.WithOpenAIError(types.OpenAIError{Code: code, Type: kind, Message: "Realtime response was rejected"}, http.StatusBadRequest)
+			session.finish(attempt, realtimeGatewayCompletion{apiErr: apiErr})
 		}
 		if id != "" && id == session.commitEventID {
 			session.commitPending = false
