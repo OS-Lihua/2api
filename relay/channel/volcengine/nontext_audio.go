@@ -25,6 +25,8 @@ import (
 // WebSocket connection belong to Provider.ExecuteRequest.
 type ttsProtocol struct{}
 
+const contextKeyDecodedSpeechResponse = "volcengine_decoded_speech_response"
+
 func (p *ttsProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInfo, request any) (any, error) {
 	r, ok := request.(dto.AudioRequest)
 	if !ok {
@@ -42,7 +44,8 @@ func (p *ttsProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInfo
 
 func (p *ttsProtocol) DoResponse(c *gin.Context, response *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
 	encoding := c.GetString(contextKeyResponseFormat)
-	if _, ok := response.Body.(*ttsSocketBody); !ok {
+	_, socketBody := response.Body.(*ttsSocketBody)
+	if !socketBody && !c.GetBool(contextKeyDecodedSpeechResponse) {
 		return handleTTSResponse(c, response, info, encoding)
 	}
 	defer response.Body.Close()
@@ -78,6 +81,7 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 	if account.Protocol != protocol.OpenAIAudioSpeech {
 		return nil, channel.ErrUseHTTPTransport
 	}
+	c.Set(contextKeyDecodedSpeechResponse, false)
 	payload, err := io.ReadAll(body)
 	if err != nil {
 		return nil, err
@@ -131,6 +135,7 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 		return nil, err
 	}
 	stop := context.AfterFunc(c.Request.Context(), func() { conn.Close() })
+	c.Set(contextKeyDecodedSpeechResponse, true)
 	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/octet-stream"}}, Body: &ttsSocketBody{conn: conn, stop: stop}}, nil
 }
 

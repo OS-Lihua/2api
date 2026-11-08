@@ -382,18 +382,20 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	if info.ResponseFacts != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices) {
 		return types.NewError(fmt.Errorf("upstream transcription request failed"), types.ErrorCodeBadResponse), responseData.Usage
 	}
+	if info.ResponseFacts != nil {
+		text := responseData.Text
+		if responseFormat == "text" || responseFormat == "srt" || responseFormat == "vtt" {
+			text = strings.TrimSpace(string(responseBody))
+		}
+		info.ResponseFacts.GeneratedText = text
+	}
 	writeErr := service.IOCopyBytesGracefully(c, resp, responseBody)
 	if info.ResponseFacts != nil {
 		if writeErr != nil {
 			info.ResponseFacts.DownstreamWriteFailed = true
 			return types.NewError(writeErr, types.ErrorCodeBadResponse), responseData.Usage
 		}
-		text := responseData.Text
-		if responseFormat == "text" || responseFormat == "srt" || responseFormat == "vtt" {
-			text = strings.TrimSpace(string(responseBody))
-		}
-		info.ResponseFacts.GeneratedText = text
-		if text != "" {
+		if info.ResponseFacts.GeneratedText != "" {
 			info.ResponseFacts.MarkBusinessOutput()
 		}
 	}

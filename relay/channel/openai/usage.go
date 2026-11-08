@@ -25,7 +25,7 @@ func mediaUsageCounters(body []byte, depth int) map[string]any {
 	for name, raw := range fields {
 		if depth == 0 {
 			switch name {
-			case "prompt_tokens", "completion_tokens", "input_tokens", "output_tokens", "total_tokens", "prompt_cache_hit_tokens", "claude_cache_creation_5_m_tokens", "claude_cache_creation_1_h_tokens", "prompt_tokens_details", "completion_tokens_details", "input_tokens_details", "output_tokens_details":
+			case "prompt_tokens", "completion_tokens", "input_tokens", "output_tokens", "total_tokens", "prompt_cache_hit_tokens", "claude_cache_creation_5_m_tokens", "claude_cache_creation_1_h_tokens", "prompt_tokens_details", "completion_tokens_details", "input_token_details", "input_tokens_details", "output_tokens_details":
 			default:
 				continue
 			}
@@ -39,6 +39,12 @@ func mediaUsageCounters(body []byte, depth int) map[string]any {
 		var count int64
 		if string(raw) != "null" && common.Unmarshal(raw, &count) == nil && count >= 0 && count <= 1<<31-1 {
 			bounded[name] = count
+		}
+	}
+	if depth == 0 {
+		if details, ok := bounded["input_token_details"]; ok {
+			bounded["input_tokens_details"] = details
+			delete(bounded, "input_token_details")
 		}
 	}
 	return bounded

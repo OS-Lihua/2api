@@ -56,6 +56,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/plugins"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -3901,6 +3902,89 @@ func TestMediaGatewaySpeechDeliversAudioAndBillsMeasuredOutput(t *testing.T) {
 	assert.Equal(t, int64(999_761_500), wallet.Balance.Nanos)
 }
 
+func TestMediaGatewayTranscriptionWriteFailureRetainsGeneratedProcurement(t *testing.T) {
+	for _, tc := range []struct {
+		format, body string
+		output       int64
+	}{
+		{"json", `{"text":"hello"}`, 1}, {"text", "hello world", 2},
+	} {
+		t.Run(tc.format, func(t *testing.T) {
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioTranscription, func(w http.ResponseWriter, r *http.Request) {
+				if tc.format == "json" {
+					w.Header().Set("Content-Type", "application/json")
+				} else {
+					w.Header().Set("Content-Type", "text/plain")
+				}
+				_, _ = io.WriteString(w, tc.body)
+			})
+			fixture.fake.Advance(time.Second)
+			for _, price := range []*model.PriceVersion{
+				{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("audio",ai * 3 + c * 4)`, EffectiveAt: clock.Now().Unix()},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("audio",ai + c)`, EffectiveAt: clock.Now().Unix()},
+			} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			request := mediaMultipartRequest(t, "/v1/audio/transcriptions", map[string]string{"model": "gateway-alias", "response_format": tc.format}, "file", mediaWAV(t, 8000, 16000, make([]byte, 16000)))
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			recorder := httptest.NewRecorder()
+			fixture.engine.ServeHTTP(gatewayPrefixOnlyWriter{ResponseRecorder: recorder}, request)
+			record, err := model.GetGatewayRequest(t.Context(), recorder.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Zero(t, record.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, "estimated", attempts[0].UsageSource)
+			assert.Equal(t, int64(17), attempts[0].Usage.AudioInputTokens)
+			assert.Equal(t, tc.output, attempts[0].Usage.CompletionTokens)
+			assert.Equal(t, (17+tc.output)*1000, attempts[0].Cost.Nanos)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1_000_000_000), wallet.Balance.Nanos)
+		})
+	}
+}
+
+func TestMediaGatewayVolcengineWebSocketSpeechSurvivesIdleWrapper(t *testing.T) {
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 2
+	t.Cleanup(func() { constant.StreamingTimeout = previousTimeout })
+	upgrader := websocket.Upgrader{}
+	fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		require.NoError(t, err)
+		defer conn.Close()
+		_, _, err = conn.ReadMessage()
+		require.NoError(t, err)
+		audio := make([]byte, 48000)
+		frame := make([]byte, 12+len(audio))
+		copy(frame, []byte{0x11, 0xb3, 0, 0})
+		binary.BigEndian.PutUint32(frame[4:8], ^uint32(0))
+		binary.BigEndian.PutUint32(frame[8:12], uint32(len(audio)))
+		copy(frame[12:], audio)
+		require.NoError(t, conn.WriteMessage(websocket.BinaryMessage, frame))
+	})
+	var provider model.Provider
+	require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
+	require.NotNil(t, provider.BaseURL)
+	require.NoError(t, model.DB.Model(&provider).Updates(map[string]any{"type": constant.ChannelTypeVolcEngine, "key": "access|secret", "base_url": strings.Replace(*provider.BaseURL, "http://", "ws://", 1)}).Error)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", `{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm","stream_format":"sse"}`)
+	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, "success", record.Status)
+	assert.Contains(t, response.Body.String(), "speech.audio.delta")
+	assert.Contains(t, response.Body.String(), "speech.audio.done")
+	assert.Equal(t, int64(17), record.Usage.AudioOutputTokens)
+	require.NotNil(t, record.Usage.AudioOutputSeconds)
+	assert.Equal(t, "1", *record.Usage.AudioOutputSeconds)
+	assert.Equal(t, int64(9_000_000), record.Receivable.Nanos)
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, int64(5_000_000), attempts[0].Cost.Nanos)
+}
+
 func TestMediaGatewayTranscriptionPreservesCounterAndDurationPresence(t *testing.T) {
 	for _, tc := range []struct {
 		name, body, seconds         string
@@ -3911,6 +3995,9 @@ func TestMediaGatewayTranscriptionPreservesCounterAndDurationPresence(t *testing
 		{"text format override", `hello`, "1", 17, 1, 49_500, 36_000, "estimated"},
 		{"explicit zero", `{"text":"hello","usage":{"input_tokens":0,"output_tokens":0}}`, "1", 0, 0, 0, 0, "upstream"},
 		{"bad total keeps zero", `{"text":"hello","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":1e200}}`, "1", 0, 0, 0, 0, "upstream"},
+		{"official audio details", `{"text":"hello","usage":{"type":"tokens","input_tokens":100,"input_token_details":{"audio_tokens":100,"text_tokens":0},"output_tokens":1,"total_tokens":101}}`, "1", 100, 1, 273_600, 202_000, "upstream"},
+		{"official zero audio", `{"text":"hello","usage":{"type":"tokens","input_tokens":100,"input_token_details":{"audio_tokens":0,"text_tokens":100},"output_tokens":1,"total_tokens":101}}`, "1", 100, 1, 3_600, 2_000, "upstream"},
+		{"official bad total", `{"text":"hello","usage":{"type":"tokens","input_tokens":100,"input_token_details":{"audio_tokens":100,"text_tokens":0},"output_tokens":1,"total_tokens":1e200}}`, "1", 100, 1, 273_600, 202_000, "upstream"},
 		{"bad total keeps audio", `{"text":"hello","usage":{"input_tokens":17,"input_tokens_details":{"audio_tokens":17},"output_tokens":0,"total_tokens":1e200}}`, "1", 17, 0, 45_900, 34_000, "upstream"},
 		{"invalid input keeps zero output", `{"text":"hello","usage":{"input_tokens":1e200,"output_tokens":0}}`, "1", 17, 0, 45_900, 34_000, "estimated"},
 		{"zero input missing output", `{"text":"hello","usage":{"input_tokens":0}}`, "1", 0, 1, 3_600, 2_000, "estimated"},
