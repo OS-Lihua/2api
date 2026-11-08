@@ -41,8 +41,9 @@ import (
 )
 
 type TaskRequestCapabilities struct {
-	Capabilities capability.Set `json:"-"`
-	ImageCount   *int64         `json:"image_count,omitempty"`
+	Capabilities    capability.Set `json:"-"`
+	ImageCount      *int64         `json:"image_count,omitempty"`
+	DurationSeconds *int64         `json:"duration_seconds,omitempty"`
 }
 
 type requestDescriptor struct {
@@ -323,7 +324,7 @@ func (a *TaskAdaptor) RequestCapabilities(c *gin.Context, info *relaycommon.Rela
 		return TaskRequestCapabilities{}, fmt.Errorf("plugin capability hook must return an object")
 	}
 	for name, field := range fields {
-		if field == nil || name != "features" && name != "input_modalities" && name != "output_modalities" && name != "image_count" {
+		if field == nil || name != "features" && name != "input_modalities" && name != "output_modalities" && name != "image_count" && name != "duration_seconds" {
 			return TaskRequestCapabilities{}, fmt.Errorf("plugin capability hook returned an unknown or null field")
 		}
 	}
@@ -341,8 +342,10 @@ func (a *TaskAdaptor) RequestCapabilities(c *gin.Context, info *relaycommon.Rela
 	if fields["input_modalities"] == nil || fields["output_modalities"] == nil || len(required.Capabilities.OutputModalities) == 0 {
 		return TaskRequestCapabilities{}, fmt.Errorf("plugin capability hook must describe input and output modalities")
 	}
-	if required.ImageCount != nil && (*required.ImageCount < 0 || *required.ImageCount > 1<<53-1) {
-		return TaskRequestCapabilities{}, fmt.Errorf("plugin capability image count must be a nonnegative safe integer")
+	for _, quantity := range []*int64{required.ImageCount, required.DurationSeconds} {
+		if quantity != nil && (*quantity < 0 || *quantity > 1<<53-1) {
+			return TaskRequestCapabilities{}, fmt.Errorf("plugin capability quantity must be a nonnegative safe integer")
+		}
 	}
 	required.Capabilities, err = required.Capabilities.Normalize()
 	return required, err

@@ -392,7 +392,12 @@ export function extractCapabilities(ctx) {
   const images = req.vendorBody ? req.vendorBody.images : Array.isArray(req.images) && req.images.length ? req.images : (req.metadata || {}).images;
   const imageCount = Array.isArray(images) ? images.length : images ? 1 : 0;
   if (imageCount || ["image_to_video", "first_tail_to_video", "reference_to_video"].includes(actionFor(req))) input.push("image");
-  return { input_modalities: input, output_modalities: ["video"], image_count: imageCount };
+  return {
+    input_modalities: input,
+    output_modalities: ["video"],
+    image_count: imageCount,
+    duration_seconds: Math.ceil(submitSettings(ctx, actionFor(req)).duration),
+  };
 }
 
 export function buildSubmitRequest(ctx) {

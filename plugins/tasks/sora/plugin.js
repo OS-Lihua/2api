@@ -108,7 +108,15 @@ export function extractCapabilities(ctx) {
   if (req.input_reference || (req.images || []).length || (ctx.files || []).some((file) => file.field === "input_reference")) input.push("image");
   if (ctx.action === "remix") input.push("video");
   const imageCount = (req.input_reference ? 1 : 0) + (req.images || []).length + (ctx.files || []).filter((file) => file.field === "input_reference").length;
-  return { input_modalities: input, output_modalities: ["video"], image_count: imageCount };
+  const result = { input_modalities: input, output_modalities: ["video"], image_count: imageCount };
+  if (ctx.action !== "remix" || req.seconds !== undefined || req.duration !== undefined) result.duration_seconds = Math.ceil(videoDuration(req));
+  else {
+    const data = ((ctx.originTasks || [])[0] || {}).data || {};
+    const duration = data.seconds === undefined ? data.duration : data.seconds;
+    if (duration !== undefined && Number.isFinite(Number(duration)) && Number(duration) >= 0 && Number(duration) <= 3600)
+      result.duration_seconds = Math.ceil(Number(duration));
+  }
+  return result;
 }
 
 export function buildSubmitRequest(ctx) {

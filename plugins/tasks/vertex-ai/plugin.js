@@ -305,8 +305,9 @@ function aspect(size) {
   return !p || p[0] <= 0 || p[1] <= 0 ? "16:9" : p[1] > p[0] ? "9:16" : "16:9";
 }
 function duration(req) {
-  let n = Number(req.duration);
-  if (!Number.isFinite(n) || n <= 0) n = 8;
+  const raw = Number(req.duration) > 0 ? req.duration : ((req.metadata || {}).durationSeconds ?? 8);
+  const n = Number(raw);
+  if (![4, 6, 8].includes(n)) throw new Error("durationSeconds must be one of 4, 6, or 8");
   return n;
 }
 function region(ctx, model) {
@@ -421,7 +422,8 @@ export function extractCapabilities(ctx) {
   const input = [];
   if (trimmed(req.prompt)) input.push("text");
   if ((req.images || []).length) input.push("image");
-  return { input_modalities: input, output_modalities: ["video"], image_count: (req.images || []).length ? 1 : 0 };
+  const seconds = omniModel(ctx) ? omniDuration(req) : duration(req);
+  return { input_modalities: input, output_modalities: ["video"], image_count: (req.images || []).length ? 1 : 0, duration_seconds: Math.ceil(seconds) };
 }
 
 export function buildSubmitRequest(ctx) {

@@ -1072,10 +1072,19 @@ export function extractCapabilities(ctx) {
     const converted = convertImage(ctx);
     const streaming =
       converted.body.parameters.stream === true || (converted.synchronous && converted.body.parameters.enable_interleave === true && streamsInterleave(ctx));
+    const input = [];
+    const body = converted.body.input;
+    if (
+      trimmed(body.prompt) ||
+      trimmed(body.negative_prompt) ||
+      (body.messages || []).some((message) => (message.content || []).some((part) => trimmed(part.text)))
+    )
+      input.push("text");
+    if (converted.inputImages) input.push("image");
     return {
       features: streaming ? ["streaming"] : [],
-      input_modalities: converted.inputImages ? ["text", "image"] : ["text"],
-      output_modalities: ["image"],
+      input_modalities: input,
+      output_modalities: converted.body.parameters.enable_interleave === true ? ["text", "image"] : ["image"],
       image_count: imageEstimate(ctx, converted).image_count,
     };
   }
@@ -1098,7 +1107,7 @@ export function extractCapabilities(ctx) {
       knownImages = false;
     }
   }
-  const result = { input_modalities: input, output_modalities: ["video"] };
+  const result = { input_modalities: input, output_modalities: ["video"], duration_seconds: Math.ceil(extractUsage(ctx).seconds) };
   if (knownImages) result.image_count = imageCount;
   return result;
 }

@@ -457,7 +457,8 @@ export function extractCapabilities(ctx) {
   if ((body.reference_audios || []).length) input.push("audio");
   if (body.video) input.push("video");
   const imageCount = (body.image ? 1 : 0) + (body.last_frame ? 1 : 0) + (body.reference_images || []).length + (body.keyframes || []).length;
-  return { input_modalities: input, output_modalities: ["video"], image_count: imageCount };
+  const duration = body.video ? (ctx.action === "video_extension" ? MAX_EXTENSION_INPUT_SECONDS + body.duration : MAX_EDIT_SECONDS) : body.duration;
+  return { input_modalities: input, output_modalities: ["video"], image_count: imageCount, duration_seconds: Math.ceil(duration) };
 }
 
 export function buildSubmitRequest(ctx) {

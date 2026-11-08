@@ -168,6 +168,12 @@ func prepareGatewayTaskRoute(c *gin.Context, selection *service.GatewaySelection
 			return nil, service.ErrGatewayCapability
 		}
 	}
+	if maximum := selection.Capabilities.Limits.MaxDurationSeconds; maximum != nil {
+		media := slices.Contains(required.Capabilities.InputModalities, capability.Video) || slices.Contains(required.Capabilities.InputModalities, capability.Audio) || slices.Contains(required.Capabilities.OutputModalities, capability.Video) || slices.Contains(required.Capabilities.OutputModalities, capability.Audio)
+		if required.DurationSeconds == nil && media || required.DurationSeconds != nil && *required.DurationSeconds > *maximum {
+			return nil, service.ErrGatewayCapability
+		}
+	}
 	facts, err := adaptor.ExtractUsageFactsValidated(candidate, info)
 	if err != nil {
 		return nil, service.ErrGatewayCapability
@@ -188,19 +194,6 @@ func prepareGatewayTaskRoute(c *gin.Context, selection *service.GatewaySelection
 		return nil, service.ErrGatewayCapability
 	}
 	selection.InputTokens = int(tokens)
-	for name, field := range schema {
-		value, exists := facts[name]
-		if !exists || field.Type != "number" {
-			continue
-		}
-		quantity, err := decimal.NewFromString(fmt.Sprint(value))
-		if err != nil {
-			return nil, service.ErrGatewayCapability
-		}
-		if field.Unit == "second" && selection.Capabilities.Limits.MaxDurationSeconds != nil && quantity.GreaterThan(decimal.NewFromInt(*selection.Capabilities.Limits.MaxDurationSeconds)) {
-			return nil, service.ErrGatewayCapability
-		}
-	}
 	info.RequestHeaders = map[string]string{}
 	for name, values := range c.Request.Header {
 		info.RequestHeaders[name] = strings.Join(values, ",")

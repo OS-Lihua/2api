@@ -799,12 +799,31 @@ export const native = {
   },
 };
 
+function requestedVideoDuration(ctx) {
+  const req = ctx.requestBody || {};
+  const metadata = req.vendorBody || req.metadata || {};
+  const stated = req.seconds ?? req.duration ?? metadata.duration;
+  if (stated === -1 || stated === "-1") return videoProfile(ctx).maxDuration;
+  if (stated === undefined || stated === null) {
+    if (metadata.frames === undefined || metadata.frames === null) return videoProfile(ctx).maxDuration;
+    const frames = Number(metadata.frames);
+    if (!Number.isSafeInteger(frames) || frames <= 0 || frames > 3600 * 24) throw new Error("frames must describe at most 3600 seconds");
+    return frames / 24;
+  }
+  const duration = (typeof stated === "number" || typeof stated === "string") && String(stated).trim() ? Number(stated) : NaN;
+  if (!Number.isFinite(duration) || duration <= 0 || duration > 3600) throw new Error("duration must be positive and at most 3600 seconds");
+  return duration;
+}
+
 export function extractCapabilities(ctx) {
   if (imageTask(ctx)) {
     const converted = convertImage(ctx);
+    const input = [];
+    if (trimmed(converted.body.prompt) || trimmed(converted.body.negative_prompt)) input.push("text");
+    if (converted.action === "image_to_image") input.push("image");
     return {
       features: converted.body.stream === true ? ["streaming"] : [],
-      input_modalities: converted.action === "image_to_image" ? ["text", "image"] : ["text"],
+      input_modalities: input,
       output_modalities: ["image"],
       image_count: converted.facts.images_up_to_1_5k + converted.facts.images_above_1_5k,
     };
@@ -829,7 +848,7 @@ export function extractCapabilities(ctx) {
       knownImages = false;
     }
   }
-  const result = { input_modalities: input, output_modalities: ["video"] };
+  const result = { input_modalities: input, output_modalities: ["video"], duration_seconds: Math.ceil(requestedVideoDuration(ctx)) };
   if (knownImages) result.image_count = imageCount;
   return result;
 }
@@ -849,8 +868,9 @@ export function buildSubmitRequest(ctx) {
     };
   }
   const req = ctx.requestBody;
-  // Reject output tiers the model does not offer before any quota is reserved.
+  // Reject output tiers and durations the request cannot safely reserve.
   videoResolution(ctx);
+  requestedVideoDuration(ctx);
   if (req.vendorBody) {
     const sent = Object.assign({}, req.vendorBody, { model: ctx.upstreamModel || req.vendorBody.model });
     sent.content = rewriteDraftTaskContent(sent.content, ctx.originTasks);
@@ -875,8 +895,8 @@ export function buildSubmitRequest(ctx) {
   if (trimmed(req.prompt) || !hasReference) body.content.push({ type: "text", text: req.prompt || "" });
   if (Array.isArray(body.content)) body.content = rewriteDraftTaskContent(body.content, ctx.originTasks);
   // -1 lets the model pick the length; extractUsage reserves the longest one.
-  const seconds = Number.parseInt(req.seconds || "", 10);
-  if (seconds > 0 || seconds === -1) body.duration = seconds;
+  const stated = req.seconds ?? req.duration;
+  if (stated !== undefined && stated !== null) body.duration = Number(stated);
   body.model = ctx.upstreamModel || body.model;
   return {
     url: apiRoot(ctx) + "/api/v3/contents/generations/tasks",
@@ -959,16 +979,7 @@ export function extractUsage(ctx) {
     return ratio === 1 ? null : { video_input_ratio: ratio };
   }
   const profile = videoProfile(ctx);
-  // A missing duration or -1 (the model picks the length; Seedance 2.5
-  // defaults to it) reserves the longest duration the model can produce.
-  const stated = req.seconds || req.duration || metadata.duration;
-  let seconds = typeof stated === "number" || typeof stated === "string" ? Number(stated) : 0;
-  if (!Number.isFinite(seconds) || seconds <= 0) {
-    const frames = Number(metadata.frames);
-    seconds = Number.isFinite(frames) && frames > 0 ? Math.floor(frames / 24) : profile.maxDuration;
-  }
-  if (seconds <= 0) seconds = 5;
-  seconds = Math.min(seconds, 3600);
+  const seconds = requestedVideoDuration(ctx);
   const resolution = videoResolution(ctx);
   const facts = { tokens: estimateTokens(seconds, resolution), resolution: resolution };
   // Every model reports video_input, including those whose profile omits it:

@@ -193,6 +193,10 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 			} else if err := provider.ValidateRouteKey(ctx, info.ApiKey, info.ChannelMultiKeyIndex); err != nil {
 				return nil, err
 			}
+			ctx, err = budget.Start()
+			if err != nil {
+				return nil, err
+			}
 			contactedProvider = true
 			return ctx, nil
 		}

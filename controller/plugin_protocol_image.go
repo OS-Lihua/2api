@@ -212,6 +212,9 @@ func pollTaskPluginImageTask(ctx context.Context, task *model.Task) error {
 	if upstreamID == "" {
 		return errors.New("task has no upstream id")
 	}
+	if task.PrivateData.Gateway != nil {
+		return service.UpdateGatewayTask(ctx, task)
+	}
 	return service.UpdateVideoTasks(ctx, task.Platform, map[int][]string{task.ChannelId: {upstreamID}}, map[string]*model.Task{upstreamID: task})
 }
 

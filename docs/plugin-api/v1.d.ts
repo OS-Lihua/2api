@@ -102,6 +102,8 @@ export interface RequestCapabilities {
   output_modalities: readonly ("text" | "image" | "audio" | "video" | "pdf")[];
   /** Generated image upper bound for image output; otherwise input image count. Omit when unknown. */
   image_count?: number;
+  /** Upper bound on media duration in whole seconds; omit when it cannot be established without I/O. */
+  duration_seconds?: number;
 }
 /** Required for ModelOffering routing. Pure facts after parameter overrides; no fetch, token exchange or file resolution. */
 export declare function extractCapabilities(ctx: DriverContext): RequestCapabilities;

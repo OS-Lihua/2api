@@ -680,7 +680,7 @@ func RouteTaskPluginEndpoint() gin.HandlerFunc {
 			}
 			var channels []model.Channel
 			if queryErr := model.OfferingChannelsQuery(model.DB, offering, modelIDs).Where("channels.protocol LIKE ?", "task:%").Order("channels.id").Find(&channels).Error; queryErr != nil {
-				abortWithOpenAiMessage(c, http.StatusServiceUnavailable, "Task Channel is unavailable")
+				abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgTaskChannelUnavailable))
 				return
 			}
 			if len(channels) == 0 {
@@ -717,7 +717,7 @@ func RouteTaskPluginEndpoint() gin.HandlerFunc {
 				c.Next()
 				return
 			}
-			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, "Task Channel is unavailable")
+			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgTaskChannelUnavailable))
 			return
 		}
 		if err != nil || generation == nil {

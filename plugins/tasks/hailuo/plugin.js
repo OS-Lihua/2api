@@ -663,7 +663,7 @@ export function extractCapabilities(ctx) {
       } else knownImages = false;
     }
   }
-  const result = { input_modalities: input, output_modalities: ["video"] };
+  const result = { input_modalities: input, output_modalities: ["video"], duration_seconds: Math.ceil(extractUsage(ctx).seconds) };
   if (knownImages) result.image_count = imageCount;
   return result;
 }

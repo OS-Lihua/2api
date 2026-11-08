@@ -954,6 +954,89 @@ func TestAsyncTaskRecoveryDoesNotStarveLaterTerminalFacts(t *testing.T) {
 	}
 }
 
+func TestAsyncTaskUnknownSubmissionCannotStarvePollingOrTimeouts(t *testing.T) {
+	for _, expired := range []bool{false, true} {
+		t.Run(fmt.Sprintf("expired_%t", expired), func(t *testing.T) {
+			var accept atomic.Bool
+			var polls atomic.Int32
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					polls.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"id":"known-job","status":"completed","seconds":"2"}`))
+					return
+				}
+				if !accept.Load() {
+					_, err := io.Copy(io.Discard, r.Body)
+					require.NoError(t, err)
+					connection, _, err := w.(http.Hijacker).Hijack()
+					require.NoError(t, err)
+					require.NoError(t, connection.Close())
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"known-job","status":"queued"}`))
+			})
+			fixture.fake.Advance(time.Second)
+			for _, owner := range []struct {
+				kind string
+				id   int
+			}{{model.PriceOwnerOffering, fixture.offering.ID}, {model.PriceOwnerChannel, fixture.channel.ID}} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: owner.kind, OwnerID: owner.id, Currency: "USD", Expression: `tier("free",0)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+			}
+			unknown := 1
+			if expired {
+				unknown = 100
+			}
+			for range unknown {
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+				require.Equal(t, 502, response.Code, response.Body.String())
+			}
+			fixture.fake.Advance(time.Second)
+			for _, price := range []*model.PriceVersion{
+				{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("video",u("seconds")*0.1)`, EffectiveAt: clock.Now().Unix()},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("video",u("seconds")*0.05)`, EffectiveAt: clock.Now().Unix()},
+			} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			accept.Store(true)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"Another bird","seconds":"4"}`)
+			require.Equal(t, 200, response.Code, response.Body.String())
+			var known model.Task
+			require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Order("id DESC").First(&known).Error)
+			previousLimit, previousTimeout := constant.TaskQueryLimit, constant.TaskTimeoutMinutes
+			constant.TaskQueryLimit, constant.TaskTimeoutMinutes = 1, 0
+			t.Cleanup(func() { constant.TaskQueryLimit, constant.TaskTimeoutMinutes = previousLimit, previousTimeout })
+			if expired {
+				constant.TaskTimeoutMinutes = 1
+				cutoff := time.Now().Unix() - 3600
+				require.NoError(t, model.DB.Model(&model.Task{}).Where("user_id = ? AND id <> ?", fixture.user.Id, known.ID).Update("submit_time", cutoff-1).Error)
+				require.NoError(t, model.DB.Model(&known).Update("submit_time", cutoff).Error)
+			}
+			service.RunTaskPollingOnce(t.Context(), nil)
+			var refreshed model.Task
+			require.NoError(t, model.DB.First(&refreshed, known.ID).Error)
+			if expired {
+				assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), refreshed.Status)
+				assert.Zero(t, polls.Load())
+			} else {
+				assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), refreshed.Status)
+				assert.EqualValues(t, 1, polls.Load())
+			}
+			var retained int64
+			require.NoError(t, model.DB.Model(&model.Task{}).Where("user_id = ? AND id <> ? AND status = ?", fixture.user.Id, known.ID, model.TaskStatusUnknown).Count(&retained).Error)
+			assert.EqualValues(t, unknown, retained, "unknown accepted identity must remain pending, not be discarded to free the queue")
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			if expired {
+				assert.EqualValues(t, 1000000000, wallet.Balance.Nanos)
+			} else {
+				assert.EqualValues(t, 820000000, wallet.Balance.Nanos)
+			}
+		})
+	}
+}
+
 func TestAsyncTaskUncertainSubmissionKeepsOneReservationWithoutRetry(t *testing.T) {
 	var calls atomic.Int32
 	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -2350,6 +2433,181 @@ func TestAsyncTaskImageCountUsesCompletedFactsOnBothSides(t *testing.T) {
 	wallet, err := model.GetUserWallet(fixture.user.Id)
 	require.NoError(t, err)
 	assert.EqualValues(t, 730000000, wallet.Balance.Nanos)
+}
+
+func TestAsyncTaskUnavailableChannelUsesBackendLanguage(t *testing.T) {
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Fail(t, "unavailable task plugin must not contact its Provider")
+	})
+	SetTaskPluginProtocolRouter(fixture.engine)
+	require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "task:unavailable-plugin").Error)
+	for _, language := range []struct{ locale, message string }{{"en", "Task Channel is unavailable"}, {"zh-CN", "任务通道不可用"}, {"zh-TW", "任務通道無法使用"}} {
+		request := httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`))
+		request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Accept-Language", language.locale)
+		response := httptest.NewRecorder()
+		fixture.engine.ServeHTTP(response, request)
+		assert.Equal(t, 503, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), language.message)
+	}
+}
+
+func TestAsyncTaskCredentialLockWaitRechecksRemainingBudget(t *testing.T) {
+	var calls atomic.Int32
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"too-late-job","status":"queued"}`))
+	})
+	t.Setenv("GATEWAY_TOTAL_FIRST_BYTE_SECONDS", "6")
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	lock := model.DB.WithContext(ctx).Begin()
+	require.NoError(t, lock.Error)
+	defer lock.Rollback()
+	var locked, lockerPID int
+	require.NoError(t, lock.Raw(`SELECT "id" FROM "providers" WHERE "id" = ? FOR UPDATE`, fixture.channel.ProviderID).Scan(&locked).Error)
+	require.NoError(t, lock.Raw(`SELECT pg_backend_pid()`).Scan(&lockerPID).Error)
+	finished := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		finished <- adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+	}()
+	completed := false
+	defer func() {
+		_ = lock.Rollback().Error
+		if !completed {
+			<-finished
+		}
+	}()
+	var waiting int
+	for waiting == 0 && ctx.Err() == nil {
+		select {
+		case early := <-finished:
+			completed = true
+			require.FailNowf(t, "task did not wait for its credential lock", "%d %s", early.Code, early.Body.String())
+		default:
+		}
+		require.NoError(t, model.DB.WithContext(ctx).Raw(`SELECT COALESCE(min(pid),0) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND ? = ANY(pg_blocking_pids(pid))`, lockerPID).Scan(&waiting).Error)
+	}
+	require.NotZero(t, waiting)
+	fixture.fake.Advance(2 * time.Second)
+	require.NoError(t, lock.Commit().Error)
+	response := <-finished
+	completed = true
+	assert.Equal(t, 503, response.Code, response.Body.String())
+	assert.Zero(t, calls.Load(), "four seconds remaining cannot authorize a new Provider exchange")
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1000000000, wallet.Balance.Nanos)
+}
+
+func TestAsyncTaskImageInRequestPollingUsesActualCredentialSlot(t *testing.T) {
+	previousTimeout := constant.TaskPluginProtocolTimeoutSeconds
+	constant.TaskPluginProtocolTimeoutSeconds = 5
+	t.Cleanup(func() { constant.TaskPluginProtocolTimeoutSeconds = previousTimeout })
+	var submitted, polled atomic.Int32
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Contains(t, []string{"Bearer image-slot-one", "Bearer image-slot-two"}, r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			polled.Add(1)
+			_, _ = w.Write([]byte(`{"output":{"task_id":"image-job","task_status":"SUCCEEDED","results":[{"url":"https://artifact.invalid/image.png"}]},"usage":{"image_count":1}}`))
+			return
+		}
+		submitted.Add(1)
+		_, _ = w.Write([]byte(`{"output":{"task_id":"image-job","task_status":"PENDING"}}`))
+	})
+	source, err := plugins.Source("alibaba")
+	require.NoError(t, err)
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "alibaba"})
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Updates(map[string]any{"model_name": "wanx2.1-t2i-turbo", "capabilities": capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Image}}}).Error)
+	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:alibaba", "upstream_model_name": "wanx2.1-t2i-turbo"}).Error)
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"key": "image-slot-one\nimage-slot-two", "channel_info": model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}}).Error)
+	fixture.fake.Advance(time.Second)
+	for _, price := range []*model.PriceVersion{
+		{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("image",u("image_count")*0.1)`, EffectiveAt: clock.Now().Unix()},
+		{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("image",u("image_count")*0.05)`, EffectiveAt: clock.Now().Unix()},
+	} {
+		require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+	}
+	SetTaskPluginProtocolRouter(fixture.engine)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", `{"model":"gateway-alias","prompt":"A bird","n":1,"response_format":"url"}`)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.EqualValues(t, 1, submitted.Load())
+	assert.EqualValues(t, 1, polled.Load())
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.EqualValues(t, 910000000, wallet.Balance.Nanos)
+}
+
+func TestAsyncTaskPhysicalDurationAndEffectiveImageModalities(t *testing.T) {
+	for _, test := range []struct {
+		name, plugin, model, body, result, expression string
+		input, output                                 []capability.Modality
+		maximum                                       int64
+		status                                        int
+	}{
+		{"credit-duration", "kling", "kling-v3", `{"model":"gateway-alias","prompt":"A bird","duration":10}`, `{"code":0,"data":{"task_id":"kling-job"}}`, `u("units")`, []capability.Modality{capability.Text}, []capability.Modality{capability.Video}, 5, 400},
+		{"token-duration", "doubao", "doubao-seedance-1-0-pro-250528", `{"model":"gateway-alias","prompt":"A bird","seconds":"10"}`, `{"id":"doubao-job"}`, `u("tokens") / 1000000`, []capability.Modality{capability.Text}, []capability.Modality{capability.Video}, 5, 400},
+		{"unbounded-wire-duration", "doubao", "doubao-seedance-1-0-pro-250528", `{"model":"gateway-alias","prompt":"A bird","seconds":"4001"}`, `{"id":"doubao-job"}`, `u("tokens") / 1000000000`, []capability.Modality{capability.Text}, []capability.Modality{capability.Video}, 0, 400},
+		{"image-only-layers", "doubao", "doubao-seedream-5-0-pro-260628", `{"model":"gateway-alias","image":"https://image.invalid/source.png","layer_decomposition":true,"size":"2K"}`, `{"data":[{"url":"https://artifact.invalid/layer.png","size":"1024x1024"}],"usage":{"generated_images":1}}`, `(u("images_up_to_1_5k") + u("images_above_1_5k")) / 100`, []capability.Modality{capability.Image}, []capability.Modality{capability.Image}, 0, 200},
+		{"interleaved-output", "alibaba", "wan2.6-image", `{"model":"gateway-alias","input":{"messages":[{"role":"user","content":[{"text":"A bird"}]}]},"parameters":{"enable_interleave":true,"max_images":1}}`, `{"output":{"choices":[{"message":{"content":[{"text":"A bird"},{"image":"https://artifact.invalid/bird.png"}]}}]},"usage":{"image_count":1}}`, `u("image_count")`, []capability.Modality{capability.Text}, []capability.Modality{capability.Image}, 0, 400},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(test.result))
+			})
+			source, err := plugins.Source(test.plugin)
+			require.NoError(t, err)
+			jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+			_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: test.plugin})
+			require.NoError(t, err)
+			caps := capability.Set{InputModalities: test.input, OutputModalities: test.output}
+			if test.maximum > 0 {
+				caps.Limits.MaxDurationSeconds = &test.maximum
+			}
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Updates(map[string]any{"model_name": test.model, "capabilities": caps}).Error)
+			require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:" + test.plugin, "upstream_model_name": test.model}).Error)
+			fixture.fake.Advance(time.Second)
+			for _, price := range []*model.PriceVersion{
+				{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("task", (` + test.expression + `) * 0.1)`, EffectiveAt: clock.Now().Unix()},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("task", (` + test.expression + `) * 0.05)`, EffectiveAt: clock.Now().Unix()},
+			} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			path := "/v1/tasks/" + test.plugin
+			if test.plugin == "alibaba" {
+				builder := newPluginGenerationBuilder(fixture.engine.Routes(), nil, productionPluginRouteHandlers)
+				require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(builder.prepare))
+				dispatcher := &pluginRouteDispatcher{registry: jsplugin.DefaultRegistry}
+				fixture.engine.NoRoute(dispatcher.dispatch)
+				path = "/ali/api/v1/services/aigc/multimodal-generation/generation"
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, test.body)
+			require.Equal(t, test.status, response.Code, response.Body.String())
+			if test.status == 200 {
+				assert.EqualValues(t, 1, calls.Load())
+				return
+			}
+			assert.Zero(t, calls.Load())
+			var reservations int64
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
+			assert.Zero(t, reservations)
+			if test.name == "interleaved-output" {
+				caps.OutputModalities = append(caps.OutputModalities, capability.Text)
+				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+				response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, test.body)
+				require.Equal(t, 200, response.Code, response.Body.String())
+				assert.EqualValues(t, 1, calls.Load())
+			}
+		})
+	}
 }
 
 func TestAsyncTaskRejectsUnboundedDurationBeforeReservation(t *testing.T) {

@@ -243,11 +243,14 @@ export const native = {
 };
 
 export function extractCapabilities(ctx) {
-  const instance = converted(ctx).body.instances[0];
+  const convertedRequest = converted(ctx);
+  const instance = convertedRequest.body.instances[0];
   const input = [];
   if (trimmed(instance.prompt)) input.push("text");
   if (instance.image) input.push("image");
-  return { input_modalities: input, output_modalities: ["video"], image_count: instance.image ? 1 : 0 };
+  const duration = convertedRequest.body.parameters.durationSeconds ?? 8;
+  if (![4, 6, 8].includes(Number(duration))) throw new Error("durationSeconds must be one of 4, 6, or 8");
+  return { input_modalities: input, output_modalities: ["video"], image_count: instance.image ? 1 : 0, duration_seconds: Number(duration) };
 }
 
 export function buildSubmitRequest(ctx) {
@@ -275,10 +278,9 @@ export function parseSubmitResponse(ctx, resp) {
 
 export function extractUsage(ctx) {
   const req = ctx.requestBody || {};
-  const metadata = req.metadata || {};
-  let seconds = Number(req.duration);
-  if (!Number.isFinite(seconds) || seconds <= 0) seconds = 8;
-  const resolution = String(metadata.resolution || resolutionForSize(req.size) || "720p").toLowerCase();
+  const parameters = converted(ctx).body.parameters;
+  const seconds = Number(parameters.durationSeconds ?? 8);
+  const resolution = String(parameters.resolution || resolutionForSize(req.size) || "720p").toLowerCase();
   return { seconds: seconds, resolution: resolution };
 }
 

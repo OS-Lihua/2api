@@ -382,12 +382,17 @@ func TaskGetAllTasks(startIdx int, num int, queryParams SyncTaskQueryParams) []*
 	return tasks
 }
 
+func pollableUnfinishedTasks() *gorm.DB {
+	return DB.Model(&Task{}).Where("progress != ?", "100%").
+		Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess}).
+		Where(`(("private_data"->>'gateway') IS NULL OR "private_data"->'gateway'->>'accepted' = ?)`, "true")
+}
+
 func GetTimedOutUnfinishedTasks(cutoffUnix int64, limit int) []*Task {
 	var tasks []*Task
-	err := DB.Where("progress != ?", "100%").
-		Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess}).
+	err := pollableUnfinishedTasks().
 		Where("submit_time < ?", cutoffUnix).
-		Order("submit_time").
+		Order("submit_time, id").
 		Limit(limit).
 		Find(&tasks).Error
 	if err != nil {
@@ -400,7 +405,7 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 	var tasks []*Task
 	var err error
 	// get all tasks progress is not 100%
-	err = DB.Where("progress != ?", "100%").Where("status != ?", TaskStatusFailure).Where("status != ?", TaskStatusSuccess).Limit(limit).Order("id").Find(&tasks).Error
+	err = pollableUnfinishedTasks().Limit(limit).Order("id").Find(&tasks).Error
 	if err != nil {
 		return nil
 	}
@@ -413,10 +418,7 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 // the scheduler skips creating a row entirely.
 func HasUnfinishedSyncTasks() bool {
 	var id int64
-	err := DB.Model(&Task{}).
-		Where("progress != ?", "100%").
-		Where("status != ?", TaskStatusFailure).
-		Where("status != ?", TaskStatusSuccess).
+	err := pollableUnfinishedTasks().
 		Limit(1).
 		Pluck("id", &id).Error
 	return err == nil && id != 0

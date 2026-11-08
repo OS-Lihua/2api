@@ -305,7 +305,12 @@ export function extractCapabilities(ctx) {
   if (trimmed(req.prompt || (req.vendorBody || {}).prompt)) input.push("text");
   const imageCount = req.vendorBody ? vendorImageCount(req.vendorBody) : submitImageCount(req);
   if (imageCount) input.push("image");
-  return { input_modalities: input, output_modalities: ["video"], image_count: imageCount };
+  return {
+    input_modalities: input,
+    output_modalities: ["video"],
+    image_count: imageCount,
+    duration_seconds: Math.ceil(outboundSeconds(req, submitReqKey(ctx))),
+  };
 }
 
 export function buildSubmitRequest(ctx) {

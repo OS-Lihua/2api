@@ -48,6 +48,7 @@ const (
 	MsgTaskSubmissionUnknown             = "task.submission_unknown"
 	MsgTaskModelNotFound                 = "task.model_not_found"
 	MsgTaskPluginUnavailable             = "task.plugin_unavailable"
+	MsgTaskChannelUnavailable            = "task.channel_unavailable"
 	MsgTaskRemixUnsupported              = "task.remix_unsupported"
 	MsgTaskInvalidRequest                = "task.invalid_request"
 	MsgTaskInvalidRemix                  = "task.invalid_remix"
