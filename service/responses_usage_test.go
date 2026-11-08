@@ -83,6 +83,32 @@ func TestRealtimeConversationFreezesItemsAcrossDeletionAndAudioTruncation(t *tes
 	assert.Equal(t, 2, conversation.Usage(false).PromptTokensDetails.AudioTokens, "A duplicate commit cannot consume the next audio turn")
 }
 
+func TestRealtimeUsageRetainsEstimatedImagesAndExplicitZero(t *testing.T) {
+	for _, tc := range []struct {
+		name, usage string
+		image       int
+	}{
+		{"missing usage", "", 765},
+		{"missing image detail", `,"usage":{"input_tokens":765,"output_tokens":1}`, 765},
+		{"explicit image zero", `,"usage":{"input_tokens":765,"output_tokens":1,"input_token_details":{"image_tokens":0}}`, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &relaycommon.RelayInfo{TokenizerModel: "gpt-4o", ProviderMeta: &relaycommon.ProviderMeta{}, StreamStatus: relaycommon.NewStreamStatus(), ResponseFacts: &relaycommon.ResponseFacts{}}
+			accumulator := NewRealtimeUsageAccumulator(info)
+			input := &dto.Usage{PromptTokens: 765, TotalTokens: 765, PromptTokensDetails: dto.InputTokenDetails{ImageTokens: 765}}
+			_, err := accumulator.Observe([]byte(`{"type":"response.created","response":{"id":"image"}}`), input, true)
+			require.NoError(t, err)
+			_, err = accumulator.Observe([]byte(`{"type":"response.text.delta","response_id":"image","delta":"hello"}`), input, true)
+			require.NoError(t, err)
+			result, err := accumulator.Observe([]byte(`{"type":"response.done","response":{"id":"image","status":"completed"`+tc.usage+`}}`), input, true)
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.Equal(t, 765, result.Usage.PromptTokens)
+			assert.Equal(t, tc.image, result.Usage.PromptTokensDetails.ImageTokens)
+		})
+	}
+}
+
 func TestResponsesUsageRejectsInvalidCumulativeFieldsAndRetainsCacheLifetimeZero(t *testing.T) {
 	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "gpt-4o"}, StreamStatus: relaycommon.NewStreamStatus(), ResponseFacts: &relaycommon.ResponseFacts{}}
 	accumulator := NewResponsesUsageAccumulator(info)

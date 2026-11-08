@@ -343,9 +343,10 @@ func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 	for _, tc := range []struct {
 		name, terminal, source, status   string
 		sale, cost                       int64
-		credentials                      bool
+		credentials, pending             bool
 		delta, cancel, disconnect, probe bool
 	}{
+		{name: "failed sale evaluation stays pending across recovery", pending: true, terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":1000,"output_tokens":10}}}`, source: "upstream", status: "settlement_pending", cost: 1_020_000},
 		{name: "partial usage without delivery", terminal: `{"type":"response.failed","response":{"id":"active","status":"failed","error":{"code":"server_error"},"usage":{"input_tokens":1000}}}`, source: "none", status: "failed", cost: 1_000_000},
 		{name: "valid base counters with invalid total", terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":"invalid"}}}`, source: "upstream", status: "success", sale: 1_836_000, cost: 1_020_000},
 		{name: "terminal function call without usage", terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"function_call","name":"hello","arguments":""}]}}`, source: "estimated", status: "success", sale: 5400, cost: 3000},
@@ -406,6 +407,12 @@ func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 				require.NoError(t, model.CreatePriceVersion(t.Context(), &price, fixture.sale.CreatedBy))
 				fixture.fake.Advance(2 * time.Second)
 			}
+			if tc.pending {
+				price := *fixture.sale
+				price.ID, price.EffectiveAt, price.Expression = 0, clock.Now().Unix()+1, `tier("pending",p * 1000 / (c - 10))`
+				require.NoError(t, model.CreatePriceVersion(t.Context(), &price, fixture.sale.CreatedBy))
+				fixture.fake.Advance(2 * time.Second)
+			}
 			if tc.credentials {
 				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("header_override", `{"Authorization":"{client_header:Authorization}","Sec-WebSocket-Protocol":"{client_header:Sec-WebSocket-Protocol}","*":""}`).Error)
 			}
@@ -436,7 +443,7 @@ func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 			require.Eventually(t, func() bool {
 				var err error
 				records, _, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
-				if err != nil || len(records) != 1 || records[0].Status == "settlement_pending" {
+				if err != nil || len(records) != 1 || records[0].Status == "settlement_pending" && !tc.pending {
 					return false
 				}
 				_, count, err := model.ListGatewayAttempts(t.Context(), records[0].ID, 0, 10)
@@ -445,6 +452,38 @@ func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 			record := records[0]
 			assert.Equal(t, tc.status, record.Status)
 			assert.Equal(t, tc.source, record.UsageSource)
+			if tc.pending {
+				var billing model.GatewayBilling
+				require.Eventually(t, func() bool {
+					return model.DB.First(&billing, "request_id = ?", record.ID).Error == nil && billing.Phase == "evaluation_failed"
+				}, 5*time.Second, 10*time.Millisecond)
+				var settlement model.GatewaySettlement
+				require.NoError(t, common.UnmarshalJsonStr(billing.Settlement, &settlement))
+				require.NotNil(t, settlement.SaleUsage)
+				assert.Equal(t, 1000, settlement.SaleUsage.PromptTokens)
+				assert.Equal(t, 10, settlement.SaleUsage.CompletionTokens)
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				var entries []model.LedgerEntry
+				require.NoError(t, model.DB.Where("request_id = ?", record.ID).Order("id").Find(&entries).Error)
+				require.Len(t, entries, 2)
+				assert.Equal(t, model.LedgerEntryPreConsume, entries[0].Type)
+				assert.Equal(t, model.LedgerAccountProviderPayable, entries[1].AccountType)
+				assert.Equal(t, model.LedgerEntryCharge, entries[1].Type)
+				assert.Equal(t, tc.cost, entries[1].Amount.Nanos)
+				for range 2 {
+					completed, recoverErr := model.RecoverGatewaySettlements(t.Context(), 10)
+					require.ErrorIs(t, recoverErr, model.ErrGatewayEvaluationPending)
+					assert.Zero(t, completed)
+				}
+				afterWallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, wallet.Balance, afterWallet.Balance)
+				var after []model.LedgerEntry
+				require.NoError(t, model.DB.Where("request_id = ?", record.ID).Order("id").Find(&after).Error)
+				assert.Equal(t, entries, after)
+				return
+			}
 			assert.Equal(t, tc.sale, record.Receivable.Nanos)
 			assertTextGatewayLedger(t, record, tc.cost)
 			attempts, _, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
@@ -473,15 +512,20 @@ func (writer websocketTerminalFailureWriter) Hijack() (net.Conn, *bufio.ReadWrit
 type websocketTerminalFailureConn struct{ net.Conn }
 
 func (connection websocketTerminalFailureConn) Write(data []byte) (int, error) {
-	if bytes.Contains(data, []byte(`"type":"response.completed"`)) || bytes.Contains(data, []byte(`"type":"response.done"`)) {
+	if bytes.Contains(data, []byte(`"type":"response.audio.delta"`)) || bytes.Contains(data, []byte(`"type":"response.completed"`)) || bytes.Contains(data, []byte(`"type":"response.done"`)) {
 		return 0, io.ErrClosedPipe
 	}
 	return connection.Conn.Write(data)
 }
 
 func TestWebSocketGatewayTerminalWriteFailurePreservesCompleteUsage(t *testing.T) {
-	for _, native := range []protocol.Type{protocol.OpenAIResponses, protocol.OpenAIRealtime} {
-		t.Run(string(native), func(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		native protocol.Type
+		audio  bool
+	}{{"responses terminal", protocol.OpenAIResponses, false}, {"realtime terminal", protocol.OpenAIRealtime, false}, {"realtime undelivered audio", protocol.OpenAIRealtime, true}} {
+		native := test.native
+		t.Run(test.name, func(t *testing.T) {
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
 				if !assert.NoError(t, err) {
@@ -489,11 +533,25 @@ func TestWebSocketGatewayTerminalWriteFailurePreservesCompleteUsage(t *testing.T
 				}
 				defer peer.Close()
 				if native == protocol.OpenAIRealtime {
-					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"modalities":["text"],"turn_detection":null}}`))) {
+					session := `{"type":"session.created","session":{"modalities":["text"],"turn_detection":null}}`
+					if test.audio {
+						session = `{"type":"session.created","session":{"modalities":["text","audio"],"output_audio_format":"g711_ulaw","turn_detection":null}}`
+					}
+					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(session))) {
 						return
 					}
 				}
 				if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
+					return
+				}
+				if test.audio {
+					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"complete","status":"in_progress","conversation_id":null}}`))) {
+						return
+					}
+					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.audio.delta","response_id":"complete","delta":"`+base64.StdEncoding.EncodeToString(make([]byte, 8000))+`"}`))) {
+						return
+					}
+					_, _, _ = peer.ReadMessage()
 					return
 				}
 				terminal := "response.completed"
@@ -514,12 +572,21 @@ func TestWebSocketGatewayTerminalWriteFailurePreservesCompleteUsage(t *testing.T
 				provider.SetSetting(dto.ProviderSettings{ResponsesWebSocketEnabled: true})
 				require.NoError(t, model.DB.Model(&provider).Update("setting", provider.Setting).Error)
 			}
+			if test.audio {
+				var unified model.Model
+				require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+				unified.Capabilities.OutputModalities = append(unified.Capabilities.OutputModalities, capability.Audio)
+				require.NoError(t, model.DB.Model(&unified).Select("capabilities").Updates(&unified).Error)
+			}
 			server := newRealtimeGatewayServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				fixture.engine.ServeHTTP(websocketTerminalFailureWriter{w}, r)
 			}))
 			path, create := "/v1/responses", `{"type":"response.create","model":"gateway-alias","input":"hello","max_output_tokens":16}`
 			if native == protocol.OpenAIRealtime {
 				path, create = "/v1/realtime", `{"type":"response.create","response":{"conversation":"none","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],"output_modalities":["text"],"max_output_tokens":16}}`
+			}
+			if test.audio {
+				create = strings.ReplaceAll(create, `"output_modalities":["text"]`, `"output_modalities":["audio"]`)
 			}
 			client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+path+"?model=gateway-alias", http.Header{"Authorization": {"Bearer sk-" + fixture.token.Key}})
 			require.NoError(t, err)
@@ -530,7 +597,11 @@ func TestWebSocketGatewayTerminalWriteFailurePreservesCompleteUsage(t *testing.T
 				require.NoError(t, err)
 			}
 			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(create)))
-			for range 2 {
+			deliveredFrames := 2
+			if test.audio {
+				deliveredFrames = 1
+			}
+			for range deliveredFrames {
 				_, _, err = client.ReadMessage()
 				require.NoError(t, err)
 			}
@@ -543,6 +614,11 @@ func TestWebSocketGatewayTerminalWriteFailurePreservesCompleteUsage(t *testing.T
 				records, count, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
 				return err == nil && count == 1 && len(records) == 1 && records[0].Status != "settlement_pending"
 			}, 5*time.Second, 10*time.Millisecond)
+			if test.audio {
+				assert.Zero(t, records[0].Receivable.Nanos)
+				assertTextGatewayLedger(t, records[0], 41_000)
+				return
+			}
 			assert.Equal(t, int64(10), records[0].Usage.CompletionTokens)
 			assert.Equal(t, "upstream", records[0].UsageSource)
 			assert.Equal(t, int64(1_836_000), records[0].Receivable.Nanos)

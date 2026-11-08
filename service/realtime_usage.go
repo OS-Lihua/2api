@@ -26,6 +26,7 @@ type realtimeResponseUsage struct {
 	deliveredAudioBytes int64
 	audioReported       bool
 	inputAudioReported  bool
+	inputImageReported  bool
 	outputAudioFormat   string
 }
 
@@ -132,6 +133,9 @@ func (accumulator *RealtimeUsageAccumulator) Observe(raw []byte, input *dto.Usag
 		if valid, _ := relaycommon.NativeUsagePresence(normalized, "response.usage.output_tokens_details.audio_tokens", "", ""); valid {
 			state.audioReported = true
 		}
+		if valid, _ := relaycommon.NativeUsagePresence(normalized, "response.usage.input_tokens_details.image_tokens", "", ""); valid {
+			state.inputImageReported = true
+		}
 		if valid, _ := relaycommon.NativeUsagePresence(normalized, "response.usage.input_tokens_details.audio_tokens", "", ""); valid {
 			state.inputAudioReported = true
 		}
@@ -193,6 +197,10 @@ func (accumulator *RealtimeUsageAccumulator) finish(id string, state *realtimeRe
 	}
 	if !state.inputAudioReported && state.input.PromptTokensDetails.AudioTokens > 0 && (!facts.PromptTokensReported || usage.PromptTokens > 0) {
 		usage.PromptTokensDetails.AudioTokens = min(state.input.PromptTokensDetails.AudioTokens, usage.PromptTokens)
+		estimated = true
+	}
+	if !state.inputImageReported && state.input.PromptTokensDetails.ImageTokens > 0 && (!facts.PromptTokensReported || usage.PromptTokens > 0) {
+		usage.PromptTokensDetails.ImageTokens = min(state.input.PromptTokensDetails.ImageTokens, max(0, usage.PromptTokens-usage.PromptTokensDetails.AudioTokens))
 		estimated = true
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
