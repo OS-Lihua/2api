@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"maps"
 	"math"
 	"net/http"
 	"slices"
@@ -20,7 +21,6 @@ import (
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/pkg/protocol"
-	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -160,13 +160,51 @@ func MediaGateway(c *gin.Context) {
 
 func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclusions *service.GatewayExclusions) (result service.GatewayAttemptResult) {
 	c := run.c
-	selection, err := service.SelectGatewayMediaChannel(c, run.offering, run.parsed.Protocol, run.parsed.Request, exclusions.Channels, exclusions.Providers)
+	mean, err := model.RecentOfferingOutputTokens(c.Request.Context(), run.offering.ID, run.started.UnixMilli())
 	if err != nil {
-		if errors.Is(err, service.ErrGatewayCapability) {
+		run.code = "billing_unavailable"
+		return result
+	}
+	candidates := map[int]*gatewayPreparedMedia{}
+	selection, err := service.SelectGatewayRoute(c, run.offering, service.GatewayRouteInput{
+		Protocol: run.parsed.Protocol, Sale: run.sale, SaleFX: run.saleFX, Ratio: run.ratio, StartedAt: run.started, Failures: exclusions,
+		Prepare: func(selection *service.GatewaySelection) (*service.GatewayRouteFacts, error) {
+			prepared, err := prepareGatewayMediaRoute(c, selection, run.parsed, run.started, run.id, mean)
+			if err != nil {
+				return nil, err
+			}
+			if run.record != nil {
+				_, value, _, priceErr := service.GatewayPrice(run.sale, prepared.Usage, prepared.SaleInput, run.started, run.ratio, run.saleFX)
+				if priceErr == nil {
+					amount, amountErr := value.Receivable()
+					if amountErr != nil || amount.Nanos > run.reservation.Nanos {
+						return nil, service.ErrGatewayUnavailable
+					}
+				}
+			}
+			candidates[selection.Channel.ID] = prepared
+			return &prepared.Facts, nil
+		},
+	})
+	if err != nil {
+		run.status, run.code = 503, "channel_unavailable"
+		if errors.Is(err, service.ErrGatewayCapability) || errors.Is(err, service.ErrGatewayConversion) {
 			run.status, run.code = 400, "unsupported_parameter"
+		}
+		if errors.Is(err, service.ErrGatewayPriceUnavailable) {
+			run.code = "price_unavailable"
 		}
 		return result
 	}
+	contactedProvider := false
+	defer func() {
+		ctx := context.WithoutCancel(c.Request.Context())
+		if result.Attempt != nil && result.Attempt.UsageSource != "none" {
+			_ = selection.Permit.Release(ctx, contactedProvider, result.Attempt.Usage.TotalTokens)
+		} else {
+			_ = selection.Permit.Release(ctx, contactedProvider)
+		}
+	}()
 	stopProbe := service.ChannelHealth.KeepAlive(c.Request.Context(), selection.Admission)
 	defer stopProbe()
 	defer func() {
@@ -175,121 +213,41 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		}
 	}()
 	skipped := service.GatewayAttemptResult{SkippedChannel: selection.Channel.ID}
-	if setupErr := middleware.SetupContextForSelectedChannel(c, selection.Provider, selection.Channel.Model.ModelName); setupErr != nil {
-		return skipped
-	}
-	var overrides map[string]any
-	if common.UnmarshalJsonStr(selection.Channel.ParameterOverrides, &overrides) != nil {
-		return skipped
-	}
-	common.SetContextKey(c, constant.ContextKeyChannelParamOverride, overrides)
-	var info *relaycommon.RelayInfo
-	if run.parsed.Protocol == protocol.OpenAIImages {
-		info = relaycommon.GenRelayInfoImage(c, run.parsed.Request)
-	} else {
-		info = relaycommon.GenRelayInfoOpenAIAudio(c, run.parsed.Request)
-	}
-	info.InitChannelMeta(c)
-	info.StartTime, info.RequestId = run.started, run.id
-	info.UpstreamModelName, info.OriginModelName = selection.Channel.UpstreamModelName, selection.Channel.UpstreamModelName
-	info.TokenizerModel = selection.Channel.Model.ModelName
-	info.IsModelMapped = true
-	info.StreamStatus = relaycommon.NewStreamStatus()
+	selected := candidates[selection.Channel.ID]
+	maps.Copy(c.Keys, selected.Context.Keys)
+	c.Request.Header = selected.Context.Request.Header.Clone()
+	info := selected.Info
 	var sentAt time.Time
 	var firstByte time.Duration
-	info.ResponseFacts = &relaycommon.ResponseFacts{OnBusinessOutput: func() {
+	info.ResponseFacts.OnBusinessOutput = func() {
 		if firstByte == 0 && !sentAt.IsZero() {
 			firstByte = max(clock.Now().Sub(sentAt), time.Nanosecond)
 		}
 		budget.Delivered()
-	}, CanFinishStream: func() bool { return info.StreamStatus.CompletedNormally() }}
-	info.BeginProviderCall = budget.Start
+	}
+	info.ResponseFacts.CanFinishStream = func() bool { return info.StreamStatus.CompletedNormally() }
+	committedKey := false
+	info.BeginProviderCall = func() (context.Context, error) {
+		ctx, err := budget.Start()
+		if err != nil {
+			return nil, err
+		}
+		if !committedKey {
+			if err := selection.Provider.CommitRouteKey(ctx, info.ApiKey, info.ChannelMultiKeyIndex); err != nil {
+				return nil, err
+			}
+			committedKey = true
+		} else if err := selection.Provider.ValidateRouteKey(ctx, info.ApiKey, info.ChannelMultiKeyIndex); err != nil {
+			return nil, err
+		}
+		contactedProvider = true
+		return ctx, nil
+	}
 	common.SetContextKey(c, constant.ContextKeyResponseFacts, info.ResponseFacts)
 	common.SetContextKey(c, constant.ContextKeyOriginalModel, info.TokenizerModel)
-	if helper.ValidateGatewayMediaMultipliers(run.parsed.Input.Body, selection.Capabilities.Limits) != nil {
-		run.status, run.code = 400, "unsupported_parameter"
-		return skipped
-	}
-	adaptor, err := relay.GetChannelAdaptor(info.ApiType, run.parsed.Protocol)
-	if err != nil {
-		run.status, run.code = 400, "unsupported_parameter"
-		return skipped
-	}
-	prepared, err := adaptor.PrepareMediaWire(c, info, run.parsed)
-	if err != nil {
-		run.status, run.code = 400, "unsupported_parameter"
-		return skipped
-	}
-	meta := prepared.Request.GetTokenCountMeta()
-	if audio, ok := prepared.Request.(*dto.AudioRequest); ok && audio.Instructions != "" {
-		meta.CombineText += "\n" + audio.Instructions
-	}
-	inputTokens, err := service.CountRequestToken(c, meta, info)
-	if err != nil || !service.GatewayMediaCapabilitiesMatch(c, run.parsed.Protocol, prepared.Request, selection.Capabilities, inputTokens, info.ResponseFacts) {
-		run.status, run.code = 400, "unsupported_parameter"
-		return skipped
-	}
-	limits := selection.Capabilities.Limits
-	if limits.ContextLength != nil {
-		remaining := *limits.ContextLength - int64(inputTokens)
-		if limits.MaxOutputTokens == nil || *limits.MaxOutputTokens > remaining {
-			limits.MaxOutputTokens = &remaining
-		}
-	}
-	if limits.MaxOutputTokens != nil && run.parsed.Protocol != protocol.OpenAIAudioSpeech {
-		run.status, run.code = 400, "unsupported_parameter"
-		return skipped
-	}
-	if audio, ok := prepared.Request.(*dto.AudioRequest); ok && run.parsed.Protocol == protocol.OpenAIAudioSpeech && len(audio.MaxNewTokens) == 0 && limits.MaxOutputTokens != nil {
-		if err := adaptor.SetMediaOutputLimit(prepared, *limits.MaxOutputTokens); err != nil {
-			run.status, run.code = 400, "unsupported_parameter"
-			return skipped
-		}
-	}
-	if len(prepared.Input.Body) > 0 && helper.ValidateGatewayMediaMultipliers(prepared.Input.Body, limits) != nil {
-		run.status, run.code = 400, "unsupported_parameter"
-		return skipped
-	}
-	info.SetEstimatePromptTokens(inputTokens)
-	mean, err := model.RecentOfferingOutputTokens(c.Request.Context(), run.offering.ID, run.started.UnixMilli())
-	if err != nil {
-		run.code = "billing_unavailable"
-		return result
-	}
-	mean = max(mean, int64(prepared.MinimumOutputTokens))
-	if limit := limits.MaxOutputTokens; limit != nil {
-		if int64(prepared.MinimumOutputTokens) > *limit {
-			run.status, run.code = 400, "unsupported_parameter"
-			return skipped
-		}
-		mean = min(mean, *limit)
-	}
-	if audio, ok := prepared.Request.(*dto.AudioRequest); ok && len(audio.MaxNewTokens) > 0 {
-		var limit uint
-		if common.Unmarshal(audio.MaxNewTokens, &limit) != nil {
-			run.status, run.code = 400, "unsupported_parameter"
-			return skipped
-		}
-		mean = min(mean, int64(limit))
-	}
-	count := 1
-	if prepared.Input.ImageCount != nil {
-		count = *prepared.Input.ImageCount
-	}
-	if mean > int64(common.MaxQuota)/int64(count) {
-		run.status, run.code = 400, "unsupported_parameter"
-		return skipped
-	}
-	mean *= int64(count)
-	estimatedUsage := &dto.Usage{PromptTokens: inputTokens, CompletionTokens: int(mean), TotalTokens: inputTokens + int(mean)}
-	if run.parsed.Protocol == protocol.OpenAIAudioSpeech {
-		estimatedUsage.CompletionTokenDetails.AudioTokens = int(mean)
-	}
-	if run.parsed.Protocol == protocol.OpenAIAudioTranscription {
-		estimatedUsage.PromptTokensDetails.AudioTokens = inputTokens
-	}
-	saleInput := run.parsed.Input
-	saleInput.ImageCount = prepared.Input.ImageCount
+	adaptor, prepared := selected.Adaptor, selected.Request
+	inputTokens, estimatedUsage, count := selection.InputTokens, selected.Usage, selected.Choices
+	saleInput := selected.SaleInput
 	source, reserveValue, _, err := service.GatewayPrice(run.sale, estimatedUsage, saleInput, run.started, run.ratio, run.saleFX)
 	if err != nil {
 		run.code = "price_unavailable"
@@ -343,6 +301,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		return result
 	}
 	prepared.Input.Headers = make(map[string]string)
+	prepared.Input.DeferredHeaders = nil
 	for key, values := range prepared.Prepared.Headers() {
 		prepared.Input.Headers[strings.ToLower(key)] = strings.Join(values, ",")
 	}
@@ -365,13 +324,39 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		run.code = "price_unavailable"
 		return skipped
 	}
-	ctx, err := budget.Start()
+	comparison, err := service.GatewayComparisonCost(c.Request.Context(), estimatedCost)
 	if err != nil {
-		run.code = "first_byte_budget"
-		return result
+		run.code = "price_unavailable"
+		return skipped
+	}
+	profitable, err := service.GatewayRouteProfitAllowed(comparison, reserveValue, run.offering.MinimumMarginRate)
+	if err != nil {
+		run.code = "price_unavailable"
+		return skipped
+	}
+	selection.LossFallback = false
+	if !profitable {
+		if run.offering.AllowLossFallback {
+			selection.LossFallback, err = selection.LossFallbackAllowed(c.Request.Context(), comparison, run.offering.MinimumMarginRate)
+		}
+		if err != nil || !selection.LossFallback {
+			run.code = "channel_unavailable"
+			return skipped
+		}
+	}
+	selection.Diagnostics["estimated_cost"] = comparison.String()
+	selection.Diagnostics["loss_fallback"] = selection.LossFallback
+	ctx, err := info.BeginProviderCall()
+	if err != nil {
+		if errors.Is(err, service.ErrGatewayBudget) || parent.Context().Err() != nil {
+			run.code = "first_byte_budget"
+			return result
+		}
+		run.code = "channel_unavailable"
+		return skipped
 	}
 	c.Request = parent.WithContext(ctx)
-	attempt := &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: run.id, ChannelID: selection.Channel.ID, ProviderID: selection.Provider.Id, ModelID: selection.Channel.ModelID, StartedAt: at.UnixMilli(), PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, AccountingFXRate: purchaseRate, Cost: money.Amount{Currency: purchase.Currency}, ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, UsageSource: "none", RouteDiagnostics: selection.Diagnostics, CircuitAction: "none", ConversionLosses: []string{}}
+	attempt := &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: run.id, ChannelID: selection.Channel.ID, ProviderID: selection.Provider.Id, ModelID: selection.Channel.ModelID, StartedAt: at.UnixMilli(), PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, AccountingFXRate: purchaseRate, Cost: money.Amount{Currency: purchase.Currency}, ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, UsageSource: "none", RouteDiagnostics: selection.Diagnostics, CircuitAction: "none", ConversionLosses: selection.ConversionLosses}
 	for _, member := range run.offering.Members {
 		if member.ModelID == selection.Channel.ModelID {
 			attempt.MemberTier = member.Tier
@@ -401,6 +386,10 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	if err != nil {
 		transport = true
 		apiErr = types.NewError(err, types.ErrorCodeDoRequestFailed)
+		var rejection *types.NewAPIError
+		if errors.As(err, &rejection) && rejection.GetErrorCode() != types.ErrorCodeDoRequestFailed && rejection.StatusCode >= 100 && (!budget.TimedOut() || rejection.StatusCode != 500) {
+			apiErr, status, transport = rejection, rejection.StatusCode, false
+		}
 	} else if upstream, ok := response.(*http.Response); !ok || upstream == nil {
 		apiErr = types.NewError(errors.New("missing media response"), types.ErrorCodeBadResponse)
 	} else {
@@ -503,6 +492,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	}
 	failure := service.ClassifyGatewayFailure(status, code, transport, budget.TimedOut(), parent.Context().Err() != nil, facts.DownstreamWriteFailed, errorType)
 	if attempt.Status == "success" {
+		service.RecordGatewayChannelAffinity(c, selection)
 		failure = service.GatewayFailure{}
 		if run.record.ErrorCode != "billing_evaluation_failed" {
 			run.record.ErrorCode = ""

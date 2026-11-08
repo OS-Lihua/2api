@@ -4353,24 +4353,164 @@ func TestMediaGatewayImagesUseOfferingWalletAndActualPayload(t *testing.T) {
 	assert.Empty(t, reconciliation.Mismatches)
 }
 
-func TestMediaGatewayAlibabaPluginImagesUseGatewayMoney(t *testing.T) {
+func TestMediaGatewaySharedRouteFiltersProfitAndQuota(t *testing.T) {
+	for _, kind := range []protocol.Type{protocol.OpenAIImages, protocol.OpenAIAudioSpeech, protocol.OpenAIAudioTranscription} {
+		for _, policy := range []string{"profit", "rpm"} {
+			t.Run(string(kind)+"/"+policy, func(t *testing.T) {
+				var firstCalls, secondCalls atomic.Int64
+				contentType, body := "application/json", []byte(`{"data":{"url":"https://image.invalid/one"}}`)
+				if kind == protocol.OpenAIAudioSpeech {
+					contentType, body = "audio/pcm", make([]byte, 48000)
+				}
+				if kind == protocol.OpenAIAudioTranscription {
+					body = []byte(`{"text":"hello"}`)
+				}
+				fixture := newMediaGatewayFixture(t, kind, func(w http.ResponseWriter, r *http.Request) {
+					firstCalls.Add(1)
+					w.Header().Set("Content-Type", contentType)
+					_, _ = w.Write(body)
+				})
+				fixture.offering.RouteMethod, fixture.offering.AllowLossFallback = "weight", false
+				require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+				selectedID := fixture.channel.ID
+				if policy == "profit" {
+					fallback := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+						secondCalls.Add(1)
+						w.Header().Set("Content-Type", contentType)
+						_, _ = w.Write(body)
+					})
+					require.NoError(t, model.DB.Model(fallback).Update("protocol", kind).Error)
+					selectedID = fallback.ID
+					fixture.fake.Advance(time.Second)
+					price := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("request",fixed(0.08))`, EffectiveAt: clock.Now().Unix()}
+					if err := model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy); err != nil {
+						var confirmation *model.MarginConfirmationError
+						require.ErrorAs(t, err, &confirmation)
+						price.MarginConfirmation = confirmation.Report.Revision
+						require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+					}
+				} else {
+					require.NoError(t, model.DB.Model(fixture.channel).Update("rpm", int64(1)).Error)
+				}
+				requests := 1
+				if policy == "rpm" {
+					requests = 2
+				}
+				for index := range requests {
+					request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gateway-alias","prompt":"draw","n":1}`))
+					request.Header.Set("Content-Type", "application/json")
+					if kind == protocol.OpenAIAudioSpeech {
+						request = httptest.NewRequest(http.MethodPost, "/v1/audio/speech", strings.NewReader(`{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm"}`))
+						request.Header.Set("Content-Type", "application/json")
+					}
+					if kind == protocol.OpenAIAudioTranscription {
+						request = mediaMultipartRequest(t, "/v1/audio/transcriptions", map[string]string{"model": "gateway-alias"}, "file", mediaWAV(t, 8000, 16000, make([]byte, 16000)))
+					}
+					request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+					response := httptest.NewRecorder()
+					fixture.engine.ServeHTTP(response, request)
+					if index > 0 {
+						assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+						continue
+					}
+					require.Equal(t, http.StatusOK, response.Code)
+					attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+					require.NoError(t, err)
+					require.EqualValues(t, 1, total)
+					assert.Equal(t, selectedID, attempts[0].ChannelID)
+					assert.Equal(t, "weight", attempts[0].RouteDiagnostics["method"])
+				}
+				if policy == "profit" {
+					assert.Zero(t, firstCalls.Load())
+					assert.EqualValues(t, 1, secondCalls.Load())
+				} else {
+					assert.EqualValues(t, 1, firstCalls.Load())
+				}
+			})
+		}
+	}
+}
+
+func TestMediaGatewaySharedRouteRechecksAfterOAuthPreparation(t *testing.T) {
+	for _, change := range []string{"provider", "price"} {
+		t.Run(change, func(t *testing.T) {
+			var oauthCalls, modelCalls atomic.Int32
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
+				modelCalls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"predictions":[{"bytesBase64Encoded":"eA==","mimeType":"image/png"}]}`)
+			})
+			fixture.offering.AllowLossFallback = false
+			require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+			private, err := rsa.GenerateKey(cryptorand.Reader, 2048)
+			require.NoError(t, err)
+			der, err := x509.MarshalPKCS8PrivateKey(private)
+			require.NoError(t, err)
+			credentials, err := common.Marshal(map[string]string{"project_id": "media-route-project", "client_email": "media-route@example.invalid", "private_key": string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})), "private_key_id": change})
+			require.NoError(t, err)
+			quiet := model.DB.Session(&gorm.Session{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
+			require.NoError(t, quiet.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeVertexAi, "key": string(credentials), "other": `{"default":"us-central1"}`}).Error)
+			require.NoError(t, quiet.Model(fixture.channel).Update("upstream_model_name", "imagen-4.0-generate-001").Error)
+			client := service.GetHttpClient()
+			original := client.Transport
+			t.Cleanup(func() { client.Transport = original })
+			client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
+				if request.URL.Host != "www.googleapis.com" || request.URL.Path != "/oauth2/v4/token" {
+					return original.RoundTrip(request)
+				}
+				oauthCalls.Add(1)
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.Less(t, wallet.Balance.Nanos, int64(1_000_000_000), "OAuth follows the sole reservation")
+				if change == "provider" {
+					require.NoError(t, quiet.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("status", common.ChannelStatusManuallyDisabled).Error)
+				} else {
+					fixture.fake.Advance(time.Second)
+					price := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("request",fixed(0.08))`, EffectiveAt: clock.Now().Unix()}
+					if err := model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy); err != nil {
+						var confirmation *model.MarginConfirmationError
+						require.ErrorAs(t, err, &confirmation)
+						price.MarginConfirmation = confirmation.Report.Revision
+						require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+					}
+				}
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"access_token":"media-route-test-access","expires_in":3600}`))}, nil
+			})
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", `{"model":"gateway-alias","prompt":"draw","n":1}`)
+			assert.GreaterOrEqual(t, response.Code, 400)
+			assert.EqualValues(t, 1, oauthCalls.Load())
+			assert.Zero(t, modelCalls.Load())
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Zero(t, record.Receivable.Nanos)
+			_, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			assert.Zero(t, total)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1_000_000_000), wallet.Balance.Nanos)
+		})
+	}
+}
+
+func TestMediaGatewayHostImagesRetainTaskPluginCandidates(t *testing.T) {
 	generation := jsplugin.DefaultRegistry.Generation()
 	require.NotNil(t, generation)
 	plugin, present := generation.Get("alibaba")
 	require.True(t, present)
-	require.Contains(t, plugin.Meta.Models, "qwen-image")
+	require.Contains(t, plugin.Meta.Models, "qwen-image-2.0")
 	calls := 0
 	fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		assert.Contains(t, r.URL.Path, "/multimodal-generation/generation")
 		var wire map[string]any
 		require.NoError(t, common.DecodeJson(r.Body, &wire))
-		assert.Equal(t, "qwen-image", wire["model"])
+		assert.Equal(t, "qwen-image-2.0", wire["model"])
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"output":{"choices":[{"message":{"content":[{"image":"https://image.invalid/one"}]}}]},"usage":{"image_count":1}}`)
 	})
 	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeAli).Error)
-	require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", "qwen-image").Error)
+	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"upstream_model_name": "qwen-image-2.0", "protocol": protocol.Type("task:alibaba")}).Error)
 	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", `{"model":"gateway-alias","prompt":"draw","n":1}`)
 	assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
 	assert.Equal(t, 1, calls)
@@ -5623,6 +5763,8 @@ func TestMediaGatewaySkipsQuantityBeyondFrozenReservationAndContinues(t *testing
 				w.WriteHeader(503)
 				_, _ = io.WriteString(w, `{"error":{"type":"upstream_error","code":"overloaded"},"usage":{"input_tokens":7,"output_tokens":0}}`)
 			})
+			fixture.offering.RouteMethod = "weight"
+			require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
 			require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", fmt.Sprintf(`{"n":%d}`, tc.initialCount)).Error)
 			second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				var wire struct {
