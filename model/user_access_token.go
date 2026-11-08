@@ -1,6 +1,7 @@
 package model
 
 import (
+	"crypto/subtle"
 	"errors"
 	"strconv"
 	"strings"
@@ -246,6 +247,23 @@ func ParseAccessTokenSessionID(sid string) (int, bool) {
 		return 0, false
 	}
 	return id, true
+}
+
+// ValidateLegacyAccessTokenWithTx binds a legacy request to the same current
+// user and secret while holding the user's authentication row through commit.
+func ValidateLegacyAccessTokenWithTx(tx *gorm.DB, identity AuthSessionIdentity, raw string) (*User, error) {
+	if identity.UserID <= 0 || raw == "" || LegacyAccessTokensRetired(common.GetTimestamp()) {
+		return nil, ErrUserSessionInactive
+	}
+	var user User
+	if err := lockForUpdate(tx).First(&user, identity.UserID).Error; err != nil {
+		return nil, err
+	}
+	if user.Status != common.UserStatusEnabled || user.AuthVersion != identity.UserAuthVersion || user.AccessToken == nil ||
+		subtle.ConstantTimeCompare([]byte(*user.AccessToken), []byte(raw)) != 1 {
+		return nil, ErrUserSessionInactive
+	}
+	return &user, nil
 }
 
 // ValidateAccessTokenIdentity checks a token-bound step-up identity without
