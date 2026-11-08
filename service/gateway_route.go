@@ -156,18 +156,9 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 			}
 			active = append(active, &GatewaySelection{Channel: candidate, Provider: provider, Tier: tier})
 		}
-		hasReady := slices.ContainsFunc(active, func(selection *GatewaySelection) bool {
-			snapshot := health[selection.Channel.ID]
-			return snapshot.Circuit == "closed" || snapshot.Circuit == "open" && snapshot.RetryAt <= clock.Now().UnixMilli()
+		hasClosed := slices.ContainsFunc(active, func(selection *GatewaySelection) bool {
+			return health[selection.Channel.ID].Circuit == "closed"
 		})
-		var earliest *GatewaySelection
-		if !hasReady {
-			for _, selection := range active {
-				if earliest == nil || health[selection.Channel.ID].RetryAt < health[earliest.Channel.ID].RetryAt {
-					earliest = selection
-				}
-			}
-		}
 		eligible := []*GatewaySelection{}
 		priced := []*GatewaySelection{}
 		unprofitable := []*GatewaySelection{}
@@ -175,7 +166,9 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 			id := selection.Channel.ID
 			snapshot := health[id]
 			ready := snapshot.Circuit == "closed" || snapshot.Circuit == "open" && snapshot.RetryAt <= clock.Now().UnixMilli()
-			if !ready && (hasReady || selection != earliest) {
+			// Keep the full all-open set for Manager's atomic lease fence and
+			// earliest-probe choice after candidate validation.
+			if !ready && hasClosed {
 				reject(id, "circuit_open")
 				lastStage = max(lastStage, 3)
 				continue

@@ -17,6 +17,7 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
@@ -109,11 +110,11 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 	}
 	common.SetContextKey(candidate, constant.ContextKeyOriginalModel, info.TokenizerModel)
 	tokens, err := service.CountRequestToken(candidate, effective.GetTokenCountMeta(), info)
-	if err != nil || !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, tokens) {
+	if err != nil {
 		return nil, service.ErrGatewayCapability
 	}
 	selection.InputTokens = tokens
-	if effective.GetMaxTokens() == 0 && (selection.Capabilities.Limits.MaxOutputTokens != nil || selection.Capabilities.Limits.ContextLength != nil) {
+	if selection.Capabilities.Limits.MaxOutputTokens != nil || selection.Capabilities.Limits.ContextLength != nil {
 		var limit int64
 		if output := selection.Capabilities.Limits.MaxOutputTokens; output != nil {
 			limit = *output
@@ -129,17 +130,23 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 		if limit <= 0 {
 			return nil, service.ErrGatewayCapability
 		}
-		request.MaxCompletionTokens = common.GetPointer(uint(limit))
-		encoded, err = adaptor.SetChatOutputLimit(converted, encoded, uint(limit))
-		if err == nil {
-			effective, err = adaptor.ProjectChatRequest(info, converted, request, encoded)
+		convertedDefaultExceedsLimit := original.GetMaxTokens() == 0 && len(info.ParamOverride) == 0 && effective.GetMaxTokens() > uint(limit)
+		if effective.GetMaxTokens() == 0 || convertedDefaultExceedsLimit {
+			request.MaxCompletionTokens = common.GetPointer(uint(limit))
+			encoded, err = adaptor.SetChatOutputLimit(converted, encoded, uint(limit))
+			if err == nil {
+				effective, err = adaptor.ProjectChatRequest(info, converted, request, encoded)
+			}
+			if err != nil {
+				return nil, service.ErrGatewayCapability
+			}
+			if _, err = helper.ValidateTextRequest(candidate, effective, relayconstant.RelayModeChatCompletions); err != nil {
+				return nil, service.ErrGatewayCapability
+			}
 		}
-		if err != nil {
-			return nil, service.ErrGatewayCapability
-		}
-		if _, err = helper.ValidateTextRequest(candidate, effective, relayconstant.RelayModeChatCompletions); err != nil || !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, tokens) {
-			return nil, service.ErrGatewayCapability
-		}
+	}
+	if !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, tokens) {
+		return nil, service.ErrGatewayCapability
 	}
 	if limit := effective.GetMaxTokens(); limit > 0 {
 		mean = min(mean, int64(limit))
@@ -172,6 +179,9 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 		return nil, service.ErrGatewayConversion
 	}
 	for _, diagnostic := range info.ConversionDiagnostics() {
+		if diagnostic.Severity == types.ConversionDiagnosticError {
+			return nil, service.ErrGatewayConversion
+		}
 		if !slices.Contains(losses, diagnostic.Code) {
 			losses = append(losses, diagnostic.Code)
 		}

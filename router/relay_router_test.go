@@ -966,6 +966,67 @@ func TestTextGatewayRouteOccupiedProbeContinuesToNextTier(t *testing.T) {
 	}
 }
 
+func TestTextGatewayAllOpenProbeRemainsExclusiveAfterRetryOrderChanges(t *testing.T) {
+	for _, shared := range []bool{false, true} {
+		t.Run(fmt.Sprintf("redis=%t", shared), func(t *testing.T) {
+			var calls atomic.Int32
+			upstream := func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+			}
+			fixture := newTextGatewayFixture(t, upstream)
+			second := addTextGatewayChannel(t, fixture, upstream)
+			manager := service.ChannelHealth
+			observer := manager
+			if shared {
+				server := miniredis.RunT(t)
+				client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+				t.Cleanup(func() { require.NoError(t, client.Close()) })
+				manager, observer = channelhealth.New(client), channelhealth.New(client)
+				service.ChannelHealth = manager
+			}
+			ctx := t.Context()
+			ordinary, err := observer.Acquire(ctx, []int{fixture.channel.ID})
+			require.NoError(t, err)
+			require.Empty(t, ordinary.Lease)
+			for _, sample := range []channelhealth.Sample{
+				{AttemptID: "open-one", ChannelID: fixture.channel.ID, ProviderFailure: true, RateLimited: true, RetryAfter: "60"},
+				{AttemptID: "open-two", ChannelID: second.ID, ProviderFailure: true, RateLimited: true, RetryAfter: "120"},
+			} {
+				_, err = observer.Record(ctx, sample)
+				require.NoError(t, err)
+			}
+			probe, err := observer.Acquire(ctx, []int{fixture.channel.ID, second.ID})
+			require.NoError(t, err)
+			require.Equal(t, fixture.channel.ID, probe.ChannelID)
+			require.NotEmpty(t, probe.Lease)
+			defer observer.Release(ctx, probe)
+			_, err = observer.Record(ctx, channelhealth.Sample{AttemptID: "late-ordinary", ChannelID: fixture.channel.ID,
+				ProviderFailure: true, RateLimited: true, RetryAfter: "172800", Lease: ordinary.Lease})
+			require.NoError(t, err)
+			body := `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+			require.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+			assert.Zero(t, calls.Load())
+			_, total, err := model.ListGatewayAttempts(ctx, response.Header().Get(common.RequestIdKey), 0, 10)
+			require.NoError(t, err)
+			assert.Zero(t, total)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
+			require.NoError(t, observer.Release(ctx, probe))
+			response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			attempts, total, err := model.ListGatewayAttempts(ctx, response.Header().Get(common.RequestIdKey), 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, second.ID, attempts[0].ChannelID)
+			assert.EqualValues(t, 1, calls.Load())
+		})
+	}
+}
+
 func TestTextGatewayRouteVertexOAuthWaitsForReservationAndBudget(t *testing.T) {
 	var oauthCalls, modelCalls atomic.Int32
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1204,6 +1265,27 @@ func TestTextGatewayRouteFiltersConversionLossBeforeSending(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 1, total)
 	assert.Equal(t, []string{"claude_budget_adjusted"}, attempts[0].ConversionLosses)
+
+	t.Run("allowed code cannot override a hard media error", func(t *testing.T) {
+		unified.Capabilities.InputModalities = append(unified.Capabilities.InputModalities, capability.Audio)
+		require.NoError(t, model.DB.Model(&unified).Update("capabilities", unified.Capabilities).Error)
+		require.NoError(t, model.DB.Model(fixture.offering).Update("accepted_conversion_losses", `["unsupported_media_type"]`).Error)
+		before, err := model.GetUserWallet(fixture.user.Id)
+		require.NoError(t, err)
+		audio, err := os.ReadFile("../controller/probe-fixtures/seven.wav")
+		require.NoError(t, err)
+		audioBody := fmt.Sprintf(`{"model":"gateway-alias","messages":[{"role":"user","content":[{"type":"text","text":"Hello"},{"type":"input_audio","input_audio":{"data":%q,"format":"wav"}}]}],"max_tokens":16}`, base64.StdEncoding.EncodeToString(audio))
+		response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", audioBody)
+		assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), "unsupported_parameter")
+		assert.EqualValues(t, 1, calls.Load(), "hard conversion failure must not contact the Provider")
+		_, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+		require.NoError(t, err)
+		assert.Zero(t, total)
+		after, err := model.GetUserWallet(fixture.user.Id)
+		require.NoError(t, err)
+		assert.Equal(t, before.Balance, after.Balance)
+	})
 }
 
 func TestTextGatewayRouteRotatesOnlyTheSelectedProviderKey(t *testing.T) {
@@ -4615,6 +4697,41 @@ func TestTextGatewayDefaultOutputLimitFitsRemainingContext(t *testing.T) {
 			} else {
 				assert.EqualValues(t, test.limit, sent["max_completion_tokens"])
 			}
+		})
+	}
+	for _, test := range []struct {
+		name, field, path, response string
+		upstream                    protocol.Type
+	}{
+		{"Claude converted limit", "max_tokens", "max_tokens", `{"id":"bounded","type":"message","role":"assistant","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":9,"output_tokens":1}}`, protocol.AnthropicMessages},
+		{"Responses converted limit", "max_output_tokens", "max_output_tokens", `{"id":"bounded","object":"response","status":"completed","output":[{"type":"message","id":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"OK","annotations":[]}]}],"usage":{"input_tokens":9,"output_tokens":1,"total_tokens":10}}`, protocol.OpenAIResponses},
+		{"Gemini converted limit", "maxOutputTokens", "generationConfig.maxOutputTokens", `{"candidates":[{"content":{"parts":[{"text":"OK"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":1,"totalTokenCount":10}}`, protocol.GeminiGenerate},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var sent map[string]any
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				require.NoError(t, common.DecodeJson(r.Body, &sent))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, test.response)
+			})
+			caps := capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{MaxOutputTokens: common.GetPointer(int64(16))}}
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", test.upstream).Error)
+			price := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: fmt.Sprintf(`param(%q) == 16 ? tier("bounded",fixed(0.000001)) : tier("unbounded",fixed(0.000002))`, test.path), EffectiveAt: clock.Now().Unix()}
+			require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}]}`)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			wire := sent
+			if test.upstream == protocol.GeminiGenerate {
+				config, ok := sent["generationConfig"].(map[string]any)
+				require.True(t, ok)
+				wire = config
+			}
+			assert.EqualValues(t, 16, wire[test.field], "the actual upstream body must carry the validated limit")
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, "0.000001 USD", attempts[0].RouteDiagnostics["estimated_cost"], "procurement probes must use the same bounded wire body")
 		})
 	}
 }

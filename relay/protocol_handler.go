@@ -87,7 +87,8 @@ func (a *ChannelAdaptor) ProjectChatRequest(info *relaycommon.RelayInfo, convert
 	if projector, ok := converted.(channel.ChatRequestProjector); ok {
 		return projector.ProjectChatRequest(body, *public)
 	}
-	if _, ok := converted.(*dto.GeneralOpenAIRequest); ok {
+	switch converted.(type) {
+	case dto.GeneralOpenAIRequest, *dto.GeneralOpenAIRequest:
 		var effective dto.GeneralOpenAIRequest
 		if err := common.Unmarshal(body, &effective); err != nil {
 			return nil, err
@@ -97,8 +98,29 @@ func (a *ChannelAdaptor) ProjectChatRequest(info *relaycommon.RelayInfo, convert
 	if len(info.ParamOverride) > 0 {
 		return nil, errors.New("native request overrides require a wire projection")
 	}
-	// An unchanged native conversion retains the already validated public facts.
+	// An unchanged native conversion retains the public input facts while its
+	// output budget is read from the final protocol body.
 	effective := *public
+	switch converted.(type) {
+	case dto.ClaudeRequest, *dto.ClaudeRequest:
+		var wire dto.ClaudeRequest
+		if err := common.Unmarshal(body, &wire); err != nil {
+			return nil, err
+		}
+		effective.MaxTokens, effective.MaxCompletionTokens = nil, wire.MaxTokens
+	case dto.OpenAIResponsesRequest, *dto.OpenAIResponsesRequest:
+		var wire dto.OpenAIResponsesRequest
+		if err := common.Unmarshal(body, &wire); err != nil {
+			return nil, err
+		}
+		effective.MaxTokens, effective.MaxCompletionTokens = nil, wire.MaxOutputTokens
+	case dto.GeminiChatRequest, *dto.GeminiChatRequest:
+		var wire dto.GeminiChatRequest
+		if err := common.Unmarshal(body, &wire); err != nil {
+			return nil, err
+		}
+		effective.MaxTokens, effective.MaxCompletionTokens = nil, wire.GenerationConfig.MaxOutputTokens
+	}
 	return &effective, nil
 }
 
@@ -106,7 +128,17 @@ func (a *ChannelAdaptor) SetChatOutputLimit(converted any, body []byte, limit ui
 	if setter, ok := converted.(channel.ChatOutputLimitSetter); ok {
 		return setter.SetChatOutputLimit(body, limit)
 	}
-	if _, ok := converted.(*dto.GeneralOpenAIRequest); !ok {
+	field := ""
+	switch converted.(type) {
+	case dto.GeneralOpenAIRequest, *dto.GeneralOpenAIRequest:
+		field = "max_completion_tokens"
+	case dto.ClaudeRequest, *dto.ClaudeRequest:
+		field = "max_tokens"
+	case dto.OpenAIResponsesRequest, *dto.OpenAIResponsesRequest:
+		field = "max_output_tokens"
+	case dto.GeminiChatRequest, *dto.GeminiChatRequest:
+		field = "generationConfig"
+	default:
 		return body, nil
 	}
 	var wire map[string]common.RawMessage
@@ -117,7 +149,23 @@ func (a *ChannelAdaptor) SetChatOutputLimit(converted any, body []byte, limit ui
 	if err != nil {
 		return nil, err
 	}
-	wire["max_completion_tokens"] = encoded
+	if field == "generationConfig" {
+		var config map[string]common.RawMessage
+		if raw := wire[field]; len(raw) > 0 {
+			if err := common.Unmarshal(raw, &config); err != nil {
+				return nil, err
+			}
+		}
+		if config == nil {
+			config = map[string]common.RawMessage{}
+		}
+		config["maxOutputTokens"] = encoded
+		encoded, err = common.Marshal(config)
+		if err != nil {
+			return nil, err
+		}
+	}
+	wire[field] = encoded
 	return common.Marshal(wire)
 }
 
