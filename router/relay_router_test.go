@@ -560,6 +560,31 @@ func TestTextGatewayModelFallbackPreservesLayerAndRequestBoundaries(t *testing.T
 	}
 }
 
+func TestTextGatewayModelFallbackBeforeBusinessKeepsFinalHTTPStatus(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"error\":{\"code\":\"overloaded\"},\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n")
+	})
+	fallback := addTextGatewayMember(t, fixture, 2, func(w http.ResponseWriter, r *http.Request) { t.Error("incapable lower member must not be dispatched") })
+	caps := capability.Set{Features: []capability.Feature{capability.Streaming}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{MaxOutputTokens: common.GetPointer(int64(1))}}
+	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fallback.ModelID).Update("capabilities", caps).Error)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	assert.Equal(t, 400, response.Code, response.Body.String())
+	assert.Contains(t, response.Result().Header.Get("Content-Type"), "application/json")
+	assert.Contains(t, response.Body.String(), `"code":"unsupported_parameter"`)
+	assert.NotContains(t, response.Body.String(), `"role":"assistant"`)
+	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+	require.NoError(t, err)
+	assert.Zero(t, record.Receivable.Nanos)
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, int64(7000), attempts[0].Cost.Nanos)
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1_000_000_000), wallet.Balance.Nanos)
+}
+
 func TestTextGatewayModelFallbackFinalFilterDeterminesStatus(t *testing.T) {
 	for _, tc := range []struct {
 		name          string

@@ -34,6 +34,7 @@ import (
 )
 
 func gatewayError(c *gin.Context, status int, code, message string) {
+	c.Header("Content-Type", "application/json")
 	c.AbortWithStatusJSON(status, gin.H{"error": types.OpenAIError{Code: code, Type: "gateway_error", Message: message}})
 }
 
@@ -118,7 +119,7 @@ func TextGateway(c *gin.Context) {
 		return
 	}
 	if run.status != 0 {
-		if strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream") {
+		if c.Writer.Written() && strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream") {
 			_ = helper.ObjectData(c, gin.H{"error": types.OpenAIError{Code: run.code, Type: "gateway_error", Message: run.message}})
 		} else if !c.Writer.Written() {
 			gatewayError(c, run.status, run.code, run.message)
