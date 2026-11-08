@@ -22,6 +22,10 @@ type gatewayDeliveryWriter struct {
 	err       error
 }
 
+func (w *gatewayDeliveryWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 func (w *gatewayDeliveryWriter) Write(data []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()

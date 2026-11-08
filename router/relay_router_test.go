@@ -380,6 +380,62 @@ func TestTextGatewayModelFallbackKeepsOfferingPrice(t *testing.T) {
 	assert.Empty(t, reconciliation.Mismatches)
 }
 
+type gatewayDeadlineListener struct {
+	net.Listener
+	deadlines chan time.Time
+}
+
+func (l gatewayDeadlineListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return gatewayDeadlineConn{Conn: conn, deadlines: l.deadlines}, nil
+}
+
+type gatewayDeadlineConn struct {
+	net.Conn
+	deadlines chan time.Time
+}
+
+func (c gatewayDeadlineConn) SetWriteDeadline(deadline time.Time) error {
+	if !deadline.IsZero() {
+		select {
+		case c.deadlines <- deadline:
+		default:
+		}
+	}
+	return c.Conn.SetWriteDeadline(deadline)
+}
+
+func TestTextGatewayModelFallbackPreservesConnectionWriteDeadline(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	})
+	deadlines := make(chan time.Time, 1)
+	server := httptest.NewUnstartedServer(fixture.engine)
+	server.Listener = gatewayDeadlineListener{Listener: server.Listener, deadlines: deadlines}
+	server.Start()
+	t.Cleanup(server.Close)
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`))
+	require.NoError(t, err)
+	request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := server.Client().Do(request)
+	require.NoError(t, err)
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	assert.Equal(t, 200, response.StatusCode, string(body))
+	assert.Contains(t, string(body), "Hello")
+	select {
+	case <-deadlines:
+	default:
+		t.Error("gateway streaming writes must retain the real connection write deadline")
+	}
+}
+
 func TestTextGatewayModelFallbackStreamHeaderDescribesDeliveredModel(t *testing.T) {
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
