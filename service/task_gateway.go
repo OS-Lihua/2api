@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/http"
 	"time"
 
 	"github.com/QuantumNous/new-api/model"
@@ -38,24 +39,74 @@ func GatewayTaskProviderIdentity(task *model.Task) (*model.Provider, error) {
 // GatewayTaskProvider resolves one enabled credential for a persisted operation.
 // Operational address, keys, proxy and headers stay in Provider configuration.
 func GatewayTaskProvider(task *model.Task) (*model.Provider, error) {
+	provider, _, err := GatewayTaskProviderWithContext(context.Background(), task)
+	return provider, err
+}
+
+// GatewayTaskProviderWithContext selects one current credential and retains its
+// actual slot for polling and content preparation. Later I/O rechecks this slot.
+func GatewayTaskProviderWithContext(ctx context.Context, task *model.Task) (*model.Provider, int, error) {
 	provider, err := GatewayTaskProviderIdentity(task)
 	if err != nil || task.PrivateData.Gateway == nil {
-		return provider, err
+		return provider, 0, err
 	}
-	key, _, keyErr := provider.GetNextEnabledKey()
+	key, index, keyErr := provider.PreviewEnabledKey()
 	if keyErr != nil || key == "" {
-		return nil, fmt.Errorf("task Provider has no available credential")
+		return nil, 0, fmt.Errorf("task Provider has no available credential")
+	}
+	if err := provider.CommitRouteKey(ctx, key, index); err != nil {
+		return nil, 0, err
 	}
 	pinned := *provider
 	pinned.Key = key
 	pinned.ProviderInfo.IsMultiKey = false
-	return &pinned, nil
+	return &pinned, index, nil
+}
+
+// GatewayTaskCredentialCheck retains only a request-scoped authority check for
+// the original Provider and the credential actually chosen for this operation.
+// It never stores credentials on the task or substitutes a newly configured key.
+func GatewayTaskCredentialCheck(task *model.Task, key string, index int) func(context.Context) error {
+	if task == nil || task.PrivateData.Gateway == nil {
+		return nil
+	}
+	provider, err := GatewayTaskProviderIdentity(task)
+	return func(ctx context.Context) error {
+		if err != nil || index < 0 {
+			return model.ErrProviderStatusConflict
+		}
+		return provider.ValidateRouteKey(ctx, key, index)
+	}
+}
+
+// GatewayTaskHTTPTransport validates the same authority before each network
+// exchange, including redirects and plugin helper fetches.
+func GatewayTaskHTTPTransport(transport http.RoundTripper, authorize func(context.Context) error) http.RoundTripper {
+	if authorize == nil {
+		return transport
+	}
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	return gatewayTaskHTTPTransport{RoundTripper: transport, authorize: authorize}
+}
+
+type gatewayTaskHTTPTransport struct {
+	http.RoundTripper
+	authorize func(context.Context) error
+}
+
+func (transport gatewayTaskHTTPTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if err := transport.authorize(request.Context()); err != nil {
+		return nil, err
+	}
+	return transport.RoundTripper.RoundTrip(request)
 }
 
 // UpdateGatewayTask polls one accepted task using its original Provider.
 // Identical private task IDs at other Providers cannot collide.
 func UpdateGatewayTask(ctx context.Context, task *model.Task) error {
-	provider, err := GatewayTaskProvider(task)
+	provider, keyIndex, err := GatewayTaskProviderWithContext(ctx, task)
 	if err != nil {
 		return err
 	}
@@ -66,10 +117,10 @@ func UpdateGatewayTask(ctx context.Context, task *model.Task) error {
 	upstreamID := task.GetUpstreamTaskID()
 	tasks := map[string]*model.Task{upstreamID: task}
 	if batch, ok := adaptor.(BatchTaskPollingAdaptor); ok && batch.FetchMode() == "batch" {
-		return updateBatchTasks(ctx, batch, provider.Id, []string{upstreamID}, tasks, provider)
+		return updateBatchTasks(ctx, batch, provider.Id, []string{upstreamID}, tasks, gatewayTaskProviderSelection{Provider: provider, KeyIndex: keyIndex})
 	}
 	adaptor.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{
-		ChannelType: provider.Type, ChannelId: provider.Id, ChannelBaseUrl: provider.GetBaseURL(), ChannelSetting: provider.GetSetting(), HeadersOverride: provider.GetHeaderOverride(), ApiKey: provider.Key,
+		ChannelType: provider.Type, ChannelId: provider.Id, ChannelBaseUrl: provider.GetBaseURL(), ChannelSetting: provider.GetSetting(), HeadersOverride: provider.GetHeaderOverride(), ApiKey: provider.Key, ChannelMultiKeyIndex: keyIndex,
 	}})
 	return updateVideoSingleTask(ctx, adaptor, provider, upstreamID, tasks)
 }

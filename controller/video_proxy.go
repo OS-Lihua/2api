@@ -93,7 +93,7 @@ func VideoProxy(c *gin.Context) {
 				if artifact.Type != "video" {
 					continue
 				}
-				adaptor, adaptorErr := initTaskArtifactAdaptor(task)
+				adaptor, adaptorErr := initTaskArtifactAdaptor(c.Request.Context(), task)
 				if adaptorErr == nil {
 					if provider, ok := adaptor.(relaychannel.TaskContentRequestProvider); ok {
 						descriptor, adaptorErr = provider.BuildContentRequest(c.Request.Context(), task, artifact.Key, relaychannel.TaskArtifactClientRequest{
@@ -210,7 +210,7 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		}
 	}
 
-	channel, err := service.GatewayTaskProvider(task)
+	channel, err := service.GatewayTaskProviderIdentity(task)
 	if err != nil {
 		return &taskMediaProxyError{
 			status: http.StatusServiceUnavailable, code: "artifact_plugin_unavailable",
@@ -265,6 +265,7 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 	client = taskMediaRedirectClient(client, proxy, c, clientHeaders, descriptor.Credentialless)
 	clientWithoutBodyTimeout := *client
 	clientWithoutBodyTimeout.Timeout = 0
+	clientWithoutBodyTimeout.Transport = service.GatewayTaskHTTPTransport(client.Transport, descriptor.Authorize)
 	resp, err := doTaskMediaRequest(&clientWithoutBodyTimeout, req, taskMediaResponseHeaderTimeout)
 	if err != nil {
 		if errors.Is(err, errTaskMediaRequestRejected) {

@@ -28,6 +28,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/clock"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	taskjsplugin "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
@@ -215,30 +216,57 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 			failures         []string
 		)
 		rejectedPlugins := make(map[string][]string)
-		for _, candidate := range eligible {
+		type routePreparation struct {
+			binding       pluginruntime.RouteBinding
+			upstreamModel string
+		}
+		var preparations []routePreparation
+		for _, binding := range eligible {
+			offering := TextOffering(c)
+			if offering == nil {
+				preparations = append(preparations, routePreparation{binding: binding})
+				continue
+			}
+			modelIDs := make([]int, 0, len(offering.Members))
+			for _, member := range offering.Members {
+				modelIDs = append(modelIDs, member.ModelID)
+			}
+			var channels []model.Channel
+			if err := model.OfferingChannelsQuery(model.DB, offering, modelIDs).Where("channels.protocol = ? AND channels.status = ? AND channels.mapping_confirmed = ?", "task:"+binding.Plugin.Meta.Key, model.ChannelEnabled, true).
+				Where("channels.model_id IN (?)", model.DB.Model(&model.Model{}).Select("id").Where("status = ?", 1)).
+				Where("channels.provider_id IN (?)", model.DB.Model(&model.Provider{}).Select("id").Where("status = ?", common.ChannelStatusEnabled)).Order("channels.id").Find(&channels).Error; err != nil {
+				abortTaskPluginRouteError(c, http.StatusServiceUnavailable)
+				return
+			}
+			for _, channel := range channels {
+				preparations = append(preparations, routePreparation{binding: binding, upstreamModel: channel.UpstreamModelName})
+			}
+		}
+		if len(preparations) == 0 && TextOffering(c) != nil {
+			abortTaskPluginRouteError(c, http.StatusServiceUnavailable)
+			return
+		}
+		for _, preparation := range preparations {
+			candidate := preparation.binding
 			candidateContext := requestContext
 			candidateContext.Params = pluginruntime.RouteParams(c.Params, candidate.Route)
-			gatewayModel := ""
-			if offering := TextOffering(c); offering != nil {
-				modelIDs := make([]int, 0, len(offering.Members))
-				for _, member := range offering.Members {
-					modelIDs = append(modelIDs, member.ModelID)
-				}
-				var channels []model.Channel
-				if err := model.OfferingChannelsQuery(model.DB, offering, modelIDs).Where("channels.protocol = ?", "task:"+candidate.Plugin.Meta.Key).Order("channels.id").Find(&channels).Error; err != nil {
-					abortTaskPluginRouteError(c, http.StatusServiceUnavailable)
-					return
-				}
-				if len(channels) == 0 {
-					continue
-				}
-				gatewayModel = channels[0].UpstreamModelName
+			gatewayModel := preparation.upstreamModel
+			if gatewayModel != "" {
 				if bodyValue, ok := bodyObject["value"].(map[string]any); ok {
 					body := maps.Clone(bodyObject)
 					value := maps.Clone(bodyValue)
 					value["model"] = gatewayModel
 					body["value"] = value
 					candidateContext.Body = body
+				}
+				if len(candidateContext.BodyText) > 0 {
+					override := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ParamOverride: map[string]any{"model": gatewayModel}}}
+					raw, err := relaycommon.ApplyParamOverrideWithRelayInfo(candidateContext.BodyText, override)
+					if err != nil {
+						abortTaskPluginRouteError(c, http.StatusBadRequest)
+						return
+					}
+					candidateContext.BodyText = raw
 				}
 			}
 			var (
@@ -332,7 +360,11 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 				rejectedPlugins[detail] = append(rejectedPlugins[detail], candidate.Plugin.Meta.Key)
 				continue
 			}
-			accepted = append(accepted, candidate)
+			if !slices.ContainsFunc(accepted, func(binding pluginruntime.RouteBinding) bool {
+				return binding.Plugin == candidate.Plugin && binding.Route.Method == candidate.Route.Method && binding.Route.Path == candidate.Route.Path
+			}) {
+				accepted = append(accepted, candidate)
+			}
 			if resolved == nil {
 				resolved, resolvedIntent, resolvedContext, resolvedBodyText = result, intent, candidateContext, bodyText
 			}
@@ -588,6 +620,12 @@ func RouteTaskPluginEndpoint() gin.HandlerFunc {
 				}
 			}
 			if len(bindings) > 0 {
+				var message string
+				bindings, message = compatibleTaskProtocolBindings(c, bindings)
+				if message != "" {
+					abortWithOpenAiMessage(c, http.StatusBadRequest, message)
+					return
+				}
 				binding := bindings[0]
 				pinned := pluginruntime.PinnedEndpoint{Generation: generation, Plugin: binding.Plugin, Protocol: binding.Protocol, Operation: binding.Operation, Model: request.Model, MappedModel: binding.Model, Candidates: bindings}
 				c.Set(pluginruntime.ContextKeyPinnedEndpoint, pinned)
@@ -713,42 +751,13 @@ func PinTaskPluginEndpoint() gin.HandlerFunc {
 		c.Set(contextKeyTaskPluginEndpointModel, *modelRequest)
 		candidates := pinnedEndpoint.Candidates
 		binding := candidates[0]
-		if definition, known := pluginruntime.HostProtocol(binding.Protocol); known && len(definition.DefinedModes()) > 0 {
-			stream, background := jsonBodyBoolFlags(c)
-			required := make([]string, 0, 2)
-			if stream {
-				required = append(required, "stream")
-			}
-			if background {
-				required = append(required, "background")
-			}
-			if !stream && !background {
-				required = append(required, "sync")
-			}
-			unfiltered := candidates
-			filtered := make([]pluginruntime.ProtocolBinding, 0, len(candidates))
-			for _, candidate := range candidates {
-				if candidate.Plugin == nil {
-					continue
-				}
-				supported := true
-				for _, mode := range required {
-					if !candidate.Plugin.Meta.ProtocolSupports(candidate.Protocol, mode) {
-						supported = false
-						break
-					}
-				}
-				if supported {
-					filtered = append(filtered, candidate)
-				}
-			}
-			if len(filtered) == 0 {
-				abortWithOpenAiMessage(c, http.StatusBadRequest, unsupportedProtocolFormMessage(unfiltered, binding.Protocol, stream, background))
-				return
-			}
-			candidates = filtered
-			binding = candidates[0]
+		var message string
+		candidates, message = compatibleTaskProtocolBindings(c, candidates)
+		if message != "" {
+			abortWithOpenAiMessage(c, http.StatusBadRequest, message)
+			return
 		}
+		binding = candidates[0]
 
 		pin := pluginruntime.PinnedPlugin{Generation: generation, Plugin: binding.Plugin}
 		pinnedEndpoint.Plugin = binding.Plugin
@@ -769,6 +778,45 @@ func PinTaskPluginEndpoint() gin.HandlerFunc {
 		)
 		c.Next()
 	}
+}
+
+func compatibleTaskProtocolBindings(c *gin.Context, candidates []pluginruntime.ProtocolBinding) ([]pluginruntime.ProtocolBinding, string) {
+	if len(candidates) == 0 {
+		return candidates, ""
+	}
+	protocol := candidates[0].Protocol
+	definition, known := pluginruntime.HostProtocol(protocol)
+	if !known || len(definition.DefinedModes()) == 0 {
+		return candidates, ""
+	}
+	stream, background := jsonBodyBoolFlags(c)
+	required := []string{}
+	if stream {
+		required = append(required, "stream")
+	}
+	if background {
+		required = append(required, "background")
+	}
+	if !stream && !background {
+		required = append(required, "sync")
+	}
+	filtered := make([]pluginruntime.ProtocolBinding, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.Plugin == nil {
+			continue
+		}
+		supported := true
+		for _, mode := range required {
+			supported = supported && candidate.Plugin.Meta.ProtocolSupports(candidate.Protocol, mode)
+		}
+		if supported {
+			filtered = append(filtered, candidate)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil, unsupportedProtocolFormMessage(candidates, protocol, stream, background)
+	}
+	return filtered, ""
 }
 
 func jsonBodyBoolFlags(c *gin.Context) (stream, background bool) {
@@ -1825,11 +1873,11 @@ func PrepareTaskVideoRemix() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		task, exists, err := model.GetByTaskId(c.GetInt("id"), c.Param("video_id"))
 		if err != nil {
-			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, "Task is unavailable")
+			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgTaskUnavailable))
 			return
 		}
 		if !exists || task == nil {
-			abortWithOpenAiMessage(c, http.StatusNotFound, "Task not found")
+			abortWithOpenAiMessage(c, http.StatusNotFound, i18n.T(c, i18n.MsgTaskNotFound))
 			return
 		}
 		if task.PrivateData.Gateway == nil {
@@ -1837,28 +1885,28 @@ func PrepareTaskVideoRemix() gin.HandlerFunc {
 			return
 		}
 		if !task.PrivateData.Gateway.Accepted {
-			abortWithOpenAiMessage(c, http.StatusConflict, "Task submission outcome is unknown")
+			abortWithOpenAiMessage(c, http.StatusConflict, i18n.T(c, i18n.MsgTaskSubmissionUnknown))
 			return
 		}
 		offering, err := model.GetModelOffering(c.Request.Context(), task.PrivateData.Gateway.Settlement.Request.ModelOfferingID)
 		if err != nil {
-			abortWithOpenAiMessage(c, http.StatusNotFound, "Model not found")
+			abortWithOpenAiMessage(c, http.StatusNotFound, i18n.T(c, i18n.MsgTaskModelNotFound))
 			return
 		}
 		generation := pluginruntime.DefaultRegistry.Generation()
 		plugin, exists := generation.Get(string(task.Platform))
 		if !exists {
-			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, "Task plugin is unavailable")
+			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgTaskPluginUnavailable))
 			return
 		}
 		supportsRemix, err := plugin.Engine.HasCallablePath(c.Request.Context(), "protocols", "openai_video", "decodeRemixRequest")
 		if err != nil || !supportsRemix {
-			abortWithOpenAiMessage(c, http.StatusBadRequest, "Task plugin does not support video remix")
+			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgTaskRemixUnsupported))
 			return
 		}
 		requestContext, err := buildTaskPluginRouteRequest(c)
 		if err != nil {
-			abortWithOpenAiMessage(c, http.StatusBadRequest, "Invalid task request")
+			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgTaskInvalidRequest))
 			return
 		}
 		protocolContext := pluginruntime.ProtocolRequestContext{RouteRequestContext: requestContext, Protocol: "openai_video", Operation: "remix", Model: task.Properties.OriginModelName, UpstreamModel: task.Properties.UpstreamModelName}
@@ -1866,7 +1914,7 @@ func PrepareTaskVideoRemix() gin.HandlerFunc {
 		resolved, ok := value.(map[string]any)
 		ids, validIDs := resolvedTaskPluginIDs(resolved["originTaskIds"])
 		if err != nil || !ok || resolved["kind"] != "submit" || resolved["model"] != task.Properties.OriginModelName || resolved["action"] != "remix" || !validIDs || len(ids) != 1 || ids[0] != task.TaskID {
-			abortWithOpenAiMessage(c, http.StatusBadRequest, "Invalid video remix request")
+			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgTaskInvalidRemix))
 			return
 		}
 		requestContext.RequestBody = resolved["requestBody"]

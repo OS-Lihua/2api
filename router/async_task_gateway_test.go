@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/capability"
 	"github.com/QuantumNous/new-api/pkg/channelhealth"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
@@ -53,7 +55,7 @@ func newAsyncTaskFixture(t *testing.T, upstream http.HandlerFunc) textGatewayFix
 	require.NoError(t, err)
 	fixture := newTextGatewayFixture(t, upstream)
 	require.NoError(t, model.DB.AutoMigrate(&model.Task{}))
-	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("model_name", "sora-2").Error)
+	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Updates(map[string]any{"model_name": "sora-2", "capabilities": capability.Set{Features: []capability.Feature{capability.Streaming}, InputModalities: []capability.Modality{capability.Text, capability.Image}, OutputModalities: []capability.Modality{capability.Video}}}).Error)
 	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:sora", "upstream_model_name": "sora-2"}).Error)
 	for _, price := range []*model.PriceVersion{
 		{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("video", u("seconds") * 0.1)`, EffectiveAt: clock.Now().Unix()},
@@ -548,8 +550,16 @@ func TestAsyncTaskNativeOfferingUsesDeclaredPluginWithIndependentProvider(t *tes
 	assert.Equal(t, "gateway-alias", task.Properties.OriginModelName)
 	assert.Empty(t, task.PrivateData.Key)
 	SetVideoRouter(fixture.engine)
-	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/videos/"+task.TaskID+"/remix", `{"prompt":"A green bird"}`)
-	assert.Equal(t, 400, response.Code, response.Body.String())
+	for _, language := range []struct{ locale, message string }{{"en", "Task plugin does not support video remix"}, {"zh-CN", "该任务插件不支持视频 remix"}, {"zh-TW", "此任務外掛不支援影片 remix"}} {
+		request := httptest.NewRequest(http.MethodPost, "/v1/videos/"+task.TaskID+"/remix", strings.NewReader(`{"prompt":"A green bird"}`))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+		request.Header.Set("Accept-Language", language.locale)
+		response = httptest.NewRecorder()
+		fixture.engine.ServeHTTP(response, request)
+		assert.Equal(t, 400, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), language.message)
+	}
 	assert.Equal(t, 1, calls, "unsupported remix must not submit an unrelated generation")
 	var postings int64
 	require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id <> ''").Count(&postings).Error)
@@ -1355,6 +1365,7 @@ func TestAsyncTaskImmediateImagesReturnOnceWithoutPersistingResults(t *testing.T
 			jsplugin.DefaultRegistry = jsplugin.NewRegistry()
 			_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "doubao"})
 			require.NoError(t, err)
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", capability.Set{InputModalities: []capability.Modality{capability.Text, capability.Image}, OutputModalities: []capability.Modality{capability.Image}}).Error)
 			require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:doubao", "upstream_model_name": "doubao-seedream-5-0-pro-260628"}).Error)
 			fixture.fake.Advance(time.Second)
 			for _, price := range []*model.PriceVersion{
@@ -1435,6 +1446,217 @@ func TestAsyncTaskRemixCredentialFailureDisablesOnlySelectedOriginalKey(t *testi
 	assert.Equal(t, common.ChannelStatusEnabled, provider.Status)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, provider.ProviderInfo.MultiKeyStatusList[1])
 	assert.NotEqual(t, common.ChannelStatusAutoDisabled, provider.ProviderInfo.MultiKeyStatusList[0])
+}
+
+func TestAsyncTaskNativeDecodeKeepsLaterCompatibleModel(t *testing.T) {
+	var calls atomic.Int32
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var body map[string]any
+		require.NoError(t, common.DecodeJson(r.Body, &body))
+		assert.Equal(t, "doubao-seedream-5-0-pro-260628", body["model"])
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"url":"https://artifact.invalid/result.png","size":"2048x2048"}],"usage":{"generated_images":1}}`))
+	})
+	source, err := plugins.Source("doubao")
+	require.NoError(t, err)
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "doubao"})
+	require.NoError(t, err)
+	var first model.Model
+	require.NoError(t, model.DB.First(&first, fixture.channel.ModelID).Error)
+	first.ModelName = "doubao-seedream-4-0-250828"
+	first.Capabilities.OutputModalities = []capability.Modality{capability.Image}
+	require.NoError(t, model.DB.Save(&first).Error)
+	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:doubao", "upstream_model_name": first.ModelName}).Error)
+	second := &model.Model{ModelName: "doubao-seedream-5-0-pro-260628", VendorID: first.VendorID, Status: 1, NameRule: model.NameRuleExact, Capabilities: first.Capabilities}
+	require.NoError(t, model.DB.Create(second).Error)
+	channel := &model.Channel{ProviderID: fixture.channel.ProviderID, ModelID: second.Id, Protocol: "task:doubao", UpstreamModelName: second.ModelName, MappingConfirmed: true, Status: model.ChannelEnabled, Weight: 1, ParameterOverrides: `{}`}
+	require.NoError(t, model.DB.Create(channel).Error)
+	fixture.fake.Advance(time.Second)
+	for _, price := range []*model.PriceVersion{
+		{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("image", u("images_above_1_5k") * 0.1)`, EffectiveAt: clock.Now().Unix()},
+		{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("image", u("images_above_1_5k") * 0.05)`, EffectiveAt: clock.Now().Unix()},
+		{OwnerType: model.PriceOwnerChannel, OwnerID: channel.ID, Currency: "USD", Expression: `tier("image", u("images_above_1_5k") * 0.05)`, EffectiveAt: clock.Now().Unix()},
+	} {
+		require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+	}
+	fixture.offering.Members = append(fixture.offering.Members, model.ModelOfferingMember{ModelID: second.Id, Tier: 1})
+	require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+	builder := newPluginGenerationBuilder(fixture.engine.Routes(), nil, productionPluginRouteHandlers)
+	require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(builder.prepare))
+	dispatcher := &pluginRouteDispatcher{registry: jsplugin.DefaultRegistry}
+	fixture.engine.NoRoute(dispatcher.dispatch)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/doubao/api/v3/images/generations", `{"model":"gateway-alias","prompt":"A bird","size":"2K","output_format":"png"}`)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.EqualValues(t, 1, calls.Load())
+	requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), requests[0].ID, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, channel.ID, attempts[0].ChannelID)
+	assert.EqualValues(t, 50000000, attempts[0].Cost.Nanos)
+	admin := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "channel:operate")
+	disabled := adminSecurityRequest(fixture.engine, admin, http.MethodPost, fmt.Sprintf("/api/admin/v1/providers/%d/disable", fixture.channel.ProviderID), "")
+	require.Equal(t, 200, disabled.Code, disabled.Body.String())
+	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/doubao/api/v3/images/generations", `{"model":"gateway-alias","prompt":"A bird","size":"2K","output_format":"png"}`)
+	assert.Equal(t, 503, response.Code, response.Body.String())
+	assert.EqualValues(t, 1, calls.Load())
+}
+
+func TestAsyncTaskRouteEnforcesTokenFactsAndOutputModality(t *testing.T) {
+	for _, tokenLimited := range []bool{false, true} {
+		t.Run(fmt.Sprintf("token_limited_%t", tokenLimited), func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				_, _ = w.Write([]byte(`{"id":"guarded-job","status":"queued"}`))
+			})
+			tokenSource := ""
+			if tokenLimited {
+				source, err := plugins.Source("sora")
+				require.NoError(t, err)
+				source = strings.Replace(source, "usageSchema: {", `usageExamples: [{label: "Synthetic task", facts: {seconds: 4, size: "720x1280", tokens: 20}}], usageSchema: {tokens: {type:"number", unit:"token", description:{en:"Generation token unit price", zh:"生成 token 单价"}},`, 1)
+				source = strings.Replace(source, `return { seconds: videoDuration(req), size: req.size || "720x1280" };`, `return { seconds: videoDuration(req), size: req.size || "720x1280", tokens: 20 };`, 1)
+				jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+				_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "sora"})
+				require.NoError(t, err)
+				tokenSource = source
+				require.NoError(t, model.DB.Model(fixture.channel).Update("tpm", 10).Error)
+			} else {
+				var unified model.Model
+				require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+				unified.Capabilities.OutputModalities = []capability.Modality{capability.Text}
+				require.NoError(t, model.DB.Model(&unified).Update("capabilities", unified.Capabilities).Error)
+			}
+			SetTaskPluginProtocolRouter(fixture.engine)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/videos", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+			want := 400
+			if tokenLimited {
+				want = 503
+			}
+			assert.Equal(t, want, response.Code, response.Body.String())
+			assert.Zero(t, calls.Load())
+			var reservations int64
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
+			assert.Zero(t, reservations)
+			if tokenLimited {
+				require.NoError(t, model.DB.Model(fixture.channel).Update("tpm", 20).Error)
+				tokenSource = strings.Replace(tokenSource, "return { taskId, taskData: body };", `return {taskId, taskData:body, immediate:{status:"SUCCESS"}};`, 1)
+				tokenSource = strings.Replace(tokenSource, "const data = body || {};", "const data = body || {}; facts.tokens = 0;", 1)
+				jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+				_, err := jsplugin.DefaultRegistry.RegisterFactory(tokenSource, jsplugin.Options{Key: "sora"})
+				require.NoError(t, err)
+				for range 2 {
+					response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/videos", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+					require.Equal(t, 200, response.Code, response.Body.String())
+				}
+				assert.EqualValues(t, 2, calls.Load(), "reported token zero must replace the forecast on the same permit")
+			}
+		})
+	}
+}
+
+func TestAsyncTaskImmediateFailureKeepsReportedProcurement(t *testing.T) {
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"failed-job","status":"failed","seconds":"2"}`))
+	})
+	source, err := plugins.Source("sora")
+	require.NoError(t, err)
+	source = strings.Replace(source, "return { taskId, taskData: body };", `return { taskId, taskData: body, immediate: {status: "FAILURE"} };`, 1)
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "sora"})
+	require.NoError(t, err)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Zero(t, requests[0].Receivable.Nanos)
+	assert.False(t, requests[0].SalePending)
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), requests[0].ID, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.False(t, attempts[0].CostPending)
+	assert.EqualValues(t, 100000000, attempts[0].Cost.Nanos)
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1000000000, wallet.Balance.Nanos)
+}
+
+func TestAsyncTaskPollingRechecksProviderAfterPluginPreparation(t *testing.T) {
+	for _, selectedSlot := range []bool{false, true} {
+		t.Run(fmt.Sprintf("selected_slot_%t", selectedSlot), func(t *testing.T) {
+			entered, release := make(chan struct{}), make(chan struct{})
+			var queryCalls atomic.Int32
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.URL.Path == "/poll-prepare" {
+					close(entered)
+					<-release
+					_, _ = w.Write([]byte(`{"ready":true}`))
+					return
+				}
+				if r.Method == http.MethodGet {
+					queryCalls.Add(1)
+					_, _ = w.Write([]byte(`{"id":"guarded-job","status":"completed","seconds":"2"}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"id":"guarded-job","status":"queued"}`))
+			})
+			var once sync.Once
+			t.Cleanup(func() { once.Do(func() { close(release) }) })
+			source, err := plugins.Source("sora")
+			require.NoError(t, err)
+			source = strings.Replace(source, "export function buildQueryRequest(ctx) {", `export function buildQueryRequest(ctx) {
+ utils.fetch({url: ctx.baseUrl + "/poll-prepare"});`, 1)
+			jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+			_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "sora"})
+			require.NoError(t, err)
+			if selectedSlot {
+				provider, err := model.GetProviderById(fixture.channel.ProviderID, true)
+				require.NoError(t, err)
+				provider.Key = "provider-secret\nprovider-secret"
+				provider.Keys = nil
+				provider.ProviderInfo.IsMultiKey = true
+				provider.ProviderInfo.MultiKeySize = 2
+				provider.ProviderInfo.MultiKeyMode = constant.MultiKeyModePolling
+				provider.ProviderInfo.MultiKeyPollingIndex = 0
+				require.NoError(t, model.DB.Save(provider).Error)
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+			require.Equal(t, 200, response.Code, response.Body.String())
+			finished := make(chan struct{})
+			go func() { service.RunTaskPollingOnce(t.Context(), nil); close(finished) }()
+			select {
+			case <-entered:
+			case <-finished:
+				t.Fatal("polling finished before preparation")
+			case <-t.Context().Done():
+				t.Fatal(t.Context().Err())
+			}
+			admin := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "channel:operate")
+			path := fmt.Sprintf("/api/admin/v1/providers/%d/disable", fixture.channel.ProviderID)
+			if selectedSlot {
+				path = fmt.Sprintf("/api/admin/v1/providers/%d/keys/1/disable", fixture.channel.ProviderID)
+			}
+			response = adminSecurityRequest(fixture.engine, admin, http.MethodPost, path, "")
+			require.Equal(t, 200, response.Code, response.Body.String())
+			once.Do(func() { close(release) })
+			<-finished
+			assert.Zero(t, queryCalls.Load(), "a committed Provider disable must prevent the prepared poll from using its old credential")
+			var task model.Task
+			require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
+			assert.NotEqual(t, model.TaskStatusSuccess, task.Status)
+			assert.True(t, task.PrivateData.Gateway.Accepted)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.EqualValues(t, 640000000, wallet.Balance.Nanos)
+		})
+	}
 }
 
 func TestAsyncTaskRouteDefersPluginFetchUntilAfterReservation(t *testing.T) {
@@ -1528,13 +1750,19 @@ func TestAsyncTaskRouteEnforcesDurationAndConcurrentAdmission(t *testing.T) {
 
 func TestAsyncTaskRouteUsesEffectivePurchaseCostAndProfit(t *testing.T) {
 	for _, tc := range []struct {
-		allowLoss, secondPlugin bool
-		path                    string
-	}{{false, false, "/v1/tasks/sora"}, {true, false, "/v1/tasks/sora"}, {false, true, "/v1/videos"}, {false, true, "/v1/responses"}} {
-		t.Run(fmt.Sprintf("allow_loss_%t_second_plugin_%t%s", tc.allowLoss, tc.secondPlugin, tc.path), func(t *testing.T) {
+		allowLoss, secondPlugin       bool
+		firstReject, firstUnsupported bool
+		path                          string
+	}{{path: "/v1/tasks/sora"}, {allowLoss: true, path: "/v1/tasks/sora"}, {secondPlugin: true, path: "/v1/videos"}, {secondPlugin: true, path: "/v1/responses"}, {secondPlugin: true, firstReject: true, path: "/v1/responses"}, {secondPlugin: true, firstUnsupported: true, path: "/v1/responses"}} {
+		t.Run(fmt.Sprintf("allow_loss_%t_second_plugin_%t_reject_%t_unsupported_%t%s", tc.allowLoss, tc.secondPlugin, tc.firstReject, tc.firstUnsupported, tc.path), func(t *testing.T) {
 			firstCalls, secondCalls := 0, 0
 			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
 				firstCalls++
+				if tc.firstReject {
+					w.WriteHeader(503)
+					_, _ = w.Write([]byte(`{"error":{"code":"overloaded"}}`))
+					return
+				}
 				_, _ = w.Write([]byte(`{"id":"expensive-job","status":"queued"}`))
 			})
 			second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1548,6 +1776,12 @@ func TestAsyncTaskRouteUsesEffectivePurchaseCostAndProfit(t *testing.T) {
 			if tc.secondPlugin {
 				source, err := plugins.Source("sora")
 				require.NoError(t, err)
+				if tc.firstUnsupported {
+					jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+					narrowed := strings.Replace(source, `supports: ["stream", "sync", "background"]`, `supports: ["stream", "sync"]`, 1)
+					_, err = jsplugin.DefaultRegistry.RegisterFactory(narrowed, jsplugin.Options{Key: "sora"})
+					require.NoError(t, err)
+				}
 				source = strings.Replace(source, `key: "sora"`, `key: "cheapsora"`, 1)
 				source = strings.Replace(source, `channelTypes: [55, 1],`, `channelTypes: [],`, 1)
 				_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "cheapsora"})
@@ -1558,8 +1792,12 @@ func TestAsyncTaskRouteUsesEffectivePurchaseCostAndProfit(t *testing.T) {
 			channel := &model.Channel{ProviderID: provider.Id, ModelID: fixture.channel.ModelID, Protocol: protocol.Type(channelProtocol), UpstreamModelName: "sora-2", MappingConfirmed: true, Status: model.ChannelEnabled, Weight: 1, ParameterOverrides: `{}`}
 			require.NoError(t, model.DB.Create(channel).Error)
 			fixture.fake.Advance(time.Second)
+			firstPrice := `tier("video", u("seconds") * 0.2)`
+			if tc.firstReject {
+				firstPrice = `tier("video", u("seconds") * 0.001)`
+			}
 			for _, price := range []*model.PriceVersion{
-				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("video", u("seconds") * 0.2)`, EffectiveAt: clock.Now().Unix()},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: firstPrice, EffectiveAt: clock.Now().Unix()},
 				{OwnerType: model.PriceOwnerChannel, OwnerID: channel.ID, Currency: "USD", Expression: `tier("video", u("seconds") * 0.01)`, EffectiveAt: clock.Now().Unix()},
 			} {
 				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
@@ -1571,21 +1809,29 @@ func TestAsyncTaskRouteUsesEffectivePurchaseCostAndProfit(t *testing.T) {
 			}
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, tc.path, body)
 			require.Equal(t, 200, response.Code, response.Body.String())
-			assert.Zero(t, firstCalls, "Route must exclude the lossmaking Channel before submission")
+			assert.EqualValues(t, map[bool]int{false: 0, true: 1}[tc.firstReject], firstCalls, "Route must exclude lossmaking candidates and try a cheaper valid candidate only once")
 			assert.Equal(t, 1, secondCalls)
 			if tc.secondPlugin {
 				var task model.Task
 				require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
 				assert.Equal(t, constant.TaskPlatform("cheapsora"), task.Platform)
+				require.NotNil(t, task.PrivateData.Execution)
+				require.NotNil(t, task.PrivateData.Execution.TaskPlugin)
+				assert.Equal(t, "cheapsora", task.PrivateData.Execution.TaskPlugin.Key)
 			}
 			requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
 			require.NoError(t, err)
 			require.EqualValues(t, 1, total)
 			attempts, total, err := model.ListGatewayAttempts(t.Context(), requests[0].ID, 0, 10)
 			require.NoError(t, err)
-			require.EqualValues(t, 1, total)
-			assert.Equal(t, channel.ID, attempts[0].ChannelID)
-			assert.Equal(t, "cost", attempts[0].RouteDiagnostics["method"])
+			wantedAttempts := 1
+			if tc.firstReject {
+				wantedAttempts = 2
+			}
+			require.EqualValues(t, wantedAttempts, total)
+			index := slices.IndexFunc(attempts, func(attempt model.GatewayAttempt) bool { return attempt.ChannelID == channel.ID })
+			require.NotEqual(t, -1, index)
+			assert.Equal(t, "cost", attempts[index].RouteDiagnostics["method"])
 			var entries []model.LedgerEntry
 			require.NoError(t, model.DB.Where("request_id = ? AND type = ?", requests[0].ID, model.LedgerEntryPreConsume).Find(&entries).Error)
 			require.Len(t, entries, 1)
@@ -1744,7 +1990,7 @@ func TestAsyncTaskImageCountUsesCompletedFactsOnBothSides(t *testing.T) {
 	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
 	_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "alibaba"})
 	require.NoError(t, err)
-	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("model_name", "qwen-image-2.0").Error)
+	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Updates(map[string]any{"model_name": "qwen-image-2.0", "capabilities": capability.Set{InputModalities: []capability.Modality{capability.Text, capability.Image}, OutputModalities: []capability.Modality{capability.Image}}}).Error)
 	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:alibaba", "upstream_model_name": "qwen-image-2.0"}).Error)
 	fixture.fake.Advance(time.Second)
 	for _, price := range []*model.PriceVersion{

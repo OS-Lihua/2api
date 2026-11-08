@@ -254,7 +254,12 @@ func UpdateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, task
 	return nil
 }
 
-func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, channelId int, taskIds []string, taskM map[string]*model.Task, pinned ...*model.Provider) error {
+type gatewayTaskProviderSelection struct {
+	Provider *model.Provider
+	KeyIndex int
+}
+
+func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, channelId int, taskIds []string, taskM map[string]*model.Task, pinned ...gatewayTaskProviderSelection) error {
 	logger.LogInfo(ctx, common.LogText("channel #%d has %d unfinished tasks", channelId, len(taskIds)))
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -265,7 +270,7 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	var ch *model.Provider
 	var err error
 	if len(pinned) > 0 {
-		ch = pinned[0]
+		ch = pinned[0].Provider
 	} else {
 		ch, err = model.CacheGetProvider(channelId)
 	}
@@ -308,6 +313,9 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		ChannelBaseUrl:  baseURL,
 		ChannelSetting:  ch.GetSetting(),
 		HeadersOverride: ch.GetHeaderOverride(),
+	}
+	if len(pinned) > 0 {
+		info.ChannelMultiKeyIndex = pinned[0].KeyIndex
 	}
 	info.ApiKey = ch.Key
 	adaptor.Init(info)

@@ -122,6 +122,9 @@ type TaskArtifactProvider interface {
 }
 
 type TaskContentRequest struct {
+	// Authorize is request-scoped and rechecks the original task Provider
+	// credential before each content request or redirect.
+	Authorize      func(context.Context) error `json:"-"`
 	URL            string
 	Method         string
 	Headers        map[string]string

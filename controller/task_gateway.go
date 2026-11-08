@@ -159,7 +159,17 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 		maps.Copy(c.Keys, candidate.Context.Keys)
 		info, adaptor, facts, saleInput := candidate.Info, candidate.Adaptor, candidate.Facts, candidate.SaleInput
 		contactedProvider := false
-		defer func() { _ = selection.Permit.Release(context.WithoutCancel(parent.Context()), contactedProvider) }()
+		defer func() {
+			ctx := context.WithoutCancel(parent.Context())
+			if accepted != nil && accepted == pending && (accepted.Status == model.TaskStatusSuccess || accepted.Status == model.TaskStatusFailure) {
+				schema, _ := candidate.Plugin.Meta.UsageForModels(info.UpstreamModelName, info.OriginModelName)
+				if tokens, known, err := gatewayTaskTokens(schema, accepted.PrivateData.Gateway.CompletionFacts, false); err == nil && known {
+					_ = selection.Permit.Release(ctx, contactedProvider, tokens)
+					return
+				}
+			}
+			_ = selection.Permit.Release(ctx, contactedProvider)
+		}()
 		stopProbe := service.ChannelHealth.KeepAlive(parent.Context(), selection.Admission)
 		defer stopProbe()
 		defer func() {
@@ -264,6 +274,9 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 		}
 		snapshot := &model.TaskGatewaySnapshot{ProviderType: info.ChannelType, ChannelID: selected.ID, ProviderID: provider.Id, Facts: facts, SaleSource: saleSource, SaleConditions: pending.PrivateData.Gateway.SaleConditions, PreviousAttempts: append([]model.GatewayAttempt(nil), previousAttempts...), Settlement: model.GatewaySettlement{Request: *record, Attempt: attempt, AttemptTrace: attemptTraces}}
 		pending.ChannelId = info.ChannelId
+		pending.Platform = constant.TaskPlatform(candidate.Plugin.Meta.Key)
+		pending.Action = info.Action
+		pending.PrivateData.Execution = service.TaskExecutionSnapshotFromContext(c)
 		pending.Properties.UpstreamModelName = info.UpstreamModelName
 		pending.PrivateData.Gateway = snapshot
 		pending.PrivateData.Key = ""

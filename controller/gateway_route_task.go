@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/capability"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	taskplugin "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
@@ -120,6 +122,36 @@ func prepareGatewayTaskRoute(c *gin.Context, selection *service.GatewaySelection
 	if err := adaptor.DecodeRequestAndSetAction(candidate, info); err != nil {
 		return nil, service.ErrGatewayCapability
 	}
+	output := capability.Modality("")
+	switch constant.NormalizeTaskAction(info.Action) {
+	case constant.TaskActionTextToVideo, constant.TaskActionImageToVideo, constant.TaskActionFirstTailToVideo, constant.TaskActionReferenceToVideo, constant.TaskActionRemix:
+		output = capability.Video
+	case "text_to_image", "image_to_image":
+		output = capability.Image
+	case "MUSIC", "music":
+		output = capability.Audio
+	case "LYRICS", "lyrics":
+		output = capability.Text
+	}
+	if value, exists := candidate.Get(jsplugin.ContextKeyPinnedEndpoint); exists {
+		if endpoint, ok := value.(jsplugin.PinnedEndpoint); ok {
+			switch endpoint.Protocol {
+			case "openai_image":
+				output = capability.Image
+			case "openai_video":
+				output = capability.Video
+			}
+		}
+	}
+	if output != "" && !slices.Contains(selection.Capabilities.OutputModalities, output) {
+		return nil, service.ErrGatewayCapability
+	}
+	if strings.HasPrefix(info.Action, "text_to_") && !slices.Contains(selection.Capabilities.InputModalities, capability.Text) {
+		return nil, service.ErrGatewayCapability
+	}
+	if strings.HasPrefix(info.Action, "image_to_") && !slices.Contains(selection.Capabilities.InputModalities, capability.Image) {
+		return nil, service.ErrGatewayCapability
+	}
 	if len(overrides) > 0 {
 		body, exists := candidate.Get("task_request")
 		if !exists {
@@ -168,6 +200,11 @@ func prepareGatewayTaskRoute(c *gin.Context, selection *service.GatewaySelection
 	// The plugin owns quantity semantics; declared canonical units let the host
 	// enforce Model/Channel limits without interpreting vendor request fields.
 	schema, _ := plugin.Meta.UsageForModels(info.UpstreamModelName, info.OriginModelName)
+	tokens, _, tokenErr := gatewayTaskTokens(schema, facts, true)
+	if tokenErr != nil {
+		return nil, service.ErrGatewayCapability
+	}
+	selection.InputTokens = int(tokens)
 	for name, field := range schema {
 		value, exists := facts[name]
 		if !exists || field.Type != "number" {
@@ -210,4 +247,34 @@ func prepareGatewayTaskRoute(c *gin.Context, selection *service.GatewaySelection
 		purchaseInput.Usage = facts
 	}
 	return &gatewayPreparedTask{Plugin: plugin, Context: candidate, Info: info, Adaptor: adaptor, Facts: facts, SaleInput: saleInput, RouteFacts: service.GatewayRouteFacts{SaleInput: saleInput, PurchaseInput: purchaseInput, MoneyInput: &billingexpr.MoneyInput{TaskUsage: true}}}, nil
+}
+
+// gatewayTaskTokens supplies the same canonical token quantities to Route TPM
+// admission and its selected permit. Missing completion facts retain the estimate.
+func gatewayTaskTokens(schema map[string]jsplugin.UsageFieldSchema, facts map[string]any, estimateMissing bool) (int64, bool, error) {
+	total := decimal.Zero
+	known := true
+	for name, field := range schema {
+		if field.Type != "number" || field.Unit != "token" {
+			continue
+		}
+		value, exists := facts[name]
+		if !exists {
+			known = false
+			if estimateMissing {
+				total = total.Add(decimal.NewFromInt(1<<31 - 1))
+			}
+			continue
+		}
+		quantity, err := decimal.NewFromString(fmt.Sprint(value))
+		if err != nil || quantity.IsNegative() {
+			return 0, false, service.ErrGatewayCapability
+		}
+		total = total.Add(quantity)
+	}
+	total = total.Ceil()
+	if total.GreaterThan(decimal.NewFromInt(1<<31 - 1)) {
+		return 0, false, service.ErrGatewayCapability
+	}
+	return total.BigInt().Int64(), known, nil
 }

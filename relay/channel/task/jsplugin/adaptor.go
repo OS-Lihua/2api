@@ -872,7 +872,8 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 		CompletionTokens: positiveInt(parsed.Immediate.CompletionTokens), TotalTokens: positiveInt(parsed.Immediate.TotalTokens),
 	}
 	response.Immediate = immediate
-	if immediate.Status != model.TaskStatusSuccess || info.IsChannelTest || !a.hasHook(c.Request.Context(), "extractUsageOnComplete") {
+	moneyFailure := immediate.Status == model.TaskStatusFailure && info.BeginProviderCall != nil
+	if immediate.Status != model.TaskStatusSuccess && !moneyFailure || info.IsChannelTest || !a.hasHook(c.Request.Context(), "extractUsageOnComplete") {
 		return response, nil
 	}
 	// A relayed stream that stopped early keeps the reservation: the plugin
@@ -903,26 +904,56 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 
 func (a *TaskAdaptor) GetModelList() []string { return append([]string(nil), a.plugin.Meta.Models...) }
 func (a *TaskAdaptor) GetChannelName() string { return a.plugin.Meta.Name }
-func (a *TaskAdaptor) FetchMode() string      { return a.plugin.Meta.FetchMode }
+
+type gatewayTaskCredentialContextKey struct{}
+
+func (a *TaskAdaptor) gatewayTaskCredentialContext(ctx context.Context, task *model.Task, key string) context.Context {
+	index := 0
+	if a.info != nil {
+		index = a.info.ChannelMultiKeyIndex
+	}
+	check := service.GatewayTaskCredentialCheck(task, key, index)
+	if check == nil {
+		return ctx
+	}
+	checks, _ := ctx.Value(gatewayTaskCredentialContextKey{}).([]func(context.Context) error)
+	return context.WithValue(ctx, gatewayTaskCredentialContextKey{}, append(slices.Clone(checks), check))
+}
+
+func checkGatewayTaskCredentials(ctx context.Context) error {
+	checks, _ := ctx.Value(gatewayTaskCredentialContextKey{}).([]func(context.Context) error)
+	for _, check := range checks {
+		if err := check(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *TaskAdaptor) FetchMode() string { return a.plugin.Meta.FetchMode }
 
 func (a *TaskAdaptor) FetchBatchTasks(baseURL, key string, tasks []*model.Task, proxy string) (*http.Response, error) {
+	requestCtx := context.Background()
+	for _, task := range tasks {
+		requestCtx = a.gatewayTaskCredentialContext(requestCtx, task, key)
+	}
 	taskContexts := make([]map[string]any, 0, len(tasks))
 	for _, task := range tasks {
-		taskCtx, err := a.queryContext(task, key, baseURL, proxy)
+		taskCtx, err := a.queryContextWithContext(requestCtx, task, key, baseURL, proxy)
 		if err != nil {
 			return nil, err
 		}
 		taskContexts = append(taskContexts, taskCtx)
 	}
-	ctx, err := a.batchQueryContext(key, baseURL, proxy, taskContexts)
+	ctx, err := a.batchQueryContext(requestCtx, key, baseURL, proxy, taskContexts)
 	if err != nil {
 		return nil, err
 	}
-	descriptor, err := a.requestDescriptor(pluginruntime.WithFetcher(context.Background(), a.hookFetcher(baseURL, proxy)), "buildBatchQueryRequest", ctx, taskContexts)
+	descriptor, err := a.requestDescriptor(pluginruntime.WithFetcher(requestCtx, a.hookFetcher(baseURL, proxy)), "buildBatchQueryRequest", ctx, taskContexts)
 	if err != nil {
 		return nil, err
 	}
-	return a.doFetchDescriptor(baseURL, key, proxy, descriptor)
+	return a.doFetchDescriptorWithContext(requestCtx, baseURL, key, proxy, descriptor)
 }
 
 func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
@@ -932,6 +963,7 @@ func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy str
 // FetchTaskWithContext bounds management and request-scoped polling while the
 // background poller keeps its existing lifecycle through FetchTask.
 func (a *TaskAdaptor) FetchTaskWithContext(requestCtx context.Context, baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
+	requestCtx = a.gatewayTaskCredentialContext(requestCtx, task, key)
 	if task != nil && task.PrivateData.Gateway == nil && task.PrivateData.Key != "" {
 		key = task.PrivateData.Key
 	}
@@ -973,6 +1005,7 @@ func (a *TaskAdaptor) hookFetcher(baseURL, proxy string) pluginruntime.Fetcher {
 		// A redirect reaches the plugin as it is; fetching its location is a
 		// new request, checked and counted again.
 		noRedirects := *client
+		noRedirects.Transport = service.GatewayTaskHTTPTransport(client.Transport, checkGatewayTaskCredentials)
 		noRedirects.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 		req, err := http.NewRequestWithContext(ctx, request.Method, request.URL, nil)
 		if err != nil {
@@ -1048,6 +1081,7 @@ func (a *TaskAdaptor) doFetchDescriptorWithContext(requestCtx context.Context, b
 	// Clients are cached across channels. Keep the redirect policy and its
 	// credential state local to this query, while reusing the transport.
 	queryClient := *client
+	queryClient.Transport = service.GatewayTaskHTTPTransport(client.Transport, checkGatewayTaskCredentials)
 	credentialsStripped := false
 	var redirectPolicyErr error
 	queryClient.CheckRedirect = func(next *http.Request, via []*http.Request) error {
@@ -1142,15 +1176,19 @@ func (a *TaskAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response,
 		input = decoded
 	}
 	key, baseURL, proxy := a.queryCredentials()
+	requestCtx := context.Background()
+	for _, task := range tasks {
+		requestCtx = a.gatewayTaskCredentialContext(requestCtx, task, key)
+	}
 	taskContexts := make([]map[string]any, 0, len(tasks))
 	for _, task := range tasks {
-		taskCtx, err := a.queryContext(task, key, baseURL, proxy)
+		taskCtx, err := a.queryContextWithContext(requestCtx, task, key, baseURL, proxy)
 		if err != nil {
 			return nil, err
 		}
 		taskContexts = append(taskContexts, taskCtx)
 	}
-	ctx, err := a.batchQueryContext(key, baseURL, proxy, taskContexts)
+	ctx, err := a.batchQueryContext(requestCtx, key, baseURL, proxy, taskContexts)
 	if err != nil {
 		return nil, err
 	}
@@ -1167,7 +1205,7 @@ func (a *TaskAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response,
 		Data       any    `json:"data"`
 		State      any    `json:"state"`
 	}
-	if err = a.plugin.Engine.CallInto(pluginruntime.WithFetcher(context.Background(), a.hookFetcher(baseURL, proxy)), &parsed, "parseBatchResult", ctx, input, hookHTTPResponse(resp)); err != nil {
+	if err = a.plugin.Engine.CallInto(pluginruntime.WithFetcher(requestCtx, a.hookFetcher(baseURL, proxy)), &parsed, "parseBatchResult", ctx, input, hookHTTPResponse(resp)); err != nil {
 		reason := "hook_failed"
 		var invalid *pluginruntime.ResultError
 		if errors.As(err, &invalid) {
@@ -1230,6 +1268,9 @@ func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, bod
 
 // ParseTaskResultWithContext keeps hook I/O inside the caller's deadline.
 func (a *TaskAdaptor) ParseTaskResultWithContext(requestCtx context.Context, task *model.Task, resp *http.Response, body []byte) (*relaycommon.TaskInfo, error) {
+	if a.info != nil {
+		requestCtx = a.gatewayTaskCredentialContext(requestCtx, task, a.info.ApiKey)
+	}
 	started := time.Now()
 	input := any(string(body))
 	var decoded any
@@ -1420,6 +1461,9 @@ func RendererArtifactsWithContext(ctx context.Context, plugin *pluginruntime.Loa
 }
 
 func (a *TaskAdaptor) BuildContentRequest(ctx context.Context, task *model.Task, artifactKey string, clientRequest channel.TaskArtifactClientRequest) (*channel.TaskContentRequest, error) {
+	if a.info != nil {
+		ctx = a.gatewayTaskCredentialContext(ctx, task, a.info.ApiKey)
+	}
 	if !a.hasHook(ctx, "buildContentRequest") {
 		return nil, nil
 	}
@@ -1515,6 +1559,7 @@ func (a *TaskAdaptor) BuildContentRequest(ctx context.Context, task *model.Task,
 		Credentialless: descriptor.Credentialless,
 		ContentPath:    descriptor.ContentPath,
 		MimeType:       descriptor.MimeType,
+		Authorize:      service.GatewayTaskCredentialCheck(task, a.info.ApiKey, a.info.ChannelMultiKeyIndex),
 	}, nil
 }
 
@@ -1607,9 +1652,9 @@ func (a *TaskAdaptor) queryContextWithContext(requestCtx context.Context, task *
 	return ctx, nil
 }
 
-func (a *TaskAdaptor) batchQueryContext(key, baseURL, proxy string, tasks []map[string]any) (map[string]any, error) {
+func (a *TaskAdaptor) batchQueryContext(requestCtx context.Context, key, baseURL, proxy string, tasks []map[string]any) (map[string]any, error) {
 	ctx := map[string]any{"baseUrl": baseURL, "tasks": tasks}
-	if err := a.applyUpstreamCredentials(ctx, a.channelType(), key, proxy); err != nil {
+	if err := a.applyUpstreamCredentialsWithContext(requestCtx, ctx, a.channelType(), key, proxy); err != nil {
 		return nil, err
 	}
 	return ctx, nil
