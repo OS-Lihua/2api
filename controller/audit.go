@@ -164,6 +164,20 @@ func recordManageAuditFor(c *gin.Context, targetUserId int, action string, param
 	markAuditLogged(c)
 }
 
+// recordFailedManageAudit retains non-secret targets and partial results when
+// a management operation fails after some of its writes have committed.
+func recordFailedManageAudit(c *gin.Context, action string, params map[string]any, status int) {
+	if common.GetContextKeyBool(c, constant.ContextKeyAdminAPIAudit) {
+		return
+	}
+	info := &model.AuditRequestInfo{
+		Method: c.Request.Method, Route: c.FullPath(), Path: c.FullPath(), Status: status, Success: false,
+	}
+	model.RecordOperationAuditLog(c.GetInt("id"), c.GetInt("role"), c.Request.Method+" "+c.FullPath(), c.ClientIP(),
+		action, params, auditOperatorInfo(c), info, c)
+	markAuditLogged(c)
+}
+
 // recordUserSecurityAudit 记录普通用户自己的安全敏感操作（如 passkey 绑定/解绑）。
 // 这类日志没有管理员操作者，不写 admin_info；同时不依赖 AdminAuth/RootAuth 的兜底。
 func recordUserSecurityAudit(c *gin.Context, userId int, action string, params map[string]any) {

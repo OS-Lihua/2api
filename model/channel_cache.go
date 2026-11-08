@@ -259,61 +259,75 @@ func CacheUpdateProviderStatus(id int, status int) {
 	cacheUpdateProviderStatus(id, status)
 }
 
-// cacheProviderStatusTransition publishes a committed transition only while the
-// cache still represents its original credentials and status. A management
-// refresh that has already published a newer state must win.
+// cacheProviderStatusTransition publishes committed state. If this node's
+// snapshot differs, read the current Provider rather than guessing whether the
+// cache is older or newer. A refresh failure evicts only this Provider.
 func cacheProviderStatusTransition(before, after *Provider) {
+	defer InvalidatePricingCache()
 	channelSyncLock.Lock()
 	defer channelSyncLock.Unlock()
 	cached, ok := channelsIDM[after.Id]
+	var updated Provider
 	if !ok || cached.Key != before.Key || cached.Status != before.Status || cached.OtherInfo != before.OtherInfo ||
 		!maps.Equal(cached.ProviderInfo.MultiKeyStatusList, before.ProviderInfo.MultiKeyStatusList) {
-		return
+		current, err := GetProviderById(after.Id, true)
+		if err != nil {
+			common.SysError(common.LogText("failed to refresh provider status cache: provider_id=%d, error=%v", after.Id, err))
+			delete(channelsIDM, after.Id)
+			cacheUpdateProviderStatus(after.Id, common.ChannelStatusManuallyDisabled)
+			return
+		}
+		updated = *current
+		if ok && cached.Key == current.Key && cached.ProviderInfo.MultiKeyMode == current.ProviderInfo.MultiKeyMode {
+			updated.ProviderInfo.MultiKeyPollingIndex = cached.ProviderInfo.MultiKeyPollingIndex
+		}
+	} else {
+		updated = *cached
+		updated.Status = after.Status
+		updated.OtherInfo = after.OtherInfo
+		updated.ProviderInfo.MultiKeyStatusList = after.ProviderInfo.MultiKeyStatusList
+		updated.ProviderInfo.MultiKeyDisabledReason = after.ProviderInfo.MultiKeyDisabledReason
+		updated.ProviderInfo.MultiKeyDisabledTime = after.ProviderInfo.MultiKeyDisabledTime
 	}
-	updated := *cached
-	updated.OtherInfo = after.OtherInfo
-	updated.ProviderInfo.MultiKeyStatusList = after.ProviderInfo.MultiKeyStatusList
-	updated.ProviderInfo.MultiKeyDisabledReason = after.ProviderInfo.MultiKeyDisabledReason
-	updated.ProviderInfo.MultiKeyDisabledTime = after.ProviderInfo.MultiKeyDisabledTime
+	if channelsIDM == nil {
+		channelsIDM = make(map[int]*Provider)
+	}
 	channelsIDM[after.Id] = &updated
-	cacheUpdateProviderStatus(after.Id, after.Status)
-	if after.Status != common.ChannelStatusEnabled {
+	if channel2advancedCustomConfig == nil {
+		channel2advancedCustomConfig = make(map[int]*kitdto.AdvancedCustomConfig)
+	}
+	delete(channel2advancedCustomConfig, after.Id)
+	if updated.Type == constant.ChannelTypeAdvancedCustom {
+		if config := updated.GetOtherSettings().AdvancedCustom; config != nil {
+			channel2advancedCustomConfig[after.Id] = config
+		}
+	}
+	cacheUpdateProviderStatus(after.Id, updated.Status)
+}
+
+// Caller holds channelSyncLock.
+func cacheUpdateProviderStatus(id int, status int) {
+	channel, ok := channelsIDM[id]
+	if ok {
+		channel.Status = status
+	}
+	for _, models := range group2model2channels {
+		for name, ids := range models {
+			models[name] = slices.DeleteFunc(ids, func(candidate int) bool { return candidate == id })
+		}
+	}
+	if !ok || status != common.ChannelStatusEnabled {
 		return
 	}
-	// An enabled Provider may have been absent from the selectable index.
-	for _, group := range updated.GetGroups() {
+	for _, group := range channel.GetGroups() {
 		if group2model2channels == nil {
 			group2model2channels = make(map[string]map[string][]int)
 		}
 		if group2model2channels[group] == nil {
 			group2model2channels[group] = make(map[string][]int)
 		}
-		for _, name := range updated.GetModels() {
-			ids := group2model2channels[group][name]
-			if !slices.Contains(ids, after.Id) {
-				group2model2channels[group][name] = append(ids, after.Id)
-			}
-		}
-	}
-}
-
-// Caller holds channelSyncLock.
-func cacheUpdateProviderStatus(id int, status int) {
-	if channel, ok := channelsIDM[id]; ok {
-		channel.Status = status
-	}
-	if status != common.ChannelStatusEnabled {
-		// delete the channel from group2model2channels
-		for group, model2channels := range group2model2channels {
-			for model, channels := range model2channels {
-				for i, channelId := range channels {
-					if channelId == id {
-						// remove the channel from the slice
-						group2model2channels[group][model] = append(channels[:i], channels[i+1:]...)
-						break
-					}
-				}
-			}
+		for _, name := range channel.GetModels() {
+			group2model2channels[group][name] = append(group2model2channels[group][name], id)
 		}
 	}
 }

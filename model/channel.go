@@ -759,6 +759,7 @@ func UpdateProviderStatusWithError(channelId int, usingKey string, status int, r
 		before := *channel
 		before.ProviderInfo.MultiKeyStatusList = maps.Clone(channel.ProviderInfo.MultiKeyStatusList)
 		beforeProvider = &before
+		committedProvider = channel
 		beforeStatus, beforeOtherInfo := channel.Status, channel.OtherInfo
 		overridesKeyExhaustion := channel.ProviderInfo.IsMultiKey && usingKey == "" &&
 			status == common.ChannelStatusManuallyDisabled && reason != ProviderStatusReasonAllKeysDisabled &&
@@ -804,7 +805,6 @@ func UpdateProviderStatusWithError(channelId int, usingKey string, status int, r
 				return err
 			}
 		}
-		committedProvider = channel
 		changed = true
 		return nil
 	})
@@ -812,7 +812,7 @@ func UpdateProviderStatusWithError(channelId int, usingKey string, status int, r
 		common.SysLog(common.LogText("failed to update channel status: channel_id=%d, status=%d, error=%v", channelId, status, err))
 		return false, err
 	}
-	if changed && common.MemoryCacheEnabled {
+	if common.MemoryCacheEnabled && (changed || usingKey == "" && committedProvider != nil) {
 		cacheProviderStatusTransition(beforeProvider, committedProvider)
 	}
 	return changed, nil

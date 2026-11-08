@@ -745,6 +745,80 @@ func TestTextGatewayAutoDisablePublishesOnlyTargetCache(t *testing.T) {
 	assert.EqualValues(t, 3, calls.Load(), "target's spare Key and unrelated Provider must remain selectable")
 }
 
+func TestTextGatewayManualDisableRepairsStaleCache(t *testing.T) {
+	for _, alreadyDisabled := range []bool{false, true} {
+		t.Run(fmt.Sprint("already disabled=", alreadyDisabled), func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"stale","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+			})
+			provider, err := model.GetProviderById(fixture.channel.ProviderID, true)
+			require.NoError(t, err)
+			provider.Key = "old-test-key\nspare-test-key"
+			provider.ProviderInfo = model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}
+			require.NoError(t, model.DB.Model(provider).Select("key", "channel_info").Updates(provider).Error)
+			common.MemoryCacheEnabled = true
+			model.InitProviderCache()
+			// Model another node's committed state without refreshing this node.
+			provider.ProviderInfo.MultiKeyStatusList = map[int]int{0: common.ChannelStatusAutoDisabled}
+			if alreadyDisabled {
+				provider.Status = common.ChannelStatusManuallyDisabled
+			}
+			require.NoError(t, model.DB.Model(provider).Select("status", "channel_info").Updates(provider).Error)
+			var admin model.User
+			require.NoError(t, model.DB.Where("username = ?", "security-admin").First(&admin).Error)
+			adminPAT := createWalletTestAccessToken(t, admin.Id, "channel:operate")
+			response := adminSecurityRequest(fixture.engine, adminPAT, http.MethodPost, fmt.Sprintf("/api/admin/v1/providers/%d/disable", provider.Id), "")
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			require.Contains(t, response.Body.String(), `"success":true`)
+			response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			assert.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+			assert.Zero(t, calls.Load(), "successful manual disable must immediately stop dispatch from a stale cache")
+		})
+	}
+}
+
+func TestProviderBatchStatusFailureRecordsCommittedTargets(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("unexpected Provider call") })
+	firstID := fixture.channel.ProviderID
+	failed := &model.Provider{Name: "Rejected status", Key: "failed-provider-secret", Status: common.ChannelStatusEnabled}
+	require.NoError(t, model.DB.Create(failed).Error)
+	for _, id := range []int{firstID, failed.Id} {
+		require.NoError(t, model.DB.Create(&model.Ability{ChannelId: id, Group: "default", Model: "legacy-model", Enabled: true}).Error)
+	}
+	require.NoError(t, model.DB.Exec(fmt.Sprintf(`CREATE FUNCTION reject_health_batch_status() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW."channel_id" = %d THEN RAISE EXCEPTION 'batch status write rejected'; END IF; RETURN NEW; END $$`, failed.Id)).Error)
+	require.NoError(t, model.DB.Exec(`CREATE TRIGGER reject_health_batch_status BEFORE UPDATE ON "abilities" FOR EACH ROW EXECUTE FUNCTION reject_health_batch_status()`).Error)
+	var admin model.User
+	require.NoError(t, model.DB.Where("username = ?", "security-admin").First(&admin).Error)
+	adminPAT := createWalletTestAccessToken(t, admin.Id, "channel:read", "channel:operate")
+	response := adminSecurityRequest(fixture.engine, adminPAT, http.MethodPost, "/api/channel/status/batch", fmt.Sprintf(`{"ids":[%d,%d],"status":2}`, firstID, failed.Id))
+	require.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), `"data":1`)
+	for id, expected := range map[int]int{firstID: common.ChannelStatusManuallyDisabled, failed.Id: common.ChannelStatusEnabled} {
+		read := adminSecurityRequest(fixture.engine, adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/providers/%d", id), "")
+		assert.Contains(t, read.Body.String(), fmt.Sprintf(`"status":%d`, expected))
+	}
+	logs, _, err := model.GetAuditLogs(model.AuditLogFilter{Category: model.AuditCategoryOperation}, 0, 100, common.RoleRootUser)
+	require.NoError(t, err)
+	found := false
+	for _, entry := range logs {
+		if entry.Action == "channel.status_update_batch" {
+			found = true
+			assert.False(t, entry.Success)
+			require.NotNil(t, entry.Other.Op)
+			params, err := common.Marshal(entry.Other.Op.Params)
+			require.NoError(t, err)
+			assert.Contains(t, string(params), fmt.Sprintf(`"committed_ids":[%d]`, firstID))
+			assert.Contains(t, string(params), fmt.Sprintf(`"failed_id":%d`, failed.Id))
+			assert.Contains(t, string(params), `"status":2`)
+			assert.NotContains(t, string(params), failed.Key)
+		}
+	}
+	assert.True(t, found, "partial failure must retain the actual committed and rejected targets")
+}
+
 func TestTextGatewayCircuitUsesProviderFailuresEvenAtAttemptLimit(t *testing.T) {
 	for _, shared := range []bool{false, true} {
 		t.Run(fmt.Sprint("redis=", shared), func(t *testing.T) { testGatewayCircuit(t, shared) })
