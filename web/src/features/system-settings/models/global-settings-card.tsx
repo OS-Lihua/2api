@@ -248,7 +248,7 @@ export function GlobalSettingsCard({ defaultValues }: GlobalSettingsCardProps) {
                 </FormControl>
                 <FormDescription>
                   {t(
-                    'Diagnostic codes accepted for every ModelOffering, in addition to its own list. Empty means no default losses are allowed. Stateful Responses fields cannot be allowed across protocols.'
+                    'Diagnostic codes accepted for every ModelOffering, in addition to its own list. Empty means no default losses are allowed. Conversion errors cannot be allowed.'
                   )}
                 </FormDescription>
                 <FormMessage />
