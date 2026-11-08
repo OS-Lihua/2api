@@ -1,6 +1,7 @@
 package service
 
 import (
+	"cmp"
 	"errors"
 	"slices"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/capability"
+	"github.com/QuantumNous/new-api/pkg/channelhealth"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -25,6 +27,8 @@ type GatewaySelection struct {
 	Diagnostics    map[string]any
 	Conversion     *relayconvert.RequestResult
 	ResponsesTools *convmeta.ResponsesToolState
+	Admission      channelhealth.Admission
+	conversionRank int
 }
 
 var ErrGatewayCapability = errors.New("no Channel supports the requested capabilities")
@@ -38,7 +42,8 @@ type GatewaySelectionOptions struct {
 }
 
 // SelectGatewayChannel preconverts candidates before any Attempt or reservation.
-// Same-protocol candidates rank before good, fair and discouraged conversions.
+// Protocol and conversion quality rank before runtime health ordering; the
+// shared health manager owns admission and recovery probe claims.
 func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request *dto.GeneralOpenAIRequest, options ...GatewaySelectionOptions) (*GatewaySelection, error) {
 	original := dto.Request(request)
 	var failures *GatewayExclusions
@@ -62,9 +67,8 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 	counts := map[string]int{}
 	excluded := []map[string]any{}
 	accepted := GatewayAcceptedConversionLosses(offering)
-	var selected *GatewaySelection
+	eligible := []*GatewaySelection{}
 	var rejected []types.ConversionDiagnostic
-	bestRank := 5
 	_, mediaPrepared := c.Get(gatewayMediaContextKey)
 	for _, candidate := range candidates {
 		if failures != nil && (failures.Channels[candidate.ID] || failures.Providers[candidate.ProviderID]) {
@@ -162,13 +166,10 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 			continue
 		}
 		diagnostics["eligible_count"] = diagnostics["eligible_count"].(int) + 1
-		if selected == nil || rank < bestRank {
-			bestRank = rank
-			selected = &GatewaySelection{Channel: candidate, Provider: provider, InputTokens: tokens, Capabilities: caps, Conversion: conversion, ResponsesTools: responsesTools}
-		}
+		eligible = append(eligible, &GatewaySelection{Channel: candidate, Provider: provider, InputTokens: tokens, Capabilities: caps, Conversion: conversion, ResponsesTools: responsesTools, conversionRank: rank})
 	}
 	diagnostics["excluded_counts"], diagnostics["excluded"] = counts, excluded
-	if selected == nil {
+	if len(eligible) == 0 {
 		if counts["conversion_loss"] > 0 {
 			return nil, &GatewayConversionError{Diagnostics: rejected}
 		}
@@ -177,6 +178,44 @@ func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request
 		}
 		return nil, ErrGatewayUnavailable
 	}
+	channelIDs := make([]int, 0, len(eligible))
+	for _, candidate := range eligible {
+		channelIDs = append(channelIDs, candidate.Channel.ID)
+	}
+	health, err := ChannelHealth.Snapshots(c.Request.Context(), channelIDs)
+	if err != nil {
+		return nil, ErrGatewayUnavailable
+	}
+	slices.SortStableFunc(eligible, func(a, b *GatewaySelection) int {
+		if order := cmp.Compare(a.conversionRank, b.conversionRank); order != 0 {
+			return order
+		}
+		left, right := health[a.Channel.ID], health[b.Channel.ID]
+		if order := cmp.Compare(right.SuccessRate, left.SuccessRate); order != 0 {
+			return order
+		}
+		return cmp.Compare(left.FirstByteMillis, right.FirstByteMillis)
+	})
+	for i, candidate := range eligible {
+		channelIDs[i] = candidate.Channel.ID
+	}
+	admission, err := ChannelHealth.Acquire(c.Request.Context(), channelIDs)
+	if err != nil || admission.ChannelID == 0 {
+		return nil, ErrGatewayUnavailable
+	}
+	var selected *GatewaySelection
+	for _, candidate := range eligible {
+		if candidate.Channel.ID == admission.ChannelID {
+			selected = candidate
+			continue
+		}
+		if health[candidate.Channel.ID].Circuit != "closed" {
+			counts["circuit_open"]++
+		}
+	}
+	selected.Admission = admission
+	diagnostics["health"] = health[selected.Channel.ID]
+	diagnostics["probe"] = admission.Lease != ""
 	selected.Diagnostics = diagnostics
 	return selected, nil
 }

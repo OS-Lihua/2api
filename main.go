@@ -341,6 +341,7 @@ func InitResources() error {
 		return err
 	}
 
+	service.InitGatewayHealth()
 	perfmetrics.Init()
 
 	// 启动系统监控

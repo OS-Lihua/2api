@@ -2,9 +2,11 @@ package model
 
 import (
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -51,8 +53,9 @@ func TestUpdateChannelStatusPersistsMultiKeyState(t *testing.T) {
 	assert.Equal(t, 1, stored.ProviderInfo.MultiKeyPollingIndex)
 }
 
-func TestSaveStatusStateFromSingleKeySnapshotPreservesUnownedColumns(t *testing.T) {
+func TestUpdateProviderStatusPreservesConcurrentConfiguration(t *testing.T) {
 	setupChannelStatusTest(t)
+	clock.UseFake(t, time.Unix(1234, 0))
 
 	channel := Provider{
 		Name:         "single-key-status",
@@ -75,23 +78,19 @@ func TestSaveStatusStateFromSingleKeySnapshotPreservesUnownedColumns(t *testing.
 		MultiKeyPollingIndex: 1,
 	}
 	require.NoError(t, DB.Model(&Provider{}).Where("id = ?", channel.Id).Updates(map[string]any{
-		"key":          "rotated-key",
+		"key":          "rotated-key\nspare-key",
 		"used_quota":   gorm.Expr("used_quota + ?", 250),
 		"models":       "concurrent-model",
 		"channel_info": concurrentChannelInfo,
 	}).Error)
 
-	stale.Status = common.ChannelStatusManuallyDisabled
-	stale.SetOtherInfo(map[string]any{
-		"status_reason": "manual operation",
-		"status_time":   int64(1234),
-	})
-	require.NoError(t, stale.saveStatusState())
+	assert.False(t, UpdateProviderStatus(stale.Id, stale.Key, common.ChannelStatusAutoDisabled, "old failure", 0))
+	require.True(t, UpdateProviderStatus(channel.Id, "", common.ChannelStatusManuallyDisabled, "manual operation"))
 
 	var stored Provider
 	require.NoError(t, DB.First(&stored, channel.Id).Error)
 	assert.Equal(t, common.ChannelStatusManuallyDisabled, stored.Status)
-	assert.Equal(t, "rotated-key", stored.Key)
+	assert.Equal(t, "rotated-key\nspare-key", stored.Key)
 	assert.Equal(t, int64(350), stored.UsedQuota)
 	assert.Equal(t, "concurrent-model", stored.Models)
 	assert.Equal(t, concurrentChannelInfo, stored.ProviderInfo)

@@ -32,6 +32,7 @@ import {
   ADMIN_PERMISSION_RESOURCES,
   ADMIN_PERMISSION_ACTIONS,
 } from '@/lib/admin-permissions'
+import { formatNumber } from '@/lib/format'
 import { useAuthStore } from '@/stores/auth-store'
 
 import {
@@ -72,6 +73,7 @@ export function ProviderChannels(props: { providerId: number }) {
     queryKey: channelKeys.list(props.providerId, pagination.pageIndex + 1),
     queryFn: () =>
       listSingleModelChannels(props.providerId, pagination.pageIndex + 1),
+    refetchInterval: 5_000,
   })
   const mutation = useMutation({
     mutationFn: async () => {
@@ -106,6 +108,60 @@ export function ProviderChannels(props: { providerId: number }) {
           copyable={false}
         />
       ),
+    },
+    {
+      id: 'health',
+      header: t('Runtime health'),
+      cell: ({ row }) => {
+        const health = row.original.health
+        if (!health) return t('Unavailable')
+        const labels = {
+          closed: t('Circuit closed'),
+          open: t('Circuit open'),
+          half_open: t('Half-open probe'),
+        }
+        return (
+          <div className='space-y-1 text-xs'>
+            <StatusBadge
+              label={labels[health.circuit]}
+              variant={health.circuit === 'closed' ? 'success' : 'neutral'}
+              copyable={false}
+            />
+            {health.samples > 0 ? (
+              <dl>
+                <div>
+                  <dt>{t('Recent success rate')}</dt>
+                  <dd>{formatNumber(health.success_rate * 100, locale)}%</dd>
+                </div>
+                <div>
+                  <dt>{t('First business byte latency')}</dt>
+                  <dd>
+                    {health.first_byte_samples > 0
+                      ? t('{{value}} ms', {
+                          value: formatNumber(health.first_byte_ms, locale),
+                        })
+                      : '-'}
+                  </dd>
+                </div>
+                <div>
+                  <dt>{t('Health samples')}</dt>
+                  <dd>{formatNumber(health.samples, locale)}</dd>
+                </div>
+              </dl>
+            ) : (
+              <p>{t('No recent samples')}</p>
+            )}
+            {health.retry_at > 0 && (
+              <p>
+                {t('Probe after')}:{' '}
+                <time dateTime={new Date(health.retry_at).toISOString()}>
+                  {new Date(health.retry_at).toLocaleString(locale)}
+                </time>
+              </p>
+            )}
+          </div>
+        )
+      },
     },
     {
       id: 'probe',
@@ -206,7 +262,10 @@ export function ProviderChannels(props: { providerId: number }) {
     totalCount: query.data?.total ?? 0,
   })
   return (
-    <section className='space-y-3 p-4' aria-label={t('Channels')}>
+    <section
+      className='w-full max-w-[calc(100vw-3rem)] space-y-3 p-4 whitespace-normal md:max-w-none'
+      aria-label={t('Channels')}
+    >
       <div className='flex items-center justify-between'>
         <h3 className='font-semibold'>{t('Channels')}</h3>
         {canWrite && (

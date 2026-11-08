@@ -9,9 +9,21 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/channelhealth"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/setting"
 )
+
+// ChannelHealth is initialized after Redis and shared by routing and completion.
+var ChannelHealth = channelhealth.New(nil)
+
+func InitGatewayHealth() {
+	var client = common.RDB
+	if !common.RedisEnabled {
+		client = nil
+	}
+	ChannelHealth = channelhealth.New(client)
+}
 
 // GatewayAttemptPolicy bounds actual upstream sends across the whole request.
 // The effective persisted configuration is frozen once per request.
@@ -145,9 +157,12 @@ func (b *GatewayAttemptBudget) TimedOut() bool {
 }
 
 type GatewayAttemptResult struct {
-	Attempt   *model.GatewayAttempt
-	Failure   GatewayFailure
-	Delivered bool
+	Attempt     *model.GatewayAttempt
+	Failure     GatewayFailure
+	Delivered   bool
+	FirstByte   time.Duration
+	RetryAfter  string
+	HealthLease string
 	// Skipped excludes a candidate rejected by preparation, without an Attempt.
 	SkippedChannel  int
 	SkippedProvider int
@@ -196,6 +211,13 @@ func RunGatewayAttempts(ctx context.Context, policy GatewayAttemptPolicy, execut
 			break
 		}
 		attempt := result.Attempt
+		action, healthErr := ChannelHealth.Record(context.WithoutCancel(ctx), channelhealth.Sample{
+			AttemptID: attempt.ID, ChannelID: attempt.ChannelID, Success: attempt.Status == "success",
+			ProviderFailure: result.Failure.Switch, RateLimited: result.Failure.Class == "rate_limited", FirstByte: result.FirstByte, RetryAfter: result.RetryAfter, Lease: result.HealthLease,
+		})
+		if healthErr == nil {
+			attempt.CircuitAction = action
+		}
 		attempt.FailoverDecision, attempt.FailoverReason = "stop", result.Failure.Class
 		if attempt.FailoverReason == "" {
 			attempt.FailoverReason = "completed"
