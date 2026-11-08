@@ -307,6 +307,23 @@ func TestKeyPermissionsIdentityVisibilityAndDeletion(t *testing.T) {
 	require.Equal(t, 200, response.Code, response.Body.String())
 	response = adminSecurityRequest(f.engine, pat, http.MethodGet, endpoint, "")
 	assert.Contains(t, response.Body.String(), `"exception_ids":[]`)
+	// A transient cache outage during revocation must not revive a cached Key
+	// once Redis becomes readable again.
+	warm := adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, "/v1/models", "")
+	require.Equal(t, http.StatusOK, warm.Code, warm.Body.String())
+	cache.SetError("cache unavailable")
+	revoked := adminSecurityRequest(f.engine, pat, http.MethodDelete, fmt.Sprintf("/api/token/%d", f.token.Id), "")
+	require.Equal(t, http.StatusOK, revoked.Code, revoked.Body.String())
+	assert.Contains(t, revoked.Body.String(), `"success":true`)
+	removed := adminSecurityRequest(f.engine, pat, http.MethodGet, endpoint, "")
+	assert.Equal(t, http.StatusNotFound, removed.Code, removed.Body.String())
+	cache.SetError("")
+	for _, name := range []string{"gateway-alias", "missing-offering"} {
+		detail := adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, "/v1/models/"+name, "")
+		assert.Equal(t, http.StatusUnauthorized, detail.Code, detail.Body.String())
+		call := adminSecurityRequest(f.engine, f.token.Key, http.MethodPost, "/v1/chat/completions", fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"Hello"}]}`, name))
+		assert.Equal(t, http.StatusUnauthorized, call.Code, call.Body.String())
+	}
 }
 
 func TestKeyPermissionsListDetailAndCall(t *testing.T) {

@@ -236,6 +236,16 @@ func validateUserToken(key string, checkQuota bool) (token *Token, err error) {
 		return nil, ErrTokenNotProvided
 	}
 	token, err = GetTokenByKey(key, false)
+	if err == nil && common.RedisEnabled {
+		// Cache invalidation can fail while a credential mutation still commits.
+		// Recheck identity restrictions in the primary database, while retaining
+		// the atomic quota counters used by the legacy relay.
+		cachedToken := token
+		token, err = GetTokenByKey(key, true)
+		if err == nil && token.Id == cachedToken.Id {
+			token.RemainQuota, token.UsedQuota = cachedToken.RemainQuota, cachedToken.UsedQuota
+		}
+	}
 	if err == nil {
 		if token.Status == common.TokenStatusExhausted ||
 			token.Status == common.TokenStatusExpired ||
