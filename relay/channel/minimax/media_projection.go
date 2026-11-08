@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 
+	"github.com/MoeForge/moego/ojson"
+
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 )
@@ -11,6 +13,9 @@ import (
 type speechRequestBody struct{ *bytes.Reader }
 
 func (speechRequestBody) ProjectAudioRequest(body []byte, public dto.AudioRequest) (*dto.AudioRequest, error) {
+	if len(public.MaxNewTokens) > 0 || ojson.GetBytes(body, "max_new_tokens").Exists() {
+		return nil, fmt.Errorf("MiniMax speech cannot enforce an output token limit")
+	}
 	var wire MiniMaxTTSRequest
 	if err := common.Unmarshal(body, &wire); err != nil {
 		return nil, err

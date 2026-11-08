@@ -5,6 +5,8 @@ import (
 	"io"
 	"math"
 
+	"github.com/MoeForge/moego/ojson"
+
 	"github.com/QuantumNous/new-api/common"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -13,6 +15,9 @@ import (
 type speechRequestBody struct{ io.Reader }
 
 func (speechRequestBody) ProjectAudioRequest(body []byte, public dto.AudioRequest) (*dto.AudioRequest, error) {
+	if len(public.MaxNewTokens) > 0 || ojson.GetBytes(body, "max_new_tokens").Exists() || ojson.GetBytes(body, "request.max_new_tokens").Exists() {
+		return nil, fmt.Errorf("Volcengine speech cannot enforce an output token limit")
+	}
 	var wire VolcengineTTSRequest
 	if err := common.Unmarshal(body, &wire); err != nil {
 		return nil, err

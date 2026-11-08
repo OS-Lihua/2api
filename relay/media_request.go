@@ -27,6 +27,7 @@ type PreparedMediaRequest struct {
 	Input       billingexpr.RequestInput
 	Body        []byte
 	ContentType string
+	nativeAudio bool
 }
 
 // PrepareMediaRequest validates the final media wire and prepares its transport.
@@ -45,6 +46,34 @@ func (a *ChannelAdaptor) PrepareMediaRequest(c *gin.Context, info *relaycommon.R
 		result.Input.Headers[strings.ToLower(key)] = strings.Join(values, ",")
 	}
 	return result, nil
+}
+
+// SetMediaOutputLimit installs a bounded default in the public speech wire.
+// Native audio projections must reject limits they cannot send to the Provider.
+func (a *ChannelAdaptor) SetMediaOutputLimit(prepared *PreparedMediaRequest, limit int64) error {
+	request, ok := prepared.Request.(*dto.AudioRequest)
+	if a.kind != protocol.OpenAIAudioSpeech || !ok || prepared.nativeAudio || limit <= 0 {
+		return fmt.Errorf("speech output limit cannot be sent to this Channel")
+	}
+	var fields map[string]common.RawMessage
+	if err := common.Unmarshal(prepared.Body, &fields); err != nil {
+		return err
+	}
+	encoded, err := common.Marshal(limit)
+	if err != nil {
+		return err
+	}
+	fields["max_new_tokens"] = encoded
+	body, err := common.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	if err := helper.ValidateGatewayMediaMultipliers(body); err != nil {
+		return err
+	}
+	request.MaxNewTokens = encoded
+	prepared.Body, prepared.Input.Body = body, body
+	return nil
 }
 
 // PrepareMediaWire converts and validates the effective media body without
@@ -187,6 +216,7 @@ func (a *ChannelAdaptor) PrepareMediaWire(c *gin.Context, info *relaycommon.Rela
 		}
 		result.Request, result.Input.ImageCount = &effective, &count
 	} else if projector, ok := converted.(channel.AudioRequestProjector); ok {
+		result.nativeAudio = true
 		effective, err := projector.ProjectAudioRequest(body, *request.(*dto.AudioRequest))
 		if err != nil {
 			return nil, err

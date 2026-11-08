@@ -44,7 +44,9 @@ type ResponseFacts struct {
 	GeneratedAudioBytes        int64
 	DeliveredAudioBytes        int64
 	GeneratedImageCount        int64
+	DeliveredImageCount        int64
 	AudioInputDurationReported bool
+	AudioInputDurationInvalid  bool
 	AudioOutputTokensReported  bool
 	GeneratedOutputTokens      *int
 	UpstreamRetryAfter         string // Transient; only the parsed cooldown may enter records.

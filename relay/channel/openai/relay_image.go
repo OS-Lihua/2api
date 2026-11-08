@@ -254,6 +254,9 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 		if info.ResponseFacts != nil {
 			var flushErr *helper.StreamFlushError
 			if (writeErr == nil || errors.As(writeErr, &flushErr)) && (openaiImageDataHasField(ojson.Parse(data), "url") || openaiImageDataHasField(ojson.Parse(data), "b64_json")) {
+				if chunk.Type == "image_generation.completed" || chunk.Type == "image_edit.completed" {
+					info.ResponseFacts.DeliveredImageCount = min(info.ResponseFacts.DeliveredImageCount+1, int64(dto.MaxImageN))
+				}
 				info.ResponseFacts.MarkBusinessOutput()
 			}
 			if writeErr != nil {
@@ -277,7 +280,11 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 	// StreamScannerHandler consumes the upstream [DONE]; re-emit it so the
 	// client still receives a terminal data: [DONE].
 	if info.StreamStatus != nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone && (info.ResponseFacts == nil || info.StreamStatus.ResponseOutcome() == string(relaycommon.ResponseOutcomeCompleted)) {
-		helper.Done(c)
+		if info.ResponseFacts == nil {
+			helper.Done(c)
+		} else if err := helper.StringData(c, "[DONE]"); err != nil {
+			info.ResponseFacts.DownstreamWriteFailed = true
+		}
 	}
 
 	applyUsagePostProcessing(info, usage, lastStreamData)
@@ -431,6 +438,7 @@ func openaiImageJSONAsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 	// without copying. Entries without url or b64_json carry no image and are
 	// not forwarded.
 	emitted := 0
+	var deliveredURLs, deliveredBase64 int64
 	for _, image := range ojson.GetBytesNoCopy(responseBody, "data").Array() {
 		if !openaiImageDataHasField(image, "url") && !openaiImageDataHasField(image, "b64_json") {
 			continue
@@ -459,6 +467,13 @@ func openaiImageJSONAsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 		if info.ResponseFacts != nil {
 			var flushErr *helper.StreamFlushError
 			if writeErr == nil || errors.As(writeErr, &flushErr) {
+				if openaiImageDataHasField(image, "url") {
+					deliveredURLs++
+				}
+				if openaiImageDataHasField(image, "b64_json") {
+					deliveredBase64++
+				}
+				info.ResponseFacts.DeliveredImageCount = min(max(deliveredURLs, deliveredBase64), int64(dto.MaxImageN))
 				info.ResponseFacts.MarkBusinessOutput()
 			}
 			info.ResponseFacts.DownstreamWriteFailed = writeErr != nil
@@ -472,6 +487,9 @@ func openaiImageJSONAsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 		emitted++
 	}
 	if err := writeOpenaiImageStreamDone(c); err != nil {
+		if info != nil && info.ResponseFacts != nil {
+			info.ResponseFacts.DownstreamWriteFailed = true
+		}
 		if info != nil && info.StreamStatus != nil {
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
 		}

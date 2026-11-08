@@ -236,6 +236,12 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 			limits.MaxOutputTokens = &remaining
 		}
 	}
+	if audio, ok := prepared.Request.(*dto.AudioRequest); ok && run.parsed.Protocol == protocol.OpenAIAudioSpeech && len(audio.MaxNewTokens) == 0 && limits.MaxOutputTokens != nil {
+		if err := adaptor.SetMediaOutputLimit(prepared, *limits.MaxOutputTokens); err != nil {
+			run.status, run.code = 400, "unsupported_parameter"
+			return skipped
+		}
+	}
 	if len(prepared.Input.Body) > 0 && helper.ValidateGatewayMediaMultipliers(prepared.Input.Body, limits) != nil {
 		run.status, run.code = 400, "unsupported_parameter"
 		return skipped
@@ -425,7 +431,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	}
 	facts := info.ResponseFacts
 	generated := facts.BusinessOutput || facts.GeneratedImageCount > 0 || facts.GeneratedAudioBytes > 0 || facts.GeneratedText != "" || facts.ImageCount != nil && *facts.ImageCount > 0
-	if !facts.PromptTokensReported && !facts.AudioInputDurationReported && (generated || facts.CompletionTokensReported) {
+	if !facts.PromptTokensReported && !facts.AudioInputDurationReported && (generated || facts.CompletionTokensReported || facts.AudioInputDurationInvalid) {
 		usage.PromptTokens = inputTokens
 		if run.parsed.Protocol == protocol.OpenAIAudioTranscription {
 			usage.PromptTokensDetails.AudioTokens = inputTokens
@@ -439,7 +445,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	if info.QuotaClamp != nil {
 		attempt.RouteDiagnostics["quota_saturation"] = info.QuotaClamp.AuditMap()
 	}
-	if generated || facts.PromptTokensReported || facts.CompletionTokensReported {
+	if generated || facts.PromptTokensReported || facts.CompletionTokensReported || facts.AudioInputDurationReported || facts.AudioInputDurationInvalid {
 		attempt.UsageSource = "estimated"
 	}
 	if facts.UsageReported {
@@ -495,6 +501,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	gatewayAutoDisableProvider(c, selection, info, failure)
 	run.record.Status = attempt.Status
 	if facts.BusinessOutput {
+		run.record.ChoiceCount = count
 		run.record.Usage = attempt.Usage
 		run.record.UsageSource = attempt.UsageSource
 	} else {
@@ -509,6 +516,13 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	if facts.BusinessOutput {
 		saleUsage := usage
 		billableFacts := *facts
+		saleCount := actualCount
+		if info.IsStream && run.parsed.Protocol == protocol.OpenAIImages && facts.DownstreamWriteFailed && !facts.UsageReported && facts.ImageCount != nil {
+			delivered := min(facts.DeliveredImageCount, *facts.ImageCount)
+			billableFacts.ImageCount = &delivered
+			saleCount = []int{int(delivered)}
+			run.record.UsageSource = "estimated"
+		}
 		estimateDelivered := attempt.Status == "partial" || !facts.UsageReported && (attempt.Status == "cancelled" || facts.DownstreamWriteFailed)
 		if info.IsStream && run.parsed.Protocol == protocol.OpenAIAudioSpeech && estimateDelivered {
 			output, clamp := common.QuotaRoundChecked(math.Ceil(float64(facts.DeliveredAudioBytes) / 1000))
@@ -536,10 +550,10 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		}
 		run.record.Usage = service.GatewayRecordUsage(saleUsage, &billableFacts)
 		run.saleUsage = service.GatewayUsageSnapshot(saleUsage)
-		source, receivable, trace, priceErr := service.GatewayPrice(run.sale, saleUsage, saleInput, run.started, run.ratio, run.saleFX, actualCount...)
+		source, receivable, trace, priceErr := service.GatewayPrice(run.sale, saleUsage, saleInput, run.started, run.ratio, run.saleFX, saleCount...)
 		trace.MatchedTier = ""
 		run.saleTrace = &trace
-		if attempt.Status != "success" && (trace.BillingUnit == billingexpr.BillingUnitRequest && trace.ImageCount == nil || billingexpr.UsesOnlyFixedPricing(run.sale.Expression) && run.parsed.Protocol != protocol.OpenAIImages) {
+		if attempt.Status != "success" && trace.ImageCount == nil && (trace.BillingUnit == billingexpr.BillingUnitRequest || billingexpr.UsesOnlyFixedPricing(run.sale.Expression)) {
 			source, _ = money.ParseValue("0", run.sale.Currency)
 			receivable, _ = money.ParseValue("0", model.SettlementCurrency())
 			priceErr = nil

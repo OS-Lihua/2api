@@ -337,23 +337,20 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		normalizeOpenAIUsage(responseData.Usage)
 		observeMediaUsage(info, responseData.Usage, responseBody)
 	}
-	if info.ResponseFacts != nil && structured {
-		if fault := observeMediaError(info, responseBody, resp.StatusCode); fault != nil {
-			return types.WithOpenAIError(*fault, resp.StatusCode), responseData.Usage
-		}
-	}
 	if info.ResponseFacts != nil && structured && decodeErr == nil {
 		duration := ojson.GetBytes(responseBody, "usage.seconds")
 		if !duration.Exists() {
 			duration = ojson.GetBytes(responseBody, "duration")
 		}
 		if duration.Exists() {
+			info.ResponseFacts.AudioInputDurationInvalid = true
 			if duration.Type == ojson.Number && helper.ValidateGatewayMediaMultipliers([]byte(`{"duration":`+duration.Raw+`}`)) == nil {
 				seconds, err := decimal.NewFromString(duration.Raw)
 				if err == nil {
 					text := seconds.String()
 					info.ResponseFacts.AudioInputSeconds = &text
 					info.ResponseFacts.AudioInputDurationReported = true
+					info.ResponseFacts.AudioInputDurationInvalid = false
 					if !info.ResponseFacts.PromptTokensReported {
 						if responseData.Usage == nil {
 							responseData.Usage = &dto.Usage{}
@@ -375,6 +372,11 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 					info.QuotaClamp = clamp
 				}
 			}
+		}
+	}
+	if info.ResponseFacts != nil && structured {
+		if fault := observeMediaError(info, responseBody, resp.StatusCode); fault != nil {
+			return types.WithOpenAIError(*fault, resp.StatusCode), responseData.Usage
 		}
 	}
 	if info.ResponseFacts != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices) {
