@@ -1570,7 +1570,7 @@ func TestRealtimeGatewayFreezesInheritedReasoning(t *testing.T) {
 }
 
 func TestRealtimeGatewayRetainsReportedInputForNextResponse(t *testing.T) {
-	for _, scenario := range []string{"default", "none default", "explicit replacement", "deleted before done", "audio details only", "inflight unrelated input deletion"} {
+	for _, scenario := range []string{"default", "none default", "explicit replacement", "deleted before done", "audio details only", "inflight unrelated input deletion", "inflight unrelated output deletion"} {
 		t.Run(scenario, func(t *testing.T) {
 			var calls atomic.Int32
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1609,6 +1609,27 @@ func TestRealtimeGatewayRetainsReportedInputForNextResponse(t *testing.T) {
 					created := fmt.Sprintf(`{"type":"response.created","response":{"id":%q,"status":"in_progress"}}`, id)
 					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(created))) {
 						return
+					}
+					if index == 1 && scenario == "inflight unrelated output deletion" {
+						if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
+							return
+						}
+						calls.Add(1)
+						for _, frame := range []string{`{"type":"response.created","response":{"id":"input-2","status":"in_progress"}}`, `{"type":"response.output_item.done","response_id":"input-1","item":{"id":"later-output","type":"message","role":"assistant","content":[{"type":"text","text":"Hi"}]}}`, `{"type":"response.done","response":{"id":"input-1","status":"completed","output":[{"id":"later-output","type":"message","role":"assistant","content":[{"type":"text","text":"Hi"}]}],"usage":{"input_tokens":600,"output_tokens":1}}}`} {
+							if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(frame))) {
+								return
+							}
+						}
+						if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
+							return
+						}
+						if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"conversation.item.deleted","item_id":"later-output"}`))) {
+							return
+						}
+						if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"input-2","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"text","text":"Hi"}]}],"usage":{"input_tokens":20000,"output_tokens":1}}}`))) {
+							return
+						}
+						continue
 					}
 					if index == 1 && scenario == "inflight unrelated input deletion" {
 						if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
@@ -1672,6 +1693,16 @@ func TestRealtimeGatewayRetainsReportedInputForNextResponse(t *testing.T) {
 			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(first)))
 			_, _, err = client.ReadMessage()
 			require.NoError(t, err)
+			if scenario == "inflight unrelated output deletion" {
+				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"conversation":"none"}}`)))
+				for range 3 {
+					_, _, err = client.ReadMessage()
+					require.NoError(t, err)
+				}
+				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"conversation.item.delete","item_id":"later-output"}`)))
+				_, _, err = client.ReadMessage()
+				require.NoError(t, err)
+			}
 			if scenario == "inflight unrelated input deletion" {
 				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"conversation.item.create","item":{"id":"later","type":"message","role":"user","content":[{"type":"input_text","text":"Later"}]}}`)))
 				_, _, err = client.ReadMessage()
@@ -1687,9 +1718,13 @@ func TestRealtimeGatewayRetainsReportedInputForNextResponse(t *testing.T) {
 			}
 			_, _, err = client.ReadMessage()
 			require.NoError(t, err)
+			wanted, expectedCalls := 1, int32(1)
+			if scenario == "inflight unrelated output deletion" {
+				wanted, expectedCalls = 2, 2
+			}
 			require.Eventually(t, func() bool {
 				records, _, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
-				return err == nil && len(records) == 1 && records[0].Status == "success"
+				return err == nil && len(records) == wanted && records[0].Status == "success" && (wanted == 1 || records[1].Status == "success")
 			}, 5*time.Second, 10*time.Millisecond)
 			wallet, err := model.GetUserWallet(fixture.user.Id)
 			require.NoError(t, err)
@@ -1697,9 +1732,9 @@ func TestRealtimeGatewayRetainsReportedInputForNextResponse(t *testing.T) {
 			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{}}`)))
 			_, raw, err := client.ReadMessage()
 			require.NoError(t, err)
-			if scenario == "default" || scenario == "none default" || scenario == "audio details only" || scenario == "inflight unrelated input deletion" {
+			if scenario == "default" || scenario == "none default" || scenario == "audio details only" || scenario == "inflight unrelated input deletion" || scenario == "inflight unrelated output deletion" {
 				assert.Equal(t, "error", ojson.GetBytes(raw, "type").String())
-				assert.Equal(t, int32(1), calls.Load())
+				assert.Equal(t, expectedCalls, calls.Load())
 			} else {
 				assert.Equal(t, "response.created", ojson.GetBytes(raw, "type").String())
 				_, _, err = client.ReadMessage()
