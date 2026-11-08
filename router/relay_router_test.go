@@ -2959,7 +2959,9 @@ func TestTextGatewayCozeRejectionsPreserveStatusAndProviderScope(t *testing.T) {
 		for _, status := range []int{400, 401, 403} {
 			for _, format := range []string{"json", "text", "truncated"} {
 				t.Run(fmt.Sprint(stage, "/", status, "/", format), func(t *testing.T) {
+					var nativeCalls atomic.Int32
 					fixture := newTextGatewayFixtureWithNativeLosses(t, func(w http.ResponseWriter, r *http.Request) {
+						nativeCalls.Add(1)
 						w.Header().Set("Content-Type", "application/json")
 						if stage == "poll" && r.Method == http.MethodPost {
 							_, _ = w.Write([]byte(`{"code":0,"data":{"id":"chat","conversation_id":"conversation"}}`))
@@ -2998,6 +3000,11 @@ func TestTextGatewayCozeRejectionsPreserveStatusAndProviderScope(t *testing.T) {
 					fixture.offering.RouteMethod = "weight"
 					require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
 					response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","user":"preview-user","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+					expectedCalls := int32(1)
+					if stage == "poll" {
+						expectedCalls++
+					}
+					assert.Equal(t, expectedCalls, nativeCalls.Load())
 					attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
 					require.NoError(t, err)
 					if status == 400 {
@@ -4590,6 +4597,84 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 	}
 }
 
+func TestTextGatewayPaLMJSONPreservesCandidateCount(t *testing.T) {
+	var sent struct {
+		CandidateCount int `json:"candidateCount"`
+	}
+	calls := 0
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		assert.NoError(t, common.DecodeJson(r.Body, &sent))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"candidates":[{"content":"Hello"},{"content":"World"}]}`)
+	})
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypePaLM).Error)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","n":2,"stream":false,"messages":[{"role":"user","content":"Hello"}]}`)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, 2, sent.CandidateCount)
+	var result dto.OpenAITextResponse
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+	require.Len(t, result.Choices, 2)
+	assert.Equal(t, "Hello", result.Choices[0].Message.StringContent())
+	assert.Equal(t, "World", result.Choices[1].Message.StringContent())
+}
+
+type gatewayCancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (body *gatewayCancelOnCloseBody) Close() error {
+	err := body.ReadCloser.Close()
+	body.cancel()
+	return err
+}
+
+func TestTextGatewayNativeJSONCancellationPreservesPurchase(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	fixture := newTextGatewayFixtureWithNativeLosses(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"answer":"Hello"}`)
+	})
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeDify).Error)
+	client := service.GetHttpClient()
+	original := client.Transport
+	t.Cleanup(func() { client.Transport = original })
+	client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
+		response, err := original.RoundTrip(request)
+		if err == nil {
+			response.Body = &gatewayCancelOnCloseBody{ReadCloser: response.Body, cancel: cancel}
+		}
+		return response, err
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gateway-alias","user":"gateway-user","messages":[{"role":"user","content":"Hello"}]}`)).WithContext(ctx)
+	request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	fixture.engine.ServeHTTP(response, request)
+	require.ErrorIs(t, ctx.Err(), context.Canceled)
+	assert.NotContains(t, response.Body.String(), "Hello")
+	requests := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests", "")
+	require.True(t, requests.Success, requests.Message)
+	items := requests.Data["items"].([]any)
+	require.Len(t, items, 1)
+	record := items[0].(map[string]any)
+	assert.Equal(t, response.Header().Get(common.RequestIdKey), record["id"])
+	assert.Equal(t, map[string]any{"nanos": "0", "currency": "USD"}, record["receivable"])
+	attempts := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests/"+record["id"].(string)+"/attempts", "")
+	require.True(t, attempts.Success, attempts.Message)
+	items = attempts.Data["items"].([]any)
+	require.Len(t, items, 1)
+	attempt := items[0].(map[string]any)
+	usage := attempt["usage"].(map[string]any)
+	assert.EqualValues(t, 13, usage["prompt_tokens"])
+	assert.EqualValues(t, 1, usage["completion_tokens"])
+	assert.Equal(t, "estimated", attempt["usage_source"])
+	assert.Equal(t, map[string]any{"nanos": "15000", "currency": "USD"}, attempt["cost"])
+}
+
 func TestTextGatewayCozeCompletedUsageSurvivesMessageFetchFailure(t *testing.T) {
 	for _, failure := range []string{"connection", "cancellation"} {
 		t.Run(failure, func(t *testing.T) {
@@ -4876,16 +4961,15 @@ func TestTextGatewayDefaultOutputLimitPreservesExplicitZero(t *testing.T) {
 	for _, tc := range []struct {
 		name, clientField, wirePath string
 		upstream                    protocol.Type
-		preservesZero               bool
 	}{
-		{"Chat max tokens", "max_tokens", "max_tokens", protocol.OpenAIChat, true},
-		{"Chat completion tokens", "max_completion_tokens", "max_completion_tokens", protocol.OpenAIChat, true},
-		{"Gemini max tokens", "max_tokens", "generationConfig.maxOutputTokens", protocol.GeminiGenerate, true},
-		{"Gemini completion tokens", "max_completion_tokens", "generationConfig.maxOutputTokens", protocol.GeminiGenerate, true},
-		{"Responses max tokens", "max_tokens", "max_output_tokens", protocol.OpenAIResponses, true},
-		{"Responses completion tokens", "max_completion_tokens", "max_output_tokens", protocol.OpenAIResponses, true},
-		{"Claude max tokens", "max_tokens", "max_tokens", protocol.AnthropicMessages, true},
-		{"Claude completion tokens", "max_completion_tokens", "max_tokens", protocol.AnthropicMessages, true},
+		{"Chat max tokens", "max_tokens", "max_tokens", protocol.OpenAIChat},
+		{"Chat completion tokens", "max_completion_tokens", "max_completion_tokens", protocol.OpenAIChat},
+		{"Gemini max tokens", "max_tokens", "generationConfig.maxOutputTokens", protocol.GeminiGenerate},
+		{"Gemini completion tokens", "max_completion_tokens", "generationConfig.maxOutputTokens", protocol.GeminiGenerate},
+		{"Responses max tokens", "max_tokens", "max_output_tokens", protocol.OpenAIResponses},
+		{"Responses completion tokens", "max_completion_tokens", "max_output_tokens", protocol.OpenAIResponses},
+		{"Claude max tokens", "max_tokens", "max_tokens", protocol.AnthropicMessages},
+		{"Claude completion tokens", "max_completion_tokens", "max_tokens", protocol.AnthropicMessages},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls atomic.Int64
@@ -4937,17 +5021,9 @@ func TestTextGatewayDefaultOutputLimitPreservesExplicitZero(t *testing.T) {
 			body := fmt.Sprintf(`{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],%q:0}`, tc.clientField)
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
 			assert.GreaterOrEqual(t, response.Code, http.StatusBadRequest, response.Body.String())
-			if tc.preservesZero {
-				assert.NotEqual(t, http.StatusPaymentRequired, response.Code, response.Body.String())
-				require.EqualValues(t, 1, calls.Load())
-				assert.EqualValues(t, 0, <-observed, "explicit zero must reach the Provider unchanged, which can reject its protocol range")
-			} else {
-				assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
-				assert.Zero(t, calls.Load(), "a conversion that replaces explicit zero must fail before Provider I/O")
-				_, attempts, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
-				require.NoError(t, err)
-				assert.Zero(t, attempts)
-			}
+			assert.NotEqual(t, http.StatusPaymentRequired, response.Code, response.Body.String())
+			require.EqualValues(t, 1, calls.Load())
+			assert.EqualValues(t, 0, <-observed, "explicit zero must reach the Provider unchanged, which can reject its protocol range")
 			after, err := model.GetUserWallet(fixture.user.Id)
 			require.NoError(t, err)
 			assert.Equal(t, before.Balance.Nanos, after.Balance.Nanos)

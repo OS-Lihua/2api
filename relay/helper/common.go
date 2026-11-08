@@ -464,6 +464,7 @@ func WriteChatResponse(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	if resp.StatusCode != http.StatusOK {
 		return &response.Usage, types.NewErrorWithStatusCode(errors.New("upstream request failed"), types.ErrorCodeBadResponse, resp.StatusCode)
 	}
+	facts.RecordChatSource(response)
 	var output strings.Builder
 	business := false
 	for _, choice := range response.Choices {
