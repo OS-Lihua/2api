@@ -17,6 +17,7 @@ import (
 
 func offeringModelsError(c *gin.Context, modelType, status int, code, message string) {
 	if code == "model_not_found" {
+		service.RecordGatewayModelAccessDenied(c)
 		message = i18n.T(c, i18n.MsgGatewayModelNotFound)
 	} else if code == "authorization_unavailable" {
 		message = i18n.T(c, i18n.MsgGatewayAuthorizationUnavailable)

@@ -34,6 +34,9 @@ import (
 )
 
 func gatewayError(c *gin.Context, status int, code, message string) {
+	if code == "model_not_found" {
+		service.RecordGatewayModelAccessDenied(c)
+	}
 	c.AbortWithStatusJSON(status, gin.H{"error": types.OpenAIError{Code: code, Type: "gateway_error", Message: message}})
 }
 
