@@ -53,10 +53,16 @@ func EstimateRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *rela
 	return CountRequestToken(c, meta, info)
 }
 
+// RequestTokenOptions controls whether declared fixed-cost media types need
+// MIME discovery. Native file references are not downloadable client assets.
+type RequestTokenOptions struct {
+	UseDeclaredMediaTypes bool
+}
+
 // CountRequestToken counts request tokens regardless of the billing estimation
 // switch. Utility endpoints such as Claude's messages/count_tokens must remain
 // available even when operators disable request-token estimation for relays.
-func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relaycommon.RelayInfo) (int, error) {
+func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relaycommon.RelayInfo, options ...RequestTokenOptions) (int, error) {
 	if meta == nil {
 		return 0, errors.New("token count meta is nil")
 	}
@@ -129,6 +135,9 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 	// 使用统一的文件服务获取文件类型
 	for _, file := range meta.Files {
 		if file.Source == nil {
+			continue
+		}
+		if len(options) > 0 && options[0].UseDeclaredMediaTypes && file.FileType != "" && file.FileType != types.FileTypeImage {
 			continue
 		}
 

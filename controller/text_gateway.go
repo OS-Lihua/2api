@@ -389,7 +389,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	// must not vary with the downstream presentation protocol.
 	counterInfo := *info
 	counterInfo.RelayFormat = types.RelayFormatOpenAI
-	estimatedInput, err := service.CountRequestToken(c, effective.GetTokenCountMeta(), &counterInfo)
+	estimatedInput, err := service.CountRequestToken(c, effective.GetTokenCountMeta(), &counterInfo, service.RequestTokenOptions{UseDeclaredMediaTypes: true})
 	if err != nil || !service.GatewayCapabilitiesMatch(effective, selection.Capabilities, estimatedInput) {
 		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
 		return
@@ -538,7 +538,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			}
 			if usage != nil {
 				if !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && (info.ResponseFacts.BusinessOutput || info.ResponseFacts.GeneratedText != "") {
-					usage.PromptTokens = estimatedInput
+					usage.PromptTokens = max(usage.PromptTokens, estimatedInput)
 				}
 				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 				attempt.Usage, attempt.UsageSource = service.GatewayRecordUsage(usage), "estimated"

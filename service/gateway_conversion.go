@@ -43,14 +43,42 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 	if err != nil {
 		return nil, err
 	}
+	projectionMedia := map[string]dto.MediaContent{}
+	if gemini, ok := request.(*dto.GeminiChatRequest); ok {
+		for i, content := range gemini.Contents {
+			for j, part := range content.Parts {
+				if part.FileData == nil || part.FileData.FileUri == "" {
+					continue
+				}
+				mime := strings.ToLower(part.FileData.MimeType)
+				path := fmt.Sprintf("contents[%d].parts[%d].fileData", i, j)
+				switch {
+				case strings.HasPrefix(mime, "audio/"):
+					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeInputAudio, InputAudio: &dto.MessageInputAudio{Data: part.FileData.FileUri, Format: strings.TrimPrefix(mime, "audio/")}}
+				case mime == "application/pdf":
+					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeFile, File: &dto.MessageFile{FileName: "reference.pdf", FileData: part.FileData.FileUri}}
+				}
+			}
+		}
+	}
+	var referencedMedia []dto.MediaContent
 	for _, diagnostic := range result.Diagnostics {
 		if (diagnostic.Code == "unsupported_media_type" || diagnostic.Code == "unsupported_media_source") && diagnostic.Severity == types.ConversionDiagnosticError {
+			if media, represented := projectionMedia[diagnostic.Path]; represented {
+				referencedMedia = append(referencedMedia, media)
+				continue
+			}
 			return nil, fmt.Errorf("request media cannot be represented for validation")
 		}
 	}
 	chat, ok := result.Value.(*dto.GeneralOpenAIRequest)
 	if !ok {
 		return nil, fmt.Errorf("missing text request projection")
+	}
+	if len(referencedMedia) > 0 {
+		// This validation-only bucket retains native reference modalities and
+		// their conservative input estimate. It is never an upstream request.
+		chat.Messages = append(chat.Messages, dto.Message{Role: "user", Content: referencedMedia})
 	}
 	if claude, ok := request.(*dto.ClaudeRequest); ok {
 		format := gjson.GetBytes(claude.OutputConfig, "format")

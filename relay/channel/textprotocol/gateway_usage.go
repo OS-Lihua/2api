@@ -46,13 +46,16 @@ func (a *gatewayUsageAccumulator) Observe(body []byte) (*dto.Usage, error) {
 	if err != nil {
 		return nil, err
 	}
+	var usage *dto.Usage
+	promptKey, completionKey := "prompt_tokens", "completion_tokens"
 	switch a.format {
 	case types.RelayFormatClaude:
 		var native dto.ClaudeUsage
 		if err := common.Unmarshal(encoded, &native); err != nil {
 			return nil, err
 		}
-		return relayconvert.UsageFromClaudeAPIUsage(&native), nil
+		promptKey, completionKey = "input_tokens", "output_tokens"
+		usage = relayconvert.UsageFromClaudeAPIUsage(&native)
 	case types.RelayFormatGemini:
 		var native dto.GeminiUsageMetadata
 		if err := common.Unmarshal(encoded, &native); err != nil {
@@ -60,17 +63,39 @@ func (a *gatewayUsageAccumulator) Observe(body []byte) (*dto.Usage, error) {
 		}
 		// Total is not a substitute for an independently present output count.
 		native.TotalTokenCount = 0
-		return relayconvert.UsageFromGeminiMetadata(&native, 0), nil
+		promptKey, completionKey = "promptTokenCount", "candidatesTokenCount"
+		usage = relayconvert.UsageFromGeminiMetadata(&native, 0)
 	default:
 		var native dto.Usage
 		if err := common.Unmarshal(encoded, &native); err != nil {
 			return nil, err
 		}
 		if a.format == types.RelayFormatOpenAIResponses {
-			return relayconvert.UsageFromResponsesUsage(&native), nil
+			promptKey, completionKey = "input_tokens", "output_tokens"
+			usage = relayconvert.UsageFromResponsesUsage(&native)
+		} else {
+			usage = relayconvert.UsageFromChatUsage(&native)
+			usage.PromptTokensDetails = native.PromptTokensDetails.Clone()
 		}
-		return relayconvert.UsageFromChatUsage(&native), nil
 	}
+	// Missing base counters may be bounded by independently reported subsets.
+	// An explicit base zero remains authoritative even with inconsistent details.
+	if _, present := a.snapshot[promptKey]; !present && a.format != types.RelayFormatClaude {
+		details := usage.PromptTokensDetails
+		usage.PromptTokens = max(usage.PromptTokens, details.CachedTokens, details.TextTokens+details.ImageTokens+details.AudioTokens)
+	}
+	if _, present := a.snapshot[completionKey]; !present {
+		details := usage.CompletionTokenDetails
+		known := details.TextTokens + details.ImageTokens + details.AudioTokens
+		if a.format == types.RelayFormatGemini {
+			known += details.ReasoningTokens
+		} else {
+			known = max(known, details.ReasoningTokens)
+		}
+		usage.CompletionTokens = max(usage.CompletionTokens, known)
+	}
+	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	return usage, nil
 }
 
 // ReportedCounters identifies independently valid usage, including cache/audio

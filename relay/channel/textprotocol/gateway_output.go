@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/QuantumNous/new-api/relaykit/types"
+
 	"github.com/tidwall/gjson"
 )
 
@@ -195,7 +197,18 @@ func gatewayResponseTool(item gjson.Result) (string, string, bool) {
 	}
 }
 
-func gatewayGeminiMediaOutput(body []byte) bool {
+func gatewayMediaOutput(body []byte, format types.RelayFormat) bool {
+	if format == types.RelayFormatOpenAI {
+		for _, choice := range gjson.GetBytes(body, "choices").Array() {
+			if choice.Get("message.audio.data").String() != "" || choice.Get("delta.audio.data").String() != "" {
+				return true
+			}
+		}
+		return false
+	}
+	if format != types.RelayFormatGemini {
+		return false
+	}
 	for _, candidate := range gjson.GetBytes(body, "candidates").Array() {
 		for _, part := range candidate.Get("content.parts").Array() {
 			if part.Get("inlineData.data").String() != "" {

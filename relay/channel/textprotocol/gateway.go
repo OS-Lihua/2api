@@ -112,7 +112,7 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	}
 	canonical, err := relayconvert.ConvertResponse(c, info, types.RelayFormatOpenAI, response)
 	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+		return usage, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	var generated strings.Builder
 	nativeMessages := p.format == types.RelayFormatClaude && info.RelayFormat == types.RelayFormatClaude
@@ -121,13 +121,13 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	if chat, ok := canonical.Value.(*dto.OpenAITextResponse); ok && !nativeMessages && !nativeGemini && !nativeResponses {
 		for _, choice := range chat.Choices {
 			generated.WriteString(choice.Message.StringContent())
-			if choice.Message.ReasoningContent != nil {
-				generated.WriteString(*choice.Message.ReasoningContent)
-			}
+			generated.WriteString(choice.Message.GetReasoningContent())
 			if p.format != types.RelayFormatOpenAIResponses || info.RelayFormat != types.RelayFormatOpenAIResponses {
 				for _, tool := range choice.Message.ParseToolCalls() {
 					generated.WriteString(tool.Function.Name)
 					generated.WriteString(tool.Function.Arguments)
+					generated.WriteString(gjson.GetBytes(tool.Custom, "name").String())
+					generated.WriteString(gjson.GetBytes(tool.Custom, "input").String())
 				}
 			}
 		}
@@ -151,9 +151,15 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 			}
 		}
 	}
+	if p.format == types.RelayFormatOpenAI && info.RelayFormat == types.RelayFormatOpenAI {
+		for _, choice := range gjson.GetBytes(body, "choices").Array() {
+			generated.WriteString(choice.Get("message.refusal").String())
+			generated.WriteString(choice.Get("message.audio.transcript").String())
+		}
+	}
 	facts.GeneratedText = generated.String()
 	if !facts.PromptTokensReported {
-		usage.PromptTokens = info.GetEstimatePromptTokens()
+		usage.PromptTokens = max(usage.PromptTokens, info.GetEstimatePromptTokens())
 	}
 	if !facts.CompletionTokensReported {
 		usage.CompletionTokens = max(usage.CompletionTokens, tokenkit.Count(info.TokenizerModelName(), facts.GeneratedText))
@@ -174,7 +180,7 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		facts.DownstreamWriteFailed = true
 		return usage, types.NewError(err, types.ErrorCodeBadResponse)
 	}
-	if facts.GeneratedText != "" || nativeGemini && gatewayGeminiMediaOutput(encoded) {
+	if facts.GeneratedText != "" || gatewayMediaOutput(encoded, info.RelayFormat) {
 		facts.MarkBusinessOutput()
 	}
 	if p.format == types.RelayFormatOpenAIResponses {

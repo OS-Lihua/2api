@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
@@ -143,7 +144,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 	}
 	info.ResponseFacts.GeneratedText = output.String()
 	if !info.ResponseFacts.PromptTokensReported {
-		usage.PromptTokens = info.GetEstimatePromptTokens()
+		usage.PromptTokens = max(usage.PromptTokens, info.GetEstimatePromptTokens())
 	}
 	if !info.ResponseFacts.CompletionTokensReported {
 		usage.CompletionTokens = max(usage.CompletionTokens, tokenkit.Count(info.TokenizerModelName(), output.String()))
@@ -184,6 +185,16 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 	switch v := value.(type) {
 	case json.RawMessage:
 		event = gjson.GetBytes(v, "type").String()
+		if info.RelayFormat == types.RelayFormatOpenAI && !info.ShouldIncludeUsage {
+			if len(gjson.GetBytes(v, "choices").Array()) == 0 {
+				return "", nil
+			}
+			filtered, err := sjson.DeleteBytes(v, "usage")
+			if err != nil {
+				return "", err
+			}
+			value = json.RawMessage(filtered)
+		}
 	case relayconvert.ChatToResponsesStreamEvent:
 		event, value = v.Type, v.Payload
 	case *dto.ResponsesStreamResponse:
@@ -223,7 +234,7 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 			text = value
 		}
 	}
-	business := text != "" || info.RelayFormat == types.RelayFormatGemini && gatewayGeminiMediaOutput(body)
+	business := text != "" || gatewayMediaOutput(body, info.RelayFormat)
 	writeErr := helper.WriteGatewayStreamFrame(c, info.ResponseFacts, frame, business)
 	if writeErr != nil {
 		info.ResponseFacts.DownstreamWriteFailed = true
@@ -254,10 +265,18 @@ func gatewayStreamBusinessText(body []byte, format types.RelayFormat) string {
 	case types.RelayFormatOpenAI:
 		for _, choice := range root.Get("choices").Array() {
 			text.WriteString(choice.Get("delta.content").String())
-			text.WriteString(choice.Get("delta.reasoning_content").String())
+			if reasoning := choice.Get("delta.reasoning_content"); reasoning.Exists() {
+				text.WriteString(reasoning.String())
+			} else {
+				text.WriteString(choice.Get("delta.reasoning").String())
+			}
+			text.WriteString(choice.Get("delta.refusal").String())
+			text.WriteString(choice.Get("delta.audio.transcript").String())
 			for _, tool := range choice.Get("delta.tool_calls").Array() {
 				text.WriteString(tool.Get("function.name").String())
 				text.WriteString(tool.Get("function.arguments").String())
+				text.WriteString(tool.Get("custom.name").String())
+				text.WriteString(tool.Get("custom.input").String())
 			}
 		}
 	case types.RelayFormatOpenAIResponses:

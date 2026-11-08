@@ -35,6 +35,16 @@ func InspectRequestParameters(ctx context.Context, source, target any, from, to 
 		}
 		Add(ctx, types.ConversionDiagnostic{Code: "response_modalities_dropped", Path: path, Message: "The target request did not retain the requested output modalities", Severity: types.ConversionDiagnosticWarning, From: from, To: to})
 	}
+	if before["safetySettings"] != nil && after["safetySettings"] == nil {
+		Add(ctx, types.ConversionDiagnostic{Code: "safety_settings_dropped", Path: "safetySettings", Message: "The target request omitted the safety settings", Severity: types.ConversionDiagnosticWarning, From: from, To: to})
+	}
+	if requestCandidateCount(before, from) != requestCandidateCount(after, to) {
+		path := "n"
+		if from == types.RelayFormatGemini {
+			path = "generationConfig.candidateCount"
+		}
+		Add(ctx, types.ConversionDiagnostic{Code: "candidate_count_dropped", Path: path, Message: "The target request did not retain the requested number of choices", Severity: types.ConversionDiagnosticWarning, From: from, To: to})
+	}
 	for _, key := range []string{"prompt_cache_key", "prompt_cache_options", "prompt_cache_retention", "cachedContent"} {
 		if before[key] != nil && after[key] == nil {
 			Add(ctx, types.ConversionDiagnostic{Code: "cache_parameter_dropped", Path: key, Message: "The target request omitted this cache parameter", Severity: types.ConversionDiagnosticWarning, From: from, To: to})
@@ -82,6 +92,17 @@ func InspectRequestParameters(ctx context.Context, source, target any, from, to 
 		}
 	}
 	return nil
+}
+
+func requestCandidateCount(request map[string]any, format types.RelayFormat) int64 {
+	path := "n"
+	if format == types.RelayFormatGemini {
+		path = "generationConfig.candidateCount"
+	}
+	if count, ok := requestParameterAt(request, path).(float64); ok && count >= 1 && count <= 1<<31-1 {
+		return int64(count)
+	}
+	return 1
 }
 
 func requestOutputModalities(request map[string]any, format types.RelayFormat) []string {
