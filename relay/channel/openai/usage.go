@@ -171,6 +171,8 @@ func observeMediaUsage(info *relaycommon.RelayInfo, usage *dto.Usage, body []byt
 	for _, prefix := range []string{"usage.input_token_details", "usage.input_tokens_details", "usage.prompt_tokens_details"} {
 		text, _ := relaycommon.NativeUsagePresence(body, prefix+".text_tokens", "", "")
 		audio, _ := relaycommon.NativeUsagePresence(body, prefix+".audio_tokens", "", "")
+		image, _ := relaycommon.NativeUsagePresence(body, prefix+".image_tokens", "", "")
+		info.ResponseFacts.ImageInputTokensReported = info.ResponseFacts.ImageInputTokensReported || image
 		info.ResponseFacts.TextInputTokensReported = info.ResponseFacts.TextInputTokensReported || text
 		info.ResponseFacts.AudioInputTokensReported = info.ResponseFacts.AudioInputTokensReported || audio
 	}
@@ -180,6 +182,11 @@ func observeMediaUsage(info *relaycommon.RelayInfo, usage *dto.Usage, body []byt
 	}
 	if reported, _ := relaycommon.NativeUsagePresence(body, path, "", ""); reported {
 		info.ResponseFacts.AudioOutputTokensReported = true
+	}
+	for _, prefix := range []string{"usage.output_tokens_details", "usage.completion_tokens_details"} {
+		if reported, _ := relaycommon.NativeUsagePresence(body, prefix+".image_tokens", "", ""); reported {
+			info.ResponseFacts.ImageOutputTokensReported = true
+		}
 	}
 	prompt, completion := relaycommon.MediaUsagePresence(body)
 	if raw := ojson.GetBytes(body, "usage.input_tokens").Raw; prompt && raw != "" && raw != "null" {

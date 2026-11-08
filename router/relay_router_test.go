@@ -5017,6 +5017,54 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 	}
 }
 
+func TestMediaGatewayImageModalitiesKeepBaseUsage(t *testing.T) {
+	for _, tc := range []struct {
+		name, usage, expression                        string
+		input, output, imageInput, imageOutput, amount int64
+	}{
+		{"output details", `{"input_tokens":0,"output_tokens_details":{"image_tokens":1000}}`, `tier("tokens",p+c)`, 0, 1000, 0, 1000, 1_000_000},
+		{"input details", `{"input_tokens_details":{"image_tokens":1000},"output_tokens":0}`, `tier("tokens",p+c)`, 1000, 0, 1000, 0, 1_000_000},
+		{"base zero", `{"input_tokens":0,"output_tokens":0,"output_tokens_details":{"image_tokens":1000}}`, `tier("images",img_o)`, 0, 0, 0, 1000, 1_000_000},
+		{"detail zero", `{"input_tokens":0,"output_tokens_details":{"image_tokens":0}}`, `tier("tokens",p+c)`, 0, 0, 0, 0, 0},
+	} {
+		for _, mode := range []string{"json", "json-sse", "native-sse"} {
+			t.Run(tc.name+"/"+mode, func(t *testing.T) {
+				fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					if mode == "native-sse" {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = fmt.Fprintf(w, "data: {\"type\":\"image_generation.completed\",\"url\":\"https://image.invalid/one\",\"usage\":%s}\n\ndata: [DONE]\n\n", tc.usage)
+						return
+					}
+					_, _ = fmt.Fprintf(w, `{"data":[{"url":"https://image.invalid/one"}],"usage":%s}`, tc.usage)
+				})
+				fixture.fake.Advance(time.Second)
+				for _, price := range []*model.PriceVersion{{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: tc.expression, EffectiveAt: clock.Now().Unix()}, {OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: tc.expression, EffectiveAt: clock.Now().Unix()}} {
+					require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+				}
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", fmt.Sprintf(`{"model":"gateway-alias","prompt":"draw","stream":%t}`, mode != "json"))
+				require.Equal(t, 200, response.Code, response.Body.String())
+				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, tc.input, record.Usage.PromptTokens)
+				assert.Equal(t, tc.output, record.Usage.CompletionTokens)
+				assert.Equal(t, tc.imageInput, record.Usage.ImageInputTokens)
+				assert.Equal(t, tc.imageOutput, record.Usage.ImageOutputTokens)
+				assert.Equal(t, tc.amount*9/10, record.Receivable.Nanos)
+				attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, total)
+				assert.Equal(t, tc.amount, attempts[0].Cost.Nanos)
+				assert.Equal(t, record.Usage.PromptTokens, attempts[0].Usage.PromptTokens)
+				assert.Equal(t, record.Usage.CompletionTokens, attempts[0].Usage.CompletionTokens)
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, int64(1_000_000_000)-tc.amount*9/10, wallet.Balance.Nanos)
+			})
+		}
+	}
+}
+
 func TestMediaGatewayImagePayloadShapesAndUsageSources(t *testing.T) {
 	for _, tc := range []struct {
 		name, body             string

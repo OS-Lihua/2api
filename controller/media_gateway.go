@@ -433,7 +433,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	}
 	facts := info.ResponseFacts
 	generated := facts.BusinessOutput || facts.GeneratedImageCount > 0 || facts.GeneratedAudioBytes > 0 || facts.GeneratedText != "" || facts.ImageCount != nil && *facts.ImageCount > 0
-	if !facts.PromptTokensReported && !facts.AudioInputDurationReported && (generated || facts.CompletionTokensReported || facts.AudioInputTokensReported || facts.TextInputTokensReported || facts.AudioOutputTokensReported || facts.AudioInputDurationInvalid) {
+	if !facts.PromptTokensReported && !facts.AudioInputDurationReported && (generated || facts.CompletionTokensReported || facts.AudioInputTokensReported || facts.TextInputTokensReported || facts.AudioOutputTokensReported || facts.ImageInputTokensReported || facts.ImageOutputTokensReported || facts.AudioInputDurationInvalid) {
 		usage.PromptTokens = inputTokens
 		if run.parsed.Protocol == protocol.OpenAIAudioTranscription && !facts.AudioInputTokensReported {
 			usage.PromptTokensDetails.AudioTokens = inputTokens
@@ -442,22 +442,26 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	if !facts.CompletionTokensReported && facts.GeneratedText != "" {
 		usage.CompletionTokens = tokenkit.Count(info.TokenizerModel, facts.GeneratedText)
 	}
-	if !facts.PromptTokensReported && (facts.TextInputTokensReported || facts.AudioInputTokensReported) {
-		tokens, clamp := common.QuotaFromFloatChecked(float64(int64(usage.PromptTokensDetails.TextTokens) + int64(usage.PromptTokensDetails.AudioTokens)))
+	if !facts.PromptTokensReported && (facts.TextInputTokensReported || facts.AudioInputTokensReported || facts.ImageInputTokensReported) {
+		tokens, clamp := common.QuotaFromFloatChecked(float64(int64(usage.PromptTokensDetails.TextTokens) + int64(usage.PromptTokensDetails.AudioTokens) + int64(usage.PromptTokensDetails.ImageTokens)))
 		usage.PromptTokens = max(usage.PromptTokens, tokens)
 		if clamp != nil {
 			info.QuotaClamp = clamp
 		}
 	}
-	if !facts.CompletionTokensReported && facts.AudioOutputTokensReported {
-		usage.CompletionTokens = max(usage.CompletionTokens, usage.CompletionTokenDetails.AudioTokens)
+	if !facts.CompletionTokensReported && (facts.AudioOutputTokensReported || facts.ImageOutputTokensReported) {
+		tokens, clamp := common.QuotaFromFloatChecked(float64(int64(usage.CompletionTokenDetails.AudioTokens) + int64(usage.CompletionTokenDetails.ImageTokens)))
+		usage.CompletionTokens = max(usage.CompletionTokens, tokens)
+		if clamp != nil {
+			info.QuotaClamp = clamp
+		}
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	attempt.Usage = service.GatewayRecordUsage(usage, facts)
 	if info.QuotaClamp != nil {
 		attempt.RouteDiagnostics["quota_saturation"] = info.QuotaClamp.AuditMap()
 	}
-	if generated || facts.PromptTokensReported || facts.CompletionTokensReported || facts.AudioInputTokensReported || facts.TextInputTokensReported || facts.AudioOutputTokensReported || facts.AudioInputDurationReported || facts.AudioInputDurationInvalid {
+	if generated || facts.PromptTokensReported || facts.CompletionTokensReported || facts.AudioInputTokensReported || facts.TextInputTokensReported || facts.AudioOutputTokensReported || facts.ImageInputTokensReported || facts.ImageOutputTokensReported || facts.AudioInputDurationReported || facts.AudioInputDurationInvalid {
 		attempt.UsageSource = "estimated"
 	}
 	if facts.UsageReported {

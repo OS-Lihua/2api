@@ -53,6 +53,8 @@ type ResponseFacts struct {
 	AudioOutputTokensReported  bool
 	AudioInputTokensReported   bool
 	TextInputTokensReported    bool
+	ImageInputTokensReported   bool
+	ImageOutputTokensReported  bool
 	GeneratedOutputTokens      *int
 	UpstreamRetryAfter         string // Transient; only the parsed cooldown may enter records.
 	OnBusinessOutput           func()
