@@ -142,7 +142,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		ended := info.StreamStatus.OutcomeSnapshot().EndReason
 		complete := len(choices) == expectedChoices
 		for _, finished := range choices {
-			complete = complete && (finished || ended == relaycommon.StreamEndReasonDone)
+			complete = complete && finished
 		}
 		if complete {
 			info.StreamStatus.MarkCompleted()
@@ -165,6 +165,15 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			}
 			_, err := writeGatewayStreamResult(c, info, result.Value, &output)
 			streamErr = err
+		}
+	}
+	if streamErr == nil {
+		output.terminalReady = true
+		for _, value := range output.pendingTerminal {
+			if _, err := writeGatewayStreamResult(c, info, value, &output); err != nil {
+				streamErr = err
+				break
+			}
 		}
 	}
 	info.ResponseFacts.GeneratedText = output.String()
@@ -210,16 +219,6 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 	switch v := value.(type) {
 	case json.RawMessage:
 		event = gjson.GetBytes(v, "type").String()
-		if info.RelayFormat == types.RelayFormatOpenAI && !info.ShouldIncludeUsage {
-			if len(gjson.GetBytes(v, "choices").Array()) == 0 {
-				return "", nil
-			}
-			filtered, err := sjson.DeleteBytes(v, "usage")
-			if err != nil {
-				return "", err
-			}
-			value = json.RawMessage(filtered)
-		}
 	case relayconvert.ChatToResponsesStreamEvent:
 		event, value = v.Type, v.Payload
 	case *dto.ResponsesStreamResponse:
@@ -230,19 +229,27 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 		event = v.Type
 	case dto.ClaudeResponse:
 		event = v.Type
-	case *dto.ChatCompletionsStreamResponse:
-		if !info.ShouldIncludeUsage && len(v.Choices) == 0 {
-			return "", nil
-		}
-		if !info.ShouldIncludeUsage {
-			copy := *v
-			copy.Usage = nil
-			value = &copy
-		}
 	}
 	body, err := common.Marshal(value)
 	if err != nil {
 		return "", err
+	}
+	if info.RelayFormat == types.RelayFormatOpenAI && !info.ShouldIncludeUsage {
+		if len(gjson.GetBytes(body, "choices").Array()) == 0 {
+			return "", nil
+		}
+		body, err = sjson.DeleteBytes(body, "usage")
+		if err != nil {
+			return "", err
+		}
+	}
+	if info.RelayFormat == types.RelayFormatClaude && !output.terminalReady && (event == "message_stop" || event == "message_delta" && gjson.GetBytes(body, "delta.stop_reason").String() != "") {
+		if output.terminalBytes+len(body) > 1<<20 {
+			return "", helper.ErrGatewayStreamPreludeLimit
+		}
+		output.terminalBytes += len(body)
+		output.pendingTerminal = append(output.pendingTerminal, json.RawMessage(body))
+		return "", nil
 	}
 	frame := "data: " + string(body) + "\n\n"
 	if event != "" {

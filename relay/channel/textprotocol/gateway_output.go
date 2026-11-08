@@ -1,6 +1,7 @@
 package textprotocol
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -11,14 +12,17 @@ import (
 
 type gatewayToolOutput struct{ name, arguments string }
 
-// gatewayGeneratedOutput holds transient delivered content. Full Responses
-// snapshots replace their own deltas without erasing omitted content blocks.
+// gatewayGeneratedOutput tracks delivered content and defers successful terminal
+// frames until upstream completion is verified. Snapshots retain omitted blocks.
 type gatewayGeneratedOutput struct {
-	text      strings.Builder
-	parts     map[string]*strings.Builder
-	partOrder []string
-	tools     map[string]gatewayToolOutput
-	order     []string
+	pendingTerminal []json.RawMessage
+	terminalBytes   int
+	terminalReady   bool
+	text            strings.Builder
+	parts           map[string]*strings.Builder
+	partOrder       []string
+	tools           map[string]gatewayToolOutput
+	order           []string
 }
 
 func (o *gatewayGeneratedOutput) ObserveResponses(body []byte) (string, bool) {

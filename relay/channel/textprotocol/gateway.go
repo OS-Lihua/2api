@@ -30,12 +30,21 @@ func observeGatewayError(info *relaycommon.RelayInfo, body []byte) bool {
 		failure = root
 	}
 	code, kind := failure.Get("code").String(), failure.Get("type").String()
+	if kind == "" {
+		kind = failure.Get("status").String()
+	}
 	if code == "" {
 		code = kind
 	}
 	status := 0
 	if value := failure.Get("code"); value.Type == gjson.Number && value.Int() >= 400 && value.Int() <= 599 {
 		status = int(value.Int())
+	}
+	if status == http.StatusNotFound && kind == "NOT_FOUND" && info.UpstreamModelName != "" {
+		message := strings.ToLower(failure.Get("message").String())
+		if strings.Contains(message, "models/"+strings.ToLower(info.UpstreamModelName)) && (strings.Contains(message, "not found") || strings.Contains(message, "not supported")) {
+			code = "model_not_found"
+		}
 	}
 	info.StreamStatus.MarkFailed(code, kind, status)
 	return true
@@ -178,13 +187,18 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	if p.format == info.RelayFormat {
 		encoded = normalized
 	}
+	business := facts.GeneratedText != "" || gatewayMediaOutput(encoded, info.RelayFormat)
+	if !business {
+		if !info.PerformanceBusinessRejection {
+			info.StreamStatus.MarkFailed("empty_response", "", 0)
+		}
+		return usage, types.NewError(fmt.Errorf("upstream response contained no business output"), types.ErrorCodeBadResponse)
+	}
 	if err := service.IOCopyBytesGracefully(c, resp, encoded); err != nil {
 		facts.DownstreamWriteFailed = true
 		return usage, types.NewError(err, types.ErrorCodeBadResponse)
 	}
-	if facts.GeneratedText != "" || gatewayMediaOutput(encoded, info.RelayFormat) {
-		facts.MarkBusinessOutput()
-	}
+	facts.MarkBusinessOutput()
 	if p.format == types.RelayFormatOpenAIResponses {
 		status := gjson.GetBytes(body, "status").String()
 		if status != "" && status != "completed" {
