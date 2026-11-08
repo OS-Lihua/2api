@@ -3553,6 +3553,9 @@ func TestTextGatewayDifyUploadUsesSharedBudgetWithoutSpendingModelAttempt(t *tes
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
 			})
+			// Exercise native upload first, independently of protocol-specific cost estimates.
+			fixture.offering.RouteMethod = "weight"
+			require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
 			t.Setenv("GATEWAY_MAX_ATTEMPTS", "1")
 			var picture bytes.Buffer
 			require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
@@ -3565,7 +3568,14 @@ func TestTextGatewayDifyUploadUsesSharedBudgetWithoutSpendingModelAttempt(t *tes
 			response := httptest.NewRecorder()
 			done := make(chan struct{})
 			go func() { fixture.engine.ServeHTTP(response, request); close(done) }()
-			<-entered
+			select {
+			case <-entered:
+			case <-done:
+				t.Fatalf("request finished before native upload: status=%d body=%s", response.Code, response.Body.String())
+			case <-time.After(10 * time.Second):
+				cancel()
+				t.Fatal("native upload did not start")
+			}
 			if cancelDownstream {
 				cancel()
 			} else {
@@ -3638,6 +3648,8 @@ func TestTextGatewayDifyUploadRejectionsRespectSharedExclusions(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
 			})
+			fixture.offering.RouteMethod = "weight"
+			require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
 			t.Setenv("GATEWAY_MAX_ATTEMPTS", "1")
 			var picture bytes.Buffer
 			require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
