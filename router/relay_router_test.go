@@ -4620,6 +4620,137 @@ func TestMediaGatewayNativeImageProvidersUseEffectiveWireAndActualMoney(t *testi
 	}
 }
 
+func TestMediaGatewayReplicateDownloadFailureRetainsGeneratedImages(t *testing.T) {
+	var downloads atomic.Int64
+	imageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { downloads.Add(1); w.WriteHeader(http.StatusBadGateway) }))
+	t.Cleanup(imageServer.Close)
+	imageURL, err := url.Parse(imageServer.URL)
+	require.NoError(t, err)
+	fetch := system_setting.GetFetchSetting()
+	saved := *fetch
+	t.Cleanup(func() { *fetch = saved })
+	*fetch = system_setting.FetchSetting{EnableSSRFProtection: true, AllowPrivateIp: true, AllowedPorts: []string{imageURL.Port()}}
+	fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"status":"succeeded","output":[%q]}`, imageServer.URL+"/one")
+	})
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeReplicate).Error)
+	require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", "black-forest-labs/flux-1.1-pro").Error)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", `{"model":"gateway-alias","prompt":"draw","response_format":"b64_json"}`)
+	assert.GreaterOrEqual(t, response.Code, 400)
+	assert.EqualValues(t, 1, downloads.Load())
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	require.NotNil(t, attempts[0].Usage.ImageCount)
+	assert.EqualValues(t, 1, *attempts[0].Usage.ImageCount)
+	assert.EqualValues(t, 20_000_000, attempts[0].Cost.Nanos)
+	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+	require.NoError(t, err)
+	assert.Zero(t, record.Receivable.Nanos)
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
+}
+
+func TestMediaGatewayReplicateNativeImageInputHonorsCapabilities(t *testing.T) {
+	for _, allowed := range []bool{false, true} {
+		for _, override := range []bool{false, true} {
+			t.Run(fmt.Sprintf("allowed=%t/override=%t", allowed, override), func(t *testing.T) {
+				var calls atomic.Int64
+				fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					var wire struct {
+						Input struct {
+							Image string `json:"image_prompt"`
+						} `json:"input"`
+					}
+					require.NoError(t, common.DecodeJson(r.Body, &wire))
+					assert.Equal(t, "https://image.invalid/source", wire.Input.Image)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"status":"succeeded","output":["https://image.invalid/one"]}`)
+				})
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeReplicate).Error)
+				changes := map[string]any{"upstream_model_name": "black-forest-labs/flux-1.1-pro"}
+				body := `{"model":"gateway-alias","prompt":"draw","input":{"image_prompt":"https://image.invalid/source"}}`
+				if override {
+					changes["parameter_overrides"] = `{"operations":[{"path":"input.image_prompt","mode":"set","value":"https://image.invalid/source"}]}`
+					body = `{"model":"gateway-alias","prompt":"draw"}`
+				}
+				require.NoError(t, model.DB.Model(fixture.channel).Updates(changes).Error)
+				if !allowed {
+					var unified model.Model
+					require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+					unified.Capabilities.InputModalities = []capability.Modality{capability.Text}
+					require.NoError(t, model.DB.Save(&unified).Error)
+				}
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", body)
+				if allowed {
+					assert.Equal(t, 200, response.Code)
+					assert.EqualValues(t, 1, calls.Load())
+				} else {
+					assert.Equal(t, 400, response.Code)
+					assert.Zero(t, calls.Load())
+					wallet, err := model.GetUserWallet(fixture.user.Id)
+					require.NoError(t, err)
+					assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
+					entries, _, err := model.ListLedgerEntries(wallet.Id, 0, 10)
+					require.NoError(t, err)
+					for _, entry := range entries {
+						assert.NotEqual(t, model.LedgerEntryPreConsume, entry.Type)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestMediaGatewayImagenEditSkipsUnsupportedCandidate(t *testing.T) {
+	var picture bytes.Buffer
+	require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+	for _, fallback := range []bool{false, true} {
+		t.Run(fmt.Sprint(fallback), func(t *testing.T) {
+			var imagenCalls, compatibleCalls atomic.Int64
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
+				imagenCalls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"predictions":[{"bytesBase64Encoded":%q,"mimeType":"image/png"}]}`, base64.StdEncoding.EncodeToString(picture.Bytes()))
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeGemini).Error)
+			require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", "imagen-4.0-generate-001").Error)
+			fixture.fake.Advance(time.Second)
+			require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("image",fixed(0.001))*image_count`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+			if fallback {
+				compatible := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+					compatibleCalls.Add(1)
+					var wire dto.ImageRequest
+					require.NoError(t, common.DecodeJson(r.Body, &wire))
+					assert.JSONEq(t, `"https://image.invalid/source"`, string(wire.Image))
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"data":[{"url":"https://image.invalid/edited"}]}`)
+				})
+				require.NoError(t, model.DB.Model(compatible).Update("protocol", protocol.OpenAIImages).Error)
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/edits", `{"model":"gateway-alias","prompt":"edit","image":"https://image.invalid/source"}`)
+			assert.Zero(t, imagenCalls.Load())
+			if fallback {
+				assert.Equal(t, 200, response.Code)
+				assert.EqualValues(t, 1, compatibleCalls.Load())
+			} else {
+				assert.Equal(t, 400, response.Code)
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
+				entries, _, err := model.ListLedgerEntries(wallet.Id, 0, 10)
+				require.NoError(t, err)
+				for _, entry := range entries {
+					assert.NotEqual(t, model.LedgerEntryPreConsume, entry.Type)
+				}
+			}
+		})
+	}
+}
+
 func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T) {
 	audio := make([]byte, 48000)
 	for _, tc := range []struct {
@@ -5837,9 +5968,12 @@ func TestMediaGatewaySpeechJSONWithoutAudioReleasesFixedFee(t *testing.T) {
 		inputAudio                     int64
 		knownDetail                    bool
 		basePrice                      string
+		contentType                    string
 		tpm                            bool
 		inputText                      int64
 	}{
+		{name: "audio MIME error", body: `{"error":{"code":"rate_limit_exceeded","message":"provider-secret"},"usage":{"input_tokens":0,"output_tokens":1000}}`, output: 1000, contentType: "audio/mpeg"},
+		{name: "octet MIME zero error", body: `{"error":{"code":"rate_limit_exceeded","message":"provider-secret"},"usage":{"input_tokens":0,"output_tokens":0}}`, contentType: "application/octet-stream"},
 		{name: "empty", body: `{"error":null,"usage":{"input_tokens":0,"output_tokens":0}}`},
 		{name: "malformed", body: `{"error":`},
 		{name: "short malformed", body: `{"error":`, short: true},
@@ -5859,6 +5993,9 @@ func TestMediaGatewaySpeechJSONWithoutAudioReleasesFixedFee(t *testing.T) {
 			fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
 				w.Header().Set("Content-Type", "application/json")
+				if tc.contentType != "" {
+					w.Header().Set("Content-Type", tc.contentType)
+				}
 				if tc.headerOutput {
 					w.Header().Set("X-VLLM-OMNI-OUTPUT-TOKENS", "1000")
 				}

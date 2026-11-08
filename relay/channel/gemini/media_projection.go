@@ -11,6 +11,11 @@ import (
 type imagenRequest dto.GeminiImageRequest
 
 func (imagenRequest) ProjectImageRequest(body []byte, public dto.ImageRequest) (*dto.ImageRequest, error) {
+	for _, input := range []common.RawMessage{public.Image, public.Images, public.Mask} {
+		if len(input) > 0 && string(input) != "null" {
+			return nil, fmt.Errorf("Imagen generation does not support image or mask inputs")
+		}
+	}
 	var wire struct {
 		Instances  []dto.GeminiImageInstance `json:"instances"`
 		Parameters struct {

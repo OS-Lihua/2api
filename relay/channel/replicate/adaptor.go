@@ -286,6 +286,11 @@ func (a *Protocol) DoResponse(c *gin.Context, resp *http.Response, info *relayco
 	if len(urls) == 0 {
 		return nil, types.NewError(errors.New("replicate adaptor: empty prediction output"), types.ErrorCodeBadResponseBody)
 	}
+	if info.ResponseFacts != nil && len(urls) <= dto.MaxImageN {
+		count := int64(len(urls))
+		info.ResponseFacts.GeneratedImageCount = count
+		info.ResponseFacts.ImageCount = &count
+	}
 
 	var imageReq *dto.ImageRequest
 	if info != nil {

@@ -460,6 +460,27 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		if !audioBuffered {
 			bodyBytes, err = io.ReadAll(resp.Body)
 		}
+		if info.ResponseFacts != nil {
+			factsBody := mediaResponseEnvelope(bodyBytes)
+			reported := reportedMediaUsage(factsBody)
+			fault := observeMediaError(info, factsBody, resp.StatusCode)
+			if fault != nil || ojson.ValidBytes(bodyBytes) && ojson.ParseBytes(bodyBytes).IsObject() {
+				observeMediaUsage(info, reported, factsBody)
+				normalizeSpeechOutputUsage(info, reported)
+				applySpeechUsageHeaders(info, reported, resp.Header)
+				if info.StreamStatus == nil {
+					info.StreamStatus = relaycommon.NewStreamStatus()
+				}
+				if err != nil {
+					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)
+					info.StreamStatus.MarkIncomplete("incomplete_audio_response")
+				}
+				if fault == nil {
+					info.StreamStatus.MarkFailed("", "invalid_response", http.StatusBadGateway)
+				}
+				return reported
+			}
+		}
 		if err != nil {
 			logger.LogError(c, common.LogText("failed to read TTS response body: %v", err))
 			if info.ResponseFacts != nil {
