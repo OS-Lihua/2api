@@ -21,6 +21,14 @@ func ValidateProvider(channel *Provider, isAdd bool) error {
 		return common.NewMessage("Invalid provider type")
 	}
 
+	if channel.RouteLimits != nil {
+		if !channel.RouteLimits.Valid() {
+			return common.NewMessage("Invalid parameters")
+		}
+		if isAdd {
+			channel.ProviderInfo.RouteLimits = *channel.RouteLimits
+		}
+	}
 	// 校验 channel settings
 	if err := channel.ValidateSettings(); err != nil {
 		return common.NewMessage("Invalid channel settings format: {{error}}", map[string]any{"error": err.Error()})

@@ -46,6 +46,7 @@ const stored: Provider = {
   balance_updated_time: 0,
   created_time: 0,
   remark: '',
+  route_limits: { rpm: 12, tpm: 34000, max_concurrency: 2 },
   channel_info: { is_multi_key: false, multi_key_size: 0 },
 }
 
@@ -224,6 +225,12 @@ it('saving an edit with an empty key field keeps the stored key', async () => {
 
   await userEvent.clear(name)
   await userEvent.type(name, 'account renamed')
+  const concurrency = screen.getByRole('textbox', { name: 'Max concurrency' })
+  expect(concurrency).toHaveValue('2')
+  expect(screen.getByRole('textbox', { name: 'RPM' })).toHaveValue('12')
+  expect(screen.getByRole('textbox', { name: 'TPM' })).toHaveValue('34000')
+  await userEvent.clear(concurrency)
+  await userEvent.type(concurrency, '0')
   await userEvent.click(screen.getByRole('button', { name: 'Save changes' }))
 
   await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
@@ -231,5 +238,6 @@ it('saving an edit with an empty key field keeps the stored key', async () => {
     name: 'account renamed',
     base_url: 'https://upstream.example',
     remark: '',
+    route_limits: { rpm: 12, tpm: 34000, max_concurrency: 0 },
   })
 })
