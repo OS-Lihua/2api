@@ -388,7 +388,10 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		finishReason = constant.FinishReasonToolCalls
 	}
 
-	msg := dto.Message{Role: "assistant", Content: contentPtr(content)}
+	msg := dto.Message{Role: "assistant"}
+	if content != "" {
+		msg.SetStringContent(content)
+	}
 	if len(toolCalls) > 0 {
 		if rawToolCalls, err := common.Marshal(toolCalls); err == nil {
 			msg.ToolCalls = rawToolCalls
@@ -444,11 +447,4 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	out, _ := common.Marshal(full)
 	_ = service.IOCopyBytesGracefully(c, resp, out)
 	return usage, nil
-}
-
-func contentPtr(s string) *string {
-	if s == "" {
-		return nil
-	}
-	return &s
 }

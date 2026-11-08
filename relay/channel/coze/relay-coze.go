@@ -229,6 +229,11 @@ func handleCozeEvent(c *gin.Context, event string, data string, responseText *st
 			return err
 		}
 		*responseText += content
+		if info.ResponseFacts != nil {
+			text := content + messageData.ReasoningContent
+			info.ResponseFacts.SourceGeneratedText += text
+			info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || text != ""
+		}
 		response := dto.ChatCompletionsStreamResponse{Id: id, Object: "chat.completion.chunk", Created: common.GetTimestamp(), Model: info.UpstreamModelName}
 		choice := dto.ChatCompletionsStreamResponseChoice{Index: 0}
 		choice.Delta.SetContentString(content)

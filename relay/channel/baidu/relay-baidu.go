@@ -143,6 +143,10 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 			usage.CompletionTokens = baiduResponse.Usage.TotalTokens - baiduResponse.Usage.PromptTokens
 		}
 		response := streamResponseBaidu2OpenAI(&baiduResponse)
+		if info.ResponseFacts != nil && baiduResponse.Result != "" {
+			info.ResponseFacts.SourceGeneratedText += baiduResponse.Result
+			info.ResponseFacts.SourceOutputObserved = true
+		}
 		if err := helper.SendChatChunk(c, info, response); err != nil {
 			sr.Stop(err)
 			return

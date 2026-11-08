@@ -185,9 +185,9 @@ func TestGeminiRelayHandsLongRunningPredictionToPluginRoute(t *testing.T) {
 				assert.Equal(t, fmt.Sprintf("plugin google for user %d", user.Id), recorder.Body.String())
 				return
 			}
-			// The relay looks for a Gemini channel serving the model; there is none.
-			assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
-			assert.Contains(t, recorder.Body.String(), `"code":"model_not_found"`)
+			// A missing native text model returns Gemini's error shape rather than a plugin response.
+			assert.Equal(t, http.StatusNotFound, recorder.Code)
+			assert.Contains(t, recorder.Body.String(), `"reason":"model_not_found"`)
 		})
 	}
 }
@@ -3497,6 +3497,7 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 		upstreamStatus     int
 		prompt, completion int64
 		charge, cost       int64
+		purchase           *model.GatewayUsage
 	}{
 		{name: "reported", body: `{"response_id":"native","text":"Hello","finish_reason":"COMPLETE","meta":{"billed_units":{"input_tokens":10,"output_tokens":5}}}`, source: "upstream", prompt: 10, completion: 5, charge: 36000, cost: 20000},
 		{name: "explicit zero", body: `{"text":"Hello","meta":{"billed_units":{"input_tokens":0,"output_tokens":0}}}`, source: "upstream"},
@@ -3511,6 +3512,8 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 		{name: "Cohere invalid input retains output", body: `{"text":"Hello","meta":{"billed_units":{"input_tokens":-1,"output_tokens":5}}}`, source: "estimated", prompt: 9, completion: 5, charge: 34200, cost: 19000},
 		{name: "Dify error reports cost", provider: constant.ChannelTypeDify, stream: true, status: "failed", source: "none", httpStatus: http.StatusBadGateway, body: "data: {\"event\":\"error\",\"metadata\":{\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}}\n\n", cost: 20000},
 		{name: "Dify error after output preserves counters", provider: constant.ChannelTypeDify, stream: true, status: "partial", source: "estimated", body: "data: {\"event\":\"message\",\"answer\":\"Hello\",\"metadata\":{\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":5}}}\n\ndata: {\"event\":\"error\"}\n\n", completion: 1, charge: 3600, cost: 10000},
+		{name: "Dify unterminated terminal after output", provider: constant.ChannelTypeDify, stream: true, status: "partial", source: "estimated", body: "data: {\"event\":\"message\",\"answer\":\"Hello\"}\n\ndata: {\"event\":\"message_end\",\"metadata\":{\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}}", prompt: 10, completion: 1, charge: 21600, cost: 20000, purchase: &model.GatewayUsage{PromptTokens: 10, CompletionTokens: 5}},
+		{name: "Baidu unterminated terminal after output", provider: constant.ChannelTypeBaidu, key: "unterminated-baidu|test-secret", stream: true, status: "partial", source: "estimated", body: "data: {\"result\":\"Hello\",\"is_end\":false}\n\ndata: {\"result\":\"\",\"is_end\":true,\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}", prompt: 10, completion: 1, charge: 21600, cost: 20000, purchase: &model.GatewayUsage{PromptTokens: 10, CompletionTokens: 5}},
 		{name: "Ollama HTTP failure preserves cost", provider: constant.ChannelTypeOllama, upstreamStatus: http.StatusServiceUnavailable, httpStatus: http.StatusServiceUnavailable, status: "failed", source: "none", body: `{"message":{"role":"assistant","content":"Hello"},"prompt_eval_count":10,"eval_count":5}`, cost: 20000},
 		{name: "Coze list failure preserves cost", provider: constant.ChannelTypeCoze, status: "failed", source: "none", httpStatus: http.StatusBadGateway, body: `{"code":1,"data":[],"msg":"Hello"}`, cost: 20000},
 		{name: "Coze polling failure preserves cost", provider: constant.ChannelTypeCoze, status: "failed", cozeStatus: "failed", source: "none", httpStatus: http.StatusBadGateway, body: `{}`, cost: 20000},
@@ -3530,6 +3533,9 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 		{name: "Tencent TokenHub JSON", provider: constant.ChannelTypeTencent, body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, source: "upstream", prompt: 10, completion: 5, charge: 36000, cost: 20000},
 		{name: "Coze JSON", provider: constant.ChannelTypeCoze, body: `{"code":0,"data":[{"type":"answer","role":"assistant","content":"Hello"}]}`, source: "upstream", prompt: 10, completion: 5, charge: 36000, cost: 20000},
 		{name: "Coze stream", provider: constant.ChannelTypeCoze, stream: true, body: "event: conversation.message.delta\ndata: {\"content\":\"Hello\"}\n\nevent: conversation.chat.completed\ndata: {\"usage\":{\"input_count\":10,\"output_count\":5,\"token_count\":15}}\n\n", source: "upstream", prompt: 10, completion: 5, charge: 36000, cost: 20000},
+		{name: "Coze unfinished delta retains source prefix", provider: constant.ChannelTypeCoze, stream: true, status: "partial", body: "event: conversation.message.delta\ndata: {\"type\":\"answer\",\"content_type\":\"text\",\"content\":\"Hello\"}\n\nevent: conversation.message.delta\ndata: {\"type\":\"answer\",\"content_type\":\"text\",\"content\":\" world\"}", source: "estimated", prompt: 9, completion: 1, charge: 19800, cost: 13000, purchase: &model.GatewayUsage{PromptTokens: 9, CompletionTokens: 2}},
+		{name: "Dify unfinished delta retains source prefix", provider: constant.ChannelTypeDify, stream: true, status: "partial", body: "data: {\"event\":\"message\",\"answer\":\"Hello\"}\n\ndata: {\"event\":\"message\",\"answer\":\" world\"}", source: "estimated", prompt: 13, completion: 1, charge: 27000, cost: 17000, purchase: &model.GatewayUsage{PromptTokens: 13, CompletionTokens: 2}},
+		{name: "Baidu unfinished delta retains source prefix", provider: constant.ChannelTypeBaidu, key: "source-prefix-baidu|test-secret", stream: true, status: "partial", body: "data: {\"result\":\"Hello\",\"is_end\":false}\n\ndata: {\"result\":\" world\",\"is_end\":false}", source: "estimated", prompt: 9, completion: 1, charge: 19800, cost: 13000, purchase: &model.GatewayUsage{PromptTokens: 9, CompletionTokens: 2}},
 		{name: "Nova missing usage", provider: constant.ChannelTypeAws, key: "test-access|test-secret|us-east-1", upstreamModel: "amazon.nova-lite-v1:0", body: `{"output":{"message":{"content":[{"text":"Hello"}]}},"stopReason":"end_turn"}`, source: "estimated", prompt: 9, completion: 1, charge: 19800, cost: 11000},
 		{name: "Nova missing input", provider: constant.ChannelTypeAws, key: "test-access|test-secret|us-east-1", upstreamModel: "amazon.nova-lite-v1:0", body: `{"output":{"message":{"content":[{"text":"Hello"}]}},"usage":{"outputTokens":5},"stopReason":"end_turn"}`, source: "estimated", prompt: 9, completion: 5, charge: 34200, cost: 19000},
 		{name: "Nova stream missing output", provider: constant.ChannelTypeAws, key: "test-access|test-secret|us-east-1", upstreamModel: "amazon.nova-lite-v1:0", stream: true, body: `{"output":{"message":{"content":[{"text":"Hello"}]}},"usage":{"inputTokens":0},"stopReason":"end_turn"}`, source: "estimated", completion: 1, charge: 3600, cost: 2000},
@@ -3633,6 +3639,12 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, attempts, 1)
 			assert.Equal(t, test.cost, attempts[0].Cost.Nanos)
+			if test.purchase != nil {
+				assert.Equal(t, test.purchase.PromptTokens, attempts[0].Usage.PromptTokens)
+				assert.Equal(t, test.purchase.CompletionTokens, attempts[0].Usage.CompletionTokens)
+				assert.NotContains(t, string(body), "[DONE]")
+				assert.NotContains(t, string(body), `"finish_reason":"stop"`)
+			}
 		})
 	}
 }
@@ -3960,6 +3972,44 @@ func TestTextGatewayDefaultOutputLimitFitsRemainingContext(t *testing.T) {
 			} else {
 				assert.EqualValues(t, test.limit, sent["max_completion_tokens"])
 			}
+		})
+	}
+}
+
+func TestTextGatewayNativeOverridesPreserveRequiredInput(t *testing.T) {
+	for _, test := range []struct {
+		protocol, path, body, override, response string
+	}{
+		{
+			protocol: "anthropic_messages", path: "/v1/messages",
+			body:     `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`,
+			override: `{"messages":[]}`,
+			response: `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`,
+		},
+		{
+			protocol: "gemini_generate", path: "/v1beta/models/gateway-alias:generateContent",
+			body:     `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16}}`,
+			override: `{"contents":[]}`,
+			response: `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}`,
+		},
+	} {
+		t.Run(test.protocol, func(t *testing.T) {
+			calls := 0
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(test.response))
+			})
+			require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": test.protocol, "parameter_overrides": test.override}).Error)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, test.path, test.body)
+			assert.Equal(t, http.StatusBadRequest, response.Code)
+			assert.Zero(t, calls)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1_000_000_000), wallet.Balance.Nanos)
+			_, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+			require.NoError(t, err)
+			assert.Zero(t, total)
 		})
 	}
 }
@@ -5792,6 +5842,33 @@ func TestTextGatewayNativeChatFileReferencesStayInValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTextGatewayNativeNestedTextDocumentsRemainText(t *testing.T) {
+	calls := 0
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var sent dto.ClaudeRequest
+		require.NoError(t, common.DecodeJson(r.Body, &sent))
+		require.Len(t, sent.Messages, 2)
+		blocks, err := sent.Messages[1].ParseContent()
+		require.NoError(t, err)
+		require.Len(t, blocks, 1)
+		nested := blocks[0].ParseMediaContent()
+		require.Len(t, nested, 1)
+		require.NotNil(t, nested[0].Source)
+		assert.Equal(t, "document", nested[0].Type)
+		assert.Equal(t, "text", nested[0].Source.Type)
+		assert.Equal(t, "SGVsbG8=", nested[0].Source.Data, "plain-text document data stays literal on the native wire")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`)
+	})
+	require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", protocol.AnthropicMessages).Error)
+	body := `{"model":"gateway-offering","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"inspect","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","source":{"type":"text","media_type":"text/plain","data":"SGVsbG8="}}]}]}],"max_tokens":16}`
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/messages", body)
+	assert.Equal(t, http.StatusOK, response.Code)
+	assert.Equal(t, 1, calls)
+	assert.Contains(t, response.Body.String(), "Hello")
 }
 
 func TestTextGatewayNativeNestedPDFAndMixedImagesKeepMediaFacts(t *testing.T) {
@@ -7832,6 +7909,42 @@ func TestTextGatewayStreamConversionFacts(t *testing.T) {
 	}
 }
 
+func TestTextGatewayProtocolPreferencePrecedesHealth(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		nativeSuccess bool
+	}{
+		{"recent success rate", false},
+		{"business latency", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			nativeCalls, convertedCalls := 0, 0
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				nativeCalls++
+				assert.Equal(t, "/v1/responses", r.URL.Path)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"native-response","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Native"}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}`))
+			})
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", protocol.OpenAIResponses).Error)
+			converted := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+				convertedCalls++
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"Converted"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+			})
+			_, err := service.ChannelHealth.Record(t.Context(), channelhealth.Sample{AttemptID: "prior-native", ChannelID: fixture.channel.ID, Success: test.nativeSuccess, ProviderFailure: !test.nativeSuccess, FirstByte: 200 * time.Millisecond})
+			require.NoError(t, err)
+			_, err = service.ChannelHealth.Record(t.Context(), channelhealth.Sample{AttemptID: "prior-converted", ChannelID: converted.ID, Success: true, FirstByte: 20 * time.Millisecond})
+			require.NoError(t, err)
+
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/responses", `{"model":"gateway-offering","input":"Hello","max_output_tokens":16}`)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), "Native")
+			assert.Equal(t, 1, nativeCalls)
+			assert.Zero(t, convertedCalls)
+		})
+	}
+}
+
 func TestTextGatewayStrictConversionLosses(t *testing.T) {
 	image, err := os.ReadFile("../controller/probe-fixtures/red.png")
 	require.NoError(t, err)
@@ -8808,6 +8921,8 @@ func TestTextGatewayInsufficientReservationStopsBeforeProvider(t *testing.T) {
 
 func TestTextGatewayUnknownOfferingRetainsLegacyTokenQuota(t *testing.T) {
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("unknown Offering must not use the new Channel") })
+	// The model exists only in legacy routing, where quota still applies even when no route is enabled.
+	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "unknown-legacy-model", ChannelId: fixture.channel.ProviderID, Enabled: false}).Error)
 	body := `{"model":"unknown-legacy-model","messages":[{"role":"user","content":"Hello"}]}`
 	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
 	assert.Equal(t, 401, response.Code, response.Body.String())
