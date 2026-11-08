@@ -324,6 +324,7 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		}
 	})
 	if info.ResponseFacts != nil && len(info.ResponseFacts.UnterminatedStreamData) > 0 {
+		info.ResponseFacts.RecordNativeUsage(usage, info.ResponseFacts.UnterminatedStreamData, "metadata.usage.prompt_tokens", "metadata.usage.completion_tokens")
 		partial := relaycommon.SanitizeNativeUsage(info.ResponseFacts.UnterminatedStreamData, "metadata.usage")
 		info.ResponseFacts.UnterminatedStreamData = nil
 		var reported DifyChunkChatCompletionResponse

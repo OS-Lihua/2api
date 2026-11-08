@@ -159,6 +159,7 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 	}
 
 	if managed && len(info.ResponseFacts.UnterminatedStreamData) > 0 {
+		info.ResponseFacts.RecordNativeUsage(usage, info.ResponseFacts.UnterminatedStreamData, "Usage.PromptTokens", "Usage.CompletionTokens")
 		partial := relaycommon.SanitizeNativeUsage(info.ResponseFacts.UnterminatedStreamData, "Usage")
 		info.ResponseFacts.UnterminatedStreamData = nil
 		var reported TencentChatResponse
