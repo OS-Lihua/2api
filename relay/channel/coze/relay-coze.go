@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/samber/lo"
+	"github.com/tidwall/gjson"
 
 	"github.com/gin-gonic/gin"
 )
@@ -55,12 +56,11 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 	usage.CompletionTokens = c.GetInt("coze_output_count")
 	usage.TotalTokens = c.GetInt("coze_token_count")
 	if info.ResponseFacts != nil {
-		var prompt, completion bool
 		if result, ok := resp.Body.(*cozeResultBody); ok {
-			info.ResponseFacts.RecordNativeUsage(&usage, result.completionBody, "data.usage.input_count", "data.usage.output_count")
-			prompt, completion = relaycommon.NativeUsagePresence(result.completionBody, "data.usage.input_count", "data.usage.output_count", "data.usage.token_count")
+			info.ResponseFacts.RecordUsage(&usage, &result.usage, result.usageFacts.PromptTokensReported, result.usageFacts.CompletionTokensReported)
+		} else {
+			info.ResponseFacts.RecordUsage(&usage, &usage, false, false)
 		}
-		info.ResponseFacts.RecordUsage(&usage, &usage, prompt, completion)
 		if result, ok := resp.Body.(*cozeResultBody); ok && result.failure != nil {
 			return &usage, result.failure
 		}
@@ -69,6 +69,20 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 		}
 	}
 	responseBody, err := io.ReadAll(resp.Body)
+	if info.ResponseFacts != nil {
+		var source dto.OpenAITextResponse
+		for _, item := range gjson.GetBytes(responseBody, "data").Array() {
+			if item.Get("type").String() != "answer" {
+				continue
+			}
+			var text string
+			if common.UnmarshalJsonStr(item.Get("content").Raw, &text) != nil {
+				continue
+			}
+			source.Choices = []dto.OpenAITextResponseChoice{{Message: dto.Message{Role: "assistant", Content: text}}}
+		}
+		info.ResponseFacts.RecordChatSource(&source, info.TokenizerModelName())
+	}
 	if err != nil {
 		return &usage, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
 	}

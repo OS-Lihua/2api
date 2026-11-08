@@ -221,6 +221,9 @@ func cohereHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	if info.ResponseFacts != nil {
 		prompt, completion := relaycommon.NativeUsagePresence(responseBody, "meta.billed_units.input_tokens", "meta.billed_units.output_tokens", "")
 		info.ResponseFacts.RecordUsage(&openaiResp.Usage, &usage, prompt, completion)
+		if strings.HasPrefix(cohereResp.FinishReason, "ERROR") && cohereResp.FinishReason != "ERROR_TOXIC" {
+			return &openaiResp.Usage, types.NewError(fmt.Errorf("Cohere response failed"), types.ErrorCodeBadResponse)
+		}
 		return helper.WriteChatResponse(c, info, resp, &openaiResp)
 	}
 	jsonResponse, err := common.Marshal(openaiResp)

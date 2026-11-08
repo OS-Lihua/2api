@@ -88,7 +88,7 @@ func (w *nativeResponseWriter) Write(body []byte) (int, error) {
 		}
 		data := []byte(event.Data)
 		w.source.text.WriteString(gatewayStreamBusinessText(data, types.RelayFormatOpenAI))
-		w.source.ObserveChatTools(data)
+		w.source.ObserveChat(data)
 		w.facts.SourceOutputObserved = w.facts.SourceOutputObserved || w.source.String() != "" || len(w.source.chatTools) > 0 || gatewayMediaOutput(data, types.RelayFormatOpenAI)
 		for _, name := range []string{"id", "model", "object", "system_fingerprint", "service_tier"} {
 			if value := gjson.GetBytes(data, name); value.Type == gjson.String && value.String() != "" {
