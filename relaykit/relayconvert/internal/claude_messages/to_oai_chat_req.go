@@ -256,7 +256,7 @@ func ClaudeMessagesRequestToOpenAIChat(ctx context.Context, claudeRequest dto.Cl
 					if mediaMsg.IsStringContent() {
 						oaiToolMessage.SetStringContent(mediaMsg.GetStringContent())
 					} else {
-						content, media := claudeToolResultToChat(mediaMsg.ParseMediaContent())
+						content, media := claudeToolResultToChat(ctx, mediaMsg.ParseMediaContent())
 						oaiToolMessage.SetStringContent(content)
 						// A Chat tool message only carries text. Images from the tool result
 						// join the user message this Claude message becomes, which lands right
@@ -290,8 +290,8 @@ func ClaudeMessagesRequestToOpenAIChat(ctx context.Context, claudeRequest dto.Cl
 // where a tool message may only carry text. Text blocks stay on the tool message and image
 // blocks come back in Chat shape for the caller to place on the following user message;
 // stringifying them instead would hand base64 image data to the upstream text tokenizer.
-// Arrays holding any other block type keep the historical stringified form so nothing is lost.
-func claudeToolResultToChat(blocks []dto.ClaudeMediaMessage) (string, []dto.MediaContent) {
+// Unsupported media keeps the compatibility text fallback and reports the loss.
+func claudeToolResultToChat(ctx context.Context, blocks []dto.ClaudeMediaMessage) (string, []dto.MediaContent) {
 	texts := make([]string, 0, len(blocks))
 	media := make([]dto.MediaContent, 0, len(blocks))
 	for _, block := range blocks {
@@ -303,10 +303,14 @@ func claudeToolResultToChat(blocks []dto.ClaudeMediaMessage) (string, []dto.Medi
 		case block.Type == "image":
 			url := claudeImageSourceURL(block.Source)
 			if url == "" {
+				convdiag.Add(ctx, types.ConversionDiagnostic{Code: "tool_result_media_dropped", Path: "messages.tool_result.content.source", Message: "Chat cannot represent this tool result image source", Severity: types.ConversionDiagnosticError})
 				return requestToJSONString(blocks), nil
 			}
 			media = append(media, dto.MediaContent{Type: "image_url", ImageUrl: &dto.MessageImageUrl{Url: url}})
 		default:
+			if block.Source != nil {
+				convdiag.Add(ctx, types.ConversionDiagnostic{Code: "tool_result_media_dropped", Path: "messages.tool_result.content.source", Message: "Chat cannot represent this tool result media source", Severity: types.ConversionDiagnosticError})
+			}
 			return requestToJSONString(blocks), nil
 		}
 	}

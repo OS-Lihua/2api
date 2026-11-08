@@ -56,6 +56,7 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 	if err != nil {
 		return nil, err
 	}
+	preservedImageReferences := false
 	projectionMedia := map[string]dto.MediaContent{}
 	var referencedMedia []dto.MediaContent
 	references := map[string]bool{}
@@ -81,6 +82,7 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 				case "input_file":
 					referencedMedia = append(referencedMedia, dto.MediaContent{Type: dto.ContentTypeFile, File: &dto.MessageFile{FileName: "reference.pdf", FileData: id}})
 				case "input_image":
+					preservedImageReferences = true
 					referencedMedia = append(referencedMedia, dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: id, Detail: part.Get("detail").String(), MimeType: "image/png"}})
 				default:
 					continue
@@ -222,6 +224,9 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 		}
 	}
 	for _, diagnostic := range result.Diagnostics {
+		if diagnostic.Code == "unsupported_image_file_reference" && preservedImageReferences {
+			continue
+		}
 		if (diagnostic.Code == "unsupported_media_type" || diagnostic.Code == "unsupported_media_source") && diagnostic.Severity == types.ConversionDiagnosticError {
 			if media, represented := projectionMedia[diagnostic.Path]; represented {
 				if media.Type == dto.ContentTypeImageURL {
@@ -362,11 +367,12 @@ func GatewayAcceptedConversionLosses(offering *model.ModelOffering) []string {
 	return append(accepted, offering.AcceptedConversionLosses...)
 }
 
-// CheckGatewayConversionLosses requires an exact explicit code for every loss.
+// CheckGatewayConversionLosses never waives errors and requires an exact
+// explicit code for every other conversion loss.
 func CheckGatewayConversionLosses(diagnostics []types.ConversionDiagnostic, accepted []string) error {
 	var rejected []types.ConversionDiagnostic
 	for _, diagnostic := range diagnostics {
-		if !slices.Contains(accepted, diagnostic.Code) {
+		if diagnostic.Severity == types.ConversionDiagnosticError || !slices.Contains(accepted, diagnostic.Code) {
 			rejected = append(rejected, diagnostic)
 		}
 	}

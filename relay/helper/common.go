@@ -447,15 +447,15 @@ func WriteChatResponse(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	return &response.Usage, nil
 }
 
-func Done(c *gin.Context) {
+func Done(c *gin.Context) error {
 	if value, ok := common.GetContextKey(c, constant.ContextKeyResponseFacts); ok {
 		if facts, _ := value.(*relaycommon.ResponseFacts); facts != nil && facts.OnBusinessOutput != nil {
 			if !facts.BusinessOutput || facts.CanFinishStream != nil && !facts.CanFinishStream() {
-				return
+				return nil
 			}
 		}
 	}
-	_ = StringData(c, "[DONE]")
+	return StringData(c, "[DONE]")
 }
 
 func WssString(c *gin.Context, ws *websocket.Conn, str string) error {

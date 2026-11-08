@@ -55,6 +55,59 @@ func NewStreamScanner(reader io.Reader, maxBytes ...int) *bufio.Scanner {
 	return scanner
 }
 
+// splitSSEEvents confirms the blank line that terminates an SSE event. EOF
+// cannot complete a pending data event; comments without data may be discarded.
+func splitSSEEvents(data []byte, atEOF bool) (int, []byte, error) {
+	lineStart := 0
+	for index := 0; index < len(data); {
+		if data[index] != '\r' && data[index] != '\n' {
+			index++
+			continue
+		}
+		next := index + 1
+		if data[index] == '\r' {
+			if next == len(data) && !atEOF && index != lineStart {
+				return 0, nil, nil
+			}
+			if next < len(data) && data[next] == '\n' {
+				next++
+			}
+		}
+		if index == lineStart {
+			return next, data[:index], nil
+		}
+		lineStart, index = next, next
+	}
+	if atEOF {
+		if _, hasData := sseEventData(string(data)); hasData {
+			return 0, nil, io.ErrUnexpectedEOF
+		}
+		return len(data), nil, nil
+	}
+	return 0, nil, nil
+}
+
+func sseEventData(event string) (string, bool) {
+	event = strings.TrimPrefix(event, "\xef\xbb\xbf")
+	event = strings.ReplaceAll(event, "\r\n", "\n")
+	event = strings.ReplaceAll(event, "\r", "\n")
+	var data strings.Builder
+	hasData := false
+	for line := range strings.SplitSeq(event, "\n") {
+		field, value, _ := strings.Cut(line, ":")
+		if field != "data" {
+			continue
+		}
+		value = strings.TrimPrefix(value, " ")
+		if hasData {
+			data.WriteByte('\n')
+		}
+		data.WriteString(value)
+		hasData = true
+	}
+	return data.String(), hasData
+}
+
 func copyCodexSSEHeaders(c *gin.Context, resp *http.Response) {
 	if c == nil || c.Writer == nil || resp == nil {
 		return
@@ -205,7 +258,18 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	// Ensure gin.Context is not returned to Gin's pool while any stream goroutine can still use it.
 	defer cleanup()
 
-	scanner.Split(bufio.ScanLines)
+	if managed {
+		scanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
+			advance, token, err := splitSSEEvents(data, atEOF)
+			if err != nil {
+				partial, _ := sseEventData(string(data))
+				info.ResponseFacts.UnterminatedStreamData = []byte(partial)
+			}
+			return advance, token, err
+		})
+	} else {
+		scanner.Split(bufio.ScanLines)
+	}
 	copyCodexSSEHeaders(c, resp)
 	SetEventStreamHeaders(c)
 
@@ -320,11 +384,20 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				logger.LogDebug(c, "stream scanner data: %s", data)
 			}
 
-			data, hasDataPrefix := strings.CutPrefix(data, "data:")
-			data = strings.TrimSpace(data)
-			if !hasDataPrefix && data != "[DONE]" {
-				continue
+			if managed {
+				var hasData bool
+				data, hasData = sseEventData(data)
+				if !hasData {
+					continue
+				}
+			} else {
+				var hasDataPrefix bool
+				data, hasDataPrefix = strings.CutPrefix(data, "data:")
+				if !hasDataPrefix && strings.TrimSpace(data) != "[DONE]" {
+					continue
+				}
 			}
+			data = strings.TrimSpace(data)
 			if data == "" {
 				continue
 			}

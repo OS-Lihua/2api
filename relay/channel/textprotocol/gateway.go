@@ -237,7 +237,7 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	if p.format == info.RelayFormat {
 		encoded = normalized
 	}
-	budgetEnd := p.format == types.RelayFormatOpenAIResponses && gjson.GetBytes(body, "status").String() == "incomplete" && gjson.GetBytes(body, "incomplete_details.reason").String() == "max_output_tokens"
+	budgetEnd := gatewayOutputLimitReached(body, p.format)
 	if budgetEnd {
 		info.StreamStatus.MarkIncomplete("max_output_tokens")
 	}

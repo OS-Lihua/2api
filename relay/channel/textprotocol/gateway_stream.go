@@ -39,6 +39,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 	var sourceOutput gatewayGeneratedOutput
 	expectedChoices := max(1, info.ResponseFacts.ExpectedChoices)
 	choices := map[int]gatewayStreamChoice{}
+	sourceBudgetEnd := false
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		info.StreamStatus.RequireTerminal()
 		measured, err := meter.Observe([]byte(data))
@@ -101,10 +102,15 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			sr.Stop(err)
 			return
 		}
+		sourceBudgetEnd = sourceBudgetEnd || gatewayOutputLimitReached(normalized, p.format)
 		switch p.format {
 		case types.RelayFormatClaude:
 			if gjson.Get(data, "type").String() == "message_stop" {
-				info.StreamStatus.MarkCompleted()
+				if sourceBudgetEnd {
+					info.StreamStatus.MarkIncomplete("max_output_tokens")
+				} else {
+					info.StreamStatus.MarkCompleted()
+				}
 			}
 		case types.RelayFormatOpenAI, types.RelayFormatGemini:
 			path, terminal := "choices", "finish_reason"
@@ -179,6 +185,33 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			sr.Stop(streamErr)
 		}
 	})
+	// An unterminated event cannot confirm delivery or a protocol terminal.
+	// Complete JSON inside it can still report a known upstream purchase usage.
+	partial := info.ResponseFacts.UnterminatedStreamData
+	info.ResponseFacts.UnterminatedStreamData = nil
+	if len(partial) > 0 && gjson.ValidBytes(partial) {
+		if measured, err := meter.Observe(partial); err == nil {
+			if measured != nil {
+				usage = measured
+			}
+			prompt, completion := gatewayUsageCounters(partial, p.format)
+			info.ResponseFacts.PromptTokensReported = info.ResponseFacts.PromptTokensReported || gatewayValidCounter(prompt)
+			info.ResponseFacts.CompletionTokensReported = info.ResponseFacts.CompletionTokensReported || gatewayValidCounter(completion)
+			info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
+			info.ResponseFacts.IndependentUsageReported = meter.ReportedCounters()
+		}
+		if normalized, err := meter.NormalizedBody(partial); err == nil {
+			if p.format == types.RelayFormatOpenAIResponses {
+				sourceOutput.ObserveResponses(normalized)
+			} else {
+				sourceOutput.text.WriteString(gatewayStreamBusinessText(normalized, p.format))
+				if p.format == types.RelayFormatOpenAI {
+					sourceOutput.ObserveChatTools(normalized)
+				}
+			}
+			info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || sourceOutput.String() != "" || gatewayMediaOutput(normalized, p.format)
+		}
+	}
 	info.StreamStatus.RequireTerminal()
 	if p.format == types.RelayFormatOpenAI || p.format == types.RelayFormatGemini {
 		ended := info.StreamStatus.OutcomeSnapshot().EndReason
@@ -187,7 +220,11 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			complete = complete && (choice.finished || choice.audioDone)
 		}
 		if complete {
-			info.StreamStatus.MarkCompleted()
+			if sourceBudgetEnd {
+				info.StreamStatus.MarkIncomplete("max_output_tokens")
+			} else {
+				info.StreamStatus.MarkCompleted()
+			}
 		} else if ended == relaycommon.StreamEndReasonDone {
 			info.StreamStatus.MarkFailed("stream_interrupted", "", 0)
 		}
@@ -260,11 +297,32 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 				info.ResponseFacts.DownstreamWriteFailed = true
 				return usage, types.NewError(err, types.ErrorCodeBadResponse)
 			}
-		} else {
-			helper.Done(c)
+		} else if err := helper.Done(c); err != nil {
+			info.ResponseFacts.DownstreamWriteFailed = true
+			return usage, types.NewError(err, types.ErrorCodeBadResponse)
 		}
 	}
 	return usage, nil
+}
+
+func gatewayOutputLimitReached(body []byte, format types.RelayFormat) bool {
+	switch format {
+	case types.RelayFormatOpenAIResponses:
+		return gjson.GetBytes(body, "status").String() == "incomplete" && gjson.GetBytes(body, "incomplete_details.reason").String() == "max_output_tokens"
+	case types.RelayFormatClaude:
+		return gjson.GetBytes(body, "stop_reason").String() == "max_tokens" || gjson.GetBytes(body, "delta.stop_reason").String() == "max_tokens"
+	case types.RelayFormatOpenAI, types.RelayFormatGemini:
+		path, terminal, reason := "choices", "finish_reason", "length"
+		if format == types.RelayFormatGemini {
+			path, terminal, reason = "candidates", "finishReason", "MAX_TOKENS"
+		}
+		for _, choice := range gjson.GetBytes(body, path).Array() {
+			if choice.Get(terminal).String() == reason {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func gatewayUsageCounters(body []byte, format types.RelayFormat) (gjson.Result, gjson.Result) {
