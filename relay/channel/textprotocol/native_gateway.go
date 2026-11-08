@@ -332,9 +332,6 @@ func mergeNativeSourceFacts(info, native *relaycommon.RelayInfo, writer *nativeR
 			facts.SourceOutputTokens = source.SourceOutputTokens
 		}
 	}
-	if !writer.stream && source.SourceOutputTokens != nil {
-		facts.SourceOutputTokens = source.SourceOutputTokens
-	}
 	facts.SourceOutputObserved = facts.SourceOutputObserved || source.SourceOutputObserved
 	info.PerformanceBusinessRejection = info.PerformanceBusinessRejection || native.PerformanceBusinessRejection
 	if facts.UpstreamErrorCode == "" {
