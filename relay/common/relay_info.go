@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -1029,8 +1030,11 @@ type OriginTaskRef struct {
 }
 
 type TaskRelayInfo struct {
-	Action       string
-	OriginTaskID string
+	// OnPreparedRequest freezes task pricing after all wire overrides and
+	// before any submission bytes are sent. It is never serialized.
+	OnPreparedRequest func(*http.Request) error `json:"-"`
+	Action            string
+	OriginTaskID      string
 	// PublicTaskID 是提交时预生成的 task_xxxx 格式公开 ID，
 	// 供 DoResponse 在返回给客户端时使用（避免暴露上游真实 ID）。
 	PublicTaskID string

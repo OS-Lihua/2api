@@ -144,15 +144,17 @@ type TaskPrivateData struct {
 // TaskGatewaySnapshot freezes the accepted Channel and quantitative billing
 // facts. Request bodies, credentials, and generated content stay out of it.
 type TaskGatewaySnapshot struct {
-	Accepted         bool              `json:"accepted"`
-	ProviderType     int               `json:"provider_type"`
-	ChannelID        int               `json:"channel_id"`
-	ProviderID       int               `json:"provider_id"`
-	Settlement       GatewaySettlement `json:"settlement"`
-	Facts            map[string]any    `json:"facts"`
-	CompletionFacts  map[string]any    `json:"completion_facts,omitempty"`
-	PreviousAttempts []GatewayAttempt  `json:"previous_attempts,omitempty"`
-	SaleSource       money.Amount      `json:"sale_source"`
+	Accepted           bool                              `json:"accepted"`
+	ProviderType       int                               `json:"provider_type"`
+	ChannelID          int                               `json:"channel_id"`
+	ProviderID         int                               `json:"provider_id"`
+	Settlement         GatewaySettlement                 `json:"settlement"`
+	Facts              map[string]any                    `json:"facts"`
+	CompletionFacts    map[string]any                    `json:"completion_facts,omitempty"`
+	PreviousAttempts   []GatewayAttempt                  `json:"previous_attempts,omitempty"`
+	SaleSource         money.Amount                      `json:"sale_source"`
+	SaleConditions     *billingexpr.MoneyRequestSnapshot `json:"sale_conditions,omitempty"`
+	PurchaseConditions *billingexpr.MoneyRequestSnapshot `json:"purchase_conditions,omitempty"`
 }
 
 type TaskExecutionSnapshot struct {

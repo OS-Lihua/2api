@@ -120,10 +120,12 @@ type cachedEntry struct {
 	fixedPricing  bool
 	fixedOnly     bool
 
-	moneyOnce         sync.Once
-	moneyProgram      *vm.Program
-	moneyRequestRules []MoneyRequestRuleTrace
-	moneyErr          error
+	moneyOnce             sync.Once
+	moneyProgram          *vm.Program
+	moneyRequestRules     []MoneyRequestRuleTrace
+	moneyErr              error
+	moneySnapshotPrograms map[string]*vm.Program
+	moneySnapshotErr      error
 }
 
 var (

@@ -195,7 +195,7 @@ func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 		trace := billingexpr.MoneyTraceResult{Currency: request.SaleCurrency}
 		if saleErr == nil {
 			price := &model.PriceVersion{Expression: request.SaleExpression, Currency: request.SaleCurrency}
-			source, converted, evaluated, err := GatewayPrice(price, nil, billingexpr.RequestInput{Usage: facts}, time.UnixMilli(request.StartedAt), ratio, fx)
+			source, converted, evaluated, err := GatewayPrice(price, nil, billingexpr.RequestInput{Usage: facts, MoneySnapshot: snapshot.SaleConditions}, time.UnixMilli(request.StartedAt), ratio, fx)
 			trace, saleErr = evaluated, err
 			if saleErr == nil {
 				intent.SaleSource, saleErr = source.Receivable()
@@ -238,7 +238,7 @@ func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 		}
 	}
 	purchase := &model.PriceVersion{Expression: attempt.PurchaseExpression, Currency: attempt.Cost.Currency}
-	cost, converted, trace, priceErr := GatewayPrice(purchase, nil, billingexpr.RequestInput{Usage: costFacts}, time.UnixMilli(attempt.StartedAt), decimal.NewFromInt(1), purchaseFX)
+	cost, converted, trace, priceErr := GatewayPrice(purchase, nil, billingexpr.RequestInput{Usage: costFacts, MoneySnapshot: snapshot.PurchaseConditions}, time.UnixMilli(attempt.StartedAt), decimal.NewFromInt(1), purchaseFX)
 	trace.MatchedTier = ""
 	intent.AttemptTrace = map[string]billingexpr.MoneyTraceResult{attempt.ID: trace}
 	originalCost, originalErr := cost.Cost()

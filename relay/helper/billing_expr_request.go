@@ -1,7 +1,12 @@
 package helper
 
 import (
+	"fmt"
+	"io"
 	"maps"
+	"mime"
+	"mime/multipart"
+	"net/http"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -72,6 +77,85 @@ func BuildBillingExprRequestInputFromRequest(request dto.Request, headers map[st
 	}
 	input.Body = bodyBytes
 	return input, nil
+}
+
+// ResolveTaskBillingRequestInput preserves original scalar task parameters,
+// including multipart fields, without putting file contents in pricing inputs.
+func ResolveTaskBillingRequestInput(c *gin.Context, info *relaycommon.RelayInfo) (billingexpr.RequestInput, error) {
+	input, err := ResolveIncomingBillingExprRequestInput(c, info)
+	if err != nil || !strings.HasPrefix(strings.ToLower(c.GetHeader("Content-Type")), "multipart/") {
+		return input, err
+	}
+	form, err := common.ParseMultipartFormReusable(c)
+	if err != nil {
+		return input, err
+	}
+	input.Body, err = taskPricingParameters(form.Value)
+	return input, err
+}
+
+func taskPricingParameters(fields map[string][]string) ([]byte, error) {
+	values := make(map[string]any, len(fields))
+	for name, entries := range fields {
+		if len(entries) == 1 {
+			values[name] = entries[0]
+		} else {
+			values[name] = entries
+		}
+	}
+	return common.Marshal(values)
+}
+
+// BuildTaskBillingRequestInput inspects the prepared wire request without
+// consuming its body. Multipart files are excluded from pricing parameters.
+// The returned context is transient; durable tasks retain boolean decisions.
+func BuildTaskBillingRequestInput(request *http.Request) (billingexpr.RequestInput, error) {
+	input := billingexpr.RequestInput{Headers: make(map[string]string, len(request.Header))}
+	for name, values := range request.Header {
+		input.Headers[name] = strings.Join(values, ",")
+	}
+	if request.Body == nil || request.Body == http.NoBody {
+		return input, nil
+	}
+	if request.GetBody == nil {
+		return input, fmt.Errorf("task pricing requires a replayable request body")
+	}
+	body, err := request.GetBody()
+	if err != nil {
+		return input, err
+	}
+	defer body.Close()
+	mediaType, parameters, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+	if err != nil {
+		return input, err
+	}
+	if strings.HasPrefix(mediaType, "multipart/") {
+		reader := multipart.NewReader(body, parameters["boundary"])
+		fields := make(map[string][]string)
+		for {
+			part, err := reader.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return input, err
+			}
+			if part.FileName() != "" || part.FormName() == "" {
+				continue
+			}
+			value, err := io.ReadAll(part)
+			if err != nil {
+				return input, err
+			}
+			fields[part.FormName()] = append(fields[part.FormName()], string(value))
+		}
+		input.Body, err = taskPricingParameters(fields)
+		return input, err
+	}
+	if isJSONContentType(mediaType) {
+		input.Body, err = io.ReadAll(body)
+	}
+	return input, err
 }
 
 func readIncomingBillingExprBody(c *gin.Context) ([]byte, error) {

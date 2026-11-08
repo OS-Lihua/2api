@@ -304,6 +304,23 @@ prices; this mode rejects `fixed()`. The host validates plugin schema and unit
 bounds before evaluation and supplies the same completed fact vector to sale
 and purchase expressions.
 
+Durable task pricing can set `RequestInput.FreezeMoneyRequest` to capture a
+`MoneyRequestSnapshot` in the money trace. It stores the expression hash and
+boolean decisions for request-only predicates, including predicates skipped by
+estimated-usage branches. It never stores raw probe values. Settlement supplies
+that snapshot through `RequestInput.MoneySnapshot`; measured `u()` conditions
+still evaluate against completion facts. Sale decisions use the original client
+request, and purchase decisions use the final upstream body and headers.
+
+This durable mode requires every `param()` / `header()` call to be enclosed by
+an independent boolean predicate. For example, a header predicate combined with
+`u("seconds") > 2` is supported: only the header decision is frozen. A direct
+comparison between a private probe and mutable usage, or a raw probe used as an
+amount, cannot be replayed without retaining input values and is rejected before
+submission. Normal request-scoped evaluation retains its existing grammar.
+A predicate that failed in an unused branch is retained as unavailable; if final
+usage selects it, the existing pending-accounting lifecycle preserves the facts.
+
 ### Request Rules (appended after `|||`)
 
 Request-conditional multipliers are appended to the expression after a `|||` separator:

@@ -1,13 +1,16 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -989,6 +992,99 @@ func TestAsyncTaskUncertainSubmissionKeepsOneReservationWithoutRetry(t *testing.
 		var count int64
 		require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id = ? AND account_type = ? AND type = ?", requests[0].ID, model.LedgerAccountUserWallet, entry.kind).Count(&count).Error)
 		assert.Equal(t, entry.count, count)
+	}
+}
+
+func TestAsyncTaskFreezesOriginalSaleAndFinalWirePricingConditions(t *testing.T) {
+	const clientHeader = "client-fast-opaque-credential-not-for-storage"
+	const wireHeader = "wire-fast-opaque-credential-not-for-storage"
+	for _, tc := range []struct {
+		name, saleCondition, purchaseCondition string
+		balance                                int64
+		multipart                              bool
+	}{
+		{"request predicates", `has(header("x-task-rate"), "client-fast")`, `has(header("x-task-rate"), "wire-fast")`, 100000000, false},
+		{"measured conditions and initially skipped probes", `has(header("x-task-rate"), "client-fast") && u("seconds") <= 2`, `u("seconds") <= 2 && has(header("x-task-rate"), "wire-fast")`, 550000000, false},
+		{"multipart scalar probes with file", `has(header("x-task-rate"), "client-fast")`, `has(header("x-task-rate"), "wire-fast")`, 100000000, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method == http.MethodGet {
+					_, _ = w.Write([]byte(`{"id":"private-probe-job","status":"completed","seconds":"2"}`))
+					return
+				}
+				assert.Equal(t, wireHeader, r.Header.Get("X-Task-Rate"))
+				if tc.multipart {
+					if !assert.NoError(t, r.ParseMultipartForm(1<<20)) {
+						return
+					}
+					assert.Equal(t, "sora-2", r.FormValue("model"))
+					assert.Len(t, r.MultipartForm.File["input_reference"], 1)
+				} else {
+					var body map[string]any
+					assert.NoError(t, common.DecodeJson(r.Body, &body))
+					assert.Equal(t, "sora-2", body["model"])
+				}
+				_, _ = w.Write([]byte(`{"id":"private-probe-job","status":"queued"}`))
+			})
+			header, err := common.Marshal(map[string]string{"X-Task-Rate": wireHeader})
+			require.NoError(t, err)
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("header_override", string(header)).Error)
+			fixture.fake.Advance(time.Second)
+			for _, price := range []*model.PriceVersion{
+				{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: fmt.Sprintf(`tier("video", u("seconds") * 0.1) * (%s ? 2 : 1) * (param("model") == "gateway-alias" ? 1.25 : 1)`, tc.saleCondition), EffectiveAt: clock.Now().Unix()},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: fmt.Sprintf(`tier("video", u("seconds") * 0.05) * (%s ? 3 : 1) * (param("model") == "sora-2" ? 2 : 1)`, tc.purchaseCondition), EffectiveAt: clock.Now().Unix()},
+			} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			request := httptest.NewRequest(http.MethodPost, "/v1/tasks/sora", strings.NewReader(`{"model":"gateway-alias","prompt":"private-pricing-request-content","seconds":"4"}`))
+			request.Header.Set("Content-Type", "application/json")
+			if tc.multipart {
+				SetTaskPluginProtocolRouter(fixture.engine)
+				var payload bytes.Buffer
+				writer := multipart.NewWriter(&payload)
+				for name, value := range map[string]string{"model": "gateway-alias", "prompt": "private-pricing-request-content", "seconds": "4"} {
+					require.NoError(t, writer.WriteField(name, value))
+				}
+				image, err := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+				require.NoError(t, err)
+				file, err := writer.CreateFormFile("input_reference", "frame.png")
+				require.NoError(t, err)
+				_, err = file.Write(image)
+				require.NoError(t, err)
+				require.NoError(t, writer.Close())
+				request = httptest.NewRequest(http.MethodPost, "/v1/videos", &payload)
+				request.Header.Set("Content-Type", writer.FormDataContentType())
+			}
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			request.Header.Set("X-Task-Rate", clientHeader)
+			response := httptest.NewRecorder()
+			fixture.engine.ServeHTTP(response, request)
+			require.Equal(t, 200, response.Code, response.Body.String())
+			var wallet model.Wallet
+			require.NoError(t, model.DB.Where("account_type = ? AND owner_id = ?", model.LedgerAccountUserWallet, fixture.user.Id).Take(&wallet).Error)
+			assert.Equal(t, tc.balance, wallet.Balance.Nanos, "reservation must use the original client price conditions")
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("header_override", `{"X-Task-Rate":"changed-wire-condition"}`).Error)
+			runAsyncTaskRecoveryProcess(t, true)
+			requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.EqualValues(t, 450000000, requests[0].Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), requests[0].ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.EqualValues(t, 600000000, attempts[0].Cost.Nanos)
+			for _, query := range []struct{ table, field string }{{"tasks", "private_data"}, {"gateway_billings", "request_data"}, {"gateway_billings", "settlement"}} {
+				var values []string
+				require.NoError(t, model.DB.Table(query.table).Pluck(query.field, &values).Error)
+				for _, value := range values {
+					for _, secret := range []string{clientHeader, wireHeader, "provider-secret", "private-pricing-request-content", "Bearer " + fixture.token.Key} {
+						assert.False(t, strings.Contains(value, secret), "persisted pricing conditions must not retain raw probes or request content")
+					}
+				}
+			}
+		})
 	}
 }
 

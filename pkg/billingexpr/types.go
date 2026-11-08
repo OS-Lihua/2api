@@ -11,6 +11,10 @@ type RequestInput struct {
 	Headers map[string]string
 	Body    []byte
 	Usage   map[string]any
+	// FreezeMoneyRequest captures only boolean request-pricing decisions.
+	// MoneySnapshot replays those decisions with new measured usage.
+	FreezeMoneyRequest bool                  `json:"-"`
+	MoneySnapshot      *MoneyRequestSnapshot `json:"-"`
 	// ImageCount is a validated billing quantity, separate from the frozen
 	// request's n. Settlement can replace it with the actual returned count.
 	ImageCount *int

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -21,6 +22,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	taskplugin "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
@@ -193,21 +195,23 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 			maps.Copy(merged, facts)
 			facts = merged
 		}
-		sourceValue, _, err := billingexpr.RunMoneyExpr(sale.Expression, billingexpr.MoneyInput{TaskUsage: true, Request: billingexpr.RequestInput{Usage: facts}, Time: started}, sale.Currency)
+		if facts == nil {
+			facts = make(map[string]any)
+		}
+		info.RequestHeaders = make(map[string]string, len(parent.Header))
+		for name, values := range parent.Header {
+			info.RequestHeaders[name] = strings.Join(values, ",")
+		}
+		saleInput, err := helper.ResolveTaskBillingRequestInput(c, info)
+		if err != nil {
+			lastStatus, lastCode = 400, "invalid_request"
+			return
+		}
+		saleInput.Usage, saleInput.FreezeMoneyRequest = facts, true
+		sourceValue, reserveValue, saleTrace, err := service.GatewayPrice(sale, nil, saleInput, started, ratio, saleFX)
 		if err != nil {
 			lastStatus, lastCode = 503, "price_unavailable"
 			return
-		}
-		sourceValue, err = money.MulUnitPrice(ratio, sourceValue)
-		if err != nil {
-			return
-		}
-		reserveValue := sourceValue
-		if saleFX != nil {
-			reserveValue, err = sourceValue.Convert(*saleFX)
-			if err != nil {
-				return
-			}
 		}
 		reserve, err := reserveValue.Receivable()
 		if err != nil {
@@ -224,7 +228,7 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 			pending.Action = info.Action
 			pending.PrivateData.Key = ""
 			pending.PrivateData.Execution = service.TaskExecutionSnapshotFromContext(c)
-			pending.PrivateData.Gateway = &model.TaskGatewaySnapshot{ProviderType: info.ChannelType, ChannelID: selected.ID, ProviderID: provider.Id, Facts: facts, SaleSource: source, Settlement: model.GatewaySettlement{Request: *record}}
+			pending.PrivateData.Gateway = &model.TaskGatewaySnapshot{ProviderType: info.ChannelType, ChannelID: selected.ID, ProviderID: provider.Id, Facts: facts, SaleSource: source, SaleConditions: saleTrace.RequestSnapshot, Settlement: model.GatewaySettlement{Request: *record}}
 			if err := model.ReserveGatewayTask(record, reserve, source, pending); err != nil {
 				record, pending = nil, nil
 				lastStatus, lastCode = 503, "task_persistence_failed"
@@ -250,11 +254,11 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 			lastStatus, lastCode = 400, "unsupported_task_action"
 			return
 		}
-		body, err := adaptor.BuildRequestBody(c, info)
+		purchase, _, rate, err := gatewayChannelPurchaseSnapshot(c.Request.Context(), selected.ID, clock.Now())
 		if err != nil {
 			return
 		}
-		purchase, _, rate, err := gatewayChannelPurchaseSnapshot(c.Request.Context(), selected.ID, clock.Now())
+		body, err := adaptor.BuildRequestBody(c, info)
 		if err != nil {
 			return
 		}
@@ -270,7 +274,7 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 				attempt.MemberTier = member.Tier
 			}
 		}
-		snapshot := &model.TaskGatewaySnapshot{ProviderType: info.ChannelType, ChannelID: selected.ID, ProviderID: provider.Id, Facts: facts, SaleSource: saleSource, PreviousAttempts: append([]model.GatewayAttempt(nil), previousAttempts...), Settlement: model.GatewaySettlement{Request: *record, Attempt: attempt}}
+		snapshot := &model.TaskGatewaySnapshot{ProviderType: info.ChannelType, ChannelID: selected.ID, ProviderID: provider.Id, Facts: facts, SaleSource: saleSource, SaleConditions: pending.PrivateData.Gateway.SaleConditions, PreviousAttempts: append([]model.GatewayAttempt(nil), previousAttempts...), Settlement: model.GatewaySettlement{Request: *record, Attempt: attempt}}
 		pending.ChannelId = info.ChannelId
 		pending.Properties.UpstreamModelName = info.UpstreamModelName
 		pending.PrivateData.Gateway = snapshot
@@ -282,10 +286,30 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 		if _, err := budget.Start(); err != nil {
 			return
 		}
+		var pricingErr error
+		info.OnPreparedRequest = func(wire *http.Request) error {
+			input, err := helper.BuildTaskBillingRequestInput(wire)
+			if err == nil {
+				input.Usage, input.FreezeMoneyRequest = facts, true
+				_, trace, evalErr := billingexpr.RunMoneyExpr(purchase.Expression, billingexpr.MoneyInput{TaskUsage: true, Request: input, Time: time.UnixMilli(attempt.StartedAt)}, purchase.Currency)
+				err = evalErr
+				if err == nil {
+					snapshot.PurchaseConditions = trace.RequestSnapshot
+					err = pending.Update()
+				}
+			}
+			pricingErr = err
+			return err
+		}
 		result.SkippedChannel = 0
 		result.Attempt = attempt
 		response, err := adaptor.DoRequest(c, info, body)
 		attempt.EndedAt = clock.Now().UnixMilli()
+		if pricingErr != nil {
+			result.Attempt, result.SkippedChannel = nil, selected.ID
+			lastStatus, lastCode = 503, "price_unavailable"
+			return
+		}
 		if err != nil || response == nil {
 			result.Failure = service.ClassifyGatewayFailure(0, "", true, budget.TimedOut(), parent.Context().Err() != nil, false)
 			attempt.ErrorClass = result.Failure.Class
