@@ -229,6 +229,9 @@ func geminiMediaToChatContent(inlineData *dto.GeminiInlineData, fileData *dto.Ge
 		if mimeType == "image/jpg" {
 			mimeType = "image/jpeg"
 		}
+		if strings.HasPrefix(mimeType, "video/") {
+			return dto.MediaContent{Type: dto.ContentTypeVideoUrl, VideoUrl: &dto.MessageVideoUrl{Url: fileData.FileUri}}, ""
+		}
 		if _, supported := chatImageMediaTypes[mimeType]; mimeType != "" && !supported {
 			return dto.MediaContent{}, fmt.Sprintf("Chat Completions content cannot reference a Gemini file of MIME type %q", fileData.MimeType)
 		}
@@ -248,6 +251,8 @@ func geminiMediaToChatContent(inlineData *dto.GeminiInlineData, fileData *dto.Ge
 		}, ""
 	}
 	switch {
+	case strings.HasPrefix(mimeType, "video/"):
+		return dto.MediaContent{Type: dto.ContentTypeVideoUrl, VideoUrl: &dto.MessageVideoUrl{Url: "data:" + mimeType + ";base64," + inlineData.Data}}, ""
 	case strings.HasPrefix(mimeType, "image/"):
 		return dto.MediaContent{}, fmt.Sprintf("Chat Completions content accepts only PNG, JPEG, WebP, and GIF images, not %q", inlineData.MimeType)
 	case mimeType == "application/pdf":

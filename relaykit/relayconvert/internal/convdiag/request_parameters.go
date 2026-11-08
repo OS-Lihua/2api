@@ -2,6 +2,7 @@ package convdiag
 
 import (
 	"context"
+	"slices"
 	"strings"
 
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
@@ -27,6 +28,13 @@ func InspectRequestParameters(ctx context.Context, source, target any, from, to 
 		return err
 	}
 	InspectCacheControls(ctx, before, after, from, to, to == types.RelayFormatClaude || to == types.RelayFormatOpenAI && openRouter)
+	if !slices.Equal(requestOutputModalities(before, from), requestOutputModalities(after, to)) {
+		path := "modalities"
+		if from == types.RelayFormatGemini {
+			path = "generationConfig.responseModalities"
+		}
+		Add(ctx, types.ConversionDiagnostic{Code: "response_modalities_dropped", Path: path, Message: "The target request did not retain the requested output modalities", Severity: types.ConversionDiagnosticWarning, From: from, To: to})
+	}
 	for _, key := range []string{"prompt_cache_key", "prompt_cache_options", "prompt_cache_retention", "cachedContent"} {
 		if before[key] != nil && after[key] == nil {
 			Add(ctx, types.ConversionDiagnostic{Code: "cache_parameter_dropped", Path: key, Message: "The target request omitted this cache parameter", Severity: types.ConversionDiagnosticWarning, From: from, To: to})
@@ -74,6 +82,25 @@ func InspectRequestParameters(ctx context.Context, source, target any, from, to 
 		}
 	}
 	return nil
+}
+
+func requestOutputModalities(request map[string]any, format types.RelayFormat) []string {
+	path := "modalities"
+	if format == types.RelayFormatGemini {
+		path = "generationConfig.responseModalities"
+	}
+	values, _ := requestParameterAt(request, path).([]any)
+	if len(values) == 0 {
+		return []string{"text"}
+	}
+	modalities := make([]string, 0, len(values))
+	for _, value := range values {
+		if name, ok := value.(string); ok {
+			modalities = append(modalities, strings.ToLower(name))
+		}
+	}
+	slices.Sort(modalities)
+	return slices.Compact(modalities)
 }
 
 func requestParameterAt(value map[string]any, path string) any {

@@ -66,6 +66,7 @@ func gatewayError(c *gin.Context, status int, code, message string) {
 		}
 	}
 	if !streaming {
+		c.Header("Content-Type", "application/json; charset=utf-8")
 		c.AbortWithStatusJSON(status, payload)
 		return
 	}
@@ -529,7 +530,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			result = service.GatewayAttemptResult{Attempt: attempt, Failure: failure, Delivered: info.ResponseFacts.BusinessOutput}
 
 			record.Status = attempt.Status
-			if !info.ResponseFacts.BusinessOutput && info.ResponseFacts.GeneratedText == "" && !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && !info.ResponseFacts.CompletionTokensReported {
+			if !info.ResponseFacts.BusinessOutput && info.ResponseFacts.GeneratedText == "" && !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && !info.ResponseFacts.CompletionTokensReported && !info.ResponseFacts.IndependentUsageReported {
 				usage = nil
 			}
 			if usage == nil && (info.ResponseFacts.BusinessOutput || info.ResponseFacts.GeneratedText != "") {

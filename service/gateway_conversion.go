@@ -59,6 +59,16 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 		}
 	}
 	if gemini, ok := request.(*dto.GeminiChatRequest); ok {
+		if len(gemini.GenerationConfig.ResponseModalities) > 0 {
+			modalities := make([]string, 0, len(gemini.GenerationConfig.ResponseModalities))
+			for _, modality := range gemini.GenerationConfig.ResponseModalities {
+				modalities = append(modalities, strings.ToLower(modality))
+			}
+			chat.Modalities, err = common.Marshal(modalities)
+			if err != nil {
+				return nil, err
+			}
+		}
 		if gemini.CachedContent != "" {
 			chat.PromptCacheKey = gemini.CachedContent
 		}

@@ -2826,6 +2826,7 @@ func TestTextGatewayNativeGeminiPreservesDeliveredParts(t *testing.T) {
 		name, parts, usage string
 		receivable         int64
 	}{
+		{"audio", `[{"inlineData":{"mimeType":"audio/pcm","data":"AAECAw=="}}]`, `,"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}`, 36000},
 		{"code", `[{"executableCode":{"language":"PYTHON","code":"print(1)"}}]`, `,"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}`, 36000},
 		{"execution result", `[{"codeExecutionResult":{"outcome":"OUTCOME_OK","output":"Hello"}}]`, `,"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}`, 36000},
 		{"all thoughts", `[{"thought":true,"text":"alpha "},{"thought":true,"text":"beta"}]`, "", 23400},
@@ -2847,8 +2848,17 @@ func TestTextGatewayNativeGeminiPreservesDeliveredParts(t *testing.T) {
 				if stream {
 					path = "/v1beta/models/gateway-offering:streamGenerateContent?alt=sse"
 				}
-				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16}}`)
+				requestBody := `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16}}`
+				if content.name == "audio" {
+					require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", capability.Set{Features: []capability.Feature{capability.Streaming}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text, capability.Audio}}).Error)
+					addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) { t.Error("delivered audio must prevent switching") })
+					requestBody = `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16,"responseModalities":["AUDIO"]}}`
+				}
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, requestBody)
 				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				if content.name == "audio" {
+					assert.Contains(t, response.Body.String(), "AAECAw==")
+				}
 				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
 				require.NoError(t, err)
 				assert.Equal(t, "success", record.Status)
@@ -3261,8 +3271,55 @@ func TestTextGatewayNativeMessagesRequiresStructuredOutput(t *testing.T) {
 	}
 }
 
+func TestTextGatewayNativeGeminiVideoRetainsValidationFacts(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		video   bool
+		context int64
+		status  int
+	}{
+		{"native video", true, 9000, http.StatusOK},
+		{"missing video capability", false, 9000, http.StatusBadRequest},
+		{"video exceeds context", true, 1000, http.StatusBadRequest},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			previous := constant.GetMediaToken
+			constant.GetMediaToken = false
+			t.Cleanup(func() { constant.GetMediaToken = previous })
+			calls := 0
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				var sent dto.GeminiChatRequest
+				require.NoError(t, common.DecodeJson(r.Body, &sent))
+				require.Len(t, sent.Contents, 1)
+				require.Len(t, sent.Contents[0].Parts, 2)
+				require.NotNil(t, sent.Contents[0].Parts[1].FileData)
+				assert.Equal(t, "video/mp4", sent.Contents[0].Parts[1].FileData.MimeType)
+				assert.Equal(t, "https://example.com/a.mp4", sent.Contents[0].Parts[1].FileData.FileUri)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}`))
+			})
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "gemini_generate").Error)
+			caps := capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{ContextLength: &test.context}}
+			if test.video {
+				caps.InputModalities = append(caps.InputModalities, capability.Video)
+			}
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1beta/models/gateway-offering:generateContent", `{"contents":[{"role":"user","parts":[{"text":"Hello"},{"fileData":{"mimeType":"video/mp4","fileUri":"https://example.com/a.mp4"}}]}],"generationConfig":{"maxOutputTokens":16}}`)
+			assert.Equal(t, test.status, response.Code, response.Body.String())
+			if test.status == http.StatusOK {
+				assert.Equal(t, 1, calls)
+				assert.Contains(t, response.Body.String(), "Hello")
+			} else {
+				assert.Zero(t, calls)
+				assert.Contains(t, response.Body.String(), "unsupported_parameter")
+			}
+		})
+	}
+}
+
 func TestTextGatewayNativeGeminiRequiresDeclaredFeatures(t *testing.T) {
-	for _, config := range []string{`"cachedContent":"cached/one"`, `"generationConfig":{"responseMimeType":"application/json","responseSchema":{"type":"OBJECT"}}`} {
+	for _, config := range []string{`"generationConfig":{"responseModalities":["AUDIO"]}`, `"cachedContent":"cached/one"`, `"generationConfig":{"responseMimeType":"application/json","responseSchema":{"type":"OBJECT"}}`} {
 		t.Run(config, func(t *testing.T) {
 			calls := 0
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { calls++; w.WriteHeader(500) })
@@ -3309,6 +3366,7 @@ func TestTextGatewayIndependentConvertedUsageCounters(t *testing.T) {
 		completion, revenue, cost    int64
 	}{
 		{"bad Responses total", "openai_responses", `{"id":"resp","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":{}}}`, `data: {"type":"response.output_text.delta","delta":"Hello","output_index":0,"content_index":0}` + "\n\ndata: " + `{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":[]}}}` + "\n\n", 5, 36000, 20000},
+		{"Gemini independent thoughts", "gemini_generate", `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"thoughtsTokenCount":100}}`, "", 100, 378000, 210000},
 		{"Gemini explicit zero", "gemini_generate", `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":0,"totalTokenCount":15}}`, "", 0, 18000, 10000},
 		{"bad Gemini total", "gemini_generate", `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":-1}}`, "", 5, 36000, 20000},
 	} {
@@ -3333,7 +3391,11 @@ func TestTextGatewayIndependentConvertedUsageCounters(t *testing.T) {
 				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
 				require.NoError(t, err)
 				assert.Equal(t, "success", record.Status)
-				assert.Equal(t, "upstream", record.UsageSource)
+				if test.name == "Gemini independent thoughts" {
+					assert.Equal(t, "estimated", record.UsageSource)
+				} else {
+					assert.Equal(t, "upstream", record.UsageSource)
+				}
 				assert.Equal(t, int64(10), record.Usage.PromptTokens)
 				assert.Equal(t, test.completion, record.Usage.CompletionTokens)
 				assert.Equal(t, test.revenue, record.Receivable.Nanos)
@@ -3343,6 +3405,54 @@ func TestTextGatewayIndependentConvertedUsageCounters(t *testing.T) {
 				assert.Equal(t, test.cost, attempts[0].Cost.Nanos)
 			})
 		}
+	}
+}
+
+func TestTextGatewayFailureRetainsIndependentUsage(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				body := `{"type":"error","error":{"type":"overloaded_error","message":"provider-secret"},"usage":{"cache_read_input_tokens":100}}`
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", body)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(body))
+			})
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "anthropic_messages").Error)
+			price := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("base", cr * 1)`, EffectiveAt: clock.Now().Unix()}
+			require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			calls := 0
+			addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = w.Write([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Recovered\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n"))
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+			})
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/messages", fmt.Sprintf(`{"model":"gateway-offering","stream":%t,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, stream))
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Equal(t, 1, calls)
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(36000), record.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 2, total)
+			for _, attempt := range attempts {
+				if attempt.ChannelID == fixture.channel.ID {
+					assert.Equal(t, int64(100), attempt.Usage.CachedTokens)
+					assert.Equal(t, int64(100000), attempt.Cost.Nanos)
+					assert.Equal(t, "switch", attempt.FailoverDecision)
+				}
+			}
+		})
 	}
 }
 
@@ -3545,6 +3655,7 @@ func TestTextGatewayNativeProtocolFailoverBoundaries(t *testing.T) {
 						assert.Equal(t, "partial", record.Status)
 					} else {
 						assert.Equal(t, http.StatusBadGateway, response.Code)
+						assert.Contains(t, response.Result().Header.Get("Content-Type"), "application/json")
 						assert.Zero(t, record.Receivable.Nanos)
 						require.Len(t, attempts, 1)
 						assert.Equal(t, "invalid_request", attempts[0].ErrorClass)
@@ -3590,6 +3701,7 @@ func TestTextGatewayFailoverPublishesActualConversionLossHeader(t *testing.T) {
 				_, _ = w.Write([]byte(prefix))
 			})
 			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", initial).Error)
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", capability.Set{Features: []capability.Feature{capability.Streaming, capability.Caching}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}).Error)
 			fixture.offering.AcceptedConversionLosses = []string{loss}
 			require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
 			calls := 0
@@ -3668,6 +3780,7 @@ func TestTextGatewayStrictConversionLosses(t *testing.T) {
 		name, path, body, upstream, code, parameter string
 		hard                                        bool
 	}{
+		{"Gemini output modalities", "/v1beta/models/gateway-offering:generateContent", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16,"responseModalities":["AUDIO"]}}`, "openai_chat", "response_modalities_dropped", "responseModalities", false},
 		{"Gemini stop sequences", "/v1beta/models/gateway-offering:generateContent", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16,"stopSequences":["a","b","c","d","e"]}}`, "openai_chat", "stop_sequences_truncated", "stopSequences", false},
 		{"blocked domains", "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"tools":[{"type":"web_search_20250305","name":"web_search","blocked_domains":["example.com"]}]}`, "openai_responses", "unsupported_blocked_domains", "blocked_domains", false},
 		{"stateful response", "/v1/responses", `{"model":"gateway-offering","input":"Hello","max_output_tokens":16,"previous_response_id":"resp-private"}`, "openai_chat", "stateful_field_unsupported", "previous_response_id", true},
@@ -3692,6 +3805,9 @@ func TestTextGatewayStrictConversionLosses(t *testing.T) {
 				})
 				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", test.upstream).Error)
 				caps := capability.Set{Features: []capability.Feature{capability.Streaming, capability.ToolCalling, capability.Caching, capability.StructuredOutput}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}
+				if test.name == "Gemini output modalities" {
+					caps.OutputModalities = append(caps.OutputModalities, capability.Audio)
+				}
 				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
 				if policy == "global" {
 					require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", fixture.sale.CreatedBy).Update("role", common.RoleRootUser).Error)
@@ -3894,7 +4010,8 @@ func TestTextGatewayNoOutputFailureReleasesReservation(t *testing.T) {
 		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	})
 	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
-	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.Equal(t, http.StatusBadGateway, response.Code, response.Body.String())
+	assert.NotContains(t, response.Body.String(), "[DONE]")
 	requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, total)

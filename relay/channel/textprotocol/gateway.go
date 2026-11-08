@@ -86,6 +86,7 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	prompt, completion := gatewayUsageCounters(body, p.format)
 	facts.PromptTokensReported, facts.CompletionTokensReported = gatewayValidCounter(prompt), gatewayValidCounter(completion)
 	facts.UsageReported = facts.PromptTokensReported && facts.CompletionTokensReported
+	facts.IndependentUsageReported = meter.ReportedCounters()
 	normalized, err := meter.NormalizedBody(body)
 	if err != nil {
 		return usage, types.NewError(err, types.ErrorCodeBadResponseBody)
@@ -155,7 +156,7 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		usage.PromptTokens = info.GetEstimatePromptTokens()
 	}
 	if !facts.CompletionTokensReported {
-		usage.CompletionTokens = tokenkit.Count(info.TokenizerModelName(), facts.GeneratedText)
+		usage.CompletionTokens = max(usage.CompletionTokens, tokenkit.Count(info.TokenizerModelName(), facts.GeneratedText))
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	converted, err := relayconvert.ConvertResponse(c, info, info.RelayFormat, response)
@@ -173,7 +174,7 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		facts.DownstreamWriteFailed = true
 		return usage, types.NewError(err, types.ErrorCodeBadResponse)
 	}
-	if facts.GeneratedText != "" {
+	if facts.GeneratedText != "" || nativeGemini && gatewayGeminiMediaOutput(encoded) {
 		facts.MarkBusinessOutput()
 	}
 	if p.format == types.RelayFormatOpenAIResponses {

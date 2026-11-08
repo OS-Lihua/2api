@@ -43,6 +43,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		info.ResponseFacts.PromptTokensReported = info.ResponseFacts.PromptTokensReported || gatewayValidCounter(prompt)
 		info.ResponseFacts.CompletionTokensReported = info.ResponseFacts.CompletionTokensReported || gatewayValidCounter(completion)
 		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
+		info.ResponseFacts.IndependentUsageReported = meter.ReportedCounters()
 		normalized, err := meter.NormalizedBody([]byte(data))
 		if err != nil {
 			streamErr = err
@@ -145,7 +146,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		usage.PromptTokens = info.GetEstimatePromptTokens()
 	}
 	if !info.ResponseFacts.CompletionTokensReported {
-		usage.CompletionTokens = tokenkit.Count(info.TokenizerModelName(), output.String())
+		usage.CompletionTokens = max(usage.CompletionTokens, tokenkit.Count(info.TokenizerModelName(), output.String()))
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	if streamErr != nil {
@@ -222,7 +223,8 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 			text = value
 		}
 	}
-	writeErr := helper.WriteGatewayStreamFrame(c, info.ResponseFacts, frame, text != "")
+	business := text != "" || info.RelayFormat == types.RelayFormatGemini && gatewayGeminiMediaOutput(body)
+	writeErr := helper.WriteGatewayStreamFrame(c, info.ResponseFacts, frame, business)
 	if writeErr != nil {
 		info.ResponseFacts.DownstreamWriteFailed = true
 		var flushErr *helper.StreamFlushError
@@ -239,7 +241,7 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 	} else {
 		output.text.WriteString(text)
 	}
-	if text != "" {
+	if business {
 		info.ResponseFacts.MarkBusinessOutput()
 	}
 	return text, writeErr

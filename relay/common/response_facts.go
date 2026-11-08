@@ -19,6 +19,7 @@ type ResponseFacts struct {
 	UsageReported            bool
 	PromptTokensReported     bool
 	CompletionTokensReported bool
+	IndependentUsageReported bool
 	BusinessOutput           bool
 	DownstreamWriteFailed    bool
 	GeneratedText            string

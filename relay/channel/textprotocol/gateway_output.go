@@ -195,6 +195,17 @@ func gatewayResponseTool(item gjson.Result) (string, string, bool) {
 	}
 }
 
+func gatewayGeminiMediaOutput(body []byte) bool {
+	for _, candidate := range gjson.GetBytes(body, "candidates").Array() {
+		for _, part := range candidate.Get("content.parts").Array() {
+			if part.Get("inlineData.data").String() != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func gatewayGeminiPartText(part gjson.Result) string {
 	var text strings.Builder
 	text.WriteString(part.Get("text").String())

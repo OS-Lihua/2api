@@ -73,6 +73,33 @@ func (a *gatewayUsageAccumulator) Observe(body []byte) (*dto.Usage, error) {
 	}
 }
 
+// ReportedCounters identifies independently valid usage, including cache/audio
+// details and explicit zero, without treating total as a base counter.
+func (a *gatewayUsageAccumulator) ReportedCounters() bool {
+	return gatewayReportedCounters(a.snapshot)
+}
+
+func gatewayReportedCounters(value any) bool {
+	switch fields := value.(type) {
+	case map[string]any:
+		for key, field := range fields {
+			if _, numeric := field.(float64); numeric && strings.Contains(strings.ToLower(key), "token") && !strings.Contains(strings.ToLower(key), "total") {
+				return true
+			}
+			if gatewayReportedCounters(field) {
+				return true
+			}
+		}
+	case []any:
+		for _, field := range fields {
+			if gatewayReportedCounters(field) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // NormalizedBody isolates invalid usage fields from the content DTO parser.
 func (a *gatewayUsageAccumulator) NormalizedBody(body []byte) ([]byte, error) {
 	key := "usage"
