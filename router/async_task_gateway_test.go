@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -140,28 +141,7 @@ func TestAsyncTaskOfferingReservesWalletBeforeAcceptance(t *testing.T) {
 		service.RunTaskPollingOnce(t.Context(), nil)
 	}
 	t.Setenv("GATEWAY_SETTLEMENT_JOURNAL_DIR", journal)
-	var schema string
-	require.NoError(t, model.DB.Raw("SELECT current_schema()").Scan(&schema).Error)
-	primaryURL, err := url.Parse(os.Getenv("TEST_POSTGRES_DSN"))
-	require.NoError(t, err)
-	query := primaryURL.Query()
-	query.Set("search_path", schema)
-	primaryURL.RawQuery = query.Encode()
-	logDSN := primaryURL.String()
-	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
-		var database string
-		require.NoError(t, model.LOG_DB.Raw("SELECT currentDatabase()").Scan(&database).Error)
-		logURL, err := url.Parse(os.Getenv("TEST_CLICKHOUSE_LOG_DSN"))
-		require.NoError(t, err)
-		logURL.Path = "/" + database
-		logDSN = logURL.String()
-	}
-	executable, err := os.Executable()
-	require.NoError(t, err)
-	command := exec.CommandContext(t.Context(), executable, "-test.run=^TestAsyncTaskRecoveryProcess$", "-test.count=1")
-	command.Env = append(os.Environ(), "ASYNC_TASK_RECOVERY_PRIMARY_DSN="+primaryURL.String(), "ASYNC_TASK_RECOVERY_LOG_DSN="+logDSN)
-	output, err := command.CombinedOutput()
-	require.NoError(t, err, "%s", output)
+	runAsyncTaskRecoveryProcess(t, false)
 	var terminal model.Task
 	require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&terminal).Error)
 	require.Equal(t, model.TaskStatus(model.TaskStatusSuccess), terminal.Status)
@@ -179,6 +159,33 @@ func TestAsyncTaskOfferingReservesWalletBeforeAcceptance(t *testing.T) {
 	assert.EqualValues(t, 820000000, wallet.Balance.Nanos)
 }
 
+func runAsyncTaskRecoveryProcess(t *testing.T, poll bool) {
+	t.Helper()
+	var schema string
+	require.NoError(t, model.DB.Raw("SELECT current_schema()").Scan(&schema).Error)
+	primaryURL, err := url.Parse(os.Getenv("TEST_POSTGRES_DSN"))
+	require.NoError(t, err)
+	query := primaryURL.Query()
+	query.Set("search_path", schema)
+	query.Set("application_name", "async49-poller")
+	primaryURL.RawQuery = query.Encode()
+	logDSN := primaryURL.String()
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		var database string
+		require.NoError(t, model.LOG_DB.Raw("SELECT currentDatabase()").Scan(&database).Error)
+		logURL, err := url.Parse(os.Getenv("TEST_CLICKHOUSE_LOG_DSN"))
+		require.NoError(t, err)
+		logURL.Path = "/" + database
+		logDSN = logURL.String()
+	}
+	executable, err := os.Executable()
+	require.NoError(t, err)
+	command := exec.CommandContext(t.Context(), executable, "-test.run=^TestAsyncTaskRecoveryProcess$", "-test.count=1")
+	command.Env = append(os.Environ(), "ASYNC_TASK_RECOVERY_PRIMARY_DSN="+primaryURL.String(), "ASYNC_TASK_RECOVERY_LOG_DSN="+logDSN, fmt.Sprintf("ASYNC_TASK_RECOVERY_POLL=%t", poll))
+	output, err := command.CombinedOutput()
+	require.NoError(t, err, "%s", output)
+}
+
 func TestAsyncTaskRecoveryProcess(t *testing.T) {
 	primaryDSN := os.Getenv("ASYNC_TASK_RECOVERY_PRIMARY_DSN")
 	if primaryDSN == "" {
@@ -191,6 +198,22 @@ func TestAsyncTaskRecoveryProcess(t *testing.T) {
 	model.DB, model.LOG_DB = primary, logs
 	common.SetLogDatabaseType(kind)
 	require.NoError(t, model.InitSettlementCurrency())
+	if os.Getenv("ASYNC_TASK_RECOVERY_POLL") == "true" {
+		if _, found := jsplugin.DefaultRegistry.Get("sora"); !found {
+			source, err := plugins.Source("sora")
+			require.NoError(t, err)
+			_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "sora"})
+			require.NoError(t, err)
+		}
+		service.InitHttpClient()
+		service.GetTaskAdaptorFunc = func(platform constant.TaskPlatform) service.TaskPollingAdaptor { return relay.GetTaskAdaptor(platform) }
+		constant.TaskQueryLimit = 100
+		service.RunTaskPollingOnce(t.Context(), nil)
+		var terminal model.Task
+		require.NoError(t, model.DB.Where("private_data->'gateway' IS NOT NULL").Take(&terminal).Error)
+		require.Equal(t, model.TaskStatus(model.TaskStatusSuccess), terminal.Status)
+		return
+	}
 	completed, err := service.RecoverGatewayTasks(t.Context(), 100)
 	require.NoError(t, err)
 	require.Equal(t, 1, completed)
@@ -631,6 +654,99 @@ func TestAsyncTaskPersistenceFailureRollsBackReservation(t *testing.T) {
 	var wallet model.Wallet
 	require.NoError(t, model.DB.Where("account_type = ? AND owner_id = ?", model.LedgerAccountUserWallet, fixture.user.Id).Take(&wallet).Error)
 	assert.EqualValues(t, 1000000000, wallet.Balance.Nanos)
+}
+
+func TestAsyncTaskVideoRemixUsesOwnedOriginalTask(t *testing.T) {
+	calls := 0
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 2 {
+			assert.Equal(t, "/v1/videos/private-job-1/remix", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"private-job-%d","status":"queued"}`, calls)
+	})
+	SetVideoRouter(fixture.engine)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	var original model.Task
+	require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&original).Error)
+	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/videos/"+original.TaskID+"/remix", `{"prompt":"A green bird"}`)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), `"object":"video"`)
+	assert.NotContains(t, response.Body.String(), "private-job")
+	assert.Equal(t, 2, calls)
+	foreign := &model.User{Username: "remix-foreign", Status: common.UserStatusEnabled, Role: common.RoleCommonUser, Group: "default", AffCode: "remix-foreign", AuthVersion: 1}
+	require.NoError(t, model.DB.Create(foreign).Error)
+	foreignKey := &model.Token{UserId: foreign.Id, Key: "foreignremixkey", Status: common.TokenStatusEnabled, ExpiredTime: -1}
+	require.NoError(t, model.DB.Create(foreignKey).Error)
+	for _, id := range []string{original.TaskID, "task_missing"} {
+		response := adminSecurityRequest(fixture.engine, foreignKey.Key, http.MethodPost, "/v1/videos/"+id+"/remix", `{"prompt":"A green bird"}`)
+		assert.Equal(t, 404, response.Code, response.Body.String())
+	}
+	for _, updates := range []map[string]any{{"status": common.TokenStatusDisabled}, {"status": common.TokenStatusEnabled, "expired_time": 1}} {
+		require.NoError(t, model.DB.Model(foreignKey).Updates(updates).Error)
+		response := adminSecurityRequest(fixture.engine, foreignKey.Key, http.MethodPost, "/v1/videos/"+original.TaskID+"/remix", `{"prompt":"A green bird"}`)
+		assert.Equal(t, 401, response.Code, response.Body.String())
+	}
+	assert.Equal(t, 2, calls)
+}
+
+func TestAsyncTaskSubmissionCannotOverwriteConcurrentPollCompletion(t *testing.T) {
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"id":"private-job","status":"completed","seconds":"2"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"private-job","status":"queued"}`))
+	})
+	require.NoError(t, model.DB.Exec(`CREATE FUNCTION "coordinate_task_submission"() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF current_setting('application_name') <> 'async49-poller' AND EXISTS (SELECT 1 FROM "tasks" WHERE "status" = 'SUBMITTED' AND "private_data"->'gateway'->>'accepted' = 'true') THEN PERFORM pg_advisory_xact_lock(49, 6655); END IF; RETURN NULL; END $$`).Error)
+	require.NoError(t, model.DB.Exec(`CREATE TRIGGER "coordinate_task_submission" BEFORE UPDATE ON "tasks" FOR EACH STATEMENT EXECUTE FUNCTION "coordinate_task_submission"()`).Error)
+	database, err := model.DB.DB()
+	require.NoError(t, err)
+	connection, err := database.Conn(t.Context())
+	require.NoError(t, err)
+	defer connection.Close()
+	_, err = connection.ExecContext(t.Context(), `SELECT pg_advisory_lock(49, 6655)`)
+	require.NoError(t, err)
+	defer func() { _, _ = connection.ExecContext(context.Background(), `SELECT pg_advisory_unlock(49, 6655)`) }()
+	responseReady := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		responseReady <- adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+	}()
+	var response *httptest.ResponseRecorder
+	polled := false
+	for response == nil {
+		select {
+		case response = <-responseReady:
+		default:
+			var blocked int64
+			require.NoError(t, model.DB.WithContext(t.Context()).Raw(`SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND classid = 49 AND objid = 6655 AND NOT granted`).Scan(&blocked).Error)
+			if blocked > 0 {
+				// The controller is stopped before acquiring the task row lock.
+				// A separate polling process can commit its terminal facts first.
+				runAsyncTaskRecoveryProcess(t, true)
+				polled = true
+				_, err := connection.ExecContext(t.Context(), `SELECT pg_advisory_unlock(49, 6655)`)
+				require.NoError(t, err)
+				response = <-responseReady
+			}
+		}
+	}
+	require.Equal(t, 200, response.Code, response.Body.String())
+	if !polled {
+		runAsyncTaskRecoveryProcess(t, true)
+	}
+	var task model.Task
+	require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
+	assert.EqualValues(t, 2, task.PrivateData.Gateway.CompletionFacts["seconds"])
+	requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, "success", requests[0].Status)
+	assert.EqualValues(t, 180000000, requests[0].Receivable.Nanos)
 }
 
 func TestAsyncTaskRejectsUnboundedDurationBeforeReservation(t *testing.T) {

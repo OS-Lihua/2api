@@ -46,6 +46,10 @@ func presentGatewayTaskSubmission(c *gin.Context) {
 		respondTaskSubmissionError(c, taskErr)
 		return
 	}
+	if c.GetBool("task_gateway_video") {
+		c.JSON(http.StatusOK, outcome.Task.ToOpenAIVideo())
+		return
+	}
 	presentTaskSubmission(c, outcome)
 }
 
@@ -313,10 +317,8 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 				pending.FailReason = "Task failed"
 			}
 		}
-		if err := pending.Update(); err != nil {
-			lastStatus, lastCode = 500, "task_persistence_failed"
-			return
-		}
+		// Publish acceptance only after the shared runner finalizes its Attempt.
+		// Once visible to pollers, submission must never save this stale row again.
 		accepted = pending
 		acceptedInfo = info
 		return

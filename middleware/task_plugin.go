@@ -25,6 +25,7 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/clock"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	taskjsplugin "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
@@ -571,9 +572,13 @@ func RouteTaskPluginEndpoint() gin.HandlerFunc {
 				return
 			}
 			c.Set("task_gateway_endpoint", true)
+			requestPath := c.Request.URL.Path
+			if requestPath == "/v1/video/generations" {
+				requestPath = "/v1/videos"
+			}
 			for _, channel := range channels {
 				pluginKey := strings.TrimPrefix(string(channel.Protocol), "task:")
-				for _, binding := range generation.LookupEndpointCandidates(c.Request.Method, c.Request.URL.Path, channel.UpstreamModelName) {
+				for _, binding := range generation.LookupEndpointCandidates(c.Request.Method, requestPath, channel.UpstreamModelName) {
 					if binding.Plugin.Meta.Key != pluginKey {
 						continue
 					}
@@ -1803,6 +1808,58 @@ func logTaskPluginChannelDecision(c *gin.Context, channel *model.Provider, model
 		identityMode,
 		reason,
 	)
+}
+
+// PrepareTaskVideoRemix resolves only the authenticated owner's original task.
+// The task's saved Offering and plugin select the existing submission path.
+func PrepareTaskVideoRemix() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		task, exists, err := model.GetByTaskId(c.GetInt("id"), c.Param("video_id"))
+		if err != nil {
+			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, "Task is unavailable")
+			return
+		}
+		if !exists || task == nil {
+			abortWithOpenAiMessage(c, http.StatusNotFound, "Task not found")
+			return
+		}
+		if task.PrivateData.Gateway == nil {
+			c.Next()
+			return
+		}
+		if !task.PrivateData.Gateway.Accepted {
+			abortWithOpenAiMessage(c, http.StatusConflict, "Task submission outcome is unknown")
+			return
+		}
+		offering, err := model.GetModelOffering(c.Request.Context(), task.PrivateData.Gateway.Settlement.Request.ModelOfferingID)
+		if err != nil {
+			abortWithOpenAiMessage(c, http.StatusNotFound, "Model not found")
+			return
+		}
+		generation := pluginruntime.DefaultRegistry.Generation()
+		plugin, exists := generation.Get(string(task.Platform))
+		if !exists {
+			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, "Task plugin is unavailable")
+			return
+		}
+		var requestBody map[string]any
+		if err := common.UnmarshalBodyReusable(c, &requestBody); err != nil || requestBody == nil {
+			abortWithOpenAiMessage(c, http.StatusBadRequest, "Invalid task request")
+			return
+		}
+		requestBody["model"] = task.Properties.OriginModelName
+		c.Set(textOfferingContextKey, offering)
+		c.Set(TextGatewayStartedAtKey, clock.Now())
+		c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Generation: generation, Plugin: plugin})
+		common.SetContextKey(c, constant.ContextKeyOriginTasks, []*model.Task{task})
+		c.Set("task_request", requestBody)
+		c.Set("resolved_task_model", task.Properties.OriginModelName)
+		c.Set("expected_task_plugin_key", plugin.Meta.Key)
+		c.Set("task_action", "remix")
+		c.Set("task_gateway_endpoint", true)
+		c.Set("task_gateway_video", true)
+		c.Next()
+	}
 }
 
 func PrepareTaskPluginSubmit() gin.HandlerFunc {

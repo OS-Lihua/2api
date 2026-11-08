@@ -551,6 +551,16 @@ func TaskReadAuth() gin.HandlerFunc {
 	}
 }
 
+// TaskOriginAuth validates the normal token identity before an owned task can
+// determine its Offering. The submission path checks funding after ownership.
+func TaskOriginAuth() gin.HandlerFunc {
+	authenticate := TokenAuth()
+	return func(c *gin.Context) {
+		c.Set(taskReadAuthKey, true)
+		authenticate(c)
+	}
+}
+
 func TokenAuth() func(c *gin.Context) {
 	return func(c *gin.Context) {
 		// 先检测是否为ws
