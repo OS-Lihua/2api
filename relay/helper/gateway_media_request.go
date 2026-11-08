@@ -116,7 +116,7 @@ func GatewayMediaMultipartInput(form *multipart.Form) ([]byte, error) {
 		}
 		value := values[0]
 		switch strings.ToLower(key) {
-		case "n", "batch_size", "batch_count", "num_images", "num_outputs", "samplecount", "sample_count", "max_images", "max_tokens", "max_completion_tokens", "max_output_tokens", "max_new_tokens", "maxoutputtokens", "duration", "seconds", "duration_seconds", "silence_duration", "speed", "width", "height", "output_quality", "output_compression", "parameters", "metadata", "stream", "watermark", "prompt_extend":
+		case "n", "batch_size", "batch_count", "num_images", "num_outputs", "samplecount", "sample_count", "max_images", "max_tokens", "max_completion_tokens", "max_output_tokens", "max_new_tokens", "maxoutputtokens", "sample_rate", "duration", "seconds", "duration_seconds", "silence_duration", "speed", "width", "height", "output_quality", "output_compression", "parameters", "metadata", "stream", "watermark", "prompt_extend":
 			scalars[key] = common.RawMessage(value)
 		default:
 			encoded, err := common.Marshal(value)
@@ -169,6 +169,9 @@ func ValidateGatewayMediaMultipliers(body []byte, declared ...capability.Limits)
 				ceiling = relaycommon.MaxTaskDurationSeconds
 			case "silence_duration":
 				ceiling = relaycommon.MaxTaskDurationSeconds * 1000
+			case "sample_rate":
+				ceiling = 1<<31 - 1
+				minimum = decimal.NewFromInt(1)
 			case "width", "height":
 				ceiling = MaxGatewayImageDimension
 				minimum = decimal.NewFromInt(1)

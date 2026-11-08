@@ -5658,6 +5658,118 @@ func TestMediaGatewayEnforcesCapabilityLimitsOnEffectiveAudioFields(t *testing.T
 	}
 }
 
+type cancelOnSpeechOutputWriter struct {
+	*httptest.ResponseRecorder
+	cancel context.CancelFunc
+}
+
+func (w cancelOnSpeechOutputWriter) Write(body []byte) (int, error) {
+	n, err := w.ResponseRecorder.Write(body)
+	if strings.Contains(string(body), `"type":"speech.audio.delta"`) {
+		w.cancel()
+	}
+	return n, err
+}
+
+func (w cancelOnSpeechOutputWriter) WriteString(body string) (int, error) {
+	return w.Write([]byte(body))
+}
+
+func TestMediaGatewayVLLMPCMUsesEffectiveSampleRate(t *testing.T) {
+	for _, tc := range []struct {
+		mode      string
+		tokens    int64
+		seconds   string
+		delivered bool
+	}{
+		{"complete", 50, "3", true}, {"short", 50, "3", false}, {"sse", 50, "3", true}, {"cancel", 33, "2", true}, {"client", 50, "3", true}, {"header", 17, "0.75", true},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			stream := tc.mode == "sse" || tc.mode == "cancel"
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]common.RawMessage
+				require.NoError(t, common.DecodeJson(r.Body, &body))
+				assert.Equal(t, "8000", string(body["sample_rate"]))
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					size := 48000
+					if tc.mode == "cancel" {
+						size = 32000
+					}
+					_, _ = fmt.Fprintf(w, "data: {\"type\":\"speech.audio.delta\",\"audio\":%q}\n\n", base64.StdEncoding.EncodeToString(make([]byte, size)))
+					w.(http.Flusher).Flush()
+					if tc.mode == "cancel" {
+						<-r.Context().Done()
+						return
+					}
+					_, _ = io.WriteString(w, "data: {\"type\":\"speech.audio.done\"}\n\ndata: [DONE]\n\n")
+					return
+				}
+				w.Header().Set("Content-Type", "audio/pcm")
+				if tc.mode == "header" {
+					w.Header().Set("X-Audio-Sample-Rate", "16000")
+					w.Header().Set("X-Audio-Channels", "2")
+				}
+				if tc.mode == "short" {
+					w.Header().Set("Content-Length", "48001")
+				}
+				_, _ = w.Write(make([]byte, 48000))
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeVLLM).Error)
+			if tc.mode != "client" {
+				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", `{"sample_rate":8000}`).Error)
+			}
+			fixture.fake.Advance(time.Second)
+			for _, price := range []*model.PriceVersion{
+				{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("audio",ao * 9)`, EffectiveAt: clock.Now().Unix()},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("audio",ao * 7)`, EffectiveAt: clock.Now().Unix()},
+			} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			format := "audio"
+			if stream {
+				format = "sse"
+			}
+			extra := ""
+			if tc.mode == "client" {
+				extra = `,"sample_rate":8000`
+			}
+			request := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", strings.NewReader(fmt.Sprintf(`{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm","stream_format":%q%s}`, format, extra)))
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			request.Header.Set("Content-Type", "application/json")
+			ctx, stop := context.WithTimeout(t.Context(), 5*time.Second)
+			defer stop()
+			request = request.WithContext(ctx)
+			recorder := httptest.NewRecorder()
+			if tc.mode == "cancel" {
+				ctx, cancel := context.WithCancel(ctx)
+				defer cancel()
+				fixture.engine.ServeHTTP(cancelOnSpeechOutputWriter{recorder, cancel}, request.WithContext(ctx))
+			} else {
+				fixture.engine.ServeHTTP(recorder, request)
+			}
+			record, err := model.GetGatewayRequest(t.Context(), recorder.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			sale := tc.tokens * 8100
+			if !tc.delivered {
+				sale = 0
+			}
+			assert.Equal(t, sale, record.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, tc.tokens, attempts[0].Usage.AudioOutputTokens)
+			assert.Equal(t, tc.tokens*7000, attempts[0].Cost.Nanos)
+			if assert.NotNil(t, attempts[0].Usage.AudioOutputSeconds) {
+				assert.Equal(t, tc.seconds, *attempts[0].Usage.AudioOutputSeconds)
+			}
+			if tc.delivered && assert.NotNil(t, record.Usage.AudioOutputSeconds) {
+				assert.Equal(t, tc.seconds, *record.Usage.AudioOutputSeconds)
+			}
+		})
+	}
+}
+
 func TestMediaGatewaySpeechCapContinuesToCompatibleCandidate(t *testing.T) {
 	var officialCalls, compatibleCalls atomic.Int64
 	fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
@@ -6054,27 +6166,36 @@ func TestMediaGatewayIncompleteMediaStreamsDoNotChargeFixedRequest(t *testing.T)
 
 func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.T) {
 	for _, tc := range []struct {
-		kind        protocol.Type
-		duration    bool
-		seconds     string
-		short, zero bool
+		kind              protocol.Type
+		duration          bool
+		seconds           string
+		short, zero       bool
+		output, audioZero bool
 	}{
 		{kind: protocol.OpenAIImages}, {kind: protocol.OpenAIAudioSpeech}, {kind: protocol.OpenAIAudioTranscription},
 		{kind: protocol.OpenAIAudioTranscription, duration: true, seconds: "60"},
 		{kind: protocol.OpenAIAudioTranscription, duration: true, seconds: "0"},
 		{kind: protocol.OpenAIAudioTranscription, duration: true, seconds: "1e200"},
 		{kind: protocol.OpenAIAudioSpeech, short: true}, {kind: protocol.OpenAIAudioSpeech, short: true, zero: true},
+		{kind: protocol.OpenAIAudioSpeech, short: true, output: true}, {kind: protocol.OpenAIAudioSpeech, short: true, output: true, audioZero: true},
 	} {
 		kind := tc.kind
 		for _, stream := range []bool{false, true} {
 			if stream && kind == protocol.OpenAIAudioTranscription {
 				continue
 			}
-			t.Run(fmt.Sprintf("%s/stream=%t/duration=%t/seconds=%s/short=%t/zero=%t", kind, stream, tc.duration, tc.seconds, tc.short, tc.zero), func(t *testing.T) {
+			t.Run(fmt.Sprintf("%s/stream=%t/duration=%t/seconds=%s/short=%t/zero=%t/output=%t/audioZero=%t", kind, stream, tc.duration, tc.seconds, tc.short, tc.zero, tc.output, tc.audioZero), func(t *testing.T) {
 				firstCalls, secondCalls := 0, 0
 				fixture := newMediaGatewayFixture(t, kind, func(w http.ResponseWriter, r *http.Request) {
 					firstCalls++
 					body := `{"type":"error","error":{"type":"upstream_error","code":"rate_limit_exceeded","message":"provider-secret"},"usage":{"input_tokens":7,"output_tokens":0}}`
+					if tc.output {
+						details := ""
+						if tc.audioZero {
+							details = `,"output_tokens_details":{"audio_tokens":0}`
+						}
+						body = `{"error":{"type":"upstream_error","code":"rate_limit_exceeded","message":"provider-secret"},"usage":{"input_tokens":0,"output_tokens":1000` + details + `}}`
+					}
 					if tc.duration {
 						body = fmt.Sprintf(`{"error":{"code":"rate_limit_exceeded","message":"provider-secret"},"usage":{"type":"duration","seconds":%s}}`, tc.seconds)
 					}
@@ -6128,8 +6249,12 @@ func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.
 					purchase = `tier("image",fixed(0.02))*image_count`
 					expectedCost, expectedSale = 20_000_000, 36_000_000
 				}
+				firstPurchase := `tier("tokens",p)`
+				if tc.output {
+					firstPurchase = `tier("audio",ao)`
+				}
 				for _, price := range []*model.PriceVersion{
-					{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("tokens",p)`, EffectiveAt: clock.Now().Unix()},
+					{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: firstPurchase, EffectiveAt: clock.Now().Unix()},
 					{OwnerType: model.PriceOwnerChannel, OwnerID: channel.ID, Currency: "USD", Expression: purchase, EffectiveAt: clock.Now().Unix()},
 				} {
 					require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
@@ -6163,7 +6288,10 @@ func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.
 				require.EqualValues(t, 2, total)
 				assert.Equal(t, "rate_limited", attempts[0].ErrorClass)
 				firstCost := int64(7000)
-				if tc.zero {
+				if tc.output {
+					firstCost = 1_000_000
+				}
+				if tc.zero || tc.audioZero {
 					firstCost = 0
 				}
 				if tc.duration {

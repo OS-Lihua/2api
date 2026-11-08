@@ -23,14 +23,14 @@ import (
 // PreparedMediaRequest carries the validated wire and transient price probes.
 // Prepared is populated only after transport and account preparation.
 type PreparedMediaRequest struct {
-	Prepared                   *PreparedChannelRequest
-	Request                    dto.Request
-	Input                      billingexpr.RequestInput
-	Body                       []byte
-	ContentType                string
-	nativeAudio                bool
-	speechOutputLimitSupported bool
-	MinimumOutputTokens        int
+	Prepared            *PreparedChannelRequest
+	Request             dto.Request
+	Input               billingexpr.RequestInput
+	Body                []byte
+	ContentType         string
+	nativeAudio         bool
+	vllmSpeech          bool
+	MinimumOutputTokens int
 }
 
 // PrepareMediaRequest validates the final media wire and prepares its transport.
@@ -55,7 +55,7 @@ func (a *ChannelAdaptor) PrepareMediaRequest(c *gin.Context, info *relaycommon.R
 // dialect with a token control. Native projections reject unsupported limits.
 func (a *ChannelAdaptor) SetMediaOutputLimit(prepared *PreparedMediaRequest, limit int64) error {
 	request, ok := prepared.Request.(*dto.AudioRequest)
-	if a.kind != protocol.OpenAIAudioSpeech || !ok || prepared.nativeAudio || !prepared.speechOutputLimitSupported || limit <= 0 {
+	if a.kind != protocol.OpenAIAudioSpeech || !ok || prepared.nativeAudio || !prepared.vllmSpeech || limit <= 0 {
 		return fmt.Errorf("speech output limit cannot be sent to this Channel")
 	}
 	var fields map[string]common.RawMessage
@@ -171,7 +171,7 @@ func (a *ChannelAdaptor) PrepareMediaWire(c *gin.Context, info *relaycommon.Rela
 	if err := helper.ValidateGatewayMediaMultipliers(body); err != nil {
 		return nil, err
 	}
-	result := &PreparedMediaRequest{Request: request, Input: billingexpr.RequestInput{Body: body}, speechOutputLimitSupported: info.ChannelType == constant.ChannelTypeVLLM}
+	result := &PreparedMediaRequest{Request: request, Input: billingexpr.RequestInput{Body: body}, vllmSpeech: info.ChannelType == constant.ChannelTypeVLLM}
 	if projector, ok := converted.(channel.ImageRequestProjector); a.kind == protocol.OpenAIImages && ok {
 		effective, err := projector.ProjectImageRequest(body, *request.(*dto.ImageRequest))
 		if err != nil {
@@ -238,11 +238,22 @@ func (a *ChannelAdaptor) PrepareMediaWire(c *gin.Context, info *relaycommon.Rela
 		}
 		if a.kind == protocol.OpenAIAudioSpeech && len(effective.MaxNewTokens) > 0 {
 			var limit uint
-			if !result.speechOutputLimitSupported || common.Unmarshal(effective.MaxNewTokens, &limit) != nil || limit == 0 {
+			if !result.vllmSpeech || common.Unmarshal(effective.MaxNewTokens, &limit) != nil || limit == 0 {
 				return nil, fmt.Errorf("speech output limit is not supported by this Channel")
 			}
 		}
 		result.Request = &effective
+	}
+	if a.kind == protocol.OpenAIAudioSpeech {
+		audio := result.Request.(*dto.AudioRequest)
+		if audio.SampleRate != nil {
+			if !result.nativeAudio && !result.vllmSpeech {
+				return nil, fmt.Errorf("speech sample rate is not supported by this Channel")
+			}
+			if info.ResponseFacts != nil {
+				info.ResponseFacts.AudioOutputSampleRate = *audio.SampleRate
+			}
+		}
 	}
 	if projector, ok := converted.(channel.AudioOutputBudgetProjector); ok {
 		result.MinimumOutputTokens, err = projector.MinimumAudioOutputTokens(body)

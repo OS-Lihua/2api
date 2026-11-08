@@ -31,6 +31,10 @@ func (speechRequestBody) ProjectAudioRequest(body []byte, public dto.AudioReques
 	if silence := wire.Request.SilenceDuration; silence != nil && (math.IsNaN(*silence) || math.IsInf(*silence, 0) || *silence < 0 || *silence > relaycommon.MaxTaskDurationSeconds*1000) {
 		return nil, fmt.Errorf("Volcengine silence duration exceeds the request limit")
 	}
+	if public.SampleRate != nil && *public.SampleRate != wire.Audio.Rate {
+		return nil, fmt.Errorf("Volcengine sample rate override cannot be preserved")
+	}
+	public.SampleRate = common.GetPointer(wire.Audio.Rate)
 	public.Input, public.Voice = wire.Request.Text, wire.Audio.VoiceType
 	switch wire.Audio.Encoding {
 	case "mp3", "wav", "pcm":

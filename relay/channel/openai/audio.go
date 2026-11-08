@@ -27,10 +27,15 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-func speechAudioDuration(ctx context.Context, audio []byte, format string) (float64, error) {
+func normalizeSpeechOutputUsage(info *relaycommon.RelayInfo, usage *dto.Usage) {
+	if info.ResponseFacts != nil && info.ResponseFacts.CompletionTokensReported && !info.ResponseFacts.AudioOutputTokensReported {
+		usage.CompletionTokenDetails.AudioTokens = usage.CompletionTokens
+	}
+}
+
+func speechAudioDuration(ctx context.Context, audio []byte, format string, facts *relaycommon.ResponseFacts) (float64, error) {
 	if format == "pcm" {
-		// OpenAI PCM uses mono 24 kHz audio with 16-bit samples.
-		return float64(len(audio)) / 48000, nil
+		return float64(len(audio)) / float64(facts.AudioPCMBytesPerSecond()), nil
 	}
 	return common.GetAudioDuration(ctx, bytes.NewReader(audio), "."+format)
 }
@@ -50,7 +55,7 @@ func EstimateGeneratedSpeech(c *gin.Context, info *relaycommon.RelayInfo, audio 
 	var duration float64
 	durationErr := errors.New("incomplete encoded audio")
 	if complete || format == "pcm" {
-		duration, durationErr = speechAudioDuration(c.Request.Context(), audio, format)
+		duration, durationErr = speechAudioDuration(c.Request.Context(), audio, format, info.ResponseFacts)
 	}
 	var clamp *common.QuotaClamp
 	if durationErr != nil {
@@ -121,10 +126,23 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	if request, ok := info.Request.(*dto.AudioRequest); ok && request.ResponseFormat != "" {
 		audioFormat = request.ResponseFormat
 	}
-	if info.ResponseFacts != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices || strings.Contains(resp.Header.Get("Content-Type"), "json")) {
+	if info.ResponseFacts != nil && info.ChannelType == constant.ChannelTypeVLLM {
+		for header, target := range map[string]*int{
+			"X-Audio-Sample-Rate": &info.ResponseFacts.AudioOutputSampleRate,
+			"X-Audio-Channels":    &info.ResponseFacts.AudioOutputChannels,
+		} {
+			if raw := resp.Header.Get(header); raw != "" {
+				if value, err := strconv.ParseInt(raw, 10, 32); err == nil && value > 0 {
+					*target = int(value)
+				}
+			}
+		}
+	}
+	if info.ResponseFacts != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices || info.IsStream && strings.Contains(resp.Header.Get("Content-Type"), "json")) {
 		body, readErr := io.ReadAll(resp.Body)
 		usage = reportedMediaUsage(body)
 		observeMediaUsage(info, usage, body)
+		normalizeSpeechOutputUsage(info, usage)
 		fault := observeMediaError(info, body, resp.StatusCode)
 		if info.StreamStatus == nil {
 			info.StreamStatus = relaycommon.NewStreamStatus()
@@ -230,18 +248,16 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		info.ResponseFacts.GeneratedAudioBytes = generatedAudioBytes
 		info.ResponseFacts.DeliveredAudioBytes = deliveredAudioBytes
 		if audioFormat == "pcm" {
-			seconds := decimal.NewFromInt(generatedAudioBytes).Div(decimal.NewFromInt(48000)).String()
+			seconds := decimal.NewFromInt(generatedAudioBytes).Div(decimal.NewFromInt(info.ResponseFacts.AudioPCMBytesPerSecond())).String()
 			info.ResponseFacts.AudioOutputSeconds = &seconds
 		} else if info.ResponseFacts.AudioOutputSeconds == nil && completed {
-			if duration, err := speechAudioDuration(c.Request.Context(), encodedAudio.Bytes(), audioFormat); err == nil && !math.IsNaN(duration) && !math.IsInf(duration, 0) && duration >= 0 {
+			if duration, err := speechAudioDuration(c.Request.Context(), encodedAudio.Bytes(), audioFormat, info.ResponseFacts); err == nil && !math.IsNaN(duration) && !math.IsInf(duration, 0) && duration >= 0 {
 				seconds := decimal.NewFromFloat(duration).String()
 				info.ResponseFacts.AudioOutputSeconds = &seconds
 			}
 		}
 		// Speech output is audio unless an explicit detail counter says otherwise.
-		if info.ResponseFacts.CompletionTokensReported && !info.ResponseFacts.AudioOutputTokensReported {
-			usage.CompletionTokenDetails.AudioTokens = usage.CompletionTokens
-		}
+		normalizeSpeechOutputUsage(info, usage)
 		if !info.ResponseFacts.CompletionTokensReported && generatedAudioBytes > 0 {
 			var tokens int
 			var clamp *common.QuotaClamp
@@ -286,10 +302,18 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
 		// 读取响应体到缓冲区
 		bodyBytes, err := io.ReadAll(resp.Body)
+		structuredError := info.ResponseFacts != nil && strings.Contains(resp.Header.Get("Content-Type"), "json") && observeMediaError(info, bodyBytes, resp.StatusCode) != nil
+		if structuredError {
+			usage = reportedMediaUsage(bodyBytes)
+			observeMediaUsage(info, usage, bodyBytes)
+			normalizeSpeechOutputUsage(info, usage)
+		}
 		if err != nil {
 			logger.LogError(c, common.LogText("failed to read TTS response body: %v", err))
 			if info.ResponseFacts != nil {
-				usage = EstimateGeneratedSpeech(c, info, bodyBytes, false)
+				if !structuredError {
+					usage = EstimateGeneratedSpeech(c, info, bodyBytes, false)
+				}
 				if info.StreamStatus == nil {
 					info.StreamStatus = relaycommon.NewStreamStatus()
 				}
@@ -301,6 +325,9 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			return usage
 		}
 
+		if structuredError {
+			return usage
+		}
 		// 写入响应到客户端
 		c.Writer.WriteHeaderNow()
 		n, writeErr := c.Writer.Write(bodyBytes)
@@ -314,7 +341,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			}
 		}
 
-		duration, durationErr := speechAudioDuration(c.Request.Context(), bodyBytes, audioFormat)
+		duration, durationErr := speechAudioDuration(c.Request.Context(), bodyBytes, audioFormat, info.ResponseFacts)
 
 		if info.ResponseFacts != nil {
 			info.ResponseFacts.GeneratedAudioBytes = int64(len(bodyBytes))

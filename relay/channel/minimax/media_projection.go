@@ -26,6 +26,10 @@ func (speechRequestBody) ProjectAudioRequest(body []byte, public dto.AudioReques
 	if wire.AudioSetting == nil || wire.AudioSetting.SampleRate != 24000 || wire.AudioSetting.Channel != 1 {
 		return nil, fmt.Errorf("MiniMax speech requires mono audio at 24000 Hz")
 	}
+	if public.SampleRate != nil && *public.SampleRate != wire.AudioSetting.SampleRate {
+		return nil, fmt.Errorf("MiniMax sample rate override cannot be preserved")
+	}
+	public.SampleRate = common.GetPointer(wire.AudioSetting.SampleRate)
 	public.Input, public.Voice = wire.Text, wire.VoiceSetting.VoiceID
 	public.ResponseFormat = wire.AudioSetting.Format
 	return &public, nil

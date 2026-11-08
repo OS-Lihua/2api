@@ -18,6 +18,7 @@ type AudioRequest struct {
 	StreamFormat   string          `json:"stream_format,omitempty"`
 	Metadata       json.RawMessage `json:"metadata,omitempty"`
 	// vllm-omini
+	SampleRate              *int            `json:"sample_rate,omitempty"`
 	TaskType                json.RawMessage `json:"task_type,omitempty"`
 	Language                json.RawMessage `json:"language,omitempty"`
 	RefAudio                json.RawMessage `json:"ref_audio,omitempty"`
