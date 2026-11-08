@@ -23,7 +23,10 @@ type cozeResultBody struct {
 	io.ReadCloser
 	completion     CozeChatResponse
 	completionBody []byte
+	failure        *types.NewAPIError
 }
+
+func (body *cozeResultBody) ResponseError() *types.NewAPIError { return body.failure }
 
 func (body *cozeResultBody) SetReader(reader io.ReadCloser) { body.ReadCloser = reader }
 
@@ -104,6 +107,10 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 			return response, nil
 		}
 		if err != nil {
+			if facts, _ := common.GetContextKey(c, constant.ContextKeyResponseFacts); facts != nil {
+				response.Body = &cozeResultBody{ReadCloser: io.NopCloser(bytes.NewReader(completionBody)), completion: completion, completionBody: completionBody, failure: types.NewError(err, types.ErrorCodeReadResponseBodyFailed)}
+				return response, nil
+			}
 			return nil, err
 		}
 		if decodeErr != nil {

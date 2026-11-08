@@ -103,6 +103,8 @@ func (p *sparkProtocol) DoResponse(c *gin.Context, resp *http.Response, info *re
 			if info.ResponseFacts == nil {
 				return nil, responseErr
 			}
+			info.ResponseFacts.SourceGeneratedText = content.String()
+			info.ResponseFacts.SourceOutputObserved = content.Len() > 0
 			promptTokens, prompt := reportedUsage["prompt_tokens"]
 			completionTokens, completion := reportedUsage["completion_tokens"]
 			reported := dto.Usage{PromptTokens: promptTokens, CompletionTokens: completionTokens}

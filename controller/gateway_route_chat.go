@@ -3,7 +3,6 @@ package controller
 import (
 	"bytes"
 	"errors"
-	"slices"
 	"strings"
 	"time"
 
@@ -229,18 +228,14 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 	for key, values := range headers {
 		purchaseInput.Headers[strings.ToLower(key)] = strings.Join(values, ",")
 	}
-	losses := []string{}
+	diagnostics := info.ConversionDiagnostics()
 	if info.ConversionDiagnosticsTruncated() {
-		return nil, service.ErrGatewayConversion
+		return nil, &service.GatewayConversionError{Diagnostics: diagnostics}
 	}
-	for _, diagnostic := range info.ConversionDiagnostics() {
-		if diagnostic.Severity == types.ConversionDiagnosticError {
-			return nil, service.ErrGatewayConversion
-		}
-		if !slices.Contains(losses, diagnostic.Code) {
-			losses = append(losses, diagnostic.Code)
-		}
+	if err := service.CheckGatewayConversionLosses(diagnostics, accepted); err != nil {
+		return nil, &service.GatewayConversionError{Diagnostics: diagnostics}
 	}
+	losses := service.GatewayConversionCodes(diagnostics)
 	quality := 0
 	if conversion.From != conversion.To {
 		quality = 2

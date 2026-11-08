@@ -364,6 +364,12 @@ func (c *ClaudeRequest) GetTokenCountMeta() *types.TokenCountMeta {
 					break
 				}
 				for _, part := range media.ParseMediaContent() {
+					if part.Type == "document" && part.Source != nil && part.Source.Type == "text" {
+						if text, ok := part.Source.Data.(string); ok {
+							texts = append(texts, text)
+						}
+						continue
+					}
 					if source := part.ToFileSource(); source != nil {
 						fileType := types.FileTypeFile
 						if part.Type == "image" {

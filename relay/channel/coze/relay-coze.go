@@ -57,9 +57,13 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 	if info.ResponseFacts != nil {
 		var prompt, completion bool
 		if result, ok := resp.Body.(*cozeResultBody); ok {
+			info.ResponseFacts.RecordNativeUsage(&usage, result.completionBody, "data.usage.input_count", "data.usage.output_count")
 			prompt, completion = relaycommon.NativeUsagePresence(result.completionBody, "data.usage.input_count", "data.usage.output_count", "data.usage.token_count")
 		}
 		info.ResponseFacts.RecordUsage(&usage, &usage, prompt, completion)
+		if result, ok := resp.Body.(*cozeResultBody); ok && result.failure != nil {
+			return &usage, result.failure
+		}
 		if resp.StatusCode != http.StatusOK {
 			return &usage, types.NewErrorWithStatusCode(errors.New("Coze request failed"), types.ErrorCodeBadResponse, resp.StatusCode)
 		}

@@ -395,7 +395,7 @@ func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 		if info.ResponseFacts != nil {
 			info.ResponseFacts.RecordChatSource(&fullTextResponse)
 		}
-		return knownUsage, types.NewError(readErr, types.ErrorCodeBadResponseBody)
+		return knownUsage, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
 	}
 	if info.ResponseFacts != nil {
 		return helper.WriteChatResponse(c, info, resp, &fullTextResponse)

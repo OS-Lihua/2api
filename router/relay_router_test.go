@@ -4368,10 +4368,12 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 		httpStatus         int
 		upstreamStatus     int
 		shortBody          bool
+		shortCozePoll      bool
 		prompt, completion int64
 		charge, cost       int64
 		purchase           *model.GatewayUsage
 	}{
+		{name: "Coze completed polling read error keeps counters", provider: constant.ChannelTypeCoze, shortCozePoll: true, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 20000, body: `{}`},
 		{name: "AWS Claude read error keeps counters", provider: constant.ChannelTypeAws, key: "test-access|test-secret|us-east-1", upstreamModel: "anthropic.claude-3-haiku-20240307-v1:0", upstreamProtocol: string(protocol.AnthropicMessages), shortBody: true, body: `{"id":"msg","type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 20000},
 		{name: "PaLM read error retains generated cost", provider: constant.ChannelTypePaLM, shortBody: true, body: `{"candidates":[{"content":"Hello"}]}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
 		{name: "AWS Claude HTTP failure keeps known counters", provider: constant.ChannelTypeAws, key: "test-access|test-secret|us-east-1", upstreamModel: "anthropic.claude-3-haiku-20240307-v1:0", upstreamProtocol: string(protocol.AnthropicMessages), upstreamStatus: http.StatusServiceUnavailable, body: `{"type":"error","error":{"type":"overloaded_error","message":"retry later"},"usage":{"input_tokens":10,"output_tokens":5}}`, status: "failed", httpStatus: http.StatusServiceUnavailable, source: "none", cost: 20000},
@@ -4444,7 +4446,11 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 						if status == "" {
 							status = "completed"
 						}
-						_, _ = fmt.Fprintf(w, `{"code":0,"data":{"status":%q,"usage":{"input_count":10,"output_count":5,"token_count":15}}}`, status)
+						body := fmt.Sprintf(`{"code":0,"data":{"status":%q,"usage":{"input_count":10,"output_count":5,"token_count":15}}}`, status)
+						if test.shortCozePoll {
+							w.Header().Set("Content-Length", strconv.Itoa(len(body)+1))
+						}
+						_, _ = io.WriteString(w, body)
 						return
 					}
 				}
@@ -4603,8 +4609,10 @@ func TestTextGatewaySparkPreservesNativeCounterPresence(t *testing.T) {
 		name, counters     string
 		before             string
 		failed             bool
+		interrupted        bool
 		prompt, completion int
 	}{
+		{name: "interrupted native source", failed: true, interrupted: true},
 		{name: "native failure reports usage", failed: true, counters: `,"usage":{"text":{"prompt_tokens":10,"completion_tokens":5}}`, prompt: 10, completion: 5},
 		{name: "native failure retains prior usage", failed: true, before: `{"header":{"code":0},"payload":{"choices":{"status":1,"text":[{"role":"assistant","content":"Hello"}]},"usage":{"text":{"prompt_tokens":10,"completion_tokens":5}}}}` + "\n", prompt: 10, completion: 5},
 		{name: "missing usage", prompt: 9, completion: 1},
@@ -4613,6 +4621,9 @@ func TestTextGatewaySparkPreservesNativeCounterPresence(t *testing.T) {
 		{name: "reported zero", counters: `,"usage":{"text":{"prompt_tokens":0,"completion_tokens":0}}`},
 	} {
 		for _, stream := range []bool{false, true} {
+			if test.interrupted && stream {
+				continue
+			}
 			t.Run(fmt.Sprintf("%s/stream=%t", test.name, stream), func(t *testing.T) {
 				recorder := httptest.NewRecorder()
 				c, _ := gin.CreateTestContext(recorder)
@@ -4628,7 +4639,19 @@ func TestTextGatewaySparkPreservesNativeCounterPresence(t *testing.T) {
 				}
 				body := test.before + fmt.Sprintf(`{"header":{"code":%d},"payload":{"choices":{"status":2,"text":[{"role":"assistant","content":"Hello"}]}%s}}`+"\n", code, test.counters)
 				response := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
+				if test.interrupted {
+					reader, writer := io.Pipe()
+					response.Body = reader
+					go func() {
+						_, _ = io.WriteString(writer, "{\"header\":{\"code\":0},\"payload\":{\"choices\":{\"status\":0,\"text\":[{\"role\":\"assistant\",\"content\":\"Hello\"}]}}}\n")
+						_ = writer.CloseWithError(io.ErrUnexpectedEOF)
+					}()
+				}
 				result, apiErr := adaptor.DoResponse(c, response, info)
+				if test.interrupted {
+					assert.Equal(t, "Hello", info.ResponseFacts.SourceGeneratedText)
+					assert.True(t, info.ResponseFacts.SourceOutputObserved)
+				}
 				if test.failed {
 					require.NotNil(t, apiErr)
 				} else {
@@ -6953,12 +6976,12 @@ func TestTextGatewayNativeNestedTextDocumentsRemainText(t *testing.T) {
 		require.NotNil(t, nested[0].Source)
 		assert.Equal(t, "document", nested[0].Type)
 		assert.Equal(t, "text", nested[0].Source.Type)
-		assert.Equal(t, "SGVsbG8=", nested[0].Source.Data, "plain-text document data stays literal on the native wire")
+		assert.Equal(t, "Hello world!", nested[0].Source.Data, "plain-text document data stays literal on the native wire")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`)
 	})
 	require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", protocol.AnthropicMessages).Error)
-	body := `{"model":"gateway-offering","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"inspect","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","source":{"type":"text","media_type":"text/plain","data":"SGVsbG8="}}]}]}],"max_tokens":16}`
+	body := `{"model":"gateway-offering","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"inspect","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","source":{"type":"text","media_type":"text/plain","data":"Hello world!"}}]}]}],"max_tokens":16}`
 	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/messages", body)
 	assert.Equal(t, http.StatusOK, response.Code)
 	assert.Equal(t, 1, calls)
@@ -7437,6 +7460,9 @@ func routeNativeRequestsToFixture(t *testing.T, fixture textGatewayFixture) {
 			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"access_token":"native-test-token","expires_in":7200}`))}, nil
 		}
 		copyRequest := request.Clone(request.Context())
+		if address := net.ParseIP(request.URL.Hostname()); address != nil && address.IsLoopback() {
+			return transport.RoundTrip(request)
+		}
 		copyURL := *request.URL
 		copyURL.Scheme, copyURL.Host = endpoint.Scheme, endpoint.Host
 		copyRequest.URL, copyRequest.Host = &copyURL, endpoint.Host
@@ -7697,6 +7723,10 @@ func TestTextGatewayNativeWireLossesRequireAcceptance(t *testing.T) {
 			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],"tool_choice":"required"}`)
 			assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+			if provider == constant.ChannelTypeDify {
+				assert.Contains(t, response.Body.String(), "max_tokens")
+				assert.Contains(t, response.Body.String(), "did not retain")
+			}
 			assert.Zero(t, calls)
 			_, totalRequests, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
 			require.NoError(t, err)
@@ -7787,20 +7817,121 @@ func TestTextGatewayNativeMessagesTextPartsReachCohere(t *testing.T) {
 	assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
 }
 
-func TestTextGatewayBaiduRetainsAllSystemPrompts(t *testing.T) {
-	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			System string `json:"system"`
-		}
-		require.NoError(t, common.DecodeJson(r.Body, &body))
-		assert.Equal(t, "first\nsecond", body.System)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"result":"Hello","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
-	})
-	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeBaidu).Error)
-	routeBaiduRequestsToFixture(t, fixture)
-	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"system","content":"first"},{"role":"system","content":"second"},{"role":"user","content":"Hello"}],"max_tokens":16}`)
-	assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+func TestTextGatewayNativeFailuresRetainClassificationAndCosts(t *testing.T) {
+	for _, test := range []struct {
+		name                              string
+		provider                          int
+		key, model, protocol, body, class string
+		short                             bool
+		status                            int
+		cost                              int64
+	}{
+		{"Dify transport", constant.ChannelTypeDify, "", "", "", `{"answer":"Hello","metadata":{"usage":{"prompt_tokens":10,"completion_tokens":5}}}`, "connection_failed", true, http.StatusOK, 20000},
+		{"Baidu transport", constant.ChannelTypeBaidu, "failure-baidu|test-secret", "", "", `{"result":"Hello","usage":{"prompt_tokens":10,"completion_tokens":5}}`, "connection_failed", true, http.StatusOK, 20000},
+		{"Nova account quota", constant.ChannelTypeAws, "test-access|test-secret|us-east-1", "amazon.nova-lite-v1:0", "", `{"message":"Account quota exceeded"}`, "account_quota", false, http.StatusBadRequest, 0},
+		{"Claude account quota", constant.ChannelTypeAws, "test-access|test-secret|us-east-1", "anthropic.claude-3-haiku-20240307-v1:0", string(protocol.AnthropicMessages), `{"message":"Account quota exceeded"}`, "account_quota", false, http.StatusBadRequest, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			firstCalls, secondCalls := 0, 0
+			fixture := newTextGatewayFixtureWithNativeLosses(t, func(w http.ResponseWriter, r *http.Request) {
+				firstCalls++
+				w.Header().Set("Content-Type", "application/json")
+				if test.short {
+					w.Header().Set("Content-Length", strconv.Itoa(len(test.body)+1))
+				}
+				if test.provider == constant.ChannelTypeAws {
+					w.Header().Set("X-Amzn-Errortype", "ServiceQuotaExceededException")
+				}
+				w.WriteHeader(test.status)
+				_, _ = io.WriteString(w, test.body)
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": test.provider, "key": test.key}).Error)
+			if test.model != "" {
+				require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", test.model).Error)
+			}
+			if test.protocol != "" {
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", test.protocol).Error)
+			}
+			if test.provider == constant.ChannelTypeBaidu {
+				routeBaiduRequestsToFixture(t, fixture)
+			} else if test.provider == constant.ChannelTypeAws {
+				routeNativeRequestsToFixture(t, fixture)
+			}
+			addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+				secondCalls++
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`)
+			})
+			fixture.offering.RouteMethod = "weight"
+			require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+			path := "/v1/chat/completions"
+			if test.protocol == string(protocol.AnthropicMessages) {
+				path = "/v1/messages"
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), "Recovered")
+			assert.Equal(t, 1, firstCalls)
+			assert.Equal(t, 1, secondCalls)
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 2, total)
+			for _, attempt := range attempts {
+				if attempt.ChannelID == fixture.channel.ID {
+					assert.Equal(t, test.class, attempt.ErrorClass)
+					assert.Equal(t, test.cost, attempt.Cost.Nanos)
+				} else {
+					assert.Equal(t, "success", attempt.Status)
+				}
+			}
+		})
+	}
+}
+
+func TestTextGatewayNativeSystemPromptsRetainAllInstructions(t *testing.T) {
+	for _, provider := range []int{constant.ChannelTypeBaidu, constant.ChannelTypeAws} {
+		t.Run(fmt.Sprint(provider), func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					System   json.RawMessage `json:"system"`
+					Messages []struct {
+						Role string `json:"role"`
+					} `json:"messages"`
+				}
+				require.NoError(t, common.DecodeJson(r.Body, &body))
+				w.Header().Set("Content-Type", "application/json")
+				if provider == constant.ChannelTypeAws {
+					var system []struct {
+						Text string `json:"text"`
+					}
+					require.NoError(t, common.Unmarshal(body.System, &system))
+					require.Len(t, system, 2)
+					assert.Equal(t, "first", system[0].Text)
+					assert.Equal(t, "second", system[1].Text)
+					require.Len(t, body.Messages, 1)
+					assert.Equal(t, "user", body.Messages[0].Role)
+					_, _ = io.WriteString(w, `{"output":{"message":{"content":[{"text":"Hello"}]}},"stopReason":"end_turn","usage":{"inputTokens":10,"outputTokens":5}}`)
+				} else {
+					var system string
+					require.NoError(t, common.Unmarshal(body.System, &system))
+					assert.Equal(t, "first\nsecond", system)
+					_, _ = io.WriteString(w, `{"result":"Hello","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+				}
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", provider).Error)
+			if provider == constant.ChannelTypeBaidu {
+				routeBaiduRequestsToFixture(t, fixture)
+			} else {
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("key", "test-access|test-secret|us-east-1").Error)
+				require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", "amazon.nova-lite-v1:0").Error)
+				routeNativeRequestsToFixture(t, fixture)
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"system","content":"first"},{"role":"system","content":"second"},{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		})
+	}
 }
 
 func TestTextGatewayErrorsRespectReaderLanguage(t *testing.T) {
@@ -9834,6 +9965,10 @@ func TestTextGatewayCancellationReleasesOrChargesReportedUsage(t *testing.T) {
 					close(cancelled)
 				})
 				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", test.provider).Error)
+				if test.provider == constant.ChannelTypeDify {
+					fixture.offering.AcceptedConversionLosses = []string{"request_parameter_dropped"}
+					require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+				}
 				if test.expression != "" {
 					price := &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: test.expression, EffectiveAt: clock.Now().Unix()}
 					require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))

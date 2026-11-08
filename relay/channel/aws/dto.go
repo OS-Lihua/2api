@@ -80,6 +80,9 @@ func (*NovaRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAIRequ
 		return nil, err
 	}
 	public.Messages = nil
+	for _, part := range wire.System {
+		public.Messages = append(public.Messages, dto.Message{Role: "system", Content: part.Text})
+	}
 	for _, message := range wire.Messages {
 		var text strings.Builder
 		for _, part := range message.Content {
@@ -105,8 +108,9 @@ func (*AwsClaudeRequest) SetChatOutputLimit(body []byte, limit uint) ([]byte, er
 }
 
 type NovaRequest struct {
-	SchemaVersion   string               `json:"schemaVersion"`             // 请求版本，例如 "1.0"
-	Messages        []NovaMessage        `json:"messages"`                  // 对话消息列表
+	SchemaVersion   string               `json:"schemaVersion"` // 请求版本，例如 "1.0"
+	Messages        []NovaMessage        `json:"messages"`      // 对话消息列表
+	System          []NovaContent        `json:"system,omitempty"`
 	InferenceConfig *NovaInferenceConfig `json:"inferenceConfig,omitempty"` // 推理配置，可选
 }
 
@@ -120,17 +124,20 @@ type NovaInferenceConfig struct {
 
 // 转换OpenAI请求为Nova格式
 func convertToNovaRequest(req *dto.GeneralOpenAIRequest) *NovaRequest {
-	novaMessages := make([]NovaMessage, len(req.Messages))
-	for i, msg := range req.Messages {
-		novaMessages[i] = NovaMessage{
-			Role:    msg.Role,
-			Content: []NovaContent{{Text: msg.StringContent()}},
+	novaMessages := make([]NovaMessage, 0, len(req.Messages))
+	var system []NovaContent
+	for _, msg := range req.Messages {
+		if msg.Role == "system" || msg.Role == "developer" {
+			system = append(system, NovaContent{Text: msg.StringContent()})
+			continue
 		}
+		novaMessages = append(novaMessages, NovaMessage{Role: msg.Role, Content: []NovaContent{{Text: msg.StringContent()}}})
 	}
 
 	novaReq := &NovaRequest{
 		SchemaVersion: "messages-v1",
 		Messages:      novaMessages,
+		System:        system,
 	}
 
 	maxTokens := req.MaxTokens

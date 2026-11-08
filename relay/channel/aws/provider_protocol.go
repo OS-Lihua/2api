@@ -60,6 +60,13 @@ func (p *novaProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInf
 	if info.ChannelOtherSettings.AwsApiType == dto.AwsApiTypeMantle {
 		return nil, fmt.Errorf("AWS Mantle does not support Nova")
 	}
+	for _, message := range chat.Messages {
+		switch message.Role {
+		case "user", "assistant", "system", "developer":
+		default:
+			return nil, fmt.Errorf("Nova cannot represent the requested message role")
+		}
+	}
 	wire := convertToNovaRequest(chat)
 	if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
 		encoded, err := common.Marshal(wire)

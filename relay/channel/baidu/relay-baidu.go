@@ -211,7 +211,7 @@ func baiduHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respon
 		if info.ResponseFacts != nil {
 			info.ResponseFacts.RecordChatSource(responseBaidu2OpenAI(&baiduResponse))
 		}
-		return types.NewError(readErr, types.ErrorCodeBadResponseBody), knownUsage
+		return types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed), knownUsage
 	}
 	if baiduResponse.ErrorMsg != "" || baiduResponse.ErrorCode != 0 {
 		if info.ResponseFacts != nil {

@@ -40,7 +40,7 @@ func (capture *awsJSONResponseCapture) Do(request *http.Request) (*http.Response
 }
 
 type awsJSONSourceBody struct {
-	*bytes.Reader
+	io.Reader
 	readErr error
 	failure *types.NewAPIError
 }
@@ -52,6 +52,8 @@ func (body *awsJSONSourceBody) Read(target []byte) (int, error) {
 	}
 	return n, err
 }
+func (body *awsJSONSourceBody) SetReader(reader io.ReadCloser) { body.Reader = reader }
+
 func (body *awsJSONSourceBody) ResponseError() *types.NewAPIError { return body.failure }
 
 func (*awsJSONSourceBody) Close() error { return nil }

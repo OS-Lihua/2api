@@ -593,12 +593,22 @@ func GatewayCapabilitiesMatch(request *dto.GeneralOpenAIRequest, caps capability
 	if (request.PromptCacheKey != "" || len(request.PromptCacheOptions) > 0 || len(request.PromptCacheRetention) > 0) && !slices.Contains(caps.Features, capability.Caching) {
 		return false
 	}
-	if !slices.Contains(caps.InputModalities, capability.Text) || !slices.Contains(caps.OutputModalities, capability.Text) {
+	requiresText := request.RequiresTextInput || request.Prompt != nil || request.Input != nil
+	for _, message := range request.Messages {
+		if message.StringContent() != "" || message.GetReasoningContent() != "" || len(message.ParseToolCalls()) > 0 {
+			requiresText = true
+			break
+		}
+	}
+	if requiresText && !slices.Contains(caps.InputModalities, capability.Text) {
 		return false
 	}
 	var outputs []capability.Modality
 	if len(request.Modalities) > 0 && common.Unmarshal(request.Modalities, &outputs) != nil {
 		return false
+	}
+	if len(outputs) == 0 {
+		outputs = []capability.Modality{capability.Text}
 	}
 	for _, output := range outputs {
 		if !slices.Contains(caps.OutputModalities, output) {
