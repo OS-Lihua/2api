@@ -985,6 +985,55 @@ func TestTextGatewayBaiduNativeRejectionsExcludeProvider(t *testing.T) {
 	}
 }
 
+func TestTextGatewayStreamModelRejectionUsesChannelScope(t *testing.T) {
+	for _, business := range []bool{false, true} {
+		for _, code := range []string{"model_not_found", "DeploymentNotFound"} {
+			t.Run(fmt.Sprint(code, "/business=", business), func(t *testing.T) {
+				calls := 0
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					w.Header().Set("Content-Type", "text/event-stream")
+					if calls > 1 {
+						_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n"))
+						return
+					}
+					if business {
+						_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"First\"}}]}\n\n"))
+					}
+					_, _ = fmt.Fprintf(w, "data: {\"error\":{\"type\":\"invalid_request_error\",\"code\":%q,\"message\":\"private-model-error\"}}\n\n", code)
+				})
+				sibling := *fixture.channel
+				sibling.ID, sibling.UpstreamModelName = 0, "same-account-next"
+				require.NoError(t, model.DB.Create(&sibling).Error)
+				price := *fixture.purchase
+				price.ID, price.OwnerID = 0, sibling.ID
+				require.NoError(t, model.CreatePriceVersion(t.Context(), &price, fixture.sale.CreatedBy))
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+				attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+				require.NoError(t, err)
+				if business {
+					assert.Equal(t, 1, calls)
+					require.EqualValues(t, 1, total)
+					assert.Contains(t, response.Body.String(), "First")
+					assert.NotContains(t, response.Body.String(), "Recovered")
+					assert.NotContains(t, response.Body.String(), "[DONE]")
+				} else {
+					assert.Equal(t, 2, calls)
+					require.EqualValues(t, 2, total)
+					assert.Contains(t, response.Body.String(), "Recovered")
+					assert.Equal(t, 1, strings.Count(response.Body.String(), "[DONE]"))
+				}
+				for _, a := range attempts {
+					if a.ChannelID == fixture.channel.ID {
+						assert.Equal(t, "model_not_found", a.ErrorClass)
+					}
+				}
+				assert.NotContains(t, response.Body.String(), "private-model-error")
+			})
+		}
+	}
+}
+
 func TestTextGatewayFailoverCannotExceedFrozenReservation(t *testing.T) {
 	for _, recovery := range []bool{false, true} {
 		t.Run(fmt.Sprint("recovery=", recovery), func(t *testing.T) {
