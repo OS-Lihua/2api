@@ -232,7 +232,8 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 						writeMutex.Lock()
 						defer writeMutex.Unlock()
 						err = PingData(c)
-						if err != nil {
+						// Cancellation can stop PingData before it writes downstream.
+						if err != nil && info.ResponseFacts != nil && !errors.Is(err, c.Request.Context().Err()) {
 							info.ResponseFacts.DownstreamWriteFailed = true
 						}
 					}()

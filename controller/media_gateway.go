@@ -427,10 +427,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		if outcome.ErrorStatus >= 400 {
 			status = outcome.ErrorStatus
 		}
-		if outcome.EndReason == relaycommon.StreamEndReasonPingFail {
-			info.ResponseFacts.DownstreamWriteFailed = true
-		}
-		if status == http.StatusOK && code == "" && outcome.Response == relaycommon.ResponseOutcomeIncomplete && !budget.TimedOut() && parent.Context().Err() == nil && !info.ResponseFacts.DownstreamWriteFailed {
+		if status == http.StatusOK && code == "" && outcome.Response == relaycommon.ResponseOutcomeIncomplete && outcome.EndReason != relaycommon.StreamEndReasonPingFail && !budget.TimedOut() && parent.Context().Err() == nil && !info.ResponseFacts.DownstreamWriteFailed {
 			code = "stream_interrupted"
 		}
 		transport = transport || outcome.EndReason == relaycommon.StreamEndReasonScannerErr
