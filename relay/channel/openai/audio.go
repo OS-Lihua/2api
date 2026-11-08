@@ -94,12 +94,20 @@ func mediaJSONObjectPrefix(body []byte) bool {
 	if len(payload) == 0 || payload[0] != '{' {
 		return false
 	}
-	colon := bytes.IndexByte(payload, ':')
-	if colon <= 1 {
+	var key string
+	if common.DecodeJson(bytes.NewReader(payload[1:]), &key) == nil {
+		return true
+	}
+	if !utf8.Valid(payload) {
 		return false
 	}
-	var key string
-	return common.Unmarshal(payload[1:colon], &key) == nil
+	for _, value := range payload {
+		if value < 0x20 && value != '\t' && value != '\r' && value != '\n' {
+			return false
+		}
+	}
+	keyPrefix := bytes.TrimSpace(payload[1:])
+	return len(keyPrefix) == 0 || keyPrefix[0] == '"'
 }
 
 func speechAudioPayload(ctx context.Context, body []byte, format string, facts *relaycommon.ResponseFacts) bool {
