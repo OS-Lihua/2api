@@ -41,6 +41,7 @@ import { Route as AuthenticatedDashboardSectionRouteImport } from './routes/_aut
 import { Route as AuthenticatedErrorsErrorRouteImport } from './routes/_authenticated/errors/$error'
 import { Route as AuthenticatedFxRatesIndexRouteImport } from './routes/_authenticated/fx-rates/index'
 import { Route as AuthenticatedKeysIndexRouteImport } from './routes/_authenticated/keys/index'
+import { Route as AuthenticatedMarginReportsIndexRouteImport } from './routes/_authenticated/margin-reports/index'
 import { Route as AuthenticatedModelOfferingsIndexRouteImport } from './routes/_authenticated/model-offerings/index'
 import { Route as AuthenticatedModelsIndexRouteImport } from './routes/_authenticated/models/index'
 import { Route as AuthenticatedModelsSectionRouteImport } from './routes/_authenticated/models/$section'
@@ -241,6 +242,12 @@ const AuthenticatedKeysIndexRoute = AuthenticatedKeysIndexRouteImport.update({
   path: '/keys/',
   getParentRoute: () => AuthenticatedRouteRoute,
 } as any)
+const AuthenticatedMarginReportsIndexRoute =
+  AuthenticatedMarginReportsIndexRouteImport.update({
+    id: '/margin-reports/',
+    path: '/margin-reports/',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
 const AuthenticatedModelOfferingsIndexRoute =
   AuthenticatedModelOfferingsIndexRouteImport.update({
     id: '/model-offerings/',
@@ -484,6 +491,7 @@ export interface FileRoutesByFullPath {
   '/dashboard/': typeof AuthenticatedDashboardIndexRoute
   '/fx-rates/': typeof AuthenticatedFxRatesIndexRoute
   '/keys/': typeof AuthenticatedKeysIndexRoute
+  '/margin-reports/': typeof AuthenticatedMarginReportsIndexRoute
   '/model-offerings/': typeof AuthenticatedModelOfferingsIndexRoute
   '/models/': typeof AuthenticatedModelsIndexRoute
   '/playground/': typeof AuthenticatedPlaygroundIndexRoute
@@ -550,6 +558,7 @@ export interface FileRoutesByTo {
   '/dashboard': typeof AuthenticatedDashboardIndexRoute
   '/fx-rates': typeof AuthenticatedFxRatesIndexRoute
   '/keys': typeof AuthenticatedKeysIndexRoute
+  '/margin-reports': typeof AuthenticatedMarginReportsIndexRoute
   '/model-offerings': typeof AuthenticatedModelOfferingsIndexRoute
   '/models': typeof AuthenticatedModelsIndexRoute
   '/playground': typeof AuthenticatedPlaygroundIndexRoute
@@ -620,6 +629,7 @@ export interface FileRoutesById {
   '/_authenticated/dashboard/': typeof AuthenticatedDashboardIndexRoute
   '/_authenticated/fx-rates/': typeof AuthenticatedFxRatesIndexRoute
   '/_authenticated/keys/': typeof AuthenticatedKeysIndexRoute
+  '/_authenticated/margin-reports/': typeof AuthenticatedMarginReportsIndexRoute
   '/_authenticated/model-offerings/': typeof AuthenticatedModelOfferingsIndexRoute
   '/_authenticated/models/': typeof AuthenticatedModelsIndexRoute
   '/_authenticated/playground/': typeof AuthenticatedPlaygroundIndexRoute
@@ -689,6 +699,7 @@ export interface FileRouteTypes {
     | '/dashboard/'
     | '/fx-rates/'
     | '/keys/'
+    | '/margin-reports/'
     | '/model-offerings/'
     | '/models/'
     | '/playground/'
@@ -755,6 +766,7 @@ export interface FileRouteTypes {
     | '/dashboard'
     | '/fx-rates'
     | '/keys'
+    | '/margin-reports'
     | '/model-offerings'
     | '/models'
     | '/playground'
@@ -824,6 +836,7 @@ export interface FileRouteTypes {
     | '/_authenticated/dashboard/'
     | '/_authenticated/fx-rates/'
     | '/_authenticated/keys/'
+    | '/_authenticated/margin-reports/'
     | '/_authenticated/model-offerings/'
     | '/_authenticated/models/'
     | '/_authenticated/playground/'
@@ -1101,6 +1114,13 @@ declare module '@tanstack/react-router' {
       path: '/keys'
       fullPath: '/keys/'
       preLoaderRoute: typeof AuthenticatedKeysIndexRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/margin-reports/': {
+      id: '/_authenticated/margin-reports/'
+      path: '/margin-reports'
+      fullPath: '/margin-reports/'
+      preLoaderRoute: typeof AuthenticatedMarginReportsIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/model-offerings/': {
@@ -1453,6 +1473,7 @@ interface AuthenticatedRouteRouteChildren {
   AuthenticatedDashboardIndexRoute: typeof AuthenticatedDashboardIndexRoute
   AuthenticatedFxRatesIndexRoute: typeof AuthenticatedFxRatesIndexRoute
   AuthenticatedKeysIndexRoute: typeof AuthenticatedKeysIndexRoute
+  AuthenticatedMarginReportsIndexRoute: typeof AuthenticatedMarginReportsIndexRoute
   AuthenticatedModelOfferingsIndexRoute: typeof AuthenticatedModelOfferingsIndexRoute
   AuthenticatedModelsIndexRoute: typeof AuthenticatedModelsIndexRoute
   AuthenticatedPlaygroundIndexRoute: typeof AuthenticatedPlaygroundIndexRoute
@@ -1483,6 +1504,7 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedDashboardIndexRoute: AuthenticatedDashboardIndexRoute,
   AuthenticatedFxRatesIndexRoute: AuthenticatedFxRatesIndexRoute,
   AuthenticatedKeysIndexRoute: AuthenticatedKeysIndexRoute,
+  AuthenticatedMarginReportsIndexRoute: AuthenticatedMarginReportsIndexRoute,
   AuthenticatedModelOfferingsIndexRoute: AuthenticatedModelOfferingsIndexRoute,
   AuthenticatedModelsIndexRoute: AuthenticatedModelsIndexRoute,
   AuthenticatedPlaygroundIndexRoute: AuthenticatedPlaygroundIndexRoute,

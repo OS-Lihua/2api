@@ -864,10 +864,7 @@ func TestCalculateTextQuotaSummaryBillsCacheCreationInputTokens(t *testing.T) {
 // OpenAI 12h cache writes bill at twice the write price and keep their own
 // count in the consume log, with ratio and expression pricing alike.
 func TestPostTextConsumeQuotaBillsOpenAI12hCacheWrites(t *testing.T) {
-	truncate(t)
 	const userID, channelID = 63, 63
-	seedUser(t, userID, 1_000_000)
-	seedChannel(t, channelID)
 	gin.SetMode(gin.TestMode)
 	// The OpenAI prompt caching guide example at gpt-6-astra prices: $10 input,
 	// $1 cached, $12.50 30m write and $25 12h write per 1M tokens.
@@ -885,6 +882,11 @@ func TestPostTextConsumeQuotaBillsOpenAI12hCacheWrites(t *testing.T) {
 		{"expression without cc12h", hosttypes.PriceData{}, `tier("standard", p * 10 + c * 50 + cr * 1 + cc * 12.5)`, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// ClickHouse log IDs are not ordered sequences. Keep each pricing
+			// case isolated so getLastLog cannot read the preceding case.
+			truncate(t)
+			seedUser(t, userID, 1_000_000)
+			seedChannel(t, channelID)
 			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 			ctx.Request = httptest.NewRequest("POST", "/v1/responses", nil)
 			tc.price.GroupRatioInfo = hosttypes.GroupRatioInfo{GroupRatio: 1}

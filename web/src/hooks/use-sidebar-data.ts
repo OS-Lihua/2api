@@ -162,6 +162,15 @@ export function useSidebarData(badges: SidebarBadges = {}): SidebarData {
             url: '/model-offerings',
             icon: Box,
           },
+          ...(hasPermission(user, 'ledger', 'read')
+            ? [
+                {
+                  title: t('Margin reports'),
+                  url: '/margin-reports' as const,
+                  icon: CreditCard,
+                },
+              ]
+            : []),
           ...(canReadPricing
             ? [
                 {
