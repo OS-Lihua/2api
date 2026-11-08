@@ -25,6 +25,8 @@ func pricingError(c *gin.Context, err error) {
 	var validation *common.Message
 	var databaseError *pgconn.PgError
 	switch {
+	case errors.Is(err, money.ErrCurrencyMismatch):
+		status, message = http.StatusBadRequest, common.NewMessage("Cannot combine amounts in different currencies")
 	case errors.Is(err, money.ErrOverflow):
 		status, message = http.StatusBadRequest, common.NewMessage("The amount is outside the supported range")
 	case errors.As(err, &validation):

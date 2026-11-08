@@ -96,8 +96,9 @@ export function MarginReports() {
         page_size: pagination.pageSize,
       }
       for (const [key, value] of Object.entries(filters)) {
-        if (value !== '')
-          {params[key] = key.endsWith('_id') ? Number(value) : value}
+        if (value !== '') {
+          params[key] = key.endsWith('_id') ? Number(value) : value
+        }
       }
       const response = await api.get('/api/admin/v1/reports/margin', {
         params,
@@ -120,8 +121,18 @@ export function MarginReports() {
     { accessorKey: 'date', header: t('Date') },
     {
       id: 'revenue',
-      header: t('Revenue'),
-      cell: ({ row }) => <RequestMoney amount={row.original.revenue} />,
+      header: t('Known revenue'),
+      cell: ({ row }) => (
+        <div>
+          <RequestMoney amount={row.original.revenue} />
+          {row.original.sale_pending > 0 && (
+            <span className='block text-xs'>
+              {t('Pending sales')}:{' '}
+              {formatNumber(row.original.sale_pending, locale)}
+            </span>
+          )}
+        </div>
+      ),
     },
     {
       id: 'collected',

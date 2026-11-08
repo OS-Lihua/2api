@@ -31,34 +31,32 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 it('shows known amounts separately from unfinished margin and applies dimension and time filters', async () => {
-  const get = vi
-    .spyOn(api, 'get')
-    .mockResolvedValue({
+  const get = vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
       data: {
-        success: true,
-        data: {
-          total: 1,
-          items: [
-            {
-              model_offering_id: 17,
-              channel_id: 31,
-              provider_id: 41,
-              date: '2025-01-02',
-              revenue: { nanos: '1000000000', currency: 'USD' },
-              cost: { nanos: '200000000', currency: 'USD' },
-              collected: { nanos: '0', currency: 'USD' },
-              outstanding: { nanos: '1000000000', currency: 'USD' },
-              known_margin: { nanos: '800000000', currency: 'USD' },
-              margin: null,
-              sale_pending: 0,
-              cost_pending: 1,
-              converted_cost_pending: 1,
-              original_costs: [{ nanos: '100000000', currency: 'EUR' }],
-            },
-          ],
-        },
+        total: 1,
+        items: [
+          {
+            model_offering_id: 17,
+            channel_id: 31,
+            provider_id: 41,
+            date: '2025-01-02',
+            revenue: { nanos: '1000000000', currency: 'USD' },
+            cost: { nanos: '200000000', currency: 'USD' },
+            collected: { nanos: '0', currency: 'USD' },
+            outstanding: { nanos: '1000000000', currency: 'USD' },
+            known_margin: { nanos: '800000000', currency: 'USD' },
+            margin: null,
+            sale_pending: 0,
+            cost_pending: 1,
+            converted_cost_pending: 1,
+            original_costs: [{ nanos: '100000000', currency: 'EUR' }],
+          },
+        ],
       },
-    })
+    },
+  })
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   render(
     <QueryClientProvider client={client}>
@@ -66,6 +64,9 @@ it('shows known amounts separately from unfinished margin and applies dimension 
     </QueryClientProvider>
   )
   expect(await screen.findByText('Incomplete accounting')).toBeInTheDocument()
+  expect(
+    screen.getByRole('columnheader', { name: 'Known revenue' })
+  ).toBeInTheDocument()
   const user = userEvent.setup()
   await user.type(screen.getByRole('textbox', { name: 'Provider ID' }), '41')
   await user.type(screen.getByLabelText('From date'), '2025-01-02')

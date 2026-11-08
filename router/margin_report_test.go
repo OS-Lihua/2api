@@ -5,6 +5,9 @@ import (
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +17,99 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMarginBulkConfirmationHTTP(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(http.ResponseWriter, *http.Request) {})
+	manager := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "pricing:write", "channel:write", "channel:operate")
+	source := fmt.Sprintf(`{"rows":[{"resource":"channels","action":"confirm","data":{"id":%d}},{"resource":"price-versions","action":"create","data":{"owner_type":"channel","owner_id":%d,"currency":"USD","expression":"tier(\"purchase\",fixed(2))"}},{"resource":"price-versions","action":"create","data":{"owner_type":"model_offering","owner_id":%d,"currency":"USD","expression":"tier(\"sale\",fixed(1))"}}]}`, fixture.channel.ID, fixture.channel.ID, fixture.offering.ID)
+	preview := adminSecurityRequest(fixture.engine, manager, http.MethodPost, "/api/admin/v1/bulk-import?dry_run=true", source)
+	require.Equal(t, http.StatusOK, preview.Code, preview.Body.String())
+	var reply struct {
+		Data struct {
+			Valid       bool                     `json:"valid"`
+			MarginCheck *model.PriceMarginReport `json:"margin_check"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(preview.Body.Bytes(), &reply))
+	require.True(t, reply.Data.Valid)
+	require.NotNil(t, reply.Data.MarginCheck)
+	require.True(t, reply.Data.MarginCheck.RequiresConfirmation)
+	rejected := adminSecurityRequest(fixture.engine, manager, http.MethodPost, "/api/admin/v1/bulk-import", source)
+	require.Equal(t, http.StatusConflict, rejected.Code, rejected.Body.String())
+	fixture.fake.Advance(3 * time.Second)
+	request := httptest.NewRequest(http.MethodPost, "/api/admin/v1/bulk-import", strings.NewReader(source))
+	request.Header.Set("Authorization", "Bearer "+manager)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Margin-Confirmation", reply.Data.MarginCheck.Revision)
+	request.Header.Set("X-Margin-Effective-At", strconv.FormatInt(reply.Data.MarginCheck.EffectiveAt, 10))
+	response := httptest.NewRecorder()
+	fixture.engine.ServeHTTP(response, request)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var committed struct {
+		Data struct {
+			Committed bool `json:"committed"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &committed))
+	assert.True(t, committed.Data.Committed)
+}
+
+func TestMarginMixedCurrencyHTTP(t *testing.T) {
+	engine, actor, token := newAdminTestServer(t)
+	t.Setenv("GATEWAY_SETTLEMENT_JOURNAL_DIR", t.TempDir())
+	require.NoError(t, model.MigrateGatewayBilling(model.DB))
+	zero := money.Amount{Currency: "USD"}
+	request := model.GatewayRequest{ID: "mixed-currency-margin", UserID: actor.Id, ModelOfferingID: 17, SaleCurrency: "USD", SaleFXRate: "1", StartedAt: clock.Now().UnixMilli(), Status: "success", Receivable: zero}
+	require.NoError(t, model.ReserveGateway(&request, zero, zero))
+	require.NoError(t, model.PrepareGatewaySettlement(model.GatewaySettlement{Request: request, SaleSource: zero}))
+	_, err := model.SettleGateway(request.ID)
+	require.NoError(t, err)
+	_, err = model.PostLedgerEntries(model.LedgerPosting{Account: model.PlatformRevenueAccount("EUR"), Type: model.LedgerEntryCharge, Amount: money.Amount{Nanos: 1, Currency: "EUR"}, RequestId: request.ID})
+	require.NoError(t, err)
+	response := adminSecurityRequest(engine, token, http.MethodGet, "/api/admin/v1/reports/margin?group_by=model_offering", "")
+	require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), "Cannot combine amounts in different currencies")
+}
+
+func TestMarginGuardUsesGatewayUsage(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, expression string
+		stream                 bool
+		cost                   int64
+	}{
+		{name: "normal success contributes to seven day means", body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, expression: `p * 100`, cost: 1000000},
+		{name: "procurement uses reported output after interrupted delivery", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1000,\"total_tokens\":1010}}\n\n", expression: `c * 10`, cost: 10000000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+				contentType := "application/json"
+				if tc.stream {
+					contentType = "text/event-stream"
+				}
+				w.Header().Set("Content-Type", contentType)
+				_, err := fmt.Fprint(w, tc.body)
+				assert.NoError(t, err)
+			})
+			request := fmt.Sprintf(`{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"stream":%t,"max_tokens":16}`, tc.stream)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", request)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			manager := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "pricing:read", "pricing:write")
+			draft, err := common.Marshal(map[string]any{"owner_type": "channel", "owner_id": fixture.channel.ID, "currency": "USD", "expression": tc.expression})
+			require.NoError(t, err)
+			denied := adminSecurityRequest(fixture.engine, manager, http.MethodPost, "/api/admin/v1/price-versions", string(draft))
+			require.Equal(t, http.StatusConflict, denied.Code, denied.Body.String())
+			var reply struct {
+				Data model.PriceMarginReport `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(denied.Body.Bytes(), &reply))
+			require.Len(t, reply.Data.Estimates, 1)
+			estimate := reply.Data.Estimates[0]
+			assert.Equal(t, 1, estimate.Samples)
+			require.NotNil(t, estimate.Cost)
+			assert.EqualValues(t, tc.cost, estimate.Cost.Nanos)
+		})
+	}
+}
 
 func TestMarginReportOverflowHTTP(t *testing.T) {
 	engine, actor, token := newAdminTestServer(t)

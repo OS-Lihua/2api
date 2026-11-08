@@ -70,7 +70,7 @@ export class MarginConfirmationRequired extends Error {
   }
 }
 
-function throwMarginConfirmation(error: unknown): never {
+export function throwMarginConfirmation(error: unknown): never {
   if (
     isAxiosError(error) &&
     error.response?.status === 409 &&

@@ -107,6 +107,9 @@ func MarginReport(ctx context.Context, filter MarginFilter, offset, limit int) (
 				if err := common.UnmarshalJsonStr(lifecycle.RequestData, &request); err != nil {
 					return err
 				}
+				if request.Receivable.Currency != "" && request.Receivable.Currency != SettlementCurrency() {
+					return money.ErrCurrencyMismatch
+				}
 				var intent GatewaySettlement
 				if lifecycle.Settlement != "" {
 					if err := common.UnmarshalJsonStr(lifecycle.Settlement, &intent); err != nil {
@@ -150,6 +153,9 @@ func MarginReport(ctx context.Context, filter MarginFilter, offset, limit int) (
 							total.SalePending++
 						}
 					} else {
+						if !attempt.CostPending && !attempt.ConvertedCostPending && attempt.ConvertedCost.Currency != SettlementCurrency() {
+							return money.ErrCurrencyMismatch
+						}
 						if attempt.CostPending || lifecycle.Phase == "settlement_pending" {
 							total.CostPending++
 						}
@@ -164,6 +170,9 @@ func MarginReport(ctx context.Context, filter MarginFilter, offset, limit int) (
 					for _, entryIndex := range byRequest[request.ID] {
 						entry := entries[entryIndex]
 						if index == 0 {
+							if entry.AccountType != LedgerAccountProviderPayable && entry.Currency != SettlementCurrency() {
+								return money.ErrCurrencyMismatch
+							}
 							switch entry.AccountType {
 							case LedgerAccountPlatformRevenue:
 								total.revenue = total.revenue.Add(entry.Amount)

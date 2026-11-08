@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
@@ -28,10 +29,11 @@ type BulkImportRow struct {
 }
 
 type BulkImportResult struct {
-	DryRun    bool                `json:"dry_run"`
-	Valid     bool                `json:"valid"`
-	Committed bool                `json:"committed"`
-	Rows      []BulkImportPreview `json:"rows"`
+	MarginCheck *PriceMarginReport  `json:"margin_check,omitempty"`
+	DryRun      bool                `json:"dry_run"`
+	Valid       bool                `json:"valid"`
+	Committed   bool                `json:"committed"`
+	Rows        []BulkImportPreview `json:"rows"`
 }
 
 // Preview deliberately includes no user supplied strings or configuration.
@@ -99,13 +101,12 @@ type BulkChannelActionInput struct {
 }
 
 type BulkPriceInput struct {
-	MarginConfirmation string         `json:"margin_confirmation"`
-	OwnerType          string         `json:"owner_type"`
-	OwnerID            int            `json:"owner_id"`
-	OwnerRef           string         `json:"owner_ref"`
-	Currency           money.Currency `json:"currency"`
-	Expression         string         `json:"expression"`
-	EffectiveAt        *int64         `json:"effective_at"`
+	OwnerType   string         `json:"owner_type"`
+	OwnerID     int            `json:"owner_id"`
+	OwnerRef    string         `json:"owner_ref"`
+	Currency    money.Currency `json:"currency"`
+	Expression  string         `json:"expression"`
+	EffectiveAt *int64         `json:"effective_at"`
 }
 
 type bulkReference struct {
@@ -178,7 +179,19 @@ func bulkValidationError(err error) (string, string) {
 // ImportBatch validates before writing. dryRun executes only reads: it does not
 // insert and roll back, allocate IDs, update caches, or contact Providers.
 // Execution revalidates against locked rows in the same transaction as writes.
-func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID int) (*BulkImportResult, error) {
+type BulkMarginApproval struct {
+	Revision    string
+	EffectiveAt int64
+}
+
+func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID int, approvals ...BulkMarginApproval) (*BulkImportResult, error) {
+	approval := BulkMarginApproval{}
+	if len(approvals) > 0 {
+		approval = approvals[0]
+	}
+	if len(approvals) > 1 || approval.EffectiveAt < 0 || approval.EffectiveAt > MaxPriceEffectiveAt {
+		return nil, errInvalidBulk
+	}
 	if len(rows) == 0 || len(rows) > MaxBulkImportRows {
 		return nil, errInvalidBulk
 	}
@@ -186,6 +199,10 @@ func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID
 	err := DB.WithContext(ctx).Session(&gorm.Session{Logger: logger.Default.LogMode(logger.Silent)}).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Exec(`SELECT pg_advisory_xact_lock(510033)`).Error; err != nil {
 			return err
+		}
+		effectiveAt := approval.EffectiveAt
+		if effectiveAt == 0 {
+			effectiveAt = clock.Now().Unix()
 		}
 		if dryRun {
 			if err := tx.Exec("SET TRANSACTION READ ONLY").Error; err != nil {
@@ -356,11 +373,11 @@ func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID
 					rowErr = errInvalidBulk
 					break
 				}
-				at := clock.Now().Unix()
+				at := effectiveAt
 				if input.EffectiveAt != nil {
 					at = *input.EffectiveAt
 				}
-				record := &PriceVersion{MarginConfirmation: input.MarginConfirmation, OwnerType: input.OwnerType, OwnerID: input.OwnerID, Currency: input.Currency, Expression: input.Expression, EffectiveAt: at}
+				record := &PriceVersion{OwnerType: input.OwnerType, OwnerID: input.OwnerID, Currency: input.Currency, Expression: input.Expression, EffectiveAt: at}
 				channel := channels[input.OwnerID]
 				// Offering IDs and Channel IDs occupy independent namespaces.
 				if input.OwnerType != PriceOwnerChannel {
@@ -442,16 +459,29 @@ func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID
 		for _, channel := range channels {
 			catalog.Channels = append(catalog.Channels, channel)
 		}
-		for _, mutation := range mutations {
-			if mutation.price == nil {
-				continue
+		if len(catalog.Prices) > 0 {
+			marginReport := &PriceMarginReport{EffectiveAt: effectiveAt, Estimates: []MarginEstimate{}}
+			var revisions []string
+			for _, mutation := range mutations {
+				if mutation.price == nil {
+					continue
+				}
+				report, err := CheckPriceMargins(ctx, tx, mutation.price, nil, !dryRun, catalog)
+				if err != nil {
+					return err
+				}
+				revisions = append(revisions, report.Revision)
+				marginReport.Estimates = append(marginReport.Estimates, report.Estimates...)
+				marginReport.RequiresConfirmation = marginReport.RequiresConfirmation || report.RequiresConfirmation
 			}
-			report, err := CheckPriceMargins(ctx, tx, mutation.price, nil, !dryRun, catalog)
+			encoded, err := common.Marshal(revisions)
 			if err != nil {
 				return err
 			}
-			if report.RequiresConfirmation && mutation.price.MarginConfirmation != report.Revision {
-				return &MarginConfirmationError{Report: report}
+			marginReport.Revision = fmt.Sprintf("%x", sha256.Sum256(encoded))
+			result.MarginCheck = marginReport
+			if !dryRun && marginReport.RequiresConfirmation && approval.Revision != marginReport.Revision {
+				return &MarginConfirmationError{Report: marginReport}
 			}
 		}
 		if dryRun {

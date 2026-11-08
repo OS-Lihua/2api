@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/money"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/shopspring/decimal"
 	"gorm.io/gorm"
 )
@@ -107,7 +108,9 @@ func CheckPriceMargins(ctx context.Context, tx *gorm.DB, proposal *PriceVersion,
 			if !included || slices.Contains(scope.ExcludeProviderIDs, candidate.ProviderID) || slices.Contains(scope.ExcludeChannelIDs, candidate.ID) {
 				continue
 			}
-			channels = append(channels, *candidate)
+			copy := *candidate
+			copy.CreatedAt, copy.UpdatedAt = 0, 0
+			channels = append(channels, copy)
 		}
 		slices.SortFunc(channels, func(a, b Channel) int { return cmp.Compare(a.ID, b.ID) })
 		sale, saleErr := marginPriceVersion(ctx, tx, PriceOwnerOffering, offering.ID, at.Unix(), staged.Prices)
@@ -282,15 +285,37 @@ func meanPriceValue(ctx context.Context, tx *gorm.DB, price *PriceVersion, offer
 		if err != nil {
 			return money.Value{}, 0, "", err
 		}
+		var usages, channelUsages []*dto.Usage
 		for _, record := range records {
 			var intent GatewaySettlement
 			if err := common.UnmarshalJsonStr(record.Settlement, &intent); err != nil {
 				return money.Value{}, 0, "", err
 			}
-			usage := intent.SaleUsage
-			if usage == nil {
+			if price.OwnerType == PriceOwnerOffering {
+				if intent.SaleUsage != nil {
+					usages = append(usages, intent.SaleUsage)
+				}
 				continue
 			}
+			attempts := intent.Attempts
+			if intent.Attempt != nil {
+				attempts = []GatewayAttempt{*intent.Attempt}
+			}
+			for _, attempt := range attempts {
+				usage := intent.AttemptUsage[attempt.ID]
+				if usage == nil {
+					continue
+				}
+				usages = append(usages, usage)
+				if attempt.ChannelID == price.OwnerID {
+					channelUsages = append(channelUsages, usage)
+				}
+			}
+		}
+		if len(channelUsages) > 0 {
+			usages = channelUsages
+		}
+		for _, usage := range usages {
 			normalized, err := billingexpr.MoneyTokenQuantities(usage, used)
 			if err != nil {
 				return money.Value{}, 0, "", err

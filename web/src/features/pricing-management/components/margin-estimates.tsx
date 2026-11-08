@@ -32,7 +32,9 @@ export function MarginEstimates(props: { estimates: MarginEstimate[] }) {
   return (
     <StaticDataTable
       data={props.estimates}
-      getRowKey={(row) => `${row.model_offering_id}:${row.channel_id}`}
+      getRowKey={(row, index) =>
+        `${row.model_offering_id}:${row.channel_id}:${index}`
+      }
       getRowClassName={(row) => (row.negative ? 'text-destructive' : undefined)}
       tableProps={{ 'aria-label': t('Estimated channel margins') }}
       columns={[
@@ -89,13 +91,16 @@ export function MarginEstimates(props: { estimates: MarginEstimate[] }) {
           cell: (row) => {
             if (row.negative) return t('Sale price below purchase price')
             if (row.status === 'estimated') return t('Estimated')
-            if (row.status === 'missing_sale_price')
-              {return t('Missing sale price')}
-            if (row.status === 'missing_purchase_price')
-              {return t('Missing purchase price')}
+            if (row.status === 'missing_sale_price') {
+              return t('Missing sale price')
+            }
+            if (row.status === 'missing_purchase_price') {
+              return t('Missing purchase price')
+            }
             if (row.status === 'missing_fx') return t('Missing exchange rate')
-            if (row.status === 'no_usage_history')
-              {return t('No usage in the last seven days')}
+            if (row.status === 'no_usage_history') {
+              return t('No usage in the last seven days')
+            }
             return t('Insufficient pricing facts')
           },
         },
