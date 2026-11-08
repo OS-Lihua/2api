@@ -49,6 +49,26 @@ func TestKeyPermissionsHiddenAndMissingCallsAreIndistinguishable(t *testing.T) {
 		}
 	}
 	assert.Zero(t, calls, "neither inaccessible nor nonexistent models may dispatch")
+	logs, _, err := model.GetAuditLogs(model.AuditLogFilter{UserId: f.user.Id, Category: model.AuditCategorySecurity}, 0, 100, common.RoleRootUser)
+	require.NoError(t, err)
+	denials := 0
+	for _, entry := range logs {
+		if entry.Action != "gateway.model_access.denied" {
+			continue
+		}
+		denials++
+		assert.False(t, entry.Success)
+		assert.Equal(t, http.StatusNotFound, entry.Status)
+		assert.Equal(t, "api_key", entry.AuthMethod)
+		assert.Equal(t, "/v1/chat/completions", entry.Route)
+		assert.NotEmpty(t, entry.RequestId)
+	}
+	assert.Equal(t, 2, denials, "authorization failures must leave a security event for both hidden and unknown names")
+	encoded, err := common.Marshal(logs)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), f.token.Key)
+	assert.NotContains(t, string(encoded), "gateway-alias")
+	assert.NotContains(t, string(encoded), "missing-offering")
 }
 
 func TestKeyPermissionsAuthenticatesBeforeModelResolution(t *testing.T) {
