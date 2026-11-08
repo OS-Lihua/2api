@@ -10,7 +10,9 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -28,26 +30,33 @@ type providerAPIReply struct {
 	Data    map[string]any `json:"data"`
 }
 
-func newProviderAdminEngine(t *testing.T) *gin.Engine {
+type providerAdminTestEngine struct {
+	*gin.Engine
+	accessToken string
+}
+
+func newProviderAdminEngine(t *testing.T) *providerAdminTestEngine {
 	t.Helper()
 	previousMaster, previousCache, previousRedis := common.IsMasterNode, common.MemoryCacheEnabled, common.RedisEnabled
+	previousSecret := common.SessionSecret
+	common.SessionSecret = "provider-admin-session-fixture-secret"
 	t.Cleanup(func() {
+		common.SessionSecret = previousSecret
 		common.IsMasterNode, common.MemoryCacheEnabled, common.RedisEnabled = previousMaster, previousCache, previousRedis
 	})
 	common.IsMasterNode, common.MemoryCacheEnabled, common.RedisEnabled = false, false, false
 	database := model.UseTestDatabases(t)
 	model.LOG_DB = database
 	common.SetLogDatabaseType(common.DatabaseTypePostgreSQL)
-	require.NoError(t, database.AutoMigrate(&model.Provider{}, &model.Ability{}, &model.User{}, &model.Log{}, &model.AuditLog{}))
-	root := &model.User{Username: "provider-admin-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled}
+	require.NoError(t, database.AutoMigrate(&model.Provider{}, &model.Ability{}, &model.User{}, &model.UserSession{}, &model.Log{}, &model.AuditLog{}))
+	root := &model.User{Username: "provider-admin-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AuthVersion: 1}
 	require.NoError(t, database.Create(root).Error)
+	session, err := service.CreateLoginSession(root.Id, service.VerificationMethodPassword, "127.0.0.1", "provider-admin-fixture")
+	require.NoError(t, err)
 
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
-	group := engine.Group("/api/admin/v1/providers", func(c *gin.Context) {
-		c.Set("id", root.Id)
-		c.Set("role", common.RoleRootUser)
-	})
+	group := engine.Group("/api/admin/v1/providers", middleware.AdminAuth())
 	group.GET("", ListProviders)
 	group.POST("", CreateProvider)
 	group.GET("/:id", GetProvider)
@@ -63,21 +72,22 @@ func newProviderAdminEngine(t *testing.T) *gin.Engine {
 	group.POST("/:id/keys/:index/enable", EnableProviderKey)
 	group.POST("/:id/keys/:index/disable", DisableProviderKey)
 	group.DELETE("/:id/keys/:index", DeleteProviderKey)
-	return engine
+	return &providerAdminTestEngine{Engine: engine, accessToken: session.AccessToken}
 }
 
 // callProviderAPI sends a request and checks that no reply carries a
 // credential, whatever the route.
-func callProviderAPI(t *testing.T, engine *gin.Engine, method, path, body string) providerAPIReply {
+func callProviderAPI(t *testing.T, engine *providerAdminTestEngine, method, path, body string) providerAPIReply {
 	t.Helper()
 	return callProviderAPIStatus(t, engine, http.StatusOK, method, path, body)
 }
 
-func callProviderAPIStatus(t *testing.T, engine *gin.Engine, wantStatus int, method, path, body string, secrets ...string) providerAPIReply {
+func callProviderAPIStatus(t *testing.T, engine *providerAdminTestEngine, wantStatus int, method, path, body string, secrets ...string) providerAPIReply {
 	t.Helper()
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(method, "/api/admin/v1/providers"+path, strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+engine.accessToken)
 	engine.ServeHTTP(recorder, request)
 	require.Equal(t, wantStatus, recorder.Code, recorder.Body.String())
 	for _, secret := range append(secrets, providerKeyA, "sk-provider", `"key":`, "key_preview") {
@@ -307,6 +317,7 @@ func TestProviderAdminAPIKeepsAccountSecretsWriteOnly(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			request := httptest.NewRequest(tc.method, "/api/admin/v1/providers"+tc.path, strings.NewReader(tc.body))
 			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "Bearer "+engine.accessToken)
 			engine.ServeHTTP(recorder, request)
 			require.Equal(t, http.StatusOK, recorder.Code)
 			for _, secret := range []string{providerKeyA, "fixture-header-secret", "fixture-api-secret", "fixture-custom-secret", "fixture-proxy-secret", "fixture-info-secret", "fixture-settings-secret", "fixture-param-secret", "fixture-new-secret", "fixture-reason-secret"} {

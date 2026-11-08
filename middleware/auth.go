@@ -258,12 +258,7 @@ func AuthorizeDashboardMutation(tx *gorm.DB, c *gin.Context, permissions ...auth
 	if user.Status != common.UserStatusEnabled || user.Role < common.RoleAdminUser {
 		return false
 	}
-	for _, permission := range permissions {
-		if !authz.Can(user.Id, user.Role, permission) {
-			return false
-		}
-	}
-	return true
+	return authz.CanWithTx(tx, user.Id, user.Role, permissions...)
 }
 
 func authenticateDashboardRequest(c *gin.Context) (*model.UserBase, service.AuthIdentity, bool, error) {

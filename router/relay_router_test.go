@@ -1046,7 +1046,7 @@ func providerSecurityRequest(t *testing.T, engine http.Handler, session *service
 func TestProviderSensitiveEditRechecksPermissionAfterLock(t *testing.T) {
 	for _, operation := range []string{"replace", "delete", "name", "disable", "provider", "batch", "tag"} {
 		for _, lockTable := range []string{"providers", "abilities"} {
-			for _, changeKind := range []string{"policy", "pat_revoke", "pat_expire", "pat_scope", "user_disable", "user_demote", "session_revoke", "session_expire"} {
+			for _, changeKind := range []string{"policy", "remote_policy", "pat_revoke", "pat_expire", "pat_scope", "user_disable", "user_demote", "session_revoke", "session_expire"} {
 				if changeKind == "user_demote" {
 					if operation != "name" || lockTable != "providers" {
 						continue
@@ -1082,7 +1082,7 @@ func TestProviderSensitiveEditRechecksPermissionAfterLock(t *testing.T) {
 					credential := pat
 					var control *service.AuthBundle
 					var personal model.UserAccessToken
-					if changeKind != "policy" {
+					if changeKind != "policy" && changeKind != "remote_policy" {
 						require.NoError(t, model.DB.AutoMigrate(&model.AuthFlow{}, &model.TwoFA{}, &model.PasskeyCredential{}, &model.UserOAuthBinding{}))
 						previousPasswordLogin := common.PasswordLoginEnabled
 						common.PasswordLoginEnabled = true
@@ -1148,6 +1148,11 @@ func TestProviderSensitiveEditRechecksPermissionAfterLock(t *testing.T) {
 						require.NoError(t, authz.SetUserPermissions(admin.Id, authz.PermissionsMap{permission.Resource: {permission.Action: false}}))
 						require.NoError(t, authz.ReloadPolicy())
 						require.False(t, authz.Can(admin.Id, admin.Role, permission))
+					case "remote_policy":
+						require.NoError(t, model.DB.Transaction(func(tx *gorm.DB) error {
+							return authz.SetUserPermissionsInTx(tx, admin.Id, authz.PermissionsMap{permission.Resource: {permission.Action: false}})
+						}))
+						require.True(t, authz.Can(admin.Id, admin.Role, permission), "the serving node must still have its old policy snapshot")
 					case "pat_revoke", "pat_scope":
 						var operation service.VerificationOperation
 						method, body := http.MethodDelete, ""
