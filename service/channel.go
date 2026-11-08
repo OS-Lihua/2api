@@ -26,16 +26,16 @@ func shouldCloseActiveWebSocketsAfterDisable(channelId int) bool {
 }
 
 // disable & notify
-func DisableChannel(channelError types.ProviderError, reason string) {
+func DisableChannel(channelError types.ProviderError, reason string, selectedIndex ...int) bool {
 	common.SysLog(common.LogText("channel %q (#%d) failed, disabling it, reason: %s", channelError.ChannelName, channelError.ChannelId, common.LocalLogPreview(reason)))
 
 	// 检查是否启用自动禁用功能
 	if !channelError.AutoBan {
 		common.SysLog(common.LogText("channel %q (#%d) has automatic disabling turned off, skipping", channelError.ChannelName, channelError.ChannelId))
-		return
+		return false
 	}
 
-	success := model.UpdateProviderStatus(channelError.ChannelId, channelError.UsingKey, common.ChannelStatusAutoDisabled, reason)
+	success := model.UpdateProviderStatus(channelError.ChannelId, channelError.UsingKey, common.ChannelStatusAutoDisabled, reason, selectedIndex...)
 	if success {
 		if shouldCloseActiveWebSocketsAfterDisable(channelError.ChannelId) {
 			CloseActiveWebSocketsForChannel(channelError.ChannelId, ChannelDisabledCloseReason)
@@ -45,6 +45,7 @@ func DisableChannel(channelError types.ProviderError, reason string) {
 			return i18n.Translate(lang, i18n.MsgChannelNotifyDisabledSubject, params), i18n.Translate(lang, i18n.MsgChannelNotifyDisabledContent, params)
 		})
 	}
+	return success
 }
 
 func EnableChannel(channelId int, usingKey string, channelName string) {

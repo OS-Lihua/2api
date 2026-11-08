@@ -120,14 +120,12 @@ it('uses resource permissions through the selected import operation', async () =
   const client = new QueryClient({
     defaultOptions: { mutations: { retry: false } },
   })
-  const post = vi
-    .spyOn(api, 'post')
-    .mockResolvedValue({
-      data: {
-        success: true,
-        data: { dry_run: true, valid: true, committed: false, rows: [] },
-      },
-    })
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: {
+      success: true,
+      data: { dry_run: true, valid: true, committed: false, rows: [] },
+    },
+  })
   render(
     <I18nextProvider i18n={i18n}>
       <QueryClientProvider client={client}>
@@ -174,26 +172,24 @@ it('blocks execution after invalid or rejected previews and while an uploaded fi
   const client = new QueryClient({
     defaultOptions: { mutations: { retry: false } },
   })
-  const post = vi
-    .spyOn(api, 'post')
-    .mockResolvedValue({
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: {
+      success: false,
       data: {
-        success: false,
-        data: {
-          dry_run: true,
-          valid: false,
-          committed: false,
-          rows: [
-            {
-              row: 2,
-              resource: 'channels',
-              action: 'enable',
-              error: 'Configure a purchase price before enabling the channel',
-            },
-          ],
-        },
+        dry_run: true,
+        valid: false,
+        committed: false,
+        rows: [
+          {
+            row: 2,
+            resource: 'channels',
+            action: 'enable',
+            error: 'Configure a purchase price before enabling the channel',
+          },
+        ],
       },
-    })
+    },
+  })
   render(
     <I18nextProvider i18n={i18n}>
       <QueryClientProvider client={client}>
@@ -662,6 +658,55 @@ it('refreshes another administrator’s running probe and reconciles a failed su
   expect(
     await screen.findByText('Capability behavior was not observed')
   ).toBeVisible()
+  client.clear()
+})
+
+it('shows runtime circuit health separately from persistent Channel status', async () => {
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        items: [
+          {
+            id: 3,
+            provider_id: 7,
+            model_id: 2,
+            protocol: 'openai_chat',
+            upstream_model_name: 'runtime-model',
+            status: 'enabled',
+            mapping_confirmed: true,
+            health: {
+              circuit: 'open',
+              retry_at: 1794000060000,
+              failures: 5,
+              samples: 10,
+              success_rate: 0.5,
+              first_byte_ms: 120,
+              first_byte_samples: 5,
+            },
+          },
+        ],
+        total: 1,
+      },
+    },
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <ProviderChannels providerId={7} />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  expect(await screen.findByText('Circuit open')).toBeVisible()
+  expect(screen.getByText('Enabled')).toBeVisible()
+  expect(screen.getByText('Recent success rate')).toBeVisible()
+  expect(screen.getByText('50%')).toBeVisible()
+  expect(screen.getByText('120 ms')).toBeVisible()
+  expect(screen.getByText('10')).toBeVisible()
+  expect(screen.getByText(/Probe after:/)).toBeVisible()
   client.clear()
 })
 

@@ -658,16 +658,24 @@ func CleanupProviderPollingLocks() {
 	})
 }
 
-func handlerMultiKeyUpdate(channel *Provider, usingKey string, status int, reason string) {
+func handlerMultiKeyUpdate(channel *Provider, usingKey string, status int, reason string, selectedIndex ...int) {
 	keys := channel.GetKeys()
 	if len(keys) == 0 {
 		channel.Status = status
 	} else {
 		keyIndex := -1
-		for i, key := range keys {
-			if key == usingKey {
-				keyIndex = i
-				break
+		if len(selectedIndex) > 0 && usingKey != "" {
+			index := selectedIndex[0]
+			if index < 0 || index >= len(keys) || keys[index] != usingKey {
+				return
+			}
+			keyIndex = index
+		} else {
+			for i, key := range keys {
+				if key == usingKey {
+					keyIndex = i
+					break
+				}
 			}
 		}
 		if keyIndex < 0 {
@@ -723,7 +731,7 @@ func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
 	return false
 }
 
-func UpdateProviderStatus(channelId int, usingKey string, status int, reason string) bool {
+func UpdateProviderStatus(channelId int, usingKey string, status int, reason string, selectedIndex ...int) bool {
 	if common.MemoryCacheEnabled {
 		channelStatusLock.Lock()
 		defer channelStatusLock.Unlock()
@@ -744,7 +752,7 @@ func UpdateProviderStatus(channelId int, usingKey string, status int, reason str
 		if channelCache.ProviderInfo.IsMultiKey {
 			beforeStatus := channelCache.Status
 			// 如果是多Key模式，更新缓存中的状态
-			handlerMultiKeyUpdate(channelCache, usingKey, status, reason)
+			handlerMultiKeyUpdate(channelCache, usingKey, status, reason, selectedIndex...)
 			if beforeStatus != channelCache.Status {
 				CacheUpdateProviderStatus(channelId, channelCache.Status)
 			}
@@ -783,7 +791,7 @@ func UpdateProviderStatus(channelId int, usingKey string, status int, reason str
 
 		if channel.ProviderInfo.IsMultiKey {
 			beforeStatus := channel.Status
-			handlerMultiKeyUpdate(channel, usingKey, status, reason)
+			handlerMultiKeyUpdate(channel, usingKey, status, reason, selectedIndex...)
 			if beforeStatus != channel.Status {
 				shouldUpdateAbilities = true
 			}

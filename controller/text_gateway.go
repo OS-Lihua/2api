@@ -185,7 +185,12 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
 		return
 	}
+	stopProbe := service.ChannelHealth.KeepAlive(c.Request.Context(), selection.Admission)
+	defer stopProbe()
 	defer func() {
+		if result.Attempt == nil {
+			_ = service.ChannelHealth.Release(context.WithoutCancel(c.Request.Context()), selection.Admission)
+		}
 		if result.Attempt == nil && (run.code == "unsupported_parameter" || run.code == "channel_unavailable" || run.code == "price_unavailable" || run.code == "upstream_error") {
 			result.SkippedChannel = selection.Channel.ID
 		}
@@ -215,7 +220,14 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	if info.StreamStatus == nil {
 		info.StreamStatus = relaycommon.NewStreamStatus()
 	}
-	info.ResponseFacts = &relaycommon.ResponseFacts{OnBusinessOutput: budget.Delivered, CanFinishStream: func() bool { return info.StreamStatus.CompletedNormally() }}
+	var sentAt time.Time
+	var firstByte time.Duration
+	info.ResponseFacts = &relaycommon.ResponseFacts{OnBusinessOutput: func() {
+		if firstByte == 0 && !sentAt.IsZero() {
+			firstByte = max(clock.Now().Sub(sentAt), time.Nanosecond)
+		}
+		budget.Delivered()
+	}, CanFinishStream: func() bool { return info.StreamStatus.CompletedNormally() }}
 	info.BeginProviderCall = budget.Start
 	common.SetContextKey(c, constant.ContextKeyResponseFacts, info.ResponseFacts)
 	info.InitChannelMeta(c)
@@ -362,7 +374,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	parent := c.Request
 	defer func() { c.Request = parent }()
 	var upstreamStatus int
-	var upstreamCode, upstreamType string
+	var upstreamCode, upstreamType, retryAfter string
 	var transportFailed bool
 	var attempt *model.GatewayAttempt
 	var usage *dto.Usage
@@ -409,7 +421,28 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				failure = service.GatewayFailure{Class: "stream_interrupted", Switch: true}
 				attempt.ErrorClass = failure.Class
 			}
-			result = service.GatewayAttemptResult{Attempt: attempt, Failure: failure, Delivered: info.ResponseFacts.BusinessOutput}
+			if common.AutomaticDisableChannelEnabled && selection.Provider.GetAutoBan() && (failure.Class == "credentials" || failure.Class == "account_quota") {
+				key := info.ApiKey
+				index := info.ChannelMultiKeyIndex
+				if failure.Class == "account_quota" {
+					key = ""
+					index = -1
+				}
+				changed := service.DisableChannel(types.ProviderError{ChannelId: selection.Channel.ProviderID, ChannelName: selection.Provider.Name,
+					IsMultiKey: info.ChannelIsMultiKey, UsingKey: key, AutoBan: true}, "Provider rejected authentication or account quota", index)
+				model.RecordAuditLog(c, model.AuditLog{UserId: c.GetInt("id"), ActorRole: c.GetInt("role"), Category: model.AuditCategorySecurity,
+					Action: "provider.auto_disable", Success: changed, Content: "Provider rejected authentication or account quota",
+					Other: model.AuditOther{Op: &model.AuditOperation{Action: "provider.auto_disable"}, RootInfo: model.AuditFields{
+						"provider_id": selection.Channel.ProviderID, "channel_id": selection.Channel.ID, "key_index": index, "error_class": failure.Class}}})
+			}
+			result = service.GatewayAttemptResult{Attempt: attempt, Failure: failure, Delivered: info.ResponseFacts.BusinessOutput,
+				FirstByte: firstByte, HealthLease: selection.Admission.Lease}
+			if failure.Class == "rate_limited" {
+				result.RetryAfter = retryAfter
+				if result.RetryAfter == "" {
+					result.RetryAfter = "0"
+				}
+			}
 
 			record.Status = attempt.Status
 			if !info.ResponseFacts.BusinessOutput && info.ResponseFacts.GeneratedText == "" && !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && !info.ResponseFacts.CompletionTokensReported {
@@ -530,6 +563,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	}
 	c.Request = parent.WithContext(attemptContext)
 	defer budget.Delivered()
+	sentAt = clock.Now()
 	response, err := adaptor.DoPreparedRequest(c, info, prepared)
 	if err != nil {
 		transportFailed = true
@@ -555,6 +589,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		return
 	}
 	upstreamStatus = httpResponse.StatusCode
+	retryAfter = httpResponse.Header.Get("Retry-After")
 	if httpResponse.StatusCode != http.StatusOK {
 		// Parse only bounded structured codes; provider text and URLs never leave memory.
 		raw, readErr := io.ReadAll(io.LimitReader(httpResponse.Body, 1<<20))
