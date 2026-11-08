@@ -165,6 +165,11 @@ func BulkImport(c *gin.Context) {
 		middleware.SetBulkImportAudit(c, result)
 	}
 	if err != nil {
+		var marginError *model.MarginConfirmationError
+		if errors.As(err, &marginError) {
+			pricingError(c, err)
+			return
+		}
 		common.ApiErrorStatus(c, 409, common.NewMessage("Bulk import could not be committed"))
 		return
 	}

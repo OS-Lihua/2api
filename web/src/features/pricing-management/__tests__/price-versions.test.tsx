@@ -126,6 +126,74 @@ function mockPrices(forbiddenPath?: string) {
   })
 }
 
+it('requires an explicit loss confirmation and resubmits the exact rejected draft and server revision', async () => {
+  mockPrices()
+  const report = {
+    revision: 'frozen-margin',
+    effective_at: 1800000000,
+    requires_confirmation: true,
+    estimates: [
+      {
+        model_offering_id: 9,
+        channel_id: 12,
+        provider_id: 3,
+        samples: 7,
+        status: 'estimated',
+        negative: true,
+        revenue: { nanos: '1000000000', currency: 'USD' },
+        cost: { nanos: '2000000000', currency: 'USD' },
+        margin: { nanos: '-1000000000', currency: 'USD' },
+      },
+    ],
+  }
+  const post = vi
+    .spyOn(api, 'post')
+    .mockRejectedValueOnce(
+      Object.assign(new AxiosError('Conflict'), {
+        response: {
+          status: 409,
+          data: {
+            success: false,
+            message_key: 'Negative margin requires confirmation',
+            data: report,
+          },
+        },
+      })
+    )
+    .mockResolvedValue({ data: { success: true, data: version } })
+  renderPage(true)
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: 'New price version' }))
+  const dialog = await screen.findByRole('dialog', {
+    name: 'New price version',
+  })
+  await user.type(
+    within(dialog).getByRole('combobox', { name: 'Price owner ID' }),
+    '9'
+  )
+  await user.tab()
+  await user.click(
+    within(dialog).getByRole('button', { name: 'Create price version' })
+  )
+  const approval = await screen.findByRole('alertdialog', {
+    name: 'Negative margin requires confirmation',
+  })
+  expect(post).toHaveBeenCalledTimes(1)
+  await user.click(
+    within(approval).getByRole('button', { name: 'Confirm loss' })
+  )
+  await waitFor(() =>
+    expect(post).toHaveBeenLastCalledWith(
+      '/api/admin/v1/price-versions',
+      expect.objectContaining({
+        owner_id: 9,
+        effective_at: 1800000000,
+        margin_confirmation: 'frozen-margin',
+      })
+    )
+  )
+})
+
 it('creates the explicitly displayed zero price without requiring an unrelated input edit', async () => {
   mockPrices()
   const post = vi

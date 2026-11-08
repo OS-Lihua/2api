@@ -32,7 +32,13 @@ import { hasPermission } from '@/lib/admin-permissions'
 import { getServerErrorMessage } from '@/lib/server-error-message'
 import { useAuthStore } from '@/stores/auth-store'
 
-import { getCurrentPrice, listPriceVersions, pricingKeys } from './api'
+import {
+  getCurrentPrice,
+  listMarginEstimates,
+  listPriceVersions,
+  pricingKeys,
+} from './api'
+import { MarginEstimates } from './components/margin-estimates'
 import { PriceDialog } from './components/price-dialog'
 import type { OwnerType, PriceListParams, PriceVersion } from './types'
 
@@ -41,6 +47,12 @@ export function PriceVersions() {
   const user = useAuthStore((state) => state.auth.user)
   const canWrite = hasPermission(user, 'pricing', 'write')
   const [creating, setCreating] = useState(false)
+  const [showMargins, setShowMargins] = useState(false)
+  const margins = useQuery({
+    queryKey: ['price-versions', 'margins'],
+    queryFn: listMarginEstimates,
+    enabled: showMargins,
+  })
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const [pagination, setPagination] = useState({ pageIndex: 0, pageSize: 20 })
   const [ownerType, setOwnerType] = useState<OwnerType | ''>('')
@@ -137,6 +149,14 @@ export function PriceVersions() {
     <SectionPageLayout fixedContent>
       <SectionPageLayout.Title>{t('Price versions')}</SectionPageLayout.Title>
       <SectionPageLayout.Actions>
+        <Button
+          variant='outline'
+          size='sm'
+          onClick={() => setShowMargins((value) => !value)}
+          aria-expanded={showMargins}
+        >
+          {t('Estimated channel margins')}
+        </Button>
         {canWrite && (
           <Button size='sm' onClick={() => setCreating(true)}>
             {t('New price version')}
@@ -144,6 +164,28 @@ export function PriceVersions() {
         )}
       </SectionPageLayout.Actions>
       <SectionPageLayout.Content>
+        {showMargins && (
+          <section
+            className='mb-4 space-y-3'
+            aria-label={t('Estimated channel margins')}
+          >
+            <p className='text-muted-foreground text-sm'>
+              {t(
+                'Estimates use the last seven days of measured usage and buffered purchase exchange rates.'
+              )}
+            </p>
+            {margins.isPending && <p>{t('Loading...')}</p>}
+            {margins.isError && (
+              <ErrorState
+                description={getServerErrorMessage(margins.error)}
+                onRetry={() => void margins.refetch()}
+              />
+            )}
+            {margins.data && (
+              <MarginEstimates estimates={margins.data.estimates} />
+            )}
+          </section>
+        )}
         {creating && <PriceDialog onClose={() => setCreating(false)} />}
         <p className='text-muted-foreground mb-4 text-sm'>
           {t(

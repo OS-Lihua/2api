@@ -15,17 +15,19 @@ import (
 // FXRate stores a directional quote: one unit of FromCurrency buys Rate units
 // of ToCurrency. A quote never implies an inverse or a path through other pairs.
 type FXRate struct {
-	FromCurrency money.Currency  `json:"from_currency" gorm:"type:char(3);primaryKey;check:fx_from_valid,from_currency ~ '^[A-Z]{3}$'"`
-	ToCurrency   money.Currency  `json:"to_currency" gorm:"type:char(3);primaryKey;check:fx_to_valid,to_currency ~ '^[A-Z]{3}$' AND to_currency <> from_currency"`
-	Rate         decimal.Decimal `json:"rate" gorm:"type:numeric(30,18);not null;check:fx_rate_positive,rate > 0 AND rate <= 1000000000"`
-	BufferRate   decimal.Decimal `json:"buffer_rate" gorm:"type:numeric(30,18);not null;check:fx_buffer_valid,buffer_rate >= 0 AND buffer_rate <= 1"`
-	UpdatedBy    int             `json:"updated_by" gorm:"not null"`
-	UpdatedAt    int64           `json:"updated_at" gorm:"not null;autoUpdateTime:false"`
+	MarginConfirmation string             `json:"-" gorm:"-"`
+	MarginCheck        *PriceMarginReport `json:"margin_check,omitempty" gorm:"-"`
+	FromCurrency       money.Currency     `json:"from_currency" gorm:"type:char(3);primaryKey;check:fx_from_valid,from_currency ~ '^[A-Z]{3}$'"`
+	ToCurrency         money.Currency     `json:"to_currency" gorm:"type:char(3);primaryKey;check:fx_to_valid,to_currency ~ '^[A-Z]{3}$' AND to_currency <> from_currency"`
+	Rate               decimal.Decimal    `json:"rate" gorm:"type:numeric(30,18);not null;check:fx_rate_positive,rate > 0 AND rate <= 1000000000"`
+	BufferRate         decimal.Decimal    `json:"buffer_rate" gorm:"type:numeric(30,18);not null;check:fx_buffer_valid,buffer_rate >= 0 AND buffer_rate <= 1"`
+	UpdatedBy          int                `json:"updated_by" gorm:"not null"`
+	UpdatedAt          int64              `json:"updated_at" gorm:"not null;autoUpdateTime:false"`
 }
 
 var fxDecimal = regexp.MustCompile(`^(0|[1-9][0-9]{0,9})(\.[0-9]{1,18})?$`)
 
-func SaveFXRate(ctx context.Context, from, to money.Currency, rateText, bufferText string, actorID int) (*FXRate, error) {
+func SaveFXRate(ctx context.Context, from, to money.Currency, rateText, bufferText string, actorID int, confirmation ...string) (*FXRate, error) {
 	if bufferText == "" {
 		bufferText = "0.02"
 	}
@@ -44,10 +46,23 @@ func SaveFXRate(ctx context.Context, from, to money.Currency, rateText, bufferTe
 		return nil, common.NewMessage("Invalid exchange rate or buffer")
 	}
 	record := &FXRate{FromCurrency: from, ToCurrency: to, Rate: rate, BufferRate: buffer, UpdatedBy: actorID, UpdatedAt: clock.Now().Unix()}
-	err = DB.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "from_currency"}, {Name: "to_currency"}},
-		DoUpdates: clause.AssignmentColumns([]string{"rate", "buffer_rate", "updated_by", "updated_at"}),
-	}).Create(record).Error
+	err = DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`SELECT pg_advisory_xact_lock(510033)`).Error; err != nil {
+			return err
+		}
+		report, err := CheckPriceMargins(ctx, tx, nil, record, true)
+		if err != nil {
+			return err
+		}
+		if report.RequiresConfirmation && (len(confirmation) != 1 || confirmation[0] != report.Revision) {
+			return &MarginConfirmationError{Report: report}
+		}
+		record.MarginCheck = report
+		return tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "from_currency"}, {Name: "to_currency"}},
+			DoUpdates: clause.AssignmentColumns([]string{"rate", "buffer_rate", "updated_by", "updated_at"}),
+		}).Create(record).Error
+	})
 	return record, err
 }
 

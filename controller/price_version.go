@@ -16,10 +16,17 @@ import (
 )
 
 func pricingError(c *gin.Context, err error) {
+	var marginError *model.MarginConfirmationError
+	if errors.As(err, &marginError) {
+		c.JSON(http.StatusConflict, gin.H{"success": false, "message": "Negative margin requires confirmation", "message_key": "Negative margin requires confirmation", "data": marginError.Report})
+		return
+	}
 	status, message := http.StatusInternalServerError, common.NewMessage("Failed to access pricing")
 	var validation *common.Message
 	var databaseError *pgconn.PgError
 	switch {
+	case errors.Is(err, money.ErrOverflow):
+		status, message = http.StatusBadRequest, common.NewMessage("The amount is outside the supported range")
 	case errors.As(err, &validation):
 		status, message = http.StatusBadRequest, validation
 	case errors.Is(err, gorm.ErrRecordNotFound):
@@ -105,18 +112,20 @@ func GetCurrentPriceVersion(c *gin.Context) {
 
 func CreatePriceVersion(c *gin.Context) {
 	var request struct {
-		OwnerType   string         `json:"owner_type"`
-		OwnerID     int            `json:"owner_id"`
-		Currency    money.Currency `json:"currency"`
-		Expression  string         `json:"expression"`
-		EffectiveAt *int64         `json:"effective_at"`
+		MarginConfirmation string         `json:"margin_confirmation"`
+		OwnerType          string         `json:"owner_type"`
+		OwnerID            int            `json:"owner_id"`
+		Currency           money.Currency `json:"currency"`
+		Expression         string         `json:"expression"`
+		EffectiveAt        *int64         `json:"effective_at"`
 	}
 	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
 		pricingError(c, common.NewMessage("Invalid parameters"))
 		return
 	}
 	record := model.PriceVersion{
-		OwnerType: request.OwnerType, OwnerID: request.OwnerID,
+		MarginConfirmation: request.MarginConfirmation,
+		OwnerType:          request.OwnerType, OwnerID: request.OwnerID,
 		Currency: request.Currency, Expression: request.Expression,
 		EffectiveAt: clock.Now().Unix(),
 	}
@@ -129,7 +138,9 @@ func CreatePriceVersion(c *gin.Context) {
 		pricingError(c, err)
 		return
 	}
-	common.ApiSuccess(c, record)
+	report := record.MarginCheck
+	record.MarginCheck = nil
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": record, "margin_check": report})
 }
 
 func ListFXRates(c *gin.Context) {
@@ -150,10 +161,11 @@ func ListFXRates(c *gin.Context) {
 
 func SaveFXRate(c *gin.Context) {
 	var request struct {
-		FromCurrency money.Currency `json:"from_currency"`
-		ToCurrency   money.Currency `json:"to_currency"`
-		Rate         string         `json:"rate"`
-		BufferRate   *string        `json:"buffer_rate"`
+		MarginConfirmation string         `json:"margin_confirmation"`
+		FromCurrency       money.Currency `json:"from_currency"`
+		ToCurrency         money.Currency `json:"to_currency"`
+		Rate               string         `json:"rate"`
+		BufferRate         *string        `json:"buffer_rate"`
 	}
 	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
 		pricingError(c, common.NewMessage("Invalid parameters"))
@@ -167,12 +179,14 @@ func SaveFXRate(c *gin.Context) {
 			return
 		}
 	}
-	record, err := model.SaveFXRate(c.Request.Context(), request.FromCurrency, request.ToCurrency, request.Rate, buffer, c.GetInt("id"))
+	record, err := model.SaveFXRate(c.Request.Context(), request.FromCurrency, request.ToCurrency, request.Rate, buffer, c.GetInt("id"), request.MarginConfirmation)
 	if err != nil {
 		pricingError(c, err)
 		return
 	}
-	common.ApiSuccess(c, record)
+	report := record.MarginCheck
+	record.MarginCheck = nil
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": record, "margin_check": report})
 }
 
 func GetFXQuote(c *gin.Context) {

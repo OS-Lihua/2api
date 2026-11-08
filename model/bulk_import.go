@@ -99,12 +99,13 @@ type BulkChannelActionInput struct {
 }
 
 type BulkPriceInput struct {
-	OwnerType   string         `json:"owner_type"`
-	OwnerID     int            `json:"owner_id"`
-	OwnerRef    string         `json:"owner_ref"`
-	Currency    money.Currency `json:"currency"`
-	Expression  string         `json:"expression"`
-	EffectiveAt *int64         `json:"effective_at"`
+	MarginConfirmation string         `json:"margin_confirmation"`
+	OwnerType          string         `json:"owner_type"`
+	OwnerID            int            `json:"owner_id"`
+	OwnerRef           string         `json:"owner_ref"`
+	Currency           money.Currency `json:"currency"`
+	Expression         string         `json:"expression"`
+	EffectiveAt        *int64         `json:"effective_at"`
 }
 
 type bulkReference struct {
@@ -183,6 +184,9 @@ func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID
 	}
 	result := &BulkImportResult{DryRun: dryRun, Valid: true, Rows: make([]BulkImportPreview, len(rows))}
 	err := DB.WithContext(ctx).Session(&gorm.Session{Logger: logger.Default.LogMode(logger.Silent)}).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`SELECT pg_advisory_xact_lock(510033)`).Error; err != nil {
+			return err
+		}
 		if dryRun {
 			if err := tx.Exec("SET TRANSACTION READ ONLY").Error; err != nil {
 				return err
@@ -356,7 +360,7 @@ func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID
 				if input.EffectiveAt != nil {
 					at = *input.EffectiveAt
 				}
-				record := &PriceVersion{OwnerType: input.OwnerType, OwnerID: input.OwnerID, Currency: input.Currency, Expression: input.Expression, EffectiveAt: at}
+				record := &PriceVersion{MarginConfirmation: input.MarginConfirmation, OwnerType: input.OwnerType, OwnerID: input.OwnerID, Currency: input.Currency, Expression: input.Expression, EffectiveAt: at}
 				channel := channels[input.OwnerID]
 				// Offering IDs and Channel IDs occupy independent namespaces.
 				if input.OwnerType != PriceOwnerChannel {
@@ -431,7 +435,26 @@ func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID
 			}
 			result.Rows[i] = preview
 		}
-		if !result.Valid || dryRun {
+		if !result.Valid {
+			return nil
+		}
+		catalog := MarginPriceCatalog{Prices: prices.versions}
+		for _, channel := range channels {
+			catalog.Channels = append(catalog.Channels, channel)
+		}
+		for _, mutation := range mutations {
+			if mutation.price == nil {
+				continue
+			}
+			report, err := CheckPriceMargins(ctx, tx, mutation.price, nil, !dryRun, catalog)
+			if err != nil {
+				return err
+			}
+			if report.RequiresConfirmation && mutation.price.MarginConfirmation != report.Revision {
+				return &MarginConfirmationError{Report: report}
+			}
+		}
+		if dryRun {
 			return nil
 		}
 		ids := map[int]int{}

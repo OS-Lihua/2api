@@ -38,15 +38,20 @@ import {
 import { Input } from '@/components/ui/input'
 import { getServerErrorMessage } from '@/lib/server-error-message'
 
-import { pricingKeys, saveFxRate } from '../api'
+import { MarginConfirmationRequired, pricingKeys, saveFxRate } from '../api'
 import { fxFormSchema, type FxFormValues } from '../lib/forms'
-import type { FxRate } from '../types'
+import type { FxRate, FxRateInput, MarginCheck } from '../types'
 import { CurrencyInput } from './currency-input'
+import { MarginConfirmation } from './margin-estimates'
 
 export function FxDialog(props: { initial?: FxRate; onClose: () => void }) {
   const { t } = useTranslation()
   const client = useQueryClient()
   const [discard, setDiscard] = useState(false)
+  const [approval, setApproval] = useState<{
+    draft: FxRateInput
+    report: MarginCheck
+  } | null>(null)
   const form = useForm<FxFormValues>({
     resolver: zodResolver(fxFormSchema(t)),
     defaultValues: {
@@ -61,11 +66,17 @@ export function FxDialog(props: { initial?: FxRate; onClose: () => void }) {
     mutationFn: saveFxRate,
     onSuccess: async () => {
       await client.invalidateQueries({ queryKey: pricingKeys.fx })
+      await client.invalidateQueries({ queryKey: pricingKeys.prices })
       toast.success(t('Exchange rate saved'))
       props.onClose()
     },
-    onError: (error) =>
-      form.setError('root', { message: getServerErrorMessage(error) }),
+    onError: (error, draft) => {
+      if (error instanceof MarginConfirmationRequired) {
+        setApproval({ draft, report: error.report })
+        return
+      }
+      form.setError('root', { message: getServerErrorMessage(error) })
+    },
   })
   const requestClose = () => {
     if (mutation.isPending) return
@@ -190,6 +201,19 @@ export function FxDialog(props: { initial?: FxRate; onClose: () => void }) {
           </form>
         </Form>
       </Dialog>
+      {approval && (
+        <MarginConfirmation
+          report={approval.report}
+          isPending={mutation.isPending}
+          onCancel={() => setApproval(null)}
+          onConfirm={() =>
+            mutation.mutate({
+              ...approval.draft,
+              margin_confirmation: approval.report.revision,
+            })
+          }
+        />
+      )}
       <ConfirmDialog
         open={discard}
         onOpenChange={setDiscard}
