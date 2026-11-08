@@ -17,6 +17,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	kitreasoning "github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/net/http/httpguts"
@@ -134,6 +135,23 @@ func (a *ChannelAdaptor) SetChatOutputLimit(converted any, body []byte, limit ui
 		field = "max_completion_tokens"
 	case dto.ClaudeRequest, *dto.ClaudeRequest:
 		field = "max_tokens"
+		var request dto.ClaudeRequest
+		if err := common.Unmarshal(body, &request); err != nil {
+			return nil, err
+		}
+		if request.Thinking != nil && request.Thinking.Type == "enabled" {
+			intent, _, err := kitreasoning.FromClaude(&request)
+			if err != nil {
+				return nil, err
+			}
+			rendered, err := kitreasoning.RenderClaude(request.Model, intent, &limit, 0)
+			if err != nil {
+				return nil, err
+			}
+			if rendered.MaxTokens != nil || rendered.Thinking == nil || rendered.Thinking.GetBudgetTokens() != request.Thinking.GetBudgetTokens() {
+				return nil, errors.New("output limit cannot preserve the Claude thinking budget")
+			}
+		}
 	case dto.OpenAIResponsesRequest, *dto.OpenAIResponsesRequest:
 		field = "max_output_tokens"
 	case dto.GeminiChatRequest, *dto.GeminiChatRequest:

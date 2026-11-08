@@ -1242,9 +1242,20 @@ func TestTextGatewayRouteEstimatesRecentOutputInsteadOfOutputBudget(t *testing.T
 
 func TestTextGatewayRouteFiltersConversionLossBeforeSending(t *testing.T) {
 	var calls atomic.Int32
+	var outbound atomic.Value
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
+		body, err := io.ReadAll(r.Body)
+		assert.NoError(t, err)
+		outbound.Store(body)
+		var wire dto.ClaudeRequest
+		assert.NoError(t, common.Unmarshal(body, &wire))
 		w.Header().Set("Content-Type", "application/json")
+		if wire.Thinking != nil && wire.Thinking.Type == "enabled" && wire.MaxTokens != nil && uint(wire.Thinking.GetBudgetTokens()) >= *wire.MaxTokens {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"type":"error","error":{"type":"invalid_request_error","message":"Thinking budget must fit the output limit"}}`)
+			return
+		}
 		_, _ = io.WriteString(w, `{"id":"converted","type":"message","role":"assistant","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
 	})
 	var unified model.Model
@@ -1266,6 +1277,45 @@ func TestTextGatewayRouteFiltersConversionLossBeforeSending(t *testing.T) {
 	require.EqualValues(t, 1, total)
 	assert.Equal(t, []string{"claude_budget_adjusted"}, attempts[0].ConversionLosses)
 
+	for _, tc := range []struct {
+		name   string
+		limit  int64
+		status int
+	}{
+		{"default cap cannot fit manual thinking", 512, http.StatusBadRequest},
+		{"default cap preserves valid manual thinking", 2048, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			unified.Capabilities.Limits.MaxOutputTokens = common.GetPointer(tc.limit)
+			require.NoError(t, model.DB.Model(&unified).Update("capabilities", unified.Capabilities).Error)
+			beforeCalls := calls.Load()
+			var beforeAttempts int64
+			require.NoError(t, model.DB.Model(&model.GatewayAttempt{}).Count(&beforeAttempts).Error)
+			before, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"reasoning":{"max_tokens":1024}}`)
+			require.Equal(t, tc.status, response.Code, response.Body.String())
+			var afterAttempts int64
+			require.NoError(t, model.DB.Model(&model.GatewayAttempt{}).Count(&afterAttempts).Error)
+			if tc.status == http.StatusBadRequest {
+				assert.Equal(t, beforeCalls, calls.Load(), "an impossible thinking/output pair must fail before Provider I/O")
+				assert.Equal(t, beforeAttempts, afterAttempts)
+				after, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, before.Balance.Nanos, after.Balance.Nanos)
+				return
+			}
+			assert.Equal(t, beforeCalls+1, calls.Load())
+			assert.Equal(t, beforeAttempts+1, afterAttempts)
+			var wire dto.ClaudeRequest
+			require.NoError(t, common.Unmarshal(outbound.Load().([]byte), &wire))
+			require.NotNil(t, wire.MaxTokens)
+			assert.EqualValues(t, tc.limit, *wire.MaxTokens)
+			require.NotNil(t, wire.Thinking)
+			assert.Equal(t, 1024, wire.Thinking.GetBudgetTokens())
+		})
+	}
+
 	t.Run("allowed code cannot override a hard media error", func(t *testing.T) {
 		unified.Capabilities.InputModalities = append(unified.Capabilities.InputModalities, capability.Audio)
 		require.NoError(t, model.DB.Model(&unified).Update("capabilities", unified.Capabilities).Error)
@@ -1275,10 +1325,11 @@ func TestTextGatewayRouteFiltersConversionLossBeforeSending(t *testing.T) {
 		audio, err := os.ReadFile("../controller/probe-fixtures/seven.wav")
 		require.NoError(t, err)
 		audioBody := fmt.Sprintf(`{"model":"gateway-alias","messages":[{"role":"user","content":[{"type":"text","text":"Hello"},{"type":"input_audio","input_audio":{"data":%q,"format":"wav"}}]}],"max_tokens":16}`, base64.StdEncoding.EncodeToString(audio))
+		beforeCalls := calls.Load()
 		response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", audioBody)
 		assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
 		assert.Contains(t, response.Body.String(), "unsupported_parameter")
-		assert.EqualValues(t, 1, calls.Load(), "hard conversion failure must not contact the Provider")
+		assert.Equal(t, beforeCalls, calls.Load(), "hard conversion failure must not contact the Provider")
 		_, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
 		require.NoError(t, err)
 		assert.Zero(t, total)
@@ -4654,6 +4705,86 @@ func TestTextGatewayHistoricalOutputNormalizesChoicesBeforeReservation(t *testin
 	require.NoError(t, common.Unmarshal(requests.Body.Bytes(), &payload))
 	require.Len(t, payload.Data.Items, 2)
 	assert.EqualValues(t, 4, payload.Data.Items[0]["choice_count"])
+}
+
+func TestTextGatewayDefaultOutputLimitPreservesExplicitZero(t *testing.T) {
+	for _, tc := range []struct {
+		name, clientField, wirePath string
+		upstream                    protocol.Type
+		preservesZero               bool
+	}{
+		{"Chat max tokens", "max_tokens", "max_tokens", protocol.OpenAIChat, true},
+		{"Chat completion tokens", "max_completion_tokens", "max_completion_tokens", protocol.OpenAIChat, true},
+		{"Gemini max tokens", "max_tokens", "generationConfig.maxOutputTokens", protocol.GeminiGenerate, true},
+		{"Gemini completion tokens", "max_completion_tokens", "generationConfig.maxOutputTokens", protocol.GeminiGenerate, true},
+		{"Responses max tokens", "max_tokens", "max_output_tokens", protocol.OpenAIResponses, true},
+		{"Responses completion tokens", "max_completion_tokens", "max_output_tokens", protocol.OpenAIResponses, true},
+		{"Claude max tokens cannot preserve zero", "max_tokens", "max_tokens", protocol.AnthropicMessages, false},
+		{"Claude completion tokens cannot preserve zero", "max_completion_tokens", "max_tokens", protocol.AnthropicMessages, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int64
+			observed := make(chan any, 1)
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				var wire map[string]any
+				assert.NoError(t, common.DecodeJson(r.Body, &wire))
+				var limit any = wire
+				for part := range strings.SplitSeq(tc.wirePath, ".") {
+					object, ok := limit.(map[string]any)
+					if !ok {
+						limit = nil
+						break
+					}
+					limit = object[part]
+				}
+				observed <- limit
+				w.Header().Set("Content-Type", "application/json")
+				if limit == float64(0) {
+					w.WriteHeader(http.StatusBadRequest)
+					errorBody := `{"error":{"message":"Output limit must be positive","type":"invalid_request_error","code":"invalid_parameter"}}`
+					if tc.upstream == protocol.GeminiGenerate {
+						errorBody = `{"error":{"code":400,"message":"Output limit must be positive","status":"INVALID_ARGUMENT"}}`
+					}
+					_, _ = io.WriteString(w, errorBody)
+					return
+				}
+				response := `{"id":"zero-replaced","choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":1,"total_tokens":10}}`
+				switch tc.upstream {
+				case protocol.AnthropicMessages:
+					response = `{"id":"zero-replaced","type":"message","role":"assistant","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":9,"output_tokens":1}}`
+				case protocol.OpenAIResponses:
+					response = `{"id":"zero-replaced","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"OK"}]}],"usage":{"input_tokens":9,"output_tokens":1,"total_tokens":10}}`
+				case protocol.GeminiGenerate:
+					response = `{"candidates":[{"content":{"role":"model","parts":[{"text":"OK"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":1,"totalTokenCount":10}}`
+				}
+				_, _ = io.WriteString(w, response)
+			})
+			var unified model.Model
+			require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+			unified.Capabilities.Limits.MaxOutputTokens = common.GetPointer(int64(16_384))
+			require.NoError(t, model.DB.Model(&unified).Update("capabilities", unified.Capabilities).Error)
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", tc.upstream).Error)
+			before, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			body := fmt.Sprintf(`{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],%q:0}`, tc.clientField)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+			assert.GreaterOrEqual(t, response.Code, http.StatusBadRequest, response.Body.String())
+			if tc.preservesZero {
+				require.EqualValues(t, 1, calls.Load())
+				assert.EqualValues(t, 0, <-observed, "explicit zero must reach the Provider unchanged, which can reject its protocol range")
+			} else {
+				assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+				assert.Zero(t, calls.Load(), "a conversion that replaces explicit zero must fail before Provider I/O")
+				var attempts int64
+				require.NoError(t, model.DB.Model(&model.GatewayAttempt{}).Count(&attempts).Error)
+				assert.Zero(t, attempts)
+			}
+			after, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, before.Balance.Nanos, after.Balance.Nanos)
+		})
+	}
 }
 
 func TestTextGatewayDefaultOutputLimitFitsRemainingContext(t *testing.T) {

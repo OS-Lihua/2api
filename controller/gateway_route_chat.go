@@ -108,6 +108,17 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 	if _, err = helper.ValidateTextRequest(candidate, effective, relayconstant.RelayModeChatCompletions); err != nil || effective.Model != selection.Channel.UpstreamModelName || effective.IsStream(candidate.Request) != info.IsStream {
 		return nil, service.ErrGatewayCapability
 	}
+	requestedOutputLimit := original.MaxCompletionTokens
+	if requestedOutputLimit == nil {
+		requestedOutputLimit = original.MaxTokens
+	}
+	effectiveOutputLimit := effective.MaxCompletionTokens
+	if effectiveOutputLimit == nil {
+		effectiveOutputLimit = effective.MaxTokens
+	}
+	if requestedOutputLimit != nil && *requestedOutputLimit == 0 && (effectiveOutputLimit == nil || *effectiveOutputLimit != 0) {
+		return nil, service.ErrGatewayConversion
+	}
 	common.SetContextKey(candidate, constant.ContextKeyOriginalModel, info.TokenizerModel)
 	tokens, err := service.CountRequestToken(candidate, effective.GetTokenCountMeta(), info)
 	if err != nil {
@@ -130,8 +141,8 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 		if limit <= 0 {
 			return nil, service.ErrGatewayCapability
 		}
-		convertedDefaultExceedsLimit := original.GetMaxTokens() == 0 && len(info.ParamOverride) == 0 && effective.GetMaxTokens() > uint(limit)
-		if effective.GetMaxTokens() == 0 || convertedDefaultExceedsLimit {
+		convertedDefaultExceedsLimit := requestedOutputLimit == nil && len(info.ParamOverride) == 0 && effective.GetMaxTokens() > uint(limit)
+		if effectiveOutputLimit == nil || convertedDefaultExceedsLimit {
 			request.MaxCompletionTokens = common.GetPointer(uint(limit))
 			encoded, err = adaptor.SetChatOutputLimit(converted, encoded, uint(limit))
 			if err == nil {
