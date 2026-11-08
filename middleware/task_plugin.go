@@ -1842,17 +1842,34 @@ func PrepareTaskVideoRemix() gin.HandlerFunc {
 			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, "Task plugin is unavailable")
 			return
 		}
-		var requestBody map[string]any
-		if err := common.UnmarshalBodyReusable(c, &requestBody); err != nil || requestBody == nil {
+		supportsRemix, err := plugin.Engine.HasCallablePath(c.Request.Context(), "protocols", "openai_video", "decodeRemixRequest")
+		if err != nil || !supportsRemix {
+			abortWithOpenAiMessage(c, http.StatusBadRequest, "Task plugin does not support video remix")
+			return
+		}
+		requestContext, err := buildTaskPluginRouteRequest(c)
+		if err != nil {
 			abortWithOpenAiMessage(c, http.StatusBadRequest, "Invalid task request")
 			return
 		}
-		requestBody["model"] = task.Properties.OriginModelName
+		protocolContext := pluginruntime.ProtocolRequestContext{RouteRequestContext: requestContext, Protocol: "openai_video", Operation: "remix", Model: task.Properties.OriginModelName, UpstreamModel: task.Properties.UpstreamModelName}
+		value, bodyText, err := plugin.Engine.CallPathWithMemberJSON(c.Request.Context(), 0, plugin.Meta.JSONTextMember("requestBody"), "protocols", []string{"openai_video", "decodeRemixRequest"}, protocolContext.JSValueFor(plugin.Meta))
+		resolved, ok := value.(map[string]any)
+		ids, validIDs := resolvedTaskPluginIDs(resolved["originTaskIds"])
+		if err != nil || !ok || resolved["kind"] != "submit" || resolved["model"] != task.Properties.OriginModelName || resolved["action"] != "remix" || !validIDs || len(ids) != 1 || ids[0] != task.TaskID {
+			abortWithOpenAiMessage(c, http.StatusBadRequest, "Invalid video remix request")
+			return
+		}
+		requestContext.RequestBody = resolved["requestBody"]
+		c.Set(pluginruntime.ContextKeyRouteRequest, requestContext)
+		if bodyText != nil {
+			c.Set(pluginruntime.ContextKeyRequestBodyText, bodyText)
+		}
 		c.Set(textOfferingContextKey, offering)
 		c.Set(TextGatewayStartedAtKey, clock.Now())
 		c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Generation: generation, Plugin: plugin})
 		common.SetContextKey(c, constant.ContextKeyOriginTasks, []*model.Task{task})
-		c.Set("task_request", requestBody)
+		c.Set("task_request", requestContext.RequestBody)
 		c.Set("resolved_task_model", task.Properties.OriginModelName)
 		c.Set("expected_task_plugin_key", plugin.Meta.Key)
 		c.Set("task_action", "remix")

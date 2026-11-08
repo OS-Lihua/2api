@@ -241,8 +241,13 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 				return
 			}
 		}
+		requestedAction := info.Action
 		if taskErr := adaptor.ValidateRequestAndSetAction(c, info); taskErr != nil {
 			lastStatus, lastCode = 400, "invalid_request"
+			return
+		}
+		if len(origins) > 0 && requestedAction == constant.TaskActionRemix && info.Action != requestedAction {
+			lastStatus, lastCode = 400, "unsupported_task_action"
 			return
 		}
 		body, err := adaptor.BuildRequestBody(c, info)

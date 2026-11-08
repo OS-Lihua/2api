@@ -426,7 +426,7 @@ func RecoverableGatewayTasks(ctx context.Context, limit int) ([]Task, error) {
 	err := DB.WithContext(ctx).Model(&Task{}).
 		Joins(`JOIN "gateway_billings" ON "gateway_billings"."request_id" = "tasks"."private_data"->'gateway'->'settlement'->'request'->>'id'`).
 		Where(`"gateway_billings"."phase" <> ?`, "settled").
-		Order(`"tasks"."id"`).Limit(limit).Find(&tasks).Error
+		Order(`"gateway_billings"."updated_at", "gateway_billings"."request_id"`).Limit(limit).Find(&tasks).Error
 	return tasks, err
 }
 

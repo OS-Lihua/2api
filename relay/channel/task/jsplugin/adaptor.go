@@ -265,7 +265,7 @@ func (a *TaskAdaptor) ExtractUsageFactsValidated(c *gin.Context, info *relaycomm
 	if !a.hasHook(c.Request.Context(), "extractUsage") {
 		return nil, nil
 	}
-	usageContext := a.submitContext(c, info)
+	usageContext := a.taskRequestContext(c, info)
 	usageContext["usagePurpose"] = "facts"
 	value, err := a.plugin.Engine.Call(c.Request.Context(), "extractUsage", usageContext)
 	if err != nil {
@@ -1676,8 +1676,8 @@ func (a *TaskAdaptor) buildSubmit(c *gin.Context, info *relaycommon.RelayInfo) (
 		return a.submit, nil
 	}
 	started := time.Now()
-	// buildSubmitRequest runs before quota is reserved, so a failed fetch
-	// costs nothing; requests that start vendor work stay the descriptor.
+	// ModelOffering requests reserve funds before this hook. Only the returned
+	// descriptor may start vendor work; helper fetches remain read-only.
 	fetchContext := c.Request.Context()
 	if info.HasChannelMeta() {
 		fetchContext = pluginruntime.WithFetcher(fetchContext, a.hookFetcher(info.ChannelBaseUrl, info.ChannelSetting.Proxy))
@@ -1757,6 +1757,32 @@ func (a *TaskAdaptor) buildSubmit(c *gin.Context, info *relaycommon.RelayInfo) (
 }
 
 func (a *TaskAdaptor) submitContext(c *gin.Context, info *relaycommon.RelayInfo) map[string]any {
+	ctx := a.taskRequestContext(c, info)
+	requestCtx := context.Background()
+	if c != nil && c.Request != nil {
+		requestCtx = c.Request.Context()
+	}
+	needsExchange := info.ChannelType != constant.ChannelTypeNewAPI && a.plugin.Meta.Auth.Type != "" && a.plugin.Meta.Auth.Type != "none" && a.plugin.Meta.Auth.Type != "api_key"
+	if needsExchange && info.BeginProviderCall != nil {
+		budgetContext, err := info.BeginProviderCall()
+		if err != nil {
+			ctx["authError"] = err.Error()
+			return ctx
+		}
+		bounded, cancel := context.WithCancel(requestCtx)
+		stop := context.AfterFunc(budgetContext, cancel)
+		defer func() { stop(); cancel() }()
+		requestCtx = bounded
+	}
+	if err := a.applyUpstreamCredentialsWithContext(requestCtx, ctx, info.ChannelType, info.ApiKey, info.ChannelSetting.Proxy); err != nil {
+		ctx["authError"] = err.Error()
+	}
+	return ctx
+}
+
+// taskRequestContext projects the driver input without token exchange or I/O.
+// Usage validation can run before reservation using this same request identity.
+func (a *TaskAdaptor) taskRequestContext(c *gin.Context, info *relaycommon.RelayInfo) map[string]any {
 	routeRequest := pluginruntime.RouteRequestContext{
 		Params:      map[string]string{},
 		Query:       map[string][]string{},
@@ -1870,13 +1896,17 @@ func (a *TaskAdaptor) submitContext(c *gin.Context, info *relaycommon.RelayInfo)
 	ctx["upstreamModel"] = info.UpstreamModelName
 	ctx["baseUrl"] = info.ChannelBaseUrl
 	ctx["userSetting"] = info.UserSetting
-	requestCtx := context.Background()
-	if c != nil && c.Request != nil {
-		requestCtx = c.Request.Context()
+	ctx["authHeader"] = ""
+	ctx["upstream"] = map[string]any{"kind": pluginruntime.UpstreamKindVendor}
+	if info.ChannelType == constant.ChannelTypeNewAPI {
+		ctx["upstream"] = map[string]any{"kind": pluginruntime.UpstreamKindNewAPI}
+		ctx["apiKey"] = info.ApiKey
+		ctx["authHeader"] = "Bearer " + info.ApiKey
+	} else if a.plugin.Meta.Auth.Type == "" || a.plugin.Meta.Auth.Type == "none" || a.plugin.Meta.Auth.Type == "api_key" {
+		ctx["apiKey"] = info.ApiKey
+		ctx["authHeader"] = info.ApiKey
 	}
-	if err := a.applyUpstreamCredentialsWithContext(requestCtx, ctx, info.ChannelType, info.ApiKey, info.ChannelSetting.Proxy); err != nil {
-		ctx["authError"] = err.Error()
-	}
+	ctx["auth"] = map[string]any{"authHeader": ctx["authHeader"]}
 	return ctx
 }
 

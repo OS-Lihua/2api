@@ -406,6 +406,9 @@ func CompilePlugin(source string, options Options) (*LoadedPlugin, error) {
 		definition, _ := HostProtocol(protocol)
 		required := make(map[string]struct{})
 		allowed := make(map[string]struct{})
+		if protocol == "openai_video" {
+			allowed["decodeRemixRequest"] = struct{}{}
+		}
 		modeHookUsers := make(map[string][]string)
 		for _, operation := range definition.Operations {
 			for _, hook := range operation.RequiredProtocolMembers {
@@ -499,6 +502,17 @@ func CompilePlugin(source string, options Options) (*LoadedPlugin, error) {
 		implementation, ok := protocolObject[protocol].(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf("plugin %s protocol %q must be an object", meta.Key, protocol)
+		}
+		if protocol == "openai_video" {
+			if _, present := implementation["decodeRemixRequest"]; present {
+				callable, err := engine.HasCallablePath(context.Background(), "protocols", protocol, "decodeRemixRequest")
+				if err != nil {
+					return nil, err
+				}
+				if !callable {
+					return nil, fmt.Errorf("plugin %s protocol %q remix decoder must be callable", meta.Key, protocol)
+				}
+			}
 		}
 		for member := range implementation {
 			if _, accepted := allowed[member]; !accepted {

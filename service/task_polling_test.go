@@ -525,31 +525,42 @@ func TestUpdateVideoTasksDefaultSleepDoesNotBlockOtherChannels(t *testing.T) {
 	secondChannelFirst := seedPollingTask(t, secondChannelID, "task_public_7", "upstream_b_1")
 	secondChannelSecond := seedPollingTask(t, secondChannelID, "task_public_8", "upstream_b_2")
 
-	adaptor := &taskPollingFetchAdaptor{}
+	adaptor := &taskPollingFetchAdaptor{fetched: make(chan string, 4)}
 	previousFactory := GetTaskAdaptorFunc
 	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return adaptor }
 	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-
-	err := UpdateVideoTasks(ctx, constant.TaskPlatform("kling"), map[int][]string{
-		firstChannelID: {
-			firstChannelFirst.GetUpstreamTaskID(),
-			firstChannelSecond.GetUpstreamTaskID(),
-		},
-		secondChannelID: {
-			secondChannelFirst.GetUpstreamTaskID(),
-			secondChannelSecond.GetUpstreamTaskID(),
-		},
-	}, map[string]*model.Task{
-		firstChannelFirst.GetUpstreamTaskID():   firstChannelFirst,
-		firstChannelSecond.GetUpstreamTaskID():  firstChannelSecond,
-		secondChannelFirst.GetUpstreamTaskID():  secondChannelFirst,
-		secondChannelSecond.GetUpstreamTaskID(): secondChannelSecond,
+	errCh := make(chan error, 1)
+	gopool.Go(func() {
+		errCh <- UpdateVideoTasks(ctx, constant.TaskPlatform("kling"), map[int][]string{
+			firstChannelID: {
+				firstChannelFirst.GetUpstreamTaskID(),
+				firstChannelSecond.GetUpstreamTaskID(),
+			},
+			secondChannelID: {
+				secondChannelFirst.GetUpstreamTaskID(),
+				secondChannelSecond.GetUpstreamTaskID(),
+			},
+		}, map[string]*model.Task{
+			firstChannelFirst.GetUpstreamTaskID():   firstChannelFirst,
+			firstChannelSecond.GetUpstreamTaskID():  firstChannelSecond,
+			secondChannelFirst.GetUpstreamTaskID():  secondChannelFirst,
+			secondChannelSecond.GetUpstreamTaskID(): secondChannelSecond,
+		})
 	})
-
-	require.ErrorIs(t, err, context.DeadlineExceeded)
+	for range 2 {
+		select {
+		case <-adaptor.fetched:
+		case err := <-errCh:
+			require.FailNow(t, "polling ended before both channels made their first call", "%v", err)
+		case <-t.Context().Done():
+			require.FailNow(t, "both channels must make their first call")
+		}
+	}
+	cancel()
+	require.ErrorIs(t, <-errCh, context.Canceled)
 	assert.ElementsMatch(t, []string{"upstream_a_1", "upstream_b_1"}, adaptor.fetchedTaskIDs())
 }
 

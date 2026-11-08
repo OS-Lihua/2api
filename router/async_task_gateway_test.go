@@ -2,6 +2,10 @@ package router
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -530,6 +535,13 @@ func TestAsyncTaskNativeOfferingUsesDeclaredPluginWithIndependentProvider(t *tes
 	assert.Equal(t, constant.TaskPlatform("doubao"), task.Platform)
 	assert.Equal(t, "gateway-alias", task.Properties.OriginModelName)
 	assert.Empty(t, task.PrivateData.Key)
+	SetVideoRouter(fixture.engine)
+	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/videos/"+task.TaskID+"/remix", `{"prompt":"A green bird"}`)
+	assert.Equal(t, 400, response.Code, response.Body.String())
+	assert.Equal(t, 1, calls, "unsupported remix must not submit an unrelated generation")
+	var postings int64
+	require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id <> ''").Count(&postings).Error)
+	assert.EqualValues(t, 1, postings, "unsupported remix must be rejected before reservation")
 }
 
 func TestAsyncTaskFailoverAndConcurrentCompletionChargeOnce(t *testing.T) {
@@ -747,6 +759,164 @@ func TestAsyncTaskSubmissionCannotOverwriteConcurrentPollCompletion(t *testing.T
 	require.EqualValues(t, 1, total)
 	assert.Equal(t, "success", requests[0].Status)
 	assert.EqualValues(t, 180000000, requests[0].Receivable.Nanos)
+}
+
+func TestAsyncTaskInsufficientWalletDoesNotExchangeProviderCredentials(t *testing.T) {
+	const exchangedKey = "task-oauth-fixture"
+	var funded atomic.Bool
+	var generationCalls atomic.Int32
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		generationCalls.Add(1)
+		assert.True(t, funded.Load(), "unfunded task must not reach generation")
+		assert.Equal(t, "Bearer "+exchangedKey, r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"private-oauth-job","status":"queued"}`))
+	})
+	source, err := plugins.Source("sora")
+	require.NoError(t, err)
+	source = strings.Replace(source, "apiVersion: 1,", `apiVersion: 1, auth: "vertex_oauth",`, 1)
+	source = strings.ReplaceAll(source, `Authorization: "Bearer " + ctx.apiKey`, `Authorization: ctx.authHeader`)
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "sora"})
+	require.NoError(t, err)
+	private, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	der, err := x509.MarshalPKCS8PrivateKey(private)
+	require.NoError(t, err)
+	credentials, err := common.Marshal(map[string]string{"project_id": "synthetic-task-project", "client_email": "synthetic@example.invalid", "private_key": string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))})
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("key", string(credentials)).Error)
+	_, err = model.PostLedgerEntries(model.LedgerPosting{Account: model.UserWalletAccount(fixture.user.Id), Type: model.LedgerEntryAdjustment, Amount: money.Amount{Nanos: -1000000000, Currency: "USD"}, IdempotencyKey: "task-empty-wallet"})
+	require.NoError(t, err)
+	var provider model.Provider
+	require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
+	generationURL, err := url.Parse(provider.GetBaseURL())
+	require.NoError(t, err)
+	var exchanges atomic.Int32
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		exchanges.Add(1)
+		var reservations int64
+		require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id <> '' AND type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
+		assert.EqualValues(t, 1, reservations, "credential exchange must follow the reservation")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"access_token":%q,"token_type":"Bearer","expires_in":3600}`, exchangedKey)
+	}))
+	t.Cleanup(broker.Close)
+	brokerURL, err := url.Parse(broker.URL)
+	require.NoError(t, err)
+	client := service.GetHttpClient()
+	original := client.Transport
+	t.Cleanup(func() { client.Transport = original })
+	transport := original
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Host == generationURL.Host {
+			return transport.RoundTrip(request)
+		}
+		if request.URL.Host != "www.googleapis.com" || request.URL.Path != "/oauth2/v4/token" {
+			return nil, fmt.Errorf("unexpected credential destination")
+		}
+		copyRequest := request.Clone(request.Context())
+		copyURL := *request.URL
+		copyURL.Scheme, copyURL.Host = brokerURL.Scheme, brokerURL.Host
+		copyRequest.URL, copyRequest.Host = &copyURL, brokerURL.Host
+		return transport.RoundTrip(copyRequest)
+	})
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+	assert.Equal(t, 402, response.Code, response.Body.String())
+	assert.Zero(t, exchanges.Load(), "Provider credential I/O must wait for reservation")
+	assert.NotContains(t, response.Body.String(), "PRIVATE KEY")
+	assert.NotContains(t, response.Body.String(), exchangedKey)
+	_, err = model.TopUpWallet(model.WalletTopUp{UserId: fixture.user.Id, Source: money.Amount{Nanos: 1000000000, Currency: "USD"}, Reference: "task-fund-oauth"})
+	require.NoError(t, err)
+	funded.Store(true)
+	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.EqualValues(t, 1, exchanges.Load())
+	assert.EqualValues(t, 1, generationCalls.Load())
+	var task model.Task
+	require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
+	assert.Empty(t, task.PrivateData.Key)
+}
+
+func TestAsyncTaskRecoveryDoesNotStarveLaterTerminalFacts(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		badTerminal   bool
+		limit, passes int
+		wallet        int64
+	}{
+		{"pending", false, 1, 2, 460000000},
+		{"evaluation failure", true, 2, 1, 764000000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var submitted atomic.Int32
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method == http.MethodPost {
+					_, _ = fmt.Fprintf(w, `{"id":"recovery-job-%d","status":"queued"}`, submitted.Add(1))
+					return
+				}
+				status := "completed"
+				if strings.HasSuffix(r.URL.Path, "recovery-job-1") && !tc.badTerminal {
+					status = "queued"
+				}
+				_, _ = fmt.Fprintf(w, `{"id":%q,"status":%q,"seconds":"2"}`, strings.TrimPrefix(r.URL.Path, "/v1/videos/"), status)
+			})
+			if tc.badTerminal {
+				fixture.fake.Advance(time.Second)
+				require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `u("seconds") == 2 ? tier("overflow", 10000000000) : tier("video", u("seconds") * 0.01)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+			require.Equal(t, 200, response.Code, response.Body.String())
+			fixture.fake.Advance(time.Second)
+			require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("video", u("seconds") * 0.1)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+			response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"Another bird","seconds":"4"}`)
+			require.Equal(t, 200, response.Code, response.Body.String())
+			var later model.Task
+			require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Order("id DESC").First(&later).Error)
+			journal := t.TempDir()
+			t.Setenv("GATEWAY_SETTLEMENT_JOURNAL_DIR", "/dev/null/unwritable")
+			service.RunTaskPollingOnce(t.Context(), nil)
+			t.Setenv("GATEWAY_SETTLEMENT_JOURNAL_DIR", journal)
+			if tc.badTerminal {
+				// Another request already has a prepared financial intent. A bad
+				// task must not stop the scheduled handler from replaying it.
+				text := model.GatewayRequest{ID: "unrelated-recovery-text", UserID: fixture.user.Id, SaleCurrency: "USD", SaleFXRate: "1", GroupRatio: "1", Receivable: money.Amount{Nanos: 20000000, Currency: "USD"}, Status: "success"}
+				require.NoError(t, model.ReserveGateway(&text, text.Receivable, text.Receivable))
+				require.NoError(t, model.PrepareGatewaySettlement(model.GatewaySettlement{Request: text, SaleSource: text.Receivable}))
+				require.NoError(t, model.DB.AutoMigrate(&model.SystemTask{}, &model.SystemTaskLock{}))
+				job, err := model.CreateSystemTask("gateway_settlement", nil, nil)
+				require.NoError(t, err)
+				claimed, won, err := model.ClaimSystemTask(job.ID, job.Type, "async49-recovery", common.GetTimestamp()+60)
+				require.NoError(t, err)
+				require.True(t, won)
+				service.GatewayRecoveryHandler{}.Run(t.Context(), claimed, "async49-recovery")
+				finished, err := model.GetSystemTaskByTaskID(job.TaskID)
+				require.NoError(t, err)
+				assert.Equal(t, model.SystemTaskStatusFailed, finished.Status, "the bad task must remain visible")
+				recovered, err := model.GetGatewayRequest(t.Context(), text.ID, fixture.user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, "success", recovered.Status)
+				assert.EqualValues(t, 20000000, recovered.Receivable.Nanos)
+			} else {
+				for range tc.passes {
+					fixture.fake.Advance(time.Millisecond)
+					_, err := service.RecoverGatewayTasks(t.Context(), tc.limit)
+					require.NoError(t, err)
+				}
+			}
+			record, err := model.GetGatewayRequest(t.Context(), later.PrivateData.Gateway.Settlement.Request.ID, fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, "success", record.Status)
+			assert.EqualValues(t, 180000000, record.Receivable.Nanos)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wallet, wallet.Balance.Nanos)
+		})
+	}
 }
 
 func TestAsyncTaskRejectsUnboundedDurationBeforeReservation(t *testing.T) {

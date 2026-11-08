@@ -42,7 +42,10 @@ func MigrateGatewayBilling(db *gorm.DB) error {
 	if err := migrateWalletLedger(db); err != nil {
 		return err
 	}
-	return db.AutoMigrate(&GatewayBilling{})
+	if err := db.AutoMigrate(&GatewayBilling{}); err != nil {
+		return err
+	}
+	return db.Exec(`CREATE INDEX IF NOT EXISTS "idx_gateway_billing_recovery" ON "gateway_billings" ("updated_at", "request_id") WHERE "phase" <> 'settled'`).Error
 }
 
 // ReserveGateway writes the request lifecycle and reservation in one primary

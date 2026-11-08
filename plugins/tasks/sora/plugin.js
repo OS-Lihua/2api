@@ -7,7 +7,7 @@ export const meta = {
     en: "OpenAI Sora video generation (text-to-video, image-to-video, and remix)",
     zh: "OpenAI Sora 视频生成（文生视频、图生视频、remix）",
   },
-  version: "1.1.1",
+  version: "1.1.2",
   channelTypes: [55, 1], // OpenAI-type channels natively serve sora with the same wire format
   author: { name: "QuantumNous" },
   models: ["sora-2", "sora-2-pro"],
@@ -324,6 +324,13 @@ protocols.openai_video = {
       action: hasInputReferenceFile || req.input_reference || req.image ? "image_to_video" : "text_to_video",
       requestBody: Object.assign({}, req, { model: ctx.model }),
     };
+  },
+  decodeRemixRequest: function (ctx) {
+    if (!ctx.body || ctx.body.kind !== "json" || !ctx.body.value || Array.isArray(ctx.body.value)) throw new Error("JSON object required");
+    const req = ctx.body.value;
+    if (Object.keys(req).some((key) => key !== "prompt")) throw new Error("video remix accepts only prompt");
+    if (typeof req.prompt !== "string" || !req.prompt.trim()) throw new Error("field prompt is required");
+    return { kind: "submit", model: ctx.model, action: "remix", requestBody: { prompt: req.prompt }, originTaskIds: [ctx.params.video_id] };
   },
   render: function (ctx, task) {
     if (task.data && typeof task.data === "object" && !Array.isArray(task.data)) return task.data;

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"time"
@@ -65,27 +66,38 @@ func UpdateGatewayTask(ctx context.Context, task *model.Task) error {
 
 // RecoverGatewayTasks retries terminal task settlement from durable facts.
 func RecoverGatewayTasks(ctx context.Context, limit int) (int, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
 	tasks, err := model.RecoverableGatewayTasks(ctx, limit)
 	if err != nil {
 		return 0, err
 	}
 	completed := 0
+	var failures error
 	for i := range tasks {
 		if err := ctx.Err(); err != nil {
-			return completed, err
+			return completed, errors.Join(failures, err)
 		}
-		if tasks[i].Status != model.TaskStatusSuccess && tasks[i].Status != model.TaskStatusFailure {
-			if err := PublishGatewayTask(&tasks[i]); err != nil {
-				return completed, err
+		task := &tasks[i]
+		var taskErr error
+		if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
+			taskErr = SettleGatewayTask(ctx, task)
+			if taskErr == nil {
+				completed++
 			}
-			continue
+		} else {
+			taskErr = PublishGatewayTask(task)
 		}
-		if err := SettleGatewayTask(ctx, &tasks[i]); err != nil {
-			return completed, err
-		}
-		completed++
+		failures = errors.Join(failures, taskErr)
+		// Rotate attempted work behind older queued work, even when one task's
+		// facts cannot yet be evaluated or its log projection is unavailable.
+		err := model.DB.WithContext(ctx).Model(&model.GatewayBilling{}).
+			Where("request_id = ? AND phase <> ?", task.PrivateData.Gateway.Settlement.Request.ID, "settled").
+			Update("updated_at", clock.Now().UnixMilli()).Error
+		failures = errors.Join(failures, err)
 	}
-	return completed, nil
+	return completed, failures
 }
 
 // PublishGatewayTask projects durable submission state into the existing
