@@ -109,7 +109,7 @@ func TestSingleModelChannelAPI(t *testing.T) {
 	path := fmt.Sprintf("/api/admin/v1/channels/%v", data["id"])
 	status, read := call(http.MethodGet, path, "")
 	require.Equal(t, http.StatusOK, status)
-	assert.Equal(t, data, read["data"])
+	assert.Subset(t, read["data"], data, "all saved configuration fields round-trip; health is a runtime read projection")
 	status, duplicate := call(http.MethodPost, "/api/admin/v1/channels", body)
 	assert.Equal(t, http.StatusConflict, status, duplicate)
 	status, _ = call(http.MethodPost, path+"/enable", "")
@@ -163,6 +163,8 @@ func TestSingleModelChannelAPI(t *testing.T) {
 			status, created := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":%q,"upstream_model_name":"probe-model"}`, provider.Id, unified.Id, protocolName))
 			require.Equal(t, http.StatusOK, status, created)
 			probePath := fmt.Sprintf("/api/admin/v1/channels/%v", created["data"].(map[string]any)["id"])
+			status, before := call(http.MethodGet, probePath, "")
+			require.Equal(t, http.StatusOK, status, before)
 			status, result := call(http.MethodPost, probePath+"/probes", `{"capability":"structured_output"}`)
 			require.Equal(t, http.StatusOK, status, result)
 			observation := result["data"].(map[string]any)
@@ -183,7 +185,7 @@ func TestSingleModelChannelAPI(t *testing.T) {
 				}
 			}
 			_, after := call(http.MethodGet, probePath, "")
-			assert.Equal(t, created["data"], after["data"])
+			assert.Equal(t, before["data"], after["data"], "capability probes change neither configuration nor runtime health")
 		}
 	})
 	t.Run("probe applies channel overrides and rejects an enlarged request budget", func(t *testing.T) {
@@ -421,6 +423,8 @@ export function buildContentRequest(ctx){if(ctx.artifactKey==="preview")return {
 		status, created := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":"task:probe","upstream_model_name":"task-probe-upstream"}`, provider.Id, unified.Id))
 		require.Equal(t, http.StatusOK, status, created)
 		channelPath := fmt.Sprintf("/api/admin/v1/channels/%v", created["data"].(map[string]any)["id"])
+		status, before := call(http.MethodGet, channelPath, "")
+		require.Equal(t, http.StatusOK, status, before)
 		for _, expected := range []string{"passed", "inconclusive"} {
 			status, result := call(http.MethodPost, channelPath+"/probes", `{"capability":"output_video"}`)
 			require.Equal(t, http.StatusOK, status, result)
@@ -524,7 +528,7 @@ export function buildContentRequest(ctx){if(ctx.artifactKey==="preview")return {
 			}
 		}
 		_, after := call(http.MethodGet, channelPath, "")
-		assert.Equal(t, created["data"], after["data"])
+		assert.Equal(t, before["data"], after["data"], "task capability probes do not become gateway health samples")
 	})
 	t.Run("installed image edit decoders forward the reference through their native request", func(t *testing.T) {
 		previousRegistry := jsplugin.DefaultRegistry
