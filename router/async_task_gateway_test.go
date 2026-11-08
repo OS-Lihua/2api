@@ -2543,6 +2543,56 @@ func TestAsyncTaskImageInRequestPollingUsesActualCredentialSlot(t *testing.T) {
 	assert.EqualValues(t, 910000000, wallet.Balance.Nanos)
 }
 
+func TestAsyncTaskNativeDurationUsesFinalWire(t *testing.T) {
+	for _, test := range []struct {
+		name, plugin, model, path, body, overrides, expression, result string
+		maximum                                                        int64
+	}{
+		{"vidu-native-unbounded", "vidu", "viduq3-pro", "/vidu/ent/v2/text2video", `{"model":"gateway-alias","prompt":"A bird","duration":4001}`, `{}`, `u("duration")/10000`, `{"task_id":"oversized-job"}`, 16},
+		{"doubao-native-override", "doubao", "doubao-seedance-1-0-pro-250528", "/doubao/api/v3/contents/generations/tasks", `{"model":"gateway-alias","content":[{"type":"text","text":"A bird"}],"duration":10}`, `{"seconds":4}`, `u("tokens")/1000000`, `{"id":"oversized-job"}`, 5},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(test.result))
+			})
+			source, err := plugins.Source(test.plugin)
+			require.NoError(t, err)
+			jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+			_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: test.plugin})
+			require.NoError(t, err)
+			caps := capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Video}, Limits: capability.Limits{MaxDurationSeconds: &test.maximum}}
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Updates(map[string]any{"model_name": test.model, "capabilities": caps}).Error)
+			require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:" + test.plugin, "upstream_model_name": test.model, "parameter_overrides": test.overrides}).Error)
+			fixture.fake.Advance(time.Second)
+			for _, price := range []*model.PriceVersion{{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("task", (` + test.expression + `)*0.1)`, EffectiveAt: clock.Now().Unix()}, {OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("task", (` + test.expression + `)*0.05)`, EffectiveAt: clock.Now().Unix()}} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			builder := newPluginGenerationBuilder(fixture.engine.Routes(), nil, productionPluginRouteHandlers)
+			require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(builder.prepare))
+			dispatcher := &pluginRouteDispatcher{registry: jsplugin.DefaultRegistry}
+			fixture.engine.NoRoute(dispatcher.dispatch)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, test.path, test.body)
+			assert.Equal(t, 400, response.Code, response.Body.String())
+			assert.Zero(t, calls.Load())
+			var reservations int64
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
+			assert.Zero(t, reservations)
+			require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", `{}`).Error)
+			var valid map[string]any
+			require.NoError(t, common.UnmarshalJsonStr(test.body, &valid))
+			valid["duration"] = 4
+			encoded, err := common.Marshal(valid)
+			require.NoError(t, err)
+			response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, test.path, string(encoded))
+			assert.Equal(t, 200, response.Code, response.Body.String())
+			assert.EqualValues(t, 1, calls.Load())
+		})
+	}
+}
+
 func TestAsyncTaskPhysicalDurationAndEffectiveImageModalities(t *testing.T) {
 	for _, test := range []struct {
 		name, plugin, model, body, result, expression string

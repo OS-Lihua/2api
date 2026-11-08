@@ -213,8 +213,10 @@ function nativeSettings(action, model, body) {
   const settings = dearestSettings(action, model);
   const seconds = typeof body.duration === "number" || typeof body.duration === "string" ? Number(body.duration) : NaN;
   let durationKnown = true;
-  if (Number.isInteger(seconds) && seconds > 0 && seconds <= 3600) settings.duration = seconds;
-  else if ((body.duration === undefined || body.duration === null) && listed) settings.duration = listed.durations[2];
+  if (body.duration !== undefined && body.duration !== null) {
+    if (!Number.isInteger(seconds) || seconds <= 0 || seconds > 3600) throw new Error("seconds must be between 1 and 3600");
+    settings.duration = seconds;
+  } else if (listed) settings.duration = listed.durations[2];
   else durationKnown = false;
   const tier = RESOLUTIONS.find((item) => item.toLowerCase() === trimmed(body.resolution).toLowerCase());
   if (tier) settings.resolution = tier;
@@ -392,12 +394,12 @@ export function extractCapabilities(ctx) {
   const images = req.vendorBody ? req.vendorBody.images : Array.isArray(req.images) && req.images.length ? req.images : (req.metadata || {}).images;
   const imageCount = Array.isArray(images) ? images.length : images ? 1 : 0;
   if (imageCount || ["image_to_video", "first_tail_to_video", "reference_to_video"].includes(actionFor(req))) input.push("image");
-  return {
-    input_modalities: input,
-    output_modalities: ["video"],
-    image_count: imageCount,
-    duration_seconds: Math.ceil(submitSettings(ctx, actionFor(req)).duration),
-  };
+  const result = { input_modalities: input, output_modalities: ["video"], image_count: imageCount };
+  const settings = submitSettings(ctx, actionFor(req));
+  const body = req.vendorBody;
+  if (!body || (body.duration !== undefined && body.duration !== null) || listedProfile(actionFor(req), ctx.upstreamModel || ctx.model))
+    result.duration_seconds = settings.duration;
+  return result;
 }
 
 export function buildSubmitRequest(ctx) {
@@ -405,8 +407,10 @@ export function buildSubmitRequest(ctx) {
   const action = actionFor(req);
   const model = ctx.upstreamModel || req.model;
   let body;
-  if (req.vendorBody) body = Object.assign({}, req.vendorBody, { model: model });
-  else {
+  if (req.vendorBody) {
+    nativeSettings(action, model, req.vendorBody);
+    body = Object.assign({}, req.vendorBody, { model: model });
+  } else {
     body = Object.assign({}, req.metadata || {}, { model: model }, requestSettings(req, action, model));
     if (trimmed(req.prompt)) body.prompt = req.prompt;
     if (Array.isArray(req.images) && req.images.length) body.images = req.images;

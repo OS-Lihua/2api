@@ -802,7 +802,7 @@ export const native = {
 function requestedVideoDuration(ctx) {
   const req = ctx.requestBody || {};
   const metadata = req.vendorBody || req.metadata || {};
-  const stated = req.seconds ?? req.duration ?? metadata.duration;
+  const stated = req.vendorBody ? metadata.duration : (req.seconds ?? req.duration ?? metadata.duration);
   if (stated === -1 || stated === "-1") return videoProfile(ctx).maxDuration;
   if (stated === undefined || stated === null) {
     if (metadata.frames === undefined || metadata.frames === null) return videoProfile(ctx).maxDuration;
