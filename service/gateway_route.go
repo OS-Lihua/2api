@@ -6,7 +6,6 @@ import (
 	"math/big"
 	"math/rand/v2"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
