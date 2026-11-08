@@ -912,75 +912,81 @@ func TestBaiduTokenPreparationRejectsUntrustedTLS(t *testing.T) {
 func TestTextGatewayBaiduNativeRejectionsExcludeProvider(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		for _, code := range []int{17, 110, 111} {
-			t.Run(fmt.Sprint("stream=", stream, "/code=", code), func(t *testing.T) {
-				calls := 0
-				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
-					w.Header().Set("Content-Type", "application/json")
-					if r.URL.Path == "/oauth/2.0/token" {
-						_, _ = w.Write([]byte(`{"access_token":"fake-token","expires_in":7200}`))
-						return
-					}
-					calls++
-					if stream {
-						w.Header().Set("Content-Type", "text/event-stream")
-						_, _ = fmt.Fprintf(w, "data: {\"error_code\":%d,\"error_msg\":\"private-baidu-error\"}\n\n", code)
-					} else {
-						_, _ = fmt.Fprintf(w, `{"error_code":%d,"error_msg":"private-baidu-error"}`, code)
-					}
-				})
-				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeBaidu, "key": t.Name() + "|fake"}).Error)
-				sibling := *fixture.channel
-				sibling.ID, sibling.UpstreamModelName = 0, "same-account-next"
-				require.NoError(t, model.DB.Create(&sibling).Error)
-				price := *fixture.purchase
-				price.ID, price.OwnerID = 0, sibling.ID
-				require.NoError(t, model.CreatePriceVersion(t.Context(), &price, fixture.sale.CreatedBy))
-				var provider model.Provider
-				require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
-				endpoint, err := url.Parse(*provider.BaseURL)
-				require.NoError(t, err)
-				client := service.GetHttpClient()
-				original := client.Transport
-				t.Cleanup(func() { client.Transport = original })
-				client.Transport = channelProbeRoundTripper(func(r *http.Request) (*http.Response, error) {
-					if r.URL.Host != "aip.baidubce.com" {
-						return original.RoundTrip(r)
-					}
-					copyRequest := r.Clone(r.Context())
-					copyURL := *r.URL
-					copyURL.Scheme, copyURL.Host = endpoint.Scheme, endpoint.Host
-					copyRequest.URL, copyRequest.Host = &copyURL, endpoint.Host
-					return original.RoundTrip(copyRequest)
-				})
-				recovered := 0
-				addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
-					recovered++
-					if stream {
-						w.Header().Set("Content-Type", "text/event-stream")
-						_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n"))
-						return
-					}
-					w.Header().Set("Content-Type", "application/json")
-					_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
-				})
-				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", fmt.Sprintf(`{"model":"gateway-alias","stream":%t,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, stream))
-				assert.Equal(t, 1, calls)
-				assert.Equal(t, 1, recovered)
-				assert.Contains(t, response.Body.String(), "Recovered")
-				assert.NotContains(t, response.Body.String(), "private-baidu-error")
-				attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
-				require.NoError(t, err)
-				require.EqualValues(t, 2, total)
-				for _, a := range attempts {
-					if a.ChannelID == fixture.channel.ID {
-						expected := "credentials"
-						if code == 17 {
-							expected = "account_quota"
-						}
-						assert.Equal(t, expected, a.ErrorClass)
-					}
+			for _, status := range []int{200, 400, 429} {
+				if stream && status != 200 {
+					continue
 				}
-			})
+				t.Run(fmt.Sprint("stream=", stream, "/code=", code, "/status=", status), func(t *testing.T) {
+					calls := 0
+					fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+						w.Header().Set("Content-Type", "application/json")
+						if r.URL.Path == "/oauth/2.0/token" {
+							_, _ = w.Write([]byte(`{"access_token":"fake-token","expires_in":7200}`))
+							return
+						}
+						calls++
+						if stream {
+							w.Header().Set("Content-Type", "text/event-stream")
+							_, _ = fmt.Fprintf(w, "data: {\"error_code\":%d,\"error_msg\":\"private-baidu-error\"}\n\n", code)
+						} else {
+							w.WriteHeader(status)
+							_, _ = fmt.Fprintf(w, `{"error_code":%d,"error_msg":"private-baidu-error"}`, code)
+						}
+					})
+					require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeBaidu, "key": t.Name() + "|fake"}).Error)
+					sibling := *fixture.channel
+					sibling.ID, sibling.UpstreamModelName = 0, "same-account-next"
+					require.NoError(t, model.DB.Create(&sibling).Error)
+					price := *fixture.purchase
+					price.ID, price.OwnerID = 0, sibling.ID
+					require.NoError(t, model.CreatePriceVersion(t.Context(), &price, fixture.sale.CreatedBy))
+					var provider model.Provider
+					require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
+					endpoint, err := url.Parse(*provider.BaseURL)
+					require.NoError(t, err)
+					client := service.GetHttpClient()
+					original := client.Transport
+					t.Cleanup(func() { client.Transport = original })
+					client.Transport = channelProbeRoundTripper(func(r *http.Request) (*http.Response, error) {
+						if r.URL.Host != "aip.baidubce.com" {
+							return original.RoundTrip(r)
+						}
+						copyRequest := r.Clone(r.Context())
+						copyURL := *r.URL
+						copyURL.Scheme, copyURL.Host = endpoint.Scheme, endpoint.Host
+						copyRequest.URL, copyRequest.Host = &copyURL, endpoint.Host
+						return original.RoundTrip(copyRequest)
+					})
+					recovered := 0
+					addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+						recovered++
+						if stream {
+							w.Header().Set("Content-Type", "text/event-stream")
+							_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n"))
+							return
+						}
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+					})
+					response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", fmt.Sprintf(`{"model":"gateway-alias","stream":%t,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, stream))
+					assert.Equal(t, 1, calls)
+					assert.Equal(t, 1, recovered)
+					assert.Contains(t, response.Body.String(), "Recovered")
+					assert.NotContains(t, response.Body.String(), "private-baidu-error")
+					attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+					require.NoError(t, err)
+					require.EqualValues(t, 2, total)
+					for _, a := range attempts {
+						if a.ChannelID == fixture.channel.ID {
+							expected := "credentials"
+							if code == 17 {
+								expected = "account_quota"
+							}
+							assert.Equal(t, expected, a.ErrorClass)
+						}
+					}
+				})
+			}
 		}
 	}
 }
@@ -1032,6 +1038,79 @@ func TestTextGatewayStreamModelRejectionUsesChannelScope(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestTextGatewayFirstByteBudgetIsNotShortenedByIdleTimeout(t *testing.T) {
+	previous := constant.StreamingTimeout
+	constant.StreamingTimeout = 300
+	t.Cleanup(func() { constant.StreamingTimeout = previous })
+	release, reading, closed := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+			return
+		case <-release:
+		}
+		_, _ = w.Write([]byte("{\"message\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"done\":true,\"prompt_eval_count\":10,\"eval_count\":5}\n"))
+	})
+	constant.StreamingTimeout = 300
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeOllama).Error)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", fixture.sale.CreatedBy).Update("role", common.RoleRootUser).Error)
+	root := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "option:write")
+	for _, key := range []string{"GatewayTotalFirstByteSeconds", "GatewayAttemptFirstByteSeconds"} {
+		updated := adminSecurityRequest(fixture.engine, root, http.MethodPut, "/api/option/", fmt.Sprintf(`{"key":%q,"value":600}`, key))
+		require.Contains(t, updated.Body.String(), `"success":true`)
+	}
+	client := service.GetHttpClient()
+	original := client.Transport
+	t.Cleanup(func() { client.Transport = original })
+	client.Transport = channelProbeRoundTripper(func(r *http.Request) (*http.Response, error) {
+		response, err := original.RoundTrip(r)
+		if err == nil {
+			response.Body = &gatewayObservedStreamBody{ReadCloser: response.Body, reads: 1, readingAgain: reading, closed: closed}
+		}
+		return response, err
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)).WithContext(ctx)
+	request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() { fixture.engine.ServeHTTP(response, request); close(done) }()
+	select {
+	case <-reading:
+	case <-done:
+		t.Fatal("stream stopped before the first read")
+	case <-time.After(10 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("upstream read not reached")
+	}
+	fixture.fake.Advance(300 * time.Second)
+	select {
+	case <-closed:
+		t.Error("idle timeout shortened the configured 600-second first-byte budget")
+	default:
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("stream did not complete after the business frame was released")
+	}
+	assert.Contains(t, response.Body.String(), "Hello")
+	assert.Equal(t, 1, strings.Count(response.Body.String(), "[DONE]"))
+	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, "success", record.Status)
 }
 
 func TestTextGatewayFailoverCannotExceedFrozenReservation(t *testing.T) {

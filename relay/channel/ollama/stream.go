@@ -12,7 +12,6 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
-	"github.com/QuantumNous/new-api/pkg/clock"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -177,20 +176,6 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	defer info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
 	helper.SetEventStreamHeaders(c)
 	scanner := helper.NewStreamScanner(resp.Body)
-	idleTimeout := time.Duration(constant.StreamingTimeout) * time.Second
-	onIdle := func() {
-		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, errors.New("upstream stream idle timeout"))
-		_ = resp.Body.Close()
-	}
-	var stopIdle func() bool
-	if info.ResponseFacts != nil && idleTimeout > 0 {
-		stopIdle = clock.AfterFunc(idleTimeout, onIdle)
-	}
-	defer func() {
-		if stopIdle != nil {
-			stopIdle()
-		}
-	}()
 	usage = &dto.Usage{}
 	defer func() {
 		if info.ResponseFacts == nil || info.ResponseFacts.UsageReported {
@@ -215,10 +200,6 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	}
 
 	for scanner.Scan() {
-		if stopIdle != nil {
-			stopIdle()
-			stopIdle = clock.AfterFunc(idleTimeout, onIdle)
-		}
 		line := scanner.Text()
 		line = strings.TrimSpace(line)
 		if line == "" {

@@ -203,6 +203,9 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		info.RequestId = run.record.ID
 	}
 	info.TokenizerModel = selection.Channel.Model.ModelName
+	if info.StreamStatus == nil {
+		info.StreamStatus = relaycommon.NewStreamStatus()
+	}
 	info.ResponseFacts = &relaycommon.ResponseFacts{OnBusinessOutput: budget.Delivered, CanFinishStream: func() bool { return info.StreamStatus.CompletedNormally() }}
 	info.BeginProviderCall = budget.Start
 	common.SetContextKey(c, constant.ContextKeyResponseFacts, info.ResponseFacts)
@@ -572,8 +575,17 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		// without forwarding Provider error text or treating it as output.
 		stream := info.IsStream
 		info.IsStream = false
-		responseUsage, _ := adaptor.DoResponse(c, httpResponse, info)
+		responseUsage, responseFailure := adaptor.DoResponse(c, httpResponse, info)
 		usage, _ = responseUsage.(*dto.Usage)
+		if responseFailure != nil {
+			failure := responseFailure.ToOpenAIError()
+			if upstreamCode == "" {
+				upstreamCode, _ = failure.Code.(string)
+			}
+			if upstreamType == "" {
+				upstreamType = failure.Type
+			}
+		}
 		info.IsStream = stream
 		attemptErr = types.NewErrorWithStatusCode(errors.New("upstream request failed"), types.ErrorCodeBadResponse, httpResponse.StatusCode)
 		status := httpResponse.StatusCode
