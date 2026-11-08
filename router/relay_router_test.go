@@ -402,6 +402,7 @@ func TestTextGatewayModelFallbackKeepsOfferingPrice(t *testing.T) {
 	require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Model-Fallback", "provider-forged->provider-model")
 		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Fallback answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
 	}))
 	t.Cleanup(server.Close)
@@ -6043,6 +6044,62 @@ func (w cancelOnOutputWriter) WriteString(body string) (int, error) {
 		w.cancel()
 	}
 	return n, err
+}
+
+type gatewayCancelAfterReadBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (body gatewayCancelAfterReadBody) Read(data []byte) (int, error) {
+	n, err := body.ReadCloser.Read(data)
+	if errors.Is(err, io.EOF) {
+		body.cancel()
+	}
+	return n, err
+}
+
+func TestTextGatewayClaudeCancellationBeforeDeliveryKeepsReportedCost(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"cancelled","type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":1000,"output_tokens":100,"cache_read_input_tokens":2000}}`)
+	})
+	require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", protocol.AnthropicMessages).Error)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	client := service.GetHttpClient()
+	original := client.Transport
+	if original == nil {
+		original = http.DefaultTransport
+	}
+	client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
+		response, err := original.RoundTrip(request)
+		if err == nil {
+			response.Body = gatewayCancelAfterReadBody{ReadCloser: response.Body, cancel: cancel}
+		}
+		return response, err
+	})
+	t.Cleanup(func() { client.Transport = original })
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)).WithContext(ctx)
+	request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	fixture.engine.ServeHTTP(response, request)
+	assert.ErrorIs(t, ctx.Err(), context.Canceled)
+	assert.NotContains(t, response.Body.String(), "Hello")
+	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, "cancelled", record.Status)
+	assert.Zero(t, record.Receivable.Nanos)
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, "upstream", attempts[0].UsageSource)
+	assert.EqualValues(t, 1000, attempts[0].Usage.PromptTokens)
+	assert.EqualValues(t, 100, attempts[0].Usage.CompletionTokens)
+	assert.EqualValues(t, 2000, attempts[0].Usage.CachedTokens)
+	assert.EqualValues(t, 3200000, attempts[0].Cost.Nanos)
+	assertTextGatewayLedger(t, *record, 3200000)
 }
 
 func TestTextGatewayCancellationReleasesOrChargesReportedUsage(t *testing.T) {

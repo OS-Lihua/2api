@@ -470,7 +470,7 @@ func ClaudeHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayI
 	logger.LogDebug(c, "responseBody: %s", responseBody)
 	handleErr := HandleClaudeResponseData(c, info, claudeInfo, resp, responseBody)
 	if handleErr != nil {
-		return nil, handleErr
+		return claudeInfo.Usage, handleErr
 	}
 	return claudeInfo.Usage, nil
 }
