@@ -416,7 +416,7 @@ function videoResolution(ctx) {
   const req = ctx.requestBody || {};
   const metadata = req.vendorBody || req.metadata || {};
   const profile = videoProfile(ctx);
-  const raw = trimmed(metadata.resolution || req.size).toLowerCase();
+  const raw = trimmed(metadata.resolution || (req.vendorBody ? "" : req.size)).toLowerCase();
   const recognized = SEEDANCE_RESOLUTIONS.includes(raw) || raw.replace("*", "x").split("x").length === 2;
   if (!recognized) return profile.resolutions.includes("1080p") ? "1080p" : profile.resolutions[profile.resolutions.length - 1];
   const resolution = normalizeResolution(raw);

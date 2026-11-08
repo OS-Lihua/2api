@@ -2543,7 +2543,7 @@ func TestAsyncTaskImageInRequestPollingUsesActualCredentialSlot(t *testing.T) {
 	assert.EqualValues(t, 910000000, wallet.Balance.Nanos)
 }
 
-func TestAsyncTaskNativeDurationUsesFinalWire(t *testing.T) {
+func TestAsyncTaskNativeMediaFactsUseFinalWire(t *testing.T) {
 	for _, test := range []struct {
 		name, plugin, model, path, body, overrides, expression, result string
 		maximum                                                        int64
@@ -2589,6 +2589,17 @@ func TestAsyncTaskNativeDurationUsesFinalWire(t *testing.T) {
 			response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, test.path, string(encoded))
 			assert.Equal(t, 200, response.Code, response.Body.String())
 			assert.EqualValues(t, 1, calls.Load())
+			if test.plugin == "doubao" {
+				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", `{"size":"480p"}`).Error)
+				response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, test.path, string(encoded))
+				require.Equal(t, 200, response.Code, response.Body.String())
+				requests, _, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+				require.NoError(t, err)
+				require.Len(t, requests, 2)
+				for _, request := range requests {
+					assert.EqualValues(t, 194400, request.Usage.TaskFacts["tokens"], "native wire omits resolution, so a normalized size override cannot reduce the default upper-bound reservation")
+				}
+			}
 		})
 	}
 }
