@@ -26,6 +26,7 @@ type ResponseFacts struct {
 	GeneratedText            string
 	SourceGeneratedText      string `json:"-"`
 	SourceOutputObserved     bool   `json:"-"`
+	SourceOutputTokens       *int   `json:"-"`
 	GeneratedOutputTokens    *int
 	OnBusinessOutput         func()
 	CanFinishStream          func() bool `json:"-"`

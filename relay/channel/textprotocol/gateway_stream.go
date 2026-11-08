@@ -85,6 +85,9 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			sourceOutput.ObserveResponses(normalized)
 		} else {
 			sourceOutput.text.WriteString(gatewayStreamBusinessText(normalized, p.format))
+			if p.format == types.RelayFormatOpenAI {
+				sourceOutput.ObserveChatTools(normalized)
+			}
 		}
 		info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || sourceOutput.String() != "" || gatewayMediaOutput(normalized, p.format)
 		safety := observeGatewaySafety(info, []byte(data), p.format)
@@ -188,6 +191,9 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			info.StreamStatus.MarkFailed("stream_interrupted", "", 0)
 		}
 	}
+	if info.StreamStatus.OutcomeSnapshot().Response == relaycommon.ResponseOutcomeUnknown {
+		info.StreamStatus.MarkFailed("stream_interrupted", "", 0)
+	}
 	if streamErr == nil && !info.StreamStatus.CompletedNormally() {
 		streamErr = errors.New("upstream stream did not complete")
 	}
@@ -216,11 +222,21 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 	}
 	info.ResponseFacts.SourceGeneratedText = sourceOutput.String()
 	info.ResponseFacts.GeneratedText = output.String()
+	if p.format == types.RelayFormatOpenAI {
+		// Preserve the Chat estimator's structural tokens for each tool call.
+		sourceTokens := tokenkit.Count(info.TokenizerModelName(), sourceOutput.String()) + len(sourceOutput.chatTools)*7
+		info.ResponseFacts.SourceOutputTokens = &sourceTokens
+	}
+	generatedTokens := tokenkit.Count(info.TokenizerModelName(), output.String())
+	if p.format == types.RelayFormatOpenAI && info.RelayFormat == types.RelayFormatOpenAI {
+		generatedTokens += len(output.chatTools) * 7
+		info.ResponseFacts.GeneratedOutputTokens = &generatedTokens
+	}
 	if !info.ResponseFacts.PromptTokensReported {
 		usage.PromptTokens = max(usage.PromptTokens, info.GetEstimatePromptTokens())
 	}
 	if !info.ResponseFacts.CompletionTokensReported {
-		usage.CompletionTokens = max(usage.CompletionTokens, tokenkit.Count(info.TokenizerModelName(), output.String()))
+		usage.CompletionTokens = max(usage.CompletionTokens, generatedTokens)
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	if streamErr != nil {
@@ -324,6 +340,9 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 		if !errors.As(writeErr, &flushErr) {
 			return "", writeErr
 		}
+	}
+	if info.RelayFormat == types.RelayFormatOpenAI {
+		output.ObserveChatTools(generatedBody)
 	}
 	if info.RelayFormat == types.RelayFormatOpenAIResponses {
 		if toolText, handled := output.ObserveResponses(body); handled {

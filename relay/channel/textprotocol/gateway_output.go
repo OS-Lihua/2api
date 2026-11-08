@@ -23,7 +23,27 @@ type gatewayGeneratedOutput struct {
 	parts           map[string]*strings.Builder
 	partOrder       []string
 	tools           map[string]gatewayToolOutput
+	chatTools       map[[2]int64]struct{}
 	order           []string
+}
+
+func (o *gatewayGeneratedOutput) ObserveChatTools(body []byte) {
+	for i, choice := range gjson.GetBytes(body, "choices").Array() {
+		index := int64(i)
+		if reported := choice.Get("index"); reported.Exists() {
+			index = reported.Int()
+		}
+		for j, tool := range choice.Get("delta.tool_calls").Array() {
+			toolIndex := int64(j)
+			if reported := tool.Get("index"); reported.Exists() {
+				toolIndex = reported.Int()
+			}
+			if o.chatTools == nil {
+				o.chatTools = map[[2]int64]struct{}{}
+			}
+			o.chatTools[[2]int64{index, toolIndex}] = struct{}{}
+		}
+	}
 }
 
 func (o *gatewayGeneratedOutput) ObserveResponses(body []byte) (string, bool) {

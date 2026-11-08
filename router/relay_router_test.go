@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -4055,6 +4056,114 @@ func TestTextGatewayChatInputDetailsReachPurchaseAccounting(t *testing.T) {
 	}
 }
 
+func TestTextGatewayJSONTransportFailuresRetainPurchase(t *testing.T) {
+	for _, source := range []struct{ protocol, path, request, output string }{
+		{"openai_chat", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, `"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}]`},
+		{"openai_responses", "/v1/responses", `{"model":"gateway-offering","input":"Hello","max_output_tokens":16}`, `"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}]`},
+		{"anthropic_messages", "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, `"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn"`},
+		{"gemini_generate", "/v1beta/models/gateway-offering:generateContent", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16}}`, `"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}]`},
+	} {
+		for _, truncated := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/truncated=%t", source.protocol, truncated), func(t *testing.T) {
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					body := "{" + source.output + "}"
+					if truncated {
+						usage := `,"usage":{"input_tokens":10,"output_tokens":5}`
+						if source.protocol == "openai_chat" {
+							usage = `,"usage":{"prompt_tokens":10,"completion_tokens":5}`
+						} else if source.protocol == "gemini_generate" {
+							usage = `,"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}`
+						}
+						body = "{" + source.output + usage + "}"
+						w.Header().Set("Content-Length", strconv.Itoa(len(body)+20))
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, body)
+				})
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", source.protocol).Error)
+				path, request := source.path, source.request
+				if !truncated {
+					if source.protocol == "gemini_generate" {
+						path = strings.Replace(path, ":generateContent", ":streamGenerateContent?alt=sse", 1)
+					} else {
+						request = strings.TrimSuffix(request, "}") + `,"stream":true}`
+					}
+				}
+				recover := truncated && source.protocol == "openai_chat"
+				if recover {
+					addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`)
+					})
+				}
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, request)
+				status, charge, count := http.StatusBadGateway, int64(0), int64(1)
+				if recover {
+					status, charge, count = http.StatusOK, 36000, 2
+					assert.Contains(t, response.Body.String(), "Recovered")
+				}
+				require.Equal(t, status, response.Code, response.Body.String())
+				assert.NotContains(t, response.Body.String(), "Hello")
+				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, charge, record.Receivable.Nanos)
+				attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, count, total)
+				var first model.GatewayAttempt
+				for _, attempt := range attempts {
+					if attempt.ChannelID == fixture.channel.ID {
+						first = attempt
+					}
+				}
+				require.NotEmpty(t, first.ID)
+				if truncated {
+					assert.Equal(t, "upstream", first.UsageSource)
+					assert.Equal(t, int64(10), first.Usage.PromptTokens)
+					assert.Equal(t, int64(5), first.Usage.CompletionTokens)
+					assert.Equal(t, int64(20000), first.Cost.Nanos)
+				} else {
+					assert.Equal(t, "estimated", first.UsageSource)
+					assert.Equal(t, int64(9), first.Usage.PromptTokens)
+					assert.Equal(t, int64(1), first.Usage.CompletionTokens)
+					assert.Equal(t, int64(11000), first.Cost.Nanos)
+				}
+			})
+		}
+	}
+}
+
+func TestTextGatewayNativeTerminalCannotBeReplacedByDone(t *testing.T) {
+	for _, source := range []struct{ protocol, path, request, frames string }{
+		{"openai_responses", "/v1/responses", `{"model":"gateway-offering","stream":true,"input":"Hello","max_output_tokens":16}`, "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}\n\n"},
+		{"anthropic_messages", "/v1/messages", `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg\",\"role\":\"assistant\",\"content\":[]}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n"},
+	} {
+		t.Run(source.protocol, func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, source.frames+"data: [DONE]\n\n")
+			})
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", source.protocol).Error)
+			price := &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("request",fixed(0.01))`, EffectiveAt: clock.Now().Unix()}
+			require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, source.path, source.request)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), "Hello")
+			if source.protocol == "openai_responses" {
+				assert.Contains(t, response.Body.String(), "event: response.failed")
+			} else {
+				assert.Contains(t, response.Body.String(), "event: error")
+			}
+			assert.NotContains(t, response.Body.String(), "event: response.completed")
+			assert.NotContains(t, response.Body.String(), "event: message_stop")
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, "partial", record.Status)
+			assert.Zero(t, record.Receivable.Nanos)
+		})
+	}
+}
+
 func TestTextGatewayResponseConversionFailureRetainsUsage(t *testing.T) {
 	for _, reported := range []bool{false, true} {
 		t.Run(fmt.Sprintf("reported=%t", reported), func(t *testing.T) {
@@ -4429,6 +4538,54 @@ func TestTextGatewayMessagesTerminalWaitsForValidUpstreamCompletion(t *testing.T
 				assert.Zero(t, record.Receivable.Nanos)
 			}
 		})
+	}
+}
+
+func TestTextGatewayEmptySSEDoesNotCommitSuccess(t *testing.T) {
+	for _, source := range []struct{ protocol, path, request, empty, success string }{
+		{"openai_chat", "/v1/chat/completions", `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0}}\n\ndata: [DONE]\n\n", "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Recovered\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n"},
+		{"openai_responses", "/v1/responses", `{"model":"gateway-offering","stream":true,"input":"Hello","max_output_tokens":16}`, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n", "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Recovered\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n"},
+		{"anthropic_messages", "/v1/messages", `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, "data: {\"type\":\"message_start\",\"message\":{\"id\":\"empty\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":10}}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\ndata: {\"type\":\"message_stop\"}\n\n", "data: {\"type\":\"message_start\",\"message\":{\"id\":\"recovered\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":10}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Recovered\"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\ndata: {\"type\":\"message_stop\"}\n\n"},
+		{"gemini_generate", "/v1beta/models/gateway-offering:streamGenerateContent?alt=sse", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16}}`, "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":0}}\n\n", "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Recovered\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5}}\n\n"},
+	} {
+		for _, recover := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/recover=%t", source.protocol, recover), func(t *testing.T) {
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, source.empty)
+				})
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", source.protocol).Error)
+				if recover {
+					second := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = io.WriteString(w, source.success)
+					})
+					require.NoError(t, model.DB.Model(second).Update("protocol", source.protocol).Error)
+				}
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, source.path, source.request)
+				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+				require.NoError(t, err)
+				if recover {
+					assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+					assert.Contains(t, response.Body.String(), "Recovered")
+					assert.Equal(t, "success", record.Status)
+					assert.Equal(t, int64(36000), record.Receivable.Nanos)
+				} else {
+					assert.Equal(t, http.StatusBadGateway, response.Code, response.Body.String())
+					assert.Contains(t, response.Body.String(), "upstream_error")
+					assert.NotContains(t, response.Body.String(), "[DONE]")
+					assert.Zero(t, record.Receivable.Nanos)
+				}
+				attempts, _, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+				require.NoError(t, err)
+				for _, attempt := range attempts {
+					if attempt.ChannelID == fixture.channel.ID {
+						assert.Equal(t, "failed", attempt.Status)
+						assert.Equal(t, int64(10000), attempt.Cost.Nanos)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -4820,6 +4977,9 @@ func TestTextGatewayStrictConversionLosses(t *testing.T) {
 		{"Gemini video sampling", "/v1beta/models/gateway-offering:generateContent", `{"contents":[{"role":"user","parts":[{"fileData":{"mimeType":"video/mp4","fileUri":"https://example.com/a.mp4"},"videoMetadata":{"startOffset":"10s","endOffset":"20s","fps":1}}]}],"generationConfig":{"maxOutputTokens":16}}`, "openai_chat", "request_parameter_dropped", "videoMetadata", false},
 		{"Gemini part media resolution", "/v1beta/models/gateway-offering:generateContent", fmt.Sprintf(`{"contents":[{"role":"user","parts":[{"inlineData":{"mimeType":"image/png","data":%q},"mediaResolution":{"level":"MEDIA_RESOLUTION_HIGH"}}]}],"generationConfig":{"maxOutputTokens":16}}`, base64.StdEncoding.EncodeToString(image)), "openai_chat", "request_parameter_dropped", "mediaResolution", false},
 		{"Gemini media resolution", "/v1beta/models/gateway-offering:generateContent", fmt.Sprintf(`{"contents":[{"role":"user","parts":[{"inlineData":{"mimeType":"image/png","data":%q}}]}],"generationConfig":{"maxOutputTokens":16,"mediaResolution":"MEDIA_RESOLUTION_HIGH"}}`, base64.StdEncoding.EncodeToString(image)), "openai_chat", "request_parameter_dropped", "mediaResolution", false},
+		{"minimum output", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"min_tokens":8}`, "openai_responses", "request_parameter_dropped", "min_tokens", false},
+		{"regex constraint", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"regex":"[a-z]+"}`, "openai_responses", "request_parameter_dropped", "regex", false},
+		{"stop token IDs", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stop_token_ids":[42]}`, "anthropic_messages", "request_parameter_dropped", "stop_token_ids", false},
 		{"Responses stop", "/v1/responses", `{"model":"gateway-offering","input":"Hello","max_output_tokens":16,"stop":["END"]}`, "openai_chat", "request_parameter_dropped", "stop", false},
 		{"Responses top k", "/v1/responses", `{"model":"gateway-offering","input":"Hello","max_output_tokens":16,"top_k":1}`, "openai_chat", "request_parameter_dropped", "top_k", false},
 		{"stop string", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stop":"END"}`, "openai_responses", "request_parameter_dropped", "stop", false},

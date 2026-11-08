@@ -566,7 +566,11 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 					purchaseUsage.PromptTokens = max(purchaseUsage.PromptTokens, estimatedInput)
 				}
 				if !info.ResponseFacts.CompletionTokensReported {
-					purchaseUsage.CompletionTokens = max(purchaseUsage.CompletionTokens, tokenkit.Count(info.TokenizerModelName(), info.ResponseFacts.SourceGeneratedText))
+					generated := tokenkit.Count(info.TokenizerModelName(), info.ResponseFacts.SourceGeneratedText)
+					if info.ResponseFacts.SourceOutputTokens != nil {
+						generated = *info.ResponseFacts.SourceOutputTokens
+					}
+					purchaseUsage.CompletionTokens = max(purchaseUsage.CompletionTokens, generated)
 				}
 			}
 			if purchaseUsage != nil {
@@ -798,6 +802,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	usage, _ = responseUsage.(*dto.Usage)
 	attemptErr = responseErr
 	if responseErr != nil {
+		transportFailed = responseErr.GetErrorCode() == types.ErrorCodeReadResponseBodyFailed
 		apiError := responseErr.ToOpenAIError()
 		upstreamType = apiError.Type
 		upstreamCode, _ = apiError.Code.(string)

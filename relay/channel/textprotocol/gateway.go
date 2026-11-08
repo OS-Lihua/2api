@@ -79,35 +79,8 @@ func observeGatewaySafety(info *relaycommon.RelayInfo, body []byte, format types
 // delivery/presence contract of the money gateway across all four protocols.
 func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
-	}
-	meter := gatewayUsageAccumulator{format: p.format, context: c}
-	usage, err := meter.Observe(body)
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
-	}
-	if usage == nil {
-		usage = &dto.Usage{}
-	}
+	body, readErr := io.ReadAll(resp.Body)
 	facts := info.ResponseFacts
-	prompt, completion := gatewayUsageCounters(body, p.format)
-	facts.PromptTokensReported, facts.CompletionTokensReported = gatewayValidCounter(prompt), gatewayValidCounter(completion)
-	facts.UsageReported = facts.PromptTokensReported && facts.CompletionTokensReported
-	facts.IndependentUsageReported = meter.ReportedCounters()
-	normalized, err := meter.NormalizedBody(body)
-	if err != nil {
-		return usage, types.NewError(err, types.ErrorCodeBadResponseBody)
-	}
-	protocolError := observeGatewayError(info, body)
-	if resp.StatusCode != http.StatusOK || protocolError {
-		return usage, types.NewError(fmt.Errorf("upstream response failed"), types.ErrorCodeBadResponse)
-	}
-	if info.IsStream {
-		return usage, types.NewError(fmt.Errorf("upstream returned JSON for a stream request"), types.ErrorCodeBadResponse)
-	}
-	observeGatewaySafety(info, body, p.format)
 	var sourceOutput gatewayGeneratedOutput
 	root := gjson.ParseBytes(body)
 	switch p.format {
@@ -152,6 +125,33 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	}
 	facts.SourceGeneratedText = sourceOutput.String()
 	facts.SourceOutputObserved = facts.SourceGeneratedText != "" || gatewayMediaOutput(body, p.format)
+	meter := gatewayUsageAccumulator{format: p.format, context: c}
+	usage, err := meter.Observe(body)
+	if err != nil {
+		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+	}
+	if usage == nil {
+		usage = &dto.Usage{}
+	}
+	prompt, completion := gatewayUsageCounters(body, p.format)
+	facts.PromptTokensReported, facts.CompletionTokensReported = gatewayValidCounter(prompt), gatewayValidCounter(completion)
+	facts.UsageReported = facts.PromptTokensReported && facts.CompletionTokensReported
+	facts.IndependentUsageReported = meter.ReportedCounters()
+	if readErr != nil {
+		return usage, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
+	}
+	normalized, err := meter.NormalizedBody(body)
+	if err != nil {
+		return usage, types.NewError(err, types.ErrorCodeBadResponseBody)
+	}
+	protocolError := observeGatewayError(info, body)
+	if resp.StatusCode != http.StatusOK || protocolError {
+		return usage, types.NewError(fmt.Errorf("upstream response failed"), types.ErrorCodeBadResponse)
+	}
+	if info.IsStream {
+		return usage, types.NewError(fmt.Errorf("upstream returned JSON for a stream request"), types.ErrorCodeBadResponse)
+	}
+	observeGatewaySafety(info, body, p.format)
 	var response any
 	switch p.kind {
 	case protocol.OpenAIChat:
