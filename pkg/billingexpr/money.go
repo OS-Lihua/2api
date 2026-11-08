@@ -165,7 +165,7 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 		"_money_index":   exactIndex,
 	}
 	imageCount := 1
-	if entry.usedVars["image_count"] {
+	if entry.sourceVars["image_count"] {
 		if input.Request.ImageCount != nil {
 			imageCount = *input.Request.ImageCount
 		}

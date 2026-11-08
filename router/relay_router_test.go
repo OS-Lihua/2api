@@ -5855,7 +5855,7 @@ func TestMediaGatewayVLLMPCMUsesEffectiveSampleRate(t *testing.T) {
 		seconds   string
 		delivered bool
 	}{
-		{"complete", 50, "3", true}, {"wrong_mime", 50, "3", true}, {"wrong_mime_pcm_prefix", 50, "3", true}, {"wrong_mime_wav", 50, "3", true}, {"short", 50, "3", false}, {"sse", 50, "3", true}, {"cancel", 33, "2", true}, {"client", 50, "3", true}, {"header", 17, "0.75", true},
+		{"complete", 50, "3", true}, {"pcm_key", 50, "3", true}, {"wrong_mime_pcm_key", 50, "3", true}, {"wrong_mime", 50, "3", true}, {"wrong_mime_pcm_prefix", 50, "3", true}, {"wrong_mime_wav", 50, "3", true}, {"short", 50, "3", false}, {"sse", 50, "3", true}, {"cancel", 33, "2", true}, {"client", 50, "3", true}, {"header", 17, "0.75", true},
 		{"sse_format", 17, "1", true}, {"sse_changing_format", 33, "2", true}, {"sse_format_interrupt", 17, "1", true},
 		{"headers_zero", 0, "3", true}, {"headers_reported", 1000, "3", true}, {"headers_short_zero", 0, "3", false}, {"headers_short_reported", 1000, "3", false},
 	} {
@@ -5863,6 +5863,9 @@ func TestMediaGatewayVLLMPCMUsesEffectiveSampleRate(t *testing.T) {
 			stream := strings.HasPrefix(tc.mode, "sse") || tc.mode == "cancel"
 			responseFormat := "pcm"
 			payload := make([]byte, 48000)
+			if strings.HasSuffix(tc.mode, "pcm_key") {
+				copy(payload, []byte(`{"a"`))
+			}
 			if tc.mode == "wrong_mime_pcm_prefix" {
 				payload[0] = 123
 			}
@@ -6080,13 +6083,21 @@ func TestMediaGatewaySpeechJSONWithoutAudioReleasesFixedFee(t *testing.T) {
 
 func TestMediaGatewayTruncatedSpeechSafetyErrorDoesNotRetry(t *testing.T) {
 	for _, kind := range []protocol.Type{protocol.OpenAIAudioSpeech, protocol.OpenAIAudioTranscription} {
-		for _, badType := range []string{"", "123", "1e400", "1e400-valid", "sse-1000", "sse-0", "sse-mime-1000", "sse-mime-0"} {
+		for _, badType := range []string{"", "123", "1e400", "1e400-valid", "sse-1000", "sse-0", "sse-mime-1000", "sse-mime-0", "duration-1e308", "duration-1e400"} {
+			if strings.HasPrefix(badType, "duration-") && kind != protocol.OpenAIAudioTranscription {
+				continue
+			}
 			if strings.HasPrefix(badType, "sse-") && kind != protocol.OpenAIAudioSpeech {
 				continue
 			}
 			t.Run(fmt.Sprintf("%s/badType=%s", kind, badType), func(t *testing.T) {
 				var secondCalls atomic.Int64
 				fixture := newMediaGatewayFixture(t, kind, func(w http.ResponseWriter, r *http.Request) {
+					if strings.HasPrefix(badType, "duration-") {
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = fmt.Fprintf(w, `{"error":{"code":"content_filter"},"usage":{"input_tokens":7,"output_tokens":0,"seconds":%s}}`, strings.TrimPrefix(badType, "duration-"))
+						return
+					}
 					if strings.HasPrefix(badType, "sse-") {
 						output := 1000
 						if strings.HasSuffix(badType, "-0") {
@@ -6128,6 +6139,10 @@ func TestMediaGatewayTruncatedSpeechSafetyErrorDoesNotRetry(t *testing.T) {
 					fixture.fake.Advance(time.Second)
 					require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("audio",ao)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
 				}
+				if strings.HasPrefix(badType, "duration-") {
+					fixture.fake.Advance(time.Second)
+					require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("known",p)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+				}
 				var response *httptest.ResponseRecorder
 				if kind == protocol.OpenAIAudioTranscription {
 					request := mediaMultipartRequest(t, "/v1/audio/transcriptions", map[string]string{"model": "gateway-alias"}, "file", mediaWAV(t, 8000, 16000, make([]byte, 16000)))
@@ -6147,6 +6162,31 @@ func TestMediaGatewayTruncatedSpeechSafetyErrorDoesNotRetry(t *testing.T) {
 				require.NoError(t, err)
 				require.EqualValues(t, 1, total)
 				assert.Equal(t, "content_safety", attempts[0].ErrorClass)
+				if strings.HasPrefix(badType, "duration-") {
+					assert.EqualValues(t, 7, attempts[0].Usage.PromptTokens)
+					assert.EqualValues(t, 7000, attempts[0].Cost.Nanos)
+					assert.Contains(t, attempts[0].RouteDiagnostics, "quota_saturation")
+					record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+					require.NoError(t, err)
+					assert.Zero(t, record.Receivable.Nanos)
+					assert.False(t, record.SalePending)
+					wallet, err := model.GetUserWallet(fixture.user.Id)
+					require.NoError(t, err)
+					assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
+					var payable model.Wallet
+					require.NoError(t, model.DB.Where("account_type = ? AND owner_id = ?", model.ProviderPayableAccount(fixture.channel.ProviderID, "USD").Type, fixture.channel.ProviderID).First(&payable).Error)
+					assert.EqualValues(t, 7000, payable.Balance.Nanos)
+					for range 2 {
+						_, err := model.RecoverGatewaySettlements(t.Context(), 100)
+						require.NoError(t, err)
+					}
+					after, err := model.GetUserWallet(fixture.user.Id)
+					require.NoError(t, err)
+					assert.Equal(t, wallet.Balance, after.Balance)
+					var afterPayable model.Wallet
+					require.NoError(t, model.DB.First(&afterPayable, payable.Id).Error)
+					assert.Equal(t, payable.Balance, afterPayable.Balance)
+				}
 				if strings.HasPrefix(badType, "sse-") {
 					output := int64(1000)
 					if strings.HasSuffix(badType, "-0") {

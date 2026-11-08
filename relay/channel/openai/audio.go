@@ -94,10 +94,6 @@ func mediaJSONObjectPrefix(body []byte) bool {
 	if len(payload) == 0 || payload[0] != '{' {
 		return false
 	}
-	var key string
-	if common.DecodeJson(bytes.NewReader(payload[1:]), &key) == nil {
-		return true
-	}
 	if !utf8.Valid(payload) {
 		return false
 	}

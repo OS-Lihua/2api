@@ -340,6 +340,18 @@ func TestMoneyExprActualMediaQuantitiesKeepRequestProbesFrozen(t *testing.T) {
 		_, _, err := billingexpr.RunMoneyExpr(`tier("image", fixed(0.04)) * image_count`, billingexpr.MoneyInput{ImageCount: &count}, "USD")
 		require.Error(t, err)
 	}
+	const foldedCondition = `(9223372036854775807 + 1 == -9223372036854775807 - 1 || image_count > 1) ? tier("bulk",fixed(0.01)) : tier("single",fixed(0.02))`
+	for _, actual := range []int{3, 1, 0} {
+		amount, trace, err := billingexpr.RunMoneyExpr(foldedCondition, billingexpr.MoneyInput{ImageCount: &actual}, "USD")
+		require.NoError(t, err)
+		want := "0.02 USD"
+		if actual > 1 {
+			want = "0.01 USD"
+		}
+		assert.Equal(t, want, amount.String())
+		require.NotNil(t, trace.ImageCount)
+		assert.Equal(t, actual, *trace.ImageCount)
+	}
 	amount, _, err := billingexpr.RunMoneyExpr(`tier("audio", p * 2 + ai * 3 + ao * 15)`, billingexpr.MoneyInput{Tokens: map[string]int64{"p": 100, "ai": 1000, "ao": 2000}}, "USD")
 	require.NoError(t, err)
 	assert.Equal(t, "0.0332 USD", amount.String())
