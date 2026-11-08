@@ -128,6 +128,7 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 		err := common.Unmarshal([]byte(data), &tencentResponse)
 		if err != nil {
 			if managed {
+				helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource([]byte(data), "Choices", "Delta.Content"))
 				return usage, types.NewError(fmt.Errorf("invalid Tencent stream event"), types.ErrorCodeBadResponseBody)
 			}
 			common.SysLog(common.LogText("error unmarshalling stream response: %s", err.Error()))
@@ -162,16 +163,9 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 		info.ResponseFacts.RecordNativeUsage(usage, info.ResponseFacts.UnterminatedStreamData, "Usage.PromptTokens", "Usage.CompletionTokens")
 		partial := relaycommon.SanitizeNativeUsage(info.ResponseFacts.UnterminatedStreamData, "Usage")
 		info.ResponseFacts.UnterminatedStreamData = nil
-		var reported TencentChatResponse
-		if common.Unmarshal(partial, &reported) == nil {
-			prompt, completion := relaycommon.NativeUsagePresence(partial, "Usage.PromptTokens", "Usage.CompletionTokens", "Usage.TotalTokens")
-			counts := dto.Usage{PromptTokens: reported.Usage.PromptTokens, CompletionTokens: reported.Usage.CompletionTokens}
-			info.ResponseFacts.RecordUsage(usage, &counts, prompt, completion)
-			for _, choice := range streamResponseTencent2OpenAI(&reported).Choices {
-				text := choice.Delta.GetContentString() + choice.Delta.GetReasoningContent()
-				info.ResponseFacts.SourceGeneratedText += text
-				info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || text != ""
-			}
+		var complete common.RawMessage
+		if common.Unmarshal(partial, &complete) == nil {
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(partial, "Choices", "Delta.Content"))
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -194,6 +188,9 @@ func tencentHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Resp
 		knownUsage = &dto.Usage{}
 		info.ResponseFacts.RecordNativeUsage(knownUsage, responseBody, "Response.Usage.PromptTokens", "Response.Usage.CompletionTokens")
 		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "Response.Usage")
+	}
+	if info.ResponseFacts != nil {
+		info.ResponseFacts.RecordNativeTextSource(responseBody, "Response.Choices", "Message.Content", info.TokenizerModelName())
 	}
 	err := common.Unmarshal(responseBody, &tencentSb)
 	if err != nil {

@@ -4424,6 +4424,25 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 		{name: "Baidu malformed cache JSON preserves independent counters", provider: constant.ChannelTypeBaidu, key: "cache-json-malformed-baidu|test-secret", body: `{"result":{},"usage":{"prompt_tokens_details":{"cached_tokens":1000}}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1000000, purchaseExpression: `tier("cache",cr*1)`},
 		{name: "Zhipu malformed cache JSON preserves independent counters", provider: constant.ChannelTypeZhipu, key: "test.secret", body: `{"success":{},"data":{"usage":{"prompt_tokens_details":{"cached_tokens":1000}}}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1000000, purchaseExpression: `tier("cache",cr*1)`},
 		{name: "Zhipu malformed cache stream preserves independent counters", provider: constant.ChannelTypeZhipu, key: "test.secret", stream: true, body: "meta:{\"task_status\":{},\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":1000}}}\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1000000, purchaseExpression: `tier("cache",cr*1)`},
+		{name: "independent source Cohere malformed terminal", provider: constant.ChannelTypeCohere, body: `{"text":"Hello","finish_reason":{}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
+		{name: "independent source Ollama malformed metadata", provider: constant.ChannelTypeOllama, body: `{"message":{"content":"Hello"},"done":true,"done_reason":{}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
+		{name: "independent source Dify malformed conversation", provider: constant.ChannelTypeDify, body: `{"conversation_id":{},"answer":"Hello"}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 15000},
+		{name: "independent source Baidu malformed id", provider: constant.ChannelTypeBaidu, key: "source-json-baidu|test-secret", body: `{"id":{},"result":"Hello"}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
+		{name: "independent source TC3 malformed terminal", provider: constant.ChannelTypeTencent, key: "1|test-id|test-secret", body: `{"Response":{"Choices":[{"Message":{"Role":"assistant","Content":"Hello"},"FinishReason":{}}]}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
+		{name: "independent source Zhipu malformed status", provider: constant.ChannelTypeZhipu, key: "test.secret", body: `{"success":{},"data":{"choices":[{"role":"assistant","content":"Hello"}]}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
+		{name: "independent stream source Cohere malformed metadata", provider: constant.ChannelTypeCohere, stream: true, body: "{\"event_type\":\"text-generation\",\"is_finished\":{},\"text\":\"Hello\"}\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
+		{name: "independent stream source Dify malformed metadata", provider: constant.ChannelTypeDify, stream: true, body: "data: {\"event\":\"message\",\"status\":{},\"answer\":\"Hello\"}\n\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 15000},
+		{name: "independent stream source Baidu malformed metadata", provider: constant.ChannelTypeBaidu, key: "source-stream-baidu|test-secret", stream: true, body: "data: {\"id\":{},\"result\":\"Hello\",\"is_end\":true}\n\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
+		{name: "independent stream source TC3 malformed metadata", provider: constant.ChannelTypeTencent, key: "1|test-id|test-secret", stream: true, body: "data: {\"Choices\":[{\"Delta\":{\"Content\":\"Hello\"},\"FinishReason\":{}}]}\n\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
+		{name: "independent stream source Ollama malformed metadata", provider: constant.ChannelTypeOllama, stream: true, body: "{\"model\":{},\"message\":{\"content\":\"Hello\"},\"done\":false}\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
+		{name: "independent unterminated source Dify malformed metadata", provider: constant.ChannelTypeDify, stream: true, body: "data: {\"event\":\"message\",\"status\":{},\"answer\":\"Hello\"}", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 15000},
+		{name: "independent unterminated source Baidu malformed metadata", provider: constant.ChannelTypeBaidu, key: "source-unterminated-baidu|test-secret", stream: true, body: "data: {\"id\":{},\"result\":\"Hello\",\"is_end\":true}", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
+		{name: "independent unterminated source TC3 malformed metadata", provider: constant.ChannelTypeTencent, key: "1|test-id|test-secret", stream: true, body: "data: {\"Choices\":[{\"Delta\":{\"Content\":\"Hello\"},\"FinishReason\":{}}]}", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
+		{name: "independent source Ollama reasoning and tools", provider: constant.ChannelTypeOllama, body: `{"model":{},"message":{"content":"Hello","thinking":"World","tool_calls":[{"function":{"name":"f","arguments":{}}}]},"done":true}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 8000},
+		{name: "independent source Ollama NDJSON tools keep all fragments", provider: constant.ChannelTypeOllama, body: "{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"f\",\"arguments\":{}}}]},\"done\":false}\n{\"model\":{},\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"g\",\"arguments\":{}}}]},\"done\":true}\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 8000},
+		{name: "independent stream source Cohere retains prior fragments", provider: constant.ChannelTypeCohere, stream: true, body: "{\"event_type\":\"text-generation\",\"text\":\"Hello\"}\n{\"event_type\":\"text-generation\",\"is_finished\":{},\"text\":\"World\"}\n", status: "partial", source: "estimated", prompt: 9, completion: 1, charge: 19800, cost: 13000},
+		{name: "independent stream source Ollama tools preserve structure", provider: constant.ChannelTypeOllama, stream: true, body: "{\"model\":{},\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"f\",\"arguments\":{}}}]},\"done\":false}\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 18000},
+		{name: "independent stream source Ollama tools keep prior indices", provider: constant.ChannelTypeOllama, stream: true, body: "{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"Hello\",\"arguments\":{}}}]},\"done\":false}\n{\"model\":{},\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"g\",\"arguments\":{}}}]},\"done\":false}\n", status: "partial", source: "estimated", prompt: 9, completion: 9, charge: 48600, purchaseExpression: `tier("output",c*2)`, cost: 36000},
 		{name: "Cohere failed JSON is not successful output", provider: constant.ChannelTypeCohere, body: `{"text":"Hello","finish_reason":"ERROR","meta":{"billed_units":{"input_tokens":10,"output_tokens":5}}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 20000},
 		{name: "Cohere failed JSON keeps source estimate", provider: constant.ChannelTypeCohere, body: `{"text":"Hello","finish_reason":"ERROR"}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
 		{name: "Ollama pretty JSON remains valid", provider: constant.ChannelTypeOllama, body: "{\n\"message\":{\"content\":\"Hello\"},\n\"done\":true,\n\"prompt_eval_count\":1000,\n\"eval_count\":100\n}", source: "upstream", prompt: 1000, completion: 100, charge: 2160000, cost: 1200000},
@@ -5055,48 +5074,85 @@ func (body *gatewayCancelOnReadBody) Read(buffer []byte) (int, error) {
 }
 
 func TestTextGatewayNativeStreamCancellationPreservesPurchase(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	t.Cleanup(cancel)
-	var calls atomic.Int32
-	fixture := newTextGatewayFixtureWithNativeLosses(t, func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data:Hello\n")
-	})
-	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeZhipu, "key": "test.secret"}).Error)
-	require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("output", c * 2)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
-	client := service.GetHttpClient()
-	original := client.Transport
-	t.Cleanup(func() { client.Transport = original })
-	client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
-		response, err := original.RoundTrip(request)
-		if err == nil {
-			response.Body = &gatewayCancelOnReadBody{ReadCloser: response.Body, cancel: cancel}
+	for _, provider := range []struct {
+		name, body, key string
+		kind            int
+	}{{"Zhipu", "data:Hello\n", "test.secret", constant.ChannelTypeZhipu}, {"PaLM", `{"candidates":[{"content":"Hello"}]}`, "", constant.ChannelTypePaLM}} {
+		t.Run(provider.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			t.Cleanup(cancel)
+			var calls atomic.Int32
+			fixture := newTextGatewayFixtureWithNativeLosses(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, provider.body)
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": provider.kind, "key": provider.key}).Error)
+			require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("output", c * 2)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+			client := service.GetHttpClient()
+			original := client.Transport
+			t.Cleanup(func() { client.Transport = original })
+			client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
+				response, err := original.RoundTrip(request)
+				if err == nil {
+					response.Body = &gatewayCancelOnReadBody{ReadCloser: response.Body, cancel: cancel}
+				}
+				return response, err
+			})
+			body := `{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`
+			if provider.kind == constant.ChannelTypePaLM {
+				body = `{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}]}`
+			}
+			request := httptest.NewRequest(http.MethodPost, "/v1/"+"chat/"+"completions", strings.NewReader(body)).WithContext(ctx)
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			fixture.engine.ServeHTTP(response, request)
+			require.ErrorIs(t, ctx.Err(), context.Canceled)
+			assert.EqualValues(t, 1, calls.Load())
+			assert.NotContains(t, response.Body.String(), "Hello")
+			requests := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests", "")
+			require.True(t, requests.Success, requests.Message)
+			items := requests.Data["items"].([]any)
+			require.Len(t, items, 1)
+			record := items[0].(map[string]any)
+			assert.Equal(t, map[string]any{"nanos": "0", "currency": "USD"}, record["receivable"])
+			attempts := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests/"+record["id"].(string)+"/attempts", "")
+			require.True(t, attempts.Success, attempts.Message)
+			items = attempts.Data["items"].([]any)
+			require.Len(t, items, 1)
+			attempt := items[0].(map[string]any)
+			assert.Equal(t, "estimated", attempt["usage_source"])
+			assert.EqualValues(t, 1, attempt["usage"].(map[string]any)["completion_tokens"])
+			assert.Equal(t, map[string]any{"nanos": "2000", "currency": "USD"}, attempt["cost"])
+		})
+	}
+}
+
+func TestTextGatewayNativeZeroLimitReturnsLossReason(t *testing.T) {
+	for _, field := range []string{"max_tokens", "max_completion_tokens"} {
+		for _, accepted := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/accepted=%t", field, accepted), func(t *testing.T) {
+				calls := 0
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { calls++ })
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeDify).Error)
+				if accepted {
+					fixture.offering.AcceptedConversionLosses = []string{"request_parameter_dropped"}
+					require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+				}
+				body := fmt.Sprintf(`{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],%q:0}`, field)
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", body)
+				assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+				assert.Contains(t, response.Body.String(), "unsupported_parameter")
+				assert.Contains(t, response.Body.String(), field)
+				assert.Contains(t, response.Body.String(), "The native request did not retain this request parameter")
+				assert.Zero(t, calls)
+				_, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+				require.NoError(t, err)
+				assert.Zero(t, total)
+			})
 		}
-		return response, err
-	})
-	request := httptest.NewRequest(http.MethodPost, "/v1/"+"chat/"+"completions", strings.NewReader(`{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)).WithContext(ctx)
-	request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
-	request.Header.Set("Content-Type", "application/json")
-	response := httptest.NewRecorder()
-	fixture.engine.ServeHTTP(response, request)
-	require.ErrorIs(t, ctx.Err(), context.Canceled)
-	assert.EqualValues(t, 1, calls.Load())
-	assert.NotContains(t, response.Body.String(), "Hello")
-	requests := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests", "")
-	require.True(t, requests.Success, requests.Message)
-	items := requests.Data["items"].([]any)
-	require.Len(t, items, 1)
-	record := items[0].(map[string]any)
-	assert.Equal(t, map[string]any{"nanos": "0", "currency": "USD"}, record["receivable"])
-	attempts := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests/"+record["id"].(string)+"/attempts", "")
-	require.True(t, attempts.Success, attempts.Message)
-	items = attempts.Data["items"].([]any)
-	require.Len(t, items, 1)
-	attempt := items[0].(map[string]any)
-	assert.Equal(t, "estimated", attempt["usage_source"])
-	assert.EqualValues(t, 1, attempt["usage"].(map[string]any)["completion_tokens"])
-	assert.Equal(t, map[string]any{"nanos": "2000", "currency": "USD"}, attempt["cost"])
+	}
 }
 
 func TestTextGatewayNativeJSONCancellationPreservesPurchase(t *testing.T) {

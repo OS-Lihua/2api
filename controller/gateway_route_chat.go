@@ -166,7 +166,7 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 		effectiveOutputLimit = effective.MaxTokens
 	}
 	if requestedOutputLimit != nil && *requestedOutputLimit == 0 && (effectiveOutputLimit == nil || *effectiveOutputLimit != 0) {
-		return nil, service.ErrGatewayConversion
+		return nil, &service.GatewayConversionError{Diagnostics: info.ConversionDiagnostics()}
 	}
 	common.SetContextKey(candidate, constant.ContextKeyOriginalModel, info.TokenizerModel)
 	tokens, err := service.CountRequestToken(candidate, effective.GetTokenCountMeta(), &counterInfo, service.GatewayRequestTokenOptions(candidate))

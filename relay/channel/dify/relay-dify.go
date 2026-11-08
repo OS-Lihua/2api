@@ -263,6 +263,7 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		}
 		var difyResponse DifyChunkChatCompletionResponse
 		if err := common.Unmarshal([]byte(data), &difyResponse); err != nil {
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource([]byte(data), "", "answer"))
 			if info.ResponseFacts != nil {
 				err = errors.New("invalid upstream stream data")
 			}
@@ -329,13 +330,11 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		partial := relaycommon.SanitizeNativeUsage(info.ResponseFacts.UnterminatedStreamData, "metadata.usage")
 		_ = info.ResponseFacts.RecordChatUsage(usage, partial, "metadata.usage")
 		info.ResponseFacts.UnterminatedStreamData = nil
-		var reported DifyChunkChatCompletionResponse
-		if common.Unmarshal(partial, &reported) == nil {
-			_ = info.ResponseFacts.RecordChatUsage(usage, partial, "metadata.usage")
-			if (reported.Event == "message" || reported.Event == "agent_message") && reported.Answer != "" {
-				info.ResponseFacts.SourceGeneratedText += reported.Answer
-				info.ResponseFacts.SourceOutputObserved = true
-			}
+		var event struct {
+			Event string `json:"event"`
+		}
+		if common.Unmarshal(partial, &event) == nil && (event.Event == "message" || event.Event == "agent_message") {
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(partial, "", "answer"))
 		}
 	}
 	if info.ResponseFacts == nil || info.ResponseFacts.OnBusinessOutput == nil || info.ResponseFacts.BusinessOutput && info.StreamStatus.CompletedNormally() {
@@ -371,6 +370,9 @@ func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 		info.ResponseFacts.RecordNativeUsage(knownUsage, responseBody, "metadata.usage.prompt_tokens", "metadata.usage.completion_tokens")
 		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "metadata.usage")
 		_ = info.ResponseFacts.RecordChatUsage(knownUsage, responseBody, "metadata.usage")
+	}
+	if info.ResponseFacts != nil {
+		info.ResponseFacts.RecordNativeTextSource(responseBody, "", "answer", info.TokenizerModelName())
 	}
 	err := common.Unmarshal(responseBody, &difyResponse)
 	if err != nil {

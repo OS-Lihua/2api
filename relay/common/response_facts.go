@@ -207,6 +207,33 @@ func (facts *ResponseFacts) RecordNativeUsage(usage *dto.Usage, body []byte, pro
 	facts.RecordUsage(usage, &reported, prompt, completion)
 }
 
+// NativeTextSource extracts independently valid text without decoding unrelated
+// native fields. Each candidate remains a separate tokenizer input.
+func NativeTextSource(body []byte, choicesPath, textPath string) *dto.OpenAITextResponse {
+	choices := []gjson.Result{gjson.ParseBytes(body)}
+	if choicesPath != "" {
+		choices = gjson.GetBytes(body, choicesPath).Array()
+	}
+	var source dto.OpenAITextResponse
+	for i, choice := range choices {
+		raw := choice.Get(textPath)
+		var text string
+		if raw.Type != gjson.String || common.UnmarshalJsonStr(raw.Raw, &text) != nil {
+			continue
+		}
+		source.Choices = append(source.Choices, dto.OpenAITextResponseChoice{Index: i, Message: dto.Message{Role: "assistant", Content: text}})
+	}
+	return &source
+}
+
+// RecordNativeTextSource retains a native JSON source snapshot for procurement.
+func (facts *ResponseFacts) RecordNativeTextSource(body []byte, choicesPath, textPath, model string) {
+	source := NativeTextSource(body, choicesPath, textPath)
+	if len(source.Choices) > 0 {
+		facts.RecordChatSource(source, model)
+	}
+}
+
 // RecordChatUsage merges a native usage object with Chat counter names.
 // Omitted detail fields retain their preceding snapshot; explicit zeros reset it.
 func (facts *ResponseFacts) RecordChatUsage(usage *dto.Usage, body []byte, path string) error {

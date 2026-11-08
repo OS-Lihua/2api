@@ -128,6 +128,7 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		}
 		var cohereResp CohereResponse
 		if err := common.Unmarshal(body, &cohereResp); err != nil {
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(body, "", "text"))
 			if info.ResponseFacts == nil {
 				continue
 			}
@@ -186,11 +187,10 @@ func cohereHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 		info.ResponseFacts.RecordNativeUsage(&usage, responseBody, "meta.billed_units.input_tokens", "meta.billed_units.output_tokens")
 	}
 	var cohereResp CohereResponseResult
-	err := common.Unmarshal(responseBody, &cohereResp)
-	if err == nil && info.ResponseFacts != nil {
-		info.ResponseFacts.SourceGeneratedText = cohereResp.Text
-		info.ResponseFacts.SourceOutputObserved = cohereResp.Text != ""
+	if info.ResponseFacts != nil {
+		info.ResponseFacts.RecordNativeTextSource(responseBody, "", "text", info.TokenizerModelName())
 	}
+	err := common.Unmarshal(responseBody, &cohereResp)
 	if readErr != nil {
 		return &usage, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
 	}

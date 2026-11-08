@@ -142,6 +142,7 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 		}
 		var baiduResponse BaiduChatStreamResponse
 		if err := common.Unmarshal([]byte(data), &baiduResponse); err != nil {
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource([]byte(data), "", "result"))
 			common.SysLog(common.LogText("error unmarshalling stream response: %s", err.Error()))
 			sr.Error(err)
 			return
@@ -178,13 +179,9 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 		partial := relaycommon.SanitizeNativeUsage(info.ResponseFacts.UnterminatedStreamData, "usage")
 		_ = info.ResponseFacts.RecordChatUsage(usage, partial, "usage")
 		info.ResponseFacts.UnterminatedStreamData = nil
-		var reported BaiduChatStreamResponse
-		if common.Unmarshal(partial, &reported) == nil {
-			_ = info.ResponseFacts.RecordChatUsage(usage, partial, "usage")
-			if reported.Result != "" {
-				info.ResponseFacts.SourceGeneratedText += reported.Result
-				info.ResponseFacts.SourceOutputObserved = true
-			}
+		var complete common.RawMessage
+		if common.Unmarshal(partial, &complete) == nil {
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(partial, "", "result"))
 		}
 	}
 	service.CloseResponseBodyGracefully(resp)
@@ -202,6 +199,9 @@ func baiduHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respon
 		info.ResponseFacts.RecordNativeUsage(knownUsage, responseBody, "usage.prompt_tokens", "usage.completion_tokens")
 		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "usage")
 		_ = info.ResponseFacts.RecordChatUsage(knownUsage, responseBody, "usage")
+	}
+	if info.ResponseFacts != nil {
+		info.ResponseFacts.RecordNativeTextSource(responseBody, "", "result", info.TokenizerModelName())
 	}
 	err := common.Unmarshal(responseBody, &baiduResponse)
 	if err != nil {

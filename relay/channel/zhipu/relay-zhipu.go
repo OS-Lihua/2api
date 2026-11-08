@@ -220,6 +220,9 @@ func zhipuHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respon
 		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "data.usage")
 		_ = info.ResponseFacts.RecordChatUsage(knownUsage, responseBody, "data.usage")
 	}
+	if info.ResponseFacts != nil {
+		info.ResponseFacts.RecordNativeTextSource(responseBody, "data.choices", "content", info.TokenizerModelName())
+	}
 	err := common.Unmarshal(responseBody, &zhipuResponse)
 	if err != nil {
 		if readErr != nil {

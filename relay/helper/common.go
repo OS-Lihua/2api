@@ -326,6 +326,34 @@ func WriteGatewayJSONResponse(c *gin.Context, resp *http.Response, facts *relayc
 	return nil
 }
 
+// RecordNativeStreamSource keeps a received generation chunk as procurement
+// evidence when unrelated native fields prevent canonical delivery.
+func RecordNativeStreamSource(c *gin.Context, info *relaycommon.RelayInfo, source *dto.OpenAITextResponse) {
+	if info.ResponseFacts == nil || source == nil || len(source.Choices) == 0 {
+		return
+	}
+	type sourceChoice struct {
+		Index int         `json:"index"`
+		Delta dto.Message `json:"delta"`
+	}
+	frame := struct {
+		Choices []sourceChoice `json:"choices"`
+	}{}
+	for _, choice := range source.Choices {
+		frame.Choices = append(frame.Choices, sourceChoice{Index: choice.Index, Delta: choice.Message})
+	}
+	body, err := common.Marshal(frame)
+	if err != nil {
+		return
+	}
+	text := relaycommon.ChatStreamBusinessText(body)
+	info.ResponseFacts.SourceGeneratedText += text
+	info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || text != ""
+	if recorder, ok := c.Writer.(interface{ RecordChatStreamSource([]byte) }); ok {
+		recorder.RecordChatStreamSource(body)
+	}
+}
+
 func StringData(c *gin.Context, str string) error {
 	if c == nil || c.Writer == nil {
 		return errors.New("context or writer is nil")

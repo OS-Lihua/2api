@@ -61,6 +61,14 @@ func (w *nativeResponseWriter) Flush()                                {}
 func (w *nativeResponseWriter) FlushError() error                     { return w.err }
 func (w *nativeResponseWriter) WriteString(value string) (int, error) { return w.Write([]byte(value)) }
 
+// RecordChatStreamSource shares the capture state with canonical writes without
+// forwarding a frame or confirming downstream delivery.
+func (w *nativeResponseWriter) RecordChatStreamSource(body []byte) {
+	w.source.text.WriteString(gatewayStreamBusinessText(body, types.RelayFormatOpenAI))
+	w.source.ObserveChat(body)
+	w.facts.SourceOutputObserved = w.facts.SourceOutputObserved || w.source.String() != "" || len(w.source.chatTools) > 0 || gatewayMediaOutput(body, types.RelayFormatOpenAI)
+}
+
 func (w *nativeResponseWriter) Write(body []byte) (int, error) {
 	if w.err != nil {
 		return 0, w.err
@@ -87,9 +95,7 @@ func (w *nativeResponseWriter) Write(body []byte) (int, error) {
 			continue
 		}
 		data := []byte(event.Data)
-		w.source.text.WriteString(gatewayStreamBusinessText(data, types.RelayFormatOpenAI))
-		w.source.ObserveChat(data)
-		w.facts.SourceOutputObserved = w.facts.SourceOutputObserved || w.source.String() != "" || len(w.source.chatTools) > 0 || gatewayMediaOutput(data, types.RelayFormatOpenAI)
+		w.RecordChatStreamSource(data)
 		for _, name := range []string{"id", "model", "object", "system_fingerprint", "service_tier"} {
 			if value := gjson.GetBytes(data, name); value.Type == gjson.String && value.String() != "" {
 				w.metadata[name] = value.String()

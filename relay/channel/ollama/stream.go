@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/tidwall/gjson"
 
 	"github.com/gin-gonic/gin"
 	"github.com/samber/lo"
@@ -214,6 +215,7 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			line = string(relaycommon.SanitizeNativeUsage([]byte(line), ""))
 		}
 		if err := common.Unmarshal([]byte(line), &chunk); err != nil {
+			helper.RecordNativeStreamSource(c, info, ollamaSourceResponse([]string{line}, toolCallIndex))
 			info.StreamStatus.MarkFailed("invalid_response", "upstream_error", 0)
 			logger.LogError(c, "ollama stream JSON decode failed")
 			return usage, types.NewOpenAIError(fmt.Errorf("invalid Ollama response"), types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
@@ -294,6 +296,41 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	return usage, nil
 }
 
+// ollamaSourceResponse extracts complete generation fields independently from
+// metadata and terminal decoding, retaining earlier NDJSON fragments.
+func ollamaSourceResponse(lines []string, index int) *dto.OpenAITextResponse {
+	var content, reasoning strings.Builder
+	var calls []dto.ToolCallResponse
+	for _, line := range lines {
+		var text string
+		if common.UnmarshalJsonStr(gjson.Get(line, "message.content").Raw, &text) != nil || text == "" {
+			_ = common.UnmarshalJsonStr(gjson.Get(line, "response").Raw, &text)
+		}
+		content.WriteString(text)
+		var thought string
+		if common.UnmarshalJsonStr(gjson.Get(line, "message.thinking").Raw, &thought) == nil {
+			reasoning.WriteString(thought)
+		}
+		for _, raw := range gjson.Get(line, "message.tool_calls").Array() {
+			var call OllamaToolCall
+			if common.UnmarshalJsonStr(raw.Raw, &call) != nil {
+				continue
+			}
+			var converted []dto.ToolCallResponse
+			converted, index = ollamaToolCallsToOpenAI([]OllamaToolCall{call}, index, true)
+			calls = append(calls, converted...)
+		}
+	}
+	message := dto.Message{Role: "assistant", Content: content.String()}
+	if reasoning.Len() > 0 {
+		message.ReasoningContent = common.GetPointer(reasoning.String())
+	}
+	if len(calls) > 0 {
+		message.ToolCalls, _ = common.Marshal(calls)
+	}
+	return &dto.OpenAITextResponse{Choices: []dto.OpenAITextResponseChoice{{Message: message}}}
+}
+
 // non-stream handler for chat/generate
 func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	body, readErr := io.ReadAll(resp.Body)
@@ -308,6 +345,9 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	var complete common.RawMessage
 	if common.Unmarshal(body, &complete) == nil {
 		lines = []string{raw}
+	}
+	if info.ResponseFacts != nil {
+		info.ResponseFacts.RecordChatSource(ollamaSourceResponse(lines, 0), info.TokenizerModelName())
 	}
 	var (
 		aggContent       strings.Builder
@@ -470,7 +510,7 @@ func ollamaChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		}},
 		Usage: *usage,
 	}
-	if info.ResponseFacts != nil {
+	if info.ResponseFacts != nil && parsingErr == nil {
 		info.ResponseFacts.RecordChatSource(&full, info.TokenizerModelName())
 	}
 	if readErr != nil {
