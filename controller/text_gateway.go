@@ -194,6 +194,10 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			run.fail(c, http.StatusBadRequest, "unsupported_parameter", "No Channel supports the requested capabilities")
 			return
 		}
+		if errors.Is(err, service.ErrGatewayPriceUnavailable) {
+			run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
+			return
+		}
 		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
 		return
 	}

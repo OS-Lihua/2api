@@ -74,6 +74,7 @@ type GatewayRouteInput struct {
 var ErrGatewayCapability = errors.New("no Channel supports the requested capabilities")
 var ErrGatewayConversion = errors.New("no Channel supports the requested conversion")
 var ErrGatewayUnavailable = errors.New("no Channel is available")
+var ErrGatewayPriceUnavailable = errors.New("Channel price is unavailable")
 
 // GatewayRouteRandomSource is a context key for an optional bounded random
 // source. Production uses math/rand/v2; HTTP tests can supply exact draws.
@@ -380,6 +381,9 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 	}
 	if lastStage == 5 {
 		return nil, ErrGatewayConversion
+	}
+	if lastStage == 7 && counts["price_unavailable"] > 0 && counts["profit"] == 0 {
+		return nil, ErrGatewayPriceUnavailable
 	}
 	return nil, ErrGatewayUnavailable
 }

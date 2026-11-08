@@ -5552,9 +5552,9 @@ func TestTextGatewayAuthorizationCapabilityAndScopeFilters(t *testing.T) {
 		{name: "Channel disabled", change: func(t *testing.T, f *textGatewayFixture) {
 			require.NoError(t, model.DB.Model(f.channel).Update("status", model.ChannelDisabled).Error)
 		}, status: 503, code: "channel_unavailable"},
-		{name: "different protocol", change: func(t *testing.T, f *textGatewayFixture) {
-			require.NoError(t, model.DB.Model(f.channel).Update("protocol", "openai_responses").Error)
-		}, status: 503, code: "channel_unavailable"},
+		{name: "non-text protocol cannot serve Chat", change: func(t *testing.T, f *textGatewayFixture) {
+			require.NoError(t, model.DB.Model(f.channel).Update("protocol", "openai_embeddings").Error)
+		}, status: 400, code: "unsupported_parameter"},
 		{name: "disabled token", change: func(t *testing.T, f *textGatewayFixture) {
 			require.NoError(t, model.DB.Model(f.token).Update("status", common.TokenStatusDisabled).Error)
 		}, status: 401},
@@ -5796,6 +5796,8 @@ func TestTextGatewayMetadataPrefixIsNotDeliveredBusinessOutput(t *testing.T) {
 			addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
 				t.Error("downstream write failures must not dispatch another Provider")
 			})
+			fixture.offering.RouteMethod = "weight"
+			require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
 			recorder := httptest.NewRecorder()
 			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(fmt.Sprintf(`{"model":"gateway-offering","stream":%t,"messages":[{"role":"user","content":"Hello"}],"max_tokens":32}`, test.stream)))
 			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
