@@ -300,8 +300,16 @@ func ObjectData(c *gin.Context, object any) error {
 // SendChatChunk records only complete business frames accepted downstream.
 // A flush failure after the frame is distinct from a partial frame write.
 func SendChatChunk(c *gin.Context, info *relaycommon.RelayInfo, response *dto.ChatCompletionsStreamResponse) error {
-	err := ObjectData(c, response)
 	facts := info.ResponseFacts
+	if facts != nil && facts.OnBusinessOutput != nil {
+		for _, choice := range response.Choices {
+			if choice.FinishReason != nil && *choice.FinishReason == constant.FinishReasonContentFilter {
+				info.PerformanceBusinessRejection = true
+				info.StreamStatus.MarkFailed("content_filter", "", 0)
+			}
+		}
+	}
+	err := ObjectData(c, response)
 	if facts == nil {
 		return err
 	}
@@ -321,6 +329,9 @@ func SendChatChunk(c *gin.Context, info *relaycommon.RelayInfo, response *dto.Ch
 			facts.GeneratedText += text
 			facts.MarkBusinessOutput()
 		}
+	}
+	if err == nil && facts.OnBusinessOutput != nil && info.PerformanceBusinessRejection {
+		return errors.New("upstream content safety rejection")
 	}
 	return err
 }
@@ -351,6 +362,9 @@ func WriteChatResponse(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	var output strings.Builder
 	business := false
 	for _, choice := range response.Choices {
+		if facts.OnBusinessOutput != nil && choice.FinishReason == constant.FinishReasonContentFilter {
+			info.PerformanceBusinessRejection = true
+		}
 		output.WriteString(choice.Message.StringContent())
 		output.WriteString(choice.Message.GetReasoningContent())
 		for _, call := range choice.Message.ParseToolCalls() {
@@ -381,6 +395,13 @@ func WriteChatResponse(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 }
 
 func Done(c *gin.Context) {
+	if value, ok := common.GetContextKey(c, constant.ContextKeyResponseFacts); ok {
+		if facts, _ := value.(*relaycommon.ResponseFacts); facts != nil && facts.OnBusinessOutput != nil {
+			if !facts.BusinessOutput || facts.CanFinishStream != nil && !facts.CanFinishStream() {
+				return
+			}
+		}
+	}
 	_ = StringData(c, "[DONE]")
 }
 

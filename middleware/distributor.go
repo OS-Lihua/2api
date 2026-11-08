@@ -661,9 +661,11 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Provider, mod
 	}
 	common.SetContextKey(c, constant.ContextKeyChannelParamOverride, paramOverride)
 	common.SetContextKey(c, constant.ContextKeyChannelHeaderOverride, headerOverride)
-	if nil != channel.OpenAIOrganization && *channel.OpenAIOrganization != "" {
-		common.SetContextKey(c, constant.ContextKeyChannelOrganization, *channel.OpenAIOrganization)
+	organization := ""
+	if channel.OpenAIOrganization != nil {
+		organization = *channel.OpenAIOrganization
 	}
+	common.SetContextKey(c, constant.ContextKeyChannelOrganization, organization)
 	common.SetContextKey(c, constant.ContextKeyChannelAutoBan, channel.GetAutoBan())
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
@@ -685,6 +687,10 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Provider, mod
 
 	common.SetContextKey(c, constant.ContextKeySystemPromptOverride, false)
 
+	// Provider-specific values must not survive a switch to another account.
+	for _, key := range []string{"api_version", "region", "plugin", "bot_id"} {
+		c.Set(key, "")
+	}
 	// TODO: api_version统一
 	switch channel.Type {
 	case constant.ChannelTypeAzure:

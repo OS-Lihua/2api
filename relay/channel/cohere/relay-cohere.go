@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -72,6 +73,8 @@ func stopReasonCohere2OpenAI(reason string) string {
 	switch reason {
 	case "COMPLETE":
 		return "stop"
+	case "ERROR_TOXIC":
+		return constant.FinishReasonContentFilter
 	case "MAX_TOKENS":
 		return "max_tokens"
 	default:

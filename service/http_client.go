@@ -394,6 +394,43 @@ func GetHttpClientWithProxy(rawProxyURL string) (*http.Client, error) {
 	return GetHttpClientWithProxySettings(rawProxyURL, dto.ProviderSettings{})
 }
 
+// GetVerifiedHttpClientWithProxy isolates credential exchanges from relay TLS
+// exceptions. Custom transports must explicitly provide a verified TLS clone.
+func GetVerifiedHttpClientWithProxy(rawProxyURL string) (*http.Client, error) {
+	base, err := GetHttpClientWithProxy(rawProxyURL)
+	if err != nil {
+		return nil, err
+	}
+	client := *base
+	transport := base.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	switch transport := transport.(type) {
+	case *http.Transport:
+		verified := transport.Clone()
+		if verified.TLSClientConfig == nil {
+			verified.TLSClientConfig = &tls.Config{}
+		}
+		verified.TLSClientConfig.InsecureSkipVerify = false
+		verified.TLSClientConfig.ServerName = ""
+		verified.TLSClientConfig.MinVersion = max(verified.TLSClientConfig.MinVersion, tls.VersionTLS12)
+		verified.DialTLS, verified.DialTLSContext = nil, nil
+		verified.TLSNextProto = nil
+		verified.ForceAttemptHTTP2 = true
+		client.Transport = verified
+	case interface{ CloneWithVerifiedTLS() http.RoundTripper }:
+		client.Transport = transport.CloneWithVerifiedTLS()
+		if client.Transport == nil {
+			return nil, fmt.Errorf("verified TLS transport is unavailable")
+		}
+	default:
+		return nil, fmt.Errorf("transport cannot enforce certificate verification")
+	}
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+	return &client, nil
+}
+
 // GetHttpClientWithProxySettings returns a cached HTTP client for the proxy URL and
 // channel transport settings. Default auto + 1 shard shares the same client pool as
 // GetHttpClientWithProxy / GetHttpClient for the empty-proxy case.

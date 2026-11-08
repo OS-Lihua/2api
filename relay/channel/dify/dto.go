@@ -71,6 +71,8 @@ type DifyChatCompletionResponse struct {
 }
 
 type DifyChunkChatCompletionResponse struct {
+	Status         int          `json:"status"`
+	Code           string       `json:"code"`
 	Event          string       `json:"event"`
 	ConversationId string       `json:"conversation_id"`
 	Answer         string       `json:"answer"`

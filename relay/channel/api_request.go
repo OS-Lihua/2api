@@ -472,6 +472,15 @@ func keepUpstreamRedirectResponse(_ *http.Request, _ []*http.Request) error {
 	return http.ErrUseLastResponse
 }
 
+// GatewayHTTPClient leaves lifetime control to the shared first-byte and idle
+// budgets. It also prevents redirects from hiding another upstream send.
+func GatewayHTTPClient(client *http.Client) *http.Client {
+	managed := *client
+	managed.Timeout = 0
+	managed.CheckRedirect = keepUpstreamRedirectResponse
+	return &managed
+}
+
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
 	client, err := service.GetHttpClientWithProxySettings(info.ChannelSetting.Proxy, info.ChannelSetting)
 	if err != nil {
@@ -483,6 +492,9 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	// transparent stream retries.
 	relayClient := *client
 	relayClient.CheckRedirect = keepUpstreamRedirectResponse
+	if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+		relayClient = *GatewayHTTPClient(client)
+	}
 	if common2.DebugEnabled && req != nil && req.URL != nil {
 		policy := service.NormalizeHTTPTransportPolicy(info.ChannelSetting)
 		logger.LogDebug(c, "http transport select: host=%s protocol=%s shards=%d policy=%s",
