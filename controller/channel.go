@@ -981,8 +981,9 @@ func UpdateChannel(c *gin.Context) {
 	}
 	clearChannelReadOnlyFields(&channel, requestData)
 
-	if channel.Type == constant.ChannelTypeTaskPlugin &&
-		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.TaskPluginBind) {
+	canBindPlugins := authz.Can(c.GetInt("id"), c.GetInt("role"), authz.TaskPluginBind)
+	canWriteSensitive := authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite)
+	if channel.Type == constant.ChannelTypeTaskPlugin && !canBindPlugins {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "task plugin channels require the task_plugin.bind permission",
@@ -997,12 +998,14 @@ func UpdateChannel(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	// Preserve existing ProviderInfo to ensure multi-key channels keep correct state even if the client does not send channel_info in the request.
-	originChannel, err := model.GetProviderById(channel.Id, true)
+	// Load credentials and Key state under the database lock held through commit.
+	edit, err := model.BeginProviderEdit(c.Request.Context(), channel.Id)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
+	defer edit.Rollback()
+	originChannel := edit.Provider
 	originProxy := originChannel.GetSetting().Proxy
 	proxyChanged := false
 	_, settingProvided := requestData["setting"]
@@ -1016,7 +1019,7 @@ func UpdateChannel(c *gin.Context) {
 	// administrators without it can still edit the rest of a gateway channel.
 	if settingProvided &&
 		!slices.Equal(channel.GetSetting().TaskPluginBindings(), originChannel.GetSetting().TaskPluginBindings()) &&
-		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.TaskPluginBind) {
+		!canBindPlugins {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "task plugin channels require the task_plugin.bind permission",
@@ -1027,8 +1030,7 @@ func UpdateChannel(c *gin.Context) {
 	// Always copy the original ProviderInfo so that fields like IsMultiKey and MultiKeySize are retained.
 	channel.ProviderInfo = originChannel.ProviderInfo
 
-	if channelHasSensitiveChanges(&channel, originChannel, requestData) &&
-		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite) {
+	if channelHasSensitiveChanges(&channel, originChannel, requestData) && !canWriteSensitive {
 		common.ApiErrorT(c, "Unauthorized, insufficient privileges")
 		return
 	}
@@ -1051,7 +1053,7 @@ func UpdateChannel(c *gin.Context) {
 				if strings.HasPrefix(strings.TrimSpace(originChannel.Key), "[") {
 					// JSON数组格式
 					var arr []json.RawMessage
-					if err := json.Unmarshal([]byte(strings.TrimSpace(originChannel.Key)), &arr); err == nil {
+					if err := common.Unmarshal([]byte(strings.TrimSpace(originChannel.Key)), &arr); err == nil {
 						existingKeys = make([]string, len(arr))
 						for i, v := range arr {
 							existingKeys[i] = string(v)
@@ -1115,7 +1117,7 @@ func UpdateChannel(c *gin.Context) {
 			// 覆盖模式：直接使用新密钥（默认行为，不需要特殊处理）
 		}
 	}
-	err = channel.Update()
+	err = edit.Commit(&channel.Provider)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -1563,35 +1565,48 @@ func ManageMultiKeys(c *gin.Context) {
 		return
 	}
 
-	channel, err := model.GetProviderById(request.ChannelId, true)
-	if err != nil {
-		common.ApiErrorT(c, "Channel does not exist")
-		return
-	}
-
-	if !channel.ProviderInfo.IsMultiKey {
-		common.ApiErrorT(c, "This channel is not in multi-key mode")
-		return
-	}
 	if multiKeyActionRequiresSensitiveWrite(request.Action) &&
 		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite) {
 		common.ApiErrorT(c, "Unauthorized, insufficient privileges")
 		return
 	}
-
-	// get_key_status 为只读查询，不记录审计；其余为修改操作，记录审计并跳过中间件兜底。
-	if request.Action == "get_key_status" {
-		markAuditLogged(c)
-	} else {
-		recordManageAudit(c, "channel.multi_key_manage", map[string]any{
-			"action": request.Action,
-			"id":     channel.Id,
-		})
+	var edit *model.ProviderEdit
+	committed := false
+	if request.Action != "get_key_status" {
+		defer func() {
+			params := map[string]any{"action": request.Action, "id": request.ChannelId}
+			if committed {
+				recordManageAudit(c, "channel.multi_key_manage", params)
+			} else {
+				recordFailedManageAudit(c, "channel.multi_key_manage", params, c.Writer.Status())
+			}
+		}()
 	}
-
-	lock := model.GetProviderPollingLock(channel.Id)
+	lock := model.GetProviderPollingLock(request.ChannelId)
 	lock.Lock()
 	defer lock.Unlock()
+
+	var channel *model.Provider
+	if request.Action == "get_key_status" {
+		channel, err = model.GetProviderById(request.ChannelId, true)
+	} else {
+		edit, err = model.BeginProviderEdit(c.Request.Context(), request.ChannelId)
+		if err == nil {
+			defer edit.Rollback()
+			channel = edit.Provider
+		}
+	}
+	if err != nil {
+		common.ApiErrorT(c, "Channel does not exist")
+		return
+	}
+	if !channel.ProviderInfo.IsMultiKey {
+		common.ApiErrorT(c, "This channel is not in multi-key mode")
+		return
+	}
+	if request.Action == "get_key_status" {
+		markAuditLogged(c)
+	}
 
 	switch request.Action {
 	case "get_key_status":
@@ -1730,11 +1745,12 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ProviderInfo.MultiKeyStatusList[keyIndex] = 2 // disabled
 
 		shouldCloseWebSocket := disableMultiKeyChannelIfUnavailable(channel)
-		err = channel.Update()
+		err = edit.Commit(channel)
 		if err != nil {
 			common.ApiError(c, err)
 			return
 		}
+		committed = true
 		model.InitProviderCache()
 		if shouldCloseWebSocket {
 			closeActiveChannelWebSockets([]int{channel.Id})
@@ -1766,11 +1782,12 @@ func ManageMultiKeys(c *gin.Context) {
 		}
 		restoreMultiKeyChannelIfAvailable(channel)
 
-		err = channel.Update()
+		err = edit.Commit(channel)
 		if err != nil {
 			common.ApiError(c, err)
 			return
 		}
+		committed = true
 
 		model.InitProviderCache()
 		common.ApiSuccessT(c, "Key enabled", nil)
@@ -1788,11 +1805,12 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ProviderInfo.MultiKeyDisabledReason = make(map[int]string)
 		restoreMultiKeyChannelIfAvailable(channel)
 
-		err = channel.Update()
+		err = edit.Commit(channel)
 		if err != nil {
 			common.ApiError(c, err)
 			return
 		}
+		committed = true
 
 		model.InitProviderCache()
 		common.ApiSuccessT(c, "Enabled {{count}} keys", nil, map[string]any{"count": enabledCount})
@@ -1811,7 +1829,7 @@ func ManageMultiKeys(c *gin.Context) {
 		}
 
 		var disabledCount int
-		for i := 0; i < channel.ProviderInfo.MultiKeySize; i++ {
+		for i := range channel.ProviderInfo.MultiKeySize {
 			status := 1 // default enabled
 			if s, exists := channel.ProviderInfo.MultiKeyStatusList[i]; exists {
 				status = s
@@ -1830,11 +1848,12 @@ func ManageMultiKeys(c *gin.Context) {
 		}
 
 		shouldCloseWebSocket := disableMultiKeyChannelIfUnavailable(channel)
-		err = channel.Update()
+		err = edit.Commit(channel)
 		if err != nil {
 			common.ApiError(c, err)
 			return
 		}
+		committed = true
 		model.InitProviderCache()
 		if shouldCloseWebSocket {
 			closeActiveChannelWebSockets([]int{channel.Id})
@@ -1901,11 +1920,12 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ProviderInfo.MultiKeyDisabledReason = newDisabledReason
 
 		shouldCloseWebSocket := disableMultiKeyChannelIfUnavailable(channel)
-		err = channel.Update()
+		err = edit.Commit(channel)
 		if err != nil {
 			common.ApiError(c, err)
 			return
 		}
+		committed = true
 		model.InitProviderCache()
 		if shouldCloseWebSocket {
 			closeActiveChannelWebSockets([]int{channel.Id})
@@ -1966,11 +1986,12 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ProviderInfo.MultiKeyDisabledReason = newDisabledReason
 
 		shouldCloseWebSocket := disableMultiKeyChannelIfUnavailable(channel)
-		err = channel.Update()
+		err = edit.Commit(channel)
 		if err != nil {
 			common.ApiError(c, err)
 			return
 		}
+		committed = true
 		model.InitProviderCache()
 		if shouldCloseWebSocket {
 			closeActiveChannelWebSockets([]int{channel.Id})

@@ -813,6 +813,175 @@ func TestTextGatewayManualDisableRepairsStaleCache(t *testing.T) {
 	}
 }
 
+func TestTextGatewayRejectedAutoDisableRepairsStaleCache(t *testing.T) {
+	for _, keyOnly := range []bool{false, true} {
+		t.Run(fmt.Sprint("key=", keyOnly), func(t *testing.T) {
+			var rejected, spare atomic.Int32
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") == "Bearer stale-selected-key" {
+					rejected.Add(1)
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				spare.Add(1)
+				assert.Equal(t, "Bearer stale-spare-key", r.Header.Get("Authorization"))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"spare","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+			})
+			previous := common.AutomaticDisableChannelEnabled
+			common.AutomaticDisableChannelEnabled = true
+			t.Cleanup(func() { common.AutomaticDisableChannelEnabled = previous })
+			provider, err := model.GetProviderById(fixture.channel.ProviderID, true)
+			require.NoError(t, err)
+			provider.Key = "stale-selected-key"
+			provider.AutoBan = common.GetPointer(1)
+			if keyOnly {
+				provider.Key += "\nstale-spare-key"
+				provider.ProviderInfo = model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}
+			}
+			require.NoError(t, model.DB.Model(provider).Select("key", "auto_ban", "channel_info").Updates(provider).Error)
+			var admin model.User
+			require.NoError(t, model.DB.Where("username = ?", "security-admin").First(&admin).Error)
+			adminPAT := createWalletTestAccessToken(t, admin.Id, "channel:read", "channel:operate")
+			common.MemoryCacheEnabled = true
+			model.InitProviderCache()
+			model.CacheUpdateProvider(provider)
+			// A management node without a memory cache commits the manual state;
+			// this gateway node retains its earlier enabled cache.
+			common.MemoryCacheEnabled = false
+			path := fmt.Sprintf("/api/admin/v1/providers/%d/disable", provider.Id)
+			if keyOnly {
+				path = fmt.Sprintf("/api/admin/v1/providers/%d/keys/0/disable", provider.Id)
+			}
+			manual := adminSecurityRequest(fixture.engine, adminPAT, http.MethodPost, path, "")
+			require.Equal(t, http.StatusOK, manual.Code, manual.Body.String())
+			require.Contains(t, manual.Body.String(), `"success":true`)
+			common.MemoryCacheEnabled = true
+			_ = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			require.EqualValues(t, 1, rejected.Load(), "the first call must exercise the stale gateway cache")
+			for range 2 {
+				next := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+				expected := http.StatusServiceUnavailable
+				if keyOnly {
+					expected = http.StatusOK
+				}
+				assert.Equal(t, expected, next.Code, next.Body.String())
+			}
+			assert.EqualValues(t, 1, rejected.Load(), "observing committed manual state must stop further dispatch to the disabled credential")
+			if keyOnly {
+				assert.EqualValues(t, 2, spare.Load())
+			}
+		})
+	}
+}
+
+func TestTextGatewayManagementEditPreservesCommittedKeyDisable(t *testing.T) {
+	var rejected, spare atomic.Int32
+	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer edited-selected-key" {
+			if rejected.Add(1) == 1 {
+				close(entered)
+				<-release
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		spare.Add(1)
+		assert.Equal(t, "Bearer edited-spare-key", r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"edited","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	})
+	previous := common.AutomaticDisableChannelEnabled
+	common.AutomaticDisableChannelEnabled = true
+	t.Cleanup(func() { common.AutomaticDisableChannelEnabled = previous })
+	provider, err := model.GetProviderById(fixture.channel.ProviderID, true)
+	require.NoError(t, err)
+	provider.Key = "edited-selected-key\nedited-spare-key"
+	provider.AutoBan = common.GetPointer(1)
+	provider.ProviderInfo = model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}
+	require.NoError(t, model.DB.Model(provider).Select("key", "auto_ban", "channel_info").Updates(provider).Error)
+	var admin model.User
+	require.NoError(t, model.DB.Where("username = ?", "security-admin").First(&admin).Error)
+	adminPAT := createWalletTestAccessToken(t, admin.Id, "channel:read", "channel:write", "channel:operate")
+	common.MemoryCacheEnabled = true
+	model.InitProviderCache()
+	model.CacheUpdateProvider(provider)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	gatewayDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)).WithContext(ctx)
+		request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		fixture.engine.ServeHTTP(response, request)
+		gatewayDone <- response
+	}()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("gateway did not reach Provider")
+	}
+	lock := model.DB.WithContext(ctx).Begin()
+	require.NoError(t, lock.Error)
+	defer lock.Rollback()
+	var lockedID, lockerPID int
+	require.NoError(t, lock.Raw(`SELECT "id" FROM "providers" WHERE "id" = ? FOR UPDATE`, provider.Id).Scan(&lockedID).Error)
+	require.NoError(t, lock.Raw("SELECT pg_backend_pid()").Scan(&lockerPID).Error)
+	releaseOnce.Do(func() { close(release) })
+	var statusPID int
+	for statusPID == 0 && ctx.Err() == nil {
+		require.NoError(t, model.DB.WithContext(ctx).Raw(`SELECT COALESCE(min(pid), 0) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND ? = ANY(pg_blocking_pids(pid)) AND query LIKE 'UPDATE "providers"%'`, lockerPID).Scan(&statusPID).Error)
+	}
+	require.NotZero(t, statusPID, "automatic status update must enter the PostgreSQL lock queue first")
+	adminDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		request := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/v1/providers/%d", provider.Id), strings.NewReader(`{"name":"Edited after selected failure"}`)).WithContext(ctx)
+		request.Header.Set("Authorization", "Bearer "+adminPAT)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		fixture.engine.ServeHTTP(response, request)
+		adminDone <- response
+	}()
+	var adminPID int
+	for adminPID == 0 && ctx.Err() == nil {
+		select {
+		case response := <-adminDone:
+			t.Fatalf("management edit completed before locking: HTTP %d %s", response.Code, response.Body.String())
+		default:
+		}
+		require.NoError(t, model.DB.WithContext(ctx).Raw(`SELECT COALESCE(min(pid), 0) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> ? AND (? = ANY(pg_blocking_pids(pid)) OR ? = ANY(pg_blocking_pids(pid)))`, statusPID, lockerPID, statusPID).Scan(&adminPID).Error)
+	}
+	require.NotZero(t, adminPID, "management read or write must queue behind the automatic status update")
+	require.NoError(t, lock.Commit().Error)
+	select {
+	case response := <-adminDone:
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		require.Contains(t, response.Body.String(), `"success":true`)
+	case <-ctx.Done():
+		t.Fatal("management edit did not complete")
+	}
+	select {
+	case <-gatewayDone:
+	case <-ctx.Done():
+		t.Fatal("gateway did not complete")
+	}
+	keys := adminSecurityRequest(fixture.engine, adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/providers/%d/keys", provider.Id), "")
+	require.Equal(t, http.StatusOK, keys.Code, keys.Body.String())
+	assert.Contains(t, keys.Body.String(), `"auto_disabled_count":1`, "ordinary editing must preserve the earlier committed disable")
+	read := adminSecurityRequest(fixture.engine, adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/providers/%d", provider.Id), "")
+	assert.Contains(t, read.Body.String(), `"name":"Edited after selected failure"`)
+	for range 2 {
+		next := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+		assert.Equal(t, http.StatusOK, next.Code, next.Body.String())
+	}
+	assert.EqualValues(t, 1, rejected.Load())
+	assert.EqualValues(t, 2, spare.Load())
+}
+
 func TestProviderBatchStatusFailureRecordsCommittedTargets(t *testing.T) {
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("unexpected Provider call") })
 	firstID := fixture.channel.ProviderID
@@ -921,7 +1090,7 @@ func TestTextGatewayManualDisableWinsOverLateCredentialRecovery(t *testing.T) {
 			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 			// A previously started probe completes through the public recovery API
 			// after the administrator has already committed the manual disable.
-			service.EnableChannel(provider.Id, provider.Key, provider.Name)
+			assert.False(t, service.EnableChannel(provider.Id, provider.Key, provider.Name, 0), "a refused recovery must not be counted as a committed enable")
 			if keyOnly {
 				read := adminSecurityRequest(fixture.engine, adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/providers/%d/keys", provider.Id), "")
 				assert.Contains(t, read.Body.String(), `"manual_disabled_count":1`)

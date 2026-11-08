@@ -164,8 +164,8 @@ func recordManageAuditFor(c *gin.Context, targetUserId int, action string, param
 	markAuditLogged(c)
 }
 
-// recordFailedManageAudit retains non-secret targets and partial results when
-// a management operation fails after some of its writes have committed.
+// recordFailedManageAudit retains non-secret targets and any committed partial
+// results when a management operation is rejected or fails.
 func recordFailedManageAudit(c *gin.Context, action string, params map[string]any, status int) {
 	if common.GetContextKeyBool(c, constant.ContextKeyAdminAPIAudit) {
 		return

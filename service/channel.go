@@ -63,7 +63,7 @@ func disableProvider(channelError types.ProviderError, reason string, providerWi
 	return success
 }
 
-func EnableChannel(channelId int, usingKey string, channelName string, selectedIndex ...int) {
+func EnableChannel(channelId int, usingKey string, channelName string, selectedIndex ...int) bool {
 	change := model.ProviderStatusChange{Status: common.ChannelStatusEnabled, UsingKey: usingKey}
 	if len(selectedIndex) > 0 {
 		change.KeyIndex = &selectedIndex[0]
@@ -75,6 +75,7 @@ func EnableChannel(channelId int, usingKey string, channelName string, selectedI
 			return i18n.Translate(lang, i18n.MsgChannelNotifyEnabledSubject, params), i18n.Translate(lang, i18n.MsgChannelNotifyEnabledContent, params)
 		})
 	}
+	return success
 }
 
 func ShouldDisableChannel(err *types.NewAPIError) bool {

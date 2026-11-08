@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
@@ -410,6 +411,32 @@ func SearchProviders(keyword string, group string, model string, idSort bool, so
 // in-memory cache and falls back to this function automatically when
 // MemoryCacheEnabled is false. Direct use is appropriate only where fresh DB
 // state is required, e.g. admin CRUD, channel testing, or cache (re)building.
+// ProviderEdit keeps the current Provider locked until its configuration and
+// abilities commit together. Callers must defer Rollback after beginning an edit.
+type ProviderEdit struct {
+	Provider *Provider
+	tx       *gorm.DB
+	id       int
+	key      string
+}
+
+func BeginProviderEdit(ctx context.Context, id int) (*ProviderEdit, error) {
+	tx := DB.WithContext(ctx).Begin()
+	if tx.Error != nil {
+		return nil, tx.Error
+	}
+	provider := &Provider{}
+	if err := lockForUpdate(tx).First(provider, id).Error; err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	return &ProviderEdit{Provider: provider, tx: tx, id: id, key: provider.Key}, nil
+}
+
+func (edit *ProviderEdit) Rollback() {
+	edit.tx.Rollback()
+}
+
 func GetProviderById(id int, selectAll bool) (*Provider, error) {
 	channel := &Provider{Id: id}
 	var err error = nil
@@ -532,17 +559,16 @@ func (channel *Provider) Insert() error {
 	return err
 }
 
-func (channel *Provider) Update() error {
+func (edit *ProviderEdit) Commit(channel *Provider) error {
+	defer edit.Rollback()
+	if channel.Id != edit.id {
+		return gorm.ErrRecordNotFound
+	}
 	// If this is a multi-key channel, recalculate MultiKeySize based on the current key list to avoid inconsistency after editing keys
 	if channel.ProviderInfo.IsMultiKey {
-		var keyStr string
-		if channel.Key != "" {
-			keyStr = channel.Key
-		} else {
-			// If key is not provided, read the existing key from the database
-			if existing, err := GetProviderById(channel.Id, true); err == nil {
-				keyStr = existing.Key
-			}
+		keyStr := channel.Key
+		if keyStr == "" {
+			keyStr = edit.key
 		}
 		// Parse the key list (supports newline separation or JSON array)
 		keys := []string{}
@@ -571,14 +597,20 @@ func (channel *Provider) Update() error {
 			}
 		}
 	}
-	var err error
-	err = DB.Model(channel).Updates(channel).Error
-	if err != nil {
+	result := edit.tx.Model(channel).Updates(channel)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return gorm.ErrRecordNotFound
+	}
+	if err := edit.tx.First(channel, channel.Id).Error; err != nil {
 		return err
 	}
-	DB.Model(channel).First(channel, "id = ?", channel.Id)
-	err = channel.UpdateAbilities(nil)
-	return err
+	if err := channel.UpdateAbilities(edit.tx); err != nil {
+		return err
+	}
+	return edit.tx.Commit().Error
 }
 
 func (channel *Provider) UpdateResponseTime(responseTime int64) {
@@ -778,14 +810,14 @@ func ApplyProviderStatus(channelId int, change ProviderStatusChange) (bool, erro
 			return err
 		}
 		channel := &snapshot.Provider
-		if status == common.ChannelStatusAutoDisabled && channel.Status != common.ChannelStatusEnabled ||
-			hasCredential && status == common.ChannelStatusEnabled && channel.Status == common.ChannelStatusManuallyDisabled {
-			return nil
-		}
 		before := *channel
 		before.ProviderInfo.MultiKeyStatusList = maps.Clone(channel.ProviderInfo.MultiKeyStatusList)
 		beforeProvider = &before
 		committedProvider = channel
+		if status == common.ChannelStatusAutoDisabled && channel.Status != common.ChannelStatusEnabled ||
+			hasCredential && status == common.ChannelStatusEnabled && channel.Status == common.ChannelStatusManuallyDisabled {
+			return nil
+		}
 		beforeStatus, beforeOtherInfo := channel.Status, channel.OtherInfo
 		overridesKeyExhaustion := channel.ProviderInfo.IsMultiKey && !hasCredential &&
 			status == common.ChannelStatusManuallyDisabled && reason != ProviderStatusReasonAllKeysDisabled &&
@@ -838,7 +870,7 @@ func ApplyProviderStatus(channelId int, change ProviderStatusChange) (bool, erro
 		common.SysLog(common.LogText("failed to update channel status: channel_id=%d, status=%d, error=%v", channelId, status, err))
 		return false, err
 	}
-	if common.MemoryCacheEnabled && (changed || !hasCredential && committedProvider != nil) {
+	if common.MemoryCacheEnabled && committedProvider != nil {
 		cacheProviderStatusTransition(beforeProvider, committedProvider)
 	}
 	return changed, nil
