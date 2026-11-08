@@ -162,6 +162,7 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 		eligible := []*GatewaySelection{}
 		priced := []*GatewaySelection{}
 		unprofitable := []*GatewaySelection{}
+		eligibleFence, lossFence := []int{}, []int{}
 		for _, selection := range active {
 			id := selection.Channel.ID
 			snapshot := health[id]
@@ -214,15 +215,6 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 			selection.EstimatedTokens = int64(selection.InputTokens)
 			if facts.Usage != nil {
 				selection.EstimatedTokens = int64(facts.Usage.TotalTokens)
-			}
-			if err := GatewayRouteQuota.Check(c.Request.Context(), selection, selection.EstimatedTokens); err != nil {
-				reason := "admission_unavailable"
-				if errors.Is(err, ErrGatewayRateLimited) {
-					reason = "rate_limited"
-				}
-				reject(id, reason)
-				lastStage = max(lastStage, 6)
-				continue
 			}
 			if selection.Provider.BalanceUpdatedTime > 0 && selection.Provider.Balance <= 0 {
 				reject(id, "provider_balance")
@@ -278,13 +270,29 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 			}
 			selection.EstimatedCost, selection.EstimatedSale = cost, sale
 			selection.profitFacts = facts
-			priced = append(priced, selection)
 			allowed, err := GatewayRouteProfitAllowed(cost, sale, offering.MinimumMarginRate)
 			if err != nil {
 				reject(id, "price_unavailable")
 				lastStage = max(lastStage, 7)
 				continue
 			}
+			// Quota availability limits selection, but a busy candidate can still
+			// hold the only probe lease for this valid all-open pool.
+			if allowed {
+				eligibleFence = append(eligibleFence, id)
+			} else {
+				lossFence = append(lossFence, id)
+			}
+			if err := GatewayRouteQuota.Check(c.Request.Context(), selection, selection.EstimatedTokens); err != nil {
+				reason := "admission_unavailable"
+				if errors.Is(err, ErrGatewayRateLimited) {
+					reason = "rate_limited"
+				}
+				reject(id, reason)
+				lastStage = max(lastStage, 6)
+				continue
+			}
+			priced = append(priced, selection)
 			if !allowed {
 				reject(id, "profit")
 				lastStage = max(lastStage, 7)
@@ -294,21 +302,15 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 			eligible = append(eligible, selection)
 		}
 		lossFallback := false
-		probeCandidates := eligible
+		probeFence := eligibleFence
 		if len(eligible) == 0 && len(unprofitable) > 0 && offering.AllowLossFallback {
 			slices.SortStableFunc(unprofitable, func(a, b *GatewaySelection) int { order, _ := a.EstimatedCost.Compare(b.EstimatedCost); return order })
-			probeCandidates = unprofitable
+			probeFence = append(probeFence, lossFence...)
 			eligible = unprofitable[:1]
 			lossFallback = true
 		}
 		if len(eligible) == 0 {
 			continue
-		}
-		// Quality limits selection, but cannot hide another valid candidate's
-		// active probe from Manager's atomic fence.
-		probeFence := make([]int, len(probeCandidates))
-		for i, selection := range probeCandidates {
-			probeFence[i] = selection.Channel.ID
 		}
 		// Protocol preparation supplies an ordering quality; affinity cannot restore
 		// a rejected candidate or cross a protocol-quality boundary.
@@ -357,7 +359,6 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 				}
 				reject(selected.Channel.ID, reason)
 				lastStage = max(lastStage, 6)
-				probeFence = slices.DeleteFunc(probeFence, func(id int) bool { return id == selected.Channel.ID })
 				ranked = slices.Delete(ranked, index, index+1)
 				continue
 			}

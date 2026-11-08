@@ -976,8 +976,10 @@ func TestTextGatewayAllOpenProbeRemainsExclusiveAfterRetryOrderChanges(t *testin
 		name          string
 		first, second protocol.Type
 		recoverFirst  bool
+		occupyQuota   bool
 	}{
 		{name: "same protocol", first: protocol.OpenAIChat, second: protocol.OpenAIChat},
+		{name: "quota lease holder", first: protocol.OpenAIChat, second: protocol.OpenAIChat, occupyQuota: true},
 		{name: "converted lease holder", first: protocol.OpenAIResponses, second: protocol.OpenAIChat},
 		{name: "native lease holder", first: protocol.OpenAIChat, second: protocol.OpenAIResponses, recoverFirst: true},
 	} {
@@ -1005,6 +1007,9 @@ func TestTextGatewayAllOpenProbeRemainsExclusiveAfterRetryOrderChanges(t *testin
 					t.Cleanup(func() { require.NoError(t, client.Close()) })
 					manager, observer = channelhealth.New(client), channelhealth.New(client)
 					service.ChannelHealth = manager
+					if tc.occupyQuota {
+						service.GatewayRouteQuota = service.NewGatewayRouteQuota(client)
+					}
 				}
 				ctx := t.Context()
 				ordinary, err := observer.Acquire(ctx, []int{fixture.channel.ID})
@@ -1022,6 +1027,16 @@ func TestTextGatewayAllOpenProbeRemainsExclusiveAfterRetryOrderChanges(t *testin
 				require.Equal(t, fixture.channel.ID, probe.ChannelID)
 				require.NotEmpty(t, probe.Lease)
 				defer observer.Release(ctx, probe)
+				var quota *service.GatewayRoutePermit
+				if tc.occupyQuota {
+					fixture.channel.MaxConcurrency = 1
+					require.NoError(t, model.DB.Model(fixture.channel).Update("max_concurrency", 1).Error)
+					var provider model.Provider
+					require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
+					quota, err = service.GatewayRouteQuota.Acquire(ctx, &service.GatewaySelection{Channel: *fixture.channel, Provider: &provider}, 0)
+					require.NoError(t, err)
+					defer quota.Release(ctx, false)
+				}
 				_, err = observer.Record(ctx, channelhealth.Sample{AttemptID: "late-ordinary", ChannelID: fixture.channel.ID,
 					ProviderFailure: true, RateLimited: true, RetryAfter: "172800", Lease: ordinary.Lease})
 				require.NoError(t, err)
@@ -1035,6 +1050,7 @@ func TestTextGatewayAllOpenProbeRemainsExclusiveAfterRetryOrderChanges(t *testin
 				wallet, err := model.GetUserWallet(fixture.user.Id)
 				require.NoError(t, err)
 				assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
+				require.NoError(t, quota.Release(ctx, false))
 				require.NoError(t, observer.Release(ctx, probe))
 				response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
 				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
@@ -5991,16 +6007,23 @@ func TestMediaGatewayIncompleteMediaStreamsDoNotChargeFixedRequest(t *testing.T)
 
 func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.T) {
 	for _, tc := range []struct {
-		kind     protocol.Type
-		duration bool
-		seconds  string
-	}{{protocol.OpenAIImages, false, ""}, {protocol.OpenAIAudioSpeech, false, ""}, {protocol.OpenAIAudioTranscription, false, ""}, {protocol.OpenAIAudioTranscription, true, "60"}, {protocol.OpenAIAudioTranscription, true, "0"}, {protocol.OpenAIAudioTranscription, true, "1e200"}} {
+		kind        protocol.Type
+		duration    bool
+		seconds     string
+		short, zero bool
+	}{
+		{kind: protocol.OpenAIImages}, {kind: protocol.OpenAIAudioSpeech}, {kind: protocol.OpenAIAudioTranscription},
+		{kind: protocol.OpenAIAudioTranscription, duration: true, seconds: "60"},
+		{kind: protocol.OpenAIAudioTranscription, duration: true, seconds: "0"},
+		{kind: protocol.OpenAIAudioTranscription, duration: true, seconds: "1e200"},
+		{kind: protocol.OpenAIAudioSpeech, short: true}, {kind: protocol.OpenAIAudioSpeech, short: true, zero: true},
+	} {
 		kind := tc.kind
 		for _, stream := range []bool{false, true} {
 			if stream && kind == protocol.OpenAIAudioTranscription {
 				continue
 			}
-			t.Run(fmt.Sprintf("%s/stream=%t/duration=%t/seconds=%s", kind, stream, tc.duration, tc.seconds), func(t *testing.T) {
+			t.Run(fmt.Sprintf("%s/stream=%t/duration=%t/seconds=%s/short=%t/zero=%t", kind, stream, tc.duration, tc.seconds, tc.short, tc.zero), func(t *testing.T) {
 				firstCalls, secondCalls := 0, 0
 				fixture := newMediaGatewayFixture(t, kind, func(w http.ResponseWriter, r *http.Request) {
 					firstCalls++
@@ -6013,6 +6036,12 @@ func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.
 						body = "data: " + body + "\n\ndata: [DONE]\n\n"
 					} else {
 						w.Header().Set("Content-Type", "application/json")
+					}
+					if tc.short {
+						if tc.zero {
+							body = strings.Replace(body, `"input_tokens":7`, `"input_tokens":0`, 1)
+						}
+						w.Header().Set("Content-Length", strconv.Itoa(len(body)+1))
 					}
 					_, _ = io.WriteString(w, body)
 				})
@@ -6087,6 +6116,9 @@ func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.
 				require.EqualValues(t, 2, total)
 				assert.Equal(t, "rate_limited", attempts[0].ErrorClass)
 				firstCost := int64(7000)
+				if tc.zero {
+					firstCost = 0
+				}
 				if tc.duration {
 					expectedSeconds := tc.seconds
 					switch tc.seconds {

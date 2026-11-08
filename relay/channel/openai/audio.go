@@ -121,25 +121,19 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	if request, ok := info.Request.(*dto.AudioRequest); ok && request.ResponseFormat != "" {
 		audioFormat = request.ResponseFormat
 	}
-	if info.ResponseFacts != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices) {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return usage
-		}
+	if info.ResponseFacts != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices || strings.Contains(resp.Header.Get("Content-Type"), "json")) {
+		body, readErr := io.ReadAll(resp.Body)
 		usage = reportedMediaUsage(body)
 		observeMediaUsage(info, usage, body)
-		observeMediaError(info, body, resp.StatusCode)
-		return usage
-	}
-	if info.ResponseFacts != nil && info.IsStream && strings.Contains(resp.Header.Get("Content-Type"), "json") {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return usage
-		}
-		usage = reportedMediaUsage(body)
-		observeMediaUsage(info, usage, body)
-		if observeMediaError(info, body, resp.StatusCode) == nil {
+		fault := observeMediaError(info, body, resp.StatusCode)
+		if info.StreamStatus == nil {
 			info.StreamStatus = relaycommon.NewStreamStatus()
+		}
+		if readErr != nil {
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, readErr)
+			info.StreamStatus.MarkIncomplete("incomplete_audio_response")
+		}
+		if fault == nil && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 			info.StreamStatus.MarkFailed("", "invalid_response", http.StatusBadGateway)
 		}
 		return usage
@@ -307,11 +301,6 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			return usage
 		}
 
-		if info.ResponseFacts != nil && strings.Contains(resp.Header.Get("Content-Type"), "json") && observeMediaError(info, bodyBytes, resp.StatusCode) != nil {
-			usage = reportedMediaUsage(bodyBytes)
-			observeMediaUsage(info, usage, bodyBytes)
-			return usage
-		}
 		// 写入响应到客户端
 		c.Writer.WriteHeaderNow()
 		n, writeErr := c.Writer.Write(bodyBytes)
