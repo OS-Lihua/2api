@@ -32,6 +32,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/pkg/protocol"
+	"github.com/QuantumNous/new-api/pkg/wsmanager"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -1025,118 +1026,205 @@ func TestTextGatewayManagementEditPreservesCommittedKeyDisable(t *testing.T) {
 	assert.EqualValues(t, 2, spare.Load())
 }
 
+func providerSecurityRequest(t *testing.T, engine http.Handler, session *service.AuthBundle, operation service.VerificationOperation, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	identity, err := service.ParseAccessToken(session.AccessToken)
+	require.NoError(t, err)
+	binding, err := service.BindVerificationOperation(operation)
+	require.NoError(t, err)
+	proof, _, err := service.IssueSecurityProof(identity, service.VerificationMethodPassword, binding)
+	require.NoError(t, err)
+	request := httptest.NewRequest(method, path, strings.NewReader(body))
+	request.Header.Set("Authorization", "Bearer "+session.AccessToken)
+	request.Header.Set("X-Security-Proof", proof)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+	return response
+}
+
 func TestProviderSensitiveEditRechecksPermissionAfterLock(t *testing.T) {
 	for _, operation := range []string{"replace", "delete", "name", "disable", "provider", "batch", "tag"} {
 		for _, lockTable := range []string{"providers", "abilities"} {
-			t.Run(operation+"/"+lockTable, func(t *testing.T) {
-				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("unexpected upstream call") })
-				provider, err := model.GetProviderById(fixture.channel.ProviderID, true)
-				require.NoError(t, err)
-				provider.Key = "permission-first-key\npermission-spare-key"
-				provider.ProviderInfo = model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}
-				provider.Tag = common.GetPointer("permission-lock-tag")
-				require.NoError(t, model.DB.Model(provider).Select("key", "channel_info", "tag").Updates(provider).Error)
-				require.NoError(t, model.DB.Create(&model.Ability{ChannelId: provider.Id, Group: "default", Model: "permission-lock-model", Enabled: true}).Error)
-				var following *model.Provider
-				if operation == "batch" {
-					following = &model.Provider{Name: "Following Provider", Key: "following-permission-key", Status: common.ChannelStatusEnabled}
-					require.NoError(t, model.DB.Create(following).Error)
-				}
-				admin := &model.User{Username: "locked-sensitive-editor", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "lockedit"}
-				require.NoError(t, model.DB.Create(admin).Error)
-				permission := authz.ChannelSensitiveWrite
-				if operation == "name" {
-					permission = authz.ChannelWrite
-				} else if operation == "disable" || operation == "provider" || operation == "batch" || operation == "tag" {
-					permission = authz.ChannelOperate
-				}
-				require.NoError(t, authz.SetUserPermissions(admin.Id, authz.PermissionsMap{permission.Resource: {permission.Action: true}}))
-				require.True(t, authz.Can(admin.Id, admin.Role, permission))
-				pat := createWalletTestAccessToken(t, admin.Id, "channel:read", "channel:write", "channel:sensitive_write", "channel:operate")
-				ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-				defer cancel()
-				lock := model.DB.WithContext(ctx).Begin()
-				require.NoError(t, lock.Error)
-				defer lock.Rollback()
-				var lockedID, lockerPID int
-				if lockTable == "providers" {
-					require.NoError(t, lock.Raw(`SELECT "id" FROM "providers" WHERE "id" = ? FOR UPDATE`, provider.Id).Scan(&lockedID).Error)
-				} else {
-					require.NoError(t, lock.Raw(`SELECT "channel_id" FROM "abilities" WHERE "channel_id" = ? FOR UPDATE`, provider.Id).Scan(&lockedID).Error)
-				}
-				require.NoError(t, lock.Raw("SELECT pg_backend_pid()").Scan(&lockerPID).Error)
-				done := make(chan *httptest.ResponseRecorder, 1)
-				go func() {
-					method, path, body := http.MethodPatch, fmt.Sprintf("/api/admin/v1/providers/%d", provider.Id), `{"key":"permission-replacement-key\npermission-spare-key","key_mode":"replace"}`
-					if operation == "delete" {
-						method, path, body = http.MethodDelete, fmt.Sprintf("/api/admin/v1/providers/%d/keys/0", provider.Id), ""
-					} else if operation == "name" {
-						body = `{"name":"Revoked edited Provider"}`
-					} else if operation == "disable" {
-						method, path, body = http.MethodPost, fmt.Sprintf("/api/admin/v1/providers/%d/keys/0/disable", provider.Id), ""
-					} else if operation == "provider" {
-						method, path, body = http.MethodPost, fmt.Sprintf("/api/admin/v1/providers/%d/disable", provider.Id), ""
-					} else if operation == "batch" {
-						method, path, body = http.MethodPost, "/api/channel/status/batch", fmt.Sprintf(`{"ids":[%d,%d],"status":2}`, provider.Id, following.Id)
-					} else if operation == "tag" {
-						method, path, body = http.MethodPost, "/api/channel/tag/disabled", `{"tag":"permission-lock-tag"}`
+			for _, changeKind := range []string{"policy", "pat_revoke", "pat_expire", "pat_scope", "user_disable", "user_demote", "session_revoke", "session_expire"} {
+				if changeKind == "user_demote" {
+					if operation != "name" || lockTable != "providers" {
+						continue
 					}
-					request := httptest.NewRequest(method, path, strings.NewReader(body)).WithContext(ctx)
-					request.Header.Set("Authorization", "Bearer "+pat)
-					request.Header.Set("Content-Type", "application/json")
-					response := httptest.NewRecorder()
-					fixture.engine.ServeHTTP(response, request)
-					done <- response
-				}()
-				var waitingPID int
-				for waitingPID == 0 && ctx.Err() == nil {
+				} else if changeKind != "policy" && (operation != "replace" || lockTable != "providers") {
+					continue
+				}
+				t.Run(operation+"/"+lockTable+"/"+changeKind, func(t *testing.T) {
+					fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("unexpected upstream call") })
+					provider, err := model.GetProviderById(fixture.channel.ProviderID, true)
+					require.NoError(t, err)
+					provider.Key = "permission-first-key\npermission-spare-key"
+					provider.ProviderInfo = model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}
+					provider.Tag = common.GetPointer("permission-lock-tag")
+					require.NoError(t, model.DB.Model(provider).Select("key", "channel_info", "tag").Updates(provider).Error)
+					require.NoError(t, model.DB.Create(&model.Ability{ChannelId: provider.Id, Group: "default", Model: "permission-lock-model", Enabled: true}).Error)
+					var following *model.Provider
+					if operation == "batch" {
+						following = &model.Provider{Name: "Following Provider", Key: "following-permission-key", Status: common.ChannelStatusEnabled}
+						require.NoError(t, model.DB.Create(following).Error)
+					}
+					admin := &model.User{Username: "locked-sensitive-editor", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "lockedit"}
+					require.NoError(t, model.DB.Create(admin).Error)
+					permission := authz.ChannelSensitiveWrite
+					if operation == "name" {
+						permission = authz.ChannelWrite
+					} else if operation == "disable" || operation == "provider" || operation == "batch" || operation == "tag" {
+						permission = authz.ChannelOperate
+					}
+					require.NoError(t, authz.SetUserPermissions(admin.Id, authz.PermissionsMap{permission.Resource: {permission.Action: true}}))
+					require.True(t, authz.Can(admin.Id, admin.Role, permission))
+					pat := createWalletTestAccessToken(t, admin.Id, "channel:read", "channel:write", "channel:sensitive_write", "channel:operate")
+					credential := pat
+					var control *service.AuthBundle
+					var personal model.UserAccessToken
+					if changeKind != "policy" {
+						require.NoError(t, model.DB.AutoMigrate(&model.AuthFlow{}, &model.TwoFA{}, &model.PasskeyCredential{}, &model.UserOAuthBinding{}))
+						previousPasswordLogin := common.PasswordLoginEnabled
+						common.PasswordLoginEnabled = true
+						t.Cleanup(func() { common.PasswordLoginEnabled = previousPasswordLogin })
+						hash, err := common.Password2Hash("provider-test-password")
+						require.NoError(t, err)
+						admin.Password = hash
+						require.NoError(t, model.DB.Model(admin).Select("Password").Updates(&model.User{Password: hash}).Error)
+						control, err = service.CreateLoginSession(admin.Id, service.VerificationMethodPassword, "127.0.0.1", "provider-regression")
+						require.NoError(t, err)
+						require.NoError(t, model.DB.Where("token_hash = ?", model.AccessTokenFingerprint(pat)).First(&personal).Error)
+						if strings.HasPrefix(changeKind, "session_") {
+							credential = control.AccessToken
+						}
+					}
+					ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+					defer cancel()
+					lock := model.DB.WithContext(ctx).Begin()
+					require.NoError(t, lock.Error)
+					defer lock.Rollback()
+					var lockedID, lockerPID int
+					if lockTable == "providers" {
+						require.NoError(t, lock.Raw(`SELECT "id" FROM "providers" WHERE "id" = ? FOR UPDATE`, provider.Id).Scan(&lockedID).Error)
+					} else {
+						require.NoError(t, lock.Raw(`SELECT "channel_id" FROM "abilities" WHERE "channel_id" = ? FOR UPDATE`, provider.Id).Scan(&lockedID).Error)
+					}
+					require.NoError(t, lock.Raw("SELECT pg_backend_pid()").Scan(&lockerPID).Error)
+					done := make(chan *httptest.ResponseRecorder, 1)
+					go func() {
+						method, path, body := http.MethodPatch, fmt.Sprintf("/api/admin/v1/providers/%d", provider.Id), `{"key":"permission-replacement-key\npermission-spare-key","key_mode":"replace"}`
+						if operation == "delete" {
+							method, path, body = http.MethodDelete, fmt.Sprintf("/api/admin/v1/providers/%d/keys/0", provider.Id), ""
+						} else if operation == "name" {
+							body = `{"name":"Revoked edited Provider"}`
+						} else if operation == "disable" {
+							method, path, body = http.MethodPost, fmt.Sprintf("/api/admin/v1/providers/%d/keys/0/disable", provider.Id), ""
+						} else if operation == "provider" {
+							method, path, body = http.MethodPost, fmt.Sprintf("/api/admin/v1/providers/%d/disable", provider.Id), ""
+						} else if operation == "batch" {
+							method, path, body = http.MethodPost, "/api/channel/status/batch", fmt.Sprintf(`{"ids":[%d,%d],"status":2}`, provider.Id, following.Id)
+						} else if operation == "tag" {
+							method, path, body = http.MethodPost, "/api/channel/tag/disabled", `{"tag":"permission-lock-tag"}`
+						}
+						request := httptest.NewRequest(method, path, strings.NewReader(body)).WithContext(ctx)
+						request.Header.Set("Authorization", "Bearer "+credential)
+						request.Header.Set("Content-Type", "application/json")
+						response := httptest.NewRecorder()
+						fixture.engine.ServeHTTP(response, request)
+						done <- response
+					}()
+					var waitingPID int
+					for waitingPID == 0 && ctx.Err() == nil {
+						select {
+						case response := <-done:
+							t.Fatalf("sensitive request completed before locking: HTTP %d %s", response.Code, response.Body.String())
+						default:
+						}
+						require.NoError(t, model.DB.WithContext(ctx).Raw(`SELECT COALESCE(min(pid), 0) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND ? = ANY(pg_blocking_pids(pid))`, lockerPID).Scan(&waitingPID).Error)
+					}
+					require.NotZero(t, waitingPID)
+					switch changeKind {
+					case "policy":
+						require.NoError(t, authz.SetUserPermissions(admin.Id, authz.PermissionsMap{permission.Resource: {permission.Action: false}}))
+						require.NoError(t, authz.ReloadPolicy())
+						require.False(t, authz.Can(admin.Id, admin.Role, permission))
+					case "pat_revoke", "pat_scope":
+						var operation service.VerificationOperation
+						method, body := http.MethodDelete, ""
+						if changeKind == "pat_revoke" {
+							context, err := common.Marshal(service.AccessTokenRevokeContext{TokenID: personal.Id})
+							require.NoError(t, err)
+							operation = service.VerificationOperation{Scope: service.VerificationScopeAccessTokenRevoke, Context: context}
+						} else {
+							scopes := []string{"profile:read"}
+							context, err := common.Marshal(service.AccessTokenUpdateContext{TokenID: personal.Id, Scopes: scopes})
+							require.NoError(t, err)
+							operation = service.VerificationOperation{Scope: service.VerificationScopeAccessTokenUpdate, Context: context}
+							method, body = http.MethodPatch, `{"name":"narrowed","scopes":["profile:read"]}`
+						}
+						response := providerSecurityRequest(t, fixture.engine, control, operation, method, fmt.Sprintf("/api/user/access_tokens/%d", personal.Id), body)
+						require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+						require.Contains(t, response.Body.String(), `"success":true`)
+					case "pat_expire":
+						require.NoError(t, model.DB.Model(&personal).Update("expires_at", time.Now().Unix()-1).Error)
+					case "session_revoke":
+						response := adminSecurityRequest(fixture.engine, credential, http.MethodPost, "/api/user/auth/logout", "")
+						require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+						require.Contains(t, response.Body.String(), `"success":true`)
+					case "session_expire":
+						identity, err := service.ParseAccessToken(credential)
+						require.NoError(t, err)
+						require.NoError(t, model.DB.Model(&model.UserSession{}).Where("sid = ?", identity.SessionID).Update("expires_at", time.Now().Unix()-1).Error)
+					case "user_disable", "user_demote":
+						root := &model.User{Username: "provider-authority-root", Password: admin.Password, Role: common.RoleRootUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "authroot"}
+						require.NoError(t, model.DB.Create(root).Error)
+						rootSession, err := service.CreateLoginSession(root.Id, service.VerificationMethodPassword, "127.0.0.1", "provider-regression")
+						require.NoError(t, err)
+						action := strings.TrimPrefix(changeKind, "user_")
+						context, err := common.Marshal(service.AdminUserManageContext{UserID: admin.Id, Action: action})
+						require.NoError(t, err)
+						operation := service.VerificationOperation{Scope: service.VerificationScopeAdminUserManage, Context: context}
+						response := providerSecurityRequest(t, fixture.engine, rootSession, operation, http.MethodPost, "/api/user/manage", fmt.Sprintf(`{"id":%d,"action":"%s"}`, admin.Id, action))
+						require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+						require.Contains(t, response.Body.String(), `"success":true`)
+					}
+					require.NoError(t, lock.Commit().Error)
 					select {
 					case response := <-done:
-						t.Fatalf("sensitive request completed before locking: HTTP %d %s", response.Code, response.Body.String())
-					default:
+						assert.Contains(t, response.Body.String(), `"success":false`, "revoked permission must prevent the queued credential mutation")
+					case <-ctx.Done():
+						t.Fatal("sensitive request did not complete")
 					}
-					require.NoError(t, model.DB.WithContext(ctx).Raw(`SELECT COALESCE(min(pid), 0) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND ? = ANY(pg_blocking_pids(pid))`, lockerPID).Scan(&waitingPID).Error)
-				}
-				require.NotZero(t, waitingPID)
-				require.NoError(t, authz.SetUserPermissions(admin.Id, authz.PermissionsMap{permission.Resource: {permission.Action: false}}))
-				require.NoError(t, authz.ReloadPolicy())
-				require.False(t, authz.Can(admin.Id, admin.Role, permission))
-				require.NoError(t, lock.Commit().Error)
-				select {
-				case response := <-done:
-					assert.Contains(t, response.Body.String(), `"success":false`, "revoked permission must prevent the queued credential mutation")
-				case <-ctx.Done():
-					t.Fatal("sensitive request did not complete")
-				}
-				stored, err := model.GetProviderById(provider.Id, true)
-				require.NoError(t, err)
-				assert.Equal(t, provider.Key, stored.Key)
-				assert.Equal(t, provider.Name, stored.Name)
-				assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
-				assert.Empty(t, stored.ProviderInfo.MultiKeyStatusList)
-				assert.Equal(t, 2, stored.ProviderInfo.MultiKeySize)
-				if following != nil {
-					next, err := model.GetProviderById(following.Id, true)
+					stored, err := model.GetProviderById(provider.Id, true)
 					require.NoError(t, err)
-					assert.Equal(t, common.ChannelStatusEnabled, next.Status, "revocation must stop the remaining batch targets")
-				}
-				logs, _, err := model.GetAuditLogs(model.AuditLogFilter{Category: model.AuditCategoryOperation}, 0, 100, common.RoleRootUser)
-				require.NoError(t, err)
-				found := false
-				for _, entry := range logs {
-					if entry.UserId == admin.Id {
-						found = true
-						assert.False(t, entry.Success)
+					assert.Equal(t, provider.Key, stored.Key)
+					assert.Equal(t, provider.Name, stored.Name)
+					assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+					assert.Empty(t, stored.ProviderInfo.MultiKeyStatusList)
+					assert.Equal(t, 2, stored.ProviderInfo.MultiKeySize)
+					if following != nil {
+						next, err := model.GetProviderById(following.Id, true)
+						require.NoError(t, err)
+						assert.Equal(t, common.ChannelStatusEnabled, next.Status, "revocation must stop the remaining batch targets")
 					}
-				}
-				assert.True(t, found)
-			})
+					logs, _, err := model.GetAuditLogs(model.AuditLogFilter{Category: model.AuditCategoryOperation}, 0, 100, common.RoleRootUser)
+					require.NoError(t, err)
+					found := false
+					for _, entry := range logs {
+						if entry.UserId == admin.Id && (strings.Contains(entry.Route, "/providers/") || strings.HasPrefix(entry.Action, "channel.")) {
+							found = true
+							assert.False(t, entry.Success)
+						}
+					}
+					assert.True(t, found)
+				})
+			}
 		}
 	}
 }
 
 func TestProviderCredentialsStayOutOfDebugSQL(t *testing.T) {
-	for _, operation := range []string{"status", "name", "polling"} {
+	for _, operation := range []string{"status", "name", "polling", "invalid_setting", "invalid_other"} {
 		t.Run(operation, func(t *testing.T) {
 			const sentinel = "debug-provider-credential-sentinel"
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1151,7 +1239,12 @@ func TestProviderCredentialsStayOutOfDebugSQL(t *testing.T) {
 				provider.Key += "\ndebug-spare-key"
 				provider.ProviderInfo = model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}
 			}
-			require.NoError(t, model.DB.Model(provider).Select("key", "channel_info").Updates(provider).Error)
+			if operation == "invalid_setting" {
+				provider.Setting = common.GetPointer("{")
+			} else if operation == "invalid_other" {
+				provider.OtherSettings = "{"
+			}
+			require.NoError(t, model.DB.Model(provider).Select("key", "channel_info", "setting", "other_settings").Updates(provider).Error)
 			var admin model.User
 			require.NoError(t, model.DB.Where("username = ?", "security-admin").First(&admin).Error)
 			adminPAT := createWalletTestAccessToken(t, admin.Id, "channel:read", "channel:write", "channel:operate")
@@ -1166,16 +1259,41 @@ func TestProviderCredentialsStayOutOfDebugSQL(t *testing.T) {
 			token := adminPAT
 			if operation == "name" {
 				method, path, body = http.MethodPatch, fmt.Sprintf("/api/admin/v1/providers/%d", provider.Id), `{"name":"Debug-safe edited Provider"}`
-			} else if operation == "polling" {
+			} else if operation == "invalid_setting" {
+				method, path, body = http.MethodPut, "/api/channel/", fmt.Sprintf(`{"id":%d,"name":"Debug-safe edited Provider"}`, provider.Id)
+			} else if operation == "polling" || operation == "invalid_other" {
 				path, body, token = "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, fixture.token.Key
 			}
-			response := adminSecurityRequest(fixture.engine, token, method, path, body)
+			var response *httptest.ResponseRecorder
+			if operation == "invalid_setting" {
+				done := make(chan *httptest.ResponseRecorder, 1)
+				go func() { done <- adminSecurityRequest(fixture.engine, token, method, path, body) }()
+				ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+				defer cancel()
+				for response == nil && ctx.Err() == nil {
+					select {
+					case response = <-done:
+					default:
+						var waitingPID int
+						require.NoError(t, originalDB.WithContext(ctx).Raw(`SELECT COALESCE(min(pid), 0) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'UPDATE "providers"%'`).Scan(&waitingPID).Error)
+						if waitingPID != 0 {
+							assert.Fail(t, "reading invalid settings blocked on its own Provider transaction")
+							var cancelled bool
+							require.NoError(t, originalDB.Raw("SELECT pg_cancel_backend(?)", waitingPID).Scan(&cancelled).Error)
+							require.True(t, cancelled)
+						}
+					}
+				}
+				require.NotNil(t, response)
+			} else {
+				response = adminSecurityRequest(fixture.engine, token, method, path, body)
+			}
 			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 			read := adminSecurityRequest(fixture.engine, adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/providers/%d", provider.Id), "")
 			require.Equal(t, http.StatusOK, read.Code, read.Body.String())
 			if operation == "status" {
 				assert.Contains(t, read.Body.String(), `"status":2`)
-			} else if operation == "name" {
+			} else if operation == "name" || operation == "invalid_setting" {
 				assert.Contains(t, read.Body.String(), `"name":"Debug-safe edited Provider"`)
 			}
 			assert.NotEmpty(t, output.String(), "ordinary diagnostics remain enabled")
@@ -1190,42 +1308,62 @@ func TestProviderCredentialsStayOutOfDebugSQL(t *testing.T) {
 }
 
 func TestProviderBatchStatusFailureRecordsCommittedTargets(t *testing.T) {
-	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("unexpected Provider call") })
-	firstID := fixture.channel.ProviderID
-	failed := &model.Provider{Name: "Rejected status", Key: "failed-provider-secret", Status: common.ChannelStatusEnabled}
-	require.NoError(t, model.DB.Create(failed).Error)
-	for _, id := range []int{firstID, failed.Id} {
-		require.NoError(t, model.DB.Create(&model.Ability{ChannelId: id, Group: "default", Model: "legacy-model", Enabled: true}).Error)
-	}
-	require.NoError(t, model.DB.Exec(fmt.Sprintf(`CREATE FUNCTION reject_health_batch_status() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW."channel_id" = %d THEN RAISE EXCEPTION 'batch status write rejected'; END IF; RETURN NEW; END $$`, failed.Id)).Error)
-	require.NoError(t, model.DB.Exec(`CREATE TRIGGER reject_health_batch_status BEFORE UPDATE ON "abilities" FOR EACH ROW EXECUTE FUNCTION reject_health_batch_status()`).Error)
-	var admin model.User
-	require.NoError(t, model.DB.Where("username = ?", "security-admin").First(&admin).Error)
-	adminPAT := createWalletTestAccessToken(t, admin.Id, "channel:read", "channel:operate")
-	response := adminSecurityRequest(fixture.engine, adminPAT, http.MethodPost, "/api/channel/status/batch", fmt.Sprintf(`{"ids":[%d,%d],"status":2}`, firstID, failed.Id))
-	require.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
-	assert.Contains(t, response.Body.String(), `"data":1`)
-	for id, expected := range map[int]int{firstID: common.ChannelStatusManuallyDisabled, failed.Id: common.ChannelStatusEnabled} {
-		read := adminSecurityRequest(fixture.engine, adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/providers/%d", id), "")
-		assert.Contains(t, read.Body.String(), fmt.Sprintf(`"status":%d`, expected))
-	}
-	logs, _, err := model.GetAuditLogs(model.AuditLogFilter{Category: model.AuditCategoryOperation}, 0, 100, common.RoleRootUser)
-	require.NoError(t, err)
-	found := false
-	for _, entry := range logs {
-		if entry.Action == "channel.status_update_batch" {
-			found = true
-			assert.False(t, entry.Success)
-			require.NotNil(t, entry.Other.Op)
-			params, err := common.Marshal(entry.Other.Op.Params)
+	for _, operation := range []string{"batch", "tag"} {
+		t.Run(operation, func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("unexpected Provider call") })
+			firstID := fixture.channel.ProviderID
+			failed := &model.Provider{Name: "Rejected status", Key: "failed-provider-secret", Status: common.ChannelStatusEnabled}
+			require.NoError(t, model.DB.Create(failed).Error)
+			for _, id := range []int{firstID, failed.Id} {
+				require.NoError(t, model.DB.Create(&model.Ability{ChannelId: id, Group: "default", Model: "legacy-model", Enabled: true}).Error)
+			}
+			require.NoError(t, model.DB.Exec(fmt.Sprintf(`CREATE FUNCTION reject_health_batch_status() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW."channel_id" = %d THEN RAISE EXCEPTION 'batch status write rejected'; END IF; RETURN NEW; END $$`, failed.Id)).Error)
+			require.NoError(t, model.DB.Exec(`CREATE TRIGGER reject_health_batch_status BEFORE UPDATE ON "abilities" FOR EACH ROW EXECUTE FUNCTION reject_health_batch_status()`).Error)
+			var admin model.User
+			require.NoError(t, model.DB.Where("username = ?", "security-admin").First(&admin).Error)
+			adminPAT := createWalletTestAccessToken(t, admin.Id, "channel:read", "channel:operate")
+			closed := make(chan string, 1)
+			unregister := wsmanager.Register(firstID, wsmanager.KindResponses, func(reason string) { closed <- reason })
+			defer unregister()
+			path, body, action := "/api/channel/status/batch", fmt.Sprintf(`{"ids":[%d,%d],"status":2}`, firstID, failed.Id), "channel.status_update_batch"
+			if operation == "tag" {
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where(`"id" IN ?`, []int{firstID, failed.Id}).Update("tag", "partial-disable-tag").Error)
+				path, body, action = "/api/channel/tag/disabled", `{"tag":"partial-disable-tag"}`, "channel.tag_disable"
+			}
+			response := adminSecurityRequest(fixture.engine, adminPAT, http.MethodPost, path, body)
+			assert.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
+			if operation == "batch" {
+				assert.Contains(t, response.Body.String(), `"data":1`)
+			}
+			select {
+			case reason := <-closed:
+				assert.Equal(t, service.ChannelDisabledCloseReason, reason)
+			default:
+				t.Error("a committed disable must close active connections even when a later target fails")
+			}
+			for id, expected := range map[int]int{firstID: common.ChannelStatusManuallyDisabled, failed.Id: common.ChannelStatusEnabled} {
+				read := adminSecurityRequest(fixture.engine, adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/providers/%d", id), "")
+				assert.Contains(t, read.Body.String(), fmt.Sprintf(`"status":%d`, expected))
+			}
+			logs, _, err := model.GetAuditLogs(model.AuditLogFilter{Category: model.AuditCategoryOperation}, 0, 100, common.RoleRootUser)
 			require.NoError(t, err)
-			assert.Contains(t, string(params), fmt.Sprintf(`"committed_ids":[%d]`, firstID))
-			assert.Contains(t, string(params), fmt.Sprintf(`"failed_id":%d`, failed.Id))
-			assert.Contains(t, string(params), `"status":2`)
-			assert.NotContains(t, string(params), failed.Key)
-		}
+			found := false
+			for _, entry := range logs {
+				if entry.Action == action {
+					found = true
+					assert.False(t, entry.Success)
+					require.NotNil(t, entry.Other.Op)
+					params, err := common.Marshal(entry.Other.Op.Params)
+					require.NoError(t, err)
+					assert.Contains(t, string(params), fmt.Sprintf(`"committed_ids":[%d]`, firstID))
+					assert.Contains(t, string(params), fmt.Sprintf(`"failed_id":%d`, failed.Id))
+					assert.Contains(t, string(params), `"status":2`)
+					assert.NotContains(t, string(params), failed.Key)
+				}
+			}
+			assert.True(t, found, "partial failure must retain the actual committed and rejected targets")
+		})
 	}
-	assert.True(t, found, "partial failure must retain the actual committed and rejected targets")
 }
 
 func TestTextGatewayPollingSnapshotPreservesCommittedKeyDisable(t *testing.T) {

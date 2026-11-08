@@ -416,7 +416,7 @@ func SearchProviders(keyword string, group string, model string, idSort bool, so
 // abilities commit together. Callers must defer Rollback after beginning an edit.
 type ProviderEdit struct {
 	Provider  *Provider
-	Authorize func() bool `json:"-"`
+	Authorize func(*gorm.DB) bool `json:"-"`
 	tx        *gorm.DB
 	id        int
 	key       string
@@ -618,7 +618,7 @@ func (edit *ProviderEdit) Commit(channel *Provider) error {
 	if err := channel.UpdateAbilities(edit.tx); err != nil {
 		return err
 	}
-	if edit.Authorize != nil && !edit.Authorize() {
+	if edit.Authorize != nil && !edit.Authorize(edit.tx) {
 		return ErrProviderMutationForbidden
 	}
 	return edit.tx.Commit().Error
@@ -780,7 +780,7 @@ type ProviderStatusChange struct {
 	UsingKey     string
 	KeyIndex     *int
 	ProviderWide bool
-	Authorize    func() bool `json:"-"`
+	Authorize    func(*gorm.DB) bool `json:"-"`
 }
 
 func UpdateProviderStatus(channelId int, usingKey string, status int, reason string, selectedIndex ...int) bool {
@@ -818,7 +818,7 @@ func ApplyProviderStatus(channelId int, change ProviderStatusChange) (bool, erro
 		// Validate current caller permissions after any row/ability lock wait,
 		// before committing or publishing an otherwise successful transition.
 		defer func() {
-			if err == nil && change.Authorize != nil && !change.Authorize() {
+			if err == nil && change.Authorize != nil && !change.Authorize(tx) {
 				err = ErrProviderMutationForbidden
 			}
 		}()
@@ -898,15 +898,24 @@ func ApplyProviderStatus(channelId int, change ProviderStatusChange) (bool, erro
 	return changed, nil
 }
 
-func EnableProviderByTag(tag string, authorize ...func() bool) error {
+type ProviderTagStatusError struct {
+	CommittedIDs []int
+	FailedID     int
+	Err          error
+}
+
+func (err *ProviderTagStatusError) Error() string { return err.Err.Error() }
+func (err *ProviderTagStatusError) Unwrap() error { return err.Err }
+
+func EnableProviderByTag(tag string, authorize ...func(*gorm.DB) bool) error {
 	return updateProviderStatusByTag(tag, common.ChannelStatusEnabled, authorize)
 }
 
-func DisableProviderByTag(tag string, authorize ...func() bool) error {
+func DisableProviderByTag(tag string, authorize ...func(*gorm.DB) bool) error {
 	return updateProviderStatusByTag(tag, common.ChannelStatusManuallyDisabled, authorize)
 }
 
-func updateProviderStatusByTag(tag string, status int, authorize []func() bool) error {
+func updateProviderStatusByTag(tag string, status int, authorize []func(*gorm.DB) bool) error {
 	var ids []int
 	if err := DB.Model(&Provider{}).Where(`"tag" = ?`, tag).Order("id").Pluck("id", &ids).Error; err != nil {
 		return err
@@ -915,9 +924,14 @@ func updateProviderStatusByTag(tag string, status int, authorize []func() bool) 
 	if len(authorize) > 0 {
 		change.Authorize = authorize[0]
 	}
+	var committedIDs []int
 	for _, id := range ids {
-		if _, err := ApplyProviderStatus(id, change); err != nil {
-			return err
+		changed, err := ApplyProviderStatus(id, change)
+		if err != nil {
+			return &ProviderTagStatusError{CommittedIDs: committedIDs, FailedID: id, Err: err}
+		}
+		if changed {
+			committedIDs = append(committedIDs, id)
 		}
 	}
 	return nil
@@ -1102,8 +1116,7 @@ func (channel *Provider) GetSetting() dto.ProviderSettings {
 		err := common.Unmarshal([]byte(*channel.Setting), &setting)
 		if err != nil {
 			common.SysLog(common.LogText("failed to unmarshal setting: channel_id=%d, error=%v", channel.Id, err))
-			channel.Setting = nil // 清空设置以避免后续错误
-			_ = channel.Save()    // 保存修改
+			return dto.ProviderSettings{}
 		}
 	}
 	return setting
@@ -1124,8 +1137,7 @@ func (channel *Provider) GetOtherSettings() dto.ProviderOtherSettings {
 		err := common.UnmarshalJsonStr(channel.OtherSettings, &setting)
 		if err != nil {
 			common.SysLog(common.LogText("failed to unmarshal setting: channel_id=%d, error=%v", channel.Id, err))
-			channel.OtherSettings = "{}" // 清空设置以避免后续错误
-			_ = channel.Save()           // 保存修改
+			setting = dto.ProviderOtherSettings{}
 		}
 	}
 	if preset := common.GetAdvancedCustomPreset(channel.Type); preset != nil {

@@ -13,6 +13,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/ollama"
@@ -810,6 +811,27 @@ type ProviderTag struct {
 	HeaderOverride *string `json:"header_override"`
 }
 
+func failedProviderTagStatus(c *gin.Context, action, tag string, status int, updateErr error) {
+	code := http.StatusInternalServerError
+	if errors.Is(updateErr, model.ErrProviderMutationForbidden) {
+		code = http.StatusForbidden
+	} else if errors.Is(updateErr, model.ErrProviderStatusConflict) {
+		code = http.StatusConflict
+	}
+	params := map[string]any{"tag": tag, "status": status}
+	var partial *model.ProviderTagStatusError
+	if errors.As(updateErr, &partial) {
+		params["committed_ids"] = partial.CommittedIDs
+		params["failed_id"] = partial.FailedID
+		params["count"] = len(partial.CommittedIDs)
+		if status != common.ChannelStatusEnabled {
+			closeActiveChannelWebSockets(partial.CommittedIDs)
+		}
+	}
+	recordFailedManageAudit(c, action, params, code)
+	common.ApiErrorStatus(c, code, common.NewMessage("Failed to update provider"))
+}
+
 func DisableTagChannels(c *gin.Context) {
 	channelTag := ProviderTag{}
 	err := c.ShouldBindJSON(&channelTag)
@@ -823,11 +845,11 @@ func DisableTagChannels(c *gin.Context) {
 		return
 	}
 	ids := channelIDsFromChannels(channels)
-	err = model.DisableProviderByTag(channelTag.Tag, func() bool {
-		return authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelOperate)
+	err = model.DisableProviderByTag(channelTag.Tag, func(tx *gorm.DB) bool {
+		return middleware.AuthorizeDashboardMutation(tx, c, authz.ChannelOperate)
 	})
 	if err != nil {
-		common.ApiError(c, err)
+		failedProviderTagStatus(c, "channel.tag_disable", channelTag.Tag, common.ChannelStatusManuallyDisabled, err)
 		return
 	}
 	model.InitProviderCache()
@@ -849,11 +871,11 @@ func EnableTagChannels(c *gin.Context) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	err = model.EnableProviderByTag(channelTag.Tag, func() bool {
-		return authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelOperate)
+	err = model.EnableProviderByTag(channelTag.Tag, func(tx *gorm.DB) bool {
+		return middleware.AuthorizeDashboardMutation(tx, c, authz.ChannelOperate)
 	})
 	if err != nil {
-		common.ApiError(c, err)
+		failedProviderTagStatus(c, "channel.tag_enable", channelTag.Tag, common.ChannelStatusEnabled, err)
 		return
 	}
 	model.InitProviderCache()
@@ -1128,11 +1150,15 @@ func UpdateChannel(c *gin.Context) {
 			// 覆盖模式：直接使用新密钥（默认行为，不需要特殊处理）
 		}
 	}
-	requiresBind := channel.Type == constant.ChannelTypeTaskPlugin || bindingChanged
-	edit.Authorize = func() bool {
-		return authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelWrite) &&
-			(!sensitiveChanged || authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite)) &&
-			(!requiresBind || authz.Can(c.GetInt("id"), c.GetInt("role"), authz.TaskPluginBind))
+	permissions := []authz.Permission{authz.ChannelWrite}
+	if sensitiveChanged {
+		permissions = append(permissions, authz.ChannelSensitiveWrite)
+	}
+	if channel.Type == constant.ChannelTypeTaskPlugin || bindingChanged {
+		permissions = append(permissions, authz.TaskPluginBind)
+	}
+	edit.Authorize = func(tx *gorm.DB) bool {
+		return middleware.AuthorizeDashboardMutation(tx, c, permissions...)
 	}
 	err = edit.Commit(&channel.Provider)
 	if err != nil {
@@ -1192,7 +1218,7 @@ func UpdateChannelStatus(c *gin.Context) {
 	}
 	changed, err := model.ApplyProviderStatus(id, model.ProviderStatusChange{
 		Status: req.Status, Reason: "manual operation",
-		Authorize: func() bool { return authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelOperate) },
+		Authorize: func(tx *gorm.DB) bool { return middleware.AuthorizeDashboardMutation(tx, c, authz.ChannelOperate) },
 	})
 	if err != nil {
 		status := http.StatusInternalServerError
@@ -1234,7 +1260,7 @@ func BatchUpdateChannelStatus(c *gin.Context) {
 	failedID := 0
 	change := model.ProviderStatusChange{
 		Status: req.Status, Reason: "manual batch operation",
-		Authorize: func() bool { return authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelOperate) },
+		Authorize: func(tx *gorm.DB) bool { return middleware.AuthorizeDashboardMutation(tx, c, authz.ChannelOperate) },
 	}
 	for _, id := range req.Ids {
 		changed, err := model.ApplyProviderStatus(id, change)
@@ -1635,9 +1661,12 @@ func ManageMultiKeys(c *gin.Context) {
 		return
 	}
 	if edit != nil {
-		edit.Authorize = func() bool {
-			return authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelOperate) &&
-				(!multiKeyActionRequiresSensitiveWrite(request.Action) || authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite))
+		permissions := []authz.Permission{authz.ChannelOperate}
+		if multiKeyActionRequiresSensitiveWrite(request.Action) {
+			permissions = append(permissions, authz.ChannelSensitiveWrite)
+		}
+		edit.Authorize = func(tx *gorm.DB) bool {
+			return middleware.AuthorizeDashboardMutation(tx, c, permissions...)
 		}
 	}
 	if !channel.ProviderInfo.IsMultiKey {
