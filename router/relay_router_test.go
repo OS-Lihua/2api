@@ -971,16 +971,42 @@ func TestTextGatewayAllOpenProbeRemainsExclusiveAfterRetryOrderChanges(t *testin
 		name          string
 		first, second protocol.Type
 		recoverFirst  bool
+		occupyQuota   bool
+		providerQuota bool
+		lossFence     bool
+		ineligible    string
+		lateQuota     bool
 	}{
 		{name: "same protocol", first: protocol.OpenAIChat, second: protocol.OpenAIChat},
+		{name: "quota lease holder", first: protocol.OpenAIChat, second: protocol.OpenAIChat, occupyQuota: true},
+		{name: "provider quota lease holder", first: protocol.OpenAIChat, second: protocol.OpenAIChat, occupyQuota: true, providerQuota: true},
+		{name: "profitable pool after loss probe", first: protocol.OpenAIChat, second: protocol.OpenAIChat, occupyQuota: true, lossFence: true},
+		{name: "scope excludes lease holder", first: protocol.OpenAIChat, second: protocol.OpenAIChat, ineligible: "scope"},
+		{name: "capability excludes lease holder", first: protocol.OpenAIChat, second: protocol.OpenAIChat, ineligible: "capability"},
+		{name: "missing price excludes lease holder", first: protocol.OpenAIChat, second: protocol.OpenAIChat, ineligible: "price"},
+		{name: "final atomic quota rejection", first: protocol.OpenAIChat, second: protocol.OpenAIChat, occupyQuota: true, ineligible: "final quota", lateQuota: true},
 		{name: "converted lease holder", first: protocol.OpenAIResponses, second: protocol.OpenAIChat},
 		{name: "native lease holder", first: protocol.OpenAIChat, second: protocol.OpenAIResponses, recoverFirst: true},
 	} {
 		for _, shared := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/redis=%t", tc.name, shared), func(t *testing.T) {
 				var calls atomic.Int32
+				entered, release := make(chan struct{}), make(chan struct{})
+				releaseOnce := sync.OnceFunc(func() { close(release) })
+				var firstFinished chan *httptest.ResponseRecorder
+				firstDone := false
+				defer func() {
+					releaseOnce()
+					if firstFinished != nil && !firstDone {
+						<-firstFinished
+					}
+				}()
 				upstream := func(w http.ResponseWriter, r *http.Request) {
 					calls.Add(1)
+					if tc.lossFence && r.Header.Get("Authorization") == "Bearer provider-secret" {
+						close(entered)
+						<-release
+					}
 					w.Header().Set("Content-Type", "application/json")
 					if strings.HasSuffix(r.URL.Path, "/responses") {
 						_, _ = io.WriteString(w, `{"id":"recovered","object":"response","status":"completed","output":[{"type":"message","id":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Recovered","annotations":[]}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}`)
@@ -990,6 +1016,14 @@ func TestTextGatewayAllOpenProbeRemainsExclusiveAfterRetryOrderChanges(t *testin
 				}
 				fixture := newTextGatewayFixture(t, upstream)
 				second := addTextGatewayChannel(t, fixture, upstream)
+				if tc.ineligible == "price" {
+					unpriced := *fixture.channel
+					unpriced.ID = 0
+					unpriced.UpstreamModelName += "-unpriced"
+					require.NoError(t, model.DB.Create(&unpriced).Error)
+					require.NoError(t, model.DB.Model(fixture.channel).Update("status", model.ChannelDisabled).Error)
+					fixture.channel = &unpriced
+				}
 				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", tc.first).Error)
 				require.NoError(t, model.DB.Model(second).Update("protocol", tc.second).Error)
 				manager := service.ChannelHealth
@@ -1000,6 +1034,9 @@ func TestTextGatewayAllOpenProbeRemainsExclusiveAfterRetryOrderChanges(t *testin
 					t.Cleanup(func() { require.NoError(t, client.Close()) })
 					manager, observer = channelhealth.New(client), channelhealth.New(client)
 					service.ChannelHealth = manager
+					if tc.occupyQuota {
+						service.GatewayRouteQuota = service.NewGatewayRouteQuota(client)
+					}
 				}
 				ctx := t.Context()
 				ordinary, err := observer.Acquire(ctx, []int{fixture.channel.ID})
@@ -1012,24 +1049,128 @@ func TestTextGatewayAllOpenProbeRemainsExclusiveAfterRetryOrderChanges(t *testin
 					_, err = observer.Record(ctx, sample)
 					require.NoError(t, err)
 				}
-				probe, err := observer.Acquire(ctx, []int{fixture.channel.ID, second.ID})
-				require.NoError(t, err)
-				require.Equal(t, fixture.channel.ID, probe.ChannelID)
-				require.NotEmpty(t, probe.Lease)
-				defer observer.Release(ctx, probe)
+				var probe channelhealth.Admission
+				var quota *service.GatewayRoutePermit
+				body := `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`
+				if tc.occupyQuota && !tc.lateQuota {
+					var provider model.Provider
+					require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
+					if tc.providerQuota {
+						provider.ProviderInfo.RouteLimits.MaxConcurrency = 1
+						require.NoError(t, model.DB.Model(&provider).Update("channel_info", provider.ProviderInfo).Error)
+					} else {
+						fixture.channel.MaxConcurrency = 1
+						require.NoError(t, model.DB.Model(fixture.channel).Update("max_concurrency", 1).Error)
+					}
+					selection := &service.GatewaySelection{Channel: *fixture.channel, Provider: &provider}
+					if tc.lossFence {
+						second.MaxConcurrency = 1
+						require.NoError(t, model.DB.Model(second).Update("max_concurrency", 1).Error)
+						provider = model.Provider{}
+						require.NoError(t, model.DB.First(&provider, second.ProviderID).Error)
+						selection = &service.GatewaySelection{Channel: *second, Provider: &provider}
+						require.NoError(t, model.CreatePriceVersion(ctx, &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("loss",p*1000+c*1000)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+					}
+					quota, err = service.GatewayRouteQuota.Acquire(ctx, selection, 0)
+					require.NoError(t, err)
+					defer quota.Release(ctx, false)
+				}
+				if tc.lossFence {
+					firstFinished = make(chan *httptest.ResponseRecorder, 1)
+					go func() {
+						firstFinished <- adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+					}()
+					select {
+					case <-entered:
+					case early := <-firstFinished:
+						firstDone = true
+						require.FailNowf(t, "loss fallback did not reach its Provider", "%d %s", early.Code, early.Body.String())
+					}
+					require.NoError(t, quota.Release(ctx, false))
+				} else if !tc.lateQuota {
+					probe, err = observer.Acquire(ctx, []int{fixture.channel.ID, second.ID})
+					require.NoError(t, err)
+					require.Equal(t, fixture.channel.ID, probe.ChannelID)
+					require.NotEmpty(t, probe.Lease)
+					defer observer.Release(ctx, probe)
+				}
+				var lateSelection *service.GatewaySelection
+				if tc.lateQuota {
+					second.MaxConcurrency = 1
+					require.NoError(t, model.DB.Model(second).Update("max_concurrency", 1).Error)
+					var provider model.Provider
+					require.NoError(t, model.DB.First(&provider, second.ProviderID).Error)
+					lateSelection = &service.GatewaySelection{Channel: *second, Provider: &provider}
+					occupy := sync.OnceFunc(func() { quota, err = service.GatewayRouteQuota.Acquire(ctx, lateSelection, 0); require.NoError(t, err) })
+					defer func() { _ = quota.Release(ctx, false) }()
+					engine := gin.New()
+					engine.Use(middleware.RequestId())
+					engine.Use(func(c *gin.Context) {
+						c.Set(service.GatewayRouteRandomSource, func(bound uint64) uint64 { occupy(); return 0 })
+						c.Next()
+					})
+					SetRelayRouter(engine)
+					fixture.engine = engine
+				}
+				switch tc.ineligible {
+				case "scope":
+					fixture.offering.ChannelScope.ExcludeChannelIDs = []int{fixture.channel.ID}
+					require.NoError(t, model.SaveModelOffering(ctx, fixture.offering, "save"))
+				case "capability":
+					require.NoError(t, model.DB.Model(fixture.channel).Update("capabilities", capability.Set{OutputModalities: []capability.Modality{capability.Text}}).Error)
+				}
 				_, err = observer.Record(ctx, channelhealth.Sample{AttemptID: "late-ordinary", ChannelID: fixture.channel.ID,
 					ProviderFailure: true, RateLimited: true, RetryAfter: "172800", Lease: ordinary.Lease})
 				require.NoError(t, err)
-				body := `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`
+				before, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
 				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+				if tc.ineligible != "" {
+					require.Equal(t, 200, response.Code, response.Body.String())
+					assert.EqualValues(t, 1, calls.Load())
+					attempts, total, err := model.ListGatewayAttempts(ctx, response.Header().Get(common.RequestIdKey), 0, 10)
+					require.NoError(t, err)
+					require.EqualValues(t, 1, total)
+					if tc.lateQuota {
+						assert.Equal(t, fixture.channel.ID, attempts[0].ChannelID)
+						assert.ErrorIs(t, service.GatewayRouteQuota.Check(ctx, lateSelection, 0), service.ErrGatewayRateLimited)
+						recovered, err := observer.Acquire(ctx, []int{second.ID})
+						require.NoError(t, err)
+						require.Equal(t, second.ID, recovered.ChannelID)
+						require.NotEmpty(t, recovered.Lease, "failed atomic admission must return its probe lease")
+						require.NoError(t, observer.Release(ctx, recovered))
+						require.NoError(t, quota.Release(ctx, false))
+						assert.NoError(t, service.GatewayRouteQuota.Check(ctx, lateSelection, 0))
+					} else {
+						assert.Equal(t, second.ID, attempts[0].ChannelID)
+					}
+					return
+				}
 				require.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
-				assert.Zero(t, calls.Load())
+				priorCalls := int32(0)
+				if tc.lossFence {
+					priorCalls = 1
+				}
+				assert.Equal(t, priorCalls, calls.Load())
 				_, total, err := model.ListGatewayAttempts(ctx, response.Header().Get(common.RequestIdKey), 0, 10)
 				require.NoError(t, err)
 				assert.Zero(t, total)
 				wallet, err := model.GetUserWallet(fixture.user.Id)
 				require.NoError(t, err)
-				assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
+				assert.Equal(t, before.Balance, wallet.Balance)
+				if tc.lossFence {
+					require.NoError(t, model.DB.Model(fixture.offering).Update("allow_loss_fallback", false).Error)
+					allowed := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+					require.Equal(t, 200, allowed.Code, allowed.Body.String())
+					require.NoError(t, model.DB.Model(fixture.offering).Update("allow_loss_fallback", true).Error)
+					allowed = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+					require.Equal(t, 200, allowed.Code, allowed.Body.String())
+					releaseOnce()
+					first := <-firstFinished
+					firstDone = true
+					require.Equal(t, 200, first.Code, first.Body.String())
+				}
+				require.NoError(t, quota.Release(ctx, false))
 				require.NoError(t, observer.Release(ctx, probe))
 				response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
 				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
@@ -1041,7 +1182,11 @@ func TestTextGatewayAllOpenProbeRemainsExclusiveAfterRetryOrderChanges(t *testin
 					expected = fixture.channel.ID
 				}
 				assert.Equal(t, expected, attempts[0].ChannelID, "probe selection must retain native protocol priority")
-				assert.EqualValues(t, 1, calls.Load())
+				if tc.lossFence {
+					assert.EqualValues(t, 4, calls.Load())
+				} else {
+					assert.EqualValues(t, 1, calls.Load())
+				}
 			})
 		}
 	}
