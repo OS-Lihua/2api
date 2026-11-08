@@ -2518,7 +2518,7 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 		{name: "Cohere interrupted stream", stream: true, status: "partial", body: "{\"text\":\"Hello\"}\n", source: "estimated", prompt: 9, completion: 1, charge: 19800, cost: 11000},
 		{name: "Cohere failed terminal", stream: true, status: "partial", body: "{\"text\":\"Hello\"}\n{\"is_finished\":true,\"finish_reason\":\"ERROR\",\"response\":{\"meta\":{\"billed_units\":{\"input_tokens\":10,\"output_tokens\":5}}}}\n", source: "upstream", prompt: 10, completion: 5, charge: 36000, cost: 20000},
 		{name: "Cohere invalid input retains output", body: `{"text":"Hello","meta":{"billed_units":{"input_tokens":-1,"output_tokens":5}}}`, source: "estimated", prompt: 9, completion: 5, charge: 34200, cost: 19000},
-		{name: "Dify error reports cost", provider: constant.ChannelTypeDify, stream: true, status: "failed", source: "none", body: "data: {\"event\":\"error\",\"metadata\":{\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}}\n\n", cost: 20000},
+		{name: "Dify error reports cost", provider: constant.ChannelTypeDify, stream: true, status: "failed", source: "none", httpStatus: http.StatusBadGateway, body: "data: {\"event\":\"error\",\"metadata\":{\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}}\n\n", cost: 20000},
 		{name: "Dify error after output preserves counters", provider: constant.ChannelTypeDify, stream: true, status: "partial", source: "upstream", body: "data: {\"event\":\"message\",\"answer\":\"Hello\",\"metadata\":{\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":5}}}\n\ndata: {\"event\":\"error\"}\n\n", completion: 5, charge: 18000, cost: 10000},
 		{name: "Ollama HTTP failure preserves cost", provider: constant.ChannelTypeOllama, upstreamStatus: http.StatusServiceUnavailable, httpStatus: http.StatusServiceUnavailable, status: "failed", source: "none", body: `{"message":{"role":"assistant","content":"Hello"},"prompt_eval_count":10,"eval_count":5}`, cost: 20000},
 		{name: "Coze list failure preserves cost", provider: constant.ChannelTypeCoze, status: "failed", source: "none", httpStatus: http.StatusBadGateway, body: `{"code":1,"data":[],"msg":"Hello"}`, cost: 20000},
@@ -3290,7 +3290,10 @@ func TestTextGatewayNoOutputFailureReleasesReservation(t *testing.T) {
 		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	})
 	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
-	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.Equal(t, http.StatusBadGateway, response.Code, response.Body.String())
+	assert.Contains(t, response.Result().Header.Get("Content-Type"), "application/json")
+	assert.Contains(t, response.Body.String(), `"code":"upstream_error"`)
+	assert.NotContains(t, response.Body.String(), "[DONE]")
 	requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, total)
