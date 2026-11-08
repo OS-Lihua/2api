@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -8,6 +9,7 @@ import (
 	"github.com/MoeForge/moego/base64"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/capability"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -18,14 +20,61 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestResponsesUsageBoundsImageAliases(t *testing.T) {
+	previous := constant.MaxRequestBodyMB
+	constant.MaxRequestBodyMB = 1
+	t.Cleanup(func() { constant.MaxRequestBodyMB = previous })
+	info := &relaycommon.RelayInfo{TokenizerModel: "gpt-4o", StreamStatus: relaycommon.NewStreamStatus(), ResponseFacts: &relaycommon.ResponseFacts{}}
+	counter := NewResponsesUsageAccumulator(info)
+	for i, prefix := range []string{"a", "b"} {
+		item := &dto.ResponsesOutput{Type: dto.ResponsesOutputTypeImageGenerationCall, ID: strings.Repeat(prefix, 600_000), Status: "completed", Result: prefix}
+		counter.Observe(&dto.ResponsesStreamResponse{Type: dto.ResponsesOutputTypeItemDone, Item: item}, nil)
+		if i == 0 {
+			require.NoError(t, counter.Err())
+		}
+	}
+	require.Error(t, counter.Err())
+	counter.Finish()
+	require.NotNil(t, info.ResponsesUsageInfo)
+	require.Contains(t, info.ResponsesUsageInfo.BuiltInTools, dto.BuildInToolImageGeneration)
+	assert.Equal(t, 2, info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolImageGeneration].CallCount, "The final frame still contains known completed procurement")
+}
+
+func TestResponsesUsageBoundsStructuredToolPayloads(t *testing.T) {
+	previous := constant.MaxRequestBodyMB
+	constant.MaxRequestBodyMB = 1
+	t.Cleanup(func() { constant.MaxRequestBodyMB = previous })
+	info := &relaycommon.RelayInfo{TokenizerModel: "gpt-4o", StreamStatus: relaycommon.NewStreamStatus(), ResponseFacts: &relaycommon.ResponseFacts{}}
+	info.SetEstimatePromptTokens(1)
+	counter := NewResponsesUsageAccumulator(info)
+	first := []byte(`{"value":"` + strings.Repeat("a", 600_000) + `"}`)
+	second := []byte(`{"value":"` + strings.Repeat("b", 600_000) + `"}`)
+	for i, payload := range [][]byte{first, second} {
+		item := &dto.ResponsesOutput{ID: fmt.Sprint(i), Type: "function_call", Arguments: payload}
+		event := &dto.ResponsesStreamResponse{Type: "response.output_item.added", Item: item}
+		counter.Observe(event, nil)
+		if i == 0 {
+			counter.RecordDelivery(event, nil)
+			require.NoError(t, counter.Err())
+		}
+	}
+	require.Error(t, counter.Err())
+	usage := counter.Finish()
+	assert.Equal(t, tokenkit.Count("gpt-4o", string(first))+tokenkit.Count("gpt-4o", string(second)), usage.CompletionTokens, "A resource failure cannot erase known generated work")
+	require.NotNil(t, info.ResponseFacts.DeliveredOutputTokens)
+	assert.Equal(t, tokenkit.Count("gpt-4o", string(first)), *info.ResponseFacts.DeliveredOutputTokens)
+}
+
 func TestRealtimeUsageRetainsIndependentDetailsAndMissingText(t *testing.T) {
 	for _, test := range []struct {
 		name, usage                                              string
+		inputAudio                                               int
 		input, prompt, completion, audio, image, textIn, textOut int
 	}{
 		{name: "missing usage text", input: 600, prompt: 600, completion: 20, textIn: 600, textOut: 20},
 		{name: "explicit text zero", usage: `,"usage":{"input_tokens":600,"output_tokens":20,"input_token_details":{"text_tokens":0},"output_token_details":{"text_tokens":0}}`, input: 600, prompt: 600, completion: 20},
 		{name: "independent audio", usage: `,"usage":{"output_tokens":20,"input_token_details":{"audio_tokens":20000}}`, input: 10, prompt: 20000, completion: 20, audio: 20000, textOut: 20},
+		{name: "independent audio with text", usage: `,"usage":{"output_tokens":20,"input_token_details":{"audio_tokens":20000}}`, input: 610, inputAudio: 10, prompt: 20600, completion: 20, audio: 20000, textIn: 600, textOut: 20},
 		{name: "independent image", usage: `,"usage":{"output_tokens":20,"input_token_details":{"image_tokens":10000}}`, input: 85, prompt: 10000, completion: 20, image: 10000, textOut: 20},
 		{name: "explicit total zero", usage: `,"usage":{"input_tokens":0,"output_tokens":20,"input_token_details":{"audio_tokens":20000}}`, input: 10, prompt: 0, completion: 20, audio: 20000, textOut: 20},
 	} {
@@ -37,6 +86,9 @@ func TestRealtimeUsageRetainsIndependentDetailsAndMissingText(t *testing.T) {
 				input.PromptTokensDetails.AudioTokens = test.input
 			} else if test.image > 0 {
 				input.PromptTokensDetails.ImageTokens = test.input
+			}
+			if test.inputAudio > 0 {
+				input.PromptTokensDetails.AudioTokens = test.inputAudio
 			}
 			_, err := counter.Observe([]byte(`{"type":"response.created","response":{"id":"details","status":"in_progress"}}`), input, true)
 			require.NoError(t, err)
@@ -75,9 +127,11 @@ func TestRealtimeConversationRefinesAggregateInputWithoutDoubleCounting(t *testi
 	_, err = conversation.Observe([]byte(`{"type":"conversation.item.deleted","item_id":"a-output"}`), false)
 	require.NoError(t, err)
 	assert.Equal(t, 30001, conversation.Usage(false).PromptTokens, "Editing a later output cannot discard known input that preceded it")
+	require.NoError(t, conversation.Complete(&relaycommon.RealtimeResponseFacts{ID: "in-flight", Usage: &dto.Usage{PromptTokens: 40000}, Facts: &relaycommon.ResponseFacts{PromptTokensReported: true}}, false, observation))
+	assert.Equal(t, 40001, conversation.Usage(false).PromptTokens, "An in-flight input observation does not depend on an output born after it")
 	explicit := conversation.Snapshot().Observation([]byte(`{"response":{"input":[]}}`))
 	require.NoError(t, conversation.Complete(&relaycommon.RealtimeResponseFacts{ID: "explicit", Usage: &dto.Usage{PromptTokens: 90000, CompletionTokens: 1}, Facts: &relaycommon.ResponseFacts{PromptTokensReported: true}}, false, explicit))
-	assert.Equal(t, 30001, conversation.Usage(false).PromptTokens)
+	assert.Equal(t, 40001, conversation.Usage(false).PromptTokens)
 	_, err = conversation.Observe([]byte(`{"type":"conversation.item.deleted","item_id":"seed"}`), false)
 	require.NoError(t, err)
 	require.NoError(t, conversation.Complete(&relaycommon.RealtimeResponseFacts{ID: "late", Usage: &dto.Usage{PromptTokens: 50000}, Facts: &relaycommon.ResponseFacts{PromptTokensReported: true}}, false, observation))

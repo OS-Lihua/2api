@@ -136,7 +136,7 @@ func (info *RelayInfo) incrementBillableToolCall(name string) {
 // ImageGenerationCallCounter counts completed Responses image_generation_call
 // outputs with stream-safe identity deduplication.
 type ImageGenerationCallCounter struct {
-	seen  map[string]struct{}
+	seen  map[[32]byte]struct{}
 	count int
 }
 
@@ -171,15 +171,15 @@ func (c *ImageGenerationCallCounter) Observe(item *dto.ResponsesOutput, outputIn
 	aliases = append(aliases, "result:"+hex.EncodeToString(sum[:]))
 
 	if c.seen == nil {
-		c.seen = make(map[string]struct{})
+		c.seen = make(map[[32]byte]struct{})
 	}
 	for _, alias := range aliases {
-		if _, ok := c.seen[alias]; ok {
+		if _, ok := c.seen[sha256.Sum256([]byte(alias))]; ok {
 			return
 		}
 	}
 	for _, alias := range aliases {
-		c.seen[alias] = struct{}{}
+		c.seen[sha256.Sum256([]byte(alias))] = struct{}{}
 	}
 	c.count++
 }

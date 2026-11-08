@@ -632,6 +632,9 @@ func (session *realtimeGatewaySession) defaultInput(buffered bool) *dto.Usage {
 // interruption commands behind the existing request reservation boundary.
 func (session *realtimeGatewaySession) prepareSessionSettings(raw []byte, initial bool) ([]byte, *types.NewAPIError) {
 	value := ojson.ParseBytes(raw)
+	if prompt := value.Get("prompt"); prompt.Exists() && prompt.Type != ojson.Null {
+		return nil, types.NewErrorWithStatusCode(errors.New("Unknown prompt template; provide complete input and configuration"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
+	}
 	if !value.IsObject() {
 		return nil, types.NewErrorWithStatusCode(errors.New("Invalid Realtime session"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
 	}
@@ -757,6 +760,9 @@ func (session *realtimeGatewaySession) event(raw []byte) ([]byte, [][]byte, *typ
 	switch kind {
 	case "session.created", "session.updated":
 		value := ojson.GetBytes(raw, "session")
+		if prompt := value.Get("prompt"); prompt.Exists() && prompt.Type != ojson.Null {
+			return nil, nil, types.NewError(errors.New("Unknown prompt template; provide complete input and configuration"), types.ErrorCodeBadResponse)
+		}
 		var commands [][]byte
 		if kind == "session.created" {
 			session.configPending = false

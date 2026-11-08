@@ -100,6 +100,9 @@ func (call *ResponsesWSCall) SetControlAuthenticator(runner ResponsesWSRequestRu
 // EstimateInput resolves quantities known on this connection. Per-request
 // configuration is billed now but does not enter previous_response_id history.
 func (call *ResponsesWSCall) EstimateInput(c *gin.Context, info *relaycommon.RelayInfo, request *dto.OpenAIResponsesRequest, caps capability.Set) (*relaycommon.ResponsesInputFacts, error) {
+	if prompt := ojson.GetBytes(request.Prompt, "@this"); prompt.Exists() && prompt.Type != ojson.Null {
+		return nil, errors.New("Unknown prompt template; provide complete input and configuration")
+	}
 	if len(request.Conversation) > 0 && ojson.GetBytes(request.Conversation, "@this").Type != ojson.Null {
 		return nil, errors.New("Unknown conversation context; provide complete input")
 	}

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
@@ -25,21 +26,23 @@ type responseOutputState struct {
 }
 
 type ResponsesUsageAccumulator struct {
-	retainedBytes, retainedLimit int
-	budgetErr                    error
-	discarded                    responseOutputState
-	info                         *relaycommon.RelayInfo
-	usage                        *dto.Usage
-	outputText                   strings.Builder
-	outputs                      map[string]*responseOutputState
-	terminalOutputSeen           bool
-	delivered                    *ResponsesUsageAccumulator
-	imageCounter                 relaycommon.ImageGenerationCallCounter
-	itemBytes                    int
-	imageInputReported           bool
-	imageCommitted               bool
-	started                      bool
-	finished                     bool
+	retainedBytes, retainedLimit                            int
+	unretainedOutputTokens                                  int
+	budgetErr                                               error
+	discarded                                               responseOutputState
+	info                                                    *relaycommon.RelayInfo
+	usage                                                   *dto.Usage
+	outputText                                              strings.Builder
+	outputs                                                 map[string]*responseOutputState
+	terminalOutputSeen                                      bool
+	delivered                                               *ResponsesUsageAccumulator
+	imageCounter                                            relaycommon.ImageGenerationCallCounter
+	itemBytes                                               int
+	promptReported, inputTextReported, inputDetailsReported bool
+	imageInputReported                                      bool
+	imageCommitted                                          bool
+	started                                                 bool
+	finished                                                bool
 }
 
 func NewResponsesUsageAccumulator(info *relaycommon.RelayInfo) *ResponsesUsageAccumulator {
@@ -62,10 +65,15 @@ func (a *ResponsesUsageAccumulator) Err() error {
 }
 
 func (a *ResponsesUsageAccumulator) recordText(text string) {
+	if text == "" {
+		return
+	}
 	if a.budgetErr != nil {
+		a.unretainedOutputTokens += tokenkit.Count(a.info.TokenizerModelName(), text)
 		return
 	}
 	if len(text) > a.retainedLimit-a.retainedBytes {
+		a.unretainedOutputTokens += tokenkit.Count(a.info.TokenizerModelName(), text)
 		a.budgetErr = errors.New("Responses output memory budget exceeded")
 		a.info.StreamStatus.RecordError("Responses output memory budget exceeded")
 		return
@@ -106,13 +114,20 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 	if event.Response != nil {
 		a.info.ObserveResponseModel(event.Response.Model)
 		if event.Response.Usage != nil {
+			prompt, _ := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens", "", "")
+			a.promptReported = a.promptReported || prompt
+			text, _ := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens_details.text_tokens", "", "")
+			a.inputTextReported = a.inputTextReported || text
+			audio, _ := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens_details.audio_tokens", "", "")
 			image, _ := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens_details.image_tokens", "", "")
+			a.inputDetailsReported = a.inputDetailsReported || audio || image || text
 			if image || len(raw) == 0 && event.Response.Usage.PromptTokensDetails.ImageTokens > 0 {
 				a.imageInputReported = true
 			}
 			ApplyResponsesUsage(a.usage, event.Response.Usage, []byte(ojson.GetBytes(raw, "response.usage").Raw))
 			if facts := a.info.ResponseFacts; facts != nil {
 				prompt, completion := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens", "response.usage.output_tokens", "response.usage.total_tokens")
+				facts.InputDetailsReported = a.inputDetailsReported
 				reported := *a.usage
 				facts.RecordUsage(a.usage, &reported, prompt, completion)
 			}
@@ -145,7 +160,7 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 		// image items.
 		if event.Response != nil {
 			for i := range event.Response.Output {
-				a.imageCounter.Observe(&event.Response.Output[i], &i)
+				a.observeImageOutput(&event.Response.Output[i], &i)
 			}
 		}
 		a.imageCounter.Commit(a.info)
@@ -171,10 +186,24 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 			a.info.CountBillableToolCall(event.Item.Type, event.Item.Name)
 		case dto.ResponsesOutputTypeImageGenerationCall:
 			if !a.imageCommitted {
-				a.imageCounter.Observe(event.Item, event.OutputIndex)
+				a.observeImageOutput(event.Item, event.OutputIndex)
 			}
 		}
 	}
+}
+
+func (a *ResponsesUsageAccumulator) observeImageOutput(item *dto.ResponsesOutput, index *int) {
+	if item == nil || item.Type != dto.ResponsesOutputTypeImageGenerationCall {
+		return
+	}
+	a.outputState(item.ID, index)
+	if item.CallId != "" {
+		a.outputState("image-call:"+item.CallId, nil)
+	}
+	a.outputState(fmt.Sprintf("image-result:%x", sha256.Sum256([]byte(item.Result))), nil)
+	// Preserve completed procurement on the last frame; the counter keeps only
+	// fixed-size digests and the owner stops reading when Err is non-nil.
+	a.imageCounter.Observe(item, index)
 }
 
 func (a *ResponsesUsageAccumulator) rememberOutputItem(item *dto.ResponsesOutput) {
@@ -285,7 +314,7 @@ func (a *ResponsesUsageAccumulator) observeToolOutput(item *dto.ResponsesOutput,
 		if common.Unmarshal(payload, &text) == nil {
 			a.recordText(text)
 		} else {
-			a.outputText.Write(payload)
+			a.recordText(string(payload))
 		}
 		state.payloadSeen = true
 	}
@@ -336,12 +365,14 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 		if output := a.outputText.String(); output != "" {
 			a.usage.CompletionTokens = tokenkit.Count(a.info.TokenizerModelName(), output)
 		}
+		a.usage.CompletionTokens += a.unretainedOutputTokens
 	}
 	// Upstream bills the prompt as soon as it starts generating, so a stream
 	// that produced any event but no usage still owes its input tokens unless
 	// upstream reported an explicit failure.
 	billsPrompt := a.usage.CompletionTokens != 0 || (a.started && !a.info.StreamStatus.ResponseFailed())
-	if a.usage.PromptTokens == 0 && billsPrompt && (facts == nil || !facts.PromptTokensReported) {
+	promptReported := a.promptReported || facts != nil && facts.PromptTokensReported
+	if a.usage.PromptTokens == 0 && billsPrompt && !promptReported {
 		a.usage.PromptTokens = a.info.GetEstimatePromptTokens()
 	}
 	if input := a.info.ResponsesInputFacts; input != nil && (billsPrompt || a.usage.PromptTokens > 0) && !a.imageInputReported && (facts == nil || !facts.PromptTokensReported || a.usage.PromptTokens > 0) {
@@ -349,6 +380,15 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 		if facts != nil && a.usage.PromptTokensDetails.ImageTokens > 0 {
 			facts.UsageEstimated = true
 		}
+	}
+	if !promptReported && (billsPrompt || a.usage.PromptTokens > 0 || a.inputDetailsReported) {
+		text := a.usage.PromptTokensDetails.TextTokens
+		if !a.inputTextReported {
+			if input := a.info.ResponsesInputFacts; input != nil && input.Usage != nil {
+				text = max(text, max(0, input.Usage.PromptTokens-input.Usage.PromptTokensDetails.AudioTokens-input.Usage.PromptTokensDetails.ImageTokens))
+			}
+		}
+		a.usage.PromptTokens = max(a.usage.PromptTokens, text+a.usage.PromptTokensDetails.AudioTokens+a.usage.PromptTokensDetails.ImageTokens)
 	}
 	a.usage.TotalTokens = a.usage.PromptTokens + a.usage.CompletionTokens
 	if a.usage.BillingUsage != nil {

@@ -60,6 +60,7 @@ type RealtimeConversation struct {
 	context                                   *gin.Context
 	model, inputFormat                        string
 	items                                     map[string]realtimeConversationItem
+	destructiveEdits                          map[uint64]uint64
 	outputs                                   map[string]realtimeConversationOutput
 	epoch, sequence                           uint64
 	current                                   realtimeInputQuantity
@@ -84,6 +85,10 @@ func (conversation *RealtimeConversation) changeInput(previous, next realtimeInp
 	delta := next.subtract(previous)
 	if delta.total < 0 || delta.audio < 0 || delta.image < 0 || delta.audioItems < 0 || delta.imageItems < 0 {
 		conversation.epoch++
+		if conversation.destructiveEdits == nil {
+			conversation.destructiveEdits = map[uint64]uint64{}
+		}
+		conversation.destructiveEdits[sequence] = conversation.epoch
 		for id, output := range conversation.outputs {
 			if output.evidence.valid && sequence <= output.evidence.sequence {
 				output.evidence.valid = false
@@ -344,7 +349,16 @@ func (conversation *RealtimeConversation) remove(id string) {
 func (conversation *RealtimeConversation) Complete(result *relaycommon.RealtimeResponseFacts, defaultConversation bool, observations ...RealtimeInputObservation) error {
 	output := conversation.outputs[result.ID]
 	evidence := output.evidence
-	if len(observations) > 0 && observations[0].defaultInput && observations[0].epoch == conversation.epoch && result.Facts != nil && (result.Facts.PromptTokensReported || result.Facts.InputDetailsReported) {
+	observationValid := len(observations) > 0
+	if observationValid && observations[0].epoch != conversation.epoch {
+		for sequence, epoch := range conversation.destructiveEdits {
+			if sequence <= observations[0].sequence && epoch > observations[0].epoch {
+				observationValid = false
+				break
+			}
+		}
+	}
+	if observationValid && observations[0].defaultInput && result.Facts != nil && (result.Facts.PromptTokensReported || result.Facts.InputDetailsReported) {
 		observation := observations[0]
 		quantity := observation.base
 		quantity.total = max(quantity.total, max(0, result.Usage.PromptTokens-observation.configuration))
@@ -487,6 +501,9 @@ func (snapshot *RealtimeInputSnapshot) EstimateForCapabilities(body []byte, caps
 func (snapshot *RealtimeInputSnapshot) estimate(body []byte, caps *capability.Set) (*dto.Usage, error) {
 	quantity := snapshot.conversation
 	value := ojson.ParseBytes(body)
+	if prompt := value.Get("prompt"); prompt.Exists() && prompt.Type != ojson.Null {
+		return nil, errors.New("Unknown prompt template; provide complete input and configuration")
+	}
 	items := value.Get("input")
 	if items.Exists() && items.Type != ojson.Null {
 		if !items.IsArray() {

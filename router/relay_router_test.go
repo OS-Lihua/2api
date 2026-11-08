@@ -428,7 +428,7 @@ func TestResponsesWSGatewayRechecksControlAuthorization(t *testing.T) {
 }
 
 func TestResponsesWSGatewayPreservesImageInputCategories(t *testing.T) {
-	for _, scenario := range []string{"missing usage", "reported zero", "base only", "failed input"} {
+	for _, scenario := range []string{"missing usage", "reported zero", "base only", "failed input", "image detail without aggregate", "aggregate zero with image detail"} {
 		t.Run(scenario, func(t *testing.T) {
 			var fixture textGatewayFixture
 			reserved := make(chan int64, 1)
@@ -449,6 +449,10 @@ func TestResponsesWSGatewayPreservesImageInputCategories(t *testing.T) {
 				usage := ""
 				kind, status, output := "response.completed", "completed", `[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi"}]}]`
 				switch scenario {
+				case "image detail without aggregate":
+					usage = `,"usage":{"output_tokens":1,"input_tokens_details":{"image_tokens":1000}}`
+				case "aggregate zero with image detail":
+					usage = `,"usage":{"input_tokens":0,"output_tokens":1,"input_tokens_details":{"image_tokens":1000}}`
 				case "reported zero":
 					usage = `,"usage":{"input_tokens":85,"output_tokens":1,"input_tokens_details":{"image_tokens":0}}`
 				case "base only":
@@ -472,7 +476,11 @@ func TestResponsesWSGatewayPreservesImageInputCategories(t *testing.T) {
 				if owner == model.PriceOwnerChannel {
 					id = fixture.channel.ID
 				}
-				require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: owner, OwnerID: id, Currency: "USD", Expression: `tier("image",img * 1000)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+				expression := `tier("image",img * 1000)`
+				if scenario == "image detail without aggregate" || scenario == "aggregate zero with image detail" {
+					expression = `tier("base",p * 1000)`
+				}
+				require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: owner, OwnerID: id, Currency: "USD", Expression: expression, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
 			}
 			client := dialResponsesGateway(t, fixture)
 			var picture bytes.Buffer
@@ -499,6 +507,14 @@ func TestResponsesWSGatewayPreservesImageInputCategories(t *testing.T) {
 			if scenario == "reported zero" {
 				amount, cost, images, source = 0, 0, 0, "upstream"
 			}
+			if scenario == "image detail without aggregate" {
+				amount, cost, images = 900_000_000, 1_000_000_000, 1000
+				assert.EqualValues(t, 1000, records[0].Usage.PromptTokens)
+			}
+			if scenario == "aggregate zero with image detail" {
+				amount, cost, images, source = 0, 0, 1000, "upstream"
+				assert.Zero(t, records[0].Usage.PromptTokens)
+			}
 			if scenario == "failed input" {
 				amount, images, source = 0, 0, "none"
 				attempts, _, err := model.ListGatewayAttempts(t.Context(), records[0].ID, 0, 10)
@@ -511,6 +527,15 @@ func TestResponsesWSGatewayPreservesImageInputCategories(t *testing.T) {
 			assert.EqualValues(t, images, records[0].Usage.ImageInputTokens)
 			assert.Equal(t, amount, records[0].Receivable.Nanos)
 			assertTextGatewayLedger(t, records[0], cost)
+			if scenario == "image detail without aggregate" {
+				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","previous_response_id":"image-result","input":[],"max_output_tokens":1}`)))
+				_, next, err := client.ReadMessage()
+				require.NoError(t, err)
+				assert.Equal(t, "error", ojson.GetBytes(next, "type").String(), "The inherited independent input lower bound must be guaranteed before another dispatch")
+				var count int64
+				require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Where("user_id = ?", fixture.user.Id).Count(&count).Error)
+				assert.EqualValues(t, 1, count)
+			}
 			require.NoError(t, client.Close())
 		})
 	}
@@ -676,8 +701,8 @@ func TestResponsesWSGatewayResolvesItemReferences(t *testing.T) {
 	}
 }
 
-func TestResponsesWSGatewayValidatesNativeFileSources(t *testing.T) {
-	for _, source := range []string{"image ID", "file ID", "file data", "unsupported file data", "tool image ID", "tool file ID"} {
+func TestResponsesWSGatewayValidatesNativeInputSources(t *testing.T) {
+	for _, source := range []string{"image ID", "file ID", "file data", "unsupported file data", "tool image ID", "tool file ID", "prompt template"} {
 		t.Run(source, func(t *testing.T) {
 			tool := strings.HasPrefix(source, "tool ")
 			source = strings.TrimPrefix(source, "tool ")
@@ -717,7 +742,12 @@ func TestResponsesWSGatewayValidatesNativeFileSources(t *testing.T) {
 			if tool {
 				input = `[{"type":"function_call","name":"read_file","call_id":"call_A","arguments":"{}"},{"type":"function_call_output","call_id":"call_A","output":[` + part + `]}]`
 			}
-			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","input":`+input+`,"max_output_tokens":1}`)))
+			extra := ""
+			if source == "prompt template" {
+				input = `[]`
+				extra = `,"prompt":{"id":"pmpt_known"}`
+			}
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","input":`+input+extra+`,"max_output_tokens":1}`)))
 			_, reply, err := client.ReadMessage()
 			require.NoError(t, err)
 			if source != "file data" {
@@ -1540,7 +1570,7 @@ func TestRealtimeGatewayFreezesInheritedReasoning(t *testing.T) {
 }
 
 func TestRealtimeGatewayRetainsReportedInputForNextResponse(t *testing.T) {
-	for _, scenario := range []string{"default", "none default", "explicit replacement", "deleted before done", "audio details only"} {
+	for _, scenario := range []string{"default", "none default", "explicit replacement", "deleted before done", "audio details only", "inflight unrelated input deletion"} {
 		t.Run(scenario, func(t *testing.T) {
 			var calls atomic.Int32
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1579,6 +1609,20 @@ func TestRealtimeGatewayRetainsReportedInputForNextResponse(t *testing.T) {
 					created := fmt.Sprintf(`{"type":"response.created","response":{"id":%q,"status":"in_progress"}}`, id)
 					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(created))) {
 						return
+					}
+					if index == 1 && scenario == "inflight unrelated input deletion" {
+						if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
+							return
+						}
+						if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"conversation.item.created","item":{"id":"later","type":"message","role":"user","content":[{"type":"input_text","text":"Later"}]}}`))) {
+							return
+						}
+						if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
+							return
+						}
+						if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"conversation.item.deleted","item_id":"later"}`))) {
+							return
+						}
 					}
 					if index == 1 && scenario == "deleted before done" {
 						if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
@@ -1628,6 +1672,14 @@ func TestRealtimeGatewayRetainsReportedInputForNextResponse(t *testing.T) {
 			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(first)))
 			_, _, err = client.ReadMessage()
 			require.NoError(t, err)
+			if scenario == "inflight unrelated input deletion" {
+				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"conversation.item.create","item":{"id":"later","type":"message","role":"user","content":[{"type":"input_text","text":"Later"}]}}`)))
+				_, _, err = client.ReadMessage()
+				require.NoError(t, err)
+				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"conversation.item.delete","item_id":"later"}`)))
+				_, _, err = client.ReadMessage()
+				require.NoError(t, err)
+			}
 			if scenario == "deleted before done" {
 				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"conversation.item.delete","item_id":"known-input"}`)))
 				_, _, err = client.ReadMessage()
@@ -1645,7 +1697,7 @@ func TestRealtimeGatewayRetainsReportedInputForNextResponse(t *testing.T) {
 			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{}}`)))
 			_, raw, err := client.ReadMessage()
 			require.NoError(t, err)
-			if scenario == "default" || scenario == "none default" || scenario == "audio details only" {
+			if scenario == "default" || scenario == "none default" || scenario == "audio details only" || scenario == "inflight unrelated input deletion" {
 				assert.Equal(t, "error", ojson.GetBytes(raw, "type").String())
 				assert.Equal(t, int32(1), calls.Load())
 			} else {
@@ -1778,7 +1830,7 @@ func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
 }
 
 func TestRealtimeGatewayRejectsUnknownInitialVADState(t *testing.T) {
-	for _, body := range []string{`{}`, `{"modalities":["text"]}`, `{"type":"realtime","audio":{"input":{}}}`} {
+	for _, body := range []string{`{}`, `{"modalities":["text"]}`, `{"type":"realtime","audio":{"input":{}}}`, `{"modalities":["text"],"turn_detection":null,"prompt":{"id":"pmpt_known"}}`} {
 		t.Run(body, func(t *testing.T) {
 			var calls atomic.Int32
 			release := make(chan struct{}, 1)
@@ -2023,7 +2075,7 @@ func TestRealtimeGatewayRecoversControlErrorsAndAcceptsLockedModel(t *testing.T)
 }
 
 func TestRealtimeGatewayRejectsUnsupportedNativeInputsBeforeReservation(t *testing.T) {
-	for _, source := range []string{"explicit audio", "conversation image", "image reference", "two image references"} {
+	for _, source := range []string{"explicit audio", "conversation image", "image reference", "two image references", "prompt template", "session prompt template"} {
 		t.Run(source, func(t *testing.T) {
 			var calls atomic.Int32
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -2066,7 +2118,7 @@ func TestRealtimeGatewayRejectsUnsupportedNativeInputsBeforeReservation(t *testi
 			client := dialRealtimeGateway(t, fixture)
 			_, _, err := client.ReadMessage()
 			require.NoError(t, err)
-			if source != "explicit audio" {
+			if source != "explicit audio" && !strings.Contains(source, "prompt template") {
 				count := 1
 				if source == "two image references" {
 					count = 2
@@ -2083,6 +2135,10 @@ func TestRealtimeGatewayRejectsUnsupportedNativeInputsBeforeReservation(t *testi
 			}
 			create := `{"type":"response.create","response":{"conversation":"none"}}`
 			switch source {
+			case "prompt template":
+				create = `{"type":"response.create","response":{"input":[],"prompt":{"id":"pmpt_known"}}}`
+			case "session prompt template":
+				create = `{"type":"session.update","session":{"prompt":{"id":"pmpt_known"}}}`
 			case "explicit audio":
 				create = `{"type":"response.create","response":{"input":[{"type":"message","role":"user","content":[{"type":"input_audio","audio":""}]}]}}`
 			case "image reference":
