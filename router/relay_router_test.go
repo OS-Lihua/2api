@@ -11,6 +11,7 @@ import (
 	"image"
 	"image/png"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -53,6 +54,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 func TestListModelsSupportsOpenAIAndGeminiAuthentication(t *testing.T) {
@@ -980,6 +982,60 @@ func TestTextGatewayManagementEditPreservesCommittedKeyDisable(t *testing.T) {
 	}
 	assert.EqualValues(t, 1, rejected.Load())
 	assert.EqualValues(t, 2, spare.Load())
+}
+
+func TestProviderCredentialsStayOutOfDebugSQL(t *testing.T) {
+	for _, operation := range []string{"status", "name", "polling"} {
+		t.Run(operation, func(t *testing.T) {
+			const sentinel = "debug-provider-credential-sentinel"
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "Bearer "+sentinel, r.Header.Get("Authorization"))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"debug","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+			})
+			provider, err := model.GetProviderById(fixture.channel.ProviderID, true)
+			require.NoError(t, err)
+			provider.Key = sentinel
+			if operation == "polling" {
+				provider.Key += "\ndebug-spare-key"
+				provider.ProviderInfo = model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}
+			}
+			require.NoError(t, model.DB.Model(provider).Select("key", "channel_info").Updates(provider).Error)
+			var admin model.User
+			require.NoError(t, model.DB.Where("username = ?", "security-admin").First(&admin).Error)
+			adminPAT := createWalletTestAccessToken(t, admin.Id, "channel:read", "channel:write", "channel:operate")
+			var output bytes.Buffer
+			originalDB, originalDebug := model.DB, common.DebugEnabled
+			common.DebugEnabled = true
+			// Match production DEBUG: Info SQL with visible bound parameters.
+			debugLogger := gormlogger.New(log.New(&output, "", 0), gormlogger.Config{LogLevel: gormlogger.Info, ParameterizedQueries: false})
+			model.DB = model.DB.Session(&gorm.Session{Logger: debugLogger}).Debug()
+			t.Cleanup(func() { model.DB, common.DebugEnabled = originalDB, originalDebug })
+			method, path, body := http.MethodPost, fmt.Sprintf("/api/admin/v1/providers/%d/disable", provider.Id), ""
+			token := adminPAT
+			if operation == "name" {
+				method, path, body = http.MethodPatch, fmt.Sprintf("/api/admin/v1/providers/%d", provider.Id), `{"name":"Debug-safe edited Provider"}`
+			} else if operation == "polling" {
+				path, body, token = "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, fixture.token.Key
+			}
+			response := adminSecurityRequest(fixture.engine, token, method, path, body)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			read := adminSecurityRequest(fixture.engine, adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/providers/%d", provider.Id), "")
+			require.Equal(t, http.StatusOK, read.Code, read.Body.String())
+			if operation == "status" {
+				assert.Contains(t, read.Body.String(), `"status":2`)
+			} else if operation == "name" {
+				assert.Contains(t, read.Body.String(), `"name":"Debug-safe edited Provider"`)
+			}
+			assert.NotEmpty(t, output.String(), "ordinary diagnostics remain enabled")
+			assert.NotContains(t, output.String(), sentinel, "sensitive Provider sessions must not log usable credentials")
+			logs, _, err := model.GetAuditLogs(model.AuditLogFilter{}, 0, 100, common.RoleRootUser)
+			require.NoError(t, err)
+			encoded, err := common.Marshal(logs)
+			require.NoError(t, err)
+			assert.NotContains(t, string(encoded), sentinel)
+		})
+	}
 }
 
 func TestProviderBatchStatusFailureRecordsCommittedTargets(t *testing.T) {

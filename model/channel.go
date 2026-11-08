@@ -21,6 +21,7 @@ import (
 	"github.com/samber/lo"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 type Provider struct {
@@ -293,7 +294,7 @@ func (channel *Provider) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 // SaveProviderInfo persists the polling cursor without replacing credential
 // status written by another node after this Provider snapshot was loaded.
 func (channel *Provider) SaveProviderInfo() error {
-	return DB.Model(&Provider{}).
+	return providerCredentialSession().Model(&Provider{}).
 		Where(`"id" = ? AND "key" = ? AND "channel_info"::jsonb ->> 'is_multi_key' = 'true' AND "channel_info"::jsonb ->> 'multi_key_mode' = ?`,
 			channel.Id, channel.Key, constant.MultiKeyModePolling).
 		Update("channel_info", gorm.Expr(`jsonb_set("channel_info"::jsonb, '{multi_key_polling_index}', to_jsonb(?::integer), true)::json`, channel.ProviderInfo.MultiKeyPollingIndex)).Error
@@ -420,8 +421,14 @@ type ProviderEdit struct {
 	key      string
 }
 
+// Credential predicates and Provider writes must stay out of SQL logs even
+// when DEBUG enables parameter interpolation on ordinary sessions.
+func providerCredentialSession() *gorm.DB {
+	return DB.Session(&gorm.Session{Logger: DB.Logger.LogMode(gormlogger.Silent)})
+}
+
 func BeginProviderEdit(ctx context.Context, id int) (*ProviderEdit, error) {
-	tx := DB.WithContext(ctx).Begin()
+	tx := providerCredentialSession().WithContext(ctx).Begin()
 	if tx.Error != nil {
 		return nil, tx.Error
 	}
@@ -799,7 +806,7 @@ func ApplyProviderStatus(channelId int, change ProviderStatusChange) (bool, erro
 
 	changed := false
 	var beforeProvider, committedProvider *Provider
-	err := DB.Transaction(func(tx *gorm.DB) error {
+	err := providerCredentialSession().Transaction(func(tx *gorm.DB) error {
 		// Keep the stored JSON, including NULL and legacy shapes, for the CAS.
 		// Comparing the decoded/re-encoded ProviderInfo would reject legacy rows.
 		var snapshot struct {
