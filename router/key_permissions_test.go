@@ -51,6 +51,20 @@ func TestKeyPermissionsHiddenAndMissingCallsAreIndistinguishable(t *testing.T) {
 	assert.Zero(t, calls, "neither inaccessible nor nonexistent models may dispatch")
 }
 
+func TestKeyPermissionsAuthenticatesBeforeModelResolution(t *testing.T) {
+	f := newTextGatewayFixture(t, func(http.ResponseWriter, *http.Request) { t.Error("unexpected dispatch") })
+	require.NoError(t, model.DB.Migrator().DropTable(&model.ModelOfferingName{}))
+	body := `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}]}`
+	for _, key := range []string{"", "not-a-valid-key"} {
+		response := adminSecurityRequest(f.engine, key, http.MethodPost, "/v1/chat/completions", body)
+		assert.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
+		assert.NotContains(t, response.Body.String(), "Could not resolve model")
+	}
+	response := adminSecurityRequest(f.engine, f.token.Key, http.MethodPost, "/v1/chat/completions", body)
+	assert.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
+	assert.NotContains(t, response.Body.String(), "model_offering_names")
+}
+
 func TestKeyPermissionsLegacyAllowlistMigration(t *testing.T) {
 	f := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

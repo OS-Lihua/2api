@@ -6,7 +6,6 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
-	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -14,16 +13,14 @@ import (
 const textOfferingContextKey = "text_gateway_offering"
 const TextGatewayStartedAtKey = "text_gateway_started_at"
 
-// ResolveTextOffering runs before token validation so a wallet request does not
-// mutate the token's retired quota status. It does not authorize the offering;
-// the normal token checks and the gateway's visibility check still apply.
+// ResolveTextOffering resolves the authenticated Chat request's public name.
+// The gateway still checks visibility and Key permissions before dispatch.
 func ResolveTextOffering() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if c.Request.Method != http.MethodPost || c.Request.URL.Path != "/v1/chat/completions" {
 			c.Next()
 			return
 		}
-		c.Set(TextGatewayStartedAtKey, clock.Now())
 		var request struct {
 			Model string `json:"model"`
 		}

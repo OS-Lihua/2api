@@ -7,6 +7,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relaykit/types"
 
@@ -103,8 +104,13 @@ func SetRelayRouter(router *gin.Engine) {
 	relayV1Router := router.Group("/v1")
 	relayV1Router.Use(middleware.RouteTag("relay"))
 	relayV1Router.Use(middleware.SystemPerformanceCheck())
-	relayV1Router.Use(middleware.ResolveTextOffering())
+	// Keep the request's price timestamp fixed while authentication runs.
+	relayV1Router.Use(func(c *gin.Context) {
+		c.Set(middleware.TextGatewayStartedAtKey, clock.Now())
+		c.Next()
+	})
 	relayV1Router.Use(middleware.TokenAuth())
+	relayV1Router.Use(middleware.ResolveTextOffering())
 	{
 		// Responses WebSocket route. Channel selection happens after the first
 		// response.create event; each event runs the ordinary request limiter.
