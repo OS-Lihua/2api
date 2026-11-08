@@ -6529,6 +6529,7 @@
     "Task plugins": "Плагины задач",
     "Task Plugins": "Плагины задач",
     "Task price requires an available plugin usage schema": "Для цены задачи требуется доступная схема использования плагина",
+    "Task prices require request probes in independent boolean conditions": "Проверки запроса в ценах задач должны находиться в независимых логических условиях",
     "Task pricing": "Тарификация задач",
     "Task pricing must be converted manually using the task usage schema.": "Тарифы задач необходимо преобразовать вручную по схеме использования задачи.",
     "Task submission outcome unknown": "Результат отправки задачи неизвестен",

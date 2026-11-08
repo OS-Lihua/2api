@@ -15,9 +15,9 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// GatewayTaskProvider resolves credentials within the task's original Provider.
-// Operational address, keys, proxy and headers stay in Provider configuration.
-func GatewayTaskProvider(task *model.Task) (*model.Provider, error) {
+// GatewayTaskProviderIdentity resolves the original Provider configuration without
+// selecting a key. New operations retain its multi-key slot identity at dispatch.
+func GatewayTaskProviderIdentity(task *model.Task) (*model.Provider, error) {
 	snapshot := task.PrivateData.Gateway
 	if snapshot == nil {
 		return model.CacheGetProvider(task.ChannelId)
@@ -31,6 +31,16 @@ func GatewayTaskProvider(task *model.Task) (*model.Provider, error) {
 	}
 	if provider.Type != snapshot.ProviderType {
 		return nil, fmt.Errorf("task Provider identity has changed")
+	}
+	return provider, nil
+}
+
+// GatewayTaskProvider resolves one enabled credential for a persisted operation.
+// Operational address, keys, proxy and headers stay in Provider configuration.
+func GatewayTaskProvider(task *model.Task) (*model.Provider, error) {
+	provider, err := GatewayTaskProviderIdentity(task)
+	if err != nil || task.PrivateData.Gateway == nil {
+		return provider, err
 	}
 	key, _, keyErr := provider.GetNextEnabledKey()
 	if keyErr != nil || key == "" {
@@ -126,6 +136,27 @@ func PublishGatewayTask(task *model.Task) error {
 	return model.PublishPendingGatewayRecords(intent)
 }
 
+// gatewayTaskUsageSource distinguishes reported facts from retained estimates,
+// including the image_count scalar alias of the same task quantity.
+func gatewayTaskUsageSource(expression string, completed map[string]any) string {
+	keys := billingexpr.UsedUsageKeys(expression)
+	used, err := billingexpr.MoneyUsedVars(expression)
+	if err != nil {
+		return "estimated"
+	}
+	if used["image_count"] {
+		if _, reported := completed["image_count"]; !reported {
+			return "estimated"
+		}
+	}
+	for key := range keys {
+		if _, reported := completed[key]; !reported {
+			return "estimated"
+		}
+	}
+	return "upstream"
+}
+
 // SettleGatewayTask uses one plugin fact vector for both sides of the accepted
 // task. It replays the existing immutable settlement lifecycle on every retry.
 func SettleGatewayTask(ctx context.Context, task *model.Task) error {
@@ -162,24 +193,14 @@ func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 	maps.Copy(facts, snapshot.CompletionFacts)
 	request.EndedAt = clock.Now().UnixMilli()
 	request.Status = "failed"
-	request.UsageSource = "upstream"
-	for key := range billingexpr.UsedUsageKeys(request.SaleExpression) {
-		if _, reported := snapshot.CompletionFacts[key]; !reported {
-			request.UsageSource = "estimated"
-		}
-	}
+	request.UsageSource = gatewayTaskUsageSource(request.SaleExpression, snapshot.CompletionFacts)
 	request.Usage.TaskFacts = facts
 	request.Receivable = money.Amount{Currency: model.SettlementCurrency()}
 	intent.SaleSource = money.Amount{Currency: request.SaleCurrency}
 	attempt.EndedAt = request.EndedAt
 	attempt.Status = "failed"
 	attempt.Usage.TaskFacts = facts
-	attempt.UsageSource = "upstream"
-	for key := range billingexpr.UsedUsageKeys(attempt.PurchaseExpression) {
-		if _, reported := snapshot.CompletionFacts[key]; !reported {
-			attempt.UsageSource = "estimated"
-		}
-	}
+	attempt.UsageSource = gatewayTaskUsageSource(attempt.PurchaseExpression, snapshot.CompletionFacts)
 	if task.Status == model.TaskStatusSuccess {
 		request.Status, attempt.Status = "success", "success"
 		ratio, saleErr := decimal.NewFromString(request.GroupRatio)
@@ -252,6 +273,9 @@ func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 		attempt.ConvertedCost = convertedCost
 	}
 	intent.EvaluationFailed = intent.SaleEvaluationFailed || priceErr != nil || attempt.CostPending || attempt.ConvertedCostPending
+	for _, previous := range snapshot.PreviousAttempts {
+		intent.EvaluationFailed = intent.EvaluationFailed || previous.CostPending || previous.ConvertedCostPending
+	}
 	if intent.EvaluationFailed {
 		request.Status = "settlement_pending"
 		request.ErrorCode = "billing_evaluation_failed"

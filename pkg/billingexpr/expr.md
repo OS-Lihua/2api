@@ -302,7 +302,10 @@ return currency amounts in canonical task units and are not divided by one
 million. Set `MoneyInput.TaskUsage` for task evaluation, including constant task
 prices; this mode rejects `fixed()`. The host validates plugin schema and unit
 bounds before evaluation and supplies the same completed fact vector to sale
-and purchase expressions.
+and purchase expressions. In task mode, `image_count` reads the same bounded
+whole `u("image_count")` fact, including an explicitly reported zero; it never
+defaults to one. Saving this syntax requires the selected plugin schema to
+declare `image_count` as a numeric count field.
 
 Durable task pricing can set `RequestInput.FreezeMoneyRequest` to capture a
 `MoneyRequestSnapshot` in the money trace. It stores the expression hash and
@@ -316,8 +319,11 @@ This durable mode requires every `param()` / `header()` call to be enclosed by
 an independent boolean predicate. For example, a header predicate combined with
 `u("seconds") > 2` is supported: only the header decision is frozen. A direct
 comparison between a private probe and mutable usage, or a raw probe used as an
-amount, cannot be replayed without retaining input values and is rejected before
-submission. Normal request-scoped evaluation retains its existing grammar.
+amount, cannot be replayed without retaining input values and is rejected by
+price-version management when a task owner is selected, as well as before
+submission for historical configurations. An incomplete snapshot fails closed
+when the missing predicate is required. Normal request-scoped evaluation retains
+its existing grammar.
 A predicate that failed in an unused branch is retained as unavailable; if final
 usage selects it, the existing pending-accounting lifecycle preserves the facts.
 

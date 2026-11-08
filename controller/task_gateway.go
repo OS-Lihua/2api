@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"maps"
@@ -116,6 +117,8 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 	var lastStatus = http.StatusServiceUnavailable
 	var lastCode = "channel_unavailable"
 	parent := c.Request
+	originalTaskRequest, hasTaskRequest := c.Get("task_request")
+	originalBodyText, hasBodyText := c.Get(jsplugin.ContextKeyRequestBodyText)
 	attempts := service.RunGatewayAttempts(parent.Context(), service.GatewayPolicy(), func(budget *service.GatewayAttemptBudget, exclusions *service.GatewayExclusions) (result service.GatewayAttemptResult) {
 		defer func() {
 			if result.Attempt != nil {
@@ -132,6 +135,7 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 			return
 		}
 		var selected *model.Channel
+		var eligible []int
 		for i := range candidates {
 			candidate := &candidates[i]
 			if pinnedChannelID != 0 && candidate.ID != pinnedChannelID {
@@ -149,9 +153,26 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 			if exclusions.Providers[providerID] {
 				continue
 			}
-			selected = candidate
-			break
+			eligible = append(eligible, candidate.ID)
 		}
+		admission, err := service.ChannelHealth.Acquire(parent.Context(), eligible)
+		if err != nil || admission.ChannelID == 0 {
+			return
+		}
+		for i := range candidates {
+			if candidates[i].ID == admission.ChannelID {
+				selected = &candidates[i]
+				break
+			}
+		}
+		stopProbe := service.ChannelHealth.KeepAlive(parent.Context(), admission)
+		defer stopProbe()
+		defer func() {
+			if result.Attempt == nil {
+				_ = service.ChannelHealth.Release(context.WithoutCancel(parent.Context()), admission)
+			}
+		}()
+		result.HealthLease = admission.Lease
 		if selected == nil {
 			return
 		}
@@ -159,8 +180,8 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 		provider := &selected.Provider
 		if len(origins) > 0 {
 			var err error
-			provider, err = service.GatewayTaskProvider(origins[0])
-			if err != nil {
+			provider, err = service.GatewayTaskProviderIdentity(origins[0])
+			if err != nil || provider.Status != common.ChannelStatusEnabled {
 				return
 			}
 		}
@@ -172,6 +193,49 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 		}
 		info := &relaycommon.RelayInfo{UserId: c.GetInt("id"), TokenId: c.GetInt("token_id"), UsingGroup: group, OriginModelName: requested, StartTime: started, RequestId: requestID, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: publicTaskID}}
 		info.InitChannelMeta(c)
+		var overrides map[string]any
+		if err := common.UnmarshalJsonStr(selected.ParameterOverrides, &overrides); err != nil {
+			return
+		}
+		info.ParamOverride = overrides
+		if hasTaskRequest {
+			c.Set("task_request", originalTaskRequest)
+		} else {
+			delete(c.Keys, "task_request")
+		}
+		if hasBodyText {
+			c.Set(jsplugin.ContextKeyRequestBodyText, originalBodyText)
+		} else {
+			delete(c.Keys, jsplugin.ContextKeyRequestBodyText)
+		}
+		if len(overrides) > 0 {
+			body := originalTaskRequest
+			if !hasTaskRequest {
+				value, _ := c.Get(jsplugin.ContextKeyRouteRequest)
+				route, ok := value.(jsplugin.RouteRequestContext)
+				if !ok {
+					return
+				}
+				body = route.RequestBody
+			}
+			encoded, err := common.Marshal(body)
+			if err != nil {
+				return
+			}
+			encoded, err = relaycommon.ApplyParamOverrideWithRelayInfo(encoded, info)
+			if err != nil {
+				return
+			}
+			var effective map[string]any
+			if err := common.Unmarshal(encoded, &effective); err != nil {
+				return
+			}
+			if source, ok := body.(map[string]any); ok && effective["model"] != source["model"] {
+				return
+			}
+			c.Set("task_request", effective)
+			c.Set(jsplugin.ContextKeyRequestBodyText, json.RawMessage(encoded))
+		}
 		info.Action = c.GetString("task_action")
 		info.UpstreamModelName = selected.UpstreamModelName
 		if len(origins) > 0 {
@@ -254,11 +318,17 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 			lastStatus, lastCode = 400, "unsupported_task_action"
 			return
 		}
-		purchase, _, rate, err := gatewayChannelPurchaseSnapshot(c.Request.Context(), selected.ID, clock.Now())
-		if err != nil {
+		// Reject missing prices before Provider preparation I/O; freeze the actual
+		// version again at the model-send boundary after preparation completes.
+		if _, _, _, err := gatewayChannelPurchaseSnapshot(c.Request.Context(), selected.ID, clock.Now()); err != nil {
 			return
 		}
 		body, err := adaptor.BuildRequestBody(c, info)
+		if err != nil {
+			return
+		}
+		attemptStart := clock.Now()
+		purchase, _, rate, err := gatewayChannelPurchaseSnapshot(c.Request.Context(), selected.ID, attemptStart)
 		if err != nil {
 			return
 		}
@@ -268,7 +338,7 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 		}
 		c.Request = parent.WithContext(attemptContext)
 		defer func() { c.Request = parent }()
-		attempt := &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: requestID, ChannelID: selected.ID, ProviderID: provider.Id, ModelID: selected.ModelID, StartedAt: clock.Now().UnixMilli(), PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, AccountingFXRate: rate, Cost: money.Amount{Currency: purchase.Currency}, ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, UsageSource: "none", Status: "failed", ConversionLosses: []string{}, RouteDiagnostics: map[string]any{}}
+		attempt := &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: requestID, ChannelID: selected.ID, ProviderID: provider.Id, ModelID: selected.ModelID, StartedAt: attemptStart.UnixMilli(), PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, AccountingFXRate: rate, Cost: money.Amount{Currency: purchase.Currency}, ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, UsageSource: "none", Status: "failed", ConversionLosses: []string{}, RouteDiagnostics: map[string]any{}}
 		for _, member := range offering.Members {
 			if member.ModelID == selected.ModelID {
 				attempt.MemberTier = member.Tier
@@ -323,11 +393,41 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 		}
 		defer response.Body.Close()
 		if response.StatusCode/100 != 2 {
-			_, _ = io.Copy(io.Discard, response.Body)
-			result.Failure = service.ClassifyGatewayFailure(response.StatusCode, "", false, budget.TimedOut(), parent.Context().Err() != nil, false)
+			raw, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+			var payload struct {
+				Error any    `json:"error"`
+				Code  string `json:"code"`
+			}
+			var code, kind string
+			if common.Unmarshal(raw, &payload) == nil {
+				code = payload.Code
+				switch failure := payload.Error.(type) {
+				case string:
+					code = failure
+				case map[string]any:
+					kind, _ = failure["type"].(string)
+					code, _ = failure["code"].(string)
+					if code == "" {
+						code = kind
+					}
+				}
+			}
+			result.Failure = service.ClassifyGatewayFailure(response.StatusCode, code, false, budget.TimedOut(), parent.Context().Err() != nil, false, kind)
+			if result.Failure.Class == "rate_limited" {
+				result.RetryAfter = response.Header.Get("Retry-After")
+			}
+			gatewayAutoDisableProvider(c, selected.ID, provider, info, result.Failure)
 			attempt.ErrorClass = result.Failure.Class
+			// A rejection without reported billing facts cannot establish a free
+			// Provider operation. Reconcile procurement without holding user funds.
+			attempt.CostPending, attempt.ConvertedCostPending = true, true
+			lastStatus, lastCode = response.StatusCode, "upstream_error"
+			if lastStatus < 400 || lastStatus > 599 {
+				lastStatus = http.StatusBadGateway
+			}
 			return
 		}
+		result.FirstByte = max(clock.Now().Sub(attemptStart), time.Nanosecond)
 		// Once accepted, never submit this operation on another Channel.
 		upstreamAccepted = true
 		result.Delivered = true
@@ -392,6 +492,13 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 		}
 		record.EndedAt = clock.Now().UnixMilli()
 		intent := model.GatewaySettlement{Request: *record, Attempts: attempts, SaleSource: money.Amount{Currency: sale.Currency}}
+		for _, attempt := range attempts {
+			if attempt.CostPending || attempt.ConvertedCostPending {
+				intent.EvaluationFailed = true
+				intent.Request.Status = "settlement_pending"
+				intent.Request.ErrorCode = "billing_evaluation_failed"
+			}
+		}
 		if err := model.PrepareGatewaySettlement(intent); err == nil {
 			_, _ = model.SettleGateway(record.ID)
 			_ = model.PublishGatewayRecords(record.ID)

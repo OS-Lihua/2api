@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/money"
@@ -235,6 +236,19 @@ func validatePriceExpression(ctx context.Context, db *gorm.DB, expression string
 // Identical selected schemas share one smoke validation, even when many
 // Channels or member Models use the same plugin profile.
 func validateTaskPriceSchema(expression string, schema map[string]jsplugin.UsageFieldSchema, validated map[string]bool) error {
+	if err := billingexpr.ValidateMoneyRequestSnapshot(expression); err != nil {
+		return common.NewMessage("Task prices require request probes in independent boolean conditions")
+	}
+	used, err := billingexpr.MoneyUsedVars(expression)
+	if err != nil {
+		return common.NewMessage("Invalid price expression")
+	}
+	if used["image_count"] {
+		field, ok := schema["image_count"]
+		if !ok || field.Type != "number" || field.Unit != "count" {
+			return common.NewMessage("Invalid price expression")
+		}
+	}
 	encoded, err := common.Marshal(schema)
 	if err != nil {
 		return common.NewMessage("Invalid price expression")

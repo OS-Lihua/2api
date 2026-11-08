@@ -6529,6 +6529,7 @@
     "Task plugins": "Plugins de tâche",
     "Task Plugins": "Plugins de tâches",
     "Task price requires an available plugin usage schema": "Le prix des tâches nécessite un schéma d’utilisation de plugin disponible",
+    "Task prices require request probes in independent boolean conditions": "Les sondes de requête des prix de tâche doivent figurer dans des conditions booléennes indépendantes",
     "Task pricing": "Tarification des tâches",
     "Task pricing must be converted manually using the task usage schema.": "La tarification des tâches doit être convertie manuellement selon leur schéma d’utilisation.",
     "Task submission outcome unknown": "Résultat de soumission inconnu",

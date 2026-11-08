@@ -6529,6 +6529,7 @@
     "Task plugins": "任務外掛",
     "Task Plugins": "任务外掛",
     "Task price requires an available plugin usage schema": "任務價格需要可用的外掛用量結構",
+    "Task prices require request probes in independent boolean conditions": "任務價格中的請求探針必須位於獨立布林條件內",
     "Task pricing": "任務定價",
     "Task pricing must be converted manually using the task usage schema.": "任務定價需根據任務用量定義手動轉換。",
     "Task submission outcome unknown": "任務提交結果未知",

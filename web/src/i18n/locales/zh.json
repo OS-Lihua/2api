@@ -6529,6 +6529,7 @@
     "Task plugins": "任务插件",
     "Task Plugins": "任务插件",
     "Task price requires an available plugin usage schema": "任务价格需要可用的插件用量结构",
+    "Task prices require request probes in independent boolean conditions": "任务价格中的请求探针必须位于独立布尔条件内",
     "Task pricing": "任务定价",
     "Task pricing must be converted manually using the task usage schema.": "任务定价需根据任务用量定义手动转换。",
     "Task submission outcome unknown": "任务提交结果未知",

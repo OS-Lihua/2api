@@ -6529,6 +6529,7 @@
     "Task plugins": "タスクプラグイン",
     "Task Plugins": "タスクプラグイン",
     "Task price requires an available plugin usage schema": "タスク価格には利用可能なプラグインの使用量スキーマが必要です",
+    "Task prices require request probes in independent boolean conditions": "タスク価格のリクエストプローブは独立した真偽条件内で使用してください",
     "Task pricing": "タスク料金",
     "Task pricing must be converted manually using the task usage schema.": "タスク料金はタスクの使用量スキーマに基づいて手動で変換してください。",
     "Task submission outcome unknown": "タスク送信結果が不明",

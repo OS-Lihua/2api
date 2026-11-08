@@ -6529,6 +6529,7 @@
     "Task plugins": "Task plugins",
     "Task Plugins": "Task Plugins",
     "Task price requires an available plugin usage schema": "Task price requires an available plugin usage schema",
+    "Task prices require request probes in independent boolean conditions": "Task prices require request probes in independent boolean conditions",
     "Task pricing": "Task pricing",
     "Task pricing must be converted manually using the task usage schema.": "Task pricing must be converted manually using the task usage schema.",
     "Task submission outcome unknown": "Task submission outcome unknown",

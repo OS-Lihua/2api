@@ -160,7 +160,7 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 			if input.Request.MoneySnapshot == nil {
 				return false
 			}
-			_, exists := input.Request.MoneySnapshot.Conditions[condition]
+			_, exists := entry.moneySnapshotPrograms[condition]
 			return exists
 		},
 		"_money_frozen_condition": func(condition string) (bool, error) {
@@ -203,11 +203,22 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 	}
 	imageCount := 1
 	if entry.usedVars["image_count"] {
-		if input.Request.ImageCount != nil {
+		minimum := 1
+		if input.TaskUsage {
+			fact, err := env["u"].(func(string) (any, error))("image_count")
+			if err != nil {
+				return money.Value{}, trace, err
+			}
+			quantity, err := exactNumber(fact)
+			if err != nil || !quantity.IsInt() || quantity.Sign() < 0 || quantity.Cmp(big.NewRat(dto.MaxImageN, 1)) > 0 {
+				return money.Value{}, trace, fmt.Errorf("image_count must be a bounded whole task usage fact")
+			}
+			imageCount, minimum = int(quantity.Num().Int64()), 0
+		} else if input.Request.ImageCount != nil {
 			imageCount = *input.Request.ImageCount
 		}
-		if imageCount < 1 || imageCount > dto.MaxImageN {
-			return money.Value{}, trace, fmt.Errorf("image_count must be between 1 and %d", dto.MaxImageN)
+		if imageCount < minimum || imageCount > dto.MaxImageN {
+			return money.Value{}, trace, fmt.Errorf("image_count must be between %d and %d", minimum, dto.MaxImageN)
 		}
 		trace.ImageCount = &imageCount
 	}
@@ -244,10 +255,10 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 	if entry.moneyErr != nil {
 		return money.Value{}, trace, entry.moneyErr
 	}
+	if (input.Request.FreezeMoneyRequest || input.Request.MoneySnapshot != nil) && entry.moneySnapshotErr != nil {
+		return money.Value{}, trace, entry.moneySnapshotErr
+	}
 	if input.Request.FreezeMoneyRequest {
-		if entry.moneySnapshotErr != nil {
-			return money.Value{}, trace, entry.moneySnapshotErr
-		}
 		snapshot := &MoneyRequestSnapshot{ExpressionHash: ExprHashString(expression), Conditions: make(map[string]*bool, len(entry.moneySnapshotPrograms))}
 		conditionEnv := maps.Clone(env)
 		conditionEnv["_money_condition"] = func(_ string, value any) (bool, error) {

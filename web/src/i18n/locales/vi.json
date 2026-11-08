@@ -6529,6 +6529,7 @@
     "Task plugins": "Plugin tác vụ",
     "Task Plugins": "Plugin tác vụ",
     "Task price requires an available plugin usage schema": "Giá tác vụ cần lược đồ sử dụng của plugin khả dụng",
+    "Task prices require request probes in independent boolean conditions": "Các phép dò yêu cầu trong giá tác vụ phải nằm trong điều kiện boolean độc lập",
     "Task pricing": "Giá tác vụ",
     "Task pricing must be converted manually using the task usage schema.": "Cần chuyển đổi giá tác vụ thủ công theo lược đồ mức sử dụng tác vụ.",
     "Task submission outcome unknown": "Chưa rõ kết quả gửi tác vụ",

@@ -26,6 +26,8 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/channelhealth"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/money"
@@ -593,7 +595,7 @@ func TestAsyncTaskFailoverAndConcurrentCompletionChargeOnce(t *testing.T) {
 	close(release)
 	workers.Wait()
 	_, err := service.RecoverGatewayTasks(t.Context(), 100)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, model.ErrGatewayEvaluationPending)
 	requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, total)
@@ -610,8 +612,12 @@ func TestAsyncTaskFailoverAndConcurrentCompletionChargeOnce(t *testing.T) {
 			assert.Equal(t, "switch", attempt.FailoverDecision)
 			assert.Equal(t, "failed", attempt.Status)
 			assert.Zero(t, attempt.Cost.Nanos)
+			assert.True(t, attempt.CostPending, "the rejected attempt has no reported procurement facts")
+			assert.True(t, attempt.ConvertedCostPending)
 		}
 	}
+	assert.Equal(t, "settlement_pending", requests[0].Status)
+	assert.False(t, requests[0].SalePending)
 	for _, kind := range []model.LedgerEntryType{model.LedgerEntryPreConsume, model.LedgerEntryPreConsumeRelease, model.LedgerEntryCharge} {
 		var count int64
 		require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id = ? AND account_type = ? AND type = ?", requests[0].ID, model.LedgerAccountUserWallet, kind).Count(&count).Error)
@@ -802,11 +808,14 @@ func TestAsyncTaskInsufficientWalletDoesNotExchangeProviderCredentials(t *testin
 	generationURL, err := url.Parse(provider.GetBaseURL())
 	require.NoError(t, err)
 	var exchanges atomic.Int32
+	scheduled := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("new", u("seconds") * 0.2)`, EffectiveAt: clock.Now().Unix() + 1}
+	require.NoError(t, model.CreatePriceVersion(t.Context(), scheduled, fixture.sale.CreatedBy))
 	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		exchanges.Add(1)
 		var reservations int64
 		require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id <> '' AND type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
 		assert.EqualValues(t, 1, reservations, "credential exchange must follow the reservation")
+		fixture.fake.Advance(2 * time.Second)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"access_token":%q,"token_type":"Bearer","expires_in":3600}`, exchangedKey)
 	}))
@@ -848,6 +857,11 @@ func TestAsyncTaskInsufficientWalletDoesNotExchangeProviderCredentials(t *testin
 	var task model.Task
 	require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
 	assert.Empty(t, task.PrivateData.Key)
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), task.PrivateData.Gateway.Settlement.Request.ID, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, scheduled.ID, attempts[0].PurchasePriceVersionID, "purchase price freezes at the model send after OAuth preparation")
+	assert.GreaterOrEqual(t, attempts[0].StartedAt, scheduled.EffectiveAt*1000)
 }
 
 func TestAsyncTaskRecoveryDoesNotStarveLaterTerminalFacts(t *testing.T) {
@@ -1088,6 +1102,73 @@ func TestAsyncTaskFreezesOriginalSaleAndFinalWirePricingConditions(t *testing.T)
 	}
 }
 
+func TestAsyncTaskPricingRejectsUnsafeDurableProbes(t *testing.T) {
+	calls := 0
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) { calls++ })
+	pricingPAT := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "pricing:read", "pricing:write")
+	for _, owner := range []struct {
+		kind string
+		id   int
+	}{{model.PriceOwnerOffering, fixture.offering.ID}, {model.PriceOwnerChannel, fixture.channel.ID}} {
+		for i, expression := range []string{
+			`tier("video", u("seconds") * (param("rate") ?? 0.1))`,
+			`u("seconds") < (param("threshold") ?? 3) ? tier("low", u("seconds") * 0.1) : tier("high", u("seconds") * 0.2)`,
+		} {
+			body, err := common.Marshal(map[string]any{"owner_type": owner.kind, "owner_id": owner.id, "currency": "USD", "expression": expression, "effective_at": clock.Now().Unix() + int64(i+1)})
+			require.NoError(t, err)
+			response := adminSecurityRequest(fixture.engine, pricingPAT, http.MethodPost, "/api/admin/v1/price-versions", string(body))
+			assert.Equal(t, 400, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), "independent boolean conditions")
+		}
+	}
+	// Historical or externally inserted prices must fail closed at dispatch too.
+	fixture.fake.Advance(10 * time.Second)
+	price := &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, OfferingID: &fixture.offering.ID, Currency: "USD", Expression: `tier("video", u("seconds") * float(header("x-rate")))`, EffectiveAt: clock.Now().Unix(), CreatedAt: clock.Now().Unix(), CreatedBy: fixture.sale.CreatedBy}
+	require.NoError(t, model.DB.Omit("Creator", "Channel", "Offering").Create(price).Error)
+	request := httptest.NewRequest(http.MethodPost, "/v1/tasks/sora", strings.NewReader(`{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+	request.Header.Set("X-Rate", "0.1")
+	response := httptest.NewRecorder()
+	fixture.engine.ServeHTTP(response, request)
+	assert.Equal(t, 503, response.Code, response.Body.String())
+	assert.Zero(t, calls)
+	var count int64
+	require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Count(&count).Error)
+	assert.Zero(t, count)
+}
+
+func TestAsyncTaskPricingSnapshotReplaysOnlyCapturedRequestConditions(t *testing.T) {
+	const expression = `u("seconds") > 2 ? tier("initial", u("seconds") * 0.1) : (float(param("rate")) > 0 ? tier("final", u("seconds") * 0.3) : tier("zero", 0))`
+	_, trace, err := billingexpr.RunMoneyExpr(expression, billingexpr.MoneyInput{TaskUsage: true, Request: billingexpr.RequestInput{Usage: map[string]any{"seconds": 4}, Body: []byte(`{}`), FreezeMoneyRequest: true}}, "USD")
+	require.NoError(t, err)
+	require.NotNil(t, trace.RequestSnapshot)
+	_, _, err = billingexpr.RunMoneyExpr(expression, billingexpr.MoneyInput{TaskUsage: true, Request: billingexpr.RequestInput{Usage: map[string]any{"seconds": 2}, MoneySnapshot: trace.RequestSnapshot}}, "USD")
+	require.ErrorContains(t, err, "frozen pricing condition is unavailable")
+	_, _, err = billingexpr.RunMoneyExpr(expression+` + 0`, billingexpr.MoneyInput{TaskUsage: true, Request: billingexpr.RequestInput{Usage: map[string]any{"seconds": 2}, MoneySnapshot: trace.RequestSnapshot}}, "USD")
+	require.ErrorContains(t, err, "does not match its expression")
+	const zeroFalse = `param("zero") == 0 && param("disabled") == false ? tier("explicit", u("seconds") * 0.2) : tier("other", u("seconds") * 0.1)`
+	var snapshots []*billingexpr.MoneyRequestSnapshot
+	for _, body := range []string{`{"zero":0,"disabled":false}`, `{}`} {
+		_, trace, err := billingexpr.RunMoneyExpr(zeroFalse, billingexpr.MoneyInput{TaskUsage: true, Request: billingexpr.RequestInput{Usage: map[string]any{"seconds": 4}, Body: []byte(body), FreezeMoneyRequest: true}}, "USD")
+		require.NoError(t, err)
+		snapshots = append(snapshots, trace.RequestSnapshot)
+	}
+	// Reuse the cached expression after a second request captures opposite values.
+	for i, expected := range []int64{400000000, 200000000} {
+		value, _, err := billingexpr.RunMoneyExpr(zeroFalse, billingexpr.MoneyInput{TaskUsage: true, Request: billingexpr.RequestInput{Usage: map[string]any{"seconds": 2}, MoneySnapshot: snapshots[i]}}, "USD")
+		require.NoError(t, err)
+		amount, err := value.Receivable()
+		require.NoError(t, err)
+		assert.Equal(t, expected, amount.Nanos)
+	}
+	for condition := range snapshots[0].Conditions {
+		delete(snapshots[0].Conditions, condition)
+	}
+	_, _, err = billingexpr.RunMoneyExpr(zeroFalse, billingexpr.MoneyInput{TaskUsage: true, Request: billingexpr.RequestInput{Usage: map[string]any{"seconds": 2}, MoneySnapshot: snapshots[0]}}, "USD")
+	require.ErrorContains(t, err, "frozen pricing condition is unavailable", "an incomplete snapshot must not re-evaluate absent raw probes")
+}
+
 func TestAsyncTaskEvaluationFailuresUseExistingGatewayReconciliation(t *testing.T) {
 	for _, tc := range []struct {
 		name, sale, purchase, status               string
@@ -1263,6 +1344,200 @@ func TestAsyncTaskImmediateImagesReturnOnceWithoutPersistingResults(t *testing.T
 			assert.Equal(t, money.Currency("USD"), attempts[0].Cost.Currency)
 		})
 	}
+}
+
+func TestAsyncTaskRemixCredentialFailureDisablesOnlySelectedOriginalKey(t *testing.T) {
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/remix") {
+			assert.Equal(t, "Bearer spare-secret", r.Header.Get("Authorization"))
+			w.WriteHeader(401)
+			_, _ = w.Write([]byte(`{"error":{"code":"invalid_api_key"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"original-job","status":"queued"}`))
+	})
+	previous := common.AutomaticDisableChannelEnabled
+	common.AutomaticDisableChannelEnabled = true
+	t.Cleanup(func() { common.AutomaticDisableChannelEnabled = previous })
+	provider, err := model.GetProviderById(fixture.channel.ProviderID, true)
+	require.NoError(t, err)
+	provider.Key = "first-secret\nspare-secret"
+	provider.AutoBan = common.GetPointer(1)
+	provider.ProviderInfo = model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}
+	require.NoError(t, model.DB.Model(provider).Select("key", "auto_ban", "channel_info").Updates(provider).Error)
+	SetVideoRouter(fixture.engine)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	var task model.Task
+	require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
+	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/videos/"+task.TaskID+"/remix", `{"prompt":"A blue bird"}`)
+	require.Equal(t, 401, response.Code, response.Body.String())
+	provider, err = model.GetProviderById(provider.Id, true)
+	require.NoError(t, err)
+	assert.Equal(t, common.ChannelStatusEnabled, provider.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, provider.ProviderInfo.MultiKeyStatusList[1])
+	assert.NotEqual(t, common.ChannelStatusAutoDisabled, provider.ProviderInfo.MultiKeyStatusList[0])
+}
+
+func TestAsyncTaskHealthAdmissionSkipsCoolingChannel(t *testing.T) {
+	firstCalls := 0
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		firstCalls++
+		w.Header().Set("Retry-After", "172800")
+		w.WriteHeader(429)
+		_, _ = w.Write([]byte(`{"error":{"code":"rate_limit_exceeded"}}`))
+	})
+	secondCalls := 0
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"healthy-job-%d","status":"queued"}`, secondCalls)
+	}))
+	t.Cleanup(second.Close)
+	provider := &model.Provider{Name: "Healthy task Provider", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Key: "healthy-secret", BaseURL: &second.URL}
+	require.NoError(t, model.DB.Create(provider).Error)
+	channel := &model.Channel{ProviderID: provider.Id, ModelID: fixture.channel.ModelID, Protocol: "task:sora", UpstreamModelName: "sora-2", MappingConfirmed: true, Status: model.ChannelEnabled, Weight: 1, ParameterOverrides: `{}`}
+	require.NoError(t, model.DB.Create(channel).Error)
+	require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: channel.ID, Currency: "USD", Expression: `tier("video", u("seconds") * 0.05)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+	for range 2 {
+		response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+		require.Equal(t, 200, response.Code, response.Body.String())
+	}
+	assert.Equal(t, 1, firstCalls, "a cooling Channel must not be submitted again while a healthy Channel exists")
+	assert.Equal(t, 2, secondCalls)
+}
+
+func TestAsyncTaskRejectedAttemptsPreserveErrorsAndUnknownCosts(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		code   string
+	}{{400, "invalid_request_error"}, {413, "invalid_request_error"}, {422, "invalid_request_error"}, {401, "invalid_api_key"}, {429, "rate_limit_exceeded"}, {400, "insufficient_quota"}, {503, "overloaded"}} {
+		t.Run(fmt.Sprintf("%d_%s", tc.status, tc.code), func(t *testing.T) {
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Retry-After", "172800")
+				w.WriteHeader(tc.status)
+				_, _ = fmt.Fprintf(w, `{"error":{"code":%q,"message":"private-provider-error-secret"}}`, tc.code)
+			})
+			previous := common.AutomaticDisableChannelEnabled
+			common.AutomaticDisableChannelEnabled = true
+			t.Cleanup(func() { common.AutomaticDisableChannelEnabled = previous })
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("auto_ban", 1).Error)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+			assert.Equal(t, tc.status, response.Code, response.Body.String())
+			assert.NotContains(t, response.Body.String(), "private-provider-error-secret")
+			requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Zero(t, requests[0].Receivable.Nanos)
+			assert.False(t, requests[0].SalePending)
+			assert.Equal(t, "settlement_pending", requests[0].Status)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), requests[0].ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.True(t, attempts[0].CostPending)
+			assert.True(t, attempts[0].ConvertedCostPending)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.EqualValues(t, 1000000000, wallet.Balance.Nanos)
+			if tc.status == 401 || tc.code == "insufficient_quota" {
+				var provider model.Provider
+				require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
+				assert.Equal(t, common.ChannelStatusAutoDisabled, provider.Status)
+				var audits []model.AuditLog
+				require.NoError(t, model.LOG_DB.Where("action = ?", "provider.auto_disable").Find(&audits).Error)
+				require.Len(t, audits, 1)
+				assert.True(t, audits[0].Success)
+				encoded, err := common.Marshal(audits)
+				require.NoError(t, err)
+				assert.NotContains(t, string(encoded), "provider-secret")
+				assert.NotContains(t, string(encoded), "private-provider-error-secret")
+			}
+			if tc.status == 429 {
+				details := adminSecurityRequest(fixture.engine, fixture.adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/channels/%d", fixture.channel.ID), "")
+				require.Equal(t, 200, details.Code)
+				var view struct {
+					Data struct {
+						Health channelhealth.Snapshot `json:"health"`
+					} `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(details.Body.Bytes(), &view))
+				assert.Equal(t, "open", view.Data.Health.Circuit)
+				assert.Equal(t, fixture.fake.Now().Add(48*time.Hour).UnixMilli(), view.Data.Health.RetryAt)
+			}
+		})
+	}
+}
+
+func TestAsyncTaskChannelOverridesChangeWireAndBillingFacts(t *testing.T) {
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"id":"override-job","status":"completed","seconds":"8"}`))
+			return
+		}
+		var body map[string]any
+		require.NoError(t, common.DecodeJson(r.Body, &body))
+		assert.Equal(t, "8", body["seconds"])
+		_, _ = w.Write([]byte(`{"id":"override-job","status":"queued"}`))
+	})
+	require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", `{"seconds":"8"}`).Error)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	var task model.Task
+	require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
+	assert.EqualValues(t, 8, task.PrivateData.Gateway.Facts["seconds"])
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.EqualValues(t, 280000000, wallet.Balance.Nanos)
+	service.RunTaskPollingOnce(t.Context(), nil)
+	requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.EqualValues(t, 720000000, requests[0].Receivable.Nanos)
+}
+
+func TestAsyncTaskImageCountUsesCompletedFactsOnBothSides(t *testing.T) {
+	calls := 0
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":{"choices":[{"message":{"content":[{"image":"https://artifact.invalid/one.png"},{"image":"https://artifact.invalid/two.png"},{"image":"https://artifact.invalid/three.png"}]}}]},"usage":{"image_count":3}}`))
+	})
+	source, err := plugins.Source("alibaba")
+	require.NoError(t, err)
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "alibaba"})
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("model_name", "qwen-image-2.0").Error)
+	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:alibaba", "upstream_model_name": "qwen-image-2.0"}).Error)
+	fixture.fake.Advance(time.Second)
+	for _, price := range []*model.PriceVersion{
+		{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("image", image_count * 0.1)`, EffectiveAt: clock.Now().Unix()},
+		{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("image", u("image_count") * 0.05)`, EffectiveAt: clock.Now().Unix()},
+	} {
+		require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+	}
+	SetTaskPluginProtocolRouter(fixture.engine)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", `{"model":"gateway-alias","prompt":"A bird","n":4,"response_format":"url"}`)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.Equal(t, 1, calls)
+	requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.EqualValues(t, 270000000, requests[0].Receivable.Nanos)
+	assert.EqualValues(t, 3, requests[0].Usage.TaskFacts["image_count"])
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), requests[0].ID, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.EqualValues(t, 150000000, attempts[0].Cost.Nanos)
+	var reservation model.LedgerEntry
+	require.NoError(t, model.DB.Where("request_id = ? AND type = ?", requests[0].ID, model.LedgerEntryPreConsume).Take(&reservation).Error)
+	assert.EqualValues(t, -360000000, reservation.Amount.Nanos)
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.EqualValues(t, 730000000, wallet.Balance.Nanos)
 }
 
 func TestAsyncTaskRejectsUnboundedDurationBeforeReservation(t *testing.T) {

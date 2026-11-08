@@ -208,7 +208,7 @@ func RunGatewayAttempts(ctx context.Context, policy GatewayAttemptPolicy, execut
 		}
 		attempt := result.Attempt
 		action, healthErr := ChannelHealth.Record(context.WithoutCancel(ctx), channelhealth.Sample{
-			AttemptID: attempt.ID, ChannelID: attempt.ChannelID, Success: attempt.Status == "success",
+			AttemptID: attempt.ID, ChannelID: attempt.ChannelID, Success: attempt.Status == "success" || attempt.Status == "pending",
 			ProviderFailure: result.Failure.Switch, RateLimited: result.Failure.Class == "rate_limited", FirstByte: result.FirstByte, RetryAfter: result.RetryAfter, Lease: result.HealthLease,
 		})
 		if healthErr == nil {

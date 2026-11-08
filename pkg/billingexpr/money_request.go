@@ -97,7 +97,15 @@ func moneyRequestProbe(node ast.Node) bool {
 	return ok && (name.Value == "param" || name.Value == "header")
 }
 
-func compileMoneyRequestSnapshot(body string, env map[string]any) (map[string]*vm.Program, error) {
+// ValidateMoneyRequestSnapshot checks whether pricing can be replayed using
+// boolean decisions without storing request probe values.
+func ValidateMoneyRequestSnapshot(expression string) error {
+	_, body := ParseExprVersion(expression)
+	_, err := moneyRequestPredicates(body)
+	return err
+}
+
+func moneyRequestPredicates(body string) (map[string]ast.Node, error) {
 	_, literalText, err := parseMoneyLiterals(body)
 	if err != nil {
 		return nil, err
@@ -108,7 +116,7 @@ func compileMoneyRequestSnapshot(body string, env map[string]any) (map[string]*v
 	}
 	ast.Walk(&tree.Node, moneyConditionLiterals(literalText))
 	conditions := moneyBooleanExpressions(tree.Node)
-	programs := make(map[string]*vm.Program)
+	predicates := make(map[string]ast.Node)
 	covered := make(map[file.Location]bool)
 	for _, condition := range conditions {
 		if ast.Find(condition, moneyRequestProbe) == nil {
@@ -130,11 +138,7 @@ func compileMoneyRequestSnapshot(body string, env map[string]any) (map[string]*v
 		if measured != nil {
 			continue
 		}
-		program, _, err := compileMoneyProgram(condition.String(), env)
-		if err != nil {
-			return nil, err
-		}
-		programs[condition.String()] = program
+		predicates[condition.String()] = condition
 		ast.Find(condition, func(node ast.Node) bool {
 			if moneyRequestProbe(node) {
 				covered[node.Location()] = true
@@ -147,6 +151,22 @@ func compileMoneyRequestSnapshot(body string, env map[string]any) (map[string]*v
 	})
 	if unsafe != nil {
 		return nil, fmt.Errorf("durable pricing requires request probes in independent boolean conditions")
+	}
+	return predicates, nil
+}
+
+func compileMoneyRequestSnapshot(body string, env map[string]any) (map[string]*vm.Program, error) {
+	predicates, err := moneyRequestPredicates(body)
+	if err != nil {
+		return nil, err
+	}
+	programs := make(map[string]*vm.Program, len(predicates))
+	for condition := range predicates {
+		program, _, err := compileMoneyProgram(condition, env)
+		if err != nil {
+			return nil, err
+		}
+		programs[condition] = program
 	}
 	return programs, nil
 }
