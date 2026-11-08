@@ -19,6 +19,12 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+type gatewayStreamChoice struct {
+	finished                                         bool
+	audioID, audioData, audioTranscript, audioExpiry bool
+	audioDone                                        bool
+}
+
 func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
 	state, err := relayconvert.NewResponseStreamState(p.format, info.RelayFormat, relayconvert.ResponseStreamOptions{ID: helper.GetResponseID(c), Model: info.UpstreamModelName, IncludeUsage: true, EmitSequenceNumber: true})
@@ -30,7 +36,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 	var streamErr error
 	var output gatewayGeneratedOutput
 	expectedChoices := max(1, info.ResponseFacts.ExpectedChoices)
-	choices := map[int]bool{}
+	choices := map[int]gatewayStreamChoice{}
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		info.StreamStatus.RequireTerminal()
 		measured, err := meter.Observe([]byte(data))
@@ -104,7 +110,31 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 					sr.Stop(streamErr)
 					return
 				}
-				choices[index] = choices[index] || choice.Get(terminal).String() != ""
+				current := choices[index]
+				current.finished = current.finished || choice.Get(terminal).String() != ""
+				if p.format == types.RelayFormatOpenAI {
+					if delta := choice.Get("delta"); delta.IsObject() {
+						current.audioDone = false
+						audio := delta.Get("audio")
+						current.audioID = current.audioID || audio.Get("id").Type == gjson.String
+						current.audioData = current.audioData || audio.Get("data").Type == gjson.String
+						current.audioTranscript = current.audioTranscript || audio.Get("transcript").Type == gjson.String
+						current.audioExpiry = current.audioExpiry || audio.Get("expires_at").Type == gjson.Number
+						expiryOnly := audio.Get("expires_at").Type == gjson.Number
+						for key, value := range audio.Map() {
+							if key != "expires_at" && value.Type != gjson.Null {
+								expiryOnly = false
+							}
+						}
+						for key, value := range delta.Map() {
+							if key != "audio" && value.Type != gjson.Null {
+								expiryOnly = false
+							}
+						}
+						current.audioDone = expiryOnly && current.audioID && current.audioData && current.audioTranscript && current.audioExpiry
+					}
+				}
+				choices[index] = current
 			}
 		}
 		if info.StreamStatus.ResponseFailed() {
@@ -116,9 +146,25 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			return
 		}
 		if p.format == info.RelayFormat {
-			if _, err := writeGatewayStreamResult(c, info, json.RawMessage(normalized), &output); err != nil {
-				streamErr = err
-				sr.Stop(err)
+			body := normalized
+			var presented gatewayGeneratedOutput
+			written := &output
+			if p.format == types.RelayFormatOpenAI && info.ChannelSetting.ThinkingToContent {
+				body, err = helper.ChatThinkingToContent(info, normalized)
+				if err != nil {
+					streamErr = err
+					sr.Stop(err)
+					return
+				}
+				written = &presented
+			}
+			_, writeErr := writeGatewayStreamResult(c, info, json.RawMessage(body), written)
+			if written == &presented && presented.String() != "" {
+				output.text.WriteString(gatewayStreamBusinessText(normalized, p.format))
+			}
+			if writeErr != nil {
+				streamErr = writeErr
+				sr.Stop(writeErr)
 				return
 			}
 		} else {
@@ -141,8 +187,8 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 	if p.format == types.RelayFormatOpenAI || p.format == types.RelayFormatGemini {
 		ended := info.StreamStatus.OutcomeSnapshot().EndReason
 		complete := len(choices) == expectedChoices
-		for _, finished := range choices {
-			complete = complete && finished
+		for _, choice := range choices {
+			complete = complete && (choice.finished || choice.audioDone)
 		}
 		if complete {
 			info.StreamStatus.MarkCompleted()

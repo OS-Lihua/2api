@@ -3613,6 +3613,122 @@ func TestTextGatewayFailureRetainsIndependentUsage(t *testing.T) {
 	}
 }
 
+func TestTextGatewayClaudeCacheTTLReachesMoneyBilling(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, path := range []string{"/v1/messages", "/v1/chat/completions"} {
+			for _, price := range []struct {
+				expression string
+				cost       int64
+			}{{`tier("base", cc1h * 10)`, 1000000}, {`tier("base", cc * 10)`, 1600000}} {
+				t.Run(fmt.Sprintf("stream=%t/%s/%s", stream, path, price.expression), func(t *testing.T) {
+					fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+						if stream {
+							w.Header().Set("Content-Type", "text/event-stream")
+							_, _ = w.Write([]byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":100,\"cache_creation\":{\"ephemeral_1h_input_tokens\":100}}}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\ndata: {\"type\":\"message_stop\"}\n\n"))
+							return
+						}
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = w.Write([]byte(`{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_1h_input_tokens":100}}}`))
+					})
+					require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "anthropic_messages").Error)
+					purchase := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: price.expression, EffectiveAt: clock.Now().Unix()}
+					require.NoError(t, model.CreatePriceVersion(t.Context(), purchase, fixture.sale.CreatedBy))
+					response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, fmt.Sprintf(`{"model":"gateway-offering","stream":%t,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, stream))
+					require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+					record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+					require.NoError(t, err)
+					assert.Equal(t, int64(324000), record.Receivable.Nanos)
+					attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+					require.NoError(t, err)
+					require.EqualValues(t, 1, total)
+					assert.Equal(t, price.cost, attempts[0].Cost.Nanos)
+				})
+			}
+		}
+	}
+}
+
+func TestTextGatewayChatThinkingToContentRemainsEffective(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"R\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Answer\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n"))
+			})
+			setting, err := common.Marshal(map[string]bool{"thinking_to_content": enabled})
+			require.NoError(t, err)
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("setting", string(setting)).Error)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			var content, reasoning strings.Builder
+			for line := range strings.SplitSeq(response.Body.String(), "\n") {
+				data, found := strings.CutPrefix(line, "data: ")
+				if !found || data == "[DONE]" {
+					continue
+				}
+				var event dto.ChatCompletionsStreamResponse
+				require.NoError(t, common.UnmarshalJsonStr(data, &event))
+				for _, choice := range event.Choices {
+					if choice.Delta.Content != nil {
+						content.WriteString(*choice.Delta.Content)
+					}
+					reasoning.WriteString(choice.Delta.GetReasoningContent())
+				}
+			}
+			if enabled {
+				assert.Equal(t, "<think>\nR\n</think>\nAnswer", content.String())
+				assert.Empty(t, reasoning.String())
+			} else {
+				assert.Equal(t, "Answer", content.String())
+				assert.Equal(t, "R", reasoning.String())
+			}
+		})
+	}
+}
+
+func TestTextGatewayChatAudioExpiryIsAValidTerminal(t *testing.T) {
+	for _, test := range []struct {
+		name, audio             string
+		expiry, later, complete bool
+	}{
+		{"complete", `{"id":"audio-id","data":"AAECAw==","transcript":"Hello"}`, true, false, true},
+		{"missing transcript", `{"id":"audio-id","data":"AAECAw=="}`, true, false, false},
+		{"missing expiry", `{"id":"audio-id","data":"AAECAw==","transcript":"Hello"}`, false, false, false},
+		{"later delta", `{"id":"audio-id","data":"AAECAw==","transcript":"Hello"}`, true, true, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"audio\":%s}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n", test.audio)
+				if test.expiry {
+					_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"audio\":{\"expires_at\":%d}}}]}\n\n", clock.Now().Add(time.Hour).Unix())
+				}
+				if test.later {
+					_, _ = w.Write([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Later\"}}]}\n\n"))
+				}
+				_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			})
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", capability.Set{Features: []capability.Feature{capability.Streaming}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text, capability.Audio}}).Error)
+			price := &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("request", fixed(0.01))`, EffectiveAt: clock.Now().Unix()}
+			require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","stream":true,"modalities":["audio"],"audio":{"voice":"alloy","format":"pcm16"},"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), "AAECAw==")
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			if test.complete {
+				assert.Equal(t, "success", record.Status)
+				assert.Equal(t, int64(9000000), record.Receivable.Nanos)
+				assert.Contains(t, response.Body.String(), "[DONE]")
+			} else {
+				assert.Equal(t, "partial", record.Status)
+				assert.Zero(t, record.Receivable.Nanos)
+				assert.NotContains(t, response.Body.String(), "[DONE]")
+			}
+		})
+	}
+}
+
 func TestTextGatewayNativeChatAudioDelivery(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {

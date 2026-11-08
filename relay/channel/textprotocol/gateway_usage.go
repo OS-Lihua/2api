@@ -55,7 +55,11 @@ func (a *gatewayUsageAccumulator) Observe(body []byte) (*dto.Usage, error) {
 			return nil, err
 		}
 		promptKey, completionKey = "input_tokens", "output_tokens"
-		usage = relayconvert.UsageFromClaudeAPIUsage(&native)
+		billing := dto.NewClaudeMessagesBillingUsage(&native)
+		usage, _ = billing.CanonicalUsage()
+		if usage == nil {
+			usage = &dto.Usage{UsageSemantic: dto.BillingUsageSemanticAnthropic, UsageSource: dto.BillingUsageSourceClaudeMessages, BillingUsage: billing}
+		}
 	case types.RelayFormatGemini:
 		var native dto.GeminiUsageMetadata
 		if err := common.Unmarshal(encoded, &native); err != nil {
