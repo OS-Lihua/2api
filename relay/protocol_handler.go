@@ -207,6 +207,31 @@ func (a *ChannelAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 	return a.DoPreparedRequest(c, info, prepared)
 }
 
+// PreviewHeaders builds transient pricing probes without constructing a URL,
+// acquiring account tokens, or preparing an execution.
+func (a *ChannelAdaptor) PreviewHeaders(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (http.Header, error) {
+	if c == nil || c.Request == nil || info == nil || info.ProviderMeta == nil {
+		return nil, errors.New("missing upstream request metadata")
+	}
+	metadata := a.providerMetadata(info)
+	if providerNeedsPayload(a.provider) {
+		payload, err := io.ReadAll(requestBody)
+		if err != nil {
+			return nil, errors.New("could not read upstream request")
+		}
+		metadata.Payload = payload
+	}
+	request := &http.Request{Header: make(http.Header)}
+	if channel.IsNonTextProtocol(a.kind) {
+		request.Header.Set("Content-Type", c.Request.Header.Get("Content-Type"))
+	}
+	channel.ApplyUpstreamBodyMetadata(request, requestBody)
+	if err := a.prepareHeaders(c, info, request, metadata); err != nil {
+		return nil, err
+	}
+	return request.Header.Clone(), nil
+}
+
 func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (*PreparedChannelRequest, error) {
 	if c == nil || c.Request == nil || info == nil || info.ProviderMeta == nil {
 		return nil, errors.New("missing upstream request metadata")
@@ -258,24 +283,8 @@ func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayI
 		}
 		channel.ApplyUpstreamBodyMetadata(request, requestBody)
 	}
-	if err := a.provider.SetupHeader(c, &request.Header, metadata); err != nil {
-		return nil, errors.New("provider authentication failed")
-	}
-	if err := channel.ApplyHeaderOverride(info, c, request); err != nil {
-		return nil, errors.New("invalid provider header override")
-	}
-	for name, values := range request.Header {
-		if !httpguts.ValidHeaderFieldName(name) {
-			return nil, errors.New("invalid upstream header name")
-		}
-		for _, value := range values {
-			if !httpguts.ValidHeaderFieldValue(value) {
-				return nil, errors.New("invalid upstream header value")
-			}
-		}
-	}
-	if request.Header.Get("Host") != "" && !httpguts.ValidHostHeader(request.Host) {
-		return nil, errors.New("invalid upstream host override")
+	if err := a.prepareHeaders(c, info, request, metadata); err != nil {
+		return nil, err
 	}
 	metadata.RequestHeaders = request.Header.Clone()
 	prepared := &PreparedChannelRequest{adaptor: a, request: request, metadata: metadata, body: requestBody}
@@ -287,6 +296,29 @@ func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayI
 		prepared.execute = execute
 	}
 	return prepared, nil
+}
+
+func (a *ChannelAdaptor) prepareHeaders(c *gin.Context, info *relaycommon.RelayInfo, request *http.Request, metadata *channel.ProviderRequest) error {
+	if err := a.provider.SetupHeader(c, &request.Header, metadata); err != nil {
+		return errors.New("provider authentication failed")
+	}
+	if err := channel.ApplyHeaderOverride(info, c, request); err != nil {
+		return errors.New("invalid provider header override")
+	}
+	for name, values := range request.Header {
+		if !httpguts.ValidHeaderFieldName(name) {
+			return errors.New("invalid upstream header name")
+		}
+		for _, value := range values {
+			if !httpguts.ValidHeaderFieldValue(value) {
+				return errors.New("invalid upstream header value")
+			}
+		}
+	}
+	if request.Header.Get("Host") != "" && !httpguts.ValidHostHeader(request.Host) {
+		return errors.New("invalid upstream host override")
+	}
+	return nil
 }
 
 func (a *ChannelAdaptor) DoPreparedRequest(c *gin.Context, info *relaycommon.RelayInfo, prepared *PreparedChannelRequest) (any, error) {
