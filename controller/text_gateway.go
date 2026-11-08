@@ -630,6 +630,19 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
 		return
 	}
+	// Credential row-lock waits belong to preparation, before the purchase snapshot.
+	previousContact := contactedProvider
+	attemptContext, budgetErr := info.BeginProviderCall()
+	contactedProvider = previousContact
+	if budgetErr != nil {
+		if errors.Is(budgetErr, service.ErrGatewayBudget) || parent.Context().Err() != nil {
+			run.fail(c, http.StatusServiceUnavailable, "budget_exhausted", "Upstream request failed")
+		} else {
+			run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
+		}
+		return
+	}
+	c.Request = parent.WithContext(attemptContext)
 	// Preparation shares the budget but is not part of the model Attempt or its purchase snapshot.
 	attemptStart := clock.Now()
 	var purchaseRate string
@@ -681,14 +694,9 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		StartedAt: attemptStart.UnixMilli(), FailoverDecision: "stop", FailoverReason: "single_attempt", CircuitAction: "none", RouteDiagnostics: selection.Diagnostics,
 		UsageSource: "none", PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, Cost: money.Amount{Currency: purchase.Currency}, AccountingFXRate: purchaseRate,
 		ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, ConversionLosses: selection.ConversionLosses}
-	attemptContext, budgetErr := info.BeginProviderCall()
-	if budgetErr != nil {
+	if attemptContext.Err() != nil {
 		attempt = nil
-		if errors.Is(budgetErr, service.ErrGatewayBudget) || parent.Context().Err() != nil {
-			run.fail(c, http.StatusServiceUnavailable, "budget_exhausted", "Upstream request failed")
-		} else {
-			run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
-		}
+		run.fail(c, http.StatusServiceUnavailable, "budget_exhausted", "Upstream request failed")
 		return
 	}
 	contactedProvider = true

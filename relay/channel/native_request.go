@@ -48,6 +48,17 @@ func DiagnoseNativeChatRequest(c *gin.Context, info *relaycommon.RelayInfo, requ
 		return err
 	}
 	var diagnostics []types.ConversionDiagnostic
+	beforeMessages, err := nativeChatMessageSemantics(request.Messages)
+	if err != nil {
+		return err
+	}
+	afterMessages, err := nativeChatMessageSemantics(actual.Messages)
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(beforeMessages, afterMessages) {
+		diagnostics = append(diagnostics, types.ConversionDiagnostic{Code: "request_parameter_dropped", Path: "messages", Severity: types.ConversionDiagnosticWarning, From: types.RelayFormatOpenAI, To: types.RelayFormatOpenAI, Message: "The native request changed message roles, history or content"})
+	}
 	keys := slices.Sorted(maps.Keys(fields))
 	for _, key := range keys {
 		if len(fields[key]) == 0 || string(fields[key]) == "null" {
@@ -164,5 +175,56 @@ func ProjectNativeChatParameters(body []byte, public dto.GeneralOpenAIRequest, n
 		return nil, err
 	}
 	result.RequiresTextInput = public.RequiresTextInput
+	result.RequiresToolCalling = public.RequiresToolCalling
 	return &result, nil
+}
+
+func nativeChatMessageSemantics(messages []dto.Message) (any, error) {
+	normalized := slices.Clone(messages)
+	for i := range normalized {
+		parts := normalized[i].ParseContent()
+		textOnly := true
+		for _, part := range parts {
+			if part.Type != dto.ContentTypeText {
+				textOnly = false
+				break
+			}
+		}
+		if textOnly {
+			normalized[i].Content = normalized[i].StringContent()
+		} else {
+			normalized[i].Content = parts
+		}
+	}
+	grouped := make([]dto.Message, 0, len(normalized))
+	for _, message := range normalized {
+		if len(grouped) > 0 && message.Role == "system" && grouped[len(grouped)-1].Role == "system" {
+			before, after := grouped[len(grouped)-1], message
+			previousText, previousOK := before.Content.(string)
+			text, textOK := after.Content.(string)
+			before.Content, after.Content = nil, nil
+			beforeBody, err := common.Marshal(before)
+			if err != nil {
+				return nil, err
+			}
+			afterBody, err := common.Marshal(after)
+			if err != nil {
+				return nil, err
+			}
+			if previousOK && textOK && string(beforeBody) == string(afterBody) {
+				grouped[len(grouped)-1].Content = previousText + "\n" + text
+				continue
+			}
+		}
+		grouped = append(grouped, message)
+	}
+	body, err := common.Marshal(grouped)
+	if err != nil {
+		return nil, err
+	}
+	var value any
+	if err := common.Unmarshal(body, &value); err != nil {
+		return nil, err
+	}
+	return value, nil
 }

@@ -577,7 +577,7 @@ func GatewayCapabilitiesMatch(request *dto.GeneralOpenAIRequest, caps capability
 	if request.Stream != nil && *request.Stream && !slices.Contains(caps.Features, capability.Streaming) {
 		return false
 	}
-	tools := len(request.Tools) > 0 || len(request.Functions) > 0
+	tools := request.RequiresToolCalling || len(request.Tools) > 0 || len(request.Functions) > 0
 	for _, message := range request.Messages {
 		tools = tools || len(message.Tools) > 0 || len(message.ParseToolCalls()) > 0 || message.Role == "tool"
 	}
@@ -589,6 +589,13 @@ func GatewayCapabilitiesMatch(request *dto.GeneralOpenAIRequest, caps capability
 	}
 	if request.ResponseFormat != nil && request.ResponseFormat.Type != "" && request.ResponseFormat.Type != "text" && !slices.Contains(caps.Features, capability.StructuredOutput) {
 		return false
+	}
+	for _, message := range request.Messages {
+		for _, part := range message.ParseContent() {
+			if len(part.CacheControl) > 0 && string(part.CacheControl) != "null" && !slices.Contains(caps.Features, capability.Caching) {
+				return false
+			}
+		}
 	}
 	if (request.PromptCacheKey != "" || len(request.PromptCacheOptions) > 0 || len(request.PromptCacheRetention) > 0) && !slices.Contains(caps.Features, capability.Caching) {
 		return false

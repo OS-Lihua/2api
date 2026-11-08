@@ -171,6 +171,10 @@ func zhipuStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 			response = streamResponseZhipu2OpenAI(data)
 		} else if data, ok := strings.CutPrefix(line, "meta:"); ok {
 			var meta ZhipuStreamMetaResponse
+			if info.ResponseFacts != nil {
+				info.ResponseFacts.RecordNativeUsage(usage, []byte(data), "usage.prompt_tokens", "usage.completion_tokens")
+				data = string(relaycommon.SanitizeNativeUsage([]byte(data), "usage"))
+			}
 			if err := common.UnmarshalJsonStr(data, &meta); err != nil {
 				if info.ResponseFacts == nil {
 					continue

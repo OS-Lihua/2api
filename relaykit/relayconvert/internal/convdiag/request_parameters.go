@@ -67,6 +67,7 @@ func InspectRequestParameters(ctx context.Context, source, target any, from, to 
 			{"vl_high_resolution_images", "", "", ""},
 			{"store", "store", "", ""},
 			{"service_tier", "service_tier", "service_tier", ""},
+			{"", "", "mcp_servers", ""},
 			{"user", "user", "metadata.user_id", ""},
 			{"safety_identifier", "safety_identifier", "", ""},
 			{"prediction", "", "", ""},

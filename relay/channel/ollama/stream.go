@@ -209,6 +209,10 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			return usage, types.NewError(fmt.Errorf("Ollama stream contains data after completion"), types.ErrorCodeBadResponseBody)
 		}
 		var chunk ollamaChatStreamChunk
+		if info.ResponseFacts != nil {
+			info.ResponseFacts.RecordNativeUsage(usage, []byte(line), "prompt_eval_count", "eval_count")
+			line = string(relaycommon.SanitizeNativeUsage([]byte(line), ""))
+		}
 		if err := common.Unmarshal([]byte(line), &chunk); err != nil {
 			info.StreamStatus.MarkFailed("invalid_response", "upstream_error", 0)
 			logger.LogError(c, "ollama stream JSON decode failed")

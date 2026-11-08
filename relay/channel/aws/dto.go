@@ -1,21 +1,70 @@
 package aws
 
 import (
-	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/tidwall/sjson"
 )
 
+// AwsClaudeRequest preserves the complete Messages DTO while adding Bedrock's
+// envelope. Model identity and streaming remain SDK transport parameters.
 type AwsClaudeRequest struct {
-	// AnthropicVersion should be "bedrock-2023-05-31"
+	Request          *dto.ClaudeRequest
+	AnthropicVersion string
+	AnthropicBeta    json.RawMessage
+}
+
+func (request *AwsClaudeRequest) MarshalJSON() ([]byte, error) {
+	body, err := common.Marshal(request.Request)
+	if err != nil {
+		return nil, err
+	}
+	var fields map[string]common.RawMessage
+	if err := common.Unmarshal(body, &fields); err != nil {
+		return nil, err
+	}
+	delete(fields, "model")
+	delete(fields, "stream")
+	fields["anthropic_version"], err = common.Marshal(request.AnthropicVersion)
+	if err != nil {
+		return nil, err
+	}
+	if len(request.AnthropicBeta) > 0 {
+		fields["anthropic_beta"] = request.AnthropicBeta
+	}
+	return common.Marshal(fields)
+}
+
+func (wire *AwsClaudeRequest) ProjectNativeRequest(body []byte) (dto.Request, error) {
+	var envelope map[string]common.RawMessage
+	if err := common.Unmarshal(body, &envelope); err != nil {
+		return nil, err
+	}
+	if _, present := envelope["model"]; present {
+		return nil, errors.New("Bedrock model identity belongs to the SDK request")
+	}
+	if _, present := envelope["stream"]; present {
+		return nil, errors.New("Bedrock streaming belongs to the SDK request")
+	}
+	var request dto.ClaudeRequest
+	if err := common.Unmarshal(body, &request); err != nil {
+		return nil, err
+	}
+	if wire.Request != nil {
+		request.Model = wire.Request.Model
+	}
+	return &request, nil
+}
+
+// The legacy transport retains its established field set and serialization.
+type legacyAwsClaudeRequest struct {
 	AnthropicVersion  string              `json:"anthropic_version"`
 	AnthropicBeta     json.RawMessage     `json:"anthropic_beta,omitempty"`
 	System            any                 `json:"system,omitempty"`
@@ -31,18 +80,14 @@ type AwsClaudeRequest struct {
 	ContextManagement json.RawMessage     `json:"context_management,omitempty"`
 	Thinking          *dto.Thinking       `json:"thinking,omitempty"`
 	OutputConfig      json.RawMessage     `json:"output_config,omitempty"`
-	//Metadata         json.RawMessage     `json:"metadata,omitempty"`
 }
 
-func formatRequest(requestBody io.Reader, requestHeader http.Header) (*AwsClaudeRequest, error) {
-	var awsClaudeRequest AwsClaudeRequest
-	err := common.DecodeJson(requestBody, &awsClaudeRequest)
-	if err != nil {
+func formatRequest(requestBody io.Reader, requestHeader http.Header) (*legacyAwsClaudeRequest, error) {
+	var request legacyAwsClaudeRequest
+	if err := common.DecodeJson(requestBody, &request); err != nil {
 		return nil, err
 	}
-	awsClaudeRequest.AnthropicVersion = "bedrock-2023-05-31"
-
-	// check header anthropic-beta
+	request.AnthropicVersion = "bedrock-2023-05-31"
 	var betas []string
 	for beta := range strings.SplitSeq(requestHeader.Get("anthropic-beta"), ",") {
 		if beta = strings.TrimSpace(beta); beta != "" {
@@ -50,14 +95,31 @@ func formatRequest(requestBody io.Reader, requestHeader http.Header) (*AwsClaude
 		}
 	}
 	if len(betas) > 0 {
-		betaJson, err := common.Marshal(betas)
+		var err error
+		request.AnthropicBeta, err = common.Marshal(betas)
 		if err != nil {
 			return nil, err
 		}
-		awsClaudeRequest.AnthropicBeta = betaJson
 	}
-	logger.LogJson(context.Background(), "json", awsClaudeRequest)
-	return &awsClaudeRequest, nil
+	return &request, nil
+}
+
+func newAwsClaudeRequest(request *dto.ClaudeRequest, headers http.Header) (*AwsClaudeRequest, error) {
+	wire := &AwsClaudeRequest{Request: request, AnthropicVersion: "bedrock-2023-05-31"}
+	var betas []string
+	for beta := range strings.SplitSeq(headers.Get("anthropic-beta"), ",") {
+		if beta = strings.TrimSpace(beta); beta != "" {
+			betas = append(betas, beta)
+		}
+	}
+	if len(betas) > 0 {
+		var err error
+		wire.AnthropicBeta, err = common.Marshal(betas)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return wire, nil
 }
 
 // NovaMessage Nova模型使用messages-v1格式
@@ -101,10 +163,6 @@ func (*NovaRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAIRequ
 
 func (*NovaRequest) SetChatOutputLimit(body []byte, limit uint) ([]byte, error) {
 	return sjson.SetBytes(body, "inferenceConfig.maxTokens", limit)
-}
-
-func (*AwsClaudeRequest) SetChatOutputLimit(body []byte, limit uint) ([]byte, error) {
-	return sjson.SetBytes(body, "max_tokens", limit)
 }
 
 type NovaRequest struct {

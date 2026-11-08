@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 func (p *Provider) ComposeProtocol(kind protocol.Type, generic channel.ProtocolHandler) (channel.ProtocolHandler, error) {
@@ -78,12 +79,14 @@ func (p *sparkProtocol) DoResponse(c *gin.Context, resp *http.Response, info *re
 		var responseErr *types.NewAPIError
 		scanner := helper.NewStreamScanner(resp.Body)
 		for scanner.Scan() {
-			if err := common.Unmarshal(scanner.Bytes(), &last); err != nil {
+			raw := scanner.Bytes()
+			if info.ResponseFacts != nil {
+				recordSparkUsage(raw, reportedUsage)
+				raw = relaycommon.SanitizeNativeUsage(raw, "payload.usage.text")
+			}
+			if err := common.Unmarshal(raw, &last); err != nil {
 				responseErr = types.NewError(err, types.ErrorCodeBadResponseBody)
 				break
-			}
-			if info.ResponseFacts != nil {
-				recordSparkUsage(scanner.Bytes(), reportedUsage, last.Payload.Usage.Text)
 			}
 			if last.Header.Code != 0 {
 				responseErr = types.NewError(fmt.Errorf("Xunfei response error %d", last.Header.Code), types.ErrorCodeBadResponseBody)
@@ -141,8 +144,24 @@ func (p *sparkProtocol) DoResponse(c *gin.Context, resp *http.Response, info *re
 		scanner := helper.NewStreamScanner(original)
 		var usage dto.Usage
 		for scanner.Scan() {
+			raw := scanner.Bytes()
+			if info.ResponseFacts != nil {
+				recordSparkUsage(raw, reportedUsage)
+				raw = relaycommon.SanitizeNativeUsage(raw, "payload.usage.text")
+			}
 			var frame XunfeiChatResponse
-			if err := common.Unmarshal(scanner.Bytes(), &frame); err != nil {
+			if err := common.Unmarshal(raw, &frame); err != nil {
+				if info.ResponseFacts != nil && len(reportedUsage) > 0 {
+					metadata, marshalErr := common.Marshal(struct {
+						Choices []any          `json:"choices"`
+						Usage   map[string]int `json:"usage"`
+					}{Choices: []any{}, Usage: reportedUsage})
+					if marshalErr == nil {
+						if _, writeErr := fmt.Fprintf(writer, "data: %s\n\n", metadata); writeErr != nil {
+							return
+						}
+					}
+				}
 				writer.CloseWithError(err)
 				return
 			}
@@ -166,7 +185,6 @@ func (p *sparkProtocol) DoResponse(c *gin.Context, resp *http.Response, info *re
 				Usage any `json:"usage,omitempty"`
 			}{ChatCompletionsStreamResponse: chunk, Usage: chunk.Usage}
 			if info.ResponseFacts != nil {
-				recordSparkUsage(scanner.Bytes(), reportedUsage, frame.Payload.Usage.Text)
 				wire.Usage = nil
 				if len(reportedUsage) > 0 {
 					wire.Usage = reportedUsage
@@ -196,13 +214,13 @@ func (p *sparkProtocol) DoResponse(c *gin.Context, resp *http.Response, info *re
 	return p.public.DoResponse(c, resp, info)
 }
 
-func recordSparkUsage(body []byte, reported map[string]int, usage dto.Usage) {
+func recordSparkUsage(body []byte, reported map[string]int) {
 	prompt, completion := relaycommon.NativeUsagePresence(body, "payload.usage.text.prompt_tokens", "payload.usage.text.completion_tokens", "payload.usage.text.total_tokens")
 	if prompt {
-		reported["prompt_tokens"] = usage.PromptTokens
+		reported["prompt_tokens"] = int(gjson.GetBytes(body, "payload.usage.text.prompt_tokens").Int())
 	}
 	if completion {
-		reported["completion_tokens"] = usage.CompletionTokens
+		reported["completion_tokens"] = int(gjson.GetBytes(body, "payload.usage.text.completion_tokens").Int())
 	}
 }
 

@@ -343,6 +343,9 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 		return nil, fmt.Errorf("missing text request projection")
 	}
 	chat.RequiresTextInput = requiresTextInput
+	if native, ok := request.(*dto.ClaudeRequest); ok {
+		chat.RequiresToolCalling = len(gjson.ParseBytes(native.McpServers).Array()) > 0
+	}
 	if len(chat.Tools) == 0 {
 		var nativeTools []byte
 		switch native := request.(type) {

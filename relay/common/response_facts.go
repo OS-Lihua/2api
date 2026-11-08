@@ -118,6 +118,9 @@ func NativeUsagePresence(body []byte, promptPath, completionPath, _ string) (boo
 // provider DTO is decoded. Unrelated broken totals/details cannot erase bases.
 func SanitizeNativeUsage(body []byte, path string) []byte {
 	usage := gjson.GetBytes(body, path)
+	if path == "" {
+		usage = gjson.ParseBytes(body)
+	}
 	if !usage.Exists() {
 		return body
 	}
@@ -128,8 +131,15 @@ func SanitizeNativeUsage(body []byte, path string) []byte {
 	paths := []string{path}
 	for index := 0; index < len(paths); index++ {
 		prefix := paths[index]
-		for key, value := range gjson.GetBytes(body, prefix).Map() {
-			field := prefix + "." + key
+		object := gjson.GetBytes(body, prefix)
+		if prefix == "" {
+			object = gjson.ParseBytes(body)
+		}
+		for key, value := range object.Map() {
+			field := key
+			if prefix != "" {
+				field = prefix + "." + key
+			}
 			name := strings.ToLower(key)
 			if strings.HasSuffix(name, "tokens") || strings.HasSuffix(name, "count") {
 				if valid, _ := NativeUsagePresence(body, field, "", ""); !valid {
@@ -141,7 +151,7 @@ func SanitizeNativeUsage(body []byte, path string) []byte {
 				body, _ = sjson.DeleteBytes(body, field)
 				continue
 			}
-			if value.IsObject() {
+			if value.IsObject() && path != "" {
 				paths = append(paths, field)
 			}
 		}

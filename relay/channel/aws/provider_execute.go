@@ -99,7 +99,7 @@ func (p *Provider) PrepareExecution(c *gin.Context, metadata channel.ProviderMet
 	if err != nil {
 		return nil, err
 	}
-	if !nova {
+	if !nova && !managed {
 		wire, err := formatRequest(bytes.NewReader(payload), request.RequestHeaders)
 		if err != nil {
 			return nil, err
@@ -164,18 +164,16 @@ func (prepared *awsPreparedInvocation) execute(c *gin.Context) (*http.Response, 
 			})
 		}
 		output, err := prepared.client.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{ModelId: aws.String(prepared.modelID), ContentType: aws.String("application/json"), Accept: aws.String("application/json"), Body: prepared.payload}, options...)
-		if capture != nil && capture.response != nil && capture.readErr != nil {
+		if capture != nil && capture.response != nil && (capture.readErr != nil || err != nil) {
+			if err != nil {
+				if body, ok := capture.response.Body.(*awsJSONSourceBody); ok {
+					body.failure = prepared.failure(parent, err, "InvokeModel")
+				}
+			}
 			return capture.response, nil
 		}
 		if err != nil {
-			failure := prepared.failure(parent, err, "InvokeModel")
-			if prepared.managed && capture != nil && capture.response != nil {
-				if body, ok := capture.response.Body.(*awsJSONSourceBody); ok {
-					body.failure = failure
-				}
-				return capture.response, nil
-			}
-			return nil, failure
+			return nil, prepared.failure(parent, err, "InvokeModel")
 		}
 		response := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(output.Body))}
 		response.Header.Set("Content-Type", "application/json")

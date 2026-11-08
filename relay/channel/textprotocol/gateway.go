@@ -145,12 +145,12 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	facts.PromptTokensReported, facts.CompletionTokensReported = gatewayValidCounter(prompt), gatewayValidCounter(completion)
 	facts.UsageReported = facts.PromptTokensReported && facts.CompletionTokensReported
 	facts.IndependentUsageReported = meter.ReportedCounters()
-	if readErr != nil {
-		return usage, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
-	}
 	if captured, ok := resp.Body.(channel.ResponseErrorCarrier); ok && captured.ResponseError() != nil {
 		observeGatewayError(info, body)
 		return usage, captured.ResponseError()
+	}
+	if readErr != nil {
+		return usage, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
 	}
 	normalized, err := meter.NormalizedBody(body)
 	if err != nil {

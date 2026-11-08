@@ -22,6 +22,12 @@ type ProviderProtocolComposer interface {
 
 // ChatRequestProjector exposes effective validation facts from a selected native
 // wire DTO. It neither chooses a protocol nor performs transport or billing.
+// NativeRequestProjector decodes the actual provider envelope back to its
+// public native DTO; the host supplies the current request context for facts.
+type NativeRequestProjector interface {
+	ProjectNativeRequest([]byte) (dto.Request, error)
+}
+
 type ChatRequestProjector interface {
 	ProjectChatRequest([]byte, dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error)
 }

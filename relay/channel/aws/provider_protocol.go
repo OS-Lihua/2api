@@ -38,7 +38,28 @@ func (p *Provider) FixRequest(c *gin.Context, ctx *channel.ProtocolRequestContex
 	if isNovaModel(ctx.UpstreamModelName) {
 		return nil, fmt.Errorf("Nova requires explicitly selected OpenAI Chat protocol")
 	}
-	return p.repairClaudeMedia(c, req)
+	repaired, err := p.repairClaudeMedia(c, req)
+	if err != nil {
+		return nil, err
+	}
+	nativeRequest := repaired.(*dto.ClaudeRequest)
+	info := channel.ProtocolRepairSnapshot(ctx)
+	info.InitChannelMeta(c)
+	if info.ChannelOtherSettings.AwsApiType == dto.AwsApiTypeMantle {
+		return nativeRequest, nil
+	}
+	headers := http.Header{}
+	if err := p.SetupHeader(c, &headers, channel.NewProviderMetadata(info)); err != nil {
+		return nil, err
+	}
+	overrides, err := channel.ResolveHeaderOverride(info, c)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range overrides {
+		headers.Set(key, value)
+	}
+	return newAwsClaudeRequest(nativeRequest, headers)
 }
 
 // novaProtocol is the Bedrock Nova wire dialect of the public Chat protocol.

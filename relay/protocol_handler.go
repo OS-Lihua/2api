@@ -86,6 +86,20 @@ func (a *ChannelAdaptor) PrepareChatRequest(c *gin.Context, info *relaycommon.Re
 }
 
 func (a *ChannelAdaptor) ProjectChatRequest(c *gin.Context, info *relaycommon.RelayInfo, converted any, public *dto.GeneralOpenAIRequest, body []byte) (*dto.GeneralOpenAIRequest, error) {
+	if projector, ok := converted.(channel.NativeRequestProjector); ok {
+		request, err := projector.ProjectNativeRequest(body)
+		if err != nil {
+			return nil, err
+		}
+		request.SetModelName(info.UpstreamModelName)
+		effective, err := service.GatewayChatProjection(c, request)
+		if err != nil {
+			return nil, err
+		}
+		effective.Model = info.UpstreamModelName
+		effective.Stream = common.GetPointer(info.IsStream)
+		return effective, nil
+	}
 	if contract, ok := converted.(channel.NativeChatRequestContract); ok {
 		var err error
 		public, err = channel.ProjectNativeChatParameters(body, *public, converted, contract.ChatRequestCapabilities())
@@ -131,6 +145,13 @@ func (a *ChannelAdaptor) ProjectChatRequest(c *gin.Context, info *relaycommon.Re
 }
 
 func (a *ChannelAdaptor) SetChatOutputLimit(converted any, body []byte, limit uint) ([]byte, error) {
+	if projector, ok := converted.(channel.NativeRequestProjector); ok {
+		request, err := projector.ProjectNativeRequest(body)
+		if err != nil {
+			return nil, err
+		}
+		return a.SetChatOutputLimit(request, body, limit)
+	}
 	if setter, ok := converted.(channel.ChatOutputLimitSetter); ok {
 		return setter.SetChatOutputLimit(body, limit)
 	}
