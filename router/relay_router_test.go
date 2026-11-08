@@ -479,9 +479,12 @@ func TestTextGatewayRateLimitCooldownHonorsHeader(t *testing.T) {
 	for _, tc := range []struct {
 		name, header string
 		delay        time.Duration
+		sdk          bool
 	}{
-		{"long seconds", "172800", 48 * time.Hour}, {"long HTTP date", "date", 48 * time.Hour},
-		{"zero", "0", 0}, {"elapsed HTTP date", "past", 0}, {"invalid sign", "+1", time.Minute}, {"missing", "", time.Minute},
+		{"long seconds", "172800", 48 * time.Hour, false}, {"long HTTP date", "date", 48 * time.Hour, false},
+		{"zero", "0", 0, false}, {"elapsed HTTP date", "past", 0, false}, {"invalid sign", "+1", time.Minute, false}, {"missing", "", time.Minute, false},
+		{"SDK long seconds", "172800", 48 * time.Hour, true}, {"SDK zero", "0", 0, true},
+		{"SDK invalid private header", "private-sdk-header-secret", time.Minute, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			header := tc.header
@@ -499,9 +502,23 @@ func TestTextGatewayRateLimitCooldownHonorsHeader(t *testing.T) {
 			if tc.header == "past" {
 				header = fixture.fake.Now().Add(-time.Second).UTC().Format(http.TimeFormat)
 			}
+			if tc.sdk {
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeAws, "key": "fake|us-east-1"}).Error)
+				require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", "amazon.nova-lite-v1:0").Error)
+				client := service.GetHttpClient()
+				original := client.Transport
+				t.Cleanup(func() { client.Transport = original })
+				client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
+					return &http.Response{StatusCode: 429, Header: http.Header{"Content-Type": {"application/json"}, "X-Amzn-Errortype": {"ThrottlingException"}, "Retry-After": {header}}, Body: io.NopCloser(strings.NewReader(`{"message":"rate limited"}`)), Request: request}, nil
+				})
+			}
 			t.Setenv("GATEWAY_MAX_ATTEMPTS", "1")
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
-			require.Equal(t, 429, response.Code, response.Body.String())
+			expectedStatus := http.StatusTooManyRequests
+			if tc.sdk {
+				expectedStatus = http.StatusBadGateway
+			}
+			require.Equal(t, expectedStatus, response.Code, response.Body.String())
 			details := adminSecurityRequest(fixture.engine, fixture.adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/channels/%d", fixture.channel.ID), "")
 			require.Equal(t, 200, details.Code, details.Body.String())
 			var view struct {
@@ -513,6 +530,16 @@ func TestTextGatewayRateLimitCooldownHonorsHeader(t *testing.T) {
 			assert.Equal(t, "open", view.Data.Health.Circuit)
 			assert.Equal(t, fixture.fake.Now().Add(tc.delay).UnixMilli(), view.Data.Health.RetryAt)
 			assert.Equal(t, 1, view.Data.Health.Samples)
+			if strings.HasPrefix(tc.header, "private-") {
+				assert.NotContains(t, response.Body.String(), tc.header)
+				assert.NotContains(t, details.Body.String(), tc.header)
+				attempts, _, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+				require.NoError(t, err)
+				require.Len(t, attempts, 1)
+				encoded, err := common.Marshal(attempts)
+				require.NoError(t, err)
+				assert.NotContains(t, string(encoded), tc.header)
+			}
 		})
 	}
 }
