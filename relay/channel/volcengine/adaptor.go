@@ -87,7 +87,13 @@ func convertTTSRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.
 	}
 
 	if len(request.Metadata) > 0 {
-		if err := common.Unmarshal(request.Metadata, &volcRequest); err != nil {
+		var err error
+		if info.ResponseFacts != nil {
+			err = common.DecodeJsonStrict(bytes.NewReader(request.Metadata), &volcRequest)
+		} else {
+			err = common.Unmarshal(request.Metadata, &volcRequest)
+		}
+		if err != nil {
 			return nil, fmt.Errorf("error unmarshalling metadata to volcengine request: %w", err)
 		}
 	}

@@ -4788,6 +4788,10 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 		hold           int64
 		extra          string
 	}{
+		{name: "Volcengine metadata output positive", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"request":{"max_new_tokens":16}}`, reject: true},
+		{name: "Volcengine metadata output zero", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"request":{"max_new_tokens":0}}`, reject: true},
+		{name: "Volcengine metadata top output", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"max_new_tokens":16}`, reject: true},
+		{name: "Volcengine metadata alternate output", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"request":{"max_tokens":16}}`, reject: true},
 		{name: "Volcengine valid key after malformed", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, keys: "malformed\naccess|secret"},
 		{name: "Volcengine valid key after empty", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, keys: "|\naccess|secret"},
 		{name: "Volcengine disabled valid key", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, keys: "malformed\naccess|secret", disabledValid: true, unavailable: true},
