@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -247,7 +248,28 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	var bufferedAudio []byte
 	var bufferedAudioErr error
 	var audioBuffered bool
-	if info.ResponseFacts != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices || strings.Contains(resp.Header.Get("Content-Type"), "json")) {
+	structuredResponse := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "json")
+	if info.ResponseFacts != nil && info.IsStream && !structuredResponse {
+		original := resp.Body
+		reader := bufio.NewReader(original)
+		for {
+			first, err := reader.Peek(1)
+			if err != nil {
+				break
+			}
+			if first[0] == ' ' || first[0] == '\t' || first[0] == '\r' || first[0] == '\n' {
+				_, _ = reader.ReadByte()
+				continue
+			}
+			structuredResponse = first[0] == '{' || first[0] == '['
+			break
+		}
+		resp.Body = struct {
+			io.Reader
+			io.Closer
+		}{reader, original}
+	}
+	if info.ResponseFacts != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices || structuredResponse) {
 		body, readErr := io.ReadAll(resp.Body)
 		if resp.StatusCode == http.StatusOK && !info.IsStream && speechAudioPayload(c.Request.Context(), body, audioFormat, formatFacts) {
 			bufferedAudio, bufferedAudioErr, audioBuffered = body, readErr, true
@@ -464,7 +486,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			factsBody := mediaResponseEnvelope(bodyBytes)
 			reported := reportedMediaUsage(factsBody)
 			fault := observeMediaError(info, factsBody, resp.StatusCode)
-			if fault != nil || ojson.ValidBytes(bodyBytes) && ojson.ParseBytes(bodyBytes).IsObject() {
+			if fault != nil || !bytes.Equal(factsBody, bodyBytes) || ojson.ValidBytes(bodyBytes) && ojson.ParseBytes(bodyBytes).IsObject() {
 				observeMediaUsage(info, reported, factsBody)
 				normalizeSpeechOutputUsage(info, reported)
 				applySpeechUsageHeaders(info, reported, resp.Header)

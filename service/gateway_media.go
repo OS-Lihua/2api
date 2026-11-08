@@ -32,14 +32,15 @@ func GatewayMediaCapabilitiesMatch(c *gin.Context, kind protocol.Type, request d
 		if err != nil || caps.Limits.MaxImages != nil && int64(count) > *caps.Limits.MaxImages {
 			return false
 		}
-		images := 0
+		uploadedImages := 0
 		if form := c.Request.MultipartForm; form != nil {
 			for field, files := range form.File {
 				if field == "image" || strings.HasPrefix(field, "image[") {
-					images += len(files)
+					uploadedImages += len(files)
 				}
 			}
 		}
+		images := 0
 		for _, raw := range []common.RawMessage{image.Image, image.Images} {
 			if len(raw) == 0 {
 				continue
@@ -51,6 +52,8 @@ func GatewayMediaCapabilitiesMatch(c *gin.Context, kind protocol.Type, request d
 				images++
 			}
 		}
+		// Uploaded files and the effective DTO are separate input views.
+		images = max(images, uploadedImages)
 		if images > dto.MaxImageN || images > 0 && !slices.Contains(caps.InputModalities, capability.Image) || caps.Limits.MaxImages != nil && int64(images) > *caps.Limits.MaxImages {
 			return false
 		}
