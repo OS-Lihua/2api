@@ -4774,6 +4774,9 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 	audio := make([]byte, 48000)
 	for _, tc := range []struct {
 		purchaseBody   bool
+		keys           string
+		disabledValid  bool
+		unavailable    bool
 		name           string
 		provider       int
 		kind           protocol.Type
@@ -4785,6 +4788,10 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 		hold           int64
 		extra          string
 	}{
+		{name: "Volcengine valid key after malformed", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, keys: "malformed\naccess|secret"},
+		{name: "Volcengine valid key after empty", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, keys: "|\naccess|secret"},
+		{name: "Volcengine disabled valid key", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, keys: "malformed\naccess|secret", disabledValid: true, unavailable: true},
+		{name: "Volcengine no valid key", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, keys: "malformed\nbroken", unavailable: true},
 		{name: "Volcengine purchase body", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, purchaseBody: true},
 		{name: "Volcengine purchase body override", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, purchaseBody: true, overrides: `{"operations":[{"path":"app.appid","mode":"set","value":""},{"path":"app.token","mode":"set","value":"client-token"}]}`},
 		{name: "MiniMax short PCM", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, short: true},
@@ -4833,7 +4840,7 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 					assert.Equal(t, float64(1), settings["channel"])
 					encoded = fmt.Sprintf(`{"data":{"audio":%q,"status":2},"base_resp":{"status_code":0}}`, strings.Repeat("00", len(audio)))
 				} else {
-					if tc.purchaseBody {
+					if tc.purchaseBody || tc.keys != "" {
 						assert.Equal(t, "access", body["app"].(map[string]any)["appid"])
 						assert.Equal(t, "secret", body["app"].(map[string]any)["token"])
 					}
@@ -4863,6 +4870,16 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 				require.NoError(t, model.DB.Save(&unified).Error)
 			}
 			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": tc.provider, "key": "access|secret"}).Error)
+			if tc.keys != "" {
+				var provider model.Provider
+				require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
+				provider.Key = tc.keys
+				provider.ProviderInfo = model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}
+				if tc.disabledValid {
+					provider.ProviderInfo.MultiKeyStatusList = map[int]int{1: common.ChannelStatusManuallyDisabled}
+				}
+				require.NoError(t, model.DB.Save(&provider).Error)
+			}
 			upstream := "speech-model"
 			sale, cost := `tier("audio",ao * 10)`, `tier("audio",ao * 7)`
 			if tc.kind == protocol.OpenAIAudioTranscription {
@@ -4892,8 +4909,20 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
 			response := httptest.NewRecorder()
 			fixture.engine.ServeHTTP(response, request)
-			if tc.reject {
-				assert.Equal(t, 400, response.Code, response.Body.String())
+			if tc.keys != "" {
+				var stored model.Provider
+				require.NoError(t, model.DB.First(&stored, fixture.channel.ProviderID).Error)
+				assert.Zero(t, stored.ProviderInfo.MultiKeyStatusList[0])
+				if tc.disabledValid {
+					assert.Equal(t, common.ChannelStatusManuallyDisabled, stored.ProviderInfo.MultiKeyStatusList[1])
+				}
+			}
+			if tc.reject || tc.unavailable {
+				wantStatus := 400
+				if tc.unavailable {
+					wantStatus = 503
+				}
+				assert.Equal(t, wantStatus, response.Code, response.Body.String())
 				assert.Zero(t, calls)
 				_, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
 				require.NoError(t, err)

@@ -82,6 +82,20 @@ func (p *ttsProtocol) DoResponse(c *gin.Context, response *http.Response, info *
 	return &dto.Usage{PromptTokens: info.GetEstimatePromptTokens(), TotalTokens: info.GetEstimatePromptTokens()}, nil
 }
 
+func (p *Provider) ValidateCredentialFormat(kind protocol.Type, key string) error {
+	if kind != protocol.OpenAIAudioSpeech {
+		return nil
+	}
+	appID, token, err := parseVolcengineAuth(key)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(appID) == "" || strings.TrimSpace(token) == "" {
+		return errors.New("Volcengine speech credentials are empty")
+	}
+	return nil
+}
+
 func (p *Provider) PrepareRequestBody(_ *gin.Context, metadata channel.ProviderMetadata, body []byte) ([]byte, error) {
 	account := metadata.ProviderRequest()
 	if account.Protocol != protocol.OpenAIAudioSpeech {

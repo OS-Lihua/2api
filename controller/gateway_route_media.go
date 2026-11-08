@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -37,9 +38,33 @@ func prepareGatewayMediaRoute(c *gin.Context, selection *service.GatewaySelectio
 	if selection.Channel.Protocol != parsed.Protocol {
 		return nil, service.ErrGatewayCapability
 	}
+	apiType, ok := common.ChannelType2APIType(selection.Provider.Type)
+	if !ok {
+		return nil, service.ErrGatewayCapability
+	}
+	adaptor, err := relay.GetChannelAdaptor(apiType, selection.Channel.Protocol)
+	if err != nil {
+		return nil, service.ErrGatewayCapability
+	}
+	// Filter this preview without changing stored Key status or rotation state.
+	provider := *selection.Provider
+	if provider.ProviderInfo.IsMultiKey {
+		statuses := maps.Clone(provider.ProviderInfo.MultiKeyStatusList)
+		for index, key := range provider.GetKeys() {
+			if adaptor.ValidateCredentialFormat(key) != nil {
+				if statuses == nil {
+					statuses = make(map[int]int)
+				}
+				statuses[index] = common.ChannelStatusAutoDisabled
+			}
+		}
+		provider.ProviderInfo.MultiKeyStatusList = statuses
+	} else if adaptor.ValidateCredentialFormat(provider.Key) != nil {
+		return nil, service.ErrGatewayUnavailable
+	}
 	candidate := c.Copy()
 	candidate.Request = c.Request.Clone(c.Request.Context())
-	if err := middleware.SetupContextForGatewayCandidate(candidate, selection.Provider, selection.Channel.Model.ModelName); err != nil {
+	if err := middleware.SetupContextForGatewayCandidate(candidate, &provider, selection.Channel.Model.ModelName); err != nil {
 		return nil, service.ErrGatewayUnavailable
 	}
 	var overrides map[string]any
@@ -63,10 +88,6 @@ func prepareGatewayMediaRoute(c *gin.Context, selection *service.GatewaySelectio
 	common.SetContextKey(candidate, constant.ContextKeyResponseFacts, info.ResponseFacts)
 	common.SetContextKey(candidate, constant.ContextKeyOriginalModel, info.TokenizerModel)
 	if helper.ValidateGatewayMediaMultipliers(parsed.Input.Body, selection.Capabilities.Limits) != nil {
-		return nil, service.ErrGatewayCapability
-	}
-	adaptor, err := relay.GetChannelAdaptor(info.ApiType, selection.Channel.Protocol)
-	if err != nil {
 		return nil, service.ErrGatewayCapability
 	}
 	prepared, err := adaptor.PrepareMediaWire(candidate, info, parsed)

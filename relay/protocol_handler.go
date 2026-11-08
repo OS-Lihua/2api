@@ -174,6 +174,13 @@ func (a *ChannelAdaptor) SetChatOutputLimit(converted any, body []byte, limit ui
 	return common.Marshal(wire)
 }
 
+func (a *ChannelAdaptor) ValidateCredentialFormat(key string) error {
+	if validator, ok := a.provider.(channel.ProviderCredentialValidator); ok {
+		return validator.ValidateCredentialFormat(a.kind, key)
+	}
+	return nil
+}
+
 func (a *ChannelAdaptor) providerMetadata(info *relaycommon.RelayInfo) *channel.ProviderRequest {
 	metadata := channel.NewProviderMetadata(info)
 	metadata.Protocol = a.kind
