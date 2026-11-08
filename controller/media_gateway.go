@@ -447,7 +447,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	if info.QuotaClamp != nil {
 		attempt.RouteDiagnostics["quota_saturation"] = info.QuotaClamp.AuditMap()
 	}
-	if generated || facts.PromptTokensReported || facts.CompletionTokensReported || facts.AudioInputDurationReported || facts.AudioInputDurationInvalid {
+	if generated || facts.PromptTokensReported || facts.CompletionTokensReported || facts.AudioInputTokensReported || facts.TextInputTokensReported || facts.AudioOutputTokensReported || facts.AudioInputDurationReported || facts.AudioInputDurationInvalid {
 		attempt.UsageSource = "estimated"
 	}
 	if facts.UsageReported {

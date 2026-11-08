@@ -5682,7 +5682,7 @@ func TestMediaGatewayVLLMPCMUsesEffectiveSampleRate(t *testing.T) {
 		seconds   string
 		delivered bool
 	}{
-		{"complete", 50, "3", true}, {"wrong_mime", 50, "3", true}, {"wrong_mime_wav", 50, "3", true}, {"short", 50, "3", false}, {"sse", 50, "3", true}, {"cancel", 33, "2", true}, {"client", 50, "3", true}, {"header", 17, "0.75", true},
+		{"complete", 50, "3", true}, {"wrong_mime", 50, "3", true}, {"wrong_mime_pcm_prefix", 50, "3", true}, {"wrong_mime_wav", 50, "3", true}, {"short", 50, "3", false}, {"sse", 50, "3", true}, {"cancel", 33, "2", true}, {"client", 50, "3", true}, {"header", 17, "0.75", true},
 		{"sse_format", 17, "1", true}, {"sse_changing_format", 33, "2", true}, {"sse_format_interrupt", 17, "1", true},
 		{"headers_zero", 0, "3", true}, {"headers_reported", 1000, "3", true}, {"headers_short_zero", 0, "3", false}, {"headers_short_reported", 1000, "3", false},
 	} {
@@ -5690,6 +5690,9 @@ func TestMediaGatewayVLLMPCMUsesEffectiveSampleRate(t *testing.T) {
 			stream := strings.HasPrefix(tc.mode, "sse") || tc.mode == "cancel"
 			responseFormat := "pcm"
 			payload := make([]byte, 48000)
+			if tc.mode == "wrong_mime_pcm_prefix" {
+				payload[0] = 123
+			}
 			if tc.mode == "wrong_mime_wav" {
 				responseFormat = "wav"
 				payload = mediaWAV(t, 8000, uint32(len(payload)), payload)
@@ -5728,7 +5731,7 @@ func TestMediaGatewayVLLMPCMUsesEffectiveSampleRate(t *testing.T) {
 					return
 				}
 				w.Header().Set("Content-Type", "audio/pcm")
-				if tc.mode == "wrong_mime" || tc.mode == "wrong_mime_wav" {
+				if tc.mode == "wrong_mime" || tc.mode == "wrong_mime_pcm_prefix" || tc.mode == "wrong_mime_wav" {
 					w.Header().Set("Content-Type", "application/json")
 				}
 				if tc.mode == "header" {
@@ -5809,12 +5812,17 @@ func TestMediaGatewaySpeechJSONWithoutAudioReleasesFixedFee(t *testing.T) {
 		output                         int64
 		headerOutput, headerInputAudio bool
 		inputAudio                     int64
+		knownDetail                    bool
 	}{
 		{name: "empty", body: `{"error":null,"usage":{"input_tokens":0,"output_tokens":0}}`},
 		{name: "malformed", body: `{"error":`},
 		{name: "short malformed", body: `{"error":`, short: true},
 		{name: "malformed keeps usage", body: `{"usage":{"input_tokens":0,"output_tokens":1000},"error":`, short: true, output: 1000},
 		{name: "audio zero survives header total", body: `{"error":{"code":"rate_limit_exceeded"},"usage":{"input_tokens":0,"output_tokens_details":{"audio_tokens":0}}}`, headerOutput: true},
+		{name: "input audio detail only", body: `{"error":{"code":"rate_limit_exceeded"},"usage":{"input_token_details":{"audio_tokens":1000}}}`, inputAudio: 1000, knownDetail: true},
+		{name: "input audio zero only", body: `{"error":{"code":"rate_limit_exceeded"},"usage":{"input_token_details":{"audio_tokens":0}}}`, knownDetail: true},
+		{name: "output audio detail only", body: `{"error":{"code":"rate_limit_exceeded"},"usage":{"output_tokens_details":{"audio_tokens":1000}}}`, output: 1000, knownDetail: true},
+		{name: "input audio header only", body: `{"error":{"code":"rate_limit_exceeded"}}`, headerInputAudio: true, inputAudio: 1000, knownDetail: true},
 		{name: "input detail supplements body total", body: `{"error":{"code":"rate_limit_exceeded"},"usage":{"input_tokens":1000,"output_tokens":0}}`, headerInputAudio: true, inputAudio: 1000},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -5848,6 +5856,9 @@ func TestMediaGatewaySpeechJSONWithoutAudioReleasesFixedFee(t *testing.T) {
 			assert.Equal(t, (tc.output+tc.inputAudio)*1000, attempts[0].Cost.Nanos)
 			assert.Equal(t, tc.output, attempts[0].Usage.AudioOutputTokens)
 			assert.Equal(t, tc.inputAudio, attempts[0].Usage.AudioInputTokens)
+			if tc.knownDetail {
+				assert.NotEqual(t, "none", attempts[0].UsageSource)
+			}
 			wallet, err := model.GetUserWallet(fixture.user.Id)
 			require.NoError(t, err)
 			assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
@@ -5856,28 +5867,36 @@ func TestMediaGatewaySpeechJSONWithoutAudioReleasesFixedFee(t *testing.T) {
 }
 
 func TestMediaGatewayTruncatedSpeechSafetyErrorDoesNotRetry(t *testing.T) {
-	var secondCalls atomic.Int64
-	fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
-		body := `{"error":{"code":"content_filter","type":"invalid_request_error"},"usage":{"input_tokens":0,"output_tokens":0},"channels":`
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Content-Length", strconv.Itoa(len(body)+1))
-		_, _ = io.WriteString(w, body)
-	})
-	fixture.offering.RouteMethod = "weight"
-	require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
-	fallback := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
-		secondCalls.Add(1)
-		w.Header().Set("Content-Type", "audio/pcm")
-		_, _ = w.Write(make([]byte, 48000))
-	})
-	require.NoError(t, model.DB.Model(fallback).Update("protocol", protocol.OpenAIAudioSpeech).Error)
-	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", `{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm"}`)
-	assert.GreaterOrEqual(t, response.Code, 400)
-	assert.Zero(t, secondCalls.Load())
-	attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
-	require.NoError(t, err)
-	require.EqualValues(t, 1, total)
-	assert.Equal(t, "content_safety", attempts[0].ErrorClass)
+	for _, badType := range []bool{false, true} {
+		t.Run(fmt.Sprintf("badType=%t", badType), func(t *testing.T) {
+			var secondCalls atomic.Int64
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
+				body := `{"error":{"code":"content_filter","type":"invalid_request_error"},"usage":{"input_tokens":0,"output_tokens":0},`
+				if badType {
+					body += `"type":123,`
+				}
+				body += `"channels":`
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Content-Length", strconv.Itoa(len(body)+1))
+				_, _ = io.WriteString(w, body)
+			})
+			fixture.offering.RouteMethod = "weight"
+			require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+			fallback := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+				secondCalls.Add(1)
+				w.Header().Set("Content-Type", "audio/pcm")
+				_, _ = w.Write(make([]byte, 48000))
+			})
+			require.NoError(t, model.DB.Model(fallback).Update("protocol", protocol.OpenAIAudioSpeech).Error)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", `{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm"}`)
+			assert.GreaterOrEqual(t, response.Code, 400)
+			assert.Zero(t, secondCalls.Load())
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, "content_safety", attempts[0].ErrorClass)
+		})
+	}
 }
 
 func TestMediaGatewaySpeechCapContinuesToCompatibleCandidate(t *testing.T) {

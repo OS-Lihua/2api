@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/MoeForge/moego/ojson"
 
@@ -96,6 +97,31 @@ func speechAudioPayload(ctx context.Context, body []byte, format string, facts *
 		return false
 	}
 	first := payload[0]
+	if format == "pcm" {
+		channels := int64(1)
+		if facts != nil && facts.AudioOutputChannels > 0 && facts.AudioOutputChannels <= 1<<31-1 {
+			channels = int64(facts.AudioOutputChannels)
+		}
+		if int64(len(body))%(channels*2) != 0 {
+			return false
+		}
+		if colon := bytes.IndexByte(payload, ':'); first == '{' && colon > 1 {
+			var key string
+			if common.Unmarshal(payload[1:colon], &key) == nil {
+				return false
+			}
+		}
+		binary := !utf8.Valid(body)
+		for _, value := range body {
+			if value < 0x20 && value != '\t' && value != '\n' && value != '\r' {
+				binary = true
+				break
+			}
+		}
+		if binary {
+			return true
+		}
+	}
 	if first == '{' || first == '[' || first == '"' || first == '-' || first >= '0' && first <= '9' || bytes.HasPrefix(payload, []byte("true")) || bytes.HasPrefix(payload, []byte("false")) || bytes.HasPrefix(payload, []byte("null")) {
 		return false
 	}
@@ -103,11 +129,7 @@ func speechAudioPayload(ctx context.Context, body []byte, format string, facts *
 		duration, err := speechAudioDuration(ctx, body, format, facts)
 		return err == nil && !math.IsNaN(duration) && !math.IsInf(duration, 0) && duration > 0
 	}
-	channels := int64(1)
-	if facts != nil && facts.AudioOutputChannels > 0 && facts.AudioOutputChannels <= 1<<31-1 {
-		channels = int64(facts.AudioOutputChannels)
-	}
-	return int64(len(body))%(channels*2) == 0
+	return true
 }
 
 func speechAudioDuration(ctx context.Context, audio []byte, format string, facts *relaycommon.ResponseFacts) (float64, error) {

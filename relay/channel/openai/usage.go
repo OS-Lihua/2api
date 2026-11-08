@@ -97,18 +97,19 @@ func mergeMediaTokenDetails(usage *dto.Usage, body []byte) {
 // Provider's message or other error details into downstream output or logs.
 func observeMediaError(info *relaycommon.RelayInfo, body []byte, status int) *types.OpenAIError {
 	var envelope struct {
-		Type  string `json:"type"`
-		Code  any    `json:"code"`
-		Error any    `json:"error"`
+		Type  any `json:"type"`
+		Code  any `json:"code"`
+		Error any `json:"error"`
 	}
 	if common.Unmarshal(body, &envelope) != nil {
 		return nil
 	}
 	fault := dto.GetOpenAIError(envelope.Error)
 	if fault == nil {
-		switch strings.ToLower(strings.TrimSpace(envelope.Type)) {
+		kind, _ := envelope.Type.(string)
+		switch strings.ToLower(strings.TrimSpace(kind)) {
 		case "error", "upstream_error":
-			fault = &types.OpenAIError{Type: envelope.Type, Code: envelope.Code}
+			fault = &types.OpenAIError{Type: kind, Code: envelope.Code}
 		default:
 			return nil
 		}
