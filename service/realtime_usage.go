@@ -223,6 +223,7 @@ func (accumulator *RealtimeUsageAccumulator) Observe(raw []byte, input *dto.Usag
 func (accumulator *RealtimeUsageAccumulator) finish(id string, state *realtimeResponseUsage) RealtimeUsageResult {
 	usage := state.accumulator.Finish()
 	facts := state.info.ResponseFacts
+	facts.GeneratedAudioBytes = state.audioBytes
 	text := tokenkit.Count(state.info.TokenizerModelName(), facts.GeneratedText)
 	audio := CountRealtimeAudioTokens(state.audioBytes, state.outputAudioFormat, false)
 	generated := text + audio
@@ -237,7 +238,7 @@ func (accumulator *RealtimeUsageAccumulator) finish(id string, state *realtimeRe
 	if !facts.CompletionTokensReported {
 		usage.CompletionTokens = max(usage.CompletionTokens, generated)
 	}
-	if !facts.PromptTokensReported && generated > 0 {
+	if !facts.PromptTokensReported && (generated > 0 || state.audioBytes > 0) {
 		usage.PromptTokens = state.input.PromptTokens
 	}
 	if !state.audioReported && audio > 0 && (!facts.CompletionTokensReported || usage.CompletionTokens > 0) {

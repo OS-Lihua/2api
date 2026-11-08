@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -523,7 +524,8 @@ func TestWebSocketGatewayTerminalWriteFailurePreservesCompleteUsage(t *testing.T
 		name   string
 		native protocol.Type
 		audio  bool
-	}{{"responses terminal", protocol.OpenAIResponses, false}, {"realtime terminal", protocol.OpenAIRealtime, false}, {"realtime undelivered audio", protocol.OpenAIRealtime, true}} {
+		short  bool
+	}{{"responses terminal", protocol.OpenAIResponses, false, false}, {"realtime terminal", protocol.OpenAIRealtime, false, false}, {"realtime undelivered audio", protocol.OpenAIRealtime, true, false}, {"realtime short undelivered audio", protocol.OpenAIRealtime, true, true}} {
 		native := test.native
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -548,7 +550,11 @@ func TestWebSocketGatewayTerminalWriteFailurePreservesCompleteUsage(t *testing.T
 					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"complete","status":"in_progress","conversation_id":null}}`))) {
 						return
 					}
-					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.audio.delta","response_id":"complete","delta":"`+base64.StdEncoding.EncodeToString(make([]byte, 8000))+`"}`))) {
+					audioBytes := 8000
+					if test.short {
+						audioBytes = 960
+					}
+					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.audio.delta","response_id":"complete","delta":"`+base64.StdEncoding.EncodeToString(make([]byte, audioBytes))+`"}`))) {
 						return
 					}
 					_, _, _ = peer.ReadMessage()
@@ -586,7 +592,11 @@ func TestWebSocketGatewayTerminalWriteFailurePreservesCompleteUsage(t *testing.T
 				path, create = "/v1/realtime", `{"type":"response.create","response":{"conversation":"none","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],"output_modalities":["text"],"max_output_tokens":16}}`
 			}
 			if test.audio {
-				create = strings.ReplaceAll(create, `"output_modalities":["text"]`, `"output_modalities":["audio"],"audio":{"output":{"format":{"type":"audio/pcmu"}}}`)
+				format := "audio/pcmu"
+				if test.short {
+					format = "audio/pcm"
+				}
+				create = strings.ReplaceAll(create, `"output_modalities":["text"]`, fmt.Sprintf(`"output_modalities":["audio"],"audio":{"output":{"format":{"type":%q}}}`, format))
 			}
 			client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+path+"?model=gateway-alias", http.Header{"Authorization": {"Bearer sk-" + fixture.token.Key}})
 			require.NoError(t, err)
@@ -616,7 +626,11 @@ func TestWebSocketGatewayTerminalWriteFailurePreservesCompleteUsage(t *testing.T
 			}, 5*time.Second, 10*time.Millisecond)
 			if test.audio {
 				assert.Zero(t, records[0].Receivable.Nanos)
-				assertTextGatewayLedger(t, records[0], 41_000)
+				cost := int64(41_000)
+				if test.short {
+					cost = 1000
+				}
+				assertTextGatewayLedger(t, records[0], cost)
 				return
 			}
 			assert.Equal(t, int64(10), records[0].Usage.CompletionTokens)
@@ -881,8 +895,68 @@ func TestRealtimeGatewayRejectsFixedPricingBeforeReservation(t *testing.T) {
 	}
 }
 
+func TestRealtimeGatewayRequiresConfirmedAutomaticSuppression(t *testing.T) {
+	for _, sessionBody := range []string{`{}`, `{"turn_detection":{}}`, `{"turn_detection":{"create_response":false}}`} {
+		t.Run(sessionBody, func(t *testing.T) {
+			var forwarded atomic.Int32
+			release := make(chan struct{}, 1)
+			defer close(release)
+			done := make(chan struct{})
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				defer close(done)
+				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if !assert.NoError(t, err) {
+					return
+				}
+				defer peer.Close()
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"modalities":["text"],"turn_detection":{"type":"server_vad","create_response":true,"interrupt_response":true}}}`))) {
+					return
+				}
+				_, command, err := peer.ReadMessage()
+				if !assert.NoError(t, err) {
+					return
+				}
+				assert.Equal(t, "session.update", ojson.GetBytes(command, "type").String())
+				<-release
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.updated","session":`+sessionBody+`}`))) {
+					return
+				}
+				for {
+					_, _, err := peer.ReadMessage()
+					if err != nil {
+						return
+					}
+					forwarded.Add(1)
+				}
+			})
+			var unified model.Model
+			require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+			unified.Capabilities.InputModalities = append(unified.Capabilities.InputModalities, capability.Audio)
+			require.NoError(t, model.DB.Model(&unified).Select("capabilities").Updates(&unified).Error)
+			client := dialRealtimeGateway(t, fixture)
+			_, _, err := client.ReadMessage()
+			require.NoError(t, err)
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"input_audio_buffer.append","audio":"`+base64.StdEncoding.EncodeToString(make([]byte, 4800))+`"}`)))
+			release <- struct{}{}
+			_, reply, err := client.ReadMessage()
+			require.NoError(t, err)
+			assert.Equal(t, "error", ojson.GetBytes(reply, "type").String())
+			require.NoError(t, client.Close())
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Unconfirmed bootstrap left the Provider socket alive")
+			}
+			assert.Zero(t, forwarded.Load(), "Client input cannot pass an unconfirmed automatic-generation gate")
+			var billings int64
+			require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Where("user_id = ?", fixture.user.Id).Count(&billings).Error)
+			assert.Zero(t, billings)
+		})
+	}
+}
+
 func TestRealtimeGatewayRecoversControlErrorsAndAcceptsLockedModel(t *testing.T) {
-	for _, scenario := range []string{"same model", "config error", "commit error"} {
+	for _, scenario := range []string{"same model", "config error", "commit error", "response error"} {
 		t.Run(scenario, func(t *testing.T) {
 			var calls atomic.Int32
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -900,7 +974,7 @@ func TestRealtimeGatewayRecoversControlErrorsAndAcceptsLockedModel(t *testing.T)
 						return
 					}
 					kind := ojson.GetBytes(raw, "type").String()
-					if kind == "input_audio_buffer.commit" || ojson.GetBytes(raw, "session.temperature").Exists() {
+					if kind == "input_audio_buffer.commit" || ojson.GetBytes(raw, "session.temperature").Exists() || ojson.GetBytes(raw, "response.tools").Exists() {
 						reply := ojson.NewDoc([]byte(`{"type":"error","error":{"type":"invalid_request_error","code":"invalid_value","message":"Rejected control"}}`))
 						if !assert.NoError(t, reply.Set("error.event_id", ojson.GetBytes(raw, "event_id").String())) {
 							return
@@ -939,6 +1013,9 @@ func TestRealtimeGatewayRecoversControlErrorsAndAcceptsLockedModel(t *testing.T)
 				if scenario == "commit error" {
 					control = `{"type":"input_audio_buffer.commit","event_id":"bad-commit"}`
 				}
+				if scenario == "response error" {
+					control = `{"type":"response.create","event_id":"bad-response","response":{"input":[],"conversation":"none","tools":[{"type":"function","name":"bad","parameters":{"type":"invalid"}}]}}`
+				}
 				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(control)))
 				_, reply, err := client.ReadMessage()
 				require.NoError(t, err)
@@ -962,13 +1039,25 @@ func TestRealtimeGatewayRecoversControlErrorsAndAcceptsLockedModel(t *testing.T)
 			}
 			require.NoError(t, client.Close())
 			assert.Equal(t, int32(1), calls.Load())
+			recordCount := 1
+			if scenario == "response error" {
+				recordCount = 2
+			}
 			var records []model.GatewayRequest
 			require.Eventually(t, func() bool {
 				var err error
 				records, _, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
-				return err == nil && len(records) == 1 && records[0].Status == "success"
+				return err == nil && len(records) == recordCount && slices.ContainsFunc(records, func(record model.GatewayRequest) bool { return record.Status == "success" })
 			}, 5*time.Second, 10*time.Millisecond)
-			assertTextGatewayLedger(t, records[0], 3000)
+			for _, record := range records {
+				cost := int64(3000)
+				if record.Status != "success" {
+					assert.Equal(t, "failed", record.Status)
+					assert.Zero(t, record.Receivable.Nanos)
+					cost = 0
+				}
+				assertTextGatewayLedger(t, record, cost)
+			}
 		})
 	}
 }

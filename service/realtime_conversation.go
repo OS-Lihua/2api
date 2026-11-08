@@ -278,6 +278,8 @@ func (conversation *RealtimeConversation) remove(id string) {
 		output.quantity.total = max(0, output.quantity.total-item.quantity.total)
 		output.quantity.audio = max(0, output.quantity.audio-item.quantity.audio)
 		output.quantity.image = max(0, output.quantity.image-item.quantity.image)
+		output.quantity.audioItems = max(0, output.quantity.audioItems-item.quantity.audioItems)
+		output.quantity.imageItems = max(0, output.quantity.imageItems-item.quantity.imageItems)
 		if output.defaultConversation {
 			conversation.current = conversation.current.subtract(previous).add(output.quantity)
 		}
@@ -308,6 +310,7 @@ func (conversation *RealtimeConversation) Complete(result *relaycommon.RealtimeR
 		quantity.audioItems = 1
 	}
 	ids := []string{}
+	quantity.audioItems = 0
 	edited, audioItems := false, 0
 	for id, item := range conversation.items {
 		if item.response != result.ID {
@@ -316,6 +319,11 @@ func (conversation *RealtimeConversation) Complete(result *relaycommon.RealtimeR
 		ids = append(ids, id)
 		edited = edited || item.deleted || item.truncatedAtMS != nil
 		audioItems += item.quantity.audioItems
+		quantity.audioItems += item.quantity.audioItems
+		quantity.imageItems += item.quantity.imageItems
+	}
+	if len(ids) == 0 && audio > 0 {
+		quantity.audioItems = 1
 	}
 	retained := realtimeInputQuantity{}
 	for _, id := range ids {

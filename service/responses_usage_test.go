@@ -8,6 +8,7 @@ import (
 	"github.com/MoeForge/moego/base64"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/capability"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -69,6 +70,8 @@ func TestRealtimeConversationFreezesItemsAcrossDeletionAndAudioTruncation(t *tes
 	_, err = conversation.Observe([]byte(`{"type":"conversation.item.deleted","item_id":"voice"}`), false)
 	require.NoError(t, err)
 	assert.Zero(t, conversation.Usage(false).PromptTokens)
+	_, err = conversation.Snapshot().EstimateForCapabilities([]byte(`{}`), capability.Set{InputModalities: []capability.Modality{capability.Text}})
+	require.NoError(t, err, "Deleting the audio item removes its input modality")
 	for _, edit := range []struct {
 		name, frame string
 		expected    int

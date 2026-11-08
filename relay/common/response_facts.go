@@ -31,6 +31,7 @@ type ResponseFacts struct {
 	CompletionTokensReported bool
 	BusinessOutput           bool
 	DownstreamWriteFailed    bool
+	GeneratedAudioBytes      int64
 	GeneratedText            string
 	GeneratedOutputTokens    *int
 	DeliveredOutputTokens    *int

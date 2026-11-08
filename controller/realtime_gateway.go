@@ -50,6 +50,7 @@ type realtimeGatewayResponse struct {
 }
 
 type realtimeGatewayAttempt struct {
+	eventID               string
 	channelID, providerID int
 	finished              bool
 	stopTimeout           func() bool
@@ -352,7 +353,7 @@ func (response *realtimeGatewayResponse) purchaseInput() billingexpr.RequestInpu
 }
 
 func (response *realtimeGatewayResponse) exchange(c *gin.Context, info *relaycommon.RelayInfo, channelID, providerID int, prepared *relaychannel.PreparedWssRequest, payload []byte) (*dto.Usage, *types.NewAPIError) {
-	attempt := &realtimeGatewayAttempt{channelID: channelID, providerID: providerID, info: info, prepared: prepared, context: c.Request.Context(), reply: make(chan realtimeGatewayCompletion, 1), response: response,
+	attempt := &realtimeGatewayAttempt{eventID: ojson.GetBytes(payload, "event_id").String(), channelID: channelID, providerID: providerID, info: info, prepared: prepared, context: c.Request.Context(), reply: make(chan realtimeGatewayCompletion, 1), response: response,
 		saleInput: billingexpr.RequestInput{Body: response.call.Native.OriginalBody, Headers: info.RequestHeaders}, purchaseInput: billingexpr.RequestInput{Body: payload, Headers: map[string]string{}}, input: response.call.Native.InputUsage}
 	for name, values := range prepared.Headers() {
 		attempt.purchaseInput.Headers[strings.ToLower(name)] = strings.Join(values, ",")
@@ -529,9 +530,15 @@ func (session *realtimeGatewaySession) requestAt(raw []byte, startedAt time.Time
 		if eventID.Type != ojson.String {
 			return nil, types.NewErrorWithStatusCode(errors.New("event_id must be a string"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
 		}
-		if err := document.SetRawBytes("event_id", []byte(eventID.Raw)); err != nil {
+		value := eventID.String()
+		if value == "" {
+			value = "event_" + common.GetUUID()[:24]
+		}
+		if err := document.Set("event_id", value); err != nil {
 			return nil, types.NewError(err, types.ErrorCodeInvalidRequest)
 		}
+	} else if err := document.Set("event_id", "event_"+common.GetUUID()[:24]); err != nil {
+		return nil, types.NewError(err, types.ErrorCodeInvalidRequest)
 	}
 	attempt, apiErr := session.admitGeneration(document.Bytes(), originalRaw, session.defaultInput(false), startedAt)
 	if apiErr != nil {
@@ -769,6 +776,20 @@ func (session *realtimeGatewaySession) event(raw []byte) ([]byte, [][]byte, *typ
 				session.configPending = true
 			}
 		} else {
+			if session.requiredConfig || session.pendingDetection {
+				path, kind := session.vadPath, session.vadType
+				if session.pendingDetection {
+					path, kind = session.nextVADPath, session.nextVADType
+				}
+				physical := value.Get(path)
+				confirmed := physical.Exists() && physical.Type == ojson.Null
+				if kind != "" {
+					confirmed = physical.IsObject() && physical.Get("create_response").Type == ojson.False && physical.Get("interrupt_response").Type == ojson.False
+				}
+				if !confirmed {
+					return nil, nil, types.NewError(errors.New("Upstream automatic generation suppression was not confirmed"), types.ErrorCodeBadResponse)
+				}
+			}
 			if session.pendingDetection {
 				session.autoResponse, session.autoInterrupt, session.vadType = session.nextAutoResponse, session.nextAutoInterrupt, session.nextVADType
 				session.vadPath, session.pendingDetection = session.nextVADPath, false
@@ -808,6 +829,11 @@ func (session *realtimeGatewaySession) event(raw []byte) ([]byte, [][]byte, *typ
 			}
 			session.configPending, session.pendingDetection = false, false
 			session.configEventID = ""
+		}
+		if id != "" && session.awaiting != nil && id == session.awaiting.eventID {
+			attempt := session.awaiting
+			session.awaiting = nil
+			session.finish(attempt, realtimeGatewayCompletion{apiErr: types.NewErrorWithStatusCode(errors.New("Realtime response was rejected"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)})
 		}
 		if id != "" && id == session.commitEventID {
 			session.commitPending = false
