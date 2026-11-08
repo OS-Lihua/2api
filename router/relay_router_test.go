@@ -4061,6 +4061,197 @@ type gatewayFailingFlushWriter struct{ *httptest.ResponseRecorder }
 
 func (w gatewayFailingFlushWriter) FlushError() error { return io.ErrClosedPipe }
 
+func TestTextGatewayResponsesBudgetTerminalIsNotTransportFailure(t *testing.T) {
+	for _, target := range []struct {
+		name, path, request, terminal string
+		empty                         bool
+	}{
+		{"responses", "/v1/responses", `{"model":"gateway-offering","input":"Hello","stream":true,"max_output_tokens":16}`, "event: response.incomplete", false},
+		{"responses without content", "/v1/responses", `{"model":"gateway-offering","input":"Hello","stream":true,"max_output_tokens":16}`, "event: response.incomplete", true},
+		{"chat", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"stream":true,"max_tokens":16}`, `"finish_reason":"length"`, false},
+		{"messages", "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"stream":true,"max_tokens":16}`, `"stop_reason":"max_tokens"`, false},
+		{"gemini", "/v1beta/models/gateway-offering:streamGenerateContent?alt=sse", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16}}`, `"finishReason":"MAX_TOKENS"`, false},
+	} {
+		for _, fixed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/fixed=%t", target.name, fixed), func(t *testing.T) {
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					if !target.empty {
+						_, _ = io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}\n\n")
+					}
+					_, _ = io.WriteString(w, "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n")
+				})
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "openai_responses").Error)
+				if fixed {
+					price := &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("request",fixed(0.01))`, EffectiveAt: clock.Now().Unix()}
+					require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+				}
+				second := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+					t.Error("normal output budget termination must not switch")
+				})
+				require.NoError(t, model.DB.Model(second).Update("protocol", "openai_responses").Error)
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, target.path, target.request)
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				if !target.empty {
+					assert.Contains(t, response.Body.String(), "Hello")
+				}
+				assert.Contains(t, response.Body.String(), target.terminal)
+				assert.NotContains(t, response.Body.String(), "event: response.failed")
+				assert.NotContains(t, response.Body.String(), "upstream_error")
+				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, "partial", record.Status)
+				if fixed || target.empty {
+					assert.Zero(t, record.Receivable.Nanos)
+				} else {
+					assert.Equal(t, int64(36000), record.Receivable.Nanos)
+				}
+				attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, total)
+				assert.Equal(t, "output_limit", attempts[0].ErrorClass)
+				assert.Equal(t, "stop", attempts[0].FailoverDecision)
+				assert.Equal(t, int64(20000), attempts[0].Cost.Nanos)
+			})
+		}
+	}
+}
+
+func TestTextGatewayMalformedModalityDetailsRetainValidUsage(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				body := `{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"promptTokensDetails":[{"modality":7,"tokenCount":1},{"modality":"AUDIO","tokenCount":2}]}}`
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", body)
+				} else {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, body)
+				}
+			})
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "gemini_generate").Error)
+			path := "/v1beta/models/gateway-offering:generateContent"
+			if stream {
+				path = "/v1beta/models/gateway-offering:streamGenerateContent?alt=sse"
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16}}`)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), "Hello")
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(36000), record.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, "upstream", attempts[0].UsageSource)
+			assert.Equal(t, int64(10), attempts[0].Usage.PromptTokens)
+			assert.Equal(t, int64(5), attempts[0].Usage.CompletionTokens)
+			assert.Equal(t, int64(2), attempts[0].Usage.AudioInputTokens)
+			assert.Equal(t, int64(20000), attempts[0].Cost.Nanos)
+		})
+	}
+}
+
+func TestTextGatewayFailoverDiscardsProviderStateHeaders(t *testing.T) {
+	for _, finalHeader := range []string{"", "final"} {
+		t.Run("final="+finalHeader, func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set("X-Codex-Turn-State", "discarded")
+				w.Header().Set("X-Reasoning-Included", "discarded")
+				_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n")
+			})
+			addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				if finalHeader != "" {
+					w.Header().Set("X-Codex-Turn-State", finalHeader)
+					w.Header().Set("X-Reasoning-Included", finalHeader)
+				}
+				_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n")
+			})
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), "Hello")
+			for _, name := range []string{"X-Codex-Turn-State", "X-Reasoning-Included"} {
+				if finalHeader == "" {
+					assert.Empty(t, response.Header().Values(name))
+				} else {
+					assert.Equal(t, []string{finalHeader}, response.Header().Values(name))
+				}
+			}
+		})
+	}
+}
+
+func TestTextGatewayNativeMessagesURLDocumentRetainsValidationFacts(t *testing.T) {
+	for _, scenario := range []string{"missing capability", "small context", "native"} {
+		t.Run(scenario, func(t *testing.T) {
+			downloads := 0
+			document := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { downloads++; _, _ = io.WriteString(w, "%PDF-1.7") }))
+			t.Cleanup(document.Close)
+			uri := document.URL + "/document.pdf"
+			calls := 0
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				var sent map[string]any
+				require.NoError(t, common.DecodeJson(r.Body, &sent))
+				body, err := common.Marshal(sent)
+				require.NoError(t, err)
+				assert.Contains(t, string(body), uri)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`)
+			})
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "anthropic_messages").Error)
+			caps := capability.Set{InputModalities: []capability.Modality{capability.PDF}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{ContextLength: common.GetPointer(int64(10000))}}
+			if scenario == "missing capability" {
+				caps.InputModalities = []capability.Modality{capability.Text}
+			}
+			if scenario == "small context" {
+				caps.Limits.ContextLength = common.GetPointer(int64(1000))
+			}
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/messages", fmt.Sprintf(`{"model":"gateway-offering","messages":[{"role":"user","content":[{"type":"document","source":{"type":"url","url":%q}}]}],"max_tokens":16}`, uri))
+			assert.Zero(t, downloads, "native document reference must remain Provider-owned")
+			if scenario == "native" {
+				assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				assert.Equal(t, 1, calls)
+			} else {
+				assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+				assert.Zero(t, calls)
+			}
+		})
+	}
+}
+
+func TestTextGatewayResponsesImageDetailIsPreserved(t *testing.T) {
+	image, err := os.ReadFile("../controller/probe-fixtures/red.png")
+	require.NoError(t, err)
+	for _, detail := range []string{"low", "high", "auto"} {
+		t.Run(detail, func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				var sent struct {
+					Messages []struct {
+						Content []struct {
+							ImageURL struct{ Detail string } `json:"image_url"`
+						}
+					}
+				}
+				require.NoError(t, common.DecodeJson(r.Body, &sent))
+				require.NotEmpty(t, sent.Messages)
+				require.NotEmpty(t, sent.Messages[0].Content)
+				assert.Equal(t, detail, sent.Messages[0].Content[0].ImageURL.Detail)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`)
+			})
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", capability.Set{InputModalities: []capability.Modality{capability.Image}, OutputModalities: []capability.Modality{capability.Text}}).Error)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/responses", fmt.Sprintf(`{"model":"gateway-offering","input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,%s","detail":%q}]}],"max_output_tokens":16}`, base64.StdEncoding.EncodeToString(image), detail))
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Empty(t, response.Header().Get("X-Gateway-Conversion-Loss"))
+		})
+	}
+}
+
 func TestTextGatewayJSONFlushFailurePreservesCostAndRefundsFixedPrice(t *testing.T) {
 	for _, source := range []struct{ protocol, path, request, response string }{
 		{"openai_chat", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`},
@@ -4600,6 +4791,7 @@ func TestTextGatewayPartialSaleUsesDeliveredOutput(t *testing.T) {
 
 func TestTextGatewaySuccessfulTerminalWaitsForTransportValidation(t *testing.T) {
 	for _, source := range []struct{ protocol, path, request, prefix, terminal, broken, forbidden string }{
+		{"openai_responses", "/v1/responses", `{"model":"gateway-offering","stream":true,"input":"Hello","max_output_tokens":16}`, `{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Hello"}`, `{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":10,"output_tokens":5}}}`, `{"type":"response.output_text.delta","output_index":"invalid"}`, "event: response.incomplete"},
 		{"openai_chat", "/v1/chat/completions", `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, `{"choices":[{"index":0,"delta":{"content":"Hello"}}]}`, `{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`, `{"choices":"invalid"}`, `"finish_reason":"stop"`},
 		{"openai_responses", "/v1/responses", `{"model":"gateway-offering","stream":true,"input":"Hello","max_output_tokens":16}`, `{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Hello"}`, `{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5}}}`, `{"type":"response.output_text.delta","output_index":"invalid"}`, "event: response.completed"},
 		{"anthropic_messages", "/v1/messages", `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}`, `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}`, `{"type":"content_block_delta","index":"invalid"}`, "event: message_stop"},
@@ -5106,6 +5298,7 @@ func TestTextGatewayStrictConversionLosses(t *testing.T) {
 		{"Gemini video sampling", "/v1beta/models/gateway-offering:generateContent", `{"contents":[{"role":"user","parts":[{"fileData":{"mimeType":"video/mp4","fileUri":"https://example.com/a.mp4"},"videoMetadata":{"startOffset":"10s","endOffset":"20s","fps":1}}]}],"generationConfig":{"maxOutputTokens":16}}`, "openai_chat", "request_parameter_dropped", "videoMetadata", false},
 		{"Gemini part media resolution", "/v1beta/models/gateway-offering:generateContent", fmt.Sprintf(`{"contents":[{"role":"user","parts":[{"inlineData":{"mimeType":"image/png","data":%q},"mediaResolution":{"level":"MEDIA_RESOLUTION_HIGH"}}]}],"generationConfig":{"maxOutputTokens":16}}`, base64.StdEncoding.EncodeToString(image)), "openai_chat", "request_parameter_dropped", "mediaResolution", false},
 		{"Gemini media resolution", "/v1beta/models/gateway-offering:generateContent", fmt.Sprintf(`{"contents":[{"role":"user","parts":[{"inlineData":{"mimeType":"image/png","data":%q}}]}],"generationConfig":{"maxOutputTokens":16,"mediaResolution":"MEDIA_RESOLUTION_HIGH"}}`, base64.StdEncoding.EncodeToString(image)), "openai_chat", "request_parameter_dropped", "mediaResolution", false},
+		{"hosted tool call limit", "/v1/responses", `{"model":"gateway-offering","input":"Hello","tools":[{"type":"web_search"}],"max_tool_calls":1,"max_output_tokens":16}`, "anthropic_messages", "request_parameter_dropped", "max_tool_calls", false},
 		{"minimum output", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"min_tokens":8}`, "openai_responses", "request_parameter_dropped", "min_tokens", false},
 		{"regex constraint", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"regex":"[a-z]+"}`, "openai_responses", "request_parameter_dropped", "regex", false},
 		{"stop token IDs", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stop_token_ids":[42]}`, "anthropic_messages", "request_parameter_dropped", "stop_token_ids", false},

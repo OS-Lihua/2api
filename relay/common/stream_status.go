@@ -70,6 +70,10 @@ type StreamOutcome struct {
 	IncompleteReason string
 }
 
+func (o StreamOutcome) OutputLimitReached() bool {
+	return o.Response == ResponseOutcomeIncomplete && o.IncompleteReason == "max_output_tokens"
+}
+
 func NewStreamStatus() *StreamStatus {
 	return &StreamStatus{}
 }
@@ -223,10 +227,10 @@ func (s *StreamStatus) CompletedNormally() bool {
 	}
 	outcome := s.OutcomeSnapshot()
 	normal := outcome.EndReason == StreamEndReasonDone || outcome.EndReason == StreamEndReasonEOF || outcome.EndReason == StreamEndReasonHandlerStop
-	if !normal || outcome.HasErrors || outcome.Response == ResponseOutcomeFailed || outcome.Response == ResponseOutcomeIncomplete || outcome.Response == ResponseOutcomeCancelled {
+	if !normal || outcome.HasErrors || outcome.Response == ResponseOutcomeFailed || outcome.Response == ResponseOutcomeCancelled || outcome.Response == ResponseOutcomeIncomplete && !outcome.OutputLimitReached() {
 		return false
 	}
-	return !outcome.ExpectsTerminal || outcome.Response == ResponseOutcomeCompleted || outcome.Response == ResponseOutcomeUnknown && outcome.EndReason == StreamEndReasonDone
+	return !outcome.ExpectsTerminal || outcome.Response == ResponseOutcomeCompleted || outcome.OutputLimitReached() || outcome.Response == ResponseOutcomeUnknown && outcome.EndReason == StreamEndReasonDone
 }
 
 func (s *StreamStatus) Summary() string {

@@ -66,6 +66,8 @@ func ClassifyGatewayFailure(status int, code string, transport, timeout, cancell
 		return GatewayFailure{Class: "account_quota", Switch: true, ExcludeProvider: true}
 	case code == "baidu:110" || code == "baidu:111" || code == "invalid_client" || code == "unauthorized_client" || status == 401 || status == 403 || code == "invalid_api_key" || code == "authentication_error" || kind == "authentication_error":
 		return GatewayFailure{Class: "credentials", Switch: true, ExcludeProvider: true}
+	case status == 200 && code == "gateway_output_limit":
+		return GatewayFailure{Class: "output_limit"}
 	case code == "empty_response":
 		return GatewayFailure{Class: "empty_response", Switch: true}
 	case code == "stream_idle_timeout":

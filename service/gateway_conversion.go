@@ -57,6 +57,22 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 	projectionMedia := map[string]dto.MediaContent{}
 	var referencedMedia []dto.MediaContent
 	references := map[string]bool{}
+	if claude, ok := request.(*dto.ClaudeRequest); ok {
+		for i, message := range claude.Messages {
+			blocks, _ := message.ParseContent()
+			for j, block := range blocks {
+				if block.Type != "document" || block.Source == nil || block.Source.Type != "url" || block.Source.Url == "" {
+					continue
+				}
+				uri := block.Source.Url
+				projectionMedia[fmt.Sprintf("messages[%d].content[%d].source", i, j)] = dto.MediaContent{Type: dto.ContentTypeFile, File: &dto.MessageFile{FileName: "reference.pdf", FileData: uri}}
+				references[uri] = true
+			}
+		}
+		if c, ok := ctx.(*gin.Context); ok {
+			c.Set(gatewayNativeMediaReferencesKey, references)
+		}
+	}
 	if gemini, ok := request.(*dto.GeminiChatRequest); ok {
 		if c, ok := ctx.(*gin.Context); ok {
 			if previous, found := c.Get(gatewayNativeMediaReferencesKey); found {

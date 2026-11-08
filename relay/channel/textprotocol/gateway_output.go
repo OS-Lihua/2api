@@ -12,8 +12,8 @@ import (
 
 type gatewayToolOutput struct{ name, arguments string }
 
-// gatewayGeneratedOutput tracks delivered content and defers successful terminal
-// frames until upstream completion is verified. Snapshots retain omitted blocks.
+// gatewayGeneratedOutput tracks delivered content and defers terminal
+// snapshots until upstream completion is verified. Snapshots retain omitted blocks.
 type gatewayGeneratedOutput struct {
 	pendingTerminal []json.RawMessage
 	terminalBytes   int

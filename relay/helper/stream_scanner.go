@@ -59,7 +59,13 @@ func copyCodexSSEHeaders(c *gin.Context, resp *http.Response) {
 	if c == nil || c.Writer == nil || resp == nil {
 		return
 	}
-	// codex
+	headers := c.Writer.Header()
+	if facts, ok := common.GetContextKeyType[*relaycommon.ResponseFacts](c, constant.ContextKeyResponseFacts); ok && facts != nil && facts.OnBusinessOutput != nil && !facts.BusinessOutput {
+		if facts.StreamHeaders == nil {
+			facts.StreamHeaders = make(map[string][]string)
+		}
+		headers = http.Header(facts.StreamHeaders)
+	}
 	for _, name := range []string{"X-Reasoning-Included", "X-Codex-Turn-State"} {
 		values := resp.Header.Values(name)
 		if !service.ShouldCopyUpstreamHeader(c, name, values) {
@@ -67,7 +73,7 @@ func copyCodexSSEHeaders(c *gin.Context, resp *http.Response) {
 		}
 		for _, value := range values {
 			if value != "" {
-				c.Writer.Header().Add(name, value)
+				headers.Add(name, value)
 			}
 		}
 	}

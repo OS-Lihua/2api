@@ -237,8 +237,12 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	if p.format == info.RelayFormat {
 		encoded = normalized
 	}
+	budgetEnd := p.format == types.RelayFormatOpenAIResponses && gjson.GetBytes(body, "status").String() == "incomplete" && gjson.GetBytes(body, "incomplete_details.reason").String() == "max_output_tokens"
+	if budgetEnd {
+		info.StreamStatus.MarkIncomplete("max_output_tokens")
+	}
 	business := facts.GeneratedText != "" || gatewayMediaOutput(encoded, info.RelayFormat)
-	if !business {
+	if !business && !budgetEnd {
 		if !info.PerformanceBusinessRejection {
 			info.StreamStatus.MarkFailed("empty_response", "", 0)
 		}
@@ -259,14 +263,16 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		facts.DownstreamWriteFailed = true
 		return usage, types.NewError(writeErr, types.ErrorCodeBadResponse)
 	}
-	facts.MarkBusinessOutput()
+	if business {
+		facts.MarkBusinessOutput()
+	}
 	if err := helper.FlushWriter(c); err != nil {
 		facts.DownstreamWriteFailed = true
 		return usage, types.NewError(err, types.ErrorCodeBadResponse)
 	}
 	if p.format == types.RelayFormatOpenAIResponses {
 		status := gjson.GetBytes(body, "status").String()
-		if status != "" && status != "completed" {
+		if status != "" && status != "completed" && !budgetEnd {
 			return usage, types.NewError(fmt.Errorf("upstream response did not complete"), types.ErrorCodeBadResponse)
 		}
 	}

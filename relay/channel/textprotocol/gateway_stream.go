@@ -3,6 +3,7 @@ package textprotocol
 import (
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/http"
 	"strings"
 
@@ -155,7 +156,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		if resp.StatusCode != http.StatusOK {
 			return
 		}
-		output.sourceTerminal = gatewaySuccessfulTerminal(normalized, p.format)
+		output.sourceTerminal = gatewayTerminalSnapshot(normalized, p.format)
 		if p.format == info.RelayFormat {
 			if _, err := writeGatewayStreamResult(c, info, json.RawMessage(normalized), &output); err != nil {
 				streamErr = err
@@ -220,6 +221,17 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			}
 		}
 	}
+	budgetEnd := streamErr == nil && info.StreamStatus.CompletedNormally() && info.StreamStatus.OutcomeSnapshot().OutputLimitReached()
+	if budgetEnd && !info.ResponseFacts.BusinessOutput && len(info.ResponseFacts.StreamPrelude) > 0 {
+		maps.Copy(c.Writer.Header(), info.ResponseFacts.StreamHeaders)
+		info.ResponseFacts.StreamHeaders = nil
+		prelude := string(info.ResponseFacts.StreamPrelude)
+		info.ResponseFacts.StreamPrelude = nil
+		if err := helper.WriteGatewayStreamFrame(c, nil, prelude, false); err != nil {
+			info.ResponseFacts.DownstreamWriteFailed = true
+			streamErr = err
+		}
+	}
 	info.ResponseFacts.SourceGeneratedText = sourceOutput.String()
 	info.ResponseFacts.GeneratedText = output.String()
 	if p.format == types.RelayFormatOpenAI {
@@ -243,7 +255,14 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		return usage, types.NewError(streamErr, types.ErrorCodeBadResponse)
 	}
 	if info.RelayFormat == types.RelayFormatOpenAI {
-		helper.Done(c)
+		if budgetEnd && !info.ResponseFacts.BusinessOutput {
+			if err := helper.StringData(c, "[DONE]"); err != nil {
+				info.ResponseFacts.DownstreamWriteFailed = true
+				return usage, types.NewError(err, types.ErrorCodeBadResponse)
+			}
+		} else {
+			helper.Done(c)
+		}
 	}
 	return usage, nil
 }
@@ -298,7 +317,7 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 			return "", err
 		}
 	}
-	terminal := gatewaySuccessfulTerminal(body, info.RelayFormat)
+	terminal := gatewayTerminalSnapshot(body, info.RelayFormat)
 	if (terminal || output.sourceTerminal || len(output.pendingTerminal) > 0) && !output.terminalReady && !info.PerformanceBusinessRejection {
 		// Terminal snapshots can contain complete image or audio payloads.
 		if output.terminalBytes+len(body) > 64<<20 {
@@ -359,7 +378,7 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 	return text, writeErr
 }
 
-func gatewaySuccessfulTerminal(body []byte, format types.RelayFormat) bool {
+func gatewayTerminalSnapshot(body []byte, format types.RelayFormat) bool {
 	root := gjson.ParseBytes(body)
 	switch format {
 	case types.RelayFormatClaude:
@@ -367,7 +386,7 @@ func gatewaySuccessfulTerminal(body []byte, format types.RelayFormat) bool {
 		return event == "message_stop" || event == "message_delta" && root.Get("delta.stop_reason").String() != ""
 	case types.RelayFormatOpenAIResponses:
 		event := root.Get("type").String()
-		return event == "response.completed" || event == "response.done"
+		return event == "response.completed" || event == "response.done" || event == "response.incomplete" && root.Get("response.incomplete_details.reason").String() == "max_output_tokens"
 	case types.RelayFormatOpenAI:
 		for _, choice := range root.Get("choices").Array() {
 			if choice.Get("finish_reason").String() != "" || choice.Get("delta.audio.expires_at").Type == gjson.Number {

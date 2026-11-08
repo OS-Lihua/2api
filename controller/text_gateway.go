@@ -514,6 +514,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				attempt.Status = "failed"
 			}
 			outcome := info.StreamStatus.OutcomeSnapshot()
+			normalBudget := outcome.OutputLimitReached() && attemptErr == nil && (!info.IsStream || info.StreamStatus.CompletedNormally())
 			if outcome.ErrorCode != "" {
 				upstreamCode = outcome.ErrorCode
 			}
@@ -525,6 +526,9 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			}
 			if outcome.ErrorStatus >= 400 {
 				upstreamStatus = outcome.ErrorStatus
+			}
+			if normalBudget {
+				upstreamCode = "gateway_output_limit"
 			}
 			if info.PerformanceBusinessRejection {
 				upstreamCode = "content_filter"
@@ -609,7 +613,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				record.ChoiceCount = choiceCount
 				saleUsage := usage
 				record.Usage, record.UsageSource = service.GatewayRecordUsage(usage), attempt.UsageSource
-				estimateDeliveredOutput := attempt.Status == "partial" || !info.ResponseFacts.UsageReported && (attempt.Status == "cancelled" || info.ResponseFacts.DownstreamWriteFailed)
+				estimateDeliveredOutput := attempt.Status == "partial" && !normalBudget || !info.ResponseFacts.UsageReported && (attempt.Status == "cancelled" || info.ResponseFacts.DownstreamWriteFailed)
 				if info.IsStream && estimateDeliveredOutput && usage != nil {
 					// Procurement retains reported usage; interrupted sales use delivered text.
 					delivered := tokenkit.Count(info.TokenizerModel, info.ResponseFacts.GeneratedText)
@@ -810,7 +814,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			upstreamCode = apiError.Type
 		}
 	}
-	if status, _ := gatewayAttemptOutcome(c, info, responseErr); status != "success" {
+	if status, reason := gatewayAttemptOutcome(c, info, responseErr); status != "success" && reason != "output_limit" {
 		run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream response failed")
 	}
 	if responseErr != nil && !c.Writer.Written() {
@@ -847,6 +851,9 @@ func gatewayAttemptOutcome(c *gin.Context, info *relaycommon.RelayInfo, err *typ
 			}
 			return "failed", "stream_interrupted"
 		}
+	}
+	if info.StreamStatus.OutcomeSnapshot().OutputLimitReached() {
+		return "partial", "output_limit"
 	}
 	if !info.ResponseFacts.BusinessOutput {
 		return "failed", "empty_response"

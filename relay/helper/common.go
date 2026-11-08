@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"strings"
 	"sync"
@@ -267,6 +268,8 @@ func WriteGatewayStreamFrame(c *gin.Context, facts *relaycommon.ResponseFacts, f
 			facts.StreamPrelude = append(facts.StreamPrelude, frame...)
 			return nil
 		}
+		maps.Copy(c.Writer.Header(), facts.StreamHeaders)
+		facts.StreamHeaders = nil
 		frame = string(facts.StreamPrelude) + frame
 		facts.StreamPrelude = nil
 	}

@@ -45,6 +45,7 @@ func InspectRequestParameters(ctx context.Context, source, target any, from, to 
 			{"top_logprobs", "top_logprobs", "", "generationConfig.logprobs"},
 			{"min_p", "min_p", "", ""},
 			{"repetition_penalty", "repetition_penalty", "", ""},
+			{"", "max_tool_calls", "", ""},
 			{"min_tokens", "", "", ""},
 			{"structured_outputs", "", "", ""},
 			{"return_token_ids", "", "", ""},

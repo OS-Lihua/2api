@@ -230,13 +230,15 @@ func mergeGatewayUsageSnapshot(current, incoming map[string]any) {
 				if !ok {
 					continue
 				}
+				modality, valid := fields["modality"].(string)
+				if !valid {
+					continue
+				}
 				var merged map[string]any
-				if modality, ok := fields["modality"].(string); ok {
-					for _, old := range previous {
-						if old, ok := old.(map[string]any); ok && old["modality"] == modality {
-							merged = old
-							break
-						}
+				for _, old := range previous {
+					if old, ok := old.(map[string]any); ok && old["modality"] == modality {
+						merged = old
+						break
 					}
 				}
 				if merged == nil {
