@@ -111,6 +111,9 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (apiErr 
 		select {
 		case incoming := <-fromClient:
 			if incoming.err != nil {
+				if info.RealtimePeerClosed != nil {
+					info.RealtimePeerClosed(true)
+				}
 				if websocket.IsCloseError(incoming.err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 				} else {
@@ -124,8 +127,12 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (apiErr 
 				var rejection *types.NewAPIError
 				message, rejection = info.RealtimeRequestHandler(message)
 				if rejection != nil {
+					helper.WssError(c, client, rejection.ToOpenAIError())
 					return rejection, sum
 				}
+			}
+			if message == nil {
+				continue
 			}
 			var event dto.RealtimeEvent
 			if err := common.Unmarshal(message, &event); err != nil {
@@ -156,6 +163,9 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (apiErr 
 			}
 		case incoming := <-fromTarget:
 			if incoming.err != nil {
+				if info.RealtimePeerClosed != nil {
+					info.RealtimePeerClosed(false)
+				}
 				if websocket.IsCloseError(incoming.err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 				} else {
@@ -186,14 +196,32 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (apiErr 
 					}
 				}
 			}
-			writeErr := client.SetWriteDeadline(clientWrite.Deadline(time.Now(), len(incoming.body)))
+			presented := incoming.body
+			var commands [][]byte
+			if info.RealtimeEventHandler != nil {
+				var rejection *types.NewAPIError
+				presented, commands, rejection = info.RealtimeEventHandler(incoming.body)
+				if rejection != nil {
+					helper.WssError(c, client, rejection.ToOpenAIError())
+					return rejection, sum
+				}
+			}
+			writeErr := client.SetWriteDeadline(clientWrite.Deadline(time.Now(), len(presented)))
 			if writeErr == nil {
-				writeErr = client.WriteMessage(incoming.kind, incoming.body)
+				writeErr = client.WriteMessage(incoming.kind, presented)
 			}
 			result, observeErr := accumulator.Observe(incoming.body, input, writeErr == nil)
 			if result != nil {
 				if err := recordRealtimeResponse(c, info, result, sum); err != nil {
 					return err, sum
+				}
+				if writeErr == nil && info.RealtimeAfterResponse != nil {
+					outgoing, rejection := info.RealtimeAfterResponse()
+					if rejection != nil {
+						helper.WssError(c, client, rejection.ToOpenAIError())
+						return rejection, sum
+					}
+					commands = append(commands, outgoing...)
 				}
 				conversation := ojson.GetBytes(incoming.body, "response.conversation_id")
 				if !conversation.Exists() || conversation.Type != ojson.Null {
@@ -210,6 +238,14 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (apiErr 
 				}
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, writeErr)
 				return nil, sum
+			}
+			for _, command := range commands {
+				if err := target.SetWriteDeadline(targetWrite.Deadline(time.Now(), len(command))); err != nil {
+					return types.NewError(err, types.ErrorCodeBadResponse), sum
+				}
+				if err := target.WriteMessage(websocket.TextMessage, command); err != nil {
+					return types.NewError(err, types.ErrorCodeBadResponse), sum
+				}
 			}
 		case <-idle.C:
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, context.DeadlineExceeded)

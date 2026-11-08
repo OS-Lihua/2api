@@ -36,6 +36,7 @@ type GatewayChannelRequirements struct {
 	ChannelID          int
 	Responses          *dto.OpenAIResponsesRequest
 	ResponsesWebSocket bool
+	InputTokens        *int
 }
 
 func SelectGatewayChannel(c *gin.Context, offering *model.ModelOffering, request *dto.GeneralOpenAIRequest, failures ...*GatewayExclusions) (*GatewaySelection, error) {
@@ -98,7 +99,11 @@ func SelectGatewayProtocolChannel(c *gin.Context, offering *model.ModelOffering,
 			if requirements.Responses != nil {
 				meta = requirements.Responses.GetTokenCountMeta()
 			}
-			tokens, err = CountRequestToken(c, meta, info)
+			if requirements.InputTokens != nil {
+				tokens = *requirements.InputTokens
+			} else {
+				tokens, err = CountRequestToken(c, meta, info)
+			}
 			if err != nil {
 				return nil, errors.New("could not estimate input tokens")
 			}

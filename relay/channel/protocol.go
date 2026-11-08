@@ -171,6 +171,8 @@ func ProtocolRelayFormat(kind protocol.Type) (types.RelayFormat, error) {
 		return types.RelayFormatOpenAI, nil
 	case protocol.OpenAIResponses:
 		return types.RelayFormatOpenAIResponses, nil
+	case protocol.OpenAIRealtime:
+		return types.RelayFormatOpenAIRealtime, nil
 	case protocol.AnthropicMessages:
 		return types.RelayFormatClaude, nil
 	case protocol.GeminiGenerate, protocol.GeminiEmbed:
@@ -192,6 +194,8 @@ func protocolRelayMode(kind protocol.Type) int {
 	switch kind {
 	case protocol.OpenAIResponses:
 		return relayconstant.RelayModeResponses
+	case protocol.OpenAIRealtime:
+		return relayconstant.RelayModeRealtime
 	case protocol.GeminiGenerate:
 		return relayconstant.RelayModeGemini
 	case protocol.GeminiEmbed, protocol.OpenAIEmbeddings:

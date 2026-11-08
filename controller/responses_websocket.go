@@ -22,9 +22,10 @@ import (
 type responsesWSRequestContextKey struct{}
 
 type responsesWSRequestState struct {
-	requestID string
-	handle    func(*gin.Context) *types.NewAPIError
-	apiError  *types.NewAPIError
+	requestID        string
+	handle           func(*gin.Context) *types.NewAPIError
+	apiError         *types.NewAPIError
+	authenticateOnly bool
 }
 
 // Each response.create runs the ordinary request middleware to completion,
@@ -33,12 +34,20 @@ var responsesWSRequestEngine = sync.OnceValue(func() *gin.Engine {
 	engine := gin.New()
 	engine.ForwardedByClientIP = false
 	_ = engine.SetTrustedProxies(nil)
+	rateLimit := middleware.ModelRequestRateLimit()
 	engine.POST("/v1/responses", func(c *gin.Context) {
 		state := c.Request.Context().Value(responsesWSRequestContextKey{}).(*responsesWSRequestState)
 		c.Set(common.RequestIdKey, state.requestID)
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
 		c.Next()
-	}, middleware.BodyStorageCleanup(), middleware.ResolveTextOffering("/v1/responses"), middleware.TokenAuth(), middleware.ModelRequestRateLimit(), func(c *gin.Context) {
+	}, middleware.BodyStorageCleanup(), middleware.ResolveTextOffering("/v1/responses"), middleware.TokenAuth(), func(c *gin.Context) {
+		state := c.Request.Context().Value(responsesWSRequestContextKey{}).(*responsesWSRequestState)
+		if state.authenticateOnly {
+			c.Next()
+			return
+		}
+		rateLimit(c)
+	}, func(c *gin.Context) {
 		state := c.Request.Context().Value(responsesWSRequestContextKey{}).(*responsesWSRequestState)
 		state.apiError = state.handle(c)
 		if state.apiError != nil {
@@ -73,7 +82,7 @@ func (w *responsesWSResponseWriter) Write(data []byte) (int, error) {
 	return w.body.Write(data)
 }
 
-func newResponsesWSRequestRunner(c *gin.Context) relay.ResponsesWSRequestRunner {
+func newResponsesWSRequestRunner(c *gin.Context, authenticateOnly ...bool) relay.ResponsesWSRequestRunner {
 	// Capture credentials before channel selection or header overrides. Resolve
 	// the peer once with the public router's trusted-proxy configuration.
 	headers := c.Request.Header.Clone()
@@ -82,7 +91,7 @@ func newResponsesWSRequestRunner(c *gin.Context) relay.ResponsesWSRequestRunner 
 	}
 	remoteAddr := net.JoinHostPort(c.ClientIP(), "0")
 	return func(request *http.Request, requestID string, handle func(*gin.Context) *types.NewAPIError) *types.NewAPIError {
-		state := &responsesWSRequestState{requestID: requestID, handle: handle}
+		state := &responsesWSRequestState{requestID: requestID, handle: handle, authenticateOnly: len(authenticateOnly) > 0 && authenticateOnly[0]}
 		ctx := context.WithValue(request.Context(), responsesWSRequestContextKey{}, state)
 		ctx = context.WithValue(ctx, common.RequestIdKey, requestID)
 		request = request.Clone(ctx)

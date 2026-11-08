@@ -14,11 +14,13 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/capability"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -41,16 +43,8 @@ func responsesWSGateway(c *gin.Context, call *relay.ResponsesWSCall) (bool, *typ
 	if call.LegacyConnection {
 		return true, types.NewErrorWithStatusCode(errors.New("Connection billing identity changed; reconnect required"), "connection_locked", http.StatusConflict)
 	}
-	group := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
-	if !offering.Enabled || offering.Visibility == "groups" && !slices.Contains(offering.Groups, group) {
-		return true, types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound)
-	}
-	if c.GetBool("token_model_limit_enabled") {
-		raw, _ := c.Get("token_model_limit")
-		limits, _ := raw.(map[string]bool)
-		if !limits[call.Request.Model] && !limits[offering.Name] {
-			return true, types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound)
-		}
+	if apiErr := authorizeWebSocketOffering(c, call.Request.Model); apiErr != nil {
+		return true, apiErr
 	}
 	run := &textGatewayRun{}
 	parent := c.Request
@@ -65,10 +59,29 @@ func responsesWSGateway(c *gin.Context, call *relay.ResponsesWSCall) (bool, *typ
 	return true, nil
 }
 
+func authorizeWebSocketOffering(c *gin.Context, requested string) *types.NewAPIError {
+	offering := middleware.TextOffering(c)
+	group := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
+	if offering == nil || !offering.Enabled || offering.Visibility == "groups" && !slices.Contains(offering.Groups, group) {
+		return types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound)
+	}
+	if c.GetBool("token_model_limit_enabled") {
+		raw, _ := c.Get("token_model_limit")
+		limits, _ := raw.(map[string]bool)
+		if !limits[requested] && !limits[offering.Name] {
+			return types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound)
+		}
+	}
+	return nil
+}
+
 func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, run *textGatewayRun, budget *service.GatewayAttemptBudget, exclusions *service.GatewayExclusions) (result service.GatewayAttemptResult) {
 	run.status, run.code, run.message = 0, "", ""
 	offering := middleware.TextOffering(c)
 	started := c.GetTime(middleware.TextGatewayStartedAtKey)
+	if call.Native != nil && !call.Native.StartedAt.IsZero() {
+		started = call.Native.StartedAt
+	}
 	if started.IsZero() {
 		started = clock.Now()
 	}
@@ -90,8 +103,19 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	// Responses body, including state references, is sent without conversion.
 	request := &dto.GeneralOpenAIRequest{Model: call.Request.Model, Stream: common.GetPointer(true), MaxCompletionTokens: call.Request.MaxOutputTokens}
 	request.Messages = []dto.Message{{Role: "user", Content: string(call.Request.Input)}}
+	if call.Native != nil {
+		call.Native.Budget = budget
+	}
+	if call.Protocol() == protocol.OpenAIRealtime && billingexpr.UsesFixedPricingByHash(run.sale.Expression, billingexpr.ExprHashString(run.sale.Expression)) {
+		run.fail(c, http.StatusBadRequest, "unsupported_pricing", "Fixed pricing is not supported for Realtime")
+		return
+	}
+	var inputTokens *int
+	if call.Native != nil && call.Native.InputUsage != nil {
+		inputTokens = &call.Native.InputUsage.PromptTokens
+	}
 	selection, err := service.SelectGatewayProtocolChannel(c, offering, request, service.GatewayChannelRequirements{
-		Protocol: protocol.OpenAIResponses, ChannelID: call.LockedChannelID, Responses: &call.Request, ResponsesWebSocket: true,
+		Protocol: call.Protocol(), ChannelID: call.LockedChannelID, Responses: &call.Request, ResponsesWebSocket: call.Protocol() == protocol.OpenAIResponses, InputTokens: inputTokens,
 	}, exclusions)
 	if err != nil {
 		status, code := http.StatusServiceUnavailable, "channel_unavailable"
@@ -101,10 +125,17 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		run.fail(c, status, code, "No Channel is available")
 		return
 	}
+	if call.Native != nil {
+		call.Native.Capabilities = selection.Capabilities
+	}
 	stopProbe := service.ChannelHealth.KeepAlive(c.Request.Context(), selection.Admission)
 	defer stopProbe()
 	defer func() {
 		if result.Attempt == nil {
+			if call.Established() && run.code != "" {
+				result.Failure = service.GatewayFailure{Class: run.code}
+				result.Established = true
+			}
 			_ = service.ChannelHealth.Release(context.WithoutCancel(c.Request.Context()), selection.Admission)
 			result.SkippedChannel = selection.Channel.ID
 		}
@@ -124,6 +155,11 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	common.SetContextKey(c, constant.ContextKeyOriginalModel, call.Request.Model)
 	info := relaycommon.GenRelayInfoResponses(c, &call.Request)
 	info.InitChannelMeta(c)
+	if call.Protocol() == protocol.OpenAIRealtime {
+		info.RelayFormat, info.RelayMode = types.RelayFormatOpenAIRealtime, relayconstant.RelayModeRealtime
+		info.InputAudioFormat, info.OutputAudioFormat = "pcm16", "pcm16"
+	}
+	info.BeginProviderCall = budget.Start
 	info.UpstreamModelName, info.TokenizerModel = selection.Channel.UpstreamModelName, selection.Channel.Model.ModelName
 	info.IsModelMapped, info.IsStream = true, true
 	info.RequestId, info.StartTime = c.GetString(common.RequestIdKey), started
@@ -155,6 +191,13 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	}
 	info.ParamOverride = overrides
 	body, err := relaycommon.ApplyParamOverrideWithRelayInfo(document.Bytes(), info)
+	if err == nil && call.Protocol() == protocol.OpenAIRealtime {
+		knownInput := 0
+		if inputTokens != nil {
+			knownInput = *inputTokens
+		}
+		body, err = helper.NormalizeRealtimeRequestLimits(body, selection.Capabilities, knownInput)
+	}
 	var effective dto.OpenAIResponsesRequest
 	if err != nil || common.Unmarshal(body, &effective) != nil || effective.Model != info.UpstreamModelName || helper.ValidateResponsesMultipliers(body) != nil || !service.GatewayResponsesCapabilitiesMatch(&effective, selection.Capabilities, 0) {
 		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Invalid Channel request parameters")
@@ -162,12 +205,17 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	}
 	// Count native input rather than treating max_output_tokens as usage.
 	common.SetContextKey(c, constant.ContextKeyOriginalModel, info.TokenizerModel)
-	estimatedInput, err := service.CountRequestToken(c, effective.GetTokenCountMeta(), info)
+	estimatedInput := 0
+	if inputTokens != nil {
+		estimatedInput = *inputTokens
+	} else {
+		estimatedInput, err = service.CountRequestToken(c, effective.GetTokenCountMeta(), info)
+	}
 	if err != nil || !service.GatewayResponsesCapabilitiesMatch(&effective, selection.Capabilities, estimatedInput) {
 		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
 		return
 	}
-	if effective.MaxOutputTokens == nil || *effective.MaxOutputTokens == 0 {
+	if effective.MaxOutputTokens == nil && call.Protocol() == protocol.OpenAIResponses {
 		var limit int64
 		if maximum := selection.Capabilities.Limits.MaxOutputTokens; maximum != nil {
 			limit = *maximum
@@ -196,7 +244,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		run.fail(c, http.StatusServiceUnavailable, "billing_unavailable", "Billing is unavailable")
 		return
 	}
-	if limit := effective.MaxOutputTokens; limit != nil && *limit > 0 {
+	if limit := effective.MaxOutputTokens; limit != nil {
 		mean = min(mean, int64(*limit))
 	}
 	if limit := selection.Capabilities.Limits.MaxOutputTokens; limit != nil {
@@ -211,6 +259,24 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	}
 	input := saleInput
 	estimated := &dto.Usage{PromptTokens: estimatedInput, CompletionTokens: int(mean), TotalTokens: estimatedInput + int(mean)}
+	if call.Protocol() == protocol.OpenAIRealtime {
+		if call.Native.InputUsage != nil {
+			estimated.PromptTokensDetails = call.Native.InputUsage.PromptTokensDetails.Clone()
+		}
+		outputs := ojson.GetBytes(body, "output_modalities")
+		if !outputs.Exists() {
+			outputs = ojson.GetBytes(body, "modalities")
+		}
+		call.Native.OutputAudio = !outputs.Exists() && slices.Contains(selection.Capabilities.OutputModalities, capability.Audio)
+		for _, output := range outputs.Array() {
+			if output.String() == "audio" {
+				call.Native.OutputAudio = true
+			}
+		}
+		if call.Native.OutputAudio {
+			estimated.CompletionTokenDetails.AudioTokens = int(mean)
+		}
+	}
 	source, reserveValue, _, err := service.GatewayPrice(run.sale, estimated, input, started, run.ratio, run.saleFX)
 	reserve, reserveErr := reserveValue.Receivable()
 	sourceReserve, sourceErr := source.Receivable()
@@ -224,8 +290,10 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 			Receivable: money.Amount{Currency: model.SettlementCurrency()}, StartedAt: started.UnixMilli(), UsageSource: "none", Status: "failed", LedgerEntryIDs: []string{}}
 		if err = model.ReserveGateway(record, reserve, sourceReserve); err != nil {
 			if errors.Is(err, model.ErrInsufficientWalletBalance) {
+				result.Failure = service.GatewayFailure{Class: "insufficient_balance"}
 				run.fail(c, http.StatusPaymentRequired, "insufficient_balance", "Insufficient wallet balance")
 			} else {
+				result.Failure = service.GatewayFailure{Class: "billing_unavailable"}
 				run.fail(c, http.StatusServiceUnavailable, "billing_unavailable", "Billing is unavailable")
 			}
 			return
@@ -246,6 +314,10 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
 	}
+	if call.Protocol() == protocol.OpenAIRealtime && billingexpr.UsesFixedPricingByHash(purchase.Expression, billingexpr.ExprHashString(purchase.Expression)) {
+		run.fail(c, http.StatusBadRequest, "unsupported_pricing", "Fixed pricing is not supported for Realtime")
+		return
+	}
 	payload, err := call.CreatePayload(body)
 	if err != nil {
 		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid Responses request")
@@ -261,6 +333,50 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	if priceErr != nil || costErr != nil || convertedErr != nil {
 		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
+	}
+	if call.Native != nil {
+		call.Native.Validate = func(saleRequest, purchaseRequest billingexpr.RequestInput, knownInput *dto.Usage) error {
+			probe := service.GatewayUsageSnapshot(knownInput)
+			estimatedOutput := mean
+			if limit := ojson.GetBytes(purchaseRequest.Body, "response.max_output_tokens"); limit.Exists() {
+				estimatedOutput = min(estimatedOutput, limit.Int())
+			}
+			probe.CompletionTokens, probe.TotalTokens = int(estimatedOutput), probe.PromptTokens+int(estimatedOutput)
+			probe.CompletionTokenDetails = dto.OutputTokenDetails{}
+			if call.Native.OutputAudio {
+				probe.CompletionTokenDetails.AudioTokens = int(estimatedOutput)
+			}
+			_, amount, _, quoteErr := service.GatewayPrice(run.sale, probe, saleRequest, started, run.ratio, run.saleFX)
+			if quoteErr != nil {
+				return quoteErr
+			}
+			required, quoteErr := amount.Receivable()
+			if quoteErr != nil {
+				return quoteErr
+			}
+			if required.Nanos > run.reservation.Nanos {
+				additional, additionalErr := required.Sub(run.reservation)
+				if additionalErr != nil {
+					return additionalErr
+				}
+				wallet, walletErr := model.GetUserWallet(run.record.UserID)
+				if walletErr != nil {
+					return walletErr
+				}
+				if wallet.RequestsPaused || additional.Nanos > wallet.Balance.Nanos {
+					return model.ErrInsufficientWalletBalance
+				}
+			}
+			original, converted, _, quoteErr := service.GatewayPrice(purchase, probe, purchaseRequest, attemptStart, decimal.NewFromInt(1), purchaseFX)
+			if quoteErr != nil {
+				return quoteErr
+			}
+			if _, quoteErr = original.Cost(); quoteErr != nil {
+				return quoteErr
+			}
+			_, quoteErr = converted.Cost()
+			return quoteErr
+		}
 	}
 	attemptContext, err := budget.Start()
 	if err != nil {
@@ -290,6 +406,9 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	}
 	if apiErr != nil {
 		status = apiErr.StatusCode
+		if !call.Established() && prepared.HandshakeStatus() == 0 {
+			status = 0
+		}
 		native := apiErr.ToOpenAIError()
 		code, _ = native.Code.(string)
 		errorType = native.Type
@@ -322,7 +441,15 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		attempt.ErrorClass = failure.Class
 	}
 	recordGatewayProviderFailure(c, info, selection, failure)
-	result = service.GatewayAttemptResult{Attempt: attempt, Failure: failure, Delivered: call.Established(), HealthLease: selection.Admission.Lease, FirstByte: firstByte, RetryAfter: prepared.RetryAfter()}
+	result = service.GatewayAttemptResult{Attempt: attempt, Failure: failure, Delivered: info.ResponseFacts.BusinessOutput, Established: call.Established(), HealthLease: selection.Admission.Lease, FirstByte: firstByte, RetryAfter: prepared.RetryAfter()}
+	if call.Native != nil {
+		if call.Native.SaleInput != nil {
+			input = call.Native.SaleInput()
+		}
+		if call.Native.PurchaseInput != nil {
+			purchaseInput = call.Native.PurchaseInput()
+		}
+	}
 	run.record.Status = attempt.Status
 	if usage != nil {
 		if !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && !info.ResponseFacts.CompletionTokensReported && !info.ResponseFacts.BusinessOutput && info.ResponseFacts.GeneratedText == "" {
@@ -353,14 +480,18 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		if info.ResponseFacts.BusinessOutput {
 			saleUsage := service.GatewayUsageSnapshot(usage)
 			saleUsageSource := attempt.UsageSource
-			if attempt.Status == "partial" && info.ResponseFacts.CompletionTokensReported {
+			if attempt.Status == "partial" || !call.TerminalDelivered() {
 				delivered := tokenkit.Count(info.TokenizerModel, info.ResponseFacts.GeneratedText)
+				if info.ResponseFacts.DeliveredOutputTokens != nil {
+					delivered = *info.ResponseFacts.DeliveredOutputTokens
+				}
 				if delivered < saleUsage.CompletionTokens {
 					saleUsageSource = "estimated"
 					saleUsage.CompletionTokens, saleUsage.OutputTokens = delivered, delivered
 					saleUsage.TotalTokens = saleUsage.PromptTokens + delivered
-					saleUsage.CompletionTokenDetails = dto.OutputTokenDetails{}
-					saleUsage.OutputTokensDetails = nil
+					saleUsage.CompletionTokenDetails = info.ResponseFacts.DeliveredOutputDetails
+					details := saleUsage.CompletionTokenDetails
+					saleUsage.OutputTokensDetails = &details
 				}
 			}
 			run.saleUsage = saleUsage
@@ -386,7 +517,11 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		}
 	}
 	if attempt.Status != "success" && apiErr != nil {
-		run.fail(c, http.StatusBadGateway, "upstream_error", "Upstream response failed")
+		status := http.StatusBadGateway
+		if failure.Class == "invalid_request" || failure.Class == "context_length" || failure.Class == "content_safety" {
+			status = http.StatusBadRequest
+		}
+		run.fail(c, status, "upstream_error", "Upstream response failed")
 	}
 	return
 }

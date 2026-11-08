@@ -20,6 +20,8 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	appmodel "github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/capability"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/pkg/wsmanager"
@@ -47,9 +49,30 @@ type ResponsesWSRequestRunner func(*http.Request, string, func(*gin.Context) *ty
 // Returning false keeps legacy requests on their original billing path.
 type ResponsesWSGateway func(*gin.Context, *ResponsesWSCall) (bool, *types.NewAPIError)
 
-// ResponsesWSCall exposes one serial logical request. Only non-secret Channel
+// NativeWSLifecycle lets the same gateway lifecycle wait for a multiplexed
+// native response. The existing transport remains the only socket owner.
+// These callbacks and probe values are transient and must never be persisted.
+type NativeWSLifecycle struct {
+	Protocol          protocol.Type
+	StartedAt         time.Time
+	Budget            *service.GatewayAttemptBudget
+	OutputAudio       bool
+	InputUsage        *dto.Usage
+	Capabilities      capability.Set
+	Validate          func(billingexpr.RequestInput, billingexpr.RequestInput, *dto.Usage) error
+	Prepare           func(*gin.Context, *relaycommon.RelayInfo) (*relaychannel.PreparedWssRequest, error)
+	CreatePayload     func([]byte) ([]byte, error)
+	Exchange          func(*gin.Context, *relaycommon.RelayInfo, int, int, *relaychannel.PreparedWssRequest, []byte) (*dto.Usage, *types.NewAPIError)
+	Established       func() bool
+	TerminalDelivered func() bool
+	SaleInput         func() billingexpr.RequestInput
+	PurchaseInput     func() billingexpr.RequestInput
+}
+
+// ResponsesWSCall exposes one logical request. Only non-secret Channel
 // identity survives between calls; credentials stay in the Provider transport.
 type ResponsesWSCall struct {
+	Native              *NativeWSLifecycle
 	Request             dto.OpenAIResponsesRequest
 	Body                []byte
 	LegacyConnection    bool
@@ -65,6 +88,9 @@ type ResponsesWSCall struct {
 
 // Prepare uses the existing Provider transport without sending any bytes.
 func (call *ResponsesWSCall) Prepare(c *gin.Context, info *relaycommon.RelayInfo) (*relaychannel.PreparedWssRequest, error) {
+	if call.Native != nil {
+		return call.Native.Prepare(c, info)
+	}
 	prepared, err := PrepareNativeWebSocketRequest(c, info, protocol.OpenAIResponses)
 	if err != nil {
 		return nil, err
@@ -78,6 +104,9 @@ func (call *ResponsesWSCall) Prepare(c *gin.Context, info *relaycommon.RelayInfo
 // Exchange sends one prepared request on the session's single upstream socket.
 // The caller reserves funds and freezes the Attempt before calling Exchange.
 func (call *ResponsesWSCall) Exchange(c *gin.Context, info *relaycommon.RelayInfo, channelID, providerID int, prepared *relaychannel.PreparedWssRequest, payload []byte) (*dto.Usage, *types.NewAPIError) {
+	if call.Native != nil {
+		return call.Native.Exchange(c, info, channelID, providerID, prepared, payload)
+	}
 	s := call.session
 	if s.lockedChannelID != 0 {
 		return nil, newResponsesWSInvalidRequestError(errors.New("connection billing identity changed; reconnect required"))
@@ -110,11 +139,31 @@ func (call *ResponsesWSCall) Exchange(c *gin.Context, info *relaycommon.RelayInf
 }
 
 // Established includes a successful handshake followed by a failed generation.
-func (call *ResponsesWSCall) Established() bool { return call.session.gatewayChannelID != 0 }
+func (call *ResponsesWSCall) Established() bool {
+	if call.Native != nil {
+		return call.Native.Established()
+	}
+	return call.session.gatewayChannelID != 0
+}
 
-func (call *ResponsesWSCall) TerminalDelivered() bool { return call.state.terminalDelivered }
+func (call *ResponsesWSCall) TerminalDelivered() bool {
+	if call.Native != nil {
+		return call.Native.TerminalDelivered()
+	}
+	return call.state.terminalDelivered
+}
+
+func (call *ResponsesWSCall) Protocol() protocol.Type {
+	if call.Native != nil {
+		return call.Native.Protocol
+	}
+	return protocol.OpenAIResponses
+}
 
 func (call *ResponsesWSCall) CreatePayload(body []byte) ([]byte, error) {
+	if call.Native != nil {
+		return call.Native.CreatePayload(body)
+	}
 	return buildResponsesWSCreateEvent(body, call.create.Generate, call.create.StreamID)
 }
 
@@ -564,7 +613,7 @@ func (s *responsesWSSession) receive(c *gin.Context, state *responsesWSCallState
 						s.lastResponseID = responseID
 						if info.ResponseFacts != nil {
 							state.finishing.Store(true)
-							if err := s.deliver(info, incoming, &event.ResponsesStreamResponse); err != nil {
+							if err := s.deliver(info, incoming, &event.ResponsesStreamResponse, accumulator); err != nil {
 								state.closeCode = websocket.CloseInternalServerErr
 							} else {
 								state.terminalDelivered = true
@@ -608,7 +657,7 @@ func (s *responsesWSSession) receive(c *gin.Context, state *responsesWSCallState
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 				if info.ResponseFacts != nil {
 					state.finishing.Store(true)
-					if err := s.deliver(info, incoming, &event.ResponsesStreamResponse); err != nil {
+					if err := s.deliver(info, incoming, &event.ResponsesStreamResponse, accumulator); err != nil {
 						state.closeCode = websocket.CloseInternalServerErr
 					} else {
 						state.terminalDelivered = true
@@ -618,7 +667,7 @@ func (s *responsesWSSession) receive(c *gin.Context, state *responsesWSCallState
 				}
 				return accumulator.Finish(), nil
 			}
-			if err := s.deliver(info, incoming, &event.ResponsesStreamResponse); err != nil {
+			if err := s.deliver(info, incoming, &event.ResponsesStreamResponse, accumulator); err != nil {
 				s.shutdown(websocket.CloseInternalServerErr, "")
 			}
 			if accepted && pendingControl != nil {
@@ -660,7 +709,7 @@ func (s *responsesWSSession) receive(c *gin.Context, state *responsesWSCallState
 
 // deliver confirms business output only after a complete WebSocket message is
 // accepted by the downstream writer. Session metadata never disarms a budget.
-func (s *responsesWSSession) deliver(info *relaycommon.RelayInfo, incoming responsesWSMessage, event *dto.ResponsesStreamResponse) error {
+func (s *responsesWSSession) deliver(info *relaycommon.RelayInfo, incoming responsesWSMessage, event *dto.ResponsesStreamResponse, accumulator *service.ResponsesUsageAccumulator) error {
 	err := s.writeClient(incoming.kind, incoming.body)
 	facts := info.ResponseFacts
 	if facts == nil {
@@ -670,6 +719,7 @@ func (s *responsesWSSession) deliver(info *relaycommon.RelayInfo, incoming respo
 		facts.DownstreamWriteFailed = true
 		return err
 	}
+	accumulator.RecordDelivery(event, incoming.body)
 	business := false
 	switch event.Type {
 	case "response.output_text.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.refusal.delta", "response.audio.delta", "response.output_audio.delta":

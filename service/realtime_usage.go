@@ -19,12 +19,14 @@ import (
 type RealtimeUsageResult = relaycommon.RealtimeResponseFacts
 
 type realtimeResponseUsage struct {
-	info               *relaycommon.RelayInfo
-	accumulator        *ResponsesUsageAccumulator
-	input              *dto.Usage
-	audioBytes         int64
-	audioReported      bool
-	inputAudioReported bool
+	info                *relaycommon.RelayInfo
+	accumulator         *ResponsesUsageAccumulator
+	input               *dto.Usage
+	audioBytes          int64
+	deliveredAudioBytes int64
+	audioReported       bool
+	inputAudioReported  bool
+	outputAudioFormat   string
 }
 
 // RealtimeUsageAccumulator correlates native response IDs, including concurrent
@@ -79,15 +81,20 @@ func (accumulator *RealtimeUsageAccumulator) Observe(raw []byte, input *dto.Usag
 			ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: accumulator.info.GetUpstreamModelName()},
 			StreamStatus: relaycommon.NewStreamStatus(), ResponseFacts: &relaycommon.ResponseFacts{}}
 		info.ResponseFacts.OnBusinessOutput = func() {
-			if accumulator.info.ResponseFacts != nil {
+			if accumulator.info.RealtimeBusinessOutput != nil {
+				accumulator.info.RealtimeBusinessOutput(id)
+			} else if accumulator.info.ResponseFacts != nil {
 				accumulator.info.ResponseFacts.MarkBusinessOutput()
 			}
+		}
+		if accumulator.info.RealtimeInputUsage != nil {
+			input = accumulator.info.RealtimeInputUsage(id)
 		}
 		if input == nil {
 			input = &dto.Usage{}
 		}
 		info.SetEstimatePromptTokens(input.PromptTokens)
-		state = &realtimeResponseUsage{info: info, accumulator: NewResponsesUsageAccumulator(info), input: GatewayUsageSnapshot(input)}
+		state = &realtimeResponseUsage{info: info, accumulator: NewResponsesUsageAccumulator(info), input: GatewayUsageSnapshot(input), outputAudioFormat: accumulator.info.OutputAudioFormat}
 		accumulator.active[id] = state
 	}
 	document := ojson.NewDoc(raw)
@@ -138,8 +145,17 @@ func (accumulator *RealtimeUsageAccumulator) Observe(raw []byte, input *dto.Usag
 			return nil, errors.New("Realtime audio quantity overflow")
 		}
 		state.audioBytes += int64(len(audio))
+		if delivered {
+			state.deliveredAudioBytes += int64(len(audio))
+		}
+	}
+	if !delivered {
+		state.info.ResponseFacts.DownstreamWriteFailed = true
 	}
 	state.accumulator.Observe(event, normalized)
+	if delivered {
+		state.accumulator.RecordDelivery(event, normalized)
+	}
 	if delivered && realtimeBusinessOutput(event) {
 		state.info.ResponseFacts.MarkBusinessOutput()
 	}
@@ -155,9 +171,15 @@ func (accumulator *RealtimeUsageAccumulator) finish(id string, state *realtimeRe
 	usage := state.accumulator.Finish()
 	facts := state.info.ResponseFacts
 	text := tokenkit.Count(state.info.TokenizerModelName(), facts.GeneratedText)
-	audio := CountRealtimeAudioTokens(state.audioBytes, accumulator.info.OutputAudioFormat, false)
+	audio := CountRealtimeAudioTokens(state.audioBytes, state.outputAudioFormat, false)
 	generated := text + audio
 	facts.GeneratedOutputTokens = &generated
+	delivered := CountRealtimeAudioTokens(state.deliveredAudioBytes, state.outputAudioFormat, false)
+	if facts.DeliveredOutputTokens != nil {
+		delivered += *facts.DeliveredOutputTokens
+	}
+	facts.DeliveredOutputTokens = &delivered
+	facts.DeliveredOutputDetails.AudioTokens = CountRealtimeAudioTokens(state.deliveredAudioBytes, state.outputAudioFormat, false)
 	estimated := !facts.UsageReported
 	if !facts.CompletionTokensReported {
 		usage.CompletionTokens = max(usage.CompletionTokens, generated)
@@ -176,12 +198,13 @@ func (accumulator *RealtimeUsageAccumulator) finish(id string, state *realtimeRe
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	if estimated {
 		usage.UsageSource = "estimated"
+		facts.UsageReported = false
 	} else {
 		usage.UsageSource = "upstream"
 	}
 	delete(accumulator.active, id)
 	accumulator.completed[id] = true
-	return RealtimeUsageResult{ID: id, Usage: usage, Facts: facts, Outcome: state.info.StreamStatus.OutcomeSnapshot()}
+	return RealtimeUsageResult{ID: id, Usage: usage, Facts: facts, Outcome: state.info.StreamStatus.OutcomeSnapshot(), StreamStatus: state.info.StreamStatus}
 }
 
 // Finish preserves the evidence for every still-active response on disconnect.
@@ -194,7 +217,11 @@ func (accumulator *RealtimeUsageAccumulator) Finish() []RealtimeUsageResult {
 	slices.Sort(ids)
 	results := make([]RealtimeUsageResult, 0, len(ids))
 	for _, id := range ids {
-		results = append(results, accumulator.finish(id, accumulator.active[id]))
+		state := accumulator.active[id]
+		if accumulator.info.StreamStatus != nil {
+			state.info.StreamStatus.SetEndReason(accumulator.info.StreamStatus.OutcomeSnapshot().EndReason, nil)
+		}
+		results = append(results, accumulator.finish(id, state))
 	}
 	return results
 }

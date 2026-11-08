@@ -28,6 +28,7 @@ type ResponsesUsageAccumulator struct {
 	outputText         strings.Builder
 	outputs            map[string]*responseOutputState
 	terminalOutputSeen bool
+	delivered          *ResponsesUsageAccumulator
 	imageCounter       relaycommon.ImageGenerationCallCounter
 	imageCommitted     bool
 	started            bool
@@ -189,6 +190,26 @@ func (a *ResponsesUsageAccumulator) observeToolOutput(item *dto.ResponsesOutput,
 	}
 }
 
+// RecordDelivery observes only content accepted by the downstream writer.
+// Reported counters describe upstream work and are excluded from the delivery
+// estimate used to cap an interrupted sale.
+func (a *ResponsesUsageAccumulator) RecordDelivery(event *dto.ResponsesStreamResponse, raw []byte) {
+	if event == nil || a.info == nil || a.info.ResponseFacts == nil {
+		return
+	}
+	if a.delivered == nil {
+		info := &relaycommon.RelayInfo{TokenizerModel: a.info.TokenizerModelName(), ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: a.info.GetUpstreamModelName()}, StreamStatus: relaycommon.NewStreamStatus(), ResponseFacts: &relaycommon.ResponseFacts{}}
+		a.delivered = NewResponsesUsageAccumulator(info)
+	}
+	copy := *event
+	if event.Response != nil {
+		response := *event.Response
+		response.Usage = nil
+		copy.Response = &response
+	}
+	a.delivered.Observe(&copy, raw)
+}
+
 func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 	if a.finished {
 		return a.usage
@@ -203,6 +224,12 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 	facts := a.info.ResponseFacts
 	if facts != nil {
 		facts.GeneratedText = a.outputText.String()
+		delivered := 0
+		if a.delivered != nil {
+			delivered = a.delivered.Finish().CompletionTokens
+		}
+		facts.DeliveredOutputTokens = &delivered
+		facts.DeliveredOutputDetails = dto.OutputTokenDetails{TextTokens: delivered}
 	}
 	if a.usage.CompletionTokens == 0 && (facts == nil || !facts.CompletionTokensReported) {
 		if output := a.outputText.String(); output != "" {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -59,6 +60,9 @@ func (a *ChannelAdaptor) FixResponse(c *gin.Context, info *relaycommon.RelayInfo
 }
 
 func GetProtocolHandler(kind protocol.Type) (channel.ProtocolHandler, error) {
+	if kind == protocol.OpenAIRealtime {
+		return realtimeProtocol{}, nil
+	}
 	if channel.IsNonTextProtocol(kind) || strings.HasPrefix(string(kind), "task:") {
 		return nontextprotocol.New(kind)
 	}
@@ -134,6 +138,10 @@ func (a *ChannelAdaptor) providerMetadata(info *relaycommon.RelayInfo) *channel.
 		metadata.RelayFormat = types.RelayFormatOpenAIResponses
 		metadata.RelayMode = relayconstant.RelayModeResponses
 		metadata.RequestURLPath = "/v1/responses"
+	case protocol.OpenAIRealtime:
+		metadata.RelayFormat = types.RelayFormatOpenAIRealtime
+		metadata.RelayMode = relayconstant.RelayModeRealtime
+		metadata.RequestURLPath = "/v1/realtime?model=" + url.QueryEscape(info.UpstreamModelName)
 	case protocol.AnthropicMessages:
 		metadata.RelayFormat = types.RelayFormatClaude
 		metadata.RelayMode = relayconstant.RelayModeChatCompletions
@@ -204,15 +212,16 @@ func (r *PreparedChannelRequest) Headers() http.Header { return r.request.Header
 // the native wire protocol and the existing WebSocket dialer. Client credentials
 // are removed after authentication, before Provider header templates run.
 func PrepareNativeWebSocketRequest(c *gin.Context, info *relaycommon.RelayInfo, kind protocol.Type) (*channel.PreparedWssRequest, error) {
-	if kind != protocol.OpenAIResponses {
+	if kind != protocol.OpenAIResponses && kind != protocol.OpenAIRealtime {
 		return nil, errors.New("unsupported native WebSocket protocol")
 	}
-	provider := GetProviderAdapter(info.ApiType)
-	if provider == nil {
-		return nil, errors.New("unsupported Provider transport")
+	adaptor, err := GetChannelAdaptor(info.ApiType, kind)
+	if err != nil {
+		return nil, err
 	}
 	providerContext := c.Copy()
 	providerContext.Request = c.Request.Clone(c.Request.Context())
+	providerContext.Request.Method = http.MethodGet
 	credentialHeaders := []string{"Authorization", "X-API-Key", "X-Goog-API-Key", "Mj-API-Secret", "Cookie", "Proxy-Authorization", "Sec-WebSocket-Protocol"}
 	transportInfo := *info
 	providerMetadata := *info.ProviderMeta
@@ -237,7 +246,6 @@ func PrepareNativeWebSocketRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 	}
 	providerContext.Request.URL.RawQuery = ""
 	providerContext.Request.RequestURI = providerContext.Request.URL.RequestURI()
-	adaptor := &ChannelAdaptor{provider: provider, kind: kind}
 	prepared, err := adaptor.PrepareRequest(providerContext, &transportInfo, strings.NewReader(""))
 	if err != nil {
 		return nil, err
@@ -302,7 +310,8 @@ func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayI
 		}
 		request.URL.Scheme = strings.ToLower(request.URL.Scheme)
 		_, hasExecutor := a.provider.(channel.ProviderRequestExecutor)
-		sdkWebsocket := hasExecutor && (request.URL.Scheme == "ws" || request.URL.Scheme == "wss")
+		nativeWebsocket := c.Request.Method == http.MethodGet && (a.kind == protocol.OpenAIResponses || a.kind == protocol.OpenAIRealtime)
+		sdkWebsocket := (hasExecutor || nativeWebsocket) && (request.URL.Scheme == "ws" || request.URL.Scheme == "wss")
 		if request.URL.Scheme != "http" && request.URL.Scheme != "https" && !sdkWebsocket {
 			return nil, errors.New("invalid upstream request URL scheme")
 		}

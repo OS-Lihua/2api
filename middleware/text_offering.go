@@ -23,7 +23,8 @@ func ResolveTextOffering(paths ...string) gin.HandlerFunc {
 		paths = []string{"/v1/chat/completions"}
 	}
 	return func(c *gin.Context) {
-		if c.Request.Method != http.MethodPost || !slices.Contains(paths, c.Request.URL.Path) {
+		isRealtime := c.Request.Method == http.MethodGet && c.Request.URL.Path == "/v1/realtime"
+		if !isRealtime && (c.Request.Method != http.MethodPost || !slices.Contains(paths, c.Request.URL.Path)) {
 			c.Next()
 			return
 		}
@@ -31,7 +32,13 @@ func ResolveTextOffering(paths ...string) gin.HandlerFunc {
 		var request struct {
 			Model string `json:"model"`
 		}
-		if common.UnmarshalBodyReusable(c, &request) != nil || request.Model == "" {
+		if isRealtime {
+			request.Model = c.Query("model")
+		} else if common.UnmarshalBodyReusable(c, &request) != nil {
+			c.Next()
+			return
+		}
+		if request.Model == "" {
 			c.Next()
 			return
 		}

@@ -109,6 +109,7 @@ type GatewayAttemptBudget struct {
 	started   time.Time
 	elapsed   time.Duration
 	finished  bool
+	paused    bool
 	stop      func() bool
 	cancel    context.CancelCauseFunc
 	sent      bool
@@ -123,8 +124,21 @@ func (b *GatewayAttemptBudget) Start() (context.Context, error) {
 		if cause := context.Cause(b.ctx); cause != nil {
 			return nil, cause
 		}
-		if b.remaining-clock.Now().Sub(b.started) < 5*time.Second {
+		if b.finished {
+			return b.ctx, nil
+		}
+		remainingTotal, remainingAttempt := b.remaining-b.elapsed, b.policy.AttemptFirstByte-b.elapsed
+		if !b.paused {
+			elapsed := clock.Now().Sub(b.started)
+			remainingTotal -= elapsed
+			remainingAttempt -= elapsed
+		}
+		if remainingTotal < 5*time.Second || remainingAttempt <= 0 {
 			return nil, ErrGatewayBudget
+		}
+		if b.paused {
+			b.paused, b.started = false, clock.Now()
+			b.stop = clock.AfterFunc(min(remainingTotal, remainingAttempt), func() { b.cancel(ErrGatewayBudget) })
 		}
 		return b.ctx, nil
 	}
@@ -139,10 +153,26 @@ func (b *GatewayAttemptBudget) Start() (context.Context, error) {
 	b.stop = clock.AfterFunc(min(remaining, b.policy.AttemptFirstByte), func() { cancel(ErrGatewayBudget) })
 	return ctx, nil
 }
+
+// Pause excludes client think/input time on an established native connection.
+// Resume uses Start and retains the same attempt and total time already spent.
+func (b *GatewayAttemptBudget) Pause() {
+	if !b.sent || b.finished || b.paused {
+		return
+	}
+	b.elapsed = min(b.elapsed+clock.Now().Sub(b.started), b.remaining, b.policy.AttemptFirstByte)
+	b.paused = true
+	if b.stop != nil {
+		b.stop()
+	}
+}
+
 func (b *GatewayAttemptBudget) Delivered() {
 	if b.sent && !b.finished {
 		b.finished = true
-		b.elapsed = min(clock.Now().Sub(b.started), b.remaining, b.policy.AttemptFirstByte)
+		if !b.paused {
+			b.elapsed = min(b.elapsed+clock.Now().Sub(b.started), b.remaining, b.policy.AttemptFirstByte)
+		}
 	}
 	if b.stop != nil {
 		b.stop()
@@ -156,6 +186,7 @@ type GatewayAttemptResult struct {
 	Attempt     *model.GatewayAttempt
 	Failure     GatewayFailure
 	Delivered   bool
+	Established bool
 	FirstByte   time.Duration
 	RetryAfter  string
 	HealthLease string
@@ -218,10 +249,12 @@ func RunGatewayAttempts(ctx context.Context, policy GatewayAttemptPolicy, execut
 		if attempt.FailoverReason == "" {
 			attempt.FailoverReason = "completed"
 		}
-		canSwitch := result.Failure.Switch && !result.Delivered && ctx.Err() == nil
+		canSwitch := result.Failure.Switch && !result.Delivered && !result.Established && ctx.Err() == nil
 		switch {
 		case result.Delivered:
 			attempt.FailoverReason = "business_delivered"
+		case result.Established:
+			attempt.FailoverReason = "connection_established"
 		case ctx.Err() != nil:
 			attempt.FailoverReason = "client_cancelled"
 		case len(attempts)+1 >= policy.MaxAttempts && canSwitch:

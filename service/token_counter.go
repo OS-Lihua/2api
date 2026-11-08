@@ -18,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/tokenkit"
 
 	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
 )
 
 func getImageToken(c *gin.Context, fileMeta *types.FileMeta, model string, stream bool) (int, error) {
@@ -249,7 +250,18 @@ func CountRealtimeAudioTokens(byteCount int64, audioFormat string, input bool) i
 	if byteCount <= 0 {
 		return 0
 	}
-	return realtimeAudioTokenCount(realtimeAudioDuration(byteCount, audioFormat), input)
+	// Realtime user audio is one token per 100 ms; assistant audio is one
+	// token per 50 ms. Count complete token spans across accumulated chunks.
+	// https://developers.openai.com/api/docs/guides/voice-latency-cost
+	bytesPerSecond := int64(24000 * 2)
+	if audioFormat == "g711_ulaw" || audioFormat == "g711_alaw" {
+		bytesPerSecond = 8000
+	}
+	tokensPerSecond := int64(20)
+	if input {
+		tokensPerSecond = 10
+	}
+	return common.QuotaFromDecimal(decimal.NewFromInt(byteCount / (bytesPerSecond / tokensPerSecond)))
 }
 
 func realtimeAudioTokenCount(duration float64, input bool) int {

@@ -116,8 +116,13 @@ type RelayInfo struct {
 	InputAudioFormat        string
 	OutputAudioFormat       string
 	RealtimeTools           []dto.RealTimeTool
-	RealtimeRequestHandler  func([]byte) ([]byte, *types.NewAPIError)       `json:"-"`
-	RealtimeResponseHandler func(*RealtimeResponseFacts) *types.NewAPIError `json:"-"`
+	RealtimeRequestHandler  func([]byte) ([]byte, *types.NewAPIError)           `json:"-"`
+	RealtimeResponseHandler func(*RealtimeResponseFacts) *types.NewAPIError     `json:"-"`
+	RealtimeEventHandler    func([]byte) ([]byte, [][]byte, *types.NewAPIError) `json:"-"`
+	RealtimeAfterResponse   func() ([][]byte, *types.NewAPIError)               `json:"-"`
+	RealtimeInputUsage      func(string) *dto.Usage                             `json:"-"`
+	RealtimeBusinessOutput  func(string)                                        `json:"-"`
+	RealtimePeerClosed      func(bool)                                          `json:"-"`
 	IsFirstRequest          bool
 	AudioUsage              bool
 	ReasoningEffort         string

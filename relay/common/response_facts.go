@@ -15,10 +15,11 @@ func ChatUsagePresence(body []byte) (prompt, completion bool) {
 // RealtimeResponseFacts is transient evidence for one native response. The
 // lifecycle stores quantitative usage and frozen pricing, never this object.
 type RealtimeResponseFacts struct {
-	ID      string
-	Usage   *dto.Usage
-	Facts   *ResponseFacts
-	Outcome StreamOutcome
+	ID           string
+	Usage        *dto.Usage
+	Facts        *ResponseFacts
+	Outcome      StreamOutcome
+	StreamStatus *StreamStatus
 }
 
 // ResponseFacts separates upstream-reported zero usage from a local estimate,
@@ -32,6 +33,8 @@ type ResponseFacts struct {
 	DownstreamWriteFailed    bool
 	GeneratedText            string
 	GeneratedOutputTokens    *int
+	DeliveredOutputTokens    *int
+	DeliveredOutputDetails   dto.OutputTokenDetails
 	UpstreamRetryAfter       string // Transient; only the parsed cooldown may enter records.
 	OnBusinessOutput         func()
 	CanFinishStream          func() bool `json:"-"`
