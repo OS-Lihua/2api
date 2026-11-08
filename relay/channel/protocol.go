@@ -101,6 +101,7 @@ func ConvertProtocolRequest(c *gin.Context, info *relaycommon.RelayInfo, kind pr
 	if err != nil {
 		return nil, err
 	}
+	info.RequestConversionQuality = string(result.Quality)
 	info.RecordConversionDiagnostics(c, result.Diagnostics)
 	relaycommon.AppendRequestConversionFromRequest(info, result.Value)
 	info.FinalRequestRelayFormat = format

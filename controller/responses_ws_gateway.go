@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/MoeForge/moego/ojson"
@@ -14,15 +13,13 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
-	"github.com/QuantumNous/new-api/pkg/capability"
 	"github.com/QuantumNous/new-api/pkg/channelhealth"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay"
+	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	relayconstant "github.com/QuantumNous/new-api/relay/constant"
-	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
@@ -79,13 +76,8 @@ func authorizeWebSocketOffering(c *gin.Context, requested string) *types.NewAPIE
 // runRealtimeTransportAttempt opens the native session through the shared Route,
 // health and attempt budget. Session setup does not generate a response. Each
 // subsequent response reserves its known input and output plan before inference.
-func runRealtimeTransportAttempt(c *gin.Context, call *relay.ResponsesWSCall, run *textGatewayRun, info *relaycommon.RelayInfo, selection *service.GatewaySelection, budget *service.GatewayAttemptBudget, stopProbe func()) (result service.GatewayAttemptResult) {
-	prepared, err := call.Prepare(c, info)
-	if err != nil {
-		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "Invalid Channel settings")
-		return
-	}
-	ctx, err := budget.Start()
+func runRealtimeTransportAttempt(c *gin.Context, call *relay.ResponsesWSCall, run *textGatewayRun, info *relaycommon.RelayInfo, selection *service.GatewaySelection, budget *service.GatewayAttemptBudget, stopProbe func(), prepared *relaychannel.PreparedWssRequest) (result service.GatewayAttemptResult) {
+	ctx, err := info.BeginProviderCall()
 	if err != nil {
 		run.fail(c, http.StatusGatewayTimeout, "first_byte_budget", "First byte budget exhausted")
 		return
@@ -93,6 +85,7 @@ func runRealtimeTransportAttempt(c *gin.Context, call *relay.ResponsesWSCall, ru
 	call.Native.ConnectionReady = func() {
 		stopProbe()
 		_ = service.ChannelHealth.Release(context.WithoutCancel(ctx), selection.Admission)
+		_ = selection.Permit.Release(context.WithoutCancel(ctx), true, 0)
 	}
 	parent := c.Request
 	c.Request = parent.WithContext(ctx)
@@ -143,10 +136,6 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 			return
 		}
 	}
-	// The projection is used only for shared capability admission. The native
-	// Responses body, including state references, is sent without conversion.
-	request := &dto.GeneralOpenAIRequest{Model: call.Request.Model, Stream: common.GetPointer(true), MaxCompletionTokens: call.Request.MaxOutputTokens}
-	request.Messages = []dto.Message{{Role: "user", Content: string(call.Request.Input)}}
 	if call.Native != nil {
 		if call.Established() && call.Native.Budget != nil {
 			budget = call.Native.Budget
@@ -157,13 +146,20 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		run.fail(c, http.StatusBadRequest, "unsupported_pricing", "Fixed pricing is not supported for Realtime")
 		return
 	}
-	var inputTokens *int
-	if call.Native != nil && call.Native.InputUsage != nil {
-		inputTokens = &call.Native.InputUsage.PromptTokens
+	mean, err := model.RecentOfferingOutputTokens(c.Request.Context(), offering.ID, started.UnixMilli())
+	if err != nil {
+		run.fail(c, http.StatusServiceUnavailable, "billing_unavailable", "Billing is unavailable")
+		return
 	}
-	selection, err := service.SelectGatewayProtocolChannel(c, offering, request, service.GatewayChannelRequirements{
-		Protocol: call.Protocol(), ChannelID: call.LockedChannelID, Responses: &call.Request, ResponsesWebSocket: call.Protocol() == protocol.OpenAIResponses, InputTokens: inputTokens,
-	}, exclusions)
+	candidates := map[int]*gatewayPreparedWebSocket{}
+	selection, err := service.SelectGatewayRoute(c, offering, service.GatewayRouteInput{Protocol: call.Protocol(), Sale: run.sale, SaleFX: run.saleFX, Ratio: run.ratio, StartedAt: started, Failures: exclusions, Prepare: func(selection *service.GatewaySelection) (*service.GatewayRouteFacts, error) {
+		prepared, err := prepareGatewayWebSocketRoute(c, selection, call, started, mean)
+		if err != nil {
+			return nil, err
+		}
+		candidates[selection.Channel.ID] = prepared
+		return &prepared.Facts, nil
+	}})
 	if err != nil {
 		status, code := http.StatusServiceUnavailable, "channel_unavailable"
 		if errors.Is(err, service.ErrGatewayCapability) {
@@ -172,8 +168,21 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		run.fail(c, status, code, "No Channel is available")
 		return
 	}
+	chosen := candidates[selection.Channel.ID]
+	c = chosen.Context
+	contactedProvider := false
+	var observedUsage *dto.Usage
+	defer func() {
+		ctx := context.WithoutCancel(c.Request.Context())
+		if observedUsage != nil {
+			selection.Permit.Release(ctx, contactedProvider, int64(observedUsage.TotalTokens))
+		} else {
+			selection.Permit.Release(ctx, contactedProvider)
+		}
+	}()
 	if call.Native != nil {
 		call.Native.Capabilities = selection.Capabilities
+		call.Native.InputUsage = chosen.InputUsage
 	}
 	stopProbe := service.ChannelHealth.KeepAlive(c.Request.Context(), selection.Admission)
 	defer stopProbe()
@@ -204,170 +213,43 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 			return
 		}
 	}
-	var pinnedKey []int
-	if call.LockedChannelID != 0 {
-		pinnedKey = []int{call.LockedKeyIndex}
+	info := chosen.Info
+	committedKey := call.Established()
+	info.BeginProviderCall = func() (context.Context, error) {
+		ctx, err := budget.Start()
+		if err != nil {
+			return nil, err
+		}
+		if !committedKey {
+			if err = selection.Provider.CommitRouteKey(ctx, info.ApiKey, info.ChannelMultiKeyIndex); err != nil {
+				return nil, err
+			}
+			committedKey = true
+		} else if err = selection.Provider.ValidateRouteKey(ctx, info.ApiKey, info.ChannelMultiKeyIndex); err != nil {
+			return nil, err
+		}
+		contactedProvider = true
+		return ctx, nil
 	}
-	if apiErr := middleware.SetupContextForSelectedChannel(c, selection.Provider, selection.Channel.Model.ModelName, pinnedKey...); apiErr != nil {
-		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
-		return
-	}
-	common.SetContextKey(c, constant.ContextKeyOriginalModel, call.Request.Model)
-	info := relaycommon.GenRelayInfoResponses(c, &call.Request)
-	info.InitChannelMeta(c)
-	if call.Protocol() == protocol.OpenAIRealtime {
-		info.RelayFormat, info.RelayMode = types.RelayFormatOpenAIRealtime, relayconstant.RelayModeRealtime
-		info.InputAudioFormat, info.OutputAudioFormat = "pcm16", "pcm16"
-	}
-	info.BeginProviderCall = budget.Start
-	info.UpstreamModelName, info.TokenizerModel = selection.Channel.UpstreamModelName, selection.Channel.Model.ModelName
-	info.IsModelMapped, info.IsStream = true, true
-	info.RequestId, info.StartTime = c.GetString(common.RequestIdKey), started
-	info.StreamStatus = relaycommon.NewStreamStatus()
 	var sentAt time.Time
 	var firstByte time.Duration
-	info.ResponseFacts = &relaycommon.ResponseFacts{OnBusinessOutput: func() {
+	info.ResponseFacts.OnBusinessOutput = func() {
 		if firstByte == 0 && !sentAt.IsZero() {
 			firstByte = max(clock.Now().Sub(sentAt), time.Nanosecond)
 		}
 		budget.Delivered()
-	}}
-	common.SetContextKey(c, constant.ContextKeyResponseFacts, info.ResponseFacts)
+	}
 	if call.Native != nil && call.Native.TransportOnly {
-		return runRealtimeTransportAttempt(c, call, run, info, selection, budget, stopProbe)
-	}
-	saleInput, err := helper.ResolveIncomingBillingExprRequestInput(c, info)
-	if err != nil {
-		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid Responses request")
+		result = runRealtimeTransportAttempt(c, call, run, info, selection, budget, stopProbe, chosen.Transport)
+		contactedProvider = result.TransportAttempt
 		return
 	}
-	if call.Native != nil && len(call.Native.OriginalBody) > 0 {
-		saleInput.Body = call.Native.OriginalBody
-	}
-	// Channel overrides must not change the connection's native model identity.
-	document := ojson.NewDoc(call.Body)
-	if err = document.Set("model", info.UpstreamModelName); err != nil {
-		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid Responses request")
-		return
-	}
-	var overrides map[string]any
-	if err = common.UnmarshalJsonStr(selection.Channel.ParameterOverrides, &overrides); err != nil {
-		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "Invalid Channel settings")
-		return
-	}
-	info.ParamOverride = overrides
-	body, err := relaycommon.ApplyParamOverrideWithRelayInfo(document.Bytes(), info)
-	if err == nil && call.Protocol() == protocol.OpenAIRealtime {
-		if call.Native.EstimateInput != nil {
-			call.Native.InputUsage, err = call.Native.EstimateInput(body)
-			if err != nil {
-				run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Invalid Realtime input")
-				return
-			}
-			inputTokens = &call.Native.InputUsage.PromptTokens
-		}
-		knownInput := 0
-		if inputTokens != nil {
-			knownInput = *inputTokens
-		}
-		body, err = helper.NormalizeRealtimeRequestLimits(body, selection.Capabilities, knownInput)
-	}
-	var effective dto.OpenAIResponsesRequest
-	if err != nil || common.Unmarshal(body, &effective) != nil || effective.Model != info.UpstreamModelName || helper.ValidateResponsesMultipliers(body) != nil || !service.GatewayResponsesCapabilitiesMatch(&effective, selection.Capabilities, 0) {
-		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Invalid Channel request parameters")
-		return
-	}
-	// Count native input rather than treating max_output_tokens as usage.
-	common.SetContextKey(c, constant.ContextKeyOriginalModel, info.TokenizerModel)
-	estimatedInput := 0
-	if inputTokens != nil {
-		estimatedInput = *inputTokens
-	} else {
-		estimatedInput, err = service.CountRequestToken(c, effective.GetTokenCountMeta(), info)
-	}
-	if err != nil || !service.GatewayResponsesCapabilitiesMatch(&effective, selection.Capabilities, estimatedInput) {
-		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel parameters exceed the request capabilities")
-		return
-	}
-	if effective.MaxOutputTokens == nil && call.Protocol() == protocol.OpenAIResponses {
-		var limit int64
-		if maximum := selection.Capabilities.Limits.MaxOutputTokens; maximum != nil {
-			limit = *maximum
-		}
-		if contextLength := selection.Capabilities.Limits.ContextLength; contextLength != nil {
-			remaining := *contextLength - int64(estimatedInput)
-			if limit == 0 {
-				limit = remaining
-			} else {
-				limit = min(limit, remaining)
-			}
-		}
-		if limit > 0 {
-			document = ojson.NewDoc(body)
-			if err = document.Set("max_output_tokens", limit); err != nil {
-				run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid Responses request")
-				return
-			}
-			body = document.Bytes()
-			effective.MaxOutputTokens = common.GetPointer(uint(limit))
-		}
-	}
-	info.SetEstimatePromptTokens(estimatedInput)
-	mean, err := model.RecentOfferingOutputTokens(c.Request.Context(), offering.ID, started.UnixMilli())
-	if err != nil {
-		run.fail(c, http.StatusServiceUnavailable, "billing_unavailable", "Billing is unavailable")
-		return
-	}
-	if limit := effective.MaxOutputTokens; limit != nil {
-		mean = min(mean, int64(*limit))
-	}
-	if limit := selection.Capabilities.Limits.MaxOutputTokens; limit != nil {
-		mean = min(mean, *limit)
-	}
-	if limit := selection.Capabilities.Limits.ContextLength; limit != nil {
-		mean = min(mean, *limit-int64(estimatedInput))
-	}
-	if mean < 0 {
-		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Channel context limit exceeded")
-		return
-	}
-	input := saleInput
-	estimated := &dto.Usage{PromptTokens: estimatedInput, CompletionTokens: int(mean), TotalTokens: estimatedInput + int(mean)}
-	if call.Protocol() == protocol.OpenAIRealtime {
-		if call.Native.InputUsage != nil {
-			estimated.PromptTokensDetails = call.Native.InputUsage.PromptTokensDetails.Clone()
-		}
-		outputs := ojson.GetBytes(body, "output_modalities")
-		if !outputs.Exists() {
-			outputs = ojson.GetBytes(body, "modalities")
-		}
-		if outputs.Exists() && !outputs.IsArray() {
-			run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Output modalities must be an array")
-			return
-		}
-		call.Native.OutputAudio = !outputs.Exists() && slices.Contains(selection.Capabilities.OutputModalities, capability.Audio)
-		for _, output := range outputs.Array() {
-			if output.Type != ojson.String || !slices.Contains(selection.Capabilities.OutputModalities, capability.Modality(output.String())) {
-				run.fail(c, http.StatusBadRequest, "unsupported_parameter", "Output modality is not supported on this connection")
-				return
-			}
-			if output.String() == "audio" {
-				call.Native.OutputAudio = true
-			}
-		}
-		if call.Native.OutputAudio {
-			estimated.CompletionTokenDetails.AudioTokens = int(mean)
-		}
-	}
-	prepared, err := call.Prepare(c, info)
-	if err != nil {
-		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "Upstream connection settings are unavailable")
-		return
-	}
-	payload, err := call.CreatePayload(body)
-	if err != nil {
-		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid Responses request")
-		return
+	input, purchaseInput := chosen.Facts.SaleInput, chosen.Facts.PurchaseInput
+	estimated := chosen.Facts.Usage
+	mean = int64(estimated.CompletionTokens)
+	prepared, payload := chosen.Transport, chosen.Payload
+	if call.Native != nil {
+		call.Native.OutputAudio = estimated.CompletionTokenDetails.AudioTokens > 0
 	}
 	source, reserveValue, _, err := service.GatewayPrice(run.sale, estimated, input, started, run.ratio, run.saleFX)
 	reserve, reserveErr := reserveValue.Receivable()
@@ -405,10 +287,6 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		run.fail(c, http.StatusBadRequest, "unsupported_pricing", "Fixed pricing is not supported for Realtime")
 		return
 	}
-	purchaseInput := billingexpr.RequestInput{Body: payload, Headers: map[string]string{}}
-	for key, values := range prepared.Headers() {
-		purchaseInput.Headers[strings.ToLower(key)] = strings.Join(values, ",")
-	}
 	costEstimate, convertedEstimate, _, priceErr := service.GatewayPrice(purchase, estimated, purchaseInput, attemptStart, decimal.NewFromInt(1), purchaseFX)
 	_, costErr := costEstimate.Cost()
 	_, convertedErr := convertedEstimate.Cost()
@@ -416,6 +294,27 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
 		return
 	}
+	comparison, err := service.GatewayComparisonCost(c.Request.Context(), costEstimate)
+	if err != nil {
+		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
+		return
+	}
+	profitable, err := service.GatewayRouteProfitAllowed(comparison, reserveValue, offering.MinimumMarginRate)
+	if err != nil {
+		run.fail(c, http.StatusServiceUnavailable, "price_unavailable", "Channel price is unavailable")
+		return
+	}
+	selection.LossFallback = false
+	if !profitable {
+		if offering.AllowLossFallback {
+			selection.LossFallback, err = selection.LossFallbackAllowed(c.Request.Context(), comparison, offering.MinimumMarginRate)
+		}
+		if err != nil || !selection.LossFallback {
+			run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
+			return
+		}
+	}
+	selection.Diagnostics["estimated_cost"], selection.Diagnostics["loss_fallback"] = comparison.String(), selection.LossFallback
 	if call.Native != nil {
 		call.Native.Validate = func(saleRequest, purchaseRequest billingexpr.RequestInput, knownInput *dto.Usage) error {
 			probe := service.GatewayUsageSnapshot(knownInput)
@@ -450,7 +349,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 			return quoteErr
 		}
 	}
-	attemptContext, err := budget.Start()
+	attemptContext, err := info.BeginProviderCall()
 	if err != nil {
 		run.fail(c, http.StatusServiceUnavailable, "budget_exhausted", "Upstream request failed")
 		return
@@ -507,6 +406,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	transportFailed := apiErr != nil || outcome.EndReason == relaycommon.StreamEndReasonScannerErr || outcome.EndReason == relaycommon.StreamEndReasonTimeout
 	failure := service.ClassifyGatewayFailure(status, code, transportFailed, budget.TimedOut(), cancelled, info.ResponseFacts.DownstreamWriteFailed, errorType)
 	if attempt.Status == "success" {
+		service.RecordGatewayChannelAffinity(c, selection)
 		failure = service.GatewayFailure{}
 	}
 	if attempt.Status != "success" {
@@ -529,6 +429,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		}
 	}
 	if usage != nil {
+		observedUsage = usage
 		attempt.Usage, attempt.UsageSource = service.GatewayRecordUsage(usage), "estimated"
 		if info.ResponseFacts.UsageReported {
 			attempt.UsageSource = "upstream"

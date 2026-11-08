@@ -310,6 +310,84 @@ func TestChannelHealthInflightRateLimitExtendsCooldownAfterTrip(t *testing.T) {
 	}
 }
 
+func TestChannelHealthAllOpenProbeRemainsExclusiveAfterRetryOrderChanges(t *testing.T) {
+	for _, shared := range []bool{false, true} {
+		for _, release := range []bool{false, true} {
+			t.Run(fmt.Sprintf("redis=%t/release=%t", shared, release), func(t *testing.T) {
+				fake := clock.UseFake(t, time.Unix(1000, 0))
+				var client *redis.Client
+				if shared {
+					server := miniredis.RunT(t)
+					client = redis.NewClient(&redis.Options{Addr: server.Addr()})
+					t.Cleanup(func() { require.NoError(t, client.Close()) })
+				}
+				first := channelhealth.New(client)
+				second := first
+				if shared {
+					second = channelhealth.New(client)
+				}
+				ctx := t.Context()
+				ordinary, err := first.Acquire(ctx, []int{1})
+				require.NoError(t, err)
+				require.Equal(t, channelhealth.Admission{ChannelID: 1}, ordinary)
+				for _, sample := range []channelhealth.Sample{
+					{AttemptID: "open-one", ChannelID: 1, ProviderFailure: true, RateLimited: true, RetryAfter: "60"},
+					{AttemptID: "open-two", ChannelID: 2, ProviderFailure: true, RateLimited: true, RetryAfter: "120"},
+				} {
+					_, err = first.Record(ctx, sample)
+					require.NoError(t, err)
+				}
+				probe, err := first.Acquire(ctx, []int{1, 2})
+				require.NoError(t, err)
+				require.Equal(t, 1, probe.ChannelID)
+				require.NotEmpty(t, probe.Lease)
+				_, err = second.Record(ctx, channelhealth.Sample{AttemptID: "late-ordinary", ChannelID: 1,
+					ProviderFailure: true, RateLimited: true, RetryAfter: "172800", Lease: ordinary.Lease})
+				require.NoError(t, err)
+				states, err := second.Snapshots(ctx, []int{1, 2})
+				require.NoError(t, err)
+				assert.Equal(t, "half_open", states[1].Circuit)
+				assert.Equal(t, clock.Now().Add(48*time.Hour).UnixMilli(), states[1].RetryAt)
+				blocked, err := second.Acquire(ctx, []int{2, 1})
+				require.NoError(t, err)
+				assert.Equal(t, channelhealth.Admission{}, blocked, "Retry-After reordering must retain candidate-set probe exclusivity")
+				blocked, err = second.AcquireWithProbeFence(ctx, []int{2}, []int{1, 2})
+				require.NoError(t, err)
+				assert.Equal(t, channelhealth.Admission{}, blocked, "quality selection must not hide a lease in the validated pool")
+				normal, err := second.Acquire(ctx, []int{1, 2, 3})
+				require.NoError(t, err)
+				assert.Equal(t, channelhealth.Admission{ChannelID: 3}, normal, "closed candidates still serve traffic")
+				normal, err = second.AcquireWithProbeFence(ctx, []int{3}, []int{1, 2, 3})
+				require.NoError(t, err)
+				assert.Equal(t, channelhealth.Admission{ChannelID: 3}, normal, "the full probe fence must not block closed traffic")
+				if release {
+					require.NoError(t, first.Release(ctx, probe))
+				} else {
+					fake.Advance(11 * time.Minute)
+				}
+				preferred, err := second.AcquireWithProbeFence(ctx, []int{1}, []int{1, 2})
+				require.NoError(t, err)
+				require.Equal(t, 1, preferred.ChannelID, "a lower-quality candidate cannot win by expiring earlier")
+				require.NotEmpty(t, preferred.Lease)
+				require.NoError(t, second.Release(ctx, preferred))
+				replacement, err := second.Acquire(ctx, []int{1, 2})
+				require.NoError(t, err)
+				require.Equal(t, 2, replacement.ChannelID)
+				require.NotEmpty(t, replacement.Lease)
+				assert.NotEqual(t, probe.Lease, replacement.Lease)
+				require.NoError(t, first.Release(ctx, probe))
+				blocked, err = first.Acquire(ctx, []int{1, 2})
+				require.NoError(t, err)
+				assert.Equal(t, channelhealth.Admission{}, blocked, "stale release must not clear the replacement probe")
+				unrelated, err := first.Acquire(ctx, []int{1})
+				require.NoError(t, err)
+				assert.Equal(t, 1, unrelated.ChannelID, "a lease outside the current candidate set must not block admission")
+				assert.NotEmpty(t, unrelated.Lease)
+			})
+		}
+	}
+}
+
 func TestChannelHealthStaleCompletionCannotChangeCurrentCircuit(t *testing.T) {
 	for _, shared := range []bool{false, true} {
 		for _, tc := range []struct {

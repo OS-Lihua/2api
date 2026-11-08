@@ -584,6 +584,16 @@ func getTaskOriginModelName(c *gin.Context) string {
 }
 
 func SetupContextForSelectedChannel(c *gin.Context, channel *model.Provider, modelName string, pinnedKey ...int) *types.NewAPIError {
+	return setupContextForSelectedChannel(c, channel, modelName, false, pinnedKey...)
+}
+
+// SetupContextForGatewayCandidate projects account metadata without consuming
+// a Key rotation for a candidate that may subsequently be filtered out.
+func SetupContextForGatewayCandidate(c *gin.Context, provider *model.Provider, modelName string, pinnedKey ...int) *types.NewAPIError {
+	return setupContextForSelectedChannel(c, provider, modelName, true, pinnedKey...)
+}
+
+func setupContextForSelectedChannel(c *gin.Context, channel *model.Provider, modelName string, preview bool, pinnedKey ...int) *types.NewAPIError {
 	c.Set("original_model", modelName) // for retry
 	expectedPlugin := c.GetString("expected_task_plugin_key")
 	if channel == nil {
@@ -689,7 +699,11 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Provider, mod
 		}
 	} else {
 		var newAPIError *types.NewAPIError
-		key, index, newAPIError = channel.GetNextEnabledKey()
+		selectKey := channel.GetNextEnabledKey
+		if preview {
+			selectKey = channel.PreviewEnabledKey
+		}
+		key, index, newAPIError = selectKey()
 		if newAPIError != nil {
 			return newAPIError
 		}

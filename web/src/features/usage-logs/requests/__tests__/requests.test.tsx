@@ -85,7 +85,12 @@ const internalAttempt = {
   failover_reason: 'admin-only-route',
   circuit_action: 'none',
   route_diagnostics: {
-    method: 'single_channel',
+    method: 'cost',
+    score: '3/2',
+    estimated_cost: '0.012345678901 USD',
+    estimated_receivable: '0.023456789012 USD',
+    affinity_hit: true,
+    loss_fallback: false,
     candidate_count: 3,
     eligible_count: 1,
     excluded_counts: { disabled: 2 },
@@ -266,6 +271,11 @@ it('uses request:read permission for all requests and strips internal fields in 
   expect(within(drawer).getByText('1.23456789123456789')).toBeVisible()
   expect(within(drawer).getByText('admin-only-route')).toBeVisible()
   expect(within(drawer).getByText('Candidate Channels')).toBeVisible()
+  expect(within(drawer).getByText('0.012345678901 USD')).toBeVisible()
+  expect(within(drawer).getByText('0.023456789012 USD')).toBeVisible()
+  expect(within(drawer).getByText('3/2')).toBeVisible()
+  expect(within(drawer).getByText('Affinity hit')).toBeVisible()
+  expect(within(drawer).getByText('Loss fallback')).toBeVisible()
   expect(within(drawer).getByText('Eligible Channels')).toBeVisible()
   expect(within(drawer).getByText('Disabled: 2')).toBeVisible()
   expect(within(drawer).queryByText('never-show')).not.toBeInTheDocument()
@@ -284,6 +294,10 @@ it('uses request:read permission for all requests and strips internal fields in 
     within(drawer).queryByText('1.23456789123456789')
   ).not.toBeInTheDocument()
   expect(within(drawer).queryByText('admin-only-route')).not.toBeInTheDocument()
+  expect(
+    within(drawer).queryByText('0.012345678901 USD')
+  ).not.toBeInTheDocument()
+  expect(within(drawer).queryByText('3/2')).not.toBeInTheDocument()
   expect(within(drawer).queryByText('Provider ID')).not.toBeInTheDocument()
   expect(within(drawer).queryByText('Channel ID')).not.toBeInTheDocument()
   expect(within(drawer).queryByText('Member tier')).not.toBeInTheDocument()
