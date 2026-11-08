@@ -333,7 +333,21 @@ func TestGatewayBudgetManagementOptions(t *testing.T) {
 }
 
 func TestTextGatewayAutomaticallyDisablesSelectedProviderKey(t *testing.T) {
-	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusUnauthorized) })
+	for _, rotated := range []bool{false, true} {
+		t.Run(fmt.Sprint("rotated=", rotated), func(t *testing.T) { testGatewayAutomaticDisable(t, rotated) })
+	}
+}
+
+func testGatewayAutomaticDisable(t *testing.T, rotated bool) {
+	var selectedProviderID int
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if rotated {
+			if err := model.DB.Model(&model.Provider{}).Where("id = ?", selectedProviderID).Update("key", "replacement-secret").Error; err != nil {
+				t.Error(err)
+			}
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	})
 	previous := common.AutomaticDisableChannelEnabled
 	common.AutomaticDisableChannelEnabled = true
 	t.Cleanup(func() { common.AutomaticDisableChannelEnabled = previous })
@@ -344,6 +358,7 @@ func TestTextGatewayAutomaticallyDisablesSelectedProviderKey(t *testing.T) {
 	require.NoError(t, err)
 	provider.BaseURL = original.BaseURL
 	require.NoError(t, model.DB.Create(provider).Error)
+	selectedProviderID = provider.Id
 	require.NotEqual(t, fixture.channel.ID, provider.Id)
 	require.NoError(t, model.DB.Model(fixture.channel).Update("provider_id", provider.Id).Error)
 	response := httptest.NewRecorder()
@@ -354,7 +369,11 @@ func TestTextGatewayAutomaticallyDisablesSelectedProviderKey(t *testing.T) {
 	stored, err := model.GetProviderById(provider.Id, true)
 	require.NoError(t, err)
 	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
-	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ProviderInfo.MultiKeyStatusList[1])
+	if rotated {
+		assert.Empty(t, stored.ProviderInfo.MultiKeyStatusList)
+	} else {
+		assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ProviderInfo.MultiKeyStatusList[1])
+	}
 	assert.Zero(t, stored.ProviderInfo.MultiKeyStatusList[0])
 	untouched, err := model.GetProviderById(original.Id, true)
 	require.NoError(t, err)
@@ -365,6 +384,15 @@ func TestTextGatewayAutomaticallyDisablesSelectedProviderKey(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(encoded), "provider.auto_disable")
 	assert.NotContains(t, string(encoded), "slot-secret")
+	assert.NotContains(t, string(encoded), "replacement-secret")
+	found := false
+	for _, entry := range logs {
+		if entry.Action == "provider.auto_disable" {
+			found = true
+			assert.Equal(t, !rotated, entry.Success, "audit reports the actual Key transition outcome")
+		}
+	}
+	assert.True(t, found)
 }
 
 func TestTextGatewayCircuitUsesProviderFailuresEvenAtAttemptLimit(t *testing.T) {
@@ -375,8 +403,14 @@ func TestTextGatewayCircuitUsesProviderFailuresEvenAtAttemptLimit(t *testing.T) 
 
 func testGatewayCircuit(t *testing.T, shared bool) {
 	calls := 0
+	recovered := false
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		calls++
+		if recovered {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"Recovered probe"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+			return
+		}
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
 	if shared {
@@ -429,6 +463,16 @@ func testGatewayCircuit(t *testing.T, shared bool) {
 	var stored model.Channel
 	require.NoError(t, model.DB.First(&stored, fixture.channel.ID).Error)
 	assert.Equal(t, model.ChannelEnabled, stored.Status, "circuit state is runtime only")
+	recovered = true
+	fixture.fake.Advance(time.Minute)
+	probe := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	require.Equal(t, 200, probe.Code, probe.Body.String())
+	assert.Contains(t, probe.Body.String(), "Recovered probe", "expired circuits receive their probe despite poor recent health")
+	assert.Equal(t, 6, calls)
+	health, err := service.ChannelHealth.Snapshots(t.Context(), []int{fixture.channel.ID})
+	require.NoError(t, err)
+	assert.Equal(t, "closed", health[fixture.channel.ID].Circuit)
+	assert.Zero(t, health[fixture.channel.ID].Failures)
 }
 
 func TestTextGatewayHealthOrdersByCompletedBusinessLatency(t *testing.T) {

@@ -186,6 +186,24 @@ func TestChannelHealthProbeLeaseSurvivesLongResponseAndExpiresAfterCrash(t *test
 	assert.NotEqual(t, probe.Lease, replacement.Lease)
 }
 
+func TestChannelHealthLongRetryAfterStillRequiresSharedProbe(t *testing.T) {
+	fake := clock.UseFake(t, time.Unix(100, 0))
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	first, second := channelhealth.New(client), channelhealth.New(client)
+	_, err := first.Record(t.Context(), channelhealth.Sample{AttemptID: "long-429", ChannelID: 1, ProviderFailure: true, RetryAfter: "86400"})
+	require.NoError(t, err)
+	server.FastForward(48 * time.Hour)
+	fake.Advance(48 * time.Hour)
+	probe, err := first.Acquire(t.Context(), []int{1})
+	require.NoError(t, err)
+	require.NotEmpty(t, probe.Lease, "a long idle cooldown cannot turn an open circuit into unbounded normal admission")
+	blocked, err := second.Acquire(t.Context(), []int{1})
+	require.NoError(t, err)
+	assert.Zero(t, blocked.ChannelID)
+}
+
 func TestGatewayKnownRejectionSurvivesBudgetCancellation(t *testing.T) {
 	for _, test := range []struct {
 		status           int

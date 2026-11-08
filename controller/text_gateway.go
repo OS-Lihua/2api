@@ -430,7 +430,13 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				}
 				changed := service.DisableChannel(types.ProviderError{ChannelId: selection.Channel.ProviderID, ChannelName: selection.Provider.Name,
 					IsMultiKey: info.ChannelIsMultiKey, UsingKey: key, AutoBan: true}, "Provider rejected authentication or account quota", index)
-				model.RecordAuditLog(c, model.AuditLog{UserId: c.GetInt("id"), ActorRole: c.GetInt("role"), Category: model.AuditCategorySecurity,
+				actorRole := c.GetInt("role")
+				if actorRole == 0 {
+					if actor, err := model.GetUserCache(c.GetInt("id")); err == nil {
+						actorRole = actor.Role
+					}
+				}
+				model.RecordAuditLog(c, model.AuditLog{UserId: c.GetInt("id"), ActorRole: actorRole, AuthMethod: "api_token", Category: model.AuditCategorySecurity,
 					Action: "provider.auto_disable", Success: changed, Content: "Provider rejected authentication or account quota",
 					Other: model.AuditOther{Op: &model.AuditOperation{Action: "provider.auto_disable"}, RootInfo: model.AuditFields{
 						"provider_id": selection.Channel.ProviderID, "channel_id": selection.Channel.ID, "key_index": index, "error_class": failure.Class}}})

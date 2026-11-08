@@ -658,7 +658,7 @@ func CleanupProviderPollingLocks() {
 	})
 }
 
-func handlerMultiKeyUpdate(channel *Provider, usingKey string, status int, reason string, selectedIndex ...int) {
+func handlerMultiKeyUpdate(channel *Provider, usingKey string, status int, reason string, selectedIndex ...int) bool {
 	keys := channel.GetKeys()
 	if len(keys) == 0 {
 		channel.Status = status
@@ -667,7 +667,7 @@ func handlerMultiKeyUpdate(channel *Provider, usingKey string, status int, reaso
 		if len(selectedIndex) > 0 && usingKey != "" {
 			index := selectedIndex[0]
 			if index < 0 || index >= len(keys) || keys[index] != usingKey {
-				return
+				return false
 			}
 			keyIndex = index
 		} else {
@@ -681,14 +681,14 @@ func handlerMultiKeyUpdate(channel *Provider, usingKey string, status int, reaso
 		if keyIndex < 0 {
 			if usingKey != "" {
 				common.SysLog(common.LogText("failed to update multi-key status: channel_id=%d, using key not found", channel.Id))
-				return
+				return false
 			}
 			channel.Status = status
 			info := channel.GetOtherInfo()
 			info["status_reason"] = reason
 			info["status_time"] = common.GetTimestamp()
 			channel.SetOtherInfo(info)
-			return
+			return true
 		}
 		if channel.ProviderInfo.MultiKeyStatusList == nil {
 			channel.ProviderInfo.MultiKeyStatusList = make(map[int]int)
@@ -716,6 +716,7 @@ func handlerMultiKeyUpdate(channel *Provider, usingKey string, status int, reaso
 			channel.Status = common.ChannelStatusEnabled
 		}
 	}
+	return true
 }
 
 func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
@@ -752,7 +753,9 @@ func UpdateProviderStatus(channelId int, usingKey string, status int, reason str
 		if channelCache.ProviderInfo.IsMultiKey {
 			beforeStatus := channelCache.Status
 			// 如果是多Key模式，更新缓存中的状态
-			handlerMultiKeyUpdate(channelCache, usingKey, status, reason, selectedIndex...)
+			if !handlerMultiKeyUpdate(channelCache, usingKey, status, reason, selectedIndex...) {
+				return false
+			}
 			if beforeStatus != channelCache.Status {
 				CacheUpdateProviderStatus(channelId, channelCache.Status)
 			}
@@ -791,7 +794,9 @@ func UpdateProviderStatus(channelId int, usingKey string, status int, reason str
 
 		if channel.ProviderInfo.IsMultiKey {
 			beforeStatus := channel.Status
-			handlerMultiKeyUpdate(channel, usingKey, status, reason, selectedIndex...)
+			if !handlerMultiKeyUpdate(channel, usingKey, status, reason, selectedIndex...) {
+				return false
+			}
 			if beforeStatus != channel.Status {
 				shouldUpdateAbilities = true
 			}

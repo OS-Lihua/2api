@@ -147,7 +147,11 @@ func (m *Manager) transact(ctx context.Context, ids []int, event string, apply f
 					if err != nil {
 						return err
 					}
-					pipe.Set(ctx, keys[i], raw, 24*time.Hour)
+					expiration := 24 * time.Hour
+					if states[id].RetryAt > 0 {
+						expiration = 0
+					}
+					pipe.Set(ctx, keys[i], raw, expiration)
 				}
 				if event != "" {
 					pipe.Set(ctx, eventKey, "1", 7*24*time.Hour)
@@ -206,34 +210,31 @@ func (m *Manager) Snapshots(ctx context.Context, ids []int) (map[int]Snapshot, e
 	return result, err
 }
 
-// Acquire takes candidates already ordered by Route. Open circuits remain
-// behind closed ones. If all are open, only the earliest is eligible, even
-// while its shared probe lease is occupied.
+// Acquire takes candidates already ordered by Route. The earliest expired
+// circuit receives one recovery probe before normal health ordering. If all
+// circuits are open, only the earliest can probe, including before cooldown.
 func (m *Manager) Acquire(ctx context.Context, ids []int) (Admission, error) {
 	admission := Admission{}
 	lease := common.NewRequestId()
 	err := m.transact(ctx, ids, "", func(states map[int]*state, _ bool) bool {
 		admission = Admission{}
 		now := clock.Now().UnixMilli()
-		hasClosed := slices.ContainsFunc(ids, func(id int) bool { return states[id].RetryAt == 0 })
-		if hasClosed {
+		earliest := 0
+		for _, id := range ids {
+			if states[id].RetryAt == 0 {
+				continue
+			}
+			if earliest == 0 || states[id].RetryAt < states[earliest].RetryAt || states[id].RetryAt == states[earliest].RetryAt && id < earliest {
+				earliest = id
+			}
+		}
+		probe := earliest != 0 && states[earliest].RetryAt <= now && states[earliest].LeaseUntil <= now
+		if !probe {
 			for _, id := range ids {
-				s := states[id]
-				if s.RetryAt == 0 {
+				if states[id].RetryAt == 0 {
 					admission.ChannelID = id
 					return false
 				}
-				if s.RetryAt <= now && s.LeaseUntil <= now {
-					s.Lease, s.LeaseUntil = lease, now+int64(10*time.Minute/time.Millisecond)
-					admission = Admission{ChannelID: id, Lease: lease}
-					return true
-				}
-			}
-		}
-		earliest := 0
-		for _, id := range ids {
-			if earliest == 0 || states[id].RetryAt < states[earliest].RetryAt || states[id].RetryAt == states[earliest].RetryAt && id < earliest {
-				earliest = id
 			}
 		}
 		if earliest == 0 {
