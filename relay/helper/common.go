@@ -355,6 +355,9 @@ func StringData(c *gin.Context, str string) error {
 				facts.OutputLimitObserved = facts.OutputLimitObserved || choice.FinishReason != nil && *choice.FinishReason == "length"
 				business = business || choice.Delta.GetContentString() != "" || choice.Delta.GetReasoningContent() != "" || len(choice.Delta.ToolCalls) > 0
 			}
+			text := relaycommon.ChatStreamBusinessText([]byte(str))
+			facts.SourceGeneratedText += text
+			facts.SourceOutputObserved = facts.SourceOutputObserved || text != "" || business
 			return WriteGatewayStreamFrame(c, facts, "data: "+str+"\n\n", business)
 		}
 	}

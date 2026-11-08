@@ -8,6 +8,7 @@ import (
 	"maps"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -317,7 +318,10 @@ func mergeNativeSourceFacts(info, native *relaycommon.RelayInfo, writer *nativeR
 	facts.UsageReported = facts.PromptTokensReported && facts.CompletionTokensReported
 	facts.IndependentUsageReported = facts.IndependentUsageReported || source.IndependentUsageReported
 	if writer.stream {
-		facts.SourceGeneratedText = writer.source.String() + source.SourceGeneratedText
+		facts.SourceGeneratedText = source.SourceGeneratedText
+		if !strings.HasPrefix(source.SourceGeneratedText, writer.source.String()) {
+			facts.SourceGeneratedText = writer.source.String() + source.SourceGeneratedText
+		}
 		count := tokenkit.Count(info.TokenizerModelName(), facts.SourceGeneratedText) + len(writer.source.chatTools)*7
 		facts.SourceOutputTokens = &count
 	}

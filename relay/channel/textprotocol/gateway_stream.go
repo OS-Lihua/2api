@@ -466,22 +466,7 @@ func gatewayStreamBusinessText(body []byte, format types.RelayFormat) string {
 	var text strings.Builder
 	switch format {
 	case types.RelayFormatOpenAI:
-		for _, choice := range root.Get("choices").Array() {
-			text.WriteString(choice.Get("delta.content").String())
-			if reasoning := choice.Get("delta.reasoning_content"); reasoning.Exists() {
-				text.WriteString(reasoning.String())
-			} else {
-				text.WriteString(choice.Get("delta.reasoning").String())
-			}
-			text.WriteString(choice.Get("delta.refusal").String())
-			text.WriteString(choice.Get("delta.audio.transcript").String())
-			for _, tool := range choice.Get("delta.tool_calls").Array() {
-				text.WriteString(tool.Get("function.name").String())
-				text.WriteString(tool.Get("function.arguments").String())
-				text.WriteString(tool.Get("custom.name").String())
-				text.WriteString(tool.Get("custom.input").String())
-			}
-		}
+		return relaycommon.ChatStreamBusinessText(body)
 	case types.RelayFormatOpenAIResponses:
 		switch root.Get("type").String() {
 		case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.refusal.delta":

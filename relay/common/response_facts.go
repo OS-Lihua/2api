@@ -15,6 +15,27 @@ func ChatUsagePresence(body []byte) (prompt, completion bool) {
 	return NativeUsagePresence(body, "usage.prompt_tokens", "usage.completion_tokens", "usage.total_tokens")
 }
 
+// ChatStreamBusinessText extracts generated content independently of delivery.
+func ChatStreamBusinessText(body []byte) string {
+	var text strings.Builder
+	for _, choice := range gjson.GetBytes(body, "choices").Array() {
+		text.WriteString(choice.Get("delta.content").String())
+		if reasoning := choice.Get("delta.reasoning_content"); reasoning.Exists() {
+			text.WriteString(reasoning.String())
+		} else {
+			text.WriteString(choice.Get("delta.reasoning").String())
+		}
+		text.WriteString(choice.Get("delta.refusal").String())
+		text.WriteString(choice.Get("delta.audio.transcript").String())
+		for _, tool := range choice.Get("delta.tool_calls").Array() {
+			for _, field := range []string{"function.name", "function.arguments", "custom.name", "custom.input"} {
+				text.WriteString(tool.Get(field).String())
+			}
+		}
+	}
+	return text.String()
+}
+
 // ResponseFacts separates upstream-reported zero usage from a local estimate,
 // and business output from protocol framing and keep-alive pings. It contains
 // transient source and delivered output only; callers must never persist either.
