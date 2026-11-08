@@ -46,26 +46,37 @@ func getAccessToken(a *Protocol, info *relaycommon.RelayInfo) (string, error) {
 }
 
 func getProviderAccessToken(a *Provider, info *channel.ProviderRequest) (string, error) {
-	return getProviderAccessTokenWithContext(context.Background(), a, info)
+	return getProviderAccessTokenWithContext(context.Background(), a, info, nil)
 }
 
-func getProviderAccessTokenWithContext(ctx context.Context, a *Provider, info *channel.ProviderRequest) (string, error) {
+func providerAccessTokenCacheKey(info *channel.ProviderRequest) string {
 	credentialHash := sha256.Sum256([]byte(info.ApiKey))
-	cacheKey := fmt.Sprintf("access-token-%d-%d-%x", info.ChannelId, info.ChannelMultiKeyIndex, credentialHash)
-	val, err := Cache.Get(cacheKey)
-	if err == nil {
-		return val.(string), nil
+	return fmt.Sprintf("access-token-%d-%d-%x", info.ChannelId, info.ChannelMultiKeyIndex, credentialHash)
+}
+
+func cachedProviderAccessToken(info *channel.ProviderRequest) (string, bool) {
+	value, err := Cache.Get(providerAccessTokenCacheKey(info))
+	if err != nil {
+		return "", false
+	}
+	token, ok := value.(string)
+	return token, ok && token != ""
+}
+
+func getProviderAccessTokenWithContext(ctx context.Context, a *Provider, info *channel.ProviderRequest, begin func() (context.Context, error)) (string, error) {
+	if token, ok := cachedProviderAccessToken(info); ok {
+		return token, nil
 	}
 
 	signedJWT, err := createSignedJWT(a.AccountCredentials.ClientEmail, a.AccountCredentials.PrivateKey)
 	if err != nil {
 		return "", fmt.Errorf("failed to create signed JWT: %w", err)
 	}
-	newToken, err := exchangeJwtForAccessTokenWithContext(ctx, signedJWT, info.ChannelSetting.Proxy)
+	newToken, err := exchangeJwtForAccessTokenWithContext(ctx, signedJWT, info.ChannelSetting.Proxy, begin)
 	if err != nil {
 		return "", fmt.Errorf("failed to exchange JWT for access token: %w", err)
 	}
-	if err := Cache.SetDefault(cacheKey, newToken); err {
+	if err := Cache.SetDefault(providerAccessTokenCacheKey(info), newToken); err {
 		return newToken, nil
 	}
 	return newToken, nil
@@ -123,25 +134,33 @@ func AcquireAccessTokenWithContext(ctx context.Context, creds Credentials, proxy
 	if err != nil {
 		return "", fmt.Errorf("failed to create signed JWT: %w", err)
 	}
-	return exchangeJwtForAccessTokenWithContext(ctx, signedJWT, proxy)
+	return exchangeJwtForAccessTokenWithContext(ctx, signedJWT, proxy, nil)
 }
 
 // exchangeJwtForAccessToken trades a signed service-account JWT for an access
 // token at Google's OAuth endpoint. It goes through the channel proxy only and
 // always verifies the certificate; the channel's TLS setting does not apply.
 func exchangeJwtForAccessToken(signedJWT string, proxy string) (string, error) {
-	return exchangeJwtForAccessTokenWithContext(context.Background(), signedJWT, proxy)
+	return exchangeJwtForAccessTokenWithContext(context.Background(), signedJWT, proxy, nil)
 }
 
-func exchangeJwtForAccessTokenWithContext(ctx context.Context, signedJWT, proxy string) (string, error) {
+func exchangeJwtForAccessTokenWithContext(ctx context.Context, signedJWT, proxy string, begin func() (context.Context, error)) (string, error) {
 	authURL := "https://www.googleapis.com/oauth2/v4/token"
 	data := url.Values{}
 	data.Set("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer")
 	data.Set("assertion", signedJWT)
 
-	client, err := service.GetHttpClientWithProxy(proxy)
+	client, err := service.GetVerifiedHttpClientWithProxy(proxy)
 	if err != nil {
 		return "", fmt.Errorf("new proxy http client failed: %w", err)
+	}
+	defer client.CloseIdleConnections()
+	if begin != nil {
+		ctx, err = begin()
+		if err != nil {
+			return "", err
+		}
+		client = channel.GatewayHTTPClient(client)
 	}
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, authURL, strings.NewReader(data.Encode()))

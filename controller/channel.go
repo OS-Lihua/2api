@@ -1061,6 +1061,9 @@ func UpdateChannel(c *gin.Context) {
 
 	// Always copy the original ProviderInfo so that fields like IsMultiKey and MultiKeySize are retained.
 	channel.ProviderInfo = originChannel.ProviderInfo
+	if channel.RouteLimits != nil {
+		channel.ProviderInfo.RouteLimits = *channel.RouteLimits
+	}
 
 	sensitiveChanged := channelHasSensitiveChanges(&channel, originChannel, requestData)
 	if sensitiveChanged && !canWriteSensitive {

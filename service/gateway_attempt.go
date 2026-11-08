@@ -23,6 +23,7 @@ func InitGatewayHealth() {
 		client = nil
 	}
 	ChannelHealth = channelhealth.New(client)
+	GatewayRouteQuota = NewGatewayRouteQuota(client)
 }
 
 // GatewayAttemptPolicy bounds actual upstream sends across the whole request.

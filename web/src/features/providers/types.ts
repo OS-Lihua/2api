@@ -20,7 +20,14 @@ import type { MultiKeyStatusResponse } from '@/features/channels/types'
 
 // A Provider is one upstream account: address, credential, and account-level
 // quota. The API never returns the credential, so Provider has no key field.
+export interface ProviderRouteLimits {
+  rpm: number
+  tpm: number
+  max_concurrency: number
+}
+
 export interface Provider {
+  route_limits?: ProviderRouteLimits
   id: number
   type: number
   name: string
@@ -63,6 +70,7 @@ export interface CreateProviderPayload {
   mode: ProviderAddMode
   multi_key_mode?: 'random' | 'polling'
   provider: {
+    route_limits?: ProviderRouteLimits
     type: number
     name: string
     key: string
@@ -77,6 +85,7 @@ export interface CreateProviderPayload {
 }
 
 export interface UpdateProviderPayload {
+  route_limits?: ProviderRouteLimits
   name?: string
   base_url?: string
   remark?: string

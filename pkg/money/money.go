@@ -156,6 +156,14 @@ func (v Value) String() string {
 	return amount.RatString() + " " + string(v.currency)
 }
 
+// Compare orders two unrounded amounts without rounding or currency coercion.
+func (v Value) Compare(other Value) (int, error) {
+	if v.currency != other.currency {
+		return 0, ErrCurrencyMismatch
+	}
+	return v.rational().Cmp(other.rational()), nil
+}
+
 // Add returns v + other.
 func (v Value) Add(other Value) (Value, error) {
 	if v.currency != other.currency {

@@ -15,6 +15,34 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestMoneyExprDeferredHeadersAreNotEmptyPricingProbes(t *testing.T) {
+	for _, test := range []struct {
+		name, expression string
+		deferred         []string
+		wantError        bool
+	}{
+		{"flat price", `tier("base", p)`, []string{"authorization"}, false},
+		{"known negotiation", `header("X-Mode") == "fast" ? tier("base", p) : tier("other", p*2)`, []string{"authorization"}, false},
+		{"unknown authentication", `header("Authorization") == "" ? tier("free", p*0) : tier("base", p)`, []string{" authorization "}, true},
+		{"dynamic authentication", `header(param("name")) == "" ? tier("free", p*0) : tier("base", p)`, []string{"AUTHORIZATION"}, true},
+		{"unselected branch", `param("paid") == true ? tier("base", p) : header("Authorization") == "" ? tier("free", p*0) : tier("other", p*2)`, []string{"authorization"}, false},
+		{"resolved authentication reuses cached program", `header("Authorization") == "" ? tier("free", p*0) : tier("base", p)`, nil, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			amount, _, err := billingexpr.RunMoneyExpr(test.expression, billingexpr.MoneyInput{
+				Tokens:  map[string]int64{"p": 1_000_000},
+				Request: billingexpr.RequestInput{Headers: map[string]string{"X-Mode": "fast", "Authorization": "Bearer fixture"}, DeferredHeaders: test.deferred, Body: []byte(`{"name":"Authorization","paid":true}`)},
+			}, "USD")
+			if test.wantError {
+				require.ErrorContains(t, err, "pricing header is unavailable")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, "1 USD", amount.String())
+		})
+	}
+}
+
 func TestMoneyOverflowRetainsExactResultWithoutRequestContent(t *testing.T) {
 	for _, test := range []struct{ body, amount string }{
 		{`{"rate":2,"secret":"private-request"}`, "2500000000000001/50000"},
