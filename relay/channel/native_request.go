@@ -1,8 +1,10 @@
 package channel
 
 import (
+	"encoding/json"
 	"fmt"
 	"maps"
+	"math/big"
 	"reflect"
 	"slices"
 	"strings"
@@ -179,6 +181,44 @@ func ProjectNativeChatParameters(body []byte, public dto.GeneralOpenAIRequest, n
 	return &result, nil
 }
 
+type nativeJSONNumber struct {
+	negative         bool
+	digits, exponent string
+}
+
+// nativeJSONSemantics compares decimal values exactly without float rounding or
+// expanding a large exponent into a correspondingly large integer.
+func nativeJSONSemantics(value any) any {
+	switch value := value.(type) {
+	case json.Number:
+		literal := value.String()
+		negative := strings.HasPrefix(literal, "-")
+		literal = strings.TrimPrefix(literal, "-")
+		mantissa, rawExponent, _ := strings.Cut(strings.ToLower(literal), "e")
+		whole, fraction, _ := strings.Cut(mantissa, ".")
+		digits := strings.TrimLeft(whole+fraction, "0")
+		if digits == "" {
+			return nativeJSONNumber{}
+		}
+		coefficient := strings.TrimRight(digits, "0")
+		var exponent big.Int
+		if rawExponent != "" {
+			exponent.SetString(rawExponent, 10)
+		}
+		exponent.Add(&exponent, big.NewInt(int64(len(digits)-len(coefficient)-len(fraction))))
+		return nativeJSONNumber{negative: negative, digits: coefficient, exponent: exponent.String()}
+	case map[string]any:
+		for key, child := range value {
+			value[key] = nativeJSONSemantics(child)
+		}
+	case []any:
+		for i := range value {
+			value[i] = nativeJSONSemantics(value[i])
+		}
+	}
+	return value
+}
+
 func nativeChatMessageSemantics(messages []dto.Message) (any, error) {
 	normalized := slices.Clone(messages)
 	for i := range normalized {
@@ -250,7 +290,7 @@ func nativeChatMessageSemantics(messages []dto.Message) (any, error) {
 			// Compare valid argument JSON by value without changing the request.
 			var decoded any
 			if common.UnmarshalUseNumber([]byte(arguments), &decoded) == nil {
-				function["arguments"] = decoded
+				function["arguments"] = nativeJSONSemantics(decoded)
 			}
 		}
 	}
