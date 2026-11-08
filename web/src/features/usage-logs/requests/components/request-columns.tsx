@@ -105,7 +105,12 @@ export function useRequestColumns(onSelect: (request: RequestLog) => void) {
         id: 'receivable',
         header: t('Charge'),
         size: 220,
-        cell: ({ row }) => <RequestMoney amount={row.original.receivable} />,
+        cell: ({ row }) => (
+          <RequestMoney
+            amount={row.original.receivable}
+            pending={row.original.sale_pending}
+          />
+        ),
       },
       {
         accessorKey: 'sale_price_version_id',
