@@ -422,14 +422,18 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				attempt.ErrorClass = failure.Class
 			}
 			if common.AutomaticDisableChannelEnabled && selection.Provider.GetAutoBan() && (failure.Class == "credentials" || failure.Class == "account_quota") {
-				key := info.ApiKey
 				index := info.ChannelMultiKeyIndex
+				providerError := types.ProviderError{ChannelId: selection.Channel.ProviderID, ChannelName: selection.Provider.Name,
+					IsMultiKey: info.ChannelIsMultiKey, UsingKey: info.ApiKey, AutoBan: true}
+				const reason = "Provider rejected authentication or account quota"
+				targetScope := "key"
+				var changed bool
 				if failure.Class == "account_quota" {
-					key = ""
-					index = -1
+					targetScope = "provider"
+					changed = service.DisableProvider(providerError, reason, index)
+				} else {
+					changed = service.DisableChannel(providerError, reason, index)
 				}
-				changed := service.DisableChannel(types.ProviderError{ChannelId: selection.Channel.ProviderID, ChannelName: selection.Provider.Name,
-					IsMultiKey: info.ChannelIsMultiKey, UsingKey: key, AutoBan: true}, "Provider rejected authentication or account quota", index)
 				actorRole := c.GetInt("role")
 				if actorRole == 0 {
 					if actor, err := model.GetUserCache(c.GetInt("id")); err == nil {
@@ -437,9 +441,9 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 					}
 				}
 				model.RecordAuditLog(c, model.AuditLog{UserId: c.GetInt("id"), ActorRole: actorRole, AuthMethod: "api_token", Category: model.AuditCategorySecurity,
-					Action: "provider.auto_disable", Success: changed, Content: "Provider rejected authentication or account quota",
+					Action: "provider.auto_disable", Success: changed, Content: reason,
 					Other: model.AuditOther{Op: &model.AuditOperation{Action: "provider.auto_disable"}, RootInfo: model.AuditFields{
-						"provider_id": selection.Channel.ProviderID, "channel_id": selection.Channel.ID, "key_index": index, "error_class": failure.Class}}})
+						"provider_id": selection.Channel.ProviderID, "channel_id": selection.Channel.ID, "key_index": index, "error_class": failure.Class, "target_scope": targetScope}}})
 			}
 			result = service.GatewayAttemptResult{Attempt: attempt, Failure: failure, Delivered: info.ResponseFacts.BusinessOutput,
 				FirstByte: firstByte, HealthLease: selection.Admission.Lease}

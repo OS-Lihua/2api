@@ -289,8 +289,13 @@ func (channel *Provider) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 	}
 }
 
+// SaveProviderInfo persists the polling cursor without replacing credential
+// status written by another node after this Provider snapshot was loaded.
 func (channel *Provider) SaveProviderInfo() error {
-	return DB.Model(channel).Update("channel_info", channel.ProviderInfo).Error
+	return DB.Model(&Provider{}).
+		Where(`"id" = ? AND "key" = ? AND "channel_info"::jsonb ->> 'is_multi_key' = 'true' AND "channel_info"::jsonb ->> 'multi_key_mode' = ?`,
+			channel.Id, channel.Key, constant.MultiKeyModePolling).
+		Update("channel_info", gorm.Expr(`jsonb_set("channel_info"::jsonb, '{multi_key_polling_index}', to_jsonb(?::integer), true)::json`, channel.ProviderInfo.MultiKeyPollingIndex)).Error
 }
 
 func (channel *Provider) GetModels() []string {
@@ -642,68 +647,66 @@ func CleanupProviderPollingLocks() {
 	})
 }
 
-func handlerMultiKeyUpdate(channel *Provider, usingKey string, status int, reason string, selectedIndex ...int) bool {
+func handlerMultiKeyUpdate(channel *Provider, change ProviderStatusChange) bool {
 	keys := channel.GetKeys()
-	if len(keys) == 0 {
-		channel.Status = status
-	} else {
-		keyIndex := -1
-		if len(selectedIndex) > 0 && usingKey != "" {
-			index := selectedIndex[0]
-			if index < 0 || index >= len(keys) || keys[index] != usingKey {
-				return false
-			}
-			keyIndex = index
-		} else {
-			for i, key := range keys {
-				if key == usingKey {
-					keyIndex = i
-					break
-				}
+	keyIndex := -1
+	if change.KeyIndex != nil {
+		index := *change.KeyIndex
+		if index < 0 || index >= len(keys) || keys[index] != change.UsingKey {
+			return false
+		}
+		keyIndex = index
+	} else if change.UsingKey != "" {
+		for i, key := range keys {
+			if key == change.UsingKey {
+				keyIndex = i
+				break
 			}
 		}
 		if keyIndex < 0 {
-			if usingKey != "" {
-				common.SysLog(common.LogText("failed to update multi-key status: channel_id=%d, using key not found", channel.Id))
-				return false
-			}
-			channel.Status = status
-			info := channel.GetOtherInfo()
-			info["status_reason"] = reason
-			info["status_time"] = common.GetTimestamp()
-			channel.SetOtherInfo(info)
-			return true
+			common.SysLog(common.LogText("failed to update multi-key status: channel_id=%d, using key not found", channel.Id))
+			return false
 		}
-		if status == common.ChannelStatusAutoDisabled {
-			if current, exists := channel.ProviderInfo.MultiKeyStatusList[keyIndex]; exists && current != common.ChannelStatusEnabled {
-				return false
-			}
+	}
+	if keyIndex >= 0 {
+		if current, exists := channel.ProviderInfo.MultiKeyStatusList[keyIndex]; exists &&
+			(change.Status == common.ChannelStatusAutoDisabled && current != common.ChannelStatusEnabled ||
+				change.Status == common.ChannelStatusEnabled && current == common.ChannelStatusManuallyDisabled) {
+			return false
 		}
-		if channel.ProviderInfo.MultiKeyStatusList == nil {
-			channel.ProviderInfo.MultiKeyStatusList = make(map[int]int)
+	}
+	if keyIndex < 0 || change.ProviderWide {
+		channel.Status = change.Status
+		info := channel.GetOtherInfo()
+		info["status_reason"] = change.Reason
+		info["status_time"] = common.GetTimestamp()
+		channel.SetOtherInfo(info)
+		return true
+	}
+	if channel.ProviderInfo.MultiKeyStatusList == nil {
+		channel.ProviderInfo.MultiKeyStatusList = make(map[int]int)
+	}
+	if change.Status == common.ChannelStatusEnabled {
+		delete(channel.ProviderInfo.MultiKeyStatusList, keyIndex)
+	} else {
+		channel.ProviderInfo.MultiKeyStatusList[keyIndex] = change.Status
+		if channel.ProviderInfo.MultiKeyDisabledReason == nil {
+			channel.ProviderInfo.MultiKeyDisabledReason = make(map[int]string)
 		}
-		if status == common.ChannelStatusEnabled {
-			delete(channel.ProviderInfo.MultiKeyStatusList, keyIndex)
-		} else {
-			channel.ProviderInfo.MultiKeyStatusList[keyIndex] = status
-			if channel.ProviderInfo.MultiKeyDisabledReason == nil {
-				channel.ProviderInfo.MultiKeyDisabledReason = make(map[int]string)
-			}
-			if channel.ProviderInfo.MultiKeyDisabledTime == nil {
-				channel.ProviderInfo.MultiKeyDisabledTime = make(map[int]int64)
-			}
-			channel.ProviderInfo.MultiKeyDisabledReason[keyIndex] = reason
-			channel.ProviderInfo.MultiKeyDisabledTime[keyIndex] = common.GetTimestamp()
+		if channel.ProviderInfo.MultiKeyDisabledTime == nil {
+			channel.ProviderInfo.MultiKeyDisabledTime = make(map[int]int64)
 		}
-		if !hasEnabledMultiKey(keys, channel.ProviderInfo.MultiKeyStatusList) {
-			channel.Status = common.ChannelStatusAutoDisabled
-			info := channel.GetOtherInfo()
-			info["status_reason"] = ProviderStatusReasonAllKeysDisabled
-			info["status_time"] = common.GetTimestamp()
-			channel.SetOtherInfo(info)
-		} else if status == common.ChannelStatusEnabled {
-			channel.Status = common.ChannelStatusEnabled
-		}
+		channel.ProviderInfo.MultiKeyDisabledReason[keyIndex] = change.Reason
+		channel.ProviderInfo.MultiKeyDisabledTime[keyIndex] = common.GetTimestamp()
+	}
+	if !hasEnabledMultiKey(keys, channel.ProviderInfo.MultiKeyStatusList) {
+		channel.Status = common.ChannelStatusAutoDisabled
+		info := channel.GetOtherInfo()
+		info["status_reason"] = ProviderStatusReasonAllKeysDisabled
+		info["status_time"] = common.GetTimestamp()
+		channel.SetOtherInfo(info)
+	} else if change.Status == common.ChannelStatusEnabled {
+		channel.Status = common.ChannelStatusEnabled
 	}
 	return true
 }
@@ -723,6 +726,16 @@ func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
 
 var ErrProviderStatusConflict = errors.New("provider changed during status update")
 
+// ProviderStatusChange keeps the failed credential identity separate from the
+// scope of the transition. KeyIndex also pins a credential whose value is empty.
+type ProviderStatusChange struct {
+	Status       int
+	Reason       string
+	UsingKey     string
+	KeyIndex     *int
+	ProviderWide bool
+}
+
 func UpdateProviderStatus(channelId int, usingKey string, status int, reason string, selectedIndex ...int) bool {
 	changed, _ := UpdateProviderStatusWithError(channelId, usingKey, status, reason, selectedIndex...)
 	return changed
@@ -731,6 +744,18 @@ func UpdateProviderStatus(channelId int, usingKey string, status int, reason str
 // UpdateProviderStatusWithError distinguishes an idempotent no-op from a
 // rejected or failed write so management replies can report the actual outcome.
 func UpdateProviderStatusWithError(channelId int, usingKey string, status int, reason string, selectedIndex ...int) (bool, error) {
+	change := ProviderStatusChange{Status: status, Reason: reason, UsingKey: usingKey}
+	if usingKey != "" && len(selectedIndex) > 0 {
+		change.KeyIndex = &selectedIndex[0]
+	}
+	return ApplyProviderStatus(channelId, change)
+}
+
+// ApplyProviderStatus atomically validates the captured credential and applies
+// either a Key or whole-Provider transition.
+func ApplyProviderStatus(channelId int, change ProviderStatusChange) (bool, error) {
+	status, reason, usingKey := change.Status, change.Reason, change.UsingKey
+	hasCredential := usingKey != "" || change.KeyIndex != nil
 	if common.MemoryCacheEnabled {
 		channelStatusLock.Lock()
 		defer channelStatusLock.Unlock()
@@ -753,7 +778,8 @@ func UpdateProviderStatusWithError(channelId int, usingKey string, status int, r
 			return err
 		}
 		channel := &snapshot.Provider
-		if status == common.ChannelStatusAutoDisabled && channel.Status != common.ChannelStatusEnabled {
+		if status == common.ChannelStatusAutoDisabled && channel.Status != common.ChannelStatusEnabled ||
+			hasCredential && status == common.ChannelStatusEnabled && channel.Status == common.ChannelStatusManuallyDisabled {
 			return nil
 		}
 		before := *channel
@@ -761,7 +787,7 @@ func UpdateProviderStatusWithError(channelId int, usingKey string, status int, r
 		beforeProvider = &before
 		committedProvider = channel
 		beforeStatus, beforeOtherInfo := channel.Status, channel.OtherInfo
-		overridesKeyExhaustion := channel.ProviderInfo.IsMultiKey && usingKey == "" &&
+		overridesKeyExhaustion := channel.ProviderInfo.IsMultiKey && !hasCredential &&
 			status == common.ChannelStatusManuallyDisabled && reason != ProviderStatusReasonAllKeysDisabled &&
 			channel.GetOtherInfo()["status_reason"] == ProviderStatusReasonAllKeysDisabled
 		if channel.Status == status && !overridesKeyExhaustion {
@@ -769,11 +795,11 @@ func UpdateProviderStatusWithError(channelId int, usingKey string, status int, r
 		}
 
 		if channel.ProviderInfo.IsMultiKey {
-			if !handlerMultiKeyUpdate(channel, usingKey, status, reason, selectedIndex...) {
+			if !handlerMultiKeyUpdate(channel, change) {
 				return nil
 			}
 		} else {
-			if usingKey != "" && (channel.Key != usingKey || len(selectedIndex) > 0 && selectedIndex[0] != 0) {
+			if hasCredential && (channel.Key != usingKey || change.KeyIndex != nil && *change.KeyIndex != 0) {
 				return nil
 			}
 			info := channel.GetOtherInfo()
@@ -812,7 +838,7 @@ func UpdateProviderStatusWithError(channelId int, usingKey string, status int, r
 		common.SysLog(common.LogText("failed to update channel status: channel_id=%d, status=%d, error=%v", channelId, status, err))
 		return false, err
 	}
-	if common.MemoryCacheEnabled && (changed || usingKey == "" && committedProvider != nil) {
+	if common.MemoryCacheEnabled && (changed || !hasCredential && committedProvider != nil) {
 		cacheProviderStatusTransition(beforeProvider, committedProvider)
 	}
 	return changed, nil

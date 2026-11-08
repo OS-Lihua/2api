@@ -338,16 +338,19 @@ func TestTextGatewayAutomaticallyDisablesSelectedProviderKey(t *testing.T) {
 		name   string
 		rotate bool
 		single bool
+		quota  bool
 	}{
-		{"unchanged", false, false},
-		{"rotated", true, false},
-		{"removed slot", false, true},
+		{"unchanged", false, false, false},
+		{"rotated", true, false, false},
+		{"removed slot", false, true, false},
+		{"account quota", false, false, true},
+		{"account quota rotated", true, false, true},
 	} {
-		t.Run(tc.name, func(t *testing.T) { testGatewayAutomaticDisable(t, tc.rotate, tc.single) })
+		t.Run(tc.name, func(t *testing.T) { testGatewayAutomaticDisable(t, tc.rotate, tc.single, tc.quota) })
 	}
 }
 
-func testGatewayAutomaticDisable(t *testing.T, rotated, single bool) {
+func testGatewayAutomaticDisable(t *testing.T, rotated, single, quota bool) {
 	var selectedProviderID int
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		if rotated {
@@ -361,6 +364,12 @@ func testGatewayAutomaticDisable(t *testing.T, rotated, single bool) {
 			}).Error; err != nil {
 				t.Error(err)
 			}
+		}
+		if quota {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"message":"quota exhausted","type":"insufficient_quota","code":"insufficient_quota"}}`)
+			return
 		}
 		w.WriteHeader(http.StatusUnauthorized)
 	})
@@ -384,8 +393,12 @@ func testGatewayAutomaticDisable(t *testing.T, rotated, single bool) {
 	fixture.engine.ServeHTTP(response, request)
 	stored, err := model.GetProviderById(provider.Id, true)
 	require.NoError(t, err)
-	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
-	if rotated || single {
+	if quota && !rotated && !single {
+		assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+	} else {
+		assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	}
+	if rotated || single || quota {
 		assert.Empty(t, stored.ProviderInfo.MultiKeyStatusList)
 	} else {
 		assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ProviderInfo.MultiKeyStatusList[1])
@@ -406,6 +419,14 @@ func testGatewayAutomaticDisable(t *testing.T, rotated, single bool) {
 		if entry.Action == "provider.auto_disable" {
 			found = true
 			assert.Equal(t, !rotated && !single, entry.Success, "audit reports the actual Key transition outcome")
+			rootInfo, err := common.Marshal(entry.Other.RootInfo)
+			require.NoError(t, err)
+			expectedScope := "key"
+			if quota {
+				expectedScope = "provider"
+				assert.Contains(t, string(rootInfo), `"error_class":"account_quota"`)
+			}
+			assert.Contains(t, string(rootInfo), `"target_scope":"`+expectedScope+`"`)
 		}
 	}
 	assert.True(t, found)
@@ -413,15 +434,15 @@ func testGatewayAutomaticDisable(t *testing.T, rotated, single bool) {
 
 func TestTextGatewayReplacementKeySurvivesConcurrentAutoDisable(t *testing.T) {
 	for _, cached := range []bool{false, true} {
-		t.Run(fmt.Sprint("cache=", cached), func(t *testing.T) {
-			testGatewayReplacementKeySurvivesConcurrentAutoDisable(t, cached)
-		})
+		for _, quota := range []bool{false, true} {
+			t.Run(fmt.Sprint("cache=", cached, "/quota=", quota), func(t *testing.T) {
+				testGatewayReplacementKeySurvivesConcurrentAutoDisable(t, cached, quota)
+			})
+		}
 	}
 }
 
-func testGatewayReplacementKeySurvivesConcurrentAutoDisable(t *testing.T, cached bool) {
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
+func testGatewayReplacementKeySurvivesConcurrentAutoDisable(t *testing.T, cached, quota bool) {
 	arrived := make(chan struct{})
 	release := make(chan struct{})
 	var releaseOnce sync.Once
@@ -441,7 +462,13 @@ func testGatewayReplacementKeySurvivesConcurrentAutoDisable(t *testing.T, cached
 		close(arrived)
 		select {
 		case <-release:
-			w.WriteHeader(http.StatusUnauthorized)
+			if quota {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = io.WriteString(w, `{"error":{"message":"quota exhausted","type":"insufficient_quota","code":"insufficient_quota"}}`)
+			} else {
+				w.WriteHeader(http.StatusUnauthorized)
+			}
 		case <-r.Context().Done():
 		}
 	})
@@ -455,11 +482,14 @@ func testGatewayReplacementKeySurvivesConcurrentAutoDisable(t *testing.T, cached
 	provider.ProviderInfo = model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}
 	require.NoError(t, model.DB.Model(provider).Select("key", "auto_ban", "channel_info").Updates(provider).Error)
 	common.MemoryCacheEnabled = cached
+	model.CacheUpdateProvider(provider)
 	model.InitProviderCache()
 	var admin model.User
 	require.NoError(t, model.DB.Where("username = ?", "security-admin").First(&admin).Error)
 	require.NoError(t, model.DB.Model(&admin).Update("role", common.RoleRootUser).Error)
 	adminPAT := createWalletTestAccessToken(t, admin.Id, "channel:read", "channel:write", "channel:sensitive_write", "channel:operate")
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
 	gatewayDone := make(chan *httptest.ResponseRecorder, 1)
 	defer func() {
 		cancel()
@@ -534,6 +564,9 @@ func testGatewayReplacementKeySurvivesConcurrentAutoDisable(t *testing.T, cached
 	keys := adminSecurityRequest(fixture.engine, adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/providers/%d/keys", provider.Id), "")
 	require.Equal(t, http.StatusOK, keys.Code)
 	assert.Contains(t, keys.Body.String(), `"auto_disabled_count":0`, "a failure for the old Key must not disable its replacement")
+	read := adminSecurityRequest(fixture.engine, adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/providers/%d", provider.Id), "")
+	require.Equal(t, http.StatusOK, read.Code)
+	assert.Contains(t, read.Body.String(), `"status":1`, "an old account quota failure must not disable the replacement Provider")
 	logs, _, err := model.GetAuditLogs(model.AuditLogFilter{Category: model.AuditCategorySecurity}, 0, 100, common.RoleRootUser)
 	require.NoError(t, err)
 	found := false
@@ -817,6 +850,135 @@ func TestProviderBatchStatusFailureRecordsCommittedTargets(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "partial failure must retain the actual committed and rejected targets")
+}
+
+func TestTextGatewayPollingSnapshotPreservesCommittedKeyDisable(t *testing.T) {
+	var calls atomic.Int32
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			assert.Equal(t, "Bearer old-test-key", r.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		assert.Equal(t, "Bearer spare-test-key", r.Header.Get("Authorization"), "a polling snapshot must not restore the rejected Key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"polling","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	})
+	previous := common.AutomaticDisableChannelEnabled
+	common.AutomaticDisableChannelEnabled = true
+	t.Cleanup(func() { common.AutomaticDisableChannelEnabled = previous })
+	provider, err := model.GetProviderById(fixture.channel.ProviderID, true)
+	require.NoError(t, err)
+	provider.Key = "old-test-key\nspare-test-key"
+	provider.AutoBan = common.GetPointer(1)
+	provider.ProviderInfo = model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}
+	require.NoError(t, model.DB.Model(provider).Select("key", "auto_ban", "channel_info").Updates(provider).Error)
+	// Another node can retain this independently loaded snapshot while the
+	// gateway commits a Key disable. Exercise its public polling operation next.
+	pollingSnapshot, err := model.GetProviderById(provider.Id, true)
+	require.NoError(t, err)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	require.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
+	_, _, pollingErr := pollingSnapshot.GetNextEnabledKey()
+	require.Nil(t, pollingErr)
+	var admin model.User
+	require.NoError(t, model.DB.Where("username = ?", "security-admin").First(&admin).Error)
+	adminPAT := createWalletTestAccessToken(t, admin.Id, "channel:read", "channel:operate")
+	keys := adminSecurityRequest(fixture.engine, adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/providers/%d/keys", provider.Id), "")
+	require.Equal(t, http.StatusOK, keys.Code, keys.Body.String())
+	assert.Contains(t, keys.Body.String(), `"auto_disabled_count":1`, "cursor persistence must preserve a newer committed Key status")
+	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.EqualValues(t, 2, calls.Load())
+}
+
+func TestTextGatewayManualDisableWinsOverLateCredentialRecovery(t *testing.T) {
+	for _, keyOnly := range []bool{false, true} {
+		t.Run(fmt.Sprint("key=", keyOnly), func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"late","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+			})
+			provider, err := model.GetProviderById(fixture.channel.ProviderID, true)
+			require.NoError(t, err)
+			provider.Status = common.ChannelStatusAutoDisabled
+			provider.ProviderInfo = model.ProviderInfo{IsMultiKey: keyOnly, MultiKeySize: 1, MultiKeyMode: constant.MultiKeyModePolling,
+				MultiKeyStatusList: map[int]int{0: common.ChannelStatusAutoDisabled}}
+			require.NoError(t, model.DB.Model(provider).Select("status", "channel_info").Updates(provider).Error)
+			common.MemoryCacheEnabled = true
+			model.CacheUpdateProvider(provider)
+			model.InitProviderCache()
+			var admin model.User
+			require.NoError(t, model.DB.Where("username = ?", "security-admin").First(&admin).Error)
+			adminPAT := createWalletTestAccessToken(t, admin.Id, "channel:read", "channel:operate")
+			path := fmt.Sprintf("/api/admin/v1/providers/%d/disable", provider.Id)
+			if keyOnly {
+				path = fmt.Sprintf("/api/admin/v1/providers/%d/keys/0/disable", provider.Id)
+			}
+			response := adminSecurityRequest(fixture.engine, adminPAT, http.MethodPost, path, "")
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			// A previously started probe completes through the public recovery API
+			// after the administrator has already committed the manual disable.
+			service.EnableChannel(provider.Id, provider.Key, provider.Name)
+			if keyOnly {
+				read := adminSecurityRequest(fixture.engine, adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/providers/%d/keys", provider.Id), "")
+				assert.Contains(t, read.Body.String(), `"manual_disabled_count":1`)
+			} else {
+				read := adminSecurityRequest(fixture.engine, adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/providers/%d", provider.Id), "")
+				assert.Contains(t, read.Body.String(), `"status":2`)
+			}
+			response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			assert.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+			assert.Zero(t, calls.Load(), "late automatic recovery must not override manual intent")
+		})
+	}
+}
+
+func TestTextGatewaySingleKeyFailoverCapturesCurrentSlot(t *testing.T) {
+	var calls atomic.Int32
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		assert.Equal(t, "Bearer second-test-key", r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	previous := common.AutomaticDisableChannelEnabled
+	common.AutomaticDisableChannelEnabled = true
+	t.Cleanup(func() { common.AutomaticDisableChannelEnabled = previous })
+	first, err := model.GetProviderById(fixture.channel.ProviderID, true)
+	require.NoError(t, err)
+	first.Key = "first-test-key\nsecond-test-key"
+	first.AutoBan = common.GetPointer(1)
+	first.ProviderInfo = model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling, MultiKeyPollingIndex: 1}
+	require.NoError(t, model.DB.Model(first).Select("key", "auto_ban", "channel_info").Updates(first).Error)
+	second := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		assert.Equal(t, "Bearer additional-secret", r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", second.ProviderID).Update("auto_ban", 1).Error)
+	_ = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	assert.EqualValues(t, 2, calls.Load())
+	read := adminSecurityRequest(fixture.engine, fixture.adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/providers/%d", second.ProviderID), "")
+	require.Equal(t, http.StatusOK, read.Code, read.Body.String())
+	assert.Contains(t, read.Body.String(), `"status":3`, "the single-Key Provider must not inherit the previous Provider's slot index")
+	logs, _, err := model.GetAuditLogs(model.AuditLogFilter{Category: model.AuditCategorySecurity}, 0, 100, common.RoleRootUser)
+	require.NoError(t, err)
+	found := false
+	for _, entry := range logs {
+		if entry.Action == "provider.auto_disable" {
+			rootInfo, err := common.Marshal(entry.Other.RootInfo)
+			require.NoError(t, err)
+			if strings.Contains(string(rootInfo), fmt.Sprintf(`"provider_id":%d`, second.ProviderID)) {
+				found = true
+				assert.True(t, entry.Success)
+				assert.Contains(t, string(rootInfo), `"key_index":0`)
+				assert.Contains(t, string(rootInfo), `"target_scope":"key"`)
+			}
+		}
+	}
+	assert.True(t, found)
 }
 
 func TestTextGatewayCircuitUsesProviderFailuresEvenAtAttemptLimit(t *testing.T) {

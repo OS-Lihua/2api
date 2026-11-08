@@ -27,6 +27,16 @@ func shouldCloseActiveWebSocketsAfterDisable(channelId int) bool {
 
 // disable & notify
 func DisableChannel(channelError types.ProviderError, reason string, selectedIndex ...int) bool {
+	return disableProvider(channelError, reason, false, selectedIndex...)
+}
+
+// DisableProvider handles account-wide failures while retaining the credential
+// that produced the failure as a precondition of the transition.
+func DisableProvider(channelError types.ProviderError, reason string, selectedIndex ...int) bool {
+	return disableProvider(channelError, reason, true, selectedIndex...)
+}
+
+func disableProvider(channelError types.ProviderError, reason string, providerWide bool, selectedIndex ...int) bool {
 	common.SysLog(common.LogText("channel %q (#%d) failed, disabling it, reason: %s", channelError.ChannelName, channelError.ChannelId, common.LocalLogPreview(reason)))
 
 	// 检查是否启用自动禁用功能
@@ -35,7 +45,12 @@ func DisableChannel(channelError types.ProviderError, reason string, selectedInd
 		return false
 	}
 
-	success := model.UpdateProviderStatus(channelError.ChannelId, channelError.UsingKey, common.ChannelStatusAutoDisabled, reason, selectedIndex...)
+	change := model.ProviderStatusChange{Status: common.ChannelStatusAutoDisabled, Reason: reason,
+		UsingKey: channelError.UsingKey, ProviderWide: providerWide}
+	if len(selectedIndex) > 0 {
+		change.KeyIndex = &selectedIndex[0]
+	}
+	success, _ := model.ApplyProviderStatus(channelError.ChannelId, change)
 	if success {
 		if shouldCloseActiveWebSocketsAfterDisable(channelError.ChannelId) {
 			CloseActiveWebSocketsForChannel(channelError.ChannelId, ChannelDisabledCloseReason)
@@ -48,8 +63,12 @@ func DisableChannel(channelError types.ProviderError, reason string, selectedInd
 	return success
 }
 
-func EnableChannel(channelId int, usingKey string, channelName string) {
-	success := model.UpdateProviderStatus(channelId, usingKey, common.ChannelStatusEnabled, "")
+func EnableChannel(channelId int, usingKey string, channelName string, selectedIndex ...int) {
+	change := model.ProviderStatusChange{Status: common.ChannelStatusEnabled, UsingKey: usingKey}
+	if len(selectedIndex) > 0 {
+		change.KeyIndex = &selectedIndex[0]
+	}
+	success, _ := model.ApplyProviderStatus(channelId, change)
 	if success {
 		params := map[string]any{"Name": channelName, "Id": channelId}
 		NotifyChannelWatchers(formatNotifyType(channelId, common.ChannelStatusEnabled), func(lang string) (string, string) {
