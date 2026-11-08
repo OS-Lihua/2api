@@ -314,9 +314,14 @@ estimated-usage branches. It never stores raw probe values. Settlement supplies
 that snapshot through `RequestInput.MoneySnapshot`; measured `u()` conditions
 still evaluate against completion facts. Sale decisions use the original client
 request, and purchase decisions use the final upstream body and headers.
+Recovery sets `RequireMoneySnapshot`; a missing snapshot for an expression using
+request probes fails evaluation instead of reading an empty request. Expressions
+without request probes remain recoverable from their quantitative facts alone.
 
 This durable mode requires every `param()` / `header()` call to be enclosed by
-an independent boolean predicate. For example, a header predicate combined with
+an independent, self-contained boolean predicate. Predicates that depend on
+local variables or collection-predicate pointers cannot be captured separately
+and are rejected at save time. For example, a header predicate combined with
 `u("seconds") > 2` is supported: only the header decision is frozen. A direct
 comparison between a private probe and mutable usage, or a raw probe used as an
 amount, cannot be replayed without retaining input values and is rejected by

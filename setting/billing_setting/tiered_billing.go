@@ -261,6 +261,23 @@ func SmokeTestTaskExpr(exprStr string, schema map[string]jsplugin.UsageFieldSche
 	return nil
 }
 
+// SmokeTestTaskMoneyExpr validates price versions with the exact task evaluator,
+// including scalar aliases that read the current vector's measured quantities.
+func SmokeTestTaskMoneyExpr(exprStr string, schema map[string]jsplugin.UsageFieldSchema) error {
+	if err := SmokeTestTaskExpr(exprStr, schema); err != nil {
+		return err
+	}
+	for _, usage := range taskUsageSmokeVectors(schema) {
+		for _, request := range billingExprSmokeRequests() {
+			request.Usage = usage
+			if _, _, err := billingexpr.RunMoneyExpr(exprStr, billingexpr.MoneyInput{TaskUsage: true, Request: request}, "USD"); err != nil {
+				return fmt.Errorf("task price validation failed: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
 type usageSmokeDimension struct {
 	name   string
 	values []any

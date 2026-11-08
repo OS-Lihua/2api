@@ -151,6 +151,7 @@ type TaskAdaptor struct {
 	// the relayed events of a submission whose stream stopped before the
 	// upstream finished it, or whose result the plugin could not read: the
 	// task then settles at the reserved quota.
+	requestDecoded    bool
 	keepReservation   bool
 	submissionWritten atomic.Bool
 }
@@ -158,7 +159,12 @@ type TaskAdaptor struct {
 func New(plugin *pluginruntime.LoadedPlugin) *TaskAdaptor { return &TaskAdaptor{plugin: plugin} }
 func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo)   { a.info = info }
 
-func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskError {
+// DecodeRequestAndSetAction selects the executing plugin's normalized request
+// without building a descriptor or exchanging credentials.
+func (a *TaskAdaptor) DecodeRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskError {
+	if a.requestDecoded {
+		return nil
+	}
 	if pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedEndpoint); exists {
 		if pinned, ok := pinnedValue.(pluginruntime.PinnedEndpoint); ok && pinned.Plugin == a.plugin {
 			if protocolValue, present := c.Get(pluginruntime.ContextKeyProtocolRequest); present {
@@ -223,6 +229,14 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 				}
 			}
 		}
+	}
+	a.requestDecoded = true
+	return nil
+}
+
+func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskError {
+	if taskErr := a.DecodeRequestAndSetAction(c, info); taskErr != nil {
+		return taskErr
 	}
 	if _, exists := c.Get("task_request"); !exists {
 		if taskErr := relaycommon.ValidateBasicTaskRequest(c, info, "image_to_video"); taskErr != nil {

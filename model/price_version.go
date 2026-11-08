@@ -257,7 +257,7 @@ func validateTaskPriceSchema(expression string, schema map[string]jsplugin.Usage
 	if validated[key] {
 		return nil
 	}
-	if err := billing_setting.SmokeTestTaskExpr(expression, schema); err != nil {
+	if err := billing_setting.SmokeTestTaskMoneyExpr(expression, schema); err != nil {
 		return common.NewMessage("Invalid price expression")
 	}
 	validated[key] = true

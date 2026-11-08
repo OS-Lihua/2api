@@ -112,6 +112,7 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 	var acceptedInfo *relaycommon.RelayInfo
 	var pending *model.Task
 	var previousAttempts []model.GatewayAttempt
+	attemptTraces := make(map[string]billingexpr.MoneyTraceResult)
 	publicTaskID := model.GenerateTaskID()
 	upstreamAccepted := false
 	var lastStatus = http.StatusServiceUnavailable
@@ -208,9 +209,24 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 		} else {
 			delete(c.Keys, jsplugin.ContextKeyRequestBodyText)
 		}
+		info.Action = c.GetString("task_action")
+		info.UpstreamModelName = selected.UpstreamModelName
+		if len(origins) > 0 {
+			info.UpstreamModelName = origins[0].Properties.UpstreamModelName
+			info.OriginTaskID = origins[0].GetUpstreamTaskID()
+			for _, origin := range origins {
+				info.OriginTasks = append(info.OriginTasks, relaycommon.OriginTaskRef{TaskID: origin.TaskID, UpstreamTaskID: origin.GetUpstreamTaskID(), Action: origin.Action, Status: string(origin.Status), Data: origin.Data})
+			}
+		}
+		adaptor := taskplugin.New(pin.Plugin)
+		adaptor.Init(info)
+		if taskErr := adaptor.DecodeRequestAndSetAction(c, info); taskErr != nil {
+			lastStatus, lastCode = taskErr.StatusCode, "invalid_request"
+			return
+		}
 		if len(overrides) > 0 {
-			body := originalTaskRequest
-			if !hasTaskRequest {
+			body, exists := c.Get("task_request")
+			if !exists {
 				value, _ := c.Get(jsplugin.ContextKeyRouteRequest)
 				route, ok := value.(jsplugin.RouteRequestContext)
 				if !ok {
@@ -221,6 +237,11 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 			encoded, err := common.Marshal(body)
 			if err != nil {
 				return
+			}
+			if text, exists := c.Get(jsplugin.ContextKeyRequestBodyText); exists && pin.Plugin.Meta.PreservesJSONOrder() {
+				if raw, ok := text.(json.RawMessage); ok {
+					encoded = append([]byte(nil), raw...)
+				}
 			}
 			encoded, err = relaycommon.ApplyParamOverrideWithRelayInfo(encoded, info)
 			if err != nil {
@@ -236,17 +257,6 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 			c.Set("task_request", effective)
 			c.Set(jsplugin.ContextKeyRequestBodyText, json.RawMessage(encoded))
 		}
-		info.Action = c.GetString("task_action")
-		info.UpstreamModelName = selected.UpstreamModelName
-		if len(origins) > 0 {
-			info.UpstreamModelName = origins[0].Properties.UpstreamModelName
-			info.OriginTaskID = origins[0].GetUpstreamTaskID()
-			for _, origin := range origins {
-				info.OriginTasks = append(info.OriginTasks, relaycommon.OriginTaskRef{TaskID: origin.TaskID, UpstreamTaskID: origin.GetUpstreamTaskID(), Action: origin.Action, Status: string(origin.Status), Data: origin.Data})
-			}
-		}
-		adaptor := taskplugin.New(pin.Plugin)
-		adaptor.Init(info)
 		info.BeginProviderCall = budget.Start
 		info.ResponseFacts = &relaycommon.ResponseFacts{OnBusinessOutput: budget.Delivered}
 		facts, err := adaptor.ExtractUsageFactsValidated(c, info)
@@ -339,12 +349,14 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 		c.Request = parent.WithContext(attemptContext)
 		defer func() { c.Request = parent }()
 		attempt := &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: requestID, ChannelID: selected.ID, ProviderID: provider.Id, ModelID: selected.ModelID, StartedAt: attemptStart.UnixMilli(), PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, AccountingFXRate: rate, Cost: money.Amount{Currency: purchase.Currency}, ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, UsageSource: "none", Status: "failed", ConversionLosses: []string{}, RouteDiagnostics: map[string]any{}}
+		attempt.Usage.TaskFacts = maps.Clone(facts)
+		attempt.UsageSource = "estimated"
 		for _, member := range offering.Members {
 			if member.ModelID == selected.ModelID {
 				attempt.MemberTier = member.Tier
 			}
 		}
-		snapshot := &model.TaskGatewaySnapshot{ProviderType: info.ChannelType, ChannelID: selected.ID, ProviderID: provider.Id, Facts: facts, SaleSource: saleSource, SaleConditions: pending.PrivateData.Gateway.SaleConditions, PreviousAttempts: append([]model.GatewayAttempt(nil), previousAttempts...), Settlement: model.GatewaySettlement{Request: *record, Attempt: attempt}}
+		snapshot := &model.TaskGatewaySnapshot{ProviderType: info.ChannelType, ChannelID: selected.ID, ProviderID: provider.Id, Facts: facts, SaleSource: saleSource, SaleConditions: pending.PrivateData.Gateway.SaleConditions, PreviousAttempts: append([]model.GatewayAttempt(nil), previousAttempts...), Settlement: model.GatewaySettlement{Request: *record, Attempt: attempt, AttemptTrace: attemptTraces}}
 		pending.ChannelId = info.ChannelId
 		pending.Properties.UpstreamModelName = info.UpstreamModelName
 		pending.PrivateData.Gateway = snapshot
@@ -365,6 +377,7 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 				err = evalErr
 				if err == nil {
 					snapshot.PurchaseConditions = trace.RequestSnapshot
+					attemptTraces[attempt.ID] = billingexpr.MoneyTraceResult{Currency: purchase.Currency, RequestSnapshot: trace.RequestSnapshot}
 					err = pending.Update()
 				}
 			}
@@ -491,7 +504,7 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 			_ = pending.Update()
 		}
 		record.EndedAt = clock.Now().UnixMilli()
-		intent := model.GatewaySettlement{Request: *record, Attempts: attempts, SaleSource: money.Amount{Currency: sale.Currency}}
+		intent := model.GatewaySettlement{Request: *record, Attempts: attempts, AttemptTrace: attemptTraces, SaleSource: money.Amount{Currency: sale.Currency}}
 		for _, attempt := range attempts {
 			if attempt.CostPending || attempt.ConvertedCostPending {
 				intent.EvaluationFailed = true

@@ -90,6 +90,9 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 	if input.TaskUsage && entry.sourceVars["fixed"] {
 		return money.Value{}, trace, fmt.Errorf("fixed pricing is not supported for task usage expressions")
 	}
+	if input.Request.RequireMoneySnapshot && input.Request.MoneySnapshot == nil && (entry.sourceVars["param"] || entry.sourceVars["header"]) {
+		return money.Value{}, trace, fmt.Errorf("frozen pricing context is unavailable")
+	}
 	if input.Request.MoneySnapshot != nil && input.Request.MoneySnapshot.ExpressionHash != ExprHashString(expression) {
 		return money.Value{}, trace, fmt.Errorf("frozen pricing context does not match its expression")
 	}

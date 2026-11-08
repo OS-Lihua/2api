@@ -115,6 +115,13 @@ func moneyRequestPredicates(body string) (map[string]ast.Node, error) {
 		return nil, err
 	}
 	ast.Walk(&tree.Node, moneyConditionLiterals(literalText))
+	locals := make(map[string]bool)
+	ast.Find(tree.Node, func(node ast.Node) bool {
+		if declaration, ok := node.(*ast.VariableDeclaratorNode); ok {
+			locals[declaration.Name] = true
+		}
+		return false
+	})
 	conditions := moneyBooleanExpressions(tree.Node)
 	predicates := make(map[string]ast.Node)
 	covered := make(map[file.Location]bool)
@@ -123,11 +130,17 @@ func moneyRequestPredicates(body string) (map[string]ast.Node, error) {
 			continue
 		}
 		measured := ast.Find(condition, func(node ast.Node) bool {
+			if _, scoped := node.(*ast.PointerNode); scoped {
+				return true
+			}
 			if call, ok := node.(*ast.CallNode); ok {
 				name, ok := call.Callee.(*ast.IdentifierNode)
 				return ok && name.Value == "u"
 			}
 			if name, ok := node.(*ast.IdentifierNode); ok {
+				if locals[name.Value] {
+					return true
+				}
 				switch name.Value {
 				case "p", "c", "len", "cr", "cc", "cc1h", "cc12h", "img", "img_cr", "img_o", "ai", "ao", "image_count":
 					return true

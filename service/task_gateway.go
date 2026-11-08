@@ -216,7 +216,7 @@ func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 		trace := billingexpr.MoneyTraceResult{Currency: request.SaleCurrency}
 		if saleErr == nil {
 			price := &model.PriceVersion{Expression: request.SaleExpression, Currency: request.SaleCurrency}
-			source, converted, evaluated, err := GatewayPrice(price, nil, billingexpr.RequestInput{Usage: facts, MoneySnapshot: snapshot.SaleConditions}, time.UnixMilli(request.StartedAt), ratio, fx)
+			source, converted, evaluated, err := GatewayPrice(price, nil, billingexpr.RequestInput{Usage: facts, MoneySnapshot: snapshot.SaleConditions, RequireMoneySnapshot: true}, time.UnixMilli(request.StartedAt), ratio, fx)
 			trace, saleErr = evaluated, err
 			if saleErr == nil {
 				intent.SaleSource, saleErr = source.Receivable()
@@ -226,6 +226,7 @@ func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 			}
 		}
 		trace.MatchedTier = ""
+		trace.RequestSnapshot = snapshot.SaleConditions
 		intent.SaleTrace = &trace
 		if saleErr != nil {
 			request.SalePending = true
@@ -259,9 +260,14 @@ func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 		}
 	}
 	purchase := &model.PriceVersion{Expression: attempt.PurchaseExpression, Currency: attempt.Cost.Currency}
-	cost, converted, trace, priceErr := GatewayPrice(purchase, nil, billingexpr.RequestInput{Usage: costFacts, MoneySnapshot: snapshot.PurchaseConditions}, time.UnixMilli(attempt.StartedAt), decimal.NewFromInt(1), purchaseFX)
+	cost, converted, trace, priceErr := GatewayPrice(purchase, nil, billingexpr.RequestInput{Usage: costFacts, MoneySnapshot: snapshot.PurchaseConditions, RequireMoneySnapshot: true}, time.UnixMilli(attempt.StartedAt), decimal.NewFromInt(1), purchaseFX)
 	trace.MatchedTier = ""
-	intent.AttemptTrace = map[string]billingexpr.MoneyTraceResult{attempt.ID: trace}
+	trace.RequestSnapshot = snapshot.PurchaseConditions
+	intent.AttemptTrace = maps.Clone(intent.AttemptTrace)
+	if intent.AttemptTrace == nil {
+		intent.AttemptTrace = make(map[string]billingexpr.MoneyTraceResult)
+	}
+	intent.AttemptTrace[attempt.ID] = trace
 	originalCost, originalErr := cost.Cost()
 	attempt.CostPending = originalErr != nil || originalCost.Currency != purchase.Currency
 	if !attempt.CostPending {
