@@ -56,7 +56,13 @@ func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayIn
 
 	// 同步扩展字段的厂商自定义metadata
 	if len(request.Metadata) > 0 {
-		if err := common.Unmarshal(request.Metadata, &minimaxRequest); err != nil {
+		var err error
+		if info.ResponseFacts != nil {
+			err = common.DecodeJsonStrict(bytes.NewReader(request.Metadata), &minimaxRequest)
+		} else {
+			err = common.Unmarshal(request.Metadata, &minimaxRequest)
+		}
+		if err != nil {
 			return nil, fmt.Errorf("error unmarshalling metadata to minimax request: %w", err)
 		}
 	}

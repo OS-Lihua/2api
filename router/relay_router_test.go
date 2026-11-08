@@ -4788,6 +4788,9 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 		hold           int64
 		extra          string
 	}{
+		{name: "MiniMax metadata output positive", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"max_new_tokens":16}`, reject: true},
+		{name: "MiniMax metadata output zero", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"max_new_tokens":0}`, reject: true},
+		{name: "MiniMax valid metadata", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"language_boost":"English"}`},
 		{name: "Volcengine metadata output positive", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"request":{"max_new_tokens":16}}`, reject: true},
 		{name: "Volcengine metadata output zero", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"request":{"max_new_tokens":0}}`, reject: true},
 		{name: "Volcengine metadata top output", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"max_new_tokens":16}`, reject: true},
@@ -4839,6 +4842,9 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 				require.NoError(t, common.DecodeJson(r.Body, &body))
 				encoded := ""
 				if tc.provider == constant.ChannelTypeMiniMax {
+					if strings.Contains(tc.extra, "language_boost") {
+						assert.Equal(t, "English", body["language_boost"])
+					}
 					settings := body["audio_setting"].(map[string]any)
 					assert.Equal(t, float64(24000), settings["sample_rate"])
 					assert.Equal(t, float64(1), settings["channel"])
