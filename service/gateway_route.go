@@ -188,12 +188,14 @@ func GatewayCapabilitiesMatch(request *dto.GeneralOpenAIRequest, caps capability
 		return false
 	}
 	tools := len(request.Tools) > 0 || len(request.Functions) > 0
+	caching := request.PromptCacheKey != "" || len(request.PromptCacheOptions) > 0 || len(request.PromptCacheRetention) > 0
 	textInput := request.Prompt != nil || request.Input != nil || request.Instruction != ""
 	for _, message := range request.Messages {
 		calls := message.ParseToolCalls()
 		tools = tools || len(message.Tools) > 0 || len(calls) > 0 || message.Role == "tool"
 		textInput = textInput || message.GetReasoningContent() != "" || len(calls) > 0
 		for _, part := range message.ParseContent() {
+			caching = caching || len(part.CacheControl) > 0 && string(part.CacheControl) != "null"
 			textInput = textInput || part.Type == dto.ContentTypeText && part.Text != ""
 		}
 	}
@@ -206,7 +208,7 @@ func GatewayCapabilitiesMatch(request *dto.GeneralOpenAIRequest, caps capability
 	if request.ResponseFormat != nil && request.ResponseFormat.Type != "" && request.ResponseFormat.Type != "text" && !slices.Contains(caps.Features, capability.StructuredOutput) {
 		return false
 	}
-	if (request.PromptCacheKey != "" || len(request.PromptCacheOptions) > 0 || len(request.PromptCacheRetention) > 0) && !slices.Contains(caps.Features, capability.Caching) {
+	if caching && !slices.Contains(caps.Features, capability.Caching) {
 		return false
 	}
 	if textInput && !slices.Contains(caps.InputModalities, capability.Text) {

@@ -151,6 +151,24 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 	if !ok {
 		return nil, fmt.Errorf("missing text request projection")
 	}
+	if len(chat.PromptCacheOptions) == 0 {
+		for _, diagnostic := range result.Diagnostics {
+			if diagnostic.Code != "cache_control_dropped" {
+				continue
+			}
+			body, err := common.Marshal(request)
+			if err != nil {
+				return nil, err
+			}
+			path := strings.NewReplacer("[", ".", "]", "").Replace(diagnostic.Path)
+			control := gjson.GetBytes(body, path)
+			if control.Exists() && control.Type != gjson.Null {
+				// Keep the native cache requirement in the validation projection.
+				chat.PromptCacheOptions = []byte(control.Raw)
+				break
+			}
+		}
+	}
 	if len(referencedMedia) > 0 {
 		// This validation-only bucket retains native reference modalities and
 		// their conservative input estimate. It is never an upstream request.

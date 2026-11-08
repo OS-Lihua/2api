@@ -3686,6 +3686,112 @@ func TestTextGatewayChatThinkingToContentRemainsEffective(t *testing.T) {
 	}
 }
 
+func TestTextGatewayThinkingChoicesKeepSeparateTags(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"R0\"}},{\"index\":1,\"delta\":{\"reasoning_content\":\"R1\"}}]}\n\ndata: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"A1\"},\"finish_reason\":\"stop\"},{\"index\":0,\"delta\":{\"content\":\"A0\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+	})
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("setting", `{"thinking_to_content":true}`).Error)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","stream":true,"n":2,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	content := map[int]string{}
+	for line := range strings.SplitSeq(response.Body.String(), "\n") {
+		data, found := strings.CutPrefix(line, "data: ")
+		if !found || data == "[DONE]" {
+			continue
+		}
+		var event dto.ChatCompletionsStreamResponse
+		require.NoError(t, common.UnmarshalJsonStr(data, &event))
+		for _, choice := range event.Choices {
+			if choice.Delta.Content != nil {
+				content[choice.Index] += *choice.Delta.Content
+			}
+		}
+	}
+	assert.Equal(t, "<think>\nR0\n</think>\nA0", content[0])
+	assert.Equal(t, "<think>\nR1\n</think>\nA1", content[1])
+}
+
+func TestTextGatewayProviderCacheRepairRetainsPresence(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, reset := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%t/reset=%t", stream, reset), func(t *testing.T) {
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					details := ""
+					if reset {
+						details = `,"prompt_tokens_details":{"cached_tokens":0}`
+					}
+					if stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = w.Write([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":1,\"prompt_cache_hit_tokens\":80}}\n\n"))
+						_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":1%s}}\n\ndata: [DONE]\n\n", details)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":1,"prompt_cache_hit_tokens":80%s}}`, details)
+				})
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeDeepSeek).Error)
+				for _, owner := range []struct {
+					kind string
+					id   int
+				}{{model.PriceOwnerChannel, fixture.channel.ID}, {model.PriceOwnerOffering, fixture.offering.ID}} {
+					price := &model.PriceVersion{OwnerType: owner.kind, OwnerID: owner.id, Currency: "USD", Expression: `tier("base", p * 1 + cr * 0.1)`, EffectiveAt: clock.Now().Unix()}
+					require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+				}
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", fmt.Sprintf(`{"model":"gateway-offering","stream":%t,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, stream))
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+				require.NoError(t, err)
+				attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, total)
+				if reset {
+					assert.Zero(t, attempts[0].Usage.CachedTokens)
+					assert.Equal(t, int64(100000), attempts[0].Cost.Nanos)
+					assert.Equal(t, int64(90000), record.Receivable.Nanos)
+				} else {
+					assert.Equal(t, int64(80), attempts[0].Usage.CachedTokens)
+					assert.Equal(t, int64(28000), attempts[0].Cost.Nanos)
+					assert.Equal(t, int64(25200), record.Receivable.Nanos)
+				}
+			})
+		}
+	}
+}
+
+func TestTextGatewayNativeCachingRequiresDeclaredCapability(t *testing.T) {
+	for _, content := range []string{
+		`"messages":[{"role":"user","content":[{"type":"text","text":"Hello","cache_control":{"type":"ephemeral"}}]}]`,
+		`"system":[{"type":"text","text":"System","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"Hello"}]`,
+		`"tools":[{"name":"lookup","description":"Lookup","input_schema":{"type":"object","properties":{}},"cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"Hello"}]`,
+	} {
+		for _, caching := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/caching=%t", content[:12], caching), func(t *testing.T) {
+				calls := 0
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`))
+				})
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "anthropic_messages").Error)
+				caps := capability.Set{Features: []capability.Feature{capability.ToolCalling}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}
+				if caching {
+					caps.Features = append(caps.Features, capability.Caching)
+				}
+				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/messages", `{"model":"gateway-offering","max_tokens":16,`+content+`}`)
+				if caching {
+					assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+					assert.Equal(t, 1, calls)
+				} else {
+					assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+					assert.Zero(t, calls)
+				}
+			})
+		}
+	}
+}
+
 func TestTextGatewayChatAudioExpiryIsAValidTerminal(t *testing.T) {
 	for _, test := range []struct {
 		name, audio             string
@@ -4083,6 +4189,44 @@ func TestTextGatewayAllChoicesMustFinishBeforeNormalEOF(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+func TestTextGatewaySuccessfulTerminalWaitsForTransportValidation(t *testing.T) {
+	for _, source := range []struct{ protocol, path, request, prefix, terminal, broken, forbidden string }{
+		{"openai_chat", "/v1/chat/completions", `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, `{"choices":[{"index":0,"delta":{"content":"Hello"}}]}`, `{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`, `{"choices":"invalid"}`, `"finish_reason":"stop"`},
+		{"openai_responses", "/v1/responses", `{"model":"gateway-offering","stream":true,"input":"Hello","max_output_tokens":16}`, `{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Hello"}`, `{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5}}}`, `{"type":"response.output_text.delta","output_index":"invalid"}`, "event: response.completed"},
+		{"anthropic_messages", "/v1/messages", `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}`, `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}`, `{"type":"content_block_delta","index":"invalid"}`, "event: message_stop"},
+		{"gemini_generate", "/v1beta/models/gateway-offering:streamGenerateContent?alt=sse", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16}}`, `{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"Hello"}]}}]}`, `{"candidates":[{"index":0,"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}`, `{"candidates":"invalid"}`, `"finishReason":"STOP"`},
+	} {
+		t.Run(source.protocol, func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				if source.protocol == "anthropic_messages" {
+					_, _ = w.Write([]byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":10}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"))
+				}
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", source.prefix)
+				if source.protocol == "anthropic_messages" {
+					_, _ = w.Write([]byte("data: {\"type\":\"content_block_stop\",\"index\":0}\n\n"))
+				}
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", source.terminal)
+				if source.protocol == "anthropic_messages" {
+					_, _ = w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
+				}
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", source.broken)
+			})
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", source.protocol).Error)
+			price := &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("request", fixed(0.01))`, EffectiveAt: clock.Now().Unix()}
+			require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, source.path, source.request)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), "Hello")
+			assert.NotContains(t, response.Body.String(), source.forbidden)
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, "partial", record.Status)
+			assert.Zero(t, record.Receivable.Nanos)
+		})
 	}
 }
 
@@ -4499,10 +4643,13 @@ func TestTextGatewayStreamConversionFacts(t *testing.T) {
 }
 
 func TestTextGatewayStrictConversionLosses(t *testing.T) {
+	image, err := os.ReadFile("../controller/probe-fixtures/red.png")
+	require.NoError(t, err)
 	for _, test := range []struct {
 		name, path, body, upstream, code, parameter string
 		hard                                        bool
 	}{
+		{"Gemini media resolution", "/v1beta/models/gateway-offering:generateContent", fmt.Sprintf(`{"contents":[{"role":"user","parts":[{"inlineData":{"mimeType":"image/png","data":%q}}]}],"generationConfig":{"maxOutputTokens":16,"mediaResolution":"MEDIA_RESOLUTION_HIGH"}}`, base64.StdEncoding.EncodeToString(image)), "openai_chat", "request_parameter_dropped", "mediaResolution", false},
 		{"stop string", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stop":"END"}`, "openai_responses", "request_parameter_dropped", "stop", false},
 		{"stop list", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stop":["END"]}`, "openai_responses", "request_parameter_dropped", "stop", false},
 		{"sampling controls", "/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"seed":123,"frequency_penalty":1,"logit_bias":{"42":-100}}`, "anthropic_messages", "request_parameter_dropped", "seed", false},
@@ -4535,6 +4682,9 @@ func TestTextGatewayStrictConversionLosses(t *testing.T) {
 				})
 				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", test.upstream).Error)
 				caps := capability.Set{Features: []capability.Feature{capability.Streaming, capability.ToolCalling, capability.Caching, capability.StructuredOutput}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}
+				if test.name == "Gemini media resolution" {
+					caps.InputModalities = append(caps.InputModalities, capability.Image)
+				}
 				if test.name == "Gemini output modalities" {
 					caps.OutputModalities = append(caps.OutputModalities, capability.Audio)
 				}

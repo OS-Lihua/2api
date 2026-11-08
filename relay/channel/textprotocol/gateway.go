@@ -83,7 +83,7 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
 	}
-	meter := gatewayUsageAccumulator{format: p.format}
+	meter := gatewayUsageAccumulator{format: p.format, context: c}
 	usage, err := meter.Observe(body)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)

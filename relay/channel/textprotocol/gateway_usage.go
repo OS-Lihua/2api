@@ -4,9 +4,11 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -14,8 +16,10 @@ import (
 // gatewayUsageAccumulator overlays only present upstream fields. A zero resets
 // its field; an omitted field retains the preceding cumulative fact.
 type gatewayUsageAccumulator struct {
-	format   types.RelayFormat
-	snapshot map[string]any
+	format        types.RelayFormat
+	context       *gin.Context
+	snapshot      map[string]any
+	repairedCache *int
 }
 
 func (a *gatewayUsageAccumulator) Observe(body []byte) (*dto.Usage, error) {
@@ -30,13 +34,24 @@ func (a *gatewayUsageAccumulator) Observe(body []byte) (*dto.Usage, error) {
 	if a.format == types.RelayFormatGemini {
 		key = "usageMetadata"
 	}
+	cacheReported := false
+	if a.format == types.RelayFormatOpenAI {
+		for _, path := range []string{"usage.prompt_tokens_details.cached_tokens", "usage.input_tokens_details.cached_tokens", "usage.cached_tokens", "usage.prompt_cache_hit_tokens", "timings.cache_n"} {
+			cacheReported = cacheReported || gatewayValidCounter(root.Get(path))
+		}
+		for _, choice := range root.Get("choices").Array() {
+			cacheReported = cacheReported || gatewayValidCounter(choice.Get("usage.cached_tokens"))
+		}
+	}
 	raw := root.Get(key)
-	if !raw.Exists() || raw.Type == gjson.Null {
+	if (!raw.Exists() || raw.Type == gjson.Null) && !cacheReported {
 		return nil, nil
 	}
-	var incoming map[string]any
-	if err := common.UnmarshalJsonStr(raw.Raw, &incoming); err != nil || incoming == nil {
-		return nil, nil
+	incoming := map[string]any{}
+	if raw.Exists() && raw.Type != gjson.Null {
+		if err := common.UnmarshalJsonStr(raw.Raw, &incoming); err != nil || incoming == nil {
+			return nil, nil
+		}
 	}
 	if a.snapshot == nil {
 		a.snapshot = map[string]any{}
@@ -78,8 +93,22 @@ func (a *gatewayUsageAccumulator) Observe(body []byte) (*dto.Usage, error) {
 			promptKey, completionKey = "input_tokens", "output_tokens"
 			usage = relayconvert.UsageFromResponsesUsage(&native)
 		} else {
+			channel.RepairProviderUsage(a.context, &native, body)
 			usage = relayconvert.UsageFromChatUsage(&native)
 			usage.PromptTokensDetails = native.PromptTokensDetails.Clone()
+			if usage.PromptTokensDetails.CachedTokens < 0 || int64(usage.PromptTokensDetails.CachedTokens) > 1<<31-1 {
+				usage.PromptTokensDetails.CachedTokens = 0
+			}
+			cached := gjson.GetBytes(encoded, "prompt_tokens_details.cached_tokens")
+			if gatewayValidCounter(cached) {
+				usage.PromptTokensDetails.CachedTokens = int(cached.Int())
+			} else if !cacheReported && usage.PromptTokensDetails.CachedTokens == 0 && a.repairedCache != nil {
+				usage.PromptTokensDetails.CachedTokens = *a.repairedCache
+			}
+			if cacheReported || usage.PromptTokensDetails.CachedTokens != 0 || a.repairedCache != nil {
+				count := usage.PromptTokensDetails.CachedTokens
+				a.repairedCache = &count
+			}
 		}
 	}
 	// Missing base counters may be bounded by independently reported subsets.
@@ -105,7 +134,7 @@ func (a *gatewayUsageAccumulator) Observe(body []byte) (*dto.Usage, error) {
 // ReportedCounters identifies independently valid usage, including cache/audio
 // details and explicit zero, without treating total as a base counter.
 func (a *gatewayUsageAccumulator) ReportedCounters() bool {
-	return gatewayReportedCounters(a.snapshot)
+	return a.repairedCache != nil || gatewayReportedCounters(a.snapshot)
 }
 
 func gatewayReportedCounters(value any) bool {

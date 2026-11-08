@@ -32,7 +32,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		return nil, types.NewError(err, types.ErrorCodeBadResponse)
 	}
 	usage := &dto.Usage{}
-	meter := gatewayUsageAccumulator{format: p.format}
+	meter := gatewayUsageAccumulator{format: p.format, context: c}
 	var streamErr error
 	var output gatewayGeneratedOutput
 	expectedChoices := max(1, info.ResponseFacts.ExpectedChoices)
@@ -146,25 +146,9 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			return
 		}
 		if p.format == info.RelayFormat {
-			body := normalized
-			var presented gatewayGeneratedOutput
-			written := &output
-			if p.format == types.RelayFormatOpenAI && info.ChannelSetting.ThinkingToContent {
-				body, err = helper.ChatThinkingToContent(info, normalized)
-				if err != nil {
-					streamErr = err
-					sr.Stop(err)
-					return
-				}
-				written = &presented
-			}
-			_, writeErr := writeGatewayStreamResult(c, info, json.RawMessage(body), written)
-			if written == &presented && presented.String() != "" {
-				output.text.WriteString(gatewayStreamBusinessText(normalized, p.format))
-			}
-			if writeErr != nil {
-				streamErr = writeErr
-				sr.Stop(writeErr)
+			if _, err := writeGatewayStreamResult(c, info, json.RawMessage(normalized), &output); err != nil {
+				streamErr = err
+				sr.Stop(err)
 				return
 			}
 		} else {
@@ -289,13 +273,36 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 			return "", err
 		}
 	}
-	if info.RelayFormat == types.RelayFormatClaude && !output.terminalReady && (event == "message_stop" || event == "message_delta" && gjson.GetBytes(body, "delta.stop_reason").String() != "") {
-		if output.terminalBytes+len(body) > 1<<20 {
+	terminal := false
+	switch info.RelayFormat {
+	case types.RelayFormatClaude:
+		terminal = event == "message_stop" || event == "message_delta" && gjson.GetBytes(body, "delta.stop_reason").String() != ""
+	case types.RelayFormatOpenAIResponses:
+		terminal = event == "response.completed" || event == "response.done"
+	case types.RelayFormatOpenAI:
+		for _, choice := range gjson.GetBytes(body, "choices").Array() {
+			terminal = terminal || choice.Get("finish_reason").String() != "" || choice.Get("delta.audio.expires_at").Type == gjson.Number
+		}
+	case types.RelayFormatGemini:
+		for _, candidate := range gjson.GetBytes(body, "candidates").Array() {
+			terminal = terminal || candidate.Get("finishReason").String() != ""
+		}
+	}
+	if terminal && !output.terminalReady && !info.PerformanceBusinessRejection {
+		// Terminal snapshots can contain complete image or audio payloads.
+		if output.terminalBytes+len(body) > 64<<20 {
 			return "", helper.ErrGatewayStreamPreludeLimit
 		}
 		output.terminalBytes += len(body)
 		output.pendingTerminal = append(output.pendingTerminal, json.RawMessage(body))
 		return "", nil
+	}
+	generatedBody := body
+	if info.RelayFormat == types.RelayFormatOpenAI && info.ChannelSetting.ThinkingToContent {
+		body, err = helper.ChatThinkingToContent(info, body)
+		if err != nil {
+			return "", err
+		}
 	}
 	frame := "data: " + string(body) + "\n\n"
 	if event != "" {
@@ -305,7 +312,7 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 	if err := c.Request.Context().Err(); err != nil {
 		return "", err
 	}
-	text := gatewayStreamBusinessText(body, info.RelayFormat)
+	text := gatewayStreamBusinessText(generatedBody, info.RelayFormat)
 	if info.RelayFormat == types.RelayFormatOpenAIResponses {
 		var probe gatewayGeneratedOutput
 		if value, handled := probe.ObserveResponses(body); handled {

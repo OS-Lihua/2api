@@ -51,6 +51,11 @@ func InspectRequestParameters(ctx context.Context, source, target any, from, to 
 			{"safety_identifier", "safety_identifier", "", ""},
 			{"prediction", "", "", ""},
 			{"verbosity", "text.verbosity", "", ""},
+			{"", "", "", "generationConfig.mediaResolution"},
+			{"", "", "", "generationConfig.mediaProcessing"},
+			{"", "", "", "generationConfig.enableEnhancedCivicAnswers"},
+			{"", "", "", "generationConfig.speechConfig"},
+			{"", "", "", "generationConfig.imageConfig"},
 		} {
 			path := paths[fromIndex]
 			if path == "" {

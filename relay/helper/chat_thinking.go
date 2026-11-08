@@ -12,10 +12,22 @@ import (
 // dropping unrelated native fields. Added tags are presentation, not usage.
 func ChatThinkingToContent(info *relaycommon.RelayInfo, body []byte) ([]byte, error) {
 	choices := gjson.GetBytes(body, "choices").Array()
-	first := info.ThinkingContentInfo.IsFirstThinkingContent
-	sent := info.ThinkingContentInfo.HasSentThinkingContent
-	closed := info.ThinkingContentInfo.SendLastThinkingContent
+	if info.ThinkingContentInfo.Choices == nil {
+		info.ThinkingContentInfo.Choices = map[int]*relaycommon.ThinkingContentInfo{}
+	}
 	for i, choice := range choices {
+		index := i
+		if value := choice.Get("index"); value.Exists() {
+			index = int(value.Int())
+		}
+		state := info.ThinkingContentInfo.Choices[index]
+		if state == nil {
+			state = &relaycommon.ThinkingContentInfo{IsFirstThinkingContent: true}
+			info.ThinkingContentInfo.Choices[index] = state
+		}
+		first := state.IsFirstThinkingContent
+		sent := state.HasSentThinkingContent
+		closed := state.SendLastThinkingContent
 		delta := choice.Get("delta")
 		reasoning := delta.Get("reasoning_content")
 		if !reasoning.Exists() || reasoning.Type == gjson.Null {
@@ -53,9 +65,9 @@ func ChatThinkingToContent(info *relaycommon.RelayInfo, body []byte) ([]byte, er
 		if err != nil {
 			return nil, err
 		}
+		state.IsFirstThinkingContent = first && !sent
+		state.HasSentThinkingContent = sent
+		state.SendLastThinkingContent = closed
 	}
-	info.ThinkingContentInfo.IsFirstThinkingContent = first && !sent
-	info.ThinkingContentInfo.HasSentThinkingContent = sent
-	info.ThinkingContentInfo.SendLastThinkingContent = closed
 	return body, nil
 }
