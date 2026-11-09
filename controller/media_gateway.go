@@ -228,17 +228,21 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	}
 	info.ResponseFacts.CanFinishStream = func() bool { return info.StreamStatus.CompletedNormally() }
 	committedKey := false
+	selectedProvider, selectedKey, selectedKeyIndex := selection.Provider, info.ApiKey, info.ChannelMultiKeyIndex
 	info.BeginProviderCall = func() (context.Context, error) {
 		ctx, err := budget.Start()
 		if err != nil {
 			return nil, err
 		}
 		if !committedKey {
-			if err := selection.Provider.CommitRouteKey(ctx, info.ApiKey, info.ChannelMultiKeyIndex); err != nil {
+			if err := selectedProvider.CommitRouteKey(ctx, selectedKey, selectedKeyIndex); err != nil {
 				return nil, err
 			}
 			committedKey = true
-		} else if err := selection.Provider.ValidateRouteKey(ctx, info.ApiKey, info.ChannelMultiKeyIndex); err != nil {
+		} else if err := selectedProvider.ValidateRouteKey(ctx, selectedKey, selectedKeyIndex); err != nil {
+			return nil, err
+		}
+		if _, err := budget.Start(); err != nil {
 			return nil, err
 		}
 		contactedProvider = true
@@ -306,6 +310,19 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	for key, values := range prepared.Prepared.Headers() {
 		prepared.Input.Headers[strings.ToLower(key)] = strings.Join(values, ",")
 	}
+	// Credential preparation must finish before the purchase price and FX are frozen.
+	previousContact := contactedProvider
+	ctx, err := info.BeginProviderCall()
+	contactedProvider = previousContact
+	if err != nil {
+		if errors.Is(err, service.ErrGatewayBudget) || parent.Context().Err() != nil {
+			run.code = "first_byte_budget"
+			return result
+		}
+		run.code = "channel_unavailable"
+		return skipped
+	}
+	c.Request = parent.WithContext(ctx)
 	at := clock.Now()
 	purchase, purchaseFX, purchaseRate, err := gatewayChannelPurchaseSnapshot(c.Request.Context(), selection.Channel.ID, at)
 	if err != nil {
@@ -347,16 +364,11 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	}
 	selection.Diagnostics["estimated_cost"] = comparison.String()
 	selection.Diagnostics["loss_fallback"] = selection.LossFallback
-	ctx, err := info.BeginProviderCall()
-	if err != nil {
-		if errors.Is(err, service.ErrGatewayBudget) || parent.Context().Err() != nil {
-			run.code = "first_byte_budget"
-			return result
-		}
-		run.code = "channel_unavailable"
-		return skipped
+	if _, err := budget.Start(); err != nil {
+		run.code = "first_byte_budget"
+		return result
 	}
-	c.Request = parent.WithContext(ctx)
+	contactedProvider = true
 	attempt := &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: run.id, ChannelID: selection.Channel.ID, ProviderID: selection.Provider.Id, ModelID: selection.Channel.ModelID, StartedAt: at.UnixMilli(), PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, AccountingFXRate: purchaseRate, Cost: money.Amount{Currency: purchase.Currency}, ConvertedCost: money.Amount{Currency: model.SettlementCurrency()}, UsageSource: "none", RouteDiagnostics: selection.Diagnostics, CircuitAction: "none", ConversionLosses: selection.ConversionLosses}
 	for _, member := range run.offering.Members {
 		if member.ModelID == selection.Channel.ModelID {

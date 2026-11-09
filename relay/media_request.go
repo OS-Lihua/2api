@@ -204,6 +204,36 @@ func (a *ChannelAdaptor) PrepareMediaWire(c *gin.Context, info *relaycommon.Rela
 		if effective.Model != info.UpstreamModelName {
 			return nil, fmt.Errorf("image model override is not allowed")
 		}
+		if form != nil {
+			uploaded := false
+			for _, name := range []string{"image", "image[]", "images", "images[]"} {
+				uploaded = uploaded || len(form.File[name]) > 0
+			}
+			if uploaded {
+				for _, raw := range []common.RawMessage{effective.Image, effective.Images} {
+					if len(raw) == 0 {
+						continue
+					}
+					var value any
+					if err := common.Unmarshal(raw, &value); err != nil {
+						return nil, err
+					}
+					switch input := value.(type) {
+					case nil:
+						continue
+					case string:
+						if input == "" {
+							continue
+						}
+					case []any:
+						if len(input) == 0 {
+							continue
+						}
+					}
+					return nil, fmt.Errorf("mixed uploaded and referenced image inputs are not supported")
+				}
+			}
+		}
 		count, err := effective.ImageCount(false)
 		if err != nil {
 			return nil, err

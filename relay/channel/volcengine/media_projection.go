@@ -8,7 +8,6 @@ import (
 	"github.com/MoeForge/moego/ojson"
 
 	"github.com/QuantumNous/new-api/common"
-	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 )
 
@@ -34,14 +33,11 @@ func (speechRequestBody) ProjectAudioRequest(body []byte, public dto.AudioReques
 	if err := common.Unmarshal(body, &wire); err != nil {
 		return nil, err
 	}
-	if wire.Request.Model != public.Model || wire.Request.Text == "" || wire.Request.Operation != "submit" || wire.Audio.Rate != 24000 {
+	if wire.Request.Model != public.Model || wire.Request.Text == "" || wire.Request.Operation != "submit" || wire.Audio.Rate != 24000 || wire.Audio.VoiceType == "" {
 		return nil, fmt.Errorf("invalid Volcengine speech parameters")
 	}
-	if math.IsNaN(wire.Audio.SpeedRatio) || math.IsInf(wire.Audio.SpeedRatio, 0) || wire.Audio.SpeedRatio < 0 || wire.Audio.SpeedRatio > 4 {
-		return nil, fmt.Errorf("Volcengine speech speed exceeds the request limit")
-	}
-	if silence := wire.Request.SilenceDuration; silence != nil && (math.IsNaN(*silence) || math.IsInf(*silence, 0) || *silence < 0 || *silence > relaycommon.MaxTaskDurationSeconds*1000) {
-		return nil, fmt.Errorf("Volcengine silence duration exceeds the request limit")
+	if _, err := (speechRequestBody{}).MinimumAudioOutputTokens(body); err != nil {
+		return nil, err
 	}
 	if public.SampleRate != nil && *public.SampleRate != wire.Audio.Rate {
 		return nil, fmt.Errorf("Volcengine sample rate override cannot be preserved")
@@ -64,13 +60,37 @@ func (speechRequestBody) MinimumAudioOutputTokens(body []byte) (int, error) {
 	if err := common.Unmarshal(body, &wire); err != nil {
 		return 0, err
 	}
+	// V1 shares transports across voice families; select controls by exact voice ID.
+	// https://www.volcengine.com/docs/6561/79823
+	// https://www.volcengine.com/docs/doubao-voice/http-one-timecompositenon-streaming-interface-v1-not-recommended
+	minSpeed, maxSpeed, largeModel := 1.0, 1.0, false
+	switch wire.Audio.VoiceType {
+	case "zh_male_M392_conversation_wvae_bigtts", "zh_female_cancan_mars_bigtts":
+		minSpeed, maxSpeed, largeModel = 0.1, 2, true
+	case "BV700_streaming":
+		minSpeed, maxSpeed = 0.2, 3
+	}
+	speed := wire.Audio.SpeedRatio
+	if !ojson.GetBytes(body, "audio.speed_ratio").Exists() {
+		speed = 1
+	}
+	if math.IsNaN(speed) || math.IsInf(speed, 0) || speed < minSpeed || speed > maxSpeed {
+		return 0, fmt.Errorf("Volcengine speech speed is unsupported for the selected voice")
+	}
 	if wire.Request.SilenceDuration == nil {
+		if wire.Request.EnableTrailingSilenceAudio != nil && *wire.Request.EnableTrailingSilenceAudio {
+			return 0, fmt.Errorf("Volcengine trailing silence requires an explicit duration")
+		}
 		return 0, nil
 	}
-	seconds := *wire.Request.SilenceDuration / 1000
-	if math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds < 0 || seconds > relaycommon.MaxTaskDurationSeconds {
-		return 0, fmt.Errorf("Volcengine silence duration exceeds the request limit")
+	if !largeModel || wire.Request.EnableTrailingSilenceAudio == nil || !*wire.Request.EnableTrailingSilenceAudio {
+		return 0, fmt.Errorf("Volcengine trailing silence requires a supported voice and enabled switch")
 	}
+	milliseconds := *wire.Request.SilenceDuration
+	if math.IsNaN(milliseconds) || math.IsInf(milliseconds, 0) || milliseconds < 0 || milliseconds > 30_000 {
+		return 0, fmt.Errorf("Volcengine trailing silence exceeds the request limit")
+	}
+	seconds := milliseconds / 1000
 	tokens, clamp := common.AudioDurationTokens(seconds)
 	if clamp != nil {
 		return 0, fmt.Errorf("Volcengine silence duration exceeds the request limit")

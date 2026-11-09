@@ -128,19 +128,25 @@ type ResponseFacts struct {
 	StreamHeaders                      map[string][]string `json:"-"`
 }
 
+// AudioPCMFrameBytes is the size of one complete signed 16-bit sample frame.
+func (facts *ResponseFacts) AudioPCMFrameBytes() int64 {
+	channels := int64(1)
+	if facts != nil && facts.AudioOutputChannels > 0 && facts.AudioOutputChannels <= 1<<31-1 {
+		channels = int64(facts.AudioOutputChannels)
+	}
+	return channels * 2
+}
+
 // AudioPCMBytesPerSecond uses the effective or reported signed 16-bit PCM
 // format. OpenAI's default remains mono 24 kHz when no format was supplied.
 func (facts *ResponseFacts) AudioPCMBytesPerSecond() int64 {
-	rate, channels := int64(24000), int64(1)
+	rate := int64(24000)
 	if facts != nil {
 		if facts.AudioOutputSampleRate > 0 && facts.AudioOutputSampleRate <= 1<<31-1 {
 			rate = int64(facts.AudioOutputSampleRate)
 		}
-		if facts.AudioOutputChannels > 0 && facts.AudioOutputChannels <= 1<<31-1 {
-			channels = int64(facts.AudioOutputChannels)
-		}
 	}
-	return rate * channels * 2
+	return rate * facts.AudioPCMFrameBytes()
 }
 
 // RecordChatSource retains generated facts when a native transport fails after

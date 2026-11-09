@@ -247,6 +247,36 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 	var completedImages int64
 	generatedTokens, deliveredTokens := 0, 0
 	generatedKnown, deliveredKnown := true, true
+	recordGenerated := func(raw []byte) (int, bool) {
+		completedImages++
+		info.ResponseFacts.GeneratedImageCount = min(completedImages, int64(dto.MaxImageN))
+		info.ResponseFacts.ImageOutputEstimationStarted = true
+		tokens, known := estimateImageFrameOutput(info, raw)
+		generatedKnown = generatedKnown && known
+		if known {
+			var clamp *common.QuotaClamp
+			generatedTokens, clamp = common.QuotaFromFloatChecked(float64(generatedTokens) + float64(tokens))
+			if clamp != nil {
+				info.QuotaClamp = clamp
+				generatedKnown = false
+			}
+		}
+		return tokens, known
+	}
+	observeStoppedSource := func(data string) {
+		if info.ResponseFacts == nil {
+			return
+		}
+		raw := []byte(data)
+		mergeMediaStreamUsage(info, usage, raw)
+		if observeMediaError(info, mediaResponseEnvelope(raw), resp.StatusCode) != nil || !ojson.ValidBytes(raw) {
+			return
+		}
+		kind := ojson.GetBytes(raw, "type").Str
+		if (kind == "image_generation.completed" || kind == "image_edit.completed") && (openaiImageDataHasField(ojson.ParseBytes(raw), "url") || openaiImageDataHasField(ojson.ParseBytes(raw), "b64_json")) {
+			recordGenerated(raw)
+		}
+	}
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		raw := common.StringToByteSlice(data)
@@ -258,17 +288,7 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 		}
 		if info.ResponseFacts != nil {
 			eventFacts := mediaResponseEnvelope(raw)
-			reported := reportedMediaUsage(eventFacts)
-			prompt, completion := relaycommon.MediaUsagePresence(eventFacts)
-			observeMediaUsage(info, reported, eventFacts)
-			if prompt {
-				usage.PromptTokens = reported.PromptTokens
-			}
-			if completion {
-				usage.CompletionTokens = reported.CompletionTokens
-			}
-			mergeMediaTokenDetails(usage, eventFacts)
-			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+			mergeMediaStreamUsage(info, usage, raw)
 			if observeMediaError(info, eventFacts, resp.StatusCode) != nil {
 				sr.Stop(errors.New("upstream image stream failed"))
 				return
@@ -294,20 +314,10 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 			}
 			if chunk.Type == "image_generation.completed" || chunk.Type == "image_edit.completed" {
 				if info.ResponseFacts == nil || openaiImageDataHasField(ojson.Parse(data), "url") || openaiImageDataHasField(ojson.Parse(data), "b64_json") {
-					completedImages++
-					if info.ResponseFacts != nil {
-						info.ResponseFacts.GeneratedImageCount = min(completedImages, int64(dto.MaxImageN))
-						info.ResponseFacts.ImageOutputEstimationStarted = true
-						frameTokens, frameKnown = estimateImageFrameOutput(info, raw)
-						generatedKnown = generatedKnown && frameKnown
-						if frameKnown {
-							var clamp *common.QuotaClamp
-							generatedTokens, clamp = common.QuotaFromFloatChecked(float64(generatedTokens) + float64(frameTokens))
-							if clamp != nil {
-								info.QuotaClamp = clamp
-								generatedKnown = false
-							}
-						}
+					if info.ResponseFacts == nil {
+						completedImages++
+					} else {
+						frameTokens, frameKnown = recordGenerated(raw)
 					}
 				}
 			}
@@ -340,7 +350,12 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 		if writeErr != nil {
 			sr.Stop(writeErr)
 		}
-	})
+	}, observeStoppedSource)
+	if info.ResponseFacts != nil && len(info.ResponseFacts.UnterminatedStreamData) > 0 {
+		observeStoppedSource(string(info.ResponseFacts.UnterminatedStreamData))
+		info.ResponseFacts.UnterminatedStreamData = nil
+		info.ResponseFacts.UnterminatedStreamEvent = ""
+	}
 
 	if info.ResponseFacts != nil && info.StreamStatus != nil {
 		info.StreamStatus.RequireTerminal()

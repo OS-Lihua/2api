@@ -58,6 +58,10 @@ func (p *ttsProtocol) DoResponse(c *gin.Context, response *http.Response, info *
 			}
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)
 			info.StreamStatus.MarkIncomplete("incomplete_audio_response")
+			var nativeError *types.NewAPIError
+			if errors.As(err, &nativeError) {
+				return usage, nativeError
+			}
 			return usage, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
 		}
 		return openai.WriteAudioResponse(c, info, response, audio), nil
@@ -211,7 +215,7 @@ func (b *ttsSocketBody) Read(p []byte) (int, error) {
 		}
 		switch message.MsgType {
 		case MsgTypeError:
-			return 0, errors.New("volcengine speech transport returned an error")
+			return 0, speechError(int(message.ErrorCode))
 		case MsgTypeAudioOnlyServer:
 			b.done = message.Sequence < 0
 			b.pending = bytes.NewReader(message.Payload)

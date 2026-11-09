@@ -53,14 +53,15 @@ type VolcengineTTSAudio struct {
 }
 
 type VolcengineTTSReqInfo struct {
-	ReqID           string                   `json:"reqid"`
-	Text            string                   `json:"text"`
-	Operation       string                   `json:"operation"`
-	Model           string                   `json:"model,omitempty"`
-	TextType        string                   `json:"text_type,omitempty"`
-	SilenceDuration *float64                 `json:"silence_duration,omitempty"`
-	WithTimestamp   any                      `json:"with_timestamp,omitempty"`
-	ExtraParam      *VolcengineTTSExtraParam `json:"extra_param,omitempty"`
+	ReqID                      string                   `json:"reqid"`
+	Text                       string                   `json:"text"`
+	Operation                  string                   `json:"operation"`
+	Model                      string                   `json:"model,omitempty"`
+	TextType                   string                   `json:"text_type,omitempty"`
+	EnableTrailingSilenceAudio *bool                    `json:"enable_trailing_silence_audio,omitempty"`
+	SilenceDuration            *float64                 `json:"silence_duration,omitempty"`
+	WithTimestamp              any                      `json:"with_timestamp,omitempty"`
+	ExtraParam                 *VolcengineTTSExtraParam `json:"extra_param,omitempty"`
 }
 
 type VolcengineTTSExtraParam struct {
@@ -145,6 +146,21 @@ func getContentTypeByEncoding(encoding string) string {
 	return "application/octet-stream"
 }
 
+func speechError(code int) *types.NewAPIError {
+	status := http.StatusBadGateway
+	switch code {
+	case 3001, 3006, 3010, 3011, 3050:
+		status = http.StatusBadRequest
+	case 3003:
+		status = http.StatusTooManyRequests
+	case 3005, 3031, 3040:
+		status = http.StatusServiceUnavailable
+	case 3030, 3032:
+		status = http.StatusGatewayTimeout
+	}
+	return types.WithOpenAIError(types.OpenAIError{Type: "upstream_error", Code: fmt.Sprintf("volcengine:%d", code), Message: "Volcengine speech request failed"}, status)
+}
+
 func handleTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, encoding string) (usage any, err *types.NewAPIError) {
 	defer resp.Body.Close()
 	body, readErr := io.ReadAll(resp.Body)
@@ -187,7 +203,7 @@ func handleTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon.Re
 		return usage, types.NewErrorWithStatusCode(errors.New("failed to parse volcengine response"), types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	if volcResp.Code != 3000 {
-		return usage, types.NewErrorWithStatusCode(errors.New(volcResp.Message), types.ErrorCodeBadResponse, http.StatusBadRequest)
+		return usage, speechError(volcResp.Code)
 	}
 	if audioData == nil {
 		var decodeErr error

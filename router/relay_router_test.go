@@ -4729,6 +4729,66 @@ func TestMediaGatewayNativeImageProvidersUseEffectiveWireAndActualMoney(t *testi
 	}
 }
 
+func TestMediaGatewayMiniMaxImagesKeepHostStreamAndRejectInputLoss(t *testing.T) {
+	for _, tc := range []struct {
+		name, fields, override string
+		stream, reject         bool
+	}{
+		{name: "native JSON"},
+		{name: "native JSON as SSE", stream: true},
+		{name: "image input", fields: `,"image":"https://image.invalid/input"`, reject: true},
+		{name: "images input", fields: `,"images":["https://image.invalid/input"]`, reject: true},
+		{name: "mask input", fields: `,"mask":"https://image.invalid/mask"`, reject: true},
+		{name: "override input", override: `{"image":"https://image.invalid/input"}`, reject: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				var wire struct {
+					Model, Prompt string
+					N             int
+				}
+				require.NoError(t, common.DecodeJson(r.Body, &wire))
+				assert.Equal(t, "image-01", wire.Model)
+				assert.Equal(t, "draw", wire.Prompt)
+				assert.Equal(t, 2, wire.N)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"data":{"image_urls":["https://image.invalid/a","https://image.invalid/b"]},"base_resp":{"status_code":0}}`)
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeMiniMax).Error)
+			require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", "image-01").Error)
+			if tc.override != "" {
+				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", tc.override).Error)
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", fmt.Sprintf(`{"model":"gateway-alias","prompt":"draw","n":2,"stream":%t%s}`, tc.stream, tc.fields))
+			if tc.reject {
+				assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+				assert.Zero(t, calls)
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
+				return
+			}
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Equal(t, 1, calls)
+			if tc.stream {
+				assert.Equal(t, 2, strings.Count(response.Body.String(), `"type":"image_generation.completed"`))
+				assert.Contains(t, response.Body.String(), "[DONE]")
+			}
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.EqualValues(t, 72_000_000, record.Receivable.Nanos)
+			require.NotNil(t, record.Usage.ImageCount)
+			assert.EqualValues(t, 2, *record.Usage.ImageCount)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.EqualValues(t, 40_000_000, attempts[0].Cost.Nanos)
+		})
+	}
+}
+
 func TestMediaGatewayJimengNativeImageInputsHonorCapabilities(t *testing.T) {
 	var picture bytes.Buffer
 	require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
@@ -5019,7 +5079,18 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 		hold           int64
 		extra          string
 		requestFormat  string
+		speed          float64
 	}{
+		{name: "Volcengine controls default speed", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech},
+		{name: "Volcengine controls lower speed", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"audio":{"speed_ratio":0.1}}`, speed: 0.1},
+		{name: "Volcengine controls excessive speed", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"speed":3`, reject: true},
+		{name: "Volcengine controls metadata zero speed", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"audio":{"speed_ratio":0}}`, reject: true},
+		{name: "Volcengine controls override speed", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, overrides: `{"operations":[{"path":"audio.speed_ratio","mode":"set","value":3}]}`, reject: true},
+		{name: "Volcengine controls old voice speed", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"audio":{"voice_type":"BV700_streaming","speed_ratio":2.5}}`, speed: 2.5},
+		{name: "Volcengine controls unknown voice speed", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"audio":{"voice_type":"custom-voice","speed_ratio":2}}`, reject: true},
+		{name: "Volcengine controls missing silence switch", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"request":{"silence_duration":1000}}`, reject: true},
+		{name: "Volcengine controls false silence switch", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"request":{"silence_duration":1000,"enable_trailing_silence_audio":false}}`, reject: true},
+		{name: "Volcengine controls excessive silence", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"request":{"silence_duration":30001,"enable_trailing_silence_audio":true}}`, reject: true},
 		{name: "Volcengine unsupported AAC", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, requestFormat: "aac", reject: true},
 		{name: "Volcengine unsupported FLAC", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, requestFormat: "flac", reject: true},
 		{name: "MiniMax metadata sample rate", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"audio_setting":{"sample_rate":48000}}`, reject: true},
@@ -5053,18 +5124,22 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 		{name: "Volcengine cannot enforce output cap", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, outputLimit: 16, reject: true},
 		{name: "MiniMax explicit output zero", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, extra: `,"max_new_tokens":0`, reject: true},
 		{name: "Volcengine explicit output limit", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"max_new_tokens":16`, reject: true},
-		{name: "Volcengine metadata silence exceeds duration cap", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, durationLimit: 1, extra: `,"metadata":{"request":{"silence_duration":2000}}`, reject: true},
-		{name: "Volcengine override silence exceeds duration cap", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, durationLimit: 1, overrides: `{"operations":[{"path":"request.silence_duration","mode":"set","value":2000}]}`, reject: true},
-		{name: "Volcengine explicit silence zero", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"request":{"silence_duration":0}}`},
-		{name: "Volcengine explicit silence zero duration bound", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, durationLimit: 1, extra: `,"metadata":{"request":{"silence_duration":0}}`, reject: true},
-		{name: "Volcengine silence reservation", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"request":{"silence_duration":120000}}`, hold: 18_000_000},
-		{name: "Volcengine override silence reservation", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, overrides: `{"operations":[{"path":"request.silence_duration","mode":"set","value":120000}]}`, hold: 18_000_000},
+		{name: "Volcengine metadata silence exceeds duration cap", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, durationLimit: 1, extra: `,"metadata":{"request":{"silence_duration":2000,"enable_trailing_silence_audio":true}}`, reject: true},
+		{name: "Volcengine override silence exceeds duration cap", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, durationLimit: 1, overrides: `{"operations":[{"path":"request.silence_duration","mode":"set","value":2000},{"path":"request.enable_trailing_silence_audio","mode":"set","value":true}]}`, reject: true},
+		{name: "Volcengine explicit silence zero", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"request":{"silence_duration":0,"enable_trailing_silence_audio":true}}`},
+		{name: "Volcengine explicit silence zero duration bound", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, durationLimit: 1, extra: `,"metadata":{"request":{"silence_duration":0,"enable_trailing_silence_audio":true}}`, reject: true},
+		{name: "Volcengine silence reservation", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"request":{"silence_duration":2000,"enable_trailing_silence_audio":true}}`, hold: 297_000},
+		{name: "Volcengine override silence reservation", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, overrides: `{"operations":[{"path":"request.silence_duration","mode":"set","value":2000},{"path":"request.enable_trailing_silence_audio","mode":"set","value":true}]}`, hold: 297_000},
 		{name: "Volcengine unsupported output override", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, overrides: `{"max_new_tokens":16}`, reject: true},
 		{name: "Volcengine unsupported nested output override", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, overrides: `{"operations":[{"path":"request.max_new_tokens","mode":"set","value":16}]}`, reject: true},
 		{name: "MiniMax unsupported output override", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, overrides: `{"max_new_tokens":16}`, reject: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
+			outputAudio := audio
+			if tc.hold > 0 {
+				outputAudio = make([]byte, 144000)
+			}
 			wave := mediaWAV(t, 8000, 16000, make([]byte, 16000))
 			fixture := newMediaGatewayFixture(t, tc.kind, func(w http.ResponseWriter, r *http.Request) {
 				calls++
@@ -5094,13 +5169,22 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 						assert.Equal(t, "secret", body["app"].(map[string]any)["token"])
 					}
 					assert.Equal(t, float64(24000), body["audio"].(map[string]any)["rate"])
+					speed := tc.speed
+					if speed == 0 {
+						speed = 1
+					}
+					assert.Equal(t, speed, body["audio"].(map[string]any)["speed_ratio"])
 					if strings.Contains(tc.name, "explicit silence zero") {
 						assert.Equal(t, float64(0), body["request"].(map[string]any)["silence_duration"])
 					}
-					if tc.hold > 0 {
-						assert.Equal(t, float64(120000), body["request"].(map[string]any)["silence_duration"])
+					wireAudio := outputAudio
+					if tc.hold > 0 && calls > 1 {
+						assert.Equal(t, float64(2000), body["request"].(map[string]any)["silence_duration"])
+						assert.Equal(t, true, body["request"].(map[string]any)["enable_trailing_silence_audio"])
+					} else if tc.hold > 0 {
+						wireAudio = audio
 					}
-					encoded = fmt.Sprintf(`{"code":3000,"data":%q}`, base64.StdEncoding.EncodeToString(audio))
+					encoded = fmt.Sprintf(`{"code":3000,"data":%q}`, base64.StdEncoding.EncodeToString(wireAudio))
 				}
 				if tc.short {
 					w.Header().Set("Content-Length", strconv.Itoa(len(encoded)+1))
@@ -5149,6 +5233,16 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: cost, EffectiveAt: clock.Now().Unix()},
 			} {
 				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			if tc.hold > 0 {
+				// A real lower-output request seeds the same published history on both log databases.
+				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", `{}`).Error)
+				seed := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", `{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm"}`)
+				require.Equal(t, 200, seed.Code, seed.Body.String())
+				mean, err := model.RecentOfferingOutputTokens(t.Context(), fixture.offering.ID, clock.Now().UnixMilli())
+				require.NoError(t, err)
+				require.EqualValues(t, 17, mean)
+				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", overrides).Error)
 			}
 			responseFormat := tc.requestFormat
 			if responseFormat == "" {
@@ -5201,13 +5295,21 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 				return
 			}
 			require.Equal(t, 200, response.Code, response.Body.String())
-			assert.Equal(t, 1, calls)
+			wantCalls := 1
+			if tc.hold > 0 {
+				wantCalls = 2
+			}
+			assert.Equal(t, wantCalls, calls)
 			if tc.kind == protocol.OpenAIAudioTranscription {
 				assert.Equal(t, "hello", response.Body.String())
 			} else if tc.stream {
 				assert.Contains(t, response.Body.String(), "speech.audio.delta")
 			} else {
-				assert.Equal(t, audio, response.Body.Bytes())
+				assert.Equal(t, outputAudio, response.Body.Bytes())
+			}
+			tokens, seconds := int64(17), "1"
+			if tc.hold > 0 {
+				tokens, seconds = 50, "3"
 			}
 			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
 			require.NoError(t, err)
@@ -5217,14 +5319,14 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 				assert.Equal(t, new(int64(17)), record.Usage.AudioInputTokens)
 			} else {
 				require.NotNil(t, record.Usage.AudioOutputSeconds)
-				assert.Equal(t, "1", *record.Usage.AudioOutputSeconds)
-				assert.Equal(t, new(int64(17)), record.Usage.AudioOutputTokens)
+				assert.Equal(t, seconds, *record.Usage.AudioOutputSeconds)
+				assert.Equal(t, new(tokens), record.Usage.AudioOutputTokens)
 			}
-			assert.Equal(t, int64(153_000), record.Receivable.Nanos)
+			assert.Equal(t, tokens*9000, record.Receivable.Nanos)
 			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
 			require.NoError(t, err)
 			require.EqualValues(t, 1, total)
-			wantCost := int64(119_000)
+			wantCost := tokens * 7000
 			if tc.purchaseBody {
 				wantCost = 20_000
 			}
@@ -5237,16 +5339,23 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 			}
 			wallet, err := model.GetUserWallet(fixture.user.Id)
 			require.NoError(t, err)
-			assert.Equal(t, int64(999_847_000), wallet.Balance.Nanos)
+			wantBalance := int64(1_000_000_000) - tokens*9000
+			if tc.hold > 0 {
+				wantBalance -= 153_000
+			}
+			assert.Equal(t, wantBalance, wallet.Balance.Nanos)
 			if tc.hold > 0 {
 				entries, _, err := model.ListLedgerEntries(wallet.Id, 0, 20)
 				require.NoError(t, err)
 				var held int64
+				holds := 0
 				for _, entry := range entries {
-					if entry.Type == model.LedgerEntryPreConsume {
+					if entry.Type == model.LedgerEntryPreConsume && entry.RequestId == record.ID {
 						held -= entry.Amount.Nanos
+						holds++
 					}
 				}
+				assert.Equal(t, 1, holds)
 				assert.Equal(t, tc.hold, held)
 			}
 			reconciliation, err := model.ReconcileWallets(100)
@@ -5699,14 +5808,17 @@ func TestMediaGatewayImageInputsKeepEstimatedTokensAndExplicitZeros(t *testing.T
 	for _, tc := range []struct {
 		name, inputs, usage, override string
 		tokens                        int64
+		provider                      int
 		multipart, reject             bool
 	}{
+		{name: "uploaded image", multipart: true, usage: `{"output_tokens":0}`, tokens: 520},
+		{name: "native upload projects once", multipart: true, provider: constant.ChannelTypeReplicate, usage: `{"output_tokens":0}`, tokens: 520},
 		{name: "URL input", inputs: `,"image":"https://image.invalid/input"`, usage: `{"output_tokens":0}`, tokens: 520},
 		{name: "array input", inputs: `,"images":["https://image.invalid/a","https://image.invalid/b"],"n":3`, usage: `{"output_tokens":0}`, tokens: 1040},
 		{name: "explicit image zero", inputs: `,"image":"https://image.invalid/input"`, usage: `{"input_tokens":0,"input_tokens_details":{"image_tokens":0},"output_tokens":0}`},
 		{name: "reported total missing image detail", inputs: `,"image":"https://image.invalid/input"`, usage: `{"input_tokens":1000,"output_tokens":0}`, tokens: 520},
 		{name: "reported zero total missing image detail", inputs: `,"image":"https://image.invalid/input"`, usage: `{"input_tokens":0,"output_tokens":0}`, tokens: 520},
-		{name: "uploaded and projected views count once", multipart: true, override: `{"images":["https://image.invalid/input"]}`, usage: `{"output_tokens":0}`, tokens: 520},
+		{name: "distinct uploaded and overridden references reject", multipart: true, override: `{"images":["https://image.invalid/input"]}`, usage: `{"output_tokens":0}`, reject: true},
 		{name: "original image context before override", inputs: `,"images":["https://image.invalid/a","https://image.invalid/b"]`, override: `{"images":[]}`, usage: `{"output_tokens":0}`, reject: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -5714,16 +5826,41 @@ func TestMediaGatewayImageInputsKeepEstimatedTokensAndExplicitZeros(t *testing.T
 			fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
 				calls++
 				w.Header().Set("Content-Type", "application/json")
+				if tc.provider == constant.ChannelTypeReplicate {
+					var wire struct {
+						Input struct {
+							Image string `json:"image_prompt"`
+						} `json:"input"`
+					}
+					require.NoError(t, common.DecodeJson(r.Body, &wire))
+					assert.True(t, strings.HasPrefix(wire.Input.Image, "data:image/png;base64,"))
+					_, _ = io.WriteString(w, `{"status":"succeeded","output":["https://image.invalid/one"]}`)
+					return
+				}
+				if tc.multipart {
+					require.NoError(t, r.ParseMultipartForm(1<<20))
+					require.Len(t, r.MultipartForm.File["image"], 1)
+					if tc.override != "" {
+						assert.JSONEq(t, `["https://image.invalid/input"]`, r.FormValue("images"))
+					}
+				}
 				_, _ = fmt.Fprintf(w, `{"data":[{"url":"https://image.invalid/one"}],"usage":%s}`, tc.usage)
 			})
+			if tc.provider != 0 {
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", tc.provider).Error)
+				require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", "black-forest-labs/flux-1.1-pro").Error)
+			}
 			if tc.override != "" {
 				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", tc.override).Error)
 			}
 			var unified model.Model
 			require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
 			unified.ModelName = "gateway-image-tokenizer-" + strconv.Itoa(fixture.channel.ModelID)
-			if tc.reject {
+			if tc.reject && !tc.multipart {
 				unified.Capabilities.Limits.ContextLength = common.GetPointer(int64(1000))
+			}
+			if tc.reject && tc.multipart {
+				unified.Capabilities.Limits.MaxImages = common.GetPointer(int64(1))
 			}
 			require.NoError(t, model.DB.Save(&unified).Error)
 			fixture.fake.Advance(time.Second)
@@ -6280,6 +6417,110 @@ func mediaVolcengineAudioFrame(audio []byte, sequence int32) []byte {
 	binary.BigEndian.PutUint32(frame[8:12], uint32(len(audio)))
 	copy(frame[12:], audio)
 	return frame
+}
+
+func TestMediaGatewayVolcengineNativeErrorsUseSharedFailover(t *testing.T) {
+	for _, tc := range []struct {
+		code  int
+		class string
+		retry bool
+	}{{3001, "invalid_request", false}, {3003, "rate_limited", true}, {3005, "upstream_unavailable", true}, {3030, "upstream_unavailable", true}} {
+		for _, socket := range []bool{false, true} {
+			t.Run(fmt.Sprintf("code=%d/websocket=%t", tc.code, socket), func(t *testing.T) {
+				firstCalls, secondCalls := 0, 0
+				upgrader := websocket.Upgrader{}
+				fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
+					firstCalls++
+					if socket {
+						conn, err := upgrader.Upgrade(w, r, nil)
+						require.NoError(t, err)
+						defer conn.Close()
+						_, _, err = conn.ReadMessage()
+						require.NoError(t, err)
+						payload := []byte("provider-secret")
+						frame := make([]byte, 12+len(payload))
+						copy(frame, []byte{0x11, 0xf0, 0, 0})
+						binary.BigEndian.PutUint32(frame[4:8], uint32(tc.code))
+						binary.BigEndian.PutUint32(frame[8:12], uint32(len(payload)))
+						copy(frame[12:], payload)
+						require.NoError(t, conn.WriteMessage(websocket.BinaryMessage, frame))
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprintf(w, `{"code":%d,"message":"provider-secret"}`, tc.code)
+				})
+				var firstProvider model.Provider
+				require.NoError(t, model.DB.First(&firstProvider, fixture.channel.ProviderID).Error)
+				base := *firstProvider.BaseURL
+				if socket {
+					base = strings.Replace(base, "http://", "ws://", 1)
+				}
+				require.NoError(t, model.DB.Model(&firstProvider).Updates(map[string]any{"type": constant.ChannelTypeVolcEngine, "key": "access|secret", "base_url": base}).Error)
+				audio := make([]byte, 48000)
+				fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					secondCalls++
+					w.Header().Set("Content-Type", "audio/pcm")
+					_, _ = w.Write(audio)
+				}))
+				t.Cleanup(fallback.Close)
+				provider := &model.Provider{Name: "Native error fallback", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Key: "unused", BaseURL: &fallback.URL}
+				require.NoError(t, model.DB.Create(provider).Error)
+				channel := &model.Channel{ProviderID: provider.Id, ModelID: fixture.channel.ModelID, Protocol: protocol.OpenAIAudioSpeech, UpstreamModelName: "fallback-speech", ParameterOverrides: `{}`, MappingConfirmed: true, Status: model.ChannelEnabled, Weight: 1}
+				require.NoError(t, model.DB.Create(channel).Error)
+				fixture.fake.Advance(time.Second)
+				for _, price := range []*model.PriceVersion{{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("audio",ao*10)`, EffectiveAt: clock.Now().Unix()}, {OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("audio",ao)`, EffectiveAt: clock.Now().Unix()}, {OwnerType: model.PriceOwnerChannel, OwnerID: channel.ID, Currency: "USD", Expression: `tier("audio",ao*7)`, EffectiveAt: clock.Now().Unix()}} {
+					require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+				}
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", `{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm"}`)
+				assert.Equal(t, 1, firstCalls)
+				assert.NotContains(t, response.Body.String(), "provider-secret")
+				count := 1
+				charge := int64(0)
+				if tc.retry {
+					count = 2
+					charge = 153_000
+					require.Equal(t, 200, response.Code, response.Body.String())
+					assert.Equal(t, audio, response.Body.Bytes())
+					assert.Equal(t, 1, secondCalls)
+				} else {
+					assert.Equal(t, 400, response.Code)
+					assert.Zero(t, secondCalls)
+				}
+				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, charge, record.Receivable.Nanos)
+				attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, count, total)
+				byChannel := map[int]model.GatewayAttempt{}
+				for _, attempt := range attempts {
+					byChannel[attempt.ChannelID] = attempt
+				}
+				require.Contains(t, byChannel, fixture.channel.ID)
+				assert.Equal(t, tc.class, byChannel[fixture.channel.ID].ErrorClass)
+				assert.Zero(t, byChannel[fixture.channel.ID].Cost.Nanos)
+				if tc.retry {
+					require.Contains(t, byChannel, channel.ID)
+					assert.EqualValues(t, 119_000, byChannel[channel.ID].Cost.Nanos)
+				}
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, int64(1_000_000_000)-charge, wallet.Balance.Nanos)
+				entries, _, err := model.ListLedgerEntries(wallet.Id, 0, 20)
+				require.NoError(t, err)
+				holds := 0
+				for _, entry := range entries {
+					if entry.Type == model.LedgerEntryPreConsume {
+						holds++
+					}
+				}
+				assert.Equal(t, 1, holds)
+				reconciliation, err := model.ReconcileWallets(100)
+				require.NoError(t, err)
+				assert.Empty(t, reconciliation.Mismatches)
+			})
+		}
+	}
 }
 
 func TestMediaGatewayIncompleteSpeechBodyRetainsProcurement(t *testing.T) {
@@ -7274,6 +7515,54 @@ func TestMediaGatewayVLLMPCMUsesEffectiveSampleRate(t *testing.T) {
 	}
 }
 
+func TestMediaGatewayPCMStreamUsesCompleteSamples(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		chunks   [][]byte
+		channels int
+		frames   bool
+	}{
+		{name: "half sample", chunks: [][]byte{{0}}},
+		{name: "split sample", chunks: [][]byte{{0}, {0}}, frames: true},
+		{name: "trailing half sample", chunks: [][]byte{{0, 0, 0}}, frames: true},
+		{name: "half stereo sample", chunks: [][]byte{{0, 0}}, channels: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				channels := tc.channels
+				if channels == 0 {
+					channels = 1
+				}
+				for _, chunk := range tc.chunks {
+					_, _ = fmt.Fprintf(w, "data: {\"type\":\"speech.audio.delta\",\"audio\":%q,\"channels\":%d}\n\n", base64.StdEncoding.EncodeToString(chunk), channels)
+				}
+				_, _ = io.WriteString(w, "data: {\"type\":\"speech.audio.done\"}\n\ndata: [DONE]\n\n")
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeVLLM).Error)
+			fixture.fake.Advance(time.Second)
+			require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("audio",ao*7)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", `{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm","stream_format":"sse"}`)
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			sale, cost := int64(0), int64(0)
+			if tc.frames {
+				sale, cost = 9_000_000, 119_000
+				assert.Equal(t, "success", record.Status)
+				assert.Equal(t, len(tc.chunks), strings.Count(response.Body.String(), `"type":"speech.audio.delta"`))
+			} else {
+				assert.Equal(t, "failed", record.Status)
+				assert.NotContains(t, response.Body.String(), "[DONE]")
+			}
+			assert.Equal(t, sale, record.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, cost, attempts[0].Cost.Nanos)
+		})
+	}
+}
+
 func TestMediaGatewaySpeechJSONWithoutAudioReleasesFixedFee(t *testing.T) {
 	for _, tc := range []struct {
 		name, body                     string
@@ -7286,7 +7575,10 @@ func TestMediaGatewaySpeechJSONWithoutAudioReleasesFixedFee(t *testing.T) {
 		contentType                    string
 		tpm                            bool
 		inputText                      int64
+		format                         string
 	}{
+		{name: "PCM incomplete sample", body: "\x00", contentType: "audio/pcm", headerOutput: true, output: 1000},
+		{name: "MP3 metadata only", body: "ID3\x04\x00\x00\x00\x00\x00\x00", contentType: "audio/mpeg", format: "mp3", headerOutput: true, output: 1000},
 		{name: "audio MIME before colon", body: `{"error"`, contentType: "audio/pcm"},
 		{name: "audio MIME before colon short", body: `{"error"`, contentType: "audio/pcm", short: true},
 		{name: "audio MIME incomplete key", body: `{"erro`, contentType: "audio/pcm"},
@@ -7346,7 +7638,11 @@ func TestMediaGatewaySpeechJSONWithoutAudioReleasesFixedFee(t *testing.T) {
 			}
 			fixture.fake.Advance(time.Second)
 			require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: expression, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
-			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", `{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm"}`)
+			format := tc.format
+			if format == "" {
+				format = "pcm"
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", fmt.Sprintf(`{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":%q}`, format))
 			assert.Equal(t, http.StatusServiceUnavailable, response.Code)
 			assert.NotContains(t, response.Body.String(), `"usage"`)
 			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
@@ -7963,7 +8259,14 @@ func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.
 		output, audioZero bool
 		badFormat         string
 		inputAudioZero    bool
+		unterminated      bool
 	}{
+		{kind: protocol.OpenAIImages, unterminated: true},
+		{kind: protocol.OpenAIImages, unterminated: true, zero: true},
+		{kind: protocol.OpenAIAudioSpeech, unterminated: true},
+		{kind: protocol.OpenAIAudioSpeech, unterminated: true, zero: true},
+		{kind: protocol.OpenAIAudioSpeech, unterminated: true, output: true},
+		{kind: protocol.OpenAIAudioSpeech, unterminated: true, output: true, audioZero: true},
 		{kind: protocol.OpenAIImages}, {kind: protocol.OpenAIAudioSpeech}, {kind: protocol.OpenAIAudioTranscription},
 		{kind: protocol.OpenAIAudioTranscription, inputAudioZero: true},
 		{kind: protocol.OpenAIAudioTranscription, inputAudioZero: true, duration: true, seconds: "60"},
@@ -7979,10 +8282,17 @@ func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.
 	} {
 		kind := tc.kind
 		for _, stream := range []bool{false, true} {
+			if tc.unterminated && !stream {
+				continue
+			}
 			if stream && kind == protocol.OpenAIAudioTranscription || tc.badFormat != "" && !stream {
 				continue
 			}
-			t.Run(fmt.Sprintf("%s/stream=%t/duration=%t/seconds=%s/short=%t/zero=%t/output=%t/audioZero=%t/format=%s/inputAudioZero=%t", kind, stream, tc.duration, tc.seconds, tc.short, tc.zero, tc.output, tc.audioZero, tc.badFormat, tc.inputAudioZero), func(t *testing.T) {
+			name := fmt.Sprintf("%s/stream=%t/duration=%t/seconds=%s/short=%t/zero=%t/output=%t/audioZero=%t/format=%s/inputAudioZero=%t", kind, stream, tc.duration, tc.seconds, tc.short, tc.zero, tc.output, tc.audioZero, tc.badFormat, tc.inputAudioZero)
+			if tc.unterminated {
+				name = "unterminated/" + name
+			}
+			t.Run(name, func(t *testing.T) {
 				firstCalls, secondCalls := 0, 0
 				fixture := newMediaGatewayFixture(t, kind, func(w http.ResponseWriter, r *http.Request) {
 					firstCalls++
@@ -8006,7 +8316,13 @@ func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.
 					if tc.badFormat != "" {
 						body = strings.TrimSuffix(body, "}") + `,"channels":` + tc.badFormat + `}`
 					}
-					if stream && (kind != protocol.OpenAIAudioSpeech || tc.badFormat != "") {
+					if tc.unterminated {
+						if tc.zero {
+							body = strings.Replace(body, `"input_tokens":7`, `"input_tokens":0`, 1)
+						}
+						w.Header().Set("Content-Type", "text/event-stream")
+						body = "data: " + body + "\n"
+					} else if stream && (kind != protocol.OpenAIAudioSpeech || tc.badFormat != "") {
 						w.Header().Set("Content-Type", "text/event-stream")
 						body = "data: " + body + "\n\ndata: [DONE]\n\n"
 					} else {
@@ -8351,6 +8667,129 @@ func TestMediaGatewayImageFrameFailuresKeepSaleAndProcurementSeparate(t *testing
 	}
 }
 
+func TestMediaGatewayQueuedSourceUsageSurvivesWriteFailure(t *testing.T) {
+	for _, kind := range []protocol.Type{protocol.OpenAIImages, protocol.OpenAIAudioSpeech} {
+		for _, zero := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/zero=%t", kind, zero), func(t *testing.T) {
+				fixture := newMediaGatewayFixture(t, kind, func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					first := `{"type":"image_generation.completed","url":"https://image.invalid/one"}`
+					if kind == protocol.OpenAIAudioSpeech {
+						first = `{"type":"speech.audio.delta","audio":"AAA="}`
+					}
+					prompt, output := 1000, 100
+					if zero {
+						prompt, output = 0, 0
+					}
+					_, _ = fmt.Fprintf(w, "data: %s\n\ndata: {\"usage\":{\"input_tokens\":%d,\"output_tokens\":%d}}\n\n", first, prompt, output)
+				})
+				fixture.fake.Advance(time.Second)
+				require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("tokens",p*10+c*20)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+				body := &gatewayQueuedUsageBody{firstWrite: make(chan struct{}), queued: make(chan struct{}), closed: make(chan struct{})}
+				client := service.GetHttpClient()
+				original := client.Transport
+				t.Cleanup(func() { client.Transport = original })
+				client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
+					response, err := original.RoundTrip(request)
+					if err != nil {
+						return response, err
+					}
+					raw, err := io.ReadAll(response.Body)
+					_ = response.Body.Close()
+					if err != nil {
+						return nil, err
+					}
+					for part := range strings.SplitSeq(string(raw), "\n\n") {
+						if part != "" {
+							body.chunks = append(body.chunks, strings.NewReader(part+"\n\n"))
+						}
+					}
+					response.Body = body
+					return response, nil
+				})
+				recorder := httptest.NewRecorder()
+				var once sync.Once
+				writer := gatewayPrefixOnlyWriter{ResponseRecorder: recorder, beforeWrite: func() {
+					once.Do(func() { close(body.firstWrite) })
+					select {
+					case <-body.queued:
+					case <-time.After(10 * time.Second):
+						t.Error("scanner did not receive queued media usage")
+					}
+				}}
+				path, requestBody := "/v1/images/generations", `{"model":"gateway-alias","prompt":"draw","stream":true}`
+				if kind == protocol.OpenAIAudioSpeech {
+					path, requestBody = "/v1/audio/speech", `{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm","stream_format":"sse"}`
+				}
+				request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(requestBody))
+				request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+				request.Header.Set("Content-Type", "application/json")
+				fixture.engine.ServeHTTP(writer, request)
+				record, err := model.GetGatewayRequest(t.Context(), recorder.Header().Get(common.RequestIdKey), fixture.user.Id)
+				require.NoError(t, err)
+				assert.Zero(t, record.Receivable.Nanos)
+				attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, total)
+				prompt, output, cost := int64(1000), int64(100), int64(12_000_000)
+				if zero {
+					prompt, output, cost = 0, 0, 0
+				}
+				assert.Equal(t, prompt, attempts[0].Usage.PromptTokens)
+				assert.Equal(t, output, attempts[0].Usage.CompletionTokens)
+				assert.Equal(t, cost, attempts[0].Cost.Nanos)
+				assert.Equal(t, "upstream", attempts[0].UsageSource)
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
+			})
+		}
+	}
+}
+
+func TestMediaGatewaySpeechUsageFrameConfirmsActualDelivery(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("writer failure %t", fail), func(t *testing.T) {
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprintf(w, "data: {\"type\":\"speech.audio.delta\",\"audio\":%q,\"usage\":{\"input_tokens\":0,\"output_tokens\":1000}}\n\ndata: {\"type\":\"speech.audio.done\"}\n\ndata: [DONE]\n\n", base64.StdEncoding.EncodeToString(make([]byte, 48000)))
+			})
+			fixture.fake.Advance(time.Second)
+			require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("output",c*10)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+			request := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", strings.NewReader(`{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm","stream_format":"sse"}`))
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			if fail {
+				fixture.engine.ServeHTTP(&mediaFrameFailureWriter{ResponseRecorder: response, failFrame: 1}, request)
+			} else {
+				fixture.engine.ServeHTTP(response, request)
+			}
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			sale := int64(9_000_000)
+			frames := 1
+			if fail {
+				sale = 0
+				frames = 0
+				assert.Equal(t, "failed", record.Status)
+			} else {
+				assert.Equal(t, "success", record.Status)
+				assert.Contains(t, response.Body.String(), "[DONE]")
+			}
+			assert.Equal(t, frames, strings.Count(response.Body.String(), `"type":"speech.audio.delta"`))
+			assert.Equal(t, sale, record.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.EqualValues(t, 10_000_000, attempts[0].Cost.Nanos)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.EqualValues(t, 1_000_000_000-sale, wallet.Balance.Nanos)
+		})
+	}
+}
+
 func TestMediaGatewayInterruptedSpeechBillsDeliveredAudioAndRetainsProcurement(t *testing.T) {
 	fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -8366,6 +8805,7 @@ func TestMediaGatewayInterruptedSpeechBillsDeliveredAudioAndRetainsProcurement(t
 	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", `{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm","stream_format":"sse"}`)
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 	assert.NotContains(t, response.Body.String(), "[DONE]")
+	assert.Equal(t, 1, strings.Count(response.Body.String(), `"type":"speech.audio.delta"`), "the accepted audio frame must reach the client even when it carries usage")
 	assert.True(t, strings.Contains(response.Body.String(), `"error"`), "an interrupted stream must report a protocol error after its last delivered frame")
 	id := response.Header().Get(common.RequestIdKey)
 	record, err := model.GetGatewayRequest(t.Context(), id, fixture.user.Id)
@@ -11841,8 +12281,8 @@ func TestTextGatewayChatInputDetailsReachPurchaseAccounting(t *testing.T) {
 			require.NoError(t, err)
 			require.EqualValues(t, 1, total)
 			assert.Equal(t, int64(3), attempts[0].Usage.CachedTokens)
-			assert.Equal(t, int64(2), attempts[0].Usage.AudioInputTokens)
-			assert.Equal(t, int64(1), attempts[0].Usage.ImageInputTokens)
+			assert.Equal(t, new(int64(2)), attempts[0].Usage.AudioInputTokens)
+			assert.Equal(t, new(int64(1)), attempts[0].Usage.ImageInputTokens)
 			assert.Equal(t, int64(10000), attempts[0].Cost.Nanos)
 		})
 	}
@@ -13166,6 +13606,109 @@ func TestTextGatewayVertexClaudePreservesActualWire(t *testing.T) {
 	assert.Equal(t, int64(20000), attempts[0].Cost.Nanos)
 }
 
+func TestMediaGatewayPurchaseSnapshotFollowsCredentialWait(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		total int
+		wait  time.Duration
+		loss  bool
+	}{{"fresh price and FX after wait", 90, 10 * time.Second, false}, {"remaining budget below five seconds", 10, 7 * time.Second, false}, {"fresh price fails profit gate", 90, 10 * time.Second, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "audio/pcm")
+				_, _ = w.Write(make([]byte, 48000))
+			})
+			fixture.fake.Advance(time.Second)
+			require.NoError(t, model.UpdateOption("GatewayTotalFirstByteSeconds", strconv.Itoa(tc.total)))
+			require.NoError(t, model.DB.Model(fixture.offering).Update("allow_loss_fallback", false).Error)
+			_, err := model.SaveFXRate(t.Context(), "EUR", "USD", "1", "0", fixture.sale.CreatedBy)
+			require.NoError(t, err)
+			initial := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "EUR", Expression: `tier("before",fixed(0.001))`, EffectiveAt: clock.Now().Unix()}
+			require.NoError(t, model.CreatePriceVersion(t.Context(), initial, fixture.sale.CreatedBy))
+			started := clock.Now()
+			expression := `tier("after",fixed(0.002))`
+			if tc.loss {
+				expression = `tier("after",fixed(0.02))`
+			}
+			later := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "EUR", Expression: expression, EffectiveAt: started.Add(5 * time.Second).Unix()}
+			err = model.CreatePriceVersion(t.Context(), later, fixture.sale.CreatedBy)
+			var priceConfirmation *model.MarginConfirmationError
+			if errors.As(err, &priceConfirmation) {
+				later.MarginConfirmation = priceConfirmation.Report.Revision
+				err = model.CreatePriceVersion(t.Context(), later, fixture.sale.CreatedBy)
+			}
+			require.NoError(t, err)
+			before, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			locked := model.DB.Begin()
+			require.NoError(t, locked.Error)
+			t.Cleanup(func() { locked.Rollback() })
+			var provider model.Provider
+			require.NoError(t, locked.Clauses(clause.Locking{Strength: "UPDATE"}).First(&provider, fixture.channel.ProviderID).Error)
+			var response *httptest.ResponseRecorder
+			done := make(chan struct{})
+			go func() {
+				response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", `{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm"}`)
+				close(done)
+			}()
+			require.Eventually(t, func() bool {
+				var waiting bool
+				err := model.DB.Raw(`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid())`).Scan(&waiting).Error
+				return err == nil && waiting
+			}, 10*time.Second, 10*time.Millisecond, "request must reach the real Provider row lock")
+			fixture.fake.Advance(tc.wait)
+			_, err = model.SaveFXRate(t.Context(), "EUR", "USD", "2", "0", fixture.sale.CreatedBy)
+			var confirmation *model.MarginConfirmationError
+			if errors.As(err, &confirmation) {
+				_, err = model.SaveFXRate(t.Context(), "EUR", "USD", "2", "0", fixture.sale.CreatedBy, confirmation.Report.Revision)
+			}
+			require.NoError(t, err)
+			require.NoError(t, locked.Commit().Error)
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("request did not finish after credential unlock")
+			}
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+			require.NoError(t, err)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			if tc.total == 10 || tc.loss {
+				assert.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+				assert.Zero(t, calls)
+				assert.Zero(t, total)
+				assert.Zero(t, record.Receivable.Nanos)
+				assert.Equal(t, before.Balance, wallet.Balance)
+			} else {
+				require.Equal(t, 200, response.Code, response.Body.String())
+				assert.Equal(t, 1, calls)
+				require.EqualValues(t, 1, total)
+				assert.Equal(t, later.ID, attempts[0].PurchasePriceVersionID)
+				assert.Equal(t, started.Add(tc.wait).UnixMilli(), attempts[0].StartedAt)
+				assert.Equal(t, "2", attempts[0].AccountingFXRate)
+				assert.EqualValues(t, 2_000_000, attempts[0].Cost.Nanos)
+				assert.EqualValues(t, 4_000_000, attempts[0].ConvertedCost.Nanos)
+			}
+			entries, _, err := model.ListLedgerEntries(wallet.Id, 0, 20)
+			require.NoError(t, err)
+			holds := 0
+			for _, entry := range entries {
+				if entry.Type == model.LedgerEntryPreConsume {
+					holds++
+				}
+			}
+			assert.Equal(t, 1, holds)
+			reconciliation, err := model.ReconcileWallets(100)
+			require.NoError(t, err)
+			assert.Empty(t, reconciliation.Mismatches)
+		})
+	}
+}
+
 func TestTextGatewayPurchaseSnapshotFollowsCredentialWait(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -13769,7 +14312,7 @@ func TestTextGatewayMalformedModalityDetailsRetainValidUsage(t *testing.T) {
 			assert.Equal(t, "upstream", attempts[0].UsageSource)
 			assert.Equal(t, int64(10), attempts[0].Usage.PromptTokens)
 			assert.Equal(t, int64(5), attempts[0].Usage.CompletionTokens)
-			assert.Equal(t, int64(2), attempts[0].Usage.AudioInputTokens)
+			assert.Equal(t, new(int64(2)), attempts[0].Usage.AudioInputTokens)
 			assert.Equal(t, int64(20000), attempts[0].Cost.Nanos)
 		})
 	}
@@ -14247,7 +14790,7 @@ func TestTextGatewayConvertedStreamPreservesUsagePresence(t *testing.T) {
 	require.Len(t, requests, 1)
 	assert.Equal(t, "upstream", requests[0].UsageSource)
 	assert.Equal(t, int64(0), requests[0].Usage.CachedTokens)
-	assert.Equal(t, int64(2), requests[0].Usage.AudioInputTokens)
+	assert.Equal(t, new(int64(2)), requests[0].Usage.AudioInputTokens)
 }
 
 func TestTextGatewayAllEntrancesEnforceCredentialAndOfferingChecks(t *testing.T) {
@@ -15467,9 +16010,11 @@ func (w *mediaFrameFailureWriter) Write(body []byte) (int, error) {
 			return 0, io.ErrClosedPipe
 		}
 	}
-	if strings.HasPrefix(text, "data: ") && (strings.Contains(text, `"type":"image_generation.completed"`) || strings.Contains(text, `"type":"speech.audio.delta"`)) {
-		w.frames++
-		if w.failFrame > 0 && w.frames == w.failFrame {
+	if strings.HasPrefix(text, "data: ") {
+		frames := strings.Count(text, `"type":"image_generation.completed"`) + strings.Count(text, `"type":"speech.audio.delta"`)
+		previous := w.frames
+		w.frames += frames
+		if w.failFrame > previous && w.failFrame <= w.frames {
 			return 0, io.ErrClosedPipe
 		}
 	}

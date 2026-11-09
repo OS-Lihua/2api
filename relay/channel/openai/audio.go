@@ -167,11 +167,7 @@ func speechAudioPayload(ctx context.Context, body []byte, format string, facts *
 	}
 	first := payload[0]
 	if format == "pcm" {
-		channels := int64(1)
-		if facts != nil && facts.AudioOutputChannels > 0 && facts.AudioOutputChannels <= 1<<31-1 {
-			channels = int64(facts.AudioOutputChannels)
-		}
-		if int64(len(body))%(channels*2) != 0 {
+		if int64(len(body)) < facts.AudioPCMFrameBytes() {
 			return false
 		}
 		binary := !utf8.Valid(body)
@@ -197,7 +193,8 @@ func speechAudioPayload(ctx context.Context, body []byte, format string, facts *
 
 func speechAudioDuration(ctx context.Context, audio []byte, format string, facts *relaycommon.ResponseFacts) (float64, error) {
 	if format == "pcm" {
-		return float64(len(audio)) / float64(facts.AudioPCMBytesPerSecond()), nil
+		completeBytes := int64(len(audio)) / facts.AudioPCMFrameBytes() * facts.AudioPCMFrameBytes()
+		return float64(completeBytes) / float64(facts.AudioPCMBytesPerSecond()), nil
 	}
 	if format == "wav" {
 		return common.WAVDuration(bytes.NewReader(audio))
@@ -385,24 +382,66 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	if info.IsStream && info.ResponseFacts != nil {
 		var audioBytes, deliveredAudioBytes int64
 		var generatedPCMSeconds, deliveredPCMSeconds big.Rat
+		var pcmRemainder int64
+		pcmChunkSeconds := func(size int64) *big.Rat {
+			bytes := pcmRemainder + size
+			frameBytes := formatFacts.AudioPCMFrameBytes()
+			pcmRemainder = bytes % frameBytes
+			return new(big.Rat).SetFrac64(bytes-pcmRemainder, formatFacts.AudioPCMBytesPerSecond())
+		}
 		var encodedAudio bytes.Buffer
 		var completed bool
 		var generatedAudioPayload bool
+		observeStoppedSource := func(data string) {
+			raw := []byte(data)
+			eventFacts := mediaResponseEnvelope(raw)
+			mergeMediaStreamUsage(info, usage, raw)
+			if observeMediaError(info, eventFacts, resp.StatusCode) != nil || !ojson.ValidBytes(raw) {
+				return
+			}
+			kind := ojson.GetBytes(raw, "type").Str
+			if kind == "speech.audio.done" {
+				if duration := ojson.GetBytes(eventFacts, "duration"); duration.Exists() && duration.Raw != "null" {
+					info.ResponseFacts.AudioOutputDurationInvalid = true
+					if duration.Type == ojson.Number {
+						ObserveSpeechOutputSeconds(info, duration.Raw)
+					}
+				}
+				return
+			}
+			if kind != "speech.audio.delta" {
+				return
+			}
+			if info.ChannelType == constant.ChannelTypeVLLM {
+				for name, target := range map[string]*int{"sample_rate": &formatFacts.AudioOutputSampleRate, "channels": &formatFacts.AudioOutputChannels} {
+					if rawValue := ojson.GetBytes(raw, name); rawValue.Exists() && rawValue.Raw != "null" {
+						var value int
+						if common.UnmarshalJsonStr(rawValue.Raw, &value) != nil || value <= 0 || value > 1<<31-1 {
+							return
+						}
+						*target = value
+					}
+				}
+			}
+			encoded := ojson.GetBytes(raw, "audio").Str
+			if encoded == "" {
+				encoded = ojson.GetBytes(raw, "delta").Str
+			}
+			audio, err := base64.StdEncoding.DecodeString(encoded)
+			if err != nil || int64(len(audio)) > math.MaxInt64-audioBytes {
+				return
+			}
+			audioBytes += int64(len(audio))
+			if audioFormat == "pcm" {
+				generatedPCMSeconds.Add(&generatedPCMSeconds, pcmChunkSeconds(int64(len(audio))))
+			} else if info.ResponseFacts.AudioOutputSeconds == nil || audioFormat == "wav" {
+				_, _ = encodedAudio.Write(audio)
+			}
+		}
 		helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 			eventBody := []byte(data)
 			eventFacts := mediaResponseEnvelope(eventBody)
-			if raw := ojson.GetBytes(eventFacts, "usage"); raw.Exists() && raw.Raw != "null" {
-				reported := reportedMediaUsage(eventFacts)
-				prompt, completion := relaycommon.MediaUsagePresence(eventFacts)
-				observeMediaUsage(info, reported, eventFacts)
-				if prompt {
-					usage.PromptTokens = reported.PromptTokens
-				}
-				if completion {
-					usage.CompletionTokens = reported.CompletionTokens
-				}
-				mergeMediaTokenDetails(usage, eventFacts)
-			}
+			mergeMediaStreamUsage(info, usage, eventBody)
 			if observeMediaError(info, eventFacts, resp.StatusCode) != nil {
 				sr.Stop(errors.New("upstream speech stream failed"))
 				return
@@ -463,20 +502,23 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 				chunkBytes = int64(len(audio))
 				audioBytes += chunkBytes
 				if audioFormat == "pcm" {
-					chunkPCMSeconds.SetFrac64(chunkBytes, formatFacts.AudioPCMBytesPerSecond())
+					chunkPCMSeconds.Set(pcmChunkSeconds(chunkBytes))
 					generatedPCMSeconds.Add(&generatedPCMSeconds, &chunkPCMSeconds)
 				}
 				if audioFormat != "pcm" && (info.ResponseFacts.AudioOutputSeconds == nil || audioFormat == "wav") {
 					_, _ = encodedAudio.Write(audio)
 				}
 				business = len(audio) > 0
+				if audioFormat == "pcm" {
+					business = chunkPCMSeconds.Sign() > 0
+				}
 				if audioFormat == "wav" {
 					duration, err := common.WAVDuration(bytes.NewReader(encodedAudio.Bytes()))
 					business = business && err == nil && duration > 0
 				}
 				generatedAudioPayload = generatedAudioPayload || business
 			}
-			writeErr := helper.StringData(c, data)
+			writeErr := helper.WriteGatewayStreamFrame(c, info.ResponseFacts, "data: "+data+"\n\n", business)
 			var flushErr *helper.StreamFlushError
 			if chunkBytes > 0 && (writeErr == nil || errors.As(writeErr, &flushErr)) {
 				deliveredAudioBytes += chunkBytes
@@ -486,12 +528,19 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 				}
 			}
 			if writeErr != nil {
-				info.ResponseFacts.DownstreamWriteFailed = true
+				if !errors.Is(writeErr, helper.ErrGatewayStreamPreludeLimit) {
+					info.ResponseFacts.DownstreamWriteFailed = true
+				}
 				sr.Stop(writeErr)
 			} else if chunk.Type == "speech.audio.done" {
 				sr.Done()
 			}
-		})
+		}, observeStoppedSource)
+		if len(info.ResponseFacts.UnterminatedStreamData) > 0 {
+			observeStoppedSource(string(info.ResponseFacts.UnterminatedStreamData))
+			info.ResponseFacts.UnterminatedStreamData = nil
+			info.ResponseFacts.UnterminatedStreamEvent = ""
+		}
 		if info.StreamStatus != nil {
 			info.StreamStatus.RequireTerminal()
 			if completed && info.StreamStatus.IsNormalEnd() && !info.StreamStatus.HasErrors() {
@@ -608,6 +657,15 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			} else {
 				c.Writer.WriteHeaderNow()
 			}
+			applySpeechUsageHeaders(info, usage, resp.Header)
+			return usage
+		}
+		if info.ResponseFacts != nil && !speechAudioPayload(c.Request.Context(), bodyBytes, audioFormat, formatFacts) {
+			usage = EstimateGeneratedSpeech(c, info, bodyBytes, true)
+			if info.StreamStatus == nil {
+				info.StreamStatus = relaycommon.NewStreamStatus()
+			}
+			info.StreamStatus.MarkFailed("", "invalid_response", http.StatusBadGateway)
 			applySpeechUsageHeaders(info, usage, resp.Header)
 			return usage
 		}

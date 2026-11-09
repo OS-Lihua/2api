@@ -162,6 +162,23 @@ func observeMediaError(info *relaycommon.RelayInfo, body []byte, status int) *ty
 	return fault
 }
 
+// mergeMediaStreamUsage retains independent counters across source frames,
+// including frames that cannot be delivered or are missing SSE termination.
+func mergeMediaStreamUsage(info *relaycommon.RelayInfo, usage *dto.Usage, body []byte) {
+	facts := mediaResponseEnvelope(body)
+	reported := reportedMediaUsage(facts)
+	prompt, completion := relaycommon.MediaUsagePresence(facts)
+	observeMediaUsage(info, reported, facts)
+	if prompt {
+		usage.PromptTokens = reported.PromptTokens
+	}
+	if completion {
+		usage.CompletionTokens = reported.CompletionTokens
+	}
+	mergeMediaTokenDetails(usage, facts)
+	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+}
+
 // observeMediaUsage preserves each reported counter, including explicit zero,
 // across OpenAI-compatible image and audio response envelopes.
 func observeMediaUsage(info *relaycommon.RelayInfo, usage *dto.Usage, body []byte) {

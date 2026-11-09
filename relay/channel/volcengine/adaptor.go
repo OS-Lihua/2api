@@ -69,7 +69,7 @@ func convertTTSRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.
 		}
 	}
 	voiceType := mapVoiceType(request.Voice)
-	speedRatio := lo.FromPtrOr(request.Speed, 0.0)
+	speedRatio := lo.FromPtrOr(request.Speed, 1.0)
 	encoding := mapEncoding(request.ResponseFormat)
 
 	c.Set(contextKeyResponseFormat, encoding)
