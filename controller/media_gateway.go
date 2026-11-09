@@ -600,12 +600,19 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		saleUsage := usage
 		billableFacts := *facts
 		saleCount := actualCount
-		if info.IsStream && run.parsed.Protocol == protocol.OpenAIImages && facts.DownstreamWriteFailed && !facts.UsageReported && facts.ImageCount != nil {
-			delivered := min(facts.DeliveredImageCount, *facts.ImageCount)
+		if info.IsStream && run.parsed.Protocol == protocol.OpenAIImages && (facts.DownstreamWriteFailed || attempt.Status == "partial") && attempt.Status != "cancelled" && !facts.UsageReported {
+			delivered := facts.DeliveredImageCount
+			if facts.ImageCount != nil {
+				delivered = min(delivered, *facts.ImageCount)
+			}
 			billableFacts.ImageCount = &delivered
 			saleCount = []int{int(delivered)}
-			if (facts.ImageOutputTokensEstimated || facts.ImageOutputTokensUnknown && facts.DeliveredImageOutputTokensEstimate != nil) && *facts.ImageCount > 0 {
-				tokens, clamp := common.QuotaFromFloatChecked(float64(usage.CompletionTokenDetails.ImageTokens) * float64(delivered) / float64(*facts.ImageCount))
+			if facts.ImageOutputTokensEstimated || facts.ImageOutputTokensUnknown && facts.DeliveredImageOutputTokensEstimate != nil {
+				tokens := 0
+				var clamp *common.QuotaClamp
+				if facts.ImageCount != nil && *facts.ImageCount > 0 {
+					tokens, clamp = common.QuotaFromFloatChecked(float64(usage.CompletionTokenDetails.ImageTokens) * float64(delivered) / float64(*facts.ImageCount))
+				}
 				if facts.DeliveredImageOutputTokensEstimate != nil {
 					tokens = *facts.DeliveredImageOutputTokensEstimate
 					billableFacts.ImageOutputTokensUnknown = false

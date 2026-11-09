@@ -7,9 +7,12 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 )
 
-type imageRequest map[string]any
+type imageRequest struct {
+	Input        map[string]any `json:"input"`
+	requireImage bool
+}
 
-func (imageRequest) ProjectImageRequest(body []byte, public dto.ImageRequest) (*dto.ImageRequest, error) {
+func (request imageRequest) ProjectImageRequest(body []byte, public dto.ImageRequest) (*dto.ImageRequest, error) {
 	var wire struct {
 		Input struct {
 			Prompt string            `json:"prompt"`
@@ -26,6 +29,10 @@ func (imageRequest) ProjectImageRequest(body []byte, public dto.ImageRequest) (*
 	}
 	if count == 0 || count > dto.MaxImageN || wire.Input.Prompt == "" {
 		return nil, fmt.Errorf("invalid Replicate image quantities")
+	}
+	public.Image, public.Images = nil, nil
+	if request.requireImage && (len(wire.Input.Image) == 0 || string(wire.Input.Image) == "null") {
+		return nil, fmt.Errorf("Replicate image edits require an image input")
 	}
 	if len(wire.Input.Image) > 0 && string(wire.Input.Image) != "null" {
 		var image string

@@ -73,6 +73,13 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 	if info == nil {
 		return nil, errors.New("replicate adaptor: relay info is nil")
 	}
+	if info.ResponseFacts != nil && info.RelayMode != relayconstant.RelayModeImagesEdits {
+		for _, value := range []common.RawMessage{request.Image, request.Images, request.Mask} {
+			if len(value) > 0 && string(value) != "null" {
+				return nil, errors.New("replicate adaptor cannot preserve standard image inputs for generation")
+			}
+		}
+	}
 	if strings.TrimSpace(request.Prompt) == "" {
 		if v := c.PostForm("prompt"); strings.TrimSpace(v) != "" {
 			request.Prompt = v
@@ -237,7 +244,7 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 	}
 	if info.ResponseFacts != nil {
 		c.Request.Header.Set("Content-Type", "application/json")
-		return imageRequest{"input": inputPayload}, nil
+		return imageRequest{Input: inputPayload, requireImage: info.RelayMode == relayconstant.RelayModeImagesEdits}, nil
 	}
 	return map[string]any{
 		"input": inputPayload,

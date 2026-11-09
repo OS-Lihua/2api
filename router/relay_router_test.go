@@ -4712,7 +4712,7 @@ func TestMediaGatewayJimengNativeImageInputsHonorCapabilities(t *testing.T) {
 func TestMediaGatewayReplicateEditsRejectInputLoss(t *testing.T) {
 	var picture bytes.Buffer
 	require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
-	for _, name := range []string{"single", "mask", "multiple"} {
+	for _, name := range []string{"single", "mask", "multiple", "generation image", "generation images", "removed native input"} {
 		t.Run(name, func(t *testing.T) {
 			calls := 0
 			fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
@@ -4736,7 +4736,18 @@ func TestMediaGatewayReplicateEditsRejectInputLoss(t *testing.T) {
 			if name == "multiple" {
 				additional = []string{"image[]"}
 			}
+			if name == "removed native input" {
+				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", `{"operations":[{"path":"input.image_prompt","mode":"set","value":null}]}`).Error)
+			}
 			request := mediaMultipartRequest(t, "/v1/images/edits", map[string]string{"model": "gateway-alias", "prompt": "edit"}, "image", picture.Bytes(), additional...)
+			if strings.HasPrefix(name, "generation") {
+				field := `"image":"https://image.invalid/input"`
+				if name == "generation images" {
+					field = `"images":["https://image.invalid/a","https://image.invalid/b"]`
+				}
+				request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gateway-alias","prompt":"draw",`+field+`}`))
+				request.Header.Set("Content-Type", "application/json")
+			}
 			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
 			response := httptest.NewRecorder()
 			fixture.engine.ServeHTTP(response, request)
@@ -5412,9 +5423,9 @@ func TestMediaGatewaySpeechDurationCapsRequireExecutableControl(t *testing.T) {
 
 func TestMediaGatewayMissingImageOutputUsageEstimatesOrStaysPending(t *testing.T) {
 	for _, tc := range []struct {
-		name, model, quality                                            string
-		tokens                                                          int64
-		unknown, zero, free, resolved, two, mixed, partial, costUnknown bool
+		name, model, quality                                                           string
+		tokens                                                                         int64
+		unknown, zero, free, resolved, two, mixed, partial, costUnknown, upstreamShort bool
 	}{
 		{name: "known low", model: "gpt-image-1.5", quality: "low", tokens: 272},
 		{name: "known medium", model: "gpt-image-1", quality: "medium", tokens: 1056},
@@ -5424,13 +5435,14 @@ func TestMediaGatewayMissingImageOutputUsageEstimatesOrStaysPending(t *testing.T
 		{name: "mixed frame parameters", model: "gpt-image-1.5", quality: "auto", tokens: 672, two: true, resolved: true, mixed: true},
 		{name: "mixed frames partial delivery", model: "gpt-image-1.5", quality: "auto", tokens: 672, two: true, resolved: true, mixed: true, partial: true},
 		{name: "known delivered frame unknown procurement", model: "gpt-image-1.5", quality: "auto", two: true, resolved: true, mixed: true, partial: true, costUnknown: true},
+		{name: "upstream short after known frame", model: "gpt-image-1.5", quality: "auto", resolved: true, upstreamShort: true, costUnknown: true},
 		{name: "unknown model", model: "image-01", quality: "low", unknown: true},
 		{name: "unresolved quality", model: "gpt-image-1.5", quality: "auto", unknown: true},
 		{name: "explicit zero", model: "gpt-image-1.5", quality: "low", zero: true},
 		{name: "unselected token branch", model: "image-01", quality: "low", free: true},
 	} {
 		for _, mode := range []string{"json", "json-sse", "native-sse"} {
-			if tc.mixed && mode != "native-sse" {
+			if (tc.mixed || tc.upstreamShort) && mode != "native-sse" {
 				continue
 			}
 			t.Run(tc.name+"/"+mode, func(t *testing.T) {
@@ -5439,6 +5451,9 @@ func TestMediaGatewayMissingImageOutputUsageEstimatesOrStaysPending(t *testing.T
 				if tc.two {
 					count = 2
 					requested = 3
+				}
+				if tc.upstreamShort {
+					requested = 2
 				}
 				fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
 					w.Header().Set("Content-Type", "application/json")
@@ -5451,6 +5466,12 @@ func TestMediaGatewayMissingImageOutputUsageEstimatesOrStaysPending(t *testing.T
 					}
 					if mode == "native-sse" {
 						w.Header().Set("Content-Type", "text/event-stream")
+						if tc.upstreamShort {
+							frame := fmt.Sprintf("data: {\"type\":\"image_generation.completed\",\"url\":\"https://image.invalid/one\"%s}\n\n", usage)
+							w.Header().Set("Content-Length", strconv.Itoa(len(frame)+1))
+							_, _ = io.WriteString(w, frame)
+							return
+						}
 						for i := range count {
 							shape := usage
 							if tc.mixed && i > 0 {
@@ -5529,7 +5550,7 @@ func TestMediaGatewayMissingImageOutputUsageEstimatesOrStaysPending(t *testing.T
 					return
 				}
 				saleTokens := tc.tokens
-				if tc.partial {
+				if tc.partial || tc.upstreamShort {
 					saleTokens = 272
 				}
 				assert.Equal(t, saleTokens, record.Usage.CompletionTokens)
@@ -5559,7 +5580,7 @@ func TestMediaGatewayMissingImageOutputUsageEstimatesOrStaysPending(t *testing.T
 				}
 				assert.Equal(t, saleTokens*8100, record.Receivable.Nanos)
 				assert.Equal(t, tc.tokens*7000, attempts[0].Cost.Nanos)
-				if tc.partial {
+				if tc.partial || tc.upstreamShort {
 					wallet, err := model.GetUserWallet(fixture.user.Id)
 					require.NoError(t, err)
 					assert.EqualValues(t, 1_000_000_000-saleTokens*8100, wallet.Balance.Nanos)
