@@ -155,9 +155,9 @@ export function RequestUsageFacts(props: {
       {(
         [
           ['cr', t('Cached tokens'), props.usage.cached_tokens],
-          ['cw', t('Cache Write'), props.usage.cache_creation_tokens],
+          ['cc', t('Cache Write'), props.usage.cache_creation_tokens],
           [
-            'cw12',
+            'cc12h',
             t('Cache Write (12h)'),
             props.usage.cache_creation_12h_tokens,
           ],
@@ -205,7 +205,7 @@ export function RequestUsageFacts(props: {
       {props.source !== 'none' && props.usage.total_tokens !== undefined && (
         <div className='text-muted-foreground'>
           {t('Total tokens')}:{' '}
-          {unmeasured.length > 0
+          {unmeasured.includes('p') || unmeasured.includes('c')
             ? t('Unknown')
             : formatNumber(props.usage.total_tokens, locale)}
         </div>

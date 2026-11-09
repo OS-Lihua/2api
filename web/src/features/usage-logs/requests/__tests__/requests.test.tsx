@@ -879,7 +879,7 @@ it('shows unmeasured output and total as unknown while retaining known media cou
               completion_tokens: 0,
               total_tokens: 120,
               image_count: 1,
-              unmeasured_tokens: ['c', 'img_o', 'cr', 'cw', 'cw12'],
+              unmeasured_tokens: ['c', 'img_o', 'cr', 'cc', 'cc12h'],
             },
           },
         ],
@@ -898,6 +898,40 @@ it('shows unmeasured output and total as unknown while retaining known media cou
   expect(screen.getByText('Cache Write (12h): Unknown')).toBeVisible()
   expect(screen.getByText('Image count: 1')).toBeVisible()
   expect(screen.queryByText('Image input tokens: 0')).not.toBeInTheDocument()
+})
+
+it('keeps measured totals while cache quantities are unknown', async () => {
+  api.defaults.adapter = async (config) => ({
+    config,
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+    data: {
+      success: true,
+      data: {
+        items: [
+          {
+            ...request,
+            usage: {
+              prompt_tokens: 10,
+              completion_tokens: 5,
+              total_tokens: 15,
+              unmeasured_tokens: ['cr', 'cc', 'cc12h'],
+            },
+          },
+        ],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      },
+    },
+  })
+  renderRequests()
+  expect(await screen.findByText('Input: 10 · Output: 5')).toBeVisible()
+  expect(screen.getByText('Total tokens: 15')).toBeVisible()
+  expect(screen.getByText('Cached tokens: Unknown')).toBeVisible()
+  expect(screen.getByText('Cache Write: Unknown')).toBeVisible()
+  expect(screen.getByText('Cache Write (12h): Unknown')).toBeVisible()
 })
 
 it('preserves nonzero measured audio duration and reacts to all interface locales', async () => {
