@@ -46,6 +46,11 @@ type BatchTaskPollingAdaptor interface {
 	ParseBatchResult(tasks []*model.Task, resp *http.Response, body []byte) (map[string]*BatchTaskResult, error)
 }
 
+type contextBatchTaskPollingAdaptor interface {
+	FetchBatchTasksWithContext(context.Context, string, string, []*model.Task, string) (*http.Response, error)
+	ParseBatchResultWithContext(context.Context, []*model.Task, *http.Response, []byte) (map[string]*BatchTaskResult, error)
+}
+
 const (
 	pollClassOK           = "ok"
 	pollClassOtherClient  = "other_client"
@@ -340,13 +345,25 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	}
 	info.ApiKey = ch.Key
 	adaptor.Init(info)
-	resp, err := adaptor.FetchBatchTasks(baseURL, ch.Key, tasks, proxy)
+	contextual, hasContext := adaptor.(contextBatchTaskPollingAdaptor)
+	var resp *http.Response
+	if hasContext {
+		resp, err = contextual.FetchBatchTasksWithContext(ctx, baseURL, ch.Key, tasks, proxy)
+	} else {
+		resp, err = adaptor.FetchBatchTasks(baseURL, ch.Key, tasks, proxy)
+	}
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		common.SysLog(common.LogText("Get Task Do req error: %v", err))
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassTransport, 0, err.Error())
 	}
 	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(resp.Body)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err != nil {
 		common.SysLog(common.LogText("Get Suno Task parse body error: %v", err))
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassTransport, resp.StatusCode, err.Error())
@@ -365,7 +382,15 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	case pollClassTransient:
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassTransient, resp.StatusCode, "")
 	}
-	responseItems, err := adaptor.ParseBatchResult(tasks, resp, responseBody)
+	var responseItems map[string]*BatchTaskResult
+	if hasContext {
+		responseItems, err = contextual.ParseBatchResultWithContext(ctx, tasks, resp, responseBody)
+	} else {
+		responseItems, err = adaptor.ParseBatchResult(tasks, resp, responseBody)
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err != nil {
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassHookError, resp.StatusCode, err.Error())
 	}

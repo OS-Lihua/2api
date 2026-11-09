@@ -1135,7 +1135,10 @@ func checkGatewayTaskCredentials(ctx context.Context) error {
 func (a *TaskAdaptor) FetchMode() string { return a.plugin.Meta.FetchMode }
 
 func (a *TaskAdaptor) FetchBatchTasks(baseURL, key string, tasks []*model.Task, proxy string) (*http.Response, error) {
-	requestCtx := context.Background()
+	return a.FetchBatchTasksWithContext(context.Background(), baseURL, key, tasks, proxy)
+}
+
+func (a *TaskAdaptor) FetchBatchTasksWithContext(requestCtx context.Context, baseURL, key string, tasks []*model.Task, proxy string) (*http.Response, error) {
 	for _, task := range tasks {
 		requestCtx = a.gatewayTaskCredentialContext(requestCtx, task, key)
 	}
@@ -1371,6 +1374,10 @@ func (a *TaskAdaptor) doFetchDescriptorWithContext(requestCtx context.Context, b
 }
 
 func (a *TaskAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response, body []byte) (map[string]*service.BatchTaskResult, error) {
+	return a.ParseBatchResultWithContext(context.Background(), tasks, resp, body)
+}
+
+func (a *TaskAdaptor) ParseBatchResultWithContext(requestCtx context.Context, tasks []*model.Task, resp *http.Response, body []byte) (map[string]*service.BatchTaskResult, error) {
 	started := time.Now()
 	input := any(string(body))
 	var decoded any
@@ -1378,7 +1385,6 @@ func (a *TaskAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response,
 		input = decoded
 	}
 	key, baseURL, proxy := a.queryCredentials()
-	requestCtx := context.Background()
 	for _, task := range tasks {
 		requestCtx = a.gatewayTaskCredentialContext(requestCtx, task, key)
 	}
@@ -1417,7 +1423,7 @@ func (a *TaskAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response,
 		return nil, err
 	}
 	results := make(map[string]*service.BatchTaskResult, len(parsed))
-	hasCompletionUsage := a.hasHook(context.Background(), "extractUsageOnComplete")
+	hasCompletionUsage := a.hasHook(requestCtx, "extractUsageOnComplete")
 	for _, item := range parsed {
 		if strings.TrimSpace(item.TaskID) == "" {
 			continue
@@ -1443,7 +1449,7 @@ func (a *TaskAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response,
 					break
 				}
 			}
-			facts, hookErr := a.plugin.Engine.Call(context.Background(), "extractUsageOnComplete", itemCtx, jsonValue(&info), usageBody)
+			facts, hookErr := a.plugin.Engine.Call(requestCtx, "extractUsageOnComplete", itemCtx, jsonValue(&info), usageBody)
 			if hookErr == nil {
 				upstreamModel, _ := itemCtx["upstreamModel"].(string)
 				originModel, _ := itemCtx["model"].(string)

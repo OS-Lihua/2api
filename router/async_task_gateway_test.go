@@ -2595,8 +2595,8 @@ func TestAsyncTaskPollingKeepsOtherProvidersAndLegacyProgressing(t *testing.T) {
 }
 
 func TestAsyncTaskPollingHonorsCallerCancellation(t *testing.T) {
-	for _, hook := range []bool{false, true} {
-		t.Run(fmt.Sprintf("parse_hook=%t", hook), func(t *testing.T) {
+	for _, test := range []struct{ hook, batch bool }{{}, {hook: true}, {batch: true}, {hook: true, batch: true}} {
+		t.Run(fmt.Sprintf("parse_hook=%t/batch=%t", test.hook, test.batch), func(t *testing.T) {
 			started, stopped, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
 			var releaseOnce sync.Once
 			defer releaseOnce.Do(func() { close(release) })
@@ -2606,7 +2606,7 @@ func TestAsyncTaskPollingHonorsCallerCancellation(t *testing.T) {
 					_, _ = io.WriteString(w, `{"id":"cancel-poll-job","status":"queued"}`)
 					return
 				}
-				if !hook || r.URL.Path == "/parse-hold" {
+				if !test.hook || r.URL.Path == "/parse-hold" {
 					w.WriteHeader(http.StatusOK)
 					w.(http.Flusher).Flush()
 					close(started)
@@ -2618,12 +2618,26 @@ func TestAsyncTaskPollingHonorsCallerCancellation(t *testing.T) {
 				}
 				_, _ = io.WriteString(w, `{"id":"cancel-poll-job","status":"completed","seconds":"2"}`)
 			})
-			if hook {
+			if test.hook || test.batch {
 				source, err := plugins.Source("sora")
 				require.NoError(t, err)
-				anchor := "export function parseTaskResult(ctx, body) {"
-				require.Contains(t, source, anchor)
-				source = strings.Replace(source, anchor, anchor+` utils.fetch({url:ctx.baseUrl+"/parse-hold",method:"GET"});`, 1)
+				if test.batch {
+					// Add synthetic v1 batch hooks to exercise the host lifecycle.
+					anchor := `fetchMode: "per_task"`
+					require.Contains(t, source, anchor)
+					source = strings.Replace(source, anchor, `fetchMode: "batch"`, 1)
+					source += `
+export function buildBatchQueryRequest(ctx,tasks) { return {url:ctx.baseUrl+"/v1/videos/"+tasks[0].taskId,method:"GET"}; }
+export function parseBatchResult(ctx,body) {`
+					if test.hook {
+						source += `utils.fetch({url:ctx.baseUrl+"/parse-hold",method:"GET"});`
+					}
+					source += `return [{taskId:ctx.tasks[0].taskId,status:"SUCCESS",data:body}]; }`
+				} else {
+					anchor := "export function parseTaskResult(ctx, body) {"
+					require.Contains(t, source, anchor)
+					source = strings.Replace(source, anchor, anchor+` utils.fetch({url:ctx.baseUrl+"/parse-hold",method:"GET"});`, 1)
+				}
 				jsplugin.DefaultRegistry = jsplugin.NewRegistry()
 				_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "sora"})
 				require.NoError(t, err)
