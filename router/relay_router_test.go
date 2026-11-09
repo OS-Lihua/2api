@@ -11992,12 +11992,19 @@ func TestTextGatewayDefaultOutputLimitFitsRemainingContext(t *testing.T) {
 						w.WriteHeader(http.StatusInternalServerError)
 						return
 					}
+					if test.vertex {
+						assert.Equal(t, "vertex-2023-10-16", sent["anthropic_version"])
+						assert.NotContains(t, sent, "model")
+					}
 					w.Header().Set("Content-Type", "application/json")
 					_, _ = w.Write(body)
 				})
 				caps := capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{MaxOutputTokens: common.GetPointer(int64(16))}}
 				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
 				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", test.upstream).Error)
+				if test.vertex {
+					setGatewayVertexClaudeProvider(t, fixture)
+				}
 				price := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: fmt.Sprintf(`param(%q) == 16 ? tier("bounded",fixed(0.000001)) : tier("unbounded",fixed(0.000002))`, test.path), EffectiveAt: clock.Now().Unix()}
 				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
 				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}]}`)
