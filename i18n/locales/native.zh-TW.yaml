@@ -1,4 +1,6 @@
 # Native relay errors returned to AI clients
+"Invalid JSON request body": "JSON 請求本文無效"
+"parameters must be an object": "parameters 必須為物件"
 "Could not estimate request input": "無法估算請求輸入"
 "Invalid request metadata": "請求中繼資料無效"
 "Invalid request parameter overrides": "請求參數覆寫無效"

@@ -218,50 +218,29 @@ func NormalizeRealtimeRequestLimits(body []byte, caps capability.Set, inputToken
 // ValidateResponsesMultipliers bounds compatible passthrough token limits too.
 // Responses has one output response; a vendor n>1 cannot silently multiply it.
 func ValidateResponsesMultipliers(body []byte) error {
-	var request struct {
-		Model               string            `json:"model"`
-		N                   *int              `json:"n"`
-		MaxTokens           *uint             `json:"max_tokens"`
-		MaxCompletionTokens *uint             `json:"max_completion_tokens"`
-		MaxOutputTokens     *uint             `json:"max_output_tokens"`
-		MinTokens           *uint             `json:"min_tokens"`
-		Parameters          common.RawMessage `json:"parameters"`
+	var envelope struct{}
+	if common.Unmarshal(body, &envelope) != nil || !ojson.ParseBytes(body).IsObject() {
+		return &requestParameterError{path: "request", reason: "Invalid JSON request body"}
 	}
-	if err := common.Unmarshal(body, &request); err != nil {
-		return err
+	if container := ojson.GetBytes(body, "parameters"); container.Exists() && container.Type != ojson.Null && !container.IsObject() {
+		return &requestParameterError{path: "parameters", reason: "parameters must be an object"}
 	}
-	if request.N != nil && *request.N != 1 {
-		return &requestParameterError{path: "n", reason: "n must be 1 for Responses"}
-	}
-	for _, field := range []struct {
-		path  string
-		value *uint
-	}{{"max_tokens", request.MaxTokens}, {"max_completion_tokens", request.MaxCompletionTokens}, {"max_output_tokens", request.MaxOutputTokens}, {"min_tokens", request.MinTokens}} {
-		if ExceedsMaxTokensLimit(field.value) {
-			return &requestParameterError{path: field.path, reason: "max_tokens is invalid"}
+	for _, prefix := range []string{"", "parameters."} {
+		if value := ojson.GetBytes(body, prefix+"n"); value.Exists() && value.Type != ojson.Null {
+			var count int
+			if common.UnmarshalJsonStr(value.Raw, &count) != nil || count != 1 {
+				return &requestParameterError{path: prefix + "n", reason: prefix + "n must be 1 for Responses"}
+			}
 		}
-	}
-	if len(request.Parameters) > 0 && string(request.Parameters) != "null" {
-		// Only the known compatible container is interpreted; request content
-		// and tool schemas are never searched for similarly named properties.
-		var nested struct {
-			N                   *int  `json:"n"`
-			MaxTokens           *uint `json:"max_tokens"`
-			MaxCompletionTokens *uint `json:"max_completion_tokens"`
-			MaxOutputTokens     *uint `json:"max_output_tokens"`
-		}
-		if err := common.Unmarshal(request.Parameters, &nested); err != nil {
-			return err
-		}
-		if nested.N != nil && *nested.N != 1 {
-			return &requestParameterError{path: "parameters.n", reason: "parameters.n must be 1 for Responses"}
-		}
-		for _, field := range []struct {
-			path  string
-			value *uint
-		}{{"parameters.max_tokens", nested.MaxTokens}, {"parameters.max_completion_tokens", nested.MaxCompletionTokens}, {"parameters.max_output_tokens", nested.MaxOutputTokens}} {
-			if ExceedsMaxTokensLimit(field.value) {
-				return &requestParameterError{path: field.path, reason: "parameters.max_tokens is invalid"}
+		for _, field := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens", "min_tokens"} {
+			path := prefix + field
+			value := ojson.GetBytes(body, path)
+			if !value.Exists() || value.Type == ojson.Null {
+				continue
+			}
+			var count uint
+			if common.UnmarshalJsonStr(value.Raw, &count) != nil || ExceedsMaxTokensLimit(&count) {
+				return &requestParameterError{path: path, reason: prefix + "max_tokens is invalid"}
 			}
 		}
 	}

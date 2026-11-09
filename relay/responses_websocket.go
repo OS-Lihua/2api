@@ -29,7 +29,6 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
-	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/tokenkit"
@@ -960,24 +959,11 @@ func (s *responsesWSSession) deliver(info *relaycommon.RelayInfo, incoming respo
 		return err
 	}
 	accumulator.RecordDelivery(event, incoming.body)
+	if service.NativeResponseHasBusinessOutput(event) {
+		facts.MarkBusinessOutput()
+	}
 	if err := accumulator.Err(); err != nil {
 		return err
-	}
-	business := false
-	switch event.Type {
-	case "response.output_text.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.refusal.delta", "response.audio.delta", "response.output_audio.delta":
-		business = event.Delta != ""
-	case "response.output_item.added", "response.output_item.done":
-		business = event.Item != nil && (event.Item.Name != "" || len(event.Item.Arguments) > 0 || event.Item.Result != "")
-	}
-	if event.Response != nil {
-		business = business || relayconvert.ExtractOutputTextFromResponses(event.Response) != ""
-		for _, output := range event.Response.Output {
-			business = business || output.Name != "" || len(output.Arguments) > 0 || output.Result != ""
-		}
-	}
-	if business {
-		facts.MarkBusinessOutput()
 	}
 	return nil
 }
@@ -1312,10 +1298,10 @@ func normalizeResponsesWSCreateEvent(message []byte, event responsesWSCreateEven
 		}
 	}
 	payload := doc.Bytes()
-	if err := common.Unmarshal(payload, &create.Request); err != nil {
+	if err := helper.ValidateResponsesMultipliers(payload); err != nil {
 		return create, err
 	}
-	if err := helper.ValidateResponsesMultipliers(payload); err != nil {
+	if err := common.Unmarshal(payload, &create.Request); err != nil {
 		return create, err
 	}
 	if helper.ExceedsMaxTokensLimit(create.Request.MaxOutputTokens) {

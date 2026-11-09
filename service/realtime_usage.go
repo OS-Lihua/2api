@@ -141,8 +141,10 @@ func (accumulator *RealtimeUsageAccumulator) Observe(raw []byte, input *dto.Usag
 			index = &parsed
 		}
 		transcript := ""
-		if !state.accumulator.outputState(ojson.GetBytes(raw, "item_id").String(), index).textSeen {
-			transcript = ojson.GetBytes(raw, "transcript").String()
+		complete := ojson.GetBytes(raw, "transcript").String()
+		seen := state.accumulator.outputState(ojson.GetBytes(raw, "item_id").String(), index).textBytes
+		if len(complete) > seen {
+			transcript = complete[seen:]
 		}
 		if err := document.Set("type", "response.output_text.delta"); err != nil {
 			return nil, err
@@ -219,7 +221,7 @@ func (accumulator *RealtimeUsageAccumulator) Observe(raw []byte, input *dto.Usag
 	if delivered {
 		state.accumulator.RecordDelivery(event, normalized)
 	}
-	if delivered && realtimeBusinessOutput(event) {
+	if delivered && NativeResponseHasBusinessOutput(event) {
 		state.info.ResponseFacts.MarkBusinessOutput()
 	}
 	if err := state.accumulator.Err(); err != nil {
@@ -333,12 +335,22 @@ func (accumulator *RealtimeUsageAccumulator) Finish() []RealtimeUsageResult {
 	return results
 }
 
-func realtimeBusinessOutput(event *dto.ResponsesStreamResponse) bool {
+// NativeResponseHasBusinessOutput recognizes delivered content across native streams.
+func NativeResponseHasBusinessOutput(event *dto.ResponsesStreamResponse) bool {
 	switch event.Type {
 	case "response.output_text.delta", "response.text.delta", "response.audio.delta", "response.output_audio.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.reasoning_text.delta", "response.reasoning_summary_text.delta", "response.refusal.delta":
 		return event.Delta != ""
 	case "response.output_item.added", "response.output_item.done":
-		return event.Item != nil && (event.Item.Name != "" || len(event.Item.Arguments) > 0 || event.Item.Result != "")
+		if event.Item != nil {
+			if event.Item.Name != "" || len(event.Item.Arguments) > 0 || event.Item.Result != "" {
+				return true
+			}
+			for _, content := range event.Item.Content {
+				if content.Text != "" || content.Refusal != "" {
+					return true
+				}
+			}
+		}
 	}
 	if event.Response != nil {
 		for _, output := range event.Response.Output {
@@ -346,7 +358,7 @@ func realtimeBusinessOutput(event *dto.ResponsesStreamResponse) bool {
 				return true
 			}
 			for _, content := range output.Content {
-				if content.Text != "" {
+				if content.Text != "" || content.Refusal != "" {
 					return true
 				}
 			}

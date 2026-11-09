@@ -1,6 +1,10 @@
 package dto
 
-import "github.com/QuantumNous/new-api/relaykit/types"
+import (
+	"encoding/json"
+
+	"github.com/QuantumNous/new-api/relaykit/types"
+)
 
 const (
 	RealtimeEventTypeError              = "error"
@@ -54,7 +58,7 @@ type RealtimeSession struct {
 	InputAudioTranscription InputAudioTranscription `json:"input_audio_transcription"`
 	TurnDetection           any                     `json:"turn_detection"`
 	Tools                   []RealTimeTool          `json:"tools"`
-	ToolChoice              string                  `json:"tool_choice"`
+	ToolChoice              json.RawMessage         `json:"tool_choice,omitempty"`
 	Temperature             float64                 `json:"temperature"`
 	//MaxResponseOutputTokens int                     `json:"max_response_output_tokens"`
 }

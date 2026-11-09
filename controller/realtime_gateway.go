@@ -630,39 +630,48 @@ func (session *realtimeGatewaySession) defaultInput(buffered bool) *dto.Usage {
 	return input
 }
 
+func nativeParameterError(path, reason string) *types.NewAPIError {
+	return types.NewErrorWithStatusCode(&service.GatewayParameterError{Path: path, Reason: reason}, types.ErrorCodeInvalidRequest, http.StatusBadRequest)
+}
+
 // prepareSessionSettings keeps native VAD detection while moving inference and
 // interruption commands behind the existing request reservation boundary.
 func (session *realtimeGatewaySession) prepareSessionSettings(raw []byte, initial bool) ([]byte, *types.NewAPIError) {
 	value := ojson.ParseBytes(raw)
 	if prompt := value.Get("prompt"); prompt.Exists() && prompt.Type != ojson.Null {
-		return nil, types.NewErrorWithStatusCode(errors.New("Unknown prompt template; provide complete input and configuration"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
+		return nil, nativeParameterError("session.prompt", "Unknown prompt template; provide complete input and configuration")
 	}
 	if !value.IsObject() {
-		return nil, types.NewErrorWithStatusCode(errors.New("Invalid Realtime session"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
+		return nil, nativeParameterError("session", "Invalid Realtime session")
 	}
 	if kind := value.Get("type"); kind.Exists() && kind.String() != "realtime" {
-		return nil, types.NewErrorWithStatusCode(errors.New("Only conversational Realtime sessions are supported"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
+		return nil, nativeParameterError("session.type", "Only conversational Realtime sessions are supported")
 	}
 	for _, path := range []string{"input_audio_transcription", "audio.input.transcription"} {
 		if transcription := value.Get(path); transcription.Exists() && transcription.Type != ojson.Null {
-			return nil, types.NewErrorWithStatusCode(errors.New("Input audio transcription is not supported on this connection"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
+			return nil, nativeParameterError("session."+path, "Input audio transcription is not supported on this connection")
 		}
 	}
 	for _, path := range []string{"turn_detection.idle_timeout_ms", "audio.input.turn_detection.idle_timeout_ms"} {
 		if timeout := value.Get(path); timeout.Exists() && timeout.Type != ojson.Null {
 			var milliseconds int64
 			if common.UnmarshalJsonStr(timeout.Raw, &milliseconds) != nil || milliseconds <= 0 || milliseconds > (1<<31)-1 {
-				return nil, types.NewErrorWithStatusCode(errors.New("idle_timeout_ms must be a positive integer"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
+				return nil, nativeParameterError("session."+path, "idle_timeout_ms must be a positive integer")
 			}
 		}
 	}
 	if err := helper.ValidateRealtimeMultipliers(raw); err != nil {
-		return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest)
+		path := "session"
+		var parameter interface{ ParameterPath() string }
+		if errors.As(err, &parameter) {
+			path += "." + parameter.ParameterPath()
+		}
+		return nil, nativeParameterError(path, err.Error())
 	}
 	for _, path := range []string{"input_audio_format", "output_audio_format", "audio.input.format.type", "audio.output.format.type"} {
 		if format := value.Get(path); format.Exists() && format.Type != ojson.Null {
 			if _, valid := service.NormalizeRealtimeAudioFormat(format.String()); !valid {
-				return nil, types.NewErrorWithStatusCode(errors.New("Unsupported Realtime audio format"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
+				return nil, nativeParameterError("session."+path, "Unsupported Realtime audio format")
 			}
 		}
 	}
@@ -670,7 +679,7 @@ func (session *realtimeGatewaySession) prepareSessionSettings(raw []byte, initia
 		if rate := value.Get(path); rate.Exists() {
 			var sampleRate int
 			if common.UnmarshalJsonStr(rate.Raw, &sampleRate) != nil || sampleRate != 24000 {
-				return nil, types.NewErrorWithStatusCode(errors.New("PCM audio requires a sample rate of 24000"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
+				return nil, nativeParameterError("session."+path, "PCM audio requires a sample rate of 24000")
 			}
 		}
 	}
@@ -697,7 +706,7 @@ func (session *realtimeGatewaySession) prepareSessionSettings(raw []byte, initia
 		create, interrupt, kind = false, false, ""
 	} else {
 		if !detection.IsObject() || kind != "server_vad" && kind != "semantic_vad" {
-			return nil, types.NewErrorWithStatusCode(errors.New("Unsupported Realtime turn detection"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
+			return nil, nativeParameterError("session."+path, "Unsupported Realtime turn detection")
 		}
 		for _, setting := range []struct {
 			name   string
@@ -705,7 +714,7 @@ func (session *realtimeGatewaySession) prepareSessionSettings(raw []byte, initia
 		}{{"create_response", &create}, {"interrupt_response", &interrupt}} {
 			if flag := detection.Get(setting.name); flag.Exists() {
 				if common.UnmarshalJsonStr(flag.Raw, setting.target) != nil {
-					return nil, types.NewErrorWithStatusCode(errors.New("Turn detection flags must be boolean"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
+					return nil, nativeParameterError("session."+path+"."+setting.name, "Turn detection flags must be boolean")
 				}
 			}
 		}

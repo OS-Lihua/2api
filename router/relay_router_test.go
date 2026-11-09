@@ -351,6 +351,16 @@ func TestWebSocketGatewayParameterDiagnostics(t *testing.T) {
 		native                      bool
 		body, path, overrides, code string
 	}{
+		{name: "Responses output limit type", body: `{"type":"response.create","model":"gateway-alias","input":"Hi","max_output_tokens":"huge"}`, path: "max_output_tokens", code: "invalid_request"},
+		{name: "Responses nested minimum bound", body: `{"type":"response.create","model":"gateway-alias","input":"Hi","parameters":{"min_tokens":2147483648}}`, path: "parameters.min_tokens", code: "invalid_request"},
+		{name: "Responses nested minimum type", body: `{"type":"response.create","model":"gateway-alias","input":"Hi","parameters":{"min_tokens":"huge"}}`, path: "parameters.min_tokens", code: "invalid_request"},
+		{name: "Responses nested minimum negative", body: `{"type":"response.create","model":"gateway-alias","input":"Hi","parameters":{"min_tokens":-1}}`, path: "parameters.min_tokens", code: "invalid_request"},
+		{name: "Responses nested batch type", body: `{"type":"response.create","model":"gateway-alias","input":"Hi","parameters":{"n":"two"}}`, path: "parameters.n", code: "invalid_request"},
+		{name: "Responses batch type override", body: `{"type":"response.create","model":"gateway-alias","input":"Hi"}`, overrides: `{"n":"two"}`, path: "n"},
+		{name: "Responses nested minimum override", body: `{"type":"response.create","model":"gateway-alias","input":"Hi"}`, overrides: `{"parameters":{"min_tokens":-1}}`, path: "parameters.min_tokens"},
+		{name: "Realtime session prompt", native: true, body: `{"type":"session.update","session":{"prompt":{"id":"pmpt_known"}}}`, path: "session.prompt", code: "invalid_request"},
+		{name: "Realtime session format", native: true, body: `{"type":"session.update","session":{"output_audio_format":"invalid"}}`, path: "session.output_audio_format", code: "invalid_request"},
+		{name: "Realtime session rate", native: true, body: `{"type":"session.update","session":{"audio":{"output":{"format":{"type":"audio/pcm","rate":8000}}}}}`, path: "session.audio.output.format.rate", code: "invalid_request"},
 		{name: "Realtime prompt", native: true, body: `{"type":"response.create","response":{"input":[],"prompt":{"id":"pmpt_known"}}}`, path: "prompt", code: "invalid_request"},
 		{name: "Realtime input reference", native: true, body: `{"type":"response.create","response":{"input":[{"type":"item_reference","id":"unknown"}]}}`, path: "input[0].id", code: "invalid_request"},
 		{name: "Responses batch override", body: `{"type":"response.create","model":"gateway-alias","input":"Hi"}`, path: "n", overrides: `{"n":2}`},
@@ -991,7 +1001,7 @@ func TestResponsesWSGatewayRejectsOlderTerminalReplays(t *testing.T) {
 }
 
 func TestResponsesWSGatewayBoundsOutputIdentityState(t *testing.T) {
-	for _, scenario := range []string{"identity index", "first generated text", "Realtime identity gate", "Realtime first generated text", "Realtime malformed output", "Realtime malformed sequence", "Realtime malformed image zero"} {
+	for _, scenario := range []string{"identity index", "first generated text", "Realtime identity gate", "Realtime first generated text", "Realtime malformed output", "Realtime malformed sequence", "Realtime malformed image zero", "Realtime message snapshot"} {
 		t.Run(scenario, func(t *testing.T) {
 			previous := constant.MaxRequestBodyMB
 			constant.MaxRequestBodyMB = 1
@@ -1030,6 +1040,9 @@ func TestResponsesWSGatewayBoundsOutputIdentityState(t *testing.T) {
 						terminal = `{"type":"response.done","response":{"id":"bounded","status":"completed","output":{},"usage":{"input_tokens":85,"output_tokens":0,"input_token_details":{"image_tokens":0}}}}`
 					}
 					frames = append(frames, terminal)
+				}
+				if scenario == "Realtime message snapshot" {
+					frames = []string{`{"type":"response.created","response":{"id":"bounded","status":"in_progress"}}`, `{"type":"response.output_item.done","response_id":"bounded","output_index":0,"item":{"type":"message","id":"snapshot","role":"assistant","content":[{"type":"text","text":"hello"}]}}`, `{"type":"response.done","response":{"id":"bounded","status":"failed","output":[],"status_details":{"error":{"code":"server_error","type":"server_error"}}}}`}
 				}
 				frames = append(frames, `{"type":"response.output_text.delta","response_id":"bounded","item_id":"text","delta":"UNBOUNDED"}`, `{"type":"response.completed","response":{"id":"bounded","status":"completed"}}`)
 				for _, frame := range frames {
@@ -1079,9 +1092,14 @@ func TestResponsesWSGatewayBoundsOutputIdentityState(t *testing.T) {
 				}
 				late = late || bytes.Contains(raw, []byte("UNBOUNDED"))
 				completed = completed || ojson.GetBytes(raw, "type").String() == "response.completed" || ojson.GetBytes(raw, "type").String() == "response.done"
+				if scenario == "Realtime message snapshot" && completed {
+					break
+				}
 			}
 			assert.False(t, late, "Cumulative identity budget closes the original owner before further frames")
-			assert.False(t, completed)
+			if scenario != "Realtime message snapshot" {
+				assert.False(t, completed)
+			}
 			require.NoError(t, client.Close())
 			var records []model.GatewayRequest
 			require.Eventually(t, func() bool {
@@ -1089,7 +1107,11 @@ func TestResponsesWSGatewayBoundsOutputIdentityState(t *testing.T) {
 				records, _, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
 				return err == nil && len(records) == 1 && records[0].Status != "settlement_pending"
 			}, 5*time.Second, 10*time.Millisecond)
-			if strings.HasPrefix(scenario, "Realtime malformed") {
+			if scenario == "Realtime message snapshot" {
+				assert.Equal(t, "partial", records[0].Status)
+				assert.EqualValues(t, 5400, records[0].Receivable.Nanos)
+				assertTextGatewayLedger(t, records[0], 3000)
+			} else if strings.HasPrefix(scenario, "Realtime malformed") {
 				assert.Equal(t, "failed", records[0].Status)
 				assert.Zero(t, records[0].Receivable.Nanos)
 				cost := int64(1_020_000)
@@ -1124,8 +1146,16 @@ func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 		sale, cost                       int64
 		invalid                          bool
 		credentials, pending             bool
+		item, refusal, tool              bool
 		delta, cancel, disconnect, probe bool
 	}{
+		{name: "partial tool arguments and complete snapshots", item: true, delta: true, tool: true, terminal: `{"type":"response.failed","response":{"id":"active","status":"failed","error":{"code":"server_error"}}}`, source: "estimated", status: "partial", sale: 23400, cost: 13000},
+		{name: "complete refusal snapshot disconnect", item: true, refusal: true, disconnect: true, source: "estimated", status: "cancelled", sale: 5400, cost: 3000},
+		{name: "complete message snapshot disconnect", item: true, disconnect: true, source: "estimated", status: "cancelled", sale: 5400, cost: 3000},
+		{name: "complete message snapshot failure", item: true, terminal: `{"type":"response.failed","response":{"id":"active","status":"failed","error":{"code":"server_error"}}}`, source: "estimated", status: "partial", sale: 5400, cost: 3000},
+		{name: "partial delta and complete message snapshots", delta: true, item: true, terminal: `{"type":"response.failed","response":{"id":"active","status":"failed","error":{"code":"server_error"}}}`, source: "estimated", status: "partial", sale: 9000, cost: 5000},
+		{name: "cache write lifetime missing aggregate", terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"output_tokens":1,"input_tokens_details":{"cache_write_tokens_details":{"ttl_12h_tokens":20000}}}}}`, source: "estimated", status: "success", sale: 72_003_600, cost: 20_000_000},
+		{name: "cache write lifetime explicit total zero", terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":20000,"output_tokens":1,"input_tokens_details":{"cache_write_tokens":0,"cache_write_tokens_details":{"ttl_12h_tokens":20000}}}}}`, source: "upstream", status: "success", sale: 36_003_600, cost: 0},
 		{name: "malformed output retains valid counters", invalid: true, terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":{},"usage":{"input_tokens":1000,"output_tokens":10}}}`, source: "none", status: "failed", cost: 1_020_000},
 		{name: "malformed metadata retains valid counters", invalid: true, terminal: `{"type":"response.completed","sequence_number":"bad","response":{"id":"active","status":"completed","output":[],"usage":{"input_tokens":1000,"output_tokens":10}}}`, source: "none", status: "failed", cost: 1_020_000},
 		{name: "cached subtype explicit aggregate zero", terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Hi"}]}],"usage":{"output_tokens":1,"input_tokens_details":{"cached_tokens":0,"cached_tokens_details":{"text_tokens":20000}}}}}`, source: "estimated", status: "success", sale: 36_003_600, cost: 0},
@@ -1162,12 +1192,41 @@ func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 				if !assert.NoError(t, err) {
 					return
 				}
-				if tc.delta {
+				if tc.delta || tc.item {
 					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"active","status":"in_progress"}}`))) {
 						return
 					}
-					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","delta":"hello"}`))) {
-						return
+					if tc.tool {
+						if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_item.added","response_id":"active","output_index":0,"item":{"id":"snapshot","type":"function_call","name":"lookup","arguments":""}}`))) {
+							return
+						}
+					}
+					if tc.delta {
+						frame := `{"type":"response.output_text.delta","response_id":"active","item_id":"snapshot","output_index":0,"delta":"hello"}`
+						if tc.tool {
+							frame = `{"type":"response.function_call_arguments.delta","response_id":"active","item_id":"snapshot","output_index":0,"delta":"{"}`
+						}
+						if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(frame))) {
+							return
+						}
+					}
+					if tc.item {
+						text := "hello"
+						if tc.delta {
+							text = "hello world"
+						}
+						frame := `{"type":"response.output_item.done","response_id":"active","output_index":0,"item":{"id":"snapshot","type":"message","role":"assistant","content":[{"type":"output_text","text":"` + text + `"}]}}`
+						if tc.tool {
+							frame = `{"type":"response.output_item.done","response_id":"active","output_index":0,"item":{"id":"snapshot","type":"function_call","name":"lookup","arguments":"{\"ok\":1}"}}`
+						}
+						if tc.refusal {
+							frame = `{"type":"response.output_item.done","response_id":"active","output_index":0,"item":{"id":"snapshot","type":"message","role":"assistant","content":[{"type":"refusal","refusal":"hello"}]}}`
+						}
+						for range 2 {
+							if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(frame))) {
+								return
+							}
+						}
 					}
 				}
 				if tc.disconnect {
@@ -1187,6 +1246,12 @@ func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 				_, _, _ = peer.ReadMessage()
 			})
 			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("model_name", "gpt-4o").Error)
+			if strings.HasPrefix(tc.name, "cache write lifetime") {
+				price := *fixture.purchase
+				price.ID, price.EffectiveAt, price.Expression = 0, clock.Now().Unix()+1, `tier("cache",cc12h)`
+				require.NoError(t, model.CreatePriceVersion(t.Context(), &price, fixture.sale.CreatedBy))
+				fixture.fake.Advance(2 * time.Second)
+			}
 			if strings.HasPrefix(tc.name, "cached subtype") {
 				price := *fixture.purchase
 				price.ID, price.EffectiveAt, price.Expression = 0, clock.Now().Unix()+1, `tier("cache",cr)`
@@ -1214,8 +1279,18 @@ func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 			client := dialResponsesGateway(t, fixture)
 			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","input":"hello","max_output_tokens":16}`)))
 			require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
-			if tc.delta {
-				for range 2 {
+			if tc.delta || tc.item {
+				count := 1
+				if tc.tool {
+					count++
+				}
+				if tc.delta {
+					count++
+				}
+				if tc.item {
+					count += 2
+				}
+				for range count {
 					_, _, err := client.ReadMessage()
 					require.NoError(t, err)
 				}
@@ -2077,6 +2152,67 @@ func TestRealtimeGatewayAcceptsAudioOnlyOutput(t *testing.T) {
 	}
 	assert.Equal(t, int32(1), calls.Load())
 	require.NoError(t, client.Close())
+}
+
+func TestRealtimeGatewayAcceptsNativeToolChoice(t *testing.T) {
+	choice := `{"type":"function","name":"lookup"}`
+	tools := `[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{}}}]`
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if !assert.NoError(t, err) {
+			return
+		}
+		defer peer.Close()
+		if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"modalities":["text"],"turn_detection":null,"tool_choice":`+choice+`,"tools":`+tools+`}}`))) {
+			return
+		}
+		_, raw, err := peer.ReadMessage()
+		if err != nil {
+			return
+		}
+		assert.Equal(t, "session.update", ojson.GetBytes(raw, "type").String())
+		assert.JSONEq(t, choice, ojson.GetBytes(raw, "session.tool_choice").Raw)
+		if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.updated","session":{"modalities":["text"],"turn_detection":null,"tool_choice":`+choice+`,"tools":`+tools+`}}`))) {
+			return
+		}
+		if _, _, err := peer.ReadMessage(); err != nil {
+			return
+		}
+		for _, frame := range []string{`{"type":"response.created","response":{"id":"choice","status":"in_progress"}}`, `{"type":"response.done","response":{"id":"choice","status":"completed","output":[{"type":"function_call","name":"lookup","call_id":"lookup-call","arguments":"{}"}],"usage":{"input_tokens":10,"output_tokens":1}}}`} {
+			if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(frame))) {
+				return
+			}
+		}
+		_, _, _ = peer.ReadMessage()
+	})
+	var unified model.Model
+	require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+	unified.Capabilities.Features = append(unified.Capabilities.Features, capability.ToolCalling)
+	require.NoError(t, model.DB.Model(&unified).Select("capabilities").Updates(&unified).Error)
+	client := dialRealtimeGateway(t, fixture)
+	_, raw, err := client.ReadMessage()
+	require.NoError(t, err)
+	require.Equal(t, "session.created", ojson.GetBytes(raw, "type").String())
+	assert.JSONEq(t, choice, ojson.GetBytes(raw, "session.tool_choice").Raw)
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.update","session":{"tool_choice":`+choice+`}}`)))
+	_, raw, err = client.ReadMessage()
+	require.NoError(t, err)
+	require.Equal(t, "session.updated", ojson.GetBytes(raw, "type").String())
+	assert.JSONEq(t, choice, ojson.GetBytes(raw, "session.tool_choice").Raw)
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"input":[],"modalities":["text"]}}`)))
+	for range 2 {
+		_, raw, err = client.ReadMessage()
+		require.NoError(t, err)
+	}
+	assert.Equal(t, "response.done", ojson.GetBytes(raw, "type").String())
+	require.NoError(t, client.Close())
+	var records []model.GatewayRequest
+	require.Eventually(t, func() bool {
+		var err error
+		records, _, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+		return err == nil && len(records) == 1 && records[0].Status == "success"
+	}, 5*time.Second, 10*time.Millisecond)
+	assertTextGatewayLedger(t, records[0], 12000)
 }
 
 func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {

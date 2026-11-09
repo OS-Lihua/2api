@@ -1,4 +1,6 @@
 # Native relay errors returned to AI clients
+"Invalid JSON request body": "JSON 请求体无效"
+"parameters must be an object": "parameters 必须为对象"
 "Could not estimate request input": "无法估算请求输入"
 "Invalid request metadata": "请求元数据无效"
 "Invalid request parameter overrides": "请求参数覆盖无效"

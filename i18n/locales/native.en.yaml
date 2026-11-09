@@ -1,4 +1,6 @@
 # Native relay errors returned to AI clients
+"Invalid JSON request body": "Invalid JSON request body"
+"parameters must be an object": "parameters must be an object"
 "Could not estimate request input": "Could not estimate request input"
 "Invalid request metadata": "Invalid request metadata"
 "Invalid request parameter overrides": "Invalid request parameter overrides"

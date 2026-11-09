@@ -20,12 +20,12 @@ import (
 // Finish's usage through the normal text billing path, including interrupted
 // streams. Observe and Finish must be called by the same stream owner.
 type responseOutputState struct {
-	nameSeen    bool
-	payloadSeen bool
-	textSeen    bool
+	nameSeen     bool
+	payloadBytes int
+	textBytes    int
 }
 
-type nativeInputPresence struct{ text, audio, image, cached bool }
+type nativeInputPresence struct{ text, audio, image, cached, cacheWrite bool }
 
 type ResponsesUsageAccumulator struct {
 	retainedBytes, retainedLimit         int
@@ -138,6 +138,11 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 			a.inputPresence.text = a.inputPresence.text || text
 			cached, _ := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens_details.cached_tokens", "", "")
 			a.inputPresence.cached = a.inputPresence.cached || cached
+			for _, path := range []string{"cached_creation_tokens", "cache_write_tokens", "cache_creation_input_tokens"} {
+				if valid, _ := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens_details."+path, "", ""); valid {
+					a.inputPresence.cacheWrite = true
+				}
+			}
 			audio, _ := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens_details.audio_tokens", "", "")
 			image, _ := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens_details.image_tokens", "", "")
 			a.inputPresence.audio = a.inputPresence.audio || audio
@@ -189,6 +194,19 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 					}
 				}
 			}
+			if lifetimes := a.usage.PromptTokensDetails.CacheWriteTokensDetails; lifetimes != nil && !a.inputPresence.cacheWrite {
+				total := lifetimes.TTL12hTokens + lifetimes.TTL30mTokens
+				if total > a.usage.PromptTokensDetails.CacheCreationTokensTotal() {
+					a.usage.PromptTokensDetails.CacheWriteTokens = total
+					if a.usage.InputTokensDetails != nil {
+						details := a.usage.PromptTokensDetails.Clone()
+						a.usage.InputTokensDetails = &details
+					}
+					if a.info.ResponseFacts != nil {
+						a.info.ResponseFacts.UsageEstimated = true
+					}
+				}
+			}
 			if facts := a.info.ResponseFacts; facts != nil {
 				prompt, completion := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens", "response.usage.output_tokens", "response.usage.total_tokens")
 				facts.InputDetailsReported = a.inputDetailsReported
@@ -207,12 +225,7 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 		if event.Response != nil && !a.terminalOutputSeen {
 			for i, output := range event.Response.Output {
 				a.rememberOutputItem(&output)
-				state := a.outputState(output.ID, &i)
-				if output.Type == dto.BuildInCallFunctionCall || output.Type == "custom_tool_call" {
-					a.observeToolOutput(&output, &i)
-				} else if !state.textSeen {
-					a.recordText(relayconvert.ExtractOutputTextFromResponses(&dto.OpenAIResponsesResponse{Output: []dto.ResponsesOutput{output}}))
-				}
+				a.observeOutputItem(&output, &i)
 			}
 			a.terminalOutputSeen = true
 		}
@@ -233,21 +246,20 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 		a.imageCounter.Commit(a.info)
 		a.imageCommitted = true
 	case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.refusal.delta":
-		if event.Type == "response.output_text.delta" || event.Type == "response.refusal.delta" {
-			a.outputState(event.ItemID, event.OutputIndex).textSeen = true
-		}
+		state := a.outputState(event.ItemID, event.OutputIndex)
+		state.textBytes += len(event.Delta)
 		a.recordText(event.Delta)
 	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
-		a.outputState(event.ItemID, event.OutputIndex).payloadSeen = true
+		a.outputState(event.ItemID, event.OutputIndex).payloadBytes += len(event.Delta)
 		a.recordText(event.Delta)
 	case "response.output_item.added":
-		a.observeToolOutput(event.Item, event.OutputIndex)
+		a.observeOutputItem(event.Item, event.OutputIndex)
 	case dto.ResponsesOutputTypeItemDone:
 		if event.Item == nil {
 			return
 		}
 		a.rememberOutputItem(event.Item)
-		a.observeToolOutput(event.Item, event.OutputIndex)
+		a.observeOutputItem(event.Item, event.OutputIndex)
 		switch event.Item.Type {
 		case dto.BuildInCallWebSearchCall, dto.BuildInCallFileSearchCall, dto.BuildInCallFunctionCall:
 			a.info.CountBillableToolCall(event.Item.Type, event.Item.Name)
@@ -273,6 +285,15 @@ func (a *ResponsesUsageAccumulator) observeImageOutput(item *dto.ResponsesOutput
 	a.imageCounter.Observe(item, index)
 }
 
+func nativeOutputText(item *dto.ResponsesOutput) string {
+	var text strings.Builder
+	for _, content := range item.Content {
+		text.WriteString(content.Text)
+		text.WriteString(content.Refusal)
+	}
+	return text.String()
+}
+
 func (a *ResponsesUsageAccumulator) rememberOutputItem(item *dto.ResponsesOutput) {
 	if a.info.ResponsesInputFacts == nil || item == nil || item.ID == "" {
 		return
@@ -294,7 +315,11 @@ func (a *ResponsesUsageAccumulator) rememberOutputItem(item *dto.ResponsesOutput
 	if len(meta.Files) > 0 {
 		return
 	}
-	tokens := tokenkit.Count(a.info.TokenizerModelName(), meta.CombineText)
+	text := meta.CombineText
+	if item.Type == "message" {
+		text = nativeOutputText(item)
+	}
+	tokens := tokenkit.Count(a.info.TokenizerModelName(), text)
 	if old := a.info.ResponsesItemUsage[item.ID]; old != nil && old.PromptTokens >= tokens {
 		return
 	}
@@ -369,11 +394,19 @@ func (a *ResponsesUsageAccumulator) outputState(id string, index *int) *response
 	return state
 }
 
-func (a *ResponsesUsageAccumulator) observeToolOutput(item *dto.ResponsesOutput, index *int) {
-	if item == nil || item.Type != dto.BuildInCallFunctionCall && item.Type != "custom_tool_call" {
+func (a *ResponsesUsageAccumulator) observeOutputItem(item *dto.ResponsesOutput, index *int) {
+	if item == nil {
 		return
 	}
 	state := a.outputState(item.ID, index)
+	if item.Type != dto.BuildInCallFunctionCall && item.Type != "custom_tool_call" {
+		text := nativeOutputText(item)
+		if len(text) > state.textBytes {
+			a.recordText(text[state.textBytes:])
+			state.textBytes = len(text)
+		}
+		return
+	}
 	if !state.nameSeen && item.Name != "" {
 		a.recordText(item.Name)
 		state.nameSeen = true
@@ -382,14 +415,15 @@ func (a *ResponsesUsageAccumulator) observeToolOutput(item *dto.ResponsesOutput,
 	if item.Type == "custom_tool_call" {
 		payload = item.Input
 	}
-	if !state.payloadSeen && len(payload) > 0 {
+	if len(payload) > 0 {
 		var text string
-		if common.Unmarshal(payload, &text) == nil {
-			a.recordText(text)
-		} else {
-			a.recordText(string(payload))
+		if common.Unmarshal(payload, &text) != nil {
+			text = string(payload)
 		}
-		state.payloadSeen = true
+		if len(text) > state.payloadBytes {
+			a.recordText(text[state.payloadBytes:])
+			state.payloadBytes = len(text)
+		}
 	}
 }
 
