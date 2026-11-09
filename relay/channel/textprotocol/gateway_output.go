@@ -269,7 +269,7 @@ func gatewayResponseTool(item gjson.Result) (string, string, bool) {
 		var arguments strings.Builder
 		for _, key := range []string{"action", "arguments", "input", "code", "queries"} {
 			value := item.Get(key)
-			if !value.Exists() || value.Type == gjson.Null || !gjson.Valid(value.Raw) {
+			if value.Type != gjson.String && !value.IsObject() && !value.IsArray() || !gjson.Valid(value.Raw) {
 				continue
 			}
 			if value.IsObject() && len(value.Map()) == 0 || value.IsArray() && len(value.Array()) == 0 {
@@ -333,7 +333,7 @@ func gatewayGeminiPartText(part gjson.Result) string {
 	text.WriteString(relaycommon.SourceText(part.Get("text")))
 	if part.Get("functionCall").Exists() {
 		text.WriteString(relaycommon.SourceText(part.Get("functionCall.name")))
-		if arguments := part.Get("functionCall.args"); gjson.Valid(arguments.Raw) {
+		if arguments := part.Get("functionCall.args"); arguments.IsObject() && gjson.Valid(arguments.Raw) {
 			text.WriteString(arguments.Raw)
 		}
 	}
@@ -352,7 +352,7 @@ func gatewayMessagesBlockText(block gjson.Result, initialBlock bool) string {
 		text := relaycommon.SourceText(block.Get("name"))
 		input := block.Get("input")
 		// An empty initial object is a placeholder before input_json_delta.
-		if input.Exists() && input.Type != gjson.Null && !(initialBlock && input.IsObject() && len(input.Map()) == 0) && gjson.Valid(input.Raw) {
+		if input.IsObject() && !(initialBlock && len(input.Map()) == 0) && gjson.Valid(input.Raw) {
 			text += input.String()
 		}
 		return text
