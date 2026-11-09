@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
@@ -543,7 +544,7 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 		parts := strings.Split(key, "-")
 		key = parts[0]
 
-		token, err := model.GetTokenByKey(key, false)
+		token, err := model.GetTokenCredential(key)
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				common.ApiErrorStatus(c, http.StatusUnauthorized, errors.New(common.TranslateMessage(c, i18n.MsgTokenInvalid)))
@@ -598,6 +599,25 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 }
 
 func TokenAuth(credentialOnly ...bool) func(c *gin.Context) {
+	return tokenAuth(len(credentialOnly) > 0 && credentialOnly[0])
+}
+
+// GatewayTokenAuth authenticates gateway and discovery requests before resolution.
+// A configured legacy fallback still checks quota before dispatch.
+func GatewayTokenAuth() func(c *gin.Context) {
+	return func(c *gin.Context) {
+		textProtocol, _ := TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
+		realtime := c.Request.Method == http.MethodGet && c.Request.URL.Path == "/v1/realtime"
+		if (textProtocol != "" || realtime) && c.GetTime(TextGatewayStartedAtKey).IsZero() {
+			// Freeze request-start prices before credential lookups.
+			c.Set(TextGatewayStartedAtKey, clock.Now())
+		}
+		discovery := c.Request.Method == http.MethodGet && (strings.HasPrefix(c.Request.URL.Path, "/v1/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/openai/models"))
+		tokenAuth(textProtocol != "" || discovery || realtime)(c)
+	}
+}
+
+func tokenAuth(walletCredential bool) func(c *gin.Context) {
 	return func(c *gin.Context) {
 		// 先检测是否为ws
 		applyWebSocketSubprotocolAuthorization(c.Request.Header)
@@ -642,10 +662,8 @@ func TokenAuth(credentialOnly ...bool) func(c *gin.Context) {
 			key = parts[0]
 		}
 		validateToken := model.ValidateUserToken
-		// The handshake has no billable request yet. Each response.create
-		// revalidates credentials and chooses wallet or legacy quota billing.
 		responsesHandshake := c.Request.Method == http.MethodGet && c.Request.URL.Path == "/v1/responses" && strings.EqualFold(c.GetHeader("Upgrade"), "websocket")
-		if TextOffering(c) != nil || TextOfferingMissing(c) || responsesHandshake || len(credentialOnly) > 0 && credentialOnly[0] {
+		if walletCredential || TextOffering(c) != nil || TextOfferingMissing(c) || responsesHandshake {
 			validateToken = model.ValidateWalletToken
 		}
 		token, err := validateToken(key)

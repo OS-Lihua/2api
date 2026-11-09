@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"slices"
 	"time"
 
 	"github.com/MoeForge/moego/ojson"
@@ -33,8 +32,15 @@ import (
 func responsesWSGateway(c *gin.Context, call *relay.ResponsesWSCall) (bool, *types.NewAPIError) {
 	offering := middleware.TextOffering(c)
 	if offering == nil {
-		if call.Established() {
+		if call.Established() || middleware.TextOfferingMissing(c) {
+			service.RecordGatewayModelAccessDenied(c)
 			return true, types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound)
+		}
+		if _, err := model.ValidateUserToken(c.GetString("token_key")); err != nil {
+			if errors.Is(err, model.ErrDatabase) {
+				return true, types.NewErrorWithStatusCode(errors.New("Authorization is temporarily unavailable"), "authorization_unavailable", http.StatusServiceUnavailable)
+			}
+			return true, types.NewErrorWithStatusCode(errors.New("Invalid API key"), "invalid_api_key", http.StatusUnauthorized)
 		}
 		return false, nil
 	}
@@ -47,9 +53,9 @@ func responsesWSGateway(c *gin.Context, call *relay.ResponsesWSCall) (bool, *typ
 		if offering == nil || offering.ID != lockedOfferingID {
 			return types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound)
 		}
-		return authorizeWebSocketOffering(control, call.Request.Model)
+		return authorizeWebSocketOffering(control)
 	}
-	if apiErr := authorizeWebSocketOffering(c, call.Request.Model); apiErr != nil {
+	if apiErr := authorizeWebSocketOffering(c); apiErr != nil {
 		return true, apiErr
 	}
 	run := &textGatewayRun{}
@@ -68,18 +74,14 @@ func responsesWSGateway(c *gin.Context, call *relay.ResponsesWSCall) (bool, *typ
 	return true, nil
 }
 
-func authorizeWebSocketOffering(c *gin.Context, requested string) *types.NewAPIError {
-	offering := middleware.TextOffering(c)
-	group := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
-	if offering == nil || !offering.Enabled || offering.Visibility == "groups" && !slices.Contains(offering.Groups, group) {
-		return types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound)
+func authorizeWebSocketOffering(c *gin.Context) *types.NewAPIError {
+	allowed, err := service.GatewayOfferingAllowed(c, middleware.TextOffering(c))
+	if err != nil {
+		return types.NewErrorWithStatusCode(errors.New("Authorization is temporarily unavailable"), "authorization_unavailable", http.StatusServiceUnavailable)
 	}
-	if c.GetBool("token_model_limit_enabled") {
-		raw, _ := c.Get("token_model_limit")
-		limits, _ := raw.(map[string]bool)
-		if !limits[requested] && !limits[offering.Name] {
-			return types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound)
-		}
+	if !allowed {
+		service.RecordGatewayModelAccessDenied(c)
+		return types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound)
 	}
 	return nil
 }
@@ -526,6 +528,11 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		}
 	}
 	if attempt.Status != "success" && apiErr != nil {
+		if outcome.Response == relaycommon.ResponseOutcomeCancelled {
+			run.fail(c, apiErr.StatusCode, string(apiErr.GetErrorCode()), apiErr.Error())
+			run.nativeError = apiErr
+			return
+		}
 		status := http.StatusBadGateway
 		if failure.Class == "invalid_request" || failure.Class == "context_length" || failure.Class == "content_safety" {
 			status = http.StatusBadRequest

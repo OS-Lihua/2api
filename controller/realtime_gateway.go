@@ -131,19 +131,24 @@ type realtimeGatewaySession struct {
 func RealtimeGateway(c *gin.Context) {
 	offering := middleware.TextOffering(c)
 	if offering == nil {
-		c.Next()
+		if middleware.TextOfferingMissing(c) {
+			gatewayError(c, http.StatusNotFound, "model_not_found", "Model not found")
+			return
+		}
+		middleware.TokenAuth()(c)
 		return
 	}
 	c.Abort()
+	if apiErr := authorizeWebSocketOffering(c); apiErr != nil {
+		gatewayError(c, apiErr.StatusCode, string(apiErr.GetErrorCode()), apiErr.Error())
+		return
+	}
 	key, keyErr := base64.StdEncoding.DecodeString(c.GetHeader("Sec-WebSocket-Key"))
 	if !websocket.IsWebSocketUpgrade(c.Request) || c.GetHeader("Sec-WebSocket-Version") != "13" || keyErr != nil || len(key) != 16 {
 		gatewayError(c, http.StatusBadRequest, "invalid_request", "Invalid WebSocket handshake")
 		return
 	}
-	if !offering.Enabled || offering.Visibility == "groups" && !slices.Contains(offering.Groups, common.GetContextKeyString(c, constant.ContextKeyUserGroup)) {
-		gatewayError(c, http.StatusNotFound, "model_not_found", "Model not found")
-		return
-	}
+
 	requestContext, cancelRequests := context.WithCancel(c.Request.Context())
 	ioContext, cancel := context.WithCancelCause(c.Request.Context())
 	session := &realtimeGatewaySession{language: i18n.StatedLang(c),
@@ -616,7 +621,7 @@ func (session *realtimeGatewaySession) authorize(c *gin.Context) *types.NewAPIEr
 	if offering == nil || offering.ID != session.offeringID {
 		return types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound)
 	}
-	return authorizeWebSocketOffering(c, session.model)
+	return authorizeWebSocketOffering(c)
 }
 
 func (session *realtimeGatewaySession) instructionTokens() int {

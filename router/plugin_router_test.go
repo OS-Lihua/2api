@@ -534,6 +534,9 @@ func TestBuiltInPluginRoutesAreServedBesideHostRoutes(t *testing.T) {
 		},
 	))
 	require.NoError(t, registry.SetGenerationPreparer(builder.prepare))
+	previousRegistry := defaultPluginDispatcher.registry
+	defaultPluginDispatcher.registry = registry
+	t.Cleanup(func() { defaultPluginDispatcher.registry = previousRegistry })
 	outer.NoRoute((&pluginRouteDispatcher{registry: registry}).dispatch, controller.RelayNotFound)
 
 	require.Empty(t, registry.RoutingErrors())

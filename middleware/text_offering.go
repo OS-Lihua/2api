@@ -17,13 +17,9 @@ const textOfferingContextKey = "text_gateway_offering"
 const textOfferingMissingContextKey = "text_gateway_offering_missing"
 const TextGatewayStartedAtKey = "text_gateway_started_at"
 
-// ResolveTextOffering runs before token validation so a wallet request does not
-// mutate the token's retired quota status. It does not authorize the offering;
-// the normal token checks and the gateway's visibility check still apply.
-func ResolveTextOffering(paths ...string) gin.HandlerFunc {
-	if len(paths) == 0 {
-		paths = []string{"/v1/chat/completions"}
-	}
+// ResolveTextOffering resolves the request's public ModelOffering name.
+// The gateway checks visibility and Key permissions before dispatch.
+func ResolveTextOffering() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		isRealtime := c.Request.Method == http.MethodGet && c.Request.URL.Path == "/v1/realtime"
 		kind, name := TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
@@ -34,7 +30,9 @@ func ResolveTextOffering(paths ...string) gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		c.Set(TextGatewayStartedAtKey, clock.Now())
+		if c.GetTime(TextGatewayStartedAtKey).IsZero() {
+			c.Set(TextGatewayStartedAtKey, clock.Now())
+		}
 		if name == "" {
 			var request struct {
 				Model string `json:"model"`

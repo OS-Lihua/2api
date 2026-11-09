@@ -51,7 +51,10 @@ func GatewayPolicy() GatewayAttemptPolicy {
 
 // GatewayExclusions is request-local. Credentials and account quota exclude a
 // Provider; other failures exclude only the actual Channel.
-type GatewayExclusions struct{ Channels, Providers map[int]bool }
+type GatewayExclusions struct {
+	Channels, Providers map[int]bool
+	MemberTier          int
+}
 
 type GatewayFailure struct {
 	Class                   string

@@ -35,20 +35,20 @@ var responsesWSRequestEngine = sync.OnceValue(func() *gin.Engine {
 	engine.ForwardedByClientIP = false
 	_ = engine.SetTrustedProxies(nil)
 	rateLimit := middleware.ModelRequestRateLimit()
-	authenticate, authenticateControl := middleware.TokenAuth(), middleware.TokenAuth(true)
+	authenticate, authenticateControl := middleware.GatewayTokenAuth(), middleware.TokenAuth(true)
 	engine.POST("/v1/responses", func(c *gin.Context) {
 		state := c.Request.Context().Value(responsesWSRequestContextKey{}).(*responsesWSRequestState)
 		c.Set(common.RequestIdKey, state.requestID)
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
 		c.Next()
-	}, middleware.BodyStorageCleanup(), middleware.ResolveTextOffering("/v1/responses"), func(c *gin.Context) {
+	}, middleware.BodyStorageCleanup(), func(c *gin.Context) {
 		state := c.Request.Context().Value(responsesWSRequestContextKey{}).(*responsesWSRequestState)
 		if state.authenticateOnly {
 			authenticateControl(c)
 		} else {
 			authenticate(c)
 		}
-	}, func(c *gin.Context) {
+	}, middleware.ResolveTextOffering(), func(c *gin.Context) {
 		state := c.Request.Context().Value(responsesWSRequestContextKey{}).(*responsesWSRequestState)
 		if state.authenticateOnly {
 			c.Next()

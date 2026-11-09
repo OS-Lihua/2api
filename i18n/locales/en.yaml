@@ -2,6 +2,7 @@
 
 # Errors returned to AI clients
 gateway.model_not_found: "Model not found"
+gateway.authorization_unavailable: "Model authorization is unavailable"
 gateway.invalid_text_request: "Invalid text request"
 gateway.cannot_convert_request: "The request cannot be converted"
 gateway.unsupported_capabilities: "No Channel supports the requested capabilities"
