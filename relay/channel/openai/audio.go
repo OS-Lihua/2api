@@ -828,15 +828,20 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	if info.ResponseFacts != nil && structured && decodeErr != nil {
 		return types.NewOpenAIError(decodeErr, types.ErrorCodeBadResponseBody, http.StatusBadGateway), responseData.Usage
 	}
-	writeErr := service.IOCopyBytesGracefully(c, resp, responseBody)
+	var writeErr error
 	if info.ResponseFacts != nil {
-		if writeErr != nil {
-			info.ResponseFacts.DownstreamWriteFailed = true
-			return types.NewError(writeErr, types.ErrorCodeBadResponse), responseData.Usage
+		business := info.ResponseFacts.GeneratedText != ""
+		if structured {
+			writeErr = helper.WriteGatewayJSONResponse(c, resp, info.ResponseFacts, responseBody, business)
+		} else {
+			writeErr = helper.WriteGatewayResponse(c, resp, info.ResponseFacts, responseBody, resp.Header.Get("Content-Type"), business)
 		}
-		if info.ResponseFacts.GeneratedText != "" {
-			info.ResponseFacts.MarkBusinessOutput()
-		}
+	} else {
+		writeErr = service.IOCopyBytesGracefully(c, resp, responseBody)
+	}
+	if info.ResponseFacts != nil && writeErr != nil {
+		info.ResponseFacts.DownstreamWriteFailed = true
+		return types.NewError(writeErr, types.ErrorCodeBadResponse), responseData.Usage
 	}
 	if decodeErr == nil && responseData.Usage != nil {
 		if responseData.Usage.TotalTokens > 0 || info.UpstreamProtocol != "" || info.ResponseFacts != nil {

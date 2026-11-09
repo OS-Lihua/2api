@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"errors"
-	"maps"
 	"time"
 
 	"github.com/QuantumNous/new-api/model"
@@ -48,12 +47,7 @@ func GatewayPrice(price *model.PriceVersion, usage *dto.Usage, request billingex
 	if err != nil {
 		return money.Value{}, money.Value{}, billingexpr.MoneyTraceResult{}, err
 	}
-	for _, modality := range []string{"img_o", "ao"} {
-		if request.UnmeasuredTokens[modality] && !used[modality] {
-			request.UnmeasuredTokens = maps.Clone(request.UnmeasuredTokens)
-			request.UnmeasuredTokens["c"] = true
-		}
-	}
+	request.UnmeasuredTokens = billingexpr.NormalizeUnmeasuredOutputTokens(request.UnmeasuredTokens, used)
 	input := billingexpr.MoneyInput{TokenQuantities: quantities, Request: request, Time: at}
 	if len(actualImageCount) > 1 {
 		return money.Value{}, money.Value{}, billingexpr.MoneyTraceResult{}, errors.New("multiple actual image counts")

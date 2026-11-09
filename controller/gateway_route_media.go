@@ -163,7 +163,8 @@ func prepareGatewayMediaRoute(c *gin.Context, selection *service.GatewaySelectio
 		usage.CompletionTokenDetails.AudioTokens = int(mean)
 	}
 	if parsed.Protocol == protocol.OpenAIAudioTranscription {
-		usage.PromptTokensDetails.AudioTokens = input
+		usage.PromptTokensDetails.AudioTokens = info.ResponseFacts.AudioInputTokensEstimated
+		usage.PromptTokensDetails.TextTokens = info.ResponseFacts.TextInputTokensEstimated
 	}
 	headers, deferred, err := adaptor.PreviewHeaders(candidate, info, bytes.NewReader(prepared.Body))
 	if err != nil {

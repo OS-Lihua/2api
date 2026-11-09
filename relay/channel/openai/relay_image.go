@@ -117,15 +117,15 @@ func OpenaiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 		}
 	}
 
-	writeErr := service.IOCopyBytesGracefully(c, resp, responseBody)
+	var writeErr error
 	if info.ResponseFacts != nil {
-		if writeErr != nil {
-			info.ResponseFacts.DownstreamWriteFailed = true
-			return &usageResp.Usage, types.NewError(writeErr, types.ErrorCodeBadResponse)
-		}
-		if count > 0 {
-			info.ResponseFacts.MarkBusinessOutput()
-		}
+		writeErr = helper.WriteGatewayJSONResponse(c, resp, info.ResponseFacts, responseBody, count > 0)
+	} else {
+		writeErr = service.IOCopyBytesGracefully(c, resp, responseBody)
+	}
+	if info.ResponseFacts != nil && writeErr != nil {
+		info.ResponseFacts.DownstreamWriteFailed = true
+		return &usageResp.Usage, types.NewError(writeErr, types.ErrorCodeBadResponse)
 	}
 
 	normalizeOpenAIUsage(&usageResp.Usage)
@@ -549,6 +549,11 @@ func openaiImageJSONAsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 	// not forwarded.
 	emitted := 0
 	var deliveredURLs, deliveredBase64 int64
+	var imageTokens int
+	var imageTokensKnown bool
+	if info.ResponseFacts != nil {
+		imageTokens, imageTokensKnown = estimateImageFrameOutput(info, responseBody)
+	}
 	for _, image := range ojson.GetBytesNoCopy(responseBody, "data").Array() {
 		if !openaiImageDataHasField(image, "url") && !openaiImageDataHasField(image, "b64_json") {
 			continue
@@ -584,6 +589,10 @@ func openaiImageJSONAsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 					deliveredBase64++
 				}
 				info.ResponseFacts.DeliveredImageCount = min(max(deliveredURLs, deliveredBase64), int64(dto.MaxImageN))
+				if imageTokensKnown {
+					tokens := imageTokens * int(info.ResponseFacts.DeliveredImageCount)
+					info.ResponseFacts.DeliveredImageOutputTokensEstimate = &tokens
+				}
 				info.ResponseFacts.MarkBusinessOutput()
 			}
 			info.ResponseFacts.DownstreamWriteFailed = writeErr != nil

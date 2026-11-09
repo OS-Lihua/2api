@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"fmt"
+	"maps"
 	"math/big"
 	"slices"
 	"strings"
@@ -439,9 +440,11 @@ func meanPriceValue(ctx context.Context, tx *gorm.DB, price *PriceVersion, offer
 		}
 		weight := new(big.Rat)
 		for _, sample := range usages {
+			sampleUnknown := make(map[string]bool, len(sample.facts.UnmeasuredTokens))
 			for _, name := range sample.facts.UnmeasuredTokens {
-				unmeasured[name] = true
+				sampleUnknown[name] = true
 			}
+			maps.Copy(unmeasured, billingexpr.NormalizeUnmeasuredOutputTokens(sampleUnknown, used))
 			if meanImages != nil {
 				count := sample.facts.ImageCount
 				if count == nil || *count < 0 || *count > dto.MaxImageN {

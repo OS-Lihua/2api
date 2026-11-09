@@ -640,15 +640,25 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 			}
 			billableFacts.ImageCount = &delivered
 			saleCount = []int{int(delivered)}
-			if facts.ImageOutputTokensEstimated || facts.ImageOutputTokensUnknown && facts.DeliveredImageOutputTokensEstimate != nil {
+			reportedSubset := facts.ImageOutputTokensReported && usage.CompletionTokenDetails.ImageTokens > 0 && (facts.ImageCount == nil || delivered < *facts.ImageCount)
+			if reportedSubset || facts.ImageOutputTokensEstimated || facts.ImageOutputTokensUnknown && facts.DeliveredImageOutputTokensEstimate != nil {
 				tokens := 0
 				var clamp *common.QuotaClamp
-				if facts.ImageCount != nil && *facts.ImageCount > 0 {
+				if !reportedSubset && facts.ImageCount != nil && *facts.ImageCount > 0 {
 					tokens, clamp = common.QuotaFromFloatChecked(float64(usage.CompletionTokenDetails.ImageTokens) * float64(delivered) / float64(*facts.ImageCount))
+				}
+				if reportedSubset {
+					// A batch report does not identify the tokens of a delivered subset.
+					billableFacts.ImageOutputTokensReported = false
+					billableFacts.CompletionTokensReported, billableFacts.UsageReported = false, false
+					billableFacts.ImageOutputTokensUnknown = true
+					saleInput.UnmeasuredTokens = map[string]bool{"img_o": true}
+					run.record.UsageSource = "estimated"
 				}
 				if facts.DeliveredImageOutputTokensEstimate != nil {
 					tokens = *facts.DeliveredImageOutputTokensEstimate
 					billableFacts.ImageOutputTokensUnknown = false
+					billableFacts.ImageOutputTokensEstimated = true
 					delete(saleInput.UnmeasuredTokens, "img_o")
 				}
 				if clamp != nil {

@@ -300,6 +300,12 @@ func WriteGatewayStreamFrame(c *gin.Context, facts *relaycommon.ResponseFacts, f
 // WriteGatewayJSONResponse records complete business writes and checks the
 // error-aware flush boundary for both generic and native protocol writers.
 func WriteGatewayJSONResponse(c *gin.Context, resp *http.Response, facts *relaycommon.ResponseFacts, body []byte, business bool) error {
+	return WriteGatewayResponse(c, resp, facts, body, "application/json", business)
+}
+
+// WriteGatewayResponse preserves the response format at the error-aware
+// business-write and flush boundary shared by gateway protocols.
+func WriteGatewayResponse(c *gin.Context, resp *http.Response, facts *relaycommon.ResponseFacts, body []byte, contentType string, business bool) error {
 	if err := c.Request.Context().Err(); err != nil {
 		return err
 	}
@@ -310,7 +316,7 @@ func WriteGatewayJSONResponse(c *gin.Context, resp *http.Response, facts *relayc
 			}
 		}
 	}
-	c.Header("Content-Type", "application/json")
+	c.Header("Content-Type", contentType)
 	c.Header("Content-Length", fmt.Sprint(len(body)))
 	status := http.StatusOK
 	if resp != nil {

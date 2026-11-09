@@ -386,7 +386,10 @@ func TestMarginGuardUsesMediaQuantities(t *testing.T) {
 	for _, tc := range []struct {
 		name, expression                         string
 		images, unknown, sale, zero, fx, partial bool
+		residual, legacy                         bool
 	}{
+		{name: "normalized residual sale", sale: true, residual: true, expression: `image_count > 0 ? tier("text",c*7) : tier("image",img_o*7)`},
+		{name: "legacy normalized residual sale", sale: true, residual: true, legacy: true, expression: `image_count > 0 ? tier("text",c*7) : tier("image",img_o*7)`},
 		{name: "image quantity price", images: true, expression: `tier("image",fixed(0.05))*image_count`},
 		{name: "separate delivered and generated image counts", images: true, partial: true, expression: `tier("image",fixed(0.05))*image_count`},
 		{name: "image quantity FX", images: true, fx: true},
@@ -447,6 +450,19 @@ func TestMarginGuardUsesMediaQuantities(t *testing.T) {
 				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 				fixture.fake.Advance(time.Second)
 			}
+			if tc.legacy {
+				var rows []model.GatewayBilling
+				require.NoError(t, model.DB.Find(&rows).Error)
+				require.Len(t, rows, 2)
+				for _, row := range rows {
+					var intent model.GatewaySettlement
+					require.NoError(t, common.UnmarshalJsonStr(row.Settlement, &intent))
+					intent.SaleUsage, intent.AttemptUsage = nil, nil
+					data, err := common.Marshal(intent)
+					require.NoError(t, err)
+					require.NoError(t, model.DB.Model(&row).Update("settlement", string(data)).Error)
+				}
+			}
 			manager := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "pricing:read", "pricing:write")
 			owner, id := "channel", fixture.channel.ID
 			if tc.sale {
@@ -464,6 +480,19 @@ func TestMarginGuardUsesMediaQuantities(t *testing.T) {
 				MarginCheck model.PriceMarginReport `json:"margin_check"`
 			}
 			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &reply))
+			if tc.residual {
+				require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
+				require.True(t, reply.Data.RequiresConfirmation)
+				require.Len(t, reply.Data.Estimates, 1)
+				estimate := reply.Data.Estimates[0]
+				assert.Equal(t, "estimated", estimate.Status)
+				require.NotNil(t, estimate.Revenue)
+				require.NotNil(t, estimate.Cost)
+				assert.Zero(t, estimate.Revenue.Nanos)
+				assert.EqualValues(t, 20_000_000, estimate.Cost.Nanos)
+				assert.True(t, estimate.Negative)
+				return
+			}
 			if tc.images {
 				require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
 				require.True(t, reply.Data.RequiresConfirmation)
