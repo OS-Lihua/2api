@@ -229,21 +229,29 @@ func smokeTestExpr(exprStr string) error {
 	return nil
 }
 
+func compileTaskUsageExpression(exprStr string, schema map[string]jsplugin.UsageFieldSchema) (*billingexpr.CompiledExpression, error) {
+	compiled, err := billingexpr.Compile(exprStr)
+	if err != nil {
+		return nil, err
+	}
+	if compiled.UsesFixedPricing() {
+		return nil, fmt.Errorf("fixed pricing is not supported for task usage expressions")
+	}
+	for key := range compiled.UsageKeys() {
+		if _, declared := schema[key]; !declared {
+			return nil, fmt.Errorf("usage key %q is not declared by the task plugin", key)
+		}
+	}
+	return compiled, nil
+}
+
 // SmokeTestTaskExpr validates a task usage expression against the usage facts
 // declared by its plugin. Literal u() keys must be declared; dynamic calls are
 // still exercised by the generated runtime vectors when possible.
 func SmokeTestTaskExpr(exprStr string, schema map[string]jsplugin.UsageFieldSchema) error {
-	compiled, err := billingexpr.Compile(exprStr)
+	compiled, err := compileTaskUsageExpression(exprStr, schema)
 	if err != nil {
 		return err
-	}
-	if compiled.UsesFixedPricing() {
-		return fmt.Errorf("fixed pricing is not supported for task usage expressions")
-	}
-	for key := range compiled.UsageKeys() {
-		if _, declared := schema[key]; !declared {
-			return fmt.Errorf("usage key %q is not declared by the task plugin", key)
-		}
 	}
 
 	for _, usage := range taskUsageSmokeVectors(schema) {
@@ -264,7 +272,7 @@ func SmokeTestTaskExpr(exprStr string, schema map[string]jsplugin.UsageFieldSche
 // SmokeTestTaskMoneyExpr validates price versions with the exact task evaluator,
 // including scalar aliases that read the current vector's measured quantities.
 func SmokeTestTaskMoneyExpr(exprStr string, schema map[string]jsplugin.UsageFieldSchema) error {
-	if err := SmokeTestTaskExpr(exprStr, schema); err != nil {
+	if _, err := compileTaskUsageExpression(exprStr, schema); err != nil {
 		return err
 	}
 	for _, usage := range taskUsageSmokeVectors(schema) {

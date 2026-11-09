@@ -311,12 +311,14 @@ func TestAsyncTaskTerminalAccountingKeepsAcceptedIdentityAndFrozenPrices(t *test
 	for _, tc := range []struct {
 		name, status, seconds    string
 		wallet, sale, cost, debt int64
+		exactPrice               bool
 	}{
-		{"success", "completed", "2", 820000000, 180000000, 100000000, 0},
-		{"failure", "failed", "2", 1000000000, 0, 100000000, 0},
-		{"explicit failed zero", "failed", "0", 1000000000, 0, 0, 0},
-		{"cancelled", "cancelled", "2", 1000000000, 0, 100000000, 0},
-		{"shortfall", "completed", "20", 0, 1800000000, 1000000000, 800000000},
+		{"success", "completed", "2", 820000000, 180000000, 100000000, 0, false},
+		{"failure", "failed", "2", 1000000000, 0, 100000000, 0, false},
+		{"explicit failed zero", "failed", "0", 1000000000, 0, 0, 0, false},
+		{"cancelled", "cancelled", "2", 1000000000, 0, 100000000, 0, false},
+		{"shortfall", "completed", "20", 0, 1800000000, 1000000000, 800000000, false},
+		{"exact decimal price", "completed", "2", 820000000, 180000000, 100000000, 0, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			submits, polls := 0, 0
@@ -331,6 +333,15 @@ func TestAsyncTaskTerminalAccountingKeepsAcceptedIdentityAndFrozenPrices(t *test
 				submits++
 				_, _ = w.Write([]byte(`{"id":"private-job","status":"queued"}`))
 			})
+			if tc.exactPrice {
+				fixture.fake.Advance(time.Second)
+				for _, price := range []*model.PriceVersion{
+					{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `0.100000000000000001 > 0.1 ? tier("video", u("seconds") * 0.1) : tier("unreachable", -1)`, EffectiveAt: clock.Now().Unix()},
+					{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `0.100000000000000001 > 0.1 ? tier("video", u("seconds") * 0.05) : tier("unreachable", -1)`, EffectiveAt: clock.Now().Unix()},
+				} {
+					require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+				}
+			}
 			request := httptest.NewRequest(http.MethodPost, "/v1/tasks/sora", strings.NewReader(`{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`))
 			request.Header.Set("Content-Type", "application/json")
 			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
