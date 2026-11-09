@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/bytedance/gopkg/util/gopool"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 type Token struct {
@@ -235,7 +236,7 @@ func validateUserToken(key string, checkQuota bool) (token *Token, err error) {
 	if key == "" {
 		return nil, ErrTokenNotProvided
 	}
-	token, err = GetTokenByKey(key, false)
+	token, err = GetTokenCredential(key)
 	if err == nil {
 		if token.Status == common.TokenStatusExhausted ||
 			token.Status == common.TokenStatusExpired ||
@@ -291,6 +292,27 @@ func GetTokenById(id int) (*Token, error) {
 	return &token, err
 }
 
+// GetTokenCredential reads identity restrictions from the primary database even
+// when invalidation failed during a committed mutation. Atomic quota counters
+// for the same Key remain sourced from Redis for legacy authentication.
+func GetTokenCredential(key string) (*Token, error) {
+	if key == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var cachedToken *Token
+	if common.RedisEnabled {
+		cachedToken, _ = cacheGetTokenByKey(key)
+	}
+	token, err := GetTokenByKey(key, true)
+	if err != nil {
+		return nil, err
+	}
+	if cachedToken != nil && token.Id == cachedToken.Id {
+		token.RemainQuota, token.UsedQuota = cachedToken.RemainQuota, cachedToken.UsedQuota
+	}
+	return token, nil
+}
+
 func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 	if !fromDB && common.RedisEnabled {
 		// Try Redis first
@@ -301,7 +323,10 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 		// Don't return error - fall through to DB
 	}
 	token = &Token{}
-	if err = DB.Where(`"key" = ?`, key).First(token).Error; err != nil {
+	// This query binds a usable credential. Keep it out of SQL traces even
+	// when an operator enables unparameterized debug logging.
+	query := DB.Session(&gorm.Session{Logger: DB.Logger.LogMode(gormlogger.Silent)})
+	if err = query.Where(`"key" = ?`, key).First(token).Error; err != nil {
 		return nil, err
 	}
 	if common.RedisEnabled {

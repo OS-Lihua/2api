@@ -75,6 +75,7 @@ import (
 
 func TestListModelsSupportsOpenAIAndGeminiAuthentication(t *testing.T) {
 	setupRelayRouterTestDB(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Model{}, &model.ModelOffering{}, &model.ModelOfferingName{}, &model.ModelOfferingMember{}, &model.TokenOfferingPolicy{}, &model.TokenOfferingException{}))
 
 	user := model.User{
 		Username: "models-user",
@@ -182,6 +183,7 @@ func TestGeminiRelayHandsLongRunningPredictionToPluginRoute(t *testing.T) {
 	}{
 		{method: http.MethodPost, path: "/v1beta/models/veo-3.1-generate-preview:predictLongRunning", toPlugin: true},
 		{method: http.MethodGet, path: "/v1beta/models/veo-3.1-generate-preview/operations/task_sample", toPlugin: true},
+		{method: http.MethodGet, path: "/v1beta/models/veo-3.1-generate-preview/oper%61tions/task_sample", toPlugin: true},
 		{method: http.MethodPost, path: "/v1beta/models/gemini-2.5-flash:generateContent"},
 	} {
 		t.Run(testCase.path, func(t *testing.T) {
@@ -235,7 +237,7 @@ func newTextGatewayFixture(t *testing.T, upstream http.HandlerFunc) textGatewayF
 	t.Cleanup(func() { constant.StreamingTimeout = previousStreamTimeout })
 	require.NoError(t, model.InitSettlementCurrency())
 	db := model.DB
-	require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Channel{}, &model.ModelOffering{}, &model.ModelOfferingName{}, &model.ModelOfferingMember{}, &model.Wallet{}, &model.LedgerEntry{}))
+	require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Channel{}, &model.ModelOffering{}, &model.ModelOfferingName{}, &model.ModelOfferingMember{}, &model.TokenOfferingPolicy{}, &model.TokenOfferingException{}, &model.Wallet{}, &model.LedgerEntry{}))
 	require.NoError(t, db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS "idx_wallets_account" ON "wallets" ("account_type", "owner_id", "balance_currency")`).Error)
 	require.NoError(t, model.MigratePricing(db))
 	require.NoError(t, model.MigrateGatewayBilling(db))
@@ -12162,8 +12164,9 @@ func TestTextGatewayAuthorizationCapabilityAndScopeFilters(t *testing.T) {
 			f.offering.Groups = []string{"vip"}
 			require.NoError(t, model.SaveModelOffering(t.Context(), f.offering, "save"))
 		}, status: 404, code: "model_not_found"},
-		{name: "token model restriction", change: func(t *testing.T, f *textGatewayFixture) {
-			require.NoError(t, model.DB.Model(f.token).Updates(map[string]any{"model_limits_enabled": true, "model_limits": "other-model"}).Error)
+		{name: "token Offering restriction", change: func(t *testing.T, f *textGatewayFixture) {
+			_, err := model.MutateKeyPermissions(t.Context(), f.token.Id, f.user.Id, 0, "deny_all", model.KeyPermissions{}, nil)
+			require.NoError(t, err)
 		}, status: 404, code: "model_not_found"},
 		{name: "Provider exclusion", change: func(t *testing.T, f *textGatewayFixture) {
 			f.offering.ChannelScope.ExcludeProviderIDs = []int{f.channel.ProviderID}
@@ -12299,22 +12302,28 @@ func TestTextGatewayInsufficientReservationStopsBeforeProvider(t *testing.T) {
 }
 
 func TestTextGatewayUnknownOfferingRetainsLegacyTokenQuota(t *testing.T) {
-	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("unknown Offering must not use the new Channel") })
-	// The model exists only in legacy routing, where quota still applies even when no route is enabled.
-	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "unknown-legacy-model", ChannelId: fixture.channel.ProviderID, Enabled: false}).Error)
-	body := `{"model":"unknown-legacy-model","messages":[{"role":"user","content":"Hello"}]}`
-	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
-	assert.Equal(t, 401, response.Code, response.Body.String())
-	token, err := model.GetTokenById(fixture.token.Id)
-	require.NoError(t, err)
-	assert.Equal(t, common.TokenStatusExhausted, token.Status)
-	require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"status": common.TokenStatusEnabled, "unlimited_quota": true}).Error)
-	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
-	assert.Equal(t, 503, response.Code, response.Body.String())
-	assert.Contains(t, response.Body.String(), `"code":"model_not_found"`)
-	_, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
-	require.NoError(t, err)
-	assert.Zero(t, total)
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprint("enabled=", enabled), func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("legacy model must not use the new Channel") })
+			// Legacy quota applies to a registered model even when its route is disabled.
+			require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "unknown-legacy-model", ChannelId: fixture.channel.ProviderID, Enabled: enabled}).Error)
+			body := `{"model":"unknown-legacy-model","messages":[{"role":"user","content":"Hello"}]}`
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+			assert.Equal(t, 401, response.Code, response.Body.String())
+			token, err := model.GetTokenById(fixture.token.Id)
+			require.NoError(t, err)
+			assert.Equal(t, common.TokenStatusExhausted, token.Status)
+			// Keep the registered legacy route unavailable for the unlimited-Key check.
+			require.NoError(t, model.DB.Model(&model.Ability{}).Where("model = ?", "unknown-legacy-model").Update("enabled", false).Error)
+			require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"status": common.TokenStatusEnabled, "unlimited_quota": true}).Error)
+			response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+			assert.Equal(t, 503, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), `"code":"model_not_found"`)
+			_, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+			require.NoError(t, err)
+			assert.Zero(t, total)
+		})
+	}
 }
 
 func TestTextGatewayMissingUsageDoesNotChargeOutputLimitAsPrompt(t *testing.T) {

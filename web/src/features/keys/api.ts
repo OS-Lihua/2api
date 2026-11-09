@@ -32,6 +32,36 @@ import type {
 // API Key Management
 // ============================================================================
 
+export type KeyPermissions = {
+  default_allow: boolean
+  exception_ids: number[]
+  revision: number
+}
+
+export type KeyOfferingChoice = { id: number; name: string }
+
+export async function getKeyPermissions(
+  id: number
+): Promise<ApiResponse<KeyPermissions>> {
+  const response = await api.get(`/api/token/${id}/permissions`)
+  return response.data
+}
+
+export async function getKeyOfferings(): Promise<
+  ApiResponse<KeyOfferingChoice[]>
+> {
+  const response = await api.get('/api/token/offerings')
+  return response.data
+}
+
+export async function updateKeyPermissions(
+  id: number,
+  permissions: KeyPermissions
+): Promise<ApiResponse<KeyPermissions>> {
+  const response = await api.put(`/api/token/${id}/permissions`, permissions)
+  return response.data
+}
+
 // Get paginated API keys list
 export async function getApiKeys(
   params: GetApiKeysParams = {}

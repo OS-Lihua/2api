@@ -51,7 +51,17 @@ let renderedDrawer: RenderedDrawer | null = null
 
 function installApiFixtures(createdPayloads: Array<Record<string, unknown>>) {
   apiClient.get = async (url) => {
+    if (/^\/api\/token\/\d+\/permissions$/.test(url)) {
+      return {
+        data: {
+          success: true,
+          data: { default_allow: true, exception_ids: [], revision: 0 },
+        },
+      }
+    }
     switch (url) {
+      case '/api/token/offerings':
+        return { data: { success: true, data: [] } }
       case '/api/status':
         return { data: { data: { default_use_auto_group: true } } }
       case '/api/user/models':
@@ -346,6 +356,19 @@ describe('API key expiry across editing sessions', () => {
       await waitFor(() => expect(screen.getByLabelText('Time')).toBeEnabled())
 
       if (finish === 'save') {
+        const policy = await screen.findByRole('combobox', {
+          name: 'Default policy',
+        })
+        fireEvent.change(policy, { target: { value: 'deny' } })
+        await waitFor(() =>
+          expect(findButton('Save changes', true)).toBeDisabled()
+        )
+        fireEvent.click(
+          screen.getByRole('button', { name: 'Reload permissions' })
+        )
+        await waitFor(() =>
+          expect(findButton('Save changes', true)).toBeEnabled()
+        )
         fireEvent.click(findButton('Save changes', true))
         await waitFor(() => expect(put).toHaveBeenCalled())
         expect(put.mock.calls[0][1]).toMatchObject({
@@ -402,6 +425,18 @@ describe('API key expiry across editing sessions', () => {
       expect(payloads[0]?.expired_time).toBe(-1)
     }
   )
+})
+
+describe('API Key Offering permissions', () => {
+  test('explains that a new Key allows newly listed visible Offerings', async () => {
+    installApiFixtures([])
+    await renderCreateDrawer()
+    expect(
+      screen.getByText(
+        'New Keys allow all visible Offerings, including newly listed Offerings.'
+      )
+    ).toBeVisible()
+  })
 })
 
 describe('API keys mutate drawer user quota query switch', () => {
