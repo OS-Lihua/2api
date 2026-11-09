@@ -58,6 +58,9 @@ func GatewayMediaCapabilitiesMatch(c *gin.Context, kind protocol.Type, request d
 			return false
 		}
 	case protocol.OpenAIAudioSpeech:
+		if caps.Limits.MaxDurationSeconds != nil {
+			return false
+		}
 		output = capability.Audio
 	case protocol.OpenAIAudioTranscription:
 		input, output = capability.Audio, capability.Text

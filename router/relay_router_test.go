@@ -4821,7 +4821,8 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 		{name: "Volcengine explicit output limit", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"max_new_tokens":16`, reject: true},
 		{name: "Volcengine metadata silence exceeds duration cap", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, durationLimit: 1, extra: `,"metadata":{"request":{"silence_duration":2000}}`, reject: true},
 		{name: "Volcengine override silence exceeds duration cap", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, durationLimit: 1, overrides: `{"operations":[{"path":"request.silence_duration","mode":"set","value":2000}]}`, reject: true},
-		{name: "Volcengine explicit silence zero", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, durationLimit: 1, extra: `,"metadata":{"request":{"silence_duration":0}}`},
+		{name: "Volcengine explicit silence zero", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"request":{"silence_duration":0}}`},
+		{name: "Volcengine explicit silence zero duration bound", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, durationLimit: 1, extra: `,"metadata":{"request":{"silence_duration":0}}`, reject: true},
 		{name: "Volcengine silence reservation", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"request":{"silence_duration":120000}}`, hold: 18_000_000},
 		{name: "Volcengine override silence reservation", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, overrides: `{"operations":[{"path":"request.silence_duration","mode":"set","value":120000}]}`, hold: 18_000_000},
 		{name: "Volcengine unsupported output override", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, overrides: `{"max_new_tokens":16}`, reject: true},
@@ -5013,6 +5014,80 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 			reconciliation, err := model.ReconcileWallets(100)
 			require.NoError(t, err)
 			assert.Empty(t, reconciliation.Mismatches)
+		})
+	}
+}
+
+func TestMediaGatewayOriginalImageInputsHonorCapabilities(t *testing.T) {
+	for _, tc := range []struct {
+		name, images, override string
+		allow                  bool
+		status                 int
+	}{
+		{"count before override", `["https://image.invalid/a","https://image.invalid/b"]`, `{"images":["https://image.invalid/a"]}`, true, 400},
+		{"modality before override", `["https://image.invalid/a"]`, `{"images":[]}`, false, 400},
+		{"compatible original", `["https://image.invalid/a"]`, `{"images":["https://image.invalid/a"]}`, true, 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"data":[{"url":"https://image.invalid/one"}]}`)
+			})
+			var unified model.Model
+			require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+			unified.Capabilities.InputModalities = []capability.Modality{capability.Text}
+			if tc.allow {
+				unified.Capabilities.InputModalities = append(unified.Capabilities.InputModalities, capability.Image)
+			}
+			unified.Capabilities.Limits.MaxImages = common.GetPointer(int64(1))
+			require.NoError(t, model.DB.Save(&unified).Error)
+			require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", tc.override).Error)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", fmt.Sprintf(`{"model":"gateway-alias","prompt":"draw","images":%s}`, tc.images))
+			assert.Equal(t, tc.status, response.Code)
+			if tc.status == 400 {
+				assert.Zero(t, calls)
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
+			} else {
+				assert.Equal(t, 1, calls)
+			}
+		})
+	}
+}
+
+func TestMediaGatewaySpeechDurationCapsRequireExecutableControl(t *testing.T) {
+	for _, providerType := range []int{constant.ChannelTypeOpenAI, constant.ChannelTypeVLLM, constant.ChannelTypeMiniMax, constant.ChannelTypeVolcEngine} {
+		t.Run(fmt.Sprint(providerType), func(t *testing.T) {
+			calls := 0
+			audio := make([]byte, 48000*31)
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "audio/pcm")
+				switch providerType {
+				case constant.ChannelTypeMiniMax:
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprintf(w, `{"data":{"audio":%q,"status":2},"base_resp":{"status_code":0}}`, hex.EncodeToString(audio))
+				case constant.ChannelTypeVolcEngine:
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprintf(w, `{"code":3000,"data":%q}`, base64.StdEncoding.EncodeToString(audio))
+				default:
+					_, _ = w.Write(audio)
+				}
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": providerType, "key": "access|secret"}).Error)
+			var unified model.Model
+			require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+			unified.Capabilities.Limits.MaxDurationSeconds = common.GetPointer(int64(30))
+			require.NoError(t, model.DB.Save(&unified).Error)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", `{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm"}`)
+			assert.Equal(t, 400, response.Code)
+			assert.Zero(t, calls)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
 		})
 	}
 }

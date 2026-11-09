@@ -87,6 +87,9 @@ func prepareGatewayMediaRoute(c *gin.Context, selection *service.GatewaySelectio
 	info.ResponseFacts = &relaycommon.ResponseFacts{}
 	common.SetContextKey(candidate, constant.ContextKeyResponseFacts, info.ResponseFacts)
 	common.SetContextKey(candidate, constant.ContextKeyOriginalModel, info.TokenizerModel)
+	if !service.GatewayMediaCapabilitiesMatch(candidate, parsed.Protocol, parsed.Request, selection.Capabilities, 0, nil) {
+		return nil, service.ErrGatewayCapability
+	}
 	if helper.ValidateGatewayMediaMultipliers(parsed.Input.Body, selection.Capabilities.Limits) != nil {
 		return nil, service.ErrGatewayCapability
 	}
