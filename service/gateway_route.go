@@ -323,8 +323,7 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 			probeFence = append(probeFence, lossFence...)
 		}
 		if len(eligible) == 0 && len(unprofitable) > 0 && offering.AllowLossFallback {
-			slices.SortStableFunc(unprofitable, func(a, b *GatewaySelection) int { order, _ := a.EstimatedCost.Compare(b.EstimatedCost); return order })
-			eligible = unprofitable[:1]
+			eligible = unprofitable
 			lossFallback = true
 		}
 		if len(eligible) == 0 {
@@ -337,9 +336,18 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 			quality = min(quality, selection.Quality)
 		}
 		eligible = slices.DeleteFunc(eligible, func(selection *GatewaySelection) bool { return selection.Quality != quality })
-		ranked, err := rankGatewayChannels(c, offering.RouteMethod, eligible, health)
+		rankMethod := offering.RouteMethod
+		if lossFallback {
+			// Loss fallback uses purchase cost; health and weight only order equal costs.
+			rankMethod = "weight"
+		}
+		ranked, err := rankGatewayChannels(c, rankMethod, eligible, health)
 		if err != nil {
 			return nil, err
+		}
+		if lossFallback {
+			// Keep later candidates for atomic admission failures, in purchase-cost order.
+			slices.SortStableFunc(ranked, func(a, b *GatewaySelection) int { order, _ := a.EstimatedCost.Compare(b.EstimatedCost); return order })
 		}
 		preferred, found := GetPreferredGatewayChannelByAffinity(c, offering.ID, tier, offering.Name)
 		if found && !lossFallback {
@@ -377,6 +385,7 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 				}
 				reject(selected.Channel.ID, reason)
 				lastStage = max(lastStage, 6)
+				priced = slices.DeleteFunc(priced, func(peer *GatewaySelection) bool { return peer.Channel.ID == selected.Channel.ID })
 				ranked = slices.Delete(ranked, index, index+1)
 				continue
 			}
