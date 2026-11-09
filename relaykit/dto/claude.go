@@ -50,6 +50,16 @@ type ClaudeMediaMessage struct {
 	ToolUseId string `json:"tool_use_id,omitempty"`
 }
 
+func (c *ClaudeMediaMessage) UnmarshalJSON(data []byte) error {
+	type fields ClaudeMediaMessage
+	var value fields
+	if err := kitutil.UnmarshalUseNumber(data, &value); err != nil {
+		return err
+	}
+	*c = ClaudeMediaMessage(value)
+	return nil
+}
+
 func (c *ClaudeMediaMessage) SetText(s string) {
 	c.Text = &s
 }
@@ -127,10 +137,11 @@ func (m *ClaudeMediaMessage) ToFileSource() types.FileSource {
 }
 
 type ClaudeMessageSource struct {
-	Type      string `json:"type"`
-	MediaType string `json:"media_type,omitempty"`
-	Data      any    `json:"data,omitempty"`
-	Url       string `json:"url,omitempty"`
+	Type      string  `json:"type"`
+	MediaType string  `json:"media_type,omitempty"`
+	Data      any     `json:"data,omitempty"`
+	Url       string  `json:"url,omitempty"`
+	FileID    *string `json:"file_id,omitempty"`
 }
 
 type ClaudeMessage struct {
@@ -270,7 +281,7 @@ func (c *ClaudeRequest) UnmarshalJSON(data []byte) error {
 		requestFields
 		Tools json.RawMessage `json:"tools,omitempty"`
 	}
-	if err := kitutil.Unmarshal(data, &fields); err != nil {
+	if err := kitutil.UnmarshalUseNumber(data, &fields); err != nil {
 		return err
 	}
 	*c = ClaudeRequest(fields.requestFields)
@@ -363,6 +374,12 @@ func (c *ClaudeRequest) GetTokenCountMeta() *types.TokenCountMeta {
 					break
 				}
 				for _, part := range media.ParseMediaContent() {
+					if part.Type == "document" && part.Source != nil && part.Source.Type == "text" {
+						if text, ok := part.Source.Data.(string); ok {
+							texts = append(texts, text)
+						}
+						continue
+					}
 					if source := part.ToFileSource(); source != nil {
 						fileType := types.FileTypeFile
 						if part.Type == "image" {

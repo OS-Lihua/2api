@@ -170,6 +170,26 @@ func ConvertRequest(c context.Context, info convmeta.Meta, target types.RelayFor
 		}, nil
 	}
 
+	if req, ok := request.(*dto.OpenAIResponsesRequest); ok {
+		var diagnostics []types.ConversionDiagnostic
+		fields := []struct {
+			name    string
+			present bool
+		}{
+			{"previous_response_id", strings.TrimSpace(req.PreviousResponseID) != ""},
+			{"conversation", len(req.Conversation) > 0 && string(req.Conversation) != "null"},
+			{"prompt", len(req.Prompt) > 0 && string(req.Prompt) != "null"},
+			{"context_management", len(req.ContextManagement) > 0 && string(req.ContextManagement) != "null"},
+		}
+		for _, field := range fields {
+			if field.present {
+				diagnostics = append(diagnostics, types.ConversionDiagnostic{Code: "stateful_field_unsupported", Path: field.name, Message: "Stateful Responses fields require the Responses protocol", Severity: types.ConversionDiagnosticError, From: from, To: target})
+			}
+		}
+		if len(diagnostics) > 0 {
+			return &RequestResult{From: from, To: target, Diagnostics: diagnostics}, &types.ConversionLossError{Diagnostics: diagnostics}
+		}
+	}
 	spec, ok := lookupRequestRoute(from, target)
 	if !ok {
 		return nil, fmt.Errorf("request converter from %s to %s is not registered", from, target)
@@ -259,6 +279,9 @@ func executeRequestSteps(c context.Context, info convmeta.Meta, from types.Relay
 
 	tools.Model = convmeta.UpstreamModelName(info)
 	current, toolDiagnostics, err := toolconv.AttachRequest(target, current, tools, convmeta.OptionsOf(info))
+	if err == nil {
+		err = convdiag.InspectRequestParameters(c, request, current, from, target, convmeta.OptionsOf(info).OpenRouterDialect)
+	}
 	diagnostics := append(diagnosticCollector.Diagnostics(), toolDiagnostics...)
 	for i := range diagnostics {
 		if diagnostics[i].From == "" {

@@ -32,7 +32,7 @@ func (r *GeminiChatRequest) UnmarshalJSON(data []byte) error {
 		ContinuationTokenSnake json.RawMessage    `json:"continuation_token,omitempty"`
 	}
 
-	if err := kitutil.Unmarshal(data, &aux); err != nil {
+	if err := kitutil.UnmarshalUseNumber(data, &aux); err != nil {
 		return err
 	}
 
@@ -361,7 +361,7 @@ func (p *GeminiPart) UnmarshalJSON(data []byte) error {
 		MediaProcessingSnake json.RawMessage   `json:"media_processing,omitempty"`
 	}
 
-	if err := kitutil.Unmarshal(data, &aux); err != nil {
+	if err := kitutil.UnmarshalUseNumber(data, &aux); err != nil {
 		return err
 	}
 

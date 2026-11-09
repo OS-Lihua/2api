@@ -28,7 +28,22 @@ func SetMediaResolver(resolver MediaResolver) {
 	mediaResolver = resolver
 }
 
+type resolverContextKey struct{}
+
+// WithResolver supplies a request-scoped resolver without changing the default.
+func WithResolver(ctx context.Context, resolver MediaResolver) context.Context {
+	return context.WithValue(ctx, resolverContextKey{}, resolver)
+}
+
 func ResolveBase64Data(c context.Context, source types.FileSource, reason ...string) (string, string, error) {
+	if c != nil {
+		if resolver, ok := c.Value(resolverContextKey{}).(MediaResolver); ok {
+			if resolver.GetBase64Data == nil {
+				return "", "", errors.New("request media resolver is not configured")
+			}
+			return resolver.GetBase64Data(c, source, reason...)
+		}
+	}
 	mediaResolverMu.RLock()
 	resolver := mediaResolver.GetBase64Data
 	mediaResolverMu.RUnlock()

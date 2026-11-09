@@ -2,14 +2,14 @@ package vertex
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/relay/channel"
+
 	"github.com/QuantumNous/new-api/relaykit/dto"
 )
 
 type VertexAIClaudeRequest struct {
-	model            string
 	AnthropicVersion string              `json:"anthropic_version"`
 	Messages         []dto.ClaudeMessage `json:"messages"`
 	System           any                 `json:"system,omitempty"`
@@ -26,21 +26,48 @@ type VertexAIClaudeRequest struct {
 	//Metadata         json.RawMessage     `json:"metadata,omitempty"`
 }
 
-func (*VertexAIClaudeRequest) ChatOutputLimit(body []byte) (*uint, error) {
-	var request VertexAIClaudeRequest
+type vertexClaudeRequest struct {
+	Request *dto.ClaudeRequest
+}
+
+func (r *vertexClaudeRequest) MarshalJSON() ([]byte, error) {
+	body, err := common.Marshal(r.Request)
+	if err != nil {
+		return nil, err
+	}
+	var fields map[string]json.RawMessage
+	if err := common.Unmarshal(body, &fields); err != nil {
+		return nil, err
+	}
+	delete(fields, "model")
+	fields["anthropic_version"], err = common.Marshal(anthropicVersion)
+	if err != nil {
+		return nil, err
+	}
+	return common.Marshal(fields)
+}
+
+func (r *vertexClaudeRequest) ProjectNativeRequest(body []byte) (dto.Request, error) {
+	var fields map[string]json.RawMessage
+	if err := common.Unmarshal(body, &fields); err != nil {
+		return nil, err
+	}
+	if _, ok := fields["model"]; ok {
+		return nil, fmt.Errorf("Vertex model is controlled by the request URL")
+	}
+	var request dto.ClaudeRequest
 	if err := common.Unmarshal(body, &request); err != nil {
 		return nil, err
 	}
-	return request.MaxTokens, nil
-}
-
-func (request *VertexAIClaudeRequest) SetChatOutputLimit(body []byte, limit uint) ([]byte, error) {
-	return channel.SetClaudeOutputLimit(body, request.model, limit)
+	if (request.Stream != nil && *request.Stream) != (r.Request.Stream != nil && *r.Request.Stream) {
+		return nil, fmt.Errorf("Vertex stream must match the request transport")
+	}
+	request.Model = r.Request.Model
+	return &request, nil
 }
 
 func copyRequest(req *dto.ClaudeRequest, version string) *VertexAIClaudeRequest {
 	return &VertexAIClaudeRequest{
-		model:            req.Model,
 		AnthropicVersion: version,
 		System:           req.System,
 		Messages:         req.Messages,

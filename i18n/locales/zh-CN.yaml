@@ -2,6 +2,19 @@
 # 中文（简体）翻译文件
 
 # Errors returned to AI clients
+gateway.model_not_found: "找不到模型"
+gateway.invalid_text_request: "文本请求无效"
+gateway.cannot_convert_request: "无法转换此请求"
+gateway.unsupported_capabilities: "没有通道支持请求所需的能力"
+gateway.channel_price_unavailable: "通道价格不可用"
+gateway.channel_unavailable: "没有可用的通道"
+gateway.model_price_unavailable: "模型价格不可用"
+gateway.insufficient_balance: "钱包余额不足"
+gateway.billing_unavailable: "计费服务不可用"
+gateway.upstream_request_failed: "上游请求失败"
+gateway.invalid_upstream_response: "上游响应无效"
+gateway.upstream_response_failed: "上游响应失败"
+gateway.unsupported_parameters: "不支持的参数：{{.Parameters}}"
 common.database_error: "数据库出错，请联系管理员"
 gateway.invalid_media_request: "媒体请求无效"
 gateway.authorization_unavailable: "权限验证不可用"

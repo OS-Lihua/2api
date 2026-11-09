@@ -190,7 +190,7 @@ export function OfferingRouteFields(props: {
             </FormControl>
             <FormDescription>
               {t(
-                'Enter conversion loss identifiers. Leave empty to reject all conversion losses.'
+                'Add conversion loss identifiers to the global defaults. Leave empty to use only global defaults. Conversion errors cannot be allowed.'
               )}
             </FormDescription>
             <FormMessage />
