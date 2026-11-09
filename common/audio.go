@@ -27,7 +27,7 @@ func GetAudioDuration(ctx context.Context, f io.ReadSeeker, ext string) (duratio
 	case ".mp3":
 		duration, err = getMP3Duration(f)
 	case ".wav":
-		duration, err = WAVDuration(f)
+		duration, err = wavDuration(f, true)
 	case ".flac":
 		duration, err = getFLACDuration(f)
 	case ".m4a", ".mp4":
@@ -74,7 +74,9 @@ func getMP3Duration(r io.Reader) (float64, error) {
 // getWAVDuration 解析 WAV 文件头以获取时长。
 // WAVDuration measures complete frames present in the data chunk. Streaming
 // length placeholders use available bytes; declared sizes cannot invent frames.
-func WAVDuration(r io.ReadSeeker) (float64, error) {
+func WAVDuration(r io.ReadSeeker) (float64, error) { return wavDuration(r, false) }
+
+func wavDuration(r io.ReadSeeker, requireComplete bool) (float64, error) {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return 0, err
 	}
@@ -98,6 +100,9 @@ func WAVDuration(r io.ReadSeeker) (float64, error) {
 	}
 	available := max(int64(0), end-start)
 	pcmSize := int64(dec.PCMSize)
+	if requireComplete && pcmSize != 0 && pcmSize != int64(^uint32(0)) && pcmSize > available {
+		return 0, io.ErrUnexpectedEOF
+	}
 	if pcmSize == 0 || pcmSize == int64(^uint32(0)) {
 		pcmSize = available
 	} else {
