@@ -6,7 +6,6 @@ import (
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relaykit/dto"
-	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/gin-gonic/gin"
 )
 
@@ -43,9 +42,6 @@ func (p *Provider) FixRequest(c *gin.Context, ctx *channel.ProtocolRequestContex
 		req, ok := request.(*dto.GeminiChatRequest)
 		if !ok || req == nil {
 			return nil, fmt.Errorf("expected Gemini generateContent DTO, got %T", request)
-		}
-		if model_setting.GetGeminiSettings().RemoveFunctionResponseIdEnabled {
-			removeFunctionCallIDs(req)
 		}
 		return req, nil
 	case protocol.OpenAIChat:

@@ -177,10 +177,10 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 	var responseText, currentEvent, currentData string
 	type sourceMessage struct{ content, reasoning string }
 	sourceMessages := map[string]sourceMessage{}
-	observeCompletedSource := func(data []byte) {
+	observeCompletedSource := func(data []byte) bool {
 		root := gjson.ParseBytes(data)
 		if !cozeGeneratedMessage(root) {
-			return
+			return false
 		}
 		id := relaycommon.SourceText(root.Get("id"))
 		previous := sourceMessages[id]
@@ -196,6 +196,7 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 		}
 		sourceMessages[id] = previous
 		helper.RecordNativeStreamSource(c, info, &dto.OpenAITextResponse{Choices: []dto.OpenAITextResponseChoice{{Message: dto.Message{Role: "assistant", Content: suffix.String()}}}})
+		return suffix.Len() > 0
 	}
 	for scanner.Scan() {
 		if managed {
@@ -216,7 +217,10 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 				sourceMessages[id] = message
 			}
 			if event.Event == "conversation.message.completed" {
-				observeCompletedSource([]byte(event.Data))
+				generated := observeCompletedSource([]byte(event.Data))
+				if generated && info.StreamStatus.CompletedNormally() {
+					return usage, types.NewError(fmt.Errorf("Coze stream contains generation after completion"), types.ErrorCodeBadResponseBody)
+				}
 			}
 			if event.Event != "" && event.HasData {
 				if err := handleCozeEvent(c, event.Event, event.Data, &responseText, usage, id, info); err != nil {

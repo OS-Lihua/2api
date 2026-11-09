@@ -266,6 +266,7 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		info.StreamStatus.RequireTerminal()
 		if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil && info.StreamStatus.CompletedNormally() {
+			observeSource([]byte(data))
 			sr.Error(errors.New("Dify stream contains data after completion"))
 			return
 		}

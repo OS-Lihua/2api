@@ -168,6 +168,10 @@ func zhipuStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 		line := scanner.Text()
 		var response *dto.ChatCompletionsStreamResponse
 		if data, ok := strings.CutPrefix(line, "data:"); ok {
+			if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil && info.StreamStatus.CompletedNormally() && data != "" {
+				helper.RecordNativeStreamSource(c, info, &dto.OpenAITextResponse{Choices: []dto.OpenAITextResponseChoice{{Message: dto.Message{Role: "assistant", Content: data}}}})
+				return usage, types.NewError(fmt.Errorf("Zhipu stream contains generation after completion"), types.ErrorCodeBadResponseBody)
+			}
 			response = streamResponseZhipu2OpenAI(data)
 		} else if data, ok := strings.CutPrefix(line, "meta:"); ok {
 			var meta ZhipuStreamMetaResponse

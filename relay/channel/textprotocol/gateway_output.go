@@ -17,18 +17,19 @@ type gatewayToolOutput struct{ name, arguments string }
 // gatewayGeneratedOutput tracks delivered content and defers terminal
 // snapshots until upstream completion is verified. Snapshots retain omitted blocks.
 type gatewayGeneratedOutput struct {
-	pendingTerminal  []json.RawMessage
-	terminalBytes    int
-	sourceTerminal   bool
-	terminalReady    bool
-	text             strings.Builder
-	parts            map[string]*strings.Builder
-	partOrder        []string
-	tools            map[string]gatewayToolOutput
-	chatTools        map[[2]int64]struct{}
-	choiceText       map[int64]*strings.Builder
-	geminiCandidates map[int64]*strings.Builder
-	order            []string
+	pendingTerminal       []json.RawMessage
+	terminalBytes         int
+	sourceTerminal        bool
+	sourceTerminalChoices map[int64]bool
+	terminalReady         bool
+	text                  strings.Builder
+	parts                 map[string]*strings.Builder
+	partOrder             []string
+	tools                 map[string]gatewayToolOutput
+	chatTools             map[[2]int64]struct{}
+	choiceText            map[int64]*strings.Builder
+	geminiCandidates      map[int64]*strings.Builder
+	order                 []string
 }
 
 func (o *gatewayGeneratedOutput) appendChoice(index int64, text string) {

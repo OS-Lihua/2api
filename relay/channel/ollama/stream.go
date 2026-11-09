@@ -207,6 +207,8 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			continue
 		}
 		if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil && info.StreamStatus.CompletedNormally() {
+			info.ResponseFacts.RecordNativeUsage(usage, []byte(line), "prompt_eval_count", "eval_count")
+			helper.RecordNativeStreamSource(c, info, ollamaSourceResponse([]string{line}, toolCallIndex))
 			return usage, types.NewError(fmt.Errorf("Ollama stream contains data after completion"), types.ErrorCodeBadResponseBody)
 		}
 		var chunk ollamaChatStreamChunk

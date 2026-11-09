@@ -38,7 +38,7 @@ func SourceText(value gjson.Result) string {
 func ChatStreamChoiceBusinessText(choice gjson.Result) string {
 	var text strings.Builder
 	text.WriteString(SourceText(choice.Get("delta.content")))
-	if reasoning := choice.Get("delta.reasoning_content"); reasoning.Exists() {
+	if reasoning := choice.Get("delta.reasoning_content"); reasoning.Exists() && reasoning.Type != gjson.Null {
 		text.WriteString(SourceText(reasoning))
 	} else {
 		text.WriteString(SourceText(choice.Get("delta.reasoning")))

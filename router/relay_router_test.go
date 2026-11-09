@@ -9827,6 +9827,20 @@ func TestTextGatewayVertexClaudePreservesActualWire(t *testing.T) {
 	calls := 0
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		calls++
+		if strings.Contains(r.URL.Path, "gemini") {
+			var body dto.GeminiChatRequest
+			require.NoError(t, common.DecodeJson(r.Body, &body))
+			require.Len(t, body.Contents, 3)
+			for i, id := range []string{"call_a", "call_b"} {
+				require.NotNil(t, body.Contents[1].Parts[i].FunctionCall)
+				assert.Equal(t, id, body.Contents[1].Parts[i].FunctionCall.ID)
+				require.NotNil(t, body.Contents[2].Parts[i].FunctionResponse)
+				assert.JSONEq(t, fmt.Sprintf("%q", id), string(body.Contents[2].Parts[i].FunctionResponse.ID))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}`)
+			return
+		}
 		var body map[string]json.RawMessage
 		require.NoError(t, common.DecodeJson(r.Body, &body))
 		assert.JSONEq(t, `"vertex-2023-10-16"`, string(body["anthropic_version"]))
@@ -9887,6 +9901,20 @@ func TestTextGatewayVertexClaudePreservesActualWire(t *testing.T) {
 			assert.Equal(t, 1, calls, "hard native envelope errors cannot be waived or dispatched")
 		})
 	}
+	t.Run("Gemini tool history retains correlation IDs", func(t *testing.T) {
+		previous := model_setting.GetGeminiSettings().RemoveFunctionResponseIdEnabled
+		model_setting.GetGeminiSettings().RemoveFunctionResponseIdEnabled = true
+		t.Cleanup(func() { model_setting.GetGeminiSettings().RemoveFunctionResponseIdEnabled = previous })
+		fixture.offering.AcceptedConversionLosses = nil
+		require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+		caps.Features = []capability.Feature{capability.ToolCalling}
+		require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+		require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": string(protocol.GeminiGenerate), "upstream_model_name": "gemini-2.5-flash", "parameter_overrides": "{}"}).Error)
+		response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1beta/models/gateway-offering:generateContent", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]},{"role":"model","parts":[{"functionCall":{"id":"call_a","name":"lookup","args":{"key":"a"}}},{"functionCall":{"id":"call_b","name":"lookup","args":{"key":"b"}}}]},{"role":"user","parts":[{"functionResponse":{"id":"call_a","name":"lookup","response":{"result":"A"}}},{"functionResponse":{"id":"call_b","name":"lookup","response":{"result":"B"}}}]}],"tools":[{"functionDeclarations":[{"name":"lookup","parameters":{"type":"OBJECT","properties":{"key":{"type":"STRING"}}}}]}],"generationConfig":{"maxOutputTokens":16}}`)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		assert.Equal(t, 2, calls)
+		assert.Empty(t, response.Header().Get("X-Gateway-Conversion-Loss"))
+	})
 }
 
 func TestTextGatewayPurchaseSnapshotFollowsCredentialWait(t *testing.T) {
@@ -10255,9 +10283,12 @@ func TestTextGatewayNativeTerminalsWaitForTransport(t *testing.T) {
 		{"Coze", constant.ChannelTypeCoze, "", "event: conversation.message.delta\ndata: {\"content\":\"Hello\"}\n\nevent: conversation.chat.completed\ndata: {\"usage\":{\"input_count\":10,\"output_count\":5}}\n\n", "event: conversation.message.delta\ndata: broken\n\n"},
 	} {
 		t.Run(provider.name, func(t *testing.T) {
-			modes := []string{"clean", "bad JSON", "read error"}
-			if provider.kind == constant.ChannelTypeCoze || provider.kind == constant.ChannelTypeTencent || provider.kind == constant.ChannelTypeCohere {
-				modes = append(modes, "business after terminal", "business after terminal without usage")
+			modes := []string{"clean", "bad JSON", "read error", "business after terminal", "business after terminal without usage"}
+			if provider.kind == constant.ChannelTypeDify || provider.kind == constant.ChannelTypeBaidu || provider.kind == constant.ChannelTypeOllama {
+				modes = append(modes, "business after terminal with usage")
+			}
+			if provider.kind == constant.ChannelTypeCoze {
+				modes = append(modes, "business after terminal completed", "business after terminal completed without usage", "business after terminal completed suffix", "business after terminal completed suffix without usage", "completed snapshot after terminal")
 			}
 			if provider.kind == constant.ChannelTypeTencent {
 				modes = append(modes, "usage after terminal")
@@ -10274,14 +10305,39 @@ func TestTextGatewayNativeTerminalsWaitForTransport(t *testing.T) {
 								body += "data: {\"Choices\":[{\"Delta\":{\"Content\":\"World\"}}]}\n\n"
 							} else if provider.kind == constant.ChannelTypeCohere {
 								body += "{\"text\":\"World\",\"event_type\":\"text-generation\"}\n"
+							} else if provider.kind == constant.ChannelTypeDify {
+								body += "data: {\"event\":\"message\",\"answer\":\"World\"}\n\n"
+							} else if provider.kind == constant.ChannelTypeBaidu {
+								body += "data: {\"result\":\"World\",\"is_end\":false}\n\n"
+							} else if provider.kind == constant.ChannelTypeOllama {
+								body += "{\"message\":{\"content\":\"World\"},\"done\":false}\n"
+							} else if provider.kind == constant.ChannelTypeZhipu {
+								body += "data:World\n"
+							} else if strings.Contains(mode, "completed") {
+								messageID, content := "later", "World"
+								if strings.Contains(mode, "suffix") {
+									messageID, content = "", "HelloWorld"
+								}
+								body += fmt.Sprintf("event: conversation.message.completed\ndata: {\"id\":%q,\"role\":\"assistant\",\"type\":\"answer\",\"content\":%q}\n\n", messageID, content)
 							} else {
 								body += "event: conversation.message.delta\ndata: {\"content\":\"World\"}\n\n"
+							}
+							if mode == "business after terminal with usage" {
+								body = strings.Replace(body, `"answer":"World"}`, `"answer":"World","metadata":{"usage":{"prompt_tokens":10,"completion_tokens":100}}}`, 1)
+								body = strings.Replace(body, `"result":"World","is_end":false}`, `"result":"World","is_end":false,"usage":{"prompt_tokens":10,"completion_tokens":100}}`, 1)
+								body = strings.Replace(body, `"content":"World"},"done":false}`, `"content":"World"},"done":false,"prompt_eval_count":10,"eval_count":100}`, 1)
 							}
 							if strings.HasSuffix(mode, "without usage") {
 								body = strings.Replace(body, `{"usage":{"input_count":10,"output_count":5}}`, `{}`, 1)
 								body = strings.Replace(body, `,"Usage":{"PromptTokens":10,"CompletionTokens":5}`, ``, 1)
 								body = strings.Replace(body, `"billed_units":{"input_tokens":10,"output_tokens":5}`, `"billed_units":{}`, 1)
+								body = strings.Replace(body, `"metadata":{"usage":{"prompt_tokens":10,"completion_tokens":5}}`, `"metadata":{}`, 1)
+								body = strings.Replace(body, `,"usage":{"prompt_tokens":10,"completion_tokens":5}`, ``, 1)
+								body = strings.Replace(body, `,"prompt_eval_count":10,"eval_count":5`, ``, 1)
 							}
+						}
+						if mode == "completed snapshot after terminal" {
+							body += "event: conversation.message.completed\ndata: {\"role\":\"assistant\",\"type\":\"answer\",\"content\":\"Hello\"}\n\n"
 						}
 						if mode == "usage after terminal" {
 							body += "data: {\"Choices\":[],\"Usage\":{\"PromptTokens\":10,\"CompletionTokens\":7}}\n\n"
@@ -10309,14 +10365,26 @@ func TestTextGatewayNativeTerminalsWaitForTransport(t *testing.T) {
 					require.EqualValues(t, 1, total)
 					cost := int64(20000)
 					if strings.HasSuffix(mode, "without usage") {
-						cost = 13000
+						prompt := int64(9)
+						if provider.kind == constant.ChannelTypeDify {
+							prompt = 13
+						}
+						cost = (prompt + 2*2) * 1000
+						require.NotNil(t, attempts[0].Usage)
+						assert.Equal(t, prompt, attempts[0].Usage.PromptTokens)
+						assert.EqualValues(t, 2, attempts[0].Usage.CompletionTokens)
+					}
+					if mode == "business after terminal with usage" {
+						cost = 210000
+						require.NotNil(t, attempts[0].Usage)
+						assert.EqualValues(t, 100, attempts[0].Usage.CompletionTokens)
 					}
 					if mode == "usage after terminal" {
 						cost = 24000
 						assert.EqualValues(t, 7, record.Usage.CompletionTokens)
 					}
 					assert.Equal(t, cost, attempts[0].Cost.Nanos)
-					if mode == "clean" || mode == "usage after terminal" {
+					if mode == "clean" || mode == "usage after terminal" || mode == "completed snapshot after terminal" {
 						assert.Equal(t, "success", record.Status)
 						assert.Equal(t, int64(9000000), record.Receivable.Nanos)
 						assert.Contains(t, response.Body.String(), "[DONE]")
@@ -10940,6 +11008,59 @@ func TestTextGatewayFinishedChoiceDoesNotBlockOtherChoice(t *testing.T) {
 	require.EqualValues(t, 1, total)
 	assert.Equal(t, int64(20000), attempts[0].Cost.Nanos)
 	assertTextGatewayLedger(t, *record, 20000)
+}
+
+func TestTextGatewayChoiceTerminalPreservesStreamSemantics(t *testing.T) {
+	for _, test := range []struct {
+		name, events string
+		count        int
+		failed       bool
+		protocol     string
+	}{
+		{"mixed choices", "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A\"},\"finish_reason\":\"stop\"},{\"index\":1,\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\" world\"}}]}\n\ndata: {\"choices\":[{\"index\":1,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n", 2, false, "openai_chat"},
+		{"generation after finished choice", "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Extra\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n", 1, true, "openai_chat"},
+		{"Gemini mixed choices", "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"A\"}]},\"finishReason\":\"STOP\"},{\"index\":1,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello\"}]}}]}\n\ndata: {\"candidates\":[{\"index\":1,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\" world\"}]}}]}\n\ndata: {\"candidates\":[{\"index\":1,\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5}}\n\n", 2, false, "gemini_generate"},
+		{"Gemini generation after finished choice", "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello\"}]}}]}\n\ndata: {\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}\n\ndata: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Extra\"}]}}]}\n\ndata: {\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5}}\n\n", 1, true, "gemini_generate"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, test.events)
+			})
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", test.protocol).Error)
+			require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("request",fixed(0.01))`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", fmt.Sprintf(`{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"stream":true,"n":%d,"max_tokens":16}`, test.count))
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			if test.failed {
+				assert.Equal(t, "partial", record.Status)
+				assert.Zero(t, record.Receivable.Nanos)
+				assert.NotContains(t, response.Body.String(), "Extra")
+				assert.NotContains(t, response.Body.String(), "[DONE]")
+			} else {
+				assert.Equal(t, "success", record.Status)
+				assert.EqualValues(t, 9000000, record.Receivable.Nanos)
+				byChoice := map[int]string{}
+				for frame := range strings.SplitSeq(response.Body.String(), "\n\n") {
+					data, ok := strings.CutPrefix(frame, "data: ")
+					if !ok || data == "[DONE]" {
+						continue
+					}
+					var chunk dto.ChatCompletionsStreamResponse
+					require.NoError(t, common.UnmarshalJsonStr(data, &chunk))
+					for _, choice := range chunk.Choices {
+						byChoice[choice.Index] += choice.Delta.GetContentString()
+					}
+				}
+				assert.Equal(t, "A", byChoice[0])
+				assert.Equal(t, "Hello world", byChoice[1])
+			}
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.EqualValues(t, 20000, attempts[0].Cost.Nanos)
+		})
+	}
 }
 
 func TestTextGatewayCompleteLargeBusinessFrameIsDelivered(t *testing.T) {
@@ -12465,6 +12586,9 @@ func TestTextGatewayJSONAndStreamUsage(t *testing.T) {
 		{name: "JSON explicit zero input estimates only output", body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0}}`, status: "success", source: "estimated", completion: 1, receivable: 3600, cost: 2000},
 		{name: "JSON explicit zero output estimates only input", body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"completion_tokens":0}}`, status: "success", source: "estimated", prompt: 9, receivable: 16200, cost: 9000},
 		{name: "JSON reasoning is generated output", body: `{"choices":[{"message":{"role":"assistant","reasoning_content":"Hello"},"finish_reason":"stop"}]}`, status: "success", source: "estimated", prompt: 9, completion: 1, receivable: 19800, cost: 11000},
+		{name: "SSE null primary reasoning falls back", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null,\"reasoning\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", status: "success", source: "estimated", prompt: 9, completion: 2, receivable: 23400, cost: 13000},
+		{name: "SSE null primary reasoning alone is business", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null,\"reasoning\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", status: "success", source: "estimated", prompt: 9, completion: 1, receivable: 19800, cost: 11000},
+		{name: "SSE empty primary reasoning retains priority", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"\",\"reasoning\":\"ignored\",\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", status: "success", source: "estimated", prompt: 9, completion: 1, receivable: 19800, cost: 11000},
 		{name: "SSE interrupted reported tool uses complete local estimate", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_test\",\"type\":\"function\",\"function\":{\"name\":\"Hello\",\"arguments\":\"\"}}]}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":100}}\n\n", status: "partial", source: "estimated", attemptSource: "upstream", prompt: 10, completion: 8, receivable: 46800, cost: 210000},
 		{name: "SSE interrupted tool keeps complete local estimate", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_test\",\"type\":\"function\",\"function\":{\"name\":\"Hello\",\"arguments\":\"\"}}]}}]}\n\n", status: "partial", source: "estimated", prompt: 9, completion: 8, receivable: 45000, cost: 25000},
 		{name: "SSE interrupted explicit zero stays authoritative", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\n", status: "partial", source: "upstream"},
