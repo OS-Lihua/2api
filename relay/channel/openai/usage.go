@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 
@@ -105,6 +106,45 @@ func mediaResponseEnvelope(body []byte) []byte {
 			recovered[name] = common.RawMessage(raw.Raw)
 		}
 	}
+	if _, complete := recovered["usage"]; !complete {
+		// Query known leaves independently: an unfinished sibling must not
+		// discard a complete counter, but a number at EOF is still a prefix.
+		groups := map[string][]string{
+			"": {"prompt_tokens", "completion_tokens", "input_tokens", "output_tokens", "total_tokens", "prompt_cache_hit_tokens", "claude_cache_creation_5_m_tokens", "claude_cache_creation_1_h_tokens"},
+		}
+		for _, detail := range []string{"prompt_tokens_details", "input_token_details", "input_tokens_details", "completion_tokens_details", "output_tokens_details"} {
+			groups[detail] = []string{"cached_tokens", "cached_creation_tokens", "cache_write_tokens", "cache_creation_input_tokens", "text_tokens", "audio_tokens", "image_tokens", "reasoning_tokens", "accepted_prediction_tokens", "rejected_prediction_tokens"}
+			groups[detail+".cached_tokens_details"] = []string{"text_tokens", "audio_tokens", "image_tokens"}
+			groups[detail+".cache_write_tokens_details"] = []string{"ttl_30m_tokens", "ttl_12h_tokens"}
+		}
+		usage := ojson.NewDocString(`{}`)
+		for prefix, names := range groups {
+			for _, name := range names {
+				path := name
+				if prefix != "" {
+					path = prefix + "." + name
+				}
+				raw := ojson.GetBytes(body, "usage."+path)
+				if raw.Type != ojson.Number || raw.Index < 0 || raw.Index+len(raw.Raw) > len(body) {
+					continue
+				}
+				tail := bytes.TrimLeft(body[raw.Index+len(raw.Raw):], " \r\n\t")
+				if len(tail) == 0 || tail[0] != ',' && tail[0] != '}' {
+					continue
+				}
+				var count int64
+				if common.UnmarshalJsonStr(raw.Raw, &count) != nil || count < 0 || count > 1<<31-1 {
+					continue
+				}
+				if usage.Set(path, count) != nil {
+					continue
+				}
+			}
+		}
+		if usage.String() != `{}` {
+			recovered["usage"] = common.RawMessage(usage.String())
+		}
+	}
 	if len(recovered) > 0 {
 		if encoded, err := common.Marshal(recovered); err == nil {
 			return encoded
@@ -115,7 +155,7 @@ func mediaResponseEnvelope(body []byte) []byte {
 
 // observeMediaError keeps structured classification facts without copying a
 // Provider's message or other error details into downstream output or logs.
-func observeMediaError(info *relaycommon.RelayInfo, body []byte, status int) *types.OpenAIError {
+func observeMediaError(info *relaycommon.RelayInfo, body []byte, status int, eventName ...string) *types.OpenAIError {
 	var envelope struct {
 		Type  json.RawMessage `json:"type"`
 		Code  json.RawMessage `json:"code"`
@@ -147,6 +187,9 @@ func observeMediaError(info *relaycommon.RelayInfo, body []byte, status int) *ty
 		var kind, code string
 		_ = common.Unmarshal(envelope.Type, &kind)
 		_ = common.Unmarshal(envelope.Code, &code)
+		if len(eventName) > 0 && strings.EqualFold(strings.TrimSpace(eventName[0]), "error") {
+			kind = "upstream_error"
+		}
 		switch strings.ToLower(strings.TrimSpace(kind)) {
 		case "error", "upstream_error":
 			fault = &types.OpenAIError{Type: kind, Code: code}

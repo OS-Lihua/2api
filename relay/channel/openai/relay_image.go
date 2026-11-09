@@ -289,7 +289,7 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 		if info.ResponseFacts != nil {
 			eventFacts := mediaResponseEnvelope(raw)
 			mergeMediaStreamUsage(info, usage, raw)
-			if observeMediaError(info, eventFacts, resp.StatusCode) != nil {
+			if observeMediaError(info, eventFacts, resp.StatusCode, sr.EventName()) != nil {
 				sr.Stop(errors.New("upstream image stream failed"))
 				return
 			}

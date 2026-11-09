@@ -183,11 +183,12 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 		}
 		return nil, err
 	}
+	stop := context.AfterFunc(c.Request.Context(), func() { conn.Close() })
 	if err := FullClientRequest(conn, payload); err != nil {
+		stop()
 		conn.Close()
 		return nil, err
 	}
-	stop := context.AfterFunc(c.Request.Context(), func() { conn.Close() })
 	c.Set(contextKeyDecodedSpeechResponse, true)
 	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/octet-stream"}}, Body: &ttsSocketBody{conn: conn, stop: stop}}, nil
 }

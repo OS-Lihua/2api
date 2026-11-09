@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/MoeForge/moego/base64"
 	"github.com/MoeForge/moego/ojson"
@@ -18,7 +19,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/shopspring/decimal"
 )
 
 type VolcengineTTSRequest struct {
@@ -73,6 +73,27 @@ type VolcengineTTSExtraParam struct {
 	UnsupportedCharRatioThresh float64                   `json:"unsupported_char_ratio_thresh,omitempty"`
 	AigcWatermark              bool                      `json:"aigc_watermark,omitempty"`
 	CacheConfig                *VolcengineTTSCacheConfig `json:"cache_config,omitempty"`
+}
+
+// MarshalJSON preserves V1's JSON-string wire contract for extra_param.
+func (p VolcengineTTSExtraParam) MarshalJSON() ([]byte, error) {
+	type fields VolcengineTTSExtraParam
+	body, err := common.Marshal(fields(p))
+	if err != nil {
+		return nil, err
+	}
+	return common.Marshal(string(body))
+}
+
+// UnmarshalJSON accepts the native JSON string and existing object metadata,
+// validating their contents before encoding the final native wire.
+func (p *VolcengineTTSExtraParam) UnmarshalJSON(body []byte) error {
+	type fields VolcengineTTSExtraParam
+	var encoded string
+	if err := common.Unmarshal(body, &encoded); err != nil {
+		encoded = string(body)
+	}
+	return common.DecodeJsonStrict(strings.NewReader(encoded), (*fields)(p))
 }
 
 type VolcengineTTSCacheConfig struct {
@@ -169,12 +190,7 @@ func handleTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon.Re
 		if duration := ojson.GetBytes(body, "addition.duration"); duration.Exists() && duration.Raw != "null" {
 			info.ResponseFacts.AudioOutputDurationInvalid = true
 			if duration.Type == ojson.String {
-				milliseconds, err := decimal.NewFromString(duration.Str)
-				if err == nil {
-					openai.ObserveSpeechOutputSeconds(info, milliseconds.Shift(-3).String())
-				} else {
-					openai.ObserveSpeechOutputSeconds(info, duration.Str)
-				}
+				openai.ObserveSpeechOutputDuration(info, duration.Str, time.Millisecond)
 			}
 		}
 		var encoded string

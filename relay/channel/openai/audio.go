@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/MoeForge/moego/ojson"
@@ -30,17 +31,22 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// ObserveSpeechOutputSeconds preserves an independent upstream duration report.
+// ObserveSpeechOutputDuration preserves a bounded independent duration report.
 // Invalid reports leave local measurement available and retain clamp evidence.
-func ObserveSpeechOutputSeconds(info *relaycommon.RelayInfo, raw string) {
+func ObserveSpeechOutputDuration(info *relaycommon.RelayInfo, raw string, unit time.Duration) {
 	facts := info.ResponseFacts
 	if facts == nil {
 		return
 	}
 	facts.AudioOutputDurationInvalid = true
-	seconds, err := decimal.NewFromString(raw)
-	if err != nil {
-		value, parseErr := strconv.ParseFloat(raw, 64)
+	if len(raw) > 128 || unit != time.Second && unit != time.Millisecond {
+		return
+	}
+	value, parseErr := strconv.ParseFloat(raw, 64)
+	if unit == time.Millisecond {
+		value /= 1000
+	}
+	if parseErr != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value > relaycommon.MaxTaskDurationSeconds {
 		if parseErr == nil || math.IsInf(value, 0) {
 			_, clamp := common.AudioDurationTokens(value)
 			if clamp != nil {
@@ -49,15 +55,26 @@ func ObserveSpeechOutputSeconds(info *relaycommon.RelayInfo, raw string) {
 		}
 		return
 	}
-	if seconds.IsNegative() || seconds.GreaterThan(decimal.NewFromInt(relaycommon.MaxTaskDurationSeconds)) {
-		_, clamp := common.AudioDurationTokens(seconds.InexactFloat64())
-		if clamp != nil {
-			info.QuotaClamp = clamp
-		}
+	seconds, err := decimal.NewFromString(raw)
+	if err != nil {
 		return
 	}
-	value := seconds.String()
-	facts.AudioOutputSeconds = &value
+	if seconds.IsZero() {
+		raw = "0"
+	} else {
+		// Bound decimal scaling before comparisons or fixed-point formatting.
+		if seconds.Exponent() < -324 || value == 0 {
+			return
+		}
+		if unit == time.Millisecond {
+			seconds = seconds.Shift(-3)
+		}
+		if seconds.IsNegative() || seconds.GreaterThan(decimal.NewFromInt(relaycommon.MaxTaskDurationSeconds)) {
+			return
+		}
+		raw = seconds.String()
+	}
+	facts.AudioOutputSeconds = &raw
 	facts.AudioOutputDurationReported = true
 	facts.AudioOutputDurationInvalid = false
 }
@@ -300,7 +317,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	}
 	if info.ChannelType == constant.ChannelTypeVLLM {
 		if raw := resp.Header.Get("X-Audio-Duration-Seconds"); raw != "" {
-			ObserveSpeechOutputSeconds(info, raw)
+			ObserveSpeechOutputDuration(info, raw, time.Second)
 		}
 		for header, target := range map[string]*int{
 			"X-Audio-Sample-Rate": &formatFacts.AudioOutputSampleRate,
@@ -404,7 +421,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 				if duration := ojson.GetBytes(eventFacts, "duration"); duration.Exists() && duration.Raw != "null" {
 					info.ResponseFacts.AudioOutputDurationInvalid = true
 					if duration.Type == ojson.Number {
-						ObserveSpeechOutputSeconds(info, duration.Raw)
+						ObserveSpeechOutputDuration(info, duration.Raw, time.Second)
 					}
 				}
 				return
@@ -442,7 +459,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			eventBody := []byte(data)
 			eventFacts := mediaResponseEnvelope(eventBody)
 			mergeMediaStreamUsage(info, usage, eventBody)
-			if observeMediaError(info, eventFacts, resp.StatusCode) != nil {
+			if observeMediaError(info, eventFacts, resp.StatusCode, sr.EventName()) != nil {
 				sr.Stop(errors.New("upstream speech stream failed"))
 				return
 			}
@@ -477,7 +494,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 				if duration := ojson.GetBytes(eventFacts, "duration"); duration.Exists() && duration.Raw != "null" {
 					info.ResponseFacts.AudioOutputDurationInvalid = true
 					if duration.Type == ojson.Number {
-						ObserveSpeechOutputSeconds(info, duration.Raw)
+						ObserveSpeechOutputDuration(info, duration.Raw, time.Second)
 					}
 				}
 				if !generatedAudioPayload {

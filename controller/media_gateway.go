@@ -470,9 +470,12 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	if imageInputEstimated {
 		usage.PromptTokensDetails.ImageTokens = facts.ImageInputTokensEstimated
 	}
-	referenceInputEstimated := !facts.AudioInputTokensReported && !facts.AudioInputDurationReported && facts.AudioInputTokensEstimated > 0 && (run.parsed.Protocol != protocol.OpenAIAudioTranscription || !facts.PromptTokensReported)
+	referenceInputEstimated := !facts.AudioInputTokensReported && !facts.AudioInputDurationReported && facts.AudioInputTokensEstimated > 0 && (run.parsed.Protocol != protocol.OpenAIAudioTranscription || !facts.PromptTokensReported || usage.PromptTokens > 0)
 	if referenceInputEstimated {
 		usage.PromptTokensDetails.AudioTokens = facts.AudioInputTokensEstimated
+		if run.parsed.Protocol == protocol.OpenAIAudioTranscription && facts.PromptTokensReported {
+			usage.PromptTokensDetails.AudioTokens = min(usage.PromptTokensDetails.AudioTokens, max(0, usage.PromptTokens-usage.PromptTokensDetails.TextTokens))
+		}
 	}
 	textInputEstimated := run.parsed.Protocol == protocol.OpenAIAudioTranscription && !facts.TextInputTokensReported && !facts.PromptTokensReported && facts.TextInputTokensEstimated > 0
 	if textInputEstimated {
