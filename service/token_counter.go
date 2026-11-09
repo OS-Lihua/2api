@@ -113,6 +113,19 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 				info.QuotaClamp = clamp
 			}
 		}
+		if info.ResponseFacts != nil {
+			textTokens := utf8.RuneCountInString(meta.CombineText)
+			if meta.TokenType != types.TokenTypeTextNumber {
+				textTokens = tokenkit.Count(info.TokenizerModel, meta.CombineText)
+			}
+			info.ResponseFacts.AudioInputTokensEstimated = totalAudioToken
+			info.ResponseFacts.TextInputTokensEstimated = textTokens
+			total, clamp := common.QuotaFromFloatChecked(float64(totalAudioToken) + float64(textTokens))
+			if clamp != nil {
+				return 0, clamp
+			}
+			return total, nil
+		}
 		return totalAudioToken, nil
 	}
 

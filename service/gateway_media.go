@@ -285,6 +285,9 @@ func GatewayMediaCapabilitiesMatch(c *gin.Context, kind protocol.Type, request d
 		}
 		output = capability.Audio
 	case protocol.OpenAIAudioTranscription:
+		if audio, ok := request.(*dto.AudioRequest); ok && audio.Prompt != nil && *audio.Prompt != "" && !slices.Contains(caps.InputModalities, capability.Text) {
+			return false
+		}
 		input, output = capability.Audio, capability.Text
 	default:
 		return false

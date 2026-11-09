@@ -11,11 +11,13 @@ import (
 type AudioRequest struct {
 	Model          string          `json:"model"`
 	Input          string          `json:"input"`
+	Prompt         *string         `json:"prompt,omitempty"`
 	Voice          string          `json:"voice"`
 	Instructions   string          `json:"instructions,omitempty"`
 	ResponseFormat string          `json:"response_format,omitempty"`
 	Speed          *float64        `json:"speed,omitempty"`
 	StreamFormat   string          `json:"stream_format,omitempty"`
+	Stream         *bool           `json:"stream,omitempty"`
 	Metadata       json.RawMessage `json:"metadata,omitempty"`
 	// vllm-omini
 	SampleRate              *int            `json:"sample_rate,omitempty"`
@@ -31,8 +33,6 @@ type AudioRequest struct {
 	XVectorOnlyMode         json.RawMessage `json:"x_vector_only_mode,omitempty"`
 	MaxNewTokens            json.RawMessage `json:"max_new_tokens,omitempty"`
 	InitialCodecChunkFrames json.RawMessage `json:"initial_codec_chunk_frames,omitempty"`
-	// TODO：ensure that the logic remains correct after the stream is started.
-	//Stream                  json.RawMessage `json:"stream,omitempty"`
 }
 
 func (r *AudioRequest) HasSpeechConditioning() bool {
@@ -52,6 +52,12 @@ func (r *AudioRequest) GetTokenCountMeta() *types.TokenCountMeta {
 		CombineText: r.Input,
 		TokenType:   types.TokenTypeTextNumber,
 	}
+	if r.Prompt != nil {
+		if meta.CombineText != "" {
+			meta.CombineText += "\n"
+		}
+		meta.CombineText += *r.Prompt
+	}
 	if strings.Contains(r.Model, "gpt") {
 		meta.TokenType = types.TokenTypeTokenizer
 	}
@@ -59,7 +65,7 @@ func (r *AudioRequest) GetTokenCountMeta() *types.TokenCountMeta {
 }
 
 func (r *AudioRequest) IsStream(c *http.Request) bool {
-	return r.StreamFormat == "sse"
+	return r.StreamFormat == "sse" || r.Stream != nil && *r.Stream && r.StreamFormat != "audio"
 }
 
 func (r *AudioRequest) SetModelName(modelName string) {

@@ -278,6 +278,20 @@ func (a *ChannelAdaptor) PrepareMediaWire(c *gin.Context, info *relaycommon.Rela
 	}
 	if a.kind == protocol.OpenAIAudioSpeech {
 		audio := result.Request.(*dto.AudioRequest)
+		if audio.Prompt != nil {
+			return nil, fmt.Errorf("speech prompt is not supported by this Channel")
+		}
+		if audio.Stream != nil && !result.vllmSpeech {
+			return nil, fmt.Errorf("speech stream flag is not supported by this Channel")
+		}
+		if result.vllmSpeech {
+			if audio.StreamFormat == "audio" {
+				return nil, fmt.Errorf("raw speech streaming is not supported by this Channel")
+			}
+			if audio.IsStream(c.Request) && audio.ResponseFormat != "pcm" && audio.ResponseFormat != "wav" {
+				return nil, fmt.Errorf("speech streaming requires pcm or wav")
+			}
+		}
 		if audio.SampleRate != nil {
 			if !result.nativeAudio && !result.vllmSpeech {
 				return nil, fmt.Errorf("speech sample rate is not supported by this Channel")

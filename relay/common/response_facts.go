@@ -102,6 +102,7 @@ type ResponseFacts struct {
 	AudioInputTokensEstimated          int
 	AudioInputTokensReported           bool
 	TextInputTokensReported            bool
+	TextInputTokensEstimated           int
 	ImageOutputEstimationStarted       bool
 	ImageOutputTokensEstimate          *int
 	DeliveredImageOutputTokensEstimate *int

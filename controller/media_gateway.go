@@ -446,9 +446,18 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	if imageInputEstimated {
 		usage.PromptTokensDetails.ImageTokens = facts.ImageInputTokensEstimated
 	}
-	referenceInputEstimated := !facts.AudioInputTokensReported && facts.AudioInputTokensEstimated > 0
+	referenceInputEstimated := !facts.AudioInputTokensReported && !facts.AudioInputDurationReported && facts.AudioInputTokensEstimated > 0 && (run.parsed.Protocol != protocol.OpenAIAudioTranscription || !facts.PromptTokensReported)
 	if referenceInputEstimated {
 		usage.PromptTokensDetails.AudioTokens = facts.AudioInputTokensEstimated
+	}
+	textInputEstimated := run.parsed.Protocol == protocol.OpenAIAudioTranscription && !facts.TextInputTokensReported && !facts.PromptTokensReported && facts.TextInputTokensEstimated > 0
+	if textInputEstimated {
+		usage.PromptTokensDetails.TextTokens = facts.TextInputTokensEstimated
+		tokens, clamp := common.QuotaFromFloatChecked(float64(usage.PromptTokensDetails.TextTokens) + float64(usage.PromptTokensDetails.AudioTokens))
+		usage.PromptTokens = tokens
+		if clamp != nil {
+			info.QuotaClamp = clamp
+		}
 	}
 	if !facts.CompletionTokensReported && facts.GeneratedText != "" {
 		usage.CompletionTokens = tokenkit.Count(info.TokenizerModel, facts.GeneratedText)
@@ -511,7 +520,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	if generated || facts.PromptTokensReported || facts.CompletionTokensReported || facts.AudioInputTokensReported || facts.TextInputTokensReported || facts.AudioOutputTokensReported || facts.ImageInputTokensReported || facts.ImageOutputTokensReported || facts.AudioInputDurationReported || facts.AudioInputDurationInvalid || facts.AudioOutputDurationReported || facts.AudioOutputDurationInvalid {
 		attempt.UsageSource = "estimated"
 	}
-	if facts.UsageReported && !referenceInputEstimated && !imageInputEstimated && !facts.ImageOutputTokensEstimated && !facts.AudioOutputDurationInvalid {
+	if facts.UsageReported && !referenceInputEstimated && !textInputEstimated && !imageInputEstimated && !facts.ImageOutputTokensEstimated && !facts.AudioOutputDurationInvalid {
 		attempt.UsageSource = "upstream"
 	}
 	actualCount := []int{}
@@ -600,7 +609,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		saleUsage := usage
 		billableFacts := *facts
 		saleCount := actualCount
-		if info.IsStream && run.parsed.Protocol == protocol.OpenAIImages && (facts.DownstreamWriteFailed || attempt.Status == "partial") && attempt.Status != "cancelled" && !facts.UsageReported {
+		if info.IsStream && run.parsed.Protocol == protocol.OpenAIImages && (facts.DownstreamWriteFailed || attempt.Status == "partial") && attempt.Status != "cancelled" {
 			delivered := facts.DeliveredImageCount
 			if facts.ImageCount != nil {
 				delivered = min(delivered, *facts.ImageCount)
@@ -628,7 +637,9 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 				snapshot.TotalTokens = snapshot.PromptTokens + tokens
 				saleUsage = &snapshot
 			}
-			run.record.UsageSource = "estimated"
+			if !facts.UsageReported {
+				run.record.UsageSource = "estimated"
+			}
 		}
 		estimateDelivered := attempt.Status == "partial" || !facts.UsageReported && (attempt.Status == "cancelled" || facts.DownstreamWriteFailed)
 		if info.IsStream && run.parsed.Protocol == protocol.OpenAIAudioSpeech && estimateDelivered {
