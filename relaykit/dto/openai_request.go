@@ -685,18 +685,20 @@ func (m *Message) SetPrefix(prefix bool) {
 }
 
 func (m *Message) ParseToolCalls() []ToolCallRequest {
-	if m.ToolCalls == nil {
-		var function FunctionRequest
-		if len(m.FunctionCall) > 0 && kitutil.Unmarshal(m.FunctionCall, &function) == nil && (function.Name != "" || function.Arguments != "") {
-			return []ToolCallRequest{{Type: "function", Function: function}}
+	if m.ToolCalls != nil {
+		var calls []ToolCallRequest
+		if err := kitutil.Unmarshal(m.ToolCalls, &calls); err != nil {
+			return calls
 		}
-		return nil
+		if len(calls) > 0 {
+			return calls
+		}
 	}
-	var toolCalls []ToolCallRequest
-	if err := kitutil.Unmarshal(m.ToolCalls, &toolCalls); err == nil {
-		return toolCalls
+	var function FunctionRequest
+	if len(m.FunctionCall) > 0 && kitutil.Unmarshal(m.FunctionCall, &function) == nil && (function.Name != "" || function.Arguments != "") {
+		return []ToolCallRequest{{Type: "function", Function: function}}
 	}
-	return toolCalls
+	return nil
 }
 
 func (m *Message) SetToolCalls(toolCalls any) {

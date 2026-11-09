@@ -480,6 +480,9 @@ func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info convmeta
 			claudeContent := dto.ClaudeMediaMessage{}
 			claudeContent.Type = "tool_use"
 			claudeContent.Id = toolUse.ID
+			if claudeContent.Id == "" {
+				claudeContent.Id = fmt.Sprintf("toolu_%s", kitutil.GetUUID())
+			}
 			claudeContent.Name = toolUse.Function.Name
 			mapParams := map[string]json.RawMessage{}
 			if strings.TrimSpace(toolUse.Function.Arguments) != "" {

@@ -152,6 +152,10 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	if usage == nil {
 		usage = &dto.Usage{}
 	}
+	if p.format == types.RelayFormatGemini {
+		sourceOutput.ObserveGemini(body)
+		sourceTokens = meter.CompletionTokenEstimate(&sourceOutput, usage, info.TokenizerModelName())
+	}
 	facts.PromptTokensReported, facts.CompletionTokensReported = meter.BaseCounters()
 	facts.UsageReported = facts.PromptTokensReported && facts.CompletionTokensReported
 	facts.IndependentUsageReported = meter.ReportedCounters()
@@ -248,7 +252,11 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		usage.PromptTokens = max(usage.PromptTokens, info.GetEstimatePromptTokens())
 	}
 	if !facts.CompletionTokensReported {
-		usage.CompletionTokens = max(usage.CompletionTokens, generatedTokens)
+		if p.format == types.RelayFormatGemini {
+			usage.CompletionTokens = max(usage.CompletionTokens, sourceTokens)
+		} else {
+			usage.CompletionTokens = max(usage.CompletionTokens, generatedTokens)
+		}
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	converted, err := relayconvert.ConvertResponse(c, info, info.RelayFormat, response)

@@ -4487,6 +4487,14 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 		{name: "Ollama malformed terminal retains accumulated bases", provider: constant.ChannelTypeOllama, body: "{\"message\":{\"content\":\"Hello\"},\"done\":false}\n{\"done\":true,\"prompt_eval_count\":1000,\"eval_count\":100,\"message\":{\"content\":{}}}", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1200000},
 		{name: "PaLM malformed filter read error keeps source", provider: constant.ChannelTypePaLM, shortBody: true, body: `{"candidates":[{"content":"Hello"}],"filters":[{"reason":{}}]}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
 		{name: "PaLM stream malformed filter read error keeps source", provider: constant.ChannelTypePaLM, stream: true, shortBody: true, body: `{"candidates":[{"content":"Hello"}],"filters":[{"reason":{}}]}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
+		{name: "Gemini JSON missing candidates retains thoughts", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "gemini_generate", body: `{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"thoughtsTokenCount":100}}`, source: "estimated", prompt: 10, completion: 101, charge: 381600, cost: 212000},
+		{name: "Gemini stream missing candidates retains thoughts", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "gemini_generate", stream: true, body: "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"thoughtsTokenCount\":100}}\n\n", source: "estimated", prompt: 10, completion: 101, charge: 381600, cost: 212000},
+		{name: "Gemini JSON reported thoughts do not duplicate thought text", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "gemini_generate", body: `{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"Plan","thought":true},{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"thoughtsTokenCount":100}}`, source: "estimated", prompt: 10, completion: 101, charge: 381600, cost: 212000},
+		{name: "Gemini stream reported thoughts do not duplicate thought text", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "gemini_generate", stream: true, body: "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Plan\",\"thought\":true},{\"text\":\"Hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"thoughtsTokenCount\":100}}\n\n", source: "estimated", prompt: 10, completion: 101, charge: 381600, cost: 212000},
+		{name: "Gemini JSON explicit zero candidates keeps thoughts authoritative", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "gemini_generate", body: `{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"Plan","thought":true},{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":0,"thoughtsTokenCount":100}}`, source: "upstream", prompt: 10, completion: 100, charge: 378000, cost: 210000},
+		{name: "Gemini stream explicit zero candidates keeps thoughts authoritative", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "gemini_generate", stream: true, body: "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Plan\",\"thought\":true},{\"text\":\"Hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":0,\"thoughtsTokenCount\":100}}\n\n", source: "upstream", prompt: 10, completion: 100, charge: 378000, cost: 210000},
+		{name: "Gemini JSON explicit zero thoughts does not count thought text", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "gemini_generate", body: `{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"Plan","thought":true},{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"thoughtsTokenCount":0}}`, source: "estimated", prompt: 10, completion: 1, charge: 21600, cost: 12000},
+		{name: "Gemini stream explicit zero thoughts does not count thought text", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "gemini_generate", stream: true, body: "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Plan\",\"thought\":true},{\"text\":\"Hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"thoughtsTokenCount\":0}}\n\n", source: "estimated", prompt: 10, completion: 1, charge: 21600, cost: 12000},
 		{name: "Coze multiple answers keep source after successful delivery", provider: constant.ChannelTypeCoze, cozePollBody: `{"code":0,"data":{"status":"completed"}}`, body: `{"code":0,"data":[{"type":"answer","content":"World"},{"type":"answer","content":"Hello"}]}`, source: "estimated", prompt: 9, completion: 1, charge: 19800, cost: 13000},
 		{name: "Coze multiple answers survive message read error", provider: constant.ChannelTypeCoze, cozePollBody: `{"code":0,"data":{"status":"completed"}}`, shortBody: true, body: `{"code":0,"data":[{"type":"answer","content":"Hello","content_type":"text"},{"type":"answer","content":"World","content_type":"text"}]}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 13000},
 		{name: "Coze multiple answers survive unrelated DTO error", provider: constant.ChannelTypeCoze, cozePollBody: `{"code":0,"data":{"status":"completed"}}`, body: `{"code":"broken","data":[{"type":"answer","content":"Hello"},{"type":"answer","content":"World"}]}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 13000},
@@ -9874,11 +9882,11 @@ func TestTextGatewayLegacyFunctionOutputRetainsUsage(t *testing.T) {
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 				if stream {
 					w.Header().Set("Content-Type", "text/event-stream")
-					_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"function_call\":{\"name\":\"f\",\"arguments\":\"{}\"}},\"finish_reason\":\"function_call\"}]}\n\ndata: [DONE]\n\n")
+					_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[],\"function_call\":{\"name\":\"f\",\"arguments\":\"{}\"}},\"finish_reason\":\"function_call\"}]}\n\ndata: [DONE]\n\n")
 					return
 				}
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.WriteString(w, `{"choices":[{"index":0,"message":{"role":"assistant","content":null,"function_call":{"name":"f","arguments":"{}"}},"finish_reason":"function_call"}]}`)
+				_, _ = io.WriteString(w, `{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[],"function_call":{"name":"f","arguments":"{}"}},"finish_reason":"function_call"}]}`)
 			})
 			caps := capability.Set{Features: []capability.Feature{capability.ToolCalling, capability.Streaming}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}
 			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
@@ -9913,7 +9921,13 @@ func TestTextGatewayLegacyFunctionConvertsAcrossPublicProtocols(t *testing.T) {
 			{"gemini", "/v1beta/models/gateway-offering:generateContent", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"tools":[{"functionDeclarations":[{"name":"f","parameters":{"type":"OBJECT"}}]}],"toolConfig":{"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["f"]}},"generationConfig":{"maxOutputTokens":16}}`, `"functionCall"`},
 		} {
 			t.Run(fmt.Sprintf("%s/stream=%t", target.kind, stream), func(t *testing.T) {
+				sent := make(chan []byte, 2)
 				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					wire, err := io.ReadAll(r.Body)
+					if !assert.NoError(t, err) {
+						return
+					}
+					sent <- wire
 					if stream {
 						w.Header().Set("Content-Type", "text/event-stream")
 						_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"function_call\":{\"name\":\"f\",\"arguments\":\"{}\"}},\"finish_reason\":\"function_call\"}]}\n\ndata: [DONE]\n\n")
@@ -9937,6 +9951,42 @@ func TestTextGatewayLegacyFunctionConvertsAcrossPublicProtocols(t *testing.T) {
 				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, request)
 				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 				assert.Contains(t, response.Body.String(), target.needle)
+				<-sent
+				if target.kind == "messages" && !stream {
+					var message struct {
+						StopReason string `json:"stop_reason"`
+						Content    []struct {
+							ID   string `json:"id"`
+							Type string `json:"type"`
+							Name string `json:"name"`
+						} `json:"content"`
+					}
+					require.NoError(t, common.Unmarshal(response.Body.Bytes(), &message))
+					require.Len(t, message.Content, 1)
+					assert.Equal(t, "tool_use", message.StopReason)
+					assert.Equal(t, "tool_use", message.Content[0].Type)
+					require.NotEmpty(t, message.Content[0].ID)
+					assert.Equal(t, "f", message.Content[0].Name)
+					history, err := common.Marshal(map[string]any{"model": "gateway-offering", "max_tokens": 16, "tools": []any{map[string]any{"name": "f", "input_schema": map[string]any{"type": "object"}}}, "messages": []any{map[string]any{"role": "user", "content": "Hello"}, map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "tool_use", "id": message.Content[0].ID, "name": "f", "input": map[string]any{}}}}, map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": message.Content[0].ID, "content": "Result"}}}}})
+					require.NoError(t, err)
+					followup := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, target.path, string(history))
+					require.Equal(t, http.StatusOK, followup.Code, followup.Body.String())
+					var forwarded struct {
+						Messages []struct {
+							Role      string `json:"role"`
+							ToolCalls []struct {
+								ID string `json:"id"`
+							} `json:"tool_calls"`
+							ToolCallID string `json:"tool_call_id"`
+						} `json:"messages"`
+					}
+					require.NoError(t, common.Unmarshal(<-sent, &forwarded))
+					require.Len(t, forwarded.Messages, 3)
+					require.Len(t, forwarded.Messages[1].ToolCalls, 1)
+					assert.Equal(t, message.Content[0].ID, forwarded.Messages[1].ToolCalls[0].ID)
+					assert.Equal(t, "tool", forwarded.Messages[2].Role)
+					assert.Equal(t, message.Content[0].ID, forwarded.Messages[2].ToolCallID)
+				}
 				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
 				require.NoError(t, err)
 				assert.Equal(t, "success", record.Status)

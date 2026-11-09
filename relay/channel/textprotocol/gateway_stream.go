@@ -283,7 +283,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 	info.ResponseFacts.SourceGeneratedText = sourceOutput.String()
 	info.ResponseFacts.GeneratedText = output.String()
 	if p.format == types.RelayFormatOpenAI || p.format == types.RelayFormatGemini {
-		sourceTokens := sourceOutput.TextTokenEstimate(info.TokenizerModelName())
+		sourceTokens := meter.CompletionTokenEstimate(&sourceOutput, usage, info.TokenizerModelName())
 		if p.format == types.RelayFormatOpenAI {
 			sourceTokens += len(sourceOutput.chatTools) * 7
 		}
@@ -300,7 +300,11 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		usage.PromptTokens = max(usage.PromptTokens, info.GetEstimatePromptTokens())
 	}
 	if !info.ResponseFacts.CompletionTokensReported {
-		usage.CompletionTokens = max(usage.CompletionTokens, generatedTokens)
+		if p.format == types.RelayFormatGemini && info.ResponseFacts.SourceOutputTokens != nil {
+			usage.CompletionTokens = max(usage.CompletionTokens, *info.ResponseFacts.SourceOutputTokens)
+		} else {
+			usage.CompletionTokens = max(usage.CompletionTokens, generatedTokens)
+		}
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	if streamErr != nil {

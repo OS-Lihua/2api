@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -151,6 +152,27 @@ func (a *gatewayUsageAccumulator) Observe(body []byte) (*dto.Usage, error) {
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	return usage, nil
+}
+
+// CompletionTokenEstimate preserves independently reported Gemini thought output
+// while estimating a missing candidate count from candidate text alone.
+func (a *gatewayUsageAccumulator) CompletionTokenEstimate(output *gatewayGeneratedOutput, usage *dto.Usage, model string) int {
+	estimate := output.TextTokenEstimate(model)
+	if a.format != types.RelayFormatGemini {
+		return estimate
+	}
+	if _, present := a.snapshot["candidatesTokenCount"]; present {
+		return estimate
+	}
+	if _, present := a.snapshot["thoughtsTokenCount"]; !present {
+		return estimate
+	}
+	candidates := 0
+	for _, text := range output.geminiCandidates {
+		candidates += tokenkit.Count(model, text.String())
+	}
+	reasoning := usage.CompletionTokenDetails.ReasoningTokens
+	return max(candidates, usage.CompletionTokens-reasoning) + reasoning
 }
 
 func (a *gatewayUsageAccumulator) BaseCounters() (bool, bool) {
