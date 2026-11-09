@@ -5484,7 +5484,16 @@ func TestMediaGatewayMiniMaxImagesKeepHostStreamAndRejectInputLoss(t *testing.T)
 	for _, tc := range []struct {
 		name, fields, override string
 		stream, reject         bool
+		width, height, n       int
+		seed                   *int64
 	}{
+		{name: "exact dimensions", fields: `,"size":"1536x1024"`, width: 1536, height: 1024},
+		{name: "seed zero", fields: `,"seed":0`, seed: new(int64(0))},
+		{name: "extra seed zero", fields: `,"extra_fields":{"seed":0}`, seed: new(int64(0))},
+		{name: "invalid seed", fields: `,"seed":"invalid-seed-private-sentinel"`, reject: true},
+		{name: "native count limit", n: 10, reject: true},
+		{name: "invalid exact dimensions", fields: `,"size":"1010x512"`, reject: true},
+		{name: "final dimensions limit", fields: `,"size":"1536x1024"`, override: `{"operations":[{"path":"width","mode":"set","value":2056}]}`, reject: true},
 		{name: "native JSON"},
 		{name: "native JSON as SSE", stream: true},
 		{name: "quality high cannot be preserved", fields: `,"quality":"high"`, reject: true},
@@ -5496,17 +5505,32 @@ func TestMediaGatewayMiniMaxImagesKeepHostStreamAndRejectInputLoss(t *testing.T)
 		{name: "override input", override: `{"image":"https://image.invalid/input"}`, reject: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			n := tc.n
+			if n == 0 {
+				n = 2
+			}
 			calls := 0
 			fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
 				calls++
 				var wire struct {
 					Model, Prompt string
+					AspectRatio   string `json:"aspect_ratio"`
 					N             int
+					Width, Height *int
+					Seed          *int64
 				}
 				require.NoError(t, common.DecodeJson(r.Body, &wire))
 				assert.Equal(t, "image-01", wire.Model)
 				assert.Equal(t, "draw", wire.Prompt)
-				assert.Equal(t, 2, wire.N)
+				assert.Equal(t, n, wire.N)
+				if tc.width > 0 {
+					assert.Equal(t, &tc.width, wire.Width)
+					assert.Equal(t, &tc.height, wire.Height)
+					assert.Empty(t, wire.AspectRatio)
+				}
+				if tc.seed != nil {
+					assert.Equal(t, tc.seed, wire.Seed)
+				}
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = io.WriteString(w, `{"data":{"image_urls":["https://image.invalid/a","https://image.invalid/b"]},"base_resp":{"status_code":0}}`)
 			})
@@ -5515,9 +5539,13 @@ func TestMediaGatewayMiniMaxImagesKeepHostStreamAndRejectInputLoss(t *testing.T)
 			if tc.override != "" {
 				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", tc.override).Error)
 			}
-			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", fmt.Sprintf(`{"model":"gateway-alias","prompt":"draw","n":2,"stream":%t%s}`, tc.stream, tc.fields))
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", fmt.Sprintf(`{"model":"gateway-alias","prompt":"draw","n":%d,"stream":%t%s}`, n, tc.stream, tc.fields))
 			if tc.reject {
 				assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+				if strings.Contains(tc.fields, "invalid-seed-private-sentinel") {
+					assert.Contains(t, response.Body.String(), "seed")
+					assert.NotContains(t, response.Body.String(), "invalid-seed-private-sentinel")
+				}
 				assert.Zero(t, calls)
 				wallet, err := model.GetUserWallet(fixture.user.Id)
 				require.NoError(t, err)

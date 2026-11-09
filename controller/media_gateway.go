@@ -193,7 +193,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 				if errors.As(err, &loss) {
 					for _, diagnostic := range loss.Diagnostics {
 						switch diagnostic.Path {
-						case "request", "input", "file", "image", "images", "mask", "n", "batch_size", "batch_count", "num_images", "num_outputs", "samplecount", "sample_count", "max_images", "prompt", "max_new_tokens", "max_tokens", "max_output_tokens", "max_completion_tokens", "maxoutputtokens", "duration", "seconds", "duration_seconds", "silence_duration", "sample_rate", "width", "height", "size", "quality", "response_format", "voice", "speed", "stream", "stream_format", "ref_audio", "ref_text", "metadata":
+						case "request", "input", "file", "image", "images", "mask", "n", "batch_size", "batch_count", "num_images", "num_outputs", "samplecount", "sample_count", "max_images", "prompt", "seed", "max_new_tokens", "max_tokens", "max_output_tokens", "max_completion_tokens", "maxoutputtokens", "duration", "seconds", "duration_seconds", "silence_duration", "sample_rate", "width", "height", "size", "quality", "response_format", "voice", "speed", "stream", "stream_format", "ref_audio", "ref_text", "metadata":
 						default:
 							continue
 						}

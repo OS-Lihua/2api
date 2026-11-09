@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel"
@@ -100,7 +102,36 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 	if info.RelayMode != constant.RelayModeImagesGenerations {
 		return nil, fmt.Errorf("unsupported image relay mode: %d", info.RelayMode)
 	}
-	return oaiImage2MiniMaxImageRequest(request), nil
+	converted := oaiImage2MiniMaxImageRequest(request)
+	if info.ResponseFacts != nil {
+		if request.Size != "" && request.Size != "auto" {
+			widthText, heightText, found := strings.Cut(request.Size, "x")
+			width, widthErr := strconv.Atoi(widthText)
+			height, heightErr := strconv.Atoi(heightText)
+			if !found || widthErr != nil || heightErr != nil {
+				return nil, types.NewMediaParameterError("size", "media_format_unsupported")
+			}
+			if err := validateMiniMaxDimensions(width, height); err != nil {
+				return nil, err
+			}
+			converted.Width, converted.Height, converted.AspectRatio = &width, &height, ""
+		}
+		var extra struct {
+			Seed *int64 `json:"seed"`
+		}
+		if len(request.ExtraFields) > 0 {
+			if err := common.Unmarshal(request.ExtraFields, &extra); err != nil {
+				return nil, types.NewMediaParameterError("seed", "media_control_unsupported")
+			}
+		}
+		converted.Seed = extra.Seed
+		if raw, exists := request.Extra["seed"]; exists {
+			if err := common.Unmarshal(raw, &converted.Seed); err != nil {
+				return nil, types.NewMediaParameterError("seed", "media_control_unsupported")
+			}
+		}
+	}
+	return converted, nil
 }
 
 func (a *Protocol) Init(info *relaycommon.RelayInfo) {

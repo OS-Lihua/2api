@@ -24,6 +24,9 @@ type MiniMaxImageRequest struct {
 	AspectRatio     string `json:"aspect_ratio,omitempty"`
 	ResponseFormat  string `json:"response_format,omitempty"`
 	N               int    `json:"n,omitempty"`
+	Width           *int   `json:"width,omitempty"`
+	Height          *int   `json:"height,omitempty"`
+	Seed            *int64 `json:"seed,omitempty"`
 	PromptOptimizer *bool  `json:"prompt_optimizer,omitempty"`
 	AigcWatermark   *bool  `json:"aigc_watermark,omitempty"`
 }
@@ -39,6 +42,13 @@ type MiniMaxImageResponse struct {
 		StatusCode int    `json:"status_code"`
 		StatusMsg  string `json:"status_msg"`
 	} `json:"base_resp"`
+}
+
+func validateMiniMaxDimensions(width, height int) error {
+	if width < 512 || width > 2048 || height < 512 || height > 2048 || width%8 != 0 || height%8 != 0 {
+		return types.NewMediaParameterError("size", "media_format_unsupported")
+	}
+	return nil
 }
 
 func oaiImage2MiniMaxImageRequest(request dto.ImageRequest) MiniMaxImageRequest {

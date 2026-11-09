@@ -35,6 +35,7 @@ func (MiniMaxImageRequest) ProjectImageRequest(body []byte, public dto.ImageRequ
 		N              *uint  `json:"n"`
 		AspectRatio    string `json:"aspect_ratio"`
 		ResponseFormat string `json:"response_format"`
+		Width, Height  *int
 	}
 	if err := common.Unmarshal(body, &wire); err != nil {
 		return nil, err
@@ -43,13 +44,30 @@ func (MiniMaxImageRequest) ProjectImageRequest(body []byte, public dto.ImageRequ
 	if wire.N != nil {
 		count = *wire.N
 	}
-	if wire.Model != public.Model || wire.Prompt == "" || count == 0 || count > dto.MaxImageN {
+	if count == 0 || count > 9 {
+		return nil, types.NewMediaParameterError("n", "media_capability_limit_exceeded")
+	}
+	if wire.Model != public.Model || wire.Prompt == "" {
 		return nil, fmt.Errorf("invalid MiniMax image parameters")
 	}
 	switch wire.AspectRatio {
 	case "", "1:1", "16:9", "4:3", "3:2", "2:3", "3:4", "9:16", "21:9":
 	default:
 		return nil, fmt.Errorf("unsupported MiniMax image aspect ratio")
+	}
+	if wire.Width != nil || wire.Height != nil {
+		if wire.Width == nil || wire.Height == nil {
+			return nil, types.NewMediaParameterError("size", "media_format_unsupported")
+		}
+		if err := validateMiniMaxDimensions(*wire.Width, *wire.Height); err != nil {
+			return nil, err
+		}
+	}
+	if wire.AspectRatio == "" && wire.Width != nil {
+		public.Size = fmt.Sprintf("%dx%d", *wire.Width, *wire.Height)
+	} else {
+		sizes := map[string]string{"": "1024x1024", "1:1": "1024x1024", "16:9": "1280x720", "4:3": "1152x864", "3:2": "1248x832", "2:3": "832x1248", "3:4": "864x1152", "9:16": "720x1280", "21:9": "1344x576"}
+		public.Size = sizes[wire.AspectRatio]
 	}
 	switch wire.ResponseFormat {
 	case "", "url":
