@@ -188,7 +188,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (apiErr 
 				}
 				return types.NewError(errors.New("invalid upstream Realtime event"), types.ErrorCodeBadResponse), sum
 			}
-			if _, err := service.DecodeResponsesStreamEvent(incoming.body); err != nil {
+			if _, err := service.DecodeRealtimeStreamEvent(incoming.body); err != nil {
 				result, _ := accumulator.Observe(incoming.body, input, false)
 				if result != nil {
 					if err := recordRealtimeResponse(c, info, result, sum); err != nil {

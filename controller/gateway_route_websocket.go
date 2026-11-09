@@ -124,7 +124,12 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 		if err == nil {
 			body, err = helper.NormalizeRealtimeRequestLimits(body, selection.Capabilities, inputUsage.PromptTokens)
 			if err != nil {
-				return nil, &service.GatewayParameterError{Path: "max_output_tokens", Reason: err.Error()}
+				path := "request"
+				var field interface{ ParameterPath() string }
+				if errors.As(err, &field) {
+					path = field.ParameterPath()
+				}
+				return nil, &service.GatewayParameterError{Path: path, Reason: err.Error()}
 			}
 		}
 	} else {
@@ -153,7 +158,12 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 		return nil, &service.GatewayParameterError{Path: "model", Reason: "Connection model is locked"}
 	}
 	if err := helper.ValidateResponsesMultipliers(body); err != nil {
-		return nil, &service.GatewayParameterError{Path: "max_output_tokens", Reason: err.Error()}
+		path := "request"
+		var field interface{ ParameterPath() string }
+		if errors.As(err, &field) {
+			path = field.ParameterPath()
+		}
+		return nil, &service.GatewayParameterError{Path: path, Reason: err.Error()}
 	}
 	if failure := service.GatewayResponsesCapabilitiesFailure(&effective, selection.Capabilities, inputUsage.PromptTokens, nativeModalities); failure != nil {
 		return nil, failure

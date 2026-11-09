@@ -175,14 +175,8 @@ func (accumulator *RealtimeUsageAccumulator) Observe(raw []byte, input *dto.Usag
 		}
 	}
 	normalized := document.Bytes()
-	event, err := DecodeResponsesStreamEvent(normalized)
-	if err != nil {
-		if event != nil {
-			state.accumulator.Observe(event, normalized)
-		}
-		return nil, err
-	}
-	if event.Response != nil && event.Response.Usage != nil {
+	event, err := DecodeRealtimeStreamEvent(normalized)
+	if event != nil && event.Response != nil && event.Response.Usage != nil {
 		if valid, _ := relaycommon.NativeUsagePresence(normalized, "response.usage.input_tokens_details.text_tokens", "", ""); valid {
 			state.inputTextReported = true
 		}
@@ -198,6 +192,12 @@ func (accumulator *RealtimeUsageAccumulator) Observe(raw []byte, input *dto.Usag
 		if valid, _ := relaycommon.NativeUsagePresence(normalized, "response.usage.input_tokens_details.audio_tokens", "", ""); valid {
 			state.inputAudioReported = true
 		}
+	}
+	if err != nil {
+		if event != nil {
+			state.accumulator.Observe(event, normalized)
+		}
+		return nil, err
 	}
 	if kind == "response.audio.delta" || kind == "response.output_audio.delta" {
 		audio, err := base64.StdEncoding.DecodeString(event.Delta)
@@ -231,6 +231,19 @@ func (accumulator *RealtimeUsageAccumulator) Observe(raw []byte, input *dto.Usag
 	state.info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 	result := accumulator.finish(id, state)
 	return &result, nil
+}
+
+// DecodeRealtimeStreamEvent preserves native union metadata while exposing
+// only quantity facts to the shared Responses counter.
+func DecodeRealtimeStreamEvent(raw []byte) (*dto.ResponsesStreamResponse, error) {
+	if limit := ojson.GetBytes(raw, "response.max_output_tokens"); limit.Type == ojson.String && limit.String() == "inf" {
+		document := ojson.NewDoc(raw)
+		if err := document.Delete("response.max_output_tokens"); err != nil {
+			return nil, err
+		}
+		raw = document.Bytes()
+	}
+	return DecodeResponsesStreamEvent(raw)
 }
 
 func (accumulator *RealtimeUsageAccumulator) finish(id string, state *realtimeResponseUsage) RealtimeUsageResult {

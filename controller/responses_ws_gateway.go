@@ -5,13 +5,11 @@ import (
 	"errors"
 	"net/http"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
@@ -186,17 +184,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		if errors.Is(err, service.ErrGatewayCapability) {
 			status, code = http.StatusBadRequest, "unsupported_parameter"
 			if rejected != nil {
-				parameter, _, _ := strings.Cut(rejected.Path, ".")
-				parameter, _, _ = strings.Cut(parameter, "[")
-				message := i18n.T(c, rejected.Reason)
-				metadata, _ := common.Marshal(map[string]string{"parameter": parameter, "path": rejected.Path, "reason": message})
-				// WithOpenAIError appends Provider metadata to Message; native
-				// diagnostics remain separate structured fields.
-				problem := types.OpenAIError{Message: message, Type: string(types.ErrorTypeNewAPIError), Code: code, Param: rejected.Path}
-				run.nativeError = types.WithOpenAIError(problem, status, types.ErrOptionWithSkipRetry())
-				problem.Metadata = metadata
-				run.nativeError.RelayError = problem
-				run.nativeError.Metadata = metadata
+				run.nativeError = types.NewErrorWithStatusCode(rejected, types.ErrorCode(code), status, types.ErrOptionWithSkipRetry())
 				run.fail(c, status, code, rejected.Reason)
 				return
 			}

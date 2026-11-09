@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"fmt"
 	"maps"
 	"slices"
 	"strings"
@@ -504,13 +505,18 @@ func (snapshot *RealtimeInputSnapshot) estimate(body []byte, caps *capability.Se
 	items := value.Get("input")
 	if items.Exists() && items.Type != ojson.Null {
 		if !items.IsArray() {
-			return nil, errors.New("Realtime input must be an array")
+			return nil, &GatewayParameterError{Path: "input", Reason: "Realtime input must be an array"}
 		}
 		quantity = realtimeInputQuantity{}
-		for _, item := range items.Array() {
+		for index, item := range items.Array() {
 			part, err := snapshot.countItem(item)
 			if err != nil {
-				return nil, err
+				path := fmt.Sprintf("input[%d]", index)
+				var parameter *GatewayParameterError
+				if errors.As(err, &parameter) && parameter.Path != "" {
+					path += "." + parameter.Path
+				}
+				return nil, &GatewayParameterError{Path: path, Reason: err.Error()}
 			}
 			quantity = quantity.add(part)
 		}
@@ -549,7 +555,7 @@ func (snapshot *RealtimeInputSnapshot) countItem(item ojson.Result) (realtimeInp
 	case "item_reference":
 		known, exists := snapshot.items[item.Get("id").String()]
 		if !exists || !known.accepted {
-			return quantity, errors.New("Unknown Realtime input reference")
+			return quantity, &GatewayParameterError{Path: "id", Reason: "Unknown Realtime input reference"}
 		}
 		return known.quantity, nil
 	case "function_call":

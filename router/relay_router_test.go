@@ -347,10 +347,14 @@ func dialResponsesGateway(t *testing.T, fixture textGatewayFixture, language ...
 
 func TestWebSocketGatewayParameterDiagnostics(t *testing.T) {
 	for _, test := range []struct {
-		name       string
-		native     bool
-		body, path string
+		name                        string
+		native                      bool
+		body, path, overrides, code string
 	}{
+		{name: "Realtime prompt", native: true, body: `{"type":"response.create","response":{"input":[],"prompt":{"id":"pmpt_known"}}}`, path: "prompt", code: "invalid_request"},
+		{name: "Realtime input reference", native: true, body: `{"type":"response.create","response":{"input":[{"type":"item_reference","id":"unknown"}]}}`, path: "input[0].id", code: "invalid_request"},
+		{name: "Responses batch override", body: `{"type":"response.create","model":"gateway-alias","input":"Hi"}`, path: "n", overrides: `{"n":2}`},
+		{name: "Responses nested batch override", body: `{"type":"response.create","model":"gateway-alias","input":"Hi"}`, path: "parameters.n", overrides: `{"parameters":{"n":2}}`},
 		{name: "Responses reasoning", body: `{"type":"response.create","model":"gateway-alias","input":"Hi","reasoning":{"effort":"high"}}`, path: "reasoning.effort"},
 		{name: "Realtime reasoning", native: true, body: `{"type":"response.create","response":{"input":[],"reasoning":{"effort":"high"}}}`, path: "reasoning.effort"},
 		{name: "Responses file", body: `{"type":"response.create","model":"gateway-alias","input":[{"role":"user","content":[{"type":"input_file","file_id":"file-unknown"}]}]}`, path: "input[0].content[0].file_id"},
@@ -376,6 +380,9 @@ func TestWebSocketGatewayParameterDiagnostics(t *testing.T) {
 					calls.Add(1)
 				}
 			})
+			if test.overrides != "" {
+				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", test.overrides).Error)
+			}
 			var client *websocket.Conn
 			if test.native {
 				client = dialRealtimeGateway(t, fixture, i18n.LangEn)
@@ -388,7 +395,11 @@ func TestWebSocketGatewayParameterDiagnostics(t *testing.T) {
 			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(test.body)))
 			_, raw, err := client.ReadMessage()
 			require.NoError(t, err)
-			assert.Equal(t, "unsupported_parameter", ojson.GetBytes(raw, "error.code").String())
+			code := test.code
+			if code == "" {
+				code = "unsupported_parameter"
+			}
+			assert.Equal(t, code, ojson.GetBytes(raw, "error.code").String())
 			assert.Equal(t, test.path, ojson.GetBytes(raw, "error.param").String())
 			assert.Equal(t, test.path, ojson.GetBytes(raw, "error.metadata.path").String())
 			assert.NotEmpty(t, ojson.GetBytes(raw, "error.metadata.parameter").String())
@@ -980,7 +991,7 @@ func TestResponsesWSGatewayRejectsOlderTerminalReplays(t *testing.T) {
 }
 
 func TestResponsesWSGatewayBoundsOutputIdentityState(t *testing.T) {
-	for _, scenario := range []string{"identity index", "first generated text", "Realtime identity gate", "Realtime first generated text", "Realtime malformed output", "Realtime malformed sequence"} {
+	for _, scenario := range []string{"identity index", "first generated text", "Realtime identity gate", "Realtime first generated text", "Realtime malformed output", "Realtime malformed sequence", "Realtime malformed image zero"} {
 		t.Run(scenario, func(t *testing.T) {
 			previous := constant.MaxRequestBodyMB
 			constant.MaxRequestBodyMB = 1
@@ -1015,6 +1026,9 @@ func TestResponsesWSGatewayBoundsOutputIdentityState(t *testing.T) {
 					if scenario == "Realtime malformed sequence" {
 						terminal = `{"type":"response.done","sequence_number":"bad","response":{"id":"bounded","status":"completed","output":[],"usage":{"input_tokens":1000,"output_tokens":10}}}`
 					}
+					if scenario == "Realtime malformed image zero" {
+						terminal = `{"type":"response.done","response":{"id":"bounded","status":"completed","output":{},"usage":{"input_tokens":85,"output_tokens":0,"input_token_details":{"image_tokens":0}}}}`
+					}
 					frames = append(frames, terminal)
 				}
 				frames = append(frames, `{"type":"response.output_text.delta","response_id":"bounded","item_id":"text","delta":"UNBOUNDED"}`, `{"type":"response.completed","response":{"id":"bounded","status":"completed"}}`)
@@ -1025,6 +1039,19 @@ func TestResponsesWSGatewayBoundsOutputIdentityState(t *testing.T) {
 				}
 				_, _, _ = peer.ReadMessage()
 			})
+			if scenario == "Realtime malformed image zero" {
+				var unified model.Model
+				require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+				unified.Capabilities.InputModalities = append(unified.Capabilities.InputModalities, capability.Image)
+				require.NoError(t, model.DB.Model(&unified).Select("capabilities").Updates(&unified).Error)
+				for _, owner := range []string{model.PriceOwnerOffering, model.PriceOwnerChannel} {
+					id := fixture.offering.ID
+					if owner == model.PriceOwnerChannel {
+						id = fixture.channel.ID
+					}
+					require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: owner, OwnerID: id, Currency: "USD", Expression: `tier("image",img * 1000)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+				}
+			}
 			var client *websocket.Conn
 			if strings.HasPrefix(scenario, "Realtime") {
 				client = dialRealtimeGateway(t, fixture)
@@ -1037,6 +1064,11 @@ func TestResponsesWSGatewayBoundsOutputIdentityState(t *testing.T) {
 			body := `{"type":"response.create","model":"gateway-alias","input":"Hi","max_output_tokens":16}`
 			if strings.HasPrefix(scenario, "Realtime") {
 				body = `{"type":"response.create","response":{"instructions":"Hi","max_output_tokens":16}}`
+			}
+			if scenario == "Realtime malformed image zero" {
+				var picture bytes.Buffer
+				require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+				body = `{"type":"response.create","response":{"input":[{"type":"message","role":"user","content":[{"type":"input_image","detail":"low","image_url":"data:image/png;base64,` + base64.StdEncoding.EncodeToString(picture.Bytes()) + `"}]}],"max_output_tokens":1}}`
 			}
 			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(body)))
 			late, completed := false, false
@@ -1060,7 +1092,11 @@ func TestResponsesWSGatewayBoundsOutputIdentityState(t *testing.T) {
 			if strings.HasPrefix(scenario, "Realtime malformed") {
 				assert.Equal(t, "failed", records[0].Status)
 				assert.Zero(t, records[0].Receivable.Nanos)
-				assertTextGatewayLedger(t, records[0], 1_020_000)
+				cost := int64(1_020_000)
+				if scenario == "Realtime malformed image zero" {
+					cost = 0
+				}
+				assertTextGatewayLedger(t, records[0], cost)
 			} else if scenario == "Realtime first generated text" {
 				assert.Equal(t, "partial", records[0].Status)
 				assert.EqualValues(t, 360_001_800, records[0].Receivable.Nanos)
@@ -2079,7 +2115,7 @@ func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
 		if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
 			return
 		}
-		for _, raw := range []string{`{"type":"response.created","response":{"id":"legacy-text","status":"in_progress"}}`, `{"type":"response.function_call_arguments.delta","response_id":"legacy-text","delta":"` + strings.Repeat(" hello", 20) + `"}`, `{"type":"response.done","response":{"id":"legacy-text","status":"completed"}}`} {
+		for _, raw := range []string{`{"type":"response.created","response":{"id":"legacy-text","status":"in_progress","max_output_tokens":"inf"}}`, `{"type":"response.function_call_arguments.delta","response_id":"legacy-text","delta":"` + strings.Repeat(" hello", 20) + `"}`, `{"type":"response.done","response":{"id":"legacy-text","status":"completed"}}`} {
 			if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(raw))) {
 				return
 			}

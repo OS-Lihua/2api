@@ -136,6 +136,11 @@ func ExceedsMaxTokensLimit(values ...*uint) bool {
 	return false
 }
 
+type requestParameterError struct{ path, reason string }
+
+func (err *requestParameterError) Error() string         { return err.reason }
+func (err *requestParameterError) ParameterPath() string { return err.path }
+
 // Realtime accepts integer output budgets from 1 through 4096, or "inf".
 // https://github.com/openai/openai-python/blob/a1175a35ba6aa2d6bf98d26088a572ab0c5f4453/src/openai/types/realtime/realtime_response_create_params.py
 const RealtimeMaxOutputTokens = 4096
@@ -159,7 +164,7 @@ func ValidateRealtimeMultipliers(body []byte) error {
 			}
 			var count uint
 			if common.UnmarshalJsonStr(value.Raw, &count) != nil || count < 1 || count > RealtimeMaxOutputTokens || ExceedsMaxTokensLimit(&count) {
-				return fmt.Errorf("%s must be an integer between 1 and 4096 or inf", path)
+				return &requestParameterError{path: path, reason: fmt.Sprintf("%s must be an integer between 1 and 4096 or inf", path)}
 			}
 		}
 	}
@@ -180,7 +185,7 @@ func NormalizeRealtimeRequestLimits(body []byte, caps capability.Set, inputToken
 		limit = min(limit, *contextLength-int64(inputTokens))
 	}
 	if limit < 1 {
-		return nil, errors.New("Realtime context limit exceeded")
+		return nil, &requestParameterError{path: "input", reason: "Realtime context limit exceeded"}
 	}
 	document := ojson.NewDoc(append([]byte(nil), body...))
 	for _, prefix := range []string{"", "parameters."} {
@@ -198,7 +203,7 @@ func NormalizeRealtimeRequestLimits(body []byte, caps capability.Set, inputToken
 			}
 			var count uint
 			if common.UnmarshalJsonStr(value.Raw, &count) != nil || count > uint(limit) {
-				return nil, fmt.Errorf("%s exceeds the connection output limit", path)
+				return nil, &requestParameterError{path: path, reason: fmt.Sprintf("%s exceeds the connection output limit", path)}
 			}
 		}
 	}
@@ -226,10 +231,15 @@ func ValidateResponsesMultipliers(body []byte) error {
 		return err
 	}
 	if request.N != nil && *request.N != 1 {
-		return errors.New("n must be 1 for Responses")
+		return &requestParameterError{path: "n", reason: "n must be 1 for Responses"}
 	}
-	if ExceedsMaxTokensLimit(request.MaxTokens, request.MaxCompletionTokens, request.MaxOutputTokens, request.MinTokens) {
-		return errors.New("max_tokens is invalid")
+	for _, field := range []struct {
+		path  string
+		value *uint
+	}{{"max_tokens", request.MaxTokens}, {"max_completion_tokens", request.MaxCompletionTokens}, {"max_output_tokens", request.MaxOutputTokens}, {"min_tokens", request.MinTokens}} {
+		if ExceedsMaxTokensLimit(field.value) {
+			return &requestParameterError{path: field.path, reason: "max_tokens is invalid"}
+		}
 	}
 	if len(request.Parameters) > 0 && string(request.Parameters) != "null" {
 		// Only the known compatible container is interpreted; request content
@@ -244,10 +254,15 @@ func ValidateResponsesMultipliers(body []byte) error {
 			return err
 		}
 		if nested.N != nil && *nested.N != 1 {
-			return errors.New("parameters.n must be 1 for Responses")
+			return &requestParameterError{path: "parameters.n", reason: "parameters.n must be 1 for Responses"}
 		}
-		if ExceedsMaxTokensLimit(nested.MaxTokens, nested.MaxCompletionTokens, nested.MaxOutputTokens) {
-			return errors.New("parameters.max_tokens is invalid")
+		for _, field := range []struct {
+			path  string
+			value *uint
+		}{{"parameters.max_tokens", nested.MaxTokens}, {"parameters.max_completion_tokens", nested.MaxCompletionTokens}, {"parameters.max_output_tokens", nested.MaxOutputTokens}} {
+			if ExceedsMaxTokensLimit(field.value) {
+				return &requestParameterError{path: field.path, reason: "parameters.max_tokens is invalid"}
+			}
 		}
 	}
 	return nil

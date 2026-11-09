@@ -74,8 +74,9 @@ type GatewayRouteInput struct {
 // GatewayParameterError retains a native parameter rejection through Route selection.
 type GatewayParameterError struct{ Path, Reason string }
 
-func (err *GatewayParameterError) Error() string { return err.Reason }
-func (err *GatewayParameterError) Unwrap() error { return ErrGatewayCapability }
+func (err *GatewayParameterError) ParameterPath() string { return err.Path }
+func (err *GatewayParameterError) Error() string         { return err.Reason }
+func (err *GatewayParameterError) Unwrap() error         { return ErrGatewayCapability }
 
 var ErrGatewayCapability = errors.New("no Channel supports the requested capabilities")
 var ErrGatewayConversion = errors.New("no Channel supports the requested conversion")
