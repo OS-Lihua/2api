@@ -36,12 +36,6 @@ func responsesWSGateway(c *gin.Context, call *relay.ResponsesWSCall) (bool, *typ
 			service.RecordGatewayModelAccessDenied(c)
 			return true, types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound)
 		}
-		if _, err := model.ValidateUserToken(c.GetString("token_key")); err != nil {
-			if errors.Is(err, model.ErrDatabase) {
-				return true, types.NewErrorWithStatusCode(errors.New("Authorization is temporarily unavailable"), "authorization_unavailable", http.StatusServiceUnavailable)
-			}
-			return true, types.NewErrorWithStatusCode(errors.New("Invalid API key"), "invalid_api_key", http.StatusUnauthorized)
-		}
 		return false, nil
 	}
 	if call.LegacyConnection {
