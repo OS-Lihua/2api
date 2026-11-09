@@ -28,7 +28,7 @@ func taskPluginProtocolHandlers(protocol, operation string) ([]gin.HandlerFunc, 
 	switch protocol + "." + operation {
 	case "openai_responses.create":
 		return []gin.HandlerFunc{
-			middleware.RouteTag("relay"), middleware.SystemPerformanceCheck(), middleware.ResolveTextOffering(), middleware.TokenAuth(),
+			middleware.RouteTag("relay"), middleware.SystemPerformanceCheck(), middleware.GatewayTokenAuth(), middleware.ResolveTextOffering(),
 			middleware.ModelRequestRateLimit(), controller.TextGateway, middleware.RouteTaskPluginEndpoint(), middleware.PrepareTaskPluginEndpoint(), middleware.Distribute(),
 			func(c *gin.Context) {
 				controller.RelayTaskPluginEndpoint(c, func(c *gin.Context) { controller.Relay(c, types.RelayFormatOpenAIResponses) })

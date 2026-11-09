@@ -8,7 +8,6 @@ import (
 	"io"
 	"maps"
 	"net/http"
-	"slices"
 	"strings"
 	"time"
 
@@ -34,6 +33,9 @@ import (
 )
 
 func gatewayError(c *gin.Context, status int, code, message string) {
+	if code == "model_not_found" {
+		service.RecordGatewayModelAccessDenied(c)
+	}
 	kind, _ := middleware.TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
 	streaming := c.Writer.Written() && strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream")
 	if c.Writer.Written() && !streaming {
@@ -170,16 +172,8 @@ func gatewayPreparationRejection(err error, budget *service.GatewayAttemptBudget
 	return result
 }
 
-// TextGateway uses one reservation and one settlement for all actual sends.
-func TextGateway(c *gin.Context) {
-	if middleware.TextOfferingMissing(c) {
-		gatewayError(c, http.StatusNotFound, "model_not_found", "Model not found")
-		return
-	}
-	if middleware.TextOffering(c) == nil {
-		c.Next()
-		return
-	}
+// runAuthorizedTextGateway uses one reservation and settlement for all actual sends.
+func runAuthorizedTextGateway(c *gin.Context) {
 	run := &textGatewayRun{}
 	parent := c.Request
 	attempts := service.RunGatewayAttempts(parent.Context(), service.GatewayPolicy(), func(budget *service.GatewayAttemptBudget, exclusions *service.GatewayExclusions) service.GatewayAttemptResult {
@@ -217,20 +211,57 @@ func TextGateway(c *gin.Context) {
 	}
 }
 
-// TextGateway dispatches only a resolved ModelOffering. Absence continues to the
-// legacy middleware; known disabled and unauthorized offerings stop here.
-func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.GatewayAttemptBudget, exclusions *service.GatewayExclusions) (result service.GatewayAttemptResult) {
+// TextGateway authorizes requests before running the shared attempt lifecycle.
+func TextGateway(c *gin.Context) {
+	if middleware.TextOfferingMissing(c) {
+		gatewayError(c, http.StatusNotFound, "model_not_found", "Model not found")
+		return
+	}
 	offering := middleware.TextOffering(c)
 	if offering == nil {
+		kind, name := middleware.TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
+		if kind == "" {
+			c.Next()
+			return
+		}
+		if name == "" {
+			var request struct {
+				Model string `json:"model"`
+			}
+			if common.UnmarshalBodyReusable(c, &request) != nil || request.Model == "" {
+				gatewayError(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
+				return
+			}
+		}
+		// Resolution already distinguishes configured legacy models from missing names.
+		// Every text protocol must enforce legacy quota before entering the legacy relay.
+		if _, err := model.ValidateUserToken(c.GetString("token_key")); err != nil {
+			if errors.Is(err, model.ErrDatabase) {
+				gatewayError(c, http.StatusServiceUnavailable, "authorization_unavailable", i18n.T(c, i18n.MsgGatewayAuthorizationUnavailable))
+			} else {
+				gatewayError(c, http.StatusUnauthorized, "invalid_api_key", common.TranslateMessage(c, i18n.MsgTokenInvalid))
+			}
+			return
+		}
 		c.Next()
 		return
 	}
 	c.Abort()
-	userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
-	if !offering.Enabled || offering.Visibility == "groups" && !slices.Contains(offering.Groups, userGroup) {
-		run.fail(c, http.StatusNotFound, "model_not_found", "Model not found")
+	allowed, err := service.GatewayOfferingAllowed(c, offering)
+	if err != nil {
+		gatewayError(c, http.StatusServiceUnavailable, "authorization_unavailable", i18n.T(c, i18n.MsgGatewayAuthorizationUnavailable))
 		return
 	}
+	if !allowed {
+		gatewayError(c, http.StatusNotFound, "model_not_found", i18n.T(c, i18n.MsgGatewayModelNotFound))
+		return
+	}
+	runAuthorizedTextGateway(c)
+}
+
+func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.GatewayAttemptBudget, exclusions *service.GatewayExclusions) (result service.GatewayAttemptResult) {
+	offering := middleware.TextOffering(c)
+	userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
 	kind, pathName := middleware.TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
 	format, _ := service.GatewayProtocolFormat(kind)
 	native, err := helper.GetAndValidateRequest(c, format)
@@ -259,14 +290,6 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		request.Model = pathName
 	}
 	requestedName := request.Model
-	if c.GetBool("token_model_limit_enabled") {
-		limits, _ := c.Get("token_model_limit")
-		allowed, _ := limits.(map[string]bool)
-		if !allowed[requestedName] && !allowed[offering.Name] {
-			run.fail(c, http.StatusNotFound, "model_not_found", "Model not found")
-			return
-		}
-	}
 	started := c.GetTime(middleware.TextGatewayStartedAtKey)
 	if started.IsZero() {
 		started = clock.Now()

@@ -2,7 +2,8 @@
 # 中文（简体）翻译文件
 
 # Errors returned to AI clients
-gateway.model_not_found: "找不到模型"
+gateway.model_not_found: "模型不存在"
+gateway.authorization_unavailable: "暂时无法验证模型权限"
 gateway.invalid_text_request: "文本请求无效"
 gateway.cannot_convert_request: "无法转换此请求"
 gateway.unsupported_capabilities: "没有通道支持请求所需的能力"
