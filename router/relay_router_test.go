@@ -402,6 +402,660 @@ func TestGatewayBudgetManagementOptions(t *testing.T) {
 	assert.Equal(t, service.GatewayAttemptPolicy{MaxAttempts: 5, TotalFirstByte: 61 * time.Second, AttemptFirstByte: 12 * time.Second}, service.GatewayPolicy())
 }
 
+func TestTextGatewayModelFallbackKeepsOfferingPrice(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"code":"overloaded"},"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`))
+	})
+	lower := &model.Model{ModelName: "fallback-model", Status: 1, NameRule: model.NameRuleExact, Capabilities: capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}}
+	require.NoError(t, model.DB.Create(lower).Error)
+	fixture.offering.Members = append(fixture.offering.Members, model.ModelOfferingMember{ModelID: lower.Id, Tier: 3})
+	require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Model-Fallback", "provider-forged->provider-model")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Fallback answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	}))
+	t.Cleanup(server.Close)
+	provider := &model.Provider{Name: "Fallback Provider", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Key: "fallback-secret", BaseURL: &server.URL}
+	require.NoError(t, model.DB.Create(provider).Error)
+	fallback := &model.Channel{ProviderID: provider.Id, ModelID: lower.Id, Protocol: protocol.OpenAIChat, UpstreamModelName: "fallback-upstream", ParameterOverrides: `{}`, MappingConfirmed: true, Status: model.ChannelEnabled, Weight: 1}
+	require.NoError(t, model.DB.Create(fallback).Error)
+	purchase := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fallback.ID, Currency: "USD", Expression: `tier("base", p * 0.5 + c)`, EffectiveAt: clock.Now().Unix() - 1}
+	require.NoError(t, model.CreatePriceVersion(t.Context(), purchase, fixture.sale.CreatedBy))
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), "Fallback answer")
+	assert.Equal(t, "gpt-4o-mini->fallback-model", response.Result().Header.Get("X-Model-Fallback"))
+	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, "gateway-alias", record.RequestedName)
+	assert.Equal(t, fixture.sale.ID, record.SalePriceVersionID)
+	assert.Equal(t, int64(36000), record.Receivable.Nanos)
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, total)
+	for _, attempt := range attempts {
+		if attempt.ChannelID == fallback.ID {
+			assert.Equal(t, lower.Id, attempt.ModelID)
+			assert.Equal(t, 3, attempt.MemberTier)
+			assert.Equal(t, int64(10000), attempt.Cost.Nanos)
+		} else {
+			assert.Equal(t, 1, attempt.MemberTier)
+			assert.Equal(t, int64(7000), attempt.Cost.Nanos)
+		}
+	}
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, int64(999964000), wallet.Balance.Nanos)
+	entries, _, err := model.ListLedgerEntries(wallet.Id, 0, 20)
+	require.NoError(t, err)
+	assert.Len(t, entries, 4)
+	reconciliation, err := model.ReconcileWallets(100)
+	require.NoError(t, err)
+	assert.Empty(t, reconciliation.Mismatches)
+}
+
+func TestTextGatewayModelFallbackFourProtocol(t *testing.T) {
+	for _, client := range []struct{ name, path, body, field, terminal string }{
+		{"Chat", "/v1/" + "chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, "choices", "[DONE]"},
+		{"Responses", "/v1/responses", `{"model":"gateway-alias","input":"Hello","max_output_tokens":16}`, "output", "event: response.completed"},
+		{"Messages", "/v1/messages", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, "content", "message_stop"},
+		{"Gemini", "/v1beta/models/gateway-alias:generateContent", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16}}`, "candidates", "STOP"},
+	} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", client.name, stream), func(t *testing.T) {
+				var firstCalls, lowerCalls atomic.Int32
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					firstCalls.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_, _ = io.WriteString(w, `{"error":{"code":"overloaded"},"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`)
+				})
+				lower := addTextGatewayMember(t, fixture, 3, func(w http.ResponseWriter, r *http.Request) {
+					lowerCalls.Add(1)
+					w.Header().Set("X-Model-Fallback", "provider-forged->provider-model")
+					if stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = io.WriteString(w, "data: {\"id\":\"chat-fallback\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Fallback answer\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chat-fallback\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n")
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"id":"chat-fallback","object":"chat.completion","model":"fallback-upstream","choices":[{"index":0,"message":{"role":"assistant","content":"Fallback answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+				})
+				path, body := client.path, client.body
+				if stream {
+					if client.name == "Gemini" {
+						path = strings.Replace(path, ":generateContent", ":streamGenerateContent?alt=sse", 1)
+					} else {
+						body = strings.TrimSuffix(body, "}") + `,"stream":true}`
+					}
+				}
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, body)
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				assert.EqualValues(t, 1, firstCalls.Load())
+				assert.EqualValues(t, 1, lowerCalls.Load())
+				assert.Contains(t, response.Body.String(), "Fallback answer")
+				assert.Equal(t, fmt.Sprintf("gpt-4o-mini->fallback-%d", lower.ID), response.Result().Header.Get("X-Model-Fallback"))
+				if stream {
+					assert.Contains(t, response.Body.String(), client.terminal)
+				} else {
+					var payload map[string]any
+					require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+					assert.Contains(t, payload, client.field)
+				}
+				requests := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests", "")
+				require.True(t, requests.Success, requests.Message)
+				require.EqualValues(t, 1, requests.Data["total"])
+				record := requests.Data["items"].([]any)[0].(map[string]any)
+				assert.Equal(t, response.Header().Get(common.RequestIdKey), record["id"])
+				assert.Equal(t, "gateway-alias", record["requested_name"])
+				assert.Equal(t, map[string]any{"nanos": "36000", "currency": "USD"}, record["receivable"])
+				attempts := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests/"+record["id"].(string)+"/attempts", "")
+				require.True(t, attempts.Success, attempts.Message)
+				require.EqualValues(t, 2, attempts.Data["total"])
+				for _, item := range attempts.Data["items"].([]any) {
+					attempt := item.(map[string]any)
+					if attempt["channel_id"] == float64(lower.ID) {
+						assert.EqualValues(t, lower.ModelID, attempt["model_id"])
+						assert.EqualValues(t, 3, attempt["member_tier"])
+						assert.Equal(t, "success", attempt["status"])
+						assert.Equal(t, map[string]any{"nanos": "20000", "currency": "USD"}, attempt["cost"])
+					} else {
+						assert.EqualValues(t, fixture.channel.ID, attempt["channel_id"])
+						assert.EqualValues(t, fixture.channel.ModelID, attempt["model_id"])
+						assert.EqualValues(t, 1, attempt["member_tier"])
+						assert.Equal(t, map[string]any{"nanos": "7000", "currency": "USD"}, attempt["cost"])
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestTextGatewayModelFallbackDetailPermissions(t *testing.T) {
+	for _, client := range []struct{ name, path, keyHeader, idField string }{
+		{"OpenAI", "/v1/models/", "Authorization", "id"},
+		{"Anthropic", "/v1/models/", "x-api-key", "id"},
+		{"Gemini", "/v1beta/models/", "x-goog-api-key", "name"},
+	} {
+		t.Run(client.name, func(t *testing.T) {
+			var calls atomic.Int32
+			upstream := func(http.ResponseWriter, *http.Request) { calls.Add(1) }
+			fixture := newTextGatewayFixture(t, upstream)
+			lower := addTextGatewayMember(t, fixture, 3, upstream)
+			requestDetail := func(name string) *httptest.ResponseRecorder {
+				request := httptest.NewRequest(http.MethodGet, client.path+name, nil)
+				key := fixture.token.Key
+				if client.keyHeader == "Authorization" {
+					key = "Bearer " + key
+				}
+				request.Header.Set(client.keyHeader, key)
+				if client.name == "Anthropic" {
+					request.Header.Set("anthropic-version", "2023-06-01")
+				}
+				response := httptest.NewRecorder()
+				fixture.engine.ServeHTTP(response, request)
+				return response
+			}
+			for _, name := range []string{fixture.offering.Name, "gateway-alias"} {
+				response := requestDetail(name)
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				var payload map[string]common.RawMessage
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+				assert.JSONEq(t, `"gateway-offering"`, string(payload[client.idField]))
+				assert.JSONEq(t, fmt.Sprintf(`[{"model_id":%d,"tier":1},{"model_id":%d,"tier":3}]`, fixture.channel.ModelID, lower.ModelID), string(payload["members"]))
+			}
+			pat := createWalletTestAccessToken(t, fixture.user.Id, "api_key:read", "api_key:write")
+			policy := fmt.Sprintf("/api/token/%d/permissions", fixture.token.Id)
+			denied := adminSecurityRequest(fixture.engine, pat, http.MethodPatch, policy, `{"action":"deny_all","revision":0}`)
+			require.Equal(t, http.StatusOK, denied.Code, denied.Body.String())
+			missing := requestDetail("missing-offering")
+			require.Equal(t, http.StatusNotFound, missing.Code, missing.Body.String())
+			for _, name := range []string{fixture.offering.Name, "gateway-alias"} {
+				response := requestDetail(name)
+				assert.Equal(t, http.StatusNotFound, response.Code)
+				assert.JSONEq(t, missing.Body.String(), response.Body.String())
+				assert.NotContains(t, response.Body.String(), `"members"`)
+			}
+			assert.Zero(t, calls.Load(), "model details must not contact a Provider")
+		})
+	}
+}
+
+type gatewayDeadlineListener struct {
+	net.Listener
+	deadlines chan time.Time
+}
+
+func (l gatewayDeadlineListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return gatewayDeadlineConn{Conn: conn, deadlines: l.deadlines}, nil
+}
+
+type gatewayDeadlineConn struct {
+	net.Conn
+	deadlines chan time.Time
+}
+
+func (c gatewayDeadlineConn) SetWriteDeadline(deadline time.Time) error {
+	if !deadline.IsZero() {
+		select {
+		case c.deadlines <- deadline:
+		default:
+		}
+	}
+	return c.Conn.SetWriteDeadline(deadline)
+}
+
+func TestTextGatewayModelFallbackPreservesConnectionWriteDeadline(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	})
+	deadlines := make(chan time.Time, 1)
+	server := httptest.NewUnstartedServer(fixture.engine)
+	server.Listener = gatewayDeadlineListener{Listener: server.Listener, deadlines: deadlines}
+	server.Start()
+	t.Cleanup(server.Close)
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`))
+	require.NoError(t, err)
+	request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := server.Client().Do(request)
+	require.NoError(t, err)
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	assert.Equal(t, 200, response.StatusCode, string(body))
+	assert.Contains(t, string(body), "Hello")
+	select {
+	case <-deadlines:
+	default:
+		t.Error("gateway streaming writes must retain the real connection write deadline")
+	}
+}
+
+func TestTextGatewayModelFallbackAllowsLargeFirstBusinessFrames(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprint("stream=", stream), func(t *testing.T) {
+			content := strings.Repeat("a", (1<<20)+1)
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(503)
+				_, _ = io.WriteString(w, `{"error":{"code":"overloaded"}}`)
+			})
+			fallback := addTextGatewayMember(t, fixture, 2, func(w http.ResponseWriter, r *http.Request) {
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n", content)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"content":%q},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, content)
+			})
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", fmt.Sprintf(`{"model":"gateway-alias","stream":%t,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, stream))
+			require.Equal(t, 200, response.Code)
+			assert.True(t, strings.Contains(response.Body.String(), content), "the complete first business frame must be delivered")
+			assert.NotEmpty(t, response.Result().Header.Get("X-Model-Fallback"))
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(36000), record.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 2, total)
+			for _, attempt := range attempts {
+				if attempt.ChannelID == fallback.ID {
+					assert.Equal(t, "success", attempt.Status)
+					assert.Equal(t, int64(20000), attempt.Cost.Nanos)
+				}
+			}
+		})
+	}
+}
+
+func TestTextGatewayModelFallbackStreamHeaderDescribesDeliveredModel(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"error\":{\"code\":\"overloaded\"}}\n\n"))
+	})
+	fallback := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+	})
+	lower := &model.Model{ModelName: "stream-fallback", Status: 1, NameRule: model.NameRuleExact, Capabilities: capability.Set{Features: []capability.Feature{capability.Streaming}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}}
+	require.NoError(t, model.DB.Create(lower).Error)
+	require.NoError(t, model.DB.Model(fallback).Update("model_id", lower.Id).Error)
+	fixture.offering.Members = append(fixture.offering.Members, model.ModelOfferingMember{ModelID: lower.Id, Tier: 2})
+	require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), "Recovered")
+	assert.Equal(t, "gpt-4o-mini->stream-fallback", response.Result().Header.Get("X-Model-Fallback"))
+	assert.Equal(t, 1, strings.Count(response.Body.String(), "[DONE]"))
+}
+
+// addTextGatewayMember extends the existing Offering declaration and transport
+// fixture without replacing the real HTTP, permission or accounting boundaries.
+func addTextGatewayMember(t *testing.T, fixture textGatewayFixture, tier int, upstream http.HandlerFunc) *model.Channel {
+	t.Helper()
+	channel := addTextGatewayChannel(t, fixture, upstream)
+	var source model.Model
+	require.NoError(t, model.DB.First(&source, fixture.channel.ModelID).Error)
+	member := &model.Model{ModelName: fmt.Sprintf("fallback-%d", channel.ID), Status: 1, NameRule: model.NameRuleExact, Capabilities: source.Capabilities}
+	require.NoError(t, model.DB.Create(member).Error)
+	require.NoError(t, model.DB.Model(channel).Update("model_id", member.Id).Error)
+	fixture.offering.Members = append(fixture.offering.Members, model.ModelOfferingMember{ModelID: member.Id, Tier: tier})
+	require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+	return channel
+}
+
+func TestTextGatewayModelFallbackPreservesLayerAndRequestBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		firstStatus    int
+		firstBody      string
+		stream, cancel bool
+		wantLower      bool
+	}{
+		{"unavailable", 503, `{"error":{"code":"overloaded"}}`, false, false, true},
+		{"invalid request", 400, `{"error":{"code":"invalid_request_error"}}`, false, false, false},
+		{"business delivered", 200, "data: {\"choices\":[{\"delta\":{\"content\":\"First model\"}}]}\n\ndata: {\"error\":{\"code\":\"overloaded\"}}\n\n", true, false, false},
+		{"client cancelled", 503, `{"error":{"code":"overloaded"}}`, false, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				if tc.cancel {
+					cancel()
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if tc.stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+				}
+				w.WriteHeader(tc.firstStatus)
+				_, _ = io.WriteString(w, tc.firstBody)
+			})
+			lowerCalls := 0
+			addTextGatewayMember(t, fixture, 3, func(w http.ResponseWriter, r *http.Request) {
+				lowerCalls++
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Lower model"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+			})
+			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(fmt.Sprintf(`{"model":"gateway-alias","stream":%t,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, tc.stream))).WithContext(ctx)
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			fixture.engine.ServeHTTP(response, request)
+			if tc.wantLower {
+				assert.Equal(t, 1, lowerCalls)
+				assert.Equal(t, 200, response.Code, response.Body.String())
+			} else {
+				assert.Zero(t, lowerCalls)
+				assert.NotContains(t, response.Body.String(), "Lower model")
+				assert.Empty(t, response.Result().Header.Get("X-Model-Fallback"))
+			}
+		})
+	}
+}
+
+func TestTextGatewayModelFallbackBeforeBusinessKeepsFinalHTTPStatus(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"error\":{\"code\":\"overloaded\"},\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n")
+	})
+	fallback := addTextGatewayMember(t, fixture, 2, func(w http.ResponseWriter, r *http.Request) { t.Error("incapable lower member must not be dispatched") })
+	caps := capability.Set{Features: []capability.Feature{capability.Streaming}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{MaxOutputTokens: common.GetPointer(int64(1))}}
+	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fallback.ModelID).Update("capabilities", caps).Error)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	assert.Equal(t, 400, response.Code, response.Body.String())
+	assert.Contains(t, response.Result().Header.Get("Content-Type"), "application/json")
+	assert.Contains(t, response.Body.String(), `"code":"unsupported_parameter"`)
+	assert.NotContains(t, response.Body.String(), `"role":"assistant"`)
+	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+	require.NoError(t, err)
+	assert.Zero(t, record.Receivable.Nanos)
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, int64(7000), attempts[0].Cost.Nanos)
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1_000_000_000), wallet.Balance.Nanos)
+}
+
+func TestTextGatewayModelFallbackFinalFilterDeterminesStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		upperOverride string
+		lowerDisabled bool
+		wantStatus    int
+	}{
+		{"lower unavailable overrides upper preparation mismatch", `{"max_tokens":5000000000}`, true, 503},
+		{"lower capability mismatch", `{}`, false, 400},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			handler := func(w http.ResponseWriter, r *http.Request) { calls++ }
+			fixture := newTextGatewayFixture(t, handler)
+			fallback := addTextGatewayMember(t, fixture, 3, handler)
+			if tc.lowerDisabled {
+				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", tc.upperOverride).Error)
+				require.NoError(t, model.DB.Model(fallback).Update("status", model.ChannelDisabled).Error)
+			} else {
+				require.NoError(t, model.DB.Model(fixture.channel).Update("status", model.ChannelDisabled).Error)
+				caps := capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{MaxOutputTokens: common.GetPointer(int64(1))}}
+				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fallback.ModelID).Update("capabilities", caps).Error)
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			assert.Equal(t, tc.wantStatus, response.Code, response.Body.String())
+			assert.Zero(t, calls)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1_000_000_000), wallet.Balance.Nanos)
+		})
+	}
+}
+
+func TestTextGatewayModelFallbackExhaustsAllSameTierMembersFirst(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		_, _ = io.WriteString(w, `{"error":{"code":"overloaded"}}`)
+	})
+	lowerCalls := 0
+	addTextGatewayMember(t, fixture, 2, func(w http.ResponseWriter, r *http.Request) { lowerCalls++ })
+	sibling := addTextGatewayMember(t, fixture, 1, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Same tier answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+	})
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), "Same tier answer")
+	assert.Zero(t, lowerCalls)
+	assert.Empty(t, response.Result().Header.Get("X-Model-Fallback"))
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, total)
+	for _, attempt := range attempts {
+		assert.Equal(t, 1, attempt.MemberTier)
+		if attempt.Status == "success" {
+			assert.Equal(t, sibling.ModelID, attempt.ModelID)
+		}
+	}
+}
+
+func TestTextGatewayModelFallbackCapabilityExclusionsDoNotSpendAttempt(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("an incapable Model must not be called") })
+	fallback := addTextGatewayMember(t, fixture, 3, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Lower model"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+	})
+	common.OptionMapRWMutex.Lock()
+	common.OptionMap["GatewayMaxAttempts"] = "1"
+	common.OptionMapRWMutex.Unlock()
+	caps := capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{MaxOutputTokens: common.GetPointer(int64(1))}}
+	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, fallback.ModelID, attempts[0].ModelID)
+	assert.Equal(t, 3, attempts[0].MemberTier)
+	assert.NotEmpty(t, response.Result().Header.Get("X-Model-Fallback"))
+}
+
+func TestTextGatewayModelFallbackKeepsProviderExclusionsAndScope(t *testing.T) {
+	for _, scoped := range []bool{false, true} {
+		t.Run(fmt.Sprint("exclude lower provider=", scoped), func(t *testing.T) {
+			calls := 0
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(401)
+				_, _ = io.WriteString(w, `{"error":{"code":"invalid_api_key"}}`)
+			})
+			sameAccount := addTextGatewayMember(t, fixture, 2, func(w http.ResponseWriter, r *http.Request) {
+				t.Error("the failed Provider must remain excluded across tiers")
+			})
+			require.NoError(t, model.DB.Model(sameAccount).Update("provider_id", fixture.channel.ProviderID).Error)
+			lowerCalls := 0
+			fallback := addTextGatewayMember(t, fixture, 3, func(w http.ResponseWriter, r *http.Request) {
+				lowerCalls++
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+			})
+			if scoped {
+				fixture.offering.ChannelScope.ExcludeProviderIDs = []int{fallback.ProviderID}
+				require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			assert.Equal(t, 1, calls)
+			if scoped {
+				assert.Equal(t, 503, response.Code, response.Body.String())
+				assert.Zero(t, lowerCalls)
+			} else {
+				assert.Equal(t, 200, response.Code, response.Body.String())
+				assert.Equal(t, 1, lowerCalls)
+			}
+		})
+	}
+}
+
+func TestTextGatewayModelFallbackFreezesSaleOnceAndPurchasePerAttempt(t *testing.T) {
+	var fixture textGatewayFixture
+	var fallback *model.Channel
+	var changedPurchase *model.PriceVersion
+	fixture = newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		fixture.fake.Advance(2 * time.Second)
+		changedSale := &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("base", p * 100 + c * 100)`, EffectiveAt: clock.Now().Unix()}
+		require.NoError(t, model.CreatePriceVersion(t.Context(), changedSale, fixture.sale.CreatedBy))
+		changedPurchase = &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fallback.ID, Currency: "JPY", Expression: `tier("base", p + c * 2)`, EffectiveAt: clock.Now().Unix()}
+		require.NoError(t, model.CreatePriceVersion(t.Context(), changedPurchase, fixture.sale.CreatedBy))
+		_, err := model.SaveFXRate(t.Context(), "JPY", "USD", "0.2", "0.02", fixture.sale.CreatedBy)
+		require.NoError(t, err)
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap["GroupRatio"] = `{"default":0.1}`
+		common.OptionMapRWMutex.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		_, _ = io.WriteString(w, `{"error":{"code":"overloaded"},"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`)
+	})
+	fallback = addTextGatewayMember(t, fixture, 2, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+	})
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, fixture.sale.ID, record.SalePriceVersionID)
+	assert.Equal(t, "0.9", record.GroupRatio)
+	assert.Equal(t, int64(36000), record.Receivable.Nanos)
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, total)
+	for _, attempt := range attempts {
+		if attempt.ChannelID == fallback.ID {
+			assert.Equal(t, changedPurchase.ID, attempt.PurchasePriceVersionID)
+			assert.Equal(t, "0.2", attempt.AccountingFXRate)
+			assert.Equal(t, money.Amount{Nanos: 20000, Currency: "JPY"}, attempt.Cost)
+			assert.Equal(t, money.Amount{Nanos: 4000, Currency: "USD"}, attempt.ConvertedCost)
+		} else {
+			assert.Equal(t, fixture.purchase.ID, attempt.PurchasePriceVersionID)
+			assert.Equal(t, money.Amount{Nanos: 7000, Currency: "USD"}, attempt.Cost)
+		}
+	}
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, int64(999964000), wallet.Balance.Nanos)
+}
+
+func TestTextGatewayModelFallbackNeverReturnsToExhaustedTier(t *testing.T) {
+	var upperCalls int
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		upperCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Exhausted upper tier"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+	})
+	require.NoError(t, model.DB.Model(fixture.channel).Update("status", model.ChannelDisabled).Error)
+	middle := addTextGatewayMember(t, fixture, 3, func(w http.ResponseWriter, r *http.Request) {
+		// The management state changes after Route has exhausted the upper tier.
+		if err := model.DB.Model(fixture.channel).Update("status", model.ChannelEnabled).Error; !assert.NoError(t, err) {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"error":{"code":"overloaded"},"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`)
+	})
+	lower := addTextGatewayMember(t, fixture, 5, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Lower tier answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+	})
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Zero(t, upperCalls, "an exhausted tier stays exhausted for this request")
+	assert.Contains(t, response.Body.String(), "Lower tier answer")
+	assert.Equal(t, "gpt-4o-mini->"+fmt.Sprintf("fallback-%d", lower.ID), response.Result().Header.Get("X-Model-Fallback"))
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, total)
+	for _, attempt := range attempts {
+		if attempt.ChannelID == middle.ID {
+			assert.Equal(t, 3, attempt.MemberTier)
+			assert.EqualValues(t, 7000, attempt.Cost.Nanos)
+		} else {
+			assert.Equal(t, lower.ID, attempt.ChannelID)
+			assert.Equal(t, 5, attempt.MemberTier)
+			assert.EqualValues(t, 20000, attempt.Cost.Nanos)
+		}
+	}
+	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+	require.NoError(t, err)
+	assert.EqualValues(t, 36000, record.Receivable.Nanos)
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.EqualValues(t, 999964000, wallet.Balance.Nanos)
+}
+
+func TestTextGatewayModelFallbackSharesLimitsAcrossTiers(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		budget     string
+		limit      string
+		wantSends  int
+		wantReason string
+	}{
+		{"attempt count", "90", "2", 2, "attempt_limit"},
+		{"total first byte", "60", "5", 2, "first_byte_budget"},
+		{"five seconds remain", "61", "5", 3, "first_byte_budget"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var fake *clock.Fake
+			sends := 0
+			failed := func(w http.ResponseWriter, r *http.Request) {
+				sends++
+				fake.Advance(28 * time.Second)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(503)
+				_, _ = io.WriteString(w, `{"error":{"code":"overloaded"},"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`)
+			}
+			fixture := newTextGatewayFixture(t, failed)
+			fake = fixture.fake
+			common.OptionMapRWMutex.Lock()
+			common.OptionMap["GatewayMaxAttempts"] = tc.limit
+			common.OptionMap["GatewayTotalFirstByteSeconds"] = tc.budget
+			common.OptionMapRWMutex.Unlock()
+			for _, tier := range []int{3, 7, 9} {
+				addTextGatewayMember(t, fixture, tier, failed)
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			assert.Equal(t, tc.wantSends, sends)
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Zero(t, record.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, tc.wantSends, total)
+			for _, attempt := range attempts {
+				if attempt.MemberTier == []int{1, 3, 7}[tc.wantSends-1] {
+					assert.Equal(t, tc.wantReason, attempt.FailoverReason)
+				}
+			}
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1_000_000_000), wallet.Balance.Nanos)
+		})
+	}
+}
+
 func TestTextGatewayFailoverCompletesWhileDisableNoticeIsPending(t *testing.T) {
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -6012,32 +6666,76 @@ func TestTextGatewayDefaultOutputLimitFitsRemainingContext(t *testing.T) {
 		{"Responses converted limit", "max_output_tokens", "max_output_tokens", `{"id":"bounded","object":"response","status":"completed","output":[{"type":"message","id":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"OK","annotations":[]}]}],"usage":{"input_tokens":9,"output_tokens":1,"total_tokens":10}}`, protocol.OpenAIResponses},
 		{"Gemini converted limit", "maxOutputTokens", "generationConfig.maxOutputTokens", `{"candidates":[{"content":{"parts":[{"text":"OK"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":1,"totalTokenCount":10}}`, protocol.GeminiGenerate},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			var sent map[string]any
-			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
-				require.NoError(t, common.DecodeJson(r.Body, &sent))
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.WriteString(w, test.response)
+		for _, counters := range []string{"reported", "explicit zero", "missing"} {
+			t.Run(test.name+"/"+counters, func(t *testing.T) {
+				body := []byte(test.response)
+				if counters != "reported" {
+					var response map[string]any
+					require.NoError(t, common.Unmarshal(body, &response))
+					usageKey, promptKey, completionKey := "usage", "input_tokens", "output_tokens"
+					if test.upstream == protocol.GeminiGenerate {
+						usageKey, promptKey, completionKey = "usageMetadata", "promptTokenCount", "candidatesTokenCount"
+					}
+					if counters == "missing" {
+						delete(response, usageKey)
+					} else {
+						response[usageKey] = map[string]any{promptKey: 0, completionKey: 0}
+					}
+					var err error
+					body, err = common.Marshal(response)
+					require.NoError(t, err)
+				}
+				var sent map[string]any
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					if err := common.DecodeJson(r.Body, &sent); !assert.NoError(t, err) {
+						w.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write(body)
+				})
+				caps := capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{MaxOutputTokens: common.GetPointer(int64(16))}}
+				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", test.upstream).Error)
+				price := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: fmt.Sprintf(`param(%q) == 16 ? tier("bounded",fixed(0.000001)) : tier("unbounded",fixed(0.000002))`, test.path), EffectiveAt: clock.Now().Unix()}
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}]}`)
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				wire := sent
+				if test.upstream == protocol.GeminiGenerate {
+					config, ok := sent["generationConfig"].(map[string]any)
+					require.True(t, ok)
+					wire = config
+				}
+				assert.EqualValues(t, 16, wire[test.field], "the actual upstream body must carry the validated limit")
+				attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, total)
+				assert.Equal(t, "0.000001 USD", attempts[0].RouteDiagnostics["estimated_cost"], "procurement probes must use the same bounded wire body")
+				assert.Contains(t, response.Body.String(), "OK")
+				assert.Equal(t, "success", attempts[0].Status)
+				assert.EqualValues(t, 1000, attempts[0].Cost.Nanos)
+				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+				require.NoError(t, err)
+				if counters == "missing" {
+					assert.Equal(t, "estimated", record.UsageSource)
+					assert.Equal(t, "estimated", attempts[0].UsageSource)
+				} else {
+					assert.Equal(t, "upstream", record.UsageSource)
+					assert.Equal(t, "upstream", attempts[0].UsageSource)
+				}
+				if counters == "explicit zero" {
+					assert.Zero(t, record.Usage.PromptTokens)
+					assert.Zero(t, record.Usage.CompletionTokens)
+					assert.Zero(t, record.Receivable.Nanos)
+				} else {
+					assert.EqualValues(t, 9, record.Usage.PromptTokens)
+					assert.EqualValues(t, 1, record.Usage.CompletionTokens)
+					assert.EqualValues(t, 19800, record.Receivable.Nanos)
+				}
+				assertTextGatewayLedger(t, *record, 1000)
 			})
-			caps := capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{MaxOutputTokens: common.GetPointer(int64(16))}}
-			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
-			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", test.upstream).Error)
-			price := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: fmt.Sprintf(`param(%q) == 16 ? tier("bounded",fixed(0.000001)) : tier("unbounded",fixed(0.000002))`, test.path), EffectiveAt: clock.Now().Unix()}
-			require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
-			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}]}`)
-			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
-			wire := sent
-			if test.upstream == protocol.GeminiGenerate {
-				config, ok := sent["generationConfig"].(map[string]any)
-				require.True(t, ok)
-				wire = config
-			}
-			assert.EqualValues(t, 16, wire[test.field], "the actual upstream body must carry the validated limit")
-			attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
-			require.NoError(t, err)
-			require.EqualValues(t, 1, total)
-			assert.Equal(t, "0.000001 USD", attempts[0].RouteDiagnostics["estimated_cost"], "procurement probes must use the same bounded wire body")
-		})
+		}
 	}
 }
 
@@ -11106,6 +11804,8 @@ func TestTextGatewayNoOutputFailureReleasesReservation(t *testing.T) {
 	})
 	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
 	require.Equal(t, http.StatusBadGateway, response.Code, response.Body.String())
+	assert.Contains(t, response.Result().Header.Get("Content-Type"), "application/json")
+	assert.Contains(t, response.Body.String(), `"code":"upstream_error"`)
 	assert.NotContains(t, response.Body.String(), "[DONE]")
 	requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
 	require.NoError(t, err)
@@ -11266,6 +11966,62 @@ func (w cancelOnOutputWriter) WriteString(body string) (int, error) {
 		w.cancel()
 	}
 	return n, err
+}
+
+type gatewayCancelAfterReadBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (body gatewayCancelAfterReadBody) Read(data []byte) (int, error) {
+	n, err := body.ReadCloser.Read(data)
+	if errors.Is(err, io.EOF) {
+		body.cancel()
+	}
+	return n, err
+}
+
+func TestTextGatewayClaudeCancellationBeforeDeliveryKeepsReportedCost(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"cancelled","type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":1000,"output_tokens":100,"cache_read_input_tokens":2000}}`)
+	})
+	require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", protocol.AnthropicMessages).Error)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	client := service.GetHttpClient()
+	original := client.Transport
+	if original == nil {
+		original = http.DefaultTransport
+	}
+	client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
+		response, err := original.RoundTrip(request)
+		if err == nil {
+			response.Body = gatewayCancelAfterReadBody{ReadCloser: response.Body, cancel: cancel}
+		}
+		return response, err
+	})
+	t.Cleanup(func() { client.Transport = original })
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)).WithContext(ctx)
+	request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	fixture.engine.ServeHTTP(response, request)
+	assert.ErrorIs(t, ctx.Err(), context.Canceled)
+	assert.NotContains(t, response.Body.String(), "Hello")
+	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, "cancelled", record.Status)
+	assert.Zero(t, record.Receivable.Nanos)
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, "upstream", attempts[0].UsageSource)
+	assert.EqualValues(t, 1000, attempts[0].Usage.PromptTokens)
+	assert.EqualValues(t, 100, attempts[0].Usage.CompletionTokens)
+	assert.EqualValues(t, 2000, attempts[0].Usage.CachedTokens)
+	assert.EqualValues(t, 3200000, attempts[0].Cost.Nanos)
+	assertTextGatewayLedger(t, *record, 3200000)
 }
 
 func TestTextGatewayCancellationReleasesOrChargesReportedUsage(t *testing.T) {
@@ -12131,6 +12887,7 @@ func TestTextGatewayMetadataPrefixIsNotDeliveredBusinessOutput(t *testing.T) {
 	for _, test := range []struct {
 		name     string
 		provider int
+		upstream protocol.Type
 		body     string
 		stream   bool
 		nilError bool
@@ -12139,6 +12896,9 @@ func TestTextGatewayMetadataPrefixIsNotDeliveredBusinessOutput(t *testing.T) {
 		{name: "OpenAI", provider: constant.ChannelTypeOpenAI, body: `{"id":"chat-test","object":"chat.completion","model":"upstream-model","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`},
 		{name: "Ollama", provider: constant.ChannelTypeOllama, body: `{"model":"upstream-model","message":{"role":"assistant","content":"Hello"},"done":true,"prompt_eval_count":10,"eval_count":5}`},
 		{name: "Dify", provider: constant.ChannelTypeDify, body: `{"answer":"Hello","conversation_id":"chat-test","metadata":{"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}}`},
+		{name: "Converted Claude", provider: constant.ChannelTypeOpenAI, upstream: protocol.AnthropicMessages, body: `{"id":"converted","type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`},
+		{name: "Converted Responses", provider: constant.ChannelTypeOpenAI, upstream: protocol.OpenAIResponses, body: `{"id":"converted","object":"response","status":"completed","output":[{"type":"message","id":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hello","annotations":[]}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}`},
+		{name: "Converted Gemini", provider: constant.ChannelTypeOpenAI, upstream: protocol.GeminiGenerate, body: `{"candidates":[{"content":{"parts":[{"text":"Hello"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}`},
 		{name: "Dify short write without error", provider: constant.ChannelTypeDify, nilError: true, body: `{"answer":"Hello","conversation_id":"chat-test","metadata":{"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}}`},
 		{name: "Cohere", provider: constant.ChannelTypeCohere, body: `{"text":"Hello","meta":{"billed_units":{"input_tokens":10,"output_tokens":5}}}`},
 		{name: "Dify stream", provider: constant.ChannelTypeDify, stream: true, body: "data: {\"event\":\"message\",\"answer\":\"Hello\",\"metadata\":{\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}}\n\n"},
@@ -12157,9 +12917,12 @@ func TestTextGatewayMetadataPrefixIsNotDeliveredBusinessOutput(t *testing.T) {
 				fixture.offering.AcceptedConversionLosses = []string{"request_parameter_dropped"}
 				require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
 			}
-			addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+			backup := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
 				t.Error("downstream write failures must not dispatch another Provider")
 			})
+			if test.upstream != "" {
+				require.NoError(t, model.DB.Model(&model.Channel{}).Where("id IN ?", []int{fixture.channel.ID, backup.ID}).Update("protocol", test.upstream).Error)
+			}
 			fixture.offering.RouteMethod = "weight"
 			require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
 			recorder := httptest.NewRecorder()

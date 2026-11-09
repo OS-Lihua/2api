@@ -120,6 +120,8 @@ func gatewayError(c *gin.Context, status int, code, message string) {
 }
 
 type textGatewayRun struct {
+	firstModel           string
+	firstTier            int
 	record               *model.GatewayRequest
 	sale                 *model.PriceVersion
 	saleFX               *money.Rate
@@ -178,9 +180,10 @@ func runAuthorizedTextGateway(c *gin.Context) {
 	parent := c.Request
 	attempts := service.RunGatewayAttempts(parent.Context(), service.GatewayPolicy(), func(budget *service.GatewayAttemptBudget, exclusions *service.GatewayExclusions) service.GatewayAttemptResult {
 		previousStatus, previousCode, previousMessage := run.status, run.code, run.message
+		previousTier := exclusions.MemberTier
 		run.status, run.code, run.message = 0, "", ""
 		result := runTextGatewayAttempt(c, run, budget, exclusions)
-		if result.Attempt == nil && result.SkippedChannel == 0 && run.code == "channel_unavailable" && previousCode != "" {
+		if result.Attempt == nil && result.SkippedChannel == 0 && run.code == "channel_unavailable" && previousCode != "" && exclusions.MemberTier == previousTier {
 			run.status, run.code, run.message = previousStatus, previousCode, previousMessage
 		}
 		return result
@@ -312,6 +315,20 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			return
 		}
 		run.sale, run.saleFX, run.saleRate, run.ratio = sale, saleFX, saleRate, ratio
+	}
+	if run.firstModel == "" {
+		var first model.ModelOfferingMember
+		for _, member := range offering.Members {
+			if first.ModelID == 0 || member.Tier < first.Tier || member.Tier == first.Tier && member.ModelID < first.ModelID {
+				first = member
+			}
+		}
+		var unified model.Model
+		if first.ModelID == 0 || model.DB.WithContext(c.Request.Context()).First(&unified, first.ModelID).Error != nil {
+			run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
+			return
+		}
+		run.firstModel, run.firstTier = unified.ModelName, first.Tier
 	}
 	selection, preparedChat, err := gatewayChatRoute(c, run, offering, request, native, kind, started, exclusions)
 	if err != nil {
@@ -821,9 +838,26 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		run.fail(c, status, "upstream_error", "Upstream request failed")
 		return
 	}
+	originalWriter := c.Writer
+	originalHeaders := originalWriter.Header().Clone()
+	defer func() {
+		c.Writer = originalWriter
+		delete(c.Keys, "event_stream_headers_set")
+		if !info.ResponseFacts.BusinessOutput && !originalWriter.Written() {
+			clear(originalWriter.Header())
+			for key, values := range originalHeaders {
+				originalWriter.Header()[key] = values
+			}
+		}
+	}()
 	info.IsStream = info.IsStream || strings.HasPrefix(httpResponse.Header.Get("Content-Type"), "text/event-stream")
 	if info.IsStream {
 		httpResponse.Body = helper.GatewayStreamIdleBody(httpResponse.Body, info)
+	}
+	if selection.Tier > run.firstTier {
+		c.Header("X-Model-Fallback", run.firstModel+"->"+selection.Channel.Model.ModelName)
+	} else {
+		c.Writer.Header().Del("X-Model-Fallback")
 	}
 	responseUsage, responseErr := adaptor.DoResponse(c, httpResponse, info)
 	usage, _ = responseUsage.(*dto.Usage)
