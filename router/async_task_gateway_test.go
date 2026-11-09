@@ -2540,6 +2540,74 @@ func TestAsyncTaskRejectedAttemptsPreserveErrorsAndUnknownCosts(t *testing.T) {
 	}
 }
 
+func TestAsyncTaskPollingHonorsCallerCancellation(t *testing.T) {
+	for _, hook := range []bool{false, true} {
+		t.Run(fmt.Sprintf("parse_hook=%t", hook), func(t *testing.T) {
+			started, stopped, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			var releaseOnce sync.Once
+			defer releaseOnce.Do(func() { close(release) })
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method == http.MethodPost {
+					_, _ = io.WriteString(w, `{"id":"cancel-poll-job","status":"queued"}`)
+					return
+				}
+				if !hook || r.URL.Path == "/parse-hold" {
+					w.WriteHeader(http.StatusOK)
+					w.(http.Flusher).Flush()
+					close(started)
+					select {
+					case <-r.Context().Done():
+					case <-release:
+					}
+					close(stopped)
+				}
+				_, _ = io.WriteString(w, `{"id":"cancel-poll-job","status":"completed","seconds":"2"}`)
+			})
+			if hook {
+				source, err := plugins.Source("sora")
+				require.NoError(t, err)
+				anchor := "export function parseTaskResult(ctx, body) {"
+				require.Contains(t, source, anchor)
+				source = strings.Replace(source, anchor, anchor+` utils.fetch({url:ctx.baseUrl+"/parse-hold",method:"GET"});`, 1)
+				jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+				_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "sora"})
+				require.NoError(t, err)
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			var task model.Task
+			require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- service.UpdateGatewayTask(ctx, &task) }()
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				require.FailNow(t, "poll did not reach the controlled Provider read")
+			}
+			cancel()
+			select {
+			case err := <-done:
+				assert.ErrorIs(t, err, context.Canceled)
+			case <-time.After(time.Second):
+				assert.Fail(t, "caller cancellation did not stop in-flight task polling")
+				releaseOnce.Do(func() { close(release) })
+				<-done
+			}
+			select {
+			case <-stopped:
+			case <-time.After(time.Second):
+				assert.Fail(t, "caller cancellation did not reach the Provider connection")
+			}
+			require.NoError(t, model.DB.First(&task, task.ID).Error)
+			assert.True(t, task.PrivateData.Gateway.Accepted)
+			assert.Zero(t, task.PrivateData.PollFailures)
+		})
+	}
+}
+
 func TestAsyncTaskModelFallbackFinalTierDeterminesStatus(t *testing.T) {
 	for _, test := range []struct {
 		name, code   string

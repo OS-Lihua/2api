@@ -34,6 +34,11 @@ type TaskPollingAdaptor interface {
 	AdjustBillingOnComplete(task *model.Task, taskResult *relaycommon.TaskInfo) int
 }
 
+type contextTaskPollingAdaptor interface {
+	FetchTaskWithContext(context.Context, string, string, *model.Task, string) (*http.Response, error)
+	ParseTaskResultWithContext(context.Context, *model.Task, *http.Response, []byte) (*relaycommon.TaskInfo, error)
+}
+
 type BatchTaskPollingAdaptor interface {
 	TaskPollingAdaptor
 	FetchMode() string
@@ -543,12 +548,25 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		key = privateData.Key
 	}
 	snap := task.Snapshot()
-	resp, err := adaptor.FetchTask(baseURL, key, task, proxy)
+	contextual, hasContext := adaptor.(contextTaskPollingAdaptor)
+	var resp *http.Response
+	var err error
+	if hasContext {
+		resp, err = contextual.FetchTaskWithContext(ctx, baseURL, key, task, proxy)
+	} else {
+		resp, err = adaptor.FetchTask(baseURL, key, task, proxy)
+	}
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassTransport, 0, err.Error())
 	}
 	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(resp.Body)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err != nil {
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassTransport, resp.StatusCode, err.Error())
 	}
@@ -578,8 +596,18 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		taskResult.Progress = t.Progress
 		taskResult.Reason = t.FailReason
 		task.Data = t.Data
-	} else if taskResult, err = adaptor.ParseTaskResult(task, resp, responseBody); err != nil {
-		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, err.Error())
+	} else {
+		if hasContext {
+			taskResult, err = contextual.ParseTaskResultWithContext(ctx, task, resp, responseBody)
+		} else {
+			taskResult, err = adaptor.ParseTaskResult(task, resp, responseBody)
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil {
+			return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, err.Error())
+		}
 	}
 
 	logger.LogDebug(ctx, "updateVideoSingleTask taskResult: %+v", taskResult)
