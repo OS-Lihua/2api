@@ -147,6 +147,9 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 				previousAttempts = append(previousAttempts, *result.Attempt)
 			}
 		}()
+		previousStatus, previousCode := lastStatus, lastCode
+		previousTier := exclusions.MemberTier
+		lastStatus, lastCode = http.StatusServiceUnavailable, "channel_unavailable"
 		prepared := map[int]*gatewayPreparedTask{}
 		selection, err := service.SelectGatewayRoute(c, offering, service.GatewayRouteInput{PinnedChannelID: pinnedChannelID, PinnedProviderID: pinnedProviderID, Sale: sale, SaleFX: saleFX, Ratio: ratio, StartedAt: started, Failures: exclusions,
 			Prepare: func(selection *service.GatewaySelection) (*service.GatewayRouteFacts, error) {
@@ -170,6 +173,9 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 				return &candidate.RouteFacts, nil
 			}})
 		if err != nil {
+			if errors.Is(err, service.ErrGatewayUnavailable) && exclusions.MemberTier == previousTier {
+				lastStatus, lastCode = previousStatus, previousCode
+			}
 			if errors.Is(err, service.ErrGatewayCapability) || errors.Is(err, service.ErrGatewayConversion) {
 				lastStatus, lastCode = 400, "unsupported_parameter"
 			}

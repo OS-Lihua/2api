@@ -2540,6 +2540,59 @@ func TestAsyncTaskRejectedAttemptsPreserveErrorsAndUnknownCosts(t *testing.T) {
 	}
 }
 
+func TestAsyncTaskModelFallbackFinalTierDeterminesStatus(t *testing.T) {
+	for _, test := range []struct {
+		name, code   string
+		tier, status int
+		disabled     bool
+	}{
+		{name: "same tier retains upstream rejection", tier: 1, disabled: true, status: http.StatusUnauthorized, code: "upstream_error"},
+		{name: "later tier unavailable", tier: 2, disabled: true, status: http.StatusServiceUnavailable, code: "channel_unavailable"},
+		{name: "later tier capability mismatch", tier: 2, status: http.StatusBadRequest, code: "unsupported_parameter"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls, lowerCalls atomic.Int32
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = io.WriteString(w, `{"error":{"code":"invalid_api_key","message":"private-provider-error-secret"}}`)
+			})
+			fixture.fake.Advance(time.Second)
+			lower := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) { lowerCalls.Add(1) })
+			var source model.Model
+			require.NoError(t, model.DB.First(&source, fixture.channel.ModelID).Error)
+			member := &model.Model{ModelName: fmt.Sprintf("fallback-%d", lower.ID), Status: 1, NameRule: model.NameRuleExact, Capabilities: source.Capabilities}
+			require.NoError(t, model.DB.Create(member).Error)
+			require.NoError(t, model.DB.Model(lower).Updates(map[string]any{"protocol": "task:sora", "upstream_model_name": "sora-2-pro", "model_id": member.Id}).Error)
+			require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: lower.ID, Currency: "USD", Expression: `tier("video", u("seconds") * 0.05)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+			fixture.offering.Members = append(fixture.offering.Members, model.ModelOfferingMember{ModelID: member.Id, Tier: test.tier})
+			require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+			if test.disabled {
+				require.NoError(t, model.DB.Model(lower).Update("status", model.ChannelDisabled).Error)
+			} else {
+				caps := capability.Set{InputModalities: []capability.Modality{capability.Image}, OutputModalities: []capability.Modality{capability.Video}}
+				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", lower.ModelID).Update("capabilities", caps).Error)
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+			assert.Equal(t, test.status, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), `"code":"`+test.code+`"`)
+			assert.NotContains(t, response.Body.String(), "private-provider-error-secret")
+			assert.EqualValues(t, 1, calls.Load())
+			assert.Zero(t, lowerCalls.Load())
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, fixture.channel.ID, attempts[0].ChannelID)
+			assert.Equal(t, "credentials", attempts[0].ErrorClass)
+			assert.True(t, attempts[0].CostPending)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.EqualValues(t, 1000000000, wallet.Balance.Nanos)
+		})
+	}
+}
+
 func TestAsyncTaskChannelOverridesChangeWireAndBillingFacts(t *testing.T) {
 	for _, path := range []string{"/v1/tasks/sora", "/v1/videos"} {
 		t.Run(path, func(t *testing.T) {
