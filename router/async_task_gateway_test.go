@@ -2047,6 +2047,7 @@ func TestAsyncTaskNativeLegacySubmissionStillRequiresLegacyQuota(t *testing.T) {
 		calls.Add(1)
 		_, _ = w.Write([]byte(`{"id":"unexpected"}`))
 	})
+	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "doubao-seedance-1-0-pro-250528", ChannelId: fixture.channel.ProviderID, Enabled: true}).Error)
 	source, err := plugins.Source("doubao")
 	require.NoError(t, err)
 	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
