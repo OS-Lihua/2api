@@ -25,24 +25,27 @@ type responseOutputState struct {
 	textSeen    bool
 }
 
+type nativeInputPresence struct{ text, audio, image, cached bool }
+
 type ResponsesUsageAccumulator struct {
-	retainedBytes, retainedLimit                            int
-	unretainedOutputTokens                                  int
-	budgetErr                                               error
-	completionReported                                      bool
-	info                                                    *relaycommon.RelayInfo
-	usage                                                   *dto.Usage
-	outputText                                              strings.Builder
-	outputs                                                 map[string]*responseOutputState
-	terminalOutputSeen                                      bool
-	delivered                                               *ResponsesUsageAccumulator
-	imageCounter                                            relaycommon.ImageGenerationCallCounter
-	itemBytes                                               int
-	promptReported, inputTextReported, inputDetailsReported bool
-	imageInputReported                                      bool
-	imageCommitted                                          bool
-	started                                                 bool
-	finished                                                bool
+	retainedBytes, retainedLimit         int
+	unretainedOutputTokens               int
+	budgetErr                            error
+	completionReported                   bool
+	info                                 *relaycommon.RelayInfo
+	usage                                *dto.Usage
+	outputText                           strings.Builder
+	outputs                              map[string]*responseOutputState
+	terminalOutputSeen                   bool
+	delivered                            *ResponsesUsageAccumulator
+	imageCounter                         relaycommon.ImageGenerationCallCounter
+	itemBytes                            int
+	inputPresence                        nativeInputPresence
+	promptReported, inputDetailsReported bool
+	imageInputReported                   bool
+	imageCommitted                       bool
+	started                              bool
+	finished                             bool
 }
 
 func NewResponsesUsageAccumulator(info *relaycommon.RelayInfo) *ResponsesUsageAccumulator {
@@ -122,9 +125,13 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 			a.completionReported = a.completionReported || completion
 			a.promptReported = a.promptReported || prompt
 			text, _ := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens_details.text_tokens", "", "")
-			a.inputTextReported = a.inputTextReported || text
+			a.inputPresence.text = a.inputPresence.text || text
+			cached, _ := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens_details.cached_tokens", "", "")
+			a.inputPresence.cached = a.inputPresence.cached || cached
 			audio, _ := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens_details.audio_tokens", "", "")
 			image, _ := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens_details.image_tokens", "", "")
+			a.inputPresence.audio = a.inputPresence.audio || audio
+			a.inputPresence.image = a.inputPresence.image || image
 			for _, path := range []string{"cached_tokens", "cached_creation_tokens", "cache_write_tokens", "cache_creation_input_tokens", "cached_tokens_details.text_tokens", "cached_tokens_details.image_tokens", "cached_tokens_details.audio_tokens", "cache_write_tokens_details.ttl_12h_tokens", "cache_write_tokens_details.ttl_30m_tokens"} {
 				if valid, _ := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens_details."+path, "", ""); valid {
 					a.inputDetailsReported = true
@@ -138,6 +145,40 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 				a.imageInputReported = true
 			}
 			ApplyResponsesUsage(a.usage, event.Response.Usage, []byte(ojson.GetBytes(raw, "response.usage").Raw))
+			if subtypes := a.usage.PromptTokensDetails.CachedTokensDetails; subtypes != nil {
+				changed := false
+				if !a.inputPresence.cached {
+					cached := 0
+					for _, part := range []*int{subtypes.TextTokens, subtypes.ImageTokens, subtypes.AudioTokens} {
+						if part != nil {
+							cached += max(0, *part)
+						}
+					}
+					if cached > a.usage.PromptTokensDetails.CachedTokens {
+						a.usage.PromptTokensDetails.CachedTokens = cached
+						changed = true
+					}
+				}
+				for _, part := range []struct {
+					reported bool
+					total    *int
+					subset   *int
+				}{{a.inputPresence.text, &a.usage.PromptTokensDetails.TextTokens, subtypes.TextTokens}, {a.inputPresence.audio, &a.usage.PromptTokensDetails.AudioTokens, subtypes.AudioTokens}, {a.inputPresence.image, &a.usage.PromptTokensDetails.ImageTokens, subtypes.ImageTokens}} {
+					if !part.reported && part.subset != nil && *part.subset > *part.total {
+						*part.total = *part.subset
+						changed = true
+					}
+				}
+				if changed {
+					if a.usage.InputTokensDetails != nil {
+						details := a.usage.PromptTokensDetails.Clone()
+						a.usage.InputTokensDetails = &details
+					}
+					if a.info.ResponseFacts != nil {
+						a.info.ResponseFacts.UsageEstimated = true
+					}
+				}
+			}
 			if facts := a.info.ResponseFacts; facts != nil {
 				prompt, completion := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens", "response.usage.output_tokens", "response.usage.total_tokens")
 				facts.InputDetailsReported = a.inputDetailsReported
@@ -405,7 +446,7 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 		a.usage.PromptTokens = a.info.GetEstimatePromptTokens()
 	}
 	if input := a.info.ResponsesInputFacts; input != nil && (billsPrompt || a.usage.PromptTokens > 0) && !a.imageInputReported && (facts == nil || !facts.PromptTokensReported || a.usage.PromptTokens > 0) {
-		a.usage.PromptTokensDetails.ImageTokens = min(a.usage.PromptTokens, input.Usage.PromptTokensDetails.ImageTokens)
+		a.usage.PromptTokensDetails.ImageTokens = max(a.usage.PromptTokensDetails.ImageTokens, min(a.usage.PromptTokens, input.Usage.PromptTokensDetails.ImageTokens))
 		if facts != nil && a.usage.PromptTokensDetails.ImageTokens > 0 {
 			facts.UsageEstimated = true
 		}
@@ -415,7 +456,7 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 		if input := a.info.ResponsesInputFacts; input != nil {
 			estimate = input.Usage
 		}
-		a.usage.PromptTokens = max(a.usage.PromptTokens, inputTokenLowerBound(a.usage, estimate, a.inputTextReported))
+		a.usage.PromptTokens = max(a.usage.PromptTokens, inputTokenLowerBound(a.usage, estimate, a.inputPresence))
 	}
 	a.usage.TotalTokens = a.usage.PromptTokens + a.usage.CompletionTokens
 	if a.usage.BillingUsage != nil {
@@ -426,11 +467,22 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 
 // inputTokenLowerBound combines disjoint modalities and overlapping cache
 // facts without treating cached input as additional input.
-func inputTokenLowerBound(usage, estimate *dto.Usage, textReported bool) int {
+func inputTokenLowerBound(usage, estimate *dto.Usage, presence nativeInputPresence) int {
 	details := usage.PromptTokensDetails
-	text := details.TextTokens
-	if !textReported && estimate != nil {
+	text, audio, image := details.TextTokens, details.AudioTokens, details.ImageTokens
+	if !presence.text && estimate != nil {
 		text = max(text, max(0, estimate.PromptTokens-estimate.PromptTokensDetails.AudioTokens-estimate.PromptTokensDetails.ImageTokens))
+	}
+	if subtypes := details.CachedTokensDetails; subtypes != nil {
+		if !presence.text && subtypes.TextTokens != nil {
+			text = max(text, *subtypes.TextTokens)
+		}
+		if !presence.audio && subtypes.AudioTokens != nil {
+			audio = max(audio, *subtypes.AudioTokens)
+		}
+		if !presence.image && subtypes.ImageTokens != nil {
+			image = max(image, *subtypes.ImageTokens)
+		}
 	}
 	cached := max(details.CachedTokens, usage.PromptCacheHitTokens)
 	if subtypes := details.CachedTokensDetails; subtypes != nil {
@@ -442,7 +494,7 @@ func inputTokenLowerBound(usage, estimate *dto.Usage, textReported bool) int {
 		}
 		cached = max(cached, count)
 	}
-	return max(text+details.AudioTokens+details.ImageTokens, cached+details.CacheCreationTokensTotal())
+	return max(text+audio+image, cached+details.CacheCreationTokensTotal())
 }
 
 // ObserveResponsesOutcome records the protocol outcome of one Responses event

@@ -361,6 +361,7 @@ type responsesWSCallState struct {
 }
 
 type responsesWSSession struct {
+	language                 string
 	ctx                      context.Context
 	cancel                   context.CancelFunc
 	client                   *websocket.Conn
@@ -407,7 +408,7 @@ type responsesWSSession struct {
 
 func ResponsesWebSocketHelper(c *gin.Context, client *websocket.Conn, runner ResponsesWSRequestRunner, gateways ...ResponsesWSGateway) *types.NewAPIError {
 	ctx, cancel := context.WithCancel(c.Request.Context())
-	s := &responsesWSSession{ctx: ctx, cancel: cancel, client: client, runner: runner,
+	s := &responsesWSSession{language: i18n.StatedLang(c), ctx: ctx, cancel: cancel, client: client, runner: runner,
 		request: c.Request.Clone(ctx), requestID: c.GetString(common.RequestIdKey)}
 	if len(gateways) > 0 {
 		s.gateway = gateways[0]
@@ -492,7 +493,7 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
 		// as a normal closure; shutdown itself takes neither lock.
 		outgoing := state.terminal
 		if apiErr != nil {
-			if body, err := buildResponsesWSErrorPayload(envelope.EventID, streamID, apiErr, upstreamURLs...); err == nil {
+			if body, err := buildResponsesWSErrorPayload(s.language, envelope.EventID, streamID, apiErr, upstreamURLs...); err == nil {
 				outgoing = &responsesWSMessage{kind: websocket.TextMessage, body: body}
 			}
 		}
@@ -1165,7 +1166,7 @@ func (s *responsesWSSession) sendError(eventID, streamID string, apiErr *types.N
 	if apiErr == nil {
 		return
 	}
-	payload, err := buildResponsesWSErrorPayload(eventID, streamID, apiErr)
+	payload, err := buildResponsesWSErrorPayload(s.language, eventID, streamID, apiErr)
 	if err == nil {
 		_ = s.writeClient(websocket.TextMessage, payload)
 	}
@@ -1329,7 +1330,7 @@ func buildResponsesWSCreateEvent(jsonData []byte, generate common.RawMessage, st
 	return event.Bytes(), nil
 }
 
-func buildResponsesWSErrorPayload(eventID, streamID string, apiErr *types.NewAPIError, upstreamURLs ...string) ([]byte, error) {
+func buildResponsesWSErrorPayload(language, eventID, streamID string, apiErr *types.NewAPIError, upstreamURLs ...string) ([]byte, error) {
 	if apiErr == nil {
 		return nil, errors.New("api error is nil")
 	}
@@ -1337,7 +1338,7 @@ func buildResponsesWSErrorPayload(eventID, streamID string, apiErr *types.NewAPI
 	if status == 0 {
 		status = http.StatusInternalServerError
 	}
-	openaiErr := apiErr.ToOpenAIError(upstreamURLs...)
+	openaiErr := i18n.LocalizeRelayError(language, apiErr, upstreamURLs...)
 	return common.Marshal(&responsesWSErrorEvent{
 		Type:     "error",
 		Status:   status,

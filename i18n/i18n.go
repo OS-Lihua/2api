@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
 const (
@@ -41,7 +42,7 @@ func Init() error {
 		bundle.RegisterUnmarshalFunc("yaml", yaml.Unmarshal)
 
 		// Load embedded translation files
-		files := []string{"locales/zh-CN.yaml", "locales/zh-TW.yaml", "locales/en.yaml"}
+		files := []string{"locales/zh-CN.yaml", "locales/zh-TW.yaml", "locales/en.yaml", "locales/native.zh-CN.yaml", "locales/native.zh-TW.yaml", "locales/native.en.yaml"}
 		for _, file := range files {
 			_, err := bundle.LoadMessageFileFS(localeFS, file)
 			if err != nil {
@@ -59,6 +60,36 @@ func Init() error {
 		common.TranslateMessage = T
 	})
 	return initErr
+}
+
+// LocalizeRelayError translates gateway errors while preserving Provider errors.
+func LocalizeRelayError(lang string, apiErr *types.NewAPIError, upstreamURLs ...string) types.OpenAIError {
+	problem := apiErr.ToOpenAIError(upstreamURLs...)
+	if apiErr.GetErrorType() != types.ErrorTypeNewAPIError {
+		return problem
+	}
+	for _, suffix := range []string{" must be an integer between 1 and 4096 or inf", " exceeds the connection output limit"} {
+		if field, ok := strings.CutSuffix(problem.Message, suffix); ok {
+			problem.Message = Translate(lang, "{{.Field}}"+suffix, map[string]any{"Field": field})
+			return problem
+		}
+	}
+	if detail, ok := strings.CutPrefix(problem.Message, "Realtime accounting failed: "); ok {
+		problem.Message = Translate(lang, "Realtime accounting failed: {{.Error}}", map[string]any{"Error": detail})
+		return problem
+	}
+	if detail, ok := strings.CutPrefix(problem.Message, "dial failed to "); ok {
+		if target, cause, found := strings.Cut(detail, ": "); found {
+			problem.Message = Translate(lang, "dial failed to {{.URL}}: {{.Error}}", map[string]any{"URL": target, "Error": cause})
+			return problem
+		}
+	}
+	if kind, ok := strings.CutPrefix(problem.Message, "invalid api type: "); ok {
+		problem.Message = Translate(lang, "invalid api type: {{.Type}}", map[string]any{"Type": kind})
+		return problem
+	}
+	problem.Message = Translate(lang, problem.Message)
+	return problem
 }
 
 // GetLocalizer returns a localizer for the specified language

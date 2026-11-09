@@ -536,7 +536,8 @@ func TestHTTPResponsesRequestOmitsWebSocketMetadata(t *testing.T) {
 }
 
 func TestBuildResponsesWSErrorPayloadIncludesStatus(t *testing.T) {
-	payload, err := buildResponsesWSErrorPayload("evt_err", "", types.NewErrorWithStatusCode(
+	require.NoError(t, i18n.Init())
+	payload, err := buildResponsesWSErrorPayload(i18n.LangEn, "evt_err", "", types.NewErrorWithStatusCode(
 		errors.New("model is required"),
 		types.ErrorCodeInvalidRequest,
 		http.StatusBadRequest,
@@ -560,10 +561,18 @@ func TestBuildResponsesWSErrorPayloadIncludesStatus(t *testing.T) {
 	if data.Error == nil || data.Error.Code != string(types.ErrorCodeInvalidRequest) {
 		t.Fatalf("unexpected error body: %#v", data.Error)
 	}
+	provider := types.WithOpenAIError(types.OpenAIError{Message: "Unknown Realtime input reference", Type: string(types.ErrorTypeNewAPIError), Code: "provider_code"}, http.StatusBadRequest)
+	payload, err = buildResponsesWSErrorPayload(i18n.LangZhCN, "provider", "", provider)
+	require.NoError(t, err)
+	require.NoError(t, common.Unmarshal(payload, &data))
+	require.NotNil(t, data.Error)
+	assert.Equal(t, "Unknown Realtime input reference", data.Error.Message)
+	assert.Equal(t, "provider_code", data.Error.Code)
 }
 
 func TestResponsesWSInvalidRequestErrorUsesBadRequestStatus(t *testing.T) {
-	payload, err := buildResponsesWSErrorPayload("", "", newResponsesWSInvalidRequestError(errors.New("bad event")))
+	require.NoError(t, i18n.Init())
+	payload, err := buildResponsesWSErrorPayload(i18n.LangEn, "", "", newResponsesWSInvalidRequestError(errors.New("bad event")))
 	if err != nil {
 		t.Fatalf("buildResponsesWSErrorPayload() error = %v", err)
 	}

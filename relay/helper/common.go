@@ -11,6 +11,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -427,10 +428,11 @@ func WssObject(c *gin.Context, ws *websocket.Conn, object any) error {
 	return ws.WriteMessage(1, jsonData)
 }
 
-func WssError(c *gin.Context, ws *websocket.Conn, openaiError types.OpenAIError) {
+func WssError(c *gin.Context, ws *websocket.Conn, apiErr *types.NewAPIError, upstreamURLs ...string) {
 	if ws == nil {
 		return
 	}
+	openaiError := i18n.LocalizeRelayError(i18n.StatedLang(c), apiErr, upstreamURLs...)
 	errorObj := &dto.RealtimeEvent{
 		Type:    "error",
 		EventId: GetLocalRealtimeID(c),

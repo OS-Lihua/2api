@@ -127,7 +127,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (apiErr 
 				var rejection *types.NewAPIError
 				message, rejection = info.RealtimeRequestHandler(message)
 				if rejection != nil {
-					helper.WssError(c, client, rejection.ToOpenAIError())
+					helper.WssError(c, client, rejection)
 					return rejection, sum
 				}
 			}
@@ -202,7 +202,13 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (apiErr 
 				var rejection *types.NewAPIError
 				presented, commands, rejection = info.RealtimeEventHandler(incoming.body)
 				if rejection != nil {
-					helper.WssError(c, client, rejection.ToOpenAIError())
+					result, _ := accumulator.Observe(incoming.body, input, false)
+					if result != nil {
+						if err := recordRealtimeResponse(c, info, result, sum); err != nil {
+							return err, sum
+						}
+					}
+					helper.WssError(c, client, rejection)
 					return rejection, sum
 				}
 			}
@@ -218,7 +224,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (apiErr 
 				if writeErr == nil && info.RealtimeAfterResponse != nil {
 					outgoing, rejection := info.RealtimeAfterResponse()
 					if rejection != nil {
-						helper.WssError(c, client, rejection.ToOpenAIError())
+						helper.WssError(c, client, rejection)
 						return rejection, sum
 					}
 					commands = append(commands, outgoing...)

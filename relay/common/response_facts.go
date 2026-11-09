@@ -43,6 +43,7 @@ type ResponseFacts struct {
 	DownstreamWriteFailed    bool
 	GeneratedAudioBytes      int64
 	GeneratedText            string
+	GeneratedOutputDetails   dto.OutputTokenDetails
 	GeneratedOutputTokens    *int
 	DeliveredOutputTokens    *int
 	DeliveredOutputDetails   dto.OutputTokenDetails

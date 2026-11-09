@@ -240,6 +240,9 @@ func (accumulator *RealtimeUsageAccumulator) finish(id string, state *realtimeRe
 	if facts.GeneratedOutputTokens != nil {
 		generated = max(generated, *facts.GeneratedOutputTokens)
 	}
+	facts.GeneratedOutputDetails = usage.CompletionTokenDetails
+	facts.GeneratedOutputDetails.AudioTokens = max(facts.GeneratedOutputDetails.AudioTokens, audio)
+	facts.GeneratedOutputDetails.TextTokens = max(facts.GeneratedOutputDetails.TextTokens, text)
 	facts.GeneratedOutputTokens = &generated
 	delivered := CountRealtimeAudioTokens(state.deliveredAudioBytes, state.outputAudioFormat, false)
 	if facts.DeliveredOutputTokens != nil {
@@ -259,16 +262,16 @@ func (accumulator *RealtimeUsageAccumulator) finish(id string, state *realtimeRe
 		estimated = true
 	}
 	if !state.inputAudioReported && state.input.PromptTokensDetails.AudioTokens > 0 && (!facts.PromptTokensReported || usage.PromptTokens > 0) {
-		usage.PromptTokensDetails.AudioTokens = min(state.input.PromptTokensDetails.AudioTokens, usage.PromptTokens)
+		usage.PromptTokensDetails.AudioTokens = max(usage.PromptTokensDetails.AudioTokens, min(state.input.PromptTokensDetails.AudioTokens, usage.PromptTokens))
 		estimated = true
 	}
 	if !state.inputImageReported && state.input.PromptTokensDetails.ImageTokens > 0 && (!facts.PromptTokensReported || usage.PromptTokens > 0) {
-		usage.PromptTokensDetails.ImageTokens = min(state.input.PromptTokensDetails.ImageTokens, max(0, usage.PromptTokens-usage.PromptTokensDetails.AudioTokens))
+		usage.PromptTokensDetails.ImageTokens = max(usage.PromptTokensDetails.ImageTokens, min(state.input.PromptTokensDetails.ImageTokens, max(0, usage.PromptTokens-usage.PromptTokensDetails.AudioTokens)))
 		estimated = true
 	}
 	facts.InputDetailsReported = facts.InputDetailsReported || state.inputTextReported || state.inputAudioReported || state.inputImageReported
 	if !facts.PromptTokensReported && (usage.PromptTokens > 0 || generated > 0 || state.audioBytes > 0 || facts.InputDetailsReported) {
-		usage.PromptTokens = max(usage.PromptTokens, inputTokenLowerBound(usage, state.input, state.inputTextReported))
+		usage.PromptTokens = max(usage.PromptTokens, inputTokenLowerBound(usage, state.input, nativeInputPresence{text: state.inputTextReported, audio: state.inputAudioReported, image: state.inputImageReported}))
 	}
 	if !state.inputTextReported {
 		usage.PromptTokensDetails.TextTokens = max(0, usage.PromptTokens-usage.PromptTokensDetails.AudioTokens-usage.PromptTokensDetails.ImageTokens)

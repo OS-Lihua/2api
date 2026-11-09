@@ -15,6 +15,7 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
@@ -83,6 +84,7 @@ type realtimeQueuedRequest struct {
 type realtimeVADTurn struct{ started, stopped, committed, generated bool }
 
 type realtimeGatewaySession struct {
+	language                                      string
 	context                                       context.Context
 	cancel                                        context.CancelCauseFunc
 	requestContext                                context.Context
@@ -144,7 +146,7 @@ func RealtimeGateway(c *gin.Context) {
 	}
 	requestContext, cancelRequests := context.WithCancel(c.Request.Context())
 	ioContext, cancel := context.WithCancelCause(c.Request.Context())
-	session := &realtimeGatewaySession{
+	session := &realtimeGatewaySession{language: i18n.StatedLang(c),
 		context: ioContext, cancel: cancel, requestContext: requestContext, cancelRequests: cancelRequests,
 		runner: newResponsesWSRequestRunner(c), auth: newResponsesWSRequestRunner(c, true),
 		offeringID: offering.ID, model: c.Query("model"),
@@ -848,7 +850,7 @@ func (session *realtimeGatewaySession) event(raw []byte) ([]byte, [][]byte, *typ
 			if value := ojson.GetBytes(raw, "error.type"); value.Type == ojson.String {
 				kind = value.String()
 			}
-			apiErr := types.WithOpenAIError(types.OpenAIError{Code: code, Type: kind, Message: "Realtime response was rejected"}, http.StatusBadRequest)
+			apiErr := types.WithOpenAIError(types.OpenAIError{Code: code, Type: kind, Message: i18n.Translate(session.language, "Realtime response was rejected")}, http.StatusBadRequest)
 			session.finish(attempt, realtimeGatewayCompletion{apiErr: apiErr})
 		}
 		if id != "" && id == session.commitEventID {

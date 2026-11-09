@@ -17,6 +17,7 @@ import (
 
 	common2 "github.com/QuantumNous/new-api/common"
 	appconstant "github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
@@ -415,6 +416,7 @@ func DoWssRequest(a ProviderTransport, c *gin.Context, info *common.RelayInfo, r
 // PreparedWssRequest holds transient Provider credentials only at the transport
 // boundary. Pricing probes receive copies; no prepared request is persisted.
 type PreparedWssRequest struct {
+	language   string
 	url        string
 	header     http.Header
 	dialer     websocket.Dialer
@@ -478,7 +480,7 @@ func PrepareWssTransport(c *gin.Context, info *common.RelayInfo, fullRequestURL 
 	_ = targetHeader.Write(&identity)
 	identity.WriteString(info.ChannelSetting.Proxy)
 	identity.WriteString(fmt.Sprint(info.ChannelSetting.TLSInsecureSkipVerify))
-	return &PreparedWssRequest{url: fullRequestURL, header: targetHeader, dialer: dialer, identity: sha256.Sum256(identity.Bytes()), managed: info.ResponseFacts != nil}, nil
+	return &PreparedWssRequest{language: i18n.StatedLang(c), url: fullRequestURL, header: targetHeader, dialer: dialer, identity: sha256.Sum256(identity.Bytes()), managed: info.ResponseFacts != nil}, nil
 }
 
 func DoPreparedWssRequest(c *gin.Context, request *PreparedWssRequest) (*websocket.Conn, error) {
@@ -539,7 +541,7 @@ func DoPreparedWssRequest(c *gin.Context, request *PreparedWssRequest) (*websock
 						} `json:"error"`
 					}
 					if readErr == nil && common2.Unmarshal(raw, &payload) == nil && len(payload.Error.Code) <= 128 && len(payload.Error.Type) <= 128 && (payload.Error.Code != "" || payload.Error.Type != "") {
-						return nil, types.WithOpenAIError(types.OpenAIError{Message: "Upstream WebSocket handshake rejected", Code: payload.Error.Code, Type: payload.Error.Type}, statusCode)
+						return nil, types.WithOpenAIError(types.OpenAIError{Message: i18n.Translate(request.language, "Upstream WebSocket handshake rejected"), Code: payload.Error.Code, Type: payload.Error.Type}, statusCode)
 					}
 				}
 			}

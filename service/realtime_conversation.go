@@ -385,12 +385,9 @@ func (conversation *RealtimeConversation) Complete(result *relaycommon.RealtimeR
 	audio := result.Usage.CompletionTokenDetails.AudioTokens
 	if result.Facts.GeneratedOutputTokens != nil {
 		generated = max(generated, *result.Facts.GeneratedOutputTokens)
-		audio = max(audio, *result.Facts.GeneratedOutputTokens-tokenkit.Count(conversation.model, result.Facts.GeneratedText))
+		audio = max(audio, result.Facts.GeneratedOutputDetails.AudioTokens)
 	}
 	quantity := realtimeInputQuantity{total: generated, audio: min(audio, generated)}
-	if audio > 0 {
-		quantity.audioItems = 1
-	}
 	ids := []string{}
 	quantity.audioItems = 0
 	edited, audioItems := false, 0
@@ -404,7 +401,7 @@ func (conversation *RealtimeConversation) Complete(result *relaycommon.RealtimeR
 		quantity.audioItems += item.quantity.audioItems
 		quantity.imageItems += item.quantity.imageItems
 	}
-	if len(ids) == 0 && audio > 0 {
+	if len(ids) == 0 && (audio > 0 || result.Facts.GeneratedAudioBytes > 0) {
 		quantity.audioItems = 1
 	}
 	retained := realtimeInputQuantity{}
@@ -522,10 +519,14 @@ func (snapshot *RealtimeInputSnapshot) estimate(body []byte, caps *capability.Se
 		if quantity.total-quantity.audio-quantity.image > 0 && !slices.Contains(caps.InputModalities, capability.Text) {
 			return nil, errors.New("Realtime input modality is not supported on this connection")
 		}
-		if quantity.audioItems > 0 && !slices.Contains(caps.InputModalities, capability.Audio) || quantity.imageItems > 0 && !slices.Contains(caps.InputModalities, capability.Image) {
+		if (quantity.audioItems > 0 || quantity.audio > 0) && !slices.Contains(caps.InputModalities, capability.Audio) || (quantity.imageItems > 0 || quantity.image > 0) && !slices.Contains(caps.InputModalities, capability.Image) {
 			return nil, errors.New("Realtime input modality is not supported on this connection")
 		}
-		if maximum := caps.Limits.MaxImages; maximum != nil && int64(quantity.imageItems) > *maximum {
+		images := quantity.imageItems
+		if quantity.image > 0 {
+			images = max(images, 1)
+		}
+		if maximum := caps.Limits.MaxImages; maximum != nil && int64(images) > *maximum {
 			return nil, errors.New("Realtime image count limit exceeded")
 		}
 	}
