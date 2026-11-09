@@ -114,6 +114,13 @@ type taskResult struct {
 	State            any     `json:"state"`
 }
 
+// Completion projections never become persisted accepted task identity.
+type submitCompletionInput struct {
+	Result relaycommon.TaskInfo
+	Data   any
+	State  []byte
+}
+
 var taskArtifactKeyPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$`)
 
 // gatewayCredentialHeaders carry the client's gateway credentials. Driver
@@ -820,8 +827,8 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 			if a.submitBusiness.Load() {
 				immediate.Status = model.TaskStatusSuccess
 			}
-			a.observeSubmitSourceCompletion(c, info, immediate, info.PublicTaskID, responseBody, nil)
-			stream := a.submitStreamFacts(c, info, immediate, info.PublicTaskID, nil)
+			a.observeSubmitSourceCompletion(c, info, immediate, info.PublicTaskID, responseBody, nil, resp)
+			stream := a.submitStreamFacts(c, info, immediate, info.PublicTaskID, nil, resp)
 			submitted = &channel.TaskSubmitResponse{UpstreamTaskID: info.PublicTaskID, Immediate: immediate, Stream: stream}
 			taskErr = nil
 		case relayed:
@@ -942,12 +949,7 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 	if parsed.Immediate == nil {
 		return response, nil
 	}
-	immediate := &relaycommon.TaskInfo{
-		Code: parsed.Immediate.Code, TaskID: parsed.Immediate.TaskID,
-		Status: parsed.Immediate.Status, Progress: parsed.Immediate.Progress,
-		Reason: parsed.Immediate.Reason, Url: parsed.Immediate.URL, RemoteUrl: parsed.Immediate.RemoteURL,
-		CompletionTokens: positiveInt(parsed.Immediate.CompletionTokens), TotalTokens: positiveInt(parsed.Immediate.TotalTokens),
-	}
+	immediate := submitResultInfo(parsed.Immediate)
 	if sourceFailed {
 		immediate.Status = model.TaskStatusFailure
 		if a.submitBusiness.Load() {
@@ -965,19 +967,20 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 		return response, nil
 	}
 	sourceTaskData := parsed.TaskData
-	if sourceFailed {
+	if sourceFailed && a.submitSourceFallback != nil {
 		sourceTaskData = responseBody
 	}
-	a.observeSubmitSourceCompletion(c, info, immediate, parsed.TaskID, sourceTaskData, pluginState)
+	a.observeSubmitSourceCompletion(c, info, immediate, parsed.TaskID, sourceTaskData, pluginState, resp)
 	if eventStream && relaysSubmitEvents(c) && info.BeginProviderCall != nil {
-		response.Stream = a.submitStreamFacts(c, info, immediate, parsed.TaskID, pluginState)
+		response.Stream = a.submitStreamFacts(c, info, immediate, parsed.TaskID, pluginState, resp)
 	}
 	return response, nil
 }
 
-func (a *TaskAdaptor) submitStreamFacts(c *gin.Context, info *relaycommon.RelayInfo, generated *relaycommon.TaskInfo, taskID string, pluginState []byte) *model.TaskStreamFacts {
-	delivered := &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}
-	a.observeSubmitCompletion(c, info, delivered, taskID, a.deliveredSubmitData, pluginState)
+func (a *TaskAdaptor) submitStreamFacts(c *gin.Context, info *relaycommon.RelayInfo, generated *relaycommon.TaskInfo, taskID string, pluginState []byte, resp *http.Response) *model.TaskStreamFacts {
+	input := a.projectSubmitCompletion(c, info, resp, &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}, taskID, a.deliveredSubmitData, pluginState)
+	delivered := &input.Result
+	a.observeSubmitCompletion(c, info, delivered, taskID, input.Data, input.State)
 	for name, value := range delivered.UsageFacts {
 		count, numeric := value.(float64)
 		source, known := generated.UsageFacts[name].(float64)
@@ -988,18 +991,57 @@ func (a *TaskAdaptor) submitStreamFacts(c *gin.Context, info *relaycommon.RelayI
 	return &model.TaskStreamFacts{Delivered: delivered.UsageFacts, BusinessOutput: a.submitBusiness.Load(), DeliveryFailed: a.submitDeliveryFailed, Incomplete: a.keepReservation}
 }
 
-func (a *TaskAdaptor) observeSubmitSourceCompletion(c *gin.Context, info *relaycommon.RelayInfo, immediate *relaycommon.TaskInfo, taskID string, taskData any, pluginState []byte) {
+func (a *TaskAdaptor) observeSubmitSourceCompletion(c *gin.Context, info *relaycommon.RelayInfo, immediate *relaycommon.TaskInfo, taskID string, taskData any, pluginState []byte, resp *http.Response) {
 	if a.submitSourceFallback == nil {
 		a.observeSubmitCompletion(c, info, immediate, taskID, taskData, pluginState)
 		return
 	}
-	a.observeSubmitCompletion(c, info, immediate, taskID, a.submitSourceFallback, pluginState)
-	priorFacts := immediate.UsageFacts
-	a.observeSubmitCompletion(c, info, immediate, taskID, taskData, pluginState)
-	if priorFacts != nil {
-		maps.Copy(priorFacts, immediate.UsageFacts)
-		immediate.UsageFacts = priorFacts
+	known := make(map[string]any)
+	for _, source := range []any{a.submitSourceFallback, taskData} {
+		input := a.projectSubmitCompletion(c, info, resp, immediate, taskID, source, pluginState)
+		a.observeSubmitCompletion(c, info, &input.Result, taskID, input.Data, input.State)
+		maps.Copy(known, input.Result.UsageFacts)
 	}
+	_ = a.applyCompletionUsageFacts(immediate, known, info.UpstreamModelName, info.OriginModelName)
+}
+
+func submitResultInfo(result *taskResult) *relaycommon.TaskInfo {
+	return &relaycommon.TaskInfo{
+		Code: result.Code, TaskID: result.TaskID,
+		Status: result.Status, Progress: result.Progress,
+		Reason: result.Reason, Url: result.URL, RemoteUrl: result.RemoteURL,
+		CompletionTokens: positiveInt(result.CompletionTokens), TotalTokens: positiveInt(result.TotalTokens),
+	}
+}
+
+func (a *TaskAdaptor) projectSubmitCompletion(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response, result *relaycommon.TaskInfo, taskID string, data any, pluginState []byte) submitCompletionInput {
+	input := submitCompletionInput{Result: *result, Data: data, State: pluginState}
+	input.Result.TaskID, input.Result.UsageFacts = taskID, nil
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), pluginruntime.DefaultCallTimeout)
+	defer cancel()
+	value, err := a.plugin.Engine.Call(ctx, "parseSubmitResponse", a.preparedSubmitContext(c, info), map[string]any{"statusCode": resp.StatusCode, "headers": maps.Clone(resp.Header), "body": data})
+	if err != nil {
+		return input
+	}
+	if object, ok := value.(map[string]any); ok {
+		if _, forbidden := object["clientResponse"]; forbidden {
+			return input
+		}
+	}
+	var parsed submitResponse
+	if err := convert(value, &parsed); err != nil {
+		return input
+	}
+	input.Data = parsed.TaskData
+	input.State, _ = encodeReturnedPluginState(value)
+	if len(input.State) > maxTaskPluginPersistedJSONBytes {
+		input.State = nil
+	}
+	if parsed.Immediate != nil {
+		input.Result = *submitResultInfo(parsed.Immediate)
+		input.Result.TaskID = taskID
+	}
+	return input
 }
 
 func (a *TaskAdaptor) observeSubmitCompletion(c *gin.Context, info *relaycommon.RelayInfo, immediate *relaycommon.TaskInfo, taskID string, taskData any, pluginState []byte) {

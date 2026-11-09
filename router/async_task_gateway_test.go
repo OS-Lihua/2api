@@ -3150,6 +3150,75 @@ func TestAsyncTaskNativeStreamRetainsAcceptedIdentityAfterInvalidDelta(t *testin
 	}
 }
 
+func TestAsyncTaskNativeStreamProjectsCompletionData(t *testing.T) {
+	for _, mode := range []string{"snapshot", "delta"} {
+		t.Run(mode, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, "data: first\n\ndata: fail\n\n")
+			})
+			source, err := plugins.Source("sora")
+			require.NoError(t, err)
+			source = strings.Replace(source, "apiVersion: 1,", `apiVersion: 1,
+				requiredCapabilities:["submit-sse-business@1"],submitResponseTypes:["json","sse"],
+				routes:[{method:"POST",path:"/sora/projected-native-stream",type:"submit",decode:"submit",render:"created"}],`, 1)
+			source = strings.Replace(source, "export function buildSubmitRequest(ctx) {", `export function buildSubmitRequest(ctx) {
+				return {url:ctx.baseUrl+"/v1/videos",method:"POST",headers:{"Content-Type":"application/json",Authorization:"Bearer "+ctx.apiKey},body:ctx.requestBody,responseType:"sse"};`, 1)
+			source = strings.Replace(source, "return { taskId, taskData: body };", `return {taskId,taskData:body.output,immediate:{status:"SUCCESS",progress:"100%"}};`, 1)
+			source += `
+				export const native = {
+					submit(ctx) { return {kind:"submit",model:ctx.body.value.model,requestBody:ctx.body.value}; },
+					created(ctx,task) { return {id:task.task_id}; }
+				};`
+			sale := int64(180000000)
+			if mode == "snapshot" {
+				source += `
+					export function parseSubmitEvent(ctx,event,state) {
+						if(event.data === "first") return {state:{id:"accepted-projected-id",output:{seconds:2}},done:false,business:true};
+						throw new Error("synthetic truncated snapshot");
+					}`
+			} else {
+				sale = 90000000
+				source += `
+					export function parseSubmitEventDelta(ctx,event,state) {
+						if(event.data === "first") return {changes:[{op:"set",path:[],value:{id:"accepted-projected-id",output:{seconds:1}}}],state:{},done:false,business:true};
+						return {changes:[{op:"set",path:["output","seconds"],value:2},{op:"set",path:["id"],value:"different-id"},{op:"append",path:["missing"],value:1}],state:{},done:false,business:true};
+					}`
+			}
+			_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "sora"})
+			require.NoError(t, err)
+			builder := newPluginGenerationBuilder(fixture.engine.Routes(), nil, productionPluginRouteHandlers)
+			require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(builder.prepare))
+			fixture.engine.NoRoute((&pluginRouteDispatcher{registry: jsplugin.DefaultRegistry}).dispatch)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/sora/projected-native-stream", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), "data: first")
+			assert.NotContains(t, response.Body.String(), "data: fail")
+			assert.EqualValues(t, 1, calls.Load())
+			var task model.Task
+			require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
+			assert.Equal(t, "accepted-projected-id", task.PrivateData.UpstreamTaskID)
+			assert.EqualValues(t, 2, task.PrivateData.Gateway.CompletionFacts["seconds"])
+			for range 2 {
+				_, err := service.RecoverGatewayTasks(t.Context(), 100)
+				require.ErrorIs(t, err, model.ErrGatewayEvaluationPending)
+			}
+			request, err := model.GetGatewayRequest(t.Context(), task.PrivateData.Gateway.Settlement.Request.ID, fixture.user.Id)
+			require.NoError(t, err)
+			assert.False(t, request.SalePending)
+			assert.Equal(t, sale, request.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), request.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.EqualValues(t, 100000000, attempts[0].Cost.Nanos)
+			assert.True(t, attempts[0].CostPending)
+			assertTextGatewayLedger(t, *request, 100000000)
+		})
+	}
+}
+
 func TestAsyncTaskDoubaoNativeStreamPreservesInputFacts(t *testing.T) {
 	for _, test := range []struct {
 		name                        string
