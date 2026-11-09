@@ -134,6 +134,10 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 	}
 	converted, err := adaptor.ConvertRequest(candidate, info, conversion.Value)
 	if err != nil {
+		var loss *types.ConversionLossError
+		if errors.As(err, &loss) {
+			info.RecordConversionDiagnostics(candidate, loss.Diagnostics)
+		}
 		if diagnostics := info.ConversionDiagnostics(); len(diagnostics) > 0 {
 			return nil, &service.GatewayConversionError{Diagnostics: diagnostics}
 		}

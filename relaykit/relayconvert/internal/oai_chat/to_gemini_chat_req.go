@@ -252,7 +252,7 @@ func OpenAIChatRequestToGeminiGenerateContent(c context.Context, textRequest dto
 			for _, call := range message.ParseToolCalls() {
 				args := map[string]any{}
 				if call.Function.Arguments != "" {
-					if kitutil.Unmarshal([]byte(call.Function.Arguments), &args) != nil {
+					if kitutil.UnmarshalUseNumber([]byte(call.Function.Arguments), &args) != nil {
 						return nil, fmt.Errorf("invalid arguments for function %s, args: %s", call.Function.Name, call.Function.Arguments)
 					}
 				}

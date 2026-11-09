@@ -7,6 +7,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
 type OllamaChatMessage struct {
@@ -111,8 +112,15 @@ func (request *OllamaChatRequest) ProjectChatRequest(body []byte, public dto.Gen
 			return nil, err
 		}
 		var limit uint
-		if err := common.Unmarshal(encoded, &limit); err != nil || limit == 0 {
+		if err := common.Unmarshal(encoded, &limit); err != nil {
 			return nil, fmt.Errorf("invalid Ollama output limit")
+		}
+		if limit == 0 {
+			path := "max_tokens"
+			if public.MaxCompletionTokens != nil {
+				path = "max_completion_tokens"
+			}
+			return nil, &types.ConversionLossError{Diagnostics: []types.ConversionDiagnostic{{Code: "request_parameter_dropped", Path: path, Message: "The native Ollama request cannot represent an explicit zero output limit", Severity: types.ConversionDiagnosticError}}}
 		}
 		effective.MaxCompletionTokens = &limit
 	}

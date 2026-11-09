@@ -306,7 +306,7 @@ func OpenAIChatRequestToClaudeMessages(c context.Context, info convmeta.Meta, te
 				for _, toolCall := range message.ParseToolCalls() {
 					inputObj := make(map[string]any)
 					if args := toolCall.Function.Arguments; args != "" {
-						if err := kitutil.Unmarshal([]byte(args), &inputObj); err != nil {
+						if err := kitutil.UnmarshalUseNumber([]byte(args), &inputObj); err != nil {
 							kitutil.LogInfo("tool call function arguments is not a map[string]any: " + fmt.Sprintf("%v", toolCall.Function.Arguments))
 						}
 					}

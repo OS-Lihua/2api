@@ -90,6 +90,47 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 		copy := *responses
 		copy.PreviousResponseID = ""
 		copy.Conversation, copy.Prompt, copy.ContextManagement = nil, nil, nil
+		// Represent Provider-owned file URLs as opaque references in the validation copy.
+		var inputs []map[string]any
+		if common.UnmarshalUseNumber(copy.Input, &inputs) == nil {
+			changed := false
+			for _, input := range inputs {
+				parts, _ := input["content"].([]any)
+				switch input["type"] {
+				case "function_call_output", "custom_tool_call_output":
+					parts, _ = input["output"].([]any)
+				case "input_file":
+					parts = []any{input}
+				}
+				for _, rawPart := range parts {
+					part, ok := rawPart.(map[string]any)
+					if !ok || part["type"] != "input_file" {
+						continue
+					}
+					fields := part
+					if nested, ok := part["file"].(map[string]any); ok {
+						fields = nested
+					}
+					reference, _ := fields["file_url"].(string)
+					if reference == "" {
+						continue
+					}
+					if inline, _ := fields["file_data"].(string); inline != "" {
+						continue
+					}
+					fields["file_id"] = reference
+					delete(fields, "file_url")
+					changed = true
+				}
+			}
+			if changed {
+				encoded, err := common.Marshal(inputs)
+				if err != nil {
+					return nil, err
+				}
+				copy.Input = encoded
+			}
+		}
 		request = &copy
 	}
 	projectionRequest := request
@@ -118,7 +159,7 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 		}
 		projectionRequest = &projection
 	}
-	result, err := relayconvert.ConvertRequest(gatewayConversionContext(ctx), nil, types.RelayFormatOpenAI, projectionRequest)
+	result, err := relayconvert.ConvertRequest(gatewayConversionContext(ctx, false), nil, types.RelayFormatOpenAI, projectionRequest)
 	if err != nil {
 		return nil, err
 	}
@@ -465,7 +506,7 @@ func PreconvertGatewayRequest(ctx context.Context, info convmeta.Meta, kind prot
 	if err != nil {
 		return nil, err
 	}
-	result, err := relayconvert.ConvertRequest(gatewayConversionContext(ctx), info, format, clone)
+	result, err := relayconvert.ConvertRequest(gatewayConversionContext(ctx, true), info, format, clone)
 	if err != nil {
 		return result, err
 	}

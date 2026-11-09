@@ -98,7 +98,7 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		}
 	case types.RelayFormatClaude:
 		for _, block := range root.Get("content").Array() {
-			sourceOutput.text.WriteString(gatewayMessagesBlockText(block))
+			sourceOutput.text.WriteString(gatewayMessagesBlockText(block, false))
 		}
 	case types.RelayFormatGemini:
 		for _, candidate := range root.Get("candidates").Array() {
@@ -150,8 +150,7 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	if usage == nil {
 		usage = &dto.Usage{}
 	}
-	prompt, completion := gatewayUsageCounters(body, p.format)
-	facts.PromptTokensReported, facts.CompletionTokensReported = gatewayValidCounter(prompt), gatewayValidCounter(completion)
+	facts.PromptTokensReported, facts.CompletionTokensReported = meter.BaseCounters()
 	facts.UsageReported = facts.PromptTokensReported && facts.CompletionTokensReported
 	facts.IndependentUsageReported = meter.ReportedCounters()
 	if captured, ok := resp.Body.(channel.ResponseErrorCarrier); ok && captured.ResponseError() != nil {
@@ -160,6 +159,9 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	}
 	if readErr != nil {
 		return usage, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
+	}
+	if !gjson.ValidBytes(body) {
+		return usage, types.NewError(fmt.Errorf("invalid upstream response JSON"), types.ErrorCodeBadResponseBody)
 	}
 	normalized, err := meter.NormalizedBody(body)
 	if err != nil {
@@ -224,7 +226,7 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	}
 	if nativeMessages {
 		for _, block := range gjson.GetBytes(body, "content").Array() {
-			generated.WriteString(gatewayMessagesBlockText(block))
+			generated.WriteString(gatewayMessagesBlockText(block, false))
 		}
 	}
 	if nativeGemini {

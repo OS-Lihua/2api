@@ -21,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/samber/lo"
+	"github.com/tidwall/gjson"
 
 	"github.com/gin-gonic/gin"
 )
@@ -249,6 +250,18 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	usage := &dto.Usage{}
 	var nodeToken int
 	var streamError *types.NewAPIError
+	observeSource := func(data []byte) {
+		if info.ResponseFacts == nil {
+			return
+		}
+		info.ResponseFacts.RecordNativeUsage(usage, data, "metadata.usage.prompt_tokens", "metadata.usage.completion_tokens")
+		data = relaycommon.SanitizeNativeUsage(data, "metadata.usage")
+		_ = info.ResponseFacts.RecordChatUsage(usage, data, "metadata.usage")
+		event := relaycommon.SourceText(gjson.GetBytes(data, "event"))
+		if event == "message" || event == "agent_message" {
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(data, "", "answer"))
+		}
+	}
 	helper.SetEventStreamHeaders(c)
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		info.StreamStatus.RequireTerminal()
@@ -324,18 +337,10 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		if err != nil {
 			sr.Stop(fmt.Errorf("Dify stream delivery failed"))
 		}
-	})
+	}, func(data string) { observeSource([]byte(data)) })
 	if info.ResponseFacts != nil && len(info.ResponseFacts.UnterminatedStreamData) > 0 {
-		info.ResponseFacts.RecordNativeUsage(usage, info.ResponseFacts.UnterminatedStreamData, "metadata.usage.prompt_tokens", "metadata.usage.completion_tokens")
-		partial := relaycommon.SanitizeNativeUsage(info.ResponseFacts.UnterminatedStreamData, "metadata.usage")
-		_ = info.ResponseFacts.RecordChatUsage(usage, partial, "metadata.usage")
+		observeSource(info.ResponseFacts.UnterminatedStreamData)
 		info.ResponseFacts.UnterminatedStreamData = nil
-		var event struct {
-			Event string `json:"event"`
-		}
-		if common.Unmarshal(partial, &event) == nil && (event.Event == "message" || event.Event == "agent_message") {
-			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(partial, "", "answer"))
-		}
 	}
 	if info.ResponseFacts == nil || info.ResponseFacts.OnBusinessOutput == nil || info.ResponseFacts.BusinessOutput && info.StreamStatus.CompletedNormally() {
 		helper.Done(c)

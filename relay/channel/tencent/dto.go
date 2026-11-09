@@ -1,6 +1,9 @@
 package tencent
 
 import (
+	"encoding/json"
+	"fmt"
+
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -73,8 +76,31 @@ type TencentChatRequest struct {
 }
 
 type TencentError struct {
-	Code    int    `json:"Code"`
+	Code    any    `json:"Code"`
 	Message string `json:"Message"`
+}
+
+func (e *TencentError) UnmarshalJSON(body []byte) error {
+	type fields TencentError
+	var value fields
+	if err := common.UnmarshalUseNumber(body, &value); err != nil {
+		return err
+	}
+	switch value.Code.(type) {
+	case nil, string, json.Number:
+	default:
+		return fmt.Errorf("invalid Tencent error code")
+	}
+	*e = TencentError(value)
+	return nil
+}
+
+func (e TencentError) HasError() bool {
+	if e.Code == nil {
+		return false
+	}
+	code := fmt.Sprint(e.Code)
+	return code != "" && code != "0"
 }
 
 type TencentUsage struct {

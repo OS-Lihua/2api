@@ -139,8 +139,8 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 			prompt, completion := relaycommon.NativeUsagePresence([]byte(data), "Usage.PromptTokens", "Usage.CompletionTokens", "Usage.TotalTokens")
 			reported := dto.Usage{PromptTokens: tencentResponse.Usage.PromptTokens, CompletionTokens: tencentResponse.Usage.CompletionTokens}
 			info.ResponseFacts.RecordUsage(usage, &reported, prompt, completion)
-			if tencentResponse.Error.Code != 0 {
-				return usage, types.NewError(fmt.Errorf("Tencent stream failed"), types.ErrorCodeBadResponse)
+			if tencentResponse.Error.HasError() {
+				return usage, types.WithOpenAIError(types.OpenAIError{Message: tencentResponse.Error.Message, Code: tencentResponse.Error.Code}, resp.StatusCode)
 			}
 		}
 		response := streamResponseTencent2OpenAI(&tencentResponse)
@@ -210,7 +210,7 @@ func tencentHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Resp
 		}
 		return &fullTextResponse.Usage, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
-	if tencentSb.Response.Error.Code != 0 {
+	if tencentSb.Response.Error.HasError() {
 		return &fullTextResponse.Usage, types.WithOpenAIError(types.OpenAIError{
 			Message: tencentSb.Response.Error.Message,
 			Code:    tencentSb.Response.Error.Code,

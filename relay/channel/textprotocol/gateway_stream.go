@@ -47,9 +47,9 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		if measured != nil {
 			usage = measured
 		}
-		prompt, completion := gatewayUsageCounters(data, p.format)
-		info.ResponseFacts.PromptTokensReported = info.ResponseFacts.PromptTokensReported || gatewayValidCounter(prompt)
-		info.ResponseFacts.CompletionTokensReported = info.ResponseFacts.CompletionTokensReported || gatewayValidCounter(completion)
+		prompt, completion := meter.BaseCounters()
+		info.ResponseFacts.PromptTokensReported = info.ResponseFacts.PromptTokensReported || prompt
+		info.ResponseFacts.CompletionTokensReported = info.ResponseFacts.CompletionTokensReported || completion
 		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 		info.ResponseFacts.IndependentUsageReported = meter.ReportedCounters()
 		normalized, err := meter.NormalizedBody(data)
@@ -94,6 +94,11 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			event = &dto.GeminiChatResponse{}
 		}
 		safety := observeGatewaySafety(info, []byte(data), p.format)
+		if !gjson.Valid(data) {
+			streamErr = errors.New("invalid upstream stream JSON")
+			sr.Stop(streamErr)
+			return
+		}
 		if err := common.Unmarshal(normalized, event); err != nil {
 			streamErr = err
 			sr.Stop(err)
@@ -198,9 +203,9 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 	if len(partial) > 0 {
 		if measured, err := meter.Observe(partial); err == nil && measured != nil {
 			usage = measured
-			prompt, completion := gatewayUsageCounters(partial, p.format)
-			info.ResponseFacts.PromptTokensReported = info.ResponseFacts.PromptTokensReported || gatewayValidCounter(prompt)
-			info.ResponseFacts.CompletionTokensReported = info.ResponseFacts.CompletionTokensReported || gatewayValidCounter(completion)
+			prompt, completion := meter.BaseCounters()
+			info.ResponseFacts.PromptTokensReported = info.ResponseFacts.PromptTokensReported || prompt
+			info.ResponseFacts.CompletionTokensReported = info.ResponseFacts.CompletionTokensReported || completion
 			info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 			info.ResponseFacts.IndependentUsageReported = meter.ReportedCounters()
 		}
@@ -331,27 +336,6 @@ func gatewayOutputLimitReached(body []byte, format types.RelayFormat) bool {
 		}
 	}
 	return false
-}
-
-func gatewayUsageCounters(body []byte, format types.RelayFormat) (gjson.Result, gjson.Result) {
-	switch format {
-	case types.RelayFormatOpenAIResponses:
-		root := gjson.ParseBytes(body)
-		if root.Get("response").Exists() {
-			root = root.Get("response")
-		}
-		return root.Get("usage.input_tokens"), root.Get("usage.output_tokens")
-	case types.RelayFormatClaude:
-		root := gjson.ParseBytes(body)
-		if root.Get("message").Exists() {
-			root = root.Get("message")
-		}
-		return root.Get("usage.input_tokens"), root.Get("usage.output_tokens")
-	case types.RelayFormatGemini:
-		return gjson.GetBytes(body, "usageMetadata.promptTokenCount"), gjson.GetBytes(body, "usageMetadata.candidatesTokenCount")
-	default:
-		return gjson.GetBytes(body, "usage.prompt_tokens"), gjson.GetBytes(body, "usage.completion_tokens")
-	}
 }
 
 func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value any, output *gatewayGeneratedOutput) (string, error) {
@@ -489,7 +473,7 @@ func gatewayStreamBusinessText(body []byte, format types.RelayFormat) string {
 		}
 	case types.RelayFormatClaude:
 		if root.Get("type").String() == "content_block_start" {
-			text.WriteString(gatewayMessagesBlockText(root.Get("content_block")))
+			text.WriteString(gatewayMessagesBlockText(root.Get("content_block"), true))
 		}
 		if root.Get("type").String() == "content_block_delta" {
 			for _, key := range []string{"text", "thinking", "partial_json"} {

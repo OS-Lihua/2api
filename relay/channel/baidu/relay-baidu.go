@@ -127,6 +127,15 @@ func embeddingResponseBaidu2OpenAI(response *BaiduEmbeddingResponse) *dto.OpenAI
 
 func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, *dto.Usage) {
 	usage := &dto.Usage{}
+	observeSource := func(data []byte) {
+		if info.ResponseFacts == nil {
+			return
+		}
+		info.ResponseFacts.RecordNativeUsage(usage, data, "usage.prompt_tokens", "usage.completion_tokens")
+		data = relaycommon.SanitizeNativeUsage(data, "usage")
+		_ = info.ResponseFacts.RecordChatUsage(usage, data, "usage")
+		helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(data, "", "result"))
+	}
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		if info.ResponseFacts != nil {
 			info.StreamStatus.RequireTerminal()
@@ -173,16 +182,10 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 				sr.Done()
 			}
 		}
-	})
+	}, func(data string) { observeSource([]byte(data)) })
 	if info.ResponseFacts != nil && len(info.ResponseFacts.UnterminatedStreamData) > 0 {
-		info.ResponseFacts.RecordNativeUsage(usage, info.ResponseFacts.UnterminatedStreamData, "usage.prompt_tokens", "usage.completion_tokens")
-		partial := relaycommon.SanitizeNativeUsage(info.ResponseFacts.UnterminatedStreamData, "usage")
-		_ = info.ResponseFacts.RecordChatUsage(usage, partial, "usage")
+		observeSource(info.ResponseFacts.UnterminatedStreamData)
 		info.ResponseFacts.UnterminatedStreamData = nil
-		var complete common.RawMessage
-		if common.Unmarshal(partial, &complete) == nil {
-			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(partial, "", "result"))
-		}
 	}
 	service.CloseResponseBodyGracefully(resp)
 	helper.EstimateMissingChatUsage(c, info, usage)

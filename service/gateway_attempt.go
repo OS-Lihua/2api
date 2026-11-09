@@ -87,7 +87,7 @@ func ClassifyGatewayFailure(status int, code string, transport, timeout, cancell
 		return GatewayFailure{Class: "stream_interrupted", Switch: true}
 	case (status == 200 || status == 404) && (code == "model_not_found" || code == "model_not_exist" || code == "not_found_error" || code == "ResourceNotFoundException" || code == "DeploymentNotFound" || strings.HasPrefix(code, "model '") && strings.HasSuffix(code, "' not found") || strings.HasPrefix(code, "model \"") && strings.HasSuffix(code, "\" not found")):
 		return GatewayFailure{Class: "model_not_found", Switch: true}
-	case status == 429 || code == "rate_limit_exceeded" || code == "ThrottlingException":
+	case status == 429 || code == "rate_limit_exceeded" || code == "ThrottlingException" || code == "RequestLimitExceeded" || strings.HasPrefix(code, "RequestLimitExceeded."):
 		return GatewayFailure{Class: "rate_limited", Switch: true}
 	case status == 500 || status == 502 || status == 503 || status == 504 || status == 529 || code == "overloaded" || code == "overloaded_error":
 		return GatewayFailure{Class: "upstream_unavailable", Switch: true}

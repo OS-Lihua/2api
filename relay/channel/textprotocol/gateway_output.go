@@ -314,7 +314,7 @@ func gatewayGeminiPartText(part gjson.Result) string {
 	return text.String()
 }
 
-func gatewayMessagesBlockText(block gjson.Result) string {
+func gatewayMessagesBlockText(block gjson.Result, initialBlock bool) string {
 	switch block.Get("type").String() {
 	case "text":
 		return relaycommon.SourceText(block.Get("text"))
@@ -324,7 +324,7 @@ func gatewayMessagesBlockText(block gjson.Result) string {
 		text := relaycommon.SourceText(block.Get("name"))
 		input := block.Get("input")
 		// An empty initial object is a placeholder before input_json_delta.
-		if input.Exists() && input.Type != gjson.Null && input.Raw != "{}" && gjson.Valid(input.Raw) {
+		if input.Exists() && input.Type != gjson.Null && !(initialBlock && input.IsObject() && len(input.Map()) == 0) && gjson.Valid(input.Raw) {
 			text += input.String()
 		}
 		return text

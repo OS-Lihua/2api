@@ -153,6 +153,23 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 	var responseText, currentEvent, currentData string
 	type sourceMessage struct{ content, reasoning string }
 	sourceMessages := map[string]sourceMessage{}
+	observeCompletedSource := func(data []byte) {
+		root := gjson.ParseBytes(data)
+		id := relaycommon.SourceText(root.Get("id"))
+		previous := sourceMessages[id]
+		content, reasoning := relaycommon.SourceText(root.Get("content")), relaycommon.SourceText(root.Get("reasoning_content"))
+		var suffix strings.Builder
+		if strings.HasPrefix(content, previous.content) {
+			suffix.WriteString(content[len(previous.content):])
+			previous.content = content
+		}
+		if strings.HasPrefix(reasoning, previous.reasoning) {
+			suffix.WriteString(reasoning[len(previous.reasoning):])
+			previous.reasoning = reasoning
+		}
+		sourceMessages[id] = previous
+		helper.RecordNativeStreamSource(c, info, &dto.OpenAITextResponse{Choices: []dto.OpenAITextResponseChoice{{Message: dto.Message{Role: "assistant", Content: suffix.String()}}}})
+	}
 	for scanner.Scan() {
 		if managed {
 			event := helper.ParseSSEEvent(scanner.Text())
@@ -163,6 +180,9 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 				message.content += relaycommon.SourceText(root.Get("content"))
 				message.reasoning += relaycommon.SourceText(root.Get("reasoning_content"))
 				sourceMessages[id] = message
+			}
+			if event.Event == "conversation.message.completed" {
+				observeCompletedSource([]byte(event.Data))
 			}
 			if event.Event != "" && event.HasData {
 				if err := handleCozeEvent(c, event.Event, event.Data, &responseText, usage, id, info); err != nil {
@@ -190,26 +210,12 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 	if managed && len(info.ResponseFacts.UnterminatedStreamData) > 0 {
 		partial := info.ResponseFacts.UnterminatedStreamData
 		_ = recordCozeStreamUsage(info, usage, string(partial))
-		var complete common.RawMessage
-		if common.Unmarshal(partial, &complete) == nil {
-			event := info.ResponseFacts.UnterminatedStreamEvent
-			if event == "conversation.message.delta" {
-				helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(partial, "", "content", "reasoning_content"))
-			}
-			if event == "conversation.message.completed" {
-				root := gjson.ParseBytes(partial)
-				previous := sourceMessages[relaycommon.SourceText(root.Get("id"))]
-				content := relaycommon.SourceText(root.Get("content"))
-				reasoning := relaycommon.SourceText(root.Get("reasoning_content"))
-				var suffix strings.Builder
-				if strings.HasPrefix(content, previous.content) {
-					suffix.WriteString(content[len(previous.content):])
-				}
-				if strings.HasPrefix(reasoning, previous.reasoning) {
-					suffix.WriteString(reasoning[len(previous.reasoning):])
-				}
-				helper.RecordNativeStreamSource(c, info, &dto.OpenAITextResponse{Choices: []dto.OpenAITextResponseChoice{{Message: dto.Message{Role: "assistant", Content: suffix.String()}}}})
-			}
+		event := info.ResponseFacts.UnterminatedStreamEvent
+		if event == "conversation.message.delta" {
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(partial, "", "content", "reasoning_content"))
+		}
+		if event == "conversation.message.completed" {
+			observeCompletedSource(partial)
 		}
 		info.ResponseFacts.UnterminatedStreamData = nil
 		info.ResponseFacts.UnterminatedStreamEvent = ""
