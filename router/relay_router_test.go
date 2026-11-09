@@ -2467,8 +2467,14 @@ func TestRealtimeGatewayAcceptsNativeToolChoice(t *testing.T) {
 }
 
 func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
-	for _, withTools := range []bool{false, true} {
-		t.Run(fmt.Sprintf("tools=%t", withTools), func(t *testing.T) {
+	for _, tc := range []struct {
+		name                            string
+		tools, malformed, before, fixed bool
+	}{
+		{name: "text"}, {name: "tools", tools: true}, {name: "text_error", malformed: true}, {name: "tools_error", tools: true, malformed: true}, {name: "no_generation_error", malformed: true, before: true}, {name: "fixed_error", malformed: true, fixed: true}, {name: "fixed_success", fixed: true},
+	} {
+		withTools, malformed := tc.tools, tc.malformed
+		t.Run(tc.name, func(t *testing.T) {
 			rounds, expected := 1, 558
 			settings := ojson.NewDoc([]byte(`{"type":"session.update","session":{"instructions":"` + strings.Repeat(" hello", 600) + `"}}`))
 			if withTools {
@@ -2480,6 +2486,9 @@ func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
 				schemaTokens := tokenkit.Count("gpt-4o", fmt.Sprint(tool)) + 8
 				expected = common.QuotaRound(float64(1260+2*schemaTokens) * 0.9)
 			}
+			if tc.before {
+				rounds, expected = 0, 0
+			}
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 				t.Error("Legacy Realtime must not use the wallet Channel")
 			})
@@ -2489,6 +2498,13 @@ func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
 			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4o":1}`))
 			require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(`{"gpt-4o":1}`))
 			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{}`))
+			if tc.fixed {
+				require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"gpt-4o":0.01}`))
+				expected = 4500
+				if malformed {
+					expected = 0
+				}
+			}
 			t.Cleanup(func() {
 				require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(oldModel))
 				require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(oldCompletion))
@@ -2549,15 +2565,24 @@ func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
 					require.NoError(t, err)
 				}
 			}
+			if malformed {
+				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":`)))
+				_, _, err := client.ReadMessage()
+				require.True(t, websocket.IsCloseError(err, websocket.CloseNormalClosure), "Malformed client events end the legacy connection")
+			} else {
+				require.NoError(t, client.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second)))
+				_, _, err = client.ReadMessage()
+				require.True(t, websocket.IsCloseError(err, websocket.CloseNormalClosure), "Completed sessions close normally")
+			}
 			require.NoError(t, client.Close())
 			select {
 			case <-done:
 			case <-time.After(5 * time.Second):
 				t.Fatal("Legacy text connection did not release")
 			}
-			require.Eventually(t, func() bool {
+			assert.Eventually(t, func() bool {
 				var user model.User
-				return model.DB.First(&user, fixture.user.Id).Error == nil && user.UsedQuota == expected
+				return model.DB.First(&user, fixture.user.Id).Error == nil && user.UsedQuota == expected && user.Quota == 1_000_000-expected
 			}, 5*time.Second, 10*time.Millisecond, "Input instructions, current tool definitions and delivered output must all be charged; expected %d", expected)
 			var user model.User
 			require.NoError(t, model.DB.First(&user, fixture.user.Id).Error)

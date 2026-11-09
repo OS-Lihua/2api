@@ -175,6 +175,7 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		},
 		ModelName:  modelName,
 		UsePrice:   usePrice,
+		ModelPrice: modelPrice,
 		ModelRatio: modelRatio,
 		GroupRatio: groupRatio,
 	}
