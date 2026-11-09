@@ -1633,8 +1633,14 @@ func TestTextGatewayRouteOccupiedProbeContinuesToNextTier(t *testing.T) {
 }
 
 func TestTextGatewayLossFallbackRetainsNextCheapestAfterAtomicQuotaRejection(t *testing.T) {
-	for _, shared := range []bool{false, true} {
-		t.Run(fmt.Sprintf("redis=%t", shared), func(t *testing.T) {
+	for _, test := range []struct {
+		shared    bool
+		firstCost int
+	}{
+		{false, 1}, {true, 1},
+		{false, 0}, {true, 0},
+	} {
+		t.Run(fmt.Sprintf("redis=%t/first_cost=%d", test.shared, test.firstCost), func(t *testing.T) {
 			var calls atomic.Int32
 			upstream := func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
@@ -1647,14 +1653,18 @@ func TestTextGatewayLossFallbackRetainsNextCheapestAfterAtomicQuotaRejection(t *
 			fixture.offering.RouteMethod = "weight"
 			require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
 			for i, channel := range []*model.Channel{fixture.channel, second, third} {
+				cost := i + 1
+				if i == 0 {
+					cost = test.firstCost
+				}
 				require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{
 					OwnerType: model.PriceOwnerChannel, OwnerID: channel.ID, Currency: "USD",
-					Expression: fmt.Sprintf(`tier("loss", fixed(%d))`, i+1), EffectiveAt: clock.Now().Unix(),
+					Expression: fmt.Sprintf(`tier("loss", fixed(%d))`, cost), EffectiveAt: clock.Now().Unix(),
 				}, fixture.sale.CreatedBy))
 			}
 			fixture.channel.MaxConcurrency = 1
 			require.NoError(t, model.DB.Model(fixture.channel).Update("max_concurrency", 1).Error)
-			if shared {
+			if test.shared {
 				server := miniredis.RunT(t)
 				client := redis.NewClient(&redis.Options{Addr: server.Addr()})
 				t.Cleanup(func() { require.NoError(t, client.Close()) })

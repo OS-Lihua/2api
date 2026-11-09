@@ -327,93 +327,97 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 			}
 			eligible = append(eligible, selection)
 		}
-		lossFallback := false
 		probeFence := eligibleFence
 		if offering.AllowLossFallback {
 			probeFence = append(probeFence, lossFence...)
 		}
-		if len(eligible) == 0 && len(unprofitable) > 0 && offering.AllowLossFallback {
-			eligible = unprofitable
-			lossFallback = true
-		}
-		if len(eligible) == 0 {
-			continue
-		}
-		// Protocol preparation supplies an ordering quality; affinity cannot restore
-		// a rejected candidate or cross a protocol-quality boundary.
-		quality := eligible[0].Quality
-		for _, selection := range eligible {
-			quality = min(quality, selection.Quality)
-		}
-		eligible = slices.DeleteFunc(eligible, func(selection *GatewaySelection) bool { return selection.Quality != quality })
-		rankMethod := offering.RouteMethod
-		if lossFallback {
-			// Loss fallback uses purchase cost; health and weight only order equal costs.
-			rankMethod = "weight"
-		}
-		ranked, err := rankGatewayChannels(c, rankMethod, eligible, health)
-		if err != nil {
-			return nil, err
-		}
-		if lossFallback {
-			// Keep later candidates for atomic admission failures, in purchase-cost order.
-			slices.SortStableFunc(ranked, func(a, b *GatewaySelection) int { order, _ := a.EstimatedCost.Compare(b.EstimatedCost); return order })
-		}
-		preferred, found := GetPreferredGatewayChannelByAffinity(c, offering.ID, tier, offering.Name)
-		if found && !lossFallback {
-			for i, selection := range ranked {
-				if selection.Channel.ID == preferred {
-					ranked = append([]*GatewaySelection{selection}, append(ranked[:i], ranked[i+1:]...)...)
+		for phase := range 2 {
+			lossFallback := phase == 1
+			if lossFallback {
+				if !offering.AllowLossFallback {
 					break
 				}
+				eligible = unprofitable
 			}
-		}
-		for len(ranked) > 0 {
-			ordered := make([]int, len(ranked))
-			for i, selection := range ranked {
-				ordered[i] = selection.Channel.ID
-			}
-			admission, err := ChannelHealth.AcquireWithProbeFence(c.Request.Context(), ordered, probeFence)
-			if err != nil {
-				return nil, ErrGatewayUnavailable
-			}
-			if admission.ChannelID == 0 {
-				lastStage = max(lastStage, 6)
-				for _, selection := range ranked {
-					reject(selection.Channel.ID, "circuit_open")
-				}
-				break
-			}
-			index := slices.IndexFunc(ranked, func(selection *GatewaySelection) bool { return selection.Channel.ID == admission.ChannelID })
-			selected := ranked[index]
-			permit, err := GatewayRouteQuota.Acquire(c.Request.Context(), selected, selected.EstimatedTokens)
-			if err != nil {
-				_ = ChannelHealth.Release(c.Request.Context(), admission)
-				reason := "admission_unavailable"
-				if errors.Is(err, ErrGatewayRateLimited) {
-					reason = "rate_limited"
-				}
-				reject(selected.Channel.ID, reason)
-				lastStage = max(lastStage, 6)
-				priced = slices.DeleteFunc(priced, func(peer *GatewaySelection) bool { return peer.Channel.ID == selected.Channel.ID })
-				ranked = slices.Delete(ranked, index, index+1)
+			if len(eligible) == 0 {
 				continue
 			}
-			selected.Admission, selected.Permit = admission, permit
-			selected.LossFallback, selected.profitPeers = lossFallback, priced
-			selected.affinity, selected.hasAffinity = getChannelAffinityMeta(c)
-			diagnostics["eligible_count"] = len(ranked)
-			diagnostics["excluded"] = excluded
-			diagnostics["member_tier"] = tier
-			diagnostics["health"] = health[selected.Channel.ID]
-			diagnostics["probe"] = admission.Lease != ""
-			diagnostics["loss_fallback"] = lossFallback
-			diagnostics["affinity_hit"] = found && selected.Channel.ID == preferred && !lossFallback
-			diagnostics["estimated_cost"] = selected.EstimatedCost.String()
-			diagnostics["estimated_receivable"] = selected.EstimatedSale.String()
-			diagnostics["score"] = selected.Score.RatString()
-			selected.Diagnostics = diagnostics
-			return selected, nil
+			// Protocol preparation supplies an ordering quality; affinity cannot restore
+			// a rejected candidate or cross a protocol-quality boundary.
+			quality := eligible[0].Quality
+			for _, selection := range eligible {
+				quality = min(quality, selection.Quality)
+			}
+			eligible = slices.DeleteFunc(eligible, func(selection *GatewaySelection) bool { return selection.Quality != quality })
+			rankMethod := offering.RouteMethod
+			if lossFallback {
+				// Loss fallback uses purchase cost; health and weight only order equal costs.
+				rankMethod = "weight"
+			}
+			ranked, err := rankGatewayChannels(c, rankMethod, eligible, health)
+			if err != nil {
+				return nil, err
+			}
+			if lossFallback {
+				// Keep later candidates for atomic admission failures, in purchase-cost order.
+				slices.SortStableFunc(ranked, func(a, b *GatewaySelection) int { order, _ := a.EstimatedCost.Compare(b.EstimatedCost); return order })
+			}
+			preferred, found := GetPreferredGatewayChannelByAffinity(c, offering.ID, tier, offering.Name)
+			if found && !lossFallback {
+				for i, selection := range ranked {
+					if selection.Channel.ID == preferred {
+						ranked = append([]*GatewaySelection{selection}, append(ranked[:i], ranked[i+1:]...)...)
+						break
+					}
+				}
+			}
+			for len(ranked) > 0 {
+				ordered := make([]int, len(ranked))
+				for i, selection := range ranked {
+					ordered[i] = selection.Channel.ID
+				}
+				admission, err := ChannelHealth.AcquireWithProbeFence(c.Request.Context(), ordered, probeFence)
+				if err != nil {
+					return nil, ErrGatewayUnavailable
+				}
+				if admission.ChannelID == 0 {
+					lastStage = max(lastStage, 6)
+					for _, selection := range ranked {
+						reject(selection.Channel.ID, "circuit_open")
+					}
+					break
+				}
+				index := slices.IndexFunc(ranked, func(selection *GatewaySelection) bool { return selection.Channel.ID == admission.ChannelID })
+				selected := ranked[index]
+				permit, err := GatewayRouteQuota.Acquire(c.Request.Context(), selected, selected.EstimatedTokens)
+				if err != nil {
+					_ = ChannelHealth.Release(c.Request.Context(), admission)
+					reason := "admission_unavailable"
+					if errors.Is(err, ErrGatewayRateLimited) {
+						reason = "rate_limited"
+					}
+					reject(selected.Channel.ID, reason)
+					lastStage = max(lastStage, 6)
+					priced = slices.DeleteFunc(priced, func(peer *GatewaySelection) bool { return peer.Channel.ID == selected.Channel.ID })
+					ranked = slices.Delete(ranked, index, index+1)
+					continue
+				}
+				selected.Admission, selected.Permit = admission, permit
+				selected.LossFallback, selected.profitPeers = lossFallback, priced
+				selected.affinity, selected.hasAffinity = getChannelAffinityMeta(c)
+				diagnostics["eligible_count"] = len(ranked)
+				diagnostics["excluded"] = excluded
+				diagnostics["member_tier"] = tier
+				diagnostics["health"] = health[selected.Channel.ID]
+				diagnostics["probe"] = admission.Lease != ""
+				diagnostics["loss_fallback"] = lossFallback
+				diagnostics["affinity_hit"] = found && selected.Channel.ID == preferred && !lossFallback
+				diagnostics["estimated_cost"] = selected.EstimatedCost.String()
+				diagnostics["estimated_receivable"] = selected.EstimatedSale.String()
+				diagnostics["score"] = selected.Score.RatString()
+				selected.Diagnostics = diagnostics
+				return selected, nil
+			}
 		}
 	}
 	if lastStage == 4 {
