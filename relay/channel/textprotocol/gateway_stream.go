@@ -40,7 +40,9 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 	expectedChoices := max(1, info.ResponseFacts.ExpectedChoices)
 	choices := map[int]gatewayStreamChoice{}
 	sourceBudgetEnd := false
+	sourceClosed, sourceBusiness := false, false
 	observeSource := func(data []byte) ([]byte, error) {
+		sourceBusiness = false
 		measured, err := meter.Observe(data)
 		if err != nil {
 			return nil, err
@@ -58,16 +60,20 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			return nil, err
 		}
 		if p.format == types.RelayFormatOpenAIResponses {
-			sourceOutput.ObserveResponses(normalized)
+			text, _ := sourceOutput.ObserveResponses(normalized)
+			sourceBusiness = text != ""
 		} else {
-			sourceOutput.text.WriteString(gatewayStreamBusinessText(normalized, p.format))
+			text := gatewayStreamBusinessText(normalized, p.format)
+			sourceOutput.text.WriteString(text)
+			sourceBusiness = text != ""
 			if p.format == types.RelayFormatOpenAI {
 				sourceOutput.ObserveChat(normalized)
 			} else if p.format == types.RelayFormatGemini {
 				sourceOutput.ObserveGemini(normalized)
 			}
 		}
-		info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || sourceOutput.String() != "" || gatewayMediaOutput(normalized, p.format)
+		sourceBusiness = sourceBusiness || gatewayMediaOutput(normalized, p.format)
+		info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || sourceOutput.String() != "" || sourceBusiness
 		return normalized, nil
 	}
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
@@ -104,6 +110,14 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			streamErr = err
 			sr.Stop(err)
 			return
+		}
+		if sourceClosed && sourceBusiness {
+			streamErr = errors.New("upstream stream contains generation after completion")
+			sr.Stop(streamErr)
+			return
+		}
+		if p.format == types.RelayFormatClaude || p.format == types.RelayFormatOpenAIResponses {
+			sourceClosed = sourceClosed || gatewayTerminalSnapshot(normalized, p.format)
 		}
 		if p.format == types.RelayFormatOpenAIResponses {
 			service.ObserveResponsesOutcome(info, event.(*dto.ResponsesStreamResponse))

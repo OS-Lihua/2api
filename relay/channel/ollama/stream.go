@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -176,7 +177,8 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	info.StreamStatus.RequireTerminal()
 	defer info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
 	helper.SetEventStreamHeaders(c)
-	scanner := helper.NewStreamScanner(resp.Body)
+	sourceReader := &io.LimitedReader{R: resp.Body, N: math.MaxInt64}
+	scanner := helper.NewStreamScanner(sourceReader)
 	usage = &dto.Usage{}
 	defer func() {
 		if info.ResponseFacts == nil || info.ResponseFacts.UsageReported {
@@ -195,6 +197,19 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	var responseId = common.GetUUID()
 	var created = time.Now().Unix()
 	var toolCallIndex int
+	defer func() {
+		if info.ResponseFacts == nil || info.ResponseFacts.OnBusinessOutput == nil {
+			return
+		}
+		// Drain only bytes already received by this scanner.
+		sourceReader.N = 0
+		var lines []string
+		for scanner.Scan() {
+			lines = append(lines, scanner.Text())
+			info.ResponseFacts.RecordNativeUsage(usage, scanner.Bytes(), "prompt_eval_count", "eval_count")
+		}
+		helper.RecordNativeStreamSource(c, info, ollamaSourceResponse(lines, toolCallIndex))
+	}()
 	start := helper.GenerateStartEmptyResponse(responseId, created, model, nil)
 	if data, err := common.Marshal(start); err == nil {
 		_ = helper.StringData(c, string(data))

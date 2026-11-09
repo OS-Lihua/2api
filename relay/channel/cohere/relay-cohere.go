@@ -3,6 +3,7 @@ package cohere
 import (
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 
@@ -112,7 +113,19 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	info.StreamStatus.RequireTerminal()
 	defer info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
 	defer helper.EstimateMissingChatUsage(c, info, usage)
-	scanner := helper.NewStreamScanner(resp.Body)
+	sourceReader := &io.LimitedReader{R: resp.Body, N: math.MaxInt64}
+	scanner := helper.NewStreamScanner(sourceReader)
+	defer func() {
+		if !managed {
+			return
+		}
+		// Drain only bytes already received by this scanner.
+		sourceReader.N = 0
+		for scanner.Scan() {
+			info.ResponseFacts.RecordNativeUsage(usage, scanner.Bytes(), "response.meta.billed_units.input_tokens", "response.meta.billed_units.output_tokens")
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(scanner.Bytes(), "", "text"))
+		}
+	}()
 	helper.SetEventStreamHeaders(c)
 	for scanner.Scan() {
 		if strings.TrimSpace(scanner.Text()) == "" {

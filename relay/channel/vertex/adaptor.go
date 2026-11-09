@@ -62,6 +62,9 @@ func (a *Protocol) ConvertGeminiRequest(c *gin.Context, info *relaycommon.RelayI
 	if err != nil {
 		return nil, err
 	}
+	if native, ok := converted.(*dto.GeminiChatRequest); ok && model_setting.GetGeminiSettings().RemoveFunctionResponseIdEnabled {
+		removeFunctionCallIDs(native)
+	}
 	return (&Provider{}).FixRequest(c, channel.NewProtocolRequestContext(protocol.GeminiGenerate, info), converted)
 }
 

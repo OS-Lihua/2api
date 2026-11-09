@@ -52,6 +52,7 @@ import (
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/alicebob/miniredis/v2"
@@ -5775,10 +5776,15 @@ func (body *gatewayCancelOnCloseBody) Close() error {
 
 type gatewayCancelOnReadBody struct {
 	io.ReadCloser
-	cancel context.CancelFunc
+	cancel      context.CancelFunc
+	context     context.Context
+	afterCancel *atomic.Int32
 }
 
 func (body *gatewayCancelOnReadBody) Read(buffer []byte) (int, error) {
+	if body.afterCancel != nil && body.context.Err() != nil {
+		body.afterCancel.Add(1)
+	}
 	n, err := body.ReadCloser.Read(buffer)
 	if n > 0 {
 		body.cancel()
@@ -5791,7 +5797,17 @@ func TestTextGatewayNativeStreamCancellationPreservesPurchase(t *testing.T) {
 		name, body, key string
 		kind            int
 		tokens          int
-	}{{"Zhipu", "data:Hello\n", "test.secret", constant.ChannelTypeZhipu, 1}, {"PaLM", `{"candidates":[{"content":"Hello"}]}`, "", constant.ChannelTypePaLM, 1}, {"Ollama tool", "{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"Hello\",\"arguments\":{}}}]},\"done\":false}\n", "", constant.ChannelTypeOllama, 9}} {
+		reported        bool
+	}{
+		{"Zhipu", "data:Hello\n", "test.secret", constant.ChannelTypeZhipu, 1, false},
+		{"PaLM", `{"candidates":[{"content":"Hello"}]}`, "", constant.ChannelTypePaLM, 1, false},
+		{"Ollama tool", "{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"Hello\",\"arguments\":{}}}]},\"done\":false}\n", "", constant.ChannelTypeOllama, 9, false},
+		{"Zhipu buffered usage", "data:Hello\nmeta:{\"task_status\":\"SUCCESS\",\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n", "test.secret", constant.ChannelTypeZhipu, 5, true},
+		{"Ollama buffered usage", "{\"message\":{\"content\":\"Hello\"},\"done\":false}\n{\"done\":true,\"prompt_eval_count\":10,\"eval_count\":5}\n", "", constant.ChannelTypeOllama, 5, true},
+		{"Cohere buffered usage", "{\"text\":\"Hello\",\"event_type\":\"text-generation\"}\n{\"is_finished\":true,\"event_type\":\"stream-end\",\"finish_reason\":\"COMPLETE\",\"response\":{\"meta\":{\"billed_units\":{\"input_tokens\":10,\"output_tokens\":5}}}}\n", "", constant.ChannelTypeCohere, 5, true},
+		{"Tencent buffered usage", "data: {\"Choices\":[{\"Delta\":{\"Content\":\"Hello\"}}]}\n\ndata: {\"Choices\":[],\"Usage\":{\"PromptTokens\":10,\"CompletionTokens\":5}}\n\n", "1|test-id|test-secret", constant.ChannelTypeTencent, 5, true},
+		{"Coze buffered usage", "event: conversation.message.delta\ndata: {\"content\":\"Hello\"}\n\nevent: conversation.chat.completed\ndata: {\"usage\":{\"input_count\":10,\"output_count\":5}}\n\n", "", constant.ChannelTypeCoze, 5, true},
+	} {
 		t.Run(provider.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			t.Cleanup(cancel)
@@ -5809,10 +5825,17 @@ func TestTextGatewayNativeStreamCancellationPreservesPurchase(t *testing.T) {
 			client := service.GetHttpClient()
 			original := client.Transport
 			t.Cleanup(func() { client.Transport = original })
+			var afterCancel atomic.Int32
 			client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
 				response, err := original.RoundTrip(request)
 				if err == nil {
-					response.Body = &gatewayCancelOnReadBody{ReadCloser: response.Body, cancel: cancel}
+					if provider.reported {
+						buffered, readErr := io.ReadAll(response.Body)
+						require.NoError(t, readErr)
+						require.NoError(t, response.Body.Close())
+						response.Body = io.NopCloser(bytes.NewReader(buffered))
+					}
+					response.Body = &gatewayCancelOnReadBody{ReadCloser: response.Body, cancel: cancel, context: ctx, afterCancel: &afterCancel}
 				}
 				return response, err
 			})
@@ -5839,7 +5862,12 @@ func TestTextGatewayNativeStreamCancellationPreservesPurchase(t *testing.T) {
 			items = attempts.Data["items"].([]any)
 			require.Len(t, items, 1)
 			attempt := items[0].(map[string]any)
-			assert.Equal(t, "estimated", attempt["usage_source"])
+			if provider.reported {
+				assert.Equal(t, "upstream", attempt["usage_source"])
+				assert.Zero(t, afterCancel.Load(), "source recovery must not read upstream after cancellation")
+			} else {
+				assert.Equal(t, "estimated", attempt["usage_source"])
+			}
 			assert.EqualValues(t, provider.tokens, attempt["usage"].(map[string]any)["completion_tokens"])
 			assert.Equal(t, map[string]any{"nanos": strconv.Itoa(provider.tokens * 2000), "currency": "USD"}, attempt["cost"])
 		})
@@ -9825,6 +9853,7 @@ func TestTextGatewayBedrockClaudeUsesFinalWireForPurchase(t *testing.T) {
 
 func TestTextGatewayVertexClaudePreservesActualWire(t *testing.T) {
 	calls := 0
+	removeLegacyIDs := false
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		if strings.Contains(r.URL.Path, "gemini") {
@@ -9833,9 +9862,14 @@ func TestTextGatewayVertexClaudePreservesActualWire(t *testing.T) {
 			require.Len(t, body.Contents, 3)
 			for i, id := range []string{"call_a", "call_b"} {
 				require.NotNil(t, body.Contents[1].Parts[i].FunctionCall)
-				assert.Equal(t, id, body.Contents[1].Parts[i].FunctionCall.ID)
 				require.NotNil(t, body.Contents[2].Parts[i].FunctionResponse)
-				assert.JSONEq(t, fmt.Sprintf("%q", id), string(body.Contents[2].Parts[i].FunctionResponse.ID))
+				if removeLegacyIDs {
+					assert.Empty(t, body.Contents[1].Parts[i].FunctionCall.ID)
+					assert.Empty(t, body.Contents[2].Parts[i].FunctionResponse.ID)
+				} else {
+					assert.Equal(t, id, body.Contents[1].Parts[i].FunctionCall.ID)
+					assert.JSONEq(t, fmt.Sprintf("%q", id), string(body.Contents[2].Parts[i].FunctionResponse.ID))
+				}
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}`)
@@ -9914,6 +9948,32 @@ func TestTextGatewayVertexClaudePreservesActualWire(t *testing.T) {
 		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 		assert.Equal(t, 2, calls)
 		assert.Empty(t, response.Header().Get("X-Gateway-Conversion-Loss"))
+		var history dto.GeminiChatRequest
+		require.NoError(t, common.UnmarshalJsonStr(`{"contents":[{"role":"user","parts":[{"text":"Hello"}]},{"role":"model","parts":[{"functionCall":{"id":"call_a","name":"lookup","args":{}}},{"functionCall":{"id":"call_b","name":"lookup","args":{}}}]},{"role":"user","parts":[{"functionResponse":{"id":"call_a","name":"lookup","response":{"result":"A"}}},{"functionResponse":{"id":"call_b","name":"lookup","response":{"result":"B"}}}]}],"generationConfig":{"maxOutputTokens":16}}`, &history))
+		previousPerf := perf_metrics_setting.GetSetting().Enabled
+		require.NoError(t, model.UpdateOption("perf_metrics_setting.enabled", "false"))
+		t.Cleanup(func() {
+			require.NoError(t, model.UpdateOption("perf_metrics_setting.enabled", strconv.FormatBool(previousPerf)))
+		})
+		previousRatios := ratio_setting.ModelRatio2JSONString()
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gemini-2.5-flash":1}`))
+		t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(previousRatios)) })
+		require.NoError(t, model.DB.Model(fixture.token).Update("remain_quota", 1000000).Error)
+		require.NoError(t, model.DB.Model(fixture.user).Updates(map[string]any{"quota": 1000000, "setting": `{"billing_preference":"wallet_only"}`}).Error)
+		require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"models": "gemini-2.5-flash", "group": "default"}).Error)
+		require.NoError(t, model.DB.Create(&model.Ability{ChannelId: fixture.channel.ProviderID, Group: "default", Model: "gemini-2.5-flash", Enabled: true}).Error)
+		for _, remove := range []bool{true, false} {
+			t.Run(fmt.Sprintf("legacy removal=%t", remove), func(t *testing.T) {
+				removeLegacyIDs = remove
+				model_setting.GetGeminiSettings().RemoveFunctionResponseIdEnabled = remove
+				body, err := common.Marshal(&history)
+				require.NoError(t, err)
+				before := calls
+				legacy := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1beta/models/gemini-2.5-flash:generateContent", string(body))
+				require.Equal(t, http.StatusOK, legacy.Code, legacy.Body.String())
+				assert.Equal(t, before+1, calls)
+			})
+		}
 	})
 }
 
@@ -11792,6 +11852,9 @@ func TestTextGatewayPartialSaleUsesDeliveredOutput(t *testing.T) {
 
 func TestTextGatewaySuccessfulTerminalWaitsForTransportValidation(t *testing.T) {
 	for _, source := range []struct{ protocol, path, request, prefix, terminal, broken, forbidden string }{
+		{"openai_responses", "/v1/responses", `{"model":"gateway-offering","stream":true,"input":"Hello","max_output_tokens":16}`, `{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Hello"}`, `{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5}}}`, `{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Extra"}`, "event: response.completed"},
+		{"openai_responses", "/v1/responses", `{"model":"gateway-offering","stream":true,"input":"Hello","max_output_tokens":16}`, `{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Hello"}`, `{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":10,"output_tokens":5}}}`, `{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Extra"}`, "event: response.incomplete"},
+		{"anthropic_messages", "/v1/messages", `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}`, `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}`, `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Extra"}}`, "event: message_stop"},
 		{"openai_responses", "/v1/responses", `{"model":"gateway-offering","stream":true,"input":"Hello","max_output_tokens":16}`, `{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Hello"}`, `{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":10,"output_tokens":5}}}`, `{"type":"response.output_text.delta","output_index":"invalid"}`, "event: response.incomplete"},
 		{"openai_chat", "/v1/chat/completions", `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, `{"choices":[{"index":0,"delta":{"content":"Hello"}}]}`, `{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`, `{"choices":"invalid"}`, `"finish_reason":"stop"`},
 		{"openai_responses", "/v1/responses", `{"model":"gateway-offering","stream":true,"input":"Hello","max_output_tokens":16}`, `{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Hello"}`, `{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5}}}`, `{"type":"response.output_text.delta","output_index":"invalid"}`, "event: response.completed"},
@@ -11821,6 +11884,7 @@ func TestTextGatewaySuccessfulTerminalWaitsForTransportValidation(t *testing.T) 
 			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 			assert.Contains(t, response.Body.String(), "Hello")
 			assert.NotContains(t, response.Body.String(), source.forbidden)
+			assert.NotContains(t, response.Body.String(), "Extra")
 			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
 			require.NoError(t, err)
 			assert.Equal(t, "partial", record.Status)
