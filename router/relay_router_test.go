@@ -348,9 +348,12 @@ func dialResponsesGateway(t *testing.T, fixture textGatewayFixture, language ...
 func TestWebSocketGatewayParameterDiagnostics(t *testing.T) {
 	for _, test := range []struct {
 		name                        string
-		native                      bool
+		native, noTools             bool
 		body, path, overrides, code string
 	}{
+		{name: "Responses tool history", noTools: true, body: `{"type":"response.create","model":"gateway-alias","input":[{"type":"function_call","name":"lookup","call_id":"a","arguments":"{}"},{"type":"function_call_output","call_id":"a","output":"ok"}]}`, path: "input[0].type"},
+		{name: "Realtime tool history", native: true, noTools: true, body: `{"type":"response.create","response":{"input":[{"type":"function_call","name":"lookup","call_id":"a","arguments":"{}"},{"type":"function_call_output","call_id":"a","output":"ok"}]}}`, path: "input[0].type"},
+		{name: "Responses output limit type override", body: `{"type":"response.create","model":"gateway-alias","input":"Hi"}`, overrides: `{"max_output_tokens":"huge"}`, path: "max_output_tokens"},
 		{name: "Responses output limit type", body: `{"type":"response.create","model":"gateway-alias","input":"Hi","max_output_tokens":"huge"}`, path: "max_output_tokens", code: "invalid_request"},
 		{name: "Responses nested minimum bound", body: `{"type":"response.create","model":"gateway-alias","input":"Hi","parameters":{"min_tokens":2147483648}}`, path: "parameters.min_tokens", code: "invalid_request"},
 		{name: "Responses nested minimum type", body: `{"type":"response.create","model":"gateway-alias","input":"Hi","parameters":{"min_tokens":"huge"}}`, path: "parameters.min_tokens", code: "invalid_request"},
@@ -390,6 +393,12 @@ func TestWebSocketGatewayParameterDiagnostics(t *testing.T) {
 					calls.Add(1)
 				}
 			})
+			if test.noTools {
+				var unified model.Model
+				require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+				unified.Capabilities.Features = []capability.Feature{capability.Streaming}
+				require.NoError(t, model.DB.Model(&unified).Select("capabilities").Updates(&unified).Error)
+			}
 			if test.overrides != "" {
 				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", test.overrides).Error)
 			}
@@ -786,7 +795,7 @@ func TestResponsesWSGatewayReservesKnownHistory(t *testing.T) {
 }
 
 func TestResponsesWSGatewayResolvesItemReferences(t *testing.T) {
-	for _, scenario := range []string{"insufficient funds", "missing usage", "unknown item", "conversation", "omitted insufficient funds", "omitted missing usage", "omitted unknown item"} {
+	for _, scenario := range []string{"insufficient funds", "missing usage", "unknown item", "conversation", "omitted insufficient funds", "omitted missing usage", "omitted unknown item", "tool reference", "previous tool response", "tool reference allowed"} {
 		t.Run(scenario, func(t *testing.T) {
 			omitted := strings.HasPrefix(scenario, "omitted ")
 			scenario = strings.TrimPrefix(scenario, "omitted ")
@@ -815,6 +824,9 @@ func TestResponsesWSGatewayResolvesItemReferences(t *testing.T) {
 						id = "msg-B"
 					}
 					reply := fmt.Sprintf(`{"type":"response.completed","response":{"id":"ref-response-%d","status":"completed","output":[{"id":%q,"type":"message","role":"assistant","content":[{"type":"output_text","text":%q}]}]%s}}`, index, id, text, usage)
+					if strings.Contains(scenario, "tool") {
+						reply = fmt.Sprintf(`{"type":"response.completed","response":{"id":"ref-response-%d","status":"completed","output":[{"id":%q,"type":"function_call","name":"lookup","call_id":"tool-call","arguments":"{}"}],"usage":{"input_tokens":0,"output_tokens":0}}}`, index, id)
+					}
 					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(reply))) {
 						return
 					}
@@ -834,6 +846,12 @@ func TestResponsesWSGatewayResolvesItemReferences(t *testing.T) {
 				require.NoError(t, err)
 				require.NoError(t, model.DB.Model(wallet).Update("balance_nanos", 1_000_000).Error)
 			}
+			if strings.Contains(scenario, "tool") && !strings.HasSuffix(scenario, "allowed") {
+				var unified model.Model
+				require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+				unified.Capabilities.Features = []capability.Feature{capability.Streaming}
+				require.NoError(t, model.DB.Model(&unified).Select("capabilities").Updates(&unified).Error)
+			}
 			id := "msg-A"
 			if scenario == "unknown item" {
 				id = "unknown-item"
@@ -842,15 +860,28 @@ func TestResponsesWSGatewayResolvesItemReferences(t *testing.T) {
 			if omitted {
 				body = strings.Replace(body, `"type":"item_reference",`, "", 1)
 			}
+			if scenario == "previous tool response" {
+				body = `{"type":"response.create","model":"gateway-alias","previous_response_id":"ref-response-1","input":[],"max_output_tokens":1}`
+			}
 			if scenario == "conversation" {
 				body = `{"type":"response.create","model":"gateway-alias","conversation":"external-conversation","input":"Hi","max_output_tokens":1}`
 			}
 			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(body)))
 			_, reply, err := client.ReadMessage()
 			require.NoError(t, err)
-			if scenario != "missing usage" {
+			if scenario != "missing usage" && scenario != "tool reference allowed" {
 				assert.Equal(t, "error", ojson.GetBytes(reply, "type").String())
 				assert.Equal(t, int32(1), calls.Load())
+				if strings.Contains(scenario, "tool") {
+					path := "input[0].id"
+					if scenario == "previous tool response" {
+						path = "previous_response_id"
+					}
+					assert.Equal(t, path, ojson.GetBytes(reply, "error.param").String())
+					var reservations int64
+					require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Where("user_id = ?", fixture.user.Id).Count(&reservations).Error)
+					assert.EqualValues(t, 1, reservations)
+				}
 			} else {
 				assert.Equal(t, "response.completed", ojson.GetBytes(reply, "type").String())
 				var records []model.GatewayRequest
@@ -859,10 +890,14 @@ func TestResponsesWSGatewayResolvesItemReferences(t *testing.T) {
 					records, _, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
 					return err == nil && len(records) == 2 && records[0].Status == "success" && records[1].Status == "success"
 				}, 5*time.Second, 10*time.Millisecond)
-				index := slices.IndexFunc(records, func(record model.GatewayRequest) bool { return record.Usage.PromptTokens == 600 })
-				require.NotEqual(t, -1, index)
-				assert.Equal(t, int64(1_083_600), records[index].Receivable.Nanos)
-				assertTextGatewayLedger(t, records[index], 602_000)
+				if scenario == "missing usage" {
+					index := slices.IndexFunc(records, func(record model.GatewayRequest) bool { return record.Usage.PromptTokens == 600 })
+					require.NotEqual(t, -1, index)
+					assert.Equal(t, int64(1_083_600), records[index].Receivable.Nanos)
+					assertTextGatewayLedger(t, records[index], 602_000)
+				} else {
+					assert.EqualValues(t, 2, calls.Load())
+				}
 			}
 			require.NoError(t, client.Close())
 		})
@@ -1142,13 +1177,20 @@ func TestResponsesWSGatewayBoundsOutputIdentityState(t *testing.T) {
 
 func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 	for _, tc := range []struct {
-		name, terminal, source, status   string
-		sale, cost                       int64
-		invalid                          bool
-		credentials, pending             bool
-		item, refusal, tool              bool
-		delta, cancel, disconnect, probe bool
+		name, terminal, source, status, interim          string
+		sale, cost                                       int64
+		invalid                                          bool
+		credentials, pending                             bool
+		item, refusal, tool, split, summary, splitPrefix bool
+		delta, cancel, disconnect, probe                 bool
 	}{
+		{name: "later partial content delta and complete snapshot", item: true, delta: true, split: true, splitPrefix: true, terminal: `{"type":"response.failed","response":{"id":"active","status":"failed","error":{"code":"server_error"}}}`, source: "estimated", status: "partial", sale: 9000, cost: 5000},
+		{name: "complete reasoning summary snapshot disconnect", item: true, summary: true, disconnect: true, source: "estimated", status: "cancelled", sale: 5400, cost: 3000},
+		{name: "later summary delta and complete snapshot", item: true, delta: true, split: true, summary: true, terminal: `{"type":"response.failed","response":{"id":"active","status":"failed","error":{"code":"server_error"}}}`, source: "estimated", status: "partial", sale: 9000, cost: 5000},
+		{name: "cache write correction clears total", delta: true, interim: `{"type":"response.in_progress","response":{"id":"active","status":"in_progress","usage":{"input_tokens_details":{"cache_write_tokens_details":{"ttl_12h_tokens":20000}}}}}`, terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[],"usage":{"output_tokens":1,"input_tokens_details":{"cache_write_tokens_details":{"ttl_12h_tokens":0}}}}}`, source: "estimated", status: "success", sale: 5400, cost: 0},
+		{name: "cache write correction retains missing lifetime", delta: true, interim: `{"type":"response.in_progress","response":{"id":"active","status":"in_progress","usage":{"input_tokens_details":{"cache_write_tokens_details":{"ttl_12h_tokens":20000,"ttl_30m_tokens":10000}}}}}`, terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[],"usage":{"output_tokens":1,"input_tokens_details":{"cache_write_tokens_details":{"ttl_12h_tokens":0}}}}}`, source: "estimated", status: "success", sale: 18003600, cost: 10000000},
+		{name: "cached subtype correction clears modal totals", delta: true, interim: `{"type":"response.in_progress","response":{"id":"active","status":"in_progress","usage":{"input_tokens_details":{"cached_tokens_details":{"text_tokens":20000,"image_tokens":20000,"audio_tokens":20000}}}}}`, terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[],"usage":{"output_tokens":1,"input_tokens_details":{"cached_tokens_details":{"text_tokens":0,"image_tokens":0,"audio_tokens":0}}}}}`, source: "estimated", status: "success", sale: 5400, cost: 0},
+		{name: "later content delta and complete multipart snapshot", item: true, delta: true, split: true, terminal: `{"type":"response.failed","response":{"id":"active","status":"failed","error":{"code":"server_error"}}}`, source: "estimated", status: "partial", sale: 9000, cost: 5000},
 		{name: "partial tool arguments and complete snapshots", item: true, delta: true, tool: true, terminal: `{"type":"response.failed","response":{"id":"active","status":"failed","error":{"code":"server_error"}}}`, source: "estimated", status: "partial", sale: 23400, cost: 13000},
 		{name: "complete refusal snapshot disconnect", item: true, refusal: true, disconnect: true, source: "estimated", status: "cancelled", sale: 5400, cost: 3000},
 		{name: "complete message snapshot disconnect", item: true, disconnect: true, source: "estimated", status: "cancelled", sale: 5400, cost: 3000},
@@ -1203,6 +1245,15 @@ func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 					}
 					if tc.delta {
 						frame := `{"type":"response.output_text.delta","response_id":"active","item_id":"snapshot","output_index":0,"delta":"hello"}`
+						if tc.split {
+							frame = `{"type":"response.output_text.delta","response_id":"active","item_id":"snapshot","output_index":0,"content_index":1,"delta":"x"}`
+						}
+						if tc.splitPrefix {
+							frame = `{"type":"response.output_text.delta","response_id":"active","item_id":"snapshot","output_index":0,"content_index":1,"delta":"wo"}`
+						}
+						if tc.summary {
+							frame = `{"type":"response.reasoning_summary_text.delta","response_id":"active","item_id":"snapshot","output_index":0,"summary_index":1,"delta":"x"}`
+						}
 						if tc.tool {
 							frame = `{"type":"response.function_call_arguments.delta","response_id":"active","item_id":"snapshot","output_index":0,"delta":"{"}`
 						}
@@ -1219,6 +1270,18 @@ func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 						if tc.tool {
 							frame = `{"type":"response.output_item.done","response_id":"active","output_index":0,"item":{"id":"snapshot","type":"function_call","name":"lookup","arguments":"{\"ok\":1}"}}`
 						}
+						if tc.split {
+							frame = `{"type":"response.output_item.done","response_id":"active","output_index":0,"item":{"id":"snapshot","type":"message","role":"assistant","content":[{"type":"output_text","text":"abcdefghijklmnopqrstuvwxyz"},{"type":"output_text","text":"x"}]}}`
+						}
+						if tc.summary {
+							frame = `{"type":"response.output_item.done","response_id":"active","output_index":0,"item":{"id":"snapshot","type":"reasoning","summary":[{"type":"summary_text","text":"hello"}]}}`
+							if tc.split {
+								frame = `{"type":"response.output_item.done","response_id":"active","output_index":0,"item":{"id":"snapshot","type":"reasoning","summary":[{"type":"summary_text","text":"abcdefghijklmnopqrstuvwxyz"},{"type":"summary_text","text":"x"}]}}`
+							}
+						}
+						if tc.splitPrefix {
+							frame = `{"type":"response.output_item.done","response_id":"active","output_index":0,"item":{"id":"snapshot","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello "},{"type":"output_text","text":"world"}]}}`
+						}
 						if tc.refusal {
 							frame = `{"type":"response.output_item.done","response_id":"active","output_index":0,"item":{"id":"snapshot","type":"message","role":"assistant","content":[{"type":"refusal","refusal":"hello"}]}}`
 						}
@@ -1227,6 +1290,11 @@ func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 								return
 							}
 						}
+					}
+				}
+				if tc.interim != "" {
+					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(tc.interim))) {
+						return
 					}
 				}
 				if tc.disconnect {
@@ -1246,6 +1314,12 @@ func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 				_, _, _ = peer.ReadMessage()
 			})
 			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("model_name", "gpt-4o").Error)
+			if strings.HasPrefix(tc.name, "cache write correction") {
+				price := *fixture.purchase
+				price.ID, price.EffectiveAt, price.Expression = 0, clock.Now().Unix()+1, `tier("cache",cc)`
+				require.NoError(t, model.CreatePriceVersion(t.Context(), &price, fixture.sale.CreatedBy))
+				fixture.fake.Advance(2 * time.Second)
+			}
 			if strings.HasPrefix(tc.name, "cache write lifetime") {
 				price := *fixture.purchase
 				price.ID, price.EffectiveAt, price.Expression = 0, clock.Now().Unix()+1, `tier("cache",cc12h)`
@@ -1281,6 +1355,9 @@ func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 			require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
 			if tc.delta || tc.item {
 				count := 1
+				if tc.interim != "" {
+					count++
+				}
 				if tc.tool {
 					count++
 				}
@@ -2114,44 +2191,70 @@ func TestRealtimeGatewayRetainsReportedInputForNextResponse(t *testing.T) {
 }
 
 func TestRealtimeGatewayAcceptsAudioOnlyOutput(t *testing.T) {
-	var calls atomic.Int32
-	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
-		peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
-		if !assert.NoError(t, err) {
-			return
-		}
-		defer peer.Close()
-		if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"modalities":["audio"],"output_audio_format":"pcm16","turn_detection":null}}`))) {
-			return
-		}
-		if _, _, err := peer.ReadMessage(); err != nil {
-			return
-		}
-		calls.Add(1)
-		for _, frame := range []string{`{"type":"response.created","response":{"id":"audio-only","status":"in_progress"}}`, `{"type":"response.audio.delta","response_id":"audio-only","delta":"` + base64.StdEncoding.EncodeToString(make([]byte, 4800)) + `"}`, `{"type":"response.done","response":{"id":"audio-only","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"output_token_details":{"audio_tokens":2,"text_tokens":0}}}}`} {
-			if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(frame))) {
-				return
+	for _, snapshot := range []bool{false, true} {
+		t.Run(fmt.Sprintf("transcript snapshots=%t", snapshot), func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if !assert.NoError(t, err) {
+					return
+				}
+				defer peer.Close()
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"modalities":["audio"],"output_audio_format":"pcm16","turn_detection":null}}`))) {
+					return
+				}
+				if _, _, err := peer.ReadMessage(); err != nil {
+					return
+				}
+				calls.Add(1)
+				frames := []string{`{"type":"response.created","response":{"id":"audio-only","status":"in_progress"}}`, `{"type":"response.audio.delta","response_id":"audio-only","delta":"` + base64.StdEncoding.EncodeToString(make([]byte, 4800)) + `"}`, `{"type":"response.done","response":{"id":"audio-only","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"output_token_details":{"audio_tokens":2,"text_tokens":0}}}}`}
+				if snapshot {
+					frames = []string{frames[0], `{"type":"response.audio_transcript.delta","response_id":"audio-only","item_id":"transcript","output_index":0,"content_index":1,"delta":"wo"}`, `{"type":"response.output_item.done","response_id":"audio-only","output_index":0,"item":{"id":"transcript","type":"message","role":"assistant","content":[{"type":"audio","transcript":"hello "},{"type":"audio","transcript":"world"}]}}`, `{"type":"response.done","response":{"id":"audio-only","status":"failed","status_details":{"error":{"code":"server_error","type":"server_error"}}}}`}
+				}
+				for _, frame := range frames {
+					if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(frame))) {
+						return
+					}
+				}
+				_, _, _ = peer.ReadMessage()
+			})
+			var unified model.Model
+			require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+			unified.Capabilities.OutputModalities = []capability.Modality{capability.Audio}
+			require.NoError(t, model.DB.Model(&unified).Select("capabilities").Updates(&unified).Error)
+			client := dialRealtimeGateway(t, fixture)
+			_, _, err := client.ReadMessage()
+			require.NoError(t, err)
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Hi"}]}],"output_modalities":["audio"]}}`)))
+			_, raw, err := client.ReadMessage()
+			require.NoError(t, err)
+			require.Equal(t, "response.created", ojson.GetBytes(raw, "type").String())
+			count := 2
+			if snapshot {
+				count = 3
 			}
-		}
-		_, _, _ = peer.ReadMessage()
-	})
-	var unified model.Model
-	require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
-	unified.Capabilities.OutputModalities = []capability.Modality{capability.Audio}
-	require.NoError(t, model.DB.Model(&unified).Select("capabilities").Updates(&unified).Error)
-	client := dialRealtimeGateway(t, fixture)
-	_, _, err := client.ReadMessage()
-	require.NoError(t, err)
-	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Hi"}]}],"output_modalities":["audio"]}}`)))
-	_, raw, err := client.ReadMessage()
-	require.NoError(t, err)
-	require.Equal(t, "response.created", ojson.GetBytes(raw, "type").String())
-	for range 2 {
-		_, _, err := client.ReadMessage()
-		require.NoError(t, err)
+			for range count {
+				_, raw, err = client.ReadMessage()
+				require.NoError(t, err)
+				if ojson.GetBytes(raw, "type").String() == "response.output_item.done" {
+					assert.Equal(t, "hello ", ojson.GetBytes(raw, "item.content.0.transcript").String())
+				}
+			}
+			assert.Equal(t, int32(1), calls.Load())
+			require.NoError(t, client.Close())
+			if snapshot {
+				var records []model.GatewayRequest
+				require.Eventually(t, func() bool {
+					var err error
+					records, _, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+					return err == nil && len(records) == 1 && records[0].Status != "settlement_pending"
+				}, 5*time.Second, 10*time.Millisecond)
+				assert.Equal(t, "partial", records[0].Status)
+				assert.EqualValues(t, 9000, records[0].Receivable.Nanos)
+				assertTextGatewayLedger(t, records[0], 5000)
+			}
+		})
 	}
-	assert.Equal(t, int32(1), calls.Load())
-	require.NoError(t, client.Close())
 }
 
 func TestRealtimeGatewayAcceptsNativeToolChoice(t *testing.T) {
@@ -2538,7 +2641,7 @@ func TestRealtimeGatewayRecoversControlErrorsAndAcceptsLockedModel(t *testing.T)
 }
 
 func TestRealtimeGatewayRejectsUnsupportedNativeInputsBeforeReservation(t *testing.T) {
-	for _, source := range []string{"explicit audio", "conversation image", "image reference", "two image references", "prompt template", "session prompt template"} {
+	for _, source := range []string{"explicit audio", "conversation image", "image reference", "two image references", "prompt template", "session prompt template", "tool reference", "conversation tool"} {
 		t.Run(source, func(t *testing.T) {
 			var calls atomic.Int32
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -2571,6 +2674,12 @@ func TestRealtimeGatewayRejectsUnsupportedNativeInputsBeforeReservation(t *testi
 					}
 				}
 			})
+			if strings.Contains(source, "tool") {
+				var unified model.Model
+				require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+				unified.Capabilities.Features = []capability.Feature{capability.Streaming}
+				require.NoError(t, model.DB.Model(&unified).Select("capabilities").Updates(&unified).Error)
+			}
 			if source == "two image references" {
 				var unified model.Model
 				require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
@@ -2581,7 +2690,7 @@ func TestRealtimeGatewayRejectsUnsupportedNativeInputsBeforeReservation(t *testi
 			client := dialRealtimeGateway(t, fixture)
 			_, _, err := client.ReadMessage()
 			require.NoError(t, err)
-			if source != "explicit audio" && !strings.Contains(source, "prompt template") {
+			if strings.Contains(source, "image") {
 				count := 1
 				if source == "two image references" {
 					count = 2
@@ -2596,6 +2705,12 @@ func TestRealtimeGatewayRejectsUnsupportedNativeInputsBeforeReservation(t *testi
 					require.Equal(t, "conversation.item.created", ojson.GetBytes(ack, "type").String())
 				}
 			}
+			if strings.Contains(source, "tool") {
+				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"conversation.item.create","item":{"id":"tool0","type":"function_call","name":"lookup","call_id":"call0","arguments":"{}"}}`)))
+				_, ack, err := client.ReadMessage()
+				require.NoError(t, err)
+				require.Equal(t, "conversation.item.created", ojson.GetBytes(ack, "type").String())
+			}
 			create := `{"type":"response.create","response":{"conversation":"none"}}`
 			switch source {
 			case "prompt template":
@@ -2604,6 +2719,8 @@ func TestRealtimeGatewayRejectsUnsupportedNativeInputsBeforeReservation(t *testi
 				create = `{"type":"session.update","session":{"prompt":{"id":"pmpt_known"}}}`
 			case "explicit audio":
 				create = `{"type":"response.create","response":{"input":[{"type":"message","role":"user","content":[{"type":"input_audio","audio":""}]}]}}`
+			case "tool reference":
+				create = `{"type":"response.create","response":{"input":[{"type":"item_reference","id":"tool0"}]}}`
 			case "image reference":
 				create = `{"type":"response.create","response":{"input":[{"type":"item_reference","id":"image0"}]}}`
 			case "two image references":
@@ -2613,6 +2730,13 @@ func TestRealtimeGatewayRejectsUnsupportedNativeInputsBeforeReservation(t *testi
 			_, reply, err := client.ReadMessage()
 			require.NoError(t, err)
 			assert.Equal(t, "error", ojson.GetBytes(reply, "type").String())
+			if strings.Contains(source, "tool") {
+				path := "input"
+				if source == "tool reference" {
+					path = "input[0].id"
+				}
+				assert.Equal(t, path, ojson.GetBytes(reply, "error.param").String())
+			}
 			require.NoError(t, client.Close())
 			assert.Zero(t, calls.Load())
 			var reservations int64

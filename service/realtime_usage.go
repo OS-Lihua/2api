@@ -142,7 +142,11 @@ func (accumulator *RealtimeUsageAccumulator) Observe(raw []byte, input *dto.Usag
 		}
 		transcript := ""
 		complete := ojson.GetBytes(raw, "transcript").String()
-		seen := state.accumulator.outputState(ojson.GetBytes(raw, "item_id").String(), index).textBytes
+		key := responseContentKey{}
+		if contentIndex := ojson.GetBytes(raw, "content_index"); contentIndex.Exists() {
+			key.index = int(contentIndex.Int())
+		}
+		seen := state.accumulator.outputContent(state.accumulator.outputState(ojson.GetBytes(raw, "item_id").String(), index), key).observedBytes
 		if len(complete) > seen {
 			transcript = complete[seen:]
 		}
@@ -153,10 +157,14 @@ func (accumulator *RealtimeUsageAccumulator) Observe(raw []byte, input *dto.Usag
 			return nil, err
 		}
 	}
-	for outputIndex, output := range ojson.GetBytes(raw, "response.output").Array() {
-		for contentIndex, content := range output.Get("content").Array() {
+	outputs := []string{"item"}
+	for i := range ojson.GetBytes(raw, "response.output").Array() {
+		outputs = append(outputs, fmt.Sprintf("response.output.%d", i))
+	}
+	for _, output := range outputs {
+		for contentIndex, content := range ojson.GetBytes(raw, output+".content").Array() {
 			if transcript := content.Get("transcript"); transcript.Type == ojson.String {
-				path := fmt.Sprintf("response.output.%d.content.%d", outputIndex, contentIndex)
+				path := fmt.Sprintf("%s.content.%d", output, contentIndex)
 				if err := document.Set(path+".type", "output_text"); err != nil {
 					return nil, err
 				}
@@ -345,6 +353,11 @@ func NativeResponseHasBusinessOutput(event *dto.ResponsesStreamResponse) bool {
 			if event.Item.Name != "" || len(event.Item.Arguments) > 0 || event.Item.Result != "" {
 				return true
 			}
+			for _, part := range event.Item.Summary {
+				if part.Text != "" {
+					return true
+				}
+			}
 			for _, content := range event.Item.Content {
 				if content.Text != "" || content.Refusal != "" {
 					return true
@@ -356,6 +369,11 @@ func NativeResponseHasBusinessOutput(event *dto.ResponsesStreamResponse) bool {
 		for _, output := range event.Response.Output {
 			if output.Name != "" || len(output.Arguments) > 0 || output.Result != "" {
 				return true
+			}
+			for _, part := range output.Summary {
+				if part.Text != "" {
+					return true
+				}
 			}
 			for _, content := range output.Content {
 				if content.Text != "" || content.Refusal != "" {

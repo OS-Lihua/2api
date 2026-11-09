@@ -1,9 +1,12 @@
 package service
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/MoeForge/moego/ojson"
@@ -15,18 +18,30 @@ import (
 	"github.com/QuantumNous/new-api/tokenkit"
 )
 
-// ResponsesUsageAccumulator owns the accounting facts for one Responses stream.
-// HTTP SSE and WebSocket transports feed the same events into it, then settle
-// Finish's usage through the normal text billing path, including interrupted
-// streams. Observe and Finish must be called by the same stream owner.
+type responseContentKey struct {
+	index   int
+	summary bool
+}
+
+type responseOutputText struct {
+	observedBytes int
+	text          strings.Builder
+}
+
 type responseOutputState struct {
-	nameSeen     bool
-	payloadBytes int
-	textBytes    int
+	nameSeen      bool
+	name, payload responseOutputText
+	index         int
+	hasIndex      bool
+	content       map[responseContentKey]*responseOutputText
 }
 
 type nativeInputPresence struct{ text, audio, image, cached, cacheWrite bool }
 
+// ResponsesUsageAccumulator owns the accounting facts for one Responses stream.
+// HTTP SSE and WebSocket transports feed the same events into it, then settle
+// Finish's usage through the normal text billing path, including interrupted
+// streams. Observe and Finish must be called by the same stream owner.
 type ResponsesUsageAccumulator struct {
 	retainedBytes, retainedLimit         int
 	unretainedOutputTokens               int
@@ -34,12 +49,14 @@ type ResponsesUsageAccumulator struct {
 	completionReported                   bool
 	info                                 *relaycommon.RelayInfo
 	usage                                *dto.Usage
-	outputText                           strings.Builder
+	outputBytes                          int
+	outputOrder                          []*responseOutputState
 	outputs                              map[string]*responseOutputState
 	terminalOutputSeen                   bool
 	delivered                            *ResponsesUsageAccumulator
 	imageCounter                         relaycommon.ImageGenerationCallCounter
 	itemBytes                            int
+	reportedInputDetails                 dto.InputTokenDetails
 	inputPresence                        nativeInputPresence
 	promptReported, inputDetailsReported bool
 	imageInputReported                   bool
@@ -67,10 +84,11 @@ func (a *ResponsesUsageAccumulator) Err() error {
 	return nil
 }
 
-func (a *ResponsesUsageAccumulator) recordText(text string) {
+func (a *ResponsesUsageAccumulator) recordText(output *responseOutputText, text string) {
 	if text == "" {
 		return
 	}
+	output.observedBytes += len(text)
 	if a.budgetErr != nil {
 		a.unretainedOutputTokens += tokenkit.Count(a.info.TokenizerModelName(), text)
 		return
@@ -82,7 +100,8 @@ func (a *ResponsesUsageAccumulator) recordText(text string) {
 		return
 	}
 	a.retainedBytes += len(text)
-	a.outputText.WriteString(text)
+	a.outputBytes += len(text)
+	output.text.WriteString(text)
 }
 
 // DecodeResponsesStreamEvent decodes protocol framing independently from usage.
@@ -159,7 +178,15 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 			if image || len(raw) == 0 && event.Response.Usage.PromptTokensDetails.ImageTokens > 0 {
 				a.imageInputReported = true
 			}
+			// Rebuild derived totals from the latest valid reported details;
+			// a later explicit zero must be able to clear an earlier estimate.
+			a.usage.PromptTokensDetails = a.reportedInputDetails.Clone()
+			if a.usage.InputTokensDetails != nil {
+				details := a.reportedInputDetails.Clone()
+				a.usage.InputTokensDetails = &details
+			}
 			ApplyResponsesUsage(a.usage, event.Response.Usage, []byte(ojson.GetBytes(raw, "response.usage").Raw))
+			a.reportedInputDetails = a.usage.PromptTokensDetails.Clone()
 			if subtypes := a.usage.PromptTokensDetails.CachedTokensDetails; subtypes != nil {
 				changed := false
 				if !a.inputPresence.cached {
@@ -247,11 +274,20 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 		a.imageCommitted = true
 	case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.refusal.delta":
 		state := a.outputState(event.ItemID, event.OutputIndex)
-		state.textBytes += len(event.Delta)
-		a.recordText(event.Delta)
+		key := responseContentKey{}
+		index := event.ContentIndex
+		if event.Type == "response.reasoning_summary_text.delta" {
+			key.summary = true
+			index = event.SummaryIndex
+		}
+		if index != nil {
+			key.index = *index
+		}
+		text := a.outputContent(state, key)
+		a.recordText(text, event.Delta)
 	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
-		a.outputState(event.ItemID, event.OutputIndex).payloadBytes += len(event.Delta)
-		a.recordText(event.Delta)
+		state := a.outputState(event.ItemID, event.OutputIndex)
+		a.recordText(&state.payload, event.Delta)
 	case "response.output_item.added":
 		a.observeOutputItem(event.Item, event.OutputIndex)
 	case dto.ResponsesOutputTypeItemDone:
@@ -302,7 +338,7 @@ func (a *ResponsesUsageAccumulator) rememberOutputItem(item *dto.ResponsesOutput
 		return
 	}
 	for _, part := range item.Content {
-		if part.Type != "output_text" && part.Type != "input_text" {
+		if part.Type != "output_text" && part.Type != "input_text" && part.Type != "text" && part.Type != "refusal" {
 			return
 		}
 	}
@@ -320,23 +356,27 @@ func (a *ResponsesUsageAccumulator) rememberOutputItem(item *dto.ResponsesOutput
 		text = nativeOutputText(item)
 	}
 	tokens := tokenkit.Count(a.info.TokenizerModelName(), text)
-	if old := a.info.ResponsesItemUsage[item.ID]; old != nil && old.PromptTokens >= tokens {
-		return
+	toolCalls := NativeItemUsesTools(item.Type)
+	if old := a.info.ResponsesItemFacts[item.ID]; old != nil {
+		old.ToolCalls = old.ToolCalls || toolCalls
+		if old.Usage.PromptTokens >= tokens {
+			return
+		}
 	}
 	maximum := constant.MaxRequestBodyMB
 	if maximum <= 0 {
 		maximum = 128
 	}
-	if a.info.ResponsesItemUsage[item.ID] == nil {
+	if a.info.ResponsesItemFacts[item.ID] == nil {
 		if a.itemBytes+len(item.ID)+128 > maximum<<20 {
 			return
 		}
 		a.itemBytes += len(item.ID) + 128
 	}
-	if a.info.ResponsesItemUsage == nil {
-		a.info.ResponsesItemUsage = map[string]*dto.Usage{}
+	if a.info.ResponsesItemFacts == nil {
+		a.info.ResponsesItemFacts = map[string]*relaycommon.ResponsesInputFacts{}
 	}
-	a.info.ResponsesItemUsage[item.ID] = &dto.Usage{PromptTokens: tokens, TotalTokens: tokens, PromptTokensDetails: dto.InputTokenDetails{TextTokens: tokens}}
+	a.info.ResponsesItemFacts[item.ID] = &relaycommon.ResponsesInputFacts{Usage: &dto.Usage{PromptTokens: tokens, TotalTokens: tokens, PromptTokensDetails: dto.InputTokenDetails{TextTokens: tokens}}, ToolCalls: toolCalls}
 }
 
 func (a *ResponsesUsageAccumulator) outputState(id string, index *int) *responseOutputState {
@@ -365,6 +405,9 @@ func (a *ResponsesUsageAccumulator) outputState(id string, index *int) *response
 		keys = []string{"unknown"}
 	}
 	additional := 0
+	if state == nil {
+		additional += 256
+	}
 	for _, key := range keys {
 		if key != "" && a.outputs[key] == nil {
 			additional += len(key) + 64
@@ -381,6 +424,10 @@ func (a *ResponsesUsageAccumulator) outputState(id string, index *int) *response
 	a.retainedBytes += additional
 	if state == nil {
 		state = &responseOutputState{}
+		a.outputOrder = append(a.outputOrder, state)
+	}
+	if index != nil && !state.hasIndex {
+		state.index, state.hasIndex = *index, true
 	}
 	if idKey != "" {
 		a.outputs[idKey] = state
@@ -394,21 +441,63 @@ func (a *ResponsesUsageAccumulator) outputState(id string, index *int) *response
 	return state
 }
 
+func (a *ResponsesUsageAccumulator) outputContent(state *responseOutputState, key responseContentKey) *responseOutputText {
+	if text := state.content[key]; text != nil {
+		return text
+	}
+	additional := 128
+	if state.content == nil {
+		additional += 256
+	}
+	if a.budgetErr != nil {
+		return &responseOutputText{}
+	}
+	if additional > a.retainedLimit-a.retainedBytes {
+		a.budgetErr = errors.New("Responses output identity budget exceeded")
+		a.info.StreamStatus.RecordError("Responses output identity budget exceeded")
+		return &responseOutputText{}
+	}
+	a.retainedBytes += additional
+	if state.content == nil {
+		state.content = map[responseContentKey]*responseOutputText{}
+	}
+	text := &responseOutputText{}
+	state.content[key] = text
+	return text
+}
+
 func (a *ResponsesUsageAccumulator) observeOutputItem(item *dto.ResponsesOutput, index *int) {
 	if item == nil {
 		return
 	}
+	if NativeItemUsesTools(item.Type) && a.info.ResponseFacts != nil {
+		a.info.ResponseFacts.GeneratedToolCalls = true
+	}
 	state := a.outputState(item.ID, index)
 	if item.Type != dto.BuildInCallFunctionCall && item.Type != "custom_tool_call" {
-		text := nativeOutputText(item)
-		if len(text) > state.textBytes {
-			a.recordText(text[state.textBytes:])
-			state.textBytes = len(text)
+		for i, content := range item.Content {
+			text := content.Text + content.Refusal
+			if text == "" {
+				continue
+			}
+			output := a.outputContent(state, responseContentKey{index: i})
+			if len(text) > output.observedBytes {
+				a.recordText(output, text[output.observedBytes:])
+			}
+		}
+		for i, summary := range item.Summary {
+			if summary.Text == "" {
+				continue
+			}
+			output := a.outputContent(state, responseContentKey{index: i, summary: true})
+			if len(summary.Text) > output.observedBytes {
+				a.recordText(output, summary.Text[output.observedBytes:])
+			}
 		}
 		return
 	}
 	if !state.nameSeen && item.Name != "" {
-		a.recordText(item.Name)
+		a.recordText(&state.name, item.Name)
 		state.nameSeen = true
 	}
 	payload := item.Arguments
@@ -420,9 +509,8 @@ func (a *ResponsesUsageAccumulator) observeOutputItem(item *dto.ResponsesOutput,
 		if common.Unmarshal(payload, &text) != nil {
 			text = string(payload)
 		}
-		if len(text) > state.payloadBytes {
-			a.recordText(text[state.payloadBytes:])
-			state.payloadBytes = len(text)
+		if len(text) > state.payload.observedBytes {
+			a.recordText(&state.payload, text[state.payload.observedBytes:])
 		}
 	}
 }
@@ -458,9 +546,44 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 		a.imageCounter.Commit(a.info)
 		a.imageCommitted = true
 	}
+	// Keep stream chunks separate until each content part is complete, then
+	// tokenize their canonical output order once, independent of arrival order.
+	slices.SortStableFunc(a.outputOrder, func(left, right *responseOutputState) int {
+		if left.hasIndex != right.hasIndex {
+			if left.hasIndex {
+				return -1
+			}
+			return 1
+		}
+		return cmp.Compare(left.index, right.index)
+	})
+	var output strings.Builder
+	output.Grow(a.outputBytes)
+	for _, state := range a.outputOrder {
+		output.WriteString(state.name.text.String())
+		output.WriteString(state.payload.text.String())
+		state.name.text.Reset()
+		state.payload.text.Reset()
+		keys := slices.Collect(maps.Keys(state.content))
+		slices.SortFunc(keys, func(left, right responseContentKey) int {
+			if left.summary != right.summary {
+				if left.summary {
+					return 1
+				}
+				return -1
+			}
+			return cmp.Compare(left.index, right.index)
+		})
+		for _, key := range keys {
+			text := state.content[key]
+			output.WriteString(text.text.String())
+			text.text.Reset()
+		}
+	}
+	generatedText := output.String()
 	facts := a.info.ResponseFacts
 	if facts != nil {
-		facts.GeneratedText = a.outputText.String()
+		facts.GeneratedText = generatedText
 		delivered := 0
 		if a.delivered != nil {
 			delivered = a.delivered.Finish().CompletionTokens
@@ -470,8 +593,8 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 	}
 	completionReported := a.completionReported || facts != nil && facts.CompletionTokensReported
 	generated := a.unretainedOutputTokens
-	if output := a.outputText.String(); output != "" {
-		generated += tokenkit.Count(a.info.TokenizerModelName(), output)
+	if generatedText != "" {
+		generated += tokenkit.Count(a.info.TokenizerModelName(), generatedText)
 	}
 	if !completionReported {
 		details := a.usage.CompletionTokenDetails

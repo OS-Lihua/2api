@@ -3,11 +3,13 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/big"
 	"math/rand/v2"
 	"slices"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
@@ -403,11 +405,33 @@ func GatewayResponsesCapabilitiesMatch(request *dto.OpenAIResponsesRequest, caps
 	return GatewayResponsesCapabilitiesFailure(request, caps, inputTokens, nativeModalities...) == nil
 }
 
+// NativeItemUsesTools identifies protocol items that require tool capability.
+func NativeItemUsesTools(kind string) bool {
+	switch kind {
+	case "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output",
+		"local_shell_call", "local_shell_call_output", "shell_call", "shell_call_output",
+		"apply_patch_call", "apply_patch_call_output", "computer_call", "computer_call_output",
+		"web_search_call", "file_search_call", "code_interpreter_call", "image_generation_call",
+		"mcp_call", "mcp_list_tools", "mcp_approval_request", "mcp_approval_response":
+		return true
+	}
+	return false
+}
+
 // GatewayResponsesCapabilitiesFailure identifies the first unsupported native parameter.
 func GatewayResponsesCapabilitiesFailure(request *dto.OpenAIResponsesRequest, caps capability.Set, inputTokens int, nativeModalities ...bool) *GatewayParameterError {
 	projection := &dto.GeneralOpenAIRequest{Model: request.Model, Stream: common.GetPointer(true), MaxCompletionTokens: request.MaxOutputTokens}
+	toolPath := "tools"
 	if len(request.Tools) > 0 && string(request.Tools) != "[]" && string(request.Tools) != "null" {
 		projection.Tools = make([]dto.ToolCallRequest, 1)
+	} else {
+		for i, item := range ojson.GetBytes(request.Input, "@this").Array() {
+			if NativeItemUsesTools(item.Get("type").String()) || item.Get("role").String() == "tool" {
+				projection.Tools = make([]dto.ToolCallRequest, 1)
+				toolPath = fmt.Sprintf("input[%d].type", i)
+				break
+			}
+		}
 	}
 	if request.Reasoning != nil {
 		projection.ReasoningEffort = request.Reasoning.Effort
@@ -428,6 +452,8 @@ func GatewayResponsesCapabilitiesFailure(request *dto.OpenAIResponsesRequest, ca
 	projection.ResponseFormat = text.Format
 	if failure := gatewayCapabilitiesFailure(projection, caps, inputTokens, nativeModalities...); failure != nil {
 		switch failure.Path {
+		case "tools":
+			failure.Path = toolPath
 		case "reasoning_effort":
 			failure.Path = "reasoning.effort"
 		case "response_format":

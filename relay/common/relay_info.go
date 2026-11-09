@@ -121,7 +121,7 @@ type RelayInfo struct {
 	RealtimeEventHandler      func([]byte) ([]byte, [][]byte, *types.NewAPIError) `json:"-"`
 	RealtimeAfterResponse     func() ([][]byte, *types.NewAPIError)               `json:"-"`
 	RealtimeOutputAudioFormat func(string) string                                 `json:"-"`
-	ResponsesItemUsage        map[string]*dto.Usage                               `json:"-"`
+	ResponsesItemFacts        map[string]*ResponsesInputFacts                     `json:"-"`
 	ResponsesInputFacts       *ResponsesInputFacts                                `json:"-"`
 	RealtimeInputUsage        func(string) *dto.Usage                             `json:"-"`
 	RealtimeBusinessOutput    func(string)                                        `json:"-"`

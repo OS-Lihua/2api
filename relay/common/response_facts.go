@@ -28,6 +28,7 @@ type ResponsesInputFacts struct {
 	Usage      *dto.Usage
 	Context    *dto.Usage
 	ImageCount int
+	ToolCalls  bool
 }
 
 // ResponseFacts separates upstream-reported zero usage from a local estimate,
@@ -41,6 +42,7 @@ type ResponseFacts struct {
 	CompletionTokensReported bool
 	BusinessOutput           bool
 	DownstreamWriteFailed    bool
+	GeneratedToolCalls       bool
 	GeneratedAudioBytes      int64
 	GeneratedText            string
 	GeneratedOutputDetails   dto.OutputTokenDetails

@@ -269,7 +269,7 @@ func (session *realtimeGatewaySession) begin(body, original []byte, input *dto.U
 		close(response.finalized)
 		return response
 	}
-	response.inputSnapshot = session.conversation.Snapshot()
+	response.inputSnapshot = session.conversation.Snapshot(projection)
 	if session.channelID != 0 {
 		var err error
 		input, err = response.inputSnapshot.Estimate(projection)

@@ -137,17 +137,28 @@ func (call *ResponsesWSCall) EstimateInput(c *gin.Context, info *relaycommon.Rel
 			images++
 		}
 	}
+	toolCalls := false
 	var inherited []*dto.Usage
 	if request.PreviousResponseID != "" {
 		previous, ok := call.session.contexts[request.PreviousResponseID]
 		if !ok {
 			return nil, &service.GatewayParameterError{Path: "previous_response_id", Reason: "Unknown response context; provide complete input"}
 		}
+		if previous.ToolCalls && !slices.Contains(caps.Features, capability.ToolCalling) {
+			return nil, &service.GatewayParameterError{Path: "previous_response_id", Reason: "Tool calling is not supported on this channel"}
+		}
+		toolCalls = toolCalls || previous.ToolCalls
 		inherited = append(inherited, previous.Context)
 		images += previous.ImageCount
 	}
 	for index, item := range ojson.GetBytes(request.Input, "@this").Array() {
 		kind := item.Get("type").String()
+		if service.NativeItemUsesTools(kind) || item.Get("role").String() == "tool" {
+			toolCalls = true
+			if !slices.Contains(caps.Features, capability.ToolCalling) {
+				return nil, &service.GatewayParameterError{Path: fmt.Sprintf("input[%d].type", index), Reason: "Tool calling is not supported on this channel"}
+			}
+		}
 		reference := kind == "item_reference" || kind == "" && item.Get("id").Type == ojson.String && !item.Get("content").Exists() && !item.Get("role").Exists()
 		if !reference {
 			continue
@@ -156,7 +167,11 @@ func (call *ResponsesWSCall) EstimateInput(c *gin.Context, info *relaycommon.Rel
 		if known == nil {
 			return nil, &service.GatewayParameterError{Path: fmt.Sprintf("input[%d].id", index), Reason: "Unknown response item; provide complete input"}
 		}
-		inherited = append(inherited, known)
+		if known.ToolCalls && !slices.Contains(caps.Features, capability.ToolCalling) {
+			return nil, &service.GatewayParameterError{Path: fmt.Sprintf("input[%d].id", index), Reason: "Tool calling is not supported on this channel"}
+		}
+		toolCalls = toolCalls || known.ToolCalls
+		inherited = append(inherited, known.Usage)
 	}
 	for _, previous := range inherited {
 		total := usage.PromptTokens + previous.PromptTokens
@@ -182,7 +197,7 @@ func (call *ResponsesWSCall) EstimateInput(c *gin.Context, info *relaycommon.Rel
 	contextUsage.PromptTokens += tokenkit.Count(model, inputOnly.GetTokenCountMeta().CombineText) - tokenkit.Count(model, meta.CombineText)
 	contextUsage.TotalTokens = contextUsage.PromptTokens
 	contextUsage.PromptTokensDetails.TextTokens = contextUsage.PromptTokens - contextUsage.PromptTokensDetails.ImageTokens - contextUsage.PromptTokensDetails.AudioTokens
-	return &relaycommon.ResponsesInputFacts{Usage: usage, Context: contextUsage, ImageCount: images}, nil
+	return &relaycommon.ResponsesInputFacts{Usage: usage, Context: contextUsage, ImageCount: images, ToolCalls: toolCalls}, nil
 }
 
 // Prepare uses the existing Provider transport without sending any bytes.
@@ -270,8 +285,8 @@ func (call *ResponsesWSCall) Exchange(c *gin.Context, info *relaycommon.RelayInf
 				if _, exists := s.contexts[id]; !exists {
 					s.contextBytes += len(id) + 256
 				}
-				s.contexts[id] = relaycommon.ResponsesInputFacts{Context: contextUsage, ImageCount: input.ImageCount}
-				for itemID, item := range info.ResponsesItemUsage {
+				s.contexts[id] = relaycommon.ResponsesInputFacts{Context: contextUsage, ImageCount: input.ImageCount, ToolCalls: input.ToolCalls || info.ResponseFacts != nil && info.ResponseFacts.GeneratedToolCalls}
+				for itemID, item := range info.ResponsesItemFacts {
 					if s.items[itemID] != nil {
 						continue
 					}
@@ -280,10 +295,10 @@ func (call *ResponsesWSCall) Exchange(c *gin.Context, info *relaycommon.RelayInf
 						break
 					}
 					if s.items == nil {
-						s.items = map[string]*dto.Usage{}
+						s.items = map[string]*relaycommon.ResponsesInputFacts{}
 					}
 					s.contextBytes += len(itemID) + 128
-					s.items[itemID] = service.GatewayUsageSnapshot(item)
+					s.items[itemID] = &relaycommon.ResponsesInputFacts{Usage: service.GatewayUsageSnapshot(item.Usage), ToolCalls: item.ToolCalls}
 				}
 			} else {
 				call.state.closeCode = websocket.CloseMessageTooBig
@@ -408,7 +423,7 @@ type responsesWSSession struct {
 	// These fields belong to the serial request worker and describe the actual
 	// established connection. Per-request token/user data is never stored here.
 	completed       map[string]bool
-	items           map[string]*dto.Usage
+	items           map[string]*relaycommon.ResponsesInputFacts
 	contexts        map[string]relaycommon.ResponsesInputFacts
 	contextBytes    int
 	lastResponseID  string

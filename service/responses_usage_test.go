@@ -133,7 +133,7 @@ func TestRealtimeConversationRefinesAggregateInputWithoutDoubleCounting(t *testi
 	conversation := NewRealtimeConversation(c, "gpt-4o")
 	_, err := conversation.Observe([]byte(`{"type":"conversation.item.created","item":{"id":"seed","type":"message","role":"user","content":[{"type":"input_text","text":" hello hello"}]}}`), false)
 	require.NoError(t, err)
-	observation := conversation.Snapshot().Observation([]byte(`{"type":"response.create","response":{}}`))
+	observation := conversation.Snapshot(nil).Observation([]byte(`{"type":"response.create","response":{}}`))
 	_, err = conversation.Observe([]byte(`{"type":"response.output_item.done","response_id":"a","item":{"id":"a-output","type":"message","role":"assistant","content":[{"type":"text","text":"Hi"}]}}`), false)
 	require.NoError(t, err)
 	for _, test := range []struct {
@@ -149,7 +149,7 @@ func TestRealtimeConversationRefinesAggregateInputWithoutDoubleCounting(t *testi
 	assert.Equal(t, 30001, conversation.Usage(false).PromptTokens, "Editing a later output cannot discard known input that preceded it")
 	require.NoError(t, conversation.Complete(&relaycommon.RealtimeResponseFacts{ID: "in-flight", Usage: &dto.Usage{PromptTokens: 40000}, Facts: &relaycommon.ResponseFacts{PromptTokensReported: true}}, false, observation))
 	assert.Equal(t, 40001, conversation.Usage(false).PromptTokens, "An in-flight input observation does not depend on an output born after it")
-	explicit := conversation.Snapshot().Observation([]byte(`{"response":{"input":[]}}`))
+	explicit := conversation.Snapshot(nil).Observation([]byte(`{"response":{"input":[]}}`))
 	require.NoError(t, conversation.Complete(&relaycommon.RealtimeResponseFacts{ID: "explicit", Usage: &dto.Usage{PromptTokens: 90000, CompletionTokens: 1}, Facts: &relaycommon.ResponseFacts{PromptTokensReported: true}}, false, explicit))
 	assert.Equal(t, 40001, conversation.Usage(false).PromptTokens)
 	_, err = conversation.Observe([]byte(`{"type":"conversation.item.deleted","item_id":"seed"}`), false)
@@ -169,7 +169,7 @@ func TestRealtimeConversationFreezesItemsAcrossDeletionAndAudioTruncation(t *tes
 	_, err = conversation.Observe([]byte(`{"type":"conversation.item.created","item":{"id":"input","type":"message","role":"user","content":[{"type":"input_text","text":" hello hello"}]}}`), false)
 	require.NoError(t, err)
 	assert.False(t, conversation.Pending())
-	snapshot := conversation.Snapshot()
+	snapshot := conversation.Snapshot([]byte(`{"input":[{"type":"item_reference","id":"input"}]}`))
 	usage, err := snapshot.Estimate([]byte(`{"conversation":"none"}`))
 	require.NoError(t, err)
 	assert.Equal(t, 2, usage.PromptTokens, "Out-of-band membership does not replace default input")
@@ -184,7 +184,7 @@ func TestRealtimeConversationFreezesItemsAcrossDeletionAndAudioTruncation(t *tes
 	usage, err = snapshot.Estimate([]byte(`{"input":[{"type":"item_reference","id":"input"}]}`))
 	require.NoError(t, err)
 	assert.Equal(t, 2, usage.PromptTokens, "An admitted plan retains its frozen input")
-	_, err = conversation.Snapshot().Estimate([]byte(`{"input":[{"type":"item_reference","id":"input"}]}`))
+	_, err = conversation.Snapshot([]byte(`{"input":[{"type":"item_reference","id":"input"}]}`)).Estimate([]byte(`{"input":[{"type":"item_reference","id":"input"}]}`))
 	require.Error(t, err)
 	assert.Zero(t, conversation.Usage(false).PromptTokens)
 
@@ -192,7 +192,7 @@ func TestRealtimeConversationFreezesItemsAcrossDeletionAndAudioTruncation(t *tes
 	require.NoError(t, err)
 	result := &relaycommon.RealtimeResponseFacts{ID: "r", Facts: &relaycommon.ResponseFacts{}, Usage: &dto.Usage{CompletionTokens: 12, CompletionTokenDetails: dto.OutputTokenDetails{AudioTokens: 10}}}
 	require.NoError(t, conversation.Complete(result, true))
-	snapshot = conversation.Snapshot()
+	snapshot = conversation.Snapshot([]byte(`{"input":[{"type":"item_reference","id":"voice"}]}`))
 	assert.Equal(t, 12, conversation.Usage(false).PromptTokens)
 	_, err = conversation.Observe([]byte(`{"type":"conversation.item.truncate","item_id":"voice","content_index":0,"audio_end_ms":250}`), true)
 	require.NoError(t, err)
@@ -204,13 +204,13 @@ func TestRealtimeConversationFreezesItemsAcrossDeletionAndAudioTruncation(t *tes
 	usage, err = snapshot.Estimate([]byte(`{"input":[{"type":"item_reference","id":"voice"}]}`))
 	require.NoError(t, err)
 	assert.Equal(t, 12, usage.PromptTokens)
-	usage, err = conversation.Snapshot().Estimate([]byte(`{"input":[{"type":"item_reference","id":"voice"}]}`))
+	usage, err = conversation.Snapshot([]byte(`{"input":[{"type":"item_reference","id":"voice"}]}`)).Estimate([]byte(`{"input":[{"type":"item_reference","id":"voice"}]}`))
 	require.NoError(t, err)
 	assert.Equal(t, 5, usage.PromptTokens)
 	_, err = conversation.Observe([]byte(`{"type":"conversation.item.deleted","item_id":"voice"}`), false)
 	require.NoError(t, err)
 	assert.Zero(t, conversation.Usage(false).PromptTokens)
-	_, err = conversation.Snapshot().EstimateForCapabilities([]byte(`{}`), capability.Set{InputModalities: []capability.Modality{capability.Text}})
+	_, err = conversation.Snapshot(nil).EstimateForCapabilities([]byte(`{}`), capability.Set{InputModalities: []capability.Modality{capability.Text}})
 	require.NoError(t, err, "Deleting the audio item removes its input modality")
 	for _, edit := range []struct {
 		name, frame string
@@ -320,7 +320,7 @@ func TestResponsesUsageEstimatesMixedAndCustomTools(t *testing.T) {
 	for _, tc := range []struct{ name, delta, terminal, output string }{
 		{name: "text and terminal function", delta: `{"type":"response.output_text.delta","output_index":0,"delta":"hello "}`, terminal: `{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello "}]},{"type":"function_call","name":"lookup","arguments":"{}"}]}}`, output: "hello lookup{}"},
 		{name: "terminal custom tool", terminal: `{"type":"response.completed","response":{"status":"completed","output":[{"type":"custom_tool_call","name":"apply_patch","input":"hello"}]}}`, output: "apply_patchhello"},
-		{name: "custom tool delta and terminal", delta: `{"type":"response.custom_tool_call_input.delta","output_index":0,"delta":"hello"}`, terminal: `{"type":"response.completed","response":{"status":"completed","output":[{"type":"custom_tool_call","name":"apply_patch","input":"hello"}]}}`, output: "helloapply_patch"},
+		{name: "custom tool delta and terminal", delta: `{"type":"response.custom_tool_call_input.delta","output_index":0,"delta":"hello"}`, terminal: `{"type":"response.completed","response":{"status":"completed","output":[{"type":"custom_tool_call","name":"apply_patch","input":"hello"}]}}`, output: "apply_patchhello"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			info := &relaycommon.RelayInfo{TokenizerModel: "gpt-4o", ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "gpt-4o"}, StreamStatus: relaycommon.NewStreamStatus(), ResponseFacts: &relaycommon.ResponseFacts{}}

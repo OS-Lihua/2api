@@ -118,6 +118,18 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 	if err != nil {
 		return nil, &service.GatewayParameterError{Path: "parameter_overrides", Reason: "Invalid request parameter overrides"}
 	}
+	validateMultipliers := helper.ValidateResponsesMultipliers
+	if call.Protocol() == protocol.OpenAIRealtime {
+		validateMultipliers = helper.ValidateRealtimeMultipliers
+	}
+	if err := validateMultipliers(body); err != nil {
+		path := "request"
+		var field interface{ ParameterPath() string }
+		if errors.As(err, &field) {
+			path = field.ParameterPath()
+		}
+		return nil, &service.GatewayParameterError{Path: path, Reason: err.Error()}
+	}
 	inputUsage := &dto.Usage{}
 	if call.Native != nil && call.Native.EstimateInput != nil {
 		inputUsage, err = call.Native.EstimateInput(body, selection.Capabilities)
@@ -156,14 +168,6 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 	}
 	if effective.Model != info.UpstreamModelName {
 		return nil, &service.GatewayParameterError{Path: "model", Reason: "Connection model is locked"}
-	}
-	if err := helper.ValidateResponsesMultipliers(body); err != nil {
-		path := "request"
-		var field interface{ ParameterPath() string }
-		if errors.As(err, &field) {
-			path = field.ParameterPath()
-		}
-		return nil, &service.GatewayParameterError{Path: path, Reason: err.Error()}
 	}
 	if failure := service.GatewayResponsesCapabilitiesFailure(&effective, selection.Capabilities, inputUsage.PromptTokens, nativeModalities); failure != nil {
 		return nil, failure
