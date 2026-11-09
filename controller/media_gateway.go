@@ -7,7 +7,6 @@ import (
 	"maps"
 	"math"
 	"net/http"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -57,14 +56,31 @@ type mediaGatewayRun struct {
 // MediaGateway composes authenticated synchronous image/audio protocols with
 // the shared attempt budget and the single GatewayBilling money lifecycle.
 func MediaGateway(c *gin.Context) {
-	switch c.Request.URL.Path {
-	case "/v1/images/generations", "/v1/images/edits", "/v1/audio/speech", "/v1/audio/transcriptions":
-	default:
+	if !middleware.IsMediaGatewayEndpoint(c.Request.Method, c.Request.URL.Path) {
 		c.Next()
+		return
+	}
+	if middleware.TextOfferingMissing(c) {
+		gatewayError(c, http.StatusNotFound, "model_not_found", i18n.T(c, i18n.MsgGatewayModelNotFound))
 		return
 	}
 	offering := middleware.TextOffering(c)
 	if offering == nil {
+		var request struct {
+			Model string `json:"model"`
+		}
+		if common.UnmarshalBodyReusable(c, &request) != nil || request.Model == "" {
+			gatewayError(c, http.StatusBadRequest, "invalid_request", i18n.T(c, i18n.MsgGatewayInvalidMediaRequest))
+			return
+		}
+		if _, err := model.ValidateUserToken(c.GetString("token_key")); err != nil {
+			if errors.Is(err, model.ErrDatabase) {
+				gatewayError(c, http.StatusServiceUnavailable, "authorization_unavailable", i18n.T(c, i18n.MsgGatewayAuthorizationUnavailable))
+			} else {
+				gatewayError(c, http.StatusUnauthorized, "invalid_api_key", common.TranslateMessage(c, i18n.MsgTokenInvalid))
+			}
+			return
+		}
 		c.Next()
 		return
 	}
@@ -74,8 +90,12 @@ func MediaGateway(c *gin.Context) {
 			_ = c.Request.MultipartForm.RemoveAll()
 		}
 	}()
-	userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
-	if !offering.Enabled || offering.Visibility == "groups" && !slices.Contains(offering.Groups, userGroup) {
+	allowed, err := service.GatewayOfferingAllowed(c, offering)
+	if err != nil {
+		gatewayError(c, http.StatusServiceUnavailable, "authorization_unavailable", i18n.T(c, i18n.MsgGatewayAuthorizationUnavailable))
+		return
+	}
+	if !allowed {
 		gatewayError(c, 404, "model_not_found", i18n.T(c, i18n.MsgGatewayModelNotFound))
 		return
 	}
@@ -116,14 +136,6 @@ func MediaGateway(c *gin.Context) {
 		name = request.Model
 	case *dto.AudioRequest:
 		name = request.Model
-	}
-	if c.GetBool("token_model_limit_enabled") {
-		limits, _ := c.Get("token_model_limit")
-		allowed, _ := limits.(map[string]bool)
-		if !allowed[name] && !allowed[offering.Name] {
-			gatewayError(c, 404, "model_not_found", i18n.T(c, i18n.MsgGatewayModelNotFound))
-			return
-		}
 	}
 	run := &mediaGatewayRun{c: c, name: name, offering: offering, parsed: parsed, started: started, id: id, sale: sale, saleFX: fx, saleRate: rate, ratio: ratio, status: 503, code: "channel_unavailable", saleSource: money.Amount{Currency: sale.Currency}}
 	attempts := service.RunGatewayAttempts(c.Request.Context(), service.GatewayPolicy(), run.attempt)

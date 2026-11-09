@@ -277,6 +277,8 @@ func migrateDB() error {
 		&ModelOffering{},
 		&ModelOfferingName{},
 		&ModelOfferingMember{},
+		&TokenOfferingPolicy{},
+		&TokenOfferingException{},
 		&Token{},
 		&User{},
 		&UserSession{},
@@ -315,6 +317,9 @@ func migrateDB() error {
 	)
 	if err != nil {
 		return err
+	}
+	if err := MigrateKeyPermissions(DB); err != nil {
+		return fmt.Errorf("migrate Key permissions: %w", err)
 	}
 	if err := MigrateRecommendationRules(DB); err != nil {
 		return fmt.Errorf("migrate recommendation rules: %w", err)

@@ -78,6 +78,7 @@ import (
 
 func TestListModelsSupportsOpenAIAndGeminiAuthentication(t *testing.T) {
 	setupRelayRouterTestDB(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Model{}, &model.ModelOffering{}, &model.ModelOfferingName{}, &model.ModelOfferingMember{}, &model.TokenOfferingPolicy{}, &model.TokenOfferingException{}))
 
 	user := model.User{
 		Username: "models-user",
@@ -185,6 +186,7 @@ func TestGeminiRelayHandsLongRunningPredictionToPluginRoute(t *testing.T) {
 	}{
 		{method: http.MethodPost, path: "/v1beta/models/veo-3.1-generate-preview:predictLongRunning", toPlugin: true},
 		{method: http.MethodGet, path: "/v1beta/models/veo-3.1-generate-preview/operations/task_sample", toPlugin: true},
+		{method: http.MethodGet, path: "/v1beta/models/veo-3.1-generate-preview/oper%61tions/task_sample", toPlugin: true},
 		{method: http.MethodPost, path: "/v1beta/models/gemini-2.5-flash:generateContent"},
 	} {
 		t.Run(testCase.path, func(t *testing.T) {
@@ -238,7 +240,7 @@ func newTextGatewayFixture(t *testing.T, upstream http.HandlerFunc) textGatewayF
 	t.Cleanup(func() { constant.StreamingTimeout = previousStreamTimeout })
 	require.NoError(t, model.InitSettlementCurrency())
 	db := model.DB
-	require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Channel{}, &model.ModelOffering{}, &model.ModelOfferingName{}, &model.ModelOfferingMember{}, &model.Wallet{}, &model.LedgerEntry{}))
+	require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Channel{}, &model.ModelOffering{}, &model.ModelOfferingName{}, &model.ModelOfferingMember{}, &model.TokenOfferingPolicy{}, &model.TokenOfferingException{}, &model.Wallet{}, &model.LedgerEntry{}))
 	require.NoError(t, db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS "idx_wallets_account" ON "wallets" ("account_type", "owner_id", "balance_currency")`).Error)
 	require.NoError(t, model.MigratePricing(db))
 	require.NoError(t, model.MigrateGatewayBilling(db))
@@ -6795,14 +6797,22 @@ func TestMediaGatewayRejectsUntrustedUploadDurationBeforeDispatch(t *testing.T) 
 }
 
 func TestMediaGatewayKeepsCredentialAndOfferingAuthorizationAtEveryEntrypoint(t *testing.T) {
-	for _, kind := range []protocol.Type{protocol.OpenAIImages, protocol.OpenAIAudioSpeech, protocol.OpenAIAudioTranscription} {
+	for _, endpoint := range []struct {
+		kind protocol.Type
+		edit bool
+	}{{protocol.OpenAIImages, false}, {protocol.OpenAIImages, true}, {protocol.OpenAIAudioSpeech, false}, {protocol.OpenAIAudioTranscription, false}} {
+		kind := endpoint.kind
 		for _, tc := range []struct {
 			name   string
 			status int
 		}{
 			{"disabled token", 401}, {"revoked token", 401}, {"expired token", 401}, {"IP restriction", 403}, {"disabled user", 403}, {"disabled Offering", 404}, {"hidden Offering", 404}, {"missing Offering", 404}, {"Key denies Offering ID", 404}, {"missing denied Offering", 404},
 		} {
-			t.Run(string(kind)+"/"+tc.name, func(t *testing.T) {
+			name := string(kind) + "/" + tc.name
+			if endpoint.edit {
+				name = "image_edit/" + tc.name
+			}
+			t.Run(name, func(t *testing.T) {
 				calls := 0
 				fixture := newMediaGatewayFixture(t, kind, func(w http.ResponseWriter, r *http.Request) { calls++ })
 				switch tc.name {
@@ -6838,6 +6848,11 @@ func TestMediaGatewayKeepsCredentialAndOfferingAuthorizationAtEveryEntrypoint(t 
 				if kind == protocol.OpenAIAudioTranscription {
 					request = mediaMultipartRequest(t, "/v1/audio/transcriptions", map[string]string{"model": name}, "file", mediaWAV(t, 8000, 16000, make([]byte, 16000)))
 				}
+				if endpoint.edit {
+					var picture bytes.Buffer
+					require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+					request = mediaMultipartRequest(t, "/v1/images/edits", map[string]string{"model": name, "prompt": "edit"}, "image", picture.Bytes())
+				}
 				request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
 				response := httptest.NewRecorder()
 				fixture.engine.ServeHTTP(response, request)
@@ -6847,8 +6862,88 @@ func TestMediaGatewayKeepsCredentialAndOfferingAuthorizationAtEveryEntrypoint(t 
 				wallet, err := model.GetUserWallet(fixture.user.Id)
 				require.NoError(t, err)
 				assert.Equal(t, int64(1_000_000_000), wallet.Balance.Nanos)
+				entries, _, err := model.ListLedgerEntries(wallet.Id, 0, 20)
+				require.NoError(t, err)
+				for _, entry := range entries {
+					assert.NotEqual(t, model.LedgerEntryPreConsume, entry.Type)
+				}
 			})
 		}
+	}
+}
+
+func TestMediaGatewayRegisteredLegacyStillChecksQuota(t *testing.T) {
+	for _, path := range []string{"/v1/images/generations", "/v1/images/edits", "/v1/audio/speech", "/v1/audio/transcriptions"} {
+		t.Run(path, func(t *testing.T) {
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(http.ResponseWriter, *http.Request) { t.Error("legacy model must not use a new Channel") })
+			require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "legacy-media-model", ChannelId: fixture.channel.ProviderID, Enabled: true}).Error)
+			body := `{"model":"legacy-media-model","prompt":"draw"}`
+			if path == "/v1/audio/speech" {
+				body = `{"model":"legacy-media-model","input":"hello","voice":"alloy"}`
+			}
+			request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			if path == "/v1/images/edits" {
+				var picture bytes.Buffer
+				require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+				request = mediaMultipartRequest(t, path, map[string]string{"model": "legacy-media-model", "prompt": "edit"}, "image", picture.Bytes())
+			}
+			if path == "/v1/audio/transcriptions" {
+				request = mediaMultipartRequest(t, path, map[string]string{"model": "legacy-media-model"}, "file", mediaWAV(t, 8000, 16000, make([]byte, 16000)))
+			}
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			response := httptest.NewRecorder()
+			fixture.engine.ServeHTTP(response, request)
+			assert.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
+			token, err := model.GetTokenById(fixture.token.Id)
+			require.NoError(t, err)
+			assert.Equal(t, common.TokenStatusExhausted, token.Status)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
+			_, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+			require.NoError(t, err)
+			assert.Zero(t, total)
+		})
+	}
+}
+
+func TestMediaGatewayAuthenticatesBeforeModelResolution(t *testing.T) {
+	fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(http.ResponseWriter, *http.Request) { t.Error("unexpected dispatch") })
+	require.NoError(t, model.DB.Migrator().DropTable(&model.ModelOfferingName{}))
+	var picture bytes.Buffer
+	require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+	for _, path := range []string{"/v1/images/generations", "/v1/images/edits", "/v1/audio/speech", "/v1/audio/transcriptions"} {
+		t.Run(path, func(t *testing.T) {
+			for _, key := range []string{"", "not-a-valid-key", fixture.token.Key} {
+				body := `{"model":"gateway-alias","prompt":"draw"}`
+				if path == "/v1/audio/speech" {
+					body = `{"model":"gateway-alias","input":"hello","voice":"alloy"}`
+				}
+				request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+				request.Header.Set("Content-Type", "application/json")
+				if path == "/v1/images/edits" {
+					request = mediaMultipartRequest(t, path, map[string]string{"model": "gateway-alias", "prompt": "edit"}, "image", picture.Bytes())
+				}
+				if path == "/v1/audio/transcriptions" {
+					request = mediaMultipartRequest(t, path, map[string]string{"model": "gateway-alias"}, "file", mediaWAV(t, 8000, 16000, make([]byte, 16000)))
+				}
+				if key != "" {
+					request.Header.Set("Authorization", "Bearer "+key)
+				}
+				response := httptest.NewRecorder()
+				fixture.engine.ServeHTTP(response, request)
+				status := http.StatusUnauthorized
+				if key == fixture.token.Key {
+					status = http.StatusInternalServerError
+				}
+				assert.Equal(t, status, response.Code, response.Body.String())
+				assert.NotContains(t, response.Body.String(), "model_offering_names")
+				if key != fixture.token.Key {
+					assert.NotContains(t, response.Body.String(), "Could not resolve model")
+				}
+			}
+		})
 	}
 }
 
@@ -16504,8 +16599,9 @@ func TestTextGatewayAuthorizationCapabilityAndScopeFilters(t *testing.T) {
 			f.offering.Groups = []string{"vip"}
 			require.NoError(t, model.SaveModelOffering(t.Context(), f.offering, "save"))
 		}, status: 404, code: "model_not_found"},
-		{name: "token model restriction", change: func(t *testing.T, f *textGatewayFixture) {
-			require.NoError(t, model.DB.Model(f.token).Updates(map[string]any{"model_limits_enabled": true, "model_limits": "other-model"}).Error)
+		{name: "token Offering restriction", change: func(t *testing.T, f *textGatewayFixture) {
+			_, err := model.MutateKeyPermissions(t.Context(), f.token.Id, f.user.Id, 0, "deny_all", model.KeyPermissions{}, nil)
+			require.NoError(t, err)
 		}, status: 404, code: "model_not_found"},
 		{name: "Provider exclusion", change: func(t *testing.T, f *textGatewayFixture) {
 			f.offering.ChannelScope.ExcludeProviderIDs = []int{f.channel.ProviderID}
@@ -16641,22 +16737,28 @@ func TestTextGatewayInsufficientReservationStopsBeforeProvider(t *testing.T) {
 }
 
 func TestTextGatewayUnknownOfferingRetainsLegacyTokenQuota(t *testing.T) {
-	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("unknown Offering must not use the new Channel") })
-	// The model exists only in legacy routing, where quota still applies even when no route is enabled.
-	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "unknown-legacy-model", ChannelId: fixture.channel.ProviderID, Enabled: false}).Error)
-	body := `{"model":"unknown-legacy-model","messages":[{"role":"user","content":"Hello"}]}`
-	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
-	assert.Equal(t, 401, response.Code, response.Body.String())
-	token, err := model.GetTokenById(fixture.token.Id)
-	require.NoError(t, err)
-	assert.Equal(t, common.TokenStatusExhausted, token.Status)
-	require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"status": common.TokenStatusEnabled, "unlimited_quota": true}).Error)
-	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
-	assert.Equal(t, 503, response.Code, response.Body.String())
-	assert.Contains(t, response.Body.String(), `"code":"model_not_found"`)
-	_, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
-	require.NoError(t, err)
-	assert.Zero(t, total)
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprint("enabled=", enabled), func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("legacy model must not use the new Channel") })
+			// Legacy quota applies to a registered model even when its route is disabled.
+			require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "unknown-legacy-model", ChannelId: fixture.channel.ProviderID, Enabled: enabled}).Error)
+			body := `{"model":"unknown-legacy-model","messages":[{"role":"user","content":"Hello"}]}`
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+			assert.Equal(t, 401, response.Code, response.Body.String())
+			token, err := model.GetTokenById(fixture.token.Id)
+			require.NoError(t, err)
+			assert.Equal(t, common.TokenStatusExhausted, token.Status)
+			// Keep the registered legacy route unavailable for the unlimited-Key check.
+			require.NoError(t, model.DB.Model(&model.Ability{}).Where("model = ?", "unknown-legacy-model").Update("enabled", false).Error)
+			require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"status": common.TokenStatusEnabled, "unlimited_quota": true}).Error)
+			response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+			assert.Equal(t, 503, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), `"code":"model_not_found"`)
+			_, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+			require.NoError(t, err)
+			assert.Zero(t, total)
+		})
+	}
 }
 
 func TestTextGatewayMissingUsageDoesNotChargeOutputLimitAsPrompt(t *testing.T) {

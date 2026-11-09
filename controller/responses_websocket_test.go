@@ -38,6 +38,7 @@ var responsesWSTestUserSequence atomic.Int64
 
 func setupResponsesWSRequestTest(t *testing.T) (*model.User, *model.Token) {
 	t.Helper()
+	require.NoError(t, i18n.Init())
 	previousRedis := common.RedisEnabled
 	previousRDB := common.RDB
 	previousMaster, previousMemory := common.IsMasterNode, common.MemoryCacheEnabled
