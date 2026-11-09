@@ -265,14 +265,22 @@ func gatewayResponseTool(item gjson.Result) (string, string, bool) {
 	case "custom_tool_call":
 		return name, relaycommon.SourceText(item.Get("input")), true
 	case "web_search_call", "file_search_call", "computer_call", "code_interpreter_call", "mcp_call", "local_shell_call":
-		if name == "" {
-			name = strings.TrimSuffix(kind, "_call")
-		}
 		var arguments strings.Builder
 		for _, key := range []string{"action", "arguments", "input", "code", "queries"} {
-			if value := item.Get(key); value.Exists() && value.Type != gjson.Null && gjson.Valid(value.Raw) {
-				arguments.WriteString(value.String())
+			value := item.Get(key)
+			if !value.Exists() || value.Type == gjson.Null || !gjson.Valid(value.Raw) {
+				continue
 			}
+			if value.IsObject() && len(value.Map()) == 0 || value.IsArray() && len(value.Array()) == 0 {
+				continue
+			}
+			arguments.WriteString(value.String())
+		}
+		if name == "" && arguments.Len() == 0 {
+			return "", "", true
+		}
+		if name == "" {
+			name = strings.TrimSuffix(kind, "_call")
 		}
 		return name, arguments.String(), true
 	default:

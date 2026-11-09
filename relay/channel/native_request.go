@@ -109,7 +109,11 @@ func DiagnoseNativeChatRequest(c *gin.Context, info *relaycommon.RelayInfo, requ
 		if key == "response_format" && request.ResponseFormat != nil && request.ResponseFormat.Type == "text" {
 			continue
 		}
-		diagnostics = append(diagnostics, types.ConversionDiagnostic{Code: "request_parameter_dropped", Path: key, Severity: types.ConversionDiagnosticWarning, From: types.RelayFormatOpenAI, To: types.RelayFormatOpenAI, Message: "The native request did not retain this request parameter"})
+		severity := types.ConversionDiagnosticWarning
+		if key == "n" {
+			severity = types.ConversionDiagnosticError
+		}
+		diagnostics = append(diagnostics, types.ConversionDiagnostic{Code: "request_parameter_dropped", Path: key, Severity: severity, From: types.RelayFormatOpenAI, To: types.RelayFormatOpenAI, Message: "The native request did not retain this request parameter"})
 	}
 	for index, message := range request.Messages {
 		for _, part := range message.ParseContent() {

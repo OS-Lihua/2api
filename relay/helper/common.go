@@ -7,6 +7,7 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -300,6 +301,9 @@ func WriteGatewayJSONResponse(c *gin.Context, resp *http.Response, facts *relayc
 	}
 	if resp != nil {
 		for name, values := range resp.Header {
+			if strings.EqualFold(name, "X-Gateway-Conversion-Loss") {
+				continue
+			}
 			if len(values) > 0 && service.ShouldCopyUpstreamHeader(c, name, values) {
 				c.Writer.Header().Set(name, values[0])
 			}

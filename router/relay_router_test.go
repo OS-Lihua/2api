@@ -6860,6 +6860,55 @@ func TestTextGatewayNativeHostedToolOutputIsBillable(t *testing.T) {
 	}
 }
 
+func TestTextGatewayNativeHostedToolContainersAreNotBusinessOutput(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, extra := range []string{"", `,"action":{}`, `,"queries":[]`} {
+			t.Run(fmt.Sprintf("stream=%t/%s", stream, extra), func(t *testing.T) {
+				item := `{"id":"metadata-only","type":"web_search_call","status":"in_progress"` + extra + `}`
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					if stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":%s}\n\n", item)
+						return
+					}
+					_, _ = fmt.Fprintf(w, `{"id":"metadata-response","status":"completed","output":[%s]}`, item)
+				})
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "openai_responses").Error)
+				calls := 0
+				second := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					response := `{"id":"recovered","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Recovered"}]}],"usage":{"input_tokens":10,"output_tokens":5}}`
+					if stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Recovered\",\"output_index\":0,\"content_index\":0}\n\ndata: {\"type\":\"response.completed\",\"response\":%s}\n\n", response)
+						return
+					}
+					_, _ = io.WriteString(w, response)
+				})
+				require.NoError(t, model.DB.Model(second).Update("protocol", "openai_responses").Error)
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/responses", fmt.Sprintf(`{"model":"gateway-offering","input":"Hello","tools":[{"type":"web_search_preview"}],"max_output_tokens":16,"stream":%t}`, stream))
+				assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				assert.Equal(t, 1, calls)
+				assert.Contains(t, response.Body.String(), "Recovered")
+				assert.NotContains(t, response.Body.String(), "metadata-only")
+				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, "success", record.Status)
+				assert.EqualValues(t, 36000, record.Receivable.Nanos)
+				attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, 2, total)
+				for _, attempt := range attempts {
+					if attempt.ChannelID == fixture.channel.ID {
+						assert.Equal(t, "switch", attempt.FailoverDecision)
+						assert.Zero(t, attempt.Cost.Nanos)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestTextGatewayConvertedStreamInterruptionDoesNotComplete(t *testing.T) {
 	for _, endpoint := range []struct{ path, body, failure, forbidden string }{
 		{"/v1/chat/completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stream":true}`, `"error"`, "[DONE]"},
@@ -9124,6 +9173,22 @@ func TestTextGatewayVertexClaudePreservesActualWire(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 1, total)
 	assert.Equal(t, int64(20000), attempts[0].Cost.Nanos)
+	fixture.offering.AcceptedConversionLosses = []string{"request_parameter_dropped"}
+	require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+	for _, test := range []struct{ path, overrides, reason string }{
+		{"model", `{"model":"other-model"}`, "Vertex model is controlled by the request URL"},
+		{"stream", `{"stream":true}`, "Vertex stream must match the request transport"},
+		{"anthropic_version", `{"anthropic_version":"wrong-version"}`, "Vertex anthropic_version must match the native API version"},
+	} {
+		t.Run(test.path, func(t *testing.T) {
+			require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", test.overrides).Error)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/messages", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"metadata":{"user_id":"native-user"},"output_format":{"type":"json_schema","schema":{"type":"object"}}}`)
+			assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), test.path)
+			assert.Contains(t, response.Body.String(), test.reason)
+			assert.Equal(t, 1, calls, "hard native envelope errors cannot be waived or dispatched")
+		})
+	}
 }
 
 func TestTextGatewayPurchaseSnapshotFollowsCredentialWait(t *testing.T) {
@@ -10207,6 +10272,8 @@ func TestTextGatewayNativeComposerReturnsParameterReasons(t *testing.T) {
 		system                             bool
 		overrides, messages, upstream, key string
 	}{
+		{field: "n", extra: `"n":2`, provider: constant.ChannelTypeXunfei, key: "fixture-app|fixture-secret|fixture-key", upstream: "SparkDesk-v3.5", reason: "The native request did not retain this request parameter"},
+		{field: "n", extra: `"n":2`, provider: constant.ChannelTypeAws, key: "test-access|test-secret|us-east-1", upstream: "amazon.nova-lite-v1:0", reason: "The native request did not retain this request parameter"},
 		{field: "n", extra: `"max_tokens":16`, provider: constant.ChannelTypeCohere, overrides: `{"n":2}`, reason: "native wire does not support request parameter n"},
 		{field: "n", extra: `"n":2`, provider: constant.ChannelTypeTencent, key: "1|test-id|test-secret", reason: "native Provider cannot represent multiple output choices (n)"},
 		{field: "tools", extra: `"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]`, provider: constant.ChannelTypeCohere, reason: "The native Cohere request cannot represent this parameter"},
@@ -10234,6 +10301,16 @@ func TestTextGatewayNativeComposerReturnsParameterReasons(t *testing.T) {
 			}
 			if test.overrides != "" {
 				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", test.overrides).Error)
+			}
+			if test.field == "n" && test.provider == constant.ChannelTypeAws {
+				client, err := service.GetHttpClientWithProxySettings("", dto.ProviderSettings{})
+				require.NoError(t, err)
+				original := client.Transport
+				t.Cleanup(func() { client.Transport = original })
+				client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
+					calls++
+					return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"output":{"message":{"role":"assistant","content":[{"text":"Hello"}]}},"stopReason":"end_turn","usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15}}`))}, nil
+				})
 			}
 			messages := `[{"role":"user","content":"Hello"}]`
 			if test.system {
@@ -11191,9 +11268,13 @@ func TestTextGatewayFailoverPublishesActualConversionLossHeader(t *testing.T) {
 }
 
 func TestTextGatewayProviderCannotOverrideConversionLossHeader(t *testing.T) {
-	for _, stream := range []bool{false, true} {
+	for _, test := range []struct {
+		stream bool
+		header string
+	}{{false, "X-Gateway-Conversion-Loss"}, {true, "X-Gateway-Conversion-Loss"}, {false, "x-gateway-conversion-loss"}, {true, "x-gateway-conversion-loss"}} {
+		stream := test.stream
 		for _, loss := range []bool{false, true} {
-			t.Run(fmt.Sprintf("stream=%t/loss=%t", stream, loss), func(t *testing.T) {
+			t.Run(fmt.Sprintf("stream=%t/header=%s/loss=%t", stream, test.header, loss), func(t *testing.T) {
 				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 					w.Header().Set("X-Gateway-Conversion-Loss", "other")
 					if stream {
@@ -11210,6 +11291,19 @@ func TestTextGatewayProviderCannotOverrideConversionLossHeader(t *testing.T) {
 					content, expected = `[{"type":"text","text":"Hello","cache_control":{"type":"ephemeral"}}]`, "cache_control_dropped"
 					fixture.offering.AcceptedConversionLosses = []string{expected}
 					require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+				}
+				if test.header == "x-gateway-conversion-loss" {
+					client := service.GetHttpClient()
+					original := client.Transport
+					t.Cleanup(func() { client.Transport = original })
+					client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
+						response, err := original.RoundTrip(request)
+						if response != nil {
+							response.Header.Del("X-Gateway-Conversion-Loss")
+							response.Header[test.header] = []string{"other"}
+						}
+						return response, err
+					})
 				}
 				body := fmt.Sprintf(`{"model":"gateway-offering","stream":%t,"messages":[{"role":"user","content":%s}],"max_tokens":16}`, stream, content)
 				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/messages", body)
