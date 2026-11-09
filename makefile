@@ -39,11 +39,17 @@ dev-web:
 dev: dev-api dev-web
 
 # The main package embeds the ignored web/dist output and is covered after build-web.
+# Run the router's text and remaining tests separately so each process has its
+# own timeout. Keep both complementary selections even when another group fails.
 test:
 	@echo "Testing root Go module..."
 	@root_module=$$(GOWORK=off go list -m); \
-		root_packages=$$(GOWORK=off go list -e ./... | grep -vxF "$$root_module"); \
-		GOWORK=off go test -timeout=40m $$root_packages
+		root_packages=$$(GOWORK=off go list -e ./... | grep -vxF -e "$$root_module" -e "$$root_module/router"); \
+		status=0; \
+		GOWORK=off go test -timeout=40m $$root_packages || status=$$?; \
+		GOWORK=off go test -timeout=40m "$$root_module/router" -run '^TestTextGateway' || status=$$?; \
+		GOWORK=off go test -timeout=40m "$$root_module/router" -skip '^TestTextGateway' || status=$$?; \
+		exit $$status
 	@echo "Testing relaykit Go module..."
 	@cd relaykit && GOWORK=off go test ./...
 	@echo "Testing tokenkit Go module..."
