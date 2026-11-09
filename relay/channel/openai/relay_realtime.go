@@ -288,7 +288,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (apiErr 
 }
 
 func recordRealtimeResponse(c *gin.Context, info *relaycommon.RelayInfo, result *relaycommon.RealtimeResponseFacts, total *dto.RealtimeUsage) *types.NewAPIError {
-	if result.Facts != nil && result.StreamStatus != nil && result.StreamStatus.CompletedNormally() && result.StreamStatus.OutcomeSnapshot().Response == relaycommon.ResponseOutcomeCompleted && result.Facts.BusinessOutput {
+	if result.Facts != nil && !result.Facts.DownstreamWriteFailed && result.StreamStatus != nil && result.StreamStatus.CompletedNormally() && result.StreamStatus.OutcomeSnapshot().Response == relaycommon.ResponseOutcomeCompleted && result.Facts.BusinessOutput {
 		info.RealtimeResponseSucceeded = true
 	}
 	if info.RealtimeResponseHandler != nil {

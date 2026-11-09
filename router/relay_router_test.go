@@ -2468,11 +2468,11 @@ func TestRealtimeGatewayAcceptsNativeToolChoice(t *testing.T) {
 
 func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
 	for _, tc := range []struct {
-		name                                      string
-		tools, malformed, before, fixed, lowFunds bool
-		terminal                                  string
+		name                                                                string
+		tools, malformed, before, fixed, lowFunds, terminalWrite, zeroUsage bool
+		terminal                                                            string
 	}{
-		{name: "text"}, {name: "tools", tools: true}, {name: "text_error", malformed: true}, {name: "tools_error", tools: true, malformed: true}, {name: "no_generation_error", malformed: true, before: true}, {name: "fixed_error", malformed: true, fixed: true}, {name: "fixed_success", fixed: true}, {name: "fixed_low_funds", fixed: true, lowFunds: true}, {name: "fixed_failed_generation", fixed: true, terminal: "failed"}, {name: "fixed_incomplete_generation", fixed: true, terminal: "incomplete"},
+		{name: "text"}, {name: "tools", tools: true}, {name: "text_error", malformed: true}, {name: "tools_error", tools: true, malformed: true}, {name: "no_generation_error", malformed: true, before: true}, {name: "fixed_error", malformed: true, fixed: true}, {name: "fixed_success", fixed: true}, {name: "fixed_low_funds", fixed: true, lowFunds: true}, {name: "fixed_failed_generation", fixed: true, terminal: "failed"}, {name: "fixed_incomplete_generation", fixed: true, terminal: "incomplete"}, {name: "fixed_terminal_write_failure", fixed: true, terminalWrite: true}, {name: "fixed_explicit_zero_usage", fixed: true, zeroUsage: true},
 	} {
 		withTools, malformed := tc.tools, tc.malformed
 		t.Run(tc.name, func(t *testing.T) {
@@ -2508,7 +2508,7 @@ func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
 					expected, initialQuota = 45, 100
 				}
 				require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(price))
-				if malformed || tc.terminal != "" {
+				if malformed || tc.terminal != "" || tc.terminalWrite {
 					expected = 0
 				}
 			}
@@ -2541,6 +2541,9 @@ func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
 					}
 					id := fmt.Sprintf("legacy-text-%d", round)
 					frames := []string{`{"type":"response.created","response":{"id":"` + id + `","status":"in_progress","max_output_tokens":"inf"}}`, `{"type":"response.function_call_arguments.delta","response_id":"` + id + `","delta":"` + strings.Repeat(" hello", 20) + `"}`, `{"type":"response.done","response":{"id":"` + id + `","status":"completed"}}`}
+					if tc.zeroUsage {
+						frames[2] = `{"type":"response.done","response":{"id":"` + id + `","status":"completed","usage":{"input_tokens":0,"output_tokens":0}}}`
+					}
 					if tc.terminal == "failed" {
 						frames = []string{frames[0], `{"type":"response.done","response":{"id":"` + id + `","status":"failed","output":[],"status_details":{"error":{"code":"server_error","type":"server_error"}},"usage":{"input_tokens":10,"output_tokens":0}}}`}
 					}
@@ -2559,7 +2562,13 @@ func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
 			provider := &model.Provider{Name: "Legacy realtime text", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Key: "legacy-text-key", BaseURL: &upstream.URL, Models: "gpt-4o", Group: "default"}
 			require.NoError(t, model.DB.Create(provider).Error)
 			require.NoError(t, model.DB.Create(&model.Ability{ChannelId: provider.Id, Model: "gpt-4o", Group: "default", Enabled: true}).Error)
-			gateway := newWebSocketGatewayServer(t, fixture.engine)
+			gateway := newWebSocketGatewayServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.terminalWrite {
+					fixture.engine.ServeHTTP(websocketTerminalFailureWriter{w}, r)
+					return
+				}
+				fixture.engine.ServeHTTP(w, r)
+			}))
 			client, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(gateway.URL, "http")+"/v1/realtime?model=gpt-4o", http.Header{"Authorization": {"Bearer sk-" + fixture.token.Key}})
 			if response != nil && response.Body != nil {
 				require.NoError(t, response.Body.Close())
@@ -2578,8 +2587,12 @@ func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
 				if tc.terminal == "failed" {
 					events = 2
 				}
-				for range events {
+				for index := range events {
 					_, _, err = client.ReadMessage()
+					if tc.terminalWrite && index == 2 {
+						require.Error(t, err, "The injected terminal write failure must close the connection")
+						break
+					}
 					require.NoError(t, err)
 				}
 			}
@@ -2587,7 +2600,7 @@ func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
 				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":`)))
 				_, _, err := client.ReadMessage()
 				require.True(t, websocket.IsCloseError(err, websocket.CloseNormalClosure), "Malformed client events end the legacy connection")
-			} else {
+			} else if !tc.terminalWrite {
 				require.NoError(t, client.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second)))
 				_, _, err = client.ReadMessage()
 				require.True(t, websocket.IsCloseError(err, websocket.CloseNormalClosure), "Completed sessions close normally")
