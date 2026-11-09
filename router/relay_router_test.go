@@ -5095,6 +5095,7 @@ func TestMediaGatewayImagesUseOfferingWalletAndActualPayload(t *testing.T) {
 		require.NoError(t, common.DecodeJson(r.Body, &sent))
 		sentN = sent.N
 		assert.Equal(t, "upstream-model", sent.Model)
+		w.Header().Set("X-Gateway-Conversion-Loss", "provider-only")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"data":{"url":"https://image.invalid/one"}}`)
 	})
@@ -5106,6 +5107,7 @@ func TestMediaGatewayImagesUseOfferingWalletAndActualPayload(t *testing.T) {
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 	assert.Equal(t, uint(2), sentN)
 	assert.Contains(t, response.Body.String(), "https://image.invalid/one")
+	assert.Empty(t, response.Header().Get("X-Gateway-Conversion-Loss"))
 	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
 	require.NoError(t, err)
 	assert.Equal(t, int64(36_000_000), record.Receivable.Nanos)
@@ -9945,52 +9947,130 @@ func TestMediaGatewaySpeechUsageFrameConfirmsActualDelivery(t *testing.T) {
 }
 
 func TestMediaGatewayInterruptedSpeechBillsDeliveredAudioAndRetainsProcurement(t *testing.T) {
-	fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = fmt.Fprintf(w, "data: {\"type\":\"speech.audio.delta\",\"audio\":%q,\"usage\":{\"input_tokens\":0,\"output_tokens\":1000,\"output_tokens_details\":{\"audio_tokens\":1000}}}\n\n", base64.StdEncoding.EncodeToString(make([]byte, 48000)))
-	})
-	fixture.fake.Advance(time.Second)
-	for _, price := range []*model.PriceVersion{
-		{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("audio", ao * 15)`, EffectiveAt: clock.Now().Unix()},
-		{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("audio", ao * 10)`, EffectiveAt: clock.Now().Unix()},
-	} {
-		require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+	for _, mode := range []string{"upstream interrupted", "inline report write failure", "vllm header write failure", "reported zero write failure", "cancel with report"} {
+		t.Run(mode, func(t *testing.T) {
+			cancelled := mode == "cancel with report"
+			writeFailure := mode != "upstream interrupted" && !cancelled
+			sourceTokens := int64(1000)
+			if mode == "reported zero write failure" {
+				sourceTokens = 0
+			}
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set("X-Gateway-Conversion-Loss", "provider-only")
+				reported := fmt.Sprintf(`,"usage":{"input_tokens":0,"output_tokens":%d,"output_tokens_details":{"audio_tokens":%d}}`, sourceTokens, sourceTokens)
+				if mode == "vllm header write failure" {
+					w.Header().Set("X-VLLM-OMNI-INPUT-TOKENS", "0")
+					w.Header().Set("X-VLLM-OMNI-OUTPUT-TOKENS", "1000")
+					reported = ""
+				}
+				audio := base64.StdEncoding.EncodeToString(make([]byte, 48000))
+				_, _ = fmt.Fprintf(w, "data: {\"type\":\"speech.audio.delta\",\"audio\":%q%s}\n\n", audio, reported)
+				if writeFailure || cancelled {
+					_, _ = fmt.Fprintf(w, "data: {\"type\":\"speech.audio.delta\",\"audio\":%q}\n\ndata: {\"type\":\"speech.audio.done\"}\n\n", audio)
+				}
+			})
+			if mode == "vllm header write failure" {
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeVLLM).Error)
+			}
+			fixture.fake.Advance(time.Second)
+			for _, price := range []*model.PriceVersion{
+				{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("audio", ao * 15)`, EffectiveAt: clock.Now().Unix()},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("audio", ao * 10)`, EffectiveAt: clock.Now().Unix()},
+			} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			request := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", strings.NewReader(`{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm","stream_format":"sse"}`)).WithContext(ctx)
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			if cancelled {
+				fixture.engine.ServeHTTP(cancelOnSpeechOutputWriter{ResponseRecorder: response, cancel: cancel}, request)
+			} else if writeFailure {
+				fixture.engine.ServeHTTP(&mediaFrameFailureWriter{ResponseRecorder: response, failFrame: 2}, request)
+			} else {
+				fixture.engine.ServeHTTP(response, request)
+			}
+			if cancelled {
+				require.ErrorIs(t, request.Context().Err(), context.Canceled)
+			} else {
+				require.NoError(t, request.Context().Err())
+			}
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.NotContains(t, response.Body.String(), "[DONE]")
+			assert.Equal(t, 1, strings.Count(response.Body.String(), `"type":"speech.audio.delta"`))
+			if !writeFailure && !cancelled {
+				assert.Contains(t, response.Body.String(), `"error"`)
+			}
+			id := response.Header().Get(common.RequestIdKey)
+			record, err := model.GetGatewayRequest(t.Context(), id, fixture.user.Id)
+			require.NoError(t, err)
+			status, errorClass := "partial", "stream_interrupted"
+			if writeFailure {
+				status, errorClass = "failed", "downstream_write_failed"
+			}
+			if cancelled {
+				status = "cancelled"
+			}
+			assert.Equal(t, status, record.Status)
+			output, sale, cost := int64(17), int64(229_500), int64(10_000_000)
+			if cancelled {
+				output, sale = 1000, 13_500_000
+			}
+			if sourceTokens == 0 {
+				output, sale, cost = 0, 0, 0
+			}
+			assert.Equal(t, sale, record.Receivable.Nanos)
+			assert.Equal(t, &output, record.Usage.AudioOutputTokens)
+			if !cancelled {
+				assert.Equal(t, new("1"), record.Usage.AudioOutputSeconds)
+			}
+			if sourceTokens > 0 && !cancelled {
+				assert.Equal(t, "estimated", record.UsageSource)
+			}
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), id, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, cost, attempts[0].Cost.Nanos)
+			if cancelled {
+				assert.Equal(t, "cancelled", attempts[0].Status)
+			} else {
+				assert.Equal(t, errorClass, attempts[0].ErrorClass)
+			}
+			assert.Equal(t, &sourceTokens, attempts[0].Usage.AudioOutputTokens)
+			assert.Equal(t, "upstream", attempts[0].UsageSource)
+			assert.Equal(t, strings.Join(attempts[0].ConversionLosses, ","), response.Header().Get("X-Gateway-Conversion-Loss"))
+			healthView := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/channels/%d", fixture.channel.ID), "")
+			require.True(t, healthView.Success, healthView.Message)
+			health := healthView.Data["health"].(map[string]any)
+			samples := 1
+			if writeFailure || cancelled {
+				samples = 0
+			}
+			assert.EqualValues(t, samples, health["samples"])
+			failures := 0
+			if !writeFailure && !cancelled {
+				failures = 1
+			}
+			assert.EqualValues(t, failures, health["failures"])
+			var lifecycle model.GatewayBilling
+			require.NoError(t, model.DB.First(&lifecycle, "request_id = ?", id).Error)
+			var intent model.GatewaySettlement
+			require.NoError(t, common.UnmarshalJsonStr(lifecycle.Settlement, &intent))
+			require.NotNil(t, intent.SaleUsage)
+			assert.EqualValues(t, output, intent.SaleUsage.CompletionTokenDetails.AudioTokens)
+			require.NotNil(t, intent.AttemptUsage[attempts[0].ID])
+			assert.EqualValues(t, sourceTokens, intent.AttemptUsage[attempts[0].ID].CompletionTokenDetails.AudioTokens)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, 1_000_000_000-sale, wallet.Balance.Nanos)
+			reconciliation, err := model.ReconcileWallets(100)
+			require.NoError(t, err)
+			assert.Empty(t, reconciliation.Mismatches)
+		})
 	}
-	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", `{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm","stream_format":"sse"}`)
-	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
-	assert.NotContains(t, response.Body.String(), "[DONE]")
-	assert.Equal(t, 1, strings.Count(response.Body.String(), `"type":"speech.audio.delta"`), "the accepted audio frame must reach the client even when it carries usage")
-	assert.True(t, strings.Contains(response.Body.String(), `"error"`), "an interrupted stream must report a protocol error after its last delivered frame")
-	id := response.Header().Get(common.RequestIdKey)
-	record, err := model.GetGatewayRequest(t.Context(), id, fixture.user.Id)
-	require.NoError(t, err)
-	assert.Equal(t, "partial", record.Status)
-	assert.Equal(t, int64(229_500), record.Receivable.Nanos)
-	assert.Equal(t, new(int64(17)), record.Usage.AudioOutputTokens)
-	assert.Equal(t, "estimated", record.UsageSource)
-	attempts, total, err := model.ListGatewayAttempts(t.Context(), id, 0, 10)
-	require.NoError(t, err)
-	require.EqualValues(t, 1, total)
-	assert.Equal(t, int64(10_000_000), attempts[0].Cost.Nanos)
-	assert.Equal(t, "stream_interrupted", attempts[0].ErrorClass)
-	healthView := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, fmt.Sprintf("/api/admin/v1/channels/%d", fixture.channel.ID), "")
-	require.True(t, healthView.Success, healthView.Message)
-	health := healthView.Data["health"].(map[string]any)
-	assert.EqualValues(t, 1, health["samples"])
-	assert.EqualValues(t, 1, health["failures"])
-	assert.Equal(t, new(int64(1000)), attempts[0].Usage.AudioOutputTokens)
-	assert.Equal(t, "upstream", attempts[0].UsageSource)
-	var lifecycle model.GatewayBilling
-	require.NoError(t, model.DB.First(&lifecycle, "request_id = ?", id).Error)
-	var intent model.GatewaySettlement
-	require.NoError(t, common.UnmarshalJsonStr(lifecycle.Settlement, &intent))
-	require.NotNil(t, intent.SaleUsage)
-	assert.Equal(t, 17, intent.SaleUsage.CompletionTokenDetails.AudioTokens)
-	require.NotNil(t, intent.AttemptUsage[attempts[0].ID])
-	assert.Equal(t, 1000, intent.AttemptUsage[attempts[0].ID].CompletionTokenDetails.AudioTokens)
-	reconciliation, err := model.ReconcileWallets(100)
-	require.NoError(t, err)
-	assert.Empty(t, reconciliation.Mismatches)
 }
 
 func TestMediaGatewayReleasesUnsentHealthProbeAndRecordsRecoveryOnce(t *testing.T) {

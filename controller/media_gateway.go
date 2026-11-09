@@ -430,6 +430,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 			c.Header("X-Model-Fallback", firstModel.ModelName+"->"+selection.Channel.Model.ModelName)
 		}
 	}
+	c.Header("X-Gateway-Conversion-Loss", strings.Join(selection.ConversionLosses, ","))
 	var usage *dto.Usage
 	var apiErr *types.NewAPIError
 	status, code, transport := 0, "", false
@@ -707,7 +708,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 				run.record.UsageSource = "estimated"
 			}
 		}
-		estimateDelivered := attempt.Status == "partial" || !facts.UsageReported && (attempt.Status == "cancelled" || facts.DownstreamWriteFailed)
+		estimateDelivered := attempt.Status == "partial" || facts.DownstreamWriteFailed && attempt.Status != "cancelled" || !facts.UsageReported && attempt.Status == "cancelled"
 		if info.IsStream && run.parsed.Protocol == protocol.OpenAIAudioSpeech && estimateDelivered {
 			output, clamp := common.QuotaRoundChecked(math.Ceil(float64(facts.DeliveredAudioBytes) / 1000))
 			if audio, ok := prepared.Request.(*dto.AudioRequest); ok && (audio.ResponseFormat == "pcm" || facts.DeliveredAudioSeconds != nil) {
