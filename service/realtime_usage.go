@@ -237,6 +237,9 @@ func (accumulator *RealtimeUsageAccumulator) finish(id string, state *realtimeRe
 	text := tokenkit.Count(state.info.TokenizerModelName(), facts.GeneratedText)
 	audio := CountRealtimeAudioTokens(state.audioBytes, state.outputAudioFormat, false)
 	generated := text + audio
+	if facts.GeneratedOutputTokens != nil {
+		generated = max(generated, *facts.GeneratedOutputTokens)
+	}
 	facts.GeneratedOutputTokens = &generated
 	delivered := CountRealtimeAudioTokens(state.deliveredAudioBytes, state.outputAudioFormat, false)
 	if facts.DeliveredOutputTokens != nil {
@@ -263,13 +266,9 @@ func (accumulator *RealtimeUsageAccumulator) finish(id string, state *realtimeRe
 		usage.PromptTokensDetails.ImageTokens = min(state.input.PromptTokensDetails.ImageTokens, max(0, usage.PromptTokens-usage.PromptTokensDetails.AudioTokens))
 		estimated = true
 	}
-	facts.InputDetailsReported = state.inputTextReported || state.inputAudioReported || state.inputImageReported
+	facts.InputDetailsReported = facts.InputDetailsReported || state.inputTextReported || state.inputAudioReported || state.inputImageReported
 	if !facts.PromptTokensReported && (usage.PromptTokens > 0 || generated > 0 || state.audioBytes > 0 || facts.InputDetailsReported) {
-		knownText := usage.PromptTokensDetails.TextTokens
-		if !state.inputTextReported {
-			knownText = max(knownText, max(0, state.input.PromptTokens-state.input.PromptTokensDetails.AudioTokens-state.input.PromptTokensDetails.ImageTokens))
-		}
-		usage.PromptTokens = max(usage.PromptTokens, knownText+usage.PromptTokensDetails.AudioTokens+usage.PromptTokensDetails.ImageTokens)
+		usage.PromptTokens = max(usage.PromptTokens, inputTokenLowerBound(usage, state.input, state.inputTextReported))
 	}
 	if !state.inputTextReported {
 		usage.PromptTokensDetails.TextTokens = max(0, usage.PromptTokens-usage.PromptTokensDetails.AudioTokens-usage.PromptTokensDetails.ImageTokens)
@@ -279,7 +278,7 @@ func (accumulator *RealtimeUsageAccumulator) finish(id string, state *realtimeRe
 		if !state.outputTextReported {
 			knownText = max(knownText, text)
 		}
-		usage.CompletionTokens = max(usage.CompletionTokens, knownText+usage.CompletionTokenDetails.AudioTokens+usage.CompletionTokenDetails.ImageTokens)
+		usage.CompletionTokens = max(usage.CompletionTokens, max(knownText, usage.CompletionTokenDetails.ReasoningTokens)+usage.CompletionTokenDetails.AudioTokens+usage.CompletionTokenDetails.ImageTokens)
 	}
 	if !state.outputTextReported {
 		usage.CompletionTokenDetails.TextTokens = max(0, usage.CompletionTokens-usage.CompletionTokenDetails.AudioTokens-usage.CompletionTokenDetails.ImageTokens)

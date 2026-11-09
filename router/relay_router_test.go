@@ -428,7 +428,7 @@ func TestResponsesWSGatewayRechecksControlAuthorization(t *testing.T) {
 }
 
 func TestResponsesWSGatewayPreservesImageInputCategories(t *testing.T) {
-	for _, scenario := range []string{"missing usage", "reported zero", "base only", "failed input", "image detail without aggregate", "aggregate zero with image detail"} {
+	for _, scenario := range []string{"missing usage", "reported zero", "base only", "failed input", "image detail without aggregate", "aggregate zero with image detail", "failed image detail only"} {
 		t.Run(scenario, func(t *testing.T) {
 			var fixture textGatewayFixture
 			reserved := make(chan int64, 1)
@@ -449,6 +449,9 @@ func TestResponsesWSGatewayPreservesImageInputCategories(t *testing.T) {
 				usage := ""
 				kind, status, output := "response.completed", "completed", `[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi"}]}]`
 				switch scenario {
+				case "failed image detail only":
+					kind, status, output = "response.failed", "failed", `[]`
+					usage = `,"usage":{"input_tokens_details":{"image_tokens":1000}},"error":{"code":"server_error","type":"server_error"}`
 				case "image detail without aggregate":
 					usage = `,"usage":{"output_tokens":1,"input_tokens_details":{"image_tokens":1000}}`
 				case "aggregate zero with image detail":
@@ -477,7 +480,7 @@ func TestResponsesWSGatewayPreservesImageInputCategories(t *testing.T) {
 					id = fixture.channel.ID
 				}
 				expression := `tier("image",img * 1000)`
-				if scenario == "image detail without aggregate" || scenario == "aggregate zero with image detail" {
+				if scenario == "image detail without aggregate" || scenario == "aggregate zero with image detail" || scenario == "failed image detail only" {
 					expression = `tier("base",p * 1000)`
 				}
 				require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: owner, OwnerID: id, Currency: "USD", Expression: expression, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
@@ -490,7 +493,7 @@ func TestResponsesWSGatewayPreservesImageInputCategories(t *testing.T) {
 			_, reply, err := client.ReadMessage()
 			require.NoError(t, err)
 			kind, status := "response.completed", "success"
-			if scenario == "failed input" {
+			if scenario == "failed input" || scenario == "failed image detail only" {
 				kind, status = "response.failed", "failed"
 			}
 			require.Equal(t, kind, ojson.GetBytes(reply, "type").String())
@@ -514,6 +517,14 @@ func TestResponsesWSGatewayPreservesImageInputCategories(t *testing.T) {
 			if scenario == "aggregate zero with image detail" {
 				amount, cost, images, source = 0, 0, 1000, "upstream"
 				assert.Zero(t, records[0].Usage.PromptTokens)
+			}
+			if scenario == "failed image detail only" {
+				amount, cost, images, source = 0, 1_000_000_000, 0, "none"
+				attempts, _, err := model.ListGatewayAttempts(t.Context(), records[0].ID, 0, 10)
+				require.NoError(t, err)
+				require.Len(t, attempts, 1)
+				assert.EqualValues(t, 1000, attempts[0].Usage.PromptTokens)
+				assert.EqualValues(t, 1000, attempts[0].Usage.ImageInputTokens)
 			}
 			if scenario == "failed input" {
 				amount, images, source = 0, 0, "none"
@@ -833,54 +844,67 @@ func TestResponsesWSGatewayRejectsOlderTerminalReplays(t *testing.T) {
 }
 
 func TestResponsesWSGatewayBoundsOutputIdentityState(t *testing.T) {
-	previous := constant.MaxRequestBodyMB
-	constant.MaxRequestBodyMB = 1
-	t.Cleanup(func() { constant.MaxRequestBodyMB = previous })
-	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
-		peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
-		if !assert.NoError(t, err) {
-			return
-		}
-		defer peer.Close()
-		if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
-			return
-		}
-		frames := []string{`{"type":"response.created","response":{"id":"bounded","status":"in_progress"}}`, `{"type":"response.output_text.delta","response_id":"bounded","item_id":"text","delta":"Hi"}`}
-		for _, prefix := range []string{"a", "b"} {
-			frames = append(frames, `{"type":"response.output_text.delta","response_id":"bounded","item_id":"`+strings.Repeat(prefix, 600_000)+`","delta":""}`)
-		}
-		frames = append(frames, `{"type":"response.output_text.delta","response_id":"bounded","item_id":"text","delta":"UNBOUNDED"}`, `{"type":"response.completed","response":{"id":"bounded","status":"completed"}}`)
-		for _, frame := range frames {
-			if err := peer.WriteMessage(websocket.TextMessage, []byte(frame)); err != nil {
-				return
+	for _, scenario := range []string{"identity index", "first generated text"} {
+		t.Run(scenario, func(t *testing.T) {
+			previous := constant.MaxRequestBodyMB
+			constant.MaxRequestBodyMB = 1
+			t.Cleanup(func() { constant.MaxRequestBodyMB = previous })
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if !assert.NoError(t, err) {
+					return
+				}
+				defer peer.Close()
+				if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
+					return
+				}
+				frames := []string{`{"type":"response.created","response":{"id":"bounded","status":"in_progress"}}`, `{"type":"response.output_text.delta","response_id":"bounded","item_id":"text","delta":"Hi"}`}
+				for _, prefix := range []string{"a", "b"} {
+					frames = append(frames, `{"type":"response.output_text.delta","response_id":"bounded","item_id":"`+strings.Repeat(prefix, 600_000)+`","delta":""}`)
+				}
+				if scenario == "first generated text" {
+					frames = []string{`{"type":"response.created","response":{"id":"bounded","status":"in_progress"}}`, `{"type":"response.output_text.delta","response_id":"bounded","output_index":0,"item_id":"` + strings.Repeat("a", 600_000) + `","delta":""}`, `{"type":"response.output_text.delta","response_id":"bounded","output_index":0,"delta":"` + strings.Repeat(" hello", 100_000) + `"}`}
+				}
+				frames = append(frames, `{"type":"response.output_text.delta","response_id":"bounded","item_id":"text","delta":"UNBOUNDED"}`, `{"type":"response.completed","response":{"id":"bounded","status":"completed"}}`)
+				for _, frame := range frames {
+					if err := peer.WriteMessage(websocket.TextMessage, []byte(frame)); err != nil {
+						return
+					}
+				}
+				_, _, _ = peer.ReadMessage()
+			})
+			client := dialResponsesGateway(t, fixture)
+			require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","input":"Hi","max_output_tokens":16}`)))
+			late, completed := false, false
+			for {
+				_, raw, err := client.ReadMessage()
+				if err != nil {
+					break
+				}
+				late = late || bytes.Contains(raw, []byte("UNBOUNDED"))
+				completed = completed || ojson.GetBytes(raw, "type").String() == "response.completed"
 			}
-		}
-		_, _, _ = peer.ReadMessage()
-	})
-	client := dialResponsesGateway(t, fixture)
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
-	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","input":"Hi","max_output_tokens":16}`)))
-	late, completed := false, false
-	for {
-		_, raw, err := client.ReadMessage()
-		if err != nil {
-			break
-		}
-		late = late || bytes.Contains(raw, []byte("UNBOUNDED"))
-		completed = completed || ojson.GetBytes(raw, "type").String() == "response.completed"
+			assert.False(t, late, "Cumulative identity budget closes the original owner before further frames")
+			assert.False(t, completed)
+			require.NoError(t, client.Close())
+			var records []model.GatewayRequest
+			require.Eventually(t, func() bool {
+				var err error
+				records, _, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+				return err == nil && len(records) == 1 && records[0].Status != "settlement_pending"
+			}, 5*time.Second, 10*time.Millisecond)
+			if scenario == "first generated text" {
+				assert.Equal(t, "failed", records[0].Status)
+				assert.Zero(t, records[0].Receivable.Nanos)
+				assertTextGatewayLedger(t, records[0], 200_001_000)
+			} else {
+				assert.Equal(t, "partial", records[0].Status)
+				assert.Equal(t, int64(5400), records[0].Receivable.Nanos)
+				assertTextGatewayLedger(t, records[0], 3000)
+			}
+		})
 	}
-	assert.False(t, late, "Cumulative identity budget closes the original owner before further frames")
-	assert.False(t, completed)
-	require.NoError(t, client.Close())
-	var records []model.GatewayRequest
-	require.Eventually(t, func() bool {
-		var err error
-		records, _, err = model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
-		return err == nil && len(records) == 1 && records[0].Status != "settlement_pending"
-	}, 5*time.Second, 10*time.Millisecond)
-	assert.Equal(t, "partial", records[0].Status)
-	assert.Equal(t, int64(5400), records[0].Receivable.Nanos)
-	assertTextGatewayLedger(t, records[0], 3000)
 }
 
 func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
@@ -890,6 +914,10 @@ func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 		credentials, pending             bool
 		delta, cancel, disconnect, probe bool
 	}{
+		{name: "independent cached input lower bound", terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Hi"}]}],"usage":{"output_tokens":1,"input_tokens_details":{"cached_tokens":20000}}}}`, source: "estimated", status: "success", sale: 36_003_600, cost: 20_002_000},
+		{name: "explicit input zero with cached detail", terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Hi"}]}],"usage":{"input_tokens":0,"output_tokens":1,"input_tokens_details":{"cached_tokens":20000}}}}`, source: "upstream", status: "success", sale: 3600, cost: 2000},
+		{name: "independent reasoning output lower bound", terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Hi"}]}],"usage":{"input_tokens":10,"output_tokens_details":{"reasoning_tokens":20000}}}}`, source: "estimated", status: "success", sale: 72_018_000, cost: 40_010_000},
+		{name: "explicit output zero with reasoning detail", terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Hi"}]}],"usage":{"input_tokens":10,"output_tokens":0,"output_tokens_details":{"reasoning_tokens":20000}}}}`, source: "upstream", status: "success", sale: 18000, cost: 10000},
 		{name: "failed sale evaluation stays pending across recovery", pending: true, terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":1000,"output_tokens":10}}}`, source: "upstream", status: "settlement_pending", cost: 1_020_000},
 		{name: "partial usage without delivery", terminal: `{"type":"response.failed","response":{"id":"active","status":"failed","error":{"code":"server_error"},"usage":{"input_tokens":1000}}}`, source: "none", status: "failed", cost: 1_000_000},
 		{name: "valid base counters with invalid total", terminal: `{"type":"response.completed","response":{"id":"active","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":"invalid"}}}`, source: "upstream", status: "success", sale: 1_836_000, cost: 1_020_000},
@@ -1570,7 +1598,7 @@ func TestRealtimeGatewayFreezesInheritedReasoning(t *testing.T) {
 }
 
 func TestRealtimeGatewayRetainsReportedInputForNextResponse(t *testing.T) {
-	for _, scenario := range []string{"default", "none default", "explicit replacement", "deleted before done", "audio details only", "inflight unrelated input deletion", "inflight unrelated output deletion"} {
+	for _, scenario := range []string{"default", "none default", "explicit replacement", "deleted before done", "audio details only", "inflight unrelated input deletion", "inflight unrelated output deletion", "cache details only"} {
 		t.Run(scenario, func(t *testing.T) {
 			var calls atomic.Int32
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1658,6 +1686,9 @@ func TestRealtimeGatewayRetainsReportedInputForNextResponse(t *testing.T) {
 						p = 10
 					}
 					terminal := fmt.Sprintf(`{"type":"response.done","response":{"id":%q,"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"text","text":"Hi"}]}],"usage":{"input_tokens":%d,"output_tokens":1}}}`, id, p)
+					if index == 1 && scenario == "cache details only" {
+						terminal = fmt.Sprintf(`{"type":"response.done","response":{"id":%q,"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"text","text":"Hi"}]}],"usage":{"output_tokens":1,"input_token_details":{"cached_tokens":20000}}}}`, id)
+					}
 					if index == 1 && scenario == "audio details only" {
 						terminal = fmt.Sprintf(`{"type":"response.done","response":{"id":%q,"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"text","text":"Hi"}]}],"usage":{"output_tokens":1,"input_token_details":{"audio_tokens":20000}}}}`, id)
 					}
@@ -1732,7 +1763,7 @@ func TestRealtimeGatewayRetainsReportedInputForNextResponse(t *testing.T) {
 			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{}}`)))
 			_, raw, err := client.ReadMessage()
 			require.NoError(t, err)
-			if scenario == "default" || scenario == "none default" || scenario == "audio details only" || scenario == "inflight unrelated input deletion" || scenario == "inflight unrelated output deletion" {
+			if scenario == "default" || scenario == "none default" || scenario == "audio details only" || scenario == "inflight unrelated input deletion" || scenario == "inflight unrelated output deletion" || scenario == "cache details only" {
 				assert.Equal(t, "error", ojson.GetBytes(raw, "type").String())
 				assert.Equal(t, expectedCalls, calls.Load())
 			} else {

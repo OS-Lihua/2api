@@ -29,7 +29,7 @@ type ResponsesUsageAccumulator struct {
 	retainedBytes, retainedLimit                            int
 	unretainedOutputTokens                                  int
 	budgetErr                                               error
-	discarded                                               responseOutputState
+	completionReported                                      bool
 	info                                                    *relaycommon.RelayInfo
 	usage                                                   *dto.Usage
 	outputText                                              strings.Builder
@@ -114,12 +114,25 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 	if event.Response != nil {
 		a.info.ObserveResponseModel(event.Response.Model)
 		if event.Response.Usage != nil {
-			prompt, _ := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens", "", "")
+			prompt, completion := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens", "response.usage.output_tokens", "")
+			if len(raw) == 0 {
+				a.promptReported = a.promptReported || event.Response.Usage.InputTokens > 0 || event.Response.Usage.PromptTokens > 0
+				a.completionReported = a.completionReported || event.Response.Usage.OutputTokens > 0 || event.Response.Usage.CompletionTokens > 0
+			}
+			a.completionReported = a.completionReported || completion
 			a.promptReported = a.promptReported || prompt
 			text, _ := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens_details.text_tokens", "", "")
 			a.inputTextReported = a.inputTextReported || text
 			audio, _ := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens_details.audio_tokens", "", "")
 			image, _ := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens_details.image_tokens", "", "")
+			for _, path := range []string{"cached_tokens", "cached_creation_tokens", "cache_write_tokens", "cache_creation_input_tokens", "cached_tokens_details.text_tokens", "cached_tokens_details.image_tokens", "cached_tokens_details.audio_tokens", "cache_write_tokens_details.ttl_12h_tokens", "cache_write_tokens_details.ttl_30m_tokens"} {
+				if valid, _ := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens_details."+path, "", ""); valid {
+					a.inputDetailsReported = true
+				}
+			}
+			if valid, _ := relaycommon.NativeUsagePresence(raw, "response.usage.prompt_cache_hit_tokens", "", ""); valid {
+				a.inputDetailsReported = true
+			}
 			a.inputDetailsReported = a.inputDetailsReported || audio || image || text
 			if image || len(raw) == 0 && event.Response.Usage.PromptTokensDetails.ImageTokens > 0 {
 				a.imageInputReported = true
@@ -128,6 +141,9 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 			if facts := a.info.ResponseFacts; facts != nil {
 				prompt, completion := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens", "response.usage.output_tokens", "response.usage.total_tokens")
 				facts.InputDetailsReported = a.inputDetailsReported
+				if len(raw) == 0 {
+					prompt, completion = a.promptReported, a.completionReported
+				}
 				reported := *a.usage
 				facts.RecordUsage(a.usage, &reported, prompt, completion)
 			}
@@ -255,8 +271,18 @@ func (a *ResponsesUsageAccumulator) outputState(id string, index *int) *response
 	if index != nil {
 		indexKey = fmt.Sprintf("index:%d", *index)
 	}
+	state := a.outputs[idKey]
+	if state == nil {
+		state = a.outputs[indexKey]
+	}
+	if state == nil && (index == nil || *index == 0) {
+		state = a.outputs["unknown"]
+	}
 	if a.budgetErr != nil {
-		return &a.discarded
+		if state != nil {
+			return state
+		}
+		return &responseOutputState{}
 	}
 	keys := []string{idKey, indexKey}
 	if idKey == "" && indexKey == "" {
@@ -271,16 +297,12 @@ func (a *ResponsesUsageAccumulator) outputState(id string, index *int) *response
 	if additional > a.retainedLimit-a.retainedBytes {
 		a.budgetErr = errors.New("Responses output identity budget exceeded")
 		a.info.StreamStatus.RecordError("Responses output identity budget exceeded")
-		return &a.discarded
+		if state != nil {
+			return state
+		}
+		return &responseOutputState{}
 	}
 	a.retainedBytes += additional
-	state := a.outputs[idKey]
-	if state == nil {
-		state = a.outputs[indexKey]
-	}
-	if state == nil && (index == nil || *index == 0) {
-		state = a.outputs["unknown"]
-	}
 	if state == nil {
 		state = &responseOutputState{}
 	}
@@ -361,11 +383,18 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 		facts.DeliveredOutputTokens = &delivered
 		facts.DeliveredOutputDetails = dto.OutputTokenDetails{TextTokens: delivered}
 	}
-	if a.usage.CompletionTokens == 0 && (facts == nil || !facts.CompletionTokensReported) {
-		if output := a.outputText.String(); output != "" {
-			a.usage.CompletionTokens = tokenkit.Count(a.info.TokenizerModelName(), output)
-		}
-		a.usage.CompletionTokens += a.unretainedOutputTokens
+	completionReported := a.completionReported || facts != nil && facts.CompletionTokensReported
+	generated := a.unretainedOutputTokens
+	if output := a.outputText.String(); output != "" {
+		generated += tokenkit.Count(a.info.TokenizerModelName(), output)
+	}
+	if !completionReported {
+		details := a.usage.CompletionTokenDetails
+		generated = max(generated, max(details.TextTokens, details.ReasoningTokens)+details.AudioTokens+details.ImageTokens)
+		a.usage.CompletionTokens = max(a.usage.CompletionTokens, generated)
+	}
+	if facts != nil {
+		facts.GeneratedOutputTokens = &generated
 	}
 	// Upstream bills the prompt as soon as it starts generating, so a stream
 	// that produced any event but no usage still owes its input tokens unless
@@ -382,19 +411,38 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 		}
 	}
 	if !promptReported && (billsPrompt || a.usage.PromptTokens > 0 || a.inputDetailsReported) {
-		text := a.usage.PromptTokensDetails.TextTokens
-		if !a.inputTextReported {
-			if input := a.info.ResponsesInputFacts; input != nil && input.Usage != nil {
-				text = max(text, max(0, input.Usage.PromptTokens-input.Usage.PromptTokensDetails.AudioTokens-input.Usage.PromptTokensDetails.ImageTokens))
-			}
+		var estimate *dto.Usage
+		if input := a.info.ResponsesInputFacts; input != nil {
+			estimate = input.Usage
 		}
-		a.usage.PromptTokens = max(a.usage.PromptTokens, text+a.usage.PromptTokensDetails.AudioTokens+a.usage.PromptTokensDetails.ImageTokens)
+		a.usage.PromptTokens = max(a.usage.PromptTokens, inputTokenLowerBound(a.usage, estimate, a.inputTextReported))
 	}
 	a.usage.TotalTokens = a.usage.PromptTokens + a.usage.CompletionTokens
 	if a.usage.BillingUsage != nil {
 		a.usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(a.usage.BillingUsage, a.usage.CompletionTokens)
 	}
 	return a.usage
+}
+
+// inputTokenLowerBound combines disjoint modalities and overlapping cache
+// facts without treating cached input as additional input.
+func inputTokenLowerBound(usage, estimate *dto.Usage, textReported bool) int {
+	details := usage.PromptTokensDetails
+	text := details.TextTokens
+	if !textReported && estimate != nil {
+		text = max(text, max(0, estimate.PromptTokens-estimate.PromptTokensDetails.AudioTokens-estimate.PromptTokensDetails.ImageTokens))
+	}
+	cached := max(details.CachedTokens, usage.PromptCacheHitTokens)
+	if subtypes := details.CachedTokensDetails; subtypes != nil {
+		count := 0
+		for _, part := range []*int{subtypes.TextTokens, subtypes.ImageTokens, subtypes.AudioTokens} {
+			if part != nil {
+				count += max(0, *part)
+			}
+		}
+		cached = max(cached, count)
+	}
+	return max(text+details.AudioTokens+details.ImageTokens, cached+details.CacheCreationTokensTotal())
 }
 
 // ObserveResponsesOutcome records the protocol outcome of one Responses event

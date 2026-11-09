@@ -20,6 +20,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestResponsesUsageBudgetRetainsDistinctToolsInLastFrame(t *testing.T) {
+	previous := constant.MaxRequestBodyMB
+	constant.MaxRequestBodyMB = 1
+	t.Cleanup(func() { constant.MaxRequestBodyMB = previous })
+	info := &relaycommon.RelayInfo{TokenizerModel: "gpt-4o", StreamStatus: relaycommon.NewStreamStatus(), ResponseFacts: &relaycommon.ResponseFacts{}}
+	info.SetEstimatePromptTokens(1)
+	counter := NewResponsesUsageAccumulator(info)
+	index := 0
+	counter.Observe(&dto.ResponsesStreamResponse{Type: "response.output_text.delta", ItemID: strings.Repeat("a", 600_000), OutputIndex: &index}, nil)
+	counter.Observe(&dto.ResponsesStreamResponse{Type: "response.completed", Response: &dto.OpenAIResponsesResponse{ID: "terminal", Status: []byte(`"completed"`), Output: []dto.ResponsesOutput{{ID: strings.Repeat("b", 600_000), Type: "function_call", Name: "first", Arguments: []byte(`" hello"`)}, {ID: "second", Type: "function_call", Name: "second", Arguments: []byte(`" world"`)}}}}, nil)
+	require.Error(t, counter.Err())
+	usage := counter.Finish()
+	assert.Equal(t, 4, usage.CompletionTokens, "Every distinct completed tool in the parsed final frame is known generated work")
+}
+
 func TestResponsesUsageBoundsImageAliases(t *testing.T) {
 	previous := constant.MaxRequestBodyMB
 	constant.MaxRequestBodyMB = 1
@@ -74,6 +89,11 @@ func TestRealtimeUsageRetainsIndependentDetailsAndMissingText(t *testing.T) {
 		{name: "missing usage text", input: 600, prompt: 600, completion: 20, textIn: 600, textOut: 20},
 		{name: "explicit text zero", usage: `,"usage":{"input_tokens":600,"output_tokens":20,"input_token_details":{"text_tokens":0},"output_token_details":{"text_tokens":0}}`, input: 600, prompt: 600, completion: 20},
 		{name: "independent audio", usage: `,"usage":{"output_tokens":20,"input_token_details":{"audio_tokens":20000}}`, input: 10, prompt: 20000, completion: 20, audio: 20000, textOut: 20},
+		{name: "cache overlaps audio", usage: `,"usage":{"output_tokens":20,"input_token_details":{"cached_tokens":20000,"audio_tokens":20000}}`, input: 610, inputAudio: 10, prompt: 20600, completion: 20, audio: 20000, textIn: 600, textOut: 20},
+		{name: "independent cache", usage: `,"usage":{"output_tokens":20,"input_token_details":{"cached_tokens":20000}}`, input: 600, prompt: 20000, completion: 20, textIn: 20000, textOut: 20},
+		{name: "explicit input zero with cache", usage: `,"usage":{"input_tokens":0,"output_tokens":20,"input_token_details":{"cached_tokens":20000}}`, input: 600, completion: 20, textOut: 20},
+		{name: "independent reasoning", usage: `,"usage":{"input_tokens":600,"output_token_details":{"reasoning_tokens":20000}}`, input: 600, prompt: 600, completion: 20000, textIn: 600, textOut: 20000},
+		{name: "explicit output zero with reasoning", usage: `,"usage":{"input_tokens":600,"output_tokens":0,"output_token_details":{"reasoning_tokens":20000}}`, input: 600, prompt: 600, textIn: 600},
 		{name: "independent audio with text", usage: `,"usage":{"output_tokens":20,"input_token_details":{"audio_tokens":20000}}`, input: 610, inputAudio: 10, prompt: 20600, completion: 20, audio: 20000, textIn: 600, textOut: 20},
 		{name: "independent image", usage: `,"usage":{"output_tokens":20,"input_token_details":{"image_tokens":10000}}`, input: 85, prompt: 10000, completion: 20, image: 10000, textOut: 20},
 		{name: "explicit total zero", usage: `,"usage":{"input_tokens":0,"output_tokens":20,"input_token_details":{"audio_tokens":20000}}`, input: 10, prompt: 0, completion: 20, audio: 20000, textOut: 20},
@@ -445,7 +465,7 @@ func TestResponsesUsageAccumulatorTerminalAccounting(t *testing.T) {
 		{eventType: "response.canceled", wantImages: 1},
 	} {
 		t.Run(tc.eventType, func(t *testing.T) {
-			info := &relaycommon.RelayInfo{OriginModelName: "gpt-5.1", StreamStatus: relaycommon.NewStreamStatus()}
+			info := &relaycommon.RelayInfo{OriginModelName: "gpt-5.1", TokenizerModel: "gpt-5.1", StreamStatus: relaycommon.NewStreamStatus()}
 			accumulator := NewResponsesUsageAccumulator(info)
 			for _, item := range []dto.ResponsesOutput{
 				{Type: dto.BuildInCallWebSearchCall},
@@ -558,7 +578,7 @@ func TestObserveResponsesOutcomeRecordsProtocolFacts(t *testing.T) {
 }
 
 func TestResponsesUsageAccumulatorDisconnectBillsCompletedImage(t *testing.T) {
-	info := &relaycommon.RelayInfo{OriginModelName: "gpt-5.1", StreamStatus: relaycommon.NewStreamStatus()}
+	info := &relaycommon.RelayInfo{OriginModelName: "gpt-5.1", TokenizerModel: "gpt-5.1", StreamStatus: relaycommon.NewStreamStatus()}
 	accumulator := NewResponsesUsageAccumulator(info)
 	accumulator.Observe(&dto.ResponsesStreamResponse{
 		Type: dto.ResponsesOutputTypeItemDone,

@@ -441,7 +441,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	}
 	run.record.Status = attempt.Status
 	if usage != nil {
-		if !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && !info.ResponseFacts.CompletionTokensReported && !info.ResponseFacts.BusinessOutput && info.ResponseFacts.GeneratedText == "" && info.ResponseFacts.GeneratedAudioBytes == 0 && (info.ResponseFacts.GeneratedOutputTokens == nil || *info.ResponseFacts.GeneratedOutputTokens == 0) {
+		if !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && !info.ResponseFacts.InputDetailsReported && !info.ResponseFacts.CompletionTokensReported && !info.ResponseFacts.BusinessOutput && info.ResponseFacts.GeneratedText == "" && info.ResponseFacts.GeneratedAudioBytes == 0 && (info.ResponseFacts.GeneratedOutputTokens == nil || *info.ResponseFacts.GeneratedOutputTokens == 0) {
 			usage = nil
 		}
 	}
