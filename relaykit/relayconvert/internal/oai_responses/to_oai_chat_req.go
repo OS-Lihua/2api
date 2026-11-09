@@ -279,9 +279,19 @@ func responsesContentPartsToChatContent(ctx context.Context, parts []any) (any, 
 			})
 		case "input_image":
 			onlyText = false
+			image := responsesImagePartToChatImageURL(part)
+			if fields, ok := image.(map[string]any); ok && kitutil.Interface2String(fields["file_id"]) != "" && kitutil.Interface2String(fields["url"]) == "" {
+				convdiag.Add(ctx, types.ConversionDiagnostic{
+					Code:     "unsupported_image_file_reference",
+					Path:     "input.content.file_id",
+					Message:  "Chat cannot represent an image Files API reference",
+					Severity: types.ConversionDiagnosticError,
+				})
+				continue
+			}
 			chatParts = append(chatParts, map[string]any{
 				"type":      dto.ContentTypeImageURL,
-				"image_url": responsesImagePartToChatImageURL(part),
+				"image_url": image,
 			})
 		case "input_file":
 			onlyText = false
@@ -481,11 +491,12 @@ func RequestTextToChatResponseFormat(raw json.RawMessage) (*dto.ResponseFormat, 
 
 func responsesImagePartToChatImageURL(part map[string]any) any {
 	if imageURL, ok := part["image_url"]; ok {
-		// Chat Completions takes the URL inside an object. detail is left out:
-		// Chat upstreams that validate it with older OpenAI SDKs reject newer
-		// values such as "original".
 		if url, ok := imageURL.(string); ok {
-			return map[string]any{"url": url}
+			image := map[string]any{"url": url}
+			if detail, present := part["detail"]; present {
+				image["detail"] = detail
+			}
+			return image
 		}
 		return imageURL
 	}

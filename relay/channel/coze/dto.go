@@ -1,6 +1,29 @@
 package coze
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+)
+
+func (*CozeChatRequest) ChatRequestCapabilities() channel.NativeChatCapabilities {
+	return channel.NativeChatCapabilities{Parameters: []string{"user"}, ContentTypes: []string{dto.ContentTypeText}}
+}
+
+func (*CozeChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error) {
+	var wire CozeChatRequest
+	if err := common.Unmarshal(body, &wire); err != nil {
+		return nil, err
+	}
+	public.Stream = common.GetPointer(wire.Stream)
+	public.User = wire.UserId
+	public.Messages = nil
+	for _, message := range wire.AdditionalMessages {
+		public.Messages = append(public.Messages, dto.Message{Role: message.Role, Content: message.Content})
+	}
+	return &public, nil
+}
 
 type CozeError struct {
 	Code    int    `json:"code"`

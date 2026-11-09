@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
@@ -85,6 +86,8 @@ type ProviderRequest struct {
 	Payload []byte `json:"-"`
 	// RequestHeaders are the final headers after administrator overrides.
 	RequestHeaders http.Header `json:"-"`
+	// BeginFollowupCall rechecks the host-owned credential and deadline before another Provider I/O.
+	BeginFollowupCall func() (context.Context, error) `json:"-"`
 }
 
 func (r *ProviderRequest) ProviderRequest() *ProviderRequest { return r }
@@ -96,7 +99,8 @@ func NewProviderMetadata(info *relaycommon.RelayInfo) *ProviderRequest {
 		return nil
 	}
 	r := &ProviderRequest{
-		ChannelType: info.ChannelType, ChannelId: info.ChannelId,
+		BeginFollowupCall: info.BeginProviderCall,
+		ChannelType:       info.ChannelType, ChannelId: info.ChannelId,
 		ChannelIsMultiKey: info.ChannelIsMultiKey, ChannelMultiKeyIndex: info.ChannelMultiKeyIndex,
 		ChannelBaseUrl: info.ChannelBaseUrl, ApiVersion: info.ApiVersion, ApiKey: info.ApiKey,
 		Organization: info.Organization, ChannelCreateTime: info.ChannelCreateTime,

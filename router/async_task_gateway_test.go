@@ -71,6 +71,90 @@ func newAsyncTaskFixture(t *testing.T, upstream http.HandlerFunc) textGatewayFix
 	return fixture
 }
 
+func TestAsyncTaskUsesOfferingIDPermissionsAcrossEntrypoints(t *testing.T) {
+	for _, endpoint := range []struct{ name, path, body string }{
+		{"task", "/v1/tasks/sora", `{"model":"$MODEL","prompt":"A bird","seconds":"4"}`},
+		{"video", "/v1/videos", `{"model":"$MODEL","prompt":"A bird","seconds":"4"}`},
+		{"responses", "/v1/responses", `{"model":"$MODEL","input":"A bird","background":true,"seconds":"4"}`},
+		{"native", "/ali/api/v1/services/aigc/multimodal-generation/generation", `{"model":"$MODEL","input":{"messages":[{"role":"user","content":[{"text":"A bird"}]}]},"parameters":{"enable_interleave":true,"max_images":1}}`},
+	} {
+		t.Run(endpoint.name, func(t *testing.T) {
+			var calls atomic.Int32
+			upstream := func(w http.ResponseWriter, r *http.Request) {
+				id := calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				if endpoint.name == "native" {
+					_, _ = io.WriteString(w, `{"output":{"choices":[{"message":{"content":[{"image":"https://artifact.invalid/bird.png"}]},"finish_reason":"stop"}]},"usage":{"image_count":1}}`)
+					return
+				}
+				_, _ = fmt.Fprintf(w, `{"id":"permission-job-%d","status":"queued"}`, id)
+			}
+			var fixture textGatewayFixture
+			if endpoint.name == "native" {
+				fixture = newNativeImageTaskFixture(t, "alibaba", upstream)
+			} else {
+				fixture = newAsyncTaskFixture(t, upstream)
+			}
+			pat := createWalletTestAccessToken(t, fixture.user.Id, "api_key:read", "api_key:write")
+			policy := fmt.Sprintf("/api/token/%d/permissions", fixture.token.Id)
+			denied := adminSecurityRequest(fixture.engine, pat, http.MethodPatch, policy, `{"action":"deny_all","revision":0}`)
+			require.Equal(t, http.StatusOK, denied.Code, denied.Body.String())
+			var inaccessible map[string]any
+			for _, name := range []string{fixture.offering.Name, "gateway-alias", "missing-task-offering"} {
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, endpoint.path, strings.ReplaceAll(endpoint.body, "$MODEL", name))
+				require.Equal(t, http.StatusNotFound, response.Code, "%s: %s", name, response.Body.String())
+				var payload map[string]any
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+				if endpoint.name == "native" {
+					assert.Equal(t, "NotFound", payload["code"])
+					delete(payload, "request_id")
+				} else {
+					assert.Contains(t, response.Body.String(), "model_not_found")
+				}
+				if inaccessible == nil {
+					inaccessible = payload
+				} else {
+					assert.Equal(t, inaccessible, payload, "hidden and unknown Offering names must share their protocol error")
+				}
+			}
+			assert.Zero(t, calls.Load())
+			var reservations int64
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
+			assert.Zero(t, reservations)
+			opened := adminSecurityRequest(fixture.engine, pat, http.MethodPatch, policy, fmt.Sprintf(`{"action":"add","offering_ids":[%d],"revision":1}`, fixture.offering.ID))
+			require.Equal(t, http.StatusOK, opened.Code, opened.Body.String())
+			for _, name := range []string{fixture.offering.Name, "gateway-alias"} {
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, endpoint.path, strings.ReplaceAll(endpoint.body, "$MODEL", name))
+				require.Equal(t, http.StatusOK, response.Code, "%s: %s", name, response.Body.String())
+			}
+			assert.EqualValues(t, 2, calls.Load())
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
+			assert.EqualValues(t, 2, reservations)
+			closed := adminSecurityRequest(fixture.engine, pat, http.MethodPatch, policy, `{"action":"deny_all","revision":2}`)
+			require.Equal(t, http.StatusOK, closed.Code, closed.Body.String())
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, endpoint.path, strings.ReplaceAll(endpoint.body, "$MODEL", "gateway-alias"))
+			require.Equal(t, http.StatusNotFound, response.Code, response.Body.String())
+			assert.EqualValues(t, 2, calls.Load(), "live permission revocation must stop dispatch")
+			replayed := adminSecurityRequest(fixture.engine, pat, http.MethodPatch, policy, `{"action":"deny_all","revision":2}`)
+			require.Equal(t, http.StatusConflict, replayed.Code, replayed.Body.String())
+			for _, credential := range []struct {
+				updates map[string]any
+				status  int
+			}{
+				{map[string]any{"status": common.TokenStatusDisabled}, http.StatusUnauthorized},
+				{map[string]any{"expired_time": 1}, http.StatusUnauthorized},
+				{map[string]any{"allow_ips": "203.0.113.0/24"}, http.StatusForbidden},
+			} {
+				require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"status": common.TokenStatusEnabled, "expired_time": -1, "allow_ips": ""}).Error)
+				require.NoError(t, model.DB.Model(fixture.token).Updates(credential.updates).Error)
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, endpoint.path, strings.ReplaceAll(endpoint.body, "$MODEL", "gateway-alias"))
+				require.Equal(t, credential.status, response.Code, response.Body.String())
+				assert.EqualValues(t, 2, calls.Load())
+			}
+		})
+	}
+}
+
 func TestAsyncTaskOfferingReservesWalletBeforeAcceptance(t *testing.T) {
 	calls := 0
 	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -508,7 +592,6 @@ func TestAsyncTaskHostProtocolsUseOfferingMoneyLifecycle(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte(`{"id":"private-job","status":"queued"}`))
 			})
-			SetTaskPluginProtocolRouter(fixture.engine)
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, tc.path, tc.body)
 			require.Equal(t, 200, response.Code, response.Body.String())
 			assert.Equal(t, 1, calls)
@@ -1227,7 +1310,6 @@ func TestAsyncTaskFreezesOriginalSaleAndFinalWirePricingConditions(t *testing.T)
 			request := httptest.NewRequest(http.MethodPost, "/v1/tasks/sora", strings.NewReader(`{"model":"gateway-alias","prompt":"private-pricing-request-content","seconds":"4"}`))
 			request.Header.Set("Content-Type", "application/json")
 			if tc.multipart {
-				SetTaskPluginProtocolRouter(fixture.engine)
 				var payload bytes.Buffer
 				writer := multipart.NewWriter(&payload)
 				for name, value := range map[string]string{"model": "gateway-alias", "prompt": "private-pricing-request-content", "seconds": "4"} {
@@ -1535,7 +1617,6 @@ func TestAsyncTaskImmediateImagesReturnOnceWithoutPersistingResults(t *testing.T
 			} {
 				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
 			}
-			SetTaskPluginProtocolRouter(fixture.engine)
 			builder := newPluginGenerationBuilder(fixture.engine.Routes(), nil, productionPluginRouteHandlers)
 			require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(builder.prepare))
 			dispatcher := &pluginRouteDispatcher{registry: jsplugin.DefaultRegistry}
@@ -1716,7 +1797,6 @@ func TestAsyncTaskVideoFallbackCannotBypassDisabledProvider(t *testing.T) {
 		require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
 	}
 	SetVideoRouter(fixture.engine)
-	SetTaskPluginProtocolRouter(fixture.engine)
 	builder := newPluginGenerationBuilder(fixture.engine.Routes(), nil, productionPluginRouteHandlers)
 	require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(builder.prepare))
 	dispatcher := &pluginRouteDispatcher{registry: jsplugin.DefaultRegistry}
@@ -2018,7 +2098,6 @@ func TestAsyncTaskRouteEnforcesTokenFactsAndOutputModality(t *testing.T) {
 				unified.Capabilities.OutputModalities = []capability.Modality{capability.Text}
 				require.NoError(t, model.DB.Model(&unified).Update("capabilities", unified.Capabilities).Error)
 			}
-			SetTaskPluginProtocolRouter(fixture.engine)
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/videos", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
 			want := 400
 			if tokenLimited {
@@ -2274,7 +2353,6 @@ func TestAsyncTaskRouteUsesEffectivePurchaseCostAndProfit(t *testing.T) {
 				_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "cheapsora"})
 				require.NoError(t, err)
 				channelProtocol = "task:cheapsora"
-				SetTaskPluginProtocolRouter(fixture.engine)
 			}
 			channel := &model.Channel{ProviderID: provider.Id, ModelID: fixture.channel.ModelID, Protocol: protocol.Type(channelProtocol), UpstreamModelName: "sora-2", MappingConfirmed: true, Status: model.ChannelEnabled, Weight: 1, ParameterOverrides: `{}`}
 			require.NoError(t, model.DB.Create(channel).Error)
@@ -2445,7 +2523,6 @@ func TestAsyncTaskChannelOverridesChangeWireAndBillingFacts(t *testing.T) {
 				assert.Equal(t, "8", body["seconds"])
 				_, _ = w.Write([]byte(`{"id":"override-job","status":"queued"}`))
 			})
-			SetTaskPluginProtocolRouter(fixture.engine)
 			require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", `{"seconds":"8"}`).Error)
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
 			require.Equal(t, 200, response.Code, response.Body.String())
@@ -2486,7 +2563,6 @@ func TestAsyncTaskImageCountUsesCompletedFactsOnBothSides(t *testing.T) {
 	} {
 		require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
 	}
-	SetTaskPluginProtocolRouter(fixture.engine)
 	pricingPAT := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "pricing:read", "pricing:write")
 	invalid, err := common.Marshal(map[string]any{"owner_type": model.PriceOwnerOffering, "owner_id": fixture.offering.ID, "currency": "USD", "expression": `tier("image", (image_count - 1) * 0.1)`, "effective_at": clock.Now().Unix() + 1000})
 	require.NoError(t, err)
@@ -2516,7 +2592,6 @@ func TestAsyncTaskUnavailableChannelUsesBackendLanguage(t *testing.T) {
 	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		assert.Fail(t, "unavailable task plugin must not contact its Provider")
 	})
-	SetTaskPluginProtocolRouter(fixture.engine)
 	require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "task:unavailable-plugin").Error)
 	for _, language := range []struct{ locale, message string }{{"en", "Task Channel is unavailable"}, {"zh-CN", "任务通道不可用"}, {"zh-TW", "任務通道無法使用"}} {
 		request := httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`))
@@ -2610,7 +2685,6 @@ func TestAsyncTaskImageInRequestPollingUsesActualCredentialSlot(t *testing.T) {
 	} {
 		require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
 	}
-	SetTaskPluginProtocolRouter(fixture.engine)
 	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", `{"model":"gateway-alias","prompt":"A bird","n":1,"response_format":"url"}`)
 	require.Equal(t, 200, response.Code, response.Body.String())
 	assert.EqualValues(t, 1, submitted.Load())

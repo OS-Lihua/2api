@@ -55,11 +55,98 @@ func NewStreamScanner(reader io.Reader, maxBytes ...int) *bufio.Scanner {
 	return scanner
 }
 
+// NewSSEEventScanner shares event framing and retains incomplete source data
+// for procurement observers without presenting it as a delivered event.
+func NewSSEEventScanner(reader io.Reader, facts *relaycommon.ResponseFacts) *bufio.Scanner {
+	scanner := NewStreamScanner(reader)
+	scanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
+		advance, token, err := splitSSEEvents(data, atEOF)
+		if err != nil && facts != nil {
+			event := ParseSSEEvent(string(data))
+			facts.UnterminatedStreamData = []byte(event.Data)
+			facts.UnterminatedStreamEvent = event.Event
+		}
+		return advance, token, err
+	})
+	return scanner
+}
+
+type SSEEvent struct {
+	Event   string
+	Data    string
+	HasData bool
+}
+
+// splitSSEEvents confirms the blank line that terminates an SSE event. EOF
+// cannot complete a pending data event; comments without data may be discarded.
+func splitSSEEvents(data []byte, atEOF bool) (int, []byte, error) {
+	lineStart := 0
+	for index := 0; index < len(data); {
+		if data[index] != '\r' && data[index] != '\n' {
+			index++
+			continue
+		}
+		next := index + 1
+		if data[index] == '\r' {
+			if next == len(data) && !atEOF && index != lineStart {
+				return 0, nil, nil
+			}
+			if next < len(data) && data[next] == '\n' {
+				next++
+			}
+		}
+		if index == lineStart {
+			return next, data[:index], nil
+		}
+		lineStart, index = next, next
+	}
+	if atEOF {
+		if ParseSSEEvent(string(data)).HasData {
+			return 0, nil, io.ErrUnexpectedEOF
+		}
+		return len(data), nil, nil
+	}
+	return 0, nil, nil
+}
+
+// ParseSSEEvent joins data fields and retains the event name of one record.
+func ParseSSEEvent(event string) SSEEvent {
+	event = strings.TrimPrefix(event, "\xef\xbb\xbf")
+	event = strings.ReplaceAll(event, "\r\n", "\n")
+	event = strings.ReplaceAll(event, "\r", "\n")
+	var data strings.Builder
+	result := SSEEvent{}
+	for line := range strings.SplitSeq(event, "\n") {
+		field, value, _ := strings.Cut(line, ":")
+		value = strings.TrimPrefix(value, " ")
+		if field == "event" {
+			result.Event = value
+			continue
+		}
+		if field != "data" {
+			continue
+		}
+		if result.HasData {
+			data.WriteByte('\n')
+		}
+		data.WriteString(value)
+		result.HasData = true
+	}
+	result.Data = data.String()
+	return result
+}
+
 func copyCodexSSEHeaders(c *gin.Context, resp *http.Response) {
 	if c == nil || c.Writer == nil || resp == nil {
 		return
 	}
-	// codex
+	headers := c.Writer.Header()
+	if facts, ok := common.GetContextKeyType[*relaycommon.ResponseFacts](c, constant.ContextKeyResponseFacts); ok && facts != nil && facts.OnBusinessOutput != nil && !facts.BusinessOutput {
+		if facts.StreamHeaders == nil {
+			facts.StreamHeaders = make(map[string][]string)
+		}
+		headers = http.Header(facts.StreamHeaders)
+	}
 	for _, name := range []string{"X-Reasoning-Included", "X-Codex-Turn-State"} {
 		values := resp.Header.Values(name)
 		if !service.ShouldCopyUpstreamHeader(c, name, values) {
@@ -67,7 +154,7 @@ func copyCodexSSEHeaders(c *gin.Context, resp *http.Response) {
 		}
 		for _, value := range values {
 			if value != "" {
-				c.Writer.Header().Add(name, value)
+				headers.Add(name, value)
 			}
 		}
 	}
@@ -117,7 +204,7 @@ func (w *streamResponseWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
-func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult)) {
+func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult), stoppedSource ...func(string)) {
 
 	if resp == nil || dataHandler == nil {
 		return
@@ -199,7 +286,11 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	// Ensure gin.Context is not returned to Gin's pool while any stream goroutine can still use it.
 	defer cleanup()
 
-	scanner.Split(bufio.ScanLines)
+	if managed {
+		scanner = NewSSEEventScanner(resp.Body, info.ResponseFacts)
+	} else {
+		scanner.Split(bufio.ScanLines)
+	}
 	copyCodexSSEHeaders(c, resp)
 	SetEventStreamHeaders(c)
 
@@ -255,6 +346,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	}
 
 	dataChan := make(chan string, 10)
+	var pendingSource string
 	sr := newStreamResult(info.StreamStatus)
 
 	wg.Add(1)
@@ -295,15 +387,6 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		}()
 
 		for scanner.Scan() {
-			// 检查是否需要停止
-			select {
-			case <-stopChan:
-				return
-			case <-ctx.Done():
-				return
-			default:
-			}
-
 			if ticker != nil {
 				ticker.Reset(streamingTimeout)
 			}
@@ -314,10 +397,28 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				logger.LogDebug(c, "stream scanner data: %s", data)
 			}
 
-			data, hasDataPrefix := strings.CutPrefix(data, "data:")
+			if managed {
+				event := ParseSSEEvent(data)
+				data = ""
+				if event.HasData {
+					data = event.Data
+				}
+			} else {
+				var hasDataPrefix bool
+				data, hasDataPrefix = strings.CutPrefix(data, "data:")
+				if !hasDataPrefix && strings.TrimSpace(data) != "[DONE]" {
+					data = ""
+				}
+			}
 			data = strings.TrimSpace(data)
-			if !hasDataPrefix && data != "[DONE]" {
-				continue
+			select {
+			case <-stopChan:
+				pendingSource = data
+				return
+			case <-ctx.Done():
+				pendingSource = data
+				return
+			default:
 			}
 			if data == "" {
 				continue
@@ -329,8 +430,10 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				select {
 				case dataChan <- data:
 				case <-ctx.Done():
+					pendingSource = data
 					return
 				case <-stopChan:
+					pendingSource = data
 					return
 				}
 			} else {
@@ -370,6 +473,16 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	}
 
 	cleanup()
+	// Source observation runs only after both stream goroutines have joined.
+	// It retains received frames without another public write or terminal callback.
+	if len(stoppedSource) > 0 && stoppedSource[0] != nil {
+		for data := range dataChan {
+			stoppedSource[0](data)
+		}
+		if pendingSource != "" && pendingSource != "[DONE]" {
+			stoppedSource[0](pendingSource)
+		}
+	}
 	// All stream goroutines have joined. Done from a successfully delivered
 	// protocol completion can now correct a cancellation that won while its
 	// callback was still running. Bare EOF and failed writes never qualify.

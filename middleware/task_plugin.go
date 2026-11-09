@@ -1795,12 +1795,26 @@ func RespondTaskPluginError(c *gin.Context, taskErr *dto.TaskError) bool {
 		return false
 	}
 	sanitized := sanitizedTaskPluginError(taskErr.StatusCode, taskErr.Message)
+	if taskErr.StatusCode == http.StatusNotFound && taskErr.Code == "model_not_found" {
+		sanitized.Code = "model_not_found"
+	}
 	requestID := c.GetString(common.RequestIdKey)
 	hasRenderer, err := pinned.Plugin.Engine.HasCallablePath(c.Request.Context(), "native", "error")
 	requestValue, exists := c.Get(pluginruntime.ContextKeyRouteRequest)
 	requestContext, ok := requestValue.(pluginruntime.RouteRequestContext)
-	if err == nil && hasRenderer && exists && ok {
-		body, callErr := pinned.Plugin.Engine.CallMember(c.Request.Context(), "native", "error", requestContext.JSValue(), map[string]any{
+	var rendererContext any
+	if exists && ok {
+		rendererContext = requestContext.JSValue()
+	} else {
+		rendererContext = map[string]any{
+			"method": c.Request.Method, "path": c.Request.URL.Path,
+			"params": pluginruntime.RouteParams(c.Params, pinned.Route),
+			"query":  map[string][]string{}, "requestHeaders": map[string]string{},
+			"body": map[string]any{"kind": "none"},
+		}
+	}
+	if err == nil && hasRenderer {
+		body, callErr := pinned.Plugin.Engine.CallMember(c.Request.Context(), "native", "error", rendererContext, map[string]any{
 			"code":       sanitized.Code,
 			"message":    sanitized.Message,
 			"httpStatus": sanitized.HTTPStatus,

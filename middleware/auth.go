@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
@@ -543,7 +544,7 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 		parts := strings.Split(key, "-")
 		key = parts[0]
 
-		token, err := model.GetTokenByKey(key, false)
+		token, err := model.GetTokenCredential(key)
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				common.ApiErrorStatus(c, http.StatusUnauthorized, errors.New(common.TranslateMessage(c, i18n.MsgTokenInvalid)))
@@ -636,6 +637,24 @@ func LegacyTaskSubmissionAuth() gin.HandlerFunc {
 }
 
 func TokenAuth() func(c *gin.Context) {
+	return tokenAuth(false)
+}
+
+// GatewayTokenAuth selects wallet credentials only for stateless text HTTP and
+// model discovery. A configured legacy fallback still checks quota before dispatch.
+func GatewayTokenAuth() func(c *gin.Context) {
+	return func(c *gin.Context) {
+		textProtocol, _ := TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
+		if textProtocol != "" && c.GetTime(TextGatewayStartedAtKey).IsZero() {
+			// Freeze request-start prices before credential lookups.
+			c.Set(TextGatewayStartedAtKey, clock.Now())
+		}
+		discovery := c.Request.Method == http.MethodGet && (strings.HasPrefix(c.Request.URL.Path, "/v1/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/openai/models"))
+		tokenAuth(textProtocol != "" || discovery)(c)
+	}
+}
+
+func tokenAuth(walletCredential bool) func(c *gin.Context) {
 	return func(c *gin.Context) {
 		// 先检测是否为ws
 		applyWebSocketSubprotocolAuthorization(c.Request.Header)
@@ -680,7 +699,7 @@ func TokenAuth() func(c *gin.Context) {
 			key = parts[0]
 		}
 		validateToken := model.ValidateUserToken
-		if TextOffering(c) != nil || c.GetBool(taskReadAuthKey) {
+		if walletCredential || TextOffering(c) != nil || TextOfferingMissing(c) || c.GetBool(taskReadAuthKey) {
 			validateToken = model.ValidateWalletToken
 		}
 		token, err := validateToken(key)

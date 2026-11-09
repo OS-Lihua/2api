@@ -605,7 +605,7 @@ func GatewayCapabilitiesMatch(request *dto.GeneralOpenAIRequest, caps capability
 	if request.Stream != nil && *request.Stream && !slices.Contains(caps.Features, capability.Streaming) {
 		return false
 	}
-	tools := len(request.Tools) > 0 || len(request.Functions) > 0
+	tools := request.RequiresToolCalling || len(request.Tools) > 0 || len(request.Functions) > 0
 	for _, message := range request.Messages {
 		tools = tools || len(message.Tools) > 0 || len(message.ParseToolCalls()) > 0 || message.Role == "tool"
 	}
@@ -618,15 +618,32 @@ func GatewayCapabilitiesMatch(request *dto.GeneralOpenAIRequest, caps capability
 	if request.ResponseFormat != nil && request.ResponseFormat.Type != "" && request.ResponseFormat.Type != "text" && !slices.Contains(caps.Features, capability.StructuredOutput) {
 		return false
 	}
+	for _, message := range request.Messages {
+		for _, part := range message.ParseContent() {
+			if len(part.CacheControl) > 0 && string(part.CacheControl) != "null" && !slices.Contains(caps.Features, capability.Caching) {
+				return false
+			}
+		}
+	}
 	if (request.PromptCacheKey != "" || len(request.PromptCacheOptions) > 0 || len(request.PromptCacheRetention) > 0) && !slices.Contains(caps.Features, capability.Caching) {
 		return false
 	}
-	if !slices.Contains(caps.InputModalities, capability.Text) || !slices.Contains(caps.OutputModalities, capability.Text) {
+	requiresText := request.RequiresTextInput || request.Prompt != nil || request.Input != nil
+	for _, message := range request.Messages {
+		if message.StringContent() != "" || message.GetReasoningContent() != "" || len(message.ParseToolCalls()) > 0 {
+			requiresText = true
+			break
+		}
+	}
+	if requiresText && !slices.Contains(caps.InputModalities, capability.Text) {
 		return false
 	}
 	var outputs []capability.Modality
 	if len(request.Modalities) > 0 && common.Unmarshal(request.Modalities, &outputs) != nil {
 		return false
+	}
+	if len(outputs) == 0 {
+		outputs = []capability.Modality{capability.Text}
 	}
 	for _, output := range outputs {
 		if !slices.Contains(caps.OutputModalities, output) {
@@ -636,6 +653,9 @@ func GatewayCapabilitiesMatch(request *dto.GeneralOpenAIRequest, caps capability
 	images := int64(0)
 	for _, file := range request.GetTokenCountMeta().Files {
 		modality := capability.PDF
+		if file.Source != nil && request.NativeTextReferences[file.Source.GetRawData()] {
+			modality = capability.Text
+		}
 		switch file.FileType {
 		case types.FileTypeImage:
 			modality = capability.Image

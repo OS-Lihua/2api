@@ -15,26 +15,30 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/samber/lo"
+	"github.com/tidwall/gjson"
 
 	"github.com/gin-gonic/gin"
 )
 
 func convertCozeChatRequest(c *gin.Context, request dto.GeneralOpenAIRequest) *CozeChatRequest {
 	var messages []CozeEnterMessage
-	// 将 request的messages的role为user的content转换为CozeMessage
 	for _, message := range request.Messages {
-		if message.Role == "user" {
+		if message.Role == "user" || message.Role == "assistant" {
+			messageType := "question"
+			if message.Role == "assistant" {
+				messageType = "answer"
+			}
 			messages = append(messages, CozeEnterMessage{
-				Role:    "user",
-				Content: message.Content,
-				// TODO: support more content type
+				Role:        message.Role,
+				Type:        messageType,
+				Content:     message.StringContent(),
 				ContentType: "text",
 			})
 		}
 	}
 	user := request.User
 	if len(user) == 0 {
-		user = json.RawMessage(helper.GetResponseID(c))
+		user, _ = common.Marshal(helper.GetResponseID(c))
 	}
 	cozeRequest := &CozeChatRequest{
 		BotId:              c.GetString("bot_id"),
@@ -52,18 +56,35 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 	usage.CompletionTokens = c.GetInt("coze_output_count")
 	usage.TotalTokens = c.GetInt("coze_token_count")
 	if info.ResponseFacts != nil {
-		var prompt, completion bool
 		if result, ok := resp.Body.(*cozeResultBody); ok {
-			prompt, completion = relaycommon.NativeUsagePresence(result.completionBody, "data.usage.input_count", "data.usage.output_count", "data.usage.token_count")
+			info.ResponseFacts.RecordUsage(&usage, &result.usage, result.usageFacts.PromptTokensReported, result.usageFacts.CompletionTokensReported)
+		} else {
+			info.ResponseFacts.RecordUsage(&usage, &usage, false, false)
 		}
-		info.ResponseFacts.RecordUsage(&usage, &usage, prompt, completion)
+		if result, ok := resp.Body.(*cozeResultBody); ok && result.failure != nil {
+			return &usage, result.failure
+		}
 		if resp.StatusCode != http.StatusOK {
 			return &usage, types.NewErrorWithStatusCode(errors.New("Coze request failed"), types.ErrorCodeBadResponse, resp.StatusCode)
 		}
 	}
 	responseBody, err := io.ReadAll(resp.Body)
+	if info.ResponseFacts != nil {
+		var source dto.OpenAITextResponse
+		for _, item := range gjson.GetBytes(responseBody, "data").Array() {
+			if item.Get("type").String() != "answer" {
+				continue
+			}
+			var text string
+			if common.UnmarshalJsonStr(item.Get("content").Raw, &text) != nil {
+				continue
+			}
+			source.Choices = []dto.OpenAITextResponseChoice{{Message: dto.Message{Role: "assistant", Content: text}}}
+		}
+		info.ResponseFacts.RecordChatSource(&source, info.TokenizerModelName())
+	}
 	if err != nil {
-		return &usage, types.NewError(err, types.ErrorCodeBadResponseBody)
+		return &usage, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
 	}
 	var response dto.OpenAITextResponse
 	var cozeResponse CozeChatDetailResponse
@@ -116,6 +137,10 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
 	scanner := helper.NewStreamScanner(resp.Body)
+	managed := info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil
+	if managed {
+		scanner = helper.NewSSEEventScanner(resp.Body, info.ResponseFacts)
+	}
 	helper.SetEventStreamHeaders(c)
 	if info.StreamStatus == nil {
 		info.StreamStatus = relaycommon.NewStreamStatus()
@@ -126,7 +151,46 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 	defer helper.EstimateMissingChatUsage(c, info, usage)
 	id := helper.GetResponseID(c)
 	var responseText, currentEvent, currentData string
+	type sourceMessage struct{ content, reasoning string }
+	sourceMessages := map[string]sourceMessage{}
+	observeCompletedSource := func(data []byte) {
+		root := gjson.ParseBytes(data)
+		id := relaycommon.SourceText(root.Get("id"))
+		previous := sourceMessages[id]
+		content, reasoning := relaycommon.SourceText(root.Get("content")), relaycommon.SourceText(root.Get("reasoning_content"))
+		var suffix strings.Builder
+		if strings.HasPrefix(content, previous.content) {
+			suffix.WriteString(content[len(previous.content):])
+			previous.content = content
+		}
+		if strings.HasPrefix(reasoning, previous.reasoning) {
+			suffix.WriteString(reasoning[len(previous.reasoning):])
+			previous.reasoning = reasoning
+		}
+		sourceMessages[id] = previous
+		helper.RecordNativeStreamSource(c, info, &dto.OpenAITextResponse{Choices: []dto.OpenAITextResponseChoice{{Message: dto.Message{Role: "assistant", Content: suffix.String()}}}})
+	}
 	for scanner.Scan() {
+		if managed {
+			event := helper.ParseSSEEvent(scanner.Text())
+			if event.Event == "conversation.message.delta" {
+				root := gjson.Parse(event.Data)
+				id := relaycommon.SourceText(root.Get("id"))
+				message := sourceMessages[id]
+				message.content += relaycommon.SourceText(root.Get("content"))
+				message.reasoning += relaycommon.SourceText(root.Get("reasoning_content"))
+				sourceMessages[id] = message
+			}
+			if event.Event == "conversation.message.completed" {
+				observeCompletedSource([]byte(event.Data))
+			}
+			if event.Event != "" && event.HasData {
+				if err := handleCozeEvent(c, event.Event, event.Data, &responseText, usage, id, info); err != nil {
+					return usage, types.NewError(err, types.ErrorCodeBadResponse)
+				}
+			}
+			continue
+		}
 		line := scanner.Text()
 		if line == "" {
 			if currentEvent != "" && currentData != "" {
@@ -143,7 +207,20 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 			currentData = strings.TrimSpace(data)
 		}
 	}
-	if currentEvent != "" && currentData != "" {
+	if managed && len(info.ResponseFacts.UnterminatedStreamData) > 0 {
+		partial := info.ResponseFacts.UnterminatedStreamData
+		_ = recordCozeStreamUsage(info, usage, string(partial))
+		event := info.ResponseFacts.UnterminatedStreamEvent
+		if event == "conversation.message.delta" {
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(partial, "", "content", "reasoning_content"))
+		}
+		if event == "conversation.message.completed" {
+			observeCompletedSource(partial)
+		}
+		info.ResponseFacts.UnterminatedStreamData = nil
+		info.ResponseFacts.UnterminatedStreamEvent = ""
+	}
+	if !managed && currentEvent != "" && currentData != "" {
 		if err := handleCozeEvent(c, currentEvent, currentData, &responseText, usage, id, info); err != nil {
 			return usage, types.NewError(err, types.ErrorCodeBadResponse)
 		}
@@ -159,19 +236,30 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 	return usage, nil
 }
 
+func recordCozeStreamUsage(info *relaycommon.RelayInfo, usage *dto.Usage, data string) error {
+	if info.ResponseFacts != nil {
+		info.ResponseFacts.RecordNativeUsage(usage, []byte(data), "usage.input_count", "usage.output_count")
+		data = string(relaycommon.SanitizeNativeUsage([]byte(data), "usage"))
+	}
+	var chatData CozeChatResponseData
+	if err := common.UnmarshalJsonStr(data, &chatData); err != nil {
+		return err
+	}
+	reported := dto.Usage{PromptTokens: chatData.Usage.InputCount, CompletionTokens: chatData.Usage.OutputCount, TotalTokens: chatData.Usage.TokenCount}
+	if info.ResponseFacts != nil {
+		prompt, completion := relaycommon.NativeUsagePresence([]byte(data), "usage.input_count", "usage.output_count", "usage.token_count")
+		info.ResponseFacts.RecordUsage(usage, &reported, prompt, completion)
+	} else {
+		*usage = reported
+	}
+	return nil
+}
+
 func handleCozeEvent(c *gin.Context, event string, data string, responseText *string, usage *dto.Usage, id string, info *relaycommon.RelayInfo) error {
 	switch event {
 	case "conversation.chat.completed", "conversation.chat.failed", "conversation.chat.canceled", "error":
-		var chatData CozeChatResponseData
-		if err := common.UnmarshalJsonStr(data, &chatData); err != nil {
+		if err := recordCozeStreamUsage(info, usage, data); err != nil {
 			return err
-		}
-		reported := dto.Usage{PromptTokens: chatData.Usage.InputCount, CompletionTokens: chatData.Usage.OutputCount, TotalTokens: chatData.Usage.TokenCount}
-		if info.ResponseFacts != nil {
-			prompt, completion := relaycommon.NativeUsagePresence([]byte(data), "usage.input_count", "usage.output_count", "usage.token_count")
-			info.ResponseFacts.RecordUsage(usage, &reported, prompt, completion)
-		} else {
-			*usage = reported
 		}
 		if event != "conversation.chat.completed" {
 			return fmt.Errorf("Coze stream failed")
@@ -185,10 +273,12 @@ func handleCozeEvent(c *gin.Context, event string, data string, responseText *st
 	case "conversation.message.delta":
 		var messageData CozeChatV3MessageDetail
 		if err := common.UnmarshalJsonStr(data, &messageData); err != nil {
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource([]byte(data), "", "content", "reasoning_content"))
 			return err
 		}
 		var content string
 		if err := common.Unmarshal(messageData.Content, &content); err != nil {
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource([]byte(data), "", "content", "reasoning_content"))
 			return err
 		}
 		*responseText += content
@@ -228,6 +318,9 @@ func checkIfChatComplete(a *Protocol, c *gin.Context, info *relaycommon.RelayInf
 	// 解析 resp 到 CozeChatResponse
 	var cozeResponse CozeChatResponse
 	responseBody, err := io.ReadAll(resp.Body)
+	if info.ResponseFacts != nil {
+		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "data.usage")
+	}
 	if err != nil {
 		return fmt.Errorf("read response body failed: %w", err), false
 	}

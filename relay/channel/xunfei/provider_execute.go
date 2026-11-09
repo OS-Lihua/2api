@@ -97,12 +97,26 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 				writer.CloseWithError(fmt.Errorf("Xunfei WebSocket response ended before completion"))
 				return
 			}
-			var envelope XunfeiChatResponse
-			if err := common.Unmarshal(message, &envelope); err != nil {
+			var valid common.RawMessage
+			if err := common.Unmarshal(message, &valid); err != nil {
 				writer.CloseWithError(fmt.Errorf("invalid Xunfei response"))
 				return
 			}
 			if _, err := writer.Write(append(message, '\n')); err != nil {
+				return
+			}
+			var envelope struct {
+				Header struct {
+					Code int `json:"code"`
+				} `json:"header"`
+				Payload struct {
+					Choices struct {
+						Status int `json:"status"`
+					} `json:"choices"`
+				} `json:"payload"`
+			}
+			if err := common.Unmarshal(message, &envelope); err != nil {
+				writer.CloseWithError(fmt.Errorf("invalid Xunfei response"))
 				return
 			}
 			if envelope.Header.Code != 0 || envelope.Payload.Choices.Status == 2 {

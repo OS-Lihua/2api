@@ -29,6 +29,9 @@ func OpenAIChatRequestToGeminiGenerateContent(c context.Context, textRequest dto
 	if textRequest.TopP != nil {
 		geminiRequest.GenerationConfig.TopP = kitutil.GetPointer(*textRequest.TopP)
 	}
+	if textRequest.N != nil {
+		geminiRequest.GenerationConfig.CandidateCount = kitutil.GetPointer(*textRequest.N)
+	}
 	if textRequest.MaxCompletionTokens != nil {
 		geminiRequest.GenerationConfig.MaxOutputTokens = kitutil.GetPointer(*textRequest.MaxCompletionTokens)
 	} else if textRequest.MaxTokens != nil {
@@ -249,7 +252,7 @@ func OpenAIChatRequestToGeminiGenerateContent(c context.Context, textRequest dto
 			for _, call := range message.ParseToolCalls() {
 				args := map[string]any{}
 				if call.Function.Arguments != "" {
-					if kitutil.Unmarshal([]byte(call.Function.Arguments), &args) != nil {
+					if kitutil.UnmarshalUseNumber([]byte(call.Function.Arguments), &args) != nil {
 						return nil, fmt.Errorf("invalid arguments for function %s, args: %s", call.Function.Name, call.Function.Arguments)
 					}
 				}

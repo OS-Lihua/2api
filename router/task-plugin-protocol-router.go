@@ -28,15 +28,15 @@ func taskPluginProtocolHandlers(protocol, operation string) ([]gin.HandlerFunc, 
 	switch protocol + "." + operation {
 	case "openai_responses.create":
 		return []gin.HandlerFunc{
-			middleware.RouteTag("relay"), middleware.SystemPerformanceCheck(), middleware.ResolveTaskOffering(), middleware.TokenAuth(),
-			middleware.ModelRequestRateLimit(), middleware.RouteTaskPluginEndpoint(), middleware.PrepareTaskPluginEndpoint(), controller.TaskGateway, middleware.Distribute(),
+			middleware.RouteTag("relay"), middleware.SystemPerformanceCheck(), middleware.GatewayTokenAuth(), middleware.ResolveTextOffering(), controller.AuthorizeTaskGateway,
+			middleware.ModelRequestRateLimit(), middleware.RouteTaskPluginEndpoint(), middleware.PrepareTaskPluginEndpoint(), controller.TaskGateway, controller.TextGateway, middleware.Distribute(),
 			func(c *gin.Context) {
 				controller.RelayTaskPluginEndpoint(c, func(c *gin.Context) { controller.Relay(c, types.RelayFormatOpenAIResponses) })
 			},
 		}, nil
 	case "openai_image.generate", "openai_image.edit":
 		return []gin.HandlerFunc{
-			middleware.RouteTag("relay"), middleware.SystemPerformanceCheck(), middleware.ResolveTaskOffering(), middleware.TokenAuth(),
+			middleware.RouteTag("relay"), middleware.SystemPerformanceCheck(), middleware.TaskOriginAuth(), middleware.ResolveTaskOffering(), controller.AuthorizeTaskGateway, middleware.LegacyTaskSubmissionAuth(),
 			middleware.ModelRequestRateLimit(), middleware.RouteTaskPluginEndpoint(), middleware.PrepareTaskPluginEndpoint(), controller.TaskGateway, middleware.Distribute(),
 			func(c *gin.Context) {
 				controller.RelayTaskPluginEndpoint(c, func(c *gin.Context) { controller.Relay(c, types.RelayFormatOpenAIImage) })
@@ -44,7 +44,7 @@ func taskPluginProtocolHandlers(protocol, operation string) ([]gin.HandlerFunc, 
 		}, nil
 	case "openai_video.create":
 		return []gin.HandlerFunc{
-			middleware.RouteTag("relay"), middleware.ResolveTaskOffering(), middleware.TokenAuth(), middleware.SystemPerformanceCheck(),
+			middleware.RouteTag("relay"), middleware.TaskOriginAuth(), middleware.ResolveTaskOffering(), controller.AuthorizeTaskGateway, middleware.LegacyTaskSubmissionAuth(), middleware.SystemPerformanceCheck(),
 			middleware.RouteTaskPluginEndpoint(), middleware.TaskPluginEndpointOnly(middleware.ModelRequestRateLimit()), middleware.PrepareTaskPluginEndpoint(), controller.TaskGateway, middleware.Distribute(),
 			func(c *gin.Context) { controller.RelayTaskPluginEndpoint(c, controller.RelayTask) },
 		}, nil

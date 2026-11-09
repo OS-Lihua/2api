@@ -104,6 +104,20 @@ func ResponsesResponseToChatCompletionsResponse(resp *dto.OpenAIResponsesRespons
 		Role:    "assistant",
 		Content: text,
 	}
+	var refusal strings.Builder
+	for _, output := range resp.Output {
+		if output.Type != responsesOutputTypeMessage || output.Role != "" && output.Role != "assistant" {
+			continue
+		}
+		for _, content := range output.Content {
+			if content.Type == "refusal" && content.Refusal != nil {
+				refusal.WriteString(*content.Refusal)
+			}
+		}
+	}
+	if refusal.Len() > 0 {
+		msg.Refusal = kitutil.GetPointer(refusal.String())
+	}
 	if annotations, err := responsesAnnotationsToChat(resp); err != nil {
 		return nil, nil, err
 	} else if len(annotations) > 0 {
@@ -220,7 +234,9 @@ func usageFromResponsesUsage(src *dto.Usage, createBillingSnapshot bool) *dto.Us
 	if src.InputTokensDetails != nil {
 		usage.PromptTokensDetails = src.InputTokensDetails.Clone()
 	}
-	if src.CompletionTokenDetails.ReasoningTokens != 0 ||
+	if src.OutputTokensDetails != nil {
+		usage.CompletionTokenDetails = *src.OutputTokensDetails
+	} else if src.CompletionTokenDetails.ReasoningTokens != 0 ||
 		src.CompletionTokenDetails.TextTokens != 0 ||
 		src.CompletionTokenDetails.AudioTokens != 0 ||
 		src.CompletionTokenDetails.ImageTokens != 0 {

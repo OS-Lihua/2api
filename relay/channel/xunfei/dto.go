@@ -1,6 +1,33 @@
 package xunfei
 
-import "github.com/QuantumNous/new-api/relaykit/dto"
+import (
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/tidwall/sjson"
+)
+
+func (*XunfeiChatRequest) SetChatOutputLimit(body []byte, limit uint) ([]byte, error) {
+	return sjson.SetBytes(body, "parameter.chat.max_tokens", limit)
+}
+
+func (*XunfeiChatRequest) ChatRequestCapabilities() channel.NativeChatCapabilities {
+	return channel.NativeChatCapabilities{Parameters: []string{"max_tokens", "max_completion_tokens", "temperature", "top_k"}, ContentTypes: []string{dto.ContentTypeText}}
+}
+
+func (*XunfeiChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error) {
+	var wire XunfeiChatRequest
+	if err := common.Unmarshal(body, &wire); err != nil {
+		return nil, err
+	}
+	public.Temperature, public.TopK = wire.Parameter.Chat.Temperature, wire.Parameter.Chat.TopK
+	public.MaxTokens, public.MaxCompletionTokens = nil, wire.Parameter.Chat.MaxTokens
+	public.Messages = nil
+	for _, message := range wire.Payload.Message.Text {
+		public.Messages = append(public.Messages, dto.Message{Role: message.Role, Content: message.Content})
+	}
+	return &public, nil
+}
 
 type XunfeiMessage struct {
 	Role    string `json:"role"`
@@ -15,8 +42,8 @@ type XunfeiChatRequest struct {
 		Chat struct {
 			Domain      string   `json:"domain,omitempty"`
 			Temperature *float64 `json:"temperature,omitempty"`
-			TopK        int      `json:"top_k,omitempty"`
-			MaxTokens   uint     `json:"max_tokens,omitempty"`
+			TopK        *int     `json:"top_k,omitempty"`
+			MaxTokens   *uint    `json:"max_tokens,omitempty"`
 			Auditing    bool     `json:"auditing,omitempty"`
 		} `json:"chat"`
 	} `json:"parameter"`

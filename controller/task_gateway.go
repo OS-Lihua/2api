@@ -6,7 +6,6 @@ import (
 	"io"
 	"maps"
 	"net/http"
-	"slices"
 	"strings"
 	"time"
 
@@ -24,6 +23,38 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
+
+// AuthorizeTaskGateway checks resolved identities before plugin decoding.
+func AuthorizeTaskGateway(c *gin.Context) {
+	if taskErr := taskGatewayAccessError(c); taskErr != nil {
+		c.Abort()
+		if kind, _ := middleware.TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path); kind != "" {
+			gatewayError(c, taskErr.StatusCode, taskErr.Code, taskErr.Message)
+			return
+		}
+		respondTaskSubmissionError(c, taskErr)
+		return
+	}
+	c.Next()
+}
+
+func taskGatewayAccessError(c *gin.Context) *dto.TaskError {
+	if !middleware.TextOfferingMissing(c) {
+		offering := middleware.TextOffering(c)
+		if offering == nil {
+			return nil
+		}
+		allowed, err := service.GatewayOfferingAllowed(c, offering)
+		if err != nil {
+			return &dto.TaskError{StatusCode: http.StatusServiceUnavailable, Code: "authorization_unavailable", Message: http.StatusText(http.StatusServiceUnavailable), LocalError: true}
+		}
+		if allowed {
+			return nil
+		}
+	}
+	service.RecordGatewayModelAccessDenied(c)
+	return &dto.TaskError{StatusCode: http.StatusNotFound, Code: "model_not_found", Message: "Model not found", LocalError: true}
+}
 
 // TaskGateway submits a resolved ModelOffering through the shared attempt and
 // money lifecycle. Accepted tasks retain the selected Channel for all polling.
@@ -58,8 +89,8 @@ func presentGatewayTaskSubmission(c *gin.Context) {
 func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) {
 	offering := middleware.TextOffering(c)
 	group := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
-	if !offering.Enabled || offering.Visibility == "groups" && !slices.Contains(offering.Groups, group) {
-		return nil, &dto.TaskError{StatusCode: 404, Code: "model_not_found", Message: "Model not found", LocalError: true}
+	if taskErr := taskGatewayAccessError(c); taskErr != nil {
+		return nil, taskErr
 	}
 	pinValue, _ := c.Get(jsplugin.ContextKeyPinnedPlugin)
 	pin, ok := pinValue.(jsplugin.PinnedPlugin)
@@ -96,13 +127,6 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 		requestID = common.NewRequestId()
 	}
 	requested := c.GetString("resolved_task_model")
-	if c.GetBool("token_model_limit_enabled") {
-		limits, _ := c.Get("token_model_limit")
-		allowed, _ := limits.(map[string]bool)
-		if !allowed[requested] && !allowed[offering.Name] {
-			return nil, &dto.TaskError{StatusCode: http.StatusNotFound, Code: "model_not_found", Message: "Model not found", LocalError: true}
-		}
-	}
 	var record *model.GatewayRequest
 	var saleSource money.Amount
 	var accepted *model.Task
