@@ -1063,6 +1063,29 @@ func convertOAIChatStreamResponseToClaudeMessages(_ context.Context, info convme
 	if err != nil {
 		return nil, nil, err
 	}
+	var original *dto.ChatCompletionsStreamResponse
+	switch value := response.(type) {
+	case *dto.ChatCompletionsStreamResponse:
+		original = value
+	case dto.ChatCompletionsStreamResponse:
+		original = &value
+	}
+	if info == nil {
+		info = &convmeta.Values{}
+	}
+	state := info.EnsureClaudeConvertInfo()
+	for i := range chatResponse.Choices {
+		if len(original.Choices[i].Delta.FunctionCall) == 0 || len(original.Choices[i].Delta.ToolCalls) > 0 || len(chatResponse.Choices[i].Delta.ToolCalls) == 0 {
+			continue
+		}
+		tool := &chatResponse.Choices[i].Delta.ToolCalls[0]
+		if previous := state.ToolCallByIndex[0]; state.LastMessagesType == convmeta.LastMessageTypeTools && previous != nil {
+			tool.ID = previous.ID
+		}
+		if tool.ID == "" {
+			tool.ID = fmt.Sprintf("toolu_%s", kitutil.GetUUID())
+		}
+	}
 	return StreamResponseOpenAI2Claude(chatResponse, info), canonicalUsageFromResponse(chatResponse), nil
 }
 

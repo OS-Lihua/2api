@@ -412,7 +412,8 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 		}
 	}
 	terminal := gatewayTerminalSnapshot(body, info.RelayFormat)
-	hold := (terminal || output.sourceTerminal) && !output.terminalReady && !info.PerformanceBusinessRejection
+	finalUsage := info.RelayFormat == types.RelayFormatOpenAI && len(output.pendingTerminal) > 0 && len(gjson.GetBytes(body, "choices").Array()) == 0 && gjson.GetBytes(body, "usage").IsObject()
+	hold := (terminal || output.sourceTerminal || finalUsage) && !output.terminalReady && !info.PerformanceBusinessRejection
 	if hold && (info.RelayFormat == types.RelayFormatOpenAI || info.RelayFormat == types.RelayFormatGemini) {
 		path, finish := "choices", "finish_reason"
 		if info.RelayFormat == types.RelayFormatGemini {
