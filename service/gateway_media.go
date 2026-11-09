@@ -1,18 +1,121 @@
 package service
 
 import (
+	"bytes"
+	"encoding/base64"
+	"errors"
+	"math"
+	"net/http"
 	"slices"
 	"strings"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/capability"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	constant2 "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
 )
+
+// CountGatewayMediaInput includes reference audio and its transcript in the
+// original or effective speech input before the funding plan is frozen.
+func CountGatewayMediaInput(c *gin.Context, request dto.Request, info *relaycommon.RelayInfo) (int, error) {
+	meta := request.GetTokenCountMeta()
+	referenceTokens := 0
+	if audio, ok := request.(*dto.AudioRequest); ok && info.ResponseFacts != nil && info.RelayMode == constant2.RelayModeAudioSpeech {
+		facts := info.ResponseFacts
+		facts.AudioInputSeconds = nil
+		facts.AudioInputTokensEstimated = 0
+		if audio.Instructions != "" {
+			meta.CombineText += "\n" + audio.Instructions
+		}
+		if len(audio.RefText) > 0 && string(audio.RefText) != "null" {
+			var text string
+			if common.Unmarshal(audio.RefText, &text) != nil {
+				return 0, errors.New("invalid speech reference transcript")
+			}
+			meta.CombineText += "\n" + text
+		}
+		if len(audio.RefAudio) > 0 && string(audio.RefAudio) != "null" {
+			var references []string
+			var single string
+			if common.Unmarshal(audio.RefAudio, &single) == nil {
+				references = []string{single}
+			} else if common.Unmarshal(audio.RefAudio, &references) != nil {
+				return 0, errors.New("invalid speech reference audio")
+			}
+			if len(references) == 0 {
+				return 0, errors.New("invalid speech reference audio")
+			}
+			seconds := decimal.Zero
+			for _, reference := range references {
+				mediaType := ""
+				if strings.HasPrefix(reference, "data:") {
+					header, _, ok := strings.Cut(reference, ",")
+					if !ok || !strings.HasPrefix(header, "data:audio/") || !strings.HasSuffix(header, ";base64") {
+						return 0, errors.New("invalid speech reference audio")
+					}
+					mediaType = strings.TrimSuffix(strings.TrimPrefix(header, "data:"), ";base64")
+				} else if strings.Contains(reference, ",") {
+					return 0, errors.New("speech reference audio must be measurable inline data")
+				}
+				encoded, err := DecodeBase64AudioData(reference)
+				if err != nil {
+					return 0, errors.New("speech reference audio must be measurable inline data")
+				}
+				data, err := base64.StdEncoding.DecodeString(encoded)
+				if err != nil || len(data) == 0 || constant.MaxFileDownloadMB > 0 && len(data) > constant.MaxFileDownloadMB*1024*1024 {
+					return 0, errors.New("invalid speech reference audio")
+				}
+				if detected := http.DetectContentType(data); detected != "application/octet-stream" {
+					mediaType = detected
+				}
+				_, format, _ := strings.Cut(mediaType, "/")
+				format = strings.TrimPrefix(format, "x-")
+				switch format {
+				case "wave", "vnd.wave":
+					format = "wav"
+				case "mpeg":
+					format = "mp3"
+				case "mp4":
+					format = "m4a"
+				}
+				duration, err := common.GetAudioDuration(c.Request.Context(), bytes.NewReader(data), "."+format)
+				if err != nil || math.IsNaN(duration) || math.IsInf(duration, 0) || duration <= 0 || duration > relaycommon.MaxTaskDurationSeconds {
+					return 0, errors.New("speech reference duration exceeds the request limit")
+				}
+				seconds = seconds.Add(decimal.NewFromFloat(duration))
+				if seconds.GreaterThan(decimal.NewFromInt(relaycommon.MaxTaskDurationSeconds)) {
+					return 0, errors.New("speech reference duration exceeds the request limit")
+				}
+				tokens, clamp := common.AudioDurationTokens(duration)
+				if clamp != nil {
+					return 0, clamp
+				}
+				referenceTokens, clamp = common.QuotaFromFloatChecked(float64(referenceTokens) + float64(tokens))
+				if clamp != nil {
+					return 0, clamp
+				}
+			}
+			value := seconds.String()
+			facts.AudioInputSeconds = &value
+			facts.AudioInputTokensEstimated = referenceTokens
+		}
+	}
+	input, err := CountRequestToken(c, meta, info)
+	if err != nil {
+		return 0, err
+	}
+	input, clamp := common.QuotaFromFloatChecked(float64(input) + float64(referenceTokens))
+	if clamp != nil {
+		return 0, clamp
+	}
+	return input, nil
+}
 
 // GatewayMediaCapabilitiesMatch is applied to both original and effective DTOs.
 // Uploaded audio duration is measured before reservation; no request duration or
@@ -59,6 +162,9 @@ func GatewayMediaCapabilitiesMatch(c *gin.Context, kind protocol.Type, request d
 		}
 	case protocol.OpenAIAudioSpeech:
 		if caps.Limits.MaxDurationSeconds != nil {
+			return false
+		}
+		if audio, ok := request.(*dto.AudioRequest); ok && len(audio.RefAudio) > 0 && string(audio.RefAudio) != "null" && !slices.Contains(caps.InputModalities, capability.Audio) {
 			return false
 		}
 		output = capability.Audio

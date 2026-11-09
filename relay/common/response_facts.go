@@ -51,6 +51,7 @@ type ResponseFacts struct {
 	AudioInputDurationReported bool
 	AudioInputDurationInvalid  bool
 	AudioOutputTokensReported  bool
+	AudioInputTokensEstimated  int
 	AudioInputTokensReported   bool
 	TextInputTokensReported    bool
 	ImageInputTokensReported   bool

@@ -93,15 +93,15 @@ func prepareGatewayMediaRoute(c *gin.Context, selection *service.GatewaySelectio
 	if helper.ValidateGatewayMediaMultipliers(parsed.Input.Body, selection.Capabilities.Limits) != nil {
 		return nil, service.ErrGatewayCapability
 	}
+	originalInput, err := service.CountGatewayMediaInput(candidate, parsed.Request, info)
+	if err != nil || !service.GatewayMediaCapabilitiesMatch(candidate, parsed.Protocol, parsed.Request, selection.Capabilities, originalInput, info.ResponseFacts) {
+		return nil, service.ErrGatewayCapability
+	}
 	prepared, err := adaptor.PrepareMediaWire(candidate, info, parsed)
 	if err != nil {
 		return nil, service.ErrGatewayCapability
 	}
-	meta := prepared.Request.GetTokenCountMeta()
-	if audio, ok := prepared.Request.(*dto.AudioRequest); ok && audio.Instructions != "" {
-		meta.CombineText += "\n" + audio.Instructions
-	}
-	input, err := service.CountRequestToken(candidate, meta, info)
+	input, err := service.CountGatewayMediaInput(candidate, prepared.Request, info)
 	if err != nil || !service.GatewayMediaCapabilitiesMatch(candidate, parsed.Protocol, prepared.Request, selection.Capabilities, input, info.ResponseFacts) {
 		return nil, service.ErrGatewayCapability
 	}
@@ -149,6 +149,7 @@ func prepareGatewayMediaRoute(c *gin.Context, selection *service.GatewaySelectio
 	mean *= int64(count)
 	usage := &dto.Usage{PromptTokens: input, CompletionTokens: int(mean), TotalTokens: input + int(mean)}
 	if parsed.Protocol == protocol.OpenAIAudioSpeech {
+		usage.PromptTokensDetails.AudioTokens = info.ResponseFacts.AudioInputTokensEstimated
 		usage.CompletionTokenDetails.AudioTokens = int(mean)
 	}
 	if parsed.Protocol == protocol.OpenAIAudioTranscription {

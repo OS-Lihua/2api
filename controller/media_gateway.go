@@ -439,6 +439,9 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 			usage.PromptTokensDetails.AudioTokens = inputTokens
 		}
 	}
+	if !facts.PromptTokensReported && !facts.AudioInputTokensReported && facts.AudioInputTokensEstimated > 0 {
+		usage.PromptTokensDetails.AudioTokens = facts.AudioInputTokensEstimated
+	}
 	if !facts.CompletionTokensReported && facts.GeneratedText != "" {
 		usage.CompletionTokens = tokenkit.Count(info.TokenizerModel, facts.GeneratedText)
 	}
