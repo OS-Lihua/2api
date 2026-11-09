@@ -5,6 +5,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -49,9 +50,8 @@ func (a *gatewayUsageAccumulator) Observe(body []byte) (*dto.Usage, error) {
 	}
 	incoming := map[string]any{}
 	if raw.Exists() && raw.Type != gjson.Null {
-		known, valid := gatewayUsageValue(body, raw, 0)
-		object, ok := known.(map[string]any)
-		if valid && ok {
+		object := relaycommon.SourceUsageObject(body, raw)
+		if object != nil {
 			incoming = object
 		} else if !cacheReported {
 			return nil, nil
@@ -151,44 +151,6 @@ func (a *gatewayUsageAccumulator) Observe(body []byte) (*dto.Usage, error) {
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	return usage, nil
-}
-
-// gatewayUsageValue recovers complete fields without accepting a truncated scalar.
-func gatewayUsageValue(body []byte, value gjson.Result, depth int) (any, bool) {
-	if value.Type == gjson.Number {
-		end := value.Index + len(value.Raw)
-		if end >= len(body) || !strings.ContainsRune(" \t\r\n,}]", rune(body[end])) {
-			return nil, false
-		}
-	}
-	var decoded any
-	if common.UnmarshalUseNumber([]byte(value.Raw), &decoded) == nil {
-		return decoded, true
-	}
-	if depth >= 128 {
-		return nil, false
-	}
-	if value.IsObject() {
-		fields := map[string]any{}
-		value.ForEach(func(key, child gjson.Result) bool {
-			if known, ok := gatewayUsageValue(body, child, depth+1); ok {
-				fields[key.Str] = known
-			}
-			return true
-		})
-		return fields, len(fields) > 0
-	}
-	if value.IsArray() {
-		var fields []any
-		value.ForEach(func(_, child gjson.Result) bool {
-			if known, ok := gatewayUsageValue(body, child, depth+1); ok {
-				fields = append(fields, known)
-			}
-			return true
-		})
-		return fields, len(fields) > 0
-	}
-	return nil, false
 }
 
 func (a *gatewayUsageAccumulator) BaseCounters() (bool, bool) {

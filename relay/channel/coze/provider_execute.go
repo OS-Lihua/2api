@@ -67,6 +67,9 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 		return nil, err
 	}
 	response, err := client.Do(request)
+	if managed && response != nil {
+		response.Body = channel.BoundGatewayResponseBody(response.Body)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -116,6 +119,9 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 			return nil, err
 		}
 		response, err := client.Do(poll)
+		if managed && response != nil {
+			response.Body = channel.BoundGatewayResponseBody(response.Body)
+		}
 		if err != nil {
 			if managed {
 				return result.failedResponse(lastResponse, types.NewError(err, types.ErrorCodeDoRequestFailed)), nil
@@ -167,6 +173,9 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 				return nil, err
 			}
 			fetched, err := client.Do(request)
+			if managed && fetched != nil {
+				fetched.Body = channel.BoundGatewayResponseBody(fetched.Body)
+			}
 			if err != nil {
 				if managed {
 					return result.failedResponse(response, types.NewError(err, types.ErrorCodeDoRequestFailed)), nil

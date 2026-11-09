@@ -24,8 +24,6 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-const nativeResponseBufferLimit = 64 << 20
-
 // nativeResponseWriter captures the native parser's canonical Chat output.
 // Native completion is withheld until that parser has validated its source.
 // Only the public handler writes to the real client and marks delivery.
@@ -79,7 +77,7 @@ func (w *nativeResponseWriter) Write(body []byte) (int, error) {
 	if w.err != nil {
 		return 0, w.err
 	}
-	if len(body)+w.body.Len()+len(w.pending)+w.terminalBytes > nativeResponseBufferLimit {
+	if int64(len(body))+int64(w.body.Len())+int64(len(w.pending))+int64(w.terminalBytes) > channel.GatewayResponseSourceLimit() {
 		w.err = errors.New("native response exceeds capture limit")
 		return 0, w.err
 	}
@@ -208,6 +206,7 @@ func nativeReportedUsage(body []byte, facts *relaycommon.ResponseFacts) []byte {
 // module as ordinary protocols. Its private facts describe source observations,
 // while the public handler owns conversion, terminal validation and real writes.
 func (p *Handler) DoNativeResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, wire channel.ProtocolHandler) (any, *types.NewAPIError) {
+	resp.Body = channel.BoundGatewayResponseBody(resp.Body)
 	nativeContext, cancel := context.WithCancel(c.Request.Context())
 	defer cancel()
 	nativeInfo := *info

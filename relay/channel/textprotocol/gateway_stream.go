@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -370,7 +371,7 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 	terminal := gatewayTerminalSnapshot(body, info.RelayFormat)
 	if (terminal || output.sourceTerminal || len(output.pendingTerminal) > 0) && !output.terminalReady && !info.PerformanceBusinessRejection {
 		// Terminal snapshots can contain complete image or audio payloads.
-		if output.terminalBytes+len(body) > 64<<20 {
+		if int64(output.terminalBytes)+int64(len(body)) > channel.GatewayResponseSourceLimit() {
 			return "", helper.ErrGatewayStreamPreludeLimit
 		}
 		output.terminalBytes += len(body)

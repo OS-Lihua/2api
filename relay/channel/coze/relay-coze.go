@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -56,12 +57,12 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 	usage.CompletionTokens = c.GetInt("coze_output_count")
 	usage.TotalTokens = c.GetInt("coze_token_count")
 	if info.ResponseFacts != nil {
-		if result, ok := resp.Body.(*cozeResultBody); ok {
+		if result, ok := channel.GatewayResponseBodySource(resp.Body).(*cozeResultBody); ok {
 			info.ResponseFacts.RecordUsage(&usage, &result.usage, result.usageFacts.PromptTokensReported, result.usageFacts.CompletionTokensReported)
 		} else {
 			info.ResponseFacts.RecordUsage(&usage, &usage, false, false)
 		}
-		if result, ok := resp.Body.(*cozeResultBody); ok && result.failure != nil {
+		if result, ok := channel.GatewayResponseBodySource(resp.Body).(*cozeResultBody); ok && result.failure != nil {
 			return &usage, result.failure
 		}
 		if resp.StatusCode != http.StatusOK {
@@ -134,6 +135,18 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 	return &usage, nil
 }
 
+func cozeGeneratedMessage(root gjson.Result) bool {
+	if role := relaycommon.SourceText(root.Get("role")); role != "" && role != "assistant" {
+		return false
+	}
+	switch relaycommon.SourceText(root.Get("type")) {
+	case "", "answer", "function_call", "follow_up":
+		return true
+	default:
+		return false
+	}
+}
+
 func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
 	scanner := helper.NewStreamScanner(resp.Body)
@@ -155,6 +168,9 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 	sourceMessages := map[string]sourceMessage{}
 	observeCompletedSource := func(data []byte) {
 		root := gjson.ParseBytes(data)
+		if !cozeGeneratedMessage(root) {
+			return
+		}
 		id := relaycommon.SourceText(root.Get("id"))
 		previous := sourceMessages[id]
 		content, reasoning := relaycommon.SourceText(root.Get("content")), relaycommon.SourceText(root.Get("reasoning_content"))
@@ -175,6 +191,9 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 			event := helper.ParseSSEEvent(scanner.Text())
 			if event.Event == "conversation.message.delta" {
 				root := gjson.Parse(event.Data)
+				if !cozeGeneratedMessage(root) {
+					continue
+				}
 				id := relaycommon.SourceText(root.Get("id"))
 				message := sourceMessages[id]
 				message.content += relaycommon.SourceText(root.Get("content"))
@@ -211,7 +230,7 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 		partial := info.ResponseFacts.UnterminatedStreamData
 		_ = recordCozeStreamUsage(info, usage, string(partial))
 		event := info.ResponseFacts.UnterminatedStreamEvent
-		if event == "conversation.message.delta" {
+		if event == "conversation.message.delta" && cozeGeneratedMessage(gjson.ParseBytes(partial)) {
 			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(partial, "", "content", "reasoning_content"))
 		}
 		if event == "conversation.message.completed" {
