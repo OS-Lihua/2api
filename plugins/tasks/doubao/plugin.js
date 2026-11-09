@@ -1072,7 +1072,13 @@ export function buildContentRequest(ctx) {
 }
 
 export function extractUsageOnComplete(task, taskResult, body) {
-  if (imageTask(task)) return imageUsage(body || {}, imageProfile(task));
+  if (imageTask(task)) {
+    const facts = body ? imageUsage(body, imageProfile(task)) : {};
+    const submitted = task.submittedUsage || {};
+    if (facts.input_images === undefined && Number.isInteger(submitted.input_images) && submitted.input_images >= 0 && submitted.input_images <= MAX_REFERENCE_IMAGES)
+      facts.input_images = submitted.input_images;
+    return facts;
+  }
   if (!body || body.status !== "succeeded") return {};
   const facts = {};
   const usage = body.usage || {};

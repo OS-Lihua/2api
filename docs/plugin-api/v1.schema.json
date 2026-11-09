@@ -142,7 +142,8 @@
         "auth": true,
         "upstream": {"$ref": "#/$defs/upstreamContext"},
         "data": true,
-        "state": true
+        "state": true,
+        "submittedUsage": {"type": "object", "additionalProperties": {"type": ["number", "boolean", "string"]}, "description": "Frozen validated submission facts for money tasks, when available. Output budgets are not actual output quantities."}
       }
     },
     "batchQueryContext": {

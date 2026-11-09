@@ -991,6 +991,9 @@ func (a *TaskAdaptor) observeSubmitCompletion(c *gin.Context, info *relaycommon.
 			"upstreamModel": info.UpstreamModelName, "baseUrl": info.ChannelBaseUrl,
 			"data": taskData, "state": nil,
 		}
+		if info.SubmittedUsage != nil {
+			ctx["submittedUsage"] = maps.Clone(info.SubmittedUsage)
+		}
 		for _, name := range []string{"upstream", "apiKey", "authHeader", "auth"} {
 			if value, exists := local[name]; exists {
 				ctx[name] = value
@@ -1746,6 +1749,9 @@ func (a *TaskAdaptor) queryContextWithContext(requestCtx context.Context, task *
 		ctx["action"] = constant.NormalizeTaskAction(task.Action)
 		ctx["model"] = originModel
 		ctx["upstreamModel"] = upstreamModel
+		if task.PrivateData.Gateway != nil && task.PrivateData.Gateway.Facts != nil {
+			ctx["submittedUsage"] = maps.Clone(task.PrivateData.Gateway.Facts)
+		}
 		if len(task.Data) > 0 {
 			var data any
 			if err := common.Unmarshal(task.Data, &data); err != nil {

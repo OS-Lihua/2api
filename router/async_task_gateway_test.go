@@ -2748,21 +2748,25 @@ func TestAsyncTaskPhysicalDurationAndEffectiveImageModalities(t *testing.T) {
 	}
 }
 
-func newNativeImageTaskFixture(t *testing.T, upstream http.HandlerFunc) textGatewayFixture {
+func newNativeImageTaskFixture(t *testing.T, pluginKey string, upstream http.HandlerFunc) textGatewayFixture {
 	t.Helper()
 	fixture := newAsyncTaskFixture(t, upstream)
-	source, err := plugins.Source("alibaba")
+	modelName, quantity := "wan2.6-image", "image_count"
+	if pluginKey == "doubao" {
+		modelName, quantity = "doubao-seedream-5-0-lite-260128", "images_above_1_5k"
+	}
+	source, err := plugins.Source(pluginKey)
 	require.NoError(t, err)
 	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
-	_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "alibaba"})
+	_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: pluginKey})
 	require.NoError(t, err)
-	caps := capability.Set{Features: []capability.Feature{capability.Streaming}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text, capability.Image}}
-	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Updates(map[string]any{"model_name": "wan2.6-image", "capabilities": caps}).Error)
-	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:alibaba", "upstream_model_name": "wan2.6-image"}).Error)
+	caps := capability.Set{Features: []capability.Feature{capability.Streaming}, InputModalities: []capability.Modality{capability.Text, capability.Image}, OutputModalities: []capability.Modality{capability.Text, capability.Image}}
+	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Updates(map[string]any{"model_name": modelName, "capabilities": caps}).Error)
+	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:" + pluginKey, "upstream_model_name": modelName}).Error)
 	fixture.fake.Advance(time.Second)
 	for _, price := range []*model.PriceVersion{
-		{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("image", u("image_count") * 0.1)`, EffectiveAt: clock.Now().Unix()},
-		{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("image", u("image_count") * 0.05)`, EffectiveAt: clock.Now().Unix()},
+		{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: fmt.Sprintf(`tier("image", u(%q) * 0.1)`, quantity), EffectiveAt: clock.Now().Unix()},
+		{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: fmt.Sprintf(`tier("image", u(%q) * 0.05)`, quantity), EffectiveAt: clock.Now().Unix()},
 	} {
 		require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
 	}
@@ -2794,7 +2798,7 @@ func TestAsyncTaskNativeStreamSettlesObservedFacts(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var calls atomic.Int32
-			fixture := newNativeImageTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+			fixture := newNativeImageTaskFixture(t, "alibaba", func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
 				assert.Equal(t, "enable", r.Header.Get("X-DashScope-Sse"))
 				w.Header().Set("Content-Type", "text/event-stream")
@@ -2842,11 +2846,82 @@ func TestAsyncTaskNativeStreamSettlesObservedFacts(t *testing.T) {
 	}
 }
 
+func TestAsyncTaskDoubaoNativeStreamPreservesInputFacts(t *testing.T) {
+	for _, test := range []struct {
+		name                        string
+		reference, zeroInput, empty bool
+		sale, cost                  int64
+	}{
+		{"known zero input", false, false, false, 90000000, 50000000},
+		{"known reference input", true, false, false, 99000000, 55000000},
+		{"reported zero overrides reference count", true, true, false, 90000000, 50000000},
+		{"missing source stays unknown", false, false, true, 0, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newNativeImageTaskFixture(t, "doubao", func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "text/event-stream")
+				if test.empty {
+					return
+				}
+				usage := `{}`
+				if test.zeroInput {
+					usage = `{"input_images":0}`
+				}
+				_, _ = io.WriteString(w, "data: {\"type\":\"image_generation.partial_succeeded\",\"image_index\":0,\"url\":\"https://artifact.invalid/bird.png\",\"size\":\"2048x2048\"}\n\ndata: {\"type\":\"image_generation.completed\",\"usage\":"+usage+"}\n\ndata: [DONE]\n\n")
+			})
+			fixture.fake.Advance(time.Second)
+			for _, price := range []*model.PriceVersion{
+				{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("image", u("images_above_1_5k") * 0.1 + u("input_images") * 0.01)`, EffectiveAt: clock.Now().Unix()},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("image", u("images_above_1_5k") * 0.05 + u("input_images") * 0.005)`, EffectiveAt: clock.Now().Unix()},
+			} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			body := map[string]any{"model": "gateway-alias", "prompt": "A bird", "size": "2K", "stream": true, "sequential_image_generation": "auto", "sequential_image_generation_options": map[string]any{"max_images": 4}}
+			if test.reference {
+				body["image"] = []string{"https://artifact.invalid/reference.png"}
+			}
+			encoded, err := common.Marshal(body)
+			require.NoError(t, err)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/doubao/api/v3/images/generations", string(encoded))
+			status := http.StatusOK
+			if test.empty {
+				status = http.StatusBadGateway
+			}
+			require.Equal(t, status, response.Code, response.Body.String())
+			assert.EqualValues(t, 1, calls.Load())
+			for range 2 {
+				_, err = service.RecoverGatewayTasks(t.Context(), 100)
+				if test.empty {
+					require.ErrorIs(t, err, model.ErrGatewayEvaluationPending)
+				} else {
+					require.NoError(t, err)
+				}
+			}
+			requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.False(t, requests[0].SalePending)
+			assert.Equal(t, test.sale, requests[0].Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), requests[0].ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, test.cost, attempts[0].Cost.Nanos)
+			assert.Equal(t, test.empty, attempts[0].CostPending)
+			if test.empty {
+				assert.NotContains(t, attempts[0].Usage.TaskFacts, "images_above_1_5k")
+			}
+			assertTextGatewayLedger(t, requests[0], test.cost)
+		})
+	}
+}
+
 func TestAsyncTaskNativeStreamHonorsBudgetAndCallerCancellation(t *testing.T) {
 	for _, cause := range []string{"single second budget", "caller cancellation"} {
 		t.Run(cause, func(t *testing.T) {
 			entered, cancelled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
-			fixture := newNativeImageTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+			fixture := newNativeImageTaskFixture(t, "alibaba", func(w http.ResponseWriter, r *http.Request) {
 				_, err := io.Copy(io.Discard, r.Body)
 				if !assert.NoError(t, err) {
 					return

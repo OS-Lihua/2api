@@ -158,6 +158,7 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 		candidate := prepared[selected.ID]
 		maps.Copy(c.Keys, candidate.Context.Keys)
 		info, adaptor, facts, saleInput := candidate.Info, candidate.Adaptor, candidate.Facts, candidate.SaleInput
+		info.SubmittedUsage = maps.Clone(facts)
 		contactedProvider := false
 		defer func() {
 			ctx := context.WithoutCancel(parent.Context())
