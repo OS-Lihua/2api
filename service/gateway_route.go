@@ -453,16 +453,55 @@ func GatewayComparisonCost(ctx context.Context, source money.Value) (money.Value
 	return source.Convert(rate)
 }
 
-// LossFallbackAllowed rechecks the same tier's previously eligible peers when
-// procurement changes during Provider preparation. A profitable or cheaper
-// peer must be tried before accepting the selected Channel at a loss.
-func (selection *GatewaySelection) LossFallbackAllowed(ctx context.Context, cost money.Value, margin decimal.Decimal) (bool, error) {
+// LossFallbackAllowed rechecks the same tier's still-available peers when
+// procurement changes during Provider preparation. A used admission retains
+// its request and token charges when testing a replacement on the same Provider.
+func (selection *GatewaySelection) LossFallbackAllowed(ctx context.Context, cost money.Value, margin decimal.Decimal, used bool) (bool, error) {
 	if len(selection.profitPeers) == 0 {
 		return false, ErrGatewayUnavailable
 	}
+	ids, providerIDs := []int{}, []int{}
+	for _, peer := range selection.profitPeers {
+		if peer.Channel.ID != selection.Channel.ID {
+			ids = append(ids, peer.Channel.ID)
+			providerIDs = append(providerIDs, peer.Provider.Id)
+		}
+	}
+	if len(ids) == 0 {
+		return true, nil
+	}
+	db := model.DB.WithContext(ctx)
+	var channels []model.Channel
+	if err := db.Where("id IN ?", ids).Preload("Model").Find(&channels).Error; err != nil {
+		return false, err
+	}
+	var providers []model.Provider
+	if err := db.Where("id IN ?", providerIDs).Find(&providers).Error; err != nil {
+		return false, err
+	}
+	currentChannels := make(map[int]model.Channel, len(channels))
+	for _, channel := range channels {
+		currentChannels[channel.ID] = channel
+	}
+	currentProviders := make(map[int]*model.Provider, len(providers))
+	for i := range providers {
+		currentProviders[providers[i].Id] = &providers[i]
+	}
 	at := clock.Now()
+	eligible := []*GatewaySelection{selection}
 	for _, peer := range selection.profitPeers {
 		if peer.Channel.ID == selection.Channel.ID {
+			continue
+		}
+		channel, exists := currentChannels[peer.Channel.ID]
+		provider := currentProviders[peer.Provider.Id]
+		if !exists || channel.ProviderID != peer.Provider.Id || channel.ModelID != peer.Channel.ModelID || channel.Protocol != peer.Channel.Protocol || channel.UpstreamModelName != peer.Channel.UpstreamModelName {
+			continue
+		}
+		if channel.Status != model.ChannelEnabled || !channel.MappingConfirmed || channel.Model.Status != 1 {
+			continue
+		}
+		if provider == nil || provider.Status != common.ChannelStatusEnabled || provider.ProviderInfo.IsMultiKey && !gatewayProviderHasKey(provider) || provider.BalanceUpdatedTime > 0 && provider.Balance <= 0 {
 			continue
 		}
 		price, err := model.CurrentPriceVersion(ctx, model.DB, model.PriceOwnerChannel, peer.Channel.ID, at.Unix())
@@ -488,11 +527,44 @@ func (selection *GatewaySelection) LossFallbackAllowed(ctx context.Context, cost
 		if err != nil {
 			continue
 		}
-		allowed, err := GatewayRouteProfitAllowed(comparison, peer.EstimatedSale, margin)
+		live := *peer
+		live.Channel, live.Provider, live.EstimatedCost = channel, provider, comparison
+		eligible = append(eligible, &live)
+	}
+	ids = ids[:0]
+	for _, peer := range eligible {
+		ids = append(ids, peer.Channel.ID)
+	}
+	health, err := ChannelHealth.Snapshots(ctx, ids)
+	if err != nil {
+		return false, ErrGatewayUnavailable
+	}
+	hasClosed := slices.ContainsFunc(eligible, func(peer *GatewaySelection) bool { return health[peer.Channel.ID].Circuit == "closed" })
+	eligible = slices.DeleteFunc(eligible, func(peer *GatewaySelection) bool {
+		snapshot := health[peer.Channel.ID]
+		ready := snapshot.Circuit == "closed" || snapshot.Circuit == "open" && snapshot.RetryAt <= clock.Now().UnixMilli()
+		return !ready && hasClosed
+	})
+	activeProbe := slices.ContainsFunc(eligible, func(peer *GatewaySelection) bool { return health[peer.Channel.ID].Circuit == "half_open" })
+	for _, peer := range eligible {
+		if peer.Channel.ID == selection.Channel.ID {
+			continue
+		}
+		snapshot := health[peer.Channel.ID]
+		if snapshot.Circuit == "half_open" || snapshot.Circuit == "open" && activeProbe {
+			continue
+		}
+		if err := selection.Permit.CheckAlternative(ctx, peer, peer.EstimatedTokens, used); err != nil {
+			if errors.Is(err, ErrGatewayRateLimited) {
+				continue
+			}
+			return false, err
+		}
+		allowed, err := GatewayRouteProfitAllowed(peer.EstimatedCost, peer.EstimatedSale, margin)
 		if err != nil {
 			continue
 		}
-		order, err := comparison.Compare(cost)
+		order, err := peer.EstimatedCost.Compare(cost)
 		if err != nil {
 			return false, err
 		}

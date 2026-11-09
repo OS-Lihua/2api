@@ -38,8 +38,11 @@ import (
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func newAsyncTaskFixture(t *testing.T, upstream http.HandlerFunc) textGatewayFixture {
@@ -2633,6 +2636,41 @@ func TestAsyncTaskUnavailableChannelUsesBackendLanguage(t *testing.T) {
 	}
 }
 
+type taskProviderCredentialLock struct {
+	tx  *gorm.DB
+	pid int
+}
+
+func lockTaskProviderCredential(t *testing.T, providerID int) taskProviderCredentialLock {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	t.Cleanup(cancel)
+	lock := taskProviderCredentialLock{tx: model.DB.WithContext(ctx).Begin()}
+	require.NoError(t, lock.tx.Error)
+	t.Cleanup(func() { _ = lock.tx.Rollback().Error })
+	var locked int
+	require.NoError(t, lock.tx.Raw(`SELECT "id" FROM "providers" WHERE "id" = ? FOR UPDATE`, providerID).Scan(&locked).Error)
+	require.Equal(t, providerID, locked)
+	require.NoError(t, lock.tx.Raw(`SELECT pg_backend_pid()`).Scan(&lock.pid).Error)
+	return lock
+}
+
+func (lock taskProviderCredentialLock) wait(t *testing.T, finished chan *httptest.ResponseRecorder) {
+	t.Helper()
+	ctx := lock.tx.Statement.Context
+	var waiting int
+	for waiting == 0 && ctx.Err() == nil {
+		select {
+		case early := <-finished:
+			finished <- early
+			require.FailNowf(t, "task did not wait for its credential lock", "%d %s", early.Code, early.Body.String())
+		default:
+		}
+		require.NoError(t, model.DB.WithContext(ctx).Raw(`SELECT COALESCE(min(pid),0) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND ? = ANY(pg_blocking_pids(pid))`, lock.pid).Scan(&waiting).Error)
+	}
+	require.NotZero(t, waiting)
+}
+
 func TestAsyncTaskCredentialLockWaitRechecksRemainingBudget(t *testing.T) {
 	for _, test := range []struct {
 		name, budget            string
@@ -2679,14 +2717,8 @@ func TestAsyncTaskCredentialLockWaitRechecksRemainingBudget(t *testing.T) {
 					require.NoError(t, err)
 				}
 			}
-			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
-			defer cancel()
-			lock := model.DB.WithContext(ctx).Begin()
-			require.NoError(t, lock.Error)
-			defer lock.Rollback()
-			var locked, lockerPID int
-			require.NoError(t, lock.Raw(`SELECT "id" FROM "providers" WHERE "id" = ? FOR UPDATE`, fixture.channel.ProviderID).Scan(&locked).Error)
-			require.NoError(t, lock.Raw(`SELECT pg_backend_pid()`).Scan(&lockerPID).Error)
+			held := lockTaskProviderCredential(t, fixture.channel.ProviderID)
+			lock := held.tx
 			finished := make(chan *httptest.ResponseRecorder, 1)
 			go func() {
 				finished <- adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
@@ -2698,17 +2730,7 @@ func TestAsyncTaskCredentialLockWaitRechecksRemainingBudget(t *testing.T) {
 					<-finished
 				}
 			}()
-			var waiting int
-			for waiting == 0 && ctx.Err() == nil {
-				select {
-				case early := <-finished:
-					completed = true
-					require.FailNowf(t, "task did not wait for its credential lock", "%d %s", early.Code, early.Body.String())
-				default:
-				}
-				require.NoError(t, model.DB.WithContext(ctx).Raw(`SELECT COALESCE(min(pid),0) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND ? = ANY(pg_blocking_pids(pid))`, lockerPID).Scan(&waiting).Error)
-			}
-			require.NotZero(t, waiting)
+			held.wait(t, finished)
 			fixture.fake.Advance(2 * time.Second)
 			if test.refreshPrice {
 				_, err := model.SaveFXRate(t.Context(), "EUR", "USD", "3", "0", fixture.sale.CreatedBy)
@@ -2762,6 +2784,147 @@ func TestAsyncTaskCredentialLockWaitRechecksRemainingBudget(t *testing.T) {
 			var reservations int64
 			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id = ? AND type = ?", request.ID, model.LedgerEntryPreConsume).Count(&reservations).Error)
 			assert.EqualValues(t, 1, reservations)
+		})
+	}
+}
+
+func TestAsyncTaskFinalLossFallbackRechecksPeerAvailability(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		shared, wantPeer bool
+	}{
+		{name: "disabled Channel"},
+		{name: "disabled Provider"},
+		{name: "exhausted Provider balance"},
+		{name: "busy Provider"}, {name: "busy Provider", shared: true},
+		{name: "occupied probe"}, {name: "occupied probe", shared: true},
+		{name: "shared Provider", wantPeer: true}, {name: "shared Provider", shared: true, wantPeer: true},
+		{name: "available peer", wantPeer: true},
+	} {
+		t.Run(fmt.Sprintf("%s/redis=%t", test.name, test.shared), func(t *testing.T) {
+			var calls atomic.Int32
+			upstream := func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method == http.MethodGet {
+					assert.Equal(t, "/v1/videos/peer-job", r.URL.Path)
+					_, _ = io.WriteString(w, `{"id":"peer-job","status":"completed","seconds":"2"}`)
+					return
+				}
+				_, _ = io.WriteString(w, `{"id":"peer-job","status":"queued"}`)
+			}
+			fixture := newAsyncTaskFixture(t, upstream)
+			fixture.offering.RouteMethod = "weight"
+			require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+			fixture.fake.Advance(time.Second)
+			peer := addTextGatewayChannel(t, fixture, upstream)
+			peer.Protocol, peer.UpstreamModelName = "task:sora", "sora-2"
+			if test.name == "shared Provider" {
+				peer.ProviderID = fixture.channel.ProviderID
+				peer.UpstreamModelName = "sora-2-pro"
+			}
+			require.NoError(t, model.DB.Model(peer).Updates(map[string]any{"protocol": peer.Protocol, "upstream_model_name": peer.UpstreamModelName, "provider_id": peer.ProviderID}).Error)
+			var provider model.Provider
+			require.NoError(t, model.DB.First(&provider, peer.ProviderID).Error)
+			if test.name == "busy Provider" || test.name == "shared Provider" {
+				provider.ProviderInfo.RouteLimits.MaxConcurrency = 1
+				if test.name == "shared Provider" {
+					provider.ProviderInfo.RouteLimits.RPM = 1
+				}
+				require.NoError(t, model.DB.Model(&provider).Update("channel_info", provider.ProviderInfo).Error)
+			}
+			prices := []*model.PriceVersion{
+				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("video",u("seconds")*0.01)`, EffectiveAt: clock.Now().Unix()},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("video",u("seconds")*0.2)`, EffectiveAt: clock.Now().Unix() + 2},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: peer.ID, Currency: "USD", Expression: `tier("video",u("seconds")*0.005)`, EffectiveAt: clock.Now().Unix()},
+			}
+			for _, price := range prices {
+				err := model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy)
+				if err != nil {
+					var confirmation *model.MarginConfirmationError
+					require.ErrorAs(t, err, &confirmation)
+					price.MarginConfirmation = confirmation.Report.Revision
+					err = model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy)
+				}
+				require.NoError(t, err)
+			}
+			if test.shared {
+				server := miniredis.RunT(t)
+				client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+				t.Cleanup(func() { require.NoError(t, client.Close()) })
+				service.GatewayRouteQuota = service.NewGatewayRouteQuota(client)
+				service.ChannelHealth = channelhealth.New(client)
+			}
+			busy := &service.GatewaySelection{Channel: *peer, Provider: &provider}
+			var occupied *service.GatewayRoutePermit
+			var probe channelhealth.Admission
+			defer func() {
+				if occupied != nil {
+					require.NoError(t, occupied.Release(t.Context(), false))
+				}
+				if probe.Lease != "" {
+					require.NoError(t, service.ChannelHealth.Release(t.Context(), probe))
+				}
+			}()
+			held := lockTaskProviderCredential(t, fixture.channel.ProviderID)
+			finished := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				finished <- adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+			}()
+			completed := false
+			defer func() {
+				_ = held.tx.Rollback().Error
+				if !completed {
+					<-finished
+				}
+			}()
+			held.wait(t, finished)
+			fixture.fake.Advance(2 * time.Second)
+			switch test.name {
+			case "disabled Channel":
+				require.NoError(t, model.DB.Model(peer).Update("status", model.ChannelDisabled).Error)
+			case "disabled Provider":
+				require.NoError(t, model.DB.Model(&provider).Update("status", common.ChannelStatusManuallyDisabled).Error)
+			case "exhausted Provider balance":
+				require.NoError(t, model.DB.Model(&provider).Updates(map[string]any{"balance": 0, "balance_updated_time": clock.Now().Unix()}).Error)
+			case "busy Provider":
+				var err error
+				occupied, err = service.GatewayRouteQuota.Acquire(t.Context(), busy, 0)
+				require.NoError(t, err)
+			case "occupied probe":
+				_, err := service.ChannelHealth.Record(t.Context(), channelhealth.Sample{AttemptID: "late-peer-probe", ChannelID: peer.ID, ProviderFailure: true, RateLimited: true, RetryAfter: "60"})
+				require.NoError(t, err)
+				probe, err = service.ChannelHealth.Acquire(t.Context(), []int{peer.ID})
+				require.NoError(t, err)
+				require.Equal(t, peer.ID, probe.ChannelID)
+				require.NotEmpty(t, probe.Lease)
+			}
+			require.NoError(t, held.tx.Commit().Error)
+			response := <-finished
+			completed = true
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.EqualValues(t, 1, calls.Load())
+			service.RunTaskPollingOnce(t.Context(), nil)
+			assert.EqualValues(t, 2, calls.Load())
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			channelID, cost := fixture.channel.ID, int64(400000000)
+			if test.wantPeer {
+				channelID, cost = peer.ID, 10000000
+			}
+			assert.Equal(t, channelID, attempts[0].ChannelID)
+			assert.Equal(t, cost, attempts[0].Cost.Nanos)
+			request, err := model.GetGatewayRequest(t.Context(), attempts[0].RequestID, fixture.user.Id)
+			require.NoError(t, err)
+			assert.EqualValues(t, 180000000, request.Receivable.Nanos)
+			assertTextGatewayLedger(t, *request, cost)
+			var reservations int64
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id = ? AND type = ?", request.ID, model.LedgerEntryPreConsume).Count(&reservations).Error)
+			assert.EqualValues(t, 1, reservations)
+			if occupied != nil {
+				assert.ErrorIs(t, service.GatewayRouteQuota.Check(t.Context(), busy, 0), service.ErrGatewayRateLimited)
+			}
 		})
 	}
 }

@@ -354,7 +354,7 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 			}
 			selection.LossFallback = false
 			if !allowed && offering.AllowLossFallback {
-				allowed, err = selection.LossFallbackAllowed(wire.Context(), comparison, offering.MinimumMarginRate)
+				allowed, err = selection.LossFallbackAllowed(wire.Context(), comparison, offering.MinimumMarginRate, contactedProvider)
 				if err != nil {
 					return err
 				}

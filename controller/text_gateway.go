@@ -718,7 +718,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	selection.LossFallback = false
 	if !profitable {
 		if offering.AllowLossFallback {
-			selection.LossFallback, err = selection.LossFallbackAllowed(c.Request.Context(), comparison, offering.MinimumMarginRate)
+			selection.LossFallback, err = selection.LossFallbackAllowed(c.Request.Context(), comparison, offering.MinimumMarginRate, contactedProvider)
 		}
 		if err != nil || !selection.LossFallback {
 			run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
