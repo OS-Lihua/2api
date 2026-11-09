@@ -4565,58 +4565,80 @@ func TestMediaGatewayNativeImageProvidersUseEffectiveWireAndActualMoney(t *testi
 		{"Jimeng", "jimeng_high_aes_general_v21_L", `{}`, `{"code":10000,"data":{"image_urls":["https://image.invalid/one"]}}`, constant.ChannelTypeJimeng, 1, 1, 36_000_000, nil},
 		{"MiniMax", "image-01", `{}`, `{"data":{"image_urls":["https://image.invalid/one"]},"base_resp":{"status_code":0}}`, constant.ChannelTypeMiniMax, 2, 2, 72_000_000, []string{"n"}},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			calls := 0
-			fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
-				calls++
-				var wire map[string]any
-				require.NoError(t, common.DecodeJson(r.Body, &wire))
-				if len(tc.path) > 0 {
-					var quantity any = wire
-					for _, key := range tc.path {
-						quantity = quantity.(map[string]any)[key]
+		for _, short := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/short=%t", tc.name, short), func(t *testing.T) {
+				calls := 0
+				fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					var wire map[string]any
+					require.NoError(t, common.DecodeJson(r.Body, &wire))
+					if len(tc.path) > 0 {
+						var quantity any = wire
+						for _, key := range tc.path {
+							quantity = quantity.(map[string]any)[key]
+						}
+						assert.Equal(t, float64(tc.quantity), quantity)
 					}
-					assert.Equal(t, float64(tc.quantity), quantity)
+					w.Header().Set("Content-Type", "application/json")
+					if short {
+						w.Header().Set("Content-Length", strconv.Itoa(len(tc.response)+1))
+					}
+					_, _ = io.WriteString(w, tc.response)
+				})
+				providerFields := map[string]any{"type": tc.providerType}
+				if tc.providerType == constant.ChannelTypeJimeng {
+					providerFields["key"] = "access|secret"
 				}
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.WriteString(w, tc.response)
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(providerFields).Error)
+				require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"upstream_model_name": tc.upstream, "parameter_overrides": tc.overrides}).Error)
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", fmt.Sprintf(`{"model":"gateway-alias","prompt":"draw","n":%d}`, tc.requested))
+				if short {
+					assert.GreaterOrEqual(t, response.Code, 400)
+					assert.Equal(t, 1, calls)
+					attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+					require.NoError(t, err)
+					require.EqualValues(t, 1, total)
+					require.NotNil(t, attempts[0].Usage.ImageCount)
+					assert.EqualValues(t, 1, *attempts[0].Usage.ImageCount)
+					assert.EqualValues(t, 20_000_000, attempts[0].Cost.Nanos)
+					record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+					require.NoError(t, err)
+					assert.Zero(t, record.Receivable.Nanos)
+					wallet, err := model.GetUserWallet(fixture.user.Id)
+					require.NoError(t, err)
+					assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
+					return
+				}
+				require.Equal(t, 200, response.Code, response.Body.String())
+				assert.Equal(t, 1, calls)
+				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+				require.NoError(t, err)
+				assert.EqualValues(t, tc.quantity, record.ChoiceCount)
+				require.NotNil(t, record.Usage.ImageCount)
+				assert.EqualValues(t, 1, *record.Usage.ImageCount)
+				assert.Equal(t, int64(36_000_000), record.Receivable.Nanos)
+				attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, total)
+				assert.Equal(t, int64(20_000_000), attempts[0].Cost.Nanos)
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, int64(964_000_000), wallet.Balance.Nanos)
+				entries, _, err := model.ListLedgerEntries(wallet.Id, 0, 10)
+				require.NoError(t, err)
+				preconsumes := 0
+				for _, entry := range entries {
+					if entry.Type == model.LedgerEntryPreConsume {
+						preconsumes++
+						assert.Equal(t, -tc.hold, entry.Amount.Nanos)
+					}
+				}
+				assert.Equal(t, 1, preconsumes)
+				reconciliation, err := model.ReconcileWallets(100)
+				require.NoError(t, err)
+				assert.Empty(t, reconciliation.Mismatches)
 			})
-			providerFields := map[string]any{"type": tc.providerType}
-			if tc.providerType == constant.ChannelTypeJimeng {
-				providerFields["key"] = "access|secret"
-			}
-			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(providerFields).Error)
-			require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"upstream_model_name": tc.upstream, "parameter_overrides": tc.overrides}).Error)
-			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", fmt.Sprintf(`{"model":"gateway-alias","prompt":"draw","n":%d}`, tc.requested))
-			require.Equal(t, 200, response.Code, response.Body.String())
-			assert.Equal(t, 1, calls)
-			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
-			require.NoError(t, err)
-			assert.EqualValues(t, tc.quantity, record.ChoiceCount)
-			require.NotNil(t, record.Usage.ImageCount)
-			assert.EqualValues(t, 1, *record.Usage.ImageCount)
-			assert.Equal(t, int64(36_000_000), record.Receivable.Nanos)
-			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
-			require.NoError(t, err)
-			require.EqualValues(t, 1, total)
-			assert.Equal(t, int64(20_000_000), attempts[0].Cost.Nanos)
-			wallet, err := model.GetUserWallet(fixture.user.Id)
-			require.NoError(t, err)
-			assert.Equal(t, int64(964_000_000), wallet.Balance.Nanos)
-			entries, _, err := model.ListLedgerEntries(wallet.Id, 0, 10)
-			require.NoError(t, err)
-			preconsumes := 0
-			for _, entry := range entries {
-				if entry.Type == model.LedgerEntryPreConsume {
-					preconsumes++
-					assert.Equal(t, -tc.hold, entry.Amount.Nanos)
-				}
-			}
-			assert.Equal(t, 1, preconsumes)
-			reconciliation, err := model.ReconcileWallets(100)
-			require.NoError(t, err)
-			assert.Empty(t, reconciliation.Mismatches)
-		})
+		}
 	}
 }
 

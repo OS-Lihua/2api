@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relay/channel"
@@ -227,11 +228,27 @@ func (a *Protocol) DoResponse(c *gin.Context, resp *http.Response, info *relayco
 		return nil, types.NewError(errors.New("replicate adaptor: empty response"), types.ErrorCodeBadResponse)
 	}
 
+	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(resp.Body)
+	if info.ResponseFacts != nil {
+		var data []dto.ImageData
+		output := ojson.GetBytes(responseBody, "output")
+		if output.Type == ojson.String {
+			if value := strings.TrimSpace(output.Str); value != "" {
+				data = append(data, dto.ImageData{Url: value})
+			}
+		} else if output.IsArray() {
+			for _, item := range output.Array() {
+				if item.Type == ojson.String && strings.TrimSpace(item.Str) != "" {
+					data = append(data, dto.ImageData{Url: item.Str})
+				}
+			}
+		}
+		openai.ObserveImageGeneration(info, data)
+	}
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
 	}
-	_ = resp.Body.Close()
 
 	var prediction PredictionResponse
 	if err := common.Unmarshal(responseBody, &prediction); err != nil {

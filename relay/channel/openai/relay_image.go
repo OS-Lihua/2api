@@ -37,6 +37,23 @@ func WriteImageResponse(c *gin.Context, info *relaycommon.RelayInfo, response *h
 	return OpenaiImageHandler(c, info, &canonical)
 }
 
+// ObserveImageGeneration retains native image payload quantities before
+// presentation or transport errors can prevent normal response handling.
+func ObserveImageGeneration(info *relaycommon.RelayInfo, data []dto.ImageData) {
+	if info.ResponseFacts == nil || len(data) == 0 {
+		return
+	}
+	body, err := common.Marshal(dto.ImageResponse{Data: data})
+	if err != nil {
+		return
+	}
+	count := openaiImageResponseCount(body)
+	if count > 0 && count <= dto.MaxImageN {
+		info.ResponseFacts.ImageCount = &count
+		info.ResponseFacts.GeneratedImageCount = max(info.ResponseFacts.GeneratedImageCount, count)
+	}
+}
+
 // OpenaiImageHandler handles non-streaming OpenAI image responses
 // (generations/edits), returning the parsed usage for billing.
 func OpenaiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {

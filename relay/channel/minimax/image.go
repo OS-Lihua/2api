@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -177,11 +178,25 @@ func responseMiniMax2OpenAIImage(response *MiniMaxImageResponse, info *relaycomm
 }
 
 func miniMaxImageHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
+	defer service.CloseResponseBodyGracefully(resp)
 	responseBody, err := io.ReadAll(resp.Body)
+	if info.ResponseFacts != nil {
+		var data []dto.ImageData
+		for _, value := range ojson.GetBytes(responseBody, "data.image_urls").Array() {
+			if value.Type == ojson.String && value.Str != "" {
+				data = append(data, dto.ImageData{Url: value.Str})
+			}
+		}
+		for _, value := range ojson.GetBytes(responseBody, "data.image_base64").Array() {
+			if value.Type == ojson.String && value.Str != "" {
+				data = append(data, dto.ImageData{B64Json: value.Str})
+			}
+		}
+		openai.ObserveImageGeneration(info, data)
+	}
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
-	service.CloseResponseBodyGracefully(resp)
 
 	var minimaxResponse MiniMaxImageResponse
 	if err := common.Unmarshal(responseBody, &minimaxResponse); err != nil {

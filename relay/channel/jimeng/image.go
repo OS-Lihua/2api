@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -51,12 +52,26 @@ func responseJimeng2OpenAIImage(_ *gin.Context, response *ImageResponse, info *r
 
 // jimengImageHandler handles the Jimeng image generation response
 func jimengImageHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
+	defer service.CloseResponseBodyGracefully(resp)
 	var jimengResponse ImageResponse
 	responseBody, err := io.ReadAll(resp.Body)
+	if info.ResponseFacts != nil {
+		var data []dto.ImageData
+		for _, value := range ojson.GetBytes(responseBody, "data.image_urls").Array() {
+			if value.Type == ojson.String && value.Str != "" {
+				data = append(data, dto.ImageData{Url: value.Str})
+			}
+		}
+		for _, value := range ojson.GetBytes(responseBody, "data.binary_data_base64").Array() {
+			if value.Type == ojson.String && value.Str != "" {
+				data = append(data, dto.ImageData{B64Json: value.Str})
+			}
+		}
+		openai.ObserveImageGeneration(info, data)
+	}
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
-	service.CloseResponseBodyGracefully(resp)
 
 	err = common.Unmarshal(responseBody, &jimengResponse)
 	if err != nil {
