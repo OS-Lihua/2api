@@ -10890,6 +10890,38 @@ func TestTextGatewayLegacyFunctionConvertsAcrossPublicProtocols(t *testing.T) {
 	}
 }
 
+func TestTextGatewayChatFinalUsageFollowsFinishReason(t *testing.T) {
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n")
+	})
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stream":true,"stream_options":{"include_usage":true}}`)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	type chatChunk struct {
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage *dto.Usage `json:"usage"`
+	}
+	var chunks []chatChunk
+	for line := range strings.SplitSeq(response.Body.String(), "\n") {
+		data, ok := strings.CutPrefix(line, "data: ")
+		if !ok || data == "[DONE]" {
+			continue
+		}
+		var chunk chatChunk
+		require.NoError(t, common.Unmarshal([]byte(data), &chunk))
+		chunks = append(chunks, chunk)
+	}
+	require.Len(t, chunks, 3)
+	require.Len(t, chunks[1].Choices, 1)
+	assert.Equal(t, "stop", chunks[1].Choices[0].FinishReason)
+	assert.Empty(t, chunks[2].Choices)
+	require.NotNil(t, chunks[2].Usage)
+	assert.Equal(t, 15, chunks[2].Usage.TotalTokens)
+	assert.True(t, strings.HasSuffix(response.Body.String(), "data: [DONE]\n\n"))
+}
+
 func TestTextGatewayUnspecifiedGeminiFinishIsNotTerminal(t *testing.T) {
 	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

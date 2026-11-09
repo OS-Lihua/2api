@@ -374,7 +374,8 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 		}
 	}
 	terminal := gatewayTerminalSnapshot(body, info.RelayFormat)
-	if (terminal || output.sourceTerminal) && !output.terminalReady && !info.PerformanceBusinessRejection {
+	finalUsage := info.RelayFormat == types.RelayFormatOpenAI && len(output.pendingTerminal) > 0 && len(gjson.GetBytes(body, "choices").Array()) == 0 && gjson.GetBytes(body, "usage").IsObject()
+	if (terminal || output.sourceTerminal || finalUsage) && !output.terminalReady && !info.PerformanceBusinessRejection {
 		// Terminal snapshots can contain complete image or audio payloads.
 		if int64(output.terminalBytes)+int64(len(body)) > channel.GatewayResponseSourceLimit() {
 			return "", helper.ErrGatewayStreamPreludeLimit
