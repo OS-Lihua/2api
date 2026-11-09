@@ -132,7 +132,20 @@ func (call *ResponsesWSCall) EstimateInput(c *gin.Context, info *relaycommon.Rel
 		return nil, &service.GatewayParameterError{Path: "input", Reason: "Could not estimate request input"}
 	}
 	images := 0
+	var inputModalities []capability.Modality
 	for _, file := range meta.Files {
+		modality := capability.PDF
+		switch file.FileType {
+		case types.FileTypeImage:
+			modality = capability.Image
+		case types.FileTypeAudio:
+			modality = capability.Audio
+		case types.FileTypeVideo:
+			modality = capability.Video
+		}
+		if !slices.Contains(inputModalities, modality) {
+			inputModalities = append(inputModalities, modality)
+		}
 		if file.FileType == types.FileTypeImage {
 			images++
 		}
@@ -146,6 +159,14 @@ func (call *ResponsesWSCall) EstimateInput(c *gin.Context, info *relaycommon.Rel
 		}
 		if previous.ToolCalls && !slices.Contains(caps.Features, capability.ToolCalling) {
 			return nil, &service.GatewayParameterError{Path: "previous_response_id", Reason: "Tool calling is not supported on this channel"}
+		}
+		for _, modality := range previous.InputModalities {
+			if !slices.Contains(caps.InputModalities, modality) {
+				return nil, &service.GatewayParameterError{Path: "previous_response_id", Reason: "Input modality is not supported on this channel"}
+			}
+			if !slices.Contains(inputModalities, modality) {
+				inputModalities = append(inputModalities, modality)
+			}
 		}
 		toolCalls = toolCalls || previous.ToolCalls
 		inherited = append(inherited, previous.Context)
@@ -169,6 +190,14 @@ func (call *ResponsesWSCall) EstimateInput(c *gin.Context, info *relaycommon.Rel
 		}
 		if known.ToolCalls && !slices.Contains(caps.Features, capability.ToolCalling) {
 			return nil, &service.GatewayParameterError{Path: fmt.Sprintf("input[%d].id", index), Reason: "Tool calling is not supported on this channel"}
+		}
+		for _, modality := range known.InputModalities {
+			if !slices.Contains(caps.InputModalities, modality) {
+				return nil, &service.GatewayParameterError{Path: fmt.Sprintf("input[%d].id", index), Reason: "Input modality is not supported on this channel"}
+			}
+			if !slices.Contains(inputModalities, modality) {
+				inputModalities = append(inputModalities, modality)
+			}
 		}
 		toolCalls = toolCalls || known.ToolCalls
 		inherited = append(inherited, known.Usage)
@@ -200,7 +229,7 @@ func (call *ResponsesWSCall) EstimateInput(c *gin.Context, info *relaycommon.Rel
 	if contextUsage.PromptTokensDetails.TextTokens > 0 && !slices.Contains(caps.InputModalities, capability.Text) {
 		return nil, &service.GatewayParameterError{Path: "input", Reason: "Input or output text is not supported on this channel"}
 	}
-	return &relaycommon.ResponsesInputFacts{Usage: usage, Context: contextUsage, ImageCount: images, ToolCalls: toolCalls}, nil
+	return &relaycommon.ResponsesInputFacts{Usage: usage, Context: contextUsage, ImageCount: images, InputModalities: inputModalities, ToolCalls: toolCalls}, nil
 }
 
 // Prepare uses the existing Provider transport without sending any bytes.
@@ -288,7 +317,7 @@ func (call *ResponsesWSCall) Exchange(c *gin.Context, info *relaycommon.RelayInf
 				if _, exists := s.contexts[id]; !exists {
 					s.contextBytes += len(id) + 256
 				}
-				s.contexts[id] = relaycommon.ResponsesInputFacts{Context: contextUsage, ImageCount: input.ImageCount, ToolCalls: input.ToolCalls || info.ResponseFacts != nil && info.ResponseFacts.GeneratedToolCalls}
+				s.contexts[id] = relaycommon.ResponsesInputFacts{Context: contextUsage, ImageCount: input.ImageCount, InputModalities: slices.Clone(input.InputModalities), ToolCalls: input.ToolCalls || info.ResponseFacts != nil && info.ResponseFacts.GeneratedToolCalls}
 				for itemID, item := range info.ResponsesItemFacts {
 					if s.items[itemID] != nil {
 						continue
@@ -301,7 +330,7 @@ func (call *ResponsesWSCall) Exchange(c *gin.Context, info *relaycommon.RelayInf
 						s.items = map[string]*relaycommon.ResponsesInputFacts{}
 					}
 					s.contextBytes += len(itemID) + 128
-					s.items[itemID] = &relaycommon.ResponsesInputFacts{Usage: service.GatewayUsageSnapshot(item.Usage), ToolCalls: item.ToolCalls}
+					s.items[itemID] = &relaycommon.ResponsesInputFacts{Usage: service.GatewayUsageSnapshot(item.Usage), InputModalities: slices.Clone(item.InputModalities), ToolCalls: item.ToolCalls}
 				}
 			} else {
 				call.state.closeCode = websocket.CloseMessageTooBig

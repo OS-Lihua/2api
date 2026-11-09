@@ -56,6 +56,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/websocket"
@@ -726,7 +727,7 @@ func TestResponsesWSGatewayPreservesImageInputCategories(t *testing.T) {
 }
 
 func TestResponsesWSGatewayReservesKnownHistory(t *testing.T) {
-	for _, scenario := range []string{"insufficient funds", "larger reported input", "missing usage", "unknown reference"} {
+	for _, scenario := range []string{"insufficient funds", "larger reported input", "missing usage", "unknown reference", "PDF history allowed", "PDF history revoked"} {
 		t.Run(scenario, func(t *testing.T) {
 			var calls atomic.Int32
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -753,9 +754,20 @@ func TestResponsesWSGatewayReservesKnownHistory(t *testing.T) {
 					}
 				}
 			})
+			pdfHistory := strings.HasPrefix(scenario, "PDF history")
+			if pdfHistory {
+				var unified model.Model
+				require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+				unified.Capabilities.InputModalities = append(unified.Capabilities.InputModalities, capability.PDF)
+				require.NoError(t, model.DB.Model(&unified).Select("capabilities").Updates(&unified).Error)
+			}
 			client := dialResponsesGateway(t, fixture)
 			require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
 			body := `{"type":"response.create","model":"gateway-alias","input":"` + strings.Repeat(" hello", 600) + `","max_output_tokens":1}`
+			if pdfHistory {
+				pdf := "%PDF-1.4\n1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n2 0 obj\n<</Type /Pages /Count 0 /Kids []>>\nendobj\ntrailer\n<</Root 1 0 R>>\n%%EOF\n"
+				body = `{"type":"response.create","model":"gateway-alias","input":[{"role":"user","content":[{"type":"input_file","filename":"history.pdf","file_data":"data:application/pdf;base64,` + base64.StdEncoding.EncodeToString([]byte(pdf)) + `"}]}],"max_output_tokens":1}`
+			}
 			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(body)))
 			_, _, err := client.ReadMessage()
 			require.NoError(t, err)
@@ -772,14 +784,27 @@ func TestResponsesWSGatewayReservesKnownHistory(t *testing.T) {
 				}
 				require.NoError(t, model.DB.Model(wallet).Update("balance_nanos", remaining).Error)
 			}
+			if scenario == "PDF history revoked" {
+				var unified model.Model
+				require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+				unified.Capabilities.InputModalities = []capability.Modality{capability.Text}
+				require.NoError(t, model.DB.Model(&unified).Select("capabilities").Updates(&unified).Error)
+			}
 			previous := "context-1"
 			if scenario == "unknown reference" {
 				previous = "unknown-on-this-connection"
 			}
-			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","previous_response_id":"`+previous+`","input":"Hi","max_output_tokens":1}`)))
+			followup := `{"type":"response.create","model":"gateway-alias","previous_response_id":"` + previous + `","input":"Hi","max_output_tokens":1}`
+			if pdfHistory {
+				followup = `{"type":"response.create","model":"gateway-alias","previous_response_id":"` + previous + `","input":[],"max_output_tokens":1}`
+			}
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(followup)))
 			_, reply, err := client.ReadMessage()
 			require.NoError(t, err)
-			if scenario == "missing usage" {
+			if scenario == "PDF history allowed" {
+				assert.Equal(t, "response.completed", ojson.GetBytes(reply, "type").String())
+				assert.EqualValues(t, 2, calls.Load())
+			} else if scenario == "missing usage" {
 				assert.Equal(t, "response.completed", ojson.GetBytes(reply, "type").String())
 				var records []model.GatewayRequest
 				require.Eventually(t, func() bool {
@@ -795,6 +820,11 @@ func TestResponsesWSGatewayReservesKnownHistory(t *testing.T) {
 			} else {
 				assert.Equal(t, "error", ojson.GetBytes(reply, "type").String(), "History must be known and covered by the original reservation")
 				assert.Equal(t, int32(1), calls.Load())
+				if pdfHistory {
+					var count int64
+					require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Where("user_id = ?", fixture.user.Id).Count(&count).Error)
+					assert.EqualValues(t, 1, count, "Rejected inherited PDF must not reserve again")
+				}
 			}
 			require.NoError(t, client.Close())
 		})
@@ -2356,80 +2386,103 @@ func TestRealtimeGatewayAcceptsNativeToolChoice(t *testing.T) {
 }
 
 func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
-	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
-		t.Error("Legacy Realtime must not use the wallet Channel")
-	})
-	require.NoError(t, model.DB.AutoMigrate(&model.Ability{}, &model.Log{}))
-	oldModel, oldCompletion, oldPrice := ratio_setting.ModelRatio2JSONString(), ratio_setting.CompletionRatio2JSONString(), ratio_setting.ModelPrice2JSONString()
-	require.NoError(t, model.DB.Model(fixture.token).Update("unlimited_quota", true).Error)
-	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4o":1}`))
-	require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(`{"gpt-4o":1}`))
-	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{}`))
-	t.Cleanup(func() {
-		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(oldModel))
-		require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(oldCompletion))
-		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(oldPrice))
-	})
-	require.NoError(t, model.DB.Model(fixture.user).Updates(map[string]any{"quota": 1_000_000, "setting": `{"billing_preference":"wallet_only"}`}).Error)
-	done := make(chan struct{})
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer close(done)
-		peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
-		if !assert.NoError(t, err) {
-			return
-		}
-		defer peer.Close()
-		if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"turn_detection":null}}`))) {
-			return
-		}
-		if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
-			return
-		}
-		if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.updated","session":{"turn_detection":null}}`))) {
-			return
-		}
-		if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
-			return
-		}
-		for _, raw := range []string{`{"type":"response.created","response":{"id":"legacy-text","status":"in_progress","max_output_tokens":"inf"}}`, `{"type":"response.function_call_arguments.delta","response_id":"legacy-text","delta":"` + strings.Repeat(" hello", 20) + `"}`, `{"type":"response.done","response":{"id":"legacy-text","status":"completed"}}`} {
-			if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(raw))) {
-				return
+	for _, withTools := range []bool{false, true} {
+		t.Run(fmt.Sprintf("tools=%t", withTools), func(t *testing.T) {
+			rounds, expected := 1, 558
+			settings := ojson.NewDoc([]byte(`{"type":"session.update","session":{"instructions":"` + strings.Repeat(" hello", 600) + `"}}`))
+			if withTools {
+				rounds = 2
+				tool := dto.RealTimeTool{Type: "function", Name: "lookup", Description: strings.Repeat(" hello", 600)}
+				encoded, err := common.Marshal([]dto.RealTimeTool{tool})
+				require.NoError(t, err)
+				require.NoError(t, settings.SetRawBytes("session.tools", encoded))
+				schemaTokens := tokenkit.Count("gpt-4o", fmt.Sprint(tool)) + 8
+				expected = common.QuotaRound(float64(1260+2*schemaTokens) * 0.9)
 			}
-		}
-		_, _, _ = peer.ReadMessage()
-	}))
-	t.Cleanup(upstream.Close)
-	provider := &model.Provider{Name: "Legacy realtime text", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Key: "legacy-text-key", BaseURL: &upstream.URL, Models: "gpt-4o", Group: "default"}
-	require.NoError(t, model.DB.Create(provider).Error)
-	require.NoError(t, model.DB.Create(&model.Ability{ChannelId: provider.Id, Model: "gpt-4o", Group: "default", Enabled: true}).Error)
-	gateway := newWebSocketGatewayServer(t, fixture.engine)
-	client, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(gateway.URL, "http")+"/v1/realtime?model=gpt-4o", http.Header{"Authorization": {"Bearer sk-" + fixture.token.Key}})
-	if response != nil && response.Body != nil {
-		require.NoError(t, response.Body.Close())
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				t.Error("Legacy Realtime must not use the wallet Channel")
+			})
+			require.NoError(t, model.DB.AutoMigrate(&model.Ability{}, &model.Log{}))
+			oldModel, oldCompletion, oldPrice := ratio_setting.ModelRatio2JSONString(), ratio_setting.CompletionRatio2JSONString(), ratio_setting.ModelPrice2JSONString()
+			require.NoError(t, model.DB.Model(fixture.token).Update("unlimited_quota", true).Error)
+			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4o":1}`))
+			require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(`{"gpt-4o":1}`))
+			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{}`))
+			t.Cleanup(func() {
+				require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(oldModel))
+				require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(oldCompletion))
+				require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(oldPrice))
+			})
+			require.NoError(t, model.DB.Model(fixture.user).Updates(map[string]any{"quota": 1_000_000, "setting": `{"billing_preference":"wallet_only"}`}).Error)
+			done := make(chan struct{})
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer close(done)
+				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if !assert.NoError(t, err) {
+					return
+				}
+				defer peer.Close()
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"turn_detection":null}}`))) {
+					return
+				}
+				if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
+					return
+				}
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.updated","session":{"turn_detection":null}}`))) {
+					return
+				}
+				for round := range rounds {
+					if _, _, err := peer.ReadMessage(); !assert.NoError(t, err) {
+						return
+					}
+					id := fmt.Sprintf("legacy-text-%d", round)
+					for _, raw := range []string{`{"type":"response.created","response":{"id":"` + id + `","status":"in_progress","max_output_tokens":"inf"}}`, `{"type":"response.function_call_arguments.delta","response_id":"` + id + `","delta":"` + strings.Repeat(" hello", 20) + `"}`, `{"type":"response.done","response":{"id":"` + id + `","status":"completed"}}`} {
+						if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(raw))) {
+							return
+						}
+					}
+				}
+				_, _, _ = peer.ReadMessage()
+			}))
+			t.Cleanup(upstream.Close)
+			provider := &model.Provider{Name: "Legacy realtime text", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Key: "legacy-text-key", BaseURL: &upstream.URL, Models: "gpt-4o", Group: "default"}
+			require.NoError(t, model.DB.Create(provider).Error)
+			require.NoError(t, model.DB.Create(&model.Ability{ChannelId: provider.Id, Model: "gpt-4o", Group: "default", Enabled: true}).Error)
+			gateway := newWebSocketGatewayServer(t, fixture.engine)
+			client, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(gateway.URL, "http")+"/v1/realtime?model=gpt-4o", http.Header{"Authorization": {"Bearer sk-" + fixture.token.Key}})
+			if response != nil && response.Body != nil {
+				require.NoError(t, response.Body.Close())
+			}
+			require.NoError(t, err)
+			defer client.Close()
+			require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+			_, _, err = client.ReadMessage()
+			require.NoError(t, err)
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, settings.Bytes()))
+			_, _, err = client.ReadMessage()
+			require.NoError(t, err)
+			for range rounds {
+				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"output_modalities":["text"]}}`)))
+				for range 3 {
+					_, _, err = client.ReadMessage()
+					require.NoError(t, err)
+				}
+			}
+			require.NoError(t, client.Close())
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Legacy text connection did not release")
+			}
+			require.Eventually(t, func() bool {
+				var user model.User
+				return model.DB.First(&user, fixture.user.Id).Error == nil && user.UsedQuota == expected
+			}, 5*time.Second, 10*time.Millisecond, "Input instructions, current tool definitions and delivered output must all be charged; expected %d", expected)
+			var user model.User
+			require.NoError(t, model.DB.First(&user, fixture.user.Id).Error)
+			assert.Equal(t, 1_000_000-expected, user.Quota)
+		})
 	}
-	require.NoError(t, err)
-	defer client.Close()
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
-	_, _, err = client.ReadMessage()
-	require.NoError(t, err)
-	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.update","session":{"instructions":"`+strings.Repeat(" hello", 600)+`"}}`)))
-	_, _, err = client.ReadMessage()
-	require.NoError(t, err)
-	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"output_modalities":["text"]}}`)))
-	for range 3 {
-		_, _, err = client.ReadMessage()
-		require.NoError(t, err)
-	}
-	require.NoError(t, client.Close())
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Legacy text connection did not release")
-	}
-	require.Eventually(t, func() bool {
-		var user model.User
-		return model.DB.First(&user, fixture.user.Id).Error == nil && user.UsedQuota == 558
-	}, 5*time.Second, 10*time.Millisecond, "600 input +20 output at ratio1/group0.9 must charge 558, not minimum1")
 }
 
 func TestRealtimeGatewayRejectsUnknownInitialVADState(t *testing.T) {

@@ -95,6 +95,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (apiErr 
 	accumulator := service.NewRealtimeUsageAccumulator(info)
 	sum := &dto.RealtimeUsage{}
 	input := &dto.Usage{}
+	toolTokens := 0
 	var clientWrite, targetWrite helper.StreamWriteBudget
 	defer func() {
 		cancel()
@@ -141,6 +142,14 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (apiErr 
 			if event.Type == dto.RealtimeEventTypeSessionUpdate && event.Session != nil {
 				if event.Session.Tools != nil {
 					info.RealtimeTools = event.Session.Tools
+					if info.RealtimeInputUsage == nil {
+						previous := toolTokens
+						toolTokens = 0
+						for _, tool := range info.RealtimeTools {
+							toolTokens += service.CountTokenInput(tool, info.TokenizerModelName()) + 8
+						}
+						input.PromptTokens += toolTokens - previous
+					}
 				}
 			}
 			// Client item creation is input too; the legacy counter names the
@@ -311,5 +320,5 @@ func preConsumeUsage(ctx *gin.Context, info *relaycommon.RelayInfo, usage *dto.R
 	if info.RealtimeResponseHandler != nil || info.ResponseFacts != nil {
 		return nil
 	}
-	return service.PreWssConsumeQuota(ctx, info, usage)
+	return service.PreWssConsumeQuota(ctx, info, totalUsage)
 }

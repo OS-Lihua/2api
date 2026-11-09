@@ -3,6 +3,7 @@ package common
 import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/capability"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/tidwall/gjson"
@@ -29,10 +30,11 @@ type RealtimeResponseFacts struct {
 // ResponsesInputFacts freezes billable input and reusable conversation quantities.
 // Context excludes configuration that the Responses protocol does not inherit.
 type ResponsesInputFacts struct {
-	Usage      *dto.Usage
-	Context    *dto.Usage
-	ImageCount int
-	ToolCalls  bool
+	Usage           *dto.Usage
+	Context         *dto.Usage
+	ImageCount      int
+	InputModalities []capability.Modality
+	ToolCalls       bool
 }
 
 // ChatStreamBusinessText extracts generated content independently of delivery.
