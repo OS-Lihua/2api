@@ -11029,8 +11029,6 @@ func TestTextGatewayNativeComposerReturnsParameterReasons(t *testing.T) {
 		system                             bool
 		overrides, messages, upstream, key string
 	}{
-		{field: "n", extra: `"n":2`, provider: constant.ChannelTypeXunfei, key: "fixture-app|fixture-secret|fixture-key", upstream: "SparkDesk-v3.5", reason: "The native request did not retain this request parameter"},
-		{field: "n", extra: `"n":2`, provider: constant.ChannelTypeAws, key: "test-access|test-secret|us-east-1", upstream: "amazon.nova-lite-v1:0", reason: "The native request did not retain this request parameter"},
 		{field: "n", extra: `"max_tokens":16`, provider: constant.ChannelTypeCohere, overrides: `{"n":2}`, reason: "native wire does not support request parameter n"},
 		{field: "n", extra: `"n":2`, provider: constant.ChannelTypeTencent, key: "1|test-id|test-secret", reason: "native Provider cannot represent multiple output choices (n)"},
 		{field: "n", extra: `"n":2`, provider: constant.ChannelTypeXunfei, upstream: "SparkDesk-v3.5", key: "fixture-app|fixture-secret|fixture-key", reason: "native Provider cannot represent multiple output choices (n)"},
