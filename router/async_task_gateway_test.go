@@ -2778,12 +2778,15 @@ func TestAsyncTaskNativeStreamSettlesObservedFacts(t *testing.T) {
 		sale, cost     int64
 		costPending    bool
 		completeWrites int
+		status         int
 	}{
-		{"metadata only", ": keep-alive\n\ndata: invalid-json\n\n", 0, 0, true, -1},
-		{"one image before invalid event", "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]}}]},\"usage\":{\"image_count\":1}}\n\ndata: invalid-json\n\n", 90000000, 50000000, true, -1},
-		{"completed image", "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]},\"finish_reason\":\"stop\"}]},\"usage\":{\"image_count\":1}}\n\n", 90000000, 50000000, false, -1},
-		{"short first image write", "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]},\"finish_reason\":\"stop\"}]},\"usage\":{\"image_count\":1}}\n\n", 0, 50000000, false, 0},
-		{"short second image write", "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]}}]}}\n\ndata: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/second.png\"}]},\"finish_reason\":\"stop\"}]},\"usage\":{\"image_count\":2}}\n\n", 90000000, 100000000, false, 1},
+		{"metadata only", ": keep-alive\n\ndata: invalid-json\n\n", 0, 0, true, -1, http.StatusOK},
+		{"invalid first frame", "data: invalid-json\n\n", 0, 0, true, -1, http.StatusBadGateway},
+		{"empty stream", "", 0, 0, true, -1, http.StatusBadGateway},
+		{"one image before invalid event", "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]}}]},\"usage\":{\"image_count\":1}}\n\ndata: invalid-json\n\n", 90000000, 50000000, true, -1, http.StatusOK},
+		{"completed image", "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]},\"finish_reason\":\"stop\"}]},\"usage\":{\"image_count\":1}}\n\n", 90000000, 50000000, false, -1, http.StatusOK},
+		{"short first image write", "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]},\"finish_reason\":\"stop\"}]},\"usage\":{\"image_count\":1}}\n\n", 0, 50000000, false, 0, http.StatusOK},
+		{"short second image write", "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]}}]}}\n\ndata: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/second.png\"}]},\"finish_reason\":\"stop\"}]},\"usage\":{\"image_count\":2}}\n\n", 90000000, 100000000, false, 1, http.StatusOK},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var calls atomic.Int32
@@ -2804,7 +2807,7 @@ func TestAsyncTaskNativeStreamSettlesObservedFacts(t *testing.T) {
 				writer = gatewayPrefixOnlyWriter{ResponseRecorder: response, nilError: true, completeWrites: &remaining}
 			}
 			fixture.engine.ServeHTTP(writer, request)
-			require.Equal(t, 200, response.Code, response.Body.String())
+			require.Equal(t, test.status, response.Code, response.Body.String())
 			assert.EqualValues(t, 1, calls.Load())
 			for range 2 {
 				_, err := service.RecoverGatewayTasks(t.Context(), 100)

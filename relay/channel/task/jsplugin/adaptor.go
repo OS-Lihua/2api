@@ -812,6 +812,7 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 		switch {
 		case taskErr == nil:
 		case acceptedStream && relaysSubmitEvents(c) && info.BeginProviderCall != nil:
+			a.keepReservation = true
 			logger.LogWarn(c, common.LogText("task plugin %s has an incomplete submit result; preserving observed usage: %s", a.plugin.Meta.Key, taskErr.Message))
 			immediate := &relaycommon.TaskInfo{Status: model.TaskStatusFailure, Progress: taskcommon.ProgressComplete}
 			if a.submitBusiness.Load() {

@@ -433,6 +433,9 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 		if accepted.Status == model.TaskStatusSuccess || accepted.Status == model.TaskStatusFailure {
 			_ = service.SettleGatewayTask(context.WithoutCancel(parent.Context()), accepted)
 		}
+		if accepted.Status == model.TaskStatusFailure && accepted.PrivateData.Gateway.Stream != nil && !c.Writer.Written() {
+			return nil, &dto.TaskError{StatusCode: http.StatusBadGateway, Code: "task_response_invalid", Message: http.StatusText(http.StatusBadGateway), LocalError: true}
+		}
 		return &taskSubmissionOutcome{Task: accepted, RelayInfo: acceptedInfo}, nil
 	}
 	if upstreamAccepted && pending != nil {
