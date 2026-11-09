@@ -15,6 +15,16 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func mantleModelName(model string) string {
+	if model == "claude-haiku-4-5-20251001" {
+		model = "claude-haiku-4-5"
+	}
+	if strings.HasPrefix(model, "claude-") {
+		model = "anthropic." + model
+	}
+	return model
+}
+
 func mantleRequestURL(info *relaycommon.RelayInfo) (string, error) {
 	return mantleProviderRequestURL(channel.NewProviderMetadata(info))
 }
@@ -70,7 +80,15 @@ func (a *Protocol) newMantleRequest(c *gin.Context, info *relaycommon.RelayInfo,
 	for key, value := range overrides {
 		metadata.RequestHeaders.Set(key, value)
 	}
-	return (&Provider{}).NewMantleRequest(c, metadata, requestBody)
+	payload, err := io.ReadAll(requestBody)
+	if err != nil {
+		return nil, err
+	}
+	payload, err = finalizeAwsClaudeBody(payload, metadata, nil)
+	if err != nil {
+		return nil, err
+	}
+	return (&Provider{}).NewMantleRequest(c, metadata, bytes.NewReader(payload))
 }
 
 func (p *Provider) NewMantleRequest(c *gin.Context, metadata channel.ProviderMetadata, requestBody io.Reader) (*http.Request, error) {
@@ -92,26 +110,9 @@ func (p *Provider) NewMantleRequest(c *gin.Context, metadata channel.ProviderMet
 	if !ojson.GetBytesNoCopy(payload, "@this").IsObject() {
 		return nil, fmt.Errorf("AWS Mantle request must be a JSON object")
 	}
-	// Use the channel's resolved model even for passthrough requests. Do not
-	// apply InvokeModel's version suffixes or automatic cross-region prefixes.
-	model := info.UpstreamModelName
-	if model == "claude-haiku-4-5-20251001" {
-		model = "claude-haiku-4-5"
-	}
-	if strings.HasPrefix(model, "claude-") {
-		model = "anthropic." + model
-	}
-	doc := ojson.NewDoc(payload)
-	for _, key := range []string{"anthropic_version", "anthropic_beta"} {
-		if err := relaycommon.DeleteJSONMember(doc, key); err != nil {
-			return nil, fmt.Errorf("marshal AWS Mantle request: %w", err)
-		}
-	}
-	if err := relaycommon.SetJSONMember(doc, "", "model", model); err != nil {
-		return nil, fmt.Errorf("marshal AWS Mantle request: %w", err)
-	}
-	body := doc.Bytes()
-	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, endpoint, bytes.NewReader(body))
+	// Body finalization precedes route and purchase probes. Sign and send those
+	// exact bytes; transport must not change the model or strip native fields.
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("create AWS Mantle request: %w", err)
 	}
@@ -124,7 +125,7 @@ func (p *Provider) NewMantleRequest(c *gin.Context, metadata channel.ProviderMet
 			req.Host = info.RequestHeaders.Get(key)
 		}
 	}
-	if err := p.SignRequest(req, metadata, body); err != nil {
+	if err := p.SignRequest(req, metadata, payload); err != nil {
 		return nil, err
 	}
 	return req, nil

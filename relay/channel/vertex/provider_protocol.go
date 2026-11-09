@@ -38,7 +38,7 @@ func (p *Provider) FixRequest(c *gin.Context, ctx *channel.ProtocolRequestContex
 		if c != nil {
 			c.Set("request_model", model)
 		}
-		return copyRequest(req, anthropicVersion), nil
+		return &vertexClaudeRequest{Request: req}, nil
 	case protocol.GeminiGenerate:
 		req, ok := request.(*dto.GeminiChatRequest)
 		if !ok || req == nil {

@@ -642,7 +642,7 @@ func TokenAuth() func(c *gin.Context) {
 			key = parts[0]
 		}
 		validateToken := model.ValidateUserToken
-		if TextOffering(c) != nil {
+		if TextOffering(c) != nil || TextOfferingMissing(c) {
 			validateToken = model.ValidateWalletToken
 		}
 		token, err := validateToken(key)

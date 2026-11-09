@@ -32,23 +32,24 @@ var baiduTokenStore sync.Map
 func requestOpenAI2Baidu(request dto.GeneralOpenAIRequest) *BaiduChatRequest {
 	baiduRequest := BaiduChatRequest{
 		Temperature:    request.Temperature,
-		TopP:           lo.FromPtrOr(request.TopP, 0),
-		PenaltyScore:   lo.FromPtrOr(request.FrequencyPenalty, 0),
+		TopP:           request.TopP,
+		PenaltyScore:   request.FrequencyPenalty,
 		Stream:         lo.FromPtrOr(request.Stream, false),
 		DisableSearch:  false,
 		EnableCitation: false,
 		UserId:         request.User,
 	}
-	if request.GetMaxTokens() != 0 {
+	if request.MaxTokens != nil || request.MaxCompletionTokens != nil {
 		maxTokens := int(request.GetMaxTokens())
-		if request.GetMaxTokens() == 1 {
-			maxTokens = 2
-		}
 		baiduRequest.MaxOutputTokens = &maxTokens
 	}
+	var system strings.Builder
 	for _, message := range request.Messages {
 		if message.Role == "system" {
-			baiduRequest.System = message.StringContent()
+			if system.Len() > 0 {
+				system.WriteByte('\n')
+			}
+			system.WriteString(message.StringContent())
 		} else {
 			baiduRequest.Messages = append(baiduRequest.Messages, BaiduMessage{
 				Role:    message.Role,
@@ -56,6 +57,7 @@ func requestOpenAI2Baidu(request dto.GeneralOpenAIRequest) *BaiduChatRequest {
 			})
 		}
 	}
+	baiduRequest.System = system.String()
 	return &baiduRequest
 }
 
@@ -67,6 +69,9 @@ func responseBaidu2OpenAI(response *BaiduChatResponse) *dto.OpenAITextResponse {
 			Content: response.Result,
 		},
 		FinishReason: "stop",
+	}
+	if response.IsTruncated {
+		choice.FinishReason = "length"
 	}
 	fullTextResponse := dto.OpenAITextResponse{
 		Id:      response.Id,
@@ -83,6 +88,9 @@ func streamResponseBaidu2OpenAI(baiduResponse *BaiduChatStreamResponse) *dto.Cha
 	choice.Delta.SetContentString(baiduResponse.Result)
 	if baiduResponse.IsEnd {
 		choice.FinishReason = &constant.FinishReasonStop
+		if baiduResponse.IsTruncated {
+			choice.FinishReason = common.GetPointer("length")
+		}
 	}
 	response := dto.ChatCompletionsStreamResponse{
 		Id:      baiduResponse.Id,
@@ -119,17 +127,40 @@ func embeddingResponseBaidu2OpenAI(response *BaiduEmbeddingResponse) *dto.OpenAI
 
 func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, *dto.Usage) {
 	usage := &dto.Usage{}
+	observeSource := func(data []byte) {
+		if info.ResponseFacts == nil {
+			return
+		}
+		info.ResponseFacts.RecordNativeUsage(usage, data, "usage.prompt_tokens", "usage.completion_tokens")
+		data = relaycommon.SanitizeNativeUsage(data, "usage")
+		_ = info.ResponseFacts.RecordChatUsage(usage, data, "usage")
+		helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(data, "", "result"))
+	}
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+		if info.ResponseFacts != nil {
+			info.StreamStatus.RequireTerminal()
+		}
+		if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil && info.StreamStatus.CompletedNormally() {
+			sr.Error(errors.New("Baidu stream contains data after completion"))
+			return
+		}
+		if info.ResponseFacts != nil {
+			info.ResponseFacts.RecordNativeUsage(usage, []byte(data), "usage.prompt_tokens", "usage.completion_tokens")
+			data = string(relaycommon.SanitizeNativeUsage([]byte(data), "usage"))
+			_ = info.ResponseFacts.RecordChatUsage(usage, []byte(data), "usage")
+		}
 		var baiduResponse BaiduChatStreamResponse
 		if err := common.Unmarshal([]byte(data), &baiduResponse); err != nil {
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource([]byte(data), "", "result"))
 			common.SysLog(common.LogText("error unmarshalling stream response: %s", err.Error()))
 			sr.Error(err)
 			return
 		}
 		if info.ResponseFacts != nil {
-			info.StreamStatus.RequireTerminal()
-			prompt, completion := relaycommon.ChatUsagePresence([]byte(data))
-			info.ResponseFacts.RecordUsage(usage, &baiduResponse.Usage, prompt, completion)
+			if err := info.ResponseFacts.RecordChatUsage(usage, []byte(data), "usage"); err != nil {
+				sr.Error(err)
+				return
+			}
 			if baiduResponse.ErrorMsg != "" || baiduResponse.ErrorCode != 0 {
 				info.StreamStatus.MarkFailed(fmt.Sprintf("baidu:%d", baiduResponse.ErrorCode), "upstream_error", 0)
 				sr.Stop(fmt.Errorf("Baidu stream failed"))
@@ -147,9 +178,15 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 		}
 		if baiduResponse.IsEnd {
 			info.StreamStatus.MarkCompleted()
-			sr.Done()
+			if info.ResponseFacts == nil || info.ResponseFacts.OnBusinessOutput == nil {
+				sr.Done()
+			}
 		}
-	})
+	}, func(data string) { observeSource([]byte(data)) })
+	if info.ResponseFacts != nil && len(info.ResponseFacts.UnterminatedStreamData) > 0 {
+		observeSource(info.ResponseFacts.UnterminatedStreamData)
+		info.ResponseFacts.UnterminatedStreamData = nil
+	}
 	service.CloseResponseBodyGracefully(resp)
 	helper.EstimateMissingChatUsage(c, info, usage)
 	return nil, usage
@@ -157,18 +194,35 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 
 func baiduHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, *dto.Usage) {
 	var baiduResponse BaiduChatResponse
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
-	}
+	responseBody, readErr := io.ReadAll(resp.Body)
 	service.CloseResponseBodyGracefully(resp)
-	err = common.Unmarshal(responseBody, &baiduResponse)
-	if err != nil {
-		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
+	var knownUsage *dto.Usage
+	if info.ResponseFacts != nil {
+		knownUsage = &baiduResponse.Usage
+		info.ResponseFacts.RecordNativeUsage(knownUsage, responseBody, "usage.prompt_tokens", "usage.completion_tokens")
+		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "usage")
+		_ = info.ResponseFacts.RecordChatUsage(knownUsage, responseBody, "usage")
 	}
 	if info.ResponseFacts != nil {
-		prompt, completion := relaycommon.ChatUsagePresence(responseBody)
-		info.ResponseFacts.RecordUsage(&baiduResponse.Usage, &baiduResponse.Usage, prompt, completion)
+		info.ResponseFacts.RecordNativeTextSource(responseBody, "", "result", info.TokenizerModelName())
+	}
+	err := common.Unmarshal(responseBody, &baiduResponse)
+	if err != nil {
+		if readErr != nil {
+			return types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed), knownUsage
+		}
+		return types.NewError(err, types.ErrorCodeBadResponseBody), knownUsage
+	}
+	if info.ResponseFacts != nil {
+		if err := info.ResponseFacts.RecordChatUsage(&baiduResponse.Usage, responseBody, "usage"); err != nil {
+			return types.NewError(err, types.ErrorCodeBadResponseBody), nil
+		}
+	}
+	if readErr != nil {
+		if info.ResponseFacts != nil {
+			info.ResponseFacts.RecordChatSource(responseBaidu2OpenAI(&baiduResponse), info.TokenizerModelName())
+		}
+		return types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed), knownUsage
 	}
 	if baiduResponse.ErrorMsg != "" || baiduResponse.ErrorCode != 0 {
 		if info.ResponseFacts != nil {
