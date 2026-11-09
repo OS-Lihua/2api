@@ -4404,7 +4404,6 @@ func TestTextGatewayNativeModelNotFoundIsDistinctFromUnknownPath(t *testing.T) {
 func newMediaGatewayFixture(t *testing.T, kind protocol.Type, upstream http.HandlerFunc) textGatewayFixture {
 	t.Helper()
 	fixture := newTextGatewayFixture(t, upstream)
-	SetTaskPluginProtocolRouter(fixture.engine)
 	require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", kind).Error)
 	var unified model.Model
 	require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
@@ -6721,6 +6720,8 @@ func TestMediaGatewaySpeechReportedDurationRemainsIndependent(t *testing.T) {
 		failure, pending, audit, reported bool
 	}{
 		{"error scalar output zero", "json", "", "", 0, true, false, false, false},
+		{"short JSON scalar output zero", "json-short", "", "", 0, true, false, false, false},
+		{"SSE error scalar output zero", "sse-error", "", "0", 0, true, false, false, false},
 		{"header zero", "header", "0", "0", 0, false, false, false, false},
 		{"header fractional", "header", "0.25", "0.25", 17, false, false, false, false},
 		{"header longer", "header", "2", "2", 33, false, false, false, false},
@@ -6752,9 +6753,16 @@ func TestMediaGatewaySpeechReportedDurationRemainsIndependent(t *testing.T) {
 						usage = `,"usage":{"input_tokens":0,"output_tokens":1000}`
 					}
 					_, _ = fmt.Fprintf(w, "data: {\"type\":\"speech.audio.delta\",\"audio\":%q}\n\ndata: {\"type\":\"speech.audio.done\",\"duration\":%s%s}\n\ndata: [DONE]\n\n", base64.StdEncoding.EncodeToString(audio), tc.value, usage)
-				case "json":
+				case "json", "json-short":
 					w.Header().Set("Content-Type", "application/json")
-					_, _ = io.WriteString(w, `{"error":{"code":"rate_limit_exceeded"},"usage":{"output_tokens":0}}`)
+					body := `{"error":{"code":"rate_limit_exceeded"},"usage":{"output_tokens":0}}`
+					if tc.where == "json-short" {
+						w.Header().Set("Content-Length", strconv.Itoa(len(body)+1))
+					}
+					_, _ = io.WriteString(w, body)
+				case "sse-error":
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "data: {\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\"},\"usage\":{\"output_tokens\":0}}\n\n")
 				case "native":
 					w.Header().Set("Content-Type", "application/json")
 					code := 3000
@@ -6776,7 +6784,7 @@ func TestMediaGatewaySpeechReportedDurationRemainsIndependent(t *testing.T) {
 				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
 			}
 			format := "audio"
-			if tc.where == "sse" {
+			if strings.HasPrefix(tc.where, "sse") {
 				format = "sse"
 			}
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", fmt.Sprintf(`{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm","stream_format":%q}`, format))
