@@ -5079,6 +5079,11 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 		purchase                                         *model.GatewayUsage
 		cozePollBody, cozeCreateBody, purchaseExpression string
 	}{
+		{name: "OpenAI reasoning alias survives JSON read error", provider: constant.ChannelTypeOpenAI, shortBody: true, body: `{"choices":[{"message":{"role":"assistant","content":null,"reasoning_content":null,"reasoning":"Hello"},"finish_reason":"stop"}]}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 2000},
+		{name: "OpenAI reasoning alias survives JSON DTO error", provider: constant.ChannelTypeOpenAI, body: `{"id":{},"choices":[{"message":{"role":"assistant","content":null,"reasoning_content":null,"reasoning":"Hello"},"finish_reason":"stop"}]}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 2000},
+		{name: "OpenAI reasoning alias empty primary stays authoritative", provider: constant.ChannelTypeOpenAI, shortBody: true, body: `{"choices":[{"message":{"role":"assistant","content":null,"reasoning_content":"","reasoning":"Hello"},"finish_reason":"stop"}]}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`},
+		{name: "OpenAI reasoning alias survives invalid JSON primary", provider: constant.ChannelTypeOpenAI, body: `{"choices":[{"message":{"role":"assistant","content":null,"reasoning_content":{},"reasoning":"Hello"},"finish_reason":"stop"}]}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 2000},
+		{name: "OpenAI reasoning alias survives invalid SSE primary", provider: constant.ChannelTypeOpenAI, stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":{},\"reasoning\":\"Hello\"}}]}\n\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 2000},
 		{name: "Dify malformed cache JSON preserves independent counters", provider: constant.ChannelTypeDify, body: `{"answer":{},"metadata":{"usage":{"prompt_tokens_details":{"cached_tokens":1000}}}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1000000, purchaseExpression: `tier("cache",cr*1)`},
 		{name: "Baidu malformed cache JSON preserves independent counters", provider: constant.ChannelTypeBaidu, key: "cache-json-malformed-baidu|test-secret", body: `{"result":{},"usage":{"prompt_tokens_details":{"cached_tokens":1000}}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1000000, purchaseExpression: `tier("cache",cr*1)`},
 		{name: "Zhipu malformed cache JSON preserves independent counters", provider: constant.ChannelTypeZhipu, key: "test.secret", body: `{"success":{},"data":{"usage":{"prompt_tokens_details":{"cached_tokens":1000}}}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1000000, purchaseExpression: `tier("cache",cr*1)`},
@@ -11263,6 +11268,56 @@ func TestTextGatewayCumulativeResponseSourceIsBounded(t *testing.T) {
 	}
 }
 
+func TestTextGatewayNativeRepairPreservesDiagnosticBaseline(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		topP, wireTopP float64
+		allow          bool
+	}{
+		{"strict rewrite", 1, 0.99, false}, {"accepted rewrite", 1, 0.99, true}, {"explicit zero", 0, 0, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				var body struct {
+					TopP *float64 `json:"top_p"`
+				}
+				require.NoError(t, common.DecodeJson(r.Body, &body))
+				require.NotNil(t, body.TopP)
+				assert.Equal(t, test.wireTopP, *body.TopP)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"success":true,"data":{"choices":[{"role":"assistant","content":"Hello"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}}`)
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeZhipu, "key": "test.secret"}).Error)
+			if test.allow {
+				fixture.offering.AcceptedConversionLosses = []string{"request_parameter_dropped"}
+				require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", fmt.Sprintf(`{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"top_p":%g}`, test.topP))
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+			require.NoError(t, err)
+			if test.topP == 1 && !test.allow {
+				assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+				assert.Contains(t, response.Body.String(), "top_p")
+				assert.Zero(t, calls)
+				assert.Zero(t, total)
+				return
+			}
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Equal(t, 1, calls)
+			require.EqualValues(t, 1, total)
+			if test.allow {
+				assert.Equal(t, "request_parameter_dropped", response.Header().Get("X-Gateway-Conversion-Loss"))
+				assert.Equal(t, []string{"request_parameter_dropped"}, attempts[0].ConversionLosses)
+			} else {
+				assert.Empty(t, response.Header().Get("X-Gateway-Conversion-Loss"))
+				assert.Empty(t, attempts[0].ConversionLosses)
+			}
+		})
+	}
+}
+
 func TestTextGatewayNativeComposerReturnsParameterReasons(t *testing.T) {
 	for _, test := range []struct {
 		field, extra                       string
@@ -12710,6 +12765,7 @@ func TestTextGatewayJSONAndStreamUsage(t *testing.T) {
 		{name: "SSE missing usage", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", status: "success", source: "estimated", prompt: 9, completion: 1, receivable: 19800, cost: 11000},
 		{name: "JSON explicit zero input estimates only output", body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0}}`, status: "success", source: "estimated", completion: 1, receivable: 3600, cost: 2000},
 		{name: "JSON explicit zero output estimates only input", body: `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"completion_tokens":0}}`, status: "success", source: "estimated", prompt: 9, receivable: 16200, cost: 9000},
+		{name: "JSON null primary reasoning falls back", body: `{"choices":[{"message":{"role":"assistant","content":null,"reasoning_content":null,"reasoning":"Hello"},"finish_reason":"stop"}]}`, status: "success", source: "estimated", prompt: 9, completion: 1, receivable: 19800, cost: 11000},
 		{name: "JSON reasoning is generated output", body: `{"choices":[{"message":{"role":"assistant","reasoning_content":"Hello"},"finish_reason":"stop"}]}`, status: "success", source: "estimated", prompt: 9, completion: 1, receivable: 19800, cost: 11000},
 		{name: "SSE null primary reasoning falls back", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null,\"reasoning\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", status: "success", source: "estimated", prompt: 9, completion: 2, receivable: 23400, cost: 13000},
 		{name: "SSE null primary reasoning alone is business", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null,\"reasoning\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", status: "success", source: "estimated", prompt: 9, completion: 1, receivable: 19800, cost: 11000},

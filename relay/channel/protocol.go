@@ -162,6 +162,13 @@ func (p *WireProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInf
 		return nil, err
 	}
 	publicChat, _ := converted.(*dto.GeneralOpenAIRequest)
+	if managed && p.Kind == protocol.OpenAIChat && !p.PublicResponse && publicChat != nil {
+		// Keep the diagnostic baseline independent of native request repairs.
+		publicChat, err = common.DeepCopy(publicChat)
+		if err != nil {
+			return nil, err
+		}
+	}
 	mode := info.RelayMode
 	info.RelayMode = p.relayMode(info)
 	defer func() { info.RelayMode = mode }()

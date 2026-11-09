@@ -120,11 +120,7 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 					sourceOutput.text.WriteString(relaycommon.SourceText(part.Get("text")))
 				}
 			}
-			reasoning := message.Get("reasoning_content")
-			if !reasoning.Exists() {
-				reasoning = message.Get("reasoning")
-			}
-			sourceOutput.text.WriteString(relaycommon.SourceText(reasoning))
+			sourceOutput.text.WriteString(relaycommon.SourceReasoningText(message))
 			sourceOutput.text.WriteString(relaycommon.SourceText(message.Get("refusal")))
 			sourceOutput.text.WriteString(relaycommon.SourceText(message.Get("audio.transcript")))
 			sourceOutput.text.WriteString(relaycommon.SourceText(message.Get("function_call.name")))

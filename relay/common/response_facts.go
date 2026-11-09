@@ -34,15 +34,22 @@ func SourceText(value gjson.Result) string {
 	return text
 }
 
+// SourceReasoningText preserves an explicit empty primary and recovers a complete alias.
+func SourceReasoningText(message gjson.Result) string {
+	if value := message.Get("reasoning_content"); value.Type == gjson.String {
+		var text string
+		if common.UnmarshalJsonStr(value.Raw, &text) == nil {
+			return text
+		}
+	}
+	return SourceText(message.Get("reasoning"))
+}
+
 // ChatStreamChoiceBusinessText preserves the content within one independent output.
 func ChatStreamChoiceBusinessText(choice gjson.Result) string {
 	var text strings.Builder
 	text.WriteString(SourceText(choice.Get("delta.content")))
-	if reasoning := choice.Get("delta.reasoning_content"); reasoning.Exists() && reasoning.Type != gjson.Null {
-		text.WriteString(SourceText(reasoning))
-	} else {
-		text.WriteString(SourceText(choice.Get("delta.reasoning")))
-	}
+	text.WriteString(SourceReasoningText(choice.Get("delta")))
 	text.WriteString(SourceText(choice.Get("delta.refusal")))
 	text.WriteString(SourceText(choice.Get("delta.audio.transcript")))
 	text.WriteString(SourceText(choice.Get("delta.function_call.name")))
