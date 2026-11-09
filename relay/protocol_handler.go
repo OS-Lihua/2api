@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -21,6 +23,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	kitreasoning "github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/net/http/httpguts"
 )
@@ -80,6 +83,13 @@ func (a *ChannelAdaptor) ConvertRequest(c *gin.Context, info *relaycommon.RelayI
 	return converted, err
 }
 
+func (a *ChannelAdaptor) FinalizeChatRequest(c *gin.Context, info *relaycommon.RelayInfo, converted any, body []byte) ([]byte, error) {
+	if finalizer, ok := converted.(channel.ChatRequestFinalizer); ok {
+		return finalizer.FinalizeChatRequest(c, info, body)
+	}
+	return body, nil
+}
+
 // PrepareChatRequest runs selected native preparation after the caller reserves
 // funds and freezes purchase prices, before final body/header probes are taken.
 func (a *ChannelAdaptor) PrepareChatRequest(c *gin.Context, info *relaycommon.RelayInfo, converted any, body []byte) ([]byte, error) {
@@ -89,9 +99,39 @@ func (a *ChannelAdaptor) PrepareChatRequest(c *gin.Context, info *relaycommon.Re
 	return body, nil
 }
 
-func (a *ChannelAdaptor) ProjectChatRequest(info *relaycommon.RelayInfo, converted any, public *dto.GeneralOpenAIRequest, body []byte) (*dto.GeneralOpenAIRequest, error) {
+func (a *ChannelAdaptor) ProjectChatRequest(c *gin.Context, info *relaycommon.RelayInfo, converted any, public *dto.GeneralOpenAIRequest, body []byte) (*dto.GeneralOpenAIRequest, error) {
+	if projector, ok := converted.(channel.NativeRequestProjector); ok {
+		request, err := projector.ProjectNativeRequest(body)
+		if err != nil {
+			return nil, err
+		}
+		request.SetModelName(info.UpstreamModelName)
+		effective, err := service.GatewayChatProjection(c, request)
+		if err != nil {
+			return nil, err
+		}
+		effective.Model = info.UpstreamModelName
+		effective.Stream = common.GetPointer(info.IsStream)
+		return effective, nil
+	}
+	if contract, ok := converted.(channel.NativeChatRequestContract); ok {
+		var err error
+		public, err = channel.ProjectNativeChatParameters(body, *public, converted, contract.ChatRequestCapabilities())
+		if err != nil {
+			return nil, err
+		}
+	}
 	if projector, ok := converted.(channel.ChatRequestProjector); ok {
-		return projector.ProjectChatRequest(body, *public)
+		effective, err := projector.ProjectChatRequest(body, *public)
+		if err != nil {
+			return nil, err
+		}
+		if contract, ok := converted.(channel.NativeChatRequestContract); ok && effective.N != nil && *effective.N > 1 {
+			if info.IsStream || !slices.Contains(contract.ChatRequestCapabilities().Parameters, "n") {
+				return nil, errors.New("native Provider cannot represent multiple output choices (n)")
+			}
+		}
+		return effective, nil
 	}
 	switch converted.(type) {
 	case dto.GeneralOpenAIRequest, *dto.GeneralOpenAIRequest:
@@ -99,38 +139,42 @@ func (a *ChannelAdaptor) ProjectChatRequest(info *relaycommon.RelayInfo, convert
 		if err := common.Unmarshal(body, &effective); err != nil {
 			return nil, err
 		}
-		return &effective, nil
+		return service.GatewayChatProjection(c, &effective)
 	}
-	if len(info.ParamOverride) > 0 {
-		return nil, errors.New("native request overrides require a wire projection")
-	}
-	// An unchanged native conversion retains the public input facts while its
-	// output budget is read from the final protocol body.
-	effective := *public
+	var native dto.Request
 	switch converted.(type) {
-	case dto.ClaudeRequest, *dto.ClaudeRequest:
-		var wire dto.ClaudeRequest
-		if err := common.Unmarshal(body, &wire); err != nil {
-			return nil, err
-		}
-		effective.MaxTokens, effective.MaxCompletionTokens = nil, wire.MaxTokens
-	case dto.OpenAIResponsesRequest, *dto.OpenAIResponsesRequest:
-		var wire dto.OpenAIResponsesRequest
-		if err := common.Unmarshal(body, &wire); err != nil {
-			return nil, err
-		}
-		effective.MaxTokens, effective.MaxCompletionTokens = nil, wire.MaxOutputTokens
-	case dto.GeminiChatRequest, *dto.GeminiChatRequest:
-		var wire dto.GeminiChatRequest
-		if err := common.Unmarshal(body, &wire); err != nil {
-			return nil, err
-		}
-		effective.MaxTokens, effective.MaxCompletionTokens = nil, wire.GenerationConfig.MaxOutputTokens
+	case *dto.OpenAIResponsesRequest, dto.OpenAIResponsesRequest:
+		native = &dto.OpenAIResponsesRequest{}
+	case *dto.ClaudeRequest, dto.ClaudeRequest:
+		native = &dto.ClaudeRequest{}
+	case *dto.GeminiChatRequest, dto.GeminiChatRequest:
+		native = &dto.GeminiChatRequest{}
 	}
-	return &effective, nil
+	if native != nil {
+		if err := common.Unmarshal(body, native); err != nil {
+			return nil, err
+		}
+		effective, err := service.GatewayChatProjection(c, native)
+		if err != nil {
+			return nil, err
+		}
+		if _, gemini := native.(*dto.GeminiChatRequest); gemini {
+			effective.Model = info.UpstreamModelName
+			effective.Stream = common.GetPointer(info.IsStream)
+		}
+		return effective, nil
+	}
+	return nil, errors.New("native request requires an effective wire projection")
 }
 
 func (a *ChannelAdaptor) SetChatOutputLimit(converted any, body []byte, limit uint) ([]byte, error) {
+	if projector, ok := converted.(channel.NativeRequestProjector); ok {
+		request, err := projector.ProjectNativeRequest(body)
+		if err != nil {
+			return nil, err
+		}
+		return a.SetChatOutputLimit(request, body, limit)
+	}
 	if setter, ok := converted.(channel.ChatOutputLimitSetter); ok {
 		return setter.SetChatOutputLimit(body, limit)
 	}
@@ -162,7 +206,7 @@ func (a *ChannelAdaptor) SetChatOutputLimit(converted any, body []byte, limit ui
 	case dto.GeminiChatRequest, *dto.GeminiChatRequest:
 		field = "generationConfig"
 	default:
-		return body, nil
+		return nil, errors.New("native request cannot enforce the output limit")
 	}
 	var wire map[string]common.RawMessage
 	if err := common.Unmarshal(body, &wire); err != nil {
@@ -274,6 +318,20 @@ type PreparedChannelRequest struct {
 
 func (r *PreparedChannelRequest) Headers() http.Header { return r.request.Header.Clone() }
 
+var nativeWebSocketCredentialHeaders = []string{"Authorization", "X-API-Key", "X-Goog-API-Key", "Mj-API-Secret", "Cookie", "Proxy-Authorization", "Sec-WebSocket-Protocol"}
+
+// SanitizeNativeClientHeaders copies client metadata without gateway credentials.
+// Apply it before evaluating header operations or Provider templates.
+func SanitizeNativeClientHeaders(headers map[string]string) map[string]string {
+	clean := maps.Clone(headers)
+	for name := range clean {
+		if slices.ContainsFunc(nativeWebSocketCredentialHeaders, func(credential string) bool { return strings.EqualFold(name, credential) }) {
+			delete(clean, name)
+		}
+	}
+	return clean
+}
+
 // PrepareNativeWebSocketRequest composes the selected Provider account with
 // the native wire protocol and the existing WebSocket dialer. Client credentials
 // are removed after authentication, before Provider header templates run.
@@ -288,8 +346,8 @@ func PrepareNativeWebSocketRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 	providerContext := c.Copy()
 	providerContext.Request = c.Request.Clone(c.Request.Context())
 	providerContext.Request.Method = http.MethodGet
-	credentialHeaders := []string{"Authorization", "X-API-Key", "X-Goog-API-Key", "Mj-API-Secret", "Cookie", "Proxy-Authorization", "Sec-WebSocket-Protocol"}
 	transportInfo := *info
+	transportInfo.RequestHeaders = SanitizeNativeClientHeaders(info.RequestHeaders)
 	providerMetadata := *info.ProviderMeta
 	headers := relaycommon.GetEffectiveHeaderOverride(info)
 	for name, value := range headers {
@@ -297,7 +355,7 @@ func PrepareNativeWebSocketRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 		if !ok {
 			continue
 		}
-		for _, credential := range credentialHeaders {
+		for _, credential := range nativeWebSocketCredentialHeaders {
 			if strings.EqualFold(strings.TrimSpace(template), "{client_header:"+credential+"}") {
 				delete(headers, name)
 				break
@@ -307,7 +365,7 @@ func PrepareNativeWebSocketRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 	providerMetadata.HeadersOverride = headers
 	transportInfo.ProviderMeta = &providerMetadata
 	transportInfo.UseRuntimeHeadersOverride, transportInfo.RuntimeHeadersOverride = true, headers
-	for _, name := range credentialHeaders {
+	for _, name := range nativeWebSocketCredentialHeaders {
 		providerContext.Request.Header.Del(name)
 	}
 	providerContext.Request.URL.RawQuery = ""

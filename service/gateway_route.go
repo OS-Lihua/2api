@@ -421,13 +421,22 @@ func NativeItemUsesTools(kind string) bool {
 // GatewayResponsesCapabilitiesFailure identifies the first unsupported native parameter.
 func GatewayResponsesCapabilitiesFailure(request *dto.OpenAIResponsesRequest, caps capability.Set, inputTokens int, nativeModalities ...bool) *GatewayParameterError {
 	projection := &dto.GeneralOpenAIRequest{Model: request.Model, Stream: common.GetPointer(true), MaxCompletionTokens: request.MaxOutputTokens}
+	for _, part := range request.ParseInput() {
+		if part.Type == "input_text" && part.Text != "" {
+			projection.RequiresTextInput = true
+			break
+		}
+	}
+	if instructions := string(request.Instructions); instructions != "" && instructions != "null" && instructions != `""` {
+		projection.RequiresTextInput = true
+	}
 	toolPath := "tools"
 	if len(request.Tools) > 0 && string(request.Tools) != "[]" && string(request.Tools) != "null" {
-		projection.Tools = make([]dto.ToolCallRequest, 1)
+		projection.RequiresToolCalling = true
 	} else {
 		for i, item := range ojson.GetBytes(request.Input, "@this").Array() {
 			if NativeItemUsesTools(item.Get("type").String()) || item.Get("role").String() == "tool" {
-				projection.Tools = make([]dto.ToolCallRequest, 1)
+				projection.RequiresToolCalling = true
 				toolPath = fmt.Sprintf("input[%d].type", i)
 				break
 			}
@@ -678,7 +687,7 @@ func gatewayCapabilitiesFailure(request *dto.GeneralOpenAIRequest, caps capabili
 	if request.Stream != nil && *request.Stream && !slices.Contains(caps.Features, capability.Streaming) {
 		return &GatewayParameterError{Path: "stream", Reason: "Streaming is not supported on this channel"}
 	}
-	tools := len(request.Tools) > 0 || len(request.Functions) > 0
+	tools := request.RequiresToolCalling || len(request.Tools) > 0 || len(request.Functions) > 0
 	for _, message := range request.Messages {
 		tools = tools || len(message.Tools) > 0 || len(message.ParseToolCalls()) > 0 || message.Role == "tool"
 	}
@@ -691,6 +700,13 @@ func gatewayCapabilitiesFailure(request *dto.GeneralOpenAIRequest, caps capabili
 	if request.ResponseFormat != nil && request.ResponseFormat.Type != "" && request.ResponseFormat.Type != "text" && !slices.Contains(caps.Features, capability.StructuredOutput) {
 		return &GatewayParameterError{Path: "response_format", Reason: "Structured output is not supported on this channel"}
 	}
+	for messageIndex, message := range request.Messages {
+		for contentIndex, part := range message.ParseContent() {
+			if len(part.CacheControl) > 0 && string(part.CacheControl) != "null" && !slices.Contains(caps.Features, capability.Caching) {
+				return &GatewayParameterError{Path: fmt.Sprintf("messages[%d].content[%d].cache_control", messageIndex, contentIndex), Reason: "Prompt caching is not supported on this channel"}
+			}
+		}
+	}
 	if (request.PromptCacheKey != "" || len(request.PromptCacheOptions) > 0 || len(request.PromptCacheRetention) > 0) && !slices.Contains(caps.Features, capability.Caching) {
 		path := "prompt_cache_key"
 		if len(request.PromptCacheOptions) > 0 {
@@ -701,12 +717,22 @@ func gatewayCapabilitiesFailure(request *dto.GeneralOpenAIRequest, caps capabili
 		}
 		return &GatewayParameterError{Path: path, Reason: "Prompt caching is not supported on this channel"}
 	}
-	if (len(nativeModalities) == 0 || !nativeModalities[0]) && (!slices.Contains(caps.InputModalities, capability.Text) || !slices.Contains(caps.OutputModalities, capability.Text)) {
+	requiresText := request.RequiresTextInput || request.Prompt != nil || request.Input != nil
+	for _, message := range request.Messages {
+		if message.StringContent() != "" || message.GetReasoningContent() != "" || len(message.ParseToolCalls()) > 0 {
+			requiresText = true
+			break
+		}
+	}
+	if requiresText && !slices.Contains(caps.InputModalities, capability.Text) {
 		return &GatewayParameterError{Path: "messages", Reason: "Input or output text is not supported on this channel"}
 	}
 	var outputs []capability.Modality
 	if len(request.Modalities) > 0 && common.Unmarshal(request.Modalities, &outputs) != nil {
 		return &GatewayParameterError{Path: "modalities", Reason: "Invalid output modalities"}
+	}
+	if len(outputs) == 0 && (len(nativeModalities) == 0 || !nativeModalities[0]) {
+		outputs = []capability.Modality{capability.Text}
 	}
 	for _, output := range outputs {
 		if !slices.Contains(caps.OutputModalities, output) {
@@ -716,6 +742,9 @@ func gatewayCapabilitiesFailure(request *dto.GeneralOpenAIRequest, caps capabili
 	images := int64(0)
 	for _, file := range request.GetTokenCountMeta().Files {
 		modality := capability.PDF
+		if file.Source != nil && request.NativeTextReferences[file.Source.GetRawData()] {
+			modality = capability.Text
+		}
 		switch file.FileType {
 		case types.FileTypeImage:
 			modality = capability.Image

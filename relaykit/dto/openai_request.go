@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -134,6 +135,10 @@ type GeneralOpenAIRequest struct {
 
 	// Internal conversion state; never serialized to an upstream protocol.
 	ReasoningConversion *ReasoningConversionState `json:"-"`
+	RequiresTextInput   bool                      `json:"-"`
+	// NativeTextReferences identifies Provider-owned text files in validation projections.
+	NativeTextReferences map[string]bool `json:"-"`
+	RequiresToolCalling  bool            `json:"-"`
 }
 
 func (r GeneralOpenAIRequest) MarshalJSON() ([]byte, error) {
@@ -225,7 +230,7 @@ func (r *GeneralOpenAIRequest) GetTokenCountMeta() *types.TokenCountMeta {
 				dynamicTools = append(dynamicTools, messageTools...)
 			}
 		}
-		if message.Content != nil {
+		if message.Content != nil || message.Refusal != nil {
 			if message.Name != nil {
 				tokenCountMeta.NameCount++
 				texts = append(texts, *message.Name)
@@ -498,6 +503,7 @@ type Message struct {
 	Prefix           *bool           `json:"prefix,omitempty"`
 	ReasoningContent *string         `json:"reasoning_content,omitempty"`
 	Reasoning        *string         `json:"reasoning,omitempty"`
+	Refusal          *string         `json:"refusal,omitempty"`
 	ToolCalls        json.RawMessage `json:"tool_calls,omitempty"`
 	ToolCallId       string          `json:"tool_call_id,omitempty"`
 	// Tools carries Kimi K3 dynamic tool loading declarations on a system message.
@@ -694,26 +700,25 @@ func (m *Message) SetToolCalls(toolCalls any) {
 }
 
 func (m *Message) StringContent() string {
+	if m.Refusal != nil && *m.Refusal != "" {
+		copy := *m
+		copy.Refusal = nil
+		return copy.StringContent() + *m.Refusal
+	}
 	switch m.Content.(type) {
 	case string:
 		return m.Content.(string)
-	case []any:
+	default:
+		content := *m
+		content.parsedContent = nil
 		var contentStr strings.Builder
-		for _, contentItem := range m.Content.([]any) {
-			contentMap, ok := contentItem.(map[string]any)
-			if !ok {
-				continue
-			}
-			if contentMap["type"] == ContentTypeText {
-				if subStr, ok := contentMap["text"].(string); ok {
-					contentStr.WriteString(subStr)
-				}
+		for _, part := range content.ParseContent() {
+			if part.Type == ContentTypeText {
+				contentStr.WriteString(part.Text)
 			}
 		}
 		return contentStr.String()
 	}
-
-	return ""
 }
 
 func (m *Message) SetNullContent() {
@@ -740,6 +745,11 @@ func (m *Message) IsStringContent() bool {
 }
 
 func (m *Message) ParseContent() []MediaContent {
+	if m.Refusal != nil && *m.Refusal != "" {
+		copy := *m
+		copy.Refusal = nil
+		return append(slices.Clone(copy.ParseContent()), MediaContent{Type: ContentTypeText, Text: *m.Refusal})
+	}
 	if m.Content == nil {
 		return nil
 	}
@@ -788,6 +798,7 @@ func (m *Message) ParseContent() []MediaContent {
 			continue
 		}
 
+		firstMedia := len(contentList)
 		switch contentType {
 		case ContentTypeText:
 			if text, ok := contentItem["text"].(string); ok {
@@ -867,6 +878,14 @@ func (m *Message) ParseContent() []MediaContent {
 						Url: videoUrl,
 					},
 				})
+			}
+		}
+		if control, exists := contentItem["cache_control"]; exists {
+			encoded, err := kitutil.Marshal(control)
+			if err == nil {
+				for index := firstMedia; index < len(contentList); index++ {
+					contentList[index].CacheControl = encoded
+				}
 			}
 		}
 	}

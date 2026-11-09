@@ -90,6 +90,7 @@ type ChatCompletionsStreamResponseChoiceDelta struct {
 	Content          *string            `json:"content,omitempty"`
 	ReasoningContent *string            `json:"reasoning_content,omitempty"`
 	Reasoning        *string            `json:"reasoning,omitempty"`
+	Refusal          *string            `json:"refusal,omitempty"`
 	Role             string             `json:"role,omitempty"`
 	ToolCalls        []ToolCallResponse `json:"tool_calls,omitempty"`
 	// Annotations is an OpenAI-compatible streaming extension supported by
@@ -103,10 +104,14 @@ func (c *ChatCompletionsStreamResponseChoiceDelta) SetContentString(s string) {
 }
 
 func (c *ChatCompletionsStreamResponseChoiceDelta) GetContentString() string {
-	if c.Content == nil {
-		return ""
+	var text string
+	if c.Content != nil {
+		text = *c.Content
 	}
-	return *c.Content
+	if c.Refusal != nil {
+		text += *c.Refusal
+	}
+	return text
 }
 
 func (c *ChatCompletionsStreamResponseChoiceDelta) GetReasoningContent() string {
@@ -574,15 +579,34 @@ func ResponsesArgumentsString(arguments json.RawMessage) string {
 }
 
 type ResponsesOutputContent struct {
-	Type        string `json:"type"`
-	Text        string `json:"text"`
-	Refusal     string `json:"refusal,omitempty"`
-	Annotations []any  `json:"annotations"`
+	Type        string  `json:"type"`
+	Text        string  `json:"text"`
+	Annotations []any   `json:"annotations"`
+	Refusal     *string `json:"refusal,omitempty"`
+}
+
+func (c ResponsesOutputContent) GetText() string {
+	if c.Type == "refusal" && c.Refusal != nil {
+		return *c.Refusal
+	}
+	return c.Text
+}
+
+func (c ResponsesOutputContent) MarshalJSON() ([]byte, error) {
+	if c.Type == "refusal" {
+		return kitutil.Marshal(struct {
+			Type    string  `json:"type"`
+			Refusal *string `json:"refusal"`
+		}{Type: c.Type, Refusal: c.Refusal})
+	}
+	type content ResponsesOutputContent
+	return kitutil.Marshal(content(c))
 }
 
 type ResponsesReasoningSummaryPart struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type    string  `json:"type"`
+	Text    string  `json:"text"`
+	Refusal *string `json:"refusal,omitempty"`
 }
 
 const (
@@ -617,6 +641,7 @@ type ResponsesStreamResponse struct {
 	Input           *string                  `json:"input,omitempty"`
 	Name            string                   `json:"name,omitempty"`
 	Text            *string                  `json:"text,omitempty"`
+	Refusal         *string                  `json:"refusal,omitempty"`
 	Item            *ResponsesOutput         `json:"item,omitempty"`
 	SequenceNumber  *int                     `json:"sequence_number,omitempty"`
 	Annotation      json.RawMessage          `json:"annotation,omitempty"`

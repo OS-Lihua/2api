@@ -43,7 +43,7 @@ func (info *RelayInfo) RecordConversionDiagnostics(ctx context.Context, diagnost
 		if _, exists := info.conversionDiagnosticKeys[key]; exists {
 			continue
 		}
-		if len(info.conversionDiagnostics) >= maxConversionDiagnostics {
+		if info.ResponseFacts == nil && len(info.conversionDiagnostics) >= maxConversionDiagnostics {
 			if !info.conversionDiagnosticsTruncated {
 				info.conversionDiagnosticsTruncated = true
 				logger.LogWarn(ctx, common.LogText("conversion diagnostics truncated after %d distinct entries", maxConversionDiagnostics))

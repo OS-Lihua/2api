@@ -1,6 +1,35 @@
 package palm
 
-import "github.com/QuantumNous/new-api/relaykit/dto"
+import (
+	"fmt"
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+)
+
+func (*PaLMChatRequest) ChatRequestCapabilities() channel.NativeChatCapabilities {
+	return channel.NativeChatCapabilities{Parameters: []string{"temperature", "top_p", "top_k", "n"}, ContentTypes: []string{dto.ContentTypeText}}
+}
+
+func (*PaLMChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error) {
+	var wire PaLMChatRequest
+	if err := common.Unmarshal(body, &wire); err != nil {
+		return nil, err
+	}
+	public.Temperature, public.TopP, public.N = wire.Temperature, wire.TopP, wire.CandidateCount
+	public.TopK = nil
+	if wire.TopK != nil {
+		if *wire.TopK > 1<<31-1 {
+			return nil, fmt.Errorf("invalid PaLM top_k")
+		}
+		public.TopK = common.GetPointer(int(*wire.TopK))
+	}
+	public.Messages = nil
+	for _, message := range wire.Prompt.Messages {
+		public.Messages = append(public.Messages, dto.Message{Role: message.Author, Content: message.Content})
+	}
+	return &public, nil
+}
 
 type PaLMChatMessage struct {
 	Author  string `json:"author"`

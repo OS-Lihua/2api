@@ -75,16 +75,28 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 	if call.Native != nil && len(call.Native.OriginalBody) > 0 {
 		saleInput.Body = call.Native.OriginalBody
 	}
-	prepared, err := call.Prepare(candidate, info)
+	document := ojson.NewDoc(append([]byte(nil), call.Body...))
+	if document.Set("model", info.UpstreamModelName) != nil {
+		return nil, &service.GatewayParameterError{Path: "model", Reason: "Invalid effective WebSocket request"}
+	}
+	incomingHeaders := info.RequestHeaders
+	info.RequestHeaders = relay.SanitizeNativeClientHeaders(incomingHeaders)
+	body, err := relaycommon.ApplyParamOverrideWithRelayInfo(document.Bytes(), info)
+	info.RequestHeaders = incomingHeaders
 	if err != nil {
-		return nil, service.ErrGatewayUnavailable
+		return nil, &service.GatewayParameterError{Path: "parameter_overrides", Reason: "Invalid request parameter overrides"}
 	}
 	purchaseInput := billingexpr.RequestInput{Headers: map[string]string{}}
-	for name, values := range prepared.Headers() {
-		purchaseInput.Headers[strings.ToLower(name)] = strings.Join(values, ",")
-	}
-	result := &gatewayPreparedWebSocket{Context: candidate, Info: info, Transport: prepared}
+	result := &gatewayPreparedWebSocket{Context: candidate, Info: info}
 	if call.Native != nil && call.Native.TransportOnly {
+		prepared, err := call.Prepare(candidate, info)
+		if err != nil {
+			return nil, service.ErrGatewayUnavailable
+		}
+		for name, values := range prepared.Headers() {
+			purchaseInput.Headers[strings.ToLower(name)] = strings.Join(values, ",")
+		}
+		result.Transport = prepared
 		result.InputUsage = &dto.Usage{}
 		result.Facts = service.GatewayRouteFacts{Usage: &dto.Usage{}, SaleInput: saleInput, PurchaseInput: purchaseInput}
 		return result, nil
@@ -109,14 +121,6 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 	}
 	if failure := service.GatewayResponsesCapabilitiesFailure(&call.Request, selection.Capabilities, originalTokens, call.Protocol() == protocol.OpenAIRealtime); failure != nil {
 		return nil, failure
-	}
-	document := ojson.NewDoc(append([]byte(nil), call.Body...))
-	if document.Set("model", info.UpstreamModelName) != nil {
-		return nil, &service.GatewayParameterError{Path: "model", Reason: "Invalid effective WebSocket request"}
-	}
-	body, err := relaycommon.ApplyParamOverrideWithRelayInfo(document.Bytes(), info)
-	if err != nil {
-		return nil, &service.GatewayParameterError{Path: "parameter_overrides", Reason: "Invalid request parameter overrides"}
 	}
 	validateMultipliers := helper.ValidateResponsesMultipliers
 	if call.Protocol() == protocol.OpenAIRealtime {
@@ -246,6 +250,14 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 	if err != nil {
 		return nil, &service.GatewayParameterError{Path: "request", Reason: "Invalid effective WebSocket request"}
 	}
+	prepared, err := call.Prepare(candidate, info)
+	if err != nil {
+		return nil, service.ErrGatewayUnavailable
+	}
+	for name, values := range prepared.Headers() {
+		purchaseInput.Headers[strings.ToLower(name)] = strings.Join(values, ",")
+	}
+	result.Transport = prepared
 	purchaseInput.Body = payload
 	info.SetEstimatePromptTokens(inputUsage.PromptTokens)
 	selection.InputTokens = inputUsage.PromptTokens

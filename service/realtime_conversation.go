@@ -391,9 +391,9 @@ func (conversation *RealtimeConversation) Complete(result *relaycommon.RealtimeR
 	}
 	generated := result.Usage.CompletionTokens
 	audio := result.Usage.CompletionTokenDetails.AudioTokens
-	if result.Facts.GeneratedOutputTokens != nil {
-		generated = max(generated, *result.Facts.GeneratedOutputTokens)
-		audio = max(audio, result.Facts.GeneratedOutputDetails.AudioTokens)
+	if result.Facts.SourceOutputTokens != nil {
+		generated = max(generated, *result.Facts.SourceOutputTokens)
+		audio = max(audio, result.Facts.SourceOutputDetails.AudioTokens)
 	}
 	quantity := realtimeInputQuantity{total: generated, audio: min(audio, generated)}
 	ids := []string{}
@@ -493,13 +493,23 @@ type RealtimeInputSnapshot struct {
 	raw                realtimeInputQuantity
 	conversation       realtimeInputQuantity
 	captureErr         error
+	referenceBytes     int
 	items              map[string]realtimeConversationItem
 }
 
 // Snapshot freezes default quantities and only the references named by this input.
 func (conversation *RealtimeConversation) Snapshot(body []byte) *RealtimeInputSnapshot {
 	snapshot := &RealtimeInputSnapshot{context: conversation.context.Copy(), model: conversation.model, inputFormat: conversation.inputFormat, conversation: conversation.inputQuantity(), epoch: conversation.epoch, sequence: conversation.sequence, raw: conversation.current}
-	retained := 0
+	snapshot.CaptureReferences(conversation, body)
+	return snapshot
+}
+
+// CaptureReferences freezes candidate override references while the connection
+// owner waits for request preparation. It never reads newer conversation state.
+func (snapshot *RealtimeInputSnapshot) CaptureReferences(conversation *RealtimeConversation, body []byte) {
+	if snapshot.captureErr != nil || conversation.epoch != snapshot.epoch {
+		return
+	}
 	for _, item := range ojson.GetBytes(body, "input").Array() {
 		if item.Get("type").String() != "item_reference" {
 			continue
@@ -509,20 +519,19 @@ func (conversation *RealtimeConversation) Snapshot(body []byte) *RealtimeInputSn
 			continue
 		}
 		known, exists := conversation.items[id]
-		if !exists || !known.accepted {
+		if !exists || !known.accepted || known.sequence > snapshot.sequence {
 			continue
 		}
-		if len(id)+128 > conversation.limit-retained {
+		if len(id)+128 > conversation.limit-snapshot.referenceBytes {
 			snapshot.captureErr = errors.New("Realtime conversation identity budget exceeded")
 			break
 		}
-		retained += len(id) + 128
+		snapshot.referenceBytes += len(id) + 128
 		if snapshot.items == nil {
 			snapshot.items = map[string]realtimeConversationItem{}
 		}
 		snapshot.items[id] = known
 	}
-	return snapshot
 }
 
 func (snapshot *RealtimeInputSnapshot) Estimate(body []byte) (*dto.Usage, error) {

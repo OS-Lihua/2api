@@ -3,6 +3,7 @@ package channel
 import (
 	"fmt"
 	"net/http"
+	"slices"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/protocol"
@@ -22,8 +23,21 @@ type ProviderProtocolComposer interface {
 
 // ChatRequestProjector exposes effective validation facts from a selected native
 // wire DTO. It neither chooses a protocol nor performs transport or billing.
+// NativeRequestProjector decodes the actual provider envelope back to its
+// public native DTO; the host supplies the current request context for facts.
+type NativeRequestProjector interface {
+	ProjectNativeRequest([]byte) (dto.Request, error)
+}
+
 type ChatRequestProjector interface {
 	ProjectChatRequest([]byte, dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error)
+}
+
+// ChatRequestFinalizer applies local wire changes after parameter and header
+// overrides, before effective validation, route pricing and reservation.
+// Implementations must perform no upstream I/O and remain idempotent.
+type ChatRequestFinalizer interface {
+	FinalizeChatRequest(*gin.Context, *relaycommon.RelayInfo, []byte) ([]byte, error)
 }
 
 // ChatRequestPreparer resolves Provider-managed request data after reservation.
@@ -108,6 +122,12 @@ func ConvertProtocolRequest(c *gin.Context, info *relaycommon.RelayInfo, kind pr
 	return result.Value, nil
 }
 
+// NativeResponseGateway presents a provider's canonical Chat response through
+// the shared gateway conversion, delivery and accounting implementation.
+type NativeResponseGateway interface {
+	DoNativeResponse(*gin.Context, *http.Response, *relaycommon.RelayInfo, ProtocolHandler) (any, *types.NewAPIError)
+}
+
 // WireProtocol composes a public DTO conversion with an explicitly declared
 // provider wire dialect. The dialect owns its response parser and usage facts.
 // It never receives or calls the legacy Adaptor interface.
@@ -119,13 +139,16 @@ type WireProtocol struct {
 	// ReportsGatewayFacts confirms that the native Chat writer records actual
 	// business delivery, write failures and usage presence for money settlement.
 	ReportsGatewayFacts bool
+	// PublicResponse declares that the wire body already uses Kind's public DTO.
+	PublicResponse bool
 }
 
 func (p *WireProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInfo, request any) (any, error) {
 	if p.Kind == protocol.OpenAIChat && info.ResponseFacts != nil && !p.ReportsGatewayFacts {
 		return nil, fmt.Errorf("native protocol does not report gateway response facts")
 	}
-	if !p.SupportsCrossProtocol {
+	managed := info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil
+	if !p.SupportsCrossProtocol && !(managed && p.Kind == protocol.OpenAIChat) {
 		format, err := ProtocolRelayFormat(p.Kind)
 		if err != nil {
 			return nil, err
@@ -138,6 +161,7 @@ func (p *WireProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInf
 	if err != nil {
 		return nil, err
 	}
+	publicChat, _ := converted.(*dto.GeneralOpenAIRequest)
 	mode := info.RelayMode
 	info.RelayMode = p.relayMode(info)
 	defer func() { info.RelayMode = mode }()
@@ -145,9 +169,44 @@ func (p *WireProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInf
 	if err == nil && converted == nil {
 		return nil, fmt.Errorf("provider wire conversion for %q returned no request", p.Kind)
 	}
+	if err == nil && managed && p.Kind == protocol.OpenAIChat && !p.PublicResponse && publicChat != nil {
+		contract, ok := converted.(NativeChatRequestContract)
+		if !ok {
+			return nil, fmt.Errorf("native request does not declare retained parameters")
+		}
+		capabilities := contract.ChatRequestCapabilities()
+		if publicChat.N != nil && *publicChat.N > 1 && (info.IsStream || !slices.Contains(capabilities.Parameters, "n")) {
+			return nil, fmt.Errorf("native Provider cannot represent multiple output choices (n)")
+		}
+		projector, ok := converted.(ChatRequestProjector)
+		if !ok {
+			return nil, fmt.Errorf("native request does not expose its effective wire projection")
+		}
+		encoded, err := common.Marshal(converted)
+		if err != nil {
+			return nil, err
+		}
+		actual, err := projector.ProjectChatRequest(encoded, *publicChat)
+		if err != nil {
+			return nil, err
+		}
+		if err := DiagnoseNativeChatRequest(c, info, publicChat, capabilities, actual); err != nil {
+			return nil, err
+		}
+	}
 	return converted, err
 }
 func (p *WireProtocol) DoResponse(c *gin.Context, response *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
+	if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+		if p.PublicResponse {
+			return p.Public.DoResponse(c, response, info)
+		}
+		if p.Kind == protocol.OpenAIChat {
+			if gateway, ok := p.Public.(NativeResponseGateway); ok {
+				return gateway.DoNativeResponse(c, response, info, p.Wire)
+			}
+		}
+	}
 	mode := info.RelayMode
 	info.RelayMode = p.relayMode(info)
 	defer func() { info.RelayMode = mode }()
@@ -167,28 +226,7 @@ func (p *WireProtocol) relayMode(info *relaycommon.RelayInfo) int {
 
 // ProtocolRelayFormat maps only the explicit public protocol enum.
 func ProtocolRelayFormat(kind protocol.Type) (types.RelayFormat, error) {
-	switch kind {
-	case protocol.OpenAIChat:
-		return types.RelayFormatOpenAI, nil
-	case protocol.OpenAIResponses:
-		return types.RelayFormatOpenAIResponses, nil
-	case protocol.OpenAIRealtime:
-		return types.RelayFormatOpenAIRealtime, nil
-	case protocol.AnthropicMessages:
-		return types.RelayFormatClaude, nil
-	case protocol.GeminiGenerate, protocol.GeminiEmbed:
-		return types.RelayFormatGemini, nil
-	case protocol.OpenAIEmbeddings:
-		return types.RelayFormatEmbedding, nil
-	case protocol.OpenAIImages:
-		return types.RelayFormatOpenAIImage, nil
-	case protocol.OpenAIAudioSpeech, protocol.OpenAIAudioTranscription:
-		return types.RelayFormatOpenAIAudio, nil
-	case protocol.Rerank:
-		return types.RelayFormatRerank, nil
-	default:
-		return "", fmt.Errorf("unsupported protocol %q", kind)
-	}
+	return kind.RelayFormat()
 }
 
 func protocolRelayMode(kind protocol.Type) int {

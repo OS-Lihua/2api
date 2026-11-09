@@ -4,8 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"maps"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -240,7 +241,7 @@ func ResponseChunkData(c *gin.Context, resp dto.ResponsesStreamResponse, data st
 	return FlushWriter(c)
 }
 
-// StreamFlushError means the complete frame was written before flushing failed.
+// StreamFlushError means a complete frame was accepted before a write or flush error.
 // Callers can distinguish accepted business content from a partial frame write.
 type StreamFlushError struct {
 	Err error
@@ -249,15 +250,156 @@ type StreamFlushError struct {
 func (e *StreamFlushError) Error() string { return e.Err.Error() }
 func (e *StreamFlushError) Unwrap() error { return e.Err }
 
+// ErrGatewayStreamPreludeLimit is an upstream framing failure before any
+// downstream write. It must remain eligible for pre-business failover.
+var ErrGatewayStreamPreludeLimit = errors.New("upstream stream prelude exceeds limit")
+
+// WriteGatewayStreamFrame holds an Attempt's prelude until its first business
+// frame. A failed candidate cannot commit stale protocol IDs or loss headers.
+func WriteGatewayStreamFrame(c *gin.Context, facts *relaycommon.ResponseFacts, frame string, business bool) error {
+	if err := c.Request.Context().Err(); err != nil {
+		return err
+	}
+	if facts != nil && facts.OnBusinessOutput != nil && !facts.BusinessOutput {
+		if !business {
+			if len(facts.StreamPrelude)+len(frame) > 1<<20 {
+				return ErrGatewayStreamPreludeLimit
+			}
+			facts.StreamPrelude = append(facts.StreamPrelude, frame...)
+			return nil
+		}
+		maps.Copy(c.Writer.Header(), facts.StreamHeaders)
+		facts.StreamHeaders = nil
+		frame = string(facts.StreamPrelude) + frame
+		facts.StreamPrelude = nil
+	}
+	n, err := c.Writer.Write([]byte(frame))
+	if n != len(frame) {
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		return err
+	}
+	if facts != nil && business {
+		facts.MarkBusinessOutput()
+	}
+	if err != nil {
+		return &StreamFlushError{Err: err}
+	}
+	if err := FlushWriter(c); err != nil {
+		return &StreamFlushError{Err: err}
+	}
+	return nil
+}
+
+// WriteGatewayJSONResponse records complete business writes and checks the
+// error-aware flush boundary for both generic and native protocol writers.
+func WriteGatewayJSONResponse(c *gin.Context, resp *http.Response, facts *relaycommon.ResponseFacts, body []byte, business bool) error {
+	if err := c.Request.Context().Err(); err != nil {
+		return err
+	}
+	if resp != nil {
+		for name, values := range resp.Header {
+			if len(values) > 0 && service.ShouldCopyUpstreamHeader(c, name, values) {
+				c.Writer.Header().Set(name, values[0])
+			}
+		}
+	}
+	c.Header("Content-Type", "application/json")
+	c.Header("Content-Length", fmt.Sprint(len(body)))
+	status := http.StatusOK
+	if resp != nil {
+		status = resp.StatusCode
+	}
+	c.Writer.WriteHeader(status)
+	written, err := c.Writer.Write(body)
+	if err == nil && written != len(body) {
+		err = io.ErrShortWrite
+	}
+	if business && written == len(body) {
+		facts.MarkBusinessOutput()
+	}
+	if err != nil {
+		facts.DownstreamWriteFailed = true
+		return err
+	}
+	if err := FlushWriter(c); err != nil {
+		facts.DownstreamWriteFailed = true
+		return err
+	}
+	return nil
+}
+
+// RecordNativeStreamSource keeps a received generation chunk as procurement
+// evidence when unrelated native fields prevent canonical delivery.
+func RecordNativeStreamSource(c *gin.Context, info *relaycommon.RelayInfo, source *dto.OpenAITextResponse) {
+	if info.ResponseFacts == nil || source == nil || len(source.Choices) == 0 {
+		return
+	}
+	type sourceChoice struct {
+		Index int         `json:"index"`
+		Delta dto.Message `json:"delta"`
+	}
+	frame := struct {
+		Choices []sourceChoice `json:"choices"`
+	}{}
+	for _, choice := range source.Choices {
+		frame.Choices = append(frame.Choices, sourceChoice{Index: choice.Index, Delta: choice.Message})
+	}
+	body, err := common.Marshal(frame)
+	if err != nil {
+		return
+	}
+	text := relaycommon.ChatStreamBusinessText(body)
+	info.ResponseFacts.SourceGeneratedText += text
+	info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || text != ""
+	recordNativeCaptureSource(c, body)
+}
+
+func recordNativeCaptureSource(c *gin.Context, body []byte) {
+	for writer := http.ResponseWriter(c.Writer); writer != nil; {
+		if recorder, ok := writer.(interface{ RecordChatStreamSource([]byte) }); ok {
+			recorder.RecordChatStreamSource(body)
+			break
+		}
+		wrapper, ok := writer.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			break
+		}
+		writer = wrapper.Unwrap()
+	}
+}
+
 func StringData(c *gin.Context, str string) error {
 	if c == nil || c.Writer == nil {
 		return errors.New("context or writer is nil")
 	}
 
+	if facts, ok := common.GetContextKeyType[*relaycommon.ResponseFacts](c, constant.ContextKeyResponseFacts); ok && facts != nil && facts.OnBusinessOutput != nil {
+		if str == "[DONE]" {
+			err := WriteGatewayStreamFrame(c, nil, "data: [DONE]\n\n", false)
+			if err != nil {
+				facts.DownstreamWriteFailed = true
+			}
+			return err
+		}
+		var chunk dto.ChatCompletionsStreamResponse
+		if common.UnmarshalJsonStr(str, &chunk) == nil && (chunk.Choices != nil || chunk.Usage != nil) {
+			business := false
+			for _, choice := range chunk.Choices {
+				facts.OutputLimitObserved = facts.OutputLimitObserved || choice.FinishReason != nil && *choice.FinishReason == "length"
+				business = business || choice.Delta.GetContentString() != "" || choice.Delta.GetReasoningContent() != "" || len(choice.Delta.ToolCalls) > 0
+			}
+			text := relaycommon.ChatStreamBusinessText([]byte(str))
+			facts.SourceGeneratedText += text
+			facts.SourceOutputObserved = facts.SourceOutputObserved || text != "" || business
+			recordNativeCaptureSource(c, []byte(str))
+			return WriteGatewayStreamFrame(c, facts, "data: "+str+"\n\n", business)
+		}
+	}
 	if requestContextDone(c) {
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
-
 	if facts, _ := common.GetContextKey(c, constant.ContextKeyResponseFacts); facts == nil {
 		c.Render(-1, common.CustomEvent{Data: "data: " + str})
 		return FlushWriter(c)
@@ -281,6 +423,9 @@ func PingData(c *gin.Context) error {
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
 
+	if facts, ok := common.GetContextKeyType[*relaycommon.ResponseFacts](c, constant.ContextKeyResponseFacts); ok && facts != nil && facts.OnBusinessOutput != nil && !facts.BusinessOutput {
+		return nil
+	}
 	if _, err := c.Writer.Write([]byte(": PING\n\n")); err != nil {
 		return fmt.Errorf("write ping data failed: %w", err)
 	}
@@ -315,7 +460,9 @@ func SendChatChunk(c *gin.Context, info *relaycommon.RelayInfo, response *dto.Ch
 		return err
 	}
 	if err != nil {
-		facts.DownstreamWriteFailed = true
+		if !errors.Is(err, ErrGatewayStreamPreludeLimit) {
+			facts.DownstreamWriteFailed = true
+		}
 		var flushErr *StreamFlushError
 		if !errors.As(err, &flushErr) {
 			return err
@@ -343,12 +490,19 @@ func EstimateMissingChatUsage(c *gin.Context, info *relaycommon.RelayInfo, usage
 	if facts == nil || facts.UsageReported {
 		return
 	}
-	estimated := service.ResponseText2Usage(c, facts.GeneratedText, info.TokenizerModelName(), info.GetEstimatePromptTokens())
+	common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
 	if !facts.PromptTokensReported {
-		usage.PromptTokens = estimated.PromptTokens
+		usage.PromptTokens = info.GetEstimatePromptTokens()
 	}
 	if !facts.CompletionTokensReported {
-		usage.CompletionTokens = estimated.CompletionTokens
+		switch {
+		case facts.SourceOutputTokens != nil:
+			usage.CompletionTokens = *facts.SourceOutputTokens
+		case facts.GeneratedOutputTokens != nil:
+			usage.CompletionTokens = *facts.GeneratedOutputTokens
+		default:
+			usage.CompletionTokens = service.ResponseText2Usage(c, facts.GeneratedText, info.TokenizerModelName(), info.GetEstimatePromptTokens()).CompletionTokens
+		}
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 }
@@ -360,22 +514,16 @@ func WriteChatResponse(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	if resp.StatusCode != http.StatusOK {
 		return &response.Usage, types.NewErrorWithStatusCode(errors.New("upstream request failed"), types.ErrorCodeBadResponse, resp.StatusCode)
 	}
-	var output strings.Builder
+	facts.RecordChatSource(response, info.TokenizerModelName())
 	business := false
 	for _, choice := range response.Choices {
+		facts.OutputLimitObserved = facts.OutputLimitObserved || choice.FinishReason == "length"
 		if facts.OnBusinessOutput != nil && choice.FinishReason == constant.FinishReasonContentFilter {
 			info.PerformanceBusinessRejection = true
 		}
-		output.WriteString(choice.Message.StringContent())
-		output.WriteString(choice.Message.GetReasoningContent())
-		for _, call := range choice.Message.ParseToolCalls() {
-			business = true
-			output.WriteString(call.Function.Name)
-			output.WriteString(call.Function.Arguments)
-			output.Write(call.Custom)
-		}
+		business = business || len(choice.Message.ParseToolCalls()) > 0
 	}
-	facts.GeneratedText = output.String()
+	facts.GeneratedText = facts.SourceGeneratedText
 	EstimateMissingChatUsage(c, info, &response.Usage)
 	encoded, err := common.Marshal(response)
 	if err != nil {
@@ -384,26 +532,22 @@ func WriteChatResponse(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	if err := c.Request.Context().Err(); err != nil {
 		return &response.Usage, types.NewError(err, types.ErrorCodeBadResponse)
 	}
-	c.Header("Content-Type", "application/json")
-	if err := service.IOCopyBytesGracefully(c, resp, encoded); err != nil {
-		facts.DownstreamWriteFailed = true
+	if err := WriteGatewayJSONResponse(c, resp, facts, encoded, business || facts.GeneratedText != ""); err != nil {
 		return &response.Usage, types.NewError(err, types.ErrorCodeBadResponse)
 	}
-	if business || facts.GeneratedText != "" {
-		facts.MarkBusinessOutput()
-	}
+	facts.GeneratedOutputTokens = facts.SourceOutputTokens
 	return &response.Usage, nil
 }
 
-func Done(c *gin.Context) {
+func Done(c *gin.Context) error {
 	if value, ok := common.GetContextKey(c, constant.ContextKeyResponseFacts); ok {
 		if facts, _ := value.(*relaycommon.ResponseFacts); facts != nil && facts.OnBusinessOutput != nil {
 			if !facts.BusinessOutput || facts.CanFinishStream != nil && !facts.CanFinishStream() {
-				return
+				return nil
 			}
 		}
 	}
-	_ = StringData(c, "[DONE]")
+	return StringData(c, "[DONE]")
 }
 
 func WssString(c *gin.Context, ws *websocket.Conn, str string) error {

@@ -279,7 +279,7 @@ func (session *realtimeGatewaySession) begin(body, original []byte, input *dto.U
 			return response
 		}
 	}
-	call.Native = &relay.NativeWSLifecycle{Protocol: protocol.OpenAIRealtime, TransportOnly: session.channelID == 0, OriginalBody: append([]byte(nil), original...), StartedAt: startedAt, InputUsage: service.GatewayUsageSnapshot(input), EstimateInput: response.inputSnapshot.EstimateForCapabilities, Prepare: response.prepare, CreatePayload: response.payload,
+	call.Native = &relay.NativeWSLifecycle{Protocol: protocol.OpenAIRealtime, TransportOnly: session.channelID == 0, OriginalBody: append([]byte(nil), original...), StartedAt: startedAt, InputUsage: service.GatewayUsageSnapshot(input), EstimateInput: response.estimateInput, Prepare: response.prepare, CreatePayload: response.payload,
 		Exchange: response.exchange, Established: response.connected, TerminalDelivered: response.delivered, SaleInput: response.saleInput, PurchaseInput: response.purchaseInput}
 	if !call.Native.TransportOnly && session.sequence == 2 {
 		call.Native.Budget = session.initial.call.Native.Budget
@@ -311,6 +311,12 @@ func (session *realtimeGatewaySession) next(response *realtimeGatewayResponse) (
 	case <-session.context.Done():
 		return nil, types.NewError(context.Cause(session.context), types.ErrorCodeDoRequestFailed)
 	}
+}
+
+func (response *realtimeGatewayResponse) estimateInput(body []byte, caps capability.Set) (*dto.Usage, error) {
+	// The connection owner is blocked in next until this preparation finishes.
+	response.inputSnapshot.CaptureReferences(response.session.conversation, body)
+	return response.inputSnapshot.EstimateForCapabilities(body, caps)
 }
 
 func (response *realtimeGatewayResponse) prepare(c *gin.Context, info *relaycommon.RelayInfo) (*relaychannel.PreparedWssRequest, error) {

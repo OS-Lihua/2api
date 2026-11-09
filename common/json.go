@@ -48,6 +48,11 @@ func UnmarshalJsonStr(data string, v any) error {
 	return kitutil.UnmarshalJsonStr(data, v)
 }
 
+// UnmarshalUseNumber preserves numeric literals for exact JSON comparisons.
+func UnmarshalUseNumber(data []byte, v any) error {
+	return kitutil.UnmarshalUseNumber(data, v)
+}
+
 // DecodeJsonStrict accepts exactly one JSON value and rejects unknown fields.
 // Keep decoder configuration here with the host JSON codec.
 func DecodeJsonStrict(reader io.Reader, v any) error {

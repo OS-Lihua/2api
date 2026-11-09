@@ -241,6 +241,12 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 					prompt, completion = a.promptReported, a.completionReported
 				}
 				reported := *a.usage
+				facts.IndependentUsageReported = facts.IndependentUsageReported || a.inputDetailsReported
+				for _, path := range []string{"text_tokens", "audio_tokens", "image_tokens", "reasoning_tokens"} {
+					if valid, _ := relaycommon.NativeUsagePresence(raw, "response.usage.output_tokens_details."+path, "", ""); valid {
+						facts.IndependentUsageReported = true
+					}
+				}
 				facts.RecordUsage(a.usage, &reported, prompt, completion)
 			}
 		}
@@ -324,8 +330,7 @@ func (a *ResponsesUsageAccumulator) observeImageOutput(item *dto.ResponsesOutput
 func nativeOutputText(item *dto.ResponsesOutput) string {
 	var text strings.Builder
 	for _, content := range item.Content {
-		text.WriteString(content.Text)
-		text.WriteString(content.Refusal)
+		text.WriteString(content.GetText())
 	}
 	return text.String()
 }
@@ -476,7 +481,7 @@ func (a *ResponsesUsageAccumulator) observeOutputItem(item *dto.ResponsesOutput,
 	state := a.outputState(item.ID, index)
 	if item.Type != dto.BuildInCallFunctionCall && item.Type != "custom_tool_call" {
 		for i, content := range item.Content {
-			text := content.Text + content.Refusal
+			text := content.GetText()
 			if text == "" {
 				continue
 			}
@@ -583,11 +588,18 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 	generatedText := output.String()
 	facts := a.info.ResponseFacts
 	if facts != nil {
-		facts.GeneratedText = generatedText
+		facts.SourceGeneratedText = generatedText
 		delivered := 0
 		if a.delivered != nil {
 			delivered = a.delivered.Finish().CompletionTokens
+			if text := a.delivered.info.ResponseFacts.SourceGeneratedText; text != "" || facts.GeneratedText == "" {
+				facts.GeneratedText = text
+			}
 		}
+		if delivered == 0 && facts.GeneratedText != "" {
+			delivered = tokenkit.Count(a.info.TokenizerModelName(), facts.GeneratedText)
+		}
+		facts.GeneratedOutputTokens = &delivered
 		facts.DeliveredOutputTokens = &delivered
 		facts.DeliveredOutputDetails = dto.OutputTokenDetails{TextTokens: delivered}
 	}
@@ -596,13 +608,17 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 	if generatedText != "" {
 		generated += tokenkit.Count(a.info.TokenizerModelName(), generatedText)
 	}
+	if facts != nil && facts.DeliveredOutputTokens != nil {
+		generated = max(generated, *facts.DeliveredOutputTokens)
+	}
 	if !completionReported {
 		details := a.usage.CompletionTokenDetails
 		generated = max(generated, max(details.TextTokens, details.ReasoningTokens)+details.AudioTokens+details.ImageTokens)
 		a.usage.CompletionTokens = max(a.usage.CompletionTokens, generated)
 	}
 	if facts != nil {
-		facts.GeneratedOutputTokens = &generated
+		facts.SourceOutputTokens = &generated
+		facts.SourceOutputObserved = facts.SourceOutputObserved || generated > 0 || facts.GeneratedToolCalls || facts.GeneratedAudioBytes > 0
 	}
 	// Upstream bills the prompt as soon as it starts generating, so a stream
 	// that produced any event but no usage still owes its input tokens unless

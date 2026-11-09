@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"errors"
 	"sort"
 	"strings"
@@ -45,6 +46,14 @@ func GetGroupEnabledModels(group string) []string {
 	// Find distinct models
 	DB.Table("abilities").Where(`"group" = ? and enabled = ?`, group, true).Distinct("model").Pluck("model", &models)
 	return models
+}
+
+// LegacyModelConfigured distinguishes legacy routing names from missing gateway
+// offerings without applying legacy quota rules to a wallet credential.
+func LegacyModelConfigured(ctx context.Context, name string) (bool, error) {
+	var abilities []Ability
+	err := DB.WithContext(ctx).Select("model").Where("model IN ?", []string{name, ratio_setting.RoutingMatchModelName(name)}).Limit(1).Find(&abilities).Error
+	return len(abilities) != 0, err
 }
 
 func GetEnabledModels() []string {

@@ -20,20 +20,36 @@ import (
 
 func requestOpenAI2Cohere(textRequest dto.GeneralOpenAIRequest) *CohereRequest {
 	cohereReq := CohereRequest{
-		Model:       textRequest.Model,
-		ChatHistory: []ChatHistory{},
-		Message:     "",
-		Stream:      lo.FromPtrOr(textRequest.Stream, false),
-		MaxTokens:   textRequest.GetMaxTokens(),
+		Model:            textRequest.Model,
+		ChatHistory:      []ChatHistory{},
+		Message:          "",
+		Stream:           lo.FromPtrOr(textRequest.Stream, false),
+		MaxTokens:        textRequest.GetMaxTokens(),
+		Temperature:      textRequest.Temperature,
+		P:                textRequest.TopP,
+		K:                textRequest.TopK,
+		FrequencyPenalty: textRequest.FrequencyPenalty,
+		PresencePenalty:  textRequest.PresencePenalty,
+		Seed:             textRequest.Seed,
+		StopSequences:    textRequest.Stop,
 	}
 	if common.CohereSafetySetting != "NONE" {
 		cohereReq.SafetyMode = common.CohereSafetySetting
 	}
-	if cohereReq.MaxTokens == 0 {
+	if stop, ok := textRequest.Stop.(string); ok {
+		cohereReq.StopSequences = []string{stop}
+	}
+	if textRequest.MaxTokens == nil && textRequest.MaxCompletionTokens == nil {
 		cohereReq.MaxTokens = 4000
 	}
-	for _, msg := range textRequest.Messages {
-		if msg.Role == "user" {
+	lastUser := -1
+	for index, message := range textRequest.Messages {
+		if message.Role == "user" {
+			lastUser = index
+		}
+	}
+	for index, msg := range textRequest.Messages {
+		if index == lastUser {
 			cohereReq.Message = msg.StringContent()
 		} else {
 			var role string
@@ -76,7 +92,7 @@ func stopReasonCohere2OpenAI(reason string) string {
 	case "ERROR_TOXIC":
 		return constant.FinishReasonContentFilter
 	case "MAX_TOKENS":
-		return "max_tokens"
+		return "length"
 	default:
 		return reason
 	}
@@ -88,6 +104,7 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	createdTime := common.GetTimestamp()
 	usage := &dto.Usage{}
 	var responseText strings.Builder
+	finished := false
 	if info.StreamStatus == nil {
 		info.StreamStatus = relaycommon.NewStreamStatus()
 	}
@@ -97,9 +114,21 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	scanner := helper.NewStreamScanner(resp.Body)
 	helper.SetEventStreamHeaders(c)
 	for scanner.Scan() {
+		if strings.TrimSpace(scanner.Text()) == "" {
+			continue
+		}
+		if finished {
+			return usage, types.NewError(fmt.Errorf("Cohere stream contains data after completion"), types.ErrorCodeBadResponseBody)
+		}
 		info.SetFirstResponseTime()
+		body := scanner.Bytes()
+		if info.ResponseFacts != nil {
+			info.ResponseFacts.RecordNativeUsage(usage, body, "response.meta.billed_units.input_tokens", "response.meta.billed_units.output_tokens")
+			body = relaycommon.SanitizeNativeUsage(body, "response.meta.billed_units")
+		}
 		var cohereResp CohereResponse
-		if err := common.Unmarshal(scanner.Bytes(), &cohereResp); err != nil {
+		if err := common.Unmarshal(body, &cohereResp); err != nil {
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(body, "", "text"))
 			if info.ResponseFacts == nil {
 				continue
 			}
@@ -108,7 +137,7 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		if cohereResp.Response != nil {
 			reported := dto.Usage{PromptTokens: cohereResp.Response.Meta.BilledUnits.InputTokens, CompletionTokens: cohereResp.Response.Meta.BilledUnits.OutputTokens}
 			if info.ResponseFacts != nil {
-				prompt, completion := relaycommon.NativeUsagePresence(scanner.Bytes(), "response.meta.billed_units.input_tokens", "response.meta.billed_units.output_tokens", "")
+				prompt, completion := relaycommon.NativeUsagePresence(body, "response.meta.billed_units.input_tokens", "response.meta.billed_units.output_tokens", "")
 				info.ResponseFacts.RecordUsage(usage, &reported, prompt, completion)
 			} else {
 				*usage = reported
@@ -134,7 +163,7 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			}
 			info.StreamStatus.MarkCompleted()
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
-			break
+			finished = true
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -150,20 +179,29 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 
 func cohereHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	createdTime := common.GetTimestamp()
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
-	}
+	responseBody, readErr := io.ReadAll(resp.Body)
 	service.CloseResponseBodyGracefully(resp)
-	var cohereResp CohereResponseResult
-	err = common.Unmarshal(responseBody, &cohereResp)
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
-	}
 	usage := dto.Usage{}
-	usage.PromptTokens = cohereResp.Meta.BilledUnits.InputTokens
-	usage.CompletionTokens = cohereResp.Meta.BilledUnits.OutputTokens
-	usage.TotalTokens = cohereResp.Meta.BilledUnits.InputTokens + cohereResp.Meta.BilledUnits.OutputTokens
+	if info.ResponseFacts != nil {
+		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "meta.billed_units")
+		info.ResponseFacts.RecordNativeUsage(&usage, responseBody, "meta.billed_units.input_tokens", "meta.billed_units.output_tokens")
+	}
+	var cohereResp CohereResponseResult
+	if info.ResponseFacts != nil {
+		info.ResponseFacts.RecordNativeTextSource(responseBody, "", "text", info.TokenizerModelName())
+	}
+	err := common.Unmarshal(responseBody, &cohereResp)
+	if readErr != nil {
+		return &usage, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
+	}
+	if err != nil {
+		return &usage, types.NewError(err, types.ErrorCodeBadResponseBody)
+	}
+	if info.ResponseFacts == nil {
+		usage.PromptTokens = cohereResp.Meta.BilledUnits.InputTokens
+		usage.CompletionTokens = cohereResp.Meta.BilledUnits.OutputTokens
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	}
 
 	var openaiResp dto.OpenAITextResponse
 	openaiResp.Id = cohereResp.ResponseId
@@ -183,6 +221,9 @@ func cohereHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	if info.ResponseFacts != nil {
 		prompt, completion := relaycommon.NativeUsagePresence(responseBody, "meta.billed_units.input_tokens", "meta.billed_units.output_tokens", "")
 		info.ResponseFacts.RecordUsage(&openaiResp.Usage, &usage, prompt, completion)
+		if strings.HasPrefix(cohereResp.FinishReason, "ERROR") && cohereResp.FinishReason != "ERROR_TOXIC" {
+			return &openaiResp.Usage, types.NewError(fmt.Errorf("Cohere response failed"), types.ErrorCodeBadResponse)
+		}
 		return helper.WriteChatResponse(c, info, resp, &openaiResp)
 	}
 	jsonResponse, err := common.Marshal(openaiResp)

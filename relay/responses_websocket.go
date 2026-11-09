@@ -197,6 +197,9 @@ func (call *ResponsesWSCall) EstimateInput(c *gin.Context, info *relaycommon.Rel
 	contextUsage.PromptTokens += tokenkit.Count(model, inputOnly.GetTokenCountMeta().CombineText) - tokenkit.Count(model, meta.CombineText)
 	contextUsage.TotalTokens = contextUsage.PromptTokens
 	contextUsage.PromptTokensDetails.TextTokens = contextUsage.PromptTokens - contextUsage.PromptTokensDetails.ImageTokens - contextUsage.PromptTokensDetails.AudioTokens
+	if contextUsage.PromptTokensDetails.TextTokens > 0 && !slices.Contains(caps.InputModalities, capability.Text) {
+		return nil, &service.GatewayParameterError{Path: "input", Reason: "Input or output text is not supported on this channel"}
+	}
 	return &relaycommon.ResponsesInputFacts{Usage: usage, Context: contextUsage, ImageCount: images, ToolCalls: toolCalls}, nil
 }
 
@@ -271,7 +274,7 @@ func (call *ResponsesWSCall) Exchange(c *gin.Context, info *relaycommon.RelayInf
 			}
 			generated := 0
 			if info.ResponseFacts != nil {
-				generated = tokenkit.Count(info.TokenizerModelName(), info.ResponseFacts.GeneratedText)
+				generated = tokenkit.Count(info.TokenizerModelName(), info.ResponseFacts.SourceGeneratedText)
 			}
 			if usage != nil {
 				generated = max(generated, usage.CompletionTokens)

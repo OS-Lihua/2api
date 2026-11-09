@@ -7,6 +7,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
 type OllamaChatMessage struct {
@@ -49,6 +50,10 @@ type OllamaChatRequest struct {
 	Think     json.RawMessage     `json:"think,omitempty"`
 }
 
+func (*OllamaChatRequest) ChatRequestCapabilities() channel.NativeChatCapabilities {
+	return channel.NativeChatCapabilities{Parameters: []string{"max_tokens", "max_completion_tokens", "temperature", "top_p", "top_k", "frequency_penalty", "presence_penalty", "seed", "stop", "tools", "response_format", "reasoning_effort", "think", "reasoning"}, ContentTypes: []string{dto.ContentTypeText, dto.ContentTypeImageURL}}
+}
+
 func (*OllamaChatRequest) SetChatOutputLimit(body []byte, limit uint) ([]byte, error) {
 	var wire map[string]common.RawMessage
 	if err := common.Unmarshal(body, &wire); err != nil {
@@ -72,7 +77,7 @@ func (*OllamaChatRequest) SetChatOutputLimit(body []byte, limit uint) ([]byte, e
 	return common.Marshal(wire)
 }
 
-func (*OllamaChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error) {
+func (request *OllamaChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error) {
 	var wire OllamaChatRequest
 	if err := common.Unmarshal(body, &wire); err != nil {
 		return nil, err
@@ -85,24 +90,74 @@ func (*OllamaChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpen
 		return nil, fmt.Errorf("Ollama supports one choice per request")
 	}
 	effective.Model, effective.Stream = wire.Model, common.GetPointer(wire.Stream)
+	effective.MaxTokens, effective.MaxCompletionTokens = nil, nil
+	effective.Temperature, effective.TopP, effective.FrequencyPenalty, effective.PresencePenalty, effective.Seed = nil, nil, nil, nil, nil
+	effective.TopK, effective.Stop = nil, nil
+	options := make(map[string]any)
+	for key, target := range map[string]string{"temperature": "temperature", "top_p": "top_p", "top_k": "top_k", "frequency_penalty": "frequency_penalty", "presence_penalty": "presence_penalty", "seed": "seed", "stop": "stop"} {
+		if value, exists := wire.Options[key]; exists {
+			options[target] = value
+		}
+	}
+	encoded, err := common.Marshal(options)
+	if err != nil {
+		return nil, err
+	}
+	if err := common.Unmarshal(encoded, effective); err != nil {
+		return nil, err
+	}
 	if raw, ok := wire.Options["num_predict"]; ok {
 		encoded, err := common.Marshal(raw)
 		if err != nil {
 			return nil, err
 		}
 		var limit uint
-		if err := common.Unmarshal(encoded, &limit); err != nil || limit == 0 {
+		if err := common.Unmarshal(encoded, &limit); err != nil {
 			return nil, fmt.Errorf("invalid Ollama output limit")
+		}
+		if limit == 0 {
+			path := "max_tokens"
+			if public.MaxCompletionTokens != nil {
+				path = "max_completion_tokens"
+			}
+			return nil, &types.ConversionLossError{Diagnostics: []types.ConversionDiagnostic{{Code: "request_parameter_dropped", Path: path, Message: "The native Ollama request cannot represent an explicit zero output limit", Severity: types.ConversionDiagnosticError}}}
 		}
 		effective.MaxCompletionTokens = &limit
 	}
 	effective.Messages = make([]dto.Message, 0, len(wire.Messages))
-	for _, message := range wire.Messages {
+	for index, message := range wire.Messages {
 		content := []dto.MediaContent{{Type: dto.ContentTypeText, Text: message.Content}}
-		for _, image := range message.Images {
-			content = append(content, dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: "data:image/jpeg;base64," + image}})
+		var originalImages []dto.MediaContent
+		if len(message.Images) > 0 && index < len(public.Messages) {
+			for _, part := range public.Messages[index].ParseContent() {
+				if part.Type == dto.ContentTypeImageURL {
+					originalImages = append(originalImages, part)
+				}
+			}
 		}
-		projected := dto.Message{Role: message.Role, Content: content}
+		for imageIndex, image := range message.Images {
+			part := dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: "data:image/jpeg;base64," + image}}
+			// Preserve the resolved image's identity only while its wire bytes match.
+			if index < len(request.Messages) && imageIndex < len(request.Messages[index].Images) && imageIndex < len(originalImages) && image == request.Messages[index].Images[imageIndex] {
+				part = originalImages[imageIndex]
+			}
+			content = append(content, part)
+		}
+		projected := dto.Message{Role: message.Role, Content: content, ToolCallId: message.ToolCallID}
+		if message.ToolName != "" && index < len(public.Messages) && public.Messages[index].Name != nil {
+			projected.Name = common.GetPointer(message.ToolName)
+		}
+		if len(message.Thinking) > 0 {
+			var thinking string
+			if err := common.Unmarshal(message.Thinking, &thinking); err != nil {
+				return nil, err
+			}
+			if index < len(public.Messages) && public.Messages[index].ReasoningContent == nil && public.Messages[index].Reasoning != nil {
+				projected.Reasoning = &thinking
+			} else {
+				projected.ReasoningContent = &thinking
+			}
+		}
 		if len(message.ToolCalls) > 0 {
 			calls, _ := ollamaToolCallsToOpenAI(message.ToolCalls, 0, false)
 			projected.ToolCalls, err = common.Marshal(calls)
@@ -112,6 +167,7 @@ func (*OllamaChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpen
 		}
 		effective.Messages = append(effective.Messages, projected)
 	}
+	effective.Tools = nil
 	if wire.Tools != nil {
 		encoded, err := common.Marshal(wire.Tools)
 		if err != nil {
@@ -121,6 +177,9 @@ func (*OllamaChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpen
 			return nil, err
 		}
 	}
+	effective.ReasoningEffort = ""
+	effective.Think = wire.Think
+	effective.Reasoning = nil
 	if len(wire.Think) > 0 {
 		var enabled bool
 		if common.Unmarshal(wire.Think, &enabled) == nil {
@@ -132,8 +191,31 @@ func (*OllamaChatRequest) ProjectChatRequest(body []byte, public dto.GeneralOpen
 			return nil, fmt.Errorf("invalid Ollama reasoning setting")
 		}
 	}
+	if len(public.Reasoning) > 0 {
+		encoded, err := common.Marshal(dto.Reasoning{Effort: effective.ReasoningEffort})
+		if err != nil {
+			return nil, err
+		}
+		effective.Reasoning = encoded
+	}
+	effective.ResponseFormat = nil
 	if wire.Format != nil && wire.Format != "" {
-		effective.ResponseFormat = &dto.ResponseFormat{Type: "json_schema"}
+		if text, ok := wire.Format.(string); ok && text == "json" {
+			effective.ResponseFormat = &dto.ResponseFormat{Type: "json_object"}
+		} else {
+			var schema dto.FormatJsonSchema
+			if public.ResponseFormat != nil && public.ResponseFormat.Type == "json_schema" {
+				if err := common.Unmarshal(public.ResponseFormat.JsonSchema, &schema); err != nil {
+					return nil, err
+				}
+			}
+			schema.Schema = wire.Format
+			encoded, err := common.Marshal(schema)
+			if err != nil {
+				return nil, err
+			}
+			effective.ResponseFormat = &dto.ResponseFormat{Type: "json_schema", JsonSchema: encoded}
+		}
 	}
 	return effective, nil
 }

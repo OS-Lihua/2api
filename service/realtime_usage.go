@@ -260,20 +260,22 @@ func (accumulator *RealtimeUsageAccumulator) finish(id string, state *realtimeRe
 	usage := state.accumulator.Finish()
 	facts := state.info.ResponseFacts
 	facts.GeneratedAudioBytes = state.audioBytes
-	text := tokenkit.Count(state.info.TokenizerModelName(), facts.GeneratedText)
+	text := tokenkit.Count(state.info.TokenizerModelName(), facts.SourceGeneratedText)
 	audio := CountRealtimeAudioTokens(state.audioBytes, state.outputAudioFormat, false)
 	generated := text + audio
-	if facts.GeneratedOutputTokens != nil {
-		generated = max(generated, *facts.GeneratedOutputTokens)
+	if facts.SourceOutputTokens != nil {
+		generated = max(generated, *facts.SourceOutputTokens)
 	}
-	facts.GeneratedOutputDetails = usage.CompletionTokenDetails
-	facts.GeneratedOutputDetails.AudioTokens = max(facts.GeneratedOutputDetails.AudioTokens, audio)
-	facts.GeneratedOutputDetails.TextTokens = max(facts.GeneratedOutputDetails.TextTokens, text)
-	facts.GeneratedOutputTokens = &generated
+	facts.SourceOutputDetails = usage.CompletionTokenDetails
+	facts.SourceOutputDetails.AudioTokens = max(facts.SourceOutputDetails.AudioTokens, audio)
+	facts.SourceOutputDetails.TextTokens = max(facts.SourceOutputDetails.TextTokens, text)
+	facts.SourceOutputTokens = &generated
+	facts.SourceOutputObserved = facts.SourceOutputObserved || generated > 0 || state.audioBytes > 0
 	delivered := CountRealtimeAudioTokens(state.deliveredAudioBytes, state.outputAudioFormat, false)
 	if facts.DeliveredOutputTokens != nil {
 		delivered += *facts.DeliveredOutputTokens
 	}
+	facts.GeneratedOutputTokens = &delivered
 	facts.DeliveredOutputTokens = &delivered
 	facts.DeliveredOutputDetails.AudioTokens = CountRealtimeAudioTokens(state.deliveredAudioBytes, state.outputAudioFormat, false)
 	estimated := !facts.UsageReported
@@ -359,7 +361,7 @@ func NativeResponseHasBusinessOutput(event *dto.ResponsesStreamResponse) bool {
 				}
 			}
 			for _, content := range event.Item.Content {
-				if content.Text != "" || content.Refusal != "" {
+				if content.GetText() != "" {
 					return true
 				}
 			}
@@ -376,7 +378,7 @@ func NativeResponseHasBusinessOutput(event *dto.ResponsesStreamResponse) bool {
 				}
 			}
 			for _, content := range output.Content {
-				if content.Text != "" || content.Refusal != "" {
+				if content.GetText() != "" {
 					return true
 				}
 			}

@@ -75,9 +75,9 @@ func OpenAIChatRequestToClaudeMessages(c context.Context, info convmeta.Meta, te
 	if len(claudeTools) > 0 {
 		claudeRequest.Tools = claudeTools
 	}
-	if textRequest.MaxCompletionTokens != nil && *textRequest.MaxCompletionTokens > 0 {
+	if textRequest.MaxCompletionTokens != nil {
 		claudeRequest.MaxTokens = kitutil.GetPointer(*textRequest.MaxCompletionTokens)
-	} else if textRequest.MaxTokens != nil && *textRequest.MaxTokens > 0 {
+	} else if textRequest.MaxTokens != nil {
 		claudeRequest.MaxTokens = kitutil.GetPointer(*textRequest.MaxTokens)
 	}
 	if textRequest.TopP != nil {
@@ -306,7 +306,7 @@ func OpenAIChatRequestToClaudeMessages(c context.Context, info convmeta.Meta, te
 				for _, toolCall := range message.ParseToolCalls() {
 					inputObj := make(map[string]any)
 					if args := toolCall.Function.Arguments; args != "" {
-						if err := kitutil.Unmarshal([]byte(args), &inputObj); err != nil {
+						if err := kitutil.UnmarshalUseNumber([]byte(args), &inputObj); err != nil {
 							kitutil.LogInfo("tool call function arguments is not a map[string]any: " + fmt.Sprintf("%v", toolCall.Function.Arguments))
 						}
 					}

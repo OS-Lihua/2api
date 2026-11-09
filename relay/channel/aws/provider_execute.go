@@ -55,8 +55,35 @@ func (p *Provider) PrepareExecution(c *gin.Context, metadata channel.ProviderMet
 		facts, _ = value.(*relaycommon.ResponseFacts)
 		managed = facts != nil && facts.OnBusinessOutput != nil
 	}
-	if request.ChannelOtherSettings.AwsApiType == dto.AwsApiTypeMantle {
-		req, err := p.NewMantleRequest(c, metadata, body)
+	payload, err := io.ReadAll(body)
+	if err != nil {
+		return nil, err
+	}
+	mantle := request.ChannelOtherSettings.AwsApiType == dto.AwsApiTypeMantle
+	if request.Protocol == protocol.AnthropicMessages || mantle {
+		claude, err := decodeAwsClaudeRequest(payload)
+		if err != nil {
+			return nil, err
+		}
+		if managed && mantle && (claude.Stream != nil && *claude.Stream) != request.IsStream {
+			return nil, errors.New("AWS Mantle streaming does not match the prepared request")
+		}
+		if managed || mantle {
+			finalized, err := finalizeAwsClaudeBody(payload, request, nil)
+			if err != nil {
+				return nil, err
+			}
+			if managed {
+				if !bytes.Equal(finalized, payload) {
+					return nil, errors.New("AWS Claude body does not match the prepared request")
+				}
+			} else {
+				payload = finalized
+			}
+		}
+	}
+	if mantle {
+		req, err := p.NewMantleRequest(c, metadata, bytes.NewReader(payload))
 		if err != nil {
 			return nil, err
 		}
@@ -95,11 +122,7 @@ func (p *Provider) PrepareExecution(c *gin.Context, metadata channel.ProviderMet
 	if awsModelCanCrossRegion(modelID, regionPrefix) {
 		modelID = awsModelCrossRegion(modelID, regionPrefix)
 	}
-	payload, err := io.ReadAll(body)
-	if err != nil {
-		return nil, err
-	}
-	if !nova {
+	if !nova && !managed {
 		wire, err := formatRequest(bytes.NewReader(payload), request.RequestHeaders)
 		if err != nil {
 			return nil, err
@@ -154,7 +177,24 @@ func (prepared *awsPreparedInvocation) execute(c *gin.Context) (*http.Response, 
 	ctx, cancel := newAwsInvokeContext(parent, prepared.managed)
 	if !prepared.stream {
 		defer cancel()
-		output, err := prepared.client.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{ModelId: aws.String(prepared.modelID), ContentType: aws.String("application/json"), Accept: aws.String("application/json"), Body: prepared.payload}, prepared.options...)
+		options := append([]func(*bedrockruntime.Options){}, prepared.options...)
+		var capture *awsJSONResponseCapture
+		if prepared.managed {
+			capture = &awsJSONResponseCapture{}
+			options = append(options, func(options *bedrockruntime.Options) {
+				capture.client = options.HTTPClient
+				options.HTTPClient = capture
+			})
+		}
+		output, err := prepared.client.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{ModelId: aws.String(prepared.modelID), ContentType: aws.String("application/json"), Accept: aws.String("application/json"), Body: prepared.payload}, options...)
+		if capture != nil && capture.response != nil && (capture.readErr != nil || err != nil) {
+			if err != nil {
+				if body, ok := capture.response.Body.(*awsJSONSourceBody); ok {
+					body.failure = prepared.failure(parent, err, "InvokeModel")
+				}
+			}
+			return capture.response, nil
+		}
 		if err != nil {
 			return nil, prepared.failure(parent, err, "InvokeModel")
 		}

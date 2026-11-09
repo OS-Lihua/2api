@@ -15,7 +15,6 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
-	"github.com/samber/lo"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -98,7 +97,7 @@ func requestOpenAI2Zhipu(request dto.GeneralOpenAIRequest) *ZhipuRequest {
 	return &ZhipuRequest{
 		Prompt:      messages,
 		Temperature: request.Temperature,
-		TopP:        lo.FromPtrOr(request.TopP, 0),
+		TopP:        request.TopP,
 		Incremental: false,
 	}
 }
@@ -172,6 +171,11 @@ func zhipuStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 			response = streamResponseZhipu2OpenAI(data)
 		} else if data, ok := strings.CutPrefix(line, "meta:"); ok {
 			var meta ZhipuStreamMetaResponse
+			if info.ResponseFacts != nil {
+				info.ResponseFacts.RecordNativeUsage(usage, []byte(data), "usage.prompt_tokens", "usage.completion_tokens")
+				data = string(relaycommon.SanitizeNativeUsage([]byte(data), "usage"))
+				_ = info.ResponseFacts.RecordChatUsage(usage, []byte(data), "usage")
+			}
 			if err := common.UnmarshalJsonStr(data, &meta); err != nil {
 				if info.ResponseFacts == nil {
 					continue
@@ -207,18 +211,34 @@ func zhipuStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 
 func zhipuHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	var zhipuResponse ZhipuResponse
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
-	}
+	responseBody, readErr := io.ReadAll(resp.Body)
 	service.CloseResponseBodyGracefully(resp)
-	err = common.Unmarshal(responseBody, &zhipuResponse)
+	var knownUsage *dto.Usage
+	if info.ResponseFacts != nil {
+		knownUsage = &zhipuResponse.Data.Usage
+		info.ResponseFacts.RecordNativeUsage(knownUsage, responseBody, "data.usage.prompt_tokens", "data.usage.completion_tokens")
+		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "data.usage")
+		_ = info.ResponseFacts.RecordChatUsage(knownUsage, responseBody, "data.usage")
+	}
+	if info.ResponseFacts != nil {
+		info.ResponseFacts.RecordNativeTextSource(responseBody, "data.choices", "content", info.TokenizerModelName())
+	}
+	err := common.Unmarshal(responseBody, &zhipuResponse)
 	if err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		if readErr != nil {
+			return knownUsage, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
+		}
+		return knownUsage, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	if info.ResponseFacts != nil {
 		prompt, completion := relaycommon.NativeUsagePresence(responseBody, "data.usage.prompt_tokens", "data.usage.completion_tokens", "data.usage.total_tokens")
 		info.ResponseFacts.RecordUsage(&zhipuResponse.Data.Usage, &zhipuResponse.Data.Usage, prompt, completion)
+	}
+	if readErr != nil {
+		if info.ResponseFacts != nil {
+			info.ResponseFacts.RecordChatSource(responseZhipu2OpenAI(&zhipuResponse), info.TokenizerModelName())
+		}
+		return knownUsage, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
 	if !zhipuResponse.Success {
 		return &zhipuResponse.Data.Usage, types.WithOpenAIError(types.OpenAIError{

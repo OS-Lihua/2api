@@ -21,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/samber/lo"
+	"github.com/tidwall/gjson"
 
 	"github.com/gin-gonic/gin"
 )
@@ -249,11 +250,33 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	usage := &dto.Usage{}
 	var nodeToken int
 	var streamError *types.NewAPIError
+	observeSource := func(data []byte) {
+		if info.ResponseFacts == nil {
+			return
+		}
+		info.ResponseFacts.RecordNativeUsage(usage, data, "metadata.usage.prompt_tokens", "metadata.usage.completion_tokens")
+		data = relaycommon.SanitizeNativeUsage(data, "metadata.usage")
+		_ = info.ResponseFacts.RecordChatUsage(usage, data, "metadata.usage")
+		event := relaycommon.SourceText(gjson.GetBytes(data, "event"))
+		if event == "message" || event == "agent_message" {
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(data, "", "answer"))
+		}
+	}
 	helper.SetEventStreamHeaders(c)
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		info.StreamStatus.RequireTerminal()
+		if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil && info.StreamStatus.CompletedNormally() {
+			sr.Error(errors.New("Dify stream contains data after completion"))
+			return
+		}
+		if info.ResponseFacts != nil {
+			info.ResponseFacts.RecordNativeUsage(usage, []byte(data), "metadata.usage.prompt_tokens", "metadata.usage.completion_tokens")
+			data = string(relaycommon.SanitizeNativeUsage([]byte(data), "metadata.usage"))
+			_ = info.ResponseFacts.RecordChatUsage(usage, []byte(data), "metadata.usage")
+		}
 		var difyResponse DifyChunkChatCompletionResponse
 		if err := common.Unmarshal([]byte(data), &difyResponse); err != nil {
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource([]byte(data), "", "answer"))
 			if info.ResponseFacts != nil {
 				err = errors.New("invalid upstream stream data")
 			}
@@ -262,23 +285,19 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			return
 		}
 		if info.ResponseFacts != nil {
-			prompt, completion := relaycommon.ChatUsagePresence([]byte(ojson.Get(data, "metadata").Raw))
-			if rawUsage := ojson.Get(data, "metadata.usage"); rawUsage.IsObject() {
-				previousPrompt, previousCompletion := usage.PromptTokens, usage.CompletionTokens
-				if err := common.UnmarshalJsonStr(rawUsage.Raw, usage); err != nil {
-					sr.Error(err)
-					return
-				}
-				usage.PromptTokens, usage.CompletionTokens = previousPrompt, previousCompletion
+			if err := info.ResponseFacts.RecordChatUsage(usage, []byte(data), "metadata.usage"); err != nil {
+				sr.Error(err)
+				return
 			}
-			info.ResponseFacts.RecordUsage(usage, &difyResponse.MetaData.Usage, prompt, completion)
 		}
 		if difyResponse.Event == "message_end" {
 			if info.ResponseFacts == nil {
 				usage = &difyResponse.MetaData.Usage
 			}
 			info.StreamStatus.MarkCompleted()
-			sr.Done()
+			if info.ResponseFacts == nil || info.ResponseFacts.OnBusinessOutput == nil {
+				sr.Done()
+			}
 			return
 		} else if difyResponse.Event == "error" {
 			if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
@@ -304,7 +323,7 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			}
 		}
 		err := helper.ObjectData(c, openaiResponse)
-		if err != nil && info.ResponseFacts != nil {
+		if err != nil && info.ResponseFacts != nil && !errors.Is(err, helper.ErrGatewayStreamPreludeLimit) {
 			info.ResponseFacts.DownstreamWriteFailed = true
 		}
 		var flushErr *helper.StreamFlushError
@@ -318,7 +337,11 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		if err != nil {
 			sr.Stop(fmt.Errorf("Dify stream delivery failed"))
 		}
-	})
+	}, func(data string) { observeSource([]byte(data)) })
+	if info.ResponseFacts != nil && len(info.ResponseFacts.UnterminatedStreamData) > 0 {
+		observeSource(info.ResponseFacts.UnterminatedStreamData)
+		info.ResponseFacts.UnterminatedStreamData = nil
+	}
 	if info.ResponseFacts == nil || info.ResponseFacts.OnBusinessOutput == nil || info.ResponseFacts.BusinessOutput && info.StreamStatus.CompletedNormally() {
 		helper.Done(c)
 	}
@@ -344,19 +367,29 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 
 func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	var difyResponse DifyChatCompletionResponse
-	responseBody, err := io.ReadAll(resp.Body)
-
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
-	}
+	responseBody, readErr := io.ReadAll(resp.Body)
 	service.CloseResponseBodyGracefully(resp)
-	err = common.Unmarshal(responseBody, &difyResponse)
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+	var knownUsage *dto.Usage
+	if info.ResponseFacts != nil {
+		knownUsage = &difyResponse.MetaData.Usage
+		info.ResponseFacts.RecordNativeUsage(knownUsage, responseBody, "metadata.usage.prompt_tokens", "metadata.usage.completion_tokens")
+		responseBody = relaycommon.SanitizeNativeUsage(responseBody, "metadata.usage")
+		_ = info.ResponseFacts.RecordChatUsage(knownUsage, responseBody, "metadata.usage")
 	}
 	if info.ResponseFacts != nil {
-		prompt, completion := relaycommon.ChatUsagePresence([]byte(ojson.GetBytes(responseBody, "metadata").Raw))
-		info.ResponseFacts.RecordUsage(&difyResponse.MetaData.Usage, &difyResponse.MetaData.Usage, prompt, completion)
+		info.ResponseFacts.RecordNativeTextSource(responseBody, "", "answer", info.TokenizerModelName())
+	}
+	err := common.Unmarshal(responseBody, &difyResponse)
+	if err != nil {
+		if readErr != nil {
+			return knownUsage, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
+		}
+		return knownUsage, types.NewError(err, types.ErrorCodeBadResponseBody)
+	}
+	if info.ResponseFacts != nil {
+		if err := info.ResponseFacts.RecordChatUsage(&difyResponse.MetaData.Usage, responseBody, "metadata.usage"); err != nil {
+			return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+		}
 	}
 	fullTextResponse := dto.OpenAITextResponse{
 		Id:      difyResponse.ConversationId,
@@ -373,6 +406,12 @@ func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 		FinishReason: "stop",
 	}
 	fullTextResponse.Choices = append(fullTextResponse.Choices, choice)
+	if readErr != nil {
+		if info.ResponseFacts != nil {
+			info.ResponseFacts.RecordChatSource(&fullTextResponse, info.TokenizerModelName())
+		}
+		return knownUsage, types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed)
+	}
 	if info.ResponseFacts != nil {
 		return helper.WriteChatResponse(c, info, resp, &fullTextResponse)
 	}

@@ -54,17 +54,24 @@ func EstimateRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *rela
 	return CountRequestToken(c, meta, info)
 }
 
+// RequestTokenOptions controls whether declared fixed-cost media types need
+// MIME discovery. Native file references are not downloadable client assets.
+type RequestTokenOptions struct {
+	UseDeclaredMediaTypes bool
+	NativeReferences      map[string]bool
+}
+
 // CountRequestToken counts request tokens regardless of the billing estimation
 // switch. Utility endpoints such as Claude's messages/count_tokens must remain
 // available even when operators disable request-token estimation for relays.
-func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relaycommon.RelayInfo) (int, error) {
-	return countRequestToken(c, meta, info, nil)
+func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relaycommon.RelayInfo, options ...RequestTokenOptions) (int, error) {
+	return countRequestToken(c, meta, info, nil, options...)
 }
 
 // CountRequestUsage retains media categories from the same input estimate.
-func CountRequestUsage(c *gin.Context, meta *types.TokenCountMeta, info *relaycommon.RelayInfo) (*dto.Usage, error) {
+func CountRequestUsage(c *gin.Context, meta *types.TokenCountMeta, info *relaycommon.RelayInfo, options ...RequestTokenOptions) (*dto.Usage, error) {
 	usage := &dto.Usage{}
-	total, err := countRequestToken(c, meta, info, usage)
+	total, err := countRequestToken(c, meta, info, usage, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -73,7 +80,7 @@ func CountRequestUsage(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 	return usage, nil
 }
 
-func countRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relaycommon.RelayInfo, usage *dto.Usage) (int, error) {
+func countRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relaycommon.RelayInfo, usage *dto.Usage, options ...RequestTokenOptions) (int, error) {
 	if meta == nil {
 		return 0, errors.New("token count meta is nil")
 	}
@@ -151,6 +158,9 @@ func countRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 		if file.Source == nil {
 			continue
 		}
+		if len(options) > 0 && options[0].UseDeclaredMediaTypes && (file.FileType != "" && file.FileType != types.FileTypeImage || options[0].NativeReferences[file.Source.GetRawData()]) {
+			continue
+		}
 
 		// 如果文件类型未知且需要获取，通过 MIME 类型检测
 		if file.FileType == "" || (file.Source.IsURL() && shouldFetchFiles) {
@@ -171,6 +181,10 @@ func countRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 	for i, file := range meta.Files {
 		switch file.FileType {
 		case types.FileTypeImage:
+			if len(options) > 0 && file.Source != nil && options[0].NativeReferences[file.Source.GetRawData()] {
+				tkm += tokenkit.ImageTokens(model, tokenkit.Image{Detail: file.Detail})
+				continue
+			}
 			token, err := getImageToken(c, file, model, info.IsStream)
 			if err != nil {
 				return 0, fmt.Errorf("error counting image token, media index[%d], identifier[%s], err: %v", i, file.GetIdentifier(), err)
