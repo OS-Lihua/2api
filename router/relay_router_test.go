@@ -5293,20 +5293,27 @@ func TestMediaGatewaySpeechDurationCapsRequireExecutableControl(t *testing.T) {
 
 func TestMediaGatewayMissingImageOutputUsageEstimatesOrStaysPending(t *testing.T) {
 	for _, tc := range []struct {
-		name, model, quality               string
-		tokens                             int64
-		unknown, zero, free, resolved, two bool
+		name, model, quality                                            string
+		tokens                                                          int64
+		unknown, zero, free, resolved, two, mixed, partial, costUnknown bool
 	}{
 		{name: "known low", model: "gpt-image-1.5", quality: "low", tokens: 272},
 		{name: "known medium", model: "gpt-image-1", quality: "medium", tokens: 1056},
 		{name: "resolved response quality", model: "gpt-image-1.5", quality: "auto", tokens: 272, resolved: true},
 		{name: "actual output quantity", model: "gpt-image-1.5", quality: "low", tokens: 544, two: true},
+		{name: "resolved batch parameters", model: "gpt-image-1.5", quality: "auto", tokens: 544, two: true, resolved: true},
+		{name: "mixed frame parameters", model: "gpt-image-1.5", quality: "auto", tokens: 672, two: true, resolved: true, mixed: true},
+		{name: "mixed frames partial delivery", model: "gpt-image-1.5", quality: "auto", tokens: 672, two: true, resolved: true, mixed: true, partial: true},
+		{name: "known delivered frame unknown procurement", model: "gpt-image-1.5", quality: "auto", two: true, resolved: true, mixed: true, partial: true, costUnknown: true},
 		{name: "unknown model", model: "image-01", quality: "low", unknown: true},
 		{name: "unresolved quality", model: "gpt-image-1.5", quality: "auto", unknown: true},
 		{name: "explicit zero", model: "gpt-image-1.5", quality: "low", zero: true},
 		{name: "unselected token branch", model: "image-01", quality: "low", free: true},
 	} {
 		for _, mode := range []string{"json", "json-sse", "native-sse"} {
+			if tc.mixed && mode != "native-sse" {
+				continue
+			}
 			t.Run(tc.name+"/"+mode, func(t *testing.T) {
 				count := int64(1)
 				requested := 1
@@ -5325,8 +5332,15 @@ func TestMediaGatewayMissingImageOutputUsageEstimatesOrStaysPending(t *testing.T
 					}
 					if mode == "native-sse" {
 						w.Header().Set("Content-Type", "text/event-stream")
-						for range count {
-							_, _ = fmt.Fprintf(w, "data: {\"type\":\"image_generation.completed\",\"url\":\"https://image.invalid/one\"%s}\n\n", usage)
+						for i := range count {
+							shape := usage
+							if tc.mixed && i > 0 {
+								shape = `,"quality":"low","size":"1536x1024"`
+								if tc.costUnknown {
+									shape = `,"quality":"auto","size":"1536x1024"`
+								}
+							}
+							_, _ = fmt.Fprintf(w, "data: {\"type\":\"image_generation.completed\",\"url\":\"https://image.invalid/one\"%s}\n\n", shape)
 						}
 						_, _ = io.WriteString(w, "data: [DONE]\n\n")
 						return
@@ -5347,17 +5361,31 @@ func TestMediaGatewayMissingImageOutputUsageEstimatesOrStaysPending(t *testing.T
 				for _, price := range []*model.PriceVersion{{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: saleExpression, EffectiveAt: clock.Now().Unix()}, {OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: purchaseExpression, EffectiveAt: clock.Now().Unix()}} {
 					require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
 				}
-				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", fmt.Sprintf(`{"model":"gateway-alias","prompt":"draw","size":"1024x1024","quality":%q,"stream":%t,"n":%d}`, tc.quality, mode != "json", requested))
+				body := fmt.Sprintf(`{"model":"gateway-alias","prompt":"draw","size":"1024x1024","quality":%q,"stream":%t,"n":%d}`, tc.quality, mode != "json", requested)
+				var response *httptest.ResponseRecorder
+				if tc.partial {
+					response = httptest.NewRecorder()
+					request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(body))
+					request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+					request.Header.Set("Content-Type", "application/json")
+					fixture.engine.ServeHTTP(&mediaFrameFailureWriter{ResponseRecorder: response, failFrame: 2}, request)
+				} else {
+					response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", body)
+				}
 				require.Equal(t, 200, response.Code, response.Body.String())
 				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
 				require.NoError(t, err)
 				assert.Equal(t, tc.unknown, record.SalePending)
 				require.NotNil(t, record.Usage.ImageCount)
-				assert.EqualValues(t, count, *record.Usage.ImageCount)
+				deliveredCount := count
+				if tc.partial {
+					deliveredCount = 1
+				}
+				assert.EqualValues(t, deliveredCount, *record.Usage.ImageCount)
 				attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
 				require.NoError(t, err)
 				require.EqualValues(t, 1, total)
-				assert.Equal(t, tc.unknown, attempts[0].CostPending)
+				assert.Equal(t, tc.unknown || tc.costUnknown, attempts[0].CostPending)
 				if tc.unknown {
 					assert.ElementsMatch(t, []string{"c", "img_o"}, record.Usage.UnmeasuredTokens)
 					var billing model.GatewayBilling
@@ -5381,13 +5409,26 @@ func TestMediaGatewayMissingImageOutputUsageEstimatesOrStaysPending(t *testing.T
 					assert.Equal(t, wallet.Balance, after.Balance)
 					return
 				}
-				assert.Equal(t, tc.tokens, record.Usage.CompletionTokens)
+				saleTokens := tc.tokens
+				if tc.partial {
+					saleTokens = 272
+				}
+				assert.Equal(t, saleTokens, record.Usage.CompletionTokens)
 				var expectedOutput *int64
 				if !tc.free {
-					expectedOutput = new(tc.tokens)
+					expectedOutput = new(saleTokens)
 				}
 				assert.Equal(t, expectedOutput, record.Usage.ImageOutputTokens)
-				assert.Equal(t, expectedOutput, attempts[0].Usage.ImageOutputTokens)
+				expectedAttemptOutput := expectedOutput
+				if tc.partial {
+					expectedAttemptOutput = new(tc.tokens)
+				}
+				if tc.costUnknown {
+					expectedAttemptOutput = nil
+					assert.ElementsMatch(t, []string{"c", "img_o"}, attempts[0].Usage.UnmeasuredTokens)
+					assert.Empty(t, record.Usage.UnmeasuredTokens)
+				}
+				assert.Equal(t, expectedAttemptOutput, attempts[0].Usage.ImageOutputTokens)
 				if tc.free || tc.zero {
 					mean, err := model.RecentOfferingOutputTokens(t.Context(), fixture.offering.ID, record.EndedAt)
 					require.NoError(t, err)
@@ -5397,8 +5438,13 @@ func TestMediaGatewayMissingImageOutputUsageEstimatesOrStaysPending(t *testing.T
 					}
 					assert.Equal(t, expected, mean)
 				}
-				assert.Equal(t, tc.tokens*8100, record.Receivable.Nanos)
+				assert.Equal(t, saleTokens*8100, record.Receivable.Nanos)
 				assert.Equal(t, tc.tokens*7000, attempts[0].Cost.Nanos)
+				if tc.partial {
+					wallet, err := model.GetUserWallet(fixture.user.Id)
+					require.NoError(t, err)
+					assert.EqualValues(t, 1_000_000_000-saleTokens*8100, wallet.Balance.Nanos)
+				}
 				if tc.tokens > 0 {
 					assert.Equal(t, "estimated", record.UsageSource)
 				}

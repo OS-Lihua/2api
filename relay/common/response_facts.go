@@ -39,32 +39,35 @@ type ResponseFacts struct {
 	// Nil means that an actual count is not yet known.
 	ImageCount *int64
 	// Media duration strings are finite decimal quantities, never money.
-	AudioInputSeconds          *string
-	AudioOutputSeconds         *string
-	AudioOutputSampleRate      int
-	AudioOutputChannels        int
-	GeneratedAudioBytes        int64
-	DeliveredAudioBytes        int64
-	DeliveredAudioSeconds      *string
-	GeneratedImageCount        int64
-	DeliveredImageCount        int64
-	AudioInputDurationReported bool
-	AudioInputDurationInvalid  bool
-	AudioOutputTokensReported  bool
-	AudioInputTokensEstimated  int
-	AudioInputTokensReported   bool
-	TextInputTokensReported    bool
-	ImageOutputTokensUnknown   bool
-	ImageOutputTokensEstimated bool
-	ImageOutputSize            string
-	ImageOutputQuality         string
-	ImageInputTokensReported   bool
-	ImageOutputTokensReported  bool
-	GeneratedOutputTokens      *int
-	UpstreamRetryAfter         string // Transient; only the parsed cooldown may enter records.
-	OnBusinessOutput           func()
-	CanFinishStream            func() bool `json:"-"`
-	UpstreamErrorCode          string
+	AudioInputSeconds                  *string
+	AudioOutputSeconds                 *string
+	AudioOutputSampleRate              int
+	AudioOutputChannels                int
+	GeneratedAudioBytes                int64
+	DeliveredAudioBytes                int64
+	DeliveredAudioSeconds              *string
+	GeneratedImageCount                int64
+	DeliveredImageCount                int64
+	AudioInputDurationReported         bool
+	AudioInputDurationInvalid          bool
+	AudioOutputTokensReported          bool
+	AudioInputTokensEstimated          int
+	AudioInputTokensReported           bool
+	TextInputTokensReported            bool
+	ImageOutputEstimationStarted       bool
+	ImageOutputTokensEstimate          *int
+	DeliveredImageOutputTokensEstimate *int
+	ImageOutputTokensUnknown           bool
+	ImageOutputTokensEstimated         bool
+	ImageOutputSize                    string
+	ImageOutputQuality                 string
+	ImageInputTokensReported           bool
+	ImageOutputTokensReported          bool
+	GeneratedOutputTokens              *int
+	UpstreamRetryAfter                 string // Transient; only the parsed cooldown may enter records.
+	OnBusinessOutput                   func()
+	CanFinishStream                    func() bool `json:"-"`
+	UpstreamErrorCode                  string
 }
 
 // AudioPCMBytesPerSecond uses the effective or reported signed 16-bit PCM

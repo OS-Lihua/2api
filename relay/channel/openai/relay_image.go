@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/tokenkit"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
@@ -132,6 +133,27 @@ func OpenaiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 	return &usageResp.Usage, nil
 }
 
+// estimateImageFrameOutput uses a completion event's resolved shape and the
+// effective request defaults to estimate that image independently.
+func estimateImageFrameOutput(info *relaycommon.RelayInfo, body []byte) (int, bool) {
+	image, ok := info.Request.(*dto.ImageRequest)
+	if !ok {
+		return 0, false
+	}
+	size, quality := image.Size, image.Quality
+	for name, target := range map[string]*string{"size": &size, "quality": &quality} {
+		value := ojson.GetBytes(body, name)
+		if !value.Exists() || value.Raw == "null" {
+			continue
+		}
+		if value.Type != ojson.String {
+			return 0, false
+		}
+		*target = value.Str
+	}
+	return tokenkit.ImageOutputTokens(info.UpstreamModelName, size, quality)
+}
+
 // openaiImageResponseCount counts billable images in an OpenAI-format image
 // response body. An object-shaped data is one image when it carries url or
 // b64_json. For arrays the count is the larger of the url-bearing and the
@@ -223,6 +245,8 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 	usage := &dto.Usage{}
 	var lastStreamData []byte
 	var completedImages int64
+	generatedTokens, deliveredTokens := 0, 0
+	generatedKnown, deliveredKnown := true, true
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		raw := common.StringToByteSlice(data)
@@ -254,6 +278,7 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 				return
 			}
 		}
+		frameTokens, frameKnown := 0, false
 		var chunk struct {
 			Type  string          `json:"type"`
 			Usage json.RawMessage `json:"usage"`
@@ -272,6 +297,17 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 					completedImages++
 					if info.ResponseFacts != nil {
 						info.ResponseFacts.GeneratedImageCount = min(completedImages, int64(dto.MaxImageN))
+						info.ResponseFacts.ImageOutputEstimationStarted = true
+						frameTokens, frameKnown = estimateImageFrameOutput(info, raw)
+						generatedKnown = generatedKnown && frameKnown
+						if frameKnown {
+							var clamp *common.QuotaClamp
+							generatedTokens, clamp = common.QuotaFromFloatChecked(float64(generatedTokens) + float64(frameTokens))
+							if clamp != nil {
+								info.QuotaClamp = clamp
+								generatedKnown = false
+							}
+						}
 					}
 				}
 			}
@@ -285,6 +321,15 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 			if (writeErr == nil || errors.As(writeErr, &flushErr)) && (openaiImageDataHasField(ojson.Parse(data), "url") || openaiImageDataHasField(ojson.Parse(data), "b64_json")) {
 				if chunk.Type == "image_generation.completed" || chunk.Type == "image_edit.completed" {
 					info.ResponseFacts.DeliveredImageCount = min(info.ResponseFacts.DeliveredImageCount+1, int64(dto.MaxImageN))
+					deliveredKnown = deliveredKnown && frameKnown
+					if frameKnown {
+						var clamp *common.QuotaClamp
+						deliveredTokens, clamp = common.QuotaFromFloatChecked(float64(deliveredTokens) + float64(frameTokens))
+						if clamp != nil {
+							info.QuotaClamp = clamp
+							deliveredKnown = false
+						}
+					}
 				}
 				info.ResponseFacts.MarkBusinessOutput()
 			}
@@ -332,6 +377,14 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 			if info.ResponseFacts != nil && completedImages <= dto.MaxImageN {
 				info.ResponseFacts.ImageCount = &completedImages
 			}
+		}
+	}
+	if facts := info.ResponseFacts; facts != nil && completedImages > 0 {
+		if generatedKnown && facts.ImageCount != nil && *facts.ImageCount == completedImages {
+			facts.ImageOutputTokensEstimate = &generatedTokens
+		}
+		if deliveredKnown && facts.DeliveredImageCount > 0 {
+			facts.DeliveredImageOutputTokensEstimate = &deliveredTokens
 		}
 	}
 	return usage, nil

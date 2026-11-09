@@ -466,29 +466,29 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 			facts.ImageOutputTokensReported = true
 		} else if generated {
 			facts.ImageOutputTokensUnknown = true
-			if facts.ImageCount != nil && *facts.ImageCount > 0 && *facts.ImageCount <= dto.MaxImageN {
+			estimate := facts.ImageOutputTokensEstimate
+			if !facts.ImageOutputEstimationStarted && facts.ImageCount != nil && *facts.ImageCount > 0 && *facts.ImageCount <= dto.MaxImageN {
 				image := prepared.Request.(*dto.ImageRequest)
 				size, quality := image.Size, image.Quality
-				if *facts.ImageCount == 1 {
-					if facts.ImageOutputSize != "" {
-						size = facts.ImageOutputSize
-					}
-					if facts.ImageOutputQuality != "" {
-						quality = facts.ImageOutputQuality
-					}
-				} else if facts.ImageOutputSize != "" && facts.ImageOutputSize != size || facts.ImageOutputQuality != "" && facts.ImageOutputQuality != quality {
-					size, quality = "", ""
+				if facts.ImageOutputSize != "" {
+					size = facts.ImageOutputSize
+				}
+				if facts.ImageOutputQuality != "" {
+					quality = facts.ImageOutputQuality
 				}
 				if tokens, known := tokenkit.ImageOutputTokens(info.UpstreamModelName, size, quality); known {
 					total, clamp := common.QuotaFromFloatChecked(float64(tokens) * float64(*facts.ImageCount))
 					if clamp != nil {
 						info.QuotaClamp = clamp
 					}
-					usage.CompletionTokens, usage.OutputTokens = total, total
-					usage.CompletionTokenDetails.ImageTokens = total
-					facts.ImageOutputTokensEstimated = true
-					facts.ImageOutputTokensUnknown = false
+					estimate = &total
 				}
+			}
+			if estimate != nil {
+				usage.CompletionTokens, usage.OutputTokens = *estimate, *estimate
+				usage.CompletionTokenDetails.ImageTokens = *estimate
+				facts.ImageOutputTokensEstimated = true
+				facts.ImageOutputTokensUnknown = false
 			}
 		}
 		if usage.OutputTokensDetails != nil {
@@ -590,8 +590,13 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 			delivered := min(facts.DeliveredImageCount, *facts.ImageCount)
 			billableFacts.ImageCount = &delivered
 			saleCount = []int{int(delivered)}
-			if facts.ImageOutputTokensEstimated && *facts.ImageCount > 0 {
+			if (facts.ImageOutputTokensEstimated || facts.ImageOutputTokensUnknown && facts.DeliveredImageOutputTokensEstimate != nil) && *facts.ImageCount > 0 {
 				tokens, clamp := common.QuotaFromFloatChecked(float64(usage.CompletionTokenDetails.ImageTokens) * float64(delivered) / float64(*facts.ImageCount))
+				if facts.DeliveredImageOutputTokensEstimate != nil {
+					tokens = *facts.DeliveredImageOutputTokensEstimate
+					billableFacts.ImageOutputTokensUnknown = false
+					delete(saleInput.UnmeasuredTokens, "img_o")
+				}
 				if clamp != nil {
 					attempt.RouteDiagnostics["quota_saturation"] = clamp.AuditMap()
 				}
