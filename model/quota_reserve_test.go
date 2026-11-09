@@ -141,6 +141,9 @@ func TestRedisBatchReserveNeverFallsBackToStaleDatabaseBalance(t *testing.T) {
 func TestBatchUpdateAccumulatesTwoMaximumRequestCharges(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
+	oldRedisEnabled := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = oldRedisEnabled })
 	common.BatchUpdateEnabled = true
 
 	user := createReserveTestUser(t, common.MaxQuota*2+100)
