@@ -30,6 +30,9 @@ type NativeChatRequestContract interface {
 // DiagnoseNativeChatRequest applies strict conversion acceptance to the final
 // provider dialect as well as to public protocol conversions.
 func DiagnoseNativeChatRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest, caps NativeChatCapabilities, actual *dto.GeneralOpenAIRequest) error {
+	if request.N != nil && *request.N > 1 && (info.IsStream || !slices.Contains(caps.Parameters, "n")) {
+		return &types.ConversionLossError{Diagnostics: []types.ConversionDiagnostic{{Code: "request_parameter_dropped", Path: "n", Severity: types.ConversionDiagnosticError, From: types.RelayFormatOpenAI, To: types.RelayFormatOpenAI, Message: "native Provider cannot represent multiple output choices (n)"}}}
+	}
 	body, err := common.Marshal(request)
 	if err != nil {
 		return err
