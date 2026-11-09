@@ -1184,15 +1184,19 @@ func TestResponsesWSGatewayBoundsOutputIdentityState(t *testing.T) {
 
 func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 	for _, tc := range []struct {
-		name, terminal, source, status, interim          string
-		sale, cost                                       int64
-		invalid                                          bool
-		credentials, pending                             bool
-		item, refusal, tool, split, summary, splitPrefix bool
-		credentialOperation                              bool
-		headerOperation                                  bool
-		delta, cancel, disconnect, probe                 bool
+		name, terminal, source, status, interim, errorClass string
+		sale, cost                                          int64
+		invalid                                             bool
+		fixed                                               bool
+		credentials, pending                                bool
+		item, refusal, tool, split, summary, splitPrefix    bool
+		credentialOperation                                 bool
+		headerOperation                                     bool
+		delta, cancel, disconnect, probe                    bool
 	}{
+		{name: "output budget without content has no sale", terminal: `{"type":"response.incomplete","response":{"id":"active","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010}}}`, source: "none", status: "partial", errorClass: "output_limit", cost: 1020000},
+		{name: "output budget terminal retains token sale", delta: true, terminal: `{"type":"response.incomplete","response":{"id":"active","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010}}}`, source: "upstream", status: "partial", errorClass: "output_limit", sale: 1836000, cost: 1020000},
+		{name: "output budget terminal refunds fixed sale", fixed: true, delta: true, terminal: `{"type":"response.incomplete","response":{"id":"active","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010}}}`, source: "upstream", status: "partial", errorClass: "output_limit", cost: 1020000},
 		{name: "later partial content delta and complete snapshot", item: true, delta: true, split: true, splitPrefix: true, terminal: `{"type":"response.failed","response":{"id":"active","status":"failed","error":{"code":"server_error"}}}`, source: "estimated", status: "partial", sale: 9000, cost: 5000},
 		{name: "complete reasoning summary snapshot disconnect", item: true, summary: true, disconnect: true, source: "estimated", status: "cancelled", sale: 5400, cost: 3000},
 		{name: "later summary delta and complete snapshot", item: true, delta: true, split: true, summary: true, terminal: `{"type":"response.failed","response":{"id":"active","status":"failed","error":{"code":"server_error"}}}`, source: "estimated", status: "partial", sale: 9000, cost: 5000},
@@ -1360,6 +1364,12 @@ func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 				require.NoError(t, model.CreatePriceVersion(t.Context(), &price, fixture.sale.CreatedBy))
 				fixture.fake.Advance(2 * time.Second)
 			}
+			if tc.fixed {
+				price := *fixture.sale
+				price.ID, price.EffectiveAt, price.Expression = 0, clock.Now().Unix()+1, `tier("request",fixed(0.01))`
+				require.NoError(t, model.CreatePriceVersion(t.Context(), &price, fixture.sale.CreatedBy))
+				fixture.fake.Advance(2 * time.Second)
+			}
 			if tc.pending {
 				price := *fixture.sale
 				price.ID, price.EffectiveAt, price.Expression = 0, clock.Now().Unix()+1, `tier("pending",p * 1000 / (c - 10))`
@@ -1470,6 +1480,11 @@ func TestResponsesWSGatewayAccountingOutcomes(t *testing.T) {
 			attempts, _, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
 			require.NoError(t, err)
 			assert.Equal(t, tc.cost, attempts[0].Cost.Nanos)
+			if tc.errorClass != "" {
+				assert.Equal(t, tc.errorClass, attempts[0].ErrorClass)
+				assert.Equal(t, "stop", attempts[0].FailoverDecision)
+				assert.Equal(t, "none", attempts[0].CircuitAction)
+			}
 			wallet, err := model.GetUserWallet(fixture.user.Id)
 			require.NoError(t, err)
 			assert.Equal(t, int64(1_000_000_000)-tc.sale, wallet.Balance.Nanos)

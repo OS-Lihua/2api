@@ -418,11 +418,12 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		errorType = native.Type
 	}
 	cancelled := parent.Context().Err() != nil && !call.TerminalDelivered() || outcome.Response == relaycommon.ResponseOutcomeCancelled
+	normalBudget := (outcome.OutputLimitReached() || info.ResponseFacts.OutputLimitObserved) && apiErr == nil && call.TerminalDelivered() && info.StreamStatus.CompletedNormally() && !info.ResponseFacts.DownstreamWriteFailed && !cancelled
 	if call.TerminalDelivered() && !info.ResponseFacts.DownstreamWriteFailed {
 		attempt.Status = "failed"
 		if info.ResponseFacts.BusinessOutput {
 			attempt.Status = "partial"
-			if info.StreamStatus.CompletedNormally() {
+			if info.StreamStatus.CompletedNormally() && !outcome.OutputLimitReached() && !info.ResponseFacts.OutputLimitObserved {
 				attempt.Status = "success"
 			}
 		}
@@ -430,8 +431,9 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	if outcome.Response == relaycommon.ResponseOutcomeCancelled {
 		attempt.Status = "cancelled"
 	}
-	if outcome.Response == relaycommon.ResponseOutcomeIncomplete && outcome.IncompleteReason == "max_output_tokens" && outcome.EndReason == relaycommon.StreamEndReasonDone && !outcome.HasErrors && !info.ResponseFacts.DownstreamWriteFailed && info.ResponseFacts.BusinessOutput && !cancelled {
-		attempt.Status = "success"
+	if normalBudget {
+		attempt.Status = "partial"
+		code = "gateway_output_limit"
 	}
 	if outcome.IncompleteReason == "content_filter" {
 		code = "content_filter"
@@ -487,7 +489,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 			saleUsage := service.GatewayUsageSnapshot(usage)
 			saleUsageSource := attempt.UsageSource
 			completeOnDisconnect := info.ResponseFacts.CompletionTokensReported && info.ResponseFacts.DownstreamWriteFailed && outcome.Response == relaycommon.ResponseOutcomeCompleted
-			if !completeOnDisconnect && (attempt.Status == "partial" || !call.TerminalDelivered()) {
+			if !completeOnDisconnect && !normalBudget && (attempt.Status == "partial" || !call.TerminalDelivered()) {
 				delivered := tokenkit.Count(info.TokenizerModel, info.ResponseFacts.GeneratedText)
 				if info.ResponseFacts.DeliveredOutputTokens != nil {
 					delivered = *info.ResponseFacts.DeliveredOutputTokens
