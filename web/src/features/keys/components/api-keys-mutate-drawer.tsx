@@ -34,7 +34,6 @@ import {
   sideDrawerHeaderClassName,
   sideDrawerSwitchItemClassName,
 } from '@/components/drawer-layout'
-import { MultiSelect } from '@/components/multi-select'
 import { Button } from '@/components/ui/button'
 import {
   Collapsible,
@@ -64,7 +63,7 @@ import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { RelatedPolicyLink } from '@/features/system-settings/request-policies/related-policy-link'
 import { useStatus } from '@/hooks/use-status'
-import { getUserModels, getUserGroups } from '@/lib/api'
+import { getUserGroups } from '@/lib/api'
 import { getCurrencyDisplay, getCurrencyLabel } from '@/lib/currency'
 import { handleServerError } from '@/lib/handle-server-error'
 import {
@@ -94,6 +93,7 @@ import {
 } from './api-key-group-combobox'
 import { useApiKeys } from './api-keys-provider'
 import { AutoGroupOrderEditor } from './auto-group-order-editor'
+import { KeyPermissionsEditor } from './key-permissions-editor'
 
 type ApiKeyMutateDrawerProps = {
   open: boolean
@@ -112,19 +112,12 @@ export function ApiKeysMutateDrawer({
   const { triggerRefresh } = useApiKeys()
   const { status, loading: statusLoading } = useStatus()
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [permissionsDirty, setPermissionsDirty] = useState(false)
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [initializedTarget, setInitializedTarget] = useState<string | null>(
     null
   )
   const defaultUseAutoGroup = status?.default_use_auto_group === true
-
-  // Fetch models
-  const { data: modelsData } = useQuery({
-    queryKey: ['user-models'],
-    queryFn: async () => requireServerSuccess(await getUserModels()),
-    enabled: open,
-    staleTime: 0,
-  })
 
   // Fetch groups
   const {
@@ -161,7 +154,6 @@ export function ApiKeysMutateDrawer({
     staleTime: 0,
   })
 
-  const models = modelsData?.data || []
   const groups = useMemo<ApiKeyGroupOption[]>(
     () =>
       Object.entries(groupsData?.data || {}).map(([key, info]) => ({
@@ -288,6 +280,12 @@ export function ApiKeysMutateDrawer({
   }, [groups, form, selectedGroup])
 
   const onSubmit = async (data: ApiKeyFormValues) => {
+    if (permissionsDirty) {
+      toast.error(
+        t('Save or reload Key permissions before saving other settings.')
+      )
+      return
+    }
     setIsSubmitting(true)
     try {
       const basePayload = transformFormDataToPayload(data)
@@ -668,6 +666,23 @@ export function ApiKeysMutateDrawer({
               />
             </SideDrawerSection>
 
+            <SideDrawerSection>
+              <SideDrawerSectionHeader title={t('Key permissions')} />
+              {isUpdate && currentRow && open ? (
+                <KeyPermissionsEditor
+                  tokenId={currentRow.id}
+                  onSaved={triggerRefresh}
+                  onDirtyChange={setPermissionsDirty}
+                />
+              ) : (
+                <p className='text-muted-foreground text-sm'>
+                  {t(
+                    'New Keys allow all visible Offerings, including newly listed Offerings.'
+                  )}
+                </p>
+              )}
+            </SideDrawerSection>
+
             <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
               <SideDrawerSection>
                 <CollapsibleTrigger
@@ -693,33 +708,6 @@ export function ApiKeysMutateDrawer({
                 </CollapsibleTrigger>
                 <CollapsibleContent>
                   <div className='flex flex-col gap-4 pt-2'>
-                    <FormField
-                      control={form.control}
-                      name='model_limits'
-                      render={({ field }) => (
-                        <FormItem>
-                          <FormLabel>{t('Model Limits')}</FormLabel>
-                          <FormControl>
-                            <MultiSelect
-                              options={models.map((m) => ({
-                                label: m,
-                                value: m,
-                              }))}
-                              selected={field.value}
-                              onChange={field.onChange}
-                              placeholder={t(
-                                'Select models (empty for allow all)'
-                              )}
-                            />
-                          </FormControl>
-                          <FormDescription>
-                            {t('Limit which models can be used with this key')}
-                          </FormDescription>
-                          <FormMessage />
-                        </FormItem>
-                      )}
-                    />
-
                     <FormField
                       control={form.control}
                       name='allow_ips'
@@ -779,6 +767,13 @@ export function ApiKeysMutateDrawer({
           </form>
         </Form>
         <SheetFooter className={sideDrawerFooterClassName()}>
+          {permissionsDirty && (
+            <p role='status' className='text-muted-foreground text-xs'>
+              {t(
+                'Save or reload Key permissions before saving other settings.'
+              )}
+            </p>
+          )}
           <SheetClose
             render={<Button variant='outline' className='w-full sm:w-auto' />}
           >
@@ -787,7 +782,7 @@ export function ApiKeysMutateDrawer({
           <Button
             type='button'
             onClick={form.handleSubmit(onSubmit, onInvalid)}
-            disabled={!isFormInitialized || isSubmitting}
+            disabled={!isFormInitialized || isSubmitting || permissionsDirty}
             className='w-full sm:w-auto'
           >
             {isSubmitting ? t('Saving...') : t('Save changes')}

@@ -91,6 +91,9 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 	ids := []int{}
 	tiers := map[int]int{}
 	for _, member := range offering.Members {
+		if input.Failures != nil && member.Tier < input.Failures.MemberTier {
+			continue
+		}
 		if input.Tier != 0 && member.Tier != input.Tier {
 			continue
 		}
@@ -121,10 +124,12 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 		return nil, ErrGatewayUnavailable
 	}
 	counts := map[string]int{}
+	tierCounts := map[string]int{}
 	excluded := []map[string]any{}
 	diagnostics := map[string]any{"method": offering.RouteMethod, "candidate_count": len(candidates), "excluded_counts": counts, "affinity_hit": false, "loss_fallback": false}
 	reject := func(id int, reason string) {
 		counts[reason]++
+		tierCounts[reason]++
 		if len(excluded) < 10 {
 			excluded = append(excluded, map[string]any{"channel_id": id, "reason": reason})
 		}
@@ -138,6 +143,11 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 	slices.Sort(tierIDs)
 	lastStage := 0
 	for _, tier := range tierIDs {
+		if input.Failures != nil {
+			input.Failures.MemberTier = tier
+		}
+		lastStage = 0
+		clear(tierCounts)
 		active := []*GatewaySelection{}
 		for _, candidate := range candidates {
 			if tiers[candidate.ModelID] != tier {
@@ -384,7 +394,7 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 	if lastStage == 5 {
 		return nil, ErrGatewayConversion
 	}
-	if lastStage == 7 && counts["price_unavailable"] > 0 && counts["profit"] == 0 {
+	if lastStage == 7 && tierCounts["price_unavailable"] > 0 && tierCounts["profit"] == 0 {
 		return nil, ErrGatewayPriceUnavailable
 	}
 	return nil, ErrGatewayUnavailable
