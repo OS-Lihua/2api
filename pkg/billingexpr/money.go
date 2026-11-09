@@ -32,6 +32,9 @@ type MoneyInput struct {
 	// ImageCount overrides the request estimate with a bounded actual payload
 	// count, including zero. It never changes frozen param("n") probes.
 	ImageCount *int
+	// MeanImageCount supplies an exact historical mean for margin estimates.
+	// It is never an actual payload count or a request multiplier override.
+	MeanImageCount *big.Rat
 	// TokenQuantities overrides whole counts for exact weighted cache quantities,
 	// such as the 1.6 short-write units used by an unpriced one-hour cache write.
 	TokenQuantities map[string]decimal.Decimal
@@ -62,6 +65,7 @@ type MoneyTraceResult struct {
 	UnroundedAmount     string                  `json:"unrounded_amount,omitempty"`
 	Conditions          []MoneyConditionTrace   `json:"conditions,omitempty"`
 	ImageCount          *int                    `json:"image_count,omitempty"`
+	MeanImageCount      string                  `json:"mean_image_count,omitempty"`
 	FixedPricePerImage  bool                    `json:"fixed_price_per_image,omitempty"`
 	ImageQuantityPriced bool                    `json:"image_quantity_priced,omitempty"`
 	BillingUnit         BillingUnit             `json:"billing_unit"`
@@ -189,6 +193,14 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 		trace.ImageCount = &imageCount
 	}
 	env["image_count"] = big.NewRat(int64(imageCount), 1)
+	if entry.sourceVars["image_count"] && input.MeanImageCount != nil {
+		if input.ImageCount != nil || input.MeanImageCount.Sign() < 0 || input.MeanImageCount.Cmp(big.NewRat(dto.MaxImageN, 1)) > 0 {
+			return money.Value{}, trace, fmt.Errorf("mean image_count must be between 0 and %d without an actual count", dto.MaxImageN)
+		}
+		env["image_count"] = new(big.Rat).Set(input.MeanImageCount)
+		trace.ImageCount = nil
+		trace.MeanImageCount = input.MeanImageCount.RatString()
+	}
 	for name, count := range input.Tokens {
 		if count < 0 {
 			return money.Value{}, trace, fmt.Errorf("%s must be non-negative", name)

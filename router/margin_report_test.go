@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/money"
+	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -378,6 +379,128 @@ func TestMarginOfferingWorkloadHTTP(t *testing.T) {
 			assert.EqualValues(t, 12625000, estimate.Cost.Nanos)
 			assert.True(t, estimate.Negative)
 		}
+	}
+}
+
+func TestMarginGuardUsesMediaQuantities(t *testing.T) {
+	for _, tc := range []struct {
+		name, expression                         string
+		images, unknown, sale, zero, fx, partial bool
+	}{
+		{name: "image quantity price", images: true, expression: `tier("image",fixed(0.05))*image_count`},
+		{name: "separate delivered and generated image counts", images: true, partial: true, expression: `tier("image",fixed(0.05))*image_count`},
+		{name: "image quantity FX", images: true, fx: true},
+		{name: "unknown procurement", unknown: true, expression: `tier("tokens",img_o*7)`},
+		{name: "unknown base procurement", unknown: true, expression: `tier("tokens",c*7)`},
+		{name: "unknown sale", unknown: true, sale: true, expression: `tier("tokens",img_o*7)`},
+		{name: "reported zero", zero: true, expression: `tier("tokens",img_o*7)`},
+		{name: "unused unknown", expression: `true ? tier("request",fixed(0.02)) : tier("tokens",img_o*7)`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
+				var input struct {
+					N int `json:"n"`
+				}
+				require.NoError(t, common.DecodeJson(r.Body, &input))
+				data := make([]string, input.N)
+				for i := range data {
+					data[i] = `{"url":"https://image.invalid/one"}`
+				}
+				usage := ""
+				if tc.zero {
+					usage = `,"usage":{"input_tokens":0,"output_tokens":0}`
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, err := fmt.Fprintf(w, `{"data":[%s]%s}`, strings.Join(data, ","), usage)
+				require.NoError(t, err)
+			})
+			common.OptionMapRWMutex.Lock()
+			common.OptionMap["GroupRatio"] = `{"default":1}`
+			common.OptionMapRWMutex.Unlock()
+			currency := money.Currency("USD")
+			if tc.fx {
+				currency = "EUR"
+				_, err := model.SaveFXRate(t.Context(), "EUR", "USD", "1", "0", fixture.sale.CreatedBy)
+				require.NoError(t, err)
+			}
+			saleExpression, purchaseExpression := `tier("request",fixed(0.04))`, `tier("request",fixed(0.02))`
+			if tc.images {
+				saleExpression += `*image_count`
+				purchaseExpression += `*image_count`
+			}
+			fixture.fake.Advance(time.Second)
+			for _, price := range []*model.PriceVersion{{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: saleExpression, EffectiveAt: clock.Now().Unix()}, {OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: currency, Expression: purchaseExpression, EffectiveAt: clock.Now().Unix()}} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			for count := 1; count <= 2; count++ {
+				body := fmt.Sprintf(`{"model":"gateway-alias","prompt":"draw","n":%d}`, count)
+				var response *httptest.ResponseRecorder
+				if tc.partial && count == 2 {
+					request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(fmt.Sprintf(`{"model":"gateway-alias","prompt":"draw","n":%d,"stream":true}`, count)))
+					request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+					request.Header.Set("Content-Type", "application/json")
+					response = httptest.NewRecorder()
+					fixture.engine.ServeHTTP(&mediaFrameFailureWriter{ResponseRecorder: response, failFrame: 2}, request)
+				} else {
+					response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", body)
+				}
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				fixture.fake.Advance(time.Second)
+			}
+			manager := createWalletTestAccessToken(t, fixture.sale.CreatedBy, "pricing:read", "pricing:write")
+			owner, id := "channel", fixture.channel.ID
+			if tc.sale {
+				owner, id = "model_offering", fixture.offering.ID
+			}
+			path, method := "/api/admin/v1/price-versions", http.MethodPost
+			draft := fmt.Sprintf(`{"owner_type":%q,"owner_id":%d,"currency":"USD","expression":%q}`, owner, id, tc.expression)
+			if tc.fx {
+				path, method = "/api/admin/v1/fx-rates", http.MethodPut
+				draft = `{"from_currency":"EUR","to_currency":"USD","rate":"3","buffer_rate":"0"}`
+			}
+			response := adminSecurityRequest(fixture.engine, manager, method, path, draft)
+			var reply struct {
+				Data        model.PriceMarginReport `json:"data"`
+				MarginCheck model.PriceMarginReport `json:"margin_check"`
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &reply))
+			if tc.images {
+				require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
+				require.True(t, reply.Data.RequiresConfirmation)
+				require.Len(t, reply.Data.Estimates, 1)
+				estimate := reply.Data.Estimates[0]
+				require.NotNil(t, estimate.Revenue)
+				require.NotNil(t, estimate.Cost)
+				revenue := int64(60_000_000)
+				if tc.partial {
+					revenue = 40_000_000
+				}
+				assert.EqualValues(t, revenue, estimate.Revenue.Nanos)
+				cost := int64(75_000_000)
+				if tc.fx {
+					cost = 90_000_000
+				}
+				assert.EqualValues(t, cost, estimate.Cost.Nanos)
+				assert.True(t, estimate.Negative)
+				return
+			}
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			require.Len(t, reply.MarginCheck.Estimates, 1)
+			estimate := reply.MarginCheck.Estimates[0]
+			if tc.unknown {
+				assert.Equal(t, "usage_details_unavailable", estimate.Status)
+				assert.Nil(t, estimate.Revenue)
+				assert.Nil(t, estimate.Cost)
+				return
+			}
+			assert.Equal(t, "estimated", estimate.Status)
+			require.NotNil(t, estimate.Cost)
+			cost := int64(20_000_000)
+			if tc.zero {
+				cost = 0
+			}
+			assert.EqualValues(t, cost, estimate.Cost.Nanos)
+		})
 	}
 }
 

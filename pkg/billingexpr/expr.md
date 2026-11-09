@@ -288,7 +288,11 @@ bounded actual payload count from 0 through `dto.MaxImageN`. Zero means no image
 payload; nil leaves the existing request-estimate behavior intact. It does not
 change frozen `param("n")` probes. `RequestInput.ImageCount` retains its existing
 1-through-128 validation and default of one. This additive currency-path input
-does not change `RunExpr` or task usage expressions. Audio `ai`/`ao` quantities
+does not change `RunExpr` or task usage expressions. `MoneyInput.MeanImageCount`
+accepts an exact rational historical mean from 0 through `dto.MaxImageN` for
+margin estimates. It cannot be combined with an actual `ImageCount`; its trace
+uses `mean_image_count` and leaves actual `image_count` absent. A mean never
+becomes a measured payload count. Audio `ai`/`ao` quantities
 retain their per-million-token semantics; measured audio seconds are normalized
 by the host's existing 1000-tokens-per-minute convention before evaluation.
 
