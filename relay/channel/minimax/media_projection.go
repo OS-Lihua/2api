@@ -13,6 +13,13 @@ import (
 type speechRequestBody struct{ *bytes.Reader }
 
 func (speechRequestBody) ProjectAudioRequest(body []byte, public dto.AudioRequest) (*dto.AudioRequest, error) {
+	var conditioning dto.AudioRequest
+	if err := common.Unmarshal(body, &conditioning); err != nil {
+		return nil, err
+	}
+	if public.HasSpeechConditioning() || conditioning.HasSpeechConditioning() {
+		return nil, fmt.Errorf("MiniMax speech cannot preserve the requested conditioning inputs")
+	}
 	if len(public.MaxNewTokens) > 0 || ojson.GetBytes(body, "max_new_tokens").Exists() {
 		return nil, fmt.Errorf("MiniMax speech cannot enforce an output token limit")
 	}

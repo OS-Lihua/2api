@@ -439,7 +439,8 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 			usage.PromptTokensDetails.AudioTokens = inputTokens
 		}
 	}
-	if !facts.PromptTokensReported && !facts.AudioInputTokensReported && facts.AudioInputTokensEstimated > 0 {
+	referenceInputEstimated := !facts.AudioInputTokensReported && facts.AudioInputTokensEstimated > 0
+	if referenceInputEstimated {
 		usage.PromptTokensDetails.AudioTokens = facts.AudioInputTokensEstimated
 	}
 	if !facts.CompletionTokensReported && facts.GeneratedText != "" {
@@ -503,7 +504,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	if generated || facts.PromptTokensReported || facts.CompletionTokensReported || facts.AudioInputTokensReported || facts.TextInputTokensReported || facts.AudioOutputTokensReported || facts.ImageInputTokensReported || facts.ImageOutputTokensReported || facts.AudioInputDurationReported || facts.AudioInputDurationInvalid {
 		attempt.UsageSource = "estimated"
 	}
-	if facts.UsageReported {
+	if facts.UsageReported && !referenceInputEstimated && !facts.ImageOutputTokensEstimated {
 		attempt.UsageSource = "upstream"
 	}
 	actualCount := []int{}

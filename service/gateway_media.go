@@ -30,27 +30,58 @@ func CountGatewayMediaInput(c *gin.Context, request dto.Request, info *relaycomm
 		facts := info.ResponseFacts
 		facts.AudioInputSeconds = nil
 		facts.AudioInputTokensEstimated = 0
+		for _, value := range []common.RawMessage{audio.RefAudio2, audio.RefAudioCodes, audio.SpeakerEmbedding, audio.ExtraParams} {
+			if raw := strings.TrimSpace(string(value)); raw != "" && raw != "null" {
+				return 0, errors.New("speech conditioning input cannot be measured locally")
+			}
+		}
 		if audio.Instructions != "" {
 			meta.CombineText += "\n" + audio.Instructions
 		}
+		transcript := ""
 		if len(audio.RefText) > 0 && string(audio.RefText) != "null" {
-			var text string
-			if common.Unmarshal(audio.RefText, &text) != nil {
+			if common.Unmarshal(audio.RefText, &transcript) != nil {
 				return 0, errors.New("invalid speech reference transcript")
 			}
-			meta.CombineText += "\n" + text
 		}
+		var references []string
+		singleReference := false
 		if len(audio.RefAudio) > 0 && string(audio.RefAudio) != "null" {
-			var references []string
 			var single string
 			if common.Unmarshal(audio.RefAudio, &single) == nil {
 				references = []string{single}
+				singleReference = true
 			} else if common.Unmarshal(audio.RefAudio, &references) != nil {
 				return 0, errors.New("invalid speech reference audio")
 			}
 			if len(references) == 0 {
 				return 0, errors.New("invalid speech reference audio")
 			}
+		}
+		if len(audio.References) > 0 && string(audio.References) != "null" {
+			var aliases []struct {
+				AudioPath string  `json:"audio_path"`
+				Text      *string `json:"text"`
+			}
+			if common.Unmarshal(audio.References, &aliases) != nil || len(aliases) != 1 || aliases[0].AudioPath == "" {
+				return 0, errors.New("invalid speech reference alias")
+			}
+			alias := aliases[0]
+			if len(references) > 0 && (!singleReference || references[0] != alias.AudioPath) {
+				return 0, errors.New("conflicting speech reference audio")
+			}
+			references = []string{alias.AudioPath}
+			if alias.Text != nil && strings.TrimSpace(*alias.Text) != "" {
+				if transcript != "" && transcript != *alias.Text {
+					return 0, errors.New("conflicting speech reference transcript")
+				}
+				transcript = *alias.Text
+			}
+		}
+		if transcript != "" {
+			meta.CombineText += "\n" + transcript
+		}
+		if len(references) > 0 {
 			seconds := decimal.Zero
 			for _, reference := range references {
 				mediaType := ""
@@ -164,7 +195,7 @@ func GatewayMediaCapabilitiesMatch(c *gin.Context, kind protocol.Type, request d
 		if caps.Limits.MaxDurationSeconds != nil {
 			return false
 		}
-		if audio, ok := request.(*dto.AudioRequest); ok && len(audio.RefAudio) > 0 && string(audio.RefAudio) != "null" && !slices.Contains(caps.InputModalities, capability.Audio) {
+		if facts != nil && facts.AudioInputSeconds != nil && !slices.Contains(caps.InputModalities, capability.Audio) {
 			return false
 		}
 		output = capability.Audio

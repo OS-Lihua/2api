@@ -23,11 +23,28 @@ type AudioRequest struct {
 	Language                json.RawMessage `json:"language,omitempty"`
 	RefAudio                json.RawMessage `json:"ref_audio,omitempty"`
 	RefText                 json.RawMessage `json:"ref_text,omitempty"`
+	References              json.RawMessage `json:"references,omitempty"`
+	RefAudio2               json.RawMessage `json:"ref_audio_2,omitempty"`
+	RefAudioCodes           json.RawMessage `json:"ref_audio_codes,omitempty"`
+	SpeakerEmbedding        json.RawMessage `json:"speaker_embedding,omitempty"`
+	ExtraParams             json.RawMessage `json:"extra_params,omitempty"`
 	XVectorOnlyMode         json.RawMessage `json:"x_vector_only_mode,omitempty"`
 	MaxNewTokens            json.RawMessage `json:"max_new_tokens,omitempty"`
 	InitialCodecChunkFrames json.RawMessage `json:"initial_codec_chunk_frames,omitempty"`
 	// TODO：ensure that the logic remains correct after the stream is started.
 	//Stream                  json.RawMessage `json:"stream,omitempty"`
+}
+
+func (r *AudioRequest) HasSpeechConditioning() bool {
+	if r.Instructions != "" {
+		return true
+	}
+	for _, value := range []json.RawMessage{r.RefAudio, r.RefText, r.References, r.RefAudio2, r.RefAudioCodes, r.SpeakerEmbedding, r.ExtraParams} {
+		if raw := strings.TrimSpace(string(value)); raw != "" && raw != "null" && raw != `""` {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *AudioRequest) GetTokenCountMeta() *types.TokenCountMeta {

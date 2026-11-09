@@ -314,13 +314,21 @@ func RecentOfferingOutputTokens(ctx context.Context, offeringID int, at int64) (
 		return 1024, nil
 	}
 	total := new(big.Rat)
+	samples := int64(0)
 	for _, record := range recent {
+		if slices.Contains(record.Usage.UnmeasuredTokens, "c") {
+			continue
+		}
 		if record.Usage.CompletionTokens < 0 || record.Usage.CompletionTokens > 1<<31-1 || record.ChoiceCount < 1 {
 			return 0, fmt.Errorf("invalid recorded output usage")
 		}
 		total.Add(total, big.NewRat(record.Usage.CompletionTokens, int64(record.ChoiceCount)))
+		samples++
 	}
-	mean := total.Quo(total, big.NewRat(int64(len(recent)), 1))
+	if samples == 0 {
+		return 1024, nil
+	}
+	mean := total.Quo(total, big.NewRat(samples, 1))
 	whole, remainder := new(big.Int), new(big.Int)
 	whole.QuoRem(mean.Num(), mean.Denom(), remainder)
 	if remainder.Sign() > 0 {

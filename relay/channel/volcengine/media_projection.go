@@ -15,6 +15,18 @@ import (
 type speechRequestBody struct{ io.Reader }
 
 func (speechRequestBody) ProjectAudioRequest(body []byte, public dto.AudioRequest) (*dto.AudioRequest, error) {
+	if public.HasSpeechConditioning() {
+		return nil, fmt.Errorf("Volcengine speech cannot preserve the requested conditioning inputs")
+	}
+	for _, fields := range [][]byte{body, []byte(ojson.GetBytes(body, "request").Raw)} {
+		var conditioning dto.AudioRequest
+		if err := common.Unmarshal(fields, &conditioning); err != nil {
+			return nil, err
+		}
+		if conditioning.HasSpeechConditioning() {
+			return nil, fmt.Errorf("Volcengine speech cannot preserve the requested conditioning inputs")
+		}
+	}
 	if len(public.MaxNewTokens) > 0 || ojson.GetBytes(body, "max_new_tokens").Exists() || ojson.GetBytes(body, "request.max_new_tokens").Exists() {
 		return nil, fmt.Errorf("Volcengine speech cannot enforce an output token limit")
 	}

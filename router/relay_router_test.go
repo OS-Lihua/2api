@@ -5086,6 +5086,8 @@ func TestMediaGatewaySpeechReferenceInputsHonorCapabilitiesAndFunding(t *testing
 	for _, tc := range []struct {
 		name                                                      string
 		allow, override, clear, remote, badPrefix, multiple, zero bool
+		alias, totalOnly, conflict, totalOnlyZero                 bool
+		unsupported                                               string
 		context                                                   int64
 		status                                                    int
 	}{
@@ -5094,6 +5096,16 @@ func TestMediaGatewaySpeechReferenceInputsHonorCapabilitiesAndFunding(t *testing
 		{name: "reference array", allow: true, multiple: true, status: 200},
 		{name: "reported reference zero", allow: true, zero: true, status: 200},
 		{name: "measured reference", allow: true, status: 200},
+		{name: "original references alias", alias: true, status: 400},
+		{name: "effective references alias", alias: true, override: true, status: 400},
+		{name: "measured references alias", alias: true, allow: true, status: 200},
+		{name: "conflicting references alias", alias: true, allow: true, conflict: true, status: 400},
+		{name: "base input keeps missing reference detail", allow: true, totalOnly: true, status: 200},
+		{name: "base zero keeps missing reference detail", allow: true, totalOnly: true, totalOnlyZero: true, status: 200},
+		{name: "opaque second reference", allow: true, unsupported: `"ref_audio_2":"file:///private/reference.wav"`, status: 400},
+		{name: "opaque reference codes", allow: true, unsupported: `"ref_audio_codes":[[1,2]]`, status: 400},
+		{name: "opaque speaker embedding", allow: true, unsupported: `"speaker_embedding":[1,2]`, status: 400},
+		{name: "opaque speech extra inputs", allow: true, unsupported: `"extra_params":{"ref_audio":"file:///private/reference.wav"}`, status: 400},
 		{name: "original context before override", allow: true, clear: true, context: 8, status: 400},
 		{name: "reference URL is not inline audio", allow: true, badPrefix: true, status: 400},
 		{name: "unmeasurable server reference", allow: true, remote: true, status: 400},
@@ -5102,6 +5114,13 @@ func TestMediaGatewaySpeechReferenceInputsHonorCapabilitiesAndFunding(t *testing
 			calls := 0
 			fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
 				calls++
+				if tc.totalOnly {
+					value := "100"
+					if tc.totalOnlyZero {
+						value = "0"
+					}
+					w.Header().Set("X-VLLM-OMNI-INPUT-TOKENS", value)
+				}
 				if tc.zero {
 					w.Header().Set("X-VLLM-OMNI-INPUT-TOKENS", "0")
 					w.Header().Set("X-VLLM-OMNI-INPUT-AUDIO-TOKENS", "0")
@@ -5128,12 +5147,26 @@ func TestMediaGatewaySpeechReferenceInputsHonorCapabilitiesAndFunding(t *testing
 				ref = "file:///provider/private/reference.wav"
 			}
 			extra := fmt.Sprintf(`,"ref_audio":%q,"ref_text":"reference"`, ref)
+			if tc.alias {
+				extra = fmt.Sprintf(`,"references":[{"audio_path":%q,"text":"reference"}]`, ref)
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("setting", `{"pass_through_body_enabled":true}`).Error)
+				if tc.conflict {
+					extra += fmt.Sprintf(`,"ref_audio":%q`, reference+"wrong")
+				}
+			}
+			if tc.unsupported != "" {
+				extra = "," + tc.unsupported
+			}
 			if tc.multiple {
 				extra = fmt.Sprintf(`,"ref_audio":[%q,%q],"ref_text":"reference"`, ref, ref)
 			}
 			if tc.override {
 				extra = ""
-				override, err := common.Marshal(map[string]any{"ref_audio": reference, "ref_text": "reference"})
+				fields := map[string]any{"ref_audio": reference, "ref_text": "reference"}
+				if tc.alias {
+					fields = map[string]any{"references": []map[string]string{{"audio_path": reference, "text": "reference"}}}
+				}
+				override, err := common.Marshal(fields)
 				require.NoError(t, err)
 				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", string(override)).Error)
 			}
@@ -5169,7 +5202,17 @@ func TestMediaGatewaySpeechReferenceInputsHonorCapabilitiesAndFunding(t *testing
 			assert.Equal(t, new(tokens), record.Usage.AudioInputTokens)
 			require.NotNil(t, record.Usage.AudioInputSeconds)
 			assert.Equal(t, seconds, *record.Usage.AudioInputSeconds)
-			assert.GreaterOrEqual(t, record.Usage.PromptTokens, tokens)
+			if !tc.totalOnlyZero {
+				assert.GreaterOrEqual(t, record.Usage.PromptTokens, tokens)
+			}
+			if tc.totalOnly {
+				expected := int64(100)
+				if tc.totalOnlyZero {
+					expected = 0
+				}
+				assert.EqualValues(t, expected, record.Usage.PromptTokens)
+				assert.Equal(t, "estimated", record.UsageSource)
+			}
 			assert.EqualValues(t, tokens*9000, record.Receivable.Nanos)
 			assert.EqualValues(t, 1_000_000_000-tokens*9000, wallet.Balance.Nanos)
 			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
@@ -5177,6 +5220,40 @@ func TestMediaGatewaySpeechReferenceInputsHonorCapabilitiesAndFunding(t *testing
 			require.EqualValues(t, 1, total)
 			assert.EqualValues(t, tokens*7000, attempts[0].Cost.Nanos)
 		})
+	}
+}
+
+func TestMediaGatewayNativeSpeechRejectsUnsentConditioning(t *testing.T) {
+	wave := mediaWAV(t, 8000, 16000, make([]byte, 16000))
+	reference := "data:audio/wav;base64," + base64.StdEncoding.EncodeToString(wave)
+	for _, provider := range []int{constant.ChannelTypeMiniMax, constant.ChannelTypeVolcEngine} {
+		for _, extra := range []string{`,"instructions":"calm voice"`, `,"ref_text":"reference"`, fmt.Sprintf(`,"ref_audio":%q`, reference), fmt.Sprintf(`,"references":[{"audio_path":%q,"text":"reference"}]`, reference)} {
+			label, _, _ := strings.Cut(extra, ":")
+			t.Run(fmt.Sprintf("%d/%s", provider, label), func(t *testing.T) {
+				calls := 0
+				fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					w.Header().Set("Content-Type", "application/json")
+					audio := make([]byte, 48000)
+					if provider == constant.ChannelTypeMiniMax {
+						_, _ = fmt.Fprintf(w, `{"data":{"audio":%q,"status":2},"base_resp":{"status_code":0}}`, hex.EncodeToString(audio))
+					} else {
+						_, _ = fmt.Fprintf(w, `{"code":3000,"data":%q}`, base64.StdEncoding.EncodeToString(audio))
+					}
+				})
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": provider, "key": "access|secret"}).Error)
+				var unified model.Model
+				require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+				unified.Capabilities.InputModalities = []capability.Modality{capability.Text, capability.Audio}
+				require.NoError(t, model.DB.Save(&unified).Error)
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", fmt.Sprintf(`{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm"%s}`, extra))
+				assert.Equal(t, 400, response.Code)
+				assert.Zero(t, calls)
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
+			})
+		}
 	}
 }
 
@@ -5311,6 +5388,15 @@ func TestMediaGatewayMissingImageOutputUsageEstimatesOrStaysPending(t *testing.T
 				}
 				assert.Equal(t, expectedOutput, record.Usage.ImageOutputTokens)
 				assert.Equal(t, expectedOutput, attempts[0].Usage.ImageOutputTokens)
+				if tc.free || tc.zero {
+					mean, err := model.RecentOfferingOutputTokens(t.Context(), fixture.offering.ID, record.EndedAt)
+					require.NoError(t, err)
+					expected := int64(0)
+					if tc.free {
+						expected = 1024
+					}
+					assert.Equal(t, expected, mean)
+				}
 				assert.Equal(t, tc.tokens*8100, record.Receivable.Nanos)
 				assert.Equal(t, tc.tokens*7000, attempts[0].Cost.Nanos)
 				if tc.tokens > 0 {
