@@ -158,6 +158,10 @@ func (p *sparkProtocol) DoResponse(c *gin.Context, resp *http.Response, info *re
 				}
 				raw = relaycommon.SanitizeNativeUsage(raw, "payload.usage.text")
 			}
+			if err := c.Request.Context().Err(); err != nil {
+				_ = writer.CloseWithError(err)
+				return
+			}
 			var frame XunfeiChatResponse
 			if err := common.Unmarshal(raw, &frame); err != nil {
 				if info.ResponseFacts != nil && len(reportedUsage) > 0 {

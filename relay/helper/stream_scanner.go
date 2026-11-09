@@ -204,7 +204,7 @@ func (w *streamResponseWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
-func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult)) {
+func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult), stoppedSource ...func(string)) {
 
 	if resp == nil || dataHandler == nil {
 		return
@@ -346,6 +346,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	}
 
 	dataChan := make(chan string, 10)
+	var pendingSource string
 	sr := newStreamResult(info.StreamStatus)
 
 	wg.Add(1)
@@ -386,15 +387,6 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		}()
 
 		for scanner.Scan() {
-			// 检查是否需要停止
-			select {
-			case <-stopChan:
-				return
-			case <-ctx.Done():
-				return
-			default:
-			}
-
 			if ticker != nil {
 				ticker.Reset(streamingTimeout)
 			}
@@ -407,18 +399,27 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 
 			if managed {
 				event := ParseSSEEvent(data)
-				if !event.HasData {
-					continue
+				data = ""
+				if event.HasData {
+					data = event.Data
 				}
-				data = event.Data
 			} else {
 				var hasDataPrefix bool
 				data, hasDataPrefix = strings.CutPrefix(data, "data:")
 				if !hasDataPrefix && strings.TrimSpace(data) != "[DONE]" {
-					continue
+					data = ""
 				}
 			}
 			data = strings.TrimSpace(data)
+			select {
+			case <-stopChan:
+				pendingSource = data
+				return
+			case <-ctx.Done():
+				pendingSource = data
+				return
+			default:
+			}
 			if data == "" {
 				continue
 			}
@@ -429,8 +430,10 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				select {
 				case dataChan <- data:
 				case <-ctx.Done():
+					pendingSource = data
 					return
 				case <-stopChan:
+					pendingSource = data
 					return
 				}
 			} else {
@@ -470,6 +473,16 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	}
 
 	cleanup()
+	// Source observation runs only after both stream goroutines have joined.
+	// It retains received frames without another public write or terminal callback.
+	if len(stoppedSource) > 0 && stoppedSource[0] != nil {
+		for data := range dataChan {
+			stoppedSource[0](data)
+		}
+		if pendingSource != "" && pendingSource != "[DONE]" {
+			stoppedSource[0](pendingSource)
+		}
+	}
 	// All stream goroutines have joined. Done from a successfully delivered
 	// protocol completion can now correct a cancellation that won while its
 	// callback was still running. Bare EOF and failed writes never qualify.

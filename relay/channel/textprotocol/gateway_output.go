@@ -117,7 +117,7 @@ func (o *gatewayGeneratedOutput) ObserveResponses(body []byte) (string, bool) {
 		text := gatewayResponsesContentText(root.Get("part"))
 		o.mergePart(fmt.Sprintf("%d/%s/%d", index, category, partIndex), text, false)
 		return text, true
-	case "response.completed", "response.done", "response.incomplete":
+	case "response.completed", "response.done", "response.incomplete", "response.failed", "response.cancelled", "response.canceled":
 		var text strings.Builder
 		for index, item := range root.Get("response.output").Array() {
 			text.WriteString(o.ObserveItem(int64(index), item))
@@ -251,7 +251,7 @@ func gatewayResponseTool(item gjson.Result) (string, string, bool) {
 		}
 		var arguments strings.Builder
 		for _, key := range []string{"action", "arguments", "input", "code", "queries"} {
-			if value := item.Get(key); value.Exists() && value.Type != gjson.Null {
+			if value := item.Get(key); value.Exists() && value.Type != gjson.Null && gjson.Valid(value.Raw) {
 				arguments.WriteString(value.String())
 			}
 		}
@@ -273,7 +273,7 @@ func gatewayMediaOutput(body []byte, format types.RelayFormat) bool {
 			items = append(items, item)
 		}
 		for _, item := range items {
-			if item.Get("type").String() == "image_generation_call" && item.Get("result").Type == gjson.String && item.Get("result").String() != "" {
+			if item.Get("type").String() == "image_generation_call" && relaycommon.SourceText(item.Get("result")) != "" {
 				return true
 			}
 		}
@@ -305,7 +305,9 @@ func gatewayGeminiPartText(part gjson.Result) string {
 	text.WriteString(relaycommon.SourceText(part.Get("text")))
 	if part.Get("functionCall").Exists() {
 		text.WriteString(relaycommon.SourceText(part.Get("functionCall.name")))
-		text.WriteString(part.Get("functionCall.args").Raw)
+		if arguments := part.Get("functionCall.args"); gjson.Valid(arguments.Raw) {
+			text.WriteString(arguments.Raw)
+		}
 	}
 	text.WriteString(relaycommon.SourceText(part.Get("executableCode.code")))
 	text.WriteString(relaycommon.SourceText(part.Get("codeExecutionResult.output")))
@@ -322,7 +324,7 @@ func gatewayMessagesBlockText(block gjson.Result) string {
 		text := relaycommon.SourceText(block.Get("name"))
 		input := block.Get("input")
 		// An empty initial object is a placeholder before input_json_delta.
-		if input.Exists() && input.Type != gjson.Null && input.Raw != "{}" {
+		if input.Exists() && input.Type != gjson.Null && input.Raw != "{}" && gjson.Valid(input.Raw) {
 			text += input.String()
 		}
 		return text

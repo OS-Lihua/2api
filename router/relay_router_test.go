@@ -4451,6 +4451,9 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 		{name: "independent stream source Coze malformed id", provider: constant.ChannelTypeCoze, stream: true, body: "event: conversation.message.delta\ndata: {\"id\":1,\"content\":\"Hello\",\"reasoning_content\":\"World\"}\n\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 4000},
 		{name: "independent unterminated source Coze malformed id", provider: constant.ChannelTypeCoze, stream: true, body: "event: conversation.message.delta\ndata: {\"id\":1,\"content\":\"Hello\",\"reasoning_content\":\"World\"}", status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 4000},
 		{name: "independent stream source Chat malformed created", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "openai_chat", stream: true, body: "data: {\"created\":{},\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}\n\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 2000},
+		{name: "Responses failed snapshot does not duplicate delta", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "openai_responses", stream: true, body: "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\"},\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"}]}]}}\n\n", status: "partial", source: "estimated", prompt: 9, completion: 1, charge: 19800, purchaseExpression: `tier("output",c*2)`, cost: 2000},
+		{name: "Responses failed snapshot preserves source", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "openai_responses", stream: true, body: "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"failed\"},\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"}]}]}}\n\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 2000},
+		{name: "Chat incomplete root retains complete usage", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "openai_chat", stream: true, body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":100},\"tail\":", status: "partial", source: "estimated", prompt: 1000, completion: 1, charge: 1803600, cost: 1200000, purchase: &model.GatewayUsage{PromptTokens: 1000, CompletionTokens: 100}},
 		{name: "invalid source Chat incomplete string", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "openai_chat", shortBody: true, body: `{"choices":[{"message":{"content":"Hello`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 0},
 		{name: "invalid source Responses incomplete string", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "openai_responses", shortBody: true, body: `{"output":[{"type":"message","content":[{"type":"output_text","text":"Hello`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 0},
 		{name: "invalid source Messages numeric text", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "anthropic_messages", body: `{"id":"msg","type":"message","role":"assistant","content":[{"type":"text","text":123}],"stop_reason":"end_turn"}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", purchaseExpression: `tier("output",c*2)`, cost: 0},
@@ -5092,7 +5095,8 @@ func TestTextGatewayNativeStreamCancellationPreservesPurchase(t *testing.T) {
 	for _, provider := range []struct {
 		name, body, key string
 		kind            int
-	}{{"Zhipu", "data:Hello\n", "test.secret", constant.ChannelTypeZhipu}, {"PaLM", `{"candidates":[{"content":"Hello"}]}`, "", constant.ChannelTypePaLM}} {
+		tokens          int
+	}{{"Zhipu", "data:Hello\n", "test.secret", constant.ChannelTypeZhipu, 1}, {"PaLM", `{"candidates":[{"content":"Hello"}]}`, "", constant.ChannelTypePaLM, 1}, {"Ollama tool", "{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"Hello\",\"arguments\":{}}}]},\"done\":false}\n", "", constant.ChannelTypeOllama, 9}} {
 		t.Run(provider.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			t.Cleanup(cancel)
@@ -5103,6 +5107,9 @@ func TestTextGatewayNativeStreamCancellationPreservesPurchase(t *testing.T) {
 				_, _ = io.WriteString(w, provider.body)
 			})
 			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": provider.kind, "key": provider.key}).Error)
+			if provider.kind == constant.ChannelTypeOllama {
+				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", capability.Set{Features: []capability.Feature{capability.Streaming, capability.ToolCalling}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}).Error)
+			}
 			require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("output", c * 2)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
 			client := service.GetHttpClient()
 			original := client.Transport
@@ -5138,8 +5145,8 @@ func TestTextGatewayNativeStreamCancellationPreservesPurchase(t *testing.T) {
 			require.Len(t, items, 1)
 			attempt := items[0].(map[string]any)
 			assert.Equal(t, "estimated", attempt["usage_source"])
-			assert.EqualValues(t, 1, attempt["usage"].(map[string]any)["completion_tokens"])
-			assert.Equal(t, map[string]any{"nanos": "2000", "currency": "USD"}, attempt["cost"])
+			assert.EqualValues(t, provider.tokens, attempt["usage"].(map[string]any)["completion_tokens"])
+			assert.Equal(t, map[string]any{"nanos": strconv.Itoa(provider.tokens * 2000), "currency": "USD"}, attempt["cost"])
 		})
 	}
 }
@@ -6960,7 +6967,7 @@ func TestTextGatewayNativeGeminiMediaReferencesRetainValidationFacts(t *testing.
 	for _, media := range []struct {
 		name, mime string
 		modality   capability.Modality
-	}{{"video", "video/mp4", capability.Video}, {"audio", "audio/mpeg", capability.Audio}, {"PDF", "application/pdf", capability.PDF}, {"image reference", "image/png", capability.Image}, {"native image codec", "image/heic", capability.Image}} {
+	}{{"text reference", "text/plain", capability.Text}, {"video", "video/mp4", capability.Video}, {"audio", "audio/mpeg", capability.Audio}, {"PDF", "application/pdf", capability.PDF}, {"image reference", "image/png", capability.Image}, {"native image codec", "image/heic", capability.Image}} {
 		for _, test := range []struct {
 			name      string
 			allowed   bool
@@ -6999,7 +7006,7 @@ func TestTextGatewayNativeGeminiMediaReferencesRetainValidationFacts(t *testing.
 				})
 				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "gemini_generate").Error)
 				caps := capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}, Limits: capability.Limits{ContextLength: &test.context}}
-				if test.mediaOnly {
+				if test.mediaOnly || media.modality == capability.Text && !test.allowed {
 					caps.InputModalities = nil
 				}
 				if test.allowed {
@@ -9695,17 +9702,26 @@ func TestTextGatewayMalformedSafetyFrameNeverSwitches(t *testing.T) {
 }
 
 func TestTextGatewayNativeComposerReturnsParameterReasons(t *testing.T) {
-	for _, test := range []struct{ field, extra string }{{"tools", `"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]`}, {"response_format", `"response_format":{"type":"json_object"}`}} {
+	for _, test := range []struct {
+		field, extra string
+		provider     int
+		reason       string
+		system       bool
+	}{{"tools", `"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]`, constant.ChannelTypeCohere, "The native Cohere request cannot represent this parameter", false}, {"response_format", `"response_format":{"type":"json_object"}`, constant.ChannelTypeCohere, "The native Cohere request cannot represent this parameter", false}, {"messages[0].role", `"max_tokens":16`, constant.ChannelTypeCoze, "The native Coze request cannot represent this message role", true}, {"max_tokens", `"max_tokens":0`, constant.ChannelTypePaLM, "PaLM generateMessage cannot represent this parameter", false}} {
 		t.Run(test.field, func(t *testing.T) {
 			calls := 0
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { calls++ })
-			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeCohere).Error)
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", test.provider).Error)
 			caps := capability.Set{Features: []capability.Feature{capability.ToolCalling, capability.StructuredOutput}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}
 			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
-			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", fmt.Sprintf(`{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],%s}`, test.extra))
+			messages := `[{"role":"user","content":"Hello"}]`
+			if test.system {
+				messages = `[{"role":"system","content":"Answer briefly"},{"role":"user","content":"Hello"}]`
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", fmt.Sprintf(`{"model":"gateway-offering","messages":%s,%s}`, messages, test.extra))
 			assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
 			assert.Contains(t, response.Body.String(), test.field)
-			assert.Contains(t, response.Body.String(), "The native Cohere request cannot represent this parameter")
+			assert.Contains(t, response.Body.String(), test.reason)
 			assert.Zero(t, calls)
 		})
 	}
@@ -11847,15 +11863,161 @@ func TestTextGatewayToolOnlyUsageCountsDeliveredArguments(t *testing.T) {
 
 type gatewayPrefixOnlyWriter struct {
 	*httptest.ResponseRecorder
-	nilError bool
+	nilError    bool
+	full        bool
+	beforeWrite func()
 }
 
 func (w gatewayPrefixOnlyWriter) Write(body []byte) (int, error) {
-	n, _ := w.ResponseRecorder.Write(body[:min(8, len(body))])
+	if w.beforeWrite != nil {
+		w.beforeWrite()
+	}
+	length := min(8, len(body))
+	if w.full {
+		length = len(body)
+	}
+	n, _ := w.ResponseRecorder.Write(body[:length])
 	if w.nilError {
 		return n, nil
 	}
 	return n, io.ErrClosedPipe
+}
+
+type gatewayQueuedUsageBody struct {
+	chunks                     []*strings.Reader
+	index                      int
+	firstWrite, queued, closed chan struct{}
+	once                       sync.Once
+}
+
+func (b *gatewayQueuedUsageBody) Read(p []byte) (int, error) {
+	for b.index < len(b.chunks) {
+		if b.index == 1 {
+			select {
+			case <-b.firstWrite:
+			case <-b.closed:
+				return 0, io.EOF
+			}
+		}
+		n, err := b.chunks[b.index].Read(p)
+		if n > 0 {
+			return n, nil
+		}
+		if err != io.EOF {
+			return n, err
+		}
+		b.index++
+	}
+	close(b.queued)
+	<-b.closed
+	return 0, io.EOF
+}
+func (b *gatewayQueuedUsageBody) Close() error { b.once.Do(func() { close(b.closed) }); return nil }
+
+func TestTextGatewayQueuedSourceUsageSurvivesWriteFailure(t *testing.T) {
+	for _, full := range []bool{false, true} {
+		t.Run(fmt.Sprint(full), func(t *testing.T) {
+			first := "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n"
+			second := "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":100}}\n\n"
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, first+second)
+			})
+			body := &gatewayQueuedUsageBody{firstWrite: make(chan struct{}), queued: make(chan struct{}), closed: make(chan struct{})}
+			client := service.GetHttpClient()
+			original := client.Transport
+			t.Cleanup(func() { client.Transport = original })
+			client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
+				response, err := original.RoundTrip(request)
+				if err != nil {
+					return response, err
+				}
+				raw, err := io.ReadAll(response.Body)
+				_ = response.Body.Close()
+				if err != nil {
+					return nil, err
+				}
+				parts := strings.SplitAfter(string(raw), "\n\n")
+				for _, part := range parts {
+					if part != "" {
+						body.chunks = append(body.chunks, strings.NewReader(part))
+					}
+				}
+				response.Body = body
+				return response, nil
+			})
+			recorder := httptest.NewRecorder()
+			var once sync.Once
+			writer := gatewayPrefixOnlyWriter{ResponseRecorder: recorder, full: full, beforeWrite: func() {
+				once.Do(func() { close(body.firstWrite) })
+				select {
+				case <-body.queued:
+				case <-time.After(10 * time.Second):
+					t.Error("scanner did not receive and enqueue usage before write failure")
+				}
+			}}
+			request := httptest.NewRequest(http.MethodPost, "/v1/"+"chat/"+"completions", strings.NewReader(`{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`))
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			request.Header.Set("Content-Type", "application/json")
+			fixture.engine.ServeHTTP(writer, request)
+			record, err := model.GetGatewayRequest(t.Context(), recorder.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			expectedSale := int64(0)
+			if full {
+				expectedSale = 1803600
+			}
+			assert.Equal(t, expectedSale, record.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.EqualValues(t, 1200000, attempts[0].Cost.Nanos)
+			require.NotNil(t, attempts[0].Usage)
+			assert.EqualValues(t, 1000, attempts[0].Usage.PromptTokens)
+			assert.EqualValues(t, 100, attempts[0].Usage.CompletionTokens)
+		})
+	}
+}
+
+func TestTextGatewayCompleteWriteErrorKeepsDeliveredUsage(t *testing.T) {
+	for _, fixed := range []bool{false, true} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%t/fixed=%t", stream, fixed), func(t *testing.T) {
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					if stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n")
+						return
+					}
+					_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`)
+				})
+				if fixed {
+					require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("request",fixed(1))`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+				}
+				recorder := httptest.NewRecorder()
+				writer := gatewayPrefixOnlyWriter{ResponseRecorder: recorder, full: true}
+				request := httptest.NewRequest(http.MethodPost, "/v1/"+"chat/"+"completions", strings.NewReader(fmt.Sprintf(`{"model":"gateway-offering","stream":%t,"messages":[{"role":"user","content":"Hello"}]}`, stream)))
+				request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+				request.Header.Set("Content-Type", "application/json")
+				fixture.engine.ServeHTTP(writer, request)
+				record, err := model.GetGatewayRequest(t.Context(), recorder.Header().Get(common.RequestIdKey), fixture.user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, "failed", record.Status)
+				expectedSale := int64(36000)
+				if stream {
+					expectedSale = 21600
+				}
+				if fixed {
+					expectedSale = 0
+				}
+				assert.Equal(t, expectedSale, record.Receivable.Nanos)
+				attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, total)
+				assert.EqualValues(t, 20000, attempts[0].Cost.Nanos)
+				assert.Equal(t, "downstream_write_failed", attempts[0].ErrorClass)
+			})
+		}
+	}
 }
 
 func TestTextGatewayMetadataPrefixIsNotDeliveredBusinessOutput(t *testing.T) {

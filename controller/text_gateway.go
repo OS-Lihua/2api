@@ -576,7 +576,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				record.ChoiceCount = choiceCount
 				saleUsage := usage
 				record.Usage, record.UsageSource = service.GatewayRecordUsage(usage), attempt.UsageSource
-				estimateDeliveredOutput := attempt.Status == "partial" && !normalBudget || !info.ResponseFacts.UsageReported && (attempt.Status == "cancelled" || info.ResponseFacts.DownstreamWriteFailed)
+				estimateDeliveredOutput := attempt.Status == "partial" && !normalBudget || info.ResponseFacts.DownstreamWriteFailed || !info.ResponseFacts.UsageReported && attempt.Status == "cancelled"
 				if info.IsStream && estimateDeliveredOutput && usage != nil {
 					// Procurement retains reported usage; interrupted sales use delivered text.
 					delivered := tokenkit.Count(info.TokenizerModel, info.ResponseFacts.GeneratedText)

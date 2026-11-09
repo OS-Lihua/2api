@@ -625,6 +625,9 @@ func GatewayCapabilitiesMatch(request *dto.GeneralOpenAIRequest, caps capability
 	images := int64(0)
 	for _, file := range request.GetTokenCountMeta().Files {
 		modality := capability.PDF
+		if file.Source != nil && request.NativeTextReferences[file.Source.GetRawData()] {
+			modality = capability.Text
+		}
 		switch file.FileType {
 		case types.FileTypeImage:
 			modality = capability.Image

@@ -125,6 +125,7 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 	preservedImageReferences := false
 	projectionMedia := map[string]dto.MediaContent{}
 	geminiImageDetails := map[string][]string{}
+	nativeTextReferences := map[string]bool{}
 	var referencedMedia []dto.MediaContent
 	references := map[string]bool{}
 	if responses, ok := request.(*dto.OpenAIResponsesRequest); ok {
@@ -313,6 +314,9 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeVideoUrl, VideoUrl: &dto.MessageVideoUrl{Url: part.FileData.FileUri}}
 				case mime == "application/pdf":
 					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeFile, File: &dto.MessageFile{FileName: "reference.pdf", FileData: part.FileData.FileUri}}
+				case strings.HasPrefix(mime, "text/"):
+					projectionMedia[path] = dto.MediaContent{Type: dto.ContentTypeFile, File: &dto.MessageFile{FileName: "reference.txt", FileData: part.FileData.FileUri}}
+					nativeTextReferences[part.FileData.FileUri] = true
 				}
 			}
 			if !part.nested {
@@ -360,6 +364,7 @@ func GatewayChatProjection(ctx context.Context, request dto.Request) (*dto.Gener
 		return nil, fmt.Errorf("missing text request projection")
 	}
 	chat.RequiresTextInput = requiresTextInput
+	chat.NativeTextReferences = nativeTextReferences
 	for i := range chat.Messages {
 		media := chat.Messages[i].ParseContent()
 		changed := false

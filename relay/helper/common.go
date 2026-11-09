@@ -240,7 +240,7 @@ func ResponseChunkData(c *gin.Context, resp dto.ResponsesStreamResponse, data st
 	return FlushWriter(c)
 }
 
-// StreamFlushError means the complete frame was written before flushing failed.
+// StreamFlushError means a complete frame was accepted before a write or flush error.
 // Callers can distinguish accepted business content from a partial frame write.
 type StreamFlushError struct {
 	Err error
@@ -273,14 +273,17 @@ func WriteGatewayStreamFrame(c *gin.Context, facts *relaycommon.ResponseFacts, f
 		facts.StreamPrelude = nil
 	}
 	n, err := c.Writer.Write([]byte(frame))
-	if err != nil {
-		return err
-	}
 	if n != len(frame) {
-		return io.ErrShortWrite
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		return err
 	}
 	if facts != nil && business {
 		facts.MarkBusinessOutput()
+	}
+	if err != nil {
+		return &StreamFlushError{Err: err}
 	}
 	if err := FlushWriter(c); err != nil {
 		return &StreamFlushError{Err: err}
@@ -312,12 +315,12 @@ func WriteGatewayJSONResponse(c *gin.Context, resp *http.Response, facts *relayc
 	if err == nil && written != len(body) {
 		err = io.ErrShortWrite
 	}
+	if business && written == len(body) {
+		facts.MarkBusinessOutput()
+	}
 	if err != nil {
 		facts.DownstreamWriteFailed = true
 		return err
-	}
-	if business {
-		facts.MarkBusinessOutput()
 	}
 	if err := FlushWriter(c); err != nil {
 		facts.DownstreamWriteFailed = true
@@ -349,6 +352,10 @@ func RecordNativeStreamSource(c *gin.Context, info *relaycommon.RelayInfo, sourc
 	text := relaycommon.ChatStreamBusinessText(body)
 	info.ResponseFacts.SourceGeneratedText += text
 	info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || text != ""
+	recordNativeCaptureSource(c, body)
+}
+
+func recordNativeCaptureSource(c *gin.Context, body []byte) {
 	for writer := http.ResponseWriter(c.Writer); writer != nil; {
 		if recorder, ok := writer.(interface{ RecordChatStreamSource([]byte) }); ok {
 			recorder.RecordChatStreamSource(body)
@@ -385,6 +392,7 @@ func StringData(c *gin.Context, str string) error {
 			text := relaycommon.ChatStreamBusinessText([]byte(str))
 			facts.SourceGeneratedText += text
 			facts.SourceOutputObserved = facts.SourceOutputObserved || text != "" || business
+			recordNativeCaptureSource(c, []byte(str))
 			return WriteGatewayStreamFrame(c, facts, "data: "+str+"\n\n", business)
 		}
 	}

@@ -269,10 +269,13 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		}
 		return usage, types.NewError(fmt.Errorf("upstream response contained no business output"), types.ErrorCodeBadResponse)
 	}
-	if err := helper.WriteGatewayJSONResponse(c, resp, facts, encoded, business); err != nil {
-		return usage, types.NewError(err, types.ErrorCodeBadResponse)
+	writeErr := helper.WriteGatewayJSONResponse(c, resp, facts, encoded, business)
+	if facts.BusinessOutput {
+		facts.GeneratedOutputTokens = &generatedTokens
 	}
-	facts.GeneratedOutputTokens = &generatedTokens
+	if writeErr != nil {
+		return usage, types.NewError(writeErr, types.ErrorCodeBadResponse)
+	}
 	if p.format == types.RelayFormatOpenAIResponses {
 		status := gjson.GetBytes(body, "status").String()
 		if status != "" && status != "completed" && !budgetEnd {

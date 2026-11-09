@@ -6,6 +6,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 )
 
@@ -25,6 +26,16 @@ func (a *Protocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInfo, r
 			return nil, fmt.Errorf("nil PaLM request")
 		}
 		if request.MaxTokens != nil || request.MaxCompletionTokens != nil || len(request.Tools) > 0 {
+			if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+				for _, parameter := range []struct {
+					path    string
+					present bool
+				}{{"max_tokens", request.MaxTokens != nil}, {"max_completion_tokens", request.MaxCompletionTokens != nil}, {"tools", len(request.Tools) > 0}} {
+					if parameter.present {
+						info.RecordConversionDiagnostics(c, []types.ConversionDiagnostic{{Code: "request_parameter_dropped", Path: parameter.path, Message: "PaLM generateMessage cannot represent this parameter", Severity: types.ConversionDiagnosticError}})
+					}
+				}
+			}
 			return nil, fmt.Errorf("PaLM generateMessage does not support output token limits or tools")
 		}
 		wire := &PaLMChatRequest{Temperature: request.Temperature, CandidateCount: request.N, TopP: request.TopP}
@@ -35,11 +46,17 @@ func (a *Protocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInfo, r
 			value := uint(*request.TopK)
 			wire.TopK = &value
 		}
-		for _, message := range request.Messages {
+		for i, message := range request.Messages {
 			if message.Role != "user" && message.Role != "assistant" {
+				if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+					info.RecordConversionDiagnostics(c, []types.ConversionDiagnostic{{Code: "request_parameter_dropped", Path: fmt.Sprintf("messages[%d].role", i), Message: "PaLM generateMessage cannot represent this message role", Severity: types.ConversionDiagnosticError}})
+				}
 				return nil, fmt.Errorf("PaLM generateMessage does not support message role %q", message.Role)
 			}
 			if !message.IsStringContent() {
+				if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
+					info.RecordConversionDiagnostics(c, []types.ConversionDiagnostic{{Code: "request_parameter_dropped", Path: fmt.Sprintf("messages[%d].content", i), Message: "PaLM generateMessage requires plain text message content", Severity: types.ConversionDiagnosticError}})
+				}
 				return nil, fmt.Errorf("PaLM generateMessage requires text messages")
 			}
 			wire.Prompt.Messages = append(wire.Prompt.Messages, PaLMChatMessage{Author: message.Role, Content: message.StringContent()})

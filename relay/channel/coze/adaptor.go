@@ -48,8 +48,9 @@ func (a *Protocol) ConvertOpenAIRequest(c *gin.Context, info *common.RelayInfo, 
 		return nil, errors.New("request is nil")
 	}
 	if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
-		for _, message := range request.Messages {
+		for i, message := range request.Messages {
 			if message.Role != "user" && message.Role != "assistant" {
+				info.RecordConversionDiagnostics(c, []types.ConversionDiagnostic{{Code: "request_parameter_dropped", Path: fmt.Sprintf("messages[%d].role", i), Message: "The native Coze request cannot represent this message role", Severity: types.ConversionDiagnosticError}})
 				return nil, fmt.Errorf("Coze cannot represent message role %s", message.Role)
 			}
 		}

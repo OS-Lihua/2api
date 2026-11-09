@@ -42,6 +42,7 @@ type nativeResponseWriter struct {
 	finish         string
 	metadata       map[string]any
 	source         gatewayGeneratedOutput
+	recordedSource string
 	terminalFrames [][]byte
 	terminalBytes  int
 	err            error
@@ -64,6 +65,11 @@ func (w *nativeResponseWriter) WriteString(value string) (int, error) { return w
 // RecordChatStreamSource shares the capture state with canonical writes without
 // forwarding a frame or confirming downstream delivery.
 func (w *nativeResponseWriter) RecordChatStreamSource(body []byte) {
+	w.recordedSource = strings.TrimSpace(string(body))
+	w.observeChatStreamSource(body)
+}
+
+func (w *nativeResponseWriter) observeChatStreamSource(body []byte) {
 	w.source.text.WriteString(gatewayStreamBusinessText(body, types.RelayFormatOpenAI))
 	w.source.ObserveChat(body)
 	w.facts.SourceOutputObserved = w.facts.SourceOutputObserved || w.source.String() != "" || len(w.source.chatTools) > 0 || gatewayMediaOutput(body, types.RelayFormatOpenAI)
@@ -95,7 +101,12 @@ func (w *nativeResponseWriter) Write(body []byte) (int, error) {
 			continue
 		}
 		data := []byte(event.Data)
-		w.RecordChatStreamSource(data)
+		// Metadata prelude frames must not consume the recorded business frame.
+		if event.Data != w.recordedSource {
+			w.observeChatStreamSource(data)
+		} else {
+			w.recordedSource = ""
+		}
 		for _, name := range []string{"id", "model", "object", "system_fingerprint", "service_tier"} {
 			if value := gjson.GetBytes(data, name); value.Type == gjson.String && value.String() != "" {
 				w.metadata[name] = value.String()

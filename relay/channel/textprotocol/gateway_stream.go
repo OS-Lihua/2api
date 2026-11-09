@@ -39,23 +39,39 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 	expectedChoices := max(1, info.ResponseFacts.ExpectedChoices)
 	choices := map[int]gatewayStreamChoice{}
 	sourceBudgetEnd := false
-	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
-		info.StreamStatus.RequireTerminal()
-		measured, err := meter.Observe([]byte(data))
+	observeSource := func(data []byte) ([]byte, error) {
+		measured, err := meter.Observe(data)
 		if err != nil {
-			streamErr = err
-			sr.Stop(err)
-			return
+			return nil, err
 		}
 		if measured != nil {
 			usage = measured
 		}
-		prompt, completion := gatewayUsageCounters([]byte(data), p.format)
+		prompt, completion := gatewayUsageCounters(data, p.format)
 		info.ResponseFacts.PromptTokensReported = info.ResponseFacts.PromptTokensReported || gatewayValidCounter(prompt)
 		info.ResponseFacts.CompletionTokensReported = info.ResponseFacts.CompletionTokensReported || gatewayValidCounter(completion)
 		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 		info.ResponseFacts.IndependentUsageReported = meter.ReportedCounters()
-		normalized, err := meter.NormalizedBody([]byte(data))
+		normalized, err := meter.NormalizedBody(data)
+		if err != nil {
+			return nil, err
+		}
+		if p.format == types.RelayFormatOpenAIResponses {
+			sourceOutput.ObserveResponses(normalized)
+		} else {
+			sourceOutput.text.WriteString(gatewayStreamBusinessText(normalized, p.format))
+			if p.format == types.RelayFormatOpenAI {
+				sourceOutput.ObserveChat(normalized)
+			} else if p.format == types.RelayFormatGemini {
+				sourceOutput.ObserveGemini(normalized)
+			}
+		}
+		info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || sourceOutput.String() != "" || gatewayMediaOutput(normalized, p.format)
+		return normalized, nil
+	}
+	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+		info.StreamStatus.RequireTerminal()
+		normalized, err := observeSource([]byte(data))
 		if err != nil {
 			streamErr = err
 			sr.Stop(err)
@@ -77,17 +93,6 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		case types.RelayFormatGemini:
 			event = &dto.GeminiChatResponse{}
 		}
-		if p.format == types.RelayFormatOpenAIResponses {
-			sourceOutput.ObserveResponses(normalized)
-		} else {
-			sourceOutput.text.WriteString(gatewayStreamBusinessText(normalized, p.format))
-			if p.format == types.RelayFormatOpenAI {
-				sourceOutput.ObserveChat(normalized)
-			} else if p.format == types.RelayFormatGemini {
-				sourceOutput.ObserveGemini(normalized)
-			}
-		}
-		info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || sourceOutput.String() != "" || gatewayMediaOutput(normalized, p.format)
 		safety := observeGatewaySafety(info, []byte(data), p.format)
 		if err := common.Unmarshal(normalized, event); err != nil {
 			streamErr = err
@@ -185,35 +190,31 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			streamErr = errors.New("upstream content safety rejection")
 			sr.Stop(streamErr)
 		}
-	})
+	}, func(data string) { _, _ = observeSource([]byte(data)) })
 	// An unterminated event cannot confirm delivery or a protocol terminal.
-	// Complete JSON inside it can still report a known upstream purchase usage.
+	// Independently complete fields can still report procurement facts.
 	partial := info.ResponseFacts.UnterminatedStreamData
 	info.ResponseFacts.UnterminatedStreamData = nil
-	if len(partial) > 0 && gjson.ValidBytes(partial) {
-		if measured, err := meter.Observe(partial); err == nil {
-			if measured != nil {
-				usage = measured
-			}
+	if len(partial) > 0 {
+		if measured, err := meter.Observe(partial); err == nil && measured != nil {
+			usage = measured
 			prompt, completion := gatewayUsageCounters(partial, p.format)
 			info.ResponseFacts.PromptTokensReported = info.ResponseFacts.PromptTokensReported || gatewayValidCounter(prompt)
 			info.ResponseFacts.CompletionTokensReported = info.ResponseFacts.CompletionTokensReported || gatewayValidCounter(completion)
 			info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 			info.ResponseFacts.IndependentUsageReported = meter.ReportedCounters()
 		}
-		if normalized, err := meter.NormalizedBody(partial); err == nil {
-			if p.format == types.RelayFormatOpenAIResponses {
-				sourceOutput.ObserveResponses(normalized)
-			} else {
-				sourceOutput.text.WriteString(gatewayStreamBusinessText(normalized, p.format))
-				if p.format == types.RelayFormatOpenAI {
-					sourceOutput.ObserveChat(normalized)
-				} else if p.format == types.RelayFormatGemini {
-					sourceOutput.ObserveGemini(normalized)
-				}
+		if p.format == types.RelayFormatOpenAIResponses {
+			sourceOutput.ObserveResponses(partial)
+		} else {
+			sourceOutput.text.WriteString(gatewayStreamBusinessText(partial, p.format))
+			if p.format == types.RelayFormatOpenAI {
+				sourceOutput.ObserveChat(partial)
+			} else if p.format == types.RelayFormatGemini {
+				sourceOutput.ObserveGemini(partial)
 			}
-			info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || sourceOutput.String() != "" || gatewayMediaOutput(normalized, p.format)
 		}
+		info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || sourceOutput.String() != "" || gatewayMediaOutput(partial, p.format)
 	}
 	info.StreamStatus.RequireTerminal()
 	if p.format == types.RelayFormatOpenAI || p.format == types.RelayFormatGemini {
