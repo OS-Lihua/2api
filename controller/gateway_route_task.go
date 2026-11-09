@@ -20,6 +20,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
 )
@@ -174,6 +175,11 @@ func prepareGatewayTaskRoute(c *gin.Context, selection *service.GatewaySelection
 	if maximum := selection.Capabilities.Limits.MaxDurationSeconds; maximum != nil {
 		media := slices.Contains(required.Capabilities.InputModalities, capability.Video) || slices.Contains(required.Capabilities.InputModalities, capability.Audio) || slices.Contains(required.Capabilities.OutputModalities, capability.Video) || slices.Contains(required.Capabilities.OutputModalities, capability.Audio)
 		if required.DurationSeconds == nil && media || required.DurationSeconds != nil && *required.DurationSeconds > *maximum {
+			return nil, service.ErrGatewayCapability
+		}
+	}
+	if maximum := selection.Capabilities.Limits.ContextLength; maximum != nil {
+		if required.ContextText == nil || int64(tokenkit.Count(selection.Channel.UpstreamModelName, *required.ContextText)) > *maximum {
 			return nil, service.ErrGatewayCapability
 		}
 	}

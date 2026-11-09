@@ -104,6 +104,8 @@ export interface RequestCapabilities {
   image_count?: number;
   /** Upper bound on media duration in whole seconds; omit when it cannot be established without I/O. */
   duration_seconds?: number;
+  /** Complete effective text input for host context counting; empty means known empty, omit when media or other unknown input prevents a complete projection. Transient, never billing usage. */
+  context_text?: string;
 }
 /** Required for ModelOffering routing. Pure facts after parameter overrides; no fetch, token exchange or file resolution. */
 export declare function extractCapabilities(ctx: DriverContext): RequestCapabilities;

@@ -1074,19 +1074,22 @@ export function extractCapabilities(ctx) {
       converted.body.parameters.stream === true || (converted.synchronous && converted.body.parameters.enable_interleave === true && streamsInterleave(ctx));
     const input = [];
     const body = converted.body.input;
-    if (
-      trimmed(body.prompt) ||
-      trimmed(body.negative_prompt) ||
-      (body.messages || []).some((message) => (message.content || []).some((part) => trimmed(part.text)))
-    )
-      input.push("text");
+    const text = [body.prompt, body.negative_prompt];
+    for (const message of body.messages || []) {
+      for (const part of message.content || []) {
+        if (typeof part.text === "string") text.push(part.text);
+      }
+    }
+    if (text.some((part) => trimmed(part))) input.push("text");
     if (converted.inputImages) input.push("image");
-    return {
+    const result = {
       features: streaming ? ["streaming"] : [],
       input_modalities: input,
       output_modalities: converted.body.parameters.enable_interleave === true ? ["text", "image"] : ["image"],
       image_count: imageEstimate(ctx, converted).image_count,
     };
+    if (!converted.inputImages) result.context_text = text.filter((part) => typeof part === "string").join("\n");
+    return result;
   }
   const source = convert(ctx).input;
   const input = [];

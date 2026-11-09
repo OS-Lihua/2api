@@ -44,6 +44,7 @@ type TaskRequestCapabilities struct {
 	Capabilities    capability.Set `json:"-"`
 	ImageCount      *int64         `json:"image_count,omitempty"`
 	DurationSeconds *int64         `json:"duration_seconds,omitempty"`
+	ContextText     *string        `json:"context_text,omitempty"`
 }
 
 type requestDescriptor struct {
@@ -334,7 +335,7 @@ func (a *TaskAdaptor) RequestCapabilities(c *gin.Context, info *relaycommon.Rela
 		return TaskRequestCapabilities{}, fmt.Errorf("plugin capability hook must return an object")
 	}
 	for name, field := range fields {
-		if field == nil || name != "features" && name != "input_modalities" && name != "output_modalities" && name != "image_count" && name != "duration_seconds" {
+		if field == nil || name != "features" && name != "input_modalities" && name != "output_modalities" && name != "image_count" && name != "duration_seconds" && name != "context_text" {
 			return TaskRequestCapabilities{}, fmt.Errorf("plugin capability hook returned an unknown or null field")
 		}
 	}

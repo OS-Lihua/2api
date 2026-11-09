@@ -2071,6 +2071,8 @@ func TestAsyncTaskCapabilitiesMustBeKnownAndPureBeforeAdmission(t *testing.T) {
 		{"unknown-modality", `export function extractCapabilities() { return {input_modalities:["opaque"],output_modalities:["video"]}; }`},
 		{"missing-input", `export function extractCapabilities() { return {output_modalities:["video"]}; }`},
 		{"unknown-image-count", `export function extractCapabilities(ctx) { const facts=ignoredCapabilities(ctx); delete facts.image_count; return facts; }`},
+		{"unknown-context", `export function extractCapabilities(ctx) { const facts=ignoredCapabilities(ctx); delete facts.context_text; return facts; }`},
+		{"invalid-context", `export function extractCapabilities(ctx) { const facts=ignoredCapabilities(ctx); facts.context_text=0; return facts; }`},
 		{"provider-io", `export function extractCapabilities(ctx) { utils.fetch({url:ctx.baseUrl+"/preflight",method:"GET"}); return {input_modalities:["text"],output_modalities:["video"]}; }`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -2095,12 +2097,88 @@ func TestAsyncTaskCapabilitiesMustBeKnownAndPureBeforeAdmission(t *testing.T) {
 				require.NoError(t, model.DB.Model(&unified).Update("capabilities", unified.Capabilities).Error)
 				body = `{"model":"gateway-alias","prompt":"A bird","seconds":"4","input_reference":"https://image.invalid/first.png"}`
 			}
+			if test.name == "unknown-context" {
+				var unified model.Model
+				require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+				maximum := int64(4)
+				unified.Capabilities.Limits.ContextLength = &maximum
+				require.NoError(t, model.DB.Model(&unified).Update("capabilities", unified.Capabilities).Error)
+			}
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", body)
 			assert.Equal(t, 400, response.Code, response.Body.String())
 			assert.Zero(t, calls.Load())
 			var reservations int64
 			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
 			assert.Zero(t, reservations)
+		})
+	}
+}
+
+func TestAsyncTaskContextLimitUsesEffectivePromptBeforeReservation(t *testing.T) {
+	for _, test := range []struct {
+		name, prompt, override, negative string
+		native                           bool
+		status                           int
+	}{
+		{"long prompt", "A bird flies over the quiet valley beside the river at sunset", "", "", false, http.StatusBadRequest},
+		{"short prompt", "A bird", "", "", false, http.StatusOK},
+		{"override expands prompt", "A bird", "A bird flies over the quiet valley beside the river at sunset", "", false, http.StatusBadRequest},
+		{"override removes long prompt", "A bird flies over the quiet valley beside the river at sunset", "A bird", "", false, http.StatusOK},
+		{"native long prompt", "A bird flies over the quiet valley beside the river at sunset", "", "", true, http.StatusBadRequest},
+		{"native short prompt", "A bird", "", "", true, http.StatusOK},
+		{"native negative prompt", "A bird", "", "Avoid the dark sky and the trees beside the quiet river", true, http.StatusBadRequest},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"output":{"task_id":"context-bounded-job","task_status":"PENDING"}}`)
+			})
+			source, err := plugins.Source("alibaba")
+			require.NoError(t, err)
+			jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+			_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "alibaba"})
+			require.NoError(t, err)
+			maximum := int64(4)
+			caps := capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Image}, Limits: capability.Limits{ContextLength: &maximum}}
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Updates(map[string]any{"model_name": "wanx2.1-t2i-turbo", "capabilities": caps}).Error)
+			overrides := "{}"
+			if test.override != "" {
+				encoded, err := common.Marshal(map[string]any{"prompt": test.override})
+				require.NoError(t, err)
+				overrides = string(encoded)
+			}
+			require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:alibaba", "upstream_model_name": "wanx2.1-t2i-turbo", "parameter_overrides": overrides}).Error)
+			fixture.fake.Advance(time.Second)
+			for _, price := range []*model.PriceVersion{
+				{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("image",u("image_count")*0.1)`, EffectiveAt: clock.Now().Unix()},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("image",u("image_count")*0.05)`, EffectiveAt: clock.Now().Unix()},
+			} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			path := "/v1/tasks/alibaba"
+			payload := map[string]any{"model": "gateway-alias", "prompt": test.prompt, "n": 1}
+			if test.native {
+				path = "/ali/api/v1/services/aigc/text2image/image-synthesis"
+				payload = map[string]any{"model": "gateway-alias", "input": map[string]any{"prompt": test.prompt, "negative_prompt": test.negative}, "parameters": map[string]any{"n": 1}}
+				builder := newPluginGenerationBuilder(fixture.engine.Routes(), nil, productionPluginRouteHandlers)
+				require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(builder.prepare))
+				fixture.engine.NoRoute((&pluginRouteDispatcher{registry: jsplugin.DefaultRegistry}).dispatch)
+			}
+			body, err := common.Marshal(payload)
+			require.NoError(t, err)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, string(body))
+			assert.Equal(t, test.status, response.Code, response.Body.String())
+			var reservations int64
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
+			if test.status == http.StatusOK {
+				assert.EqualValues(t, 1, calls.Load())
+				assert.EqualValues(t, 1, reservations)
+			} else {
+				assert.Zero(t, calls.Load())
+				assert.Zero(t, reservations)
+			}
 		})
 	}
 }
