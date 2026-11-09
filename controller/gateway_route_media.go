@@ -101,6 +101,12 @@ func prepareGatewayMediaRoute(c *gin.Context, selection *service.GatewaySelectio
 	if err != nil {
 		return nil, service.ErrGatewayCapability
 	}
+	if prepared.OriginalRequest != nil {
+		originalInput, err := service.CountGatewayMediaInput(candidate, prepared.OriginalRequest, info)
+		if err != nil || !service.GatewayMediaCapabilitiesMatch(candidate, parsed.Protocol, prepared.OriginalRequest, selection.Capabilities, originalInput, info.ResponseFacts) {
+			return nil, service.ErrGatewayCapability
+		}
+	}
 	input, err := service.CountGatewayMediaInput(candidate, prepared.Request, info)
 	if err != nil || !service.GatewayMediaCapabilitiesMatch(candidate, parsed.Protocol, prepared.Request, selection.Capabilities, input, info.ResponseFacts) {
 		return nil, service.ErrGatewayCapability

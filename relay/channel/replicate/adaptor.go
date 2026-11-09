@@ -130,9 +130,34 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 	}
 
 	if info.RelayMode == relayconstant.RelayModeImagesEdits && info.ResponseFacts != nil {
-		fileHeader, err := imageFileFromForm(c, "image", "image[]", "image_prompt")
-		if err != nil {
-			return nil, err
+		if len(request.Mask) > 0 && string(request.Mask) != "null" {
+			return nil, errors.New("replicate adaptor cannot preserve an image mask")
+		}
+		form := c.Request.MultipartForm
+		if form == nil {
+			var err error
+			form, err = common.ParseMultipartFormReusable(c)
+			if err != nil {
+				return nil, err
+			}
+		}
+		var fileHeader *multipart.FileHeader
+		for field, files := range form.File {
+			if field == "mask" && len(files) > 0 {
+				return nil, errors.New("replicate adaptor cannot preserve an image mask")
+			}
+			if field != "image" && !strings.HasPrefix(field, "image[") && field != "image_prompt" {
+				continue
+			}
+			for _, file := range files {
+				if fileHeader != nil {
+					return nil, errors.New("replicate adaptor cannot preserve multiple input images")
+				}
+				fileHeader = file
+			}
+		}
+		if len(form.Value["mask"]) > 0 {
+			return nil, errors.New("replicate adaptor cannot preserve an image mask")
 		}
 		if fileHeader == nil {
 			return nil, errors.New("replicate adaptor: image file is required for edits")

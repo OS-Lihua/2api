@@ -25,6 +25,7 @@ import (
 type PreparedMediaRequest struct {
 	Prepared            *PreparedChannelRequest
 	Request             dto.Request
+	OriginalRequest     dto.Request
 	Input               billingexpr.RequestInput
 	Body                []byte
 	ContentType         string
@@ -162,6 +163,13 @@ func (a *ChannelAdaptor) PrepareMediaWire(c *gin.Context, info *relaycommon.Rela
 			return nil, err
 		}
 	}
+	var originalRequest dto.Request
+	if projector, ok := converted.(channel.ImageRequestProjector); a.kind == protocol.OpenAIImages && ok {
+		originalRequest, err = projector.ProjectImageRequest(body, *request.(*dto.ImageRequest))
+		if err != nil {
+			return nil, err
+		}
+	}
 	if len(info.ParamOverride) > 0 {
 		body, err = relaycommon.ApplyParamOverrideWithRelayInfo(body, info)
 		if err != nil {
@@ -177,7 +185,7 @@ func (a *ChannelAdaptor) PrepareMediaWire(c *gin.Context, info *relaycommon.Rela
 	if err := helper.ValidateGatewayMediaMultipliers(body); err != nil {
 		return nil, err
 	}
-	result := &PreparedMediaRequest{Request: request, Input: billingexpr.RequestInput{Body: body}, vllmSpeech: info.ChannelType == constant.ChannelTypeVLLM}
+	result := &PreparedMediaRequest{Request: request, OriginalRequest: originalRequest, Input: billingexpr.RequestInput{Body: body}, vllmSpeech: info.ChannelType == constant.ChannelTypeVLLM}
 	if projector, ok := converted.(channel.ImageRequestProjector); a.kind == protocol.OpenAIImages && ok {
 		effective, err := projector.ProjectImageRequest(body, *request.(*dto.ImageRequest))
 		if err != nil {

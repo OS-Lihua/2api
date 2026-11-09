@@ -61,6 +61,13 @@ func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayIn
 }
 
 func convertTTSRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.AudioRequest, app VolcengineTTSApp) (io.Reader, error) {
+	if info.ResponseFacts != nil {
+		switch request.ResponseFormat {
+		case "", "mp3", "wav", "pcm", "opus":
+		default:
+			return nil, fmt.Errorf("Volcengine cannot preserve the requested audio format")
+		}
+	}
 	voiceType := mapVoiceType(request.Voice)
 	speedRatio := lo.FromPtrOr(request.Speed, 0.0)
 	encoding := mapEncoding(request.ResponseFormat)

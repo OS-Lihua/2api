@@ -86,6 +86,16 @@ type imageRequestPayload struct {
 }
 
 func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.ImageRequest) (any, error) {
+	if info.ResponseFacts != nil {
+		for _, value := range []common.RawMessage{request.Image, request.Images, request.Mask} {
+			if len(value) > 0 && string(value) != "null" {
+				return nil, fmt.Errorf("Jimeng cannot preserve standard image edit inputs")
+			}
+		}
+		if c.Request.MultipartForm != nil && len(c.Request.MultipartForm.File) > 0 {
+			return nil, fmt.Errorf("Jimeng cannot preserve uploaded image edit inputs")
+		}
+	}
 	payload := imageRequestPayload{
 		ReqKey: request.Model,
 		Prompt: request.Prompt,

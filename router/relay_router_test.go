@@ -4642,6 +4642,117 @@ func TestMediaGatewayNativeImageProvidersUseEffectiveWireAndActualMoney(t *testi
 	}
 }
 
+func TestMediaGatewayJimengNativeImageInputsHonorCapabilities(t *testing.T) {
+	var picture bytes.Buffer
+	require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+	for _, tc := range []struct {
+		name, field          string
+		count                int
+		allow, shrink, clear bool
+		status               int
+	}{
+		{"URL modality", "image_urls", 1, false, false, false, 400},
+		{"URL count", "image_urls", 2, true, false, false, 400},
+		{"base64 count", "binary_data_base64", 2, true, false, false, 400},
+		{"URL compatible", "image_urls", 1, true, false, false, 200},
+		{"base64 compatible", "binary_data_base64", 1, true, false, false, 200},
+		{"original count before shrink", "image_urls", 2, true, true, false, 400},
+		{"original modality before clear", "image_urls", 1, false, false, true, 400},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"code":10000,"data":{"image_urls":["https://image.invalid/one"]}}`)
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeJimeng, "key": "access|secret"}).Error)
+			require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", "jimeng_high_aes_general_v21_L").Error)
+			var unified model.Model
+			require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+			unified.Capabilities.InputModalities = []capability.Modality{capability.Text}
+			if tc.allow {
+				unified.Capabilities.InputModalities = append(unified.Capabilities.InputModalities, capability.Image)
+			}
+			unified.Capabilities.Limits.MaxImages = common.GetPointer(int64(1))
+			require.NoError(t, model.DB.Save(&unified).Error)
+			inputs := make([]string, tc.count)
+			for i := range inputs {
+				inputs[i] = "https://image.invalid/input"
+				if tc.field == "binary_data_base64" {
+					inputs[i] = base64.StdEncoding.EncodeToString(picture.Bytes())
+				}
+			}
+			if tc.shrink || tc.clear {
+				count := 1
+				if tc.clear {
+					count = 0
+				}
+				override, err := common.Marshal(map[string]any{tc.field: inputs[:count]})
+				require.NoError(t, err)
+				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", string(override)).Error)
+			}
+			body, err := common.Marshal(map[string]any{"model": "gateway-alias", "prompt": "draw", "extra_fields": map[string]any{tc.field: inputs}})
+			require.NoError(t, err)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", string(body))
+			assert.Equal(t, tc.status, response.Code)
+			if tc.status == 400 {
+				assert.Zero(t, calls)
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
+			} else {
+				assert.Equal(t, 1, calls)
+			}
+		})
+	}
+}
+
+func TestMediaGatewayReplicateEditsRejectInputLoss(t *testing.T) {
+	var picture bytes.Buffer
+	require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+	for _, name := range []string{"single", "mask", "multiple"} {
+		t.Run(name, func(t *testing.T) {
+			calls := 0
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				var body struct {
+					Input struct {
+						Image string `json:"image_prompt"`
+					} `json:"input"`
+				}
+				require.NoError(t, common.DecodeJson(r.Body, &body))
+				assert.True(t, strings.HasPrefix(body.Input.Image, "data:image/png;base64,"))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"status":"succeeded","output":["https://image.invalid/one"]}`)
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeReplicate).Error)
+			require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", "black-forest-labs/flux-1.1-pro").Error)
+			var additional []string
+			if name == "mask" {
+				additional = []string{"mask"}
+			}
+			if name == "multiple" {
+				additional = []string{"image[]"}
+			}
+			request := mediaMultipartRequest(t, "/v1/images/edits", map[string]string{"model": "gateway-alias", "prompt": "edit"}, "image", picture.Bytes(), additional...)
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			response := httptest.NewRecorder()
+			fixture.engine.ServeHTTP(response, request)
+			if name == "single" {
+				assert.Equal(t, 200, response.Code)
+				assert.Equal(t, 1, calls)
+			} else {
+				assert.Equal(t, 400, response.Code)
+				assert.Zero(t, calls)
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
+			}
+		})
+	}
+}
+
 func TestMediaGatewayReplicateDownloadFailureRetainsGeneratedImages(t *testing.T) {
 	var downloads atomic.Int64
 	imageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { downloads.Add(1); w.WriteHeader(http.StatusBadGateway) }))
@@ -4809,7 +4920,10 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 		durationLimit  int64
 		hold           int64
 		extra          string
+		requestFormat  string
 	}{
+		{name: "Volcengine unsupported AAC", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, requestFormat: "aac", reject: true},
+		{name: "Volcengine unsupported FLAC", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, requestFormat: "flac", reject: true},
 		{name: "MiniMax metadata sample rate", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"audio_setting":{"sample_rate":48000}}`, reject: true},
 		{name: "MiniMax metadata channel", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"audio_setting":{"channel":2}}`, reject: true},
 		{name: "MiniMax metadata transport", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"output_format":"url"}`, reject: true},
@@ -4938,7 +5052,11 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 			} {
 				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
 			}
-			request := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", strings.NewReader(fmt.Sprintf(`{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm","stream_format":%q%s}`, map[bool]string{false: "audio", true: "sse"}[tc.stream], tc.extra)))
+			responseFormat := tc.requestFormat
+			if responseFormat == "" {
+				responseFormat = "pcm"
+			}
+			request := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", strings.NewReader(fmt.Sprintf(`{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":%q,"stream_format":%q%s}`, responseFormat, map[bool]string{false: "audio", true: "sse"}[tc.stream], tc.extra)))
 			request.Header.Set("Content-Type", "application/json")
 			if tc.kind == protocol.OpenAIAudioTranscription {
 				request = mediaMultipartRequest(t, "/v1/audio/transcriptions", map[string]string{"model": "gateway-alias", "response_format": "text"}, "file", wave)
@@ -5569,17 +5687,19 @@ func TestMediaGatewayImagePayloadShapesAndUsageSources(t *testing.T) {
 	}
 }
 
-func mediaMultipartRequest(t *testing.T, path string, fields map[string]string, field string, data []byte) *http.Request {
+func mediaMultipartRequest(t *testing.T, path string, fields map[string]string, field string, data []byte, additional ...string) *http.Request {
 	t.Helper()
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	for key, value := range fields {
 		require.NoError(t, writer.WriteField(key, value))
 	}
-	part, err := writer.CreateFormFile(field, "input.wav")
-	require.NoError(t, err)
-	_, err = part.Write(data)
-	require.NoError(t, err)
+	for _, name := range append([]string{field}, additional...) {
+		part, err := writer.CreateFormFile(name, "input.wav")
+		require.NoError(t, err)
+		_, err = part.Write(data)
+		require.NoError(t, err)
+	}
 	require.NoError(t, writer.Close())
 	request := httptest.NewRequest(http.MethodPost, path, &body)
 	request.Header.Set("Content-Type", writer.FormDataContentType())
