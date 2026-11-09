@@ -236,6 +236,32 @@ func TestJSONStateChangesAndEncodedLimits(t *testing.T) {
 		}
 	})
 
+	t.Run("source failure retains bounded independent changes", func(t *testing.T) {
+		for _, failure := range []string{
+			`{"op":"appendText","path":["text"],"value":"` + strings.Repeat("x", 128) + `"}`,
+			`{"op":"appendText","path":["parts"],"value":"invalid target"}`,
+		} {
+			state := NewJSONState(128)
+			require.NoError(t, state.ApplyAtomic(t.Context(), []any{map[string]any{"op": "set", "path": []any{}, "value": map[string]any{"text": "a", "parts": []any{"first"}, "known": 1}}}))
+			var changes any
+			require.NoError(t, common.UnmarshalJsonStr(`[{"op":"set","path":["known"],"value":2},`+failure+`,{"op":"append","path":["parts"],"value":"second"}]`, &changes))
+			require.Error(t, state.ApplySource(t.Context(), changes))
+			value, err := state.Value()
+			require.NoError(t, err)
+			var want any
+			require.NoError(t, common.UnmarshalJsonStr(`{"text":"a","parts":["first","second"],"known":2}`, &want))
+			assert.Equal(t, want, value)
+			tooMany := make([]any, 257)
+			for i := range tooMany {
+				tooMany[i] = map[string]any{"op": "set", "path": []any{"known"}, "value": 3}
+			}
+			require.Error(t, state.ApplySource(t.Context(), tooMany))
+			after, err := state.Value()
+			require.NoError(t, err)
+			assert.Equal(t, value, after, "an oversized batch must not bypass the operation limit")
+		}
+	})
+
 	t.Run("replacement releases byte and node budget", func(t *testing.T) {
 		state := NewJSONState(16)
 		for _, value := range []any{"abcdefghijklmn", map[string]any{}, []any{int64(0), false, nil}, []any(nil), map[string]any(nil)} {

@@ -164,7 +164,7 @@ func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Respon
 				break
 			}
 			if stream.money {
-				err = accumulated.ApplyAtomic(ctx, result["changes"])
+				err = accumulated.ApplySource(ctx, result["changes"])
 			} else {
 				err = accumulated.Apply(ctx, result["changes"])
 			}
@@ -237,6 +237,9 @@ func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Respon
 		if readErr == nil {
 			readErr = fmt.Errorf("task submit stream ended before the plugin reported completion")
 		}
+		if stream.money && stream.client != nil {
+			return result, true, readErr
+		}
 		return nil, false, readErr
 	case readErr == nil:
 		logger.LogDebug(stream.client, "task_plugin subsystem=adaptor event=relayed_stream_closed plugin=%q reason=eof_before_done", a.plugin.Meta.Key)
@@ -250,6 +253,9 @@ func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Respon
 		// The client's stream is cut off rather than closed, so a downstream
 		// gateway relaying it keeps its reservation too.
 		_ = http.NewResponseController(stream.client.Writer).SetWriteDeadline(time.Now())
+		if stream.money {
+			return result, true, readErr
+		}
 		return result, true, nil
 	}
 }

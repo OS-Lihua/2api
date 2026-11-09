@@ -2851,9 +2851,12 @@ func newNativeImageTaskFixture(t *testing.T, pluginKey string, upstream http.Han
 }
 
 func TestAsyncTaskNativeStreamSettlesObservedFacts(t *testing.T) {
-	overflow := "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]}}]},\"usage\":{\"image_count\":1}}\n\n" +
-		"data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/second.png\"}]}}]},\"usage\":{\"image_count\":2}}\n\n" +
-		strings.Repeat("data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"text\":\""+strings.Repeat("x", 512<<10)+"\"}]}}]}}\n\n", 2)
+	first := "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]}}]},\"usage\":{\"image_count\":1}}\n\n"
+	padding := "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"text\":\"" + strings.Repeat("x", 512<<10) + "\"}]}}]}}\n\n"
+	overflow := first + "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/second.png\"}]}}]},\"usage\":{\"image_count\":2}}\n\n" + strings.Repeat(padding, 2)
+	text := `{"text":"` + strings.Repeat("x", 512<<10) + `"}`
+	image := `{"image":"https://artifact.invalid/second.png"}`
+	sameEvent := first + padding + `data: {"output":{"choices":[{"message":{"content":[`
 	for _, test := range []struct {
 		name, stream   string
 		sale, cost     int64
@@ -2865,6 +2868,9 @@ func TestAsyncTaskNativeStreamSettlesObservedFacts(t *testing.T) {
 		{"invalid first frame", "data: invalid-json\n\n", 0, 0, true, -1, http.StatusBadGateway},
 		{"empty stream", "", 0, 0, true, -1, http.StatusBadGateway},
 		{"known source survives cumulative limit", overflow, 90000000, 100000000, true, 1, http.StatusOK},
+		{"same event image before oversized text", sameEvent + image + "," + text + `]}}]},"usage":{"image_count":2}}` + "\n\n", 90000000, 100000000, true, -1, http.StatusOK},
+		{"same event image after oversized text", sameEvent + text + "," + image + `]}}]},"usage":{"image_count":2}}` + "\n\n", 90000000, 100000000, true, -1, http.StatusOK},
+		{"same event before first delivery", `data: {"output":{"choices":[{"message":{"content":[` + image + `,{"image":"https://artifact.invalid/third.png"},{"text":"` + strings.Repeat("<", 200<<10) + `"}]}}]},"usage":{"image_count":2}}` + "\n\n", 0, 100000000, true, -1, http.StatusBadGateway},
 		{"one image before invalid event", "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]}}]},\"usage\":{\"image_count\":1}}\n\ndata: invalid-json\n\n", 90000000, 50000000, true, -1, http.StatusOK},
 		{"completed image", "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]},\"finish_reason\":\"stop\"}]},\"usage\":{\"image_count\":1}}\n\n", 90000000, 50000000, false, -1, http.StatusOK},
 		{"short first image write", "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]},\"finish_reason\":\"stop\"}]},\"usage\":{\"image_count\":1}}\n\n", 0, 50000000, false, 0, http.StatusOK},

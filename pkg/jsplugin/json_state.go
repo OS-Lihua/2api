@@ -309,6 +309,24 @@ func (s *JSONState) ApplyAtomic(ctx context.Context, changes any) error {
 	return err
 }
 
+// ApplySource retains independent bounded changes for source accounting after
+// a failed batch. It still returns the error; its recovered value must never
+// be published as a completed response.
+func (s *JSONState) ApplySource(ctx context.Context, changes any) error {
+	err := s.ApplyAtomic(ctx, changes)
+	if err == nil || s.failed != nil {
+		return err
+	}
+	items, ok := changes.([]any)
+	if !ok || len(items) > maxJSONChanges {
+		return err
+	}
+	for _, item := range items {
+		_ = s.ApplyAtomic(context.WithoutCancel(ctx), []any{item})
+	}
+	return err
+}
+
 func (s *JSONState) apply(ctx context.Context, changes any, checkpoint func(*jsonStateNode)) error {
 	if err := ctx.Err(); err != nil {
 		return err
