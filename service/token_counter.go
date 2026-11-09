@@ -89,7 +89,7 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 			if err != nil {
 				return 0, fmt.Errorf("error getting audio duration: %v", err)
 			}
-			if info.ResponseFacts != nil && (math.IsNaN(duration) || math.IsInf(duration, 0) || duration < 0 || duration > relaycommon.MaxTaskDurationSeconds) {
+			if info.ResponseFacts != nil && (math.IsNaN(duration) || math.IsInf(duration, 0) || duration <= 0 || duration > relaycommon.MaxTaskDurationSeconds) {
 				return 0, errors.New("audio duration exceeds the request limit")
 			}
 			if info.ResponseFacts != nil {

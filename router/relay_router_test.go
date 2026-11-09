@@ -18,6 +18,7 @@ import (
 	"image/png"
 	"io"
 	"log"
+	"math"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -6605,6 +6606,110 @@ func (w cancelOnSpeechOutputWriter) WriteString(body string) (int, error) {
 	return w.Write([]byte(body))
 }
 
+func TestMediaGatewayWAVUsesActualAudioFrames(t *testing.T) {
+	for _, tc := range []struct {
+		name                                               string
+		stream, placeholder, longHeader, partial, reported bool
+		seconds                                            int
+		costTokens                                         int64
+	}{
+		{name: "empty header"},
+		{name: "empty stream header", stream: true},
+		{name: "empty header preserves counter", reported: true, costTokens: 1000},
+		{name: "placeholder length", placeholder: true, seconds: 1, costTokens: 17},
+		{name: "stream placeholder length", stream: true, placeholder: true, seconds: 1, costTokens: 17},
+		{name: "declared length exceeds available frames", longHeader: true, seconds: 1, costTokens: 17},
+		{name: "partial stream frames", stream: true, placeholder: true, partial: true, seconds: 3, costTokens: 50},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := make([]byte, 48000*tc.seconds)
+			size := uint32(len(payload))
+			if tc.placeholder {
+				size = math.MaxUint32
+			}
+			if tc.longHeader {
+				size = 144000
+			}
+			wave := mediaWAV(t, 24000, size, payload)
+			if tc.placeholder {
+				binary.LittleEndian.PutUint32(wave[4:8], math.MaxUint32)
+			}
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
+				if tc.reported {
+					w.Header().Set("X-VLLM-OMNI-INPUT-TOKENS", "0")
+					w.Header().Set("X-VLLM-OMNI-OUTPUT-TOKENS", "1000")
+				}
+				w.Header().Set("Content-Type", "audio/wav")
+				if !tc.stream {
+					_, _ = w.Write(wave)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprintf(w, "data: {\"type\":\"speech.audio.delta\",\"audio\":%q}\n\n", base64.StdEncoding.EncodeToString(wave[:44]))
+				for offset := 0; offset < len(payload); {
+					end := min(offset+48000, len(payload))
+					if tc.partial && offset > 0 {
+						end = len(payload)
+					}
+					_, _ = fmt.Fprintf(w, "data: {\"type\":\"speech.audio.delta\",\"audio\":%q}\n\n", base64.StdEncoding.EncodeToString(payload[offset:end]))
+					offset = end
+				}
+				_, _ = io.WriteString(w, "data: {\"type\":\"speech.audio.done\"}\n\ndata: [DONE]\n\n")
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeVLLM).Error)
+			fixture.fake.Advance(time.Second)
+			sale := `tier("audio",ao*9)`
+			if tc.seconds == 0 {
+				sale = `tier("request",fixed(0.01))`
+			}
+			for _, price := range []*model.PriceVersion{{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: sale, EffectiveAt: clock.Now().Unix()}, {OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("audio",ao*7)`, EffectiveAt: clock.Now().Unix()}} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			format := "audio"
+			if tc.stream {
+				format = "sse"
+			}
+			request := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", strings.NewReader(fmt.Sprintf(`{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"wav","stream_format":%q}`, format)))
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			if tc.partial {
+				fixture.engine.ServeHTTP(&mediaFrameFailureWriter{ResponseRecorder: response, failFrame: 3}, request)
+			} else {
+				fixture.engine.ServeHTTP(response, request)
+			}
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			saleTokens := tc.costTokens
+			if tc.partial {
+				saleTokens = 17
+			}
+			if tc.seconds == 0 {
+				saleTokens = 0
+				assert.NotEqual(t, "success", record.Status)
+				assert.NotContains(t, response.Body.String(), "[DONE]")
+			}
+			assert.Equal(t, saleTokens*8100, record.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, new(tc.costTokens), attempts[0].Usage.AudioOutputTokens)
+			assert.Equal(t, tc.costTokens*7000, attempts[0].Cost.Nanos)
+			require.NotNil(t, attempts[0].Usage.AudioOutputSeconds)
+			assert.Equal(t, strconv.Itoa(tc.seconds), *attempts[0].Usage.AudioOutputSeconds)
+			if tc.partial {
+				require.NotNil(t, record.Usage.AudioOutputSeconds)
+				assert.Equal(t, "1", *record.Usage.AudioOutputSeconds)
+				assert.Equal(t, "failed", record.Status)
+				assert.Equal(t, "downstream_write_failed", attempts[0].ErrorClass)
+			}
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.EqualValues(t, 1_000_000_000-saleTokens*8100, wallet.Balance.Nanos)
+		})
+	}
+}
+
 func TestMediaGatewayVLLMOmittedFormatUsesWAV(t *testing.T) {
 	for _, override := range []bool{false, true} {
 		t.Run(fmt.Sprint(override), func(t *testing.T) {
@@ -9263,7 +9368,7 @@ func (w *mediaFrameFailureWriter) Write(body []byte) (int, error) {
 			return 0, io.ErrClosedPipe
 		}
 	}
-	if strings.HasPrefix(text, "data: ") && strings.Contains(text, `"type":"image_generation.completed"`) {
+	if strings.HasPrefix(text, "data: ") && (strings.Contains(text, `"type":"image_generation.completed"`) || strings.Contains(text, `"type":"speech.audio.delta"`)) {
 		w.frames++
 		if w.failFrame > 0 && w.frames == w.failFrame {
 			return 0, io.ErrClosedPipe

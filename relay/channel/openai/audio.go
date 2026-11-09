@@ -148,6 +148,9 @@ func speechAudioDuration(ctx context.Context, audio []byte, format string, facts
 	if format == "pcm" {
 		return float64(len(audio)) / float64(facts.AudioPCMBytesPerSecond()), nil
 	}
+	if format == "wav" {
+		return common.WAVDuration(bytes.NewReader(audio))
+	}
 	return common.GetAudioDuration(ctx, bytes.NewReader(audio), "."+format)
 }
 
@@ -165,7 +168,7 @@ func EstimateGeneratedSpeech(c *gin.Context, info *relaycommon.RelayInfo, audio 
 	}
 	var duration float64
 	durationErr := errors.New("incomplete encoded audio")
-	if complete || format == "pcm" {
+	if complete || format == "pcm" || format == "wav" {
 		duration, durationErr = speechAudioDuration(c.Request.Context(), audio, format, info.ResponseFacts)
 	}
 	var clamp *common.QuotaClamp
@@ -327,6 +330,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		var generatedPCMSeconds, deliveredPCMSeconds big.Rat
 		var encodedAudio bytes.Buffer
 		var completed bool
+		var generatedAudioPayload bool
 		helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 			eventBody := []byte(data)
 			eventFacts := mediaResponseEnvelope(eventBody)
@@ -374,7 +378,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 				}
 			}
 			if chunk.Type == "speech.audio.done" {
-				if audioBytes == 0 {
+				if !generatedAudioPayload {
 					sr.Stop(errors.New("speech stream completed without audio"))
 					return
 				}
@@ -399,17 +403,24 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 					chunkPCMSeconds.SetFrac64(chunkBytes, formatFacts.AudioPCMBytesPerSecond())
 					generatedPCMSeconds.Add(&generatedPCMSeconds, &chunkPCMSeconds)
 				}
-				if audioFormat != "pcm" && info.ResponseFacts.AudioOutputSeconds == nil {
+				if audioFormat != "pcm" && (info.ResponseFacts.AudioOutputSeconds == nil || audioFormat == "wav") {
 					_, _ = encodedAudio.Write(audio)
 				}
 				business = len(audio) > 0
+				if audioFormat == "wav" {
+					duration, err := common.WAVDuration(bytes.NewReader(encodedAudio.Bytes()))
+					business = business && err == nil && duration > 0
+				}
+				generatedAudioPayload = generatedAudioPayload || business
 			}
 			writeErr := helper.StringData(c, data)
 			var flushErr *helper.StreamFlushError
-			if business && (writeErr == nil || errors.As(writeErr, &flushErr)) {
+			if chunkBytes > 0 && (writeErr == nil || errors.As(writeErr, &flushErr)) {
 				deliveredAudioBytes += chunkBytes
 				deliveredPCMSeconds.Add(&deliveredPCMSeconds, &chunkPCMSeconds)
-				info.ResponseFacts.MarkBusinessOutput()
+				if business {
+					info.ResponseFacts.MarkBusinessOutput()
+				}
 			}
 			if writeErr != nil {
 				info.ResponseFacts.DownstreamWriteFailed = true
@@ -438,10 +449,16 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			duration, _ := deliveredPCMSeconds.Float64()
 			seconds := decimal.NewFromFloat(duration).String()
 			info.ResponseFacts.DeliveredAudioSeconds = &seconds
-		} else if info.ResponseFacts.AudioOutputSeconds == nil && completed {
+		} else if info.ResponseFacts.AudioOutputSeconds == nil && (completed || audioFormat == "wav") {
 			if duration, err := speechAudioDuration(c.Request.Context(), encodedAudio.Bytes(), audioFormat, info.ResponseFacts); err == nil && !math.IsNaN(duration) && !math.IsInf(duration, 0) && duration >= 0 {
 				seconds := decimal.NewFromFloat(duration).String()
 				info.ResponseFacts.AudioOutputSeconds = &seconds
+			}
+		}
+		if audioFormat == "wav" && deliveredAudioBytes > 0 && deliveredAudioBytes <= int64(encodedAudio.Len()) {
+			if duration, err := common.WAVDuration(bytes.NewReader(encodedAudio.Bytes()[:deliveredAudioBytes])); err == nil {
+				seconds := decimal.NewFromFloat(duration).String()
+				info.ResponseFacts.DeliveredAudioSeconds = &seconds
 			}
 		}
 		// Speech output is audio unless an explicit detail counter says otherwise.
@@ -537,7 +554,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		}
 		if info.ResponseFacts != nil {
 			info.ResponseFacts.DownstreamWriteFailed = writeErr != nil || n != len(bodyBytes)
-			if !info.ResponseFacts.DownstreamWriteFailed && len(bodyBytes) > 0 {
+			if !info.ResponseFacts.DownstreamWriteFailed && len(bodyBytes) > 0 && (audioFormat != "wav" || speechAudioPayload(c.Request.Context(), bodyBytes, audioFormat, formatFacts)) {
 				info.ResponseFacts.MarkBusinessOutput()
 			}
 		}

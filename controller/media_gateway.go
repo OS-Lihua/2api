@@ -616,7 +616,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		estimateDelivered := attempt.Status == "partial" || !facts.UsageReported && (attempt.Status == "cancelled" || facts.DownstreamWriteFailed)
 		if info.IsStream && run.parsed.Protocol == protocol.OpenAIAudioSpeech && estimateDelivered {
 			output, clamp := common.QuotaRoundChecked(math.Ceil(float64(facts.DeliveredAudioBytes) / 1000))
-			if audio, ok := prepared.Request.(*dto.AudioRequest); ok && audio.ResponseFormat == "pcm" {
+			if audio, ok := prepared.Request.(*dto.AudioRequest); ok && (audio.ResponseFormat == "pcm" || facts.DeliveredAudioSeconds != nil) {
 				seconds := decimal.NewFromInt(facts.DeliveredAudioBytes).Div(decimal.NewFromInt(facts.AudioPCMBytesPerSecond())).String()
 				if facts.DeliveredAudioSeconds != nil {
 					seconds = *facts.DeliveredAudioSeconds
