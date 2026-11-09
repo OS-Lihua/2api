@@ -11033,6 +11033,8 @@ func TestTextGatewayNativeComposerReturnsParameterReasons(t *testing.T) {
 		{field: "n", extra: `"n":2`, provider: constant.ChannelTypeAws, key: "test-access|test-secret|us-east-1", upstream: "amazon.nova-lite-v1:0", reason: "The native request did not retain this request parameter"},
 		{field: "n", extra: `"max_tokens":16`, provider: constant.ChannelTypeCohere, overrides: `{"n":2}`, reason: "native wire does not support request parameter n"},
 		{field: "n", extra: `"n":2`, provider: constant.ChannelTypeTencent, key: "1|test-id|test-secret", reason: "native Provider cannot represent multiple output choices (n)"},
+		{field: "n", extra: `"n":2`, provider: constant.ChannelTypeXunfei, upstream: "SparkDesk-v3.5", key: "fixture-app|fixture-secret|fixture-key", reason: "native Provider cannot represent multiple output choices (n)"},
+		{field: "n", extra: `"n":2`, provider: constant.ChannelTypeAws, upstream: "amazon.nova-lite-v1:0", key: "test-access|test-secret|us-east-1", reason: "native Provider cannot represent multiple output choices (n)"},
 		{field: "tools", extra: `"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]`, provider: constant.ChannelTypeCohere, reason: "The native Cohere request cannot represent this parameter"},
 		{field: "response_format", extra: `"response_format":{"type":"json_object"}`, provider: constant.ChannelTypeCohere, reason: "The native Cohere request cannot represent this parameter"},
 		{field: "messages[0].role", extra: `"max_tokens":16`, provider: constant.ChannelTypeCoze, reason: "The native Coze request cannot represent this message role", system: true},
@@ -11047,6 +11049,13 @@ func TestTextGatewayNativeComposerReturnsParameterReasons(t *testing.T) {
 		t.Run(test.field, func(t *testing.T) {
 			calls := 0
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { calls++ })
+			client := service.GetHttpClient()
+			original := client.Transport
+			t.Cleanup(func() { client.Transport = original })
+			client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
+				calls++
+				return nil, fmt.Errorf("unexpected Provider call for an invalid request")
+			})
 			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", test.provider).Error)
 			caps := capability.Set{Features: []capability.Feature{capability.ToolCalling, capability.StructuredOutput, capability.Caching, capability.Reasoning}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}
 			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
