@@ -401,6 +401,7 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 			pending.Progress = parsed.Immediate.Progress
 			pending.FinishTime = clock.Now().Unix()
 			snapshot.CompletionFacts = parsed.Immediate.UsageFacts
+			snapshot.Stream = parsed.Stream
 			if pending.Status == model.TaskStatusFailure {
 				pending.FailReason = "Task failed"
 			}

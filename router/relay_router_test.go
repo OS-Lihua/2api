@@ -6333,15 +6333,24 @@ func TestTextGatewayToolOnlyUsageCountsDeliveredArguments(t *testing.T) {
 
 type gatewayPrefixOnlyWriter struct {
 	*httptest.ResponseRecorder
-	nilError bool
+	nilError       bool
+	completeWrites *int
 }
 
 func (w gatewayPrefixOnlyWriter) Write(body []byte) (int, error) {
+	if w.completeWrites != nil && *w.completeWrites > 0 {
+		*w.completeWrites--
+		return w.ResponseRecorder.Write(body)
+	}
 	n, _ := w.ResponseRecorder.Write(body[:min(8, len(body))])
 	if w.nilError {
 		return n, nil
 	}
 	return n, io.ErrClosedPipe
+}
+
+func (w gatewayPrefixOnlyWriter) WriteString(body string) (int, error) {
+	return w.Write([]byte(body))
 }
 
 func TestTextGatewayMetadataPrefixIsNotDeliveredBusinessOutput(t *testing.T) {

@@ -3,8 +3,10 @@ package jsplugin
 import (
 	"context"
 	"fmt"
+	"io"
 	"mime"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -22,20 +24,13 @@ import (
 type submitEventStream struct {
 	client     *gin.Context
 	frameLimit int64
+	money      bool
 }
 
-// readSubmitEvents owns only SSE framing and bounded JSON state. The plugin
-// interprets data, accumulates provider output and decides when it is
-// complete. On a native route each event also reaches the client as the
-// vendor sent it, before the plugin reads it. Once one has, the client holds
-// vendor output and the submission settles instead of failing. The upstream
-// finished the stream when the plugin reports completion or the upstream
-// closes it, and the last result settles as usual. A stream that stops any
-// other way (a read error, the idle timeout or the submission deadline, a
-// failed hook, invalid state or changes, a size limit) is reported stopped:
-// the plugin did not see the end of the vendor's work, so its usage cannot
-// lower the reserved charge, and the client's stream is cut off rather than
-// closed. A result that invalid changes left half applied is never published.
+// readSubmitEvents owns SSE framing and bounded source state; the plugin owns
+// vendor payload and terminal semantics. Money submissions parse source first
+// and keep a separately bounded receipt of byte-complete public frames. Legacy
+// native submissions retain their earlier forwarding and quota behavior.
 func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Response, driverContext map[string]any, stream submitEventStream) (_ any, stopped bool, _ error) {
 	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	if err != nil || mediaType != "text/event-stream" {
@@ -52,12 +47,18 @@ func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Respon
 	timer := time.AfterFunc(idleTimeout, func() { cancel(fmt.Errorf("task submit stream idle timeout")) })
 	defer timer.Stop()
 
+	a.deliveredSubmitData = nil
+	a.submitDeliveryFailed = false
+	supportsBusiness := slices.Contains(a.plugin.Meta.RequiredCapabilities, pluginruntime.CapabilitySubmitSSEBusiness)
 	scanner := helper.NewStreamScanner(resp.Body, int(stream.frameLimit)+1)
 	hook := "parseSubmitEvent"
-	var accumulated *pluginruntime.JSONState
+	var accumulated, delivered *pluginruntime.JSONState
 	if pluginruntime.UsesSubmitEventDelta(a.plugin.Meta, a.plugin.Engine) {
 		hook = "parseSubmitEventDelta"
 		accumulated = pluginruntime.NewJSONState(maxTaskPluginPersistedJSONBytes)
+		if stream.money && stream.client != nil {
+			delivered = pluginruntime.NewJSONState(maxTaskPluginPersistedJSONBytes)
+		}
 	}
 	var state any
 	var data []string
@@ -102,12 +103,18 @@ func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Respon
 			continue
 		}
 		frameBytes = 0
-		if stream.client != nil {
-			relaySubmitEvent(stream.client, frame.String())
-			frame.Reset()
+		currentFrame := frame.String()
+		frame.Reset()
+		if stream.client != nil && !stream.money {
+			_, _ = a.relaySubmitEvent(stream.client, currentFrame, false)
 			relayed = true
 		}
 		if len(data) == 0 {
+			if stream.money && stream.client != nil && !a.submitDeliveryFailed {
+				_, writeErr := a.relaySubmitEvent(stream.client, currentFrame, false)
+				a.submitDeliveryFailed = writeErr != nil
+				relayed = stream.client.Writer.Written()
+			}
 			eventName = ""
 			continue
 		}
@@ -127,6 +134,11 @@ func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Respon
 		}
 		nextState, hasState := result["state"]
 		done, hasDone := result["done"].(bool)
+		business, hasBusiness := result["business"].(bool)
+		if supportsBusiness && !hasBusiness {
+			readErr = fmt.Errorf("%s must return a boolean business flag", hook)
+			break
+		}
 		if !hasState || !hasDone {
 			readErr = fmt.Errorf("%s must return state and a boolean done", hook)
 			break
@@ -141,8 +153,8 @@ func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Respon
 			break
 		}
 		if accumulated != nil {
-			if len(result) != 3 {
-				readErr = fmt.Errorf("parseSubmitEventDelta must return only changes, state and done")
+			if len(result) != 3 && (len(result) != 4 || !hasBusiness) {
+				readErr = fmt.Errorf("parseSubmitEventDelta must return changes, state, done and an optional boolean business")
 				break
 			}
 			// Control state is separate from the full result and is the only
@@ -170,6 +182,21 @@ func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Respon
 			}
 			state = decoded
 		}
+		if stream.money && stream.client != nil && !a.submitDeliveryFailed {
+			written, writeErr := a.relaySubmitEvent(stream.client, currentFrame, business)
+			a.submitDeliveryFailed = writeErr != nil
+			relayed = stream.client.Writer.Written()
+			if written {
+				if delivered != nil {
+					if err := delivered.Apply(ctx, result["changes"]); err != nil {
+						readErr = err
+						break
+					}
+				} else {
+					a.deliveredSubmitData = state
+				}
+			}
+		}
 		if done {
 			completed = true
 			break
@@ -190,6 +217,12 @@ func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Respon
 			readErr = valueErr
 		}
 	}
+	if delivered != nil {
+		value, err := delivered.Value()
+		if err == nil {
+			a.deliveredSubmitData = value
+		}
+	}
 	switch {
 	case readErr == nil && completed:
 		return result, false, nil
@@ -200,9 +233,13 @@ func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Respon
 		return nil, false, readErr
 	case readErr == nil:
 		logger.LogDebug(stream.client, "task_plugin subsystem=adaptor event=relayed_stream_closed plugin=%q reason=eof_before_done", a.plugin.Meta.Key)
-		return result, false, nil
+		return result, stream.money, nil
 	default:
-		logger.LogWarn(stream.client, common.LogText("task plugin %s settles a relayed submit stream that stopped early at the reserved quota: %s", a.plugin.Meta.Key, readErr.Error()))
+		if stream.money {
+			logger.LogWarn(stream.client, common.LogText("task plugin %s preserves observed usage after an incomplete submit stream: %s", a.plugin.Meta.Key, readErr.Error()))
+		} else {
+			logger.LogWarn(stream.client, common.LogText("task plugin %s settles a relayed submit stream that stopped early at the reserved quota: %s", a.plugin.Meta.Key, readErr.Error()))
+		}
 		// The client's stream is cut off rather than closed, so a downstream
 		// gateway relaying it keeps its reservation too.
 		_ = http.NewResponseController(stream.client.Writer).SetWriteDeadline(time.Now())
@@ -213,8 +250,21 @@ func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Respon
 // relaySubmitEvent writes one upstream SSE event, as the vendor framed it, to
 // the client of a native route. The first event commits a 200 event-stream
 // response; a client that has left only misses the rest.
-func relaySubmitEvent(c *gin.Context, frame string) {
+func (a *TaskAdaptor) relaySubmitEvent(c *gin.Context, frame string, business bool) (bool, error) {
 	helper.SetEventStreamHeaders(c)
-	_, _ = c.Writer.WriteString(frame)
-	c.Writer.Flush()
+	n, err := c.Writer.WriteString(frame)
+	written := n == len(frame)
+	if written && business && a.info != nil && a.info.BeginProviderCall != nil {
+		a.submitBusiness.Store(true)
+		if a.info.ResponseFacts != nil {
+			a.info.ResponseFacts.MarkBusinessOutput()
+		}
+	}
+	if err != nil {
+		return written, err
+	}
+	if !written {
+		return false, io.ErrShortWrite
+	}
+	return true, helper.FlushWriter(c)
 }

@@ -301,8 +301,12 @@ A missing referenced fact fails evaluation. Expressions containing `u()` already
 return currency amounts in canonical task units and are not divided by one
 million. Set `MoneyInput.TaskUsage` for task evaluation, including constant task
 prices; this mode rejects `fixed()`. The host validates plugin schema and unit
-bounds before evaluation and supplies the same completed fact vector to sale
-and purchase expressions. In task mode, `image_count` reads the same bounded
+bounds before evaluation and supplies the same completed fact record to sale
+and purchase expressions. Native submission streams retain separate source and
+byte-complete public-delivery quantities in that record: procurement uses the
+source facts, and sales use the delivered facts without exceeding known source
+quantities. Missing quantities remain unknown; an output budget is not a
+completion fact. In task mode, `image_count` reads the same bounded
 whole `u("image_count")` fact, including an explicitly reported zero; it never
 defaults to one. Saving this syntax requires the selected plugin schema to
 declare `image_count` as a numeric count field.

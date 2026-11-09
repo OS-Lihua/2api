@@ -241,19 +241,43 @@ func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 	if facts == nil {
 		facts = make(map[string]any)
 	}
+	incomplete := snapshot.Stream != nil && snapshot.Stream.Incomplete
+	if snapshot.Stream != nil {
+		for name, value := range facts {
+			switch value.(type) {
+			case string, bool:
+			default:
+				delete(facts, name)
+			}
+		}
+	}
 	maps.Copy(facts, snapshot.CompletionFacts)
+	saleFacts := facts
+	if snapshot.Stream != nil {
+		saleFacts = make(map[string]any)
+		for name, value := range facts {
+			switch value.(type) {
+			case string, bool:
+				saleFacts[name] = value
+			}
+		}
+		maps.Copy(saleFacts, snapshot.Stream.Delivered)
+	}
 	request.EndedAt = clock.Now().UnixMilli()
 	request.Status = "failed"
 	request.UsageSource = gatewayTaskUsageSource(request.SaleExpression, snapshot.CompletionFacts)
-	request.Usage.TaskFacts = facts
+	request.Usage.TaskFacts = saleFacts
 	request.Receivable = money.Amount{Currency: model.SettlementCurrency()}
 	intent.SaleSource = money.Amount{Currency: request.SaleCurrency}
 	attempt.EndedAt = request.EndedAt
 	attempt.Status = "failed"
 	attempt.Usage.TaskFacts = facts
 	attempt.UsageSource = gatewayTaskUsageSource(attempt.PurchaseExpression, snapshot.CompletionFacts)
-	if task.Status == model.TaskStatusSuccess {
+	if task.Status == model.TaskStatusSuccess && (snapshot.Stream == nil || snapshot.Stream.BusinessOutput) {
 		request.Status, attempt.Status = "success", "success"
+		if snapshot.Stream != nil && (snapshot.Stream.Incomplete || snapshot.Stream.DeliveryFailed) {
+			request.Status = "partial"
+		}
 		ratio, saleErr := decimal.NewFromString(request.GroupRatio)
 		var fx *money.Rate
 		if request.SaleCurrency != model.SettlementCurrency() {
@@ -267,7 +291,7 @@ func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 		trace := billingexpr.MoneyTraceResult{Currency: request.SaleCurrency}
 		if saleErr == nil {
 			price := &model.PriceVersion{Expression: request.SaleExpression, Currency: request.SaleCurrency}
-			source, converted, evaluated, err := GatewayPrice(price, nil, billingexpr.RequestInput{Usage: facts, MoneySnapshot: snapshot.SaleConditions, RequireMoneySnapshot: true}, time.UnixMilli(request.StartedAt), ratio, fx)
+			source, converted, evaluated, err := GatewayPrice(price, nil, billingexpr.RequestInput{Usage: saleFacts, MoneySnapshot: snapshot.SaleConditions, RequireMoneySnapshot: true}, time.UnixMilli(request.StartedAt), ratio, fx)
 			trace, saleErr = evaluated, err
 			if saleErr == nil {
 				intent.SaleSource, saleErr = source.Receivable()
@@ -288,7 +312,7 @@ func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 	// Failed delivery owes no sale. Procurement uses reported quantities;
 	// requested quantities cannot confirm what an unsuccessful Provider billed.
 	costFacts := facts
-	if task.Status == model.TaskStatusFailure {
+	if task.Status == model.TaskStatusFailure || snapshot.Stream != nil {
 		costFacts = maps.Clone(snapshot.CompletionFacts)
 		if costFacts == nil {
 			costFacts = make(map[string]any)
@@ -320,15 +344,17 @@ func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 	}
 	intent.AttemptTrace[attempt.ID] = trace
 	originalCost, originalErr := cost.Cost()
-	attempt.CostPending = originalErr != nil || originalCost.Currency != purchase.Currency
-	if !attempt.CostPending {
+	originalKnown := originalErr == nil && originalCost.Currency == purchase.Currency
+	if originalKnown {
 		attempt.Cost = originalCost
 	}
+	attempt.CostPending = !originalKnown || incomplete
 	convertedCost, convertedErr := converted.Cost()
-	attempt.ConvertedCostPending = fxErr != nil || convertedErr != nil || convertedCost.Currency != model.SettlementCurrency()
-	if !attempt.ConvertedCostPending {
+	convertedKnown := fxErr == nil && convertedErr == nil && convertedCost.Currency == model.SettlementCurrency()
+	if convertedKnown {
 		attempt.ConvertedCost = convertedCost
 	}
+	attempt.ConvertedCostPending = !convertedKnown || incomplete
 	intent.EvaluationFailed = intent.SaleEvaluationFailed || priceErr != nil || attempt.CostPending || attempt.ConvertedCostPending
 	for _, previous := range snapshot.PreviousAttempts {
 		intent.EvaluationFailed = intent.EvaluationFailed || previous.CostPending || previous.ConvertedCostPending

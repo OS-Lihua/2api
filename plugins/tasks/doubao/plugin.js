@@ -311,7 +311,7 @@ export const meta = {
   upstreams: ["vendor", "new_api"],
   // Seedream streams its images when asked to (stream: true).
   submitResponseTypes: ["json", "sse"],
-  requiredCapabilities: ["duration-auto@1"],
+  requiredCapabilities: ["duration-auto@1", "submit-sse-business@1"],
   usageSchema: seedanceUsageSchema(DEFAULT_VIDEO_PROFILE),
   usageExamples: seedanceUsageExamples(DEFAULT_VIDEO_PROFILE),
   usageProfiles: capabilityUsageProfiles(VIDEO_MODELS, seedanceUsageSchema, seedanceUsageExamples).concat(
@@ -916,13 +916,15 @@ export function buildSubmitRequest(ctx) {
 // standing for the payload the client already has.
 export function parseSubmitEvent(ctx, event, previousState) {
   const state = previousState ? utils.json.clone(previousState) : { data: [] };
-  if (trimmed(event.data) === "[DONE]") return { state: state, done: true };
+  if (trimmed(event.data) === "[DONE]") return { state: state, done: true, business: false };
+  let business = false;
   const body = JSON.parse(event.data);
   if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("invalid image stream event");
   if (body.type === "image_generation.partial_succeeded") {
     const image = { image_index: body.image_index, size: body.size };
     if (trimmed(body.url)) image.url = body.url;
     else if (trimmed(body.b64_json)) image.b64_json = "streamed";
+    business = !!(image.url || image.b64_json);
     state.data.push(image);
   } else if (body.type === "image_generation.partial_failed") {
     state.data.push({ image_index: body.image_index, error: body.error });
@@ -933,7 +935,7 @@ export function parseSubmitEvent(ctx, event, previousState) {
   } else if (body.error) {
     state.error = body.error;
   }
-  return { state: state, done: false };
+  return { state: state, done: false, business: business };
 }
 
 export function parseSubmitResponse(ctx, resp) {

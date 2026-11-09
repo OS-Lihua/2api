@@ -141,6 +141,15 @@ type TaskPrivateData struct {
 	ResultDiscarded bool `json:"result_discarded,omitempty"`
 }
 
+// TaskStreamFacts retains bounded quantitative delivery receipts independently
+// of source completion. It never contains response payloads.
+type TaskStreamFacts struct {
+	Delivered      map[string]any `json:"delivered,omitempty"`
+	BusinessOutput bool           `json:"business_output"`
+	DeliveryFailed bool           `json:"delivery_failed,omitempty"`
+	Incomplete     bool           `json:"incomplete,omitempty"`
+}
+
 // TaskGatewaySnapshot freezes the accepted Channel and quantitative billing
 // facts. Request bodies, credentials, and generated content stay out of it.
 type TaskGatewaySnapshot struct {
@@ -151,6 +160,7 @@ type TaskGatewaySnapshot struct {
 	Settlement         GatewaySettlement                 `json:"settlement"`
 	Facts              map[string]any                    `json:"facts"`
 	CompletionFacts    map[string]any                    `json:"completion_facts,omitempty"`
+	Stream             *TaskStreamFacts                  `json:"stream,omitempty"`
 	PreviousAttempts   []GatewayAttempt                  `json:"previous_attempts,omitempty"`
 	SaleSource         money.Amount                      `json:"sale_source"`
 	SaleConditions     *billingexpr.MoneyRequestSnapshot `json:"sale_conditions,omitempty"`

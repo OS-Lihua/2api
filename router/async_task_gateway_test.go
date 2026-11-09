@@ -2682,6 +2682,149 @@ func TestAsyncTaskPhysicalDurationAndEffectiveImageModalities(t *testing.T) {
 	}
 }
 
+func newNativeImageTaskFixture(t *testing.T, upstream http.HandlerFunc) textGatewayFixture {
+	t.Helper()
+	fixture := newAsyncTaskFixture(t, upstream)
+	source, err := plugins.Source("alibaba")
+	require.NoError(t, err)
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "alibaba"})
+	require.NoError(t, err)
+	caps := capability.Set{Features: []capability.Feature{capability.Streaming}, InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text, capability.Image}}
+	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Updates(map[string]any{"model_name": "wan2.6-image", "capabilities": caps}).Error)
+	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:alibaba", "upstream_model_name": "wan2.6-image"}).Error)
+	fixture.fake.Advance(time.Second)
+	for _, price := range []*model.PriceVersion{
+		{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("image", u("image_count") * 0.1)`, EffectiveAt: clock.Now().Unix()},
+		{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("image", u("image_count") * 0.05)`, EffectiveAt: clock.Now().Unix()},
+	} {
+		require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+	}
+	builder := newPluginGenerationBuilder(fixture.engine.Routes(), nil, productionPluginRouteHandlers)
+	require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(builder.prepare))
+	fixture.engine.NoRoute((&pluginRouteDispatcher{registry: jsplugin.DefaultRegistry}).dispatch)
+	return fixture
+}
+
+func TestAsyncTaskNativeStreamSettlesObservedFacts(t *testing.T) {
+	for _, test := range []struct {
+		name, stream   string
+		sale, cost     int64
+		costPending    bool
+		completeWrites int
+	}{
+		{"metadata only", ": keep-alive\n\ndata: invalid-json\n\n", 0, 0, true, -1},
+		{"one image before invalid event", "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]}}]},\"usage\":{\"image_count\":1}}\n\ndata: invalid-json\n\n", 90000000, 50000000, true, -1},
+		{"completed image", "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]},\"finish_reason\":\"stop\"}]},\"usage\":{\"image_count\":1}}\n\n", 90000000, 50000000, false, -1},
+		{"short first image write", "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]},\"finish_reason\":\"stop\"}]},\"usage\":{\"image_count\":1}}\n\n", 0, 50000000, false, 0},
+		{"short second image write", "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]}}]}}\n\ndata: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/second.png\"}]},\"finish_reason\":\"stop\"}]},\"usage\":{\"image_count\":2}}\n\n", 90000000, 100000000, false, 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newNativeImageTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				assert.Equal(t, "enable", r.Header.Get("X-DashScope-Sse"))
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, test.stream)
+			})
+			request := httptest.NewRequest(http.MethodPost, "/ali/api/v1/services/aigc/multimodal-generation/generation", strings.NewReader(`{"model":"gateway-alias","input":{"messages":[{"role":"user","content":[{"text":"A bird"}]}]},"parameters":{"enable_interleave":true,"max_images":4}}`))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			request.Header.Set("X-DashScope-Sse", "enable")
+			response := httptest.NewRecorder()
+			var writer http.ResponseWriter = response
+			if test.completeWrites >= 0 {
+				remaining := test.completeWrites
+				writer = gatewayPrefixOnlyWriter{ResponseRecorder: response, nilError: true, completeWrites: &remaining}
+			}
+			fixture.engine.ServeHTTP(writer, request)
+			require.Equal(t, 200, response.Code, response.Body.String())
+			assert.EqualValues(t, 1, calls.Load())
+			for range 2 {
+				_, err := service.RecoverGatewayTasks(t.Context(), 100)
+				if test.costPending {
+					require.ErrorIs(t, err, model.ErrGatewayEvaluationPending)
+				} else {
+					require.NoError(t, err)
+				}
+			}
+			requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, test.sale, requests[0].Receivable.Nanos)
+			assert.False(t, requests[0].SalePending)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), requests[0].ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, test.cost, attempts[0].Cost.Nanos)
+			assert.Equal(t, test.costPending, attempts[0].CostPending)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.EqualValues(t, 1000000000-test.sale, wallet.Balance.Nanos)
+			assertTextGatewayLedger(t, requests[0], test.cost)
+			var reservations int64
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id = ? AND type = ?", requests[0].ID, model.LedgerEntryPreConsume).Count(&reservations).Error)
+			assert.EqualValues(t, 1, reservations)
+		})
+	}
+}
+
+func TestAsyncTaskNativeStreamHonorsBudgetAndCallerCancellation(t *testing.T) {
+	for _, cause := range []string{"single second budget", "caller cancellation"} {
+		t.Run(cause, func(t *testing.T) {
+			entered, cancelled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			fixture := newNativeImageTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				_, err := io.Copy(io.Discard, r.Body)
+				if !assert.NoError(t, err) {
+					return
+				}
+				close(entered)
+				select {
+				case <-r.Context().Done():
+					close(cancelled)
+				case <-release:
+				}
+			})
+			t.Setenv("GATEWAY_MAX_ATTEMPTS", "1")
+			t.Setenv("GATEWAY_ATTEMPT_FIRST_BYTE_SECONDS", "1")
+			parent, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			request := httptest.NewRequest(http.MethodPost, "/ali/api/v1/services/aigc/multimodal-generation/generation", strings.NewReader(`{"model":"gateway-alias","input":{"messages":[{"role":"user","content":[{"text":"A bird"}]}]},"parameters":{"enable_interleave":true,"max_images":4}}`)).WithContext(parent)
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			request.Header.Set("X-DashScope-Sse", "enable")
+			finished := make(chan struct{})
+			go func() {
+				fixture.engine.ServeHTTP(httptest.NewRecorder(), request)
+				close(finished)
+			}()
+			defer func() { close(release); <-finished }()
+			guard, stop := context.WithTimeout(t.Context(), 10*time.Second)
+			defer stop()
+			select {
+			case <-entered:
+			case <-guard.Done():
+				require.FailNow(t, "model request did not reach the controlled Provider")
+			}
+			if cause == "single second budget" {
+				fixture.fake.Advance(time.Second)
+			} else {
+				cancel()
+			}
+			select {
+			case <-cancelled:
+			case <-guard.Done():
+				require.FailNow(t, "actual Provider request ignored the original budget or caller cancellation")
+			}
+			select {
+			case <-finished:
+			case <-guard.Done():
+				require.FailNow(t, "submission did not finish after its Provider request was cancelled")
+			}
+		})
+	}
+}
+
 func TestAsyncTaskRejectsUnboundedDurationBeforeReservation(t *testing.T) {
 	calls := 0
 	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {

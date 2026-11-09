@@ -155,13 +155,14 @@ type TaskAdaptor struct {
 	// requestBodyText is the decoded requestBody as JSON text, which hooks
 	// of a plugin that preserves JSON order receive instead.
 	requestBodyText json.RawMessage
-	// keepReservation is set when the client of a native route already holds
-	// the relayed events of a submission whose stream stopped before the
-	// upstream finished it, or whose result the plugin could not read: the
-	// task then settles at the reserved quota.
-	requestDecoded    bool
-	keepReservation   bool
-	submissionWritten atomic.Bool
+	// keepReservation preserves legacy quota after an incomplete native stream.
+	// Money settlement instead retains observed facts and incomplete procurement.
+	requestDecoded       bool
+	keepReservation      bool
+	deliveredSubmitData  any
+	submitDeliveryFailed bool
+	submitBusiness       atomic.Bool
+	submissionWritten    atomic.Bool
 }
 
 func New(plugin *pluginruntime.LoadedPlugin) *TaskAdaptor { return &TaskAdaptor{plugin: plugin} }
@@ -711,21 +712,27 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, bod
 	wasStream := info.IsStream
 	info.IsStream = false
 	defer func() { info.IsStream = wasStream }()
-	// A native route relays an SSE reply to the client as it arrives, so the
-	// vendor's work and what the client receives no longer depend on the
-	// client staying: from here the submission ignores the client leaving,
-	// keeps reading to the end and settles. Keep-alive comments reset the
-	// idle timeout, so the upstream request is bounded by the submission
-	// deadline of the host protocols (TASK_PLUGIN_PROTOCOL_TIMEOUT_SECONDS).
+	// Native streams keep a protocol deadline. Money submissions also follow
+	// caller cancellation and the shared first-byte budget until business is written.
+	a.submitBusiness.Store(false)
 	var release context.CancelFunc
 	if a.submit != nil && a.submit.ResponseType == "sse" && relaysSubmitEvents(c) {
-		detached := c.Request.WithContext(context.WithoutCancel(c.Request.Context()))
+		originalContext := c.Request.Context()
+		detached := c.Request.WithContext(context.WithoutCancel(originalContext))
 		timeout := time.Duration(constant.TaskPluginProtocolTimeoutSeconds) * time.Second
 		if timeout <= 0 {
 			timeout = 10 * time.Minute
 		}
-		var upstream context.Context
-		upstream, release = context.WithTimeout(detached.Context(), timeout)
+		upstream, cancel := context.WithTimeout(detached.Context(), timeout)
+		release = cancel
+		if info.BeginProviderCall != nil {
+			stopCaller := context.AfterFunc(originalContext, func() {
+				if !a.submitBusiness.Load() {
+					cancel()
+				}
+			})
+			release = func() { stopCaller(); cancel() }
+		}
 		c.Request = detached.WithContext(upstream)
 		defer func() { c.Request = detached }()
 	}
@@ -804,6 +811,16 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 	defer func() {
 		switch {
 		case taskErr == nil:
+		case acceptedStream && relaysSubmitEvents(c) && info.BeginProviderCall != nil:
+			logger.LogWarn(c, common.LogText("task plugin %s has an incomplete submit result; preserving observed usage: %s", a.plugin.Meta.Key, taskErr.Message))
+			immediate := &relaycommon.TaskInfo{Status: model.TaskStatusFailure, Progress: taskcommon.ProgressComplete}
+			if a.submitBusiness.Load() {
+				immediate.Status = model.TaskStatusSuccess
+			}
+			a.observeSubmitCompletion(c, info, immediate, info.PublicTaskID, responseBody, nil)
+			stream := a.submitStreamFacts(c, info, immediate, info.PublicTaskID, nil)
+			submitted = &channel.TaskSubmitResponse{UpstreamTaskID: info.PublicTaskID, Immediate: immediate, Stream: stream}
+			taskErr = nil
 		case relayed:
 			// The client already holds the vendor's events, so the task
 			// completes at the reserved quota instead of failing and refunding
@@ -829,7 +846,7 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 			client = c
 		}
 		var stopped bool
-		responseBody, stopped, err = a.readSubmitEvents(c.Request.Context(), resp, a.submitContext(c, info), submitEventStream{client: client, frameLimit: replyLimit})
+		responseBody, stopped, err = a.readSubmitEvents(c.Request.Context(), resp, a.submitContext(c, info), submitEventStream{client: client, frameLimit: replyLimit, money: info.BeginProviderCall != nil})
 		relayed = client != nil && c.Writer.Written()
 		a.keepReservation = stopped
 	} else {
@@ -926,30 +943,80 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 	if immediate.Status != model.TaskStatusSuccess && !moneyFailure || info.IsChannelTest || !a.hasHook(c.Request.Context(), "extractUsageOnComplete") {
 		return response, nil
 	}
-	// A relayed stream that stopped early keeps the reservation: the plugin
-	// did not see the end of the vendor's work.
-	if a.keepReservation {
+	// Legacy relayed submissions retain their quota after an incomplete stream.
+	// Money submissions retain the observed quantities for reconciliation.
+	if a.keepReservation && info.BeginProviderCall == nil {
 		return response, nil
 	}
-	// Match the polling hook context without persisting a temporary task.
-	task := &model.Task{TaskID: info.PublicTaskID, Action: info.Action, Data: taskData,
-		Properties: model.Properties{OriginModelName: info.OriginModelName, UpstreamModelName: info.UpstreamModelName}}
-	task.PrivateData.UpstreamTaskID = parsed.TaskID
-	task.PrivateData.PluginState = pluginState
-	ctx, err := a.queryContext(task, info.ApiKey, info.ChannelBaseUrl, info.ChannelSetting.Proxy)
-	if err != nil {
-		logger.LogWarn(c, common.LogText("task plugin %s completion context failed; retaining reserved quota: %v", a.plugin.Meta.Key, err))
-		return response, nil
-	}
-	facts, err := a.plugin.Engine.Call(c.Request.Context(), "extractUsageOnComplete", ctx, jsonValue(immediate), parsed.TaskData)
-	if err != nil {
-		logger.LogWarn(c, common.LogText("task plugin %s completion usage failed; retaining reserved quota: %v", a.plugin.Meta.Key, err))
-		return response, nil
-	}
-	if err := a.applyCompletionUsageFacts(immediate, facts, info.UpstreamModelName, info.OriginModelName); err != nil {
-		logger.LogWarn(c, common.LogText("task plugin %s completion usage rejected; retaining reserved quota: %v", a.plugin.Meta.Key, err))
+	a.observeSubmitCompletion(c, info, immediate, parsed.TaskID, parsed.TaskData, pluginState)
+	if eventStream && relaysSubmitEvents(c) && info.BeginProviderCall != nil {
+		response.Stream = a.submitStreamFacts(c, info, immediate, parsed.TaskID, pluginState)
 	}
 	return response, nil
+}
+
+func (a *TaskAdaptor) submitStreamFacts(c *gin.Context, info *relaycommon.RelayInfo, generated *relaycommon.TaskInfo, taskID string, pluginState []byte) *model.TaskStreamFacts {
+	delivered := &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}
+	a.observeSubmitCompletion(c, info, delivered, taskID, a.deliveredSubmitData, pluginState)
+	for name, value := range delivered.UsageFacts {
+		count, numeric := value.(float64)
+		source, known := generated.UsageFacts[name].(float64)
+		if numeric && known && count > source {
+			delivered.UsageFacts[name] = source
+		}
+	}
+	return &model.TaskStreamFacts{Delivered: delivered.UsageFacts, BusinessOutput: a.submitBusiness.Load(), DeliveryFailed: a.submitDeliveryFailed, Incomplete: a.keepReservation}
+}
+
+func (a *TaskAdaptor) observeSubmitCompletion(c *gin.Context, info *relaycommon.RelayInfo, immediate *relaycommon.TaskInfo, taskID string, taskData any, pluginState []byte) {
+	if !a.hasHook(c.Request.Context(), "extractUsageOnComplete") {
+		return
+	}
+	encoded, err := common.Marshal(taskData)
+	if err != nil {
+		return
+	}
+	// Match the polling hook context without persisting a temporary task.
+	task := &model.Task{TaskID: info.PublicTaskID, Action: info.Action, Data: encoded,
+		Properties: model.Properties{OriginModelName: info.OriginModelName, UpstreamModelName: info.UpstreamModelName}}
+	task.PrivateData.UpstreamTaskID = taskID
+	task.PrivateData.PluginState = pluginState
+	var ctx map[string]any
+	if info.BeginProviderCall != nil {
+		local := a.taskRequestContext(nil, info)
+		ctx = map[string]any{
+			"taskId": taskID, "publicTaskId": info.PublicTaskID,
+			"action": constant.NormalizeTaskAction(info.Action), "model": info.OriginModelName,
+			"upstreamModel": info.UpstreamModelName, "baseUrl": info.ChannelBaseUrl,
+			"data": taskData, "state": nil,
+		}
+		for _, name := range []string{"upstream", "apiKey", "authHeader", "auth"} {
+			if value, exists := local[name]; exists {
+				ctx[name] = value
+			}
+		}
+		if len(pluginState) > 0 {
+			var state any
+			if err := common.Unmarshal(pluginState, &state); err != nil {
+				return
+			}
+			ctx["state"] = state
+		}
+	} else {
+		ctx, err = a.queryContext(task, info.ApiKey, info.ChannelBaseUrl, info.ChannelSetting.Proxy)
+		if err != nil {
+			logger.LogWarn(c, common.LogText("task plugin %s completion context failed; preserving known usage: %v", a.plugin.Meta.Key, err))
+			return
+		}
+	}
+	facts, err := a.plugin.Engine.Call(c.Request.Context(), "extractUsageOnComplete", ctx, jsonValue(immediate), taskData)
+	if err != nil {
+		logger.LogWarn(c, common.LogText("task plugin %s completion usage failed; preserving known usage: %v", a.plugin.Meta.Key, err))
+		return
+	}
+	if err := a.applyCompletionUsageFacts(immediate, facts, info.UpstreamModelName, info.OriginModelName); err != nil {
+		logger.LogWarn(c, common.LogText("task plugin %s completion usage rejected; preserving known usage: %v", a.plugin.Meta.Key, err))
+	}
 }
 
 func (a *TaskAdaptor) GetModelList() []string { return append([]string(nil), a.plugin.Meta.Models...) }

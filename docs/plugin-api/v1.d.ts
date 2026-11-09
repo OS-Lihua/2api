@@ -1,6 +1,6 @@
 export type JSONValue = null | boolean | number | string | readonly JSONValue[] | {readonly [key: string]: JSONValue};
 /** json-clone@1, submit-sse-delta@1 and duration-auto@1 are accepted for earlier hosts; new plugins need none of them. */
-export type HostCapability = "json-clone@1" | "submit-sse-delta@1" | "json-order@1" | "duration-auto@1";
+export type HostCapability = "json-clone@1" | "submit-sse-delta@1" | "submit-sse-business@1" | "json-order@1" | "duration-auto@1";
 /** Kinds of upstream a driver can address: the vendor API itself, or another New API gateway with the same plugin installed. */
 export type UpstreamKind = "vendor" | "new_api";
 /** Host-injected on every driver hook context. With "new_api" the driver uses its own native-route prefix and the host already set Bearer credentials. */
@@ -86,10 +86,10 @@ export type JSONPath = readonly (string | number)[];
 export type JSONChange =
   | {op: "set" | "append"; path: JSONPath; value: JSONValue}
   | {op: "appendText"; path: JSONPath; value: string};
-export interface SubmitEventDeltaResult {changes: readonly JSONChange[]; state: JSONValue; done: boolean}
+export interface SubmitEventDeltaResult {changes: readonly JSONChange[]; state: JSONValue; done: boolean; /** Required with submit-sse-business@1; true only for actual content in this event. */ business?: boolean}
 /** With submit-sse-delta@1, state is small control data; changes build the separate response body. */
 export declare function parseSubmitEventDelta(ctx: DriverContext, event: SubmitEvent, previousState: JSONValue | null): SubmitEventDeltaResult;
-export declare function parseSubmitEvent(ctx: DriverContext, event: SubmitEvent, previousState: JSONValue | null): {state: JSONValue; done: boolean};
+export declare function parseSubmitEvent(ctx: DriverContext, event: SubmitEvent, previousState: JSONValue | null): {state: JSONValue; done: boolean; /** Required with submit-sse-business@1. */ business?: boolean};
 export declare function parseSubmitResponse(ctx: DriverContext, response: UpstreamResponse): {taskId: string; taskData?: unknown; immediate?: NormalizedTaskResult; state?: unknown};
 /** Query redirects retain credentials only within the channel host and meta.allowedHosts; SSRF checks and HTTPS downgrade protection still apply. */
 export declare function buildQueryRequest(ctx: TaskQueryContext): RequestDescriptor;
@@ -109,6 +109,7 @@ export interface RequestCapabilities {
 export declare function extractCapabilities(ctx: DriverContext): RequestCapabilities;
 export declare function extractUsage(ctx: DriverContext & {usagePurpose?: "facts" | "billing_ratios"}): Readonly<Record<string, string | number | boolean>> | null;
 export declare function extractUsageOnSubmit(ctx: DriverContext, taskData: unknown): Readonly<Record<string, string | number | boolean>> | null;
+/** Money completion uses local credential fields only; OAuth authHeader is empty and no exchange is performed. */
 export declare function extractUsageOnComplete(task: TaskQueryContext, result: NormalizedTaskResult, data: unknown): Readonly<Record<string, string | number | boolean>> | null;
 export declare function listArtifacts(task: {taskId: string; status: string; action: string; data: unknown; producerVersion: string}): readonly TaskArtifact[];
 export declare function buildContentRequest(ctx: DriverContext & {artifactKey: string; data: unknown; state?: unknown; upstreamTaskId: string; clientRequest: {method: "GET" | "HEAD"; headers: Readonly<Record<string, string>>}}): RequestDescriptor;

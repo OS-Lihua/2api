@@ -159,6 +159,9 @@ func prepareGatewayTaskRoute(c *gin.Context, selection *service.GatewaySelection
 	if err != nil {
 		return nil, service.ErrGatewayCapability
 	}
+	if _, native := candidate.Get(jsplugin.ContextKeyPinnedRoute); native && slices.Contains(required.Capabilities.Features, capability.Streaming) && !slices.Contains(plugin.Meta.RequiredCapabilities, jsplugin.CapabilitySubmitSSEBusiness) {
+		return nil, service.ErrGatewayCapability
+	}
 	if _, err := required.Capabilities.Narrow(selection.Capabilities); err != nil {
 		return nil, service.ErrGatewayCapability
 	}

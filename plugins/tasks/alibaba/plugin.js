@@ -277,7 +277,7 @@ export const meta = {
   fetchMode: "per_task",
   upstreams: ["vendor", "new_api"],
   submitResponseTypes: ["json", "sse"],
-  requiredCapabilities: ["duration-auto@1"],
+  requiredCapabilities: ["duration-auto@1", "submit-sse-business@1"],
   usageSchema: { ...WAN_IMAGE_USAGE_SCHEMA, ...wanVideoUsageSchema(WAN_VIDEO_RESOLUTIONS, false) },
   usageProfiles: [
     {
@@ -1155,8 +1155,9 @@ export function parseSubmitEventDelta(ctx, event, previousState) {
   if (body.code || event.event === "error") {
     changes.push({ op: "set", path: ["code"], value: String(body.code || "upstream_error") });
     changes.push({ op: "set", path: ["message"], value: String(body.message || "stream failed") });
-    return { changes: changes, state: state, done: true };
+    return { changes: changes, state: state, done: true, business: false };
   }
+  let business = false;
   if (body.request_id) changes.push({ op: "set", path: ["request_id"], value: body.request_id });
   if (body.usage) {
     if (!state.hasUsage) {
@@ -1176,6 +1177,7 @@ export function parseSubmitEventDelta(ctx, event, previousState) {
     const control = state.choices[index];
     for (const part of choice.message.content) {
       if (!part || typeof part !== "object") throw new Error("invalid DashScope stream content");
+      business = business || (typeof part.text === "string" && part.text.length > 0) || (typeof part.image === "string" && part.image.trim().length > 0);
       if (typeof part.text === "string" && control.lastText) {
         changes.push({ op: "appendText", path: ["output", "choices", index, "message", "content", control.count - 1, "text"], value: part.text });
       } else {
@@ -1197,7 +1199,7 @@ export function parseSubmitEventDelta(ctx, event, previousState) {
       return choice.finishReason === "stop";
     });
   changes.push({ op: "set", path: ["output", "finished"], value: done });
-  return { changes: changes, state: state, done: done };
+  return { changes: changes, state: state, done: done, business: business };
 }
 
 export function parseSubmitResponse(ctx, resp) {

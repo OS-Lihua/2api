@@ -1225,7 +1225,7 @@ func normalizeV1Meta(meta *Meta) error {
 		if !HasCapability(name) || seenCapabilities[name] {
 			return fmt.Errorf("unsupported or duplicate required capability %q", name)
 		}
-		if name == CapabilitySubmitSSEDelta && !slices.Contains(meta.SubmitResponseTypes, "sse") {
+		if (name == CapabilitySubmitSSEDelta || name == CapabilitySubmitSSEBusiness) && !slices.Contains(meta.SubmitResponseTypes, "sse") {
 			return fmt.Errorf("%s requires submitResponseTypes to include sse", name)
 		}
 		seenCapabilities[name] = true

@@ -103,6 +103,7 @@ type TaskSubmitResponse struct {
 	TaskData       []byte
 	ClientResponse any
 	Immediate      *relaycommon.TaskInfo
+	Stream         *model.TaskStreamFacts
 	PluginState    []byte
 }
 
