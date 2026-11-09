@@ -488,7 +488,7 @@ func (selection *GatewaySelection) LossFallbackAllowed(ctx context.Context, cost
 		currentProviders[providers[i].Id] = &providers[i]
 	}
 	at := clock.Now()
-	eligible := []*GatewaySelection{selection}
+	eligible := []*GatewaySelection{}
 	for _, peer := range selection.profitPeers {
 		if peer.Channel.ID == selection.Channel.ID {
 			continue
@@ -545,20 +545,23 @@ func (selection *GatewaySelection) LossFallbackAllowed(ctx context.Context, cost
 		ready := snapshot.Circuit == "closed" || snapshot.Circuit == "open" && snapshot.RetryAt <= clock.Now().UnixMilli()
 		return !ready && hasClosed
 	})
-	activeProbe := slices.ContainsFunc(eligible, func(peer *GatewaySelection) bool { return health[peer.Channel.ID].Circuit == "half_open" })
+	ids = ids[:0]
 	for _, peer := range eligible {
-		if peer.Channel.ID == selection.Channel.ID {
-			continue
-		}
-		snapshot := health[peer.Channel.ID]
-		if snapshot.Circuit == "half_open" || snapshot.Circuit == "open" && activeProbe {
-			continue
-		}
+		ids = append(ids, peer.Channel.ID)
+	}
+	for _, peer := range eligible {
 		if err := selection.Permit.CheckAlternative(ctx, peer, peer.EstimatedTokens, used); err != nil {
 			if errors.Is(err, ErrGatewayRateLimited) {
 				continue
 			}
 			return false, err
+		}
+		admitted, err := ChannelHealth.CheckWithProbeFence(ctx, []int{peer.Channel.ID}, ids)
+		if err != nil {
+			return false, ErrGatewayUnavailable
+		}
+		if admitted == 0 {
+			continue
 		}
 		allowed, err := GatewayRouteProfitAllowed(peer.EstimatedCost, peer.EstimatedSale, margin)
 		if err != nil {

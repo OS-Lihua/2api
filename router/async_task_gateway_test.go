@@ -2921,6 +2921,8 @@ func TestAsyncTaskFinalLossFallbackRechecksPeerAvailability(t *testing.T) {
 		{name: "occupied probe"}, {name: "occupied probe", shared: true},
 		{name: "shared Provider", wantPeer: true}, {name: "shared Provider", shared: true, wantPeer: true},
 		{name: "available peer", wantPeer: true},
+		{name: "own probe", wantPeer: true}, {name: "own probe", shared: true, wantPeer: true},
+		{name: "foreign probe fence"}, {name: "foreign probe fence", shared: true},
 	} {
 		t.Run(fmt.Sprintf("%s/redis=%t", test.name, test.shared), func(t *testing.T) {
 			var calls atomic.Int32
@@ -2954,10 +2956,18 @@ func TestAsyncTaskFinalLossFallbackRechecksPeerAvailability(t *testing.T) {
 				}
 				require.NoError(t, model.DB.Model(&provider).Update("channel_info", provider.ProviderInfo).Error)
 			}
+			var fence *model.Channel
+			if test.name == "foreign probe fence" {
+				fence = addTextGatewayChannel(t, fixture, upstream)
+				require.NoError(t, model.DB.Model(fence).Updates(map[string]any{"protocol": "task:sora", "upstream_model_name": "sora-2"}).Error)
+			}
 			prices := []*model.PriceVersion{
 				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("video",u("seconds")*0.01)`, EffectiveAt: clock.Now().Unix()},
 				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("video",u("seconds")*0.2)`, EffectiveAt: clock.Now().Unix() + 2},
 				{OwnerType: model.PriceOwnerChannel, OwnerID: peer.ID, Currency: "USD", Expression: `tier("video",u("seconds")*0.005)`, EffectiveAt: clock.Now().Unix()},
+			}
+			if fence != nil {
+				prices = append(prices, &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fence.ID, Currency: "USD", Expression: `tier("video",u("seconds")*0.005)`, EffectiveAt: clock.Now().Unix()})
 			}
 			for _, price := range prices {
 				err := model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy)
@@ -2975,6 +2985,12 @@ func TestAsyncTaskFinalLossFallbackRechecksPeerAvailability(t *testing.T) {
 				t.Cleanup(func() { require.NoError(t, client.Close()) })
 				service.GatewayRouteQuota = service.NewGatewayRouteQuota(client)
 				service.ChannelHealth = channelhealth.New(client)
+			}
+			if test.name == "own probe" {
+				for i, channel := range []*model.Channel{fixture.channel, peer} {
+					_, err := service.ChannelHealth.Record(t.Context(), channelhealth.Sample{AttemptID: fmt.Sprintf("own-probe-open-%d", channel.ID), ChannelID: channel.ID, ProviderFailure: true, RateLimited: true, RetryAfter: fmt.Sprint(60 * (i + 1))})
+					require.NoError(t, err)
+				}
 			}
 			busy := &service.GatewaySelection{Channel: *peer, Provider: &provider}
 			var occupied *service.GatewayRoutePermit
@@ -3012,6 +3028,17 @@ func TestAsyncTaskFinalLossFallbackRechecksPeerAvailability(t *testing.T) {
 				var err error
 				occupied, err = service.GatewayRouteQuota.Acquire(t.Context(), busy, 0)
 				require.NoError(t, err)
+			case "foreign probe fence":
+				for _, channel := range []*model.Channel{peer, fence} {
+					_, err := service.ChannelHealth.Record(t.Context(), channelhealth.Sample{AttemptID: fmt.Sprintf("foreign-fence-open-%d", channel.ID), ChannelID: channel.ID, ProviderFailure: true, RateLimited: true, RetryAfter: "1"})
+					require.NoError(t, err)
+				}
+				var err error
+				probe, err = service.ChannelHealth.Acquire(t.Context(), []int{fence.ID})
+				require.NoError(t, err)
+				require.Equal(t, fence.ID, probe.ChannelID)
+				require.NotEmpty(t, probe.Lease)
+				fixture.fake.Advance(2 * time.Second)
 			case "occupied probe":
 				_, err := service.ChannelHealth.Record(t.Context(), channelhealth.Sample{AttemptID: "late-peer-probe", ChannelID: peer.ID, ProviderFailure: true, RateLimited: true, RetryAfter: "60"})
 				require.NoError(t, err)

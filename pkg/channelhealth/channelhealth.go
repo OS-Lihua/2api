@@ -246,6 +246,18 @@ func (m *Manager) Acquire(ctx context.Context, ids []int) (Admission, error) {
 // the full validated pool as the fence and its preferred quality group as ids.
 // Both sets are checked in the same memory lock or Redis transaction.
 func (m *Manager) AcquireWithProbeFence(ctx context.Context, ids, probeFence []int) (Admission, error) {
+	return m.admit(ctx, ids, probeFence, common.NewRequestId())
+}
+
+// CheckWithProbeFence reports the same eligible Channel without reserving a
+// probe. Callers provide the candidate and fence sets that would remain after
+// their own admission is released, retaining leases held by other requests.
+func (m *Manager) CheckWithProbeFence(ctx context.Context, ids, probeFence []int) (int, error) {
+	admission, err := m.admit(ctx, ids, probeFence, "")
+	return admission.ChannelID, err
+}
+
+func (m *Manager) admit(ctx context.Context, ids, probeFence []int, lease string) (Admission, error) {
 	watched := slices.Clone(ids)
 	for _, id := range probeFence {
 		if !slices.Contains(watched, id) {
@@ -253,7 +265,6 @@ func (m *Manager) AcquireWithProbeFence(ctx context.Context, ids, probeFence []i
 		}
 	}
 	admission := Admission{}
-	lease := common.NewRequestId()
 	err := m.transact(ctx, watched, "", func(states map[int]*state, _ bool) bool {
 		admission = Admission{}
 		now := clock.Now().UnixMilli()
@@ -292,10 +303,14 @@ func (m *Manager) AcquireWithProbeFence(ctx context.Context, ids, probeFence []i
 		if s.Lease != "" && s.LeaseUntil > now {
 			return false
 		}
+		admission = Admission{ChannelID: earliest}
+		if lease == "" {
+			return false
+		}
 		// Covers the maximum managed first-byte budget plus delivery/idle time;
 		// completion or abandoned preparation releases the lease immediately.
 		s.Lease, s.LeaseUntil = lease, now+int64(10*time.Minute/time.Millisecond)
-		admission = Admission{ChannelID: earliest, Lease: lease}
+		admission.Lease = lease
 		return true
 	})
 	return admission, err
