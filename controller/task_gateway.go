@@ -317,36 +317,63 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 			return
 		}
 		var pricingErr error
-		info.OnPreparedRequest = func(wire *http.Request) error {
-			input, err := helper.BuildTaskBillingRequestInput(wire)
-			if err == nil {
-				input.Usage, input.FreezeMoneyRequest = facts, true
-				value, trace, evalErr := billingexpr.RunMoneyExpr(purchase.Expression, billingexpr.MoneyInput{TaskUsage: true, Request: input, Time: time.UnixMilli(attempt.StartedAt)}, purchase.Currency)
-				err = evalErr
-				if err == nil {
-					comparison, compareErr := service.GatewayComparisonCost(wire.Context(), value)
-					err = compareErr
-					if err == nil {
-						allowed, profitErr := service.GatewayRouteProfitAllowed(comparison, selection.EstimatedSale, offering.MinimumMarginRate)
-						err = profitErr
-						if err == nil && !allowed && offering.AllowLossFallback {
-							allowed, err = selection.LossFallbackAllowed(wire.Context(), comparison, offering.MinimumMarginRate)
-						}
-						if err == nil && !allowed {
-							err = service.ErrGatewayUnavailable
-						}
-					}
-				}
-				if err == nil {
-					snapshot.PurchaseConditions = trace.RequestSnapshot
-					attemptTraces[attempt.ID] = billingexpr.MoneyTraceResult{Currency: purchase.Currency, RequestSnapshot: trace.RequestSnapshot}
-					err = pending.Update()
-					if err == nil {
-						_, err = info.BeginProviderCall()
-					}
-				}
+		info.OnPreparedRequest = func(wire *http.Request) (err error) {
+			defer func() { pricingErr = err }()
+			previousContact := contactedProvider
+			_, err = info.BeginProviderCall()
+			contactedProvider = previousContact
+			if err != nil {
+				return err
 			}
-			pricingErr = err
+			// Final credential waits finish before the model Attempt freezes prices.
+			attemptStart = clock.Now()
+			purchase, _, rate, err = gatewayChannelPurchaseSnapshot(wire.Context(), selected.ID, attemptStart)
+			if err != nil {
+				return err
+			}
+			attempt.StartedAt = attemptStart.UnixMilli()
+			attempt.PurchasePriceVersionID, attempt.PurchaseExpression = purchase.ID, purchase.Expression
+			attempt.AccountingFXRate = rate
+			attempt.Cost = money.Amount{Currency: purchase.Currency}
+			input, err := helper.BuildTaskBillingRequestInput(wire)
+			if err != nil {
+				return err
+			}
+			input.Usage, input.FreezeMoneyRequest = facts, true
+			value, trace, err := billingexpr.RunMoneyExpr(purchase.Expression, billingexpr.MoneyInput{TaskUsage: true, Request: input, Time: attemptStart}, purchase.Currency)
+			if err != nil {
+				return err
+			}
+			comparison, err := service.GatewayComparisonCost(wire.Context(), value)
+			if err != nil {
+				return err
+			}
+			allowed, err := service.GatewayRouteProfitAllowed(comparison, selection.EstimatedSale, offering.MinimumMarginRate)
+			if err != nil {
+				return err
+			}
+			selection.LossFallback = false
+			if !allowed && offering.AllowLossFallback {
+				allowed, err = selection.LossFallbackAllowed(wire.Context(), comparison, offering.MinimumMarginRate)
+				if err != nil {
+					return err
+				}
+				selection.LossFallback = allowed
+			}
+			if !allowed {
+				return service.ErrGatewayUnavailable
+			}
+			selection.Diagnostics["estimated_cost"] = comparison.String()
+			selection.Diagnostics["loss_fallback"] = selection.LossFallback
+			snapshot.PurchaseConditions = trace.RequestSnapshot
+			attemptTraces[attempt.ID] = billingexpr.MoneyTraceResult{Currency: purchase.Currency, RequestSnapshot: trace.RequestSnapshot}
+			if err = pending.Update(); err != nil {
+				return err
+			}
+			_, err = budget.Start()
+			if err == nil {
+				contactedProvider = true
+			}
 			return err
 		}
 		result.SkippedChannel = 0

@@ -2634,52 +2634,136 @@ func TestAsyncTaskUnavailableChannelUsesBackendLanguage(t *testing.T) {
 }
 
 func TestAsyncTaskCredentialLockWaitRechecksRemainingBudget(t *testing.T) {
-	var calls atomic.Int32
-	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"too-late-job","status":"queued"}`))
-	})
-	t.Setenv("GATEWAY_TOTAL_FIRST_BYTE_SECONDS", "6")
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-	lock := model.DB.WithContext(ctx).Begin()
-	require.NoError(t, lock.Error)
-	defer lock.Rollback()
-	var locked, lockerPID int
-	require.NoError(t, lock.Raw(`SELECT "id" FROM "providers" WHERE "id" = ? FOR UPDATE`, fixture.channel.ProviderID).Scan(&locked).Error)
-	require.NoError(t, lock.Raw(`SELECT pg_backend_pid()`).Scan(&lockerPID).Error)
-	finished := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		finished <- adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
-	}()
-	completed := false
-	defer func() {
-		_ = lock.Rollback().Error
-		if !completed {
-			<-finished
-		}
-	}()
-	var waiting int
-	for waiting == 0 && ctx.Err() == nil {
-		select {
-		case early := <-finished:
+	for _, test := range []struct {
+		name, budget            string
+		refreshPrice, allowLoss bool
+		revokeKey               bool
+		status                  int
+	}{
+		{name: "remaining budget", budget: "6", status: http.StatusServiceUnavailable},
+		{name: "new purchase price and FX", budget: "60", refreshPrice: true, allowLoss: true, status: http.StatusOK},
+		{name: "new loss without fallback", budget: "60", refreshPrice: true, status: http.StatusServiceUnavailable},
+		{name: "revoked key after wait", budget: "60", revokeKey: true, status: http.StatusServiceUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method == http.MethodGet {
+					assert.Equal(t, "/v1/videos/too-late-job", r.URL.Path)
+					_, _ = io.WriteString(w, `{"id":"too-late-job","status":"completed","seconds":"2"}`)
+					return
+				}
+				_, _ = io.WriteString(w, `{"id":"too-late-job","status":"queued"}`)
+			})
+			t.Setenv("GATEWAY_TOTAL_FIRST_BYTE_SECONDS", test.budget)
+			var scheduled *model.PriceVersion
+			if test.refreshPrice {
+				fixture.offering.AllowLossFallback = test.allowLoss
+				require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+				fixture.fake.Advance(time.Duration(59-clock.Now().Second()) * time.Second)
+				_, err := model.SaveFXRate(t.Context(), "EUR", "USD", "2", "0", fixture.sale.CreatedBy)
+				require.NoError(t, err)
+				scheduled = &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "EUR", Expression: fmt.Sprintf(`tier("video", u("seconds") * 0.03 * (minute("UTC") == %d ? 2 : 1))`, clock.Now().Add(2*time.Second).UTC().Minute()), EffectiveAt: clock.Now().Unix() + 2}
+				for _, price := range []*model.PriceVersion{
+					{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "EUR", Expression: `tier("video", u("seconds") * 0.01)`, EffectiveAt: clock.Now().Unix()}, scheduled,
+				} {
+					err := model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy)
+					if err != nil {
+						var confirmation *model.MarginConfirmationError
+						require.ErrorAs(t, err, &confirmation)
+						price.MarginConfirmation = confirmation.Report.Revision
+						err = model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy)
+					}
+					require.NoError(t, err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			defer cancel()
+			lock := model.DB.WithContext(ctx).Begin()
+			require.NoError(t, lock.Error)
+			defer lock.Rollback()
+			var locked, lockerPID int
+			require.NoError(t, lock.Raw(`SELECT "id" FROM "providers" WHERE "id" = ? FOR UPDATE`, fixture.channel.ProviderID).Scan(&locked).Error)
+			require.NoError(t, lock.Raw(`SELECT pg_backend_pid()`).Scan(&lockerPID).Error)
+			finished := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				finished <- adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+			}()
+			completed := false
+			defer func() {
+				_ = lock.Rollback().Error
+				if !completed {
+					<-finished
+				}
+			}()
+			var waiting int
+			for waiting == 0 && ctx.Err() == nil {
+				select {
+				case early := <-finished:
+					completed = true
+					require.FailNowf(t, "task did not wait for its credential lock", "%d %s", early.Code, early.Body.String())
+				default:
+				}
+				require.NoError(t, model.DB.WithContext(ctx).Raw(`SELECT COALESCE(min(pid),0) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND ? = ANY(pg_blocking_pids(pid))`, lockerPID).Scan(&waiting).Error)
+			}
+			require.NotZero(t, waiting)
+			fixture.fake.Advance(2 * time.Second)
+			if test.refreshPrice {
+				_, err := model.SaveFXRate(t.Context(), "EUR", "USD", "3", "0", fixture.sale.CreatedBy)
+				if err != nil {
+					var confirmation *model.MarginConfirmationError
+					require.ErrorAs(t, err, &confirmation)
+					_, err = model.SaveFXRate(t.Context(), "EUR", "USD", "3", "0", fixture.sale.CreatedBy, confirmation.Report.Revision)
+				}
+				require.NoError(t, err)
+			}
+			if test.revokeKey {
+				require.NoError(t, lock.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("key", "rotated-task-fixture-key").Error)
+			}
+			require.NoError(t, lock.Commit().Error)
+			response := <-finished
 			completed = true
-			require.FailNowf(t, "task did not wait for its credential lock", "%d %s", early.Code, early.Body.String())
-		default:
-		}
-		require.NoError(t, model.DB.WithContext(ctx).Raw(`SELECT COALESCE(min(pid),0) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND ? = ANY(pg_blocking_pids(pid))`, lockerPID).Scan(&waiting).Error)
+			require.Equal(t, test.status, response.Code, response.Body.String())
+			if test.status != http.StatusOK {
+				assert.Zero(t, calls.Load())
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.EqualValues(t, 1000000000, wallet.Balance.Nanos)
+				_, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+				require.NoError(t, err)
+				assert.Zero(t, total)
+				return
+			}
+			assert.EqualValues(t, 1, calls.Load())
+			service.RunTaskPollingOnce(t.Context(), nil)
+			assert.EqualValues(t, 2, calls.Load())
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, scheduled.ID, attempts[0].PurchasePriceVersionID)
+			assert.GreaterOrEqual(t, attempts[0].StartedAt, scheduled.EffectiveAt*1000)
+			assert.Equal(t, "3", attempts[0].AccountingFXRate)
+			assert.Equal(t, money.Currency("EUR"), attempts[0].Cost.Currency)
+			assert.EqualValues(t, 120000000, attempts[0].Cost.Nanos)
+			assert.EqualValues(t, 360000000, attempts[0].ConvertedCost.Nanos)
+			request, err := model.GetGatewayRequest(t.Context(), attempts[0].RequestID, fixture.user.Id)
+			require.NoError(t, err)
+			assert.EqualValues(t, 180000000, request.Receivable.Nanos)
+			var payables []model.LedgerEntry
+			require.NoError(t, model.DB.Where("request_id = ? AND account_type = ?", request.ID, model.LedgerAccountProviderPayable).Find(&payables).Error)
+			require.Len(t, payables, 1)
+			assert.Equal(t, money.Amount{Nanos: 120000000, Currency: "EUR"}, payables[0].Amount)
+			assert.Equal(t, "3", payables[0].FxRate.Decimal.String())
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.EqualValues(t, 820000000, wallet.Balance.Nanos)
+			var reservations int64
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id = ? AND type = ?", request.ID, model.LedgerEntryPreConsume).Count(&reservations).Error)
+			assert.EqualValues(t, 1, reservations)
+		})
 	}
-	require.NotZero(t, waiting)
-	fixture.fake.Advance(2 * time.Second)
-	require.NoError(t, lock.Commit().Error)
-	response := <-finished
-	completed = true
-	assert.Equal(t, 503, response.Code, response.Body.String())
-	assert.Zero(t, calls.Load(), "four seconds remaining cannot authorize a new Provider exchange")
-	wallet, err := model.GetUserWallet(fixture.user.Id)
-	require.NoError(t, err)
-	assert.EqualValues(t, 1000000000, wallet.Balance.Nanos)
 }
 
 func TestAsyncTaskImageInRequestPollingUsesActualCredentialSlot(t *testing.T) {
