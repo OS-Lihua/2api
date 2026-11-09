@@ -144,6 +144,14 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 			}
 		}
 		response := streamResponseTencent2OpenAI(&tencentResponse)
+		if managed && info.StreamStatus.CompletedNormally() {
+			for _, choice := range response.Choices {
+				if choice.Delta.GetContentString() != "" {
+					helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource([]byte(data), "Choices", "Delta.Content"))
+					return usage, types.NewError(fmt.Errorf("Tencent stream contains generation after completion"), types.ErrorCodeBadResponseBody)
+				}
+			}
+		}
 		if len(response.Choices) != 0 {
 			responseText.WriteString(response.Choices[0].Delta.GetContentString())
 		}

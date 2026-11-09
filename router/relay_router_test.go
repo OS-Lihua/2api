@@ -10217,6 +10217,29 @@ func TestTextGatewayNativeDefaultsReachActualWire(t *testing.T) {
 	}
 }
 
+func TestTextGatewayLegacyCohereTerminalDoesNotReadTrailingBody(t *testing.T) {
+	body := "{\"text\":\"Hello\"}\n{\"is_finished\":true,\"finish_reason\":\"COMPLETE\",\"response\":{\"meta\":{\"billed_units\":{\"input_tokens\":10,\"output_tokens\":5}}}}\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)+1))
+		_, _ = io.WriteString(w, body)
+	}))
+	defer server.Close()
+	response, err := http.Get(server.URL)
+	require.NoError(t, err)
+	defer response.Body.Close()
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/"+"chat/"+"completions", nil)
+	info := &relaycommon.RelayInfo{IsStream: true, RelayFormat: relaytypes.RelayFormatOpenAI, RelayMode: relayconstant.RelayModeChatCompletions, TokenizerModel: "gpt-4o-mini", ProviderMeta: &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeCohere, UpstreamModelName: "command"}}
+	adaptor, err := relay.GetChannelAdaptor(constant.APITypeCohere, protocol.OpenAIChat)
+	require.NoError(t, err)
+	_, apiErr := adaptor.DoResponse(c, response, info)
+	require.Nil(t, apiErr, "legacy completion does not depend on transport after the protocol terminal")
+	assert.Contains(t, recorder.Body.String(), "Hello")
+	assert.Contains(t, recorder.Body.String(), "[DONE]")
+	assert.True(t, info.StreamStatus.CompletedNormally())
+}
+
 func TestTextGatewayNativeTerminalsWaitForTransport(t *testing.T) {
 	for _, provider := range []struct {
 		name            string
@@ -10228,15 +10251,40 @@ func TestTextGatewayNativeTerminalsWaitForTransport(t *testing.T) {
 		{"Baidu", constant.ChannelTypeBaidu, "terminal-baidu|test-secret", "data: {\"result\":\"Hello\",\"is_end\":false}\n\ndata: {\"result\":\"\",\"is_end\":true,\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n", "data: broken\n\n"},
 		{"Ollama", constant.ChannelTypeOllama, "", "{\"message\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"done\":false}\n{\"message\":{\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":10,\"eval_count\":5}\n", "broken\n"},
 		{"Zhipu", constant.ChannelTypeZhipu, "test.secret", "data:Hello\nmeta:{\"task_status\":\"SUCCESS\",\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n", "meta:broken\n"},
+		{"Tencent", constant.ChannelTypeTencent, "1|test-id|test-secret", "data: {\"Choices\":[{\"Delta\":{\"Content\":\"Hello\"}}]}\n\ndata: {\"Choices\":[{\"Delta\":{},\"FinishReason\":\"stop\"}],\"Usage\":{\"PromptTokens\":10,\"CompletionTokens\":5}}\n\n", "data: broken\n\n"},
 		{"Coze", constant.ChannelTypeCoze, "", "event: conversation.message.delta\ndata: {\"content\":\"Hello\"}\n\nevent: conversation.chat.completed\ndata: {\"usage\":{\"input_count\":10,\"output_count\":5}}\n\n", "event: conversation.message.delta\ndata: broken\n\n"},
 	} {
 		t.Run(provider.name, func(t *testing.T) {
-			for _, mode := range []string{"clean", "bad JSON", "read error"} {
+			modes := []string{"clean", "bad JSON", "read error"}
+			if provider.kind == constant.ChannelTypeCoze || provider.kind == constant.ChannelTypeTencent || provider.kind == constant.ChannelTypeCohere {
+				modes = append(modes, "business after terminal", "business after terminal without usage")
+			}
+			if provider.kind == constant.ChannelTypeTencent {
+				modes = append(modes, "usage after terminal")
+			}
+			for _, mode := range modes {
 				t.Run(mode, func(t *testing.T) {
 					fixture := newTextGatewayFixtureWithNativeLosses(t, func(w http.ResponseWriter, r *http.Request) {
 						body := provider.body
 						if mode == "bad JSON" {
 							body += provider.tail
+						}
+						if strings.HasPrefix(mode, "business after terminal") {
+							if provider.kind == constant.ChannelTypeTencent {
+								body += "data: {\"Choices\":[{\"Delta\":{\"Content\":\"World\"}}]}\n\n"
+							} else if provider.kind == constant.ChannelTypeCohere {
+								body += "{\"text\":\"World\",\"event_type\":\"text-generation\"}\n"
+							} else {
+								body += "event: conversation.message.delta\ndata: {\"content\":\"World\"}\n\n"
+							}
+							if strings.HasSuffix(mode, "without usage") {
+								body = strings.Replace(body, `{"usage":{"input_count":10,"output_count":5}}`, `{}`, 1)
+								body = strings.Replace(body, `,"Usage":{"PromptTokens":10,"CompletionTokens":5}`, ``, 1)
+								body = strings.Replace(body, `"billed_units":{"input_tokens":10,"output_tokens":5}`, `"billed_units":{}`, 1)
+							}
+						}
+						if mode == "usage after terminal" {
+							body += "data: {\"Choices\":[],\"Usage\":{\"PromptTokens\":10,\"CompletionTokens\":7}}\n\n"
 						}
 						if mode == "read error" {
 							w.Header().Set("Content-Length", strconv.Itoa(len(body)+1))
@@ -10259,8 +10307,16 @@ func TestTextGatewayNativeTerminalsWaitForTransport(t *testing.T) {
 					attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
 					require.NoError(t, err)
 					require.EqualValues(t, 1, total)
-					assert.Equal(t, int64(20000), attempts[0].Cost.Nanos)
-					if mode == "clean" {
+					cost := int64(20000)
+					if strings.HasSuffix(mode, "without usage") {
+						cost = 13000
+					}
+					if mode == "usage after terminal" {
+						cost = 24000
+						assert.EqualValues(t, 7, record.Usage.CompletionTokens)
+					}
+					assert.Equal(t, cost, attempts[0].Cost.Nanos)
+					if mode == "clean" || mode == "usage after terminal" {
 						assert.Equal(t, "success", record.Status)
 						assert.Equal(t, int64(9000000), record.Receivable.Nanos)
 						assert.Contains(t, response.Body.String(), "[DONE]")
@@ -10268,6 +10324,9 @@ func TestTextGatewayNativeTerminalsWaitForTransport(t *testing.T) {
 						assert.Equal(t, "partial", record.Status, response.Body.String())
 						assert.Zero(t, record.Receivable.Nanos)
 						assert.NotContains(t, response.Body.String(), "[DONE]")
+						if strings.HasPrefix(mode, "business after terminal") {
+							assert.NotContains(t, response.Body.String(), "World")
+						}
 					}
 				})
 			}

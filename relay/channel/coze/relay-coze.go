@@ -205,6 +205,10 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 				if !cozeGeneratedMessage(root) {
 					continue
 				}
+				if info.StreamStatus.CompletedNormally() {
+					helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource([]byte(event.Data), "", "content", "reasoning_content"))
+					return usage, types.NewError(fmt.Errorf("Coze stream contains generation after completion"), types.ErrorCodeBadResponseBody)
+				}
 				id := relaycommon.SourceText(root.Get("id"))
 				message := sourceMessages[id]
 				message.content += relaycommon.SourceText(root.Get("content"))

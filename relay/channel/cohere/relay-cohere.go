@@ -105,6 +105,7 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	usage := &dto.Usage{}
 	var responseText strings.Builder
 	finished := false
+	managed := info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil
 	if info.StreamStatus == nil {
 		info.StreamStatus = relaycommon.NewStreamStatus()
 	}
@@ -118,6 +119,8 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			continue
 		}
 		if finished {
+			info.ResponseFacts.RecordNativeUsage(usage, scanner.Bytes(), "response.meta.billed_units.input_tokens", "response.meta.billed_units.output_tokens")
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(scanner.Bytes(), "", "text"))
 			return usage, types.NewError(fmt.Errorf("Cohere stream contains data after completion"), types.ErrorCodeBadResponseBody)
 		}
 		info.SetFirstResponseTime()
@@ -163,6 +166,9 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			}
 			info.StreamStatus.MarkCompleted()
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
+			if !managed {
+				break
+			}
 			finished = true
 		}
 	}
