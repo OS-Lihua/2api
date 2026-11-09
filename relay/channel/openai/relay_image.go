@@ -325,10 +325,11 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 			sr.Stop(errors.New("invalid image stream event"))
 			return
 		}
-		writeErr := writeOpenaiImageStreamChunk(c, raw)
+		business := openaiImageDataHasField(ojson.Parse(data), "url") || openaiImageDataHasField(ojson.Parse(data), "b64_json")
+		writeErr := writeOpenaiImageStreamChunk(c, raw, info.ResponseFacts, business)
 		if info.ResponseFacts != nil {
 			var flushErr *helper.StreamFlushError
-			if (writeErr == nil || errors.As(writeErr, &flushErr)) && (openaiImageDataHasField(ojson.Parse(data), "url") || openaiImageDataHasField(ojson.Parse(data), "b64_json")) {
+			if (writeErr == nil || errors.As(writeErr, &flushErr)) && business {
 				if chunk.Type == "image_generation.completed" || chunk.Type == "image_edit.completed" {
 					info.ResponseFacts.DeliveredImageCount = min(info.ResponseFacts.DeliveredImageCount+1, int64(dto.MaxImageN))
 					deliveredKnown = deliveredKnown && frameKnown
@@ -343,7 +344,9 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 				}
 				info.ResponseFacts.MarkBusinessOutput()
 			}
-			if writeErr != nil {
+			if errors.Is(writeErr, helper.ErrGatewayStreamPreludeLimit) {
+				info.StreamStatus.MarkFailed("", "invalid_response", http.StatusBadGateway)
+			} else if writeErr != nil {
 				info.ResponseFacts.DownstreamWriteFailed = true
 			}
 		}
@@ -408,12 +411,20 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 // writeOpenaiImageStreamChunk rebuilds the SSE frame for an image stream chunk:
 // it emits an "event:" line derived from the JSON "type" field (when present)
 // followed by the verbatim "data:" payload, mirroring helper.ResponseChunkData.
-func writeOpenaiImageStreamChunk(c *gin.Context, data []byte) error {
+func writeOpenaiImageStreamChunk(c *gin.Context, data []byte, facts *relaycommon.ResponseFacts, business bool) error {
 	var payload struct {
 		Type string `json:"type"`
 	}
 	_ = common.Unmarshal(data, &payload)
-	if eventName := strings.TrimSpace(payload.Type); eventName != "" {
+	eventName := strings.TrimSpace(payload.Type)
+	if facts != nil {
+		frame := fmt.Sprintf("data: %s\n\n", data)
+		if eventName != "" {
+			frame = "event: " + eventName + "\n" + frame
+		}
+		return helper.WriteGatewayStreamFrame(c, facts, frame, business)
+	}
+	if eventName != "" {
 		return helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: eventName}, string(data))
 	}
 	return helper.StringData(c, string(data))

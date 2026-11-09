@@ -102,9 +102,21 @@ func mediaResponseEnvelope(body []byte) []byte {
 	}
 	recovered := map[string]common.RawMessage{}
 	for _, name := range []string{"usage", "error", "type", "code", "duration", "size", "quality"} {
-		if raw := ojson.GetBytes(body, name); raw.Exists() && ojson.Valid(raw.Raw) {
-			recovered[name] = common.RawMessage(raw.Raw)
+		raw := ojson.GetBytes(body, name)
+		if !raw.Exists() || !ojson.Valid(raw.Raw) {
+			continue
 		}
+		if raw.Type == ojson.Number {
+			end := raw.Index + len(raw.Raw)
+			if raw.Index < 0 || end > len(body) {
+				continue
+			}
+			tail := bytes.TrimLeft(body[end:], " \r\n\t")
+			if len(tail) == 0 || tail[0] != ',' && tail[0] != '}' {
+				continue
+			}
+		}
+		recovered[name] = common.RawMessage(raw.Raw)
 	}
 	if _, complete := recovered["usage"]; !complete {
 		// Query known leaves independently: an unfinished sibling must not
@@ -145,7 +157,7 @@ func mediaResponseEnvelope(body []byte) []byte {
 			recovered["usage"] = common.RawMessage(usage.String())
 		}
 	}
-	if len(recovered) > 0 {
+	if len(recovered) > 0 || mediaJSONObjectPrefix(body) {
 		if encoded, err := common.Marshal(recovered); err == nil {
 			return encoded
 		}

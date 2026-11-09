@@ -5123,6 +5123,54 @@ func TestMediaGatewayImagesUseOfferingWalletAndActualPayload(t *testing.T) {
 	assert.Empty(t, reconciliation.Mismatches)
 }
 
+func TestMediaGatewayImagePreludeIsDiscardedBeforeModelFallback(t *testing.T) {
+	for _, recovered := range []bool{true, false} {
+		t.Run(fmt.Sprintf("recovered=%t", recovered), func(t *testing.T) {
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, "data: {\"type\":\"image_generation.in_progress\",\"attempt_marker\":\"discard-first-attempt\"}\n\ndata: {\"error\":{\"code\":\"rate_limit_exceeded\"}}\n\n")
+			})
+			fallback := addTextGatewayMember(t, fixture, 2, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				if recovered {
+					_, _ = io.WriteString(w, "data: {\"type\":\"image_generation.completed\",\"url\":\"https://image.invalid/recovered\"}\n\ndata: [DONE]\n\n")
+				} else {
+					_, _ = io.WriteString(w, "data: {\"type\":\"image_generation.in_progress\",\"attempt_marker\":\"discard-second-attempt\"}\n\ndata: {\"error\":{\"code\":\"rate_limit_exceeded\"}}\n\n")
+				}
+			})
+			require.NoError(t, model.DB.Model(fallback).Update("protocol", protocol.OpenAIImages).Error)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", `{"model":"gateway-alias","prompt":"draw","stream":true}`)
+			assert.NotContains(t, response.Body.String(), "discard-first-attempt")
+			assert.NotContains(t, response.Body.String(), "discard-second-attempt")
+			charge := int64(0)
+			if recovered {
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				var original, delivered model.Model
+				require.NoError(t, model.DB.First(&original, fixture.channel.ModelID).Error)
+				require.NoError(t, model.DB.First(fallback, fallback.ID).Error)
+				require.NoError(t, model.DB.First(&delivered, fallback.ModelID).Error)
+				assert.Equal(t, original.ModelName+"->"+delivered.ModelName, response.Result().Header.Get("X-Model-Fallback"))
+				assert.Contains(t, response.Body.String(), "https://image.invalid/recovered")
+				assert.Equal(t, 1, strings.Count(response.Body.String(), "[DONE]"))
+				charge = 36_000_000
+			} else {
+				assert.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+				assert.NotContains(t, response.Body.String(), "[DONE]")
+			}
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, charge, record.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 2, total)
+			assert.Equal(t, "rate_limited", attempts[0].ErrorClass)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, 1_000_000_000-charge, wallet.Balance.Nanos)
+		})
+	}
+}
+
 func TestMediaGatewaySharedRouteFiltersProfitAndQuota(t *testing.T) {
 	for _, kind := range []protocol.Type{protocol.OpenAIImages, protocol.OpenAIAudioSpeech, protocol.OpenAIAudioTranscription} {
 		for _, policy := range []string{"profit", "rpm"} {
@@ -7858,10 +7906,14 @@ func TestMediaGatewayAuthenticatesBeforeModelResolution(t *testing.T) {
 func TestMediaGatewayFullFrameCancellationAndPartialJSONDelivery(t *testing.T) {
 	for _, tc := range []struct {
 		name                        string
-		audio, prefix               bool
+		audio, prefix, full, fixed  bool
 		transcription, flush, plain bool
 		charge, cost                int64
 	}{
+		{name: "audio complete body then write error", audio: true, full: true, charge: 238_500, cost: 175_000},
+		{name: "audio complete body then flush error", audio: true, flush: true, charge: 238_500, cost: 175_000},
+		{name: "audio complete body fixed request write error", audio: true, full: true, fixed: true, cost: 20_000_000},
+		{name: "audio short write has no full body", audio: true, prefix: true, cost: 175_000},
 		{name: "image SSE complete frame then cancel", charge: 72_000_000, cost: 40_000_000},
 		{name: "audio complete body then cancel", audio: true, charge: 238_500, cost: 175_000},
 		{name: "image JSON metadata prefix fails", prefix: true, cost: 20_000_000},
@@ -7912,7 +7964,7 @@ func TestMediaGatewayFullFrameCancellationAndPartialJSONDelivery(t *testing.T) {
 					require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
 				}
 			}
-			if tc.flush {
+			if tc.flush && !tc.audio || tc.fixed {
 				fixture.fake.Advance(time.Second)
 				for _, price := range []*model.PriceVersion{{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("request",fixed(0.04))`, EffectiveAt: clock.Now().Unix()}, {OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("request",fixed(0.02))`, EffectiveAt: clock.Now().Unix()}} {
 					require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
@@ -7922,7 +7974,7 @@ func TestMediaGatewayFullFrameCancellationAndPartialJSONDelivery(t *testing.T) {
 			if tc.audio {
 				body, path = `{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm"}`, "/v1/audio/speech"
 			}
-			if tc.prefix || tc.flush {
+			if (tc.prefix || tc.flush) && !tc.audio {
 				body = `{"model":"gateway-alias","prompt":"draw","n":2}`
 			}
 			request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
@@ -7943,6 +7995,8 @@ func TestMediaGatewayFullFrameCancellationAndPartialJSONDelivery(t *testing.T) {
 			if tc.flush {
 				fixture.engine.ServeHTTP(gatewayFailingFlushWriter{recorder}, request)
 				assert.Contains(t, recorder.Body.String(), "Hello")
+			} else if tc.full {
+				fixture.engine.ServeHTTP(gatewayPrefixOnlyWriter{ResponseRecorder: recorder, full: true}, request)
 			} else if tc.prefix {
 				fixture.engine.ServeHTTP(gatewayPrefixOnlyWriter{ResponseRecorder: recorder}, request)
 			} else {
@@ -7955,7 +8009,10 @@ func TestMediaGatewayFullFrameCancellationAndPartialJSONDelivery(t *testing.T) {
 			require.NoError(t, err)
 			require.EqualValues(t, 1, total)
 			assert.Equal(t, tc.cost, attempts[0].Cost.Nanos)
-			if tc.prefix || tc.flush {
+			if tc.audio && (tc.full || tc.flush) {
+				assert.Equal(t, new(int64(17)), record.Usage.AudioOutputTokens)
+			}
+			if tc.prefix || tc.flush || tc.full {
 				assert.Equal(t, "downstream_write_failed", attempts[0].ErrorClass)
 				assert.NotEqual(t, "success", record.Status)
 			} else {
@@ -9351,16 +9408,21 @@ func TestMediaGatewayEventNamedErrorsStopAfterBusinessOutput(t *testing.T) {
 
 func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.T) {
 	for _, tc := range []struct {
-		kind                          protocol.Type
-		duration                      bool
-		seconds                       string
-		short, zero                   bool
-		output, audioZero             bool
-		badFormat                     string
-		inputAudioZero                bool
-		unterminated                  bool
-		innerUsage, unfinishedCounter bool
+		kind                              protocol.Type
+		duration                          bool
+		seconds                           string
+		short, zero                       bool
+		output, audioZero                 bool
+		badFormat                         string
+		inputAudioZero                    bool
+		unterminated                      bool
+		innerUsage, unfinishedCounter     bool
+		durationPrefix, durationDelimiter bool
 	}{
+		{kind: protocol.OpenAIAudioTranscription, duration: true, durationPrefix: true, seconds: "6"},
+		{kind: protocol.OpenAIAudioTranscription, duration: true, durationPrefix: true, seconds: "0"},
+		{kind: protocol.OpenAIAudioTranscription, duration: true, durationPrefix: true, durationDelimiter: true, seconds: "6"},
+		{kind: protocol.OpenAIAudioTranscription, duration: true, durationPrefix: true, durationDelimiter: true, seconds: "0"},
 		{kind: protocol.OpenAIImages, innerUsage: true},
 		{kind: protocol.OpenAIAudioSpeech, innerUsage: true},
 		{kind: protocol.OpenAIAudioTranscription, innerUsage: true},
@@ -9394,6 +9456,9 @@ func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.
 				continue
 			}
 			name := fmt.Sprintf("%s/stream=%t/duration=%t/seconds=%s/short=%t/zero=%t/output=%t/audioZero=%t/format=%s/inputAudioZero=%t", kind, stream, tc.duration, tc.seconds, tc.short, tc.zero, tc.output, tc.audioZero, tc.badFormat, tc.inputAudioZero)
+			if tc.durationPrefix {
+				name = fmt.Sprintf("duration-prefix/%t/", tc.durationDelimiter) + name
+			}
 			if tc.innerUsage {
 				name = fmt.Sprintf("inner-usage/%t/", tc.unfinishedCounter) + name
 			}
@@ -9417,6 +9482,12 @@ func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.
 					}
 					if tc.duration {
 						body = fmt.Sprintf(`{"error":{"code":"rate_limit_exceeded","message":"provider-secret"},"usage":{"type":"duration","seconds":%s}}`, tc.seconds)
+					}
+					if tc.durationPrefix {
+						body = fmt.Sprintf(`{"text":"hello","duration":%s`, tc.seconds)
+						if tc.durationDelimiter {
+							body += ","
+						}
 					}
 					if tc.duration && tc.inputAudioZero {
 						body = `{"error":{"code":"rate_limit_exceeded"},"duration":60,"usage":{"input_token_details":{"audio_tokens":0}}}`
@@ -9532,7 +9603,11 @@ func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.
 				attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
 				require.NoError(t, err)
 				require.EqualValues(t, 2, total)
-				assert.Equal(t, "rate_limited", attempts[0].ErrorClass)
+				if tc.durationPrefix {
+					assert.NotEmpty(t, attempts[0].ErrorClass)
+				} else {
+					assert.Equal(t, "rate_limited", attempts[0].ErrorClass)
+				}
 				firstCost := int64(7000)
 				if tc.output {
 					firstCost = 1_000_000
@@ -9546,14 +9621,24 @@ func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.
 				}
 				if tc.duration {
 					expectedSeconds := tc.seconds
-					switch tc.seconds {
-					case "60":
-						firstCost = 1_000_000
-					case "0":
-						firstCost = 0
-					default:
+					if tc.durationPrefix {
 						firstCost, expectedSeconds = 17_000, "1"
-						assert.Contains(t, attempts[0].RouteDiagnostics, "quota_saturation")
+						if tc.durationDelimiter {
+							firstCost, expectedSeconds = 100_000, tc.seconds
+							if tc.seconds == "0" {
+								firstCost = 0
+							}
+						}
+					} else {
+						switch tc.seconds {
+						case "60":
+							firstCost = 1_000_000
+						case "0":
+							firstCost = 0
+						default:
+							firstCost, expectedSeconds = 17_000, "1"
+							assert.Contains(t, attempts[0].RouteDiagnostics, "quota_saturation")
+						}
 					}
 					require.NotNil(t, attempts[0].Usage.AudioInputSeconds)
 					assert.Equal(t, expectedSeconds, *attempts[0].Usage.AudioInputSeconds)

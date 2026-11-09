@@ -686,17 +686,15 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			applySpeechUsageHeaders(info, usage, resp.Header)
 			return usage
 		}
-		// 写入响应到客户端
-		c.Writer.WriteHeaderNow()
-		n, writeErr := c.Writer.Write(bodyBytes)
+		var writeErr error
+		if info.ResponseFacts != nil {
+			writeErr = helper.WriteGatewayResponse(c, resp, info.ResponseFacts, bodyBytes, resp.Header.Get("Content-Type"), len(bodyBytes) > 0)
+		} else {
+			c.Writer.WriteHeaderNow()
+			_, writeErr = c.Writer.Write(bodyBytes)
+		}
 		if writeErr != nil {
 			logger.LogError(c, common.LogText("failed to write TTS response: %v", writeErr))
-		}
-		if info.ResponseFacts != nil {
-			info.ResponseFacts.DownstreamWriteFailed = writeErr != nil || n != len(bodyBytes)
-			if !info.ResponseFacts.DownstreamWriteFailed && len(bodyBytes) > 0 && (audioFormat != "wav" || speechAudioPayload(c.Request.Context(), bodyBytes, audioFormat, formatFacts)) {
-				info.ResponseFacts.MarkBusinessOutput()
-			}
 		}
 
 		duration, durationErr := speechAudioDuration(c.Request.Context(), bodyBytes, audioFormat, formatFacts)
