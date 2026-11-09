@@ -457,6 +457,133 @@ func TestTextGatewayModelFallbackKeepsOfferingPrice(t *testing.T) {
 	assert.Empty(t, reconciliation.Mismatches)
 }
 
+func TestTextGatewayModelFallbackFourProtocol(t *testing.T) {
+	for _, client := range []struct{ name, path, body, field, terminal string }{
+		{"Chat", "/v1/" + "chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, "choices", "[DONE]"},
+		{"Responses", "/v1/responses", `{"model":"gateway-alias","input":"Hello","max_output_tokens":16}`, "output", "event: response.completed"},
+		{"Messages", "/v1/messages", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, "content", "message_stop"},
+		{"Gemini", "/v1beta/models/gateway-alias:generateContent", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16}}`, "candidates", "STOP"},
+	} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", client.name, stream), func(t *testing.T) {
+				var firstCalls, lowerCalls atomic.Int32
+				fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					firstCalls.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_, _ = io.WriteString(w, `{"error":{"code":"overloaded"},"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`)
+				})
+				lower := addTextGatewayMember(t, fixture, 3, func(w http.ResponseWriter, r *http.Request) {
+					lowerCalls.Add(1)
+					w.Header().Set("X-Model-Fallback", "provider-forged->provider-model")
+					if stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = io.WriteString(w, "data: {\"id\":\"chat-fallback\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Fallback answer\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chat-fallback\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n")
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"id":"chat-fallback","object":"chat.completion","model":"fallback-upstream","choices":[{"index":0,"message":{"role":"assistant","content":"Fallback answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+				})
+				path, body := client.path, client.body
+				if stream {
+					if client.name == "Gemini" {
+						path = strings.Replace(path, ":generateContent", ":streamGenerateContent?alt=sse", 1)
+					} else {
+						body = strings.TrimSuffix(body, "}") + `,"stream":true}`
+					}
+				}
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, body)
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				assert.EqualValues(t, 1, firstCalls.Load())
+				assert.EqualValues(t, 1, lowerCalls.Load())
+				assert.Contains(t, response.Body.String(), "Fallback answer")
+				assert.Equal(t, fmt.Sprintf("gpt-4o-mini->fallback-%d", lower.ID), response.Result().Header.Get("X-Model-Fallback"))
+				if stream {
+					assert.Contains(t, response.Body.String(), client.terminal)
+				} else {
+					var payload map[string]any
+					require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+					assert.Contains(t, payload, client.field)
+				}
+				requests := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests", "")
+				require.True(t, requests.Success, requests.Message)
+				require.EqualValues(t, 1, requests.Data["total"])
+				record := requests.Data["items"].([]any)[0].(map[string]any)
+				assert.Equal(t, response.Header().Get(common.RequestIdKey), record["id"])
+				assert.Equal(t, "gateway-alias", record["requested_name"])
+				assert.Equal(t, map[string]any{"nanos": "36000", "currency": "USD"}, record["receivable"])
+				attempts := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests/"+record["id"].(string)+"/attempts", "")
+				require.True(t, attempts.Success, attempts.Message)
+				require.EqualValues(t, 2, attempts.Data["total"])
+				for _, item := range attempts.Data["items"].([]any) {
+					attempt := item.(map[string]any)
+					if attempt["channel_id"] == float64(lower.ID) {
+						assert.EqualValues(t, lower.ModelID, attempt["model_id"])
+						assert.EqualValues(t, 3, attempt["member_tier"])
+						assert.Equal(t, "success", attempt["status"])
+						assert.Equal(t, map[string]any{"nanos": "20000", "currency": "USD"}, attempt["cost"])
+					} else {
+						assert.EqualValues(t, fixture.channel.ID, attempt["channel_id"])
+						assert.EqualValues(t, fixture.channel.ModelID, attempt["model_id"])
+						assert.EqualValues(t, 1, attempt["member_tier"])
+						assert.Equal(t, map[string]any{"nanos": "7000", "currency": "USD"}, attempt["cost"])
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestTextGatewayModelFallbackDetailPermissions(t *testing.T) {
+	for _, client := range []struct{ name, path, keyHeader, idField string }{
+		{"OpenAI", "/v1/models/", "Authorization", "id"},
+		{"Anthropic", "/v1/models/", "x-api-key", "id"},
+		{"Gemini", "/v1beta/models/", "x-goog-api-key", "name"},
+	} {
+		t.Run(client.name, func(t *testing.T) {
+			var calls atomic.Int32
+			upstream := func(http.ResponseWriter, *http.Request) { calls.Add(1) }
+			fixture := newTextGatewayFixture(t, upstream)
+			lower := addTextGatewayMember(t, fixture, 3, upstream)
+			requestDetail := func(name string) *httptest.ResponseRecorder {
+				request := httptest.NewRequest(http.MethodGet, client.path+name, nil)
+				key := fixture.token.Key
+				if client.keyHeader == "Authorization" {
+					key = "Bearer " + key
+				}
+				request.Header.Set(client.keyHeader, key)
+				if client.name == "Anthropic" {
+					request.Header.Set("anthropic-version", "2023-06-01")
+				}
+				response := httptest.NewRecorder()
+				fixture.engine.ServeHTTP(response, request)
+				return response
+			}
+			for _, name := range []string{fixture.offering.Name, "gateway-alias"} {
+				response := requestDetail(name)
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				var payload map[string]common.RawMessage
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+				assert.JSONEq(t, `"gateway-offering"`, string(payload[client.idField]))
+				assert.JSONEq(t, fmt.Sprintf(`[{"model_id":%d,"tier":1},{"model_id":%d,"tier":3}]`, fixture.channel.ModelID, lower.ModelID), string(payload["members"]))
+			}
+			pat := createWalletTestAccessToken(t, fixture.user.Id, "api_key:read", "api_key:write")
+			policy := fmt.Sprintf("/api/token/%d/permissions", fixture.token.Id)
+			denied := adminSecurityRequest(fixture.engine, pat, http.MethodPatch, policy, `{"action":"deny_all","revision":0}`)
+			require.Equal(t, http.StatusOK, denied.Code, denied.Body.String())
+			missing := requestDetail("missing-offering")
+			require.Equal(t, http.StatusNotFound, missing.Code, missing.Body.String())
+			for _, name := range []string{fixture.offering.Name, "gateway-alias"} {
+				response := requestDetail(name)
+				assert.Equal(t, http.StatusNotFound, response.Code)
+				assert.JSONEq(t, missing.Body.String(), response.Body.String())
+				assert.NotContains(t, response.Body.String(), `"members"`)
+			}
+			assert.Zero(t, calls.Load(), "model details must not contact a Provider")
+		})
+	}
+}
+
 type gatewayDeadlineListener struct {
 	net.Listener
 	deadlines chan time.Time
