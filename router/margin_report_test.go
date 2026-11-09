@@ -384,10 +384,16 @@ func TestMarginOfferingWorkloadHTTP(t *testing.T) {
 
 func TestMarginGuardUsesMediaQuantities(t *testing.T) {
 	for _, tc := range []struct {
-		name, expression                         string
+		name, expression, batch                  string
 		images, unknown, sale, zero, fx, partial bool
 		residual, legacy                         bool
 	}{
+		{name: "batch per-image sale and token purchase", batch: "per-image-sale", expression: `tier("tokens",c*100)`},
+		{name: "batch partial sale and generated token purchase", batch: "per-image-sale", partial: true, expression: `tier("tokens",c*100)`},
+		{name: "batch per-image sale and image-token purchase", batch: "per-image-sale", expression: `tier("tokens",img_o*100)`},
+		{name: "batch fixed-request sale and token purchase", batch: "fixed-sale", expression: `tier("tokens",c*100)`},
+		{name: "batch token sale and per-image purchase", batch: "token-sale", sale: true, expression: `tier("tokens",c*100)`},
+		{name: "legacy batch per-image sale and token purchase", batch: "per-image-sale", legacy: true, expression: `tier("tokens",c*100)`},
 		{name: "normalized residual sale", sale: true, residual: true, expression: `image_count > 0 ? tier("text",c*7) : tier("image",img_o*7)`},
 		{name: "legacy normalized residual sale", sale: true, residual: true, legacy: true, expression: `image_count > 0 ? tier("text",c*7) : tier("image",img_o*7)`},
 		{name: "image quantity price", images: true, expression: `tier("image",fixed(0.05))*image_count`},
@@ -412,6 +418,8 @@ func TestMarginGuardUsesMediaQuantities(t *testing.T) {
 				usage := ""
 				if tc.zero {
 					usage = `,"usage":{"input_tokens":0,"output_tokens":0}`
+				} else if tc.batch != "" {
+					usage = fmt.Sprintf(`,"usage":{"input_tokens":0,"output_tokens":%d}`, input.N*1000)
 				}
 				w.Header().Set("Content-Type", "application/json")
 				_, err := fmt.Fprintf(w, `{"data":[%s]%s}`, strings.Join(data, ","), usage)
@@ -431,11 +439,23 @@ func TestMarginGuardUsesMediaQuantities(t *testing.T) {
 				saleExpression += `*image_count`
 				purchaseExpression += `*image_count`
 			}
+			switch tc.batch {
+			case "per-image-sale":
+				saleExpression = `tier("image",fixed(0.06))*image_count`
+			case "fixed-sale":
+				saleExpression = `tier("request",fixed(0.12))`
+			case "token-sale":
+				saleExpression = `tier("request",fixed(0.2))`
+				purchaseExpression = `tier("image",fixed(0.06))*image_count`
+			}
 			fixture.fake.Advance(time.Second)
 			for _, price := range []*model.PriceVersion{{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: saleExpression, EffectiveAt: clock.Now().Unix()}, {OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: currency, Expression: purchaseExpression, EffectiveAt: clock.Now().Unix()}} {
 				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
 			}
 			for count := 1; count <= 2; count++ {
+				if tc.batch != "" && count == 1 {
+					continue
+				}
 				body := fmt.Sprintf(`{"model":"gateway-alias","prompt":"draw","n":%d}`, count)
 				var response *httptest.ResponseRecorder
 				if tc.partial && count == 2 {
@@ -453,7 +473,11 @@ func TestMarginGuardUsesMediaQuantities(t *testing.T) {
 			if tc.legacy {
 				var rows []model.GatewayBilling
 				require.NoError(t, model.DB.Find(&rows).Error)
-				require.Len(t, rows, 2)
+				expectedHistory := 2
+				if tc.batch != "" {
+					expectedHistory = 1
+				}
+				require.Len(t, rows, expectedHistory)
 				for _, row := range rows {
 					var intent model.GatewaySettlement
 					require.NoError(t, common.UnmarshalJsonStr(row.Settlement, &intent))
@@ -480,6 +504,30 @@ func TestMarginGuardUsesMediaQuantities(t *testing.T) {
 				MarginCheck model.PriceMarginReport `json:"margin_check"`
 			}
 			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &reply))
+			if tc.batch != "" {
+				report := reply.Data
+				revenue, cost := int64(120_000_000), int64(200_000_000)
+				if tc.partial {
+					revenue = 60_000_000
+				}
+				if tc.sale {
+					require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+					report = reply.MarginCheck
+					revenue, cost = 200_000_000, 120_000_000
+				} else {
+					require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
+				}
+				require.Len(t, report.Estimates, 1)
+				estimate := report.Estimates[0]
+				assert.Equal(t, "estimated", estimate.Status)
+				require.NotNil(t, estimate.Revenue)
+				require.NotNil(t, estimate.Cost)
+				assert.Equal(t, revenue, estimate.Revenue.Nanos)
+				assert.Equal(t, cost, estimate.Cost.Nanos)
+				assert.Equal(t, !tc.sale, estimate.Negative)
+				assert.Equal(t, !tc.sale, report.RequiresConfirmation)
+				return
+			}
 			if tc.residual {
 				require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
 				require.True(t, reply.Data.RequiresConfirmation)

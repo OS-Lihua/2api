@@ -402,7 +402,15 @@ func meanPriceValue(ctx context.Context, tx *gorm.DB, price *PriceVersion, offer
 			if err := common.UnmarshalJsonStr(record.Settlement, &intent); err != nil {
 				return money.Value{}, 0, "", err
 			}
+			attempts := intent.Attempts
+			if intent.Attempt != nil {
+				attempts = []GatewayAttempt{*intent.Attempt}
+			}
 			choices := int64(max(intent.Request.ChoiceCount, 1))
+			if intent.Request.Usage.ImageCount != nil || slices.ContainsFunc(attempts, func(attempt GatewayAttempt) bool { return attempt.Usage.ImageCount != nil }) {
+				// Image quantities and output tokens describe the same request batch.
+				choices = 1
+			}
 			if price.OwnerType == PriceOwnerOffering {
 				usage := intent.SaleUsage
 				if usage == nil {
@@ -415,10 +423,6 @@ func meanPriceValue(ctx context.Context, tx *gorm.DB, price *PriceVersion, offer
 					usages = append(usages, usageSample{usage, intent.Request.Usage, choices, big.NewRat(1, 1)})
 				}
 				continue
-			}
-			attempts := intent.Attempts
-			if intent.Attempt != nil {
-				attempts = []GatewayAttempt{*intent.Attempt}
 			}
 			if len(attempts) == 0 && (needsUsage || used["image_count"]) {
 				return money.Value{}, len(records), "usage_details_unavailable", nil
