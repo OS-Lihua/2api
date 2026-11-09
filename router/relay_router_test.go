@@ -6158,6 +6158,44 @@ func (w cancelOnSpeechOutputWriter) WriteString(body string) (int, error) {
 	return w.Write([]byte(body))
 }
 
+func TestMediaGatewayVLLMOmittedFormatUsesWAV(t *testing.T) {
+	for _, override := range []bool{false, true} {
+		t.Run(fmt.Sprint(override), func(t *testing.T) {
+			audio := mediaWAV(t, 8000, 16000, make([]byte, 16000))
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
+				var wire map[string]common.RawMessage
+				require.NoError(t, common.DecodeJson(r.Body, &wire))
+				assert.JSONEq(t, `"wav"`, string(wire["response_format"]))
+				w.Header().Set("Content-Type", "audio/wav")
+				_, _ = w.Write(audio)
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeVLLM).Error)
+			parameters := `{"sample_rate":8000}`
+			if override {
+				parameters = `{"sample_rate":8000,"response_format":null}`
+			}
+			require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", parameters).Error)
+			fixture.fake.Advance(time.Second)
+			for _, price := range []*model.PriceVersion{{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("audio",ao*9)`, EffectiveAt: clock.Now().Unix()}, {OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("audio",ao*7)`, EffectiveAt: clock.Now().Unix()}} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", `{"model":"gateway-alias","input":"hello","voice":"alloy"}`)
+			require.Equal(t, 200, response.Code)
+			assert.Equal(t, audio, response.Body.Bytes())
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			require.NotNil(t, record.Usage.AudioOutputSeconds)
+			assert.Equal(t, "1", *record.Usage.AudioOutputSeconds)
+			assert.EqualValues(t, 17, record.Usage.AudioOutputTokens)
+			assert.EqualValues(t, 137_700, record.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.EqualValues(t, 119_000, attempts[0].Cost.Nanos)
+		})
+	}
+}
+
 func TestMediaGatewayVLLMPCMUsesEffectiveSampleRate(t *testing.T) {
 	for _, tc := range []struct {
 		mode      string

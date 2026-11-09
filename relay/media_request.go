@@ -236,6 +236,24 @@ func (a *ChannelAdaptor) PrepareMediaWire(c *gin.Context, info *relaycommon.Rela
 		if err := common.Unmarshal(body, &effective); err != nil {
 			return nil, err
 		}
+		if a.kind == protocol.OpenAIAudioSpeech && effective.ResponseFormat == "" {
+			effective.ResponseFormat = "mp3"
+			if result.vllmSpeech {
+				effective.ResponseFormat = "wav"
+			}
+			var fields map[string]common.RawMessage
+			if err := common.Unmarshal(body, &fields); err != nil {
+				return nil, err
+			}
+			fields["response_format"], err = common.Marshal(effective.ResponseFormat)
+			if err != nil {
+				return nil, err
+			}
+			body, err = common.Marshal(fields)
+			if err != nil {
+				return nil, err
+			}
+		}
 		if effective.Model != info.UpstreamModelName {
 			return nil, fmt.Errorf("audio model override is not allowed")
 		}
