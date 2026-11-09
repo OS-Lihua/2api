@@ -198,6 +198,12 @@ func ValidateGatewayMediaMultipliers(body []byte, declared ...capability.Limits)
 				if value.Str == "" || value.Str == "auto" {
 					continue
 				}
+				if value.Str == "custom" {
+					if item.Get("width").Type != ojson.Number || item.Get("height").Type != ojson.Number {
+						return fmt.Errorf("%s custom mode requires numeric width and height", name)
+					}
+					continue
+				}
 				widthText, heightText, found := strings.Cut(value.Str, ":")
 				width, widthErr := strconv.ParseUint(widthText, 10, 32)
 				height, heightErr := strconv.ParseUint(heightText, 10, 32)

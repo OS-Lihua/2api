@@ -8,6 +8,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
 func (MiniMaxImageRequest) ProjectImageRequest(body []byte, public dto.ImageRequest) (*dto.ImageRequest, error) {
@@ -16,6 +17,9 @@ func (MiniMaxImageRequest) ProjectImageRequest(body []byte, public dto.ImageRequ
 		return nil, err
 	}
 	for _, request := range []dto.ImageRequest{public, input} {
+		if request.Quality != "" {
+			return nil, types.NewMediaParameterError("quality", "media_control_unsupported")
+		}
 		for _, value := range []common.RawMessage{request.Image, request.Images, request.Mask} {
 			if len(value) > 0 && string(value) != "null" {
 				return nil, fmt.Errorf("MiniMax image generation cannot preserve image or mask inputs")

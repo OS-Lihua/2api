@@ -15,6 +15,9 @@ func (imagenRequest) ProjectImageRequest(body []byte, public dto.ImageRequest) (
 	if public.ResponseFormat != "" && public.ResponseFormat != "b64_json" {
 		return nil, types.NewMediaParameterError("response_format", "media_format_unsupported")
 	}
+	if public.Size != "" && public.Size != "auto" {
+		return nil, types.NewMediaParameterError("size", "media_format_unsupported")
+	}
 	for _, input := range []common.RawMessage{public.Image, public.Images, public.Mask} {
 		if len(input) > 0 && string(input) != "null" {
 			return nil, fmt.Errorf("Imagen generation does not support image or mask inputs")
@@ -42,7 +45,7 @@ func (imagenRequest) ProjectImageRequest(body []byte, public dto.ImageRequest) (
 		return nil, fmt.Errorf("Imagen sampleCount exceeds the image count limit")
 	}
 	switch wire.Parameters.AspectRatio {
-	case "", "1:1", "3:2", "2:3", "9:16", "16:9":
+	case "", "1:1", "3:4", "4:3", "9:16", "16:9":
 	default:
 		return nil, fmt.Errorf("unsupported Imagen aspect ratio")
 	}

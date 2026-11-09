@@ -2,7 +2,6 @@ package jimeng
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -34,14 +33,13 @@ func (imageRequestPayload) ProjectImageRequest(body []byte, public dto.ImageRequ
 	if wire.Model != public.Model || wire.Prompt == "" || wire.N != nil && *wire.N != 1 {
 		return nil, fmt.Errorf("invalid Jimeng image parameters")
 	}
-	inputs := append(wire.ImageURLs, wire.BinaryData...)
-	if len(inputs) > dto.MaxImageN {
-		return nil, fmt.Errorf("Jimeng image inputs exceed the request limit")
-	}
-	for _, input := range inputs {
-		if strings.TrimSpace(input) == "" {
-			return nil, fmt.Errorf("invalid Jimeng image input")
+	for _, input := range []common.RawMessage{public.Image, public.Images, public.Mask} {
+		if len(input) > 0 && string(input) != "null" {
+			return nil, types.NewMediaParameterError("images", "media_input_unsupported")
 		}
+	}
+	if len(wire.ImageURLs) > 0 || len(wire.BinaryData) > 0 {
+		return nil, types.NewMediaParameterError("images", "media_input_unsupported")
 	}
 	// V2.1_L dimensions are before super resolution; omitted use_sr is true.
 	// https://www.volcengine.com/docs/85621/1537648
@@ -67,11 +65,7 @@ func (imageRequestPayload) ProjectImageRequest(body []byte, public dto.ImageRequ
 	if *wire.ReturnURL {
 		public.ResponseFormat = "url"
 	}
-	public.Image = nil
-	public.Images, err = common.Marshal(inputs)
-	if err != nil {
-		return nil, err
-	}
+	public.Image, public.Images, public.Mask = nil, nil, nil
 	public.N, public.Prompt = common.GetPointer(uint(1)), wire.Prompt
 	return &public, nil
 }

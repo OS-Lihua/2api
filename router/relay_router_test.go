@@ -5358,6 +5358,11 @@ func TestMediaGatewayNativeImageProvidersUseEffectiveWireAndActualMoney(t *testi
 	}{
 		{name: "Imagen", upstream: "imagen-4.0-generate-001", overrides: `{"operations":[{"path":"parameters.sampleCount","mode":"set","value":4}]}`, response: fmt.Sprintf(`{"predictions":[{"bytesBase64Encoded":%q,"mimeType":"image/png"}]}`, base64.StdEncoding.EncodeToString(picture.Bytes())), providerType: constant.ChannelTypeGemini, requested: 2, quantity: 4, hold: 144_000_000, path: []string{"parameters", "sampleCount"}},
 		{name: "Replicate", upstream: "black-forest-labs/flux-1.1-pro", overrides: `{}`, response: `{"status":"succeeded","output":["https://image.invalid/one"]}`, providerType: constant.ChannelTypeReplicate, requested: 2, quantity: 2, hold: 72_000_000, path: []string{"input", "num_outputs"}},
+		{name: "Replicate custom dimensions", size: "1024x512", width: 1024, height: 512, upstream: "black-forest-labs/flux-1.1-pro", overrides: `{}`, response: `{"status":"succeeded","output":["https://image.invalid/one"]}`, providerType: constant.ChannelTypeReplicate, requested: 2, quantity: 2, hold: 72_000_000, path: []string{"input", "num_outputs"}},
+		{name: "Replicate custom dimension rejects rounding", size: "1010x512", reject: true, upstream: "black-forest-labs/flux-1.1-pro", overrides: `{}`, response: `{"status":"succeeded","output":["https://image.invalid/one"]}`, providerType: constant.ChannelTypeReplicate, requested: 2, quantity: 2, hold: 72_000_000},
+		{name: "Replicate custom dimension limit", size: "1536x1024", reject: true, upstream: "black-forest-labs/flux-1.1-pro", overrides: `{}`, response: `{"status":"succeeded","output":["https://image.invalid/one"]}`, providerType: constant.ChannelTypeReplicate, requested: 2, quantity: 2, hold: 72_000_000},
+		{name: "Replicate final custom rounding", size: "1024x512", reject: true, upstream: "black-forest-labs/flux-1.1-pro", overrides: `{"operations":[{"path":"input.width","mode":"set","value":1010}]}`, response: `{"status":"succeeded","output":["https://image.invalid/one"]}`, providerType: constant.ChannelTypeReplicate, requested: 2, quantity: 2, hold: 72_000_000},
+		{name: "Replicate final ratio loses pixels", size: "1024x512", reject: true, upstream: "black-forest-labs/flux-1.1-pro", overrides: `{"operations":[{"path":"input.aspect_ratio","mode":"set","value":"16:9"}]}`, response: `{"status":"succeeded","output":["https://image.invalid/one"]}`, providerType: constant.ChannelTypeReplicate, requested: 2, quantity: 2, hold: 72_000_000},
 		{name: "Jimeng", upstream: "jimeng_high_aes_general_v21_L", overrides: `{}`, response: `{"code":10000,"data":{"image_urls":["https://image.invalid/one"]}}`, providerType: constant.ChannelTypeJimeng, requested: 1, quantity: 1, hold: 36_000_000},
 		{name: "MiniMax", upstream: "image-01", overrides: `{}`, response: `{"data":{"image_urls":["https://image.invalid/one"]},"base_resp":{"status_code":0}}`, providerType: constant.ChannelTypeMiniMax, requested: 2, quantity: 2, hold: 72_000_000, path: []string{"n"}},
 		{name: "Jimeng 512 output", size: "512x512", width: 512, height: 512, upstream: "jimeng_high_aes_general_v21_L", overrides: `{}`, response: `{"code":10000,"data":{"image_urls":["https://image.invalid/one"]}}`, providerType: constant.ChannelTypeJimeng, requested: 1, quantity: 1, hold: 36_000_000},
@@ -5377,9 +5382,16 @@ func TestMediaGatewayNativeImageProvidersUseEffectiveWireAndActualMoney(t *testi
 					var wire map[string]any
 					require.NoError(t, common.DecodeJson(r.Body, &wire))
 					if tc.size != "" && !tc.reject {
-						assert.Equal(t, float64(tc.width), wire["width"])
-						assert.Equal(t, float64(tc.height), wire["height"])
-						assert.Equal(t, tc.superResolution, wire["use_sr"], "explicit false must remain on the native wire")
+						if tc.providerType == constant.ChannelTypeReplicate {
+							input := wire["input"].(map[string]any)
+							assert.Equal(t, "custom", input["aspect_ratio"])
+							assert.Equal(t, float64(tc.width), input["width"])
+							assert.Equal(t, float64(tc.height), input["height"])
+						} else {
+							assert.Equal(t, float64(tc.width), wire["width"])
+							assert.Equal(t, float64(tc.height), wire["height"])
+							assert.Equal(t, tc.superResolution, wire["use_sr"], "explicit false must remain on the native wire")
+						}
 					}
 					if len(tc.path) > 0 {
 						var quantity any = wire
@@ -5475,6 +5487,9 @@ func TestMediaGatewayMiniMaxImagesKeepHostStreamAndRejectInputLoss(t *testing.T)
 	}{
 		{name: "native JSON"},
 		{name: "native JSON as SSE", stream: true},
+		{name: "quality high cannot be preserved", fields: `,"quality":"high"`, reject: true},
+		{name: "quality standard cannot be preserved", fields: `,"quality":"standard"`, reject: true},
+		{name: "quality override cannot be preserved", override: `{"quality":"high"}`, reject: true},
 		{name: "image input", fields: `,"image":"https://image.invalid/input"`, reject: true},
 		{name: "images input", fields: `,"images":["https://image.invalid/input"]`, reject: true},
 		{name: "mask input", fields: `,"mask":"https://image.invalid/mask"`, reject: true},
@@ -5540,8 +5555,8 @@ func TestMediaGatewayJimengNativeImageInputsHonorCapabilities(t *testing.T) {
 		{"URL modality", "image_urls", 1, false, false, false, 400},
 		{"URL count", "image_urls", 2, true, false, false, 400},
 		{"base64 count", "binary_data_base64", 2, true, false, false, 400},
-		{"URL compatible", "image_urls", 1, true, false, false, 200},
-		{"base64 compatible", "binary_data_base64", 1, true, false, false, 200},
+		{"URL unsupported by text-to-image contract", "image_urls", 1, true, false, false, 400},
+		{"base64 unsupported by text-to-image contract", "binary_data_base64", 1, true, false, false, 400},
 		{"original count before shrink", "image_urls", 2, true, true, false, 400},
 		{"original modality before clear", "image_urls", 1, false, false, true, 400},
 	} {
@@ -5791,8 +5806,13 @@ func TestMediaGatewayReplicateNativeImageInputHonorsCapabilities(t *testing.T) {
 func TestMediaGatewayImagenEditSkipsUnsupportedCandidate(t *testing.T) {
 	var picture bytes.Buffer
 	require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
-	for _, mode := range []string{"json-edit", "multipart-edit", "url-output"} {
+	for _, mode := range []string{"json-edit", "multipart-edit", "url-output", "unmapped-size", "unsupported-ratio"} {
 		formInput, urlOutput := mode == "multipart-edit", mode == "url-output"
+		sizeInput := mode == "unmapped-size" || mode == "unsupported-ratio"
+		size := "2048x1024"
+		if mode == "unsupported-ratio" {
+			size = "1536x1024"
+		}
 		for _, fallback := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/fallback=%t", mode, fallback), func(t *testing.T) {
 				var imagenCalls, compatibleCalls atomic.Int64
@@ -5818,7 +5838,9 @@ func TestMediaGatewayImagenEditSkipsUnsupportedCandidate(t *testing.T) {
 						} else {
 							var wire dto.ImageRequest
 							require.NoError(t, common.DecodeJson(r.Body, &wire))
-							if urlOutput {
+							if sizeInput {
+								assert.Equal(t, size, wire.Size)
+							} else if urlOutput {
 								assert.Equal(t, "url", wire.ResponseFormat)
 							} else {
 								assert.JSONEq(t, `"https://image.invalid/source"`, string(wire.Image))
@@ -5830,7 +5852,9 @@ func TestMediaGatewayImagenEditSkipsUnsupportedCandidate(t *testing.T) {
 					require.NoError(t, model.DB.Model(compatible).Update("protocol", protocol.OpenAIImages).Error)
 				}
 				var response *httptest.ResponseRecorder
-				if urlOutput {
+				if sizeInput {
+					response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", fmt.Sprintf(`{"model":"gateway-alias","prompt":"draw","size":%q}`, size))
+				} else if urlOutput {
 					response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", `{"model":"gateway-alias","prompt":"draw","response_format":"url"}`)
 				} else if formInput {
 					request := mediaMultipartRequest(t, "/v1/images/edits", map[string]string{"model": "gateway-alias", "prompt": "edit"}, "image", picture.Bytes())
@@ -5879,7 +5903,11 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 		extra          string
 		requestFormat  string
 		speed          float64
+		silence        *float64
 	}{
+		{name: "Volcengine small silence zero", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"audio":{"voice_type":"BV700_streaming"},"request":{"silence_duration":0}}`, silence: new(float64(0))},
+		{name: "Volcengine small silence default value", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"audio":{"voice_type":"BV700_streaming"},"request":{"silence_duration":125}}`, silence: new(float64(125))},
+		{name: "Volcengine small silence requires integer", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"audio":{"voice_type":"BV700_streaming"},"request":{"silence_duration":125.5}}`, reject: true},
 		{name: "Volcengine official small voice controls", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"audio":{"voice_type":"BV001_streaming","speed_ratio":2.5}}`, speed: 2.5},
 		{name: "Volcengine official large voice controls", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"audio":{"voice_type":"zh_female_tianmeitaozi_mars_bigtts","speed_ratio":1.5}}`, speed: 1.5},
 		{name: "Volcengine official large voice silence", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, extra: `,"metadata":{"audio":{"voice_type":"zh_female_tianmeitaozi_mars_bigtts"},"request":{"enable_trailing_silence_audio":true,"silence_duration":1000}}`},
@@ -5925,6 +5953,8 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 		{name: "MiniMax public SSE", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, stream: true},
 		{name: "Volcengine PCM", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech},
 		{name: "Cloudflare upload", provider: constant.ChannelCloudflare, kind: protocol.OpenAIAudioTranscription},
+		{name: "Cloudflare short text upload", provider: constant.ChannelCloudflare, kind: protocol.OpenAIAudioTranscription, short: true},
+		{name: "Cloudflare short JSON upload", provider: constant.ChannelCloudflare, kind: protocol.OpenAIAudioTranscription, short: true, requestFormat: "json"},
 		{name: "MiniMax changed sample rate", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, overrides: `{"operations":[{"path":"audio_setting.sample_rate","mode":"set","value":48000}]}`, reject: true},
 		{name: "Volcengine changed sample rate", provider: constant.ChannelTypeVolcEngine, kind: protocol.OpenAIAudioSpeech, overrides: `{"operations":[{"path":"audio.rate","mode":"set","value":48000}]}`, reject: true},
 		{name: "MiniMax native stream", provider: constant.ChannelTypeMiniMax, kind: protocol.OpenAIAudioSpeech, overrides: `{"stream":true}`, reject: true},
@@ -5958,7 +5988,11 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 					require.NoError(t, err)
 					assert.Equal(t, wave, body)
 					assert.Equal(t, "application/octet-stream", r.Header.Get("Content-Type"))
-					_, _ = io.WriteString(w, `{"success":true,"result":{"text":"hello"}}`)
+					encoded := `{"success":true,"result":{"text":"hello"}}`
+					if tc.short {
+						w.Header().Set("Content-Length", strconv.Itoa(len(encoded)+1))
+					}
+					_, _ = io.WriteString(w, encoded)
 					return
 				}
 				var body map[string]any
@@ -5992,6 +6026,9 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 					}
 					if strings.Contains(tc.name, "explicit silence zero") {
 						assert.Equal(t, float64(0), body["request"].(map[string]any)["silence_duration"])
+					}
+					if tc.silence != nil {
+						assert.Equal(t, *tc.silence, body["request"].(map[string]any)["silence_duration"])
 					}
 					wireAudio := outputAudio
 					if tc.requestFormat == "wav" {
@@ -6073,7 +6110,11 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 			request := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", strings.NewReader(fmt.Sprintf(`{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":%q,"stream_format":%q%s}`, responseFormat, map[bool]string{false: "audio", true: "sse"}[tc.stream], tc.extra)))
 			request.Header.Set("Content-Type", "application/json")
 			if tc.kind == protocol.OpenAIAudioTranscription {
-				request = mediaMultipartRequest(t, "/v1/audio/transcriptions", map[string]string{"model": "gateway-alias", "response_format": "text"}, "file", wave)
+				format := tc.requestFormat
+				if format == "" {
+					format = "text"
+				}
+				request = mediaMultipartRequest(t, "/v1/audio/transcriptions", map[string]string{"model": "gateway-alias", "response_format": format}, "file", wave)
 			}
 			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
 			response := httptest.NewRecorder()
@@ -6106,7 +6147,12 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 				attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
 				require.NoError(t, err)
 				require.EqualValues(t, 1, total)
-				assert.Equal(t, new(int64(17)), attempts[0].Usage.AudioOutputTokens)
+				if tc.kind == protocol.OpenAIAudioTranscription {
+					assert.Equal(t, new(int64(17)), attempts[0].Usage.AudioInputTokens)
+					assert.Equal(t, "estimated", attempts[0].UsageSource)
+				} else {
+					assert.Equal(t, new(int64(17)), attempts[0].Usage.AudioOutputTokens)
+				}
 				assert.EqualValues(t, 119_000, attempts[0].Cost.Nanos)
 				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
 				require.NoError(t, err)

@@ -104,8 +104,19 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 	inputPayload := make(map[string]any)
 	inputPayload["prompt"] = request.Prompt
 
-	if size := strings.TrimSpace(request.Size); size != "" {
-		if aspect, width, height, ok := mapOpenAISizeToFlux(size); ok {
+	if size := strings.TrimSpace(request.Size); size != "" && size != "auto" {
+		if info.ResponseFacts != nil {
+			widthText, heightText, found := strings.Cut(size, "x")
+			width, widthErr := strconv.Atoi(widthText)
+			height, heightErr := strconv.Atoi(heightText)
+			if modelName != ModelFlux11Pro || info.RelayMode == relayconstant.RelayModeImagesEdits || !found || widthErr != nil || heightErr != nil {
+				return nil, types.NewMediaParameterError("size", "media_format_unsupported")
+			}
+			if err := validateFluxCustomDimensions(width, height); err != nil {
+				return nil, err
+			}
+			inputPayload["aspect_ratio"], inputPayload["width"], inputPayload["height"] = "custom", width, height
+		} else if aspect, width, height, ok := mapOpenAISizeToFlux(size); ok {
 			if aspect != "" {
 				if aspect == "custom" {
 					inputPayload["aspect_ratio"] = "custom"
@@ -474,6 +485,13 @@ func gcd(a, b int) int {
 		return -a
 	}
 	return a
+}
+
+func validateFluxCustomDimensions(width, height int) error {
+	if normalizeFluxDimension(width) != width || normalizeFluxDimension(height) != height {
+		return types.NewMediaParameterError("size", "media_format_unsupported")
+	}
+	return nil
 }
 
 func normalizeFluxDimension(value int) int {

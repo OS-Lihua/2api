@@ -123,14 +123,23 @@ func cfHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response)
 
 func cfSTTHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, *dto.Usage) {
 	var cfResp CfAudioResponse
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, readErr := io.ReadAll(resp.Body)
+	defer service.CloseResponseBodyGracefully(resp)
+	if readErr != nil && info.ResponseFacts == nil {
+		return types.NewError(readErr, types.ErrorCodeBadResponseBody), nil
+	}
+	err := common.Unmarshal(responseBody, &cfResp)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
-	service.CloseResponseBodyGracefully(resp)
-	err = common.Unmarshal(responseBody, &cfResp)
-	if err != nil {
-		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
+	if readErr != nil {
+		info.ResponseFacts.GeneratedText = cfResp.Result.Text
+		if info.StreamStatus == nil {
+			info.StreamStatus = relaycommon.NewStreamStatus()
+		}
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, readErr)
+		info.StreamStatus.MarkIncomplete("incomplete_transcription_response")
+		return types.NewError(readErr, types.ErrorCodeBadResponseBody), nil
 	}
 
 	audioResp := &dto.AudioResponse{
