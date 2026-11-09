@@ -537,7 +537,9 @@ export function parseTaskResult(ctx, body, response) {
     }
     return result;
   }
-  if (status === "failed") return chargedFailure(data) ? { status: "SUCCESS" } : { status: "FAILURE", reason: failureReason(data) };
+  // Legacy quota retains a charged failure as SUCCESS. Frozen submittedUsage
+  // identifies a money task, where failed delivery owes no user charge.
+  if (status === "failed") return chargedFailure(data) && !ctx.submittedUsage ? { status: "SUCCESS" } : { status: "FAILURE", reason: failureReason(data) };
   if (status === "expired") return { status: "FAILURE", reason: "the video expired before it was retrieved" };
   return { status: "UNKNOWN", reason: "unrecognized status: " + String(status || "") };
 }

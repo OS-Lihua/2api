@@ -2184,6 +2184,58 @@ func TestAsyncTaskImmediateFailureKeepsReportedProcurement(t *testing.T) {
 	assert.EqualValues(t, 1000000000, wallet.Balance.Nanos)
 }
 
+func TestAsyncTaskChargedXaiFailureDoesNotChargeUser(t *testing.T) {
+	failure := map[string]any{"status": "failed", "usage": map[string]any{"cost_in_usd_ticks": 1}, "error": map[string]any{"message": "generation failed"}}
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			_, _ = io.WriteString(w, `{"request_id":"charged-failure-job"}`)
+			return
+		}
+		encoded, err := common.Marshal(failure)
+		if assert.NoError(t, err) {
+			_, _ = w.Write(encoded)
+		}
+	})
+	source, err := plugins.Source("xai")
+	require.NoError(t, err)
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	loaded, err := jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "xai"})
+	require.NoError(t, err)
+	legacy, err := loaded.Engine.Call(t.Context(), "parseTaskResult", map[string]any{}, failure, map[string]any{"status": 200})
+	require.NoError(t, err)
+	legacyResult, ok := legacy.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "SUCCESS", legacyResult["status"], "legacy quota compatibility retains its existing charged-failure outcome")
+	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("model_name", "grok-imagine-video-1.5").Error)
+	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:xai", "upstream_model_name": "grok-imagine-video-1.5"}).Error)
+	fixture.fake.Advance(time.Second)
+	for _, price := range []*model.PriceVersion{
+		{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("video", u("seconds") * 0.1)`, EffectiveAt: clock.Now().Unix()},
+		{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("video", u("seconds") * 0.05)`, EffectiveAt: clock.Now().Unix()},
+	} {
+		require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+	}
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/xai", `{"model":"gateway-alias","prompt":"A bird","duration":4}`)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	service.RunTaskPollingOnce(t.Context(), nil)
+	var task model.Task
+	require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), task.Status)
+	assert.Equal(t, true, task.PrivateData.Gateway.CompletionFacts["moderated"])
+	request, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+	require.NoError(t, err)
+	assert.Zero(t, request.Receivable.Nanos)
+	assert.False(t, request.SalePending)
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), request.ID, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.True(t, attempts[0].CostPending, "a charged failure without a reported duration must retain unknown procurement")
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1000000000, wallet.Balance.Nanos)
+}
+
 func TestAsyncTaskPollingRechecksProviderAfterPluginPreparation(t *testing.T) {
 	for _, selectedSlot := range []bool{false, true} {
 		t.Run(fmt.Sprintf("selected_slot_%t", selectedSlot), func(t *testing.T) {
