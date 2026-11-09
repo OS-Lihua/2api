@@ -162,6 +162,12 @@ func GetUserWallet(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	pending, err := model.HasPendingGatewaySale(c.Request.Context(), user.Id)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	view.RequestsPaused = pending
 	if outstanding.Nanos > 0 {
 		view.Outstanding = amountString(outstanding)
 		view.RequestsPaused = true

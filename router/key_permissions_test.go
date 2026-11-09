@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -17,12 +18,113 @@ import (
 	"github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	gormlogger "gorm.io/gorm/logger"
 )
+
+func TestKeyPermissionsFourProtocol(t *testing.T) {
+	for _, protocol := range []struct{ name, path, body, field, terminal string }{
+		{"Chat", "/v1/chat/completions", `{"model":"$MODEL","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, "choices", "[DONE]"},
+		{"Responses", "/v1/responses", `{"model":"$MODEL","input":"Hello","max_output_tokens":16}`, "output", "event: response.completed"},
+		{"Messages", "/v1/messages", `{"model":"$MODEL","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`, "content", "message_stop"},
+		{"Gemini", "/v1beta/models/$MODEL:generateContent", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"maxOutputTokens":16}}`, "candidates", "STOP"},
+	} {
+		for _, mode := range []struct {
+			name   string
+			stream bool
+		}{{"JSON", false}, {"SSE", true}} {
+			t.Run(protocol.name+"/"+mode.name, func(t *testing.T) {
+				var calls atomic.Int32
+				f := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					if mode.stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = fmt.Fprint(w, "data: {\"id\":\"chat-test\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chat-test\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n")
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprint(w, `{"id":"chat-test","object":"chat.completion","model":"upstream-model","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+				})
+				// A fully funded legacy route with the same names must not bypass Offering-ID permissions.
+				require.NoError(t, model.DB.Model(f.user).Update("quota", 1_000_000).Error)
+				require.NoError(t, model.DB.Model(f.token).Updates(map[string]any{"remain_quota": 1_000_000, "unlimited_quota": false}).Error)
+				require.NoError(t, model.DB.Create(&[]model.Ability{
+					{Group: "default", Model: f.offering.Name, ChannelId: f.channel.ProviderID, Enabled: true},
+					{Group: "default", Model: "gateway-alias", ChannelId: f.channel.ProviderID, Enabled: true},
+				}).Error)
+				previousRatios := ratio_setting.ModelRatio2JSONString()
+				require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gateway-offering":1,"gateway-alias":1}`))
+				t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(previousRatios)) })
+
+				path, body := protocol.path, protocol.body
+				if mode.stream {
+					if protocol.name == "Gemini" {
+						path = strings.Replace(path, ":generateContent", ":streamGenerateContent?alt=sse", 1)
+					} else {
+						body = strings.TrimSuffix(body, "}") + `,"stream":true}`
+					}
+				}
+				pat := createWalletTestAccessToken(t, f.user.Id, "api_key:read", "api_key:write")
+				permissionsPath := fmt.Sprintf("/api/token/%d/permissions", f.token.Id)
+				walletPath := fmt.Sprintf("/api/admin/v1/user-wallets/%d", f.user.Id)
+				walletBefore := walletAPIRequest(t, f.engine, f.adminPAT, http.MethodGet, walletPath, "")
+				require.True(t, walletBefore.Success, walletBefore.Message)
+				entriesBefore := walletAPIRequest(t, f.engine, f.adminPAT, http.MethodGet, walletPath+"/entries", "")
+				require.True(t, entriesBefore.Success, entriesBefore.Message)
+				tokenBefore := walletAPIRequest(t, f.engine, pat, http.MethodGet, fmt.Sprintf("/api/token/%d", f.token.Id), "")
+				require.True(t, tokenBefore.Success, tokenBefore.Message)
+
+				denied := adminSecurityRequest(f.engine, pat, http.MethodPatch, permissionsPath, `{"action":"deny_all","revision":0}`)
+				require.Equal(t, http.StatusOK, denied.Code, denied.Body.String())
+				missing := adminSecurityRequest(f.engine, f.token.Key, http.MethodPost, strings.ReplaceAll(path, "$MODEL", "missing-offering"), strings.ReplaceAll(body, "$MODEL", "missing-offering"))
+				assert.Equal(t, http.StatusNotFound, missing.Code, missing.Body.String())
+				assert.Contains(t, missing.Body.String(), "model_not_found")
+				for _, name := range []string{f.offering.Name, "gateway-alias"} {
+					response := adminSecurityRequest(f.engine, f.token.Key, http.MethodPost, strings.ReplaceAll(path, "$MODEL", name), strings.ReplaceAll(body, "$MODEL", name))
+					assert.Equal(t, http.StatusNotFound, response.Code, "%s: %s", name, response.Body.String())
+					assert.JSONEq(t, missing.Body.String(), response.Body.String(), name)
+				}
+				assert.Zero(t, calls.Load(), "denied Offering identities and unknown names must not contact a Provider")
+				walletAfter := walletAPIRequest(t, f.engine, f.adminPAT, http.MethodGet, walletPath, "")
+				require.True(t, walletAfter.Success, walletAfter.Message)
+				assert.Equal(t, walletBefore.Data, walletAfter.Data, "denied requests must not change the wallet")
+				entriesAfter := walletAPIRequest(t, f.engine, f.adminPAT, http.MethodGet, walletPath+"/entries", "")
+				require.True(t, entriesAfter.Success, entriesAfter.Message)
+				assert.Equal(t, entriesBefore.Data["total"], entriesAfter.Data["total"], "denied requests must not post ledger entries")
+				tokenAfter := walletAPIRequest(t, f.engine, pat, http.MethodGet, fmt.Sprintf("/api/token/%d", f.token.Id), "")
+				require.True(t, tokenAfter.Success, tokenAfter.Message)
+				assert.Equal(t, tokenBefore.Data["remain_quota"], tokenAfter.Data["remain_quota"])
+				assert.Equal(t, tokenBefore.Data["used_quota"], tokenAfter.Data["used_quota"])
+				records := walletAPIRequest(t, f.engine, f.userPAT, http.MethodGet, "/api/requests/self", "")
+				require.True(t, records.Success, records.Message)
+				assert.EqualValues(t, 0, records.Data["total"], "denied requests must not create billable requests")
+
+				opened := adminSecurityRequest(f.engine, pat, http.MethodPatch, permissionsPath, fmt.Sprintf(`{"action":"add","offering_ids":[%d],"revision":1}`, f.offering.ID))
+				require.Equal(t, http.StatusOK, opened.Code, opened.Body.String())
+				for _, name := range []string{f.offering.Name, "gateway-alias"} {
+					response := adminSecurityRequest(f.engine, f.token.Key, http.MethodPost, strings.ReplaceAll(path, "$MODEL", name), strings.ReplaceAll(body, "$MODEL", name))
+					require.Equal(t, http.StatusOK, response.Code, "%s: %s", name, response.Body.String())
+					assert.Contains(t, response.Body.String(), "Hello", name)
+					if mode.stream {
+						assert.Contains(t, response.Body.String(), protocol.terminal, name)
+					} else {
+						var payload map[string]any
+						require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+						assert.Contains(t, payload, protocol.field, name)
+					}
+				}
+				assert.EqualValues(t, 2, calls.Load(), "the same Offering-ID grant authorizes both its main name and alias")
+				records = walletAPIRequest(t, f.engine, f.userPAT, http.MethodGet, "/api/requests/self", "")
+				require.True(t, records.Success, records.Message)
+				assert.EqualValues(t, 2, records.Data["total"], "allowed names must use the gateway lifecycle")
+			})
+		}
+	}
+}
 
 func TestKeyPermissionsHiddenAndMissingCallsAreIndistinguishable(t *testing.T) {
 	calls := 0
@@ -77,15 +179,23 @@ func TestKeyPermissionsHiddenAndMissingCallsAreIndistinguishable(t *testing.T) {
 func TestKeyPermissionsAuthenticatesBeforeModelResolution(t *testing.T) {
 	f := newTextGatewayFixture(t, func(http.ResponseWriter, *http.Request) { t.Error("unexpected dispatch") })
 	require.NoError(t, model.DB.Migrator().DropTable(&model.ModelOfferingName{}))
-	body := `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}]}`
-	for _, key := range []string{"", "not-a-valid-key"} {
-		response := adminSecurityRequest(f.engine, key, http.MethodPost, "/v1/chat/completions", body)
-		assert.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
-		assert.NotContains(t, response.Body.String(), "Could not resolve model")
+	for _, protocol := range []struct{ name, path, body string }{
+		{"Chat", "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}]}`},
+		{"Responses", "/v1/responses", `{"model":"gateway-alias","input":"Hello"}`},
+		{"Messages", "/v1/messages", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`},
+		{"Gemini", "/v1beta/models/gateway-alias:generateContent", `{"contents":[{"role":"user","parts":[{"text":"Hello"}]}]}`},
+	} {
+		t.Run(protocol.name, func(t *testing.T) {
+			for _, key := range []string{"", "not-a-valid-key"} {
+				response := adminSecurityRequest(f.engine, key, http.MethodPost, protocol.path, protocol.body)
+				assert.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
+				assert.NotContains(t, response.Body.String(), "Could not resolve model")
+			}
+			response := adminSecurityRequest(f.engine, f.token.Key, http.MethodPost, protocol.path, protocol.body)
+			assert.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
+			assert.NotContains(t, response.Body.String(), "model_offering_names")
+		})
 	}
-	response := adminSecurityRequest(f.engine, f.token.Key, http.MethodPost, "/v1/chat/completions", body)
-	assert.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
-	assert.NotContains(t, response.Body.String(), "model_offering_names")
 }
 
 func TestKeyPermissionsLegacyAllowlistMigration(t *testing.T) {

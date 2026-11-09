@@ -4,6 +4,10 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/tokenkit"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+	"strings"
 )
 
 // ChatUsagePresence reports bounded base counters independently. A reported
@@ -12,19 +16,95 @@ func ChatUsagePresence(body []byte) (prompt, completion bool) {
 	return NativeUsagePresence(body, "usage.prompt_tokens", "usage.completion_tokens", "usage.total_tokens")
 }
 
+// ChatStreamBusinessText extracts generated content independently of delivery.
+func ChatStreamBusinessText(body []byte) string {
+	var text strings.Builder
+	for _, choice := range gjson.GetBytes(body, "choices").Array() {
+		text.WriteString(ChatStreamChoiceBusinessText(choice))
+	}
+	return text.String()
+}
+
+// SourceText accepts only an independently complete JSON string.
+func SourceText(value gjson.Result) string {
+	var text string
+	if value.Type != gjson.String || common.UnmarshalJsonStr(value.Raw, &text) != nil {
+		return ""
+	}
+	return text
+}
+
+// ChatStreamChoiceBusinessText preserves the content within one independent output.
+func ChatStreamChoiceBusinessText(choice gjson.Result) string {
+	var text strings.Builder
+	text.WriteString(SourceText(choice.Get("delta.content")))
+	if reasoning := choice.Get("delta.reasoning_content"); reasoning.Exists() {
+		text.WriteString(SourceText(reasoning))
+	} else {
+		text.WriteString(SourceText(choice.Get("delta.reasoning")))
+	}
+	text.WriteString(SourceText(choice.Get("delta.refusal")))
+	text.WriteString(SourceText(choice.Get("delta.audio.transcript")))
+	for _, tool := range choice.Get("delta.tool_calls").Array() {
+		for _, field := range []string{"function.name", "function.arguments", "custom.name", "custom.input"} {
+			text.WriteString(SourceText(tool.Get(field)))
+		}
+	}
+	return text.String()
+}
+
 // ResponseFacts separates upstream-reported zero usage from a local estimate,
 // and business output from protocol framing and keep-alive pings. It contains
-// transient output only; callers must never persist GeneratedText.
+// transient source and delivered output only; callers must never persist either.
 type ResponseFacts struct {
 	UsageReported            bool
 	PromptTokensReported     bool
 	CompletionTokensReported bool
+	IndependentUsageReported bool
 	BusinessOutput           bool
+	TerminalDelivered        bool `json:"-"`
+	ExpectedChoices          int  `json:"-"`
 	DownstreamWriteFailed    bool
 	GeneratedText            string
+	SourceGeneratedText      string `json:"-"`
+	SourceOutputObserved     bool   `json:"-"`
+	SourceOutputTokens       *int   `json:"-"`
+	GeneratedOutputTokens    *int
+	OutputLimitObserved      bool   `json:"-"`
+	UnterminatedStreamData   []byte `json:"-"`
+	UnterminatedStreamEvent  string `json:"-"`
+	UpstreamRetryAfter       string // Transient; only the parsed cooldown may enter records.
 	OnBusinessOutput         func()
 	CanFinishStream          func() bool `json:"-"`
 	UpstreamErrorCode        string
+	// StreamPrelude belongs only to this Attempt and is never persisted. Hold
+	// metadata until business output commits its protocol and loss headers.
+	StreamPrelude []byte              `json:"-"`
+	StreamHeaders map[string][]string `json:"-"`
+}
+
+// RecordChatSource retains generated facts when a native transport fails after
+// returning a decodable response. It does not confirm downstream delivery.
+func (facts *ResponseFacts) RecordChatSource(response *dto.OpenAITextResponse, model string) {
+	var text strings.Builder
+	tokens := 0
+	for _, choice := range response.Choices {
+		var output strings.Builder
+		output.WriteString(choice.Message.StringContent())
+		output.WriteString(choice.Message.GetReasoningContent())
+		for _, call := range choice.Message.ParseToolCalls() {
+			facts.SourceOutputObserved = true
+			output.WriteString(call.Function.Name)
+			output.WriteString(call.Function.Arguments)
+			output.Write(call.Custom)
+		}
+		candidate := output.String()
+		text.WriteString(candidate)
+		tokens += tokenkit.Count(model, candidate)
+	}
+	facts.SourceGeneratedText = text.String()
+	facts.SourceOutputTokens = &tokens
+	facts.SourceOutputObserved = facts.SourceOutputObserved || facts.SourceGeneratedText != ""
 }
 
 // MarkBusinessOutput records accepted content and disarms first-byte budgets.
@@ -58,6 +138,51 @@ func NativeUsagePresence(body []byte, promptPath, completionPath, _ string) (boo
 	return present[0], present[1]
 }
 
+// SanitizeNativeUsage removes only invalid numeric usage fields before a
+// provider DTO is decoded. Unrelated broken totals/details cannot erase bases.
+func SanitizeNativeUsage(body []byte, path string) []byte {
+	usage := gjson.GetBytes(body, path)
+	if path == "" {
+		usage = gjson.ParseBytes(body)
+	}
+	if !usage.Exists() {
+		return body
+	}
+	if !usage.IsObject() {
+		body, _ = sjson.DeleteBytes(body, path)
+		return body
+	}
+	paths := []string{path}
+	for index := 0; index < len(paths); index++ {
+		prefix := paths[index]
+		object := gjson.GetBytes(body, prefix)
+		if prefix == "" {
+			object = gjson.ParseBytes(body)
+		}
+		for key, value := range object.Map() {
+			field := key
+			if prefix != "" {
+				field = prefix + "." + key
+			}
+			name := strings.ToLower(key)
+			if strings.HasSuffix(name, "tokens") || strings.HasSuffix(name, "count") {
+				if valid, _ := NativeUsagePresence(body, field, "", ""); !valid {
+					body, _ = sjson.DeleteBytes(body, field)
+				}
+				continue
+			}
+			if strings.HasSuffix(name, "_details") && !value.IsObject() {
+				body, _ = sjson.DeleteBytes(body, field)
+				continue
+			}
+			if value.IsObject() && path != "" {
+				paths = append(paths, field)
+			}
+		}
+	}
+	return body
+}
+
 // RecordUsage merges independently reported base counters, including explicit
 // zero. Missing or invalid fields cannot erase an earlier valid stream counter.
 func (facts *ResponseFacts) RecordUsage(usage, reported *dto.Usage, prompt, completion bool) {
@@ -76,6 +201,90 @@ func (facts *ResponseFacts) RecordUsage(usage, reported *dto.Usage, prompt, comp
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	facts.UsageReported = facts.PromptTokensReported && facts.CompletionTokensReported
+}
+
+// RecordNativeUsage retains independently valid base counters before decoding
+// a provider envelope or reporting its transport error.
+func (facts *ResponseFacts) RecordNativeUsage(usage *dto.Usage, body []byte, promptPath, completionPath string) {
+	prompt, completion := NativeUsagePresence(body, promptPath, completionPath, "")
+	reported := dto.Usage{}
+	if prompt {
+		reported.PromptTokens = int(gjson.GetBytes(body, promptPath).Int())
+	}
+	if completion {
+		reported.CompletionTokens = int(gjson.GetBytes(body, completionPath).Int())
+	}
+	facts.RecordUsage(usage, &reported, prompt, completion)
+}
+
+// NativeTextSource extracts independently valid text without decoding unrelated
+// native fields. Each candidate remains a separate tokenizer input.
+func NativeTextSource(body []byte, choicesPath string, textPaths ...string) *dto.OpenAITextResponse {
+	choices := []gjson.Result{gjson.ParseBytes(body)}
+	if choicesPath != "" {
+		choices = gjson.GetBytes(body, choicesPath).Array()
+	}
+	var source dto.OpenAITextResponse
+	for i, choice := range choices {
+		var text strings.Builder
+		found := false
+		for _, path := range textPaths {
+			raw := choice.Get(path)
+			var part string
+			if raw.Type == gjson.String && common.UnmarshalJsonStr(raw.Raw, &part) == nil {
+				text.WriteString(part)
+				found = true
+			}
+		}
+		if found {
+			source.Choices = append(source.Choices, dto.OpenAITextResponseChoice{Index: i, Message: dto.Message{Role: "assistant", Content: text.String()}})
+		}
+	}
+	return &source
+}
+
+// RecordNativeTextSource retains a native JSON source snapshot for procurement.
+func (facts *ResponseFacts) RecordNativeTextSource(body []byte, choicesPath, textPath, model string) {
+	source := NativeTextSource(body, choicesPath, textPath)
+	if len(source.Choices) > 0 {
+		facts.RecordChatSource(source, model)
+	}
+}
+
+// RecordChatUsage merges a native usage object with Chat counter names.
+// Omitted detail fields retain their preceding snapshot; explicit zeros reset it.
+func (facts *ResponseFacts) RecordChatUsage(usage *dto.Usage, body []byte, path string) error {
+	raw := gjson.GetBytes(body, path)
+	if !raw.IsObject() {
+		return nil
+	}
+	prompt, completion := NativeUsagePresence(body, path+".prompt_tokens", path+".completion_tokens", "")
+	paths := []string{path}
+	for index := 0; index < len(paths) && !facts.IndependentUsageReported; index++ {
+		prefix := paths[index]
+		for key, value := range gjson.GetBytes(body, prefix).Map() {
+			if prefix == path && (key == "prompt_tokens" || key == "completion_tokens" || key == "total_tokens") {
+				continue
+			}
+			field := prefix + "." + key
+			if value.IsObject() {
+				paths = append(paths, field)
+				continue
+			}
+			if strings.Contains(strings.ToLower(key), "token") {
+				valid, _ := NativeUsagePresence(body, field, "", "")
+				facts.IndependentUsageReported = facts.IndependentUsageReported || valid
+			}
+		}
+	}
+	previousPrompt, previousCompletion := usage.PromptTokens, usage.CompletionTokens
+	if err := common.UnmarshalJsonStr(raw.Raw, usage); err != nil {
+		return err
+	}
+	reported := *usage
+	usage.PromptTokens, usage.CompletionTokens = previousPrompt, previousCompletion
+	facts.RecordUsage(usage, &reported, prompt, completion)
+	return nil
 }
 
 func (info *RelayInfo) TokenizerModelName() string {

@@ -51,17 +51,23 @@ export function AttemptAdminFacts(props: { attempt: RequestAttempt }) {
         <div>
           <dt className='text-muted-foreground'>{t('Purchase cost')}</dt>
           <dd className='mt-1'>
-            <RequestMoney amount={attempt.cost} />
+            <RequestMoney
+              amount={attempt.cost}
+              pending={attempt.cost_pending}
+            />
           </dd>
         </div>
         <div>
           <dt className='text-muted-foreground'>{t('Converted cost')}</dt>
           <dd className='mt-1'>
-            <RequestMoney amount={attempt.converted_cost} />
+            <RequestMoney
+              amount={attempt.converted_cost}
+              pending={attempt.cost_pending || attempt.converted_cost_pending}
+            />
           </dd>
         </div>
       </dl>
-      {attempt.route_diagnostics?.method === 'single_channel' && (
+      {attempt.route_diagnostics && (
         <RouteDiagnosticsFacts diagnostics={attempt.route_diagnostics} />
       )}
     </section>
@@ -77,8 +83,29 @@ function RouteDiagnosticsFacts(props: { diagnostics: RouteDiagnostics }) {
     capability: t('Capability mismatch'),
     protocol: t('Protocol mismatch'),
     price_unavailable: t('Purchase price unavailable'),
+    already_failed: t('Already failed'),
+    circuit_open: t('Circuit open'),
+    conversion_loss: t('Conversion loss'),
+    rate_limited: t('Rate limit reached'),
+    admission_unavailable: t('Unavailable'),
+    provider_balance: t('Provider balance exhausted'),
+    profit: t('Profit filter'),
+    preparation: t('Channel preparation failed'),
   }
   const diagnostics = props.diagnostics
+  const methods: Record<string, string> = {
+    single_channel: t('Single Channel'),
+    cost: t('Cost'),
+    weight: t('Weight'),
+    latency: t('Latency'),
+  }
+  const facts = [
+    [t('Route score'), diagnostics.score],
+    [t('Estimated cost'), diagnostics.estimated_cost],
+    [t('Estimated receivable'), diagnostics.estimated_receivable],
+    [t('Affinity hit'), diagnostics.affinity_hit ? t('Yes') : t('No')],
+    [t('Loss fallback'), diagnostics.loss_fallback ? t('Yes') : t('No')],
+  ]
   const counts = Object.entries(diagnostics.excluded_counts ?? {}).filter(
     ([reason, count]) =>
       Object.hasOwn(reasons, reason) &&
@@ -92,7 +119,7 @@ function RouteDiagnosticsFacts(props: { diagnostics: RouteDiagnostics }) {
   return (
     <div className='space-y-2 border-t pt-3 text-xs'>
       <h5 className='font-medium'>{t('Route selection')}</h5>
-      <p>{t('Single Channel')}</p>
+      <p>{methods[diagnostics.method] ?? diagnostics.method}</p>
       <dl className='grid grid-cols-2 gap-3'>
         <div>
           <dt className='text-muted-foreground'>{t('Candidate Channels')}</dt>
@@ -102,6 +129,12 @@ function RouteDiagnosticsFacts(props: { diagnostics: RouteDiagnostics }) {
           <dt className='text-muted-foreground'>{t('Eligible Channels')}</dt>
           <dd>{formatNumber(diagnostics.eligible_count, locale)}</dd>
         </div>
+        {facts.map(([label, value]) => (
+          <div key={label}>
+            <dt className='text-muted-foreground'>{label}</dt>
+            <dd className='font-mono break-words'>{value ?? '-'}</dd>
+          </div>
+        ))}
       </dl>
       {counts.map(([reason, count]) => (
         <p key={reason}>

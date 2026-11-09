@@ -16,6 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { throwMarginConfirmation } from '@/features/pricing-management/api'
+import type { MarginCheck } from '@/features/pricing-management/types'
 import { api } from '@/lib/api'
 import { requireServerSuccess } from '@/lib/server-error-message'
 
@@ -39,6 +41,7 @@ export type ImportPreviewRow = {
 }
 
 export type ImportResult = {
+  margin_check?: MarginCheck
   dry_run: boolean
   valid: boolean
   committed: boolean
@@ -57,20 +60,31 @@ export async function importBatch(
   source: string,
   format: string,
   dryRun: boolean,
-  target: ImportTarget
+  target: ImportTarget,
+  approval?: MarginCheck
 ): Promise<ImportResult> {
-  const response = await api.post(`/api/admin/v1/${target}`, source, {
-    params: { dry_run: dryRun },
-    headers: {
-      'Content-Type': format === 'csv' ? 'text/csv' : 'application/json',
-    },
-    validateStatus: (status) => status === 200 || status === 400,
-  })
-  // Row validation failures are displayed in the preview table. Only an
-  // explicit committed result represents a successful write.
-  if (response.data.data?.rows) return response.data.data
-  requireServerSuccess(response.data)
-  return response.data.data
+  try {
+    const response = await api.post(`/api/admin/v1/${target}`, source, {
+      params: { dry_run: dryRun },
+      headers: {
+        'Content-Type': format === 'csv' ? 'text/csv' : 'application/json',
+        ...(approval
+          ? {
+              'X-Margin-Confirmation': approval.revision,
+              'X-Margin-Effective-At': String(approval.effective_at),
+            }
+          : {}),
+      },
+      validateStatus: (status) => status === 200 || status === 400,
+    })
+    // Row validation failures are displayed in the preview table. Only an
+    // explicit committed result represents a successful write.
+    if (response.data.data?.rows) return response.data.data
+    requireServerSuccess(response.data)
+    return response.data.data
+  } catch (error) {
+    throwMarginConfirmation(error)
+  }
 }
 
 export const importExample = JSON.stringify(

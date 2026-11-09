@@ -235,6 +235,17 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
+	if key == "global.accepted_conversion_losses" {
+		var codes []string
+		if common.UnmarshalJsonStr(value, &codes) != nil || codes == nil || len(codes) > 1000 {
+			return common.NewMessage("Enter a JSON array of diagnostic codes")
+		}
+		for _, code := range codes {
+			if code == "" || strings.TrimSpace(code) != code || len(code) > 128 {
+				return common.NewMessage("Invalid conversion loss code")
+			}
+		}
+	}
 	if err := setting.ValidateGatewayBudgetOption(key, value); err != nil {
 		return err
 	}
@@ -301,13 +312,15 @@ func UpdateOption(key string, value string) error {
 	option := Option{
 		Key: key,
 	}
-	// https://gorm.io/docs/update.html#Save-All-Fields
-	DB.FirstOrCreate(&option, Option{Key: key})
-	option.Value = value
-	// Save is a combination function.
-	// If save value does not contain primary key, it will execute Create,
-	// otherwise it will execute Update (with all fields).
-	DB.Save(&option)
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.FirstOrCreate(&option, Option{Key: key}).Error; err != nil {
+			return err
+		}
+		option.Value = value
+		return tx.Save(&option).Error
+	}); err != nil {
+		return err
+	}
 	// Update OptionMap
 	return updateOptionMap(key, value)
 }

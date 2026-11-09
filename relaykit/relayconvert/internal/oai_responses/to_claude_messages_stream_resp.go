@@ -115,21 +115,34 @@ func (s *ResponsesToClaudeStreamState) ConvertChunk(event *dto.ResponsesStreamRe
 			block.NeedsReasoningBreak = true
 		}
 		return responses, s.Usage, nil
-	case responsesEventOutputTextDelta:
+	case responsesEventOutputTextDelta, "response.refusal.delta":
 		block, err := s.ensureBlock(event, "text")
 		if err != nil {
 			return nil, s.Usage, err
 		}
 		return s.appendDelta(block, event.Delta, estimatedInputTokens), s.Usage, nil
-	case responsesEventOutputTextDone:
+	case responsesEventOutputTextDone, "response.refusal.done":
 		block, err := s.ensureBlock(event, "text")
 		if err != nil {
 			return nil, s.Usage, err
 		}
-		if event.Text == nil {
+		text := event.Text
+		if event.Type == "response.refusal.done" {
+			text = event.Refusal
+		}
+		if text == nil {
 			return nil, s.Usage, nil
 		}
-		return s.mergeFinalValue(block, *event.Text, estimatedInputTokens), s.Usage, nil
+		return s.mergeFinalValue(block, *text, estimatedInputTokens), s.Usage, nil
+	case "response.content_part.added", "response.content_part.done":
+		if event.Part == nil || event.Part.Type != "refusal" || event.Part.Refusal == nil {
+			return nil, s.Usage, nil
+		}
+		block, err := s.ensureBlock(event, "text")
+		if err != nil {
+			return nil, s.Usage, err
+		}
+		return s.mergeFinalValue(block, *event.Part.Refusal, estimatedInputTokens), s.Usage, nil
 	case responsesEventOutputTextAnnotationAdded:
 		block, err := s.ensureBlock(event, "text")
 		if err != nil {
@@ -406,10 +419,10 @@ func (s *ResponsesToClaudeStreamState) applyOutputItem(event *dto.ResponsesStrea
 		var text strings.Builder
 		var annotations []any
 		for _, content := range item.Content {
-			if content.Type != "output_text" {
+			if content.Type != "output_text" && content.Type != "refusal" {
 				continue
 			}
-			text.WriteString(content.Text)
+			text.WriteString(content.GetText())
 			annotations = append(annotations, content.Annotations...)
 		}
 		responses = append(responses, s.mergeFinalValue(block, text.String(), estimatedInputTokens)...)

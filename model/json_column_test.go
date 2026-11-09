@@ -19,8 +19,8 @@ func TestJSONColumnValuersReturnString(t *testing.T) {
 	}{
 		{
 			name:   "ChannelInfo",
-			valuer: ProviderInfo{IsMultiKey: true, MultiKeySize: 2},
-			want:   `{"is_multi_key":true,"multi_key_size":2,"multi_key_status_list":null,"multi_key_polling_index":0,"multi_key_mode":""}`,
+			valuer: ProviderInfo{IsMultiKey: true, MultiKeySize: 2, RouteLimits: ProviderRouteLimits{RPM: 7, TPM: 90, MaxConcurrency: 2}},
+			want:   `{"is_multi_key":true,"multi_key_size":2,"multi_key_status_list":null,"multi_key_polling_index":0,"multi_key_mode":"","route_limits":{"rpm":7,"tpm":90,"max_concurrency":2}}`,
 		},
 		{
 			name:   "Properties",
@@ -81,6 +81,9 @@ func TestJSONColumnScannersAcceptStringAndBytes(t *testing.T) {
 			require.NoError(t, info.Scan(toInput(kind, `{"is_multi_key":true,"multi_key_size":2}`)))
 			assert.True(t, info.IsMultiKey)
 			assert.Equal(t, 2, info.MultiKeySize)
+			assert.Equal(t, ProviderRouteLimits{}, info.RouteLimits)
+			require.NoError(t, info.Scan(toInput(kind, `{"route_limits":{"rpm":7,"tpm":90,"max_concurrency":2}}`)))
+			assert.Equal(t, ProviderRouteLimits{RPM: 7, TPM: 90, MaxConcurrency: 2}, info.RouteLimits)
 
 			var props Properties
 			require.NoError(t, props.Scan(toInput(kind, `{"input":"hello"}`)))

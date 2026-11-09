@@ -1,10 +1,12 @@
 package model
 
 import (
+	"context"
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand"
 	"slices"
 	"strings"
@@ -19,6 +21,7 @@ import (
 	"github.com/samber/lo"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 type Provider struct {
@@ -56,13 +59,26 @@ type Provider struct {
 
 	OtherSettings string `json:"settings" gorm:"column:settings"` // 其他设置，存储azure版本等不需要检索的信息，详见dto.ProviderOtherSettings
 
+	RouteLimits *ProviderRouteLimits `json:"route_limits,omitempty" gorm:"-"`
 	// cache info
 	Keys []string `json:"-" gorm:"-"`
 }
 
 const ProviderStatusReasonAllKeysDisabled = "All keys are disabled"
 
+type ProviderRouteLimits struct {
+	RPM            int64 `json:"rpm"`
+	TPM            int64 `json:"tpm"`
+	MaxConcurrency int64 `json:"max_concurrency"`
+}
+
+func (limits ProviderRouteLimits) Valid() bool {
+	return limits.RPM >= 0 && limits.TPM >= 0 && limits.MaxConcurrency >= 0 &&
+		limits.RPM <= 1_000_000_000 && limits.TPM <= 1_000_000_000_000 && limits.MaxConcurrency <= 1_000_000
+}
+
 type ProviderInfo struct {
+	RouteLimits            ProviderRouteLimits   `json:"route_limits"`
 	IsMultiKey             bool                  `json:"is_multi_key"`                        // 是否多Key模式
 	MultiKeySize           int                   `json:"multi_key_size"`                      // 多Key模式下的Key数量
 	MultiKeyStatusList     map[int]int           `json:"multi_key_status_list"`               // key状态列表，key index -> status
@@ -203,6 +219,17 @@ func (channel *Provider) GetKeys() []string {
 }
 
 func (channel *Provider) GetNextEnabledKey() (string, int, *types.NewAPIError) {
+	return channel.nextEnabledKey(true)
+}
+
+// PreviewEnabledKey uses the authoritative Route snapshot without advancing a
+// cursor or reading the legacy cache. Only the selected candidate commits it.
+func (channel *Provider) PreviewEnabledKey() (string, int, *types.NewAPIError) {
+	snapshot := *channel
+	return snapshot.nextEnabledKey(false)
+}
+
+func (channel *Provider) nextEnabledKey(advance bool) (string, int, *types.NewAPIError) {
 	// If not in multi-key mode, return the original key string directly.
 	if !channel.ProviderInfo.IsMultiKey {
 		return channel.Key, 0, nil
@@ -253,11 +280,18 @@ func (channel *Provider) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 	case constant.MultiKeyModePolling:
 		// Use channel-specific lock to ensure thread-safe polling
 
-		channelInfo, err := CacheGetProviderInfo(channel.Id)
-		if err != nil {
-			return "", 0, types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+		channelInfo := &channel.ProviderInfo
+		if advance {
+			var err error
+			channelInfo, err = CacheGetProviderInfo(channel.Id)
+			if err != nil {
+				return "", 0, types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+			}
 		}
 		defer func() {
+			if !advance {
+				return
+			}
 			if common.DebugEnabled {
 				logger.LogDebug(nil, "channel %d polling index: %d", channel.Id, channel.ProviderInfo.MultiKeyPollingIndex)
 			}
@@ -288,8 +322,55 @@ func (channel *Provider) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 	}
 }
 
+// CommitRouteKey rechecks the exact Provider credential and slot under the
+// existing row lock, then advances only the selected polling cursor.
+func (channel *Provider) CommitRouteKey(ctx context.Context, key string, index int) error {
+	return channel.checkRouteKey(ctx, key, index, true)
+}
+
+// ValidateRouteKey rechecks a prepared credential before each Provider call,
+// without advancing a polling cursor already committed for this selection.
+func (channel *Provider) ValidateRouteKey(ctx context.Context, key string, index int) error {
+	return channel.checkRouteKey(ctx, key, index, false)
+}
+
+func (channel *Provider) checkRouteKey(ctx context.Context, key string, index int, advancePolling bool) error {
+	return providerCredentialSession().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current Provider
+		if err := lockForUpdate(tx).First(&current, channel.Id).Error; err != nil {
+			return err
+		}
+		if current.Status != common.ChannelStatusEnabled || current.Key != channel.Key {
+			return ErrProviderStatusConflict
+		}
+		keys := current.GetKeys()
+		if !current.ProviderInfo.IsMultiKey {
+			if index != 0 || key != current.Key {
+				return ErrProviderStatusConflict
+			}
+			return nil
+		}
+		if index < 0 || index >= len(keys) || keys[index] != key {
+			return ErrProviderStatusConflict
+		}
+		if status, exists := current.ProviderInfo.MultiKeyStatusList[index]; exists && status != common.ChannelStatusEnabled {
+			return ErrProviderStatusConflict
+		}
+		if !advancePolling || current.ProviderInfo.MultiKeyMode != constant.MultiKeyModePolling {
+			return nil
+		}
+		return tx.Model(&Provider{}).Where("id = ?", current.Id).
+			Update("channel_info", gorm.Expr(`jsonb_set("channel_info"::jsonb, '{multi_key_polling_index}', to_jsonb(?::integer), true)::json`, (index+1)%len(keys))).Error
+	})
+}
+
+// SaveProviderInfo persists the polling cursor without replacing credential
+// status written by another node after this Provider snapshot was loaded.
 func (channel *Provider) SaveProviderInfo() error {
-	return DB.Model(channel).Update("channel_info", channel.ProviderInfo).Error
+	return providerCredentialSession().Model(&Provider{}).
+		Where(`"id" = ? AND "key" = ? AND "channel_info"::jsonb ->> 'is_multi_key' = 'true' AND "channel_info"::jsonb ->> 'multi_key_mode' = ?`,
+			channel.Id, channel.Key, constant.MultiKeyModePolling).
+		Update("channel_info", gorm.Expr(`jsonb_set("channel_info"::jsonb, '{multi_key_polling_index}', to_jsonb(?::integer), true)::json`, channel.ProviderInfo.MultiKeyPollingIndex)).Error
 }
 
 func (channel *Provider) GetModels() []string {
@@ -352,23 +433,6 @@ func (channel *Provider) Save() error {
 	return DB.Save(channel).Error
 }
 
-// saveStatusState persists only the fields owned by the channel status flow.
-// Keeping this allowlist here prevents a stale channel snapshot from
-// overwriting credentials, accounting counters, or channel configuration.
-func (channel *Provider) saveStatusState() error {
-	if channel.Id == 0 {
-		return errors.New("channel ID is 0")
-	}
-	updates := map[string]any{
-		"status":     channel.Status,
-		"other_info": channel.OtherInfo,
-	}
-	if channel.ProviderInfo.IsMultiKey {
-		updates["channel_info"] = channel.ProviderInfo
-	}
-	return DB.Model(&Provider{}).Where("id = ?", channel.Id).Updates(updates).Error
-}
-
 func GetAllProviders(startIdx int, num int, selectAll bool, idSort bool, sortOptions ...ProviderSortOptions) ([]*Provider, error) {
 	var channels []*Provider
 	var err error
@@ -421,6 +485,39 @@ func SearchProviders(keyword string, group string, model string, idSort bool, so
 // in-memory cache and falls back to this function automatically when
 // MemoryCacheEnabled is false. Direct use is appropriate only where fresh DB
 // state is required, e.g. admin CRUD, channel testing, or cache (re)building.
+// ProviderEdit keeps the current Provider locked until its configuration and
+// abilities commit together. Callers must defer Rollback after beginning an edit.
+type ProviderEdit struct {
+	Provider  *Provider
+	Authorize func(*gorm.DB) bool `json:"-"`
+	tx        *gorm.DB
+	id        int
+	key       string
+}
+
+// Credential predicates and Provider writes must stay out of SQL logs even
+// when DEBUG enables parameter interpolation on ordinary sessions.
+func providerCredentialSession() *gorm.DB {
+	return DB.Session(&gorm.Session{Logger: DB.Logger.LogMode(gormlogger.Silent)})
+}
+
+func BeginProviderEdit(ctx context.Context, id int) (*ProviderEdit, error) {
+	tx := providerCredentialSession().WithContext(ctx).Begin()
+	if tx.Error != nil {
+		return nil, tx.Error
+	}
+	provider := &Provider{}
+	if err := lockForUpdate(tx).First(provider, id).Error; err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	return &ProviderEdit{Provider: provider, tx: tx, id: id, key: provider.Key}, nil
+}
+
+func (edit *ProviderEdit) Rollback() {
+	edit.tx.Rollback()
+}
+
 func GetProviderById(id int, selectAll bool) (*Provider, error) {
 	channel := &Provider{Id: id}
 	var err error = nil
@@ -543,17 +640,16 @@ func (channel *Provider) Insert() error {
 	return err
 }
 
-func (channel *Provider) Update() error {
+func (edit *ProviderEdit) Commit(channel *Provider) error {
+	defer edit.Rollback()
+	if channel.Id != edit.id {
+		return gorm.ErrRecordNotFound
+	}
 	// If this is a multi-key channel, recalculate MultiKeySize based on the current key list to avoid inconsistency after editing keys
 	if channel.ProviderInfo.IsMultiKey {
-		var keyStr string
-		if channel.Key != "" {
-			keyStr = channel.Key
-		} else {
-			// If key is not provided, read the existing key from the database
-			if existing, err := GetProviderById(channel.Id, true); err == nil {
-				keyStr = existing.Key
-			}
+		keyStr := channel.Key
+		if keyStr == "" {
+			keyStr = edit.key
 		}
 		// Parse the key list (supports newline separation or JSON array)
 		keys := []string{}
@@ -582,14 +678,23 @@ func (channel *Provider) Update() error {
 			}
 		}
 	}
-	var err error
-	err = DB.Model(channel).Updates(channel).Error
-	if err != nil {
+	result := edit.tx.Model(channel).Updates(channel)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return gorm.ErrRecordNotFound
+	}
+	if err := edit.tx.First(channel, channel.Id).Error; err != nil {
 		return err
 	}
-	DB.Model(channel).First(channel, "id = ?", channel.Id)
-	err = channel.UpdateAbilities(nil)
-	return err
+	if err := channel.UpdateAbilities(edit.tx); err != nil {
+		return err
+	}
+	if edit.Authorize != nil && !edit.Authorize(edit.tx) {
+		return ErrProviderMutationForbidden
+	}
+	return edit.tx.Commit().Error
 }
 
 func (channel *Provider) UpdateResponseTime(responseTime int64) {
@@ -658,56 +763,68 @@ func CleanupProviderPollingLocks() {
 	})
 }
 
-func handlerMultiKeyUpdate(channel *Provider, usingKey string, status int, reason string) {
+func handlerMultiKeyUpdate(channel *Provider, change ProviderStatusChange) bool {
 	keys := channel.GetKeys()
-	if len(keys) == 0 {
-		channel.Status = status
-	} else {
-		keyIndex := -1
+	keyIndex := -1
+	if change.KeyIndex != nil {
+		index := *change.KeyIndex
+		if index < 0 || index >= len(keys) || keys[index] != change.UsingKey {
+			return false
+		}
+		keyIndex = index
+	} else if change.UsingKey != "" {
 		for i, key := range keys {
-			if key == usingKey {
+			if key == change.UsingKey {
 				keyIndex = i
 				break
 			}
 		}
 		if keyIndex < 0 {
-			if usingKey != "" {
-				common.SysLog(common.LogText("failed to update multi-key status: channel_id=%d, using key not found", channel.Id))
-				return
-			}
-			channel.Status = status
-			info := channel.GetOtherInfo()
-			info["status_reason"] = reason
-			info["status_time"] = common.GetTimestamp()
-			channel.SetOtherInfo(info)
-			return
-		}
-		if channel.ProviderInfo.MultiKeyStatusList == nil {
-			channel.ProviderInfo.MultiKeyStatusList = make(map[int]int)
-		}
-		if status == common.ChannelStatusEnabled {
-			delete(channel.ProviderInfo.MultiKeyStatusList, keyIndex)
-		} else {
-			channel.ProviderInfo.MultiKeyStatusList[keyIndex] = status
-			if channel.ProviderInfo.MultiKeyDisabledReason == nil {
-				channel.ProviderInfo.MultiKeyDisabledReason = make(map[int]string)
-			}
-			if channel.ProviderInfo.MultiKeyDisabledTime == nil {
-				channel.ProviderInfo.MultiKeyDisabledTime = make(map[int]int64)
-			}
-			channel.ProviderInfo.MultiKeyDisabledReason[keyIndex] = reason
-			channel.ProviderInfo.MultiKeyDisabledTime[keyIndex] = common.GetTimestamp()
-		}
-		if !hasEnabledMultiKey(keys, channel.ProviderInfo.MultiKeyStatusList) {
-			channel.Status = common.ChannelStatusAutoDisabled
-			info := channel.GetOtherInfo()
-			info["status_reason"] = ProviderStatusReasonAllKeysDisabled
-			info["status_time"] = common.GetTimestamp()
-			channel.SetOtherInfo(info)
-		} else if status == common.ChannelStatusEnabled {
-			channel.Status = common.ChannelStatusEnabled
+			common.SysLog(common.LogText("failed to update multi-key status: channel_id=%d, using key not found", channel.Id))
+			return false
 		}
 	}
+	if keyIndex >= 0 {
+		if current, exists := channel.ProviderInfo.MultiKeyStatusList[keyIndex]; exists &&
+			(change.Status == common.ChannelStatusAutoDisabled && current != common.ChannelStatusEnabled ||
+				change.Status == common.ChannelStatusEnabled && current == common.ChannelStatusManuallyDisabled) {
+			return false
+		}
+	}
+	if keyIndex < 0 || change.ProviderWide {
+		channel.Status = change.Status
+		info := channel.GetOtherInfo()
+		info["status_reason"] = change.Reason
+		info["status_time"] = common.GetTimestamp()
+		channel.SetOtherInfo(info)
+		return true
+	}
+	if channel.ProviderInfo.MultiKeyStatusList == nil {
+		channel.ProviderInfo.MultiKeyStatusList = make(map[int]int)
+	}
+	if change.Status == common.ChannelStatusEnabled {
+		delete(channel.ProviderInfo.MultiKeyStatusList, keyIndex)
+	} else {
+		channel.ProviderInfo.MultiKeyStatusList[keyIndex] = change.Status
+		if channel.ProviderInfo.MultiKeyDisabledReason == nil {
+			channel.ProviderInfo.MultiKeyDisabledReason = make(map[int]string)
+		}
+		if channel.ProviderInfo.MultiKeyDisabledTime == nil {
+			channel.ProviderInfo.MultiKeyDisabledTime = make(map[int]int64)
+		}
+		channel.ProviderInfo.MultiKeyDisabledReason[keyIndex] = change.Reason
+		channel.ProviderInfo.MultiKeyDisabledTime[keyIndex] = common.GetTimestamp()
+	}
+	if !hasEnabledMultiKey(keys, channel.ProviderInfo.MultiKeyStatusList) {
+		channel.Status = common.ChannelStatusAutoDisabled
+		info := channel.GetOtherInfo()
+		info["status_reason"] = ProviderStatusReasonAllKeysDisabled
+		info["status_time"] = common.GetTimestamp()
+		channel.SetOtherInfo(info)
+	} else if change.Status == common.ChannelStatusEnabled {
+		channel.Status = common.ChannelStatusEnabled
+	}
+	return true
 }
 
 func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
@@ -723,116 +840,174 @@ func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
 	return false
 }
 
-func UpdateProviderStatus(channelId int, usingKey string, status int, reason string) bool {
+var (
+	ErrProviderStatusConflict    = errors.New("provider changed during status update")
+	ErrProviderMutationForbidden = errors.New("Unauthorized, insufficient privileges")
+)
+
+// ProviderStatusChange keeps the failed credential identity separate from the
+// scope of the transition. KeyIndex also pins a credential whose value is empty.
+type ProviderStatusChange struct {
+	Status       int
+	Reason       string
+	UsingKey     string
+	KeyIndex     *int
+	ProviderWide bool
+	Authorize    func(*gorm.DB) bool `json:"-"`
+}
+
+func UpdateProviderStatus(channelId int, usingKey string, status int, reason string, selectedIndex ...int) bool {
+	changed, _ := UpdateProviderStatusWithError(channelId, usingKey, status, reason, selectedIndex...)
+	return changed
+}
+
+// UpdateProviderStatusWithError distinguishes an idempotent no-op from a
+// rejected or failed write so management replies can report the actual outcome.
+func UpdateProviderStatusWithError(channelId int, usingKey string, status int, reason string, selectedIndex ...int) (bool, error) {
+	change := ProviderStatusChange{Status: status, Reason: reason, UsingKey: usingKey}
+	if usingKey != "" && len(selectedIndex) > 0 {
+		change.KeyIndex = &selectedIndex[0]
+	}
+	return ApplyProviderStatus(channelId, change)
+}
+
+// ApplyProviderStatus atomically validates the captured credential and applies
+// either a Key or whole-Provider transition.
+func ApplyProviderStatus(channelId int, change ProviderStatusChange) (bool, error) {
+	status, reason, usingKey := change.Status, change.Reason, change.UsingKey
+	hasCredential := usingKey != "" || change.KeyIndex != nil
 	if common.MemoryCacheEnabled {
 		channelStatusLock.Lock()
 		defer channelStatusLock.Unlock()
 	}
 
-	// ProviderInfo stores both multi-key status and the polling cursor. Hold the
-	// same per-channel lock from the first read through persistence so neither
-	// writer can save a stale JSON snapshot over the other.
 	pollingLock := GetProviderPollingLock(channelId)
 	pollingLock.Lock()
 	defer pollingLock.Unlock()
 
-	if common.MemoryCacheEnabled {
-		channelCache, _ := CacheGetProvider(channelId)
-		if channelCache == nil {
-			return false
-		}
-		if channelCache.ProviderInfo.IsMultiKey {
-			beforeStatus := channelCache.Status
-			// 如果是多Key模式，更新缓存中的状态
-			handlerMultiKeyUpdate(channelCache, usingKey, status, reason)
-			if beforeStatus != channelCache.Status {
-				CacheUpdateProviderStatus(channelId, channelCache.Status)
+	changed := false
+	var beforeProvider, committedProvider *Provider
+	err := providerCredentialSession().Transaction(func(tx *gorm.DB) (err error) {
+		// Validate current caller permissions after any row/ability lock wait,
+		// before committing or publishing an otherwise successful transition.
+		defer func() {
+			if err == nil && change.Authorize != nil && !change.Authorize(tx) {
+				err = ErrProviderMutationForbidden
 			}
-			//CacheUpdateProvider(channelCache)
-			//return true
-		} else {
-			// 如果缓存渠道存在，且状态已是目标状态，直接返回
-			if channelCache.Status == status {
-				return false
-			}
-			CacheUpdateProviderStatus(channelId, status)
+		}()
+		// Keep the stored JSON, including NULL and legacy shapes, for the CAS.
+		// Comparing the decoded/re-encoded ProviderInfo would reject legacy rows.
+		var snapshot struct {
+			Provider
+			StoredInfo *string `gorm:"column:stored_info"`
 		}
-	}
-
-	shouldUpdateAbilities := false
-	defer func() {
-		if shouldUpdateAbilities {
-			err := UpdateAbilityStatus(channelId, status == common.ChannelStatusEnabled)
-			if err != nil {
-				common.SysLog(common.LogText("failed to update ability status: channel_id=%d, error=%v", channelId, err))
-			}
+		if err := tx.Model(&Provider{}).Select(`*, "channel_info"::text AS "stored_info"`).First(&snapshot, "id = ?", channelId).Error; err != nil {
+			return err
 		}
-	}()
-	channel, err := GetProviderById(channelId, true)
-	if err != nil {
-		return false
-	} else {
-		// A manual channel operation must replace the exhaustion reason even
-		// when the status value is already manually disabled.
-		overridesKeyExhaustion := channel.ProviderInfo.IsMultiKey && usingKey == "" &&
+		channel := &snapshot.Provider
+		before := *channel
+		before.ProviderInfo.MultiKeyStatusList = maps.Clone(channel.ProviderInfo.MultiKeyStatusList)
+		beforeProvider = &before
+		committedProvider = channel
+		if status == common.ChannelStatusAutoDisabled && channel.Status != common.ChannelStatusEnabled ||
+			hasCredential && status == common.ChannelStatusEnabled && channel.Status == common.ChannelStatusManuallyDisabled {
+			return nil
+		}
+		beforeStatus, beforeOtherInfo := channel.Status, channel.OtherInfo
+		overridesKeyExhaustion := channel.ProviderInfo.IsMultiKey && !hasCredential &&
 			status == common.ChannelStatusManuallyDisabled && reason != ProviderStatusReasonAllKeysDisabled &&
 			channel.GetOtherInfo()["status_reason"] == ProviderStatusReasonAllKeysDisabled
 		if channel.Status == status && !overridesKeyExhaustion {
-			return false
+			return nil
 		}
 
 		if channel.ProviderInfo.IsMultiKey {
-			beforeStatus := channel.Status
-			handlerMultiKeyUpdate(channel, usingKey, status, reason)
-			if beforeStatus != channel.Status {
-				shouldUpdateAbilities = true
+			if !handlerMultiKeyUpdate(channel, change) {
+				return nil
 			}
 		} else {
+			if hasCredential && (channel.Key != usingKey || change.KeyIndex != nil && *change.KeyIndex != 0) {
+				return nil
+			}
 			info := channel.GetOtherInfo()
 			info["status_reason"] = reason
 			info["status_time"] = common.GetTimestamp()
 			channel.SetOtherInfo(info)
 			channel.Status = status
-			shouldUpdateAbilities = true
 		}
-		err = channel.saveStatusState()
-		if err != nil {
-			common.SysLog(common.LogText("failed to update channel status: channel_id=%d, status=%d, error=%v", channel.Id, status, err))
-			return false
+
+		// PostgreSQL rechecks these conditions after waiting for a concurrent
+		// editor. A stale failure cannot transfer its status to replacement keys
+		// or overwrite another node's key status or polling state.
+		updates := map[string]any{"status": channel.Status, "other_info": channel.OtherInfo}
+		if channel.ProviderInfo.IsMultiKey {
+			updates["channel_info"] = channel.ProviderInfo
 		}
-	}
-	return true
-}
-
-func EnableProviderByTag(tag string) error {
-	err := DB.Model(&Provider{}).Where("tag = ?", tag).Update("status", common.ChannelStatusEnabled).Error
-	if err != nil {
-		return err
-	}
-	err = UpdateAbilityStatusByTag(tag, true)
-	return err
-}
-
-func DisableProviderByTag(tag string) error {
-	// Explicit tag-level disable also cancels automatic restoration for
-	// channels that were already disabled because all keys were unavailable.
-	var channels []Provider
-	if err := DB.Where("tag = ?", tag).Find(&channels).Error; err != nil {
-		return err
-	}
-	for _, channel := range channels {
-		if channel.ProviderInfo.IsMultiKey && channel.GetOtherInfo()["status_reason"] == ProviderStatusReasonAllKeysDisabled {
-			if !UpdateProviderStatus(channel.Id, "", common.ChannelStatusManuallyDisabled, "manual tag operation") {
-				return fmt.Errorf("failed to disable channel #%d by tag", channel.Id)
+		result := tx.Model(&Provider{}).
+			Where(`"id" = ? AND "key" = ? AND "status" = ? AND COALESCE("other_info", '') = ? AND "channel_info"::jsonb IS NOT DISTINCT FROM CAST(? AS jsonb)`,
+				channelId, channel.Key, beforeStatus, beforeOtherInfo, snapshot.StoredInfo).
+			Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrProviderStatusConflict
+		}
+		if beforeStatus != channel.Status {
+			if err := tx.Model(&Ability{}).Where("channel_id = ?", channelId).Update("enabled", channel.Status == common.ChannelStatusEnabled).Error; err != nil {
+				return err
 			}
 		}
-	}
-	err := DB.Model(&Provider{}).Where("tag = ?", tag).Update("status", common.ChannelStatusManuallyDisabled).Error
+		changed = true
+		return nil
+	})
 	if err != nil {
+		common.SysLog(common.LogText("failed to update channel status: channel_id=%d, status=%d, error=%v", channelId, status, err))
+		return false, err
+	}
+	if common.MemoryCacheEnabled && committedProvider != nil {
+		cacheProviderStatusTransition(beforeProvider, committedProvider)
+	}
+	return changed, nil
+}
+
+type ProviderTagStatusError struct {
+	CommittedIDs []int
+	FailedID     int
+	Err          error
+}
+
+func (err *ProviderTagStatusError) Error() string { return err.Err.Error() }
+func (err *ProviderTagStatusError) Unwrap() error { return err.Err }
+
+func EnableProviderByTag(tag string, authorize ...func(*gorm.DB) bool) error {
+	return updateProviderStatusByTag(tag, common.ChannelStatusEnabled, authorize)
+}
+
+func DisableProviderByTag(tag string, authorize ...func(*gorm.DB) bool) error {
+	return updateProviderStatusByTag(tag, common.ChannelStatusManuallyDisabled, authorize)
+}
+
+func updateProviderStatusByTag(tag string, status int, authorize []func(*gorm.DB) bool) error {
+	var ids []int
+	if err := DB.Model(&Provider{}).Where(`"tag" = ?`, tag).Order("id").Pluck("id", &ids).Error; err != nil {
 		return err
 	}
-	err = UpdateAbilityStatusByTag(tag, false)
-	return err
+	change := ProviderStatusChange{Status: status, Reason: "manual tag operation"}
+	if len(authorize) > 0 {
+		change.Authorize = authorize[0]
+	}
+	var committedIDs []int
+	for _, id := range ids {
+		changed, err := ApplyProviderStatus(id, change)
+		if err != nil {
+			return &ProviderTagStatusError{CommittedIDs: committedIDs, FailedID: id, Err: err}
+		}
+		if changed {
+			committedIDs = append(committedIDs, id)
+		}
+	}
+	return nil
 }
 
 func EditProviderByTag(tag string, newTag *string, modelMapping *string, models *string, group *string, priority *int64, weight *uint, paramOverride *string, headerOverride *string) error {
@@ -1014,8 +1189,7 @@ func (channel *Provider) GetSetting() dto.ProviderSettings {
 		err := common.Unmarshal([]byte(*channel.Setting), &setting)
 		if err != nil {
 			common.SysLog(common.LogText("failed to unmarshal setting: channel_id=%d, error=%v", channel.Id, err))
-			channel.Setting = nil // 清空设置以避免后续错误
-			_ = channel.Save()    // 保存修改
+			return dto.ProviderSettings{}
 		}
 	}
 	return setting
@@ -1036,8 +1210,7 @@ func (channel *Provider) GetOtherSettings() dto.ProviderOtherSettings {
 		err := common.UnmarshalJsonStr(channel.OtherSettings, &setting)
 		if err != nil {
 			common.SysLog(common.LogText("failed to unmarshal setting: channel_id=%d, error=%v", channel.Id, err))
-			channel.OtherSettings = "{}" // 清空设置以避免后续错误
-			_ = channel.Save()           // 保存修改
+			setting = dto.ProviderOtherSettings{}
 		}
 	}
 	if preset := common.GetAdvancedCustomPreset(channel.Type); preset != nil {

@@ -8,7 +8,10 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -16,7 +19,10 @@ import (
 
 func TestMultiKeyEnableRestoresOnlyExhaustedChannels(t *testing.T) {
 	previousMaster, previousCache, previousRedis := common.IsMasterNode, common.MemoryCacheEnabled, common.RedisEnabled
+	previousSecret := common.SessionSecret
+	common.SessionSecret = "multi-key-session-fixture-secret"
 	t.Cleanup(func() {
+		common.SessionSecret = previousSecret
 		common.IsMasterNode, common.MemoryCacheEnabled, common.RedisEnabled = previousMaster, previousCache, previousRedis
 	})
 	common.IsMasterNode, common.MemoryCacheEnabled, common.RedisEnabled = false, false, false
@@ -24,10 +30,14 @@ func TestMultiKeyEnableRestoresOnlyExhaustedChannels(t *testing.T) {
 	database := model.UseTestDatabases(t)
 	model.LOG_DB = database
 	common.SetLogDatabaseType(common.DatabaseTypePostgreSQL)
-	require.NoError(t, database.AutoMigrate(&model.Provider{}, &model.Ability{}, &model.User{}, &model.Log{}, &model.AuditLog{}))
-	root := &model.User{Username: "multi-key-review-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled}
+	require.NoError(t, database.AutoMigrate(&model.Provider{}, &model.Ability{}, &model.User{}, &model.UserSession{}, &model.Log{}, &model.AuditLog{}))
+	root := &model.User{Username: "multi-key-review-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AuthVersion: 1}
 	require.NoError(t, database.Create(root).Error)
 	t.Cleanup(func() { require.NoError(t, database.Unscoped().Delete(root).Error) })
+	session, err := service.CreateLoginSession(root.Id, service.VerificationMethodPassword, "127.0.0.1", "multi-key-fixture")
+	require.NoError(t, err)
+	engine := gin.New()
+	engine.POST("/api/channel/multi_key/manage", middleware.AdminAuth(), middleware.RequirePermission(authz.ChannelOperate), ManageMultiKeys)
 
 	for _, cacheEnabled := range []bool{false, true} {
 		for _, action := range []string{"enable_key", "enable_all_keys"} {
@@ -64,12 +74,10 @@ func TestMultiKeyEnableRestoresOnlyExhaustedChannels(t *testing.T) {
 						payload, err := common.Marshal(MultiKeyManageRequest{ChannelId: channel.Id, Action: operation, KeyIndex: common.GetPointer(0)})
 						require.NoError(t, err)
 						recorder := httptest.NewRecorder()
-						c, _ := gin.CreateTestContext(recorder)
-						c.Set("id", root.Id)
-						c.Set("role", common.RoleRootUser)
-						c.Request = httptest.NewRequest(http.MethodPost, "/api/channel/multi_key", bytes.NewReader(payload))
-						c.Request.Header.Set("Content-Type", "application/json")
-						ManageMultiKeys(c)
+						request := httptest.NewRequest(http.MethodPost, "/api/channel/multi_key/manage", bytes.NewReader(payload))
+						request.Header.Set("Content-Type", "application/json")
+						request.Header.Set("Authorization", "Bearer "+session.AccessToken)
+						engine.ServeHTTP(recorder, request)
 						var result struct {
 							Success bool `json:"success"`
 						}

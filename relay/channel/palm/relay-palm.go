@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/tidwall/gjson"
 
 	"github.com/gin-gonic/gin"
 )
@@ -50,17 +51,40 @@ func streamResponsePaLM2OpenAI(palmResponse *PaLMChatResponse) *dto.ChatCompleti
 	return &response
 }
 
+func recordPaLMSource(info *relaycommon.RelayInfo, body []byte) {
+	if info.ResponseFacts == nil {
+		return
+	}
+	var source dto.OpenAITextResponse
+	for _, raw := range gjson.GetBytes(body, "candidates").Array() {
+		var candidate struct {
+			Content string `json:"content"`
+		}
+		if common.UnmarshalJsonStr(raw.Raw, &candidate) != nil {
+			continue
+		}
+		source.Choices = append(source.Choices, dto.OpenAITextResponseChoice{Index: len(source.Choices), Message: dto.Message{Role: "assistant", Content: candidate.Content}})
+	}
+	info.ResponseFacts.RecordChatSource(&source, info.TokenizerModelName())
+}
+
 func palmStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, string) {
 	defer service.CloseResponseBodyGracefully(resp)
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return types.NewError(err, types.ErrorCodeReadResponseBodyFailed), ""
-	}
+	body, readErr := io.ReadAll(resp.Body)
 	var palmResponse PaLMChatResponse
 	if err := common.Unmarshal(body, &palmResponse); err != nil {
+		recordPaLMSource(info, body)
+		if readErr != nil {
+			return types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed), ""
+		}
 		return types.NewError(err, types.ErrorCodeBadResponseBody), ""
 	}
+	if readErr != nil {
+		recordPaLMSource(info, body)
+		return types.NewError(readErr, types.ErrorCodeReadResponseBodyFailed), ""
+	}
 	if resp.StatusCode != http.StatusOK || palmResponse.Error.Code != 0 || len(palmResponse.Candidates) == 0 {
+		recordPaLMSource(info, body)
 		return types.NewError(fmt.Errorf("PaLM response failed"), types.ErrorCodeBadResponse), ""
 	}
 	response := streamResponsePaLM2OpenAI(&palmResponse)
@@ -79,17 +103,19 @@ func palmStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 }
 
 func palmHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
-	}
+	responseBody, readErr := io.ReadAll(resp.Body)
 	service.CloseResponseBodyGracefully(resp)
 	var palmResponse PaLMChatResponse
-	err = common.Unmarshal(responseBody, &palmResponse)
+	err := common.Unmarshal(responseBody, &palmResponse)
 	if err != nil {
+		recordPaLMSource(info, responseBody)
+		if readErr != nil {
+			return nil, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
+		}
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	if palmResponse.Error.Code != 0 || len(palmResponse.Candidates) == 0 {
+		recordPaLMSource(info, responseBody)
 		return nil, types.WithOpenAIError(types.OpenAIError{
 			Message: palmResponse.Error.Message,
 			Type:    palmResponse.Error.Status,
@@ -98,6 +124,10 @@ func palmHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 		}, resp.StatusCode)
 	}
 	fullTextResponse := responsePaLM2OpenAI(&palmResponse)
+	if readErr != nil {
+		recordPaLMSource(info, responseBody)
+		return &fullTextResponse.Usage, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
+	}
 	if info.ResponseFacts != nil {
 		return helper.WriteChatResponse(c, info, resp, fullTextResponse)
 	}

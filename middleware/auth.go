@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
@@ -199,6 +201,65 @@ func GetStepUpIdentity(c *gin.Context) (service.AuthIdentity, bool) {
 	}
 	identity, ok := value.(service.AuthIdentity)
 	return identity, ok && identity.UserID > 0 && identity.SessionID != ""
+}
+
+// AuthorizeDashboardMutation rechecks the original credential and current user
+// under the mutation transaction; it never falls back to another credential.
+func AuthorizeDashboardMutation(tx *gorm.DB, c *gin.Context, permissions ...authz.Permission) bool {
+	raw, ok := authorizationToken(c.GetHeader("Authorization"))
+	if !ok {
+		return false
+	}
+	var user *model.User
+	if c.GetBool("access_token_legacy") {
+		identity, ok := GetAuthIdentity(c)
+		if !ok {
+			return false
+		}
+		var err error
+		user, err = model.ValidateLegacyAccessTokenWithTx(tx, identity, raw)
+		if err != nil {
+			return false
+		}
+	} else {
+		identity, ok := GetStepUpIdentity(c)
+		if !ok || identity.UserID != c.GetInt("id") {
+			return false
+		}
+		tokenID, pat := model.ParseAccessTokenSessionID(identity.SessionID)
+		if !pat {
+			parsed, internal, err := service.ParseDashboardAccessToken(raw)
+			if err != nil || !internal || parsed != identity {
+				return false
+			}
+		}
+		if err := model.ValidateAuthSessionWithTx(tx, identity); err != nil {
+			return false
+		}
+		if pat {
+			var token model.UserAccessToken
+			if err := tx.Where(`"id" = ? AND "user_id" = ?`, tokenID, identity.UserID).First(&token).Error; err != nil {
+				return false
+			}
+			if subtle.ConstantTimeCompare([]byte(token.TokenHash), []byte(model.AccessTokenFingerprint(raw))) != 1 {
+				return false
+			}
+			for _, permission := range permissions {
+				if !service.AccessTokenScopeGranted(token.GetScopes(), service.AccessTokenScopeOf(permission)) {
+					return false
+				}
+			}
+		}
+		user = &model.User{}
+		if err := tx.Select("id", "role", "status").First(user, identity.UserID).Error; err != nil {
+			return false
+		}
+	}
+	c.Set("role", user.Role)
+	if user.Status != common.UserStatusEnabled || user.Role < common.RoleAdminUser {
+		return false
+	}
+	return authz.CanWithTx(tx, user.Id, user.Role, permissions...)
 }
 
 func authenticateDashboardRequest(c *gin.Context) (*model.UserBase, service.AuthIdentity, bool, error) {
@@ -549,6 +610,11 @@ func GatewayTokenAuth() func(c *gin.Context) {
 
 func tokenAuth(walletCredential bool) func(c *gin.Context) {
 	return func(c *gin.Context) {
+		textProtocol, _ := TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
+		if textProtocol != "" && c.GetTime(TextGatewayStartedAtKey).IsZero() {
+			// Freeze request-start prices before credential lookups.
+			c.Set(TextGatewayStartedAtKey, clock.Now())
+		}
 		// 先检测是否为ws
 		applyWebSocketSubprotocolAuthorization(c.Request.Header)
 		// 检查path包含/v1/messages 或 /v1/models
@@ -592,7 +658,7 @@ func tokenAuth(walletCredential bool) func(c *gin.Context) {
 			key = parts[0]
 		}
 		validateToken := model.ValidateUserToken
-		if walletCredential || TextOffering(c) != nil || c.Request.Method == http.MethodPost && c.Request.URL.Path == "/v1/chat/completions" || c.Request.Method == http.MethodGet && (strings.HasPrefix(c.Request.URL.Path, "/v1/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/openai/models")) {
+		if walletCredential || textProtocol != "" || TextOffering(c) != nil || TextOfferingMissing(c) || c.Request.Method == http.MethodGet && (strings.HasPrefix(c.Request.URL.Path, "/v1/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/openai/models")) {
 			validateToken = model.ValidateWalletToken
 		}
 		token, err := validateToken(key)

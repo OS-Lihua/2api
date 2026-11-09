@@ -94,6 +94,14 @@ func GeminiGenerateContentRequestToOpenAIChat(ctx context.Context, geminiRequest
 				}
 				mediaContents = append(mediaContents, mediaContent)
 			} else if part.InlineData != nil || part.FileData != nil {
+				for _, control := range []struct {
+					name  string
+					value []byte
+				}{{"mediaResolution", part.MediaResolution}, {"mediaProcessing", part.MediaProcessing}, {"videoMetadata", part.VideoMetadata}} {
+					if len(control.value) > 0 && string(control.value) != "null" {
+						convdiag.Add(ctx, types.ConversionDiagnostic{Code: "request_parameter_dropped", Path: fmt.Sprintf("contents[%d].parts[%d].%s", contentIndex, partIndex, control.name), Message: "The target request omitted the media processing control", Severity: types.ConversionDiagnosticWarning})
+					}
+				}
 				mediaContent, reason := geminiMediaToChatContent(part.InlineData, part.FileData)
 				if reason != "" {
 					kind := "inlineData"
@@ -120,6 +128,15 @@ func GeminiGenerateContentRequestToOpenAIChat(ctx context.Context, geminiRequest
 				}
 				toolCalls = append(toolCalls, toolCall)
 			} else if part.FunctionResponse != nil {
+				var parts []dto.GeminiPart
+				if len(part.FunctionResponse.Parts) > 0 {
+					if err := kitutil.Unmarshal(part.FunctionResponse.Parts, &parts); err != nil {
+						return nil, fmt.Errorf("invalid Gemini function response parts: %w", err)
+					}
+				}
+				if len(parts) > 0 {
+					convdiag.Add(ctx, types.ConversionDiagnostic{Code: "tool_result_media_dropped", Path: fmt.Sprintf("contents[%d].parts[%d].functionResponse.parts", contentIndex, partIndex), Message: "The target request omitted the tool result media", Severity: types.ConversionDiagnosticWarning})
+				}
 				toolMessage := dto.Message{
 					Role:       "tool",
 					ToolCallId: callHistory.match(part.FunctionResponse),
@@ -162,6 +179,9 @@ func GeminiGenerateContentRequestToOpenAIChat(ctx context.Context, geminiRequest
 		openaiRequest.MaxTokens = kitutil.GetPointer(*geminiRequest.GenerationConfig.MaxOutputTokens)
 	}
 	if len(geminiRequest.GenerationConfig.StopSequences) > 0 {
+		if len(geminiRequest.GenerationConfig.StopSequences) > 4 {
+			convdiag.Add(ctx, types.ConversionDiagnostic{Code: "stop_sequences_truncated", Path: "generationConfig.stopSequences", Message: "The target protocol accepts at most four stop sequences", Severity: types.ConversionDiagnosticWarning})
+		}
 		openaiRequest.Stop = geminiRequest.GenerationConfig.StopSequences[:min(len(geminiRequest.GenerationConfig.StopSequences), 4)]
 	}
 	if geminiRequest.GenerationConfig.CandidateCount != nil {
@@ -226,6 +246,9 @@ func geminiMediaToChatContent(inlineData *dto.GeminiInlineData, fileData *dto.Ge
 		if mimeType == "image/jpg" {
 			mimeType = "image/jpeg"
 		}
+		if strings.HasPrefix(mimeType, "video/") {
+			return dto.MediaContent{Type: dto.ContentTypeVideoUrl, VideoUrl: &dto.MessageVideoUrl{Url: fileData.FileUri}}, ""
+		}
 		if _, supported := chatImageMediaTypes[mimeType]; mimeType != "" && !supported {
 			return dto.MediaContent{}, fmt.Sprintf("Chat Completions content cannot reference a Gemini file of MIME type %q", fileData.MimeType)
 		}
@@ -245,6 +268,8 @@ func geminiMediaToChatContent(inlineData *dto.GeminiInlineData, fileData *dto.Ge
 		}, ""
 	}
 	switch {
+	case strings.HasPrefix(mimeType, "video/"):
+		return dto.MediaContent{Type: dto.ContentTypeVideoUrl, VideoUrl: &dto.MessageVideoUrl{Url: "data:" + mimeType + ";base64," + inlineData.Data}}, ""
 	case strings.HasPrefix(mimeType, "image/"):
 		return dto.MediaContent{}, fmt.Sprintf("Chat Completions content accepts only PNG, JPEG, WebP, and GIF images, not %q", inlineData.MimeType)
 	case mimeType == "application/pdf":

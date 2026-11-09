@@ -45,6 +45,7 @@ export interface RequestLog {
   usage_source?: UsageSource
   group_ratio?: string
   receivable?: MoneyAmount
+  sale_pending?: boolean
   ledger_entry_ids?: string[]
   started_at: number
   ended_at?: number
@@ -52,7 +53,12 @@ export interface RequestLog {
   error_code?: string
 }
 export interface RouteDiagnostics {
-  method: 'single_channel'
+  method: 'single_channel' | 'cost' | 'weight' | 'latency'
+  score?: string
+  estimated_cost?: string
+  estimated_receivable?: string
+  affinity_hit?: boolean
+  loss_fallback?: boolean
   candidate_count: number
   eligible_count: number
   excluded_counts: Record<string, number>
@@ -74,6 +80,8 @@ export interface RequestAttempt {
   member_tier?: number
   purchase_price_version_id?: number
   cost?: MoneyAmount
+  cost_pending?: boolean
+  converted_cost_pending?: boolean
   accounting_fx_rate?: string
   converted_cost?: MoneyAmount
   failover_decision?: string

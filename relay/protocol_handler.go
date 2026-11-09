@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -17,7 +18,9 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	kitreasoning "github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/net/http/httpguts"
 )
@@ -74,6 +77,13 @@ func (a *ChannelAdaptor) ConvertRequest(c *gin.Context, info *relaycommon.RelayI
 	return converted, err
 }
 
+func (a *ChannelAdaptor) FinalizeChatRequest(c *gin.Context, info *relaycommon.RelayInfo, converted any, body []byte) ([]byte, error) {
+	if finalizer, ok := converted.(channel.ChatRequestFinalizer); ok {
+		return finalizer.FinalizeChatRequest(c, info, body)
+	}
+	return body, nil
+}
+
 // PrepareChatRequest runs selected native preparation after the caller reserves
 // funds and freezes purchase prices, before final body/header probes are taken.
 func (a *ChannelAdaptor) PrepareChatRequest(c *gin.Context, info *relaycommon.RelayInfo, converted any, body []byte) ([]byte, error) {
@@ -83,31 +93,114 @@ func (a *ChannelAdaptor) PrepareChatRequest(c *gin.Context, info *relaycommon.Re
 	return body, nil
 }
 
-func (a *ChannelAdaptor) ProjectChatRequest(info *relaycommon.RelayInfo, converted any, public *dto.GeneralOpenAIRequest, body []byte) (*dto.GeneralOpenAIRequest, error) {
-	if projector, ok := converted.(channel.ChatRequestProjector); ok {
-		return projector.ProjectChatRequest(body, *public)
+func (a *ChannelAdaptor) ProjectChatRequest(c *gin.Context, info *relaycommon.RelayInfo, converted any, public *dto.GeneralOpenAIRequest, body []byte) (*dto.GeneralOpenAIRequest, error) {
+	if projector, ok := converted.(channel.NativeRequestProjector); ok {
+		request, err := projector.ProjectNativeRequest(body)
+		if err != nil {
+			return nil, err
+		}
+		request.SetModelName(info.UpstreamModelName)
+		effective, err := service.GatewayChatProjection(c, request)
+		if err != nil {
+			return nil, err
+		}
+		effective.Model = info.UpstreamModelName
+		effective.Stream = common.GetPointer(info.IsStream)
+		return effective, nil
 	}
-	if _, ok := converted.(*dto.GeneralOpenAIRequest); ok {
+	if contract, ok := converted.(channel.NativeChatRequestContract); ok {
+		var err error
+		public, err = channel.ProjectNativeChatParameters(body, *public, converted, contract.ChatRequestCapabilities())
+		if err != nil {
+			return nil, err
+		}
+	}
+	if projector, ok := converted.(channel.ChatRequestProjector); ok {
+		effective, err := projector.ProjectChatRequest(body, *public)
+		if err != nil {
+			return nil, err
+		}
+		if contract, ok := converted.(channel.NativeChatRequestContract); ok && effective.N != nil && *effective.N > 1 {
+			if info.IsStream || !slices.Contains(contract.ChatRequestCapabilities().Parameters, "n") {
+				return nil, errors.New("native Provider cannot represent multiple output choices (n)")
+			}
+		}
+		return effective, nil
+	}
+	switch converted.(type) {
+	case dto.GeneralOpenAIRequest, *dto.GeneralOpenAIRequest:
 		var effective dto.GeneralOpenAIRequest
 		if err := common.Unmarshal(body, &effective); err != nil {
 			return nil, err
 		}
-		return &effective, nil
+		return service.GatewayChatProjection(c, &effective)
 	}
-	if len(info.ParamOverride) > 0 {
-		return nil, errors.New("native request overrides require a wire projection")
+	var native dto.Request
+	switch converted.(type) {
+	case *dto.OpenAIResponsesRequest, dto.OpenAIResponsesRequest:
+		native = &dto.OpenAIResponsesRequest{}
+	case *dto.ClaudeRequest, dto.ClaudeRequest:
+		native = &dto.ClaudeRequest{}
+	case *dto.GeminiChatRequest, dto.GeminiChatRequest:
+		native = &dto.GeminiChatRequest{}
 	}
-	// An unchanged native conversion retains the already validated public facts.
-	effective := *public
-	return &effective, nil
+	if native != nil {
+		if err := common.Unmarshal(body, native); err != nil {
+			return nil, err
+		}
+		effective, err := service.GatewayChatProjection(c, native)
+		if err != nil {
+			return nil, err
+		}
+		if _, gemini := native.(*dto.GeminiChatRequest); gemini {
+			effective.Model = info.UpstreamModelName
+			effective.Stream = common.GetPointer(info.IsStream)
+		}
+		return effective, nil
+	}
+	return nil, errors.New("native request requires an effective wire projection")
 }
 
 func (a *ChannelAdaptor) SetChatOutputLimit(converted any, body []byte, limit uint) ([]byte, error) {
+	if projector, ok := converted.(channel.NativeRequestProjector); ok {
+		request, err := projector.ProjectNativeRequest(body)
+		if err != nil {
+			return nil, err
+		}
+		return a.SetChatOutputLimit(request, body, limit)
+	}
 	if setter, ok := converted.(channel.ChatOutputLimitSetter); ok {
 		return setter.SetChatOutputLimit(body, limit)
 	}
-	if _, ok := converted.(*dto.GeneralOpenAIRequest); !ok {
-		return body, nil
+	field := ""
+	switch converted.(type) {
+	case dto.GeneralOpenAIRequest, *dto.GeneralOpenAIRequest:
+		field = "max_completion_tokens"
+	case dto.ClaudeRequest, *dto.ClaudeRequest:
+		field = "max_tokens"
+		var request dto.ClaudeRequest
+		if err := common.Unmarshal(body, &request); err != nil {
+			return nil, err
+		}
+		if request.Thinking != nil && request.Thinking.Type == "enabled" {
+			intent, _, err := kitreasoning.FromClaude(&request)
+			if err != nil {
+				return nil, err
+			}
+			rendered, err := kitreasoning.RenderClaude(request.Model, intent, &limit, 0)
+			if err != nil {
+				return nil, err
+			}
+			if rendered.MaxTokens != nil || rendered.Thinking == nil || rendered.Thinking.GetBudgetTokens() != request.Thinking.GetBudgetTokens() {
+				return nil, errors.New("output limit cannot preserve the Claude thinking budget")
+			}
+		}
+	case dto.OpenAIResponsesRequest, *dto.OpenAIResponsesRequest:
+		field = "max_output_tokens"
+	case dto.GeminiChatRequest, *dto.GeminiChatRequest:
+		field = "generationConfig"
+	default:
+		return nil, errors.New("native request cannot enforce the output limit")
 	}
 	var wire map[string]common.RawMessage
 	if err := common.Unmarshal(body, &wire); err != nil {
@@ -117,7 +210,23 @@ func (a *ChannelAdaptor) SetChatOutputLimit(converted any, body []byte, limit ui
 	if err != nil {
 		return nil, err
 	}
-	wire["max_completion_tokens"] = encoded
+	if field == "generationConfig" {
+		var config map[string]common.RawMessage
+		if raw := wire[field]; len(raw) > 0 {
+			if err := common.Unmarshal(raw, &config); err != nil {
+				return nil, err
+			}
+		}
+		if config == nil {
+			config = map[string]common.RawMessage{}
+		}
+		config["maxOutputTokens"] = encoded
+		encoded, err = common.Marshal(config)
+		if err != nil {
+			return nil, err
+		}
+	}
+	wire[field] = encoded
 	return common.Marshal(wire)
 }
 
@@ -207,6 +316,32 @@ func (a *ChannelAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 	return a.DoPreparedRequest(c, info, prepared)
 }
 
+// PreviewHeaders builds transient pricing probes without constructing a URL,
+// acquiring account tokens, or preparing an execution.
+func (a *ChannelAdaptor) PreviewHeaders(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (http.Header, []string, error) {
+	if c == nil || c.Request == nil || info == nil || info.ProviderMeta == nil {
+		return nil, nil, errors.New("missing upstream request metadata")
+	}
+	metadata := a.providerMetadata(info)
+	if providerNeedsPayload(a.provider) {
+		payload, err := io.ReadAll(requestBody)
+		if err != nil {
+			return nil, nil, errors.New("could not read upstream request")
+		}
+		metadata.Payload = payload
+	}
+	request := &http.Request{Header: make(http.Header)}
+	if channel.IsNonTextProtocol(a.kind) {
+		request.Header.Set("Content-Type", c.Request.Header.Get("Content-Type"))
+	}
+	channel.ApplyUpstreamBodyMetadata(request, requestBody)
+	deferred, err := a.prepareHeaders(c, info, request, metadata, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	return request.Header.Clone(), deferred, nil
+}
+
 func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (*PreparedChannelRequest, error) {
 	if c == nil || c.Request == nil || info == nil || info.ProviderMeta == nil {
 		return nil, errors.New("missing upstream request metadata")
@@ -258,11 +393,40 @@ func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayI
 		}
 		channel.ApplyUpstreamBodyMetadata(request, requestBody)
 	}
-	if err := a.provider.SetupHeader(c, &request.Header, metadata); err != nil {
+	if _, err := a.prepareHeaders(c, info, request, metadata, false); err != nil {
+		return nil, err
+	}
+	metadata.RequestHeaders = request.Header.Clone()
+	prepared := &PreparedChannelRequest{adaptor: a, request: request, metadata: metadata, body: requestBody}
+	if preparer, ok := a.provider.(channel.ProviderRequestPreparer); ok {
+		execute, err := preparer.PrepareExecution(c, metadata, requestBody)
+		if err != nil || execute == nil {
+			return nil, errors.New("provider execution preparation failed")
+		}
+		prepared.execute = execute
+	}
+	return prepared, nil
+}
+
+func (a *ChannelAdaptor) prepareHeaders(c *gin.Context, info *relaycommon.RelayInfo, request *http.Request, metadata *channel.ProviderRequest, preview bool) ([]string, error) {
+	var deferred []string
+	var err error
+	if projector, ok := a.provider.(channel.ProviderHeaderPreviewer); ok && preview {
+		deferred, err = projector.PreviewHeaders(c, &request.Header, metadata)
+	} else {
+		err = a.provider.SetupHeader(c, &request.Header, metadata)
+	}
+	if err != nil {
 		return nil, errors.New("provider authentication failed")
 	}
 	if err := channel.ApplyHeaderOverride(info, c, request); err != nil {
 		return nil, errors.New("invalid provider header override")
+	}
+	unresolved := deferred[:0]
+	for _, name := range deferred {
+		if _, overridden := request.Header[http.CanonicalHeaderKey(name)]; !overridden {
+			unresolved = append(unresolved, name)
+		}
 	}
 	for name, values := range request.Header {
 		if !httpguts.ValidHeaderFieldName(name) {
@@ -277,16 +441,7 @@ func (a *ChannelAdaptor) PrepareRequest(c *gin.Context, info *relaycommon.RelayI
 	if request.Header.Get("Host") != "" && !httpguts.ValidHostHeader(request.Host) {
 		return nil, errors.New("invalid upstream host override")
 	}
-	metadata.RequestHeaders = request.Header.Clone()
-	prepared := &PreparedChannelRequest{adaptor: a, request: request, metadata: metadata, body: requestBody}
-	if preparer, ok := a.provider.(channel.ProviderRequestPreparer); ok {
-		execute, err := preparer.PrepareExecution(c, metadata, requestBody)
-		if err != nil || execute == nil {
-			return nil, errors.New("provider execution preparation failed")
-		}
-		prepared.execute = execute
-	}
-	return prepared, nil
+	return unresolved, nil
 }
 
 func (a *ChannelAdaptor) DoPreparedRequest(c *gin.Context, info *relaycommon.RelayInfo, prepared *PreparedChannelRequest) (any, error) {

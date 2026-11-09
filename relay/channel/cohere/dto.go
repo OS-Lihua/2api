@@ -1,14 +1,67 @@
 package cohere
 
-import "github.com/QuantumNous/new-api/relaykit/dto"
+import (
+	"fmt"
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/tidwall/sjson"
+)
 
 type CohereRequest struct {
-	Model       string        `json:"model"`
-	ChatHistory []ChatHistory `json:"chat_history"`
-	Message     string        `json:"message"`
-	Stream      bool          `json:"stream"`
-	MaxTokens   uint          `json:"max_tokens"`
-	SafetyMode  string        `json:"safety_mode,omitempty"`
+	Model            string        `json:"model"`
+	ChatHistory      []ChatHistory `json:"chat_history"`
+	Message          string        `json:"message"`
+	Stream           bool          `json:"stream"`
+	MaxTokens        uint          `json:"max_tokens"`
+	Temperature      *float64      `json:"temperature,omitempty"`
+	P                *float64      `json:"p,omitempty"`
+	K                *int          `json:"k,omitempty"`
+	FrequencyPenalty *float64      `json:"frequency_penalty,omitempty"`
+	PresencePenalty  *float64      `json:"presence_penalty,omitempty"`
+	Seed             *float64      `json:"seed,omitempty"`
+	StopSequences    any           `json:"stop_sequences,omitempty"`
+	SafetyMode       string        `json:"safety_mode,omitempty"`
+}
+
+func (*CohereRequest) ChatRequestCapabilities() channel.NativeChatCapabilities {
+	return channel.NativeChatCapabilities{Parameters: []string{"max_tokens", "max_completion_tokens", "temperature", "top_p", "top_k", "frequency_penalty", "presence_penalty", "seed", "stop"}, ContentTypes: []string{dto.ContentTypeText}}
+}
+
+func (r *CohereRequest) ProjectChatRequest(body []byte, public dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error) {
+	var wire CohereRequest
+	if err := common.Unmarshal(body, &wire); err != nil {
+		return nil, err
+	}
+	public.Model, public.Messages = wire.Model, nil
+	for _, message := range wire.ChatHistory {
+		role := "user"
+		if message.Role == "SYSTEM" {
+			role = "system"
+		}
+		if message.Role == "CHATBOT" {
+			role = "assistant"
+		}
+		public.Messages = append(public.Messages, dto.Message{Role: role, Content: message.Message})
+	}
+	public.Messages = append(public.Messages, dto.Message{Role: "user", Content: wire.Message})
+	public.Prompt, public.Input, public.Instruction = nil, nil, ""
+	public.MaxTokens, public.MaxCompletionTokens = nil, &wire.MaxTokens
+	public.Stream, public.N = common.GetPointer(wire.Stream), common.GetPointer(1)
+	public.Temperature, public.TopP, public.TopK = wire.Temperature, wire.P, wire.K
+	public.FrequencyPenalty, public.PresencePenalty, public.Seed, public.Stop = wire.FrequencyPenalty, wire.PresencePenalty, wire.Seed, wire.StopSequences
+	result, err := channel.ProjectChatRequestControls(body, public)
+	if err != nil {
+		return nil, err
+	}
+	if result.N != nil && *result.N > 1 {
+		return nil, fmt.Errorf("Cohere cannot represent multiple output choices (n)")
+	}
+	return result, nil
+}
+
+func (r *CohereRequest) SetChatOutputLimit(body []byte, limit uint) ([]byte, error) {
+	return sjson.SetBytes(body, "max_tokens", limit)
 }
 
 type ChatHistory struct {

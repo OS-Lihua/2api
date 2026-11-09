@@ -20,6 +20,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   PROVIDER_FORM_DEFAULT_VALUES,
+  providerToFormValues,
   toCreateProviderPayload,
   toUpdateProviderPayload,
 } from '../lib/provider-form'
@@ -44,6 +45,24 @@ function provider(isMultiKey: boolean): Provider {
 }
 
 describe('toUpdateProviderPayload', () => {
+  it('loads and persists Provider limits with ordinary metadata edits', () => {
+    const account = {
+      ...provider(false),
+      route_limits: { rpm: 12, tpm: 34000, max_concurrency: 2 },
+    }
+    const values = providerToFormValues(account)
+    expect(values).toMatchObject({
+      rpm: '12',
+      tpm: '34000',
+      max_concurrency: '2',
+    })
+    expect(toUpdateProviderPayload(values, account)).toMatchObject({
+      route_limits: account.route_limits,
+    })
+    expect(
+      toCreateProviderPayload({ ...values, key: 'new-key' }).provider
+    ).toMatchObject({ route_limits: account.route_limits })
+  })
   it('omits the key when the key field is left empty', () => {
     const payload = toUpdateProviderPayload(
       { ...PROVIDER_FORM_DEFAULT_VALUES, name: ' renamed ', key: '  ' },

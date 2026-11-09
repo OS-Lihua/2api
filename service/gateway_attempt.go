@@ -9,9 +9,22 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/channelhealth"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/setting"
 )
+
+// ChannelHealth is initialized after Redis and shared by routing and completion.
+var ChannelHealth = channelhealth.New(nil)
+
+func InitGatewayHealth() {
+	var client = common.RDB
+	if !common.RedisEnabled {
+		client = nil
+	}
+	ChannelHealth = channelhealth.New(client)
+	GatewayRouteQuota = NewGatewayRouteQuota(client)
+}
 
 // GatewayAttemptPolicy bounds actual upstream sends across the whole request.
 // The effective persisted configuration is frozen once per request.
@@ -66,11 +79,15 @@ func ClassifyGatewayFailure(status int, code string, transport, timeout, cancell
 		return GatewayFailure{Class: "account_quota", Switch: true, ExcludeProvider: true}
 	case code == "baidu:110" || code == "baidu:111" || code == "invalid_client" || code == "unauthorized_client" || status == 401 || status == 403 || code == "invalid_api_key" || code == "authentication_error" || kind == "authentication_error":
 		return GatewayFailure{Class: "credentials", Switch: true, ExcludeProvider: true}
+	case status == 200 && code == "gateway_output_limit":
+		return GatewayFailure{Class: "output_limit"}
+	case code == "empty_response":
+		return GatewayFailure{Class: "empty_response", Switch: true}
 	case code == "stream_idle_timeout":
 		return GatewayFailure{Class: "stream_interrupted", Switch: true}
 	case (status == 200 || status == 404) && (code == "model_not_found" || code == "model_not_exist" || code == "not_found_error" || code == "ResourceNotFoundException" || code == "DeploymentNotFound" || strings.HasPrefix(code, "model '") && strings.HasSuffix(code, "' not found") || strings.HasPrefix(code, "model \"") && strings.HasSuffix(code, "\" not found")):
 		return GatewayFailure{Class: "model_not_found", Switch: true}
-	case status == 429 || code == "rate_limit_exceeded" || code == "ThrottlingException":
+	case status == 429 || code == "rate_limit_exceeded" || code == "ThrottlingException" || code == "RequestLimitExceeded" || strings.HasPrefix(code, "RequestLimitExceeded."):
 		return GatewayFailure{Class: "rate_limited", Switch: true}
 	case status == 500 || status == 502 || status == 503 || status == 504 || status == 529 || code == "overloaded" || code == "overloaded_error":
 		return GatewayFailure{Class: "upstream_unavailable", Switch: true}
@@ -141,9 +158,14 @@ func (b *GatewayAttemptBudget) TimedOut() bool {
 }
 
 type GatewayAttemptResult struct {
-	Attempt   *model.GatewayAttempt
-	Failure   GatewayFailure
-	Delivered bool
+	Attempt     *model.GatewayAttempt
+	Failure     GatewayFailure
+	Delivered   bool
+	FirstByte   time.Duration
+	RetryAfter  string
+	HealthLease string
+	// LocalRejection preserves a completed Attempt's costs without penalizing Provider health for a host gate.
+	LocalRejection bool
 	// Skipped excludes a candidate rejected by preparation, without an Attempt.
 	SkippedChannel  int
 	SkippedProvider int
@@ -192,6 +214,13 @@ func RunGatewayAttempts(ctx context.Context, policy GatewayAttemptPolicy, execut
 			break
 		}
 		attempt := result.Attempt
+		action, healthErr := ChannelHealth.Record(context.WithoutCancel(ctx), channelhealth.Sample{
+			AttemptID: attempt.ID, ChannelID: attempt.ChannelID, Success: attempt.Status == "success",
+			ProviderFailure: result.Failure.Switch && !result.LocalRejection, RateLimited: result.Failure.Class == "rate_limited", FirstByte: result.FirstByte, RetryAfter: result.RetryAfter, Lease: result.HealthLease,
+		})
+		if healthErr == nil {
+			attempt.CircuitAction = action
+		}
 		attempt.FailoverDecision, attempt.FailoverReason = "stop", result.Failure.Class
 		if attempt.FailoverReason == "" {
 			attempt.FailoverReason = "completed"

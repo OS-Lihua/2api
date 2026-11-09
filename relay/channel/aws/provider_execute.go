@@ -3,6 +3,7 @@ package aws
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,10 +14,12 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	bedrocktypes "github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/gin-gonic/gin"
 )
 
@@ -46,13 +49,41 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 func (p *Provider) PrepareExecution(c *gin.Context, metadata channel.ProviderMetadata, body io.Reader) (channel.ProviderExecution, error) {
 	request := metadata.ProviderRequest()
 	managed := false
+	var facts *relaycommon.ResponseFacts
 	if c != nil {
 		value, _ := c.Get(string(constant.ContextKeyResponseFacts))
-		facts, _ := value.(*relaycommon.ResponseFacts)
+		facts, _ = value.(*relaycommon.ResponseFacts)
 		managed = facts != nil && facts.OnBusinessOutput != nil
 	}
-	if request.ChannelOtherSettings.AwsApiType == dto.AwsApiTypeMantle {
-		req, err := p.NewMantleRequest(c, metadata, body)
+	payload, err := io.ReadAll(body)
+	if err != nil {
+		return nil, err
+	}
+	mantle := request.ChannelOtherSettings.AwsApiType == dto.AwsApiTypeMantle
+	if request.Protocol == protocol.AnthropicMessages || mantle {
+		claude, err := decodeAwsClaudeRequest(payload)
+		if err != nil {
+			return nil, err
+		}
+		if managed && mantle && (claude.Stream != nil && *claude.Stream) != request.IsStream {
+			return nil, errors.New("AWS Mantle streaming does not match the prepared request")
+		}
+		if managed || mantle {
+			finalized, err := finalizeAwsClaudeBody(payload, request, nil)
+			if err != nil {
+				return nil, err
+			}
+			if managed {
+				if !bytes.Equal(finalized, payload) {
+					return nil, errors.New("AWS Claude body does not match the prepared request")
+				}
+			} else {
+				payload = finalized
+			}
+		}
+	}
+	if mantle {
+		req, err := p.NewMantleRequest(c, metadata, bytes.NewReader(payload))
 		if err != nil {
 			return nil, err
 		}
@@ -91,11 +122,7 @@ func (p *Provider) PrepareExecution(c *gin.Context, metadata channel.ProviderMet
 	if awsModelCanCrossRegion(modelID, regionPrefix) {
 		modelID = awsModelCrossRegion(modelID, regionPrefix)
 	}
-	payload, err := io.ReadAll(body)
-	if err != nil {
-		return nil, err
-	}
-	if !nova {
+	if !nova && !managed {
 		wire, err := formatRequest(bytes.NewReader(payload), request.RequestHeaders)
 		if err != nil {
 			return nil, err
@@ -105,7 +132,7 @@ func (p *Provider) PrepareExecution(c *gin.Context, metadata channel.ProviderMet
 			return nil, err
 		}
 	}
-	prepared := &awsPreparedInvocation{client: client, modelID: modelID, payload: payload, stream: request.IsStream && !nova, managed: managed}
+	prepared := &awsPreparedInvocation{client: client, modelID: modelID, payload: payload, stream: request.IsStream && !nova, managed: managed, facts: facts}
 	if managed {
 		httpClient := client.Options().HTTPClient
 		if base, ok := httpClient.(*http.Client); ok {
@@ -125,7 +152,21 @@ type awsPreparedInvocation struct {
 	payload []byte
 	stream  bool
 	managed bool
+	facts   *relaycommon.ResponseFacts
 	options []func(*bedrockruntime.Options)
+}
+
+func (prepared *awsPreparedInvocation) failure(ctx context.Context, err error, operation string) *types.NewAPIError {
+	if prepared.facts != nil {
+		var source interface{ HTTPResponse() *smithyhttp.Response }
+		if errors.As(err, &source) {
+			response := source.HTTPResponse()
+			if response != nil && response.Response != nil {
+				prepared.facts.UpstreamRetryAfter = response.Header.Get("Retry-After")
+			}
+		}
+	}
+	return newAwsInvokeError(ctx, err, operation)
 }
 
 func (prepared *awsPreparedInvocation) execute(c *gin.Context) (*http.Response, error) {
@@ -136,9 +177,26 @@ func (prepared *awsPreparedInvocation) execute(c *gin.Context) (*http.Response, 
 	ctx, cancel := newAwsInvokeContext(parent, prepared.managed)
 	if !prepared.stream {
 		defer cancel()
-		output, err := prepared.client.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{ModelId: aws.String(prepared.modelID), ContentType: aws.String("application/json"), Accept: aws.String("application/json"), Body: prepared.payload}, prepared.options...)
+		options := append([]func(*bedrockruntime.Options){}, prepared.options...)
+		var capture *awsJSONResponseCapture
+		if prepared.managed {
+			capture = &awsJSONResponseCapture{}
+			options = append(options, func(options *bedrockruntime.Options) {
+				capture.client = options.HTTPClient
+				options.HTTPClient = capture
+			})
+		}
+		output, err := prepared.client.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{ModelId: aws.String(prepared.modelID), ContentType: aws.String("application/json"), Accept: aws.String("application/json"), Body: prepared.payload}, options...)
+		if capture != nil && capture.response != nil && (capture.readErr != nil || err != nil) {
+			if err != nil {
+				if body, ok := capture.response.Body.(*awsJSONSourceBody); ok {
+					body.failure = prepared.failure(parent, err, "InvokeModel")
+				}
+			}
+			return capture.response, nil
+		}
 		if err != nil {
-			return nil, newAwsInvokeError(parent, err, "InvokeModel")
+			return nil, prepared.failure(parent, err, "InvokeModel")
 		}
 		response := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(output.Body))}
 		response.Header.Set("Content-Type", "application/json")
@@ -147,7 +205,7 @@ func (prepared *awsPreparedInvocation) execute(c *gin.Context) (*http.Response, 
 	output, err := prepared.client.InvokeModelWithResponseStream(ctx, &bedrockruntime.InvokeModelWithResponseStreamInput{ModelId: aws.String(prepared.modelID), ContentType: aws.String("application/json"), Accept: aws.String("application/json"), Body: prepared.payload}, prepared.options...)
 	if err != nil {
 		cancel()
-		return nil, newAwsInvokeError(parent, err, "InvokeModelWithResponseStream")
+		return nil, prepared.failure(parent, err, "InvokeModelWithResponseStream")
 	}
 	stream := output.GetStream()
 	reader, writer := io.Pipe()

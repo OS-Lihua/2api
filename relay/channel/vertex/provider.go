@@ -1,9 +1,14 @@
 package vertex
 
 import (
+	"context"
+	"errors"
+
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/gin-gonic/gin"
 	"net/http"
 	"strings"
@@ -12,9 +17,25 @@ import (
 type Provider struct {
 	RequestMode        int
 	AccountCredentials Credentials
+	accessToken        string
 }
 
 var _ channel.ProviderAdapter = (*Provider)(nil)
+var _ channel.ProviderHeaderPreviewer = (*Provider)(nil)
+var _ channel.ProviderAccountPreparer = (*Provider)(nil)
+
+func (a *Provider) PrepareAccount(ctx context.Context, metadata channel.ProviderMetadata, begin func() (context.Context, error)) error {
+	info := metadata.ProviderRequest()
+	if info.ChannelOtherSettings.VertexKeyType == dto.VertexKeyTypeAPIKey {
+		return nil
+	}
+	if err := common.Unmarshal([]byte(info.ApiKey), &a.AccountCredentials); err != nil {
+		return errors.New("failed to decode credentials file")
+	}
+	var err error
+	a.accessToken, err = getProviderAccessTokenWithContext(ctx, a, info, begin)
+	return err
+}
 
 func (a *Provider) initRequestMode(info *channel.ProviderRequest) {
 	if info.Protocol != "" {
