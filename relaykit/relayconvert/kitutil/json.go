@@ -7,6 +7,7 @@ package kitutil
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"unsafe"
 )
@@ -33,6 +34,19 @@ func (stdCodec) Unmarshal(data []byte, v any) error {
 	return json.Unmarshal(data, v)
 }
 
+func (stdCodec) UnmarshalUseNumber(data []byte, v any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(v); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return fmt.Errorf("expected a single JSON value")
+	}
+	return nil
+}
+
 func (stdCodec) Decode(r io.Reader, v any) error {
 	return json.NewDecoder(r).Decode(v)
 }
@@ -57,6 +71,15 @@ func SetCodec(c Codec) {
 
 func Unmarshal(data []byte, v any) error {
 	return codec.Unmarshal(data, v)
+}
+
+// UnmarshalUseNumber preserves exact literals in open JSON objects such as
+// native tool inputs. A host codec may supply the same decoder capability.
+func UnmarshalUseNumber(data []byte, v any) error {
+	if numeric, ok := codec.(interface{ UnmarshalUseNumber([]byte, any) error }); ok {
+		return numeric.UnmarshalUseNumber(data, v)
+	}
+	return (stdCodec{}).UnmarshalUseNumber(data, v)
 }
 
 func UnmarshalJsonStr(data string, v any) error {

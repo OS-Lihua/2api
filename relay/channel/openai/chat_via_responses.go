@@ -46,15 +46,6 @@ func OaiResponsesToChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
-	if facts := info.ResponseFacts; facts != nil && info.RelayFormat == types.RelayFormatOpenAI {
-		chat, ok := responseValue.(*dto.OpenAITextResponse)
-		if !ok {
-			return usage, types.NewOpenAIError(fmt.Errorf("invalid converted chat response"), types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
-		}
-		facts.PromptTokensReported, facts.CompletionTokensReported = relaycommon.NativeUsagePresence(body, "usage.input_tokens", "usage.output_tokens", "usage.total_tokens")
-		facts.UsageReported = facts.PromptTokensReported && facts.CompletionTokensReported
-		return helper.WriteChatResponse(c, info, resp, chat)
-	}
 	responseBody, err := common.Marshal(responseValue)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeJsonMarshalFailed, http.StatusInternalServerError)

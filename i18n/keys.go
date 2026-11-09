@@ -6,6 +6,21 @@ package i18n
 
 // Errors returned to AI clients
 const (
+	MsgGatewayAuthorizationUnavailable = "gateway.authorization_unavailable"
+	MsgGatewayModelNotFound            = "gateway.model_not_found"
+	MsgGatewayInvalidTextRequest       = "gateway.invalid_text_request"
+	MsgGatewayCannotConvertRequest     = "gateway.cannot_convert_request"
+	MsgGatewayUnsupportedCapabilities  = "gateway.unsupported_capabilities"
+	MsgGatewayChannelPriceUnavailable  = "gateway.channel_price_unavailable"
+	MsgGatewayChannelUnavailable       = "gateway.channel_unavailable"
+	MsgGatewayModelPriceUnavailable    = "gateway.model_price_unavailable"
+	MsgGatewayInsufficientBalance      = "gateway.insufficient_balance"
+	MsgGatewayBillingUnavailable       = "gateway.billing_unavailable"
+	MsgGatewayUpstreamRequestFailed    = "gateway.upstream_request_failed"
+	MsgGatewayInvalidUpstreamResponse  = "gateway.invalid_upstream_response"
+	MsgGatewayUpstreamResponseFailed   = "gateway.upstream_response_failed"
+	MsgGatewayUnsupportedParameters    = "gateway.unsupported_parameters"
+
 	MsgDatabaseError          = "common.database_error"
 	MsgAuthUserBanned         = "auth.user_banned"
 	MsgTokenGetInfoFailed     = "token.get_info_failed"

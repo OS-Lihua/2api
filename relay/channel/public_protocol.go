@@ -14,6 +14,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// ResponseErrorCarrier preserves a transport adapter's failure while the
+// protocol extracts received source usage before returning that failure.
+type ResponseErrorCarrier interface {
+	ResponseError() *types.NewAPIError
+}
+
 // PublicProtocol applies the shared normalization for the selected public DTO.
 // Explicit scalar zero values remain present on the new protocol path.
 type PublicProtocol struct {
@@ -63,6 +69,17 @@ func (p *PublicProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayI
 	}
 	return request, nil
 }
+func (p *PublicProtocol) DoNativeResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, wire ProtocolHandler) (any, *types.NewAPIError) {
+	gateway, ok := p.Handler.(NativeResponseGateway)
+	if !ok {
+		return nil, types.NewError(fmt.Errorf("public protocol cannot present a native response"), types.ErrorCodeBadResponse)
+	}
+	if info.ChannelSetting.ThinkingToContent {
+		info.ThinkingContentInfo = relaycommon.ThinkingContentInfo{IsFirstThinkingContent: true}
+	}
+	return gateway.DoNativeResponse(c, resp, info, wire)
+}
+
 func (p *PublicProtocol) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
 	if info.ChannelSetting.ThinkingToContent {
 		info.ThinkingContentInfo = relaycommon.ThinkingContentInfo{IsFirstThinkingContent: true}

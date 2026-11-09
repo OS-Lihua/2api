@@ -381,6 +381,8 @@ func TokenOperationAudit() gin.HandlerFunc {
 			if c.Query("status_only") != "" {
 				action, content = "token.status_update", "API token status update"
 			}
+		case "PUT /api/token/:id/permissions", "PATCH /api/token/:id/permissions":
+			action, content = "token.permissions.update", "API token permission update"
 		case "DELETE /api/token/:id":
 			action, content = "token.delete", "API token deletion"
 		case "POST /api/token/batch":

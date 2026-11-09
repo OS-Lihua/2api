@@ -143,9 +143,6 @@ func GetAndValidateResponsesRequest(c *gin.Context) (*dto.OpenAIResponsesRequest
 	if request.Model == "" {
 		return nil, errors.New("model is required")
 	}
-	if request.Input == nil {
-		return nil, errors.New("input is required")
-	}
 	if ExceedsMaxTokensLimit(request.MaxOutputTokens) {
 		return nil, errors.New("max_output_tokens is invalid")
 	}
@@ -349,7 +346,7 @@ func GetAndValidateTextRequest(c *gin.Context, relayMode int) (*dto.GeneralOpenA
 // forwarding, including a Channel's parameter overrides.
 const MaxChatCompletionsN = 128
 
-func ValidateTextRequest(c *gin.Context, textRequest *dto.GeneralOpenAIRequest, relayMode int) (*dto.GeneralOpenAIRequest, error) {
+func ValidateTextRequest(c *gin.Context, textRequest *dto.GeneralOpenAIRequest, relayMode int, nativeProjection ...bool) (*dto.GeneralOpenAIRequest, error) {
 	if textRequest.N != nil && (*textRequest.N < 1 || *textRequest.N > MaxChatCompletionsN) {
 		return nil, errors.New("n is invalid")
 	}
@@ -391,7 +388,7 @@ func ValidateTextRequest(c *gin.Context, textRequest *dto.GeneralOpenAIRequest, 
 	case relayconstant.RelayModeChatCompletions:
 		// For FIM (Fill-in-the-middle) requests with prefix/suffix, messages is optional
 		// It will be filled by provider-specific adaptors if needed (e.g., SiliconFlow)。Or it is allowed by model vendor(s) (e.g., DeepSeek)
-		if len(textRequest.Messages) == 0 && textRequest.Prefix == nil && textRequest.Suffix == nil {
+		if len(textRequest.Messages) == 0 && textRequest.Prefix == nil && textRequest.Suffix == nil && (len(nativeProjection) == 0 || !nativeProjection[0]) {
 			return nil, errors.New("field messages is required")
 		}
 	case relayconstant.RelayModeEmbeddings:

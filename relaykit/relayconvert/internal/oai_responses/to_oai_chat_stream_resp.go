@@ -21,6 +21,7 @@ type ResponsesToChatStreamState struct {
 	sentStart                  bool
 	finalized                  bool
 	hasSentText                bool
+	refusalParts               map[string]string
 	sentAnnotationCount        int
 	sawToolCall                bool
 	hasSentReasoning           bool
@@ -99,7 +100,19 @@ func ResponsesStreamEventToChatChunks(event *dto.ResponsesStreamResponse, state 
 		}
 		return nil, nil
 	case responsesEventOutputTextDelta:
-		return state.textDelta(event.Delta), nil
+		return state.textDelta(event.Delta, false), nil
+	case "response.refusal.delta":
+		return state.refusalDelta(event, event.Delta, true), nil
+	case "response.refusal.done":
+		if event.Refusal != nil {
+			return state.refusalDelta(event, *event.Refusal, false), nil
+		}
+		return nil, nil
+	case "response.content_part.added", "response.content_part.done":
+		if event.Part != nil && event.Part.Type == "refusal" && event.Part.Refusal != nil {
+			return state.refusalDelta(event, *event.Part.Refusal, false), nil
+		}
+		return nil, nil
 	case responsesEventOutputTextAnnotationAdded:
 		return state.annotationRawDelta(event.Annotation)
 	case responsesEventOutputItemAdded, responsesEventOutputItemDone:
@@ -166,16 +179,45 @@ func (s *ResponsesToChatStreamState) ensureStart() []dto.ChatCompletionsStreamRe
 	}, nil)}
 }
 
-func (s *ResponsesToChatStreamState) textDelta(delta string) []dto.ChatCompletionsStreamResponse {
+func (s *ResponsesToChatStreamState) refusalDelta(event *dto.ResponsesStreamResponse, text string, delta bool) []dto.ChatCompletionsStreamResponse {
+	if s.refusalParts == nil {
+		s.refusalParts = map[string]string{}
+	}
+	index, part := 0, 0
+	if event.OutputIndex != nil {
+		index = *event.OutputIndex
+	}
+	if event.ContentIndex != nil {
+		part = *event.ContentIndex
+	}
+	key := fmt.Sprintf("%d/%d", index, part)
+	previous := s.refusalParts[key]
+	if delta {
+		s.refusalParts[key] = previous + text
+	} else if strings.HasPrefix(text, previous) {
+		s.refusalParts[key] = text
+		text = text[len(previous):]
+	} else if strings.Contains(previous, text) {
+		return nil
+	} else {
+		s.refusalParts[key] = previous + text
+	}
+	return s.textDelta(text, true)
+}
+
+func (s *ResponsesToChatStreamState) textDelta(delta string, refusal bool) []dto.ChatCompletionsStreamResponse {
 	if delta == "" {
 		return nil
 	}
 	s.usageText.WriteString(delta)
-	s.hasSentText = true
+	value := dto.ChatCompletionsStreamResponseChoiceDelta{Content: &delta}
+	if refusal {
+		value.Content, value.Refusal = nil, &delta
+	} else {
+		s.hasSentText = true
+	}
 	chunks := s.ensureStart()
-	chunks = append(chunks, s.makeChunk(dto.ChatCompletionsStreamResponseChoiceDelta{
-		Content: &delta,
-	}, nil))
+	chunks = append(chunks, s.makeChunk(value, nil))
 	return chunks
 }
 
@@ -191,21 +233,17 @@ func (s *ResponsesToChatStreamState) terminalOutputChunks(response *dto.OpenAIRe
 	for i := range response.Output {
 		out := &response.Output[i]
 		switch {
-		case out.Type == responsesOutputTypeMessage && !hadSentText:
+		case out.Type == responsesOutputTypeMessage:
 			var text strings.Builder
-			for _, c := range out.Content {
-				if c.Type == "output_text" && c.Text != "" {
-					text.WriteString(c.Text)
+			for partIndex, content := range out.Content {
+				if !hadSentText && content.Type == "output_text" {
+					text.WriteString(content.Text)
+				}
+				if content.Type == "refusal" && content.Refusal != nil {
+					chunks = append(chunks, s.refusalDelta(&dto.ResponsesStreamResponse{OutputIndex: kitutil.GetPointer(i), ContentIndex: kitutil.GetPointer(partIndex)}, *content.Refusal, false)...)
 				}
 			}
-			chunks = append(chunks, s.textDelta(text.String())...)
-			annotationChunks, err := s.remainingAnnotationChunks(out, annotationOffset)
-			if err != nil {
-				return nil, err
-			}
-			chunks = append(chunks, annotationChunks...)
-			annotationOffset += responsesOutputAnnotationCount(out)
-		case out.Type == responsesOutputTypeMessage:
+			chunks = append(chunks, s.textDelta(text.String(), false)...)
 			annotationChunks, err := s.remainingAnnotationChunks(out, annotationOffset)
 			if err != nil {
 				return nil, err

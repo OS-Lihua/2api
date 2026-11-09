@@ -51,7 +51,8 @@ func (p *tencentProtocol) ConvertRequest(c *gin.Context, info *relaycommon.Relay
 }
 func (p *tencentProtocol) DoResponse(c *gin.Context, response *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
 	if strings.Contains(info.ApiKey, "|") {
-		return p.native.DoResponse(c, response, info)
+		wire := channel.WireProtocol{Kind: p.kind, Public: p.public, Wire: p.native, ReportsGatewayFacts: true}
+		return wire.DoResponse(c, response, info)
 	}
 	return p.public.DoResponse(c, response, info)
 }

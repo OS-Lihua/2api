@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -63,9 +64,11 @@ var defaultPluginDispatcher = &pluginRouteDispatcher{registry: jsplugin.DefaultR
 // pluginHandoffRoutes are the host routes that offer matching requests to the
 // plugin routes before their own handlers run, so a plugin route may overlap
 // them: GET /v1/videos/:task_id offers a task to its own plugin's query route
-// (handOffNativeTaskQuery) and the Gemini relay offers :predictLongRunning.
+// (handOffNativeTaskQuery), Gemini discovery offers native operation queries,
+// and the Gemini relay offers :predictLongRunning.
 var pluginHandoffRoutes = map[string]struct{}{
 	http.MethodGet + " /v1/videos/:task_id":   {},
+	http.MethodGet + " /v1beta/models/*model": {},
 	http.MethodPost + " /v1beta/models/*path": {},
 }
 
@@ -641,6 +644,29 @@ func parseRoutePattern(routePath string) []routePatternSegment {
 		})
 	}
 	return segments
+}
+
+func routeMatchesPath(pattern, escapedPath string) bool {
+	segments := parseRoutePattern(pattern)
+	index := 0
+	for encodedPart := range strings.SplitSeq(strings.TrimPrefix(escapedPath, "/"), "/") {
+		part, err := url.PathUnescape(encodedPart)
+		if err != nil {
+			return false
+		}
+		if index >= len(segments) {
+			return false
+		}
+		segment := segments[index]
+		if segment.catchAll {
+			return true
+		}
+		if segment.dynamic && part == "" || !segment.dynamic && segment.value != part {
+			return false
+		}
+		index++
+	}
+	return index == len(segments)
 }
 
 func routePatternsIntersect(leftPath, rightPath string) bool {

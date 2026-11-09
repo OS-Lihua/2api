@@ -248,7 +248,7 @@ func GetTokenUsage(c *gin.Context) {
 	}
 	tokenKey := parts[1]
 
-	token, err := model.GetTokenByKey(strings.TrimPrefix(tokenKey, "sk-"), false)
+	token, err := model.GetTokenCredential(strings.TrimPrefix(tokenKey, "sk-"))
 	if err != nil {
 		common.SysError(common.LogText("failed to get token by key: %s", err.Error()))
 		common.ApiErrorI18n(c, i18n.MsgTokenGetInfoFailed)
