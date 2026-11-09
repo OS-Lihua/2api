@@ -254,57 +254,69 @@ func CountGatewayMediaInput(c *gin.Context, request dto.Request, info *relaycomm
 // Uploaded audio duration is measured before reservation; no request duration or
 // output ceiling is accepted as actual usage.
 func GatewayMediaCapabilitiesMatch(c *gin.Context, kind protocol.Type, request dto.Request, caps capability.Set, inputTokens int, facts *relaycommon.ResponseFacts) bool {
+	return ValidateGatewayMediaCapabilities(c, kind, request, caps, inputTokens, facts) == nil
+}
+
+// ValidateGatewayMediaCapabilities identifies the control excluded by the
+// declared capabilities without exposing Channel configuration.
+func ValidateGatewayMediaCapabilities(c *gin.Context, kind protocol.Type, request dto.Request, caps capability.Set, inputTokens int, facts *relaycommon.ResponseFacts) error {
 	if request.IsStream(c.Request) && !slices.Contains(caps.Features, capability.Streaming) {
-		return false
+		return types.NewMediaParameterError("stream", "media_capability_mismatch")
 	}
 	input, output := capability.Text, capability.Image
 	switch kind {
 	case protocol.OpenAIImages:
 		image, ok := request.(*dto.ImageRequest)
 		if !ok {
-			return false
+			return types.NewMediaParameterError("request", "media_parameters_unrepresentable")
 		}
 		count, err := image.ImageCount(false)
 		if err != nil || caps.Limits.MaxImages != nil && int64(count) > *caps.Limits.MaxImages {
-			return false
+			return types.NewMediaParameterError("n", "media_capability_limit_exceeded")
 		}
 		inputs, err := gatewayImageInputs(c, image, "")
 		if err != nil {
-			return false
+			return types.NewMediaParameterError("images", "media_input_unsupported")
 		}
 		images := len(inputs)
-		if images > dto.MaxImageN || images > 0 && !slices.Contains(caps.InputModalities, capability.Image) || caps.Limits.MaxImages != nil && int64(images) > *caps.Limits.MaxImages {
-			return false
+		if images > dto.MaxImageN || caps.Limits.MaxImages != nil && int64(images) > *caps.Limits.MaxImages {
+			return types.NewMediaParameterError("images", "media_capability_limit_exceeded")
+		}
+		if images > 0 && !slices.Contains(caps.InputModalities, capability.Image) {
+			return types.NewMediaParameterError("images", "media_capability_mismatch")
 		}
 	case protocol.OpenAIAudioSpeech:
 		if caps.Limits.MaxDurationSeconds != nil {
-			return false
+			return types.NewMediaParameterError("duration", "media_control_unsupported")
 		}
 		if facts != nil && facts.AudioInputSeconds != nil && !slices.Contains(caps.InputModalities, capability.Audio) {
-			return false
+			return types.NewMediaParameterError("ref_audio", "media_capability_mismatch")
 		}
 		output = capability.Audio
 	case protocol.OpenAIAudioTranscription:
 		if audio, ok := request.(*dto.AudioRequest); ok && audio.Prompt != nil && *audio.Prompt != "" && !slices.Contains(caps.InputModalities, capability.Text) {
-			return false
+			return types.NewMediaParameterError("prompt", "media_capability_mismatch")
 		}
 		input, output = capability.Audio, capability.Text
 	default:
-		return false
+		return types.NewMediaParameterError("request", "media_parameters_unrepresentable")
 	}
-	if !slices.Contains(caps.InputModalities, input) || !slices.Contains(caps.OutputModalities, output) {
-		return false
+	if !slices.Contains(caps.InputModalities, input) {
+		return types.NewMediaParameterError("input", "media_capability_mismatch")
+	}
+	if !slices.Contains(caps.OutputModalities, output) {
+		return types.NewMediaParameterError("response_format", "media_capability_mismatch")
 	}
 	if caps.Limits.ContextLength != nil && int64(inputTokens) > *caps.Limits.ContextLength {
-		return false
+		return types.NewMediaParameterError("input", "media_capability_limit_exceeded")
 	}
 	if facts != nil && facts.AudioInputSeconds != nil && caps.Limits.MaxDurationSeconds != nil {
 		seconds, err := decimal.NewFromString(*facts.AudioInputSeconds)
 		if err != nil || seconds.IsNegative() || seconds.GreaterThan(decimal.NewFromInt(*caps.Limits.MaxDurationSeconds)) {
-			return false
+			return types.NewMediaParameterError("file", "media_capability_limit_exceeded")
 		}
 	}
-	return true
+	return nil
 }
 
 const gatewayMediaContextKey = "gateway_prepared_media"

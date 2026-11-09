@@ -4,16 +4,34 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strings"
 
 	"github.com/MoeForge/moego/ojson"
 
 	"github.com/QuantumNous/new-api/common"
+	channelconstant "github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
-type speechRequestBody struct{ io.Reader }
+type speechRequestBody struct {
+	io.Reader
+	query, submit bool
+}
 
-func (speechRequestBody) ProjectAudioRequest(body []byte, public dto.AudioRequest) (*dto.AudioRequest, error) {
+// The default V1 service supports HTTP query and WebSocket submit. Explicit
+// proxy endpoints keep their selected transport.
+func speechTransports(baseURL string) (query, submit bool) {
+	if baseURL == "" || baseURL == channelconstant.GetChannelBaseURL(channelconstant.ChannelTypeVolcEngine) {
+		return true, true
+	}
+	if strings.HasPrefix(baseURL, "ws://") || strings.HasPrefix(baseURL, "wss://") {
+		return false, true
+	}
+	return true, false
+}
+
+func (p speechRequestBody) ProjectAudioRequest(body []byte, public dto.AudioRequest) (*dto.AudioRequest, error) {
 	if public.HasSpeechConditioning() {
 		return nil, fmt.Errorf("Volcengine speech cannot preserve the requested conditioning inputs")
 	}
@@ -27,14 +45,17 @@ func (speechRequestBody) ProjectAudioRequest(body []byte, public dto.AudioReques
 		}
 	}
 	if len(public.MaxNewTokens) > 0 || ojson.GetBytes(body, "max_new_tokens").Exists() || ojson.GetBytes(body, "request.max_new_tokens").Exists() {
-		return nil, fmt.Errorf("Volcengine speech cannot enforce an output token limit")
+		return nil, types.NewMediaParameterError("max_new_tokens", "media_output_limit_unsupported")
 	}
 	var wire VolcengineTTSRequest
 	if err := common.Unmarshal(body, &wire); err != nil {
 		return nil, err
 	}
-	if wire.Request.Model != public.Model || wire.Request.Text == "" || wire.Request.Operation != "submit" || wire.Audio.Rate != 24000 || wire.Audio.VoiceType == "" {
+	if wire.Request.Model != public.Model || wire.Request.Text == "" || wire.Audio.Rate != 24000 || wire.Audio.VoiceType == "" {
 		return nil, fmt.Errorf("invalid Volcengine speech parameters")
+	}
+	if wire.Request.Operation != "query" && wire.Request.Operation != "submit" || wire.Request.Operation == "query" && !p.query || wire.Request.Operation == "submit" && !p.submit || wire.Audio.Encoding == "wav" && wire.Request.Operation != "query" {
+		return nil, types.NewMediaParameterError("response_format", "media_format_unsupported")
 	}
 	if _, err := (speechRequestBody{}).MinimumAudioOutputTokens(body); err != nil {
 		return nil, err
@@ -142,7 +163,7 @@ func (speechRequestBody) MinimumAudioOutputTokens(body []byte) (int, error) {
 		speed = 1
 	}
 	if math.IsNaN(speed) || math.IsInf(speed, 0) || speed < minSpeed || speed > maxSpeed {
-		return 0, fmt.Errorf("Volcengine speech speed is unsupported for the selected voice")
+		return 0, types.NewMediaParameterError("speed", "media_control_unsupported")
 	}
 	if wire.Request.SilenceDuration == nil {
 		if wire.Request.EnableTrailingSilenceAudio != nil && *wire.Request.EnableTrailingSilenceAudio {

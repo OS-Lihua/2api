@@ -6,6 +6,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
 func (imageRequestPayload) ProjectImageRequest(body []byte, public dto.ImageRequest) (*dto.ImageRequest, error) {
@@ -20,6 +21,10 @@ func (imageRequestPayload) ProjectImageRequest(body []byte, public dto.ImageRequ
 		Model      string   `json:"req_key"`
 		Prompt     string   `json:"prompt"`
 		N          *uint    `json:"n"`
+		Width      *int     `json:"width"`
+		Height     *int     `json:"height"`
+		UseSR      *bool    `json:"use_sr"`
+		ReturnURL  *bool    `json:"return_url"`
 		ImageURLs  []string `json:"image_urls"`
 		BinaryData []string `json:"binary_data_base64"`
 	}
@@ -37,6 +42,30 @@ func (imageRequestPayload) ProjectImageRequest(body []byte, public dto.ImageRequ
 		if strings.TrimSpace(input) == "" {
 			return nil, fmt.Errorf("invalid Jimeng image input")
 		}
+	}
+	// V2.1_L dimensions are before super resolution; omitted use_sr is true.
+	// https://www.volcengine.com/docs/85621/1537648
+	width, height := 512, 512
+	if wire.Width != nil {
+		width = *wire.Width
+	}
+	if wire.Height != nil {
+		height = *wire.Height
+	}
+	if width < 256 || width > 768 || height < 256 || height > 768 {
+		return nil, types.NewMediaParameterError("size", "media_format_unsupported")
+	}
+	factor := 1
+	if wire.UseSR == nil || *wire.UseSR {
+		factor = 2
+	}
+	public.Size = fmt.Sprintf("%dx%d", width*factor, height*factor)
+	if wire.ReturnURL == nil {
+		return nil, types.NewMediaParameterError("response_format", "media_format_unsupported")
+	}
+	public.ResponseFormat = "b64_json"
+	if *wire.ReturnURL {
+		public.ResponseFormat = "url"
 	}
 	public.Image = nil
 	public.Images, err = common.Marshal(inputs)

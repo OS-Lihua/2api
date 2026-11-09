@@ -71,6 +71,14 @@ func convertTTSRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.
 	voiceType := mapVoiceType(request.Voice)
 	speedRatio := lo.FromPtrOr(request.Speed, 1.0)
 	encoding := mapEncoding(request.ResponseFormat)
+	query, submit := speechTransports(info.ChannelBaseUrl)
+	operation := "query"
+	if submit && encoding != "wav" {
+		operation = "submit"
+	}
+	if encoding == "wav" && !query {
+		return nil, types.NewMediaParameterError("response_format", "media_format_unsupported")
+	}
 
 	c.Set(contextKeyResponseFormat, encoding)
 
@@ -88,7 +96,7 @@ func convertTTSRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.
 		Request: VolcengineTTSReqInfo{
 			ReqID:     generateRequestID(),
 			Text:      request.Input,
-			Operation: "submit",
+			Operation: operation,
 			Model:     info.OriginModelName,
 		},
 	}
@@ -293,7 +301,7 @@ func (a *Provider) RequestURL(metadata channel.ProviderMetadata) (string, error)
 			return fmt.Sprintf("%s/api/v3/responses", baseUrl), nil
 		case constant.RelayModeAudioSpeech:
 			if baseUrl == channelconstant.GetChannelBaseURL(channelconstant.ChannelTypeVolcEngine) {
-				return "wss://openspeech.bytedance.com/api/v1/tts/ws_binary", nil
+				return defaultSpeechWebSocketURL, nil
 			}
 			return fmt.Sprintf("%s/v1/audio/speech", baseUrl), nil
 		default:

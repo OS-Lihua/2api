@@ -17,6 +17,7 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/shopspring/decimal"
 )
 
@@ -253,6 +254,9 @@ func ValidateGatewayMediaMultipliers(body []byte, declared ...capability.Limits)
 					return fmt.Errorf("%s exceeds numeric precision limits", name)
 				}
 				if number.LessThan(minimum) || number.GreaterThan(decimal.NewFromInt(ceiling)) {
+					if len(declared) == 1 {
+						return types.NewMediaParameterError(name, "media_capability_limit_exceeded")
+					}
 					return fmt.Errorf("%s is outside the media request limit", name)
 				}
 				if name != "speed" && name != "duration" && name != "seconds" && name != "duration_seconds" && name != "silence_duration" && !number.Equal(number.Truncate(0)) {

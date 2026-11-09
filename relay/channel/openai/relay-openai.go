@@ -132,6 +132,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 						reportedStreamUsage = &dto.Usage{}
 					}
 					if err == nil && common.Unmarshal(encoded, reportedStreamUsage) == nil {
+						info.ResponseFacts.RecordTokenDetailPresence(common.StringToByteSlice(data), "usage")
 						reportedStreamUsage.TotalTokens = reportedStreamUsage.PromptTokens + reportedStreamUsage.CompletionTokens
 						info.ResponseFacts.PromptTokensReported = info.ResponseFacts.PromptTokensReported || prompt
 						info.ResponseFacts.CompletionTokensReported = info.ResponseFacts.CompletionTokensReported || completion
@@ -347,6 +348,7 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	}
 
 	if info.ResponseFacts != nil {
+		info.ResponseFacts.RecordTokenDetailPresence(responseBody, "usage")
 		info.ResponseFacts.PromptTokensReported, info.ResponseFacts.CompletionTokensReported = relaycommon.ChatUsagePresence(responseBody)
 		info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
 	}

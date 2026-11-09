@@ -7,6 +7,7 @@ import (
 	"maps"
 	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -45,7 +46,7 @@ type mediaGatewayRun struct {
 	record                                 *model.GatewayRequest
 	reservation, saleSource                money.Amount
 	status                                 int
-	code                                   string
+	code, message                          string
 	evaluationFailed, saleEvaluationFailed bool
 	saleUsage                              *dto.Usage
 	attemptUsage                           map[string]*dto.Usage
@@ -163,6 +164,9 @@ func MediaGateway(c *gin.Context) {
 	}
 	if run.status != 0 && c.Request.Context().Err() == nil {
 		message := i18n.T(c, i18n.MsgGatewayMediaRequestFailed)
+		if run.message != "" {
+			message = run.message
+		}
 		if c.Writer.Written() && strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream") {
 			_ = helper.ObjectData(c, gin.H{"error": types.OpenAIError{Code: run.code, Type: "gateway_error", Message: message}})
 		} else if !c.Writer.Written() {
@@ -179,11 +183,33 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		return result
 	}
 	candidates := map[int]*gatewayPreparedMedia{}
+	var rejections []types.ConversionDiagnostic
 	selection, err := service.SelectGatewayRoute(c, run.offering, service.GatewayRouteInput{
 		Protocol: run.parsed.Protocol, Sale: run.sale, SaleFX: run.saleFX, Ratio: run.ratio, StartedAt: run.started, Failures: exclusions,
 		Prepare: func(selection *service.GatewaySelection) (*service.GatewayRouteFacts, error) {
 			prepared, err := prepareGatewayMediaRoute(c, selection, run.parsed, run.started, run.id, mean)
 			if err != nil {
+				var loss *types.ConversionLossError
+				if errors.As(err, &loss) {
+					for _, diagnostic := range loss.Diagnostics {
+						switch diagnostic.Path {
+						case "request", "input", "file", "image", "images", "mask", "n", "batch_size", "batch_count", "num_images", "num_outputs", "samplecount", "sample_count", "max_images", "prompt", "max_new_tokens", "max_tokens", "max_output_tokens", "max_completion_tokens", "maxoutputtokens", "duration", "seconds", "duration_seconds", "silence_duration", "sample_rate", "width", "height", "size", "quality", "response_format", "voice", "speed", "stream", "stream_format", "ref_audio", "ref_text", "metadata":
+						default:
+							continue
+						}
+						switch diagnostic.Code {
+						case "media_output_limit_unsupported", "media_capability_limit_exceeded", "media_format_unsupported", "media_input_unsupported", "media_control_unsupported", "media_parameters_unrepresentable", "media_capability_mismatch":
+						default:
+							continue
+						}
+						if len(rejections) >= 10 || slices.ContainsFunc(rejections, func(existing types.ConversionDiagnostic) bool {
+							return existing.Path == diagnostic.Path && existing.Code == diagnostic.Code
+						}) {
+							continue
+						}
+						rejections = append(rejections, types.ConversionDiagnostic{Path: diagnostic.Path, Code: diagnostic.Code, Message: i18n.T(c, "gateway."+diagnostic.Code), Severity: types.ConversionDiagnosticError})
+					}
+				}
 				return nil, err
 			}
 			if run.record != nil {
@@ -203,6 +229,9 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		run.status, run.code = 503, "channel_unavailable"
 		if errors.Is(err, service.ErrGatewayCapability) || errors.Is(err, service.ErrGatewayConversion) {
 			run.status, run.code = 400, "unsupported_parameter"
+			if len(rejections) > 0 {
+				run.message = (&service.GatewayConversionError{Diagnostics: rejections}).Error()
+			}
 		}
 		if errors.Is(err, service.ErrGatewayPriceUnavailable) {
 			run.code = "price_unavailable"

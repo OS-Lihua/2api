@@ -5,12 +5,16 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
 // imagenRequest retains the native Imagen wire shape and its quantity contract.
 type imagenRequest dto.GeminiImageRequest
 
 func (imagenRequest) ProjectImageRequest(body []byte, public dto.ImageRequest) (*dto.ImageRequest, error) {
+	if public.ResponseFormat != "" && public.ResponseFormat != "b64_json" {
+		return nil, types.NewMediaParameterError("response_format", "media_format_unsupported")
+	}
 	for _, input := range []common.RawMessage{public.Image, public.Images, public.Mask} {
 		if len(input) > 0 && string(input) != "null" {
 			return nil, fmt.Errorf("Imagen generation does not support image or mask inputs")

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"errors"
 	"maps"
 	"slices"
 	"strings"
@@ -87,29 +88,42 @@ func prepareGatewayMediaRoute(c *gin.Context, selection *service.GatewaySelectio
 	info.ResponseFacts = &relaycommon.ResponseFacts{}
 	common.SetContextKey(candidate, constant.ContextKeyResponseFacts, info.ResponseFacts)
 	common.SetContextKey(candidate, constant.ContextKeyOriginalModel, info.TokenizerModel)
-	if !service.GatewayMediaCapabilitiesMatch(candidate, parsed.Protocol, parsed.Request, selection.Capabilities, 0, nil) {
-		return nil, service.ErrGatewayCapability
+	if err := service.ValidateGatewayMediaCapabilities(candidate, parsed.Protocol, parsed.Request, selection.Capabilities, 0, nil); err != nil {
+		return nil, errors.Join(service.ErrGatewayCapability, err)
 	}
-	if helper.ValidateGatewayMediaMultipliers(parsed.Input.Body, selection.Capabilities.Limits) != nil {
-		return nil, service.ErrGatewayCapability
+	if err := helper.ValidateGatewayMediaMultipliers(parsed.Input.Body, selection.Capabilities.Limits); err != nil {
+		return nil, errors.Join(service.ErrGatewayCapability, err)
 	}
 	originalInput, err := service.CountGatewayMediaInput(candidate, parsed.Request, info)
-	if err != nil || !service.GatewayMediaCapabilitiesMatch(candidate, parsed.Protocol, parsed.Request, selection.Capabilities, originalInput, info.ResponseFacts) {
-		return nil, service.ErrGatewayCapability
+	if err != nil {
+		return nil, errors.Join(service.ErrGatewayCapability, types.NewMediaParameterError("input", "media_input_unsupported"))
+	}
+	if err := service.ValidateGatewayMediaCapabilities(candidate, parsed.Protocol, parsed.Request, selection.Capabilities, originalInput, info.ResponseFacts); err != nil {
+		return nil, errors.Join(service.ErrGatewayCapability, err)
 	}
 	prepared, err := adaptor.PrepareMediaWire(candidate, info, parsed)
 	if err != nil {
-		return nil, service.ErrGatewayCapability
+		var diagnostic *types.ConversionLossError
+		if !errors.As(err, &diagnostic) {
+			err = types.NewMediaParameterError("request", "media_parameters_unrepresentable")
+		}
+		return nil, errors.Join(service.ErrGatewayCapability, err)
 	}
 	if prepared.OriginalRequest != nil {
 		originalInput, err := service.CountGatewayMediaInput(candidate, prepared.OriginalRequest, info)
-		if err != nil || !service.GatewayMediaCapabilitiesMatch(candidate, parsed.Protocol, prepared.OriginalRequest, selection.Capabilities, originalInput, info.ResponseFacts) {
-			return nil, service.ErrGatewayCapability
+		if err != nil {
+			return nil, errors.Join(service.ErrGatewayCapability, types.NewMediaParameterError("input", "media_input_unsupported"))
+		}
+		if err := service.ValidateGatewayMediaCapabilities(candidate, parsed.Protocol, prepared.OriginalRequest, selection.Capabilities, originalInput, info.ResponseFacts); err != nil {
+			return nil, errors.Join(service.ErrGatewayCapability, err)
 		}
 	}
 	input, err := service.CountGatewayMediaInput(candidate, prepared.Request, info)
-	if err != nil || !service.GatewayMediaCapabilitiesMatch(candidate, parsed.Protocol, prepared.Request, selection.Capabilities, input, info.ResponseFacts) {
-		return nil, service.ErrGatewayCapability
+	if err != nil {
+		return nil, errors.Join(service.ErrGatewayCapability, types.NewMediaParameterError("input", "media_input_unsupported"))
+	}
+	if err := service.ValidateGatewayMediaCapabilities(candidate, parsed.Protocol, prepared.Request, selection.Capabilities, input, info.ResponseFacts); err != nil {
+		return nil, errors.Join(service.ErrGatewayCapability, err)
 	}
 	selection.InputTokens = input
 	limits := selection.Capabilities.Limits
@@ -120,15 +134,17 @@ func prepareGatewayMediaRoute(c *gin.Context, selection *service.GatewaySelectio
 		}
 	}
 	if limits.MaxOutputTokens != nil && parsed.Protocol != protocol.OpenAIAudioSpeech {
-		return nil, service.ErrGatewayCapability
+		return nil, errors.Join(service.ErrGatewayCapability, types.NewMediaParameterError("max_new_tokens", "media_output_limit_unsupported"))
 	}
 	if audio, ok := prepared.Request.(*dto.AudioRequest); ok && parsed.Protocol == protocol.OpenAIAudioSpeech && len(audio.MaxNewTokens) == 0 && limits.MaxOutputTokens != nil {
 		if err := adaptor.SetMediaOutputLimit(prepared, *limits.MaxOutputTokens); err != nil {
-			return nil, service.ErrGatewayCapability
+			return nil, errors.Join(service.ErrGatewayCapability, err)
 		}
 	}
-	if len(prepared.Input.Body) > 0 && helper.ValidateGatewayMediaMultipliers(prepared.Input.Body, limits) != nil {
-		return nil, service.ErrGatewayCapability
+	if len(prepared.Input.Body) > 0 {
+		if err := helper.ValidateGatewayMediaMultipliers(prepared.Input.Body, limits); err != nil {
+			return nil, errors.Join(service.ErrGatewayCapability, err)
+		}
 	}
 	info.SetEstimatePromptTokens(input)
 	mean = max(mean, int64(prepared.MinimumOutputTokens))

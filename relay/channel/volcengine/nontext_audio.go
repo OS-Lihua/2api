@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
@@ -25,7 +26,11 @@ import (
 // WebSocket connection belong to Provider.
 type ttsProtocol struct{}
 
-const contextKeyDecodedSpeechResponse = "volcengine_decoded_speech_response"
+const (
+	contextKeyDecodedSpeechResponse = "volcengine_decoded_speech_response"
+	defaultSpeechWebSocketURL       = "wss://openspeech.bytedance.com/api/v1/tts/ws_binary"
+	defaultSpeechHTTPURL            = "https://openspeech.bytedance.com/api/v1/tts"
+)
 
 func (p *ttsProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInfo, request any) (any, error) {
 	r, ok := request.(dto.AudioRequest)
@@ -37,13 +42,19 @@ func (p *ttsProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInfo
 		return nil, err
 	}
 	if info.ResponseFacts != nil {
-		return speechRequestBody{body}, nil
+		query, submit := speechTransports(info.ChannelBaseUrl)
+		return speechRequestBody{Reader: body, query: query, submit: submit}, nil
 	}
 	return body, nil
 }
 
 func (p *ttsProtocol) DoResponse(c *gin.Context, response *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
 	encoding := c.GetString(contextKeyResponseFormat)
+	if info.ResponseFacts != nil {
+		if request, ok := info.Request.(*dto.AudioRequest); ok {
+			encoding = mapEncoding(request.ResponseFormat)
+		}
+	}
 	_, socketBody := response.Body.(*ttsSocketBody)
 	if !socketBody && !c.GetBool(contextKeyDecodedSpeechResponse) {
 		return handleTTSResponse(c, response, info, encoding)
@@ -155,6 +166,9 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 	destination, err := p.RequestURL(metadata)
 	if err != nil {
 		return nil, err
+	}
+	if ojson.GetBytes(payload, "request.operation").Str == "query" && destination == defaultSpeechWebSocketURL {
+		destination = defaultSpeechHTTPURL
 	}
 	if !strings.HasPrefix(destination, "ws://") && !strings.HasPrefix(destination, "wss://") {
 		upstream, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, destination, bytes.NewReader(payload))

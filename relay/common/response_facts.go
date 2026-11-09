@@ -1,13 +1,15 @@
 package common
 
 import (
+	"bytes"
+	"strings"
+
 	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
-	"strings"
 )
 
 // ChatUsagePresence reports bounded base counters independently. A reported
@@ -249,6 +251,66 @@ func SanitizeNativeUsage(body []byte, path string) []byte {
 	return body
 }
 
+// RecordTokenDetailPresence preserves independently valid modality reports,
+// including zero, without assigning presence to an absent detail.
+func (facts *ResponseFacts) RecordTokenDetailPresence(body []byte, usagePath string) {
+	if facts == nil {
+		return
+	}
+	if usagePath != "" {
+		usagePath += "."
+	}
+	for _, detail := range []struct {
+		path     string
+		reported *bool
+	}{
+		{"prompt_tokens_details.audio_tokens", &facts.AudioInputTokensReported},
+		{"input_tokens_details.audio_tokens", &facts.AudioInputTokensReported},
+		{"input_token_details.audio_tokens", &facts.AudioInputTokensReported},
+		{"prompt_tokens_details.image_tokens", &facts.ImageInputTokensReported},
+		{"input_tokens_details.image_tokens", &facts.ImageInputTokensReported},
+		{"input_token_details.image_tokens", &facts.ImageInputTokensReported},
+		{"completion_tokens_details.audio_tokens", &facts.AudioOutputTokensReported},
+		{"output_tokens_details.audio_tokens", &facts.AudioOutputTokensReported},
+		{"completion_tokens_details.image_tokens", &facts.ImageOutputTokensReported},
+		{"output_tokens_details.image_tokens", &facts.ImageOutputTokensReported},
+	} {
+		path := usagePath + detail.path
+		present, _ := NativeUsagePresence(body, path, "", "")
+		if present {
+			raw := ojson.GetBytes(body, path)
+			end := raw.Index + len(raw.Raw)
+			if raw.Index < 0 || end > len(body) {
+				continue
+			}
+			tail := bytes.TrimLeft(body[end:], " \r\n\t")
+			present = len(tail) > 0 && (tail[0] == ',' || tail[0] == '}')
+		}
+		*detail.reported = *detail.reported || present
+	}
+	for _, group := range []struct {
+		path         string
+		audio, image *bool
+	}{
+		{"promptTokensDetails", &facts.AudioInputTokensReported, &facts.ImageInputTokensReported},
+		{"candidatesTokensDetails", &facts.AudioOutputTokensReported, &facts.ImageOutputTokensReported},
+	} {
+		for _, detail := range ojson.GetBytes(body, usagePath+group.path).Array() {
+			var count int64
+			raw := detail.Get("tokenCount")
+			if raw.Type != ojson.Number || common.UnmarshalJsonStr(raw.Raw, &count) != nil || count < 0 || count > 1<<31-1 {
+				continue
+			}
+			switch detail.Get("modality").Str {
+			case "AUDIO":
+				*group.audio = true
+			case "IMAGE":
+				*group.image = true
+			}
+		}
+	}
+}
+
 // RecordUsage merges independently reported base counters, including explicit
 // zero. Missing or invalid fields cannot erase an earlier valid stream counter.
 func (facts *ResponseFacts) RecordUsage(usage, reported *dto.Usage, prompt, completion bool) {
@@ -272,6 +334,9 @@ func (facts *ResponseFacts) RecordUsage(usage, reported *dto.Usage, prompt, comp
 // RecordNativeUsage retains independently valid base counters before decoding
 // a provider envelope or reporting its transport error.
 func (facts *ResponseFacts) RecordNativeUsage(usage *dto.Usage, body []byte, promptPath, completionPath string) {
+	if index := strings.LastIndexByte(promptPath, '.'); index >= 0 {
+		facts.RecordTokenDetailPresence(body, promptPath[:index])
+	}
 	prompt, completion := NativeUsagePresence(body, promptPath, completionPath, "")
 	reported := dto.Usage{}
 	if prompt {

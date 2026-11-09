@@ -4,7 +4,9 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relay/channel"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -150,6 +152,11 @@ func (a *gatewayUsageAccumulator) Observe(body []byte) (*dto.Usage, error) {
 		usage.CompletionTokens = max(usage.CompletionTokens, known)
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	if a.context != nil {
+		if facts, ok := common.GetContextKeyType[*relaycommon.ResponseFacts](a.context, constant.ContextKeyResponseFacts); ok {
+			facts.RecordTokenDetailPresence(encoded, "")
+		}
+	}
 	return usage, nil
 }
 

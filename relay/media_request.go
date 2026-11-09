@@ -16,6 +16,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/gin-gonic/gin"
 )
@@ -57,7 +58,7 @@ func (a *ChannelAdaptor) PrepareMediaRequest(c *gin.Context, info *relaycommon.R
 func (a *ChannelAdaptor) SetMediaOutputLimit(prepared *PreparedMediaRequest, limit int64) error {
 	request, ok := prepared.Request.(*dto.AudioRequest)
 	if a.kind != protocol.OpenAIAudioSpeech || !ok || prepared.nativeAudio || !prepared.vllmSpeech || limit <= 0 {
-		return fmt.Errorf("speech output limit cannot be sent to this Channel")
+		return types.NewMediaParameterError("max_new_tokens", "media_output_limit_unsupported")
 	}
 	var fields map[string]common.RawMessage
 	if err := common.Unmarshal(prepared.Body, &fields); err != nil {
@@ -301,7 +302,7 @@ func (a *ChannelAdaptor) PrepareMediaWire(c *gin.Context, info *relaycommon.Rela
 		if a.kind == protocol.OpenAIAudioSpeech && len(effective.MaxNewTokens) > 0 {
 			var limit uint
 			if !result.vllmSpeech || common.Unmarshal(effective.MaxNewTokens, &limit) != nil || limit == 0 {
-				return nil, fmt.Errorf("speech output limit is not supported by this Channel")
+				return nil, types.NewMediaParameterError("max_new_tokens", "media_output_limit_unsupported")
 			}
 		}
 		result.Request = &effective
