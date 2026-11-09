@@ -6579,7 +6579,8 @@ func TestMediaGatewayMissingImageOutputUsageEstimatesOrStaysPending(t *testing.T
 					return
 				}
 				saleTokens := tc.tokens
-				if tc.partial || tc.upstreamShort && !tc.reported {
+				deliveredEstimate := tc.partial || tc.upstreamShort && (!tc.reported || tc.tokens > 0)
+				if deliveredEstimate {
 					saleTokens = 272
 				}
 				assert.Equal(t, saleTokens, record.Usage.CompletionTokens)
@@ -6589,7 +6590,7 @@ func TestMediaGatewayMissingImageOutputUsageEstimatesOrStaysPending(t *testing.T
 				}
 				assert.Equal(t, expectedOutput, record.Usage.ImageOutputTokens)
 				expectedAttemptOutput := expectedOutput
-				if tc.partial {
+				if tc.partial || tc.upstreamShort && tc.reported {
 					expectedAttemptOutput = new(tc.tokens)
 				}
 				if tc.costUnknown {
@@ -6618,7 +6619,9 @@ func TestMediaGatewayMissingImageOutputUsageEstimatesOrStaysPending(t *testing.T
 					require.NoError(t, err)
 					assert.EqualValues(t, 1_000_000_000-saleNanos, wallet.Balance.Nanos)
 				}
-				if tc.reported {
+				if deliveredEstimate {
+					assert.Equal(t, "estimated", record.UsageSource)
+				} else if tc.reported {
 					assert.Equal(t, "upstream", record.UsageSource)
 				} else if tc.tokens > 0 {
 					assert.Equal(t, "estimated", record.UsageSource)
@@ -17426,7 +17429,7 @@ func (w *mediaFrameFailureWriter) Write(body []byte) (int, error) {
 			return 0, io.ErrClosedPipe
 		}
 	}
-	if strings.HasPrefix(text, "data: ") {
+	if strings.HasPrefix(text, "data: ") || strings.Contains(text, "\ndata: ") {
 		frames := strings.Count(text, `"type":"image_generation.completed"`) + strings.Count(text, `"type":"speech.audio.delta"`)
 		previous := w.frames
 		w.frames += frames
