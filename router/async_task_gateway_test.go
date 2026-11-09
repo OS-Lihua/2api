@@ -648,6 +648,72 @@ func TestAsyncTaskFailoverAndConcurrentCompletionChargeOnce(t *testing.T) {
 	}
 }
 
+func TestAsyncTaskTriesAffordableCandidateBeforeReserving(t *testing.T) {
+	for _, affordable := range []bool{true, false} {
+		t.Run(fmt.Sprintf("affordable=%t", affordable), func(t *testing.T) {
+			var firstCalls, secondSubmissions atomic.Int32
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				firstCalls.Add(1)
+				w.WriteHeader(http.StatusServiceUnavailable)
+			})
+			require.NoError(t, model.DB.Model(fixture.offering).Update("route_method", "weight").Error)
+			second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method == http.MethodGet {
+					_, _ = io.WriteString(w, `{"id":"funded-job","status":"completed","seconds":"4"}`)
+					return
+				}
+				secondSubmissions.Add(1)
+				var body map[string]any
+				if !assert.NoError(t, common.DecodeJson(r.Body, &body)) {
+					return
+				}
+				assert.Equal(t, "4", fmt.Sprint(body["seconds"]))
+				_, _ = io.WriteString(w, `{"id":"funded-job","status":"queued"}`)
+			}))
+			t.Cleanup(second.Close)
+			provider := &model.Provider{Name: "Affordable task account", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Key: "affordable-provider-key", BaseURL: &second.URL}
+			require.NoError(t, model.DB.Create(provider).Error)
+			overrides := `{}`
+			if affordable {
+				overrides = `{"seconds":"4"}`
+			}
+			channel := &model.Channel{ProviderID: provider.Id, ModelID: fixture.channel.ModelID, Protocol: "task:sora", UpstreamModelName: "sora-2", MappingConfirmed: true, Status: model.ChannelEnabled, Weight: 1, ParameterOverrides: overrides}
+			require.NoError(t, model.DB.Create(channel).Error)
+			require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: channel.ID, Currency: "USD", Expression: `tier("video", u("seconds") * 0.05)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"12"}`)
+			assert.Zero(t, firstCalls.Load(), "insufficient funds must not contact the first Provider")
+			if !affordable {
+				require.Equal(t, http.StatusPaymentRequired, response.Code, response.Body.String())
+				assert.Zero(t, secondSubmissions.Load())
+				var count int64
+				require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Count(&count).Error)
+				assert.Zero(t, count)
+				require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&count).Error)
+				assert.Zero(t, count)
+				return
+			}
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.EqualValues(t, 1, secondSubmissions.Load())
+			service.RunTaskPollingOnce(t.Context(), nil)
+			service.RunTaskPollingOnce(t.Context(), nil)
+			requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.EqualValues(t, 360000000, requests[0].Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), requests[0].ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, channel.ID, attempts[0].ChannelID)
+			assert.EqualValues(t, 200000000, attempts[0].Cost.Nanos)
+			assertTextGatewayLedger(t, requests[0], 200000000)
+			var reservations int64
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id = ? AND type = ?", requests[0].ID, model.LedgerEntryPreConsume).Count(&reservations).Error)
+			assert.EqualValues(t, 1, reservations)
+		})
+	}
+}
+
 func TestAsyncTaskFreezesSaleAndPurchaseFX(t *testing.T) {
 	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

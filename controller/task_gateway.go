@@ -227,8 +227,8 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 				record, pending = nil, nil
 				lastStatus, lastCode = 503, "task_persistence_failed"
 				if errors.Is(err, model.ErrInsufficientWalletBalance) {
+					// The shared preflight exclusions can try a smaller reservation.
 					lastStatus, lastCode = 402, "insufficient_balance"
-					result.Failure = service.GatewayFailure{Class: "insufficient_balance"}
 				}
 				return
 			}
