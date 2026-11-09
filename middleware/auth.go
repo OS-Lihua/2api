@@ -602,19 +602,22 @@ func TokenAuth() func(c *gin.Context) {
 	return tokenAuth(false)
 }
 
-// GatewayTokenAuth verifies credentials before Offering resolution without using
-// retired integer quota. A legacy fallback must check its quota before dispatch.
+// GatewayTokenAuth selects wallet credentials only for stateless text HTTP and
+// model discovery. A configured legacy fallback still checks quota before dispatch.
 func GatewayTokenAuth() func(c *gin.Context) {
-	return tokenAuth(true)
-}
-
-func tokenAuth(walletCredential bool) func(c *gin.Context) {
 	return func(c *gin.Context) {
 		textProtocol, _ := TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
 		if textProtocol != "" && c.GetTime(TextGatewayStartedAtKey).IsZero() {
 			// Freeze request-start prices before credential lookups.
 			c.Set(TextGatewayStartedAtKey, clock.Now())
 		}
+		discovery := c.Request.Method == http.MethodGet && (strings.HasPrefix(c.Request.URL.Path, "/v1/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/openai/models"))
+		tokenAuth(textProtocol != "" || discovery)(c)
+	}
+}
+
+func tokenAuth(walletCredential bool) func(c *gin.Context) {
+	return func(c *gin.Context) {
 		// 先检测是否为ws
 		applyWebSocketSubprotocolAuthorization(c.Request.Header)
 		// 检查path包含/v1/messages 或 /v1/models
@@ -658,7 +661,7 @@ func tokenAuth(walletCredential bool) func(c *gin.Context) {
 			key = parts[0]
 		}
 		validateToken := model.ValidateUserToken
-		if walletCredential || textProtocol != "" || TextOffering(c) != nil || TextOfferingMissing(c) || c.Request.Method == http.MethodGet && (strings.HasPrefix(c.Request.URL.Path, "/v1/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/openai/models")) {
+		if walletCredential || TextOffering(c) != nil || TextOfferingMissing(c) {
 			validateToken = model.ValidateWalletToken
 		}
 		token, err := validateToken(key)
