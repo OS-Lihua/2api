@@ -117,6 +117,7 @@ type RelayInfo struct {
 	InputAudioFormat          string
 	OutputAudioFormat         string
 	RealtimeTools             []dto.RealTimeTool
+	RealtimeResponseSucceeded bool                                                `json:"-"`
 	RealtimeRequestHandler    func([]byte) ([]byte, *types.NewAPIError)           `json:"-"`
 	RealtimeResponseHandler   func(*RealtimeResponseFacts) *types.NewAPIError     `json:"-"`
 	RealtimeEventHandler      func([]byte) ([]byte, [][]byte, *types.NewAPIError) `json:"-"`

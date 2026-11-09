@@ -185,6 +185,9 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 	if tieredOk {
 		quota = tieredQuota
 	}
+	if usePrice && !relayInfo.RealtimeResponseSucceeded {
+		quota = 0
+	}
 
 	totalTokens := usage.TotalTokens
 	var logContent []*common.Message

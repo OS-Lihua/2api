@@ -2470,8 +2470,9 @@ func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
 	for _, tc := range []struct {
 		name                                      string
 		tools, malformed, before, fixed, lowFunds bool
+		terminal                                  string
 	}{
-		{name: "text"}, {name: "tools", tools: true}, {name: "text_error", malformed: true}, {name: "tools_error", tools: true, malformed: true}, {name: "no_generation_error", malformed: true, before: true}, {name: "fixed_error", malformed: true, fixed: true}, {name: "fixed_success", fixed: true}, {name: "fixed_low_funds", fixed: true, lowFunds: true},
+		{name: "text"}, {name: "tools", tools: true}, {name: "text_error", malformed: true}, {name: "tools_error", tools: true, malformed: true}, {name: "no_generation_error", malformed: true, before: true}, {name: "fixed_error", malformed: true, fixed: true}, {name: "fixed_success", fixed: true}, {name: "fixed_low_funds", fixed: true, lowFunds: true}, {name: "fixed_failed_generation", fixed: true, terminal: "failed"}, {name: "fixed_incomplete_generation", fixed: true, terminal: "incomplete"},
 	} {
 		withTools, malformed := tc.tools, tc.malformed
 		t.Run(tc.name, func(t *testing.T) {
@@ -2507,7 +2508,7 @@ func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
 					expected, initialQuota = 45, 100
 				}
 				require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(price))
-				if malformed {
+				if malformed || tc.terminal != "" {
 					expected = 0
 				}
 			}
@@ -2539,7 +2540,14 @@ func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
 						return
 					}
 					id := fmt.Sprintf("legacy-text-%d", round)
-					for _, raw := range []string{`{"type":"response.created","response":{"id":"` + id + `","status":"in_progress","max_output_tokens":"inf"}}`, `{"type":"response.function_call_arguments.delta","response_id":"` + id + `","delta":"` + strings.Repeat(" hello", 20) + `"}`, `{"type":"response.done","response":{"id":"` + id + `","status":"completed"}}`} {
+					frames := []string{`{"type":"response.created","response":{"id":"` + id + `","status":"in_progress","max_output_tokens":"inf"}}`, `{"type":"response.function_call_arguments.delta","response_id":"` + id + `","delta":"` + strings.Repeat(" hello", 20) + `"}`, `{"type":"response.done","response":{"id":"` + id + `","status":"completed"}}`}
+					if tc.terminal == "failed" {
+						frames = []string{frames[0], `{"type":"response.done","response":{"id":"` + id + `","status":"failed","output":[],"status_details":{"error":{"code":"server_error","type":"server_error"}},"usage":{"input_tokens":10,"output_tokens":0}}}`}
+					}
+					if tc.terminal == "incomplete" {
+						frames[2] = `{"type":"response.done","response":{"id":"` + id + `","status":"incomplete","status_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":10,"output_tokens":20}}}`
+					}
+					for _, raw := range frames {
 						if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(raw))) {
 							return
 						}
@@ -2566,7 +2574,11 @@ func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
 			require.NoError(t, err)
 			for range rounds {
 				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"output_modalities":["text"]}}`)))
-				for range 3 {
+				events := 3
+				if tc.terminal == "failed" {
+					events = 2
+				}
+				for range events {
 					_, _, err = client.ReadMessage()
 					require.NoError(t, err)
 				}
