@@ -42,6 +42,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/wsmanager"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/xunfei"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -4485,6 +4486,8 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 		{name: "Cohere failed JSON keeps source estimate", provider: constant.ChannelTypeCohere, body: `{"text":"Hello","finish_reason":"ERROR"}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
 		{name: "Ollama pretty JSON remains valid", provider: constant.ChannelTypeOllama, body: "{\n\"message\":{\"content\":\"Hello\"},\n\"done\":true,\n\"prompt_eval_count\":1000,\n\"eval_count\":100\n}", source: "upstream", prompt: 1000, completion: 100, charge: 2160000, cost: 1200000},
 		{name: "Ollama malformed terminal retains accumulated bases", provider: constant.ChannelTypeOllama, body: "{\"message\":{\"content\":\"Hello\"},\"done\":false}\n{\"done\":true,\"prompt_eval_count\":1000,\"eval_count\":100,\"message\":{\"content\":{}}}", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1200000},
+		{name: "PaLM truncated candidate retains closed content", provider: constant.ChannelTypePaLM, shortBody: true, body: `{"candidates":[{"content":"Hello",`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
+		{name: "PaLM truncated candidate stream retains closed content", provider: constant.ChannelTypePaLM, stream: true, shortBody: true, body: `{"candidates":[{"content":"Hello",`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
 		{name: "PaLM malformed filter read error keeps source", provider: constant.ChannelTypePaLM, shortBody: true, body: `{"candidates":[{"content":"Hello"}],"filters":[{"reason":{}}]}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
 		{name: "PaLM stream malformed filter read error keeps source", provider: constant.ChannelTypePaLM, stream: true, shortBody: true, body: `{"candidates":[{"content":"Hello"}],"filters":[{"reason":{}}]}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
 		{name: "Gemini JSON missing candidates retains thoughts", provider: constant.ChannelTypeOpenAI, upstreamProtocol: "gemini_generate", body: `{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"thoughtsTokenCount":100}}`, source: "estimated", prompt: 10, completion: 101, charge: 381600, cost: 212000},
@@ -5095,6 +5098,7 @@ func TestTextGatewayPaLMStreamingOverrideRejectsMultipleCandidates(t *testing.T)
 	require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", `{"candidateCount":2}`).Error)
 	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", `{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}]}`)
 	assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), "native Provider cannot represent multiple output choices (n)")
 	assert.Zero(t, calls.Load())
 	requests := walletAPIRequest(t, fixture.engine, fixture.adminPAT, http.MethodGet, "/api/admin/v1/requests", "")
 	require.True(t, requests.Success, requests.Message)
@@ -5547,6 +5551,62 @@ func TestTextGatewayCozeFollowupRevalidatesCredentialAndBudget(t *testing.T) {
 				assert.Equal(t, expectedClass, attempts[0].ErrorClass)
 				assert.NotEqual(t, "open", attempts[0].CircuitAction)
 			})
+		}
+	}
+}
+
+func TestTextGatewaySparkInitialWriteHonorsCancellation(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if !assert.NoError(t, err) {
+			return
+		}
+		defer conn.Close()
+		if tcp, ok := conn.UnderlyingConn().(*net.TCPConn); ok {
+			assert.NoError(t, tcp.SetReadBuffer(1024))
+		}
+		_, _, err = conn.NextReader()
+		if !assert.NoError(t, err) {
+			return
+		}
+		close(started)
+		<-release // Receive the frame header, then hold request-body backpressure.
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/"+"chat/"+"completions", nil).WithContext(ctx)
+	common.SetContextKey(c, constant.ContextKeyResponseFacts, &relaycommon.ResponseFacts{})
+	metadata := &channel.ProviderRequest{ChannelBaseUrl: server.URL, UpstreamModelName: "SparkDesk-v3.5", ApiKey: "fixture-app|fixture-secret|fixture-key"}
+	body := `{"header":{"app_id":"fixture-app"},"parameter":{"chat":{"domain":"generalv3.5"}},"payload":{"message":{"text":[{"role":"user","content":"` + strings.Repeat("x", 8<<20) + `"}]}}}`
+	result := make(chan error, 1)
+	go func() {
+		response, err := (&xunfei.Provider{}).ExecuteRequest(c, metadata, strings.NewReader(body))
+		if response != nil {
+			response.Body.Close()
+		}
+		result <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("Spark request did not reach its initial WebSocket write")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		assert.Error(t, err)
+		close(release)
+	case <-time.After(2 * time.Second):
+		t.Error("cancelled Spark initial write retained the attempt")
+		close(release)
+		select {
+		case <-result:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Spark write did not stop after test peer closed")
 		}
 	}
 }
@@ -7259,7 +7319,7 @@ func TestTextGatewayIndependentConvertedUsageCounters(t *testing.T) {
 		{"bad Responses total", "openai_responses", `{"id":"resp","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":{}}}`, `data: {"type":"response.output_text.delta","delta":"Hello","output_index":0,"content_index":0}` + "\n\ndata: " + `{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":[]}}}` + "\n\n", 5, 36000, 20000},
 		{"Responses independent thoughts", "openai_responses", `{"id":"resp","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens_details":{"reasoning_tokens":100}}}`, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\",\"output_index\":0,\"content_index\":0}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens_details\":{\"reasoning_tokens\":100}}}}\n\n", 100, 378000, 210000},
 		{"Gemini independent audio", "gemini_generate", `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokensDetails":[{"modality":"AUDIO","tokenCount":100}]}}`, "", 100, 378000, 210000},
-		{"Gemini independent thoughts", "gemini_generate", `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"thoughtsTokenCount":100}}`, "", 100, 378000, 210000},
+		{"Gemini independent thoughts", "gemini_generate", `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"thoughtsTokenCount":100}}`, "", 101, 381600, 212000},
 		{"Gemini explicit zero", "gemini_generate", `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":0,"totalTokenCount":15}}`, "", 0, 18000, 10000},
 		{"bad Gemini total", "gemini_generate", `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":-1}}`, "", 5, 36000, 20000},
 	} {
@@ -10145,6 +10205,8 @@ func TestTextGatewayNativeComposerReturnsParameterReasons(t *testing.T) {
 		system                             bool
 		overrides, messages, upstream, key string
 	}{
+		{field: "n", extra: `"max_tokens":16`, provider: constant.ChannelTypeCohere, overrides: `{"n":2}`, reason: "native wire does not support request parameter n"},
+		{field: "n", extra: `"n":2`, provider: constant.ChannelTypeTencent, key: "1|test-id|test-secret", reason: "native Provider cannot represent multiple output choices (n)"},
 		{field: "tools", extra: `"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]`, provider: constant.ChannelTypeCohere, reason: "The native Cohere request cannot represent this parameter"},
 		{field: "response_format", extra: `"response_format":{"type":"json_object"}`, provider: constant.ChannelTypeCohere, reason: "The native Cohere request cannot represent this parameter"},
 		{field: "messages[0].role", extra: `"max_tokens":16`, provider: constant.ChannelTypeCoze, reason: "The native Coze request cannot represent this message role", system: true},
@@ -10178,11 +10240,26 @@ func TestTextGatewayNativeComposerReturnsParameterReasons(t *testing.T) {
 			if test.messages != "" {
 				messages = test.messages
 			}
+			if test.field == "n" && test.overrides != "" {
+				fixture.offering.AcceptedConversionLosses = []string{"request_parameter_dropped"}
+				require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+			}
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", fmt.Sprintf(`{"model":"gateway-offering","messages":%s,%s}`, messages, test.extra))
 			assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
 			assert.Contains(t, response.Body.String(), test.field)
 			assert.Contains(t, response.Body.String(), test.reason)
 			assert.Zero(t, calls)
+			if test.field == "n" && test.overrides == "" {
+				fixture.offering.AcceptedConversionLosses = []string{"request_parameter_dropped"}
+				require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+				response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", `{"model":"gateway-offering","messages":[{"role":"user","content":"Hello"}],"n":2}`)
+				assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+				assert.Contains(t, response.Body.String(), test.reason, "hard multi-choice rejection cannot be waived")
+				assert.Zero(t, calls)
+				var attempts int64
+				require.NoError(t, model.LOG_DB.Model(&model.GatewayAttempt{}).Count(&attempts).Error)
+				assert.Zero(t, attempts)
+			}
 		})
 	}
 }
@@ -12351,7 +12428,8 @@ type gatewayQueuedUsageBody struct {
 	chunks                     []*strings.Reader
 	index                      int
 	firstWrite, queued, closed chan struct{}
-	once                       sync.Once
+	once, receivedOnce         sync.Once
+	coalesced                  bool
 }
 
 func (b *gatewayQueuedUsageBody) Read(p []byte) (int, error) {
@@ -12365,6 +12443,9 @@ func (b *gatewayQueuedUsageBody) Read(p []byte) (int, error) {
 		}
 		n, err := b.chunks[b.index].Read(p)
 		if n > 0 {
+			if b.coalesced && b.index == 0 && b.chunks[0].Len() == 0 {
+				b.receivedOnce.Do(func() { close(b.queued) })
+			}
 			return n, nil
 		}
 		if err != io.EOF {
@@ -12372,23 +12453,29 @@ func (b *gatewayQueuedUsageBody) Read(p []byte) (int, error) {
 		}
 		b.index++
 	}
-	close(b.queued)
+	b.receivedOnce.Do(func() { close(b.queued) })
 	<-b.closed
 	return 0, io.EOF
 }
 func (b *gatewayQueuedUsageBody) Close() error { b.once.Do(func() { close(b.closed) }); return nil }
 
 func TestTextGatewayQueuedSourceUsageSurvivesWriteFailure(t *testing.T) {
-	for _, provider := range []int{constant.ChannelTypeOpenAI, constant.ChannelTypeDify, constant.ChannelTypeBaidu} {
+	for _, provider := range []struct {
+		kind      int
+		coalesced bool
+	}{{constant.ChannelTypeOpenAI, false}, {constant.ChannelTypeDify, false}, {constant.ChannelTypeBaidu, false}, {constant.ChannelTypeOpenAI, true}, {constant.ChannelTypeDify, true}, {constant.ChannelTypeBaidu, true}} {
 		for _, full := range []bool{false, true} {
-			t.Run(fmt.Sprintf("provider=%d/full=%t", provider, full), func(t *testing.T) {
+			t.Run(fmt.Sprintf("provider=%d/coalesced=%t/full=%t", provider.kind, provider.coalesced, full), func(t *testing.T) {
 				first := "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n"
 				second := "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":100}}\n\n"
-				if provider == constant.ChannelTypeDify {
+				if provider.coalesced {
+					first = strings.Repeat(first, 16)
+				}
+				if provider.kind == constant.ChannelTypeDify {
 					first = strings.Repeat("data: {\"event\":\"message\",\"answer\":\"Hello\"}\n\n", 16)
 					second = "data: {\"event\":\"message_end\",\"metadata\":{\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":100}}}\n\n"
 				}
-				if provider == constant.ChannelTypeBaidu {
+				if provider.kind == constant.ChannelTypeBaidu {
 					first = strings.Repeat("data: {\"result\":\"Hello\",\"is_end\":false}\n\n", 16)
 					second = "data: {\"is_end\":true,\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":100}}\n\n"
 				}
@@ -12396,11 +12483,11 @@ func TestTextGatewayQueuedSourceUsageSurvivesWriteFailure(t *testing.T) {
 					w.Header().Set("Content-Type", "text/event-stream")
 					_, _ = io.WriteString(w, first+second)
 				})
-				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", provider).Error)
-				if provider == constant.ChannelTypeBaidu {
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", provider.kind).Error)
+				if provider.kind == constant.ChannelTypeBaidu {
 					routeBaiduRequestsToFixture(t, fixture)
 				}
-				body := &gatewayQueuedUsageBody{firstWrite: make(chan struct{}), queued: make(chan struct{}), closed: make(chan struct{})}
+				body := &gatewayQueuedUsageBody{firstWrite: make(chan struct{}), queued: make(chan struct{}), closed: make(chan struct{}), coalesced: provider.coalesced}
 				client := service.GetHttpClient()
 				original := client.Transport
 				t.Cleanup(func() { client.Transport = original })
@@ -12417,10 +12504,13 @@ func TestTextGatewayQueuedSourceUsageSurvivesWriteFailure(t *testing.T) {
 					if err != nil {
 						return nil, err
 					}
-					parts := strings.SplitAfter(string(raw), "\n\n")
-					for _, part := range parts {
-						if part != "" {
-							body.chunks = append(body.chunks, strings.NewReader(part))
+					if provider.coalesced {
+						body.chunks = []*strings.Reader{strings.NewReader(string(raw))}
+					} else {
+						for part := range strings.SplitSeq(string(raw), "\n\n") {
+							if part != "" {
+								body.chunks = append(body.chunks, strings.NewReader(part+"\n\n"))
+							}
 						}
 					}
 					response.Body = body

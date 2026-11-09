@@ -126,7 +126,9 @@ func (p *Provider) executeSpark(c *gin.Context, metadata channel.ProviderMetadat
 		}
 		return nil, fmt.Errorf("Xunfei WebSocket connection failed")
 	}
+	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+		stopCancellation()
 		cancel()
 		conn.Close()
 		return nil, fmt.Errorf("Xunfei WebSocket request failed")
@@ -136,15 +138,9 @@ func (p *Provider) executeSpark(c *gin.Context, metadata channel.ProviderMetadat
 	done := make(chan struct{})
 	source := &sparkResponseBody{PipeReader: reader, conn: conn, cancel: cancel, sourceLimit: sourceLimit, finished: done}
 	go func() {
-		select {
-		case <-ctx.Done():
-			conn.Close()
-		case <-done:
-		}
-	}()
-	go func() {
 		defer close(done)
 		defer cancel()
+		defer stopCancellation()
 		defer conn.Close()
 		defer writer.Close()
 		remaining := sourceLimit

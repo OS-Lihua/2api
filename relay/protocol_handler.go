@@ -122,7 +122,7 @@ func (a *ChannelAdaptor) ProjectChatRequest(c *gin.Context, info *relaycommon.Re
 		}
 		if contract, ok := converted.(channel.NativeChatRequestContract); ok && effective.N != nil && *effective.N > 1 {
 			if info.IsStream || !slices.Contains(contract.ChatRequestCapabilities().Parameters, "n") {
-				return nil, errors.New("native Provider cannot represent multiple output choices (n)")
+				return nil, &types.ConversionLossError{Diagnostics: []types.ConversionDiagnostic{{Code: "request_parameter_dropped", Path: "n", Severity: types.ConversionDiagnosticError, From: types.RelayFormatOpenAI, To: types.RelayFormatOpenAI, Message: "native Provider cannot represent multiple output choices (n)"}}}
 			}
 		}
 		return effective, nil

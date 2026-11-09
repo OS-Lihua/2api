@@ -150,9 +150,9 @@ func ProjectNativeChatParameters(body []byte, public dto.GeneralOpenAIRequest, n
 			properties[key] = true
 		}
 	}
-	for key := range wire {
+	for _, key := range slices.Sorted(maps.Keys(wire)) {
 		if !properties[key] {
-			return nil, fmt.Errorf("native wire does not support request parameter %s", key)
+			return nil, &types.ConversionLossError{Diagnostics: []types.ConversionDiagnostic{{Code: "request_parameter_dropped", Path: key, Severity: types.ConversionDiagnosticError, From: types.RelayFormatOpenAI, To: types.RelayFormatOpenAI, Message: "native wire does not support request parameter " + key}}}
 		}
 	}
 	encoded, err := common.Marshal(public)
