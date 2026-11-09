@@ -2,6 +2,7 @@ package jsplugin
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -48,6 +49,7 @@ func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Respon
 	defer timer.Stop()
 
 	a.deliveredSubmitData = nil
+	a.submitSourceFallback = nil
 	a.submitDeliveryFailed = false
 	supportsBusiness := slices.Contains(a.plugin.Meta.RequiredCapabilities, pluginruntime.CapabilitySubmitSSEBusiness)
 	scanner := helper.NewStreamScanner(resp.Body, int(stream.frameLimit)+1)
@@ -169,6 +171,10 @@ func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Respon
 				err = accumulated.Apply(ctx, result["changes"])
 			}
 			if err != nil {
+				var sourceErr *pluginruntime.JSONSourceRecoveryError
+				if errors.As(err, &sourceErr) {
+					a.submitSourceFallback = sourceErr.Previous
+				}
 				readErr = fmt.Errorf("invalid submit stream changes: %w", err)
 				if !stream.money {
 					accumulated, state = nil, nil

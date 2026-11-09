@@ -309,6 +309,16 @@ func (s *JSONState) ApplyAtomic(ctx context.Context, changes any) error {
 	return err
 }
 
+// JSONSourceRecoveryError retains the last valid state beside a failed source
+// batch. Callers may recover known facts from it without publishing the result.
+type JSONSourceRecoveryError struct {
+	Err      error
+	Previous any
+}
+
+func (e *JSONSourceRecoveryError) Error() string { return e.Err.Error() }
+func (e *JSONSourceRecoveryError) Unwrap() error { return e.Err }
+
 // ApplySource retains independent bounded changes for source accounting after
 // a failed batch. It still returns the error; its recovered value must never
 // be published as a completed response.
@@ -321,10 +331,14 @@ func (s *JSONState) ApplySource(ctx context.Context, changes any) error {
 	if !ok || len(items) > maxJSONChanges {
 		return err
 	}
+	previous, snapshotErr := s.Value()
+	if snapshotErr != nil {
+		return err
+	}
 	for _, item := range items {
 		_ = s.ApplyAtomic(context.WithoutCancel(ctx), []any{item})
 	}
-	return err
+	return &JSONSourceRecoveryError{Err: err, Previous: previous}
 }
 
 func (s *JSONState) apply(ctx context.Context, changes any, checkpoint func(*jsonStateNode)) error {

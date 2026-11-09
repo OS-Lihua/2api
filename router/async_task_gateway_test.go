@@ -963,6 +963,8 @@ func TestAsyncTaskInsufficientWalletDoesNotExchangeProviderCredentials(t *testin
 	require.NoError(t, err)
 	source = strings.Replace(source, "apiVersion: 1,", `apiVersion: 1, auth: "vertex_oauth",`, 1)
 	source = strings.ReplaceAll(source, `Authorization: "Bearer " + ctx.apiKey`, `Authorization: ctx.authHeader`)
+	source = strings.Replace(source, "export function parseSubmitResponse(ctx, resp) {", `export function parseSubmitResponse(ctx, resp) {
+		if (ctx.authHeader !== "Bearer task-oauth-fixture") throw new Error("accepted response lost its prepared authentication context");`, 1)
 	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
 	_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "sora"})
 	require.NoError(t, err)
@@ -1029,6 +1031,10 @@ func TestAsyncTaskInsufficientWalletDoesNotExchangeProviderCredentials(t *testin
 	var task model.Task
 	require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
 	assert.Empty(t, task.PrivateData.Key)
+	persisted, err := common.Marshal(task)
+	require.NoError(t, err)
+	assert.NotContains(t, string(persisted), exchangedKey)
+	assert.NotContains(t, string(persisted), "PRIVATE KEY")
 	attempts, total, err := model.ListGatewayAttempts(t.Context(), task.PrivateData.Gateway.Settlement.Request.ID, 0, 10)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, total)
@@ -2890,6 +2896,7 @@ func TestAsyncTaskNativeStreamSettlesObservedFacts(t *testing.T) {
 		{"invalid first frame", "data: invalid-json\n\n", 0, 0, true, -1, http.StatusBadGateway},
 		{"empty stream", "", 0, 0, true, -1, http.StatusBadGateway},
 		{"known source survives cumulative limit", overflow, 90000000, 100000000, true, 1, http.StatusOK},
+		{"invalid recovered count retains prior source", sameEvent + text + `]}}]},"usage":{"image_count":-1}}` + "\n\n", 90000000, 50000000, true, -1, http.StatusOK},
 		{"same event image before oversized text", sameEvent + image + "," + text + `]}}]},"usage":{"image_count":2}}` + "\n\n", 90000000, 100000000, true, -1, http.StatusOK},
 		{"same event image after oversized text", sameEvent + text + "," + image + `]}}]},"usage":{"image_count":2}}` + "\n\n", 90000000, 100000000, true, -1, http.StatusOK},
 		{"same event before first delivery", `data: {"output":{"choices":[{"message":{"content":[` + image + `,{"image":"https://artifact.invalid/third.png"},{"text":"` + strings.Repeat("<", 200<<10) + `"}]}}]},"usage":{"image_count":2}}` + "\n\n", 0, 100000000, true, -1, http.StatusBadGateway},
@@ -2943,6 +2950,92 @@ func TestAsyncTaskNativeStreamSettlesObservedFacts(t *testing.T) {
 			assertTextGatewayLedger(t, requests[0], test.cost)
 			var reservations int64
 			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id = ? AND type = ?", requests[0].ID, model.LedgerEntryPreConsume).Count(&reservations).Error)
+			assert.EqualValues(t, 1, reservations)
+		})
+	}
+}
+
+func TestAsyncTaskNativeStreamRetainsAcceptedIdentityAfterInvalidDelta(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		eraseID, cancel bool
+	}{
+		{name: "erase-id-false"},
+		{name: "erase-id-true", eraseID: true},
+		{name: "caller-cancelled", cancel: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var submissions, queries atomic.Int32
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					queries.Add(1)
+					assert.Equal(t, "/v1/videos/accepted-real-id", r.URL.Path)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"id":"accepted-real-id","status":"completed","seconds":"2"}`)
+					return
+				}
+				submissions.Add(1)
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, "data: Hello\n\ndata: invalid-delta\n\n")
+			})
+			source, err := plugins.Source("sora")
+			require.NoError(t, err)
+			source = strings.Replace(source, "apiVersion: 1,", `apiVersion: 1,
+		requiredCapabilities: ["submit-sse-business@1"], submitResponseTypes: ["json", "sse"],
+		routes: [{method:"POST", path:"/sora/native-stream-job", type:"submit", decode:"submit", render:"created"}],`, 1)
+			source = strings.Replace(source, "export function buildSubmitRequest(ctx) {", `export function buildSubmitRequest(ctx) {
+		return {url:ctx.baseUrl+"/v1/videos", method:"POST", headers:{"Content-Type":"application/json",Authorization:"Bearer "+ctx.apiKey}, body:ctx.requestBody, responseType:"sse"};`, 1)
+			source += `
+	export const native = {
+		submit(ctx) { return {kind:"submit", model:ctx.body.value.model, requestBody:ctx.body.value}; },
+		created(ctx, task) { return {id:task.task_id}; }
+	};
+	export function parseSubmitEventDelta(ctx, event, state) {
+		if (event.data === "Hello") return {changes:[{op:"set",path:[],value:{id:"accepted-real-id",status:"queued"}}],state:{},done:false,business:false};
+		return {changes:INVALID_CHANGES,state:{},done:false,business:false};
+	}`
+			badChanges := `[{op:"append",path:["missing"],value:1}]`
+			if test.eraseID {
+				badChanges = `[{op:"set",path:["id"],value:""},{op:"append",path:["missing"],value:1}]`
+			}
+			source = strings.Replace(source, "INVALID_CHANGES", badChanges, 1)
+			_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "sora"})
+			require.NoError(t, err)
+			builder := newPluginGenerationBuilder(fixture.engine.Routes(), nil, productionPluginRouteHandlers)
+			require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(builder.prepare))
+			fixture.engine.NoRoute((&pluginRouteDispatcher{registry: jsplugin.DefaultRegistry}).dispatch)
+			parent, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			request := httptest.NewRequest(http.MethodPost, "/sora/native-stream-job", strings.NewReader(`{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)).WithContext(parent)
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			var writer http.ResponseWriter = response
+			if test.cancel {
+				writer = cancelOnOutputWriter{ResponseRecorder: response, cancel: cancel}
+			}
+			fixture.engine.ServeHTTP(writer, request)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), "data: Hello")
+			if test.cancel {
+				require.ErrorIs(t, parent.Err(), context.Canceled)
+			}
+			var task model.Task
+			require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
+			require.Equal(t, "accepted-real-id", task.PrivateData.UpstreamTaskID)
+			require.Equal(t, model.TaskStatus(model.TaskStatusSubmitted), task.Status)
+			assert.Equal(t, fixture.channel.ID, task.ChannelId)
+			service.RunTaskPollingOnce(t.Context(), nil)
+			require.NoError(t, model.DB.First(&task, task.ID).Error)
+			assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
+			assert.EqualValues(t, 1, submissions.Load())
+			assert.EqualValues(t, 1, queries.Load())
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), task.PrivateData.Gateway.Settlement.Request.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.EqualValues(t, 100000000, attempts[0].Cost.Nanos)
+			var reservations int64
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id = ? AND type = ?", attempts[0].RequestID, model.LedgerEntryPreConsume).Count(&reservations).Error)
 			assert.EqualValues(t, 1, reservations)
 		})
 	}

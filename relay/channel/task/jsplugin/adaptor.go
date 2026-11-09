@@ -143,12 +143,13 @@ const maxTaskArtifacts = 64
 const maxTaskPluginPersistedJSONBytes = 1 << 20
 
 type TaskAdaptor struct {
-	plugin         *pluginruntime.LoadedPlugin
-	info           *relaycommon.RelayInfo
-	submit         *requestDescriptor
-	routeRequest   *pluginruntime.RouteRequestContext
-	requestHeaders map[string]string
-	files          []map[string]any
+	plugin            *pluginruntime.LoadedPlugin
+	info              *relaycommon.RelayInfo
+	submit            *requestDescriptor
+	submitCredentials map[string]any
+	routeRequest      *pluginruntime.RouteRequestContext
+	requestHeaders    map[string]string
+	files             []map[string]any
 	// hookRequestBody is hookRequestSource as hooks receive it.
 	hookRequestSource map[string]any
 	hookRequestBody   any
@@ -160,6 +161,7 @@ type TaskAdaptor struct {
 	requestDecoded       bool
 	keepReservation      bool
 	deliveredSubmitData  any
+	submitSourceFallback any
 	submitDeliveryFailed bool
 	submitBusiness       atomic.Bool
 	submissionWritten    atomic.Bool
@@ -818,7 +820,7 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 			if a.submitBusiness.Load() {
 				immediate.Status = model.TaskStatusSuccess
 			}
-			a.observeSubmitCompletion(c, info, immediate, info.PublicTaskID, responseBody, nil)
+			a.observeSubmitSourceCompletion(c, info, immediate, info.PublicTaskID, responseBody, nil)
 			stream := a.submitStreamFacts(c, info, immediate, info.PublicTaskID, nil)
 			submitted = &channel.TaskSubmitResponse{UpstreamTaskID: info.PublicTaskID, Immediate: immediate, Stream: stream}
 			taskErr = nil
@@ -847,7 +849,13 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 			client = c
 		}
 		var stopped bool
-		responseBody, stopped, err = a.readSubmitEvents(c.Request.Context(), resp, a.submitContext(c, info), submitEventStream{client: client, frameLimit: replyLimit, money: info.BeginProviderCall != nil})
+		var driverContext map[string]any
+		if info.BeginProviderCall != nil {
+			driverContext = a.preparedSubmitContext(c, info)
+		} else {
+			driverContext = a.submitContext(c, info)
+		}
+		responseBody, stopped, err = a.readSubmitEvents(c.Request.Context(), resp, driverContext, submitEventStream{client: client, frameLimit: replyLimit, money: info.BeginProviderCall != nil})
 		relayed = client != nil && c.Writer.Written()
 		a.keepReservation = stopped
 	} else {
@@ -865,42 +873,62 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 			responseBody = decoded
 		}
 	}
-	if err != nil {
+	sourceFailed := err != nil
+	if sourceFailed && !(eventStream && relaysSubmitEvents(c) && info.BeginProviderCall != nil && responseBody != nil) {
 		failure := service.TaskErrorWrapper(err, "read_response_body_failed", http.StatusBadGateway, common.UpstreamAddresses(c)...)
 		failure.NoRetry = streaming
 		return nil, failure
 	}
 	headers := make(map[string][]string, len(resp.Header))
 	maps.Copy(headers, resp.Header)
-	value, err := a.plugin.Engine.Call(c.Request.Context(), "parseSubmitResponse", a.submitContext(c, info), map[string]any{"statusCode": resp.StatusCode, "headers": headers, "body": responseBody})
-	if err != nil {
-		logger.LogDebug(
-			c,
-			"task_plugin subsystem=adaptor event=parse_submit_failed plugin=%q stage=parse_submit_response reason=hook_failed status=%d elapsed_ms=%d",
-			a.plugin.Meta.Key,
-			resp.StatusCode,
-			time.Since(started).Milliseconds(),
-		)
-		return nil, service.TaskErrorWrapper(err, "plugin_submit_response_failed", http.StatusBadGateway, common.UpstreamAddresses(c)...)
+	parseContext := c.Request.Context()
+	var driverContext map[string]any
+	if info.BeginProviderCall != nil {
+		var cancel context.CancelFunc
+		parseContext, cancel = context.WithTimeout(context.WithoutCancel(parseContext), pluginruntime.DefaultCallTimeout)
+		defer cancel()
+		driverContext = a.preparedSubmitContext(c, info)
+	} else {
+		driverContext = a.submitContext(c, info)
 	}
-	if object, ok := value.(map[string]any); ok {
-		if _, forbidden := object["clientResponse"]; forbidden {
-			return nil, service.TaskErrorWrapperLocal(fmt.Errorf("parseSubmitResponse must not return clientResponse"), "plugin_submit_response_invalid", http.StatusBadGateway)
-		}
+	parseBodies := []any{responseBody}
+	if sourceFailed && a.submitSourceFallback != nil {
+		parseBodies = append(parseBodies, a.submitSourceFallback)
 	}
+	var value any
 	var parsed submitResponse
-	if err = convert(value, &parsed); err != nil || strings.TrimSpace(parsed.TaskID) == "" {
+	failureCode, failureReason := "plugin_submit_response_invalid", "invalid_result"
+	for _, source := range parseBodies {
+		value, err = a.plugin.Engine.Call(parseContext, "parseSubmitResponse", driverContext, map[string]any{"statusCode": resp.StatusCode, "headers": headers, "body": source})
+		failureCode, failureReason = "plugin_submit_response_failed", "hook_failed"
+		if err != nil {
+			continue
+		}
+		if object, ok := value.(map[string]any); ok {
+			if _, forbidden := object["clientResponse"]; forbidden {
+				return nil, service.TaskErrorWrapperLocal(fmt.Errorf("parseSubmitResponse must not return clientResponse"), "plugin_submit_response_invalid", http.StatusBadGateway)
+			}
+		}
+		failureCode, failureReason = "plugin_submit_response_invalid", "invalid_result"
+		parsed = submitResponse{}
+		err = convert(value, &parsed)
+		if err == nil && strings.TrimSpace(parsed.TaskID) != "" {
+			break
+		}
 		if err == nil {
 			err = fmt.Errorf("plugin returned an empty taskId")
 		}
+	}
+	if err != nil {
 		logger.LogDebug(
 			c,
-			"task_plugin subsystem=adaptor event=parse_submit_failed plugin=%q stage=parse_submit_response reason=invalid_result status=%d elapsed_ms=%d",
+			"task_plugin subsystem=adaptor event=parse_submit_failed plugin=%q stage=parse_submit_response reason=%s status=%d elapsed_ms=%d",
 			a.plugin.Meta.Key,
+			failureReason,
 			resp.StatusCode,
 			time.Since(started).Milliseconds(),
 		)
-		return nil, service.TaskErrorWrapper(err, "plugin_submit_response_invalid", http.StatusBadGateway, common.UpstreamAddresses(c)...)
+		return nil, service.TaskErrorWrapper(err, failureCode, http.StatusBadGateway, common.UpstreamAddresses(c)...)
 	}
 	// Only an immediate terminal result goes unpersisted; any other task data
 	// is stored and keeps the persisted limit.
@@ -909,7 +937,7 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 		dataLimit = replyLimit
 	}
 	var taskData []byte
-	if parsed.TaskData != nil {
+	if parsed.TaskData != nil && !sourceFailed {
 		taskData, err = common.Marshal(parsed.TaskData)
 		if err != nil || int64(len(taskData)) > dataLimit {
 			if err == nil {
@@ -939,6 +967,12 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 		Reason: parsed.Immediate.Reason, Url: parsed.Immediate.URL, RemoteUrl: parsed.Immediate.RemoteURL,
 		CompletionTokens: positiveInt(parsed.Immediate.CompletionTokens), TotalTokens: positiveInt(parsed.Immediate.TotalTokens),
 	}
+	if sourceFailed {
+		immediate.Status = model.TaskStatusFailure
+		if a.submitBusiness.Load() {
+			immediate.Status = model.TaskStatusSuccess
+		}
+	}
 	response.Immediate = immediate
 	moneyFailure := immediate.Status == model.TaskStatusFailure && info.BeginProviderCall != nil
 	if immediate.Status != model.TaskStatusSuccess && !moneyFailure || info.IsChannelTest || !a.hasHook(c.Request.Context(), "extractUsageOnComplete") {
@@ -949,7 +983,7 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 	if a.keepReservation && info.BeginProviderCall == nil {
 		return response, nil
 	}
-	a.observeSubmitCompletion(c, info, immediate, parsed.TaskID, parsed.TaskData, pluginState)
+	a.observeSubmitSourceCompletion(c, info, immediate, parsed.TaskID, parsed.TaskData, pluginState)
 	if eventStream && relaysSubmitEvents(c) && info.BeginProviderCall != nil {
 		response.Stream = a.submitStreamFacts(c, info, immediate, parsed.TaskID, pluginState)
 	}
@@ -969,6 +1003,20 @@ func (a *TaskAdaptor) submitStreamFacts(c *gin.Context, info *relaycommon.RelayI
 	return &model.TaskStreamFacts{Delivered: delivered.UsageFacts, BusinessOutput: a.submitBusiness.Load(), DeliveryFailed: a.submitDeliveryFailed, Incomplete: a.keepReservation}
 }
 
+func (a *TaskAdaptor) observeSubmitSourceCompletion(c *gin.Context, info *relaycommon.RelayInfo, immediate *relaycommon.TaskInfo, taskID string, taskData any, pluginState []byte) {
+	if a.submitSourceFallback == nil {
+		a.observeSubmitCompletion(c, info, immediate, taskID, taskData, pluginState)
+		return
+	}
+	a.observeSubmitCompletion(c, info, immediate, taskID, a.submitSourceFallback, pluginState)
+	priorFacts := immediate.UsageFacts
+	a.observeSubmitCompletion(c, info, immediate, taskID, taskData, pluginState)
+	if priorFacts != nil {
+		maps.Copy(priorFacts, immediate.UsageFacts)
+		immediate.UsageFacts = priorFacts
+	}
+}
+
 func (a *TaskAdaptor) observeSubmitCompletion(c *gin.Context, info *relaycommon.RelayInfo, immediate *relaycommon.TaskInfo, taskID string, taskData any, pluginState []byte) {
 	if !a.hasHook(c.Request.Context(), "extractUsageOnComplete") {
 		return
@@ -984,7 +1032,7 @@ func (a *TaskAdaptor) observeSubmitCompletion(c *gin.Context, info *relaycommon.
 	task.PrivateData.PluginState = pluginState
 	var ctx map[string]any
 	if info.BeginProviderCall != nil {
-		local := a.taskRequestContext(nil, info)
+		local := a.preparedSubmitContext(nil, info)
 		ctx = map[string]any{
 			"taskId": taskID, "publicTaskId": info.PublicTaskID,
 			"action": constant.NormalizeTaskAction(info.Action), "model": info.OriginModelName,
@@ -1013,7 +1061,13 @@ func (a *TaskAdaptor) observeSubmitCompletion(c *gin.Context, info *relaycommon.
 			return
 		}
 	}
-	facts, err := a.plugin.Engine.Call(c.Request.Context(), "extractUsageOnComplete", ctx, jsonValue(immediate), taskData)
+	callContext := c.Request.Context()
+	if info.BeginProviderCall != nil {
+		var cancel context.CancelFunc
+		callContext, cancel = context.WithTimeout(context.WithoutCancel(callContext), pluginruntime.DefaultCallTimeout)
+		defer cancel()
+	}
+	facts, err := a.plugin.Engine.Call(callContext, "extractUsageOnComplete", ctx, jsonValue(immediate), taskData)
 	if err != nil {
 		logger.LogWarn(c, common.LogText("task plugin %s completion usage failed; preserving known usage: %v", a.plugin.Meta.Key, err))
 		return
@@ -1971,7 +2025,8 @@ func (a *TaskAdaptor) buildSubmit(c *gin.Context, info *relaycommon.RelayInfo) (
 	if info.HasChannelMeta() {
 		fetchContext = pluginruntime.WithFetcher(fetchContext, a.hookFetcher(info.ChannelBaseUrl, info.ChannelSetting.Proxy))
 	}
-	descriptor, err := a.requestDescriptor(fetchContext, "buildSubmitRequest", a.submitContext(c, info))
+	driverContext := a.submitContext(c, info)
+	descriptor, err := a.requestDescriptor(fetchContext, "buildSubmitRequest", driverContext)
 	if err != nil {
 		reason := "hook_failed"
 		var invalid *pluginruntime.ResultError
@@ -2026,6 +2081,12 @@ func (a *TaskAdaptor) buildSubmit(c *gin.Context, info *relaycommon.RelayInfo) (
 		info.UpstreamModelName = descriptor.RewriteModel
 	}
 	a.submit = &descriptor
+	a.submitCredentials = make(map[string]any, 4)
+	for _, name := range []string{"apiKey", "authHeader", "auth", "upstream"} {
+		if value, exists := driverContext[name]; exists {
+			a.submitCredentials[name] = value
+		}
+	}
 	method := strings.ToUpper(strings.TrimSpace(descriptor.Method))
 	if method == "" {
 		method = http.MethodPost
@@ -2043,6 +2104,12 @@ func (a *TaskAdaptor) buildSubmit(c *gin.Context, info *relaycommon.RelayInfo) (
 		time.Since(started).Milliseconds(),
 	)
 	return a.submit, nil
+}
+
+func (a *TaskAdaptor) preparedSubmitContext(c *gin.Context, info *relaycommon.RelayInfo) map[string]any {
+	ctx := a.taskRequestContext(c, info)
+	maps.Copy(ctx, a.submitCredentials)
+	return ctx
 }
 
 func (a *TaskAdaptor) submitContext(c *gin.Context, info *relaycommon.RelayInfo) map[string]any {
