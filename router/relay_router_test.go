@@ -1636,20 +1636,31 @@ func TestTextGatewayLossFallbackRetainsNextCheapestAfterAtomicQuotaRejection(t *
 	for _, test := range []struct {
 		shared    bool
 		firstCost int
+		converted bool
+		probe     bool
 	}{
-		{false, 1}, {true, 1},
-		{false, 0}, {true, 0},
+		{firstCost: 1}, {shared: true, firstCost: 1},
+		{}, {shared: true},
+		{firstCost: 1, converted: true}, {shared: true, firstCost: 1, converted: true},
+		{probe: true}, {shared: true, probe: true},
 	} {
-		t.Run(fmt.Sprintf("redis=%t/first_cost=%d", test.shared, test.firstCost), func(t *testing.T) {
+		t.Run(fmt.Sprintf("redis=%t/first_cost=%d/converted=%t/probe=%t", test.shared, test.firstCost, test.converted, test.probe), func(t *testing.T) {
 			var calls atomic.Int32
 			upstream := func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
 				w.Header().Set("Content-Type", "application/json")
+				if strings.HasSuffix(r.URL.Path, "/responses") {
+					_, _ = io.WriteString(w, `{"id":"next","object":"response","status":"completed","output":[{"type":"message","id":"next","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Next cheapest","annotations":[]}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}`)
+					return
+				}
 				_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"Next cheapest"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
 			}
 			fixture := newTextGatewayFixture(t, upstream)
 			second := addTextGatewayChannel(t, fixture, upstream)
 			third := addTextGatewayChannel(t, fixture, upstream)
+			if test.converted {
+				require.NoError(t, model.DB.Model(&model.Channel{}).Where("id IN ?", []int{second.ID, third.ID}).Update("protocol", protocol.OpenAIResponses).Error)
+			}
 			fixture.offering.RouteMethod = "weight"
 			require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
 			for i, channel := range []*model.Channel{fixture.channel, second, third} {
@@ -1669,17 +1680,31 @@ func TestTextGatewayLossFallbackRetainsNextCheapestAfterAtomicQuotaRejection(t *
 				client := redis.NewClient(&redis.Options{Addr: server.Addr()})
 				t.Cleanup(func() { require.NoError(t, client.Close()) })
 				service.GatewayRouteQuota = service.NewGatewayRouteQuota(client)
+				service.ChannelHealth = channelhealth.New(client)
 			}
 			var provider model.Provider
 			require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
 			busy := &service.GatewaySelection{Channel: *fixture.channel, Provider: &provider}
 			var occupied *service.GatewayRoutePermit
+			var probe channelhealth.Admission
 			occupy := sync.OnceFunc(func() {
+				if test.probe {
+					_, err := service.ChannelHealth.Record(t.Context(), channelhealth.Sample{AttemptID: "late-profitable-peer", ChannelID: fixture.channel.ID, ProviderFailure: true, RateLimited: true, RetryAfter: "60"})
+					require.NoError(t, err)
+					probe, err = service.ChannelHealth.Acquire(t.Context(), []int{fixture.channel.ID})
+					require.NoError(t, err)
+					require.Equal(t, fixture.channel.ID, probe.ChannelID)
+					require.NotEmpty(t, probe.Lease)
+					return
+				}
 				var err error
 				occupied, err = service.GatewayRouteQuota.Acquire(t.Context(), busy, 0)
 				require.NoError(t, err)
 			})
 			defer func() {
+				if probe.Lease != "" {
+					require.NoError(t, service.ChannelHealth.Release(t.Context(), probe))
+				}
 				if occupied != nil {
 					require.NoError(t, occupied.Release(t.Context(), false))
 				}
@@ -1697,7 +1722,11 @@ func TestTextGatewayLossFallbackRetainsNextCheapestAfterAtomicQuotaRejection(t *
 			response := adminSecurityRequest(engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
 			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 			assert.EqualValues(t, 1, calls.Load())
-			assert.ErrorIs(t, service.GatewayRouteQuota.Check(t.Context(), busy, 0), service.ErrGatewayRateLimited)
+			if test.probe {
+				assert.NoError(t, service.GatewayRouteQuota.Check(t.Context(), busy, 0))
+			} else {
+				assert.ErrorIs(t, service.GatewayRouteQuota.Check(t.Context(), busy, 0), service.ErrGatewayRateLimited)
+			}
 			attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
 			require.NoError(t, err)
 			require.EqualValues(t, 1, total)
