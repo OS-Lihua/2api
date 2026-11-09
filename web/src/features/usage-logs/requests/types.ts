@@ -29,6 +29,9 @@ export type RequestStatus =
   | 'settlement_pending'
 export type UsageSource = 'upstream' | 'estimated' | 'none'
 export interface RequestUsage {
+  cached_tokens?: number
+  cache_creation_tokens?: number
+  cache_creation_12h_tokens?: number
   unmeasured_tokens?: string[]
   image_input_tokens?: number
   image_output_tokens?: number

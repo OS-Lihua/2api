@@ -812,6 +812,56 @@ it('shows actual media quantities including zero in request rows and attempts wi
   ).toBeVisible()
 })
 
+it.each(['upstream', 'none'] as const)(
+  'shows recorded cache quantities in request rows and attempts when source is %s',
+  async (source) => {
+    api.defaults.adapter = async (config) => ({
+      config,
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      data: {
+        success: true,
+        data: {
+          items: [
+            {
+              ...(config.url?.endsWith('/attempts') ? attempt : request),
+              usage: {
+                cached_tokens: 1500,
+                cache_creation_tokens: 1000,
+                cache_creation_12h_tokens: 0,
+              },
+              usage_source: source,
+            },
+          ],
+          total: 1,
+          page: 1,
+          page_size: 20,
+        },
+      },
+    })
+    const user = userEvent.setup()
+    renderRequests()
+    expect(await screen.findByText('Cached tokens: 1,500')).toBeVisible()
+    expect(screen.getByText('Cache Write: 1,000')).toBeVisible()
+    expect(screen.getByText('Cache Write (12h): 0')).toBeVisible()
+    expect(screen.queryByText('No usage available')).not.toBeInTheDocument()
+    await user.click(
+      screen.getByRole('button', {
+        name: `View attempts for request ${requestId}`,
+      })
+    )
+    const drawer = await screen.findByRole('dialog', {
+      name: 'Request attempts',
+    })
+    expect(
+      await within(drawer).findByText('Cached tokens: 1,500')
+    ).toBeVisible()
+    expect(within(drawer).getByText('Cache Write: 1,000')).toBeVisible()
+    expect(within(drawer).getByText('Cache Write (12h): 0')).toBeVisible()
+  }
+)
+
 it('shows unmeasured output and total as unknown while retaining known media counts', async () => {
   api.defaults.adapter = async (config) => ({
     config,
@@ -829,7 +879,7 @@ it('shows unmeasured output and total as unknown while retaining known media cou
               completion_tokens: 0,
               total_tokens: 120,
               image_count: 1,
-              unmeasured_tokens: ['c', 'img_o'],
+              unmeasured_tokens: ['c', 'img_o', 'cr', 'cw', 'cw12'],
             },
           },
         ],
@@ -843,6 +893,9 @@ it('shows unmeasured output and total as unknown while retaining known media cou
   expect(await screen.findByText('Input: 120 · Output: Unknown')).toBeVisible()
   expect(screen.getByText('Image output tokens: Unknown')).toBeVisible()
   expect(screen.getByText('Total tokens: Unknown')).toBeVisible()
+  expect(screen.getByText('Cached tokens: Unknown')).toBeVisible()
+  expect(screen.getByText('Cache Write: Unknown')).toBeVisible()
+  expect(screen.getByText('Cache Write (12h): Unknown')).toBeVisible()
   expect(screen.getByText('Image count: 1')).toBeVisible()
   expect(screen.queryByText('Image input tokens: 0')).not.toBeInTheDocument()
 })

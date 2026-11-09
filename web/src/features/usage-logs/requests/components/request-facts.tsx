@@ -116,8 +116,11 @@ export function RequestUsageFacts(props: {
   const { t, i18n } = useTranslation()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const unmeasured = props.usage?.unmeasured_tokens ?? []
-  const hasMediaQuantities =
+  const hasQuantities =
     unmeasured.length > 0 ||
+    props.usage?.cached_tokens !== undefined ||
+    props.usage?.cache_creation_tokens !== undefined ||
+    props.usage?.cache_creation_12h_tokens !== undefined ||
     props.usage?.image_input_tokens !== undefined ||
     props.usage?.image_output_tokens !== undefined ||
     props.usage?.audio_input_tokens !== undefined ||
@@ -125,7 +128,7 @@ export function RequestUsageFacts(props: {
     props.usage?.image_count !== undefined ||
     props.usage?.audio_input_seconds !== undefined ||
     props.usage?.audio_output_seconds !== undefined
-  if (!props.usage || (props.source === 'none' && !hasMediaQuantities)) {
+  if (!props.usage || (props.source === 'none' && !hasQuantities)) {
     return (
       <span className='text-muted-foreground text-xs'>
         {t('No usage available')}
@@ -151,6 +154,13 @@ export function RequestUsageFacts(props: {
       )}
       {(
         [
+          ['cr', t('Cached tokens'), props.usage.cached_tokens],
+          ['cw', t('Cache Write'), props.usage.cache_creation_tokens],
+          [
+            'cw12',
+            t('Cache Write (12h)'),
+            props.usage.cache_creation_12h_tokens,
+          ],
           ['img', t('Image input tokens'), props.usage.image_input_tokens],
           ['img_o', t('Image output tokens'), props.usage.image_output_tokens],
           ['ai', t('Audio input tokens'), props.usage.audio_input_tokens],
