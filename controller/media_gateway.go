@@ -459,6 +459,42 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 			info.QuotaClamp = clamp
 		}
 	}
+	if run.parsed.Protocol == protocol.OpenAIImages && !facts.ImageOutputTokensReported {
+		if facts.CompletionTokensReported {
+			usage.CompletionTokenDetails.ImageTokens = usage.CompletionTokens
+			facts.ImageOutputTokensReported = true
+		} else if generated {
+			facts.ImageOutputTokensUnknown = true
+			if facts.ImageCount != nil && *facts.ImageCount > 0 && *facts.ImageCount <= dto.MaxImageN {
+				image := prepared.Request.(*dto.ImageRequest)
+				size, quality := image.Size, image.Quality
+				if *facts.ImageCount == 1 {
+					if facts.ImageOutputSize != "" {
+						size = facts.ImageOutputSize
+					}
+					if facts.ImageOutputQuality != "" {
+						quality = facts.ImageOutputQuality
+					}
+				} else if facts.ImageOutputSize != "" && facts.ImageOutputSize != size || facts.ImageOutputQuality != "" && facts.ImageOutputQuality != quality {
+					size, quality = "", ""
+				}
+				if tokens, known := tokenkit.ImageOutputTokens(info.UpstreamModelName, size, quality); known {
+					total, clamp := common.QuotaFromFloatChecked(float64(tokens) * float64(*facts.ImageCount))
+					if clamp != nil {
+						info.QuotaClamp = clamp
+					}
+					usage.CompletionTokens, usage.OutputTokens = total, total
+					usage.CompletionTokenDetails.ImageTokens = total
+					facts.ImageOutputTokensEstimated = true
+					facts.ImageOutputTokensUnknown = false
+				}
+			}
+		}
+		if usage.OutputTokensDetails != nil {
+			details := usage.CompletionTokenDetails
+			usage.OutputTokensDetails = &details
+		}
+	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	attempt.Usage = service.GatewayRecordUsage(usage, facts)
 	if info.QuotaClamp != nil {
@@ -479,7 +515,11 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	}
 	run.attemptUsage[attempt.ID] = service.GatewayUsageSnapshot(usage)
 	if attempt.UsageSource != "none" {
-		cost, converted, trace, priceErr := service.GatewayPrice(purchase, usage, prepared.Input, at, decimal.NewFromInt(1), purchaseFX, actualCount...)
+		purchaseInput := prepared.Input
+		if facts.ImageOutputTokensUnknown {
+			purchaseInput.UnmeasuredTokens = map[string]bool{"img_o": true}
+		}
+		cost, converted, trace, priceErr := service.GatewayPrice(purchase, usage, purchaseInput, at, decimal.NewFromInt(1), purchaseFX, actualCount...)
 		trace.MatchedTier = ""
 		if run.attemptTrace == nil {
 			run.attemptTrace = make(map[string]billingexpr.MoneyTraceResult)
@@ -526,6 +566,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		run.record.UsageSource = attempt.UsageSource
 	} else {
 		billable := *facts
+		billable.ImageOutputTokensUnknown = false
 		if billable.AudioOutputSeconds != nil {
 			zero := "0"
 			billable.AudioOutputSeconds = &zero
@@ -538,6 +579,9 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		run.record.UsageSource = "none"
 	}
 	if facts.BusinessOutput {
+		if facts.ImageOutputTokensUnknown {
+			saleInput.UnmeasuredTokens = map[string]bool{"img_o": true}
+		}
 		saleUsage := usage
 		billableFacts := *facts
 		saleCount := actualCount
@@ -545,6 +589,18 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 			delivered := min(facts.DeliveredImageCount, *facts.ImageCount)
 			billableFacts.ImageCount = &delivered
 			saleCount = []int{int(delivered)}
+			if facts.ImageOutputTokensEstimated && *facts.ImageCount > 0 {
+				tokens, clamp := common.QuotaFromFloatChecked(float64(usage.CompletionTokenDetails.ImageTokens) * float64(delivered) / float64(*facts.ImageCount))
+				if clamp != nil {
+					attempt.RouteDiagnostics["quota_saturation"] = clamp.AuditMap()
+				}
+				snapshot := *usage
+				snapshot.CompletionTokens, snapshot.OutputTokens = tokens, tokens
+				snapshot.CompletionTokenDetails.ImageTokens = tokens
+				snapshot.OutputTokensDetails = nil
+				snapshot.TotalTokens = snapshot.PromptTokens + tokens
+				saleUsage = &snapshot
+			}
 			run.record.UsageSource = "estimated"
 		}
 		estimateDelivered := attempt.Status == "partial" || !facts.UsageReported && (attempt.Status == "cancelled" || facts.DownstreamWriteFailed)

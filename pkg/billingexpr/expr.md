@@ -265,6 +265,15 @@ optionally overrides individual counts with exact decimals, including the 1.6
 short-write units for an omitted
 one-hour cache-write price. Counts must be non-negative and at most `MaxInt64`.
 
+`RequestInput.UnmeasuredTokens` marks quantities without a report or a supported
+local estimate. Reading one in the executed pricing branch fails evaluation;
+short-circuited branches and independent fixed/image-count prices still work.
+`MoneyTraceResult.UnmeasuredTokens` records the unavailable names actually read.
+The gateway preserves those traces in its existing pending settlement intent.
+Explicit zero remains measured. Image output estimates use documented generation
+rules in `tokenkit.ImageOutputTokens`; input-image vision rules and reservation
+means cannot substitute for generated output quantities.
+
 The evaluator preserves numeric source tokens and request JSON numbers,
 including grouped literals, scientific notation, and coefficients with 18
 decimal places. It validates the existing v1 grammar, then executes a separate

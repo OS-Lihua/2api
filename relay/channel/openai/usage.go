@@ -100,7 +100,7 @@ func mediaResponseEnvelope(body []byte) []byte {
 		return body
 	}
 	recovered := map[string]common.RawMessage{}
-	for _, name := range []string{"usage", "error", "type", "code", "duration"} {
+	for _, name := range []string{"usage", "error", "type", "code", "duration", "size", "quality"} {
 		if raw := ojson.GetBytes(body, name); raw.Exists() && ojson.Valid(raw.Raw) {
 			recovered[name] = common.RawMessage(raw.Raw)
 		}
@@ -167,6 +167,11 @@ func observeMediaError(info *relaycommon.RelayInfo, body []byte, status int) *ty
 func observeMediaUsage(info *relaycommon.RelayInfo, usage *dto.Usage, body []byte) {
 	if info.ResponseFacts == nil || usage == nil {
 		return
+	}
+	for key, target := range map[string]*string{"size": &info.ResponseFacts.ImageOutputSize, "quality": &info.ResponseFacts.ImageOutputQuality} {
+		if value := ojson.GetBytes(body, key); value.Type == ojson.String && len(value.Str) <= 64 {
+			*target = value.Str
+		}
 	}
 	for _, prefix := range []string{"usage.input_token_details", "usage.input_tokens_details", "usage.prompt_tokens_details"} {
 		text, _ := relaycommon.NativeUsagePresence(body, prefix+".text_tokens", "", "")

@@ -54,6 +54,10 @@ type ResponseFacts struct {
 	AudioInputTokensEstimated  int
 	AudioInputTokensReported   bool
 	TextInputTokensReported    bool
+	ImageOutputTokensUnknown   bool
+	ImageOutputTokensEstimated bool
+	ImageOutputSize            string
+	ImageOutputQuality         string
 	ImageInputTokensReported   bool
 	ImageOutputTokensReported  bool
 	GeneratedOutputTokens      *int

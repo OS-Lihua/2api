@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"maps"
 	"time"
 
 	"github.com/QuantumNous/new-api/model"
@@ -46,6 +47,10 @@ func GatewayPrice(price *model.PriceVersion, usage *dto.Usage, request billingex
 	quantities, err := billingexpr.MoneyTokenQuantities(usage, used)
 	if err != nil {
 		return money.Value{}, money.Value{}, billingexpr.MoneyTraceResult{}, err
+	}
+	if request.UnmeasuredTokens["img_o"] && !used["img_o"] {
+		request.UnmeasuredTokens = maps.Clone(request.UnmeasuredTokens)
+		request.UnmeasuredTokens["c"] = true
 	}
 	input := billingexpr.MoneyInput{TokenQuantities: quantities, Request: request, Time: at}
 	if len(actualImageCount) > 1 {
@@ -99,6 +104,9 @@ func GatewayRecordUsage(usage *dto.Usage, facts ...*relaycommon.ResponseFacts) m
 	}
 	record := model.GatewayUsage{PromptTokens: int64(usage.PromptTokens), CompletionTokens: int64(usage.CompletionTokens), TotalTokens: int64(usage.PromptTokens) + int64(usage.CompletionTokens), CachedTokens: int64(usage.PromptTokensDetails.CachedTokens), CacheCreationTokens: int64(usage.PromptTokensDetails.CacheCreationTokensTotal()), CacheCreation12hTokens: int64(usage.PromptTokensDetails.CacheWrite12hTokens()), ImageInputTokens: int64(usage.PromptTokensDetails.ImageTokens), AudioInputTokens: int64(usage.PromptTokensDetails.AudioTokens), ImageOutputTokens: int64(usage.CompletionTokenDetails.ImageTokens), AudioOutputTokens: int64(usage.CompletionTokenDetails.AudioTokens)}
 	if len(facts) > 0 && facts[0] != nil {
+		if facts[0].ImageOutputTokensUnknown {
+			record.UnmeasuredTokens = []string{"c", "img_o"}
+		}
 		record.ImageCount = facts[0].ImageCount
 		record.AudioInputSeconds = facts[0].AudioInputSeconds
 		record.AudioOutputSeconds = facts[0].AudioOutputSeconds

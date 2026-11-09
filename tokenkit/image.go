@@ -59,6 +59,35 @@ func ImageTokens(model string, img Image) int {
 	}
 }
 
+// ImageOutputTokens estimates generated image tokens from the documented
+// GPT Image output table. Auto settings and other models remain unmeasured.
+// https://developers.openai.com/api/docs/guides/image-generation#earlier-gpt-image-models
+func ImageOutputTokens(model, size, quality string) (int, bool) {
+	if model != "gpt-image-1" && model != "gpt-image-1.5" {
+		return 0, false
+	}
+	var tokens [3]int
+	switch quality {
+	case "low":
+		tokens = [3]int{272, 408, 400}
+	case "medium":
+		tokens = [3]int{1056, 1584, 1568}
+	case "high":
+		tokens = [3]int{4160, 6240, 6208}
+	default:
+		return 0, false
+	}
+	switch size {
+	case "1024x1024":
+		return tokens[0], true
+	case "1024x1536":
+		return tokens[1], true
+	case "1536x1024":
+		return tokens[2], true
+	}
+	return 0, false
+}
+
 // ImageNeedsSize reports whether ImageTokens depends on the image dimensions
 // for model and detail. When it returns false, callers can skip reading the
 // image.

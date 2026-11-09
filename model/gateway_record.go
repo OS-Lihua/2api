@@ -17,19 +17,20 @@ import (
 // GatewayUsage contains measured quantities only. Provider extensions and raw
 // response data never enter request records.
 type GatewayUsage struct {
-	PromptTokens           int64   `json:"prompt_tokens"`
-	CompletionTokens       int64   `json:"completion_tokens"`
-	TotalTokens            int64   `json:"total_tokens"`
-	CachedTokens           int64   `json:"cached_tokens,omitempty"`
-	CacheCreationTokens    int64   `json:"cache_creation_tokens,omitempty"`
-	CacheCreation12hTokens int64   `json:"cache_creation_12h_tokens,omitempty"`
-	ImageInputTokens       int64   `json:"image_input_tokens,omitempty"`
-	AudioInputTokens       int64   `json:"audio_input_tokens,omitempty"`
-	ImageOutputTokens      int64   `json:"image_output_tokens,omitempty"`
-	AudioOutputTokens      int64   `json:"audio_output_tokens,omitempty"`
-	ImageCount             *int64  `json:"image_count,omitempty"`
-	AudioInputSeconds      *string `json:"audio_input_seconds,omitempty"`
-	AudioOutputSeconds     *string `json:"audio_output_seconds,omitempty"`
+	UnmeasuredTokens       []string `json:"unmeasured_tokens,omitempty"`
+	PromptTokens           int64    `json:"prompt_tokens"`
+	CompletionTokens       int64    `json:"completion_tokens"`
+	TotalTokens            int64    `json:"total_tokens"`
+	CachedTokens           int64    `json:"cached_tokens,omitempty"`
+	CacheCreationTokens    int64    `json:"cache_creation_tokens,omitempty"`
+	CacheCreation12hTokens int64    `json:"cache_creation_12h_tokens,omitempty"`
+	ImageInputTokens       int64    `json:"image_input_tokens,omitempty"`
+	AudioInputTokens       int64    `json:"audio_input_tokens,omitempty"`
+	ImageOutputTokens      int64    `json:"image_output_tokens,omitempty"`
+	AudioOutputTokens      int64    `json:"audio_output_tokens,omitempty"`
+	ImageCount             *int64   `json:"image_count,omitempty"`
+	AudioInputSeconds      *string  `json:"audio_input_seconds,omitempty"`
+	AudioOutputSeconds     *string  `json:"audio_output_seconds,omitempty"`
 }
 
 type GatewayRequest struct {

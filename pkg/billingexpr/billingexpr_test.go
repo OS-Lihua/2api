@@ -322,6 +322,33 @@ func TestMoneyExprPreservesImageCountCompatibility(t *testing.T) {
 	assert.False(t, trace.ImageQuantityPriced, "the failing request factor prevented quantity evaluation")
 }
 
+func TestMoneyExprUnmeasuredQuantitiesFailOnlyWhenRead(t *testing.T) {
+	count := 2
+	for _, tc := range []struct {
+		name, expression, want string
+		failure                bool
+	}{
+		{"output price", `tier("tokens",c*3)`, "", true},
+		{"output zero condition", `c == 0 ? tier("free",fixed(0)) : tier("tokens",c)`, "", true},
+		{"image output price", `tier("images",img_o)`, "", true},
+		{"unselected output", `true ? tier("free",fixed(0)) : tier("tokens",c)`, "0 USD", false},
+		{"short circuit", `false && c > 0 ? tier("tokens",c) : tier("free",fixed(0))`, "0 USD", false},
+		{"measured image quantity", `tier("images",fixed(0.02))*image_count`, "0.04 USD", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			amount, trace, err := billingexpr.RunMoneyExpr(tc.expression, billingexpr.MoneyInput{ImageCount: &count, Request: billingexpr.RequestInput{UnmeasuredTokens: map[string]bool{"c": true, "img_o": true}}}, "USD")
+			if tc.failure {
+				require.ErrorContains(t, err, "unknown")
+				assert.NotEmpty(t, trace.UnmeasuredTokens)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, amount.String())
+			assert.Empty(t, trace.UnmeasuredTokens)
+		})
+	}
+}
+
 func TestMoneyExprActualMediaQuantitiesKeepRequestProbesFrozen(t *testing.T) {
 	requested := 3
 	for _, actual := range []int{0, 1, 2} {

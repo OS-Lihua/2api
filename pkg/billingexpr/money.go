@@ -57,6 +57,7 @@ type MoneyConditionTrace struct {
 // MoneyTraceResult contains billing metadata without request bodies or headers.
 // FixedPrice is present even for an explicitly free request-priced leaf.
 type MoneyTraceResult struct {
+	UnmeasuredTokens    []string                `json:"unmeasured_tokens,omitempty"`
 	Currency            money.Currency          `json:"currency,omitempty"`
 	UnroundedAmount     string                  `json:"unrounded_amount,omitempty"`
 	Conditions          []MoneyConditionTrace   `json:"conditions,omitempty"`
@@ -96,7 +97,15 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 	if now.IsZero() {
 		now = clock.Now()
 	}
+	tokenValues := make(map[string]*big.Rat)
 	env := map[string]any{
+		"_money_token": func(name string) (*big.Rat, error) {
+			if input.Request.UnmeasuredTokens[name] {
+				trace.UnmeasuredTokens = append(trace.UnmeasuredTokens, name)
+				return nil, fmt.Errorf("token quantity %s is unknown", name)
+			}
+			return tokenValues[name], nil
+		},
 		"tier": func(name string, amount any) any {
 			trace.MatchedTier = name
 			return amount
@@ -203,10 +212,11 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 		quantities[name] = new(big.Rat).Set(quantity)
 	}
 	for _, name := range []string{"p", "c", "len", "cr", "cc", "cc1h", "cc12h", "img", "img_cr", "img_o", "ai", "ao"} {
-		env[name] = big.NewRat(input.Tokens[name], 1)
+		tokenValues[name] = big.NewRat(input.Tokens[name], 1)
 		if quantity, ok := quantities[name]; ok {
-			env[name] = quantity
+			tokenValues[name] = quantity
 		}
+		env[name] = tokenValues[name]
 	}
 	entry.moneyOnce.Do(func() {
 		_, body := ParseExprVersion(expression)
@@ -245,7 +255,7 @@ func compileMoneyProgram(body string, env map[string]any) (*vm.Program, []MoneyR
 	literalText := make(map[file.Location]string)
 	for _, token := range tokens {
 		switch token.Value {
-		case "_money_fixed", "_money_rule", "_money_condition", "_money_builtin", "_money_binary", "_money_unary", "_money_index", "_money_image_quantity":
+		case "_money_token", "_money_fixed", "_money_rule", "_money_condition", "_money_builtin", "_money_binary", "_money_unary", "_money_index", "_money_image_quantity":
 			if token.Kind == lexer.Identifier {
 				return nil, nil, fmt.Errorf("expr compile error: identifier %q is reserved for internal use", token.Value)
 			}
@@ -338,6 +348,11 @@ type moneyPatcher struct {
 
 func (p *moneyPatcher) Visit(node *ast.Node) {
 	switch part := (*node).(type) {
+	case *ast.IdentifierNode:
+		switch part.Value {
+		case "p", "c", "len", "cr", "cc", "cc1h", "cc12h", "img", "img_cr", "img_o", "ai", "ao":
+			ast.Patch(node, &ast.CallNode{Callee: &ast.IdentifierNode{Value: "_money_token"}, Arguments: []ast.Node{&ast.StringNode{Value: part.Value}}})
+		}
 	case *ast.IntegerNode:
 		ast.Patch(node, &ast.ConstantNode{Value: int(p.literals[part.Location()].Num().Int64())})
 	case *ast.FloatNode:
