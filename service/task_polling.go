@@ -158,16 +158,31 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 	allTasks := model.GetAllUnFinishSyncTasks(constant.TaskQueryLimit)
 	summary.UnfinishedTasks = len(allTasks)
 	platformTask := make(map[constant.TaskPlatform][]*model.Task)
+	gatewayTasks := make(map[int][]*model.Task)
 	for _, t := range allTasks {
 		if t.PrivateData.Gateway != nil {
 			if t.PrivateData.Gateway.Accepted {
-				if err := UpdateGatewayTask(ctx, t); err != nil {
-					logger.LogError(ctx, "Gateway task polling remains pending for task "+t.TaskID)
-				}
+				providerID := t.PrivateData.Gateway.ProviderID
+				gatewayTasks[providerID] = append(gatewayTasks[providerID], t)
 			}
 			continue
 		}
 		platformTask[t.Platform] = append(platformTask[t.Platform], t)
+	}
+	var gatewayPolls sync.WaitGroup
+	for _, tasks := range gatewayTasks {
+		gatewayPolls.Add(1)
+		gopool.Go(func() {
+			defer gatewayPolls.Done()
+			for _, task := range tasks {
+				if ctx.Err() != nil {
+					return
+				}
+				if err := UpdateGatewayTask(ctx, task); err != nil {
+					logger.LogError(ctx, "Gateway task polling remains pending for task "+task.TaskID)
+				}
+			}
+		})
 	}
 
 	totalPlatforms := len(platformTask)
@@ -218,6 +233,7 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 
 		DispatchPlatformUpdate(ctx, platform, taskChannelM, taskM)
 	}
+	gatewayPolls.Wait()
 	if report != nil && ctx.Err() == nil {
 		report(totalPlatforms, totalPlatforms)
 	}

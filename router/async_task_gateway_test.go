@@ -2540,6 +2540,60 @@ func TestAsyncTaskRejectedAttemptsPreserveErrorsAndUnknownCosts(t *testing.T) {
 	}
 }
 
+func TestAsyncTaskPollingKeepsOtherProvidersAndLegacyProgressing(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			_, _ = io.WriteString(w, `{"id":"slow-poll-job","status":"queued"}`)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		close(started)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	})
+	first := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+	fixture.fake.Advance(time.Second)
+	peer := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			_, _ = io.WriteString(w, `{"id":"ready-poll-job","status":"queued"}`)
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/v1/videos/")
+		_, _ = fmt.Fprintf(w, `{"id":%q,"status":"completed","seconds":"2"}`, id)
+	})
+	require.NoError(t, model.DB.Model(peer).Updates(map[string]any{"protocol": "task:sora", "upstream_model_name": "sora-2"}).Error)
+	require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: peer.ID, Currency: "USD", Expression: `tier("video", u("seconds") * 0.05)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+	require.NoError(t, model.DB.Model(fixture.channel).Update("status", model.ChannelDisabled).Error)
+	second := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+	require.Equal(t, http.StatusOK, second.Code, second.Body.String())
+	var ready model.Task
+	require.NoError(t, model.DB.Where("user_id = ? AND channel_id = ?", fixture.user.Id, peer.ProviderID).Take(&ready).Error)
+	legacy := &model.Task{TaskID: "legacy-poll-progress", Platform: ready.Platform, UserId: fixture.user.Id, Group: ready.Group, ChannelId: ready.ChannelId, Action: ready.Action, Status: model.TaskStatusSubmitted, SubmitTime: clock.Now().Unix(), Properties: ready.Properties, PrivateData: model.TaskPrivateData{UpstreamTaskID: "legacy-poll-job"}}
+	require.NoError(t, model.DB.Create(legacy).Error)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { service.RunTaskPollingOnce(ctx, nil); close(done) }()
+	defer func() { cancel(); <-done }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "polling did not reach the controlled slow Provider")
+	}
+	assert.Eventually(t, func() bool {
+		var completed int64
+		err := model.DB.Model(&model.Task{}).Where("id IN ? AND status = ?", []int64{ready.ID, legacy.ID}, model.TaskStatusSuccess).Count(&completed).Error
+		return err == nil && completed == 2
+	}, 2*time.Second, 10*time.Millisecond, "another Provider's accepted task and legacy task must complete while the slow Provider is still blocked")
+}
+
 func TestAsyncTaskPollingHonorsCallerCancellation(t *testing.T) {
 	for _, hook := range []bool{false, true} {
 		t.Run(fmt.Sprintf("parse_hook=%t", hook), func(t *testing.T) {
