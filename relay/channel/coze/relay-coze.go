@@ -76,11 +76,13 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 			if item.Get("type").String() != "answer" {
 				continue
 			}
-			var text string
-			if common.UnmarshalJsonStr(item.Get("content").Raw, &text) != nil {
-				continue
+			text := relaycommon.SourceText(item.Get("content"))
+			reasoning := relaycommon.SourceText(item.Get("reasoning_content"))
+			message := dto.Message{Role: "assistant", Content: text}
+			if reasoning != "" {
+				message.ReasoningContent = &reasoning
 			}
-			source.Choices = []dto.OpenAITextResponseChoice{{Message: dto.Message{Role: "assistant", Content: text}}}
+			source.Choices = append(source.Choices, dto.OpenAITextResponseChoice{Message: message})
 		}
 		info.ResponseFacts.RecordChatSource(&source, info.TokenizerModelName())
 	}
@@ -100,9 +102,11 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 	response.Id = helper.GetResponseID(c)
 
 	var responseContent json.RawMessage
+	var responseReasoning string
 	for _, data := range cozeResponse.Data {
 		if data.Type == "answer" {
 			responseContent = data.Content
+			responseReasoning = data.ReasoningContent
 			response.Created = data.CreatedAt
 		}
 	}
@@ -115,6 +119,9 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 		},
 	}
 	if info.ResponseFacts != nil {
+		if responseReasoning != "" {
+			response.Choices[0].Message.ReasoningContent = &responseReasoning
+		}
 		if len(responseContent) > 0 {
 			var text string
 			if err := common.Unmarshal(responseContent, &text); err != nil {
@@ -122,7 +129,11 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 			}
 			response.Choices[0].Message.Content = text
 		}
-		return helper.WriteChatResponse(c, info, resp, &response)
+		sourceText, sourceTokens, sourceObserved := info.ResponseFacts.SourceGeneratedText, info.ResponseFacts.SourceOutputTokens, info.ResponseFacts.SourceOutputObserved
+		result, failure := helper.WriteChatResponse(c, info, resp, &response)
+		info.ResponseFacts.SourceGeneratedText, info.ResponseFacts.SourceOutputTokens = sourceText, sourceTokens
+		info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || sourceObserved
+		return result, failure
 	}
 	jsonResponse, err := common.Marshal(response)
 	if err != nil {

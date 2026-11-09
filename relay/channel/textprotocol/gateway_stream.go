@@ -140,7 +140,8 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 					return
 				}
 				current := choices[index]
-				current.finished = current.finished || choice.Get(terminal).String() != ""
+				reason := choice.Get(terminal).String()
+				current.finished = current.finished || reason != "" && (p.format != types.RelayFormatGemini || reason != "FINISH_REASON_UNSPECIFIED")
 				if p.format == types.RelayFormatOpenAI {
 					if delta := choice.Get("delta"); delta.IsObject() {
 						current.audioDone = false
@@ -369,7 +370,7 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 		}
 	}
 	terminal := gatewayTerminalSnapshot(body, info.RelayFormat)
-	if (terminal || output.sourceTerminal || len(output.pendingTerminal) > 0) && !output.terminalReady && !info.PerformanceBusinessRejection {
+	if (terminal || output.sourceTerminal) && !output.terminalReady && !info.PerformanceBusinessRejection {
 		// Terminal snapshots can contain complete image or audio payloads.
 		if int64(output.terminalBytes)+int64(len(body)) > channel.GatewayResponseSourceLimit() {
 			return "", helper.ErrGatewayStreamPreludeLimit
@@ -448,7 +449,7 @@ func gatewayTerminalSnapshot(body []byte, format types.RelayFormat) bool {
 		}
 	case types.RelayFormatGemini:
 		for _, candidate := range root.Get("candidates").Array() {
-			if candidate.Get("finishReason").String() != "" {
+			if reason := candidate.Get("finishReason").String(); reason != "" && reason != "FINISH_REASON_UNSPECIFIED" {
 				return true
 			}
 		}

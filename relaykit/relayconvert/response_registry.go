@@ -1267,14 +1267,36 @@ func asOAIChatResponse(response any) (*dto.OpenAITextResponse, error) {
 }
 
 func asOAIChatStreamResponse(response any) (*dto.ChatCompletionsStreamResponse, error) {
+	var chunk *dto.ChatCompletionsStreamResponse
 	switch resp := response.(type) {
 	case *dto.ChatCompletionsStreamResponse:
-		return resp, nil
+		chunk = resp
 	case dto.ChatCompletionsStreamResponse:
-		return &resp, nil
+		chunk = &resp
 	default:
 		return nil, fmt.Errorf("expected OAI chat stream response, got %T", response)
 	}
+	normalized := *chunk
+	normalized.Choices = append([]dto.ChatCompletionsStreamResponseChoice(nil), chunk.Choices...)
+	for i := range normalized.Choices {
+		choice := &normalized.Choices[i]
+		if len(choice.Delta.FunctionCall) > 0 && len(choice.Delta.ToolCalls) == 0 {
+			var function dto.FunctionResponse
+			if err := kitutil.Unmarshal(choice.Delta.FunctionCall, &function); err != nil {
+				return nil, err
+			}
+			if function.Name != "" || function.Arguments != "" {
+				index := 0
+				choice.Delta.ToolCalls = []dto.ToolCallResponse{{Index: &index, Type: "function", Function: function}}
+			}
+			choice.Delta.FunctionCall = nil
+		}
+		if choice.FinishReason != nil && *choice.FinishReason == "function_call" {
+			reason := "tool_calls"
+			choice.FinishReason = &reason
+		}
+	}
+	return &normalized, nil
 }
 
 func asOAIResponsesResponse(response any) (*dto.OpenAIResponsesResponse, error) {

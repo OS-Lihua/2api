@@ -72,6 +72,13 @@ func (o *gatewayGeneratedOutput) ObserveChat(body []byte) {
 			index = reported.Int()
 		}
 		o.appendChoice(index, relaycommon.ChatStreamChoiceBusinessText(choice))
+		legacy := choice.Get("delta.function_call")
+		if relaycommon.SourceText(legacy.Get("name")) != "" || relaycommon.SourceText(legacy.Get("arguments")) != "" {
+			if o.chatTools == nil {
+				o.chatTools = map[[2]int64]struct{}{}
+			}
+			o.chatTools[[2]int64{index, -1}] = struct{}{}
+		}
 		for j, tool := range choice.Get("delta.tool_calls").Array() {
 			toolIndex := int64(j)
 			if reported := tool.Get("index"); reported.Exists() {

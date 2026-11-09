@@ -163,10 +163,7 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 		info.ResponseFacts.RecordNativeUsage(usage, info.ResponseFacts.UnterminatedStreamData, "Usage.PromptTokens", "Usage.CompletionTokens")
 		partial := relaycommon.SanitizeNativeUsage(info.ResponseFacts.UnterminatedStreamData, "Usage")
 		info.ResponseFacts.UnterminatedStreamData = nil
-		var complete common.RawMessage
-		if common.Unmarshal(partial, &complete) == nil {
-			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(partial, "Choices", "Delta.Content"))
-		}
+		helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(partial, "Choices", "Delta.Content"))
 	}
 	if err := scanner.Err(); err != nil {
 		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)

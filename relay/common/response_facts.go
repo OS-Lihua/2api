@@ -45,6 +45,8 @@ func ChatStreamChoiceBusinessText(choice gjson.Result) string {
 	}
 	text.WriteString(SourceText(choice.Get("delta.refusal")))
 	text.WriteString(SourceText(choice.Get("delta.audio.transcript")))
+	text.WriteString(SourceText(choice.Get("delta.function_call.name")))
+	text.WriteString(SourceText(choice.Get("delta.function_call.arguments")))
 	for _, tool := range choice.Get("delta.tool_calls").Array() {
 		for _, field := range []string{"function.name", "function.arguments", "custom.name", "custom.input"} {
 			text.WriteString(SourceText(tool.Get(field)))

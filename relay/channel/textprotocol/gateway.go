@@ -127,6 +127,8 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 			sourceOutput.text.WriteString(relaycommon.SourceText(reasoning))
 			sourceOutput.text.WriteString(relaycommon.SourceText(message.Get("refusal")))
 			sourceOutput.text.WriteString(relaycommon.SourceText(message.Get("audio.transcript")))
+			sourceOutput.text.WriteString(relaycommon.SourceText(message.Get("function_call.name")))
+			sourceOutput.text.WriteString(relaycommon.SourceText(message.Get("function_call.arguments")))
 			for _, tool := range message.Get("tool_calls").Array() {
 				for _, path := range []string{"function.name", "function.arguments", "custom.name", "custom.input"} {
 					sourceOutput.text.WriteString(relaycommon.SourceText(tool.Get(path)))
