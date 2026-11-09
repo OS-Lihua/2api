@@ -85,7 +85,7 @@ func calculateAudioQuota(info QuotaInfo) (int, *common.QuotaClamp) {
 }
 
 func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.RealtimeUsage) error {
-	if relayInfo.UsePrice {
+	if relayInfo.UsePrice || relayInfo.PriceData.UsePrice {
 		return nil
 	}
 	modelName := relayInfo.OriginModelName

@@ -61,6 +61,7 @@
 "Realtime input modality is not supported on this connection": "Realtime input modality is not supported on this connection"
 "Realtime input must be an array": "Realtime input must be an array"
 "Realtime input token budget exceeded": "Realtime input token budget exceeded"
+"Realtime retained request body budget exceeded": "Realtime retained request body budget exceeded"
 "Realtime pending request body budget exceeded": "Realtime pending request body budget exceeded"
 "Realtime price cannot be evaluated": "Realtime price cannot be evaluated"
 "Realtime request did not start": "Realtime request did not start"

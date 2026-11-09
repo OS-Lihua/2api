@@ -248,10 +248,18 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 	}
 	payload, err := call.CreatePayload(body)
 	if err != nil {
+		var parameterErr *service.GatewayParameterError
+		if errors.As(err, &parameterErr) {
+			return nil, parameterErr
+		}
 		return nil, &service.GatewayParameterError{Path: "request", Reason: "Invalid effective WebSocket request"}
 	}
 	prepared, err := call.Prepare(candidate, info)
 	if err != nil {
+		var parameterErr *service.GatewayParameterError
+		if errors.As(err, &parameterErr) {
+			return nil, parameterErr
+		}
 		return nil, service.ErrGatewayUnavailable
 	}
 	for name, values := range prepared.Headers() {

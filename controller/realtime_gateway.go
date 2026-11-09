@@ -49,6 +49,9 @@ type realtimeGatewayResponse struct {
 	finishing         bool
 	inputObservation  service.RealtimeInputObservation
 	inputSnapshot     *service.RealtimeInputSnapshot
+	retainedBytes     int
+	headerBytes       int
+	payloadBytes      int
 }
 
 type realtimeGatewayAttempt struct {
@@ -126,6 +129,7 @@ type realtimeGatewaySession struct {
 	autoPending                                   bool
 	vadBytes                                      int
 	queuedBytes                                   int
+	retainedBytes                                 int
 }
 
 func RealtimeGateway(c *gin.Context) {
@@ -284,6 +288,11 @@ func (session *realtimeGatewaySession) begin(body, original []byte, input *dto.U
 			return response
 		}
 	}
+	if err := response.retainRequestBytes(len(projection) + len(original)); err != nil {
+		response.apiErr = types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusRequestEntityTooLarge)
+		close(response.finalized)
+		return response
+	}
 	call.Native = &relay.NativeWSLifecycle{Protocol: protocol.OpenAIRealtime, TransportOnly: session.channelID == 0, OriginalBody: append([]byte(nil), original...), StartedAt: startedAt, InputUsage: service.GatewayUsageSnapshot(input), EstimateInput: response.estimateInput, Prepare: response.prepare, CreatePayload: response.payload,
 		Exchange: response.exchange, Established: response.connected, TerminalDelivered: response.delivered, SaleInput: response.saleInput, PurchaseInput: response.purchaseInput}
 	if !call.Native.TransportOnly && session.sequence == 2 {
@@ -324,6 +333,20 @@ func (response *realtimeGatewayResponse) estimateInput(body []byte, caps capabil
 	return response.inputSnapshot.EstimateForCapabilities(body, caps)
 }
 
+func (response *realtimeGatewayResponse) retainRequestBytes(additional int) error {
+	// The transport owner waits in next while preparation changes this budget.
+	maximum := constant.MaxRequestBodyMB
+	if maximum <= 0 {
+		maximum = 128
+	}
+	if additional > maximum<<20-response.session.queuedBytes-response.session.retainedBytes {
+		return &service.GatewayParameterError{Path: "request", Reason: "Realtime retained request body budget exceeded"}
+	}
+	response.retainedBytes += additional
+	response.session.retainedBytes += additional
+	return nil
+}
+
 func (response *realtimeGatewayResponse) prepare(c *gin.Context, info *relaycommon.RelayInfo) (*relaychannel.PreparedWssRequest, error) {
 	prepared, err := relay.PrepareNativeWebSocketRequest(c, info, protocol.OpenAIRealtime)
 	if err != nil {
@@ -332,6 +355,20 @@ func (response *realtimeGatewayResponse) prepare(c *gin.Context, info *relaycomm
 	if response.established && prepared.Identity() != response.session.identity {
 		return nil, errors.New("Upstream connection settings changed; reconnect required")
 	}
+	headerBytes := 0
+	for name, value := range info.RequestHeaders {
+		headerBytes += len(name) + len(value)
+	}
+	for name, values := range prepared.Headers() {
+		headerBytes += 2 * len(name)
+		for _, value := range values {
+			headerBytes += 2*len(value) + 2
+		}
+	}
+	if err := response.retainRequestBytes(headerBytes - response.headerBytes); err != nil {
+		return nil, err
+	}
+	response.headerBytes = headerBytes
 	return prepared, nil
 }
 func (response *realtimeGatewayResponse) payload(body []byte) ([]byte, error) {
@@ -355,7 +392,12 @@ func (response *realtimeGatewayResponse) payload(body []byte) ([]byte, error) {
 	if err := event.SetRawBytes("response", document.Bytes()); err != nil {
 		return nil, err
 	}
-	return event.Bytes(), nil
+	payload := event.Bytes()
+	if err := response.retainRequestBytes(len(payload) - response.payloadBytes); err != nil {
+		return nil, err
+	}
+	response.payloadBytes = len(payload)
+	return payload, nil
 }
 func (response *realtimeGatewayResponse) connected() bool { return response.established }
 func (response *realtimeGatewayResponse) delivered() bool { return response.terminalDelivered }
@@ -455,7 +497,7 @@ func (session *realtimeGatewaySession) requestAt(raw []byte, startedAt time.Time
 		if maximum <= 0 {
 			maximum = 128
 		}
-		remaining := maximum<<20 - session.queuedBytes
+		remaining := maximum<<20 - session.queuedBytes - session.retainedBytes
 		if len(raw) > remaining {
 			return nil, types.NewErrorWithStatusCode(errors.New("Realtime pending request body budget exceeded"), types.ErrorCodeInvalidRequest, http.StatusRequestEntityTooLarge)
 		}
@@ -595,6 +637,9 @@ func (session *realtimeGatewaySession) admitGeneration(body, original []byte, in
 		}
 		select {
 		case <-previous.finalized:
+			if previous != session.initial {
+				session.retainedBytes -= previous.retainedBytes
+			}
 		case <-session.context.Done():
 			return nil, types.NewError(context.Cause(session.context), types.ErrorCodeDoRequestFailed)
 		}

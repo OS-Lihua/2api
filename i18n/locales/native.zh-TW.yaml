@@ -61,6 +61,7 @@
 "Realtime input modality is not supported on this connection": "此連接不支持該 Realtime 輸入模態"
 "Realtime input must be an array": "Realtime 輸入必須為數組"
 "Realtime input token budget exceeded": "已超出 Realtime 輸入 token 預算"
+"Realtime retained request body budget exceeded": "已超出 Realtime 保留請求體預算"
 "Realtime pending request body budget exceeded": "已超出 Realtime 待處理請求體預算"
 "Realtime price cannot be evaluated": "無法計算 Realtime 價格"
 "Realtime request did not start": "Realtime 請求未啓動"

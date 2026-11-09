@@ -2468,10 +2468,10 @@ func TestRealtimeGatewayAcceptsNativeToolChoice(t *testing.T) {
 
 func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
 	for _, tc := range []struct {
-		name                            string
-		tools, malformed, before, fixed bool
+		name                                      string
+		tools, malformed, before, fixed, lowFunds bool
 	}{
-		{name: "text"}, {name: "tools", tools: true}, {name: "text_error", malformed: true}, {name: "tools_error", tools: true, malformed: true}, {name: "no_generation_error", malformed: true, before: true}, {name: "fixed_error", malformed: true, fixed: true}, {name: "fixed_success", fixed: true},
+		{name: "text"}, {name: "tools", tools: true}, {name: "text_error", malformed: true}, {name: "tools_error", tools: true, malformed: true}, {name: "no_generation_error", malformed: true, before: true}, {name: "fixed_error", malformed: true, fixed: true}, {name: "fixed_success", fixed: true}, {name: "fixed_low_funds", fixed: true, lowFunds: true},
 	} {
 		withTools, malformed := tc.tools, tc.malformed
 		t.Run(tc.name, func(t *testing.T) {
@@ -2498,9 +2498,15 @@ func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
 			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4o":1}`))
 			require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(`{"gpt-4o":1}`))
 			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{}`))
+			initialQuota := 1_000_000
 			if tc.fixed {
-				require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"gpt-4o":0.01}`))
+				price := `{"gpt-4o":0.01}`
 				expected = 4500
+				if tc.lowFunds {
+					price = `{"gpt-4o":0.0001}`
+					expected, initialQuota = 45, 100
+				}
+				require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(price))
 				if malformed {
 					expected = 0
 				}
@@ -2510,7 +2516,7 @@ func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
 				require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(oldCompletion))
 				require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(oldPrice))
 			})
-			require.NoError(t, model.DB.Model(fixture.user).Updates(map[string]any{"quota": 1_000_000, "setting": `{"billing_preference":"wallet_only"}`}).Error)
+			require.NoError(t, model.DB.Model(fixture.user).Updates(map[string]any{"quota": initialQuota, "setting": `{"billing_preference":"wallet_only"}`}).Error)
 			done := make(chan struct{})
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				defer close(done)
@@ -2582,11 +2588,11 @@ func TestRealtimeLegacyMissingUsageChargesTextCategories(t *testing.T) {
 			}
 			assert.Eventually(t, func() bool {
 				var user model.User
-				return model.DB.First(&user, fixture.user.Id).Error == nil && user.UsedQuota == expected && user.Quota == 1_000_000-expected
+				return model.DB.First(&user, fixture.user.Id).Error == nil && user.UsedQuota == expected && user.Quota == initialQuota-expected
 			}, 5*time.Second, 10*time.Millisecond, "Input instructions, current tool definitions and delivered output must all be charged; expected %d", expected)
 			var user model.User
 			require.NoError(t, model.DB.First(&user, fixture.user.Id).Error)
-			assert.Equal(t, 1_000_000-expected, user.Quota)
+			assert.Equal(t, initialQuota-expected, user.Quota)
 		})
 	}
 }
@@ -3356,6 +3362,106 @@ func TestRealtimeGatewayVADInterruptsOnlyDefaultConversation(t *testing.T) {
 			}, 5*time.Second, 10*time.Millisecond)
 			assert.Zero(t, records[0].Receivable.Nanos)
 			assertTextGatewayLedger(t, records[0], 10000)
+		})
+	}
+}
+
+func TestRealtimeGatewayRetainedRequestBudget(t *testing.T) {
+	for _, concurrent := range []bool{false, true} {
+		t.Run(fmt.Sprintf("concurrent=%t", concurrent), func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if !assert.NoError(t, err) {
+					return
+				}
+				defer peer.Close()
+				if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"modalities":["text"],"turn_detection":null}}`))) {
+					return
+				}
+				for {
+					if _, _, err := peer.ReadMessage(); err != nil {
+						return
+					}
+					id := fmt.Sprintf("retained-%d", calls.Add(1))
+					frames := []string{`{"type":"response.created","response":{"id":"` + id + `","status":"in_progress","conversation_id":null}}`, `{"type":"response.text.delta","response_id":"` + id + `","output_index":0,"delta":"Hi"}`}
+					if !concurrent {
+						frames = append(frames, `{"type":"response.done","response":{"id":"`+id+`","status":"completed","conversation_id":null,"usage":{"input_tokens":1,"output_tokens":1}}}`)
+					}
+					for _, frame := range frames {
+						if !assert.NoError(t, peer.WriteMessage(websocket.TextMessage, []byte(frame))) {
+							return
+						}
+					}
+				}
+			})
+			previous := constant.MaxRequestBodyMB
+			constant.MaxRequestBodyMB = 1
+			t.Cleanup(func() { constant.MaxRequestBodyMB = previous })
+			client := dialRealtimeGateway(t, fixture)
+			defer client.Close()
+			require.NoError(t, client.SetReadDeadline(time.Now().Add(15*time.Second)))
+			_, _, err := client.ReadMessage()
+			require.NoError(t, err)
+			request, err := common.Marshal(map[string]any{"type": "response.create", "response": map[string]any{"conversation": "none", "input": []any{}, "instructions": strings.Repeat(" hello", 21000), "max_output_tokens": 16}})
+			require.NoError(t, err)
+			for round := range 3 {
+				require.NoError(t, client.WriteMessage(websocket.TextMessage, request))
+				_, reply, err := client.ReadMessage()
+				require.NoError(t, err)
+				if concurrent && round == 2 {
+					assert.Equal(t, "error", ojson.GetBytes(reply, "type").String())
+					assert.Contains(t, string(reply), "budget")
+					break
+				}
+				require.Equal(t, "response.created", ojson.GetBytes(reply, "type").String())
+				_, _, err = client.ReadMessage()
+				require.NoError(t, err)
+				if !concurrent {
+					_, reply, err = client.ReadMessage()
+					require.NoError(t, err)
+					require.Equal(t, "response.done", ojson.GetBytes(reply, "type").String())
+				}
+			}
+			require.NoError(t, client.Close())
+			expected := 3
+			if concurrent {
+				expected = 2
+			}
+			assert.EqualValues(t, expected, calls.Load())
+			require.Eventually(t, func() bool {
+				var settled int64
+				if model.DB.Model(&model.GatewayBilling{}).Where("user_id = ? AND phase = ? AND published = ?", fixture.user.Id, "settled", true).Count(&settled).Error != nil || settled != int64(expected) {
+					return false
+				}
+				rows, _, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+				if err != nil || len(rows) != expected {
+					return false
+				}
+				for _, row := range rows {
+					if row.EndedAt == 0 {
+						return false
+					}
+				}
+				return true
+			}, 5*time.Second, 10*time.Millisecond)
+			rows, _, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+			require.NoError(t, err)
+			var sales int64
+			for _, row := range rows {
+				assert.Positive(t, row.Receivable.Nanos)
+				sales += row.Receivable.Nanos
+				attempts, _, err := model.ListGatewayAttempts(t.Context(), row.ID, 0, 10)
+				require.NoError(t, err)
+				require.Len(t, attempts, 1)
+				assert.Positive(t, attempts[0].Cost.Nanos)
+			}
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1_000_000_000)-sales, wallet.Balance.Nanos)
+			var count int64
+			require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Where("user_id = ?", fixture.user.Id).Count(&count).Error)
+			assert.EqualValues(t, expected, count)
 		})
 	}
 }
