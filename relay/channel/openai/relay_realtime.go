@@ -180,6 +180,21 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (apiErr 
 				Session *dto.RealtimeSession `json:"session"`
 			}
 			if err := common.Unmarshal(incoming.body, &event); err != nil {
+				result, _ := accumulator.Observe(incoming.body, input, false)
+				if result != nil {
+					if err := recordRealtimeResponse(c, info, result, sum); err != nil {
+						return err, sum
+					}
+				}
+				return types.NewError(errors.New("invalid upstream Realtime event"), types.ErrorCodeBadResponse), sum
+			}
+			if _, err := service.DecodeResponsesStreamEvent(incoming.body); err != nil {
+				result, _ := accumulator.Observe(incoming.body, input, false)
+				if result != nil {
+					if err := recordRealtimeResponse(c, info, result, sum); err != nil {
+						return err, sum
+					}
+				}
 				return types.NewError(errors.New("invalid upstream Realtime event"), types.ErrorCodeBadResponse), sum
 			}
 			if event.Session != nil && (event.Type == dto.RealtimeEventTypeSessionUpdated || event.Type == dto.RealtimeEventTypeSessionCreated) {

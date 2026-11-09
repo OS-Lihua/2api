@@ -71,6 +71,12 @@ type GatewayRouteInput struct {
 	Prepare                  func(*GatewaySelection) (*GatewayRouteFacts, error)
 }
 
+// GatewayParameterError retains a native parameter rejection through Route selection.
+type GatewayParameterError struct{ Path, Reason string }
+
+func (err *GatewayParameterError) Error() string { return err.Reason }
+func (err *GatewayParameterError) Unwrap() error { return ErrGatewayCapability }
+
 var ErrGatewayCapability = errors.New("no Channel supports the requested capabilities")
 var ErrGatewayConversion = errors.New("no Channel supports the requested conversion")
 var ErrGatewayUnavailable = errors.New("no Channel is available")
@@ -393,6 +399,11 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 // GatewayResponsesCapabilitiesMatch checks native request features without
 // converting stateful Responses fields through another wire protocol.
 func GatewayResponsesCapabilitiesMatch(request *dto.OpenAIResponsesRequest, caps capability.Set, inputTokens int, nativeModalities ...bool) bool {
+	return GatewayResponsesCapabilitiesFailure(request, caps, inputTokens, nativeModalities...) == nil
+}
+
+// GatewayResponsesCapabilitiesFailure identifies the first unsupported native parameter.
+func GatewayResponsesCapabilitiesFailure(request *dto.OpenAIResponsesRequest, caps capability.Set, inputTokens int, nativeModalities ...bool) *GatewayParameterError {
 	projection := &dto.GeneralOpenAIRequest{Model: request.Model, Stream: common.GetPointer(true), MaxCompletionTokens: request.MaxOutputTokens}
 	if len(request.Tools) > 0 && string(request.Tools) != "[]" && string(request.Tools) != "null" {
 		projection.Tools = make([]dto.ToolCallRequest, 1)
@@ -411,11 +422,21 @@ func GatewayResponsesCapabilitiesMatch(request *dto.OpenAIResponsesRequest, caps
 		Format *dto.ResponseFormat `json:"format"`
 	}
 	if len(request.Text) > 0 && common.Unmarshal(request.Text, &text) != nil {
-		return false
+		return &GatewayParameterError{Path: "text.format", Reason: "Invalid text format"}
 	}
 	projection.ResponseFormat = text.Format
-	if !GatewayCapabilitiesMatch(projection, caps, inputTokens, nativeModalities...) {
-		return false
+	if failure := gatewayCapabilitiesFailure(projection, caps, inputTokens, nativeModalities...); failure != nil {
+		switch failure.Path {
+		case "reasoning_effort":
+			failure.Path = "reasoning.effort"
+		case "response_format":
+			failure.Path = "text.format"
+		case "max_completion_tokens":
+			failure.Path = "max_output_tokens"
+		case "messages":
+			failure.Path = "input"
+		}
+		return failure
 	}
 	var images int64
 	for _, file := range request.GetTokenCountMeta().Files {
@@ -430,10 +451,13 @@ func GatewayResponsesCapabilitiesMatch(request *dto.OpenAIResponsesRequest, caps
 			modality = capability.Video
 		}
 		if !slices.Contains(caps.InputModalities, modality) {
-			return false
+			return &GatewayParameterError{Path: "input", Reason: "Input modality is not supported on this channel"}
 		}
 	}
-	return caps.Limits.MaxImages == nil || images <= *caps.Limits.MaxImages
+	if caps.Limits.MaxImages != nil && images > *caps.Limits.MaxImages {
+		return &GatewayParameterError{Path: "input", Reason: "Image count limit exceeded"}
+	}
+	return nil
 }
 
 // GatewayComparisonCost applies the current directional quote and its buffer.
@@ -620,35 +644,46 @@ func gatewayWeightedChoice(c *gin.Context, candidates []*GatewaySelection) int {
 
 // GatewayCapabilitiesMatch checks original and effective protocol facts.
 func GatewayCapabilitiesMatch(request *dto.GeneralOpenAIRequest, caps capability.Set, inputTokens int, nativeModalities ...bool) bool {
+	return gatewayCapabilitiesFailure(request, caps, inputTokens, nativeModalities...) == nil
+}
+
+func gatewayCapabilitiesFailure(request *dto.GeneralOpenAIRequest, caps capability.Set, inputTokens int, nativeModalities ...bool) *GatewayParameterError {
 	if request.Stream != nil && *request.Stream && !slices.Contains(caps.Features, capability.Streaming) {
-		return false
+		return &GatewayParameterError{Path: "stream", Reason: "Streaming is not supported on this channel"}
 	}
 	tools := len(request.Tools) > 0 || len(request.Functions) > 0
 	for _, message := range request.Messages {
 		tools = tools || len(message.Tools) > 0 || len(message.ParseToolCalls()) > 0 || message.Role == "tool"
 	}
 	if tools && !slices.Contains(caps.Features, capability.ToolCalling) {
-		return false
+		return &GatewayParameterError{Path: "tools", Reason: "Tool calling is not supported on this channel"}
 	}
 	if (request.ReasoningEffort != "" && request.ReasoningEffort != "none" || len(request.Reasoning) > 0) && !slices.Contains(caps.Features, capability.Reasoning) {
-		return false
+		return &GatewayParameterError{Path: "reasoning_effort", Reason: "Reasoning is not supported on this channel"}
 	}
 	if request.ResponseFormat != nil && request.ResponseFormat.Type != "" && request.ResponseFormat.Type != "text" && !slices.Contains(caps.Features, capability.StructuredOutput) {
-		return false
+		return &GatewayParameterError{Path: "response_format", Reason: "Structured output is not supported on this channel"}
 	}
 	if (request.PromptCacheKey != "" || len(request.PromptCacheOptions) > 0 || len(request.PromptCacheRetention) > 0) && !slices.Contains(caps.Features, capability.Caching) {
-		return false
+		path := "prompt_cache_key"
+		if len(request.PromptCacheOptions) > 0 {
+			path = "prompt_cache_options"
+		}
+		if len(request.PromptCacheRetention) > 0 {
+			path = "prompt_cache_retention"
+		}
+		return &GatewayParameterError{Path: path, Reason: "Prompt caching is not supported on this channel"}
 	}
 	if (len(nativeModalities) == 0 || !nativeModalities[0]) && (!slices.Contains(caps.InputModalities, capability.Text) || !slices.Contains(caps.OutputModalities, capability.Text)) {
-		return false
+		return &GatewayParameterError{Path: "messages", Reason: "Input or output text is not supported on this channel"}
 	}
 	var outputs []capability.Modality
 	if len(request.Modalities) > 0 && common.Unmarshal(request.Modalities, &outputs) != nil {
-		return false
+		return &GatewayParameterError{Path: "modalities", Reason: "Invalid output modalities"}
 	}
 	for _, output := range outputs {
 		if !slices.Contains(caps.OutputModalities, output) {
-			return false
+			return &GatewayParameterError{Path: "modalities", Reason: "Output modality is not supported on this channel"}
 		}
 	}
 	images := int64(0)
@@ -664,15 +699,18 @@ func GatewayCapabilitiesMatch(request *dto.GeneralOpenAIRequest, caps capability
 			modality = capability.Video
 		}
 		if !slices.Contains(caps.InputModalities, modality) {
-			return false
+			return &GatewayParameterError{Path: "messages", Reason: "Input modality is not supported on this channel"}
 		}
 	}
 	output := int64(request.GetMaxTokens())
 	if caps.Limits.MaxOutputTokens != nil && output > *caps.Limits.MaxOutputTokens {
-		return false
+		return &GatewayParameterError{Path: "max_completion_tokens", Reason: "Output token limit exceeded"}
 	}
 	if caps.Limits.ContextLength != nil && int64(inputTokens)+output > *caps.Limits.ContextLength {
-		return false
+		return &GatewayParameterError{Path: "messages", Reason: "Context token limit exceeded"}
 	}
-	return caps.Limits.MaxImages == nil || images <= *caps.Limits.MaxImages
+	if caps.Limits.MaxImages != nil && images > *caps.Limits.MaxImages {
+		return &GatewayParameterError{Path: "messages", Reason: "Image count limit exceeded"}
+	}
+	return nil
 }

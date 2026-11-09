@@ -99,7 +99,17 @@ func DecodeResponsesStreamEvent(raw []byte) (*dto.ResponsesStreamResponse, error
 	}
 	var event dto.ResponsesStreamResponse
 	if err := common.Unmarshal(body, &event); err != nil {
-		return nil, err
+		var identity struct {
+			Response *struct {
+				ID string `json:"id"`
+			} `json:"response"`
+		}
+		if common.Unmarshal(body, &identity) != nil || identity.Response == nil || identity.Response.ID == "" || !reported.IsObject() {
+			return nil, err
+		}
+		partial := &dto.ResponsesStreamResponse{Response: &dto.OpenAIResponsesResponse{ID: identity.Response.ID, Usage: &dto.Usage{}}}
+		ApplyResponsesUsage(partial.Response.Usage, &dto.Usage{}, []byte(reported.Raw))
+		return partial, err
 	}
 	if event.Response != nil && reported.IsObject() {
 		event.Response.Usage = &dto.Usage{}

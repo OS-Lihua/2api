@@ -14,6 +14,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
@@ -33,7 +34,7 @@ import (
 )
 
 func gatewayError(c *gin.Context, status int, code, message string) {
-	c.AbortWithStatusJSON(status, gin.H{"error": types.OpenAIError{Code: code, Type: "gateway_error", Message: message}})
+	c.AbortWithStatusJSON(status, gin.H{"error": types.OpenAIError{Code: code, Type: "gateway_error", Message: i18n.T(c, message)}})
 }
 
 type textGatewayRun struct {
@@ -50,6 +51,7 @@ type textGatewayRun struct {
 	attemptUsage         map[string]*dto.Usage
 	saleTrace            *billingexpr.MoneyTraceResult
 	attemptTrace         map[string]billingexpr.MoneyTraceResult
+	nativeError          *types.NewAPIError
 	status               int
 	code, message        string
 }

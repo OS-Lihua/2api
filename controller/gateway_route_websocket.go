@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"slices"
 	"strings"
 	"time"
@@ -69,7 +70,7 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 	common.SetContextKey(candidate, constant.ContextKeyResponseFacts, info.ResponseFacts)
 	saleInput, err := helper.ResolveIncomingBillingExprRequestInput(candidate, info)
 	if err != nil {
-		return nil, service.ErrGatewayCapability
+		return nil, &service.GatewayParameterError{Path: "request", Reason: "Invalid request metadata"}
 	}
 	if call.Native != nil && len(call.Native.OriginalBody) > 0 {
 		saleInput.Body = call.Native.OriginalBody
@@ -99,27 +100,37 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 			originalTokens = original.Usage.PromptTokens
 		}
 	}
-	if err != nil || !service.GatewayResponsesCapabilitiesMatch(&call.Request, selection.Capabilities, originalTokens, call.Protocol() == protocol.OpenAIRealtime) {
-		return nil, service.ErrGatewayCapability
+	if err != nil {
+		var parameter *service.GatewayParameterError
+		if errors.As(err, &parameter) {
+			return nil, parameter
+		}
+		return nil, &service.GatewayParameterError{Path: "input", Reason: err.Error()}
+	}
+	if failure := service.GatewayResponsesCapabilitiesFailure(&call.Request, selection.Capabilities, originalTokens, call.Protocol() == protocol.OpenAIRealtime); failure != nil {
+		return nil, failure
 	}
 	document := ojson.NewDoc(append([]byte(nil), call.Body...))
 	if document.Set("model", info.UpstreamModelName) != nil {
-		return nil, service.ErrGatewayCapability
+		return nil, &service.GatewayParameterError{Path: "model", Reason: "Invalid effective WebSocket request"}
 	}
 	body, err := relaycommon.ApplyParamOverrideWithRelayInfo(document.Bytes(), info)
 	if err != nil {
-		return nil, service.ErrGatewayCapability
+		return nil, &service.GatewayParameterError{Path: "parameter_overrides", Reason: "Invalid request parameter overrides"}
 	}
 	inputUsage := &dto.Usage{}
 	if call.Native != nil && call.Native.EstimateInput != nil {
 		inputUsage, err = call.Native.EstimateInput(body, selection.Capabilities)
 		if err == nil {
 			body, err = helper.NormalizeRealtimeRequestLimits(body, selection.Capabilities, inputUsage.PromptTokens)
+			if err != nil {
+				return nil, &service.GatewayParameterError{Path: "max_output_tokens", Reason: err.Error()}
+			}
 		}
 	} else {
 		var effective dto.OpenAIResponsesRequest
 		if common.Unmarshal(body, &effective) != nil {
-			return nil, service.ErrGatewayCapability
+			return nil, &service.GatewayParameterError{Path: "request", Reason: "Invalid effective WebSocket request"}
 		}
 		info.ResponsesInputFacts, err = call.EstimateInput(candidate, info, &effective, selection.Capabilities)
 		if err == nil {
@@ -128,8 +139,24 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 	}
 	nativeModalities := call.Protocol() == protocol.OpenAIRealtime
 	var effective dto.OpenAIResponsesRequest
-	if err != nil || common.Unmarshal(body, &effective) != nil || effective.Model != info.UpstreamModelName || helper.ValidateResponsesMultipliers(body) != nil || !service.GatewayResponsesCapabilitiesMatch(&effective, selection.Capabilities, inputUsage.PromptTokens, nativeModalities) {
-		return nil, service.ErrGatewayCapability
+	if err != nil {
+		var parameter *service.GatewayParameterError
+		if errors.As(err, &parameter) {
+			return nil, parameter
+		}
+		return nil, &service.GatewayParameterError{Path: "input", Reason: err.Error()}
+	}
+	if common.Unmarshal(body, &effective) != nil {
+		return nil, &service.GatewayParameterError{Path: "request", Reason: "Invalid effective WebSocket request"}
+	}
+	if effective.Model != info.UpstreamModelName {
+		return nil, &service.GatewayParameterError{Path: "model", Reason: "Connection model is locked"}
+	}
+	if err := helper.ValidateResponsesMultipliers(body); err != nil {
+		return nil, &service.GatewayParameterError{Path: "max_output_tokens", Reason: err.Error()}
+	}
+	if failure := service.GatewayResponsesCapabilitiesFailure(&effective, selection.Capabilities, inputUsage.PromptTokens, nativeModalities); failure != nil {
+		return nil, failure
 	}
 	if effective.MaxOutputTokens == nil && call.Protocol() == protocol.OpenAIResponses {
 		var limit int64
@@ -147,14 +174,14 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 		if limit > 0 {
 			document = ojson.NewDoc(body)
 			if document.Set("max_output_tokens", limit) != nil {
-				return nil, service.ErrGatewayCapability
+				return nil, &service.GatewayParameterError{Path: "max_output_tokens", Reason: "Invalid effective WebSocket request"}
 			}
 			body = document.Bytes()
 			effective.MaxOutputTokens = common.GetPointer(uint(limit))
 		}
 	}
-	if !service.GatewayResponsesCapabilitiesMatch(&effective, selection.Capabilities, inputUsage.PromptTokens, nativeModalities) {
-		return nil, service.ErrGatewayCapability
+	if failure := service.GatewayResponsesCapabilitiesFailure(&effective, selection.Capabilities, inputUsage.PromptTokens, nativeModalities); failure != nil {
+		return nil, failure
 	}
 	if effective.MaxOutputTokens != nil {
 		mean = min(mean, int64(*effective.MaxOutputTokens))
@@ -166,7 +193,7 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 		mean = min(mean, *limit-int64(inputUsage.PromptTokens))
 	}
 	if mean < 0 {
-		return nil, service.ErrGatewayCapability
+		return nil, &service.GatewayParameterError{Path: "input", Reason: "Context token limit exceeded"}
 	}
 	estimated := service.GatewayUsageSnapshot(inputUsage)
 	estimated.CompletionTokens, estimated.TotalTokens = int(mean), estimated.PromptTokens+int(mean)
@@ -174,24 +201,24 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 		for _, path := range []string{"audio.output.format.type", "output_audio_format"} {
 			if format := ojson.GetBytes(body, path); format.Exists() {
 				if _, valid := service.NormalizeRealtimeAudioFormat(format.String()); format.Type != ojson.String || !valid {
-					return nil, service.ErrGatewayCapability
+					return nil, &service.GatewayParameterError{Path: path, Reason: "Unsupported Realtime response audio format"}
 				}
 			}
 		}
 		if rate := ojson.GetBytes(body, "audio.output.format.rate"); rate.Exists() && (rate.Type != ojson.Number || rate.Raw != "24000") {
-			return nil, service.ErrGatewayCapability
+			return nil, &service.GatewayParameterError{Path: "audio.output.format.rate", Reason: "PCM audio requires a sample rate of 24000"}
 		}
 		outputs := ojson.GetBytes(body, "output_modalities")
 		if !outputs.Exists() {
 			outputs = ojson.GetBytes(body, "modalities")
 		}
 		if outputs.Exists() && !outputs.IsArray() {
-			return nil, service.ErrGatewayCapability
+			return nil, &service.GatewayParameterError{Path: "output_modalities", Reason: "Invalid output modalities"}
 		}
 		audio := !outputs.Exists() && slices.Contains(selection.Capabilities.OutputModalities, capability.Audio)
 		for _, output := range outputs.Array() {
 			if output.Type != ojson.String || !slices.Contains(selection.Capabilities.OutputModalities, capability.Modality(output.String())) {
-				return nil, service.ErrGatewayCapability
+				return nil, &service.GatewayParameterError{Path: "output_modalities", Reason: "Output modality is not supported on this channel"}
 			}
 			if output.String() == "audio" {
 				audio = true
@@ -203,7 +230,7 @@ func prepareGatewayWebSocketRoute(c *gin.Context, selection *service.GatewaySele
 	}
 	payload, err := call.CreatePayload(body)
 	if err != nil {
-		return nil, service.ErrGatewayCapability
+		return nil, &service.GatewayParameterError{Path: "request", Reason: "Invalid effective WebSocket request"}
 	}
 	purchaseInput.Body = payload
 	info.SetEstimatePromptTokens(inputUsage.PromptTokens)

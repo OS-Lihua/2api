@@ -177,6 +177,9 @@ func (accumulator *RealtimeUsageAccumulator) Observe(raw []byte, input *dto.Usag
 	normalized := document.Bytes()
 	event, err := DecodeResponsesStreamEvent(normalized)
 	if err != nil {
+		if event != nil {
+			state.accumulator.Observe(event, normalized)
+		}
 		return nil, err
 	}
 	if event.Response != nil && event.Response.Usage != nil {
@@ -216,11 +219,11 @@ func (accumulator *RealtimeUsageAccumulator) Observe(raw []byte, input *dto.Usag
 	if delivered {
 		state.accumulator.RecordDelivery(event, normalized)
 	}
-	if err := state.accumulator.Err(); err != nil {
-		return nil, err
-	}
 	if delivered && realtimeBusinessOutput(event) {
 		state.info.ResponseFacts.MarkBusinessOutput()
+	}
+	if err := state.accumulator.Err(); err != nil {
+		return nil, err
 	}
 	if kind != "response.done" {
 		return nil, nil

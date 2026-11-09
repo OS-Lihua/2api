@@ -101,20 +101,36 @@ func (call *ResponsesWSCall) SetControlAuthenticator(runner ResponsesWSRequestRu
 // configuration is billed now but does not enter previous_response_id history.
 func (call *ResponsesWSCall) EstimateInput(c *gin.Context, info *relaycommon.RelayInfo, request *dto.OpenAIResponsesRequest, caps capability.Set) (*relaycommon.ResponsesInputFacts, error) {
 	if prompt := ojson.GetBytes(request.Prompt, "@this"); prompt.Exists() && prompt.Type != ojson.Null {
-		return nil, errors.New("Unknown prompt template; provide complete input and configuration")
+		return nil, &service.GatewayParameterError{Path: "prompt", Reason: "Unknown prompt template; provide complete input and configuration"}
 	}
 	if len(request.Conversation) > 0 && ojson.GetBytes(request.Conversation, "@this").Type != ojson.Null {
-		return nil, errors.New("Unknown conversation context; provide complete input")
+		return nil, &service.GatewayParameterError{Path: "conversation", Reason: "Unknown conversation context; provide complete input"}
 	}
 	for _, part := range request.ParseInput() {
 		if part.FileID != "" {
-			return nil, errors.New("Unknown file content; provide complete input")
+			path := "input"
+			for i, item := range ojson.GetBytes(request.Input, "@this").Array() {
+				field := "content"
+				if item.Get("type").String() == "function_call_output" || item.Get("type").String() == "custom_tool_call_output" {
+					field = "output"
+				}
+				for j, content := range item.Get(field).Array() {
+					if content.Get("file_id").String() == part.FileID {
+						path = fmt.Sprintf("input[%d].%s[%d].file_id", i, field, j)
+						break
+					}
+				}
+				if path != "input" {
+					break
+				}
+			}
+			return nil, &service.GatewayParameterError{Path: path, Reason: "Unknown file content; provide complete input"}
 		}
 	}
 	meta := request.GetTokenCountMeta()
 	usage, err := service.CountRequestUsage(c, meta, info)
 	if err != nil {
-		return nil, err
+		return nil, &service.GatewayParameterError{Path: "input", Reason: "Could not estimate request input"}
 	}
 	images := 0
 	for _, file := range meta.Files {
@@ -126,12 +142,12 @@ func (call *ResponsesWSCall) EstimateInput(c *gin.Context, info *relaycommon.Rel
 	if request.PreviousResponseID != "" {
 		previous, ok := call.session.contexts[request.PreviousResponseID]
 		if !ok {
-			return nil, errors.New("Unknown response context; provide complete input")
+			return nil, &service.GatewayParameterError{Path: "previous_response_id", Reason: "Unknown response context; provide complete input"}
 		}
 		inherited = append(inherited, previous.Context)
 		images += previous.ImageCount
 	}
-	for _, item := range ojson.GetBytes(request.Input, "@this").Array() {
+	for index, item := range ojson.GetBytes(request.Input, "@this").Array() {
 		kind := item.Get("type").String()
 		reference := kind == "item_reference" || kind == "" && item.Get("id").Type == ojson.String && !item.Get("content").Exists() && !item.Get("role").Exists()
 		if !reference {
@@ -139,24 +155,24 @@ func (call *ResponsesWSCall) EstimateInput(c *gin.Context, info *relaycommon.Rel
 		}
 		known := call.session.items[item.Get("id").String()]
 		if known == nil {
-			return nil, errors.New("Unknown response item; provide complete input")
+			return nil, &service.GatewayParameterError{Path: fmt.Sprintf("input[%d].id", index), Reason: "Unknown response item; provide complete input"}
 		}
 		inherited = append(inherited, known)
 	}
 	for _, previous := range inherited {
 		total := usage.PromptTokens + previous.PromptTokens
 		if total < usage.PromptTokens {
-			return nil, errors.New("Response context exceeds token limits")
+			return nil, &service.GatewayParameterError{Path: "input", Reason: "Response context exceeds token limits"}
 		}
 		usage.PromptTokens = total
 		usage.PromptTokensDetails.ImageTokens += previous.PromptTokensDetails.ImageTokens
 		usage.PromptTokensDetails.AudioTokens += previous.PromptTokensDetails.AudioTokens
 	}
 	if images > 0 && (!slices.Contains(caps.InputModalities, capability.Image) || caps.Limits.MaxImages != nil && int64(images) > *caps.Limits.MaxImages) {
-		return nil, service.ErrGatewayCapability
+		return nil, &service.GatewayParameterError{Path: "input", Reason: "Image input or image count is not supported on this channel"}
 	}
 	if usage.PromptTokensDetails.AudioTokens > 0 && !slices.Contains(caps.InputModalities, capability.Audio) {
-		return nil, service.ErrGatewayCapability
+		return nil, &service.GatewayParameterError{Path: "input", Reason: "Audio input is not supported on this connection"}
 	}
 	usage.TotalTokens = usage.PromptTokens
 	usage.PromptTokensDetails.TextTokens = usage.PromptTokens - usage.PromptTokensDetails.ImageTokens - usage.PromptTokensDetails.AudioTokens
@@ -750,7 +766,20 @@ func (s *responsesWSSession) receive(c *gin.Context, state *responsesWSCallState
 			}
 			decoded, decodeErr := service.DecodeResponsesStreamEvent(incoming.body)
 			if decodeErr != nil {
+				if decoded != nil && decoded.Response != nil {
+					id := decoded.Response.ID
+					stream := ojson.GetBytes(incoming.body, "stream_id").String()
+					if s.completed[id] || stream != "" && stream != create.StreamID {
+						continue
+					}
+					if responseID == "" || responseID == id {
+						responseID = id
+						accumulator.Observe(decoded, incoming.body)
+					}
+				}
 				info.StreamStatus.RecordError("invalid upstream websocket event")
+				state.closeCode = websocket.CloseInternalServerErr
+				return accumulator.Finish(), types.NewError(errors.New("invalid upstream WebSocket event"), types.ErrorCodeBadResponse)
 			} else {
 				event.ResponsesStreamResponse = *decoded
 				event.StreamID = ojson.GetBytes(incoming.body, "stream_id").String()

@@ -499,7 +499,7 @@ func (snapshot *RealtimeInputSnapshot) estimate(body []byte, caps *capability.Se
 	quantity := snapshot.conversation
 	value := ojson.ParseBytes(body)
 	if prompt := value.Get("prompt"); prompt.Exists() && prompt.Type != ojson.Null {
-		return nil, errors.New("Unknown prompt template; provide complete input and configuration")
+		return nil, &GatewayParameterError{Path: "prompt", Reason: "Unknown prompt template; provide complete input and configuration"}
 	}
 	items := value.Get("input")
 	if items.Exists() && items.Type != ojson.Null {
