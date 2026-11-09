@@ -554,8 +554,11 @@ export function extractCapabilities(ctx) {
   }
   const result = { input_modalities: input, output_modalities: ["video"] };
   if (usesKling4(ctx, req)) {
-    const settings = plainObject(kling4Submission(ctx).body.settings);
-    result.duration_seconds = settings.duration === undefined || settings.duration === null ? KLING4_MAX_SECONDS : kling4Duration(settings.duration);
+    // Output seconds do not bound an input video or an element's unknown media.
+    if (!input.includes("video")) {
+      const settings = plainObject(kling4Submission(ctx).body.settings);
+      result.duration_seconds = settings.duration === undefined || settings.duration === null ? KLING4_MAX_SECONDS : kling4Duration(settings.duration);
+    }
   } else result.duration_seconds = outboundDuration(req.vendorBody ? { metadata: req.vendorBody } : req);
   if (knownImages) result.image_count = imageCount;
   return result;

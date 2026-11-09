@@ -3238,6 +3238,56 @@ func TestAsyncTaskImageInRequestPollingUsesActualCredentialSlot(t *testing.T) {
 	assert.EqualValues(t, 910000000, wallet.Balance.Nanos)
 }
 
+func TestAsyncTaskKlingVideoInputCannotUseOutputDurationAsInputBound(t *testing.T) {
+	for _, input := range []string{"base_video", "feature_video", "element", "prompt"} {
+		t.Run(input, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"code":0,"data":{"id":"kling-input-job","status":"submitted"}}`)
+			})
+			source, err := plugins.Source("kling")
+			require.NoError(t, err)
+			jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+			_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "kling"})
+			require.NoError(t, err)
+			maximum := int64(10)
+			caps := capability.Set{InputModalities: []capability.Modality{capability.Text, capability.Image, capability.Video}, OutputModalities: []capability.Modality{capability.Video}, Limits: capability.Limits{MaxDurationSeconds: &maximum}}
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Updates(map[string]any{"model_name": "kling-4.0", "capabilities": caps}).Error)
+			require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:kling", "upstream_model_name": "kling-4.0"}).Error)
+			require.NoError(t, model.DB.Create(&model.ModelOfferingName{Name: "kling-4.0", OfferingID: fixture.offering.ID}).Error)
+			fixture.fake.Advance(time.Second)
+			for _, price := range []*model.PriceVersion{
+				{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("video",u("units")*0.001)`, EffectiveAt: clock.Now().Unix()},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("video",u("units")*0.0005)`, EffectiveAt: clock.Now().Unix()},
+			} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			builder := newPluginGenerationBuilder(fixture.engine.Routes(), nil, productionPluginRouteHandlers)
+			require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(builder.prepare))
+			fixture.engine.NoRoute((&pluginRouteDispatcher{registry: jsplugin.DefaultRegistry}).dispatch)
+			body := fmt.Sprintf(`{"contents":[{"type":%q,"url":"https://artifact.invalid/input.mp4","text":"A bird","element_id":"input-element"}],"settings":{"duration":3}}`, input)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/kling/omni-video/kling-4.0", body)
+			if input == "prompt" {
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				assert.EqualValues(t, 1, calls.Load())
+				return
+			}
+			require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+			assert.Zero(t, calls.Load())
+			var reservations int64
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
+			assert.Zero(t, reservations)
+			caps.Limits.MaxDurationSeconds = nil
+			require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
+			response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/kling/omni-video/kling-4.0", body)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.EqualValues(t, 1, calls.Load())
+		})
+	}
+}
+
 func TestAsyncTaskNativeMediaFactsUseFinalWire(t *testing.T) {
 	for _, test := range []struct {
 		name, plugin, model, path, body, overrides, expression, result string
