@@ -891,44 +891,25 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 	} else {
 		driverContext = a.submitContext(c, info)
 	}
-	parseBodies := []any{responseBody}
+	identitySource := responseBody
 	if sourceFailed && a.submitSourceFallback != nil {
-		parseBodies = append(parseBodies, a.submitSourceFallback)
+		identitySource = a.submitSourceFallback
 	}
-	var value any
+	value, err := a.plugin.Engine.Call(parseContext, "parseSubmitResponse", driverContext, map[string]any{"statusCode": resp.StatusCode, "headers": headers, "body": identitySource})
+	if err != nil {
+		return nil, service.TaskErrorWrapper(err, "plugin_submit_response_failed", http.StatusBadGateway, common.UpstreamAddresses(c)...)
+	}
+	if object, ok := value.(map[string]any); ok {
+		if _, forbidden := object["clientResponse"]; forbidden {
+			return nil, service.TaskErrorWrapperLocal(fmt.Errorf("parseSubmitResponse must not return clientResponse"), "plugin_submit_response_invalid", http.StatusBadGateway)
+		}
+	}
 	var parsed submitResponse
-	failureCode, failureReason := "plugin_submit_response_invalid", "invalid_result"
-	for _, source := range parseBodies {
-		value, err = a.plugin.Engine.Call(parseContext, "parseSubmitResponse", driverContext, map[string]any{"statusCode": resp.StatusCode, "headers": headers, "body": source})
-		failureCode, failureReason = "plugin_submit_response_failed", "hook_failed"
-		if err != nil {
-			continue
-		}
-		if object, ok := value.(map[string]any); ok {
-			if _, forbidden := object["clientResponse"]; forbidden {
-				return nil, service.TaskErrorWrapperLocal(fmt.Errorf("parseSubmitResponse must not return clientResponse"), "plugin_submit_response_invalid", http.StatusBadGateway)
-			}
-		}
-		failureCode, failureReason = "plugin_submit_response_invalid", "invalid_result"
-		parsed = submitResponse{}
-		err = convert(value, &parsed)
-		if err == nil && strings.TrimSpace(parsed.TaskID) != "" {
-			break
-		}
+	if err = convert(value, &parsed); err != nil || strings.TrimSpace(parsed.TaskID) == "" {
 		if err == nil {
 			err = fmt.Errorf("plugin returned an empty taskId")
 		}
-	}
-	if err != nil {
-		logger.LogDebug(
-			c,
-			"task_plugin subsystem=adaptor event=parse_submit_failed plugin=%q stage=parse_submit_response reason=%s status=%d elapsed_ms=%d",
-			a.plugin.Meta.Key,
-			failureReason,
-			resp.StatusCode,
-			time.Since(started).Milliseconds(),
-		)
-		return nil, service.TaskErrorWrapper(err, failureCode, http.StatusBadGateway, common.UpstreamAddresses(c)...)
+		return nil, service.TaskErrorWrapper(err, "plugin_submit_response_invalid", http.StatusBadGateway, common.UpstreamAddresses(c)...)
 	}
 	// Only an immediate terminal result goes unpersisted; any other task data
 	// is stored and keeps the persisted limit.
@@ -983,7 +964,11 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 	if a.keepReservation && info.BeginProviderCall == nil {
 		return response, nil
 	}
-	a.observeSubmitSourceCompletion(c, info, immediate, parsed.TaskID, parsed.TaskData, pluginState)
+	sourceTaskData := parsed.TaskData
+	if sourceFailed {
+		sourceTaskData = responseBody
+	}
+	a.observeSubmitSourceCompletion(c, info, immediate, parsed.TaskID, sourceTaskData, pluginState)
 	if eventStream && relaysSubmitEvents(c) && info.BeginProviderCall != nil {
 		response.Stream = a.submitStreamFacts(c, info, immediate, parsed.TaskID, pluginState)
 	}

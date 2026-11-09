@@ -2958,11 +2958,15 @@ func TestAsyncTaskNativeStreamSettlesObservedFacts(t *testing.T) {
 func TestAsyncTaskNativeStreamRetainsAcceptedIdentityAfterInvalidDelta(t *testing.T) {
 	for _, test := range []struct {
 		name            string
+		replacement     string
 		eraseID, cancel bool
+		immediate       bool
 	}{
 		{name: "erase-id-false"},
 		{name: "erase-id-true", eraseID: true},
+		{name: "replace-id", replacement: "other-real-id"},
 		{name: "caller-cancelled", cancel: true},
+		{name: "current-source-with-recovered-id", eraseID: true, immediate: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var submissions, queries atomic.Int32
@@ -2991,12 +2995,19 @@ func TestAsyncTaskNativeStreamRetainsAcceptedIdentityAfterInvalidDelta(t *testin
 		created(ctx, task) { return {id:task.task_id}; }
 	};
 	export function parseSubmitEventDelta(ctx, event, state) {
-		if (event.data === "Hello") return {changes:[{op:"set",path:[],value:{id:"accepted-real-id",status:"queued"}}],state:{},done:false,business:false};
+		if (event.data === "Hello") return {changes:[{op:"set",path:[],value:{id:"accepted-real-id",status:"queued",seconds:1}}],state:{},done:false,business:HAS_BUSINESS};
 		return {changes:INVALID_CHANGES,state:{},done:false,business:false};
 	}`
+			source = strings.Replace(source, "HAS_BUSINESS", fmt.Sprintf("%t", test.immediate), 1)
+			if test.immediate {
+				source = strings.Replace(source, "return { taskId, taskData: body };", `return {taskId,taskData:body,immediate:{status:"SUCCESS",progress:"100%"}};`, 1)
+			}
 			badChanges := `[{op:"append",path:["missing"],value:1}]`
-			if test.eraseID {
-				badChanges = `[{op:"set",path:["id"],value:""},{op:"append",path:["missing"],value:1}]`
+			if test.eraseID || test.replacement != "" {
+				badChanges = fmt.Sprintf(`[{op:"set",path:["id"],value:%q},{op:"append",path:["missing"],value:1}]`, test.replacement)
+			}
+			if test.immediate {
+				badChanges = `[{op:"set",path:["seconds"],value:2},` + strings.TrimPrefix(badChanges, "[")
 			}
 			source = strings.Replace(source, "INVALID_CHANGES", badChanges, 1)
 			_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "sora"})
@@ -3023,13 +3034,27 @@ func TestAsyncTaskNativeStreamRetainsAcceptedIdentityAfterInvalidDelta(t *testin
 			var task model.Task
 			require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
 			require.Equal(t, "accepted-real-id", task.PrivateData.UpstreamTaskID)
-			require.Equal(t, model.TaskStatus(model.TaskStatusSubmitted), task.Status)
+			if test.immediate {
+				require.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
+				assert.EqualValues(t, 2, task.PrivateData.Gateway.CompletionFacts["seconds"])
+				for range 2 {
+					_, err := service.RecoverGatewayTasks(t.Context(), 100)
+					require.ErrorIs(t, err, model.ErrGatewayEvaluationPending)
+				}
+				request, err := model.GetGatewayRequest(t.Context(), task.PrivateData.Gateway.Settlement.Request.ID, fixture.user.Id)
+				require.NoError(t, err)
+				assert.EqualValues(t, 90000000, request.Receivable.Nanos)
+				assertTextGatewayLedger(t, *request, 100000000)
+				assert.Zero(t, queries.Load())
+			} else {
+				require.Equal(t, model.TaskStatus(model.TaskStatusSubmitted), task.Status)
+				service.RunTaskPollingOnce(t.Context(), nil)
+				require.NoError(t, model.DB.First(&task, task.ID).Error)
+				assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
+				assert.EqualValues(t, 1, queries.Load())
+			}
 			assert.Equal(t, fixture.channel.ID, task.ChannelId)
-			service.RunTaskPollingOnce(t.Context(), nil)
-			require.NoError(t, model.DB.First(&task, task.ID).Error)
-			assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
 			assert.EqualValues(t, 1, submissions.Load())
-			assert.EqualValues(t, 1, queries.Load())
 			attempts, total, err := model.ListGatewayAttempts(t.Context(), task.PrivateData.Gateway.Settlement.Request.ID, 0, 10)
 			require.NoError(t, err)
 			require.EqualValues(t, 1, total)
