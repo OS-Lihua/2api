@@ -8608,7 +8608,7 @@ func TestMediaGatewayImageFrameFailuresKeepSaleAndProcurementSeparate(t *testing
 		charge, cost int64
 	}{
 		{"JSON second image write", true, false, false, 36_000_000, 60_000_000},
-		{"JSON second image write with complete usage", true, false, true, 108_000_000, 60_000_000},
+		{"JSON second image write with complete usage", true, false, true, 36_000_000, 60_000_000},
 		{"native DONE write", false, false, false, 0, 20_000_000},
 		{"native DONE flush", false, true, false, 0, 20_000_000},
 	} {
@@ -8652,11 +8652,11 @@ func TestMediaGatewayImageFrameFailuresKeepSaleAndProcurementSeparate(t *testing
 			assert.Equal(t, "downstream_write_failed", attempts[0].ErrorClass)
 			if tc.json {
 				require.NotNil(t, record.Usage.ImageCount)
-				expectedCount := int64(1)
+				assert.Equal(t, int64(1), *record.Usage.ImageCount)
 				if tc.fullUsage {
-					expectedCount = 3
+					assert.Equal(t, new(int64(0)), record.Usage.ImageOutputTokens)
+					assert.Equal(t, new(int64(0)), attempts[0].Usage.ImageOutputTokens)
 				}
-				assert.Equal(t, expectedCount, *record.Usage.ImageCount)
 				require.NotNil(t, attempts[0].Usage.ImageCount)
 				assert.Equal(t, int64(3), *attempts[0].Usage.ImageCount)
 			}
