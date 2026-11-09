@@ -59,9 +59,12 @@ func NewStreamScanner(reader io.Reader, maxBytes ...int) *bufio.Scanner {
 // for procurement observers without presenting it as a delivered event.
 func NewSSEEventScanner(reader io.Reader, facts *relaycommon.ResponseFacts) *bufio.Scanner {
 	scanner := NewStreamScanner(reader)
+	limit := getScannerBufferSize()
 	scanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
 		advance, token, err := splitSSEEvents(data, atEOF)
-		if err != nil && facts != nil {
+		// Scanner rejects an oversized token after this callback returns.
+		limitReached := advance == 0 && token == nil && len(data) >= limit
+		if facts != nil && (err != nil || limitReached) {
 			event := ParseSSEEvent(string(data))
 			facts.UnterminatedStreamData = []byte(event.Data)
 			facts.UnterminatedStreamEvent = event.Event

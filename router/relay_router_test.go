@@ -11234,6 +11234,47 @@ func TestTextGatewayCompleteLargeBusinessFrameIsDelivered(t *testing.T) {
 	}
 }
 
+func TestTextGatewayScannerLimitPreservesReceivedSource(t *testing.T) {
+	previous := constant.StreamScannerMaxBufferMB
+	constant.StreamScannerMaxBufferMB = 1
+	t.Cleanup(func() { constant.StreamScannerMaxBufferMB = previous })
+	text := strings.Repeat("x", 2<<20)
+	for _, test := range []struct {
+		name, body, key string
+		provider        int
+	}{
+		{"Chat", `data: {"usage":{"prompt_tokens":10,"completion_tokens":5},"choices":[{"index":0,"delta":{"content":"` + text + `"}}]}` + "\n\n", "test-secret", constant.ChannelTypeOpenAI},
+		{"Ollama", `{"prompt_eval_count":10,"eval_count":5,"message":{"content":"` + text + `"},"done":true}` + "\n", "test-secret", constant.ChannelTypeOllama},
+		{"Cohere", `{"response":{"meta":{"billed_units":{"input_tokens":10,"output_tokens":5}}},"text":"` + text + `","event_type":"stream-end"}` + "\n", "test-secret", constant.ChannelTypeCohere},
+		{"Zhipu", `meta:{"usage":{"prompt_tokens":10,"completion_tokens":5},"tail":"` + text + `"}` + "\n", "test.secret", constant.ChannelTypeZhipu},
+		{"Coze", "event: conversation.chat.completed\ndata: " + `{"usage":{"input_count":10,"output_count":5},"tail":"` + text + `"}` + "\n\n", "test-secret", constant.ChannelTypeCoze},
+		{"Tencent", `data: {"Usage":{"PromptTokens":10,"CompletionTokens":5},"Choices":[{"Delta":{"Content":"` + text + `"}}]}` + "\n\n", "1|test-id|test-secret", constant.ChannelTypeTencent},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, test.body)
+			})
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": test.provider, "key": test.key}).Error)
+			fixture.offering.AcceptedConversionLosses = []string{"request_parameter_dropped"}
+			require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/"+"chat/"+"completions", `{"model":"gateway-offering","stream":true,"messages":[{"role":"user","content":"Hello"}]}`)
+			assert.Equal(t, http.StatusBadGateway, response.Code, response.Body.String())
+			assert.NotContains(t, response.Body.String(), "[DONE]")
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, "failed", record.Status)
+			assert.Zero(t, record.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.EqualValues(t, 20000, attempts[0].Cost.Nanos)
+			assert.EqualValues(t, 10, attempts[0].Usage.PromptTokens)
+			assert.EqualValues(t, 5, attempts[0].Usage.CompletionTokens)
+		})
+	}
+}
+
 func TestTextGatewayCumulativeResponseSourceIsBounded(t *testing.T) {
 	previous := constant.StreamScannerMaxBufferMB
 	constant.StreamScannerMaxBufferMB = 1
