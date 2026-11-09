@@ -1871,16 +1871,23 @@ func TestAsyncTaskFirstTailAndReferenceRequireDeclaredInputs(t *testing.T) {
 		{"reference2video", "vidu", "viduq3-turbo", "/vidu/ent/v2/reference2video", `{"model":"gateway-alias","prompt":"A bird","images":["https://image.invalid/first.png","https://image.invalid/last.png"],"duration":4,"resolution":"720p"}`, `{"task_id":"vidu-job","state":"created"}`, "duration", capability.Image},
 		{"jimeng-first-tail", "jimeng", "jimeng_i2v_first_tail_v30", "/jimeng/api/common/v3/submit_task_v2", `{"req_key":"gateway-alias","prompt":"A bird","image_urls":["https://image.invalid/first.png","https://image.invalid/last.png"],"frames":121}`, `{"code":10000,"data":{"task_id":"jimeng-job"}}`, "seconds", capability.Image},
 		{"xai-audio-reference", "xai", "grok-imagine-video-1.5", "/xai/v1/videos/generations", `{"model":"gateway-alias","prompt":"A bird","duration":4,"reference_audios":[{"voice_id":"synthetic-voice"}]}`, `{"request_id":"xai-job"}`, "seconds", capability.Audio},
+		{"vidu-metadata-prompt", "vidu", "viduq3-turbo", "/v1/tasks/vidu", `{"model":"gateway-alias","images":["https://image.invalid/first.png","https://image.invalid/last.png"],"duration":4,"metadata":{"prompt":"A bird"}}`, `{"task_id":"vidu-job","state":"created"}`, "duration", capability.Text},
+		{"jimeng-metadata-prompt", "jimeng", "jimeng_i2v_first_tail_v30", "/v1/tasks/jimeng", `{"model":"gateway-alias","images":["https://image.invalid/first.png","https://image.invalid/last.png"],"duration":5,"metadata":{"prompt":"A bird","frames":121}}`, `{"code":10000,"data":{"task_id":"jimeng-job"}}`, "seconds", capability.Text},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var calls atomic.Int32
 			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
-				if test.plugin == "jimeng" {
+				if test.plugin == "jimeng" || test.input == capability.Text {
 					var body map[string]any
 					require.NoError(t, common.DecodeJson(r.Body, &body))
-					assert.Equal(t, test.model, body["req_key"])
-					assert.NotContains(t, body, "model")
+					if test.plugin == "jimeng" {
+						assert.Equal(t, test.model, body["req_key"])
+						assert.NotContains(t, body, "model")
+					}
+					if test.input == capability.Text {
+						assert.Equal(t, "A bird", body["prompt"])
+					}
 				}
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte(test.result))
@@ -1890,7 +1897,11 @@ func TestAsyncTaskFirstTailAndReferenceRequireDeclaredInputs(t *testing.T) {
 			jsplugin.DefaultRegistry = jsplugin.NewRegistry()
 			_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: test.plugin})
 			require.NoError(t, err)
-			caps := capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Video}}
+			initialInput := capability.Text
+			if test.input == capability.Text {
+				initialInput = capability.Image
+			}
+			caps := capability.Set{InputModalities: []capability.Modality{initialInput}, OutputModalities: []capability.Modality{capability.Video}}
 			modelName := test.model
 			if test.plugin == "jimeng" {
 				modelName = "jimeng_vgfm_t2v_l20"
@@ -1957,7 +1968,7 @@ func TestAsyncTaskFirstTailAndReferenceRequireDeclaredInputs(t *testing.T) {
 				caps.Limits.MaxImages = nil
 				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("capabilities", caps).Error)
 			}
-			narrowed := capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Video}}
+			narrowed := capability.Set{InputModalities: []capability.Modality{initialInput}, OutputModalities: []capability.Modality{capability.Video}}
 			require.NoError(t, model.DB.Model(fixture.channel).Update("capabilities", narrowed).Error)
 			response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, test.path, test.body)
 			assert.Equal(t, 400, response.Code, response.Body.String())

@@ -390,7 +390,9 @@ function submitSettings(ctx, action) {
 export function extractCapabilities(ctx) {
   const req = ctx.requestBody || {};
   const input = [];
-  if (trimmed(req.prompt || (req.vendorBody || {}).prompt)) input.push("text");
+  let prompt = req.vendorBody ? req.vendorBody.prompt : req.prompt;
+  if (!req.vendorBody && !trimmed(prompt)) prompt = (req.metadata || {}).prompt;
+  if (trimmed(prompt)) input.push("text");
   const images = req.vendorBody ? req.vendorBody.images : Array.isArray(req.images) && req.images.length ? req.images : (req.metadata || {}).images;
   const imageCount = Array.isArray(images) ? images.length : images ? 1 : 0;
   if (imageCount || ["image_to_video", "first_tail_to_video", "reference_to_video"].includes(actionFor(req))) input.push("image");

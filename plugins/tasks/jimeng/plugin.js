@@ -302,7 +302,10 @@ function decodeImageCount(req, hasInputReferenceFile) {
 export function extractCapabilities(ctx) {
   const req = ctx.requestBody || {};
   const input = [];
-  if (trimmed(req.prompt || (req.vendorBody || {}).prompt)) input.push("text");
+  const metadata = req.metadata || {};
+  let prompt = req.vendorBody ? req.vendorBody.prompt : req.prompt;
+  if (!req.vendorBody && metadata.prompt !== undefined && metadata.prompt !== null) prompt = metadata.prompt;
+  if (trimmed(prompt)) input.push("text");
   const imageCount = req.vendorBody ? vendorImageCount(req.vendorBody) : submitImageCount(req);
   if (imageCount) input.push("image");
   return {
