@@ -50,6 +50,10 @@ type ResponseFacts struct {
 	DeliveredImageCount                int64
 	AudioInputDurationReported         bool
 	AudioInputDurationInvalid          bool
+	AudioOutputDurationReported        bool
+	AudioOutputDurationInvalid         bool
+	AudioOutputTokensUnknown           bool
+	AudioOutputTokensDerived           bool
 	AudioOutputTokensReported          bool
 	AudioInputTokensEstimated          int
 	AudioInputTokensReported           bool

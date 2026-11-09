@@ -48,9 +48,11 @@ func GatewayPrice(price *model.PriceVersion, usage *dto.Usage, request billingex
 	if err != nil {
 		return money.Value{}, money.Value{}, billingexpr.MoneyTraceResult{}, err
 	}
-	if request.UnmeasuredTokens["img_o"] && !used["img_o"] {
-		request.UnmeasuredTokens = maps.Clone(request.UnmeasuredTokens)
-		request.UnmeasuredTokens["c"] = true
+	for _, modality := range []string{"img_o", "ao"} {
+		if request.UnmeasuredTokens[modality] && !used[modality] {
+			request.UnmeasuredTokens = maps.Clone(request.UnmeasuredTokens)
+			request.UnmeasuredTokens["c"] = true
+		}
 	}
 	input := billingexpr.MoneyInput{TokenQuantities: quantities, Request: request, Time: at}
 	if len(actualImageCount) > 1 {
@@ -109,6 +111,9 @@ func GatewayRecordUsage(usage *dto.Usage, facts ...*relaycommon.ResponseFacts) m
 		if source.ImageOutputTokensUnknown {
 			record.UnmeasuredTokens = []string{"c", "img_o"}
 		}
+		if source.AudioOutputTokensUnknown {
+			record.UnmeasuredTokens = []string{"c", "ao"}
+		}
 		record.ImageCount = source.ImageCount
 		record.AudioInputSeconds = source.AudioInputSeconds
 		record.AudioOutputSeconds = source.AudioOutputSeconds
@@ -121,7 +126,7 @@ func GatewayRecordUsage(usage *dto.Usage, facts ...*relaycommon.ResponseFacts) m
 		{usage.PromptTokensDetails.ImageTokens, source.ImageInputTokensReported, &record.ImageInputTokens},
 		{usage.PromptTokensDetails.AudioTokens, source.AudioInputTokensReported || source.AudioInputSeconds != nil || source.AudioInputTokensEstimated > 0, &record.AudioInputTokens},
 		{usage.CompletionTokenDetails.ImageTokens, source.ImageOutputTokensReported || source.ImageOutputTokensEstimated, &record.ImageOutputTokens},
-		{usage.CompletionTokenDetails.AudioTokens, source.AudioOutputTokensReported || source.AudioOutputSeconds != nil, &record.AudioOutputTokens},
+		{usage.CompletionTokenDetails.AudioTokens, source.AudioOutputTokensReported || source.AudioOutputTokensDerived || source.AudioOutputSeconds != nil, &record.AudioOutputTokens},
 	} {
 		if detail.value != 0 || detail.known {
 			value := int64(detail.value)

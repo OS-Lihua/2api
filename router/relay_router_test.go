@@ -6606,6 +6606,110 @@ func (w cancelOnSpeechOutputWriter) WriteString(body string) (int, error) {
 	return w.Write([]byte(body))
 }
 
+func TestMediaGatewaySpeechReportedDurationRemainsIndependent(t *testing.T) {
+	for _, tc := range []struct {
+		name, where, value, seconds       string
+		tokens                            int64
+		failure, pending, audit, reported bool
+	}{
+		{"error scalar output zero", "json", "", "", 0, true, false, false, false},
+		{"header zero", "header", "0", "0", 0, false, false, false, false},
+		{"header fractional", "header", "0.25", "0.25", 17, false, false, false, false},
+		{"header longer", "header", "2", "2", 33, false, false, false, false},
+		{"header huge fallback", "header", "1e400", "1", 17, false, false, true, false},
+		{"header nan fallback", "header", "NaN", "1", 17, false, false, true, false},
+		{"done zero", "sse", "0", "0", 0, false, false, false, false},
+		{"done longer", "sse", "2", "2", 33, false, false, false, false},
+		{"done zero keeps token counter", "sse", "0", "0", 1000, false, false, false, true},
+		{"native zero", "native", "0", "0", 0, false, false, false, false},
+		{"native milliseconds", "native", "250", "0.25", 17, false, false, false, false},
+		{"native longer", "native", "2000", "2", 33, false, false, false, false},
+		{"native huge fallback", "native", "1e400", "1", 17, false, false, true, false},
+		{"native error keeps duration", "native", "1000", "1", 17, true, false, false, false},
+		{"native error keeps zero", "native", "0", "0", 0, true, false, false, false},
+		{"native error unknown duration", "native", "1e400", "", 0, true, true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIAudioSpeech, func(w http.ResponseWriter, r *http.Request) {
+				audio := make([]byte, 48000)
+				w.Header().Set("Content-Type", "audio/pcm")
+				switch tc.where {
+				case "header":
+					w.Header().Set("X-Audio-Duration-Seconds", tc.value)
+					_, _ = w.Write(audio)
+				case "sse":
+					w.Header().Set("Content-Type", "text/event-stream")
+					usage := ""
+					if tc.reported {
+						usage = `,"usage":{"input_tokens":0,"output_tokens":1000}`
+					}
+					_, _ = fmt.Fprintf(w, "data: {\"type\":\"speech.audio.delta\",\"audio\":%q}\n\ndata: {\"type\":\"speech.audio.done\",\"duration\":%s%s}\n\ndata: [DONE]\n\n", base64.StdEncoding.EncodeToString(audio), tc.value, usage)
+				case "json":
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"error":{"code":"rate_limit_exceeded"},"usage":{"output_tokens":0}}`)
+				case "native":
+					w.Header().Set("Content-Type", "application/json")
+					code := 3000
+					data := base64.StdEncoding.EncodeToString(audio)
+					if tc.failure {
+						code = 3030
+						data = ""
+					}
+					_, _ = fmt.Fprintf(w, `{"code":%d,"data":%q,"addition":{"duration":%q}}`, code, data, tc.value)
+				}
+			})
+			provider := constant.ChannelTypeVLLM
+			if tc.where == "native" {
+				provider = constant.ChannelTypeVolcEngine
+			}
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Updates(map[string]any{"type": provider, "key": "access|secret"}).Error)
+			fixture.fake.Advance(time.Second)
+			for _, price := range []*model.PriceVersion{{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("audio",ao*9)`, EffectiveAt: clock.Now().Unix()}, {OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("audio",ao*7)`, EffectiveAt: clock.Now().Unix()}} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			format := "audio"
+			if tc.where == "sse" {
+				format = "sse"
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/audio/speech", fmt.Sprintf(`{"model":"gateway-alias","input":"hello","voice":"alloy","response_format":"pcm","stream_format":%q}`, format))
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.False(t, record.SalePending)
+			saleTokens := tc.tokens
+			if tc.failure {
+				saleTokens = 0
+				assert.GreaterOrEqual(t, response.Code, 400)
+			} else {
+				assert.Equal(t, 200, response.Code)
+			}
+			assert.Equal(t, saleTokens*8100, record.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, tc.pending, attempts[0].CostPending)
+			assert.Equal(t, tc.tokens*7000, attempts[0].Cost.Nanos)
+			if tc.pending {
+				assert.ElementsMatch(t, []string{"c", "ao"}, attempts[0].Usage.UnmeasuredTokens)
+				assert.Nil(t, attempts[0].Usage.AudioOutputTokens)
+			} else {
+				assert.Equal(t, new(tc.tokens), attempts[0].Usage.AudioOutputTokens)
+				if tc.seconds != "" {
+					require.NotNil(t, attempts[0].Usage.AudioOutputSeconds)
+					assert.Equal(t, tc.seconds, *attempts[0].Usage.AudioOutputSeconds)
+				} else {
+					assert.Nil(t, attempts[0].Usage.AudioOutputSeconds)
+				}
+			}
+			if tc.audit {
+				assert.Contains(t, attempts[0].RouteDiagnostics, "quota_saturation")
+			}
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.EqualValues(t, 1_000_000_000-saleTokens*8100, wallet.Balance.Nanos)
+		})
+	}
+}
+
 func TestMediaGatewayWAVUsesActualAudioFrames(t *testing.T) {
 	for _, tc := range []struct {
 		name                                               string

@@ -18,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/shopspring/decimal"
 )
 
 type VolcengineTTSRequest struct {
@@ -149,12 +150,26 @@ func handleTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon.Re
 	body, readErr := io.ReadAll(resp.Body)
 	var audioData []byte
 	if info.ResponseFacts != nil {
+		if duration := ojson.GetBytes(body, "addition.duration"); duration.Exists() && duration.Raw != "null" {
+			info.ResponseFacts.AudioOutputDurationInvalid = true
+			if duration.Type == ojson.String {
+				milliseconds, err := decimal.NewFromString(duration.Str)
+				if err == nil {
+					openai.ObserveSpeechOutputSeconds(info, milliseconds.Shift(-3).String())
+				} else {
+					openai.ObserveSpeechOutputSeconds(info, duration.Str)
+				}
+			}
+		}
 		var encoded string
 		if raw := ojson.GetBytes(body, "data").Raw; raw != "" && common.UnmarshalJsonStr(raw, &encoded) == nil {
 			if decoded, decodeErr := base64.StdEncoding.DecodeString(encoded); decodeErr == nil && len(decoded) > 0 {
 				audioData = decoded
 				usage = openai.EstimateGeneratedSpeech(c, info, audioData, true)
 			}
+		}
+		if usage == nil && info.ResponseFacts.AudioOutputDurationReported {
+			usage = openai.EstimateGeneratedSpeech(c, info, nil, true)
 		}
 	}
 	if readErr != nil {

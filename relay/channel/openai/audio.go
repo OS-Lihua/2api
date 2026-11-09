@@ -30,9 +30,60 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// ObserveSpeechOutputSeconds preserves an independent upstream duration report.
+// Invalid reports leave local measurement available and retain clamp evidence.
+func ObserveSpeechOutputSeconds(info *relaycommon.RelayInfo, raw string) {
+	facts := info.ResponseFacts
+	if facts == nil {
+		return
+	}
+	facts.AudioOutputDurationInvalid = true
+	seconds, err := decimal.NewFromString(raw)
+	if err != nil {
+		value, parseErr := strconv.ParseFloat(raw, 64)
+		if parseErr == nil || math.IsInf(value, 0) {
+			_, clamp := common.AudioDurationTokens(value)
+			if clamp != nil {
+				info.QuotaClamp = clamp
+			}
+		}
+		return
+	}
+	if seconds.IsNegative() || seconds.GreaterThan(decimal.NewFromInt(relaycommon.MaxTaskDurationSeconds)) {
+		_, clamp := common.AudioDurationTokens(seconds.InexactFloat64())
+		if clamp != nil {
+			info.QuotaClamp = clamp
+		}
+		return
+	}
+	value := seconds.String()
+	facts.AudioOutputSeconds = &value
+	facts.AudioOutputDurationReported = true
+	facts.AudioOutputDurationInvalid = false
+}
+
 func normalizeSpeechOutputUsage(info *relaycommon.RelayInfo, usage *dto.Usage) {
-	if info.ResponseFacts != nil && info.ResponseFacts.CompletionTokensReported && !info.ResponseFacts.AudioOutputTokensReported {
-		usage.CompletionTokenDetails.AudioTokens = usage.CompletionTokens
+	facts := info.ResponseFacts
+	if facts == nil || usage == nil {
+		return
+	}
+	if facts.CompletionTokensReported {
+		if !facts.AudioOutputTokensReported {
+			usage.CompletionTokenDetails.AudioTokens = usage.CompletionTokens
+			facts.AudioOutputTokensDerived = true
+		}
+		return
+	}
+	if facts.AudioOutputDurationReported && facts.AudioOutputSeconds != nil {
+		seconds, _ := strconv.ParseFloat(*facts.AudioOutputSeconds, 64)
+		tokens, clamp := common.AudioDurationTokens(seconds)
+		if clamp != nil {
+			info.QuotaClamp = clamp
+		}
+		usage.CompletionTokens = tokens
+		if !facts.AudioOutputTokensReported {
+			usage.CompletionTokenDetails.AudioTokens = tokens
+		}
 	}
 }
 
@@ -168,7 +219,10 @@ func EstimateGeneratedSpeech(c *gin.Context, info *relaycommon.RelayInfo, audio 
 	}
 	var duration float64
 	durationErr := errors.New("incomplete encoded audio")
-	if complete || format == "pcm" || format == "wav" {
+	if facts := info.ResponseFacts; facts != nil && facts.AudioOutputDurationReported && facts.AudioOutputSeconds != nil {
+		duration, _ = strconv.ParseFloat(*facts.AudioOutputSeconds, 64)
+		durationErr = nil
+	} else if complete || format == "pcm" || format == "wav" {
 		duration, durationErr = speechAudioDuration(c.Request.Context(), audio, format, info.ResponseFacts)
 	}
 	var clamp *common.QuotaClamp
@@ -176,7 +230,7 @@ func EstimateGeneratedSpeech(c *gin.Context, info *relaycommon.RelayInfo, audio 
 		usage.CompletionTokens, clamp = common.QuotaRoundChecked(math.Ceil(float64(len(audio)) / 1000))
 	} else {
 		usage.CompletionTokens, clamp = common.AudioDurationTokens(duration)
-		if info.ResponseFacts != nil && !math.IsNaN(duration) && !math.IsInf(duration, 0) && duration >= 0 {
+		if info.ResponseFacts != nil && !info.ResponseFacts.AudioOutputDurationReported && !math.IsNaN(duration) && !math.IsInf(duration, 0) && duration >= 0 {
 			seconds := decimal.NewFromFloat(duration).String()
 			info.ResponseFacts.AudioOutputSeconds = &seconds
 		}
@@ -248,6 +302,9 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		}
 	}
 	if info.ChannelType == constant.ChannelTypeVLLM {
+		if raw := resp.Header.Get("X-Audio-Duration-Seconds"); raw != "" {
+			ObserveSpeechOutputSeconds(info, raw)
+		}
 		for header, target := range map[string]*int{
 			"X-Audio-Sample-Rate": &formatFacts.AudioOutputSampleRate,
 			"X-Audio-Channels":    &formatFacts.AudioOutputChannels,
@@ -378,6 +435,12 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 				}
 			}
 			if chunk.Type == "speech.audio.done" {
+				if duration := ojson.GetBytes(eventFacts, "duration"); duration.Exists() && duration.Raw != "null" {
+					info.ResponseFacts.AudioOutputDurationInvalid = true
+					if duration.Type == ojson.Number {
+						ObserveSpeechOutputSeconds(info, duration.Raw)
+					}
+				}
 				if !generatedAudioPayload {
 					sr.Stop(errors.New("speech stream completed without audio"))
 					return
@@ -441,7 +504,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		info.ResponseFacts.GeneratedAudioBytes = generatedAudioBytes
 		info.ResponseFacts.DeliveredAudioBytes = deliveredAudioBytes
 		if audioFormat == "pcm" {
-			if generatedAudioBytes <= audioBytes || info.ResponseFacts.AudioOutputSeconds == nil {
+			if !info.ResponseFacts.AudioOutputDurationReported && (generatedAudioBytes <= audioBytes || info.ResponseFacts.AudioOutputSeconds == nil) {
 				duration, _ := generatedPCMSeconds.Float64()
 				seconds := decimal.NewFromFloat(duration).String()
 				info.ResponseFacts.AudioOutputSeconds = &seconds
@@ -480,6 +543,8 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 				info.QuotaClamp = clamp
 			}
 		}
+		applySpeechUsageHeaders(info, usage, resp.Header)
+		normalizeSpeechOutputUsage(info, usage)
 		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 		if info.StreamStatus != nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone && info.StreamStatus.ResponseOutcome() == string(relaycommon.ResponseOutcomeCompleted) {
 			if err := helper.StringData(c, "[DONE]"); err != nil {
@@ -560,12 +625,16 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		}
 
 		duration, durationErr := speechAudioDuration(c.Request.Context(), bodyBytes, audioFormat, formatFacts)
+		if info.ResponseFacts != nil && info.ResponseFacts.AudioOutputDurationReported && info.ResponseFacts.AudioOutputSeconds != nil {
+			duration, _ = strconv.ParseFloat(*info.ResponseFacts.AudioOutputSeconds, 64)
+			durationErr = nil
+		}
 
 		if info.ResponseFacts != nil {
 			info.ResponseFacts.GeneratedAudioBytes = int64(len(bodyBytes))
 		}
 		usage.PromptTokensDetails.TextTokens = usage.PromptTokens
-		if info.ResponseFacts != nil && durationErr == nil && !math.IsNaN(duration) && !math.IsInf(duration, 0) && duration >= 0 {
+		if info.ResponseFacts != nil && !info.ResponseFacts.AudioOutputDurationReported && durationErr == nil && !math.IsNaN(duration) && !math.IsInf(duration, 0) && duration >= 0 {
 			seconds := decimal.NewFromFloat(duration).String()
 			info.ResponseFacts.AudioOutputSeconds = &seconds
 		}

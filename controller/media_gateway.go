@@ -432,8 +432,11 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		transport = transport || outcome.EndReason == relaycommon.StreamEndReasonScannerErr
 	}
 	facts := info.ResponseFacts
+	if run.parsed.Protocol == protocol.OpenAIAudioSpeech && facts.AudioOutputDurationInvalid && facts.AudioOutputSeconds == nil && facts.GeneratedAudioBytes == 0 && !facts.CompletionTokensReported && !facts.AudioOutputTokensReported {
+		facts.AudioOutputTokensUnknown = true
+	}
 	generated := facts.BusinessOutput || facts.GeneratedImageCount > 0 || facts.GeneratedAudioBytes > 0 || facts.GeneratedText != "" || facts.ImageCount != nil && *facts.ImageCount > 0
-	if !facts.PromptTokensReported && !facts.AudioInputDurationReported && (generated || facts.CompletionTokensReported || facts.AudioInputTokensReported || facts.TextInputTokensReported || facts.AudioOutputTokensReported || facts.ImageInputTokensReported || facts.ImageOutputTokensReported || facts.AudioInputDurationInvalid) {
+	if !facts.PromptTokensReported && !facts.AudioInputDurationReported && (generated || facts.CompletionTokensReported || facts.AudioInputTokensReported || facts.TextInputTokensReported || facts.AudioOutputTokensReported || facts.ImageInputTokensReported || facts.ImageOutputTokensReported || facts.AudioInputDurationInvalid || facts.AudioOutputDurationReported || facts.AudioOutputDurationInvalid) {
 		usage.PromptTokens = inputTokens
 		if run.parsed.Protocol == protocol.OpenAIAudioTranscription && !facts.AudioInputTokensReported {
 			usage.PromptTokensDetails.AudioTokens = inputTokens
@@ -505,10 +508,10 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	if info.QuotaClamp != nil {
 		attempt.RouteDiagnostics["quota_saturation"] = info.QuotaClamp.AuditMap()
 	}
-	if generated || facts.PromptTokensReported || facts.CompletionTokensReported || facts.AudioInputTokensReported || facts.TextInputTokensReported || facts.AudioOutputTokensReported || facts.ImageInputTokensReported || facts.ImageOutputTokensReported || facts.AudioInputDurationReported || facts.AudioInputDurationInvalid {
+	if generated || facts.PromptTokensReported || facts.CompletionTokensReported || facts.AudioInputTokensReported || facts.TextInputTokensReported || facts.AudioOutputTokensReported || facts.ImageInputTokensReported || facts.ImageOutputTokensReported || facts.AudioInputDurationReported || facts.AudioInputDurationInvalid || facts.AudioOutputDurationReported || facts.AudioOutputDurationInvalid {
 		attempt.UsageSource = "estimated"
 	}
-	if facts.UsageReported && !referenceInputEstimated && !imageInputEstimated && !facts.ImageOutputTokensEstimated {
+	if facts.UsageReported && !referenceInputEstimated && !imageInputEstimated && !facts.ImageOutputTokensEstimated && !facts.AudioOutputDurationInvalid {
 		attempt.UsageSource = "upstream"
 	}
 	actualCount := []int{}
@@ -523,6 +526,9 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		purchaseInput := prepared.Input
 		if facts.ImageOutputTokensUnknown {
 			purchaseInput.UnmeasuredTokens = map[string]bool{"img_o": true}
+		}
+		if facts.AudioOutputTokensUnknown {
+			purchaseInput.UnmeasuredTokens = map[string]bool{"ao": true}
 		}
 		cost, converted, trace, priceErr := service.GatewayPrice(purchase, usage, purchaseInput, at, decimal.NewFromInt(1), purchaseFX, actualCount...)
 		trace.MatchedTier = ""
@@ -572,6 +578,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	} else {
 		billable := *facts
 		billable.ImageOutputTokensUnknown = false
+		billable.AudioOutputTokensUnknown = false
 		if billable.AudioOutputSeconds != nil {
 			zero := "0"
 			billable.AudioOutputSeconds = &zero
@@ -586,6 +593,9 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	if facts.BusinessOutput {
 		if facts.ImageOutputTokensUnknown {
 			saleInput.UnmeasuredTokens = map[string]bool{"img_o": true}
+		}
+		if facts.AudioOutputTokensUnknown {
+			saleInput.UnmeasuredTokens = map[string]bool{"ao": true}
 		}
 		saleUsage := usage
 		billableFacts := *facts
@@ -620,6 +630,13 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 				seconds := decimal.NewFromInt(facts.DeliveredAudioBytes).Div(decimal.NewFromInt(facts.AudioPCMBytesPerSecond())).String()
 				if facts.DeliveredAudioSeconds != nil {
 					seconds = *facts.DeliveredAudioSeconds
+				}
+				if facts.AudioOutputDurationReported && facts.AudioOutputSeconds != nil {
+					reported, _ := decimal.NewFromString(*facts.AudioOutputSeconds)
+					delivered, _ := decimal.NewFromString(seconds)
+					if reported.LessThan(delivered) {
+						seconds = reported.String()
+					}
 				}
 				duration, _ := strconv.ParseFloat(seconds, 64)
 				output, clamp = common.AudioDurationTokens(duration)
