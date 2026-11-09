@@ -163,9 +163,16 @@ func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Respon
 				readErr = fmt.Errorf("task submit stream control state exceeds size limit")
 				break
 			}
-			if err = accumulated.Apply(ctx, result["changes"]); err != nil {
+			if stream.money {
+				err = accumulated.ApplyAtomic(ctx, result["changes"])
+			} else {
+				err = accumulated.Apply(ctx, result["changes"])
+			}
+			if err != nil {
 				readErr = fmt.Errorf("invalid submit stream changes: %w", err)
-				accumulated, state = nil, nil
+				if !stream.money {
+					accumulated, state = nil, nil
+				}
 				break
 			}
 		}
@@ -188,7 +195,7 @@ func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Respon
 			relayed = stream.client.Writer.Written()
 			if written {
 				if delivered != nil {
-					if err := delivered.Apply(ctx, result["changes"]); err != nil {
+					if err := delivered.ApplyAtomic(context.WithoutCancel(ctx), result["changes"]); err != nil {
 						readErr = err
 						break
 					}

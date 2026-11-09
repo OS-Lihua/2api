@@ -3,7 +3,9 @@ package jsplugin
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -266,7 +268,49 @@ func (s *JSONState) Apply(ctx context.Context, changes any) (err error) {
 			s.failed = err
 		}
 	}()
-	if err = ctx.Err(); err != nil {
+	return s.apply(ctx, changes, nil)
+}
+
+// ApplyAtomic preserves the last accepted JSON value when a batch fails.
+// It copies touched containers and only rebuilds appended text on rollback.
+func (s *JSONState) ApplyAtomic(ctx context.Context, changes any) error {
+	if s.failed != nil {
+		return s.failed
+	}
+	type checkpoint struct {
+		node jsonStateNode
+		text string
+	}
+	original := s.root
+	checkpoints := make(map[*jsonStateNode]checkpoint)
+	err := s.apply(ctx, changes, func(node *jsonStateNode) {
+		if _, saved := checkpoints[node]; saved {
+			return
+		}
+		saved := checkpoint{node: *node}
+		if node.text != nil {
+			saved.text = node.text.String()
+		}
+		checkpoints[node] = saved
+		node.object = maps.Clone(node.object)
+		node.array = slices.Clone(node.array)
+	})
+	if err == nil {
+		return nil
+	}
+	s.root = original
+	for node, saved := range checkpoints {
+		*node = saved.node
+		if node.text != nil {
+			node.text = &strings.Builder{}
+			node.text.WriteString(saved.text)
+		}
+	}
+	return err
+}
+
+func (s *JSONState) apply(ctx context.Context, changes any, checkpoint func(*jsonStateNode)) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	items, ok := changes.([]any)
@@ -328,6 +372,14 @@ func (s *JSONState) Apply(ctx context.Context, changes any) (err error) {
 			}
 			if target == nil && (offset != len(path)-1 || op != "set") {
 				return fmt.Errorf("JSON change target does not exist")
+			}
+		}
+		if checkpoint != nil {
+			for _, ancestor := range ancestors {
+				checkpoint(ancestor)
+			}
+			if op != "set" {
+				checkpoint(target)
 			}
 		}
 		addedBytes, addedNodes := 0, 0

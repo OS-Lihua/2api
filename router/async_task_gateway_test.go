@@ -2773,6 +2773,9 @@ func newNativeImageTaskFixture(t *testing.T, upstream http.HandlerFunc) textGate
 }
 
 func TestAsyncTaskNativeStreamSettlesObservedFacts(t *testing.T) {
+	overflow := "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]}}]},\"usage\":{\"image_count\":1}}\n\n" +
+		"data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/second.png\"}]}}]},\"usage\":{\"image_count\":2}}\n\n" +
+		strings.Repeat("data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"text\":\""+strings.Repeat("x", 512<<10)+"\"}]}}]}}\n\n", 2)
 	for _, test := range []struct {
 		name, stream   string
 		sale, cost     int64
@@ -2783,6 +2786,7 @@ func TestAsyncTaskNativeStreamSettlesObservedFacts(t *testing.T) {
 		{"metadata only", ": keep-alive\n\ndata: invalid-json\n\n", 0, 0, true, -1, http.StatusOK},
 		{"invalid first frame", "data: invalid-json\n\n", 0, 0, true, -1, http.StatusBadGateway},
 		{"empty stream", "", 0, 0, true, -1, http.StatusBadGateway},
+		{"known source survives cumulative limit", overflow, 90000000, 100000000, true, 1, http.StatusOK},
 		{"one image before invalid event", "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]}}]},\"usage\":{\"image_count\":1}}\n\ndata: invalid-json\n\n", 90000000, 50000000, true, -1, http.StatusOK},
 		{"completed image", "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]},\"finish_reason\":\"stop\"}]},\"usage\":{\"image_count\":1}}\n\n", 90000000, 50000000, false, -1, http.StatusOK},
 		{"short first image write", "data: {\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://artifact.invalid/bird.png\"}]},\"finish_reason\":\"stop\"}]},\"usage\":{\"image_count\":1}}\n\n", 0, 50000000, false, 0, http.StatusOK},
