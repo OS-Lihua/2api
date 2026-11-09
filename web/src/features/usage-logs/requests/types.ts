@@ -18,6 +18,8 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import type { MoneyAmount } from '@/lib/currency'
 
+import type { QuotaSaturation } from '../types'
+
 export type RequestScope = 'all' | 'self'
 export type RequestStatus =
   | 'success'
@@ -27,6 +29,11 @@ export type RequestStatus =
   | 'settlement_pending'
 export type UsageSource = 'upstream' | 'estimated' | 'none'
 export interface RequestUsage {
+  unmeasured_tokens?: string[]
+  image_input_tokens?: number
+  image_output_tokens?: number
+  audio_input_tokens?: number
+  audio_output_tokens?: number
   prompt_tokens?: number
   completion_tokens?: number
   total_tokens?: number
@@ -56,6 +63,7 @@ export interface RequestLog {
   error_code?: string
 }
 export interface RouteDiagnostics {
+  quota_saturation?: QuotaSaturation
   method: 'single_channel' | 'cost' | 'weight' | 'latency'
   score?: string
   estimated_cost?: string

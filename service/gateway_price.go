@@ -102,14 +102,31 @@ func GatewayRecordUsage(usage *dto.Usage, facts ...*relaycommon.ResponseFacts) m
 	if usage == nil {
 		return model.GatewayUsage{}
 	}
-	record := model.GatewayUsage{PromptTokens: int64(usage.PromptTokens), CompletionTokens: int64(usage.CompletionTokens), TotalTokens: int64(usage.PromptTokens) + int64(usage.CompletionTokens), CachedTokens: int64(usage.PromptTokensDetails.CachedTokens), CacheCreationTokens: int64(usage.PromptTokensDetails.CacheCreationTokensTotal()), CacheCreation12hTokens: int64(usage.PromptTokensDetails.CacheWrite12hTokens()), ImageInputTokens: int64(usage.PromptTokensDetails.ImageTokens), AudioInputTokens: int64(usage.PromptTokensDetails.AudioTokens), ImageOutputTokens: int64(usage.CompletionTokenDetails.ImageTokens), AudioOutputTokens: int64(usage.CompletionTokenDetails.AudioTokens)}
+	record := model.GatewayUsage{PromptTokens: int64(usage.PromptTokens), CompletionTokens: int64(usage.CompletionTokens), TotalTokens: int64(usage.PromptTokens) + int64(usage.CompletionTokens), CachedTokens: int64(usage.PromptTokensDetails.CachedTokens), CacheCreationTokens: int64(usage.PromptTokensDetails.CacheCreationTokensTotal()), CacheCreation12hTokens: int64(usage.PromptTokensDetails.CacheWrite12hTokens())}
+	source := &relaycommon.ResponseFacts{}
 	if len(facts) > 0 && facts[0] != nil {
-		if facts[0].ImageOutputTokensUnknown {
+		source = facts[0]
+		if source.ImageOutputTokensUnknown {
 			record.UnmeasuredTokens = []string{"c", "img_o"}
 		}
-		record.ImageCount = facts[0].ImageCount
-		record.AudioInputSeconds = facts[0].AudioInputSeconds
-		record.AudioOutputSeconds = facts[0].AudioOutputSeconds
+		record.ImageCount = source.ImageCount
+		record.AudioInputSeconds = source.AudioInputSeconds
+		record.AudioOutputSeconds = source.AudioOutputSeconds
+	}
+	for _, detail := range []struct {
+		value  int
+		known  bool
+		target **int64
+	}{
+		{usage.PromptTokensDetails.ImageTokens, source.ImageInputTokensReported, &record.ImageInputTokens},
+		{usage.PromptTokensDetails.AudioTokens, source.AudioInputTokensReported || source.AudioInputSeconds != nil || source.AudioInputTokensEstimated > 0, &record.AudioInputTokens},
+		{usage.CompletionTokenDetails.ImageTokens, source.ImageOutputTokensReported || source.ImageOutputTokensEstimated, &record.ImageOutputTokens},
+		{usage.CompletionTokenDetails.AudioTokens, source.AudioOutputTokensReported || source.AudioOutputSeconds != nil, &record.AudioOutputTokens},
+	} {
+		if detail.value != 0 || detail.known {
+			value := int64(detail.value)
+			*detail.target = &value
+		}
 	}
 	return record
 }

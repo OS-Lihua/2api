@@ -24,10 +24,10 @@ type GatewayUsage struct {
 	CachedTokens           int64    `json:"cached_tokens,omitempty"`
 	CacheCreationTokens    int64    `json:"cache_creation_tokens,omitempty"`
 	CacheCreation12hTokens int64    `json:"cache_creation_12h_tokens,omitempty"`
-	ImageInputTokens       int64    `json:"image_input_tokens,omitempty"`
-	AudioInputTokens       int64    `json:"audio_input_tokens,omitempty"`
-	ImageOutputTokens      int64    `json:"image_output_tokens,omitempty"`
-	AudioOutputTokens      int64    `json:"audio_output_tokens,omitempty"`
+	ImageInputTokens       *int64   `json:"image_input_tokens,omitempty"`
+	AudioInputTokens       *int64   `json:"audio_input_tokens,omitempty"`
+	ImageOutputTokens      *int64   `json:"image_output_tokens,omitempty"`
+	AudioOutputTokens      *int64   `json:"audio_output_tokens,omitempty"`
 	ImageCount             *int64   `json:"image_count,omitempty"`
 	AudioInputSeconds      *string  `json:"audio_input_seconds,omitempty"`
 	AudioOutputSeconds     *string  `json:"audio_output_seconds,omitempty"`

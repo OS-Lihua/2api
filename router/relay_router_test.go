@@ -4974,7 +4974,7 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 				attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
 				require.NoError(t, err)
 				require.EqualValues(t, 1, total)
-				assert.EqualValues(t, 17, attempts[0].Usage.AudioOutputTokens)
+				assert.Equal(t, new(int64(17)), attempts[0].Usage.AudioOutputTokens)
 				assert.EqualValues(t, 119_000, attempts[0].Cost.Nanos)
 				record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
 				require.NoError(t, err)
@@ -4998,11 +4998,11 @@ func TestMediaGatewayNativeAudioProvidersPreservePCMAndUploadUnits(t *testing.T)
 			if tc.kind == protocol.OpenAIAudioTranscription {
 				require.NotNil(t, record.Usage.AudioInputSeconds)
 				assert.Equal(t, "1", *record.Usage.AudioInputSeconds)
-				assert.EqualValues(t, 17, record.Usage.AudioInputTokens)
+				assert.Equal(t, new(int64(17)), record.Usage.AudioInputTokens)
 			} else {
 				require.NotNil(t, record.Usage.AudioOutputSeconds)
 				assert.Equal(t, "1", *record.Usage.AudioOutputSeconds)
-				assert.EqualValues(t, 17, record.Usage.AudioOutputTokens)
+				assert.Equal(t, new(int64(17)), record.Usage.AudioOutputTokens)
 			}
 			assert.Equal(t, int64(153_000), record.Receivable.Nanos)
 			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
@@ -5166,7 +5166,7 @@ func TestMediaGatewaySpeechReferenceInputsHonorCapabilitiesAndFunding(t *testing
 			if tc.zero {
 				tokens = 0
 			}
-			assert.EqualValues(t, tokens, record.Usage.AudioInputTokens)
+			assert.Equal(t, new(tokens), record.Usage.AudioInputTokens)
 			require.NotNil(t, record.Usage.AudioInputSeconds)
 			assert.Equal(t, seconds, *record.Usage.AudioInputSeconds)
 			assert.GreaterOrEqual(t, record.Usage.PromptTokens, tokens)
@@ -5305,8 +5305,12 @@ func TestMediaGatewayMissingImageOutputUsageEstimatesOrStaysPending(t *testing.T
 					return
 				}
 				assert.Equal(t, tc.tokens, record.Usage.CompletionTokens)
-				assert.Equal(t, tc.tokens, record.Usage.ImageOutputTokens)
-				assert.Equal(t, tc.tokens, attempts[0].Usage.ImageOutputTokens)
+				var expectedOutput *int64
+				if !tc.free {
+					expectedOutput = new(tc.tokens)
+				}
+				assert.Equal(t, expectedOutput, record.Usage.ImageOutputTokens)
+				assert.Equal(t, expectedOutput, attempts[0].Usage.ImageOutputTokens)
 				assert.Equal(t, tc.tokens*8100, record.Receivable.Nanos)
 				assert.Equal(t, tc.tokens*7000, attempts[0].Cost.Nanos)
 				if tc.tokens > 0 {
@@ -5348,8 +5352,20 @@ func TestMediaGatewayImageModalitiesKeepBaseUsage(t *testing.T) {
 				require.NoError(t, err)
 				assert.Equal(t, tc.input, record.Usage.PromptTokens)
 				assert.Equal(t, tc.output, record.Usage.CompletionTokens)
-				assert.Equal(t, tc.imageInput, record.Usage.ImageInputTokens)
-				assert.Equal(t, tc.imageOutput, record.Usage.ImageOutputTokens)
+				if tc.name == "detail zero" {
+					encoded, err := common.Marshal(record.Usage)
+					require.NoError(t, err)
+					var fields map[string]common.RawMessage
+					require.NoError(t, common.Unmarshal(encoded, &fields))
+					assert.Equal(t, "0", string(fields["image_output_tokens"]))
+					assert.NotContains(t, fields, "image_input_tokens")
+				}
+				var expectedInput *int64
+				if tc.imageInput > 0 {
+					expectedInput = new(tc.imageInput)
+				}
+				assert.Equal(t, expectedInput, record.Usage.ImageInputTokens)
+				assert.Equal(t, new(tc.imageOutput), record.Usage.ImageOutputTokens)
 				assert.Equal(t, tc.amount*9/10, record.Receivable.Nanos)
 				attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
 				require.NoError(t, err)
@@ -5569,7 +5585,7 @@ func TestMediaGatewaySpeechDeliversAudioAndBillsMeasuredOutput(t *testing.T) {
 	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
 	require.NoError(t, err)
 	assert.Equal(t, int64(238_500), record.Receivable.Nanos)
-	assert.Equal(t, int64(17), record.Usage.AudioOutputTokens)
+	assert.Equal(t, new(int64(17)), record.Usage.AudioOutputTokens)
 	require.NotNil(t, record.Usage.AudioOutputSeconds)
 	assert.Equal(t, "1", *record.Usage.AudioOutputSeconds)
 	attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
@@ -5729,7 +5745,7 @@ func TestMediaGatewaySpeechSSETerminalAndMeasuredAudio(t *testing.T) {
 			} else {
 				assert.Equal(t, "success", record.Status)
 			}
-			assert.Equal(t, expectedTokens, record.Usage.AudioOutputTokens)
+			assert.Equal(t, new(expectedTokens), record.Usage.AudioOutputTokens)
 			if assert.NotNil(t, record.Usage.AudioOutputSeconds) {
 				assert.Equal(t, expectedSeconds, *record.Usage.AudioOutputSeconds)
 			}
@@ -5792,7 +5808,7 @@ func TestMediaGatewayTranscriptionWriteFailureRetainsGeneratedProcurement(t *tes
 			require.NoError(t, err)
 			require.EqualValues(t, 1, total)
 			assert.Equal(t, "estimated", attempts[0].UsageSource)
-			assert.Equal(t, int64(17), attempts[0].Usage.AudioInputTokens)
+			assert.Equal(t, new(int64(17)), attempts[0].Usage.AudioInputTokens)
 			assert.Equal(t, tc.output, attempts[0].Usage.CompletionTokens)
 			assert.Equal(t, (17+tc.output)*1000, attempts[0].Cost.Nanos)
 			wallet, err := model.GetUserWallet(fixture.user.Id)
@@ -5852,7 +5868,7 @@ func TestMediaGatewayIncompleteSpeechBodyRetainsProcurement(t *testing.T) {
 			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
 			require.NoError(t, err)
 			assert.Zero(t, record.Receivable.Nanos)
-			assert.Zero(t, record.Usage.AudioOutputTokens)
+			assert.Equal(t, new(int64(0)), record.Usage.AudioOutputTokens)
 			if assert.NotNil(t, record.Usage.AudioOutputSeconds) {
 				assert.Equal(t, "0", *record.Usage.AudioOutputSeconds)
 			}
@@ -5860,7 +5876,7 @@ func TestMediaGatewayIncompleteSpeechBodyRetainsProcurement(t *testing.T) {
 			require.NoError(t, err)
 			require.EqualValues(t, 1, total)
 			assert.Equal(t, "estimated", attempts[0].UsageSource)
-			assert.Equal(t, int64(17), attempts[0].Usage.AudioOutputTokens)
+			assert.Equal(t, new(int64(17)), attempts[0].Usage.AudioOutputTokens)
 			if assert.NotNil(t, attempts[0].Usage.AudioOutputSeconds) {
 				assert.Equal(t, "1", *attempts[0].Usage.AudioOutputSeconds)
 			}
@@ -5898,7 +5914,7 @@ func TestMediaGatewayVolcengineWebSocketSpeechSurvivesIdleWrapper(t *testing.T) 
 	assert.Equal(t, "success", record.Status)
 	assert.Contains(t, response.Body.String(), "speech.audio.delta")
 	assert.Contains(t, response.Body.String(), "speech.audio.done")
-	assert.Equal(t, int64(17), record.Usage.AudioOutputTokens)
+	assert.Equal(t, new(int64(17)), record.Usage.AudioOutputTokens)
 	require.NotNil(t, record.Usage.AudioOutputSeconds)
 	assert.Equal(t, "1", *record.Usage.AudioOutputSeconds)
 	assert.Equal(t, int64(9_000_000), record.Receivable.Nanos)
@@ -6289,7 +6305,7 @@ func TestMediaGatewayVLLMOmittedFormatUsesWAV(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, record.Usage.AudioOutputSeconds)
 			assert.Equal(t, "1", *record.Usage.AudioOutputSeconds)
-			assert.EqualValues(t, 17, record.Usage.AudioOutputTokens)
+			assert.Equal(t, new(int64(17)), record.Usage.AudioOutputTokens)
 			assert.EqualValues(t, 137_700, record.Receivable.Nanos)
 			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
 			require.NoError(t, err)
@@ -6420,7 +6436,7 @@ func TestMediaGatewayVLLMPCMUsesEffectiveSampleRate(t *testing.T) {
 			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
 			require.NoError(t, err)
 			require.EqualValues(t, 1, total)
-			assert.Equal(t, tc.tokens, attempts[0].Usage.AudioOutputTokens)
+			assert.Equal(t, new(tc.tokens), attempts[0].Usage.AudioOutputTokens)
 			assert.Equal(t, tc.tokens*7000, attempts[0].Cost.Nanos)
 			if assert.NotNil(t, attempts[0].Usage.AudioOutputSeconds) {
 				assert.Equal(t, tc.seconds, *attempts[0].Usage.AudioOutputSeconds)
@@ -6514,8 +6530,16 @@ func TestMediaGatewaySpeechJSONWithoutAudioReleasesFixedFee(t *testing.T) {
 			require.NoError(t, err)
 			require.EqualValues(t, 1, total)
 			assert.Equal(t, (tc.output+tc.inputAudio+tc.inputText)*1000, attempts[0].Cost.Nanos)
-			assert.Equal(t, tc.output, attempts[0].Usage.AudioOutputTokens)
-			assert.Equal(t, tc.inputAudio, attempts[0].Usage.AudioInputTokens)
+			if tc.output == 0 {
+				assert.Empty(t, attempts[0].Usage.AudioOutputTokens)
+			} else {
+				assert.Equal(t, new(tc.output), attempts[0].Usage.AudioOutputTokens)
+			}
+			if tc.inputAudio == 0 {
+				assert.Empty(t, attempts[0].Usage.AudioInputTokens)
+			} else {
+				assert.Equal(t, new(tc.inputAudio), attempts[0].Usage.AudioInputTokens)
+			}
 			if tc.knownDetail {
 				assert.NotEqual(t, "none", attempts[0].UsageSource)
 			}
@@ -6643,7 +6667,11 @@ func TestMediaGatewayTruncatedSpeechSafetyErrorDoesNotRetry(t *testing.T) {
 					if strings.HasSuffix(badType, "-0") {
 						output = 0
 					}
-					assert.Equal(t, output, attempts[0].Usage.AudioOutputTokens)
+					if output == 0 {
+						assert.Empty(t, attempts[0].Usage.AudioOutputTokens)
+					} else {
+						assert.Equal(t, new(output), attempts[0].Usage.AudioOutputTokens)
+					}
 					assert.Equal(t, output*1000, attempts[0].Cost.Nanos)
 				}
 			})
@@ -7255,7 +7283,7 @@ func TestMediaGatewayErrorEnvelopesRetainCostAndSwitchBeforeDelivery(t *testing.
 				}
 				if tc.inputAudioZero {
 					firstCost = 0
-					assert.Zero(t, attempts[0].Usage.AudioInputTokens)
+					assert.Equal(t, new(int64(0)), attempts[0].Usage.AudioInputTokens)
 				}
 				if tc.duration {
 					expectedSeconds := tc.seconds
@@ -7314,7 +7342,7 @@ func TestMediaGatewaySpeechStreamPreservesReportedAudioZeroForMoney(t *testing.T
 	record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
 	require.NoError(t, err)
 	assert.Zero(t, record.Receivable.Nanos)
-	assert.Zero(t, record.Usage.AudioOutputTokens)
+	assert.Empty(t, record.Usage.AudioOutputTokens)
 	assert.EqualValues(t, 17, record.Usage.CompletionTokens)
 	attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
 	require.NoError(t, err)
@@ -7518,7 +7546,7 @@ func TestMediaGatewayInterruptedSpeechBillsDeliveredAudioAndRetainsProcurement(t
 	require.NoError(t, err)
 	assert.Equal(t, "partial", record.Status)
 	assert.Equal(t, int64(229_500), record.Receivable.Nanos)
-	assert.Equal(t, int64(17), record.Usage.AudioOutputTokens)
+	assert.Equal(t, new(int64(17)), record.Usage.AudioOutputTokens)
 	assert.Equal(t, "estimated", record.UsageSource)
 	attempts, total, err := model.ListGatewayAttempts(t.Context(), id, 0, 10)
 	require.NoError(t, err)
@@ -7530,7 +7558,7 @@ func TestMediaGatewayInterruptedSpeechBillsDeliveredAudioAndRetainsProcurement(t
 	health := healthView.Data["health"].(map[string]any)
 	assert.EqualValues(t, 1, health["samples"])
 	assert.EqualValues(t, 1, health["failures"])
-	assert.Equal(t, int64(1000), attempts[0].Usage.AudioOutputTokens)
+	assert.Equal(t, new(int64(1000)), attempts[0].Usage.AudioOutputTokens)
 	assert.Equal(t, "upstream", attempts[0].UsageSource)
 	var lifecycle model.GatewayBilling
 	require.NoError(t, model.DB.First(&lifecycle, "request_id = ?", id).Error)

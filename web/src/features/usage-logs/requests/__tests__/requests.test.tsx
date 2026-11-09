@@ -99,6 +99,12 @@ const internalAttempt = {
     eligible_count: 1,
     excluded_counts: { disabled: 2 },
     excluded: [{ channel_id: 61, reason: 'disabled' }],
+    quota_saturation: {
+      op: 'seconds_to_tokens',
+      kind: 'overflow',
+      original: '+Inf',
+      clamped: 2147483647,
+    },
     credentials: 'never-show',
     destination: 'https://internal.invalid',
     raw_prompt: 'never-show-prompt',
@@ -227,6 +233,10 @@ it('uses request:read permission for all requests and strips internal fields in 
   expect(within(drawer).getByText('Affinity hit')).toBeVisible()
   expect(within(drawer).getByText('Loss fallback')).toBeVisible()
   expect(within(drawer).getByText('Eligible Channels')).toBeVisible()
+  expect(within(drawer).getByText('Quota clamped')).toBeVisible()
+  expect(within(drawer).getByText('+Inf')).toBeVisible()
+  expect(within(drawer).getByText('Overflow')).toBeVisible()
+  expect(within(drawer).getByText('seconds_to_tokens')).toBeVisible()
   expect(within(drawer).getByText('Disabled: 2')).toBeVisible()
   expect(within(drawer).queryByText('never-show')).not.toBeInTheDocument()
   await user.keyboard('{Escape}')
@@ -248,6 +258,11 @@ it('uses request:read permission for all requests and strips internal fields in 
     within(drawer).queryByText('0.012345678901 USD')
   ).not.toBeInTheDocument()
   expect(within(drawer).queryByText('3/2')).not.toBeInTheDocument()
+  expect(within(drawer).queryByText('Quota clamped')).not.toBeInTheDocument()
+  expect(within(drawer).queryByText('+Inf')).not.toBeInTheDocument()
+  expect(
+    within(drawer).queryByText('seconds_to_tokens')
+  ).not.toBeInTheDocument()
   expect(within(drawer).queryByText('Provider ID')).not.toBeInTheDocument()
   expect(within(drawer).queryByText('Channel ID')).not.toBeInTheDocument()
   expect(within(drawer).queryByText('Member tier')).not.toBeInTheDocument()
@@ -744,6 +759,10 @@ it('shows actual media quantities including zero in request rows and attempts wi
             ...(config.url?.endsWith('/attempts') ? attempt : request),
             usage: {
               image_count: 0,
+              image_input_tokens: 1200,
+              image_output_tokens: 0,
+              audio_input_tokens: 0,
+              audio_output_tokens: 17,
               audio_input_seconds: '1.25',
               audio_output_seconds: '0',
             },
@@ -759,6 +778,10 @@ it('shows actual media quantities including zero in request rows and attempts wi
   const user = userEvent.setup()
   renderRequests()
   expect(await screen.findByText('Image count: 0')).toBeVisible()
+  expect(screen.getByText('Image input tokens: 1,200')).toBeVisible()
+  expect(screen.getByText('Image output tokens: 0')).toBeVisible()
+  expect(screen.getByText('Audio input tokens: 0')).toBeVisible()
+  expect(screen.getByText('Audio output tokens: 17')).toBeVisible()
   expect(
     screen.getByText(
       (_, element) =>
@@ -779,12 +802,49 @@ it('shows actual media quantities including zero in request rows and attempts wi
   )
   const drawer = await screen.findByRole('dialog', { name: 'Request attempts' })
   expect(await within(drawer).findByText('Image count: 0')).toBeVisible()
+  expect(within(drawer).getByText('Audio output tokens: 17')).toBeVisible()
+  expect(within(drawer).getByText('Image output tokens: 0')).toBeVisible()
   expect(
     within(drawer).getByText(
       (_, element) =>
         element?.textContent === 'Input audio duration: 1.25 seconds'
     )
   ).toBeVisible()
+})
+
+it('shows unmeasured output and total as unknown while retaining known media counts', async () => {
+  api.defaults.adapter = async (config) => ({
+    config,
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+    data: {
+      success: true,
+      data: {
+        items: [
+          {
+            ...request,
+            usage: {
+              prompt_tokens: 120,
+              completion_tokens: 0,
+              total_tokens: 120,
+              image_count: 1,
+              unmeasured_tokens: ['c', 'img_o'],
+            },
+          },
+        ],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      },
+    },
+  })
+  renderRequests()
+  expect(await screen.findByText('Input: 120 · Output: Unknown')).toBeVisible()
+  expect(screen.getByText('Image output tokens: Unknown')).toBeVisible()
+  expect(screen.getByText('Total tokens: Unknown')).toBeVisible()
+  expect(screen.getByText('Image count: 1')).toBeVisible()
+  expect(screen.queryByText('Image input tokens: 0')).not.toBeInTheDocument()
 })
 
 it('preserves nonzero measured audio duration and reacts to all interface locales', async () => {

@@ -21,6 +21,7 @@ import { useTranslation } from 'react-i18next'
 import { toIntlLocale } from '@/i18n/languages'
 import { formatNumber } from '@/lib/format'
 
+import { QuotaSaturationFacts } from '../../components/quota-saturation-facts'
 import type { RequestAttempt, RouteDiagnostics } from '../types'
 import { RequestMoney } from './request-facts'
 
@@ -67,6 +68,11 @@ export function AttemptAdminFacts(props: { attempt: RequestAttempt }) {
           </dd>
         </div>
       </dl>
+      {attempt.route_diagnostics?.quota_saturation && (
+        <QuotaSaturationFacts
+          saturation={attempt.route_diagnostics.quota_saturation}
+        />
+      )}
       {attempt.route_diagnostics && (
         <RouteDiagnosticsFacts diagnostics={attempt.route_diagnostics} />
       )}

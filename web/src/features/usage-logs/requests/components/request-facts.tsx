@@ -115,7 +115,13 @@ export function RequestUsageFacts(props: {
 }) {
   const { t, i18n } = useTranslation()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
+  const unmeasured = props.usage?.unmeasured_tokens ?? []
   const hasMediaQuantities =
+    unmeasured.length > 0 ||
+    props.usage?.image_input_tokens !== undefined ||
+    props.usage?.image_output_tokens !== undefined ||
+    props.usage?.audio_input_tokens !== undefined ||
+    props.usage?.audio_output_tokens !== undefined ||
     props.usage?.image_count !== undefined ||
     props.usage?.audio_input_seconds !== undefined ||
     props.usage?.audio_output_seconds !== undefined
@@ -133,10 +139,36 @@ export function RequestUsageFacts(props: {
     <div className='space-y-1 text-xs'>
       {props.source !== 'none' && (
         <div className='tabular-nums'>
-          {t('Input')}: {formatNumber(props.usage.prompt_tokens, locale)} ·{' '}
-          {t('Output')}: {formatNumber(props.usage.completion_tokens, locale)}
+          {t('Input')}:{' '}
+          {unmeasured.includes('p')
+            ? t('Unknown')
+            : formatNumber(props.usage.prompt_tokens, locale)}{' '}
+          · {t('Output')}:{' '}
+          {unmeasured.includes('c')
+            ? t('Unknown')
+            : formatNumber(props.usage.completion_tokens, locale)}
         </div>
       )}
+      {(
+        [
+          ['img', t('Image input tokens'), props.usage.image_input_tokens],
+          ['img_o', t('Image output tokens'), props.usage.image_output_tokens],
+          ['ai', t('Audio input tokens'), props.usage.audio_input_tokens],
+          ['ao', t('Audio output tokens'), props.usage.audio_output_tokens],
+        ] as const
+      )
+        .filter(
+          ([quantity, , value]) =>
+            value !== undefined || unmeasured.includes(quantity)
+        )
+        .map(([quantity, label, value]) => (
+          <div key={quantity} className='tabular-nums'>
+            {label}:{' '}
+            {unmeasured.includes(quantity)
+              ? t('Unknown')
+              : formatNumber(value, locale)}
+          </div>
+        ))}
       {props.usage.image_count !== undefined && (
         <div className='tabular-nums'>
           {t('Image count')}: {formatNumber(props.usage.image_count, locale)}
@@ -162,7 +194,10 @@ export function RequestUsageFacts(props: {
       )}
       {props.source !== 'none' && props.usage.total_tokens !== undefined && (
         <div className='text-muted-foreground'>
-          {t('Total tokens')}: {formatNumber(props.usage.total_tokens, locale)}
+          {t('Total tokens')}:{' '}
+          {unmeasured.length > 0
+            ? t('Unknown')
+            : formatNumber(props.usage.total_tokens, locale)}
         </div>
       )}
       {props.source === 'estimated' && (

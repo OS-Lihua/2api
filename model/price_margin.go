@@ -318,21 +318,46 @@ func marginLegacyUsage(usage GatewayUsage, used map[string]bool) *dto.Usage {
 	if (used["cc"] || used["cc1h"]) && usage.CacheCreationTokens != 0 {
 		return nil
 	}
-	if used["img_cr"] && usage.CachedTokens != 0 && usage.ImageInputTokens != 0 {
+	if used["img_cr"] && usage.CachedTokens != 0 && usage.ImageInputTokens != nil && *usage.ImageInputTokens != 0 {
 		return nil
 	}
 	if usage.PromptTokens < 0 || usage.CompletionTokens < 0 || usage.PromptTokens > 1<<31-1 || usage.CompletionTokens > 1<<31-1 || usage.TotalTokens != usage.PromptTokens+usage.CompletionTokens {
 		return nil
 	}
-	return &dto.Usage{
+	for _, name := range usage.UnmeasuredTokens {
+		if used[name] {
+			return nil
+		}
+	}
+	result := &dto.Usage{
 		PromptTokens: int(usage.PromptTokens), CompletionTokens: int(usage.CompletionTokens), TotalTokens: int(usage.TotalTokens),
 		PromptTokensDetails: dto.InputTokenDetails{
 			CachedTokens: int(usage.CachedTokens), CacheWriteTokens: int(usage.CacheCreationTokens),
 			CacheWriteTokensDetails: &dto.CacheWriteTokenDetails{TTL12hTokens: int(usage.CacheCreation12hTokens)},
-			ImageTokens:             int(usage.ImageInputTokens), AudioTokens: int(usage.AudioInputTokens),
 		},
-		CompletionTokenDetails: dto.OutputTokenDetails{ImageTokens: int(usage.ImageOutputTokens), AudioTokens: int(usage.AudioOutputTokens)},
 	}
+	for _, detail := range []struct {
+		name   string
+		value  *int64
+		target *int
+	}{
+		{"img", usage.ImageInputTokens, &result.PromptTokensDetails.ImageTokens},
+		{"ai", usage.AudioInputTokens, &result.PromptTokensDetails.AudioTokens},
+		{"img_o", usage.ImageOutputTokens, &result.CompletionTokenDetails.ImageTokens},
+		{"ao", usage.AudioOutputTokens, &result.CompletionTokenDetails.AudioTokens},
+	} {
+		if detail.value == nil {
+			if used[detail.name] {
+				return nil
+			}
+			continue
+		}
+		if *detail.value < 0 || *detail.value > 1<<31-1 {
+			return nil
+		}
+		*detail.target = int(*detail.value)
+	}
+	return result
 }
 
 // meanPriceValue normalizes each quantitative snapshot before taking an exact
