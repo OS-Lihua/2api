@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
+	"image"
 	"math"
 	"net/http"
 	"slices"
@@ -17,15 +18,113 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	constant2 "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
 )
 
-// CountGatewayMediaInput includes reference audio and its transcript in the
-// original or effective speech input before the funding plan is frozen.
+// gatewayImageInputs shares the canonical and uploaded image view. Remote
+// references use tokenkit's existing typical-size estimate without a fetch.
+func gatewayImageInputs(c *gin.Context, request *dto.ImageRequest, model string) ([]tokenkit.Image, error) {
+	var inputs []tokenkit.Image
+	for _, raw := range []common.RawMessage{request.Image, request.Images} {
+		if len(raw) == 0 {
+			continue
+		}
+		value := ojson.ParseBytes(raw)
+		if value.Type == ojson.Null {
+			continue
+		}
+		values := []ojson.Result{value}
+		if value.IsArray() {
+			values = value.Array()
+		}
+		if len(inputs)+len(values) > dto.MaxImageN {
+			return nil, errors.New("image input count exceeds the request limit")
+		}
+		for _, value := range values {
+			metadata := tokenkit.Image{}
+			reference := value.Str
+			if value.IsObject() {
+				metadata.Detail = value.Get("detail").Str
+				reference = value.Get("url").Str
+				if reference == "" {
+					reference = value.Get("image_url").Str
+				}
+				if reference == "" {
+					reference = value.Get("image_url.url").Str
+				}
+			}
+			if tokenkit.ImageNeedsSize(model, metadata.Detail) {
+				encoded := reference
+				if strings.HasPrefix(encoded, "data:") {
+					_, payload, ok := strings.Cut(encoded, ",")
+					encoded = ""
+					if ok {
+						encoded = payload
+					}
+				}
+				if encoded != "" && !strings.Contains(encoded, ":") {
+					config, _, err := image.DecodeConfig(base64.NewDecoder(base64.StdEncoding, strings.NewReader(encoded)))
+					if err == nil {
+						metadata.Width, metadata.Height = config.Width, config.Height
+					}
+				}
+			}
+			inputs = append(inputs, metadata)
+		}
+	}
+	var uploaded []tokenkit.Image
+	if form := c.Request.MultipartForm; form != nil {
+		for field, files := range form.File {
+			if field != "image" && !strings.HasPrefix(field, "image[") && field != "image_prompt" {
+				continue
+			}
+			if len(uploaded)+len(files) > dto.MaxImageN {
+				return nil, errors.New("image input count exceeds the request limit")
+			}
+			for _, header := range files {
+				metadata := tokenkit.Image{}
+				if tokenkit.ImageNeedsSize(model, "") {
+					file, err := header.Open()
+					if err != nil {
+						return nil, errors.New("image input is unavailable")
+					}
+					config, _, err := image.DecodeConfig(file)
+					_ = file.Close()
+					if err == nil {
+						metadata.Width, metadata.Height = config.Width, config.Height
+					}
+				}
+				uploaded = append(uploaded, metadata)
+			}
+		}
+	}
+	if len(uploaded) > len(inputs) {
+		return uploaded, nil
+	}
+	return inputs, nil
+}
+
+// CountGatewayMediaInput includes images, reference audio and transcripts in
+// original or effective media input before the funding plan is frozen.
 func CountGatewayMediaInput(c *gin.Context, request dto.Request, info *relaycommon.RelayInfo) (int, error) {
 	meta := request.GetTokenCountMeta()
-	referenceTokens := 0
+	inputMediaTokens := 0
+	if request, ok := request.(*dto.ImageRequest); ok && info.ResponseFacts != nil {
+		inputs, err := gatewayImageInputs(c, request, info.TokenizerModel)
+		if err != nil {
+			return 0, err
+		}
+		for _, input := range inputs {
+			var clamp *common.QuotaClamp
+			inputMediaTokens, clamp = common.QuotaFromFloatChecked(float64(inputMediaTokens) + float64(tokenkit.ImageTokens(info.TokenizerModel, input)))
+			if clamp != nil {
+				return 0, clamp
+			}
+		}
+		info.ResponseFacts.ImageInputTokensEstimated = inputMediaTokens
+	}
 	if audio, ok := request.(*dto.AudioRequest); ok && info.ResponseFacts != nil && info.RelayMode == constant2.RelayModeAudioSpeech {
 		facts := info.ResponseFacts
 		facts.AudioInputSeconds = nil
@@ -127,21 +226,21 @@ func CountGatewayMediaInput(c *gin.Context, request dto.Request, info *relaycomm
 				if clamp != nil {
 					return 0, clamp
 				}
-				referenceTokens, clamp = common.QuotaFromFloatChecked(float64(referenceTokens) + float64(tokens))
+				inputMediaTokens, clamp = common.QuotaFromFloatChecked(float64(inputMediaTokens) + float64(tokens))
 				if clamp != nil {
 					return 0, clamp
 				}
 			}
 			value := seconds.String()
 			facts.AudioInputSeconds = &value
-			facts.AudioInputTokensEstimated = referenceTokens
+			facts.AudioInputTokensEstimated = inputMediaTokens
 		}
 	}
 	input, err := CountRequestToken(c, meta, info)
 	if err != nil {
 		return 0, err
 	}
-	input, clamp := common.QuotaFromFloatChecked(float64(input) + float64(referenceTokens))
+	input, clamp := common.QuotaFromFloatChecked(float64(input) + float64(inputMediaTokens))
 	if clamp != nil {
 		return 0, clamp
 	}
@@ -166,28 +265,11 @@ func GatewayMediaCapabilitiesMatch(c *gin.Context, kind protocol.Type, request d
 		if err != nil || caps.Limits.MaxImages != nil && int64(count) > *caps.Limits.MaxImages {
 			return false
 		}
-		uploadedImages := 0
-		if form := c.Request.MultipartForm; form != nil {
-			for field, files := range form.File {
-				if field == "image" || strings.HasPrefix(field, "image[") {
-					uploadedImages += len(files)
-				}
-			}
+		inputs, err := gatewayImageInputs(c, image, "")
+		if err != nil {
+			return false
 		}
-		images := 0
-		for _, raw := range []common.RawMessage{image.Image, image.Images} {
-			if len(raw) == 0 {
-				continue
-			}
-			value := ojson.ParseBytes(raw)
-			if value.IsArray() {
-				images += len(value.Array())
-			} else if value.Exists() {
-				images++
-			}
-		}
-		// Uploaded files and the effective DTO are separate input views.
-		images = max(images, uploadedImages)
+		images := len(inputs)
 		if images > dto.MaxImageN || images > 0 && !slices.Contains(caps.InputModalities, capability.Image) || caps.Limits.MaxImages != nil && int64(images) > *caps.Limits.MaxImages {
 			return false
 		}

@@ -5571,6 +5571,82 @@ func TestMediaGatewayMissingImageOutputUsageEstimatesOrStaysPending(t *testing.T
 	}
 }
 
+func TestMediaGatewayImageInputsKeepEstimatedTokensAndExplicitZeros(t *testing.T) {
+	for _, tc := range []struct {
+		name, inputs, usage, override string
+		tokens                        int64
+		multipart, reject             bool
+	}{
+		{name: "URL input", inputs: `,"image":"https://image.invalid/input"`, usage: `{"output_tokens":0}`, tokens: 520},
+		{name: "array input", inputs: `,"images":["https://image.invalid/a","https://image.invalid/b"],"n":3`, usage: `{"output_tokens":0}`, tokens: 1040},
+		{name: "explicit image zero", inputs: `,"image":"https://image.invalid/input"`, usage: `{"input_tokens":0,"input_tokens_details":{"image_tokens":0},"output_tokens":0}`},
+		{name: "reported total missing image detail", inputs: `,"image":"https://image.invalid/input"`, usage: `{"input_tokens":1000,"output_tokens":0}`, tokens: 520},
+		{name: "reported zero total missing image detail", inputs: `,"image":"https://image.invalid/input"`, usage: `{"input_tokens":0,"output_tokens":0}`, tokens: 520},
+		{name: "uploaded and projected views count once", multipart: true, override: `{"images":["https://image.invalid/input"]}`, usage: `{"output_tokens":0}`, tokens: 520},
+		{name: "original image context before override", inputs: `,"images":["https://image.invalid/a","https://image.invalid/b"]`, override: `{"images":[]}`, usage: `{"output_tokens":0}`, reject: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"data":[{"url":"https://image.invalid/one"}],"usage":%s}`, tc.usage)
+			})
+			if tc.override != "" {
+				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", tc.override).Error)
+			}
+			var unified model.Model
+			require.NoError(t, model.DB.First(&unified, fixture.channel.ModelID).Error)
+			unified.ModelName = "gateway-image-tokenizer-" + strconv.Itoa(fixture.channel.ModelID)
+			if tc.reject {
+				unified.Capabilities.Limits.ContextLength = common.GetPointer(int64(1000))
+			}
+			require.NoError(t, model.DB.Save(&unified).Error)
+			fixture.fake.Advance(time.Second)
+			for _, price := range []*model.PriceVersion{{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("images",img*9)`, EffectiveAt: clock.Now().Unix()}, {OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("images",img*7)`, EffectiveAt: clock.Now().Unix()}} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gateway-alias","prompt":"draw"`+tc.inputs+`}`))
+			request.Header.Set("Content-Type", "application/json")
+			if tc.multipart {
+				var picture bytes.Buffer
+				require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+				request = mediaMultipartRequest(t, "/v1/images/edits", map[string]string{"model": "gateway-alias", "prompt": "edit"}, "image", picture.Bytes())
+			}
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			response := httptest.NewRecorder()
+			fixture.engine.ServeHTTP(response, request)
+			if tc.reject {
+				assert.Equal(t, 400, response.Code)
+				assert.Zero(t, calls)
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
+				return
+			}
+			require.Equal(t, 200, response.Code, response.Body.String())
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, new(tc.tokens), record.Usage.ImageInputTokens)
+			assert.Equal(t, tc.tokens*8100, record.Receivable.Nanos)
+			if tc.tokens > 0 {
+				assert.Equal(t, "estimated", record.UsageSource)
+			}
+			if tc.name == "reported total missing image detail" {
+				assert.EqualValues(t, 1000, record.Usage.PromptTokens)
+			}
+			if tc.name == "reported zero total missing image detail" {
+				assert.Zero(t, record.Usage.PromptTokens)
+			}
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, new(tc.tokens), attempts[0].Usage.ImageInputTokens)
+			assert.Equal(t, tc.tokens*7000, attempts[0].Cost.Nanos)
+		})
+	}
+}
+
 func TestMediaGatewayImageModalitiesKeepBaseUsage(t *testing.T) {
 	for _, tc := range []struct {
 		name, usage, expression                        string

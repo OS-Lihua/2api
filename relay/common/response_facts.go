@@ -61,6 +61,7 @@ type ResponseFacts struct {
 	ImageOutputTokensEstimated         bool
 	ImageOutputSize                    string
 	ImageOutputQuality                 string
+	ImageInputTokensEstimated          int
 	ImageInputTokensReported           bool
 	ImageOutputTokensReported          bool
 	GeneratedOutputTokens              *int

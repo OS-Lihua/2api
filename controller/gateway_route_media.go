@@ -155,6 +155,7 @@ func prepareGatewayMediaRoute(c *gin.Context, selection *service.GatewaySelectio
 	mean *= int64(count)
 	usage := &dto.Usage{PromptTokens: input, CompletionTokens: int(mean), TotalTokens: input + int(mean)}
 	if parsed.Protocol == protocol.OpenAIImages {
+		usage.PromptTokensDetails.ImageTokens = info.ResponseFacts.ImageInputTokensEstimated
 		usage.CompletionTokenDetails.ImageTokens = int(mean)
 	}
 	if parsed.Protocol == protocol.OpenAIAudioSpeech {
