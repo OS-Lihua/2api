@@ -125,9 +125,13 @@ func BuildTaskBillingRequestInput(request *http.Request) (billingexpr.RequestInp
 		return input, err
 	}
 	defer body.Close()
-	mediaType, parameters, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
-	if err != nil {
-		return input, err
+	mediaType := "application/json"
+	var parameters map[string]string
+	if contentType := request.Header.Get("Content-Type"); strings.TrimSpace(contentType) != "" {
+		mediaType, parameters, err = mime.ParseMediaType(contentType)
+		if err != nil {
+			return input, err
+		}
 	}
 	if strings.HasPrefix(mediaType, "multipart/") {
 		reader := multipart.NewReader(body, parameters["boundary"])

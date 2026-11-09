@@ -1270,11 +1270,12 @@ func TestAsyncTaskFreezesOriginalSaleAndFinalWirePricingConditions(t *testing.T)
 	for _, tc := range []struct {
 		name, saleCondition, purchaseCondition string
 		balance                                int64
-		multipart                              bool
+		multipart, omitContentType             bool
 	}{
-		{"request predicates", `has(header("x-task-rate"), "client-fast")`, `has(header("x-task-rate"), "wire-fast")`, 100000000, false},
-		{"measured conditions and initially skipped probes", `has(header("x-task-rate"), "client-fast") && u("seconds") <= 2`, `u("seconds") <= 2 && has(header("x-task-rate"), "wire-fast")`, 550000000, false},
-		{"multipart scalar probes with file", `has(header("x-task-rate"), "client-fast")`, `has(header("x-task-rate"), "wire-fast")`, 100000000, true},
+		{"request predicates", `has(header("x-task-rate"), "client-fast")`, `has(header("x-task-rate"), "wire-fast")`, 100000000, false, false},
+		{"measured conditions and initially skipped probes", `has(header("x-task-rate"), "client-fast") && u("seconds") <= 2`, `u("seconds") <= 2 && has(header("x-task-rate"), "wire-fast")`, 550000000, false, false},
+		{"multipart scalar probes with file", `has(header("x-task-rate"), "client-fast")`, `has(header("x-task-rate"), "wire-fast")`, 100000000, true, false},
+		{"default JSON descriptor without content type", `has(header("x-task-rate"), "client-fast")`, `has(header("x-task-rate"), "wire-fast")`, 100000000, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1284,6 +1285,9 @@ func TestAsyncTaskFreezesOriginalSaleAndFinalWirePricingConditions(t *testing.T)
 					return
 				}
 				assert.Equal(t, wireHeader, r.Header.Get("X-Task-Rate"))
+				if tc.omitContentType {
+					assert.Empty(t, r.Header.Get("Content-Type"))
+				}
 				if tc.multipart {
 					if !assert.NoError(t, r.ParseMultipartForm(1<<20)) {
 						return
@@ -1297,6 +1301,13 @@ func TestAsyncTaskFreezesOriginalSaleAndFinalWirePricingConditions(t *testing.T)
 				}
 				_, _ = w.Write([]byte(`{"id":"private-probe-job","status":"queued"}`))
 			})
+			if tc.omitContentType {
+				source, err := plugins.Source("sora")
+				require.NoError(t, err)
+				source = strings.ReplaceAll(source, `headers["Content-Type"] = "application/json";`, "")
+				_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "sora"})
+				require.NoError(t, err)
+			}
 			header, err := common.Marshal(map[string]string{"X-Task-Rate": wireHeader})
 			require.NoError(t, err)
 			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("header_override", string(header)).Error)
