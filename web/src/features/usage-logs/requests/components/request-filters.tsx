@@ -127,6 +127,11 @@ export function RequestFilterBar(props: {
             { value: 'failed', label: t('Failed') },
             { value: 'cancelled', label: t('Cancelled') },
             { value: 'partial', label: t('Partial') },
+            { value: 'pending', label: t('Pending') },
+            {
+              value: 'submission_unknown',
+              label: t('Task submission outcome unknown'),
+            },
             { value: 'settlement_pending', label: t('Settlement pending') },
           ]}
           onValueChange={(value) =>

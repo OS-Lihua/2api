@@ -124,9 +124,39 @@ type GatewayAttemptBudget struct {
 	ctx       context.Context
 }
 
+// RequirePermit binds Provider I/O to this Attempt's shared concurrency lease.
+// Call it once after selection, before Start. Losing the lease cancels I/O even
+// after delivery has ended the first-byte deadline.
+func (b *GatewayAttemptBudget) RequirePermit(permit *GatewayRoutePermit) {
+	if b.sent && b.cancel != nil {
+		permit.mu.Lock()
+		defer permit.mu.Unlock()
+		permit.cancel = b.cancel
+		if permit.closed || permit.lost {
+			b.cancel(ErrGatewayPermitLost)
+		}
+		return
+	}
+	ctx, cancel := context.WithCancelCause(b.parent)
+	b.parent = ctx
+	if permit == nil {
+		cancel(ErrGatewayPermitLost)
+		return
+	}
+	permit.mu.Lock()
+	defer permit.mu.Unlock()
+	permit.cancel = cancel
+	if permit.closed || permit.lost {
+		cancel(ErrGatewayPermitLost)
+	}
+}
+
+// Context returns this Attempt's parent without starting its first-byte timer.
+func (b *GatewayAttemptBudget) Context() context.Context { return b.parent }
+
 func (b *GatewayAttemptBudget) Start() (context.Context, error) {
 	if err := b.parent.Err(); err != nil {
-		return nil, err
+		return nil, context.Cause(b.parent)
 	}
 	if b.ctx != nil {
 		if cause := context.Cause(b.ctx); cause != nil {
@@ -160,6 +190,19 @@ func (b *GatewayAttemptBudget) Start() (context.Context, error) {
 	b.cancel, b.sent = cancel, true
 	b.stop = clock.AfterFunc(min(remaining, b.policy.AttemptFirstByte), func() { cancel(ErrGatewayBudget) })
 	return ctx, nil
+}
+
+// Handoff gives a native session a live context after its handshake Attempt
+// returns. Budget accounting and the normal pause/resume lifecycle are retained.
+func (b *GatewayAttemptBudget) Handoff() {
+	if b.sent && !b.finished && !b.paused {
+		b.elapsed = min(b.elapsed+clock.Now().Sub(b.started), b.remaining, b.policy.AttemptFirstByte)
+	}
+	if b.stop != nil {
+		b.stop()
+	}
+	b.parent = context.WithoutCancel(b.parent)
+	b.ctx, b.cancel = context.WithCancelCause(b.parent)
 }
 
 // Pause excludes client think/input time on an established native connection.
@@ -259,7 +302,7 @@ func RunGatewayAttempts(ctx context.Context, policy GatewayAttemptPolicy, execut
 		}
 		attempt := result.Attempt
 		action, healthErr := ChannelHealth.Record(context.WithoutCancel(ctx), channelhealth.Sample{
-			AttemptID: attempt.ID, ChannelID: attempt.ChannelID, Success: attempt.Status == "success",
+			AttemptID: attempt.ID, ChannelID: attempt.ChannelID, Success: attempt.Status == "success" || attempt.Status == "pending",
 			ProviderFailure: result.Failure.Switch && !result.LocalRejection, RateLimited: result.Failure.Class == "rate_limited", FirstByte: result.FirstByte, RetryAfter: result.RetryAfter, Lease: result.HealthLease,
 		})
 		if healthErr == nil {

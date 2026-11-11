@@ -37,7 +37,7 @@ export const meta = {
     en: "Google Veo and Gemini Omni Flash video generation on Vertex AI (text-to-video and image-to-video)",
     zh: "Google Veo 与 Gemini Omni Flash 视频生成（文生视频、图生视频），Vertex AI 版本",
   },
-  version: "1.2.0",
+  version: "1.3.0",
   channelTypes: [41],
   author: { name: "QuantumNous" },
   models: [
@@ -305,8 +305,9 @@ function aspect(size) {
   return !p || p[0] <= 0 || p[1] <= 0 ? "16:9" : p[1] > p[0] ? "9:16" : "16:9";
 }
 function duration(req) {
-  let n = Number(req.duration);
-  if (!Number.isFinite(n) || n <= 0) n = 8;
+  const raw = Number(req.duration) > 0 ? req.duration : ((req.metadata || {}).durationSeconds ?? 8);
+  const n = Number(raw);
+  if (![4, 6, 8].includes(n)) throw new Error("durationSeconds must be one of 4, 6, or 8");
   return n;
 }
 function region(ctx, model) {
@@ -415,6 +416,15 @@ export const native = {
     return { error: { code: error.httpStatus, message: error.message } };
   },
 };
+
+export function extractCapabilities(ctx) {
+  const req = ctx.requestBody || {};
+  const input = [];
+  if (trimmed(req.prompt)) input.push("text");
+  if ((req.images || []).length) input.push("image");
+  const seconds = omniModel(ctx) ? omniDuration(req) : duration(req);
+  return { input_modalities: input, output_modalities: ["video"], image_count: (req.images || []).length ? 1 : 0, duration_seconds: Math.ceil(seconds) };
+}
 
 export function buildSubmitRequest(ctx) {
   if (ctx.authError) throw new Error(ctx.authError);

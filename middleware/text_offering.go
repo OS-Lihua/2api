@@ -30,37 +30,47 @@ func ResolveTextOffering() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		if c.GetTime(TextGatewayStartedAtKey).IsZero() {
-			c.Set(TextGatewayStartedAtKey, clock.Now())
+		resolveOffering(c, name)
+	}
+}
+
+// ResolveTaskOffering shares Offering resolution with stateless text routes.
+// Credential and Offering authorization checks remain in their normal handlers.
+func ResolveTaskOffering() gin.HandlerFunc {
+	return func(c *gin.Context) { resolveOffering(c, "") }
+}
+
+func resolveOffering(c *gin.Context, name string) {
+	if c.GetTime(TextGatewayStartedAtKey).IsZero() {
+		c.Set(TextGatewayStartedAtKey, clock.Now())
+	}
+	if name == "" {
+		var request struct {
+			Model string `json:"model"`
 		}
-		if name == "" {
-			var request struct {
-				Model string `json:"model"`
-			}
-			if common.UnmarshalBodyReusable(c, &request) != nil || request.Model == "" {
-				c.Next()
-				return
-			}
-			name = request.Model
-		}
-		offering, err := model.FindModelOfferingByName(c.Request.Context(), name)
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			legacy, legacyErr := model.LegacyModelConfigured(c.Request.Context(), name)
-			if legacyErr != nil {
-				abortWithOpenAiMessage(c, http.StatusInternalServerError, "Could not resolve model")
-				return
-			}
-			c.Set(textOfferingMissingContextKey, !legacy)
+		if common.UnmarshalBodyReusable(c, &request) != nil || request.Model == "" {
 			c.Next()
 			return
 		}
-		if err != nil {
+		name = request.Model
+	}
+	offering, err := model.FindModelOfferingByName(c.Request.Context(), name)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		legacy, legacyErr := model.LegacyModelConfigured(c.Request.Context(), name)
+		if legacyErr != nil {
 			abortWithOpenAiMessage(c, http.StatusInternalServerError, "Could not resolve model")
 			return
 		}
-		c.Set(textOfferingContextKey, offering)
+		c.Set(textOfferingMissingContextKey, !legacy)
 		c.Next()
+		return
 	}
+	if err != nil {
+		abortWithOpenAiMessage(c, http.StatusInternalServerError, "Could not resolve model")
+		return
+	}
+	c.Set(textOfferingContextKey, offering)
+	c.Next()
 }
 
 // TextGatewayEndpoint identifies only the four stateless HTTP text operations.

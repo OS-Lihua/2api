@@ -18,6 +18,7 @@ import (
 var GatewayRouteQuota = NewGatewayRouteQuota(nil)
 
 var ErrGatewayRateLimited = errors.New("Provider or Channel admission limit reached")
+var ErrGatewayPermitLost = errors.New("Provider or Channel admission lease lost")
 
 type gatewayQuotaState struct {
 	Window   int64            `json:"window"`
@@ -126,10 +127,10 @@ func normalizeGatewayQuota(state *gatewayQuotaState, now time.Time) {
 }
 
 func (manager *GatewayRouteQuotaManager) Check(ctx context.Context, selection *GatewaySelection, tokens int64) error {
-	return manager.admit(ctx, selection, tokens, "")
+	return manager.admit(ctx, selection, tokens, "", nil, false)
 }
 
-func (manager *GatewayRouteQuotaManager) admit(ctx context.Context, selection *GatewaySelection, tokens int64, lease string) error {
+func (manager *GatewayRouteQuotaManager) admit(ctx context.Context, selection *GatewaySelection, tokens int64, lease string, held *GatewayRoutePermit, used bool) error {
 	if tokens < 0 || tokens > 1<<31-1 {
 		return ErrGatewayRateLimited
 	}
@@ -138,7 +139,17 @@ func (manager *GatewayRouteQuotaManager) admit(ctx context.Context, selection *G
 		for _, scope := range scopes {
 			state := states[scope.key]
 			limits := scope.limits
-			if !limits.Valid() || limits.RPM > 0 && state.Requests >= limits.RPM || limits.TPM > 0 && (tokens > limits.TPM || state.Tokens > limits.TPM-tokens) || limits.MaxConcurrency > 0 && int64(len(state.Leases)) >= limits.MaxConcurrency {
+			requests, forecast, concurrent := state.Requests, state.Tokens, int64(len(state.Leases))
+			if held != nil {
+				if _, owns := state.Leases[held.lease]; owns {
+					concurrent--
+					if !used && state.Window == held.window {
+						requests = max(0, requests-1)
+						forecast = max(0, forecast-held.tokens)
+					}
+				}
+			}
+			if !limits.Valid() || limits.RPM > 0 && requests >= limits.RPM || limits.TPM > 0 && (tokens > limits.TPM || forecast > limits.TPM-tokens) || limits.MaxConcurrency > 0 && concurrent >= limits.MaxConcurrency {
 				return ErrGatewayRateLimited
 			}
 		}
@@ -163,11 +174,40 @@ type GatewayRoutePermit struct {
 	mu             sync.Mutex
 	stop           func() bool
 	closed         bool
+	lost           bool
+	cancel         context.CancelCauseFunc
+	disarmed       bool
+}
+
+// CheckAlternative tests admission after this Permit releases its slot. An
+// unused reservation also returns its request and token forecast.
+func (permit *GatewayRoutePermit) CheckAlternative(ctx context.Context, selection *GatewaySelection, tokens int64, used bool) error {
+	if permit == nil {
+		return ErrGatewayUnavailable
+	}
+	permit.mu.Lock()
+	defer permit.mu.Unlock()
+	if permit.closed {
+		return permit.manager.Check(ctx, selection, tokens)
+	}
+	return permit.manager.admit(ctx, selection, tokens, "", permit, used)
+}
+
+// Disarm detaches this Permit after its Provider I/O is complete. It cannot
+// undo a loss that already cancelled that I/O or transfer it to a future one.
+func (permit *GatewayRoutePermit) Disarm() {
+	if permit == nil {
+		return
+	}
+	permit.mu.Lock()
+	defer permit.mu.Unlock()
+	permit.disarmed = true
+	permit.cancel = nil
 }
 
 func (manager *GatewayRouteQuotaManager) Acquire(ctx context.Context, selection *GatewaySelection, tokens int64) (*GatewayRoutePermit, error) {
 	lease := common.NewRequestId()
-	if err := manager.admit(ctx, selection, tokens, lease); err != nil {
+	if err := manager.admit(ctx, selection, tokens, lease, nil, false); err != nil {
 		return nil, err
 	}
 	permit := &GatewayRoutePermit{manager: manager, scopes: gatewayQuotaScopes(selection), lease: lease, tokens: tokens, window: clock.Now().Unix() / 60}
@@ -185,15 +225,26 @@ func (permit *GatewayRoutePermit) renew() {
 	// call has returned and released its concurrency slot.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = permit.manager.transact(ctx, permit.scopes, func(states map[string]*gatewayQuotaState) error {
+	err := permit.manager.transact(ctx, permit.scopes, func(states map[string]*gatewayQuotaState) error {
 		for _, scope := range permit.scopes {
-			state := states[scope.key]
-			if _, ok := state.Leases[permit.lease]; ok {
-				state.Leases[permit.lease] = clock.Now().Add(10 * time.Minute).UnixMilli()
+			if _, ok := states[scope.key].Leases[permit.lease]; !ok {
+				return ErrGatewayPermitLost
 			}
+		}
+		for _, scope := range permit.scopes {
+			states[scope.key].Leases[permit.lease] = clock.Now().Add(10 * time.Minute).UnixMilli()
 		}
 		return nil
 	})
+	if err != nil {
+		if !permit.disarmed {
+			permit.lost = true
+			if permit.cancel != nil {
+				permit.cancel(ErrGatewayPermitLost)
+			}
+		}
+	}
+	// Keep the slot renewed until the cancelled Provider call actually returns.
 	permit.stop = clock.AfterFunc(time.Minute, permit.renew)
 }
 
@@ -212,6 +263,8 @@ func (permit *GatewayRoutePermit) Release(ctx context.Context, used bool, actual
 	if permit.stop != nil {
 		permit.stop()
 	}
+	// Release retires the quota lease. A shared budget may survive for later
+	// logical requests on a native session; its own runner ends its I/O context.
 	err := permit.manager.transact(ctx, permit.scopes, func(states map[string]*gatewayQuotaState) error {
 		for _, scope := range permit.scopes {
 			state := states[scope.key]

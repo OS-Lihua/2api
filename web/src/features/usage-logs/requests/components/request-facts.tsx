@@ -93,6 +93,8 @@ export function RequestOutcome(props: { status: string }) {
     cancelled: t('Cancelled'),
     partial: t('Partial'),
     settlement_pending: t('Settlement pending'),
+    pending: t('Pending'),
+    submission_unknown: t('Task submission outcome unknown'),
   }
   const label = statuses[props.status as keyof typeof statuses] ?? props.status
   let variant: 'success' | 'danger' | 'warning' | 'neutral' = 'neutral'
@@ -100,7 +102,8 @@ export function RequestOutcome(props: { status: string }) {
   else if (props.status === 'failed') variant = 'danger'
   else if (
     props.status === 'partial' ||
-    props.status === 'settlement_pending'
+    props.status === 'settlement_pending' ||
+    props.status === 'submission_unknown'
   ) {
     variant = 'warning'
   }
@@ -131,15 +134,42 @@ export function RequestUsageFacts(props: {
     [t('Image output tokens'), props.usage.image_output_tokens],
     [t('Audio output tokens'), props.usage.audio_output_tokens],
   ]
+  const taskFacts = Object.entries(props.usage.task_facts ?? {})
   return (
     <div className='space-y-1 text-xs'>
-      <div className='tabular-nums'>
-        {t('Input')}: {formatNumber(props.usage.prompt_tokens, locale)} ·{' '}
-        {t('Output')}: {formatNumber(props.usage.completion_tokens, locale)}
-      </div>
-      {props.usage.total_tokens !== undefined && (
-        <div className='text-muted-foreground'>
-          {t('Total tokens')}: {formatNumber(props.usage.total_tokens, locale)}
+      {taskFacts.length > 0 ? (
+        <dl role='group' aria-label={t('Task usage')} className='space-y-1'>
+          {taskFacts.map(([key, value]) => {
+            let display: string
+            if (typeof value === 'number') {
+              display = formatNumber(value, locale)
+            } else if (typeof value === 'boolean') {
+              display = value ? t('Yes') : t('No')
+            } else {
+              display = value
+            }
+            return (
+              <div key={key} className='flex flex-wrap gap-1'>
+                <dt className='text-muted-foreground'>{key}</dt>
+                <dd className='break-all tabular-nums' title={String(value)}>
+                  {display}
+                </dd>
+              </div>
+            )
+          })}
+        </dl>
+      ) : (
+        <div>
+          <div className='tabular-nums'>
+            {t('Input')}: {formatNumber(props.usage.prompt_tokens, locale)} ·{' '}
+            {t('Output')}: {formatNumber(props.usage.completion_tokens, locale)}
+          </div>
+          {props.usage.total_tokens !== undefined && (
+            <div className='text-muted-foreground'>
+              {t('Total tokens')}:{' '}
+              {formatNumber(props.usage.total_tokens, locale)}
+            </div>
+          )}
         </div>
       )}
       {details.map(([label, quantity]) =>

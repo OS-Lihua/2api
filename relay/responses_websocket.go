@@ -340,6 +340,26 @@ func (call *ResponsesWSCall) Exchange(c *gin.Context, info *relaycommon.RelayInf
 	return usage, apiErr
 }
 
+// CancelWithCause stops this session when the gateway revokes a Provider lease.
+func (call *ResponsesWSCall) CancelWithCause(cause error) {
+	if call.session != nil {
+		call.session.cancel(cause)
+	}
+}
+
+// WatchAttempt ends the socket after a lost shared admission lease. Normal
+// Release cancellation runs only after the logical request has returned.
+func (call *ResponsesWSCall) WatchAttempt(ctx context.Context) {
+	if call.session != nil {
+		go func() {
+			<-ctx.Done()
+			if errors.Is(context.Cause(ctx), service.ErrGatewayPermitLost) {
+				call.session.shutdown(websocket.CloseInternalServerErr, "shared concurrency lease lost")
+			}
+		}()
+	}
+}
+
 // Established includes a successful handshake followed by a failed generation.
 func (call *ResponsesWSCall) Established() bool {
 	if call.Native != nil {
@@ -425,7 +445,7 @@ type responsesWSCallState struct {
 type responsesWSSession struct {
 	language                 string
 	ctx                      context.Context
-	cancel                   context.CancelFunc
+	cancel                   context.CancelCauseFunc
 	client                   *websocket.Conn
 	runner                   ResponsesWSRequestRunner
 	gateway                  ResponsesWSGateway
@@ -469,7 +489,7 @@ type responsesWSSession struct {
 }
 
 func ResponsesWebSocketHelper(c *gin.Context, client *websocket.Conn, runner ResponsesWSRequestRunner, gateways ...ResponsesWSGateway) *types.NewAPIError {
-	ctx, cancel := context.WithCancel(c.Request.Context())
+	ctx, cancel := context.WithCancelCause(c.Request.Context())
 	s := &responsesWSSession{language: i18n.StatedLang(c), ctx: ctx, cancel: cancel, client: client, runner: runner,
 		request: c.Request.Clone(ctx), requestID: c.GetString(common.RequestIdKey)}
 	if len(gateways) > 0 {
@@ -1240,7 +1260,7 @@ func (s *responsesWSSession) sendError(eventID, streamID string, apiErr *types.N
 // data writer, so shutdown takes no write lock and never waits for workers.
 func (s *responsesWSSession) shutdown(code int, reason string) {
 	s.closeOnce.Do(func() {
-		s.cancel()
+		s.cancel(context.Canceled)
 		s.connectionMu.Lock()
 		target, unregister := s.target, s.unregister
 		s.target, s.unregister = nil, nil

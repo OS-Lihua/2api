@@ -5246,21 +5246,155 @@ func TestTextGatewayRouteOccupiedProbeContinuesToNextTier(t *testing.T) {
 	}
 }
 
+func TestTextGatewayLossFallbackRetainsNextCheapestAfterAtomicQuotaRejection(t *testing.T) {
+	for _, test := range []struct {
+		shared    bool
+		firstCost int
+		converted bool
+		probe     bool
+	}{
+		{firstCost: 1}, {shared: true, firstCost: 1},
+		{}, {shared: true},
+		{firstCost: 1, converted: true}, {shared: true, firstCost: 1, converted: true},
+		{probe: true}, {shared: true, probe: true},
+	} {
+		t.Run(fmt.Sprintf("redis=%t/first_cost=%d/converted=%t/probe=%t", test.shared, test.firstCost, test.converted, test.probe), func(t *testing.T) {
+			var calls atomic.Int32
+			upstream := func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				if strings.HasSuffix(r.URL.Path, "/responses") {
+					_, _ = io.WriteString(w, `{"id":"next","object":"response","status":"completed","output":[{"type":"message","id":"next","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Next cheapest","annotations":[]}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}`)
+					return
+				}
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"Next cheapest"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+			}
+			fixture := newTextGatewayFixture(t, upstream)
+			second := addTextGatewayChannel(t, fixture, upstream)
+			third := addTextGatewayChannel(t, fixture, upstream)
+			if test.converted {
+				require.NoError(t, model.DB.Model(&model.Channel{}).Where("id IN ?", []int{second.ID, third.ID}).Update("protocol", protocol.OpenAIResponses).Error)
+			}
+			fixture.offering.RouteMethod = "weight"
+			require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+			for i, channel := range []*model.Channel{fixture.channel, second, third} {
+				cost := i + 1
+				if i == 0 {
+					cost = test.firstCost
+				}
+				require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{
+					OwnerType: model.PriceOwnerChannel, OwnerID: channel.ID, Currency: "USD",
+					Expression: fmt.Sprintf(`tier("loss", fixed(%d))`, cost), EffectiveAt: clock.Now().Unix(),
+				}, fixture.sale.CreatedBy))
+			}
+			fixture.channel.MaxConcurrency = 1
+			require.NoError(t, model.DB.Model(fixture.channel).Update("max_concurrency", 1).Error)
+			if test.shared {
+				server := miniredis.RunT(t)
+				client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+				t.Cleanup(func() { require.NoError(t, client.Close()) })
+				service.GatewayRouteQuota = service.NewGatewayRouteQuota(client)
+				service.ChannelHealth = channelhealth.New(client)
+			}
+			var provider model.Provider
+			require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
+			busy := &service.GatewaySelection{Channel: *fixture.channel, Provider: &provider}
+			var occupied *service.GatewayRoutePermit
+			var probe channelhealth.Admission
+			occupy := sync.OnceFunc(func() {
+				if test.probe {
+					_, err := service.ChannelHealth.Record(t.Context(), channelhealth.Sample{AttemptID: "late-profitable-peer", ChannelID: fixture.channel.ID, ProviderFailure: true, RateLimited: true, RetryAfter: "60"})
+					require.NoError(t, err)
+					probe, err = service.ChannelHealth.Acquire(t.Context(), []int{fixture.channel.ID})
+					require.NoError(t, err)
+					require.Equal(t, fixture.channel.ID, probe.ChannelID)
+					require.NotEmpty(t, probe.Lease)
+					return
+				}
+				var err error
+				occupied, err = service.GatewayRouteQuota.Acquire(t.Context(), busy, 0)
+				require.NoError(t, err)
+			})
+			defer func() {
+				if probe.Lease != "" {
+					require.NoError(t, service.ChannelHealth.Release(t.Context(), probe))
+				}
+				if occupied != nil {
+					require.NoError(t, occupied.Release(t.Context(), false))
+				}
+			}()
+			engine := gin.New()
+			engine.Use(middleware.RequestId())
+			engine.Use(func(c *gin.Context) {
+				c.Set(service.GatewayRouteRandomSource, func(bound uint64) uint64 {
+					occupy()
+					return bound - 1
+				})
+				c.Next()
+			})
+			SetRelayRouter(engine)
+			response := adminSecurityRequest(engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.EqualValues(t, 1, calls.Load())
+			if test.probe {
+				assert.NoError(t, service.GatewayRouteQuota.Check(t.Context(), busy, 0))
+			} else {
+				assert.ErrorIs(t, service.GatewayRouteQuota.Check(t.Context(), busy, 0), service.ErrGatewayRateLimited)
+			}
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), response.Header().Get(common.RequestIdKey), 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, second.ID, attempts[0].ChannelID)
+			assert.EqualValues(t, 2_000_000_000, attempts[0].Cost.Nanos)
+			request, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.EqualValues(t, 36_000, request.Receivable.Nanos)
+			assertTextGatewayLedger(t, *request, 2_000_000_000)
+		})
+	}
+}
+
 func TestTextGatewayAllOpenProbeRemainsExclusiveAfterRetryOrderChanges(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		first, second protocol.Type
 		recoverFirst  bool
+		occupyQuota   bool
+		providerQuota bool
+		lossFence     bool
+		ineligible    string
+		lateQuota     bool
 	}{
 		{name: "same protocol", first: protocol.OpenAIChat, second: protocol.OpenAIChat},
+		{name: "quota lease holder", first: protocol.OpenAIChat, second: protocol.OpenAIChat, occupyQuota: true},
+		{name: "provider quota lease holder", first: protocol.OpenAIChat, second: protocol.OpenAIChat, occupyQuota: true, providerQuota: true},
+		{name: "profitable pool after loss probe", first: protocol.OpenAIChat, second: protocol.OpenAIChat, occupyQuota: true, lossFence: true},
+		{name: "scope excludes lease holder", first: protocol.OpenAIChat, second: protocol.OpenAIChat, ineligible: "scope"},
+		{name: "capability excludes lease holder", first: protocol.OpenAIChat, second: protocol.OpenAIChat, ineligible: "capability"},
+		{name: "missing price excludes lease holder", first: protocol.OpenAIChat, second: protocol.OpenAIChat, ineligible: "price"},
+		{name: "final atomic quota rejection", first: protocol.OpenAIChat, second: protocol.OpenAIChat, occupyQuota: true, ineligible: "final quota", lateQuota: true},
 		{name: "converted lease holder", first: protocol.OpenAIResponses, second: protocol.OpenAIChat},
 		{name: "native lease holder", first: protocol.OpenAIChat, second: protocol.OpenAIResponses, recoverFirst: true},
 	} {
 		for _, shared := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/redis=%t", tc.name, shared), func(t *testing.T) {
 				var calls atomic.Int32
+				entered, release := make(chan struct{}), make(chan struct{})
+				releaseOnce := sync.OnceFunc(func() { close(release) })
+				var firstFinished chan *httptest.ResponseRecorder
+				firstDone := false
+				defer func() {
+					releaseOnce()
+					if firstFinished != nil && !firstDone {
+						<-firstFinished
+					}
+				}()
 				upstream := func(w http.ResponseWriter, r *http.Request) {
 					calls.Add(1)
+					if tc.lossFence && r.Header.Get("Authorization") == "Bearer provider-secret" {
+						close(entered)
+						<-release
+					}
 					w.Header().Set("Content-Type", "application/json")
 					if strings.HasSuffix(r.URL.Path, "/responses") {
 						_, _ = io.WriteString(w, `{"id":"recovered","object":"response","status":"completed","output":[{"type":"message","id":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Recovered","annotations":[]}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}`)
@@ -5270,6 +5404,14 @@ func TestTextGatewayAllOpenProbeRemainsExclusiveAfterRetryOrderChanges(t *testin
 				}
 				fixture := newTextGatewayFixture(t, upstream)
 				second := addTextGatewayChannel(t, fixture, upstream)
+				if tc.ineligible == "price" {
+					unpriced := *fixture.channel
+					unpriced.ID = 0
+					unpriced.UpstreamModelName += "-unpriced"
+					require.NoError(t, model.DB.Create(&unpriced).Error)
+					require.NoError(t, model.DB.Model(fixture.channel).Update("status", model.ChannelDisabled).Error)
+					fixture.channel = &unpriced
+				}
 				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", tc.first).Error)
 				require.NoError(t, model.DB.Model(second).Update("protocol", tc.second).Error)
 				manager := service.ChannelHealth
@@ -5280,6 +5422,9 @@ func TestTextGatewayAllOpenProbeRemainsExclusiveAfterRetryOrderChanges(t *testin
 					t.Cleanup(func() { require.NoError(t, client.Close()) })
 					manager, observer = channelhealth.New(client), channelhealth.New(client)
 					service.ChannelHealth = manager
+					if tc.occupyQuota {
+						service.GatewayRouteQuota = service.NewGatewayRouteQuota(client)
+					}
 				}
 				ctx := t.Context()
 				ordinary, err := observer.Acquire(ctx, []int{fixture.channel.ID})
@@ -5292,24 +5437,128 @@ func TestTextGatewayAllOpenProbeRemainsExclusiveAfterRetryOrderChanges(t *testin
 					_, err = observer.Record(ctx, sample)
 					require.NoError(t, err)
 				}
-				probe, err := observer.Acquire(ctx, []int{fixture.channel.ID, second.ID})
-				require.NoError(t, err)
-				require.Equal(t, fixture.channel.ID, probe.ChannelID)
-				require.NotEmpty(t, probe.Lease)
-				defer observer.Release(ctx, probe)
+				var probe channelhealth.Admission
+				var quota *service.GatewayRoutePermit
+				body := `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`
+				if tc.occupyQuota && !tc.lateQuota {
+					var provider model.Provider
+					require.NoError(t, model.DB.First(&provider, fixture.channel.ProviderID).Error)
+					if tc.providerQuota {
+						provider.ProviderInfo.RouteLimits.MaxConcurrency = 1
+						require.NoError(t, model.DB.Model(&provider).Update("channel_info", provider.ProviderInfo).Error)
+					} else {
+						fixture.channel.MaxConcurrency = 1
+						require.NoError(t, model.DB.Model(fixture.channel).Update("max_concurrency", 1).Error)
+					}
+					selection := &service.GatewaySelection{Channel: *fixture.channel, Provider: &provider}
+					if tc.lossFence {
+						second.MaxConcurrency = 1
+						require.NoError(t, model.DB.Model(second).Update("max_concurrency", 1).Error)
+						provider = model.Provider{}
+						require.NoError(t, model.DB.First(&provider, second.ProviderID).Error)
+						selection = &service.GatewaySelection{Channel: *second, Provider: &provider}
+						require.NoError(t, model.CreatePriceVersion(ctx, &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("loss",p*1000+c*1000)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+					}
+					quota, err = service.GatewayRouteQuota.Acquire(ctx, selection, 0)
+					require.NoError(t, err)
+					defer quota.Release(ctx, false)
+				}
+				if tc.lossFence {
+					firstFinished = make(chan *httptest.ResponseRecorder, 1)
+					go func() {
+						firstFinished <- adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+					}()
+					select {
+					case <-entered:
+					case early := <-firstFinished:
+						firstDone = true
+						require.FailNowf(t, "loss fallback did not reach its Provider", "%d %s", early.Code, early.Body.String())
+					}
+					require.NoError(t, quota.Release(ctx, false))
+				} else if !tc.lateQuota {
+					probe, err = observer.Acquire(ctx, []int{fixture.channel.ID, second.ID})
+					require.NoError(t, err)
+					require.Equal(t, fixture.channel.ID, probe.ChannelID)
+					require.NotEmpty(t, probe.Lease)
+					defer observer.Release(ctx, probe)
+				}
+				var lateSelection *service.GatewaySelection
+				if tc.lateQuota {
+					second.MaxConcurrency = 1
+					require.NoError(t, model.DB.Model(second).Update("max_concurrency", 1).Error)
+					var provider model.Provider
+					require.NoError(t, model.DB.First(&provider, second.ProviderID).Error)
+					lateSelection = &service.GatewaySelection{Channel: *second, Provider: &provider}
+					occupy := sync.OnceFunc(func() { quota, err = service.GatewayRouteQuota.Acquire(ctx, lateSelection, 0); require.NoError(t, err) })
+					defer func() { _ = quota.Release(ctx, false) }()
+					engine := gin.New()
+					engine.Use(middleware.RequestId())
+					engine.Use(func(c *gin.Context) {
+						c.Set(service.GatewayRouteRandomSource, func(bound uint64) uint64 { occupy(); return 0 })
+						c.Next()
+					})
+					SetRelayRouter(engine)
+					fixture.engine = engine
+				}
+				switch tc.ineligible {
+				case "scope":
+					fixture.offering.ChannelScope.ExcludeChannelIDs = []int{fixture.channel.ID}
+					require.NoError(t, model.SaveModelOffering(ctx, fixture.offering, "save"))
+				case "capability":
+					require.NoError(t, model.DB.Model(fixture.channel).Update("capabilities", capability.Set{OutputModalities: []capability.Modality{capability.Text}}).Error)
+				}
 				_, err = observer.Record(ctx, channelhealth.Sample{AttemptID: "late-ordinary", ChannelID: fixture.channel.ID,
 					ProviderFailure: true, RateLimited: true, RetryAfter: "172800", Lease: ordinary.Lease})
 				require.NoError(t, err)
-				body := `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`
+				before, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
 				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+				if tc.ineligible != "" {
+					require.Equal(t, 200, response.Code, response.Body.String())
+					assert.EqualValues(t, 1, calls.Load())
+					attempts, total, err := model.ListGatewayAttempts(ctx, response.Header().Get(common.RequestIdKey), 0, 10)
+					require.NoError(t, err)
+					require.EqualValues(t, 1, total)
+					if tc.lateQuota {
+						assert.Equal(t, fixture.channel.ID, attempts[0].ChannelID)
+						assert.ErrorIs(t, service.GatewayRouteQuota.Check(ctx, lateSelection, 0), service.ErrGatewayRateLimited)
+						recovered, err := observer.Acquire(ctx, []int{second.ID})
+						require.NoError(t, err)
+						require.Equal(t, second.ID, recovered.ChannelID)
+						require.NotEmpty(t, recovered.Lease, "failed atomic admission must return its probe lease")
+						require.NoError(t, observer.Release(ctx, recovered))
+						require.NoError(t, quota.Release(ctx, false))
+						assert.NoError(t, service.GatewayRouteQuota.Check(ctx, lateSelection, 0))
+					} else {
+						assert.Equal(t, second.ID, attempts[0].ChannelID)
+					}
+					return
+				}
 				require.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
-				assert.Zero(t, calls.Load())
+				priorCalls := int32(0)
+				if tc.lossFence {
+					priorCalls = 1
+				}
+				assert.Equal(t, priorCalls, calls.Load())
 				_, total, err := model.ListGatewayAttempts(ctx, response.Header().Get(common.RequestIdKey), 0, 10)
 				require.NoError(t, err)
 				assert.Zero(t, total)
 				wallet, err := model.GetUserWallet(fixture.user.Id)
 				require.NoError(t, err)
-				assert.EqualValues(t, 1_000_000_000, wallet.Balance.Nanos)
+				assert.Equal(t, before.Balance, wallet.Balance)
+				if tc.lossFence {
+					require.NoError(t, model.DB.Model(fixture.offering).Update("allow_loss_fallback", false).Error)
+					allowed := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+					require.Equal(t, 200, allowed.Code, allowed.Body.String())
+					require.NoError(t, model.DB.Model(fixture.offering).Update("allow_loss_fallback", true).Error)
+					allowed = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
+					require.Equal(t, 200, allowed.Code, allowed.Body.String())
+					releaseOnce()
+					first := <-firstFinished
+					firstDone = true
+					require.Equal(t, 200, first.Code, first.Body.String())
+				}
+				require.NoError(t, quota.Release(ctx, false))
 				require.NoError(t, observer.Release(ctx, probe))
 				response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", body)
 				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
@@ -5321,7 +5570,11 @@ func TestTextGatewayAllOpenProbeRemainsExclusiveAfterRetryOrderChanges(t *testin
 					expected = fixture.channel.ID
 				}
 				assert.Equal(t, expected, attempts[0].ChannelID, "probe selection must retain native protocol priority")
-				assert.EqualValues(t, 1, calls.Load())
+				if tc.lossFence {
+					assert.EqualValues(t, 4, calls.Load())
+				} else {
+					assert.EqualValues(t, 1, calls.Load())
+				}
 			})
 		}
 	}
@@ -5920,6 +6173,187 @@ func TestTextGatewayRouteConcurrencyAdmission(t *testing.T) {
 			assert.Equal(t, 200, next.Code, next.Body.String())
 		})
 	}
+}
+
+func TestTextGatewayRouteConcurrencyRenewalFailureCancelsProvider(t *testing.T) {
+	cancelled := make(chan struct{})
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+		close(cancelled)
+	})
+	constant.StreamingTimeout = 300
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr(), MaxRetries: -1})
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	service.GatewayRouteQuota = service.NewGatewayRouteQuota(client)
+	require.NoError(t, model.DB.Model(fixture.channel).Update("max_concurrency", 1).Error)
+	ctx, cancel := context.WithCancel(t.Context())
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gateway-alias","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`)).WithContext(ctx)
+	request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+	request.Header.Set("Content-Type", "application/json")
+	writer := &gatewayObservedDeliveryWriter{ResponseRecorder: httptest.NewRecorder(), delivered: make(chan struct{})}
+	done := make(chan struct{})
+	go func() { fixture.engine.ServeHTTP(writer, request); close(done) }()
+	defer func() {
+		server.SetError("")
+		cancel()
+		<-done
+	}()
+	select {
+	case <-writer.delivered:
+	case <-done:
+		t.Fatalf("stream ended before business delivery: %d %s", writer.Code, writer.Body.String())
+	case <-time.After(5 * time.Second):
+		t.Fatal("business frame was not delivered")
+	}
+	server.SetError("ERR injected quota renewal failure")
+	fixture.fake.Advance(time.Minute)
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("Provider remained active after its shared concurrency lease could not be renewed")
+	}
+	server.SetError("")
+	<-done
+	assert.Contains(t, writer.Body.String(), "Hello")
+	assert.NotContains(t, writer.Body.String(), "[DONE]")
+	record, err := model.GetGatewayRequest(t.Context(), writer.Header().Get(common.RequestIdKey), fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, "partial", record.Status)
+}
+
+func TestResponsesWSGatewayLostPermitClosesProviderConnection(t *testing.T) {
+	delivered := make(chan struct{})
+	upstreamDone := make(chan struct{})
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		ws, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if !assert.NoError(t, err) {
+			return
+		}
+		defer ws.Close()
+		defer close(upstreamDone)
+		_, _, err = ws.ReadMessage()
+		if !assert.NoError(t, err) {
+			return
+		}
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","response_id":"lost-lease","delta":"Hello"}`)))
+		close(delivered)
+		if _, _, err = ws.ReadMessage(); err != nil {
+			assert.True(t, websocket.IsCloseError(err, websocket.CloseInternalServerErr), "lost lease must close the Provider connection: %v", err)
+		}
+	})
+	require.NoError(t, model.DB.Model(fixture.channel).Update("max_concurrency", 1).Error)
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr(), MaxRetries: -1})
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	service.GatewayRouteQuota = service.NewGatewayRouteQuota(client)
+	ws := dialResponsesGateway(t, fixture)
+	require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","input":"Hello","max_output_tokens":16}`)))
+	require.NoError(t, ws.SetReadDeadline(time.Now().Add(10*time.Second)))
+	_, raw, err := ws.ReadMessage()
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "Hello")
+	<-delivered
+	server.SetError("ERR injected quota renewal failure")
+	fixture.fake.Advance(time.Minute)
+	select {
+	case <-upstreamDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Provider connection remained active after its shared concurrency lease was lost")
+	}
+	server.SetError("")
+	var record model.GatewayRequest
+	require.Eventually(t, func() bool {
+		records, _, listErr := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+		if listErr != nil || len(records) != 1 || records[0].Status == "settlement_pending" {
+			return false
+		}
+		record = records[0]
+		return true
+	}, 5*time.Second, 10*time.Millisecond)
+	assert.Equal(t, "partial", record.Status)
+	attempts, _, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, attempts, 1)
+	assert.Equal(t, "channel_unavailable", attempts[0].ErrorClass)
+	assert.NotEqual(t, "opened", attempts[0].CircuitAction)
+}
+
+func TestRealtimeGatewayLostPermitCancelsProviderConnection(t *testing.T) {
+	upstreamDone := make(chan struct{})
+	fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		ws, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if !assert.NoError(t, err) {
+			return
+		}
+		defer ws.Close()
+		defer close(upstreamDone)
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"modalities":["text"],"turn_detection":null}}`)))
+		for {
+			_, raw, readErr := ws.ReadMessage()
+			if !assert.NoError(t, readErr) {
+				return
+			}
+			if ojson.GetBytes(raw, "type").String() == "response.create" {
+				break
+			}
+		}
+		for _, raw := range []string{`{"type":"response.created","response":{"id":"lost-native","status":"in_progress"}}`, `{"type":"response.text.delta","response_id":"lost-native","delta":"Hello","output_index":0}`} {
+			if !assert.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(raw))) {
+				return
+			}
+		}
+		_, _, _ = ws.ReadMessage()
+	})
+	require.NoError(t, model.DB.Model(fixture.channel).Update("max_concurrency", 1).Error)
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr(), MaxRetries: -1})
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	service.GatewayRouteQuota = service.NewGatewayRouteQuota(client)
+	ws := dialRealtimeGateway(t, fixture)
+	for {
+		_, raw, err := ws.ReadMessage()
+		require.NoError(t, err)
+		if ojson.GetBytes(raw, "type").String() == "session.created" {
+			break
+		}
+	}
+	require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"conversation":"none","input":[],"output_modalities":["text"],"max_output_tokens":16}}`)))
+	var delivered bool
+	for !delivered {
+		_, raw, err := ws.ReadMessage()
+		require.NoError(t, err)
+		delivered = ojson.GetBytes(raw, "type").String() == "response.text.delta"
+	}
+	server.SetError("ERR injected quota renewal failure")
+	fixture.fake.Advance(time.Minute)
+	select {
+	case <-upstreamDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Realtime Provider survived loss of the logical response's concurrency lease")
+	}
+	server.SetError("")
+	var record model.GatewayRequest
+	require.Eventually(t, func() bool {
+		records, _, listErr := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+		if listErr != nil || len(records) != 1 || records[0].Status == "settlement_pending" {
+			return false
+		}
+		record = records[0]
+		return true
+	}, 5*time.Second, 10*time.Millisecond)
+	assert.Equal(t, "partial", record.Status)
+	attempts, _, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, attempts, 1)
+	assert.Equal(t, "channel_unavailable", attempts[0].ErrorClass)
+	assert.NotEqual(t, "opened", attempts[0].CircuitAction)
+	assert.Positive(t, attempts[0].Cost.Nanos)
+	assert.Positive(t, record.Receivable.Nanos)
 }
 
 func TestTextGatewayRouteFiltersProfitBeforeChoosing(t *testing.T) {
@@ -7098,7 +7532,7 @@ type gatewayObservedDeliveryWriter struct {
 
 func (writer *gatewayObservedDeliveryWriter) Flush() {
 	writer.ResponseRecorder.Flush()
-	if strings.Contains(writer.Body.String(), "Hello") {
+	if strings.Contains(writer.Body.String(), "Hello") || strings.Contains(writer.Body.String(), "artifact.invalid") {
 		writer.once.Do(func() { close(writer.delivered) })
 	}
 }
@@ -16323,14 +16757,19 @@ func TestTextGatewayToolOnlyUsageCountsDeliveredArguments(t *testing.T) {
 
 type gatewayPrefixOnlyWriter struct {
 	*httptest.ResponseRecorder
-	nilError    bool
-	full        bool
-	beforeWrite func()
+	nilError       bool
+	full           bool
+	beforeWrite    func()
+	completeWrites *int
 }
 
 func (w gatewayPrefixOnlyWriter) Write(body []byte) (int, error) {
 	if w.beforeWrite != nil {
 		w.beforeWrite()
+	}
+	if w.completeWrites != nil && *w.completeWrites > 0 {
+		*w.completeWrites--
+		return w.ResponseRecorder.Write(body)
 	}
 	length := min(8, len(body))
 	if w.full {
@@ -16341,6 +16780,10 @@ func (w gatewayPrefixOnlyWriter) Write(body []byte) (int, error) {
 		return n, nil
 	}
 	return n, io.ErrClosedPipe
+}
+
+func (w gatewayPrefixOnlyWriter) WriteString(body string) (int, error) {
+	return w.Write([]byte(body))
 }
 
 type gatewayQueuedUsageBody struct {

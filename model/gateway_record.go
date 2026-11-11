@@ -14,19 +14,20 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// GatewayUsage contains measured quantities only. Provider extensions and raw
-// response data never enter request records.
+// GatewayUsage contains quantitative usage facts. UsageSource identifies
+// estimates; Provider extensions and raw response data never enter records.
 type GatewayUsage struct {
-	PromptTokens           int64 `json:"prompt_tokens"`
-	CompletionTokens       int64 `json:"completion_tokens"`
-	TotalTokens            int64 `json:"total_tokens"`
-	CachedTokens           int64 `json:"cached_tokens,omitempty"`
-	CacheCreationTokens    int64 `json:"cache_creation_tokens,omitempty"`
-	CacheCreation12hTokens int64 `json:"cache_creation_12h_tokens,omitempty"`
-	ImageInputTokens       int64 `json:"image_input_tokens,omitempty"`
-	AudioInputTokens       int64 `json:"audio_input_tokens,omitempty"`
-	ImageOutputTokens      int64 `json:"image_output_tokens,omitempty"`
-	AudioOutputTokens      int64 `json:"audio_output_tokens,omitempty"`
+	TaskFacts              map[string]any `json:"task_facts,omitempty"`
+	PromptTokens           int64          `json:"prompt_tokens"`
+	CompletionTokens       int64          `json:"completion_tokens"`
+	TotalTokens            int64          `json:"total_tokens"`
+	CachedTokens           int64          `json:"cached_tokens,omitempty"`
+	CacheCreationTokens    int64          `json:"cache_creation_tokens,omitempty"`
+	CacheCreation12hTokens int64          `json:"cache_creation_12h_tokens,omitempty"`
+	ImageInputTokens       int64          `json:"image_input_tokens,omitempty"`
+	AudioInputTokens       int64          `json:"audio_input_tokens,omitempty"`
+	ImageOutputTokens      int64          `json:"image_output_tokens,omitempty"`
+	AudioOutputTokens      int64          `json:"audio_output_tokens,omitempty"`
 }
 
 type GatewayRequest struct {
@@ -171,25 +172,82 @@ func (filter GatewayRequestFilter) apply(query *gorm.DB, pending bool) *gorm.DB 
 func ListGatewayRequests(ctx context.Context, filter GatewayRequestFilter, offset, limit int) ([]GatewayRequest, int64, error) {
 	query := filter.apply(gatewayRecordQuery(ctx, &GatewayRequest{}, "gateway_requests"), false)
 	var total int64
-	if err := query.Count(&total).Error; err != nil {
+	if err := query.Session(&gorm.Session{}).Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	// A task may already have a submission record in the log database. Its
+	// primary accounting intent supersedes that record, including when a
+	// status filter would otherwise expose the older submission state.
+	shadowFilter := filter
+	shadowFilter.Status = ""
+	shadowQuery := shadowFilter.apply(gatewayPendingAccounting(DB.WithContext(ctx)), true)
+	var shadowTotal int64
+	if err := shadowQuery.Session(&gorm.Session{}).Count(&shadowTotal).Error; err != nil {
+		return nil, 0, err
+	}
+	items := []GatewayRequest{}
+	if shadowTotal == 0 {
+		err := query.Order("started_at DESC, id DESC").Offset(offset).Limit(limit).Find(&items).Error
+		return items, total, err
+	}
+	// Cross-database reconciliation uses bounded batches, so a large pending
+	// procurement backlog cannot produce an unbounded IN list or allocation.
+	var shadowRows []GatewayBilling
+	err := shadowQuery.Select("request_id").FindInBatches(&shadowRows, 1000, func(_ *gorm.DB, _ int) error {
+		ids := make([]string, len(shadowRows))
+		for i := range shadowRows {
+			ids[i] = shadowRows[i].RequestID
+		}
+		var overlap int64
+		if err := query.Session(&gorm.Session{}).Where("id IN ?", ids).Count(&overlap).Error; err != nil {
+			return err
+		}
+		total -= overlap
+		return nil
+	}).Error
+	if err != nil {
 		return nil, 0, err
 	}
 	pendingQuery := filter.apply(gatewayPendingAccounting(DB.WithContext(ctx)), true)
 	var pendingTotal int64
-	if err := pendingQuery.Count(&pendingTotal).Error; err != nil {
+	if err := pendingQuery.Session(&gorm.Session{}).Count(&pendingTotal).Error; err != nil {
 		return nil, 0, err
 	}
-	items := []GatewayRequest{}
-	if pendingTotal == 0 {
-		err := query.Order("started_at DESC, id DESC").Offset(offset).Limit(limit).Find(&items).Error
-		return items, total, err
-	}
-	if err := query.Order("started_at DESC, id DESC").Limit(offset + limit).Find(&items).Error; err != nil {
-		return nil, 0, err
+	logOffset := 0
+	for len(items) < offset+limit {
+		var batch []GatewayRequest
+		if err := query.Session(&gorm.Session{}).Order("started_at DESC, id DESC").Offset(logOffset).Limit(min(1000, offset+limit-len(items))).Find(&batch).Error; err != nil {
+			return nil, 0, err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		logOffset += len(batch)
+		ids := make([]string, len(batch))
+		for i := range batch {
+			ids[i] = batch[i].ID
+		}
+		var hidden []string
+		if err := gatewayPendingAccounting(DB.WithContext(ctx)).Where("request_id IN ?", ids).Pluck("request_id", &hidden).Error; err != nil {
+			return nil, 0, err
+		}
+		hiddenIDs := make(map[string]struct{}, len(hidden))
+		for _, id := range hidden {
+			hiddenIDs[id] = struct{}{}
+		}
+		for _, request := range batch {
+			if _, shadowed := hiddenIDs[request.ID]; !shadowed {
+				items = append(items, request)
+			}
+		}
 	}
 	var pendingRows []struct{ RequestData string }
 	if err := pendingQuery.Select(`(NULLIF("settlement", '')::jsonb -> 'request')::text AS "request_data"`).Order(`(NULLIF("settlement", '')::jsonb -> 'request' ->> 'started_at')::bigint DESC, "request_id" DESC`).Limit(offset + limit).Scan(&pendingRows).Error; err != nil {
 		return nil, 0, err
+	}
+	byID := make(map[string]int, len(items))
+	for i := range items {
+		byID[items[i].ID] = i
 	}
 	for _, row := range pendingRows {
 		var request GatewayRequest
@@ -197,7 +255,12 @@ func ListGatewayRequests(ctx context.Context, filter GatewayRequestFilter, offse
 			return nil, 0, err
 		}
 		request.Status = "settlement_pending"
-		items = append(items, request)
+		if i, exists := byID[request.ID]; exists {
+			items[i] = request
+		} else {
+			byID[request.ID] = len(items)
+			items = append(items, request)
+		}
 	}
 	slices.SortFunc(items, func(a, b GatewayRequest) int {
 		if order := cmp.Compare(b.StartedAt, a.StartedAt); order != 0 {
@@ -271,7 +334,7 @@ func gatewayPendingSettlement(ctx context.Context, id string, ownerID int) (*Gat
 
 func appendGatewayRecord(record any) error {
 	if !common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
-		return LOG_DB.Clauses(clause.OnConflict{DoNothing: true}).Create(record).Error
+		return LOG_DB.Clauses(clause.OnConflict{UpdateAll: true}).Create(record).Error
 	}
 	// ClickHouse's native String binder does not accept defined string types.
 	// Override just the storage fields; quantities remain exact int64 nanos.

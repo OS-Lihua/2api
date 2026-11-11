@@ -12,12 +12,14 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptrace"
 	"net/textproto"
 	"net/url"
 	"reflect"
 	"regexp"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -27,6 +29,8 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/capability"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
@@ -35,6 +39,13 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
+
+type TaskRequestCapabilities struct {
+	Capabilities    capability.Set `json:"-"`
+	ImageCount      *int64         `json:"image_count,omitempty"`
+	DurationSeconds *int64         `json:"duration_seconds,omitempty"`
+	ContextText     *string        `json:"context_text,omitempty"`
+}
 
 type requestDescriptor struct {
 	ResponseType   string            `json:"responseType"`
@@ -104,6 +115,13 @@ type taskResult struct {
 	State            any     `json:"state"`
 }
 
+// Completion projections never become persisted accepted task identity.
+type submitCompletionInput struct {
+	Result relaycommon.TaskInfo
+	Data   any
+	State  []byte
+}
+
 var taskArtifactKeyPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$`)
 
 // gatewayCredentialHeaders carry the client's gateway credentials. Driver
@@ -133,29 +151,39 @@ const maxTaskArtifacts = 64
 const maxTaskPluginPersistedJSONBytes = 1 << 20
 
 type TaskAdaptor struct {
-	plugin         *pluginruntime.LoadedPlugin
-	info           *relaycommon.RelayInfo
-	submit         *requestDescriptor
-	routeRequest   *pluginruntime.RouteRequestContext
-	requestHeaders map[string]string
-	files          []map[string]any
+	plugin            *pluginruntime.LoadedPlugin
+	info              *relaycommon.RelayInfo
+	submit            *requestDescriptor
+	submitCredentials map[string]any
+	routeRequest      *pluginruntime.RouteRequestContext
+	requestHeaders    map[string]string
+	files             []map[string]any
 	// hookRequestBody is hookRequestSource as hooks receive it.
 	hookRequestSource map[string]any
 	hookRequestBody   any
 	// requestBodyText is the decoded requestBody as JSON text, which hooks
 	// of a plugin that preserves JSON order receive instead.
 	requestBodyText json.RawMessage
-	// keepReservation is set when the client of a native route already holds
-	// the relayed events of a submission whose stream stopped before the
-	// upstream finished it, or whose result the plugin could not read: the
-	// task then settles at the reserved quota.
-	keepReservation bool
+	// keepReservation preserves legacy quota after an incomplete native stream.
+	// Money settlement instead retains observed facts and incomplete procurement.
+	requestDecoded       bool
+	keepReservation      bool
+	deliveredSubmitData  any
+	submitSourceFallback any
+	submitDeliveryFailed bool
+	submitBusiness       atomic.Bool
+	submissionWritten    atomic.Bool
 }
 
 func New(plugin *pluginruntime.LoadedPlugin) *TaskAdaptor { return &TaskAdaptor{plugin: plugin} }
 func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo)   { a.info = info }
 
-func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskError {
+// DecodeRequestAndSetAction selects the executing plugin's normalized request
+// without building a descriptor or exchanging credentials.
+func (a *TaskAdaptor) DecodeRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskError {
+	if a.requestDecoded {
+		return nil
+	}
 	if pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedEndpoint); exists {
 		if pinned, ok := pinnedValue.(pluginruntime.PinnedEndpoint); ok && pinned.Plugin == a.plugin {
 			if protocolValue, present := c.Get(pluginruntime.ContextKeyProtocolRequest); present {
@@ -189,10 +217,30 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 	// On a native path several plugins declare, the channel may have bound a
 	// plugin other than the one that prepared the request; it decodes again.
 	if pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedRoute); exists {
-		if pinned, ok := pinnedValue.(pluginruntime.PinnedRoute); ok && len(pinned.Candidates) > 1 && pinned.Plugin == a.plugin {
+		if pinned, ok := pinnedValue.(pluginruntime.PinnedRoute); ok && (len(pinned.Candidates) > 1 || c.GetBool("task_gateway_endpoint")) && pinned.Plugin == a.plugin {
 			if requestValue, present := c.Get(pluginruntime.ContextKeyRouteRequest); present {
 				if requestContext, valid := requestValue.(pluginruntime.RouteRequestContext); valid {
 					requestContext.Params = pluginruntime.RouteParams(c.Params, pinned.Route)
+					if c.GetBool("task_gateway_endpoint") {
+						rewriteBodyModel := false
+						if body, ok := requestContext.Body.(map[string]any); ok {
+							if value, ok := body["value"].(map[string]any); ok && value["model"] != nil {
+								body, value = maps.Clone(body), maps.Clone(value)
+								value["model"] = info.UpstreamModelName
+								body["value"] = value
+								requestContext.Body = body
+								rewriteBodyModel = true
+							}
+						}
+						if rewriteBodyModel && len(requestContext.BodyText) > 0 {
+							override := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ParamOverride: map[string]any{"model": info.UpstreamModelName}}}
+							raw, err := relaycommon.ApplyParamOverrideWithRelayInfo(requestContext.BodyText, override)
+							if err != nil {
+								return service.TaskErrorWrapperLocal(fmt.Errorf("invalid task request"), "plugin_request_invalid", http.StatusBadRequest)
+							}
+							requestContext.BodyText = raw
+						}
+					}
 					resolvedValue, requestBodyText, callErr := a.plugin.Engine.CallPathWithMemberJSON(
 						context.WithoutCancel(c.Request.Context()), 0, a.plugin.Meta.JSONTextMember("requestBody"),
 						"native", []string{pinned.Route.Decode}, requestContext.JSValueFor(a.plugin.Meta),
@@ -201,7 +249,11 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 					kind, _ := resolved["kind"].(string)
 					resolvedModel, _ := resolved["model"].(string)
 					served, _, owned := model.ResolveTaskPluginModel(pinned.Generation, resolvedModel, a.plugin.Meta.Models)
-					if callErr != nil || !resolvedOK || kind != string(pluginruntime.RouteTypeSubmit) || !owned || served != c.GetString("resolved_task_model") {
+					modelMatches := owned && served == c.GetString("resolved_task_model")
+					if c.GetBool("task_gateway_endpoint") {
+						modelMatches = resolvedModel == info.OriginModelName || strings.EqualFold(resolvedModel, info.UpstreamModelName)
+					}
+					if callErr != nil || !resolvedOK || kind != string(pluginruntime.RouteTypeSubmit) || !modelMatches {
 						return service.TaskErrorWrapperLocal(fmt.Errorf("final task plugin decoder rejected the pinned model"), "plugin_request_invalid", http.StatusBadRequest)
 					}
 					if _, forbidden := resolved["renderer"]; forbidden {
@@ -220,6 +272,14 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 				}
 			}
 		}
+	}
+	a.requestDecoded = true
+	return nil
+}
+
+func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskError {
+	if taskErr := a.DecodeRequestAndSetAction(c, info); taskErr != nil {
+		return taskErr
 	}
 	if _, exists := c.Get("task_request"); !exists {
 		if taskErr := relaycommon.ValidateBasicTaskRequest(c, info, "image_to_video"); taskErr != nil {
@@ -261,11 +321,52 @@ func (a *TaskAdaptor) ExtractUsageFacts(c *gin.Context, info *relaycommon.RelayI
 	return facts
 }
 
+// RequestCapabilities describes the effective request without Provider I/O.
+func (a *TaskAdaptor) RequestCapabilities(c *gin.Context, info *relaycommon.RelayInfo) (TaskRequestCapabilities, error) {
+	if !a.hasHook(c.Request.Context(), "extractCapabilities") {
+		return TaskRequestCapabilities{}, fmt.Errorf("plugin must describe request capabilities")
+	}
+	value, err := a.plugin.Engine.Call(c.Request.Context(), "extractCapabilities", a.taskRequestContext(c, info))
+	if err != nil {
+		return TaskRequestCapabilities{}, fmt.Errorf("plugin capability hook failed")
+	}
+	fields, ok := value.(map[string]any)
+	if !ok {
+		return TaskRequestCapabilities{}, fmt.Errorf("plugin capability hook must return an object")
+	}
+	for name, field := range fields {
+		if field == nil || name != "features" && name != "input_modalities" && name != "output_modalities" && name != "image_count" && name != "duration_seconds" && name != "context_text" {
+			return TaskRequestCapabilities{}, fmt.Errorf("plugin capability hook returned an unknown or null field")
+		}
+	}
+	encoded, err := common.Marshal(fields)
+	if err != nil {
+		return TaskRequestCapabilities{}, err
+	}
+	var required TaskRequestCapabilities
+	if err := common.Unmarshal(encoded, &required); err != nil {
+		return TaskRequestCapabilities{}, fmt.Errorf("plugin capability hook returned invalid counts")
+	}
+	if err := common.Unmarshal(encoded, &required.Capabilities); err != nil {
+		return TaskRequestCapabilities{}, fmt.Errorf("plugin capability hook returned invalid capabilities")
+	}
+	if fields["input_modalities"] == nil || fields["output_modalities"] == nil || len(required.Capabilities.OutputModalities) == 0 {
+		return TaskRequestCapabilities{}, fmt.Errorf("plugin capability hook must describe input and output modalities")
+	}
+	for _, quantity := range []*int64{required.ImageCount, required.DurationSeconds} {
+		if quantity != nil && (*quantity < 0 || *quantity > 1<<53-1) {
+			return TaskRequestCapabilities{}, fmt.Errorf("plugin capability quantity must be a nonnegative safe integer")
+		}
+	}
+	required.Capabilities, err = required.Capabilities.Normalize()
+	return required, err
+}
+
 func (a *TaskAdaptor) ExtractUsageFactsValidated(c *gin.Context, info *relaycommon.RelayInfo) (map[string]any, error) {
 	if !a.hasHook(c.Request.Context(), "extractUsage") {
 		return nil, nil
 	}
-	usageContext := a.submitContext(c, info)
+	usageContext := a.taskRequestContext(c, info)
 	usageContext["usagePurpose"] = "facts"
 	value, err := a.plugin.Engine.Call(c.Request.Context(), "extractUsage", usageContext)
 	if err != nil {
@@ -337,6 +438,72 @@ func (a *TaskAdaptor) BuildRequestHeader(c *gin.Context, req *http.Request, _ *r
 		req.Header.Set("Content-Type", c.Request.Header.Get("Content-Type"))
 	}
 	return nil
+}
+
+// PreviewBillingRequestInput projects descriptor pricing fields without exchanging
+// credentials, resolving files, or enabling utils.fetch. The descriptor is never
+// cached: reserved preparation must build it again with authoritative credentials.
+func (a *TaskAdaptor) PreviewBillingRequestInput(c *gin.Context, info *relaycommon.RelayInfo) (billingexpr.RequestInput, error) {
+	ctx := a.taskRequestContext(c, info)
+	descriptor, err := a.requestDescriptor(c.Request.Context(), "buildSubmitRequest", ctx)
+	if err != nil {
+		return billingexpr.RequestInput{}, err
+	}
+	if err := pluginruntime.ValidateRequestURL(descriptor.URL, info.ChannelBaseUrl, a.plugin.Meta.AllowedHosts); err != nil {
+		return billingexpr.RequestInput{}, err
+	}
+	var encoded []byte
+	if descriptor.BodyType == "multipart" {
+		fields := map[string][]string{}
+		for _, part := range descriptor.Parts {
+			if part.FileRef == "" {
+				fields[part.Name] = append(fields[part.Name], fmt.Sprint(part.Value))
+			}
+		}
+		values := map[string]any{}
+		for name, entries := range fields {
+			if len(entries) == 1 {
+				values[name] = entries[0]
+			} else {
+				values[name] = entries
+			}
+		}
+		encoded, err = common.Marshal(values)
+	} else if descriptor.BodyText != nil {
+		encoded = descriptor.BodyText
+	} else if body, ok := descriptor.Body.(string); ok {
+		encoded = []byte(body)
+	} else if descriptor.Body != nil {
+		encoded, err = common.Marshal(descriptor.Body)
+	}
+	if err != nil {
+		return billingexpr.RequestInput{}, err
+	}
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, descriptor.URL, bytes.NewReader(encoded))
+	if err != nil {
+		return billingexpr.RequestInput{}, err
+	}
+	for name, value := range descriptor.Headers {
+		req.Header.Set(name, value)
+	}
+	if err := channel.ApplyHeaderOverride(info, c, req); err != nil {
+		return billingexpr.RequestInput{}, err
+	}
+	input := billingexpr.RequestInput{Body: encoded, Headers: map[string]string{}}
+	for name, values := range req.Header {
+		input.Headers[name] = strings.Join(values, ",")
+	}
+	if info.ChannelType != constant.ChannelTypeNewAPI && a.plugin.Meta.Auth.Type != "" && a.plugin.Meta.Auth.Type != "none" && a.plugin.Meta.Auth.Type != "api_key" {
+		// An explicit override resolves the header independently of OAuth.
+		resolved := false
+		for name := range info.HeadersOverride {
+			resolved = resolved || strings.EqualFold(name, "Authorization")
+		}
+		if !resolved {
+			input.DeferredHeaders = []string{"Authorization"}
+		}
+	}
+	return input, nil
 }
 
 func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayInfo) (io.Reader, error) {
@@ -555,21 +722,27 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, bod
 	wasStream := info.IsStream
 	info.IsStream = false
 	defer func() { info.IsStream = wasStream }()
-	// A native route relays an SSE reply to the client as it arrives, so the
-	// vendor's work and what the client receives no longer depend on the
-	// client staying: from here the submission ignores the client leaving,
-	// keeps reading to the end and settles. Keep-alive comments reset the
-	// idle timeout, so the upstream request is bounded by the submission
-	// deadline of the host protocols (TASK_PLUGIN_PROTOCOL_TIMEOUT_SECONDS).
+	// Native streams keep a protocol deadline. Money submissions also follow
+	// caller cancellation and the shared first-byte budget until business is written.
+	a.submitBusiness.Store(false)
 	var release context.CancelFunc
 	if a.submit != nil && a.submit.ResponseType == "sse" && relaysSubmitEvents(c) {
-		detached := c.Request.WithContext(context.WithoutCancel(c.Request.Context()))
+		originalContext := c.Request.Context()
+		detached := c.Request.WithContext(context.WithoutCancel(originalContext))
 		timeout := time.Duration(constant.TaskPluginProtocolTimeoutSeconds) * time.Second
 		if timeout <= 0 {
 			timeout = 10 * time.Minute
 		}
-		var upstream context.Context
-		upstream, release = context.WithTimeout(detached.Context(), timeout)
+		upstream, cancel := context.WithTimeout(detached.Context(), timeout)
+		release = cancel
+		if info.BeginProviderCall != nil {
+			stopCaller := context.AfterFunc(originalContext, func() {
+				if !a.submitBusiness.Load() || errors.Is(context.Cause(originalContext), service.ErrGatewayPermitLost) {
+					cancel()
+				}
+			})
+			release = func() { stopCaller(); cancel() }
+		}
 		c.Request = detached.WithContext(upstream)
 		defer func() { c.Request = detached }()
 	}
@@ -577,6 +750,13 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, bod
 		originalMethod := c.Request.Method
 		c.Request.Method = strings.ToUpper(a.submit.Method)
 		defer func() { c.Request.Method = originalMethod }()
+	}
+	a.submissionWritten.Store(false)
+	if info.BeginProviderCall != nil {
+		originalRequest := c.Request
+		trace := &httptrace.ClientTrace{WroteHeaders: func() { a.submissionWritten.Store(true) }}
+		c.Request = originalRequest.WithContext(httptrace.WithClientTrace(originalRequest.Context(), trace))
+		defer func() { c.Request = originalRequest }()
 	}
 	resp, err := channel.DoTaskApiRequest(a, c, info, body)
 	if release != nil {
@@ -587,6 +767,13 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, bod
 		}
 	}
 	return resp, err
+}
+
+// SubmissionMayHaveBeenAccepted prevents replay after a transport error once
+// submission headers were written. Credential exchanges and hook fetches do not
+// set this flag because they cannot establish acceptance of the task submission.
+func (a *TaskAdaptor) SubmissionMayHaveBeenAccepted() bool {
+	return a.submissionWritten.Load()
 }
 
 // deadlineBody releases the deadline of a relayed submission's upstream
@@ -634,6 +821,17 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 	defer func() {
 		switch {
 		case taskErr == nil:
+		case acceptedStream && relaysSubmitEvents(c) && info.BeginProviderCall != nil:
+			a.keepReservation = true
+			logger.LogWarn(c, common.LogText("task plugin %s has an incomplete submit result; preserving observed usage: %s", a.plugin.Meta.Key, taskErr.Message))
+			immediate := &relaycommon.TaskInfo{Status: model.TaskStatusFailure, Progress: taskcommon.ProgressComplete}
+			if a.submitBusiness.Load() {
+				immediate.Status = model.TaskStatusSuccess
+			}
+			a.observeSubmitSourceCompletion(c, info, immediate, info.PublicTaskID, responseBody, nil, resp)
+			stream := a.submitStreamFacts(c, info, immediate, info.PublicTaskID, nil, resp)
+			submitted = &channel.TaskSubmitResponse{UpstreamTaskID: info.PublicTaskID, Immediate: immediate, Stream: stream}
+			taskErr = nil
 		case relayed:
 			// The client already holds the vendor's events, so the task
 			// completes at the reserved quota instead of failing and refunding
@@ -659,7 +857,13 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 			client = c
 		}
 		var stopped bool
-		responseBody, stopped, err = a.readSubmitEvents(c.Request.Context(), resp, a.submitContext(c, info), submitEventStream{client: client, frameLimit: replyLimit})
+		var driverContext map[string]any
+		if info.BeginProviderCall != nil {
+			driverContext = a.preparedSubmitContext(c, info)
+		} else {
+			driverContext = a.submitContext(c, info)
+		}
+		responseBody, stopped, err = a.readSubmitEvents(c.Request.Context(), resp, driverContext, submitEventStream{client: client, frameLimit: replyLimit, money: info.BeginProviderCall != nil})
 		relayed = client != nil && c.Writer.Written()
 		a.keepReservation = stopped
 	} else {
@@ -677,22 +881,30 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 			responseBody = decoded
 		}
 	}
-	if err != nil {
+	sourceFailed := err != nil
+	if sourceFailed && !(eventStream && relaysSubmitEvents(c) && info.BeginProviderCall != nil && responseBody != nil) {
 		failure := service.TaskErrorWrapper(err, "read_response_body_failed", http.StatusBadGateway, common.UpstreamAddresses(c)...)
 		failure.NoRetry = streaming
 		return nil, failure
 	}
 	headers := make(map[string][]string, len(resp.Header))
 	maps.Copy(headers, resp.Header)
-	value, err := a.plugin.Engine.Call(c.Request.Context(), "parseSubmitResponse", a.submitContext(c, info), map[string]any{"statusCode": resp.StatusCode, "headers": headers, "body": responseBody})
+	parseContext := c.Request.Context()
+	var driverContext map[string]any
+	if info.BeginProviderCall != nil {
+		var cancel context.CancelFunc
+		parseContext, cancel = context.WithTimeout(context.WithoutCancel(parseContext), pluginruntime.DefaultCallTimeout)
+		defer cancel()
+		driverContext = a.preparedSubmitContext(c, info)
+	} else {
+		driverContext = a.submitContext(c, info)
+	}
+	identitySource := responseBody
+	if sourceFailed && a.submitSourceFallback != nil {
+		identitySource = a.submitSourceFallback
+	}
+	value, err := a.plugin.Engine.Call(parseContext, "parseSubmitResponse", driverContext, map[string]any{"statusCode": resp.StatusCode, "headers": headers, "body": identitySource})
 	if err != nil {
-		logger.LogDebug(
-			c,
-			"task_plugin subsystem=adaptor event=parse_submit_failed plugin=%q stage=parse_submit_response reason=hook_failed status=%d elapsed_ms=%d",
-			a.plugin.Meta.Key,
-			resp.StatusCode,
-			time.Since(started).Milliseconds(),
-		)
 		return nil, service.TaskErrorWrapper(err, "plugin_submit_response_failed", http.StatusBadGateway, common.UpstreamAddresses(c)...)
 	}
 	if object, ok := value.(map[string]any); ok {
@@ -705,13 +917,6 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 		if err == nil {
 			err = fmt.Errorf("plugin returned an empty taskId")
 		}
-		logger.LogDebug(
-			c,
-			"task_plugin subsystem=adaptor event=parse_submit_failed plugin=%q stage=parse_submit_response reason=invalid_result status=%d elapsed_ms=%d",
-			a.plugin.Meta.Key,
-			resp.StatusCode,
-			time.Since(started).Milliseconds(),
-		)
 		return nil, service.TaskErrorWrapper(err, "plugin_submit_response_invalid", http.StatusBadGateway, common.UpstreamAddresses(c)...)
 	}
 	// Only an immediate terminal result goes unpersisted; any other task data
@@ -721,7 +926,7 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 		dataLimit = replyLimit
 	}
 	var taskData []byte
-	if parsed.TaskData != nil {
+	if parsed.TaskData != nil && !sourceFailed {
 		taskData, err = common.Marshal(parsed.TaskData)
 		if err != nil || int64(len(taskData)) > dataLimit {
 			if err == nil {
@@ -745,64 +950,216 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 	if parsed.Immediate == nil {
 		return response, nil
 	}
-	immediate := &relaycommon.TaskInfo{
-		Code: parsed.Immediate.Code, TaskID: parsed.Immediate.TaskID,
-		Status: parsed.Immediate.Status, Progress: parsed.Immediate.Progress,
-		Reason: parsed.Immediate.Reason, Url: parsed.Immediate.URL, RemoteUrl: parsed.Immediate.RemoteURL,
-		CompletionTokens: positiveInt(parsed.Immediate.CompletionTokens), TotalTokens: positiveInt(parsed.Immediate.TotalTokens),
+	immediate := submitResultInfo(parsed.Immediate)
+	if sourceFailed {
+		immediate.Status = model.TaskStatusFailure
+		if a.submitBusiness.Load() {
+			immediate.Status = model.TaskStatusSuccess
+		}
 	}
 	response.Immediate = immediate
-	if immediate.Status != model.TaskStatusSuccess || info.IsChannelTest || !a.hasHook(c.Request.Context(), "extractUsageOnComplete") {
+	moneyFailure := immediate.Status == model.TaskStatusFailure && info.BeginProviderCall != nil
+	if immediate.Status != model.TaskStatusSuccess && !moneyFailure || info.IsChannelTest || !a.hasHook(c.Request.Context(), "extractUsageOnComplete") {
 		return response, nil
 	}
-	// A relayed stream that stopped early keeps the reservation: the plugin
-	// did not see the end of the vendor's work.
-	if a.keepReservation {
+	// Legacy relayed submissions retain their quota after an incomplete stream.
+	// Money submissions retain the observed quantities for reconciliation.
+	if a.keepReservation && info.BeginProviderCall == nil {
 		return response, nil
 	}
-	// Match the polling hook context without persisting a temporary task.
-	task := &model.Task{TaskID: info.PublicTaskID, Action: info.Action, Data: taskData,
-		Properties: model.Properties{OriginModelName: info.OriginModelName, UpstreamModelName: info.UpstreamModelName}}
-	task.PrivateData.UpstreamTaskID = parsed.TaskID
-	task.PrivateData.PluginState = pluginState
-	ctx, err := a.queryContext(task, info.ApiKey, info.ChannelBaseUrl, info.ChannelSetting.Proxy)
-	if err != nil {
-		logger.LogWarn(c, common.LogText("task plugin %s completion context failed; retaining reserved quota: %v", a.plugin.Meta.Key, err))
-		return response, nil
+	sourceTaskData := parsed.TaskData
+	if sourceFailed && a.submitSourceFallback != nil {
+		sourceTaskData = responseBody
 	}
-	facts, err := a.plugin.Engine.Call(c.Request.Context(), "extractUsageOnComplete", ctx, jsonValue(immediate), parsed.TaskData)
-	if err != nil {
-		logger.LogWarn(c, common.LogText("task plugin %s completion usage failed; retaining reserved quota: %v", a.plugin.Meta.Key, err))
-		return response, nil
-	}
-	if err := a.applyCompletionUsageFacts(immediate, facts, info.UpstreamModelName, info.OriginModelName); err != nil {
-		logger.LogWarn(c, common.LogText("task plugin %s completion usage rejected; retaining reserved quota: %v", a.plugin.Meta.Key, err))
+	a.observeSubmitSourceCompletion(c, info, immediate, parsed.TaskID, sourceTaskData, pluginState, resp)
+	if eventStream && relaysSubmitEvents(c) && info.BeginProviderCall != nil {
+		response.Stream = a.submitStreamFacts(c, info, immediate, parsed.TaskID, pluginState, resp)
 	}
 	return response, nil
 }
 
+func (a *TaskAdaptor) submitStreamFacts(c *gin.Context, info *relaycommon.RelayInfo, generated *relaycommon.TaskInfo, taskID string, pluginState []byte, resp *http.Response) *model.TaskStreamFacts {
+	input := a.projectSubmitCompletion(c, info, resp, &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}, taskID, a.deliveredSubmitData, pluginState)
+	delivered := &input.Result
+	a.observeSubmitCompletion(c, info, delivered, taskID, input.Data, input.State)
+	for name, value := range delivered.UsageFacts {
+		count, numeric := value.(float64)
+		source, known := generated.UsageFacts[name].(float64)
+		if numeric && known && count > source {
+			delivered.UsageFacts[name] = source
+		}
+	}
+	return &model.TaskStreamFacts{Delivered: delivered.UsageFacts, BusinessOutput: a.submitBusiness.Load(), DeliveryFailed: a.submitDeliveryFailed, Incomplete: a.keepReservation}
+}
+
+func (a *TaskAdaptor) observeSubmitSourceCompletion(c *gin.Context, info *relaycommon.RelayInfo, immediate *relaycommon.TaskInfo, taskID string, taskData any, pluginState []byte, resp *http.Response) {
+	if a.submitSourceFallback == nil {
+		a.observeSubmitCompletion(c, info, immediate, taskID, taskData, pluginState)
+		return
+	}
+	known := make(map[string]any)
+	for _, source := range []any{a.submitSourceFallback, taskData} {
+		input := a.projectSubmitCompletion(c, info, resp, immediate, taskID, source, pluginState)
+		a.observeSubmitCompletion(c, info, &input.Result, taskID, input.Data, input.State)
+		maps.Copy(known, input.Result.UsageFacts)
+	}
+	_ = a.applyCompletionUsageFacts(immediate, known, info.UpstreamModelName, info.OriginModelName)
+}
+
+func submitResultInfo(result *taskResult) *relaycommon.TaskInfo {
+	return &relaycommon.TaskInfo{
+		Code: result.Code, TaskID: result.TaskID,
+		Status: result.Status, Progress: result.Progress,
+		Reason: result.Reason, Url: result.URL, RemoteUrl: result.RemoteURL,
+		CompletionTokens: positiveInt(result.CompletionTokens), TotalTokens: positiveInt(result.TotalTokens),
+	}
+}
+
+func (a *TaskAdaptor) projectSubmitCompletion(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response, result *relaycommon.TaskInfo, taskID string, data any, pluginState []byte) submitCompletionInput {
+	input := submitCompletionInput{Result: *result, Data: data, State: pluginState}
+	input.Result.TaskID, input.Result.UsageFacts = taskID, nil
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), pluginruntime.DefaultCallTimeout)
+	defer cancel()
+	value, err := a.plugin.Engine.Call(ctx, "parseSubmitResponse", a.preparedSubmitContext(c, info), map[string]any{"statusCode": resp.StatusCode, "headers": maps.Clone(resp.Header), "body": data})
+	if err != nil {
+		return input
+	}
+	if object, ok := value.(map[string]any); ok {
+		if _, forbidden := object["clientResponse"]; forbidden {
+			return input
+		}
+	}
+	var parsed submitResponse
+	if err := convert(value, &parsed); err != nil {
+		return input
+	}
+	input.Data = parsed.TaskData
+	input.State, _ = encodeReturnedPluginState(value)
+	if len(input.State) > maxTaskPluginPersistedJSONBytes {
+		input.State = nil
+	}
+	if parsed.Immediate != nil {
+		input.Result = *submitResultInfo(parsed.Immediate)
+		input.Result.TaskID = taskID
+	}
+	return input
+}
+
+func (a *TaskAdaptor) observeSubmitCompletion(c *gin.Context, info *relaycommon.RelayInfo, immediate *relaycommon.TaskInfo, taskID string, taskData any, pluginState []byte) {
+	if !a.hasHook(c.Request.Context(), "extractUsageOnComplete") {
+		return
+	}
+	encoded, err := common.Marshal(taskData)
+	if err != nil {
+		return
+	}
+	// Match the polling hook context without persisting a temporary task.
+	task := &model.Task{TaskID: info.PublicTaskID, Action: info.Action, Data: encoded,
+		Properties: model.Properties{OriginModelName: info.OriginModelName, UpstreamModelName: info.UpstreamModelName}}
+	task.PrivateData.UpstreamTaskID = taskID
+	task.PrivateData.PluginState = pluginState
+	var ctx map[string]any
+	if info.BeginProviderCall != nil {
+		local := a.preparedSubmitContext(nil, info)
+		ctx = map[string]any{
+			"taskId": taskID, "publicTaskId": info.PublicTaskID,
+			"action": constant.NormalizeTaskAction(info.Action), "model": info.OriginModelName,
+			"upstreamModel": info.UpstreamModelName, "baseUrl": info.ChannelBaseUrl,
+			"data": taskData, "state": nil,
+		}
+		if info.SubmittedUsage != nil {
+			ctx["submittedUsage"] = maps.Clone(info.SubmittedUsage)
+		}
+		for _, name := range []string{"upstream", "apiKey", "authHeader", "auth"} {
+			if value, exists := local[name]; exists {
+				ctx[name] = value
+			}
+		}
+		if len(pluginState) > 0 {
+			var state any
+			if err := common.Unmarshal(pluginState, &state); err != nil {
+				return
+			}
+			ctx["state"] = state
+		}
+	} else {
+		ctx, err = a.queryContext(task, info.ApiKey, info.ChannelBaseUrl, info.ChannelSetting.Proxy)
+		if err != nil {
+			logger.LogWarn(c, common.LogText("task plugin %s completion context failed; preserving known usage: %v", a.plugin.Meta.Key, err))
+			return
+		}
+	}
+	callContext := c.Request.Context()
+	if info.BeginProviderCall != nil {
+		var cancel context.CancelFunc
+		callContext, cancel = context.WithTimeout(context.WithoutCancel(callContext), pluginruntime.DefaultCallTimeout)
+		defer cancel()
+	}
+	facts, err := a.plugin.Engine.Call(callContext, "extractUsageOnComplete", ctx, jsonValue(immediate), taskData)
+	if err != nil {
+		logger.LogWarn(c, common.LogText("task plugin %s completion usage failed; preserving known usage: %v", a.plugin.Meta.Key, err))
+		return
+	}
+	if err := a.applyCompletionUsageFacts(immediate, facts, info.UpstreamModelName, info.OriginModelName); err != nil {
+		logger.LogWarn(c, common.LogText("task plugin %s completion usage rejected; preserving known usage: %v", a.plugin.Meta.Key, err))
+	}
+}
+
 func (a *TaskAdaptor) GetModelList() []string { return append([]string(nil), a.plugin.Meta.Models...) }
 func (a *TaskAdaptor) GetChannelName() string { return a.plugin.Meta.Name }
-func (a *TaskAdaptor) FetchMode() string      { return a.plugin.Meta.FetchMode }
+
+type gatewayTaskCredentialContextKey struct{}
+
+func (a *TaskAdaptor) gatewayTaskCredentialContext(ctx context.Context, task *model.Task, key string) context.Context {
+	index := 0
+	if a.info != nil {
+		index = a.info.ChannelMultiKeyIndex
+	}
+	check := service.GatewayTaskCredentialCheck(task, key, index)
+	if check == nil {
+		return ctx
+	}
+	checks, _ := ctx.Value(gatewayTaskCredentialContextKey{}).([]func(context.Context) error)
+	return context.WithValue(ctx, gatewayTaskCredentialContextKey{}, append(slices.Clone(checks), check))
+}
+
+func checkGatewayTaskCredentials(ctx context.Context) error {
+	checks, _ := ctx.Value(gatewayTaskCredentialContextKey{}).([]func(context.Context) error)
+	for _, check := range checks {
+		if err := check(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *TaskAdaptor) FetchMode() string { return a.plugin.Meta.FetchMode }
 
 func (a *TaskAdaptor) FetchBatchTasks(baseURL, key string, tasks []*model.Task, proxy string) (*http.Response, error) {
+	return a.FetchBatchTasksWithContext(context.Background(), baseURL, key, tasks, proxy)
+}
+
+func (a *TaskAdaptor) FetchBatchTasksWithContext(requestCtx context.Context, baseURL, key string, tasks []*model.Task, proxy string) (*http.Response, error) {
+	for _, task := range tasks {
+		requestCtx = a.gatewayTaskCredentialContext(requestCtx, task, key)
+	}
 	taskContexts := make([]map[string]any, 0, len(tasks))
 	for _, task := range tasks {
-		taskCtx, err := a.queryContext(task, key, baseURL, proxy)
+		taskCtx, err := a.queryContextWithContext(requestCtx, task, key, baseURL, proxy)
 		if err != nil {
 			return nil, err
 		}
 		taskContexts = append(taskContexts, taskCtx)
 	}
-	ctx, err := a.batchQueryContext(key, baseURL, proxy, taskContexts)
+	ctx, err := a.batchQueryContext(requestCtx, key, baseURL, proxy, taskContexts)
 	if err != nil {
 		return nil, err
 	}
-	descriptor, err := a.requestDescriptor(pluginruntime.WithFetcher(context.Background(), a.hookFetcher(baseURL, proxy)), "buildBatchQueryRequest", ctx, taskContexts)
+	descriptor, err := a.requestDescriptor(pluginruntime.WithFetcher(requestCtx, a.hookFetcher(baseURL, proxy)), "buildBatchQueryRequest", ctx, taskContexts)
 	if err != nil {
 		return nil, err
 	}
-	return a.doFetchDescriptor(baseURL, key, proxy, descriptor)
+	return a.doFetchDescriptorWithContext(requestCtx, baseURL, key, proxy, descriptor)
 }
 
 func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
@@ -812,7 +1169,8 @@ func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy str
 // FetchTaskWithContext bounds management and request-scoped polling while the
 // background poller keeps its existing lifecycle through FetchTask.
 func (a *TaskAdaptor) FetchTaskWithContext(requestCtx context.Context, baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
-	if task != nil && task.PrivateData.Key != "" {
+	requestCtx = a.gatewayTaskCredentialContext(requestCtx, task, key)
+	if task != nil && task.PrivateData.Gateway == nil && task.PrivateData.Key != "" {
 		key = task.PrivateData.Key
 	}
 	ctx, err := a.queryContextWithContext(requestCtx, task, key, baseURL, proxy)
@@ -830,6 +1188,16 @@ func (a *TaskAdaptor) FetchTaskWithContext(requestCtx context.Context, baseURL, 
 // request descriptors may use, through the channel's proxy like poll requests.
 func (a *TaskAdaptor) hookFetcher(baseURL, proxy string) pluginruntime.Fetcher {
 	return func(ctx context.Context, request pluginruntime.FetchRequest) (pluginruntime.FetchResponse, error) {
+		if a.info != nil && a.info.BeginProviderCall != nil {
+			budgetContext, err := a.info.BeginProviderCall()
+			if err != nil {
+				return pluginruntime.FetchResponse{}, err
+			}
+			bounded, cancel := context.WithCancel(ctx)
+			stop := context.AfterFunc(budgetContext, cancel)
+			defer func() { stop(); cancel() }()
+			ctx = bounded
+		}
 		if err := pluginruntime.ValidateRequestURL(request.URL, baseURL, a.plugin.Meta.AllowedHosts); err != nil {
 			return pluginruntime.FetchResponse{}, err
 		}
@@ -837,9 +1205,13 @@ func (a *TaskAdaptor) hookFetcher(baseURL, proxy string) pluginruntime.Fetcher {
 		if err != nil {
 			return pluginruntime.FetchResponse{}, err
 		}
+		if a.info != nil && a.info.BeginProviderCall != nil {
+			client = channel.GatewayHTTPClient(client)
+		}
 		// A redirect reaches the plugin as it is; fetching its location is a
 		// new request, checked and counted again.
 		noRedirects := *client
+		noRedirects.Transport = service.GatewayTaskHTTPTransport(client.Transport, checkGatewayTaskCredentials)
 		noRedirects.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 		req, err := http.NewRequestWithContext(ctx, request.Method, request.URL, nil)
 		if err != nil {
@@ -915,6 +1287,7 @@ func (a *TaskAdaptor) doFetchDescriptorWithContext(requestCtx context.Context, b
 	// Clients are cached across channels. Keep the redirect policy and its
 	// credential state local to this query, while reusing the transport.
 	queryClient := *client
+	queryClient.Transport = service.GatewayTaskHTTPTransport(client.Transport, checkGatewayTaskCredentials)
 	credentialsStripped := false
 	var redirectPolicyErr error
 	queryClient.CheckRedirect = func(next *http.Request, via []*http.Request) error {
@@ -1002,6 +1375,10 @@ func (a *TaskAdaptor) doFetchDescriptorWithContext(requestCtx context.Context, b
 }
 
 func (a *TaskAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response, body []byte) (map[string]*service.BatchTaskResult, error) {
+	return a.ParseBatchResultWithContext(context.Background(), tasks, resp, body)
+}
+
+func (a *TaskAdaptor) ParseBatchResultWithContext(requestCtx context.Context, tasks []*model.Task, resp *http.Response, body []byte) (map[string]*service.BatchTaskResult, error) {
 	started := time.Now()
 	input := any(string(body))
 	var decoded any
@@ -1009,15 +1386,18 @@ func (a *TaskAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response,
 		input = decoded
 	}
 	key, baseURL, proxy := a.queryCredentials()
+	for _, task := range tasks {
+		requestCtx = a.gatewayTaskCredentialContext(requestCtx, task, key)
+	}
 	taskContexts := make([]map[string]any, 0, len(tasks))
 	for _, task := range tasks {
-		taskCtx, err := a.queryContext(task, key, baseURL, proxy)
+		taskCtx, err := a.queryContextWithContext(requestCtx, task, key, baseURL, proxy)
 		if err != nil {
 			return nil, err
 		}
 		taskContexts = append(taskContexts, taskCtx)
 	}
-	ctx, err := a.batchQueryContext(key, baseURL, proxy, taskContexts)
+	ctx, err := a.batchQueryContext(requestCtx, key, baseURL, proxy, taskContexts)
 	if err != nil {
 		return nil, err
 	}
@@ -1034,7 +1414,7 @@ func (a *TaskAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response,
 		Data       any    `json:"data"`
 		State      any    `json:"state"`
 	}
-	if err = a.plugin.Engine.CallInto(pluginruntime.WithFetcher(context.Background(), a.hookFetcher(baseURL, proxy)), &parsed, "parseBatchResult", ctx, input, hookHTTPResponse(resp)); err != nil {
+	if err = a.plugin.Engine.CallInto(pluginruntime.WithFetcher(requestCtx, a.hookFetcher(baseURL, proxy)), &parsed, "parseBatchResult", ctx, input, hookHTTPResponse(resp)); err != nil {
 		reason := "hook_failed"
 		var invalid *pluginruntime.ResultError
 		if errors.As(err, &invalid) {
@@ -1044,7 +1424,7 @@ func (a *TaskAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response,
 		return nil, err
 	}
 	results := make(map[string]*service.BatchTaskResult, len(parsed))
-	hasCompletionUsage := a.hasHook(context.Background(), "extractUsageOnComplete")
+	hasCompletionUsage := a.hasHook(requestCtx, "extractUsageOnComplete")
 	for _, item := range parsed {
 		if strings.TrimSpace(item.TaskID) == "" {
 			continue
@@ -1070,7 +1450,7 @@ func (a *TaskAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response,
 					break
 				}
 			}
-			facts, hookErr := a.plugin.Engine.Call(context.Background(), "extractUsageOnComplete", itemCtx, jsonValue(&info), usageBody)
+			facts, hookErr := a.plugin.Engine.Call(requestCtx, "extractUsageOnComplete", itemCtx, jsonValue(&info), usageBody)
 			if hookErr == nil {
 				upstreamModel, _ := itemCtx["upstreamModel"].(string)
 				originModel, _ := itemCtx["model"].(string)
@@ -1097,6 +1477,9 @@ func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, bod
 
 // ParseTaskResultWithContext keeps hook I/O inside the caller's deadline.
 func (a *TaskAdaptor) ParseTaskResultWithContext(requestCtx context.Context, task *model.Task, resp *http.Response, body []byte) (*relaycommon.TaskInfo, error) {
+	if a.info != nil {
+		requestCtx = a.gatewayTaskCredentialContext(requestCtx, task, a.info.ApiKey)
+	}
 	started := time.Now()
 	input := any(string(body))
 	var decoded any
@@ -1104,7 +1487,7 @@ func (a *TaskAdaptor) ParseTaskResultWithContext(requestCtx context.Context, tas
 		input = decoded
 	}
 	key, baseURL, proxy := a.queryCredentials()
-	if task != nil && task.PrivateData.Key != "" {
+	if task != nil && task.PrivateData.Gateway == nil && task.PrivateData.Key != "" {
 		key = task.PrivateData.Key
 	}
 	ctx, err := a.queryContextWithContext(requestCtx, task, key, baseURL, proxy)
@@ -1287,6 +1670,9 @@ func RendererArtifactsWithContext(ctx context.Context, plugin *pluginruntime.Loa
 }
 
 func (a *TaskAdaptor) BuildContentRequest(ctx context.Context, task *model.Task, artifactKey string, clientRequest channel.TaskArtifactClientRequest) (*channel.TaskContentRequest, error) {
+	if a.info != nil {
+		ctx = a.gatewayTaskCredentialContext(ctx, task, a.info.ApiKey)
+	}
 	if !a.hasHook(ctx, "buildContentRequest") {
 		return nil, nil
 	}
@@ -1382,6 +1768,7 @@ func (a *TaskAdaptor) BuildContentRequest(ctx context.Context, task *model.Task,
 		Credentialless: descriptor.Credentialless,
 		ContentPath:    descriptor.ContentPath,
 		MimeType:       descriptor.MimeType,
+		Authorize:      service.GatewayTaskCredentialCheck(task, a.info.ApiKey, a.info.ChannelMultiKeyIndex),
 	}, nil
 }
 
@@ -1450,6 +1837,9 @@ func (a *TaskAdaptor) queryContextWithContext(requestCtx context.Context, task *
 		ctx["action"] = constant.NormalizeTaskAction(task.Action)
 		ctx["model"] = originModel
 		ctx["upstreamModel"] = upstreamModel
+		if task.PrivateData.Gateway != nil && task.PrivateData.Gateway.Facts != nil {
+			ctx["submittedUsage"] = maps.Clone(task.PrivateData.Gateway.Facts)
+		}
 		if len(task.Data) > 0 {
 			var data any
 			if err := common.Unmarshal(task.Data, &data); err != nil {
@@ -1464,7 +1854,7 @@ func (a *TaskAdaptor) queryContextWithContext(requestCtx context.Context, task *
 			}
 			ctx["state"] = state
 		}
-		if task.PrivateData.Key != "" {
+		if task.PrivateData.Gateway == nil && task.PrivateData.Key != "" {
 			key = task.PrivateData.Key
 		}
 	}
@@ -1474,9 +1864,9 @@ func (a *TaskAdaptor) queryContextWithContext(requestCtx context.Context, task *
 	return ctx, nil
 }
 
-func (a *TaskAdaptor) batchQueryContext(key, baseURL, proxy string, tasks []map[string]any) (map[string]any, error) {
+func (a *TaskAdaptor) batchQueryContext(requestCtx context.Context, key, baseURL, proxy string, tasks []map[string]any) (map[string]any, error) {
 	ctx := map[string]any{"baseUrl": baseURL, "tasks": tasks}
-	if err := a.applyUpstreamCredentials(ctx, a.channelType(), key, proxy); err != nil {
+	if err := a.applyUpstreamCredentialsWithContext(requestCtx, ctx, a.channelType(), key, proxy); err != nil {
 		return nil, err
 	}
 	return ctx, nil
@@ -1663,13 +2053,14 @@ func (a *TaskAdaptor) buildSubmit(c *gin.Context, info *relaycommon.RelayInfo) (
 		return a.submit, nil
 	}
 	started := time.Now()
-	// buildSubmitRequest runs before quota is reserved, so a failed fetch
-	// costs nothing; requests that start vendor work stay the descriptor.
+	// ModelOffering requests reserve funds before this hook. Only the returned
+	// descriptor may start vendor work; helper fetches remain read-only.
 	fetchContext := c.Request.Context()
 	if info.HasChannelMeta() {
 		fetchContext = pluginruntime.WithFetcher(fetchContext, a.hookFetcher(info.ChannelBaseUrl, info.ChannelSetting.Proxy))
 	}
-	descriptor, err := a.requestDescriptor(fetchContext, "buildSubmitRequest", a.submitContext(c, info))
+	driverContext := a.submitContext(c, info)
+	descriptor, err := a.requestDescriptor(fetchContext, "buildSubmitRequest", driverContext)
 	if err != nil {
 		reason := "hook_failed"
 		var invalid *pluginruntime.ResultError
@@ -1724,6 +2115,12 @@ func (a *TaskAdaptor) buildSubmit(c *gin.Context, info *relaycommon.RelayInfo) (
 		info.UpstreamModelName = descriptor.RewriteModel
 	}
 	a.submit = &descriptor
+	a.submitCredentials = make(map[string]any, 4)
+	for _, name := range []string{"apiKey", "authHeader", "auth", "upstream"} {
+		if value, exists := driverContext[name]; exists {
+			a.submitCredentials[name] = value
+		}
+	}
 	method := strings.ToUpper(strings.TrimSpace(descriptor.Method))
 	if method == "" {
 		method = http.MethodPost
@@ -1743,7 +2140,39 @@ func (a *TaskAdaptor) buildSubmit(c *gin.Context, info *relaycommon.RelayInfo) (
 	return a.submit, nil
 }
 
+func (a *TaskAdaptor) preparedSubmitContext(c *gin.Context, info *relaycommon.RelayInfo) map[string]any {
+	ctx := a.taskRequestContext(c, info)
+	maps.Copy(ctx, a.submitCredentials)
+	return ctx
+}
+
 func (a *TaskAdaptor) submitContext(c *gin.Context, info *relaycommon.RelayInfo) map[string]any {
+	ctx := a.taskRequestContext(c, info)
+	requestCtx := context.Background()
+	if c != nil && c.Request != nil {
+		requestCtx = c.Request.Context()
+	}
+	needsExchange := info.ChannelType != constant.ChannelTypeNewAPI && a.plugin.Meta.Auth.Type != "" && a.plugin.Meta.Auth.Type != "none" && a.plugin.Meta.Auth.Type != "api_key"
+	if needsExchange && info.BeginProviderCall != nil {
+		budgetContext, err := info.BeginProviderCall()
+		if err != nil {
+			ctx["authError"] = err.Error()
+			return ctx
+		}
+		bounded, cancel := context.WithCancel(requestCtx)
+		stop := context.AfterFunc(budgetContext, cancel)
+		defer func() { stop(); cancel() }()
+		requestCtx = bounded
+	}
+	if err := a.applyUpstreamCredentialsWithContext(requestCtx, ctx, info.ChannelType, info.ApiKey, info.ChannelSetting.Proxy); err != nil {
+		ctx["authError"] = err.Error()
+	}
+	return ctx
+}
+
+// taskRequestContext projects the driver input without token exchange or I/O.
+// Usage validation can run before reservation using this same request identity.
+func (a *TaskAdaptor) taskRequestContext(c *gin.Context, info *relaycommon.RelayInfo) map[string]any {
 	routeRequest := pluginruntime.RouteRequestContext{
 		Params:      map[string]string{},
 		Query:       map[string][]string{},
@@ -1857,13 +2286,17 @@ func (a *TaskAdaptor) submitContext(c *gin.Context, info *relaycommon.RelayInfo)
 	ctx["upstreamModel"] = info.UpstreamModelName
 	ctx["baseUrl"] = info.ChannelBaseUrl
 	ctx["userSetting"] = info.UserSetting
-	requestCtx := context.Background()
-	if c != nil && c.Request != nil {
-		requestCtx = c.Request.Context()
+	ctx["authHeader"] = ""
+	ctx["upstream"] = map[string]any{"kind": pluginruntime.UpstreamKindVendor}
+	if info.ChannelType == constant.ChannelTypeNewAPI {
+		ctx["upstream"] = map[string]any{"kind": pluginruntime.UpstreamKindNewAPI}
+		ctx["apiKey"] = info.ApiKey
+		ctx["authHeader"] = "Bearer " + info.ApiKey
+	} else if a.plugin.Meta.Auth.Type == "" || a.plugin.Meta.Auth.Type == "none" || a.plugin.Meta.Auth.Type == "api_key" {
+		ctx["apiKey"] = info.ApiKey
+		ctx["authHeader"] = info.ApiKey
 	}
-	if err := a.applyUpstreamCredentialsWithContext(requestCtx, ctx, info.ChannelType, info.ApiKey, info.ChannelSetting.Proxy); err != nil {
-		ctx["authError"] = err.Error()
-	}
+	ctx["auth"] = map[string]any{"authHeader": ctx["authHeader"]}
 	return ctx
 }
 

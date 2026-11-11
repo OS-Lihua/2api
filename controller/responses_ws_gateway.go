@@ -91,6 +91,8 @@ func runRealtimeTransportAttempt(c *gin.Context, call *relay.ResponsesWSCall, ru
 	}
 	call.Native.ConnectionReady = func() {
 		stopProbe()
+		budget.Handoff()
+		selection.Permit.Disarm()
 		_ = service.ChannelHealth.Release(context.WithoutCancel(ctx), selection.Admission)
 		_ = selection.Permit.Release(context.WithoutCancel(ctx), true, 0)
 	}
@@ -190,6 +192,10 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	}
 	chosen := candidates[selection.Channel.ID]
 	c = chosen.Context
+	budget.RequirePermit(selection.Permit)
+	if call.Native == nil {
+		call.WatchAttempt(budget.Context())
+	}
 	contactedProvider := false
 	var observedUsage *dto.Usage
 	defer func() {
@@ -253,6 +259,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	}
 	var sentAt time.Time
 	var firstByte time.Duration
+	lostPermit := false
 	info.ResponseFacts.OnBusinessOutput = func() {
 		if firstByte == 0 && !sentAt.IsZero() {
 			firstByte = max(clock.Now().Sub(sentAt), time.Nanosecond)
@@ -335,7 +342,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	selection.LossFallback = false
 	if !profitable {
 		if offering.AllowLossFallback {
-			selection.LossFallback, err = selection.LossFallbackAllowed(c.Request.Context(), comparison, offering.MinimumMarginRate)
+			selection.LossFallback, err = selection.LossFallbackAllowed(c.Request.Context(), comparison, offering.MinimumMarginRate, contactedProvider)
 		}
 		if err != nil || !selection.LossFallback {
 			run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
@@ -384,6 +391,10 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	}
 	parent := c.Request
 	c.Request = parent.WithContext(attemptContext)
+	if call.Native == nil {
+		cancelPermit := call.CancelWithCause
+		defer context.AfterFunc(parent.Context(), func() { cancelPermit(context.Cause(parent.Context())) })()
+	}
 	defer func() { c.Request = parent }()
 	attempt := &model.GatewayAttempt{ID: common.NewRequestId(), RequestID: run.record.ID, ChannelID: selection.Channel.ID, ProviderID: selection.Channel.ProviderID, ModelID: selection.Channel.ModelID, MemberTier: selection.Tier,
 		StartedAt: attemptStart.UnixMilli(), UsageSource: "none", PurchasePriceVersionID: purchase.ID, PurchaseExpression: purchase.Expression, AccountingFXRate: rate,
@@ -395,7 +406,16 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	// Classify against the parent before deciding cancellation accounting.
 	c.Request = parent
 	attempt.EndedAt = clock.Now().UnixMilli()
-	attempt.Status, attempt.ErrorClass = gatewayAttemptOutcome(c, info, apiErr)
+	lostPermit = errors.Is(context.Cause(attemptContext), service.ErrGatewayPermitLost)
+	if lostPermit {
+		if info.ResponseFacts.BusinessOutput {
+			attempt.Status, attempt.ErrorClass = "partial", "channel_unavailable"
+		} else {
+			attempt.Status, attempt.ErrorClass = "failed", "channel_unavailable"
+		}
+	} else {
+		attempt.Status, attempt.ErrorClass = gatewayAttemptOutcome(c, info, apiErr)
+	}
 	outcome := info.StreamStatus.OutcomeSnapshot()
 	status, code, errorType := 0, outcome.ErrorCode, outcome.ErrorType
 	if call.Established() {
@@ -436,6 +456,10 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	}
 	transportFailed := apiErr != nil || outcome.EndReason == relaycommon.StreamEndReasonScannerErr || outcome.EndReason == relaycommon.StreamEndReasonTimeout
 	failure := service.ClassifyGatewayFailure(status, code, transportFailed, budget.TimedOut(), cancelled, info.ResponseFacts.DownstreamWriteFailed, errorType)
+	lostPermit = errors.Is(context.Cause(attemptContext), service.ErrGatewayPermitLost)
+	if lostPermit {
+		failure = service.GatewayFailure{Class: "channel_unavailable", Switch: true}
+	}
 	if attempt.Status == "success" {
 		service.RecordGatewayChannelAffinity(c, selection)
 		failure = service.GatewayFailure{}
@@ -444,7 +468,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		attempt.ErrorClass = failure.Class
 	}
 	recordGatewayProviderFailure(c, info, selection, failure)
-	result = service.GatewayAttemptResult{Attempt: attempt, Failure: failure, Delivered: info.ResponseFacts.BusinessOutput, Established: call.Established(), HealthLease: selection.Admission.Lease, FirstByte: firstByte, RetryAfter: prepared.RetryAfter()}
+	result = service.GatewayAttemptResult{Attempt: attempt, Failure: failure, Delivered: info.ResponseFacts.BusinessOutput, Established: call.Established(), HealthLease: selection.Admission.Lease, FirstByte: firstByte, RetryAfter: prepared.RetryAfter(), LocalRejection: lostPermit}
 	if call.Native != nil {
 		if call.Native.SaleInput != nil {
 			input = call.Native.SaleInput()

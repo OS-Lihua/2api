@@ -356,6 +356,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
 		return
 	}
+	budget.RequirePermit(selection.Permit)
 	c.Header("X-Gateway-Conversion-Loss", strings.Join(selection.ConversionLosses, ","))
 	contactedProvider := false
 	defer func() {
@@ -508,7 +509,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				upstreamCode = "content_filter"
 			}
 			failure := service.ClassifyGatewayFailure(upstreamStatus, upstreamCode, transportFailed, budget.TimedOut(), parent.Context().Err() != nil, info.ResponseFacts.DownstreamWriteFailed, upstreamType)
-			localRejection := providerCallRejected != nil
+			localRejection := providerCallRejected != nil || errors.Is(context.Cause(c.Request.Context()), service.ErrGatewayPermitLost)
 			if localRejection && parent.Context().Err() == nil && !info.ResponseFacts.DownstreamWriteFailed {
 				if errors.Is(providerCallRejected, service.ErrGatewayBudget) {
 					failure = service.GatewayFailure{Class: "first_byte_timeout", Switch: true}
@@ -726,7 +727,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	selection.LossFallback = false
 	if !profitable {
 		if offering.AllowLossFallback {
-			selection.LossFallback, err = selection.LossFallbackAllowed(c.Request.Context(), comparison, offering.MinimumMarginRate)
+			selection.LossFallback, err = selection.LossFallbackAllowed(c.Request.Context(), comparison, offering.MinimumMarginRate, contactedProvider)
 		}
 		if err != nil || !selection.LossFallback {
 			run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
@@ -897,7 +898,7 @@ func recordGatewayProviderFailure(c *gin.Context, info *relaycommon.RelayInfo, s
 // gatewayAttemptOutcome distinguishes accepted business content from protocol
 // framing, downstream failures and incomplete upstream streams.
 func gatewayAttemptOutcome(c *gin.Context, info *relaycommon.RelayInfo, err *types.NewAPIError) (string, string) {
-	if c.Request.Context().Err() != nil {
+	if c.Request.Context().Err() != nil && !errors.Is(context.Cause(c.Request.Context()), service.ErrGatewayPermitLost) {
 		return "cancelled", "client_cancelled"
 	}
 	if info.ResponseFacts.DownstreamWriteFailed {

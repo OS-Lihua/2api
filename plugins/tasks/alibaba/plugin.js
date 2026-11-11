@@ -222,7 +222,7 @@ export const meta = {
     en: "Alibaba Cloud Bailian image and video generation (Wan, Qwen-Image, Z-Image)",
     zh: "阿里云百炼图片与视频生成（万相、千问图像、Z-Image）",
   },
-  version: "1.5.0",
+  version: "1.6.0",
   author: { name: "QuantumNous" },
   channelTypes: [17],
   // Literal metadata also supports the dashboard's static script preview.
@@ -277,7 +277,7 @@ export const meta = {
   fetchMode: "per_task",
   upstreams: ["vendor", "new_api"],
   submitResponseTypes: ["json", "sse"],
-  requiredCapabilities: ["duration-auto@1"],
+  requiredCapabilities: ["duration-auto@1", "submit-sse-business@1"],
   usageSchema: { ...WAN_IMAGE_USAGE_SCHEMA, ...wanVideoUsageSchema(WAN_VIDEO_RESOLUTIONS, false) },
   usageProfiles: [
     {
@@ -1067,6 +1067,54 @@ function dashScopeHeaders(ctx, asynchronous) {
   return headers;
 }
 
+export function extractCapabilities(ctx) {
+  if (imageModel(ctx)) {
+    const converted = convertImage(ctx);
+    const streaming =
+      converted.body.parameters.stream === true || (converted.synchronous && converted.body.parameters.enable_interleave === true && streamsInterleave(ctx));
+    const input = [];
+    const body = converted.body.input;
+    const text = [body.prompt, body.negative_prompt];
+    for (const message of body.messages || []) {
+      for (const part of message.content || []) {
+        if (typeof part.text === "string") text.push(part.text);
+      }
+    }
+    if (text.some((part) => trimmed(part))) input.push("text");
+    if (converted.inputImages) input.push("image");
+    const result = {
+      features: streaming ? ["streaming"] : [],
+      input_modalities: input,
+      output_modalities: converted.body.parameters.enable_interleave === true ? ["text", "image"] : ["image"],
+      image_count: imageEstimate(ctx, converted).image_count,
+    };
+    if (!converted.inputImages) result.context_text = text.filter((part) => typeof part === "string").join("\n");
+    return result;
+  }
+  const source = convert(ctx).input;
+  const input = [];
+  let imageCount = [source.img_url, source.image_url, source.first_frame_url, source.last_frame_url].filter(Boolean).length;
+  let knownImages = true;
+  if (trimmed(source.prompt) || trimmed(source.negative_prompt)) input.push("text");
+  if (source.img_url || source.image_url || source.first_frame_url || source.last_frame_url) input.push("image");
+  if (source.audio_url) input.push("audio");
+  for (const media of source.media || []) {
+    if (["first_frame", "last_frame", "reference_image"].includes(media.type)) {
+      input.push("image");
+      imageCount++;
+    } else if (["driving_audio", "reference_audio"].includes(media.type)) input.push("audio");
+    else if (["first_clip", "reference_video"].includes(media.type)) input.push("video");
+    // Opaque files and links have no verifiable media type before submission.
+    else {
+      input.push("image", "audio", "video", "text", "pdf");
+      knownImages = false;
+    }
+  }
+  const result = { input_modalities: input, output_modalities: ["video"], duration_seconds: Math.ceil(extractUsage(ctx).seconds) };
+  if (knownImages) result.image_count = imageCount;
+  return result;
+}
+
 export function buildSubmitRequest(ctx) {
   if (imageModel(ctx)) {
     const converted = convertImage(ctx);
@@ -1110,8 +1158,9 @@ export function parseSubmitEventDelta(ctx, event, previousState) {
   if (body.code || event.event === "error") {
     changes.push({ op: "set", path: ["code"], value: String(body.code || "upstream_error") });
     changes.push({ op: "set", path: ["message"], value: String(body.message || "stream failed") });
-    return { changes: changes, state: state, done: true };
+    return { changes: changes, state: state, done: true, business: false };
   }
+  let business = false;
   if (body.request_id) changes.push({ op: "set", path: ["request_id"], value: body.request_id });
   if (body.usage) {
     if (!state.hasUsage) {
@@ -1131,6 +1180,7 @@ export function parseSubmitEventDelta(ctx, event, previousState) {
     const control = state.choices[index];
     for (const part of choice.message.content) {
       if (!part || typeof part !== "object") throw new Error("invalid DashScope stream content");
+      business = business || (typeof part.text === "string" && part.text.length > 0) || (typeof part.image === "string" && part.image.trim().length > 0);
       if (typeof part.text === "string" && control.lastText) {
         changes.push({ op: "appendText", path: ["output", "choices", index, "message", "content", control.count - 1, "text"], value: part.text });
       } else {
@@ -1152,7 +1202,7 @@ export function parseSubmitEventDelta(ctx, event, previousState) {
       return choice.finishReason === "stop";
     });
   changes.push({ op: "set", path: ["output", "finished"], value: done });
-  return { changes: changes, state: state, done: done };
+  return { changes: changes, state: state, done: done, business: business };
 }
 
 export function parseSubmitResponse(ctx, resp) {

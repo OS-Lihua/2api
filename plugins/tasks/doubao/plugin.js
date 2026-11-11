@@ -303,7 +303,7 @@ export const meta = {
     en: "Volcengine Doubao Seedance video generation and Seedream image generation",
     zh: "火山引擎豆包 Seedance 视频生成与 Seedream 图片生成",
   },
-  version: "1.4.0",
+  version: "1.5.0",
   author: { name: "QuantumNous" },
   channelTypes: [54, 45], // VolcEngine-type channels serve Ark video models with the same wire format
   models: Object.keys(VIDEO_MODELS).concat(Object.keys(IMAGE_MODELS)),
@@ -311,7 +311,7 @@ export const meta = {
   upstreams: ["vendor", "new_api"],
   // Seedream streams its images when asked to (stream: true).
   submitResponseTypes: ["json", "sse"],
-  requiredCapabilities: ["duration-auto@1"],
+  requiredCapabilities: ["duration-auto@1", "submit-sse-business@1"],
   usageSchema: seedanceUsageSchema(DEFAULT_VIDEO_PROFILE),
   usageExamples: seedanceUsageExamples(DEFAULT_VIDEO_PROFILE),
   usageProfiles: capabilityUsageProfiles(VIDEO_MODELS, seedanceUsageSchema, seedanceUsageExamples).concat(
@@ -416,7 +416,7 @@ function videoResolution(ctx) {
   const req = ctx.requestBody || {};
   const metadata = req.vendorBody || req.metadata || {};
   const profile = videoProfile(ctx);
-  const raw = trimmed(metadata.resolution || req.size).toLowerCase();
+  const raw = trimmed(metadata.resolution || (req.vendorBody ? "" : req.size)).toLowerCase();
   const recognized = SEEDANCE_RESOLUTIONS.includes(raw) || raw.replace("*", "x").split("x").length === 2;
   if (!recognized) return profile.resolutions.includes("1080p") ? "1080p" : profile.resolutions[profile.resolutions.length - 1];
   const resolution = normalizeResolution(raw);
@@ -799,6 +799,60 @@ export const native = {
   },
 };
 
+function requestedVideoDuration(ctx) {
+  const req = ctx.requestBody || {};
+  const metadata = req.vendorBody || req.metadata || {};
+  const stated = req.vendorBody ? metadata.duration : (req.seconds ?? req.duration ?? metadata.duration);
+  if (stated === -1 || stated === "-1") return videoProfile(ctx).maxDuration;
+  if (stated === undefined || stated === null) {
+    if (metadata.frames === undefined || metadata.frames === null) return videoProfile(ctx).maxDuration;
+    const frames = Number(metadata.frames);
+    if (!Number.isSafeInteger(frames) || frames <= 0 || frames > 3600 * 24) throw new Error("frames must describe at most 3600 seconds");
+    return frames / 24;
+  }
+  const duration = (typeof stated === "number" || typeof stated === "string") && String(stated).trim() ? Number(stated) : NaN;
+  if (!Number.isFinite(duration) || duration <= 0 || duration > 3600) throw new Error("duration must be positive and at most 3600 seconds");
+  return duration;
+}
+
+export function extractCapabilities(ctx) {
+  if (imageTask(ctx)) {
+    const converted = convertImage(ctx);
+    const input = [];
+    if (trimmed(converted.body.prompt) || trimmed(converted.body.negative_prompt)) input.push("text");
+    if (converted.action === "image_to_image") input.push("image");
+    return {
+      features: converted.body.stream === true ? ["streaming"] : [],
+      input_modalities: input,
+      output_modalities: ["image"],
+      image_count: converted.facts.images_up_to_1_5k + converted.facts.images_above_1_5k,
+    };
+  }
+  const req = ctx.requestBody || {};
+  const source = req.vendorBody || req.metadata || {};
+  const input = [];
+  let imageCount = req.vendorBody ? 0 : (req.images || []).length;
+  let knownImages = true;
+  if (trimmed(req.prompt)) input.push("text");
+  if (!req.vendorBody && (req.images || []).length) input.push("image");
+  for (const item of source.content || []) {
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "text") input.push("text");
+    else if (item.type === "image_url") {
+      input.push("image");
+      imageCount++;
+    } else if (item.type === "audio_url") input.push("audio");
+    else if (item.type === "video_url" || item.type === "draft_task") input.push("video");
+    else {
+      input.push("image", "audio", "video", "text", "pdf");
+      knownImages = false;
+    }
+  }
+  const result = { input_modalities: input, output_modalities: ["video"], duration_seconds: Math.ceil(requestedVideoDuration(ctx)) };
+  if (knownImages) result.image_count = imageCount;
+  return result;
+}
+
 export function buildSubmitRequest(ctx) {
   if (imageTask(ctx)) {
     const converted = convertImage(ctx);
@@ -814,8 +868,9 @@ export function buildSubmitRequest(ctx) {
     };
   }
   const req = ctx.requestBody;
-  // Reject output tiers the model does not offer before any quota is reserved.
+  // Reject output tiers and durations the request cannot safely reserve.
   videoResolution(ctx);
+  requestedVideoDuration(ctx);
   if (req.vendorBody) {
     const sent = Object.assign({}, req.vendorBody, { model: ctx.upstreamModel || req.vendorBody.model });
     sent.content = rewriteDraftTaskContent(sent.content, ctx.originTasks);
@@ -840,8 +895,8 @@ export function buildSubmitRequest(ctx) {
   if (trimmed(req.prompt) || !hasReference) body.content.push({ type: "text", text: req.prompt || "" });
   if (Array.isArray(body.content)) body.content = rewriteDraftTaskContent(body.content, ctx.originTasks);
   // -1 lets the model pick the length; extractUsage reserves the longest one.
-  const seconds = Number.parseInt(req.seconds || "", 10);
-  if (seconds > 0 || seconds === -1) body.duration = seconds;
+  const stated = req.seconds ?? req.duration;
+  if (stated !== undefined && stated !== null) body.duration = Number(stated);
   body.model = ctx.upstreamModel || body.model;
   return {
     url: apiRoot(ctx) + "/api/v3/contents/generations/tasks",
@@ -861,13 +916,15 @@ export function buildSubmitRequest(ctx) {
 // standing for the payload the client already has.
 export function parseSubmitEvent(ctx, event, previousState) {
   const state = previousState ? utils.json.clone(previousState) : { data: [] };
-  if (trimmed(event.data) === "[DONE]") return { state: state, done: true };
+  if (trimmed(event.data) === "[DONE]") return { state: state, done: true, business: false };
+  let business = false;
   const body = JSON.parse(event.data);
   if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("invalid image stream event");
   if (body.type === "image_generation.partial_succeeded") {
     const image = { image_index: body.image_index, size: body.size };
     if (trimmed(body.url)) image.url = body.url;
     else if (trimmed(body.b64_json)) image.b64_json = "streamed";
+    business = !!(image.url || image.b64_json);
     state.data.push(image);
   } else if (body.type === "image_generation.partial_failed") {
     state.data.push({ image_index: body.image_index, error: body.error });
@@ -878,7 +935,7 @@ export function parseSubmitEvent(ctx, event, previousState) {
   } else if (body.error) {
     state.error = body.error;
   }
-  return { state: state, done: false };
+  return { state: state, done: false, business: business };
 }
 
 export function parseSubmitResponse(ctx, resp) {
@@ -924,16 +981,7 @@ export function extractUsage(ctx) {
     return ratio === 1 ? null : { video_input_ratio: ratio };
   }
   const profile = videoProfile(ctx);
-  // A missing duration or -1 (the model picks the length; Seedance 2.5
-  // defaults to it) reserves the longest duration the model can produce.
-  const stated = req.seconds || req.duration || metadata.duration;
-  let seconds = typeof stated === "number" || typeof stated === "string" ? Number(stated) : 0;
-  if (!Number.isFinite(seconds) || seconds <= 0) {
-    const frames = Number(metadata.frames);
-    seconds = Number.isFinite(frames) && frames > 0 ? Math.floor(frames / 24) : profile.maxDuration;
-  }
-  if (seconds <= 0) seconds = 5;
-  seconds = Math.min(seconds, 3600);
+  const seconds = requestedVideoDuration(ctx);
   const resolution = videoResolution(ctx);
   const facts = { tokens: estimateTokens(seconds, resolution), resolution: resolution };
   // Every model reports video_input, including those whose profile omits it:
@@ -1024,7 +1072,13 @@ export function buildContentRequest(ctx) {
 }
 
 export function extractUsageOnComplete(task, taskResult, body) {
-  if (imageTask(task)) return imageUsage(body || {}, imageProfile(task));
+  if (imageTask(task)) {
+    const facts = body ? imageUsage(body, imageProfile(task)) : {};
+    const submitted = task.submittedUsage || {};
+    if (facts.input_images === undefined && Number.isInteger(submitted.input_images) && submitted.input_images >= 0 && submitted.input_images <= MAX_REFERENCE_IMAGES)
+      facts.input_images = submitted.input_images;
+    return facts;
+  }
   if (!body || body.status !== "succeeded") return {};
   const facts = {};
   const usage = body.usage || {};

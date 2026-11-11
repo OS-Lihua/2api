@@ -11,6 +11,11 @@ type RequestInput struct {
 	Headers map[string]string
 	Body    []byte
 	Usage   map[string]any
+	// FreezeMoneyRequest captures only boolean request-pricing decisions.
+	// MoneySnapshot replays those decisions with new measured usage.
+	FreezeMoneyRequest   bool                  `json:"-"`
+	RequireMoneySnapshot bool                  `json:"-"`
+	MoneySnapshot        *MoneyRequestSnapshot `json:"-"`
 	// DeferredHeaders names headers resolved by account I/O after reservation.
 	// Exact pricing must fail if an evaluated condition needs one of them.
 	DeferredHeaders []string

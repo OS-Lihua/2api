@@ -889,7 +889,7 @@ it('keeps native request-rule expressions visually editable while retaining the 
   const source =
     '  v1:(tier("base", p * 0.123456789012345678 + c * 0)) * (param("service_tier") == "fast" ? 2 : 1)  '
   await user.clear(within(dialog).getByLabelText('Billing expression'))
-  await user.type(within(dialog).getByLabelText('Billing expression'), source)
+  await user.paste(source)
   await user.click(
     within(dialog).getByRole('combobox', { name: 'Editor mode' })
   )

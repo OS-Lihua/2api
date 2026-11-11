@@ -61,7 +61,11 @@ export function RequestSummary(props: {
           <dd className='mt-1'>
             <RequestMoney
               amount={request.receivable}
-              pending={request.sale_pending}
+              pending={
+                request.sale_pending ||
+                request.status === 'pending' ||
+                request.status === 'submission_unknown'
+              }
             />
           </dd>
         </div>

@@ -788,7 +788,7 @@ func TestResponsesWSShutdownInterruptsBusyWriter(t *testing.T) {
 	defer cleanupClient()
 	target, peer, cleanupTarget := newTestWebSocketPair(t)
 	defer cleanupTarget()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancelCause(context.Background())
 	s := &responsesWSSession{ctx: ctx, cancel: cancel, client: server, target: target}
 	// Blocked network writers own these locks. Shutdown must not wait for
 	// them: its close frames are bounded control writes, and closing the

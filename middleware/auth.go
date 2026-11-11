@@ -598,8 +598,46 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 	}
 }
 
+const taskReadAuthKey = "task_read_auth"
+
 func TokenAuth(credentialOnly ...bool) func(c *gin.Context) {
 	return tokenAuth(len(credentialOnly) > 0 && credentialOnly[0])
+}
+
+// TaskReadAuth validates credentials without requiring legacy quota for an
+// operation that only reads an existing task. Ownership is checked by handlers.
+func TaskReadAuth() gin.HandlerFunc {
+	authenticate := TokenAuth()
+	return func(c *gin.Context) {
+		if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
+			c.Set(taskReadAuthKey, true)
+		}
+		authenticate(c)
+	}
+}
+
+// TaskOriginAuth validates the normal token identity before an owned task can
+// determine its Offering. The submission path checks funding after ownership.
+func TaskOriginAuth() gin.HandlerFunc {
+	authenticate := TokenAuth()
+	return func(c *gin.Context) {
+		c.Set(taskReadAuthKey, true)
+		authenticate(c)
+	}
+}
+
+// LegacyTaskSubmissionAuth restores the legacy funding check after a native
+// decoder has established that the submission does not use a ModelOffering.
+func LegacyTaskSubmissionAuth() gin.HandlerFunc {
+	authenticate := TokenAuth()
+	return func(c *gin.Context) {
+		if TextOffering(c) != nil {
+			c.Next()
+			return
+		}
+		c.Set(taskReadAuthKey, false)
+		authenticate(c)
+	}
 }
 
 // GatewayTokenAuth authenticates gateway and discovery requests before resolution.
@@ -663,7 +701,7 @@ func tokenAuth(walletCredential bool) func(c *gin.Context) {
 		}
 		validateToken := model.ValidateUserToken
 		responsesHandshake := c.Request.Method == http.MethodGet && c.Request.URL.Path == "/v1/responses" && strings.EqualFold(c.GetHeader("Upgrade"), "websocket")
-		if walletCredential || TextOffering(c) != nil || TextOfferingMissing(c) || responsesHandshake {
+		if walletCredential || TextOffering(c) != nil || TextOfferingMissing(c) || responsesHandshake || c.GetBool(taskReadAuthKey) {
 			validateToken = model.ValidateWalletToken
 		}
 		token, err := validateToken(key)

@@ -1080,16 +1080,17 @@ func TestDoubaoNativeOfficialBodies(t *testing.T) {
 		assert.InDelta(t, 6*1920*1080*24/1024.0, facts["tokens"], 1e-6)
 	})
 
-	// Ark checks the duration, which goes as sent. The reservation reads the
-	// number when it can and takes the model's longest duration otherwise.
+	// Valid native durations keep their wire shape; invalid multipliers fail
+	// before submission instead of reserving a substitute duration.
 	for _, tc := range []struct {
 		name     string
 		duration any
 		seconds  float64
+		wantErr  string
 	}{
-		{"a fractional duration", 5.9, 5.9},
-		{"a duration given as a string", "5", 5},
-		{"a duration that is not a number", true, 15},
+		{"a fractional duration", 5.9, 5.9, ""},
+		{"a duration given as a string", "5", 5, ""},
+		{"a nonnumeric duration is rejected", true, 0, "duration must be positive and at most 3600 seconds"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := map[string]any{"model": seedance, "content": []any{map[string]any{"type": "text", "text": "a cat"}}, "duration": tc.duration}
@@ -1097,6 +1098,12 @@ func TestDoubaoNativeOfficialBodies(t *testing.T) {
 			require.NoError(t, err)
 			driver := map[string]any{"model": seedance, "upstreamModel": seedance, "requestBody": intent["requestBody"], "baseUrl": doubaoBaseURL, "apiKey": "key"}
 			descriptor, err := call([]string{"buildSubmitRequest"}, driver)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				_, err = call([]string{"extractUsage"}, driver)
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
 			require.NoError(t, err)
 			assert.Equal(t, alibabaObject(t, body), descriptor["body"])
 			facts, err := call([]string{"extractUsage"}, driver)
