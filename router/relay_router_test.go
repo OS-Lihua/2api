@@ -5098,6 +5098,12 @@ func TestTextGatewayNativeResponseAccounting(t *testing.T) {
 		{name: "Baidu malformed cache JSON preserves independent counters", provider: constant.ChannelTypeBaidu, key: "cache-json-malformed-baidu|test-secret", body: `{"result":{},"usage":{"prompt_tokens_details":{"cached_tokens":1000}}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1000000, purchaseExpression: `tier("cache",cr*1)`},
 		{name: "Zhipu malformed cache JSON preserves independent counters", provider: constant.ChannelTypeZhipu, key: "test.secret", body: `{"success":{},"data":{"usage":{"prompt_tokens_details":{"cached_tokens":1000}}}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1000000, purchaseExpression: `tier("cache",cr*1)`},
 		{name: "Zhipu malformed cache stream preserves independent counters", provider: constant.ChannelTypeZhipu, key: "test.secret", stream: true, body: "meta:{\"task_status\":{},\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":1000}}}\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 1000000, purchaseExpression: `tier("cache",cr*1)`},
+		{name: "Cohere terminal source failed snapshot", provider: constant.ChannelTypeCohere, stream: true, body: "{\"event_type\":\"stream-end\",\"is_finished\":true,\"finish_reason\":\"ERROR\",\"response\":{\"text\":\"Hello\",\"meta\":{\"billed_units\":{\"input_tokens\":10}}}}\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 12000},
+		{name: "Cohere terminal source malformed metadata", provider: constant.ChannelTypeCohere, stream: true, body: "{\"event_type\":\"stream-end\",\"is_finished\":{},\"response\":{\"text\":\"Hello\",\"meta\":{\"billed_units\":{\"input_tokens\":10}}}}\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 12000},
+		{name: "Cohere terminal source deduplicates prior delta", provider: constant.ChannelTypeCohere, stream: true, body: "{\"event_type\":\"text-generation\",\"text\":\"Hello\"}\n{\"event_type\":\"stream-end\",\"is_finished\":true,\"finish_reason\":\"ERROR\",\"response\":{\"text\":\"Hello\",\"meta\":{\"billed_units\":{\"input_tokens\":10}}}}\n", status: "partial", source: "estimated", prompt: 10, completion: 1, charge: 21600, cost: 12000},
+		{name: "Cohere terminal source retains snapshot suffix", provider: constant.ChannelTypeCohere, stream: true, body: "{\"event_type\":\"text-generation\",\"text\":\"Hello\"}\n{\"event_type\":\"stream-end\",\"is_finished\":true,\"finish_reason\":\"ERROR\",\"response\":{\"text\":\"HelloWorld\",\"meta\":{\"billed_units\":{\"input_tokens\":10}}}}\n", status: "partial", source: "estimated", prompt: 10, completion: 1, charge: 21600, cost: 14000},
+		{name: "Cohere terminal source respects explicit zero", provider: constant.ChannelTypeCohere, stream: true, body: "{\"event_type\":\"stream-end\",\"is_finished\":true,\"finish_reason\":\"ERROR\",\"response\":{\"text\":\"Hello\",\"meta\":{\"billed_units\":{\"input_tokens\":10,\"output_tokens\":0}}}}\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 10000},
+		{name: "Cohere terminal source rejects malformed text", provider: constant.ChannelTypeCohere, stream: true, body: "{\"event_type\":\"stream-end\",\"is_finished\":true,\"finish_reason\":\"ERROR\",\"response\":{\"text\":{},\"meta\":{\"billed_units\":{\"input_tokens\":10}}}}\n", status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 10000},
 		{name: "independent source Cohere malformed terminal", provider: constant.ChannelTypeCohere, body: `{"text":"Hello","finish_reason":{}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
 		{name: "independent source Ollama malformed metadata", provider: constant.ChannelTypeOllama, body: `{"message":{"content":"Hello"},"done":true,"done_reason":{}}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 11000},
 		{name: "independent source Dify malformed conversation", provider: constant.ChannelTypeDify, body: `{"conversation_id":{},"answer":"Hello"}`, status: "failed", httpStatus: http.StatusBadGateway, source: "none", cost: 15000},
@@ -5820,6 +5826,7 @@ func TestTextGatewayNativeStreamCancellationPreservesPurchase(t *testing.T) {
 		{"Zhipu buffered usage", "data:Hello\nmeta:{\"task_status\":\"SUCCESS\",\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n", "test.secret", constant.ChannelTypeZhipu, 5, true},
 		{"Ollama buffered usage", "{\"message\":{\"content\":\"Hello\"},\"done\":false}\n{\"done\":true,\"prompt_eval_count\":10,\"eval_count\":5}\n", "", constant.ChannelTypeOllama, 5, true},
 		{"Cohere buffered usage", "{\"text\":\"Hello\",\"event_type\":\"text-generation\"}\n{\"is_finished\":true,\"event_type\":\"stream-end\",\"finish_reason\":\"COMPLETE\",\"response\":{\"meta\":{\"billed_units\":{\"input_tokens\":10,\"output_tokens\":5}}}}\n", "", constant.ChannelTypeCohere, 5, true},
+		{"Cohere buffered terminal snapshot", "{\"event_type\":\"text-generation\",\"text\":\"Hello\"}\n{\"event_type\":\"stream-end\",\"is_finished\":true,\"finish_reason\":\"COMPLETE\",\"response\":{\"text\":\"HelloWorld\",\"meta\":{\"billed_units\":{\"input_tokens\":10}}}}\n", "", constant.ChannelTypeCohere, 2, false},
 		{"Tencent buffered usage", "data: {\"Choices\":[{\"Delta\":{\"Content\":\"Hello\"}}]}\n\ndata: {\"Choices\":[],\"Usage\":{\"PromptTokens\":10,\"CompletionTokens\":5}}\n\n", "1|test-id|test-secret", constant.ChannelTypeTencent, 5, true},
 		{"Coze buffered usage", "event: conversation.message.delta\ndata: {\"content\":\"Hello\"}\n\nevent: conversation.chat.completed\ndata: {\"usage\":{\"input_count\":10,\"output_count\":5}}\n\n", "", constant.ChannelTypeCoze, 5, true},
 	} {
@@ -5844,7 +5851,7 @@ func TestTextGatewayNativeStreamCancellationPreservesPurchase(t *testing.T) {
 			client.Transport = channelProbeRoundTripper(func(request *http.Request) (*http.Response, error) {
 				response, err := original.RoundTrip(request)
 				if err == nil {
-					if provider.reported {
+					if provider.reported || provider.kind == constant.ChannelTypeCohere {
 						buffered, readErr := io.ReadAll(response.Body)
 						require.NoError(t, readErr)
 						require.NoError(t, response.Body.Close())
@@ -5879,9 +5886,11 @@ func TestTextGatewayNativeStreamCancellationPreservesPurchase(t *testing.T) {
 			attempt := items[0].(map[string]any)
 			if provider.reported {
 				assert.Equal(t, "upstream", attempt["usage_source"])
-				assert.Zero(t, afterCancel.Load(), "source recovery must not read upstream after cancellation")
 			} else {
 				assert.Equal(t, "estimated", attempt["usage_source"])
+			}
+			if provider.reported || provider.kind == constant.ChannelTypeCohere {
+				assert.Zero(t, afterCancel.Load(), "source recovery must not read upstream after cancellation")
 			}
 			assert.EqualValues(t, provider.tokens, attempt["usage"].(map[string]any)["completion_tokens"])
 			assert.Equal(t, map[string]any{"nanos": strconv.Itoa(provider.tokens * 2000), "currency": "USD"}, attempt["cost"])
