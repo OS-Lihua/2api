@@ -5488,6 +5488,9 @@ func TestMediaGatewayMiniMaxImagesKeepHostStreamAndRejectInputLoss(t *testing.T)
 		seed                   *int64
 	}{
 		{name: "exact dimensions", fields: `,"size":"1536x1024"`, width: 1536, height: 1024},
+		{name: "extra native dimensions", fields: `,"extra_fields":{"width":1536,"height":1024}`, width: 1536, height: 1024},
+		{name: "extra native count limit", fields: `,"extra_fields":{"n":10}`, reject: true},
+		{name: "extra native quality", fields: `,"extra_fields":{"quality":"high"}`, reject: true},
 		{name: "seed zero", fields: `,"seed":0`, seed: new(int64(0))},
 		{name: "extra seed zero", fields: `,"extra_fields":{"seed":0}`, seed: new(int64(0))},
 		{name: "invalid seed", fields: `,"seed":"invalid-seed-private-sentinel"`, reject: true},

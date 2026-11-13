@@ -104,6 +104,9 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 	}
 	converted := oaiImage2MiniMaxImageRequest(request)
 	if info.ResponseFacts != nil {
+		if converted.AigcWatermark != nil {
+			converted.AigcWatermark = new(*converted.AigcWatermark)
+		}
 		if request.Size != "" && request.Size != "auto" {
 			widthText, heightText, found := strings.Cut(request.Size, "x")
 			width, widthErr := strconv.Atoi(widthText)
@@ -116,15 +119,33 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 			}
 			converted.Width, converted.Height, converted.AspectRatio = &width, &height, ""
 		}
-		var extra struct {
-			Seed *int64 `json:"seed"`
-		}
 		if len(request.ExtraFields) > 0 {
+			var extra map[string]common.RawMessage
 			if err := common.Unmarshal(request.ExtraFields, &extra); err != nil {
-				return nil, types.NewMediaParameterError("seed", "media_control_unsupported")
+				return nil, types.NewMediaParameterError("request", "media_control_unsupported")
+			}
+			parameters := map[string]any{
+				"model": &converted.Model, "prompt": &converted.Prompt, "n": &converted.N,
+				"width": &converted.Width, "height": &converted.Height, "seed": &converted.Seed,
+				"aspect_ratio": &converted.AspectRatio, "response_format": &converted.ResponseFormat,
+				"prompt_optimizer": &converted.PromptOptimizer, "aigc_watermark": &converted.AigcWatermark,
+			}
+			for field, raw := range extra {
+				target, ok := parameters[field]
+				if !ok {
+					if field == "quality" {
+						return nil, types.NewMediaParameterError("quality", "media_control_unsupported")
+					}
+					return nil, types.NewMediaParameterError("request", "media_parameters_unrepresentable")
+				}
+				if err := common.Unmarshal(raw, target); err != nil {
+					return nil, types.NewMediaParameterError(field, "media_control_unsupported")
+				}
+			}
+			if (extra["width"] != nil || extra["height"] != nil) && extra["aspect_ratio"] == nil && request.Extra["aspect_ratio"] == nil {
+				converted.AspectRatio = ""
 			}
 		}
-		converted.Seed = extra.Seed
 		if raw, exists := request.Extra["seed"]; exists {
 			if err := common.Unmarshal(raw, &converted.Seed); err != nil {
 				return nil, types.NewMediaParameterError("seed", "media_control_unsupported")
