@@ -473,7 +473,7 @@ func TestXAIModeratedTaskPresentation(t *testing.T) {
 	assert.Equal(t, "SUCCESS", downstream["status"])
 	facts, err := callXAI(t, plugin, []string{"extractUsageOnComplete"}, map[string]any{"action": "text_to_video"}, downstream, status)
 	require.NoError(t, err)
-	assert.Equal(t, map[string]any{"moderated": true}, facts)
+	assert.Equal(t, map[string]any{"moderated": true, "seconds": nil}, facts)
 
 	stalled, err := callXAI(t, plugin, []string{"native", "videoStatus"}, map[string]any{}, map[string]any{"task_id": "task_public", "status": "FAILURE", "fail_reason": "poll failures", "data": map[string]any{"status": "pending", "progress": 10}})
 	require.NoError(t, err)

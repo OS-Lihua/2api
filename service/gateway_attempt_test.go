@@ -542,11 +542,11 @@ func TestGatewayNativeTransportBudget(t *testing.T) {
 			b.RequirePermit(permit)
 			_, err := b.Start()
 			require.NoError(t, err)
+			permit.Disarm()
+			b.Handoff()
 			return service.GatewayAttemptResult{TransportAttempt: true, Established: true}
 		})
 		require.NoError(t, permit.Release(t.Context(), true))
-		permit.Disarm()
-		handshake.Handoff()
 		handshake.Pause()
 		next, err := manager.Acquire(t.Context(), selection, 3)
 		require.NoError(t, err)
@@ -555,9 +555,47 @@ func TestGatewayNativeTransportBudget(t *testing.T) {
 		ctx, err := handshake.Start()
 		require.NoError(t, err)
 		assert.NoError(t, ctx.Err(), "the next generation must survive the handshake's completed I/O context")
+		select {
+		case <-ctx.Done():
+			t.Fatal("the next generation was cancelled by ordinary handshake cleanup")
+		default:
+		}
 		server.SetError("ERR injected quota renewal failure")
 		fake.Advance(time.Minute)
 		assert.ErrorIs(t, context.Cause(ctx), service.ErrGatewayPermitLost, "a later logical request must retain its own lease revocation")
+		server.SetError("")
+	})
+	t.Run("handshake lease loss rejects the next generation", func(t *testing.T) {
+		fake := clock.UseFake(t, time.Unix(100, 0))
+		server := miniredis.RunT(t)
+		client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+		t.Cleanup(func() { require.NoError(t, client.Close()) })
+		manager := service.NewGatewayRouteQuota(client)
+		selection := &service.GatewaySelection{Provider: &model.Provider{Id: 1}, Channel: model.Channel{ID: 1, MaxConcurrency: 1}}
+		permit, err := manager.Acquire(t.Context(), selection, 2)
+		require.NoError(t, err)
+		var handshake *service.GatewayAttemptBudget
+		service.RunGatewayAttempts(t.Context(), service.GatewayAttemptPolicy{MaxAttempts: 1, TotalFirstByte: time.Minute, AttemptFirstByte: time.Minute}, func(b *service.GatewayAttemptBudget, _ *service.GatewayExclusions) service.GatewayAttemptResult {
+			handshake = b
+			b.RequirePermit(permit)
+			ctx, err := b.Start()
+			require.NoError(t, err)
+			server.SetError("ERR injected handshake quota renewal failure")
+			fake.Advance(time.Minute)
+			require.ErrorIs(t, context.Cause(ctx), service.ErrGatewayPermitLost)
+			permit.Disarm()
+			b.Handoff()
+			server.SetError("")
+			require.NoError(t, permit.Release(context.WithoutCancel(t.Context()), true))
+			return service.GatewayAttemptResult{TransportAttempt: true, Established: true}
+		})
+		handshake.Pause()
+		next, err := manager.Acquire(t.Context(), selection, 3)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, next.Release(context.WithoutCancel(t.Context()), true)) })
+		_, err = handshake.Start()
+		require.ErrorIs(t, err, service.ErrGatewayPermitLost)
+		assert.ErrorIs(t, context.Cause(handshake.Context()), service.ErrGatewayPermitLost, "a handshake loss rejects the next generation before Provider I/O")
 		server.SetError("")
 	})
 	t.Run("handshakes consume the shared maximum", func(t *testing.T) {

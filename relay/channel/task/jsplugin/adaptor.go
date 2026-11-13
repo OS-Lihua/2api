@@ -998,12 +998,20 @@ func (a *TaskAdaptor) observeSubmitSourceCompletion(c *gin.Context, info *relayc
 		return
 	}
 	known := make(map[string]any)
+	unknown := false
 	for _, source := range []any{a.submitSourceFallback, taskData} {
 		input := a.projectSubmitCompletion(c, info, resp, immediate, taskID, source, pluginState)
 		a.observeSubmitCompletion(c, info, &input.Result, taskID, input.Data, input.State)
+		unknown = unknown || input.Result.UsageFactsUnknown
 		maps.Copy(known, input.Result.UsageFacts)
 	}
 	_ = a.applyCompletionUsageFacts(immediate, known, info.UpstreamModelName, info.OriginModelName)
+	if unknown {
+		immediate.UsageFactsUnknown = true
+	}
+	if immediate.UsageFactsUnknown {
+		immediate.UsageFacts = known
+	}
 }
 
 func submitResultInfo(result *taskResult) *relaycommon.TaskInfo {
@@ -1097,10 +1105,12 @@ func (a *TaskAdaptor) observeSubmitCompletion(c *gin.Context, info *relaycommon.
 	}
 	facts, err := a.plugin.Engine.Call(callContext, "extractUsageOnComplete", ctx, jsonValue(immediate), taskData)
 	if err != nil {
+		immediate.UsageFactsUnknown = true
 		logger.LogWarn(c, common.LogText("task plugin %s completion usage failed; preserving known usage: %v", a.plugin.Meta.Key, err))
 		return
 	}
 	if err := a.applyCompletionUsageFacts(immediate, facts, info.UpstreamModelName, info.OriginModelName); err != nil {
+		immediate.UsageFactsUnknown = true
 		logger.LogWarn(c, common.LogText("task plugin %s completion usage rejected; preserving known usage: %v", a.plugin.Meta.Key, err))
 	}
 }
@@ -1454,7 +1464,11 @@ func (a *TaskAdaptor) ParseBatchResultWithContext(requestCtx context.Context, ta
 			if hookErr == nil {
 				upstreamModel, _ := itemCtx["upstreamModel"].(string)
 				originModel, _ := itemCtx["model"].(string)
-				a.applyCompletionUsageFacts(&info, facts, upstreamModel, originModel)
+				hookErr = a.applyCompletionUsageFacts(&info, facts, upstreamModel, originModel)
+			}
+			if hookErr != nil {
+				a.logRejectedUsage("extractUsageOnComplete", hookErr)
+				info.UsageFactsUnknown = true
 			}
 		}
 		results[item.TaskID] = &service.BatchTaskResult{TaskInfo: info, Action: item.Action, SubmitTime: item.SubmitTime, StartTime: item.StartTime, FinishTime: item.FinishTime, Data: item.Data}
@@ -1525,11 +1539,15 @@ func (a *TaskAdaptor) ParseTaskResultWithContext(requestCtx context.Context, tas
 	// The raw polling response only exists at this boundary. Capture upstream
 	// units here so the host settlement path can consume them from TaskInfo.
 	if (a.info == nil || !a.info.IsChannelTest) && a.hasHook(requestCtx, "extractUsageOnComplete") {
-		facts, hookErr := a.plugin.Engine.Call(requestCtx, "extractUsageOnComplete", ctx, jsonValue(result), input)
-		if hookErr == nil {
+		facts, err := a.plugin.Engine.Call(requestCtx, "extractUsageOnComplete", ctx, jsonValue(result), input)
+		if err == nil {
 			upstreamModel, _ := ctx["upstreamModel"].(string)
 			originModel, _ := ctx["model"].(string)
-			a.applyCompletionUsageFacts(result, facts, upstreamModel, originModel)
+			err = a.applyCompletionUsageFacts(result, facts, upstreamModel, originModel)
+		}
+		if err != nil {
+			a.logRejectedUsage("extractUsageOnComplete", err)
+			result.UsageFactsUnknown = true
 		}
 	}
 	taskStatus := model.TaskStatus(result.Status)
@@ -1545,19 +1563,28 @@ func (a *TaskAdaptor) ParseTaskResultWithContext(requestCtx context.Context, tas
 }
 
 func (a *TaskAdaptor) applyCompletionUsageFacts(result *relaycommon.TaskInfo, facts any, models ...string) error {
-	values, err := a.validatedCompletionUsageFacts(facts, models...)
+	values, unknown, err := a.validatedCompletionUsageFacts(facts, models...)
 	if err != nil {
 		a.logRejectedUsage("extractUsageOnComplete", err)
+	} else if !unknown && len(values) == 0 && result.Status == model.TaskStatusSuccess {
+		err = fmt.Errorf("plugin returned no completion usage facts")
+		unknown = true
+	}
+	if unknown || err != nil {
+		result.UsageFactsUnknown = true
+	}
+	// Retain independently valid siblings when another field was rejected or
+	// explicitly unknown. A terminal quantity the Provider did not report cannot
+	// borrow the submission estimate.
+	if len(values) != 0 {
+		result.UsageFacts = values
+	} else {
 		return err
 	}
-	if len(values) == 0 {
-		return nil
-	}
-	result.UsageFacts = values
 	if units := positiveInt(values["upstreamUnits"]); units > 0 {
 		result.CompletionTokens = units
 		result.TotalTokens = units
-		return nil
+		return err
 	}
 	if completionTokens, exists := values["completionTokens"]; exists {
 		result.CompletionTokens = positiveInt(completionTokens)
@@ -1565,7 +1592,7 @@ func (a *TaskAdaptor) applyCompletionUsageFacts(result *relaycommon.TaskInfo, fa
 	if totalTokens, exists := values["totalTokens"]; exists {
 		result.TotalTokens = positiveInt(totalTokens)
 	}
-	return nil
+	return err
 }
 
 func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
@@ -2381,22 +2408,33 @@ func (a *TaskAdaptor) validatedUsageRatios(facts map[string]any, models ...strin
 	return validated, ratios, nil
 }
 
-func (a *TaskAdaptor) validatedCompletionUsageFacts(facts any, models ...string) (map[string]any, error) {
+func (a *TaskAdaptor) validatedCompletionUsageFacts(facts any, models ...string) (map[string]any, bool, error) {
 	usageSchema, _ := a.plugin.Meta.UsageForModels(models...)
 	if facts == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	values, ok := facts.(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("plugin usage hook must return an object")
+		return nil, false, fmt.Errorf("plugin usage hook must return an object")
 	}
 	validated := make(map[string]any, len(values))
+	unknown := false
+	var rejected error
 	for key, value := range values {
+		// An explicit null reports a terminal quantity the Provider omitted.
+		// Keep valid siblings but withhold the quantity instead of settling the
+		// submission estimate as if the Provider had reported it.
+		if value == nil {
+			unknown = true
+			continue
+		}
 		validated[key] = value
 		if schema, declared := usageSchema[key]; declared {
 			number, err := validateUsageValue(value, schema)
 			if err != nil {
-				return nil, err
+				delete(validated, key)
+				rejected = errors.Join(rejected, err)
+				continue
 			}
 			if schema.Type == "number" {
 				validated[key] = number
@@ -2406,10 +2444,14 @@ func (a *TaskAdaptor) validatedCompletionUsageFacts(facts any, models ...string)
 		if limit, canonical := canonicalUsageLimit(key); canonical {
 			number, numeric := usageNumber(value)
 			if !numeric {
-				return nil, fmt.Errorf("plugin usage value must be a number")
+				delete(validated, key)
+				rejected = errors.Join(rejected, fmt.Errorf("plugin usage value must be a number"))
+				continue
 			}
 			if err := validateUsageNumberLimit(number, limit); err != nil {
-				return nil, err
+				delete(validated, key)
+				rejected = errors.Join(rejected, err)
+				continue
 			}
 			validated[key] = number
 			continue
@@ -2418,7 +2460,9 @@ func (a *TaskAdaptor) validatedCompletionUsageFacts(facts any, models ...string)
 		case "upstreamUnits", "completionTokens", "totalTokens":
 			number, numeric := usageNumber(value)
 			if !numeric || math.IsNaN(number) || math.IsInf(number, 0) || number < 0 {
-				return nil, fmt.Errorf("plugin usage value must be a finite non-negative number")
+				delete(validated, key)
+				rejected = errors.Join(rejected, fmt.Errorf("plugin usage value must be a finite non-negative number"))
+				continue
 			}
 			validated[key] = float64(common.QuotaFromFloat(number))
 		default:
@@ -2427,7 +2471,7 @@ func (a *TaskAdaptor) validatedCompletionUsageFacts(facts any, models ...string)
 			}
 		}
 	}
-	return validated, nil
+	return validated, unknown, rejected
 }
 
 func validateUsageValue(value any, schema pluginruntime.UsageFieldSchema) (float64, error) {

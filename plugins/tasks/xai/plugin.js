@@ -555,8 +555,14 @@ export function extractUsageOnComplete(task, result, body) {
   const state = plainObject(result && result.plugin_state) || plainObject(task && task.state) || {};
   if (VIDEO_MODELS["grok-imagine-video"].resolutions.includes(state.output_resolution)) facts.resolution = state.output_resolution;
   const duration = Number(data.status === "done" && plainObject(data.video) ? data.video.duration : NaN);
-  if (!(duration > 0)) return facts;
   const action = task && task.action;
+  if (!(duration > 0)) {
+    // A terminal duration the Provider did not report must not settle from the
+    // requested or reserved duration.
+    facts.seconds = null;
+    if (action === "video_edit" || action === "video_extension") facts.input_video_seconds = null;
+    return facts;
+  }
   if (action === "video_edit") {
     facts.seconds = Math.min(duration, MAX_EDIT_SECONDS);
     facts.input_video_seconds = facts.seconds;

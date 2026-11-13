@@ -475,6 +475,13 @@ func TestDoubaoSeedanceUsageFacts(t *testing.T) {
 			assert.Equal(t, tc.want, alibabaObject(t, value), tc.model)
 		}
 	})
+
+	t.Run("completion reports a missing token count as unknown", func(t *testing.T) {
+		queryContext := map[string]any{"model": v20, "upstreamModel": v20, "action": "text_to_video"}
+		value, err := plugin.Engine.Call(t.Context(), "extractUsageOnComplete", queryContext, map[string]any{"status": "SUCCESS"}, map[string]any{"status": "succeeded"})
+		require.NoError(t, err)
+		assert.Equal(t, map[string]any{"tokens": nil}, alibabaObject(t, value))
+	})
 }
 
 func keysOf(schema map[string]jsplugin.UsageFieldSchema) []string {

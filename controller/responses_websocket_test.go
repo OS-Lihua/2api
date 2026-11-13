@@ -19,7 +19,11 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/channelhealth"
+	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/relay"
+	relaychannel "github.com/QuantumNous/new-api/relay/channel"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
@@ -110,6 +114,101 @@ func newResponsesWSTestRunner(t *testing.T, token *model.Token) (relay.Responses
 	require.Equal(t, http.StatusOK, response.Code)
 	require.NotNil(t, runner)
 	return runner, request
+}
+
+func TestRealtimeHandshakeLeaseLossRejectsNextGeneration(t *testing.T) {
+	for _, lost := range []bool{false, true} {
+		t.Run(fmt.Sprint(lost), func(t *testing.T) {
+			fake := clock.UseFake(t, time.Unix(100, 0))
+			server := miniredis.RunT(t)
+			client := redis.NewClient(&redis.Options{Addr: server.Addr(), MaxRetries: -1})
+			t.Cleanup(func() { require.NoError(t, client.Close()) })
+			manager := service.NewGatewayRouteQuota(client)
+			selection := &service.GatewaySelection{Provider: &model.Provider{Id: 1}, Channel: model.Channel{ID: 1, MaxConcurrency: 1}}
+			permit, err := manager.Acquire(t.Context(), selection, 0)
+			require.NoError(t, err)
+			selection.Permit = permit
+			accepted, releaseHandshake := make(chan struct{}), make(chan struct{})
+			release := sync.OnceFunc(func() { close(releaseHandshake) })
+			t.Cleanup(release)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				ws, upgradeErr := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if !assert.NoError(t, upgradeErr) {
+					return
+				}
+				defer ws.Close()
+				close(accepted)
+				select {
+				case <-releaseHandshake:
+				case <-r.Context().Done():
+					return
+				}
+				_, _, _ = ws.ReadMessage()
+			}))
+			t.Cleanup(upstream.Close)
+			call := &relay.ResponsesWSCall{Native: &relay.NativeWSLifecycle{TransportOnly: true}}
+			established := false
+			call.Native.Exchange = func(c *gin.Context, info *relaycommon.RelayInfo, channelID, providerID int, prepared *relaychannel.PreparedWssRequest, payload []byte) (*dto.Usage, *types.NewAPIError) {
+				_, apiErr := relay.ExchangeRealtime(c, info, prepared, func() error {
+					established = true
+					call.Native.ConnectionReady()
+					return nil
+				})
+				return nil, apiErr
+			}
+			call.Native.Established = func() bool { return established }
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			c.Request.Header = make(http.Header)
+			var budget *service.GatewayAttemptBudget
+			var result service.GatewayAttemptResult
+			finished := make(chan struct{})
+			go func() {
+				defer close(finished)
+				service.RunGatewayAttempts(t.Context(), service.GatewayAttemptPolicy{MaxAttempts: 1, TotalFirstByte: 2 * time.Minute, AttemptFirstByte: 10 * time.Minute}, func(current *service.GatewayAttemptBudget, exclusions *service.GatewayExclusions) service.GatewayAttemptResult {
+					budget = current
+					budget.RequirePermit(selection.Permit)
+					info := &relaycommon.RelayInfo{ResponseFacts: &relaycommon.ResponseFacts{}, ProviderMeta: &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeOpenAI}}
+					info.BeginProviderCall = budget.Start
+					prepared, prepareErr := relaychannel.PrepareWssTransport(c, info, upstream.URL, make(http.Header))
+					require.NoError(t, prepareErr)
+					selection.Admission = channelhealth.Admission{ChannelID: selection.Channel.ID}
+					result = runRealtimeTransportAttempt(c, call, &textGatewayRun{}, info, selection, budget, func() {}, prepared)
+					return result
+				})
+			}()
+			select {
+			case <-accepted:
+			case <-time.After(5 * time.Second):
+				t.Fatal("actual Provider WebSocket handshake did not start")
+			}
+			if lost {
+				server.SetError("ERR injected handshake quota renewal failure")
+			}
+			fake.Advance(time.Minute)
+			server.SetError("")
+			release()
+			select {
+			case <-finished:
+			case <-time.After(5 * time.Second):
+				t.Fatal("native WebSocket handshake did not finish")
+			}
+			next, err := manager.Acquire(t.Context(), selection, 0)
+			require.NoError(t, err)
+			budget.RequirePermit(next)
+			ctx, err := budget.Start()
+			if lost {
+				assert.ErrorIs(t, err, service.ErrGatewayPermitLost)
+				assert.True(t, established)
+			} else {
+				require.NoError(t, err)
+				assert.NoError(t, ctx.Err())
+				assert.True(t, established)
+				assert.Equal(t, "connection_established", result.Failure.Class)
+			}
+			t.Cleanup(func() { require.NoError(t, next.Release(context.WithoutCancel(t.Context()), true)) })
+		})
+	}
 }
 
 func TestResponsesWSRequestRunnerRefreshesBillingContextAndCleansBody(t *testing.T) {

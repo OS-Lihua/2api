@@ -166,8 +166,12 @@ export function extractUsage(ctx) {
 export function extractUsageOnComplete(task, taskResult, body) {
   const facts = {};
   const data = body || {};
-  const raw = data.seconds === undefined ? data.duration : data.seconds;
-  if (raw !== undefined) {
+  const raw = data.seconds === undefined || data.seconds === null ? data.duration : data.seconds;
+  if (raw === undefined || raw === null) {
+    // A terminal duration the Provider did not report must not settle from the
+    // requested duration.
+    facts.seconds = null;
+  } else {
     const seconds = Number(raw);
     if ((typeof raw !== "number" && typeof raw !== "string") || !String(raw).trim() || !Number.isFinite(seconds) || seconds < 0 || seconds > 3600)
       throw new Error("completed seconds must be between 0 and 3600");

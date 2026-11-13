@@ -242,6 +242,18 @@ func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 		facts = make(map[string]any)
 	}
 	incomplete := snapshot.Stream != nil && snapshot.Stream.Incomplete && attempt.ErrorClass != "channel_unavailable"
+	if snapshot.CompletionUnknown && snapshot.Stream == nil {
+		// Estimated quantities cannot replace an omitted or invalid completion.
+		// Preserve validated completion facts and host-enforced Channel inputs.
+		for name, value := range facts {
+			switch value.(type) {
+			case string, bool:
+			default:
+				delete(facts, name)
+			}
+		}
+		maps.Copy(facts, snapshot.RetainedFacts)
+	}
 	if snapshot.Stream != nil {
 		for name, value := range facts {
 			switch value.(type) {
@@ -274,9 +286,11 @@ func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 	attempt.Usage.TaskFacts = facts
 	attempt.UsageSource = gatewayTaskUsageSource(attempt.PurchaseExpression, snapshot.CompletionFacts)
 	if task.Status == model.TaskStatusSuccess && (snapshot.Stream == nil || snapshot.Stream.BusinessOutput) {
-		request.Status, attempt.Status = "success", "success"
-		if (snapshot.Stream != nil && (snapshot.Stream.Incomplete || snapshot.Stream.DeliveryFailed)) || attempt.ErrorClass == "channel_unavailable" && attempt.Status == "partial" {
+		partial := (snapshot.Stream != nil && (snapshot.Stream.Incomplete || snapshot.Stream.DeliveryFailed)) || attempt.Status == "partial"
+		if partial {
 			request.Status, attempt.Status = "partial", "partial"
+		} else {
+			request.Status, attempt.Status = "success", "success"
 		}
 		ratio, saleErr := decimal.NewFromString(request.GroupRatio)
 		var fx *money.Rate
@@ -353,6 +367,8 @@ func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 	convertedKnown := fxErr == nil && convertedErr == nil && convertedCost.Currency == model.SettlementCurrency()
 	if convertedKnown {
 		attempt.ConvertedCost = convertedCost
+	} else {
+		attempt.ConvertedCost = money.Amount{Currency: model.SettlementCurrency()}
 	}
 	attempt.ConvertedCostPending = !convertedKnown || incomplete
 	intent.EvaluationFailed = intent.SaleEvaluationFailed || priceErr != nil || attempt.CostPending || attempt.ConvertedCostPending

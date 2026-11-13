@@ -1282,16 +1282,16 @@ export function extractUsageOnComplete(task, taskResult, body) {
     const inputSeconds = usage.input_video_duration;
     const outputSeconds = usage.output_video_duration ?? usage.duration;
     // Partial Wan3 statistics cannot establish the total billable duration.
-    // Keep the reservation when either side is missing. Invalid supplied facts
-    // reach the host validator unchanged, which logs and rejects them.
-    if (inputSeconds != null && outputSeconds != null) {
-      if (typeof inputSeconds !== "number" || !Number.isFinite(inputSeconds) || inputSeconds < 0) facts.seconds = inputSeconds;
-      else if (typeof outputSeconds !== "number" || !Number.isFinite(outputSeconds) || outputSeconds < 0) facts.seconds = outputSeconds;
-      else facts.seconds = inputSeconds + outputSeconds;
-    }
+    // Mark it unknown so the host keeps the reservation instead of settling the
+    // submitted duration. Invalid supplied facts reach the host validator
+    // unchanged, which logs and rejects them.
+    if (inputSeconds == null || outputSeconds == null) facts.seconds = null;
+    else if (typeof inputSeconds !== "number" || !Number.isFinite(inputSeconds) || inputSeconds < 0) facts.seconds = inputSeconds;
+    else if (typeof outputSeconds !== "number" || !Number.isFinite(outputSeconds) || outputSeconds < 0) facts.seconds = outputSeconds;
+    else facts.seconds = inputSeconds + outputSeconds;
   } else {
     const seconds = usage.duration ?? usage.output_video_duration ?? output.duration ?? output.duration_seconds;
-    if (seconds != null) facts.seconds = seconds;
+    facts.seconds = seconds == null ? null : seconds;
   }
   const resolution = usage.SR ?? output.resolution;
   if (resolution != null) facts.resolution = normalizeResolution(resolution);

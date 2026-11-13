@@ -122,6 +122,7 @@ type GatewayAttemptBudget struct {
 	cancel    context.CancelCauseFunc
 	sent      bool
 	ctx       context.Context
+	handedOff bool
 }
 
 // RequirePermit binds Provider I/O to this Attempt's shared concurrency lease.
@@ -195,14 +196,27 @@ func (b *GatewayAttemptBudget) Start() (context.Context, error) {
 // Handoff gives a native session a live context after its handshake Attempt
 // returns. Budget accounting and the normal pause/resume lifecycle are retained.
 func (b *GatewayAttemptBudget) Handoff() {
+	if b.handedOff {
+		return
+	}
+	b.handedOff = true
 	if b.sent && !b.finished && !b.paused {
 		b.elapsed = min(b.elapsed+clock.Now().Sub(b.started), b.remaining, b.policy.AttemptFirstByte)
 	}
 	if b.stop != nil {
 		b.stop()
 	}
-	b.parent = context.WithoutCancel(b.parent)
-	b.ctx, b.cancel = context.WithCancelCause(b.parent)
+	// Handoff occurs before the handshake runner's ordinary cleanup. Preserve
+	// any lease loss already observed on the handshake I/O context.
+	if !b.sent {
+		return
+	}
+	cause := context.Cause(b.ctx)
+	session, cancel := context.WithCancelCause(context.WithoutCancel(b.parent))
+	b.parent, b.ctx, b.cancel = session, session, cancel
+	if cause != nil {
+		cancel(cause)
+	}
 }
 
 // Pause excludes client think/input time on an established native connection.
@@ -270,7 +284,7 @@ func RunGatewayAttempts(ctx context.Context, policy GatewayAttemptPolicy, execut
 		}
 		budget.Delivered()
 		remaining -= budget.elapsed
-		if budget.cancel != nil {
+		if budget.cancel != nil && !budget.handedOff {
 			budget.cancel(nil)
 		}
 		if result.Attempt == nil && result.Failure.Class != "" && !result.Failure.Switch {

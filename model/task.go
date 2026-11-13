@@ -153,13 +153,18 @@ type TaskStreamFacts struct {
 // TaskGatewaySnapshot freezes the accepted Channel and quantitative billing
 // facts. Request bodies, credentials, and generated content stay out of it.
 type TaskGatewaySnapshot struct {
-	Accepted           bool                              `json:"accepted"`
-	ProviderType       int                               `json:"provider_type"`
-	ChannelID          int                               `json:"channel_id"`
-	ProviderID         int                               `json:"provider_id"`
-	Settlement         GatewaySettlement                 `json:"settlement"`
-	Facts              map[string]any                    `json:"facts"`
+	Accepted     bool              `json:"accepted"`
+	ProviderType int               `json:"provider_type"`
+	ChannelID    int               `json:"channel_id"`
+	ProviderID   int               `json:"provider_id"`
+	Settlement   GatewaySettlement `json:"settlement"`
+	Facts        map[string]any    `json:"facts"`
+	// RetainedFacts are submission facts enforced by the host's effective
+	// Channel parameters. They remain source facts when a completion report is
+	// missing, unlike quantities copied from the client's request budget.
+	RetainedFacts      map[string]any                    `json:"retained_facts,omitempty"`
 	CompletionFacts    map[string]any                    `json:"completion_facts,omitempty"`
+	CompletionUnknown  bool                              `json:"completion_unknown,omitempty"`
 	Stream             *TaskStreamFacts                  `json:"stream,omitempty"`
 	PreviousAttempts   []GatewayAttempt                  `json:"previous_attempts,omitempty"`
 	SaleSource         money.Amount                      `json:"sale_source"`

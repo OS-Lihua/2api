@@ -111,6 +111,11 @@ func sweepTimedOutTasks(ctx context.Context) {
 		} else {
 			task.FailReason = reason
 		}
+		if task.PrivateData.Gateway != nil {
+			// Timeout has no completion observation. Keep the submission estimates
+			// distinct from an explicit Provider failure or an actual completion.
+			task.PrivateData.Gateway.CompletionUnknown = true
+		}
 
 		won, err := task.UpdateWithStatus(oldStatus)
 		if err != nil {
@@ -456,6 +461,7 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		terminalTransition := isDone && snap.Status != task.Status
 		if terminalTransition && task.PrivateData.Gateway != nil {
 			task.PrivateData.Gateway.CompletionFacts = responseItem.TaskInfo.UsageFacts
+			task.PrivateData.Gateway.CompletionUnknown = responseItem.TaskInfo.UsageFactsUnknown
 		}
 		won, updateErr := task.UpdateWithStatus(snap.Status)
 		if updateErr != nil {
@@ -719,6 +725,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	if isDone && snap.Status != task.Status {
 		if task.PrivateData.Gateway != nil {
 			task.PrivateData.Gateway.CompletionFacts = taskResult.UsageFacts
+			task.PrivateData.Gateway.CompletionUnknown = taskResult.UsageFactsUnknown
 		}
 		won, err := task.UpdateWithStatus(snap.Status)
 		if err != nil {
@@ -747,6 +754,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 // finalizeTerminalTask 终态统一收尾（状态 CAS 赢家调用，恰好一次）：采样 + 结算 + 失败兜底退款。
 func finalizeTerminalTask(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, taskResult *relaycommon.TaskInfo) {
 	perfmetrics.RecordTaskResult(task, taskResult)
+	if task.PrivateData.Gateway != nil && taskResult != nil {
+		task.PrivateData.Gateway.CompletionUnknown = taskResult.UsageFactsUnknown
+	}
 	if task.PrivateData.Gateway != nil {
 		if err := SettleGatewayTask(ctx, task); err != nil {
 			logger.LogError(ctx, "Gateway task settlement remains pending for task "+task.TaskID)

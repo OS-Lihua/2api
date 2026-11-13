@@ -1084,7 +1084,9 @@ export function extractUsageOnComplete(task, taskResult, body) {
   const usage = body.usage || {};
   let tokens = Number(usage.completion_tokens);
   if (!Number.isFinite(tokens) || tokens <= 0) tokens = Number(usage.total_tokens);
-  if (Number.isFinite(tokens) && tokens > 0) facts.tokens = tokens;
+  // A terminal token count the Provider did not report must not settle from
+  // the submitted estimate.
+  facts.tokens = Number.isFinite(tokens) && tokens > 0 ? tokens : null;
   const content = body.content || {};
   const resolution = trimmed(content.resolution || body.resolution).toLowerCase();
   if (videoProfile(task).resolutions.includes(resolution)) facts.resolution = resolution;

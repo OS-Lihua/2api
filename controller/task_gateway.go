@@ -254,7 +254,7 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 			pending.Action = info.Action
 			pending.PrivateData.Key = ""
 			pending.PrivateData.Execution = service.TaskExecutionSnapshotFromContext(c)
-			pending.PrivateData.Gateway = &model.TaskGatewaySnapshot{ProviderType: info.ChannelType, ChannelID: selected.ID, ProviderID: provider.Id, Facts: facts, SaleSource: source, SaleConditions: saleTrace.RequestSnapshot, Settlement: model.GatewaySettlement{Request: *record}}
+			pending.PrivateData.Gateway = &model.TaskGatewaySnapshot{ProviderType: info.ChannelType, ChannelID: selected.ID, ProviderID: provider.Id, Facts: facts, RetainedFacts: candidate.RetainedFacts, SaleSource: source, SaleConditions: saleTrace.RequestSnapshot, Settlement: model.GatewaySettlement{Request: *record}}
 			if err := model.ReserveGatewayTask(record, reserve, source, pending); err != nil {
 				record, pending = nil, nil
 				lastStatus, lastCode = 503, "task_persistence_failed"
@@ -308,7 +308,7 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 				attempt.MemberTier = member.Tier
 			}
 		}
-		snapshot := &model.TaskGatewaySnapshot{ProviderType: info.ChannelType, ChannelID: selected.ID, ProviderID: provider.Id, Facts: facts, SaleSource: saleSource, SaleConditions: pending.PrivateData.Gateway.SaleConditions, PreviousAttempts: append([]model.GatewayAttempt(nil), previousAttempts...), Settlement: model.GatewaySettlement{Request: *record, Attempt: attempt, AttemptTrace: attemptTraces}}
+		snapshot := &model.TaskGatewaySnapshot{ProviderType: info.ChannelType, ChannelID: selected.ID, ProviderID: provider.Id, Facts: facts, RetainedFacts: candidate.RetainedFacts, SaleSource: saleSource, SaleConditions: pending.PrivateData.Gateway.SaleConditions, PreviousAttempts: append([]model.GatewayAttempt(nil), previousAttempts...), Settlement: model.GatewaySettlement{Request: *record, Attempt: attempt, AttemptTrace: attemptTraces}}
 		pending.ChannelId = info.ChannelId
 		pending.Platform = constant.TaskPlatform(candidate.Plugin.Meta.Key)
 		pending.Action = info.Action
@@ -469,6 +469,7 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 			pending.Progress = parsed.Immediate.Progress
 			pending.FinishTime = clock.Now().Unix()
 			snapshot.CompletionFacts = parsed.Immediate.UsageFacts
+			snapshot.CompletionUnknown = parsed.Immediate.UsageFactsUnknown
 			snapshot.Stream = parsed.Stream
 			if pending.Status == model.TaskStatusFailure {
 				pending.FailReason = "Task failed"

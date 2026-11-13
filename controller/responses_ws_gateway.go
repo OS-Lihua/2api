@@ -91,8 +91,8 @@ func runRealtimeTransportAttempt(c *gin.Context, call *relay.ResponsesWSCall, ru
 	}
 	call.Native.ConnectionReady = func() {
 		stopProbe()
-		budget.Handoff()
 		selection.Permit.Disarm()
+		budget.Handoff()
 		_ = service.ChannelHealth.Release(context.WithoutCancel(ctx), selection.Admission)
 		_ = selection.Permit.Release(context.WithoutCancel(ctx), true, 0)
 	}
@@ -102,7 +102,17 @@ func runRealtimeTransportAttempt(c *gin.Context, call *relay.ResponsesWSCall, ru
 	c.Request = parent
 	result.TransportAttempt, result.Established = true, call.Established()
 	if call.Established() {
+		if errors.Is(context.Cause(ctx), service.ErrGatewayPermitLost) {
+			run.nativeError = types.NewError(service.ErrGatewayPermitLost, types.ErrorCodeDoRequestFailed)
+			run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
+		}
 		result.Failure.Class = "connection_established"
+		return
+	}
+	if errors.Is(context.Cause(ctx), service.ErrGatewayPermitLost) {
+		result.LocalRejection = true
+		result.Failure = service.GatewayFailure{Class: "channel_unavailable", Switch: true, ExcludeProvider: true}
+		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
 		return
 	}
 	status, code, errorType := prepared.HandshakeStatus(), "", ""
@@ -306,7 +316,11 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	}
 	attemptContext, err := info.BeginProviderCall()
 	if err != nil {
-		run.fail(c, http.StatusServiceUnavailable, "budget_exhausted", "Upstream request failed")
+		code := "budget_exhausted"
+		if errors.Is(err, service.ErrGatewayPermitLost) {
+			code = "channel_unavailable"
+		}
+		run.fail(c, http.StatusServiceUnavailable, code, "Upstream request failed")
 		return
 	}
 	// Credential locking is preparation. Freeze purchase facts after it, and

@@ -1187,6 +1187,8 @@ func TestAsyncTaskUnknownSubmissionCannotStarvePollingOrTimeouts(t *testing.T) {
 			require.NoError(t, model.DB.First(&refreshed, known.ID).Error)
 			if expired {
 				assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), refreshed.Status)
+				assert.True(t, refreshed.PrivateData.Gateway.CompletionUnknown)
+				assert.Empty(t, refreshed.PrivateData.Gateway.CompletionFacts)
 				assert.Zero(t, polls.Load())
 			} else {
 				assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), refreshed.Status)
@@ -2221,7 +2223,10 @@ func TestAsyncTaskRouteEnforcesTokenFactsAndOutputModality(t *testing.T) {
 			if tokenLimited {
 				require.NoError(t, model.DB.Model(fixture.channel).Update("tpm", 20).Error)
 				tokenSource = strings.Replace(tokenSource, "return { taskId, taskData: body };", `return {taskId, taskData:body, immediate:{status:"SUCCESS"}};`, 1)
-				tokenSource = strings.Replace(tokenSource, "const data = body || {};", "const data = body || {}; facts.tokens = 0;", 1)
+				// The synthetic completion reports both its duration and the
+				// provider-measured token quantity; the token value is what must
+				// replace the permit forecast.
+				tokenSource = strings.Replace(tokenSource, "const data = body || {};", "const data = body || {}; data.seconds = 4; facts.tokens = 0;", 1)
 				jsplugin.DefaultRegistry = jsplugin.NewRegistry()
 				_, err := jsplugin.DefaultRegistry.RegisterFactory(tokenSource, jsplugin.Options{Key: "sora"})
 				require.NoError(t, err)
@@ -2261,6 +2266,108 @@ func TestAsyncTaskImmediateFailureKeepsReportedProcurement(t *testing.T) {
 	wallet, err := model.GetUserWallet(fixture.user.Id)
 	require.NoError(t, err)
 	assert.EqualValues(t, 1000000000, wallet.Balance.Nanos)
+}
+
+func TestAsyncTaskUnknownCompletionUsageKeepsProcurementPending(t *testing.T) {
+	for _, mode := range []string{"single_invalid", "single_hook_error", "single_nil", "single_empty", "single_missing", "batch_invalid", "batch_missing", "immediate_invalid", "known_purchase"} {
+		t.Run(mode, func(t *testing.T) {
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				result := `{"id":"unknown-usage-job","status":"completed","seconds":-1,"size":"720x1280"}`
+				if mode == "single_nil" || mode == "single_empty" || mode == "single_missing" {
+					result = `{"id":"unknown-usage-job","status":"completed"}`
+				}
+				_, _ = io.WriteString(w, result)
+			})
+			fixture.fake.Advance(time.Second)
+			sale, purchase := `u("size") == "720x1280" ? tier("video", 0.2) : tier("video", 0)`, `tier("video", u("seconds") * 0.05)`
+			knownPurchase := mode == "known_purchase"
+			if knownPurchase {
+				sale, purchase = `tier("video", u("seconds") * 0.1)`, `u("size") == "720x1280" ? tier("video", 0.2) : tier("video", 0)`
+			}
+			for _, price := range []*model.PriceVersion{
+				{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: sale, EffectiveAt: clock.Now().Unix()},
+				{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: purchase, EffectiveAt: clock.Now().Unix()},
+			} {
+				require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+			}
+			source, err := plugins.Source("sora")
+			require.NoError(t, err)
+			switch mode {
+			case "single_hook_error":
+				source = strings.Replace(source, "export function extractUsageOnComplete(task, taskResult, body) {", "export function extractUsageOnComplete(task, taskResult, body) { throw new Error(\"injected completion rejection\");", 1)
+			case "single_nil", "single_empty":
+				source = strings.Replace(source, "export function extractUsageOnComplete(task, taskResult, body) {", "export function extractUsageOnComplete(task, taskResult, body) { return "+map[string]string{"single_nil": "null", "single_empty": "{}"}[mode]+";", 1)
+			case "single_missing":
+			case "batch_invalid", "batch_missing":
+				source = strings.Replace(source, `fetchMode: "per_task"`, `fetchMode: "batch"`, 1)
+				data := "body"
+				if mode == "batch_missing" {
+					data = "null"
+				}
+				source += "\nexport function buildBatchQueryRequest(ctx){return {url:ctx.baseUrl+\"/v1/videos/\"+ctx.tasks[0].taskId};}\nexport function parseBatchResult(ctx,body){return [{taskId:ctx.tasks[0].taskId,status:\"SUCCESS\",data:" + data + "}];}\n"
+			case "immediate_invalid":
+				source = strings.Replace(source, "return { taskId, taskData: body };", `return {taskId, taskData:body, immediate:{status:"SUCCESS"}};`, 1)
+			}
+			jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+			_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "sora"})
+			require.NoError(t, err)
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			if mode != "immediate_invalid" {
+				service.RunTaskPollingOnce(t.Context(), nil)
+			}
+			var task model.Task
+			require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
+			assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status, "billing reconciliation must not overwrite Provider delivery")
+			assert.True(t, task.PrivateData.Gateway.CompletionUnknown)
+			request, err := model.GetGatewayRequest(t.Context(), task.PrivateData.Gateway.Settlement.Request.ID, fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, "settlement_pending", request.Status)
+			assert.Equal(t, knownPurchase, request.SalePending)
+			expectedSale, expectedCost := int64(180000000), int64(0)
+			expectedWallet := int64(820000000)
+			if knownPurchase {
+				expectedSale, expectedCost, expectedWallet = 0, 200000000, 640000000
+			}
+			assert.Equal(t, expectedSale, request.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), request.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, !knownPurchase, attempts[0].CostPending)
+			assert.Equal(t, !knownPurchase, attempts[0].ConvertedCostPending)
+			assert.Equal(t, expectedCost, attempts[0].Cost.Nanos)
+			assert.Equal(t, expectedCost, attempts[0].ConvertedCost.Nanos)
+			var billing model.GatewayBilling
+			require.NoError(t, model.DB.Where("request_id = ?", request.ID).Take(&billing).Error)
+			assert.Equal(t, "evaluation_failed", billing.Phase)
+			_, err = service.RecoverGatewayTasks(t.Context(), 10)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "requires reconciliation")
+			var payable model.Wallet
+			require.NoError(t, model.DB.Where("account_type = ? AND owner_id = ? AND balance_currency = ?", model.LedgerAccountProviderPayable, fixture.channel.ProviderID, "USD").Take(&payable).Error)
+			var payableEntries int64
+			if !knownPurchase {
+				assert.Zero(t, payable.Balance.Nanos)
+			} else {
+				assert.Equal(t, expectedCost, payable.Balance.Nanos)
+				payableEntries = 1
+			}
+			var entries int64
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id = ? AND account_type = ?", request.ID, model.LedgerAccountProviderPayable).Count(&entries).Error)
+			assert.Equal(t, payableEntries, entries, "only a known original-currency procurement may become a payable posting")
+			_, err = service.RecoverGatewayTasks(t.Context(), 10)
+			assert.ErrorIs(t, err, model.ErrGatewayEvaluationPending)
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, expectedWallet, wallet.Balance.Nanos)
+			if knownPurchase {
+				var charge int64
+				require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id = ? AND type = ? AND account_type IN ?", request.ID, model.LedgerEntryCharge, []model.LedgerAccountType{model.LedgerAccountUserWallet, model.LedgerAccountPlatformRevenue}).Count(&charge).Error)
+				assert.Zero(t, charge, "unknown sale retains the reservation and cannot recognize revenue")
+			}
+		})
+	}
 }
 
 func TestAsyncTaskChargedXaiFailureDoesNotChargeUser(t *testing.T) {
@@ -2861,35 +2968,40 @@ func TestAsyncTaskModelFallbackFinalTierDeterminesStatus(t *testing.T) {
 }
 
 func TestAsyncTaskChannelOverridesChangeWireAndBillingFacts(t *testing.T) {
-	for _, path := range []string{"/v1/tasks/sora", "/v1/videos"} {
-		t.Run(path, func(t *testing.T) {
-			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				if r.Method == http.MethodGet {
-					_, _ = w.Write([]byte(`{"id":"override-job","status":"completed"}`))
-					return
-				}
-				var body map[string]any
-				require.NoError(t, common.DecodeJson(r.Body, &body))
-				assert.Equal(t, "8", body["seconds"])
-				_, _ = w.Write([]byte(`{"id":"override-job","status":"queued"}`))
+	for _, override := range []struct{ name, value string }{
+		{"top-level", `{"seconds":"8"}`},
+		{"operations", `{"operations":[{"path":"seconds","mode":"set","value":"8"}]}`},
+	} {
+		for _, path := range []string{"/v1/tasks/sora", "/v1/videos"} {
+			t.Run(override.name+path, func(t *testing.T) {
+				fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					if r.Method == http.MethodGet {
+						_, _ = w.Write([]byte(`{"id":"override-job","status":"completed"}`))
+						return
+					}
+					var body map[string]any
+					require.NoError(t, common.DecodeJson(r.Body, &body))
+					assert.Equal(t, "8", body["seconds"])
+					_, _ = w.Write([]byte(`{"id":"override-job","status":"queued"}`))
+				})
+				require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", override.value).Error)
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+				require.Equal(t, 200, response.Code, response.Body.String())
+				var task model.Task
+				require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
+				assert.EqualValues(t, 8, task.PrivateData.Gateway.Facts["seconds"])
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.EqualValues(t, 280000000, wallet.Balance.Nanos)
+				service.RunTaskPollingOnce(t.Context(), nil)
+				requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, total)
+				assert.EqualValues(t, 720000000, requests[0].Receivable.Nanos)
+				assert.Equal(t, "estimated", requests[0].UsageSource)
 			})
-			require.NoError(t, model.DB.Model(fixture.channel).Update("parameter_overrides", `{"seconds":"8"}`).Error)
-			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
-			require.Equal(t, 200, response.Code, response.Body.String())
-			var task model.Task
-			require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
-			assert.EqualValues(t, 8, task.PrivateData.Gateway.Facts["seconds"])
-			wallet, err := model.GetUserWallet(fixture.user.Id)
-			require.NoError(t, err)
-			assert.EqualValues(t, 280000000, wallet.Balance.Nanos)
-			service.RunTaskPollingOnce(t.Context(), nil)
-			requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
-			require.NoError(t, err)
-			require.EqualValues(t, 1, total)
-			assert.EqualValues(t, 720000000, requests[0].Receivable.Nanos)
-			assert.Equal(t, "estimated", requests[0].UsageSource)
-		})
+		}
 	}
 }
 
@@ -3953,6 +4065,7 @@ func TestAsyncTaskNativeStreamHonorsBudgetAndCallerCancellation(t *testing.T) {
 				assert.Equal(t, "partial", intent.Attempt.Status)
 				assert.Equal(t, "channel_unavailable", intent.Attempt.ErrorClass)
 				assert.Positive(t, intent.Attempt.Cost.Nanos)
+				assert.Equal(t, "partial", requests[0].Status, "terminal settlement must retain the accepted attempt's lost lease")
 			}
 		})
 	}

@@ -213,16 +213,22 @@ func ListGatewayRequests(ctx context.Context, filter GatewayRequestFilter, offse
 	if err := pendingQuery.Session(&gorm.Session{}).Count(&pendingTotal).Error; err != nil {
 		return nil, 0, err
 	}
-	logOffset := 0
+	// Keyset pagination keeps a concurrent log write from shifting an offset
+	// page and returning an already listed request.
+	var cursor *GatewayRequest
 	for len(items) < offset+limit {
 		var batch []GatewayRequest
-		if err := query.Session(&gorm.Session{}).Order("started_at DESC, id DESC").Offset(logOffset).Limit(min(1000, offset+limit-len(items))).Find(&batch).Error; err != nil {
+		page := query.Session(&gorm.Session{}).Order("started_at DESC, id DESC").Limit(min(1000, offset+limit-len(items)))
+		if cursor != nil {
+			page = page.Where("started_at < ? OR (started_at = ? AND id < ?)", cursor.StartedAt, cursor.StartedAt, cursor.ID)
+		}
+		if err := page.Find(&batch).Error; err != nil {
 			return nil, 0, err
 		}
 		if len(batch) == 0 {
 			break
 		}
-		logOffset += len(batch)
+		cursor = &batch[len(batch)-1]
 		ids := make([]string, len(batch))
 		for i := range batch {
 			ids[i] = batch[i].ID

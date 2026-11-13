@@ -201,6 +201,9 @@ func (permit *GatewayRoutePermit) Disarm() {
 	}
 	permit.mu.Lock()
 	defer permit.mu.Unlock()
+	if permit.lost && permit.cancel != nil {
+		permit.cancel(ErrGatewayPermitLost)
+	}
 	permit.disarmed = true
 	permit.cancel = nil
 }

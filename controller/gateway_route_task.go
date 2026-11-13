@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -28,13 +29,14 @@ import (
 // gatewayPreparedTask owns only transient candidate inputs. Route chooses once;
 // reserved preparation rebuilds the descriptor before the actual send.
 type gatewayPreparedTask struct {
-	Context    *gin.Context
-	Info       *relaycommon.RelayInfo
-	Adaptor    *taskplugin.TaskAdaptor
-	Facts      map[string]any
-	SaleInput  billingexpr.RequestInput
-	RouteFacts service.GatewayRouteFacts
-	Plugin     *jsplugin.LoadedPlugin
+	Context       *gin.Context
+	Info          *relaycommon.RelayInfo
+	Adaptor       *taskplugin.TaskAdaptor
+	Facts         map[string]any
+	RetainedFacts map[string]any
+	SaleInput     billingexpr.RequestInput
+	RouteFacts    service.GatewayRouteFacts
+	Plugin        *jsplugin.LoadedPlugin
 }
 
 func prepareGatewayTaskRoute(c *gin.Context, selection *service.GatewaySelection, plugin *jsplugin.LoadedPlugin, requested, requestID, publicTaskID string, started time.Time, origins []*model.Task) (*gatewayPreparedTask, error) {
@@ -123,7 +125,10 @@ func prepareGatewayTaskRoute(c *gin.Context, selection *service.GatewaySelection
 	if err := adaptor.DecodeRequestAndSetAction(candidate, info); err != nil {
 		return nil, service.ErrGatewayCapability
 	}
+	var baselineFacts map[string]any
+	var baselineErr error
 	if len(overrides) > 0 {
+		baselineFacts, baselineErr = adaptor.ExtractUsageFactsValidated(candidate, info)
 		body, exists := candidate.Get("task_request")
 		if !exists {
 			value, _ := candidate.Get(jsplugin.ContextKeyRouteRequest)
@@ -187,6 +192,7 @@ func prepareGatewayTaskRoute(c *gin.Context, selection *service.GatewaySelection
 	if err != nil {
 		return nil, service.ErrGatewayCapability
 	}
+	retainedFacts := retainedGatewayTaskFacts(baselineFacts, facts, baselineErr, overrides)
 	if len(origins) > 0 {
 		merged := maps.Clone(origins[0].PrivateData.Gateway.Facts)
 		maps.Copy(merged, facts)
@@ -228,7 +234,39 @@ func prepareGatewayTaskRoute(c *gin.Context, selection *service.GatewaySelection
 		}
 		purchaseInput.Usage = facts
 	}
-	return &gatewayPreparedTask{Plugin: plugin, Context: candidate, Info: info, Adaptor: adaptor, Facts: facts, SaleInput: saleInput, RouteFacts: service.GatewayRouteFacts{SaleInput: saleInput, PurchaseInput: purchaseInput, MoneyInput: &billingexpr.MoneyInput{TaskUsage: true}}}, nil
+	return &gatewayPreparedTask{Plugin: plugin, Context: candidate, Info: info, Adaptor: adaptor, Facts: facts, RetainedFacts: retainedFacts, SaleInput: saleInput, RouteFacts: service.GatewayRouteFacts{SaleInput: saleInput, PurchaseInput: purchaseInput, MoneyInput: &billingexpr.MoneyInput{TaskUsage: true}}}, nil
+}
+
+// retainedGatewayTaskFacts keeps validated facts whose value the Channel's
+// effective parameter overrides established. Comparing extraction before and
+// after the override covers operations-format overrides without treating an
+// unrelated top-level key as evidence for a client-supplied budget. These
+// facts stay source quantities when a later completion report omits the field.
+func retainedGatewayTaskFacts(baseline, effective map[string]any, baselineErr error, overrides map[string]any) map[string]any {
+	if len(overrides) == 0 {
+		return nil
+	}
+	var retained map[string]any
+	for name, value := range effective {
+		switch value.(type) {
+		case string, bool, float64:
+		default:
+			continue
+		}
+		changed := baselineErr == nil && !reflect.DeepEqual(value, baseline[name])
+		enforced := false
+		if override, exists := overrides[name]; exists {
+			enforced = fmt.Sprint(value) == fmt.Sprint(override)
+		}
+		if !changed && !enforced {
+			continue
+		}
+		if retained == nil {
+			retained = make(map[string]any)
+		}
+		retained[name] = value
+	}
+	return retained
 }
 
 // gatewayTaskTokens supplies the same canonical token quantities to Route TPM
