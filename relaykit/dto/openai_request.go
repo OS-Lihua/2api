@@ -1259,6 +1259,7 @@ type Input struct {
 type MediaInput struct {
 	Type     string `json:"type"`
 	Text     string `json:"text,omitempty"`
+	FileID   string `json:"file_id,omitempty"`
 	FileUrl  string `json:"file_url,omitempty"`
 	ImageUrl string `json:"image_url,omitempty"`
 	Detail   string `json:"detail,omitempty"` // 仅 input_image 有效
@@ -1348,7 +1349,9 @@ func (r *OpenAIResponsesRequest) ParseInput() []MediaInput {
 								imageUrl = url
 							}
 						}
-						mediaInputs = append(mediaInputs, MediaInput{Type: "input_image", ImageUrl: imageUrl})
+						detail, _ := item["detail"].(string)
+						fileID, _ := item["file_id"].(string)
+						mediaInputs = append(mediaInputs, MediaInput{Type: "input_image", ImageUrl: imageUrl, Detail: detail, FileID: fileID})
 					case "input_file":
 						// file_url may be string or object with url field
 						var fileUrl string
@@ -1360,7 +1363,11 @@ func (r *OpenAIResponsesRequest) ParseInput() []MediaInput {
 								fileUrl = url
 							}
 						}
-						mediaInputs = append(mediaInputs, MediaInput{Type: "input_file", FileUrl: fileUrl})
+						if fileUrl == "" {
+							fileUrl, _ = item["file_data"].(string)
+						}
+						fileID, _ := item["file_id"].(string)
+						mediaInputs = append(mediaInputs, MediaInput{Type: "input_file", FileUrl: fileUrl, FileID: fileID})
 					}
 				}
 			}

@@ -536,7 +536,8 @@ func TestHTTPResponsesRequestOmitsWebSocketMetadata(t *testing.T) {
 }
 
 func TestBuildResponsesWSErrorPayloadIncludesStatus(t *testing.T) {
-	payload, err := buildResponsesWSErrorPayload("evt_err", "", types.NewErrorWithStatusCode(
+	require.NoError(t, i18n.Init())
+	payload, err := buildResponsesWSErrorPayload(i18n.LangEn, "evt_err", "", types.NewErrorWithStatusCode(
 		errors.New("model is required"),
 		types.ErrorCodeInvalidRequest,
 		http.StatusBadRequest,
@@ -560,10 +561,18 @@ func TestBuildResponsesWSErrorPayloadIncludesStatus(t *testing.T) {
 	if data.Error == nil || data.Error.Code != string(types.ErrorCodeInvalidRequest) {
 		t.Fatalf("unexpected error body: %#v", data.Error)
 	}
+	provider := types.WithOpenAIError(types.OpenAIError{Message: "Unknown Realtime input reference", Type: string(types.ErrorTypeNewAPIError), Code: "provider_code"}, http.StatusBadRequest)
+	payload, err = buildResponsesWSErrorPayload(i18n.LangZhCN, "provider", "", provider)
+	require.NoError(t, err)
+	require.NoError(t, common.Unmarshal(payload, &data))
+	require.NotNil(t, data.Error)
+	assert.Equal(t, "Unknown Realtime input reference", data.Error.Message)
+	assert.Equal(t, "provider_code", data.Error.Code)
 }
 
 func TestResponsesWSInvalidRequestErrorUsesBadRequestStatus(t *testing.T) {
-	payload, err := buildResponsesWSErrorPayload("", "", newResponsesWSInvalidRequestError(errors.New("bad event")))
+	require.NoError(t, i18n.Init())
+	payload, err := buildResponsesWSErrorPayload(i18n.LangEn, "", "", newResponsesWSInvalidRequestError(errors.New("bad event")))
 	if err != nil {
 		t.Fatalf("buildResponsesWSErrorPayload() error = %v", err)
 	}
@@ -612,6 +621,139 @@ func newTestWebSocketPair(t *testing.T) (*websocket.Conn, *websocket.Conn, func(
 	return target, serverConn, cleanup
 }
 
+func TestRealtimeTransportDeduplicatesNativeResponseUsage(t *testing.T) {
+	client, gatewayClient, closeClient := newTestWebSocketPair(t)
+	defer closeClient()
+	gatewayTarget, provider, closeTarget := newTestWebSocketPair(t)
+	defer closeTarget()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime?model=public", nil)
+	info := relaycommon.GenRelayInfoWs(c, gatewayClient)
+	info.ProviderMeta = &relaycommon.ProviderMeta{ApiType: constant.APITypeOpenAI, ChannelType: constant.ChannelTypeOpenAI, UpstreamModelName: "gpt-4o"}
+	info.TargetWs = gatewayTarget
+	info.TokenizerModel = "gpt-4o"
+	info.UsePrice = true // The legacy transport fixture must not access quota storage.
+	info.ResponseFacts = &relaycommon.ResponseFacts{}
+	type outcome struct {
+		usage *dto.RealtimeUsage
+		err   *types.NewAPIError
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		adaptor := GetAdaptor(constant.APITypeOpenAI)
+		adaptor.Init(info)
+		usage, err := adaptor.DoResponse(c, nil, info)
+		converted, _ := usage.(*dto.RealtimeUsage)
+		done <- outcome{converted, err}
+	}()
+	events := []string{
+		`{"type":"response.output_text.delta","response_id":"a","delta":"hello"}`,
+		`{"type":"response.done","response":{"id":"a","status":"completed","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"input_token_details":{"text_tokens":6,"audio_tokens":4,"cached_tokens":3},"output_token_details":{"text_tokens":1,"audio_tokens":1}}}}`,
+		`{"type":"response.done","response":{"id":"a","status":"completed","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}`,
+		`{"type":"response.done","response":{"id":"b","status":"completed","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`,
+	}
+	for _, event := range events {
+		require.NoError(t, provider.WriteMessage(websocket.TextMessage, []byte(event)))
+	}
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+	for range len(events) {
+		_, _, err := client.ReadMessage()
+		require.NoError(t, err)
+	}
+	require.NoError(t, provider.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second)))
+	select {
+	case result := <-done:
+		require.Nil(t, result.err)
+		require.NotNil(t, result.usage)
+		assert.Equal(t, 10, result.usage.InputTokens)
+		assert.Equal(t, 2, result.usage.OutputTokens)
+		assert.Equal(t, 4, result.usage.InputTokenDetails.AudioTokens)
+		assert.Equal(t, 3, result.usage.InputTokenDetails.CachedTokens)
+		assert.Equal(t, 1, result.usage.OutputTokenDetails.AudioTokens)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Realtime transport did not stop")
+	}
+}
+
+func TestResponsesWSGatewayTransportKeepsOneConnection(t *testing.T) {
+	var connections atomic.Int32
+	upstreamDone := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if !assert.NoError(t, err) {
+			return
+		}
+		connections.Add(1)
+		defer peer.Close()
+		defer close(upstreamDone)
+		_, _, err = peer.ReadMessage()
+		if !assert.NoError(t, err) {
+			return
+		}
+		_ = peer.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"first","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`))
+		_, _, _ = peer.ReadMessage()
+	}))
+	defer upstream.Close()
+	client, server, cleanup := newTestWebSocketPair(t)
+	defer cleanup()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	results := make(chan *dto.Usage, 1)
+	done := make(chan struct{})
+	runner := func(request *http.Request, _ string, handle func(*gin.Context) *types.NewAPIError) *types.NewAPIError {
+		requestContext, _ := gin.CreateTestContext(httptest.NewRecorder())
+		requestContext.Request = request
+		return handle(requestContext)
+	}
+	go func() {
+		defer close(done)
+		ResponsesWebSocketHelper(c, server, runner, func(c *gin.Context, call *ResponsesWSCall) (bool, *types.NewAPIError) {
+			info := &relaycommon.RelayInfo{RelayMode: relayconstant.RelayModeResponses, RequestURLPath: "/v1/responses", ResponseFacts: &relaycommon.ResponseFacts{},
+				ProviderMeta: &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeOpenAI, ApiType: constant.APITypeOpenAI, ChannelBaseUrl: upstream.URL, UpstreamModelName: "native", ApiKey: "provider-secret"}}
+			prepared, err := call.Prepare(c, info)
+			if err != nil {
+				return true, newResponsesWSInvalidRequestError(err)
+			}
+			payload, err := call.CreatePayload([]byte(`{"model":"native","input":"hi"}`))
+			if err != nil {
+				return true, newResponsesWSInvalidRequestError(err)
+			}
+			channelID := 10
+			if call.LockedChannelID != 0 {
+				channelID = 11
+			}
+			usage, apiErr := call.Exchange(c, info, channelID, 20, prepared, payload)
+			if apiErr == nil {
+				results <- usage
+			}
+			return true, apiErr
+		})
+	}()
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"public","input":"hi"}`)))
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, raw, err := client.ReadMessage()
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"id":"first"`)
+	usage := <-results
+	assert.Zero(t, usage.TotalTokens)
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"public","input":"next"}`)))
+	_, raw, err = client.ReadMessage()
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), "upstream connection identity changed")
+	require.NoError(t, client.Close())
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("gateway did not stop")
+	}
+	select {
+	case <-upstreamDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream did not stop")
+	}
+	assert.Equal(t, int32(1), connections.Load())
+}
+
 func TestResponsesWSMessageSizeLimit(t *testing.T) {
 	previous := constant.MaxRequestBodyMB
 	constant.MaxRequestBodyMB = 1
@@ -646,7 +788,7 @@ func TestResponsesWSShutdownInterruptsBusyWriter(t *testing.T) {
 	defer cleanupClient()
 	target, peer, cleanupTarget := newTestWebSocketPair(t)
 	defer cleanupTarget()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancelCause(context.Background())
 	s := &responsesWSSession{ctx: ctx, cancel: cancel, client: server, target: target}
 	// Blocked network writers own these locks. Shutdown must not wait for
 	// them: its close frames are bounded control writes, and closing the

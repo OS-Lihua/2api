@@ -10,7 +10,7 @@ import (
 )
 
 func (p *Provider) ComposeProtocol(kind protocol.Type, generic channel.ProtocolHandler) (channel.ProtocolHandler, error) {
-	if kind == protocol.GeminiEmbed {
+	if kind == protocol.GeminiEmbed || kind == protocol.OpenAIRealtime {
 		return generic, nil
 	}
 	if channel.IsNonTextProtocol(kind) {

@@ -69,6 +69,7 @@ export function AttemptsDrawer(props: {
       'attempts',
       page,
     ],
+    refetchOnMount: 'always',
     queryFn: ({ signal }) =>
       getRequestAttempts(props.scope, props.request.id, page, signal),
   })

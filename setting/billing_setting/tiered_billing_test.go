@@ -109,3 +109,32 @@ func TestSmokeTestExprRejectsTaskUsageWithoutSchema(t *testing.T) {
 
 	require.NoError(t, SmokeTestExpr(`tier("base", p * 2 + c * 8)`))
 }
+
+func TestSmokeTestTaskMoneyExprUsesExactNumericSemantics(t *testing.T) {
+	schema := map[string]jsplugin.UsageFieldSchema{"seconds": {Type: "number", Unit: "second"}}
+	tests := []struct {
+		name       string
+		expression string
+		invalid    bool
+	}{
+		{"precise comparison", `0.100000000000000001 > 0.1 ? tier("valid", u("seconds") * 0.1) : tier("unreachable", -1)`, false},
+		{"exact cancellation", `tier("valid", 0.3 - 0.2 - 0.1 + u("seconds") * 0.1)`, false},
+		{"negative precise branch", `0.100000000000000001 > 0.1 ? tier("negative", -1) : tier("unreachable", u("seconds") * 0.1)`, true},
+		{"negative usage boundary", `tier("negative", u("seconds") * 0.1 - 0.000000001)`, true},
+		{"undeclared skipped fact", `true ? tier("valid", u("seconds") * 0.1) : tier("invalid", u("unknown"))`, true},
+		{"undeclared folded and fact", `(false && u("unknown") > 0) ? tier("unused", 1) : tier("valid", u("seconds") * 0.1)`, true},
+		{"undeclared folded or fact", `(true || u("unknown") > 0) ? tier("valid", u("seconds") * 0.1) : tier("unused", 1)`, true},
+		{"declared folded fact", `(false && u("seconds") > 0) ? tier("unused", 1) : tier("valid", u("seconds") * 0.1)`, false},
+		{"fixed price remains forbidden", `tier("invalid", fixed(0.1))`, true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := SmokeTestTaskMoneyExpr(test.expression, schema)
+			if test.invalid {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}

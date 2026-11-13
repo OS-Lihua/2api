@@ -9,8 +9,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/pkg/capability"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -132,6 +134,117 @@ func ExceedsMaxTokensLimit(values ...*uint) bool {
 		}
 	}
 	return false
+}
+
+type requestParameterError struct{ path, reason string }
+
+func (err *requestParameterError) Error() string         { return err.reason }
+func (err *requestParameterError) ParameterPath() string { return err.path }
+
+// Realtime accepts integer output budgets from 1 through 4096, or "inf".
+// https://github.com/openai/openai-python/blob/a1175a35ba6aa2d6bf98d26088a572ab0c5f4453/src/openai/types/realtime/realtime_response_create_params.py
+const RealtimeMaxOutputTokens = 4096
+
+// ValidateRealtimeMultipliers accepts the native infinity sentinel while keeping
+// all numeric and compatible-container limits behind the shared token guard.
+func ValidateRealtimeMultipliers(body []byte) error {
+	document := ojson.NewDoc(append([]byte(nil), body...))
+	for _, prefix := range []string{"", "parameters."} {
+		for _, field := range []string{"max_output_tokens", "max_response_output_tokens"} {
+			path := prefix + field
+			value := ojson.GetBytes(body, path)
+			if !value.Exists() || value.Type == ojson.Null {
+				continue
+			}
+			if value.Type == ojson.String && value.String() == "inf" {
+				if err := document.Delete(path); err != nil {
+					return err
+				}
+				continue
+			}
+			var count uint
+			if common.UnmarshalJsonStr(value.Raw, &count) != nil || count < 1 || count > RealtimeMaxOutputTokens || ExceedsMaxTokensLimit(&count) {
+				return &requestParameterError{path: path, reason: fmt.Sprintf("%s must be an integer between 1 and 4096 or inf", path)}
+			}
+		}
+	}
+	return ValidateResponsesMultipliers(document.Bytes())
+}
+
+// NormalizeRealtimeRequestLimits bounds the effective native request before
+// Provider I/O. Infinity remains a budget and never becomes observed usage.
+func NormalizeRealtimeRequestLimits(body []byte, caps capability.Set, inputTokens int) ([]byte, error) {
+	if err := ValidateRealtimeMultipliers(body); err != nil {
+		return nil, err
+	}
+	limit := int64(RealtimeMaxOutputTokens)
+	if maximum := caps.Limits.MaxOutputTokens; maximum != nil {
+		limit = min(limit, *maximum)
+	}
+	if contextLength := caps.Limits.ContextLength; contextLength != nil {
+		limit = min(limit, *contextLength-int64(inputTokens))
+	}
+	if limit < 1 {
+		return nil, &requestParameterError{path: "input", reason: "Realtime context limit exceeded"}
+	}
+	document := ojson.NewDoc(append([]byte(nil), body...))
+	for _, prefix := range []string{"", "parameters."} {
+		for _, field := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens", "max_response_output_tokens", "min_tokens"} {
+			path := prefix + field
+			value := ojson.GetBytes(body, path)
+			if !value.Exists() || value.Type == ojson.Null {
+				continue
+			}
+			if value.Type == ojson.String && value.String() == "inf" {
+				if err := document.Set(path, limit); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			var count uint
+			if common.UnmarshalJsonStr(value.Raw, &count) != nil || count > uint(limit) {
+				return nil, &requestParameterError{path: path, reason: fmt.Sprintf("%s exceeds the connection output limit", path)}
+			}
+		}
+	}
+	if value := ojson.GetBytes(body, "max_output_tokens"); !value.Exists() || value.Type == ojson.Null {
+		if err := document.Set("max_output_tokens", limit); err != nil {
+			return nil, err
+		}
+	}
+	return document.Bytes(), nil
+}
+
+// ValidateResponsesMultipliers bounds compatible passthrough token limits too.
+// Responses has one output response; a vendor n>1 cannot silently multiply it.
+func ValidateResponsesMultipliers(body []byte) error {
+	var envelope struct{}
+	if common.Unmarshal(body, &envelope) != nil || !ojson.ParseBytes(body).IsObject() {
+		return &requestParameterError{path: "request", reason: "Invalid JSON request body"}
+	}
+	if container := ojson.GetBytes(body, "parameters"); container.Exists() && container.Type != ojson.Null && !container.IsObject() {
+		return &requestParameterError{path: "parameters", reason: "parameters must be an object"}
+	}
+	for _, prefix := range []string{"", "parameters."} {
+		if value := ojson.GetBytes(body, prefix+"n"); value.Exists() && value.Type != ojson.Null {
+			var count int
+			if common.UnmarshalJsonStr(value.Raw, &count) != nil || count != 1 {
+				return &requestParameterError{path: prefix + "n", reason: prefix + "n must be 1 for Responses"}
+			}
+		}
+		for _, field := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens", "min_tokens"} {
+			path := prefix + field
+			value := ojson.GetBytes(body, path)
+			if !value.Exists() || value.Type == ojson.Null {
+				continue
+			}
+			var count uint
+			if common.UnmarshalJsonStr(value.Raw, &count) != nil || ExceedsMaxTokensLimit(&count) {
+				return &requestParameterError{path: path, reason: prefix + "max_tokens is invalid"}
+			}
+		}
+	}
+	return nil
 }
 
 func GetAndValidateResponsesRequest(c *gin.Context) (*dto.OpenAIResponsesRequest, error) {

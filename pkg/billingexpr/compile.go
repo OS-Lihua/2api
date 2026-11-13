@@ -120,10 +120,12 @@ type cachedEntry struct {
 	fixedPricing  bool
 	fixedOnly     bool
 
-	moneyOnce         sync.Once
-	moneyProgram      *vm.Program
-	moneyRequestRules []MoneyRequestRuleTrace
-	moneyErr          error
+	moneyOnce             sync.Once
+	moneyProgram          *vm.Program
+	moneyRequestRules     []MoneyRequestRuleTrace
+	moneyErr              error
+	moneySnapshotPrograms map[string]*vm.Program
+	moneySnapshotErr      error
 }
 
 var (
@@ -288,7 +290,7 @@ func compileEntry(exprStr string) (*cachedEntry, error) {
 		prog:          prog,
 		usedVars:      extractUsedVars(prog),
 		sourceVars:    sourceVars,
-		usedUsageKeys: extractUsedUsageKeys(prog),
+		usedUsageKeys: extractUsedUsageKeys(tree.Node),
 		requestRules:  patcher.requestRules,
 		version:       version,
 		fixedPricing:  fixedPricing,
@@ -330,9 +332,9 @@ func extractUsedVars(prog *vm.Program) map[string]bool {
 	return vars
 }
 
-func extractUsedUsageKeys(prog *vm.Program) map[string]bool {
+func extractUsedUsageKeys(root ast.Node) map[string]bool {
 	keys := make(map[string]bool)
-	ast.Find(prog.Node(), func(node ast.Node) bool {
+	ast.Find(root, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallNode)
 		if !ok || len(call.Arguments) != 1 {
 			return false

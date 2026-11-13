@@ -10,8 +10,10 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/money"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"gorm.io/gorm"
 )
 
 type TaskStatus string
@@ -109,9 +111,10 @@ func (m Properties) Value() (driver.Value, error) {
 }
 
 type TaskPrivateData struct {
-	Key            string `json:"key,omitempty"`
-	UpstreamTaskID string `json:"upstream_task_id,omitempty"` // 上游真实 task ID
-	ResultURL      string `json:"result_url,omitempty"`       // 任务成功后的结果 URL（视频地址等）
+	Gateway        *TaskGatewaySnapshot `json:"gateway,omitempty"`
+	Key            string               `json:"key,omitempty"`
+	UpstreamTaskID string               `json:"upstream_task_id,omitempty"` // 上游真实 task ID
+	ResultURL      string               `json:"result_url,omitempty"`       // 任务成功后的结果 URL（视频地址等）
 	// Execution records safe, immutable request provenance. It lives next to
 	// other private task state so public task DTOs cannot expose it by accident.
 	Execution *TaskExecutionSnapshot `json:"execution,omitempty"`
@@ -136,6 +139,37 @@ type TaskPrivateData struct {
 	// and every retrieval surface treats the task as not found. The zero
 	// value keeps historical rows retained and retrievable.
 	ResultDiscarded bool `json:"result_discarded,omitempty"`
+}
+
+// TaskStreamFacts retains bounded quantitative delivery receipts independently
+// of source completion. It never contains response payloads.
+type TaskStreamFacts struct {
+	Delivered      map[string]any `json:"delivered,omitempty"`
+	BusinessOutput bool           `json:"business_output"`
+	DeliveryFailed bool           `json:"delivery_failed,omitempty"`
+	Incomplete     bool           `json:"incomplete,omitempty"`
+}
+
+// TaskGatewaySnapshot freezes the accepted Channel and quantitative billing
+// facts. Request bodies, credentials, and generated content stay out of it.
+type TaskGatewaySnapshot struct {
+	Accepted     bool              `json:"accepted"`
+	ProviderType int               `json:"provider_type"`
+	ChannelID    int               `json:"channel_id"`
+	ProviderID   int               `json:"provider_id"`
+	Settlement   GatewaySettlement `json:"settlement"`
+	Facts        map[string]any    `json:"facts"`
+	// RetainedFacts are submission facts enforced by the host's effective
+	// Channel parameters. They remain source facts when a completion report is
+	// missing, unlike quantities copied from the client's request budget.
+	RetainedFacts      map[string]any                    `json:"retained_facts,omitempty"`
+	CompletionFacts    map[string]any                    `json:"completion_facts,omitempty"`
+	CompletionUnknown  bool                              `json:"completion_unknown,omitempty"`
+	Stream             *TaskStreamFacts                  `json:"stream,omitempty"`
+	PreviousAttempts   []GatewayAttempt                  `json:"previous_attempts,omitempty"`
+	SaleSource         money.Amount                      `json:"sale_source"`
+	SaleConditions     *billingexpr.MoneyRequestSnapshot `json:"sale_conditions,omitempty"`
+	PurchaseConditions *billingexpr.MoneyRequestSnapshot `json:"purchase_conditions,omitempty"`
 }
 
 type TaskExecutionSnapshot struct {
@@ -214,7 +248,7 @@ func (p TaskPrivateData) Value() (driver.Value, error) {
 		p.Execution == nil && p.BillingSource == "" && p.SubscriptionId == 0 &&
 		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil &&
 		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 &&
-		!p.ResultDiscarded {
+		!p.ResultDiscarded && p.Gateway == nil {
 		return nil, nil
 	}
 	// 同 Properties.Value:string 避免 PG simple protocol 的 bytea 编码。
@@ -363,12 +397,17 @@ func TaskGetAllTasks(startIdx int, num int, queryParams SyncTaskQueryParams) []*
 	return tasks
 }
 
+func pollableUnfinishedTasks() *gorm.DB {
+	return DB.Model(&Task{}).Where("progress != ?", "100%").
+		Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess}).
+		Where(`(("private_data"->>'gateway') IS NULL OR "private_data"->'gateway'->>'accepted' = ?)`, "true")
+}
+
 func GetTimedOutUnfinishedTasks(cutoffUnix int64, limit int) []*Task {
 	var tasks []*Task
-	err := DB.Where("progress != ?", "100%").
-		Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess}).
+	err := pollableUnfinishedTasks().
 		Where("submit_time < ?", cutoffUnix).
-		Order("submit_time").
+		Order("submit_time, id").
 		Limit(limit).
 		Find(&tasks).Error
 	if err != nil {
@@ -381,7 +420,7 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 	var tasks []*Task
 	var err error
 	// get all tasks progress is not 100%
-	err = DB.Where("progress != ?", "100%").Where("status != ?", TaskStatusFailure).Where("status != ?", TaskStatusSuccess).Limit(limit).Order("id").Find(&tasks).Error
+	err = pollableUnfinishedTasks().Limit(limit).Order("id").Find(&tasks).Error
 	if err != nil {
 		return nil
 	}
@@ -394,13 +433,21 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 // the scheduler skips creating a row entirely.
 func HasUnfinishedSyncTasks() bool {
 	var id int64
-	err := DB.Model(&Task{}).
-		Where("progress != ?", "100%").
-		Where("status != ?", TaskStatusFailure).
-		Where("status != ?", TaskStatusSuccess).
+	err := pollableUnfinishedTasks().
 		Limit(1).
 		Pluck("id", &id).Error
 	return err == nil && id != 0
+}
+
+// RecoverableGatewayTasks returns terminal tasks whose primary billing intent
+// still needs preparation or posting after a process restart.
+func RecoverableGatewayTasks(ctx context.Context, limit int) ([]Task, error) {
+	var tasks []Task
+	err := DB.WithContext(ctx).Model(&Task{}).
+		Joins(`JOIN "gateway_billings" ON "gateway_billings"."request_id" = "tasks"."private_data"->'gateway'->'settlement'->'request'->>'id'`).
+		Where(`"gateway_billings"."phase" <> ?`, "settled").
+		Order(`"gateway_billings"."updated_at", "gateway_billings"."request_id"`).Limit(limit).Find(&tasks).Error
+	return tasks, err
 }
 
 func GetByOnlyTaskId(taskId string) (*Task, bool, error) {
@@ -533,6 +580,15 @@ func (t *Task) Snapshot() taskSnapshot {
 		PluginState:  t.PrivateData.PluginState,
 		PollFailures: t.PrivateData.PollFailures,
 	}
+}
+
+// BeforeSave excludes a discarded response from both task creation and later
+// updates. The in-memory data remains available for its one-time response.
+func (t *Task) BeforeSave(tx *gorm.DB) error {
+	if t.PrivateData.ResultDiscarded {
+		tx.Statement.Omits = append(tx.Statement.Omits, "data")
+	}
+	return nil
 }
 
 func (Task *Task) Update() error {

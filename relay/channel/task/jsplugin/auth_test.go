@@ -131,7 +131,7 @@ export function buildContentRequest(ctx){return {url:ctx.baseUrl+"/content/"+ctx
 			submit := adaptor.submitContext(c, info)
 			query, err := adaptor.queryContext(task, tc.key, base, "")
 			require.NoError(t, err)
-			batch, err := adaptor.batchQueryContext(tc.key, base, "", nil)
+			batch, err := adaptor.batchQueryContext(context.Background(), tc.key, base, "", nil)
 			require.NoError(t, err)
 			assert.NotContains(t, submit, "authError")
 			for name, ctx := range map[string]map[string]any{"submit": submit, "query": query, "batch": batch} {

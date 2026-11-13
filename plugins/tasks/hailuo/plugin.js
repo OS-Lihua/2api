@@ -78,7 +78,13 @@ const H3_METADATA_FIELDS = ["aigc_watermark"];
 // with the code in base_resp.
 const V1_ERROR_CODES = { 400: 2013, 401: 1004, 403: 1004, 404: 2013, 413: 2013, 429: 1002 };
 // The /v2 error types by HTTP status.
-const V2_ERROR_TYPES = { 401: "authorized_error", 402: "insufficient_balance_error", 403: "authorized_error", 422: "unprocessable_entity_error", 429: "rate_limit_error" };
+const V2_ERROR_TYPES = {
+  401: "authorized_error",
+  402: "insufficient_balance_error",
+  403: "authorized_error",
+  422: "unprocessable_entity_error",
+  429: "rate_limit_error",
+};
 
 export const meta = {
   apiVersion: 1,
@@ -89,7 +95,7 @@ export const meta = {
     en: "MiniMax Hailuo video generation (text-to-video, image-to-video, and MiniMax-H3 multimodal reference)",
     zh: "MiniMax 海螺视频生成（文生视频、图生视频、MiniMax-H3 多模态参考生视频）",
   },
-  version: "1.4.0",
+  version: "1.5.0",
   author: { name: "QuantumNous" },
   channelTypes: [35],
   models: [H3_MODEL].concat(V1_MODELS),
@@ -566,7 +572,12 @@ export const native = {
     if (!Array.isArray(body.content)) throw new Error("content must be an array");
     const content = validateH3Content(body.content);
     h3Duration(body.duration);
-    return { kind: "submit", model: body.model, action: h3HasVisualContent(content) ? "image_to_video" : "text_to_video", requestBody: { model: body.model, vendorBody: body } };
+    return {
+      kind: "submit",
+      model: body.model,
+      action: h3HasVisualContent(content) ? "image_to_video" : "text_to_video",
+      requestBody: { model: body.model, vendorBody: body },
+    };
   },
   // MiniMax answers /v1 with a base_resp envelope and /v2 with a bare task_id.
   taskCreated: function (ctx, task) {
@@ -621,6 +632,41 @@ export const native = {
     return { __status: 200, __body: { base_resp: { status_code: code, status_msg: error.message } } };
   },
 };
+
+export function extractCapabilities(ctx) {
+  const req = ctx.requestBody || {};
+  const input = [];
+  let imageCount = 0;
+  let knownImages = true;
+  if (isH3(ctx.upstreamModel)) {
+    for (const item of h3Request(req).content) {
+      if (!item || typeof item !== "object") continue;
+      if (item.type === "text") input.push("text");
+      else if (item.type === "image_url") {
+        input.push("image");
+        imageCount++;
+      } else if (item.type === "video_url") input.push("video");
+      else if (item.type === "audio_url") input.push("audio");
+      else {
+        input.push("image", "audio", "video", "text", "pdf");
+        knownImages = false;
+      }
+    }
+  } else {
+    const source = req.vendorBody || req.metadata || {};
+    if (trimmed(req.prompt || source.prompt)) input.push("text");
+    if (hasHailuoImage(req.vendorBody ? { metadata: req.vendorBody } : req, false)) input.push("image");
+    imageCount = [source.first_frame_image, source.last_frame_image].filter(Boolean).length;
+    if (source.subject_reference) {
+      if (Array.isArray(source.subject_reference) && source.subject_reference.every((item) => item && Array.isArray(item.image_file))) {
+        for (const item of source.subject_reference) imageCount += item.image_file.length;
+      } else knownImages = false;
+    }
+  }
+  const result = { input_modalities: input, output_modalities: ["video"], duration_seconds: Math.ceil(extractUsage(ctx).seconds) };
+  if (knownImages) result.image_count = imageCount;
+  return result;
+}
 
 export function buildSubmitRequest(ctx) {
   const req = ctx.requestBody || {};
@@ -707,7 +753,8 @@ export function extractUsage(ctx) {
         : 0,
     };
   }
-  if (req.vendorBody) return { seconds: outboundDuration(req.vendorBody), resolution: v1NativeResolution(model, req.vendorBody), input_images: 0, input_video_seconds: 0 };
+  if (req.vendorBody)
+    return { seconds: outboundDuration(req.vendorBody), resolution: v1NativeResolution(model, req.vendorBody), input_images: 0, input_video_seconds: 0 };
   return { seconds: outboundDuration(req), resolution: outboundResolution(req, model), input_images: 0, input_video_seconds: 0 };
 }
 

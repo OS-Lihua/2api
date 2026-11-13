@@ -84,7 +84,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		var err error
 		ws, err = upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
-			helper.WssError(c, ws, types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry()).ToOpenAIError())
+			helper.WssError(c, ws, types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry()))
 			return
 		}
 		defer ws.Close()
@@ -106,7 +106,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			}
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
-				helper.WssError(c, ws, newAPIError.ToOpenAIError(upstreamURLs...))
+				helper.WssError(c, ws, newAPIError, upstreamURLs...)
 			case types.RelayFormatClaude:
 				c.JSON(newAPIError.StatusCode, gin.H{
 					"type":  "error",
@@ -500,6 +500,9 @@ func RelayTask(c *gin.Context) {
 // come from c.Request.Context: native task endpoints use the client context,
 // while the Responses bridge supplies an independently bounded context.
 func executeTaskSubmission(c *gin.Context, relayInfo *relaycommon.RelayInfo) (*taskSubmissionOutcome, *taskdto.TaskError) {
+	if middleware.TextOffering(c) != nil {
+		return submitGatewayTask(c)
+	}
 	return executeTaskSubmissionWith(c, relayInfo, relay.RelayTaskSubmit)
 }
 
@@ -694,35 +697,9 @@ func executeTaskSubmissionWith(
 			task.PrivateData.ResultURL = taskcommon.BuildProxyURL(task.TaskID)
 		}
 	}
-	// A native submit route may declare retainResult: false. It applies only
-	// to immediate terminal results: the client receives the complete response
-	// once, the upstream snapshot is never persisted, and the task is not
-	// retrievable afterwards. An asynchronous result on such a route keeps its
-	// snapshot because polling and retrieval need it. The OpenAI Images
-	// protocol delivers its images inline in the same HTTP response, so its
-	// immediate results follow the same rule; an asynchronous image task is
-	// expected there and is polled inside the request.
-	var insertOmits []string
-	immediateTerminal := result.Immediate != nil && (result.Immediate.Status == model.TaskStatusSuccess || result.Immediate.Status == model.TaskStatusFailure)
-	if pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedRoute); exists {
-		pinned, ok := pinnedValue.(pluginruntime.PinnedRoute)
-		if ok && pinned.Route.RetainResult != nil && !*pinned.Route.RetainResult {
-			if immediateTerminal {
-				task.PrivateData.ResultDiscarded = true
-				insertOmits = append(insertOmits, "data")
-			} else {
-				logger.LogWarn(c, common.LogText("task plugin route %s %s declares retainResult: false but returned an asynchronous result; retaining task %s", pinned.Route.Method, pinned.Route.Path, task.TaskID))
-			}
-		}
-	}
-	if pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedEndpoint); exists && immediateTerminal {
-		if pinned, ok := pinnedValue.(pluginruntime.PinnedEndpoint); ok && pinned.Protocol == pluginruntime.ProtocolOpenAIImage {
-			task.PrivateData.ResultDiscarded = true
-			insertOmits = append(insertOmits, "data")
-		}
-	}
+	applyTaskResultRetention(c, task, result.Immediate)
 	diagnostics.insertStart(task)
-	if insertErr := task.InsertWithContext(c.Request.Context(), insertOmits...); insertErr != nil {
+	if insertErr := task.InsertWithContext(c.Request.Context()); insertErr != nil {
 		common.SysError(common.LogText("insert task error: %s", insertErr.Error()))
 		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to persist task"), "task_insert_failed", http.StatusInternalServerError)
 		diagnostics.failed("insert", "database_error", taskErr, false)
@@ -760,6 +737,28 @@ func executeTaskSubmissionWith(
 	return &taskSubmissionOutcome{Result: result, Task: task, RelayInfo: relayInfo}, nil
 }
 
+// applyTaskResultRetention keeps immediate results in memory for the response
+// while excluding them from storage and later retrieval when the route requires
+// one-time delivery. Asynchronous tasks retain their data for polling.
+func applyTaskResultRetention(c *gin.Context, task *model.Task, immediate *relaycommon.TaskInfo) {
+	terminal := immediate != nil && (immediate.Status == model.TaskStatusSuccess || immediate.Status == model.TaskStatusFailure)
+	if pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedRoute); exists {
+		pinned, ok := pinnedValue.(pluginruntime.PinnedRoute)
+		if ok && pinned.Route.RetainResult != nil && !*pinned.Route.RetainResult {
+			if terminal {
+				task.PrivateData.ResultDiscarded = true
+			} else {
+				logger.LogWarn(c, common.LogText("task plugin route %s %s declares retainResult: false but returned an asynchronous result; retaining task %s", pinned.Route.Method, pinned.Route.Path, task.TaskID))
+			}
+		}
+	}
+	if pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedEndpoint); exists && terminal {
+		if pinned, ok := pinnedValue.(pluginruntime.PinnedEndpoint); ok && pinned.Protocol == pluginruntime.ProtocolOpenAIImage {
+			task.PrivateData.ResultDiscarded = true
+		}
+	}
+}
+
 func presentTaskSubmission(c *gin.Context, outcome *taskSubmissionOutcome) {
 	diagnostics := newTaskPluginSubmitDiagnostics(c)
 	// A native route that relayed the vendor's event stream has answered.
@@ -767,7 +766,10 @@ func presentTaskSubmission(c *gin.Context, outcome *taskSubmissionOutcome) {
 		diagnostics.present(outcome.Task, "native_stream")
 		return
 	}
-	otherRatios := outcome.RelayInfo.PriceData.OtherRatios()
+	otherRatios := map[string]float64{}
+	if outcome.Task.PrivateData.Gateway == nil {
+		otherRatios = outcome.RelayInfo.PriceData.OtherRatios()
+	}
 	if otherRatios == nil {
 		otherRatios = map[string]float64{}
 	}

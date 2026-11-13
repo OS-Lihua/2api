@@ -74,7 +74,7 @@ export const meta = {
     en: "xAI Grok Imagine video generation (text-to-video, image-to-video, reference-to-video, video editing, and video extension)",
     zh: "xAI Grok Imagine 视频生成（文生视频、图生视频、参考生视频、视频编辑、视频延长）",
   },
-  version: "1.2.0",
+  version: "1.3.0",
   author: { name: "QuantumNous" },
   channelTypes: [48], // xAI-type channels serve the video API with the same key
   baseUrl: "https://api.x.ai",
@@ -304,7 +304,7 @@ function generationSource(req) {
   const source = Object.assign(
     {},
     plainObject(req.metadata) || {},
-    req.size === undefined || req.size === null || req.size === "" ? {} : sizeOptions(req.size),
+    req.size === undefined || req.size === null || req.size === "" ? {} : sizeOptions(req.size)
   );
   for (const key of Object.keys(req)) {
     if (req[key] !== undefined && req[key] !== null && req[key] !== "") source[key] = req[key];
@@ -449,6 +449,18 @@ export const native = {
   },
 };
 
+export function extractCapabilities(ctx) {
+  const body = videoRequest(ctx.action, ctx.requestBody || {}, ctx).body;
+  const input = [];
+  if (trimmed(body.prompt)) input.push("text");
+  if (body.image || body.last_frame || (body.reference_images || []).length || (body.keyframes || []).length) input.push("image");
+  if ((body.reference_audios || []).length) input.push("audio");
+  if (body.video) input.push("video");
+  const imageCount = (body.image ? 1 : 0) + (body.last_frame ? 1 : 0) + (body.reference_images || []).length + (body.keyframes || []).length;
+  const duration = body.video ? (ctx.action === "video_extension" ? MAX_EXTENSION_INPUT_SECONDS + body.duration : MAX_EDIT_SECONDS) : body.duration;
+  return { input_modalities: input, output_modalities: ["video"], image_count: imageCount, duration_seconds: Math.ceil(duration) };
+}
+
 export function buildSubmitRequest(ctx) {
   const request = videoRequest(ctx.action, ctx.requestBody || {}, ctx);
   const paths = { video_edit: "/v1/videos/edits", video_extension: "/v1/videos/extensions" };
@@ -525,7 +537,9 @@ export function parseTaskResult(ctx, body, response) {
     }
     return result;
   }
-  if (status === "failed") return chargedFailure(data) ? { status: "SUCCESS" } : { status: "FAILURE", reason: failureReason(data) };
+  // Legacy quota retains a charged failure as SUCCESS. Frozen submittedUsage
+  // identifies a money task, where failed delivery owes no user charge.
+  if (status === "failed") return chargedFailure(data) && !ctx.submittedUsage ? { status: "SUCCESS" } : { status: "FAILURE", reason: failureReason(data) };
   if (status === "expired") return { status: "FAILURE", reason: "the video expired before it was retrieved" };
   return { status: "UNKNOWN", reason: "unrecognized status: " + String(status || "") };
 }
@@ -541,8 +555,14 @@ export function extractUsageOnComplete(task, result, body) {
   const state = plainObject(result && result.plugin_state) || plainObject(task && task.state) || {};
   if (VIDEO_MODELS["grok-imagine-video"].resolutions.includes(state.output_resolution)) facts.resolution = state.output_resolution;
   const duration = Number(data.status === "done" && plainObject(data.video) ? data.video.duration : NaN);
-  if (!(duration > 0)) return facts;
   const action = task && task.action;
+  if (!(duration > 0)) {
+    // A terminal duration the Provider did not report must not settle from the
+    // requested or reserved duration.
+    facts.seconds = null;
+    if (action === "video_edit" || action === "video_extension") facts.input_video_seconds = null;
+    return facts;
+  }
   if (action === "video_edit") {
     facts.seconds = Math.min(duration, MAX_EDIT_SECONDS);
     facts.input_video_seconds = facts.seconds;

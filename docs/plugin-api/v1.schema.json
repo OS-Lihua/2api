@@ -20,11 +20,24 @@
       {"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"enum": ["openai_video", "openai_image"]}, "models": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}}}
     ]}},
     "submitResponseTypes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["json", "sse"]}},
-    "requiredCapabilities": {"type": "array", "uniqueItems": true, "items": {"enum": ["json-clone@1", "submit-sse-delta@1", "json-order@1", "duration-auto@1"]}},
+    "requiredCapabilities": {"type": "array", "uniqueItems": true, "items": {"enum": ["json-clone@1", "submit-sse-delta@1", "submit-sse-business@1", "json-order@1", "duration-auto@1"]}},
     "routes": {"type": "array", "items": {"$ref": "#/$defs/route"}}, "usageSchema": {"type": "object", "additionalProperties": {"$ref": "#/$defs/usageField"}}, "usageExamples": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["label", "facts"], "properties": {"label": {"type": "string"}, "facts": {"type": "object"}}}}, "usageProfiles": {"type": "array", "items": {"$ref": "#/$defs/usageProfile"}}, "auth": {}
   },
-  "allOf": [{"if": {"required": ["requiredCapabilities"], "properties": {"requiredCapabilities": {"contains": {"const": "submit-sse-delta@1"}}}}, "then": {"required": ["submitResponseTypes"], "properties": {"submitResponseTypes": {"contains": {"const": "sse"}}}}}],
+  "allOf": [{"if": {"required": ["requiredCapabilities"], "properties": {"requiredCapabilities": {"contains": {"enum": ["submit-sse-delta@1", "submit-sse-business@1"]}}}}, "then": {"required": ["submitResponseTypes"], "properties": {"submitResponseTypes": {"contains": {"const": "sse"}}}}}],
   "$defs": {
+    "requestCapabilities": {
+      "type": "object", "additionalProperties": false,
+      "required": ["input_modalities", "output_modalities"],
+      "properties": {
+        "features": {"type": "array", "items": {"enum": ["streaming", "tool_calling", "reasoning", "structured_output", "caching"]}},
+        "input_modalities": {"type": "array", "items": {"enum": ["text", "image", "audio", "video", "pdf"]}},
+        "output_modalities": {"type": "array", "minItems": 1, "items": {"enum": ["text", "image", "audio", "video", "pdf"]}},
+        "image_count": {"type": "integer", "minimum": 0, "maximum": 9007199254740991, "description": "Generated image upper bound for image output; otherwise input image count. Omit when unknown."},
+        "duration_seconds": {"type": "integer", "minimum": 0, "maximum": 9007199254740991, "description": "Media duration upper bound in whole seconds; omit when unknown."},
+        "context_text": {"type": "string", "description": "Complete effective text input for transient host context counting; empty is known empty. Omit when media or other unknown input prevents a complete projection. Never billing usage."}
+      },
+      "description": "Pure effective-request facts returned by extractCapabilities for ModelOffering routing; not manifest requiredCapabilities or billing quantities."
+    },
     "jsonChange": {
       "type": "object", "additionalProperties": false, "required": ["op", "path", "value"],
       "properties": {
@@ -39,7 +52,8 @@
       "properties": {
         "changes": {"type": "array", "maxItems": 256, "items": {"$ref": "#/$defs/jsonChange"}},
         "state": true,
-        "done": {"type": "boolean"}
+        "done": {"type": "boolean"},
+        "business": {"type": "boolean", "description": "Actual text or media content in this event; required with submit-sse-business@1"}
       }
     },
     "usageProfile": {
@@ -129,7 +143,8 @@
         "auth": true,
         "upstream": {"$ref": "#/$defs/upstreamContext"},
         "data": true,
-        "state": true
+        "state": true,
+        "submittedUsage": {"type": "object", "additionalProperties": {"type": ["number", "boolean", "string"]}, "description": "Frozen validated submission facts for money tasks, when available. Output budgets are not actual output quantities."}
       }
     },
     "batchQueryContext": {

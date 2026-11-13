@@ -148,14 +148,29 @@ func productionPluginRouteHandlers(generation *jsplugin.RoutingGeneration, group
 			c.Writer.Status(),
 		)
 	}
+	auth := middleware.TaskOriginAuth()
+	if group.Method == http.MethodGet || group.Method == http.MethodHead {
+		auth = middleware.TaskReadAuth()
+	}
+	distribute := middleware.Distribute()
 	return []gin.HandlerFunc{
 		pinRoute,
 		middleware.NativeRouteCredential(keys...),
-		middleware.TokenAuth(),
+		auth,
 		middleware.SystemPerformanceCheck(),
+		middleware.ResolveTaskOffering(),
+		middleware.ResolveTaskPluginOffering(),
+		controller.AuthorizeTaskGateway,
 		middleware.ModelRequestRateLimit(),
 		middleware.PrepareTaskPluginRoute(),
-		middleware.Distribute(),
+		middleware.LegacyTaskSubmissionAuth(),
+		func(c *gin.Context) {
+			if middleware.TextOffering(c) != nil && c.GetBool("task_gateway_endpoint") {
+				controller.TaskGateway(c)
+				return
+			}
+			distribute(c)
+		},
 		controller.RelayTask,
 	}
 }

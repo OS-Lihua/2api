@@ -12,6 +12,9 @@ var _ channel.ProviderRequestFixer = (*Provider)(nil)
 var _ channel.ProviderProtocolComposer = (*Provider)(nil)
 
 func (p *Provider) ComposeProtocol(kind protocol.Type, generic channel.ProtocolHandler) (channel.ProtocolHandler, error) {
+	if kind == protocol.OpenAIRealtime {
+		return generic, nil
+	}
 	if kind == protocol.OpenAIEmbeddings {
 		return &channel.WireProtocol{Kind: kind, Public: generic, Wire: &Protocol{}, SupportsCrossProtocol: true}, nil
 	}

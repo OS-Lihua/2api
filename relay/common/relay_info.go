@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -108,18 +109,29 @@ type RelayInfo struct {
 	// aliases never participate in channel selection or upstream routing.
 	BillingModelName string
 
-	RequestURLPath     string
-	RequestHeaders     map[string]string
-	ShouldIncludeUsage bool
-	DisablePing        bool // 是否禁止向下游发送自定义 Ping
-	ClientWs           *websocket.Conn
-	TargetWs           *websocket.Conn
-	InputAudioFormat   string
-	OutputAudioFormat  string
-	RealtimeTools      []dto.RealTimeTool
-	IsFirstRequest     bool
-	AudioUsage         bool
-	ReasoningEffort    string
+	RequestURLPath            string
+	RequestHeaders            map[string]string
+	ShouldIncludeUsage        bool
+	DisablePing               bool // 是否禁止向下游发送自定义 Ping
+	ClientWs                  *websocket.Conn
+	TargetWs                  *websocket.Conn
+	InputAudioFormat          string
+	OutputAudioFormat         string
+	RealtimeTools             []dto.RealTimeTool
+	RealtimeResponseSucceeded bool                                                `json:"-"`
+	RealtimeRequestHandler    func([]byte) ([]byte, *types.NewAPIError)           `json:"-"`
+	RealtimeResponseHandler   func(*RealtimeResponseFacts) *types.NewAPIError     `json:"-"`
+	RealtimeEventHandler      func([]byte) ([]byte, [][]byte, *types.NewAPIError) `json:"-"`
+	RealtimeAfterResponse     func() ([][]byte, *types.NewAPIError)               `json:"-"`
+	RealtimeOutputAudioFormat func(string) string                                 `json:"-"`
+	ResponsesItemFacts        map[string]*ResponsesInputFacts                     `json:"-"`
+	ResponsesInputFacts       *ResponsesInputFacts                                `json:"-"`
+	RealtimeInputUsage        func(string) *dto.Usage                             `json:"-"`
+	RealtimeBusinessOutput    func(string)                                        `json:"-"`
+	RealtimePeerClosed        func(bool)                                          `json:"-"`
+	IsFirstRequest            bool
+	AudioUsage                bool
+	ReasoningEffort           string
 	// ReasoningConversion is the suffix-derived reasoning intent attached
 	// after model mapping. Converters read it via ReasoningState().
 	ReasoningConversion *dto.ReasoningConversionState
@@ -1031,8 +1043,13 @@ type OriginTaskRef struct {
 }
 
 type TaskRelayInfo struct {
-	Action       string
-	OriginTaskID string
+	// OnPreparedRequest freezes task pricing after all wire overrides and
+	// before any submission bytes are sent. It is never serialized.
+	OnPreparedRequest func(*http.Request) error `json:"-"`
+	// SubmittedUsage retains the validated quantitative facts of the selected plan.
+	SubmittedUsage map[string]any `json:"-"`
+	Action         string
+	OriginTaskID   string
 	// PublicTaskID 是提交时预生成的 task_xxxx 格式公开 ID，
 	// 供 DoResponse 在返回给客户端时使用（避免暴露上游真实 ID）。
 	PublicTaskID string
@@ -1132,17 +1149,18 @@ func (t *TaskSubmitReq) UnmarshalMetadata(v any) error {
 }
 
 type TaskInfo struct {
-	Code             int             `json:"code"`
-	TaskID           string          `json:"task_id"`
-	Status           string          `json:"status"`
-	Reason           string          `json:"reason,omitempty"`
-	Url              string          `json:"url,omitempty"`
-	RemoteUrl        string          `json:"remote_url,omitempty"`
-	Progress         string          `json:"progress,omitempty"`
-	CompletionTokens int             `json:"completion_tokens,omitempty"` // 用于按倍率计费
-	TotalTokens      int             `json:"total_tokens,omitempty"`      // 用于按倍率计费
-	UsageFacts       map[string]any  `json:"usage_facts,omitempty"`
-	PluginState      json.RawMessage `json:"plugin_state,omitempty"`
+	Code              int             `json:"code"`
+	TaskID            string          `json:"task_id"`
+	Status            string          `json:"status"`
+	Reason            string          `json:"reason,omitempty"`
+	Url               string          `json:"url,omitempty"`
+	RemoteUrl         string          `json:"remote_url,omitempty"`
+	Progress          string          `json:"progress,omitempty"`
+	CompletionTokens  int             `json:"completion_tokens,omitempty"` // 用于按倍率计费
+	TotalTokens       int             `json:"total_tokens,omitempty"`      // 用于按倍率计费
+	UsageFacts        map[string]any  `json:"usage_facts,omitempty"`
+	UsageFactsUnknown bool            `json:"usage_facts_unknown,omitempty"`
+	PluginState       json.RawMessage `json:"plugin_state,omitempty"`
 }
 
 func FailTaskInfo(reason string) *TaskInfo {

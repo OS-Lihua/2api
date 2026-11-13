@@ -24,6 +24,7 @@ import {
   RequestMoney,
   RequestOutcome,
   RequestTime,
+  RequestUsageFacts,
 } from './request-facts'
 
 export function RequestSummary(props: {
@@ -60,7 +61,11 @@ export function RequestSummary(props: {
           <dd className='mt-1'>
             <RequestMoney
               amount={request.receivable}
-              pending={request.sale_pending}
+              pending={
+                request.sale_pending ||
+                request.status === 'pending' ||
+                request.status === 'submission_unknown'
+              }
             />
           </dd>
         </div>
@@ -83,6 +88,7 @@ export function RequestSummary(props: {
           </dd>
         </div>
       </dl>
+      <RequestUsageFacts usage={request.usage} source={request.usage_source} />
       {request.error_code && (
         <p className='text-destructive text-xs break-words'>
           {request.error_code}
