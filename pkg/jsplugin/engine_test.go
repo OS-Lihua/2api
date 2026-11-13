@@ -209,6 +209,59 @@ func TestJSONStateChangesAndEncodedLimits(t *testing.T) {
 	_, err = state.Value()
 	require.Error(t, err)
 
+	t.Run("atomic failure preserves accepted value", func(t *testing.T) {
+		const prefix = `[{"op":"appendText","path":["text"],"value":"c"},{"op":"append","path":["parts"],"value":"second"},{"op":"set","path":["parts",0],"value":"changed"},{"op":"set","path":["known"],"value":1},{"op":"set","path":["added"],"value":false},`
+		for _, test := range []struct{ name, tail string }{
+			{"invalid target", `{"op":"appendText","path":["parts"],"value":"x"}]`},
+			{"size limit", `{"op":"appendText","path":["text"],"value":"` + strings.Repeat("x", 128) + `"}]`},
+			{"replacement then failure", `{"op":"set","path":[],"value":{"text":"replacement"}},{"op":"append","path":["text"],"value":0}]`},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				state := NewJSONState(128)
+				require.NoError(t, state.ApplyAtomic(t.Context(), []any{map[string]any{"op": "set", "path": []any{}, "value": map[string]any{"text": "a", "parts": []any{"first"}, "known": 0}}}))
+				require.NoError(t, state.ApplyAtomic(t.Context(), []any{map[string]any{"op": "appendText", "path": []any{"text"}, "value": "b"}}))
+				accepted, err := state.Value()
+				require.NoError(t, err)
+				var changes any
+				require.NoError(t, common.UnmarshalJsonStr(prefix+test.tail, &changes))
+				require.Error(t, state.ApplyAtomic(t.Context(), changes))
+				value, err := state.Value()
+				require.NoError(t, err)
+				assert.Equal(t, accepted, value)
+				require.NoError(t, state.ApplyAtomic(t.Context(), []any{map[string]any{"op": "appendText", "path": []any{"text"}, "value": "z"}}))
+				value, err = state.Value()
+				require.NoError(t, err)
+				assert.Equal(t, "abz", value.(map[string]any)["text"])
+			})
+		}
+	})
+
+	t.Run("source failure retains bounded independent changes", func(t *testing.T) {
+		for _, failure := range []string{
+			`{"op":"appendText","path":["text"],"value":"` + strings.Repeat("x", 128) + `"}`,
+			`{"op":"appendText","path":["parts"],"value":"invalid target"}`,
+		} {
+			state := NewJSONState(128)
+			require.NoError(t, state.ApplyAtomic(t.Context(), []any{map[string]any{"op": "set", "path": []any{}, "value": map[string]any{"text": "a", "parts": []any{"first"}, "known": 1}}}))
+			var changes any
+			require.NoError(t, common.UnmarshalJsonStr(`[{"op":"set","path":["known"],"value":2},`+failure+`,{"op":"append","path":["parts"],"value":"second"}]`, &changes))
+			require.Error(t, state.ApplySource(t.Context(), changes))
+			value, err := state.Value()
+			require.NoError(t, err)
+			var want any
+			require.NoError(t, common.UnmarshalJsonStr(`{"text":"a","parts":["first","second"],"known":2}`, &want))
+			assert.Equal(t, want, value)
+			tooMany := make([]any, 257)
+			for i := range tooMany {
+				tooMany[i] = map[string]any{"op": "set", "path": []any{"known"}, "value": 3}
+			}
+			require.Error(t, state.ApplySource(t.Context(), tooMany))
+			after, err := state.Value()
+			require.NoError(t, err)
+			assert.Equal(t, value, after, "an oversized batch must not bypass the operation limit")
+		}
+	})
+
 	t.Run("replacement releases byte and node budget", func(t *testing.T) {
 		state := NewJSONState(16)
 		for _, value := range []any{"abcdefghijklmn", map[string]any{}, []any{int64(0), false, nil}, []any(nil), map[string]any(nil)} {

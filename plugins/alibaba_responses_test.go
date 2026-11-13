@@ -656,25 +656,26 @@ func TestAlibabaWanMediaInputs(t *testing.T) {
 func TestAlibabaWanCompletionFactsAndArtifacts(t *testing.T) {
 	plugin := newAlibabaPlugin(t)
 	for _, tc := range []struct {
-		name  string
-		model string
-		usage map[string]any
-		facts map[string]any
+		name    string
+		model   string
+		usage   map[string]any
+		facts   map[string]any
+		unknown bool
 	}{
-		{"digital human fractional duration", "wan2.2-s2v", map[string]any{"duration": 18.13, "SR": 480}, map[string]any{"seconds": 18.13, "resolution": "480P"}},
-		{"Wan3 input plus output", "wan3.0-video", map[string]any{"input_video_duration": 4.25, "output_video_duration": 6.5, "duration": 6.5, "SR": 720}, map[string]any{"seconds": 10.75, "resolution": "720P"}},
-		{"Wan3 without reference video", "wan3.0-video-prime", map[string]any{"input_video_duration": 0, "output_video_duration": 8, "SR": 1080}, map[string]any{"seconds": float64(8), "resolution": "1080P"}},
-		{"Wan3 missing input duration preserves reserved seconds", "wan3.0-video", map[string]any{"output_video_duration": 6, "SR": 720}, map[string]any{"resolution": "720P"}},
-		{"2.7 continuation uses total duration", "wan2.7-i2v", map[string]any{"duration": 15, "output_video_duration": 12, "SR": 1080}, map[string]any{"seconds": float64(15), "resolution": "1080P"}},
-		{"flash silent output settles as silent", "wan2.6-i2v-flash", map[string]any{"duration": 5, "SR": 720, "audio": false}, map[string]any{"seconds": float64(5), "resolution": "720P", "audio": false}},
-		{"flash without audio flag keeps the estimate", "wan2.6-i2v-flash", map[string]any{"duration": 5, "SR": 1080}, map[string]any{"seconds": float64(5), "resolution": "1080P"}},
-		{"audio flag is ignored for models priced without it", "wan2.6-i2v", map[string]any{"duration": 5, "SR": 1080, "audio": false}, map[string]any{"seconds": float64(5), "resolution": "1080P"}},
-		{"missing usage keeps reservation", "wan2.7-t2v", map[string]any{}, nil},
-		{"oversized duration rejected by host", "wan2.2-s2v", map[string]any{"duration": 1e30, "SR": 480}, nil},
-		{"negative input cannot reduce Wan3 charge", "wan3.0-video", map[string]any{"input_video_duration": -5, "output_video_duration": 10}, nil},
-		{"negative output cannot reduce Wan3 charge", "wan3.0-video", map[string]any{"input_video_duration": 10, "output_video_duration": -5}, nil},
-		{"non-numeric duration rejected by host", "wan2.2-s2v", map[string]any{"duration": "invalid", "SR": 480}, nil},
-		{"unknown resolution rejected by host", "wan2.7-t2v", map[string]any{"duration": 5, "SR": 4320}, nil},
+		{"digital human fractional duration", "wan2.2-s2v", map[string]any{"duration": 18.13, "SR": 480}, map[string]any{"seconds": 18.13, "resolution": "480P"}, false},
+		{"Wan3 input plus output", "wan3.0-video", map[string]any{"input_video_duration": 4.25, "output_video_duration": 6.5, "duration": 6.5, "SR": 720}, map[string]any{"seconds": 10.75, "resolution": "720P"}, false},
+		{"Wan3 without reference video", "wan3.0-video-prime", map[string]any{"input_video_duration": 0, "output_video_duration": 8, "SR": 1080}, map[string]any{"seconds": float64(8), "resolution": "1080P"}, false},
+		{"Wan3 missing input duration keeps the reservation", "wan3.0-video", map[string]any{"output_video_duration": 6, "SR": 720}, map[string]any{"resolution": "720P"}, true},
+		{"2.7 continuation uses total duration", "wan2.7-i2v", map[string]any{"duration": 15, "output_video_duration": 12, "SR": 1080}, map[string]any{"seconds": float64(15), "resolution": "1080P"}, false},
+		{"flash silent output settles as silent", "wan2.6-i2v-flash", map[string]any{"duration": 5, "SR": 720, "audio": false}, map[string]any{"seconds": float64(5), "resolution": "720P", "audio": false}, false},
+		{"flash without audio flag keeps the estimate", "wan2.6-i2v-flash", map[string]any{"duration": 5, "SR": 1080}, map[string]any{"seconds": float64(5), "resolution": "1080P"}, false},
+		{"audio flag is ignored for models priced without it", "wan2.6-i2v", map[string]any{"duration": 5, "SR": 1080, "audio": false}, map[string]any{"seconds": float64(5), "resolution": "1080P"}, false},
+		{"missing usage keeps reservation", "wan2.7-t2v", map[string]any{}, nil, true},
+		{"oversized duration rejected by host", "wan2.2-s2v", map[string]any{"duration": 1e30, "SR": 480}, map[string]any{"resolution": "480P"}, true},
+		{"negative input cannot reduce Wan3 charge", "wan3.0-video", map[string]any{"input_video_duration": -5, "output_video_duration": 10}, nil, true},
+		{"negative output cannot reduce Wan3 charge", "wan3.0-video", map[string]any{"input_video_duration": 10, "output_video_duration": -5}, nil, true},
+		{"non-numeric duration rejected by host", "wan2.2-s2v", map[string]any{"duration": "invalid", "SR": 480}, map[string]any{"resolution": "480P"}, true},
+		{"unknown resolution rejected by host", "wan2.7-t2v", map[string]any{"duration": 5, "SR": 4320}, map[string]any{"seconds": float64(5)}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			adaptor := taskplugin.New(plugin)
@@ -693,6 +694,7 @@ func TestAlibabaWanCompletionFactsAndArtifacts(t *testing.T) {
 			} else {
 				assert.Equal(t, tc.facts, alibabaObject(t, result.UsageFacts))
 			}
+			assert.Equal(t, tc.unknown, result.UsageFactsUnknown, "rejected facts must keep valid siblings but remain unknown")
 		})
 	}
 

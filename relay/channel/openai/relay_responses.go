@@ -79,8 +79,11 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 
 		// 检查当前数据是否包含 completed 状态和 usage 信息
-		var streamResponse dto.ResponsesStreamResponse
-		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
+		streamResponse, err := service.DecodeResponsesStreamEvent(common.StringToByteSlice(data))
+		if err != nil {
+			if streamResponse != nil {
+				accumulator.Observe(streamResponse, common.StringToByteSlice(data))
+			}
 			logger.LogError(c, common.LogText("failed to unmarshal stream response: %s", err.Error()))
 			sr.Error(err)
 			return
@@ -88,8 +91,17 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		if streamResponse.Response != nil {
 			data = string(rewriteSGLangResponsesCreatedAt(info, []byte(data), "response.created_at", streamResponse.Response.CreatedAt))
 		}
-		accumulator.Observe(&streamResponse, common.StringToByteSlice(data))
-		if err := helper.ResponseChunkData(c, streamResponse, data); err != nil {
+		accumulator.Observe(streamResponse, common.StringToByteSlice(data))
+		if err := accumulator.Err(); err != nil {
+			sr.Stop(err)
+			return
+		}
+		if err := helper.ResponseChunkData(c, *streamResponse, data); err != nil {
+			sr.Stop(err)
+			return
+		}
+		accumulator.RecordDelivery(streamResponse, common.StringToByteSlice(data))
+		if err := accumulator.Err(); err != nil {
 			sr.Stop(err)
 			return
 		}
@@ -101,7 +113,11 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 
 	common.SetContextKey(c, constant.ContextKeyResponseStreamStatus, info.StreamStatus)
 	info.StreamStatus.RequireTerminal()
-	return accumulator.Finish(), nil
+	usage := accumulator.Finish()
+	if err := accumulator.Err(); err != nil {
+		return usage, types.NewError(err, types.ErrorCodeBadResponse)
+	}
+	return usage, nil
 }
 
 func rewriteSGLangResponsesCreatedAt(info *relaycommon.RelayInfo, payload []byte, path string, createdAt dto.IntValue) []byte {

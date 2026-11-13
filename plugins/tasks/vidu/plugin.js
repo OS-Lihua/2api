@@ -7,7 +7,7 @@ export const meta = {
     en: "Shengshu Vidu video generation (text-to-video, image-to-video, first-and-last-frame, and reference-to-video)",
     zh: "生数 Vidu 视频生成（文生视频、图生视频、首尾帧、参考生视频）",
   },
-  version: "1.2.0",
+  version: "1.3.0",
   author: { name: "QuantumNous" },
   channelTypes: [52],
   models: [
@@ -188,7 +188,10 @@ function listedProfile(action, model) {
 // model the plugin does not list those of every Vidu model.
 function dearestSettings(action, model) {
   let profiles = [listedProfile(action, model)];
-  if (!profiles[0]) profiles = Object.keys(ENDPOINT_MODELS).map((name) => listedProfile(name, model)).filter(Boolean);
+  if (!profiles[0])
+    profiles = Object.keys(ENDPOINT_MODELS)
+      .map((name) => listedProfile(name, model))
+      .filter(Boolean);
   if (!profiles.length) {
     for (const name of Object.keys(ENDPOINT_MODELS)) profiles = profiles.concat(Object.keys(ENDPOINT_MODELS[name]).map((key) => ENDPOINT_MODELS[name][key]));
   }
@@ -210,8 +213,10 @@ function nativeSettings(action, model, body) {
   const settings = dearestSettings(action, model);
   const seconds = typeof body.duration === "number" || typeof body.duration === "string" ? Number(body.duration) : NaN;
   let durationKnown = true;
-  if (Number.isInteger(seconds) && seconds > 0 && seconds <= 3600) settings.duration = seconds;
-  else if ((body.duration === undefined || body.duration === null) && listed) settings.duration = listed.durations[2];
+  if (body.duration !== undefined && body.duration !== null) {
+    if (!Number.isInteger(seconds) || seconds <= 0 || seconds > 3600) throw new Error("seconds must be between 1 and 3600");
+    settings.duration = seconds;
+  } else if (listed) settings.duration = listed.durations[2];
   else durationKnown = false;
   const tier = RESOLUTIONS.find((item) => item.toLowerCase() === trimmed(body.resolution).toLowerCase());
   if (tier) settings.resolution = tier;
@@ -382,13 +387,32 @@ function submitSettings(ctx, action) {
 // A native request reaches Vidu as the client sent it. The host protocols
 // put the prompt and images in Vidu's fields and their other Vidu fields in
 // metadata, which cannot replace the billed model, duration and resolution.
+export function extractCapabilities(ctx) {
+  const req = ctx.requestBody || {};
+  const input = [];
+  let prompt = req.vendorBody ? req.vendorBody.prompt : req.prompt;
+  if (!req.vendorBody && !trimmed(prompt)) prompt = (req.metadata || {}).prompt;
+  if (trimmed(prompt)) input.push("text");
+  const images = req.vendorBody ? req.vendorBody.images : Array.isArray(req.images) && req.images.length ? req.images : (req.metadata || {}).images;
+  const imageCount = Array.isArray(images) ? images.length : images ? 1 : 0;
+  if (imageCount || ["image_to_video", "first_tail_to_video", "reference_to_video"].includes(actionFor(req))) input.push("image");
+  const result = { input_modalities: input, output_modalities: ["video"], image_count: imageCount };
+  const settings = submitSettings(ctx, actionFor(req));
+  const body = req.vendorBody;
+  if (!body || (body.duration !== undefined && body.duration !== null) || listedProfile(actionFor(req), ctx.upstreamModel || ctx.model))
+    result.duration_seconds = settings.duration;
+  return result;
+}
+
 export function buildSubmitRequest(ctx) {
   const req = ctx.requestBody;
   const action = actionFor(req);
   const model = ctx.upstreamModel || req.model;
   let body;
-  if (req.vendorBody) body = Object.assign({}, req.vendorBody, { model: model });
-  else {
+  if (req.vendorBody) {
+    nativeSettings(action, model, req.vendorBody);
+    body = Object.assign({}, req.vendorBody, { model: model });
+  } else {
     body = Object.assign({}, req.metadata || {}, { model: model }, requestSettings(req, action, model));
     if (trimmed(req.prompt)) body.prompt = req.prompt;
     if (Array.isArray(req.images) && req.images.length) body.images = req.images;

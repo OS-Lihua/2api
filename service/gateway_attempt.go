@@ -92,7 +92,7 @@ func ClassifyGatewayFailure(status int, code string, transport, timeout, cancell
 		return GatewayFailure{Class: "model_not_found", Switch: true}
 	case status == 429 || code == "rate_limit_exceeded" || code == "ThrottlingException" || code == "RequestLimitExceeded" || strings.HasPrefix(code, "RequestLimitExceeded."):
 		return GatewayFailure{Class: "rate_limited", Switch: true}
-	case status == 500 || status == 502 || status == 503 || status == 504 || status == 529 || code == "overloaded" || code == "overloaded_error":
+	case status == 500 || status == 502 || status == 503 || status == 504 || status == 529 || code == "server_error" || kind == "server_error" || code == "overloaded" || code == "overloaded_error":
 		return GatewayFailure{Class: "upstream_unavailable", Switch: true}
 	case status == 400 || status == 413 || status == 422 || code == "invalid_request_error" || kind == "invalid_request_error" || code == "ValidationException":
 		return GatewayFailure{Class: "invalid_request"}
@@ -117,22 +117,67 @@ type GatewayAttemptBudget struct {
 	started   time.Time
 	elapsed   time.Duration
 	finished  bool
+	paused    bool
 	stop      func() bool
 	cancel    context.CancelCauseFunc
 	sent      bool
 	ctx       context.Context
+	handedOff bool
 }
+
+// RequirePermit binds Provider I/O to this Attempt's shared concurrency lease.
+// Call it once after selection, before Start. Losing the lease cancels I/O even
+// after delivery has ended the first-byte deadline.
+func (b *GatewayAttemptBudget) RequirePermit(permit *GatewayRoutePermit) {
+	if b.sent && b.cancel != nil {
+		permit.mu.Lock()
+		defer permit.mu.Unlock()
+		permit.cancel = b.cancel
+		if permit.closed || permit.lost {
+			b.cancel(ErrGatewayPermitLost)
+		}
+		return
+	}
+	ctx, cancel := context.WithCancelCause(b.parent)
+	b.parent = ctx
+	if permit == nil {
+		cancel(ErrGatewayPermitLost)
+		return
+	}
+	permit.mu.Lock()
+	defer permit.mu.Unlock()
+	permit.cancel = cancel
+	if permit.closed || permit.lost {
+		cancel(ErrGatewayPermitLost)
+	}
+}
+
+// Context returns this Attempt's parent without starting its first-byte timer.
+func (b *GatewayAttemptBudget) Context() context.Context { return b.parent }
 
 func (b *GatewayAttemptBudget) Start() (context.Context, error) {
 	if err := b.parent.Err(); err != nil {
-		return nil, err
+		return nil, context.Cause(b.parent)
 	}
 	if b.ctx != nil {
 		if cause := context.Cause(b.ctx); cause != nil {
 			return nil, cause
 		}
-		if b.remaining-clock.Now().Sub(b.started) < 5*time.Second {
+		if b.finished {
+			return b.ctx, nil
+		}
+		remainingTotal, remainingAttempt := b.remaining-b.elapsed, b.policy.AttemptFirstByte-b.elapsed
+		if !b.paused {
+			elapsed := clock.Now().Sub(b.started)
+			remainingTotal -= elapsed
+			remainingAttempt -= elapsed
+		}
+		if remainingTotal < 5*time.Second || remainingAttempt <= 0 {
 			return nil, ErrGatewayBudget
+		}
+		if b.paused {
+			b.paused, b.started = false, clock.Now()
+			b.stop = clock.AfterFunc(min(remainingTotal, remainingAttempt), func() { b.cancel(ErrGatewayBudget) })
 		}
 		return b.ctx, nil
 	}
@@ -147,10 +192,52 @@ func (b *GatewayAttemptBudget) Start() (context.Context, error) {
 	b.stop = clock.AfterFunc(min(remaining, b.policy.AttemptFirstByte), func() { cancel(ErrGatewayBudget) })
 	return ctx, nil
 }
+
+// Handoff gives a native session a live context after its handshake Attempt
+// returns. Budget accounting and the normal pause/resume lifecycle are retained.
+func (b *GatewayAttemptBudget) Handoff() {
+	if b.handedOff {
+		return
+	}
+	b.handedOff = true
+	if b.sent && !b.finished && !b.paused {
+		b.elapsed = min(b.elapsed+clock.Now().Sub(b.started), b.remaining, b.policy.AttemptFirstByte)
+	}
+	if b.stop != nil {
+		b.stop()
+	}
+	// Handoff occurs before the handshake runner's ordinary cleanup. Preserve
+	// any lease loss already observed on the handshake I/O context.
+	if !b.sent {
+		return
+	}
+	cause := context.Cause(b.ctx)
+	session, cancel := context.WithCancelCause(context.WithoutCancel(b.parent))
+	b.parent, b.ctx, b.cancel = session, session, cancel
+	if cause != nil {
+		cancel(cause)
+	}
+}
+
+// Pause excludes client think/input time on an established native connection.
+// Resume uses Start and retains the same attempt and total time already spent.
+func (b *GatewayAttemptBudget) Pause() {
+	if !b.sent || b.finished || b.paused {
+		return
+	}
+	b.elapsed = min(b.elapsed+clock.Now().Sub(b.started), b.remaining, b.policy.AttemptFirstByte)
+	b.paused = true
+	if b.stop != nil {
+		b.stop()
+	}
+}
+
 func (b *GatewayAttemptBudget) Delivered() {
 	if b.sent && !b.finished {
 		b.finished = true
-		b.elapsed = min(clock.Now().Sub(b.started), b.remaining, b.policy.AttemptFirstByte)
+		if !b.paused {
+			b.elapsed = min(b.elapsed+clock.Now().Sub(b.started), b.remaining, b.policy.AttemptFirstByte)
+		}
 	}
 	if b.stop != nil {
 		b.stop()
@@ -161,12 +248,16 @@ func (b *GatewayAttemptBudget) TimedOut() bool {
 }
 
 type GatewayAttemptResult struct {
-	Attempt     *model.GatewayAttempt
-	Failure     GatewayFailure
-	Delivered   bool
-	FirstByte   time.Duration
-	RetryAfter  string
-	HealthLease string
+	// TransportAttempt counts a native handshake against the same attempt
+	// budget without creating a model-generation accounting record.
+	TransportAttempt bool
+	Attempt          *model.GatewayAttempt
+	Failure          GatewayFailure
+	Delivered        bool
+	Established      bool
+	FirstByte        time.Duration
+	RetryAfter       string
+	HealthLease      string
 	// LocalRejection preserves a completed Attempt's costs without penalizing Provider health for a host gate.
 	LocalRejection bool
 	// Skipped excludes a candidate rejected by preparation, without an Attempt.
@@ -184,12 +275,16 @@ func RunGatewayAttempts(ctx context.Context, policy GatewayAttemptPolicy, execut
 	exclusions := &GatewayExclusions{Channels: map[int]bool{}, Providers: map[int]bool{}}
 	remaining := policy.TotalFirstByte
 	attempts := []model.GatewayAttempt{}
-	for len(attempts) < policy.MaxAttempts && ctx.Err() == nil && remaining >= 5*time.Second {
+	dispatched := 0
+	for dispatched < policy.MaxAttempts && ctx.Err() == nil && remaining >= 5*time.Second {
 		budget := &GatewayAttemptBudget{parent: ctx, policy: policy, remaining: remaining}
 		result := execute(budget, exclusions)
+		if result.Attempt != nil || result.TransportAttempt {
+			dispatched++
+		}
 		budget.Delivered()
 		remaining -= budget.elapsed
-		if budget.cancel != nil {
+		if budget.cancel != nil && !budget.handedOff {
 			budget.cancel(nil)
 		}
 		if result.Attempt == nil && result.Failure.Class != "" && !result.Failure.Switch {
@@ -197,6 +292,9 @@ func RunGatewayAttempts(ctx context.Context, policy GatewayAttemptPolicy, execut
 				attempts[len(attempts)-1].FailoverDecision = "stop"
 				attempts[len(attempts)-1].FailoverReason = result.Failure.Class
 			}
+			break
+		}
+		if result.TransportAttempt && (result.Established || !result.Failure.Switch || dispatched >= policy.MaxAttempts) {
 			break
 		}
 		if result.SkippedChannel > 0 && result.Attempt == nil {
@@ -218,7 +316,7 @@ func RunGatewayAttempts(ctx context.Context, policy GatewayAttemptPolicy, execut
 		}
 		attempt := result.Attempt
 		action, healthErr := ChannelHealth.Record(context.WithoutCancel(ctx), channelhealth.Sample{
-			AttemptID: attempt.ID, ChannelID: attempt.ChannelID, Success: attempt.Status == "success",
+			AttemptID: attempt.ID, ChannelID: attempt.ChannelID, Success: attempt.Status == "success" || attempt.Status == "pending",
 			ProviderFailure: result.Failure.Switch && !result.LocalRejection, RateLimited: result.Failure.Class == "rate_limited", FirstByte: result.FirstByte, RetryAfter: result.RetryAfter, Lease: result.HealthLease,
 		})
 		if healthErr == nil {
@@ -228,13 +326,15 @@ func RunGatewayAttempts(ctx context.Context, policy GatewayAttemptPolicy, execut
 		if attempt.FailoverReason == "" {
 			attempt.FailoverReason = "completed"
 		}
-		canSwitch := result.Failure.Switch && !result.Delivered && ctx.Err() == nil
+		canSwitch := result.Failure.Switch && !result.Delivered && !result.Established && ctx.Err() == nil
 		switch {
 		case result.Delivered:
 			attempt.FailoverReason = "business_delivered"
+		case result.Established:
+			attempt.FailoverReason = "connection_established"
 		case ctx.Err() != nil:
 			attempt.FailoverReason = "client_cancelled"
-		case len(attempts)+1 >= policy.MaxAttempts && canSwitch:
+		case dispatched >= policy.MaxAttempts && canSwitch:
 			attempt.FailoverReason = "attempt_limit"
 		case remaining < 5*time.Second && canSwitch:
 			attempt.FailoverReason = "first_byte_budget"

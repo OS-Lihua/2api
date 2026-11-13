@@ -2076,14 +2076,22 @@ export function extractUsageOnComplete(ctx,result,body){return body.usage;}
 			{"ep-endpoint", "image", "image", float64(dto.MaxImageN + 1), false},
 		} {
 			task := &model.Task{Properties: model.Properties{OriginModelName: tc.origin, UpstreamModelName: tc.upstream}}
-			body, err := common.Marshal(map[string]any{"usage": map[string]any{"units": tc.units, "mode": tc.mode}})
+			body, err := common.Marshal(map[string]any{"usage": map[string]any{"units": tc.units, "mode": tc.mode, "legacyRatio": 3}})
 			require.NoError(t, err)
 			result, err := adaptor.ParseTaskResult(task, &http.Response{StatusCode: http.StatusOK}, body)
 			require.NoError(t, err)
 			if tc.accepted {
-				assert.Equal(t, map[string]any{"units": tc.units, "mode": tc.mode}, result.UsageFacts)
+				assert.Equal(t, map[string]any{"units": tc.units, "mode": tc.mode, "legacyRatio": 3.0}, result.UsageFacts)
+				assert.False(t, result.UsageFactsUnknown)
+			} else if tc.upstream == "video" {
+				assert.Equal(t, map[string]any{"units": tc.units, "legacyRatio": 3.0}, result.UsageFacts,
+					"an invalid selected-profile enum is omitted while valid fields remain")
+				assert.True(t, result.UsageFactsUnknown)
 			} else {
-				assert.Nil(t, result.UsageFacts)
+				assert.Equal(t, model.TaskStatusSuccess, result.Status)
+				assert.Nil(t, result.UsageFacts["units"])
+				assert.True(t, result.UsageFactsUnknown,
+					"rejected terminal quantities must not fall back to submitted estimates")
 			}
 		}
 	})
@@ -2116,17 +2124,62 @@ export function extractUsageOnComplete(ctx,result,body){return body.usage;}
 		body := []byte(`{"items":[
 {"taskId":"image-task","status":"SUCCESS","data":{"usage":{"units":2,"mode":"image"}}},
 {"taskId":"video-task","status":"SUCCESS","data":{"usage":{"units":500000,"mode":"video"}}},
-{"taskId":"invalid-image","status":"SUCCESS","data":{"usage":{"units":129,"mode":"image"}}},
-{"taskId":"endpoint-image","status":"SUCCESS","data":{"usage":{"units":129,"mode":"image"}}}
+{"taskId":"invalid-image","status":"SUCCESS","data":{"usage":{"units":129,"mode":"image","legacyRatio":3}}},
+{"taskId":"endpoint-image","status":"SUCCESS","data":{"usage":{"units":129,"mode":"image","legacyRatio":3}}}
 ]}`)
 		results, err := adaptor.ParseBatchResult(tasks, &http.Response{StatusCode: http.StatusOK}, body)
 		require.NoError(t, err)
 		require.Len(t, results, 4)
-		assert.Nil(t, results["endpoint-image"].TaskInfo.UsageFacts, "endpoint upstream must keep the origin profile's count ceiling")
+		assert.Nil(t, results["invalid-image"].TaskInfo.UsageFacts["units"])
+		assert.Nil(t, results["endpoint-image"].TaskInfo.UsageFacts["units"], "endpoint upstream must keep the origin profile's count ceiling")
 		assert.Equal(t, map[string]any{"units": 500000.0, "mode": "video"}, results["video-task"].TaskInfo.UsageFacts)
 		assert.Equal(t, map[string]any{"units": 2.0, "mode": "image"}, results["image-task"].TaskInfo.UsageFacts)
-		assert.Nil(t, results["invalid-image"].TaskInfo.UsageFacts)
+		assert.Nil(t, results["invalid-image"].TaskInfo.UsageFacts["units"])
+		assert.Equal(t, map[string]any{"mode": "image", "legacyRatio": 3.0}, results["invalid-image"].TaskInfo.UsageFacts,
+			"one rejected quantity must not discard valid completion siblings")
+		assert.True(t, results["endpoint-image"].TaskInfo.UsageFactsUnknown)
+		assert.True(t, results["invalid-image"].TaskInfo.UsageFactsUnknown)
+		assert.Equal(t, string(model.TaskStatusSuccess), results["invalid-image"].TaskInfo.Status)
 	})
+}
+
+func TestTaskAdaptorCompletionNullWithholdsTerminalQuantity(t *testing.T) {
+	const source = `
+export const meta = {
+  apiVersion:1, key:"null-usage", name:"Null Usage", version:"1.0.0", author:{name:"Test"},
+  models:["video"], fetchMode:"per_task",
+  usageSchema:{tokens:{type:"number",unit:"token"}, resolution:{enum:["720p","1080p"]}},
+  usageExamples:[{label:"video",facts:{tokens:1,resolution:"720p"}}]
+};
+export function buildSubmitRequest(){return {url:"https://provider.example/submit"};}
+export function parseSubmitResponse(){return {taskId:"task"};}
+export function buildQueryRequest(){return {url:"https://provider.example/task"};}
+export function parseTaskResult(){return {status:"SUCCESS"};}
+export function extractUsageOnComplete(ctx,result,body){return body.usage;}
+`
+	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
+	require.NoError(t, err)
+	adaptor := New(plugin)
+	for _, tc := range []struct {
+		name    string
+		facts   any
+		want    map[string]any
+		unknown bool
+	}{
+		{"reported siblings settle", map[string]any{"tokens": 42, "resolution": "720p"}, map[string]any{"tokens": 42.0, "resolution": "720p"}, false},
+		{"null quantity is withheld", map[string]any{"tokens": nil, "resolution": "720p"}, map[string]any{"resolution": "720p"}, true},
+		{"null only leaves no facts", map[string]any{"tokens": nil}, nil, true},
+		{"invalid sibling keeps reported facts", map[string]any{"tokens": 42, "resolution": "4k"}, map[string]any{"tokens": 42.0}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := common.Marshal(map[string]any{"usage": tc.facts})
+			require.NoError(t, err)
+			result, err := adaptor.ParseTaskResult(&model.Task{Properties: model.Properties{UpstreamModelName: "video"}}, &http.Response{StatusCode: http.StatusOK}, body)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, result.UsageFacts)
+			assert.Equal(t, tc.unknown, result.UsageFactsUnknown)
+		})
+	}
 }
 
 const documentStreamPlugin = `

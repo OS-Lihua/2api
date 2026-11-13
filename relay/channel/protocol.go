@@ -233,6 +233,8 @@ func protocolRelayMode(kind protocol.Type) int {
 	switch kind {
 	case protocol.OpenAIResponses:
 		return relayconstant.RelayModeResponses
+	case protocol.OpenAIRealtime:
+		return relayconstant.RelayModeRealtime
 	case protocol.GeminiGenerate:
 		return relayconstant.RelayModeGemini
 	case protocol.GeminiEmbed, protocol.OpenAIEmbeddings:

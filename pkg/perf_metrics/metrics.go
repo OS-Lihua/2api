@@ -141,6 +141,9 @@ func Record(sample Sample) {
 	}
 	actual, _ := hotBuckets.LoadOrStore(key, &atomicBucket{})
 	actual.(*atomicBucket).add(sample)
+	if !common.RedisEnabled || common.RDB == nil {
+		return
+	}
 	gopool.Go(func() {
 		recordRedis(key, sample)
 	})

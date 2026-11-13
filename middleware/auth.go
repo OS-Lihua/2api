@@ -598,21 +598,60 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 	}
 }
 
-func TokenAuth() func(c *gin.Context) {
-	return tokenAuth(false)
+const taskReadAuthKey = "task_read_auth"
+
+func TokenAuth(credentialOnly ...bool) func(c *gin.Context) {
+	return tokenAuth(len(credentialOnly) > 0 && credentialOnly[0])
 }
 
-// GatewayTokenAuth selects wallet credentials only for stateless text HTTP and
-// model discovery. A configured legacy fallback still checks quota before dispatch.
+// TaskReadAuth validates credentials without requiring legacy quota for an
+// operation that only reads an existing task. Ownership is checked by handlers.
+func TaskReadAuth() gin.HandlerFunc {
+	authenticate := TokenAuth()
+	return func(c *gin.Context) {
+		if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
+			c.Set(taskReadAuthKey, true)
+		}
+		authenticate(c)
+	}
+}
+
+// TaskOriginAuth validates the normal token identity before an owned task can
+// determine its Offering. The submission path checks funding after ownership.
+func TaskOriginAuth() gin.HandlerFunc {
+	authenticate := TokenAuth()
+	return func(c *gin.Context) {
+		c.Set(taskReadAuthKey, true)
+		authenticate(c)
+	}
+}
+
+// LegacyTaskSubmissionAuth restores the legacy funding check after a native
+// decoder has established that the submission does not use a ModelOffering.
+func LegacyTaskSubmissionAuth() gin.HandlerFunc {
+	authenticate := TokenAuth()
+	return func(c *gin.Context) {
+		if TextOffering(c) != nil {
+			c.Next()
+			return
+		}
+		c.Set(taskReadAuthKey, false)
+		authenticate(c)
+	}
+}
+
+// GatewayTokenAuth authenticates gateway and discovery requests before resolution.
+// A configured legacy fallback still checks quota before dispatch.
 func GatewayTokenAuth() func(c *gin.Context) {
 	return func(c *gin.Context) {
 		textProtocol, _ := TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
-		if textProtocol != "" && c.GetTime(TextGatewayStartedAtKey).IsZero() {
+		realtime := c.Request.Method == http.MethodGet && c.Request.URL.Path == "/v1/realtime"
+		if (textProtocol != "" || realtime) && c.GetTime(TextGatewayStartedAtKey).IsZero() {
 			// Freeze request-start prices before credential lookups.
 			c.Set(TextGatewayStartedAtKey, clock.Now())
 		}
 		discovery := c.Request.Method == http.MethodGet && (strings.HasPrefix(c.Request.URL.Path, "/v1/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/openai/models"))
-		tokenAuth(textProtocol != "" || discovery)(c)
+		tokenAuth(textProtocol != "" || discovery || realtime)(c)
 	}
 }
 
@@ -661,7 +700,8 @@ func tokenAuth(walletCredential bool) func(c *gin.Context) {
 			key = parts[0]
 		}
 		validateToken := model.ValidateUserToken
-		if walletCredential || TextOffering(c) != nil || TextOfferingMissing(c) {
+		responsesHandshake := c.Request.Method == http.MethodGet && c.Request.URL.Path == "/v1/responses" && strings.EqualFold(c.GetHeader("Upgrade"), "websocket")
+		if walletCredential || TextOffering(c) != nil || TextOfferingMissing(c) || responsesHandshake || c.GetBool(taskReadAuthKey) {
 			validateToken = model.ValidateWalletToken
 		}
 		token, err := validateToken(key)

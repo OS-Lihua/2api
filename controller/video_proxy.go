@@ -93,7 +93,7 @@ func VideoProxy(c *gin.Context) {
 				if artifact.Type != "video" {
 					continue
 				}
-				adaptor, adaptorErr := initTaskArtifactAdaptor(task)
+				adaptor, adaptorErr := initTaskArtifactAdaptor(c.Request.Context(), task)
 				if adaptorErr == nil {
 					if provider, ok := adaptor.(relaychannel.TaskContentRequestProvider); ok {
 						descriptor, adaptorErr = provider.BuildContentRequest(c.Request.Context(), task, artifact.Key, relaychannel.TaskArtifactClientRequest{
@@ -104,6 +104,13 @@ func VideoProxy(c *gin.Context) {
 				}
 				if adaptorErr != nil {
 					logger.LogWarn(c.Request.Context(), common.LogText("Failed to resolve plugin video content for task %s: %v", taskID, adaptorErr))
+					if task.PrivateData.Gateway != nil && !strings.HasPrefix(strings.TrimSpace(task.GetResultURL()), "data:") {
+						writeTaskMediaProxyError(c, &taskMediaProxyError{
+							status: http.StatusServiceUnavailable, code: "artifact_plugin_unavailable",
+							message: "Artifact channel is unavailable", err: adaptorErr,
+						})
+						return
+					}
 					descriptor = nil
 				}
 				break
@@ -210,7 +217,16 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		}
 	}
 
-	channel, err := model.CacheGetProvider(task.ChannelId)
+	var channel *model.Provider
+	if task.PrivateData.Gateway != nil && descriptor.Authorize == nil {
+		var keyIndex int
+		channel, keyIndex, err = service.GatewayTaskProviderWithContext(c.Request.Context(), task)
+		if err == nil {
+			descriptor.Authorize = service.GatewayTaskCredentialCheck(task, channel.Key, keyIndex)
+		}
+	} else {
+		channel, err = service.GatewayTaskProviderIdentity(task)
+	}
 	if err != nil {
 		return &taskMediaProxyError{
 			status: http.StatusServiceUnavailable, code: "artifact_plugin_unavailable",
@@ -265,6 +281,7 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 	client = taskMediaRedirectClient(client, proxy, c, clientHeaders, descriptor.Credentialless)
 	clientWithoutBodyTimeout := *client
 	clientWithoutBodyTimeout.Timeout = 0
+	clientWithoutBodyTimeout.Transport = service.GatewayTaskHTTPTransport(client.Transport, descriptor.Authorize)
 	resp, err := doTaskMediaRequest(&clientWithoutBodyTimeout, req, taskMediaResponseHeaderTimeout)
 	if err != nil {
 		if errors.Is(err, errTaskMediaRequestRejected) {

@@ -34,11 +34,21 @@ type TaskPollingAdaptor interface {
 	AdjustBillingOnComplete(task *model.Task, taskResult *relaycommon.TaskInfo) int
 }
 
+type contextTaskPollingAdaptor interface {
+	FetchTaskWithContext(context.Context, string, string, *model.Task, string) (*http.Response, error)
+	ParseTaskResultWithContext(context.Context, *model.Task, *http.Response, []byte) (*relaycommon.TaskInfo, error)
+}
+
 type BatchTaskPollingAdaptor interface {
 	TaskPollingAdaptor
 	FetchMode() string
 	FetchBatchTasks(baseURL, key string, tasks []*model.Task, proxy string) (*http.Response, error)
 	ParseBatchResult(tasks []*model.Task, resp *http.Response, body []byte) (map[string]*BatchTaskResult, error)
+}
+
+type contextBatchTaskPollingAdaptor interface {
+	FetchBatchTasksWithContext(context.Context, string, string, []*model.Task, string) (*http.Response, error)
+	ParseBatchResultWithContext(context.Context, []*model.Task, *http.Response, []byte) (map[string]*BatchTaskResult, error)
 }
 
 const (
@@ -84,6 +94,9 @@ func sweepTimedOutTasks(ctx context.Context) {
 	timedOutCount := 0
 
 	for _, task := range tasks {
+		if task.PrivateData.Gateway != nil && !task.PrivateData.Gateway.Accepted {
+			continue
+		}
 		isLegacy := task.SubmitTime > 0 && task.SubmitTime < model.TaskRefundLegacyCutoff
 
 		oldStatus := task.Status
@@ -98,6 +111,11 @@ func sweepTimedOutTasks(ctx context.Context) {
 		} else {
 			task.FailReason = reason
 		}
+		if task.PrivateData.Gateway != nil {
+			// Timeout has no completion observation. Keep the submission estimates
+			// distinct from an explicit Provider failure or an actual completion.
+			task.PrivateData.Gateway.CompletionUnknown = true
+		}
 
 		won, err := task.UpdateWithStatus(oldStatus)
 		if err != nil {
@@ -109,6 +127,10 @@ func sweepTimedOutTasks(ctx context.Context) {
 			continue
 		}
 		timedOutCount++
+		if task.PrivateData.Gateway != nil {
+			finalizeTerminalTask(ctx, nil, task, nil)
+			continue
+		}
 		if !isLegacy && task.Quota != 0 {
 			RefundTaskQuota(ctx, task, reason)
 		}
@@ -146,8 +168,31 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 	allTasks := model.GetAllUnFinishSyncTasks(constant.TaskQueryLimit)
 	summary.UnfinishedTasks = len(allTasks)
 	platformTask := make(map[constant.TaskPlatform][]*model.Task)
+	gatewayTasks := make(map[int][]*model.Task)
 	for _, t := range allTasks {
+		if t.PrivateData.Gateway != nil {
+			if t.PrivateData.Gateway.Accepted {
+				providerID := t.PrivateData.Gateway.ProviderID
+				gatewayTasks[providerID] = append(gatewayTasks[providerID], t)
+			}
+			continue
+		}
 		platformTask[t.Platform] = append(platformTask[t.Platform], t)
+	}
+	var gatewayPolls sync.WaitGroup
+	for _, tasks := range gatewayTasks {
+		gatewayPolls.Add(1)
+		gopool.Go(func() {
+			defer gatewayPolls.Done()
+			for _, task := range tasks {
+				if ctx.Err() != nil {
+					return
+				}
+				if err := UpdateGatewayTask(ctx, task); err != nil {
+					logger.LogError(ctx, "Gateway task polling remains pending for task "+task.TaskID)
+				}
+			}
+		})
 	}
 
 	totalPlatforms := len(platformTask)
@@ -168,6 +213,9 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 		taskM := make(map[string]*model.Task)
 		nullTaskIds := make([]int64, 0)
 		for _, task := range tasks {
+			if task.PrivateData.Gateway != nil && !task.PrivateData.Gateway.Accepted {
+				continue
+			}
 			upstreamID := task.GetUpstreamTaskID()
 			if upstreamID == "" {
 				// 统计失败的未完成任务
@@ -195,6 +243,7 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 
 		DispatchPlatformUpdate(ctx, platform, taskChannelM, taskM)
 	}
+	gatewayPolls.Wait()
 	if report != nil && ctx.Err() == nil {
 		report(totalPlatforms, totalPlatforms)
 	}
@@ -236,7 +285,12 @@ func UpdateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, task
 	return nil
 }
 
-func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, channelId int, taskIds []string, taskM map[string]*model.Task) error {
+type gatewayTaskProviderSelection struct {
+	Provider *model.Provider
+	KeyIndex int
+}
+
+func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, channelId int, taskIds []string, taskM map[string]*model.Task, pinned ...gatewayTaskProviderSelection) error {
 	logger.LogInfo(ctx, common.LogText("channel #%d has %d unfinished tasks", channelId, len(taskIds)))
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -244,7 +298,13 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	if len(taskIds) == 0 {
 		return nil
 	}
-	ch, err := model.CacheGetProvider(channelId)
+	var ch *model.Provider
+	var err error
+	if len(pinned) > 0 {
+		ch = pinned[0].Provider
+	} else {
+		ch, err = model.CacheGetProvider(channelId)
+	}
 	if err != nil {
 		common.SysLog(common.LogText("CacheGetProvider: %v", err))
 		// Collect DB primary key IDs for bulk update (taskIds are upstream IDs, not task_id column values)
@@ -285,15 +345,30 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		ChannelSetting:  ch.GetSetting(),
 		HeadersOverride: ch.GetHeaderOverride(),
 	}
+	if len(pinned) > 0 {
+		info.ChannelMultiKeyIndex = pinned[0].KeyIndex
+	}
 	info.ApiKey = ch.Key
 	adaptor.Init(info)
-	resp, err := adaptor.FetchBatchTasks(baseURL, ch.Key, tasks, proxy)
+	contextual, hasContext := adaptor.(contextBatchTaskPollingAdaptor)
+	var resp *http.Response
+	if hasContext {
+		resp, err = contextual.FetchBatchTasksWithContext(ctx, baseURL, ch.Key, tasks, proxy)
+	} else {
+		resp, err = adaptor.FetchBatchTasks(baseURL, ch.Key, tasks, proxy)
+	}
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		common.SysLog(common.LogText("Get Task Do req error: %v", err))
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassTransport, 0, err.Error())
 	}
 	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(resp.Body)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err != nil {
 		common.SysLog(common.LogText("Get Suno Task parse body error: %v", err))
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassTransport, resp.StatusCode, err.Error())
@@ -312,7 +387,15 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	case pollClassTransient:
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassTransient, resp.StatusCode, "")
 	}
-	responseItems, err := adaptor.ParseBatchResult(tasks, resp, responseBody)
+	var responseItems map[string]*BatchTaskResult
+	if hasContext {
+		responseItems, err = contextual.ParseBatchResultWithContext(ctx, tasks, resp, responseBody)
+	} else {
+		responseItems, err = adaptor.ParseBatchResult(tasks, resp, responseBody)
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err != nil {
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassHookError, resp.StatusCode, err.Error())
 	}
@@ -376,6 +459,10 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 
 		isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 		terminalTransition := isDone && snap.Status != task.Status
+		if terminalTransition && task.PrivateData.Gateway != nil {
+			task.PrivateData.Gateway.CompletionFacts = responseItem.TaskInfo.UsageFacts
+			task.PrivateData.Gateway.CompletionUnknown = responseItem.TaskInfo.UsageFactsUnknown
+		}
 		won, updateErr := task.UpdateWithStatus(snap.Status)
 		if updateErr != nil {
 			common.SysLog(common.LogText("UpdateSunoTask task error: %s", updateErr.Error()))
@@ -508,12 +595,25 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		key = privateData.Key
 	}
 	snap := task.Snapshot()
-	resp, err := adaptor.FetchTask(baseURL, key, task, proxy)
+	contextual, hasContext := adaptor.(contextTaskPollingAdaptor)
+	var resp *http.Response
+	var err error
+	if hasContext {
+		resp, err = contextual.FetchTaskWithContext(ctx, baseURL, key, task, proxy)
+	} else {
+		resp, err = adaptor.FetchTask(baseURL, key, task, proxy)
+	}
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassTransport, 0, err.Error())
 	}
 	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(resp.Body)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err != nil {
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassTransport, resp.StatusCode, err.Error())
 	}
@@ -543,8 +643,18 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		taskResult.Progress = t.Progress
 		taskResult.Reason = t.FailReason
 		task.Data = t.Data
-	} else if taskResult, err = adaptor.ParseTaskResult(task, resp, responseBody); err != nil {
-		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, err.Error())
+	} else {
+		if hasContext {
+			taskResult, err = contextual.ParseTaskResultWithContext(ctx, task, resp, responseBody)
+		} else {
+			taskResult, err = adaptor.ParseTaskResult(task, resp, responseBody)
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil {
+			return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, err.Error())
+		}
 	}
 
 	logger.LogDebug(ctx, "updateVideoSingleTask taskResult: %+v", taskResult)
@@ -613,6 +723,10 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 	if isDone && snap.Status != task.Status {
+		if task.PrivateData.Gateway != nil {
+			task.PrivateData.Gateway.CompletionFacts = taskResult.UsageFacts
+			task.PrivateData.Gateway.CompletionUnknown = taskResult.UsageFactsUnknown
+		}
 		won, err := task.UpdateWithStatus(snap.Status)
 		if err != nil {
 			logger.LogError(ctx, common.LogText("UpdateWithStatus failed for task %s: %s", task.TaskID, err.Error()))
@@ -640,6 +754,15 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 // finalizeTerminalTask 终态统一收尾（状态 CAS 赢家调用，恰好一次）：采样 + 结算 + 失败兜底退款。
 func finalizeTerminalTask(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, taskResult *relaycommon.TaskInfo) {
 	perfmetrics.RecordTaskResult(task, taskResult)
+	if task.PrivateData.Gateway != nil && taskResult != nil {
+		task.PrivateData.Gateway.CompletionUnknown = taskResult.UsageFactsUnknown
+	}
+	if task.PrivateData.Gateway != nil {
+		if err := SettleGatewayTask(ctx, task); err != nil {
+			logger.LogError(ctx, "Gateway task settlement remains pending for task "+task.TaskID)
+		}
+		return
+	}
 	billingSettled := settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
 	if task.Status == model.TaskStatusFailure && !billingSettled && task.Quota != 0 {
 		RefundTaskQuota(ctx, task, task.FailReason)

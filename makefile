@@ -39,11 +39,20 @@ dev-web:
 dev: dev-api dev-web
 
 # The main package embeds the ignored web/dist output and is covered after build-web.
+# Give native WebSocket, text gateway, and remaining router tests separate package timers.
 test:
 	@echo "Testing root Go module..."
-	@root_module=$$(GOWORK=off go list -m); \
-		root_packages=$$(GOWORK=off go list -e ./... | grep -vxF "$$root_module"); \
-		GOWORK=off go test -timeout=40m $$root_packages
+	@set -eu; \
+		root_module=$$(GOWORK=off go list -m); \
+		router_package="$$root_module/router"; \
+		root_packages=$$(GOWORK=off go list -e ./... | grep -vxF -e "$$root_module" -e "$$router_package"); \
+		native_tests='^(TestResponsesWS|TestRealtime|TestWebSocket|TestNativeRouteCredentialForms)'; \
+		gateway_tests='^TestTextGateway'; \
+		other_tests='^(TestResponsesWS|TestRealtime|TestWebSocket|TestNativeRouteCredentialForms|TestTextGateway)'; \
+		GOWORK=off go test -timeout=40m $$root_packages; \
+		GOWORK=off go test -timeout=40m -run "$$native_tests" "$$router_package"; \
+		GOWORK=off go test -timeout=40m -run "$$gateway_tests" "$$router_package"; \
+		GOWORK=off go test -timeout=40m -skip "$$other_tests" "$$router_package"
 	@echo "Testing relaykit Go module..."
 	@cd relaykit && GOWORK=off go test ./...
 	@echo "Testing tokenkit Go module..."

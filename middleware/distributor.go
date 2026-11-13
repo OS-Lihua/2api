@@ -583,24 +583,27 @@ func getTaskOriginModelName(c *gin.Context) string {
 	return ""
 }
 
-func SetupContextForSelectedChannel(c *gin.Context, channel *model.Provider, modelName string) *types.NewAPIError {
-	return setupContextForSelectedChannel(c, channel, modelName, false)
+func SetupContextForSelectedChannel(c *gin.Context, channel *model.Provider, modelName string, pinnedKey ...int) *types.NewAPIError {
+	return setupContextForSelectedChannel(c, channel, modelName, false, pinnedKey...)
 }
 
 // SetupContextForGatewayCandidate projects account metadata without consuming
 // a Key rotation for a candidate that may subsequently be filtered out.
-func SetupContextForGatewayCandidate(c *gin.Context, provider *model.Provider, modelName string) *types.NewAPIError {
-	return setupContextForSelectedChannel(c, provider, modelName, true)
+func SetupContextForGatewayCandidate(c *gin.Context, provider *model.Provider, modelName string, pinnedKey ...int) *types.NewAPIError {
+	return setupContextForSelectedChannel(c, provider, modelName, true, pinnedKey...)
 }
 
-func setupContextForSelectedChannel(c *gin.Context, channel *model.Provider, modelName string, preview bool) *types.NewAPIError {
+func setupContextForSelectedChannel(c *gin.Context, channel *model.Provider, modelName string, preview bool, pinnedKey ...int) *types.NewAPIError {
 	c.Set("original_model", modelName) // for retry
 	expectedPlugin := c.GetString("expected_task_plugin_key")
 	if channel == nil {
 		logTaskPluginChannelDecision(c, nil, modelName, "channel_rejected", "nil_channel")
 		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
-	if expectedPlugin != "" && !channelMatchesExpectedTaskPlugin(c, channel, expectedPlugin) {
+	// ModelOffering task Channels bind the plugin through their protocol;
+	// legacy Provider bindings apply only to legacy task distribution.
+	gatewayTask := TextOffering(c) != nil && c.GetBool("task_gateway_channel_selected")
+	if !gatewayTask && expectedPlugin != "" && !channelMatchesExpectedTaskPlugin(c, channel, expectedPlugin) {
 		logTaskPluginChannelDecision(c, channel, modelName, "channel_rejected", "identity_mismatch")
 		return types.NewError(
 			errors.New("selected channel does not match the pinned task plugin"),
@@ -608,7 +611,7 @@ func setupContextForSelectedChannel(c *gin.Context, channel *model.Provider, mod
 			types.ErrOptionWithSkipRetry(),
 		)
 	}
-	if index, matched := pinnedEndpointCandidateForChannel(c, channel, expectedPlugin); matched {
+	if index, matched := pinnedEndpointCandidateForChannel(c, channel, expectedPlugin); !gatewayTask && matched {
 		previousPlugin := ""
 		var selected *jsplugin.LoadedPlugin
 		var generation *jsplugin.RoutingGeneration
@@ -680,13 +683,33 @@ func setupContextForSelectedChannel(c *gin.Context, channel *model.Provider, mod
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
-	selectKey := channel.GetNextEnabledKey
-	if preview {
-		selectKey = channel.PreviewEnabledKey
-	}
-	key, index, newAPIError := selectKey()
-	if newAPIError != nil {
-		return newAPIError
+	var key string
+	var index int
+	if len(pinnedKey) > 0 {
+		index = pinnedKey[0]
+		if channel.ProviderInfo.IsMultiKey {
+			keys := channel.GetKeys()
+			status, configured := channel.ProviderInfo.MultiKeyStatusList[index]
+			if index < 0 || index >= len(keys) || configured && status != common.ChannelStatusEnabled {
+				return types.NewError(errors.New("the upstream connection credential is no longer enabled"), types.ErrorCodeChannelNoAvailableKey, types.ErrOptionWithSkipRetry())
+			}
+			key = keys[index]
+		} else {
+			if index != 0 {
+				return types.NewError(errors.New("upstream credential identity changed"), types.ErrorCodeChannelNoAvailableKey, types.ErrOptionWithSkipRetry())
+			}
+			key = channel.Key
+		}
+	} else {
+		var newAPIError *types.NewAPIError
+		selectKey := channel.GetNextEnabledKey
+		if preview {
+			selectKey = channel.PreviewEnabledKey
+		}
+		key, index, newAPIError = selectKey()
+		if newAPIError != nil {
+			return newAPIError
+		}
 	}
 	if channel.ProviderInfo.IsMultiKey {
 		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)

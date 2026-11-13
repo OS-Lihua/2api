@@ -370,8 +370,8 @@ func CompilePlugin(source string, options Options) (*LoadedPlugin, error) {
 			return nil, fmt.Errorf("plugin %s is missing required export %q", meta.Key, hook)
 		}
 	}
-	artifactHooks := make(map[string]bool, 2)
-	for _, hook := range []string{"listArtifacts", "buildContentRequest"} {
+	optionalHooks := make(map[string]bool, 3)
+	for _, hook := range []string{"extractCapabilities", "listArtifacts", "buildContentRequest"} {
 		if !engine.HasExport(hook) {
 			continue
 		}
@@ -382,9 +382,9 @@ func CompilePlugin(source string, options Options) (*LoadedPlugin, error) {
 		if !callable {
 			return nil, fmt.Errorf("plugin %s export %q is not a function", meta.Key, hook)
 		}
-		artifactHooks[hook] = true
+		optionalHooks[hook] = true
 	}
-	if artifactHooks["listArtifacts"] != artifactHooks["buildContentRequest"] {
+	if optionalHooks["listArtifacts"] != optionalHooks["buildContentRequest"] {
 		return nil, fmt.Errorf("plugin %s must export listArtifacts and buildContentRequest together", meta.Key)
 	}
 	for _, route := range meta.Routes {
@@ -406,6 +406,9 @@ func CompilePlugin(source string, options Options) (*LoadedPlugin, error) {
 		definition, _ := HostProtocol(protocol)
 		required := make(map[string]struct{})
 		allowed := make(map[string]struct{})
+		if protocol == "openai_video" {
+			allowed["decodeRemixRequest"] = struct{}{}
+		}
 		modeHookUsers := make(map[string][]string)
 		for _, operation := range definition.Operations {
 			for _, hook := range operation.RequiredProtocolMembers {
@@ -499,6 +502,17 @@ func CompilePlugin(source string, options Options) (*LoadedPlugin, error) {
 		implementation, ok := protocolObject[protocol].(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf("plugin %s protocol %q must be an object", meta.Key, protocol)
+		}
+		if protocol == "openai_video" {
+			if _, present := implementation["decodeRemixRequest"]; present {
+				callable, err := engine.HasCallablePath(context.Background(), "protocols", protocol, "decodeRemixRequest")
+				if err != nil {
+					return nil, err
+				}
+				if !callable {
+					return nil, fmt.Errorf("plugin %s protocol %q remix decoder must be callable", meta.Key, protocol)
+				}
+			}
 		}
 		for member := range implementation {
 			if _, accepted := allowed[member]; !accepted {
@@ -1211,7 +1225,7 @@ func normalizeV1Meta(meta *Meta) error {
 		if !HasCapability(name) || seenCapabilities[name] {
 			return fmt.Errorf("unsupported or duplicate required capability %q", name)
 		}
-		if name == CapabilitySubmitSSEDelta && !slices.Contains(meta.SubmitResponseTypes, "sse") {
+		if (name == CapabilitySubmitSSEDelta || name == CapabilitySubmitSSEBusiness) && !slices.Contains(meta.SubmitResponseTypes, "sse") {
 			return fmt.Errorf("%s requires submitResponseTypes to include sse", name)
 		}
 		seenCapabilities[name] = true

@@ -1,9 +1,13 @@
 package channel
 
 import (
+	"bytes"
+	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -13,6 +17,7 @@ import (
 
 	common2 "github.com/QuantumNous/new-api/common"
 	appconstant "github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
@@ -401,21 +406,56 @@ func DoFormRequest(a ProviderTransport, c *gin.Context, info *common.RelayInfo, 
 // request context, and reports a rejected handshake as a *types.NewAPIError
 // carrying the upstream status code (types.NewError preserves it).
 func DoWssRequest(a ProviderTransport, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*websocket.Conn, error) {
+	prepared, err := PrepareWssRequest(a, c, info)
+	if err != nil {
+		return nil, err
+	}
+	return DoPreparedWssRequest(c, prepared)
+}
+
+// PreparedWssRequest holds transient Provider credentials only at the transport
+// boundary. Pricing probes receive copies; no prepared request is persisted.
+type PreparedWssRequest struct {
+	language   string
+	url        string
+	header     http.Header
+	dialer     websocket.Dialer
+	identity   [32]byte
+	managed    bool
+	retryAfter string
+	statusCode int
+}
+
+func (request *PreparedWssRequest) Headers() http.Header { return request.header.Clone() }
+func (request *PreparedWssRequest) Identity() [32]byte   { return request.identity }
+func (request *PreparedWssRequest) RetryAfter() string   { return request.retryAfter }
+func (request *PreparedWssRequest) HandshakeStatus() int { return request.statusCode }
+
+// PrepareWssRequest performs no Provider I/O.
+func PrepareWssRequest(a ProviderTransport, c *gin.Context, info *common.RelayInfo) (*PreparedWssRequest, error) {
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", err)
-	}
-	fullRequestURL = toWebSocketURL(fullRequestURL)
-	if targetURL, parseErr := url.Parse(fullRequestURL); parseErr == nil {
-		common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, targetURL.Scheme+"://"+targetURL.Host)
 	}
 	targetHeader := http.Header{}
 	err = a.SetupRequestHeader(c, &targetHeader, info)
 	if err != nil {
 		return nil, fmt.Errorf("setup request header failed: %w", err)
 	}
-	// 在 SetupRequestHeader 之后应用 Header Override，确保用户设置优先级最高
-	// 这样可以覆盖默认的 Authorization header 设置
+	return PrepareWssTransport(c, info, fullRequestURL, targetHeader)
+}
+
+// PrepareWssTransport shares the existing socket dialer with independently
+// selected native protocols. It performs no I/O and owns its header copy.
+func PrepareWssTransport(c *gin.Context, info *common.RelayInfo, fullRequestURL string, targetHeader http.Header) (*PreparedWssRequest, error) {
+	fullRequestURL = toWebSocketURL(fullRequestURL)
+	targetURL, err := url.Parse(fullRequestURL)
+	if err != nil || targetURL.Hostname() == "" || targetURL.Scheme != "ws" && targetURL.Scheme != "wss" {
+		return nil, errors.New("invalid upstream WebSocket URL")
+	}
+	common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, targetURL.Scheme+"://"+targetURL.Host)
+	targetHeader = targetHeader.Clone()
+	// Apply the configured Provider header overrides after authentication.
 	headerOverride, err := processHeaderOverride(info, c)
 	if err != nil {
 		return nil, err
@@ -435,16 +475,78 @@ func DoWssRequest(a ProviderTransport, c *gin.Context, info *common.RelayInfo, r
 	if info.ChannelSetting.TLSInsecureSkipVerify {
 		dialer.TLSClientConfig = common2.InsecureTLSConfig
 	}
-	targetConn, resp, err := dialer.DialContext(c.Request.Context(), fullRequestURL, targetHeader)
+	var identity bytes.Buffer
+	identity.WriteString(fullRequestURL)
+	_ = targetHeader.Write(&identity)
+	identity.WriteString(info.ChannelSetting.Proxy)
+	identity.WriteString(fmt.Sprint(info.ChannelSetting.TLSInsecureSkipVerify))
+	return &PreparedWssRequest{language: i18n.StatedLang(c), url: fullRequestURL, header: targetHeader, dialer: dialer, identity: sha256.Sum256(identity.Bytes()), managed: info.ResponseFacts != nil}, nil
+}
+
+func DoPreparedWssRequest(c *gin.Context, request *PreparedWssRequest) (*websocket.Conn, error) {
+	ctx := c.Request.Context()
+	dialer := request.dialer
+	networkDial := dialer.NetDialContext
+	if networkDial == nil {
+		networkDial = (&net.Dialer{}).DialContext
+		if dialer.NetDial != nil {
+			networkDial = func(_ context.Context, network, address string) (net.Conn, error) {
+				return request.dialer.NetDial(network, address)
+			}
+		}
+	}
+	var stopCancellation func() bool
+	watchHandshake := func(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+		return func(dialContext context.Context, network, address string) (net.Conn, error) {
+			connection, err := dial(dialContext, network, address)
+			if err == nil {
+				stopCancellation = context.AfterFunc(ctx, func() { _ = connection.Close() })
+			}
+			return connection, err
+		}
+	}
+	dialer.NetDialContext = watchHandshake(networkDial)
+	if dialer.NetDialTLSContext != nil {
+		dialer.NetDialTLSContext = watchHandshake(dialer.NetDialTLSContext)
+	}
+	// Gorilla applies context deadlines to the handshake, but cancellation after
+	// TCP connect also needs to close the connection while reading HTTP headers.
+	targetConn, resp, err := dialer.DialContext(ctx, request.url, request.header)
+	if stopCancellation != nil {
+		stopCancellation()
+	}
+	if ctx.Err() != nil {
+		if targetConn != nil {
+			_ = targetConn.Close()
+			targetConn = nil
+		}
+		err = context.Cause(ctx)
+	}
+	if resp != nil {
+		request.statusCode = resp.StatusCode
+	}
 	if err != nil {
 		statusCode := http.StatusInternalServerError
 		if resp != nil {
 			statusCode = resp.StatusCode
+			request.retryAfter = resp.Header.Get("Retry-After")
 			if resp.Body != nil {
-				_ = resp.Body.Close()
+				defer resp.Body.Close()
+				if request.managed {
+					raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+					var payload struct {
+						Error struct {
+							Code string `json:"code"`
+							Type string `json:"type"`
+						} `json:"error"`
+					}
+					if readErr == nil && common2.Unmarshal(raw, &payload) == nil && len(payload.Error.Code) <= 128 && len(payload.Error.Type) <= 128 && (payload.Error.Code != "" || payload.Error.Type != "") {
+						return nil, types.WithOpenAIError(types.OpenAIError{Message: i18n.Translate(request.language, "Upstream WebSocket handshake rejected"), Code: payload.Error.Code, Type: payload.Error.Type}, statusCode)
+					}
+				}
 			}
 		}
-		return nil, types.NewErrorWithStatusCode(fmt.Errorf("dial failed to %s: %w", common.SanitizeURLForLog(fullRequestURL), redactUpstreamURLError(err)), types.ErrorCodeDoRequestFailed, statusCode)
+		return nil, types.NewErrorWithStatusCode(fmt.Errorf("dial failed to %s: %w", common.SanitizeURLForLog(request.url), redactUpstreamURLError(err)), types.ErrorCodeDoRequestFailed, statusCode)
 	}
 	return targetConn, nil
 }
@@ -568,6 +670,11 @@ func DoTaskApiRequest(a TaskAdaptor, c *gin.Context, info *common.RelayInfo, req
 	}
 	if err = ApplyHeaderOverride(info, c, req); err != nil {
 		return nil, err
+	}
+	if info.TaskRelayInfo != nil && info.OnPreparedRequest != nil {
+		if err := info.OnPreparedRequest(req); err != nil {
+			return nil, err
+		}
 	}
 	resp, err := doRequest(c, req, info)
 	if err != nil {

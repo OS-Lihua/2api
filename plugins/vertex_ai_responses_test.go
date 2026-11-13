@@ -474,10 +474,10 @@ func TestVertexAIOmniUsageAndVideoDecoder(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, map[string]any{"input_tokens": float64(12), "output_tokens": float64(47), "video_tokens": float64(5793)}, decodePluginValue(t, completed))
-	// Unreported facts are omitted so the host keeps the submit estimate.
+	// Unreported terminal quantities are null so the host keeps the reservation.
 	partial, err := plugin.Engine.Call(t.Context(), "extractUsageOnComplete", map[string]any{"upstreamModel": omni}, map[string]any{}, map[string]any{"usage": map[string]any{"total_input_tokens": 12}})
 	require.NoError(t, err)
-	assert.Equal(t, map[string]any{"input_tokens": float64(12)}, decodePluginValue(t, partial))
+	assert.Equal(t, map[string]any{"input_tokens": float64(12), "output_tokens": nil, "video_tokens": nil}, decodePluginValue(t, partial))
 	veo, err := plugin.Engine.Call(t.Context(), "extractUsageOnComplete", map[string]any{"upstreamModel": "veo-3.0-generate-001"}, map[string]any{}, map[string]any{"done": true})
 	require.NoError(t, err)
 	assert.Nil(t, veo)

@@ -3,6 +3,7 @@ package common
 import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/capability"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/tidwall/gjson"
@@ -14,6 +15,26 @@ import (
 // zero remains authoritative even when the other counter needs estimation.
 func ChatUsagePresence(body []byte) (prompt, completion bool) {
 	return NativeUsagePresence(body, "usage.prompt_tokens", "usage.completion_tokens", "usage.total_tokens")
+}
+
+// RealtimeResponseFacts is transient evidence for one native response. The
+// lifecycle stores quantitative usage and frozen pricing, never this object.
+type RealtimeResponseFacts struct {
+	ID           string
+	Usage        *dto.Usage
+	Facts        *ResponseFacts
+	Outcome      StreamOutcome
+	StreamStatus *StreamStatus
+}
+
+// ResponsesInputFacts freezes billable input and reusable conversation quantities.
+// Context excludes configuration that the Responses protocol does not inherit.
+type ResponsesInputFacts struct {
+	Usage           *dto.Usage
+	Context         *dto.Usage
+	ImageCount      int
+	InputModalities []capability.Modality
+	ToolCalls       bool
 }
 
 // ChatStreamBusinessText extracts generated content independently of delivery.
@@ -57,7 +78,9 @@ func ChatStreamChoiceBusinessText(choice gjson.Result) string {
 // and business output from protocol framing and keep-alive pings. It contains
 // transient source and delivered output only; callers must never persist either.
 type ResponseFacts struct {
+	UsageEstimated           bool
 	UsageReported            bool
+	InputDetailsReported     bool
 	PromptTokensReported     bool
 	CompletionTokensReported bool
 	IndependentUsageReported bool
@@ -65,11 +88,16 @@ type ResponseFacts struct {
 	TerminalDelivered        bool `json:"-"`
 	ExpectedChoices          int  `json:"-"`
 	DownstreamWriteFailed    bool
+	GeneratedToolCalls       bool
+	GeneratedAudioBytes      int64
 	GeneratedText            string
+	SourceOutputDetails      dto.OutputTokenDetails
 	SourceGeneratedText      string `json:"-"`
 	SourceOutputObserved     bool   `json:"-"`
 	SourceOutputTokens       *int   `json:"-"`
 	GeneratedOutputTokens    *int
+	DeliveredOutputTokens    *int
+	DeliveredOutputDetails   dto.OutputTokenDetails
 	OutputLimitObserved      bool   `json:"-"`
 	UnterminatedStreamData   []byte `json:"-"`
 	UnterminatedStreamEvent  string `json:"-"`

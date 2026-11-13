@@ -25,11 +25,21 @@ export type RequestStatus =
   | 'cancelled'
   | 'partial'
   | 'settlement_pending'
+  | 'pending'
+  | 'submission_unknown'
 export type UsageSource = 'upstream' | 'estimated' | 'none'
 export interface RequestUsage {
+  task_facts?: Record<string, number | string | boolean>
   prompt_tokens?: number
   completion_tokens?: number
   total_tokens?: number
+  cached_tokens?: number
+  cache_creation_tokens?: number
+  cache_creation_12h_tokens?: number
+  image_input_tokens?: number
+  audio_input_tokens?: number
+  image_output_tokens?: number
+  audio_output_tokens?: number
 }
 export interface RequestLog {
   id: string

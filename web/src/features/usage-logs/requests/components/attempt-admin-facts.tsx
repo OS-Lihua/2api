@@ -27,6 +27,8 @@ import { RequestMoney } from './request-facts'
 export function AttemptAdminFacts(props: { attempt: RequestAttempt }) {
   const { t } = useTranslation()
   const attempt = props.attempt
+  const pending =
+    attempt.status === 'pending' || attempt.status === 'submission_unknown'
   const fields = [
     [t('Provider ID'), attempt.provider_id],
     [t('Channel ID'), attempt.channel_id],
@@ -53,7 +55,7 @@ export function AttemptAdminFacts(props: { attempt: RequestAttempt }) {
           <dd className='mt-1'>
             <RequestMoney
               amount={attempt.cost}
-              pending={attempt.cost_pending}
+              pending={pending || attempt.cost_pending}
             />
           </dd>
         </div>
@@ -62,7 +64,11 @@ export function AttemptAdminFacts(props: { attempt: RequestAttempt }) {
           <dd className='mt-1'>
             <RequestMoney
               amount={attempt.converted_cost}
-              pending={attempt.cost_pending || attempt.converted_cost_pending}
+              pending={
+                pending ||
+                attempt.cost_pending ||
+                attempt.converted_cost_pending
+              }
             />
           </dd>
         </div>
