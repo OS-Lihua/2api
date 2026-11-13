@@ -9365,8 +9365,16 @@ func TestMediaGatewayHostImagesRetainTaskPluginCandidates(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"output":{"choices":[{"message":{"content":[{"image":"https://image.invalid/one"}]}}]},"usage":{"image_count":1}}`)
 	})
+	require.NoError(t, model.DB.AutoMigrate(&model.Task{}))
 	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeAli).Error)
 	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"upstream_model_name": "qwen-image-2.0", "protocol": protocol.Type("task:alibaba")}).Error)
+	fixture.fake.Advance(time.Second)
+	for _, price := range []*model.PriceVersion{
+		{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("image", image_count * 0.04)`, EffectiveAt: clock.Now().Unix()},
+		{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("image", u("image_count") * 0.02)`, EffectiveAt: clock.Now().Unix()},
+	} {
+		require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+	}
 	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", `{"model":"gateway-alias","prompt":"draw","n":1}`)
 	assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
 	assert.Equal(t, 1, calls)
@@ -13378,6 +13386,69 @@ func TestMediaGatewayAbortedImageStreamKeepsFinalWireReservationEstimate(t *test
 	require.NoError(t, err)
 	require.EqualValues(t, 1, total)
 	assert.Equal(t, int64(80_000_000), attempts[0].Cost.Nanos)
+}
+
+func TestMediaGatewayRouteConcurrencyRenewalFailureCancelsProvider(t *testing.T) {
+	cancelled := make(chan struct{})
+	fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"image_generation.completed\",\"url\":\"https://artifact.invalid/first.png\"}\n\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+		close(cancelled)
+	})
+	constant.StreamingTimeout = 300
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr(), MaxRetries: -1})
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	service.GatewayRouteQuota = service.NewGatewayRouteQuota(client)
+	require.NoError(t, model.DB.Model(fixture.channel).Update("max_concurrency", 1).Error)
+	ctx, cancel := context.WithCancel(t.Context())
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gateway-alias","prompt":"draw","n":2,"stream":true}`)).WithContext(ctx)
+	request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+	request.Header.Set("Content-Type", "application/json")
+	writer := &gatewayObservedDeliveryWriter{ResponseRecorder: httptest.NewRecorder(), delivered: make(chan struct{})}
+	done := make(chan struct{})
+	go func() { fixture.engine.ServeHTTP(writer, request); close(done) }()
+	defer func() {
+		server.SetError("")
+		cancel()
+		<-done
+	}()
+	select {
+	case <-writer.delivered:
+	case <-done:
+		t.Fatalf("stream ended before business delivery: %d %s", writer.Code, writer.Body.String())
+	case <-time.After(5 * time.Second):
+		t.Fatal("business frame was not delivered")
+	}
+	server.SetError("ERR injected quota renewal failure")
+	fixture.fake.Advance(time.Minute)
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("Provider remained active after its shared concurrency lease could not be renewed")
+	}
+	server.SetError("")
+	<-done
+	assert.Contains(t, writer.Body.String(), "https://artifact.invalid/first.png")
+	assert.NotContains(t, writer.Body.String(), "[DONE]")
+	record, err := model.GetGatewayRequest(t.Context(), writer.Header().Get(common.RequestIdKey), fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, "partial", record.Status)
+	assert.Equal(t, int64(36_000_000), record.Receivable.Nanos)
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, "channel_unavailable", attempts[0].ErrorClass)
+	assert.Equal(t, int64(40_000_000), attempts[0].Cost.Nanos)
+	health, err := service.ChannelHealth.Snapshots(t.Context(), []int{fixture.channel.ID})
+	require.NoError(t, err)
+	assert.Zero(t, health[fixture.channel.ID].Samples)
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, int64(964_000_000), wallet.Balance.Nanos)
 }
 
 func TestMediaGatewayKeepAliveFailureDoesNotBlameProvider(t *testing.T) {

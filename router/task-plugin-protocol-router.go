@@ -36,8 +36,8 @@ func taskPluginProtocolHandlers(protocol, operation string) ([]gin.HandlerFunc, 
 		}, nil
 	case "openai_image.generate", "openai_image.edit":
 		return []gin.HandlerFunc{
-			middleware.RouteTag("relay"), middleware.SystemPerformanceCheck(), middleware.GatewayTokenAuth(), middleware.ResolveTextOffering(),
-			middleware.ModelRequestRateLimit(), controller.MediaGateway, middleware.RouteTaskPluginEndpoint(), middleware.PrepareTaskPluginEndpoint(), middleware.Distribute(),
+			middleware.RouteTag("relay"), middleware.SystemPerformanceCheck(), middleware.GatewayTokenAuth(), middleware.ResolveTextOffering(), controller.AuthorizeTaskGateway,
+			middleware.ModelRequestRateLimit(), middleware.RouteTaskPluginEndpoint(), controller.MediaGateway, middleware.PrepareTaskPluginEndpoint(), controller.TaskGateway, middleware.Distribute(),
 			func(c *gin.Context) {
 				controller.RelayTaskPluginEndpoint(c, func(c *gin.Context) { controller.Relay(c, types.RelayFormatOpenAIImage) })
 			},

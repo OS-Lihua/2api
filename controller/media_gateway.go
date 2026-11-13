@@ -57,7 +57,7 @@ type mediaGatewayRun struct {
 // MediaGateway composes authenticated synchronous image/audio protocols with
 // the shared attempt budget and the single GatewayBilling money lifecycle.
 func MediaGateway(c *gin.Context) {
-	if !middleware.IsMediaGatewayEndpoint(c.Request.Method, c.Request.URL.Path) {
+	if !middleware.IsMediaGatewayEndpoint(c.Request.Method, c.Request.URL.Path) || c.GetBool("task_gateway_endpoint") {
 		c.Next()
 		return
 	}
@@ -238,6 +238,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		}
 		return result
 	}
+	budget.RequirePermit(selection.Permit)
 	contactedProvider := false
 	defer func() {
 		ctx := context.WithoutCancel(c.Request.Context())
@@ -626,6 +627,10 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		attempt.Status = "failed"
 	}
 	failure := service.ClassifyGatewayFailure(status, code, transport, budget.TimedOut(), parent.Context().Err() != nil, facts.DownstreamWriteFailed, errorType)
+	localRejection := errors.Is(context.Cause(c.Request.Context()), service.ErrGatewayPermitLost)
+	if localRejection && parent.Context().Err() == nil && !facts.DownstreamWriteFailed {
+		failure = service.GatewayFailure{Class: "channel_unavailable", Switch: true, ExcludeProvider: true}
+	}
 	if attempt.Status == "success" {
 		service.RecordGatewayChannelAffinity(c, selection)
 		failure = service.GatewayFailure{}
@@ -785,7 +790,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 		run.record.ErrorCode = attempt.ErrorClass
 	}
 	result = service.GatewayAttemptResult{Attempt: attempt, Failure: failure, Delivered: facts.BusinessOutput,
-		FirstByte: firstByte, HealthLease: selection.Admission.Lease}
+		FirstByte: firstByte, HealthLease: selection.Admission.Lease, LocalRejection: localRejection}
 	if failure.Class == "rate_limited" {
 		result.RetryAfter = retryAfter
 		if result.RetryAfter == "" {
