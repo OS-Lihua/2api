@@ -396,7 +396,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	selection.LossFallback = false
 	if !profitable {
 		if run.offering.AllowLossFallback {
-			selection.LossFallback, err = selection.LossFallbackAllowed(c.Request.Context(), comparison, run.offering.MinimumMarginRate)
+			selection.LossFallback, err = selection.LossFallbackAllowed(c.Request.Context(), comparison, run.offering.MinimumMarginRate, contactedProvider)
 		}
 		if err != nil || !selection.LossFallback {
 			run.code = "channel_unavailable"
@@ -635,7 +635,7 @@ func (run *mediaGatewayRun) attempt(budget *service.GatewayAttemptBudget, exclus
 	} else {
 		attempt.ErrorClass = failure.Class
 	}
-	gatewayAutoDisableProvider(c, selection, info, failure)
+	recordGatewayProviderFailure(c, info, selection, failure)
 	run.record.Status = attempt.Status
 	if facts.BusinessOutput {
 		run.record.ChoiceCount = count

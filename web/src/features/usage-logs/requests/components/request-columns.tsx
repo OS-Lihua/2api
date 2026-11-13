@@ -108,7 +108,11 @@ export function useRequestColumns(onSelect: (request: RequestLog) => void) {
         cell: ({ row }) => (
           <RequestMoney
             amount={row.original.receivable}
-            pending={row.original.sale_pending}
+            pending={
+              row.original.sale_pending ||
+              row.original.status === 'pending' ||
+              row.original.status === 'submission_unknown'
+            }
           />
         ),
       },

@@ -6,6 +6,7 @@ import (
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/capability"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/tidwall/gjson"
@@ -31,6 +32,26 @@ func MediaUsagePresence(body []byte) (prompt, completion bool) {
 	return NativeUsagePresence(body, input, output, "")
 }
 
+// RealtimeResponseFacts is transient evidence for one native response. The
+// lifecycle stores quantitative usage and frozen pricing, never this object.
+type RealtimeResponseFacts struct {
+	ID           string
+	Usage        *dto.Usage
+	Facts        *ResponseFacts
+	Outcome      StreamOutcome
+	StreamStatus *StreamStatus
+}
+
+// ResponsesInputFacts freezes billable input and reusable conversation quantities.
+// Context excludes configuration that the Responses protocol does not inherit.
+type ResponsesInputFacts struct {
+	Usage           *dto.Usage
+	Context         *dto.Usage
+	ImageCount      int
+	InputModalities []capability.Modality
+	ToolCalls       bool
+}
+
 // ChatStreamBusinessText extracts generated content independently of delivery.
 func ChatStreamBusinessText(body []byte) string {
 	var text strings.Builder
@@ -49,17 +70,26 @@ func SourceText(value gjson.Result) string {
 	return text
 }
 
+// SourceReasoningText preserves an explicit empty primary and recovers a complete alias.
+func SourceReasoningText(message gjson.Result) string {
+	if value := message.Get("reasoning_content"); value.Type == gjson.String {
+		var text string
+		if common.UnmarshalJsonStr(value.Raw, &text) == nil {
+			return text
+		}
+	}
+	return SourceText(message.Get("reasoning"))
+}
+
 // ChatStreamChoiceBusinessText preserves the content within one independent output.
 func ChatStreamChoiceBusinessText(choice gjson.Result) string {
 	var text strings.Builder
 	text.WriteString(SourceText(choice.Get("delta.content")))
-	if reasoning := choice.Get("delta.reasoning_content"); reasoning.Exists() {
-		text.WriteString(SourceText(reasoning))
-	} else {
-		text.WriteString(SourceText(choice.Get("delta.reasoning")))
-	}
+	text.WriteString(SourceReasoningText(choice.Get("delta")))
 	text.WriteString(SourceText(choice.Get("delta.refusal")))
 	text.WriteString(SourceText(choice.Get("delta.audio.transcript")))
+	text.WriteString(SourceText(choice.Get("delta.function_call.name")))
+	text.WriteString(SourceText(choice.Get("delta.function_call.arguments")))
 	for _, tool := range choice.Get("delta.tool_calls").Array() {
 		for _, field := range []string{"function.name", "function.arguments", "custom.name", "custom.input"} {
 			text.WriteString(SourceText(tool.Get(field)))
@@ -72,7 +102,9 @@ func ChatStreamChoiceBusinessText(choice gjson.Result) string {
 // and business output from protocol framing and keep-alive pings. It contains
 // transient source and delivered output only; callers must never persist either.
 type ResponseFacts struct {
+	UsageEstimated           bool
 	UsageReported            bool
+	InputDetailsReported     bool
 	PromptTokensReported     bool
 	CompletionTokensReported bool
 	IndependentUsageReported bool
@@ -80,6 +112,8 @@ type ResponseFacts struct {
 	TerminalDelivered        bool `json:"-"`
 	ExpectedChoices          int  `json:"-"`
 	DownstreamWriteFailed    bool
+	GeneratedToolCalls       bool
+	GeneratedAudioBytes      int64
 	GeneratedText            string
 	// ImageCount is the bounded payload count, including an empty response.
 	// Nil means that an actual count is not yet known.
@@ -89,7 +123,6 @@ type ResponseFacts struct {
 	AudioOutputSeconds                 *string
 	AudioOutputSampleRate              int
 	AudioOutputChannels                int
-	GeneratedAudioBytes                int64
 	DeliveredAudioBytes                int64
 	DeliveredAudioSeconds              *string
 	GeneratedImageCount                int64
@@ -115,19 +148,24 @@ type ResponseFacts struct {
 	ImageInputTokensEstimated          int
 	ImageInputTokensReported           bool
 	ImageOutputTokensReported          bool
+	SourceOutputDetails                dto.OutputTokenDetails
+	SourceGeneratedText                string `json:"-"`
+	SourceOutputObserved               bool   `json:"-"`
+	SourceOutputTokens                 *int   `json:"-"`
 	GeneratedOutputTokens              *int
+	DeliveredOutputTokens              *int
+	DeliveredOutputDetails             dto.OutputTokenDetails
+	OutputLimitObserved                bool   `json:"-"`
+	UnterminatedStreamData             []byte `json:"-"`
+	UnterminatedStreamEvent            string `json:"-"`
 	UpstreamRetryAfter                 string // Transient; only the parsed cooldown may enter records.
 	OnBusinessOutput                   func()
 	CanFinishStream                    func() bool `json:"-"`
 	UpstreamErrorCode                  string
-	SourceGeneratedText                string              `json:"-"`
-	SourceOutputObserved               bool                `json:"-"`
-	SourceOutputTokens                 *int                `json:"-"`
-	OutputLimitObserved                bool                `json:"-"`
-	UnterminatedStreamData             []byte              `json:"-"`
-	UnterminatedStreamEvent            string              `json:"-"`
-	StreamPrelude                      []byte              `json:"-"`
-	StreamHeaders                      map[string][]string `json:"-"`
+	// StreamPrelude belongs only to this Attempt and is never persisted. Hold
+	// metadata until business output commits its protocol and loss headers.
+	StreamPrelude []byte              `json:"-"`
+	StreamHeaders map[string][]string `json:"-"`
 }
 
 // AudioPCMFrameBytes is the size of one complete signed 16-bit sample frame.
@@ -193,8 +231,9 @@ func NativeUsagePresence(body []byte, promptPath, completionPath, _ string) (boo
 		if path == "" {
 			continue
 		}
-		raw := ojson.GetBytes(body, path).Raw
-		if raw == "" || raw == "null" {
+		value := gjson.GetBytes(body, path)
+		raw := value.Raw
+		if !sourceNumberComplete(body, value) {
 			continue
 		}
 		var count int64
@@ -382,6 +421,56 @@ func (facts *ResponseFacts) RecordNativeTextSource(body []byte, choicesPath, tex
 	}
 }
 
+// SourceUsageObject retains independently complete fields from a usage object.
+func SourceUsageObject(body []byte, value gjson.Result) map[string]any {
+	known, ok := sourceUsageValue(body, value, 0)
+	if !ok {
+		return nil
+	}
+	fields, _ := known.(map[string]any)
+	return fields
+}
+
+func sourceNumberComplete(body []byte, value gjson.Result) bool {
+	end := value.Index + len(value.Raw)
+	// A number at EOF may only be a prefix of an unreceived value.
+	return value.Type == gjson.Number && end < len(body) && strings.ContainsRune(" \t\r\n,}]", rune(body[end]))
+}
+
+func sourceUsageValue(body []byte, value gjson.Result, depth int) (any, bool) {
+	if value.Type == gjson.Number && !sourceNumberComplete(body, value) {
+		return nil, false
+	}
+	var decoded any
+	if common.UnmarshalUseNumber([]byte(value.Raw), &decoded) == nil {
+		return decoded, true
+	}
+	if depth >= 128 {
+		return nil, false
+	}
+	if value.IsObject() {
+		fields := map[string]any{}
+		value.ForEach(func(key, child gjson.Result) bool {
+			if known, ok := sourceUsageValue(body, child, depth+1); ok {
+				fields[key.Str] = known
+			}
+			return true
+		})
+		return fields, len(fields) > 0
+	}
+	if value.IsArray() {
+		var fields []any
+		value.ForEach(func(_, child gjson.Result) bool {
+			if known, ok := sourceUsageValue(body, child, depth+1); ok {
+				fields = append(fields, known)
+			}
+			return true
+		})
+		return fields, len(fields) > 0
+	}
+	return nil, false
+}
+
 // RecordChatUsage merges a native usage object with Chat counter names.
 // Omitted detail fields retain their preceding snapshot; explicit zeros reset it.
 func (facts *ResponseFacts) RecordChatUsage(usage *dto.Usage, body []byte, path string) error {
@@ -409,7 +498,15 @@ func (facts *ResponseFacts) RecordChatUsage(usage *dto.Usage, body []byte, path 
 		}
 	}
 	previousPrompt, previousCompletion := usage.PromptTokens, usage.CompletionTokens
-	if err := common.UnmarshalJsonStr(raw.Raw, usage); err != nil {
+	object := SourceUsageObject(body, raw)
+	if object == nil {
+		return nil
+	}
+	encoded, err := common.Marshal(object)
+	if err != nil {
+		return err
+	}
+	if err := common.Unmarshal(encoded, usage); err != nil {
 		return err
 	}
 	reported := *usage

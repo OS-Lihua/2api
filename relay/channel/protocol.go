@@ -221,6 +221,13 @@ func (p *WireProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInf
 		return nil, err
 	}
 	publicChat, _ := converted.(*dto.GeneralOpenAIRequest)
+	if managed && p.Kind == protocol.OpenAIChat && !p.PublicResponse && publicChat != nil {
+		// Keep the diagnostic baseline independent of native request repairs.
+		publicChat, err = common.DeepCopy(publicChat)
+		if err != nil {
+			return nil, err
+		}
+	}
 	mode := info.RelayMode
 	info.RelayMode = p.relayMode(info)
 	defer func() { info.RelayMode = mode }()
@@ -235,7 +242,9 @@ func (p *WireProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInf
 		}
 		capabilities := contract.ChatRequestCapabilities()
 		if publicChat.N != nil && *publicChat.N > 1 && (info.IsStream || !slices.Contains(capabilities.Parameters, "n")) {
-			return nil, fmt.Errorf("native Provider cannot represent multiple output choices (n)")
+			diagnostics := []types.ConversionDiagnostic{{Code: "request_parameter_dropped", Path: "n", Severity: types.ConversionDiagnosticError, From: types.RelayFormatOpenAI, To: types.RelayFormatOpenAI, Message: "native Provider cannot represent multiple output choices (n)"}}
+			info.RecordConversionDiagnostics(c, diagnostics)
+			return nil, &types.ConversionLossError{Diagnostics: diagnostics}
 		}
 		projector, ok := converted.(ChatRequestProjector)
 		if !ok {
@@ -292,6 +301,8 @@ func protocolRelayMode(kind protocol.Type) int {
 	switch kind {
 	case protocol.OpenAIResponses:
 		return relayconstant.RelayModeResponses
+	case protocol.OpenAIRealtime:
+		return relayconstant.RelayModeRealtime
 	case protocol.GeminiGenerate:
 		return relayconstant.RelayModeGemini
 	case protocol.GeminiEmbed, protocol.OpenAIEmbeddings:

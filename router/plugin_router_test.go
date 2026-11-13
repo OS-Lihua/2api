@@ -867,11 +867,14 @@ func TestProductionPluginRoutePipelineRequiresTokenAuth(t *testing.T) {
 }
 
 func TestProductionPluginNativeQueryTraversesInnerRouter(t *testing.T) {
-	previousDB := model.DB
-	database := model.UseTestDatabases(t)
-	require.NoError(t, database.AutoMigrate(&model.Task{}))
-	t.Cleanup(func() { model.DB = previousDB })
-	require.NoError(t, database.Create(&model.Task{
+	setupRelayRouterTestDB(t)
+	require.NoError(t, i18n.Init())
+	require.NoError(t, model.DB.AutoMigrate(&model.Task{}))
+	user := model.User{Id: 91, Username: "native-query-owner", Status: common.UserStatusEnabled, Group: "default", Quota: 100}
+	require.NoError(t, model.DB.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "nativequerykey", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+	require.NoError(t, model.DB.Create(&token).Error)
+	require.NoError(t, model.DB.Create(&model.Task{
 		TaskID:    "task_native_router",
 		Platform:  constant.TaskPlatform("kling"),
 		UserId:    91,
@@ -886,30 +889,11 @@ func TestProductionPluginNativeQueryTraversesInnerRouter(t *testing.T) {
 
 	kling, found := jsplugin.DefaultRegistry.Get("kling")
 	require.True(t, found)
-	authenticatedProductionHandlers := func(
-		generation *jsplugin.RoutingGeneration,
-		group jsplugin.RouteGroup,
-	) []gin.HandlerFunc {
-		production := productionPluginRouteHandlers(generation, group)
-		return []gin.HandlerFunc{
-			production[0],
-			func(c *gin.Context) {
-				common.SetContextKey(c, constant.ContextKeyUserId, 91)
-				common.SetContextKey(c, constant.ContextKeyUserGroup, "default")
-				common.SetContextKey(c, constant.ContextKeyTokenGroup, "default")
-				c.Next()
-			},
-			production[3],
-			production[4],
-			production[5],
-			production[6],
-			production[7],
-		}
-	}
-	outer, registry := newPluginRouterTest(t, []*jsplugin.LoadedPlugin{kling}, authenticatedProductionHandlers)
+	outer, registry := newPluginRouterTest(t, []*jsplugin.LoadedPlugin{kling}, productionPluginRouteHandlers)
 	outer.NoRoute((&pluginRouteDispatcher{registry: registry}).dispatch)
 
 	request := httptest.NewRequest(http.MethodGet, "/kling/v1/videos/text2video/task_native_router", nil)
+	request.Header.Set("Authorization", "Bearer "+token.Key)
 	recorder := httptest.NewRecorder()
 	outer.ServeHTTP(recorder, request)
 

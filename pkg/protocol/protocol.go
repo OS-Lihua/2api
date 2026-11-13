@@ -14,6 +14,7 @@ type Type string
 const (
 	OpenAIChat               Type = "openai_chat"
 	OpenAIResponses          Type = "openai_responses"
+	OpenAIRealtime           Type = "openai_realtime"
 	AnthropicMessages        Type = "anthropic_messages"
 	GeminiGenerate           Type = "gemini_generate"
 	OpenAIEmbeddings         Type = "openai_embeddings"
@@ -27,7 +28,7 @@ const (
 var pluginKey = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,29}$`)
 
 // Builtins returns the supported non-task protocols in display order.
-var builtinTypes = []Type{OpenAIChat, OpenAIResponses, AnthropicMessages, GeminiGenerate, OpenAIEmbeddings, GeminiEmbed, OpenAIImages, OpenAIAudioSpeech, OpenAIAudioTranscription, Rerank}
+var builtinTypes = []Type{OpenAIChat, OpenAIResponses, OpenAIRealtime, AnthropicMessages, GeminiGenerate, OpenAIEmbeddings, GeminiEmbed, OpenAIImages, OpenAIAudioSpeech, OpenAIAudioTranscription, Rerank}
 
 func Builtins() []Type { return slices.Clone(builtinTypes) }
 

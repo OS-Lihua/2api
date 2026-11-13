@@ -12,7 +12,6 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
-	"github.com/tidwall/gjson"
 
 	"github.com/gin-gonic/gin"
 )
@@ -55,17 +54,7 @@ func recordPaLMSource(info *relaycommon.RelayInfo, body []byte) {
 	if info.ResponseFacts == nil {
 		return
 	}
-	var source dto.OpenAITextResponse
-	for _, raw := range gjson.GetBytes(body, "candidates").Array() {
-		var candidate struct {
-			Content string `json:"content"`
-		}
-		if common.UnmarshalJsonStr(raw.Raw, &candidate) != nil {
-			continue
-		}
-		source.Choices = append(source.Choices, dto.OpenAITextResponseChoice{Index: len(source.Choices), Message: dto.Message{Role: "assistant", Content: candidate.Content}})
-	}
-	info.ResponseFacts.RecordChatSource(&source, info.TokenizerModelName())
+	info.ResponseFacts.RecordNativeTextSource(body, "candidates", "content", info.TokenizerModelName())
 }
 
 func palmStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, string) {

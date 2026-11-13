@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,7 +21,6 @@ import (
 	"github.com/expr-lang/expr/conf"
 	"github.com/expr-lang/expr/file"
 	"github.com/expr-lang/expr/parser"
-	"github.com/expr-lang/expr/parser/lexer"
 	"github.com/expr-lang/expr/vm"
 	"github.com/shopspring/decimal"
 )
@@ -28,7 +28,9 @@ import (
 // MoneyInput carries normalized whole token counts and frozen request context.
 // A zero Time uses pkg/clock.Now when the evaluation starts.
 type MoneyInput struct {
-	Tokens map[string]int64
+	// TaskUsage selects canonical task units, including constant task prices.
+	TaskUsage bool
+	Tokens    map[string]int64
 	// ImageCount overrides the request estimate with a bounded actual payload
 	// count, including zero. It never changes frozen param("n") probes.
 	ImageCount *int
@@ -72,6 +74,7 @@ type MoneyTraceResult struct {
 	FixedPrice          *string                 `json:"fixed_price,omitempty"`
 	MatchedTier         string                  `json:"matched_tier"`
 	RequestRules        []MoneyRequestRuleTrace `json:"request_rules,omitempty"`
+	RequestSnapshot     *MoneyRequestSnapshot   `json:"request_snapshot,omitempty"`
 }
 
 // MoneyUsedVars returns source identifiers for exact token normalization. It
@@ -95,6 +98,15 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 	entry, err := compileEntryFromCacheByHash(expression, ExprHashString(expression))
 	if err != nil {
 		return money.Value{}, trace, err
+	}
+	if input.TaskUsage && entry.sourceVars["fixed"] {
+		return money.Value{}, trace, fmt.Errorf("fixed pricing is not supported for task usage expressions")
+	}
+	if input.Request.RequireMoneySnapshot && input.Request.MoneySnapshot == nil && (entry.sourceVars["param"] || entry.sourceVars["header"]) {
+		return money.Value{}, trace, fmt.Errorf("frozen pricing context is unavailable")
+	}
+	if input.Request.MoneySnapshot != nil && input.Request.MoneySnapshot.ExpressionHash != ExprHashString(expression) {
+		return money.Value{}, trace, fmt.Errorf("frozen pricing context does not match its expression")
 	}
 	headers := normalizeHeaders(input.Request.Headers)
 	now := input.Time
@@ -128,6 +140,37 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 			trace.ImageQuantityPriced = true
 			return value
 		},
+		"u": func(key string) (any, error) {
+			value, exists := input.Request.Usage[key]
+			if !exists {
+				return nil, fmt.Errorf("usage fact %q is missing", key)
+			}
+			switch number := value.(type) {
+			case string, bool:
+				return value, nil
+			case json.Number:
+				parsed, err := decimal.NewFromString(string(number))
+				if err != nil || parsed.IsNegative() {
+					return nil, fmt.Errorf("invalid usage fact %q", key)
+				}
+				return exactDecimal(parsed)
+			case float64:
+				if math.IsNaN(number) || math.IsInf(number, 0) || number < 0 {
+					return nil, fmt.Errorf("invalid usage fact %q", key)
+				}
+				parsed, err := decimal.NewFromString(strconv.FormatFloat(number, 'g', -1, 64))
+				if err != nil {
+					return nil, err
+				}
+				return exactDecimal(parsed)
+			default:
+				quantity, err := exactNumber(value)
+				if err != nil || quantity.Sign() < 0 {
+					return nil, fmt.Errorf("invalid usage fact %q", key)
+				}
+				return quantity, nil
+			}
+		},
 		"param": func(path string) (any, error) {
 			path = strings.TrimSpace(path)
 			if path == "" || len(input.Request.Body) == 0 {
@@ -146,6 +189,21 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 		},
 		"has": func(source any, substr string) bool {
 			return source != nil && substr != "" && strings.Contains(exactString(source), substr)
+		},
+		"_money_has_frozen_condition": func(condition string) bool {
+			if input.Request.MoneySnapshot == nil {
+				return false
+			}
+			_, exists := entry.moneySnapshotPrograms[condition]
+			return exists
+		},
+		"_money_frozen_condition": func(condition string) (bool, error) {
+			value := input.Request.MoneySnapshot.Conditions[condition]
+			if value == nil {
+				return false, fmt.Errorf("frozen pricing condition is unavailable")
+			}
+			trace.Conditions = append(trace.Conditions, MoneyConditionTrace{Cond: condition, Matched: *value})
+			return *value, nil
 		},
 		"_money_condition": func(condition string, value any) (bool, error) {
 			matched, ok := value.(bool)
@@ -178,17 +236,29 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 		"_money_index":   exactIndex,
 	}
 	imageCount := 1
-	if entry.sourceVars["image_count"] {
-		if input.Request.ImageCount != nil {
-			imageCount = *input.Request.ImageCount
-		}
-		if input.ImageCount != nil {
-			imageCount = *input.ImageCount
-			if imageCount < 0 || imageCount > dto.MaxImageN {
-				return money.Value{}, trace, fmt.Errorf("actual image_count must be between 0 and %d", dto.MaxImageN)
+	if entry.sourceVars["image_count"] || entry.usedVars["image_count"] {
+		if input.TaskUsage {
+			fact, err := env["u"].(func(string) (any, error))("image_count")
+			if err != nil {
+				return money.Value{}, trace, err
 			}
-		} else if imageCount < 1 || imageCount > dto.MaxImageN {
-			return money.Value{}, trace, fmt.Errorf("image_count must be between 1 and %d", dto.MaxImageN)
+			quantity, err := exactNumber(fact)
+			if err != nil || !quantity.IsInt() || quantity.Sign() < 0 || quantity.Cmp(big.NewRat(dto.MaxImageN, 1)) > 0 {
+				return money.Value{}, trace, fmt.Errorf("image_count must be a bounded whole task usage fact")
+			}
+			imageCount = int(quantity.Num().Int64())
+		} else {
+			if input.Request.ImageCount != nil {
+				imageCount = *input.Request.ImageCount
+			}
+			if input.ImageCount != nil {
+				imageCount = *input.ImageCount
+				if imageCount < 0 || imageCount > dto.MaxImageN {
+					return money.Value{}, trace, fmt.Errorf("actual image_count must be between 0 and %d", dto.MaxImageN)
+				}
+			} else if imageCount < 1 || imageCount > dto.MaxImageN {
+				return money.Value{}, trace, fmt.Errorf("image_count must be between 1 and %d", dto.MaxImageN)
+			}
 		}
 		trace.ImageCount = &imageCount
 	}
@@ -233,9 +303,40 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 	entry.moneyOnce.Do(func() {
 		_, body := ParseExprVersion(expression)
 		entry.moneyProgram, entry.moneyRequestRules, entry.moneyErr = compileMoneyProgram(body, env)
+		if entry.moneyErr == nil {
+			entry.moneySnapshotPrograms, entry.moneySnapshotErr = compileMoneyRequestSnapshot(body, env)
+		}
 	})
 	if entry.moneyErr != nil {
 		return money.Value{}, trace, entry.moneyErr
+	}
+	if (input.Request.FreezeMoneyRequest || input.Request.MoneySnapshot != nil) && entry.moneySnapshotErr != nil {
+		return money.Value{}, trace, entry.moneySnapshotErr
+	}
+	if input.Request.FreezeMoneyRequest {
+		snapshot := &MoneyRequestSnapshot{ExpressionHash: ExprHashString(expression), Conditions: make(map[string]*bool, len(entry.moneySnapshotPrograms))}
+		conditionEnv := maps.Clone(env)
+		conditionEnv["_money_condition"] = func(_ string, value any) (bool, error) {
+			matched, ok := value.(bool)
+			if !ok {
+				return false, fmt.Errorf("pricing condition must be boolean")
+			}
+			return matched, nil
+		}
+		conditionEnv["_money_rule"] = func(_ int, matched bool, multiplier, fallback any) any {
+			if matched {
+				return multiplier
+			}
+			return fallback
+		}
+		for condition, program := range entry.moneySnapshotPrograms {
+			snapshot.Conditions[condition] = nil
+			value, err := expr.Run(program, conditionEnv)
+			if matched, ok := value.(bool); err == nil && ok {
+				snapshot.Conditions[condition] = &matched
+			}
+		}
+		trace.RequestSnapshot = snapshot
 	}
 	trace.RequestRules = append([]MoneyRequestRuleTrace(nil), entry.moneyRequestRules...)
 	result, err := expr.Run(entry.moneyProgram, env)
@@ -249,9 +350,13 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 	if number.Sign() < 0 {
 		return money.Value{}, trace, fmt.Errorf("expr result must be non-negative")
 	}
-	unrounded := new(big.Rat).Quo(number, big.NewRat(1_000_000, 1))
-	trace.UnroundedAmount = unrounded.RatString()
-	amount, err := money.NewRationalValue(unrounded, currency)
+	// Task expressions already return a price in canonical usage units.
+	// Token expressions return a price per million tokens.
+	if !input.TaskUsage && !entry.sourceVars["u"] {
+		number = new(big.Rat).Quo(number, big.NewRat(1_000_000, 1))
+	}
+	trace.UnroundedAmount = number.RatString()
+	amount, err := money.NewRationalValue(number, currency)
 	return amount, trace, err
 }
 
@@ -259,43 +364,9 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 // source digits. Only immutable source constants and metadata enter the cache;
 // request functions are always read from the current run's environment.
 func compileMoneyProgram(body string, env map[string]any) (*vm.Program, []MoneyRequestRuleTrace, error) {
-	tokens, err := lexer.Lex(file.NewSource(body))
+	literals, literalText, err := parseMoneyLiterals(body)
 	if err != nil {
-		return nil, nil, fmt.Errorf("expr compile error: %w", err)
-	}
-	literals := make(map[file.Location]*big.Rat)
-	literalText := make(map[file.Location]string)
-	for _, token := range tokens {
-		switch token.Value {
-		case "_money_token", "_money_fixed", "_money_rule", "_money_condition", "_money_builtin", "_money_binary", "_money_unary", "_money_index", "_money_image_quantity":
-			if token.Kind == lexer.Identifier {
-				return nil, nil, fmt.Errorf("expr compile error: identifier %q is reserved for internal use", token.Value)
-			}
-		}
-		if token.Kind != lexer.Number {
-			continue
-		}
-		text := strings.ReplaceAll(token.Value, "_", "")
-		lower := strings.ToLower(text)
-		if strings.HasPrefix(lower, "0x") || strings.HasPrefix(lower, "0b") || strings.HasPrefix(lower, "0o") {
-			integer, ok := new(big.Int).SetString(text, 0)
-			if !ok {
-				return nil, nil, fmt.Errorf("expr compile error: invalid numeric literal")
-			}
-			literals[token.Location] = new(big.Rat).SetInt(integer)
-			literalText[token.Location] = integer.String()
-			continue
-		}
-		value, err := decimal.NewFromString(text)
-		if err != nil {
-			return nil, nil, fmt.Errorf("expr compile error: invalid numeric literal")
-		}
-		number, err := exactDecimal(value)
-		if err != nil {
-			return nil, nil, fmt.Errorf("expr compile error: %w", err)
-		}
-		literals[token.Location] = number
-		literalText[token.Location] = value.String()
+		return nil, nil, err
 	}
 	tree, err := parser.Parse(body)
 	if err != nil {
@@ -317,6 +388,7 @@ func compileMoneyProgram(body string, env map[string]any) (*vm.Program, []MoneyR
 		}
 		return false
 	})
+	ast.Walk(&tree.Node, moneyConditionLiterals(literalText))
 	conditions := make(map[file.Location]string)
 	conditionals := make(map[file.Location]string)
 	ast.Find(tree.Node, func(node ast.Node) bool {
@@ -332,7 +404,11 @@ func compileMoneyProgram(body string, env map[string]any) (*vm.Program, []MoneyR
 		}
 		return false
 	})
-	program, err := expr.Compile(body, expr.Env(env), expr.Patch(&moneyPatcher{imagePricing: imagePricing(tree.Node), literals: literals, literalText: literalText, rules: rules, conditions: conditions, conditionals: conditionals}), expr.Optimize(false), expr.AsAny())
+	probes := make(map[file.Location]string)
+	for location, condition := range moneyBooleanExpressions(tree.Node) {
+		probes[location] = condition.String()
+	}
+	program, err := expr.Compile(body, expr.Env(env), expr.Patch(&moneyPatcher{imagePricing: imagePricing(tree.Node), literals: literals, literalText: literalText, rules: rules, conditions: conditions, conditionals: conditionals, probes: probes}), expr.Optimize(false), expr.AsAny())
 	if err != nil {
 		return nil, nil, fmt.Errorf("expr compile error: %w", err)
 	}
@@ -356,9 +432,11 @@ type moneyPatcher struct {
 	conditions   map[file.Location]string
 	conditionals map[file.Location]string
 	imagePricing imagePricePlan
+	probes       map[file.Location]string
 }
 
 func (p *moneyPatcher) Visit(node *ast.Node) {
+	location := (*node).Location()
 	switch part := (*node).(type) {
 	case *ast.IdentifierNode:
 		switch part.Value {
@@ -431,6 +509,9 @@ func (p *moneyPatcher) Visit(node *ast.Node) {
 			}
 			ast.Patch(node, replacement)
 		}
+	}
+	if condition, exists := p.probes[location]; exists {
+		ast.Patch(node, frozenMoneyBoolean(condition, *node))
 	}
 }
 

@@ -60,6 +60,8 @@ func (b *gatewayIdleBody) touch(activate bool) {
 	})
 }
 
+func (b *gatewayIdleBody) UnwrapResponseBody() io.ReadCloser { return b.body }
+
 func (b *gatewayIdleBody) Read(data []byte) (int, error) {
 	n, err := b.body.Read(data)
 	if n > 0 {

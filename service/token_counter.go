@@ -65,6 +65,22 @@ type RequestTokenOptions struct {
 // switch. Utility endpoints such as Claude's messages/count_tokens must remain
 // available even when operators disable request-token estimation for relays.
 func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relaycommon.RelayInfo, options ...RequestTokenOptions) (int, error) {
+	return countRequestToken(c, meta, info, nil, options...)
+}
+
+// CountRequestUsage retains media categories from the same input estimate.
+func CountRequestUsage(c *gin.Context, meta *types.TokenCountMeta, info *relaycommon.RelayInfo, options ...RequestTokenOptions) (*dto.Usage, error) {
+	usage := &dto.Usage{}
+	total, err := countRequestToken(c, meta, info, usage, options...)
+	if err != nil {
+		return nil, err
+	}
+	usage.PromptTokens, usage.TotalTokens = total, total
+	usage.PromptTokensDetails.TextTokens = total - usage.PromptTokensDetails.ImageTokens - usage.PromptTokensDetails.AudioTokens
+	return usage, nil
+}
+
+func countRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relaycommon.RelayInfo, usage *dto.Usage, options ...RequestTokenOptions) (int, error) {
 	if meta == nil {
 		return 0, errors.New("token count meta is nil")
 	}
@@ -125,6 +141,9 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 				return 0, clamp
 			}
 			return total, nil
+		}
+		if usage != nil {
+			usage.PromptTokensDetails.AudioTokens = totalAudioToken
 		}
 		return totalAudioToken, nil
 	}
@@ -198,8 +217,14 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 				return 0, fmt.Errorf("error counting image token, media index[%d], identifier[%s], err: %v", i, file.GetIdentifier(), err)
 			}
 			tkm += token
+			if usage != nil {
+				usage.PromptTokensDetails.ImageTokens += token
+			}
 		case types.FileTypeAudio:
 			tkm += 256
+			if usage != nil {
+				usage.PromptTokensDetails.AudioTokens += 256
+			}
 		case types.FileTypeVideo:
 			tkm += 4096 * 2
 		case types.FileTypeFile:
@@ -287,6 +312,31 @@ func CountTokenInput(input any, model string) int {
 	return CountTokenInput(fmt.Sprintf("%v", input), model)
 }
 
+func CountRealtimeAudioTokens(byteCount int64, audioFormat string, input bool) int {
+	if byteCount <= 0 {
+		return 0
+	}
+	// Realtime user audio is one token per 100 ms; assistant audio is one
+	// token per 50 ms. Count complete token spans across accumulated chunks.
+	// https://developers.openai.com/api/docs/guides/voice-latency-cost
+	bytesPerSecond := int64(24000 * 2)
+	if audioFormat == "g711_ulaw" || audioFormat == "g711_alaw" {
+		bytesPerSecond = 8000
+	}
+	tokensPerSecond := int64(20)
+	if input {
+		tokensPerSecond = 10
+	}
+	return common.QuotaFromDecimal(decimal.NewFromInt(byteCount / (bytesPerSecond / tokensPerSecond)))
+}
+
+func realtimeAudioTokenCount(duration float64, input bool) int {
+	if input {
+		return common.QuotaFromFloat(duration / 60 * 100 / 0.06)
+	}
+	return common.QuotaFromFloat(duration / 60 * 200 / 0.24)
+}
+
 func CountAudioTokenInput(audioBase64 string, audioFormat string) (int, error) {
 	if audioBase64 == "" {
 		return 0, nil
@@ -296,7 +346,7 @@ func CountAudioTokenInput(audioBase64 string, audioFormat string) (int, error) {
 		return 0, err
 	}
 	// duration 来自用户提供的音频元数据，饱和转换防止 int 回绕
-	return common.QuotaFromFloat(duration / 60 * 100 / 0.06), nil
+	return realtimeAudioTokenCount(duration, true), nil
 }
 
 func CountAudioTokenOutput(audioBase64 string, audioFormat string) (int, error) {
@@ -308,5 +358,5 @@ func CountAudioTokenOutput(audioBase64 string, audioFormat string) (int, error) 
 		return 0, err
 	}
 	// duration 来自上游返回的音频元数据，饱和转换防止 int 回绕
-	return common.QuotaFromFloat(duration / 60 * 200 / 0.24), nil
+	return realtimeAudioTokenCount(duration, false), nil
 }

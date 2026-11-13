@@ -69,11 +69,21 @@ const (
 	MsgRelayTaskUsagePriceUnsupported    = "relay.task_usage_price_unsupported"
 	MsgRelaySharedTaskPriceNeedsOverride = "relay.shared_task_price_needs_override"
 	MsgRelayTaskChannelDisabled          = "relay.task_channel_disabled"
-	MsgRelayGroupSaturated               = "relay.group_saturated"
-	MsgRelayGroupUpstreamSaturated       = "relay.group_upstream_saturated"
-	MsgRelayRetryGetChannelFailed        = "relay.retry_get_channel_failed"
-	MsgRelayRetryNoAvailableChannel      = "relay.retry_no_available_channel"
-	MsgRelayAccessTokenUnsupported       = "relay.access_token_unsupported"
+	MsgTaskUnavailable                   = "task.unavailable"
+	MsgTaskNotFound                      = "task.not_found"
+	MsgTaskSubmissionUnknown             = "task.submission_unknown"
+	MsgTaskModelNotFound                 = "task.model_not_found"
+	MsgTaskPluginUnavailable             = "task.plugin_unavailable"
+	MsgTaskChannelUnavailable            = "task.channel_unavailable"
+	MsgTaskRemixUnsupported              = "task.remix_unsupported"
+	MsgTaskInvalidRequest                = "task.invalid_request"
+	MsgTaskInvalidRemix                  = "task.invalid_remix"
+
+	MsgRelayGroupSaturated          = "relay.group_saturated"
+	MsgRelayGroupUpstreamSaturated  = "relay.group_upstream_saturated"
+	MsgRelayRetryGetChannelFailed   = "relay.retry_get_channel_failed"
+	MsgRelayRetryNoAvailableChannel = "relay.retry_no_available_channel"
+	MsgRelayAccessTokenUnsupported  = "relay.access_token_unsupported"
 )
 
 // Emails and the name of the token created at registration, in the

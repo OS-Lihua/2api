@@ -505,6 +505,7 @@ type Message struct {
 	Reasoning        *string         `json:"reasoning,omitempty"`
 	Refusal          *string         `json:"refusal,omitempty"`
 	ToolCalls        json.RawMessage `json:"tool_calls,omitempty"`
+	FunctionCall     json.RawMessage `json:"function_call,omitempty"`
 	ToolCallId       string          `json:"tool_call_id,omitempty"`
 	// Tools carries Kimi K3 dynamic tool loading declarations on a system message.
 	// Same shape as the top-level tools array; passthrough-only for OpenAI-compatible upstreams.
@@ -684,14 +685,20 @@ func (m *Message) SetPrefix(prefix bool) {
 }
 
 func (m *Message) ParseToolCalls() []ToolCallRequest {
-	if m.ToolCalls == nil {
-		return nil
+	if m.ToolCalls != nil {
+		var calls []ToolCallRequest
+		if err := kitutil.Unmarshal(m.ToolCalls, &calls); err != nil {
+			return calls
+		}
+		if len(calls) > 0 {
+			return calls
+		}
 	}
-	var toolCalls []ToolCallRequest
-	if err := kitutil.Unmarshal(m.ToolCalls, &toolCalls); err == nil {
-		return toolCalls
+	var function FunctionRequest
+	if len(m.FunctionCall) > 0 && kitutil.Unmarshal(m.FunctionCall, &function) == nil && (function.Name != "" || function.Arguments != "") {
+		return []ToolCallRequest{{Type: "function", Function: function}}
 	}
-	return toolCalls
+	return nil
 }
 
 func (m *Message) SetToolCalls(toolCalls any) {
@@ -1252,6 +1259,7 @@ type Input struct {
 type MediaInput struct {
 	Type     string `json:"type"`
 	Text     string `json:"text,omitempty"`
+	FileID   string `json:"file_id,omitempty"`
 	FileUrl  string `json:"file_url,omitempty"`
 	ImageUrl string `json:"image_url,omitempty"`
 	Detail   string `json:"detail,omitempty"` // 仅 input_image 有效
@@ -1341,7 +1349,9 @@ func (r *OpenAIResponsesRequest) ParseInput() []MediaInput {
 								imageUrl = url
 							}
 						}
-						mediaInputs = append(mediaInputs, MediaInput{Type: "input_image", ImageUrl: imageUrl})
+						detail, _ := item["detail"].(string)
+						fileID, _ := item["file_id"].(string)
+						mediaInputs = append(mediaInputs, MediaInput{Type: "input_image", ImageUrl: imageUrl, Detail: detail, FileID: fileID})
 					case "input_file":
 						// file_url may be string or object with url field
 						var fileUrl string
@@ -1353,7 +1363,11 @@ func (r *OpenAIResponsesRequest) ParseInput() []MediaInput {
 								fileUrl = url
 							}
 						}
-						mediaInputs = append(mediaInputs, MediaInput{Type: "input_file", FileUrl: fileUrl})
+						if fileUrl == "" {
+							fileUrl, _ = item["file_data"].(string)
+						}
+						fileID, _ := item["file_id"].(string)
+						mediaInputs = append(mediaInputs, MediaInput{Type: "input_file", FileUrl: fileUrl, FileID: fileID})
 					}
 				}
 			}

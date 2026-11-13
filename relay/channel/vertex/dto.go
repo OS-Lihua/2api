@@ -2,11 +2,11 @@ package vertex
 
 import (
 	"encoding/json"
-	"fmt"
 
 	"github.com/QuantumNous/new-api/common"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
 type VertexAIClaudeRequest struct {
@@ -52,15 +52,23 @@ func (r *vertexClaudeRequest) ProjectNativeRequest(body []byte) (dto.Request, er
 	if err := common.Unmarshal(body, &fields); err != nil {
 		return nil, err
 	}
+	var diagnostics []types.ConversionDiagnostic
 	if _, ok := fields["model"]; ok {
-		return nil, fmt.Errorf("Vertex model is controlled by the request URL")
+		diagnostics = append(diagnostics, types.ConversionDiagnostic{Code: "request_parameter_dropped", Path: "model", Severity: types.ConversionDiagnosticError, From: types.RelayFormatClaude, To: types.RelayFormatClaude, Message: "Vertex model is controlled by the request URL"})
+	}
+	var version string
+	if err := common.Unmarshal(fields["anthropic_version"], &version); err != nil || version != anthropicVersion {
+		diagnostics = append(diagnostics, types.ConversionDiagnostic{Code: "request_parameter_dropped", Path: "anthropic_version", Severity: types.ConversionDiagnosticError, From: types.RelayFormatClaude, To: types.RelayFormatClaude, Message: "Vertex anthropic_version must match the native API version"})
+	}
+	if len(diagnostics) > 0 {
+		return nil, &types.ConversionLossError{Diagnostics: diagnostics}
 	}
 	var request dto.ClaudeRequest
 	if err := common.Unmarshal(body, &request); err != nil {
 		return nil, err
 	}
 	if (request.Stream != nil && *request.Stream) != (r.Request.Stream != nil && *r.Request.Stream) {
-		return nil, fmt.Errorf("Vertex stream must match the request transport")
+		return nil, &types.ConversionLossError{Diagnostics: []types.ConversionDiagnostic{{Code: "request_parameter_dropped", Path: "stream", Severity: types.ConversionDiagnosticError, From: types.RelayFormatClaude, To: types.RelayFormatClaude, Message: "Vertex stream must match the request transport"}}}
 	}
 	request.Model = r.Request.Model
 	return &request, nil

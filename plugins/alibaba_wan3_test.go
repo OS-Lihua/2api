@@ -145,5 +145,20 @@ func TestAlibabaWan3(t *testing.T) {
 		})
 		require.NoError(t, callErr)
 		assert.Equal(t, map[string]any{"seconds": float64(5), "resolution": "1080P"}, roundTrip(t, value))
+
+		// Partial Wan3 statistics cannot establish the total duration.
+		value, callErr = plugin.Engine.Call(t.Context(), "extractUsageOnComplete", map[string]any{}, map[string]any{}, map[string]any{
+			"output": map[string]any{"task_status": "SUCCEEDED", "video_url": "https://upstream.example/v.mp4"},
+			"usage":  map[string]any{"input_video_duration": 3},
+		})
+		require.NoError(t, callErr)
+		assert.Equal(t, map[string]any{"seconds": nil}, roundTrip(t, value))
+
+		// A non-Wan3 completion without a duration reports it as unknown.
+		value, callErr = plugin.Engine.Call(t.Context(), "extractUsageOnComplete", map[string]any{}, map[string]any{}, map[string]any{
+			"output": map[string]any{"task_status": "SUCCEEDED", "resolution": "1080p"},
+		})
+		require.NoError(t, callErr)
+		assert.Equal(t, map[string]any{"seconds": nil, "resolution": "1080P"}, roundTrip(t, value))
 	})
 }

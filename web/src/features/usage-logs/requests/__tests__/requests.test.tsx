@@ -156,6 +156,61 @@ function renderRequests() {
   )
 }
 
+it('shows cache and audio quantities for a WebSocket request and its attempt', async () => {
+  api.defaults.adapter = async (config) => ({
+    config,
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+    data: {
+      success: true,
+      data: {
+        items: [
+          new URL(api.getUri(config), 'http://localhost').pathname.endsWith(
+            '/attempts'
+          )
+            ? {
+                ...attempt,
+                usage_source: 'upstream',
+                usage: {
+                  ...attempt.usage,
+                  cached_tokens: 12,
+                  audio_input_tokens: 24,
+                  audio_output_tokens: 18,
+                },
+              }
+            : {
+                ...request,
+                usage_source: 'upstream',
+                usage: {
+                  ...request.usage,
+                  cached_tokens: 12,
+                  audio_input_tokens: 24,
+                  audio_output_tokens: 18,
+                },
+              },
+        ],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      },
+    },
+  })
+  const user = userEvent.setup()
+  renderRequests()
+  await user.click(
+    await screen.findByRole('button', {
+      name: `View attempts for request ${requestId}`,
+    })
+  )
+  const drawer = await screen.findByRole('dialog', { name: 'Request attempts' })
+  expect(await within(drawer).findByText(attempt.id)).toBeVisible()
+  expect(within(drawer).getAllByText('Cached tokens: 12')).toHaveLength(2)
+  expect(within(drawer).getAllByText('Audio input tokens: 24')).toHaveLength(2)
+  expect(within(drawer).getAllByText('Audio output tokens: 18')).toHaveLength(2)
+  expect(within(drawer).queryByText('Estimated')).not.toBeInTheDocument()
+})
+
 it('shows a precise charge and estimated usage, opens the real self attempt, and closes with Escape', async () => {
   const user = userEvent.setup()
   renderRequests()
@@ -175,7 +230,7 @@ it('shows a precise charge and estimated usage, opens the real self attempt, and
   expect(within(drawer).getByText('9007199254740995')).toBeVisible()
   expect(within(drawer).getByText('1.000000001')).toBeVisible()
   expect(within(drawer).getByText('unsupported_parameter')).toBeVisible()
-  expect(within(drawer).getByText('Estimated')).toBeVisible()
+  expect(within(drawer).getAllByText('Estimated')).toHaveLength(2)
   expect(urls.map((url) => url.pathname)).toEqual([
     '/api/requests/self',
     `/api/requests/self/${requestId}/attempts`,
@@ -777,39 +832,105 @@ it('shows actual media quantities including zero in request rows and attempts wi
   })
   const user = userEvent.setup()
   renderRequests()
-  expect(await screen.findByText('Image count: 0')).toBeVisible()
-  expect(screen.getByText('Image input tokens: 1,200')).toBeVisible()
-  expect(screen.getByText('Image output tokens: 0')).toBeVisible()
-  expect(screen.getByText('Audio input tokens: 0')).toBeVisible()
-  expect(screen.getByText('Audio output tokens: 17')).toBeVisible()
+  const requestFacts = within(
+    await screen.findByRole('row', { name: /chat-standard/ })
+  )
+  expect(requestFacts.getByText('Image count: 0')).toBeVisible()
+  expect(requestFacts.getByText('Image input tokens: 1,200')).toBeVisible()
+  expect(requestFacts.getByText('Image output tokens: 0')).toBeVisible()
+  expect(requestFacts.getByText('Audio input tokens: 0')).toBeVisible()
+  expect(requestFacts.getByText('Audio output tokens: 17')).toBeVisible()
   expect(
-    screen.getByText(
+    requestFacts.getByText(
       (_, element) =>
         element?.textContent === 'Input audio duration: 1.25 seconds'
     )
   ).toBeVisible()
   expect(
-    screen.getByText(
+    requestFacts.getByText(
       (_, element) =>
         element?.textContent === 'Output audio duration: 0 seconds'
     )
   ).toBeVisible()
-  expect(screen.queryByText('Total tokens: 0')).not.toBeInTheDocument()
+  expect(requestFacts.queryByText('Total tokens: 0')).not.toBeInTheDocument()
   await user.click(
     screen.getByRole('button', {
       name: `View attempts for request ${requestId}`,
     })
   )
   const drawer = await screen.findByRole('dialog', { name: 'Request attempts' })
-  expect(await within(drawer).findByText('Image count: 0')).toBeVisible()
-  expect(within(drawer).getByText('Audio output tokens: 17')).toBeVisible()
-  expect(within(drawer).getByText('Image output tokens: 0')).toBeVisible()
+  const attemptFacts = within(
+    await within(drawer).findByRole('list', { name: 'Attempt chronology' })
+  )
+  expect(attemptFacts.getByText('Image count: 0')).toBeVisible()
+  expect(attemptFacts.getByText('Audio output tokens: 17')).toBeVisible()
+  expect(attemptFacts.getByText('Image output tokens: 0')).toBeVisible()
   expect(
-    within(drawer).getByText(
+    attemptFacts.getByText(
       (_, element) =>
         element?.textContent === 'Input audio duration: 1.25 seconds'
     )
   ).toBeVisible()
+})
+
+it('shows task facts alongside cache, media, and unknown quantities without inventing token totals', async () => {
+  api.defaults.adapter = async (config) => ({
+    config,
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+    data: {
+      success: true,
+      data: {
+        items: [
+          {
+            ...request,
+            usage_source: 'upstream',
+            usage: {
+              task_facts: { seconds: 2.5 },
+              cached_tokens: 12,
+              cache_creation_tokens: 0,
+              image_count: 0,
+              audio_input_tokens: 0,
+              audio_input_seconds: '1.25',
+              audio_output_seconds: '0',
+              unmeasured_tokens: ['c', 'img_o', 'cc12h'],
+            },
+          },
+        ],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      },
+    },
+  })
+  renderRequests()
+  const row = await screen.findByRole('row', { name: /chat-standard/ })
+  const facts = within(row)
+  expect(
+    within(facts.getByRole('group', { name: 'Task usage' })).getByText('2.5')
+  ).toBeVisible()
+  expect(facts.getByText('Cached tokens: 12')).toBeVisible()
+  expect(facts.getByText('Cache Write: 0')).toBeVisible()
+  expect(facts.getByText('Cache Write (12h): Unknown')).toBeVisible()
+  expect(facts.getByText('Image count: 0')).toBeVisible()
+  expect(facts.getByText('Image output tokens: Unknown')).toBeVisible()
+  expect(facts.getByText('Audio input tokens: 0')).toBeVisible()
+  expect(
+    facts.getByText(
+      (_, element) =>
+        element?.textContent === 'Input audio duration: 1.25 seconds'
+    )
+  ).toBeVisible()
+  expect(
+    facts.getByText(
+      (_, element) =>
+        element?.textContent === 'Output audio duration: 0 seconds'
+    )
+  ).toBeVisible()
+  expect(facts.queryByText(/^Input:/)).not.toBeInTheDocument()
+  expect(facts.queryByText(/^Output:/)).not.toBeInTheDocument()
+  expect(facts.queryByText(/^Total tokens:/)).not.toBeInTheDocument()
 })
 
 it.each(['upstream', 'none'] as const)(
@@ -842,10 +963,15 @@ it.each(['upstream', 'none'] as const)(
     })
     const user = userEvent.setup()
     renderRequests()
-    expect(await screen.findByText('Cached tokens: 1,500')).toBeVisible()
-    expect(screen.getByText('Cache Write: 1,000')).toBeVisible()
-    expect(screen.getByText('Cache Write (12h): 0')).toBeVisible()
-    expect(screen.queryByText('No usage available')).not.toBeInTheDocument()
+    const requestFacts = within(
+      await screen.findByRole('row', { name: /chat-standard/ })
+    )
+    expect(requestFacts.getByText('Cached tokens: 1,500')).toBeVisible()
+    expect(requestFacts.getByText('Cache Write: 1,000')).toBeVisible()
+    expect(requestFacts.getByText('Cache Write (12h): 0')).toBeVisible()
+    expect(
+      requestFacts.queryByText('No usage available')
+    ).not.toBeInTheDocument()
     await user.click(
       screen.getByRole('button', {
         name: `View attempts for request ${requestId}`,
@@ -854,11 +980,12 @@ it.each(['upstream', 'none'] as const)(
     const drawer = await screen.findByRole('dialog', {
       name: 'Request attempts',
     })
-    expect(
-      await within(drawer).findByText('Cached tokens: 1,500')
-    ).toBeVisible()
-    expect(within(drawer).getByText('Cache Write: 1,000')).toBeVisible()
-    expect(within(drawer).getByText('Cache Write (12h): 0')).toBeVisible()
+    const attemptFacts = within(
+      await within(drawer).findByRole('list', { name: 'Attempt chronology' })
+    )
+    expect(attemptFacts.getByText('Cached tokens: 1,500')).toBeVisible()
+    expect(attemptFacts.getByText('Cache Write: 1,000')).toBeVisible()
+    expect(attemptFacts.getByText('Cache Write (12h): 0')).toBeVisible()
   }
 )
 
@@ -1076,3 +1203,119 @@ it('clears the previous request attempts while another request is loading', asyn
   })
   expect(await within(drawer).findByText('No attempts recorded')).toBeVisible()
 })
+
+it('shows pending task facts in the existing request view and preserves explicit zero and boolean facts', async () => {
+  api.defaults.adapter = async (config) => ({
+    config,
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+    data: {
+      success: true,
+      data: {
+        items: [
+          {
+            ...request,
+            status: 'pending',
+            usage: {
+              task_facts: {
+                seconds: 2.5,
+                tokens: 0,
+                audio: false,
+                size: '720x1280',
+              },
+            },
+          },
+        ],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      },
+    },
+  })
+  renderRequests()
+  expect(await screen.findByText('Pending')).toBeVisible()
+  expect(screen.getByText('Settlement pending')).toBeVisible()
+  const usage = screen.getByRole('group', { name: 'Task usage' })
+  expect(within(usage).getByText('seconds')).toBeVisible()
+  expect(within(usage).getByText('2.5')).toBeVisible()
+  expect(within(usage).getByText('0')).toBeVisible()
+  expect(within(usage).getByText('No')).toBeVisible()
+  expect(within(usage).getByText('720x1280')).toBeVisible()
+  expect(within(usage).queryByText('Total tokens')).not.toBeInTheDocument()
+})
+
+it.each(['pending', 'submission_unknown'])(
+  'shows %s task amounts as pending and preserves explicit zero after completion',
+  async (status) => {
+    client.setDefaultOptions({ queries: { retry: false, staleTime: Infinity } })
+    useAuthStore.getState().auth.setUser({
+      id: 7,
+      username: 'admin',
+      role: 10,
+      permissions: { admin_permissions: { request: { read: true } } },
+    })
+    let completed = false
+    api.defaults.adapter = async (config) => {
+      const attempts = new URL(
+        api.getUri(config),
+        'http://localhost'
+      ).pathname.endsWith('/attempts')
+      const currentStatus = completed ? 'success' : status
+      return {
+        config,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        data: {
+          success: true,
+          data: {
+            items: attempts
+              ? [
+                  {
+                    ...internalAttempt,
+                    status: currentStatus,
+                    cost: { nanos: '0', currency: 'EUR' },
+                    converted_cost: { nanos: '0', currency: 'USD' },
+                  },
+                ]
+              : [
+                  {
+                    ...request,
+                    status: currentStatus,
+                    receivable: { nanos: '0', currency: 'USD' },
+                  },
+                ],
+            total: 1,
+            page: 1,
+            page_size: 20,
+          },
+        },
+      }
+    }
+    const user = userEvent.setup()
+    renderRequests()
+    await screen.findByText('chat-standard')
+    expect(screen.queryByText('0 USD')).not.toBeInTheDocument()
+    await user.click(
+      screen.getByRole('button', {
+        name: `View attempts for request ${requestId}`,
+      })
+    )
+    let drawer = await screen.findByRole('dialog', { name: 'Request attempts' })
+    await within(drawer).findByText(internalAttempt.id)
+    expect(within(drawer).queryByText('0 USD')).not.toBeInTheDocument()
+    expect(within(drawer).queryByText('0 EUR')).not.toBeInTheDocument()
+    await user.click(within(drawer).getByRole('button', { name: 'Close' }))
+    completed = true
+    await user.click(screen.getByRole('button', { name: 'Search' }))
+    expect(await screen.findByText('0 USD')).toBeVisible()
+    await user.click(
+      screen.getByRole('button', {
+        name: `View attempts for request ${requestId}`,
+      })
+    )
+    drawer = await screen.findByRole('dialog', { name: 'Request attempts' })
+    expect(await within(drawer).findByText('0 EUR')).toBeVisible()
+  }
+)

@@ -13,6 +13,8 @@ func (t Type) RelayFormat() (types.RelayFormat, error) {
 		return types.RelayFormatOpenAI, nil
 	case OpenAIResponses:
 		return types.RelayFormatOpenAIResponses, nil
+	case OpenAIRealtime:
+		return types.RelayFormatOpenAIRealtime, nil
 	case AnthropicMessages:
 		return types.RelayFormatClaude, nil
 	case GeminiGenerate, GeminiEmbed:

@@ -252,15 +252,15 @@ func TestViduNativeBodies(t *testing.T) {
 		return decodePluginValue(t, value), nil
 	}
 
-	// Vidu checks the body, which goes to it as sent. The reservation takes the
-	// duration and resolution the plugin can read, the model's defaults on the
-	// endpoint for those left out, and otherwise the dearest the model renders.
+	// Valid native bodies retain their wire shape. Reservations read explicit
+	// quantities or model defaults; invalid durations fail before submission.
 	for _, tc := range []struct {
 		name      string
 		route     string
 		body      map[string]any
 		upstream  string
 		wantFacts map[string]any
+		wantErr   string
 	}{
 		{
 			name:      "defaults are reserved and nothing is added",
@@ -348,10 +348,10 @@ func TestViduNativeBodies(t *testing.T) {
 			wantFacts: map[string]any{"duration": float64(8), "resolution": "720p"},
 		},
 		{
-			name:      "an unreadable duration reserves the longest in the dearest resolution",
-			route:     "/ent/v2/text2video",
-			body:      map[string]any{"model": "viduq3-pro", "prompt": "a cat", "duration": "long"},
-			wantFacts: map[string]any{"duration": float64(16), "resolution": "1080p"},
+			name:    "an unreadable duration is rejected before submission",
+			route:   "/ent/v2/text2video",
+			body:    map[string]any{"model": "viduq3-pro", "prompt": "a cat", "duration": "long"},
+			wantErr: "seconds must be between 1 and 3600",
 		},
 		{
 			name:      "a model the plugin does not list reserves the dearest of every model",
@@ -376,6 +376,12 @@ func TestViduNativeBodies(t *testing.T) {
 			}
 			driver := map[string]any{"requestBody": intent["requestBody"], "model": model, "upstreamModel": upstream, "baseUrl": "https://api.vidu.example", "apiKey": "vendor-key"}
 			descriptor, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", driver)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				_, err = plugin.Engine.Call(t.Context(), "extractUsage", driver)
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
 			require.NoError(t, err)
 			sent := decodePluginValue(t, descriptor)
 			assert.Equal(t, "https://api.vidu.example"+tc.route, sent["url"])

@@ -93,6 +93,8 @@ export function RequestOutcome(props: { status: string }) {
     cancelled: t('Cancelled'),
     partial: t('Partial'),
     settlement_pending: t('Settlement pending'),
+    pending: t('Pending'),
+    submission_unknown: t('Task submission outcome unknown'),
   }
   const label = statuses[props.status as keyof typeof statuses] ?? props.status
   let variant: 'success' | 'danger' | 'warning' | 'neutral' = 'neutral'
@@ -100,7 +102,8 @@ export function RequestOutcome(props: { status: string }) {
   else if (props.status === 'failed') variant = 'danger'
   else if (
     props.status === 'partial' ||
-    props.status === 'settlement_pending'
+    props.status === 'settlement_pending' ||
+    props.status === 'submission_unknown'
   ) {
     variant = 'warning'
   }
@@ -138,19 +141,43 @@ export function RequestUsageFacts(props: {
   const durationFormatter = new Intl.NumberFormat(locale, {
     maximumSignificantDigits: 9,
   })
+  const taskFacts = Object.entries(props.usage.task_facts ?? {})
   return (
     <div className='space-y-1 text-xs'>
-      {props.source !== 'none' && (
-        <div className='tabular-nums'>
-          {t('Input')}:{' '}
-          {unmeasured.includes('p')
-            ? t('Unknown')
-            : formatNumber(props.usage.prompt_tokens, locale)}{' '}
-          · {t('Output')}:{' '}
-          {unmeasured.includes('c')
-            ? t('Unknown')
-            : formatNumber(props.usage.completion_tokens, locale)}
-        </div>
+      {taskFacts.length > 0 ? (
+        <dl role='group' aria-label={t('Task usage')} className='space-y-1'>
+          {taskFacts.map(([key, value]) => {
+            let display: string
+            if (typeof value === 'number') {
+              display = formatNumber(value, locale)
+            } else if (typeof value === 'boolean') {
+              display = value ? t('Yes') : t('No')
+            } else {
+              display = value
+            }
+            return (
+              <div key={key} className='flex flex-wrap gap-1'>
+                <dt className='text-muted-foreground'>{key}</dt>
+                <dd className='break-all tabular-nums' title={String(value)}>
+                  {display}
+                </dd>
+              </div>
+            )
+          })}
+        </dl>
+      ) : (
+        props.source !== 'none' && (
+          <div className='tabular-nums'>
+            {t('Input')}:{' '}
+            {unmeasured.includes('p')
+              ? t('Unknown')
+              : formatNumber(props.usage.prompt_tokens, locale)}{' '}
+            · {t('Output')}:{' '}
+            {unmeasured.includes('c')
+              ? t('Unknown')
+              : formatNumber(props.usage.completion_tokens, locale)}
+          </div>
+        )
       )}
       {(
         [
@@ -202,14 +229,16 @@ export function RequestUsageFacts(props: {
           {t('seconds')}
         </div>
       )}
-      {props.source !== 'none' && props.usage.total_tokens !== undefined && (
-        <div className='text-muted-foreground'>
-          {t('Total tokens')}:{' '}
-          {unmeasured.includes('p') || unmeasured.includes('c')
-            ? t('Unknown')
-            : formatNumber(props.usage.total_tokens, locale)}
-        </div>
-      )}
+      {taskFacts.length === 0 &&
+        props.source !== 'none' &&
+        props.usage.total_tokens !== undefined && (
+          <div className='text-muted-foreground'>
+            {t('Total tokens')}:{' '}
+            {unmeasured.includes('p') || unmeasured.includes('c')
+              ? t('Unknown')
+              : formatNumber(props.usage.total_tokens, locale)}
+          </div>
+        )}
       {props.source === 'estimated' && (
         <Badge variant='outline'>{t('Estimated')}</Badge>
       )}

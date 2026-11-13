@@ -36,6 +36,9 @@ func resolveAuth(ctx context.Context, meta pluginruntime.AuthMeta, apiKey, proxy
 	if err := common.Unmarshal([]byte(apiKey), &credentials); err != nil {
 		return nil, fmt.Errorf("decode oauth2_jwt credentials: %w", err)
 	}
+	if err := checkGatewayTaskCredentials(ctx); err != nil {
+		return nil, err
+	}
 	token, err := acquireAccessToken(ctx, credentials, proxy)
 	if err != nil {
 		return nil, err

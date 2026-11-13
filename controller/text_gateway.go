@@ -75,6 +75,8 @@ func gatewayError(c *gin.Context, status int, code, message string) {
 		message = i18n.T(c, key)
 	} else if parameters, ok := strings.CutPrefix(message, "Unsupported parameters: "); ok {
 		message = i18n.T(c, i18n.MsgGatewayUnsupportedParameters, map[string]any{"Parameters": parameters})
+	} else {
+		message = i18n.T(c, message)
 	}
 	var payload gin.H
 	event := ""
@@ -135,6 +137,7 @@ type textGatewayRun struct {
 	attemptUsage         map[string]*dto.Usage
 	saleTrace            *billingexpr.MoneyTraceResult
 	attemptTrace         map[string]billingexpr.MoneyTraceResult
+	nativeError          *types.NewAPIError
 	status               int
 	code, message        string
 }
@@ -189,28 +192,33 @@ func runAuthorizedTextGateway(c *gin.Context) {
 		return result
 	})
 	c.Request = parent
-	if run.record != nil {
-		run.record.EndedAt = clock.Now().UnixMilli()
-		if run.evaluationFailed {
-			run.record.Status = "settlement_pending"
-		}
-		intent := model.GatewaySettlement{Request: *run.record, Attempts: attempts, SaleSource: run.saleSource, EvaluationFailed: run.evaluationFailed, SaleEvaluationFailed: run.saleEvaluationFailed, SaleUsage: run.saleUsage, AttemptUsage: run.attemptUsage}
-		if run.evaluationFailed {
-			intent.SaleTrace, intent.AttemptTrace = run.saleTrace, run.attemptTrace
-		}
-		if err := model.PrepareGatewaySettlement(intent); err != nil {
-			logger.LogError(parent.Context(), "gateway settlement preparation failed for request "+run.record.ID)
-		} else if _, err := model.SettleGateway(run.record.ID); err != nil {
-			logger.LogError(parent.Context(), "gateway settlement pending for request "+run.record.ID)
-		} else if err := model.PublishGatewayRecords(run.record.ID); err != nil {
-			logger.LogError(parent.Context(), "gateway record delivery pending for request "+run.record.ID)
-		}
-	}
+	run.settle(parent.Context(), attempts)
 	if parent.Context().Err() != nil {
 		return
 	}
 	if run.status != 0 {
 		gatewayError(c, run.status, run.code, run.message)
+	}
+}
+
+func (run *textGatewayRun) settle(ctx context.Context, attempts []model.GatewayAttempt) {
+	if run.record == nil {
+		return
+	}
+	run.record.EndedAt = clock.Now().UnixMilli()
+	if run.evaluationFailed {
+		run.record.Status = "settlement_pending"
+	}
+	intent := model.GatewaySettlement{Request: *run.record, Attempts: attempts, SaleSource: run.saleSource, EvaluationFailed: run.evaluationFailed, SaleEvaluationFailed: run.saleEvaluationFailed, SaleUsage: run.saleUsage, AttemptUsage: run.attemptUsage}
+	if run.evaluationFailed {
+		intent.SaleTrace, intent.AttemptTrace = run.saleTrace, run.attemptTrace
+	}
+	if err := model.PrepareGatewaySettlement(intent); err != nil {
+		logger.LogError(ctx, "gateway settlement preparation failed for request "+run.record.ID)
+	} else if _, err := model.SettleGateway(run.record.ID); err != nil {
+		logger.LogError(ctx, "gateway settlement pending for request "+run.record.ID)
+	} else if err := model.PublishGatewayRecords(run.record.ID); err != nil {
+		logger.LogError(ctx, "gateway record delivery pending for request "+run.record.ID)
 	}
 }
 
@@ -348,6 +356,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
 		return
 	}
+	budget.RequirePermit(selection.Permit)
 	c.Header("X-Gateway-Conversion-Loss", strings.Join(selection.ConversionLosses, ","))
 	contactedProvider := false
 	defer func() {
@@ -500,7 +509,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				upstreamCode = "content_filter"
 			}
 			failure := service.ClassifyGatewayFailure(upstreamStatus, upstreamCode, transportFailed, budget.TimedOut(), parent.Context().Err() != nil, info.ResponseFacts.DownstreamWriteFailed, upstreamType)
-			localRejection := providerCallRejected != nil
+			localRejection := providerCallRejected != nil || errors.Is(context.Cause(c.Request.Context()), service.ErrGatewayPermitLost)
 			if localRejection && parent.Context().Err() == nil && !info.ResponseFacts.DownstreamWriteFailed {
 				if errors.Is(providerCallRejected, service.ErrGatewayBudget) {
 					failure = service.GatewayFailure{Class: "first_byte_timeout", Switch: true}
@@ -519,7 +528,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				failure = service.GatewayFailure{Class: "stream_interrupted", Switch: true}
 				attempt.ErrorClass = failure.Class
 			}
-			gatewayAutoDisableProvider(c, selection, info, failure)
+			recordGatewayProviderFailure(c, info, selection, failure)
 			result = service.GatewayAttemptResult{Attempt: attempt, Failure: failure, Delivered: info.ResponseFacts.BusinessOutput,
 				FirstByte: firstByte, HealthLease: selection.Admission.Lease, LocalRejection: localRejection}
 			if failure.Class == "rate_limited" {
@@ -721,7 +730,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	selection.LossFallback = false
 	if !profitable {
 		if offering.AllowLossFallback {
-			selection.LossFallback, err = selection.LossFallbackAllowed(c.Request.Context(), comparison, offering.MinimumMarginRate)
+			selection.LossFallback, err = selection.LossFallbackAllowed(c.Request.Context(), comparison, offering.MinimumMarginRate, contactedProvider)
 		}
 		if err != nil || !selection.LossFallback {
 			run.fail(c, http.StatusServiceUnavailable, "channel_unavailable", "No Channel is available")
@@ -834,6 +843,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		}
 	}()
 	info.IsStream = info.IsStream || strings.HasPrefix(httpResponse.Header.Get("Content-Type"), "text/event-stream")
+	httpResponse.Body = channel.BoundGatewayResponseBody(httpResponse.Body)
 	if info.IsStream {
 		httpResponse.Body = helper.GatewayStreamIdleBody(httpResponse.Body, info)
 	}
@@ -863,15 +873,14 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	return
 }
 
-// gatewayAutoDisableProvider retains the selected credential and slot when an
-// account or authentication rejection changes Provider status.
-func gatewayAutoDisableProvider(c *gin.Context, selection *service.GatewaySelection, info *relaycommon.RelayInfo, failure service.GatewayFailure) {
+// recordGatewayProviderFailure shares atomic Provider checks and excludes
+// usable credentials from the audit event for every gateway transport.
+func recordGatewayProviderFailure(c *gin.Context, info *relaycommon.RelayInfo, selection *service.GatewaySelection, failure service.GatewayFailure) {
 	if !common.AutomaticDisableChannelEnabled || !selection.Provider.GetAutoBan() || failure.Class != "credentials" && failure.Class != "account_quota" {
 		return
 	}
 	index := info.ChannelMultiKeyIndex
-	providerError := types.ProviderError{ChannelId: selection.Channel.ProviderID, ChannelName: selection.Provider.Name,
-		IsMultiKey: info.ChannelIsMultiKey, UsingKey: info.ApiKey, AutoBan: true}
+	providerError := types.ProviderError{ChannelId: selection.Channel.ProviderID, ChannelName: selection.Provider.Name, IsMultiKey: info.ChannelIsMultiKey, UsingKey: info.ApiKey, AutoBan: true}
 	const reason = "Provider rejected authentication or account quota"
 	targetScope := "key"
 	if failure.Class == "account_quota" {
@@ -893,7 +902,7 @@ func gatewayAutoDisableProvider(c *gin.Context, selection *service.GatewaySelect
 // gatewayAttemptOutcome distinguishes accepted business content from protocol
 // framing, downstream failures and incomplete upstream streams.
 func gatewayAttemptOutcome(c *gin.Context, info *relaycommon.RelayInfo, err *types.NewAPIError) (string, string) {
-	if c.Request.Context().Err() != nil {
+	if c.Request.Context().Err() != nil && !errors.Is(context.Cause(c.Request.Context()), service.ErrGatewayPermitLost) {
 		return "cancelled", "client_cancelled"
 	}
 	if info.ResponseFacts.DownstreamWriteFailed {

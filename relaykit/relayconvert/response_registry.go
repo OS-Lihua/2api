@@ -1063,6 +1063,29 @@ func convertOAIChatStreamResponseToClaudeMessages(_ context.Context, info convme
 	if err != nil {
 		return nil, nil, err
 	}
+	var original *dto.ChatCompletionsStreamResponse
+	switch value := response.(type) {
+	case *dto.ChatCompletionsStreamResponse:
+		original = value
+	case dto.ChatCompletionsStreamResponse:
+		original = &value
+	}
+	if info == nil {
+		info = &convmeta.Values{}
+	}
+	state := info.EnsureClaudeConvertInfo()
+	for i := range chatResponse.Choices {
+		if len(original.Choices[i].Delta.FunctionCall) == 0 || len(original.Choices[i].Delta.ToolCalls) > 0 || len(chatResponse.Choices[i].Delta.ToolCalls) == 0 {
+			continue
+		}
+		tool := &chatResponse.Choices[i].Delta.ToolCalls[0]
+		if previous := state.ToolCallByIndex[0]; state.LastMessagesType == convmeta.LastMessageTypeTools && previous != nil {
+			tool.ID = previous.ID
+		}
+		if tool.ID == "" {
+			tool.ID = fmt.Sprintf("toolu_%s", kitutil.GetUUID())
+		}
+	}
 	return StreamResponseOpenAI2Claude(chatResponse, info), canonicalUsageFromResponse(chatResponse), nil
 }
 
@@ -1267,14 +1290,36 @@ func asOAIChatResponse(response any) (*dto.OpenAITextResponse, error) {
 }
 
 func asOAIChatStreamResponse(response any) (*dto.ChatCompletionsStreamResponse, error) {
+	var chunk *dto.ChatCompletionsStreamResponse
 	switch resp := response.(type) {
 	case *dto.ChatCompletionsStreamResponse:
-		return resp, nil
+		chunk = resp
 	case dto.ChatCompletionsStreamResponse:
-		return &resp, nil
+		chunk = &resp
 	default:
 		return nil, fmt.Errorf("expected OAI chat stream response, got %T", response)
 	}
+	normalized := *chunk
+	normalized.Choices = append([]dto.ChatCompletionsStreamResponseChoice(nil), chunk.Choices...)
+	for i := range normalized.Choices {
+		choice := &normalized.Choices[i]
+		if len(choice.Delta.FunctionCall) > 0 && len(choice.Delta.ToolCalls) == 0 {
+			var function dto.FunctionResponse
+			if err := kitutil.Unmarshal(choice.Delta.FunctionCall, &function); err != nil {
+				return nil, err
+			}
+			if function.Name != "" || function.Arguments != "" {
+				index := 0
+				choice.Delta.ToolCalls = []dto.ToolCallResponse{{Index: &index, Type: "function", Function: function}}
+			}
+			choice.Delta.FunctionCall = nil
+		}
+		if choice.FinishReason != nil && *choice.FinishReason == "function_call" {
+			reason := "tool_calls"
+			choice.FinishReason = &reason
+		}
+	}
+	return &normalized, nil
 }
 
 func asOAIResponsesResponse(response any) (*dto.OpenAIResponsesResponse, error) {

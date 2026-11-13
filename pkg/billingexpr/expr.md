@@ -333,6 +333,48 @@ after evaluation. Calculations do not round. Write the final amount with
 `Value.Receivable`, `Value.Credit`, or `Value.Cost` according to the ledger entry.
 A repeating value formats as an exact fraction until that write boundary.
 
+Task prices use this same evaluator. `u("key")` reads numeric, boolean, or enum
+facts from `MoneyInput.Request.Usage`, preserving explicit zero and false.
+A missing referenced fact fails evaluation. Expressions containing `u()` already
+return currency amounts in canonical task units and are not divided by one
+million. Set `MoneyInput.TaskUsage` for task evaluation, including constant task
+prices; this mode rejects `fixed()`. The host validates plugin schema and unit
+bounds before evaluation and supplies the same completed fact record to sale
+and purchase expressions. Native submission streams retain separate source and
+byte-complete public-delivery quantities in that record: procurement uses the
+source facts, and sales use the delivered facts without exceeding known source
+quantities. Missing quantities remain unknown; an output budget is not a
+completion fact. In task mode, `image_count` reads the same bounded
+whole `u("image_count")` fact, including an explicitly reported zero; it never
+defaults to one. Saving this syntax requires the selected plugin schema to
+declare `image_count` as a numeric count field.
+
+Durable task pricing can set `RequestInput.FreezeMoneyRequest` to capture a
+`MoneyRequestSnapshot` in the money trace. It stores the expression hash and
+boolean decisions for request-only predicates, including predicates skipped by
+estimated-usage branches. It never stores raw probe values. Settlement supplies
+that snapshot through `RequestInput.MoneySnapshot`; measured `u()` conditions
+still evaluate against completion facts. Sale decisions use the original client
+request, and purchase decisions use the final upstream body and headers.
+Recovery sets `RequireMoneySnapshot`; a missing snapshot for an expression using
+request probes fails evaluation instead of reading an empty request. Expressions
+without request probes remain recoverable from their quantitative facts alone.
+
+This durable mode requires every `param()` / `header()` call to be enclosed by
+an independent, self-contained boolean predicate. Predicates that depend on
+local variables or collection-predicate pointers cannot be captured separately;
+aliases of request-probe functions are also rejected at save time. For example,
+a header predicate combined with
+`u("seconds") > 2` is supported: only the header decision is frozen. A direct
+comparison between a private probe and mutable usage, or a raw probe used as an
+amount, cannot be replayed without retaining input values and is rejected by
+price-version management when a task owner is selected, as well as before
+submission for historical configurations. An incomplete snapshot fails closed
+when the missing predicate is required. Normal request-scoped evaluation retains
+its existing grammar.
+A predicate that failed in an unused branch is retained as unavailable; if final
+usage selects it, the existing pending-accounting lifecycle preserves the facts.
+
 ### Request Rules (appended after `|||`)
 
 Request-conditional multipliers are appended to the expression after a `|||` separator:

@@ -120,13 +120,11 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 					sourceOutput.text.WriteString(relaycommon.SourceText(part.Get("text")))
 				}
 			}
-			reasoning := message.Get("reasoning_content")
-			if !reasoning.Exists() {
-				reasoning = message.Get("reasoning")
-			}
-			sourceOutput.text.WriteString(relaycommon.SourceText(reasoning))
+			sourceOutput.text.WriteString(relaycommon.SourceReasoningText(message))
 			sourceOutput.text.WriteString(relaycommon.SourceText(message.Get("refusal")))
 			sourceOutput.text.WriteString(relaycommon.SourceText(message.Get("audio.transcript")))
+			sourceOutput.text.WriteString(relaycommon.SourceText(message.Get("function_call.name")))
+			sourceOutput.text.WriteString(relaycommon.SourceText(message.Get("function_call.arguments")))
 			for _, tool := range message.Get("tool_calls").Array() {
 				for _, path := range []string{"function.name", "function.arguments", "custom.name", "custom.input"} {
 					sourceOutput.text.WriteString(relaycommon.SourceText(tool.Get(path)))
@@ -149,6 +147,10 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	}
 	if usage == nil {
 		usage = &dto.Usage{}
+	}
+	if p.format == types.RelayFormatGemini {
+		sourceOutput.ObserveGemini(body)
+		sourceTokens = meter.CompletionTokenEstimate(&sourceOutput, usage, info.TokenizerModelName())
 	}
 	facts.PromptTokensReported, facts.CompletionTokensReported = meter.BaseCounters()
 	facts.UsageReported = facts.PromptTokensReported && facts.CompletionTokensReported
@@ -246,7 +248,11 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		usage.PromptTokens = max(usage.PromptTokens, info.GetEstimatePromptTokens())
 	}
 	if !facts.CompletionTokensReported {
-		usage.CompletionTokens = max(usage.CompletionTokens, generatedTokens)
+		if p.format == types.RelayFormatGemini {
+			usage.CompletionTokens = max(usage.CompletionTokens, sourceTokens)
+		} else {
+			usage.CompletionTokens = max(usage.CompletionTokens, generatedTokens)
+		}
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	converted, err := relayconvert.ConvertResponse(c, info, info.RelayFormat, response)

@@ -44,6 +44,7 @@ func (p *Handler) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	info.FinalRequestRelayFormat = p.format
 	info.UpstreamProtocol = p.kind
 	if info.ResponseFacts != nil {
+		resp.Body = channel.BoundGatewayResponseBody(resp.Body)
 		contentType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 		jsonResponse := contentType == "application/json" || strings.HasSuffix(contentType, "+json")
 		if contentType == "text/event-stream" || info.IsStream && !jsonResponse {

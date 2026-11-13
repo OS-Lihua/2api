@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -56,12 +58,12 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 	usage.CompletionTokens = c.GetInt("coze_output_count")
 	usage.TotalTokens = c.GetInt("coze_token_count")
 	if info.ResponseFacts != nil {
-		if result, ok := resp.Body.(*cozeResultBody); ok {
+		if result, ok := channel.GatewayResponseBodySource(resp.Body).(*cozeResultBody); ok {
 			info.ResponseFacts.RecordUsage(&usage, &result.usage, result.usageFacts.PromptTokensReported, result.usageFacts.CompletionTokensReported)
 		} else {
 			info.ResponseFacts.RecordUsage(&usage, &usage, false, false)
 		}
-		if result, ok := resp.Body.(*cozeResultBody); ok && result.failure != nil {
+		if result, ok := channel.GatewayResponseBodySource(resp.Body).(*cozeResultBody); ok && result.failure != nil {
 			return &usage, result.failure
 		}
 		if resp.StatusCode != http.StatusOK {
@@ -75,11 +77,13 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 			if item.Get("type").String() != "answer" {
 				continue
 			}
-			var text string
-			if common.UnmarshalJsonStr(item.Get("content").Raw, &text) != nil {
-				continue
+			text := relaycommon.SourceText(item.Get("content"))
+			reasoning := relaycommon.SourceText(item.Get("reasoning_content"))
+			message := dto.Message{Role: "assistant", Content: text}
+			if reasoning != "" {
+				message.ReasoningContent = &reasoning
 			}
-			source.Choices = []dto.OpenAITextResponseChoice{{Message: dto.Message{Role: "assistant", Content: text}}}
+			source.Choices = append(source.Choices, dto.OpenAITextResponseChoice{Message: message})
 		}
 		info.ResponseFacts.RecordChatSource(&source, info.TokenizerModelName())
 	}
@@ -99,9 +103,11 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 	response.Id = helper.GetResponseID(c)
 
 	var responseContent json.RawMessage
+	var responseReasoning string
 	for _, data := range cozeResponse.Data {
 		if data.Type == "answer" {
 			responseContent = data.Content
+			responseReasoning = data.ReasoningContent
 			response.Created = data.CreatedAt
 		}
 	}
@@ -114,6 +120,9 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 		},
 	}
 	if info.ResponseFacts != nil {
+		if responseReasoning != "" {
+			response.Choices[0].Message.ReasoningContent = &responseReasoning
+		}
 		if len(responseContent) > 0 {
 			var text string
 			if err := common.Unmarshal(responseContent, &text); err != nil {
@@ -121,7 +130,11 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 			}
 			response.Choices[0].Message.Content = text
 		}
-		return helper.WriteChatResponse(c, info, resp, &response)
+		sourceText, sourceTokens, sourceObserved := info.ResponseFacts.SourceGeneratedText, info.ResponseFacts.SourceOutputTokens, info.ResponseFacts.SourceOutputObserved
+		result, failure := helper.WriteChatResponse(c, info, resp, &response)
+		info.ResponseFacts.SourceGeneratedText, info.ResponseFacts.SourceOutputTokens = sourceText, sourceTokens
+		info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || sourceObserved
+		return result, failure
 	}
 	jsonResponse, err := common.Marshal(response)
 	if err != nil {
@@ -134,12 +147,26 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 	return &usage, nil
 }
 
+func cozeGeneratedMessage(root gjson.Result) bool {
+	if role := relaycommon.SourceText(root.Get("role")); role != "" && role != "assistant" {
+		return false
+	}
+	switch relaycommon.SourceText(root.Get("type")) {
+	case "", "answer", "function_call", "follow_up":
+		return true
+	default:
+		return false
+	}
+}
+
 func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
-	scanner := helper.NewStreamScanner(resp.Body)
+	sourceReader := &io.LimitedReader{R: resp.Body, N: math.MaxInt64}
+	scanner := helper.NewStreamScanner(sourceReader)
+	sourceFinished := false
 	managed := info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil
 	if managed {
-		scanner = helper.NewSSEEventScanner(resp.Body, info.ResponseFacts)
+		scanner = helper.NewSSEEventScanner(sourceReader, info.ResponseFacts)
 	}
 	helper.SetEventStreamHeaders(c)
 	if info.StreamStatus == nil {
@@ -153,8 +180,23 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 	var responseText, currentEvent, currentData string
 	type sourceMessage struct{ content, reasoning string }
 	sourceMessages := map[string]sourceMessage{}
-	observeCompletedSource := func(data []byte) {
+	observeDeltaSource := func(data []byte) bool {
 		root := gjson.ParseBytes(data)
+		if !cozeGeneratedMessage(root) {
+			return false
+		}
+		id := relaycommon.SourceText(root.Get("id"))
+		message := sourceMessages[id]
+		message.content += relaycommon.SourceText(root.Get("content"))
+		message.reasoning += relaycommon.SourceText(root.Get("reasoning_content"))
+		sourceMessages[id] = message
+		return true
+	}
+	observeCompletedSource := func(data []byte) bool {
+		root := gjson.ParseBytes(data)
+		if !cozeGeneratedMessage(root) {
+			return false
+		}
 		id := relaycommon.SourceText(root.Get("id"))
 		previous := sourceMessages[id]
 		content, reasoning := relaycommon.SourceText(root.Get("content")), relaycommon.SourceText(root.Get("reasoning_content"))
@@ -169,20 +211,57 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 		}
 		sourceMessages[id] = previous
 		helper.RecordNativeStreamSource(c, info, &dto.OpenAITextResponse{Choices: []dto.OpenAITextResponseChoice{{Message: dto.Message{Role: "assistant", Content: suffix.String()}}}})
+		return suffix.Len() > 0
 	}
+	defer func() {
+		if !managed || sourceFinished {
+			return
+		}
+		// Drain only bytes already received by this scanner.
+		sourceReader.N = 0
+		for scanner.Scan() {
+			event := helper.ParseSSEEvent(scanner.Text())
+			if !event.HasData {
+				continue
+			}
+			_ = recordCozeStreamUsage(info, usage, event.Data)
+			data := []byte(event.Data)
+			if event.Event == "conversation.message.delta" && observeDeltaSource(data) {
+				helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(data, "", "content", "reasoning_content"))
+			}
+			if event.Event == "conversation.message.completed" {
+				observeCompletedSource(data)
+			}
+		}
+		if partial := info.ResponseFacts.UnterminatedStreamData; len(partial) > 0 {
+			_ = recordCozeStreamUsage(info, usage, string(partial))
+			event := info.ResponseFacts.UnterminatedStreamEvent
+			if event == "conversation.message.delta" && observeDeltaSource(partial) {
+				helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(partial, "", "content", "reasoning_content"))
+			}
+			if event == "conversation.message.completed" {
+				observeCompletedSource(partial)
+			}
+			info.ResponseFacts.UnterminatedStreamData, info.ResponseFacts.UnterminatedStreamEvent = nil, ""
+		}
+	}()
 	for scanner.Scan() {
 		if managed {
 			event := helper.ParseSSEEvent(scanner.Text())
 			if event.Event == "conversation.message.delta" {
-				root := gjson.Parse(event.Data)
-				id := relaycommon.SourceText(root.Get("id"))
-				message := sourceMessages[id]
-				message.content += relaycommon.SourceText(root.Get("content"))
-				message.reasoning += relaycommon.SourceText(root.Get("reasoning_content"))
-				sourceMessages[id] = message
+				if !observeDeltaSource([]byte(event.Data)) {
+					continue
+				}
+				if info.StreamStatus.CompletedNormally() {
+					helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource([]byte(event.Data), "", "content", "reasoning_content"))
+					return usage, types.NewError(fmt.Errorf("Coze stream contains generation after completion"), types.ErrorCodeBadResponseBody)
+				}
 			}
 			if event.Event == "conversation.message.completed" {
-				observeCompletedSource([]byte(event.Data))
+				generated := observeCompletedSource([]byte(event.Data))
+				if generated && info.StreamStatus.CompletedNormally() {
+					return usage, types.NewError(fmt.Errorf("Coze stream contains generation after completion"), types.ErrorCodeBadResponseBody)
+				}
 			}
 			if event.Event != "" && event.HasData {
 				if err := handleCozeEvent(c, event.Event, event.Data, &responseText, usage, id, info); err != nil {
@@ -207,11 +286,12 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 			currentData = strings.TrimSpace(data)
 		}
 	}
+	sourceFinished = true
 	if managed && len(info.ResponseFacts.UnterminatedStreamData) > 0 {
 		partial := info.ResponseFacts.UnterminatedStreamData
 		_ = recordCozeStreamUsage(info, usage, string(partial))
 		event := info.ResponseFacts.UnterminatedStreamEvent
-		if event == "conversation.message.delta" {
+		if event == "conversation.message.delta" && cozeGeneratedMessage(gjson.ParseBytes(partial)) {
 			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(partial, "", "content", "reasoning_content"))
 		}
 		if event == "conversation.message.completed" {

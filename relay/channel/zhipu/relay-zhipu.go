@@ -3,6 +3,7 @@ package zhipu
 import (
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -162,12 +163,32 @@ func zhipuStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 	info.StreamStatus.RequireTerminal()
 	defer info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
 	defer helper.EstimateMissingChatUsage(c, info, usage)
-	scanner := helper.NewStreamScanner(resp.Body)
+	sourceReader := &io.LimitedReader{R: resp.Body, N: math.MaxInt64}
+	scanner := helper.NewStreamScanner(sourceReader)
+	defer func() {
+		if info.ResponseFacts == nil || info.ResponseFacts.OnBusinessOutput == nil {
+			return
+		}
+		// Drain only bytes already received by this scanner.
+		sourceReader.N = 0
+		for scanner.Scan() {
+			if data, ok := strings.CutPrefix(scanner.Text(), "meta:"); ok {
+				info.ResponseFacts.RecordNativeUsage(usage, []byte(data), "usage.prompt_tokens", "usage.completion_tokens")
+				_ = info.ResponseFacts.RecordChatUsage(usage, []byte(data), "usage")
+			} else if data, ok := strings.CutPrefix(scanner.Text(), "data:"); ok {
+				helper.RecordNativeStreamSource(c, info, &dto.OpenAITextResponse{Choices: []dto.OpenAITextResponseChoice{{Message: dto.Message{Role: "assistant", Content: data}}}})
+			}
+		}
+	}()
 	helper.SetEventStreamHeaders(c)
 	for scanner.Scan() {
 		line := scanner.Text()
 		var response *dto.ChatCompletionsStreamResponse
 		if data, ok := strings.CutPrefix(line, "data:"); ok {
+			if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil && info.StreamStatus.CompletedNormally() && data != "" {
+				helper.RecordNativeStreamSource(c, info, &dto.OpenAITextResponse{Choices: []dto.OpenAITextResponseChoice{{Message: dto.Message{Role: "assistant", Content: data}}}})
+				return usage, types.NewError(fmt.Errorf("Zhipu stream contains generation after completion"), types.ErrorCodeBadResponseBody)
+			}
 			response = streamResponseZhipu2OpenAI(data)
 		} else if data, ok := strings.CutPrefix(line, "meta:"); ok {
 			var meta ZhipuStreamMetaResponse

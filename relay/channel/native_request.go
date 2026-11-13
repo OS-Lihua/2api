@@ -30,6 +30,9 @@ type NativeChatRequestContract interface {
 // DiagnoseNativeChatRequest applies strict conversion acceptance to the final
 // provider dialect as well as to public protocol conversions.
 func DiagnoseNativeChatRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest, caps NativeChatCapabilities, actual *dto.GeneralOpenAIRequest) error {
+	if request.N != nil && *request.N > 1 && (info.IsStream || !slices.Contains(caps.Parameters, "n")) {
+		return &types.ConversionLossError{Diagnostics: []types.ConversionDiagnostic{{Code: "request_parameter_dropped", Path: "n", Severity: types.ConversionDiagnosticError, From: types.RelayFormatOpenAI, To: types.RelayFormatOpenAI, Message: "native Provider cannot represent multiple output choices (n)"}}}
+	}
 	body, err := common.Marshal(request)
 	if err != nil {
 		return err
@@ -109,7 +112,11 @@ func DiagnoseNativeChatRequest(c *gin.Context, info *relaycommon.RelayInfo, requ
 		if key == "response_format" && request.ResponseFormat != nil && request.ResponseFormat.Type == "text" {
 			continue
 		}
-		diagnostics = append(diagnostics, types.ConversionDiagnostic{Code: "request_parameter_dropped", Path: key, Severity: types.ConversionDiagnosticWarning, From: types.RelayFormatOpenAI, To: types.RelayFormatOpenAI, Message: "The native request did not retain this request parameter"})
+		severity := types.ConversionDiagnosticWarning
+		if key == "n" {
+			severity = types.ConversionDiagnosticError
+		}
+		diagnostics = append(diagnostics, types.ConversionDiagnostic{Code: "request_parameter_dropped", Path: key, Severity: severity, From: types.RelayFormatOpenAI, To: types.RelayFormatOpenAI, Message: "The native request did not retain this request parameter"})
 	}
 	for index, message := range request.Messages {
 		for _, part := range message.ParseContent() {
@@ -150,9 +157,9 @@ func ProjectNativeChatParameters(body []byte, public dto.GeneralOpenAIRequest, n
 			properties[key] = true
 		}
 	}
-	for key := range wire {
+	for _, key := range slices.Sorted(maps.Keys(wire)) {
 		if !properties[key] {
-			return nil, fmt.Errorf("native wire does not support request parameter %s", key)
+			return nil, &types.ConversionLossError{Diagnostics: []types.ConversionDiagnostic{{Code: "request_parameter_dropped", Path: key, Severity: types.ConversionDiagnosticError, From: types.RelayFormatOpenAI, To: types.RelayFormatOpenAI, Message: "native wire does not support request parameter " + key}}}
 		}
 	}
 	encoded, err := common.Marshal(public)

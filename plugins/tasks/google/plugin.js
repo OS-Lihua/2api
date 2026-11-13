@@ -7,7 +7,7 @@ export const meta = {
     en: "Google Veo video generation on the Gemini API (text-to-video and image-to-video)",
     zh: "Google Veo 视频生成（文生视频、图生视频），Gemini API 版本",
   },
-  version: "1.2.0",
+  version: "1.3.0",
   author: { name: "QuantumNous" },
   channelTypes: [24],
   models: ["veo-3.0-generate-001", "veo-3.0-fast-generate-001", "veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"],
@@ -242,6 +242,17 @@ export const native = {
   },
 };
 
+export function extractCapabilities(ctx) {
+  const convertedRequest = converted(ctx);
+  const instance = convertedRequest.body.instances[0];
+  const input = [];
+  if (trimmed(instance.prompt)) input.push("text");
+  if (instance.image) input.push("image");
+  const duration = convertedRequest.body.parameters.durationSeconds ?? 8;
+  if (![4, 6, 8].includes(Number(duration))) throw new Error("durationSeconds must be one of 4, 6, or 8");
+  return { input_modalities: input, output_modalities: ["video"], image_count: instance.image ? 1 : 0, duration_seconds: Number(duration) };
+}
+
 export function buildSubmitRequest(ctx) {
   const result = converted(ctx);
   return {
@@ -267,10 +278,9 @@ export function parseSubmitResponse(ctx, resp) {
 
 export function extractUsage(ctx) {
   const req = ctx.requestBody || {};
-  const metadata = req.metadata || {};
-  let seconds = Number(req.duration);
-  if (!Number.isFinite(seconds) || seconds <= 0) seconds = 8;
-  const resolution = String(metadata.resolution || resolutionForSize(req.size) || "720p").toLowerCase();
+  const parameters = converted(ctx).body.parameters;
+  const seconds = Number(parameters.durationSeconds ?? 8);
+  const resolution = String(parameters.resolution || resolutionForSize(req.size) || "720p").toLowerCase();
   return { seconds: seconds, resolution: resolution };
 }
 

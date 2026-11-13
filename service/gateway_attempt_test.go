@@ -455,6 +455,29 @@ func TestChannelHealthStaleCompletionCannotChangeCurrentCircuit(t *testing.T) {
 	}
 }
 
+func TestGatewayConcurrencyPermitRenewalDetectsLoss(t *testing.T) {
+	fake := clock.UseFake(t, time.Unix(1000, 0))
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	manager := service.NewGatewayRouteQuota(client)
+	selection := &service.GatewaySelection{Provider: &model.Provider{Id: 1}, Channel: model.Channel{ID: 1, MaxConcurrency: 1}}
+	permit, err := manager.Acquire(t.Context(), selection, 0)
+	require.NoError(t, err)
+	var budget *service.GatewayAttemptBudget
+	service.RunGatewayAttempts(t.Context(), service.GatewayAttemptPolicy{MaxAttempts: 1, TotalFirstByte: time.Minute, AttemptFirstByte: time.Minute}, func(current *service.GatewayAttemptBudget, _ *service.GatewayExclusions) service.GatewayAttemptResult {
+		budget = current
+		budget.RequirePermit(permit)
+		return service.GatewayAttemptResult{}
+	})
+	require.NotNil(t, budget)
+	server.Del("new-api:route-quota:v1:provider:1")
+	fake.Advance(time.Minute)
+	_, err = budget.Start()
+	assert.ErrorIs(t, err, service.ErrGatewayPermitLost)
+	require.NoError(t, permit.Release(t.Context(), true))
+}
+
 func TestGatewayKnownRejectionSurvivesBudgetCancellation(t *testing.T) {
 	for _, test := range []struct {
 		status           int
@@ -501,6 +524,114 @@ func TestGatewaySkippedCandidatesAndTiersShareTheSendBudget(t *testing.T) {
 	assert.Equal(t, 3, calls)
 	assert.Equal(t, "first_byte_budget", attempts[1].FailoverReason)
 	assert.Equal(t, 2, attempts[1].MemberTier)
+}
+
+func TestGatewayNativeTransportBudget(t *testing.T) {
+	t.Run("handshake release retains the next logical request", func(t *testing.T) {
+		fake := clock.UseFake(t, time.Unix(100, 0))
+		server := miniredis.RunT(t)
+		client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+		t.Cleanup(func() { require.NoError(t, client.Close()) })
+		manager := service.NewGatewayRouteQuota(client)
+		selection := &service.GatewaySelection{Provider: &model.Provider{Id: 1}, Channel: model.Channel{ID: 1, MaxConcurrency: 1}}
+		permit, err := manager.Acquire(t.Context(), selection, 2)
+		require.NoError(t, err)
+		var handshake *service.GatewayAttemptBudget
+		service.RunGatewayAttempts(t.Context(), service.GatewayAttemptPolicy{MaxAttempts: 1, TotalFirstByte: time.Minute, AttemptFirstByte: time.Minute}, func(b *service.GatewayAttemptBudget, _ *service.GatewayExclusions) service.GatewayAttemptResult {
+			handshake = b
+			b.RequirePermit(permit)
+			_, err := b.Start()
+			require.NoError(t, err)
+			permit.Disarm()
+			b.Handoff()
+			return service.GatewayAttemptResult{TransportAttempt: true, Established: true}
+		})
+		require.NoError(t, permit.Release(t.Context(), true))
+		handshake.Pause()
+		next, err := manager.Acquire(t.Context(), selection, 3)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, next.Release(context.WithoutCancel(t.Context()), true)) })
+		handshake.RequirePermit(next)
+		ctx, err := handshake.Start()
+		require.NoError(t, err)
+		assert.NoError(t, ctx.Err(), "the next generation must survive the handshake's completed I/O context")
+		select {
+		case <-ctx.Done():
+			t.Fatal("the next generation was cancelled by ordinary handshake cleanup")
+		default:
+		}
+		server.SetError("ERR injected quota renewal failure")
+		fake.Advance(time.Minute)
+		assert.ErrorIs(t, context.Cause(ctx), service.ErrGatewayPermitLost, "a later logical request must retain its own lease revocation")
+		server.SetError("")
+	})
+	t.Run("handshake lease loss rejects the next generation", func(t *testing.T) {
+		fake := clock.UseFake(t, time.Unix(100, 0))
+		server := miniredis.RunT(t)
+		client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+		t.Cleanup(func() { require.NoError(t, client.Close()) })
+		manager := service.NewGatewayRouteQuota(client)
+		selection := &service.GatewaySelection{Provider: &model.Provider{Id: 1}, Channel: model.Channel{ID: 1, MaxConcurrency: 1}}
+		permit, err := manager.Acquire(t.Context(), selection, 2)
+		require.NoError(t, err)
+		var handshake *service.GatewayAttemptBudget
+		service.RunGatewayAttempts(t.Context(), service.GatewayAttemptPolicy{MaxAttempts: 1, TotalFirstByte: time.Minute, AttemptFirstByte: time.Minute}, func(b *service.GatewayAttemptBudget, _ *service.GatewayExclusions) service.GatewayAttemptResult {
+			handshake = b
+			b.RequirePermit(permit)
+			ctx, err := b.Start()
+			require.NoError(t, err)
+			server.SetError("ERR injected handshake quota renewal failure")
+			fake.Advance(time.Minute)
+			require.ErrorIs(t, context.Cause(ctx), service.ErrGatewayPermitLost)
+			permit.Disarm()
+			b.Handoff()
+			server.SetError("")
+			require.NoError(t, permit.Release(context.WithoutCancel(t.Context()), true))
+			return service.GatewayAttemptResult{TransportAttempt: true, Established: true}
+		})
+		handshake.Pause()
+		next, err := manager.Acquire(t.Context(), selection, 3)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, next.Release(context.WithoutCancel(t.Context()), true)) })
+		_, err = handshake.Start()
+		require.ErrorIs(t, err, service.ErrGatewayPermitLost)
+		assert.ErrorIs(t, context.Cause(handshake.Context()), service.ErrGatewayPermitLost, "a handshake loss rejects the next generation before Provider I/O")
+		server.SetError("")
+	})
+	t.Run("handshakes consume the shared maximum", func(t *testing.T) {
+		clock.UseFake(t, time.Unix(100, 0))
+		calls := 0
+		attempts := service.RunGatewayAttempts(t.Context(), service.GatewayAttemptPolicy{MaxAttempts: 3, TotalFirstByte: 90 * time.Second, AttemptFirstByte: 30 * time.Second}, func(b *service.GatewayAttemptBudget, e *service.GatewayExclusions) service.GatewayAttemptResult {
+			calls++
+			_, err := b.Start()
+			require.NoError(t, err)
+			for id := range calls - 1 {
+				assert.True(t, e.Channels[id+1])
+			}
+			return service.GatewayAttemptResult{TransportAttempt: true, SkippedChannel: calls, Failure: service.GatewayFailure{Class: "connection", Switch: true}}
+		})
+		assert.Equal(t, 3, calls)
+		assert.Empty(t, attempts, "Connection setup does not create model-generation records")
+	})
+	t.Run("metadata wait retains handshake expenditure", func(t *testing.T) {
+		fake := clock.UseFake(t, time.Unix(100, 0))
+		service.RunGatewayAttempts(t.Context(), service.GatewayAttemptPolicy{MaxAttempts: 3, TotalFirstByte: 20 * time.Second, AttemptFirstByte: 30 * time.Second}, func(b *service.GatewayAttemptBudget, e *service.GatewayExclusions) service.GatewayAttemptResult {
+			ctx, err := b.Start()
+			require.NoError(t, err)
+			fake.Advance(4 * time.Second)
+			b.Pause()
+			fake.Advance(time.Hour)
+			require.NoError(t, ctx.Err())
+			resumed, err := b.Start()
+			require.NoError(t, err)
+			assert.NoError(t, resumed.Err())
+			fake.Advance(16*time.Second - time.Nanosecond)
+			require.NoError(t, ctx.Err())
+			fake.Advance(time.Nanosecond)
+			assert.ErrorIs(t, context.Cause(ctx), service.ErrGatewayBudget)
+			return service.GatewayAttemptResult{TransportAttempt: true, Established: true}
+		})
+	})
 }
 
 func TestGatewayBudgetExcludesPreparationAndStopsAfterDelivery(t *testing.T) {

@@ -43,12 +43,15 @@ func GatewayPrice(price *model.PriceVersion, usage *dto.Usage, request billingex
 	if err != nil {
 		return money.Value{}, money.Value{}, billingexpr.MoneyTraceResult{}, err
 	}
-	quantities, err := billingexpr.MoneyTokenQuantities(usage, used)
-	if err != nil {
-		return money.Value{}, money.Value{}, billingexpr.MoneyTraceResult{}, err
+	var quantities map[string]decimal.Decimal
+	if request.Usage == nil {
+		quantities, err = billingexpr.MoneyTokenQuantities(usage, used)
+		if err != nil {
+			return money.Value{}, money.Value{}, billingexpr.MoneyTraceResult{}, err
+		}
 	}
 	request.UnmeasuredTokens = billingexpr.NormalizeUnmeasuredOutputTokens(request.UnmeasuredTokens, used)
-	input := billingexpr.MoneyInput{TokenQuantities: quantities, Request: request, Time: at}
+	input := billingexpr.MoneyInput{TaskUsage: request.Usage != nil, TokenQuantities: quantities, Request: request, Time: at}
 	if len(actualImageCount) > 1 {
 		return money.Value{}, money.Value{}, billingexpr.MoneyTraceResult{}, errors.New("multiple actual image counts")
 	}

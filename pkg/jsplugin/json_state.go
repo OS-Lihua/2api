@@ -3,7 +3,9 @@ package jsplugin
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -12,19 +14,20 @@ import (
 )
 
 const (
-	CapabilityJSONClone      = "json-clone@1"
-	CapabilitySubmitSSEDelta = "submit-sse-delta@1"
-	CapabilityJSONOrder      = "json-order@1"
-	CapabilityDurationAuto   = "duration-auto@1"
-	MaxJSONToolBytes         = 1 << 20
-	maxJSONToolDepth         = 32
-	maxJSONToolNodes         = 32768
-	maxJSONChanges           = 256
+	CapabilityJSONClone         = "json-clone@1"
+	CapabilitySubmitSSEDelta    = "submit-sse-delta@1"
+	CapabilitySubmitSSEBusiness = "submit-sse-business@1"
+	CapabilityJSONOrder         = "json-order@1"
+	CapabilityDurationAuto      = "duration-auto@1"
+	MaxJSONToolBytes            = 1 << 20
+	maxJSONToolDepth            = 32
+	maxJSONToolNodes            = 32768
+	maxJSONChanges              = 256
 )
 
 // HasCapability describes host APIs independently of a plugin's mutable globals.
 func HasCapability(name string) bool {
-	return name == CapabilityJSONClone || name == CapabilitySubmitSSEDelta || name == CapabilityJSONOrder || name == CapabilityDurationAuto
+	return name == CapabilityJSONClone || name == CapabilitySubmitSSEDelta || name == CapabilitySubmitSSEBusiness || name == CapabilityJSONOrder || name == CapabilityDurationAuto
 }
 
 // ValidateJSONPath checks a path into a JSON document by the rules of a JSON
@@ -265,7 +268,81 @@ func (s *JSONState) Apply(ctx context.Context, changes any) (err error) {
 			s.failed = err
 		}
 	}()
-	if err = ctx.Err(); err != nil {
+	return s.apply(ctx, changes, nil)
+}
+
+// ApplyAtomic preserves the last accepted JSON value when a batch fails.
+// It copies touched containers and only rebuilds appended text on rollback.
+func (s *JSONState) ApplyAtomic(ctx context.Context, changes any) error {
+	if s.failed != nil {
+		return s.failed
+	}
+	type checkpoint struct {
+		node jsonStateNode
+		text string
+	}
+	original := s.root
+	checkpoints := make(map[*jsonStateNode]checkpoint)
+	err := s.apply(ctx, changes, func(node *jsonStateNode) {
+		if _, saved := checkpoints[node]; saved {
+			return
+		}
+		saved := checkpoint{node: *node}
+		if node.text != nil {
+			saved.text = node.text.String()
+		}
+		checkpoints[node] = saved
+		node.object = maps.Clone(node.object)
+		node.array = slices.Clone(node.array)
+	})
+	if err == nil {
+		return nil
+	}
+	s.root = original
+	for node, saved := range checkpoints {
+		*node = saved.node
+		if node.text != nil {
+			node.text = &strings.Builder{}
+			node.text.WriteString(saved.text)
+		}
+	}
+	return err
+}
+
+// JSONSourceRecoveryError retains the last valid state beside a failed source
+// batch. Callers may recover known facts from it without publishing the result.
+type JSONSourceRecoveryError struct {
+	Err      error
+	Previous any
+}
+
+func (e *JSONSourceRecoveryError) Error() string { return e.Err.Error() }
+func (e *JSONSourceRecoveryError) Unwrap() error { return e.Err }
+
+// ApplySource retains independent bounded changes for source accounting after
+// a failed batch. It still returns the error; its recovered value must never
+// be published as a completed response.
+func (s *JSONState) ApplySource(ctx context.Context, changes any) error {
+	err := s.ApplyAtomic(ctx, changes)
+	if err == nil || s.failed != nil {
+		return err
+	}
+	items, ok := changes.([]any)
+	if !ok || len(items) > maxJSONChanges {
+		return err
+	}
+	previous, snapshotErr := s.Value()
+	if snapshotErr != nil {
+		return err
+	}
+	for _, item := range items {
+		_ = s.ApplyAtomic(context.WithoutCancel(ctx), []any{item})
+	}
+	return &JSONSourceRecoveryError{Err: err, Previous: previous}
+}
+
+func (s *JSONState) apply(ctx context.Context, changes any, checkpoint func(*jsonStateNode)) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	items, ok := changes.([]any)
@@ -327,6 +404,14 @@ func (s *JSONState) Apply(ctx context.Context, changes any) (err error) {
 			}
 			if target == nil && (offset != len(path)-1 || op != "set") {
 				return fmt.Errorf("JSON change target does not exist")
+			}
+		}
+		if checkpoint != nil {
+			for _, ancestor := range ancestors {
+				checkpoint(ancestor)
+			}
+			if op != "set" {
+				checkpoint(target)
 			}
 		}
 		addedBytes, addedNodes := 0, 0

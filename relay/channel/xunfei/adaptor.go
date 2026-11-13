@@ -2,7 +2,6 @@ package xunfei
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -69,11 +68,27 @@ func (a *Provider) RequestURL(metadata channel.ProviderMetadata) (string, error)
 	if version == "" {
 		version = "v1.1"
 	}
-	endpoint := fmt.Sprintf("wss://spark-api.xf-yun.com/%s/chat", version)
-	if _, err := url.Parse(endpoint); err != nil {
-		return "", errors.New("invalid Xunfei API version")
+	base := strings.TrimRight(info.ChannelBaseUrl, "/")
+	if base == "" {
+		base = "wss://spark-api.xf-yun.com"
 	}
-	return a.authURL(endpoint, parts[2], parts[1]), nil
+	endpoint, err := url.Parse(base)
+	if err != nil || endpoint.Host == "" {
+		return "", errors.New("invalid Xunfei destination")
+	}
+	switch endpoint.Scheme {
+	case "http":
+		endpoint.Scheme = "ws"
+	case "https":
+		endpoint.Scheme = "wss"
+	case "ws", "wss":
+	default:
+		return "", errors.New("invalid Xunfei destination")
+	}
+	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/" + version + "/chat"
+	endpoint.RawQuery = ""
+	endpoint.Fragment = ""
+	return a.authURL(endpoint.String(), parts[2], parts[1]), nil
 }
 
 func (a *Provider) SetupHeader(c *gin.Context, req *http.Header, metadata channel.ProviderMetadata) error {

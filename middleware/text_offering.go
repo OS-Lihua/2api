@@ -17,46 +17,61 @@ const textOfferingContextKey = "text_gateway_offering"
 const textOfferingMissingContextKey = "text_gateway_offering_missing"
 const TextGatewayStartedAtKey = "text_gateway_started_at"
 
-// ResolveTextOffering resolves public names for stateless text and media HTTP.
-// The gateway still checks visibility and Key permissions before dispatch.
+// ResolveTextOffering resolves public names for stateless text, media, and
+// native realtime HTTP. The gateway still checks visibility and Key permissions
+// before dispatch.
 func ResolveTextOffering() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		isRealtime := c.Request.Method == http.MethodGet && c.Request.URL.Path == "/v1/realtime"
 		kind, name := TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
-		if kind == "" && !IsMediaGatewayEndpoint(c.Request.Method, c.Request.URL.Path) {
+		if isRealtime {
+			name = c.Query("model")
+		}
+		if (isRealtime && name == "") || (!isRealtime && kind == "" && !IsMediaGatewayEndpoint(c.Request.Method, c.Request.URL.Path)) {
 			c.Next()
 			return
 		}
-		if c.GetTime(TextGatewayStartedAtKey).IsZero() {
-			c.Set(TextGatewayStartedAtKey, clock.Now())
+		resolveOffering(c, name)
+	}
+}
+
+// ResolveTaskOffering shares Offering resolution with stateless text routes.
+// Credential and Offering authorization checks remain in their normal handlers.
+func ResolveTaskOffering() gin.HandlerFunc {
+	return func(c *gin.Context) { resolveOffering(c, "") }
+}
+
+func resolveOffering(c *gin.Context, name string) {
+	if c.GetTime(TextGatewayStartedAtKey).IsZero() {
+		c.Set(TextGatewayStartedAtKey, clock.Now())
+	}
+	if name == "" {
+		var request struct {
+			Model string `json:"model"`
 		}
-		if name == "" {
-			var request struct {
-				Model string `json:"model"`
-			}
-			if common.UnmarshalBodyReusable(c, &request) != nil || request.Model == "" {
-				c.Next()
-				return
-			}
-			name = request.Model
-		}
-		offering, err := model.FindModelOfferingByName(c.Request.Context(), name)
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			legacy, legacyErr := model.LegacyModelConfigured(c.Request.Context(), name)
-			if legacyErr != nil {
-				abortWithOpenAiMessage(c, http.StatusInternalServerError, "Could not resolve model")
-				return
-			}
-			c.Set(textOfferingMissingContextKey, !legacy)
+		if common.UnmarshalBodyReusable(c, &request) != nil || request.Model == "" {
 			c.Next()
 			return
 		}
-		if err != nil {
+		name = request.Model
+	}
+	offering, err := model.FindModelOfferingByName(c.Request.Context(), name)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		legacy, legacyErr := model.LegacyModelConfigured(c.Request.Context(), name)
+		if legacyErr != nil {
 			abortWithOpenAiMessage(c, http.StatusInternalServerError, "Could not resolve model")
 			return
 		}
-		c.Set(textOfferingContextKey, offering)
+		c.Set(textOfferingMissingContextKey, !legacy)
 		c.Next()
+		return
 	}
+	if err != nil {
+		abortWithOpenAiMessage(c, http.StatusInternalServerError, "Could not resolve model")
+		return
+	}
+	c.Set(textOfferingContextKey, offering)
+	c.Next()
 }
 
 // TextGatewayEndpoint identifies only the four stateless HTTP text operations.

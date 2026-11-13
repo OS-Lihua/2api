@@ -38,6 +38,15 @@ type gatewayPreparedChat struct {
 	Facts     service.GatewayRouteFacts
 }
 
+func gatewayProjectionFailure(c *gin.Context, info *relaycommon.RelayInfo, err error) error {
+	var loss *types.ConversionLossError
+	if errors.As(err, &loss) {
+		info.RecordConversionDiagnostics(c, loss.Diagnostics)
+		return &service.GatewayConversionError{Diagnostics: info.ConversionDiagnostics()}
+	}
+	return service.ErrGatewayCapability
+}
+
 func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection, original *dto.GeneralOpenAIRequest, native dto.Request, kind protocol.Type, accepted []string, started time.Time, mean int64) (*gatewayPreparedChat, error) {
 	candidate := c.Copy()
 	if selection.Provider.Setting != nil && *selection.Provider.Setting != "" {
@@ -155,11 +164,11 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 	}
 	encoded, err = adaptor.FinalizeChatRequest(candidate, info, converted, encoded)
 	if err != nil {
-		return nil, service.ErrGatewayCapability
+		return nil, gatewayProjectionFailure(candidate, info, err)
 	}
 	effective, err := adaptor.ProjectChatRequest(candidate, info, converted, request, encoded)
 	if err != nil {
-		return nil, service.ErrGatewayCapability
+		return nil, gatewayProjectionFailure(candidate, info, err)
 	}
 	if _, err = helper.ValidateTextRequest(candidate, effective, relayconstant.RelayModeChatCompletions, selection.Channel.Protocol == protocol.OpenAIResponses); err != nil || effective.Model != selection.Channel.UpstreamModelName || effective.IsStream(candidate.Request) != info.IsStream {
 		return nil, service.ErrGatewayCapability
@@ -216,7 +225,7 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 				effective, err = adaptor.ProjectChatRequest(candidate, info, converted, request, encoded)
 			}
 			if err != nil {
-				return nil, service.ErrGatewayCapability
+				return nil, gatewayProjectionFailure(candidate, info, err)
 			}
 			if _, err = helper.ValidateTextRequest(candidate, effective, relayconstant.RelayModeChatCompletions, selection.Channel.Protocol == protocol.OpenAIResponses); err != nil {
 				return nil, service.ErrGatewayCapability

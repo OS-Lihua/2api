@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -212,11 +213,11 @@ func validateProjectedTaskArtifacts(artifacts []relaychannel.TaskArtifact) ([]re
 	return artifacts, nil
 }
 
-func initTaskArtifactAdaptor(task *model.Task) (relaychannel.TaskAdaptor, error) {
+func initTaskArtifactAdaptor(ctx context.Context, task *model.Task) (relaychannel.TaskAdaptor, error) {
 	if task == nil || !taskHasPluginExecution(task) {
 		return nil, errTaskArtifactPluginUnavailable
 	}
-	channelModel, err := model.CacheGetProvider(task.ChannelId)
+	channelModel, keyIndex, err := service.GatewayTaskProviderWithContext(ctx, task)
 	if err != nil {
 		return nil, fmt.Errorf("%w: channel unavailable", errTaskArtifactPluginUnavailable)
 	}
@@ -224,9 +225,9 @@ func initTaskArtifactAdaptor(task *model.Task) (relaychannel.TaskAdaptor, error)
 	if adaptor == nil {
 		return nil, errTaskArtifactPluginUnavailable
 	}
-	pluginKey := task.PrivateData.Key
-	if pluginKey == "" {
-		pluginKey = channelModel.Key
+	pluginKey := channelModel.Key
+	if task.PrivateData.Gateway == nil && task.PrivateData.Key != "" {
+		pluginKey = task.PrivateData.Key
 	}
 	baseURL := channelModel.GetBaseURL()
 	if baseURL == "" {
@@ -234,11 +235,12 @@ func initTaskArtifactAdaptor(task *model.Task) (relaychannel.TaskAdaptor, error)
 	}
 	adaptor.Init(&relaycommon.RelayInfo{
 		ProviderMeta: &relaycommon.ProviderMeta{
-			ChannelType:     channelModel.Type,
-			ChannelBaseUrl:  baseURL,
-			ApiKey:          pluginKey,
-			ChannelSetting:  channelModel.GetSetting(),
-			HeadersOverride: channelModel.GetHeaderOverride(),
+			ChannelType:          channelModel.Type,
+			ChannelMultiKeyIndex: keyIndex,
+			ChannelBaseUrl:       baseURL,
+			ApiKey:               pluginKey,
+			ChannelSetting:       channelModel.GetSetting(),
+			HeadersOverride:      channelModel.GetHeaderOverride(),
 		},
 	})
 	return adaptor, nil
@@ -371,7 +373,7 @@ func TaskArtifactContent(c *gin.Context) {
 		return
 	}
 
-	adaptor, err := initTaskArtifactAdaptor(task)
+	adaptor, err := initTaskArtifactAdaptor(c.Request.Context(), task)
 	if err != nil {
 		writeTaskArtifactProjectionError(c, err)
 		return

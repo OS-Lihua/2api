@@ -2,6 +2,7 @@ package i18n
 
 import (
 	"embed"
+	"errors"
 	"slices"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
 const (
@@ -41,7 +43,7 @@ func Init() error {
 		bundle.RegisterUnmarshalFunc("yaml", yaml.Unmarshal)
 
 		// Load embedded translation files
-		files := []string{"locales/zh-CN.yaml", "locales/zh-TW.yaml", "locales/en.yaml"}
+		files := []string{"locales/zh-CN.yaml", "locales/zh-TW.yaml", "locales/en.yaml", "locales/native.zh-CN.yaml", "locales/native.zh-TW.yaml", "locales/native.en.yaml"}
 		for _, file := range files {
 			_, err := bundle.LoadMessageFileFS(localeFS, file)
 			if err != nil {
@@ -59,6 +61,49 @@ func Init() error {
 		common.TranslateMessage = T
 	})
 	return initErr
+}
+
+// LocalizeRelayError translates gateway errors while preserving Provider errors.
+func LocalizeRelayError(lang string, apiErr *types.NewAPIError, upstreamURLs ...string) types.OpenAIError {
+	problem := apiErr.ToOpenAIError(upstreamURLs...)
+	if apiErr.GetErrorType() != types.ErrorTypeNewAPIError {
+		return problem
+	}
+	key := problem.Message
+	var arguments map[string]any
+	for _, suffix := range []string{" must be an integer between 1 and 4096 or inf", " exceeds the connection output limit"} {
+		if field, ok := strings.CutSuffix(key, suffix); ok {
+			key = "{{.Field}}" + suffix
+			arguments = map[string]any{"Field": field}
+			break
+		}
+	}
+	if arguments == nil {
+		if detail, ok := strings.CutPrefix(key, "Realtime accounting failed: "); ok {
+			key = "Realtime accounting failed: {{.Error}}"
+			arguments = map[string]any{"Error": detail}
+		} else if detail, ok := strings.CutPrefix(key, "dial failed to "); ok {
+			if target, cause, found := strings.Cut(detail, ": "); found {
+				key = "dial failed to {{.URL}}: {{.Error}}"
+				arguments = map[string]any{"URL": target, "Error": cause}
+			}
+		} else if kind, ok := strings.CutPrefix(key, "invalid api type: "); ok {
+			key = "invalid api type: {{.Type}}"
+			arguments = map[string]any{"Type": kind}
+		}
+	}
+	problem.Message = Translate(lang, key, arguments)
+	var parameter interface{ ParameterPath() string }
+	if errors.As(apiErr.Err, &parameter) && parameter.ParameterPath() != "" {
+		path := parameter.ParameterPath()
+		problem.Param = path
+		if len(problem.Metadata) == 0 {
+			field, _, _ := strings.Cut(path, ".")
+			field, _, _ = strings.Cut(field, "[")
+			problem.Metadata, _ = common.Marshal(map[string]string{"parameter": field, "path": path, "reason": problem.Message})
+		}
+	}
+	return problem
 }
 
 // GetLocalizer returns a localizer for the specified language
