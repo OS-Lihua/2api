@@ -7,6 +7,7 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/tidwall/gjson"
 )
 
 // streamKeepAliveWriter 在业务写入前保活，写入开始时等待心跳退出。
@@ -300,6 +302,9 @@ func WriteGatewayJSONResponse(c *gin.Context, resp *http.Response, facts *relayc
 	}
 	if resp != nil {
 		for name, values := range resp.Header {
+			if strings.EqualFold(name, "X-Gateway-Conversion-Loss") {
+				continue
+			}
 			if len(values) > 0 && service.ShouldCopyUpstreamHeader(c, name, values) {
 				c.Writer.Header().Set(name, values[0])
 			}
@@ -470,6 +475,7 @@ func SendChatChunk(c *gin.Context, info *relaycommon.RelayInfo, response *dto.Ch
 	}
 	for _, choice := range response.Choices {
 		text := choice.Delta.GetContentString() + choice.Delta.GetReasoningContent()
+		text += relaycommon.SourceText(gjson.GetBytes(choice.Delta.FunctionCall, "name")) + relaycommon.SourceText(gjson.GetBytes(choice.Delta.FunctionCall, "arguments"))
 		for _, call := range choice.Delta.ToolCalls {
 			text += call.Function.Name + call.Function.Arguments
 		}

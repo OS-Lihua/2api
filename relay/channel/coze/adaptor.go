@@ -87,7 +87,7 @@ func (a *Protocol) DoRequest(c *gin.Context, info *common.RelayInfo, requestBody
 
 // DoResponse implements channel.Adaptor.
 func (a *Protocol) DoResponse(c *gin.Context, resp *http.Response, info *common.RelayInfo) (usage any, err *types.NewAPIError) {
-	if response, ok := resp.Body.(*cozeResultBody); ok {
+	if response, ok := channel.GatewayResponseBodySource(resp.Body).(*cozeResultBody); ok {
 		c.Set("coze_token_count", response.completion.Data.Usage.TokenCount)
 		c.Set("coze_output_count", response.completion.Data.Usage.OutputCount)
 		c.Set("coze_input_count", response.completion.Data.Usage.InputCount)

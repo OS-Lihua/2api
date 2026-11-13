@@ -26,7 +26,7 @@ func (p *Provider) ComposeProtocol(kind protocol.Type, generic channel.ProtocolH
 }
 
 // sparkProtocol converts the Spark envelope and feeds the shared Chat parser.
-// WebSocket execution and account fields belong to Provider.ExecuteRequest.
+// Account/version fields are finalized before probes and verified before execution.
 type sparkProtocol struct {
 	public channel.ProtocolHandler
 	wire   *Protocol
@@ -66,25 +66,52 @@ func (p *sparkProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayIn
 	}
 	return wire, nil
 }
+func decodeSparkSourceFrame(raw []byte, framed bool) (sparkSourceFrame, error) {
+	if !framed {
+		return sparkSourceFrame{Data: raw}, nil
+	}
+	var frame sparkSourceFrame
+	err := common.Unmarshal(raw, &frame)
+	return frame, err
+}
+
 func (p *sparkProtocol) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
 	if resp == nil || resp.Body == nil {
 		return nil, types.NewError(fmt.Errorf("missing Spark response"), types.ErrorCodeBadResponseBody)
 	}
 	reportedUsage := make(map[string]int)
+	framed := resp.Header.Get("Content-Type") == "application/x-spark-frame"
+	transport, _ := channel.GatewayResponseBodySource(resp.Body).(*sparkResponseBody)
+	var sourceText strings.Builder
+	var observedSequence uint64
+	observeSource := func(frame sparkSourceFrame) {
+		if info.ResponseFacts == nil || frame.Sequence > 0 && frame.Sequence <= observedSequence {
+			return
+		}
+		observedSequence = max(observedSequence, frame.Sequence)
+		recordSparkUsage(frame.Data, reportedUsage)
+		for _, choice := range relaycommon.NativeTextSource(frame.Data, "payload.choices.text", "content").Choices {
+			sourceText.WriteString(choice.Message.StringContent())
+		}
+	}
 	if !info.IsStream {
 		defer resp.Body.Close()
-		var content strings.Builder
 		var usage dto.Usage
 		var last XunfeiChatResponse
 		var responseErr *types.NewAPIError
 		scanner := helper.NewStreamScanner(resp.Body)
+		if framed {
+			scanner.Buffer(make([]byte, helper.InitialScannerBufferSize), int(2*channel.GatewayResponseSourceLimit()))
+		}
 		for scanner.Scan() {
-			raw := scanner.Bytes()
+			received, err := decodeSparkSourceFrame(scanner.Bytes(), framed)
+			if err != nil {
+				responseErr = types.NewError(err, types.ErrorCodeBadResponseBody)
+				break
+			}
+			observeSource(received)
+			raw := received.Data
 			if info.ResponseFacts != nil {
-				recordSparkUsage(raw, reportedUsage)
-				for _, choice := range relaycommon.NativeTextSource(raw, "payload.choices.text", "content").Choices {
-					content.WriteString(choice.Message.StringContent())
-				}
 				raw = relaycommon.SanitizeNativeUsage(raw, "payload.usage.text")
 			}
 			if err := common.Unmarshal(raw, &last); err != nil {
@@ -96,11 +123,15 @@ func (p *sparkProtocol) DoResponse(c *gin.Context, resp *http.Response, info *re
 				break
 			}
 			if info.ResponseFacts == nil && len(last.Payload.Choices.Text) > 0 {
-				content.WriteString(last.Payload.Choices.Text[0].Content)
+				sourceText.WriteString(last.Payload.Choices.Text[0].Content)
 			}
 			usage.PromptTokens += last.Payload.Usage.Text.PromptTokens
 			usage.CompletionTokens += last.Payload.Usage.Text.CompletionTokens
 			usage.TotalTokens += last.Payload.Usage.Text.TotalTokens
+		}
+		_ = resp.Body.Close()
+		if transport != nil {
+			observeSource(transport.pendingSource())
 		}
 		if err := scanner.Err(); err != nil {
 			responseErr = types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
@@ -109,8 +140,8 @@ func (p *sparkProtocol) DoResponse(c *gin.Context, resp *http.Response, info *re
 			if info.ResponseFacts == nil {
 				return nil, responseErr
 			}
-			info.ResponseFacts.SourceGeneratedText = content.String()
-			info.ResponseFacts.SourceOutputObserved = content.Len() > 0
+			info.ResponseFacts.SourceGeneratedText = sourceText.String()
+			info.ResponseFacts.SourceOutputObserved = sourceText.Len() > 0
 			promptTokens, prompt := reportedUsage["prompt_tokens"]
 			completionTokens, completion := reportedUsage["completion_tokens"]
 			reported := dto.Usage{PromptTokens: promptTokens, CompletionTokens: completionTokens}
@@ -119,7 +150,7 @@ func (p *sparkProtocol) DoResponse(c *gin.Context, resp *http.Response, info *re
 			return &usage, responseErr
 		}
 		response := responseXunfei2OpenAI(&last)
-		response.Choices[0].Message.Content = content.String()
+		response.Choices[0].Message.Content = sourceText.String()
 		response.Usage = usage
 		response.Model = info.UpstreamModelName
 		wire := struct {
@@ -141,21 +172,25 @@ func (p *sparkProtocol) DoResponse(c *gin.Context, resp *http.Response, info *re
 	}
 	original := resp.Body
 	reader, writer := io.Pipe()
-	var sourceText strings.Builder
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
 		defer original.Close()
 		defer writer.Close()
 		scanner := helper.NewStreamScanner(original)
+		if framed {
+			scanner.Buffer(make([]byte, helper.InitialScannerBufferSize), int(2*channel.GatewayResponseSourceLimit()))
+		}
 		var usage dto.Usage
 		for scanner.Scan() {
-			raw := scanner.Bytes()
+			received, err := decodeSparkSourceFrame(scanner.Bytes(), framed)
+			if err != nil {
+				writer.CloseWithError(err)
+				return
+			}
+			observeSource(received)
+			raw := received.Data
 			if info.ResponseFacts != nil {
-				recordSparkUsage(raw, reportedUsage)
-				for _, choice := range relaycommon.NativeTextSource(raw, "payload.choices.text", "content").Choices {
-					sourceText.WriteString(choice.Message.StringContent())
-				}
 				raw = relaycommon.SanitizeNativeUsage(raw, "payload.usage.text")
 			}
 			if err := c.Request.Context().Err(); err != nil {
@@ -227,6 +262,9 @@ func (p *sparkProtocol) DoResponse(c *gin.Context, resp *http.Response, info *re
 	value, failure := p.public.DoResponse(c, resp, info)
 	_ = resp.Body.Close()
 	<-finished
+	if transport != nil {
+		observeSource(transport.pendingSource())
+	}
 	if info.ResponseFacts != nil {
 		usage, _ := value.(*dto.Usage)
 		if usage == nil {

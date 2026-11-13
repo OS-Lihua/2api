@@ -840,6 +840,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		}
 	}()
 	info.IsStream = info.IsStream || strings.HasPrefix(httpResponse.Header.Get("Content-Type"), "text/event-stream")
+	httpResponse.Body = channel.BoundGatewayResponseBody(httpResponse.Body)
 	if info.IsStream {
 		httpResponse.Body = helper.GatewayStreamIdleBody(httpResponse.Body, info)
 	}

@@ -1,14 +1,14 @@
 package common
 
 import (
-	"github.com/MoeForge/moego/ojson"
+	"strings"
+
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/capability"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
-	"strings"
 )
 
 // ChatUsagePresence reports bounded base counters independently. A reported
@@ -55,17 +55,26 @@ func SourceText(value gjson.Result) string {
 	return text
 }
 
+// SourceReasoningText preserves an explicit empty primary and recovers a complete alias.
+func SourceReasoningText(message gjson.Result) string {
+	if value := message.Get("reasoning_content"); value.Type == gjson.String {
+		var text string
+		if common.UnmarshalJsonStr(value.Raw, &text) == nil {
+			return text
+		}
+	}
+	return SourceText(message.Get("reasoning"))
+}
+
 // ChatStreamChoiceBusinessText preserves the content within one independent output.
 func ChatStreamChoiceBusinessText(choice gjson.Result) string {
 	var text strings.Builder
 	text.WriteString(SourceText(choice.Get("delta.content")))
-	if reasoning := choice.Get("delta.reasoning_content"); reasoning.Exists() {
-		text.WriteString(SourceText(reasoning))
-	} else {
-		text.WriteString(SourceText(choice.Get("delta.reasoning")))
-	}
+	text.WriteString(SourceReasoningText(choice.Get("delta")))
 	text.WriteString(SourceText(choice.Get("delta.refusal")))
 	text.WriteString(SourceText(choice.Get("delta.audio.transcript")))
+	text.WriteString(SourceText(choice.Get("delta.function_call.name")))
+	text.WriteString(SourceText(choice.Get("delta.function_call.arguments")))
 	for _, tool := range choice.Get("delta.tool_calls").Array() {
 		for _, field := range []string{"function.name", "function.arguments", "custom.name", "custom.input"} {
 			text.WriteString(SourceText(tool.Get(field)))
@@ -153,8 +162,9 @@ func NativeUsagePresence(body []byte, promptPath, completionPath, _ string) (boo
 		if path == "" {
 			continue
 		}
-		raw := ojson.GetBytes(body, path).Raw
-		if raw == "" || raw == "null" {
+		value := gjson.GetBytes(body, path)
+		raw := value.Raw
+		if !sourceNumberComplete(body, value) {
 			continue
 		}
 		var count int64
@@ -279,6 +289,56 @@ func (facts *ResponseFacts) RecordNativeTextSource(body []byte, choicesPath, tex
 	}
 }
 
+// SourceUsageObject retains independently complete fields from a usage object.
+func SourceUsageObject(body []byte, value gjson.Result) map[string]any {
+	known, ok := sourceUsageValue(body, value, 0)
+	if !ok {
+		return nil
+	}
+	fields, _ := known.(map[string]any)
+	return fields
+}
+
+func sourceNumberComplete(body []byte, value gjson.Result) bool {
+	end := value.Index + len(value.Raw)
+	// A number at EOF may only be a prefix of an unreceived value.
+	return value.Type == gjson.Number && end < len(body) && strings.ContainsRune(" \t\r\n,}]", rune(body[end]))
+}
+
+func sourceUsageValue(body []byte, value gjson.Result, depth int) (any, bool) {
+	if value.Type == gjson.Number && !sourceNumberComplete(body, value) {
+		return nil, false
+	}
+	var decoded any
+	if common.UnmarshalUseNumber([]byte(value.Raw), &decoded) == nil {
+		return decoded, true
+	}
+	if depth >= 128 {
+		return nil, false
+	}
+	if value.IsObject() {
+		fields := map[string]any{}
+		value.ForEach(func(key, child gjson.Result) bool {
+			if known, ok := sourceUsageValue(body, child, depth+1); ok {
+				fields[key.Str] = known
+			}
+			return true
+		})
+		return fields, len(fields) > 0
+	}
+	if value.IsArray() {
+		var fields []any
+		value.ForEach(func(_, child gjson.Result) bool {
+			if known, ok := sourceUsageValue(body, child, depth+1); ok {
+				fields = append(fields, known)
+			}
+			return true
+		})
+		return fields, len(fields) > 0
+	}
+	return nil, false
+}
+
 // RecordChatUsage merges a native usage object with Chat counter names.
 // Omitted detail fields retain their preceding snapshot; explicit zeros reset it.
 func (facts *ResponseFacts) RecordChatUsage(usage *dto.Usage, body []byte, path string) error {
@@ -306,7 +366,15 @@ func (facts *ResponseFacts) RecordChatUsage(usage *dto.Usage, body []byte, path 
 		}
 	}
 	previousPrompt, previousCompletion := usage.PromptTokens, usage.CompletionTokens
-	if err := common.UnmarshalJsonStr(raw.Raw, usage); err != nil {
+	object := SourceUsageObject(body, raw)
+	if object == nil {
+		return nil
+	}
+	encoded, err := common.Marshal(object)
+	if err != nil {
+		return err
+	}
+	if err := common.Unmarshal(encoded, usage); err != nil {
 		return err
 	}
 	reported := *usage

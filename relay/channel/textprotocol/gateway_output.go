@@ -17,17 +17,19 @@ type gatewayToolOutput struct{ name, arguments string }
 // gatewayGeneratedOutput tracks delivered content and defers terminal
 // snapshots until upstream completion is verified. Snapshots retain omitted blocks.
 type gatewayGeneratedOutput struct {
-	pendingTerminal []json.RawMessage
-	terminalBytes   int
-	sourceTerminal  bool
-	terminalReady   bool
-	text            strings.Builder
-	parts           map[string]*strings.Builder
-	partOrder       []string
-	tools           map[string]gatewayToolOutput
-	chatTools       map[[2]int64]struct{}
-	choiceText      map[int64]*strings.Builder
-	order           []string
+	pendingTerminal       []json.RawMessage
+	terminalBytes         int
+	sourceTerminal        bool
+	sourceTerminalChoices map[int64]bool
+	terminalReady         bool
+	text                  strings.Builder
+	parts                 map[string]*strings.Builder
+	partOrder             []string
+	tools                 map[string]gatewayToolOutput
+	chatTools             map[[2]int64]struct{}
+	choiceText            map[int64]*strings.Builder
+	geminiCandidates      map[int64]*strings.Builder
+	order                 []string
 }
 
 func (o *gatewayGeneratedOutput) appendChoice(index int64, text string) {
@@ -57,10 +59,21 @@ func (o *gatewayGeneratedOutput) ObserveGemini(body []byte) {
 		if value := candidate.Get("index"); value.Exists() {
 			index = value.Int()
 		}
-		var text strings.Builder
+		var text, candidateText strings.Builder
 		for _, part := range candidate.Get("content.parts").Array() {
-			text.WriteString(gatewayGeminiPartText(part))
+			value := gatewayGeminiPartText(part)
+			text.WriteString(value)
+			if !part.Get("thought").Bool() {
+				candidateText.WriteString(value)
+			}
 		}
+		if o.geminiCandidates == nil {
+			o.geminiCandidates = map[int64]*strings.Builder{}
+		}
+		if o.geminiCandidates[index] == nil {
+			o.geminiCandidates[index] = &strings.Builder{}
+		}
+		o.geminiCandidates[index].WriteString(candidateText.String())
 		o.appendChoice(index, text.String())
 	}
 }
@@ -72,6 +85,13 @@ func (o *gatewayGeneratedOutput) ObserveChat(body []byte) {
 			index = reported.Int()
 		}
 		o.appendChoice(index, relaycommon.ChatStreamChoiceBusinessText(choice))
+		legacy := choice.Get("delta.function_call")
+		if relaycommon.SourceText(legacy.Get("name")) != "" || relaycommon.SourceText(legacy.Get("arguments")) != "" {
+			if o.chatTools == nil {
+				o.chatTools = map[[2]int64]struct{}{}
+			}
+			o.chatTools[[2]int64{index, -1}] = struct{}{}
+		}
 		for j, tool := range choice.Get("delta.tool_calls").Array() {
 			toolIndex := int64(j)
 			if reported := tool.Get("index"); reported.Exists() {
@@ -246,14 +266,22 @@ func gatewayResponseTool(item gjson.Result) (string, string, bool) {
 	case "custom_tool_call":
 		return name, relaycommon.SourceText(item.Get("input")), true
 	case "web_search_call", "file_search_call", "computer_call", "code_interpreter_call", "mcp_call", "local_shell_call":
-		if name == "" {
-			name = strings.TrimSuffix(kind, "_call")
-		}
 		var arguments strings.Builder
 		for _, key := range []string{"action", "arguments", "input", "code", "queries"} {
-			if value := item.Get(key); value.Exists() && value.Type != gjson.Null && gjson.Valid(value.Raw) {
-				arguments.WriteString(value.String())
+			value := item.Get(key)
+			if value.Type != gjson.String && !value.IsObject() && !value.IsArray() || !gjson.Valid(value.Raw) {
+				continue
 			}
+			if value.IsObject() && len(value.Map()) == 0 || value.IsArray() && len(value.Array()) == 0 {
+				continue
+			}
+			arguments.WriteString(value.String())
+		}
+		if name == "" && arguments.Len() == 0 {
+			return "", "", true
+		}
+		if name == "" {
+			name = strings.TrimSuffix(kind, "_call")
 		}
 		return name, arguments.String(), true
 	default:
@@ -305,7 +333,7 @@ func gatewayGeminiPartText(part gjson.Result) string {
 	text.WriteString(relaycommon.SourceText(part.Get("text")))
 	if part.Get("functionCall").Exists() {
 		text.WriteString(relaycommon.SourceText(part.Get("functionCall.name")))
-		if arguments := part.Get("functionCall.args"); gjson.Valid(arguments.Raw) {
+		if arguments := part.Get("functionCall.args"); arguments.IsObject() && gjson.Valid(arguments.Raw) {
 			text.WriteString(arguments.Raw)
 		}
 	}
@@ -324,7 +352,7 @@ func gatewayMessagesBlockText(block gjson.Result, initialBlock bool) string {
 		text := relaycommon.SourceText(block.Get("name"))
 		input := block.Get("input")
 		// An empty initial object is a placeholder before input_json_delta.
-		if input.Exists() && input.Type != gjson.Null && !(initialBlock && input.IsObject() && len(input.Map()) == 0) && gjson.Valid(input.Raw) {
+		if input.IsObject() && !(initialBlock && len(input.Map()) == 0) && gjson.Valid(input.Raw) {
 			text += input.String()
 		}
 		return text

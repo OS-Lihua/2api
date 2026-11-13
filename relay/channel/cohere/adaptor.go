@@ -60,16 +60,18 @@ func (a *Provider) SetupHeader(c *gin.Context, req *http.Header, metadata channe
 
 func (a *Protocol) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) (any, error) {
 	if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil {
-		if len(request.Tools) > 0 || len(request.Functions) > 0 || request.ResponseFormat != nil && request.ResponseFormat.Type != "text" {
-			for _, parameter := range []struct {
-				path    string
-				present bool
-			}{{"tools", len(request.Tools) > 0}, {"functions", len(request.Functions) > 0}, {"response_format", request.ResponseFormat != nil && request.ResponseFormat.Type != "text"}} {
-				if parameter.present {
-					info.RecordConversionDiagnostics(c, []types.ConversionDiagnostic{{Code: "request_parameter_dropped", Path: parameter.path, Message: "The native Cohere request cannot represent this parameter", Severity: types.ConversionDiagnosticError}})
-				}
+		var diagnostics []types.ConversionDiagnostic
+		for _, parameter := range []struct {
+			path    string
+			present bool
+		}{
+			{"tools", len(request.Tools) > 0}, {"functions", len(request.Functions) > 0}, {"response_format", request.ResponseFormat != nil && request.ResponseFormat.Type != "text"},
+			{"reasoning_effort", request.ReasoningEffort != "" && request.ReasoningEffort != "none"}, {"prompt_cache_key", request.PromptCacheKey != ""}, {"prompt_cache_options", len(request.PromptCacheOptions) > 0}, {"prompt_cache_retention", len(request.PromptCacheRetention) > 0},
+			{"logprobs", request.LogProbs != nil && *request.LogProbs}, {"top_logprobs", request.TopLogProbs != nil && *request.TopLogProbs > 0}, {"audio", len(request.Audio) > 0}, {"prediction", len(request.Prediction) > 0}, {"logit_bias", len(request.LogitBias) > 0},
+		} {
+			if parameter.present {
+				diagnostics = append(diagnostics, types.ConversionDiagnostic{Code: "request_parameter_dropped", Path: parameter.path, Message: "The native Cohere request cannot represent this parameter", Severity: types.ConversionDiagnosticError})
 			}
-			return nil, fmt.Errorf("Cohere wire request cannot represent tools or response_format")
 		}
 		if len(request.Modalities) > 0 {
 			var modalities []string
@@ -78,28 +80,31 @@ func (a *Protocol) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayI
 			}
 			for _, modality := range modalities {
 				if modality != "text" {
-					return nil, fmt.Errorf("Cohere wire request supports only text output")
+					diagnostics = append(diagnostics, types.ConversionDiagnostic{Code: "request_parameter_dropped", Path: "modalities", Message: "The native Cohere request cannot represent this parameter", Severity: types.ConversionDiagnosticError})
+					break
 				}
 			}
 		}
-		if request.ReasoningEffort != "" && request.ReasoningEffort != "none" || request.PromptCacheKey != "" || len(request.PromptCacheOptions) > 0 || len(request.PromptCacheRetention) > 0 {
-			return nil, fmt.Errorf("Cohere wire request cannot represent reasoning or cache controls")
-		}
-		if request.LogProbs != nil && *request.LogProbs || request.TopLogProbs != nil && *request.TopLogProbs > 0 || len(request.Audio) > 0 || len(request.Prediction) > 0 || len(request.LogitBias) > 0 {
-			return nil, fmt.Errorf("Cohere wire request cannot represent the requested generation controls")
-		}
-		for _, message := range request.Messages {
-			if message.Role == "tool" || len(message.ParseToolCalls()) > 0 || len(message.Tools) > 0 {
-				return nil, fmt.Errorf("Cohere wire request cannot represent tool results")
+		for i, message := range request.Messages {
+			for _, parameter := range []struct {
+				path    string
+				present bool
+			}{{"role", message.Role == "tool"}, {"tool_calls", len(message.ParseToolCalls()) > 0}, {"tools", len(message.Tools) > 0}} {
+				if parameter.present {
+					diagnostics = append(diagnostics, types.ConversionDiagnostic{Code: "request_parameter_dropped", Path: fmt.Sprintf("messages[%d].%s", i, parameter.path), Message: "The native Cohere request cannot represent this parameter", Severity: types.ConversionDiagnosticError})
+				}
 			}
-			for _, part := range message.ParseContent() {
+			for j, part := range message.ParseContent() {
 				if len(part.CacheControl) > 0 && string(part.CacheControl) != "null" {
-					return nil, fmt.Errorf("Cohere wire request cannot represent cache controls")
+					diagnostics = append(diagnostics, types.ConversionDiagnostic{Code: "request_parameter_dropped", Path: fmt.Sprintf("messages[%d].content[%d].cache_control", i, j), Message: "The native Cohere request cannot represent this parameter", Severity: types.ConversionDiagnosticError})
 				}
 				if part.Type != dto.ContentTypeText {
-					return nil, fmt.Errorf("Cohere wire request cannot represent non-text content")
+					diagnostics = append(diagnostics, types.ConversionDiagnostic{Code: "request_parameter_dropped", Path: fmt.Sprintf("messages[%d].content[%d]", i, j), Message: "The native Cohere request cannot represent this parameter", Severity: types.ConversionDiagnosticError})
 				}
 			}
+		}
+		if len(diagnostics) > 0 {
+			return nil, &types.ConversionLossError{Diagnostics: diagnostics}
 		}
 	}
 	return requestOpenAI2Cohere(*request), nil

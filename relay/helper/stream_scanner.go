@@ -59,9 +59,12 @@ func NewStreamScanner(reader io.Reader, maxBytes ...int) *bufio.Scanner {
 // for procurement observers without presenting it as a delivered event.
 func NewSSEEventScanner(reader io.Reader, facts *relaycommon.ResponseFacts) *bufio.Scanner {
 	scanner := NewStreamScanner(reader)
+	limit := getScannerBufferSize()
 	scanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
 		advance, token, err := splitSSEEvents(data, atEOF)
-		if err != nil && facts != nil {
+		// Scanner rejects an oversized token after this callback returns.
+		limitReached := advance == 0 && token == nil && len(data) >= limit
+		if facts != nil && (err != nil || limitReached) {
 			event := ParseSSEEvent(string(data))
 			facts.UnterminatedStreamData = []byte(event.Data)
 			facts.UnterminatedStreamEvent = event.Event
@@ -204,6 +207,20 @@ func (w *streamResponseWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
+// stoppedStreamReader ends future reads after cleanup. Scanner can still parse
+// bytes already received in its buffer to preserve independent source facts.
+type stoppedStreamReader struct {
+	io.Reader
+	ctx context.Context
+}
+
+func (r stoppedStreamReader) Read(data []byte) (int, error) {
+	if r.ctx.Err() != nil {
+		return 0, io.EOF
+	}
+	return r.Reader.Read(data)
+}
+
 func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult), stoppedSource ...func(string)) {
 
 	if resp == nil || dataHandler == nil {
@@ -225,9 +242,10 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 
 	streamingTimeout := time.Duration(constant.StreamingTimeout) * time.Second
 
+	reader := stoppedStreamReader{Reader: resp.Body, ctx: ctx}
 	var (
 		stopChan    = make(chan bool, 3) // 增加缓冲区避免阻塞
-		scanner     = NewStreamScanner(resp.Body)
+		scanner     = NewStreamScanner(reader)
 		ticker      *time.Ticker
 		timeout     <-chan time.Time
 		pingTicker  *time.Ticker
@@ -287,7 +305,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	defer cleanup()
 
 	if managed {
-		scanner = NewSSEEventScanner(resp.Body, info.ResponseFacts)
+		scanner = NewSSEEventScanner(reader, info.ResponseFacts)
 	} else {
 		scanner.Split(bufio.ScanLines)
 	}
@@ -481,6 +499,14 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		}
 		if pendingSource != "" && pendingSource != "[DONE]" {
 			stoppedSource[0](pendingSource)
+		}
+		// Cleanup cancelled reader and joined its owner. No new upstream read is
+		// allowed; complete events left in Scanner's received buffer remain source.
+		for scanner.Scan() {
+			data := strings.TrimSpace(ParseSSEEvent(scanner.Text()).Data)
+			if data != "" && data != "[DONE]" {
+				stoppedSource[0](data)
+			}
 		}
 	}
 	// All stream goroutines have joined. Done from a successfully delivered

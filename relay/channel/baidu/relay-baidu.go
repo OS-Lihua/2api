@@ -141,6 +141,7 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 			info.StreamStatus.RequireTerminal()
 		}
 		if info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil && info.StreamStatus.CompletedNormally() {
+			observeSource([]byte(data))
 			sr.Error(errors.New("Baidu stream contains data after completion"))
 			return
 		}

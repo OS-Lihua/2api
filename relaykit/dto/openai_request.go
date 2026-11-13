@@ -505,6 +505,7 @@ type Message struct {
 	Reasoning        *string         `json:"reasoning,omitempty"`
 	Refusal          *string         `json:"refusal,omitempty"`
 	ToolCalls        json.RawMessage `json:"tool_calls,omitempty"`
+	FunctionCall     json.RawMessage `json:"function_call,omitempty"`
 	ToolCallId       string          `json:"tool_call_id,omitempty"`
 	// Tools carries Kimi K3 dynamic tool loading declarations on a system message.
 	// Same shape as the top-level tools array; passthrough-only for OpenAI-compatible upstreams.
@@ -684,14 +685,20 @@ func (m *Message) SetPrefix(prefix bool) {
 }
 
 func (m *Message) ParseToolCalls() []ToolCallRequest {
-	if m.ToolCalls == nil {
-		return nil
+	if m.ToolCalls != nil {
+		var calls []ToolCallRequest
+		if err := kitutil.Unmarshal(m.ToolCalls, &calls); err != nil {
+			return calls
+		}
+		if len(calls) > 0 {
+			return calls
+		}
 	}
-	var toolCalls []ToolCallRequest
-	if err := kitutil.Unmarshal(m.ToolCalls, &toolCalls); err == nil {
-		return toolCalls
+	var function FunctionRequest
+	if len(m.FunctionCall) > 0 && kitutil.Unmarshal(m.FunctionCall, &function) == nil && (function.Name != "" || function.Arguments != "") {
+		return []ToolCallRequest{{Type: "function", Function: function}}
 	}
-	return toolCalls
+	return nil
 }
 
 func (m *Message) SetToolCalls(toolCalls any) {

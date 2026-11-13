@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -98,14 +99,37 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 	info.StreamStatus.RequireTerminal()
 	defer info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
 	defer service.CloseResponseBodyGracefully(resp)
-	scanner := helper.NewStreamScanner(resp.Body)
+	sourceReader := &io.LimitedReader{R: resp.Body, N: math.MaxInt64}
+	scanner := helper.NewStreamScanner(sourceReader)
+	sourceFinished := false
 	managed := info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil
 	if managed {
-		scanner = helper.NewSSEEventScanner(resp.Body, info.ResponseFacts)
+		scanner = helper.NewSSEEventScanner(sourceReader, info.ResponseFacts)
 	} else {
 		scanner.Split(bufio.ScanLines)
 	}
 
+	defer func() {
+		if !managed || sourceFinished {
+			return
+		}
+		// Drain only bytes already received by this scanner.
+		sourceReader.N = 0
+		for scanner.Scan() {
+			event := helper.ParseSSEEvent(scanner.Text())
+			if !event.HasData {
+				continue
+			}
+			body := []byte(event.Data)
+			info.ResponseFacts.RecordNativeUsage(usage, body, "Usage.PromptTokens", "Usage.CompletionTokens")
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(body, "Choices", "Delta.Content"))
+		}
+		if partial := info.ResponseFacts.UnterminatedStreamData; len(partial) > 0 {
+			info.ResponseFacts.RecordNativeUsage(usage, partial, "Usage.PromptTokens", "Usage.CompletionTokens")
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(partial, "Choices", "Delta.Content"))
+			info.ResponseFacts.UnterminatedStreamData = nil
+		}
+	}()
 	helper.SetEventStreamHeaders(c)
 
 	for scanner.Scan() {
@@ -144,6 +168,14 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 			}
 		}
 		response := streamResponseTencent2OpenAI(&tencentResponse)
+		if managed && info.StreamStatus.CompletedNormally() {
+			for _, choice := range response.Choices {
+				if choice.Delta.GetContentString() != "" {
+					helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource([]byte(data), "Choices", "Delta.Content"))
+					return usage, types.NewError(fmt.Errorf("Tencent stream contains generation after completion"), types.ErrorCodeBadResponseBody)
+				}
+			}
+		}
 		if len(response.Choices) != 0 {
 			responseText.WriteString(response.Choices[0].Delta.GetContentString())
 		}
@@ -159,14 +191,12 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 		}
 	}
 
+	sourceFinished = true
 	if managed && len(info.ResponseFacts.UnterminatedStreamData) > 0 {
 		info.ResponseFacts.RecordNativeUsage(usage, info.ResponseFacts.UnterminatedStreamData, "Usage.PromptTokens", "Usage.CompletionTokens")
 		partial := relaycommon.SanitizeNativeUsage(info.ResponseFacts.UnterminatedStreamData, "Usage")
 		info.ResponseFacts.UnterminatedStreamData = nil
-		var complete common.RawMessage
-		if common.Unmarshal(partial, &complete) == nil {
-			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(partial, "Choices", "Delta.Content"))
-		}
+		helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(partial, "Choices", "Delta.Content"))
 	}
 	if err := scanner.Err(); err != nil {
 		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)

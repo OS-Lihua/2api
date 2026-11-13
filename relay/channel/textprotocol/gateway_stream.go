@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -39,7 +40,9 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 	expectedChoices := max(1, info.ResponseFacts.ExpectedChoices)
 	choices := map[int]gatewayStreamChoice{}
 	sourceBudgetEnd := false
+	sourceClosed, sourceBusiness := false, false
 	observeSource := func(data []byte) ([]byte, error) {
+		sourceBusiness = false
 		measured, err := meter.Observe(data)
 		if err != nil {
 			return nil, err
@@ -57,16 +60,20 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			return nil, err
 		}
 		if p.format == types.RelayFormatOpenAIResponses {
-			sourceOutput.ObserveResponses(normalized)
+			text, _ := sourceOutput.ObserveResponses(normalized)
+			sourceBusiness = text != ""
 		} else {
-			sourceOutput.text.WriteString(gatewayStreamBusinessText(normalized, p.format))
+			text := gatewayStreamBusinessText(normalized, p.format)
+			sourceOutput.text.WriteString(text)
+			sourceBusiness = text != ""
 			if p.format == types.RelayFormatOpenAI {
 				sourceOutput.ObserveChat(normalized)
 			} else if p.format == types.RelayFormatGemini {
 				sourceOutput.ObserveGemini(normalized)
 			}
 		}
-		info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || sourceOutput.String() != "" || gatewayMediaOutput(normalized, p.format)
+		sourceBusiness = sourceBusiness || gatewayMediaOutput(normalized, p.format)
+		info.ResponseFacts.SourceOutputObserved = info.ResponseFacts.SourceOutputObserved || sourceOutput.String() != "" || sourceBusiness
 		return normalized, nil
 	}
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
@@ -104,6 +111,14 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			sr.Stop(err)
 			return
 		}
+		if sourceClosed && sourceBusiness {
+			streamErr = errors.New("upstream stream contains generation after completion")
+			sr.Stop(streamErr)
+			return
+		}
+		if p.format == types.RelayFormatClaude || p.format == types.RelayFormatOpenAIResponses {
+			sourceClosed = sourceClosed || gatewayTerminalSnapshot(normalized, p.format)
+		}
 		if p.format == types.RelayFormatOpenAIResponses {
 			service.ObserveResponsesOutcome(info, event.(*dto.ResponsesStreamResponse))
 		}
@@ -114,6 +129,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			return
 		}
 		sourceBudgetEnd = sourceBudgetEnd || gatewayOutputLimitReached(normalized, p.format)
+		output.sourceTerminalChoices = nil
 		switch p.format {
 		case types.RelayFormatClaude:
 			if gjson.Get(data, "type").String() == "message_stop" {
@@ -128,6 +144,8 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			if p.format == types.RelayFormatGemini {
 				path, terminal = "candidates", "finishReason"
 			}
+			terminalChoices := map[int64]bool{}
+			continuingChoice := false
 			for i, choice := range gjson.Get(data, path).Array() {
 				index := i
 				if value := choice.Get("index"); value.Exists() {
@@ -139,7 +157,40 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 					return
 				}
 				current := choices[index]
-				current.finished = current.finished || choice.Get(terminal).String() != ""
+				if current.finished {
+					business := false
+					if p.format == types.RelayFormatOpenAI {
+						textChoice := choice
+						if choice.Get("delta.audio").Exists() {
+							withoutAudio, err := sjson.DeleteBytes([]byte(choice.Raw), "delta.audio")
+							if err != nil {
+								streamErr = err
+								sr.Stop(err)
+								return
+							}
+							textChoice = gjson.ParseBytes(withoutAudio)
+						}
+						business = relaycommon.ChatStreamChoiceBusinessText(textChoice) != ""
+					} else {
+						for _, part := range choice.Get("content.parts").Array() {
+							business = business || gatewayGeminiPartText(part) != "" || relaycommon.SourceText(part.Get("inlineData.data")) != ""
+						}
+					}
+					if business {
+						streamErr = errors.New("upstream stream contains generation after choice completion")
+						sr.Stop(streamErr)
+						return
+					}
+				}
+				reason := choice.Get(terminal).String()
+				ended := reason != "" && (p.format != types.RelayFormatGemini || reason != "FINISH_REASON_UNSPECIFIED")
+				ended = ended || p.format == types.RelayFormatOpenAI && choice.Get("delta.audio.expires_at").Type == gjson.Number
+				if ended {
+					terminalChoices[int64(index)] = true
+				} else {
+					continuingChoice = true
+				}
+				current.finished = current.finished || reason != "" && (p.format != types.RelayFormatGemini || reason != "FINISH_REASON_UNSPECIFIED")
 				if p.format == types.RelayFormatOpenAI {
 					if delta := choice.Get("delta"); delta.IsObject() {
 						current.audioDone = false
@@ -163,6 +214,9 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 					}
 				}
 				choices[index] = current
+			}
+			if continuingChoice && len(terminalChoices) > 0 {
+				output.sourceTerminalChoices = terminalChoices
 			}
 		}
 		if info.StreamStatus.ResponseFailed() {
@@ -281,7 +335,7 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 	info.ResponseFacts.SourceGeneratedText = sourceOutput.String()
 	info.ResponseFacts.GeneratedText = output.String()
 	if p.format == types.RelayFormatOpenAI || p.format == types.RelayFormatGemini {
-		sourceTokens := sourceOutput.TextTokenEstimate(info.TokenizerModelName())
+		sourceTokens := meter.CompletionTokenEstimate(&sourceOutput, usage, info.TokenizerModelName())
 		if p.format == types.RelayFormatOpenAI {
 			sourceTokens += len(sourceOutput.chatTools) * 7
 		}
@@ -298,7 +352,11 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		usage.PromptTokens = max(usage.PromptTokens, info.GetEstimatePromptTokens())
 	}
 	if !info.ResponseFacts.CompletionTokensReported {
-		usage.CompletionTokens = max(usage.CompletionTokens, generatedTokens)
+		if p.format == types.RelayFormatGemini && info.ResponseFacts.SourceOutputTokens != nil {
+			usage.CompletionTokens = max(usage.CompletionTokens, *info.ResponseFacts.SourceOutputTokens)
+		} else {
+			usage.CompletionTokens = max(usage.CompletionTokens, generatedTokens)
+		}
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	if streamErr != nil {
@@ -368,9 +426,63 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 		}
 	}
 	terminal := gatewayTerminalSnapshot(body, info.RelayFormat)
-	if (terminal || output.sourceTerminal || len(output.pendingTerminal) > 0) && !output.terminalReady && !info.PerformanceBusinessRejection {
+	finalUsage := info.RelayFormat == types.RelayFormatOpenAI && len(output.pendingTerminal) > 0 && len(gjson.GetBytes(body, "choices").Array()) == 0 && gjson.GetBytes(body, "usage").IsObject()
+	hold := (terminal || output.sourceTerminal || finalUsage) && !output.terminalReady && !info.PerformanceBusinessRejection
+	if hold && (info.RelayFormat == types.RelayFormatOpenAI || info.RelayFormat == types.RelayFormatGemini) {
+		path, finish := "choices", "finish_reason"
+		if info.RelayFormat == types.RelayFormatGemini {
+			path, finish = "candidates", "finishReason"
+		}
+		var pending, ready []json.RawMessage
+		for i, choice := range gjson.GetBytes(body, path).Array() {
+			index := int64(i)
+			if reported := choice.Get("index"); reported.Exists() {
+				index = reported.Int()
+			}
+			reason := choice.Get(finish).String()
+			ends := reason != ""
+			if info.RelayFormat == types.RelayFormatGemini && reason == "FINISH_REASON_UNSPECIFIED" {
+				ends = false
+			}
+			ends = ends || info.RelayFormat == types.RelayFormatOpenAI && choice.Get("delta.audio.expires_at").Type == gjson.Number || output.sourceTerminalChoices[index]
+			if ends {
+				pending = append(pending, json.RawMessage(choice.Raw))
+			} else {
+				ready = append(ready, json.RawMessage(choice.Raw))
+			}
+		}
+		if len(pending) == 0 && len(ready) > 0 && len(output.sourceTerminalChoices) > 0 {
+			hold = false
+		}
+		if len(pending) > 0 && len(ready) > 0 {
+			// Other choices in this frame must precede their next ordinary deltas.
+			pendingJSON, err := common.Marshal(pending)
+			if err != nil {
+				return "", err
+			}
+			pendingBody, err := sjson.SetRawBytes(body, path, pendingJSON)
+			if err != nil {
+				return "", err
+			}
+			if int64(output.terminalBytes)+int64(len(pendingBody)) > channel.GatewayResponseSourceLimit() {
+				return "", helper.ErrGatewayStreamPreludeLimit
+			}
+			output.terminalBytes += len(pendingBody)
+			output.pendingTerminal = append(output.pendingTerminal, json.RawMessage(pendingBody))
+			readyJSON, err := common.Marshal(ready)
+			if err != nil {
+				return "", err
+			}
+			body, err = sjson.SetRawBytes(body, path, readyJSON)
+			if err != nil {
+				return "", err
+			}
+			hold = false
+		}
+	}
+	if hold {
 		// Terminal snapshots can contain complete image or audio payloads.
-		if output.terminalBytes+len(body) > 64<<20 {
+		if int64(output.terminalBytes)+int64(len(body)) > channel.GatewayResponseSourceLimit() {
 			return "", helper.ErrGatewayStreamPreludeLimit
 		}
 		output.terminalBytes += len(body)
@@ -447,7 +559,7 @@ func gatewayTerminalSnapshot(body []byte, format types.RelayFormat) bool {
 		}
 	case types.RelayFormatGemini:
 		for _, candidate := range root.Get("candidates").Array() {
-			if candidate.Get("finishReason").String() != "" {
+			if reason := candidate.Get("finishReason").String(); reason != "" && reason != "FINISH_REASON_UNSPECIFIED" {
 				return true
 			}
 		}

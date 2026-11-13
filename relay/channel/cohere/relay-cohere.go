@@ -3,6 +3,7 @@ package cohere
 import (
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 
@@ -98,6 +99,23 @@ func stopReasonCohere2OpenAI(reason string) string {
 	}
 }
 
+// recordCohereStreamSnapshot adds only the previously unseen part of a final
+// response.text snapshot to procurement facts, without publishing it downstream.
+func recordCohereStreamSnapshot(c *gin.Context, info *relaycommon.RelayInfo, body []byte) {
+	if info.ResponseFacts == nil {
+		return
+	}
+	source := relaycommon.NativeTextSource(body, "", "response.text")
+	if len(source.Choices) == 0 {
+		return
+	}
+	text := source.Choices[0].Message.StringContent()
+	if suffix, ok := strings.CutPrefix(text, info.ResponseFacts.SourceGeneratedText); ok {
+		source.Choices[0].Message.Content = suffix
+		helper.RecordNativeStreamSource(c, info, source)
+	}
+}
+
 func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
 	responseId := helper.GetResponseID(c)
@@ -105,19 +123,36 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	usage := &dto.Usage{}
 	var responseText strings.Builder
 	finished := false
+	managed := info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil
 	if info.StreamStatus == nil {
 		info.StreamStatus = relaycommon.NewStreamStatus()
 	}
 	info.StreamStatus.RequireTerminal()
 	defer info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
 	defer helper.EstimateMissingChatUsage(c, info, usage)
-	scanner := helper.NewStreamScanner(resp.Body)
+	sourceReader := &io.LimitedReader{R: resp.Body, N: math.MaxInt64}
+	scanner := helper.NewStreamScanner(sourceReader)
+	defer func() {
+		if !managed {
+			return
+		}
+		// Drain only bytes already received by this scanner.
+		sourceReader.N = 0
+		for scanner.Scan() {
+			info.ResponseFacts.RecordNativeUsage(usage, scanner.Bytes(), "response.meta.billed_units.input_tokens", "response.meta.billed_units.output_tokens")
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(scanner.Bytes(), "", "text"))
+			recordCohereStreamSnapshot(c, info, scanner.Bytes())
+		}
+	}()
 	helper.SetEventStreamHeaders(c)
 	for scanner.Scan() {
 		if strings.TrimSpace(scanner.Text()) == "" {
 			continue
 		}
 		if finished {
+			info.ResponseFacts.RecordNativeUsage(usage, scanner.Bytes(), "response.meta.billed_units.input_tokens", "response.meta.billed_units.output_tokens")
+			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(scanner.Bytes(), "", "text"))
+			recordCohereStreamSnapshot(c, info, scanner.Bytes())
 			return usage, types.NewError(fmt.Errorf("Cohere stream contains data after completion"), types.ErrorCodeBadResponseBody)
 		}
 		info.SetFirstResponseTime()
@@ -129,12 +164,14 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		var cohereResp CohereResponse
 		if err := common.Unmarshal(body, &cohereResp); err != nil {
 			helper.RecordNativeStreamSource(c, info, relaycommon.NativeTextSource(body, "", "text"))
+			recordCohereStreamSnapshot(c, info, body)
 			if info.ResponseFacts == nil {
 				continue
 			}
 			return usage, types.NewError(err, types.ErrorCodeBadResponseBody)
 		}
 		if cohereResp.Response != nil {
+			recordCohereStreamSnapshot(c, info, body)
 			reported := dto.Usage{PromptTokens: cohereResp.Response.Meta.BilledUnits.InputTokens, CompletionTokens: cohereResp.Response.Meta.BilledUnits.OutputTokens}
 			if info.ResponseFacts != nil {
 				prompt, completion := relaycommon.NativeUsagePresence(body, "response.meta.billed_units.input_tokens", "response.meta.billed_units.output_tokens", "")
@@ -163,6 +200,9 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			}
 			info.StreamStatus.MarkCompleted()
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
+			if !managed {
+				break
+			}
 			finished = true
 		}
 	}
