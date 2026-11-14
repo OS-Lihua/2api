@@ -172,8 +172,13 @@ func InitDB() (err error) {
 			return nil
 		}
 		common.SysLog(common.LogText("database migration started"))
-		err = migrateDB()
-		return err
+		if err := migrateDB(); err != nil {
+			return err
+		}
+		if err := MigrateKeyPermissions(DB); err != nil {
+			return fmt.Errorf("migrate Key permissions: %w", err)
+		}
+		return nil
 	} else {
 		common.FatalLog(err)
 	}
@@ -317,9 +322,6 @@ func migrateDB() error {
 	)
 	if err != nil {
 		return err
-	}
-	if err := MigrateKeyPermissions(DB); err != nil {
-		return fmt.Errorf("migrate Key permissions: %w", err)
 	}
 	if err := MigrateRecommendationRules(DB); err != nil {
 		return fmt.Errorf("migrate recommendation rules: %w", err)
