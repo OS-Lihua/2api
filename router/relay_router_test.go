@@ -9390,6 +9390,76 @@ func TestMediaGatewayHostImagesRetainTaskPluginCandidates(t *testing.T) {
 	assert.Equal(t, int64(964_000_000), wallet.Balance.Nanos)
 }
 
+func TestMediaGatewayInactiveTaskCandidatesDoNotShadowSynchronousImages(t *testing.T) {
+	for _, state := range []string{"disabled Channel", "pending Channel", "disabled Provider"} {
+		t.Run(state, func(t *testing.T) {
+			var mediaCalls, taskCalls atomic.Int32
+			fixture := newMediaGatewayFixture(t, protocol.OpenAIImages, func(w http.ResponseWriter, r *http.Request) {
+				mediaCalls.Add(1)
+				assert.Equal(t, "/v1/images/generations", r.URL.Path)
+				var wire map[string]any
+				require.NoError(t, common.DecodeJson(r.Body, &wire))
+				assert.Equal(t, "upstream-model", wire["model"])
+				assert.EqualValues(t, 2, wire["n"])
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"data":[{"url":"https://image.invalid/synchronous"}]}`)
+			})
+			require.NoError(t, model.DB.AutoMigrate(&model.Task{}))
+			taskChannel := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
+				taskCalls.Add(1)
+				t.Error("an inactive task candidate must not receive the image request")
+				w.WriteHeader(http.StatusInternalServerError)
+			})
+			status, confirmed := model.ChannelDisabled, true
+			providerStatus := common.ChannelStatusEnabled
+			if state == "pending Channel" {
+				status, confirmed = model.ChannelPending, false
+			}
+			if state == "disabled Provider" {
+				status, providerStatus = model.ChannelEnabled, common.ChannelStatusManuallyDisabled
+			}
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", taskChannel.ProviderID).Updates(map[string]any{"type": constant.ChannelTypeAli, "status": providerStatus}).Error)
+			require.NoError(t, model.DB.Model(taskChannel).Updates(map[string]any{"protocol": protocol.Type("task:alibaba"), "upstream_model_name": "qwen-image-2.0", "status": status, "mapping_confirmed": confirmed}).Error)
+
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/images/generations", `{"model":"gateway-alias","prompt":"draw","n":2}`)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), "https://image.invalid/synchronous")
+			assert.EqualValues(t, 1, mediaCalls.Load())
+			assert.Zero(t, taskCalls.Load())
+			record, err := model.GetGatewayRequest(t.Context(), response.Header().Get(common.RequestIdKey), fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, "success", record.Status)
+			assert.Equal(t, int64(36_000_000), record.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), record.ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			require.Len(t, attempts, 1)
+			assert.Equal(t, fixture.channel.ID, attempts[0].ChannelID)
+			assert.Equal(t, fixture.channel.ProviderID, attempts[0].ProviderID)
+			assert.Equal(t, "success", attempts[0].Status)
+			assert.Equal(t, int64(20_000_000), attempts[0].Cost.Nanos)
+			assertTextGatewayLedger(t, *record, 20_000_000)
+			var payableWallet model.Wallet
+			require.NoError(t, model.DB.Where("account_type = ? AND owner_id = ?", model.LedgerAccountProviderPayable, fixture.channel.ProviderID).Take(&payableWallet).Error)
+			var entries []model.LedgerEntry
+			require.NoError(t, model.DB.Where("request_id = ?", record.ID).Find(&entries).Error)
+			require.Len(t, entries, 5)
+			for _, entry := range entries {
+				if entry.Type == model.LedgerEntryPreConsume {
+					assert.Equal(t, int64(-72_000_000), entry.Amount.Nanos)
+				}
+				if entry.AccountType == model.LedgerAccountProviderPayable {
+					assert.Equal(t, payableWallet.Id, entry.WalletId)
+					assert.Equal(t, attempts[0].ID, entry.AttemptId)
+				}
+			}
+			wallet, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(964_000_000), wallet.Balance.Nanos)
+		})
+	}
+}
+
 func TestMediaGatewayNativeImageProvidersUseEffectiveWireAndActualMoney(t *testing.T) {
 	var picture bytes.Buffer
 	require.NoError(t, png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))))
