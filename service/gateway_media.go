@@ -1,15 +1,323 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
+	"image"
+	"math"
+	"net/http"
+	"slices"
 	"strings"
 
+	"github.com/MoeForge/moego/ojson"
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/capability"
+	"github.com/QuantumNous/new-api/pkg/protocol"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	constant2 "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
 )
+
+// gatewayImageInputs shares the canonical and uploaded image view. Remote
+// references use tokenkit's existing typical-size estimate without a fetch.
+func gatewayImageInputs(c *gin.Context, request *dto.ImageRequest, model string) ([]tokenkit.Image, error) {
+	var inputs []tokenkit.Image
+	for _, raw := range []common.RawMessage{request.Image, request.Images} {
+		if len(raw) == 0 {
+			continue
+		}
+		value := ojson.ParseBytes(raw)
+		if value.Type == ojson.Null {
+			continue
+		}
+		values := []ojson.Result{value}
+		if value.IsArray() {
+			values = value.Array()
+		}
+		if len(inputs)+len(values) > dto.MaxImageN {
+			return nil, errors.New("image input count exceeds the request limit")
+		}
+		for _, value := range values {
+			metadata := tokenkit.Image{}
+			reference := value.Str
+			if value.IsObject() {
+				metadata.Detail = value.Get("detail").Str
+				reference = value.Get("url").Str
+				if reference == "" {
+					reference = value.Get("image_url").Str
+				}
+				if reference == "" {
+					reference = value.Get("image_url.url").Str
+				}
+			}
+			if tokenkit.ImageNeedsSize(model, metadata.Detail) {
+				encoded := reference
+				if strings.HasPrefix(encoded, "data:") {
+					_, payload, ok := strings.Cut(encoded, ",")
+					encoded = ""
+					if ok {
+						encoded = payload
+					}
+				}
+				if encoded != "" && !strings.Contains(encoded, ":") {
+					config, _, err := image.DecodeConfig(base64.NewDecoder(base64.StdEncoding, strings.NewReader(encoded)))
+					if err == nil {
+						metadata.Width, metadata.Height = config.Width, config.Height
+					}
+				}
+			}
+			inputs = append(inputs, metadata)
+		}
+	}
+	var uploaded []tokenkit.Image
+	if form := c.Request.MultipartForm; form != nil {
+		for field, files := range form.File {
+			if field != "image" && !strings.HasPrefix(field, "image[") && field != "image_prompt" {
+				continue
+			}
+			if len(uploaded)+len(files) > dto.MaxImageN {
+				return nil, errors.New("image input count exceeds the request limit")
+			}
+			for _, header := range files {
+				metadata := tokenkit.Image{}
+				if tokenkit.ImageNeedsSize(model, "") {
+					file, err := header.Open()
+					if err != nil {
+						return nil, errors.New("image input is unavailable")
+					}
+					config, _, err := image.DecodeConfig(file)
+					_ = file.Close()
+					if err == nil {
+						metadata.Width, metadata.Height = config.Width, config.Height
+					}
+				}
+				uploaded = append(uploaded, metadata)
+			}
+		}
+	}
+	if len(uploaded) > len(inputs) {
+		return uploaded, nil
+	}
+	return inputs, nil
+}
+
+// CountGatewayMediaInput includes images, reference audio and transcripts in
+// original or effective media input before the funding plan is frozen.
+func CountGatewayMediaInput(c *gin.Context, request dto.Request, info *relaycommon.RelayInfo) (int, error) {
+	meta := request.GetTokenCountMeta()
+	inputMediaTokens := 0
+	if request, ok := request.(*dto.ImageRequest); ok && info.ResponseFacts != nil {
+		inputs, err := gatewayImageInputs(c, request, info.TokenizerModel)
+		if err != nil {
+			return 0, err
+		}
+		for _, input := range inputs {
+			var clamp *common.QuotaClamp
+			inputMediaTokens, clamp = common.QuotaFromFloatChecked(float64(inputMediaTokens) + float64(tokenkit.ImageTokens(info.TokenizerModel, input)))
+			if clamp != nil {
+				return 0, clamp
+			}
+		}
+		info.ResponseFacts.ImageInputTokensEstimated = inputMediaTokens
+	}
+	if audio, ok := request.(*dto.AudioRequest); ok && info.ResponseFacts != nil && info.RelayMode == constant2.RelayModeAudioSpeech {
+		facts := info.ResponseFacts
+		facts.AudioInputSeconds = nil
+		facts.AudioInputTokensEstimated = 0
+		for _, value := range []common.RawMessage{audio.RefAudio2, audio.RefAudioCodes, audio.SpeakerEmbedding, audio.ExtraParams} {
+			if raw := strings.TrimSpace(string(value)); raw != "" && raw != "null" {
+				return 0, errors.New("speech conditioning input cannot be measured locally")
+			}
+		}
+		if audio.Instructions != "" {
+			meta.CombineText += "\n" + audio.Instructions
+		}
+		transcript := ""
+		if len(audio.RefText) > 0 && string(audio.RefText) != "null" {
+			if common.Unmarshal(audio.RefText, &transcript) != nil {
+				return 0, errors.New("invalid speech reference transcript")
+			}
+		}
+		var references []string
+		singleReference := false
+		if len(audio.RefAudio) > 0 && string(audio.RefAudio) != "null" {
+			var single string
+			if common.Unmarshal(audio.RefAudio, &single) == nil {
+				references = []string{single}
+				singleReference = true
+			} else if common.Unmarshal(audio.RefAudio, &references) != nil {
+				return 0, errors.New("invalid speech reference audio")
+			}
+			if len(references) == 0 {
+				return 0, errors.New("invalid speech reference audio")
+			}
+		}
+		if len(audio.References) > 0 && string(audio.References) != "null" {
+			var aliases []struct {
+				AudioPath string  `json:"audio_path"`
+				Text      *string `json:"text"`
+			}
+			if common.Unmarshal(audio.References, &aliases) != nil || len(aliases) != 1 || aliases[0].AudioPath == "" {
+				return 0, errors.New("invalid speech reference alias")
+			}
+			alias := aliases[0]
+			if len(references) > 0 && (!singleReference || references[0] != alias.AudioPath) {
+				return 0, errors.New("conflicting speech reference audio")
+			}
+			references = []string{alias.AudioPath}
+			if alias.Text != nil && strings.TrimSpace(*alias.Text) != "" {
+				if transcript != "" && transcript != *alias.Text {
+					return 0, errors.New("conflicting speech reference transcript")
+				}
+				transcript = *alias.Text
+			}
+		}
+		if transcript != "" {
+			meta.CombineText += "\n" + transcript
+		}
+		if len(references) > 0 {
+			seconds := decimal.Zero
+			for _, reference := range references {
+				mediaType := ""
+				if strings.HasPrefix(reference, "data:") {
+					header, _, ok := strings.Cut(reference, ",")
+					if !ok || !strings.HasPrefix(header, "data:audio/") || !strings.HasSuffix(header, ";base64") {
+						return 0, errors.New("invalid speech reference audio")
+					}
+					mediaType = strings.TrimSuffix(strings.TrimPrefix(header, "data:"), ";base64")
+				} else if strings.Contains(reference, ",") {
+					return 0, errors.New("speech reference audio must be measurable inline data")
+				}
+				encoded, err := DecodeBase64AudioData(reference)
+				if err != nil {
+					return 0, errors.New("speech reference audio must be measurable inline data")
+				}
+				data, err := base64.StdEncoding.DecodeString(encoded)
+				if err != nil || len(data) == 0 || constant.MaxFileDownloadMB > 0 && len(data) > constant.MaxFileDownloadMB*1024*1024 {
+					return 0, errors.New("invalid speech reference audio")
+				}
+				if detected := http.DetectContentType(data); detected != "application/octet-stream" {
+					mediaType = detected
+				}
+				_, format, _ := strings.Cut(mediaType, "/")
+				format = strings.TrimPrefix(format, "x-")
+				switch format {
+				case "wave", "vnd.wave":
+					format = "wav"
+				case "mpeg":
+					format = "mp3"
+				case "mp4":
+					format = "m4a"
+				}
+				duration, err := common.GetAudioDuration(c.Request.Context(), bytes.NewReader(data), "."+format)
+				if err != nil || math.IsNaN(duration) || math.IsInf(duration, 0) || duration <= 0 || duration > relaycommon.MaxTaskDurationSeconds {
+					return 0, errors.New("speech reference duration exceeds the request limit")
+				}
+				seconds = seconds.Add(decimal.NewFromFloat(duration))
+				if seconds.GreaterThan(decimal.NewFromInt(relaycommon.MaxTaskDurationSeconds)) {
+					return 0, errors.New("speech reference duration exceeds the request limit")
+				}
+				tokens, clamp := common.AudioDurationTokens(duration)
+				if clamp != nil {
+					return 0, clamp
+				}
+				inputMediaTokens, clamp = common.QuotaFromFloatChecked(float64(inputMediaTokens) + float64(tokens))
+				if clamp != nil {
+					return 0, clamp
+				}
+			}
+			value := seconds.String()
+			facts.AudioInputSeconds = &value
+			facts.AudioInputTokensEstimated = inputMediaTokens
+		}
+	}
+	input, err := CountRequestToken(c, meta, info)
+	if err != nil {
+		return 0, err
+	}
+	input, clamp := common.QuotaFromFloatChecked(float64(input) + float64(inputMediaTokens))
+	if clamp != nil {
+		return 0, clamp
+	}
+	return input, nil
+}
+
+// GatewayMediaCapabilitiesMatch is applied to both original and effective DTOs.
+// Uploaded audio duration is measured before reservation; no request duration or
+// output ceiling is accepted as actual usage.
+func GatewayMediaCapabilitiesMatch(c *gin.Context, kind protocol.Type, request dto.Request, caps capability.Set, inputTokens int, facts *relaycommon.ResponseFacts) bool {
+	return ValidateGatewayMediaCapabilities(c, kind, request, caps, inputTokens, facts) == nil
+}
+
+// ValidateGatewayMediaCapabilities identifies the control excluded by the
+// declared capabilities without exposing Channel configuration.
+func ValidateGatewayMediaCapabilities(c *gin.Context, kind protocol.Type, request dto.Request, caps capability.Set, inputTokens int, facts *relaycommon.ResponseFacts) error {
+	if request.IsStream(c.Request) && !slices.Contains(caps.Features, capability.Streaming) {
+		return types.NewMediaParameterError("stream", "media_capability_mismatch")
+	}
+	input, output := capability.Text, capability.Image
+	switch kind {
+	case protocol.OpenAIImages:
+		image, ok := request.(*dto.ImageRequest)
+		if !ok {
+			return types.NewMediaParameterError("request", "media_parameters_unrepresentable")
+		}
+		count, err := image.ImageCount(false)
+		if err != nil || caps.Limits.MaxImages != nil && int64(count) > *caps.Limits.MaxImages {
+			return types.NewMediaParameterError("n", "media_capability_limit_exceeded")
+		}
+		inputs, err := gatewayImageInputs(c, image, "")
+		if err != nil {
+			return types.NewMediaParameterError("images", "media_input_unsupported")
+		}
+		images := len(inputs)
+		if images > dto.MaxImageN || caps.Limits.MaxImages != nil && int64(images) > *caps.Limits.MaxImages {
+			return types.NewMediaParameterError("images", "media_capability_limit_exceeded")
+		}
+		if images > 0 && !slices.Contains(caps.InputModalities, capability.Image) {
+			return types.NewMediaParameterError("images", "media_capability_mismatch")
+		}
+	case protocol.OpenAIAudioSpeech:
+		if caps.Limits.MaxDurationSeconds != nil {
+			return types.NewMediaParameterError("duration", "media_control_unsupported")
+		}
+		if facts != nil && facts.AudioInputSeconds != nil && !slices.Contains(caps.InputModalities, capability.Audio) {
+			return types.NewMediaParameterError("ref_audio", "media_capability_mismatch")
+		}
+		output = capability.Audio
+	case protocol.OpenAIAudioTranscription:
+		if audio, ok := request.(*dto.AudioRequest); ok && audio.Prompt != nil && *audio.Prompt != "" && !slices.Contains(caps.InputModalities, capability.Text) {
+			return types.NewMediaParameterError("prompt", "media_capability_mismatch")
+		}
+		input, output = capability.Audio, capability.Text
+	default:
+		return types.NewMediaParameterError("request", "media_parameters_unrepresentable")
+	}
+	if !slices.Contains(caps.InputModalities, input) {
+		return types.NewMediaParameterError("input", "media_capability_mismatch")
+	}
+	if !slices.Contains(caps.OutputModalities, output) {
+		return types.NewMediaParameterError("response_format", "media_capability_mismatch")
+	}
+	if caps.Limits.ContextLength != nil && int64(inputTokens) > *caps.Limits.ContextLength {
+		return types.NewMediaParameterError("input", "media_capability_limit_exceeded")
+	}
+	if facts != nil && facts.AudioInputSeconds != nil && caps.Limits.MaxDurationSeconds != nil {
+		seconds, err := decimal.NewFromString(*facts.AudioInputSeconds)
+		if err != nil || seconds.IsNegative() || seconds.GreaterThan(decimal.NewFromInt(*caps.Limits.MaxDurationSeconds)) {
+			return types.NewMediaParameterError("file", "media_capability_limit_exceeded")
+		}
+	}
+	return nil
+}
 
 const gatewayMediaContextKey = "gateway_prepared_media"
 

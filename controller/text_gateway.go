@@ -575,7 +575,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 					run.attemptUsage = make(map[string]*dto.Usage)
 				}
 				run.attemptUsage[attempt.ID] = service.GatewayUsageSnapshot(purchaseUsage)
-				attempt.Usage, attempt.UsageSource = service.GatewayRecordUsage(purchaseUsage), "estimated"
+				attempt.Usage, attempt.UsageSource = service.GatewayRecordUsage(purchaseUsage, info.ResponseFacts), "estimated"
 				if info.ResponseFacts.UsageReported {
 					attempt.UsageSource = "upstream"
 				}
@@ -604,7 +604,7 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			if info.ResponseFacts.BusinessOutput {
 				record.ChoiceCount = choiceCount
 				saleUsage := usage
-				record.Usage, record.UsageSource = service.GatewayRecordUsage(usage), attempt.UsageSource
+				record.Usage, record.UsageSource = service.GatewayRecordUsage(usage, info.ResponseFacts), attempt.UsageSource
 				estimateDeliveredOutput := attempt.Status == "partial" && !normalBudget || info.ResponseFacts.DownstreamWriteFailed || !info.ResponseFacts.UsageReported && attempt.Status == "cancelled"
 				if info.IsStream && estimateDeliveredOutput && usage != nil {
 					// Procurement retains reported usage; interrupted sales use delivered text.
@@ -620,7 +620,10 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 						snapshot.CompletionTokenDetails = dto.OutputTokenDetails{}
 						snapshot.OutputTokensDetails = nil
 						saleUsage = &snapshot
-						record.Usage, record.UsageSource = service.GatewayRecordUsage(saleUsage), "estimated"
+						billableFacts := *info.ResponseFacts
+						billableFacts.AudioOutputTokensReported = info.ResponseFacts.AudioOutputTokensReported && usage.CompletionTokenDetails.AudioTokens == 0
+						billableFacts.ImageOutputTokensReported = info.ResponseFacts.ImageOutputTokensReported && usage.CompletionTokenDetails.ImageTokens == 0
+						record.Usage, record.UsageSource = service.GatewayRecordUsage(saleUsage, &billableFacts), "estimated"
 					}
 				}
 				run.saleUsage = service.GatewayUsageSnapshot(saleUsage)

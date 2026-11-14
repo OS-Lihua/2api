@@ -111,14 +111,15 @@ func usesRequestProbe(node ast.Node) bool {
 }
 
 type cachedEntry struct {
-	prog          *vm.Program
-	usedVars      map[string]bool
-	sourceVars    map[string]bool
-	usedUsageKeys map[string]bool
-	requestRules  []RequestRuleTrace
-	version       int
-	fixedPricing  bool
-	fixedOnly     bool
+	prog             *vm.Program
+	usedVars         map[string]bool
+	sourceVars       map[string]bool
+	usedUsageKeys    map[string]bool
+	requestRules     []RequestRuleTrace
+	version          int
+	fixedPricing     bool
+	fixedOnly        bool
+	fixedRequestOnly bool
 
 	moneyOnce             sync.Once
 	moneyProgram          *vm.Program
@@ -287,14 +288,15 @@ func compileEntry(exprStr string) (*cachedEntry, error) {
 	}
 
 	entry := &cachedEntry{
-		prog:          prog,
-		usedVars:      extractUsedVars(prog),
-		sourceVars:    sourceVars,
-		usedUsageKeys: extractUsedUsageKeys(tree.Node),
-		requestRules:  patcher.requestRules,
-		version:       version,
-		fixedPricing:  fixedPricing,
-		fixedOnly:     fixedOnly,
+		prog:             prog,
+		usedVars:         extractUsedVars(prog),
+		sourceVars:       sourceVars,
+		usedUsageKeys:    extractUsedUsageKeys(tree.Node),
+		requestRules:     patcher.requestRules,
+		version:          version,
+		fixedPricing:     fixedPricing,
+		fixedOnly:        fixedOnly,
+		fixedRequestOnly: fixedOnly && len(imagePricing(tree.Node).multipliers) == 0,
 	}
 	return entry, nil
 }

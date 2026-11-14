@@ -32,7 +32,11 @@ import i18next from 'i18next'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
 import fr from '@/i18n/locales/fr.json'
+import ja from '@/i18n/locales/ja.json'
+import ru from '@/i18n/locales/ru.json'
+import viLocale from '@/i18n/locales/vi.json'
 import zhTW from '@/i18n/locales/zh-TW.json'
+import zh from '@/i18n/locales/zh.json'
 import { api } from '@/lib/api'
 import { createAppQueryClient } from '@/lib/query-client'
 import { useAuthStore } from '@/stores/auth-store'
@@ -95,6 +99,12 @@ const internalAttempt = {
     eligible_count: 1,
     excluded_counts: { disabled: 2 },
     excluded: [{ channel_id: 61, reason: 'disabled' }],
+    quota_saturation: {
+      op: 'seconds_to_tokens',
+      kind: 'overflow',
+      original: '+Inf',
+      clamped: 2147483647,
+    },
     credentials: 'never-show',
     destination: 'https://internal.invalid',
     raw_prompt: 'never-show-prompt',
@@ -130,8 +140,9 @@ beforeEach(() => {
 afterEach(async () => {
   cleanup()
   await i18next.changeLanguage('en')
-  i18next.removeResourceBundle('fr', 'translation')
-  i18next.removeResourceBundle('zhTW', 'translation')
+  for (const language of ['fr', 'zhTW', 'zhCN', 'ja', 'ru', 'vi']) {
+    i18next.removeResourceBundle(language, 'translation')
+  }
   client.clear()
   api.defaults.adapter = originalAdapter
   useAuthStore.getState().auth.reset()
@@ -277,6 +288,10 @@ it('uses request:read permission for all requests and strips internal fields in 
   expect(within(drawer).getByText('Affinity hit')).toBeVisible()
   expect(within(drawer).getByText('Loss fallback')).toBeVisible()
   expect(within(drawer).getByText('Eligible Channels')).toBeVisible()
+  expect(within(drawer).getByText('Quota clamped')).toBeVisible()
+  expect(within(drawer).getByText('+Inf')).toBeVisible()
+  expect(within(drawer).getByText('Overflow')).toBeVisible()
+  expect(within(drawer).getByText('seconds_to_tokens')).toBeVisible()
   expect(within(drawer).getByText('Disabled: 2')).toBeVisible()
   expect(within(drawer).queryByText('never-show')).not.toBeInTheDocument()
   await user.keyboard('{Escape}')
@@ -298,6 +313,11 @@ it('uses request:read permission for all requests and strips internal fields in 
     within(drawer).queryByText('0.012345678901 USD')
   ).not.toBeInTheDocument()
   expect(within(drawer).queryByText('3/2')).not.toBeInTheDocument()
+  expect(within(drawer).queryByText('Quota clamped')).not.toBeInTheDocument()
+  expect(within(drawer).queryByText('+Inf')).not.toBeInTheDocument()
+  expect(
+    within(drawer).queryByText('seconds_to_tokens')
+  ).not.toBeInTheDocument()
   expect(within(drawer).queryByText('Provider ID')).not.toBeInTheDocument()
   expect(within(drawer).queryByText('Channel ID')).not.toBeInTheDocument()
   expect(within(drawer).queryByText('Member tier')).not.toBeInTheDocument()
@@ -778,6 +798,313 @@ it('shows missing optional usage and charge fields without inventing zero usage 
   ).toHaveLength(1)
   expect(within(drawer).queryByText('Estimated')).not.toBeInTheDocument()
   expect(within(drawer).queryByText('Purchase cost')).not.toBeInTheDocument()
+})
+
+it('shows actual media quantities including zero in request rows and attempts without inventing token usage', async () => {
+  api.defaults.adapter = async (config) => ({
+    config,
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+    data: {
+      success: true,
+      data: {
+        items: [
+          {
+            ...(config.url?.endsWith('/attempts') ? attempt : request),
+            usage: {
+              image_count: 0,
+              image_input_tokens: 1200,
+              image_output_tokens: 0,
+              audio_input_tokens: 0,
+              audio_output_tokens: 17,
+              audio_input_seconds: '1.25',
+              audio_output_seconds: '0',
+            },
+            usage_source: 'none',
+          },
+        ],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      },
+    },
+  })
+  const user = userEvent.setup()
+  renderRequests()
+  const requestFacts = within(
+    await screen.findByRole('row', { name: /chat-standard/ })
+  )
+  expect(requestFacts.getByText('Image count: 0')).toBeVisible()
+  expect(requestFacts.getByText('Image input tokens: 1,200')).toBeVisible()
+  expect(requestFacts.getByText('Image output tokens: 0')).toBeVisible()
+  expect(requestFacts.getByText('Audio input tokens: 0')).toBeVisible()
+  expect(requestFacts.getByText('Audio output tokens: 17')).toBeVisible()
+  expect(
+    requestFacts.getByText(
+      (_, element) =>
+        element?.textContent === 'Input audio duration: 1.25 seconds'
+    )
+  ).toBeVisible()
+  expect(
+    requestFacts.getByText(
+      (_, element) =>
+        element?.textContent === 'Output audio duration: 0 seconds'
+    )
+  ).toBeVisible()
+  expect(requestFacts.queryByText('Total tokens: 0')).not.toBeInTheDocument()
+  await user.click(
+    screen.getByRole('button', {
+      name: `View attempts for request ${requestId}`,
+    })
+  )
+  const drawer = await screen.findByRole('dialog', { name: 'Request attempts' })
+  const attemptFacts = within(
+    await within(drawer).findByRole('list', { name: 'Attempt chronology' })
+  )
+  expect(attemptFacts.getByText('Image count: 0')).toBeVisible()
+  expect(attemptFacts.getByText('Audio output tokens: 17')).toBeVisible()
+  expect(attemptFacts.getByText('Image output tokens: 0')).toBeVisible()
+  expect(
+    attemptFacts.getByText(
+      (_, element) =>
+        element?.textContent === 'Input audio duration: 1.25 seconds'
+    )
+  ).toBeVisible()
+})
+
+it('shows task facts alongside cache, media, and unknown quantities without inventing token totals', async () => {
+  api.defaults.adapter = async (config) => ({
+    config,
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+    data: {
+      success: true,
+      data: {
+        items: [
+          {
+            ...request,
+            usage_source: 'upstream',
+            usage: {
+              task_facts: { seconds: 2.5 },
+              cached_tokens: 12,
+              cache_creation_tokens: 0,
+              image_count: 0,
+              audio_input_tokens: 0,
+              audio_input_seconds: '1.25',
+              audio_output_seconds: '0',
+              unmeasured_tokens: ['c', 'img_o', 'cc12h'],
+            },
+          },
+        ],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      },
+    },
+  })
+  renderRequests()
+  const row = await screen.findByRole('row', { name: /chat-standard/ })
+  const facts = within(row)
+  expect(
+    within(facts.getByRole('group', { name: 'Task usage' })).getByText('2.5')
+  ).toBeVisible()
+  expect(facts.getByText('Cached tokens: 12')).toBeVisible()
+  expect(facts.getByText('Cache Write: 0')).toBeVisible()
+  expect(facts.getByText('Cache Write (12h): Unknown')).toBeVisible()
+  expect(facts.getByText('Image count: 0')).toBeVisible()
+  expect(facts.getByText('Image output tokens: Unknown')).toBeVisible()
+  expect(facts.getByText('Audio input tokens: 0')).toBeVisible()
+  expect(
+    facts.getByText(
+      (_, element) =>
+        element?.textContent === 'Input audio duration: 1.25 seconds'
+    )
+  ).toBeVisible()
+  expect(
+    facts.getByText(
+      (_, element) =>
+        element?.textContent === 'Output audio duration: 0 seconds'
+    )
+  ).toBeVisible()
+  expect(facts.queryByText(/^Input:/)).not.toBeInTheDocument()
+  expect(facts.queryByText(/^Output:/)).not.toBeInTheDocument()
+  expect(facts.queryByText(/^Total tokens:/)).not.toBeInTheDocument()
+})
+
+it.each(['upstream', 'none'] as const)(
+  'shows recorded cache quantities in request rows and attempts when source is %s',
+  async (source) => {
+    api.defaults.adapter = async (config) => ({
+      config,
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      data: {
+        success: true,
+        data: {
+          items: [
+            {
+              ...(config.url?.endsWith('/attempts') ? attempt : request),
+              usage: {
+                cached_tokens: 1500,
+                cache_creation_tokens: 1000,
+                cache_creation_12h_tokens: 0,
+              },
+              usage_source: source,
+            },
+          ],
+          total: 1,
+          page: 1,
+          page_size: 20,
+        },
+      },
+    })
+    const user = userEvent.setup()
+    renderRequests()
+    const requestFacts = within(
+      await screen.findByRole('row', { name: /chat-standard/ })
+    )
+    expect(requestFacts.getByText('Cached tokens: 1,500')).toBeVisible()
+    expect(requestFacts.getByText('Cache Write: 1,000')).toBeVisible()
+    expect(requestFacts.getByText('Cache Write (12h): 0')).toBeVisible()
+    expect(
+      requestFacts.queryByText('No usage available')
+    ).not.toBeInTheDocument()
+    await user.click(
+      screen.getByRole('button', {
+        name: `View attempts for request ${requestId}`,
+      })
+    )
+    const drawer = await screen.findByRole('dialog', {
+      name: 'Request attempts',
+    })
+    const attemptFacts = within(
+      await within(drawer).findByRole('list', { name: 'Attempt chronology' })
+    )
+    expect(attemptFacts.getByText('Cached tokens: 1,500')).toBeVisible()
+    expect(attemptFacts.getByText('Cache Write: 1,000')).toBeVisible()
+    expect(attemptFacts.getByText('Cache Write (12h): 0')).toBeVisible()
+  }
+)
+
+it('shows unmeasured output and total as unknown while retaining known media counts', async () => {
+  api.defaults.adapter = async (config) => ({
+    config,
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+    data: {
+      success: true,
+      data: {
+        items: [
+          {
+            ...request,
+            usage: {
+              prompt_tokens: 120,
+              completion_tokens: 0,
+              total_tokens: 120,
+              image_count: 1,
+              unmeasured_tokens: ['c', 'img_o', 'cr', 'cc', 'cc12h'],
+            },
+          },
+        ],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      },
+    },
+  })
+  renderRequests()
+  expect(await screen.findByText('Input: 120 · Output: Unknown')).toBeVisible()
+  expect(screen.getByText('Image output tokens: Unknown')).toBeVisible()
+  expect(screen.getByText('Total tokens: Unknown')).toBeVisible()
+  expect(screen.getByText('Cached tokens: Unknown')).toBeVisible()
+  expect(screen.getByText('Cache Write: Unknown')).toBeVisible()
+  expect(screen.getByText('Cache Write (12h): Unknown')).toBeVisible()
+  expect(screen.getByText('Image count: 1')).toBeVisible()
+  expect(screen.queryByText('Image input tokens: 0')).not.toBeInTheDocument()
+})
+
+it('keeps measured totals while cache quantities are unknown', async () => {
+  api.defaults.adapter = async (config) => ({
+    config,
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+    data: {
+      success: true,
+      data: {
+        items: [
+          {
+            ...request,
+            usage: {
+              prompt_tokens: 10,
+              completion_tokens: 5,
+              total_tokens: 15,
+              unmeasured_tokens: ['cr', 'cc', 'cc12h'],
+            },
+          },
+        ],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      },
+    },
+  })
+  renderRequests()
+  expect(await screen.findByText('Input: 10 · Output: 5')).toBeVisible()
+  expect(screen.getByText('Total tokens: 15')).toBeVisible()
+  expect(screen.getByText('Cached tokens: Unknown')).toBeVisible()
+  expect(screen.getByText('Cache Write: Unknown')).toBeVisible()
+  expect(screen.getByText('Cache Write (12h): Unknown')).toBeVisible()
+})
+
+it('preserves nonzero measured audio duration and reacts to all interface locales', async () => {
+  const seconds = '0.0000416666666667'
+  api.defaults.adapter = async (config) => ({
+    config,
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+    data: {
+      success: true,
+      data: {
+        items: [{ ...request, usage: { audio_input_seconds: seconds } }],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      },
+    },
+  })
+  for (const [language, resource] of [
+    ['fr', fr],
+    ['zhCN', zh],
+    ['zhTW', zhTW],
+    ['ja', ja],
+    ['ru', ru],
+    ['vi', viLocale],
+  ] as const) {
+    i18next.addResourceBundle(language, 'translation', resource.translation)
+  }
+  renderRequests()
+  expect(await screen.findByText('0.0000416666667')).toBeVisible()
+  for (const [language, value] of [
+    ['en', '0.0000416666667'],
+    ['zhCN', '0.0000416666667'],
+    ['zhTW', '0.0000416666667'],
+    ['fr', '0,0000416666667'],
+    ['ru', '0,0000416666667'],
+    ['ja', '0.0000416666667'],
+    ['vi', '0,0000416666667'],
+    ['bad_locale', '0.0000416666667'],
+  ]) {
+    await act(async () => {
+      await i18next.changeLanguage(language)
+    })
+    expect(screen.getByTitle(seconds)).toHaveTextContent(value)
+  }
 })
 
 it('updates the exact charge separators when the interface language changes', async () => {

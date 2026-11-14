@@ -8,9 +8,12 @@ import (
 )
 
 type RequestInput struct {
-	Headers map[string]string
-	Body    []byte
-	Usage   map[string]any
+	// UnmeasuredTokens names unavailable quantitative facts, not request probes.
+	// Exact evaluation fails only if the executed price reads one of them.
+	UnmeasuredTokens map[string]bool `json:"-"`
+	Headers          map[string]string
+	Body             []byte
+	Usage            map[string]any
 	// FreezeMoneyRequest captures only boolean request-pricing decisions.
 	// MoneySnapshot replays those decisions with new measured usage.
 	FreezeMoneyRequest   bool                  `json:"-"`

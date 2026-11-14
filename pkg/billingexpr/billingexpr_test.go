@@ -294,6 +294,94 @@ func TestMoneyExprPreservesImageCountCompatibility(t *testing.T) {
 		_, _, err := billingexpr.RunMoneyExpr(expression, billingexpr.MoneyInput{Request: billingexpr.RequestInput{ImageCount: &count}}, "USD")
 		require.ErrorContains(t, err, "image_count")
 	}
+	for _, tc := range []struct {
+		name, expression, amount                  string
+		quantity, fixedRequestOnly, fixedPerImage bool
+	}{
+		{"condition", `image_count > 0 ? tier("a",fixed(0.01)) : tier("b",fixed(0.02))`, "0.01 USD", false, true, false},
+		{"condition arithmetic", `image_count * 2 > 0 ? tier("a",fixed(0.01)) : tier("b",fixed(0.02))`, "0.01 USD", false, true, false},
+		{"right multiplier", `tier("image",fixed(0.02)) * image_count`, "0.04 USD", true, false, true},
+		{"left multiplier", `image_count * tier("image",fixed(0.02))`, "0.04 USD", true, false, true},
+		{"selected request", `len == 7 ? tier("request",fixed(0.01)) : tier("image",fixed(0.02)) * image_count`, "0.01 USD", false, false, false},
+		{"selected images", `len == 7 ? tier("image",fixed(0.02)) * image_count : tier("request",fixed(0.01))`, "0.04 USD", true, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			amount, trace, err := billingexpr.RunMoneyExpr(tc.expression, billingexpr.MoneyInput{Tokens: map[string]int64{"len": 7}, ImageCount: &count}, "USD")
+			require.NoError(t, err)
+			assert.Equal(t, tc.amount, amount.String())
+			assert.Equal(t, tc.quantity, trace.ImageQuantityPriced)
+			assert.Equal(t, tc.fixedRequestOnly, billingexpr.UsesOnlyFixedRequestPricing(tc.expression))
+			assert.Equal(t, tc.fixedPerImage, trace.FixedPricePerImage)
+		})
+	}
+	const interruptedQuantity = `tier("image",fixed(0.01)) * (param("n") == 1 && 1 / (len - 7) > 0 ? 2 : 1) * image_count`
+	_, trace, err = billingexpr.RunMoneyExpr(interruptedQuantity, billingexpr.MoneyInput{Tokens: map[string]int64{"len": 7}, ImageCount: &count, Request: billingexpr.RequestInput{Body: []byte(`{"n":1}`)}}, "USD")
+	require.Error(t, err)
+	require.NotNil(t, trace.FixedPrice)
+	assert.True(t, trace.FixedPricePerImage, "a later quantity factor still belongs to the selected fixed price")
+	assert.False(t, trace.ImageQuantityPriced, "the failing request factor prevented quantity evaluation")
+}
+
+func TestMoneyExprUnmeasuredQuantitiesFailOnlyWhenRead(t *testing.T) {
+	count := 2
+	for _, tc := range []struct {
+		name, expression, want string
+		failure                bool
+	}{
+		{"output price", `tier("tokens",c*3)`, "", true},
+		{"output zero condition", `c == 0 ? tier("free",fixed(0)) : tier("tokens",c)`, "", true},
+		{"image output price", `tier("images",img_o)`, "", true},
+		{"unselected output", `true ? tier("free",fixed(0)) : tier("tokens",c)`, "0 USD", false},
+		{"short circuit", `false && c > 0 ? tier("tokens",c) : tier("free",fixed(0))`, "0 USD", false},
+		{"measured image quantity", `tier("images",fixed(0.02))*image_count`, "0.04 USD", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			amount, trace, err := billingexpr.RunMoneyExpr(tc.expression, billingexpr.MoneyInput{ImageCount: &count, Request: billingexpr.RequestInput{UnmeasuredTokens: map[string]bool{"c": true, "img_o": true}}}, "USD")
+			if tc.failure {
+				require.ErrorContains(t, err, "unknown")
+				assert.NotEmpty(t, trace.UnmeasuredTokens)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, amount.String())
+			assert.Empty(t, trace.UnmeasuredTokens)
+		})
+	}
+}
+
+func TestMoneyExprActualMediaQuantitiesKeepRequestProbesFrozen(t *testing.T) {
+	requested := 3
+	for _, actual := range []int{0, 1, 2} {
+		amount, trace, err := billingexpr.RunMoneyExpr(`tier("image", fixed(0.04)) * image_count * (param("n") == 3 ? 2 : 1)`, billingexpr.MoneyInput{
+			ImageCount: &actual,
+			Request:    billingexpr.RequestInput{ImageCount: &requested, Body: []byte(`{"n":3}`)},
+		}, "USD")
+		require.NoError(t, err)
+		want := []string{"0 USD", "0.08 USD", "0.16 USD"}
+		assert.Equal(t, want[actual], amount.String())
+		require.NotNil(t, trace.ImageCount)
+		assert.Equal(t, actual, *trace.ImageCount)
+		assert.True(t, trace.ImageQuantityPriced)
+	}
+	for _, count := range []int{-1, 129} {
+		_, _, err := billingexpr.RunMoneyExpr(`tier("image", fixed(0.04)) * image_count`, billingexpr.MoneyInput{ImageCount: &count}, "USD")
+		require.Error(t, err)
+	}
+	const foldedCondition = `(9223372036854775807 + 1 == -9223372036854775807 - 1 || image_count > 1) ? tier("bulk",fixed(0.01)) : tier("single",fixed(0.02))`
+	for _, actual := range []int{3, 1, 0} {
+		amount, trace, err := billingexpr.RunMoneyExpr(foldedCondition, billingexpr.MoneyInput{ImageCount: &actual}, "USD")
+		require.NoError(t, err)
+		want := "0.02 USD"
+		if actual > 1 {
+			want = "0.01 USD"
+		}
+		assert.Equal(t, want, amount.String())
+		require.NotNil(t, trace.ImageCount)
+		assert.Equal(t, actual, *trace.ImageCount)
+	}
+	amount, _, err := billingexpr.RunMoneyExpr(`tier("audio", p * 2 + ai * 3 + ao * 15)`, billingexpr.MoneyInput{Tokens: map[string]int64{"p": 100, "ai": 1000, "ao": 2000}}, "USD")
+	require.NoError(t, err)
+	assert.Equal(t, "0.0332 USD", amount.String())
 }
 
 func TestMoneyExprRoundsOnlyAtWriteAndKeepsLegacyEvaluation(t *testing.T) {

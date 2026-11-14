@@ -117,6 +117,7 @@ func SetRelayRouter(router *gin.Engine) {
 	{
 		//http router
 		httpRouter := relayV1Router.Group("")
+		httpRouter.Use(controller.MediaGateway)
 		httpRouter.Use(controller.TextGateway)
 		httpRouter.Use(middleware.Distribute())
 

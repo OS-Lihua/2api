@@ -118,22 +118,29 @@ export function RequestUsageFacts(props: {
 }) {
   const { t, i18n } = useTranslation()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
-  if (!props.usage || props.source === 'none') {
+  const unmeasured = props.usage?.unmeasured_tokens ?? []
+  const hasQuantities =
+    unmeasured.length > 0 ||
+    props.usage?.cached_tokens !== undefined ||
+    props.usage?.cache_creation_tokens !== undefined ||
+    props.usage?.cache_creation_12h_tokens !== undefined ||
+    props.usage?.image_input_tokens !== undefined ||
+    props.usage?.image_output_tokens !== undefined ||
+    props.usage?.audio_input_tokens !== undefined ||
+    props.usage?.audio_output_tokens !== undefined ||
+    props.usage?.image_count !== undefined ||
+    props.usage?.audio_input_seconds !== undefined ||
+    props.usage?.audio_output_seconds !== undefined
+  if (!props.usage || (props.source === 'none' && !hasQuantities)) {
     return (
       <span className='text-muted-foreground text-xs'>
         {t('No usage available')}
       </span>
     )
   }
-  const details: [string, number | undefined][] = [
-    [t('Cached tokens'), props.usage.cached_tokens],
-    [t('Cache write tokens'), props.usage.cache_creation_tokens],
-    [t('12-hour cache write tokens'), props.usage.cache_creation_12h_tokens],
-    [t('Image input tokens'), props.usage.image_input_tokens],
-    [t('Audio input tokens'), props.usage.audio_input_tokens],
-    [t('Image output tokens'), props.usage.image_output_tokens],
-    [t('Audio output tokens'), props.usage.audio_output_tokens],
-  ]
+  const durationFormatter = new Intl.NumberFormat(locale, {
+    maximumSignificantDigits: 9,
+  })
   const taskFacts = Object.entries(props.usage.task_facts ?? {})
   return (
     <div className='space-y-1 text-xs'>
@@ -159,26 +166,79 @@ export function RequestUsageFacts(props: {
           })}
         </dl>
       ) : (
-        <div>
+        props.source !== 'none' && (
           <div className='tabular-nums'>
-            {t('Input')}: {formatNumber(props.usage.prompt_tokens, locale)} ·{' '}
-            {t('Output')}: {formatNumber(props.usage.completion_tokens, locale)}
+            {t('Input')}:{' '}
+            {unmeasured.includes('p')
+              ? t('Unknown')
+              : formatNumber(props.usage.prompt_tokens, locale)}{' '}
+            · {t('Output')}:{' '}
+            {unmeasured.includes('c')
+              ? t('Unknown')
+              : formatNumber(props.usage.completion_tokens, locale)}
           </div>
-          {props.usage.total_tokens !== undefined && (
-            <div className='text-muted-foreground'>
-              {t('Total tokens')}:{' '}
-              {formatNumber(props.usage.total_tokens, locale)}
-            </div>
-          )}
+        )
+      )}
+      {(
+        [
+          ['cr', t('Cached tokens'), props.usage.cached_tokens],
+          ['cc', t('Cache Write'), props.usage.cache_creation_tokens],
+          [
+            'cc12h',
+            t('Cache Write (12h)'),
+            props.usage.cache_creation_12h_tokens,
+          ],
+          ['img', t('Image input tokens'), props.usage.image_input_tokens],
+          ['img_o', t('Image output tokens'), props.usage.image_output_tokens],
+          ['ai', t('Audio input tokens'), props.usage.audio_input_tokens],
+          ['ao', t('Audio output tokens'), props.usage.audio_output_tokens],
+        ] as const
+      )
+        .filter(
+          ([quantity, , value]) =>
+            value !== undefined || unmeasured.includes(quantity)
+        )
+        .map(([quantity, label, value]) => (
+          <div key={quantity} className='tabular-nums'>
+            {label}:{' '}
+            {unmeasured.includes(quantity)
+              ? t('Unknown')
+              : formatNumber(value, locale)}
+          </div>
+        ))}
+      {props.usage.image_count !== undefined && (
+        <div className='tabular-nums'>
+          {t('Image count')}: {formatNumber(props.usage.image_count, locale)}
         </div>
       )}
-      {details.map(([label, quantity]) =>
-        typeof quantity === 'number' && Number.isFinite(quantity) ? (
-          <div key={label} className='text-muted-foreground tabular-nums'>
-            {label}: {formatNumber(quantity, locale)}
-          </div>
-        ) : null
+      {props.usage.audio_input_seconds !== undefined && (
+        <div className='tabular-nums'>
+          {t('Input audio duration')}:{' '}
+          <span title={props.usage.audio_input_seconds}>
+            {durationFormatter.format(Number(props.usage.audio_input_seconds))}
+          </span>{' '}
+          {t('seconds')}
+        </div>
       )}
+      {props.usage.audio_output_seconds !== undefined && (
+        <div className='tabular-nums'>
+          {t('Output audio duration')}:{' '}
+          <span title={props.usage.audio_output_seconds}>
+            {durationFormatter.format(Number(props.usage.audio_output_seconds))}
+          </span>{' '}
+          {t('seconds')}
+        </div>
+      )}
+      {taskFacts.length === 0 &&
+        props.source !== 'none' &&
+        props.usage.total_tokens !== undefined && (
+          <div className='text-muted-foreground'>
+            {t('Total tokens')}:{' '}
+            {unmeasured.includes('p') || unmeasured.includes('c')
+              ? t('Unknown')
+              : formatNumber(props.usage.total_tokens, locale)}
+          </div>
+        )}
       {props.source === 'estimated' && (
         <Badge variant='outline'>{t('Estimated')}</Badge>
       )}

@@ -17,8 +17,9 @@ const textOfferingContextKey = "text_gateway_offering"
 const textOfferingMissingContextKey = "text_gateway_offering_missing"
 const TextGatewayStartedAtKey = "text_gateway_started_at"
 
-// ResolveTextOffering resolves the request's public ModelOffering name.
-// The gateway checks visibility and Key permissions before dispatch.
+// ResolveTextOffering resolves public names for stateless text, media, and
+// native realtime HTTP. The gateway still checks visibility and Key permissions
+// before dispatch.
 func ResolveTextOffering() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		isRealtime := c.Request.Method == http.MethodGet && c.Request.URL.Path == "/v1/realtime"
@@ -26,7 +27,7 @@ func ResolveTextOffering() gin.HandlerFunc {
 		if isRealtime {
 			name = c.Query("model")
 		}
-		if isRealtime && name == "" || !isRealtime && kind == "" {
+		if (isRealtime && name == "") || (!isRealtime && kind == "" && !IsMediaGatewayEndpoint(c.Request.Method, c.Request.URL.Path)) {
 			c.Next()
 			return
 		}

@@ -114,6 +114,13 @@ export interface ToolSurchargeItem {
   price: number
 }
 
+export interface QuotaSaturation {
+  op: string
+  kind: 'overflow' | 'underflow' | 'nan'
+  original: number | string
+  clamped: number
+}
+
 export interface LogOtherData {
   admin_info?: {
     request_policy?: PolicyEvent[]
@@ -138,12 +145,7 @@ export interface LogOtherData {
     // Quota saturation marker: set when a quota conversion clamped at the
     // supported single-request bound (overflow/underflow) or hit a NaN fallback while computing
     // this request's charge. Admin-only (nested under admin_info).
-    quota_saturation?: {
-      op: string
-      kind: 'overflow' | 'underflow' | 'nan'
-      original: number
-      clamped: number
-    }
+    quota_saturation?: QuotaSaturation
     // Reject / intercept reason (admin only)
     reject_reason?: string
     task_plugin?: TaskPluginInfo

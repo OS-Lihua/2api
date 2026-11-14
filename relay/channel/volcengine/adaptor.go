@@ -61,9 +61,24 @@ func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayIn
 }
 
 func convertTTSRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.AudioRequest, app VolcengineTTSApp) (io.Reader, error) {
+	if info.ResponseFacts != nil {
+		switch request.ResponseFormat {
+		case "", "mp3", "wav", "pcm", "opus":
+		default:
+			return nil, fmt.Errorf("Volcengine cannot preserve the requested audio format")
+		}
+	}
 	voiceType := mapVoiceType(request.Voice)
-	speedRatio := lo.FromPtrOr(request.Speed, 0.0)
+	speedRatio := lo.FromPtrOr(request.Speed, 1.0)
 	encoding := mapEncoding(request.ResponseFormat)
+	query, submit := speechTransports(info.ChannelBaseUrl)
+	operation := "query"
+	if submit && encoding != "wav" {
+		operation = "submit"
+	}
+	if encoding == "wav" && !query {
+		return nil, types.NewMediaParameterError("response_format", "media_format_unsupported")
+	}
 
 	c.Set(contextKeyResponseFormat, encoding)
 
@@ -81,13 +96,19 @@ func convertTTSRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.
 		Request: VolcengineTTSReqInfo{
 			ReqID:     generateRequestID(),
 			Text:      request.Input,
-			Operation: "submit",
+			Operation: operation,
 			Model:     info.OriginModelName,
 		},
 	}
 
 	if len(request.Metadata) > 0 {
-		if err := common.Unmarshal(request.Metadata, &volcRequest); err != nil {
+		var err error
+		if info.ResponseFacts != nil {
+			err = common.DecodeJsonStrict(bytes.NewReader(request.Metadata), &volcRequest)
+		} else {
+			err = common.Unmarshal(request.Metadata, &volcRequest)
+		}
+		if err != nil {
 			return nil, fmt.Errorf("error unmarshalling metadata to volcengine request: %w", err)
 		}
 	}
@@ -280,7 +301,7 @@ func (a *Provider) RequestURL(metadata channel.ProviderMetadata) (string, error)
 			return fmt.Sprintf("%s/api/v3/responses", baseUrl), nil
 		case constant.RelayModeAudioSpeech:
 			if baseUrl == channelconstant.GetChannelBaseURL(channelconstant.ChannelTypeVolcEngine) {
-				return "wss://openspeech.bytedance.com/api/v1/tts/ws_binary", nil
+				return defaultSpeechWebSocketURL, nil
 			}
 			return fmt.Sprintf("%s/v1/audio/speech", baseUrl), nil
 		default:

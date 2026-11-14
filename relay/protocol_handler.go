@@ -21,7 +21,6 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
-	kitreasoning "github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
@@ -183,24 +182,7 @@ func (a *ChannelAdaptor) SetChatOutputLimit(converted any, body []byte, limit ui
 	case dto.GeneralOpenAIRequest, *dto.GeneralOpenAIRequest:
 		field = "max_completion_tokens"
 	case dto.ClaudeRequest, *dto.ClaudeRequest:
-		field = "max_tokens"
-		var request dto.ClaudeRequest
-		if err := common.Unmarshal(body, &request); err != nil {
-			return nil, err
-		}
-		if request.Thinking != nil && request.Thinking.Type == "enabled" {
-			intent, _, err := kitreasoning.FromClaude(&request)
-			if err != nil {
-				return nil, err
-			}
-			rendered, err := kitreasoning.RenderClaude(request.Model, intent, &limit, 0)
-			if err != nil {
-				return nil, err
-			}
-			if rendered.MaxTokens != nil || rendered.Thinking == nil || rendered.Thinking.GetBudgetTokens() != request.Thinking.GetBudgetTokens() {
-				return nil, errors.New("output limit cannot preserve the Claude thinking budget")
-			}
-		}
+		return channel.SetClaudeOutputLimit(body, "", limit)
 	case dto.OpenAIResponsesRequest, *dto.OpenAIResponsesRequest:
 		field = "max_output_tokens"
 	case dto.GeminiChatRequest, *dto.GeminiChatRequest:
@@ -234,6 +216,13 @@ func (a *ChannelAdaptor) SetChatOutputLimit(converted any, body []byte, limit ui
 	}
 	wire[field] = encoded
 	return common.Marshal(wire)
+}
+
+func (a *ChannelAdaptor) ValidateCredentialFormat(key string) error {
+	if validator, ok := a.provider.(channel.ProviderCredentialValidator); ok {
+		return validator.ValidateCredentialFormat(a.kind, key)
+	}
+	return nil
 }
 
 func (a *ChannelAdaptor) providerMetadata(info *relaycommon.RelayInfo) *channel.ProviderRequest {

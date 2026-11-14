@@ -137,7 +137,6 @@ func TestRealtimeHandshakeLeaseLossRejectsNextGeneration(t *testing.T) {
 					return
 				}
 				defer ws.Close()
-				close(accepted)
 				select {
 				case <-releaseHandshake:
 				case <-r.Context().Done():
@@ -150,6 +149,10 @@ func TestRealtimeHandshakeLeaseLossRejectsNextGeneration(t *testing.T) {
 			established := false
 			call.Native.Exchange = func(c *gin.Context, info *relaycommon.RelayInfo, channelID, providerID int, prepared *relaychannel.PreparedWssRequest, payload []byte) (*dto.Usage, *types.NewAPIError) {
 				_, apiErr := relay.ExchangeRealtime(c, info, prepared, func() error {
+					// Hold the completed client handshake until renewal and Redis
+					// recovery finish, then let ConnectionReady release the Permit.
+					close(accepted)
+					<-releaseHandshake
 					established = true
 					call.Native.ConnectionReady()
 					return nil

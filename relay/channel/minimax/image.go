@@ -7,7 +7,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -22,6 +24,9 @@ type MiniMaxImageRequest struct {
 	AspectRatio     string `json:"aspect_ratio,omitempty"`
 	ResponseFormat  string `json:"response_format,omitempty"`
 	N               int    `json:"n,omitempty"`
+	Width           *int   `json:"width,omitempty"`
+	Height          *int   `json:"height,omitempty"`
+	Seed            *int64 `json:"seed,omitempty"`
 	PromptOptimizer *bool  `json:"prompt_optimizer,omitempty"`
 	AigcWatermark   *bool  `json:"aigc_watermark,omitempty"`
 }
@@ -37,6 +42,13 @@ type MiniMaxImageResponse struct {
 		StatusCode int    `json:"status_code"`
 		StatusMsg  string `json:"status_msg"`
 	} `json:"base_resp"`
+}
+
+func validateMiniMaxDimensions(width, height int) error {
+	if width < 512 || width > 2048 || height < 512 || height > 2048 || width%8 != 0 || height%8 != 0 {
+		return types.NewMediaParameterError("size", "media_format_unsupported")
+	}
+	return nil
 }
 
 func oaiImage2MiniMaxImageRequest(request dto.ImageRequest) MiniMaxImageRequest {
@@ -176,11 +188,25 @@ func responseMiniMax2OpenAIImage(response *MiniMaxImageResponse, info *relaycomm
 }
 
 func miniMaxImageHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
+	defer service.CloseResponseBodyGracefully(resp)
 	responseBody, err := io.ReadAll(resp.Body)
+	if info.ResponseFacts != nil {
+		var data []dto.ImageData
+		for _, value := range ojson.GetBytes(responseBody, "data.image_urls").Array() {
+			if value.Type == ojson.String && value.Str != "" {
+				data = append(data, dto.ImageData{Url: value.Str})
+			}
+		}
+		for _, value := range ojson.GetBytes(responseBody, "data.image_base64").Array() {
+			if value.Type == ojson.String && value.Str != "" {
+				data = append(data, dto.ImageData{B64Json: value.Str})
+			}
+		}
+		openai.ObserveImageGeneration(info, data)
+	}
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
-	service.CloseResponseBodyGracefully(resp)
 
 	var minimaxResponse MiniMaxImageResponse
 	if err := common.Unmarshal(responseBody, &minimaxResponse); err != nil {
@@ -203,6 +229,9 @@ func miniMaxImageHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 
+	if info.ResponseFacts != nil {
+		return openai.WriteImageResponse(c, info, resp, jsonResponse)
+	}
 	c.Writer.Header().Set("Content-Type", "application/json")
 	c.Writer.WriteHeader(resp.StatusCode)
 	if _, err := c.Writer.Write(jsonResponse); err != nil {

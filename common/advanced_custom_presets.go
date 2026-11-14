@@ -17,6 +17,12 @@ func GetAdvancedCustomPreset(channelType int) *dto.AdvancedCustomConfig {
 			Auth: &dto.AdvancedCustomRouteAuth{Type: dto.AdvancedCustomAuthTypeHeader, Name: "Authorization", Value: "Bearer {api_key}"},
 		})
 	}
+	if channelType == constant.ChannelTypeVLLM {
+		config.Routes = append(config.Routes, dto.AdvancedCustomRoute{
+			IncomingPath: "/v1/audio/speech", UpstreamPath: "/v1/audio/speech", Converter: "none",
+			Auth: &dto.AdvancedCustomRouteAuth{Type: dto.AdvancedCustomAuthTypeHeader, Name: "Authorization", Value: "Bearer {api_key}"},
+		})
+	}
 	if channelType == constant.ChannelTypeSGLang {
 		for _, path := range []string{"/v1/rerank", "/rerank"} {
 			config.Routes = append(config.Routes, dto.AdvancedCustomRoute{

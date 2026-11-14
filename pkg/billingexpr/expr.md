@@ -151,8 +151,9 @@ OpenAI 已于 2026-05-12 下线 DALL·E 2/3；其校验、默认值和倍率保�
 `image_count` 是独立于 token 的计费数量。省略上下文时默认 1；提供的数量必须是 1 到
 `dto.MaxImageN`（128）的整数。固定价格语法允许它作为乘数，仍禁止用 token 乘固定价格。
 图片入口只解析一次 provider 计费标量并随请求携带。数量来自顶层 `n`（`n=0` 兼容为 1）；
-`parameters.n` 仍在入口校验范围，但不再覆盖计费数量。每次渠道重试或参数覆盖之后，再校验最终上游数量并在发送前补足预留，
-图片钱包预留使用原子余额检查，不能通过增加数量形成欠费后继续提交。
+`parameters.n` 仍在入口校验范围，但不再覆盖计费数量。每次渠道重试或参数覆盖后，
+最终上游数量必须重新校验。对外模型入口在唯一预扣前按有效请求确定资金保障；
+后续候选超过该冻结保障时跳过，不追加预扣，也不静默改写已验证字段。旧额度入口仍按其独立的会话规则执行。
 `estimated_image_count` 保存本次发送前的数量；JSON/multipart 图片参数上下文只保留计费需要的标量，不保留图片或提示词内容。
 结算使用独立的实际数量，不修改被冻结的 `param("n")`。正常结束
 的 SSE 可以减少数量，客户端提前断开不能减少应收数量。最终消费日志记录 `image_count`。
@@ -160,6 +161,10 @@ OpenAI 已于 2026-05-12 下线 DALL·E 2/3；其校验、默认值和倍率保�
 其数量是任务用量事实 `u("image_count")`，提交时按请求数量预留，完成时按上游 `usage.image_count`
 （Qwen-Image-3.0 为 `usage.output_image_count`）或按各 `choices[].message.content[]` / `results[]`
 中的图片载荷数结算，任务消费日志同样记录 `image_count`。
+
+对外模型结算释放该预留一次，按真实载荷结算；记录中未知的最终数量仍保持未知，
+不把请求数量伪装为实测数量。
+图像和音频的金额仍走唯一 `RunMoneyExpr` 与钱包、应收账户及账目，不走旧额度链。
 
 > **注意：** 自动扣除针对 GPT/OpenAI 格式的 API（prompt_tokens 包含子类别）。Claude 格式的 API 不重复扣除缓存；未独立计价的缓存读取和缓存写入加回输入。系统根据上游返回格式自动处理。
 
@@ -260,6 +265,15 @@ optionally overrides individual counts with exact decimals, including the 1.6
 short-write units for an omitted
 one-hour cache-write price. Counts must be non-negative and at most `MaxInt64`.
 
+`RequestInput.UnmeasuredTokens` marks quantities without a report or a supported
+local estimate. Reading one in the executed pricing branch fails evaluation;
+short-circuited branches and independent fixed/image-count prices still work.
+`MoneyTraceResult.UnmeasuredTokens` records the unavailable names actually read.
+The gateway preserves those traces in its existing pending settlement intent.
+Explicit zero remains measured. Image output estimates use documented generation
+rules in `tokenkit.ImageOutputTokens`; input-image vision rules and reservation
+means cannot substitute for generated output quantities.
+
 The evaluator preserves numeric source tokens and request JSON numbers,
 including grouped literals, scientific notation, and coefficients with 18
 decimal places. It validates the existing v1 grammar, then executes a separate
@@ -268,6 +282,30 @@ returns exactly `1`. Powers must have an exact rational result. Decimal
 exponents and powers must stay within the expression memory budget. Negative
 charges, invalid arithmetic, and amounts outside the `money.Amount` range fail
 instead of being clamped.
+
+`MoneyInput.ImageCount` optionally overrides the image request estimate with a
+bounded actual payload count from 0 through `dto.MaxImageN`. Zero means no image
+payload; nil leaves the existing request-estimate behavior intact. It does not
+change frozen `param("n")` probes. `RequestInput.ImageCount` retains its existing
+1-through-128 validation and default of one. This additive currency-path input
+does not change `RunExpr` or task usage expressions. `MoneyInput.MeanImageCount`
+accepts an exact rational historical mean from 0 through `dto.MaxImageN` for
+margin estimates. It cannot be combined with an actual `ImageCount`; its trace
+uses `mean_image_count` and leaves actual `image_count` absent. A mean never
+becomes a measured payload count. Audio `ai`/`ao` quantities
+retain their per-million-token semantics; measured audio seconds are normalized
+by the host's existing 1000-tokens-per-minute convention before evaluation.
+
+`MoneyTraceResult.ImageCount` records the image quantity available to the
+expression, including condition probes. `ImageQuantityPriced` separately reports
+whether the executed price multiplied by that quantity; condition-only uses do
+not turn a fixed request fee into a per-image price. `FixedPricePerImage` records
+the selected fixed leaf's unit before later factors run, including a quantity
+factor not reached because another multiplier failed. The host can waive a
+failed request's evaluated fixed fee without discarding charges for delivered images.
+`UsesOnlyFixedRequestPricing` identifies expressions whose leaves are all fixed
+request fees and have no image quantity factors, so a failed request owes zero
+even when a condition fails before choosing a leaf.
 
 `MoneyInput.Time` freezes all standard time probes for an evaluation. A zero
 value captures `pkg/clock.Now()` once. Empty and invalid timezones use UTC.

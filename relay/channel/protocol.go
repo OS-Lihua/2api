@@ -11,6 +11,7 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
+	kitreasoning "github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 )
@@ -33,6 +34,23 @@ type ChatRequestProjector interface {
 	ProjectChatRequest([]byte, dto.GeneralOpenAIRequest) (*dto.GeneralOpenAIRequest, error)
 }
 
+// ImageRequestProjector exposes public image quantities from native wire DTOs.
+// The native protocol owns its defaults and the meaning of overridden fields.
+type ImageRequestProjector interface {
+	ProjectImageRequest([]byte, dto.ImageRequest) (*dto.ImageRequest, error)
+}
+
+// AudioRequestProjector exposes text and media controls from native wire DTOs.
+type AudioRequestProjector interface {
+	ProjectAudioRequest([]byte, dto.AudioRequest) (*dto.AudioRequest, error)
+}
+
+// AudioOutputBudgetProjector exposes an output estimate implied by native
+// controls. It is used for reservation and never represents measured usage.
+type AudioOutputBudgetProjector interface {
+	MinimumAudioOutputTokens([]byte) (int, error)
+}
+
 // ChatRequestFinalizer applies local wire changes after parameter and header
 // overrides, before effective validation, route pricing and reservation.
 // Implementations must perform no upstream I/O and remain idempotent.
@@ -49,6 +67,47 @@ type ChatRequestPreparer interface {
 // ChatOutputLimitSetter applies a validated default to a native wire body.
 type ChatOutputLimitSetter interface {
 	SetChatOutputLimit([]byte, uint) ([]byte, error)
+}
+
+// ChatOutputLimitSource exposes a native default while keeping the unchanged
+// native input projection and its existing override restrictions.
+type ChatOutputLimitSource interface {
+	ChatOutputLimit([]byte) (*uint, error)
+}
+
+// SetClaudeOutputLimit retains the Claude thinking budget while changing the
+// native max_tokens field. Vertex uses the same body controls without model.
+func SetClaudeOutputLimit(body []byte, modelName string, limit uint) ([]byte, error) {
+	var request dto.ClaudeRequest
+	if err := common.Unmarshal(body, &request); err != nil {
+		return nil, err
+	}
+	if request.Model == "" {
+		request.Model = modelName
+	}
+	if request.Thinking != nil && request.Thinking.Type == "enabled" {
+		intent, _, err := kitreasoning.FromClaude(&request)
+		if err != nil {
+			return nil, err
+		}
+		rendered, err := kitreasoning.RenderClaude(request.Model, intent, &limit, 0)
+		if err != nil {
+			return nil, err
+		}
+		if rendered.MaxTokens != nil || rendered.Thinking == nil || rendered.Thinking.GetBudgetTokens() != request.Thinking.GetBudgetTokens() {
+			return nil, fmt.Errorf("output limit cannot preserve the Claude thinking budget")
+		}
+	}
+	var wire map[string]common.RawMessage
+	if err := common.Unmarshal(body, &wire); err != nil {
+		return nil, err
+	}
+	encoded, err := common.Marshal(limit)
+	if err != nil {
+		return nil, err
+	}
+	wire["max_tokens"] = encoded
+	return common.Marshal(wire)
 }
 
 // ProjectChatRequestControls retains public multiplier validation even when a

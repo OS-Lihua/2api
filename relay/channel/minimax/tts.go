@@ -2,13 +2,16 @@ package minimax
 
 import (
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
+	"github.com/MoeForge/moego/ojson"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -106,69 +109,57 @@ func getContentTypeByFormat(format string) string {
 }
 
 func handleTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {
-	body, readErr := io.ReadAll(resp.Body)
-	if readErr != nil {
-		return nil, types.NewErrorWithStatusCode(
-			fmt.Errorf("failed to read minimax response: %w", readErr),
-			types.ErrorCodeReadResponseBodyFailed,
-			http.StatusInternalServerError,
-		)
-	}
 	defer resp.Body.Close()
-
-	// Parse response
+	body, readErr := io.ReadAll(resp.Body)
+	var audioData []byte
+	if info.ResponseFacts != nil {
+		var encoded string
+		if raw := ojson.GetBytes(body, "data.audio").Raw; raw != "" && common.UnmarshalJsonStr(raw, &encoded) == nil {
+			if decoded, decodeErr := hex.DecodeString(encoded); decodeErr == nil && len(decoded) > 0 {
+				audioData = decoded
+				usage = openai.EstimateGeneratedSpeech(c, info, audioData, true)
+			}
+		}
+	}
+	if readErr != nil {
+		if info.ResponseFacts != nil {
+			if info.StreamStatus == nil {
+				info.StreamStatus = relaycommon.NewStreamStatus()
+			}
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, readErr)
+			info.StreamStatus.MarkIncomplete("incomplete_audio_response")
+		}
+		return usage, types.NewErrorWithStatusCode(fmt.Errorf("failed to read minimax response: %w", readErr), types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
+	}
 	var minimaxResp MiniMaxTTSResponse
-	if unmarshalErr := json.Unmarshal(body, &minimaxResp); unmarshalErr != nil {
-		return nil, types.NewErrorWithStatusCode(
-			fmt.Errorf("failed to unmarshal minimax TTS response: %w", unmarshalErr),
-			types.ErrorCodeBadResponseBody,
-			http.StatusInternalServerError,
-		)
+	if unmarshalErr := common.Unmarshal(body, &minimaxResp); unmarshalErr != nil {
+		return usage, types.NewErrorWithStatusCode(fmt.Errorf("failed to unmarshal minimax TTS response: %w", unmarshalErr), types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
-
-	// Check base_resp status code
 	if minimaxResp.BaseResp.StatusCode != 0 {
-		return nil, types.NewErrorWithStatusCode(
-			fmt.Errorf("minimax TTS error: %d - %s", minimaxResp.BaseResp.StatusCode, minimaxResp.BaseResp.StatusMsg),
-			types.ErrorCodeBadResponse,
-			http.StatusBadRequest,
-		)
+		return usage, types.NewErrorWithStatusCode(fmt.Errorf("minimax TTS error: %d - %s", minimaxResp.BaseResp.StatusCode, minimaxResp.BaseResp.StatusMsg), types.ErrorCodeBadResponse, http.StatusBadRequest)
 	}
-
-	// Check if we have audio data
 	if minimaxResp.Data.Audio == "" {
-		return nil, types.NewErrorWithStatusCode(
-			fmt.Errorf("no audio data in minimax TTS response"),
-			types.ErrorCodeBadResponse,
-			http.StatusBadRequest,
-		)
+		return usage, types.NewErrorWithStatusCode(errors.New("no audio data in minimax TTS response"), types.ErrorCodeBadResponse, http.StatusBadRequest)
 	}
-
 	if strings.HasPrefix(minimaxResp.Data.Audio, "http") {
+		if info.ResponseFacts != nil {
+			return usage, types.NewError(errors.New("MiniMax did not return inline audio"), types.ErrorCodeBadResponse)
+		}
 		c.Redirect(http.StatusFound, minimaxResp.Data.Audio)
 	} else {
-		// Handle hex-encoded audio data
-		audioData, decodeErr := hex.DecodeString(minimaxResp.Data.Audio)
-		if decodeErr != nil {
-			return nil, types.NewErrorWithStatusCode(
-				fmt.Errorf("failed to decode hex audio data: %w", decodeErr),
-				types.ErrorCodeBadResponse,
-				http.StatusInternalServerError,
-			)
+		if audioData == nil {
+			var decodeErr error
+			audioData, decodeErr = hex.DecodeString(minimaxResp.Data.Audio)
+			if decodeErr != nil {
+				return usage, types.NewErrorWithStatusCode(fmt.Errorf("failed to decode hex audio data: %w", decodeErr), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			}
 		}
-
-		// Determine content type - default to mp3
-		contentType := "audio/mpeg"
-
-		c.Data(http.StatusOK, contentType, audioData)
+		if info.ResponseFacts != nil {
+			return openai.WriteAudioResponse(c, info, resp, audioData), nil
+		}
+		c.Data(http.StatusOK, "audio/mpeg", audioData)
 	}
-
-	usage = &dto.Usage{
-		PromptTokens:     info.GetEstimatePromptTokens(),
-		CompletionTokens: 0,
-		TotalTokens:      int(minimaxResp.ExtraInfo.UsageCharacters),
-	}
-
+	usage = &dto.Usage{PromptTokens: info.GetEstimatePromptTokens(), CompletionTokens: 0, TotalTokens: int(minimaxResp.ExtraInfo.UsageCharacters)}
 	return usage, nil
 }
 

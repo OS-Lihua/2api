@@ -31,6 +31,12 @@ type MoneyInput struct {
 	// TaskUsage selects canonical task units, including constant task prices.
 	TaskUsage bool
 	Tokens    map[string]int64
+	// ImageCount overrides the request estimate with a bounded actual payload
+	// count, including zero. It never changes frozen param("n") probes.
+	ImageCount *int
+	// MeanImageCount supplies an exact historical mean for margin estimates.
+	// It is never an actual payload count or a request multiplier override.
+	MeanImageCount *big.Rat
 	// TokenQuantities overrides whole counts for exact weighted cache quantities,
 	// such as the 1.6 short-write units used by an unpriced one-hour cache write.
 	TokenQuantities map[string]decimal.Decimal
@@ -56,15 +62,19 @@ type MoneyConditionTrace struct {
 // MoneyTraceResult contains billing metadata without request bodies or headers.
 // FixedPrice is present even for an explicitly free request-priced leaf.
 type MoneyTraceResult struct {
-	Currency        money.Currency          `json:"currency,omitempty"`
-	UnroundedAmount string                  `json:"unrounded_amount,omitempty"`
-	Conditions      []MoneyConditionTrace   `json:"conditions,omitempty"`
-	ImageCount      *int                    `json:"image_count,omitempty"`
-	BillingUnit     BillingUnit             `json:"billing_unit"`
-	FixedPrice      *string                 `json:"fixed_price,omitempty"`
-	MatchedTier     string                  `json:"matched_tier"`
-	RequestRules    []MoneyRequestRuleTrace `json:"request_rules,omitempty"`
-	RequestSnapshot *MoneyRequestSnapshot   `json:"request_snapshot,omitempty"`
+	UnmeasuredTokens    []string                `json:"unmeasured_tokens,omitempty"`
+	Currency            money.Currency          `json:"currency,omitempty"`
+	UnroundedAmount     string                  `json:"unrounded_amount,omitempty"`
+	Conditions          []MoneyConditionTrace   `json:"conditions,omitempty"`
+	ImageCount          *int                    `json:"image_count,omitempty"`
+	MeanImageCount      string                  `json:"mean_image_count,omitempty"`
+	FixedPricePerImage  bool                    `json:"fixed_price_per_image,omitempty"`
+	ImageQuantityPriced bool                    `json:"image_quantity_priced,omitempty"`
+	BillingUnit         BillingUnit             `json:"billing_unit"`
+	FixedPrice          *string                 `json:"fixed_price,omitempty"`
+	MatchedTier         string                  `json:"matched_tier"`
+	RequestRules        []MoneyRequestRuleTrace `json:"request_rules,omitempty"`
+	RequestSnapshot     *MoneyRequestSnapshot   `json:"request_snapshot,omitempty"`
 }
 
 // MoneyUsedVars returns source identifiers for exact token normalization. It
@@ -103,19 +113,32 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 	if now.IsZero() {
 		now = clock.Now()
 	}
+	tokenValues := make(map[string]*big.Rat)
 	env := map[string]any{
+		"_money_token": func(name string) (*big.Rat, error) {
+			if input.Request.UnmeasuredTokens[name] {
+				trace.UnmeasuredTokens = append(trace.UnmeasuredTokens, name)
+				return nil, fmt.Errorf("token quantity %s is unknown", name)
+			}
+			return tokenValues[name], nil
+		},
 		"tier": func(name string, amount any) any {
 			trace.MatchedTier = name
 			return amount
 		},
-		"_money_fixed": func(value any, text string) (*big.Rat, error) {
+		"_money_fixed": func(value any, text string, perImage bool) (*big.Rat, error) {
 			amount, err := exactNumber(value)
 			if err != nil {
 				return nil, err
 			}
 			trace.BillingUnit = BillingUnitRequest
 			trace.FixedPrice = &text
+			trace.FixedPricePerImage = perImage
 			return new(big.Rat).Mul(amount, big.NewRat(1_000_000, 1)), nil
+		},
+		"_money_image_quantity": func(value any) any {
+			trace.ImageQuantityPriced = true
+			return value
 		},
 		"u": func(key string) (any, error) {
 			value, exists := input.Request.Usage[key]
@@ -213,8 +236,7 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 		"_money_index":   exactIndex,
 	}
 	imageCount := 1
-	if entry.usedVars["image_count"] {
-		minimum := 1
+	if entry.sourceVars["image_count"] || entry.usedVars["image_count"] {
 		if input.TaskUsage {
 			fact, err := env["u"].(func(string) (any, error))("image_count")
 			if err != nil {
@@ -224,16 +246,31 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 			if err != nil || !quantity.IsInt() || quantity.Sign() < 0 || quantity.Cmp(big.NewRat(dto.MaxImageN, 1)) > 0 {
 				return money.Value{}, trace, fmt.Errorf("image_count must be a bounded whole task usage fact")
 			}
-			imageCount, minimum = int(quantity.Num().Int64()), 0
-		} else if input.Request.ImageCount != nil {
-			imageCount = *input.Request.ImageCount
-		}
-		if imageCount < minimum || imageCount > dto.MaxImageN {
-			return money.Value{}, trace, fmt.Errorf("image_count must be between %d and %d", minimum, dto.MaxImageN)
+			imageCount = int(quantity.Num().Int64())
+		} else {
+			if input.Request.ImageCount != nil {
+				imageCount = *input.Request.ImageCount
+			}
+			if input.ImageCount != nil {
+				imageCount = *input.ImageCount
+				if imageCount < 0 || imageCount > dto.MaxImageN {
+					return money.Value{}, trace, fmt.Errorf("actual image_count must be between 0 and %d", dto.MaxImageN)
+				}
+			} else if imageCount < 1 || imageCount > dto.MaxImageN {
+				return money.Value{}, trace, fmt.Errorf("image_count must be between 1 and %d", dto.MaxImageN)
+			}
 		}
 		trace.ImageCount = &imageCount
 	}
 	env["image_count"] = big.NewRat(int64(imageCount), 1)
+	if entry.sourceVars["image_count"] && input.MeanImageCount != nil {
+		if input.ImageCount != nil || input.MeanImageCount.Sign() < 0 || input.MeanImageCount.Cmp(big.NewRat(dto.MaxImageN, 1)) > 0 {
+			return money.Value{}, trace, fmt.Errorf("mean image_count must be between 0 and %d without an actual count", dto.MaxImageN)
+		}
+		env["image_count"] = new(big.Rat).Set(input.MeanImageCount)
+		trace.ImageCount = nil
+		trace.MeanImageCount = input.MeanImageCount.RatString()
+	}
 	for name, count := range input.Tokens {
 		if count < 0 {
 			return money.Value{}, trace, fmt.Errorf("%s must be non-negative", name)
@@ -257,10 +294,11 @@ func RunMoneyExpr(expression string, input MoneyInput, currency money.Currency) 
 		quantities[name] = new(big.Rat).Set(quantity)
 	}
 	for _, name := range []string{"p", "c", "len", "cr", "cc", "cc1h", "cc12h", "img", "img_cr", "img_o", "ai", "ao"} {
-		env[name] = big.NewRat(input.Tokens[name], 1)
+		tokenValues[name] = big.NewRat(input.Tokens[name], 1)
 		if quantity, ok := quantities[name]; ok {
-			env[name] = quantity
+			tokenValues[name] = quantity
 		}
+		env[name] = tokenValues[name]
 	}
 	entry.moneyOnce.Do(func() {
 		_, body := ParseExprVersion(expression)
@@ -370,7 +408,7 @@ func compileMoneyProgram(body string, env map[string]any) (*vm.Program, []MoneyR
 	for location, condition := range moneyBooleanExpressions(tree.Node) {
 		probes[location] = condition.String()
 	}
-	program, err := expr.Compile(body, expr.Env(env), expr.Patch(&moneyPatcher{literals: literals, literalText: literalText, rules: rules, conditions: conditions, conditionals: conditionals, probes: probes}), expr.Optimize(false), expr.AsAny())
+	program, err := expr.Compile(body, expr.Env(env), expr.Patch(&moneyPatcher{imagePricing: imagePricing(tree.Node), literals: literals, literalText: literalText, rules: rules, conditions: conditions, conditionals: conditionals, probes: probes}), expr.Optimize(false), expr.AsAny())
 	if err != nil {
 		return nil, nil, fmt.Errorf("expr compile error: %w", err)
 	}
@@ -393,12 +431,18 @@ type moneyPatcher struct {
 	rules        map[file.Location]int
 	conditions   map[file.Location]string
 	conditionals map[file.Location]string
+	imagePricing imagePricePlan
 	probes       map[file.Location]string
 }
 
 func (p *moneyPatcher) Visit(node *ast.Node) {
 	location := (*node).Location()
 	switch part := (*node).(type) {
+	case *ast.IdentifierNode:
+		switch part.Value {
+		case "p", "c", "len", "cr", "cc", "cc1h", "cc12h", "img", "img_cr", "img_o", "ai", "ao":
+			ast.Patch(node, &ast.CallNode{Callee: &ast.IdentifierNode{Value: "_money_token"}, Arguments: []ast.Node{&ast.StringNode{Value: part.Value}}})
+		}
 	case *ast.IntegerNode:
 		ast.Patch(node, &ast.ConstantNode{Value: int(p.literals[part.Location()].Num().Int64())})
 	case *ast.FloatNode:
@@ -407,7 +451,7 @@ func (p *moneyPatcher) Visit(node *ast.Node) {
 		if callee, ok := part.Callee.(*ast.IdentifierNode); ok && callee.Value == "fixed" {
 			ast.Patch(node, &ast.CallNode{
 				Callee:    &ast.IdentifierNode{Value: "_money_fixed"},
-				Arguments: []ast.Node{part.Arguments[0], &ast.StringNode{Value: p.literalText[part.Arguments[0].Location()]}},
+				Arguments: []ast.Node{part.Arguments[0], &ast.StringNode{Value: p.literalText[part.Arguments[0].Location()]}, &ast.BoolNode{Value: p.imagePricing.fixedImagePrices[part.Location()]}},
 			})
 		}
 	case *ast.ConditionalNode:
@@ -444,6 +488,13 @@ func (p *moneyPatcher) Visit(node *ast.Node) {
 			part.Property = &ast.CallNode{Callee: &ast.IdentifierNode{Value: "_money_index"}, Arguments: []ast.Node{part.Property}}
 		}
 	case *ast.BinaryNode:
+		if imageOnLeft, ok := p.imagePricing.multipliers[part.Location()]; ok {
+			quantity := &part.Right
+			if imageOnLeft {
+				quantity = &part.Left
+			}
+			*quantity = &ast.CallNode{Callee: &ast.IdentifierNode{Value: "_money_image_quantity"}, Arguments: []ast.Node{*quantity}}
+		}
 		switch part.Operator {
 		case "..":
 			part.Left = &ast.CallNode{Callee: &ast.IdentifierNode{Value: "_money_index"}, Arguments: []ast.Node{part.Left}}

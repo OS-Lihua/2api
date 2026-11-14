@@ -3,7 +3,11 @@ package common
 import (
 	"bytes"
 	"context"
+	"math"
+
 	"encoding/binary"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"strings"
 	"testing"
 )
@@ -30,6 +34,34 @@ func minimalWAV(sampleRate uint32, frames int) []byte {
 	binary.Write(buf, binary.LittleEndian, uint32(dataSize))
 	buf.Write(make([]byte, dataSize))
 	return buf.Bytes()
+}
+
+func TestAudioDurationTokensSaturatesUntrustedMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		seconds float64
+		want    int
+		clamped bool
+	}{
+		{"one second", 1, 17, false},
+		{"one minute", 60, 1000, false},
+		{"fractional second", 0.1, 17, false},
+		{"explicit zero", 0, 0, false},
+		{"negative", -1, 0, true},
+		{"NaN", math.NaN(), 0, true},
+		{"infinite", math.Inf(1), math.MaxInt32, true},
+		{"huge finite", math.MaxFloat64, math.MaxInt32, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tokens, clamp := AudioDurationTokens(tc.seconds)
+			assert.Equal(t, tc.want, tokens)
+			if tc.clamped {
+				require.NotNil(t, clamp)
+			} else {
+				assert.Nil(t, clamp)
+			}
+		})
+	}
 }
 
 func TestGetAudioDurationCaseInsensitiveExt(t *testing.T) {

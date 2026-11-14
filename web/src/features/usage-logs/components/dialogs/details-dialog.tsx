@@ -93,6 +93,7 @@ import {
 import { USAGE_BILLING_PATH, type LogOtherData } from '../../types'
 import { ResponseModelDetails } from '../model-badge'
 import { PluginAuthorLink } from '../plugin-author-link'
+import { QuotaSaturationFacts } from '../quota-saturation-facts'
 import { DetailRow, DetailSection } from './log-detail-layout'
 
 // Maps a channel-update changed-field token (as recorded by the backend audit)
@@ -154,15 +155,6 @@ function isUsageBillingPathLocal(
     return adminInfo.usage_billing_path === USAGE_BILLING_PATH.LOCAL
   }
   return adminInfo?.local_count_tokens === true
-}
-
-function quotaSaturationKindLabel(
-  kind: 'overflow' | 'underflow' | 'nan',
-  t: (key: string) => string
-): string {
-  if (kind === 'overflow') return t('Overflow')
-  if (kind === 'underflow') return t('Underflow')
-  return t('Invalid (NaN)')
 }
 
 function BillingBreakdown(props: {
@@ -850,37 +842,9 @@ export function DetailsDialog(props: DetailsDialogProps) {
           </DetailSection>
         ) : null}
         {props.isAdmin && other?.admin_info?.quota_saturation && (
-          <DetailSection
-            icon={<AlertTriangle className='size-3.5' aria-hidden='true' />}
-            label={t('Quota clamped')}
-            variant='danger'
-          >
-            <p className='mb-1 text-xs wrap-break-word'>
-              {t('Quota saturation protection triggered')}
-            </p>
-            <DetailRow
-              label={t('Kind')}
-              value={quotaSaturationKindLabel(
-                other.admin_info.quota_saturation.kind,
-                t
-              )}
-            />
-            <DetailRow
-              label={t('Original value')}
-              value={String(other.admin_info.quota_saturation.original)}
-              mono
-            />
-            <DetailRow
-              label={t('Clamped to')}
-              value={String(other.admin_info.quota_saturation.clamped)}
-              mono
-            />
-            <DetailRow
-              label={t('Operation')}
-              value={other.admin_info.quota_saturation.op}
-              mono
-            />
-          </DetailSection>
+          <QuotaSaturationFacts
+            saturation={other.admin_info.quota_saturation}
+          />
         )}
 
         {/* Reject reason (admin only) */}

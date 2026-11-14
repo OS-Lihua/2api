@@ -679,7 +679,11 @@ func RouteTaskPluginEndpoint() gin.HandlerFunc {
 				modelIDs = append(modelIDs, member.ModelID)
 			}
 			var channels []model.Channel
-			if queryErr := model.OfferingChannelsQuery(model.DB, offering, modelIDs).Where("channels.protocol LIKE ?", "task:%").Order("channels.id").Find(&channels).Error; queryErr != nil {
+			if queryErr := model.OfferingChannelsQuery(model.DB.WithContext(c.Request.Context()), offering, modelIDs).
+				Where("channels.protocol LIKE ? AND channels.status = ? AND channels.mapping_confirmed = ?", "task:%", model.ChannelEnabled, true).
+				Where("channels.model_id IN (?)", model.DB.Model(&model.Model{}).Select("id").Where("status = ?", 1)).
+				Where("channels.provider_id IN (?)", model.DB.Model(&model.Provider{}).Select("id").Where("status = ?", common.ChannelStatusEnabled)).
+				Order("channels.id").Find(&channels).Error; queryErr != nil {
 				abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgTaskChannelUnavailable))
 				return
 			}

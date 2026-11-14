@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -21,23 +23,60 @@ import (
 )
 
 // ttsProtocol owns the speech DTO and audio response; credentials and the
-// WebSocket connection belong to Provider.ExecuteRequest.
+// WebSocket connection belong to Provider.
 type ttsProtocol struct{}
+
+const (
+	contextKeyDecodedSpeechResponse = "volcengine_decoded_speech_response"
+	defaultSpeechWebSocketURL       = "wss://openspeech.bytedance.com/api/v1/tts/ws_binary"
+	defaultSpeechHTTPURL            = "https://openspeech.bytedance.com/api/v1/tts"
+)
 
 func (p *ttsProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInfo, request any) (any, error) {
 	r, ok := request.(dto.AudioRequest)
 	if !ok {
 		return nil, fmt.Errorf("expected speech request, got %T", request)
 	}
-	return convertTTSRequest(c, info, r, VolcengineTTSApp{Cluster: "volcano_tts"})
+	body, err := convertTTSRequest(c, info, r, VolcengineTTSApp{Cluster: "volcano_tts"})
+	if err != nil {
+		return nil, err
+	}
+	if info.ResponseFacts != nil {
+		query, submit := speechTransports(info.ChannelBaseUrl)
+		return speechRequestBody{Reader: body, query: query, submit: submit}, nil
+	}
+	return body, nil
 }
 
 func (p *ttsProtocol) DoResponse(c *gin.Context, response *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
 	encoding := c.GetString(contextKeyResponseFormat)
-	if _, ok := response.Body.(*ttsSocketBody); !ok {
+	if info.ResponseFacts != nil {
+		if request, ok := info.Request.(*dto.AudioRequest); ok {
+			encoding = mapEncoding(request.ResponseFormat)
+		}
+	}
+	_, socketBody := response.Body.(*ttsSocketBody)
+	if !socketBody && !c.GetBool(contextKeyDecodedSpeechResponse) {
 		return handleTTSResponse(c, response, info, encoding)
 	}
 	defer response.Body.Close()
+	if info.ResponseFacts != nil {
+		audio, err := io.ReadAll(response.Body)
+		if err != nil {
+			usage := openai.EstimateGeneratedSpeech(c, info, audio, false)
+			if info.StreamStatus == nil {
+				info.StreamStatus = relaycommon.NewStreamStatus()
+			}
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)
+			info.StreamStatus.MarkIncomplete("incomplete_audio_response")
+			var nativeError *types.NewAPIError
+			if errors.As(err, &nativeError) {
+				return usage, nativeError
+			}
+			return usage, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
+		}
+		return openai.WriteAudioResponse(c, info, response, audio), nil
+	}
 	c.Header("Content-Type", getContentTypeByEncoding(encoding))
 	var buffer [32 * 1024]byte
 	for {
@@ -58,31 +97,78 @@ func (p *ttsProtocol) DoResponse(c *gin.Context, response *http.Response, info *
 	return &dto.Usage{PromptTokens: info.GetEstimatePromptTokens(), TotalTokens: info.GetEstimatePromptTokens()}, nil
 }
 
-func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetadata, body io.Reader) (*http.Response, error) {
+func (p *Provider) ValidateCredentialFormat(kind protocol.Type, key string) error {
+	if kind != protocol.OpenAIAudioSpeech {
+		return nil
+	}
+	appID, token, err := parseVolcengineAuth(key)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(appID) == "" || strings.TrimSpace(token) == "" {
+		return errors.New("Volcengine speech credentials are empty")
+	}
+	return nil
+}
+
+func (p *Provider) PrepareRequestBody(_ *gin.Context, metadata channel.ProviderMetadata, body []byte) ([]byte, error) {
 	account := metadata.ProviderRequest()
 	if account.Protocol != protocol.OpenAIAudioSpeech {
-		return nil, channel.ErrUseHTTPTransport
+		return body, nil
 	}
-	payload, err := io.ReadAll(body)
-	if err != nil {
+	var fields map[string]common.RawMessage
+	if err := common.Unmarshal(body, &fields); err != nil {
 		return nil, err
 	}
-	var request VolcengineTTSRequest
-	if err = common.Unmarshal(payload, &request); err != nil {
-		return nil, err
+	if fields == nil {
+		return nil, errors.New("invalid Volcengine speech request")
+	}
+	var app map[string]common.RawMessage
+	if raw := fields["app"]; len(raw) > 0 {
+		if err := common.Unmarshal(raw, &app); err != nil {
+			return nil, err
+		}
+	}
+	if app == nil {
+		app = make(map[string]common.RawMessage)
 	}
 	appID, token, err := parseVolcengineAuth(account.ApiKey)
 	if err != nil {
 		return nil, err
 	}
-	request.App.AppID, request.App.Token = appID, token
-	payload, err = common.Marshal(request)
+	for name, value := range map[string]string{"appid": appID, "token": token} {
+		app[name], err = common.Marshal(value)
+		if err != nil {
+			return nil, err
+		}
+	}
+	fields["app"], err = common.Marshal(app)
+	if err != nil {
+		return nil, err
+	}
+	return common.Marshal(fields)
+}
+
+func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetadata, body io.Reader) (*http.Response, error) {
+	account := metadata.ProviderRequest()
+	if account.Protocol != protocol.OpenAIAudioSpeech {
+		return nil, channel.ErrUseHTTPTransport
+	}
+	c.Set(contextKeyDecodedSpeechResponse, false)
+	payload, err := io.ReadAll(body)
+	if err != nil {
+		return nil, err
+	}
+	payload, err = p.PrepareRequestBody(c, metadata, payload)
 	if err != nil {
 		return nil, err
 	}
 	destination, err := p.RequestURL(metadata)
 	if err != nil {
 		return nil, err
+	}
+	if ojson.GetBytes(payload, "request.operation").Str == "query" && destination == defaultSpeechWebSocketURL {
+		destination = defaultSpeechHTTPURL
 	}
 	if !strings.HasPrefix(destination, "ws://") && !strings.HasPrefix(destination, "wss://") {
 		upstream, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, destination, bytes.NewReader(payload))
@@ -111,11 +197,13 @@ func (p *Provider) ExecuteRequest(c *gin.Context, metadata channel.ProviderMetad
 		}
 		return nil, err
 	}
+	stop := context.AfterFunc(c.Request.Context(), func() { conn.Close() })
 	if err := FullClientRequest(conn, payload); err != nil {
+		stop()
 		conn.Close()
 		return nil, err
 	}
-	stop := context.AfterFunc(c.Request.Context(), func() { conn.Close() })
+	c.Set(contextKeyDecodedSpeechResponse, true)
 	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/octet-stream"}}, Body: &ttsSocketBody{conn: conn, stop: stop}}, nil
 }
 
@@ -142,7 +230,7 @@ func (b *ttsSocketBody) Read(p []byte) (int, error) {
 		}
 		switch message.MsgType {
 		case MsgTypeError:
-			return 0, errors.New("volcengine speech transport returned an error")
+			return 0, speechError(int(message.ErrorCode))
 		case MsgTypeAudioOnlyServer:
 			b.done = message.Sequence < 0
 			b.pending = bytes.NewReader(message.Payload)

@@ -2,11 +2,13 @@ package service
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/money"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/shopspring/decimal"
 )
@@ -36,7 +38,7 @@ func GatewayFX(ctx context.Context, from money.Currency) (*money.Rate, string, e
 
 // GatewayPrice evaluates one frozen expression and applies the exact discount
 // and frozen accounting quote. Rounding belongs to the caller's ledger boundary.
-func GatewayPrice(price *model.PriceVersion, usage *dto.Usage, request billingexpr.RequestInput, at time.Time, ratio decimal.Decimal, rate *money.Rate) (money.Value, money.Value, billingexpr.MoneyTraceResult, error) {
+func GatewayPrice(price *model.PriceVersion, usage *dto.Usage, request billingexpr.RequestInput, at time.Time, ratio decimal.Decimal, rate *money.Rate, actualImageCount ...int) (money.Value, money.Value, billingexpr.MoneyTraceResult, error) {
 	used, err := billingexpr.MoneyUsedVars(price.Expression)
 	if err != nil {
 		return money.Value{}, money.Value{}, billingexpr.MoneyTraceResult{}, err
@@ -48,7 +50,15 @@ func GatewayPrice(price *model.PriceVersion, usage *dto.Usage, request billingex
 			return money.Value{}, money.Value{}, billingexpr.MoneyTraceResult{}, err
 		}
 	}
-	value, trace, err := billingexpr.RunMoneyExpr(price.Expression, billingexpr.MoneyInput{TaskUsage: request.Usage != nil, TokenQuantities: quantities, Request: request, Time: at}, price.Currency)
+	request.UnmeasuredTokens = billingexpr.NormalizeUnmeasuredOutputTokens(request.UnmeasuredTokens, used)
+	input := billingexpr.MoneyInput{TaskUsage: request.Usage != nil, TokenQuantities: quantities, Request: request, Time: at}
+	if len(actualImageCount) > 1 {
+		return money.Value{}, money.Value{}, billingexpr.MoneyTraceResult{}, errors.New("multiple actual image counts")
+	}
+	if len(actualImageCount) == 1 {
+		input.ImageCount = &actualImageCount[0]
+	}
+	value, trace, err := billingexpr.RunMoneyExpr(price.Expression, input, price.Currency)
 	if err != nil {
 		return money.Value{}, money.Value{}, trace, err
 	}
@@ -87,9 +97,38 @@ func GatewayUsageSnapshot(usage *dto.Usage) *dto.Usage {
 	return &snapshot
 }
 
-func GatewayRecordUsage(usage *dto.Usage) model.GatewayUsage {
+func GatewayRecordUsage(usage *dto.Usage, facts ...*relaycommon.ResponseFacts) model.GatewayUsage {
 	if usage == nil {
 		return model.GatewayUsage{}
 	}
-	return model.GatewayUsage{PromptTokens: int64(usage.PromptTokens), CompletionTokens: int64(usage.CompletionTokens), TotalTokens: int64(usage.PromptTokens) + int64(usage.CompletionTokens), CachedTokens: int64(usage.PromptTokensDetails.CachedTokens), CacheCreationTokens: int64(usage.PromptTokensDetails.CacheCreationTokensTotal()), CacheCreation12hTokens: int64(usage.PromptTokensDetails.CacheWrite12hTokens()), ImageInputTokens: int64(usage.PromptTokensDetails.ImageTokens), AudioInputTokens: int64(usage.PromptTokensDetails.AudioTokens), ImageOutputTokens: int64(usage.CompletionTokenDetails.ImageTokens), AudioOutputTokens: int64(usage.CompletionTokenDetails.AudioTokens)}
+	record := model.GatewayUsage{PromptTokens: int64(usage.PromptTokens), CompletionTokens: int64(usage.CompletionTokens), TotalTokens: int64(usage.PromptTokens) + int64(usage.CompletionTokens), CachedTokens: int64(usage.PromptTokensDetails.CachedTokens), CacheCreationTokens: int64(usage.PromptTokensDetails.CacheCreationTokensTotal()), CacheCreation12hTokens: int64(usage.PromptTokensDetails.CacheWrite12hTokens())}
+	source := &relaycommon.ResponseFacts{}
+	if len(facts) > 0 && facts[0] != nil {
+		source = facts[0]
+		if source.ImageOutputTokensUnknown {
+			record.UnmeasuredTokens = []string{"c", "img_o"}
+		}
+		if source.AudioOutputTokensUnknown {
+			record.UnmeasuredTokens = []string{"c", "ao"}
+		}
+		record.ImageCount = source.ImageCount
+		record.AudioInputSeconds = source.AudioInputSeconds
+		record.AudioOutputSeconds = source.AudioOutputSeconds
+	}
+	for _, detail := range []struct {
+		value  int
+		known  bool
+		target **int64
+	}{
+		{usage.PromptTokensDetails.ImageTokens, source.ImageInputTokensReported, &record.ImageInputTokens},
+		{usage.PromptTokensDetails.AudioTokens, source.AudioInputTokensReported || source.AudioInputSeconds != nil || source.AudioInputTokensEstimated > 0, &record.AudioInputTokens},
+		{usage.CompletionTokenDetails.ImageTokens, source.ImageOutputTokensReported || source.ImageOutputTokensEstimated, &record.ImageOutputTokens},
+		{usage.CompletionTokenDetails.AudioTokens, source.AudioOutputTokensReported || source.AudioOutputTokensDerived || source.AudioOutputSeconds != nil, &record.AudioOutputTokens},
+	} {
+		if detail.value != 0 || detail.known {
+			value := int64(detail.value)
+			*detail.target = &value
+		}
+	}
+	return record
 }

@@ -15,7 +15,6 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/ai360"
 	"github.com/QuantumNous/new-api/relay/channel/lingyiwanwu"
@@ -458,6 +457,9 @@ func (a *Protocol) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.Rel
 }
 
 func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.AudioRequest) (io.Reader, error) {
+	if request.SampleRate != nil && (*request.SampleRate <= 0 || *request.SampleRate > 1<<31-1) {
+		return nil, fmt.Errorf("invalid audio sample rate")
+	}
 	a.ResponseFormat = request.ResponseFormat
 	if info.RelayMode == relayconstant.RelayModeAudioSpeech {
 		jsonData, err := common.Marshal(request)
@@ -471,22 +473,22 @@ func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayIn
 
 		writer.WriteField("model", request.Model)
 
-		formData, err2 := common.ParseMultipartFormReusable(c)
-		if err2 != nil {
-			return nil, fmt.Errorf("error parsing multipart form: %w", err2)
+		formData := c.Request.MultipartForm
+		if formData == nil {
+			var err error
+			formData, err = common.ParseMultipartFormReusable(c)
+			if err != nil {
+				return nil, fmt.Errorf("error parsing multipart form: %w", err)
+			}
+			defer formData.RemoveAll()
 		}
 
-		// 打印类似 curl 命令格式的信息
-		logger.LogDebug(c.Request.Context(), "--form 'model=\"%s\"'", request.Model)
-
-		// 遍历表单字段并打印输出
 		for key, values := range formData.Value {
 			if key == "model" {
 				continue
 			}
 			for _, value := range values {
 				writer.WriteField(key, value)
-				logger.LogDebug(c.Request.Context(), "--form '%s=\"%s\"'", key, value)
 			}
 		}
 
@@ -498,8 +500,6 @@ func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayIn
 
 		// 使用 formData 中的第一个文件
 		fileHeader := fileHeaders[0]
-		logger.LogDebug(c.Request.Context(), "--form 'file=@\"%s\"' (size: %d bytes, content-type: %s)",
-			fileHeader.Filename, fileHeader.Size, fileHeader.Header.Get("Content-Type"))
 
 		file, err := fileHeader.Open()
 		if err != nil {
@@ -518,7 +518,6 @@ func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayIn
 		// 关闭 multipart 编写器以设置分界线
 		writer.Close()
 		c.Request.Header.Set("Content-Type", writer.FormDataContentType())
-		logger.LogDebug(c.Request.Context(), "--header 'Content-Type: %s'", writer.FormDataContentType())
 		return &requestBody, nil
 	}
 }
@@ -780,7 +779,13 @@ func (a *Protocol) DoResponse(c *gin.Context, resp *http.Response, info *relayco
 	case relayconstant.RelayModeAudioTranslation:
 		fallthrough
 	case relayconstant.RelayModeAudioTranscription:
-		err, usage = OpenaiSTTHandler(c, resp, info, a.ResponseFormat)
+		format := a.ResponseFormat
+		if info.ResponseFacts != nil {
+			if request, ok := info.Request.(*dto.AudioRequest); ok {
+				format = request.ResponseFormat
+			}
+		}
+		err, usage = OpenaiSTTHandler(c, resp, info, format)
 	case relayconstant.RelayModeImagesGenerations, relayconstant.RelayModeImagesEdits:
 		if info.IsStream {
 			usage, err = OpenaiImageStreamHandler(c, info, resp)

@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"fmt"
+	"maps"
 	"math/big"
 	"slices"
 	"strings"
@@ -318,21 +319,41 @@ func marginLegacyUsage(usage GatewayUsage, used map[string]bool) *dto.Usage {
 	if (used["cc"] || used["cc1h"]) && usage.CacheCreationTokens != 0 {
 		return nil
 	}
-	if used["img_cr"] && usage.CachedTokens != 0 && usage.ImageInputTokens != 0 {
+	if used["img_cr"] && usage.CachedTokens != 0 && usage.ImageInputTokens != nil && *usage.ImageInputTokens != 0 {
 		return nil
 	}
 	if usage.PromptTokens < 0 || usage.CompletionTokens < 0 || usage.PromptTokens > 1<<31-1 || usage.CompletionTokens > 1<<31-1 || usage.TotalTokens != usage.PromptTokens+usage.CompletionTokens {
 		return nil
 	}
-	return &dto.Usage{
+	result := &dto.Usage{
 		PromptTokens: int(usage.PromptTokens), CompletionTokens: int(usage.CompletionTokens), TotalTokens: int(usage.TotalTokens),
 		PromptTokensDetails: dto.InputTokenDetails{
 			CachedTokens: int(usage.CachedTokens), CacheWriteTokens: int(usage.CacheCreationTokens),
 			CacheWriteTokensDetails: &dto.CacheWriteTokenDetails{TTL12hTokens: int(usage.CacheCreation12hTokens)},
-			ImageTokens:             int(usage.ImageInputTokens), AudioTokens: int(usage.AudioInputTokens),
 		},
-		CompletionTokenDetails: dto.OutputTokenDetails{ImageTokens: int(usage.ImageOutputTokens), AudioTokens: int(usage.AudioOutputTokens)},
 	}
+	for _, detail := range []struct {
+		name   string
+		value  *int64
+		target *int
+	}{
+		{"img", usage.ImageInputTokens, &result.PromptTokensDetails.ImageTokens},
+		{"ai", usage.AudioInputTokens, &result.PromptTokensDetails.AudioTokens},
+		{"img_o", usage.ImageOutputTokens, &result.CompletionTokenDetails.ImageTokens},
+		{"ao", usage.AudioOutputTokens, &result.CompletionTokenDetails.AudioTokens},
+	} {
+		if detail.value == nil {
+			if used[detail.name] && !slices.Contains(usage.UnmeasuredTokens, detail.name) {
+				return nil
+			}
+			continue
+		}
+		if *detail.value < 0 || *detail.value > 1<<31-1 {
+			return nil
+		}
+		*detail.target = int(*detail.value)
+	}
+	return result
 }
 
 // meanPriceValue normalizes each quantitative snapshot before taking an exact
@@ -342,12 +363,17 @@ func meanPriceValue(ctx context.Context, tx *gorm.DB, price *PriceVersion, offer
 	if err != nil {
 		return money.Value{}, 0, "", err
 	}
-	for _, probe := range []string{"param", "header", "u", "image_count"} {
+	for _, probe := range []string{"param", "header", "u"} {
 		if used[probe] {
 			return money.Value{}, 0, "request_context_unavailable", nil
 		}
 	}
 	quantities := map[string]*big.Rat{}
+	unmeasured := map[string]bool{}
+	var meanImages *big.Rat
+	if used["image_count"] {
+		meanImages = new(big.Rat)
+	}
 	needsUsage := false
 	for _, key := range []string{"p", "c", "len", "cr", "cc", "cc1h", "cc12h", "img", "img_cr", "img_o", "ai", "ao"} {
 		needsUsage = needsUsage || used[key]
@@ -366,6 +392,7 @@ func meanPriceValue(ctx context.Context, tx *gorm.DB, price *PriceVersion, offer
 		// its source quantities; it must not inherit the delivered sale usage.
 		type usageSample struct {
 			usage   *dto.Usage
+			facts   GatewayUsage
 			choices int64
 			weight  *big.Rat
 		}
@@ -375,7 +402,15 @@ func meanPriceValue(ctx context.Context, tx *gorm.DB, price *PriceVersion, offer
 			if err := common.UnmarshalJsonStr(record.Settlement, &intent); err != nil {
 				return money.Value{}, 0, "", err
 			}
+			attempts := intent.Attempts
+			if intent.Attempt != nil {
+				attempts = []GatewayAttempt{*intent.Attempt}
+			}
 			choices := int64(max(intent.Request.ChoiceCount, 1))
+			if intent.Request.Usage.ImageCount != nil || slices.ContainsFunc(attempts, func(attempt GatewayAttempt) bool { return attempt.Usage.ImageCount != nil }) {
+				// Image quantities and output tokens describe the same request batch.
+				choices = 1
+			}
 			if price.OwnerType == PriceOwnerOffering {
 				usage := intent.SaleUsage
 				if usage == nil {
@@ -384,16 +419,12 @@ func meanPriceValue(ctx context.Context, tx *gorm.DB, price *PriceVersion, offer
 				if usage == nil && needsUsage {
 					return money.Value{}, len(records), "usage_details_unavailable", nil
 				}
-				if usage != nil {
-					usages = append(usages, usageSample{usage, choices, big.NewRat(1, 1)})
+				if usage != nil || used["image_count"] {
+					usages = append(usages, usageSample{usage, intent.Request.Usage, choices, big.NewRat(1, 1)})
 				}
 				continue
 			}
-			attempts := intent.Attempts
-			if intent.Attempt != nil {
-				attempts = []GatewayAttempt{*intent.Attempt}
-			}
-			if len(attempts) == 0 && needsUsage {
+			if len(attempts) == 0 && (needsUsage || used["image_count"]) {
 				return money.Value{}, len(records), "usage_details_unavailable", nil
 			}
 			for _, attempt := range attempts {
@@ -401,19 +432,34 @@ func meanPriceValue(ctx context.Context, tx *gorm.DB, price *PriceVersion, offer
 				if usage == nil {
 					usage = marginLegacyUsage(attempt.Usage, used)
 				}
-				if usage == nil {
-					if needsUsage {
-						return money.Value{}, len(records), "usage_details_unavailable", nil
-					}
+				if usage == nil && needsUsage {
+					return money.Value{}, len(records), "usage_details_unavailable", nil
+				}
+				if usage == nil && !used["image_count"] {
 					continue
 				}
 				// Weight each request once even if it needed several Attempts.
-				usages = append(usages, usageSample{usage, choices, big.NewRat(1, int64(len(attempts)))})
+				usages = append(usages, usageSample{usage, attempt.Usage, choices, big.NewRat(1, int64(len(attempts)))})
 			}
 		}
 		weight := new(big.Rat)
 		for _, sample := range usages {
-			normalized, err := billingexpr.MoneyTokenQuantities(sample.usage, used)
+			sampleUnknown := make(map[string]bool, len(sample.facts.UnmeasuredTokens))
+			for _, name := range sample.facts.UnmeasuredTokens {
+				sampleUnknown[name] = true
+			}
+			maps.Copy(unmeasured, billingexpr.NormalizeUnmeasuredOutputTokens(sampleUnknown, used))
+			if meanImages != nil {
+				count := sample.facts.ImageCount
+				if count == nil || *count < 0 || *count > dto.MaxImageN {
+					return money.Value{}, len(records), "usage_details_unavailable", nil
+				}
+				meanImages.Add(meanImages, new(big.Rat).Mul(big.NewRat(*count, 1), sample.weight))
+			}
+			normalized := map[string]decimal.Decimal{}
+			if sample.usage != nil {
+				normalized, err = billingexpr.MoneyTokenQuantities(sample.usage, used)
+			}
 			if err != nil {
 				return money.Value{}, 0, "", err
 			}
@@ -430,11 +476,17 @@ func meanPriceValue(ctx context.Context, tx *gorm.DB, price *PriceVersion, offer
 			weight.Add(weight, sample.weight)
 		}
 		if weight.Sign() > 0 {
+			if meanImages != nil {
+				meanImages.Quo(meanImages, weight)
+			}
 			for _, value := range quantities {
 				value.Quo(value, weight)
 			}
 			samples = len(records)
 		}
+	}
+	if samples == 0 && used["image_count"] {
+		return money.Value{}, 0, "no_usage_history", nil
 	}
 	if samples == 0 {
 		for key := range used {
@@ -444,7 +496,10 @@ func meanPriceValue(ctx context.Context, tx *gorm.DB, price *PriceVersion, offer
 			}
 		}
 	}
-	value, _, err := billingexpr.RunMoneyExpr(price.Expression, billingexpr.MoneyInput{RationalTokenQuantities: quantities, Time: at}, price.Currency)
+	value, trace, err := billingexpr.RunMoneyExpr(price.Expression, billingexpr.MoneyInput{RationalTokenQuantities: quantities, MeanImageCount: meanImages, Request: billingexpr.RequestInput{UnmeasuredTokens: unmeasured}, Time: at}, price.Currency)
+	if len(trace.UnmeasuredTokens) > 0 {
+		return money.Value{}, samples, "usage_details_unavailable", nil
+	}
 	if err != nil {
 		return money.Value{}, samples, "", err
 	}

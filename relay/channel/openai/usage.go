@@ -1,13 +1,281 @@
 package openai
 
 import (
+	"bytes"
+	"encoding/json"
+	"strings"
+
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 )
+
+// mediaUsageCounters bounds each reported quantity independently. A malformed
+// total or sibling cannot erase a valid base counter or explicit zero.
+func mediaUsageCounters(body []byte, depth int) map[string]any {
+	var fields map[string]json.RawMessage
+	if common.Unmarshal(body, &fields) != nil {
+		return nil
+	}
+	bounded := make(map[string]any, len(fields))
+	for name, raw := range fields {
+		if depth == 0 {
+			switch name {
+			case "prompt_tokens", "completion_tokens", "input_tokens", "output_tokens", "total_tokens", "prompt_cache_hit_tokens", "claude_cache_creation_5_m_tokens", "claude_cache_creation_1_h_tokens", "prompt_tokens_details", "completion_tokens_details", "input_token_details", "input_tokens_details", "output_tokens_details":
+			default:
+				continue
+			}
+		}
+		if strings.HasSuffix(name, "_details") && depth < 2 {
+			if nested := mediaUsageCounters(raw, depth+1); nested != nil {
+				bounded[name] = nested
+			}
+			continue
+		}
+		var count int64
+		if string(raw) != "null" && common.Unmarshal(raw, &count) == nil && count >= 0 && count <= 1<<31-1 {
+			bounded[name] = count
+		}
+	}
+	if depth == 0 {
+		if details, ok := bounded["input_token_details"]; ok {
+			bounded["input_tokens_details"] = details
+			delete(bounded, "input_token_details")
+		}
+	}
+	return bounded
+}
+
+func reportedMediaUsage(body []byte) *dto.Usage {
+	usage := &dto.Usage{}
+	var envelope struct {
+		Usage json.RawMessage `json:"usage"`
+	}
+	if common.Unmarshal(body, &envelope) != nil {
+		return usage
+	}
+	bounded := mediaUsageCounters(envelope.Usage, 0)
+	encoded, err := common.Marshal(bounded)
+	if err == nil {
+		_ = common.Unmarshal(encoded, usage)
+	}
+	normalizeOpenAIUsage(usage)
+	return usage
+}
+
+// mergeMediaTokenDetails preserves cumulative details omitted by later frames;
+// an explicitly reported zero still resets its own counter.
+func mergeMediaTokenDetails(usage *dto.Usage, body []byte) {
+	var envelope struct {
+		Usage json.RawMessage `json:"usage"`
+	}
+	if common.Unmarshal(body, &envelope) != nil {
+		return
+	}
+	fields := mediaUsageCounters(envelope.Usage, 0)
+	for _, alias := range []struct{ from, to string }{{"input_tokens_details", "prompt_tokens_details"}, {"output_tokens_details", "completion_tokens_details"}} {
+		if detail, ok := fields[alias.from]; ok {
+			fields[alias.to] = detail
+		}
+	}
+	for name := range fields {
+		if name != "prompt_tokens_details" && name != "completion_tokens_details" && name != "prompt_cache_hit_tokens" && name != "claude_cache_creation_5_m_tokens" && name != "claude_cache_creation_1_h_tokens" {
+			delete(fields, name)
+		}
+	}
+	encoded, err := common.Marshal(fields)
+	if err == nil {
+		_ = common.Unmarshal(encoded, usage)
+	}
+}
+
+// mediaResponseEnvelope retains independently complete classification and usage
+// fields from a truncated response, without treating them as a valid payload.
+func mediaResponseEnvelope(body []byte) []byte {
+	if ojson.ValidBytes(body) {
+		return body
+	}
+	recovered := map[string]common.RawMessage{}
+	for _, name := range []string{"usage", "error", "type", "code", "duration", "size", "quality"} {
+		raw := ojson.GetBytes(body, name)
+		if !raw.Exists() || !ojson.Valid(raw.Raw) {
+			continue
+		}
+		if raw.Type == ojson.Number {
+			end := raw.Index + len(raw.Raw)
+			if raw.Index < 0 || end > len(body) {
+				continue
+			}
+			tail := bytes.TrimLeft(body[end:], " \r\n\t")
+			if len(tail) == 0 || tail[0] != ',' && tail[0] != '}' {
+				continue
+			}
+		}
+		recovered[name] = common.RawMessage(raw.Raw)
+	}
+	if _, complete := recovered["usage"]; !complete {
+		// Query known leaves independently: an unfinished sibling must not
+		// discard a complete counter, but a number at EOF is still a prefix.
+		groups := map[string][]string{
+			"": {"prompt_tokens", "completion_tokens", "input_tokens", "output_tokens", "total_tokens", "prompt_cache_hit_tokens", "claude_cache_creation_5_m_tokens", "claude_cache_creation_1_h_tokens"},
+		}
+		for _, detail := range []string{"prompt_tokens_details", "input_token_details", "input_tokens_details", "completion_tokens_details", "output_tokens_details"} {
+			groups[detail] = []string{"cached_tokens", "cached_creation_tokens", "cache_write_tokens", "cache_creation_input_tokens", "text_tokens", "audio_tokens", "image_tokens", "reasoning_tokens", "accepted_prediction_tokens", "rejected_prediction_tokens"}
+			groups[detail+".cached_tokens_details"] = []string{"text_tokens", "audio_tokens", "image_tokens"}
+			groups[detail+".cache_write_tokens_details"] = []string{"ttl_30m_tokens", "ttl_12h_tokens"}
+		}
+		usage := ojson.NewDocString(`{}`)
+		for prefix, names := range groups {
+			for _, name := range names {
+				path := name
+				if prefix != "" {
+					path = prefix + "." + name
+				}
+				raw := ojson.GetBytes(body, "usage."+path)
+				if raw.Type != ojson.Number || raw.Index < 0 || raw.Index+len(raw.Raw) > len(body) {
+					continue
+				}
+				tail := bytes.TrimLeft(body[raw.Index+len(raw.Raw):], " \r\n\t")
+				if len(tail) == 0 || tail[0] != ',' && tail[0] != '}' {
+					continue
+				}
+				var count int64
+				if common.UnmarshalJsonStr(raw.Raw, &count) != nil || count < 0 || count > 1<<31-1 {
+					continue
+				}
+				if usage.Set(path, count) != nil {
+					continue
+				}
+			}
+		}
+		if usage.String() != `{}` {
+			recovered["usage"] = common.RawMessage(usage.String())
+		}
+	}
+	if len(recovered) > 0 || mediaJSONObjectPrefix(body) {
+		if encoded, err := common.Marshal(recovered); err == nil {
+			return encoded
+		}
+	}
+	return body
+}
+
+// observeMediaError keeps structured classification facts without copying a
+// Provider's message or other error details into downstream output or logs.
+func observeMediaError(info *relaycommon.RelayInfo, body []byte, status int, eventName ...string) *types.OpenAIError {
+	var envelope struct {
+		Type  json.RawMessage `json:"type"`
+		Code  json.RawMessage `json:"code"`
+		Error json.RawMessage `json:"error"`
+	}
+	if common.Unmarshal(body, &envelope) != nil {
+		return nil
+	}
+	var fault *types.OpenAIError
+	if len(envelope.Error) > 0 && string(envelope.Error) != "null" {
+		var nested struct {
+			Type json.RawMessage `json:"type"`
+			Code json.RawMessage `json:"code"`
+		}
+		if common.Unmarshal(envelope.Error, &nested) == nil {
+			var kind, code string
+			_ = common.Unmarshal(nested.Type, &kind)
+			_ = common.Unmarshal(nested.Code, &code)
+			fault = &types.OpenAIError{Type: kind, Code: code}
+		} else {
+			kind := "unknown_error"
+			var message string
+			if common.Unmarshal(envelope.Error, &message) == nil {
+				kind = "error"
+			}
+			fault = &types.OpenAIError{Type: kind}
+		}
+	} else {
+		var kind, code string
+		_ = common.Unmarshal(envelope.Type, &kind)
+		_ = common.Unmarshal(envelope.Code, &code)
+		if len(eventName) > 0 && strings.EqualFold(strings.TrimSpace(eventName[0]), "error") {
+			kind = "upstream_error"
+		}
+		switch strings.ToLower(strings.TrimSpace(kind)) {
+		case "error", "upstream_error":
+			fault = &types.OpenAIError{Type: kind, Code: code}
+		default:
+			return nil
+		}
+	}
+	if info.StreamStatus == nil {
+		info.StreamStatus = relaycommon.NewStreamStatus()
+	}
+	code, _ := fault.Code.(string)
+	info.StreamStatus.MarkFailed(code, fault.Type, status)
+	return fault
+}
+
+// mergeMediaStreamUsage retains independent counters across source frames,
+// including frames that cannot be delivered or are missing SSE termination.
+func mergeMediaStreamUsage(info *relaycommon.RelayInfo, usage *dto.Usage, body []byte) {
+	facts := mediaResponseEnvelope(body)
+	reported := reportedMediaUsage(facts)
+	prompt, completion := relaycommon.MediaUsagePresence(facts)
+	observeMediaUsage(info, reported, facts)
+	if prompt {
+		usage.PromptTokens = reported.PromptTokens
+	}
+	if completion {
+		usage.CompletionTokens = reported.CompletionTokens
+	}
+	mergeMediaTokenDetails(usage, facts)
+	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+}
+
+// observeMediaUsage preserves each reported counter, including explicit zero,
+// across OpenAI-compatible image and audio response envelopes.
+func observeMediaUsage(info *relaycommon.RelayInfo, usage *dto.Usage, body []byte) {
+	if info.ResponseFacts == nil || usage == nil {
+		return
+	}
+	for key, target := range map[string]*string{"size": &info.ResponseFacts.ImageOutputSize, "quality": &info.ResponseFacts.ImageOutputQuality} {
+		if value := ojson.GetBytes(body, key); value.Type == ojson.String && len(value.Str) <= 64 {
+			*target = value.Str
+		}
+	}
+	for _, prefix := range []string{"usage.input_token_details", "usage.input_tokens_details", "usage.prompt_tokens_details"} {
+		text, _ := relaycommon.NativeUsagePresence(body, prefix+".text_tokens", "", "")
+		audio, _ := relaycommon.NativeUsagePresence(body, prefix+".audio_tokens", "", "")
+		image, _ := relaycommon.NativeUsagePresence(body, prefix+".image_tokens", "", "")
+		info.ResponseFacts.ImageInputTokensReported = info.ResponseFacts.ImageInputTokensReported || image
+		info.ResponseFacts.TextInputTokensReported = info.ResponseFacts.TextInputTokensReported || text
+		info.ResponseFacts.AudioInputTokensReported = info.ResponseFacts.AudioInputTokensReported || audio
+	}
+	path := "usage.output_tokens_details.audio_tokens"
+	if raw := ojson.GetBytes(body, path).Raw; raw == "" || raw == "null" {
+		path = "usage.completion_tokens_details.audio_tokens"
+	}
+	if reported, _ := relaycommon.NativeUsagePresence(body, path, "", ""); reported {
+		info.ResponseFacts.AudioOutputTokensReported = true
+	}
+	for _, prefix := range []string{"usage.output_tokens_details", "usage.completion_tokens_details"} {
+		if reported, _ := relaycommon.NativeUsagePresence(body, prefix+".image_tokens", "", ""); reported {
+			info.ResponseFacts.ImageOutputTokensReported = true
+		}
+	}
+	prompt, completion := relaycommon.MediaUsagePresence(body)
+	if raw := ojson.GetBytes(body, "usage.input_tokens").Raw; prompt && raw != "" && raw != "null" {
+		usage.PromptTokens = usage.InputTokens
+	}
+	if raw := ojson.GetBytes(body, "usage.output_tokens").Raw; completion && raw != "" && raw != "null" {
+		usage.CompletionTokens = usage.OutputTokens
+	}
+	info.ResponseFacts.PromptTokensReported = info.ResponseFacts.PromptTokensReported || prompt
+	info.ResponseFacts.CompletionTokensReported = info.ResponseFacts.CompletionTokensReported || completion
+	info.ResponseFacts.UsageReported = info.ResponseFacts.PromptTokensReported && info.ResponseFacts.CompletionTokensReported
+}
 
 func applyProtocolUsagePostProcessing(c *gin.Context, info *relaycommon.RelayInfo, usage *dto.Usage, responseBody []byte) {
 	if !channel.RepairProviderUsage(c, usage, responseBody) {

@@ -18,16 +18,20 @@ import (
 // estimates; Provider extensions and raw response data never enter records.
 type GatewayUsage struct {
 	TaskFacts              map[string]any `json:"task_facts,omitempty"`
+	UnmeasuredTokens       []string       `json:"unmeasured_tokens,omitempty"`
 	PromptTokens           int64          `json:"prompt_tokens"`
 	CompletionTokens       int64          `json:"completion_tokens"`
 	TotalTokens            int64          `json:"total_tokens"`
 	CachedTokens           int64          `json:"cached_tokens,omitempty"`
 	CacheCreationTokens    int64          `json:"cache_creation_tokens,omitempty"`
 	CacheCreation12hTokens int64          `json:"cache_creation_12h_tokens,omitempty"`
-	ImageInputTokens       int64          `json:"image_input_tokens,omitempty"`
-	AudioInputTokens       int64          `json:"audio_input_tokens,omitempty"`
-	ImageOutputTokens      int64          `json:"image_output_tokens,omitempty"`
-	AudioOutputTokens      int64          `json:"audio_output_tokens,omitempty"`
+	ImageInputTokens       *int64         `json:"image_input_tokens,omitempty"`
+	AudioInputTokens       *int64         `json:"audio_input_tokens,omitempty"`
+	ImageOutputTokens      *int64         `json:"image_output_tokens,omitempty"`
+	AudioOutputTokens      *int64         `json:"audio_output_tokens,omitempty"`
+	ImageCount             *int64         `json:"image_count,omitempty"`
+	AudioInputSeconds      *string        `json:"audio_input_seconds,omitempty"`
+	AudioOutputSeconds     *string        `json:"audio_output_seconds,omitempty"`
 }
 
 type GatewayRequest struct {
@@ -379,13 +383,21 @@ func RecentOfferingOutputTokens(ctx context.Context, offeringID int, at int64) (
 		return 1024, nil
 	}
 	total := new(big.Rat)
+	samples := int64(0)
 	for _, record := range recent {
+		if slices.Contains(record.Usage.UnmeasuredTokens, "c") {
+			continue
+		}
 		if record.Usage.CompletionTokens < 0 || record.Usage.CompletionTokens > 1<<31-1 || record.ChoiceCount < 1 {
 			return 0, fmt.Errorf("invalid recorded output usage")
 		}
 		total.Add(total, big.NewRat(record.Usage.CompletionTokens, int64(record.ChoiceCount)))
+		samples++
 	}
-	mean := total.Quo(total, big.NewRat(int64(len(recent)), 1))
+	if samples == 0 {
+		return 1024, nil
+	}
+	mean := total.Quo(total, big.NewRat(samples, 1))
 	whole, remainder := new(big.Int), new(big.Int)
 	whole.QuoRem(mean.Num(), mean.Denom(), remainder)
 	if remainder.Sign() > 0 {

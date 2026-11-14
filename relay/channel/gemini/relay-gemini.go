@@ -552,11 +552,21 @@ func GeminiEmbeddingHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *h
 }
 
 func GeminiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+	defer resp.Body.Close()
 	responseBody, readErr := io.ReadAll(resp.Body)
+	if info.ResponseFacts != nil {
+		var data []dto.ImageData
+		for _, prediction := range ojson.GetBytes(responseBody, "predictions").Array() {
+			image := prediction.Get("bytesBase64Encoded")
+			if image.Type == ojson.String && image.Str != "" && prediction.Get("raiFilteredReason").Str == "" {
+				data = append(data, dto.ImageData{B64Json: image.Str})
+			}
+		}
+		openai.ObserveImageGeneration(info, data)
+	}
 	if readErr != nil {
 		return nil, types.NewOpenAIError(readErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
-	_ = resp.Body.Close()
 
 	var geminiResponse dto.GeminiImageResponse
 	if jsonErr := common.Unmarshal(responseBody, &geminiResponse); jsonErr != nil {
@@ -587,6 +597,9 @@ func GeminiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 		return nil, types.NewError(jsonErr, types.ErrorCodeBadResponseBody)
 	}
 
+	if info.ResponseFacts != nil {
+		return openai.WriteImageResponse(c, info, resp, jsonResponse)
+	}
 	c.Writer.Header().Set("Content-Type", "application/json")
 	c.Writer.WriteHeader(resp.StatusCode)
 	_, _ = c.Writer.Write(jsonResponse)

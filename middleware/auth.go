@@ -640,18 +640,19 @@ func LegacyTaskSubmissionAuth() gin.HandlerFunc {
 	}
 }
 
-// GatewayTokenAuth authenticates gateway and discovery requests before resolution.
-// A configured legacy fallback still checks quota before dispatch.
+// GatewayTokenAuth selects wallet credentials only for stateless text/media HTTP,
+// native realtime, and model discovery. A configured legacy fallback still checks quota before dispatch.
 func GatewayTokenAuth() func(c *gin.Context) {
 	return func(c *gin.Context) {
 		textProtocol, _ := TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
+		media := IsMediaGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
 		realtime := c.Request.Method == http.MethodGet && c.Request.URL.Path == "/v1/realtime"
-		if (textProtocol != "" || realtime) && c.GetTime(TextGatewayStartedAtKey).IsZero() {
+		if (textProtocol != "" || media || realtime) && c.GetTime(TextGatewayStartedAtKey).IsZero() {
 			// Freeze request-start prices before credential lookups.
 			c.Set(TextGatewayStartedAtKey, clock.Now())
 		}
 		discovery := c.Request.Method == http.MethodGet && (strings.HasPrefix(c.Request.URL.Path, "/v1/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/openai/models"))
-		tokenAuth(textProtocol != "" || discovery || realtime)(c)
+		tokenAuth(textProtocol != "" || media || discovery || realtime)(c)
 	}
 }
 

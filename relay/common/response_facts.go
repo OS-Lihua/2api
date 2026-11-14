@@ -1,8 +1,10 @@
 package common
 
 import (
+	"bytes"
 	"strings"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/capability"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -15,6 +17,19 @@ import (
 // zero remains authoritative even when the other counter needs estimation.
 func ChatUsagePresence(body []byte) (prompt, completion bool) {
 	return NativeUsagePresence(body, "usage.prompt_tokens", "usage.completion_tokens", "usage.total_tokens")
+}
+
+// MediaUsagePresence reports the OpenAI Images/audio counters independently.
+// Explicit zero is authoritative; malformed or out-of-range counters are absent.
+func MediaUsagePresence(body []byte) (prompt, completion bool) {
+	input, output := "usage.input_tokens", "usage.output_tokens"
+	if raw := ojson.GetBytes(body, input).Raw; raw == "" || raw == "null" {
+		input = "usage.prompt_tokens"
+	}
+	if raw := ojson.GetBytes(body, output).Raw; raw == "" || raw == "null" {
+		output = "usage.completion_tokens"
+	}
+	return NativeUsagePresence(body, input, output, "")
 }
 
 // RealtimeResponseFacts is transient evidence for one native response. The
@@ -100,24 +115,78 @@ type ResponseFacts struct {
 	GeneratedToolCalls       bool
 	GeneratedAudioBytes      int64
 	GeneratedText            string
-	SourceOutputDetails      dto.OutputTokenDetails
-	SourceGeneratedText      string `json:"-"`
-	SourceOutputObserved     bool   `json:"-"`
-	SourceOutputTokens       *int   `json:"-"`
-	GeneratedOutputTokens    *int
-	DeliveredOutputTokens    *int
-	DeliveredOutputDetails   dto.OutputTokenDetails
-	OutputLimitObserved      bool   `json:"-"`
-	UnterminatedStreamData   []byte `json:"-"`
-	UnterminatedStreamEvent  string `json:"-"`
-	UpstreamRetryAfter       string // Transient; only the parsed cooldown may enter records.
-	OnBusinessOutput         func()
-	CanFinishStream          func() bool `json:"-"`
-	UpstreamErrorCode        string
+	// ImageCount is the bounded payload count, including an empty response.
+	// Nil means that an actual count is not yet known.
+	ImageCount *int64
+	// Media duration strings are finite decimal quantities, never money.
+	AudioInputSeconds                  *string
+	AudioOutputSeconds                 *string
+	AudioOutputSampleRate              int
+	AudioOutputChannels                int
+	DeliveredAudioBytes                int64
+	DeliveredAudioSeconds              *string
+	GeneratedImageCount                int64
+	DeliveredImageCount                int64
+	AudioInputDurationReported         bool
+	AudioInputDurationInvalid          bool
+	AudioOutputDurationReported        bool
+	AudioOutputDurationInvalid         bool
+	AudioOutputTokensUnknown           bool
+	AudioOutputTokensDerived           bool
+	AudioOutputTokensReported          bool
+	AudioInputTokensEstimated          int
+	AudioInputTokensReported           bool
+	TextInputTokensReported            bool
+	TextInputTokensEstimated           int
+	ImageOutputEstimationStarted       bool
+	ImageOutputTokensEstimate          *int
+	DeliveredImageOutputTokensEstimate *int
+	ImageOutputTokensUnknown           bool
+	ImageOutputTokensEstimated         bool
+	ImageOutputSize                    string
+	ImageOutputQuality                 string
+	ImageInputTokensEstimated          int
+	ImageInputTokensReported           bool
+	ImageOutputTokensReported          bool
+	SourceOutputDetails                dto.OutputTokenDetails
+	SourceGeneratedText                string `json:"-"`
+	SourceOutputObserved               bool   `json:"-"`
+	SourceOutputTokens                 *int   `json:"-"`
+	GeneratedOutputTokens              *int
+	DeliveredOutputTokens              *int
+	DeliveredOutputDetails             dto.OutputTokenDetails
+	OutputLimitObserved                bool   `json:"-"`
+	UnterminatedStreamData             []byte `json:"-"`
+	UnterminatedStreamEvent            string `json:"-"`
+	UpstreamRetryAfter                 string // Transient; only the parsed cooldown may enter records.
+	OnBusinessOutput                   func()
+	CanFinishStream                    func() bool `json:"-"`
+	UpstreamErrorCode                  string
 	// StreamPrelude belongs only to this Attempt and is never persisted. Hold
 	// metadata until business output commits its protocol and loss headers.
 	StreamPrelude []byte              `json:"-"`
 	StreamHeaders map[string][]string `json:"-"`
+}
+
+// AudioPCMFrameBytes is the size of one complete signed 16-bit sample frame.
+func (facts *ResponseFacts) AudioPCMFrameBytes() int64 {
+	channels := int64(1)
+	if facts != nil && facts.AudioOutputChannels > 0 && facts.AudioOutputChannels <= 1<<31-1 {
+		channels = int64(facts.AudioOutputChannels)
+	}
+	return channels * 2
+}
+
+// AudioPCMBytesPerSecond uses the effective or reported signed 16-bit PCM
+// format. OpenAI's default remains mono 24 kHz when no format was supplied.
+func (facts *ResponseFacts) AudioPCMBytesPerSecond() int64 {
+	rate := int64(24000)
+	if facts != nil {
+		if facts.AudioOutputSampleRate > 0 && facts.AudioOutputSampleRate <= 1<<31-1 {
+			rate = int64(facts.AudioOutputSampleRate)
+		}
+	}
+	return rate * facts.AudioPCMFrameBytes()
 }
 
 // RecordChatSource retains generated facts when a native transport fails after
@@ -221,6 +290,66 @@ func SanitizeNativeUsage(body []byte, path string) []byte {
 	return body
 }
 
+// RecordTokenDetailPresence preserves independently valid modality reports,
+// including zero, without assigning presence to an absent detail.
+func (facts *ResponseFacts) RecordTokenDetailPresence(body []byte, usagePath string) {
+	if facts == nil {
+		return
+	}
+	if usagePath != "" {
+		usagePath += "."
+	}
+	for _, detail := range []struct {
+		path     string
+		reported *bool
+	}{
+		{"prompt_tokens_details.audio_tokens", &facts.AudioInputTokensReported},
+		{"input_tokens_details.audio_tokens", &facts.AudioInputTokensReported},
+		{"input_token_details.audio_tokens", &facts.AudioInputTokensReported},
+		{"prompt_tokens_details.image_tokens", &facts.ImageInputTokensReported},
+		{"input_tokens_details.image_tokens", &facts.ImageInputTokensReported},
+		{"input_token_details.image_tokens", &facts.ImageInputTokensReported},
+		{"completion_tokens_details.audio_tokens", &facts.AudioOutputTokensReported},
+		{"output_tokens_details.audio_tokens", &facts.AudioOutputTokensReported},
+		{"completion_tokens_details.image_tokens", &facts.ImageOutputTokensReported},
+		{"output_tokens_details.image_tokens", &facts.ImageOutputTokensReported},
+	} {
+		path := usagePath + detail.path
+		present, _ := NativeUsagePresence(body, path, "", "")
+		if present {
+			raw := ojson.GetBytes(body, path)
+			end := raw.Index + len(raw.Raw)
+			if raw.Index < 0 || end > len(body) {
+				continue
+			}
+			tail := bytes.TrimLeft(body[end:], " \r\n\t")
+			present = len(tail) > 0 && (tail[0] == ',' || tail[0] == '}')
+		}
+		*detail.reported = *detail.reported || present
+	}
+	for _, group := range []struct {
+		path         string
+		audio, image *bool
+	}{
+		{"promptTokensDetails", &facts.AudioInputTokensReported, &facts.ImageInputTokensReported},
+		{"candidatesTokensDetails", &facts.AudioOutputTokensReported, &facts.ImageOutputTokensReported},
+	} {
+		for _, detail := range ojson.GetBytes(body, usagePath+group.path).Array() {
+			var count int64
+			raw := detail.Get("tokenCount")
+			if raw.Type != ojson.Number || common.UnmarshalJsonStr(raw.Raw, &count) != nil || count < 0 || count > 1<<31-1 {
+				continue
+			}
+			switch detail.Get("modality").Str {
+			case "AUDIO":
+				*group.audio = true
+			case "IMAGE":
+				*group.image = true
+			}
+		}
+	}
+}
+
 // RecordUsage merges independently reported base counters, including explicit
 // zero. Missing or invalid fields cannot erase an earlier valid stream counter.
 func (facts *ResponseFacts) RecordUsage(usage, reported *dto.Usage, prompt, completion bool) {
@@ -244,6 +373,9 @@ func (facts *ResponseFacts) RecordUsage(usage, reported *dto.Usage, prompt, comp
 // RecordNativeUsage retains independently valid base counters before decoding
 // a provider envelope or reporting its transport error.
 func (facts *ResponseFacts) RecordNativeUsage(usage *dto.Usage, body []byte, promptPath, completionPath string) {
+	if index := strings.LastIndexByte(promptPath, '.'); index >= 0 {
+		facts.RecordTokenDetailPresence(body, promptPath[:index])
+	}
 	prompt, completion := NativeUsagePresence(body, promptPath, completionPath, "")
 	reported := dto.Usage{}
 	if prompt {

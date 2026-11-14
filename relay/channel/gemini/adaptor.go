@@ -66,6 +66,9 @@ func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayIn
 }
 
 func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.ImageRequest) (any, error) {
+	if info.ResponseFacts != nil && info.RelayMode == constant.RelayModeImagesEdits {
+		return nil, errors.New("Imagen generation does not support image editing")
+	}
 	if !strings.HasPrefix(info.UpstreamModelName, "imagen") {
 		return nil, errors.New("not supported model for image generation, only imagen models are supported")
 	}
@@ -128,6 +131,9 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 		geminiRequest.Parameters.ImageSize = imageSize
 	}
 
+	if info.ResponseFacts != nil {
+		return imagenRequest(geminiRequest), nil
+	}
 	return geminiRequest, nil
 }
 

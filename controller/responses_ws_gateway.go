@@ -499,7 +499,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	}
 	if usage != nil {
 		observedUsage = usage
-		attempt.Usage, attempt.UsageSource = service.GatewayRecordUsage(usage), "estimated"
+		attempt.Usage, attempt.UsageSource = service.GatewayRecordUsage(usage, info.ResponseFacts), "estimated"
 		if info.ResponseFacts.UsageReported && !info.ResponseFacts.UsageEstimated {
 			attempt.UsageSource = "upstream"
 		}
@@ -538,7 +538,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 				}
 			}
 			run.saleUsage = saleUsage
-			run.record.Usage, run.record.UsageSource = service.GatewayRecordUsage(saleUsage), saleUsageSource
+			run.record.Usage, run.record.UsageSource = service.GatewayRecordUsage(saleUsage, info.ResponseFacts), saleUsageSource
 			source, receivable, saleTrace, priceErr := service.GatewayPrice(run.sale, saleUsage, input, started, run.ratio, run.saleFX)
 			saleTrace.MatchedTier = ""
 			run.saleTrace = &saleTrace

@@ -27,7 +27,7 @@ func GetAudioDuration(ctx context.Context, f io.ReadSeeker, ext string) (duratio
 	case ".mp3":
 		duration, err = getMP3Duration(f)
 	case ".wav":
-		duration, err = getWAVDuration(f)
+		duration, err = wavDuration(f, true)
 	case ".flac":
 		duration, err = getFLACDuration(f)
 	case ".m4a", ".mp4":
@@ -72,67 +72,51 @@ func getMP3Duration(r io.Reader) (float64, error) {
 }
 
 // getWAVDuration 解析 WAV 文件头以获取时长。
-func getWAVDuration(r io.ReadSeeker) (float64, error) {
-	// 1. 强制复位指针
-	r.Seek(0, io.SeekStart)
+// WAVDuration measures complete frames present in the data chunk. Streaming
+// length placeholders use available bytes; declared sizes cannot invent frames.
+func WAVDuration(r io.ReadSeeker) (float64, error) { return wavDuration(r, false) }
 
+func wavDuration(r io.ReadSeeker, requireComplete bool) (float64, error) {
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return 0, err
+	}
 	dec := wav.NewDecoder(r)
-
-	// IsValidFile 会读取 fmt 块
 	if !dec.IsValidFile() {
 		return 0, errors.New("invalid wav file")
 	}
-
-	// 尝试寻找 data 块
 	if err := dec.FwdToPCM(); err != nil {
 		return 0, errors.Wrap(err, "failed to find PCM data chunk")
 	}
-
-	pcmSize := int64(dec.PCMSize)
-
-	// 如果读出来的 Size 是 0，尝试用文件大小反推
-	if pcmSize == 0 {
-		// 获取文件总大小
-		currentPos, _ := r.Seek(0, io.SeekCurrent) // 当前通常在 data chunk header 之后
-		endPos, _ := r.Seek(0, io.SeekEnd)
-		fileSize := endPos
-
-		// 恢复位置（虽然如果不继续读也没关系）
-		r.Seek(currentPos, io.SeekStart)
-
-		// 数据区大小 ≈ 文件总大小 - 当前指针位置(即Header大小)
-		// 注意：FwdToPCM 成功后，CurrentPos 应该刚好指向 Data 区数据的开始
-		// 或者是 Data Chunk ID + Size 之后。
-		// WAV Header 一般 44 字节。
-		if fileSize > 44 {
-			// 如果 FwdToPCM 成功，Reader 应该位于 data 块的数据起始处
-			// 所以剩余的所有字节理论上都是音频数据
-			pcmSize = fileSize - currentPos
-
-			// 简单的兜底：如果算出来还是负数或0，强制按文件大小-44计算
-			if pcmSize <= 0 {
-				pcmSize = fileSize - 44
-			}
-		}
+	start, err := r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, err
 	}
-
-	numChans := int64(dec.NumChans)
-	bitDepth := int64(dec.BitDepth)
-	sampleRate := float64(dec.SampleRate)
-
-	if sampleRate == 0 || numChans == 0 || bitDepth == 0 {
+	end, err := r.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := r.Seek(start, io.SeekStart); err != nil {
+		return 0, err
+	}
+	available := max(int64(0), end-start)
+	pcmSize := int64(dec.PCMSize)
+	if requireComplete && pcmSize != 0 && pcmSize != int64(^uint32(0)) && pcmSize > available {
+		return 0, io.ErrUnexpectedEOF
+	}
+	if pcmSize == 0 || pcmSize == int64(^uint32(0)) {
+		pcmSize = available
+	} else {
+		pcmSize = min(pcmSize, available)
+	}
+	channels, bits, sampleRate := int64(dec.NumChans), int64(dec.BitDepth), int64(dec.SampleRate)
+	if channels <= 0 || bits <= 0 || sampleRate <= 0 {
 		return 0, errors.New("invalid wav header metadata")
 	}
-
-	bytesPerFrame := numChans * (bitDepth / 8)
-	if bytesPerFrame == 0 {
+	bytesPerFrame := channels * (bits / 8)
+	if bytesPerFrame <= 0 {
 		return 0, errors.New("invalid byte depth calculation")
 	}
-
-	totalFrames := pcmSize / bytesPerFrame
-
-	durationSeconds := float64(totalFrames) / sampleRate
-	return durationSeconds, nil
+	return float64(pcmSize/bytesPerFrame) / float64(sampleRate), nil
 }
 
 // getFLACDuration 解析 FLAC 文件的 STREAMINFO 块。
