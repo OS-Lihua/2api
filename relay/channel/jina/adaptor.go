@@ -78,7 +78,9 @@ func (a *Protocol) ConvertRerankRequest(c *gin.Context, relayMode int, request d
 }
 
 func (a *Protocol) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.EmbeddingRequest) (any, error) {
-	request.EncodingFormat = ""
+	if info.ResponseFacts == nil || info.ResponseFacts.OnBusinessOutput == nil {
+		request.EncodingFormat = ""
+	}
 	return request, nil
 }
 

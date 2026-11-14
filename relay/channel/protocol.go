@@ -207,6 +207,9 @@ func (p *WireProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInf
 		return nil, fmt.Errorf("native protocol does not report gateway response facts")
 	}
 	managed := info.ResponseFacts != nil && info.ResponseFacts.OnBusinessOutput != nil
+	if managed && (p.Kind == protocol.OpenAIEmbeddings || p.Kind == protocol.GeminiEmbed || p.Kind == protocol.Rerank) && !p.PublicResponse && !p.ReportsGatewayFacts {
+		return nil, fmt.Errorf("native protocol does not report gateway response facts")
+	}
 	if !p.SupportsCrossProtocol && !(managed && p.Kind == protocol.OpenAIChat) {
 		format, err := ProtocolRelayFormat(p.Kind)
 		if err != nil {

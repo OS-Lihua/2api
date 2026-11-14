@@ -98,11 +98,14 @@ type RelayInfo struct {
 	//SendLastReasoningResponse bool
 	IsStream               bool
 	IsGeminiBatchEmbedding bool
-	IsPlayground           bool
-	UsePrice               bool
-	RelayMode              int
-	OriginModelName        string
-	ResponseModel          *ResponseModel
+	// EmbeddingDimensions has one entry per effective input; nil entries allow
+	// the Provider's default vector dimension. Empty means no request expectation.
+	EmbeddingDimensions []*int `json:"-"`
+	IsPlayground        bool
+	UsePrice            bool
+	RelayMode           int
+	OriginModelName     string
+	ResponseModel       *ResponseModel
 
 	// BillingModelName is the pricing identity for this request. It is kept
 	// separate from OriginModelName and UpstreamModelName so virtual pricing
