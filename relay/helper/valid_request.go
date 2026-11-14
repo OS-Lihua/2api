@@ -92,6 +92,9 @@ func GetAndValidateRerankRequest(c *gin.Context) (*dto.RerankRequest, error) {
 		return nil, types.NewError(err, types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
 	}
 
+	if rerankRequest == nil {
+		return nil, errors.New("request is required")
+	}
 	if rerankRequest.Query == "" {
 		return nil, types.NewError(fmt.Errorf("query is empty"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
 	}
@@ -109,7 +112,7 @@ func GetAndValidateEmbeddingRequest(c *gin.Context, relayMode int) (*dto.Embeddi
 		return nil, types.NewError(err, types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
 	}
 
-	if embeddingRequest.Input == nil {
+	if embeddingRequest == nil || embeddingRequest.Input == nil {
 		return nil, fmt.Errorf("input is empty")
 	}
 	if relayMode == relayconstant.RelayModeModerations && embeddingRequest.Model == "" {
