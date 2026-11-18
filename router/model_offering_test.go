@@ -79,7 +79,42 @@ func TestModelOfferingAPI(t *testing.T) {
 	require.Equal(t, http.StatusOK, status, response)
 	assert.Equal(t, data, response["data"])
 
+	t.Run("legacy missing-model discovery is retired without reading routing sources", func(t *testing.T) {
+		legacy := model.Ability{Group: "default", Model: "retired-unbound-model", ChannelId: 987654, Enabled: true}
+		require.NoError(t, db.Create(&legacy).Error)
+		t.Cleanup(func() { require.NoError(t, db.Delete(&legacy).Error) })
+		request := httptest.NewRequest(http.MethodGet, "/api/models/missing", nil)
+		request.Header.Set("Authorization", "Bearer "+token)
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, request)
+		assert.Equal(t, http.StatusGone, recorder.Code)
+		assert.Equal(t, "no-store", recorder.Header().Get("Cache-Control"))
+		response := map[string]any{}
+		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+		assert.Equal(t, false, response["success"])
+		assert.Equal(t, "legacy_missing_models_retired", response["code"])
+		assert.NotContains(t, recorder.Body.String(), legacy.Model)
+		var preserved model.Ability
+		require.NoError(t, db.Where("channel_id = ?", legacy.ChannelId).First(&preserved).Error)
+		assert.Equal(t, legacy.Model, preserved.Model)
+		assert.True(t, preserved.Enabled, "retiring discovery must preserve the offline migration source")
+	})
+
 	t.Run("metadata sync preserves offering members without Channels", func(t *testing.T) {
+		legacy := []model.Ability{
+			{Group: "default", Model: "obsolete-ability-only", ChannelId: 987655, Enabled: true},
+			{Group: "default", Model: "catalog-only", ChannelId: 987655, Enabled: true},
+		}
+		require.NoError(t, db.Create(&legacy).Error)
+		t.Cleanup(func() { require.NoError(t, db.Where("channel_id = ?", 987655).Delete(&model.Ability{}).Error) })
+		abilityReads := 0
+		const queryGuard = "metadata_sync_without_legacy_routing"
+		require.NoError(t, db.Callback().Query().Before("gorm:query").Register(queryGuard, func(tx *gorm.DB) {
+			if tx.Statement.Table == "abilities" {
+				abilityReads++
+			}
+		}))
+		t.Cleanup(func() { require.NoError(t, db.Callback().Query().Remove(queryGuard)) })
 		status, response := call(http.MethodPost, "/api/admin/v1/models", fmt.Sprintf(`{"name":"sync-member","publisher_id":%d,"description":"Local description","sync_official":1,"capabilities":{"features":["streaming"],"input_modalities":["text"],"output_modalities":["text"]}}`, publisher.Id))
 		require.Equal(t, http.StatusOK, status, response)
 		member := response["data"].(map[string]any)
@@ -105,7 +140,7 @@ func TestModelOfferingAPI(t *testing.T) {
 				_, _ = w.Write([]byte(`[]`))
 				return
 			}
-			_, _ = w.Write([]byte(`[{"model_name":"sync-companion","description":"Must roll back","name_rule":0,"status":1},{"model_name":"sync-member","description":"Synced description","name_rule":1,"status":1,"tags":"synced"}]`))
+			_, _ = w.Write([]byte(`[{"model_name":"sync-companion","description":"Must roll back","name_rule":0,"status":1},{"model_name":"sync-member","description":"Synced description","name_rule":1,"status":1,"tags":"synced"},{"model_name":"catalog-only","description":"Available metadata","name_rule":0,"status":1}]`))
 		}))
 		defer upstream.Close()
 		t.Setenv("SYNC_UPSTREAM_BASE", upstream.URL)
@@ -115,12 +150,20 @@ func TestModelOfferingAPI(t *testing.T) {
 		require.Equal(t, true, response["success"], response)
 		preview := response["data"].(map[string]any)
 		versions := make(map[string]string)
+		scopes := make(map[string]string)
 		for _, item := range preview["candidates"].([]any) {
 			candidate := item.(map[string]any)
-			versions[candidate["model_name"].(string)] = candidate["record_version"].(string)
+			name := candidate["model_name"].(string)
+			versions[name] = candidate["record_version"].(string)
+			scopes[name] = candidate["scope"].(string)
 		}
 		require.NotEmpty(t, versions["sync-member"])
 		require.NotEmpty(t, versions["sync-companion"])
+		assert.NotContains(t, scopes, "obsolete-ability-only", "legacy routing names are not configured Models")
+		assert.Equal(t, "site", scopes["sync-member"])
+		assert.Equal(t, "site", scopes["sync-companion"])
+		assert.Equal(t, "catalog", scopes["catalog-only"], "upstream metadata must remain available without pretending it is configured")
+		assert.Zero(t, abilityReads, "metadata sync must work independently of retired routing storage")
 		selection := model.MetadataSyncSelection{ModelName: "sync-member", RecordVersion: versions["sync-member"], Fields: []string{"name_rule", "description", "tags"}}
 		request := map[string]any{"locale": "en", "source_version": preview["source"].(map[string]any)["version"], "selections": []model.MetadataSyncSelection{
 			{ModelName: "sync-companion", RecordVersion: versions["sync-companion"], Fields: []string{"description"}},

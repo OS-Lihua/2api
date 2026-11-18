@@ -21,7 +21,10 @@ import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { DataTablePage, useDataTable } from '@/components/data-table'
+import { ErrorState } from '@/components/error-state'
+import { ROLE } from '@/lib/roles'
 import { requireServerSuccess } from '@/lib/server-error-message'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { getAdminPlans } from '../api'
 import { useSubscriptionsColumns } from './subscriptions-columns'
@@ -32,13 +35,24 @@ export function SubscriptionsTable() {
   const columns = useSubscriptionsColumns()
   const { refreshTrigger } = useSubscriptions()
 
-  const { data, isLoading } = useQuery({
-    queryKey: ['admin-subscription-plans', refreshTrigger],
-    queryFn: async () => {
-      const result = requireServerSuccess(await getAdminPlans())
+  const actor = useAuthStore((state) => state.auth.user)
+  const sid = useAuthStore((state) => state.auth.session?.sid)
+  const allowed = !!actor && actor.role >= ROLE.ADMIN
+  const { data, isLoading, isError, refetch } = useQuery({
+    queryKey: [
+      'admin-subscription-plans',
+      actor?.id,
+      sid,
+      allowed,
+      refreshTrigger,
+    ],
+    enabled: allowed,
+    queryFn: async ({ signal }) => {
+      const result = requireServerSuccess(await getAdminPlans(signal))
       return result.data || []
     },
-    placeholderData: (prev) => prev,
+    retry: false,
+    gcTime: 0,
   })
 
   const plans = useMemo(() => data || [], [data])
@@ -50,6 +64,8 @@ export function SubscriptionsTable() {
     withFacetedRowModel: false,
   })
 
+  if (!allowed) return <ErrorState description={t('Permission denied')} />
+  if (isError) return <ErrorState onRetry={() => void refetch()} />
   return (
     <DataTablePage
       table={table}

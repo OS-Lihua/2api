@@ -16,30 +16,44 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { zodResolver } from '@hookform/resolvers/zod'
 import { Bell, Loader2, Mail, Server, Webhook } from 'lucide-react'
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
+import { ErrorState } from '@/components/error-state'
 import { PasswordInput } from '@/components/password-input'
 import { Button } from '@/components/ui/button'
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Switch } from '@/components/ui/switch'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import {
   SettingsControlChildren,
   SettingsControlGroup,
   SettingsSwitchField,
 } from '@/features/system-settings/components/settings-form-layout'
-import { getCurrencyDisplay, getCurrencyLabel } from '@/lib/currency'
+import { toIntlLocale } from '@/i18n/languages'
 import {
-  formatQuota,
-  parseQuotaFromDollars,
-  quotaUnitsToDollars,
-} from '@/lib/format'
+  balanceReminderDraftSchema,
+  balanceReminderFromDraft,
+  userBalanceReminderSchema,
+  type BalanceReminderDraft,
+  type UserBalanceReminder,
+} from '@/lib/balance-reminder'
+import { formatMoneyAmount, moneyAmountToDecimal } from '@/lib/currency'
 import { handleServerError } from '@/lib/handle-server-error'
 import { ROLE } from '@/lib/roles'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { updateUserSettings } from '../../api'
 import { NOTIFICATION_METHODS } from '../../constants'
@@ -60,25 +74,74 @@ const NOTIFICATION_ICONS: Record<NotifyType, typeof Mail> = {
 interface NotificationTabProps {
   profile: UserProfile | null
   onUpdate: () => void
-  /** Whether the site sends low balance reminders at all */
-  quotaRemindEnabled: boolean
-  /** The site default reminder threshold, in quota units */
-  quotaRemindThreshold: number
 }
 
-export function NotificationTab({
+export function NotificationTab(props: NotificationTabProps) {
+  const { t } = useTranslation()
+  const actorID = useAuthStore((state) => state.auth.user?.id)
+  const sessionID = useAuthStore((state) => state.auth.session?.sid)
+  const result = userBalanceReminderSchema.safeParse(
+    props.profile?.balance_reminder
+  )
+  if (
+    !props.profile ||
+    !result.success ||
+    (actorID !== undefined && actorID !== props.profile.id)
+  ) {
+    return (
+      <ErrorState
+        description={t('Invalid balance reminder configuration')}
+        onRetry={props.onUpdate}
+      />
+    )
+  }
+  return (
+    <NotificationSettingsForm
+      key={`${props.profile.id}:${actorID}:${sessionID}:${JSON.stringify(result.data)}`}
+      {...props}
+      profile={props.profile}
+      reminder={result.data}
+    />
+  )
+}
+
+function NotificationSettingsForm({
   profile,
   onUpdate,
-  quotaRemindEnabled,
-  quotaRemindThreshold,
-}: NotificationTabProps) {
-  const { t } = useTranslation()
-  const role = profile?.role ?? 0
+  reminder,
+}: NotificationTabProps & {
+  profile: UserProfile
+  reminder: UserBalanceReminder
+}) {
+  const { t, i18n } = useTranslation()
+  const role = profile.role
   const isAdmin = role >= ROLE.ADMIN
+  const actorID = useAuthStore((state) => state.auth.user?.id)
+  const sessionID = useAuthStore((state) => state.auth.session?.sid)
+  const active = useRef(true)
+  const request = useRef<AbortController | null>(null)
   const [loading, setLoading] = useState(false)
-  const [settings, setSettings] = useState(() => normalizeUserSettings())
-  const [thresholdInput, setThresholdInput] = useState('')
-
+  const [settings, setSettings] = useState(() =>
+    normalizeUserSettings(profile.setting)
+  )
+  const form = useForm<BalanceReminderDraft>({
+    resolver: zodResolver(balanceReminderDraftSchema),
+    defaultValues: {
+      enabled: reminder.enabled,
+      inherit: reminder.threshold === null,
+      amount: reminder.threshold
+        ? moneyAmountToDecimal(reminder.threshold)
+        : '',
+      currency: reminder.effective_threshold.currency,
+    },
+  })
+  useEffect(() => {
+    active.current = true
+    return () => {
+      active.current = false
+      request.current?.abort()
+    }
+  }, [])
   // Update form field helper
   const updateField = useCallback(
     <K extends keyof typeof settings>(
@@ -90,61 +153,62 @@ export function NotificationTab({
     []
   )
 
-  useEffect(() => {
-    if (profile?.setting) {
-      const next = normalizeUserSettings(profile.setting)
-      setSettings(next)
-      // 0 means the site default and shows as an empty input.
-      setThresholdInput(
-        next.quota_warning_threshold
-          ? String(quotaUnitsToDollars(next.quota_warning_threshold))
-          : ''
+  const handleSave = async (values: BalanceReminderDraft) => {
+    const isCurrent = () => {
+      const auth = useAuthStore.getState().auth
+      return (
+        active.current &&
+        auth.user?.id === actorID &&
+        auth.session?.sid === sessionID
       )
     }
-  }, [profile])
-
-  const handleSave = async () => {
+    if (loading || !isCurrent()) return
+    const controller = new AbortController()
+    request.current = controller
     try {
       setLoading(true)
       const { record_ip_log: _recordIpLog, ...notificationSettings } = settings
-      const response = await updateUserSettings(notificationSettings)
-
+      const response = await updateUserSettings(
+        {
+          ...notificationSettings,
+          balance_reminder: balanceReminderFromDraft(values),
+        },
+        controller.signal
+      )
+      if (!isCurrent()) return
       if (response.success) {
+        form.reset(values)
         toast.success(t('Settings updated successfully'))
         onUpdate()
       } else {
         handleServerError(response, t('Failed to update settings'))
       }
     } catch (error) {
-      handleServerError(error, t('Failed to update settings'))
+      if (isCurrent()) handleServerError(error, t('Failed to update settings'))
     } finally {
-      setLoading(false)
+      if (isCurrent()) setLoading(false)
     }
   }
 
   const notifyType = settings.notify_type
-  // Switches the user never chose: reminders stay on, and root alone gets
-  // channel notifications.
-  const quotaWarningEnabled = settings.quota_warning_enabled ?? true
   const channelNotifyEnabled =
     settings.channel_notify_enabled ?? role >= ROLE.SUPER_ADMIN
-  const tokensOnly = getCurrencyDisplay().meta.kind === 'tokens'
+  const inherit = form.watch('inherit')
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
 
   return (
-    <div className='space-y-4 sm:space-y-6'>
-      {!quotaRemindEnabled && !isAdmin && (
-        <p className='text-muted-foreground text-sm'>
-          {t('No notifications are available to you right now')}
-        </p>
-      )}
-
-      {(quotaRemindEnabled || isAdmin) && (
-        <>
+    <Form {...form}>
+      <form
+        className='min-w-0 space-y-4 sm:space-y-6'
+        onSubmit={form.handleSubmit(handleSave)}
+      >
+        <fieldset disabled={loading} className='min-w-0 space-y-4 sm:space-y-6'>
           {/* Notification Type */}
           <div className='space-y-2.5'>
             <Label>{t('Notification Method')}</Label>
             <ToggleGroup
               value={[notifyType]}
+              disabled={loading}
               onValueChange={(value) => {
                 const nextValue = value.find((item) => item !== notifyType)
                 if (nextValue) {
@@ -323,58 +387,79 @@ export function NotificationTab({
               {t('Notifications to receive')}
             </h4>
             <SettingsControlGroup>
-              {quotaRemindEnabled && (
-                <>
+              <FormField
+                control={form.control}
+                name='enabled'
+                render={({ field }) => (
                   <SettingsSwitchField
-                    controlId='quotaWarningEnabled'
+                    controlId='balanceReminderEnabled'
                     label={t('Low balance reminder')}
                     description={t(
                       'Remind me once when my balance drops below the threshold'
                     )}
-                    checked={quotaWarningEnabled}
-                    onCheckedChange={(checked) =>
-                      updateField('quota_warning_enabled', checked)
-                    }
+                    checked={field.value}
+                    onCheckedChange={field.onChange}
+                    disabled={loading}
                   />
-                  {quotaWarningEnabled && (
-                    <SettingsControlChildren className='space-y-1.5 pb-1'>
-                      <Label htmlFor='threshold'>
-                        {t('Reminder threshold')} ({getCurrencyLabel()})
-                      </Label>
-                      <Input
-                        id='threshold'
-                        type='number'
-                        className='h-9'
-                        min={0}
-                        step={tokensOnly ? 1 : 0.000001}
-                        value={thresholdInput}
-                        onChange={(e) => {
-                          const value = e.target.value
-                          setThresholdInput(value)
-                          updateField(
-                            'quota_warning_threshold',
-                            value.trim() === ''
-                              ? 0
-                              : parseQuotaFromDollars(Number(value))
-                          )
-                        }}
-                        placeholder={String(
-                          quotaUnitsToDollars(quotaRemindThreshold)
-                        )}
-                      />
-                      <p className='text-muted-foreground text-xs'>
-                        {t('Leave empty to use the site default ({{amount}})', {
-                          amount: formatQuota(quotaRemindThreshold),
-                        })}
-                      </p>
-                    </SettingsControlChildren>
+                )}
+              />
+              <SettingsControlChildren className='space-y-3 pb-1'>
+                <FormField
+                  control={form.control}
+                  name='inherit'
+                  render={({ field }) => (
+                    <SettingsSwitchField
+                      controlId='balanceReminderInherit'
+                      label={t('Use site reminder threshold')}
+                      checked={field.value}
+                      onCheckedChange={field.onChange}
+                      disabled={loading}
+                    />
                   )}
-                </>
-              )}
+                />
+                {!inherit && (
+                  <FormField
+                    control={form.control}
+                    name='amount'
+                    render={({ field }) => (
+                      <FormItem className='min-w-0 grid-cols-1'>
+                        <FormLabel>
+                          {t('Reminder threshold')} (
+                          {reminder.effective_threshold.currency})
+                        </FormLabel>
+                        <FormControl>
+                          <Input
+                            {...field}
+                            type='text'
+                            inputMode='decimal'
+                            disabled={loading}
+                            className='min-w-0'
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                )}
+                <p className='text-muted-foreground text-xs wrap-anywhere'>
+                  {t(
+                    'An explicit zero does not inherit the site threshold. Amounts use the settlement currency without conversion.'
+                  )}
+                </p>
+                <p className='text-muted-foreground text-xs wrap-anywhere'>
+                  {t('Saved effective threshold')}:{' '}
+                  {formatMoneyAmount(reminder.effective_threshold, locale)}
+                </p>
+                <p className='text-muted-foreground text-xs'>
+                  {t('Saved reminder status')}:{' '}
+                  {reminder.effective_enabled ? t('Enabled') : t('Disabled')}
+                </p>
+              </SettingsControlChildren>
               {isAdmin && (
                 <>
                   <SettingsSwitchField
                     controlId='channelNotify'
+                    disabled={loading}
                     label={t('Channel notifications')}
                     description={t(
                       'When a channel is disabled or re-enabled automatically, or a test of all channels finishes'
@@ -386,6 +471,7 @@ export function NotificationTab({
                   />
                   <SettingsSwitchField
                     controlId='upstreamModelUpdateNotify'
+                    disabled={loading}
                     label={t('Upstream Model Updates')}
                     description={t(
                       'Only available for admins. When enabled, you will receive a summary notification via your selected method when the scheduled model check detects upstream model changes or check failures.'
@@ -402,49 +488,16 @@ export function NotificationTab({
               )}
             </SettingsControlGroup>
           </div>
-        </>
-      )}
+        </fieldset>
 
-      {/* Divider */}
-      <div className='border-t' />
-
-      {/* Preferences Section */}
-      <div className='space-y-3'>
-        <div>
-          <h4 className='text-sm font-medium'>{t('Preferences')}</h4>
-          <p className='text-muted-foreground mt-1 text-xs'>
-            {t('Configure your account behavior preferences')}
-          </p>
+        {/* Save Button */}
+        <div className='flex justify-end'>
+          <Button type='submit' disabled={loading}>
+            {loading && <Loader2 className='mr-2 h-4 w-4 animate-spin' />}
+            {loading ? t('Saving...') : t('Save Settings')}
+          </Button>
         </div>
-
-        {/* Accept Unset Model Price */}
-        <div className='flex items-start justify-between gap-3 rounded-lg border p-3 sm:items-center sm:p-4'>
-          <div className='space-y-0.5'>
-            <Label htmlFor='acceptUnsetPrice'>
-              {t('Accept Unpriced Models')}
-            </Label>
-            <p className='text-muted-foreground text-xs sm:text-sm'>
-              {t('Allow using models without price configuration')}
-            </p>
-          </div>
-          <Switch
-            id='acceptUnsetPrice'
-            className='shrink-0'
-            checked={settings.accept_unset_model_ratio_model}
-            onCheckedChange={(checked) =>
-              updateField('accept_unset_model_ratio_model', checked)
-            }
-          />
-        </div>
-      </div>
-
-      {/* Save Button */}
-      <div className='flex justify-end'>
-        <Button onClick={handleSave} disabled={loading}>
-          {loading && <Loader2 className='mr-2 h-4 w-4 animate-spin' />}
-          {loading ? t('Saving...') : t('Save Settings')}
-        </Button>
-      </div>
-    </div>
+      </form>
+    </Form>
   )
 }

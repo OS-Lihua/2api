@@ -10,6 +10,9 @@ import (
 )
 
 func (p *Provider) ComposeProtocol(kind protocol.Type, generic channel.ProtocolHandler) (channel.ProtocolHandler, error) {
+	if kind == protocol.AlphaSearch || kind == protocol.DeepSeekTools || kind == protocol.OpenAIModerations {
+		return generic, nil
+	}
 	if kind == protocol.GeminiEmbed || kind == protocol.OpenAIRealtime {
 		return generic, nil
 	}

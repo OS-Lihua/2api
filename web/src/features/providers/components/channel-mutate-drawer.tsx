@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 
@@ -61,8 +61,14 @@ import {
   getServerErrorMessage,
   requireServerSuccess,
 } from '@/lib/server-error-message'
+import { useAuthStore } from '@/stores/auth-store'
 
 import {
+  assertChannelAccess,
+  channelAccessScope,
+  channelScopeKey,
+  isChannelScopeCurrent,
+  type ChannelAccessScope,
   findChannelModels,
   saveSingleModelChannel,
   suggestChannelModels,
@@ -70,13 +76,42 @@ import {
 } from '../channel-api'
 import { channelFormSchema, type ChannelFormValues } from '../lib/channel-form'
 
-export function ChannelMutateDrawer(props: {
+type ChannelMutateProps = {
   providerId: number
   channel?: SingleModelChannel
   onClose: () => void
   onSaved: () => void
-}) {
+}
+export function ChannelMutateDrawer(props: ChannelMutateProps) {
+  useAuthStore((state) => state.auth.user)
+  useAuthStore((state) => state.auth.session?.sid)
+  const scope = channelAccessScope()
+  return (
+    <ScopedChannelMutate
+      key={JSON.stringify([
+        channelScopeKey(scope),
+        props.providerId,
+        props.channel?.id,
+      ])}
+      {...props}
+      scope={scope}
+    />
+  )
+}
+function ScopedChannelMutate(
+  props: ChannelMutateProps & { scope: ChannelAccessScope }
+) {
   const { t } = useTranslation()
+  const active = useRef(true)
+  const suggestController = useRef<AbortController | null>(null)
+  useEffect(() => {
+    active.current = true
+    return () => {
+      active.current = false
+      suggestController.current?.abort()
+    }
+  }, [])
+  const current = () => active.current && isChannelScopeCurrent(props.scope)
   const [keyword, setKeyword] = useState('')
   const filter = useDebounce(keyword, 300)
   const form = useForm<ChannelFormValues>({
@@ -100,22 +135,63 @@ export function ChannelMutateDrawer(props: {
     },
   })
   const models = useQuery({
-    queryKey: ['channel-model-options', filter],
-    queryFn: () => findChannelModels(filter),
+    queryKey: [
+      'channel-model-options',
+      ...channelScopeKey(props.scope),
+      props.providerId,
+      props.channel?.id,
+      filter,
+    ],
+    queryFn: async ({ signal }) => {
+      assertChannelAccess(props.scope, 'read', signal)
+      const result = await findChannelModels(filter, signal)
+      assertChannelAccess(props.scope, 'read', signal)
+      return result
+    },
+    enabled: props.scope.read && props.scope.write && props.scope.modelRead,
+    retry: false,
+    gcTime: 0,
   })
   const protocols = useQuery({
-    queryKey: ['channel-protocols'],
-    queryFn: async () => {
-      const response = await api.get('/api/admin/v1/channels/protocols')
+    queryKey: [
+      'channel-protocols',
+      ...channelScopeKey(props.scope),
+      props.providerId,
+      props.channel?.id,
+    ],
+    queryFn: async ({ signal }) => {
+      assertChannelAccess(props.scope, 'read', signal)
+      const response = await api.get('/api/admin/v1/channels/protocols', {
+        signal,
+      })
+      assertChannelAccess(props.scope, 'read', signal)
       return requireServerSuccess<{ success: boolean; data: string[] }>(
         response.data
       ).data
     },
+    enabled: props.scope.read && props.scope.write,
+    retry: false,
+    gcTime: 0,
   })
   const suggest = useMutation({
-    mutationFn: () =>
-      suggestChannelModels(form.getValues('upstream_model_name')),
+    meta: { errorToast: false },
+    mutationFn: async () => {
+      assertChannelAccess(props.scope, 'write')
+      if (!current() || !props.scope.modelRead) {
+        throw new Error('Channel access changed')
+      }
+      suggestController.current?.abort()
+      const controller = new AbortController()
+      suggestController.current = controller
+      const result = await suggestChannelModels(
+        form.getValues('upstream_model_name'),
+        controller.signal
+      )
+      assertChannelAccess(props.scope, 'write', controller.signal)
+      return result
+    },
     onSuccess: (result) => {
+      if (!current()) return
       if (result.selected_model_id !== null) {
         form.setValue('model_id', String(result.selected_model_id), {
           shouldDirty: true,
@@ -126,6 +202,8 @@ export function ChannelMutateDrawer(props: {
   const save = useMutation({
     meta: { errorToast: false },
     mutationFn: async (values: ChannelFormValues) => {
+      assertChannelAccess(props.scope, 'write')
+      if (!current()) throw new Error('Channel access changed')
       await saveSingleModelChannel(props.channel?.id, {
         provider_id: props.providerId,
         model_id: Number(values.model_id),
@@ -142,11 +220,15 @@ export function ChannelMutateDrawer(props: {
             : JSON.parse(values.capabilities),
       })
     },
-    onSuccess: props.onSaved,
-    onError: (error) =>
+    onSuccess: () => {
+      if (current()) props.onSaved()
+    },
+    onError: (error) => {
+      if (!current()) return
       form.setError('root.server', {
         message: getServerErrorMessage(error, t('Operation failed')),
-      }),
+      })
+    },
   })
   const modelOptions = (models.data?.items ?? []).map((model) => ({
     value: String(model.id),
@@ -163,6 +245,9 @@ export function ChannelMutateDrawer(props: {
     value,
     label: value,
   }))
+  if (!props.scope.read || !props.scope.write) {
+    return <p role='status'>{t('Insufficient permissions')}</p>
+  }
   return (
     <Sheet
       open
@@ -204,7 +289,9 @@ export function ChannelMutateDrawer(props: {
                   type='button'
                   variant='outline'
                   disabled={
-                    suggest.isPending || !form.watch('upstream_model_name')
+                    !props.scope.modelRead ||
+                    suggest.isPending ||
+                    !form.watch('upstream_model_name')
                   }
                   onClick={() => suggest.mutate()}
                 >
@@ -255,26 +342,46 @@ export function ChannelMutateDrawer(props: {
                   control={form.control}
                   name='model_id'
                   render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>{t('Model')}</FormLabel>
-                      <Select
-                        items={modelOptions}
-                        value={field.value}
-                        onValueChange={field.onChange}
-                      >
+                    <FormItem className='min-w-0 grid-cols-1'>
+                      <FormLabel>
+                        {t(props.scope.modelRead ? 'Model' : 'Model ID')}
+                      </FormLabel>
+                      {!props.scope.modelRead ? (
                         <FormControl>
-                          <SelectTrigger className='w-full'>
-                            <SelectValue />
-                          </SelectTrigger>
+                          <Input {...field} inputMode='numeric' />
                         </FormControl>
-                        <SelectContent>
-                          {modelOptions.map((option) => (
-                            <SelectItem key={option.value} value={option.value}>
-                              {option.label}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
+                      ) : (
+                        <Select
+                          items={modelOptions}
+                          value={field.value}
+                          onValueChange={field.onChange}
+                        >
+                          <FormControl>
+                            <SelectTrigger
+                              className='w-full min-w-0'
+                              title={
+                                modelOptions.find(
+                                  (option) => option.value === field.value
+                                )?.label
+                              }
+                            >
+                              <SelectValue className='min-w-0' />
+                            </SelectTrigger>
+                          </FormControl>
+                          <SelectContent>
+                            {modelOptions.map((option) => (
+                              <SelectItem
+                                key={option.value}
+                                value={option.value}
+                              >
+                                <span className='min-w-0 wrap-anywhere whitespace-normal'>
+                                  {option.label}
+                                </span>
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      )}
                       <FormMessage />
                     </FormItem>
                   )}

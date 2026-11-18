@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -149,6 +150,14 @@ func TestUpdateChannelRejectsStatusField(t *testing.T) {
 	}
 	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
 	assert.False(t, response.Success)
+}
+
+func TestParameterOverrideSaveRejectsRetiredTokenGroupContext(t *testing.T) {
+	retired := json.RawMessage(`{"operations":[{"path":"temperature","mode":"set","value":0.1,"conditions":[{"path":"token_group","mode":"full","value":"old-a"}]}]}`)
+	assert.False(t, validProviderAccountFields(map[string]json.RawMessage{"param_override": retired}))
+
+	literal := json.RawMessage(`{"token_group":"business-literal"}`)
+	assert.True(t, validProviderAccountFields(map[string]json.RawMessage{"param_override": literal}))
 }
 
 func TestChannelStatusValidation(t *testing.T) {

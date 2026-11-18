@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -17,7 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
-	"github.com/QuantumNous/new-api/relaykit/dto"
+
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -29,114 +28,6 @@ import (
 type ModelRequest struct {
 	Model string `json:"model"`
 	Group string `json:"group,omitempty"`
-}
-
-func Distribute() func(c *gin.Context) {
-	return func(c *gin.Context) {
-		var channel *model.Provider
-		defer func() {
-			if c.Writer.Status() >= 400 {
-				service.RecordRequestPolicyTermination(c, types.NewErrorWithStatusCode(errors.New("request rejected"), types.ErrorCodeInvalidRequest, c.Writer.Status(), types.ErrOptionWithSkipRetry()))
-			}
-		}()
-		constraints := service.GetChannelConstraints(c)
-		constraints.AddFilter(taskdto.ProviderFilter{
-			Kind:        taskdto.FilterRequestPath,
-			RequestPath: c.Request.URL.Path,
-		})
-		service.AppendTaskPluginIdentityFilter(c, c.GetString("expected_task_plugin_key"))
-		modelRequest, shouldSelectChannel, err := getModelRequest(c)
-		if err != nil {
-			abortWithOpenAiMessage(c, invalidRequestStatus(err), i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
-			return
-		}
-		_, pinned, _ := constraints.ResolvedPin()
-		if !pinned {
-			// Select a channel for the user
-			// check token model mapping
-			modelLimitEnable := common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled)
-			if modelLimitEnable {
-				s, ok := common.GetContextKey(c, constant.ContextKeyTokenModelLimit)
-				if !ok {
-					// token model limit is empty, all models are not allowed
-					abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorTokenNoModelAccess))
-					return
-				}
-				var tokenModelLimit map[string]bool
-				tokenModelLimit, ok = s.(map[string]bool)
-				if !ok {
-					tokenModelLimit = map[string]bool{}
-				}
-				if !TokenModelLimitAllows(tokenModelLimit, modelRequest.Model) {
-					abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorTokenModelForbidden, map[string]any{"Model": modelRequest.Model}))
-					return
-				}
-			}
-
-			if shouldSelectChannel {
-				if modelRequest.Model == "" {
-					abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorModelNameRequired))
-					return
-				}
-				// check path is /pg/chat/completions
-				if strings.HasPrefix(c.Request.URL.Path, "/pg/chat/completions") {
-					usingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
-					playgroundRequest := &dto.PlayGroundRequest{}
-					err = common.UnmarshalBodyReusable(c, playgroundRequest)
-					if err != nil {
-						abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidPlayground, map[string]any{"Error": err.Error()}))
-						return
-					}
-					if playgroundRequest.Group != "" {
-						if !service.GroupInUserUsableGroups(usingGroup, playgroundRequest.Group) && playgroundRequest.Group != usingGroup {
-							abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorGroupAccessDenied))
-							return
-						}
-						common.SetContextKey(c, constant.ContextKeyUsingGroup, playgroundRequest.Group)
-					}
-				}
-			}
-		}
-		if pinned || shouldSelectChannel {
-			usingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
-			var selectErr *service.ProviderSelectError
-			if value, exists := c.Get(contextKeyTaskPluginEndpointSelection); exists && !pinned {
-				if selected, ok := value.(taskPluginEndpointSelection); ok && selected.Model == modelRequest.Model && selected.Channel != nil && selected.Channel.Status == common.ChannelStatusEnabled {
-					if matches, _ := model.ProviderSatisfiesFilters(selected.Channel, modelRequest.Model, constraints.Filters); matches {
-						channel = selected.Channel
-					}
-				}
-			}
-			if channel == nil {
-				channel, _, selectErr = service.SelectChannelForRequest(c, modelRequest.Model, &service.RetryParam{
-					Ctx:         c,
-					ModelName:   modelRequest.Model,
-					TokenGroup:  usingGroup,
-					RequestPath: c.Request.URL.Path,
-					Retry:       common.GetPointer(0),
-				})
-			}
-			if selectErr != nil {
-				if selectErr.FilterKind == taskdto.FilterTaskPluginIdentity {
-					logTaskPluginChannelDecision(c, selectErr.Channel, modelRequest.Model, "channel_rejected", "identity_mismatch")
-				}
-				message := selectErr.Message
-				if selectErr.NoAvailableChannel {
-					message = noAvailableChannelMessage(c, usingGroup, modelRequest.Model)
-				} else if selectErr.MessageID != "" {
-					message = i18n.T(c, selectErr.MessageID, selectErr.Params)
-				}
-				abortWithOpenAiMessage(c, selectErr.StatusCode, message, selectErr.Code)
-				return
-			}
-		}
-		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
-		SetupContextForSelectedChannel(c, channel, modelRequest.Model)
-		c.Next()
-		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
-			service.RecordChannelAffinity(c, channel.Id)
-		}
-	}
 }
 
 // noAvailableChannelMessage explains a 503 for a task-plugin-claimed model.
@@ -542,7 +433,6 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 		}
 		modelRequest.Model = req.Model
 		modelRequest.Group = req.Group
-		common.SetContextKey(c, constant.ContextKeyTokenGroup, modelRequest.Group)
 	}
 
 	return &modelRequest, shouldSelectChannel, nil
@@ -583,17 +473,13 @@ func getTaskOriginModelName(c *gin.Context) string {
 	return ""
 }
 
-func SetupContextForSelectedChannel(c *gin.Context, channel *model.Provider, modelName string, pinnedKey ...int) *types.NewAPIError {
-	return setupContextForSelectedChannel(c, channel, modelName, false, pinnedKey...)
-}
-
 // SetupContextForGatewayCandidate projects account metadata without consuming
 // a Key rotation for a candidate that may subsequently be filtered out.
 func SetupContextForGatewayCandidate(c *gin.Context, provider *model.Provider, modelName string, pinnedKey ...int) *types.NewAPIError {
-	return setupContextForSelectedChannel(c, provider, modelName, true, pinnedKey...)
+	return setupContextForSelectedChannel(c, provider, modelName, pinnedKey...)
 }
 
-func setupContextForSelectedChannel(c *gin.Context, channel *model.Provider, modelName string, preview bool, pinnedKey ...int) *types.NewAPIError {
+func setupContextForSelectedChannel(c *gin.Context, channel *model.Provider, modelName string, pinnedKey ...int) *types.NewAPIError {
 	c.Set("original_model", modelName) // for retry
 	expectedPlugin := c.GetString("expected_task_plugin_key")
 	if channel == nil {
@@ -702,11 +588,7 @@ func setupContextForSelectedChannel(c *gin.Context, channel *model.Provider, mod
 		}
 	} else {
 		var newAPIError *types.NewAPIError
-		selectKey := channel.GetNextEnabledKey
-		if preview {
-			selectKey = channel.PreviewEnabledKey
-		}
-		key, index, newAPIError = selectKey()
+		key, index, newAPIError = channel.PreviewEnabledKey()
 		if newAPIError != nil {
 			return newAPIError
 		}

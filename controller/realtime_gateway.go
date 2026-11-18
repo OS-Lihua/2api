@@ -135,11 +135,11 @@ type realtimeGatewaySession struct {
 func RealtimeGateway(c *gin.Context) {
 	offering := middleware.TextOffering(c)
 	if offering == nil {
-		if middleware.TextOfferingMissing(c) {
+		if c.Query("model") == "" {
+			gatewayError(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
+		} else {
 			gatewayError(c, http.StatusNotFound, "model_not_found", "Model not found")
-			return
 		}
-		middleware.TokenAuth()(c)
 		return
 	}
 	c.Abort()
@@ -307,7 +307,7 @@ func (session *realtimeGatewaySession) begin(body, original []byte, input *dto.U
 			response.apiErr = types.NewError(err, types.ErrorCodeInvalidRequest)
 			return
 		}
-		response.apiErr = session.runner(request, requestID, func(c *gin.Context) *types.NewAPIError { _, apiErr := responsesWSGateway(c, call); return apiErr })
+		response.apiErr = session.runner(request, requestID, func(c *gin.Context) *types.NewAPIError { return responsesWSGateway(c, call) })
 	})
 	return response
 }
@@ -481,6 +481,9 @@ func (session *realtimeGatewaySession) requestAt(raw []byte, startedAt time.Time
 	}
 	if apiErr := session.auth(authRequest, session.authID, session.authorize); apiErr != nil {
 		return nil, apiErr
+	}
+	if common.JsonHasDuplicateFields(raw) {
+		return nil, types.NewErrorWithStatusCode(errors.New("Invalid JSON request body"), types.ErrorCodeInvalidRequest, http.StatusBadRequest)
 	}
 	hasModel := false
 	for _, path := range []string{"model", "session.model", "response.model"} {

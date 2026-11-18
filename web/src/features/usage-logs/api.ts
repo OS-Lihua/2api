@@ -143,9 +143,10 @@ export async function exportLogs(
 }
 
 export async function getUserInfo(
-  userId: number
+  userId: number,
+  signal?: AbortSignal
 ): Promise<{ success: boolean; message?: string; data?: UserInfo }> {
-  const res = await api.get(`/api/user/${userId}`)
+  const res = await api.get(`/api/user/${userId}`, { signal })
   return res.data
 }
 

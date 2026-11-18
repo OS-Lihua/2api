@@ -11,7 +11,7 @@ import (
 // Task protocols use the existing TaskAdaptor entry point.
 func IsNonTextProtocol(kind protocol.Type) bool {
 	switch kind {
-	case protocol.OpenAIEmbeddings, protocol.GeminiEmbed, protocol.OpenAIImages, protocol.OpenAIAudioSpeech, protocol.OpenAIAudioTranscription, protocol.Rerank:
+	case protocol.OpenAIEmbeddings, protocol.GeminiEmbed, protocol.OpenAIImages, protocol.OpenAIAudioSpeech, protocol.OpenAIAudioTranscription, protocol.Rerank, protocol.AlphaSearch, protocol.DeepSeekTools, protocol.OpenAIModerations:
 		return true
 	}
 	return false

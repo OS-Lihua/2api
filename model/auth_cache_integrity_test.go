@@ -22,9 +22,9 @@ func TestAuthCacheIntegrityDatabase(t *testing.T) {
 	require.NoError(t, DB.Create(&user).Error)
 	t.Cleanup(func() { assert.NoError(t, db.Unscoped().Delete(&user).Error) })
 	require.NoError(t, populateUserCache(user))
-	quotaResult, err := cacheApplyUserQuotaDelta(user.Id, -70)
-	require.NoError(t, err)
-	require.Equal(t, cacheQuotaOK, quotaResult)
+	// Historical cache counters can differ from the database. Refreshing identity
+	// metadata must neither trust them for authorization nor rewrite their value.
+	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id), "Quota", 30).Err())
 
 	t.Run("user_metadata_and_partial_refresh", func(t *testing.T) {
 		for _, fields := range []map[string]any{
@@ -64,11 +64,10 @@ func TestAuthCacheIntegrityDatabase(t *testing.T) {
 		AllowIps: &allowIPs, Group: "auto", AutoGroups: `["default"]`}
 	require.NoError(t, DB.Create(&token).Error)
 	t.Cleanup(func() { assert.NoError(t, db.Unscoped().Delete(&token).Error) })
-	_, err = GetTokenByKey(token.Key, false)
+	_, err := GetTokenByKey(token.Key, false)
 	require.NoError(t, err)
-	quotaResult, err = cacheTryReserveTokenQuota(token.Id, token.Key, 70)
-	require.NoError(t, err)
-	require.Equal(t, cacheQuotaOK, quotaResult)
+	require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key),
+		"RemainQuota", 30, "UsedQuota", 70, "AccessedTime", common.GetTimestamp()).Err())
 
 	t.Run("token_identity_and_permissions", func(t *testing.T) {
 		for _, fields := range []map[string]any{
@@ -165,7 +164,7 @@ func TestAuthCacheIntegrityDatabase(t *testing.T) {
 		require.NoError(t, err)
 	})
 
-	t.Run("repair_during_quota_reservation", func(t *testing.T) {
+	t.Run("repair_preserves_concurrent_historical_counters", func(t *testing.T) {
 		require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key), "CacheMAC", "invalid").Err())
 		snapshotRead := make(chan struct{})
 		releaseRepair := make(chan struct{}, 1)
@@ -184,9 +183,7 @@ func TestAuthCacheIntegrityDatabase(t *testing.T) {
 			done <- err
 		}()
 		<-snapshotRead
-		result, err := cacheTryReserveTokenQuota(token.Id, token.Key, 10)
-		require.NoError(t, err)
-		require.Equal(t, cacheQuotaOK, result)
+		require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key), "RemainQuota", 20, "UsedQuota", 80).Err())
 		releaseRepair <- struct{}{}
 		require.NoError(t, <-done)
 		cached, err := cacheGetTokenByKey(token.Key)

@@ -28,7 +28,16 @@ export const Route = createFileRoute(
   '/_authenticated/system-settings/billing/$section'
 )({
   beforeLoad: ({ params }) => {
-    const validSections = BILLING_SECTION_IDS as unknown as string[]
+    if (
+      params.section === 'model-pricing' ||
+      params.section === 'group-pricing'
+    ) {
+      throw redirect({ to: '/price-versions', replace: true })
+    }
+    if (params.section === 'currency') {
+      throw redirect({ to: '/fx-rates', replace: true })
+    }
+    const validSections: readonly string[] = BILLING_SECTION_IDS
     if (!validSections.includes(params.section)) {
       throw redirect({
         to: '/system-settings/billing/$section',

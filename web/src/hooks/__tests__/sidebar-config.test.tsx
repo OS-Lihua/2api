@@ -29,7 +29,6 @@ import {
   render,
   renderHook,
   screen,
-  waitFor,
 } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -93,6 +92,18 @@ function sidebarFor(admin?: object, user?: object, canConfigure = true) {
   )
   return result
 }
+
+it('offers Providers and its channels without retaining the legacy Channels page in navigation', () => {
+  useAuthStore
+    .getState()
+    .auth.setUser({ id: 1, username: 'operator', role: 100 })
+  const { result } = renderHook(() => useSidebarData())
+  const items = result.current.navGroups.flatMap((group) => group.items)
+  expect(items).toContainEqual(
+    expect.objectContaining({ title: 'Providers', url: '/providers' })
+  )
+  expect(items.some((item) => item.url === '/channels')).toBe(false)
+})
 
 describe('security sidebar visibility', () => {
   it('old configurations show Security & Access immediately after Profile and keep API Keys', () => {
@@ -226,7 +237,7 @@ it('shows Request logs alongside legacy logs and respects the usage-log visibili
   ).not.toContain('Request logs')
 })
 
-describe('model pricing badge', () => {
+describe('retired model pricing navigation', () => {
   function issue(modelName: string, pluginKey: string): ModelPricingIssue {
     return {
       model_name: modelName,
@@ -236,17 +247,18 @@ describe('model pricing badge', () => {
     }
   }
 
-  /** Lists the sidebar entries of the current view that carry a badge. */
-  function BadgedEntries() {
+  function NavigationEntries() {
     const { navGroups } = useSidebarView()
     const entries = navGroups
       .flatMap((group) => group.items)
       .flatMap((item) => [item, ...(item.items ?? [])])
-      .filter((item) => item.badge)
     return (
-      <ul aria-label='Badged entries'>
+      <ul aria-label='Navigation entries'>
         {entries.map((item) => (
-          <li key={item.title}>{`${item.title}: ${item.badge}`}</li>
+          <li key={item.title}>
+            {item.url ? <a href={item.url}>{item.title}</a> : item.title}
+            {item.badge && <span>{`${item.title}: ${item.badge}`}</span>}
+          </li>
         ))}
       </ul>
     )
@@ -267,9 +279,10 @@ describe('model pricing badge', () => {
       defaultOptions: { queries: { retry: false } },
     })
     client.setQueryData(['status'], { SidebarModulesAdmin: '' })
+    client.setQueryData(MODEL_PRICING_ISSUES_QUERY_KEY, issues())
     useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role })
     const router = createRouter({
-      routeTree: createRootRoute({ component: BadgedEntries }),
+      routeTree: createRootRoute({ component: NavigationEntries }),
       history: createMemoryHistory({ initialEntries: [path] }),
     })
     await router.load()
@@ -281,66 +294,94 @@ describe('model pricing badge', () => {
     return { client, get }
   }
 
-  function badgedEntries() {
-    return screen
-      .getByRole('list', { name: 'Badged entries' })
-      .querySelectorAll('li')
-  }
+  it('shows price versions and offerings without loading or displaying cached model-name pricing warnings', async () => {
+    const { get, client } = await renderSidebar(
+      '/dashboard/overview',
+      ROLE.SUPER_ADMIN,
+      () => [
+        issue('kling-v3', 'kling'),
+        issue('shared-video', 'alpha'),
+        issue('shared-video', 'beta'),
+      ]
+    )
 
-  it('counts each task model once on the System Settings entry of the main sidebar', async () => {
-    await renderSidebar('/dashboard/overview', ROLE.SUPER_ADMIN, () => [
-      issue('kling-v3', 'kling'),
-      issue('shared-video', 'alpha'),
-      issue('shared-video', 'beta'),
-    ])
-
-    expect(await screen.findByText('System Settings: 2')).toBeInTheDocument()
-    expect(badgedEntries()).toHaveLength(1)
+    expect(
+      await screen.findByRole('link', { name: 'Price versions' })
+    ).toHaveAttribute('href', '/price-versions')
+    expect(
+      screen.getByRole('link', { name: 'Model offerings' })
+    ).toHaveAttribute('href', '/model-offerings')
+    expect(
+      screen.getByRole('link', { name: 'System Settings' })
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/^System Settings:/)).not.toBeInTheDocument()
+    expect(get).not.toHaveBeenCalledWith('/api/option/model_pricing/issues')
+    client.clear()
   })
 
-  it('inside System Settings shows the count on Billing & Payment and Model Pricing', async () => {
-    await renderSidebar('/system-settings/site', ROLE.SUPER_ADMIN, () => [
-      issue('kling-v3', 'kling'),
-    ])
+  it('keeps payment and check-in settings while removing model, group and quota-display pricing pages', async () => {
+    const { get, client } = await renderSidebar(
+      '/system-settings/site',
+      ROLE.SUPER_ADMIN,
+      () => [issue('kling-v3', 'kling')]
+    )
 
-    expect(await screen.findByText('Model Pricing: 1')).toBeInTheDocument()
-    expect(screen.getByText('Billing & Payment: 1')).toBeInTheDocument()
-    expect(badgedEntries()).toHaveLength(2)
+    expect(
+      await screen.findByRole('link', { name: 'Payment Gateway' })
+    ).toHaveAttribute('href', '/system-settings/billing/payment')
+    expect(
+      screen.getByRole('link', { name: 'Check-in Rewards' })
+    ).toHaveAttribute('href', '/system-settings/billing/checkin')
+    for (const name of [
+      'Model Pricing',
+      'Group Pricing',
+      'Currency & Display',
+    ]) {
+      expect(screen.queryByRole('link', { name })).not.toBeInTheDocument()
+    }
+    expect(screen.queryByText(/^Billing & Payment:/)).not.toBeInTheDocument()
+    expect(get).not.toHaveBeenCalledWith('/api/option/model_pricing/issues')
+    client.clear()
   })
 
-  it('follows plugin changes and saved prices without a page reload', async () => {
+  it('does not revive the retired pricing subscription after plugin or saved-price cache invalidation', async () => {
     let issues = [issue('kling-v3', 'kling')]
-    const { client } = await renderSidebar(
+    const { client, get } = await renderSidebar(
       '/dashboard/overview',
       ROLE.SUPER_ADMIN,
       () => issues
     )
-    await screen.findByText('System Settings: 1')
+    await screen.findByRole('link', { name: 'Price versions' })
 
-    // A plugin action refreshes the count it may have changed.
     issues = [issue('kling-v3', 'kling'), issue('vidu-q3', 'vidu')]
     await act(() =>
       client.invalidateQueries({ queryKey: MODEL_PRICING_ISSUES_QUERY_KEY })
     )
-    expect(await screen.findByText('System Settings: 2')).toBeInTheDocument()
-
-    // Every pricing save runs this invalidation.
     issues = []
     await act(() => invalidateModelPricing(client))
-    await waitFor(() => expect(badgedEntries()).toHaveLength(0))
+
+    expect(get).not.toHaveBeenCalledWith('/api/option/model_pricing/issues')
+    expect(screen.queryByText(/^System Settings:/)).not.toBeInTheDocument()
+    expect(
+      screen.getByRole('link', { name: 'Price versions' })
+    ).toHaveAttribute('href', '/price-versions')
+    client.clear()
   })
 
-  it('never asks for the count below the super administrator role', async () => {
-    const { get } = await renderSidebar(
+  it('never asks for the retired count below the super administrator role', async () => {
+    const { get, client } = await renderSidebar(
       '/dashboard/overview',
       ROLE.ADMIN,
       () => [issue('kling-v3', 'kling')]
     )
 
     expect(
-      await screen.findByRole('list', { name: 'Badged entries' })
+      await screen.findByRole('list', { name: 'Navigation entries' })
     ).toBeInTheDocument()
     expect(get).not.toHaveBeenCalledWith('/api/option/model_pricing/issues')
-    expect(badgedEntries()).toHaveLength(0)
+    expect(
+      screen.queryByRole('link', { name: 'System Settings' })
+    ).not.toBeInTheDocument()
+    client.clear()
   })
 })

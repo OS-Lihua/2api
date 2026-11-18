@@ -28,6 +28,10 @@ import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, expect, test, vi } from 'vitest'
 
+import {
+  plan,
+  subscriptionRecord,
+} from '@/features/subscriptions/__tests__/fixtures'
 import { api } from '@/lib/api'
 import { ROLE } from '@/lib/roles'
 import { useAuthStore } from '@/stores/auth-store'
@@ -74,13 +78,22 @@ async function renderLogs(props: {
   vi.spyOn(api, 'get').mockImplementation(async (url) => {
     let data: unknown = { quota: 0, rpm: 0, tpm: 0 }
     if (url === '/api/subscription/admin/plans') {
-      data = props.enabledPlans.map((enabled) => ({ plan: { enabled } }))
+      data = props.enabledPlans.map((enabled, index) => ({
+        plan: { ...plan, id: index + 1, enabled },
+      }))
     } else if (url === '/api/subscription/self') {
       data = {
-        subscriptions: props.activeSubscription
-          ? [{ subscription: { status: 'active' } }]
-          : [],
-        all_subscriptions: [{ subscription: { status: 'expired' } }],
+        billing_preference: 'subscription_first',
+        subscriptions: props.activeSubscription ? [subscriptionRecord] : [],
+        all_subscriptions: [
+          {
+            ...subscriptionRecord,
+            subscription: {
+              ...subscriptionRecord.subscription,
+              status: 'expired',
+            },
+          },
+        ],
       }
     } else if (
       url.startsWith('/api/log?') ||

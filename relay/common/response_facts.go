@@ -108,6 +108,9 @@ type ResponseFacts struct {
 	PromptTokensReported     bool
 	CompletionTokensReported bool
 	IndependentUsageReported bool
+	// NativeOperationCompleted includes a valid empty search/fetch result.
+	NativeOperationCompleted bool
+	SourceToolCount          *int
 	BusinessOutput           bool
 	TerminalDelivered        bool `json:"-"`
 	ExpectedChoices          int  `json:"-"`

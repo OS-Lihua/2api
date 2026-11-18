@@ -85,6 +85,213 @@ func createMiddlewarePATUser(t *testing.T, username, token string) *model.User {
 	return user
 }
 
+func TestTokenAuthIgnoresHistoricalQuota(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	for _, redisEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("redis_%t", redisEnabled), func(t *testing.T) {
+			setupDashboardAuthMiddlewareTest(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.Token{}))
+			if redisEnabled {
+				useRateLimitMiniRedis(t)
+			}
+			user := createMiddlewarePATUser(t, "credential-quota", "unused-dashboard-credential")
+			router := gin.New()
+			router.GET("/credential", TokenAuth(), func(c *gin.Context) {
+				c.JSON(http.StatusOK, gin.H{"id": c.GetInt("id"), "token_id": c.GetInt("token_id")})
+			})
+			for index, tc := range []struct {
+				name      string
+				remaining int
+				unlimited bool
+			}{
+				{"zero", 0, false},
+				{"negative", -7, false},
+				{"positive", 7, false},
+				{"historical_unlimited", -7, true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					token := model.Token{UserId: user.Id, Key: fmt.Sprintf("quota-auth-fixture-%d", index), Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: tc.remaining, UsedQuota: 23, UnlimitedQuota: tc.unlimited}
+					require.NoError(t, model.DB.Create(&token).Error)
+					response := middlewareBearerRequest(router, "/credential", token.Key)
+					assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+					var stored model.Token
+					require.NoError(t, model.DB.First(&stored, token.Id).Error)
+					assert.Equal(t, common.TokenStatusEnabled, stored.Status, "legacy quota must not mutate credential status")
+					assert.Equal(t, tc.remaining, stored.RemainQuota)
+					assert.Equal(t, 23, stored.UsedQuota)
+					assert.Equal(t, tc.unlimited, stored.UnlimitedQuota)
+					for _, validate := range []func(string) (*model.Token, error){model.ValidateUserToken, model.ValidateWalletToken} {
+						credential, err := validate(token.Key)
+						assert.NoError(t, err)
+						if err == nil {
+							assert.Equal(t, token.Id, credential.Id)
+							assert.Equal(t, user.Id, credential.UserId)
+						}
+					}
+					assert.NotContains(t, response.Body.String(), token.Key)
+				})
+			}
+		})
+	}
+}
+
+func TestTokenCredentialIgnoresHistoricalRedisCounters(t *testing.T) {
+	setupDashboardAuthMiddlewareTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Token{}))
+	_, client := useRateLimitMiniRedis(t)
+	token := model.Token{UserId: 1, Key: "credential-primary-counter-fixture", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 9, UsedQuota: 4}
+	require.NoError(t, model.DB.Create(&token).Error)
+	_, err := model.GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+	cacheKey := "token:" + common.GenerateHMAC(token.Key)
+	require.NoError(t, client.HSet(t.Context(), cacheKey, "RemainQuota", -37, "UsedQuota", 50).Err())
+	credential, err := model.GetTokenCredential(token.Key)
+	require.NoError(t, err)
+	assert.Equal(t, 9, credential.RemainQuota, "credential reads must not merge mutable Redis balance counters")
+	assert.Equal(t, 4, credential.UsedQuota)
+	assert.Equal(t, token.Id, credential.Id)
+	assert.Equal(t, token.UserId, credential.UserId)
+	for _, validate := range []func(string) (*model.Token, error){model.ValidateUserToken, model.ValidateWalletToken} {
+		_, err = validate(token.Key)
+		assert.NoError(t, err)
+	}
+	remaining, err := client.HGet(t.Context(), cacheKey, "RemainQuota").Int()
+	require.NoError(t, err)
+	used, err := client.HGet(t.Context(), cacheKey, "UsedQuota").Int()
+	require.NoError(t, err)
+	assert.Equal(t, -37, remaining, "retiring the credential precheck must not rewrite historical Redis counters")
+	assert.Equal(t, 50, used)
+}
+
+func TestTokenCredentialRestrictionsRemainAuthoritative(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	for _, redisEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("redis_%t", redisEnabled), func(t *testing.T) {
+			setupDashboardAuthMiddlewareTest(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.Token{}))
+			if redisEnabled {
+				useRateLimitMiniRedis(t)
+			}
+			router := gin.New()
+			require.NoError(t, router.SetTrustedProxies(nil))
+			accepted := func(c *gin.Context) { c.Status(http.StatusNoContent) }
+			router.GET("/credential", TokenAuth(), accepted)
+			router.GET("/wallet-credential", TokenAuth(true), accepted)
+			for index, tc := range []struct {
+				name       string
+				status     int
+				expires    int64
+				userStatus int
+				missing    bool
+				allowIPs   string
+				want       int
+			}{
+				{"enabled", common.TokenStatusEnabled, -1, common.UserStatusEnabled, false, "", http.StatusNoContent},
+				{"disabled", common.TokenStatusDisabled, -1, common.UserStatusEnabled, false, "", http.StatusUnauthorized},
+				{"explicit_exhausted", common.TokenStatusExhausted, -1, common.UserStatusEnabled, false, "", http.StatusUnauthorized},
+				{"explicit_expired", common.TokenStatusExpired, -1, common.UserStatusEnabled, false, "", http.StatusUnauthorized},
+				{"time_expired", common.TokenStatusEnabled, time.Now().Add(-time.Minute).Unix(), common.UserStatusEnabled, false, "", http.StatusUnauthorized},
+				{"user_disabled", common.TokenStatusEnabled, -1, common.UserStatusDisabled, false, "", http.StatusForbidden},
+				{"user_missing", common.TokenStatusEnabled, -1, common.UserStatusEnabled, true, "", http.StatusInternalServerError},
+				{"ip_allowed", common.TokenStatusEnabled, -1, common.UserStatusEnabled, false, "192.0.2.0/24", http.StatusNoContent},
+				{"ip_rejected", common.TokenStatusEnabled, -1, common.UserStatusEnabled, false, "203.0.113.0/24", http.StatusForbidden},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					user := createMiddlewarePATUser(t, fmt.Sprintf("credential-boundary-%d", index), fmt.Sprintf("unused-dashboard-%d", index))
+					require.NoError(t, model.DB.Model(user).Update("status", tc.userStatus).Error)
+					userID := user.Id
+					if tc.missing {
+						userID += 100000
+					}
+					token := model.Token{UserId: userID, Key: fmt.Sprintf("credential-boundary-fixture-%d", index), Status: tc.status, ExpiredTime: tc.expires, RemainQuota: 0, UsedQuota: 11, UnlimitedQuota: true, AllowIps: &tc.allowIPs}
+					require.NoError(t, model.DB.Create(&token).Error)
+					for _, path := range []string{"/credential", "/wallet-credential"} {
+						response := middlewareBearerRequest(router, path, token.Key)
+						assert.Equal(t, tc.want, response.Code, response.Body.String())
+						assert.NotContains(t, response.Body.String(), token.Key)
+					}
+					var stored model.Token
+					require.NoError(t, model.DB.First(&stored, token.Id).Error)
+					wantStatus := tc.status
+					if tc.name == "time_expired" && !redisEnabled {
+						wantStatus = common.TokenStatusExpired
+					}
+					assert.Equal(t, wantStatus, stored.Status)
+					assert.Zero(t, stored.RemainQuota)
+					assert.Equal(t, 11, stored.UsedQuota)
+				})
+			}
+			for _, key := range []string{"", "missing-credential-fixture"} {
+				for _, path := range []string{"/credential", "/wallet-credential"} {
+					assert.Equal(t, http.StatusUnauthorized, middlewareBearerRequest(router, path, key).Code)
+				}
+			}
+		})
+	}
+}
+
+func TestTokenCredentialCacheCannotOverridePrimaryIdentity(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	setupDashboardAuthMiddlewareTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Token{}))
+	server, client := useRateLimitMiniRedis(t)
+	user := createMiddlewarePATUser(t, "credential-cache", "unused-cache-dashboard")
+	token := model.Token{UserId: user.Id, Key: "credential-primary-identity-fixture", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 1}
+	require.NoError(t, model.DB.Create(&token).Error)
+	cacheKey := "token:" + common.GenerateHMAC(token.Key)
+	router := gin.New()
+	require.NoError(t, router.SetTrustedProxies(nil))
+	router.GET("/credential", TokenAuth(), func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"id": c.GetInt("id"), "token_id": c.GetInt("token_id")})
+	})
+	require.Equal(t, http.StatusOK, middlewareBearerRequest(router, "/credential", token.Key).Code)
+
+	t.Run("tampered_metadata_cannot_change_identity", func(t *testing.T) {
+		require.NoError(t, client.HSet(t.Context(), cacheKey, "UserId", user.Id+1000, "Status", common.TokenStatusDisabled, "ExpiredTime", 1, "Group", "forged", "UnlimitedQuota", true).Err())
+		response := middlewareBearerRequest(router, "/credential", token.Key)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		assert.JSONEq(t, fmt.Sprintf(`{"id":%d,"token_id":%d}`, user.Id, token.Id), response.Body.String())
+	})
+	t.Run("forged_positive_balance_cannot_revive_disabled_primary", func(t *testing.T) {
+		require.NoError(t, model.DB.Model(&token).Update("status", common.TokenStatusDisabled).Error)
+		defer func() { require.NoError(t, model.DB.Model(&token).Update("status", common.TokenStatusEnabled).Error) }()
+		require.NoError(t, client.HSet(t.Context(), cacheKey, "Status", common.TokenStatusEnabled, "RemainQuota", 999999, "UnlimitedQuota", true).Err())
+		assert.Equal(t, http.StatusUnauthorized, middlewareBearerRequest(router, "/credential", token.Key).Code)
+	})
+	t.Run("primary_ip_restriction_overrides_warm_cache", func(t *testing.T) {
+		require.NoError(t, model.DB.Model(&token).Update("allow_ips", "203.0.113.0/24").Error)
+		defer func() { require.NoError(t, model.DB.Model(&token).Update("allow_ips", "").Error) }()
+		require.NoError(t, client.HSet(t.Context(), cacheKey, "AllowIps", "").Err())
+		assert.Equal(t, http.StatusForbidden, middlewareBearerRequest(router, "/credential", token.Key).Code)
+	})
+	t.Run("redis_failure_uses_authoritative_database", func(t *testing.T) {
+		server.SetError("injected cache outage")
+		defer server.SetError("")
+		assert.Equal(t, http.StatusOK, middlewareBearerRequest(router, "/credential", token.Key).Code)
+		require.NoError(t, model.DB.Model(&token).Update("status", common.TokenStatusDisabled).Error)
+		defer func() { require.NoError(t, model.DB.Model(&token).Update("status", common.TokenStatusEnabled).Error) }()
+		assert.Equal(t, http.StatusUnauthorized, middlewareBearerRequest(router, "/credential", token.Key).Code)
+	})
+	t.Run("primary_read_failure_denies_even_with_valid_cache", func(t *testing.T) {
+		require.Equal(t, http.StatusOK, middlewareBearerRequest(router, "/credential", token.Key).Code)
+		require.NoError(t, model.DB.Exec("ALTER TABLE tokens RENAME TO credential_probe_tokens").Error)
+		defer func() {
+			require.NoError(t, model.DB.Exec("ALTER TABLE credential_probe_tokens RENAME TO tokens").Error)
+		}()
+		response := middlewareBearerRequest(router, "/credential", token.Key)
+		assert.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
+		assert.NotContains(t, response.Body.String(), token.Key)
+	})
+	t.Run("unverifiable_user_cache_and_primary_failure_deny", func(t *testing.T) {
+		require.NoError(t, client.HSet(t.Context(), fmt.Sprintf("user:%d", user.Id), "CacheMAC", "invalid").Err())
+		require.NoError(t, model.DB.Exec("ALTER TABLE users RENAME TO credential_probe_users").Error)
+		defer func() { require.NoError(t, model.DB.Exec("ALTER TABLE credential_probe_users RENAME TO users").Error) }()
+		response := middlewareBearerRequest(router, "/credential", token.Key)
+		assert.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
+		assert.NotContains(t, response.Body.String(), token.Key)
+	})
+}
+
 // Read-only API key routes (/api/usage/token, /api/log/token) are called by
 // scripts, not the web console, so their errors are translated by the backend
 // in the language the request asks for.
@@ -477,6 +684,53 @@ func TestUserAuthAppliesAccessTokenRouteRules(t *testing.T) {
 	assert.Equal(t, http.StatusOK, response.Code)
 	assert.JSONEq(t, `{"id":0}`, response.Body.String(), "optional authentication treats a retired token as anonymous")
 	assert.Equal(t, http.StatusOK, middlewareBearerRequest(router, "/api/user/self", profile).Code, "the deadline only retires legacy tokens")
+}
+
+func TestCheckoutQuoteRequiresWalletWrite(t *testing.T) {
+	setupDashboardAuthMiddlewareTest(t)
+	gin.SetMode(gin.TestMode)
+	user := createMiddlewarePATUser(t, "checkout-scope-user", "checkout-scope-legacy")
+	read, _ := createMiddlewareScopedToken(t, user.Id, 0, "wallet:read")
+	write, _ := createMiddlewareScopedToken(t, user.Id, 0, "wallet:write")
+	expired, _ := createMiddlewareScopedToken(t, user.Id, time.Now().Unix()-1, "wallet:write")
+
+	for _, path := range []string{
+		"/api/user/topup/quote",
+		"/api/user/amount",
+		"/api/user/stripe/amount",
+		"/api/user/waffo/amount",
+		"/api/user/waffo-pancake/amount",
+	} {
+		t.Run(path, func(t *testing.T) {
+			called := false
+			router := gin.New()
+			router.POST(path, UserAuth(), func(c *gin.Context) {
+				called = true
+				c.Status(http.StatusNoContent)
+			})
+			for _, test := range []struct {
+				name, token, code string
+				status            int
+			}{
+				{name: "read scope cannot create a quote", token: read, status: http.StatusForbidden, code: "ACCESS_TOKEN_SCOPE_DENIED"},
+				{name: "write scope can create a quote", token: write, status: http.StatusNoContent},
+				{name: "expired write token cannot create a quote", token: expired, status: http.StatusUnauthorized, code: "ACCESS_TOKEN_EXPIRED"},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					called = false
+					request := httptest.NewRequest(http.MethodPost, path, nil)
+					request.Header.Set("Authorization", "Bearer "+test.token)
+					response := httptest.NewRecorder()
+					router.ServeHTTP(response, request)
+					assert.Equal(t, test.status, response.Code)
+					assert.Equal(t, test.status == http.StatusNoContent, called, "rejected credentials must not reach order creation")
+					if test.code != "" {
+						assert.Contains(t, response.Body.String(), `"code":"`+test.code+`"`)
+					}
+				})
+			}
+		})
+	}
 }
 
 func TestAccessTokenIdentityAndSingleLookup(t *testing.T) {

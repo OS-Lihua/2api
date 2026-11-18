@@ -17,9 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { DescriptionDialog } from './dialogs/description-dialog'
-import { MissingModelsDialog } from './dialogs/missing-models-dialog'
 import { PrefillGroupManagement } from './dialogs/prefill-group-management'
-import { PriceSyncDialog } from './dialogs/price-sync-dialog'
 import { SyncWizardDialog } from './dialogs/sync-wizard-dialog'
 import { VendorMutateDialog } from './dialogs/vendor-mutate-dialog'
 import { ModelMutateDrawer } from './drawers/model-mutate-drawer'
@@ -37,18 +35,9 @@ export function ModelsDialogs() {
 
   return (
     <>
-      <PriceSyncDialog
-        open={open === 'price-sync'}
-        onOpenChange={(value) => !value && setOpen(null)}
-      />
       {/* Model Create/Update Drawer */}
       <ModelMutateDrawer
-        open={
-          open === 'create-model' ||
-          open === 'update-model' ||
-          open === 'price-model'
-        }
-        initialSection={open === 'price-model' ? 'pricing' : 'metadata'}
+        open={open === 'create-model' || open === 'update-model'}
         onOpenChange={(v) => !v && setOpen(null)}
         currentRow={currentRow}
       />
@@ -59,12 +48,6 @@ export function ModelsDialogs() {
         open={open === 'create-vendor' || open === 'update-vendor'}
         onOpenChange={(v) => !v && setOpen(null)}
         currentVendor={open === 'update-vendor' ? currentVendor : null}
-      />
-
-      {/* Missing Models Dialog */}
-      <MissingModelsDialog
-        open={open === 'missing-models'}
-        onOpenChange={(v) => !v && setOpen(null)}
       />
 
       {/* Sync Wizard Dialog */}

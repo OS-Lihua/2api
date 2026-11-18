@@ -3,17 +3,17 @@ package service
 import (
 	"math"
 	"math/rand"
-	"net/http"
-	"net/http/httptest"
+
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/money"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/types"
-	"github.com/gin-gonic/gin"
+
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -317,209 +317,98 @@ func TestTryTieredSettle_NoRequestInput_FallsBackToDefault(t *testing.T) {
 // Group ratio tests
 // ---------------------------------------------------------------------------
 
-type recordingBillingSettler struct {
-	preConsumedQuota int
-	reserveTargets   []int
-}
-
-func (*recordingBillingSettler) Settle(int) error { return nil }
-
-func (*recordingBillingSettler) Refund(*gin.Context) {}
-
-func (*recordingBillingSettler) NeedsRefund() bool { return false }
-
-func (s *recordingBillingSettler) GetPreConsumedQuota() int {
-	return s.preConsumedQuota
-}
-
-func (s *recordingBillingSettler) Reserve(targetQuota int) error {
-	s.reserveTargets = append(s.reserveTargets, targetQuota)
-	if targetQuota > s.preConsumedQuota {
-		s.preConsumedQuota = targetQuota
-	}
-	return nil
-}
-
-func (s *recordingBillingSettler) ReserveBeforeSubmit(targetQuota int) error {
-	return s.Reserve(targetQuota)
-}
-
 func TestPrepareTieredBillingForSelectedGroupUpdatesReservation(t *testing.T) {
-	const expr = `tier("base", p)`
-	billing := &recordingBillingSettler{preConsumedQuota: 50_000}
-	relayInfo := &relaycommon.RelayInfo{
-		Billing:               billing,
-		FinalPreConsumedQuota: 50_000,
-		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
-			BillingMode:               "tiered_expr",
-			ExprString:                expr,
-			ExprHash:                  billingexpr.ExprHashString(expr),
-			GroupRatio:                0.10,
-			EstimatedQuotaBeforeGroup: 500_000,
-			EstimatedQuotaAfterGroup:  50_000,
-			QuotaPerUnit:              testQuotaPerUnit,
-		},
-		PriceData: types.PriceData{
-			GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 0.20},
-		},
-	}
-
-	require.Nil(t, PrepareTieredBillingForSelectedGroup(nil, relayInfo))
-	require.Equal(t, []int{100_000}, billing.reserveTargets)
-	assert.Equal(t, 100_000, billing.preConsumedQuota)
-	assert.Equal(t, 100_000, relayInfo.FinalPreConsumedQuota)
-	assert.Equal(t, 0.20, relayInfo.TieredBillingSnapshot.GroupRatio)
-	assert.Equal(t, 100_000, relayInfo.TieredBillingSnapshot.EstimatedQuotaAfterGroup)
+	// A later price cannot rewrite the sole reservation or frozen sale discount.
+	task := seedCanonicalWalletTaskWithPricing(t, 1000, `u("tokens") / 1000000000`, `u("tokens") / 2000000000`, map[string]any{"tokens": 1000}, "0.1")
+	request := task.PrivateData.Gateway.Settlement.Request
+	changed := request
+	changed.GroupRatio = "0.2"
+	amount := money.Amount{Nanos: 2000, Currency: "USD"}
+	require.Error(t, model.ReserveGateway(&changed, amount, amount))
+	var billing model.GatewayBilling
+	require.NoError(t, model.DB.First(&billing, "request_id = ?", request.ID).Error)
+	assert.Equal(t, money.Amount{Nanos: 1000, Currency: "USD"}, billing.Reservation)
+	var frozen model.GatewayRequest
+	require.NoError(t, common.UnmarshalJsonStr(billing.RequestData, &frozen))
+	assert.Equal(t, "0.1", frozen.GroupRatio)
+	task.Status = model.TaskStatusSuccess
+	task.PrivateData.Gateway.CompletionFacts = map[string]any{"tokens": 1000}
+	require.NoError(t, SettleGatewayTask(t.Context(), task))
+	assertCanonicalWalletTaskAccounting(t, task, 1000, 100, 500)
 }
 
 func TestPrepareTieredBillingForSelectedGroupStartsBillingAfterFreeGroup(t *testing.T) {
-	truncate(t)
-	gin.SetMode(gin.TestMode)
-
-	const userID = 700
-	seedUser(t, userID, 500_000)
-
-	relayInfo := &relaycommon.RelayInfo{
-		UserId:          userID,
-		IsPlayground:    true,
-		ForcePreConsume: true,
-		OriginModelName: "gpt-test",
-		UserSetting: dto.UserSetting{
-			BillingPreference: "wallet_only",
-		},
-		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
-			BillingMode:               "tiered_expr",
-			ExprString:                `tier("base", p)`,
-			ExprHash:                  billingexpr.ExprHashString(`tier("base", p)`),
-			GroupRatio:                0,
-			EstimatedQuotaBeforeGroup: 500_000,
-			QuotaPerUnit:              testQuotaPerUnit,
-		},
-		PriceData: types.PriceData{
-			FreeModel:      true,
-			GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 0.20},
-		},
-	}
-	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-
-	require.Nil(t, PrepareTieredBillingForSelectedGroup(ctx, relayInfo))
-	require.NotNil(t, relayInfo.Billing)
-	assert.False(t, relayInfo.PriceData.FreeModel, "FreeModel must be cleared after switching to a paid group")
-	assert.Equal(t, 100_000, relayInfo.FinalPreConsumedQuota)
-	assert.Equal(t, 0.20, relayInfo.TieredBillingSnapshot.GroupRatio)
-	assert.Equal(t, 100_000, relayInfo.TieredBillingSnapshot.EstimatedQuotaAfterGroup)
-
-	userQuota, err := model.GetUserQuota(userID, false)
-	require.NoError(t, err)
-	assert.Equal(t, 400_000, userQuota)
+	// An explicit free sale still creates its lifecycle. A later paid route
+	// cannot turn it into a second reservation or consume legacy token quota.
+	task := seedCanonicalWalletTaskWithPricing(t, 0, `u("tokens") / 1000000000`, `u("tokens") / 2000000000`, map[string]any{"tokens": 1000}, "0")
+	changed := task.PrivateData.Gateway.Settlement.Request
+	changed.GroupRatio = "0.2"
+	amount := money.Amount{Nanos: 200, Currency: "USD"}
+	require.Error(t, model.ReserveGateway(&changed, amount, amount))
+	task.Status = model.TaskStatusSuccess
+	task.PrivateData.Gateway.CompletionFacts = map[string]any{"tokens": 1000}
+	require.NoError(t, SettleGatewayTask(t.Context(), task))
+	assertCanonicalWalletTaskAccounting(t, task, 0, 0, 500)
 }
 
 func TestPrepareTieredBillingForSelectedGroupPaidToFreeKeepsFreeModelFalse(t *testing.T) {
-	const expr = `tier("base", p)`
-	billing := &recordingBillingSettler{preConsumedQuota: 50_000}
-	relayInfo := &relaycommon.RelayInfo{
-		Billing:               billing,
-		FinalPreConsumedQuota: 50_000,
-		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
-			BillingMode:               "tiered_expr",
-			ExprString:                expr,
-			ExprHash:                  billingexpr.ExprHashString(expr),
-			GroupRatio:                0.10,
-			EstimatedQuotaBeforeGroup: 500_000,
-			EstimatedQuotaAfterGroup:  50_000,
-			QuotaPerUnit:              testQuotaPerUnit,
-		},
-		PriceData: types.PriceData{
-			GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 0},
-		},
-	}
-
-	require.Nil(t, PrepareTieredBillingForSelectedGroup(nil, relayInfo))
-
-	// Pre-consume did happen under the paid group, so FreeModel stays false;
-	// settlement already yields 0 for GroupRatio == 0 and the session refunds.
-	assert.False(t, relayInfo.PriceData.FreeModel)
-	assert.Empty(t, billing.reserveTargets)
-	assert.Equal(t, 50_000, relayInfo.FinalPreConsumedQuota)
+	task := seedCanonicalWalletTaskWithPricing(t, 1000, `u("tokens") / 1000000000`, `u("tokens") / 2000000000`, map[string]any{"tokens": 1000}, "0.1")
+	changed := task.PrivateData.Gateway.Settlement.Request
+	changed.GroupRatio = "0"
+	zero := money.Amount{Currency: "USD"}
+	require.Error(t, model.ReserveGateway(&changed, zero, zero))
+	task.Status = model.TaskStatusSuccess
+	task.PrivateData.Gateway.CompletionFacts = map[string]any{"tokens": 1000}
+	require.NoError(t, SettleGatewayTask(t.Context(), task))
+	assertCanonicalWalletTaskAccounting(t, task, 1000, 100, 500)
 }
 
 func TestPrepareTieredBillingForSelectedGroupTopUpArrearsAllowsNegativeBalance(t *testing.T) {
-	truncate(t)
-
-	const userID = 701
-	// Balance covers the initial 50k pre-consume (already deducted before this
-	// test's seed) but not the 50k top-up to the more expensive retry group.
-	// The top-up must NOT abort the request: the full delta is deducted, the
-	// uncovered 30k becomes arrears (negative balance), mirroring how
-	// settlement charges a positive delta unconditionally.
-	seedUser(t, userID, 20_000)
-
-	relayInfo := &relaycommon.RelayInfo{
-		UserId:                userID,
-		IsPlayground:          true,
-		FinalPreConsumedQuota: 50_000,
-		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
-			BillingMode:               "tiered_expr",
-			ExprString:                `tier("base", p)`,
-			ExprHash:                  billingexpr.ExprHashString(`tier("base", p)`),
-			GroupRatio:                0.10,
-			EstimatedQuotaBeforeGroup: 500_000,
-			EstimatedQuotaAfterGroup:  50_000,
-			QuotaPerUnit:              testQuotaPerUnit,
-		},
-		PriceData: types.PriceData{
-			GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 0.20},
-		},
-	}
-	session := &BillingSession{
-		relayInfo:        relayInfo,
-		funding:          &WalletFunding{userId: userID, consumed: 50_000},
-		preConsumedQuota: 50_000,
-	}
-	relayInfo.Billing = session
-
-	require.Nil(t, PrepareTieredBillingForSelectedGroup(nil, relayInfo))
-
-	// Full reservation recorded; wallet charged the full delta into arrears.
-	assert.Equal(t, 100_000, session.GetPreConsumedQuota())
-	assert.Equal(t, 100_000, relayInfo.FinalPreConsumedQuota)
-	assert.Equal(t, 100_000, relayInfo.TieredBillingSnapshot.EstimatedQuotaAfterGroup)
-	userQuota, err := model.GetUserQuota(userID, false)
+	// A real post-delivery shortfall is a receivable, never a negative wallet
+	// or permission to reserve more money before a later Provider attempt.
+	task := seedCanonicalWalletTask(t, 1000)
+	request := task.PrivateData.Gateway.Settlement.Request
+	larger := money.Amount{Nanos: 10000, Currency: "USD"}
+	require.Error(t, model.ReserveGateway(&request, larger, larger))
+	task.Status = model.TaskStatusSuccess
+	task.PrivateData.Gateway.CompletionFacts = map[string]any{"tokens": 10000}
+	require.NoError(t, SettleGatewayTask(t.Context(), task))
+	wallet, err := model.GetUserWallet(77)
 	require.NoError(t, err)
-	assert.Equal(t, -30_000, userQuota)
-
-	// Settlement still reconciles against the full reservation: actual 80k
-	// refunds the 20k over-reserve, landing at seed - (actual - initial) = -10k.
-	require.NoError(t, session.Settle(80_000))
-	userQuota, err = model.GetUserQuota(userID, false)
+	assert.Zero(t, wallet.Balance.Nanos)
+	var debt model.Wallet
+	require.NoError(t, model.DB.Where("account_type = ? AND owner_id = ?", model.LedgerAccountUserReceivable, 77).Take(&debt).Error)
+	assert.EqualValues(t, 1112, debt.Balance.Nanos)
+	record, err := model.GetGatewayRequest(t.Context(), request.ID, 77)
 	require.NoError(t, err)
-	assert.Equal(t, -10_000, userQuota)
+	assert.EqualValues(t, 10000, record.Receivable.Nanos)
+	var first, second []model.LedgerEntry
+	require.NoError(t, model.DB.Order("id").Find(&first).Error)
+	require.NoError(t, SettleGatewayTask(t.Context(), task))
+	require.NoError(t, model.DB.Order("id").Find(&second).Error)
+	assert.Equal(t, first, second)
+	assert.Equal(t, 8000, getTokenRemainQuota(t, 77))
+	assert.Zero(t, getUserQuota(t, 77))
+	var holds int64
+	require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id = ? AND type = ?", request.ID, model.LedgerEntryPreConsume).Count(&holds).Error)
+	assert.EqualValues(t, 1, holds)
+	reconciliation, err := model.ReconcileWallets(100)
+	require.NoError(t, err)
+	assert.Empty(t, reconciliation.Mismatches)
 }
 
 func TestBillingSessionReserveWalletTopUpDecrementsBalance(t *testing.T) {
-	truncate(t)
-
-	const userID = 702
-	seedUser(t, userID, 500_000)
-
-	relayInfo := &relaycommon.RelayInfo{
-		UserId:       userID,
-		IsPlayground: true,
-	}
-	session := &BillingSession{
-		relayInfo:        relayInfo,
-		funding:          &WalletFunding{userId: userID, consumed: 50_000},
-		preConsumedQuota: 50_000,
-	}
-
-	require.NoError(t, session.Reserve(100_000))
-
-	assert.Equal(t, 100_000, session.GetPreConsumedQuota())
-	assert.Equal(t, 100_000, relayInfo.FinalPreConsumedQuota)
-	userQuota, err := model.GetUserQuota(userID, false)
+	task := seedCanonicalWalletTask(t, 1000)
+	request := task.PrivateData.Gateway.Settlement.Request
+	more := money.Amount{Nanos: 2000, Currency: "USD"}
+	require.Error(t, model.ReserveGateway(&request, more, more))
+	wallet, err := model.GetUserWallet(77)
 	require.NoError(t, err)
-	assert.Equal(t, 450_000, userQuota)
+	assert.EqualValues(t, 7888, wallet.Balance.Nanos)
+	task.Status = model.TaskStatusSuccess
+	task.PrivateData.Gateway.CompletionFacts = map[string]any{"tokens": 800}
+	require.NoError(t, SettleGatewayTask(t.Context(), task))
+	assertCanonicalWalletTaskAccounting(t, task, 1000, 800, 400)
 }
 
 func TestTryTieredSettleUsesFinalGroupAfterRetry(t *testing.T) {
@@ -536,7 +425,6 @@ func TestTryTieredSettleUsesFinalGroupAfterRetry(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			relayInfo := &relaycommon.RelayInfo{
-				Billing:               &recordingBillingSettler{preConsumedQuota: 50_000},
 				FinalPreConsumedQuota: 50_000,
 				TieredBillingSnapshot: &billingexpr.BillingSnapshot{
 					BillingMode:               "tiered_expr",
@@ -552,7 +440,8 @@ func TestTryTieredSettleUsesFinalGroupAfterRetry(t *testing.T) {
 				},
 			}
 
-			require.Nil(t, PrepareTieredBillingForSelectedGroup(nil, relayInfo))
+			_, err := refreshTieredBillingGroup(relayInfo)
+			require.NoError(t, err)
 			ok, quota, result := TryTieredSettle(relayInfo, billingexpr.TokenParams{P: 1_000_000})
 
 			require.True(t, ok)

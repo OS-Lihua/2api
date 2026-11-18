@@ -1,7 +1,6 @@
 package controller
 
 import (
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,12 +8,16 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relaykit/dto"
-	"github.com/QuantumNous/new-api/setting"
+	"time"
+
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
-	"github.com/QuantumNous/new-api/setting/ratio_setting"
+
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -34,11 +37,14 @@ type userModelsResponse struct {
 
 func setupModelListControllerTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
-
 	gin.SetMode(gin.TestMode)
 	common.RedisEnabled = false
 	db := model.UseTestDatabases(t)
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Provider{}, &model.Ability{}, &model.Model{}, &model.Vendor{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Provider{}, &model.Model{}, &model.Vendor{}, &model.Channel{}, &model.ModelOffering{}, &model.ModelOfferingMember{}, &model.TokenOfferingPolicy{}, &model.TokenOfferingException{}))
+	require.NoError(t, model.MigratePricing(db))
+	require.NoError(t, model.MigrateKeyPermissions(db))
+	require.NoError(t, i18n.Init())
+	require.False(t, db.Migrator().HasTable("abilities"))
 	return db
 }
 
@@ -54,7 +60,6 @@ func withTieredBillingConfig(t *testing.T, modes map[string]string, exprs map[st
 	}))
 	t.Cleanup(func() {
 		require.NoError(t, config.GlobalConfig.LoadFromDB(saved))
-		model.InvalidatePricingCache()
 	})
 
 	modeBytes, err := common.Marshal(modes)
@@ -66,7 +71,6 @@ func withTieredBillingConfig(t *testing.T, modes map[string]string, exprs map[st
 		"billing_setting.billing_mode": string(modeBytes),
 		"billing_setting.billing_expr": string(exprBytes),
 	}))
-	model.InvalidatePricingCache()
 }
 
 func withSelfUseModeDisabled(t *testing.T) {
@@ -91,12 +95,13 @@ func withSelfUseModeEnabled(t *testing.T) {
 
 func decodeListModelsPayload(t *testing.T, recorder *httptest.ResponseRecorder) listModelsResponse {
 	t.Helper()
-
-	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 	var payload listModelsResponse
 	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &payload))
-	require.True(t, payload.Success)
 	require.Equal(t, "list", payload.Object)
+	for _, entry := range payload.Data {
+		require.Equal(t, "system", entry.OwnedBy, "public identity belongs to the Offering, not a Provider account")
+	}
 	return payload
 }
 
@@ -111,14 +116,6 @@ func decodeListModelsResponse(t *testing.T, recorder *httptest.ResponseRecorder)
 	return ids
 }
 
-func pricingByModelName(pricings []model.Pricing) map[string]model.Pricing {
-	byName := make(map[string]model.Pricing, len(pricings))
-	for _, pricing := range pricings {
-		byName[pricing.ModelName] = pricing
-	}
-	return byName
-}
-
 func decodeUserModelsResponse(t *testing.T, recorder *httptest.ResponseRecorder) []string {
 	t.Helper()
 
@@ -129,316 +126,161 @@ func decodeUserModelsResponse(t *testing.T, recorder *httptest.ResponseRecorder)
 	return payload.Data
 }
 
-func TestGetUserModelsFiltersByRequestedGroup(t *testing.T) {
+func TestGetUserModelsListsVisibleOfferingsWithoutRouteGroups(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.Create(&model.User{
-		Id:       1002,
-		Username: "playground-model-user",
-		Password: "password",
-		Group:    "default",
-		Status:   common.UserStatusEnabled,
-	}).Error)
-	require.NoError(t, db.Create(&[]model.Ability{
-		{Group: "default", Model: "zz-default-only-model", ChannelId: 1, Enabled: true},
-		{Group: "default", Model: "zz-disabled-model", ChannelId: 1, Enabled: false},
-	}).Error)
-
-	defaultRecorder := httptest.NewRecorder()
-	defaultContext, _ := gin.CreateTestContext(defaultRecorder)
-	defaultContext.Request = httptest.NewRequest(http.MethodGet, "/api/user/models?group=default", nil)
-	defaultContext.Set("id", 1002)
-
-	GetUserModels(defaultContext)
-
-	defaultModels := decodeUserModelsResponse(t, defaultRecorder)
-	require.ElementsMatch(t, []string{"zz-default-only-model"}, defaultModels)
-
-	vipRecorder := httptest.NewRecorder()
-	vipContext, _ := gin.CreateTestContext(vipRecorder)
-	vipContext.Request = httptest.NewRequest(http.MethodGet, "/api/user/models?group=vip", nil)
-	vipContext.Set("id", 1002)
-
-	GetUserModels(vipContext)
-
-	require.Empty(t, decodeUserModelsResponse(t, vipRecorder))
+	require.NoError(t, db.AutoMigrate(&model.ModelOffering{}))
+	require.NoError(t, db.Create(&model.User{Id: 1002, Username: "playground-model-user", Group: "default", Status: common.UserStatusEnabled}).Error)
+	require.NoError(t, db.Create(&model.Provider{Id: 1, Name: "legacy-only-names", Status: common.ChannelStatusEnabled, Models: "legacy-model,legacy-vip-model", Group: "default,vip"}).Error)
+	require.False(t, db.Migrator().HasTable("abilities"))
+	for _, offering := range []*model.ModelOffering{
+		{Name: "public-offering", Visibility: "all", Groups: []string{}, Enabled: true},
+		{Name: "own-group-offering", Visibility: "groups", Groups: []string{"default"}, Enabled: true},
+		{Name: "other-group-offering", Visibility: "groups", Groups: []string{"vip"}, Enabled: true},
+		{Name: "disabled-offering", Visibility: "all", Groups: []string{}, Enabled: false},
+	} {
+		offering.RouteMethod, offering.AcceptedConversionLosses = "cost", []string{}
+		require.NoError(t, db.Create(offering).Error)
+	}
+	for _, group := range []string{"", "default", "vip", "auto"} {
+		recorder := httptest.NewRecorder()
+		context, _ := gin.CreateTestContext(recorder)
+		context.Request = httptest.NewRequest(http.MethodGet, "/api/user/self/models?group="+group, nil)
+		context.Set("id", 1002)
+		GetUserModels(context)
+		assert.Equal(t, []string{"own-group-offering", "public-offering"}, decodeUserModelsResponse(t, recorder), "a route group cannot reveal hidden Offerings")
+	}
 }
 
-func TestGetUserModelsExpandsAutoGroupsInConfiguredOrder(t *testing.T) {
-	originalAutoGroups := setting.AutoGroups2JsonString()
-	originalUsableGroups := setting.UserUsableGroups2JSONString()
-	originalSpecialGroups := ratio_setting.GetGroupRatioSetting().GroupSpecialUsableGroup.ReadAll()
-	t.Cleanup(func() {
-		require.NoError(t, setting.UpdateAutoGroupsByJsonString(originalAutoGroups))
-		require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(originalUsableGroups))
-		specialGroups := ratio_setting.GetGroupRatioSetting().GroupSpecialUsableGroup
-		specialGroups.Clear()
-		specialGroups.AddAll(originalSpecialGroups)
-	})
-
-	require.NoError(t, setting.UpdateAutoGroupsByJsonString(`["vip","default","unavailable"]`))
-	require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"auto":"自动分组","default":"默认分组","unavailable":"不可用分组"}`))
-	specialGroups := ratio_setting.GetGroupRatioSetting().GroupSpecialUsableGroup
-	specialGroups.Clear()
-	specialGroups.Set("default", map[string]string{
-		"+:vip":         "VIP 分组",
-		"-:unavailable": "",
-	})
-
+func TestGetUserModelsRechecksLiveUserAndOfferingVisibility(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.Create(&model.User{
-		Id:       1003,
-		Username: "playground-auto-model-user",
-		Password: "password",
-		Group:    "default",
-		Status:   common.UserStatusEnabled,
-	}).Error)
-	require.NoError(t, db.Create(&[]model.Ability{
-		{Group: "vip", Model: "zz-vip-model", ChannelId: 1, Enabled: true},
-		{Group: "vip", Model: "zz-shared-model", ChannelId: 1, Enabled: true},
-		{Group: "default", Model: "zz-default-model", ChannelId: 1, Enabled: true},
-		{Group: "default", Model: "zz-shared-model", ChannelId: 2, Enabled: true},
-		{Group: "unavailable", Model: "zz-unavailable-model", ChannelId: 1, Enabled: true},
-	}).Error)
-
-	recorder := httptest.NewRecorder()
-	context, _ := gin.CreateTestContext(recorder)
-	context.Request = httptest.NewRequest(http.MethodGet, "/api/user/models?group=auto", nil)
-	context.Set("id", 1003)
-
-	GetUserModels(context)
-
-	models := decodeUserModelsResponse(t, recorder)
-	require.Len(t, models, 3)
-	assert.ElementsMatch(t, []string{"zz-vip-model", "zz-shared-model"}, models[:2])
-	assert.Equal(t, "zz-default-model", models[2])
+	require.NoError(t, db.AutoMigrate(&model.ModelOffering{}))
+	user := &model.User{Id: 1003, Username: "playground-live-model-user", Group: "default", Status: common.UserStatusEnabled}
+	require.NoError(t, db.Create(user).Error)
+	offering := &model.ModelOffering{Name: "group-offering", Visibility: "groups", Groups: []string{"default"}, Enabled: true, RouteMethod: "cost", AcceptedConversionLosses: []string{}}
+	require.NoError(t, db.Create(offering).Error)
+	for _, state := range []struct {
+		group      string
+		userStatus int
+		enabled    bool
+		want       []string
+	}{
+		{"default", common.UserStatusEnabled, true, []string{"group-offering"}},
+		{"vip", common.UserStatusEnabled, true, []string{}},
+		{"default", common.UserStatusDisabled, true, []string{}},
+		{"default", common.UserStatusEnabled, false, []string{}},
+	} {
+		require.NoError(t, db.Model(user).Updates(map[string]any{"group": state.group, "status": state.userStatus}).Error)
+		require.NoError(t, db.Model(offering).Update("enabled", state.enabled).Error)
+		recorder := httptest.NewRecorder()
+		context, _ := gin.CreateTestContext(recorder)
+		context.Request = httptest.NewRequest(http.MethodGet, "/api/user/self/models", nil)
+		context.Set("id", user.Id)
+		context.Set("group", "default")
+		GetUserModels(context)
+		assert.Equal(t, state.want, decodeUserModelsResponse(t, recorder))
+	}
 }
 
 func TestListModelsIncludesTieredBillingModel(t *testing.T) {
 	withSelfUseModeDisabled(t)
-	withTieredBillingConfig(t, map[string]string{
-		"zz-tiered-visible-model":      "tiered_expr",
-		"zz-tiered-empty-expr-model":   "tiered_expr",
-		"zz-tiered-missing-expr-model": "tiered_expr",
-	}, map[string]string{
-		"zz-tiered-visible-model":    `tier("base", p * 1 + c * 2)`,
-		"zz-tiered-empty-expr-model": "   ",
-	})
-
-	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.Create(&model.User{
-		Id:       1001,
-		Username: "model-list-user",
-		Password: "password",
-		Group:    "default",
-		Status:   common.UserStatusEnabled,
-	}).Error)
-	require.NoError(t, db.Create(&[]model.Ability{
-		{Group: "default", Model: "zz-tiered-visible-model", ChannelId: 1, Enabled: true},
-		{Group: "default", Model: "zz-tiered-empty-expr-model", ChannelId: 1, Enabled: true},
-		{Group: "default", Model: "zz-tiered-missing-expr-model", ChannelId: 1, Enabled: true},
-		{Group: "default", Model: "zz-unpriced-model", ChannelId: 1, Enabled: true},
-	}).Error)
-
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	ctx.Set("id", 1001)
-
-	ListModels(ctx, constant.ChannelTypeOpenAI)
-
-	ids := decodeListModelsResponse(t, recorder)
-	require.Contains(t, ids, "zz-tiered-visible-model")
-	require.NotContains(t, ids, "zz-tiered-empty-expr-model")
-	require.NotContains(t, ids, "zz-tiered-missing-expr-model")
-	require.NotContains(t, ids, "zz-unpriced-model")
-
-	pricingByName := pricingByModelName(model.GetPricing())
-	visiblePricing, ok := pricingByName["zz-tiered-visible-model"]
-	require.True(t, ok)
-	require.Equal(t, "tiered_expr", visiblePricing.BillingMode)
-	require.NotEmpty(t, visiblePricing.BillingExpr)
-
-	emptyExprPricing, ok := pricingByName["zz-tiered-empty-expr-model"]
-	require.True(t, ok)
-	require.Empty(t, emptyExprPricing.BillingMode)
-	require.Empty(t, emptyExprPricing.BillingExpr)
-
-	missingExprPricing, ok := pricingByName["zz-tiered-missing-expr-model"]
-	require.True(t, ok)
-	require.Empty(t, missingExprPricing.BillingMode)
-	require.Empty(t, missingExprPricing.BillingExpr)
+	withTieredBillingConfig(t, map[string]string{"zz-tiered-empty-expr-model": "tiered_expr", "zz-tiered-missing-expr-model": "tiered_expr"}, map[string]string{"zz-tiered-empty-expr-model": " "})
+	db, user, token := newOfferingDiscoveryFixture(t)
+	valid := createDiscoveryOffering(t, db, "zz-tiered-visible-model", true)
+	empty := createDiscoveryOffering(t, db, "zz-tiered-empty-expr-model", false)
+	missing := createDiscoveryOffering(t, db, "zz-tiered-missing-expr-model", false)
+	unpriced := createDiscoveryOffering(t, db, "zz-unpriced-model", false)
+	price := &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: valid.ID, Currency: "USD", Expression: `tier("base",p*1+c*2)`, EffectiveAt: 1}
+	require.NoError(t, model.CreatePriceVersion(t.Context(), price, user.Id))
+	require.Error(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: empty.ID, Currency: "USD", Expression: " ", EffectiveAt: 1}, user.Id))
+	ids := decodeListModelsResponse(t, requestOfferingModels(t, token, constant.ChannelTypeOpenAI))
+	require.Equal(t, map[string]struct{}{"zz-tiered-visible-model": {}}, ids)
+	stored, err := model.CurrentPriceVersion(t.Context(), db, model.PriceOwnerOffering, valid.ID, time.Now().Unix())
+	require.NoError(t, err)
+	assert.Equal(t, price.ID, stored.ID)
+	assert.Equal(t, `tier("base",p*1+c*2)`, stored.Expression)
+	for _, offering := range []*model.ModelOffering{empty, missing, unpriced} {
+		_, err = model.CurrentPriceVersion(t.Context(), db, model.PriceOwnerOffering, offering.ID, time.Now().Unix())
+		require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	}
+	assert.False(t, db.Migrator().HasTable("abilities"))
 }
 
 func TestListModelsUsesAdvancedCustomEndpointTypesFromPricingCache(t *testing.T) {
 	withSelfUseModeEnabled(t)
-	db := setupModelListControllerTestDB(t)
-
-	originalMemoryCacheEnabled := common.MemoryCacheEnabled
-	common.MemoryCacheEnabled = true
-	t.Cleanup(func() {
-		common.MemoryCacheEnabled = originalMemoryCacheEnabled
-		model.InvalidatePricingCache()
-	})
-
-	require.NoError(t, db.Create(&model.User{
-		Id:       1003,
-		Username: "advanced-custom-model-list-user",
-		Password: "password",
-		Group:    "default",
-		Status:   common.UserStatusEnabled,
-	}).Error)
-
-	channel := &model.Provider{
-		Id:     701,
-		Type:   constant.ChannelTypeAdvancedCustom,
-		Key:    "advanced-custom-key",
-		Status: common.ChannelStatusEnabled,
-		Name:   "advanced-custom-channel",
-		Group:  "default",
-		Models: "gemini-3.5-flash",
+	db, _, token := newOfferingDiscoveryFixture(t)
+	createDiscoveryOffering(t, db, "gemini-3.5-flash", true)
+	provider := &model.Provider{Type: constant.ChannelTypeAdvancedCustom, Name: "advanced-custom", Key: "advanced-custom-secret", Status: common.ChannelStatusEnabled, Models: "retired-model", Group: "retired-group"}
+	provider.SetOtherSettings(dto.ProviderOtherSettings{AdvancedCustom: &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{IncomingPath: "/v1/chat/completions", UpstreamPath: "/v1/chat/completions"}, {IncomingPath: "/v1/responses", UpstreamPath: "/v1beta/models/{model}:generateContent", Converter: "openai_responses_to_gemini_generate_content", Models: []string{"re:^gemini-"}}}}})
+	require.NoError(t, db.Create(provider).Error)
+	metadata := &model.Model{ModelName: "private-gemini-model", Status: 1}
+	require.NoError(t, db.Create(metadata).Error)
+	for _, kind := range []protocol.Type{protocol.OpenAIChat, protocol.OpenAIResponses} {
+		require.NoError(t, db.Create(&model.Channel{ProviderID: provider.Id, ModelID: metadata.Id, Protocol: kind, UpstreamModelName: "gemini-3.5-flash", ParameterOverrides: `{}`, Status: model.ChannelEnabled, MappingConfirmed: true}).Error)
 	}
-	channel.SetOtherSettings(dto.ProviderOtherSettings{
-		AdvancedCustom: &dto.AdvancedCustomConfig{
-			Routes: []dto.AdvancedCustomRoute{
-				{
-					IncomingPath: "/v1/chat/completions",
-					UpstreamPath: "/v1/chat/completions",
-				},
-				{
-					IncomingPath: "/v1/responses",
-					UpstreamPath: "/v1beta/models/{model}:generateContent",
-					Converter:    "openai_responses_to_gemini_generate_content",
-					Models:       []string{"re:^gemini-"},
-				},
-			},
-		},
-	})
-	require.NoError(t, db.Create(channel).Error)
-	require.NoError(t, db.Create(&model.Ability{
-		Group:     "default",
-		Model:     "gemini-3.5-flash",
-		ChannelId: 701,
-		Enabled:   true,
-	}).Error)
-
-	model.InitProviderCache()
-	model.GetPricing()
-
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	ctx.Set("id", 1003)
-
-	ListModels(ctx, constant.ChannelTypeOpenAI)
-
-	payload := decodeListModelsPayload(t, recorder)
-	require.Len(t, payload.Data, 1)
-	require.Equal(t, "gemini-3.5-flash", payload.Data[0].Id)
-	require.Equal(t, []constant.EndpointType{
-		constant.EndpointTypeOpenAI,
-		constant.EndpointTypeOpenAIResponse,
-	}, payload.Data[0].SupportedEndpointTypes)
+	for _, cache := range []bool{false, true} {
+		previous := common.MemoryCacheEnabled
+		common.MemoryCacheEnabled = cache
+		model.InitProviderCache()
+		payload := decodeListModelsPayload(t, requestOfferingModels(t, token, constant.ChannelTypeOpenAI))
+		require.Len(t, payload.Data, 1)
+		assert.Equal(t, "gemini-3.5-flash", payload.Data[0].Id)
+		assert.Empty(t, payload.Data[0].SupportedEndpointTypes, "public discovery does not expose Provider composition or imply callability")
+		require.NoError(t, model.FillModelSupportedEndpoints([]*model.Model{metadata}))
+		assert.ElementsMatch(t, []string{string(constant.EndpointTypeOpenAI), string(constant.EndpointTypeOpenAIResponse), string(constant.EndpointTypeOpenAIResponseCompact)}, metadata.SupportedEndpoints)
+		common.MemoryCacheEnabled = previous
+	}
+	assert.False(t, db.Migrator().HasTable("abilities"))
 }
 
 func TestListModelsTokenLimitIncludesTieredBillingModel(t *testing.T) {
 	withSelfUseModeDisabled(t)
-	withTieredBillingConfig(t, map[string]string{
-		"zz-token-tiered-visible-model":      "tiered_expr",
-		"zz-token-tiered-empty-expr-model":   "tiered_expr",
-		"zz-token-tiered-missing-expr-model": "tiered_expr",
-	}, map[string]string{
-		"zz-token-tiered-visible-model":    `tier("base", p * 1 + c * 2)`,
-		"zz-token-tiered-empty-expr-model": "",
-	})
-	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.Create(&[]model.Ability{
-		{Group: "default", Model: "zz-token-tiered-visible-model", ChannelId: 1, Enabled: true},
-		{Group: "default", Model: "zz-token-tiered-empty-expr-model", ChannelId: 1, Enabled: true},
-		{Group: "default", Model: "zz-token-tiered-missing-expr-model", ChannelId: 1, Enabled: true},
-		{Group: "default", Model: "zz-token-unpriced-model", ChannelId: 1, Enabled: true},
-	}).Error)
-
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	common.SetContextKey(ctx, constant.ContextKeyUserGroup, "default")
-	common.SetContextKey(ctx, constant.ContextKeyTokenModelLimitEnabled, true)
-	common.SetContextKey(ctx, constant.ContextKeyTokenModelLimit, map[string]bool{
-		"zz-token-tiered-visible-model":      true,
-		"zz-token-tiered-empty-expr-model":   true,
-		"zz-token-tiered-missing-expr-model": true,
-		"zz-token-unpriced-model":            true,
-	})
-
-	ListModels(ctx, constant.ChannelTypeOpenAI)
-
-	ids := decodeListModelsResponse(t, recorder)
-	require.Contains(t, ids, "zz-token-tiered-visible-model")
-	require.NotContains(t, ids, "zz-token-tiered-empty-expr-model")
-	require.NotContains(t, ids, "zz-token-tiered-missing-expr-model")
-	require.NotContains(t, ids, "zz-token-unpriced-model")
+	db, user, token := newOfferingDiscoveryFixture(t)
+	allowed := createDiscoveryOffering(t, db, "zz-token-tiered-visible-model", true)
+	for _, name := range []string{"zz-token-tiered-empty-expr-model", "zz-token-tiered-missing-expr-model", "zz-token-unpriced-model"} {
+		createDiscoveryOffering(t, db, name, true)
+	}
+	require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: allowed.ID, Currency: "USD", Expression: `tier("base",p*1+c*2)`, EffectiveAt: 1}, user.Id))
+	require.NoError(t, db.Create(&model.TokenOfferingPolicy{TokenID: token.Id, DefaultAllow: false}).Error)
+	require.NoError(t, db.Create(&model.TokenOfferingException{TokenID: token.Id, OfferingID: allowed.ID}).Error)
+	ids := decodeListModelsResponse(t, requestOfferingModels(t, token, constant.ChannelTypeOpenAI, func(c *gin.Context) {
+		common.SetContextKey(c, constant.ContextKeyTokenModelLimitEnabled, true)
+		common.SetContextKey(c, constant.ContextKeyTokenModelLimit, map[string]bool{"zz-token-unpriced-model": true})
+	}))
+	assert.Equal(t, map[string]struct{}{"zz-token-tiered-visible-model": {}}, ids, "only current Offering permission grants discovery; legacy ModelLimits neither grant nor deny")
+	require.NoError(t, db.Where("token_id = ?", token.Id).Delete(&model.TokenOfferingException{}).Error)
+	assert.Empty(t, decodeListModelsResponse(t, requestOfferingModels(t, token, constant.ChannelTypeOpenAI)), "revocation applies without cache invalidation")
 }
 
 func TestListModelsTokenLimitUsesResolvedCustomAutoGroups(t *testing.T) {
 	withSelfUseModeEnabled(t)
-	originalMax := setting.GetMaxTokenAutoGroups()
-	originalUsableGroups := setting.UserUsableGroups2JSONString()
-	originalRatios := ratio_setting.GroupRatio2JSONString()
-	require.NoError(t, setting.UpdateMaxTokenAutoGroups("5"))
-	require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"default":"Default","vip":"VIP"}`))
-	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1,"vip":1}`))
-	t.Cleanup(func() {
-		require.NoError(t, setting.UpdateMaxTokenAutoGroups(fmt.Sprintf("%d", originalMax)))
-		require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(originalUsableGroups))
-		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalRatios))
-	})
-
-	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.Create(&[]model.Ability{
-		{Group: "vip", Model: "zz-vip-allowed", ChannelId: 1, Enabled: true},
-		{Group: "vip", Model: "zz-vip-denied", ChannelId: 1, Enabled: true},
-		{Group: "default", Model: "zz-default-outside-snapshot", ChannelId: 1, Enabled: true},
-	}).Error)
-
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	common.SetContextKey(ctx, constant.ContextKeyUserGroup, "default")
-	common.SetContextKey(ctx, constant.ContextKeyTokenGroup, "auto")
-	common.SetContextKey(ctx, constant.ContextKeyTokenAutoGroups, []string{"vip"})
-	common.SetContextKey(ctx, constant.ContextKeyTokenModelLimitEnabled, true)
-	common.SetContextKey(ctx, constant.ContextKeyTokenModelLimit, map[string]bool{
-		"zz-vip-allowed":              true,
-		"zz-default-outside-snapshot": true,
-		"zz-not-enabled":              true,
-	})
-
-	ListModels(ctx, constant.ChannelTypeOpenAI)
-	ids := decodeListModelsResponse(t, recorder)
-	require.Equal(t, map[string]struct{}{"zz-vip-allowed": {}}, ids)
-
-	require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"default":"Default"}`))
-	emptyRecorder := httptest.NewRecorder()
-	emptyCtx, _ := gin.CreateTestContext(emptyRecorder)
-	emptyCtx.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	common.SetContextKey(emptyCtx, constant.ContextKeyUserGroup, "default")
-	common.SetContextKey(emptyCtx, constant.ContextKeyTokenGroup, "auto")
-	common.SetContextKey(emptyCtx, constant.ContextKeyTokenAutoGroups, []string{"vip"})
-	common.SetContextKey(emptyCtx, constant.ContextKeyTokenModelLimitEnabled, true)
-	common.SetContextKey(emptyCtx, constant.ContextKeyTokenModelLimit, map[string]bool{"zz-vip-allowed": true})
-
-	require.NotPanics(t, func() {
-		ListModels(emptyCtx, constant.ChannelTypeAnthropic)
-	})
-	var anthropicResponse struct {
+	db, user, token := newOfferingDiscoveryFixture(t)
+	require.NoError(t, db.Model(user).Update("group", "vip").Error)
+	allowed := createDiscoveryOffering(t, db, "zz-vip-allowed", true, "vip")
+	createDiscoveryOffering(t, db, "zz-vip-denied", true, "vip")
+	createDiscoveryOffering(t, db, "zz-default-outside-snapshot", true, "default")
+	createDiscoveryOffering(t, db, "zz-not-enabled", false)
+	require.NoError(t, db.Create(&model.TokenOfferingPolicy{TokenID: token.Id, DefaultAllow: false}).Error)
+	require.NoError(t, db.Create(&model.TokenOfferingException{TokenID: token.Id, OfferingID: allowed.ID}).Error)
+	retired := func(c *gin.Context) {
+		common.SetContextKey(c, constant.ContextKeyUserGroup, "vip")
+		common.SetContextKey(c, constant.ContextKeyTokenGroup, "auto")
+		common.SetContextKey(c, constant.ContextKeyTokenAutoGroups, []string{"vip"})
+		common.SetContextKey(c, constant.ContextKeyTokenModelLimitEnabled, true)
+		common.SetContextKey(c, constant.ContextKeyTokenModelLimit, map[string]bool{"zz-vip-allowed": true, "zz-default-outside-snapshot": true})
+	}
+	assert.Equal(t, map[string]struct{}{"zz-vip-allowed": {}}, decodeListModelsResponse(t, requestOfferingModels(t, token, constant.ChannelTypeOpenAI, retired)))
+	require.NoError(t, db.Model(user).Update("group", "default").Error)
+	response := requestOfferingModels(t, token, constant.ChannelTypeAnthropic, retired)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var payload struct {
 		Data    []dto.AnthropicModel `json:"data"`
 		FirstID string               `json:"first_id"`
 		LastID  string               `json:"last_id"`
 	}
-	require.NoError(t, common.Unmarshal(emptyRecorder.Body.Bytes(), &anthropicResponse))
-	require.Empty(t, anthropicResponse.Data)
-	require.Empty(t, anthropicResponse.FirstID)
-	require.Empty(t, anthropicResponse.LastID)
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+	assert.Empty(t, payload.Data)
+	assert.Empty(t, payload.FirstID)
+	assert.Empty(t, payload.LastID)
 }
 
 func TestSetupLoginDoesNotTouchPasswordWhenPasswordFieldOmitted(t *testing.T) {
@@ -476,4 +318,43 @@ func TestSetupLoginDoesNotTouchPasswordWhenPasswordFieldOmitted(t *testing.T) {
 	var stored model.User
 	require.NoError(t, db.First(&stored, user.Id).Error)
 	assert.Equal(t, hashedPassword, stored.Password)
+}
+
+func newOfferingDiscoveryFixture(t *testing.T) (*gorm.DB, *model.User, *model.Token) {
+	t.Helper()
+	db := setupModelListControllerTestDB(t)
+	user := &model.User{Id: 1001, Username: "offering-discovery", Group: "default", Role: common.RoleCommonUser, Status: common.UserStatusEnabled}
+	require.NoError(t, db.Create(user).Error)
+	token := &model.Token{UserId: user.Id, Key: "offering-discovery-test-key", Name: "discovery", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 0, Group: "retired-group", ModelLimitsEnabled: true, ModelLimits: "retired-model"}
+	require.NoError(t, db.Create(token).Error)
+	return db, user, token
+}
+
+func createDiscoveryOffering(t *testing.T, db *gorm.DB, name string, enabled bool, groups ...string) *model.ModelOffering {
+	t.Helper()
+	visibility := "all"
+	if len(groups) > 0 {
+		visibility = "groups"
+	}
+	offering := &model.ModelOffering{Name: name, Visibility: visibility, Groups: append([]string{}, groups...), Enabled: enabled, RouteMethod: "cost", AcceptedConversionLosses: []string{}}
+	require.NoError(t, db.Create(offering).Error)
+	return offering
+}
+
+func requestOfferingModels(t *testing.T, token *model.Token, kind int, decorate ...func(*gin.Context)) *httptest.ResponseRecorder {
+	t.Helper()
+	engine := gin.New()
+	engine.Use(middleware.GatewayTokenAuth())
+	engine.GET("/v1/models", func(c *gin.Context) {
+		for _, fn := range decorate {
+			fn(c)
+		}
+		ListOfferingModels(c, kind)
+	})
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request.Header.Set("Authorization", "Bearer "+token.Key)
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+	assert.NotContains(t, response.Body.String(), token.Key)
+	return response
 }

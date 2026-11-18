@@ -57,7 +57,7 @@ const FIELD_LABELS: Record<MetadataSyncField, string> = {
   vendor: 'Vendor',
   endpoints: 'Custom endpoints',
   name_rule: 'Match Type',
-  status: 'Model square visibility',
+  status: 'Metadata status',
 }
 const REASON_LABELS = {
   create: 'New metadata',
@@ -289,7 +289,7 @@ export function SyncWizardDialog(props: {
     }
     if (field === 'status') {
       return t(
-        'Changes visibility in the model square. Channel status and existing API access are unchanged.'
+        'Metadata status does not change Offering visibility or API authorization.'
       )
     }
     if (field === 'endpoints') {
@@ -301,7 +301,7 @@ export function SyncWizardDialog(props: {
   }
   const display = (field: MetadataSyncField, value: string | number) => {
     if (field === 'status') {
-      return value === 1 ? t('Shown') : t('Not shown')
+      return value === 1 ? t('Enabled') : t('Disabled')
     }
     if (field === 'name_rule') {
       return (

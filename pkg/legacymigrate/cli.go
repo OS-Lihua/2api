@@ -427,13 +427,27 @@ func importSource(ctx context.Context, db *gorm.DB, target *url.URL, source *leg
 // must not be reused. pgloader resets sequences from MAX(id) and can omit the
 // generator on empty SQLite tables, so both need restoration before promotion.
 func restoreSourceIdentity(ctx context.Context, db *gorm.DB, source *legacySource, targetSchema string) error {
-	query := "SELECT m.name AS table_name,p.name AS column_name FROM sqlite_master m,pragma_table_info(m.name) p WHERE m.type='table' AND upper(m.sql) LIKE '%AUTOINCREMENT%' AND p.pk=1 AND lower(p.type)='integer'"
+	// A rowid alias generates IDs even without AUTOINCREMENT. A separate primary
+	// key index identifies non-aliases, including inline DESC and WITHOUT ROWID.
+	query := `SELECT m."name" AS "table_name",p."name" AS "column_name"
+ FROM "sqlite_master" m,pragma_table_info(m."name") p
+ WHERE m."type"='table' AND p."pk"=1 AND lower(p."type")='integer'
+ AND (SELECT count(*) FROM pragma_table_info(m."name") WHERE "pk">0)=1
+ AND NOT EXISTS (SELECT 1 FROM pragma_index_list(m."name") WHERE "origin"='pk')`
 	if source.kind == "mysql" {
 		query = "SELECT JSON_OBJECT('table_name',c.TABLE_NAME,'column_name',c.COLUMN_NAME,'last_value',CAST(COALESCE(t.AUTO_INCREMENT,1)-1 AS CHAR)) FROM information_schema.COLUMNS c JOIN information_schema.TABLES t ON t.TABLE_SCHEMA=c.TABLE_SCHEMA AND t.TABLE_NAME=c.TABLE_NAME WHERE c.TABLE_SCHEMA=DATABASE() AND c.EXTRA LIKE '%auto_increment%'"
 	}
 	columns, err := source.query(ctx, query)
 	if err != nil {
 		return err
+	}
+	hasSQLiteSequence := false
+	if source.kind == "sqlite" {
+		sequences, err := source.query(ctx, `SELECT "name" FROM "sqlite_master" WHERE "type"='table' AND "name"='sqlite_sequence'`)
+		if err != nil {
+			return err
+		}
+		hasSQLiteSequence = len(sequences) != 0
 	}
 	for _, column := range columns {
 		table, tableOK := column["table_name"].(string)
@@ -448,8 +462,8 @@ func restoreSourceIdentity(ctx context.Context, db *gorm.DB, source *legacySourc
 			if !ok {
 				return errors.New("invalid source identity high-water mark")
 			}
-		} else {
-			sequence, err := source.query(ctx, "SELECT CAST(seq AS TEXT) AS last_value FROM sqlite_sequence WHERE name='"+strings.ReplaceAll(table, "'", "''")+"'")
+		} else if hasSQLiteSequence {
+			sequence, err := source.query(ctx, `SELECT CAST("seq" AS TEXT) AS "last_value" FROM "sqlite_sequence" WHERE "name"='`+strings.ReplaceAll(table, "'", "''")+"'")
 			if err != nil || len(sequence) > 1 {
 				return errors.New("invalid source identity high-water mark")
 			}

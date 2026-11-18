@@ -32,6 +32,12 @@ import { SidebarModulesCard } from './components/sidebar-modules-card'
 import { useProfile } from './hooks'
 
 export function Profile() {
+  const userId = useAuthStore((state) => state.auth.user?.id)
+  const sessionId = useAuthStore((state) => state.auth.session?.sid)
+  return <ProfileContent key={`${userId}:${sessionId}`} />
+}
+
+function ProfileContent() {
   const { profile, loading, refreshProfile } = useProfile()
   const { status } = useStatus()
   const permissions = useAuthStore((s) => s.auth.user?.permissions)
@@ -42,9 +48,6 @@ export function Profile() {
   )
   const turnstileSiteKey = status?.turnstile_site_key || ''
   const canConfigureSidebar = permissions?.sidebar_settings !== false
-  // Older cached status payloads lack these fields; the site default is on.
-  const quotaRemindEnabled = status?.quota_remind_enabled !== false
-  const quotaRemindThreshold = status?.quota_remind_threshold ?? 0
 
   return (
     <Main>
@@ -61,8 +64,6 @@ export function Profile() {
                   profile={profile}
                   loading={loading}
                   onProfileUpdate={refreshProfile}
-                  quotaRemindEnabled={quotaRemindEnabled}
-                  quotaRemindThreshold={quotaRemindThreshold}
                 />
                 <LanguagePreferencesCard
                   profile={profile}

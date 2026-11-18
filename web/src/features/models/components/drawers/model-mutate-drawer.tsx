@@ -63,7 +63,6 @@ import {
 import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
-import { ModelPricingPanel } from '@/features/model-pricing/model-pricing-panel'
 import { RecommendationPicker } from '@/features/recommendations/recommendation-picker'
 import {
   createServerError,
@@ -88,7 +87,6 @@ export function ModelMutateDrawer(props: {
   open: boolean
   onOpenChange: (open: boolean) => void
   currentRow?: Model | null
-  initialSection?: 'metadata' | 'pricing'
 }) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
@@ -102,19 +100,9 @@ export function ModelMutateDrawer(props: {
       : props.currentRow
   const isEditing = Boolean(currentRow?.id)
   const hasModelName = Boolean(currentRow?.model_name)
-  const [section, setSection] = useState<string>(
-    props.initialSection ?? 'metadata'
-  )
-  const [pricingName, setPricingName] = useState('')
-  const [pricingVisited, setPricingVisited] = useState(
-    props.initialSection === 'pricing'
-  )
-  const [pricingDirty, setPricingDirty] = useState(false)
+  const [section, setSection] = useState('metadata')
   const [capabilitiesVisited, setCapabilitiesVisited] = useState(false)
   const [capabilitiesDirty, setCapabilitiesDirty] = useState(false)
-  const [pendingPricingName, setPendingPricingName] = useState<string | null>(
-    null
-  )
   const [closeConfirm, setCloseConfirm] = useState(false)
   const loadedKey = useRef('')
   const form = useForm({
@@ -152,20 +140,11 @@ export function ModelMutateDrawer(props: {
 
   useEffect(() => {
     if (!props.open) return
-    setSection(props.initialSection ?? 'metadata')
-    setPricingVisited(props.initialSection === 'pricing')
-    setPricingName('')
-    setPricingDirty(false)
+    setSection('metadata')
     setCapabilitiesVisited(false)
     setCapabilitiesDirty(false)
-    setPendingPricingName(null)
     setCloseConfirm(false)
-  }, [
-    props.open,
-    props.initialSection,
-    props.currentRow?.id,
-    props.currentRow?.model_name,
-  ])
+  }, [props.open, props.currentRow?.id, props.currentRow?.model_name])
 
   useEffect(() => {
     if (!props.open) {
@@ -193,11 +172,6 @@ export function ModelMutateDrawer(props: {
     meta: { errorToast: false },
     onMutate: () => form.clearErrors('root.server'),
     mutationFn: async (values: ModelFormValues) => {
-      if (pricingDirty && values.model_name !== currentRow?.model_name) {
-        throw new Error(
-          t('Save or discard pricing changes before renaming metadata.')
-        )
-      }
       const payload = transformFormDataToModelPayload(values)
       const response = currentRow?.id
         ? await updateModel({ ...payload, id: currentRow.id })
@@ -220,11 +194,11 @@ export function ModelMutateDrawer(props: {
       }
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: modelsQueryKeys.all }),
-        queryClient.invalidateQueries({ queryKey: ['pricing'] }),
+        queryClient.invalidateQueries({ queryKey: ['offering-catalog'] }),
         queryClient.invalidateQueries({ queryKey: vendorsQueryKeys.all }),
       ])
       toast.success(t('Model metadata saved'))
-      if (!pricingDirty && !capabilitiesDirty) props.onOpenChange(false)
+      if (!capabilitiesDirty) props.onOpenChange(false)
     },
     onError: (error) => {
       form.setError('root.server', {
@@ -244,7 +218,7 @@ export function ModelMutateDrawer(props: {
   const metadataDirty = form.formState.isDirty
   const close = (open: boolean) => {
     if (!open && isSubmitting) return
-    if (!open && (metadataDirty || pricingDirty || capabilitiesDirty)) {
+    if (!open && (metadataDirty || capabilitiesDirty)) {
       setCloseConfirm(true)
       return
     }
@@ -263,7 +237,7 @@ export function ModelMutateDrawer(props: {
             </SheetTitle>
             <SheetDescription>
               {t(
-                'Manage metadata, pricing, and channel connections. Each section saves separately.'
+                'Manage metadata, capabilities, and channel connections. Each section saves separately.'
               )}
             </SheetDescription>
           </SheetHeader>
@@ -271,12 +245,11 @@ export function ModelMutateDrawer(props: {
             value={section}
             onValueChange={(value) => {
               setSection(value)
-              if (value === 'pricing') setPricingVisited(true)
               if (value === 'capabilities') setCapabilitiesVisited(true)
             }}
             className='shrink-0 px-4'
           >
-            <TabsList className='grid w-full grid-cols-4 group-data-horizontal/tabs:h-auto'>
+            <TabsList className='grid w-full grid-cols-3 group-data-horizontal/tabs:h-auto'>
               <TabsTrigger
                 value='metadata'
                 className='h-auto min-w-0 whitespace-normal'
@@ -291,18 +264,11 @@ export function ModelMutateDrawer(props: {
                 {t('Capabilities')}
               </TabsTrigger>
               <TabsTrigger
-                value='pricing'
-                disabled={!hasModelName}
-                className='h-auto min-w-0 whitespace-normal'
-              >
-                {t('Pricing')}
-              </TabsTrigger>
-              <TabsTrigger
                 value='connections'
                 disabled={!hasModelName}
                 className='h-auto min-w-0 whitespace-normal'
               >
-                {t('Channels and groups')}
+                {t('Channels')}
               </TabsTrigger>
             </TabsList>
           </Tabs>
@@ -349,7 +315,7 @@ export function ModelMutateDrawer(props: {
                                   currentRow?.model_name && (
                                   <span className='text-warning mt-1 block'>
                                     {t(
-                                      'Renaming metadata does not rename channel models or move pricing. Existing prices stay with the original model name.'
+                                      'Renaming metadata does not rename Offering names or channel models.'
                                     )}
                                   </span>
                                 )}
@@ -498,9 +464,7 @@ export function ModelMutateDrawer(props: {
                               </RadioGroup>
                             </FormControl>
                             <FormDescription>
-                              {t(
-                                'Matching rules apply to metadata. Pricing is configured for each concrete model.'
-                              )}
+                              {t('Matching rules apply to metadata only.')}
                             </FormDescription>
                             <FormMessage />
                           </FormItem>
@@ -571,11 +535,11 @@ export function ModelMutateDrawer(props: {
                           <FormItem className={sideDrawerSwitchItemClassName()}>
                             <div className='flex flex-col gap-0.5'>
                               <FormLabel className='text-base'>
-                                {t('Model square visibility')}
+                                {t('Metadata status')}
                               </FormLabel>
                               <FormDescription>
                                 {t(
-                                  'Allow listing when a channel is available and the user has group access. This does not change API access.'
+                                  'Metadata status does not change Offering visibility or API authorization.'
                                 )}
                               </FormDescription>
                             </div>
@@ -665,58 +629,6 @@ export function ModelMutateDrawer(props: {
               />
             </div>
           )}
-          {props.open && pricingVisited && savedModel && (
-            <div
-              className={
-                section === 'pricing'
-                  ? 'flex min-h-0 flex-1 flex-col'
-                  : 'hidden'
-              }
-            >
-              {savedModel.name_rule !== 0 && (
-                <div className='space-y-2 p-4'>
-                  <p className='text-muted-foreground text-sm'>
-                    {t(
-                      'Select a concrete model to configure pricing. Metadata matching does not propagate prices.'
-                    )}
-                  </p>
-                  <Combobox
-                    value={pricingName}
-                    onValueChange={(value) => {
-                      if (pricingDirty) {
-                        setPendingPricingName(value ?? '')
-                        setCloseConfirm(true)
-                      } else {
-                        setPricingName(value ?? '')
-                      }
-                    }}
-                    options={(savedModel.matched_models ?? []).map((name) => ({
-                      value: name,
-                      label: name,
-                    }))}
-                    aria-label={t('Select model')}
-                    className='w-full'
-                    placeholder={t('Select model')}
-                  />
-                </div>
-              )}
-              {(savedModel.name_rule === 0 || pricingName) && (
-                <ModelPricingPanel
-                  onDirtyChange={setPricingDirty}
-                  key={
-                    savedModel.name_rule === 0
-                      ? savedModel.model_name
-                      : pricingName
-                  }
-                  modelName={
-                    savedModel.name_rule === 0
-                      ? savedModel.model_name
-                      : pricingName
-                  }
-                />
-              )}
-            </div>
-          )}
           {props.open && section === 'connections' && savedModel && (
             <ModelConnections model={savedModel} />
           )}
@@ -730,13 +642,7 @@ export function ModelMutateDrawer(props: {
         confirmText={t('Discard changes')}
         handleConfirm={() => {
           setCloseConfirm(false)
-          if (pendingPricingName !== null) {
-            setPricingName(pendingPricingName)
-            setPendingPricingName(null)
-            setPricingDirty(false)
-          } else {
-            props.onOpenChange(false)
-          }
+          props.onOpenChange(false)
         }}
       />
     </>

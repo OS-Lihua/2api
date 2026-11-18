@@ -13,6 +13,8 @@ var _ channel.ProviderProtocolComposer = (*Provider)(nil)
 
 func (p *Provider) ComposeProtocol(kind protocol.Type, generic channel.ProtocolHandler) (channel.ProtocolHandler, error) {
 	switch kind {
+	case protocol.DeepSeekTools:
+		return generic, nil
 	case protocol.OpenAIChat, protocol.OpenAIResponses, protocol.AnthropicMessages:
 		return &channel.RequestRepairProtocol{Kind: kind, Public: generic, Provider: p, ProviderRendersReasoning: kind == protocol.AnthropicMessages}, nil
 	default:

@@ -18,7 +18,6 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useQuery } from '@tanstack/react-query'
-import { Pencil } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
@@ -71,8 +70,6 @@ import {
   normalizeAdminPermissions,
   type AdminPermissionMatrix,
 } from '@/lib/admin-permissions'
-import { getCurrencyDisplay, getCurrencyLabel } from '@/lib/currency'
-import { formatQuota, parseQuotaFromDollars } from '@/lib/format'
 import { handleServerError } from '@/lib/handle-server-error'
 import { accountPasswordSchema } from '@/lib/password-policy'
 import { ROLE } from '@/lib/roles'
@@ -96,7 +93,7 @@ import {
   transformUserToFormDefaults,
 } from '../lib'
 import type { User } from '../types'
-import { UserQuotaDialog } from './user-quota-dialog'
+import { UserWalletDialog } from './user-wallet-dialog'
 import { useUsers } from './users-provider'
 
 type UsersMutateDrawerProps = {
@@ -114,8 +111,9 @@ export function UsersMutateDrawer({
   const isUpdate = !!currentRow
   const { triggerRefresh, requestVerification } = useUsers()
   const currentUser = useAuthStore((s) => s.auth.user)
+  const sessionId = useAuthStore((s) => s.auth.session?.sid ?? null)
   const [isSubmitting, setIsSubmitting] = useState(false)
-  const [quotaDialogOpen, setQuotaDialogOpen] = useState(false)
+  const [walletDialogOpen, setWalletDialogOpen] = useState(false)
   // Matrix as loaded from the server; an unchanged matrix is not resubmitted so
   // routine edits of an administrator do not require step-up verification.
   const loadedPermissions = useRef<AdminPermissionMatrix | undefined>(undefined)
@@ -161,11 +159,7 @@ export function UsersMutateDrawer({
     }
   }, [open, isUpdate, currentRow, form, t])
 
-  const { meta: currencyMeta } = getCurrencyDisplay()
-  const currencyLabel = getCurrencyLabel()
-  const tokensOnly = currencyMeta.kind === 'tokens'
-
-  const currentQuotaRaw = form.watch('quota_dollars') || 0
+  const canReadWallet = hasPermission(currentUser, 'ledger', 'read')
   const selectedRole = form.watch('role')
   const canEditAdminPermissions = currentUser?.role === ROLE.SUPER_ADMIN
   const targetIsAdmin = (selectedRole ?? currentRow?.role ?? 0) >= ROLE.ADMIN
@@ -258,20 +252,6 @@ export function UsersMutateDrawer({
     }
   }
 
-  const refreshUserData = async () => {
-    if (!currentRow) return
-    try {
-      const result = requireServerSuccess(await getUser(currentRow.id))
-      if (result.success && result.data) {
-        loadedPermissions.current = result.data.admin_permissions
-        form.reset(transformUserToFormDefaults(result.data))
-      }
-      triggerRefresh()
-    } catch (error) {
-      handleServerError(error, t('Failed to load'))
-    }
-  }
-
   return (
     <>
       <Sheet
@@ -279,6 +259,7 @@ export function UsersMutateDrawer({
         onOpenChange={(v) => {
           onOpenChange(v)
           if (!v) {
+            setWalletDialogOpen(false)
             form.reset()
           }
         }}
@@ -410,10 +391,10 @@ export function UsersMutateDrawer({
                 />
               </SideDrawerSection>
 
-              {/* Group & Quota Settings (Update only) */}
+              {/* Group settings (Update only) */}
               {isUpdate && (
                 <SideDrawerSection>
-                  <h3 className='text-sm font-medium'>{t('Group & Quota')}</h3>
+                  <h3 className='text-sm font-medium'>{t('Group')}</h3>
 
                   <FormField
                     control={form.control}
@@ -438,44 +419,15 @@ export function UsersMutateDrawer({
                     )}
                   />
 
-                  <FormField
-                    control={form.control}
-                    name='quota_dollars'
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>
-                          {t('Remaining Quota ({{currency}})', {
-                            currency: currencyLabel,
-                          })}
-                        </FormLabel>
-                        <div className='flex gap-2'>
-                          <FormControl>
-                            <Input
-                              value={
-                                tokensOnly
-                                  ? String(field.value || 0)
-                                  : (field.value || 0).toFixed(6)
-                              }
-                              readOnly
-                              className='flex-1'
-                            />
-                          </FormControl>
-                          <Button
-                            type='button'
-                            variant='outline'
-                            onClick={() => setQuotaDialogOpen(true)}
-                          >
-                            <Pencil className='mr-1 h-4 w-4' />
-                            {t('Adjust Quota')}
-                          </Button>
-                        </div>
-                        <FormDescription>
-                          {formatQuota(parseQuotaFromDollars(field.value || 0))}
-                        </FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
+                  {canReadWallet && (
+                    <Button
+                      type='button'
+                      variant='outline'
+                      onClick={() => setWalletDialogOpen(true)}
+                    >
+                      {t('Wallet')}
+                    </Button>
+                  )}
 
                   <FormField
                     control={form.control}
@@ -592,14 +544,12 @@ export function UsersMutateDrawer({
         </SheetContent>
       </Sheet>
 
-      {/* Adjust Quota Dialog */}
-      {currentRow && (
-        <UserQuotaDialog
-          open={quotaDialogOpen}
-          onOpenChange={setQuotaDialogOpen}
-          userId={currentRow.id}
-          currentQuota={parseQuotaFromDollars(currentQuotaRaw || 0)}
-          onSuccess={refreshUserData}
+      {open && walletDialogOpen && currentRow && canReadWallet && (
+        <UserWalletDialog
+          key={`${currentUser?.id}:${sessionId}:${currentRow.id}`}
+          user={currentRow}
+          onClose={() => setWalletDialogOpen(false)}
+          onSuccess={triggerRefresh}
         />
       )}
     </>

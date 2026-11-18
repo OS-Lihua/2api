@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 const (
@@ -103,6 +105,107 @@ func storedProvider(t *testing.T, id int) *model.Provider {
 	provider, err := model.GetProviderById(id, true)
 	require.NoError(t, err)
 	return provider
+}
+
+func TestProviderAdminAPIRejectsRetiredRoutingFields(t *testing.T) {
+	engine := newProviderAdminEngine(t)
+	settings := ` {"tool_loss_policy":"legacy-unknown","aws_region":"us-east-1"} `
+	provider := &model.Provider{Type: constant.ChannelTypeOpenAI, Name: "existing account", Key: providerKeyA, Models: "legacy-model", Group: "legacy-group", OtherSettings: settings}
+	require.NoError(t, provider.Insert())
+	path := "/" + common.Interface2String(provider.Id)
+	before := storedProvider(t, provider.Id)
+
+	cases := []struct {
+		name   string
+		fields map[string]any
+	}{
+		{"models", map[string]any{"models": "new-model"}},
+		{"empty models", map[string]any{"models": ""}},
+		{"null models", map[string]any{"models": nil}},
+		{"case insensitive models", map[string]any{"MoDeLs": "new-model"}},
+		{"unicode folded models", map[string]any{"modelſ": "new-model"}},
+		{"unicode folded settings", map[string]any{"ſettings": `{"tool_loss_policy":"allow"}`}},
+		{"model mapping", map[string]any{"model_mapping": `{"public":"upstream"}`}},
+		{"group", map[string]any{"group": "new-group"}},
+		{"priority", map[string]any{"priority": 100}},
+		{"weight", map[string]any{"weight": 10}},
+		{"top level loss policy", map[string]any{"tool_loss_policy": "allow"}},
+		{"nested loss policy", map[string]any{"settings": `{"tool_loss_policy":"allow","aws_region":"us-west-2"}`}},
+		{"case insensitive loss policy", map[string]any{"Settings": `{"TOOL_LOSS_POLICY":"allow"}`}},
+		{"null loss policy", map[string]any{"settings": `{"tool_loss_policy":null}`}},
+		{"escaped loss policy", map[string]any{"settings": "{\"tool_loss_poli\\u0063y\":\"allow\"}"}},
+	}
+	for _, tc := range cases {
+		for _, method := range []string{http.MethodPost, http.MethodPatch} {
+			t.Run(tc.name+"/"+method, func(t *testing.T) {
+				fields := map[string]any{"name": "rejected rename", "key": providerKeyB}
+				for name, value := range tc.fields {
+					fields[name] = value
+				}
+				endpoint := path
+				var body any = fields
+				if method == http.MethodPost {
+					endpoint = ""
+					fields["type"] = constant.ChannelTypeOpenAI
+					body = map[string]any{"provider": fields}
+				}
+				encoded, err := common.Marshal(body)
+				require.NoError(t, err)
+				var providers, abilities, audits int64
+				require.NoError(t, model.DB.Model(&model.Provider{}).Count(&providers).Error)
+				require.NoError(t, model.DB.Model(&model.Ability{}).Count(&abilities).Error)
+				require.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).Where("success = ?", true).Count(&audits).Error)
+				reply := callProviderAPIStatus(t, engine, http.StatusBadRequest, method, endpoint, string(encoded))
+				assert.False(t, reply.Success)
+				assert.Equal(t, before, storedProvider(t, provider.Id), "a rejected field must not rename or rotate the account")
+				var after int64
+				require.NoError(t, model.DB.Model(&model.Provider{}).Count(&after).Error)
+				assert.Equal(t, providers, after)
+				require.NoError(t, model.DB.Model(&model.Ability{}).Count(&after).Error)
+				assert.Equal(t, abilities, after)
+				require.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).Where("success = ?", true).Count(&after).Error)
+				assert.Equal(t, audits, after, "rejection remains audited without recording a successful mutation")
+			})
+		}
+	}
+
+	updated := callProviderAPI(t, engine, http.MethodPatch, path, `{"name":"renamed account","key":""}`)
+	require.True(t, updated.Success, updated.Message)
+	current := storedProvider(t, provider.Id)
+	assert.Equal(t, "renamed account", current.Name)
+	assert.Equal(t, before.Key, current.Key)
+	assert.Equal(t, before.Models, current.Models)
+	assert.Equal(t, before.Group, current.Group)
+	assert.Equal(t, settings, current.OtherSettings, "ordinary updates preserve stored configuration without resubmitting retired fields")
+}
+
+func TestProviderSettingsRetainValidationWithRetiredLossPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name, setting, other, wantError string
+		providerType                    int
+	}{
+		{name: "unknown historical policy", other: `{"tool_loss_policy":"legacy-unknown","aws_region":"us-east-1"}`},
+		{name: "invalid policy JSON type", other: `{"tool_loss_policy":17}`, wantError: "cannot unmarshal"},
+		{name: "invalid settings JSON", setting: `{`, wantError: "unexpected end"},
+		{name: "invalid other settings JSON", other: `{`, wantError: "unexpected end"},
+		{name: "proxy still checked", setting: `{"proxy":"ftp://localhost"}`, other: `{"tool_loss_policy":"legacy-unknown"}`, wantError: "invalid channel proxy"},
+		{name: "transport still checked", setting: `{"http_protocol":"http1","http2_connection_shards":2}`, other: `{"tool_loss_policy":"legacy-unknown"}`, wantError: "http2_connection_shards"},
+		{name: "advanced config still required", providerType: constant.ChannelTypeAdvancedCustom, other: `{"tool_loss_policy":"legacy-unknown"}`, wantError: "advanced_custom is required"},
+		{name: "advanced config still checked", providerType: constant.ChannelTypeAdvancedCustom, other: `{"tool_loss_policy":"legacy-unknown","advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/chat/completions","upstream_path":"/v1/chat/completions","converter":"invalid"}]}}`, wantError: "converter"},
+		{name: "discovery route still required", providerType: constant.ChannelTypeAdvancedCustom, other: `{"tool_loss_policy":"legacy-unknown","upstream_model_update_check_enabled":true,"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/chat/completions","upstream_path":"/v1/chat/completions","converter":"none"}]}}`, wantError: "/v1/models"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := model.Provider{Type: tc.providerType, Setting: &tc.setting, OtherSettings: tc.other}
+			err := provider.ValidateSettings()
+			if tc.wantError == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, tc.wantError)
+			}
+			assert.Equal(t, tc.setting, *provider.Setting)
+			assert.Equal(t, tc.other, provider.OtherSettings)
+		})
+	}
 }
 
 func TestProviderAdminAPIKeepsURLCredentialsWriteOnly(t *testing.T) {
@@ -237,12 +340,254 @@ func TestProviderAdminAPISearchDoesNotProbeHiddenURLValues(t *testing.T) {
 	}
 }
 
+func TestProviderAdminAPIIgnoresLegacyAbilityWrites(t *testing.T) {
+	for _, operation := range []string{"create", "batch_create", "direct_insert", "patch", "replace", "append", "disable", "enable", "key_disable", "key_enable", "keys_disable", "keys_enable", "key_delete", "disabled_delete", "delete", "batch_delete"} {
+		t.Run(operation, func(t *testing.T) {
+			engine := newProviderAdminEngine(t)
+			provider := &model.Provider{Name: "legacy projection owner", Type: constant.ChannelTypeOpenAI,
+				Key: providerKeyA + "\n" + providerKeyB + "\n" + providerKeyC, Status: common.ChannelStatusEnabled,
+				Models: "legacy-model", Group: "legacy-group", ProviderInfo: model.ProviderInfo{
+					IsMultiKey: true, MultiKeySize: 3, MultiKeyMode: constant.MultiKeyModePolling,
+					MultiKeyStatusList: map[int]int{1: common.ChannelStatusManuallyDisabled}}}
+			if operation == "enable" {
+				provider.Status = common.ChannelStatusManuallyDisabled
+			} else if operation == "disabled_delete" {
+				provider.ProviderInfo.MultiKeyStatusList[1] = common.ChannelStatusAutoDisabled
+			}
+			require.NoError(t, model.DB.Create(provider).Error)
+			// Historical tools still construct source projections explicitly.
+			require.NoError(t, provider.AddAbilities(nil))
+			var before []model.Ability
+			require.NoError(t, model.DB.Order(`"channel_id", "group", "model"`).Find(&before).Error)
+			require.Len(t, before, 1)
+			require.NoError(t, model.DB.Exec(`CREATE FUNCTION reject_legacy_projection_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'legacy projection is read only'; END $$`).Error)
+			require.NoError(t, model.DB.Exec(`CREATE TRIGGER reject_legacy_projection_write BEFORE INSERT OR UPDATE OR DELETE ON "abilities" FOR EACH STATEMENT EXECUTE FUNCTION reject_legacy_projection_write()`).Error)
+			path := "/" + common.Interface2String(provider.Id)
+			method, body := http.MethodPatch, `{"name":"updated account","key":""}`
+			wantKey, wantStatus, wantCount := provider.Key, provider.Status, int64(1)
+			var direct bool
+			switch operation {
+			case "create", "batch_create":
+				method, path = http.MethodPost, ""
+				body = `{"provider":{"name":"new account","type":1,"key":"` + providerKeyA + `"}}`
+				wantCount = 2
+				if operation == "batch_create" {
+					body = `{"mode":"batch","provider":{"name":"new accounts","type":1,"key":"` + providerKeyA + `\n` + providerKeyB + `"}}`
+					wantCount = 3
+				}
+			case "direct_insert":
+				direct, wantCount = true, 2
+				inserted := &model.Provider{Name: "direct account", Type: constant.ChannelTypeOpenAI, Key: providerKeyA, Status: common.ChannelStatusEnabled}
+				require.NoError(t, inserted.Insert())
+				require.NotZero(t, inserted.Id)
+			case "replace":
+				body, wantKey = `{"key":"`+providerKeyC+`","key_mode":"replace"}`, providerKeyC
+			case "append":
+				body = `{"key":"sk-provider-added","key_mode":"append"}`
+				wantKey += "\nsk-provider-added"
+			case "disable", "enable":
+				method, path, body = http.MethodPost, path+"/"+operation, ""
+				wantStatus = common.ChannelStatusManuallyDisabled
+				if operation == "enable" {
+					wantStatus = common.ChannelStatusEnabled
+				}
+			case "key_disable", "key_enable":
+				method, body = http.MethodPost, ""
+				path += "/keys/0/disable"
+				if operation == "key_enable" {
+					path = "/" + common.Interface2String(provider.Id) + "/keys/1/enable"
+				}
+			case "keys_disable", "keys_enable":
+				method, path, body = http.MethodPost, path+"/keys/"+strings.TrimPrefix(operation, "keys_"), ""
+				if operation == "keys_disable" {
+					wantStatus = common.ChannelStatusManuallyDisabled
+				}
+			case "key_delete", "disabled_delete":
+				method, path, body = http.MethodDelete, path+"/keys/1", ""
+				if operation == "disabled_delete" {
+					path = "/" + common.Interface2String(provider.Id) + "/keys/disabled"
+				}
+				wantKey = providerKeyA + "\n" + providerKeyC
+			case "delete":
+				method, body, wantCount = http.MethodDelete, "", 0
+			case "batch_delete":
+				direct, wantCount = true, 0
+				deleted, err := model.BatchDeleteProviders([]int{provider.Id})
+				require.NoError(t, err)
+				assert.EqualValues(t, 1, deleted)
+			}
+			if !direct {
+				reply := callProviderAPI(t, engine, method, path, body)
+				require.True(t, reply.Success, reply.Message)
+				if operation == "create" || operation == "batch_create" {
+					ids := reply.Data["ids"].([]any)
+					require.Len(t, ids, int(wantCount)-1)
+					for _, id := range ids {
+						assert.NotZero(t, storedProvider(t, int(id.(float64))).Id)
+					}
+				}
+			}
+			var count int64
+			require.NoError(t, model.DB.Model(&model.Provider{}).Count(&count).Error)
+			assert.Equal(t, wantCount, count)
+			if wantCount != 0 {
+				current := storedProvider(t, provider.Id)
+				assert.Equal(t, wantKey, current.Key)
+				assert.Equal(t, wantStatus, current.Status)
+				assert.Equal(t, provider.Models, current.Models)
+				assert.Equal(t, provider.Group, current.Group)
+				if operation == "patch" {
+					assert.Equal(t, "updated account", current.Name)
+				}
+				if operation == "key_enable" || operation == "keys_enable" {
+					assert.Empty(t, current.ProviderInfo.MultiKeyStatusList)
+				}
+				if operation == "key_disable" {
+					assert.Equal(t, common.ChannelStatusManuallyDisabled, current.ProviderInfo.MultiKeyStatusList[0])
+				}
+			}
+			var after []model.Ability
+			require.NoError(t, model.DB.Order(`"channel_id", "group", "model"`).Find(&after).Error)
+			assert.Equal(t, before, after, "account mutations must leave the historical projection untouched")
+		})
+	}
+}
+
+func TestProviderAdminAPICacheDoesNotDependOnLegacyAbilities(t *testing.T) {
+	for _, failure := range []string{"read_forbidden", "table_unavailable"} {
+		t.Run(failure, func(t *testing.T) {
+			engine := newProviderAdminEngine(t)
+			provider := &model.Provider{Name: "account without legacy projection", Type: constant.ChannelTypeOpenAI,
+				Key: providerKeyA + "\n" + providerKeyB, Status: common.ChannelStatusEnabled, Group: "orphan-group", Models: "legacy-only-model",
+				ProviderInfo: model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}}
+			require.NoError(t, provider.Insert())
+			original := model.DB
+			transaction := original
+			t.Cleanup(func() {
+				if transaction != original {
+					require.NoError(t, transaction.Rollback().Error)
+				}
+				model.DB = original
+				common.MemoryCacheEnabled = false
+			})
+			var legacyReads atomic.Int32
+			require.NoError(t, original.Callback().Query().Before("gorm:query").Register("forbid_account_ability_reads", func(tx *gorm.DB) {
+				if tx.Statement.Table == "abilities" {
+					legacyReads.Add(1)
+					tx.AddError(errors.New("legacy ability reads forbidden"))
+				}
+			}))
+			t.Cleanup(func() { require.NoError(t, original.Callback().Query().Remove("forbid_account_ability_reads")) })
+			require.NoError(t, original.Exec(`CREATE FUNCTION reject_account_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'legacy projection writes forbidden'; END $$`).Error)
+			require.NoError(t, original.Exec(`CREATE TRIGGER reject_account_projection BEFORE INSERT OR UPDATE OR DELETE ON "abilities" FOR EACH STATEMENT EXECUTE FUNCTION reject_account_projection()`).Error)
+			if failure == "table_unavailable" {
+				transaction = original.Begin()
+				require.NoError(t, transaction.Error)
+				model.DB = transaction
+				require.NoError(t, transaction.Exec(`ALTER TABLE "abilities" RENAME TO "unavailable_legacy_abilities"`).Error)
+			}
+			common.MemoryCacheEnabled = true
+			require.NotPanics(t, model.InitProviderCache)
+			cached, err := model.CacheGetProvider(provider.Id)
+			require.NoError(t, err)
+			key, slot, keyErr := cached.GetNextEnabledKey()
+			require.Nil(t, keyErr)
+			assert.Equal(t, providerKeyA, key)
+			assert.Zero(t, slot)
+			require.NotPanics(t, model.InitProviderCache)
+			cached, err = model.CacheGetProvider(provider.Id)
+			require.NoError(t, err)
+			key, slot, keyErr = cached.GetNextEnabledKey()
+			require.Nil(t, keyErr)
+			assert.Equal(t, providerKeyB, key, "refresh must preserve the polling cursor")
+			assert.Equal(t, 1, slot)
+			// CRUD owns its own transactions. Restore this DDL transaction first;
+			// the read/write rejection guards remain active for every API operation.
+			if transaction != original {
+				require.NoError(t, transaction.Rollback().Error)
+				transaction, model.DB = original, original
+			}
+			path := "/" + common.Interface2String(provider.Id)
+			for _, operation := range []struct{ method, path, body string }{
+				{http.MethodPost, "", `{"provider":{"type":1,"name":"new cache-only account","key":"` + providerKeyC + `"}}`},
+				{http.MethodPatch, path, `{"name":"renamed cache-only account"}`},
+				{http.MethodPost, path + "/disable", ""},
+				{http.MethodPost, path + "/enable", ""},
+				{http.MethodPost, path + "/keys/0/disable", ""},
+			} {
+				reply := callProviderAPI(t, engine, operation.method, operation.path, operation.body)
+				require.True(t, reply.Success, reply.Message)
+			}
+			cached, err = model.CacheGetProvider(provider.Id)
+			require.NoError(t, err)
+			assert.Equal(t, "renamed cache-only account", cached.Name)
+			assert.Equal(t, common.ChannelStatusEnabled, cached.Status)
+			assert.Equal(t, common.ChannelStatusManuallyDisabled, cached.ProviderInfo.MultiKeyStatusList[0])
+			assert.Zero(t, legacyReads.Load(), "account refresh must never query the historical route projection")
+		})
+	}
+}
+
+func TestProviderAdminAPIAccountTransactionsRemainAtomic(t *testing.T) {
+	for _, operation := range []string{"batch_insert", "batch_delete", "channel_reference"} {
+		t.Run(operation, func(t *testing.T) {
+			engine := newProviderAdminEngine(t)
+			if operation == "channel_reference" {
+				require.NoError(t, model.DB.AutoMigrate(&model.Model{}, &model.Channel{}))
+				provider := &model.Provider{Name: "referenced account", Type: constant.ChannelTypeOpenAI, Key: providerKeyA}
+				require.NoError(t, provider.Insert())
+				unified := &model.Model{ModelName: "referenced model", Status: 1}
+				require.NoError(t, model.DB.Create(unified).Error)
+				channel := &model.Channel{ProviderID: provider.Id, ModelID: unified.Id, Protocol: "openai_chat", UpstreamModelName: "upstream", ParameterOverrides: "{}", Status: model.ChannelPending}
+				require.NoError(t, model.DB.Create(channel).Error)
+				reply := callProviderAPIStatus(t, engine, http.StatusBadRequest, http.MethodDelete, "/"+common.Interface2String(provider.Id), "")
+				assert.False(t, reply.Success)
+				assert.Equal(t, provider.Key, storedProvider(t, provider.Id).Key)
+				var retained model.Channel
+				require.NoError(t, model.DB.First(&retained, channel.ID).Error)
+				assert.Equal(t, provider.Id, retained.ProviderID)
+				return
+			}
+			rows := make([]model.Provider, 201)
+			for i := range rows {
+				rows[i] = model.Provider{Name: "transaction-account-" + common.Interface2String(i), Type: constant.ChannelTypeOpenAI, Key: providerKeyA}
+			}
+			rows[len(rows)-1].Name = "reject-last-account"
+			if operation == "batch_insert" {
+				require.NoError(t, model.DB.Exec(`CREATE FUNCTION reject_account_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW."name" = 'reject-last-account' THEN RAISE EXCEPTION 'account insert rejected'; END IF; RETURN NEW; END $$`).Error)
+				require.NoError(t, model.DB.Exec(`CREATE TRIGGER reject_account_insert AFTER INSERT ON "providers" FOR EACH ROW EXECUTE FUNCTION reject_account_insert()`).Error)
+				require.ErrorContains(t, model.BatchInsertProviders(rows), "account insert rejected")
+				var count int64
+				require.NoError(t, model.DB.Model(&model.Provider{}).Count(&count).Error)
+				assert.Zero(t, count, "a later chunk failure must roll back every prior inserted account")
+			} else {
+				require.NoError(t, model.BatchInsertProviders(rows))
+				ids := make([]int, len(rows))
+				for i := range rows {
+					require.NotZero(t, rows[i].Id)
+					ids[i] = rows[i].Id
+				}
+				var before []model.Provider
+				require.NoError(t, model.DB.Order("id").Find(&before).Error)
+				require.NoError(t, model.DB.Exec(`CREATE FUNCTION reject_account_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD."name" = 'reject-last-account' THEN RAISE EXCEPTION 'account delete rejected'; END IF; RETURN OLD; END $$`).Error)
+				require.NoError(t, model.DB.Exec(`CREATE TRIGGER reject_account_delete AFTER DELETE ON "providers" FOR EACH ROW EXECUTE FUNCTION reject_account_delete()`).Error)
+				count, err := model.BatchDeleteProviders(ids)
+				require.ErrorContains(t, err, "account delete rejected")
+				assert.Zero(t, count)
+				var after []model.Provider
+				require.NoError(t, model.DB.Order("id").Find(&after).Error)
+				assert.Equal(t, before, after, "a second delete chunk failure must restore every account")
+			}
+		})
+	}
+}
+
 func TestProviderAdminAPIManagesProviderWithWriteOnlyKeys(t *testing.T) {
 	engine := newProviderAdminEngine(t)
 
 	created := callProviderAPI(t, engine, http.MethodPost, "", `{"mode":"multi_to_single","multi_key_mode":"polling","provider":{
 		"name":"account one","type":1,"key":"`+providerKeyA+`\n`+providerKeyB+`\n`+providerKeyC+`",
-		"models":"gpt-test","group":"default","base_url":"https://upstream.example"}}`)
+		"base_url":"https://upstream.example"}}`)
 	require.True(t, created.Success, created.Message)
 	ids := created.Data["ids"].([]any)
 	require.Len(t, ids, 1)
@@ -504,7 +849,16 @@ func TestProviderAdminAPIRejectsInvalidRequestsWithBadRequest(t *testing.T) {
 		name, method, path, body string
 	}{
 		{name: "create without provider", method: http.MethodPost, path: "", body: `{"mode":"single"}`},
-		{name: "unsupported add mode", method: http.MethodPost, path: "", body: `{"mode":"copy","provider":{"name":"x","type":1,"key":"` + providerKeyB + `","models":"gpt-test","group":"default"}}`},
+		{name: "unsupported add mode", method: http.MethodPost, path: "", body: `{"mode":"copy","provider":{"name":"x","type":1,"key":"` + providerKeyB + `"}}`},
+		{name: "duplicate create envelope", method: http.MethodPost, path: "", body: `{"provider":{"models":"legacy"},"provider":{"name":"x","type":1,"key":"` + providerKeyB + `"}}`},
+		{name: "trailing create object", method: http.MethodPost, path: "", body: `{"provider":{"name":"x","type":1,"key":"` + providerKeyB + `"}} {}`},
+		{name: "null create object", method: http.MethodPost, path: "", body: `{"provider":null}`},
+		{name: "duplicate update field", method: http.MethodPatch, path: path, body: `{"name":"first","name":"second"}`},
+		{name: "trailing update object", method: http.MethodPatch, path: path, body: `{"name":"changed"} {}`},
+		{name: "null update object", method: http.MethodPatch, path: path, body: `null`},
+		{name: "non-object settings", method: http.MethodPatch, path: path, body: `{"settings":"[]"}`},
+		{name: "duplicate settings field", method: http.MethodPatch, path: path, body: `{"settings":"{\"aws_region\":\"us-east-1\",\"aws_region\":\"us-west-2\"}"}`},
+		{name: "trailing settings object", method: http.MethodPatch, path: path, body: `{"settings":"{} {}"}`},
 		{name: "status in update body", method: http.MethodPatch, path: path, body: `{"status":2}`},
 		{name: "key actions on a single-key provider", method: http.MethodGet, path: path + "/keys", body: ""},
 		{name: "credential prefix in name", method: http.MethodPost, path: "", body: `{"mode":"batch","batch_add_set_key_prefix_2_name":true,"provider":{"name":"x","type":1,"key":"` + providerKeyB + `\\n` + providerKeyC + `"}}`},
@@ -516,5 +870,9 @@ func TestProviderAdminAPIRejectsInvalidRequestsWithBadRequest(t *testing.T) {
 			assert.NotEmpty(t, reply.Message)
 		})
 	}
-	assert.Equal(t, common.ChannelStatusEnabled, storedProvider(t, provider.Id).Status)
+	current := storedProvider(t, provider.Id)
+	assert.Equal(t, common.ChannelStatusEnabled, current.Status)
+	assert.Equal(t, "single key account", current.Name)
+	assert.Equal(t, providerKeyA, current.Key)
+	assert.Empty(t, current.OtherSettings)
 }

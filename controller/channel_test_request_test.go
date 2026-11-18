@@ -9,7 +9,6 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel/ali"
 	"github.com/QuantumNous/new-api/relay/channel/cloudflare"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
@@ -75,18 +74,17 @@ func convertChatCompatibilityRequest(t *testing.T, request *dto.GeneralOpenAIReq
 	return encoded
 }
 
-func TestChannelTestOpenAIChatCompatibility(t *testing.T) {
+func TestOpenAIChatMappedRequestCompatibility(t *testing.T) {
 	for _, tt := range []struct {
 		name        string
 		model       string
 		upstream    string
-		endpoint    string
 		channelType int
 		stream      bool
 		wantLimit   string
 	}{
 		{name: "GPT6 automatic", model: "gpt-6-astra", upstream: "gpt-6-astra", channelType: constant.ChannelTypeOpenAI, wantLimit: "max_completion_tokens"},
-		{name: "GPT6 explicit Azure stream", model: "gpt-6-astra", upstream: "gpt-6-astra", endpoint: string(constant.EndpointTypeOpenAI), channelType: constant.ChannelTypeAzure, stream: true, wantLimit: "max_completion_tokens"},
+		{name: "GPT6 explicit Azure stream", model: "gpt-6-astra", upstream: "gpt-6-astra", channelType: constant.ChannelTypeAzure, stream: true, wantLimit: "max_completion_tokens"},
 		{name: "GPT6 sol", model: "gpt-6-sol", upstream: "gpt-6-sol", channelType: constant.ChannelTypeOpenAI, wantLimit: "max_completion_tokens"},
 		{name: "GPT6 luna", model: "gpt-6-luna", upstream: "gpt-6-luna", channelType: constant.ChannelTypeOpenAI, wantLimit: "max_completion_tokens"},
 		{name: "GPT6.1 sol", model: "gpt-6.1-sol", upstream: "gpt-6.1-sol", channelType: constant.ChannelTypeOpenAI, wantLimit: "max_completion_tokens"},
@@ -94,12 +92,18 @@ func TestChannelTestOpenAIChatCompatibility(t *testing.T) {
 		{name: "alias maps to GPT6", model: "customer-model", upstream: "gpt-6-astra", channelType: constant.ChannelTypeOpenAI, wantLimit: "max_completion_tokens"},
 		{name: "GPT5 alias maps to Qwen", model: "gpt-5.6-luna", upstream: "qwen-turbo", channelType: constant.ChannelTypeAli, wantLimit: "max_tokens"},
 		{name: "GPT5 stream", model: "gpt-5.6-luna", upstream: "gpt-5.6-luna", channelType: constant.ChannelTypeOpenAI, stream: true, wantLimit: "max_completion_tokens"},
-		{name: "GPT4 explicit", model: "gpt-4.1", upstream: "gpt-4.1", endpoint: string(constant.EndpointTypeOpenAI), channelType: constant.ChannelTypeOpenAI, wantLimit: "max_tokens"},
+		{name: "GPT4 explicit", model: "gpt-4.1", upstream: "gpt-4.1", channelType: constant.ChannelTypeOpenAI, wantLimit: "max_tokens"},
 		{name: "o series", model: "o3-mini", upstream: "o3-mini", channelType: constant.ChannelTypeAzure, wantLimit: "max_completion_tokens"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			request, ok := buildTestRequest(tt.model, tt.endpoint, &model.Provider{}, tt.stream).(*dto.GeneralOpenAIRequest)
-			require.True(t, ok)
+			// The input is a request DTO, not the retired Provider test/billing path.
+			request := &dto.GeneralOpenAIRequest{
+				Model: tt.model, Messages: []dto.Message{{Role: "user", Content: "hi"}},
+				MaxTokens: lo.ToPtr(uint(16)), Stream: lo.ToPtr(tt.stream),
+			}
+			if tt.stream {
+				request.StreamOptions = &dto.StreamOptions{IncludeUsage: true}
+			}
 			encoded := convertChatCompatibilityRequest(t, request, tt.channelType, map[string]string{tt.model: tt.upstream})
 			want := map[string]any{
 				"model":      tt.upstream,

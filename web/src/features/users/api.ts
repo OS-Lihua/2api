@@ -18,10 +18,15 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import type { AxiosRequestConfig } from 'axios'
 
+import type { WalletBalance } from '@/features/wallet/types'
 import type { PermissionCatalog } from '@/lib/admin-permissions'
 import { api } from '@/lib/api'
 import type { CustomOAuthBinding } from '@/lib/oauth'
-import { requireServerSuccess } from '@/lib/server-error-message'
+import {
+  createServerError,
+  requireServerSuccess,
+} from '@/lib/server-error-message'
+import { walletSummarySchema, type WalletSummary } from '@/lib/wallet-summary'
 
 import type {
   User,
@@ -30,7 +35,6 @@ import type {
   SearchUsersParams,
   UserFormData,
   ManageUserAction,
-  ManageUserQuotaPayload,
   ApiResponse,
 } from './types'
 
@@ -52,7 +56,8 @@ function securityProofConfig(proofToken?: string): AxiosRequestConfig {
  * Get paginated users list
  */
 export async function getUsers(
-  params: GetUsersParams = {}
+  params: GetUsersParams = {},
+  signal?: AbortSignal
 ): Promise<GetUsersResponse> {
   const { p = 1, page_size = 10, sort_by, sort_order } = params
   const res = await api.get('/api/user/', {
@@ -62,6 +67,7 @@ export async function getUsers(
       sort_by,
       sort_order,
     },
+    signal,
   })
   return res.data
 }
@@ -70,7 +76,8 @@ export async function getUsers(
  * Search users by keyword or group
  */
 export async function searchUsers(
-  params: SearchUsersParams
+  params: SearchUsersParams,
+  signal?: AbortSignal
 ): Promise<GetUsersResponse> {
   const {
     keyword = '',
@@ -91,7 +98,9 @@ export async function searchUsers(
   queryParams.set('page_size', String(page_size))
   if (sort_by) queryParams.set('sort_by', sort_by)
   if (sort_order) queryParams.set('sort_order', sort_order)
-  const res = await api.get(`/api/user/search?${queryParams.toString()}`)
+  const res = await api.get(`/api/user/search?${queryParams.toString()}`, {
+    signal,
+  })
   return res.data
 }
 
@@ -162,14 +171,56 @@ export async function manageUser(
   return res.data
 }
 
-/**
- * Adjust user quota atomically (add/subtract/override)
- */
-export async function adjustUserQuota(
-  payload: ManageUserQuotaPayload
-): Promise<ApiResponse<Partial<User>>> {
-  const res = await api.post('/api/user/manage', payload)
-  return res.data
+export async function getUserWalletSummaries(
+  userIds: number[],
+  signal?: AbortSignal
+): Promise<WalletSummary[]> {
+  const ids = [...new Set(userIds)].sort((a, b) => a - b)
+  if (
+    ids.length === 0 ||
+    ids.length > 100 ||
+    ids.some((id) => !Number.isSafeInteger(id) || id <= 0)
+  ) {
+    throw new Error('Invalid user ID')
+  }
+  const res = await api.get('/api/admin/v1/user-wallets', {
+    params: { user_ids: ids.join(',') },
+    signal,
+  })
+  const response = requireServerSuccess(res.data)
+  const items = walletSummarySchema.array().parse(response.data?.items)
+  if (
+    items.length !== ids.length ||
+    new Set(items.map((item) => item.user_id)).size !== ids.length ||
+    items.some((item) => !ids.includes(item.user_id))
+  ) {
+    throw new Error('Invalid wallet response')
+  }
+  return items
+}
+
+export async function getUserWallet(
+  userId: number,
+  signal?: AbortSignal
+): Promise<ApiResponse<WalletBalance>> {
+  const res = await api.get<ApiResponse<WalletBalance>>(
+    `/api/admin/v1/user-wallets/${userId}`,
+    { signal }
+  )
+  const response = requireServerSuccess(res.data)
+  if (!response.data) throw createServerError(response, 'Failed to load')
+  return response
+}
+
+export async function adjustUserWallet(
+  userId: number,
+  payload: { amount: string; remark: string }
+): Promise<ApiResponse> {
+  const res = await api.post(
+    `/api/admin/v1/user-wallets/${userId}/adjustments`,
+    payload
+  )
+  return requireServerSuccess(res.data)
 }
 
 /**

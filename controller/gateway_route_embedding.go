@@ -2,13 +2,16 @@ package controller
 
 import (
 	"bytes"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/capability"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel"
@@ -17,8 +20,115 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/gin-gonic/gin"
 )
+
+// Native search and classification operations use the same attempt and money
+// lifecycle without projecting their requests or results through Chat.
+func prepareGatewayNativeOperation(c *gin.Context, selection *service.GatewaySelection, native dto.Request, kind protocol.Type, started time.Time) (*gatewayPreparedRequest, error) {
+	original, ok := native.(*helper.NativeOperationRequest)
+	if !ok || original == nil || selection.Channel.Protocol != kind {
+		return nil, service.ErrGatewayCapability
+	}
+	candidate := c.Copy()
+	if err := middleware.SetupContextForGatewayCandidate(candidate, selection.Provider, selection.Channel.Model.ModelName); err != nil {
+		return nil, service.ErrGatewayUnavailable
+	}
+	var overrides map[string]any
+	if common.UnmarshalJsonStr(selection.Channel.ParameterOverrides, &overrides) != nil {
+		return nil, service.ErrGatewayUnavailable
+	}
+	common.SetContextKey(candidate, constant.ContextKeyChannelParamOverride, overrides)
+	snapshot, err := helper.DecodeNativeOperationRequest(original.RawBody, kind, original.Model)
+	if err != nil {
+		return nil, service.ErrGatewayCapability
+	}
+	format, _ := kind.RelayFormat()
+	var metadataRequest dto.Request = snapshot
+	if kind == protocol.AlphaSearch {
+		metadataRequest = &snapshot.AlphaSearchRequest
+	}
+	info, err := relaycommon.GenRelayInfo(candidate, format, metadataRequest, nil)
+	if err != nil {
+		return nil, service.ErrGatewayCapability
+	}
+	info.Request = snapshot
+	info.StartTime, info.TokenizerModel = started, selection.Channel.Model.ModelName
+	info.InitChannelMeta(candidate)
+	info.UpstreamModelName, info.IsModelMapped = selection.Channel.UpstreamModelName, true
+	info.ResponseFacts = &relaycommon.ResponseFacts{OnBusinessOutput: func() {}}
+	common.SetContextKey(candidate, constant.ContextKeyResponseFacts, info.ResponseFacts)
+	common.SetContextKey(candidate, constant.ContextKeyOriginalModel, info.TokenizerModel)
+	if info.StreamStatus == nil {
+		info.StreamStatus = relaycommon.NewStreamStatus()
+	}
+	saleInput, err := helper.ResolveIncomingBillingExprRequestInput(candidate, info)
+	if err != nil {
+		return nil, service.ErrGatewayCapability
+	}
+	adaptor, err := relay.GetChannelAdaptor(info.ApiType, kind)
+	if err != nil {
+		return nil, service.ErrGatewayCapability
+	}
+	converted, err := adaptor.ConvertRequest(candidate, info, snapshot)
+	if err != nil {
+		return nil, service.ErrGatewayCapability
+	}
+	raw, ok := converted.(common.RawMessage)
+	if !ok {
+		return nil, service.ErrGatewayCapability
+	}
+	encoded := append([]byte(nil), raw...)
+	if len(info.ParamOverride) > 0 {
+		encoded, err = relaycommon.ApplyParamOverrideWithRelayInfo(encoded, info)
+		if err != nil {
+			return nil, service.ErrGatewayCapability
+		}
+	}
+	effective, err := helper.DecodeNativeOperationRequest(encoded, kind, info.UpstreamModelName)
+	if err != nil {
+		return nil, service.ErrGatewayCapability
+	}
+	modelName := ojson.GetBytes(encoded, "model")
+	if modelName.Exists() && (modelName.Type != ojson.String || modelName.String() != info.UpstreamModelName) || kind != protocol.DeepSeekTools && !modelName.Exists() {
+		return nil, service.ErrGatewayCapability
+	}
+	for _, request := range []*helper.NativeOperationRequest{original, effective} {
+		caps := selection.Capabilities
+		if !slices.Contains(caps.InputModalities, capability.Text) || request.HasImages && !slices.Contains(caps.InputModalities, capability.Image) {
+			return nil, service.ErrGatewayCapability
+		}
+		tokens := tokenkit.Count(info.TokenizerModel, string(request.RawBody))
+		if caps.Limits.ContextLength != nil && int64(tokens) > *caps.Limits.ContextLength {
+			return nil, service.ErrGatewayCapability
+		}
+		for _, prefix := range []string{"", "parameters."} {
+			for _, field := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens", "min_tokens"} {
+				limit := ojson.GetBytes(request.RawBody, prefix+field)
+				if limit.Exists() && limit.Type != ojson.Null && (caps.Limits.MaxOutputTokens != nil && limit.Int() > *caps.Limits.MaxOutputTokens || caps.Limits.ContextLength != nil && limit.Int() > *caps.Limits.ContextLength-int64(tokens)) {
+					return nil, service.ErrGatewayCapability
+				}
+			}
+		}
+	}
+	tokens := tokenkit.Count(info.TokenizerModel, string(encoded))
+	selection.InputTokens = tokens
+	usage := &dto.Usage{PromptTokens: tokens, TotalTokens: tokens}
+	headers, deferred, err := adaptor.PreviewHeaders(candidate, info, bytes.NewReader(encoded))
+	if err != nil {
+		return nil, service.ErrGatewayCapability
+	}
+	purchaseInput := billingexpr.RequestInput{Body: encoded, Headers: map[string]string{}, DeferredHeaders: deferred}
+	for key, values := range headers {
+		purchaseInput.Headers[strings.ToLower(key)] = strings.Join(values, ",")
+	}
+	if kind == protocol.AlphaSearch {
+		saleInput.ToolCount, purchaseInput.ToolCount = common.GetPointer(1), common.GetPointer(1)
+	}
+	return &gatewayPreparedRequest{Context: candidate, Info: info, Adaptor: adaptor, Converted: converted, Encoded: encoded, SaleInput: saleInput, Usage: usage, Choices: 1,
+		Facts: service.GatewayRouteFacts{Usage: usage, SaleInput: saleInput, PurchaseInput: purchaseInput}}, nil
+}
 
 // Embeddings and rerank share the Attempt and settlement lifecycle with text,
 // but reserve only input usage and validate their own effective wire DTOs.

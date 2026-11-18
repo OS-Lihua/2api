@@ -18,6 +18,8 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useTranslation } from 'react-i18next'
 
+import { FundingStatus } from '@/components/funding-status'
+
 import type { RequestLog, RequestScope } from '../types'
 import {
   RequestIdentifier,
@@ -33,7 +35,19 @@ export function RequestSummary(props: {
 }) {
   const { t } = useTranslation()
   const request = props.request
+  const funding = request.funding
+  const source =
+    funding?.version === 1 &&
+    ['wallet', 'subscription'].includes(funding.source)
+      ? funding.source
+      : undefined
   const fields = [
+    [
+      t('Funding source'),
+      source
+        ? t(source === 'wallet' ? 'Wallet' : 'Subscription entitlement')
+        : t('Funding source unavailable'),
+    ],
     [t('Model Offering'), request.offering_name],
     [
       t('Alias'),
@@ -48,6 +62,18 @@ export function RequestSummary(props: {
     [t('Sale exchange rate'), request.sale_fx_rate],
     [t('Group ratio'), request.group_ratio],
   ]
+  if (source === 'subscription') {
+    fields.push([
+      t('Subscription ID'),
+      Number.isSafeInteger(funding?.subscription_id)
+        ? funding?.subscription_id
+        : undefined,
+    ])
+    fields.push([
+      t('Entitlement period ID'),
+      Number.isSafeInteger(funding?.period_id) ? funding?.period_id : undefined,
+    ])
+  }
   if (props.scope === 'all') fields.push([t('User ID'), request.user_id])
   return (
     <section className='space-y-3 border-b pb-5'>
@@ -88,6 +114,7 @@ export function RequestSummary(props: {
           </dd>
         </div>
       </dl>
+      {request.funding_pending === true && <FundingStatus pending />}
       <RequestUsageFacts usage={request.usage} source={request.usage_source} />
       {request.error_code && (
         <p className='text-destructive text-xs break-words'>

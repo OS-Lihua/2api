@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -29,6 +30,9 @@ import (
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/plugins"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting/system_setting"
@@ -51,6 +55,225 @@ func (configuredChannelPrice) HasPurchasePrice(context.Context, *gorm.DB, *model
 	return true, nil
 }
 
+// Model metadata may summarize stable relationships, but only channel:read can
+// disclose the individual Channels. Legacy routing tables are not a fallback.
+func TestModelConnectionsStableIdentityAPI(t *testing.T) {
+	previousMaster, previousRedis := common.IsMasterNode, common.RedisEnabled
+	common.IsMasterNode, common.RedisEnabled = true, false
+	t.Cleanup(func() { common.IsMasterNode, common.RedisEnabled = previousMaster, previousRedis })
+	db := model.UseTestDatabases(t)
+	require.NoError(t, i18n.Init())
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.UserAccessToken{}, &model.Option{}, &model.Provider{}, &model.Channel{}, &model.ChannelProbeResult{}, &model.Ability{}, &model.Model{}, &model.Vendor{}, &model.ModelOffering{}, &model.ModelOfferingMember{}))
+	require.NoError(t, model.MigrateAuditLogs())
+	require.NoError(t, model.EnsureLegacyAccessTokenRetireAt(time.Now().Unix()))
+	require.NoError(t, authz.Init(db))
+	root := model.User{Username: "model-connection-root", Password: "placeholder", Role: common.RoleRootUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "model-connections"}
+	require.NoError(t, db.Create(&root).Error)
+	token := createWalletTestAccessToken(t, root.Id, "model:read", "model:write")
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	SetApiRouter(engine)
+	call := func(t *testing.T, method, path, body string) (int, map[string]any) {
+		r := httptest.NewRequest(method, path, strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer "+token)
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, r)
+		result := map[string]any{}
+		require.NoError(t, common.Unmarshal(w.Body.Bytes(), &result), w.Body.String())
+		return w.Code, result
+	}
+	records := []model.Model{
+		{ModelName: "identity-model", Status: 1},
+		{ModelName: "identity-model-child", Status: 1},
+		{ModelName: "identity-", NameRule: model.NameRulePrefix, Status: 1},
+		{ModelName: "identity-empty", Status: 1},
+		{ModelName: "identity-hidden", Status: 0},
+	}
+	for i := range records {
+		require.NoError(t, records[i].Insert())
+	}
+	provider := model.Provider{Name: "identity-provider-secret-name", Type: 1, Key: "identity-usable-key-must-not-leak", Models: "identity-model,identity-model-child,identity-synthetic", Group: "legacy-secret-group", Status: common.ChannelStatusEnabled}
+	disabled := model.Provider{Name: "disabled-provider", Type: 1, Status: common.ChannelStatusManuallyDisabled}
+	require.NoError(t, db.Create(&provider).Error)
+	require.NoError(t, db.Create(&disabled).Error)
+	require.NoError(t, provider.UpdateAbilities(db))
+	channels := []model.Channel{
+		{ProviderID: provider.Id, ModelID: records[0].Id, Protocol: "openai_chat", UpstreamModelName: "first", ParameterOverrides: "{}", Status: model.ChannelEnabled, MappingConfirmed: true},
+		{ProviderID: provider.Id, ModelID: records[0].Id, Protocol: "openai_chat", UpstreamModelName: "disabled", ParameterOverrides: "{}", Status: model.ChannelDisabled, MappingConfirmed: true},
+		{ProviderID: provider.Id, ModelID: records[0].Id, Protocol: "openai_chat", UpstreamModelName: "pending", ParameterOverrides: "{}", Status: model.ChannelPending},
+		{ProviderID: disabled.Id, ModelID: records[0].Id, Protocol: "openai_chat", UpstreamModelName: "provider-disabled", ParameterOverrides: "{}", Status: model.ChannelEnabled, MappingConfirmed: true},
+		{ProviderID: provider.Id, ModelID: records[1].Id, Protocol: "openai_chat", UpstreamModelName: "child", ParameterOverrides: "{}", Status: model.ChannelEnabled, MappingConfirmed: true},
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	get := func(t *testing.T, index, configured, enabled int, state string) map[string]any {
+		status, response := call(t, http.MethodGet, fmt.Sprintf("/api/models/%d", records[index].Id), "")
+		require.Equal(t, http.StatusOK, status, response)
+		require.Equal(t, true, response["success"], response)
+		data := response["data"].(map[string]any)
+		assert.EqualValues(t, configured, data["configured_channel_count"])
+		assert.EqualValues(t, enabled, data["enabled_channel_count"])
+		assert.Equal(t, state, data["square_state"])
+		for _, field := range []string{"bound_channels", "enable_groups", "matched_models", "matched_count"} {
+			assert.NotContains(t, data, field)
+		}
+		wire, err := common.Marshal(response)
+		require.NoError(t, err)
+		for _, secret := range []string{provider.Name, provider.Key, provider.Group, token} {
+			assert.NotContains(t, string(wire), secret)
+		}
+		return data
+	}
+	t.Run("stable_ID_not_name_rules_and_no_privileged_connection_details", func(t *testing.T) {
+		first := get(t, 0, 4, 1, "visible")
+		assert.Equal(t, []any{"openai"}, first["supported_endpoints"])
+		get(t, 1, 1, 1, "visible")
+		get(t, 2, 0, 0, "unavailable")
+		get(t, 3, 0, 0, "unavailable")
+		get(t, 4, 0, 0, "hidden")
+		require.NoError(t, db.Model(&records[0]).Update("model_name", "renamed-stable-id").Error)
+		get(t, 0, 4, 1, "visible")
+		replacement := model.Model{ModelName: "identity-model", Status: 1}
+		require.NoError(t, replacement.Insert())
+		status, result := call(t, http.MethodGet, fmt.Sprintf("/api/models/%d", replacement.Id), "")
+		require.Equal(t, http.StatusOK, status, result)
+		assert.EqualValues(t, 0, result["data"].(map[string]any)["configured_channel_count"])
+		for _, include := range []string{"false", "true"} {
+			_, result = call(t, http.MethodGet, "/api/models/search?include_channel_models="+include+"&keyword=identity-&page_size=100", "")
+			data := result["data"].(map[string]any)
+			assert.EqualValues(t, 5, data["total"])
+			for _, row := range data["items"].([]any) {
+				assert.Positive(t, row.(map[string]any)["id"].(float64))
+				assert.NotEqual(t, "identity-synthetic", row.(map[string]any)["model_name"])
+			}
+		}
+		_, result = call(t, http.MethodGet, "/api/models/search?square_state=visible&page_size=1&p=2", "")
+		assert.EqualValues(t, 2, result["data"].(map[string]any)["total"])
+		assert.Len(t, result["data"].(map[string]any)["items"], 1)
+		_, result = call(t, http.MethodGet, "/api/models/search?square_state=partial&page_size=1", "")
+		assert.EqualValues(t, 0, result["data"].(map[string]any)["total"])
+		require.NoError(t, db.Model(&provider).Update("status", common.ChannelStatusManuallyDisabled).Error)
+		get(t, 0, 4, 0, "unavailable")
+		require.NoError(t, db.Model(&provider).Update("status", common.ChannelStatusEnabled).Error)
+		require.NoError(t, db.Delete(&channels[0]).Error)
+		get(t, 0, 3, 0, "unavailable")
+	})
+	t.Run("channel_read_is_not_model_read_or_write", func(t *testing.T) {
+		original := token
+		defer func() { token = original }()
+		path := fmt.Sprintf("/api/admin/v1/channels?model_id=%d", records[0].Id)
+		status, _ := call(t, http.MethodGet, path, "")
+		assert.Equal(t, http.StatusForbidden, status)
+		status, _ = call(t, http.MethodPatch, fmt.Sprintf("/api/admin/v1/channels/%d", channels[1].ID), `{"weight":9}`)
+		assert.Equal(t, http.StatusForbidden, status)
+		token = createWalletTestAccessToken(t, root.Id, "channel:read")
+		status, result := call(t, http.MethodGet, path, "")
+		require.Equal(t, http.StatusOK, status, result)
+		data := result["data"].(map[string]any)
+		assert.EqualValues(t, 3, data["total"])
+		for _, item := range data["items"].([]any) {
+			assert.EqualValues(t, records[0].Id, item.(map[string]any)["model_id"])
+		}
+		status, _ = call(t, http.MethodGet, fmt.Sprintf("/api/models/%d", records[0].Id), "")
+		assert.Equal(t, http.StatusForbidden, status)
+		status, _ = call(t, http.MethodDelete, fmt.Sprintf("/api/admin/v1/channels/%d", channels[1].ID), "")
+		assert.Equal(t, http.StatusForbidden, status)
+		token = createWalletTestAccessToken(t, root.Id, "model:read", "model:write")
+		require.NoError(t, db.Model(&model.UserAccessToken{}).Where("token_hash = ?", model.AccessTokenFingerprint(token)).Update("expires_at", time.Now().Unix()-1).Error)
+		status, _ = call(t, http.MethodGet, fmt.Sprintf("/api/models/%d", records[0].Id), "")
+		assert.Equal(t, http.StatusUnauthorized, status)
+		status, _ = call(t, http.MethodDelete, fmt.Sprintf("/api/models/%d?remove_from_channels=true", records[0].Id), "")
+		assert.Equal(t, http.StatusUnauthorized, status)
+	})
+	t.Run("retired_flags_and_reference_guards_do_not_mutate_channels", func(t *testing.T) {
+		var before []model.Ability
+		require.NoError(t, db.Order("channel_id, model").Find(&before).Error)
+		for _, flag := range []string{"remove_from_channels", "remove_pricing"} {
+			for _, batch := range []bool{false, true} {
+				method, path, body := http.MethodDelete, fmt.Sprintf("/api/models/%d?%s=true", records[3].Id, flag), ""
+				if batch {
+					method, path, body = http.MethodPost, "/api/models/delete", fmt.Sprintf(`{"model_ids":[%d],%q:true}`, records[3].Id, flag)
+				}
+				status, result := call(t, method, path, body)
+				assert.Equal(t, http.StatusGone, status, result)
+				assert.Equal(t, false, result["success"])
+				if flag == "remove_from_channels" {
+					assert.Equal(t, "legacy_model_connections_retired", result["code"])
+					assert.Equal(t, "Legacy model-channel removal has been retired. Manage Channels by Model ID instead.", result["message_key"])
+					assert.Equal(t, result["message_key"], result["message"])
+				}
+				require.NoError(t, db.First(&model.Model{}, records[3].Id).Error)
+			}
+		}
+		var after []model.Ability
+		require.NoError(t, db.Order("channel_id, model").Find(&after).Error)
+		assert.Equal(t, before, after)
+		var retained model.Provider
+		require.NoError(t, db.First(&retained, provider.Id).Error)
+		assert.Equal(t, provider.Models, retained.Models)
+		for _, batch := range []bool{false, true} {
+			method, path, body := http.MethodDelete, fmt.Sprintf("/api/models/%d", records[0].Id), ""
+			if batch {
+				method, path, body = http.MethodPost, "/api/models/delete", fmt.Sprintf(`{"model_ids":[%d,%d]}`, records[0].Id, records[3].Id)
+			}
+			_, result := call(t, method, path, body)
+			assert.Equal(t, false, result["success"])
+			require.NoError(t, db.First(&model.Model{}, records[3].Id).Error)
+		}
+		offering := model.ModelOffering{Name: "identity-offering", Visibility: "all", Groups: []string{}, RouteMethod: "cost", AcceptedConversionLosses: []string{}}
+		require.NoError(t, db.Create(&offering).Error)
+		require.NoError(t, db.Create(&model.ModelOfferingMember{OfferingID: offering.ID, ModelID: records[3].Id, Tier: 1}).Error)
+		_, result := call(t, http.MethodDelete, fmt.Sprintf("/api/models/%d", records[3].Id), "")
+		assert.Equal(t, false, result["success"])
+		require.NoError(t, db.Delete(&model.ModelOfferingMember{}, "offering_id = ?", offering.ID).Error)
+	})
+	t.Run("no_legacy_table_or_name_column_fallback", func(t *testing.T) {
+		var legacyReads atomic.Int32
+		guard := func(tx *gorm.DB) {
+			if tx.Statement.Table == "abilities" || (tx.Statement.Table == "providers" && (len(tx.Statement.Selects) == 0 || slices.Contains(tx.Statement.Selects, "models"))) {
+				legacyReads.Add(1)
+				tx.AddError(errors.New("legacy model routing lookup forbidden"))
+			}
+		}
+		require.NoError(t, db.Callback().Query().Before("gorm:query").Register("forbid_legacy_models", guard))
+		require.NoError(t, db.Callback().Row().Before("gorm:row").Register("forbid_legacy_models", guard))
+		defer func() {
+			require.NoError(t, db.Callback().Query().Remove("forbid_legacy_models"))
+			require.NoError(t, db.Callback().Row().Remove("forbid_legacy_models"))
+		}()
+		get(t, 0, 3, 0, "unavailable")
+		_, result := call(t, http.MethodGet, "/api/models/search?include_channel_models=true&square_state=unavailable", "")
+		assert.Equal(t, true, result["success"])
+		for i, batch := range []bool{false, true} {
+			method, path, body := http.MethodDelete, fmt.Sprintf("/api/models/%d", records[3+i].Id), ""
+			if batch {
+				method, path, body = http.MethodPost, "/api/models/delete", fmt.Sprintf(`{"model_ids":[%d]}`, records[3+i].Id)
+			}
+			_, result := call(t, method, path, body)
+			require.Equal(t, true, result["success"], result)
+			assert.EqualValues(t, 0, result["data"].(map[string]any)["updated_channels"])
+		}
+		assert.Zero(t, legacyReads.Load())
+	})
+	audits, _, err := model.GetAuditLogs(model.AuditLogFilter{UserId: root.Id, Category: model.AuditCategoryOperation}, 0, 200, common.RoleRootUser)
+	require.NoError(t, err)
+	actions, rejected := map[string]bool{}, map[string]bool{}
+	for _, audit := range audits {
+		actions[audit.Action] = true
+		if audit.Status == http.StatusGone && !audit.Success {
+			rejected[audit.Action] = true
+		}
+		wire, err := common.Marshal(audit)
+		require.NoError(t, err)
+		assert.NotContains(t, string(wire), provider.Key)
+		assert.NotContains(t, string(wire), token)
+	}
+	assert.True(t, actions["model.delete"])
+	assert.True(t, actions["model.delete_batch"])
+	assert.True(t, rejected["model.delete"])
+	assert.True(t, rejected["model.delete_batch"])
+}
+
 // Exercise the management boundary with actual PAT authentication and Casbin.
 func TestSingleModelChannelAPI(t *testing.T) {
 	service.InitHttpClient()
@@ -64,7 +287,20 @@ func TestSingleModelChannelAPI(t *testing.T) {
 	common.IsMasterNode, common.RedisEnabled = true, false
 	db := model.UseTestDatabases(t)
 	require.NoError(t, i18n.Init())
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.UserAccessToken{}, &model.Option{}, &model.Provider{}, &model.Channel{}, &model.ChannelProbeResult{}, &model.Ability{}, &model.TaskPlugin{}, &model.Model{}, &model.Vendor{}, &model.Wallet{}, &model.LedgerEntry{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.UserAccessToken{}, &model.Option{}, &model.Provider{}, &model.Channel{}, &model.ChannelProbeResult{}, &model.Ability{}, &model.TaskPlugin{}, &model.Model{}, &model.Vendor{}, &model.Wallet{}, &model.LedgerEntry{}, &model.QuotaData{}))
+	require.NoError(t, model.MigrateLogDB())
+	oldConsume := common.LogConsumeEnabled
+	common.LogConsumeEnabled = true
+	t.Cleanup(func() { common.LogConsumeEnabled = oldConsume })
+	historicalQuota := []model.QuotaData{
+		{UserID: 987, Username: "historical-probe-owner", ModelName: "retired-probe-model", CreatedAt: 3600, UseGroup: "retired", TokenID: 989, ChannelID: 988, NodeName: "retired-node", Count: 2, Quota: 9007199254740993, TokenUsed: 125, CacheReadTokens: 12, CacheCreationTokens: 30},
+	}
+	require.NoError(t, db.Create(&historicalQuota).Error)
+	historicalLog := model.Log{UserId: 987, CreatedAt: 3600, Type: model.LogTypeConsume, Content: "retained probe history", ModelName: "retired-probe-model", Quota: 9007199254740993, PromptTokens: 100, CompletionTokens: 25, RequestId: "retained-channel-probe", Other: `{"public":{"cache_tokens":12,"cache_write_tokens":30,"cache_creation_5m_tokens":10,"cache_creation_1h_tokens":20}}`}
+	require.NoError(t, model.LOG_DB.Create(&historicalLog).Error)
+	var historicalLogs []model.Log
+	require.NoError(t, model.LOG_DB.Order("request_id").Find(&historicalLogs).Error)
+	require.Len(t, historicalLogs, 1)
 	require.NoError(t, model.MigrateGatewayBilling(db))
 	require.NoError(t, model.MigrateAuditLogs())
 	require.NoError(t, model.EnsureLegacyAccessTokenRetireAt(time.Now().Unix()))
@@ -329,7 +565,7 @@ export function parseSubmitResponse(ctx,r){return {taskId:r.body.id,taskData:r.b
 export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/poll/"+ctx.taskId,headers:{Authorization:"Bearer "+ctx.apiKey}}}
 export function parseTaskResult(ctx,body){return {status:body.status,taskId:body.id,progress:"100%"}}
 export function listArtifacts(task){if(task.status!=="SUCCESS")return [];const out=[{key:"video",type:"video",mimeType:"video/mp4"}];if(task.data&&task.data.preview)out.push({key:"preview",type:"image",mimeType:"image/png"});return out}
-export function buildContentRequest(ctx){if(ctx.artifactKey==="preview")return {url:ctx.baseUrl+"/preview/"+ctx.upstreamTaskId,headers:{Authorization:"Bearer "+ctx.apiKey}};if(ctx.data&&ctx.data.cdn_url)return {url:ctx.data.cdn_url,credentialless:true};return {url:ctx.baseUrl+"/content/"+ctx.upstreamTaskId,headers:{Authorization:"Bearer "+ctx.apiKey}}}`
+export function buildContentRequest(ctx){if(ctx.data&&ctx.data.prepare_content)utils.fetch({url:ctx.baseUrl+"/prepare-content",headers:{Authorization:"Bearer "+ctx.apiKey}});if(ctx.artifactKey==="preview")return {url:ctx.baseUrl+"/preview/"+ctx.upstreamTaskId,headers:{Authorization:"Bearer "+ctx.apiKey}};if(ctx.data&&ctx.data.cdn_url)return {url:ctx.data.cdn_url,credentialless:true};return {url:ctx.baseUrl+"/content/"+ctx.upstreamTaskId,headers:{Authorization:"Bearer "+ctx.apiKey}}}`
 		_, err := jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "probe"})
 		require.NoError(t, err)
 		textSource := strings.Replace(source, `key:"probe"`, `key:"probe-text"`, 1)
@@ -348,6 +584,10 @@ export function buildContentRequest(ctx){if(ctx.artifactKey==="preview")return {
 		imageSource = strings.Replace(imageSource, `type:"video",mimeType:"video/mp4"`, `type:"image",mimeType:"image/png"`, 1)
 		_, err = jsplugin.DefaultRegistry.RegisterFactory(imageSource, jsplugin.Options{Key: "probe-edit"})
 		require.NoError(t, err)
+		preparationSource := strings.Replace(source, `key:"probe"`, `key:"probe-prepare"`, 1)
+		preparationSource = strings.Replace(preparationSource, `export function buildSubmitRequest(ctx){`, `export function buildSubmitRequest(ctx){utils.fetch({url:ctx.baseUrl+"/prepare-submit",headers:{Authorization:"Bearer "+ctx.apiKey}});`, 1)
+		_, err = jsplugin.DefaultRegistry.RegisterFactory(preparationSource, jsplugin.Options{Key: "probe-prepare"})
+		require.NoError(t, err)
 		video, err := os.ReadFile("../controller/probe-fixtures/red.mp4")
 		require.NoError(t, err)
 		imageArtifact := false
@@ -360,6 +600,8 @@ export function buildContentRequest(ctx){if(ctx.artifactKey==="preview")return {
 		cacheSubmits := 0
 		var cdnURL string
 		var cancelProbe context.CancelFunc
+		var changeProbeAuthority func(string)
+		prepareContent := false
 		counts := map[string]int{}
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			counts[r.URL.Path]++
@@ -368,7 +610,12 @@ export function buildContentRequest(ctx){if(ctx.artifactKey==="preview")return {
 			} else {
 				assert.Equal(t, "Bearer secret", r.Header.Get("Authorization"))
 			}
+			if changeProbeAuthority != nil {
+				changeProbeAuthority(r.URL.Path)
+			}
 			switch r.URL.Path {
+			case "/prepare-content", "/prepare-submit":
+				_, _ = w.Write([]byte(`{"ready":true}`))
 			case "/submit":
 				if cacheMode {
 					cacheSubmits++
@@ -392,7 +639,7 @@ export function buildContentRequest(ctx){if(ctx.artifactKey==="preview")return {
 				if cacheMode && cacheSubmits >= 2 {
 					cached = 12
 				}
-				_, _ = fmt.Fprintf(w, `{"id":"private-task-123","status":"SUCCESS","private_marker":"do-not-store-task-response","cdn_url":%q,"preview":%t,"usage":{"input_tokens_details":{"cached_tokens":%d}}}`, cdnURL, includePreview, cached)
+				_, _ = fmt.Fprintf(w, `{"id":"private-task-123","status":"SUCCESS","private_marker":"do-not-store-task-response","cdn_url":%q,"preview":%t,"prepare_content":%t,"usage":{"input_tokens_details":{"cached_tokens":%d}}}`, cdnURL, includePreview, prepareContent, cached)
 			case "/preview/private-task-123":
 				if bluePreview {
 					_, _ = w.Write(blueImage)
@@ -509,6 +756,75 @@ export function buildContentRequest(ctx){if(ctx.artifactKey==="preview")return {
 		}
 		require.NoError(t, db.Model(&provider).Update("param_override", nil).Error)
 		assert.Equal(t, beforeBudgetCheck, counts["/submit"])
+		status, preparationChannel := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":"task:probe-prepare","upstream_model_name":"task-probe-upstream"}`, provider.Id, unified.Id))
+		require.Equal(t, http.StatusOK, status, preparationChannel)
+		preparationPath := fmt.Sprintf("/api/admin/v1/channels/%v", preparationChannel["data"].(map[string]any)["id"])
+		for _, revokeAt := range []string{"", "/prepare-submit", "/submit", "/poll/private-task-123", "/prepare-content"} {
+			mutations := []string{"none"}
+			if revokeAt != "" {
+				mutations = []string{"provider_disabled", "credential_rotated", "selected_slot_disabled"}
+			}
+			for _, mutation := range mutations {
+				t.Run("request authority/"+mutation+revokeAt, func(t *testing.T) {
+					info := model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling, MultiKeyStatusList: map[int]int{0: common.ChannelStatusManuallyDisabled}}
+					require.NoError(t, db.Model(&model.Provider{}).Where("id = ?", provider.Id).Updates(map[string]any{"key": "unused-probe-key\nsecret", "status": common.ChannelStatusEnabled, "channel_info": info}).Error)
+					t.Cleanup(func() {
+						changeProbeAuthority = nil
+						prepareContent = false
+						require.NoError(t, db.Model(&model.Provider{}).Where("id = ?", provider.Id).Updates(map[string]any{"key": provider.Key, "status": common.ChannelStatusEnabled, "channel_info": provider.ProviderInfo}).Error)
+					})
+					counts = map[string]int{}
+					prepareContent = revokeAt == "/prepare-content"
+					changed := false
+					changeProbeAuthority = func(requestPath string) {
+						if requestPath != revokeAt {
+							return
+						}
+						changed = true
+						updates := map[string]any{}
+						switch mutation {
+						case "provider_disabled":
+							updates["status"] = common.ChannelStatusManuallyDisabled
+						case "credential_rotated":
+							updates["key"] = "unused-probe-key\nrotated-probe-key"
+						case "selected_slot_disabled":
+							info.MultiKeyStatusList[1] = common.ChannelStatusManuallyDisabled
+							updates["channel_info"] = info
+						}
+						assert.NoError(t, db.Model(&model.Provider{}).Where("id = ?", provider.Id).Updates(updates).Error)
+					}
+					probePath := channelPath
+					if revokeAt == "" || revokeAt == "/prepare-submit" {
+						probePath = preparationPath
+					}
+					status, observed := call(http.MethodPost, probePath+"/probes", `{"capability":"output_video"}`)
+					require.Equal(t, http.StatusOK, status, observed)
+					observation := observed["data"].(map[string]any)
+					if revokeAt == "" {
+						assert.Equal(t, "passed", observation["status"], "the explicitly selected second credential slot remains usable")
+						assert.Equal(t, map[string]int{"/prepare-submit": 1, "/submit": 1, "/poll/private-task-123": 1, "/content/private-task-123": 1}, counts)
+					} else {
+						assert.True(t, changed, "the operation must reach the exact revocation boundary")
+						assert.NotEqual(t, "passed", observation["status"], observed)
+						expected := map[string]int{"/submit": 1}
+						if revokeAt == "/prepare-submit" {
+							expected = map[string]int{"/prepare-submit": 1}
+						} else if revokeAt != "/submit" {
+							expected["/poll/private-task-123"] = 1
+						}
+						if revokeAt == "/prepare-content" {
+							expected["/prepare-content"] = 1
+						}
+						assert.Equal(t, expected, counts, "revocation must stop the next HTTP exchange, including artifact content")
+					}
+					wire, err := common.Marshal(observed)
+					require.NoError(t, err)
+					for _, private := range []string{"unused-probe-key", "rotated-probe-key", "secret", "private-task-123", "do-not-store-task-response"} {
+						assert.NotContains(t, string(wire), private)
+					}
+				})
+			}
+		}
 		probeCtx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		cancelProbe = cancel
@@ -772,18 +1088,82 @@ export function buildContentRequest(ctx){if(ctx.artifactKey==="preview")return {
 			assert.Equal(t, tc.expected, result["data"].(map[string]any)["status"], result)
 		}
 	})
+	t.Run("stored Provider loss policy does not control Channel probes", func(t *testing.T) {
+		for _, policy := range []string{"allow", "safe", "strict"} {
+			var request dto.GeneralOpenAIRequest
+			require.NoError(t, common.UnmarshalJsonStr(`{"model":"claude-sonnet-4-20250514","reasoning_effort":"low","max_tokens":64,"messages":[{"role":"user","content":"Call probe_echo with value ok."}],"tools":[{"type":"function","function":{"name":"probe_echo","parameters":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}}}],"tool_choice":{"type":"function","function":{"name":"probe_echo"}}}`, &request))
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeAnthropic, ChannelOtherSettings: dto.ProviderOtherSettings{ToolLossPolicy: policy}}, OriginModelName: request.Model}
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			converted, err := service.ConvertRequest(ctx, info, types.RelayFormatClaude, &request)
+			require.NotNil(t, converted)
+			assert.True(t, slices.ContainsFunc(converted.Diagnostics, func(diagnostic types.ConversionDiagnostic) bool {
+				return diagnostic.Code == "forced_tool_choice_downgraded"
+			}), "generic conversion retains the real loss diagnostic")
+			if policy == "allow" {
+				require.NoError(t, err)
+			} else {
+				var loss *types.ConversionLossError
+				require.ErrorAs(t, err, &loss, "generic opt-in loss policies are not retired")
+			}
+		}
+		var calls atomic.Int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			assert.Equal(t, "/v1/messages", r.URL.Path)
+			assert.Equal(t, "secret", r.Header.Get("x-api-key"))
+			var body map[string]any
+			require.NoError(t, common.DecodeJson(r.Body, &body))
+			if tools, ok := body["tools"].([]any); ok {
+				require.Len(t, tools, 1)
+				assert.Equal(t, "probe_echo", tools[0].(map[string]any)["name"])
+				assert.Equal(t, "tool", body["tool_choice"].(map[string]any)["type"])
+				_, _ = w.Write([]byte(`{"type":"message","role":"assistant","content":[{"type":"tool_use","id":"probe-call","name":"probe_echo","input":{"value":"ok"}}],"stop_reason":"tool_use"}`))
+			} else {
+				assert.NotContains(t, body, "prompt_cache_key", "Claude cannot retain the OpenAI probe's cache identity")
+				_, _ = w.Write([]byte(`{"type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":1}}`))
+			}
+		}))
+		defer upstream.Close()
+		for _, policy := range []string{"", "allow", "safe", "strict", "legacy-unknown"} {
+			t.Run(policy, func(t *testing.T) {
+				raw := fmt.Sprintf(` {"tool_loss_policy":%q,"aws_region":"retained-region"} `, policy)
+				account := model.Provider{Name: "Loss policy probe Provider", Type: constant.ChannelTypeAnthropic, Key: "secret", BaseURL: common.GetPointer(upstream.URL), Status: common.ChannelStatusEnabled, OtherSettings: raw}
+				require.NoError(t, db.Create(&account).Error)
+				status, created := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":"anthropic_messages","upstream_model_name":"claude-sonnet-4-20250514"}`, account.Id, unified.Id))
+				require.Equal(t, http.StatusOK, status, created)
+				for _, feature := range []string{"tool_calling", "caching"} {
+					before := calls.Load()
+					status, result := call(http.MethodPost, fmt.Sprintf("/api/admin/v1/channels/%v/probes", created["data"].(map[string]any)["id"]), fmt.Sprintf(`{"capability":%q}`, feature))
+					require.Equal(t, http.StatusOK, status, result)
+					assert.Equal(t, "passed", result["data"].(map[string]any)["status"], result)
+					attempts := int32(1)
+					if feature == "caching" {
+						attempts = 2
+					}
+					assert.Equal(t, before+attempts, calls.Load(), "both lossless tool and lossy cache conversions reach the upstream")
+				}
+				var stored model.Provider
+				require.NoError(t, db.First(&stored, account.Id).Error)
+				assert.Equal(t, raw, stored.OtherSettings, "probe overrides only its in-memory copy")
+			})
+		}
+	})
 	t.Run("Provider response repairs run before capability inspection", func(t *testing.T) {
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(`{"success":true,"data":{"choices":[{"message":{"content":"ok"}}]}}`))
 		}))
 		defer upstream.Close()
-		account := model.Provider{Name: "Enterprise probe Provider", Type: constant.ChannelTypeOpenRouter, Key: "secret", BaseURL: common.GetPointer(upstream.URL), Status: common.ChannelStatusEnabled, OtherSettings: `{"openrouter_enterprise":true}`}
+		account := model.Provider{Name: "Enterprise probe Provider", Type: constant.ChannelTypeOpenRouter, Key: "secret", BaseURL: common.GetPointer(upstream.URL), Status: common.ChannelStatusEnabled, OtherSettings: ` {"tool_loss_policy":"legacy-unknown","openrouter_enterprise":true} `}
 		require.NoError(t, db.Create(&account).Error)
 		status, created := call(http.MethodPost, "/api/admin/v1/channels", fmt.Sprintf(`{"provider_id":%d,"model_id":%d,"protocol":"openai_chat","upstream_model_name":"enterprise-probe"}`, account.Id, unified.Id))
 		require.Equal(t, http.StatusOK, status, created)
 		status, result := call(http.MethodPost, fmt.Sprintf("/api/admin/v1/channels/%v/probes", created["data"].(map[string]any)["id"]), `{"capability":"input_text"}`)
 		require.Equal(t, http.StatusOK, status, result)
 		assert.Equal(t, "passed", result["data"].(map[string]any)["status"], result)
+		var stored model.Provider
+		require.NoError(t, db.First(&stored, account.Id).Error)
+		assert.Equal(t, account.OtherSettings, stored.OtherSettings, "response repair preserves all stored settings")
 	})
 	t.Run("native Ollama responses use the production protocol conversion", func(t *testing.T) {
 		var diagnostics bytes.Buffer
@@ -1058,6 +1438,18 @@ export function buildContentRequest(ctx){if(ctx.artifactKey==="preview")return {
 	assert.Equal(t, walletBefore, walletAfter, "administrative probes must not debit the initiating administrator")
 	_, entries := call(http.MethodGet, walletPath+"/entries", "")
 	assert.EqualValues(t, 1, entries["data"].(map[string]any)["total"], "only the fixture top-up is recorded")
+	var retainedQuota []model.QuotaData
+	require.NoError(t, db.Order("id").Find(&retainedQuota).Error)
+	assert.Equal(t, historicalQuota, retainedQuota, "all real probes leave old statistics unchanged even with legacy export enabled")
+	var retainedLogs []model.Log
+	require.NoError(t, model.LOG_DB.Order("request_id").Find(&retainedLogs).Error)
+	assert.Equal(t, historicalLogs, retainedLogs, "probes must neither erase history nor append legacy consume/task logs")
+	history, err := model.GetQuotaDataByUserId(987, 3600, 3600)
+	require.NoError(t, err)
+	require.Len(t, history, 1)
+	assert.Equal(t, 9007199254740993, history[0].Quota)
+	assert.EqualValues(t, 12, history[0].CacheReadTokens)
+	assert.EqualValues(t, 30, history[0].CacheCreationTokens, "normalized cache creation totals are not added to their 5m/1h breakdown again")
 	audits, _, err := model.GetAuditLogs(model.AuditLogFilter{UserId: root.Id, Category: model.AuditCategoryOperation}, 0, 200, common.RoleRootUser)
 	require.NoError(t, err)
 	actions := map[string]bool{}

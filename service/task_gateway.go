@@ -4,22 +4,79 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
+	"slices"
 	"time"
 
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/clock"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/money"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
 )
+
+type gatewayTaskDeliveryWriter struct {
+	gin.ResponseWriter
+	written int
+	failed  bool
+}
+
+func (writer *gatewayTaskDeliveryWriter) Write(body []byte) (int, error) {
+	n, err := writer.ResponseWriter.Write(body)
+	writer.written += n
+	if err != nil || n != len(body) {
+		writer.failed = true
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+	}
+	return n, err
+}
+
+func (writer *gatewayTaskDeliveryWriter) WriteString(body string) (int, error) {
+	return writer.Write([]byte(body))
+}
+
+// BeginGatewayTaskDelivery records one immutable delivery outcome for an inline
+// business result, regardless of which public presenter delivers it. Call finish
+// after presentation; nested observations must finish in reverse order.
+func BeginGatewayTaskDelivery(c *gin.Context, task *model.Task) func(bool) {
+	if task == nil || task.PrivateData.Gateway == nil || task.PrivateData.Gateway.Stream == nil || !task.PrivateData.Gateway.Stream.Pending {
+		return func(bool) {}
+	}
+	writer := &gatewayTaskDeliveryWriter{ResponseWriter: c.Writer}
+	c.Writer = writer
+	return func(presented bool) {
+		c.Writer = writer.ResponseWriter
+		delivered := presented && !writer.failed && writer.written > 0 && writer.Status()/100 == 2 && task.Status == model.TaskStatusSuccess
+		ctx := context.WithoutCancel(c.Request.Context())
+		persisted, err := model.CompleteGatewayTaskDelivery(ctx, task.ID, delivered)
+		if err == nil {
+			_ = SettleGatewayTask(ctx, persisted)
+		}
+	}
+}
 
 // GatewayTaskProviderIdentity resolves the original Provider configuration without
 // selecting a key. New operations retain its multi-key slot identity at dispatch.
 func GatewayTaskProviderIdentity(task *model.Task) (*model.Provider, error) {
 	snapshot := task.PrivateData.Gateway
+	if legacy := task.PrivateData.LegacyObligation; legacy != nil {
+		if snapshot != nil || task.Platform != "midjourney" || legacy.ProviderID <= 0 || legacy.ProviderID != task.ChannelId || legacy.ProviderType <= 0 || task.PrivateData.UpstreamTaskID == "" {
+			return nil, fmt.Errorf("task Provider identity is inconsistent")
+		}
+		provider, err := model.GetProviderById(legacy.ProviderID, true)
+		if err != nil || provider.Type != legacy.ProviderType {
+			return nil, fmt.Errorf("task Provider identity is unavailable")
+		}
+		return provider, nil
+	}
 	if snapshot == nil {
 		return model.CacheGetProvider(task.ChannelId)
 	}
@@ -46,9 +103,22 @@ func GatewayTaskProvider(task *model.Task) (*model.Provider, error) {
 // GatewayTaskProviderWithContext selects one current credential and retains its
 // actual slot for polling and content preparation. Later I/O rechecks this slot.
 func GatewayTaskProviderWithContext(ctx context.Context, task *model.Task) (*model.Provider, int, error) {
+	if task == nil {
+		return nil, 0, model.ErrProviderStatusConflict
+	}
+	if task.PrivateData.Gateway == nil && task.PrivateData.LegacyObligation == nil {
+		provider, key, index, err := legacyTaskProvider(ctx, task)
+		if err != nil {
+			return nil, 0, err
+		}
+		pinned := *provider
+		pinned.Key = key
+		pinned.ProviderInfo.IsMultiKey = false
+		return &pinned, index, nil
+	}
 	provider, err := GatewayTaskProviderIdentity(task)
-	if err != nil || task.PrivateData.Gateway == nil {
-		return provider, 0, err
+	if err != nil {
+		return nil, 0, err
 	}
 	key, index, keyErr := provider.PreviewEnabledKey()
 	if keyErr != nil || key == "" {
@@ -67,8 +137,17 @@ func GatewayTaskProviderWithContext(ctx context.Context, task *model.Task) (*mod
 // the original Provider and the credential actually chosen for this operation.
 // It never stores credentials on the task or substitutes a newly configured key.
 func GatewayTaskCredentialCheck(task *model.Task, key string, index int) func(context.Context) error {
-	if task == nil || task.PrivateData.Gateway == nil {
+	if task == nil {
 		return nil
+	}
+	if task.PrivateData.Gateway == nil && task.PrivateData.LegacyObligation == nil {
+		return func(ctx context.Context) error {
+			_, expectedKey, expectedIndex, err := legacyTaskProvider(ctx, task)
+			if err != nil || expectedKey != key || expectedIndex != index {
+				return model.ErrProviderStatusConflict
+			}
+			return nil
+		}
 	}
 	provider, err := GatewayTaskProviderIdentity(task)
 	return func(ctx context.Context) error {
@@ -101,6 +180,77 @@ func (transport gatewayTaskHTTPTransport) RoundTrip(request *http.Request) (*htt
 		return nil, err
 	}
 	return transport.RoundTripper.RoundTrip(request)
+}
+
+type taskPollingPluginIdentity interface {
+	TaskPluginIdentity() (string, string)
+}
+
+func legacyTaskProvider(ctx context.Context, task *model.Task) (*model.Provider, string, int, error) {
+	verified, err := model.ValidateLegacyTaskPolling(ctx, task)
+	if err != nil || !verified {
+		return nil, "", 0, errors.New("legacy task evidence is not available for polling")
+	}
+	provider, err := model.GetProviderById(task.ChannelId, true)
+	if err != nil {
+		return nil, "", 0, errors.New("legacy task Provider is unavailable")
+	}
+	identity := task.PrivateData.Execution.TaskPlugin
+	plugin, ok := jsplugin.DefaultRegistry.Generation().Get(identity.Key)
+	if !ok || plugin.Meta.Version != identity.Version {
+		return nil, "", 0, errors.New("legacy task plugin is unavailable")
+	}
+	if provider.Type == constant.ChannelTypeTaskPlugin || provider.Type == constant.ChannelTypeNewAPI {
+		if !provider.GetSetting().BindsTaskPlugin(identity.Key) {
+			return nil, "", 0, errors.New("legacy task Provider plugin binding has changed")
+		}
+	} else if !slices.Contains(plugin.Meta.ChannelTypes, provider.Type) {
+		return nil, "", 0, errors.New("legacy task Provider plugin binding has changed")
+	}
+	key := task.PrivateData.Key
+	index := 0
+	if key == "" {
+		// A sole current key is not evidence of the credential that created
+		// this historical task. Do not query another upstream identity.
+		return nil, "", 0, errors.New("legacy task original credential is unavailable")
+	} else if provider.ProviderInfo.IsMultiKey {
+		index = slices.Index(provider.GetKeys(), key)
+	}
+	if key == "" || index < 0 || provider.ValidateRouteKey(ctx, key, index) != nil {
+		return nil, "", 0, errors.New("legacy task original credential is unavailable")
+	}
+	return provider, key, index, nil
+}
+
+// UpdateLegacyTask collects business facts only, with immutable source identity
+// and one task per query. It does not manufacture a Gateway or money contract.
+func UpdateLegacyTask(ctx context.Context, task *model.Task) error {
+	provider, key, index, err := legacyTaskProvider(ctx, task)
+	if err != nil {
+		return err
+	}
+	adaptor := GetTaskAdaptorFunc(task.Platform)
+	identity, ok := adaptor.(taskPollingPluginIdentity)
+	if !ok {
+		return errors.New("legacy task plugin identity is unavailable")
+	}
+	pluginKey, version := identity.TaskPluginIdentity()
+	source := task.PrivateData.Execution.TaskPlugin
+	if pluginKey != source.Key || version != source.Version {
+		return errors.New("legacy task plugin identity has changed")
+	}
+	pinned := *provider
+	pinned.Key = key
+	pinned.ProviderInfo.IsMultiKey = false
+	upstreamID := task.GetUpstreamTaskID()
+	tasks := map[string]*model.Task{upstreamID: task}
+	if batch, ok := adaptor.(BatchTaskPollingAdaptor); ok && batch.FetchMode() == "batch" {
+		return updateBatchTasks(ctx, batch, provider.Id, []string{upstreamID}, tasks, gatewayTaskProviderSelection{Provider: &pinned, KeyIndex: index})
+	}
+	adaptor.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{
+		ChannelType: provider.Type, ChannelId: provider.Id, ChannelBaseUrl: provider.GetBaseURL(), ChannelSetting: provider.GetSetting(), HeadersOverride: provider.GetHeaderOverride(), ApiKey: key, ChannelMultiKeyIndex: index,
+	}})
+	return updateVideoSingleTask(ctx, adaptor, &pinned, upstreamID, tasks)
 }
 
 // UpdateGatewayTask polls one accepted task using its original Provider.
@@ -169,6 +319,7 @@ func PublishGatewayTask(task *model.Task) error {
 		return fmt.Errorf("task has no gateway snapshot")
 	}
 	intent := snapshot.Settlement
+	intent.Request.Usage.BillingUsageSchema = snapshot.BillingUsageSchema
 	intent.Request.Status = "pending"
 	if !snapshot.Accepted {
 		intent.Request.Status = "submission_unknown"
@@ -180,6 +331,7 @@ func PublishGatewayTask(task *model.Task) error {
 		attempt.Status = intent.Request.Status
 		attempt.EndedAt = 0
 		attempt.Usage.TaskFacts = snapshot.Facts
+		attempt.Usage.BillingUsageSchema = snapshot.BillingUsageSchema
 		attempt.UsageSource = "estimated"
 		intent.Attempts = append(append([]model.GatewayAttempt(nil), snapshot.PreviousAttempts...), attempt)
 		intent.Attempt = nil
@@ -218,6 +370,9 @@ func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 	if task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure {
 		return fmt.Errorf("task is not terminal")
 	}
+	if snapshot.Stream != nil && snapshot.Stream.Pending {
+		return fmt.Errorf("task delivery outcome is unresolved")
+	}
 	var billing model.GatewayBilling
 	if err := model.DB.WithContext(ctx).Select("phase").Where("request_id = ? AND user_id = ?", snapshot.Settlement.Request.ID, task.UserId).Take(&billing).Error; err != nil {
 		return err
@@ -230,6 +385,7 @@ func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 		return model.PublishGatewayRecords(snapshot.Settlement.Request.ID)
 	}
 	intent := snapshot.Settlement
+	intent.Request.Usage.BillingUsageSchema = snapshot.BillingUsageSchema
 	request := &intent.Request
 	if intent.Attempt == nil {
 		return fmt.Errorf("task has no accepted attempt")
@@ -237,6 +393,7 @@ func SettleGatewayTask(ctx context.Context, task *model.Task) error {
 	acceptedAttempt := *intent.Attempt
 	intent.Attempt = &acceptedAttempt
 	attempt := intent.Attempt
+	attempt.Usage.BillingUsageSchema = snapshot.BillingUsageSchema
 	facts := maps.Clone(snapshot.Facts)
 	if facts == nil {
 		facts = make(map[string]any)

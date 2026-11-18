@@ -26,7 +26,7 @@ func SubscriptionRequestWaffoPancakePay(c *gin.Context) {
 	}
 
 	var req SubscriptionWaffoPancakePayRequest
-	if err := c.ShouldBindJSON(&req); err != nil || req.PlanId <= 0 {
+	if err := common.DecodeJsonStrict(c.Request.Body, &req); err != nil || req.PlanId <= 0 {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
@@ -36,12 +36,20 @@ func SubscriptionRequestWaffoPancakePay(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	if err := plan.ValidateMoney(); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	if !plan.Enabled {
 		common.ApiErrorT(c, "Subscription plan is not enabled")
 		return
 	}
 	if strings.TrimSpace(plan.WaffoPancakeProductId) == "" {
 		common.ApiErrorT(c, "WaffoPancakeProductId is not configured for this plan")
+		return
+	}
+	if plan.Price.Currency != "USD" || plan.Price.Nanos <= 0 || plan.Price.Nanos%10000000 != 0 {
+		common.ApiErrorT(c, "Invalid amount")
 		return
 	}
 	// Plan targets its own Pancake product, so we only require credentials
@@ -82,14 +90,13 @@ func SubscriptionRequestWaffoPancakePay(c *gin.Context) {
 	order := &model.SubscriptionOrder{
 		UserId:          userId,
 		PlanId:          plan.Id,
-		Money:           plan.PriceAmount,
 		TradeNo:         tradeNo,
 		PaymentMethod:   model.PaymentMethodWaffoPancake,
 		PaymentProvider: model.PaymentProviderWaffoPancake,
 		CreateTime:      time.Now().Unix(),
 		Status:          common.TopUpStatusPending,
 	}
-	if err := order.Insert(); err != nil {
+	if err := order.InsertWithContract(plan); err != nil {
 		logger.LogError(c.Request.Context(), common.LogText("Waffo Pancake failed to create subscription order user_id=%d plan_id=%d trade_no=%s error=%q", userId, plan.Id, tradeNo, err.Error()))
 		paymentError(c, common.NewMessage("Failed to create order"))
 		return
@@ -100,7 +107,7 @@ func SubscriptionRequestWaffoPancakePay(c *gin.Context) {
 		ProductID:     plan.WaffoPancakeProductId,
 		BuyerIdentity: service.WaffoPancakeBuyerIdentityFromUserID(user.Id),
 		PriceSnapshot: &service.WaffoPancakePriceSnapshot{
-			Amount:      decimal.NewFromFloat(plan.PriceAmount).StringFixed(2),
+			Amount:      decimal.NewFromInt(plan.Price.Nanos).Shift(-9).StringFixed(2),
 			TaxCategory: "saas",
 		},
 		BuyerEmail:              getWaffoPancakeBuyerEmail(user),
@@ -114,7 +121,6 @@ func SubscriptionRequestWaffoPancakePay(c *gin.Context) {
 		paymentError(c, common.NewMessage("Failed to start payment"))
 		return
 	}
-	logger.LogInfo(c.Request.Context(), common.LogText("Waffo Pancake subscription order created user_id=%d plan_id=%d trade_no=%s session_id=%s money=%.2f", userId, plan.Id, tradeNo, session.SessionID, plan.PriceAmount))
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "success",

@@ -26,18 +26,24 @@ import {
   within,
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { createInstance } from 'i18next'
+import { I18nextProvider } from 'react-i18next'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createJSONStorage } from 'zustand/middleware'
 
+import fr from '@/i18n/locales/fr.json'
 import { api } from '@/lib/api'
+import { useAuthStore } from '@/stores/auth-store'
 import {
   DEFAULT_CURRENCY_CONFIG,
   useSystemConfigStore,
 } from '@/stores/system-config-store'
 
+import type { CatalogOffering } from '../catalog'
 import { CachedPriceCell } from '../components/cached-price-cell'
 import { ModelCard } from '../components/model-card'
 import { ModelCardGrid } from '../components/model-card-grid'
+import { OfferingCatalog } from '../index'
 import type { PricingModel } from '../types'
 
 function pricingModel(overrides: Partial<PricingModel> = {}): PricingModel {
@@ -839,5 +845,472 @@ describe('model cards', () => {
     expect(spans).toHaveLength(1)
     expect(spans[0]).toHaveClass('bg-amber-500')
     vi.useRealTimers()
+  })
+})
+
+function catalogOffering(
+  overrides: Partial<CatalogOffering> = {}
+): CatalogOffering {
+  return {
+    id: 1,
+    name: 'sale-offering',
+    aliases: ['sale-alias'],
+    members: [
+      {
+        model_id: 7,
+        name: 'shared-member',
+        tier: 1,
+        description: 'Member description',
+        icon: '',
+        tags: 'vision',
+        publisher_id: 3,
+        publisher_name: 'Publisher',
+        capabilities: {},
+      },
+    ],
+    price: {
+      id: 1,
+      currency: 'EUR',
+      expression: 'tier("sale", p * 0.100000000000000001 + cr * 0 + c * 2)',
+      effective_at: 1,
+    },
+    ...overrides,
+  }
+}
+
+function renderCatalog(props: Parameters<typeof OfferingCatalog>[0] = {}) {
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <OfferingCatalog {...props} />
+    </QueryClientProvider>
+  )
+}
+
+describe('Offering sale catalog', () => {
+  beforeEach(() => useAuthStore.getState().auth.reset())
+  afterEach(() => useAuthStore.getState().auth.reset())
+  const signIn = (id = 1) =>
+    useAuthStore.getState().auth.setUser({
+      id,
+      username: `account-${id}`,
+      role: 1,
+      group: 'default',
+    })
+  const response = (data: CatalogOffering[]) => ({
+    data: { success: true, data, as_of: 1 },
+  })
+
+  it('shows a sign-in prompt without fetching an anonymous catalog', () => {
+    const get = vi.spyOn(api, 'get')
+    renderCatalog()
+    expect(screen.getByText('Sign in to view Offering prices')).toBeVisible()
+    expect(screen.getByRole('link', { name: 'Sign in' })).toHaveAttribute(
+      'href',
+      expect.stringContaining('/sign-in?redirect=')
+    )
+    expect(get).not.toHaveBeenCalled()
+  })
+
+  it('shrinks and wraps a maximum-length Offering name without pushing away its copy action', async () => {
+    signIn()
+    const name = `sale_${'x'.repeat(123)}`
+    vi.spyOn(api, 'get').mockResolvedValue(
+      response([catalogOffering({ name })])
+    )
+    const user = userEvent.setup()
+    const writeText = vi
+      .spyOn(navigator.clipboard, 'writeText')
+      .mockResolvedValue()
+    renderCatalog()
+    const card = within(await screen.findByRole('article'))
+    const nameButton = card.getByRole('button', { name })
+    expect(nameButton).toHaveClass(
+      'min-w-0',
+      'flex-1',
+      'shrink',
+      'break-all',
+      'whitespace-normal'
+    )
+    expect(nameButton).not.toHaveClass('shrink-0')
+    const copy = card.getByRole('button', { name: 'Copy Offering name' })
+    expect(copy).toBeEnabled()
+    await user.click(copy)
+    expect(writeText).toHaveBeenCalledWith(name)
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    await user.click(nameButton)
+    expect(await screen.findByRole('dialog')).toHaveTextContent(name)
+  })
+
+  it('shows translated filter labels before opening a popup and updates selected labels on language changes', async () => {
+    signIn()
+    vi.spyOn(api, 'get').mockResolvedValue(response([catalogOffering()]))
+    const i18n = createInstance()
+    await i18n.init({
+      lng: 'en',
+      fallbackLng: false,
+      resources: { en: { translation: {} }, fr },
+    })
+    const view = render(
+      <I18nextProvider i18n={i18n}>
+        <QueryClientProvider client={queryClient}>
+          <OfferingCatalog />
+        </QueryClientProvider>
+      </I18nextProvider>
+    )
+    await screen.findByRole('article')
+    expect(
+      screen.getByRole('combobox', { name: 'Publisher' })
+    ).toHaveTextContent('All publishers')
+    expect(screen.getByRole('combobox', { name: 'Tags' })).toHaveTextContent(
+      'All tags'
+    )
+    expect(screen.getByRole('combobox', { name: 'Sort' })).toHaveTextContent(
+      'Name ascending'
+    )
+    await act(() => i18n.changeLanguage('fr'))
+    expect(
+      screen.getByRole('combobox', { name: i18n.t('Publisher') })
+    ).toHaveTextContent(i18n.t('All publishers'))
+    expect(
+      screen.getByRole('combobox', { name: i18n.t('Tags') })
+    ).toHaveTextContent(i18n.t('All tags'))
+    expect(
+      screen.getByRole('combobox', { name: i18n.t('Sort') })
+    ).toHaveTextContent(i18n.t('Name ascending'))
+    view.rerender(
+      <I18nextProvider i18n={i18n}>
+        <QueryClientProvider client={queryClient}>
+          <OfferingCatalog
+            search={{
+              search: '',
+              vendor: '3',
+              tag: 'vision',
+              sort: 'name-desc',
+              tokenUnit: 'M',
+              view: 'card',
+            }}
+          />
+        </QueryClientProvider>
+      </I18nextProvider>
+    )
+    expect(
+      screen.getByRole('combobox', { name: i18n.t('Publisher') })
+    ).toHaveTextContent('Publisher')
+    expect(
+      screen.getByRole('combobox', { name: i18n.t('Tags') })
+    ).toHaveTextContent('vision')
+    expect(
+      screen.getByRole('combobox', { name: i18n.t('Sort') })
+    ).toHaveTextContent(i18n.t('Name descending'))
+  })
+
+  it.each(['Publisher', 'Tags'] as const)(
+    'keeps a long %s filter value readable when selecting and clearing it',
+    async (label) => {
+      signIn()
+      const name = `${label}_${'x'.repeat(128 - label.length - 1)}`
+      const offering = catalogOffering()
+      vi.spyOn(api, 'get').mockResolvedValue(
+        response([
+          {
+            ...offering,
+            members: offering.members.map((member) => ({
+              ...member,
+              publisher_name: name,
+              tags: name,
+            })),
+          },
+        ])
+      )
+      const user = userEvent.setup()
+      renderCatalog()
+      await screen.findByRole('article')
+      const filter = screen.getByRole('combobox', { name: label })
+      await user.click(filter)
+      const option = await screen.findByRole('option', { name })
+      expect(within(option).getByText(name)).toHaveClass(
+        'wrap-anywhere',
+        'whitespace-normal'
+      )
+      await user.click(option)
+      expect(filter).toHaveTextContent(name)
+      expect(filter).toHaveClass('min-w-0', 'max-w-full', 'h-auto')
+      expect(within(filter).getByText(name)).toHaveClass(
+        'wrap-anywhere',
+        'whitespace-normal'
+      )
+      await user.click(filter)
+      await user.click(
+        screen.getByRole('option', {
+          name: label === 'Publisher' ? 'All publishers' : 'All tags',
+        })
+      )
+      expect(filter).toHaveTextContent(
+        label === 'Publisher' ? 'All publishers' : 'All tags'
+      )
+      expect(screen.getByRole('article')).toBeVisible()
+    }
+  )
+
+  it('wraps a maximum-length member name in the expandable capability summary', async () => {
+    signIn()
+    const name = `model_${'x'.repeat(122)}`
+    const offering = catalogOffering()
+    vi.spyOn(api, 'get').mockResolvedValue(
+      response([
+        {
+          ...offering,
+          members: offering.members.map((member) => ({
+            ...member,
+            name,
+            capabilities: { vision: true },
+          })),
+        },
+      ])
+    )
+    const user = userEvent.setup()
+    renderCatalog({ detailName: offering.name })
+    const summary = await screen.findByText(`${name} · Capabilities`)
+    expect(summary.tagName).toBe('SUMMARY')
+    expect(summary).toHaveClass('wrap-anywhere')
+    await user.click(summary)
+    expect(summary.closest('details')).toHaveAttribute('open')
+    expect(screen.getByText(/"vision": true/)).toBeVisible()
+  })
+
+  it('identifies the current version as a base price, not an account charge, in cards, tables and details', async () => {
+    signIn()
+    const offering = catalogOffering()
+    vi.spyOn(api, 'get').mockResolvedValue(response([offering]))
+    const view = renderCatalog()
+    const explanation =
+      'Base prices come from the current price version. Your group discount, request usage and pricing conditions determine the final charge.'
+    const card = within(await screen.findByRole('article'))
+    expect(card.getByText('Base sale price')).toBeVisible()
+    expect(card.getByText(explanation)).toBeVisible()
+    expect(card.getByLabelText('Complete price expression')).toHaveTextContent(
+      offering.price?.expression ?? ''
+    )
+    await userEvent.click(screen.getByRole('button', { name: 'Table view' }))
+    const table = within(screen.getByRole('table'))
+    expect(
+      table.getByRole('columnheader', { name: 'Base sale price' })
+    ).toBeVisible()
+    expect(table.getByText(explanation)).toBeVisible()
+    await userEvent.click(table.getByRole('button', { name: offering.name }))
+    const dialog = within(await screen.findByRole('dialog'))
+    expect(dialog.getByText('Base sale price')).toBeVisible()
+    expect(dialog.getByText(explanation)).toBeVisible()
+    view.rerender(
+      <QueryClientProvider client={queryClient}>
+        <OfferingCatalog detailName={offering.name} />
+      </QueryClientProvider>
+    )
+    expect(screen.getByRole('heading', { name: offering.name })).toBeVisible()
+    expect(screen.getByText('Base sale price')).toBeVisible()
+    expect(screen.getByText(explanation)).toBeVisible()
+    expect(
+      screen.getByLabelText('Complete price expression')
+    ).toHaveTextContent(offering.price?.expression ?? '')
+  })
+
+  it('preserves native 18-decimal coefficients, zero and the full expression when switching M/K', async () => {
+    signIn()
+    const offering = catalogOffering()
+    vi.spyOn(api, 'get').mockResolvedValue(
+      response([
+        offering,
+        catalogOffering({ id: 2, name: 'no-current-price', price: null }),
+      ])
+    )
+    renderCatalog()
+    expect(await screen.findByText(/p: 0.100000000000000001 EUR/)).toBeVisible()
+    expect(screen.getByText(/cr: 0 EUR/)).toBeVisible()
+    expect(
+      screen.getByLabelText('Complete price expression')
+    ).toHaveTextContent(offering.price?.expression ?? '')
+    expect(screen.getByText('No current sale price')).toBeVisible()
+    await userEvent.click(screen.getByRole('button', { name: '1M tokens' }))
+    expect(screen.getByText(/p: 0.000100000000000000001 EUR/)).toBeVisible()
+    expect(screen.getByText(/cr: 0 EUR/)).toBeVisible()
+    expect(
+      screen.getByLabelText('Complete price expression')
+    ).toHaveTextContent(offering.price?.expression ?? '')
+    expect(screen.queryByText(/USD/)).not.toBeInTheDocument()
+  })
+
+  it('keeps fixed and task prices in native units and exposes the entire conditional expression', async () => {
+    signIn()
+    const fixed = catalogOffering({
+      price: {
+        id: 2,
+        currency: 'JPY',
+        expression: 'tier("fixed", fixed(0))',
+        effective_at: 1,
+      },
+    })
+    const expression =
+      'u("mode") == "pro" ? tier("pro", u("seconds") * 0.123456789123456789) : tier("standard", u("seconds") * 0.1)'
+    vi.spyOn(api, 'get').mockResolvedValue(
+      response([
+        fixed,
+        catalogOffering({
+          id: 2,
+          name: 'task-sale',
+          price: { id: 3, currency: 'EUR', expression, effective_at: 1 },
+        }),
+      ])
+    )
+    renderCatalog()
+    expect(await screen.findByText('0 JPY / request')).toBeVisible()
+    expect(
+      screen.getAllByLabelText('Complete price expression')[1]
+    ).toHaveTextContent(expression)
+    await userEvent.click(screen.getByRole('button', { name: '1M tokens' }))
+    expect(screen.getByText('0 JPY / request')).toBeVisible()
+    expect(
+      screen.getAllByLabelText('Complete price expression')[1]
+    ).toHaveTextContent(expression)
+  })
+
+  it('searches aliases, opens member tiers, and links with the external Offering name', async () => {
+    signIn()
+    const onOpenPage = vi.fn()
+    vi.spyOn(api, 'get').mockResolvedValue(
+      response([
+        catalogOffering(),
+        catalogOffering({
+          id: 2,
+          name: 'second-sale',
+          aliases: ['second-alias'],
+        }),
+      ])
+    )
+    renderCatalog({ onOpenPage })
+    await screen.findByRole('button', { name: 'sale-offering' })
+    await userEvent.type(screen.getByRole('textbox'), 'second-alias')
+    expect(
+      screen.queryByRole('button', { name: 'sale-offering' })
+    ).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'second-sale' }))
+    const dialog = within(await screen.findByRole('dialog'))
+    expect(dialog.getByText('shared-member')).toBeVisible()
+    expect(dialog.getByText('Member description')).toBeVisible()
+    expect(dialog.getByText('1')).toBeVisible()
+    expect(dialog.getByRole('cell', { name: 'Publisher' })).toBeVisible()
+    expect(dialog.getByText(/"model": "second-sale"/)).toBeVisible()
+    await userEvent.click(
+      dialog.getByRole('button', { name: 'Open details page' })
+    )
+    expect(onOpenPage).toHaveBeenCalledWith('second-sale')
+  })
+
+  it('preserves card/table views, pagination, and keyboard opening', async () => {
+    signIn()
+    vi.spyOn(api, 'get').mockResolvedValue(
+      response(
+        Array.from({ length: 13 }, (_, index) =>
+          catalogOffering({
+            id: index + 1,
+            name: `sale-${String(index).padStart(2, '0')}`,
+          })
+        )
+      )
+    )
+    renderCatalog()
+    const first = await screen.findByRole('button', { name: 'sale-00' })
+    first.focus()
+    await userEvent.keyboard('{Enter}')
+    expect(await screen.findByRole('dialog')).toBeVisible()
+    await userEvent.keyboard('{Escape}')
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    )
+    await userEvent.click(screen.getByRole('button', { name: 'Next' }))
+    expect(screen.getByRole('button', { name: 'sale-12' })).toBeVisible()
+    expect(
+      screen.queryByRole('button', { name: 'sale-00' })
+    ).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Table view' }))
+    expect(screen.getByRole('table')).toHaveTextContent('sale-12')
+    await userEvent.click(screen.getByRole('button', { name: 'Previous' }))
+    expect(screen.getByRole('table')).toHaveTextContent('sale-00')
+  })
+
+  it('shows a retryable error for malformed catalog data instead of a zero or empty success', async () => {
+    signIn()
+    const get = vi
+      .spyOn(api, 'get')
+      .mockResolvedValueOnce({
+        data: {
+          success: true,
+          data: [
+            {
+              ...catalogOffering(),
+              price: {
+                id: 1,
+                currency: 'usd',
+                expression: 'fixed(0)',
+                effective_at: 1,
+              },
+            },
+          ],
+          as_of: 1,
+        },
+      })
+      .mockResolvedValue(response([catalogOffering()]))
+    renderCatalog()
+    expect(
+      await screen.findByText('Unable to load Offering prices')
+    ).toBeVisible()
+    expect(screen.queryByText('No visible Offerings')).not.toBeInTheDocument()
+    await userEvent.click(
+      screen.getByRole('button', { name: /Retry|Try again/ })
+    )
+    expect(
+      await screen.findByRole('button', { name: 'sale-offering' })
+    ).toBeVisible()
+    expect(get).toHaveBeenCalledTimes(2)
+  })
+
+  it('clears the previous account immediately and ignores its late catalog response', async () => {
+    signIn()
+    let resolveFirst!: (value: ReturnType<typeof response>) => void
+    const first = new Promise<ReturnType<typeof response>>((resolve) => {
+      resolveFirst = resolve
+    })
+    const get = vi
+      .spyOn(api, 'get')
+      .mockReturnValueOnce(first)
+      .mockResolvedValue(
+        response([catalogOffering({ id: 2, name: 'account-two' })])
+      )
+    renderCatalog()
+    await waitFor(() => expect(get).toHaveBeenCalledTimes(1))
+    act(() => signIn(2))
+    expect(
+      await screen.findByRole('button', { name: 'account-two' })
+    ).toBeVisible()
+    await act(async () =>
+      resolveFirst(response([catalogOffering({ name: 'account-one-private' })]))
+    )
+    expect(screen.queryByText('account-one-private')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'account-two' })).toBeVisible()
+  })
+
+  it('resolves a detail alias and preserves the unavailable state for a hidden Offering', async () => {
+    signIn()
+    vi.spyOn(api, 'get').mockResolvedValue(response([catalogOffering()]))
+    const view = renderCatalog({ detailName: 'sale-alias' })
+    expect(
+      await screen.findByRole('heading', { name: 'sale-offering' })
+    ).toBeVisible()
+    view.rerender(
+      <QueryClientProvider client={queryClient}>
+        <OfferingCatalog detailName='hidden-sale' />
+      </QueryClientProvider>
+    )
+    expect(screen.getByText('Offering unavailable')).toBeVisible()
+    expect(screen.queryByText('shared-member')).not.toBeInTheDocument()
   })
 })

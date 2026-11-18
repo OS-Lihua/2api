@@ -548,10 +548,6 @@ func ApplyChannelAffinityOverrideTemplate(c *gin.Context, paramOverride map[stri
 	return mergedParam, true
 }
 
-func GetPreferredChannelByAffinity(c *gin.Context, modelName string, usingGroup string) (int, bool) {
-	return getPreferredChannelByAffinity(c, modelName, usingGroup, "")
-}
-
 // GetPreferredGatewayChannelByAffinity always isolates users, offerings and
 // tiers, even when a legacy session rule omits optional cache-key dimensions.
 func GetPreferredGatewayChannelByAffinity(c *gin.Context, offeringID, tier int, name string) (int, bool) {
@@ -739,10 +735,6 @@ func AppendChannelAffinityAdminInfo(c *gin.Context, other *model.LogOther) {
 		anyInfo = sanitized
 	}
 	other.SetAdmin("channel_affinity", anyInfo)
-}
-
-func RecordChannelAffinity(c *gin.Context, channelID int) {
-	recordChannelAffinity(c, channelID, true)
 }
 
 // RecordGatewayChannelAffinity records a Channel ID, never a Provider ID from

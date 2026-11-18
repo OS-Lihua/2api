@@ -20,9 +20,11 @@ import { useQuery } from '@tanstack/react-query'
 import type { ColumnDef } from '@tanstack/react-table'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { z } from 'zod'
 
 import { DataTablePage, useDataTable } from '@/components/data-table'
 import { ErrorState } from '@/components/error-state'
+import { FundingStatus } from '@/components/funding-status'
 import { SectionPageLayout } from '@/components/layout'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -36,6 +38,12 @@ import {
   getServerErrorMessage,
   requireServerSuccess,
 } from '@/lib/server-error-message'
+import {
+  moneyTotalSchema,
+  walletReadScope,
+  isWalletScopeCurrent,
+} from '@/lib/wallet-summary'
+import { useAuthStore } from '@/stores/auth-store'
 
 interface MarginRow {
   model_offering_id?: number
@@ -49,10 +57,28 @@ interface MarginRow {
   original_costs: MoneyAmount[]
   margin: MoneyAmount | null
   known_margin: MoneyAmount
+  funding_pending?: number
   sale_pending: number
   cost_pending: number
   converted_cost_pending: number
 }
+const marginRowSchema = z.object({
+  model_offering_id: z.number().int().optional(),
+  channel_id: z.number().int().optional(),
+  provider_id: z.number().int().optional(),
+  date: z.string().optional(),
+  revenue: moneyTotalSchema,
+  collected: moneyTotalSchema,
+  outstanding: moneyTotalSchema,
+  cost: moneyTotalSchema,
+  original_costs: z.array(moneyTotalSchema),
+  margin: moneyTotalSchema.nullable(),
+  known_margin: moneyTotalSchema,
+  funding_pending: z.number().int().nonnegative().optional(),
+  sale_pending: z.number().int().nonnegative(),
+  cost_pending: z.number().int().nonnegative(),
+  converted_cost_pending: z.number().int().nonnegative(),
+})
 interface MarginFilters {
   model_offering_id: string
   channel_id: string
@@ -75,6 +101,9 @@ const empty: MarginRow[] = []
 
 export function MarginReports() {
   const { t, i18n } = useTranslation()
+  const actor = useAuthStore((state) => state.auth.user)
+  const sid = useAuthStore((state) => state.auth.session?.sid)
+  const scope = walletReadScope('ledger')
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const [draft, setDraft] = useState(initial)
   const [filters, setFilters] = useState(initial)
@@ -89,8 +118,21 @@ export function MarginReports() {
       (/^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value)))
   )
   const query = useQuery({
-    queryKey: ['margin-report', filters, pagination],
+    queryKey: [
+      'margin-report',
+      actor?.id,
+      sid,
+      scope.allowed,
+      filters,
+      pagination,
+    ],
+    enabled: scope.allowed,
+    gcTime: 0,
+    retry: false,
     queryFn: async ({ signal }) => {
+      if (!isWalletScopeCurrent(scope, 'ledger')) {
+        throw new Error('Session changed')
+      }
       const params: Record<string, string | number> = {
         page: pagination.pageIndex + 1,
         page_size: pagination.pageSize,
@@ -104,10 +146,18 @@ export function MarginReports() {
         params,
         signal,
       })
-      return requireServerSuccess<{
-        success: boolean
-        data: { items: MarginRow[]; total: number }
-      }>(response.data).data
+      if (signal.aborted || !isWalletScopeCurrent(scope, 'ledger')) {
+        throw new Error('Session changed')
+      }
+      return z
+        .object({
+          success: z.literal(true),
+          data: z.object({
+            items: z.array(marginRowSchema),
+            total: z.number().int().nonnegative(),
+          }),
+        })
+        .parse(requireServerSuccess(response.data)).data
     },
   })
   const columns: ColumnDef<MarginRow>[] = [
@@ -152,7 +202,18 @@ export function MarginReports() {
     {
       id: 'collected',
       header: t('Collected'),
-      cell: ({ row }) => <RequestMoney amount={row.original.collected} />,
+      cell: ({ row }) => (
+        <div>
+          <RequestMoney amount={row.original.collected} />
+          <FundingStatus
+            pending={
+              row.original.funding_pending === undefined
+                ? undefined
+                : row.original.funding_pending > 0
+            }
+          />
+        </div>
+      ),
     },
     {
       id: 'outstanding',
@@ -185,6 +246,12 @@ export function MarginReports() {
       header: t('Pending accounting'),
       cell: ({ row }) => (
         <dl className='text-xs'>
+          <dt>{t('Pending funding requests')}</dt>
+          <dd>
+            {row.original.funding_pending === undefined
+              ? t('Funding status unavailable')
+              : formatNumber(row.original.funding_pending, locale)}
+          </dd>
           <dt>{t('Pending sales')}</dt>
           <dd>{formatNumber(row.original.sale_pending, locale)}</dd>
           <dt>{t('Pending purchase costs')}</dt>
@@ -208,6 +275,7 @@ export function MarginReports() {
     getRowId: (row) =>
       `${row.model_offering_id}:${row.channel_id}:${row.provider_id}:${row.date}`,
   })
+  if (!scope.allowed) return <ErrorState description={t('Permission denied')} />
   return (
     <SectionPageLayout>
       <SectionPageLayout.Title>{t('Margin reports')}</SectionPageLayout.Title>

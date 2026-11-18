@@ -18,16 +18,24 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { z } from 'zod'
 
+import { moneyAmountSchema } from '@/lib/wallet-summary'
+
+export const subscriptionAmountSchema = moneyAmountSchema.refine((value) =>
+  /^\d+$/.test(value.nanos)
+)
+
 // ============================================================================
 // Subscription Plan Schema & Types
 // ============================================================================
 
 export const subscriptionPlanSchema = z.object({
   id: z.number(),
+  purchase_revision: z.string().min(1),
   title: z.string(),
   subtitle: z.string().optional(),
-  price_amount: z.number(),
-  currency: z.string().default('USD'),
+  price: subscriptionAmountSchema,
+  allowance: subscriptionAmountSchema,
+  unlimited: z.boolean(),
   duration_unit: z.enum(['year', 'month', 'day', 'hour', 'custom']),
   duration_value: z.number(),
   custom_seconds: z.number().optional(),
@@ -35,10 +43,9 @@ export const subscriptionPlanSchema = z.object({
   quota_reset_custom_seconds: z.number().optional(),
   enabled: z.boolean(),
   sort_order: z.number(),
-  allow_balance_pay: z.boolean().optional().default(true),
-  allow_wallet_overflow: z.boolean().optional().default(true),
+  allow_balance_pay: z.boolean(),
+  allow_wallet_overflow: z.boolean(),
   max_purchase_per_user: z.number(),
-  total_amount: z.number(),
   upgrade_group: z.string().optional(),
   downgrade_group: z.string().optional(),
   stripe_price_id: z.string().optional(),
@@ -64,16 +71,39 @@ export const userSubscriptionSchema = z.object({
   source: z.string().optional(),
   start_time: z.number(),
   end_time: z.number(),
-  amount_total: z.number(),
-  amount_used: z.number(),
+  allowance: subscriptionAmountSchema,
+  unlimited: z.boolean(),
+  allow_wallet_overflow: z.boolean(),
   next_reset_time: z.number().optional(),
 })
 
+export const subscriptionPeriodSchema = z
+  .object({
+    period_id: z.number().int().positive(),
+    sequence: z.number().int().nonnegative(),
+    allowance: subscriptionAmountSchema,
+    consumed: moneyAmountSchema,
+    available: moneyAmountSchema,
+    reserved: moneyAmountSchema,
+    unlimited: z.boolean(),
+  })
+  .refine((period) =>
+    [period.consumed, period.available, period.reserved].every(
+      (amount) => amount.currency === period.allowance.currency
+    )
+  )
+
+export type SubscriptionPeriod = z.infer<typeof subscriptionPeriodSchema>
 export type UserSubscription = z.infer<typeof userSubscriptionSchema>
 
-export interface UserSubscriptionRecord {
-  subscription: UserSubscription
-}
+export const userSubscriptionRecordSchema = z.object({
+  subscription: userSubscriptionSchema,
+  period: subscriptionPeriodSchema,
+  legacy_reconciliation_pending: z.boolean().optional(),
+})
+export type UserSubscriptionRecord = z.infer<
+  typeof userSubscriptionRecordSchema
+>
 
 // ============================================================================
 // API Request/Response Types
@@ -138,11 +168,52 @@ export interface SubscriptionResetResult {
 // Self Subscription Data (user-facing)
 // ============================================================================
 
-export interface SelfSubscriptionData {
-  billing_preference: string
-  subscriptions: UserSubscriptionRecord[]
-  all_subscriptions: UserSubscriptionRecord[]
-}
+export const billingPreferenceSchema = z.enum([
+  'subscription_first',
+  'wallet_first',
+  'subscription_only',
+  'wallet_only',
+])
+export type BillingPreference = z.infer<typeof billingPreferenceSchema>
+export const selfSubscriptionDataSchema = z.object({
+  billing_preference: billingPreferenceSchema,
+  subscriptions: z.array(userSubscriptionRecordSchema),
+  all_subscriptions: z.array(userSubscriptionRecordSchema),
+})
+export type SelfSubscriptionData = z.infer<typeof selfSubscriptionDataSchema>
+
+export const planRecordSchema = z.object({ plan: subscriptionPlanSchema })
+export const planPayloadSchema = z
+  .object({
+    plan: subscriptionPlanSchema
+      .omit({ id: true, purchase_revision: true })
+      .strict(),
+  })
+  .strict()
+export const balancePurchaseRequestSchema = z
+  .object({
+    plan_id: z.number().int().positive(),
+    purchase_id: z.string().uuid(),
+    expected_revision: z.string().min(1),
+  })
+  .strict()
+export type BalancePurchaseRequest = z.infer<
+  typeof balancePurchaseRequestSchema
+>
+export const balancePurchaseResultSchema = userSubscriptionRecordSchema
+  .extend({
+    order_id: z.string().min(1),
+    purchase_revision: z.string().min(1),
+    contract_price: subscriptionAmountSchema,
+    wallet_charge: subscriptionAmountSchema,
+    fx_rate: z.null(),
+  })
+  .refine(
+    (result) =>
+      result.contract_price.currency === result.wallet_charge.currency &&
+      result.contract_price.nanos === result.wallet_charge.nanos
+  )
+export type BalancePurchaseResult = z.infer<typeof balancePurchaseResultSchema>
 
 // ============================================================================
 // Dialog Types

@@ -28,6 +28,9 @@ func DoWorkerRequest(req *WorkerRequest) (*http.Response, error) {
 
 // DoWorkerRequestWithContext keeps worker downloads within their caller's lifetime.
 func DoWorkerRequestWithContext(ctx context.Context, req *WorkerRequest) (*http.Response, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if !system_setting.EnableWorker() {
 		return nil, fmt.Errorf("worker not enabled")
 	}
@@ -37,8 +40,8 @@ func DoWorkerRequestWithContext(ctx context.Context, req *WorkerRequest) (*http.
 
 	// SSRF防护：验证请求URL
 	fetchSetting := system_setting.GetFetchSetting()
-	if err := common.ValidateURLWithFetchSetting(req.URL, fetchSetting.EnableSSRFProtection, fetchSetting.AllowPrivateIp, fetchSetting.DomainFilterMode, fetchSetting.IpFilterMode, fetchSetting.DomainList, fetchSetting.IpList, fetchSetting.AllowedPorts, fetchSetting.ApplyIPFilterForDomain); err != nil {
-		return nil, fmt.Errorf("request reject: %v", err)
+	if err := common.ValidateURLWithFetchSettingContext(ctx, req.URL, fetchSetting.EnableSSRFProtection, fetchSetting.AllowPrivateIp, fetchSetting.DomainFilterMode, fetchSetting.IpFilterMode, fetchSetting.DomainList, fetchSetting.IpList, fetchSetting.AllowedPorts, fetchSetting.ApplyIPFilterForDomain); err != nil {
+		return nil, fmt.Errorf("request reject: %w", err)
 	}
 
 	workerUrl := system_setting.WorkerUrl
@@ -79,7 +82,7 @@ func DoDownloadRequestWithContext(ctx context.Context, originUrl string, reason 
 		return DoWorkerRequestWithContext(ctx, req)
 	} else {
 		// SSRF防护：验证请求URL（非Worker模式）
-		if err := ValidateSSRFProtectedFetchURL(originUrl); err != nil {
+		if err := ValidateSSRFProtectedFetchURLWithContext(ctx, originUrl); err != nil {
 			return nil, fmt.Errorf("request reject: %v", err)
 		}
 

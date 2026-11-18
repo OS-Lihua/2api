@@ -38,8 +38,6 @@ const profile: UserProfile = {
   request_count: 0,
   status: 1,
   aff_count: 0,
-  aff_quota: 0,
-  aff_history_quota: 0,
   created_time: 0,
   setting: JSON.stringify({ record_ip_log: true }),
 }

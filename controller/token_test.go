@@ -16,9 +16,11 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -44,6 +46,25 @@ type tokenResponseItem struct {
 
 type tokenKeyResponse struct {
 	Key string `json:"key"`
+}
+
+func assertTokenManagementResponse(t *testing.T, recorder *httptest.ResponseRecorder, token *model.Token) {
+	t.Helper()
+	response := decodeAPIResponse(t, recorder)
+	var fields map[string]common.RawMessage
+	require.NoError(t, common.Unmarshal(response.Data, &fields))
+	if items, paged := fields["items"]; paged {
+		var entries []common.RawMessage
+		require.NoError(t, common.Unmarshal(items, &entries))
+		require.Len(t, entries, 1)
+		fields = nil
+		require.NoError(t, common.Unmarshal(entries[0], &fields))
+	}
+	assert.Equal(t, []string{"accessed_time", "allow_ips", "created_time", "expired_time", "id", "key", "name", "status"}, slices.Sorted(maps.Keys(fields)))
+	var maskedKey string
+	require.NoError(t, common.Unmarshal(fields["key"], &maskedKey))
+	assert.Equal(t, token.GetMaskedKey(), maskedKey)
+	assert.NotContains(t, recorder.Body.String(), token.GetFullKey())
 }
 
 type legacyToken struct {
@@ -313,6 +334,7 @@ func TestGetAllTokensMasksKeyInResponse(t *testing.T) {
 	if strings.Contains(recorder.Body.String(), token.Key) {
 		t.Fatalf("list response leaked raw token key: %s", recorder.Body.String())
 	}
+	assertTokenManagementResponse(t, recorder, token)
 }
 
 func TestSearchTokensMasksKeyInResponse(t *testing.T) {
@@ -340,6 +362,7 @@ func TestSearchTokensMasksKeyInResponse(t *testing.T) {
 	if strings.Contains(recorder.Body.String(), token.Key) {
 		t.Fatalf("search response leaked raw token key: %s", recorder.Body.String())
 	}
+	assertTokenManagementResponse(t, recorder, token)
 }
 
 func TestGetTokenMasksKeyInResponse(t *testing.T) {
@@ -365,6 +388,7 @@ func TestGetTokenMasksKeyInResponse(t *testing.T) {
 	if strings.Contains(recorder.Body.String(), token.Key) {
 		t.Fatalf("detail response leaked raw token key: %s", recorder.Body.String())
 	}
+	assertTokenManagementResponse(t, recorder, token)
 }
 
 func TestUpdateTokenMasksKeyInResponse(t *testing.T) {
@@ -372,15 +396,10 @@ func TestUpdateTokenMasksKeyInResponse(t *testing.T) {
 	token := seedToken(t, db, 1, "editable-token", "yzab1234cdef5678")
 
 	body := map[string]any{
-		"id":                   token.Id,
-		"name":                 "updated-token",
-		"expired_time":         -1,
-		"remain_quota":         100,
-		"unlimited_quota":      true,
-		"model_limits_enabled": false,
-		"model_limits":         "",
-		"group":                "default",
-		"cross_group_retry":    false,
+		"id":           token.Id,
+		"name":         "updated-token",
+		"expired_time": -1,
+		"allow_ips":    "203.0.113.0/24",
 	}
 
 	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
@@ -401,6 +420,7 @@ func TestUpdateTokenMasksKeyInResponse(t *testing.T) {
 	if strings.Contains(recorder.Body.String(), token.Key) {
 		t.Fatalf("update response leaked raw token key: %s", recorder.Body.String())
 	}
+	assertTokenManagementResponse(t, recorder, token)
 }
 
 func TestGetTokenKeyRequiresOwnershipAndReturnsFullKey(t *testing.T) {
@@ -437,72 +457,120 @@ func TestGetTokenKeyRequiresOwnershipAndReturnsFullKey(t *testing.T) {
 	}
 }
 
-func TestTokenAllowUserQuotaQueryOnCreateAndUpdate(t *testing.T) {
+func TestTokenManagementCreatesCredentialSettings(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	body := map[string]any{"name": "new-credential", "expired_time": -1, "allow_ips": "203.0.113.0/24"}
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", body, 1)
+	AddToken(ctx)
+	require.True(t, decodeAPIResponse(t, recorder).Success)
+	tokens, err := model.GetAllUserTokens(1, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, tokens, 1)
+	token := tokens[0]
+	assert.Equal(t, "new-credential", token.Name)
+	assert.Equal(t, int64(-1), token.ExpiredTime)
+	require.NotNil(t, token.AllowIps)
+	assert.Equal(t, "203.0.113.0/24", *token.AllowIps)
+	assert.Equal(t, common.TokenStatusEnabled, token.Status)
+	assert.NotEmpty(t, token.GetFullKey())
+	assert.NotContains(t, recorder.Body.String(), token.GetFullKey())
+	assert.Zero(t, token.RemainQuota)
+	assert.Zero(t, token.UsedQuota)
+	assert.False(t, token.UnlimitedQuota)
+	assert.False(t, token.AllowUserQuotaQuery)
+	assert.False(t, token.ModelLimitsEnabled)
+	assert.Empty(t, token.ModelLimits)
+	assert.Empty(t, token.Group)
+	assert.Empty(t, token.AutoGroups)
+	assert.False(t, token.CrossGroupRetry)
+	var count int64
+	require.NoError(t, db.Model(&model.Token{}).Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+}
+
+func TestTokenManagementUpdatesPreserveHistoryAndPermissionRevision(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.TokenOfferingPolicy{}, &model.TokenOfferingException{}))
+	token := seedToken(t, db, 1, "historical-credential", "history-permission-test-key")
+	token.RemainQuota, token.UsedQuota = 73, 27
+	token.UnlimitedQuota = false
+	token.AllowUserQuotaQuery, token.ModelLimitsEnabled = true, true
+	token.ModelLimits, token.Group = "historical-model", "auto"
+	token.AutoGroups, token.CrossGroupRetry = `["vip","default"]`, true
+	require.NoError(t, db.Save(token).Error)
+	permissions, err := model.MutateKeyPermissions(t.Context(), token.Id, token.UserId, 0, "deny_all", model.KeyPermissions{}, nil)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), permissions.Revision)
+
 	for _, tc := range []struct {
-		name   string
-		target string
-		stored *bool // nil creates the token through the API
-		field  any   // nil omits allow_user_quota_query from the request
-		want   bool
+		name, target string
+		body         map[string]any
+		status       int
 	}{
-		{name: "create without the field turns it on", target: "/api/token/", want: true},
-		{name: "create with false keeps it off", target: "/api/token/", field: false},
-		{name: "update without the field keeps it on", target: "/api/token/", stored: common.GetPointer(true), want: true},
-		{name: "update without the field keeps it off", target: "/api/token/", stored: common.GetPointer(false)},
-		{name: "update turns it off", target: "/api/token/", stored: common.GetPointer(true), field: false},
-		{name: "update turns it on", target: "/api/token/", stored: common.GetPointer(false), field: true, want: true},
-		{name: "status update leaves it alone", target: "/api/token/?status_only=true", stored: common.GetPointer(true), field: false, want: true},
+		{"edit", "/api/token/", map[string]any{"id": token.Id, "name": "updated-credential", "expired_time": int64(4102444800), "allow_ips": "203.0.113.0/24"}, common.TokenStatusEnabled},
+		{"disable", "/api/token/?status_only=true", map[string]any{"id": token.Id, "status": common.TokenStatusDisabled}, common.TokenStatusDisabled},
+		{"enable", "/api/token/?status_only=true", map[string]any{"id": token.Id, "status": common.TokenStatusEnabled}, common.TokenStatusEnabled},
+		{"clear IP and expiry", "/api/token/", map[string]any{"id": token.Id, "name": "updated-credential", "expired_time": -1, "allow_ips": ""}, common.TokenStatusEnabled},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			db := setupTokenControllerTestDB(t)
-			body := map[string]any{"name": "quota-query", "expired_time": -1, "unlimited_quota": true, "status": common.TokenStatusEnabled}
-			if tc.field != nil {
-				body["allow_user_quota_query"] = tc.field
-			}
-			var recorder *httptest.ResponseRecorder
-			if tc.stored == nil {
-				var ctx *gin.Context
-				ctx, recorder = newAuthenticatedContext(t, http.MethodPost, tc.target, body, 1)
-				AddToken(ctx)
-			} else {
-				token := seedToken(t, db, 1, "quota-query", "quota-query-key")
-				require.NoError(t, db.Model(token).Update("allow_user_quota_query", *tc.stored).Error)
-				body["id"] = token.Id
-				var ctx *gin.Context
-				ctx, recorder = newAuthenticatedContext(t, http.MethodPut, tc.target, body, 1)
-				UpdateToken(ctx)
-			}
-			response := decodeAPIResponse(t, recorder)
-			require.True(t, response.Success, response.Message)
-
-			var saved model.Token
-			require.NoError(t, db.Where("name = ?", "quota-query").First(&saved).Error)
-			assert.Equal(t, tc.want, saved.AllowUserQuotaQuery)
-			if tc.stored != nil {
-				var returned struct {
-					AllowUserQuotaQuery bool `json:"allow_user_quota_query"`
+			ctx, recorder := newAuthenticatedContext(t, http.MethodPut, tc.target, tc.body, token.UserId)
+			UpdateToken(ctx)
+			require.True(t, decodeAPIResponse(t, recorder).Success)
+			assertTokenManagementResponse(t, recorder, token)
+			if tc.target == "/api/token/" {
+				token.Name = tc.body["name"].(string)
+				token.AllowIps = common.GetPointer(tc.body["allow_ips"].(string))
+				if tc.name == "edit" {
+					token.ExpiredTime = 4102444800
+				} else {
+					token.ExpiredTime = -1
 				}
-				require.NoError(t, common.Unmarshal(response.Data, &returned))
-				assert.Equal(t, tc.want, returned.AllowUserQuotaQuery)
 			}
+			token.Status = tc.status
+			saved, err := model.GetTokenByIds(token.Id, token.UserId)
+			require.NoError(t, err)
+			assert.Equal(t, *token, *saved)
+			savedPermissions, err := model.GetKeyPermissions(t.Context(), token.Id, token.UserId)
+			require.NoError(t, err)
+			assert.Equal(t, permissions, savedPermissions, "credential settings must not bypass permission revisions")
 		})
 	}
 }
 
-func TestGetTokenUsageFollowsTheUserQuotaSwitchAndIPWhitelist(t *testing.T) {
+func TestAddTokenPreservesCountLimit(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	settings := operation_setting.GetTokenSetting()
+	previousLimit := settings.MaxUserTokens
+	settings.MaxUserTokens = 1
+	t.Cleanup(func() { settings.MaxUserTokens = previousLimit })
+	seedToken(t, db, 1, "existing-credential", "count-limit-test-key")
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", map[string]any{"name": "over-limit", "expired_time": -1}, 1)
+	AddToken(ctx)
+	assert.False(t, decodeAPIResponse(t, recorder).Success)
+	tokens, err := model.GetAllUserTokens(1, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, tokens, 1)
+	assert.Equal(t, "existing-credential", tokens[0].Name)
+}
+
+func TestGetTokenUsageRetiresQuotaWithoutBypassingIPWhitelist(t *testing.T) {
+	require.NoError(t, i18n.Init())
 	for _, tc := range []struct {
-		name          string
-		allow         bool
-		expired       bool
-		allowIps      string
-		remoteAddr    string
-		wantStatus    int
-		wantUserQuota bool
+		name       string
+		allow      bool
+		expired    bool
+		allowIps   string
+		remoteAddr string
+		wantStatus int
+		language   string
+		message    string
 	}{
-		{name: "switch off", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusOK},
-		{name: "switch on without IP whitelist", allow: true, remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusOK, wantUserQuota: true},
-		{name: "switch on with matching IP whitelist", allow: true, allowIps: "198.51.100.1\n203.0.113.0/24", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusOK, wantUserQuota: true},
-		{name: "expired key with the switch on", allow: true, expired: true, remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusOK, wantUserQuota: true},
+		{name: "switch off", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusGone},
+		{name: "simplified Chinese client", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusGone, language: "zh-CN", message: "基于旧额度的账单查询已退役，请使用已授权的钱包 API。"},
+		{name: "traditional Chinese client", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusGone, language: "zh-TW", message: "以舊額度為基礎的帳單查詢已退役，請使用已授權的錢包 API。"},
+		{name: "switch on without IP whitelist", allow: true, remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusGone},
+		{name: "switch on with matching IP whitelist", allow: true, allowIps: "198.51.100.1\n203.0.113.0/24", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusGone},
+		{name: "expired key with the switch on", allow: true, expired: true, remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusGone},
 		{name: "switch on from an IP outside the whitelist", allow: true, allowIps: "198.51.100.1", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusForbidden},
 		{name: "switch off from an IP outside the whitelist", allowIps: "198.51.100.1", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusForbidden},
 		{name: "unresolved client IP with a whitelist", allow: true, allowIps: "203.0.113.0/24", remoteAddr: "unresolved", wantStatus: http.StatusForbidden},
@@ -526,31 +594,40 @@ func TestGetTokenUsageFollowsTheUserQuotaSwitchAndIPWhitelist(t *testing.T) {
 			router.GET("/api/usage/token/", middleware.TokenAuthReadOnly(), GetTokenUsage)
 			request := httptest.NewRequest(http.MethodGet, "/api/usage/token/", nil)
 			request.Header.Set("Authorization", "Bearer sk-usagekey1234")
+			language := tc.language
+			if language == "" {
+				language = "en-US"
+			}
+			request.Header.Set("Accept-Language", language)
 			request.RemoteAddr = tc.remoteAddr
 			recorder := httptest.NewRecorder()
 			router.ServeHTTP(recorder, request)
 
 			require.Equal(t, tc.wantStatus, recorder.Code, recorder.Body.String())
-			if tc.wantStatus != http.StatusOK {
-				assert.NotContains(t, recorder.Body.String(), "total_available")
-				return
+			for _, field := range []string{"total_granted", "total_available", "total_used", "unlimited_quota", "model_limits", "user_quota", "balance", "consumed", "outstanding"} {
+				assert.NotContains(t, recorder.Body.String(), `"`+field+`"`)
 			}
-			var response struct {
-				Code bool                       `json:"code"`
-				Data map[string]json.RawMessage `json:"data"`
+			if tc.wantStatus == http.StatusGone {
+				message := tc.message
+				if message == "" {
+					message = "Quota-based billing queries have been retired. Use the authorized wallet APIs."
+				}
+				expected, err := common.Marshal(gin.H{"success": false, "message": message, "message_key": "Quota-based billing queries have been retired. Use the authorized wallet APIs.", "code": "quota_billing_retired"})
+				require.NoError(t, err)
+				assert.JSONEq(t, string(expected), recorder.Body.String())
+				assert.Contains(t, recorder.Header().Get("Cache-Control"), "no-store")
 			}
-			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
-			require.True(t, response.Code, recorder.Body.String())
-			fields := []string{"expires_at", "model_limits", "model_limits_enabled", "name", "object", "total_available", "total_granted", "total_used", "unlimited_quota"}
-			if tc.wantUserQuota {
-				fields = append(fields, "user_quota")
+			saved, err := model.GetTokenByIds(token.Id, user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, 100, saved.RemainQuota)
+			assert.Equal(t, 30, saved.UsedQuota)
+			assert.Equal(t, tc.allow, saved.AllowUserQuotaQuery)
+			assert.Equal(t, tc.allowIps, *saved.AllowIps)
+			wantTokenStatus := common.TokenStatusEnabled
+			if tc.expired {
+				wantTokenStatus = common.TokenStatusExpired
 			}
-			assert.Equal(t, fields, slices.Sorted(maps.Keys(response.Data)))
-			assert.JSONEq(t, `100`, string(response.Data["total_available"]))
-			assert.JSONEq(t, `30`, string(response.Data["total_used"]))
-			if tc.wantUserQuota {
-				assert.JSONEq(t, `{"total_available":12345,"total_used":678}`, string(response.Data["user_quota"]))
-			}
+			assert.Equal(t, wantTokenStatus, saved.Status)
 		})
 	}
 }
@@ -571,7 +648,7 @@ func TestAPITokenAuditDatabase(t *testing.T) {
 			t.Setenv("LOG_SQL_DSN", "")
 			db, _ := newAuditTestDatabase(t, "postgres")
 			model.DB = db
-			require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Token{}))
+			require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.UserAccessToken{}, &model.Token{}))
 			// Use the startup path that places the audit table on the primary database.
 			require.NoError(t, model.InitLogDB())
 			if separateLog {
@@ -591,9 +668,9 @@ func TestAPITokenAuditDatabase(t *testing.T) {
 
 func verifyAPITokenAudit(t *testing.T) {
 	t.Helper()
-	pat := "api-token-audit-pat-secret"
-	user := &model.User{Username: "token-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AccessToken: &pat, AffCode: "token-owner"}
+	user := &model.User{Username: "token-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "token-owner"}
 	require.NoError(t, model.DB.Create(user).Error)
+	pat, _ := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), "api_key:reveal")
 	other := &model.User{Username: "other-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "other-owner"}
 	require.NoError(t, model.DB.Create(other).Error)
 	session := &model.UserSession{SID: "token-audit-session", UserID: user.Id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: "placeholder", LoginMethod: "password", LastActiveAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Hour).Unix()}
@@ -626,22 +703,37 @@ func verifyAPITokenAudit(t *testing.T) {
 		params                           string
 		initialStatus                    int
 		failWrite, rateLimit, usePAT     bool
+		expired                          bool
 	}{
-		{name: "create", method: "POST", path: "/", body: `{"name":"created","expired_time":-1,"unlimited_quota":true}`, action: "token.create", success: true},
-		{name: "invalid create", method: "POST", path: "/", body: `{"name":"attempt","remain_quota":-1}`, action: "token.create", params: `{"name":"attempt"}`},
+		{name: "create", method: "POST", path: "/", body: `{"name":"created","expired_time":-1}`, action: "token.create", success: true},
+		{name: "invalid create", method: "POST", path: "/", body: `{"name":"attempt","remain_quota":-1}`, action: "token.create", params: `{}`},
 		{name: "malformed body", method: "POST", path: "/", body: `{"key":"raw-body-secret"`, action: "token.create", params: `{}`},
-		{name: "validation error exceeds audit buffer", method: "POST", path: "/", body: `{"remain_quota":` + strings.Repeat("9", 64*1024) + `}`, action: "token.create", params: `{}`},
-		{name: "create storage failure", method: "POST", path: "/", body: `{"name":"attempt","unlimited_quota":true}`, action: "token.create", params: `{"name":"attempt"}`, failWrite: true},
-		{name: "normalized update", method: "PUT", path: "/", body: `{"id":$id,"name":"renamed","expired_time":-1,"remain_quota":200,"unlimited_quota":true,"group":"default","cross_group_retry":true,"allow_ips":""}`, action: "token.update", success: true, params: `{"id":$id,"name":"renamed","changed_fields":["name","remain_quota","group","cross_group_retry","auto_groups"]}`},
-		{name: "configuration values stay private", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":42,"remain_quota":100,"unlimited_quota":false,"model_limits_enabled":true,"model_limits":"private-model-configuration","allow_ips":"203.0.113.57","group":"auto","cross_group_retry":true}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["expired_time","unlimited_quota","model_limits_enabled","model_limits","allow_ips"]}`},
-		{name: "unchanged update", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"remain_quota":100,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":""}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":[]}`},
-		{name: "user quota query update", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"remain_quota":100,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":"","allow_user_quota_query":true}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["allow_user_quota_query"]}`},
-		{name: "successful response exceeds audit buffer", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"remain_quota":100,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":"","model_limits":"` + strings.Repeat("m", 64*1024-128) + `"}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["model_limits"]}`},
-		{name: "update storage failure", method: "PUT", path: "/", body: `{"id":$id,"name":"failed-rename","unlimited_quota":true}`, action: "token.update", params: `{"id":$id,"name":"owned"}`, failWrite: true},
-		{name: "foreign update", method: "PUT", path: "/", body: `{"id":$other,"name":"forged-name","unlimited_quota":true}`, action: "token.update", params: `{"id":$other}`},
+		{name: "validation error exceeds audit buffer", method: "POST", path: "/", body: `{"expired_time":` + strings.Repeat("9", 64*1024) + `}`, action: "token.create", params: `{}`},
+		{name: "create storage failure", method: "POST", path: "/", body: `{"name":"attempt","expired_time":-1}`, action: "token.create", params: `{"name":"attempt"}`, failWrite: true},
+		{name: "normalized update", method: "PUT", path: "/", body: `{"id":$id,"name":"renamed","expired_time":-1,"allow_ips":""}`, action: "token.update", success: true, params: `{"id":$id,"name":"renamed","changed_fields":["name"]}`},
+		{name: "configuration values stay private", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":42,"allow_ips":"203.0.113.57"}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["expired_time","allow_ips"]}`},
+		{name: "unchanged update", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"allow_ips":""}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":[]}`},
+		{name: "retired user quota query update", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"allow_ips":"","allow_user_quota_query":true}`, action: "token.update", params: `{}`},
+		{name: "retired model settings stay private", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"model_limits":"private-model-configuration"}`, action: "token.update", params: `{}`},
+		{name: "successful response exceeds audit buffer", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"allow_ips":"` + strings.Repeat("203.0.113.0/24\\n", 5000) + `"}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["allow_ips"]}`},
+		{name: "update storage failure", method: "PUT", path: "/", body: `{"id":$id,"name":"failed-rename","expired_time":-1}`, action: "token.update", params: `{"id":$id,"name":"owned"}`, failWrite: true},
+		{name: "foreign update", method: "PUT", path: "/", body: `{"id":$other,"name":"forged-name","expired_time":-1}`, action: "token.update", params: `{"id":$other}`},
+		{name: "foreign status update", method: "PUT", path: "/?status_only=true", body: `{"id":$other,"status":1}`, action: "token.status_update", params: `{"id":$other}`},
+		{name: "invalid status", method: "PUT", path: "/?status_only=true", body: `{"id":$id,"status":4}`, action: "token.status_update", params: `{"id":$id}`},
+		{name: "status update rejects configuration", method: "PUT", path: "/?status_only=true", body: `{"id":$id,"status":2,"allow_ips":"203.0.113.57"}`, action: "token.status_update", params: `{}`},
+		{name: "configuration update rejects status", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"status":2}`, action: "token.update", params: `{}`},
+		{name: "credential injection", method: "POST", path: "/", body: `{"name":"injected","key":"raw-body-secret"}`, action: "token.create", params: `{}`},
+		{name: "ownership injection", method: "PUT", path: "/", body: `{"id":$id,"user_id":$other,"name":"injected","expired_time":-1}`, action: "token.update", params: `{}`},
+		{name: "trailing body", method: "POST", path: "/", body: `{"name":"injected","expired_time":-1} {"key":"raw-body-secret"}`, action: "token.create", params: `{}`},
+		{name: "long name", method: "POST", path: "/", body: `{"name":"` + strings.Repeat("n", 51) + `","expired_time":-1}`, action: "token.create", params: `{}`},
+		{name: "long update name", method: "PUT", path: "/", body: `{"id":$id,"name":"` + strings.Repeat("n", 51) + `","expired_time":-1}`, action: "token.update", params: `{"id":$id}`},
+		{name: "missing status", method: "PUT", path: "/?status_only=true", body: `{"id":$id}`, action: "token.status_update", params: `{"id":$id}`},
+		{name: "exhausted enable", method: "PUT", path: "/?status_only=true", body: `{"id":$id,"status":1}`, action: "token.status_update", success: true, params: `{"id":$id,"name":"owned","from":4,"to":1}`, initialStatus: common.TokenStatusExhausted},
 		{name: "disable", method: "PUT", path: "/?status_only=true", body: `{"id":$id,"status":2}`, action: "token.status_update", success: true, params: `{"id":$id,"name":"owned","from":1,"to":2}`},
 		{name: "enable", method: "PUT", path: "/?status_only=true", body: `{"id":$id,"status":1}`, action: "token.status_update", success: true, params: `{"id":$id,"name":"owned","from":2,"to":1}`, initialStatus: common.TokenStatusDisabled},
 		{name: "expired enable", method: "PUT", path: "/?status_only=true", body: `{"id":$id,"status":1}`, action: "token.status_update", params: `{"id":$id,"name":"owned"}`, initialStatus: common.TokenStatusExpired},
+		{name: "expired disabled enable", method: "PUT", path: "/?status_only=true", body: `{"id":$id,"status":1}`, action: "token.status_update", params: `{"id":$id,"name":"owned"}`, initialStatus: common.TokenStatusDisabled, expired: true},
+		{name: "expired exhausted enable", method: "PUT", path: "/?status_only=true", body: `{"id":$id,"status":1}`, action: "token.status_update", params: `{"id":$id,"name":"owned"}`, initialStatus: common.TokenStatusExhausted, expired: true},
 		{name: "delete", method: "DELETE", path: "/$id", action: "token.delete", success: true, params: `{"id":$id,"name":"owned"}`},
 		{name: "foreign delete", method: "DELETE", path: "/$other", action: "token.delete", params: `{"id":$other}`},
 		{name: "missing delete", method: "DELETE", path: "/999999", action: "token.delete", params: `{"id":999999}`},
@@ -661,8 +753,11 @@ func verifyAPITokenAudit(t *testing.T) {
 			if tc.initialStatus != 0 {
 				owned.Status = tc.initialStatus
 			}
-			if owned.Status == common.TokenStatusExpired {
+			if owned.Status == common.TokenStatusExpired || tc.expired {
 				owned.ExpiredTime = 1
+			}
+			if owned.Status == common.TokenStatusExhausted {
+				owned.RemainQuota, owned.UnlimitedQuota = 0, false
 			}
 			foreign := &model.Token{UserId: other.Id, Name: "private-foreign-name", Key: fmt.Sprintf("foreign-key-secret-%d", index)}
 			require.NoError(t, model.DB.Create(owned).Error)
@@ -831,7 +926,7 @@ func verifyAPITokenAudit(t *testing.T) {
 			}
 		}))
 		t.Cleanup(func() { require.NoError(t, model.LOG_DB.Callback().Create().Remove("token-audit:log-fail")) })
-		request := httptest.NewRequest("POST", "/api/token/", strings.NewReader(`{"name":"audit-down","unlimited_quota":true}`))
+		request := httptest.NewRequest("POST", "/api/token/", strings.NewReader(`{"name":"audit-down","expired_time":-1}`))
 		request.Header.Set("Authorization", "Bearer "+jwt)
 		request.Header.Set("Content-Type", "application/json")
 		response := httptest.NewRecorder()

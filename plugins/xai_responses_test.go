@@ -553,7 +553,7 @@ func TestXAIEditSettlesOnOutputResolution(t *testing.T) {
 	schema, _ := plugin.Meta.UsageForModel(videoModel)
 	require.NoError(t, billing_setting.SmokeTestTaskExpr(expression, schema))
 	info := &relaycommon.RelayInfo{
-		ProviderMeta:    &relaycommon.ProviderMeta{ChannelBaseUrl: server.URL, ApiKey: "xai-key", UpstreamModelName: videoModel},
+		ProviderMeta:    &relaycommon.ProviderMeta{ChannelId: 1, ChannelBaseUrl: server.URL, ApiKey: "xai-key", UpstreamModelName: videoModel},
 		OriginModelName: videoModel,
 		TaskRelayInfo:   &relaycommon.TaskRelayInfo{PublicTaskID: "task_public", Action: "video_extension"},
 	}
@@ -590,7 +590,7 @@ func TestXAIEditSettlesOnOutputResolution(t *testing.T) {
 				Properties:  model.Properties{OriginModelName: videoModel, UpstreamModelName: videoModel},
 				PrivateData: model.TaskPrivateData{PluginState: []byte(`{"extension_seconds":6}`)},
 			}
-			result, err := adaptor.ParseTaskResult(task, &http.Response{StatusCode: http.StatusOK, Header: make(http.Header)}, []byte(body))
+			result, err := adaptor.ParseTaskResultWithContext(fixtureTaskAuthority(t, adaptor, task), task, &http.Response{StatusCode: http.StatusOK, Header: make(http.Header)}, []byte(body))
 			require.NoError(t, err)
 			assert.Equal(t, "SUCCESS", result.Status)
 			wantFacts := map[string]any{"input_video_seconds": float64(8)}

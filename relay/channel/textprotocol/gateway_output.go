@@ -78,13 +78,17 @@ func (o *gatewayGeneratedOutput) ObserveGemini(body []byte) {
 	}
 }
 
-func (o *gatewayGeneratedOutput) ObserveChat(body []byte) {
+func (o *gatewayGeneratedOutput) ObserveChat(body []byte, completions ...bool) {
 	for i, choice := range gjson.GetBytes(body, "choices").Array() {
 		index := int64(i)
 		if reported := choice.Get("index"); reported.Exists() {
 			index = reported.Int()
 		}
-		o.appendChoice(index, relaycommon.ChatStreamChoiceBusinessText(choice))
+		text := relaycommon.ChatStreamChoiceBusinessText(choice)
+		if len(completions) > 0 && completions[0] {
+			text = relaycommon.SourceText(choice.Get("text"))
+		}
+		o.appendChoice(index, text)
 		legacy := choice.Get("delta.function_call")
 		if relaycommon.SourceText(legacy.Get("name")) != "" || relaycommon.SourceText(legacy.Get("arguments")) != "" {
 			if o.chatTools == nil {

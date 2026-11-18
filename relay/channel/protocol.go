@@ -203,6 +203,9 @@ type WireProtocol struct {
 }
 
 func (p *WireProtocol) ConvertRequest(c *gin.Context, info *relaycommon.RelayInfo, request any) (any, error) {
+	if p.Kind == protocol.OpenAIChat && info.RelayMode == relayconstant.RelayModeCompletions && !p.PublicResponse {
+		return nil, fmt.Errorf("provider wire dialect does not support native completions")
+	}
 	if p.Kind == protocol.OpenAIChat && info.ResponseFacts != nil && !p.ReportsGatewayFacts {
 		return nil, fmt.Errorf("native protocol does not report gateway response facts")
 	}

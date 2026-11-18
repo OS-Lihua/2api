@@ -28,7 +28,6 @@ import { Button } from '@/components/ui/button'
 import { Combobox } from '@/components/ui/combobox'
 import { Spinner } from '@/components/ui/spinner'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { MODEL_PRICING_ISSUES_QUERY_KEY } from '@/features/system-settings/models/pricing-issues'
 
 import {
   activateTaskPlugin,
@@ -47,6 +46,11 @@ import {
   fetchPluginSourceText,
   PluginSourceFetchError,
 } from '../lib/plugin-url'
+import {
+  isTaskPluginScopeCurrent,
+  taskPluginDetailKey,
+  useTaskPluginScope,
+} from '../lib/pricing-diagnostics'
 import type { MarketplacePlugin, MarketplaceSource } from '../types'
 import { JavaScriptViewer } from './javascript-viewer'
 import { MarketplaceCapabilities } from './marketplace-capabilities'
@@ -73,10 +77,12 @@ type MarketplaceInstallDialogProps = {
 }
 
 export function MarketplaceInstallDialog(props: MarketplaceInstallDialogProps) {
+  const scope = useTaskPluginScope()
   if (!props.target) return null
   return (
     <MarketplaceInstallContent
-      key={`${props.target.source.index_url}-${props.target.plugin.key}-${props.target.version}`}
+      key={`${scope}:${props.target.source.index_url}-${props.target.plugin.key}-${props.target.version}`}
+      scope={scope}
       target={props.target}
       onOpenChange={props.onOpenChange}
     />
@@ -84,7 +90,10 @@ export function MarketplaceInstallDialog(props: MarketplaceInstallDialogProps) {
 }
 
 function MarketplaceInstallContent(
-  props: MarketplaceInstallDialogProps & { target: MarketplaceInstallTarget }
+  props: MarketplaceInstallDialogProps & {
+    target: MarketplaceInstallTarget
+    scope: string
+  }
 ) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
@@ -139,8 +148,8 @@ function MarketplaceInstallContent(
 
   // The installed source is the diff baseline for an upgrade.
   const installedQuery = useQuery({
-    queryKey: ['task-plugin', pluginKey],
-    queryFn: () => getTaskPlugin(pluginKey),
+    queryKey: taskPluginDetailKey(pluginKey),
+    queryFn: ({ signal }) => getTaskPlugin(pluginKey, undefined, signal),
     enabled: hasInstalledPlugin,
   })
 
@@ -166,27 +175,28 @@ function MarketplaceInstallContent(
           detail.meta.key,
           detail.meta.version
         )
-        return { ...detail, pricing_issues: notice?.pricing_issues ?? [] }
+        return { ...detail, pricing_diagnostics: notice.pricing_diagnostics }
       }
       return detail
     },
     onSettled: () => {
+      if (!isTaskPluginScopeCurrent(props.scope)) return
       queryClient.invalidateQueries({ queryKey: ['task-plugins'] })
       queryClient.invalidateQueries({ queryKey: ['task-plugin', pluginKey] })
       queryClient.invalidateQueries({
         queryKey: ['task-plugin-versions', pluginKey],
       })
-      queryClient.invalidateQueries({
-        queryKey: MODEL_PRICING_ISSUES_QUERY_KEY,
-      })
     },
     onSuccess: (detail) => {
+      if (!isTaskPluginScopeCurrent(props.scope)) return
       toastPluginChange(
         t('Installed {{name}} v{{version}}', {
           name: detail.meta.name,
           version: detail.meta.version,
         }),
-        detail.pricing_issues
+        detail.pricing_diagnostics,
+        pluginKey,
+        props.scope
       )
       props.onOpenChange(false)
     },

@@ -25,6 +25,9 @@ type RequestInput struct {
 	// ImageCount is a validated billing quantity, separate from the frozen
 	// request's n. Settlement can replace it with the actual returned count.
 	ImageCount *int
+	// ToolCount is a host-native operation quantity. Only u("tool_count")
+	// expressions use canonical count units; fixed/token expressions retain theirs.
+	ToolCount *int `json:"-"`
 }
 
 // TokenParams holds all token dimensions passed into an Expr evaluation.

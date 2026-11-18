@@ -82,13 +82,13 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
               size='icon-sm'
               disabled={!complianceConfirmed}
               onClick={handleResetSubscriptions}
-              aria-label={t('Reset subscription quota')}
+              aria-label={t('Reset entitlement period')}
             />
           }
         >
           <RotateCcw />
         </TooltipTrigger>
-        <TooltipContent>{t('Reset subscription quota')}</TooltipContent>
+        <TooltipContent>{t('Reset entitlement period')}</TooltipContent>
       </Tooltip>
 
       <Tooltip>

@@ -553,12 +553,6 @@ func BatchInsertProviders(channels []Provider) error {
 			tx.Rollback()
 			return err
 		}
-		for _, channel_ := range chunk {
-			if err := channel_.AddAbilities(tx); err != nil {
-				tx.Rollback()
-				return err
-			}
-		}
 	}
 	return tx.Commit().Error
 }
@@ -567,7 +561,7 @@ func BatchDeleteProviders(ids []int) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	// 使用事务 分批删除channel表和abilities表
+	// Delete all account chunks in one transaction; legacy projections are independent.
 	tx := DB.Begin()
 	if tx.Error != nil {
 		return 0, tx.Error
@@ -580,10 +574,6 @@ func BatchDeleteProviders(ids []int) (int64, error) {
 			return 0, result.Error
 		}
 		deletedCount += result.RowsAffected
-		if err := tx.Where("channel_id in (?)", chunk).Delete(&Ability{}).Error; err != nil {
-			tx.Rollback()
-			return 0, err
-		}
 	}
 	if err := tx.Commit().Error; err != nil {
 		return 0, err
@@ -631,13 +621,7 @@ func (channel *Provider) GetStatusCodeMapping() string {
 }
 
 func (channel *Provider) Insert() error {
-	var err error
-	err = DB.Create(channel).Error
-	if err != nil {
-		return err
-	}
-	err = channel.AddAbilities(nil)
-	return err
+	return DB.Create(channel).Error
 }
 
 func (edit *ProviderEdit) Commit(channel *Provider) error {
@@ -688,9 +672,6 @@ func (edit *ProviderEdit) Commit(channel *Provider) error {
 	if err := edit.tx.First(channel, channel.Id).Error; err != nil {
 		return err
 	}
-	if err := channel.UpdateAbilities(edit.tx); err != nil {
-		return err
-	}
 	if edit.Authorize != nil && !edit.Authorize(edit.tx) {
 		return ErrProviderMutationForbidden
 	}
@@ -718,13 +699,7 @@ func (channel *Provider) UpdateBalance(balance float64) {
 }
 
 func (channel *Provider) Delete() error {
-	var err error
-	err = DB.Delete(channel).Error
-	if err != nil {
-		return err
-	}
-	err = channel.DeleteAbilities()
-	return err
+	return DB.Delete(channel).Error
 }
 
 var channelStatusLock sync.Mutex
@@ -888,7 +863,7 @@ func ApplyProviderStatus(channelId int, change ProviderStatusChange) (bool, erro
 	changed := false
 	var beforeProvider, committedProvider *Provider
 	err := providerCredentialSession().Transaction(func(tx *gorm.DB) (err error) {
-		// Validate current caller permissions after any row/ability lock wait,
+		// Validate current caller permissions after any Provider transaction lock wait,
 		// before committing or publishing an otherwise successful transition.
 		defer func() {
 			if err == nil && change.Authorize != nil && !change.Authorize(tx) {
@@ -952,11 +927,6 @@ func ApplyProviderStatus(channelId int, change ProviderStatusChange) (bool, erro
 		}
 		if result.RowsAffected != 1 {
 			return ErrProviderStatusConflict
-		}
-		if beforeStatus != channel.Status {
-			if err := tx.Model(&Ability{}).Where("channel_id = ?", channelId).Update("enabled", channel.Status == common.ChannelStatusEnabled).Error; err != nil {
-				return err
-			}
 		}
 		changed = true
 		return nil
@@ -1066,21 +1036,6 @@ func EditProviderByTag(tag string, newTag *string, modelMapping *string, models 
 	return nil
 }
 
-func UpdateProviderUsedQuota(id int, quota int) {
-	if common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeChannelUsedQuota, id, quota)
-		return
-	}
-	updateChannelUsedQuota(id, quota)
-}
-
-func updateChannelUsedQuota(id int, quota int) {
-	err := DB.Model(&Provider{}).Where("id = ?", id).Update("used_quota", gorm.Expr("used_quota + ?", quota)).Error
-	if err != nil {
-		common.SysLog(common.LogText("failed to update channel used quota: channel_id=%d, delta_quota=%d, error=%v", id, quota, err))
-	}
-}
-
 func DeleteProviderByStatus(status int64) (int64, error) {
 	result := DB.Where("status = ?", status).Delete(&Provider{})
 	return result.RowsAffected, result.Error
@@ -1158,9 +1113,6 @@ func (channel *Provider) ValidateSettings() error {
 		if err != nil {
 			return err
 		}
-	}
-	if err := channelOtherSettings.ValidateToolLossPolicy(); err != nil {
-		return err
 	}
 	if preset := common.GetAdvancedCustomPreset(channel.Type); preset != nil {
 		channelOtherSettings.AdvancedCustom = preset

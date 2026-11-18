@@ -45,7 +45,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { MODEL_PRICING_ISSUES_QUERY_KEY } from '@/features/system-settings/models/pricing-issues'
 import { handleServerError } from '@/lib/handle-server-error'
 import { resolveLocalizedText } from '@/lib/localized-text'
 
@@ -55,12 +54,19 @@ import {
   getTaskPluginVersions,
 } from '../api'
 import { toastPluginChange } from '../lib/plugin-change-toast'
+import {
+  isTaskPluginScopeCurrent,
+  taskPluginDetailKey,
+  taskPluginVersionsKey,
+  useTaskPluginScope,
+} from '../lib/pricing-diagnostics'
 import type { TaskPluginListItem } from '../types'
 import { JavaScriptViewer } from './javascript-viewer'
 import { PluginIcon } from './plugin-icon'
 import { PluginMetadataCard } from './plugin-metadata-card'
 import { PluginModelList } from './plugin-model-list'
 import { PluginSandbox } from './plugin-sandbox'
+import { PricingIssueList } from './pricing-issue-list'
 import { SourceDiff } from './source-diff'
 import { UsageSchemaTable } from './usage-schema-table'
 
@@ -70,11 +76,13 @@ type PluginDetailSheetProps = {
 }
 
 export function PluginDetailSheet(props: PluginDetailSheetProps) {
+  const scope = useTaskPluginScope()
   return (
     <Sheet open={Boolean(props.plugin)} onOpenChange={props.onOpenChange}>
       {props.plugin && (
         <PluginDetailContent
-          key={props.plugin.meta.key}
+          key={`${scope}:${props.plugin.meta.key}`}
+          scope={scope}
           plugin={props.plugin}
         />
       )}
@@ -82,7 +90,10 @@ export function PluginDetailSheet(props: PluginDetailSheetProps) {
   )
 }
 
-function PluginDetailContent(props: { plugin: TaskPluginListItem }) {
+function PluginDetailContent(props: {
+  plugin: TaskPluginListItem
+  scope: string
+}) {
   const { t, i18n } = useTranslation()
   const queryClient = useQueryClient()
   const key = props.plugin?.meta.key ?? ''
@@ -90,33 +101,38 @@ function PluginDetailContent(props: { plugin: TaskPluginListItem }) {
   const [sandboxVisited, setSandboxVisited] = useState(false)
   const [compareVersion, setCompareVersion] = useState('')
   const detailQuery = useQuery({
-    queryKey: ['task-plugin', key],
-    queryFn: () => getTaskPlugin(key),
+    queryKey: taskPluginDetailKey(key),
+    queryFn: ({ signal }) => getTaskPlugin(key, undefined, signal),
     enabled: Boolean(key),
   })
   const versionsQuery = useQuery({
-    queryKey: ['task-plugin-versions', key],
-    queryFn: () => getTaskPluginVersions(key),
+    queryKey: taskPluginVersionsKey(key),
+    queryFn: ({ signal }) => getTaskPluginVersions(key, signal),
     enabled: Boolean(key),
   })
   const compareQuery = useQuery({
-    queryKey: ['task-plugin', key, compareVersion],
-    queryFn: () => getTaskPlugin(key, compareVersion),
+    queryKey: taskPluginDetailKey(key, compareVersion),
+    queryFn: ({ signal }) => getTaskPlugin(key, compareVersion, signal),
     enabled: Boolean(key && compareVersion),
   })
   const activateMutation = useMutation({
     mutationFn: (version: string) => activateTaskPlugin(key, version),
     onSuccess: (notice) => {
+      if (!isTaskPluginScopeCurrent(props.scope)) return
       setCompareVersion('')
-      toastPluginChange(t('Plugin version activated'), notice?.pricing_issues)
+      toastPluginChange(
+        t('Plugin version activated'),
+        notice.pricing_diagnostics,
+        key,
+        props.scope
+      )
       queryClient.invalidateQueries({ queryKey: ['task-plugins'] })
       queryClient.invalidateQueries({ queryKey: ['task-plugin', key] })
       queryClient.invalidateQueries({ queryKey: ['task-plugin-versions', key] })
-      queryClient.invalidateQueries({
-        queryKey: MODEL_PRICING_ISSUES_QUERY_KEY,
-      })
     },
-    onError: (error) => handleServerError(error),
+    onError: (error) => {
+      if (isTaskPluginScopeCurrent(props.scope)) handleServerError(error)
+    },
   })
   const detail = detailQuery.data
   const versions = versionsQuery.data ?? []
@@ -247,6 +263,13 @@ function PluginDetailContent(props: { plugin: TaskPluginListItem }) {
         <TabsContent value='billing' className={panelClassName}>
           {detailState ?? (
             <div className='space-y-6'>
+              {detail && (
+                <PricingIssueList
+                  diagnostics={detail.pricing_diagnostics}
+                  pluginKey={key}
+                  scope={props.scope}
+                />
+              )}
               {showDefaultUsage && detail?.meta.usageSchema && (
                 <section className='space-y-3' aria-label={t('Default')}>
                   {usageProfiles.length > 0 && (

@@ -2,14 +2,19 @@ package service
 
 import (
 	"math"
-	"net/http"
 	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/money"
+	"github.com/shopspring/decimal"
+	"github.com/stretchr/testify/assert"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
-	"github.com/QuantumNous/new-api/relaykit/types"
+
 	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -103,38 +108,30 @@ func TestAttachQuotaSaturationNoClampNoMarker(t *testing.T) {
 }
 
 func TestPreConsumeBillingRejectsSaturatedQuotaBeforeDeduction(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	c, _ := gin.CreateTestContext(nil)
-	info := &relaycommon.RelayInfo{
-		QuotaClamp: &common.QuotaClamp{
-			Op:       "QuotaFromFloat",
-			Kind:     common.QuotaClampOverflow,
-			Original: 1e30,
-			Clamped:  common.MaxQuota,
-		},
-	}
-
-	apiErr := PreConsumeBilling(c, common.MaxQuota, info)
-
-	require.NotNil(t, apiErr)
-	require.Equal(t, types.ErrorCodeModelPriceError, apiErr.GetErrorCode())
-	require.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
-	require.Same(t, info.QuotaClamp, apiErr.Err)
-	var clamp *common.QuotaClamp
-	require.ErrorAs(t, apiErr, &clamp)
-	require.Same(t, info.QuotaClamp, clamp)
-	require.Nil(t, info.Billing)
+	seedSubscriptionTaskMoney(t, 0)
+	price := model.PriceVersion{Currency: "USD", Expression: `tier("overflow", fixed(1000000000000000000))`}
+	_, _, trace, err := GatewayPrice(&price, &dto.Usage{}, billingexpr.RequestInput{}, time.Now(), decimal.NewFromInt(1), nil)
+	require.ErrorIs(t, err, money.ErrOverflow)
+	require.NotEmpty(t, trace.UnroundedAmount, "overflow keeps the exact diagnostic amount, not a clamp")
+	wallet, err := model.GetUserWallet(77)
+	require.NoError(t, err)
+	assert.EqualValues(t, 8888, wallet.Balance.Nanos)
+	assert.Equal(t, 8000, getTokenRemainQuota(t, 77))
+	var reservations int64
+	require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
+	assert.Zero(t, reservations)
 }
 
 func TestPreConsumeBillingRejectsNegativeQuotaBeforeDeduction(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	c, _ := gin.CreateTestContext(nil)
-	info := &relaycommon.RelayInfo{}
-
-	apiErr := PreConsumeBilling(c, -1, info)
-
-	require.NotNil(t, apiErr)
-	require.Equal(t, types.ErrorCodeModelPriceError, apiErr.GetErrorCode())
-	require.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
-	require.Nil(t, info.Billing)
+	seedSubscriptionTaskMoney(t, 0)
+	request := model.GatewayRequest{ID: "negative-reservation", UserID: 77}
+	amount := money.Amount{Nanos: -1, Currency: "USD"}
+	require.Error(t, model.ReserveGateway(&request, amount, amount))
+	var rows int64
+	require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Where("request_id = ?", request.ID).Count(&rows).Error)
+	assert.Zero(t, rows)
+	wallet, err := model.GetUserWallet(77)
+	require.NoError(t, err)
+	assert.EqualValues(t, 8888, wallet.Balance.Nanos)
+	assert.Equal(t, 8000, getTokenRemainQuota(t, 77))
 }

@@ -24,14 +24,16 @@ import { BadgeCell } from '@/components/data-table'
 import { GroupBadge } from '@/components/group-badge'
 import { StatusBadge } from '@/components/status-badge'
 import { TableId } from '@/components/table-id'
-import { formatQuota } from '@/lib/format'
+import { toIntlLocale } from '@/i18n/languages'
+import { formatMoneyAmount } from '@/lib/currency'
 
 import { formatDuration, formatResetPeriod } from '../lib'
 import type { PlanRecord } from '../types'
 import { DataTableRowActions } from './data-table-row-actions'
 
 export function useSubscriptionsColumns(): ColumnDef<PlanRecord>[] {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
 
   return useMemo(
     (): ColumnDef<PlanRecord>[] => [
@@ -64,12 +66,12 @@ export function useSubscriptionsColumns(): ColumnDef<PlanRecord>[] {
         size: 200,
       },
       {
-        accessorFn: (row) => row.plan.price_amount,
         id: 'price',
         header: t('Price'),
+        enableSorting: false,
         cell: ({ row }) => (
-          <span className='font-semibold text-emerald-600'>
-            ${Number(row.original.plan.price_amount || 0).toFixed(2)}
+          <span className='font-semibold wrap-anywhere text-emerald-600'>
+            {formatMoneyAmount(row.original.plan.price, locale)}
           </span>
         ),
         size: 100,
@@ -86,7 +88,7 @@ export function useSubscriptionsColumns(): ColumnDef<PlanRecord>[] {
       },
       {
         id: 'reset',
-        header: t('Quota Reset'),
+        header: t('Entitlement reset'),
         meta: { mobileHidden: true },
         cell: ({ row }) => (
           <span className='text-muted-foreground'>
@@ -161,17 +163,16 @@ export function useSubscriptionsColumns(): ColumnDef<PlanRecord>[] {
         size: 140,
       },
       {
-        id: 'total_amount',
-        header: t('Plan Quota'),
+        id: 'allowance',
+        header: t('Entitlement limit'),
         meta: { mobileHidden: true },
-        cell: ({ row }) => {
-          const total = Number(row.original.plan.total_amount || 0)
-          return (
-            <span className='text-muted-foreground'>
-              {total > 0 ? formatQuota(total) : t('Unlimited')}
-            </span>
-          )
-        },
+        cell: ({ row }) => (
+          <span className='text-muted-foreground wrap-anywhere'>
+            {row.original.plan.unlimited
+              ? t('Unlimited')
+              : formatMoneyAmount(row.original.plan.allowance, locale)}
+          </span>
+        ),
         size: 150,
       },
       {
@@ -200,6 +201,6 @@ export function useSubscriptionsColumns(): ColumnDef<PlanRecord>[] {
         meta: { pinned: 'right' as const },
       },
     ],
-    [t]
+    [t, locale]
   )
 }

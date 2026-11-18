@@ -7,8 +7,6 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/middleware"
-	"github.com/QuantumNous/new-api/relay"
-	"github.com/QuantumNous/new-api/relaykit/types"
 
 	"github.com/gin-gonic/gin"
 )
@@ -96,7 +94,7 @@ func SetRelayRouter(router *gin.Engine) {
 	playgroundRouter := router.Group("/pg")
 	playgroundRouter.Use(middleware.RouteTag("relay"))
 	playgroundRouter.Use(middleware.SystemPerformanceCheck())
-	playgroundRouter.Use(middleware.UserAuth(), middleware.Distribute())
+	playgroundRouter.Use(middleware.UserAuth(), middleware.ResolveTextOffering(), middleware.ModelRequestRateLimit())
 	{
 		playgroundRouter.POST("/chat/completions", controller.Playground)
 	}
@@ -109,9 +107,7 @@ func SetRelayRouter(router *gin.Engine) {
 		// Responses WebSocket route. Channel selection happens after the first
 		// response.create event; each event runs the ordinary request limiter.
 		relayV1Router.GET("/responses", controller.ResponsesWebSocket)
-		relayV1Router.GET("/realtime", controller.RealtimeGateway, middleware.ModelRequestRateLimit(), middleware.Distribute(), func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIRealtime)
-		})
+		relayV1Router.GET("/realtime", controller.RealtimeGateway)
 	}
 	relayV1Router.Use(middleware.ModelRequestRateLimit())
 	{
@@ -119,81 +115,46 @@ func SetRelayRouter(router *gin.Engine) {
 		httpRouter := relayV1Router.Group("")
 		httpRouter.Use(controller.MediaGateway)
 		httpRouter.Use(controller.TextGateway)
-		httpRouter.Use(middleware.Distribute())
 
-		// claude related routes
-		// TODO: /messages/count_tokens is disabled. The current controller.CountClaudeTokens
-		// httpRouter.POST("/messages/count_tokens", controller.CountClaudeTokens)
-		httpRouter.POST("/messages", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatClaude)
-		})
+		// The gateways above own these requests, including missing models and
+		// invalid bodies. No legacy dispatch is registered behind them.
+		httpRouter.POST("/messages", controller.RelayNotImplemented)
 
 		// chat related routes
-		httpRouter.POST("/completions", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAI)
-		})
-		httpRouter.POST("/chat/completions", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAI)
-		})
+		httpRouter.POST("/completions", controller.RelayNotImplemented)
+		httpRouter.POST("/chat/completions", controller.RelayNotImplemented)
 
 		// response related routes
-		httpRouter.POST("/responses/compact", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIResponsesCompaction)
-		})
+		httpRouter.POST("/responses/compact", controller.RelayNotImplemented)
 
 		// alpha search related routes (Codex standalone web search)
-		httpRouter.POST("/alpha/search", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIAlphaSearch)
-		})
+		httpRouter.POST("/alpha/search", controller.RelayNotImplemented)
 
 		// DeepSeek Search and Fetch API routes
-		httpRouter.POST("/tools/search", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatDeepSeekTools)
-		})
-		httpRouter.POST("/tools/fetch", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatDeepSeekTools)
-		})
+		httpRouter.POST("/tools/search", controller.RelayNotImplemented)
+		httpRouter.POST("/tools/fetch", controller.RelayNotImplemented)
 
-		// image related routes. /images/generations and /images/edits are
-		// host protocol endpoints (openai_image) registered by
-		// SetTaskPluginProtocolRouter; unclaimed models fall back to Relay.
-		httpRouter.POST("/edits", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIImage)
-		})
+		// Image generation/edit endpoints are registered by the host protocol
+		// router and use the task or synchronous media gateway.
+		httpRouter.POST("/edits", controller.RelayNotImplemented)
 
 		// embedding related routes
-		httpRouter.POST("/embeddings", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatEmbedding)
-		})
+		httpRouter.POST("/embeddings", controller.RelayNotImplemented)
 
 		// audio related routes
-		httpRouter.POST("/audio/transcriptions", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIAudio)
-		})
-		httpRouter.POST("/audio/translations", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIAudio)
-		})
-		httpRouter.POST("/audio/speech", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIAudio)
-		})
+		httpRouter.POST("/audio/transcriptions", controller.RelayNotImplemented)
+		httpRouter.POST("/audio/translations", controller.RelayNotImplemented)
+		httpRouter.POST("/audio/speech", controller.RelayNotImplemented)
 
 		// rerank related routes
-		httpRouter.POST("/rerank", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatRerank)
-		})
+		httpRouter.POST("/rerank", controller.RelayNotImplemented)
 
 		// gemini relay routes
-		httpRouter.POST("/engines/:model/embeddings", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatGemini)
-		})
-		httpRouter.POST("/models/*path", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatGemini)
-		})
+		httpRouter.POST("/engines/:model/embeddings", controller.RelayNotImplemented)
+		httpRouter.POST("/models/*path", controller.RelayNotImplemented)
 
 		// other relay routes
-		httpRouter.POST("/moderations", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAI)
-		})
+		httpRouter.POST("/moderations", controller.RelayNotImplemented)
 
 		// not implemented
 		httpRouter.POST("/images/variations", controller.RelayNotImplemented)
@@ -230,9 +191,9 @@ func SetRelayRouter(router *gin.Engine) {
 			c.Abort()
 		}
 	})
-	// Veo's :predictLongRunning goes to the plugin route that declares it (the
-	// google plugin's POST /v1beta/models/:model) before this group's auth,
-	// rate limit and channel selection; without one it stays with the relay.
+	// Veo's :predictLongRunning goes to its declared plugin route before this
+	// group's auth. A dispatcher miss reaches credential validation and an
+	// explicit unsupported response, never legacy generation or quota billing.
 	relayGeminiRouter.Use(func(c *gin.Context) {
 		if strings.HasSuffix(c.Request.URL.Path, ":predictLongRunning") {
 			defaultPluginDispatcher.dispatch(c)
@@ -244,34 +205,31 @@ func SetRelayRouter(router *gin.Engine) {
 	relayGeminiRouter.Use(middleware.ResolveTextOffering())
 	relayGeminiRouter.Use(middleware.ModelRequestRateLimit())
 	relayGeminiRouter.Use(controller.TextGateway)
-	relayGeminiRouter.Use(middleware.Distribute())
 	{
-		// Gemini API 路径格式: /v1beta/models/{model_name}:{action}
-		relayGeminiRouter.POST("/models/*path", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatGemini)
-		})
+		// The four supported text actions are consumed by TextGateway. Other
+		// actions require an explicit plugin Offering contract.
+		relayGeminiRouter.POST("/models/*path", controller.RelayNotImplemented)
 	}
 }
 
 func registerMjRouterGroup(relayMjRouter *gin.RouterGroup) {
-	relayMjRouter.GET("/image/:id", relay.RelayMidjourneyImage)
-	relayMjRouter.Use(middleware.TokenAuth(), middleware.Distribute())
-	{
-		relayMjRouter.POST("/submit/action", controller.RelayMidjourney)
-		relayMjRouter.POST("/submit/shorten", controller.RelayMidjourney)
-		relayMjRouter.POST("/submit/modal", controller.RelayMidjourney)
-		relayMjRouter.POST("/submit/imagine", controller.RelayMidjourney)
-		relayMjRouter.POST("/submit/change", controller.RelayMidjourney)
-		relayMjRouter.POST("/submit/simple-change", controller.RelayMidjourney)
-		relayMjRouter.POST("/submit/describe", controller.RelayMidjourney)
-		relayMjRouter.POST("/submit/blend", controller.RelayMidjourney)
-		relayMjRouter.POST("/submit/edits", controller.RelayMidjourney)
-		relayMjRouter.POST("/submit/video", controller.RelayMidjourney)
-		//relayMjRouter.POST("/notify", controller.RelayMidjourney)
-		relayMjRouter.GET("/task/:id/fetch", controller.RelayMidjourney)
-		relayMjRouter.GET("/task/:id/image-seed", controller.RelayMidjourney)
-		relayMjRouter.POST("/task/list-by-condition", controller.RelayMidjourney)
-		relayMjRouter.POST("/insight-face/swap", controller.RelayMidjourney)
-		relayMjRouter.POST("/submit/upload-discord-images", controller.RelayMidjourney)
+	relayMjRouter.GET("/image/:id", func(c *gin.Context) {
+		c.Params = append(c.Params, gin.Param{Key: "artifact_key", Value: "image"})
+	}, middleware.TokenOrTaskArtifactAccessAuth("id", "artifact_key"), controller.MidjourneyImage)
+	// Native routes are explicitly handed to the pinned plugin pipeline. A
+	// missing/disabled plugin never revives legacy quota billing.
+	register := func(method, path string) {
+		relayMjRouter.Handle(method, path, defaultPluginDispatcher.dispatch, middleware.TaskOriginAuth(), func(c *gin.Context) {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"code": "task_plugin_unavailable", "message": "Task plugin is unavailable"}})
+		})
 	}
+	for _, operation := range []string{"action", "shorten", "modal", "imagine", "change", "simple-change", "describe", "blend", "edits", "video", "upload-discord-images"} {
+		register(http.MethodPost, "/submit/"+operation)
+	}
+	register(http.MethodPost, "/insight-face/swap")
+	register(http.MethodPost, "/task/list-by-condition")
+	register(http.MethodGet, "/task/:id/fetch")
+	relayMjRouter.GET("/task/:id/image-seed", func(c *gin.Context) {
+		c.Params = append(c.Params, gin.Param{Key: "artifact_key", Value: "seed"})
+	}, middleware.TokenOrTaskArtifactAccessAuth("id", "artifact_key"), controller.MidjourneyImage)
 }

@@ -23,7 +23,6 @@ import { useTranslation } from 'react-i18next'
 
 import { DataTablePage, useDataTable } from '@/components/data-table'
 import { ErrorState } from '@/components/error-state'
-import { useModelPricing } from '@/features/model-pricing/api'
 import { useMediaQuery } from '@/hooks'
 import { useTableUrlState } from '@/hooks/use-table-url-state'
 import {
@@ -172,16 +171,7 @@ export function ModelsTable() {
   const vendorCounts = data?.data?.vendor_counts
 
   // Columns configuration
-  const pricingQuery = useModelPricing(
-    models
-      .filter((item) => item.name_rule === 0)
-      .map((item) => item.model_name),
-    models.length > 0
-  )
-  let pricingState: 'loading' | 'error' | undefined
-  if (pricingQuery.isError) pricingState = 'error'
-  else if (pricingQuery.isLoading) pricingState = 'loading'
-  const columns = useModelsColumns(vendors, pricingQuery.data, pricingState)
+  const columns = useModelsColumns(vendors)
 
   // React Table instance
   const { table } = useDataTable({
@@ -259,21 +249,20 @@ export function ModelsTable() {
         filters: [
           {
             columnId: 'status',
-            title: t('Display policy'),
+            title: t('Metadata status'),
             options: [
-              { label: t('Allowed'), value: 'enabled' },
-              { label: t('Not listed'), value: 'disabled' },
+              { label: t('Enabled'), value: 'enabled' },
+              { label: t('Disabled'), value: 'disabled' },
             ],
             singleSelect: true,
           },
           {
             columnId: 'square_state',
-            title: t('Model square visibility'),
+            title: t('Metadata and Channel status'),
             options: [
-              { label: t('Displayed'), value: 'visible' },
-              { label: t('Unavailable'), value: 'unavailable' },
-              { label: t('Listing hidden'), value: 'hidden' },
-              { label: t('Partly shown'), value: 'partial' },
+              { label: t('Enabled Channels'), value: 'visible' },
+              { label: t('No enabled Channels'), value: 'unavailable' },
+              { label: t('Metadata disabled'), value: 'hidden' },
             ],
             singleSelect: true,
           },

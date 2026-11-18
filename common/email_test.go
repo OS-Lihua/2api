@@ -2,21 +2,28 @@ package common
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
+	"net/http"
 	"net/smtp"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,13 +37,14 @@ type fakeSMTPServer struct {
 	messages          chan string
 	authCommands      chan string
 	startTLSCommands  chan string
+	quitResponse      string
 }
 
 func newFakeSMTPServer(t *testing.T) *fakeSMTPServer {
 	return newFakeSMTPServerWithSTARTTLSAdvertisement(t, true)
 }
 
-func newFakeSMTPServerWithSTARTTLSAdvertisement(t *testing.T, advertiseSTARTTLS bool) *fakeSMTPServer {
+func newFakeSMTPServerWithSTARTTLSAdvertisement(t *testing.T, advertiseSTARTTLS bool, configure ...func(*fakeSMTPServer)) *fakeSMTPServer {
 	t.Helper()
 
 	cert, err := newTestTLSCertificate()
@@ -60,6 +68,9 @@ func newFakeSMTPServerWithSTARTTLSAdvertisement(t *testing.T, advertiseSTARTTLS 
 		messages:          make(chan string, 1),
 		authCommands:      make(chan string, 1),
 		startTLSCommands:  make(chan string, 1),
+	}
+	for _, configureServer := range configure {
+		configureServer(server)
 	}
 	go server.serve()
 	return server
@@ -194,7 +205,11 @@ func (s *fakeSMTPServer) serve() {
 				return
 			}
 		case upperCommand == "QUIT":
-			_ = writeSMTPLine(rw, "221 2.0.0 Bye")
+			response := s.quitResponse
+			if response == "" {
+				response = "221 2.0.0 Bye"
+			}
+			_ = writeSMTPLine(rw, response)
 			return
 		default:
 			if err := writeSMTPLine(rw, "502 5.5.1 Command not implemented"); err != nil {
@@ -265,6 +280,186 @@ func withSMTPSettings(t *testing.T) {
 		SMTPToken = originalSMTPToken
 		SystemName = originalSystemName
 	})
+}
+
+type emailContextTransport func(*http.Request) (*http.Response, error)
+
+func (transport emailContextTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport(request)
+}
+
+func TestEmailContextAndSafeDiagnostics(t *testing.T) {
+	for _, name := range []string{"cancelled_before_send", "cancelled_during_send", "rejected_response", "transport_failure"} {
+		t.Run(name, func(t *testing.T) {
+			OptionMapRWMutex.Lock()
+			previousOptions := OptionMap
+			OptionMap = map[string]string{"EmailProvider": "resend", "ResendApiKey": "delivery-secret-canary", "ResendFrom": "sender@example.com"}
+			OptionMapRWMutex.Unlock()
+			previousClient := resendEmailClient
+			var logs bytes.Buffer
+			LogWriterMu.Lock()
+			previousWriter, previousErrorWriter := gin.DefaultWriter, gin.DefaultErrorWriter
+			gin.DefaultWriter, gin.DefaultErrorWriter = &logs, &logs
+			LogWriterMu.Unlock()
+			t.Cleanup(func() {
+				OptionMapRWMutex.Lock()
+				OptionMap = previousOptions
+				OptionMapRWMutex.Unlock()
+				resendEmailClient = previousClient
+				LogWriterMu.Lock()
+				gin.DefaultWriter, gin.DefaultErrorWriter = previousWriter, previousErrorWriter
+				LogWriterMu.Unlock()
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if name == "cancelled_before_send" {
+				cancel()
+			}
+			calls := 0
+			resendEmailClient = &http.Client{Transport: emailContextTransport(func(request *http.Request) (*http.Response, error) {
+				calls++
+				assert.Equal(t, "https://api.resend.com/emails", request.URL.String())
+				_, hasDeadline := request.Context().Deadline()
+				assert.True(t, hasDeadline)
+				if name == "cancelled_during_send" {
+					cancel()
+					select {
+					case <-request.Context().Done():
+						return nil, request.Context().Err()
+					case <-time.After(time.Second):
+						t.Error("Resend request lost its caller cancellation")
+						return nil, errors.New("uncancelled request")
+					}
+				}
+				if name == "transport_failure" {
+					return nil, errors.New("delivery-secret-canary delivery-body-canary")
+				}
+				return &http.Response{StatusCode: http.StatusUnauthorized, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"name":"delivery-secret-canary","message":"delivery-body-canary"}`))}, nil
+			})}
+			err := SendEmailWithContext(ctx, "Balance reminder", "recipient@example.com", "delivery-body-canary")
+			require.Error(t, err)
+			if strings.HasPrefix(name, "cancelled_") {
+				assert.ErrorIs(t, err, context.Canceled)
+			}
+			if name == "cancelled_before_send" {
+				assert.Zero(t, calls)
+			} else {
+				assert.Equal(t, 1, calls, "never retry or fall back to another provider")
+			}
+			if name == "rejected_response" {
+				assert.Contains(t, logs.String(), "401", "keep the safe HTTP status diagnostic")
+			}
+			for _, secret := range []string{"delivery-secret-canary", "delivery-body-canary"} {
+				assert.NotContains(t, err.Error(), secret)
+				assert.NotContains(t, logs.String(), secret)
+			}
+		})
+	}
+}
+
+func TestSendEmailContextStopsBlockedSMTP(t *testing.T) {
+	for _, implicitTLS := range []bool{false, true} {
+		for _, deadline := range []bool{false, true} {
+			t.Run(fmt.Sprintf("implicit_tls=%t/deadline=%t", implicitTLS, deadline), func(t *testing.T) {
+				withSMTPSettings(t)
+				OptionMapRWMutex.Lock()
+				previousOptions := OptionMap
+				OptionMap = map[string]string{"EmailProvider": "smtp"}
+				OptionMapRWMutex.Unlock()
+				t.Cleanup(func() {
+					OptionMapRWMutex.Lock()
+					OptionMap = previousOptions
+					OptionMapRWMutex.Unlock()
+				})
+				listener, err := net.Listen("tcp", "127.0.0.1:0")
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = listener.Close() })
+				host, port, err := net.SplitHostPort(listener.Addr().String())
+				require.NoError(t, err)
+				SMTPServer = host
+				SMTPPort, err = strconv.Atoi(port)
+				require.NoError(t, err)
+				SMTPFrom, SMTPAccount, SMTPToken = "sender@example.com", "", ""
+				SMTPSSLEnabled, SMTPStartTLSEnabled = implicitTLS, false
+				ctx, cancel := context.WithCancel(context.Background())
+				if deadline {
+					cancel()
+					ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+				}
+				defer cancel()
+				result := make(chan error, 1)
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					result <- SendEmailWithContext(ctx, "Balance reminder", "recipient@example.com", "Low balance")
+				}()
+				require.NoError(t, listener.(*net.TCPListener).SetDeadline(time.Now().Add(2*time.Second)))
+				conn, err := listener.Accept()
+				require.NoError(t, err)
+				t.Cleanup(func() {
+					_ = conn.Close()
+					select {
+					case <-done:
+					case <-time.After(2 * time.Second):
+						t.Error("email send remained active after the connection closed")
+					}
+				})
+				// The peer accepts TCP but sends neither an SMTP greeting nor a TLS
+				// response. Losing the worker context must close the real connection.
+				if !deadline {
+					cancel()
+				}
+				select {
+				case err := <-result:
+					if deadline {
+						require.ErrorIs(t, err, context.DeadlineExceeded)
+					} else {
+						require.ErrorIs(t, err, context.Canceled)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("email send ignored cancellation or its deadline")
+				}
+			})
+		}
+	}
+}
+
+func TestSendEmailKeepsConfirmedAcceptanceWhenQuitFails(t *testing.T) {
+	withSMTPSettings(t)
+	OptionMapRWMutex.Lock()
+	previousOptions := OptionMap
+	OptionMap = map[string]string{"EmailProvider": "smtp"}
+	OptionMapRWMutex.Unlock()
+	var logs bytes.Buffer
+	LogWriterMu.Lock()
+	previousWriter := gin.DefaultErrorWriter
+	gin.DefaultErrorWriter = &logs
+	LogWriterMu.Unlock()
+	t.Cleanup(func() {
+		OptionMapRWMutex.Lock()
+		OptionMap = previousOptions
+		OptionMapRWMutex.Unlock()
+		LogWriterMu.Lock()
+		gin.DefaultErrorWriter = previousWriter
+		LogWriterMu.Unlock()
+	})
+	server := newFakeSMTPServerWithSTARTTLSAdvertisement(t, false, func(server *fakeSMTPServer) {
+		server.quitResponse = "550 smtp-private-canary recipient@example.com"
+	})
+	defer server.close()
+	SMTPServer, SMTPPort = server.host, server.port
+	SMTPFrom, SMTPAccount, SMTPToken = "sender@example.com", "", ""
+	SMTPSSLEnabled, SMTPStartTLSEnabled = false, false
+	err := SendEmailWithContext(context.Background(), "Balance reminder", "recipient@example.com", "Low balance")
+	assert.NoError(t, err, "the server already acknowledged DATA; QUIT must not cause a duplicate retry")
+	select {
+	case message := <-server.messages:
+		assert.Contains(t, message, "Low balance")
+	default:
+		t.Fatal("the controlled SMTP peer did not accept the message")
+	}
+	assert.NotContains(t, logs.String(), "smtp-private-canary")
+	assert.NotContains(t, logs.String(), "recipient@example.com")
 }
 
 func TestSendEmailUsesExplicitStartTLSWithInsecureCertificate(t *testing.T) {

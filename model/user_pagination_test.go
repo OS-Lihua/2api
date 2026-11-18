@@ -55,6 +55,25 @@ func TestGetAllUsersSortsBeforePagination(t *testing.T) {
 	assert.Equal(t, []int{41, 42}, collectUserIDs(pageThree))
 }
 
+func TestUserListsIgnoreRetiredQuotaSorting(t *testing.T) {
+	truncateTables(t)
+	insertUsersForPaginationTest(t, 3)
+	for index, quota := range []int{30, 10, 20} {
+		require.NoError(t, DB.Model(&User{}).Where("id = ?", index+1).Update("quota", quota).Error)
+	}
+	for _, order := range []string{"asc", "desc"} {
+		options := NewUserSortOptions("quota", order)
+		users, total, err := GetAllUsers(&common.PageInfo{Page: 1, PageSize: 2}, options)
+		require.NoError(t, err)
+		assert.EqualValues(t, 3, total)
+		assert.Equal(t, []int{3, 2}, collectUserIDs(users), order)
+		users, total, err = SearchUsers("user", "", nil, nil, 2, 2, options)
+		require.NoError(t, err)
+		assert.EqualValues(t, 3, total)
+		assert.Equal(t, []int{1}, collectUserIDs(users), order)
+	}
+}
+
 func TestSearchUsersSortsBeforePagination(t *testing.T) {
 	truncateTables(t)
 	insertUsersForPaginationTest(t, 42)

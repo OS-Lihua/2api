@@ -1582,11 +1582,6 @@ func TestApplyParamOverrideConditionByGroupContext(t *testing.T) {
 						"value": "vip",
 					},
 					map[string]any{
-						"path":  "token_group",
-						"mode":  "full",
-						"value": "premium",
-					},
-					map[string]any{
 						"path":  "using_group",
 						"mode":  "full",
 						"value": "priority-route",
@@ -1600,6 +1595,69 @@ func TestApplyParamOverrideConditionByGroupContext(t *testing.T) {
 
 	require.NoError(t, err)
 	require.JSONEq(t, `{"model":"gpt-5.2","service_tier":"priority"}`, string(out))
+}
+
+func TestApplyParamOverrideRejectsRetiredTokenGroupConditions(t *testing.T) {
+	condition := func(path string) map[string]any {
+		return map[string]any{"path": path, "mode": "full", "value": "old-a"}
+	}
+	operation := func(path string) map[string]any {
+		return map[string]any{"operations": []any{map[string]any{"path": "matched", "mode": "set", "value": true, "conditions": []any{condition(path)}}}}
+	}
+	cases := []struct {
+		name     string
+		override map[string]any
+	}{
+		{name: "array", override: operation("token_group")},
+		{name: "object", override: map[string]any{"operations": []any{map[string]any{"path": "matched", "mode": "set", "value": true, "conditions": map[string]any{"token_group": "old-a"}}}}},
+		{name: "object_trimmed", override: map[string]any{"operations": []any{map[string]any{"path": "matched", "mode": "set", "value": true, "conditions": map[string]any{" token_group ": "old-a"}}}}},
+		{name: "invert", override: map[string]any{"operations": []any{map[string]any{"path": "matched", "mode": "set", "value": true, "conditions": []any{map[string]any{"path": "token_group", "mode": "full", "value": "old-a", "invert": true}}}}}},
+		{name: "or", override: map[string]any{"operations": []any{map[string]any{"path": "matched", "mode": "set", "value": true, "logic": "OR", "conditions": []any{condition("model"), condition("token_group")}}}}},
+		{name: "missing", override: map[string]any{"operations": []any{map[string]any{"path": "matched", "mode": "set", "value": true, "conditions": []any{map[string]any{"path": "token_group", "mode": "full", "value": "old-a", "pass_missing_key": true}}}}}},
+		{name: "prune_where", override: map[string]any{"operations": []any{map[string]any{"path": "items", "mode": "prune_objects", "value": map[string]any{"where": map[string]any{"token_group": "old-a"}}}}}},
+		{name: "prune_array", override: map[string]any{"operations": []any{map[string]any{"path": "items", "mode": "prune_objects", "value": map[string]any{"conditions": []any{condition("token_group")}}}}}},
+		{name: "prune_object", override: map[string]any{"operations": []any{map[string]any{"path": "items", "mode": "prune_objects", "value": map[string]any{"conditions": map[string]any{"token_group": "old-a"}}}}}},
+		{name: "prune_outer_false", override: map[string]any{"operations": []any{map[string]any{"path": "items", "mode": "prune_objects", "conditions": []any{condition("model")}, "value": map[string]any{"where": map[string]any{"token_group": "old-a"}}}}}},
+		{name: "prune_missing_target", override: map[string]any{"operations": []any{map[string]any{"path": "missing", "mode": "prune_objects", "value": map[string]any{"where": map[string]any{"token_group": "old-a"}}}}}},
+		{name: "after_return_error", override: map[string]any{"operations": []any{map[string]any{"path": "", "mode": "return_error", "value": "stop"}, map[string]any{"path": "items", "mode": "prune_objects", "value": map[string]any{"where": map[string]any{"token_group": "old-a"}}}}}},
+		{name: "body_shadow", override: operation("token_group")},
+		{name: "escaped", override: operation(`token\\_group`)},
+		{name: "wildcard", override: operation("token_*")},
+		{name: "query", override: operation("token_?roup")},
+		{name: "pipe", override: operation("token_group|@this")},
+		{name: "projection", override: operation("[token_group]")},
+		{name: "object_projection", override: operation("{x:token_group}")},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			input := []byte(`{"token_group":"body-value","model":"gpt-4o","items":[{"token_group":"old-a"}]}`)
+			_, err := ApplyParamOverride(input, tt.override, map[string]any{"token_group": "old-a", "model": "gpt-4o"})
+			require.ErrorIs(t, err, ErrParamOverrideRetiredContext)
+		})
+	}
+}
+
+func TestApplyParamOverrideRetiredContextLiteralsAndCurrentGroups(t *testing.T) {
+	ctx := map[string]any{"token_group": "old-a", "user_group": "vip", "using_group": "route"}
+	out, err := ApplyParamOverride([]byte(`{"model":"gpt-4o"}`), map[string]any{"token_group": "business-literal"}, ctx)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"model":"gpt-4o","token_group":"business-literal"}`, string(out))
+
+	out, err = ApplyParamOverride([]byte(`{"model":"gpt-4o"}`), map[string]any{"operations": []any{map[string]any{"path": "token_group", "mode": "set", "value": "business-literal"}}}, ctx)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"model":"gpt-4o","token_group":"business-literal"}`, string(out))
+
+	out, err = ApplyParamOverride([]byte(`{"metadata":{"token_group":"business-literal"}}`), map[string]any{"operations": []any{map[string]any{"path": "matched", "mode": "set", "value": true, "conditions": []any{map[string]any{"path": "metadata.token_group", "mode": "full", "value": "business-literal"}}}}}, ctx)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), `"matched":true`)
+
+	out, err = ApplyParamOverride([]byte(`{"items":[{"type":"token_group"}]}`), map[string]any{"operations": []any{map[string]any{"path": "items", "mode": "prune_objects", "value": "token_group"}}}, ctx)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"items":[]}`, string(out))
+
+	out, err = ApplyParamOverride([]byte(`{"model":"gpt-4o"}`), map[string]any{"operations": []any{map[string]any{"path": "matched", "mode": "set", "value": true, "logic": "AND", "conditions": []any{map[string]any{"path": "user_group", "mode": "full", "value": "vip"}, map[string]any{"path": "using_group", "mode": "full", "value": "route"}}}}}, ctx)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), `"matched":true`)
 }
 
 func TestApplyParamOverrideConditionFromRequestHeaders(t *testing.T) {

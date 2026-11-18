@@ -300,7 +300,16 @@ export function loadConfig(): Partial<PlaygroundConfig> {
     const saved = readStoredValue(STORAGE_KEYS.CONFIG)
     if (!saved) return {}
 
-    return playgroundConfigSchema.parse(unwrapStoredValue(saved))
+    const storedConfig = unwrapStoredValue(saved)
+    const config = playgroundConfigSchema.parse(storedConfig)
+    if (
+      storedConfig &&
+      typeof storedConfig === 'object' &&
+      'group' in storedConfig
+    ) {
+      saveConfig(config)
+    }
+    return config
   } catch (error) {
     // eslint-disable-next-line no-console
     console.error('Failed to load config:', error)

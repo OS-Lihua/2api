@@ -6,7 +6,6 @@ import (
 	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/middleware"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
-	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 )
 
@@ -29,29 +28,22 @@ func taskPluginProtocolHandlers(protocol, operation string) ([]gin.HandlerFunc, 
 	case "openai_responses.create":
 		return []gin.HandlerFunc{
 			middleware.RouteTag("relay"), middleware.SystemPerformanceCheck(), middleware.GatewayTokenAuth(), middleware.ResolveTextOffering(), controller.AuthorizeTaskGateway,
-			middleware.ModelRequestRateLimit(), middleware.RouteTaskPluginEndpoint(), middleware.PrepareTaskPluginEndpoint(), controller.TaskGateway, controller.TextGateway, middleware.Distribute(),
-			func(c *gin.Context) {
-				controller.RelayTaskPluginEndpoint(c, func(c *gin.Context) { controller.Relay(c, types.RelayFormatOpenAIResponses) })
-			},
+			middleware.ModelRequestRateLimit(), middleware.RouteTaskPluginEndpoint(), middleware.PrepareTaskPluginEndpoint(), controller.TaskGateway, controller.TextGateway, controller.RelayNotImplemented,
 		}, nil
 	case "openai_image.generate", "openai_image.edit":
 		return []gin.HandlerFunc{
 			middleware.RouteTag("relay"), middleware.SystemPerformanceCheck(), middleware.GatewayTokenAuth(), middleware.ResolveTextOffering(), controller.AuthorizeTaskGateway,
-			middleware.ModelRequestRateLimit(), middleware.RouteTaskPluginEndpoint(), controller.MediaGateway, middleware.PrepareTaskPluginEndpoint(), controller.TaskGateway, middleware.Distribute(),
-			func(c *gin.Context) {
-				controller.RelayTaskPluginEndpoint(c, func(c *gin.Context) { controller.Relay(c, types.RelayFormatOpenAIImage) })
-			},
+			middleware.ModelRequestRateLimit(), middleware.RouteTaskPluginEndpoint(), controller.MediaGateway, middleware.PrepareTaskPluginEndpoint(), controller.TaskGateway, controller.RelayNotImplemented,
 		}, nil
 	case "openai_video.create":
 		return []gin.HandlerFunc{
-			middleware.RouteTag("relay"), middleware.TaskOriginAuth(), middleware.ResolveTaskOffering(), controller.AuthorizeTaskGateway, middleware.LegacyTaskSubmissionAuth(), middleware.SystemPerformanceCheck(),
-			middleware.RouteTaskPluginEndpoint(), middleware.TaskPluginEndpointOnly(middleware.ModelRequestRateLimit()), middleware.PrepareTaskPluginEndpoint(), controller.TaskGateway, middleware.Distribute(),
-			func(c *gin.Context) { controller.RelayTaskPluginEndpoint(c, controller.RelayTask) },
+			middleware.RouteTag("relay"), middleware.TaskOriginAuth(), middleware.ResolveTaskOffering(), controller.AuthorizeTaskGateway, middleware.SystemPerformanceCheck(),
+			middleware.RouteTaskPluginEndpoint(), middleware.ModelRequestRateLimit(), middleware.PrepareTaskPluginEndpoint(), controller.TaskGateway, controller.RelayNotImplemented,
 		}, nil
 	case "openai_responses.retrieve":
 		return []gin.HandlerFunc{middleware.RouteTag("relay"), middleware.TaskReadAuth(), controller.RetrieveTaskPluginResponse}, nil
 	case "openai_video.retrieve":
-		return []gin.HandlerFunc{middleware.RouteTag("relay"), middleware.TaskReadAuth(), defaultPluginDispatcher.handOffNativeTaskQuery, middleware.Distribute(), controller.RelayTaskFetch}, nil
+		return []gin.HandlerFunc{middleware.RouteTag("relay"), middleware.TaskReadAuth(), defaultPluginDispatcher.handOffNativeTaskQuery, controller.RelayTaskFetch}, nil
 	case "openai_video.content":
 		return []gin.HandlerFunc{middleware.RouteTag("relay"), middleware.TaskReadAuth(), controller.VideoProxy}, nil
 	default:

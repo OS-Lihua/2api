@@ -2,7 +2,6 @@ package controller
 
 import (
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -43,11 +42,9 @@ func listModelsMeta(c *gin.Context, keyword, vendor string) {
 		// enriched candidate set before counting and paginating the results.
 		offset, limit = 0, -1
 	}
-	search := model.SearchModels
-	if c.Query("include_channel_models") == "true" {
-		search = model.SearchModelsWithProviders
-	}
-	modelsMeta, total, err := search(keyword, vendor, c.Query("status"), c.Query("sync_official"), offset, limit)
+	// include_channel_models remains accepted for compatibility. Every new
+	// Channel already references a real Model; never synthesize name-only rows.
+	modelsMeta, total, err := model.SearchModels(keyword, vendor, c.Query("status"), c.Query("sync_official"), offset, limit)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -134,7 +131,6 @@ func CreateModelMeta(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	model.RefreshPricing()
 	m.HasMetadata = m.Id > 0
 	common.ApiSuccess(c, &m)
 }
@@ -193,7 +189,6 @@ func UpdateModelMeta(c *gin.Context) {
 		return
 	}
 	m.Capabilities = stored.Capabilities
-	model.RefreshPricing()
 	m.HasMetadata = m.Id > 0
 	common.ApiSuccess(c, &m)
 }
@@ -216,11 +211,15 @@ func DeleteModelMeta(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	if removePricing && c.GetInt("role") != common.RoleRootUser {
-		c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "Model pricing is managed by a super administrator."})
+	if removePricing {
+		RetiredModelPricing(c)
 		return
 	}
-	result, err := model.DeleteModelMetadata([]int{id}, removeFromChannels, removePricing)
+	if removeFromChannels {
+		retiredModelChannelRemoval(c, "model.delete", []int{id})
+		return
+	}
+	result, err := model.DeleteModelMetadata([]int{id})
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -239,11 +238,15 @@ func BatchDeleteModelMeta(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	if request.RemovePricing && c.GetInt("role") != common.RoleRootUser {
-		c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "Model pricing is managed by a super administrator."})
+	if request.RemovePricing {
+		RetiredModelPricing(c)
 		return
 	}
-	result, err := model.DeleteModelMetadata(request.ModelIDs, request.RemoveFromChannels, request.RemovePricing)
+	if request.RemoveFromChannels {
+		retiredModelChannelRemoval(c, "model.delete_batch", request.ModelIDs)
+		return
+	}
+	result, err := model.DeleteModelMetadata(request.ModelIDs)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -252,96 +255,21 @@ func BatchDeleteModelMeta(c *gin.Context) {
 	common.ApiSuccess(c, result)
 }
 
-// enrichModels keeps configured endpoints intact and derives connections from
-// enabled routes, including hidden or unpriced models absent from the catalog.
+func retiredModelChannelRemoval(c *gin.Context, action string, ids []int) {
+	recordFailedManageAudit(c, action, map[string]any{"model_ids": ids, "remove_from_channels": true}, http.StatusGone)
+	common.ApiErrorStatus(c, http.StatusGone,
+		common.NewMessage("Legacy model-channel removal has been retired. Manage Channels by Model ID instead."),
+		gin.H{"code": "legacy_model_connections_retired"})
+}
+
+// enrichModels reports stable-ID administrative facts only. Native declarations
+// remain independent of connection status, prices, and Offering authorization.
 func enrichModels(models []*model.Model) error {
 	if len(models) == 0 {
 		return nil
 	}
-	configured, err := model.GetConfiguredModelProviders()
-	if err != nil {
+	if err := model.FillModelChannelSummary(models); err != nil {
 		return err
 	}
-	for _, metadata := range models {
-		if metadata == nil {
-			continue
-		}
-		metadata.HasMetadata = metadata.Id > 0
-		channelIDs := make(map[int]struct{})
-		for name, ids := range configured {
-			if metadata.MatchesName(name) {
-				for _, id := range ids {
-					channelIDs[id] = struct{}{}
-				}
-			}
-		}
-		metadata.ConfiguredChannelCount = len(channelIDs)
-	}
-	connections, err := model.GetModelConnections()
-	if err != nil {
-		return err
-	}
-	if err := model.FillModelSquareStates(models, configured, connections); err != nil {
-		return err
-	}
-	for _, metadata := range models {
-		if metadata == nil {
-			continue
-		}
-		channels := make(map[int]model.BoundProvider)
-		groups := make(map[string]bool)
-		names := make(map[string]bool)
-		endpoints := make(map[string]bool)
-		quotas := make(map[int]bool)
-		for _, connection := range connections {
-			name := connection.Model
-			if !metadata.MatchesName(name) {
-				continue
-			}
-			names[name] = true
-			groups[connection.Group] = true
-			channels[connection.ChannelId] = model.BoundProvider{Name: connection.ChannelName, Type: connection.ChannelType}
-			for _, endpoint := range model.GetModelSupportEndpointTypes(name) {
-				endpoints[string(endpoint)] = true
-			}
-			for _, quota := range model.GetModelQuotaTypes(name) {
-				quotas[quota] = true
-			}
-		}
-		metadata.BoundChannels = nil
-		metadata.EnableGroups = nil
-		metadata.SupportedEndpoints = nil
-		metadata.QuotaTypes = nil
-		metadata.MatchedModels = nil
-		for _, channel := range channels {
-			metadata.BoundChannels = append(metadata.BoundChannels, channel)
-		}
-		sort.Slice(metadata.BoundChannels, func(i, j int) bool {
-			a, b := metadata.BoundChannels[i], metadata.BoundChannels[j]
-			if a.Name == b.Name {
-				return a.Type < b.Type
-			}
-			return a.Name < b.Name
-		})
-		for group := range groups {
-			metadata.EnableGroups = append(metadata.EnableGroups, group)
-		}
-		for endpoint := range endpoints {
-			metadata.SupportedEndpoints = append(metadata.SupportedEndpoints, endpoint)
-		}
-		for quota := range quotas {
-			metadata.QuotaTypes = append(metadata.QuotaTypes, quota)
-		}
-		sort.Strings(metadata.EnableGroups)
-		sort.Strings(metadata.SupportedEndpoints)
-		sort.Ints(metadata.QuotaTypes)
-		if metadata.NameRule != model.NameRuleExact {
-			for name := range names {
-				metadata.MatchedModels = append(metadata.MatchedModels, name)
-			}
-			sort.Strings(metadata.MatchedModels)
-			metadata.MatchedCount = len(names)
-		}
-	}
-	return nil
+	return model.FillModelSupportedEndpoints(models)
 }

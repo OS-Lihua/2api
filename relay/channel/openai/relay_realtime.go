@@ -298,13 +298,13 @@ func recordRealtimeResponse(c *gin.Context, info *relaycommon.RelayInfo, result 
 	}
 	usage := &dto.RealtimeUsage{InputTokens: result.Usage.PromptTokens, OutputTokens: result.Usage.CompletionTokens, TotalTokens: result.Usage.TotalTokens,
 		InputTokenDetails: result.Usage.PromptTokensDetails, OutputTokenDetails: result.Usage.CompletionTokenDetails}
-	if err := preConsumeUsage(c, info, usage, total); err != nil {
+	if err := accumulateRealtimeUsage(usage, total); err != nil {
 		return types.NewError(fmt.Errorf("Realtime accounting failed: %w", err), types.ErrorCodeBadResponse)
 	}
 	return nil
 }
 
-func preConsumeUsage(ctx *gin.Context, info *relaycommon.RelayInfo, usage *dto.RealtimeUsage, totalUsage *dto.RealtimeUsage) error {
+func accumulateRealtimeUsage(usage *dto.RealtimeUsage, totalUsage *dto.RealtimeUsage) error {
 	if usage == nil || totalUsage == nil {
 		return errors.New("invalid usage pointer")
 	}
@@ -320,8 +320,5 @@ func preConsumeUsage(ctx *gin.Context, info *relaycommon.RelayInfo, usage *dto.R
 	totalUsage.OutputTokenDetails.AudioTokens += usage.OutputTokenDetails.AudioTokens
 	totalUsage.OutputTokenDetails.ImageTokens += usage.OutputTokenDetails.ImageTokens
 	totalUsage.OutputTokenDetails.ReasoningTokens += usage.OutputTokenDetails.ReasoningTokens
-	if info.RealtimeResponseHandler != nil || info.ResponseFacts != nil {
-		return nil
-	}
-	return service.PreWssConsumeQuota(ctx, info, totalUsage)
+	return nil
 }

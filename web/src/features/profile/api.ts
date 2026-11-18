@@ -19,7 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { api } from '@/lib/api'
 import type { CustomOAuthBinding } from '@/lib/oauth'
 import { authRequestOptions, authResult } from '@/lib/secure-verification'
-import type { LoginSession } from '@/stores/auth-store'
+import { useAuthStore, type LoginSession } from '@/stores/auth-store'
 
 import { normalizeUserSettings } from './lib/user-settings'
 import type {
@@ -40,8 +40,12 @@ import type {
 /**
  * Get current user profile
  */
-export async function getUserProfile(): Promise<ApiResponse<UserProfile>> {
-  const res = await api.get('/api/user/self')
+export async function getUserProfile(
+  signal?: AbortSignal
+): Promise<ApiResponse<UserProfile>> {
+  const res = await (signal
+    ? api.get('/api/user/self', { signal })
+    : api.get('/api/user/self'))
   return res.data
 }
 
@@ -77,14 +81,33 @@ export function changeAccountPassword(
  * Update user settings
  */
 export async function updateUserSettings(
-  data: UpdateUserSettingsRequest
+  data: UpdateUserSettingsRequest,
+  signal?: AbortSignal
 ): Promise<ApiResponse> {
-  const profile = await getUserProfile()
+  const { user, session } = useAuthStore.getState().auth
+  const isCurrent = () => {
+    const current = useAuthStore.getState().auth
+    return (
+      !signal?.aborted &&
+      current.user?.id === user?.id &&
+      current.session?.sid === session?.sid
+    )
+  }
+  if (!isCurrent()) throw new DOMException('Aborted', 'AbortError')
+  const profile = await getUserProfile(signal)
+  if (!isCurrent()) throw new DOMException('Aborted', 'AbortError')
   if (!profile.success || !profile.data) {
     return { success: false, message: profile.message }
   }
+  if (user && profile.data.id !== user.id) {
+    throw new DOMException('Aborted', 'AbortError')
+  }
   const settings = normalizeUserSettings(profile.data.setting)
-  const res = await api.put('/api/user/setting', { ...settings, ...data })
+  const body = { ...settings, ...data }
+  const res = await (signal
+    ? api.put('/api/user/setting', body, { signal })
+    : api.put('/api/user/setting', body))
+  if (!isCurrent()) throw new DOMException('Aborted', 'AbortError')
   return res.data
 }
 
@@ -287,9 +310,10 @@ export function unbindCustomOAuth(
  * Get checkin status for a specific month
  */
 export async function getCheckinStatus(
-  month: string
+  month: string,
+  signal?: AbortSignal
 ): Promise<ApiResponse<CheckinStatusResponse>> {
-  const res = await api.get(`/api/user/checkin?month=${month}`)
+  const res = await api.get(`/api/user/checkin?month=${month}`, { signal })
   return res.data
 }
 

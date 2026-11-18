@@ -18,70 +18,82 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useTranslation } from 'react-i18next'
 
+import { FundingStatus } from '@/components/funding-status'
+import { LoadingState } from '@/components/loading-state'
 import { QuotaDetailsPopover } from '@/components/quota-details-popover'
-import { StatusBadge } from '@/components/status-badge'
-import { formatQuotaWithCurrency, getCurrencyDisplay } from '@/lib/currency'
-import { cn } from '@/lib/utils'
-import { useSystemConfigStore } from '@/stores/system-config-store'
+import { toIntlLocale } from '@/i18n/languages'
+import { formatMoneyAmount } from '@/lib/currency'
+import type { WalletSummary } from '@/lib/wallet-summary'
 
-type UserQuotaCellProps = {
-  remaining: number
-  used: number
-}
-
-export function UserQuotaCell(props: UserQuotaCellProps) {
-  const { t } = useTranslation()
-  useSystemConfigStore((state) => state.config.currency)
-
-  const { meta: currency } = getCurrencyDisplay()
-  const quotaUnit = currency.kind === 'tokens' ? t('Tokens') : currency.symbol
-  const hasQuota = props.remaining !== 0 || props.used !== 0
-  const formattedRemaining = formatQuotaWithCurrency(props.remaining, {
-    showSymbol: false,
-  })
-  const formattedUsed = formatQuotaWithCurrency(props.used, {
-    showSymbol: false,
-  })
-
+export function UserWalletCell(props: {
+  wallet?: WalletSummary
+  loading?: boolean
+}) {
+  const { t, i18n } = useTranslation()
+  if (props.loading) {
+    return <LoadingState inline size='sm' message={t('Loading...')} />
+  }
+  if (!props.wallet) {
+    return (
+      <span className='text-muted-foreground'>{t('Wallet unavailable')}</span>
+    )
+  }
+  const wallet = props.wallet
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
+  const available = formatMoneyAmount(wallet.available, locale)
+  const consumed = formatMoneyAmount(wallet.consumed, locale)
+  const details = [
+    { label: t('Available Balance'), value: available },
+    {
+      label: t('Outstanding'),
+      value: formatMoneyAmount(wallet.outstanding, locale),
+    },
+    { label: t('Posted consumption'), value: consumed },
+  ]
+  if (wallet.sale_pending) {
+    details.push({ label: t('Sales awaiting accounting'), value: t('Yes') })
+  }
+  if (wallet.funding_pending === true) {
+    details.push({ label: t('Funding allocation pending'), value: t('Yes') })
+  }
+  if (wallet.requests_paused) {
+    details.push({ label: t('Requests paused'), value: t('Yes') })
+  }
   return (
     <QuotaDetailsPopover
-      title={`${t('Quota')} (${quotaUnit})`}
-      triggerLabel={
-        hasQuota
-          ? `${t('Available Balance')} ${formattedRemaining}; ${t('Used amount')} ${formattedUsed}`
-          : t('No Quota')
-      }
-      details={[
-        { label: t('Available Balance'), value: formattedRemaining },
-        { label: t('Total Used'), value: formattedUsed },
-      ]}
+      title={t('Wallet')}
+      triggerLabel={`${t('Available Balance')} ${available}; ${t('Posted consumption')} ${consumed}`}
+      details={details}
+      triggerClassName='whitespace-normal'
+      description={[
+        t(
+          'Posted ledger consumption includes signed corrections. It excludes unsettled sales and legacy quota records. Debt repayments are not counted again.'
+        ),
+        wallet.funding_pending === true
+          ? t(
+              'Revenue is recorded, but funding allocation is incomplete. Zero outstanding debt does not mean fully paid.'
+            )
+          : '',
+      ]
+        .filter(Boolean)
+        .join(' ')}
     >
-      {hasQuota ? (
-        <span className='grid min-w-0 grid-cols-1 gap-y-1 text-sm tabular-nums'>
-          <span
-            className={cn(
-              props.remaining < 0 && 'text-destructive',
-              props.remaining === 0 && 'text-muted-foreground'
-            )}
-          >
-            {formattedRemaining}
-          </span>
-          <span
-            data-table-text='secondary'
-            className='text-muted-foreground flex items-baseline gap-1 text-xs font-normal'
-          >
-            <span>{t('Used amount')}</span>
-            <span>{formattedUsed}</span>
-          </span>
+      <span className='grid min-w-0 grid-cols-1 gap-y-1 text-sm tabular-nums'>
+        <span className='wrap-anywhere'>{available}</span>
+        <span
+          data-table-text='secondary'
+          className='text-muted-foreground flex min-w-0 flex-col gap-1 text-xs font-normal'
+        >
+          <span>{t('Posted consumption')}</span>
+          <span className='wrap-anywhere'>{consumed}</span>
         </span>
-      ) : (
-        <StatusBadge
-          label={t('No Quota')}
-          variant='neutral'
-          copyable={false}
-          className='-ml-1.5 font-normal'
-        />
-      )}
+        <FundingStatus pending={wallet.funding_pending} compact />
+        {wallet.sale_pending && (
+          <span className='text-muted-foreground text-xs'>
+            {t('Sales awaiting accounting')}
+          </span>
+        )}
+      </span>
     </QuotaDetailsPopover>
   )
 }

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,9 +16,334 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/pkg/protocol"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
+
+func TestDashboardFinanceAuthorizationAndEmptyHTTP(t *testing.T) {
+	engine, admin, token := newAdminTestServer(t)
+	require.NoError(t, model.MigrateGatewayBilling(model.DB))
+	require.NoError(t, model.DB.AutoMigrate(&model.Token{}, &model.ModelOffering{}, &model.Channel{}))
+	query := "?from=2025-01-01T00:00:00Z&until=2025-01-02T00:00:00Z"
+	path := "/api/admin/v1/reports/dashboard-finance" + query
+	response := adminSecurityRequest(engine, token, http.MethodGet, path, "")
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+	var reply struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Coverage  string `json:"coverage"`
+			TimeBasis string `json:"time_basis"`
+			Items     []any  `json:"items"`
+			Totals    struct {
+				Revenue struct {
+					KnownAmount  model.MoneyTotal  `json:"known_amount"`
+					TotalAmount  *model.MoneyTotal `json:"total_amount"`
+					PendingCount string            `json:"pending_count"`
+				} `json:"revenue"`
+			} `json:"totals"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &reply))
+	require.True(t, reply.Success)
+	assert.Equal(t, "primary_gateway_only", reply.Data.Coverage)
+	assert.Equal(t, "request_started_at", reply.Data.TimeBasis)
+	assert.NotNil(t, reply.Data.Items)
+	assert.Equal(t, model.MoneyTotal{Nanos: "0", Currency: "USD"}, reply.Data.Totals.Revenue.KnownAmount)
+	require.NotNil(t, reply.Data.Totals.Revenue.TotalAmount)
+	assert.Equal(t, reply.Data.Totals.Revenue.KnownAmount, *reply.Data.Totals.Revenue.TotalAmount)
+	assert.Equal(t, "0", reply.Data.Totals.Revenue.PendingCount)
+	for _, scope := range []string{"user:read", "profile:read", "usage:read", "log:read", "wallet:read"} {
+		limited := createWalletTestAccessToken(t, admin.Id, scope)
+		assert.Equal(t, http.StatusForbidden, adminSecurityRequest(engine, limited, http.MethodGet, path, "").Code, scope)
+	}
+	assert.Equal(t, http.StatusUnauthorized, adminSecurityRequest(engine, "", http.MethodGet, path, "").Code)
+	expired := createWalletTestAccessToken(t, admin.Id, "ledger:read")
+	require.NoError(t, model.DB.Model(&model.UserAccessToken{}).Where("token_hash = ?", model.AccessTokenFingerprint(expired)).Update("expires_at", time.Now().Unix()-1).Error)
+	assert.Equal(t, http.StatusUnauthorized, adminSecurityRequest(engine, expired, http.MethodGet, path, "").Code)
+	self := createWalletTestAccessToken(t, admin.Id, "wallet:read")
+	selfPath := "/api/user/self/dashboard-finance" + query
+	assert.Equal(t, http.StatusOK, adminSecurityRequest(engine, self, http.MethodGet, selfPath, "").Code)
+	for _, scope := range []string{"user:read", "profile:read", "usage:read", "log:read"} {
+		limited := createWalletTestAccessToken(t, admin.Id, scope)
+		assert.Equal(t, http.StatusForbidden, adminSecurityRequest(engine, limited, http.MethodGet, selfPath, "").Code, scope)
+	}
+	for _, suffix := range []string{"&user_id=2", "&group_by=user", "&group_by=channel", "&group_by=provider", "&group_by=group", "&group_by=node"} {
+		assert.Equal(t, http.StatusBadRequest, adminSecurityRequest(engine, self, http.MethodGet, selfPath+suffix, "").Code, suffix)
+	}
+	for _, invalid := range []string{"", "?from=2025-01-01&until=2025-01-02", query + "&from=2024-01-01T00:00:00Z", query + "&timezone=Local", query + "&bucket=month", query + "&group_by=group", query + "&group_by=node", query + "&group_by=token,token"} {
+		assert.Equal(t, http.StatusBadRequest, adminSecurityRequest(engine, token, http.MethodGet, "/api/admin/v1/reports/dashboard-finance"+invalid, "").Code, invalid)
+	}
+}
+
+func readDashboardFinanceTest(t *testing.T, engine *gin.Engine, token, path string) model.DashboardFinanceReport {
+	t.Helper()
+	response := adminSecurityRequest(engine, token, http.MethodGet, path, "")
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+	var reply struct {
+		Success bool                         `json:"success"`
+		Data    model.DashboardFinanceReport `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &reply))
+	require.True(t, reply.Success)
+	return reply.Data
+}
+
+func TestDashboardFinanceLedgerCohortAndIsolationHTTP(t *testing.T) {
+	engine, actor, token := newAdminTestServer(t)
+	t.Setenv("GATEWAY_SETTLEMENT_JOURNAL_DIR", t.TempDir())
+	require.NoError(t, model.MigrateGatewayBilling(model.DB))
+	require.NoError(t, model.DB.AutoMigrate(&model.Token{}, &model.ModelOffering{}, &model.Channel{}))
+	zero := money.Amount{Currency: "USD"}
+	request := model.GatewayRequest{ID: "dashboard-accounting", UserID: actor.Id, TokenID: 91, ModelOfferingID: 17, SaleCurrency: "USD", SaleFXRate: "1", StartedAt: 1735776000000, Status: "success", Receivable: money.Amount{Nanos: 1000000000, Currency: "USD"}, UsageSource: "upstream", Usage: model.GatewayUsage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15}}
+	require.NoError(t, model.ReserveGateway(&request, zero, zero))
+	attempts := []model.GatewayAttempt{
+		{ID: "dashboard-first", RequestID: request.ID, ChannelID: 31, ProviderID: 41, Cost: money.Amount{Nanos: 100000000, Currency: "EUR"}, AccountingFXRate: "2", ConvertedCost: money.Amount{Nanos: 200000000, Currency: "USD"}},
+		{ID: "dashboard-last", RequestID: request.ID, ChannelID: 32, ProviderID: 42, Cost: money.Amount{Nanos: 300000000, Currency: "EUR"}, AccountingFXRate: "2", ConvertedCost: money.Amount{Nanos: 600000000, Currency: "USD"}},
+	}
+	require.NoError(t, model.PrepareGatewaySettlement(model.GatewaySettlement{Request: request, Attempts: attempts, SaleSource: request.Receivable}))
+	_, err := model.SettleGateway(request.ID)
+	require.NoError(t, err)
+	query := "?from=2025-01-02T00:00:00Z&until=2025-01-03T00:00:00Z&group_by=channel,provider,model_offering"
+	path := "/api/admin/v1/reports/dashboard-finance" + query
+	report := readDashboardFinanceTest(t, engine, token, path)
+	assert.Equal(t, "1", report.Totals.RequestCount)
+	assert.Equal(t, "1000000000", report.Totals.Revenue.KnownAmount.Nanos)
+	require.NotNil(t, report.Totals.Revenue.TotalAmount, "known debt does not make revenue unknown")
+	assert.Equal(t, "0", report.Totals.Collected.KnownAmount.Nanos)
+	assert.Equal(t, "1000000000", report.Totals.Outstanding.KnownAmount.Nanos)
+	assert.Equal(t, "800000000", report.Totals.Procurement.Cost.KnownAmount.Nanos)
+	assert.Equal(t, "200000000", report.Totals.Margin.KnownAmount.Nanos)
+	require.Len(t, report.Items, 2)
+	assert.Equal(t, "0", report.Items[0].RequestCount)
+	assert.Equal(t, "0", report.Items[0].Revenue.KnownAmount.Nanos)
+	assert.Equal(t, "200000000", report.Items[0].Procurement.Cost.KnownAmount.Nanos)
+	assert.Equal(t, "1", report.Items[1].RequestCount)
+	assert.Equal(t, "15", report.Items[1].Usage["total_tokens"].KnownTotal)
+	assert.Empty(t, report.Items[0].Names, "absent metadata must not delete historical rows")
+
+	// Outbox delivery and at-least-once duplicate publication cannot change any report fact.
+	require.NoError(t, model.MigrateGatewayRecords())
+	for range 2 {
+		require.NoError(t, model.PublishGatewayRecords(request.ID))
+	}
+	assert.Equal(t, report, readDashboardFinanceTest(t, engine, token, path))
+	_, err = model.TopUpWallet(model.WalletTopUp{UserId: actor.Id, Source: money.Amount{Nanos: 400000000, Currency: "USD"}, Reference: "dashboard-repayment"})
+	require.NoError(t, err)
+	paid := readDashboardFinanceTest(t, engine, token, path)
+	assert.Equal(t, "1000000000", paid.Totals.Revenue.KnownAmount.Nanos)
+	assert.Equal(t, "400000000", paid.Totals.Collected.KnownAmount.Nanos)
+	assert.Equal(t, "600000000", paid.Totals.Outstanding.KnownAmount.Nanos)
+	entries, err := model.PostLedgerEntries(model.LedgerPosting{Account: model.PlatformRevenueAccount("USD"), Type: model.LedgerEntryAdjustment, Amount: money.Amount{Nanos: -900000000, Currency: "USD"}, RequestId: request.ID, OperatorId: actor.Id})
+	require.NoError(t, err)
+	adjusted := readDashboardFinanceTest(t, engine, token, path)
+	assert.Equal(t, "100000000", adjusted.Totals.Revenue.KnownAmount.Nanos)
+	assert.Equal(t, "-700000000", adjusted.Totals.Margin.KnownAmount.Nanos)
+	_, err = model.ReverseLedgerEntry(entries[0].Id, actor.Id, "dashboard correction")
+	require.NoError(t, err)
+	assert.Equal(t, paid, readDashboardFinanceTest(t, engine, token, path), "reversal returns to original request-start cohort")
+	_, err = model.PostLedgerEntries(model.LedgerPosting{Account: model.PlatformRevenueAccount("USD"), Type: model.LedgerEntryAdjustment, Amount: money.Amount{Nanos: 12, Currency: "USD"}, OperatorId: actor.Id})
+	require.NoError(t, err)
+	assert.Equal(t, paid, readDashboardFinanceTest(t, engine, token, path), "unattributed platform adjustment is explicitly excluded")
+	firstOnly := readDashboardFinanceTest(t, engine, token, path+"&channel_id=31")
+	assert.Equal(t, "0", firstOnly.Totals.RequestCount)
+	assert.Equal(t, "200000000", firstOnly.Totals.Procurement.Cost.KnownAmount.Nanos)
+
+	other := model.User{Username: "dashboard-other", Password: "unused", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "dash-other"}
+	require.NoError(t, model.DB.Create(&other).Error)
+	otherRequest := model.GatewayRequest{ID: "dashboard-other", UserID: other.Id, TokenID: 92, ModelOfferingID: 17, SaleCurrency: "USD", SaleFXRate: "1", StartedAt: request.StartedAt, Status: "success", Receivable: zero}
+	require.NoError(t, model.ReserveGateway(&otherRequest, zero, zero))
+	require.NoError(t, model.PrepareGatewaySettlement(model.GatewaySettlement{Request: otherRequest, SaleSource: zero}))
+	_, err = model.SettleGateway(otherRequest.ID)
+	require.NoError(t, err)
+	selfToken := createWalletTestAccessToken(t, other.Id, "wallet:read")
+	selfPath := "/api/user/self/dashboard-finance?from=2025-01-02T00:00:00Z&until=2025-01-03T00:00:00Z&group_by=token,model_offering"
+	self := readDashboardFinanceTest(t, engine, selfToken, selfPath)
+	assert.Equal(t, "1", self.Totals.RequestCount)
+	assert.Equal(t, "0", self.Totals.Revenue.KnownAmount.Nanos)
+	assert.Nil(t, self.Totals.Procurement)
+	assert.Nil(t, self.Totals.Margin)
+	require.Len(t, self.Items, 1)
+	assert.Equal(t, 92, self.Items[0].Dimensions["token"])
+	foreignToken := readDashboardFinanceTest(t, engine, selfToken, selfPath+"&token_id=91")
+	assert.Equal(t, "0", foreignToken.Totals.RequestCount)
+	assert.Empty(t, foreignToken.Items)
+	scopedAdmin := createWalletTestAccessToken(t, other.Id, "ledger:read")
+	assert.Equal(t, http.StatusForbidden, adminSecurityRequest(engine, scopedAdmin, http.MethodGet, path, "").Code)
+	_, err = model.PostLedgerEntries(model.LedgerPosting{Account: model.PlatformRevenueAccount("EUR"), Type: model.LedgerEntryAdjustment, Amount: money.Amount{Nanos: 1, Currency: "EUR"}, RequestId: request.ID, OperatorId: actor.Id})
+	require.NoError(t, err)
+	mixed := adminSecurityRequest(engine, token, http.MethodGet, path, "")
+	assert.Equal(t, http.StatusInternalServerError, mixed.Code, "mixed settlement currencies must never be added")
+	assert.NotContains(t, mixed.Body.String(), request.ID)
+}
+
+func TestDashboardFinancePendingAndUsageHTTP(t *testing.T) {
+	for _, tc := range []struct {
+		name                                   string
+		sale, purchase, fx, inFlight, unposted bool
+		original, converted                    int64
+	}{
+		{name: "known zero"}, {name: "sale unknown", sale: true, original: 1, converted: 1}, {name: "purchase unknown", purchase: true}, {name: "FX unknown", fx: true, original: 7}, {name: "in flight", inFlight: true}, {name: "intent before posting", unposted: true, original: 1, converted: 1}, {name: "frozen independent rounding", original: 1, converted: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine, actor, token := newAdminTestServer(t)
+			t.Setenv("GATEWAY_SETTLEMENT_JOURNAL_DIR", t.TempDir())
+			require.NoError(t, model.MigrateGatewayBilling(model.DB))
+			zero := money.Amount{Currency: "USD"}
+			request := model.GatewayRequest{ID: "dashboard-pending", UserID: actor.Id, ModelOfferingID: 17, SaleCurrency: "USD", SaleFXRate: "1", StartedAt: 1735776000000, Status: "failed", Receivable: zero, UsageSource: "none"}
+			require.NoError(t, model.ReserveGateway(&request, zero, zero))
+			if !tc.inFlight {
+				request.Status = "success"
+				request.Receivable.Nanos = 100
+				request.UsageSource = "estimated"
+				request.Usage = model.GatewayUsage{PromptTokens: 10, CompletionTokens: 0, TotalTokens: 10, UnmeasuredTokens: []string{"c", "img_o"}}
+				request.SalePending = tc.sale
+				if tc.sale {
+					request.Receivable.Nanos = 0
+				}
+				attempt := model.GatewayAttempt{ID: "dashboard-pending-attempt", RequestID: request.ID, ChannelID: 31, ProviderID: 41, Cost: money.Amount{Nanos: tc.original, Currency: "EUR"}, ConvertedCost: money.Amount{Nanos: tc.converted, Currency: "USD"}, AccountingFXRate: "2", CostPending: tc.purchase, ConvertedCostPending: tc.fx}
+				intent := model.GatewaySettlement{Request: request, Attempt: &attempt, SaleSource: request.Receivable, SaleEvaluationFailed: tc.sale, EvaluationFailed: tc.sale || tc.purchase || tc.fx}
+				if tc.purchase {
+					second := attempt
+					second.ID += "-second"
+					intent.Attempt, intent.Attempts = nil, []model.GatewayAttempt{attempt, second}
+				}
+				require.NoError(t, model.PrepareGatewaySettlement(intent))
+				if !tc.unposted {
+					_, err := model.SettleGateway(request.ID)
+					if tc.sale || tc.purchase || tc.fx {
+						require.ErrorIs(t, err, model.ErrGatewayEvaluationPending)
+					} else {
+						require.NoError(t, err)
+					}
+				}
+			}
+			report := readDashboardFinanceTest(t, engine, token, "/api/admin/v1/reports/dashboard-finance?from=2025-01-02T00:00:00Z&until=2025-01-03T00:00:00Z")
+			assert.Equal(t, "1", report.Totals.RequestCount)
+			assert.Equal(t, tc.sale || tc.inFlight || tc.unposted, report.Totals.Revenue.TotalAmount == nil)
+			assert.Equal(t, tc.purchase || tc.fx || tc.inFlight || tc.unposted, report.Totals.Procurement.Cost.TotalAmount == nil)
+			assert.Equal(t, tc.sale || tc.purchase || tc.fx || tc.inFlight || tc.unposted, report.Totals.Margin.TotalAmount == nil)
+			if tc.inFlight {
+				assert.Equal(t, "1", report.Totals.InFlightCount)
+				assert.Equal(t, "0", report.Totals.FailedCount)
+			} else {
+				assert.Equal(t, "1", report.Totals.SucceededCount, "settlement.request must override initial reserved failed status")
+				assert.Equal(t, "10", report.Totals.Usage["prompt_tokens"].KnownTotal)
+				assert.Equal(t, "1", report.Totals.Usage["prompt_tokens"].EstimatedCount)
+				assert.Nil(t, report.Totals.Usage["completion_tokens"].Total)
+				assert.Nil(t, report.Totals.Usage["total_tokens"].Total)
+				if !tc.purchase && !tc.fx && !tc.unposted {
+					assert.Equal(t, strconv.FormatInt(tc.converted, 10), report.Totals.Procurement.Cost.KnownAmount.Nanos)
+				}
+			}
+			assert.Nil(t, report.Totals.Usage["image_count"].Total, "absent optional media measurement is not zero")
+			if tc.purchase {
+				assert.Equal(t, "1", report.Totals.Procurement.PurchasePendingCount, "two unfinished attempts are one unfinished request")
+				assert.Equal(t, "1", report.Totals.Procurement.Cost.PendingCount)
+			}
+			if tc.name == "frozen independent rounding" {
+				var payable model.LedgerEntry
+				require.NoError(t, model.DB.Where("idempotency_key = ?", "gateway:dashboard-pending-attempt:payable").First(&payable).Error)
+				_, err := model.ReverseLedgerEntry(payable.Id, actor.Id, "reverse frozen cost")
+				require.NoError(t, err)
+				reversed := readDashboardFinanceTest(t, engine, token, "/api/admin/v1/reports/dashboard-finance?from=2025-01-02T00:00:00Z&until=2025-01-03T00:00:00Z")
+				assert.Equal(t, "0", reversed.Totals.Procurement.Cost.KnownAmount.Nanos)
+				require.Len(t, reversed.Totals.Procurement.OriginalCosts, 1)
+				assert.Equal(t, "0", reversed.Totals.Procurement.OriginalCosts[0].KnownAmount.Nanos)
+			}
+		})
+	}
+}
+
+func TestDashboardFinanceBucketsHTTP(t *testing.T) {
+	engine, _, token := newAdminTestServer(t)
+	require.NoError(t, model.MigrateGatewayBilling(model.DB))
+	for _, tc := range []struct {
+		name, from, until, zone, grain string
+		count                          int
+		first, last                    int64
+	}{
+		{"spring", "2025-03-09T00:00:00-05:00", "2025-03-10T00:00:00-04:00", "America%2FNew_York", "hour", 23, 1741496400000, 1741579200000},
+		{"fall", "2025-11-02T00:00:00-04:00", "2025-11-03T00:00:00-05:00", "America%2FNew_York", "hour", 25, 1762056000000, 1762146000000},
+		{"ISO Monday", "2025-01-05T12:00:00Z", "2025-01-06T12:00:00Z", "UTC", "week", 2, 1735516800000, 1736726400000},
+		{"midnight gap", "2018-11-04T03:00:00Z", "2018-11-05T02:00:00Z", "America%2FSao_Paulo", "day", 1, 1541300400000, 1541383200000},
+		{"half hour DST", "2025-04-05T13:00:00Z", "2025-04-06T13:30:00Z", "Australia%2FLord_Howe", "hour", 25, 1743858000000, 1743946200000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := fmt.Sprintf("/api/admin/v1/reports/dashboard-finance?from=%s&until=%s&timezone=%s&bucket=%s", tc.from, tc.until, tc.zone, tc.grain)
+			report := readDashboardFinanceTest(t, engine, token, path)
+			require.Len(t, report.Buckets, tc.count)
+			assert.Equal(t, tc.first, report.Buckets[0].Start)
+			assert.Equal(t, tc.last, report.Buckets[len(report.Buckets)-1].End)
+			for i, bucket := range report.Buckets {
+				assert.Less(t, bucket.Start, bucket.End)
+				if i > 0 {
+					assert.Equal(t, report.Buckets[i-1].End, bucket.Start)
+				}
+			}
+		})
+	}
+}
+
+func TestDashboardFinanceLargeTotalsAndSnapshotHTTP(t *testing.T) {
+	engine, actor, token := newAdminTestServer(t)
+	t.Setenv("GATEWAY_SETTLEMENT_JOURNAL_DIR", t.TempDir())
+	require.NoError(t, model.MigrateGatewayBilling(model.DB))
+	require.NoError(t, model.DB.AutoMigrate(&model.ModelOffering{}))
+	zero := money.Amount{Currency: "USD"}
+	for i := range 2 {
+		customer := model.User{Username: fmt.Sprintf("dashboard-large-%d", i), Password: "unused", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AffCode: fmt.Sprintf("dash-large-%d", i)}
+		require.NoError(t, model.DB.Create(&customer).Error)
+		request := model.GatewayRequest{ID: fmt.Sprintf("dashboard-large-%d", i), UserID: customer.Id, ModelOfferingID: 17, SaleCurrency: "USD", SaleFXRate: "1", StartedAt: 1735776000000, Status: "success", Receivable: money.Amount{Nanos: 5000000000000000000, Currency: "USD"}, UsageSource: "upstream", Usage: model.GatewayUsage{PromptTokens: 5000000000000000000, TotalTokens: 5000000000000000000}}
+		require.NoError(t, model.ReserveGateway(&request, zero, zero))
+		require.NoError(t, model.PrepareGatewaySettlement(model.GatewaySettlement{Request: request, SaleSource: request.Receivable}))
+		_, err := model.SettleGateway(request.ID)
+		require.NoError(t, err)
+		if i == 0 {
+			_, err = model.PostLedgerEntries(model.LedgerPosting{Account: model.PlatformRevenueAccount("USD"), Type: model.LedgerEntryRefund, Amount: money.Amount{Nanos: -5000000000000000000, Currency: "USD"}, OperatorId: actor.Id})
+			require.NoError(t, err)
+		}
+	}
+	var changed atomic.Bool
+	var writeErr error
+	require.NoError(t, model.DB.Callback().Query().After("gorm:query").Register("dashboard_snapshot_write", func(tx *gorm.DB) {
+		if tx.Statement.Table != "gateway_billings" || !changed.CompareAndSwap(false, true) {
+			return
+		}
+		var isolation, readOnly string
+		snapshot := tx.Session(&gorm.Session{NewDB: true})
+		writeErr = snapshot.Raw("SHOW transaction_isolation").Row().Scan(&isolation)
+		if writeErr != nil {
+			return
+		}
+		writeErr = snapshot.Raw("SHOW transaction_read_only").Row().Scan(&readOnly)
+		if writeErr != nil {
+			return
+		}
+		if isolation != "repeatable read" || readOnly != "on" {
+			writeErr = fmt.Errorf("report is not a read-only repeatable-read transaction")
+			return
+		}
+		_, writeErr = model.PostLedgerEntries(model.LedgerPosting{Account: model.PlatformRevenueAccount("USD"), Type: model.LedgerEntryAdjustment, Amount: money.Amount{Nanos: -1, Currency: "USD"}, RequestId: "dashboard-large-0", OperatorId: actor.Id})
+	}))
+	t.Cleanup(func() { require.NoError(t, model.DB.Callback().Query().Remove("dashboard_snapshot_write")) })
+	path := "/api/admin/v1/reports/dashboard-finance?from=2025-01-02T00:00:00Z&until=2025-01-03T00:00:00Z&group_by=model_offering"
+	report := readDashboardFinanceTest(t, engine, token, path)
+	require.True(t, changed.Load())
+	require.NoError(t, writeErr)
+	assert.Equal(t, "10000000000000000000", report.Totals.Revenue.KnownAmount.Nanos)
+	assert.Equal(t, "10000000000000000000", report.Totals.Usage["prompt_tokens"].KnownTotal)
+	require.Len(t, report.Items, 1)
+	assert.Equal(t, report.Totals.Revenue, report.Items[0].Revenue, "totals and groups share the snapshot before concurrent commit")
+	after := readDashboardFinanceTest(t, engine, token, path)
+	assert.Equal(t, "9999999999999999999", after.Totals.Revenue.KnownAmount.Nanos)
+	assert.Equal(t, "2", after.Totals.RequestCount)
+	boundary := readDashboardFinanceTest(t, engine, token, "/api/admin/v1/reports/dashboard-finance?from=2025-01-01T00:00:00Z&until=2025-01-02T00:00:00Z")
+	assert.Equal(t, "0", boundary.Totals.RequestCount, "upper bound is excluded")
+}
 
 func TestMarginBulkDraftBindingHTTP(t *testing.T) {
 	for _, change := range []string{"draft", "stored channel overrides"} {

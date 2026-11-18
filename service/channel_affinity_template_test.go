@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -211,7 +212,7 @@ func TestGetPreferredChannelByAffinity_RequestHeaderKeySource(t *testing.T) {
 	}
 
 	affinityValue := fmt.Sprintf("header-hit-%d", time.Now().UnixNano())
-	cacheKeySuffix := buildChannelAffinityCacheKeySuffix(rule, "gpt-5", "default", affinityValue)
+	cacheKeySuffix := "gateway:0:7:1:" + buildChannelAffinityCacheKeySuffix(rule, "gpt-5", "default", affinityValue)
 
 	cache := getChannelAffinityCache()
 	require.NoError(t, cache.SetWithTTL(cacheKeySuffix, 9528, time.Minute))
@@ -231,7 +232,8 @@ func TestGetPreferredChannelByAffinity_RequestHeaderKeySource(t *testing.T) {
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	ctx.Request.Header.Set("X-Affinity-Key", affinityValue)
 
-	channelID, found := GetPreferredChannelByAffinity(ctx, "gpt-5", "default")
+	common.SetContextKey(ctx, constant.ContextKeyUserGroup, "default")
+	channelID, found := GetPreferredGatewayChannelByAffinity(ctx, 7, 1, "gpt-5")
 	require.True(t, found)
 	require.Equal(t, 9528, channelID)
 
@@ -286,7 +288,7 @@ func TestChannelAffinityHitCodexTemplatePassHeadersEffective(t *testing.T) {
 	require.NotNil(t, codexRule)
 
 	affinityValue := fmt.Sprintf("pc-hit-%d", time.Now().UnixNano())
-	cacheKeySuffix := buildChannelAffinityCacheKeySuffix(*codexRule, "gpt-5", "default", affinityValue)
+	cacheKeySuffix := "gateway:0:7:1:" + buildChannelAffinityCacheKeySuffix(*codexRule, "gpt-5", "default", affinityValue)
 
 	cache := getChannelAffinityCache()
 	require.NoError(t, cache.SetWithTTL(cacheKeySuffix, 9527, time.Minute))
@@ -299,7 +301,8 @@ func TestChannelAffinityHitCodexTemplatePassHeadersEffective(t *testing.T) {
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(fmt.Sprintf(`{"prompt_cache_key":"%s"}`, affinityValue)))
 	ctx.Request.Header.Set("Content-Type", "application/json")
 
-	channelID, found := GetPreferredChannelByAffinity(ctx, "gpt-5", "default")
+	common.SetContextKey(ctx, constant.ContextKeyUserGroup, "default")
+	channelID, found := GetPreferredGatewayChannelByAffinity(ctx, 7, 1, "gpt-5")
 	require.True(t, found)
 	require.Equal(t, 9527, channelID)
 
@@ -418,7 +421,7 @@ func TestSessionRulesInheritOrOverrideGlobalDefault(t *testing.T) {
 				require.NoError(t, err)
 				*setting = snapshot.Affinity
 				key := t.Name()
-				cacheKey := buildChannelAffinityCacheKeySuffix(rule, "test-model", "default", key)
+				cacheKey := "gateway:0:7:1:" + buildChannelAffinityCacheKeySuffix(rule, "test-model", "default", key)
 				cache := getChannelAffinityCache()
 				require.NoError(t, cache.SetWithTTL(cacheKey, 1, time.Minute))
 				t.Cleanup(func() { _, err := cache.DeleteMany([]string{cacheKey}); assert.NoError(t, err) })
@@ -426,7 +429,8 @@ func TestSessionRulesInheritOrOverrideGlobalDefault(t *testing.T) {
 				ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 				ctx.Request.Header.Set("X-Session", key)
 				state := RequestPolicy(ctx)
-				channelID, found := GetPreferredChannelByAffinity(ctx, "test-model", "default")
+				common.SetContextKey(ctx, constant.ContextKeyUserGroup, "default")
+				channelID, found := GetPreferredGatewayChannelByAffinity(ctx, 7, 1, "test-model")
 				assert.Equal(t, expected != "off", found)
 				if found {
 					assert.Equal(t, 1, channelID)
@@ -449,14 +453,18 @@ func TestSessionRulesInheritOrOverrideGlobalDefault(t *testing.T) {
 				assert.EqualValues(t, 0, transformed["temperature"])
 				if expected == "off" {
 					ctx.Set("channel_id", 9)
-					RecordChannelAffinity(ctx, 9)
+					meta, ok := getChannelAffinityMeta(ctx)
+					require.True(t, ok)
+					RecordGatewayChannelAffinity(ctx, &GatewaySelection{Channel: model.Channel{ID: 9}, affinity: meta, hasAffinity: true})
 					cached, found, err := cache.Get(cacheKey)
 					require.NoError(t, err)
 					assert.True(t, found)
 					assert.Equal(t, 1, cached, "off does not refresh session bindings")
 					_, err = cache.DeleteMany([]string{cacheKey})
 					require.NoError(t, err)
-					RecordChannelAffinity(ctx, 9)
+					meta, ok = getChannelAffinityMeta(ctx)
+					require.True(t, ok)
+					RecordGatewayChannelAffinity(ctx, &GatewaySelection{Channel: model.Channel{ID: 9}, affinity: meta, hasAffinity: true})
 					_, found, err = cache.Get(cacheKey)
 					require.NoError(t, err)
 					assert.False(t, found, "off does not establish session bindings")

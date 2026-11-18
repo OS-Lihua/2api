@@ -5,11 +5,15 @@ import (
 	"context"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
+	"maps"
+	"reflect"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/money"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -111,10 +115,11 @@ func (m Properties) Value() (driver.Value, error) {
 }
 
 type TaskPrivateData struct {
-	Gateway        *TaskGatewaySnapshot `json:"gateway,omitempty"`
-	Key            string               `json:"key,omitempty"`
-	UpstreamTaskID string               `json:"upstream_task_id,omitempty"` // 上游真实 task ID
-	ResultURL      string               `json:"result_url,omitempty"`       // 任务成功后的结果 URL（视频地址等）
+	Gateway          *TaskGatewaySnapshot  `json:"gateway,omitempty"`
+	LegacyObligation *TaskLegacyObligation `json:"legacy_obligation,omitempty"`
+	Key              string                `json:"key,omitempty"`
+	UpstreamTaskID   string                `json:"upstream_task_id,omitempty"` // 上游真实 task ID
+	ResultURL        string                `json:"result_url,omitempty"`       // 任务成功后的结果 URL（视频地址等）
 	// Execution records safe, immutable request provenance. It lives next to
 	// other private task state so public task DTOs cannot expose it by accident.
 	Execution *TaskExecutionSnapshot `json:"execution,omitempty"`
@@ -141,9 +146,28 @@ type TaskPrivateData struct {
 	ResultDiscarded bool `json:"result_discarded,omitempty"`
 }
 
+// TaskLegacyObligation retains historical identity and unresolved accounting.
+// Quota is evidence to reconcile, never a new charge, refund, or frozen price.
+// Actual completion updates the task result without resolving these money facts.
+type TaskLegacyObligation struct {
+	Version           string         `json:"version"`
+	SourceID          int            `json:"source_id"`
+	ProviderID        int            `json:"provider_id"`
+	ProviderType      int            `json:"provider_type"`
+	SourceQuota       int            `json:"source_quota"`
+	Reconciliation    string         `json:"reconciliation"`
+	DebitEvidence     string         `json:"debit_evidence"`
+	RefundEvidence    string         `json:"refund_evidence"`
+	CompletionFacts   map[string]any `json:"completion_facts,omitempty"`
+	CompletionUnknown bool           `json:"completion_unknown,omitempty"`
+}
+
 // TaskStreamFacts retains bounded quantitative delivery receipts independently
 // of source completion. It never contains response payloads.
 type TaskStreamFacts struct {
+	// Pending retains an immediate inline result until its presenter records
+	// actual delivery. Recovery must never infer receipt from source completion.
+	Pending        bool           `json:"pending,omitempty"`
 	Delivered      map[string]any `json:"delivered,omitempty"`
 	BusinessOutput bool           `json:"business_output"`
 	DeliveryFailed bool           `json:"delivery_failed,omitempty"`
@@ -153,12 +177,14 @@ type TaskStreamFacts struct {
 // TaskGatewaySnapshot freezes the accepted Channel and quantitative billing
 // facts. Request bodies, credentials, and generated content stay out of it.
 type TaskGatewaySnapshot struct {
-	Accepted     bool              `json:"accepted"`
-	ProviderType int               `json:"provider_type"`
-	ChannelID    int               `json:"channel_id"`
-	ProviderID   int               `json:"provider_id"`
-	Settlement   GatewaySettlement `json:"settlement"`
-	Facts        map[string]any    `json:"facts"`
+	// Declared units are frozen with acceptance, independently of task quantities.
+	BillingUsageSchema map[string]jsplugin.UsageFieldSchema `json:"billing_usage_schema,omitempty"`
+	Accepted           bool                                 `json:"accepted"`
+	ProviderType       int                                  `json:"provider_type"`
+	ChannelID          int                                  `json:"channel_id"`
+	ProviderID         int                                  `json:"provider_id"`
+	Settlement         GatewaySettlement                    `json:"settlement"`
+	Facts              map[string]any                       `json:"facts"`
 	// RetainedFacts are submission facts enforced by the host's effective
 	// Channel parameters. They remain source facts when a completion report is
 	// missing, unlike quantities copied from the client's request budget.
@@ -397,6 +423,73 @@ func TaskGetAllTasks(startIdx int, num int, queryParams SyncTaskQueryParams) []*
 	return tasks
 }
 
+// ValidateLegacyTaskPolling checks immutable provenance and the still-current
+// operational identity. Evidence authorizes neither funds nor a replacement
+// Provider/plugin. Absence and database errors are deliberately distinct.
+func ValidateLegacyTaskPolling(ctx context.Context, task *Task) (bool, error) {
+	if task == nil || task.ID <= 0 {
+		return false, errors.New("legacy task identity is unavailable")
+	}
+	var ordinary []LegacyTaskObligation
+	var subscriptions []LegacySubscriptionTaskObligation
+	if err := DB.WithContext(ctx).Where(`"source_task_id" = ?`, task.ID).Limit(1).Find(&ordinary).Error; err != nil {
+		return false, errors.New("legacy task evidence is unavailable")
+	}
+	if err := DB.WithContext(ctx).Where(`"source_task_id" = ?`, task.ID).Limit(1).Find(&subscriptions).Error; err != nil {
+		return false, errors.New("legacy subscription task evidence is unavailable")
+	}
+	if len(ordinary)+len(subscriptions) == 0 {
+		return false, nil
+	}
+	if len(ordinary)+len(subscriptions) != 1 || task.PrivateData.Gateway != nil || task.PrivateData.LegacyObligation != nil {
+		return true, errors.New("legacy task classification has changed")
+	}
+	requestID := ""
+	plugin := TaskPluginSnapshot{}
+	if task.PrivateData.Execution != nil {
+		requestID = task.PrivateData.Execution.RequestID
+		if task.PrivateData.Execution.TaskPlugin != nil {
+			plugin = *task.PrivateData.Execution.TaskPlugin
+		}
+	}
+	if len(ordinary) != 0 {
+		source := ordinary[0]
+		if source.State != "unverified" || source.UserID != task.UserId || source.ProviderID != task.ChannelId ||
+			source.TaskID != task.TaskID || source.UpstreamTaskID != task.PrivateData.UpstreamTaskID ||
+			source.Platform != string(task.Platform) || source.BillingSource != task.PrivateData.BillingSource ||
+			source.TokenID != task.PrivateData.TokenId || source.SubscriptionID != task.PrivateData.SubscriptionId ||
+			source.RequestID != requestID || source.PluginKey != plugin.Key || source.PluginVersion != plugin.Version || source.PluginGeneration != plugin.Generation {
+			return true, errors.New("legacy task identity has changed")
+		}
+	} else {
+		source := subscriptions[0]
+		if source.State != "unverified" || source.UserID != task.UserId || source.ProviderID != task.ChannelId ||
+			source.TaskID != task.TaskID || source.Platform != string(task.Platform) || source.RequestID != requestID ||
+			task.PrivateData.BillingSource != "subscription" || source.SubscriptionID != task.PrivateData.SubscriptionId {
+			return true, errors.New("legacy subscription task identity has changed")
+		}
+	}
+	var current Task
+	if err := DB.WithContext(ctx).Select("id", "user_id", "channel_id", "task_id", "platform", "private_data").First(&current, task.ID).Error; err != nil {
+		return true, errors.New("legacy task is unavailable")
+	}
+	if current.UserId != task.UserId || current.ChannelId != task.ChannelId || current.TaskID != task.TaskID || current.Platform != task.Platform ||
+		current.PrivateData.Gateway != nil || current.PrivateData.LegacyObligation != nil ||
+		current.PrivateData.UpstreamTaskID != task.PrivateData.UpstreamTaskID || current.PrivateData.Key != task.PrivateData.Key ||
+		current.PrivateData.BillingSource != task.PrivateData.BillingSource || current.PrivateData.SubscriptionId != task.PrivateData.SubscriptionId ||
+		current.PrivateData.TokenId != task.PrivateData.TokenId || !reflect.DeepEqual(current.PrivateData.Execution, task.PrivateData.Execution) {
+		return true, errors.New("legacy task identity has changed")
+	}
+	if task.UserId <= 0 || task.ChannelId <= 0 || task.GetUpstreamTaskID() == "" || plugin.Key == "" || plugin.Version == "" {
+		return true, errors.New("legacy task polling identity is incomplete")
+	}
+	var owner int64
+	if err := DB.WithContext(ctx).Model(&User{}).Where(`"id" = ?`, task.UserId).Count(&owner).Error; err != nil || owner != 1 {
+		return true, errors.New("legacy task owner is unavailable")
+	}
+	return true, nil
+}
+
 func pollableUnfinishedTasks() *gorm.DB {
 	return DB.Model(&Task{}).Where("progress != ?", "100%").
 		Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess}).
@@ -405,7 +498,16 @@ func pollableUnfinishedTasks() *gorm.DB {
 
 func GetTimedOutUnfinishedTasks(cutoffUnix int64, limit int) []*Task {
 	var tasks []*Task
+	// Elapsed time cannot resolve money tasks or unverified archived obligations,
+	// even after their parent subscription is deleted. Exclude them before LIMIT
+	// so preserved obligations cannot starve unrelated legacy timeouts.
 	err := pollableUnfinishedTasks().
+		Where(`("private_data"->>'gateway') IS NULL`).
+		Where(`("private_data"->>'legacy_obligation') IS NULL`).
+		Where("NOT EXISTS (?)", DB.Model(&LegacySubscriptionTaskObligation{}).Select("1").
+			Where(`"source_task_id" = "tasks"."id" AND "state" = ?`, "unverified")).
+		Where("NOT EXISTS (?)", DB.Model(&LegacyTaskObligation{}).Select("1").
+			Where(`"source_task_id" = "tasks"."id" AND "state" = ?`, "unverified")).
 		Where("submit_time < ?", cutoffUnix).
 		Order("submit_time, id").
 		Limit(limit).
@@ -486,15 +588,20 @@ func GetByTaskId(userId int, taskId string) (*Task, bool, error) {
 	if taskId == "" {
 		return nil, false, nil
 	}
-	var task *Task
-	var err error
-	err = DB.Where("user_id = ? and task_id = ?", userId, taskId).
-		First(&task).Error
-	exist, err := RecordExist(err)
-	if err != nil {
+	var tasks []*Task
+	err := DB.Where("user_id = ?", userId).
+		Where(`("task_id" = ? OR ("platform" = ? AND "private_data"->>'legacy_obligation' IS NOT NULL AND "private_data"->>'upstream_task_id' = ?))`, taskId, "midjourney", taskId).
+		Limit(2).Find(&tasks).Error
+	if err != nil || len(tasks) != 1 {
 		return nil, false, err
 	}
-	return task, exist, err
+	return tasks[0], true, nil
+}
+
+// MatchesOwnedTaskID supports old MJ identifiers only after an owner-scoped
+// lookup. Capability-only and global lookups must use the canonical public ID.
+func (t *Task) MatchesOwnedTaskID(id string) bool {
+	return t.TaskID == id || t.Platform == "midjourney" && t.PrivateData.LegacyObligation != nil && t.PrivateData.UpstreamTaskID == id
 }
 
 func GetByTaskIdsForPlatforms(userID int, platforms []constant.TaskPlatform, taskIDs []string) ([]*Task, error) {
@@ -502,11 +609,22 @@ func GetByTaskIdsForPlatforms(userID int, platforms []constant.TaskPlatform, tas
 		return nil, nil
 	}
 	var tasks []*Task
-	err := DB.
-		Where("user_id = ? AND platform IN ? AND task_id IN ?", userID, platforms, taskIDs).
+	err := DB.Where("user_id = ? AND platform IN ?", userID, platforms).
+		Where(`("task_id" IN ? OR ("platform" = ? AND "private_data"->>'legacy_obligation' IS NOT NULL AND "private_data"->>'upstream_task_id' IN ?))`, taskIDs, "midjourney", taskIDs).
 		Find(&tasks).Error
 	if err != nil {
 		return nil, err
+	}
+	for _, id := range taskIDs {
+		matches := 0
+		for _, task := range tasks {
+			if task.MatchesOwnedTaskID(id) {
+				matches++
+			}
+		}
+		if matches > 1 {
+			return nil, nil
+		}
 	}
 	return tasks, nil
 }
@@ -597,6 +715,35 @@ func (Task *Task) Update() error {
 	return err
 }
 
+// CompleteGatewayTaskDelivery records one immutable native inline receipt. It
+// updates only private state so a presenter cannot overwrite concurrent task facts.
+func CompleteGatewayTaskDelivery(ctx context.Context, taskID int64, delivered bool) (*Task, error) {
+	var task Task
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockForUpdate(tx).First(&task, taskID).Error; err != nil {
+			return err
+		}
+		snapshot := task.PrivateData.Gateway
+		if snapshot == nil || snapshot.Stream == nil {
+			return errors.New("task has no delivery receipt")
+		}
+		if !snapshot.Stream.Pending {
+			if snapshot.Stream.BusinessOutput != delivered {
+				return errors.New("task delivery receipt is immutable")
+			}
+			return nil
+		}
+		snapshot.Stream.Pending = false
+		snapshot.Stream.BusinessOutput = delivered
+		snapshot.Stream.DeliveryFailed = !delivered
+		if delivered {
+			snapshot.Stream.Delivered = maps.Clone(snapshot.CompletionFacts)
+		}
+		return tx.Model(&task).Update("private_data", task.PrivateData).Error
+	})
+	return &task, err
+}
+
 func (t *Task) UpdateQuota() error {
 	return DB.Model(t).Update("quota", t.Quota).Error
 }
@@ -609,7 +756,15 @@ func (t *Task) UpdateQuota() error {
 // falls back to INSERT ON CONFLICT when the WHERE-guarded UPDATE matches
 // zero rows, which silently bypasses the CAS guard.
 func (t *Task) UpdateWithStatus(fromStatus TaskStatus) (bool, error) {
-	result := DB.Model(t).Where("status = ?", fromStatus).Select("*").Updates(t)
+	query := DB.Model(t).Where("status = ?", fromStatus)
+	if t.PrivateData.Gateway == nil && t.PrivateData.LegacyObligation == nil {
+		// Historical fact polling must not overwrite a task whose owner or
+		// Provider identity changed while its external query was in flight.
+		query = query.Where(`"user_id" = ? AND "channel_id" = ? AND "task_id" = ? AND "platform" = ?`, t.UserId, t.ChannelId, t.TaskID, t.Platform).
+			Where(`COALESCE("private_data"->>'upstream_task_id', '') = ?`, t.PrivateData.UpstreamTaskID).
+			Where(`("private_data"->>'gateway') IS NULL AND ("private_data"->>'legacy_obligation') IS NULL`)
+	}
+	result := query.Select("*").Updates(t)
 	if result.Error != nil {
 		return false, result.Error
 	}

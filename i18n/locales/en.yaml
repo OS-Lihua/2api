@@ -72,6 +72,7 @@ relay.group_upstream_saturated: "The upstream of the current group is at capacit
 relay.retry_get_channel_failed: "Failed to get available channel for model {{.Model}} under group {{.Group}} (retry): {{.Error}}"
 relay.retry_no_available_channel: "No available channel for model {{.Model}} under group {{.Group}} (retry)"
 relay.access_token_unsupported: "Access tokens are not supported here"
+billing.quota_queries_retired: "Quota-based billing queries have been retired. Use the authorized wallet APIs."
 
 # Emails and the name of the token created at registration
 user.default_token_name: "{{.Username}}'s initial token"
@@ -100,6 +101,11 @@ email.security_event.email_confirmed: "Email address confirmed"
 email.security_event.login_linked: "Login account linked: {{.Provider}}"
 email.security_event.login_unlinked: "Login account unlinked"
 email.security_event.wechat_linked: "WeChat account linked"
+
+# Exact balance reminders
+notify.balance_wallet_title: "Your wallet balance crossed its reminder threshold"
+notify.balance_subscription_title: "Your subscription period balance crossed its reminder threshold"
+notify.balance_content: "After the charge at {{.Time}}, the balance was {{.Balance}}, below the threshold of {{.Threshold}}. This records that charge; the current balance may have changed. Check your wallet and subscription periods before adding funds."
 
 # Low-quota notices
 notify.quota_low_title: "Your quota is running low"

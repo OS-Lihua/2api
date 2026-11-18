@@ -50,16 +50,8 @@ import {
   SheetHeader,
   SheetTitle,
 } from '@/components/ui/sheet'
-import {
-  formatQuotaWithCurrency,
-  getCurrencyDisplay,
-  getCurrencyLabel,
-} from '@/lib/currency'
-import {
-  formatQuota,
-  getEditableQuotaStep,
-  parseQuotaFromDollars,
-} from '@/lib/format'
+import { toIntlLocale } from '@/i18n/languages'
+import { formatMoneyAmount, parseDecimalMoneyAmount } from '@/lib/currency'
 import { handleServerError } from '@/lib/handle-server-error'
 import { addTimeToDate } from '@/lib/time'
 
@@ -90,7 +82,8 @@ export function RedemptionsMutateDrawer({
   onOpenChange,
   currentRow,
 }: RedemptionsMutateDrawerProps) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const isUpdate = !!currentRow
   const redemptionId = currentRow?.id
   const { triggerRefresh } = useRedemptions()
@@ -177,13 +170,11 @@ export function RedemptionsMutateDrawer({
       const basePayload = transformFormDataToPayload(data)
 
       if (isUpdate && currentRow && loadedRedemption) {
-        const quota = form.getFieldState('quota_dollars').isDirty
-          ? basePayload.quota
-          : loadedRedemption.quota
         const result = await updateRedemption({
-          ...basePayload,
-          quota,
           id: currentRow.id,
+          name: basePayload.name,
+          amount: basePayload.amount,
+          expired_time: basePayload.expired_time,
         })
         if (result.success) {
           toast.success(t(SUCCESS_MESSAGES.REDEMPTION_UPDATED))
@@ -208,9 +199,7 @@ export function RedemptionsMutateDrawer({
             setCreatedCodes({
               keys: result.data,
               name: basePayload.name,
-              quota: formatQuotaWithCurrency(basePayload.quota, {
-                abbreviate: false,
-              }),
+              amount: formatMoneyAmount(basePayload.amount, locale),
             })
           }
           onOpenChange(false)
@@ -230,8 +219,15 @@ export function RedemptionsMutateDrawer({
     if (!isUpdate) {
       const name = form.getValues('name')
       if (!name?.trim()) {
-        const quota = parseQuotaFromDollars(form.getValues('quota_dollars'))
-        form.setValue('name', formatQuota(quota), { shouldValidate: true })
+        const amount = parseDecimalMoneyAmount(
+          form.getValues('amount'),
+          form.getValues('currency')
+        )
+        if (amount) {
+          form.setValue('name', formatMoneyAmount(amount, locale), {
+            shouldValidate: true,
+          })
+        }
       }
     }
 
@@ -243,14 +239,6 @@ export function RedemptionsMutateDrawer({
     form.setValue('expired_time', newDate ?? null)
   }
 
-  const { meta: currencyMeta } = getCurrencyDisplay()
-  const currencyLabel = getCurrencyLabel()
-  const tokensOnly = currencyMeta.kind === 'tokens'
-  const quotaStep = getEditableQuotaStep()
-  const quotaLabel = t('Quota ({{currency}})', { currency: currencyLabel })
-  const quotaPlaceholder = tokensOnly
-    ? t('Enter quota in tokens')
-    : t('Enter quota in {{currency}}', { currency: currencyLabel })
   let submitButtonLabel = t('Save changes')
   if (isLoadingRedemption) {
     submitButtonLabel = t('Loading...')
@@ -310,29 +298,35 @@ export function RedemptionsMutateDrawer({
 
                   <FormField
                     control={form.control}
-                    name='quota_dollars'
+                    name='amount'
                     render={({ field }) => (
                       <FormItem>
-                        <FormLabel>{quotaLabel}</FormLabel>
+                        <FormLabel>{t('Amount')}</FormLabel>
+                        <FormControl>
+                          <Input {...field} inputMode='decimal' />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name='currency'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>{t('Currency')}</FormLabel>
                         <FormControl>
                           <Input
                             {...field}
-                            type='number'
-                            step={quotaStep}
-                            placeholder={quotaPlaceholder}
-                            onChange={(e) =>
-                              field.onChange(
-                                Number.parseFloat(e.target.value) || 0
-                              )
+                            maxLength={3}
+                            onChange={(event) =>
+                              field.onChange(event.target.value.toUpperCase())
                             }
                           />
                         </FormControl>
                         <FormDescription>
-                          {tokensOnly
-                            ? t('Enter the quota amount in tokens')
-                            : t('Enter the quota amount in {{currency}}', {
-                                currency: currencyLabel,
-                              })}
+                          {t('Enter a three-letter uppercase currency code.')}
                         </FormDescription>
                         <FormMessage />
                       </FormItem>

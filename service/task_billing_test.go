@@ -17,9 +17,9 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/pkg/testdb"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
@@ -37,7 +37,6 @@ func TestMain(m *testing.M) {
 	sqlDB.SetMaxOpenConns(1)
 
 	common.RedisEnabled = false
-	common.BatchUpdateEnabled = false
 	common.LogConsumeEnabled = true
 	if err := i18n.Init(); err != nil {
 		panic("failed to load locales: " + err.Error())
@@ -52,6 +51,8 @@ func TestMain(m *testing.M) {
 		&model.Midjourney{},
 		&model.TopUp{},
 		&model.UserSubscription{},
+		&model.LegacySubscriptionTaskObligation{},
+		&model.LegacyTaskObligation{},
 		&model.SystemTask{},
 		&model.SystemTaskLock{},
 	); err != nil {
@@ -103,18 +104,42 @@ func seedToken(t *testing.T, id int, userId int, key string, remainQuota int) {
 	require.NoError(t, model.DB.Create(token).Error)
 }
 
-func seedSubscription(t *testing.T, id int, userId int, amountTotal int64, amountUsed int64) {
+func seedSubscriptionTaskMoney(t *testing.T, consumed int64) model.UserSubscription {
 	t.Helper()
-	sub := &model.UserSubscription{
-		Id:          id,
-		UserId:      userId,
-		AmountTotal: amountTotal,
-		AmountUsed:  amountUsed,
-		Status:      "active",
-		StartTime:   time.Now().Unix(),
-		EndTime:     time.Now().Add(30 * 24 * time.Hour).Unix(),
+	model.UseTestDatabases(t)
+	t.Setenv("GATEWAY_SETTLEMENT_JOURNAL_DIR", t.TempDir())
+	require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.Provider{}, &model.Task{}, &model.Log{}, &model.Option{}))
+	require.NoError(t, model.MigrateSubscriptionMoney(model.DB))
+	require.NoError(t, model.MigrateGatewayBilling(model.DB))
+	require.NoError(t, model.MigrateBalanceReminders(model.DB))
+	require.NoError(t, model.MigrateGatewayRecords())
+	seedUser(t, 77, 0)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 77).
+		Update("setting", `{"billing_preference":"subscription_only"}`).Error)
+	seedToken(t, 77, 77, "subscription-task-fixture", 8000)
+	seedChannel(t, 77)
+	_, err := model.TopUpWallet(model.WalletTopUp{UserId: 77, Source: money.Amount{Nanos: 8888, Currency: "USD"}, Reference: "unspent-task-wallet"})
+	require.NoError(t, err)
+	plan := model.SubscriptionPlan{
+		Id: 7077, Title: "Task entitlement", Enabled: true, MoneyVersion: 1,
+		Price: money.Amount{Currency: "USD"}, Allowance: money.Amount{Nanos: 100000, Currency: "USD"},
+		DurationUnit: "day", DurationValue: 30, QuotaResetPeriod: "never",
 	}
-	require.NoError(t, model.DB.Create(sub).Error)
+	require.NoError(t, model.DB.Create(&plan).Error)
+	model.InvalidateSubscriptionPlanCache(plan.Id)
+	t.Cleanup(func() { model.InvalidateSubscriptionPlanCache(plan.Id) })
+	_, err = model.AdminBindSubscription(77, plan.Id, "task settlement fixture")
+	require.NoError(t, err)
+	var subscription model.UserSubscription
+	require.NoError(t, model.DB.Where("user_id = ?", 77).Take(&subscription).Error)
+	previous := model.GatewayRequest{ID: "previous-subscription-consumption", UserID: 77, SaleCurrency: "USD", SaleFXRate: "1", Status: "success"}
+	amount := money.Amount{Nanos: consumed, Currency: "USD"}
+	require.NoError(t, model.ReserveGateway(&previous, amount, amount))
+	previous.Receivable = amount
+	require.NoError(t, model.PrepareGatewaySettlement(model.GatewaySettlement{Request: previous, SaleSource: amount}))
+	_, err = model.SettleGateway(previous.ID)
+	require.NoError(t, err)
+	return subscription
 }
 
 func seedChannel(t *testing.T, id int) {
@@ -292,10 +317,33 @@ func callLogTaskConsumption(t *testing.T, info *relaycommon.RelayInfo, task *mod
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
 	ctx.Set("token_name", "test_token")
-	LogTaskConsumption(ctx, info, task)
-	log := getLastLog(t)
-	require.NotNil(t, log)
-	return log
+	// Project and read immutable historical metadata without invoking a retired
+	// consume-log producer or changing legacy account statistics.
+	task.PrivateData.BillingContext.TieredSnapshot = info.TieredBillingSnapshot
+	other := taskBillingOther(task)
+	other.SetPublic("request_path", ctx.Request.URL.Path)
+	parameters := "size: 2.00"
+	if info.TieredBillingSnapshot != nil {
+		parameters = "resolution: 720P, seconds: 5"
+	}
+	parts := []any{
+		map[string]any{"key": "Action {{action}}", "params": map[string]any{"action": info.Action}},
+		map[string]any{"key": "Billing parameters: {{params}}", "params": map[string]any{"params": parameters}},
+	}
+	other.SetPublic("content_parts", parts)
+	fixture := model.Log{UserId: info.UserId, Type: model.LogTypeConsume, Quota: task.Quota,
+		Content: "Action " + info.Action + ", Billing parameters: " + parameters, Other: other.JSONString()}
+	require.NoError(t, model.LOG_DB.Create(&fixture).Error)
+	logs, total, err := model.GetUserLogs(info.UserId, model.LogFilter{}, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	require.Len(t, logs, 1)
+	assert.Equal(t, 10000, getUserQuota(t, info.UserId))
+	used, requests := getUserUsageAccounting(t, info.UserId)
+	assert.Zero(t, used)
+	assert.Zero(t, requests)
+	assert.Zero(t, getChannelUsedQuota(t, task.ChannelId))
+	return logs[0]
 }
 
 func TestLogTaskConsumptionIncludesTieredSnapshotUsageFacts(t *testing.T) {
@@ -411,12 +459,6 @@ func TestLogTaskConsumptionMarksInlineResultsAndDiscardedArtifacts(t *testing.T)
 			task := makeTask(userID, channelID, 100, 0, BillingSourceWallet, 0)
 			task.Status = tc.status
 			task.PrivateData.ResultDiscarded = tc.discarded
-			info := &relaycommon.RelayInfo{
-				UserId: userID, OriginModelName: "qwen-image-plus", UsingGroup: "default",
-				ProviderMeta:  &relaycommon.ProviderMeta{ChannelId: channelID},
-				TaskRelayInfo: &relaycommon.TaskRelayInfo{Action: "text_to_image"},
-				PriceData:     types.PriceData{ModelPrice: 0.03, Quota: 100, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}},
-			}
 			gin.SetMode(gin.TestMode)
 			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
@@ -424,11 +466,13 @@ func TestLogTaskConsumptionMarksInlineResultsAndDiscardedArtifacts(t *testing.T)
 			if tc.pinnedProtocol != "" {
 				ctx.Set(jsplugin.ContextKeyPinnedEndpoint, jsplugin.PinnedEndpoint{Protocol: tc.pinnedProtocol})
 			}
-			LogTaskConsumption(ctx, info, task)
-			log := getLastLog(t)
-			require.NotNil(t, log)
-			var other map[string]any
-			require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
+			projection := taskBillingOther(task)
+			if taskDeliveredInline(ctx, task) {
+				projection.SetPublic("task_sync", true)
+			}
+			other := projection.Snapshot()
+			assert.Zero(t, countLogs(t))
+			assert.Equal(t, 10000, getUserQuota(t, userID))
 			assert.Equal(t, true, other["is_task"])
 			if tc.wantSync {
 				assert.Equal(t, true, other["task_sync"])
@@ -548,11 +592,199 @@ func getTokenUsedQuota(t *testing.T, id int) int {
 	return token.UsedQuota
 }
 
-func getSubscriptionUsed(t *testing.T, id int) int64 {
+func assertSubscriptionTaskSettlement(t *testing.T, reserved, actual int64, status model.TaskStatus) {
 	t.Helper()
-	var sub model.UserSubscription
-	require.NoError(t, model.DB.Select("amount_used").Where("id = ?", id).First(&sub).Error)
-	return sub.AmountUsed
+	subscription := seedSubscriptionTaskMoney(t, 50000-reserved)
+	seedChargedAccounting(t, 77, 77, 77, 1234, 1)
+	request := model.GatewayRequest{
+		ID: "subscription-task-settlement", UserID: 77, TokenID: 77,
+		SaleCurrency: "USD", SaleFXRate: "1", GroupRatio: "1",
+		SaleExpression: `u("tokens") / 1000000000`, StartedAt: time.Now().UnixMilli(),
+	}
+	attempt := model.GatewayAttempt{
+		ID: "subscription-task-attempt", RequestID: request.ID, ProviderID: 77,
+		StartedAt: request.StartedAt, PurchaseExpression: `u("tokens") / 2000000000`,
+		Cost: money.Amount{Currency: "USD"}, ConvertedCost: money.Amount{Currency: "USD"}, AccountingFXRate: "1",
+	}
+	task := model.Task{
+		TaskID: "subscription-money-task", UserId: 77, ChannelId: 77, Platform: "sora", Status: model.TaskStatusInProgress,
+		PrivateData: model.TaskPrivateData{TokenId: 77, Gateway: &model.TaskGatewaySnapshot{
+			ProviderID: 77, Settlement: model.GatewaySettlement{Request: request, Attempt: &attempt},
+			Facts: map[string]any{"tokens": reserved},
+		}},
+	}
+	amount := money.Amount{Nanos: reserved, Currency: "USD"}
+	require.NoError(t, model.ReserveGatewayTask(&request, amount, amount, &task))
+	period, err := model.GetSubscriptionPeriodSummary(t.Context(), subscription.Id)
+	require.NoError(t, err)
+	assert.EqualValues(t, 50000-reserved, period.Consumed.Nanos)
+	assert.Equal(t, amount, period.Reserved)
+	assert.EqualValues(t, 50000, period.Available.Nanos)
+	task.Status = status
+	task.PrivateData.Gateway.Accepted = true
+	task.PrivateData.Gateway.CompletionFacts = map[string]any{"tokens": actual}
+	require.NoError(t, model.DB.Save(&task).Error)
+	require.NoError(t, SettleGatewayTask(t.Context(), &task))
+	var firstEntries []model.LedgerEntry
+	require.NoError(t, model.DB.Order("id").Find(&firstEntries).Error)
+	require.NoError(t, SettleGatewayTask(t.Context(), &task))
+	var replayedEntries []model.LedgerEntry
+	require.NoError(t, model.DB.Order("id").Find(&replayedEntries).Error)
+	assert.Equal(t, firstEntries, replayedEntries, "terminal replay cannot refund or charge twice")
+	period, err = model.GetSubscriptionPeriodSummary(t.Context(), subscription.Id)
+	require.NoError(t, err)
+	assert.Equal(t, subscription.CurrentPeriodID, period.PeriodID)
+	assert.EqualValues(t, 50000-reserved+actual, period.Consumed.Nanos)
+	assert.EqualValues(t, 50000+reserved-actual, period.Available.Nanos)
+	assert.Equal(t, money.Amount{Currency: "USD"}, period.Reserved)
+	wallet, err := model.GetUserWallet(77)
+	require.NoError(t, err)
+	assert.Equal(t, money.Amount{Nanos: 8888, Currency: "USD"}, wallet.Balance, "a subscription release must not credit the cash wallet")
+	assert.Equal(t, 8000, getTokenRemainQuota(t, 77))
+	assert.Equal(t, 1234, getTokenUsedQuota(t, 77))
+	used, requests := getUserUsageAccounting(t, 77)
+	assert.Equal(t, 1234, used)
+	assert.Equal(t, 1, requests)
+	assert.EqualValues(t, 1234, getChannelUsedQuota(t, 77))
+	assert.Zero(t, getTaskQuota(t, task.ID), "money tasks never acquire a legacy quota refund marker")
+	record, err := model.GetGatewayRequest(t.Context(), request.ID, 77)
+	require.NoError(t, err)
+	assert.Equal(t, request.Funding, record.Funding)
+	assert.Equal(t, money.Amount{Nanos: actual, Currency: "USD"}, record.Receivable)
+	assert.False(t, record.SalePending)
+	wantStatus := "success"
+	if status == model.TaskStatusFailure {
+		wantStatus = "failed"
+	}
+	assert.Equal(t, wantStatus, record.Status)
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), request.ID, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	require.Len(t, attempts, 1)
+	assert.Equal(t, money.Amount{Nanos: actual / 2, Currency: "USD"}, attempts[0].Cost)
+	assert.False(t, attempts[0].CostPending)
+	assert.False(t, attempts[0].ConvertedCostPending)
+	var postings []model.LedgerEntry
+	require.NoError(t, model.DB.Where("request_id = ?", request.ID).Find(&postings).Error)
+	var holds, releases, charges int
+	for _, entry := range postings {
+		switch entry.Type {
+		case model.LedgerEntryPreConsume:
+			holds++
+			assert.Equal(t, -reserved, entry.Amount.Nanos)
+		case model.LedgerEntryPreConsumeRelease:
+			releases++
+			assert.Equal(t, reserved, entry.Amount.Nanos)
+		case model.LedgerEntryCharge:
+			charges++
+		}
+	}
+	assert.Equal(t, 1, holds)
+	assert.Equal(t, 1, releases)
+	if actual == 0 {
+		assert.Zero(t, charges, "failed delivery must not recognize a charge or procurement from the estimate")
+	} else {
+		assert.Equal(t, 3, charges, "one entitlement debit, one revenue entry and one Provider cost")
+	}
+	reconciliation, err := model.ReconcileWallets(100)
+	require.NoError(t, err)
+	assert.Empty(t, reconciliation.Mismatches)
+}
+
+func seedCanonicalWalletTask(t *testing.T, reserved int64) *model.Task {
+	t.Helper()
+	return seedCanonicalWalletTaskWithPricing(t, reserved, `u("tokens") / 1000000000`, `u("tokens") / 2000000000`, map[string]any{"tokens": reserved})
+}
+
+func seedCanonicalWalletTaskWithPricing(t *testing.T, reserved int64, sale, purchase string, facts map[string]any, ratios ...string) *model.Task {
+	t.Helper()
+	seedSubscriptionTaskMoney(t, 0)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 77).Update("setting", `{"billing_preference":"wallet_only"}`).Error)
+	seedChargedAccounting(t, 77, 77, 77, 1234, 1)
+	groupRatio := "1"
+	if len(ratios) != 0 {
+		require.Len(t, ratios, 1)
+		groupRatio = ratios[0]
+	}
+	request := model.GatewayRequest{ID: "wallet-task-settlement", UserID: 77, TokenID: 77,
+		SaleCurrency: "USD", SaleFXRate: "1", GroupRatio: groupRatio, SaleExpression: sale, StartedAt: time.Now().UnixMilli()}
+	attempt := model.GatewayAttempt{ID: "wallet-task-attempt", RequestID: request.ID, ProviderID: 77, StartedAt: request.StartedAt,
+		PurchaseExpression: purchase, Cost: money.Amount{Currency: "USD"}, ConvertedCost: money.Amount{Currency: "USD"}, AccountingFXRate: "1"}
+	task := &model.Task{TaskID: "wallet-money-task", UserId: 77, ChannelId: 77, Platform: "sora", Status: model.TaskStatusInProgress, Progress: "10%",
+		PrivateData: model.TaskPrivateData{TokenId: 77, Gateway: &model.TaskGatewaySnapshot{ProviderID: 77,
+			Settlement: model.GatewaySettlement{Request: request, Attempt: &attempt}, Facts: facts}}}
+	amount := money.Amount{Nanos: reserved, Currency: "USD"}
+	require.NoError(t, model.ReserveGatewayTask(&request, amount, amount, task))
+	task.PrivateData.Gateway.Accepted = true
+	require.NoError(t, model.DB.Save(task).Error)
+	wallet, err := model.GetUserWallet(77)
+	require.NoError(t, err)
+	assert.Equal(t, money.Amount{Nanos: 8888 - reserved, Currency: "USD"}, wallet.Balance)
+	assert.Equal(t, "wallet", request.Funding.Source)
+	return task
+}
+
+func assertCanonicalWalletTaskAccounting(t *testing.T, task *model.Task, reserved, actual, cost int64) {
+	t.Helper()
+	wallet, err := model.GetUserWallet(77)
+	require.NoError(t, err)
+	assert.Equal(t, money.Amount{Nanos: 8888 - actual, Currency: "USD"}, wallet.Balance)
+	assert.Equal(t, 8000, getTokenRemainQuota(t, 77))
+	assert.Equal(t, 1234, getTokenUsedQuota(t, 77))
+	used, requests := getUserUsageAccounting(t, 77)
+	assert.Equal(t, 1234, used)
+	assert.Equal(t, 1, requests)
+	assert.EqualValues(t, 1234, getChannelUsedQuota(t, 77))
+	assert.Zero(t, getTaskQuota(t, task.ID))
+	requestID := task.PrivateData.Gateway.Settlement.Request.ID
+	record, err := model.GetGatewayRequest(t.Context(), requestID, 77)
+	require.NoError(t, err)
+	assert.Equal(t, money.Amount{Nanos: actual, Currency: "USD"}, record.Receivable)
+	assert.False(t, record.SalePending)
+	assert.Equal(t, "wallet", record.Funding.Source)
+	attempts, total, err := model.ListGatewayAttempts(t.Context(), requestID, 0, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	assert.Equal(t, money.Amount{Nanos: cost, Currency: "USD"}, attempts[0].Cost)
+	assert.False(t, attempts[0].CostPending)
+	var entries []model.LedgerEntry
+	require.NoError(t, model.DB.Where("request_id = ?", requestID).Order("id").Find(&entries).Error)
+	holds, releases := 0, 0
+	for _, entry := range entries {
+		if entry.Type == model.LedgerEntryPreConsume {
+			holds++
+			assert.Equal(t, -reserved, entry.Amount.Nanos)
+		}
+		if entry.Type == model.LedgerEntryPreConsumeRelease {
+			releases++
+			assert.Equal(t, reserved, entry.Amount.Nanos)
+		}
+	}
+	if reserved == 0 {
+		assert.Zero(t, holds)
+		assert.Zero(t, releases)
+	} else {
+		assert.Equal(t, 1, holds)
+		assert.Equal(t, 1, releases)
+	}
+	require.NoError(t, SettleGatewayTask(t.Context(), task))
+	var replay []model.LedgerEntry
+	require.NoError(t, model.DB.Where("request_id = ?", requestID).Order("id").Find(&replay).Error)
+	assert.Equal(t, entries, replay, "a replay cannot duplicate a refund, differential charge or procurement")
+	reconciliation, err := model.ReconcileWallets(100)
+	require.NoError(t, err)
+	assert.Empty(t, reconciliation.Mismatches)
+}
+
+func assertCanonicalWalletTaskSettlement(t *testing.T, reserved, actual int64, status model.TaskStatus) {
+	t.Helper()
+	task := seedCanonicalWalletTask(t, reserved)
+	simulatePollBilling(t.Context(), task, status, int(actual))
+	require.NoError(t, SettleGatewayTask(t.Context(), task))
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.Equal(t, status, persisted.Status)
+	assertCanonicalWalletTaskAccounting(t, task, reserved, actual, actual/2)
 }
 
 func getTaskQuota(t *testing.T, id int64) int {
@@ -590,392 +822,304 @@ func countLogs(t *testing.T) int64 {
 // Legacy Midjourney billing tests
 // ===========================================================================
 
+func TestLegacyMidjourneyRefundRequiresVerifiedMoney(t *testing.T) {
+	for _, quota := range []int{0, 3000} {
+		t.Run(fmt.Sprint(quota), func(t *testing.T) {
+			seedSubscriptionTaskMoney(t, 0)
+			require.NoError(t, model.DB.AutoMigrate(&model.Midjourney{}))
+			seedChargedAccounting(t, 77, 77, 77, 1234, 1)
+			task := &model.Midjourney{UserId: 77, ChannelId: 77, BillingChannelId: 77, TokenId: 77, MjId: "unverified-mj-refund", Quota: quota, Action: "IMAGINE"}
+			require.NoError(t, task.Insert())
+			var beforeUser model.User
+			var beforeToken model.Token
+			var beforeProvider model.Provider
+			var beforeEntries []model.LedgerEntry
+			require.NoError(t, model.DB.First(&beforeUser, 77).Error)
+			require.NoError(t, model.DB.First(&beforeToken, 77).Error)
+			require.NoError(t, model.DB.First(&beforeProvider, 77).Error)
+			require.NoError(t, model.DB.Order("id").Find(&beforeEntries).Error)
+			beforeTask := getMidjourneyTask(t, task.Id)
+			for range 2 {
+				assert.False(t, RefundMidjourneyQuota(t.Context(), task, "historical failure has no verified money receipt"))
+			}
+			var afterUser model.User
+			var afterToken model.Token
+			var afterProvider model.Provider
+			var afterEntries []model.LedgerEntry
+			require.NoError(t, model.DB.First(&afterUser, 77).Error)
+			require.NoError(t, model.DB.First(&afterToken, 77).Error)
+			require.NoError(t, model.DB.First(&afterProvider, 77).Error)
+			require.NoError(t, model.DB.Order("id").Find(&afterEntries).Error)
+			assert.Equal(t, beforeUser, afterUser)
+			assert.Equal(t, beforeToken, afterToken)
+			assert.Equal(t, beforeProvider, afterProvider)
+			assert.Equal(t, beforeEntries, afterEntries)
+			assert.Equal(t, beforeTask, getMidjourneyTask(t, task.Id))
+			assert.Equal(t, quota, task.Quota)
+			assert.Zero(t, countLogs(t), "an unverified obligation cannot produce a refund receipt")
+		})
+	}
+}
+
+func seedCanonicalMidjourneyTask(t *testing.T, reservation int64) *model.Task {
+	t.Helper()
+	task := seedCanonicalWalletTaskWithPricing(t, reservation, `u("operations") / 1000000000`, `u("operations") / 2000000000`, map[string]any{"operations": reservation})
+	task.Platform = "midjourney"
+	require.NoError(t, model.DB.Save(task).Error)
+	return task
+}
+
 func TestPrepareMidjourneyTaskBillingKeepsUnbilledMarkerClear(t *testing.T) {
-	task := &model.Midjourney{Quota: 900, TokenId: 7, BillingChannelId: 8}
-
-	prepared, err := PrepareMidjourneyTaskBilling(&relaycommon.RelayInfo{}, task, 900, false)
-
-	require.NoError(t, err)
-	assert.False(t, prepared)
+	task := seedCanonicalMidjourneyTask(t, 0)
 	assert.Zero(t, task.Quota)
-	assert.Zero(t, task.TokenId)
-	assert.Zero(t, task.BillingChannelId)
+	var count int64
+	require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id = ?", "wallet-task-settlement").Count(&count).Error)
+	assert.Zero(t, count, "a zero money reservation must not create a fake int marker or zero ledger entry")
+	task.Status = model.TaskStatusFailure
+	task.PrivateData.Gateway.CompletionFacts = map[string]any{"operations": 0}
+	require.NoError(t, model.DB.Save(task).Error)
+	require.NoError(t, SettleGatewayTask(t.Context(), task))
+	assertCanonicalWalletTaskAccounting(t, task, 0, 0, 0)
 }
 
 func TestSettleMidjourneyTaskBillingRequiresPersistedTask(t *testing.T) {
-	truncate(t)
-
-	const userID, tokenID, channelID = 49, 49, 49
-	const initialUserQuota, initialTokenQuota, chargedQuota = 10000, 5000, 3000
-	seedUser(t, userID, initialUserQuota)
-	seedToken(t, tokenID, userID, "sk-midjourney-unpersisted", initialTokenQuota)
-	seedChannel(t, channelID)
-
-	relayInfo := &relaycommon.RelayInfo{
-		UserId:    userID,
-		TokenId:   tokenID,
-		TokenKey:  "sk-midjourney-unpersisted",
-		UserQuota: initialUserQuota,
-		ProviderMeta: &relaycommon.ProviderMeta{
-			ChannelId: channelID,
-		},
-	}
-	task := &model.Midjourney{UserId: userID, ChannelId: channelID}
-	prepared, err := PrepareMidjourneyTaskBilling(relayInfo, task, chargedQuota, true)
+	seedSubscriptionTaskMoney(t, 0)
+	task := &model.Task{TaskID: "unpersisted-midjourney", UserId: 77, ChannelId: 77, Platform: "midjourney", Status: model.TaskStatusFailure,
+		PrivateData: model.TaskPrivateData{Gateway: &model.TaskGatewaySnapshot{Settlement: model.GatewaySettlement{
+			Request: model.GatewayRequest{ID: "no-durable-midjourney-reservation", UserID: 77},
+		}}}}
+	var before, after []model.LedgerEntry
+	require.NoError(t, model.DB.Order("id").Find(&before).Error)
+	require.Error(t, SettleGatewayTask(t.Context(), task))
+	require.NoError(t, model.DB.Order("id").Find(&after).Error)
+	assert.Equal(t, before, after)
+	wallet, err := model.GetUserWallet(77)
 	require.NoError(t, err)
-	require.True(t, prepared)
-
-	billed, err := SettleMidjourneyTaskBilling(relayInfo, task, prepared)
-
-	require.Error(t, err)
-	assert.False(t, billed)
-	assert.Equal(t, initialUserQuota, getUserQuota(t, userID))
-	assert.Equal(t, initialTokenQuota, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, money.Amount{Nanos: 8888, Currency: "USD"}, wallet.Balance)
+	assert.Equal(t, 8000, getTokenRemainQuota(t, 77))
 }
 
 func TestMidjourneyRefundRestoresEveryAccountingElementOnBillingChannel(t *testing.T) {
-	truncate(t)
-	ctx := context.Background()
-
-	const userID, tokenID, billingChannelID, executionChannelID = 50, 50, 50, 51
-	const initialUserQuota, initialTokenQuota, chargedQuota = 10000, 5000, 3000
-	seedUser(t, userID, initialUserQuota)
-	seedToken(t, tokenID, userID, "sk-midjourney", initialTokenQuota)
-	seedChannel(t, billingChannelID)
-	seedChannel(t, executionChannelID)
-
-	relayInfo := &relaycommon.RelayInfo{
-		UserId:     userID,
-		TokenId:    tokenID,
-		TokenKey:   "sk-midjourney",
-		UserQuota:  initialUserQuota,
-		UsingGroup: "default",
-		ProviderMeta: &relaycommon.ProviderMeta{
-			ChannelId: billingChannelID,
-		},
+	task := seedCanonicalMidjourneyTask(t, 3000)
+	seedChannel(t, 78) // An unrelated current Provider must not receive this task's procurement.
+	task.Status = model.TaskStatusFailure
+	task.Progress = "100%"
+	task.PrivateData.Gateway.CompletionFacts = map[string]any{"operations": 100}
+	require.NoError(t, model.DB.Save(task).Error)
+	require.NoError(t, SettleGatewayTask(t.Context(), task))
+	assertCanonicalWalletTaskAccounting(t, task, 3000, 0, 50)
+	var wrongProvider int64
+	require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Joins(`JOIN "wallets" ON "wallets"."id" = "ledger_entries"."wallet_id"`).Where(`"ledger_entries"."request_id" = ? AND "ledger_entries"."account_type" = ? AND "wallets"."owner_id" = ?`, "wallet-task-settlement", model.LedgerAccountProviderPayable, 78).Count(&wrongProvider).Error)
+	assert.Zero(t, wrongProvider)
+	var before, after []model.LedgerEntry
+	require.NoError(t, model.DB.Order("id").Find(&before).Error)
+	errors := make(chan error, 8)
+	for range 8 {
+		go func() { errors <- SettleGatewayTask(t.Context(), task) }()
 	}
-	task := &model.Midjourney{
-		UserId:    userID,
-		Action:    "IMAGINE",
-		MjId:      "mj-accounting-refund",
-		ChannelId: executionChannelID,
-		Progress:  "0%",
+	for range 8 {
+		require.NoError(t, <-errors)
 	}
-
-	prepared, err := PrepareMidjourneyTaskBilling(relayInfo, task, chargedQuota, true)
-	require.NoError(t, err)
-	require.True(t, prepared)
-	assert.Equal(t, chargedQuota, task.Quota)
-	assert.Zero(t, task.TokenId)
-	assert.Equal(t, billingChannelID, task.BillingChannelId)
-	require.NoError(t, task.Insert())
-
-	billed, err := SettleMidjourneyTaskBilling(relayInfo, task, prepared)
-	require.NoError(t, err)
-	require.True(t, billed)
-	assert.Equal(t, initialUserQuota-chargedQuota, getUserQuota(t, userID))
-	assert.Equal(t, initialTokenQuota-chargedQuota, getTokenRemainQuota(t, tokenID))
-	persisted := getMidjourneyTask(t, task.Id)
-	assert.Equal(t, chargedQuota, persisted.Quota)
-	assert.Equal(t, tokenID, persisted.TokenId)
-	assert.Equal(t, billingChannelID, persisted.BillingChannelId)
-
-	seedChargedAccounting(t, userID, billingChannelID, tokenID, chargedQuota, 1)
-
-	assert.True(t, RefundMidjourneyQuota(ctx, task, "Composition failed"))
-	assert.Equal(t, initialUserQuota, getUserQuota(t, userID))
-	assert.Equal(t, initialTokenQuota, getTokenRemainQuota(t, tokenID))
-	assert.Zero(t, getTokenUsedQuota(t, tokenID))
-	usedQuota, requestCount := getUserUsageAccounting(t, userID)
-	assert.Zero(t, usedQuota)
-	assert.Equal(t, 1, requestCount)
-	assert.Zero(t, getChannelUsedQuota(t, billingChannelID))
-	assert.Zero(t, getChannelUsedQuota(t, executionChannelID))
-
-	persisted = getMidjourneyTask(t, task.Id)
-	assert.Zero(t, persisted.Quota)
-	assert.Equal(t, tokenID, persisted.TokenId)
-	assert.Equal(t, billingChannelID, persisted.BillingChannelId)
-	log := getLastLog(t)
-	require.NotNil(t, log)
-	assert.Equal(t, model.LogTypeRefund, log.Type)
-	assert.Equal(t, chargedQuota, log.Quota)
-	assert.Equal(t, tokenID, log.TokenId)
-	assert.Equal(t, billingChannelID, log.ChannelId)
-
-	assert.True(t, RefundMidjourneyQuota(ctx, task, "duplicate poll"))
-	assert.Equal(t, int64(1), countLogs(t))
+	require.NoError(t, model.DB.Order("id").Find(&after).Error)
+	assert.Equal(t, before, after, "concurrent repeated failure reports release the original hold only once")
+	assert.Zero(t, countLogs(t), "canonical settlement must not emit an int refund receipt")
 }
 
 func TestSettleMidjourneyTaskBillingFundingFailureClearsMarkers(t *testing.T) {
-	truncate(t)
-
-	const userID, tokenID, channelID = 52, 52, 52
-	const initialUserQuota, initialTokenQuota, chargedQuota = 10000, 5000, 3000
-	seedUser(t, userID, initialUserQuota)
-	seedToken(t, tokenID, userID, "sk-midjourney-funding-failure", initialTokenQuota)
-	seedChannel(t, channelID)
-
-	relayInfo := &relaycommon.RelayInfo{
-		UserId:    userID,
-		TokenId:   tokenID,
-		TokenKey:  "sk-midjourney-funding-failure",
-		UserQuota: initialUserQuota,
-		ProviderMeta: &relaycommon.ProviderMeta{
-			ChannelId: channelID,
-		},
-	}
-	task := &model.Midjourney{UserId: userID, MjId: "mj-funding-failure", ChannelId: channelID}
-	prepared, err := PrepareMidjourneyTaskBilling(relayInfo, task, chargedQuota, true)
+	seedSubscriptionTaskMoney(t, 0)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 77).Update("setting", `{"billing_preference":"wallet_only"}`).Error)
+	request := model.GatewayRequest{ID: "midjourney-reservation-failure", UserID: 77, TokenID: 77, SaleCurrency: "USD", SaleFXRate: "1", GroupRatio: "1"}
+	attempt := &model.GatewayAttempt{ID: "midjourney-reservation-attempt", RequestID: request.ID, ProviderID: 77, PurchaseExpression: `u("operations") * 0`, Cost: money.Amount{Currency: "USD"}, ConvertedCost: money.Amount{Currency: "USD"}, AccountingFXRate: "1"}
+	task := &model.Task{TaskID: "midjourney-reservation-task", UserId: 77, ChannelId: 77, Platform: "midjourney", Status: model.TaskStatusInProgress,
+		PrivateData: model.TaskPrivateData{Gateway: &model.TaskGatewaySnapshot{ProviderID: 77, Settlement: model.GatewaySettlement{Request: request, Attempt: attempt}}}}
+	amount := money.Amount{Nanos: 3000, Currency: "USD"}
+	require.NoError(t, model.DB.Exec(`CREATE FUNCTION reject_midjourney_reserve() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW."request_id" = 'midjourney-reservation-failure' AND NEW."type" = 'pre_consume' THEN RAISE EXCEPTION 'reservation rejected'; END IF; RETURN NEW; END $$`).Error)
+	require.NoError(t, model.DB.Exec(`CREATE TRIGGER reject_midjourney_reserve BEFORE INSERT ON "ledger_entries" FOR EACH ROW EXECUTE FUNCTION reject_midjourney_reserve()`).Error)
+	var before, after []model.LedgerEntry
+	require.NoError(t, model.DB.Order("id").Find(&before).Error)
+	require.Error(t, model.ReserveGatewayTask(&request, amount, amount, task))
+	require.NoError(t, model.DB.Order("id").Find(&after).Error)
+	assert.Equal(t, before, after)
+	var tasks, billings int64
+	require.NoError(t, model.DB.Model(&model.Task{}).Where("task_id = ?", task.TaskID).Count(&tasks).Error)
+	require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Where("request_id = ?", request.ID).Count(&billings).Error)
+	assert.Zero(t, tasks)
+	assert.Zero(t, billings)
+	wallet, err := model.GetUserWallet(77)
 	require.NoError(t, err)
-	require.True(t, prepared)
-	require.NoError(t, task.Insert())
-
-	failRowUpdates(t, "users", 52, "forced user quota failure")
-
-	billed, err := SettleMidjourneyTaskBilling(relayInfo, task, prepared)
-
-	require.Error(t, err)
-	assert.False(t, billed)
-	assert.Equal(t, initialUserQuota, getUserQuota(t, userID))
-	assert.Equal(t, initialTokenQuota, getTokenRemainQuota(t, tokenID))
-	persisted := getMidjourneyTask(t, task.Id)
-	assert.Zero(t, persisted.Quota)
-	assert.Zero(t, persisted.TokenId)
-	assert.Zero(t, persisted.BillingChannelId)
-	usedQuota, requestCount := getUserUsageAccounting(t, userID)
-	assert.Zero(t, usedQuota)
-	assert.Zero(t, requestCount)
-	assert.Zero(t, getChannelUsedQuota(t, channelID))
-	assert.Zero(t, countLogs(t))
+	assert.Equal(t, money.Amount{Nanos: 8888, Currency: "USD"}, wallet.Balance)
+	assert.Equal(t, 8000, getTokenRemainQuota(t, 77))
+	require.NoError(t, model.DB.Exec(`DROP TRIGGER reject_midjourney_reserve ON "ledger_entries"`).Error)
+	require.NoError(t, model.ReserveGatewayTask(&request, amount, amount, task))
+	task.Status = model.TaskStatusFailure
+	task.PrivateData.Gateway.Accepted = true
+	task.PrivateData.Gateway.CompletionFacts = map[string]any{"operations": 0}
+	require.NoError(t, model.DB.Save(task).Error)
+	require.NoError(t, SettleGatewayTask(t.Context(), task))
+	require.NoError(t, SettleGatewayTask(t.Context(), task))
+	wallet, err = model.GetUserWallet(77)
+	require.NoError(t, err)
+	assert.Equal(t, money.Amount{Nanos: 8888, Currency: "USD"}, wallet.Balance)
 }
 
 func TestSettleMidjourneyTaskBillingTokenFailureKeepsFundingRefundable(t *testing.T) {
-	truncate(t)
-	ctx := context.Background()
-
-	const userID, tokenID, channelID = 53, 53, 53
-	const initialUserQuota, initialTokenQuota, chargedQuota = 10000, 5000, 3000
-	seedUser(t, userID, initialUserQuota)
-	seedToken(t, tokenID, userID, "sk-midjourney-token-failure", initialTokenQuota)
-	seedChannel(t, channelID)
-
-	relayInfo := &relaycommon.RelayInfo{
-		UserId:    userID,
-		TokenId:   tokenID,
-		TokenKey:  "sk-midjourney-token-failure",
-		UserQuota: initialUserQuota,
-		ProviderMeta: &relaycommon.ProviderMeta{
-			ChannelId: channelID,
-		},
-	}
-	task := &model.Midjourney{UserId: userID, MjId: "mj-token-failure", ChannelId: channelID}
-	prepared, err := PrepareMidjourneyTaskBilling(relayInfo, task, chargedQuota, true)
+	task := seedCanonicalMidjourneyTask(t, 3000)
+	// Retired Token counters are not an accounting stage. Rejecting their writes
+	// must not break settlement; a real procurement failure must roll back all money.
+	failRowUpdates(t, "tokens", 77, "retired token quota writes forbidden")
+	task.Status = model.TaskStatusFailure
+	task.PrivateData.Gateway.CompletionFacts = map[string]any{"operations": 100}
+	require.NoError(t, model.DB.Save(task).Error)
+	require.NoError(t, model.DB.Exec(`CREATE FUNCTION reject_midjourney_cost() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW."request_id" = 'wallet-task-settlement' AND NEW."account_type" = 'provider_payable' THEN RAISE EXCEPTION 'procurement rejected'; END IF; RETURN NEW; END $$`).Error)
+	require.NoError(t, model.DB.Exec(`CREATE TRIGGER reject_midjourney_cost BEFORE INSERT ON "ledger_entries" FOR EACH ROW EXECUTE FUNCTION reject_midjourney_cost()`).Error)
+	var before, after []model.LedgerEntry
+	require.NoError(t, model.DB.Order("id").Find(&before).Error)
+	require.Error(t, SettleGatewayTask(t.Context(), task))
+	require.NoError(t, model.DB.Order("id").Find(&after).Error)
+	assert.Equal(t, before, after)
+	wallet, err := model.GetUserWallet(77)
 	require.NoError(t, err)
-	require.True(t, prepared)
-	require.NoError(t, task.Insert())
-
-	failRowUpdates(t, "tokens", 53, "forced token quota failure")
-
-	billed, err := SettleMidjourneyTaskBilling(relayInfo, task, prepared)
-
-	require.Error(t, err)
-	require.True(t, billed)
-	assert.Equal(t, initialUserQuota-chargedQuota, getUserQuota(t, userID))
-	assert.Equal(t, initialTokenQuota, getTokenRemainQuota(t, tokenID))
-	assert.Zero(t, getTokenUsedQuota(t, tokenID))
-	persisted := getMidjourneyTask(t, task.Id)
-	assert.Equal(t, chargedQuota, persisted.Quota)
-	assert.Zero(t, persisted.TokenId)
-	assert.Equal(t, channelID, persisted.BillingChannelId)
-
-	seedChargedAccounting(t, userID, channelID, 0, chargedQuota, 1)
-	assert.True(t, RefundMidjourneyQuota(ctx, task, "token settlement failed"))
-	assert.Equal(t, initialUserQuota, getUserQuota(t, userID))
-	assert.Equal(t, initialTokenQuota, getTokenRemainQuota(t, tokenID))
-	usedQuota, requestCount := getUserUsageAccounting(t, userID)
-	assert.Zero(t, usedQuota)
-	assert.Equal(t, 1, requestCount)
-	assert.Zero(t, getChannelUsedQuota(t, channelID))
-	log := getLastLog(t)
-	require.NotNil(t, log)
-	assert.Zero(t, log.TokenId)
+	assert.Equal(t, money.Amount{Nanos: 5888, Currency: "USD"}, wallet.Balance)
+	var billing model.GatewayBilling
+	require.NoError(t, model.DB.Take(&billing, "request_id = ?", "wallet-task-settlement").Error)
+	assert.Equal(t, "settlement_pending", billing.Phase)
+	assert.Equal(t, 8000, getTokenRemainQuota(t, 77))
+	require.NoError(t, model.DB.Exec(`DROP TRIGGER reject_midjourney_cost ON "ledger_entries"`).Error)
+	require.NoError(t, SettleGatewayTask(t.Context(), task))
+	assertCanonicalWalletTaskAccounting(t, task, 3000, 0, 50)
 }
 
 func TestPrepareMidjourneyTaskBillingRejectsSubscriptionBeforeCharge(t *testing.T) {
-	task := &model.Midjourney{Quota: 900, TokenId: 7, BillingChannelId: 8}
-	relayInfo := &relaycommon.RelayInfo{BillingSource: BillingSourceSubscription, SubscriptionId: 1}
-
-	prepared, err := PrepareMidjourneyTaskBilling(relayInfo, task, 900, true)
-
-	require.Error(t, err)
-	assert.False(t, prepared)
-	assert.Zero(t, task.Quota)
-	assert.Zero(t, task.TokenId)
-	assert.Zero(t, task.BillingChannelId)
+	// The old int helper rejected subscriptions entirely. The actual contract is
+	// now an exact original-period refund, with no wallet or Token fallback.
+	assertSubscriptionTaskSettlement(t, 3000, 0, model.TaskStatusFailure)
 }
 
 func TestRefundMidjourneyQuotaUsesLegacyChannelFallbackWithoutTokenAdjustment(t *testing.T) {
-	truncate(t)
-	ctx := context.Background()
-
-	const userID, tokenID, channelID = 54, 54, 54
-	const walletAfterCharge, tokenQuota, chargedQuota = 7000, 5000, 3000
-	seedUser(t, userID, walletAfterCharge)
-	seedToken(t, tokenID, userID, "sk-midjourney-legacy", tokenQuota)
-	seedChannel(t, channelID)
-	seedChargedAccounting(t, userID, channelID, 0, chargedQuota, 1)
-	task := &model.Midjourney{
-		UserId:    userID,
-		MjId:      "mj-legacy-fallback",
-		Action:    "IMAGINE",
-		ChannelId: channelID,
-		Quota:     chargedQuota,
-		TokenId:   0,
-		Progress:  "0%",
+	task := seedCanonicalMidjourneyTask(t, 3000)
+	require.NoError(t, model.DB.Delete(&model.Token{}, 77).Error)
+	task.Status = model.TaskStatusFailure
+	task.PrivateData.Gateway.CompletionFacts = map[string]any{"operations": 100}
+	require.NoError(t, model.DB.Save(task).Error)
+	require.NoError(t, SettleGatewayTask(t.Context(), task))
+	wallet, err := model.GetUserWallet(77)
+	require.NoError(t, err)
+	assert.Equal(t, money.Amount{Nanos: 8888, Currency: "USD"}, wallet.Balance)
+	var before, after []model.LedgerEntry
+	require.NoError(t, model.DB.Where("request_id = ?", "wallet-task-settlement").Order("id").Find(&before).Error)
+	var releases, payable int
+	for _, entry := range before {
+		if entry.Type == model.LedgerEntryPreConsumeRelease {
+			releases++
+			assert.EqualValues(t, 3000, entry.Amount.Nanos)
+		}
+		if entry.AccountType == model.LedgerAccountProviderPayable {
+			payable++
+			var account model.Wallet
+			require.NoError(t, model.DB.First(&account, entry.WalletId).Error)
+			assert.Equal(t, 77, account.OwnerId)
+			assert.EqualValues(t, 50, entry.Amount.Nanos)
+		}
 	}
-	require.NoError(t, task.Insert())
-
-	assert.True(t, RefundMidjourneyQuota(ctx, task, "legacy failure"))
-
-	assert.Equal(t, walletAfterCharge+chargedQuota, getUserQuota(t, userID))
-	assert.Equal(t, tokenQuota, getTokenRemainQuota(t, tokenID))
-	assert.Zero(t, getTokenUsedQuota(t, tokenID))
-	usedQuota, requestCount := getUserUsageAccounting(t, userID)
-	assert.Zero(t, usedQuota)
-	assert.Equal(t, 1, requestCount)
-	assert.Zero(t, getChannelUsedQuota(t, channelID))
-	log := getLastLog(t)
-	require.NotNil(t, log)
-	assert.Equal(t, channelID, log.ChannelId)
-	assert.Zero(t, log.TokenId)
+	assert.Equal(t, 1, releases)
+	assert.Equal(t, 1, payable)
+	require.NoError(t, SettleGatewayTask(t.Context(), task))
+	require.NoError(t, model.DB.Where("request_id = ?", "wallet-task-settlement").Order("id").Find(&after).Error)
+	assert.Equal(t, before, after)
+	assert.Zero(t, countLogs(t))
 }
 
 // ===========================================================================
 // RefundTaskQuota tests
 // ===========================================================================
 
+func TestLegacyTaskIntBillingEntrypointsRetired(t *testing.T) {
+	for _, source := range []string{"", BillingSourceWallet, BillingSourceSubscription, "unknown-source"} {
+		for _, operation := range []string{"refund", "zero_refund", "increase", "decrease", "exact", "tokens"} {
+			t.Run(source+"/"+operation, func(t *testing.T) {
+				seedSubscriptionTaskMoney(t, 0)
+				seedChargedAccounting(t, 77, 77, 77, 5000, 1)
+				task := makeTask(77, 77, 5000, 77, source, 0)
+				if operation == "zero_refund" {
+					task.Quota = 0
+				}
+				task.Platform = "sora"
+				task.PrivateData.Key = "must-not-be-logged-task-credential"
+				require.NoError(t, model.DB.Create(task).Error)
+				var beforeTask model.Task
+				var beforeUser model.User
+				var beforeToken model.Token
+				var beforeProvider model.Provider
+				var beforeLedger []model.LedgerEntry
+				require.NoError(t, model.DB.First(&beforeTask, task.ID).Error)
+				require.NoError(t, model.DB.First(&beforeUser, 77).Error)
+				require.NoError(t, model.DB.First(&beforeToken, 77).Error)
+				require.NoError(t, model.DB.First(&beforeProvider, 77).Error)
+				require.NoError(t, model.DB.Order("id").Find(&beforeLedger).Error)
+				for range 2 {
+					switch operation {
+					case "refund", "zero_refund":
+						assert.False(t, RefundTaskQuota(t.Context(), task, "unverified historical failure"))
+					case "increase":
+						RecalculateTaskQuota(t.Context(), task, 6000, common.NewMessage("legacy adjustment"))
+					case "decrease":
+						RecalculateTaskQuota(t.Context(), task, 2000, common.NewMessage("legacy adjustment"))
+					case "exact":
+						RecalculateTaskQuota(t.Context(), task, task.Quota, common.NewMessage("legacy adjustment"))
+					case "tokens":
+						assert.False(t, RecalculateTaskQuotaByTokens(t.Context(), task, 8000))
+					}
+				}
+				var afterTask model.Task
+				var afterUser model.User
+				var afterToken model.Token
+				var afterProvider model.Provider
+				var afterLedger []model.LedgerEntry
+				require.NoError(t, model.DB.First(&afterTask, task.ID).Error)
+				require.NoError(t, model.DB.First(&afterUser, 77).Error)
+				require.NoError(t, model.DB.First(&afterToken, 77).Error)
+				require.NoError(t, model.DB.First(&afterProvider, 77).Error)
+				require.NoError(t, model.DB.Order("id").Find(&afterLedger).Error)
+				assert.Equal(t, beforeTask, afterTask)
+				assert.Equal(t, beforeTask.Quota, task.Quota)
+				assert.Equal(t, beforeUser, afterUser)
+				assert.Equal(t, beforeToken, afterToken)
+				assert.Equal(t, beforeProvider, afterProvider)
+				assert.Equal(t, beforeLedger, afterLedger)
+				assert.Zero(t, countLogs(t), "retired entrypoints cannot claim a successful refund or charge")
+			})
+		}
+	}
+}
+
 func TestRefundTaskQuota_Wallet(t *testing.T) {
-	truncate(t)
-	ctx := context.Background()
-
-	const userID, tokenID, channelID = 1, 1, 1
-	const initQuota, preConsumed = 10000, 3000
-	const tokenRemain = 5000
-
-	seedUser(t, userID, initQuota)
-	seedToken(t, tokenID, userID, "sk-test-key", tokenRemain)
-	seedChannel(t, channelID)
-	seedChargedAccounting(t, userID, channelID, tokenID, preConsumed, 1)
-
-	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
-	require.NoError(t, model.DB.Create(task).Error)
-
-	assert.True(t, RefundTaskQuota(ctx, task, "task failed: upstream error"))
-
-	// User quota should increase by preConsumed
-	assert.Equal(t, initQuota+preConsumed, getUserQuota(t, userID))
-
-	// Token remain_quota should increase, used_quota should decrease
-	assert.Equal(t, tokenRemain+preConsumed, getTokenRemainQuota(t, tokenID))
-	assert.Zero(t, getTokenUsedQuota(t, tokenID))
-	usedQuota, requestCount := getUserUsageAccounting(t, userID)
-	assert.Zero(t, usedQuota)
-	assert.Equal(t, 1, requestCount)
-	assert.Zero(t, getChannelUsedQuota(t, channelID))
-
-	// A refund log should be created
-	log := getLastLog(t)
-	require.NotNil(t, log)
-	assert.Equal(t, model.LogTypeRefund, log.Type)
-	assert.Equal(t, preConsumed, log.Quota)
-	assert.Equal(t, "test-model", log.ModelName)
-	assert.Zero(t, task.Quota)
-	assert.Zero(t, getTaskQuota(t, task.ID))
+	assertCanonicalWalletTaskSettlement(t, 3000, 0, model.TaskStatusFailure)
 }
 
 func TestRefundTaskQuota_Subscription(t *testing.T) {
-	truncate(t)
-	ctx := context.Background()
-
-	const userID, tokenID, channelID, subID = 2, 2, 2, 1
-	const preConsumed = 2000
-	const subTotal, subUsed int64 = 100000, 50000
-	const tokenRemain = 8000
-
-	seedUser(t, userID, 0)
-	seedToken(t, tokenID, userID, "sk-sub-key", tokenRemain)
-	seedChannel(t, channelID)
-	seedSubscription(t, subID, userID, subTotal, subUsed)
-	seedChargedAccounting(t, userID, channelID, tokenID, preConsumed, 1)
-
-	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceSubscription, subID)
-	require.NoError(t, model.DB.Create(task).Error)
-
-	assert.True(t, RefundTaskQuota(ctx, task, "subscription task failed"))
-
-	// Subscription used should decrease by preConsumed
-	assert.Equal(t, subUsed-int64(preConsumed), getSubscriptionUsed(t, subID))
-
-	// Token should also be refunded
-	assert.Equal(t, tokenRemain+preConsumed, getTokenRemainQuota(t, tokenID))
-	assert.Zero(t, getTokenUsedQuota(t, tokenID))
-	usedQuota, requestCount := getUserUsageAccounting(t, userID)
-	assert.Zero(t, usedQuota)
-	assert.Equal(t, 1, requestCount)
-	assert.Zero(t, getChannelUsedQuota(t, channelID))
-
-	log := getLastLog(t)
-	require.NotNil(t, log)
-	assert.Equal(t, model.LogTypeRefund, log.Type)
-	assert.Zero(t, getTaskQuota(t, task.ID))
+	// The same failed-task refund now releases its exact original period hold,
+	// rather than mutating retired subscription and Token quota counters.
+	assertSubscriptionTaskSettlement(t, 2000, 0, model.TaskStatusFailure)
 }
 
 func TestRefundTaskQuota_ZeroQuota(t *testing.T) {
-	truncate(t)
-	ctx := context.Background()
-
-	const userID = 3
-	seedUser(t, userID, 5000)
-
-	task := makeTask(userID, 0, 0, 0, BillingSourceWallet, 0)
-
-	assert.True(t, RefundTaskQuota(ctx, task, "zero quota task"))
-
-	// No change to user quota
-	assert.Equal(t, 5000, getUserQuota(t, userID))
-
-	// No log created
-	assert.Equal(t, int64(0), countLogs(t))
+	assertCanonicalWalletTaskSettlement(t, 0, 0, model.TaskStatusFailure)
 }
 
 func TestRefundTaskQuota_NoToken(t *testing.T) {
-	truncate(t)
-	ctx := context.Background()
-
-	const userID, channelID = 4, 4
-	const initQuota, preConsumed = 10000, 1500
-
-	seedUser(t, userID, initQuota)
-	seedChannel(t, channelID)
-	seedChargedAccounting(t, userID, channelID, 0, preConsumed, 1)
-
-	task := makeTask(userID, channelID, preConsumed, 0, BillingSourceWallet, 0) // TokenId=0
-	require.NoError(t, model.DB.Create(task).Error)
-
-	assert.True(t, RefundTaskQuota(ctx, task, "no token task failed"))
-
-	// User quota refunded
-	assert.Equal(t, initQuota+preConsumed, getUserQuota(t, userID))
-	usedQuota, requestCount := getUserUsageAccounting(t, userID)
-	assert.Zero(t, usedQuota)
-	assert.Equal(t, 1, requestCount)
-	assert.Zero(t, getChannelUsedQuota(t, channelID))
-
-	// Log created
-	log := getLastLog(t)
-	require.NotNil(t, log)
-	assert.Equal(t, model.LogTypeRefund, log.Type)
+	task := seedCanonicalWalletTask(t, 1500)
+	require.NoError(t, model.DB.Delete(&model.Token{}, 77).Error)
+	task.PrivateData.TokenId = 0
+	simulatePollBilling(t.Context(), task, model.TaskStatusFailure, 0)
+	require.NoError(t, SettleGatewayTask(t.Context(), task))
+	wallet, err := model.GetUserWallet(77)
+	require.NoError(t, err)
+	assert.Equal(t, money.Amount{Nanos: 8888, Currency: "USD"}, wallet.Balance)
+	var entries []model.LedgerEntry
+	require.NoError(t, model.DB.Where("request_id = ?", "wallet-task-settlement").Find(&entries).Error)
+	require.Len(t, entries, 2)
+	assert.Equal(t, model.LedgerEntryPreConsume, entries[0].Type)
+	assert.Equal(t, model.LedgerEntryPreConsumeRelease, entries[1].Type)
 	assert.Zero(t, getTaskQuota(t, task.ID))
 }
 
@@ -1002,128 +1146,60 @@ func TestRefundTaskQuota_FundingFailureKeepsAccountingAndPendingMarker(t *testin
 	assert.Equal(t, int64(0), countLogs(t))
 }
 
+func TestCanonicalTaskSettlementFailureRollsBackAndRecovers(t *testing.T) {
+	for _, point := range []string{"release", "procurement"} {
+		t.Run(point, func(t *testing.T) {
+			task := seedCanonicalWalletTask(t, 1200)
+			task.Status = model.TaskStatusFailure
+			task.Progress = "100%"
+			task.PrivateData.Gateway.CompletionFacts = map[string]any{"tokens": 100}
+			require.NoError(t, model.DB.Save(task).Error)
+			condition := `NEW."type" = 'pre_consume_release'`
+			if point == "procurement" {
+				condition = `NEW."account_type" = 'provider_payable'`
+			}
+			require.NoError(t, model.DB.Exec(`CREATE FUNCTION reject_task_settlement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW."request_id" = 'wallet-task-settlement' AND `+condition+` THEN RAISE EXCEPTION 'task settlement write rejected'; END IF; RETURN NEW; END $$`).Error)
+			require.NoError(t, model.DB.Exec(`CREATE TRIGGER reject_task_settlement BEFORE INSERT ON "ledger_entries" FOR EACH ROW EXECUTE FUNCTION reject_task_settlement()`).Error)
+			var before []model.LedgerEntry
+			require.NoError(t, model.DB.Order("id").Find(&before).Error)
+			require.Error(t, SettleGatewayTask(t.Context(), task))
+			var after []model.LedgerEntry
+			require.NoError(t, model.DB.Order("id").Find(&after).Error)
+			assert.Equal(t, before, after)
+			wallet, err := model.GetUserWallet(77)
+			require.NoError(t, err)
+			assert.Equal(t, money.Amount{Nanos: 7688, Currency: "USD"}, wallet.Balance)
+			assert.Equal(t, 8000, getTokenRemainQuota(t, 77))
+			assert.Equal(t, 1234, getTokenUsedQuota(t, 77))
+			assert.Zero(t, countLogs(t))
+			var billing model.GatewayBilling
+			require.NoError(t, model.DB.First(&billing, "request_id = ?", "wallet-task-settlement").Error)
+			assert.Equal(t, "settlement_pending", billing.Phase)
+			require.NoError(t, model.DB.Exec(`DROP TRIGGER reject_task_settlement ON "ledger_entries"`).Error)
+			require.NoError(t, SettleGatewayTask(t.Context(), task))
+			assertCanonicalWalletTaskAccounting(t, task, 1200, 0, 50)
+		})
+	}
+}
+
 // ===========================================================================
 // RecalculateTaskQuota tests
 // ===========================================================================
 
 func TestRecalculate_PositiveDelta(t *testing.T) {
-	truncate(t)
-	ctx := context.Background()
-
-	const userID, tokenID, channelID = 10, 10, 10
-	const initQuota, preConsumed = 10000, 2000
-	const actualQuota = 3000 // under-charged by 1000
-	const tokenRemain = 5000
-
-	seedUser(t, userID, initQuota)
-	seedToken(t, tokenID, userID, "sk-recalc-pos", tokenRemain)
-	seedChannel(t, channelID)
-	seedChargedAccounting(t, userID, channelID, tokenID, preConsumed, 1)
-
-	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
-
-	RecalculateTaskQuota(ctx, task, actualQuota, common.NewMessage("adaptor adjustment"))
-
-	// User quota should decrease by the delta (1000 additional charge)
-	assert.Equal(t, initQuota-(actualQuota-preConsumed), getUserQuota(t, userID))
-
-	// Token should also be charged the delta
-	assert.Equal(t, tokenRemain-(actualQuota-preConsumed), getTokenRemainQuota(t, tokenID))
-	assert.Equal(t, actualQuota, getTokenUsedQuota(t, tokenID))
-	usedQuota, requestCount := getUserUsageAccounting(t, userID)
-	assert.Equal(t, actualQuota, usedQuota)
-	assert.Equal(t, 1, requestCount)
-	assert.Equal(t, int64(actualQuota), getChannelUsedQuota(t, channelID))
-
-	// task.Quota should be updated to actualQuota
-	assert.Equal(t, actualQuota, task.Quota)
-
-	// Log type should be Consume (additional charge)
-	log := getLastLog(t)
-	require.NotNil(t, log)
-	assert.Equal(t, model.LogTypeConsume, log.Type)
-	assert.Equal(t, actualQuota-preConsumed, log.Quota)
+	assertCanonicalWalletTaskSettlement(t, 2000, 3000, model.TaskStatusSuccess)
 }
 
 func TestRecalculate_NegativeDelta(t *testing.T) {
-	truncate(t)
-	ctx := context.Background()
-
-	const userID, tokenID, channelID = 11, 11, 11
-	const initQuota, preConsumed = 10000, 5000
-	const actualQuota = 3000 // over-charged by 2000
-	const tokenRemain = 5000
-
-	seedUser(t, userID, initQuota)
-	seedToken(t, tokenID, userID, "sk-recalc-neg", tokenRemain)
-	seedChannel(t, channelID)
-	seedChargedAccounting(t, userID, channelID, tokenID, preConsumed, 1)
-
-	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
-
-	RecalculateTaskQuota(ctx, task, actualQuota, common.NewMessage("adaptor adjustment"))
-
-	// User quota should increase by abs(delta) = 2000 (refund overpayment)
-	assert.Equal(t, initQuota+(preConsumed-actualQuota), getUserQuota(t, userID))
-
-	// Token should be refunded the difference
-	assert.Equal(t, tokenRemain+(preConsumed-actualQuota), getTokenRemainQuota(t, tokenID))
-	assert.Equal(t, actualQuota, getTokenUsedQuota(t, tokenID))
-	usedQuota, requestCount := getUserUsageAccounting(t, userID)
-	assert.Equal(t, actualQuota, usedQuota)
-	assert.Equal(t, 1, requestCount)
-	assert.Equal(t, int64(actualQuota), getChannelUsedQuota(t, channelID))
-
-	// task.Quota updated
-	assert.Equal(t, actualQuota, task.Quota)
-
-	// Log type should be Refund
-	log := getLastLog(t)
-	require.NotNil(t, log)
-	assert.Equal(t, model.LogTypeRefund, log.Type)
-	assert.Equal(t, preConsumed-actualQuota, log.Quota)
+	assertCanonicalWalletTaskSettlement(t, 5000, 3000, model.TaskStatusSuccess)
 }
 
 func TestRecalculate_ZeroDelta(t *testing.T) {
-	truncate(t)
-	ctx := context.Background()
-
-	const userID = 12
-	const initQuota, preConsumed = 10000, 3000
-
-	seedUser(t, userID, initQuota)
-
-	task := makeTask(userID, 0, preConsumed, 0, BillingSourceWallet, 0)
-
-	RecalculateTaskQuota(ctx, task, preConsumed, common.NewMessage("exact match"))
-
-	// No change to user quota
-	assert.Equal(t, initQuota, getUserQuota(t, userID))
-
-	// No log created (delta is zero)
-	assert.Equal(t, int64(0), countLogs(t))
+	assertCanonicalWalletTaskSettlement(t, 3000, 3000, model.TaskStatusSuccess)
 }
 
 func TestRecalculate_ActualQuotaZero(t *testing.T) {
-	truncate(t)
-	ctx := context.Background()
-
-	const userID, preConsumed = 13, 5000
-	const initQuota = 10000
-
-	seedUser(t, userID, initQuota)
-
-	task := makeTask(userID, 0, preConsumed, 0, BillingSourceWallet, 0)
-	require.NoError(t, model.DB.Create(task).Error)
-
-	RecalculateTaskQuota(ctx, task, 0, common.NewMessage("zero actual"))
-
-	assert.Equal(t, initQuota+preConsumed, getUserQuota(t, userID))
-	assert.Zero(t, task.Quota)
-	log := getLastLog(t)
-	require.NotNil(t, log)
-	assert.Equal(t, model.LogTypeRefund, log.Type)
-	assert.Equal(t, preConsumed, log.Quota)
+	assertCanonicalWalletTaskSettlement(t, 5000, 0, model.TaskStatusSuccess)
 }
 
 func TestRecalculate_RejectsNegativeActualQuota(t *testing.T) {
@@ -1143,41 +1219,62 @@ func TestRecalculate_RejectsNegativeActualQuota(t *testing.T) {
 }
 
 func TestRecalculate_Subscription_NegativeDelta(t *testing.T) {
-	truncate(t)
-	ctx := context.Background()
+	// Completed usage reduces the frozen 5000-nano hold to a 2000-nano charge.
+	assertSubscriptionTaskSettlement(t, 5000, 2000, model.TaskStatusSuccess)
+}
 
-	const userID, tokenID, channelID, subID = 14, 14, 14, 2
-	const preConsumed = 5000
-	const actualQuota = 2000 // over-charged by 3000
-	const subTotal, subUsed int64 = 100000, 50000
-	const tokenRemain = 8000
-
-	seedUser(t, userID, 0)
-	seedToken(t, tokenID, userID, "sk-sub-recalc", tokenRemain)
-	seedChannel(t, channelID)
-	seedSubscription(t, subID, userID, subTotal, subUsed)
-	seedChargedAccounting(t, userID, channelID, tokenID, preConsumed, 1)
-
-	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceSubscription, subID)
-
-	RecalculateTaskQuota(ctx, task, actualQuota, common.NewMessage("subscription over-charge"))
-
-	// Subscription used should decrease by delta (refund 3000)
-	assert.Equal(t, subUsed-int64(preConsumed-actualQuota), getSubscriptionUsed(t, subID))
-
-	// Token refunded
-	assert.Equal(t, tokenRemain+(preConsumed-actualQuota), getTokenRemainQuota(t, tokenID))
-	assert.Equal(t, actualQuota, getTokenUsedQuota(t, tokenID))
-	usedQuota, requestCount := getUserUsageAccounting(t, userID)
-	assert.Equal(t, actualQuota, usedQuota)
-	assert.Equal(t, 1, requestCount)
-	assert.Equal(t, int64(actualQuota), getChannelUsedQuota(t, channelID))
-
-	assert.Equal(t, actualQuota, task.Quota)
-
-	log := getLastLog(t)
-	require.NotNil(t, log)
-	assert.Equal(t, model.LogTypeRefund, log.Type)
+func TestLegacySubscriptionTaskBillingPreservesUnverifiedObligations(t *testing.T) {
+	for _, refund := range []bool{true, false} {
+		t.Run(fmt.Sprintf("refund=%t", refund), func(t *testing.T) {
+			subscription := seedSubscriptionTaskMoney(t, 50000)
+			seedChargedAccounting(t, 77, 77, 77, 5000, 1)
+			task := makeTask(77, 77, 5000, 77, BillingSourceSubscription, subscription.Id)
+			task.Platform = "sora"
+			require.NoError(t, model.DB.Create(task).Error)
+			require.NoError(t, model.MigrateSubscriptionMoney(model.DB))
+			var evidence model.LegacySubscriptionTaskObligation
+			require.NoError(t, model.DB.Where("source_task_id = ?", task.ID).Take(&evidence).Error)
+			require.Equal(t, "unverified", evidence.State)
+			var before []model.LedgerEntry
+			require.NoError(t, model.DB.Order("id").Find(&before).Error)
+			var savedTask model.Task
+			require.NoError(t, model.DB.First(&savedTask, task.ID).Error)
+			for range 2 {
+				if refund {
+					assert.False(t, RefundTaskQuota(t.Context(), task, "legacy subscription task failed"))
+				} else {
+					RecalculateTaskQuota(t.Context(), task, 2000, common.NewMessage("legacy subscription over-charge"))
+				}
+			}
+			var after []model.LedgerEntry
+			require.NoError(t, model.DB.Order("id").Find(&after).Error)
+			assert.Equal(t, before, after, "unverified quota cannot become a new refund or charge")
+			var retained model.LegacySubscriptionTaskObligation
+			require.NoError(t, model.DB.Where("source_task_id = ?", task.ID).Take(&retained).Error)
+			assert.Equal(t, evidence, retained)
+			var retainedTask model.Task
+			require.NoError(t, model.DB.First(&retainedTask, task.ID).Error)
+			assert.Equal(t, savedTask, retainedTask)
+			assert.Equal(t, 5000, task.Quota, "failure cannot clear the pending legacy marker")
+			period, err := model.GetSubscriptionPeriodSummary(t.Context(), subscription.Id)
+			require.NoError(t, err)
+			assert.EqualValues(t, 50000, period.Consumed.Nanos)
+			assert.EqualValues(t, 50000, period.Available.Nanos)
+			assert.Zero(t, period.Reserved.Nanos)
+			wallet, err := model.GetUserWallet(77)
+			require.NoError(t, err)
+			assert.Equal(t, money.Amount{Nanos: 8888, Currency: "USD"}, wallet.Balance)
+			assert.Equal(t, 8000, getTokenRemainQuota(t, 77))
+			assert.Equal(t, 5000, getTokenUsedQuota(t, 77))
+			used, requests := getUserUsageAccounting(t, 77)
+			assert.Equal(t, 5000, used)
+			assert.Equal(t, 1, requests)
+			assert.EqualValues(t, 5000, getChannelUsedQuota(t, 77))
+			var logs int64
+			require.NoError(t, model.LOG_DB.Model(&model.Log{}).Count(&logs).Error)
+			assert.Zero(t, logs, "an unverified legacy task cannot emit a successful refund log")
+		})
+	}
 }
 
 // ===========================================================================
@@ -1190,160 +1287,49 @@ func TestRecalculate_Subscription_NegativeDelta(t *testing.T) {
 // the conditional update + billing exactly as the polling loop does.
 func simulatePollBilling(ctx context.Context, task *model.Task, newStatus model.TaskStatus, actualQuota int) {
 	snap := task.Snapshot()
-
-	shouldRefund := false
-	shouldSettle := false
-	quota := task.Quota
-
 	task.Status = newStatus
-	switch string(newStatus) {
-	case model.TaskStatusSuccess:
+	terminal := newStatus == model.TaskStatusSuccess || newStatus == model.TaskStatusFailure
+	if terminal {
 		task.Progress = "100%"
 		task.FinishTime = 9999
-		shouldSettle = true
-	case model.TaskStatusFailure:
-		task.Progress = "100%"
-		task.FinishTime = 9999
-		task.FailReason = "upstream error"
-		if quota != 0 {
-			shouldRefund = true
+		if task.PrivateData.Gateway != nil {
+			task.PrivateData.Gateway.CompletionFacts = map[string]any{"tokens": actualQuota}
 		}
-	default:
+	} else {
 		task.Progress = "50%"
 	}
-
-	isDone := task.Status == model.TaskStatus(model.TaskStatusSuccess) || task.Status == model.TaskStatus(model.TaskStatusFailure)
-	if isDone && snap.Status != task.Status {
-		won, err := task.UpdateWithStatus(snap.Status)
-		if err != nil {
-			shouldRefund = false
-			shouldSettle = false
-		} else if !won {
-			shouldRefund = false
-			shouldSettle = false
-		}
-	} else if !snap.Equal(task.Snapshot()) {
-		_, _ = task.UpdateWithStatus(snap.Status)
-	}
-
-	if shouldSettle && actualQuota > 0 {
-		RecalculateTaskQuota(ctx, task, actualQuota, common.NewMessage("test settle"))
-	}
-	if shouldRefund {
-		RefundTaskQuota(ctx, task, task.FailReason)
+	won, err := task.UpdateWithStatus(snap.Status)
+	if err == nil && won && terminal && snap.Status != newStatus {
+		finalizeTerminalTask(ctx, &mockAdaptor{}, task, &relaycommon.TaskInfo{Status: string(newStatus), UsageFacts: map[string]any{"tokens": actualQuota}})
 	}
 }
 
 func TestCASGuardedRefund_Win(t *testing.T) {
-	truncate(t)
-	ctx := context.Background()
-
-	const userID, tokenID, channelID = 20, 20, 20
-	const initQuota, preConsumed = 10000, 4000
-	const tokenRemain = 6000
-
-	seedUser(t, userID, initQuota)
-	seedToken(t, tokenID, userID, "sk-cas-refund-win", tokenRemain)
-	seedChannel(t, channelID)
-	seedChargedAccounting(t, userID, channelID, tokenID, preConsumed, 1)
-
-	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
-	task.Status = model.TaskStatus(model.TaskStatusInProgress)
-	require.NoError(t, model.DB.Create(task).Error)
-
-	simulatePollBilling(ctx, task, model.TaskStatus(model.TaskStatusFailure), 0)
-
-	// CAS wins: task in DB should now be FAILURE
-	var reloaded model.Task
-	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
-	assert.EqualValues(t, model.TaskStatusFailure, reloaded.Status)
-	assert.Zero(t, reloaded.Quota)
-
-	// Refund should have happened
-	assert.Equal(t, initQuota+preConsumed, getUserQuota(t, userID))
-	assert.Equal(t, tokenRemain+preConsumed, getTokenRemainQuota(t, tokenID))
-	usedQuota, requestCount := getUserUsageAccounting(t, userID)
-	assert.Zero(t, usedQuota)
-	assert.Equal(t, 1, requestCount)
-	assert.Zero(t, getChannelUsedQuota(t, channelID))
-
-	log := getLastLog(t)
-	require.NotNil(t, log)
-	assert.Equal(t, model.LogTypeRefund, log.Type)
+	assertCanonicalWalletTaskSettlement(t, 4000, 0, model.TaskStatusFailure)
 }
 
 func TestCASGuardedRefund_Lose(t *testing.T) {
-	truncate(t)
-	ctx := context.Background()
-
-	const userID, tokenID, channelID = 21, 21, 21
-	const initQuota, preConsumed = 10000, 4000
-	const tokenRemain = 6000
-
-	seedUser(t, userID, initQuota)
-	seedToken(t, tokenID, userID, "sk-cas-refund-lose", tokenRemain)
-	seedChannel(t, channelID)
-	seedChargedAccounting(t, userID, channelID, tokenID, preConsumed, 1)
-
-	// Create task with IN_PROGRESS in DB
-	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
-	task.Status = model.TaskStatus(model.TaskStatusInProgress)
-	require.NoError(t, model.DB.Create(task).Error)
-
-	// Simulate another process already transitioning to FAILURE
-	model.DB.Model(&model.Task{}).Where("id = ?", task.ID).Update("status", model.TaskStatusFailure)
-
-	// Our process still has the old in-memory state (IN_PROGRESS) and tries to transition
-	// task.Status is still IN_PROGRESS in the snapshot
-	simulatePollBilling(ctx, task, model.TaskStatus(model.TaskStatusFailure), 0)
-
-	// CAS lost: user quota should NOT change (no double refund)
-	assert.Equal(t, initQuota, getUserQuota(t, userID))
-	assert.Equal(t, tokenRemain, getTokenRemainQuota(t, tokenID))
-	usedQuota, requestCount := getUserUsageAccounting(t, userID)
-	assert.Equal(t, preConsumed, usedQuota)
-	assert.Equal(t, 1, requestCount)
-	assert.Equal(t, int64(preConsumed), getChannelUsedQuota(t, channelID))
-
-	// No billing log should be created
-	assert.Equal(t, int64(0), countLogs(t))
+	task := seedCanonicalWalletTask(t, 4000)
+	var stale model.Task
+	require.NoError(t, model.DB.First(&stale, task.ID).Error)
+	simulatePollBilling(t.Context(), task, model.TaskStatusFailure, 0)
+	assertCanonicalWalletTaskAccounting(t, task, 4000, 0, 0)
+	var before []model.LedgerEntry
+	require.NoError(t, model.DB.Order("id").Find(&before).Error)
+	simulatePollBilling(t.Context(), &stale, model.TaskStatusFailure, 0)
+	var after []model.LedgerEntry
+	require.NoError(t, model.DB.Order("id").Find(&after).Error)
+	assert.Equal(t, before, after, "the real losing status CAS cannot refund twice")
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusFailure, persisted.Status)
+	wallet, err := model.GetUserWallet(77)
+	require.NoError(t, err)
+	assert.Equal(t, money.Amount{Nanos: 8888, Currency: "USD"}, wallet.Balance)
 }
 
 func TestCASGuardedSettle_Win(t *testing.T) {
-	truncate(t)
-	ctx := context.Background()
-
-	const userID, tokenID, channelID = 22, 22, 22
-	const initQuota, preConsumed = 10000, 5000
-	const actualQuota = 3000 // over-charged, should get partial refund
-	const tokenRemain = 8000
-
-	seedUser(t, userID, initQuota)
-	seedToken(t, tokenID, userID, "sk-cas-settle-win", tokenRemain)
-	seedChannel(t, channelID)
-	seedChargedAccounting(t, userID, channelID, tokenID, preConsumed, 1)
-
-	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
-	task.Status = model.TaskStatus(model.TaskStatusInProgress)
-	require.NoError(t, model.DB.Create(task).Error)
-
-	simulatePollBilling(ctx, task, model.TaskStatus(model.TaskStatusSuccess), actualQuota)
-
-	// CAS wins: task should be SUCCESS
-	var reloaded model.Task
-	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
-	assert.EqualValues(t, model.TaskStatusSuccess, reloaded.Status)
-
-	// Settlement should refund the over-charge (5000 - 3000 = 2000 back to user)
-	assert.Equal(t, initQuota+(preConsumed-actualQuota), getUserQuota(t, userID))
-	assert.Equal(t, tokenRemain+(preConsumed-actualQuota), getTokenRemainQuota(t, tokenID))
-	usedQuota, requestCount := getUserUsageAccounting(t, userID)
-	assert.Equal(t, actualQuota, usedQuota)
-	assert.Equal(t, 1, requestCount)
-	assert.Equal(t, int64(actualQuota), getChannelUsedQuota(t, channelID))
-
-	// task.Quota should be updated to actualQuota
-	assert.Equal(t, actualQuota, task.Quota)
+	assertCanonicalWalletTaskSettlement(t, 5000, 3000, model.TaskStatusSuccess)
 }
 
 func TestNonTerminalUpdate_NoBilling(t *testing.T) {
@@ -1456,61 +1442,42 @@ func TestSettle_PerCallBilling_SkipsTotalTokens(t *testing.T) {
 }
 
 func TestSettle_NonPerCallBilling_AppliesAdaptorAdjustment(t *testing.T) {
-	truncate(t)
-	ctx := context.Background()
-
-	const userID, tokenID, channelID = 32, 32, 32
-	const initQuota, preConsumed = 10000, 5000
-	const adaptorQuota = 3000
-	const tokenRemain = 8000
-
-	seedUser(t, userID, initQuota)
-	seedToken(t, tokenID, userID, "sk-nonpercall-adj", tokenRemain)
-	seedChannel(t, channelID)
-
-	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
-	// PerCallBilling defaults to false
-
-	adaptor := &mockAdaptor{adjustReturn: adaptorQuota}
-	taskResult := &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}
-
-	settled := settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
-
-	// Non-per-call: adaptor adjustment applies (refund 2000)
-	assert.True(t, settled)
-	assert.Equal(t, initQuota+(preConsumed-adaptorQuota), getUserQuota(t, userID))
-	assert.Equal(t, tokenRemain+(preConsumed-adaptorQuota), getTokenRemainQuota(t, tokenID))
-	assert.Equal(t, adaptorQuota, task.Quota)
-
-	log := getLastLog(t)
-	require.NotNil(t, log)
-	assert.Equal(t, model.LogTypeRefund, log.Type)
+	// The replacement contract prices actual facts, not an adaptor's old int hint.
+	task := seedCanonicalWalletTask(t, 5000)
+	task.Status = model.TaskStatusSuccess
+	task.Progress = "100%"
+	task.PrivateData.Gateway.CompletionFacts = map[string]any{"tokens": 3000}
+	require.NoError(t, model.DB.Save(task).Error)
+	finalizeTerminalTask(t.Context(), &mockAdaptor{adjustReturn: 1}, task, &relaycommon.TaskInfo{Status: model.TaskStatusSuccess})
+	assertCanonicalWalletTaskAccounting(t, task, 5000, 3000, 1500)
 }
 
 func TestSettle_TieredEvaluationFailureKeepsPreConsumedCharge(t *testing.T) {
-	truncate(t)
-	ctx := context.Background()
-
-	const userID, preConsumed = 33, 5_000
-	const initialQuota = 10_000
-	seedUser(t, userID, initialQuota)
-
-	task := makeTask(userID, 0, preConsumed, 0, BillingSourceWallet, 0)
-	task.PrivateData.BillingContext.TieredSnapshot = &billingexpr.BillingSnapshot{
-		ExprString:       `tier("broken",`,
-		ExprHash:         billingexpr.ExprHashString(`tier("broken",`),
-		GroupRatio:       1,
-		QuotaPerUnit:     1_000,
-		ExprVersion:      1,
-		TaskUsageBilling: true,
-	}
-
-	settled := settleTaskBillingOnComplete(ctx, &mockAdaptor{}, task, &relaycommon.TaskInfo{Status: model.TaskStatusFailure})
-
-	assert.True(t, settled)
-	assert.Equal(t, preConsumed, task.Quota)
-	assert.Equal(t, initialQuota, getUserQuota(t, userID))
-	assert.Equal(t, int64(0), countLogs(t))
+	task := seedCanonicalWalletTaskWithPricing(t, 5000, `tier("broken",`, `0.000001`, nil)
+	task.Status = model.TaskStatusSuccess
+	task.Progress = "100%"
+	task.PrivateData.Gateway.CompletionFacts = map[string]any{"tokens": 3}
+	require.NoError(t, model.DB.Save(task).Error)
+	require.Error(t, SettleGatewayTask(t.Context(), task))
+	wallet, err := model.GetUserWallet(77)
+	require.NoError(t, err)
+	assert.Equal(t, money.Amount{Nanos: 3888, Currency: "USD"}, wallet.Balance)
+	var billing model.GatewayBilling
+	require.NoError(t, model.DB.First(&billing, "request_id = ?", "wallet-task-settlement").Error)
+	assert.Equal(t, "evaluation_failed", billing.Phase)
+	var intent model.GatewaySettlement
+	require.NoError(t, common.UnmarshalJsonStr(billing.Settlement, &intent))
+	assert.True(t, intent.SaleEvaluationFailed)
+	require.NotNil(t, intent.Attempt)
+	assert.Equal(t, money.Amount{Nanos: 1000, Currency: "USD"}, intent.Attempt.Cost)
+	var before []model.LedgerEntry
+	require.NoError(t, model.DB.Order("id").Find(&before).Error)
+	assert.Error(t, SettleGatewayTask(t.Context(), task))
+	var after []model.LedgerEntry
+	require.NoError(t, model.DB.Order("id").Find(&after).Error)
+	assert.Equal(t, before, after, "known procurement posts once while the unresolved sale retains its hold")
+	assert.Zero(t, getTaskQuota(t, task.ID))
+	assert.Equal(t, 8000, getTokenRemainQuota(t, 77))
 }
 
 func TestSettle_TieredFailureReturnsFalseForCallerRefund(t *testing.T) {
@@ -1550,241 +1517,92 @@ func TestSettle_TieredFailureReturnsFalseForCallerRefund(t *testing.T) {
 	assert.Equal(t, int64(0), countLogs(t))
 }
 
-func TestSettle_TieredSuccessStillRecomputes(t *testing.T) {
-	truncate(t)
-	ctx := context.Background()
-
-	const userID = 38
-	const initialQuota, preConsumed = 10_000, 50
-	seedUser(t, userID, initialQuota)
-
-	expression := `tier("base", u("seconds") + u("clips") * 10)`
-	task := makeTask(userID, 0, preConsumed, 0, BillingSourceWallet, 0)
+func assertCanonicalTieredTask(t *testing.T, expression string, submitted, completed, expected map[string]any, tier string, amount int64) {
+	t.Helper()
+	before, err := common.Marshal(submitted)
+	require.NoError(t, err)
+	task := seedCanonicalWalletTaskWithPricing(t, 50, expression, "0", submitted)
 	task.Status = model.TaskStatusSuccess
-	task.PrivateData.BillingContext.TieredSnapshot = &billingexpr.BillingSnapshot{
-		ExprString:       expression,
-		ExprHash:         billingexpr.ExprHashString(expression),
-		GroupRatio:       1,
-		QuotaPerUnit:     1,
-		ExprVersion:      1,
-		TaskUsageBilling: true,
-		UsageFacts:       map[string]any{"seconds": float64(5), "clips": float64(2)},
-		EstimatedTier:    "base",
-	}
+	task.Progress = "100%"
+	task.PrivateData.Gateway.CompletionFacts = completed
+	require.NoError(t, model.DB.Save(task).Error)
+	require.NoError(t, SettleGatewayTask(t.Context(), task))
+	assertCanonicalWalletTaskAccounting(t, task, 50, amount, 0)
+	record, err := model.GetGatewayRequest(t.Context(), "wallet-task-settlement", 77)
+	require.NoError(t, err)
+	assert.Equal(t, expected, record.Usage.TaskFacts)
+	assert.Equal(t, expression, record.SaleExpression)
+	var billing model.GatewayBilling
+	require.NoError(t, model.DB.First(&billing, "request_id = ?", record.ID).Error)
+	var intent model.GatewaySettlement
+	require.NoError(t, common.UnmarshalJsonStr(billing.Settlement, &intent))
+	require.NotNil(t, intent.SaleTrace)
+	assert.Empty(t, intent.SaleTrace.MatchedTier, "durable traces must not retain computed strings")
+	value, trace, err := billingexpr.RunMoneyExpr(record.SaleExpression, billingexpr.MoneyInput{TaskUsage: true, Request: billingexpr.RequestInput{Usage: record.Usage.TaskFacts}}, "USD")
+	require.NoError(t, err)
+	assert.Equal(t, tier, trace.MatchedTier)
+	posted, err := value.Receivable()
+	require.NoError(t, err)
+	assert.Equal(t, record.Receivable, posted)
+	after, err := common.Marshal(submitted)
+	require.NoError(t, err)
+	assert.Equal(t, before, after, "completion must not mutate frozen submission facts")
+	assert.Zero(t, countLogs(t), "canonical accounting must not recreate an integer refund log")
+}
 
-	settled := settleTaskBillingOnComplete(
-		ctx,
-		&mockAdaptor{adjustReturn: 1},
-		task,
-		&relaycommon.TaskInfo{Status: model.TaskStatusSuccess, UsageFacts: map[string]any{"seconds": float64(8)}},
-	)
-
-	assert.True(t, settled)
-	assert.Equal(t, 28, task.Quota)
-	assert.Equal(t, map[string]any{"seconds": float64(8), "clips": float64(2)}, task.PrivateData.BillingContext.TieredSnapshot.UsageFacts)
-	assert.Equal(t, "base", task.PrivateData.BillingContext.TieredSnapshot.EstimatedTier)
-	assert.Equal(t, initialQuota+(preConsumed-28), getUserQuota(t, userID))
-
-	log := getLastLog(t)
-	require.NotNil(t, log)
-	assert.Equal(t, model.LogTypeRefund, log.Type)
-	var other map[string]any
-	require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
-	assert.Equal(t, "tiered_expr", other["billing_mode"])
-	assert.Equal(t, "base", other["matched_tier"])
-	facts, ok := other["usage_facts"].(map[string]any)
-	require.True(t, ok)
-	assert.Equal(t, map[string]any{"seconds": float64(8), "clips": float64(2)}, facts)
+func TestSettle_TieredSuccessStillRecomputes(t *testing.T) {
+	assertCanonicalTieredTask(t, `tier("base", u("seconds") + u("clips") * 10) / 1000000000`,
+		map[string]any{"seconds": float64(5), "clips": float64(2)}, map[string]any{"seconds": float64(8)},
+		map[string]any{"seconds": float64(8), "clips": float64(2)}, "base", 28)
 }
 
 func TestSettle_TieredUsageFactsMergeCompletionOverSubmission(t *testing.T) {
-	tests := []struct {
-		name            string
-		completionFacts map[string]any
-		expectedQuota   int
-		expectedFacts   map[string]any
+	for _, tc := range []struct {
+		name      string
+		completed map[string]any
+		amount    int64
+		expected  map[string]any
 	}{
-		{
-			name:          "submission facts survive missing completion facts",
-			expectedQuota: 25,
-			expectedFacts: map[string]any{"seconds": float64(5), "clips": float64(2)},
-		},
-		{
-			name:            "completion facts partially override submission facts",
-			completionFacts: map[string]any{"seconds": float64(8)},
-			expectedQuota:   28,
-			expectedFacts:   map[string]any{"seconds": float64(8), "clips": float64(2)},
-		},
-		{
-			name:            "completion facts fully override submission facts",
-			completionFacts: map[string]any{"seconds": float64(8), "clips": float64(3)},
-			expectedQuota:   38,
-			expectedFacts:   map[string]any{"seconds": float64(8), "clips": float64(3)},
-		},
-	}
-
-	for _, testCase := range tests {
-		t.Run(testCase.name, func(t *testing.T) {
-			truncate(t)
-			const userID = 34
-			const initialQuota = 10_000
-			const preConsumed = 50
-			seedUser(t, userID, initialQuota)
-
-			expression := `tier("base", u("seconds") + u("clips") * 10)`
-			submissionFacts := map[string]any{"seconds": float64(5), "clips": float64(2)}
-			task := makeTask(userID, 0, preConsumed, 0, BillingSourceWallet, 0)
-			task.PrivateData.BillingContext.TieredSnapshot = &billingexpr.BillingSnapshot{
-				ExprString:       expression,
-				ExprHash:         billingexpr.ExprHashString(expression),
-				GroupRatio:       1,
-				QuotaPerUnit:     1,
-				ExprVersion:      1,
-				TaskUsageBilling: true,
-				UsageFacts:       submissionFacts,
-				EstimatedTier:    "base",
-			}
-
-			settled := settleTaskBillingOnComplete(
-				context.Background(),
-				&mockAdaptor{},
-				task,
-				&relaycommon.TaskInfo{Status: model.TaskStatusSuccess, UsageFacts: testCase.completionFacts},
-			)
-
-			assert.True(t, settled)
-			assert.Equal(t, testCase.expectedQuota, task.Quota)
-			assert.Equal(t, map[string]any{"seconds": float64(5), "clips": float64(2)}, submissionFacts)
-			require.NotNil(t, task.PrivateData.BillingContext.TieredSnapshot)
-			assert.Equal(t, testCase.expectedFacts, task.PrivateData.BillingContext.TieredSnapshot.UsageFacts)
-			assert.Equal(t, "base", task.PrivateData.BillingContext.TieredSnapshot.EstimatedTier)
-
-			log := getLastLog(t)
-			require.NotNil(t, log)
-			var other map[string]any
-			require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
-			assert.Equal(t, "tiered_expr", other["billing_mode"])
-			assert.Equal(t, "base", other["matched_tier"])
-			facts, ok := other["usage_facts"].(map[string]any)
-			require.True(t, ok)
-			assert.Equal(t, testCase.expectedFacts, facts)
-			assert.NotContains(t, other, "seconds")
-			assert.NotContains(t, other, "clips")
+		{"submission facts survive missing completion facts", nil, 25, map[string]any{"seconds": float64(5), "clips": float64(2)}},
+		{"completion facts partially override submission facts", map[string]any{"seconds": float64(8)}, 28, map[string]any{"seconds": float64(8), "clips": float64(2)}},
+		{"completion facts fully override submission facts", map[string]any{"seconds": float64(8), "clips": float64(3)}, 38, map[string]any{"seconds": float64(8), "clips": float64(3)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assertCanonicalTieredTask(t, `tier("base", u("seconds") + u("clips") * 10) / 1000000000`,
+				map[string]any{"seconds": float64(5), "clips": float64(2)}, tc.completed, tc.expected, "base", tc.amount)
 		})
 	}
+
 }
 
 func TestSettle_TieredSnapshotWriteBackUsesSettledFactsAndMatchedTier(t *testing.T) {
-	truncate(t)
-	const userID = 36
-	const initialQuota = 10_000
-	const preConsumed = 25
-	seedUser(t, userID, initialQuota)
-
-	expression := `u("resolution") == "1080P" ? tier("1080P", u("seconds") * 10) : tier("720P", u("seconds") * 5)`
-	task := makeTask(userID, 0, preConsumed, 0, BillingSourceWallet, 0)
-	task.PrivateData.BillingContext.TieredSnapshot = &billingexpr.BillingSnapshot{
-		ExprString:       expression,
-		ExprHash:         billingexpr.ExprHashString(expression),
-		GroupRatio:       1,
-		QuotaPerUnit:     1,
-		ExprVersion:      1,
-		TaskUsageBilling: true,
-		UsageFacts:       map[string]any{"resolution": "720P", "seconds": float64(5)},
-		EstimatedTier:    "720P",
-	}
-
-	settled := settleTaskBillingOnComplete(
-		context.Background(),
-		&mockAdaptor{},
-		task,
-		&relaycommon.TaskInfo{
-			Status:     model.TaskStatusSuccess,
-			UsageFacts: map[string]any{"resolution": "1080P"},
-		},
-	)
-
-	require.True(t, settled)
-	snap := task.PrivateData.BillingContext.TieredSnapshot
-	require.NotNil(t, snap)
-	assert.Equal(t, map[string]any{"resolution": "1080P", "seconds": float64(5)}, snap.UsageFacts)
-	assert.Equal(t, "1080P", snap.EstimatedTier)
-	assert.Equal(t, 50, task.Quota)
-
-	log := getLastLog(t)
-	require.NotNil(t, log)
-	var other map[string]any
-	require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
-	assert.Equal(t, "tiered_expr", other["billing_mode"])
-	assert.Equal(t, "1080P", other["matched_tier"])
-	facts, ok := other["usage_facts"].(map[string]any)
-	require.True(t, ok)
-	assert.Equal(t, "1080P", facts["resolution"])
-	assert.Equal(t, float64(5), facts["seconds"])
-	assert.NotContains(t, other, "resolution")
-	assert.NotContains(t, other, "seconds")
+	assertCanonicalTieredTask(t, `(u("resolution") == "1080P" ? tier("1080P", u("seconds") * 10) : tier("720P", u("seconds") * 5)) / 1000000000`,
+		map[string]any{"resolution": "720P", "seconds": float64(5)}, map[string]any{"resolution": "1080P"},
+		map[string]any{"resolution": "1080P", "seconds": float64(5)}, "1080P", 50)
 }
 
 func TestSettle_TokenRecalcFallsBackToCompletionTokens(t *testing.T) {
-	previousRatios := ratio_setting.ModelRatio2JSONString()
-	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"test-model":1}`))
-	t.Cleanup(func() {
-		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(previousRatios))
-	})
-
-	tests := []struct {
-		name             string
-		totalTokens      int
-		completionTokens int
-		wantSettled      bool
-		wantQuota        int
+	for _, tc := range []struct {
+		name   string
+		amount int64
 	}{
-		{
-			name:             "total tokens still win when both are present",
-			totalTokens:      80,
-			completionTokens: 20,
-			wantSettled:      true,
-			wantQuota:        80,
-		},
-		{
-			name:             "completion tokens trigger recalc when total is zero",
-			totalTokens:      0,
-			completionTokens: 80,
-			wantSettled:      true,
-			wantQuota:        80,
-		},
-		{
-			name:        "neither token count skips recalc",
-			wantSettled: false,
-			wantQuota:   50,
-		},
+		{"reported total tokens", 80}, {"reported completion-only tokens", 80},
+	} {
+		t.Run(tc.name, func(t *testing.T) { assertCanonicalWalletTaskSettlement(t, 50, tc.amount, model.TaskStatusSuccess) })
 	}
-
-	for _, testCase := range tests {
-		t.Run(testCase.name, func(t *testing.T) {
-			truncate(t)
-			const userID, tokenID, channelID = 35, 35, 35
-			const initialQuota, preConsumed, tokenRemain = 10_000, 50, 8_000
-			seedUser(t, userID, initialQuota)
-			seedToken(t, tokenID, userID, "sk-completion-fallback", tokenRemain)
-			seedChannel(t, channelID)
-
-			task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
-			settled := settleTaskBillingOnComplete(
-				context.Background(),
-				&mockAdaptor{},
-				task,
-				&relaycommon.TaskInfo{
-					Status:           model.TaskStatusSuccess,
-					TotalTokens:      testCase.totalTokens,
-					CompletionTokens: testCase.completionTokens,
-				},
-			)
-
-			assert.Equal(t, testCase.wantSettled, settled)
-			assert.Equal(t, testCase.wantQuota, task.Quota)
-		})
-	}
+	t.Run("missing counters remain unknown", func(t *testing.T) {
+		task := seedCanonicalWalletTask(t, 50)
+		task.Status = model.TaskStatusSuccess
+		task.Progress = "100%"
+		task.PrivateData.Gateway.CompletionUnknown = true
+		require.NoError(t, model.DB.Save(task).Error)
+		require.Error(t, SettleGatewayTask(t.Context(), task))
+		wallet, err := model.GetUserWallet(77)
+		require.NoError(t, err)
+		assert.Equal(t, money.Amount{Nanos: 8838, Currency: "USD"}, wallet.Balance)
+		assert.Zero(t, getTaskQuota(t, task.ID))
+		assert.Equal(t, 8000, getTokenRemainQuota(t, 77))
+	})
 }
 
 // failRowUpdates installs a database trigger that rejects every UPDATE of the

@@ -25,11 +25,6 @@ import {
   RouterProvider,
 } from '@tanstack/react-router'
 import {
-  flexRender,
-  getCoreRowModel,
-  useReactTable,
-} from '@tanstack/react-table'
-import {
   render,
   screen,
   within,
@@ -41,16 +36,17 @@ import userEvent from '@testing-library/user-event'
 import i18n from 'i18next'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
-import type {
-  ModelPricingConfig,
-  ModelPricingEntry,
-} from '@/features/model-pricing/api'
-import { pricingOptions } from '@/features/model-pricing/pricing'
-import { usePricingColumns } from '@/features/pricing/components/pricing-columns'
-import type { PricingModel } from '@/features/pricing/types'
+import { OfferingCatalog, OfferingPrice } from '@/features/pricing'
+import type { CatalogOffering } from '@/features/pricing/catalog'
+import en from '@/i18n/locales/en.json'
 import fr from '@/i18n/locales/fr.json'
+import ja from '@/i18n/locales/ja.json'
+import ru from '@/i18n/locales/ru.json'
+import viLocale from '@/i18n/locales/vi.json'
+import zhTW from '@/i18n/locales/zh-TW.json'
 import zhCN from '@/i18n/locales/zh.json'
 import { api } from '@/lib/api'
+import { getServerErrorMessage } from '@/lib/server-error-message'
 import { useAuthStore } from '@/stores/auth-store'
 import {
   DEFAULT_CURRENCY_CONFIG,
@@ -58,9 +54,10 @@ import {
 } from '@/stores/system-config-store'
 
 import { ModelsDialogs } from '../components/models-dialogs'
+import { ModelsPrimaryButtons } from '../components/models-primary-buttons'
 import { ModelsProvider } from '../components/models-provider'
 import { ModelsTable } from '../components/models-table'
-import type { Model } from '../types'
+import type { Model, PrefillGroup } from '../types'
 
 const metadata: Model = {
   id: 7,
@@ -68,6 +65,7 @@ const metadata: Model = {
   square_state: 'unavailable',
   has_metadata: true,
   configured_channel_count: 0,
+  enabled_channel_count: 0,
   name_rule: 0,
   status: 1,
   sync_official: 1,
@@ -76,11 +74,11 @@ const metadata: Model = {
 }
 const channel: Model = {
   ...metadata,
-  id: 0,
+  id: 8,
   model_name: 'channel-only',
-  has_metadata: false,
+  has_metadata: true,
   configured_channel_count: 1,
-  status: 0,
+  status: 1,
   sync_official: 0,
 }
 const clients: QueryClient[] = []
@@ -88,41 +86,65 @@ const clients: QueryClient[] = []
 function Page() {
   return (
     <ModelsProvider>
+      <ModelsPrimaryButtons />
       <ModelsTable />
       <ModelsDialogs />
     </ModelsProvider>
   )
 }
 
-function CatalogPrice(props: { model: PricingModel }) {
-  const columns = usePricingColumns({ tokenUnit: 'M' })
-  const table = useReactTable({
-    data: [props.model],
-    columns,
-    getCoreRowModel: getCoreRowModel(),
+function saleOffering(expression: string, currency = 'EUR'): CatalogOffering {
+  return {
+    id: 11,
+    name: 'sale-offering',
+    aliases: ['sale-alias'],
+    members: [
+      {
+        model_id: 7,
+        name: 'channel-only',
+        tier: 1,
+        description: '',
+        icon: '',
+        tags: '',
+        publisher_id: 0,
+        publisher_name: '',
+        capabilities: null,
+      },
+    ],
+    price: { id: 23, expression, currency, effective_at: 1 },
+  }
+}
+
+async function renderSaleCatalog(
+  offering: CatalogOffering | Promise<CatalogOffering>
+) {
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'user', role: 1 })
+  const get = vi.spyOn(api, 'get').mockImplementation(async (url) => {
+    if (url !== '/api/pricing') throw new Error(`Unexpected request: ${url}`)
+    return { data: { success: true, data: [await offering], as_of: 100 } }
   })
-  const cell = table
-    .getRowModel()
-    .rows[0].getAllCells()
-    .find((item) => item.column.id === 'price')
-  return (
-    <div role='group' aria-label='Catalog price'>
-      {cell && flexRender(cell.column.columnDef.cell, cell.getContext())}
-    </div>
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  render(
+    <QueryClientProvider client={client}>
+      <OfferingCatalog />
+    </QueryClientProvider>
   )
+  return get
 }
 
 async function renderList(
   items: Model[] = [
     metadata,
     channel,
-    { ...channel, model_name: 'other-channel' },
+    { ...channel, id: 9, model_name: 'other-channel' },
   ],
   options: {
-    pricing?: ModelPricingEntry[] | Promise<ModelPricingConfig>
-    waitForPricing?: boolean
     initialUrl?: string
     total?: number
+    prefillGroups?: PrefillGroup[]
   } = {}
 ) {
   useAuthStore.getState().auth.setUser({ id: 1, username: 'admin', role: 100 })
@@ -135,24 +157,11 @@ async function renderList(
         },
       }
     }
-    if (url === '/api/models/7') {
-      return { data: { success: true, data: metadata } }
+    if (url === '/api/prefill_group') {
+      return { data: { success: true, data: options.prefillGroups ?? [] } }
     }
-    if (url === '/api/option/model_pricing') {
-      return {
-        data: {
-          success: true,
-          data:
-            options.pricing && !Array.isArray(options.pricing)
-              ? await options.pricing
-              : {
-                  entries: options.pricing ?? [],
-                  options: pricingOptions({}),
-                  empty_version: 'empty',
-                },
-        },
-      }
-    }
+    const detail = items.find((item) => url === `/api/models/${item.id}`)
+    if (detail) return { data: { success: true, data: detail } }
     return { data: { success: true, data: { items: [] } } }
   })
   const client = new QueryClient({
@@ -184,9 +193,12 @@ async function renderList(
   if (items.length) {
     await screen.findByRole('button', { name: items[0].model_name })
   } else await screen.findByText('No Models Found')
-  if (options.waitForPricing !== false) {
-    await waitFor(() => expect(client.isFetching()).toBe(0))
-  }
+  await waitFor(() => expect(client.isFetching()).toBe(0))
+  expect(
+    get.mock.calls.some(([url]) =>
+      String(url).startsWith('/api/option/model_pricing')
+    )
+  ).toBe(false)
   return { ...result, get, router }
 }
 
@@ -209,57 +221,86 @@ afterEach(async () => {
   await i18n.changeLanguage('en')
 })
 
-it('requests channel models and distinguishes catalog policy from availability using compact labels', async () => {
+it('localizes model drawer guidance and rename boundaries when the language changes', async () => {
+  await renderList([metadata])
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: 'catalog-only' }))
+  const input = await screen.findByRole('textbox', { name: /Model Name/ })
+  await user.clear(input)
+  await user.type(input, 'renamed-catalog')
+  await act(() => i18n.changeLanguage('zhCN'))
+  const drawer = screen.getByRole('dialog', { name: 'catalog-only' })
+  expect
+    .soft(drawer)
+    .toHaveTextContent('管理元信息、能力和通道关联。各部分分别保存。')
+  expect
+    .soft(drawer)
+    .toHaveTextContent('重命名元信息不会更改对外模型名称或通道模型名。')
+  expect.soft(drawer).toHaveTextContent('匹配规则仅用于元信息。')
+  await act(() => i18n.changeLanguage('fr'))
+  expect
+    .soft(drawer)
+    .toHaveTextContent(
+      'Gérez les métadonnées, les capacités et les connexions aux canaux. Chaque section est enregistrée séparément.'
+    )
+  expect
+    .soft(drawer)
+    .toHaveTextContent(
+      'Renommer les métadonnées ne modifie ni les noms des Offerings ni les modèles des canaux.'
+    )
+  expect
+    .soft(drawer)
+    .toHaveTextContent(
+      'Les règles de correspondance concernent uniquement les métadonnées.'
+    )
+})
+
+it('requests saved Models and explains exact-ID Channel counts without Offering claims', async () => {
   const { get } = await renderList()
   expect(get).toHaveBeenCalledWith('/api/models/', {
     params: expect.objectContaining({ include_channel_models: true }),
   })
-  expect(screen.getAllByText('Unavailable')).toHaveLength(3)
+  expect(screen.getAllByText('No enabled Channels')).toHaveLength(3)
   const warning = screen
-    .getAllByText('Unavailable')[0]
+    .getAllByText('No enabled Channels')[0]
     .closest('[data-slot="status-badge"]')
   expect(warning).toHaveClass('text-warning')
   expect(warning?.querySelector('svg')).toBeInTheDocument()
   expect(warning).not.toHaveClass('text-success')
-  expect(screen.getAllByText('Missing metadata')).toHaveLength(2)
-  expect(screen.getAllByText('Channels 0 · Groups 0')).toHaveLength(3)
+  expect(screen.queryByText('Missing metadata')).not.toBeInTheDocument()
+  expect(screen.getByText('Configured 0 · Enabled 0')).toBeVisible()
+  expect(screen.getAllByText('Configured 1 · Enabled 0')).toHaveLength(2)
   expect(
-    screen.queryByText(
-      'No channel is configured. This model will not appear in the model square.'
-    )
+    screen.queryByText('No Channel is configured for this Model ID.')
   ).not.toBeInTheDocument()
   const user = userEvent.setup()
   const trigger = screen.getAllByRole('button', {
-    name: 'Unavailable',
+    name: 'No enabled Channels',
   })[0]
   expect(trigger).toHaveAttribute(
     'title',
-    'No channel is configured. This model will not appear in the model square.'
+    'No Channel is configured for this Model ID.'
   )
   await user.click(trigger)
   expect(
-    await screen.findByRole('dialog', { name: 'Unavailable' })
-  ).toHaveTextContent(
-    'No channel is configured. This model will not appear in the model square.'
-  )
+    await screen.findByRole('dialog', { name: 'No enabled Channels' })
+  ).toHaveTextContent('No Channel is configured for this Model ID.')
   expect(trigger).toHaveAttribute('aria-expanded', 'true')
   await user.keyboard('{Escape}')
   await waitFor(() =>
     expect(
-      screen.queryByRole('dialog', { name: 'Unavailable' })
+      screen.queryByRole('dialog', { name: 'No enabled Channels' })
     ).not.toBeInTheDocument()
   )
   expect(trigger).toHaveFocus()
   await user.click(screen.getByRole('button', { name: 'catalog-only' }))
-  await user.click(screen.getByRole('tab', { name: 'Channels and groups' }))
+  await user.click(screen.getByRole('tab', { name: 'Channels' }))
   expect(
-    screen.getByText(
-      'No channel is configured. This model will not appear in the model square.'
-    )
+    screen.getByText('No Channel is configured for this Model ID.')
   ).toBeVisible()
 })
 
-it('keeps channel rows individually selectable and disables metadata mutations for mixed selection', async () => {
+it('keeps stable Model IDs individually selectable and preserves metadata-only bulk mutations', async () => {
   await renderList()
   const user = userEvent.setup()
   await user.click(
@@ -281,11 +322,11 @@ it('keeps channel rows individually selectable and disables metadata mutations f
   for (const name of [
     'Change vendor',
     'Clear vendor',
-    'Show selected models in model square',
-    'Hide selected models from model square',
+    'Enable selected Model metadata',
+    'Disable selected Model metadata',
     'Delete selected models',
   ]) {
-    expect(within(toolbar).getByRole('button', { name })).toBeDisabled()
+    expect(within(toolbar).getByRole('button', { name })).toBeEnabled()
   }
   expect(
     within(toolbar).getByRole('button', { name: 'Copy model names' })
@@ -306,14 +347,14 @@ it('keeps long model names and translated channel labels truncated inside their 
     { ...metadata, status: 0, square_state: 'hidden' },
   ])
   expect(screen.getByText(longName)).toHaveClass('truncate')
-  expect(screen.getByText('Add metadata')).toHaveClass('truncate')
+  expect(screen.queryByText('Add metadata')).not.toBeInTheDocument()
   await act(async () => {
     await i18n.changeLanguage('fr')
   })
   const label = screen.getAllByText(
-    i18n.t('Channels {{channels}} · Groups {{groups}}', {
-      channels: 0,
-      groups: 0,
+    i18n.t('Configured {{configured}} · Enabled {{enabled}}', {
+      configured: 0,
+      enabled: 0,
     })
   )[0]
   expect(label).toHaveClass('whitespace-normal', 'sm:truncate')
@@ -321,191 +362,242 @@ it('keeps long model names and translated channel labels truncated inside their 
   await act(async () => {
     await i18n.changeLanguage('zhCN')
   })
-  expect(screen.getByText('缺元数据')).toBeVisible()
-  expect(screen.getByText('已隐藏')).toBeVisible()
-  expect(screen.getAllByText('渠道 0 · 分组 0')).toHaveLength(2)
+  expect(screen.getByText(i18n.t('Metadata disabled'))).toBeVisible()
+  expect(
+    screen.getByText(
+      i18n.t('Configured {{configured}} · Enabled {{enabled}}', {
+        configured: 1,
+        enabled: 0,
+      })
+    )
+  ).toBeVisible()
 })
 
-it('prefills and creates metadata only when the user explicitly saves it', async () => {
+const missingModelsRetiredMessage =
+  'Legacy missing-model discovery has been retired. Use Models and metadata sync.'
+
+it.each([
+  ['en', en, missingModelsRetiredMessage],
+  ['zh', zhCN, '旧版缺失模型发现已退役。请使用模型管理和元数据同步。'],
+  ['zh-TW', zhTW, '舊版缺失模型探索已退役。請使用模型管理與中繼資料同步。'],
+  [
+    'fr',
+    fr,
+    'L’ancienne détection des modèles manquants a été retirée. Utilisez la gestion des modèles et la synchronisation des métadonnées.',
+  ],
+  [
+    'ru',
+    ru,
+    'Устаревший поиск отсутствующих моделей выведен из эксплуатации. Используйте управление моделями и синхронизацию метаданных.',
+  ],
+  [
+    'ja',
+    ja,
+    '旧式の不足モデル検出は廃止されました。モデル管理とメタデータ同期を使用してください。',
+  ],
+  [
+    'vi',
+    viLocale,
+    'Cơ chế phát hiện mô hình còn thiếu cũ đã ngừng hoạt động. Hãy sử dụng quản lý mô hình và đồng bộ siêu dữ liệu.',
+  ],
+] as const)(
+  'localizes the retired discovery HTTP response in %s',
+  async (language, resource, expected) => {
+    i18n.addResourceBundle(
+      language,
+      'translation',
+      resource.translation,
+      true,
+      true
+    )
+    await i18n.changeLanguage(language)
+    expect(
+      getServerErrorMessage({
+        response: {
+          status: 410,
+          headers: { 'cache-control': 'no-store' },
+          data: {
+            success: false,
+            code: 'legacy_missing_models_retired',
+            message: missingModelsRetiredMessage,
+            message_key: missingModelsRetiredMessage,
+          },
+        },
+      })
+    ).toBe(expected)
+  }
+)
+
+it('removes missing-model discovery from the menu while preserving model, tag and endpoint presets', async () => {
+  const { get } = await renderList([channel], {
+    prefillGroups: [
+      { id: 1, name: 'Model preset', type: 'model', items: ['channel-only'] },
+      { id: 2, name: 'Tag preset', type: 'tag', items: ['tag-value'] },
+      { id: 3, name: 'Endpoint preset', type: 'endpoint', items: ['openai'] },
+    ],
+  })
+  const user = userEvent.setup()
+  await user.click(screen.getAllByRole('button', { name: 'Open menu' })[0])
+  expect(
+    screen.queryByRole('menuitem', { name: 'Missing Models' })
+  ).not.toBeInTheDocument()
+  await user.click(screen.getByRole('menuitem', { name: 'Prefill Groups' }))
+  const dialog = await screen.findByRole('dialog', {
+    name: 'Prefill Group Management',
+  })
+  for (const name of ['Model preset', 'Tag preset', 'Endpoint preset']) {
+    expect(await within(dialog).findByText(name)).toBeVisible()
+  }
+  expect(within(dialog).getByText('channel-only')).toBeVisible()
+  expect(within(dialog).getByText('tag-value')).toBeVisible()
+  expect(within(dialog).getByText('openai')).toBeVisible()
+  expect(get).toHaveBeenCalledWith('/api/prefill_group', {
+    params: undefined,
+  })
+  expect(get.mock.calls.some(([url]) => url === '/api/models/missing')).toBe(
+    false
+  )
+})
+
+it('creates metadata only after an explicit Add Model and Save action', async () => {
   await renderList([channel])
   const post = vi.spyOn(api, 'post').mockResolvedValue({
     data: { success: true, data: { ...channel, id: 9, has_metadata: true } },
   })
   const user = userEvent.setup()
-  await user.click(screen.getByRole('button', { name: 'Add metadata' }))
-  expect(screen.getByRole('textbox', { name: 'Model Name *' })).toHaveValue(
-    'channel-only'
-  )
+  await user.click(screen.getByRole('button', { name: 'Add Model' }))
+  const name = screen.getByRole('textbox', { name: 'Model Name *' })
+  expect(name).toHaveValue('')
+  await user.type(name, 'new-metadata')
   expect(post).not.toHaveBeenCalled()
   await user.click(screen.getByRole('button', { name: 'Save metadata' }))
   await waitFor(() =>
     expect(post).toHaveBeenCalledWith(
       '/api/models/',
-      expect.objectContaining({ model_name: 'channel-only' }),
+      expect.objectContaining({ model_name: 'new-metadata' }),
       expect.anything()
     )
   )
 })
 
-it('keeps prices and channel explanations readable in the mobile card and detail drawer', async () => {
+it('keeps native Offering prices and channel explanations readable on mobile without model-name pricing', async () => {
   const originalMatchMedia = window.matchMedia
   vi.spyOn(window, 'matchMedia').mockImplementation((query) => ({
     ...originalMatchMedia(query),
     matches: query === '(max-width: 640px)',
   }))
-  await renderList([metadata], {
-    pricing: [
-      {
-        model_name: metadata.model_name,
-        version: 'v1',
-        configured: {},
-        effective: { ModelRatio: 0.625, CompletionRatio: 8 },
-      },
-    ],
-  })
-  const price = screen.getByRole('button', {
-    name: 'View pricing for catalog-only',
-  })
-  expect(within(price).getByText('1.25')).toHaveClass('whitespace-normal')
-  expect(within(price).getByText('USD / 1M tokens')).toHaveClass(
-    'whitespace-normal'
+  await renderList([metadata])
+  expect(
+    screen.queryByRole('columnheader', { name: 'Pricing' })
+  ).not.toBeInTheDocument()
+  const nativePrice = saleOffering('tier("base", p * 1.25 + c * 10)')
+  render(<OfferingPrice offering={nativePrice} tokenUnit='M' />)
+  expect(screen.getByText('p: 1.25 EUR / 1M tokens')).toHaveClass('break-all')
+  expect(screen.getByLabelText('Complete price expression')).toHaveClass(
+    'min-w-0',
+    'overflow-x-auto',
+    'whitespace-pre-wrap',
+    'break-all'
   )
-  expect(screen.getByText('Channels 0 · Groups 0')).toHaveClass(
+  expect(screen.getByText('Configured 0 · Enabled 0')).toHaveClass(
     'whitespace-normal'
   )
   const user = userEvent.setup()
   await user.click(screen.getByRole('button', { name: 'catalog-only' }))
-  await user.click(screen.getByRole('tab', { name: 'Channels and groups' }))
+  await user.click(screen.getByRole('tab', { name: 'Channels' }))
   expect(
-    screen.getByText(
-      'No channel is configured. This model will not appear in the model square.'
-    )
+    screen.getByText('No Channel is configured for this Model ID.')
   ).toBeVisible()
 })
 
-it('uses backend square states for success, warning, hidden, and partial rows including models without metadata', async () => {
-  const activeChannels = [{ name: 'Active', type: 1 }]
+it('explains real Channel counts and metadata status without turning them into Offering visibility', async () => {
   await renderList([
-    { ...metadata, model_name: 'catalog-only' },
+    metadata,
     {
       ...metadata,
       id: 8,
       model_name: 'enabled-model',
-      square_state: 'visible',
       configured_channel_count: 1,
-      bound_channels: activeChannels,
+      enabled_channel_count: 1,
     },
     {
       ...metadata,
       id: 9,
-      model_name: 'hidden-model',
+      model_name: 'disabled-model',
       status: 0,
-      square_state: 'hidden',
       configured_channel_count: 1,
-      bound_channels: activeChannels,
+      enabled_channel_count: 1,
+    },
+    { ...metadata, id: 10, model_name: 'metadata-rule', name_rule: 1 },
+    {
+      ...metadata,
+      id: 11,
+      model_name: 'pending-model',
+      configured_channel_count: 2,
+      enabled_channel_count: 0,
     },
     {
       ...metadata,
-      id: 10,
-      model_name: 'partial-rule-',
-      name_rule: 1,
-      square_state: 'partial',
-      configured_channel_count: 2,
-      bound_channels: activeChannels,
-    },
-    {
-      ...channel,
-      model_name: 'bare-visible',
-      square_state: 'visible',
-      bound_channels: activeChannels,
-    },
-    {
-      ...channel,
-      model_name: 'bare-hidden-by-rule',
-      square_state: 'hidden',
-      bound_channels: activeChannels,
+      id: 12,
+      model_name: 'unknown-counts',
+      configured_channel_count: undefined,
+      enabled_channel_count: undefined,
     },
   ])
-  expect(screen.getByRole('button', { name: 'Display policy' })).toBeVisible()
-  for (const label of ['Unavailable', 'Partly shown']) {
-    const badge = screen.getByText(label).closest('[data-slot="status-badge"]')
+  expect(screen.getByRole('button', { name: 'Metadata status' })).toBeVisible()
+  for (const label of screen.getAllByText('No enabled Channels')) {
+    const badge = label.closest('[data-slot="status-badge"]')
     expect(badge).toHaveClass('text-warning')
     expect(badge?.querySelector('svg')).toBeInTheDocument()
     expect(badge).not.toHaveClass('text-success')
   }
-  const displayed = screen.getAllByText('Displayed')
-  expect(displayed).toHaveLength(2)
-  for (const label of displayed) {
-    expect(label.closest('[data-slot="status-badge"]')).toHaveClass(
-      'text-success'
-    )
-  }
-  const hidden = screen.getAllByText('Listing hidden')
-  expect(hidden).toHaveLength(2)
-  for (const label of hidden) {
-    expect(label.closest('[data-slot="status-badge"]')).toHaveClass(
-      'text-muted-foreground'
-    )
-  }
-  await act(async () => {
-    await i18n.changeLanguage('zhCN')
-  })
-  expect(screen.getByText('无法展示')).toBeVisible()
-  expect(screen.getByText('部分展示')).toBeVisible()
-  expect(screen.getAllByText('正常展示')).toHaveLength(2)
-  expect(screen.getAllByText('已隐藏')).toHaveLength(2)
-  for (const label of ['无法展示', '部分展示']) {
-    expect(screen.getByText(label)).toHaveClass('truncate')
-  }
+  expect(
+    screen.getByText('Enabled Channels').closest('[data-slot="status-badge"]')
+  ).toHaveClass('text-success')
+  expect(
+    screen.getByText('Metadata disabled').closest('[data-slot="status-badge"]')
+  ).toHaveClass('text-muted-foreground')
+  expect(screen.getByText('Metadata rule')).toBeVisible()
+  expect(screen.queryByText('Partly shown')).not.toBeInTheDocument()
+  const unknown = screen
+    .getByRole('button', { name: 'unknown-counts' })
+    .closest('tr')
+  expect(unknown).not.toHaveTextContent('Configured 0')
+  expect(unknown).not.toHaveTextContent('No enabled Channels')
 })
-
-it.each(['{Enter}', ' '])(
-  'opens the reason with %s and returns focus to the status after Escape',
-  async (key) => {
-    await renderList([metadata])
-    const user = userEvent.setup()
-    const trigger = screen.getByRole('button', {
-      name: 'Unavailable',
-    })
-    act(() => trigger.focus())
-    await user.keyboard(key)
-    expect(
-      await screen.findByRole('dialog', { name: 'Unavailable' })
-    ).toHaveTextContent('No channel is configured.')
-    await user.keyboard('{Escape}')
-    await waitFor(() =>
-      expect(trigger).toHaveAttribute('aria-expanded', 'false')
-    )
-    expect(trigger).toHaveFocus()
-  }
-)
 
 it('opens the warning icon’s own model reason and closes it on an outside click without selecting the row', async () => {
   await renderList([metadata, channel])
   const user = userEvent.setup()
   const triggers = screen.getAllByRole('button', {
-    name: 'Unavailable',
+    name: 'No enabled Channels',
   })
   const icon = triggers[1].querySelector('svg')
   expect(icon).not.toBeNull()
   await user.click(icon as SVGElement)
-  const popup = await screen.findByRole('dialog', { name: 'Unavailable' })
-  expect(popup).toHaveTextContent('No channel is currently available.')
-  expect(popup).not.toHaveTextContent('No channel is configured.')
+  const popup = await screen.findByRole('dialog', {
+    name: 'No enabled Channels',
+  })
+  expect(popup).toHaveTextContent(
+    'No Channel has an enabled Provider and a confirmed, enabled mapping for this Model ID.'
+  )
+  expect(popup).not.toHaveTextContent(
+    'No Channel is configured for this Model ID.'
+  )
   expect(
     screen.getByRole('checkbox', { name: 'Select channel-only' })
   ).not.toBeChecked()
   await user.click(screen.getByPlaceholderText('Filter by model name...'))
   await waitFor(() =>
     expect(
-      screen.queryByRole('dialog', { name: 'Unavailable' })
+      screen.queryByRole('dialog', { name: 'No enabled Channels' })
     ).not.toBeInTheDocument()
   )
   expect(triggers[1]).toHaveAttribute('aria-expanded', 'false')
   await user.click(triggers[0])
   expect(
-    await screen.findByRole('dialog', { name: 'Unavailable' })
-  ).toHaveTextContent('No channel is configured.')
+    await screen.findByRole('dialog', { name: 'No enabled Channels' })
+  ).toHaveTextContent('No Channel is configured for this Model ID.')
 })
 
 it('opens a long translated reason by touch in the mobile card without requiring the detail drawer', async () => {
@@ -520,19 +612,17 @@ it('opens a long translated reason by touch in the mobile card without requiring
   })
   const user = userEvent.setup()
   const trigger = screen.getByRole('button', {
-    name: i18n.t('Unavailable'),
+    name: i18n.t('No enabled Channels'),
   })
   await user.pointer([
     { keys: '[TouchA>]', target: trigger },
     { keys: '[/TouchA]' },
   ])
   const popup = await screen.findByRole('dialog', {
-    name: i18n.t('Unavailable'),
+    name: i18n.t('No enabled Channels'),
   })
   expect(popup).toHaveTextContent(
-    i18n.t(
-      'No channel is configured. This model will not appear in the model square.'
-    )
+    i18n.t('No Channel is configured for this Model ID.')
   )
   expect(popup).toHaveClass('whitespace-normal', 'break-words')
   expect(popup).toHaveClass('max-w-[calc(100vw-2rem)]')
@@ -543,94 +633,58 @@ it('opens a long translated reason by touch in the mobile card without requiring
 
 it.each([
   {
-    name: 'legacy',
-    effective: { ModelRatio: 1.5, CompletionRatio: 5, CacheRatio: 0.1 },
-    catalog: { model_ratio: 1.5, completion_ratio: 5 },
-    text: 'Input3Output15',
+    name: 'migrated-token-price',
+    expression: 'tier("base", p * 3 + c * 15)',
+    summary: 'p: 3 EUR / 1M tokens',
   },
   {
     name: 'single-expression',
-    effective: {
-      'billing_setting.billing_mode': 'tiered_expr',
-      'billing_setting.billing_expr': 'tier("base", p * 3 + c * 15 + cr * 0.3)',
-    },
-    catalog: {
-      billing_mode: 'tiered_expr',
-      billing_expr: 'tier("base", p * 3 + c * 15 + cr * 0.3)',
-    },
-    text: 'Input3Output15',
+    expression: 'tier("base", p * 3 + c * 15 + cr * 0.3)',
+    summary: 'cr: 0.3 EUR / 1M tokens',
   },
   {
     name: 'tier-expression',
-    effective: {
-      'billing_setting.billing_mode': 'tiered_expr',
-      'billing_setting.billing_expr':
-        'len <= 200000 ? tier("standard", p * 3 + c * 15) : tier("long", p * 6 + c * 22.5)',
-    },
-    catalog: {
-      billing_mode: 'tiered_expr',
-      billing_expr:
-        'len <= 200000 ? tier("standard", p * 3 + c * 15) : tier("long", p * 6 + c * 22.5)',
-    },
-    text: 'Input3Output15',
+    expression:
+      'len <= 200000 ? tier("standard", p * 3 + c * 15) : tier("long", p * 6 + c * 22.5)',
+    summary: null,
   },
   {
     name: 'free-request',
-    effective: { ModelPrice: 0 },
-    catalog: { quota_type: 1, model_price: 0 },
-    text: 'Per-request0USD/request',
+    expression: 'tier("free", fixed(0))',
+    summary: '0 EUR / request',
   },
   {
     name: 'free-tokens',
-    effective: { ModelRatio: 0, CompletionRatio: 2 },
-    catalog: { model_ratio: 0, completion_ratio: 2 },
-    text: 'Input0Output0',
+    expression: 'tier("base", p * 0 + c * 0)',
+    summary: 'p: 0 EUR / 1M tokens',
   },
   {
     name: 'free-expression',
-    effective: {
-      'billing_setting.billing_mode': 'tiered_expr',
-      'billing_setting.billing_expr': 'tier("free", p * 0 + c * 0)',
-    },
-    catalog: {
-      billing_mode: 'tiered_expr',
-      billing_expr: 'tier("free", p * 0 + c * 0)',
-    },
-    text: 'Input0Output0',
+    expression: 'tier("free", p * 0 + c * 0)',
+    summary: 'c: 0 EUR / 1M tokens',
   },
 ])(
-  'shows $name effective pricing like the catalog without requiring a listed model',
-  async ({ name, effective, catalog, text }) => {
-    const model = { ...channel, model_name: name }
-    await renderList([model], {
-      pricing: [{ model_name: name, version: 'v1', configured: {}, effective }],
-    })
-    const button = screen.getByRole('button', {
-      name: `View pricing for ${name}`,
-    })
-    expect(button.textContent?.replaceAll(/\s/g, '')).toContain(text)
-    expect(button).not.toHaveTextContent('Unset price')
-    expect(button).not.toHaveTextContent('Cache')
-    render(
-      <CatalogPrice
-        model={{
-          id: 1,
-          model_name: name,
-          quota_type: 0,
-          model_ratio: 0,
-          completion_ratio: 0,
-          enable_groups: [],
-          ...catalog,
-        }}
-      />
+  'shows $name as an immutable native-currency Offering price without model metadata or legacy ratios',
+  async ({ expression, summary }) => {
+    const get = await renderSaleCatalog(saleOffering(expression))
+    expect(
+      await screen.findByLabelText('Complete price expression')
+    ).toHaveTextContent(expression)
+    if (summary) expect(screen.getByText(summary)).toBeVisible()
+    expect(screen.queryByText('No current sale price')).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'sale-offering' }))
+    const detail = within(
+      await screen.findByRole('dialog', { name: 'sale-offering' })
     )
-    expect(button.textContent).toBe(
-      screen.getByRole('group', { name: 'Catalog price' }).textContent
-    )
+    expect(
+      detail.getByLabelText('Complete price expression')
+    ).toHaveTextContent(expression)
+    if (summary) expect(detail.getByText(summary)).toBeVisible()
+    expect(get.mock.calls.every(([url]) => url === '/api/pricing')).toBe(true)
   }
 )
 
-it('shows task tier ranges in the schema unit and converts site currency only once', async () => {
+it('preserves task tiers and usage variables in their native currency without site FX or per-million conversion', async () => {
   useSystemConfigStore.getState().setConfig({
     currency: {
       ...DEFAULT_CURRENCY_CONFIG,
@@ -640,124 +694,104 @@ it('shows task tier ranges in the schema unit and converts site currency only on
   })
   const expression =
     'u("mode") == "pro" ? tier("pro", u("seconds") * 0.8) : tier("std", u("seconds") * 0.4)'
-  const schema = {
-    seconds: { type: 'number' as const, unit: 'second' as const },
-    mode: { enum: ['std', 'pro'] },
-  }
-  await renderList([channel], {
-    pricing: [
-      {
-        model_name: channel.model_name,
-        version: 'v1',
-        configured: {},
-        effective: {
-          'billing_setting.billing_mode': 'tiered_expr',
-          'billing_setting.billing_expr': expression,
-        },
-        usage_schema: schema,
-      },
-    ],
-  })
-  const button = screen.getByRole('button', {
-    name: 'View pricing for channel-only',
-  })
-  expect(button).toHaveTextContent(/2.8.*5.6/)
-  expect(button).toHaveTextContent('/s')
-  expect(button).toHaveTextContent('CNY')
-  expect(button).not.toHaveTextContent('¥')
-  expect(button).not.toHaveTextContent('1M tokens')
+  await renderSaleCatalog(saleOffering(expression))
+  expect(
+    await screen.findByLabelText('Complete price expression')
+  ).toHaveTextContent(expression)
+  expect(screen.getByText('EUR', { exact: true })).toBeVisible()
+  expect(screen.queryByText(/2\.8.*5\.6/)).not.toBeInTheDocument()
+  expect(screen.queryByText('CNY')).not.toBeInTheDocument()
+  expect(
+    screen.getByText(
+      'Token coefficients are per 1M tokens; fixed() is per request; expressions using u() return amounts in the expression currency.'
+    )
+  ).toBeVisible()
 })
 
-it('opens the effective expression breakdown from the price without creating metadata', async () => {
+it('opens the complete conditional and request expression without creating model metadata', async () => {
   const expression =
     '(len <= 200000 ? tier("standard", p * 3 + c * 15 + cr * 0.3) : tier("long", p * 6 + c * 22.5 + cr * 0.6)) * (header("x-priority") == "high" ? 2 : 1)'
-  await renderList([channel], {
-    pricing: [
-      {
-        model_name: channel.model_name,
-        version: 'v1',
-        configured: {},
-        effective: {
-          'billing_setting.billing_mode': 'tiered_expr',
-          'billing_setting.billing_expr': expression,
-        },
-      },
-    ],
-  })
+  await renderSaleCatalog(saleOffering(expression))
   const write = vi.spyOn(api, 'post')
   await userEvent.click(
-    screen.getByRole('button', { name: 'View pricing for channel-only' })
+    await screen.findByRole('button', { name: 'sale-offering' })
   )
-  const preview = await screen.findByRole('region', { name: 'Current Billing' })
-  expect(preview).toHaveTextContent('standard')
-  expect(preview).toHaveTextContent('long')
-  expect(preview).toHaveTextContent('0.3')
-  expect(preview).toHaveTextContent('0.6')
-  expect(preview).toHaveTextContent('x-priority')
+  const detail = within(
+    await screen.findByRole('dialog', { name: 'sale-offering' })
+  )
+  expect(detail.getByLabelText('Complete price expression')).toHaveTextContent(
+    expression
+  )
+  for (const fragment of ['standard', 'long', '0.3', '0.6', 'x-priority']) {
+    expect(
+      detail.getByLabelText('Complete price expression')
+    ).toHaveTextContent(fragment)
+  }
   expect(write).not.toHaveBeenCalled()
 })
 
-it('shows an unrecognized expression as special and retains its full source in pricing details', async () => {
+it('keeps an unrecognized expression complete rather than extracting a partial sale price', async () => {
   const expression = 'tier("custom", max(p * 2 + c * 8, 100))'
-  await renderList([channel], {
-    pricing: [
-      {
-        model_name: channel.model_name,
-        version: 'v1',
-        configured: {},
-        effective: {
-          'billing_setting.billing_mode': 'tiered_expr',
-          'billing_setting.billing_expr': expression,
-        },
-      },
-    ],
-  })
-  const button = screen.getByRole('button', {
-    name: 'View pricing for channel-only',
-  })
-  expect(button).toHaveTextContent('Special billing expression')
-  expect(button).not.toHaveTextContent('$2')
-  expect(button).not.toHaveTextContent(expression)
-  await userEvent.click(button)
-  const preview = await screen.findByRole('region', { name: 'Current Billing' })
-  expect(preview).toHaveTextContent(expression)
+  await renderSaleCatalog(saleOffering(expression))
+  expect(
+    await screen.findByLabelText('Complete price expression')
+  ).toHaveTextContent(expression)
+  expect(screen.queryByText('p: 2 EUR / 1M tokens')).not.toBeInTheDocument()
+  await userEvent.click(screen.getByRole('button', { name: 'sale-offering' }))
+  expect(
+    within(
+      await screen.findByRole('dialog', { name: 'sale-offering' })
+    ).getByLabelText('Complete price expression')
+  ).toHaveTextContent(expression)
 })
 
-it('distinguishes pending and failed pricing requests from an unset price', async () => {
+it('distinguishes a pending or failed catalog from a successfully loaded missing price and allows retry', async () => {
   let rejectPricing: (reason: Error) => void = () => {}
-  const pricing = new Promise<ModelPricingConfig>((_resolve, reject) => {
+  const pending = new Promise<CatalogOffering>((_resolve, reject) => {
     rejectPricing = reject
   })
-  await renderList([channel], { pricing, waitForPricing: false })
-  expect(screen.getByText('Loading...')).toBeVisible()
-  expect(screen.queryByText('Unset price')).not.toBeInTheDocument()
+  const get = await renderSaleCatalog(pending)
+  expect(screen.getByRole('status', { name: 'Loading...' })).toBeVisible()
+  expect(screen.queryByText('No current sale price')).not.toBeInTheDocument()
   await act(async () => rejectPricing(new Error('pricing unavailable')))
-  expect(await screen.findByText('Failed to load model pricing')).toBeVisible()
-  expect(screen.queryByText('Unset price')).not.toBeInTheDocument()
+  expect(
+    await screen.findByText('Unable to load Offering prices')
+  ).toBeVisible()
+  expect(screen.queryByText('No current sale price')).not.toBeInTheDocument()
+  get.mockResolvedValue({
+    data: {
+      success: true,
+      data: [{ ...saleOffering('fixed(0)'), price: null }],
+      as_of: 101,
+    },
+  })
+  await userEvent.click(screen.getByRole('button', { name: 'Retry' }))
+  expect(await screen.findByText('No current sale price')).toBeVisible()
+  expect(screen.queryByText('0 EUR / request')).not.toBeInTheDocument()
 })
 
-it('filters actual visibility independently of policy and restores filters through browser history', async () => {
+it('filters Channel status independently of metadata status and restores filters through browser history', async () => {
   const { get, router } = await renderList([channel], {
     initialUrl: '/models/metadata?page=3&status=%5B%22enabled%22%5D',
     total: 100,
   })
   const user = userEvent.setup()
   await user.click(
-    screen.getByRole('button', { name: 'Model square visibility' })
+    screen.getByRole('button', { name: 'Metadata and Channel status' })
   )
-  await user.click(screen.getByRole('option', { name: 'Partly shown' }))
+  await user.click(screen.getByRole('option', { name: 'Enabled Channels' }))
   await waitFor(() =>
     expect(get).toHaveBeenCalledWith('/api/models/search', {
       params: expect.objectContaining({
         status: 'enabled',
-        square_state: 'partial',
+        square_state: 'visible',
         p: 1,
       }),
     })
   )
   expect(router.state.location.search).toMatchObject({
     status: ['enabled'],
-    square_state: ['partial'],
+    square_state: ['visible'],
   })
   await user.keyboard('{Escape}')
   await act(async () => {
@@ -771,11 +805,11 @@ it('filters actual visibility independently of policy and restores filters throu
   })
   await waitFor(() =>
     expect(router.state.location.search).toMatchObject({
-      square_state: ['partial'],
+      square_state: ['visible'],
     })
   )
   await user.click(
-    screen.getByRole('button', { name: /Model square visibility/ })
+    screen.getByRole('button', { name: /Metadata and Channel status/ })
   )
   await user.click(screen.getByRole('option', { name: 'Clear filters' }))
   await waitFor(() =>
@@ -789,11 +823,11 @@ it('keeps all columns while collapsing tags and connection counts', async () => 
     {
       ...channel,
       tags: 'Tools,Files,Vision',
-      bound_channels: [{ name: 'Main', type: 1 }],
-      enable_groups: ['default', 'premium'],
+      configured_channel_count: 2,
+      enabled_channel_count: 1,
     },
   ])
-  expect(screen.getByText('Channels 1 · Groups 2')).toBeVisible()
+  expect(screen.getByText('Configured 2 · Enabled 1')).toBeVisible()
   expect(
     screen.getByRole('columnheader', { name: 'Sync policy' })
   ).toBeVisible()
@@ -812,46 +846,36 @@ it('keeps an active visibility filter when its server result is empty', async ()
   expect(screen.getByText('No Models Found')).toBeVisible()
   expect(screen.getByText('Try adjusting your search')).toBeVisible()
   expect(
-    screen.getByRole('button', { name: /Model square visibility.*Unavailable/ })
+    screen.getByRole('button', {
+      name: /Metadata and Channel status.*No enabled Channels/,
+    })
   ).toBeVisible()
   expect(get).toHaveBeenCalledWith('/api/models/search', {
     params: expect.objectContaining({ square_state: 'unavailable', p: 1 }),
   })
 })
 
-it.each([
-  { type: 'CUSTOM' as const, caption: '🐱 / 1M tokens' },
-  { type: 'TOKENS' as const, caption: 'USD / 1M tokens' },
-])(
-  'uses one currency caption in $type mode without replacing prices with quota counts',
-  async ({ type, caption }) => {
+it.each(['CUSTOM', 'TOKENS'] as const)(
+  'keeps the PriceVersion currency and exact token prices in %s site display mode',
+  async (type) => {
     useSystemConfigStore.getState().setConfig({
       currency: {
         ...DEFAULT_CURRENCY_CONFIG,
         quotaDisplayType: type,
-        customCurrencySymbol: '🐱',
-        customCurrencyExchangeRate: 1,
+        customCurrencySymbol: 'CAT',
+        customCurrencyExchangeRate: 7,
       },
     })
-    await renderList([channel], {
-      pricing: [
-        {
-          model_name: channel.model_name,
-          version: 'v1',
-          configured: {},
-          effective: { ModelRatio: 0.25, CompletionRatio: 2 },
-        },
-      ],
-    })
-    const button = screen.getByRole('button', {
-      name: 'View pricing for channel-only',
-    })
-    expect(button.textContent?.replaceAll(/\s/g, '')).toContain(
-      'Input0.5Output1'
-    )
-    expect(within(button).getByText(caption)).toBeVisible()
-    if (type === 'CUSTOM') {
-      expect(button.textContent?.match(/🐱/g)).toHaveLength(1)
-    }
+    const expression = 'tier("base", p * 0.100000000000000001 + c * 1)'
+    await renderSaleCatalog(saleOffering(expression))
+    expect(
+      await screen.findByText('p: 0.100000000000000001 EUR / 1M tokens')
+    ).toBeVisible()
+    expect(screen.getByText('c: 1 EUR / 1M tokens')).toBeVisible()
+    expect(
+      screen.getByLabelText('Complete price expression')
+    ).toHaveTextContent(expression)
+    expect(screen.queryByText('CAT')).not.toBeInTheDocument()
+    expect(screen.queryByText('USD')).not.toBeInTheDocument()
   }
 )

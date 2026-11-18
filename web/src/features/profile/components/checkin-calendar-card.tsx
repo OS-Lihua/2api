@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   CalendarDays,
   ChevronDown,
@@ -30,6 +30,7 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { Dialog } from '@/components/dialog'
+import { ErrorState } from '@/components/error-state'
 import { Turnstile } from '@/components/turnstile'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -41,14 +42,19 @@ import {
   TooltipTrigger,
   TooltipProvider,
 } from '@/components/ui/tooltip'
-import { formatQuotaWithCurrency } from '@/lib/currency'
+import { toIntlLocale } from '@/i18n/languages'
+import { formatMoneyAmount, type MoneyAmount } from '@/lib/currency'
 import dayjs from '@/lib/dayjs'
+import { formatNumber } from '@/lib/format'
 import { handleServerError } from '@/lib/handle-server-error'
-import { createServerError } from '@/lib/server-error-message'
+import {
+  createServerError,
+  getServerErrorMessage,
+} from '@/lib/server-error-message'
 import { cn } from '@/lib/utils'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { getCheckinStatus, performCheckin } from '../api'
-import type { CheckinRecord } from '../types'
 
 interface CheckinCalendarCardProps {
   checkinEnabled: boolean
@@ -56,12 +62,21 @@ interface CheckinCalendarCardProps {
   turnstileSiteKey: string
 }
 
-export function CheckinCalendarCard({
+export function CheckinCalendarCard(props: CheckinCalendarCardProps) {
+  const userId = useAuthStore((state) => state.auth.user?.id)
+  if (!props.checkinEnabled || !userId) return null
+  return <CheckinCalendarContent key={userId} {...props} userId={userId} />
+}
+
+function CheckinCalendarContent({
   checkinEnabled,
   turnstileEnabled,
   turnstileSiteKey,
-}: CheckinCalendarCardProps) {
-  const { t } = useTranslation()
+  userId,
+}: CheckinCalendarCardProps & { userId: number }) {
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
+  const client = useQueryClient()
   const [currentMonth, setCurrentMonth] = useState(() => {
     const now = new Date()
     return new Date(now.getFullYear(), now.getMonth(), 1)
@@ -79,15 +94,16 @@ export function CheckinCalendarCard({
   }, [currentMonth])
 
   // Fetch checkin status
-  /* eslint-disable @tanstack/query/exhaustive-deps */
   const {
     data: checkinData,
     isLoading,
+    isError,
+    error,
     refetch,
   } = useQuery({
-    queryKey: ['checkin-status', currentMonthStr],
-    queryFn: async () => {
-      const res = await getCheckinStatus(currentMonthStr)
+    queryKey: ['checkin-status', userId, currentMonthStr],
+    queryFn: async ({ signal }) => {
+      const res = await getCheckinStatus(currentMonthStr, signal)
       if (res.success && res.data) {
         return res.data
       }
@@ -96,24 +112,28 @@ export function CheckinCalendarCard({
     enabled: checkinEnabled,
     staleTime: 30000,
   })
-  /* eslint-enable @tanstack/query/exhaustive-deps */
-
   const checkinRecordsMap = useMemo(() => {
-    const map: Record<string, number> = {}
-    const records = checkinData?.stats?.records || []
-    records.forEach((record: CheckinRecord) => {
-      map[record.checkin_date] = record.quota_awarded
-    })
+    const map: Record<string, MoneyAmount> = {}
+    for (const record of checkinData?.stats.records ?? []) {
+      map[record.checkin_date] = record.amount
+    }
     return map
-  }, [checkinData?.stats?.records])
+  }, [checkinData?.stats.records])
 
-  const monthlyQuota = useMemo(() => {
-    const records = checkinData?.stats?.records || []
-    return records.reduce(
-      (sum: number, record: CheckinRecord) => sum + (record.quota_awarded || 0),
-      0
-    )
-  }, [checkinData?.stats?.records])
+  const monthlyRewards = useMemo(() => {
+    const totals = new Map<string, bigint>()
+    for (const record of checkinData?.stats.records ?? []) {
+      const amount = record.amount
+      totals.set(
+        amount.currency,
+        (totals.get(amount.currency) ?? 0n) + BigInt(amount.nanos)
+      )
+    }
+    return Array.from(totals, ([currency, nanos]) => ({
+      currency,
+      nanos: nanos.toString(),
+    }))
+  }, [checkinData?.stats.records])
 
   const todayString = useMemo(() => {
     const d = new Date()
@@ -145,11 +165,17 @@ export function CheckinCalendarCard({
       setCheckinLoading(true)
       try {
         const res = await performCheckin(token)
+        if (useAuthStore.getState().auth.user?.id !== userId) return
         if (res.success && res.data) {
           toast.success(
-            `${t('Check-in successful! Received')} ${formatQuotaWithCurrency(res.data.quota_awarded)}`
+            t('Check-in successful! Received {{amount}}', {
+              amount: formatMoneyAmount(res.data.amount, locale),
+            })
           )
-          refetch()
+          void client.invalidateQueries({
+            queryKey: ['checkin-status', userId],
+          })
+          void client.invalidateQueries({ queryKey: ['self-wallet', userId] })
           setTurnstileModalVisible(false)
         } else {
           if (!token && shouldTriggerTurnstile(res.message)) {
@@ -166,12 +192,14 @@ export function CheckinCalendarCard({
           handleServerError(res, t('Check-in failed'))
         }
       } catch (error) {
-        handleServerError(error, t('Check-in failed'))
+        if (useAuthStore.getState().auth.user?.id === userId) {
+          handleServerError(error, t('Check-in failed'))
+        }
       } finally {
         setCheckinLoading(false)
       }
     },
-    [refetch, shouldTriggerTurnstile, t, turnstileSiteKey]
+    [client, locale, shouldTriggerTurnstile, t, turnstileSiteKey, userId]
   )
 
   const handlePrevMonth = () => {
@@ -244,6 +272,18 @@ export function CheckinCalendarCard({
     )
   }
 
+  if (isError) {
+    return (
+      <Card>
+        <ErrorState
+          description={getServerErrorMessage(error)}
+          onRetry={() => void refetch()}
+        />
+      </Card>
+    )
+  }
+  if (!checkinData?.enabled) return null
+
   let checkinButtonLabel = t('Check in now')
   if (checkinLoading) {
     checkinButtonLabel = t('Loading...')
@@ -287,9 +327,11 @@ export function CheckinCalendarCard({
         {/* Header */}
         <div className='border-b p-4 sm:p-6'>
           <div className='flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4'>
-            <button
+            <Button
               type='button'
-              className='flex min-w-0 flex-1 items-start gap-3 rounded-lg text-left whitespace-normal outline-none'
+              variant='ghost'
+              aria-expanded={!collapsed}
+              className='h-auto min-w-0 flex-1 items-start justify-start gap-3 p-0 text-left whitespace-normal'
               onClick={() => setCollapsed((v) => !v)}
             >
               <IconBadge tone='neutral' size='lg' className='sm:size-11'>
@@ -319,11 +361,11 @@ export function CheckinCalendarCard({
                 </div>
                 <p className='text-muted-foreground mt-1 line-clamp-2 text-xs sm:text-sm'>
                   {checkedToday && todayAward !== undefined
-                    ? `${t('Today')} +${formatQuotaWithCurrency(todayAward)}`
-                    : t('Check in daily to receive random quota rewards')}
+                    ? `${t('Today')} ${formatMoneyAmount(todayAward, locale)}`
+                    : t('Check in daily to receive a random reward')}
                 </p>
               </div>
-            </button>
+            </Button>
             <Button
               onClick={() => doCheckin()}
               disabled={checkinLoading || checkedToday}
@@ -338,32 +380,41 @@ export function CheckinCalendarCard({
         {!collapsed ? (
           <>
             {/* Stats */}
-            <div className='grid grid-cols-3 gap-px border-b'>
-              <div className='bg-card p-3 text-center sm:p-5'>
+            <div className='grid grid-cols-1 gap-px border-b sm:grid-cols-3'>
+              <div className='bg-card min-w-0 p-3 text-center sm:p-5'>
                 <div className='text-xl font-semibold tracking-tight tabular-nums sm:text-2xl'>
-                  {checkinData?.stats?.total_checkins || 0}
+                  {formatNumber(checkinData.stats.total_checkins, locale)}
                 </div>
                 <div className='text-muted-foreground mt-0.5 text-[10px] font-medium sm:mt-1 sm:text-xs'>
                   {t('Total check-ins')}
                 </div>
               </div>
-              <div className='bg-card p-3 text-center sm:p-5'>
-                <div className='text-xl font-semibold tracking-tight tabular-nums sm:text-2xl'>
-                  {formatQuotaWithCurrency(monthlyQuota, { digitsLarge: 0 })}
-                </div>
+              <div className='bg-card min-w-0 p-3 text-center sm:p-5'>
+                {monthlyRewards.length === 0 && <div>{t('No rewards')}</div>}
+                {monthlyRewards.map((amount) => (
+                  <div
+                    key={amount.currency}
+                    className='text-xl font-semibold tracking-tight wrap-anywhere tabular-nums sm:text-2xl'
+                  >
+                    {formatMoneyAmount(amount, locale)}
+                  </div>
+                ))}
                 <div className='text-muted-foreground mt-0.5 text-[10px] font-medium sm:mt-1 sm:text-xs'>
                   {t('This month')}
                 </div>
               </div>
-              <div className='bg-card p-3 text-center sm:p-5'>
-                <div className='text-xl font-semibold tracking-tight tabular-nums sm:text-2xl'>
-                  {formatQuotaWithCurrency(
-                    checkinData?.stats?.total_quota || 0,
-                    {
-                      digitsLarge: 0,
-                    }
-                  )}
-                </div>
+              <div className='bg-card min-w-0 p-3 text-center sm:p-5'>
+                {checkinData.stats.total_awarded.length === 0 && (
+                  <div>{t('No rewards')}</div>
+                )}
+                {checkinData.stats.total_awarded.map((amount) => (
+                  <div
+                    key={amount.currency}
+                    className='text-xl font-semibold tracking-tight wrap-anywhere tabular-nums sm:text-2xl'
+                  >
+                    {formatMoneyAmount(amount, locale)}
+                  </div>
+                ))}
                 <div className='text-muted-foreground mt-0.5 text-[10px] font-medium sm:mt-1 sm:text-xs'>
                   {t('Total earned')}
                 </div>
@@ -383,6 +434,7 @@ export function CheckinCalendarCard({
                       variant='ghost'
                       size='icon'
                       className='h-7 w-7 sm:h-8 sm:w-8'
+                      aria-label={t('Previous month')}
                       onClick={handlePrevMonth}
                     >
                       <ChevronLeft className='h-3.5 w-3.5 sm:h-4 sm:w-4' />
@@ -391,6 +443,7 @@ export function CheckinCalendarCard({
                       variant='ghost'
                       size='icon'
                       className='h-7 w-7 sm:h-8 sm:w-8'
+                      aria-label={t('Next month')}
                       onClick={handleNextMonth}
                     >
                       <ChevronRight className='h-3.5 w-3.5 sm:h-4 sm:w-4' />
@@ -418,8 +471,8 @@ export function CheckinCalendarCard({
                       dayObj.date.getDate()
                     ).padStart(2, '0')}`
                     const isToday = dateStr === todayString
-                    const quotaAwarded = checkinRecordsMap[dateStr]
-                    const isCheckedIn = quotaAwarded !== undefined
+                    const rewardAmount = checkinRecordsMap[dateStr]
+                    const isCheckedIn = rewardAmount !== undefined
                     const dayNum = dayObj.date.getDate()
 
                     const dayButton = (
@@ -451,7 +504,7 @@ export function CheckinCalendarCard({
                                 {t('Checked in')}
                               </div>
                               <div className='text-muted-foreground mt-0.5'>
-                                +{formatQuotaWithCurrency(quotaAwarded)}
+                                {formatMoneyAmount(rewardAmount, locale)}
                               </div>
                             </div>
                           </TooltipContent>
@@ -470,9 +523,7 @@ export function CheckinCalendarCard({
 
                 <div className='bg-muted/30 text-muted-foreground rounded-lg border p-3 text-xs'>
                   <ul className='list-disc space-y-1 pl-5'>
-                    <li>
-                      {t('Check in daily to receive random quota rewards')}
-                    </li>
+                    <li>{t('Check in daily to receive a random reward')}</li>
                     <li>
                       {t('Rewards will be added directly to your balance')}
                     </li>

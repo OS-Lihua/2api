@@ -1,7 +1,6 @@
 package controller
 
 import (
-	"bytes"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -37,7 +36,9 @@ func TestMultiKeyEnableRestoresOnlyExhaustedChannels(t *testing.T) {
 	session, err := service.CreateLoginSession(root.Id, service.VerificationMethodPassword, "127.0.0.1", "multi-key-fixture")
 	require.NoError(t, err)
 	engine := gin.New()
-	engine.POST("/api/channel/multi_key/manage", middleware.AdminAuth(), middleware.RequirePermission(authz.ChannelOperate), ManageMultiKeys)
+	engine.POST("/api/admin/v1/providers/:id/keys/:index/disable", middleware.AdminAuth(), middleware.RequirePermission(authz.ChannelOperate), DisableProviderKey)
+	engine.POST("/api/admin/v1/providers/:id/keys/:index/enable", middleware.AdminAuth(), middleware.RequirePermission(authz.ChannelOperate), EnableProviderKey)
+	engine.POST("/api/admin/v1/providers/:id/keys/enable", middleware.AdminAuth(), middleware.RequirePermission(authz.ChannelOperate), EnableAllProviderKeys)
 
 	for _, cacheEnabled := range []bool{false, true} {
 		for _, action := range []string{"enable_key", "enable_all_keys"} {
@@ -71,13 +72,21 @@ func TestMultiKeyEnableRestoresOnlyExhaustedChannels(t *testing.T) {
 								require.NoError(t, model.DisableProviderByTag(tag))
 							}
 						}
-						payload, err := common.Marshal(MultiKeyManageRequest{ChannelId: channel.Id, Action: operation, KeyIndex: common.GetPointer(0)})
-						require.NoError(t, err)
+						path := fmt.Sprintf("/api/admin/v1/providers/%d/keys/0/enable", channel.Id)
+						switch operation {
+						case "disable_key":
+							path = fmt.Sprintf("/api/admin/v1/providers/%d/keys/0/disable", channel.Id)
+						case "enable_all_keys":
+							path = fmt.Sprintf("/api/admin/v1/providers/%d/keys/enable", channel.Id)
+						}
 						recorder := httptest.NewRecorder()
-						request := httptest.NewRequest(http.MethodPost, "/api/channel/multi_key/manage", bytes.NewReader(payload))
+						request := httptest.NewRequest(http.MethodPost, path, nil)
 						request.Header.Set("Content-Type", "application/json")
 						request.Header.Set("Authorization", "Bearer "+session.AccessToken)
 						engine.ServeHTTP(recorder, request)
+						require.Equal(t, http.StatusOK, recorder.Code)
+						assert.NotContains(t, recorder.Body.String(), "key-one")
+						assert.NotContains(t, recorder.Body.String(), "key-two")
 						var result struct {
 							Success bool `json:"success"`
 						}
@@ -90,9 +99,22 @@ func TestMultiKeyEnableRestoresOnlyExhaustedChannels(t *testing.T) {
 					assert.NotContains(t, loaded.ProviderInfo.MultiKeyStatusList, 0)
 					assert.NotContains(t, loaded.ProviderInfo.MultiKeyDisabledReason, 0)
 					assert.NotContains(t, loaded.ProviderInfo.MultiKeyDisabledTime, 0)
-					var ability model.Ability
-					require.NoError(t, database.Where("channel_id = ?", channel.Id).First(&ability).Error)
-					assert.Equal(t, tc.wantStatus == common.ChannelStatusEnabled, ability.Enabled)
+					cached, err := model.CacheGetProvider(channel.Id)
+					require.NoError(t, err)
+					assert.Equal(t, tc.wantStatus, cached.Status)
+					if tc.wantStatus == common.ChannelStatusEnabled {
+						require.NoError(t, cached.ValidateRouteKey(t.Context(), "key-one", 0))
+					} else {
+						require.ErrorIs(t, cached.ValidateRouteKey(t.Context(), "key-one", 0), model.ErrProviderStatusConflict)
+					}
+					if action == "enable_all_keys" && tc.wantStatus == common.ChannelStatusEnabled {
+						require.NoError(t, cached.ValidateRouteKey(t.Context(), "key-two", 1))
+					} else {
+						require.ErrorIs(t, cached.ValidateRouteKey(t.Context(), "key-two", 1), model.ErrProviderStatusConflict)
+					}
+					var abilities int64
+					require.NoError(t, database.Model(&model.Ability{}).Where("channel_id = ?", channel.Id).Count(&abilities).Error)
+					assert.Zero(t, abilities, "Provider key operations must not recreate retired routing rows")
 				})
 			}
 		}

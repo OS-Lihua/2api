@@ -1,6 +1,7 @@
 package common
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/url"
@@ -321,6 +322,14 @@ func (p *SSRFProtection) ValidateResolvedIP(host string, ip net.IP) error {
 
 // ValidateURL 验证URL是否安全
 func (p *SSRFProtection) ValidateURL(urlStr string) error {
+	return p.ValidateURLWithContext(context.Background(), urlStr)
+}
+
+// ValidateURLWithContext keeps DNS policy checks within the caller's lifetime.
+func (p *SSRFProtection) ValidateURLWithContext(ctx context.Context, urlStr string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// 解析URL
 	u, err := url.Parse(urlStr)
 	if err != nil {
@@ -360,9 +369,9 @@ func (p *SSRFProtection) ValidateURL(urlStr string) error {
 	}
 
 	// 解析域名对应IP并检查
-	ips, err := net.LookupIP(host)
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
 	if err != nil {
-		return fmt.Errorf("DNS resolution failed for %s: %v", host, err)
+		return fmt.Errorf("DNS resolution failed for %s: %w", host, err)
 	}
 	for _, ip := range ips {
 		if err := p.ValidateResolvedIP(host, ip); err != nil {
@@ -374,6 +383,13 @@ func (p *SSRFProtection) ValidateURL(urlStr string) error {
 
 // ValidateURLWithFetchSetting 使用FetchSetting配置验证URL
 func ValidateURLWithFetchSetting(urlStr string, enableSSRFProtection, allowPrivateIp bool, domainFilterMode bool, ipFilterMode bool, domainList, ipList, allowedPorts []string, applyIPFilterForDomain bool) error {
+	return ValidateURLWithFetchSettingContext(context.Background(), urlStr, enableSSRFProtection, allowPrivateIp, domainFilterMode, ipFilterMode, domainList, ipList, allowedPorts, applyIPFilterForDomain)
+}
+
+func ValidateURLWithFetchSettingContext(ctx context.Context, urlStr string, enableSSRFProtection, allowPrivateIp bool, domainFilterMode bool, ipFilterMode bool, domainList, ipList, allowedPorts []string, applyIPFilterForDomain bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// 如果SSRF防护被禁用，直接返回成功
 	if !enableSSRFProtection {
 		return nil
@@ -383,5 +399,5 @@ func ValidateURLWithFetchSetting(urlStr string, enableSSRFProtection, allowPriva
 	if err != nil {
 		return err
 	}
-	return protection.ValidateURL(urlStr)
+	return protection.ValidateURLWithContext(ctx, urlStr)
 }

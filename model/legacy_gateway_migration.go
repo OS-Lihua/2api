@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"maps"
 	"math/big"
@@ -17,7 +18,6 @@ import (
 	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relaykit/dto"
-	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -83,6 +83,29 @@ func MigrateLegacyGateway(ctx context.Context) (*LegacyGatewayMigrationReport, e
 		}
 		DB = tx
 		defer func() { DB = originalDB }()
+		if err := tx.Exec(`SELECT pg_advisory_xact_lock(510050)`).Error; err != nil {
+			return err
+		}
+		stage = "ability_source"
+		abilityState, err := inspectLegacyAbilityRetirementTx(tx)
+		if err != nil {
+			return err
+		}
+		if abilityState == legacyAbilityNative {
+			report.AlreadyCompleted = true
+			return nil // Native initialization is not a legacy USD conversion.
+		}
+		if abilityState == legacyAbilityEmpty {
+			return ErrLegacyAbilityRetirement
+		}
+		var abilitySeal *LegacyAbilitySourceManifest
+		if abilityState == legacyAbilityPresent {
+			abilitySeal, err = ArchiveLegacyAbilitySource(tx)
+			if err != nil {
+				return err
+			}
+		}
+		stage = "schema"
 		if err := tx.AutoMigrate(&legacyGatewayMigration{}, &legacyGatewayMigrationMapping{}); err != nil {
 			return err
 		}
@@ -90,41 +113,88 @@ func MigrateLegacyGateway(ctx context.Context) (*LegacyGatewayMigrationReport, e
 		if err := tx.Model(&legacyGatewayMigration{}).Where("version = ?", legacyGatewayMigrationVersion).Count(&completed).Error; err != nil {
 			return err
 		}
+		if completed == 0 {
+			if err := InitSettlementCurrency(); err != nil || SettlementCurrency() != money.Currency("USD") {
+				return report.blocked("migration", 0, "", "usd_settlement_currency_required")
+			}
+			// Schema migration renames the old Provider table before creating the
+			// new Channels. Key policies deliberately run after the final names exist.
+			if err := migrateDB(); err != nil {
+				return err
+			}
+			var foreignWallets int64
+			if err := tx.Model(&Wallet{}).Where("account_type IN ? AND balance_currency <> ?", []LedgerAccountType{LedgerAccountUserWallet, LedgerAccountUserReceivable}, "USD").Count(&foreignWallets).Error; err != nil {
+				return err
+			}
+			if foreignWallets != 0 {
+				return report.blocked("wallet", 0, "", "usd_settlement_currency_required")
+			}
+			// Offline conversion reads source options transactionally below. Calling
+			// InitOptionMap here would mutate the serving/global plugin generation.
+			stage = "catalog"
+			if err := migrateLegacyGatewayCatalog(ctx, tx, report); err != nil {
+				return err
+			}
+			stage = "key_policy"
+			if err := migrateLegacyGatewayKeyPolicies(tx, report); err != nil {
+				return err
+			}
+			stage = "wallet"
+			if err := migrateLegacyGatewayWallets(tx, report); err != nil {
+				return err
+			}
+			if err := tx.Create(&legacyGatewayMigration{Version: legacyGatewayMigrationVersion, CompletedAt: clock.Now().Unix()}).Error; err != nil {
+				return err
+			}
+		}
 		if completed != 0 {
-			report.AlreadyCompleted = true
-			return nil
+			// The money conversion is independent of the original gateway marker;
+			// previously migrated sites still retain released subscription terms.
+			stage = "subscription_money"
+			if err := InitSettlementCurrency(); err != nil {
+				return err
+			}
+			if err := MigrateSubscriptionMoney(tx); err != nil {
+				return err
+			}
+			// A completed gateway marker does not prove that ordinary historical
+			// task obligations have been archived by this independent upgrade.
+			stage = "legacy_task_obligations"
+			if err := MigrateLegacyTaskObligations(tx); err != nil {
+				return err
+			}
 		}
-		if err := InitSettlementCurrency(); err != nil || SettlementCurrency() != money.Currency("USD") {
-			return report.blocked("migration", 0, "", "usd_settlement_currency_required")
-		}
-		// Schema migration renames the old Provider table before creating the
-		// new Channels. Key policies deliberately run after the final names exist.
-		if err := migrateDB(); err != nil {
+		stage = "balance_reminders"
+		if err := MigrateBalanceReminders(tx); err != nil {
 			return err
 		}
-		var foreignWallets int64
-		if err := tx.Model(&Wallet{}).Where("account_type IN ? AND balance_currency <> ?", []LedgerAccountType{LedgerAccountUserWallet, LedgerAccountUserReceivable}, "USD").Count(&foreignWallets).Error; err != nil {
+		var obligationsCompleted int64
+		if err := tx.Model(&legacyGatewayMigration{}).Where("version = ?", legacyMidjourneyMigrationVersion).Count(&obligationsCompleted).Error; err != nil {
 			return err
 		}
-		if foreignWallets != 0 {
-			return report.blocked("wallet", 0, "", "usd_settlement_currency_required")
-		}
-		InitOptionMap()
-		stage = "catalog"
-		if err := migrateLegacyGatewayCatalog(ctx, tx, report); err != nil {
+		// A marker records the previous snapshot, not the absence of late writes.
+		stage = "midjourney_obligations"
+		if err := migrateLegacyMidjourneyObligations(tx, report); err != nil {
 			return err
 		}
-		stage = "key_policy"
-		if err := migrateLegacyGatewayKeyPolicies(tx, report); err != nil {
+		report.AlreadyCompleted = completed != 0 && obligationsCompleted != 0 && report.Counts["midjourney_obligations"] == 0 && abilityState == legacyAbilityRetired
+		if obligationsCompleted == 0 {
+			if err := tx.Create(&legacyGatewayMigration{Version: legacyMidjourneyMigrationVersion, CompletedAt: clock.Now().Unix()}).Error; err != nil {
+				return err
+			}
+		}
+		stage = "ability_retirement"
+		if abilityState == legacyAbilityPresent {
+			if err := retireLegacyAbilitySourceTx(tx, abilitySeal); err != nil {
+				return err
+			}
+			report.Counts["legacy_ability_source_rows"] = abilitySeal.RowCount
+			report.Counts["legacy_ability_retired"] = 1
+		} else if _, err := inspectLegacyAbilityRetirementTx(tx); err != nil {
 			return err
 		}
-		stage = "wallet"
-		if err := migrateLegacyGatewayWallets(tx, report); err != nil {
-			return err
-		}
-		stage = "completion"
-		return tx.Create(&legacyGatewayMigration{Version: legacyGatewayMigrationVersion, CompletedAt: clock.Now().Unix()}).Error
-	})
+		return nil
+	}, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
 	if err != nil {
 		if errors.Is(err, ErrLegacyGatewayMigrationBlocked) {
 			return report, ErrLegacyGatewayMigrationBlocked
@@ -148,6 +218,88 @@ func MigrateLegacyGateway(ctx context.Context) (*LegacyGatewayMigrationReport, e
 	return report, nil
 }
 
+// migrateLegacyMidjourneyObligations imports identity and results, not money.
+// Legacy quota and refund markers cannot prove atomic postings. Keep both sides
+// pending for reconciliation and retire their old writers in the same transaction.
+func migrateLegacyMidjourneyObligations(tx *gorm.DB, report *LegacyGatewayMigrationReport) error {
+	if err := tx.AutoMigrate(&Task{}, &Midjourney{}); err != nil {
+		return err
+	}
+	if err := tx.Exec(`LOCK TABLE tasks, midjourneys IN SHARE ROW EXCLUSIVE MODE`).Error; err != nil {
+		return err
+	}
+	if err := validateLegacyMidjourneyMappings(tx, true); err != nil {
+		return err
+	}
+	var rows []Midjourney
+	err := tx.Where("migrated_task_id = ?", 0).Order("id").FindInBatches(&rows, 500, func(batch *gorm.DB, _ int) error {
+		for _, source := range rows {
+			obligation := &TaskLegacyObligation{
+				Version: legacyMidjourneyMigrationVersion, SourceID: source.Id,
+				ProviderID: source.ChannelId, SourceQuota: source.Quota,
+				Reconciliation: "pending", DebitEvidence: "unverified", RefundEvidence: "unverified",
+			}
+			var provider Provider
+			err := tx.Select("id", "type").Where("id = ?", source.ChannelId).Take(&provider).Error
+			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			if err == nil && (provider.Type == constant.ChannelTypeMidjourney || provider.Type == constant.ChannelTypeMidjourneyPlus) {
+				obligation.ProviderType = provider.Type
+			}
+			payload := map[string]any{
+				"id": source.MjId, "action": source.Action, "prompt": source.Prompt, "promptEn": source.PromptEn,
+				"description": source.Description, "state": source.State, "status": source.Status,
+				"progress": source.Progress, "failReason": source.FailReason, "submitTime": source.SubmitTime,
+				"startTime": source.StartTime, "finishTime": source.FinishTime,
+				"imageUrl": source.ImageUrl, "videoUrl": source.VideoUrl,
+			}
+			var buttons, videos []any
+			if source.Buttons != "" && common.UnmarshalJsonStr(source.Buttons, &buttons) == nil {
+				payload["buttons"] = buttons
+			}
+			if source.VideoUrls != "" && common.UnmarshalJsonStr(source.VideoUrls, &videos) == nil {
+				payload["videoUrls"] = videos
+			}
+			var properties map[string]any
+			if source.Properties != "" && common.UnmarshalJsonStr(source.Properties, &properties) == nil {
+				if seed, ok := properties["seed"]; ok {
+					payload["properties"] = map[string]any{"seed": seed}
+				}
+			}
+			data, err := common.Marshal(payload)
+			if err != nil {
+				return err
+			}
+			task := Task{
+				TaskID: GenerateTaskID(), Platform: constant.TaskPlatform("midjourney"), UserId: source.UserId,
+				ChannelId: source.ChannelId, Action: source.Action, Status: TaskStatus(source.Status),
+				Progress: source.Progress, FailReason: source.FailReason, Data: data,
+				SubmitTime: source.SubmitTime / 1000, StartTime: source.StartTime / 1000, FinishTime: source.FinishTime / 1000,
+				CreatedAt: clock.Now().Unix(), UpdatedAt: clock.Now().Unix(),
+				PrivateData: TaskPrivateData{UpstreamTaskID: source.MjId, LegacyObligation: obligation},
+			}
+			if err := tx.Create(&task).Error; err != nil {
+				return err
+			}
+			mapped := tx.Model(&Midjourney{}).Where("id = ? AND migrated_task_id = ?", source.Id, 0).Update("migrated_task_id", task.ID)
+			if mapped.Error != nil {
+				return mapped.Error
+			}
+			if mapped.RowsAffected != 1 {
+				return ErrLegacyMidjourneyMigrationRequired
+			}
+			report.Counts["midjourney_obligations"]++
+			report.Items = append(report.Items, LegacyGatewayMigrationItem{Resource: "midjourney", ID: int64(source.Id), Reason: "reconciliation_pending"})
+		}
+		return nil
+	}).Error
+	if err != nil {
+		return err
+	}
+	return validateLegacyMidjourneyMappings(tx, false)
+}
+
 type legacyGatewayOffering struct {
 	providerIDs []int
 	groups      []string
@@ -163,6 +315,13 @@ type legacyGatewayChannel struct {
 }
 
 func migrateLegacyGatewayCatalog(ctx context.Context, tx *gorm.DB, report *LegacyGatewayMigrationReport) error {
+	// Capture one plugin generation and one transactional source snapshot before
+	// creating either Channels or sales. Every routing decision below uses it.
+	pricingSource, err := loadLegacyMigrationPricingSource(tx)
+	if err != nil {
+		return err
+	}
+	ctx = context.WithValue(ctx, legacyMigrationGenerationKey{}, pricingSource.generation)
 	var providers []Provider
 	// Source discovery needs only routing metadata, not credentials or URLs.
 	if err := tx.Select("id", "type", "models", "group", "model_mapping", "param_override", "setting").Order("id").Find(&providers).Error; err != nil {
@@ -217,7 +376,7 @@ func migrateLegacyGatewayCatalog(ctx context.Context, tx *gorm.DB, report *Legac
 			if upstream != strings.TrimSpace(upstream) {
 				return report.blocked("provider", int64(provider.Id), name, "invalid_upstream_model_name")
 			}
-			kind, err := legacyGatewayDefaultProtocol(provider)
+			kind, err := legacyGatewayDefaultProtocol(provider, name, upstream, pricingSource)
 			if err != nil {
 				return report.blocked("provider", int64(provider.Id), name, "unverifiable_default_protocol")
 			}
@@ -298,19 +457,6 @@ func migrateLegacyGatewayCatalog(ctx context.Context, tx *gorm.DB, report *Legac
 			return err
 		}
 	}
-	// The alias view may belong to an earlier database in this process. Rebuild
-	// it against this transaction before the existing conversion APIs use it.
-	rebuildTaskAliasView()
-	// Conversion must receive Configured: Effective loses the distinction
-	// between a missing override and an explicit zero.
-	snapshot, err := GetModelPricingSnapshot(names)
-	if err != nil {
-		return err
-	}
-	pricing := make(map[string]ModelPricingEntry, len(snapshot.Entries))
-	for _, entry := range snapshot.Entries {
-		pricing[entry.ModelName] = entry
-	}
 	var actors []User
 	if err := tx.Select("id").Order("role DESC, id").Limit(1).Find(&actors).Error; err != nil {
 		return err
@@ -348,16 +494,9 @@ func migrateLegacyGatewayCatalog(ctx context.Context, tx *gorm.DB, report *Legac
 				return err
 			}
 		}
-		configured := pricing[name].Configured
-		expression := ""
-		if pricing[name].Effective["billing_setting.billing_mode"] == billing_setting.BillingModeTieredExpr {
-			expression, _ = pricing[name].Effective["billing_setting.billing_expr"].(string)
-		} else {
-			converted, err := PreviewModelPricingConversion(name, configured)
-			if err == nil && converted != nil && converted.UnsupportedReason == "" {
-				expression = converted.Expression
-			}
-		}
+		// Preserve the selected plugin's client/mapped override priority and
+		// explicit zero. Disagreeing route prices/units cannot share one price.
+		expression := pricingSource.saleExpression(name, channels)
 		if expression == "" || len(actors) == 0 {
 			report.Counts["offerings_disabled"]++
 			reason := "sale_price_conversion_failed"
@@ -387,11 +526,66 @@ func migrateLegacyGatewayCatalog(ctx context.Context, tx *gorm.DB, report *Legac
 	return nil
 }
 
+// The private key cannot be supplied by an HTTP caller. Only the offline
+// migration sets it; ordinary mutation/price validation keeps its global default.
+type legacyMigrationGenerationKey struct{}
+
+func priceDeclarationGeneration(ctx context.Context) *jsplugin.RoutingGeneration {
+	if generation, ok := ctx.Value(legacyMigrationGenerationKey{}).(*jsplugin.RoutingGeneration); ok {
+		return generation
+	}
+	return jsplugin.DefaultRegistry.Generation()
+}
+
 // The Provider type supplies a conservative default. Names never select a
 // protocol by resemblance; each new Channel still requires mapping confirmation.
-func legacyGatewayDefaultProtocol(provider Provider) (protocol.Type, error) {
-	if plugin, ok := jsplugin.DefaultRegistry.GetByChannelType(provider.Type); ok {
+func legacyGatewayDefaultProtocol(provider Provider, name, upstream string, source *LegacyPricingConversionSource) (protocol.Type, error) {
+	generation := source.generation
+	matches := func(plugin *jsplugin.LoadedPlugin) bool {
+		return slices.ContainsFunc(plugin.Meta.Models, func(declared string) bool {
+			return jsplugin.ASCIIFold(declared) == jsplugin.ASCIIFold(name) || jsplugin.ASCIIFold(declared) == jsplugin.ASCIIFold(upstream)
+		})
+	}
+	if provider.Type == constant.ChannelTypeTaskPlugin || provider.Type == constant.ChannelTypeNewAPI {
+		var settings dto.ProviderSettings
+		if provider.Setting != nil && *provider.Setting != "" && common.UnmarshalJsonStr(*provider.Setting, &settings) != nil {
+			return "", ErrLegacyGatewayMigrationBlocked
+		}
+		keys := append([]string{}, settings.TaskExtendPluginKeys...)
+		if settings.TaskPluginKey != "" {
+			keys = append(keys, settings.TaskPluginKey)
+		}
+		if provider.Type == constant.ChannelTypeTaskPlugin {
+			keys = []string{settings.TaskPluginKey}
+		}
+		slices.Sort(keys)
+		selected := ""
+		for _, key := range slices.Compact(keys) {
+			plugin, available := generation.Get(key)
+			if !available {
+				return "", ErrLegacyGatewayMigrationBlocked
+			}
+			// Type 60 uses the first matching bound key, exactly as the legacy
+			// runtime contract. A missing binding is never ordinary text fallback.
+			if selected == "" && (provider.Type == constant.ChannelTypeTaskPlugin || matches(plugin)) {
+				selected = key
+			}
+		}
+		if selected != "" {
+			return protocol.Type("task:" + selected), nil
+		}
+	}
+	// channelTypes is transport compatibility, not a blanket claim of every
+	// model at that Provider. The immutable source generation owns selection.
+	if plugin, ok := generation.GetByChannelType(provider.Type); ok && matches(plugin) {
 		return protocol.Type("task:" + plugin.Meta.Key), nil
+	}
+	// Disabling/replacing a declaration must not reinterpret an old task USD
+	// expression as an ordinary per-million token expression.
+	for _, plugin := range source.declarations {
+		if (provider.Type == constant.ChannelTypeNewAPI || slices.Contains(plugin.Meta.ChannelTypes, provider.Type)) && matches(plugin) {
+			return "", ErrLegacyGatewayMigrationBlocked
+		}
 	}
 	switch provider.Type {
 	case constant.ChannelTypeAnthropic, constant.ChannelTypeAws:
@@ -402,16 +596,6 @@ func legacyGatewayDefaultProtocol(provider Provider) (protocol.Type, error) {
 		return protocol.OpenAIResponses, nil
 	case constant.ChannelTypeJina:
 		return protocol.Rerank, nil
-	case constant.ChannelTypeTaskPlugin:
-		var settings dto.ProviderSettings
-		if provider.Setting == nil || common.UnmarshalJsonStr(*provider.Setting, &settings) != nil {
-			return "", ErrLegacyGatewayMigrationBlocked
-		}
-		kind := protocol.Type("task:" + settings.TaskPluginKey)
-		if _, task := kind.TaskPluginKey(); !task {
-			return "", ErrLegacyGatewayMigrationBlocked
-		}
-		return kind, nil
 	default:
 		if provider.Type <= 0 || provider.Type >= constant.ChannelTypeDummy {
 			return "", ErrLegacyGatewayMigrationBlocked

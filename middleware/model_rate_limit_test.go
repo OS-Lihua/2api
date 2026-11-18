@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/gin-gonic/gin"
@@ -186,7 +187,7 @@ func TestModelRateLimitCountsConfiguredGroupsSeparately(t *testing.T) {
 			router := gin.New()
 			router.GET("/:group", func(c *gin.Context) {
 				c.Set("id", userID)
-				common.SetContextKey(c, constant.ContextKeyTokenGroup, c.Param("group"))
+				common.SetContextKey(c, constant.ContextKeyUserGroup, c.Param("group"))
 			}, ModelRequestRateLimit(), func(c *gin.Context) {
 				c.Status(http.StatusOK)
 			})
@@ -194,6 +195,60 @@ func TestModelRateLimitCountsConfiguredGroupsSeparately(t *testing.T) {
 			for _, step := range steps {
 				assert.Equal(t, step.want, performRateLimitRequest(router, "/"+step.group, "127.0.0.1:1000").Code, "group %s", step.group)
 			}
+		})
+	}
+}
+
+func TestRetiredKeyGroupCannotChooseRateLimitBucket(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	previousEnabled, previousMinutes := setting.ModelRequestRateLimitEnabled, setting.ModelRequestRateLimitDurationMinutes
+	previousTotal, previousSuccess := setting.ModelRequestRateLimitCount, setting.ModelRequestRateLimitSuccessCount
+	previousGroups, previousRedis := setting.ModelRequestRateLimitGroup, common.RedisEnabled
+	t.Cleanup(func() {
+		setting.ModelRequestRateLimitEnabled, setting.ModelRequestRateLimitDurationMinutes = previousEnabled, previousMinutes
+		setting.ModelRequestRateLimitCount, setting.ModelRequestRateLimitSuccessCount = previousTotal, previousSuccess
+		setting.ModelRequestRateLimitGroup, common.RedisEnabled = previousGroups, previousRedis
+	})
+	setting.ModelRequestRateLimitEnabled, setting.ModelRequestRateLimitDurationMinutes = true, 1
+	common.RedisEnabled = false
+	for _, tc := range []struct {
+		name   string
+		redis  bool
+		counts [2]int
+	}{
+		{name: "memory_success", counts: [2]int{0, 1}},
+		{name: "redis_success", redis: true, counts: [2]int{0, 1}},
+		{name: "memory_total", counts: [2]int{1, 1000}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.redis {
+				useRateLimitMiniRedis(t)
+			}
+			setting.ModelRequestRateLimitCount, setting.ModelRequestRateLimitSuccessCount = tc.counts[0], tc.counts[1]
+			setting.ModelRequestRateLimitGroup = map[string][2]int{
+				"member":       tc.counts,
+				"legacy-key-a": {100, 100},
+				"legacy-key-b": {100, 100},
+			}
+			userID := 7200000 + int(modelRateLimitTestUsers.Add(1))
+			calls := 0
+			router := gin.New()
+			router.GET("/:key", func(c *gin.Context) {
+				// Both credentials belong to the same authenticated user. Only
+				// their historical Key group differs, not the user's membership.
+				common.SetContextKey(c, constant.ContextKeyUserGroup, "member")
+				tokenID := 41
+				if c.Param("key") == "legacy-key-b" {
+					tokenID = 42
+				}
+				require.NoError(t, SetupContextForToken(c, &model.Token{Id: tokenID, UserId: userID, Name: "rate-limit probe", Group: c.Param("key")}))
+			}, ModelRequestRateLimit(), func(c *gin.Context) {
+				calls++
+				c.Status(http.StatusOK)
+			})
+			assert.Equal(t, http.StatusOK, performRateLimitRequest(router, "/legacy-key-a", "127.0.0.1:1000").Code)
+			assert.Equal(t, http.StatusTooManyRequests, performRateLimitRequest(router, "/legacy-key-b", "127.0.0.1:1000").Code, "stored legacy Key groups must not replace the authenticated user's rate policy")
+			assert.Equal(t, 1, calls, "changing only the obsolete Key group must not create another rate-limit bucket")
 		})
 	}
 }

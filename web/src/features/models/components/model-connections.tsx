@@ -18,10 +18,8 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useTranslation } from 'react-i18next'
 
-import { StaticDataTable } from '@/components/data-table'
-import { EmptyState } from '@/components/empty-state'
-import { GroupBadge } from '@/components/group-badge'
 import { StatusBadge } from '@/components/status-badge'
+import { ProviderChannels } from '@/features/providers/components/provider-channels'
 
 import type { Model } from '../types'
 import { ModelSquareStatus } from './model-square-status'
@@ -32,47 +30,26 @@ export function ModelConnections(props: { model: Model }) {
     <div className='min-h-0 flex-1 space-y-6 overflow-auto p-4'>
       <p className='text-muted-foreground text-sm'>
         {t(
-          'Channel availability and group access are derived from enabled channels. Importing metadata does not create a callable channel.'
+          'Channel status does not establish a sale price, Offering access, or request availability.'
         )}
       </p>
       <ModelSquareStatus model={props.model} detail />
-      <section className='space-y-3'>
-        <h3 className='font-medium'>{t('Bound Channels')}</h3>
-        {props.model.bound_channels?.length ? (
-          <StaticDataTable
-            data={props.model.bound_channels}
-            columns={[
-              {
-                id: 'name',
-                header: t('Channel'),
-                cell: (channel) => channel.name,
-              },
-              {
-                id: 'type',
-                header: t('Type'),
-                cell: (channel) => channel.type,
-              },
-            ]}
-          />
-        ) : (
-          <EmptyState title={t('No available channels')} />
-        )}
-      </section>
-      <section className='space-y-3'>
-        <h3 className='font-medium'>{t('Enable Groups')}</h3>
-        <div className='flex flex-wrap gap-2'>
-          {props.model.enable_groups?.map((group) => (
-            <GroupBadge key={group} group={group} />
-          ))}
-          {!props.model.enable_groups?.length && (
-            <span className='text-muted-foreground text-sm'>
-              {t('No enabled groups')}
-            </span>
+      {props.model.id > 0 && props.model.name_rule === 0 ? (
+        <ProviderChannels modelId={props.model.id} readOnly />
+      ) : (
+        <p role='status'>
+          {t(
+            'Connections require a saved exact-name Model. Metadata rules do not bind Channels.'
           )}
-        </div>
-      </section>
+        </p>
+      )}
       <section className='space-y-3'>
         <h3 className='font-medium'>{t('Supported endpoints')}</h3>
+        <p className='text-muted-foreground text-sm'>
+          {t(
+            'Native endpoints declared by channels and model metadata. Actual availability depends on the selected route and request.'
+          )}
+        </p>
         <div className='flex flex-wrap gap-2'>
           {props.model.supported_endpoints?.map((endpoint) => (
             <StatusBadge key={endpoint} variant='neutral' label={endpoint} />
@@ -84,16 +61,6 @@ export function ModelConnections(props: { model: Model }) {
           )}
         </div>
       </section>
-      {props.model.name_rule !== 0 && (
-        <section className='space-y-3'>
-          <h3 className='font-medium'>{t('Matched models')}</h3>
-          <div className='flex flex-wrap gap-2'>
-            {props.model.matched_models?.map((name) => (
-              <StatusBadge key={name} variant='neutral' label={name} />
-            ))}
-          </div>
-        </section>
-      )}
     </div>
   )
 }

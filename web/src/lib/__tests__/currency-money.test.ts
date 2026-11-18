@@ -16,11 +16,53 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { expect, it } from 'vitest'
+import { afterEach, expect, it } from 'vitest'
 
 import { toIntlLocale } from '@/i18n/languages'
+import { mapStatusDataToConfig } from '@/lib/status-query'
+import { useSystemConfigStore } from '@/stores/system-config-store'
 
-import { formatMoneyAmount } from '../currency'
+import {
+  formatDecimalMoneyAmount,
+  formatMoneyAmount,
+  moneyAmountToDecimal,
+  parseDecimalMoneyAmount,
+} from '../currency'
+
+afterEach(() => {
+  useSystemConfigStore.setState(useSystemConfigStore.getInitialState(), true)
+  localStorage.clear()
+})
+
+it.each(['USD', 'CNY', 'CUSTOM', 'TOKENS'])(
+  'keeps native money exact when historical status uses %s display and a custom quota unit',
+  (displayType) => {
+    useSystemConfigStore.setState(useSystemConfigStore.getInitialState(), true)
+    useSystemConfigStore.getState().setConfig(
+      mapStatusDataToConfig({
+        legacy_quota_per_unit: '1000000.000',
+        quota_per_unit: 1,
+        quota_display_type: displayType,
+        usd_exchange_rate: 7,
+        custom_currency_symbol: 'OLD',
+        custom_currency_exchange_rate: 19,
+      })
+    )
+    const amount = { nanos: '9007199254740993', currency: 'EUR' }
+    expect(formatMoneyAmount(amount, 'en')).toBe('9,007,199.254740993 EUR')
+    expect(moneyAmountToDecimal(amount)).toBe('9007199.254740993')
+    expect(parseDecimalMoneyAmount('9007199.254740993', 'EUR')).toEqual(amount)
+    expect(
+      formatDecimalMoneyAmount(
+        { amount: '9007199.254740993', currency: 'EUR' },
+        'en'
+      )
+    ).toBe('9,007,199.254740993 EUR')
+    expect(formatMoneyAmount({ nanos: '1', currency: 'JPY' }, 'en')).toBe(
+      '0.000000001 JPY'
+    )
+  }
+)
 
 it.each([
   ['en', '9,007,199.254740993 USD'],
@@ -36,6 +78,12 @@ it.each([
     expect(
       formatMoneyAmount(
         { nanos: '9007199254740993', currency: 'USD' },
+        toIntlLocale(language)
+      )
+    ).toBe(expected)
+    expect(
+      formatDecimalMoneyAmount(
+        { amount: '9007199.254740993', currency: 'USD' },
         toIntlLocale(language)
       )
     ).toBe(expected)
@@ -55,6 +103,51 @@ it.each([
     expect(formatMoneyAmount({ nanos, currency: 'CNY' }, 'en')).toBe(expected)
   }
 )
+
+it.each([
+  ['0', '0 USD'],
+  ['-0.000000001', '-0.000000001 USD'],
+  ['9223372036.854775807', '9,223,372,036.854775807 USD'],
+  ['1.0000000001', '-'],
+  ['1e3', '-'],
+  ['NaN', '-'],
+  ['', '-'],
+])(
+  'formats decimal money %s exactly or rejects invalid precision',
+  (amount, expected) => {
+    expect(formatDecimalMoneyAmount({ amount, currency: 'USD' }, 'en')).toBe(
+      expected
+    )
+  }
+)
+
+it.each([
+  ['0', '0'],
+  ['0.000000001', '1'],
+  ['9007199.254740993', '9007199254740993'],
+  ['9223372036.854775807', '9223372036854775807'],
+  ['-9223372036.854775808', '-9223372036854775808'],
+])('round-trips editable decimal %s without losing nanos', (decimal, nanos) => {
+  const amount = { nanos, currency: 'USD' }
+  expect(parseDecimalMoneyAmount(decimal, 'USD')).toEqual(amount)
+  expect(moneyAmountToDecimal(amount)).toBe(decimal)
+})
+
+it.each([
+  '9223372036.854775808',
+  '-9223372036.854775809',
+  '0.0000000001',
+  '1e3',
+  'NaN',
+  '',
+])('rejects invalid or overflowing decimal input %s', (value) => {
+  expect(parseDecimalMoneyAmount(value, 'USD')).toBeNull()
+})
+
+it('rejects invalid currency input without changing its denomination', () => {
+  expect(parseDecimalMoneyAmount('1', 'usd')).toBeNull()
+  expect(parseDecimalMoneyAmount('1', '')).toBeNull()
+})
 
 it('uses the runtime locale when an interface locale is invalid', () => {
   expect(

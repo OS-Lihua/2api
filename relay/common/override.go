@@ -159,9 +159,83 @@ func NewAPIErrorFromParamOverride(err *ParamOverrideReturnError) *types.NewAPIEr
 	}, statusCode, opts...)
 }
 
+var ErrParamOverrideRetiredContext = errors.New("parameter override references retired token_group context")
+
+// ValidateParamOverrideContextReferences rejects only condition paths that may
+// read the retired token_group root. The existing operation parser remains the
+// source of truth; paths outside its parsed conditions are not inspected.
+//
+// A condition path is accepted for runtime evaluation only when its syntax is
+// a plain dotted JSON path. This deliberately excludes ojson's wildcard,
+// escape, pipe, projection, query, and modifier forms: ojson exposes no static
+// reference AST, so those forms cannot prove which root they read. A plain
+// path with a non-retired root (including metadata.token_group) is still passed
+// unchanged to ojson for its normal body/context lookup.
+func ValidateParamOverrideContextReferences(paramOverride map[string]any) error {
+	operations, ok := tryParseOperations(paramOverride)
+	if !ok {
+		return nil
+	}
+	for _, operation := range operations {
+		if err := validateParamOverrideConditionPaths(operation.Conditions); err != nil {
+			return err
+		}
+		if strings.EqualFold(operation.Mode, "prune_objects") {
+			options, err := parsePruneObjectsOptions(operation.Value)
+			if err != nil {
+				return err
+			}
+			if err := validateParamOverrideConditionPaths(options.conditions); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateParamOverrideConditionPaths(conditions []ConditionOperation) error {
+	for i := range conditions {
+		if err := validateParamOverrideConditionPath(conditions[i].Path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateParamOverrideConditionPath(path string) error {
+	if path == "" || path != strings.TrimSpace(path) {
+		return ErrParamOverrideRetiredContext
+	}
+	segments := strings.Split(path, ".")
+	if len(segments) == 0 {
+		return ErrParamOverrideRetiredContext
+	}
+	for _, segment := range segments {
+		if segment == "" {
+			return ErrParamOverrideRetiredContext
+		}
+		for i, r := range segment {
+			if i == 0 && r == '-' && len(segment) > 1 {
+				continue
+			}
+			if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' {
+				continue
+			}
+			return ErrParamOverrideRetiredContext
+		}
+	}
+	if segments[0] == "token_group" {
+		return ErrParamOverrideRetiredContext
+	}
+	return nil
+}
+
 func ApplyParamOverride(jsonData []byte, paramOverride map[string]any, conditionContext map[string]any) ([]byte, error) {
 	if len(paramOverride) == 0 {
 		return jsonData, nil
+	}
+	if err := ValidateParamOverrideContextReferences(paramOverride); err != nil {
+		return nil, err
 	}
 	auditRecorder := getParamOverrideAuditRecorder(conditionContext)
 	// 新旧两种格式的所有修改都在同一个 Doc 上进行，最后只生成一次输出
@@ -2173,8 +2247,10 @@ func mergeObjects(doc *ojson.Doc, path string, value any, keepOrigin bool) error
 //   - original_model：请求最初指定的模型名。
 //   - user_id：已认证用户 ID。
 //   - user_group：用户所属分组。
-//   - token_group：令牌指定的分组；未指定时回退为用户分组。
 //   - using_group：当前实际使用的分组，自动跨分组重试时可能变化。
+//
+// token_group is intentionally not exposed. Legacy Key.Group is retained only
+// as source data and is not a request-routing or parameter-override authority.
 //   - request_path：请求路径
 //   - is_channel_test：是否为渠道测试请求（同 is_test）。
 func BuildParamOverrideContext(info *RelayInfo) map[string]any {
@@ -2185,7 +2261,6 @@ func BuildParamOverrideContext(info *RelayInfo) map[string]any {
 	ctx := make(map[string]any)
 	ctx["user_id"] = info.UserId
 	ctx["user_group"] = info.UserGroup
-	ctx["token_group"] = info.TokenGroup
 	ctx["using_group"] = info.UsingGroup
 	if info.ProviderMeta != nil && info.ProviderMeta.UpstreamModelName != "" {
 		ctx["model"] = info.ProviderMeta.UpstreamModelName

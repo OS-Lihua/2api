@@ -31,7 +31,6 @@ import type {
   SearchModelsParams,
   SyncUpstreamResponse,
   PreviewUpstreamDiffResponse,
-  MissingModelsResponse,
   PrefillGroupsResponse,
   SyncLocale,
   SyncSource,
@@ -113,16 +112,9 @@ export async function updateModelStatus(
  * Delete model
  */
 export async function deleteModel(
-  id: number,
-  removeFromChannels = false,
-  removePricing = false
+  id: number
 ): Promise<{ success: boolean; message?: string; data: ModelDeleteResult }> {
-  const res = await api.delete(`/api/models/${id}`, {
-    params: {
-      remove_from_channels: removeFromChannels,
-      remove_pricing: removePricing,
-    },
-  })
+  const res = await api.delete(`/api/models/${id}`)
   return res.data
 }
 
@@ -182,8 +174,9 @@ export async function getAllPublishers(): Promise<Vendor[]> {
     if (
       items.length === 0 ||
       publishers.length >= (response.data?.total ?? items.length)
-    )
-      {return publishers}
+    ) {
+      return publishers
+    }
   }
 }
 
@@ -277,14 +270,6 @@ export async function previewUpstreamDiff(params?: {
 // ============================================================================
 // Utility Operations
 // ============================================================================
-
-/**
- * Get missing models (used but not configured)
- */
-export async function getMissingModels(): Promise<MissingModelsResponse> {
-  const res = await api.get('/api/models/missing')
-  return res.data
-}
 
 /**
  * Get prefill groups
@@ -685,14 +670,10 @@ export interface ModelDeleteResult {
 }
 
 export async function deleteModels(
-  modelIds: number[],
-  removeFromChannels = false,
-  removePricing = false
+  modelIds: number[]
 ): Promise<{ success: boolean; message?: string; data: ModelDeleteResult }> {
   const res = await api.post('/api/models/delete', {
     model_ids: modelIds,
-    remove_from_channels: removeFromChannels,
-    remove_pricing: removePricing,
   })
   return res.data
 }

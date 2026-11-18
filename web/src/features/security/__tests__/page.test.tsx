@@ -52,9 +52,13 @@ const profile: UserProfile = {
   request_count: 0,
   status: 1,
   aff_count: 0,
-  aff_quota: 0,
-  aff_history_quota: 0,
   created_time: 0,
+  balance_reminder: {
+    enabled: true,
+    threshold: null,
+    effective_enabled: true,
+    effective_threshold: { nanos: '1000000000', currency: 'USD' },
+  },
   setting: JSON.stringify({
     notify_type: 'email',
     quota_warning_threshold: 500000,

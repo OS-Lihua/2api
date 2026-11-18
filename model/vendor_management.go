@@ -243,6 +243,5 @@ func applyVendorOperation(operation VendorOperation) (*VendorOperationResult, er
 	if err != nil {
 		return nil, err
 	}
-	RefreshPricing()
 	return result, nil
 }

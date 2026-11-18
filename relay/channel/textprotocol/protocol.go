@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/gemini"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 )
@@ -47,7 +48,7 @@ func (p *Handler) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		resp.Body = channel.BoundGatewayResponseBody(resp.Body)
 		contentType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 		jsonResponse := contentType == "application/json" || strings.HasSuffix(contentType, "+json")
-		if contentType == "text/event-stream" || info.IsStream && !jsonResponse {
+		if info.RelayMode != relayconstant.RelayModeResponsesCompact && (contentType == "text/event-stream" || info.IsStream && !jsonResponse) {
 			return p.gatewayStreamResponse(c, resp, info)
 		}
 		return p.gatewayJSONResponse(c, resp, info)

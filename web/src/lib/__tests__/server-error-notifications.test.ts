@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { CancelledError, QueryClientProvider } from '@tanstack/react-query'
-import { act, renderHook } from '@testing-library/react'
+import { act, renderHook, waitFor } from '@testing-library/react'
 import {
   AxiosError,
   AxiosHeaders,
@@ -46,6 +46,7 @@ afterEach(() => {
   api.defaults.adapter = originalAdapter
   vi.restoreAllMocks()
   useAuthStore.getState().auth.reset()
+  localStorage.clear()
   window.history.replaceState({}, '', '/')
 })
 
@@ -304,23 +305,23 @@ it.each([200, 401])(
       access_expires_at: 2_000_000_000,
     }
     const open = vi.spyOn(XMLHttpRequest.prototype, 'open')
-    vi.spyOn(XMLHttpRequest.prototype, 'send').mockImplementation(
-      function (this: XMLHttpRequest) {
-        Object.defineProperties(this, {
-          status: { value: refreshStatus, configurable: true },
-          statusText: { value: 'Refresh response', configurable: true },
-          responseText: {
-            value: JSON.stringify({
-              success: refreshStatus === 200,
-              data: fresh,
-            }),
-            configurable: true,
-          },
-          readyState: { value: 4, configurable: true },
-        })
-        this.onloadend?.(new ProgressEvent('loadend'))
-      }
-    )
+    vi.spyOn(XMLHttpRequest.prototype, 'send').mockImplementation(function (
+      this: XMLHttpRequest
+    ) {
+      Object.defineProperties(this, {
+        status: { value: refreshStatus, configurable: true },
+        statusText: { value: 'Refresh response', configurable: true },
+        responseText: {
+          value: JSON.stringify({
+            success: refreshStatus === 200,
+            data: fresh,
+          }),
+          configurable: true,
+        },
+        readyState: { value: 4, configurable: true },
+      })
+      this.onloadend?.(new ProgressEvent('loadend'))
+    })
     let requests = 0
     api.defaults.adapter = async (config) => {
       requests++
@@ -417,6 +418,10 @@ it('never refreshes or replays a failed single-use authorization request', async
 
 it('rejects an unsuccessful setting update so callers cannot proceed as if it saved, with one useful notification', async () => {
   const client = createAppQueryClient()
+  const status = { legacy_quota_per_unit: '1000000.000' }
+  client.setQueryData(['status'], status)
+  client.setQueryData(['system-options'], [])
+  localStorage.setItem('status', JSON.stringify(status))
   const notify = vi.spyOn(toast, 'error').mockReturnValue('setting-error')
   const success = vi.spyOn(toast, 'success').mockReturnValue('saved')
   api.defaults.adapter = async (config) => ({
@@ -432,13 +437,61 @@ it('rejects an unsuccessful setting update so callers cannot proceed as if it sa
   })
   await act(async () => {
     await expect(
-      result.current.mutateAsync({ key: 'QuotaPerUnit', value: 'invalid' })
+      result.current.mutateAsync({
+        key: 'log_setting.max_range_days',
+        value: 'invalid',
+      })
     ).rejects.toThrow('Setting value is invalid')
   })
   expect(notify.mock.calls.map(([message]) => message)).toEqual([
     'Setting value is invalid',
   ])
   expect(success).not.toHaveBeenCalled()
+  await waitFor(() => {
+    expect(result.current.variables).toEqual({
+      key: 'log_setting.max_range_days',
+      value: 'invalid',
+    })
+  })
+  expect(client.getQueryState(['status'])?.isInvalidated).toBe(false)
+  expect(client.getQueryState(['system-options'])?.isInvalidated).toBe(false)
+  expect(localStorage.getItem('status')).toBe(JSON.stringify(status))
+  unmount()
+  client.clear()
+})
+
+it('still invalidates shared status after a successful active option update', async () => {
+  const client = createAppQueryClient()
+  const status = { legacy_quota_per_unit: '1000000.000' }
+  client.setQueryData(['status'], status)
+  client.setQueryData(['system-options'], [])
+  localStorage.setItem('status', JSON.stringify(status))
+  const notify = vi.spyOn(toast, 'error').mockReturnValue('error')
+  const success = vi.spyOn(toast, 'success').mockReturnValue('saved')
+  const request = { key: 'log_setting.max_range_days', value: '30' }
+  api.defaults.adapter = async (config) => {
+    expect(config.url).toBe('/api/option/')
+    expect(JSON.parse(String(config.data))).toEqual(request)
+    return {
+      data: { success: true },
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      config,
+    }
+  }
+  const { result, unmount } = renderHook(() => useUpdateOption(), {
+    wrapper: (props: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, props.children),
+  })
+  await act(async () => {
+    await result.current.mutateAsync(request)
+  })
+  expect(client.getQueryState(['status'])?.isInvalidated).toBe(true)
+  expect(client.getQueryState(['system-options'])?.isInvalidated).toBe(true)
+  expect(localStorage.getItem('status')).toBeNull()
+  expect(notify).not.toHaveBeenCalled()
+  expect(success).toHaveBeenCalledTimes(1)
   unmount()
   client.clear()
 })

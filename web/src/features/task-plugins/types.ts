@@ -20,7 +20,6 @@ import type {
   BillingUsageSchema,
   BillingUsageExample,
 } from '@/features/pricing/types'
-import type { ModelPricingIssue } from '@/features/system-settings/models/pricing-issues'
 
 export type TaskPluginProtocolClaim =
   | string
@@ -117,17 +116,28 @@ export type TaskPluginDetail = {
   has_icon?: boolean
   /** Declared routes the gateway serves only under /{key}, as "METHOD /path". */
   skipped_routes?: string[]
-  /** Set when the upload put this version into service. */
-  pricing_issues?: ModelPricingIssue[]
+  /** Current runtime generation, including when viewing a historical version. */
+  pricing_diagnostics: TaskPluginPricingDiagnostics
 }
 
-/**
- * Answer of an activation, a switch-on or the deletion of the active version:
- * the prices the plugin now serving the key cannot charge.
- */
+export type TaskPluginPricingIssue = {
+  owner_type: 'model_offering' | 'channel'
+  owner_id: number
+  owner_name: string
+  price_version_id: number | null
+  plugin_key: string
+  plugin_name: string
+  reason: 'unconfigured' | 'incompatible' | 'stale'
+}
+
+export type TaskPluginPricingDiagnostics = {
+  state: 'ready' | 'unavailable' | 'not_authorized'
+  issues: TaskPluginPricingIssue[]
+}
+
 export type TaskPluginPricingNotice = {
-  pricing_issues?: ModelPricingIssue[] | null
-} | null
+  pricing_diagnostics: TaskPluginPricingDiagnostics
+}
 
 export type ApiResponse<T> = {
   success: boolean

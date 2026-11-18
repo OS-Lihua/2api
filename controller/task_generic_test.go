@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/system_setting"
@@ -50,6 +51,39 @@ func setupGenericTaskTest(t *testing.T) *model.Task {
 	}
 	require.NoError(t, database.Create(task).Error)
 	return task
+}
+
+func archiveGenericPluginTask(t *testing.T, task *model.Task, pluginKey, originalKey string) {
+	t.Helper()
+	generation := pluginruntime.DefaultRegistry.Generation()
+	plugin, exists := generation.Get(pluginKey)
+	require.True(t, exists)
+	task.Platform = constant.TaskPlatform(pluginKey)
+	task.PrivateData.Key = originalKey
+	task.PrivateData.UpstreamTaskID = "upstream-" + task.TaskID
+	task.PrivateData.Execution = &model.TaskExecutionSnapshot{
+		RequestID: "artifact-fixture-" + pluginKey,
+		TaskPlugin: &model.TaskPluginSnapshot{
+			Key: plugin.Meta.Key, Name: plugin.Meta.Name, Version: plugin.Meta.Version,
+			APIVersion: plugin.Meta.APIVersion, Generation: generation.Number,
+		},
+	}
+	require.NoError(t, model.DB.Save(task).Error)
+	require.NoError(t, model.DB.AutoMigrate(&model.LegacySubscriptionTaskObligation{}))
+	require.NoError(t, model.MigrateLegacyTaskObligations(model.DB))
+	var evidence model.LegacyTaskObligation
+	require.NoError(t, model.DB.First(&evidence, "source_task_id = ?", task.ID).Error)
+	require.Equal(t, "unverified", evidence.State)
+	assert.Equal(t, task.UserId, evidence.UserID)
+	assert.Equal(t, task.ChannelId, evidence.ProviderID)
+	assert.Equal(t, task.PrivateData.UpstreamTaskID, evidence.UpstreamTaskID)
+	assert.Equal(t, plugin.Meta.Key, evidence.PluginKey)
+	assert.Equal(t, plugin.Meta.Version, evidence.PluginVersion)
+	t.Cleanup(func() {
+		var unchanged model.LegacyTaskObligation
+		require.NoError(t, model.DB.First(&unchanged, "source_task_id = ?", task.ID).Error)
+		assert.Equal(t, evidence, unchanged, "artifact reads must not resolve historical financial evidence")
+	})
 }
 
 func allowPrivateTaskMediaTest(t *testing.T) {
@@ -374,16 +408,12 @@ func TestDisabledArtifactStorePreservesPluginUpstreamContent(t *testing.T) {
 		"base_url":        upstream.URL,
 		"header_override": `{"X-API-Key":"{api_key}","Host":"ignored.example"}`,
 	}).Error)
-	task.Platform = constant.TaskPlatform("google")
-	task.PrivateData.Execution = &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
-		Key: "google", Name: "Google Veo (Gemini API)", Version: "1.0.0", APIVersion: 1,
-	}}
 	task.SetData(map[string]any{"response": map[string]any{
 		"generateVideoResponse": map[string]any{
 			"generatedSamples": []any{map[string]any{"video": map[string]any{"uri": upstream.URL}}},
 		},
 	}})
-	require.NoError(t, model.DB.Save(task).Error)
+	archiveGenericPluginTask(t, task, "google", "provider-key")
 	require.False(t, service.GetTaskArtifactStore().Enabled())
 
 	recorder := httptest.NewRecorder()
@@ -449,10 +479,7 @@ func TestTaskArtifactContentFollowsHailuoRetrieveLink(t *testing.T) {
 		// Neither utils.fetch nor the credentialless OSS link gets overrides.
 		"header_override": `{"Authorization":"Bearer override"}`,
 	}).Error)
-	task.Platform = constant.TaskPlatform("hailuo")
-	task.PrivateData.Execution = &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
-		Key: "hailuo", Name: "Hailuo", Version: "1.2.0", APIVersion: 1,
-	}}
+	archiveGenericPluginTask(t, task, "hailuo", "provider-key")
 	request := func(method, fileID string) *httptest.ResponseRecorder {
 		task.SetData(map[string]any{"file_id": fileID})
 		require.NoError(t, model.DB.Save(task).Error)

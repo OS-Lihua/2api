@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { ColumnDef } from '@tanstack/react-table'
-import { useMemo } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { DataTablePage, useDataTable } from '@/components/data-table'
@@ -28,8 +28,14 @@ import { StatusBadge } from '@/components/status-badge'
 import { Button } from '@/components/ui/button'
 import { toIntlLocale } from '@/i18n/languages'
 import { formatNumber } from '@/lib/format'
+import { useAuthStore } from '@/stores/auth-store'
 
 import {
+  assertChannelAccess,
+  channelAccessScope,
+  channelScopeKey,
+  isChannelScopeCurrent,
+  type ChannelAccessScope,
   channelKeys,
   listChannelProbes,
   runChannelProbe,
@@ -40,25 +46,73 @@ import { getChannelProbeLabels } from '../lib/channel-probes'
 
 type ProbeRow = { capability: string; result?: ChannelProbeResult }
 
-export function ChannelProbeDialog(props: {
+type ChannelProbeProps = {
   channel: SingleModelChannel
   canOperate: boolean
   onClose: () => void
-}) {
+}
+export function ChannelProbeDialog(props: ChannelProbeProps) {
+  useAuthStore((state) => state.auth.user)
+  useAuthStore((state) => state.auth.session?.sid)
+  const scope = channelAccessScope()
+  return (
+    <ScopedChannelProbe
+      key={JSON.stringify([
+        channelScopeKey(scope),
+        props.channel.id,
+        props.canOperate,
+      ])}
+      {...props}
+      scope={scope}
+    />
+  )
+}
+function ScopedChannelProbe(
+  props: ChannelProbeProps & { scope: ChannelAccessScope }
+) {
   const client = useQueryClient()
   const { t, i18n } = useTranslation()
+  const active = useRef(true)
+  useEffect(() => {
+    active.current = true
+    return () => {
+      active.current = false
+    }
+  }, [])
+  const current = () => active.current && isChannelScopeCurrent(props.scope)
   const query = useQuery({
-    queryKey: ['channel-probes', props.channel.id],
-    queryFn: () => listChannelProbes(props.channel.id),
+    queryKey: [
+      'channel-probes',
+      ...channelScopeKey(props.scope),
+      props.channel.id,
+    ],
+    queryFn: async ({ signal }) => {
+      assertChannelAccess(props.scope, 'read', signal)
+      const result = await listChannelProbes(props.channel.id, signal)
+      assertChannelAccess(props.scope, 'read', signal)
+      return result
+    },
+    enabled: props.scope.read,
+    retry: false,
+    gcTime: 0,
+    staleTime: 0,
+    meta: { errorToast: false },
     refetchInterval: (query) =>
       query.state.data?.results.some((result) => result.status === 'running')
         ? 1500
         : false,
   })
   const { mutate, isPending, variables } = useMutation({
-    mutationFn: (capability: string) =>
-      runChannelProbe(props.channel.id, capability),
+    meta: { errorToast: false },
+    mutationFn: (capability: string) => {
+      assertChannelAccess(props.scope, 'operate')
+      if (!current() || !props.canOperate) {
+        throw new Error('Channel access changed')
+      }
+      return runChannelProbe(props.channel.id, capability)
+    },
     onSettled: async () => {
+      if (!current()) return
       await Promise.all([
         query.refetch(),
         client.invalidateQueries({ queryKey: channelKeys.all }),
@@ -161,7 +215,8 @@ export function ChannelProbeDialog(props: {
         id: 'actions',
         header: t('Actions'),
         cell: ({ row }) =>
-          props.canOperate && (
+          props.canOperate &&
+          props.scope.operate && (
             <Button
               size='sm'
               variant='outline'
@@ -186,6 +241,7 @@ export function ChannelProbeDialog(props: {
       featureLabels,
       reasons,
       props.canOperate,
+      props.scope.operate,
       isPending,
       variables,
       mutate,
@@ -196,6 +252,13 @@ export function ChannelProbeDialog(props: {
     columns,
     getRowId: (row) => row.capability,
   })
+  if (!props.scope.read) {
+    return (
+      <p role='status'>
+        {t('Channel read permission is required to view connections.')}
+      </p>
+    )
+  }
   return (
     <Dialog
       open

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -16,13 +15,9 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	appconstant "github.com/QuantumNous/new-api/constant"
-	appdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
-	"github.com/QuantumNous/new-api/middleware"
-	appmodel "github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/capability"
-	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/pkg/wsmanager"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
@@ -46,8 +41,7 @@ const responsesWSWriteTimeout = 30 * time.Second
 type ResponsesWSRequestRunner func(*http.Request, string, func(*gin.Context) *types.NewAPIError) *types.NewAPIError
 
 // ResponsesWSGateway handles resolved ModelOfferings on the existing session.
-// Returning false keeps legacy requests on their original billing path.
-type ResponsesWSGateway func(*gin.Context, *ResponsesWSCall) (bool, *types.NewAPIError)
+type ResponsesWSGateway func(*gin.Context, *ResponsesWSCall) *types.NewAPIError
 
 // NativeWSLifecycle lets the same gateway lifecycle wait for a multiplexed
 // native response. The existing transport remains the only socket owner.
@@ -80,7 +74,6 @@ type ResponsesWSCall struct {
 	Native              *NativeWSLifecycle
 	Request             dto.OpenAIResponsesRequest
 	Body                []byte
-	LegacyConnection    bool
 	LockedChannelID     int
 	LockedKeyIndex      int
 	LockedProviderType  int
@@ -255,9 +248,6 @@ func (call *ResponsesWSCall) Exchange(c *gin.Context, info *relaycommon.RelayInf
 	}
 	s := call.session
 	call.state.authorizeControl = call.AuthorizeControl
-	if s.lockedChannelID != 0 {
-		return nil, newResponsesWSInvalidRequestError(errors.New("connection billing identity changed; reconnect required"))
-	}
 	if s.gatewayChannelID != 0 && (s.gatewayChannelID != channelID || s.gatewayProviderID != providerID || s.gatewayUpstreamModel != info.UpstreamModelName) {
 		return nil, newResponsesWSInvalidRequestError(errors.New("upstream connection identity changed; reconnect required"))
 	}
@@ -474,27 +464,17 @@ type responsesWSSession struct {
 
 	// These fields belong to the serial request worker and describe the actual
 	// established connection. Per-request token/user data is never stored here.
-	completed       map[string]bool
-	items           map[string]*relaycommon.ResponsesInputFacts
-	contexts        map[string]relaycommon.ResponsesInputFacts
-	contextBytes    int
-	lastResponseID  string
-	lockedModel     string
-	lockedChannelID int
-	lockedGroup     string
-	lockedKey       string
-	lockedKeyIndex  int
-	lockedContext   map[appconstant.ContextKey]any
-	lockedRoute     dto.AdvancedCustomRoute
+	completed      map[string]bool
+	items          map[string]*relaycommon.ResponsesInputFacts
+	contexts       map[string]relaycommon.ResponsesInputFacts
+	contextBytes   int
+	lastResponseID string
 }
 
-func ResponsesWebSocketHelper(c *gin.Context, client *websocket.Conn, runner ResponsesWSRequestRunner, gateways ...ResponsesWSGateway) *types.NewAPIError {
+func ResponsesWebSocketHelper(c *gin.Context, client *websocket.Conn, runner ResponsesWSRequestRunner, gateway ResponsesWSGateway) *types.NewAPIError {
 	ctx, cancel := context.WithCancelCause(c.Request.Context())
-	s := &responsesWSSession{language: i18n.StatedLang(c), ctx: ctx, cancel: cancel, client: client, runner: runner,
+	s := &responsesWSSession{language: i18n.StatedLang(c), ctx: ctx, cancel: cancel, client: client, runner: runner, gateway: gateway,
 		request: c.Request.Clone(ctx), requestID: c.GetString(common.RequestIdKey)}
-	if len(gateways) > 0 {
-		s.gateway = gateways[0]
-	}
 	if s.requestID == "" {
 		s.requestID = common.NewRequestId()
 	}
@@ -610,160 +590,18 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
 		}
 		c.Request.Body = io.NopCloser(bytes.NewReader(create.Body))
 		c.Request.ContentLength = int64(len(create.Body))
-		if s.gateway != nil {
-			call := &ResponsesWSCall{Request: create.Request, Body: create.Body, LegacyConnection: s.lockedChannelID != 0, LockedChannelID: s.gatewayChannelID,
-				LockedProviderID: s.gatewayProviderID, LockedKeyIndex: s.gatewayKeyIndex, LockedProviderType: s.gatewayProviderType, LockedUpstreamModel: s.gatewayUpstreamModel, session: s, state: state, create: create}
-			if handled, gatewayErr := s.gateway(c, call); handled {
-				return gatewayErr
-			}
+		if s.gateway == nil {
+			return types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound, types.ErrOptionWithSkipRetry())
 		}
-		callErr := s.runCall(c, state, create)
+		call := &ResponsesWSCall{Request: create.Request, Body: create.Body, LockedChannelID: s.gatewayChannelID,
+			LockedProviderID: s.gatewayProviderID, LockedKeyIndex: s.gatewayKeyIndex, LockedProviderType: s.gatewayProviderType, LockedUpstreamModel: s.gatewayUpstreamModel, session: s, state: state, create: create}
+		gatewayErr := s.gateway(c, call)
 		upstreamURLs = common.UpstreamAddresses(c)
-		return callErr
+		return gatewayErr
 	})
 	if apiErr != nil && (apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusForbidden) {
 		state.closeCode = websocket.ClosePolicyViolation
 	}
-}
-
-func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState, create responsesWSCreateRequest) (apiErr *types.NewAPIError) {
-	policy := service.RequestPolicy(c)
-	modelName := create.Request.Model
-	started := time.Now()
-	var info *relaycommon.RelayInfo
-	billingPrepared := false
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			apiErr = types.NewError(fmt.Errorf("responses websocket call panic: %v", recovered), types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
-			state.closeCode = websocket.CloseInternalServerErr
-		}
-		if info == nil && modelName != "" {
-			info = &relaycommon.RelayInfo{OriginModelName: modelName, UsingGroup: common.GetContextKeyString(c, appconstant.ContextKeyUsingGroup), StartTime: started}
-		}
-		perfmetrics.RecordRelayResult(c.Request.Context(), info, apiErr)
-		// Settlement already marks the request policy successful, and nothing
-		// reads a termination decision after this point on the WebSocket path,
-		// so neither policy record belongs here.
-		if info != nil && billingPrepared {
-			apiErr = RefundFailedRequestBilling(c, info, apiErr)
-		}
-	}()
-	if modelName == "" {
-		return newResponsesWSInvalidRequestError(errors.New("model is required"))
-	}
-	if s.lockedModel != "" && modelName != s.lockedModel {
-		return newResponsesWSInvalidRequestError(fmt.Errorf("responses websocket connection is locked to model %q", s.lockedModel))
-	}
-	if apiErr = checkResponsesWSModelAccess(c, modelName); apiErr != nil {
-		return apiErr
-	}
-	common.SetContextKey(c, appconstant.ContextKeyOriginalModel, modelName)
-	common.SetContextKey(c, appconstant.ContextKeyRequestStartTime, time.Now())
-	service.GetChannelConstraints(c).AddFilter(appdto.ProviderFilter{Kind: appdto.FilterRequestPath, RequestPath: c.Request.URL.Path})
-
-	if s.lockedChannelID != 0 {
-		if apiErr = s.restoreConnectionContext(c, modelName); apiErr != nil {
-			return apiErr
-		}
-		info = relaycommon.GenRelayInfoResponses(c, &create.Request)
-		info.IsStream = true
-		common.SetContextKey(c, appconstant.ContextKeyIsStream, true)
-		if apiErr = PrepareRequestBilling(c, info); apiErr != nil {
-			return apiErr
-		}
-		billingPrepared = true
-		var payload []byte
-		payload, apiErr = buildResponsesWSCreatePayload(c, info, create.Request, create.Generate, create.StreamID)
-		if apiErr != nil {
-			return apiErr
-		}
-		if err := s.writeTarget(websocket.TextMessage, payload); err != nil {
-			state.closeCode = websocket.CloseInternalServerErr
-			return types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
-		}
-	} else {
-		retry := &service.RetryParam{Ctx: c, TokenGroup: common.GetContextKeyString(c, appconstant.ContextKeyUsingGroup), ModelName: modelName, RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0)}
-		for ; retry.GetRetry() <= common.RetryTimes; retry.IncreaseRetry() {
-			var channel *appmodel.Provider
-			channel, apiErr = selectResponsesWSChannel(c, modelName, retry)
-			if apiErr != nil {
-				return apiErr
-			}
-			service.AppendUsedChannel(c, channel.Id)
-			if info == nil {
-				info = relaycommon.GenRelayInfoResponses(c, &create.Request)
-				info.IsStream = true
-				common.SetContextKey(c, appconstant.ContextKeyIsStream, true)
-				if apiErr = PrepareRequestBilling(c, info); apiErr != nil {
-					return apiErr
-				}
-				billingPrepared = true
-			} else {
-				info.PriceData.GroupRatioInfo = helper.HandleGroupRatio(c, info)
-				if apiErr = service.PrepareTieredBillingForSelectedGroup(c, info); apiErr != nil {
-					return apiErr
-				}
-			}
-			info.RetryIndex = retry.GetRetry()
-			policy.BeginAttempt(channel, info.UsingGroup)
-			var payload []byte
-			payload, apiErr = buildResponsesWSCreatePayload(c, info, create.Request, create.Generate, create.StreamID)
-			if apiErr != nil {
-				return apiErr
-			}
-			adaptor := GetAdaptor(info.ApiType)
-			adaptor.Init(info)
-			target, dialErr := relaychannel.DoWssRequest(adaptor, c, info, nil)
-			if dialErr != nil {
-				apiErr = service.NormalizeViolationFeeError(types.NewError(dialErr, types.ErrorCodeDoRequestFailed))
-				service.ResetStatusCode(apiErr, c.GetString("status_code_mapping"))
-				info.LastError = apiErr
-				decision := service.DecideRelayRetry(c, apiErr, common.RetryTimes-retry.GetRetry())
-				service.RecordPolicyFailure(c, channel.Id, apiErr, decision)
-				service.ProcessChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ProviderInfo.IsMultiKey, info.ApiKey, channel.GetAutoBan()), apiErr, info)
-				if decision.Action == "retry" {
-					continue
-				}
-				return apiErr
-			}
-			if !s.setTarget(target) {
-				return types.NewError(context.Canceled, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
-			}
-			if err := s.writeTarget(websocket.TextMessage, payload); err != nil {
-				state.closeCode = websocket.CloseInternalServerErr
-				return types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
-			}
-			s.lockedModel, s.lockedChannelID, s.lockedGroup = modelName, channel.Id, info.UsingGroup
-			s.lockedKey, s.lockedKeyIndex = info.ApiKey, info.ChannelMultiKeyIndex
-			s.lockedRoute, _ = channel.GetOtherSettings().AdvancedCustom.MatchPathForModel(c.Request.URL.Path, modelName)
-			s.lockedContext = make(map[appconstant.ContextKey]any)
-			for _, key := range []appconstant.ContextKey{
-				appconstant.ContextKeyChannelId, appconstant.ContextKeyChannelName, appconstant.ContextKeyChannelType,
-				appconstant.ContextKeyChannelCreateTime, appconstant.ContextKeyChannelSetting, appconstant.ContextKeyChannelOtherSetting,
-				appconstant.ContextKeyChannelParamOverride, appconstant.ContextKeyChannelHeaderOverride, appconstant.ContextKeyChannelOrganization,
-				appconstant.ContextKeyChannelAutoBan, appconstant.ContextKeyChannelModelMapping, appconstant.ContextKeyChannelStatusCodeMapping,
-				appconstant.ContextKeyChannelIsMultiKey, appconstant.ContextKeyChannelMultiKeyIndex, appconstant.ContextKeyChannelKey, appconstant.ContextKeyChannelBaseUrl,
-				appconstant.ContextKeyUpstreamRequestOrigin,
-			} {
-				if value, ok := c.Get(string(key)); ok {
-					s.lockedContext[key] = value
-				}
-			}
-			s.registerChannelClose(channel.Id)
-			s.startTargetReader(target)
-			apiErr = nil
-			break
-		}
-		if apiErr != nil {
-			return apiErr
-		}
-	}
-
-	usage, receiveErr := s.receive(c, state, info, create)
-	if receiveErr == nil {
-		ConsumeResponsesQuota(c, info, usage)
-	}
-	return receiveErr
 }
 
 func (s *responsesWSSession) authorizeControl(state *responsesWSCallState, create responsesWSCreateRequest) *types.NewAPIError {
@@ -930,10 +768,6 @@ func (s *responsesWSSession) receive(c *gin.Context, state *responsesWSCallState
 					return accumulator.Finish(), rejected
 				}
 				if strings.HasPrefix(event.Type, "response.") {
-					if !accepted {
-						// Like HTTP, bind the session only once upstream accepted the request.
-						service.RecordChannelAffinity(c, s.lockedChannelID)
-					}
 					accepted = true
 					if event.Response != nil && event.Response.ID != "" {
 						responseID = event.Response.ID
@@ -1063,89 +897,6 @@ func responsesWSErrorEndsRequest(event responsesWSErrorEvent, streamID, response
 		return false, false, false
 	}
 	return true, len(control) > 0 && event.ResponseID == "", false
-}
-
-func (s *responsesWSSession) restoreConnectionContext(c *gin.Context, model string) *types.NewAPIError {
-	// The channel type is not rechecked: a locked channel keeps its type, and
-	// the FilterResponsesWebSocket rules were applied when it was selected.
-	channel, err := appmodel.CacheGetProvider(s.lockedChannelID)
-	if err != nil || channel == nil || channel.Status != common.ChannelStatusEnabled || !channel.GetSetting().ResponsesWebSocketEnabled {
-		return types.NewErrorWithStatusCode(errors.New("Responses WebSocket is disabled for this channel"), types.ErrorCode(appdto.FilterResponsesWebSocket), http.StatusForbidden, types.ErrOptionWithSkipRetry())
-	}
-	keyEnabled := channel.Key == s.lockedKey
-	if channel.ProviderInfo.IsMultiKey {
-		keys := channel.GetKeys()
-		status := channel.ProviderInfo.MultiKeyStatusList[s.lockedKeyIndex]
-		keyEnabled = s.lockedKeyIndex >= 0 && s.lockedKeyIndex < len(keys) && keys[s.lockedKeyIndex] == s.lockedKey && (status == 0 || status == common.ChannelStatusEnabled)
-	}
-	if !keyEnabled {
-		return types.NewErrorWithStatusCode(errors.New("the upstream connection credential is no longer enabled"), types.ErrorCodeAccessDenied, http.StatusForbidden, types.ErrOptionWithSkipRetry())
-	}
-	// Changes that alter the physical upstream connection require a new
-	// handshake. Request-level settings can be refreshed without rotating keys.
-	if channel.GetBaseURL() != s.lockedContext[appconstant.ContextKeyChannelBaseUrl] ||
-		!reflect.DeepEqual(channel.GetHeaderOverride(), s.lockedContext[appconstant.ContextKeyChannelHeaderOverride]) {
-		return types.NewErrorWithStatusCode(errors.New("upstream connection settings changed; reconnect required"), types.ErrorCodeAccessDenied, http.StatusForbidden, types.ErrOptionWithSkipRetry())
-	}
-	if previous, ok := s.lockedContext[appconstant.ContextKeyChannelSetting].(dto.ProviderSettings); ok && previous.Proxy != channel.GetSetting().Proxy {
-		return types.NewErrorWithStatusCode(errors.New("upstream proxy changed; reconnect required"), types.ErrorCodeAccessDenied, http.StatusForbidden, types.ErrOptionWithSkipRetry())
-	}
-	// An advanced custom connection was dialed through the route matched for
-	// this model. Only the fields that shape the upstream handshake force a
-	// reconnect: target path, protocol conversion and credential placement.
-	// Other channel types match the zero route on both sides.
-	route, _ := channel.GetOtherSettings().AdvancedCustom.MatchPathForModel(c.Request.URL.Path, model)
-	if strings.TrimSpace(route.UpstreamPath) != strings.TrimSpace(s.lockedRoute.UpstreamPath) ||
-		route.IsNative() != s.lockedRoute.IsNative() ||
-		!reflect.DeepEqual(route.Auth, s.lockedRoute.Auth) {
-		return types.NewErrorWithStatusCode(errors.New("upstream route changed; reconnect required"), types.ErrorCodeAccessDenied, http.StatusForbidden, types.ErrOptionWithSkipRetry())
-	}
-	if pin, found, _ := service.GetChannelConstraints(c).ResolvedPin(); found {
-		if pin.ChannelId != s.lockedChannelID {
-			return types.NewErrorWithStatusCode(errors.New("channel pin changed; reconnect required"), types.ErrorCodeAccessDenied, http.StatusForbidden, types.ErrOptionWithSkipRetry())
-		}
-	} else {
-		group := common.GetContextKeyString(c, appconstant.ContextKeyUsingGroup)
-		if group == "auto" {
-			if !slices.Contains(service.GetRequestAutoGroups(c, common.GetContextKeyString(c, appconstant.ContextKeyUserGroup)), s.lockedGroup) {
-				return types.NewErrorWithStatusCode(errors.New("the connection group is no longer allowed"), types.ErrorCodeAccessDenied, http.StatusForbidden, types.ErrOptionWithSkipRetry())
-			}
-			group = s.lockedGroup
-			common.SetContextKey(c, appconstant.ContextKeyAutoGroup, group)
-		}
-		if !appmodel.IsProviderEnabledForGroupModel(group, model, s.lockedChannelID) {
-			return types.NewErrorWithStatusCode(errors.New("the connection channel is no longer allowed for this group and model"), types.ErrorCodeAccessDenied, http.StatusForbidden, types.ErrOptionWithSkipRetry())
-		}
-	}
-	for key, value := range s.lockedContext {
-		c.Set(string(key), value)
-	}
-	common.SetContextKey(c, appconstant.ContextKeyChannelSetting, channel.GetSetting())
-	common.SetContextKey(c, appconstant.ContextKeyChannelOtherSetting, channel.GetOtherSettings())
-	common.SetContextKey(c, appconstant.ContextKeyChannelParamOverride, channel.GetParamOverride())
-	common.SetContextKey(c, appconstant.ContextKeyChannelModelMapping, channel.GetModelMapping())
-	common.SetContextKey(c, appconstant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
-	policy := service.RequestPolicy(c)
-	policy.BeginAttempt(channel, s.lockedGroup)
-	policy.AddEvent(service.PolicyEvent{ChannelID: channel.Id, Decision: service.PolicyDecision{Action: "select", Reason: "pinned_channel", Source: "channel_constraint"}})
-	return nil
-}
-
-func buildResponsesWSCreatePayload(c *gin.Context, info *relaycommon.RelayInfo, req dto.OpenAIResponsesRequest, generate common.RawMessage, streamID string) ([]byte, *types.NewAPIError) {
-	_, body, closer, apiErr := PrepareResponsesRequest(c, info, &req)
-	if apiErr != nil {
-		return nil, apiErr
-	}
-	defer closer.Close()
-	jsonData, err := io.ReadAll(body)
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeReadRequestBodyFailed, types.ErrOptionWithSkipRetry())
-	}
-	event, err := buildResponsesWSCreateEvent(jsonData, generate, streamID)
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
-	}
-	return event, nil
 }
 
 func (s *responsesWSSession) startTargetReader(target *websocket.Conn) {
@@ -1428,54 +1179,4 @@ func buildResponsesWSErrorPayload(language, eventID, streamID string, apiErr *ty
 		StreamID: streamID,
 		Error:    &openaiErr,
 	})
-}
-
-// checkResponsesWSModelAccess applies the token model limit with the same name
-// matching as the HTTP distributor. Unlike HTTP, it also runs for requests
-// pinned to a channel: the check is stricter there on purpose, because a
-// persistent connection keeps serving the model after the pin was resolved.
-func checkResponsesWSModelAccess(c *gin.Context, modelName string) *types.NewAPIError {
-	if !common.GetContextKeyBool(c, appconstant.ContextKeyTokenModelLimitEnabled) {
-		return nil
-	}
-	raw, ok := common.GetContextKey(c, appconstant.ContextKeyTokenModelLimit)
-	if !ok {
-		return types.NewErrorWithStatusCode(errors.New("token has no model access"), types.ErrorCodeAccessDenied, http.StatusForbidden, types.ErrOptionWithSkipRetry())
-	}
-	tokenModelLimit, ok := raw.(map[string]bool)
-	if !ok {
-		tokenModelLimit = map[string]bool{}
-	}
-	if !middleware.TokenModelLimitAllows(tokenModelLimit, modelName) {
-		return types.NewErrorWithStatusCode(fmt.Errorf("token is not allowed to use model %s", modelName), types.ErrorCodeAccessDenied, http.StatusForbidden, types.ErrOptionWithSkipRetry())
-	}
-	return nil
-}
-
-// selectResponsesWSChannel narrows the shared HTTP selection to channels that
-// speak the Responses WebSocket protocol and renders its outcome as a
-// non-retryable NewAPIError.
-func selectResponsesWSChannel(c *gin.Context, modelName string, retryParam *service.RetryParam) (*appmodel.Provider, *types.NewAPIError) {
-	constraints := service.GetChannelConstraints(c)
-	if !slices.ContainsFunc(constraints.Filters, func(filter appdto.ProviderFilter) bool {
-		return filter.Kind == appdto.FilterResponsesWebSocket
-	}) {
-		constraints.AddFilter(appdto.ProviderFilter{Kind: appdto.FilterResponsesWebSocket})
-	}
-	channel, _, selectErr := service.SelectChannelForRequest(c, modelName, retryParam)
-	if selectErr != nil {
-		message := selectErr.Message
-		if selectErr.MessageID != "" {
-			message = i18n.T(c, selectErr.MessageID, selectErr.Params)
-		}
-		code := selectErr.Code
-		if code == "" {
-			code = types.ErrorCodeGetChannelFailed
-		}
-		return nil, types.NewErrorWithStatusCode(errors.New(message), code, selectErr.StatusCode, types.ErrOptionWithSkipRetry())
-	}
-	if err := middleware.SetupContextForSelectedChannel(c, channel, modelName); err != nil {
-		return nil, err
-	}
-	return channel, nil
 }

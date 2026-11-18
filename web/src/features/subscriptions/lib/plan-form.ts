@@ -19,15 +19,38 @@ For commercial licensing, please contact support@quantumnous.com
 import type { TFunction } from 'i18next'
 import { z } from 'zod'
 
-import { parseQuotaFromDollars, quotaUnitsToDollars } from '@/lib/format'
+import { moneyAmountToDecimal, parseDecimalMoneyAmount } from '@/lib/currency'
 
-import type { SubscriptionPlan, PlanPayload } from '../types'
+import {
+  subscriptionAmountSchema,
+  type SubscriptionPlan,
+  type PlanPayload,
+} from '../types'
+
+const moneyDraftSchema = (t: TFunction) =>
+  z
+    .object({
+      amount: z.string(),
+      currency: z.string().regex(/^[A-Z]{3}$/, t('Invalid currency')),
+    })
+    .superRefine((value, context) => {
+      const parsed = parseDecimalMoneyAmount(value.amount, value.currency)
+      if (!parsed || BigInt(parsed.nanos) < 0n) {
+        context.addIssue({
+          code: 'custom',
+          path: ['amount'],
+          message: t('Invalid amount'),
+        })
+      }
+    })
 
 export function getPlanFormSchema(t: TFunction) {
   return z.object({
     title: z.string().min(1, t('Please enter plan title')),
     subtitle: z.string().optional(),
-    price_amount: z.coerce.number().min(0, t('Please enter amount')),
+    price: moneyDraftSchema(t),
+    allowance: moneyDraftSchema(t),
+    unlimited: z.boolean(),
     duration_unit: z.enum(['year', 'month', 'day', 'hour', 'custom']),
     duration_value: z.coerce.number().min(1),
     custom_seconds: z.coerce.number().min(0).optional(),
@@ -44,7 +67,6 @@ export function getPlanFormSchema(t: TFunction) {
     allow_balance_pay: z.boolean(),
     allow_wallet_overflow: z.boolean(),
     max_purchase_per_user: z.coerce.number().min(0),
-    total_amount: z.coerce.number().min(0),
     upgrade_group: z.string().optional(),
     downgrade_group: z.string().optional(),
     stripe_price_id: z.string().optional(),
@@ -58,7 +80,9 @@ export type PlanFormValues = z.infer<ReturnType<typeof getPlanFormSchema>>
 export const PLAN_FORM_DEFAULTS: PlanFormValues = {
   title: '',
   subtitle: '',
-  price_amount: 0,
+  price: { amount: '0', currency: 'USD' },
+  allowance: { amount: '0', currency: 'USD' },
+  unlimited: false,
   duration_unit: 'month',
   duration_value: 1,
   custom_seconds: 0,
@@ -69,7 +93,6 @@ export const PLAN_FORM_DEFAULTS: PlanFormValues = {
   allow_balance_pay: true,
   allow_wallet_overflow: true,
   max_purchase_per_user: 0,
-  total_amount: 0,
   upgrade_group: '',
   downgrade_group: '',
   stripe_price_id: '',
@@ -81,7 +104,15 @@ export function planToFormValues(plan: SubscriptionPlan): PlanFormValues {
   return {
     title: plan.title || '',
     subtitle: plan.subtitle || '',
-    price_amount: Number(plan.price_amount || 0),
+    price: {
+      amount: moneyAmountToDecimal(plan.price),
+      currency: plan.price.currency,
+    },
+    allowance: {
+      amount: moneyAmountToDecimal(plan.allowance),
+      currency: plan.allowance.currency,
+    },
+    unlimited: plan.unlimited,
     duration_unit: plan.duration_unit || 'month',
     duration_value: Number(plan.duration_value || 1),
     custom_seconds: Number(plan.custom_seconds || 0),
@@ -92,7 +123,6 @@ export function planToFormValues(plan: SubscriptionPlan): PlanFormValues {
     allow_balance_pay: plan.allow_balance_pay !== false,
     allow_wallet_overflow: plan.allow_wallet_overflow !== false,
     max_purchase_per_user: Number(plan.max_purchase_per_user || 0),
-    total_amount: quotaUnitsToDollars(Number(plan.total_amount || 0)),
     upgrade_group: plan.upgrade_group || '',
     downgrade_group: plan.downgrade_group || '',
     stripe_price_id: plan.stripe_price_id || '',
@@ -105,8 +135,15 @@ export function formValuesToPlanPayload(values: PlanFormValues): PlanPayload {
   return {
     plan: {
       ...values,
-      price_amount: Number(values.price_amount || 0),
-      currency: 'USD',
+      price: subscriptionAmountSchema.parse(
+        parseDecimalMoneyAmount(values.price.amount, values.price.currency)
+      ),
+      allowance: subscriptionAmountSchema.parse(
+        parseDecimalMoneyAmount(
+          values.allowance.amount,
+          values.allowance.currency
+        )
+      ),
       duration_value: Number(values.duration_value || 0),
       custom_seconds: Number(values.custom_seconds || 0),
       quota_reset_period: values.quota_reset_period || 'never',
@@ -116,7 +153,6 @@ export function formValuesToPlanPayload(values: PlanFormValues): PlanPayload {
           : 0,
       sort_order: Number(values.sort_order || 0),
       max_purchase_per_user: Number(values.max_purchase_per_user || 0),
-      total_amount: parseQuotaFromDollars(Number(values.total_amount || 0)),
       upgrade_group: values.upgrade_group || '',
       downgrade_group: values.downgrade_group || '',
     },

@@ -30,8 +30,6 @@ import { EmailSettingsSection } from '../email-settings-section'
 
 type EmailValues = ComponentProps<typeof EmailSettingsSection>['defaultValues']
 const defaults: EmailValues = {
-  QuotaRemindEnabled: true,
-  QuotaRemindThreshold: '0',
   EmailProvider: 'smtp',
   ResendApiKey: '',
   ResendKeyConfigured: true,
@@ -52,7 +50,13 @@ function EmailFixture(props: { values: EmailValues }) {
   return (
     <SettingsPageProvider actionsContainer={actions}>
       <div ref={setActions} />
-      <EmailSettingsSection defaultValues={props.values} />
+      <EmailSettingsSection
+        defaultValues={props.values}
+        reminderConfig={JSON.stringify({
+          enabled: true,
+          threshold: { nanos: '0', currency: 'USD' },
+        })}
+      />
     </SettingsPageProvider>
   )
 }
@@ -81,11 +85,16 @@ describe('email delivery settings', () => {
     await user.click(
       screen.getByRole('switch', { name: 'Low balance reminder' })
     )
-    await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+    await user.click(
+      screen.getByRole('button', { name: 'Save balance reminder settings' })
+    )
     await waitFor(() =>
       expect(request).toHaveBeenCalledWith('/api/option/', {
-        key: 'QuotaRemindEnabled',
-        value: false,
+        key: 'balance_reminder_setting.config',
+        value: JSON.stringify({
+          enabled: false,
+          threshold: { nanos: '0', currency: 'USD' },
+        }),
       })
     )
     expect(request).toHaveBeenCalledTimes(1)

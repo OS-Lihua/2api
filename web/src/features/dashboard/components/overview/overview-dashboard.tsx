@@ -59,6 +59,7 @@ import { requireServerSuccess } from '@/lib/server-error-message'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/auth-store'
 
+import { useOverviewFinance } from '../../hooks/use-finance-report'
 import {
   useApiInfo,
   useDashboardContentVisibility,
@@ -88,7 +89,7 @@ type DashboardActionPath =
   | '/keys'
   | '/wallet'
   | '/playground'
-  | '/channels'
+  | '/providers'
   | '/usage-logs'
   | '/pricing'
 
@@ -476,13 +477,19 @@ export function OverviewDashboard() {
     boolean | null
   >(() => getSavedSetupGuideExpanded())
 
-  const requestCount = Number(user?.request_count ?? 0)
-  const remainQuota = Number(user?.quota ?? 0)
-  const usedQuota = Number(user?.used_quota ?? 0)
+  const sessionId = useAuthStore((state) => state.auth.session?.sid)
+  const finance = useOverviewFinance()
+  const hasBalance = Boolean(
+    finance.wallet.data && BigInt(finance.wallet.data.available.nanos) > 0n
+  )
+  const hasRecentRequest = Boolean(
+    finance.report.data && BigInt(finance.report.data.totals.request_count) > 0n
+  )
   const isAdmin = Boolean(user?.role && user.role >= ROLE.ADMIN)
 
   const apiKeysQuery = useQuery({
-    queryKey: ['dashboard', 'overview', 'api-keys'],
+    queryKey: ['dashboard', 'overview', 'api-keys', user?.id, sessionId],
+    enabled: Boolean(user?.id),
     queryFn: async () => {
       const result = requireServerSuccess(await getApiKeys({ p: 1, size: 10 }))
       return result.success ? (result.data?.items ?? []) : []
@@ -491,7 +498,8 @@ export function OverviewDashboard() {
   })
 
   const modelsQuery = useQuery({
-    queryKey: ['dashboard', 'overview', 'user-models'],
+    queryKey: ['dashboard', 'overview', 'user-models', user?.id, sessionId],
+    enabled: Boolean(user?.id),
     queryFn: async () => {
       const result = requireServerSuccess(await getUserModels())
       return result.success ? (result.data ?? []) : []
@@ -518,17 +526,19 @@ export function OverviewDashboard() {
         description: t('Keep enough balance before production traffic'),
         to: '/wallet',
         icon: CreditCard,
-        completed: remainQuota > 0 || usedQuota > 0,
+        completed: hasBalance,
       },
       {
         title: t('Send a request'),
-        description: t('Verify routing with Playground or your client'),
+        description: t(
+          'Verify a primary gateway request in the last seven days'
+        ),
         to: '/playground',
         icon: TerminalSquare,
-        completed: requestCount > 0,
+        completed: hasRecentRequest,
       },
     ],
-    [preferredKey, remainQuota, requestCount, t, usedQuota]
+    [preferredKey, hasBalance, hasRecentRequest, t]
   )
 
   const quickActions = useMemo<QuickAction[]>(
@@ -540,9 +550,9 @@ export function OverviewDashboard() {
         icon: KeyRound,
       },
       {
-        title: t('Channels'),
+        title: t('Providers'),
         description: t('Configure upstream providers and routing.'),
-        to: '/channels',
+        to: '/providers',
         icon: RadioTower,
         adminOnly: true,
       },
@@ -611,7 +621,11 @@ export function OverviewDashboard() {
 
   const completedStepCount = startSteps.filter((step) => step.completed).length
   const setupComplete = completedStepCount === startSteps.length
-  const setupStatusReady = apiKeysQuery.isFetched && Boolean(user)
+  const setupStatusReady =
+    apiKeysQuery.isFetched &&
+    Boolean(user) &&
+    (!finance.wallet.allowed ||
+      (finance.wallet.isFetched && finance.report.isFetched))
   const setupGuideExpanded =
     manualSetupGuideExpanded ?? (setupStatusReady && !setupComplete)
   const showLeftContentPanels =
@@ -787,7 +801,7 @@ export function OverviewDashboard() {
             </CardStaggerContainer>
           )}
 
-          <SummaryCards />
+          <SummaryCards finance={finance} />
 
           {showContentPanels && (
             <CardStaggerContainer

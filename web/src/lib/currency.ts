@@ -123,6 +123,50 @@ export function formatMoneyAmount(
   return `${number} ${amount.currency}`
 }
 
+/** Parse an exact decimal input within the stored int64 nanos range. */
+export function parseDecimalMoneyAmount(
+  value: string,
+  currency: string
+): MoneyAmount | null {
+  const parts = /^(-?)(\d+)(?:\.(\d{1,9}))?$/.exec(value)
+  if (!parts || !/^[A-Z]{3}$/.test(currency)) return null
+  const magnitude =
+    BigInt(parts[2]) * 1_000_000_000n + BigInt((parts[3] ?? '').padEnd(9, '0'))
+  const nanos = parts[1] ? -magnitude : magnitude
+  if (
+    nanos < -9_223_372_036_854_775_808n ||
+    nanos > 9_223_372_036_854_775_807n
+  ) {
+    return null
+  }
+  return { nanos: nanos.toString(), currency }
+}
+
+/** Preserve all nanos in a decimal form field without locale separators. */
+export function moneyAmountToDecimal(amount: MoneyAmount): string {
+  if (!/^-?\d+$/.test(amount.nanos)) return ''
+  const nanos = BigInt(amount.nanos)
+  const magnitude = nanos < 0n ? -nanos : nanos
+  const whole = magnitude / 1_000_000_000n
+  const fraction = (magnitude % 1_000_000_000n)
+    .toString()
+    .padStart(9, '0')
+    .replace(/0+$/, '')
+  const decimal = fraction ? `.${fraction}` : ''
+  return `${nanos < 0n ? '-' : ''}${whole}${decimal}`
+}
+
+/** Format an exact decimal amount in its recorded currency. */
+export function formatDecimalMoneyAmount(
+  amount: { amount: string; currency: string } | null | undefined,
+  locale?: Intl.LocalesArgument
+): string {
+  return formatMoneyAmount(
+    amount ? parseDecimalMoneyAmount(amount.amount, amount.currency) : null,
+    locale
+  )
+}
+
 export interface CurrencyFormatOptions {
   /** Fraction digits to use when |value| >= 1 */
   digitsLarge?: number

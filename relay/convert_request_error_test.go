@@ -3,7 +3,7 @@ package relay
 import (
 	"bytes"
 	"encoding/base64"
-	"errors"
+
 	"fmt"
 	"image"
 	"image/png"
@@ -18,8 +18,9 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/pkg/billingexpr"
+
 	"github.com/QuantumNous/new-api/pkg/protocol"
+	"github.com/QuantumNous/new-api/relay/channel/ali"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -33,24 +34,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-type imageReservation struct {
-	held, limit int
-}
-
-func (s *imageReservation) Reserve(quota int) error {
-	if quota > s.limit {
-		return errors.New("insufficient image quota")
-	}
-	s.held = max(s.held, quota)
-	return nil
-}
-func (s *imageReservation) GetPreConsumedQuota() int { return s.held }
-func (*imageReservation) Settle(int) error           { return nil }
-func (*imageReservation) Refund(*gin.Context)        {}
-func (*imageReservation) NeedsRefund() bool          { return false }
-
-func (s *imageReservation) ReserveBeforeSubmit(quota int) error { return s.Reserve(quota) }
 
 func TestMediaPreparationValidatesAndSendsFinalQuantity(t *testing.T) {
 	service.InitHttpClient()
@@ -385,86 +368,6 @@ func TestMediaCloudflareTranscriptionUsesRawAudioAndCanonicalText(t *testing.T) 
 	assert.Equal(t, "hello", info.ResponseFacts.GeneratedText)
 }
 
-func TestImageRequestReservesFinalQuantityBeforeUpstream(t *testing.T) {
-	service.InitHttpClient()
-	for _, tc := range []struct {
-		name, body                                    string
-		tiered, passThrough, insufficient, retryReset bool
-		override                                      any
-		count, status                                 int
-	}{
-		{name: "top-level count", body: `{"model":"gpt-image-2","n":2,"parameters":{}}`, count: 2},
-		{name: "legacy channel quantity override", body: `{"model":"gpt-image-2","n":1}`, override: 4, count: 4},
-		{name: "expression channel quantity override", body: `{"model":"gpt-image-2","n":1}`, override: 4, count: 4, tiered: true},
-		{name: "pass-through quantity", body: `{"model":"gpt-image-2","n":2,"parameters":{}}`, count: 2, passThrough: true},
-		{name: "oversized override rejected", body: `{"model":"gpt-image-2","n":1}`, override: 129, status: http.StatusBadRequest},
-		{name: "insufficient reservation blocks upstream", body: `{"model":"gpt-image-2","n":1}`, override: 4, count: 4, insufficient: true, status: http.StatusForbidden},
-		{name: "retry drops the previous attempt's quantity", body: `{"model":"gpt-image-2","n":1}`, count: 1, retryReset: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			received := make(chan []byte, 1)
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				body, err := io.ReadAll(r.Body)
-				if err == nil {
-					received <- body
-				}
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusBadGateway)
-				_, _ = io.WriteString(w, `{"error":{"message":"fixture upstream failure","type":"upstream_error"}}`)
-			}))
-			t.Cleanup(upstream.Close)
-			c, _ := gin.CreateTestContext(httptest.NewRecorder())
-			c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(tc.body))
-			c.Request.Header.Set("Content-Type", "application/json")
-			common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenAI)
-			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstream.URL)
-			common.SetContextKey(c, constant.ContextKeyChannelSetting, dto.ProviderSettings{PassThroughBodyEnabled: tc.passThrough})
-			if tc.override != nil {
-				common.SetContextKey(c, constant.ContextKeyChannelParamOverride, map[string]any{"operations": []any{map[string]any{"path": "n", "mode": "set", "value": tc.override}}})
-			}
-			request, err := helper.GetAndValidOpenAIImageRequest(c, relayconstant.RelayModeImagesGenerations)
-			require.NoError(t, err)
-			reservation := &imageReservation{held: 20000, limit: 500000}
-			if tc.insufficient {
-				reservation.limit = reservation.held
-			}
-			info := &relaycommon.RelayInfo{Request: request, OriginModelName: "gpt-image-2", RelayMode: relayconstant.RelayModeImagesGenerations,
-				RequestURLPath: c.Request.URL.Path, Billing: reservation,
-				PriceData: hosttypes.PriceData{UsePrice: true, ModelPrice: 0.04, GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1}},
-			}
-			if tc.tiered {
-				expr := `tier("image", fixed(0.04)) * image_count`
-				info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{BillingMode: "tiered_expr", ExprString: expr, ExprHash: billingexpr.ExprHashString(expr), GroupRatio: 1, QuotaPerUnit: common.QuotaPerUnit, EstimatedImageCount: common.GetPointer(1)}
-				info.BillingRequestInput = &billingexpr.RequestInput{Body: []byte(tc.body), ImageCount: common.GetPointer(1)}
-				info.PriceData.UsePrice = false
-			}
-			if tc.retryReset {
-				reservation.held = 80000
-				info.PriceData.AddOtherRatio("n", 4)
-				info.BillingImageCount = common.GetPointer(3)
-			}
-			apiErr := ImageHelper(c, info)
-			require.NotNil(t, apiErr)
-			if tc.status != 0 {
-				assert.Equal(t, tc.status, apiErr.StatusCode)
-				assert.Empty(t, received, "no upstream submission before quantity validation and reservation")
-				return
-			}
-			assert.Equal(t, http.StatusBadGateway, apiErr.StatusCode)
-			require.Len(t, received, 1)
-			body := <-received
-			assert.Equal(t, int64(tc.count), ojson.GetBytes(body, "n").Int())
-			assert.Equal(t, tc.count*20000, info.PriceData.QuotaToPreConsume)
-			assert.GreaterOrEqual(t, reservation.held, info.PriceData.QuotaToPreConsume)
-			assert.Nil(t, info.BillingImageCount)
-			if tc.tiered {
-				assert.Equal(t, tc.body, string(info.BillingRequestInput.Body))
-				assert.Equal(t, 1, *info.BillingRequestInput.ImageCount)
-			}
-		})
-	}
-}
-
 func TestOptInSafeToolLossRejectedAsBadRequestWithAdminDiagnostics(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -633,9 +536,9 @@ func TestGeminiThinkingControlsConvertBestEffort(t *testing.T) {
 }
 
 // An Ali image model the alibaba task plugin does not claim is rejected by the
-// adaptor with a classified 400 that skips retries. ImageHelper must surface
-// that classification unchanged instead of wrapping it into a retryable
-// conversion failure that other channels would then be asked to serve.
+// pure Provider converter with a classified 400 that skips retries. Preserve
+// that classification without executing the retired request/billing wrapper
+// or asking another Channel to serve an unsupported model.
 func TestImageHelperKeepsAdaptorClassifiedConvertError(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"wanx-style-repaint-v1","prompt":"a cat"}`))
@@ -645,12 +548,15 @@ func TestImageHelperKeepsAdaptorClassifiedConvertError(t *testing.T) {
 	request, err := helper.GetAndValidOpenAIImageRequest(c, relayconstant.RelayModeImagesGenerations)
 	require.NoError(t, err)
 	info := &relaycommon.RelayInfo{Request: request, OriginModelName: "wanx-style-repaint-v1", RelayMode: relayconstant.RelayModeImagesGenerations,
-		RequestURLPath: c.Request.URL.Path, Billing: &imageReservation{limit: 500000},
-		PriceData: hosttypes.PriceData{UsePrice: true, ModelPrice: 0.04, GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1}},
+		ProviderMeta:   &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeAli, UpstreamModelName: "wanx-style-repaint-v1"},
+		RequestURLPath: c.Request.URL.Path,
+		PriceData:      hosttypes.PriceData{UsePrice: true, ModelPrice: 0.04, GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1}},
 	}
 
-	apiErr := ImageHelper(c, info)
-
+	converter := &ali.Protocol{}
+	_, err = converter.ConvertImageRequest(c, info, *request)
+	var apiErr *types.NewAPIError
+	require.ErrorAs(t, err, &apiErr)
 	require.NotNil(t, apiErr)
 	assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
 	assert.Equal(t, types.ErrorCodeInvalidRequest, apiErr.GetErrorCode())

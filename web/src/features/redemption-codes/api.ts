@@ -72,7 +72,7 @@ export async function createRedemption(
 
 // Update redemption code
 export async function updateRedemption(
-  data: RedemptionFormData & { id: number }
+  data: Omit<RedemptionFormData, 'count' | 'status'> & { id: number }
 ): Promise<ApiResponse<Redemption>> {
   const res = await api.put('/api/redemption/', data)
   return res.data

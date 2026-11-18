@@ -8,7 +8,7 @@ func IsMediaGatewayEndpoint(method, path string) bool {
 		return false
 	}
 	switch path {
-	case "/v1/images/generations", "/v1/images/edits", "/v1/audio/speech", "/v1/audio/transcriptions":
+	case "/v1/images/generations", "/v1/images/edits", "/v1/audio/speech", "/v1/audio/transcriptions", "/v1/audio/translations":
 		return true
 	default:
 		return false

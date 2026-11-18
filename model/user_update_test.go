@@ -4,13 +4,19 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"math"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 
+	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -22,13 +28,319 @@ func setupUserUpdateTestState(t *testing.T) {
 	require.NoError(t, DB.Exec("DELETE FROM users").Error)
 
 	oldRedisEnabled := common.RedisEnabled
-	oldBatchUpdateEnabled := common.BatchUpdateEnabled
 	common.RedisEnabled = false
-	common.BatchUpdateEnabled = false
 	t.Cleanup(func() {
 		common.RedisEnabled = oldRedisEnabled
-		common.BatchUpdateEnabled = oldBatchUpdateEnabled
 	})
+}
+
+func setupRegistrationRewardTest(t *testing.T, reward string) {
+	t.Helper()
+	UseTestDatabases(t)
+	require.NoError(t, DB.AutoMigrate(&User{}, &Option{}, &FXRate{}, &ReferralOpening{}))
+	require.NoError(t, migrateWalletLedger(DB))
+	previous := config.GlobalConfig.Get("reward_setting")
+	previousPayment := *operation_setting.GetPaymentSetting()
+	common.OptionMapRWMutex.Lock()
+	previousOptions := common.OptionMap
+	common.OptionMap = map[string]string{}
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		if previous != nil {
+			config.GlobalConfig.Register("reward_setting", previous)
+		}
+		*operation_setting.GetPaymentSetting() = previousPayment
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptions
+		common.OptionMapRWMutex.Unlock()
+	})
+	operation_setting.GetPaymentSetting().ComplianceConfirmed = true
+	operation_setting.GetPaymentSetting().ComplianceTermsVersion = operation_setting.CurrentComplianceTermsVersion
+	require.NoError(t, UpdateOption("reward_setting.config", reward))
+}
+
+func TestUserRegistrationRewardsAreAtomicMoney(t *testing.T) {
+	setupRegistrationRewardTest(t, `{"signup":{"nanos":"9007199254740993","currency":"USD"},"inviter":{"nanos":"300000001","currency":"USD"},"invitee":{"nanos":"200000001","currency":"USD"}}`)
+	inviter := User{Username: "reward-inviter", Password: "unused", AffCode: "reward-inviter", Status: common.UserStatusEnabled}
+	require.NoError(t, DB.Create(&inviter).Error)
+	created := User{Username: "reward-new-user", Status: common.UserStatusEnabled}
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error { return created.InsertWithTx(tx, inviter.Id) }))
+	wallet, err := GetUserWallet(created.Id)
+	require.NoError(t, err)
+	require.NotNil(t, wallet, "registration must credit the money wallet in its creation transaction")
+	assert.Equal(t, money.Amount{Nanos: 9007199454740994, Currency: "USD"}, wallet.Balance)
+	var persisted User
+	require.NoError(t, DB.First(&persisted, created.Id).Error)
+	assert.Zero(t, persisted.Quota, "registration must stop writing legacy int quota")
+	assert.Equal(t, inviter.Id, persisted.InviterId)
+	created.FinishInsert(inviter.Id)
+	created.FinalizeOAuthUserCreation(inviter.Id)
+	var entries int64
+	require.NoError(t, DB.Model(&LedgerEntry{}).Count(&entries).Error)
+	assert.EqualValues(t, 3, entries, "post-commit helpers must not award a second time")
+}
+
+func TestRegistrationRewardFailureRollsBackUserAndAllAwards(t *testing.T) {
+	setupRegistrationRewardTest(t, `{"signup":{"nanos":"7","currency":"USD"},"inviter":{"nanos":"3","currency":"CNY"},"invitee":{"nanos":"5","currency":"USD"}}`)
+	inviter := User{Username: "fx-inviter", Status: common.UserStatusEnabled}
+	require.NoError(t, DB.Create(&inviter).Error)
+	created := User{Username: "fx-invitee", Status: common.UserStatusEnabled}
+	require.Error(t, created.Insert(inviter.Id), "missing accounting FX must roll back the whole registration")
+	var count int64
+	require.NoError(t, DB.Model(&User{}).Where("username = ?", created.Username).Count(&count).Error)
+	assert.Zero(t, count)
+	require.NoError(t, DB.Model(&LedgerEntry{}).Count(&count).Error)
+	assert.Zero(t, count)
+	require.NoError(t, DB.First(&inviter, inviter.Id).Error)
+	assert.Zero(t, inviter.AffCount)
+
+	require.NoError(t, DB.Create(&FXRate{FromCurrency: "CNY", ToCurrency: "USD", Rate: decimal.RequireFromString("0.5")}).Error)
+	created.Id = 0
+	rollback := errors.New("binding transaction failed")
+	require.ErrorIs(t, DB.Transaction(func(tx *gorm.DB) error {
+		if err := created.InsertWithTx(tx, inviter.Id); err != nil {
+			return err
+		}
+		return rollback
+	}), rollback)
+	require.NoError(t, DB.Model(&LedgerEntry{}).Count(&count).Error)
+	assert.Zero(t, count)
+	created.Id = 0
+	require.NoError(t, created.Insert(inviter.Id))
+	rewards, err := GetReferralRewards(inviter.Id)
+	require.NoError(t, err)
+	assert.Equal(t, money.Amount{Nanos: 1, Currency: "USD"}, rewards.Available)
+	assert.Equal(t, CheckinAwardTotal{Nanos: "1", Currency: "USD"}, rewards.Earned)
+	assert.Equal(t, 1, rewards.Invited)
+	var entry LedgerEntry
+	require.NoError(t, DB.Where("account_type = ?", LedgerAccountUserReferral).First(&entry).Error)
+	assert.Equal(t, money.Amount{Nanos: 3, Currency: "CNY"}, entry.SourceAmount)
+	require.True(t, entry.FxRate.Valid)
+	assert.Equal(t, "0.5", entry.FxRate.Decimal.String())
+	wallet, err := GetUserWallet(created.Id)
+	require.NoError(t, err)
+	assert.Equal(t, money.Amount{Nanos: 12, Currency: "USD"}, wallet.Balance)
+
+	_, err = PostLedgerEntries(LedgerPosting{Account: userReferralAccount(inviter.Id), Type: LedgerEntryTopUp, Amount: money.Amount{Nanos: math.MaxInt64 - 1, Currency: "USD"}})
+	require.NoError(t, err)
+	overflow := User{Username: "overflow-invitee", Status: common.UserStatusEnabled}
+	require.ErrorIs(t, overflow.Insert(inviter.Id), money.ErrOverflow)
+	require.NoError(t, DB.Model(&User{}).Where("username = ?", overflow.Username).Count(&count).Error)
+	assert.Zero(t, count)
+	require.NoError(t, DB.First(&inviter, inviter.Id).Error)
+	assert.Equal(t, 1, inviter.AffCount)
+}
+
+func TestReferralRewardTransferRepaysDebtAndReplaysExactlyOnce(t *testing.T) {
+	setupRegistrationRewardTest(t, `{"signup":{"nanos":"0","currency":"USD"},"inviter":{"nanos":"0","currency":"USD"},"invitee":{"nanos":"0","currency":"USD"}}`)
+	user := User{Username: "referral-transfer", Status: common.UserStatusEnabled, Quota: 777}
+	require.NoError(t, DB.Create(&user).Error)
+	_, err := PostLedgerEntries(LedgerPosting{Account: userReferralAccount(user.Id), Type: LedgerEntryTopUp, Amount: money.Amount{Nanos: 9007199254740993, Currency: "USD"}})
+	require.NoError(t, err)
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		_, err := postLedgerEntries(tx, []LedgerPosting{{Account: UserReceivableAccount(user.Id), Type: LedgerEntryCharge, Amount: money.Amount{Nanos: 2, Currency: "USD"}, RequestId: "referral-debt"}})
+		return err
+	}))
+	amount := money.Amount{Nanos: 9007199254740993, Currency: "USD"}
+	entry, err := TransferReferralRewards(user.Id, amount, "lost-response")
+	require.NoError(t, err)
+	replayed, err := TransferReferralRewards(user.Id, amount, "lost-response")
+	require.NoError(t, err)
+	assert.Equal(t, entry.Id, replayed.Id)
+	_, err = TransferReferralRewards(user.Id, money.Amount{Nanos: 1, Currency: "USD"}, "lost-response")
+	require.Error(t, err, "an identity must not be reused for a changed amount")
+	for _, invalid := range []money.Amount{{Nanos: 1, Currency: "USD"}, {Nanos: 1, Currency: "CNY"}, {Currency: "USD"}, {Nanos: -1, Currency: "USD"}} {
+		_, err := TransferReferralRewards(user.Id, invalid, "another-transfer")
+		require.Error(t, err)
+	}
+	_, err = ReverseLedgerEntry(entry.Id, 0, "cannot reverse one side")
+	require.Error(t, err)
+	rewards, err := GetReferralRewards(user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, money.Amount{Currency: "USD"}, rewards.Available)
+	assert.Equal(t, CheckinAwardTotal{Nanos: "9007199254740993", Currency: "USD"}, rewards.Earned)
+	wallet, err := GetUserWallet(user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, money.Amount{Nanos: 9007199254740991, Currency: "USD"}, wallet.Balance)
+	debt, err := GetUserOutstanding(user.Id)
+	require.NoError(t, err)
+	assert.Zero(t, debt.Nanos)
+	require.NoError(t, DB.First(&user, user.Id).Error)
+	assert.Equal(t, 777, user.Quota)
+	var transfers int64
+	require.NoError(t, DB.Model(&LedgerEntry{}).Where("type = ?", LedgerEntryTransfer).Count(&transfers).Error)
+	assert.EqualValues(t, 2, transfers)
+	reconciliation, err := ReconcileWallets(100)
+	require.NoError(t, err)
+	assert.Empty(t, reconciliation.Mismatches)
+}
+
+func TestReferralRewardConcurrentTransfersCannotDuplicateOrOverspend(t *testing.T) {
+	for _, sameID := range []bool{true, false} {
+		t.Run(strconv.FormatBool(sameID), func(t *testing.T) {
+			setupRegistrationRewardTest(t, `{"signup":{"nanos":"0","currency":"USD"},"inviter":{"nanos":"0","currency":"USD"},"invitee":{"nanos":"0","currency":"USD"}}`)
+			user := User{Username: "concurrent-referral", Status: common.UserStatusEnabled}
+			require.NoError(t, DB.Create(&user).Error)
+			_, err := PostLedgerEntries(LedgerPosting{Account: userReferralAccount(user.Id), Type: LedgerEntryTopUp, Amount: money.Amount{Nanos: 10, Currency: "USD"}})
+			require.NoError(t, err)
+			db, err := DB.DB()
+			require.NoError(t, err)
+			db.SetMaxOpenConns(2)
+			t.Cleanup(func() { db.SetMaxOpenConns(1) })
+			type result struct {
+				entry *LedgerEntry
+				err   error
+			}
+			results := make(chan result, 2)
+			start := make(chan struct{})
+			for i := range 2 {
+				go func() {
+					<-start
+					id := "same"
+					if !sameID {
+						id = strconv.Itoa(i)
+					}
+					entry, err := TransferReferralRewards(user.Id, money.Amount{Nanos: 7, Currency: "USD"}, id)
+					results <- result{entry: entry, err: err}
+				}()
+			}
+			close(start)
+			first, second := <-results, <-results
+			if sameID {
+				require.NoError(t, first.err)
+				require.NoError(t, second.err)
+				assert.Equal(t, first.entry.Id, second.entry.Id)
+			} else {
+				assert.NotEqual(t, first.err == nil, second.err == nil, "only one competing transfer can spend the balance")
+			}
+			rewards, err := GetReferralRewards(user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, money.Amount{Nanos: 3, Currency: "USD"}, rewards.Available)
+			wallet, err := GetUserWallet(user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, money.Amount{Nanos: 7, Currency: "USD"}, wallet.Balance)
+		})
+	}
+}
+
+func TestReferralRewardsFollowWalletBeforeUserLockOrder(t *testing.T) {
+	for _, operation := range []string{"transfer", "registration"} {
+		t.Run(operation, func(t *testing.T) {
+			setupRegistrationRewardTest(t, `{"signup":{"nanos":"0","currency":"USD"},"inviter":{"nanos":"1","currency":"USD"},"invitee":{"nanos":"0","currency":"USD"}}`)
+			user := User{Username: "lock-order-inviter", Status: common.UserStatusEnabled}
+			require.NoError(t, DB.Create(&user).Error)
+			_, err := PostLedgerEntries(LedgerPosting{Account: userReferralAccount(user.Id), Type: LedgerEntryTopUp, Amount: money.Amount{Nanos: 10, Currency: "USD"}})
+			require.NoError(t, err)
+			checkout := DB.Begin()
+			require.NoError(t, checkout.Error)
+			defer checkout.Rollback()
+			var wallet Wallet
+			require.NoError(t, lockForUpdate(checkout).Where("account_type = ? AND owner_id = ?", LedgerAccountUserReferral, user.Id).Take(&wallet).Error)
+			waiting := make(chan struct{})
+			var once sync.Once
+			require.NoError(t, DB.Callback().Query().Before("gorm:query").Register("test_reward_wallet_wait", func(tx *gorm.DB) {
+				if tx.Statement.Table == "wallets" && tx.Statement.Clauses["FOR"].Name != "" {
+					once.Do(func() { close(waiting) })
+				}
+			}))
+			defer DB.Callback().Query().Remove("test_reward_wallet_wait")
+			finished := make(chan error, 1)
+			go func() {
+				if operation == "transfer" {
+					_, err := TransferReferralRewards(user.Id, money.Amount{Nanos: 1, Currency: "USD"}, "concurrent-checkout")
+					finished <- err
+					return
+				}
+				newUser := User{Username: "lock-order-invitee"}
+				finished <- newUser.Insert(user.Id)
+			}()
+			select {
+			case <-waiting:
+			case <-time.After(5 * time.Second):
+				t.Fatal("reward transaction did not reach the shared wallet lock")
+			}
+			require.NoError(t, checkout.Exec("SET LOCAL lock_timeout = '300ms'").Error)
+			err = checkout.Model(&User{}).Where("id = ?", user.Id).UpdateColumn("request_count", gorm.Expr("request_count + 1")).Error
+			assert.NoError(t, err, "an operation waiting for a wallet must not already hold the user row needed by checkout fulfillment")
+			if err != nil {
+				require.NoError(t, checkout.Rollback().Error)
+			} else {
+				require.NoError(t, checkout.Commit().Error)
+			}
+			select {
+			case err := <-finished:
+				require.NoError(t, err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("reward transaction did not finish after the wallet lock was released")
+			}
+		})
+	}
+}
+
+func TestMigrateUserRewardsPreservesUnboundedHistory(t *testing.T) {
+	UseTestDatabases(t)
+	require.NoError(t, DB.AutoMigrate(&User{}, &Option{}))
+	require.NoError(t, migrateWalletLedger(DB))
+	require.NoError(t, DB.Exec(`ALTER TABLE "users" ADD COLUMN "aff_quota" bigint DEFAULT 0, ADD COLUMN "aff_history" bigint DEFAULT 0`).Error)
+	user := User{Username: "unbounded-referral", Status: common.UserStatusEnabled}
+	require.NoError(t, DB.Create(&user).Error)
+	require.NoError(t, DB.Model(&user).Updates(map[string]any{"aff_history": int64(math.MaxInt64)}).Error)
+	for range 2 {
+		require.NoError(t, migrateUserRewards(DB))
+		rewards, err := GetReferralRewards(user.Id)
+		require.NoError(t, err)
+		assert.Zero(t, rewards.Available.Nanos)
+		assert.Equal(t, CheckinAwardTotal{Nanos: "18446744073709551614000", Currency: "USD"}, rewards.Earned)
+	}
+}
+
+func TestMigrateUserRewardsPreservesObligationsTwice(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(strconv.FormatBool(legacy), func(t *testing.T) {
+			UseTestDatabases(t)
+			require.NoError(t, DB.AutoMigrate(&User{}, &Option{}))
+			require.NoError(t, migrateWalletLedger(DB))
+			user := User{Username: "migration-referral", Status: common.UserStatusEnabled}
+			require.NoError(t, DB.Create(&user).Error)
+			if legacy {
+				require.NoError(t, DB.Exec(`ALTER TABLE "users" ADD COLUMN "aff_quota" bigint DEFAULT 0, ADD COLUMN "aff_history" bigint DEFAULT 0`).Error)
+				require.NoError(t, DB.Model(&user).Updates(map[string]any{"aff_quota": 500001, "aff_history": 1500002}).Error)
+				require.NoError(t, DB.Create(&[]Option{{Key: "QuotaForNewUser", Value: "1"}, {Key: "QuotaForInviter", Value: "500001"}, {Key: "QuotaForInvitee", Value: "0"}}).Error)
+			}
+			for range 2 {
+				require.NoError(t, migrateUserRewards(DB))
+				rewards, err := GetReferralRewards(user.Id)
+				require.NoError(t, err)
+				if legacy {
+					assert.Equal(t, money.Amount{Nanos: 1000002000, Currency: "USD"}, rewards.Available)
+					assert.Equal(t, CheckinAwardTotal{Nanos: "3000004000", Currency: "USD"}, rewards.Earned)
+					var option Option
+					require.NoError(t, DB.First(&option, `"key" = ?`, "reward_setting.config").Error)
+					var reward operation_setting.RewardConfig
+					require.NoError(t, common.UnmarshalJsonStr(option.Value, &reward))
+					assert.Equal(t, money.Amount{Nanos: 2000, Currency: "USD"}, reward.Signup)
+					assert.Equal(t, money.Amount{Nanos: 1000002000, Currency: "USD"}, reward.Inviter)
+				} else {
+					assert.Zero(t, rewards.Available.Nanos)
+				}
+				assert.False(t, DB.Migrator().HasColumn("users", "aff_quota"))
+				assert.False(t, DB.Migrator().HasColumn("users", "aff_history"))
+				wallet, err := GetUserWallet(user.Id)
+				require.NoError(t, err)
+				assert.Nil(t, wallet, "pending rewards must not be credited as spendable wallet funds during migration")
+			}
+			if legacy {
+				require.Error(t, DB.Model(&ReferralOpening{}).Where("user_id = ?", user.Id).Update("earned_nanos", 0).Error)
+				_, err := TransferReferralRewards(user.Id, money.Amount{Nanos: 1000002000, Currency: "USD"}, "migrated-transfer")
+				require.NoError(t, err)
+				require.NoError(t, migrateUserRewards(DB))
+				rewards, err := GetReferralRewards(user.Id)
+				require.NoError(t, err)
+				assert.Zero(t, rewards.Available.Nanos, "a repeated startup must not reinstate transferred opening funds")
+				assert.Equal(t, "3000004000", rewards.Earned.Nanos)
+			}
+		})
+	}
 }
 
 func createUserBindTestUser(t *testing.T) User {
@@ -47,20 +359,20 @@ func createUserBindTestUser(t *testing.T) User {
 }
 
 func TestUserUpdateDoesNotOverwriteConcurrentAccountingOrTokenChanges(t *testing.T) {
-	setupUserUpdateTestState(t)
+	UseTestDatabases(t)
+	require.NoError(t, DB.AutoMigrate(&User{}))
+	require.NoError(t, migrateWalletLedger(DB))
 
 	user := User{
-		Id:              1,
-		Username:        "quota-race-user",
-		Password:        "password",
-		DisplayName:     "before",
-		Status:          common.UserStatusEnabled,
-		Quota:           1000,
-		UsedQuota:       20,
-		RequestCount:    3,
-		AffCount:        2,
-		AffQuota:        800,
-		AffHistoryQuota: 1200,
+		Id:           1,
+		Username:     "quota-race-user",
+		Password:     "password",
+		DisplayName:  "before",
+		Status:       common.UserStatusEnabled,
+		Quota:        1000,
+		UsedQuota:    20,
+		RequestCount: 3,
+		AffCount:     2,
 	}
 	user.SetAccessToken(testAccessToken("old-token"))
 	require.NoError(t, DB.Create(&user).Error)
@@ -73,11 +385,11 @@ func TestUserUpdateDoesNotOverwriteConcurrentAccountingOrTokenChanges(t *testing
 		"used_quota":    gorm.Expr("used_quota + ?", 400),
 		"request_count": gorm.Expr("request_count + ?", 1),
 		"aff_count":     gorm.Expr("aff_count + ?", 1),
-		"aff_quota":     gorm.Expr("aff_quota - ?", 500),
-		"aff_history":   gorm.Expr("aff_history + ?", 500),
 		"access_token":  testAccessToken("rotated-token"),
 	}).Error)
 
+	_, err = PostLedgerEntries(LedgerPosting{Account: UserWalletAccount(user.Id), Type: LedgerEntryTopUp, Amount: money.Amount{Nanos: 500, Currency: "USD"}})
+	require.NoError(t, err)
 	staleUser.DisplayName = "after"
 	require.NoError(t, staleUser.Update(false))
 
@@ -88,68 +400,94 @@ func TestUserUpdateDoesNotOverwriteConcurrentAccountingOrTokenChanges(t *testing
 	assert.Equal(t, 420, got.UsedQuota)
 	assert.Equal(t, 4, got.RequestCount)
 	assert.Equal(t, 3, got.AffCount)
-	assert.Equal(t, 300, got.AffQuota)
-	assert.Equal(t, 1700, got.AffHistoryQuota)
+	wallet, err := GetUserWallet(user.Id)
+	require.NoError(t, err)
+	require.NotNil(t, wallet)
+	assert.Equal(t, money.Amount{Nanos: 500, Currency: "USD"}, wallet.Balance)
 	assert.Equal(t, testAccessToken("rotated-token"), got.GetAccessToken())
 }
 
 func TestUsageAccountingSupportsSignedDirectAndBatchDeltas(t *testing.T) {
-	setupUserUpdateTestState(t)
-	resetBatchUpdateTestState(t)
+	user, _ := subscriptionFundingFixture(t, "wallet_only", 2000, 0, false, false)
+	require.NoError(t, DB.AutoMigrate(&Provider{}))
+	require.NoError(t, DB.Model(&user).Updates(map[string]any{"used_quota": 1000, "request_count": 3}).Error)
+	provider := Provider{Id: 17, Name: "usage-adjustment-provider", Key: "fixture", Status: common.ChannelStatusEnabled, UsedQuota: 1000}
+	require.NoError(t, DB.Create(&provider).Error)
+	request := GatewayRequest{ID: "signed-usage", UserID: user.Id, SaleFXRate: "1"}
+	require.NoError(t, ReserveGateway(&request, usd(1000), usd(1000)))
+	intent := subscriptionFundingIntent(request, 1000)
+	intent.Attempts[0].Cost, intent.Attempts[0].ConvertedCost = usd(1000), usd(1000)
+	require.NoError(t, PrepareGatewaySettlement(intent))
+	_, err := SettleGateway(request.ID)
+	require.NoError(t, err)
 
-	user := User{
-		Id:           10,
-		Username:     "usage-adjustment-user",
-		Password:     "password",
-		Status:       common.UserStatusEnabled,
-		UsedQuota:    1000,
-		RequestCount: 3,
+	for _, phase := range []struct {
+		name     string
+		deltas   []int64
+		batched  bool
+		consumed int64
+	}{
+		{name: "direct", deltas: []int64{-200, 50}, consumed: 850},
+		{name: "batch", deltas: []int64{400, -100}, batched: true, consumed: 1150},
+	} {
+		var postings []LedgerPosting
+		for i, delta := range phase.deltas {
+			kind := LedgerEntryCharge
+			if delta < 0 {
+				kind = LedgerEntryRefund
+			}
+			prefix := phase.name + "-" + strconv.Itoa(i)
+			correction := []LedgerPosting{
+				{Account: UserWalletAccount(user.Id), Type: kind, Amount: usd(-delta), RequestId: request.ID, IdempotencyKey: prefix + "-wallet"},
+				{Account: PlatformRevenueAccount("USD"), Type: kind, Amount: usd(delta), RequestId: request.ID, IdempotencyKey: prefix + "-revenue"},
+				{Account: ProviderPayableAccount(provider.Id, "USD"), Type: kind, Amount: usd(delta), RequestId: request.ID, IdempotencyKey: prefix + "-payable"},
+			}
+			if !phase.batched {
+				_, err = PostLedgerEntries(correction...)
+				require.NoError(t, err)
+			}
+			postings = append(postings, correction...)
+		}
+		if phase.batched {
+			_, err = PostLedgerEntries(postings...)
+			require.NoError(t, err)
+		}
+		var entriesBefore, entriesAfter int64
+		require.NoError(t, DB.Model(&LedgerEntry{}).Count(&entriesBefore).Error)
+		_, err = PostLedgerEntries(postings...)
+		require.ErrorIs(t, err, ErrDuplicateLedgerEntry)
+		require.NoError(t, DB.Model(&LedgerEntry{}).Count(&entriesAfter).Error)
+		assert.Equal(t, entriesBefore, entriesAfter, "replayed signed corrections cannot create another entry")
+
+		wallet, err := GetUserWallet(user.Id)
+		require.NoError(t, err)
+		assert.Equal(t, usd(2000-phase.consumed), wallet.Balance)
+		for _, account := range []LedgerAccount{PlatformRevenueAccount("USD"), ProviderPayableAccount(provider.Id, "USD")} {
+			var balance Wallet
+			require.NoError(t, DB.Where("account_type = ? AND owner_id = ? AND balance_currency = ?", account.Type, account.OwnerId, account.Currency).First(&balance).Error)
+			assert.Equal(t, usd(phase.consumed), balance.Balance, "signed corrections must reach both revenue and original Provider payable")
+		}
+		summaries, err := GetUserWalletSummaries(t.Context(), []int{user.Id})
+		require.NoError(t, err)
+		require.Len(t, summaries, 1)
+		assert.Equal(t, MoneyTotal{Nanos: strconv.FormatInt(phase.consumed, 10), Currency: "USD"}, summaries[0].Consumed)
+		var savedUser User
+		var savedProvider Provider
+		require.NoError(t, DB.First(&savedUser, user.Id).Error)
+		require.NoError(t, DB.First(&savedProvider, provider.Id).Error)
+		assert.Equal(t, 1000, savedUser.UsedQuota, "historical usage is read-only, not a second accounting balance")
+		assert.Equal(t, 3, savedUser.RequestCount, "corrections are not new requests")
+		assert.EqualValues(t, 1000, savedProvider.UsedQuota)
+		var originalCharge LedgerEntry
+		require.NoError(t, DB.Where("wallet_id = ? AND request_id = ? AND type = ?", wallet.Id, request.ID, LedgerEntryCharge).Order("id").First(&originalCharge).Error)
+		assert.Equal(t, usd(-1000), originalCharge.Amount, "corrections append history instead of rewriting the original charge")
 	}
-	channel := Provider{
-		Id:        10,
-		Name:      "usage-adjustment-channel",
-		Key:       "sk-test",
-		Status:    common.ChannelStatusEnabled,
-		UsedQuota: 1000,
-	}
-	require.NoError(t, DB.Create(&user).Error)
-	require.NoError(t, DB.Create(&channel).Error)
-
-	UpdateUserUsedQuota(user.Id, -200)
-	UpdateUserUsedQuota(user.Id, 50)
-	UpdateProviderUsedQuota(channel.Id, -200)
-	UpdateProviderUsedQuota(channel.Id, 50)
-
-	var got User
-	require.NoError(t, DB.Select("used_quota", "request_count").First(&got, user.Id).Error)
-	assert.Equal(t, 850, got.UsedQuota)
-	assert.Equal(t, 3, got.RequestCount)
-	var gotChannel Provider
-	require.NoError(t, DB.Select("used_quota").First(&gotChannel, channel.Id).Error)
-	assert.Equal(t, int64(850), gotChannel.UsedQuota)
-
-	common.BatchUpdateEnabled = true
-	UpdateUserUsedQuota(user.Id, 400)
-	UpdateUserUsedQuota(user.Id, -100)
-	UpdateProviderUsedQuota(channel.Id, 400)
-	UpdateProviderUsedQuota(channel.Id, -100)
-
-	require.NoError(t, DB.Select("used_quota", "request_count").First(&got, user.Id).Error)
-	assert.Equal(t, 850, got.UsedQuota, "batch deltas must remain queued until flush")
-	assert.Equal(t, 3, got.RequestCount)
-	require.NoError(t, DB.Select("used_quota").First(&gotChannel, channel.Id).Error)
-	assert.Equal(t, int64(850), gotChannel.UsedQuota, "batch deltas must remain queued until flush")
-
-	batchUpdate()
-	require.NoError(t, DB.Select("used_quota", "request_count").First(&got, user.Id).Error)
-	assert.Equal(t, 1150, got.UsedQuota)
-	assert.Equal(t, 3, got.RequestCount)
-	require.NoError(t, DB.Select("used_quota").First(&gotChannel, channel.Id).Error)
-	assert.Equal(t, int64(1150), gotChannel.UsedQuota)
 }
 
 func TestRevokeUserAccessTokenOnlyClearsLegacyToken(t *testing.T) {
-	setupUserUpdateTestState(t)
+	UseTestDatabases(t)
+	require.NoError(t, DB.AutoMigrate(&User{}))
+	require.NoError(t, migrateWalletLedger(DB))
 
 	createdAt := int64(100)
 	user := User{
@@ -159,8 +497,6 @@ func TestRevokeUserAccessTokenOnlyClearsLegacyToken(t *testing.T) {
 		DisplayName:          "before",
 		Status:               common.UserStatusEnabled,
 		Quota:                1000,
-		AffQuota:             800,
-		AffHistoryQuota:      1200,
 		AccessTokenCreatedAt: &createdAt,
 	}
 	user.SetAccessToken(testAccessToken("legacy-token"))
@@ -168,10 +504,11 @@ func TestRevokeUserAccessTokenOnlyClearsLegacyToken(t *testing.T) {
 
 	require.NoError(t, DB.Model(&User{}).Where("id = ?", user.Id).Updates(map[string]any{
 		"quota":        gorm.Expr("quota + ?", 500),
-		"aff_quota":    gorm.Expr("aff_quota - ?", 500),
 		"display_name": "concurrent-update",
 	}).Error)
 
+	_, err := PostLedgerEntries(LedgerPosting{Account: UserWalletAccount(user.Id), Type: LedgerEntryTopUp, Amount: money.Amount{Nanos: 500, Currency: "USD"}})
+	require.NoError(t, err)
 	tokenRef, err := RevokeUserAccessToken(user.Id)
 	require.NoError(t, err)
 	assert.Equal(t, AccessTokenFingerprint(testAccessToken("legacy-token")), tokenRef)
@@ -182,8 +519,10 @@ func TestRevokeUserAccessTokenOnlyClearsLegacyToken(t *testing.T) {
 	assert.Nil(t, got.AccessTokenCreatedAt)
 	assert.Equal(t, "concurrent-update", got.DisplayName)
 	assert.Equal(t, 1500, got.Quota)
-	assert.Equal(t, 300, got.AffQuota)
-	assert.Equal(t, 1200, got.AffHistoryQuota)
+	wallet, err := GetUserWallet(user.Id)
+	require.NoError(t, err)
+	require.NotNil(t, wallet)
+	assert.Equal(t, money.Amount{Nanos: 500, Currency: "USD"}, wallet.Balance)
 }
 
 func TestRevokeUserAccessTokenRejectsSoftDeletedUser(t *testing.T) {

@@ -26,15 +26,16 @@ import (
 // gatewayPreparedRequest stays in request memory. Route evaluates the same
 // effective quantities and probes later sent by the selected candidate.
 type gatewayPreparedRequest struct {
-	Context   *gin.Context
-	Info      *relaycommon.RelayInfo
-	Adaptor   *relay.ChannelAdaptor
-	Converted any
-	Encoded   []byte
-	SaleInput billingexpr.RequestInput
-	Usage     *dto.Usage
-	Choices   int
-	Facts     service.GatewayRouteFacts
+	Context       *gin.Context
+	Info          *relaycommon.RelayInfo
+	Adaptor       *relay.ChannelAdaptor
+	Converted     any
+	Encoded       []byte
+	SaleInput     billingexpr.RequestInput
+	Usage         *dto.Usage
+	Choices       int
+	HiddenChoices bool
+	Facts         service.GatewayRouteFacts
 }
 
 func gatewayProjectionFailure(c *gin.Context, info *relaycommon.RelayInfo, err error) error {
@@ -47,6 +48,11 @@ func gatewayProjectionFailure(c *gin.Context, info *relaycommon.RelayInfo, err e
 }
 
 func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection, original *dto.GeneralOpenAIRequest, native dto.Request, kind protocol.Type, accepted []string, started time.Time, mean int64) (*gatewayPreparedRequest, error) {
+	completion := c.Request.URL.Path == "/v1/completions"
+	compact := c.Request.URL.Path == "/v1/responses/compact"
+	if (completion || compact) && selection.Channel.Protocol != kind {
+		return nil, service.ErrGatewayCapability
+	}
 	candidate := c.Copy()
 	if selection.Provider.Setting != nil && *selection.Provider.Setting != "" {
 		var settings dto.ProviderSettings
@@ -89,6 +95,14 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 	if err != nil {
 		return nil, service.ErrGatewayCapability
 	}
+	validationMode := relayconstant.RelayModeChatCompletions
+	if completion {
+		info.RelayMode = relayconstant.RelayModeCompletions
+		validationMode = relayconstant.RelayModeCompletions
+	}
+	if compact {
+		info.RelayMode = relayconstant.RelayModeResponsesCompact
+	}
 	info.ResponseFacts = &relaycommon.ResponseFacts{OnBusinessOutput: func() {}}
 	common.SetContextKey(candidate, constant.ContextKeyResponseFacts, info.ResponseFacts)
 	if info.StreamStatus == nil {
@@ -97,6 +111,9 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 	info.StartTime = started
 	info.TokenizerModel = selection.Channel.Model.ModelName
 	info.InitChannelMeta(candidate)
+	if compact && !common.SupportsResponsesCompact(info.ChannelType, info.ApiType) {
+		return nil, service.ErrGatewayCapability
+	}
 	info.ChannelOtherSettings.ToolLossPolicy = string(types.ConversionLossPolicyAllow)
 	info.UpstreamModelName = selection.Channel.UpstreamModelName
 	info.IsModelMapped = true
@@ -108,6 +125,13 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 	counterInfo := *info
 	counterInfo.RelayFormat = types.RelayFormatOpenAI
 	originalTokens, err := service.CountRequestToken(candidate, request.GetTokenCountMeta(), &counterInfo, service.GatewayRequestTokenOptions(candidate))
+	if completion {
+		_, tokenIDs, shapeErr := helper.CompletionsPromptShape(request.Prompt)
+		if shapeErr != nil {
+			return nil, service.ErrGatewayCapability
+		}
+		originalTokens += tokenIDs
+	}
 	if err != nil || !service.GatewayCapabilitiesMatch(request, selection.Capabilities, originalTokens) {
 		return nil, service.ErrGatewayCapability
 	}
@@ -155,6 +179,21 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 	if err != nil {
 		return nil, service.ErrGatewayConversion
 	}
+	if completion {
+		var originalParameters, wire map[string]common.RawMessage
+		if common.Unmarshal(saleInput.Body, &originalParameters) != nil || common.Unmarshal(encoded, &wire) != nil {
+			return nil, service.ErrGatewayCapability
+		}
+		for _, key := range []string{"echo", "logprobs", "best_of"} {
+			if value, present := originalParameters[key]; present {
+				wire[key] = value
+			}
+		}
+		encoded, err = common.Marshal(wire)
+		if err != nil {
+			return nil, service.ErrGatewayConversion
+		}
+	}
 	if len(info.ParamOverride) > 0 {
 		encoded, err = relaycommon.ApplyParamOverrideWithRelayInfo(encoded, info)
 		if err != nil {
@@ -169,7 +208,7 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 	if err != nil {
 		return nil, gatewayProjectionFailure(candidate, info, err)
 	}
-	if _, err = helper.ValidateTextRequest(candidate, effective, relayconstant.RelayModeChatCompletions, selection.Channel.Protocol == protocol.OpenAIResponses); err != nil || effective.Model != selection.Channel.UpstreamModelName || effective.IsStream(candidate.Request) != info.IsStream {
+	if _, err = helper.ValidateTextRequest(candidate, effective, validationMode, selection.Channel.Protocol == protocol.OpenAIResponses); err != nil || effective.Model != selection.Channel.UpstreamModelName || effective.IsStream(candidate.Request) != info.IsStream {
 		return nil, service.ErrGatewayCapability
 	}
 	requestedOutputLimit := original.MaxCompletionTokens
@@ -192,6 +231,15 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 	tokens, err := service.CountRequestToken(candidate, effective.GetTokenCountMeta(), &counterInfo, service.GatewayRequestTokenOptions(candidate))
 	if err != nil {
 		return nil, service.ErrGatewayCapability
+	}
+	promptBatches := 1
+	if completion {
+		var tokenIDs int
+		promptBatches, tokenIDs, err = helper.CompletionsPromptShape(effective.Prompt)
+		if err != nil {
+			return nil, service.ErrGatewayCapability
+		}
+		tokens += tokenIDs
 	}
 	selection.InputTokens = tokens
 	if selection.Capabilities.Limits.MaxOutputTokens != nil || selection.Capabilities.Limits.ContextLength != nil {
@@ -218,15 +266,20 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 		}
 		convertedDefaultExceedsLimit := boundDefault && effective.GetMaxTokens() > uint(limit)
 		if effectiveOutputLimit == nil || convertedDefaultExceedsLimit {
+			// Compact has no native output-budget parameter. A route requiring
+			// such a control cannot silently send a generation-only field.
+			if compact {
+				return nil, service.ErrGatewayCapability
+			}
 			request.MaxCompletionTokens = common.GetPointer(uint(limit))
-			encoded, err = adaptor.SetChatOutputLimit(converted, encoded, uint(limit))
+			encoded, err = adaptor.SetChatOutputLimit(info, converted, encoded, uint(limit))
 			if err == nil {
 				effective, err = adaptor.ProjectChatRequest(candidate, info, converted, request, encoded)
 			}
 			if err != nil {
 				return nil, gatewayProjectionFailure(candidate, info, err)
 			}
-			if _, err = helper.ValidateTextRequest(candidate, effective, relayconstant.RelayModeChatCompletions, selection.Channel.Protocol == protocol.OpenAIResponses); err != nil {
+			if _, err = helper.ValidateTextRequest(candidate, effective, validationMode, selection.Channel.Protocol == protocol.OpenAIResponses); err != nil {
 				return nil, service.ErrGatewayCapability
 			}
 		}
@@ -251,10 +304,27 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 	if effective.N != nil {
 		choices = *effective.N
 	}
-	if mean < 0 || choices < 1 || choices > helper.MaxChatCompletionsN || mean > ((1<<31)-1)/int64(choices) {
+	if choices < 1 || choices > helper.MaxChatCompletionsN {
 		return nil, service.ErrGatewayCapability
 	}
-	mean *= int64(choices)
+	estimatedChoices := choices
+	hiddenChoices := false
+	if completion {
+		_, parameters, err := helper.DecodeCompletionsRequest(encoded)
+		if err != nil {
+			return nil, service.ErrGatewayCapability
+		}
+		if parameters.BestOf != nil {
+			estimatedChoices = *parameters.BestOf
+			hiddenChoices = estimatedChoices > choices
+		}
+		choices *= promptBatches
+		estimatedChoices *= promptBatches
+	}
+	if mean < 0 || mean > ((1<<31)-1)/int64(estimatedChoices) {
+		return nil, service.ErrGatewayCapability
+	}
+	mean *= int64(estimatedChoices)
 	usage := &dto.Usage{PromptTokens: tokens, CompletionTokens: int(mean), TotalTokens: tokens + int(mean)}
 	headers, deferredHeaders, err := adaptor.PreviewHeaders(candidate, info, bytes.NewReader(encoded))
 	if err != nil {
@@ -279,7 +349,7 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 			quality = 1
 		}
 	}
-	return &gatewayPreparedRequest{Context: candidate, Info: info, Adaptor: adaptor, Converted: converted, Encoded: encoded, SaleInput: saleInput, Usage: usage, Choices: choices,
+	return &gatewayPreparedRequest{Context: candidate, Info: info, Adaptor: adaptor, Converted: converted, Encoded: encoded, SaleInput: saleInput, Usage: usage, Choices: choices, HiddenChoices: hiddenChoices,
 		Facts: service.GatewayRouteFacts{Usage: usage, SaleInput: saleInput, PurchaseInput: purchaseInput, Quality: quality, ConversionLosses: losses}}, nil
 }
 
@@ -300,7 +370,9 @@ func gatewayChatRoute(c *gin.Context, run *textGatewayRun, offering *model.Model
 		Prepare: func(selection *service.GatewaySelection) (*service.GatewayRouteFacts, error) {
 			var candidate *gatewayPreparedRequest
 			var err error
-			if request == nil {
+			if kind == protocol.AlphaSearch || kind == protocol.DeepSeekTools || kind == protocol.OpenAIModerations {
+				candidate, err = prepareGatewayNativeOperation(c, selection, native, kind, started)
+			} else if request == nil {
 				candidate, err = prepareGatewayEmbeddingRoute(c, selection, native, kind, accepted, started)
 			} else {
 				if !service.GatewayCapabilitiesMatch(request, selection.Capabilities, 0) {

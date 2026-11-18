@@ -16,141 +16,99 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Loader2 } from 'lucide-react'
+import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
-import { Skeleton } from '@/components/ui/skeleton'
-import { formatLocalCurrencyAmount } from '@/lib/currency'
+import { ConfirmDialog } from '@/components/confirm-dialog'
+import { toIntlLocale } from '@/i18n/languages'
+import { formatMoneyAmount } from '@/lib/currency'
 
-import { DEFAULT_DISCOUNT_RATE } from '../../constants'
-import { formatCurrency, getPaymentIcon } from '../../lib'
-import type { PaymentMethod } from '../../types'
+import type { CheckoutQuote } from '../../types'
 
-interface PaymentConfirmDialogProps {
-  open: boolean
+export function PaymentConfirmDialog(props: {
+  quote: CheckoutQuote
+  paymentMethod: string
   onOpenChange: (open: boolean) => void
   onConfirm: () => void
-  topupAmount: number
-  paymentAmount: number
-  paymentMethod: PaymentMethod | undefined
-  calculating: boolean
   processing: boolean
-  discountRate?: number
-  usdExchangeRate?: number
-}
-
-export function PaymentConfirmDialog({
-  open,
-  onOpenChange,
-  onConfirm,
-  topupAmount,
-  paymentAmount,
-  paymentMethod,
-  calculating,
-  processing,
-  discountRate = DEFAULT_DISCOUNT_RATE,
-  usdExchangeRate = 1,
-}: PaymentConfirmDialogProps) {
-  const { t } = useTranslation()
-  const hasDiscount = discountRate > 0 && discountRate < 1 && paymentAmount > 0
-  const originalAmount = hasDiscount ? paymentAmount / discountRate : 0
-  const discountAmount = hasDiscount ? originalAmount - paymentAmount : 0
+  creationAttempted: boolean
+  error?: string
+}) {
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
+  const [expired, setExpired] = useState(
+    () => props.quote.expires_at * 1000 <= Date.now()
+  )
+  useEffect(() => {
+    const remaining = props.quote.expires_at * 1000 - Date.now()
+    if (remaining <= 0) {
+      setExpired(true)
+      return
+    }
+    const timer = setTimeout(
+      () => setExpired(true),
+      Math.min(remaining, 2_147_483_647)
+    )
+    return () => clearTimeout(timer)
+  }, [props.quote.expires_at])
 
   return (
-    <AlertDialog open={open} onOpenChange={onOpenChange}>
-      <AlertDialogContent className='max-sm:w-[calc(100vw-1.5rem)] sm:max-w-md'>
-        <AlertDialogHeader>
-          <AlertDialogTitle className='text-xl font-semibold'>
-            {t('Confirm Payment')}
-          </AlertDialogTitle>
-          <AlertDialogDescription>
-            {t('Review your payment details')}
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-
-        <div className='space-y-3 py-3 sm:space-y-4 sm:py-4'>
-          <div className='flex items-center justify-between'>
-            <span className='text-muted-foreground text-sm'>
-              {t('Topup Amount')}
-            </span>
-            <span className='text-lg font-semibold'>
-              {formatLocalCurrencyAmount(topupAmount * usdExchangeRate, {
-                digitsLarge: 2,
-                digitsSmall: 2,
-                abbreviate: false,
-              })}
-            </span>
-          </div>
-
-          <div className='flex items-center justify-between'>
-            <span className='text-muted-foreground text-sm'>
-              {t('You Pay')}
-            </span>
-            {calculating ? (
-              <Skeleton className='h-6 w-24' />
-            ) : (
-              <div className='flex items-baseline gap-2'>
-                <span className='text-2xl font-semibold'>
-                  {formatCurrency(paymentAmount)}
-                </span>
-                {hasDiscount && (
-                  <span className='text-muted-foreground text-sm line-through'>
-                    {formatCurrency(originalAmount)}
-                  </span>
-                )}
-              </div>
-            )}
-          </div>
-
-          {hasDiscount && !calculating && (
-            <div className='bg-muted/50 rounded-lg p-3'>
-              <div className='flex items-center justify-between text-sm'>
-                <span className='text-muted-foreground'>{t('You save')}</span>
-                <span className='font-semibold text-green-600'>
-                  {formatCurrency(discountAmount)}
-                </span>
-              </div>
-            </div>
-          )}
-
-          <div className='border-t pt-4'>
-            <div className='flex items-center justify-between'>
-              <span className='text-muted-foreground text-sm'>
-                {t('Payment Method')}
-              </span>
-              <div className='flex items-center gap-2'>
-                {getPaymentIcon(
-                  paymentMethod?.type,
-                  'h-4 w-4',
-                  paymentMethod?.icon,
-                  paymentMethod?.name
-                )}
-                <span className='font-medium'>{paymentMethod?.name}</span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <AlertDialogFooter className='grid grid-cols-2 gap-2 sm:flex'>
-          <AlertDialogCancel disabled={processing}>
-            {t('Cancel')}
-          </AlertDialogCancel>
-          <AlertDialogAction onClick={onConfirm} disabled={processing}>
-            {processing && <Loader2 className='mr-2 h-4 w-4 animate-spin' />}
-            {t('Confirm Payment')}
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
+    <ConfirmDialog
+      open
+      onOpenChange={props.onOpenChange}
+      title={t('Confirm Payment')}
+      desc={t('Review your payment details')}
+      confirmText={t('Confirm Payment')}
+      handleConfirm={props.onConfirm}
+      isLoading={props.processing}
+      disabled={expired && !props.creationAttempted}
+      className='max-sm:w-[calc(100vw-1.5rem)] sm:max-w-md'
+    >
+      <dl className='grid min-w-0 grid-cols-1 gap-2 text-sm sm:grid-cols-2'>
+        <dt className='text-muted-foreground'>{t('Payment Method')}</dt>
+        <dd className='min-w-0 wrap-anywhere'>{props.paymentMethod}</dd>
+        <dt className='text-muted-foreground'>
+          {t(props.quote.charge_final ? 'You Pay' : 'Payment base amount')}
+        </dt>
+        <dd className='min-w-0 font-medium wrap-anywhere'>
+          {formatMoneyAmount(props.quote.charge_amount, locale)}
+        </dd>
+        <dt className='text-muted-foreground'>{t('Reward amount')}</dt>
+        <dd className='min-w-0 wrap-anywhere'>
+          {formatMoneyAmount(props.quote.source_amount, locale)}
+        </dd>
+        <dt className='text-muted-foreground'>{t('Wallet credit')}</dt>
+        <dd className='min-w-0 font-medium wrap-anywhere'>
+          {formatMoneyAmount(props.quote.credit_amount, locale)}
+        </dd>
+        {props.quote.fx && (
+          <>
+            <dt className='text-muted-foreground'>{t('Accounting rate')}</dt>
+            <dd className='min-w-0 wrap-anywhere'>
+              {props.quote.fx.from_currency} → {props.quote.fx.to_currency}:{' '}
+              {props.quote.fx.rate}
+            </dd>
+          </>
+        )}
+      </dl>
+      {!props.quote.charge_final && (
+        <p className='text-muted-foreground text-sm'>
+          {t('Final payment amount is confirmed on the payment page.')}
+        </p>
+      )}
+      <p className='text-muted-foreground text-sm'>
+        {t('Wallet credits first repay outstanding debt.')}
+      </p>
+      {expired && !props.creationAttempted && (
+        <p role='alert' className='text-destructive text-sm'>
+          {t('Quote expired. Cancel and review the payment again.')}
+        </p>
+      )}
+      {props.error && (
+        <p role='alert' className='text-destructive text-sm'>
+          {props.error}
+        </p>
+      )}
+    </ConfirmDialog>
   )
 }

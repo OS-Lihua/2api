@@ -74,15 +74,7 @@ func MediaGateway(c *gin.Context) {
 			gatewayError(c, http.StatusBadRequest, "invalid_request", i18n.T(c, i18n.MsgGatewayInvalidMediaRequest))
 			return
 		}
-		if _, err := model.ValidateUserToken(c.GetString("token_key")); err != nil {
-			if errors.Is(err, model.ErrDatabase) {
-				gatewayError(c, http.StatusServiceUnavailable, "authorization_unavailable", i18n.T(c, i18n.MsgGatewayAuthorizationUnavailable))
-			} else {
-				gatewayError(c, http.StatusUnauthorized, "invalid_api_key", common.TranslateMessage(c, i18n.MsgTokenInvalid))
-			}
-			return
-		}
-		c.Next()
+		gatewayError(c, http.StatusNotFound, "model_not_found", i18n.T(c, i18n.MsgGatewayModelNotFound))
 		return
 	}
 	c.Abort()

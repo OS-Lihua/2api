@@ -11,15 +11,19 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/plugins"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting"
-	"github.com/QuantumNous/new-api/setting/billing_setting"
-	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -637,54 +641,149 @@ func TestActivateTaskPluginRefreshesRuntimeSyncState(t *testing.T) {
 	assert.False(t, hasSyncError)
 }
 
+func taskPluginDiagnosticIdentity(t *testing.T) (service.AuthIdentity, string) {
+	t.Helper()
+	previousRedis := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = previousRedis })
+	require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.UserSession{}, &model.UserAccessToken{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.Model{}, &model.Channel{}, &model.ModelOffering{}, &model.ModelOfferingMember{}))
+	require.NoError(t, model.MigratePricing(model.DB))
+	user := model.User{Username: "pricing-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AuthVersion: 1, AffCode: "pricing-root"}
+	require.NoError(t, model.DB.Create(&user).Error)
+	return createAccessTokenTestSession(t, user.Id, "pricing-session")
+}
+
+func taskPluginDiagnosticContext(t *testing.T, method, path, body string, params gin.Params, identity service.AuthIdentity, credential string) (*gin.Context, *httptest.ResponseRecorder) {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Params = params
+	c.Request = httptest.NewRequest(method, path, strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Authorization", "Bearer "+credential)
+	c.Set("id", identity.UserID)
+	c.Set("session_id", identity.SessionID)
+	c.Set("auth_version", identity.UserAuthVersion)
+	c.Set("session_version", identity.SessionVersion)
+	return c, recorder
+}
+
+func taskPluginDiagnosticChannel(t *testing.T, key, name, expression string, actor int) model.Channel {
+	t.Helper()
+	member := model.Model{ModelName: name}
+	require.NoError(t, model.DB.Where("model_name = ?", name).FirstOrCreate(&member).Error)
+	provider := model.Provider{Name: "private-provider", Key: "fixture-only"}
+	require.NoError(t, model.DB.Create(&provider).Error)
+	channel := model.Channel{ProviderID: provider.Id, Protocol: protocol.Type("task:" + key), UpstreamModelName: name, ModelID: member.Id, ParameterOverrides: "{}", Status: model.ChannelPending}
+	require.NoError(t, model.DB.Omit("Provider", "Model").Create(&channel).Error)
+	if expression != "" {
+		require.NoError(t, model.DB.Omit("Creator", "Channel", "Offering").Create(&model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: channel.ID, ChannelID: &channel.ID, Currency: "USD", Expression: expression, EffectiveAt: 1, CreatedBy: actor}).Error)
+	}
+	return channel
+}
+
+func TestTaskPluginPricingDiagnosticsNoOwnersAndAuthorization(t *testing.T) {
+	setupTaskPluginControllerTest(t)
+	previousRedis := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = previousRedis })
+	require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.UserSession{}, &model.UserAccessToken{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.Model{}, &model.Channel{}, &model.ModelOffering{}, &model.ModelOfferingMember{}, &model.PriceVersion{}))
+	user := model.User{Username: "diagnostic-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AuthVersion: 1, AffCode: "diagnostic-root"}
+	require.NoError(t, model.DB.Create(&user).Error)
+	identity, credential := createAccessTokenTestSession(t, user.Id, "diagnostic-session")
+	for _, authorized := range []bool{false, true} {
+		key := fmt.Sprintf("diagnostic-ownerless-%t", authorized)
+		cleanupTaskPluginControllerRuntime(t, key)
+		body, err := common.Marshal(map[string]any{"source": taskPluginControllerTestSource(key, "1.0.0")})
+		require.NoError(t, err)
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/plugin/task", bytes.NewReader(body))
+		c.Request.Header.Set("Content-Type", "application/json")
+		if authorized {
+			c.Request.Header.Set("Authorization", "Bearer "+credential)
+			c.Set("id", identity.UserID)
+			c.Set("session_id", identity.SessionID)
+			c.Set("auth_version", identity.UserAuthVersion)
+			c.Set("session_version", identity.SessionVersion)
+		}
+		UploadTaskPlugin(c)
+		var response struct {
+			Success bool `json:"success"`
+			Data    struct {
+				Diagnostics struct {
+					State  string `json:"state"`
+					Issues []any  `json:"issues"`
+				} `json:"pricing_diagnostics"`
+			} `json:"data"`
+		}
+		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+		require.True(t, response.Success, recorder.Body.String())
+		want := "not_authorized"
+		if authorized {
+			want = "ready"
+		}
+		assert.Equal(t, want, response.Data.Diagnostics.State)
+		assert.NotNil(t, response.Data.Diagnostics.Issues)
+		assert.Empty(t, response.Data.Diagnostics.Issues, "plugin model declarations alone are not persisted owners")
+		assert.NotContains(t, recorder.Body.String(), `"pricing_issues"`)
+	}
+}
+
 // Every change that puts a version into service answers with the prices the
 // serving plugin cannot charge, read after the registry sync.
 func TestTaskPluginChangesReportPricingIssuesOfServingPlugin(t *testing.T) {
 	setupTaskPluginControllerTest(t)
-	// Pricing reads need the production key-column quoting.
-	previousLogDB := model.LOG_DB
-	t.Cleanup(func() { model.LOG_DB = previousLogDB })
-	t.Setenv("LOG_SQL_DSN", "")
-	require.NoError(t, model.InitLogDB())
+	identity, credential := taskPluginDiagnosticIdentity(t)
 	key := "pricing-notice-probe"
+	channel := taskPluginDiagnosticChannel(t, key, "doc-1", "", identity.UserID)
 	cleanupTaskPluginControllerRuntime(t, key)
 	upload := func(version string) string {
-		body, err := common.Marshal(map[string]any{"source": taskPluginControllerTestSource(key, version)})
+		source := taskPluginControllerTestSource(key, version)
+		if version == "2.0.0" {
+			source = strings.Replace(source, `["doc-1"]`, `["doc-2"]`, 1)
+		}
+		body, err := common.Marshal(map[string]any{"source": source})
 		require.NoError(t, err)
 		return string(body)
 	}
-	unpriced := []model.ModelPricingIssue{{ModelName: "doc-1", PluginKey: key, PluginName: "Test", Reason: model.ModelPricingIssueUnconfigured}}
+	unpriced := []model.TaskPluginPricingIssue{{OwnerType: model.PriceOwnerChannel, OwnerID: channel.ID, OwnerName: "doc-1", PluginKey: key, PluginName: "Test", Reason: model.TaskPluginPricingUnconfigured}}
+	stale := slices.Clone(unpriced)
+	stale[0].Reason = model.TaskPluginPricingStale
 	statusPath := "/api/plugin/task/" + key + "/status"
 	for _, step := range []struct {
 		name, method, path, body string
 		params                   gin.Params
 		handler                  gin.HandlerFunc
-		want                     []model.ModelPricingIssue
+		want                     []model.TaskPluginPricingIssue
 	}{
 		{"first upload serves", http.MethodPost, "/api/plugin/task", upload("1.0.0"), nil, UploadTaskPlugin, unpriced},
 		{"later upload waits for activation", http.MethodPost, "/api/plugin/task", upload("2.0.0"), nil, UploadTaskPlugin, nil},
-		{"activation", http.MethodPost, "/api/plugin/task/" + key + "/activate", `{"version":"2.0.0"}`, gin.Params{{Key: "key", Value: key}}, ActivateTaskPlugin, unpriced},
-		{"switching off", http.MethodPost, statusPath, `{"enabled":false}`, gin.Params{{Key: "key", Value: key}}, SetTaskPluginStatus, nil},
-		{"switching on", http.MethodPost, statusPath, `{"enabled":true}`, gin.Params{{Key: "key", Value: key}}, SetTaskPluginStatus, unpriced},
+		{"activation", http.MethodPost, "/api/plugin/task/" + key + "/activate", `{"version":"2.0.0"}`, gin.Params{{Key: "key", Value: key}}, ActivateTaskPlugin, stale},
+		{"old version detail uses current serving diagnostics", http.MethodGet, "/api/plugin/task/" + key + "?version=1.0.0", "", gin.Params{{Key: "key", Value: key}}, GetTaskPlugin, stale},
+		{"switching off", http.MethodPost, statusPath, `{"enabled":false}`, gin.Params{{Key: "key", Value: key}}, SetTaskPluginStatus, stale},
+		{"switching on", http.MethodPost, statusPath, `{"enabled":true}`, gin.Params{{Key: "key", Value: key}}, SetTaskPluginStatus, stale},
 		{"deleting the active version promotes another", http.MethodDelete, "/api/plugin/task/" + key + "/versions/2.0.0", "", gin.Params{{Key: "key", Value: key}, {Key: "version", Value: "2.0.0"}}, DeleteTaskPluginVersion, unpriced},
 	} {
-		recorder := httptest.NewRecorder()
-		context, _ := gin.CreateTestContext(recorder)
-		context.Params = step.params
-		context.Request = httptest.NewRequest(step.method, step.path, strings.NewReader(step.body))
-		context.Request.Header.Set("Content-Type", "application/json")
+		context, recorder := taskPluginDiagnosticContext(t, step.method, step.path, step.body, step.params, identity, credential)
 		step.handler(context)
 
 		var response struct {
 			Success bool   `json:"success"`
 			Message string `json:"message"`
 			Data    struct {
-				PricingIssues []model.ModelPricingIssue `json:"pricing_issues"`
+				Diagnostics *model.TaskPluginPricingDiagnostics `json:"pricing_diagnostics"`
 			} `json:"data"`
 		}
 		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response), step.name)
 		require.True(t, response.Success, "%s: %s", step.name, response.Message)
-		assert.Equal(t, step.want, response.Data.PricingIssues, step.name)
+		if step.name == "later upload waits for activation" {
+			assert.Nil(t, response.Data.Diagnostics)
+			continue
+		}
+		require.NotNil(t, response.Data.Diagnostics, step.name)
+		assert.Equal(t, model.TaskPluginPricingReady, response.Data.Diagnostics.State, step.name)
+		assert.Equal(t, append([]model.TaskPluginPricingIssue{}, step.want...), response.Data.Diagnostics.Issues, step.name)
 	}
 	active, err := model.GetTaskPluginVersion(key, "")
 	require.NoError(t, err)
@@ -698,22 +797,13 @@ func TestTaskPluginChangesReportPricingIssuesOfServingPlugin(t *testing.T) {
 // installed version stops declaring the model or the plugin is gone.
 func TestSwitchedOffPluginPricesAreNotPricingIssues(t *testing.T) {
 	setupTaskPluginFactoryDisableTest(t)
-	// Pricing reads need the production key-column quoting.
-	previousLogDB := model.LOG_DB
-	t.Cleanup(func() { model.LOG_DB = previousLogDB })
-	t.Setenv("LOG_SQL_DSN", "")
-	require.NoError(t, model.InitLogDB())
-	savedConfig := config.GlobalConfig.ExportAllConfigs()
-	t.Cleanup(func() { require.NoError(t, config.GlobalConfig.LoadFromDB(savedConfig)) })
+	identity, credential := taskPluginDiagnosticIdentity(t)
 	key := "pricing-off-probe"
 	cleanupTaskPluginControllerRuntime(t, key)
 	body, err := common.Marshal(map[string]any{"source": taskPluginControllerTestSource(key, "1.0.0")})
 	require.NoError(t, err)
-	upload := httptest.NewRecorder()
-	context, _ := gin.CreateTestContext(upload)
-	context.Request = httptest.NewRequest(http.MethodPost, "/api/plugin/task", strings.NewReader(string(body)))
-	context.Request.Header.Set("Content-Type", "application/json")
-	UploadTaskPlugin(context)
+	c, upload := taskPluginDiagnosticContext(t, http.MethodPost, "/api/plugin/task", string(body), nil, identity, credential)
+	UploadTaskPlugin(c)
 	require.Contains(t, upload.Body.String(), `"success":true`)
 	var kling jsplugin.Meta
 	for _, meta := range jsplugin.DefaultRegistry.Snapshot().Factory {
@@ -722,37 +812,25 @@ func TestSwitchedOffPluginPricesAreNotPricingIssues(t *testing.T) {
 		}
 	}
 	require.NotEmpty(t, kling.Models)
-	prices, err := common.Marshal(map[string]string{
-		key + "::doc-1":              `tier("base", u("units") * 0.1)`,
-		key + "::retired-model":      `tier("base", u("units") * 0.1)`,
-		"kling::" + kling.Models[0]:  `tier("base", u("units") * 0.1)`,
-		"kling::kling-retired-model": `tier("base", u("units") * 0.1)`,
-	})
-	require.NoError(t, err)
-	require.NoError(t, model.DB.Save(&model.Option{Key: billing_setting.PluginBillingExprOption, Value: string(prices)}).Error)
-	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: string(prices)}))
-	readIssues := func() []model.ModelPricingIssue {
-		recorder := httptest.NewRecorder()
-		context, _ := gin.CreateTestContext(recorder)
-		context.Request = httptest.NewRequest(http.MethodGet, "/api/option/model_pricing/issues", nil)
-		GetModelPricingIssues(context)
-		var response struct {
-			Success bool                      `json:"success"`
-			Data    []model.ModelPricingIssue `json:"data"`
-		}
-		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
-		require.True(t, response.Success)
-		return slices.DeleteFunc(response.Data, func(issue model.ModelPricingIssue) bool {
-			return issue.PluginKey != key && issue.PluginKey != "kling"
-		})
-	}
-	unpricedKling := func(issue model.ModelPricingIssue) bool {
-		return issue.PluginKey == "kling" && issue.Reason == model.ModelPricingIssueUnconfigured
-	}
+	valid := taskPluginDiagnosticChannel(t, key, "DoC-1", `tier("base", 0)`, identity.UserID)
+	stale := taskPluginDiagnosticChannel(t, key, "retired-model", `tier("base", 0)`, identity.UserID)
+	taskPluginDiagnosticChannel(t, "kling", kling.Models[0], `tier("base", 0)`, identity.UserID)
+	staleFactory := taskPluginDiagnosticChannel(t, "kling", "kling-retired-model", `tier("base", 0)`, identity.UserID)
 	if len(kling.Models) > 1 {
-		require.True(t, slices.ContainsFunc(readIssues(), unpricedKling), "a serving built-in reports its unpriced models")
+		taskPluginDiagnosticChannel(t, "kling", kling.Models[1], "", identity.UserID)
 	}
-
+	readIssues := func(plugin string) []model.TaskPluginPricingIssue {
+		c, _ := taskPluginDiagnosticContext(t, http.MethodGet, "/api/plugin/task/"+plugin, "", nil, identity, credential)
+		result := taskPluginPricingDiagnostics(c, plugin)
+		require.Equal(t, model.TaskPluginPricingReady, result.State)
+		return result.Issues
+	}
+	require.Len(t, readIssues(key), 1, "the current generation accepts the canonical mixed-case binding")
+	if len(kling.Models) > 1 {
+		require.True(t, slices.ContainsFunc(readIssues("kling"), func(issue model.TaskPluginPricingIssue) bool {
+			return issue.Reason == model.TaskPluginPricingUnconfigured
+		}), "only the persisted unpriced factory owner is reported")
+	}
 	for _, plugin := range []string{key, "kling"} {
 		require.Contains(t, postTaskPluginStatus(t, plugin, "", `{"enabled":false}`).Body.String(), `"success":true`)
 	}
@@ -762,19 +840,155 @@ func TestSwitchedOffPluginPricesAreNotPricingIssues(t *testing.T) {
 	require.Equal(t, []string{"kling"}, setting.GetTaskPluginDisabledFactoryKeys())
 	_, serving := jsplugin.DefaultRegistry.Get("kling")
 	require.False(t, serving)
-	// A plugin missing from the live generation is named by its key.
-	stale := func(name, plugin string) model.ModelPricingIssue {
-		return model.ModelPricingIssue{ModelName: name, PluginKey: plugin, PluginName: plugin, Reason: model.ModelPricingIssueStale}
+	for plugin, owner := range map[string]model.Channel{key: stale, "kling": staleFactory} {
+		issues := readIssues(plugin)
+		require.Len(t, issues, 1)
+		assert.Equal(t, owner.ID, issues[0].OwnerID)
+		assert.Equal(t, model.TaskPluginPricingStale, issues[0].Reason)
+		require.NotNil(t, issues[0].PriceVersionID)
 	}
-	assert.Equal(t, []model.ModelPricingIssue{stale("kling-retired-model", "kling"), stale("retired-model", key)}, readIssues())
-
-	remove := httptest.NewRecorder()
-	context, _ = gin.CreateTestContext(remove)
-	context.Params = gin.Params{{Key: "key", Value: key}, {Key: "version", Value: "1.0.0"}}
-	context.Request = httptest.NewRequest(http.MethodDelete, "/api/plugin/task/"+key+"/versions/1.0.0", nil)
-	DeleteTaskPluginVersion(context)
+	c, remove := taskPluginDiagnosticContext(t, http.MethodDelete, "/api/plugin/task/"+key+"/versions/1.0.0", "", gin.Params{{Key: "key", Value: key}, {Key: "version", Value: "1.0.0"}}, identity, credential)
+	DeleteTaskPluginVersion(c)
 	require.Contains(t, remove.Body.String(), `"success":true`)
-	assert.Equal(t, []model.ModelPricingIssue{stale("doc-1", key), stale("kling-retired-model", "kling"), stale("retired-model", key)}, readIssues())
+	issues := readIssues(key)
+	require.Len(t, issues, 2)
+	assert.Equal(t, []int{valid.ID, stale.ID}, []int{issues[0].OwnerID, issues[1].OwnerID})
+	for _, issue := range issues {
+		assert.Equal(t, model.TaskPluginPricingStale, issue.Reason)
+	}
+	var count int64
+	require.NoError(t, model.DB.Model(&model.PriceVersion{}).Count(&count).Error)
+	assert.EqualValues(t, 4, count, "disabling/deleting plugins never rewrites immutable prices")
+}
+
+func TestTaskPluginPricingDiagnosticsPermissionsAndReadFailure(t *testing.T) {
+	setupTaskPluginControllerTest(t)
+	identity, credential := taskPluginDiagnosticIdentity(t)
+	require.NoError(t, i18n.Init())
+	require.NoError(t, model.DB.AutoMigrate(&model.Log{}, &model.AuditLog{}))
+	require.NoError(t, model.EnsureLegacyAccessTokenRetireAt(time.Now().Unix()))
+	key := "private-owner-diagnostic"
+	cleanupTaskPluginControllerRuntime(t, key)
+	channel := taskPluginDiagnosticChannel(t, key, "doc-1", "", identity.UserID)
+	require.NoError(t, model.DB.Model(&channel).Update("upstream_model_name", "private-vendor-endpoint").Error)
+	offering := model.ModelOffering{Name: "private-sale-owner", Visibility: "all", Groups: []string{}, RouteMethod: "cost", AcceptedConversionLosses: []string{}, ChannelScope: model.OfferingChannelScope{}, Members: []model.ModelOfferingMember{{ModelID: channel.ModelID, Tier: 1}}}
+	require.NoError(t, model.DB.Omit("Members.Model").Create(&offering).Error)
+	var afterAuthentication func()
+	router := gin.New()
+	router.Use(middleware.RequestId(), middleware.AccessTokenAudit())
+	routes := router.Group("/api/plugin/task", middleware.RootAuth(), func(c *gin.Context) {
+		if afterAuthentication != nil {
+			action := afterAuthentication
+			afterAuthentication = nil
+			action()
+		}
+		c.Next()
+	})
+	routes.POST("", UploadTaskPlugin)
+	routes.GET("/:key", GetTaskPlugin)
+	routes.POST("/:key/status", SetTaskPluginStatus)
+	payload, err := common.Marshal(map[string]any{"source": taskPluginControllerTestSource(key, "1.0.0")})
+	require.NoError(t, err)
+	response := accessTokenRequest(router, http.MethodPost, "/api/plugin/task", credential, "", string(payload))
+	require.Equal(t, http.StatusOK, response.Code)
+	decode := func(response *httptest.ResponseRecorder) model.TaskPluginPricingDiagnostics {
+		var envelope struct {
+			Success bool `json:"success"`
+			Data    struct {
+				Diagnostics model.TaskPluginPricingDiagnostics `json:"pricing_diagnostics"`
+			} `json:"data"`
+		}
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &envelope))
+		require.True(t, envelope.Success, response.Body.String())
+		require.NotNil(t, envelope.Data.Diagnostics.Issues)
+		return envelope.Data.Diagnostics
+	}
+	require.Len(t, decode(response).Issues, 2)
+	for _, tc := range []struct {
+		name   string
+		scopes []string
+		owner  string
+	}{
+		{"plugin-only", []string{"plugin:read"}, ""},
+		{"pricing-without-owner", []string{"plugin:read", "pricing:read"}, ""},
+		{"owner-without-pricing", []string{"plugin:read", "model:read", "channel:read"}, ""},
+		{"sale-only", []string{"plugin:read", "pricing:read", "model:read"}, model.PriceOwnerOffering},
+		{"purchase-only", []string{"plugin:read", "pricing:read", "channel:read"}, model.PriceOwnerChannel},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, _ := createScopedAccessToken(t, identity.UserID, time.Now().Unix()+3600, tc.scopes...)
+			response := accessTokenRequest(router, http.MethodGet, "/api/plugin/task/"+key, raw, "", "")
+			require.Equal(t, http.StatusOK, response.Code)
+			result := decode(response)
+			if tc.owner == "" {
+				assert.Equal(t, model.TaskPluginPricingNotAuthorized, result.State)
+				assert.Empty(t, result.Issues)
+				assert.NotContains(t, response.Body.String(), "private-sale-owner")
+				assert.NotContains(t, response.Body.String(), "private-vendor-endpoint")
+				return
+			}
+			require.Equal(t, model.TaskPluginPricingReady, result.State)
+			require.Len(t, result.Issues, 1)
+			assert.Equal(t, tc.owner, result.Issues[0].OwnerType)
+			if tc.owner == model.PriceOwnerOffering {
+				assert.NotContains(t, response.Body.String(), "private-vendor-endpoint")
+			} else {
+				assert.NotContains(t, response.Body.String(), "private-sale-owner")
+			}
+		})
+	}
+	raw, _ := createScopedAccessToken(t, identity.UserID, time.Now().Unix()+3600, "plugin:write")
+	response = accessTokenRequest(router, http.MethodPost, "/api/plugin/task/"+key+"/status", raw, "", `{"enabled":true}`)
+	require.Equal(t, http.StatusOK, response.Code)
+	assert.Equal(t, model.TaskPluginPricingNotAuthorized, decode(response).State, "mutation grant alone reveals no private owner")
+	assert.NotContains(t, response.Body.String(), "private-sale-owner")
+	raw, token := createScopedAccessToken(t, identity.UserID, time.Now().Unix()+3600, "plugin:read", "pricing:read", "channel:read")
+	afterAuthentication = func() {
+		require.NoError(t, token.SetScopes([]string{"plugin:read"}))
+		require.NoError(t, model.DB.Model(token).Update("scopes", token.Scopes).Error)
+	}
+	response = accessTokenRequest(router, http.MethodGet, "/api/plugin/task/"+key, raw, "", "")
+	require.Equal(t, http.StatusOK, response.Code)
+	assert.Equal(t, model.TaskPluginPricingNotAuthorized, decode(response).State, "current PAT scopes, not middleware's earlier snapshot")
+
+	failureKey := "diagnostic-read-failure"
+	cleanupTaskPluginControllerRuntime(t, failureKey)
+	taskPluginDiagnosticChannel(t, failureKey, "doc-1", "", identity.UserID)
+	require.NoError(t, model.DB.Exec(`ALTER TABLE "price_versions" RENAME TO "diagnostic_private_failure"`).Error)
+	payload, err = common.Marshal(map[string]any{"source": taskPluginControllerTestSource(failureKey, "1.0.0")})
+	require.NoError(t, err)
+	response = accessTokenRequest(router, http.MethodPost, "/api/plugin/task", credential, "", string(payload))
+	require.Equal(t, http.StatusOK, response.Code)
+	result := decode(response)
+	assert.Equal(t, model.TaskPluginPricingUnavailable, result.State)
+	assert.Empty(t, result.Issues)
+	assert.NotContains(t, response.Body.String(), "diagnostic_private_failure")
+	row, err := model.GetTaskPluginVersion(failureKey, "")
+	require.NoError(t, err)
+	assert.True(t, row.Active, "diagnostic SQL failure cannot roll back the saved mutation")
+	require.NoError(t, model.DB.Exec(`ALTER TABLE "diagnostic_private_failure" RENAME TO "price_versions"`).Error)
+	response = accessTokenRequest(router, http.MethodGet, "/api/plugin/task/"+failureKey, credential, "", "")
+	assert.Equal(t, model.TaskPluginPricingReady, decode(response).State, "retry is a detail read, not another mutation")
+	var rows int64
+	require.NoError(t, model.DB.Model(&model.TaskPlugin{}).Where("key=?", failureKey).Count(&rows).Error)
+	assert.EqualValues(t, 1, rows)
+
+	// Recheck current role and policy even if middleware already authenticated
+	// a root session. This ordinary transaction legitimately locks its credential.
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id=?", identity.UserID).Update("role", common.RoleAdminUser).Error)
+	for _, resource := range []string{"pricing", "model"} {
+		require.NoError(t, model.DB.Create(&model.CasbinRule{Ptype: "p", V0: authz.UserSubject(identity.UserID), V1: resource, V2: "read", V3: authz.EffectAllow}).Error)
+	}
+	c, _ := taskPluginDiagnosticContext(t, http.MethodGet, "/api/plugin/task/"+key, "", nil, identity, credential)
+	result = *taskPluginPricingDiagnostics(c, key)
+	require.Equal(t, model.TaskPluginPricingReady, result.State)
+	require.Len(t, result.Issues, 1)
+	assert.Equal(t, model.PriceOwnerOffering, result.Issues[0].OwnerType)
+	require.NoError(t, model.DB.Model(&model.CasbinRule{}).Where("v0=? AND v1=?", authz.UserSubject(identity.UserID), "pricing").Update("v3", authz.EffectDeny).Error)
+	assert.Equal(t, model.TaskPluginPricingNotAuthorized, taskPluginPricingDiagnostics(c, key).State, "permission revocation is authoritative without cache refresh")
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id=?", identity.UserID).Update("role", common.RoleRootUser).Error)
+	require.NoError(t, model.DB.Model(&model.UserSession{}).Where("sid=?", identity.SessionID).Update("version", 2).Error)
+	assert.Equal(t, model.TaskPluginPricingNotAuthorized, taskPluginPricingDiagnostics(c, key).State, "revoked session version cannot reveal prices")
 }
 
 func TestSyncTaskPluginsPublishesOneGenerationForWholeBatch(t *testing.T) {

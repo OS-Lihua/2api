@@ -214,9 +214,6 @@ export type ContentSettings = {
   'console_setting.announcements_enabled': boolean
   'console_setting.faq_enabled': boolean
   'console_setting.uptime_kuma_enabled': boolean
-  DataExportEnabled: boolean
-  DataExportDefaultTime: string
-  DataExportInterval: number
   Chats: string
   DrawingEnabled: boolean
   MjNotifyEnabled: boolean
@@ -275,50 +272,14 @@ export type ModelSettings = {
 }
 
 export type BillingSettings = {
-  QuotaForNewUser: number
-  QuotaForInviter: number
-  QuotaForInvitee: number
+  'checkout_setting.config': string
+  'reward_setting.config': string
   TopUpLink: string
-  'quota_setting.enable_free_model_pre_consume': boolean
-  'quota_setting.trust_quota_usd': number
-  'quota_setting.pre_consume_multiplier': number
-  QuotaPerUnit: number
-  USDExchangeRate: number
-  'general_setting.quota_display_type': string
-  'general_setting.custom_currency_symbol': string
-  'general_setting.custom_currency_exchange_rate': number
-  DisplayInCurrencyEnabled: boolean
-  DisplayTokenStatEnabled: boolean
-  ModelPrice: string
-  ModelRatio: string
-  CacheRatio: string
-  CreateCacheRatio: string
-  CompletionRatio: string
-  ImageRatio: string
-  AudioRatio: string
-  AudioCompletionRatio: string
-  ExposeRatioEnabled: boolean
-  'billing_setting.billing_mode': string
-  'billing_setting.billing_expr': string
-  'billing_setting.plugin_billing_expr': string
-  'tool_price_setting.prices': string
-  TopupGroupRatio: string
-  GroupRatio: string
-  UserUsableGroups: string
-  GroupGroupRatio: string
-  AutoGroups: string
-  MaxTokenAutoGroups: number
-  DefaultUseAutoGroup: boolean
-  'group_ratio_setting.group_special_usable_group': string
   PayAddress: string
   EpayId: string
   EpayKey: string
-  Price: number
-  MinTopUp: number
   CustomCallbackAddress: string
   PayMethods: string
-  'payment_setting.amount_options': string
-  'payment_setting.amount_discount': string
   'payment_setting.compliance_confirmed': boolean
   'payment_setting.compliance_terms_version': string
   'payment_setting.compliance_confirmed_at': number
@@ -326,14 +287,10 @@ export type BillingSettings = {
   'payment_setting.compliance_confirmed_ip': string
   StripeApiSecret: string
   StripeWebhookSecret: string
-  StripePriceId: string
-  StripeUnitPrice: number
-  StripeMinTopUp: number
   StripePromotionCodesEnabled: boolean
   CreemApiKey: string
   CreemWebhookSecret: string
   CreemTestMode: boolean
-  CreemProducts: string
   WaffoEnabled: boolean
   WaffoApiKey: string
   WaffoPrivateKey: string
@@ -343,9 +300,6 @@ export type BillingSettings = {
   WaffoSandboxPrivateKey: string
   WaffoSandbox: boolean
   WaffoMerchantId: string
-  WaffoCurrency: string
-  WaffoUnitPrice: number
-  WaffoMinTopUp: number
   WaffoNotifyUrl: string
   WaffoReturnUrl: string
   WaffoPayMethods: string
@@ -357,16 +311,14 @@ export type BillingSettings = {
   WaffoPancakeStoreID: string
   WaffoPancakeProductID: string
   'checkin_setting.enabled': boolean
-  'checkin_setting.min_quota': number
-  'checkin_setting.max_quota': number
+  'checkin_setting.reward_range': string
 }
 
 export type OperationsSettings = {
   DefaultCollapseSidebar: boolean
   DemoSiteEnabled: boolean
   SelfUseModeEnabled: boolean
-  QuotaRemindEnabled: boolean
-  QuotaRemindThreshold: string
+  'balance_reminder_setting.config': string
   EmailProvider: 'smtp' | 'resend'
   ResendApiKey: string
   ResendKeyConfigured: boolean

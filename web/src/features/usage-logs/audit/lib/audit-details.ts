@@ -70,6 +70,7 @@ export type AuditDetailField = {
 }
 
 export type AuditDetailOptions = {
+  locale?: Intl.LocalesArgument
   // Labels for stored access token scopes; omitted until they have loaded.
   scopeResources?: PermissionResourceDef[]
 }
@@ -424,6 +425,13 @@ export function buildAuditDetails(
       value.every((item) => typeof item === 'string')
     ) {
       summaryParams[key] = value
+    } else if (
+      key === 'amount' &&
+      isAuditDetailObject(value) &&
+      typeof value.nanos === 'string' &&
+      typeof value.currency === 'string'
+    ) {
+      summaryParams[key] = { nanos: value.nanos, currency: value.currency }
     }
   }
   if (typeof summaryParams.method === 'string') {
@@ -452,7 +460,8 @@ export function buildAuditDetails(
           success: entry.success,
         },
       },
-      t
+      t,
+      options.locale
     ) || (entry.content && entry.content !== action ? entry.content : fallback)
   const admin = isAuditDetailObject(metadata.admin_info)
     ? metadata.admin_info

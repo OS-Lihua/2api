@@ -1,6 +1,7 @@
 package plugins_test
 
 import (
+	"context"
 	"net/http"
 	"testing"
 
@@ -15,6 +16,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func fixtureTaskAuthority(t *testing.T, adaptor *taskplugin.TaskAdaptor, task *model.Task) context.Context {
+	t.Helper()
+	task.ChannelId = 1
+	ctx, err := adaptor.WithTransientTaskAuthority(t.Context(), task, func(context.Context) error { return nil })
+	require.NoError(t, err)
+	return ctx
+}
 
 func TestGoogleResponsesProtocol(t *testing.T) {
 	testVideoResponsesProtocol(t, videoResponsesTestCase{
@@ -98,7 +107,7 @@ func TestGoogleThroughNewAPIGateway(t *testing.T) {
 
 	adaptor := taskplugin.New(plugin)
 	adaptor.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{
-		ChannelType: constant.ChannelTypeNewAPI, ApiKey: "sk-gateway", ChannelBaseUrl: "https://gateway.example",
+		ChannelId: 1, ChannelType: constant.ChannelTypeNewAPI, ApiKey: "sk-gateway", ChannelBaseUrl: "https://gateway.example",
 	}})
 	queryParams := map[string]any{"model": veo, "task_id": "task_pub"}
 	for _, tc := range []struct {
@@ -139,13 +148,19 @@ func TestGoogleThroughNewAPIGateway(t *testing.T) {
 			artifacts, err := adaptor.ListArtifacts(task)
 			require.NoError(t, err)
 			assert.Equal(t, []channel.TaskArtifact{{Key: "video", Type: "video"}}, artifacts)
-			descriptor, err := adaptor.BuildContentRequest(t.Context(), task, "video", channel.TaskArtifactClientRequest{Method: http.MethodGet})
+			ctx := fixtureTaskAuthority(t, adaptor, task)
+			descriptor, err := adaptor.BuildContentRequest(ctx, task, "video", channel.TaskArtifactClientRequest{Method: http.MethodGet})
 			require.NoError(t, err)
+			require.NotNil(t, descriptor.Authorize)
+			require.NoError(t, descriptor.Authorize(ctx))
+			require.Error(t, descriptor.Authorize(t.Context()))
+			comparable := *descriptor
+			comparable.Authorize = nil
 			assert.Equal(t, &channel.TaskContentRequest{
 				URL:     "https://gateway.example/v1/tasks/task_pub/artifacts/video/content",
 				Method:  http.MethodGet,
 				Headers: map[string]string{"Authorization": "Bearer sk-gateway"},
-			}, descriptor)
+			}, &comparable)
 		})
 	}
 

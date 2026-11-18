@@ -141,8 +141,13 @@ export function buildContentRequest(ctx){return {url:ctx.baseUrl+"/content/"+ctx
 				assert.Equal(t, tc.wantAuthHeader, ctx["auth"].(map[string]any)["authHeader"], name)
 			}
 
-			content, err := adaptor.BuildContentRequest(t.Context(), task, "video", channel.TaskArtifactClientRequest{Method: http.MethodGet})
+			authority := taskProtocolAuthority(t, adaptor, tc.key, base, task)
+			content, err := adaptor.BuildContentRequest(authority, task, "video", channel.TaskArtifactClientRequest{Method: http.MethodGet})
 			require.NoError(t, err)
+			require.NotNil(t, content)
+			require.NotNil(t, content.Authorize)
+			require.NoError(t, content.Authorize(authority), "the returned descriptor must retain its explicit authority")
+			require.ErrorIs(t, content.Authorize(t.Context()), model.ErrProviderStatusConflict, "an unrelated context must not inherit descriptor authority")
 			assert.Equal(t, base+"/content/"+tc.wantKind, content.URL)
 			assert.Equal(t, tc.wantAuthHeader, content.Headers["Authorization"])
 			if tc.wantAPIKey == nil {

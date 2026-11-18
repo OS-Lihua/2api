@@ -390,6 +390,8 @@ func serveTaskPluginProtocol(
 		}
 		logger.LogDebug(c, "task_plugin subsystem=protocol event=background_stream generation=%d plugin=%q public_task_id=%q", generation, pluginKey, outcome.Task.TaskID)
 	}
+	finishDelivery := service.BeginGatewayTaskDelivery(c, outcome.Task)
+	defer func() { finishDelivery(c.GetBool("task_gateway_protocol_delivered")) }()
 	if protocolRequest.Stream {
 		logger.LogDebug(c, "task_plugin subsystem=protocol event=observation_enter generation=%d plugin=%q mode=stream public_task_id=%q", generation, pluginKey, outcome.Task.TaskID)
 		streamTaskPluginProtocol(c, pinned, protocolRequest, outcome.Task.TaskID, machine, deps)
@@ -600,6 +602,9 @@ func streamTaskPluginProtocol(
 					logger.LogDebug(c, "task_plugin subsystem=protocol event=client_write_failed generation=%d plugin=%q mode=stream stage=event event_type=%q sequence=%d", generation, pluginKey, event.Type, event.SequenceNumber)
 					return
 				}
+				if event.Type == "response.completed" {
+					c.Set("task_gateway_protocol_delivered", true)
+				}
 			}
 			if taskPluginProtocolEventsTerminal(events) {
 				logger.LogDebug(c, "task_plugin subsystem=protocol event=observation_complete generation=%d plugin=%q mode=stream reason=terminal status=%q ticks=%d", generation, pluginKey, taskPluginDebugStatus(lastStatus), tickNumber+1)
@@ -806,6 +811,7 @@ func waitTaskPluginProtocol(
 					hookElapsed.Milliseconds(),
 				)
 				c.JSON(http.StatusOK, response)
+				c.Set("task_gateway_protocol_delivered", true)
 				logger.LogDebug(
 					c,
 					"task_plugin subsystem=protocol event=observation_complete generation=%d plugin=%q mode=nonstream reason=terminal status=%q ticks=%d",
@@ -1041,6 +1047,9 @@ func retrieveTaskPluginResponse(c *gin.Context, deps pluginProtocolBridgeDeps) {
 		return
 	}
 
+	finishDelivery := service.BeginGatewayTaskDelivery(c, task)
+	presented := false
+	defer func() { finishDelivery(presented) }()
 	var (
 		response    map[string]any
 		hookElapsed time.Duration
@@ -1088,6 +1097,7 @@ func retrieveTaskPluginResponse(c *gin.Context, deps pluginProtocolBridgeDeps) {
 		hookElapsed.Milliseconds(),
 	)
 	c.JSON(http.StatusOK, response)
+	presented = true
 }
 
 func writeTaskPluginResponseNotFound(c *gin.Context, responseID, reason string) {

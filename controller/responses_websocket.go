@@ -36,7 +36,6 @@ var responsesWSRequestEngine = sync.OnceValue(func() *gin.Engine {
 	_ = engine.SetTrustedProxies(nil)
 	rateLimit := middleware.ModelRequestRateLimit()
 	authenticate, authenticateControl := middleware.GatewayTokenAuth(), middleware.TokenAuth(true)
-	legacyAuthenticate := middleware.TokenAuth()
 	engine.POST("/v1/responses", func(c *gin.Context) {
 		state := c.Request.Context().Value(responsesWSRequestContextKey{}).(*responsesWSRequestState)
 		c.Set(common.RequestIdKey, state.requestID)
@@ -50,13 +49,6 @@ var responsesWSRequestEngine = sync.OnceValue(func() *gin.Engine {
 			authenticate(c)
 		}
 	}, middleware.ResolveTextOffering(), func(c *gin.Context) {
-		state := c.Request.Context().Value(responsesWSRequestContextKey{}).(*responsesWSRequestState)
-		if !state.authenticateOnly && middleware.TextOffering(c) == nil && !middleware.TextOfferingMissing(c) {
-			legacyAuthenticate(c)
-			return
-		}
-		c.Next()
-	}, func(c *gin.Context) {
 		state := c.Request.Context().Value(responsesWSRequestContextKey{}).(*responsesWSRequestState)
 		if state.authenticateOnly {
 			c.Next()
@@ -146,7 +138,7 @@ func ResponsesWebSocket(c *gin.Context) {
 	defer ws.Close()
 
 	authenticator := newResponsesWSRequestRunner(c, true)
-	gateway := func(ctx *gin.Context, call *relay.ResponsesWSCall) (bool, *types.NewAPIError) {
+	gateway := func(ctx *gin.Context, call *relay.ResponsesWSCall) *types.NewAPIError {
 		call.SetControlAuthenticator(authenticator)
 		return responsesWSGateway(ctx, call)
 	}

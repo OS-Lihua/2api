@@ -16,21 +16,31 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { act, render, screen } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { act, cleanup, render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { createInstance } from 'i18next'
 import { I18nextProvider, initReactI18next } from 'react-i18next'
-import { beforeEach, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
 import { BillingHistoryDialog } from '@/features/wallet/components/dialogs/billing-history-dialog'
+import { TransferDialog } from '@/features/wallet/components/dialogs/transfer-dialog'
 import en from '@/i18n/locales/en.json'
 import zh from '@/i18n/locales/zh.json'
 import { api } from '@/lib/api'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { RechargeFormCard } from '../components/recharge-form-card'
+import type { TopupInfo } from '../types'
 
 const i18n = createInstance()
+let client: QueryClient
 
 beforeEach(async () => {
+  client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'buyer', role: 1 })
   await i18n.use(initReactI18next).init({
     lng: 'zh',
     fallbackLng: false,
@@ -38,6 +48,34 @@ beforeEach(async () => {
     resources: { en, zh },
     interpolation: { escapeValue: false },
   })
+})
+
+afterEach(() => {
+  cleanup()
+  client.clear()
+  useAuthStore.getState().auth.reset()
+})
+
+it('translates the debt-repayment notice in the transfer dialog when the language changes', async () => {
+  render(
+    <I18nextProvider i18n={i18n}>
+      <TransferDialog
+        open
+        onOpenChange={vi.fn()}
+        onConfirm={vi.fn().mockResolvedValue(true)}
+        available={{ nanos: '9', currency: 'USD' }}
+        attempt={null}
+        transferring={false}
+      />
+    </I18nextProvider>
+  )
+  expect(await screen.findByRole('dialog')).toHaveAccessibleDescription(
+    '钱包入账金额会先偿还欠款。'
+  )
+  await act(() => i18n.changeLanguage('en'))
+  expect(screen.getByRole('dialog')).toHaveAccessibleDescription(
+    'Wallet credits first repay outstanding debt.'
+  )
 })
 
 it('translates billing history statuses and updates them when the language changes', async () => {
@@ -49,8 +87,10 @@ it('translates billing history statuses and updates them when the language chang
         items: ['success', 'pending', 'expired'].map((status, id) => ({
           id,
           status,
-          amount: 10,
-          money: 10,
+          contract_version: 0,
+          purpose: 'legacy_topup',
+          legacy_amount: '10',
+          legacy_money: '10',
           trade_no: `order-${id}`,
           payment_method: 'stripe',
           create_time: 1,
@@ -59,9 +99,11 @@ it('translates billing history statuses and updates them when the language chang
     },
   })
   render(
-    <I18nextProvider i18n={i18n}>
-      <BillingHistoryDialog open onOpenChange={vi.fn()} />
-    </I18nextProvider>
+    <QueryClientProvider client={client}>
+      <I18nextProvider i18n={i18n}>
+        <BillingHistoryDialog open onOpenChange={vi.fn()} />
+      </I18nextProvider>
+    </QueryClientProvider>
   )
   await screen.findByText('order-0')
   for (const label of ['成功', '待确认', '已过期']) {
@@ -74,54 +116,74 @@ it('translates billing history statuses and updates them when the language chang
 })
 
 it.each([
-  { priceRatio: 7.3, paid: '584', saved: '146', full: '146' },
-  { priceRatio: 0.000123, paid: '0.0098', saved: '0.0025', full: '0.0025' },
+  { paid: '584', nanos: '584000000000' },
+  { paid: '0.0098', nanos: '9800000' },
 ])(
-  'translates recharge presets and minimum amount without changing precision at price ratio $priceRatio',
-  async ({ priceRatio, paid, saved, full }) => {
+  'translates recharge presets and the reviewed payment without changing its exact $paid amount',
+  async ({ paid, nanos }) => {
+    const info: TopupInfo = {
+      enable_online_topup: true,
+      enable_stripe_topup: false,
+      pay_methods: [{ name: 'Bank', type: 'bank' }],
+      checkout: {
+        providers: [
+          {
+            provider: 'epay',
+            configured: true,
+            enabled: true,
+            selection_kind: 'amount',
+            minimum: { nanos: '1000000000', currency: 'USD' },
+            presets: [
+              { nanos: '100000000000', currency: 'USD' },
+              { nanos: '20000000000', currency: 'USD' },
+            ],
+            products: [],
+          },
+        ],
+      },
+    }
+    vi.spyOn(api, 'post').mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          quote_id: 'translated-quote',
+          expires_at: 2_000_000_000,
+          charge_amount: { nanos, currency: 'CNY' },
+          charge_final: true,
+          source_amount: { nanos: '100000000000', currency: 'USD' },
+          credit_amount: { nanos: '100000000000', currency: 'USD' },
+          fx: null,
+        },
+      },
+    })
+    const user = userEvent.setup()
     render(
-      <I18nextProvider i18n={i18n}>
-        <RechargeFormCard
-          topupInfo={{
-            enable_online_topup: true,
-            enable_stripe_topup: false,
-            pay_methods: [],
-            min_topup: 1,
-            stripe_min_topup: 1,
-            amount_options: [100, 20],
-            discount: {},
-          }}
-          presetAmounts={[{ value: 100, discount: 0.8 }, { value: 20 }]}
-          selectedPreset={null}
-          topupAmount={1}
-          paymentAmount={priceRatio}
-          priceRatio={priceRatio}
-          calculating={false}
-          paymentLoading={null}
-          redemptionCode=''
-          redeeming={false}
-          onSelectPreset={vi.fn()}
-          onTopupAmountChange={vi.fn()}
-          onPaymentMethodSelect={vi.fn()}
-          onRedemptionCodeChange={vi.fn()}
-          onRedeem={vi.fn()}
-        />
-      </I18nextProvider>
+      <QueryClientProvider client={client}>
+        <I18nextProvider i18n={i18n}>
+          <RechargeFormCard
+            topupInfo={info}
+            redemptionCode=''
+            redeeming={false}
+            onRedemptionCodeChange={vi.fn()}
+            onRedeem={vi.fn()}
+          />
+        </I18nextProvider>
+      </QueryClientProvider>
     )
-    expect(screen.getByRole('button', { name: /^100 / })).toHaveTextContent(
-      `优惠 20%支付 ${paid} • 节省 ${saved}`
+    expect(screen.getByRole('button', { name: '兑换' })).toBeVisible()
+    expect(screen.getByRole('button', { name: '20 USD' })).toBeVisible()
+    expect(screen.getByPlaceholderText('最低 1 USD')).toBeVisible()
+    await user.click(screen.getByRole('button', { name: '100 USD' }))
+    expect(screen.getByLabelText(/USD/)).toHaveValue('100')
+    await user.click(
+      screen.getByRole('button', { name: i18n.t('Review payment') })
     )
-    expect(screen.getByRole('button', { name: /^20 / })).toHaveTextContent(
-      `支付 ${full}`
-    )
-    expect(screen.getByPlaceholderText('最低 1')).toBeVisible()
+    expect(await screen.findByText(`${paid} CNY`)).toBeVisible()
     await act(() => i18n.changeLanguage('en'))
-    expect(screen.getByRole('button', { name: /^100 / })).toHaveTextContent(
-      `20% OFFPay ${paid} • Save ${saved}`
-    )
-    expect(screen.getByRole('button', { name: /^20 / })).toHaveTextContent(
-      `Pay ${full}`
-    )
-    expect(screen.getByPlaceholderText('Minimum 1')).toBeVisible()
+    expect(screen.getByText(`${paid} CNY`)).toBeVisible()
+    expect(
+      screen.getByRole('alertdialog', { name: 'Confirm Payment' })
+    ).toBeVisible()
+    expect(screen.getByPlaceholderText('Minimum 1 USD')).toBeVisible()
   }
 )

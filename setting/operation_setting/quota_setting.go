@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 
 	"github.com/QuantumNous/new-api/setting/config"
 )
@@ -30,7 +31,21 @@ func GetQuotaSetting() *QuotaSetting {
 	return &quotaSetting
 }
 
-// ValidateQuotaOption validates reservation settings before they are persisted.
+const RetiredQuotaSettingsMessage = "Legacy quota reservation settings have been retired."
+
+func IsRetiredQuotaOption(key string) bool {
+	if strings.EqualFold(key, "QuotaPerUnit") {
+		return true
+	}
+	switch key {
+	case "quota_setting.enable_free_model_pre_consume", "quota_setting.trust_quota_usd", "quota_setting.pre_consume_multiplier":
+		return true
+	default:
+		return false
+	}
+}
+
+// ValidateQuotaOption validates historical reservation settings without enabling live writes.
 func ValidateQuotaOption(key, value string) error {
 	if key != "quota_setting.trust_quota_usd" && key != "quota_setting.pre_consume_multiplier" {
 		return nil

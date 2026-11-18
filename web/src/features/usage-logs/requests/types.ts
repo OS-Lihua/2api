@@ -62,6 +62,14 @@ export interface RequestLog {
   group_ratio?: string
   receivable?: MoneyAmount
   sale_pending?: boolean
+  funding_pending?: boolean
+  funding?: {
+    version: number
+    preference?: string
+    source: string
+    subscription_id?: number
+    period_id?: number
+  }
   ledger_entry_ids?: string[]
   started_at: number
   ended_at?: number

@@ -43,6 +43,12 @@ func GatewayPrice(price *model.PriceVersion, usage *dto.Usage, request billingex
 	if err != nil {
 		return money.Value{}, money.Value{}, billingexpr.MoneyTraceResult{}, err
 	}
+	if request.ToolCount != nil && used["u"] {
+		if *request.ToolCount < 0 || *request.ToolCount > 1 {
+			return money.Value{}, money.Value{}, billingexpr.MoneyTraceResult{}, errors.New("invalid native tool count")
+		}
+		request.Usage = map[string]any{"tool_count": *request.ToolCount}
+	}
 	var quantities map[string]decimal.Decimal
 	if request.Usage == nil {
 		quantities, err = billingexpr.MoneyTokenQuantities(usage, used)

@@ -90,6 +90,23 @@ function QuotaLogPreview(props: { log: UsageLog }) {
 
 const cases = [
   {
+    action: 'redemption.create',
+    params: {
+      count: 2,
+      name: 'voucher',
+      amount: { nanos: '9007199254740993', currency: 'EUR' },
+    },
+    english:
+      'Created 2 redemption codes named voucher (9,007,199.254740993 EUR each)',
+    chinese: '创建了 2 个名为 voucher 的兑换码（每个 9,007,199.254740993 EUR）',
+  },
+  {
+    action: 'redemption.create',
+    params: { count: 2, name: 'legacy', quota: '$10' },
+    english: 'Created 2 redemption codes named legacy ($10 each)',
+    chinese: '创建 2 个兑换码 legacy（每个 $10）',
+  },
+  {
     action: 'user.quota_add',
     params: {
       target_user_id: 42,
@@ -208,6 +225,37 @@ describe('quota adjustment log localization', () => {
       }
     }
   )
+
+  test('does not invent a voucher amount when the audit record omits it or is malformed', async () => {
+    const i18n = createInstance()
+    await i18n.init({ lng: 'en', resources: { en } })
+    expect(
+      renderAuditContent(
+        {
+          op: {
+            action: 'redemption.create',
+            params: { count: 2, name: 'unknown' },
+          },
+        },
+        i18n.t
+      )
+    ).toBe('Created 2 redemption codes named unknown')
+    expect(
+      renderAuditContent(
+        {
+          op: {
+            action: 'redemption.create',
+            params: {
+              count: 2,
+              name: 'invalid',
+              amount: { nanos: 'NaN', currency: 'USD' },
+            },
+          },
+        },
+        i18n.t
+      )
+    ).toBe('Created 2 redemption codes named invalid (- each)')
+  })
 
   test('preserves legacy formatted quota parameters and unknown-action fallback', async () => {
     const i18n = createInstance()

@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Plus, MoreHorizontal, List, AlertCircle } from 'lucide-react'
+import { Plus, MoreHorizontal, List } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import { Button } from '@/components/ui/button'
@@ -24,26 +24,19 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuShortcut,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { useCanEditModelPricing } from '@/features/model-pricing/api'
 
 import { useModels } from './models-provider'
 
 export function ModelsPrimaryButtons() {
   const { t } = useTranslation()
   const { setOpen, setCurrentRow } = useModels()
-  const canPrice = useCanEditModelPricing()
 
   const handleCreateModel = () => {
     setCurrentRow(null)
     setOpen('create-model')
-  }
-
-  const handleMissingModels = () => {
-    setOpen('missing-models')
   }
 
   const handleSync = () => {
@@ -59,15 +52,6 @@ export function ModelsPrimaryButtons() {
       <Button onClick={handleSync} variant='outline' size='sm'>
         {t('Sync metadata')}
       </Button>
-      {canPrice && (
-        <Button
-          onClick={() => setOpen('price-sync')}
-          variant='outline'
-          size='sm'
-        >
-          {t('Sync pricing')}
-        </Button>
-      )}
       {/* Create Model */}
       <Button onClick={handleCreateModel} size='sm'>
         <Plus className='h-4 w-4' />
@@ -84,15 +68,6 @@ export function ModelsPrimaryButtons() {
           <MoreHorizontal className='h-4 w-4' />
         </DropdownMenuTrigger>
         <DropdownMenuContent align='end' className='w-56'>
-          <DropdownMenuItem onClick={handleMissingModels}>
-            {t('Missing Models')}
-            <DropdownMenuShortcut>
-              <AlertCircle className='h-4 w-4' />
-            </DropdownMenuShortcut>
-          </DropdownMenuItem>
-
-          <DropdownMenuSeparator />
-
           <DropdownMenuItem onClick={handlePrefillGroups}>
             {t('Prefill Groups')}
             <DropdownMenuShortcut>

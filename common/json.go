@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/MoeForge/moego/ojson"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/gin-gonic/gin/binding"
 )
@@ -53,10 +54,43 @@ func UnmarshalUseNumber(data []byte, v any) error {
 	return kitutil.UnmarshalUseNumber(data, v)
 }
 
-// DecodeJsonStrict accepts exactly one JSON value and rejects unknown fields.
-// Keep decoder configuration here with the host JSON codec.
+// JsonHasDuplicateFields detects decoded duplicate keys in every object,
+// including objects nested inside arrays. Callers also validate JSON syntax.
+func JsonHasDuplicateFields(data []byte) bool {
+	return jsonValueHasDuplicateFields(ojson.ParseBytes(data))
+}
+
+func jsonValueHasDuplicateFields(value ojson.Result) bool {
+	if !value.IsObject() && !value.IsArray() {
+		return false
+	}
+	seen := map[string]bool{}
+	duplicate := false
+	value.ForEach(func(key, child ojson.Result) bool {
+		if value.IsObject() {
+			if seen[key.String()] {
+				duplicate = true
+				return false
+			}
+			seen[key.String()] = true
+		}
+		duplicate = jsonValueHasDuplicateFields(child)
+		return !duplicate
+	})
+	return duplicate
+}
+
+// DecodeJsonStrict accepts exactly one JSON value and rejects duplicate or
+// unknown fields. Keep decoder configuration here with the host JSON codec.
 func DecodeJsonStrict(reader io.Reader, v any) error {
-	decoder := json.NewDecoder(reader)
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		return err
+	}
+	if JsonHasDuplicateFields(body) {
+		return fmt.Errorf("duplicate JSON field")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(v); err != nil {
 		return err

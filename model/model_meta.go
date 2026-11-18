@@ -29,6 +29,7 @@ const (
 	ModelSquarePartial     ModelSquareState = "partial"
 )
 
+// BoundProvider is retained for in-process legacy consumers, not the Models API.
 type BoundProvider struct {
 	Name string `json:"name"`
 	Type int    `json:"type"`
@@ -42,7 +43,7 @@ type Model struct {
 	Tags               string         `json:"tags,omitempty" gorm:"type:varchar(255)"`
 	VendorID           int            `json:"vendor_id,omitempty" gorm:"index"`
 	Endpoints          string         `json:"endpoints,omitempty" gorm:"type:text"`
-	SupportedEndpoints []string       `json:"supported_endpoints,omitempty" gorm:"-"`
+	SupportedEndpoints []string       `json:"supported_endpoints" gorm:"-"`
 	Status             int            `json:"status" gorm:"default:1"`
 	SyncOfficial       int            `json:"sync_official" gorm:"default:1"`
 	CreatedTime        int64          `json:"created_time" gorm:"bigint"`
@@ -50,16 +51,16 @@ type Model struct {
 	DeletedAt          gorm.DeletedAt `json:"-" gorm:"index;uniqueIndex:uk_model_name_delete_at,priority:2"`
 	Capabilities       capability.Set `json:"capabilities" gorm:"type:jsonb"` // exact-name Models only
 
-	BoundChannels []BoundProvider `json:"bound_channels,omitempty" gorm:"-"`
-	EnableGroups  []string        `json:"enable_groups,omitempty" gorm:"-"`
-	QuotaTypes    []int           `json:"quota_types,omitempty" gorm:"-"`
+	BoundChannels []BoundProvider `json:"-" gorm:"-"`
+	EnableGroups  []string        `json:"-" gorm:"-"`
 	NameRule      int             `json:"name_rule" gorm:"default:0"`
 
-	MatchedModels []string `json:"matched_models,omitempty" gorm:"-"`
-	MatchedCount  int      `json:"matched_count,omitempty" gorm:"-"`
+	MatchedModels []string `json:"-" gorm:"-"`
+	MatchedCount  int      `json:"-" gorm:"-"`
 
 	HasMetadata            bool             `json:"has_metadata" gorm:"-"`
 	ConfiguredChannelCount int              `json:"configured_channel_count" gorm:"-"`
+	EnabledChannelCount    int              `json:"enabled_channel_count" gorm:"-"`
 	SquareState            ModelSquareState `json:"square_state" gorm:"-"`
 }
 
@@ -102,138 +103,55 @@ func resolveModelMetadata(records []Model, names []string) map[string]*Model {
 	return resolved
 }
 
-// FillModelSquareStates applies the same metadata policy as the public catalog
-// to live routes, then aggregates concrete models for metadata rule rows.
-func FillModelSquareStates(rows []*Model, configured map[string][]int, connections []ModelConnection) error {
-	var metadata []Model
-	if err := DB.Find(&metadata).Error; err != nil {
-		return err
-	}
-	nameSet := make(map[string]struct{}, len(configured))
-	for name := range configured {
-		nameSet[name] = struct{}{}
-	}
+// FillModelChannelSummary is an administrative status projection, not Offering
+// visibility or request callability. Only stable exact Model IDs own Channels;
+// rule rows never aggregate connections by name. Individual Channels remain
+// behind the channel:read API, not the model:read metadata response.
+func FillModelChannelSummary(rows []*Model) error {
+	ids := make([]int, 0, len(rows))
 	for _, row := range rows {
-		if row != nil && row.NameRule == NameRuleExact {
-			nameSet[row.ModelName] = struct{}{}
+		if row != nil && row.Id > 0 && row.NameRule == NameRuleExact {
+			ids = append(ids, row.Id)
 		}
 	}
-	names := make([]string, 0, len(nameSet))
-	for name := range nameSet {
-		names = append(names, name)
+	type counts struct {
+		ModelID    int
+		Configured int
+		Enabled    int
 	}
-	resolved := resolveModelMetadata(metadata, names)
-	available := make(map[string]bool)
-	for _, connection := range connections {
-		available[connection.Model] = true
-	}
-	states := make(map[string]ModelSquareState, len(names))
-	for _, name := range names {
-		state := ModelSquareUnavailable
-		if policy := resolved[name]; policy != nil && policy.Status != 1 {
-			state = ModelSquareHidden
-		} else if available[name] {
-			state = ModelSquareVisible
+	var summaries []counts
+	if len(ids) > 0 {
+		if err := DB.Model(&Channel{}).
+			Select(`"channels"."model_id", COUNT(*) AS "configured", COUNT(*) FILTER (WHERE "channels"."status" = ? AND "channels"."mapping_confirmed" = ? AND "providers"."status" = ?) AS "enabled"`, ChannelEnabled, true, common.ChannelStatusEnabled).
+			Joins(`LEFT JOIN "providers" ON "providers"."id" = "channels"."provider_id"`).
+			Where(`"channels"."model_id" IN ?`, ids).
+			Group(`"channels"."model_id"`).Find(&summaries).Error; err != nil {
+			return err
 		}
-		states[name] = state
+	}
+	byID := make(map[int]counts, len(summaries))
+	for _, summary := range summaries {
+		byID[summary.ModelID] = summary
 	}
 	for _, row := range rows {
 		if row == nil {
 			continue
 		}
+		row.HasMetadata = row.Id > 0
+		row.BoundChannels, row.EnableGroups, row.MatchedModels, row.MatchedCount = nil, nil, nil, 0
+		row.ConfiguredChannelCount, row.EnabledChannelCount = 0, 0
 		if row.NameRule == NameRuleExact {
-			row.SquareState = states[row.ModelName]
-			continue
-		}
-		total, visible, hidden := 0, 0, 0
-		for name := range configured {
-			if !row.MatchesName(name) {
-				continue
-			}
-			total++
-			switch states[name] {
-			case ModelSquareVisible:
-				visible++
-			case ModelSquareHidden:
-				hidden++
-			}
+			summary := byID[row.Id]
+			row.ConfiguredChannelCount, row.EnabledChannelCount = summary.Configured, summary.Enabled
 		}
 		row.SquareState = ModelSquareUnavailable
-		switch {
-		case total == 0:
-			if row.Status != 1 {
-				row.SquareState = ModelSquareHidden
-			}
-		case hidden == total:
+		if row.Status != 1 {
 			row.SquareState = ModelSquareHidden
-		case visible == total:
+		} else if row.EnabledChannelCount > 0 {
 			row.SquareState = ModelSquareVisible
-		case visible > 0:
-			row.SquareState = ModelSquarePartial
 		}
 	}
 	return nil
-}
-
-// GetConfiguredModelProviders includes disabled channels and reads no credentials.
-func GetConfiguredModelProviders() (map[string][]int, error) {
-	var channels []Provider
-	if err := DB.Select("id", "models").Find(&channels).Error; err != nil {
-		return nil, err
-	}
-	configured := make(map[string][]int)
-	for _, channel := range channels {
-		for _, name := range normalizeLookupValues(channel.GetModels()) {
-			configured[name] = append(configured[name], channel.Id)
-		}
-	}
-	return configured, nil
-}
-
-// SearchModelsWithProviders augments metadata with concrete configured names.
-// Synthetic rows never persist and never affect the public pricing catalog.
-func SearchModelsWithProviders(keyword, vendor, status, syncOfficial string, offset, limit int) ([]*Model, int64, error) {
-	records, _, err := SearchModels(keyword, vendor, status, syncOfficial, 0, -1)
-	if err != nil {
-		return nil, 0, err
-	}
-	_, filterStatus := parseModelStatusFilter(status)
-	_, filterSync := parseModelSyncFilter(syncOfficial)
-	if !filterStatus && !filterSync && (vendor == "" || vendor == "0") {
-		configured, err := GetConfiguredModelProviders()
-		if err != nil {
-			return nil, 0, err
-		}
-		var exactNames []string
-		if err := DB.Model(&Model{}).Where("name_rule = ?", NameRuleExact).Pluck("model_name", &exactNames).Error; err != nil {
-			return nil, 0, err
-		}
-		for _, name := range exactNames {
-			delete(configured, name)
-		}
-		names := make([]string, 0, len(configured))
-		for name := range configured {
-			if keyword == "" || strings.Contains(strings.ToLower(name), strings.ToLower(keyword)) {
-				names = append(names, name)
-			}
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			records = append(records, &Model{ModelName: name, NameRule: NameRuleExact})
-		}
-	}
-	total := len(records)
-	if offset < 0 {
-		offset = 0
-	}
-	if offset >= total {
-		return []*Model{}, int64(total), nil
-	}
-	end := total
-	if limit >= 0 && limit < total-offset {
-		end = offset + limit
-	}
-	return records[offset:end], int64(total), nil
 }
 
 func (mi *Model) Insert() error {
@@ -353,7 +271,7 @@ func SearchExactModels(keyword string, publisherID int, offset, limit int) ([]*M
 }
 
 func (mi *Model) Delete() error {
-	_, err := DeleteModelMetadata([]int{mi.Id}, false, false)
+	_, err := DeleteModelMetadata([]int{mi.Id})
 	return err
 }
 
@@ -362,10 +280,9 @@ type ModelDeleteResult struct {
 	UpdatedChannels int `json:"updated_channels"`
 }
 
-// DeleteModelMetadata optionally removes exact model names from every channel.
-// Channel removal requires exact-match metadata records. Pricing removal
-// clears the selected names without expanding metadata matching rules.
-func DeleteModelMetadata(ids []int, removeFromChannels, removePricing bool) (ModelDeleteResult, error) {
+// DeleteModelMetadata deletes metadata with Channel/Offering reference guards.
+// Provider accounts, historical routing sources and prices are never cascaded.
+func DeleteModelMetadata(ids []int) (ModelDeleteResult, error) {
 	result := ModelDeleteResult{}
 	if len(ids) == 0 || len(ids) > 1000 {
 		return result, errors.New("select between 1 and 1000 models")
@@ -382,8 +299,7 @@ func DeleteModelMetadata(ids []int, removeFromChannels, removePricing bool) (Mod
 		modelIDs = append(modelIDs, id)
 	}
 	sort.Ints(modelIDs)
-	names := make(map[string]struct{}, len(modelIDs))
-	deleteRecords := func(tx *gorm.DB) error {
+	err := metadataTransaction(func(tx *gorm.DB) error {
 		var records []Model
 		if err := lockForUpdate(tx).Where("id IN ?", modelIDs).Order("id").Find(&records).Error; err != nil {
 			return err
@@ -398,12 +314,6 @@ func DeleteModelMetadata(ids []int, removeFromChannels, removePricing bool) (Mod
 		if channelCount > 0 {
 			return ErrModelHasChannels
 		}
-		for _, record := range records {
-			if removeFromChannels && record.NameRule != NameRuleExact {
-				return errors.New("only exact-match models can be removed from channels")
-			}
-			names[record.ModelName] = struct{}{}
-		}
 		if tx.Migrator().HasTable(&ModelOfferingMember{}) {
 			var memberships int64
 			if err := tx.Model(&ModelOfferingMember{}).Where("model_id IN ?", modelIDs).Count(&memberships).Error; err != nil {
@@ -413,71 +323,15 @@ func DeleteModelMetadata(ids []int, removeFromChannels, removePricing bool) (Mod
 				return ErrModelOfferingMember
 			}
 		}
-		if removeFromChannels {
-			var channels []Provider
-			// Read only routing fields. Lock channels in a consistent order, then
-			// update models and abilities in the same transaction as metadata.
-			if err := lockForUpdate(tx).Select("id", "models", "status", "group", "priority", "weight", "tag").Order("id").Find(&channels).Error; err != nil {
-				return err
-			}
-			for _, channel := range channels {
-				models := channel.GetModels()
-				remaining := make([]string, 0, len(models))
-				for _, name := range models {
-					if _, remove := names[strings.TrimSpace(name)]; !remove {
-						remaining = append(remaining, name)
-					}
-				}
-				if len(remaining) == len(models) {
-					continue
-				}
-				channel.Models = strings.Join(remaining, ",")
-				if err := tx.Model(&Provider{}).Where("id = ?", channel.Id).Update("models", channel.Models).Error; err != nil {
-					return err
-				}
-				if err := channel.UpdateAbilities(tx); err != nil {
-					return err
-				}
-				result.UpdatedChannels++
-			}
-		}
 		if err := tx.Where("id IN ?", modelIDs).Delete(&Model{}).Error; err != nil {
 			return err
 		}
 		result.DeletedCount = len(records)
 		return nil
-	}
-	var err error
-	if removePricing {
-		// Use the pricing mutation path so both option persistence and runtime
-		// publication stay serialized with ordinary pricing saves. All database
-		// writes share one transaction; runtime prices publish only after commit.
-		metadataMutationMu.Lock()
-		defer metadataMutationMu.Unlock()
-		err = mutateModelPricingOptions(func(tx *gorm.DB, values map[string]map[string]any) error {
-			if err := lockMetadataMutation(tx); err != nil {
-				return err
-			}
-			if err := deleteRecords(tx); err != nil {
-				return err
-			}
-			for _, entries := range values {
-				for name := range names {
-					delete(entries, name)
-				}
-			}
-			return nil
-		})
-	} else {
-		err = metadataTransaction(deleteRecords)
-	}
+	})
 	if err != nil {
 		return ModelDeleteResult{}, err
 	}
-	if result.UpdatedChannels > 0 {
-		InitProviderCache()
-	}
-	RefreshPricing()
 	return result, nil
 }
 
@@ -502,23 +356,6 @@ func GetVendorModelCounts() (map[int64]int64, error) {
 func GetAllModels(offset int, limit int) ([]*Model, error) {
 	models, _, err := SearchModels("", "", "", "", offset, limit)
 	return models, err
-}
-
-// ModelConnection describes an enabled route independently of catalog visibility or price.
-type ModelConnection struct {
-	AbilityWithProvider
-	ChannelName string `json:"channel_name"`
-}
-
-func GetModelConnections() ([]ModelConnection, error) {
-	var connections []ModelConnection
-	err := DB.Table("abilities").
-		Select("abilities.*, providers.type as channel_type, providers.name as channel_name").
-		Joins("JOIN providers ON abilities.channel_id = providers.id").
-		Where("abilities.enabled = ? AND providers.status = ?", true, common.ChannelStatusEnabled).
-		Order("abilities.model, abilities.channel_id").
-		Scan(&connections).Error
-	return connections, err
 }
 
 func normalizeLookupValues(values []string) []string {

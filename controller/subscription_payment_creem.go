@@ -1,8 +1,6 @@
 package controller
 
 import (
-	"bytes"
-	"io"
 	"net/http"
 	"time"
 
@@ -10,7 +8,6 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting"
-	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/thanhpk/randstr"
 )
@@ -26,22 +23,17 @@ func SubscriptionRequestCreemPay(c *gin.Context) {
 
 	var req SubscriptionCreemPayRequest
 
-	// Keep body for debugging consistency (like RequestCreemPay)
-	bodyBytes, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		logger.LogError(c.Request.Context(), common.LogText("Creem failed to read subscription payment request error=%q", err.Error()))
-		c.JSON(http.StatusOK, gin.H{"message": "error", "data": "read query error"})
-		return
-	}
-	c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-
-	if err := c.ShouldBindJSON(&req); err != nil || req.PlanId <= 0 {
+	if err := common.DecodeJsonStrict(c.Request.Body, &req); err != nil || req.PlanId <= 0 {
 		paymentError(c, common.NewMessage("Invalid parameters"))
 		return
 	}
 
 	plan, err := model.GetSubscriptionPlanById(req.PlanId)
 	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if err := plan.ValidateMoney(); err != nil {
 		common.ApiError(c, err)
 		return
 	}
@@ -53,7 +45,7 @@ func SubscriptionRequestCreemPay(c *gin.Context) {
 		common.ApiErrorT(c, "CreemProductId is not configured for this plan")
 		return
 	}
-	if setting.CreemWebhookSecret == "" && !setting.CreemTestMode {
+	if setting.CreemWebhookSecret == "" {
 		common.ApiErrorT(c, "Creem webhook is not configured")
 		return
 	}
@@ -88,35 +80,19 @@ func SubscriptionRequestCreemPay(c *gin.Context) {
 	order := &model.SubscriptionOrder{
 		UserId:          userId,
 		PlanId:          plan.Id,
-		Money:           plan.PriceAmount,
 		TradeNo:         referenceId,
 		PaymentMethod:   model.PaymentMethodCreem,
 		PaymentProvider: model.PaymentProviderCreem,
 		CreateTime:      time.Now().Unix(),
 		Status:          common.TopUpStatusPending,
 	}
-	if err := order.Insert(); err != nil {
+	if err := order.InsertWithContract(plan); err != nil {
 		paymentError(c, common.NewMessage("Failed to create order"))
 		return
 	}
 
-	// Reuse Creem checkout generator by building a lightweight product reference.
-	currency := "USD"
-	switch operation_setting.GetGeneralSetting().QuotaDisplayType {
-	case operation_setting.QuotaDisplayTypeCNY:
-		currency = "CNY"
-	case operation_setting.QuotaDisplayTypeUSD:
-		currency = "USD"
-	default:
-		currency = "USD"
-	}
-	product := &CreemProduct{
-		ProductId: plan.CreemProductId,
-		Name:      plan.Title,
-		Price:     plan.PriceAmount,
-		Currency:  currency,
-		Quota:     0,
-	}
+	// The remote Product owns provider cash pricing; the local contract is not a paid receipt.
+	product := &CreemProduct{ProductId: plan.CreemProductId, Name: plan.Title}
 
 	checkoutUrl, err := genCreemLink(c.Request.Context(), referenceId, product, user.Email, user.Username)
 	if err != nil {

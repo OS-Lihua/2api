@@ -65,7 +65,7 @@ func TestGPT6AstraBuiltinBilling(t *testing.T) {
 		})
 	}
 
-	t.Run("admin options expose defaults without persisting them", func(t *testing.T) {
+	t.Run("admin options omit legacy defaults without changing offline pricing", func(t *testing.T) {
 		recorder := httptest.NewRecorder()
 		ctx, _ := gin.CreateTestContext(recorder)
 		controller.GetOptions(ctx)
@@ -75,17 +75,18 @@ func TestGPT6AstraBuiltinBilling(t *testing.T) {
 		}
 		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
 		require.True(t, response.Success)
-		found := map[string]string{}
+		found := make(map[string]string, len(response.Data))
 		for _, option := range response.Data {
-			if _, ok := common.OptionMap[option.Key]; ok {
-				assert.NotContains(t, found, option.Key)
-				var values map[string]string
-				require.NoError(t, common.UnmarshalJsonStr(option.Value, &values))
-				found[option.Key] = values["gpt-6-astra"]
-				assert.Equal(t, `{}`, common.OptionMap[option.Key])
-			}
+			assert.NotContains(t, found, option.Key)
+			found[option.Key] = option.Value
+			assert.False(t, model.IsModelPricingOption(option.Key), "retired pricing key: %s", option.Key)
 		}
-		assert.Equal(t, map[string]string{"billing_setting.billing_mode": "tiered_expr", "billing_setting.billing_expr": expression}, found)
+		assert.NotContains(t, found, "CompletionRatioMeta")
+		assert.Equal(t, map[string]string{"billing_setting.billing_mode": `{}`, "billing_setting.billing_expr": `{}`}, common.OptionMap)
+		assert.Equal(t, billing_setting.BillingModeTieredExpr, billing_setting.GetBillingMode("gpt-6-astra"))
+		actualExpression, exists := billing_setting.GetBillingExpr("gpt-6-astra")
+		require.True(t, exists)
+		assert.Equal(t, expression, actualExpression)
 	})
 
 	for _, tc := range []struct {

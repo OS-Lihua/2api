@@ -26,19 +26,36 @@ import {
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Toaster } from 'sonner'
-import { afterEach, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, expect, test, vi } from 'vitest'
+
+import { api as http } from '@/lib/api'
+import { useAuthStore } from '@/stores/auth-store'
 
 import {
   MarketplaceInstallDialog,
   type MarketplaceInstallTarget,
 } from '../components/marketplace-install-dialog'
 
-const api = vi.hoisted(() => ({
-  getTaskPlugin: vi.fn(),
-  installMarketplacePlugin: vi.fn(),
-  activateTaskPlugin: vi.fn(),
-}))
-vi.mock('../api', () => api)
+const responses = { detail: vi.fn(), install: vi.fn(), activate: vi.fn() }
+beforeEach(() => {
+  vi.spyOn(http, 'get').mockImplementation(async (url) => {
+    if (url !== '/api/plugin/task/demo') {
+      throw new Error(`Unexpected GET ${url}`)
+    }
+    return { data: { success: true, data: await responses.detail() } }
+  })
+  vi.spyOn(http, 'post').mockImplementation(async (url, payload) => {
+    if (
+      url !== '/api/plugin/task' &&
+      url !== '/api/plugin/task/demo/activate'
+    ) {
+      throw new Error(`Unexpected POST ${url}`)
+    }
+    const handler =
+      url === '/api/plugin/task' ? responses.install : responses.activate
+    return { data: { success: true, data: await handler(payload) } }
+  })
+})
 const clients: QueryClient[] = []
 const source =
   '// comment\nconst plugin = "demo";\nfunction run() { return 42 }'
@@ -109,6 +126,7 @@ function renderDialog(
 afterEach(() => {
   clients.forEach((client) => client.clear())
   clients.length = 0
+  act(() => useAuthStore.getState().auth.reset())
   vi.unstubAllGlobals()
   vi.resetAllMocks()
 })
@@ -176,7 +194,7 @@ test('first install shows source on demand and disables repeat submission until 
     vi.fn(async () => new Response(source))
   )
   let resolveInstall!: (value: unknown) => void
-  api.installMarketplacePlugin.mockImplementation(
+  responses.install.mockImplementation(
     () =>
       new Promise((resolve) => {
         resolveInstall = resolve
@@ -198,9 +216,10 @@ test('first install shows source on demand and disables repeat submission until 
   expect(
     await screen.findByRole('button', { name: 'Installing...' })
   ).toBeDisabled()
-  expect(api.installMarketplacePlugin).toHaveBeenCalledWith({
+  expect(responses.install).toHaveBeenCalledWith({
     source,
     sourceSha256: undefined,
+    enabled: true,
     remark: 'Official v1.1',
     icon: undefined,
   })
@@ -213,7 +232,7 @@ test('installed plugins allow opening differences and switching to full source w
     'fetch',
     vi.fn(async () => new Response(source))
   )
-  api.getTaskPlugin.mockResolvedValue({
+  responses.detail.mockResolvedValue({
     meta: { version: '1.0' },
     source: 'const old = 0',
   })
@@ -488,7 +507,7 @@ test('selecting a historical version installs its source and hash', async () => 
         new Response(url.endsWith('old.js') ? 'const old = 0' : source)
     )
   )
-  api.installMarketplacePlugin.mockResolvedValue({
+  responses.install.mockResolvedValue({
     meta: { key: 'demo', name: 'Demo', version: '1.0' },
     plugin: { active: true },
   })
@@ -505,10 +524,11 @@ test('selecting a historical version installs its source and hash', async () => 
     ).getByText('https://old.example.com')
   ).toBeVisible()
   await user.click(install)
-  expect(api.activateTaskPlugin).not.toHaveBeenCalled()
-  expect(api.installMarketplacePlugin).toHaveBeenCalledWith({
+  expect(responses.activate).not.toHaveBeenCalled()
+  expect(responses.install).toHaveBeenCalledWith({
     source: 'const old = 0',
     sourceSha256: createHash('sha256').update('const old = 0').digest('hex'),
+    enabled: true,
     remark: 'Official v1.0',
     icon: undefined,
   })
@@ -521,30 +541,44 @@ test('an install that needs activation reports what the activated version cannot
     'fetch',
     vi.fn(async () => new Response(source))
   )
-  api.installMarketplacePlugin.mockResolvedValue({
+  responses.install.mockResolvedValue({
     meta: { key: 'demo', name: 'Demo', version: '1.1' },
     plugin: { active: false },
   })
-  api.activateTaskPlugin.mockResolvedValue({
-    pricing_issues: [
-      {
-        model_name: 'demo-video',
-        plugin_key: 'demo',
-        plugin_name: 'Demo',
-        reason: 'unconfigured',
-      },
-    ],
+  responses.activate.mockResolvedValue({
+    pricing_diagnostics: {
+      state: 'ready',
+      issues: [
+        {
+          owner_type: 'model_offering',
+          owner_id: 7,
+          owner_name: 'demo-video',
+          price_version_id: null,
+          plugin_key: 'demo',
+          plugin_name: 'Demo',
+          reason: 'unconfigured',
+        },
+      ],
+    },
   })
-  renderDialog()
-  render(<Toaster />)
+  const { client } = renderDialog()
+  render(
+    <QueryClientProvider client={client}>
+      <Toaster />
+    </QueryClientProvider>
+  )
   const install = screen.getByRole('button', { name: 'Install and enable' })
   await waitFor(() => expect(install).toBeEnabled())
 
   await user.click(install)
 
-  expect(api.activateTaskPlugin).toHaveBeenCalledWith('demo', '1.1')
+  expect(http.post).toHaveBeenCalledWith(
+    '/api/plugin/task/demo/activate',
+    { version: '1.1' },
+    expect.any(Object)
+  )
   expect(await screen.findByText('Installed Demo v1.1')).toBeVisible()
-  expect(screen.getByText('demo-video: No price set')).toBeVisible()
+  expect(screen.getByText('Model offering #7 · demo-video')).toBeVisible()
 })
 
 test('a single published version remains visible and cannot be changed', () => {
@@ -573,16 +607,16 @@ test.each(['0.9', '1.1', '1.0'])(
           new Response(url.endsWith('old.js') ? 'const old = 0' : source)
       )
     )
-    api.getTaskPlugin.mockResolvedValue({
+    responses.detail.mockResolvedValue({
       meta: { version: installedVersion },
       source: 'const current = 1',
     })
-    api.installMarketplacePlugin.mockResolvedValue({
+    responses.install.mockResolvedValue({
       meta: { key: 'demo', name: 'Demo', version: '1.0' },
       plugin: { active: false },
     })
     let finishActivation!: () => void
-    api.activateTaskPlugin.mockImplementation(
+    responses.activate.mockImplementation(
       () =>
         new Promise<void>((resolve) => {
           finishActivation = resolve
@@ -610,7 +644,11 @@ test.each(['0.9', '1.1', '1.0'])(
     ).toBeVisible()
     await user.click(screen.getByRole('button', { name: 'Install and enable' }))
     await waitFor(() =>
-      expect(api.activateTaskPlugin).toHaveBeenCalledWith('demo', '1.0')
+      expect(http.post).toHaveBeenCalledWith(
+        '/api/plugin/task/demo/activate',
+        { version: '1.0' },
+        expect.any(Object)
+      )
     )
     expect(selector).toBeDisabled()
     expect(onOpenChange).not.toHaveBeenCalled()
@@ -633,7 +671,7 @@ test('a late response for the previous version cannot replace the selected sourc
           })
     )
   )
-  api.installMarketplacePlugin.mockResolvedValue({
+  responses.install.mockResolvedValue({
     meta: { name: 'Demo', version: '1.0' },
     plugin: { active: true },
   })
@@ -649,7 +687,7 @@ test('a late response for the previous version cannot replace the selected sourc
   await act(async () => finishLatest(new Response(source)))
   expect(selector).toHaveValue('1.0')
   await user.click(screen.getByRole('button', { name: 'Install and enable' }))
-  expect(api.installMarketplacePlugin).toHaveBeenCalledWith(
+  expect(responses.install).toHaveBeenCalledWith(
     expect.objectContaining({
       source: 'const old = 0',
       remark: 'Official v1.0',
@@ -714,11 +752,11 @@ test('activation failure stays open and changing version clears the installation
     'fetch',
     vi.fn(async () => new Response(source))
   )
-  api.installMarketplacePlugin.mockResolvedValue({
+  responses.install.mockResolvedValue({
     meta: { key: 'demo', name: 'Demo', version: '1.1' },
     plugin: { active: false },
   })
-  api.activateTaskPlugin.mockRejectedValue(new Error('activation failed'))
+  responses.activate.mockRejectedValue(new Error('activation failed'))
   const { onOpenChange } = renderDialog(false, undefined, true)
   await waitFor(() =>
     expect(
@@ -739,7 +777,7 @@ test('details come first and only choosing a different installed version opens d
     'fetch',
     vi.fn(async () => new Response(source))
   )
-  api.getTaskPlugin.mockResolvedValue({ meta: { version: '1.0' }, source })
+  responses.detail.mockResolvedValue({ meta: { version: '1.0' }, source })
   renderDialog(true, undefined, true)
   const details = screen.getByRole('tab', { name: 'Plugin details' })
   const diff = screen.getByRole('tab', { name: 'Version differences' })
@@ -786,12 +824,12 @@ test('a factory plugin uses its built-in source as the diff baseline and install
         new Response(url.endsWith('old.js') ? 'const old = 0' : source)
     )
   )
-  api.getTaskPlugin.mockResolvedValue({
+  responses.detail.mockResolvedValue({
     layer: 'factory',
     meta: { version: '1.1' },
     source: 'const factory = 1',
   })
-  api.installMarketplacePlugin.mockResolvedValue({
+  responses.install.mockResolvedValue({
     layer: 'override',
     meta: { key: 'demo', name: 'Demo', version: '1.0' },
     plugin: { active: true },
@@ -819,9 +857,10 @@ test('a factory plugin uses its built-in source as the diff baseline and install
   expect(await screen.findByText('- const factory = 1')).toBeVisible()
   expect(screen.getByText('+ const old = 0')).toBeVisible()
   await user.click(screen.getByRole('button', { name: 'Install and enable' }))
-  expect(api.installMarketplacePlugin).toHaveBeenCalledWith({
+  expect(responses.install).toHaveBeenCalledWith({
     source: 'const old = 0',
     sourceSha256: createHash('sha256').update('const old = 0').digest('hex'),
+    enabled: true,
     remark: 'Official v1.0',
     icon: undefined,
   })
@@ -851,7 +890,7 @@ test('changelog is fetched only after opening its tab and a missing log does not
     await screen.findByText('No changelog for this version.')
   ).toBeVisible()
   expect(install).toBeEnabled()
-  expect(api.installMarketplacePlugin).not.toHaveBeenCalled()
+  expect(responses.install).not.toHaveBeenCalled()
 })
 
 test('changing the selected version while reading changelog keeps that tab open', async () => {
@@ -865,7 +904,7 @@ test('changing the selected version while reading changelog keeps that tab open'
       return new Response(source)
     })
   )
-  api.getTaskPlugin.mockResolvedValue({ meta: { version: '1.0' }, source })
+  responses.detail.mockResolvedValue({ meta: { version: '1.0' }, source })
   renderDialog(true, undefined, true)
   const changelog = screen.getByRole('tab', { name: 'Changelog' })
   await user.click(changelog)
@@ -878,4 +917,114 @@ test('changing the selected version while reading changelog keeps that tab open'
   await waitFor(() =>
     expect(screen.getByText('Could not load the changelog')).toBeVisible()
   )
+})
+
+test.each([true, false])(
+  'saved marketplace installation active=%s remains successful when diagnostics are unavailable',
+  async (active) => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(source))
+    )
+    const diagnostics = { state: 'unavailable', issues: [] }
+    responses.install.mockResolvedValue({
+      meta: { key: 'demo', name: 'Demo', version: '1.1' },
+      plugin: { active },
+      pricing_diagnostics: diagnostics,
+    })
+    responses.activate.mockResolvedValue({ pricing_diagnostics: diagnostics })
+    responses.detail.mockResolvedValue({
+      meta: { key: 'demo' },
+      pricing_diagnostics: { state: 'ready', issues: [] },
+    })
+    const user = userEvent.setup()
+    const { client, onOpenChange } = renderDialog()
+    render(
+      <QueryClientProvider client={client}>
+        <Toaster />
+      </QueryClientProvider>
+    )
+    const install = screen.getByRole('button', { name: 'Install and enable' })
+    await waitFor(() => expect(install).toBeEnabled())
+    await user.click(install)
+    expect(await screen.findByText('Installed Demo v1.1')).toBeVisible()
+    expect(onOpenChange).toHaveBeenCalledWith(false)
+    expect(
+      screen.getByText(
+        'Pricing diagnostics are unavailable. The plugin change was saved.'
+      )
+    ).toBeVisible()
+    screen.getByRole('button', { name: 'Retry pricing diagnostics' }).focus()
+    await user.keyboard('{Enter}')
+    expect(
+      await screen.findByText(
+        'No pricing issues found for visible price owners.'
+      )
+    ).toBeVisible()
+    expect(responses.install).toHaveBeenCalledTimes(1)
+    expect(responses.activate).toHaveBeenCalledTimes(active ? 0 : 1)
+    expect(http.post).toHaveBeenCalledTimes(active ? 1 : 2)
+    expect(http.get).toHaveBeenCalledWith(
+      '/api/plugin/task/demo',
+      expect.objectContaining({
+        params: undefined,
+        signal: expect.any(AbortSignal),
+      })
+    )
+  }
+)
+
+test('an account change during marketplace save neither activates the old result nor reveals its diagnostics', async () => {
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'first', role: 100 })
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => new Response(source))
+  )
+  let finish: (value: unknown) => void = () => undefined
+  responses.install.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve
+      })
+  )
+  const user = userEvent.setup()
+  const { client, onOpenChange } = renderDialog()
+  render(
+    <QueryClientProvider client={client}>
+      <Toaster />
+    </QueryClientProvider>
+  )
+  const install = screen.getByRole('button', { name: 'Install and enable' })
+  await waitFor(() => expect(install).toBeEnabled())
+  await user.click(install)
+  expect(responses.install).toHaveBeenCalledTimes(1)
+  act(() =>
+    useAuthStore
+      .getState()
+      .auth.setUser({ id: 2, username: 'second', role: 100 })
+  )
+  await act(async () =>
+    finish({
+      meta: { key: 'demo', name: 'Demo', version: '1.1' },
+      plugin: { active: false },
+      pricing_diagnostics: {
+        state: 'ready',
+        issues: [
+          {
+            owner_type: 'channel',
+            owner_id: 17,
+            owner_name: 'Previous account owner',
+            price_version_id: null,
+            plugin_key: 'demo',
+            plugin_name: 'Demo',
+            reason: 'unconfigured',
+          },
+        ],
+      },
+    })
+  )
+  expect(responses.activate).not.toHaveBeenCalled()
+  expect(onOpenChange).not.toHaveBeenCalled()
+  expect(screen.queryByText('Installed Demo v1.1')).not.toBeInTheDocument()
+  expect(screen.queryByText(/Previous account owner/)).not.toBeInTheDocument()
 })

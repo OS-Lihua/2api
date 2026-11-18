@@ -52,13 +52,8 @@ import {
   ERROR_MESSAGES,
 } from '../constants'
 import type { ApiKey } from '../types'
-import { ApiKeyQuotaCell } from './api-key-quota-cell'
 import { ApiKeyActivityCell } from './api-key-timestamp-cell'
-import {
-  ApiKeyCell,
-  ModelLimitsCell,
-  IpRestrictionsCell,
-} from './api-keys-cells'
+import { ApiKeyCell, IpRestrictionsCell } from './api-keys-cells'
 import { useApiKeysColumns } from './api-keys-columns'
 import { useApiKeys } from './api-keys-provider'
 import { DataTableBulkActions } from './data-table-bulk-actions'
@@ -137,9 +132,6 @@ function ApiKeysMobileList({
       {rows.map((row) => {
         const apiKey = row.original
         const statusConfig = API_KEY_STATUSES[apiKey.status]
-        const groupCell = row
-          .getAllCells()
-          .find((cell) => cell.column.id === 'group')
         const expiryCell = row
           .getAllCells()
           .find((cell) => cell.column.id === 'expired_time')
@@ -175,19 +167,7 @@ function ApiKeysMobileList({
               <DataTableRowActions row={row} />
             </div>
 
-            <div className='min-w-0 space-y-3 py-1'>
-              <div className='min-w-0'>
-                {groupCell &&
-                  flexRender(
-                    groupCell.column.columnDef.cell,
-                    groupCell.getContext()
-                  )}
-              </div>
-              <ApiKeyQuotaCell apiKey={apiKey} now={now} variant='card' />
-            </div>
-
             <div className='flex flex-wrap items-center gap-x-5 gap-y-1'>
-              <ModelLimitsCell apiKey={apiKey} detailsTrigger='click' />
               <IpRestrictionsCell apiKey={apiKey} detailsTrigger='click' />
             </div>
 

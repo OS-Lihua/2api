@@ -225,10 +225,6 @@ func initTaskArtifactAdaptor(ctx context.Context, task *model.Task) (relaychanne
 	if adaptor == nil {
 		return nil, errTaskArtifactPluginUnavailable
 	}
-	pluginKey := channelModel.Key
-	if task.PrivateData.Gateway == nil && task.PrivateData.Key != "" {
-		pluginKey = task.PrivateData.Key
-	}
 	baseURL := channelModel.GetBaseURL()
 	if baseURL == "" {
 		baseURL = constant.GetChannelBaseURL(channelModel.Type)
@@ -236,9 +232,10 @@ func initTaskArtifactAdaptor(ctx context.Context, task *model.Task) (relaychanne
 	adaptor.Init(&relaycommon.RelayInfo{
 		ProviderMeta: &relaycommon.ProviderMeta{
 			ChannelType:          channelModel.Type,
+			ChannelId:            channelModel.Id,
 			ChannelMultiKeyIndex: keyIndex,
 			ChannelBaseUrl:       baseURL,
-			ApiKey:               pluginKey,
+			ApiKey:               channelModel.Key,
 			ChannelSetting:       channelModel.GetSetting(),
 			HeadersOverride:      channelModel.GetHeaderOverride(),
 		},

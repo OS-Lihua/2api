@@ -84,7 +84,6 @@ export function PaymentMethodsVisualEditor({
       name: t('Stripe'),
       template: {
         icon: getDefaultIconName('stripe'),
-        min_topup: '10',
         name: 'Stripe',
         type: 'stripe',
       },
@@ -101,7 +100,6 @@ export function PaymentMethodsVisualEditor({
       name: t('Custom Epay method'),
       template: {
         icon: 'LuCreditCard',
-        min_topup: '50',
         name: '自定义1',
         type: 'custom1',
       },
@@ -128,7 +126,6 @@ export function PaymentMethodsVisualEditor({
         typeof item.name === 'string' &&
         typeof item.type === 'string' &&
         (!('icon' in item) || typeof item.icon === 'string') &&
-        (!('min_topup' in item) || typeof item.min_topup === 'string') &&
         (!('color' in item) || typeof item.color === 'string')
     )
   }, [value])
@@ -347,18 +344,7 @@ export function PaymentMethodsVisualEditor({
                   )
                 },
               },
-              {
-                id: 'min-top-up',
-                header: t('Min Top-up'),
-                cell: (method) =>
-                  method.min_topup ? (
-                    <span className='font-mono text-sm'>
-                      {method.min_topup}
-                    </span>
-                  ) : (
-                    <span className='text-muted-foreground text-sm'>—</span>
-                  ),
-              },
+
               {
                 id: 'actions',
                 header: t('Actions'),
@@ -385,7 +371,6 @@ export function PaymentMethodsVisualEditor({
                 method.type,
                 method.name,
                 method.icon,
-                method.min_topup,
                 method.color,
               ]
                 .filter(Boolean)
@@ -447,14 +432,6 @@ export function PaymentMethodsVisualEditor({
                         <span className='text-muted-foreground text-xs'>—</span>
                       )}
                     </div>
-                    {method.min_topup && (
-                      <div className='flex items-center gap-2'>
-                        <span className='text-muted-foreground min-w-20'>
-                          {t('Min Top-up:')}
-                        </span>
-                        <span className='font-mono'>{method.min_topup}</span>
-                      </div>
-                    )}
                   </div>
                 </div>
               )

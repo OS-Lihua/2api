@@ -23,6 +23,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 
 import { useStatus } from '@/hooks/use-status'
 import { api } from '@/lib/api'
+import { formatQuota } from '@/lib/format'
 import {
   getModuleAccessForGuard,
   type HeaderNavModule,
@@ -30,6 +31,7 @@ import {
 import {
   STATUS_QUERY_KEY,
   ensureStatus,
+  readCachedStatus,
   statusQueryOptions,
 } from '@/lib/status-query'
 import { useSystemConfigStore } from '@/stores/system-config-store'
@@ -177,6 +179,92 @@ describe('shared status query deduplication', () => {
       ).toBe('refreshed')
     })
     expect(statusRequests).toHaveLength(1)
+  })
+})
+
+describe('read-only historical quota display', () => {
+  test.each(['1000000', '1000000.000'])(
+    'preserves the historical unit %s and its raw cached status string',
+    async (legacyUnit) => {
+      const queryClient = createQueryClient()
+      const status = {
+        legacy_quota_per_unit: legacyUnit,
+        quota_per_unit: 1,
+        quota_display_type: 'USD',
+      }
+      apiClient.get = async (url) => {
+        statusRequests.push(url)
+        return { data: { success: true, data: status } }
+      }
+      const hook = renderHook(() => useStatus(), {
+        wrapper: wrapper(queryClient),
+      })
+      await waitFor(() => expect(hook.result.current.status).toEqual(status))
+      expect(formatQuota(250000)).toBe('$0.25')
+      expect(formatQuota(-250000)).toBe('-$0.25')
+      expect(readCachedStatus()).toEqual(status)
+      expect(await ensureStatus(queryClient)).toEqual(status)
+      expect(statusRequests).toEqual(['/api/status'])
+    }
+  )
+
+  test.each([{}, { quota_per_unit: 1 }])(
+    'uses the historical default when the new field is missing: %j',
+    async (status) => {
+      apiClient.get = async () => ({ data: { success: true, data: status } })
+      await ensureStatus(createQueryClient())
+      expect(formatQuota(250000)).toBe('$0.5')
+      expect(useSystemConfigStore.getState().config.currency.quotaPerUnit).toBe(
+        500000
+      )
+    }
+  )
+
+  test.each(['NaN', '0'])(
+    'retains invalid historical metadata %s but uses the existing display fallback',
+    async (legacyUnit) => {
+      const status = { legacy_quota_per_unit: legacyUnit }
+      apiClient.get = async () => ({ data: { success: true, data: status } })
+      await ensureStatus(createQueryClient())
+      expect(formatQuota(250000)).toBe('$0.5')
+      expect(readCachedStatus()).toEqual(status)
+    }
+  )
+
+  test('refreshes persisted historical display from the new field while retaining one shared query', async () => {
+    const previousStatus = { legacy_quota_per_unit: '1000000' }
+    localStorage.setItem('status', JSON.stringify(previousStatus))
+    useSystemConfigStore.getState().setConfig({
+      currency: {
+        ...useSystemConfigStore.getInitialState().config.currency,
+        quotaPerUnit: 1000000,
+      },
+    })
+    let finish: (value: { data: unknown }) => void = () => undefined
+    const response = new Promise<{ data: unknown }>((resolve) => {
+      finish = resolve
+    })
+    apiClient.get = (url) => {
+      statusRequests.push(url)
+      return response
+    }
+    const queryClient = createQueryClient()
+    const hook = renderHook(() => useStatus(), {
+      wrapper: wrapper(queryClient),
+    })
+    expect(hook.result.current.status).toEqual(previousStatus)
+    expect(formatQuota(250000)).toBe('$0.25')
+    const shared = ensureStatus(queryClient)
+    const refreshed = {
+      legacy_quota_per_unit: '2000000',
+      quota_per_unit: 500000,
+    }
+    finish({ data: { success: true, data: refreshed } })
+    expect(await shared).toEqual(refreshed)
+    await waitFor(() => expect(hook.result.current.status).toEqual(refreshed))
+    expect(formatQuota(250000)).toBe('$0.125')
+    expect(readCachedStatus()).toEqual(refreshed)
+    expect(statusRequests).toEqual(['/api/status'])
   })
 })
 

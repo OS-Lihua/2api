@@ -19,23 +19,40 @@ For commercial licensing, please contact support@quantumnous.com
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, describe, expect, test, vi } from 'vitest'
+import { createInstance } from 'i18next'
+import { I18nextProvider } from 'react-i18next'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
-import {
-  MODEL_PRICING_ISSUES_QUERY_KEY,
-  type ModelPricingIssue,
-} from '@/features/system-settings/models/pricing-issues'
+import en from '@/i18n/locales/en.json'
+import fr from '@/i18n/locales/fr.json'
+import ja from '@/i18n/locales/ja.json'
+import ru from '@/i18n/locales/ru.json'
+import viLocale from '@/i18n/locales/vi.json'
+import zhTW from '@/i18n/locales/zh-TW.json'
+import zh from '@/i18n/locales/zh.json'
+import { api } from '@/lib/api'
 
 import { UploadDialog } from '../components/upload-dialog'
 import { MAX_PLUGIN_SOURCE_BYTES } from '../lib/plugin-url'
-import type { TaskPluginDetail } from '../types'
+import type { TaskPluginPricingIssue, TaskPluginDetail } from '../types'
 
-const { uploadTaskPlugin, activateTaskPlugin } = vi.hoisted(() => ({
-  uploadTaskPlugin: vi.fn(),
-  activateTaskPlugin: vi.fn(),
-}))
-
-vi.mock('../api', () => ({ uploadTaskPlugin, activateTaskPlugin }))
+const uploadResponse = vi.fn()
+const activationResponse = vi.fn()
+beforeEach(() => {
+  uploadResponse.mockReset()
+  activationResponse.mockReset()
+  vi.spyOn(api, 'post').mockImplementation(async (url, payload) => {
+    const handler =
+      url === '/api/plugin/task' ? uploadResponse : activationResponse
+    if (
+      url !== '/api/plugin/task' &&
+      url !== '/api/plugin/task/demo/activate'
+    ) {
+      throw new Error(`Unexpected POST ${url}`)
+    }
+    return { data: { success: true, data: await handler(payload) } }
+  })
+})
 
 const queryClients: QueryClient[] = []
 
@@ -85,6 +102,7 @@ function savedPlugin(active: boolean): TaskPluginDetail {
       models: [],
       fetchMode: 'per_task',
     },
+    pricing_diagnostics: { state: 'ready', issues: [] },
     source: 'const a = 1',
     layer: 'override',
     plugin: {
@@ -259,7 +277,7 @@ describe('UploadDialog URL import', () => {
       )
     )
     // Fetching must never upload on its own.
-    expect(uploadTaskPlugin).not.toHaveBeenCalled()
+    expect(uploadResponse).not.toHaveBeenCalled()
   })
 
   test('fetches on Enter and marks the field invalid when the URL is not absolute', async () => {
@@ -285,9 +303,9 @@ describe('UploadDialog upload lifecycle', () => {
     'offers activation after saving an inactive version from %s',
     async (initialKey) => {
       const user = userEvent.setup()
-      uploadTaskPlugin.mockResolvedValue(savedPlugin(false))
+      uploadResponse.mockResolvedValue(savedPlugin(false))
       let resolveActivation!: () => void
-      activateTaskPlugin.mockImplementation(
+      activationResponse.mockImplementation(
         () =>
           new Promise<void>((resolve) => {
             resolveActivation = resolve
@@ -311,7 +329,7 @@ describe('UploadDialog upload lifecycle', () => {
       expect(
         screen.queryByRole('textbox', { name: 'Plugin source' })
       ).not.toBeInTheDocument()
-      expect(activateTaskPlugin).not.toHaveBeenCalled()
+      expect(activationResponse).not.toHaveBeenCalled()
       expect(footerButton('Activate now')).toHaveFocus()
       // Reset the cached queries so activation must invalidate them again.
       queryClient.setQueryData(['task-plugin', 'demo'], { cached: true })
@@ -319,7 +337,11 @@ describe('UploadDialog upload lifecycle', () => {
       queryClient.setQueryData(['task-plugins'], [])
       await user.keyboard('{Enter}')
 
-      expect(activateTaskPlugin).toHaveBeenCalledWith('demo', '2.0.0')
+      expect(api.post).toHaveBeenCalledWith(
+        '/api/plugin/task/demo/activate',
+        { version: '2.0.0' },
+        expect.any(Object)
+      )
       expect(footerButton('Activating...')).toBeDisabled()
       expect(footerButton('Later')).toBeDisabled()
       await user.keyboard('{Escape}')
@@ -343,8 +365,8 @@ describe('UploadDialog upload lifecycle', () => {
 
   test('keeps the saved version available to retry when activation fails', async () => {
     const user = userEvent.setup()
-    uploadTaskPlugin.mockResolvedValue(savedPlugin(false))
-    activateTaskPlugin
+    uploadResponse.mockResolvedValue(savedPlugin(false))
+    activationResponse
       .mockRejectedValueOnce(new Error('activation failed'))
       .mockResolvedValueOnce(undefined)
     renderDialog()
@@ -358,22 +380,22 @@ describe('UploadDialog upload lifecycle', () => {
     expect(footerButton('Activate now')).toBeEnabled()
     await user.click(footerButton('Activate now'))
     expect(await screen.findByText('Plugin version activated')).toBeVisible()
-    expect(uploadTaskPlugin).toHaveBeenCalledTimes(1)
+    expect(uploadResponse).toHaveBeenCalledTimes(1)
   })
 
   test('allows postponing activation without changing the active version', async () => {
     const user = userEvent.setup()
-    uploadTaskPlugin.mockResolvedValue(savedPlugin(false))
+    uploadResponse.mockResolvedValue(savedPlugin(false))
     const { onOpenChange } = renderDialog()
     await uploadSource(user)
     await user.click(await screen.findByRole('button', { name: 'Later' }))
     expect(onOpenChange).toHaveBeenCalledWith(false)
-    expect(activateTaskPlugin).not.toHaveBeenCalled()
+    expect(activationResponse).not.toHaveBeenCalled()
   })
 
   test('shows an already active upload as activated without another activation request', async () => {
     const user = userEvent.setup()
-    uploadTaskPlugin.mockResolvedValue(savedPlugin(true))
+    uploadResponse.mockResolvedValue(savedPlugin(true))
     renderDialog()
     await uploadSource(user)
     expect(await screen.findByText('Plugin version activated')).toBeVisible()
@@ -383,60 +405,69 @@ describe('UploadDialog upload lifecycle', () => {
     expect(
       screen.queryByRole('button', { name: /^Upload$/ })
     ).not.toBeInTheDocument()
-    expect(activateTaskPlugin).not.toHaveBeenCalled()
+    expect(activationResponse).not.toHaveBeenCalled()
   })
 
-  test('lists the models it cannot charge once the uploaded version serves', async () => {
+  test('lists current price owners requiring attention after upload', async () => {
     const user = userEvent.setup()
-    const issue: ModelPricingIssue = {
-      model_name: 'demo-video',
+    const issue: TaskPluginPricingIssue = {
+      owner_type: 'model_offering',
+      owner_id: 7,
+      owner_name: 'demo-video',
+      price_version_id: null,
       plugin_key: 'demo',
       plugin_name: 'Demo',
       reason: 'unconfigured',
     }
-    uploadTaskPlugin.mockResolvedValue({
+    uploadResponse.mockResolvedValue({
       ...savedPlugin(true),
-      pricing_issues: [issue],
+      pricing_diagnostics: { state: 'ready', issues: [issue] },
     })
     const { queryClient } = renderDialog()
-    queryClient.setQueryData(MODEL_PRICING_ISSUES_QUERY_KEY, [])
+    queryClient.setQueryData(['task-plugin', 'demo'], [])
 
     await uploadSource(user)
 
     expect(
-      await screen.findByText('Prices of these models need attention:')
+      await screen.findByText('Prices of these owners need attention:')
     ).toBeVisible()
-    expect(screen.getByText('demo-video: No price set')).toBeVisible()
+    expect(screen.getByText('Model offering #7 · demo-video')).toBeVisible()
     expect(
-      queryClient.getQueryState(MODEL_PRICING_ISSUES_QUERY_KEY)?.isInvalidated
+      queryClient.getQueryState(['task-plugin', 'demo'])?.isInvalidated
     ).toBe(true)
   })
 
   test('lists what the activation reports after saving an inactive version', async () => {
     const user = userEvent.setup()
-    uploadTaskPlugin.mockResolvedValue(savedPlugin(false))
-    activateTaskPlugin.mockResolvedValue({
-      pricing_issues: [
-        {
-          model_name: 'demo-old',
-          plugin_key: 'demo',
-          plugin_name: 'Demo',
-          reason: 'stale',
-        },
-      ],
+    uploadResponse.mockResolvedValue(savedPlugin(false))
+    activationResponse.mockResolvedValue({
+      pricing_diagnostics: {
+        state: 'ready',
+        issues: [
+          {
+            owner_type: 'channel',
+            owner_id: 8,
+            owner_name: 'demo-old',
+            price_version_id: 13,
+            plugin_key: 'demo',
+            plugin_name: 'Demo',
+            reason: 'stale',
+          },
+        ],
+      },
     })
     renderDialog()
     await uploadSource(user)
     await screen.findByText('Plugin saved, activation required')
     expect(
-      screen.queryByText('Prices of these models need attention:')
+      screen.queryByText('Prices of these owners need attention:')
     ).not.toBeInTheDocument()
 
     await user.click(footerButton('Activate now'))
 
     expect(
       await screen.findByText(
-        'demo-old: The plugin no longer offers this model'
+        "The price owner's plugin or model binding is no longer valid."
       )
     ).toBeVisible()
   })
@@ -444,7 +475,7 @@ describe('UploadDialog upload lifecycle', () => {
   test('disables Upload while the source is empty and shows a pending label', async () => {
     const user = userEvent.setup()
     let resolveUpload: (value: unknown) => void = () => undefined
-    uploadTaskPlugin.mockImplementation(
+    uploadResponse.mockImplementation(
       () => new Promise((resolve) => (resolveUpload = resolve))
     )
     renderDialog()
@@ -472,7 +503,7 @@ describe('UploadDialog upload lifecycle', () => {
 
   test('surfaces an upload rejection verbatim', async () => {
     const user = userEvent.setup()
-    uploadTaskPlugin.mockRejectedValue(new Error('key conflicts with `demo`'))
+    uploadResponse.mockRejectedValue(new Error('key conflicts with `demo`'))
     renderDialog()
 
     await user.upload(
@@ -514,3 +545,148 @@ describe('UploadDialog upload lifecycle', () => {
     ).toBeInTheDocument()
   })
 })
+
+const diagnosticLocales = { en, zh, 'zh-TW': zhTW, fr, ru, ja, vi: viLocale }
+test.each(Object.keys(diagnosticLocales))(
+  '%s: saved upload diagnostics and read retry use real localized owner messages',
+  async (language) => {
+    const instance = createInstance()
+    await instance.init({
+      lng: language,
+      fallbackLng: 'en',
+      resources: diagnosticLocales,
+      interpolation: { escapeValue: false },
+    })
+    const user = userEvent.setup()
+    uploadResponse.mockResolvedValue({
+      ...savedPlugin(true),
+      pricing_diagnostics: { state: 'unavailable', issues: [] },
+    })
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    })
+    queryClients.push(queryClient)
+    const read = vi
+      .spyOn(api, 'get')
+      .mockRejectedValueOnce(new Error('temporarily unavailable'))
+      .mockResolvedValueOnce({
+        data: {
+          success: true,
+          data: {
+            ...savedPlugin(true),
+            pricing_diagnostics: {
+              state: 'ready',
+              issues: [
+                {
+                  owner_type: 'model_offering',
+                  owner_id: 7,
+                  owner_name: 'Same name',
+                  price_version_id: null,
+                  plugin_key: 'demo',
+                  plugin_name: 'Demo',
+                  reason: 'unconfigured',
+                },
+                {
+                  owner_type: 'channel',
+                  owner_id: 7,
+                  owner_name: 'Same name',
+                  price_version_id: 33,
+                  plugin_key: 'demo',
+                  plugin_name: 'Demo',
+                  reason: 'incompatible',
+                },
+                {
+                  owner_type: 'channel',
+                  owner_id: 8,
+                  owner_name: '长合法名称'.repeat(40),
+                  price_version_id: 34,
+                  plugin_key: 'demo',
+                  plugin_name: 'Demo',
+                  reason: 'stale',
+                },
+              ],
+            },
+          },
+        },
+      })
+    render(
+      <I18nextProvider i18n={instance}>
+        <QueryClientProvider client={queryClient}>
+          <UploadDialog open onOpenChange={() => undefined} />
+        </QueryClientProvider>
+      </I18nextProvider>
+    )
+    await user.upload(
+      screen.getByLabelText(instance.t('JavaScript file')),
+      new File(['const a = 1'], 'plugin.js', { type: 'text/javascript' })
+    )
+    await waitFor(() =>
+      expect(footerButton(instance.t('Upload'))).toBeEnabled()
+    )
+    await user.click(footerButton(instance.t('Upload')))
+    expect(
+      await screen.findByText(instance.t('Plugin version activated'))
+    ).toBeVisible()
+    expect(
+      screen.getByText(
+        instance.t(
+          'Pricing diagnostics are unavailable. The plugin change was saved.'
+        )
+      )
+    ).toBeVisible()
+    expect(
+      screen.getByText(instance.t('Current PriceVersion diagnostics'))
+    ).toBeVisible()
+    const retryLabel = instance.t('Retry pricing diagnostics')
+    await user.click(screen.getByRole('button', { name: retryLabel }))
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: retryLabel })).toBeEnabled()
+    )
+    expect(
+      screen.getByText(instance.t('Plugin version activated'))
+    ).toBeVisible()
+    await user.click(screen.getByRole('button', { name: retryLabel }))
+    expect(
+      await screen.findByText(`${instance.t('Model offering')} #7 · Same name`)
+    ).toBeVisible()
+    expect(
+      screen.getByText(`${instance.t('Channel')} #7 · Same name`)
+    ).toBeVisible()
+    expect(screen.getByText(instance.t('No price set'))).toBeVisible()
+    expect(
+      screen.getByText(
+        instance.t(
+          'The current PriceVersion is incompatible with the plugin usage schema.'
+        )
+      )
+    ).toBeVisible()
+    expect(
+      screen.getByText(
+        instance.t(
+          "The price owner's plugin or model binding is no longer valid."
+        )
+      )
+    ).toBeVisible()
+    expect(
+      screen.getByText(`Demo (demo) · ${instance.t('PriceVersion')} #33`)
+    ).toBeVisible()
+    expect(
+      screen
+        .getByText(`${instance.t('Channel')} #8 · ${'长合法名称'.repeat(40)}`)
+        .closest('li')
+    ).toHaveClass('wrap-anywhere')
+    expect(uploadResponse).toHaveBeenCalledTimes(1)
+    expect(api.post).toHaveBeenCalledTimes(1)
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(read).toHaveBeenLastCalledWith(
+      '/api/plugin/task/demo',
+      expect.objectContaining({
+        params: undefined,
+        signal: expect.any(AbortSignal),
+      })
+    )
+  }
+)

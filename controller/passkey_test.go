@@ -294,9 +294,6 @@ func TestPasskeyDomainChoicesRespectOriginAndConfiguration(t *testing.T) {
 func setupPasskeyDomainOptions(t *testing.T) {
 	t.Helper()
 	require.NoError(t, model.DB.AutoMigrate(&model.Option{}))
-	// These tests assert on the whole options table. The server-managed legacy
-	// access token deadline written by the enrollment fixture is unrelated.
-	require.NoError(t, model.DB.Delete(&model.Option{Key: "LegacyAccessTokenRetireAt"}).Error)
 	common.OptionMapRWMutex.RLock()
 	previousOptions := maps.Clone(common.OptionMap)
 	previousAddress := system_setting.ServerAddress
@@ -358,6 +355,9 @@ func TestPasskeySnapshotDoesNotMaterializeDefaults(t *testing.T) {
 func TestPasskeyDomainPreviewConfirmationAndAudit(t *testing.T) {
 	user, identity := setupSecurityEnrollmentTest(t)
 	setupPasskeyDomainOptions(t)
+	beforeOptions, err := model.AllOption()
+	require.NoError(t, err)
+	require.NotEmpty(t, beforeOptions, "server-managed settings must remain in the fixture")
 	settings := system_setting.GetPasskeySettings()
 	settings.LegacyRPIDs = "www.example.com,WWW.example.com"
 	settings.Origins = "https://example.com,https://www.example.com"
@@ -383,7 +383,7 @@ func TestPasskeyDomainPreviewConfirmationAndAudit(t *testing.T) {
 	require.NotEmpty(t, preview.RemovalConfirmation)
 	options, err := model.AllOption()
 	require.NoError(t, err)
-	assert.Empty(t, options, "preview must not materialize default rows")
+	assert.ElementsMatch(t, beforeOptions, options, "preview must neither materialize defaults nor change existing settings")
 	assert.Equal(t, "www.example.com,WWW.example.com", settings.LegacyRPIDs)
 	assert.ErrorIs(t, model.UpdateOptionsBulk(map[string]string{"passkey.legacy_rp_ids": upper, "Notice": "must roll back"}), model.ErrPasskeyDomainRemovalConfirmation)
 	blocked := passkeyDomainRequest(t, "/api/option/", map[string]string{"key": "passkey.legacy_rp_ids", "value": upper}, identity, "https://example.com", UpdateOption)
@@ -400,7 +400,7 @@ func TestPasskeyDomainPreviewConfirmationAndAudit(t *testing.T) {
 	assert.EqualValues(t, 3, preview.UnknownCredentials)
 	options, err = model.AllOption()
 	require.NoError(t, err)
-	assert.Empty(t, options)
+	assert.ElementsMatch(t, beforeOptions, options, "blocked and stale confirmations must leave every setting unchanged")
 	request["removal_confirmation"] = preview.RemovalConfirmation
 	response = passkeyDomainRequest(t, "/api/option/passkey/domains", request, identity, "https://example.com", UpdatePasskeyDomains)
 	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
@@ -524,6 +524,9 @@ func TestPasskeyRegistrationAndDomainRemovalSerialize(t *testing.T) {
 func TestPasskeyDomainEndpointRequiresRoot(t *testing.T) {
 	user, _ := setupSecurityEnrollmentTest(t)
 	setupPasskeyDomainOptions(t)
+	beforeOptions, err := model.AllOption()
+	require.NoError(t, err)
+	require.NotEmpty(t, beforeOptions, "server-managed settings must remain in the fixture")
 	bundle, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "domain-settings-test")
 	require.NoError(t, err)
 	router := gin.New()
@@ -539,7 +542,7 @@ func TestPasskeyDomainEndpointRequiresRoot(t *testing.T) {
 	}
 	options, err := model.AllOption()
 	require.NoError(t, err)
-	assert.Empty(t, options)
+	assert.ElementsMatch(t, beforeOptions, options, "unauthenticated and non-root callers must leave every setting unchanged")
 }
 
 func TestPasskeyDefaultsDoNotRestrictUnrelatedServerAddressSetup(t *testing.T) {

@@ -17,242 +17,177 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
-import { useEffect } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
-import * as z from 'zod'
+import { z } from 'zod'
 
 import { Dialog } from '@/components/dialog'
 import { Button } from '@/components/ui/button'
 import {
   Form,
   FormControl,
-  FormDescription,
   FormField,
   FormItem,
   FormLabel,
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { CurrencyInput } from '@/features/pricing-management/components/currency-input'
+import { parseDecimalMoneyAmount } from '@/lib/currency'
+
 import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
-import type { CreemProduct } from '@/features/wallet/types'
+  checkoutTextByteLength,
+  type CheckoutSettingsValues,
+} from './checkout-settings-schema'
 
-import { safeNumberFieldProps } from '../utils/numeric-field'
-
-const creemProductDialogSchema = z.object({
-  name: z.string().min(1, 'Product name is required'),
-  productId: z.string().min(1, 'Product ID is required'),
-  price: z.number().min(0.01, 'Price must be greater than 0'),
-  quota: z.number().min(1, 'Quota must be at least 1'),
-  currency: z.enum(['USD', 'EUR']),
-})
-
-type CreemProductDialogFormValues = z.infer<typeof creemProductDialogSchema>
-
-const CREEM_PRODUCT_FORM_ID = 'creem-product-form'
-
-// Re-export for backwards compatibility
-export type CreemProductData = CreemProduct
-
-type CreemProductDialogProps = {
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  onSave: (data: CreemProduct) => void
-  editData?: CreemProduct | null
-}
-
-export function CreemProductDialog({
-  open,
-  onOpenChange,
-  onSave,
-  editData,
-}: CreemProductDialogProps) {
-  const { t } = useTranslation()
-  const isEditMode = !!editData
-
-  const form = useForm<CreemProductDialogFormValues>({
-    resolver: zodResolver(creemProductDialogSchema),
-    defaultValues: {
-      name: '',
-      productId: '',
-      price: 0,
-      quota: 0,
-      currency: 'USD',
-    },
+export type CreemProductData =
+  CheckoutSettingsValues['providers'][number]['products'][number]
+const productSchema = z
+  .object({
+    product_id: z
+      .string()
+      .trim()
+      .min(1, 'Enter a unique external product ID of at most 255 UTF-8 bytes.')
+      .refine(
+        (value) => checkoutTextByteLength(value) <= 255,
+        'Use at most 255 UTF-8 bytes.'
+      ),
+    name: z
+      .string()
+      .trim()
+      .min(1, 'Product name is required.')
+      .refine(
+        (value) => checkoutTextByteLength(value) <= 255,
+        'Use at most 255 UTF-8 bytes.'
+      ),
+    amount: z.string(),
+    currency: z.string().regex(/^[A-Z]{3}$/, 'Invalid currency'),
   })
-
-  useEffect(() => {
-    if (editData) {
-      form.reset(editData)
-    } else {
-      form.reset({
-        name: '',
-        productId: '',
-        price: 0,
-        quota: 0,
-        currency: 'USD',
+  .superRefine((value, context) => {
+    const money = parseDecimalMoneyAmount(value.amount, value.currency)
+    if (!money || BigInt(money.nanos) <= 0n) {
+      context.addIssue({
+        code: 'custom',
+        path: ['amount'],
+        message:
+          'Enter a positive amount with at most 9 decimal places within the int64 range.',
       })
     }
-  }, [editData, form, open])
+  })
 
-  const handleSubmit = (values: CreemProductDialogFormValues) => {
-    const data: CreemProduct = {
-      name: values.name,
-      productId: values.productId,
-      price: values.price,
-      quota: values.quota,
-      currency: values.currency,
-    }
-    onSave(data)
-    form.reset()
-    onOpenChange(false)
-  }
-
+export function CreemProductDialog(props: {
+  provider: 'stripe' | 'creem'
+  editData: CreemProductData | null
+  onClose: () => void
+  onSave: (value: CreemProductData) => void
+  productIDs: string[]
+}) {
+  const { t } = useTranslation()
+  const form = useForm<CreemProductData>({
+    resolver: zodResolver(productSchema),
+    defaultValues: props.editData ?? {
+      product_id: '',
+      name: '',
+      amount: '',
+      currency: '',
+    },
+  })
   return (
     <Dialog
-      open={open}
-      onOpenChange={onOpenChange}
-      title={isEditMode ? t('Edit product') : t('Add product')}
-      description={t('Configure a Creem product for user recharge options.')}
-      contentClassName='sm:max-w-[500px]'
+      open
+      onOpenChange={(open) => !open && props.onClose()}
+      title={
+        props.editData ? t('Edit external product') : t('Add external product')
+      }
+      description={t(
+        'The server retrieves the actual payment price from the external product. Configure only the reward per item here.'
+      )}
       contentHeight='auto'
-      bodyClassName='space-y-4'
       footer={
         <>
-          <Button
-            type='button'
-            variant='outline'
-            onClick={() => onOpenChange(false)}
-          >
+          <Button type='button' variant='outline' onClick={props.onClose}>
             {t('Cancel')}
           </Button>
-          <Button type='submit' form={CREEM_PRODUCT_FORM_ID}>
-            {isEditMode ? t('Update') : t('Add')}
+          <Button type='submit' form='checkout-product-reward'>
+            {t('Save product reward')}
           </Button>
         </>
       }
     >
       <Form {...form}>
         <form
-          id={CREEM_PRODUCT_FORM_ID}
-          onSubmit={form.handleSubmit(handleSubmit)}
+          id='checkout-product-reward'
           className='space-y-4'
+          onSubmit={(event) => {
+            event.stopPropagation()
+            void form.handleSubmit((values) => {
+              if (props.productIDs.includes(values.product_id)) {
+                form.setError('product_id', {
+                  message:
+                    'Enter a unique external product ID of at most 255 UTF-8 bytes.',
+                })
+                return
+              }
+              props.onSave(values)
+              props.onClose()
+            })(event)
+          }}
         >
+          <FormField
+            control={form.control}
+            name='product_id'
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>
+                  {props.provider === 'stripe'
+                    ? t('Stripe Price ID')
+                    : t('Creem Product ID')}
+                </FormLabel>
+                <FormControl>
+                  <Input {...field} />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
           <FormField
             control={form.control}
             name='name'
             render={({ field }) => (
               <FormItem>
-                <FormLabel>{t('Product Name')}</FormLabel>
+                <FormLabel>{t('Product name')}</FormLabel>
                 <FormControl>
-                  <Input placeholder={t('e.g., Basic Package')} {...field} />
+                  <Input {...field} />
                 </FormControl>
-                <FormDescription>
-                  {t('Display name shown to users.')}
-                </FormDescription>
                 <FormMessage />
               </FormItem>
             )}
           />
-
           <FormField
             control={form.control}
-            name='productId'
+            name='currency'
             render={({ field }) => (
               <FormItem>
-                <FormLabel>{t('Product ID')}</FormLabel>
+                <FormLabel>{t('Reward currency')}</FormLabel>
                 <FormControl>
-                  <Input
-                    placeholder={t('e.g., prod_xxx')}
-                    disabled={isEditMode}
-                    {...field}
-                  />
-                </FormControl>
-                <FormDescription>
-                  {t('Creem product ID from your Creem dashboard.')}
-                </FormDescription>
-                <FormMessage />
-              </FormItem>
-            )}
-          />
-
-          <div className='grid gap-4 sm:grid-cols-2'>
-            <FormField
-              control={form.control}
-              name='currency'
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>{t('Currency')}</FormLabel>
-                  <Select
-                    items={[
-                      { value: 'USD', label: 'USD ($)' },
-                      { value: 'EUR', label: 'EUR (€)' },
-                    ]}
-                    onValueChange={field.onChange}
+                  <CurrencyInput
                     value={field.value}
-                  >
-                    <FormControl>
-                      <SelectTrigger>
-                        <SelectValue placeholder={t('Select currency')} />
-                      </SelectTrigger>
-                    </FormControl>
-                    <SelectContent alignItemWithTrigger={false}>
-                      <SelectGroup>
-                        <SelectItem value='USD'>USD ($)</SelectItem>
-                        <SelectItem value='EUR'>EUR (€)</SelectItem>
-                      </SelectGroup>
-                    </SelectContent>
-                  </Select>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-
-            <FormField
-              control={form.control}
-              name='price'
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>{t('Price')}</FormLabel>
-                  <FormControl>
-                    <Input
-                      type='number'
-                      step='0.01'
-                      min={0.01}
-                      placeholder='10.00'
-                      {...safeNumberFieldProps(field)}
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-          </div>
-
-          <FormField
-            control={form.control}
-            name='quota'
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel>{t('Quota')}</FormLabel>
-                <FormControl>
-                  <Input
-                    type='number'
-                    min={1}
-                    placeholder={t('e.g., 500000')}
-                    {...safeNumberFieldProps(field)}
+                    onValueChange={field.onChange}
                   />
                 </FormControl>
-                <FormDescription>
-                  {t('Amount of quota to credit to user account.')}
-                </FormDescription>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name='amount'
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>{t('Reward amount per item')}</FormLabel>
+                <FormControl>
+                  <Input {...field} type='text' inputMode='decimal' />
+                </FormControl>
                 <FormMessage />
               </FormItem>
             )}

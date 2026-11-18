@@ -40,7 +40,7 @@ func ParseGatewayMediaRequest(c *gin.Context) (*GatewayMediaRequest, error) {
 		parsed.Protocol = protocol.OpenAIImages
 	case "/v1/audio/speech":
 		parsed.Protocol = protocol.OpenAIAudioSpeech
-	case "/v1/audio/transcriptions":
+	case "/v1/audio/transcriptions", "/v1/audio/translations":
 		parsed.Protocol = protocol.OpenAIAudioTranscription
 	default:
 		return nil, fmt.Errorf("unsupported media endpoint")

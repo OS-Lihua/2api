@@ -1,99 +1,20 @@
 package controller
 
 import (
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
-	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
-	"github.com/shopspring/decimal"
-	"github.com/thanhpk/randstr"
 )
 
-type WaffoPancakePayRequest struct {
-	Amount int64 `json:"amount"`
-}
-
-func RequestWaffoPancakeAmount(c *gin.Context) {
-	var req WaffoPancakePayRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		paymentError(c, common.NewMessage("Invalid parameters"))
-		return
-	}
-
-	if req.Amount < int64(setting.WaffoPancakeMinTopUp) {
-		paymentError(c, common.NewMessage("Top-up amount cannot be less than {{min}}", map[string]any{"min": setting.WaffoPancakeMinTopUp}))
-		return
-	}
-	id := c.GetInt("id")
-	if rejectInvalidTopUpQuota(c, id, req.Amount) {
-		return
-	}
-
-	group, err := model.GetUserGroup(id, true)
-	if err != nil {
-		paymentError(c, common.NewMessage("Failed to get the user group"))
-		return
-	}
-
-	payMoney := getWaffoPancakePayMoney(req.Amount, group)
-	if payMoney <= 0.01 {
-		paymentError(c, common.NewMessage("Payment amount is too low"))
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "success", "data": fmt.Sprintf("%.2f", payMoney)})
-}
-
-func getWaffoPancakePayMoney(amount int64, group string) float64 {
-	dAmount := decimal.NewFromInt(amount)
-	if operation_setting.GetQuotaDisplayType() == operation_setting.QuotaDisplayTypeTokens {
-		dAmount = dAmount.Div(decimal.NewFromFloat(common.QuotaPerUnit))
-	}
-
-	topupGroupRatio := common.GetTopupGroupRatio(group)
-	if topupGroupRatio == 0 {
-		topupGroupRatio = 1
-	}
-
-	discount := 1.0
-	if ds, ok := operation_setting.GetPaymentSetting().AmountDiscount[int(amount)]; ok && ds > 0 {
-		discount = ds
-	}
-
-	payMoney := dAmount.
-		Mul(decimal.NewFromFloat(setting.WaffoPancakeUnitPrice)).
-		Mul(decimal.NewFromFloat(topupGroupRatio)).
-		Mul(decimal.NewFromFloat(discount))
-
-	return payMoney.InexactFloat64()
-}
-
-func normalizeWaffoPancakeTopUpAmount(amount int64) int64 {
-	if operation_setting.GetQuotaDisplayType() != operation_setting.QuotaDisplayTypeTokens {
-		return amount
-	}
-
-	normalized := decimal.NewFromInt(amount).
-		Div(decimal.NewFromFloat(common.QuotaPerUnit)).
-		IntPart()
-	if normalized < 1 {
-		return 1
-	}
-	return normalized
-}
-
-func formatWaffoPancakeAmount(payMoney float64) string {
-	return decimal.NewFromFloat(payMoney).StringFixed(2)
-}
+func RequestWaffoPancakeAmount(c *gin.Context) { requestCheckoutQuote(c, "waffo_pancake") }
 
 func getWaffoPancakeBuyerEmail(user *model.User) string {
 	if user != nil && strings.TrimSpace(user.Email) != "" {
@@ -339,98 +260,11 @@ func getWaffoPancakeBuyerIdentity(user *model.User) string {
 	return service.WaffoPancakeBuyerIdentityFromUserID(user.Id)
 }
 
-func RequestWaffoPancakePay(c *gin.Context) {
-	if !isWaffoPancakeTopUpEnabled() {
-		paymentError(c, common.NewMessage("Waffo Pancake configuration is incomplete"))
-		return
-	}
-
-	var req WaffoPancakePayRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		paymentError(c, common.NewMessage("Invalid parameters"))
-		return
-	}
-	if req.Amount < int64(setting.WaffoPancakeMinTopUp) {
-		paymentError(c, common.NewMessage("Top-up amount cannot be less than {{min}}", map[string]any{"min": setting.WaffoPancakeMinTopUp}))
-		return
-	}
-	id := c.GetInt("id")
-	if rejectInvalidTopUpQuota(c, id, req.Amount) {
-		return
-	}
-
-	user, err := model.GetUserById(id, false)
-	if err != nil || user == nil {
-		paymentError(c, common.NewMessage("User does not exist"))
-		return
-	}
-
-	group, err := model.GetUserGroup(id, true)
-	if err != nil {
-		paymentError(c, common.NewMessage("Failed to get the user group"))
-		return
-	}
-
-	payMoney := getWaffoPancakePayMoney(req.Amount, group)
-	if payMoney < 0.01 {
-		paymentError(c, common.NewMessage("Payment amount is too low"))
-		return
-	}
-
-	tradeNo := fmt.Sprintf("WAFFO_PANCAKE-%d-%d-%s", id, time.Now().UnixMilli(), randstr.String(6))
-	topUp := &model.TopUp{
-		UserId:          id,
-		Amount:          normalizeWaffoPancakeTopUpAmount(req.Amount),
-		Money:           payMoney,
-		TradeNo:         tradeNo,
-		PaymentMethod:   model.PaymentMethodWaffoPancake,
-		PaymentProvider: model.PaymentProviderWaffoPancake,
-		CreateTime:      time.Now().Unix(),
-		Status:          common.TopUpStatusPending,
-	}
-	if err := topUp.Insert(); err != nil {
-		logger.LogError(c.Request.Context(), common.LogText("Waffo Pancake failed to create top-up order user_id=%d trade_no=%s amount=%d error=%q", id, tradeNo, req.Amount, err.Error()))
-		paymentError(c, common.NewMessage("Failed to create order"))
-		return
-	}
-
-	expiresInSeconds := 45 * 60
-	session, err := service.CreateWaffoPancakeCheckoutSession(c.Request.Context(), &service.WaffoPancakeCreateSessionParams{
-		ProductID:     setting.WaffoPancakeProductID,
-		BuyerIdentity: getWaffoPancakeBuyerIdentity(user),
-		PriceSnapshot: &service.WaffoPancakePriceSnapshot{
-			Amount:      formatWaffoPancakeAmount(payMoney),
-			TaxCategory: "saas",
-		},
-		BuyerEmail:              getWaffoPancakeBuyerEmail(user),
-		ExpiresInSeconds:        &expiresInSeconds,
-		OrderMerchantExternalID: tradeNo,
-	})
-	if err != nil {
-		logger.LogError(c.Request.Context(), common.LogText("Waffo Pancake failed to create checkout session user_id=%d trade_no=%s error=%q", id, tradeNo, err.Error()))
-		topUp.Status = common.TopUpStatusFailed
-		_ = topUp.Update()
-		paymentError(c, common.NewMessage("Failed to start payment"))
-		return
-	}
-	logger.LogInfo(c.Request.Context(), common.LogText("Waffo Pancake top-up order created user_id=%d trade_no=%s session_id=%s amount=%d money=%.2f", id, tradeNo, session.SessionID, req.Amount, payMoney))
-
-	c.JSON(http.StatusOK, gin.H{
-		"message": "success",
-		"data": gin.H{
-			"checkout_url":     session.CheckoutURL,
-			"session_id":       session.SessionID,
-			"expires_at":       session.ExpiresAt,
-			"order_id":         tradeNo,
-			"token":            session.Token,
-			"token_expires_at": session.TokenExpiresAt,
-		},
-	})
-}
+func RequestWaffoPancakePay(c *gin.Context) { requestCheckoutPayment(c, "waffo_pancake") }
 
 func WaffoPancakeWebhook(c *gin.Context) {
 	if !isWaffoPancakeWebhookEnabled() {
-		logger.LogWarn(c.Request.Context(), common.LogText("Waffo Pancake webhook rejected reason=webhook_disabled path=%q client_ip=%s", c.Request.RequestURI, c.ClientIP()))
+		logger.LogWarn(c.Request.Context(), common.LogText("Waffo Pancake webhook rejected reason=webhook_disabled path=%q client_ip=%s", c.Request.URL.Path, c.ClientIP()))
 		c.String(http.StatusForbidden, "webhook disabled")
 		return
 	}
@@ -442,7 +276,7 @@ func WaffoPancakeWebhook(c *gin.Context) {
 	if expectedEnv != "test" && expectedEnv != "prod" {
 		logger.LogWarn(c.Request.Context(), common.LogText(
 			"Waffo Pancake webhook invalid env path segment env=%q path=%q client_ip=%s",
-			expectedEnv, c.Request.RequestURI, c.ClientIP(),
+			expectedEnv, c.Request.URL.Path, c.ClientIP(),
 		))
 		c.String(http.StatusNotFound, "unknown env")
 		return
@@ -450,17 +284,15 @@ func WaffoPancakeWebhook(c *gin.Context) {
 
 	bodyBytes, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		logger.LogError(c.Request.Context(), common.LogText("Waffo Pancake webhook failed to read request body path=%q client_ip=%s error=%q", c.Request.RequestURI, c.ClientIP(), err.Error()))
+		logger.LogError(c.Request.Context(), common.LogText("Waffo Pancake webhook failed to read request body path=%q client_ip=%s error=%q", c.Request.URL.Path, c.ClientIP(), err.Error()))
 		c.String(http.StatusBadRequest, "bad request")
 		return
 	}
 
 	signature := c.GetHeader("X-Waffo-Signature")
-	logger.LogInfo(c.Request.Context(), common.LogText("Waffo Pancake webhook received request path=%q client_ip=%s signature=%q body=%q", c.Request.RequestURI, c.ClientIP(), signature, string(bodyBytes)))
 
 	event, err := service.VerifyConfiguredWaffoPancakeWebhook(string(bodyBytes), signature)
 	if err != nil {
-		logger.LogWarn(c.Request.Context(), common.LogText("Waffo Pancake webhook signature verification failed path=%q client_ip=%s signature=%q body=%q error=%q", c.Request.RequestURI, c.ClientIP(), signature, string(bodyBytes), err.Error()))
 		c.String(http.StatusUnauthorized, "invalid signature")
 		return
 	}
@@ -509,6 +341,10 @@ func WaffoPancakeWebhook(c *gin.Context) {
 
 	tradeNo, err := service.ResolveWaffoPancakeTradeNo(event)
 	if err != nil {
+		if strings.HasPrefix(rawTradeNo, "CHECKOUT-") {
+			c.String(http.StatusInternalServerError, "retry")
+			return
+		}
 		// LogError (not LogWarn): covers order-not-found and buyer-identity
 		// mismatch — both warrant human attention. 200 OK so Waffo doesn't
 		// retry a permanently-unresolvable webhook.
@@ -523,6 +359,34 @@ func WaffoPancakeWebhook(c *gin.Context) {
 	LockOrder(tradeNo)
 	defer UnlockOrder(tradeNo)
 
+	if topUp := model.GetTopUpByTradeNo(tradeNo); topUp != nil && topUp.ContractVersion == model.CheckoutContractVersion {
+		order, err := model.GetCheckoutOrder(c.Request.Context(), tradeNo)
+		if err != nil || order.ProviderStoreID != event.StoreID || event.Data.OrderID == "" {
+			c.String(http.StatusBadRequest, "payment identity mismatch")
+			return
+		}
+		currency, err := money.ParseCurrency(event.Data.Currency)
+		if err != nil {
+			c.String(http.StatusBadRequest, "invalid currency")
+			return
+		}
+		// The SDK's canonical completed-order total falls back to amount when
+		// total is absent. Tax is already represented in that received total.
+		total := event.Data.Amount
+		if event.Data.Total != nil {
+			total = *event.Data.Total
+		}
+		paid, err := service.CheckoutMajorAmount(total, currency)
+		if err == nil {
+			err = confirmExactCheckout(c.Request.Context(), model.PaymentProviderWaffoPancake, model.CheckoutPayment{TradeNo: tradeNo, PaidAmount: paid, ProviderOrderID: event.Data.OrderID, ProviderSessionID: order.ProviderSessionID, EventID: event.ID})
+		}
+		if err != nil {
+			c.String(http.StatusInternalServerError, "retry")
+		} else {
+			c.String(http.StatusOK, "OK")
+		}
+		return
+	}
 	if err := model.RechargeWaffoPancake(tradeNo); err != nil {
 		logger.LogError(c.Request.Context(), common.LogText("Waffo Pancake top-up processing failed trade_no=%s event_id=%s order_id=%s client_ip=%s error=%q", tradeNo, event.ID, event.Data.OrderID, c.ClientIP(), err.Error()))
 		c.String(http.StatusInternalServerError, "retry")

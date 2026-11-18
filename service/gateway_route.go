@@ -119,7 +119,7 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 	if err := model.OfferingChannelsQuery(db, offering, ids).Preload("Model").Order("id").Find(&candidates).Error; err != nil {
 		return nil, err
 	}
-	if input.PinnedChannelID != 0 || input.PinnedProviderID != 0 {
+	if input.PinnedChannelID != 0 {
 		if input.PinnedChannelID <= 0 || input.PinnedProviderID <= 0 {
 			return nil, ErrGatewayUnavailable
 		}
@@ -127,6 +127,13 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 		for i := range candidates {
 			candidates[i].ProviderID = input.PinnedProviderID
 		}
+	} else if input.PinnedProviderID != 0 {
+		if input.PinnedProviderID < 0 {
+			return nil, ErrGatewayUnavailable
+		}
+		// Imported obligations predate Channels. Restrict the child's current
+		// authorized routes to its proven original Provider without rebinding.
+		candidates = slices.DeleteFunc(candidates, func(candidate model.Channel) bool { return candidate.ProviderID != input.PinnedProviderID })
 	}
 	providerIDs := make([]int, 0, len(candidates))
 	channelIDs := make([]int, 0, len(candidates))
@@ -191,8 +198,8 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 			switch input.Protocol {
 			case protocol.OpenAIEmbeddings, protocol.GeminiEmbed:
 				protocolMatch = candidate.Protocol == protocol.OpenAIEmbeddings || candidate.Protocol == protocol.GeminiEmbed
-			case protocol.Rerank:
-				protocolMatch = candidate.Protocol == protocol.Rerank
+			case protocol.Rerank, protocol.AlphaSearch, protocol.DeepSeekTools, protocol.OpenAIModerations:
+				protocolMatch = candidate.Protocol == input.Protocol
 			}
 			if !protocolMatch {
 				reject(candidate.ID, "protocol")
@@ -349,6 +356,29 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 			}
 			eligible = append(eligible, selection)
 		}
+		// A session binding is a constraint on the already authorized, priced
+		// candidates, never permission to bypass their capability/profit checks.
+		preferred, found := GetPreferredGatewayChannelByAffinity(c, offering.ID, tier, offering.Name)
+		if found {
+			matches := func(selection *GatewaySelection) bool { return selection.Channel.ID == preferred }
+			usable := slices.ContainsFunc(eligible, matches) || offering.AllowLossFallback && slices.ContainsFunc(unprofitable, matches)
+			strict := RequestPolicy(c).SessionMode == "strict"
+			if !usable {
+				if !ShouldKeepChannelAffinityOnChannelDisabled() {
+					ClearCurrentChannelAffinityCache(c)
+				}
+				if strict {
+					RequestPolicy(c).AddEvent(PolicyEvent{Decision: PolicyDecision{Action: "stop", Reason: "strict_session_binding_unavailable", Source: "session_rule"}})
+					return nil, ErrGatewayUnavailable
+				}
+				found = false
+			} else if strict {
+				// Admission may change after its preview. Restrict the final
+				// atomic acquisition too, so a race cannot silently switch peers.
+				eligible = slices.DeleteFunc(eligible, func(selection *GatewaySelection) bool { return !matches(selection) })
+				unprofitable = slices.DeleteFunc(unprofitable, func(selection *GatewaySelection) bool { return !matches(selection) })
+			}
+		}
 		probeFence := eligibleFence
 		if offering.AllowLossFallback {
 			probeFence = append(probeFence, lossFence...)
@@ -387,7 +417,6 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 					// Keep later candidates for atomic admission failures, in purchase-cost order.
 					slices.SortStableFunc(ranked, func(a, b *GatewaySelection) int { order, _ := a.EstimatedCost.Compare(b.EstimatedCost); return order })
 				}
-				preferred, found := GetPreferredGatewayChannelByAffinity(c, offering.ID, tier, offering.Name)
 				if found && !lossFallback {
 					for i, selection := range ranked {
 						if selection.Channel.ID == preferred {
@@ -447,6 +476,9 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 					return selected, nil
 				}
 			}
+		}
+		if found && RequestPolicy(c).SessionMode == "strict" {
+			return nil, ErrGatewayUnavailable
 		}
 	}
 	if lastStage == 4 {

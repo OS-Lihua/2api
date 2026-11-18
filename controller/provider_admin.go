@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -108,6 +109,48 @@ type createProviderRequest struct {
 	Provider                  json.RawMessage `json:"provider"`
 }
 
+// validProviderAccountFields keeps retired routing settings out of account
+// mutations. Omitted legacy fields already stored on a Provider are not rewritten.
+func validProviderAccountFields(fields map[string]json.RawMessage) bool {
+	if fields == nil {
+		return false
+	}
+	for name, raw := range fields {
+		for _, retired := range []string{"models", "model_mapping", "group", "priority", "weight", "tool_loss_policy"} {
+			if strings.EqualFold(name, retired) {
+				return false
+			}
+		}
+		if strings.EqualFold(name, "param_override") {
+			var paramOverride map[string]any
+			if err := common.Unmarshal(raw, &paramOverride); err != nil || relaycommon.ValidateParamOverrideContextReferences(paramOverride) != nil {
+				return false
+			}
+			continue
+		}
+		if !strings.EqualFold(name, "settings") {
+			continue
+		}
+		var settings *string
+		if err := common.Unmarshal(raw, &settings); err != nil {
+			return false
+		}
+		if settings == nil || strings.TrimSpace(*settings) == "" {
+			continue
+		}
+		var other map[string]json.RawMessage
+		if err := common.DecodeJsonStrict(strings.NewReader(*settings), &other); err != nil || other == nil {
+			return false
+		}
+		for field := range other {
+			if strings.EqualFold(field, "tool_loss_policy") {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // legacyProviderReply is what a reused /api/channel handler wrote.
 type legacyProviderReply struct {
 	status  int
@@ -195,14 +238,24 @@ func respondProvider(c *gin.Context, id int) {
 	common.ApiSuccess(c, readableProvider(provider))
 }
 
-// ListProviders lists Providers. Filters: keyword (ID, name, or address host),
-// group, status (enabled or disabled), and type.
+// ListProviders lists accounts in descending ID order. Filters: keyword (ID,
+// name, or address host), status (enabled or disabled), and type.
 func ListProviders(c *gin.Context) {
+	parameters, err := url.ParseQuery(c.Request.URL.RawQuery)
+	if err != nil {
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
+		return
+	}
+	for name := range parameters {
+		switch strings.ToLower(name) {
+		case "group", "sort_by", "sort_order", "id_sort":
+			common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
+			return
+		}
+	}
 	pageInfo := common.GetPageQuery(c)
-	idSort, _ := strconv.ParseBool(c.Query("id_sort"))
-	sortOptions := model.NewProviderSortOptions(c.Query("sort_by"), c.Query("sort_order"), idSort)
 	typeFilter := -1
-	if value := c.Query("type"); value != "" {
+	if value := parameters.Get("type"); value != "" {
 		parsed, err := strconv.Atoi(value)
 		if err != nil {
 			common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
@@ -210,8 +263,12 @@ func ListProviders(c *gin.Context) {
 		}
 		typeFilter = parsed
 	}
-	query := buildChannelListQuery(model.NormalizeProviderGroupFilter(c.Query("group")), parseStatusFilter(c.Query("status")), typeFilter)
-	if keyword := strings.TrimSpace(c.Query("keyword")); keyword != "" {
+	query := model.DB.WithContext(c.Request.Context()).Model(&model.Provider{})
+	query = applyChannelStatusFilter(query, parseStatusFilter(parameters.Get("status")))
+	if typeFilter >= 0 {
+		query = query.Where("type = ?", typeFilter)
+	}
+	if keyword := strings.TrimSpace(parameters.Get("keyword")); keyword != "" {
 		pattern := "%" + keyword + "%"
 		host := keyword
 		if address, err := url.Parse(keyword); err == nil && address.Hostname() != "" {
@@ -228,8 +285,8 @@ func ListProviders(c *gin.Context) {
 		return
 	}
 	providers := make([]*model.Provider, 0)
-	if err := sortOptions.Apply(query).Omit("key").
-		Limit(pageInfo.GetPageSize()).Offset(pageInfo.GetStartIdx()).
+	if err := query.Select("id", "type", "name", "status", "base_url", "balance", "balance_updated_time", "created_time", "remark", "channel_info").
+		Order(`"id" DESC`).Limit(pageInfo.GetPageSize()).Offset(pageInfo.GetStartIdx()).
 		Find(&providers).Error; err != nil {
 		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
 		return
@@ -260,11 +317,12 @@ func GetProvider(c *gin.Context) {
 // multi-key Provider). The reply holds only the new IDs.
 func CreateProvider(c *gin.Context) {
 	var request createProviderRequest
-	if err := c.ShouldBindJSON(&request); err != nil {
-		common.ApiErrorStatus(c, http.StatusBadRequest, err)
+	if err := common.DecodeJsonStrict(c.Request.Body, &request); err != nil {
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
 		return
 	}
-	if len(request.Provider) == 0 || request.BatchAddSetKeyPrefix2Name {
+	var fields map[string]json.RawMessage
+	if err := common.Unmarshal(request.Provider, &fields); err != nil || !validProviderAccountFields(fields) || request.BatchAddSetKeyPrefix2Name {
 		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
 		return
 	}
@@ -304,12 +362,9 @@ func UpdateProvider(c *gin.Context) {
 		return
 	}
 	var fields map[string]json.RawMessage
-	if err := c.ShouldBindJSON(&fields); err != nil {
-		common.ApiErrorStatus(c, http.StatusBadRequest, err)
+	if err := common.DecodeJsonStrict(c.Request.Body, &fields); err != nil || !validProviderAccountFields(fields) {
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
 		return
-	}
-	if fields == nil {
-		fields = map[string]json.RawMessage{}
 	}
 	fields["id"] = json.RawMessage(strconv.Itoa(id))
 	// Validate the effective adapter configuration without resubmitting omitted

@@ -2,10 +2,12 @@ package model
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/pkg/money"
+	"github.com/shopspring/decimal"
 
 	"gorm.io/gorm"
 )
@@ -16,7 +18,7 @@ type Redemption struct {
 	Key          string         `json:"key" gorm:"type:char(32);uniqueIndex"`
 	Status       int            `json:"status" gorm:"default:1"`
 	Name         string         `json:"name" gorm:"index"`
-	Quota        int            `json:"quota" gorm:"default:100"`
+	Amount       money.Amount   `json:"amount" gorm:"embedded;embeddedPrefix:amount_"`
 	CreatedTime  int64          `json:"created_time" gorm:"bigint"`
 	RedeemedTime int64          `json:"redeemed_time" gorm:"bigint"`
 	Count        int            `json:"count" gorm:"-:all"` // only for api request
@@ -133,30 +135,40 @@ func GetRedemptionById(id int) (*Redemption, error) {
 	return &redemption, err
 }
 
-func Redeem(key string, userId int) (quota int, err error) {
-	if key == "" {
-		return 0, errors.New("redemption code not provided")
+var ErrInvalidRedemptionAmount error = common.NewMessage("Invalid redemption amount")
+
+func validateRedemptionAmount(amount money.Amount) error {
+	if amount.Nanos <= 0 {
+		return ErrInvalidRedemptionAmount
 	}
-	if userId == 0 {
-		return 0, errors.New("invalid user id")
+	if _, err := money.ParseCurrency(string(amount.Currency)); err != nil {
+		return ErrInvalidRedemptionAmount
+	}
+	return nil
+}
+
+// Redeem consumes a voucher and credits its original denomination at the current
+// accounting FX. The status change, credit and debt repayment commit together.
+func Redeem(key string, userId int) (money.Amount, error) {
+	if key == "" || userId <= 0 {
+		return money.Amount{}, ErrRedeemFailed
 	}
 	redemption := &Redemption{}
-
+	var credited money.Amount
 	common.RandomSleep()
-	err = DB.Transaction(func(tx *gorm.DB) error {
-		err := lockForUpdate(tx).Where(`"key" = ?`, key).First(redemption).Error
-		if err != nil {
-			return errors.New("invalid redemption code")
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockForUpdate(tx).Where(`"key" = ?`, key).First(redemption).Error; err != nil {
+			return ErrRedeemFailed
 		}
-		if redemption.Status != common.RedemptionCodeStatusEnabled {
-			return errors.New("redemption code already used")
+		if redemption.Status != common.RedemptionCodeStatusEnabled || redemption.RedeemedTime != 0 || redemption.UsedUserId != 0 {
+			return ErrRedeemFailed
 		}
 		if redemption.ExpiredTime != 0 && redemption.ExpiredTime < common.GetTimestamp() {
-			return errors.New("redemption code expired")
+			return ErrRedeemFailed
 		}
-		// Compare-and-swap on status: only the transaction that flips
-		// enabled -> used may credit quota, so a concurrent redeem of the
-		// same code loses here.
+		if err := validateRedemptionAmount(redemption.Amount); err != nil {
+			return err
+		}
 		result := tx.Model(&Redemption{}).
 			Where("id = ? AND status = ?", redemption.Id, common.RedemptionCodeStatusEnabled).
 			Updates(map[string]any{
@@ -167,25 +179,52 @@ func Redeem(key string, userId int) (quota int, err error) {
 		if result.Error != nil {
 			return result.Error
 		}
-		if result.RowsAffected == 0 {
-			return errors.New("redemption code already used")
+		if result.RowsAffected != 1 {
+			return ErrRedeemFailed
 		}
-		return creditTopUpQuota(tx, userId, redemption.Quota, nil)
+		var user User
+		if err := tx.Select("id").First(&user, userId).Error; err != nil {
+			return err
+		}
+		credited = redemption.Amount
+		var fx decimal.NullDecimal
+		if redemption.Amount.Currency != SettlementCurrency() {
+			rate, err := GetAccountingFXRate(tx.Statement.Context, tx, redemption.Amount.Currency, SettlementCurrency())
+			if err != nil {
+				return err
+			}
+			value, err := redemption.Amount.Value().Convert(rate)
+			if err != nil {
+				return err
+			}
+			credited, err = value.Credit()
+			if err != nil {
+				return err
+			}
+			fx = decimal.NewNullDecimal(rate.Decimal())
+		}
+		posting := LedgerPosting{
+			Account: UserWalletAccount(userId), Type: LedgerEntryTopUp, Amount: credited,
+			IdempotencyKey: fmt.Sprintf("top_up:redemption:%d", redemption.Id),
+			Remark:         "Redemption code redeemed", sourceAmount: &redemption.Amount, fxRate: fx,
+		}
+		if err := validateLedgerPosting(posting); err != nil {
+			return err
+		}
+		_, err := postLedgerEntries(tx, []LedgerPosting{posting})
+		return err
 	})
 	if err != nil {
-		common.SysError(common.LogText("redemption failed: %s", err.Error()))
-		return 0, ErrRedeemFailed
+		// Never log the voucher credential or database error details that could
+		// contain it. Clients receive the same failure for every rejection.
+		return money.Amount{}, ErrRedeemFailed
 	}
-	syncCreditUserQuotaCache(userId, redemption.Quota, common.LogText("redemption"))
-	RecordLog(userId, LogTypeTopup, common.NewMessage("Topped up {{quota}} with a redemption code, code ID {{id}}", map[string]any{"quota": logger.FormatQuota(redemption.Quota), "id": redemption.Id}))
-	return redemption.Quota, nil
+	RecordLog(userId, LogTypeTopup, common.NewMessage("Redeemed a redemption code, code ID {{id}}", map[string]any{"id": redemption.Id}))
+	return credited, nil
 }
 
 func (redemption *Redemption) Insert() error {
-	if redemption.Quota <= 0 {
-		return errors.New("redemption quota must be positive")
-	}
-	if err := common.ValidateWalletQuota(redemption.Quota); err != nil {
+	if err := validateRedemptionAmount(redemption.Amount); err != nil {
 		return err
 	}
 	var err error
@@ -194,20 +233,28 @@ func (redemption *Redemption) Insert() error {
 }
 
 func (redemption *Redemption) SelectUpdate() error {
-	// This can update zero values
-	return DB.Model(redemption).Select("redeemed_time", "status").Updates(redemption).Error
+	if redemption.Status != common.RedemptionCodeStatusEnabled && redemption.Status != common.RedemptionCodeStatusDisabled {
+		return common.NewMessage("Redemption failed")
+	}
+	result := DB.Model(redemption).
+		Where("status IN ? AND COALESCE(redeemed_time, 0) = 0 AND COALESCE(used_user_id, 0) = 0", []int{common.RedemptionCodeStatusEnabled, common.RedemptionCodeStatusDisabled}).
+		Update("status", redemption.Status)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return common.NewMessage("Redemption failed")
+	}
+	return nil
 }
 
-// Update Make sure your token's fields is completed, because this will update non-zero values
+// Update edits voucher terms without changing its redemption history or status.
 func (redemption *Redemption) Update() error {
-	if redemption.Quota <= 0 {
-		return errors.New("redemption quota must be positive")
-	}
-	if err := common.ValidateWalletQuota(redemption.Quota); err != nil {
+	if err := validateRedemptionAmount(redemption.Amount); err != nil {
 		return err
 	}
 	var err error
-	err = DB.Model(redemption).Select("name", "status", "quota", "redeemed_time", "expired_time").Updates(redemption).Error
+	err = DB.Model(redemption).Select("name", "amount_nanos", "amount_currency", "expired_time").Updates(redemption).Error
 	return err
 }
 

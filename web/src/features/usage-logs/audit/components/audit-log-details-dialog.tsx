@@ -24,6 +24,7 @@ import { Dialog } from '@/components/dialog'
 import { StatusBadge } from '@/components/status-badge'
 import { Button } from '@/components/ui/button'
 import { getAccessTokenScopes } from '@/features/security/api'
+import { toIntlLocale } from '@/i18n/languages'
 import dayjs from '@/lib/dayjs'
 
 import {
@@ -36,7 +37,8 @@ import { AuditDetailFields } from './audit-detail-fields'
 import { AuditDetailValue } from './audit-detail-value'
 
 export function AuditLogDetailsDialog(props: { entry: AuditLog }) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const [open, setOpen] = useState(false)
   const scopes = useQuery({
     queryKey: ['access-token-scopes'],
@@ -48,6 +50,7 @@ export function AuditLogDetailsDialog(props: { entry: AuditLog }) {
     staleTime: Infinity,
   })
   const detail = buildAuditDetails(props.entry, t, {
+    locale,
     scopeResources: scopes.data?.resources,
   })
   const identifiers = [

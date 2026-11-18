@@ -35,7 +35,7 @@ import { useAuthStore } from '@/stores/auth-store'
 import { CommandMenu } from '../command-menu'
 import { Search } from '../search'
 
-const adminEntries = ['Channels', 'Models', 'Users', 'Redemption Codes']
+const adminEntries = ['Providers', 'Models', 'Users', 'Redemption Codes']
 const superAdminEntries = ['System Info', 'Task Plugins', 'System Settings']
 
 // jsdom lacks the Web Animations API the menu's scroll area waits on.
@@ -114,6 +114,7 @@ test('admins find admin pages in search but not super admin pages', async () => 
   const entries = await searchEntriesFor(ROLE.ADMIN)
 
   expect(entries).toEqual(expect.arrayContaining(adminEntries))
+  expect(entries).not.toContain('Channels')
   for (const entry of superAdminEntries) {
     expect(entries).not.toContain(entry)
   }

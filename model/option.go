@@ -23,6 +23,22 @@ type Option struct {
 	Value string `json:"value"`
 }
 
+const RetiredStatisticsSettingsMessage = "Legacy statistics collection settings have been retired."
+const RetiredModelPricingMessage = "Model-name pricing has been retired. Manage Offering PriceVersions instead."
+
+func IsRetiredModelPricingOption(key string) bool {
+	for _, sourceKey := range modelPricingOptionKeys {
+		if strings.EqualFold(key, sourceKey) {
+			return true
+		}
+	}
+	return false
+}
+
+func IsRetiredStatisticsOption(key string) bool {
+	return strings.EqualFold(key, "DataExportEnabled") || strings.EqualFold(key, "DataExportInterval") || strings.EqualFold(key, "DataExportDefaultTime")
+}
+
 func AllOption() ([]*Option, error) {
 	var options []*Option
 	var err error
@@ -63,7 +79,6 @@ func InitOptionMap() {
 	common.OptionMap[setting.TaskPluginMarketplaceSourcesKey] = setting.TaskPluginMarketplaceSources2JsonString()
 	common.OptionMap[setting.TaskPluginDisabledFactoryKeysKey] = "[]"
 	jsplugin.DefaultRegistry.SetDisabledFactoryKeys(nil)
-	common.OptionMap["DataExportEnabled"] = strconv.FormatBool(common.DataExportEnabled)
 	common.OptionMap["ChannelDisableThreshold"] = strconv.FormatFloat(common.ChannelDisableThreshold, 'f', -1, 64)
 	common.OptionMap["EmailDomainRestrictionEnabled"] = strconv.FormatBool(common.EmailDomainRestrictionEnabled)
 	common.OptionMap["EmailAliasRestrictionEnabled"] = strconv.FormatBool(common.EmailAliasRestrictionEnabled)
@@ -146,9 +161,6 @@ func InitOptionMap() {
 	common.OptionMap["WeChatAccountQRCodeImageURL"] = ""
 	common.OptionMap["TurnstileSiteKey"] = ""
 	common.OptionMap["TurnstileSecretKey"] = ""
-	common.OptionMap["QuotaForNewUser"] = strconv.Itoa(common.QuotaForNewUser)
-	common.OptionMap["QuotaForInviter"] = strconv.Itoa(common.QuotaForInviter)
-	common.OptionMap["QuotaForInvitee"] = strconv.Itoa(common.QuotaForInvitee)
 	common.OptionMap["QuotaRemindEnabled"] = strconv.FormatBool(common.QuotaRemindEnabled)
 	common.OptionMap["QuotaRemindThreshold"] = strconv.Itoa(common.QuotaRemindThreshold)
 	common.OptionMap["PreConsumedQuota"] = strconv.Itoa(common.PreConsumedQuota)
@@ -170,10 +182,7 @@ func InitOptionMap() {
 	common.OptionMap["TopUpLink"] = common.TopUpLink
 	//common.OptionMap["ChatLink"] = common.ChatLink
 	//common.OptionMap["ChatLink2"] = common.ChatLink2
-	common.OptionMap["QuotaPerUnit"] = strconv.FormatFloat(common.QuotaPerUnit, 'f', -1, 64)
 	common.OptionMap["RetryTimes"] = strconv.Itoa(common.RetryTimes)
-	common.OptionMap["DataExportInterval"] = strconv.Itoa(common.DataExportInterval)
-	common.OptionMap["DataExportDefaultTime"] = common.DataExportDefaultTime
 	common.OptionMap["DefaultCollapseSidebar"] = strconv.FormatBool(common.DefaultCollapseSidebar)
 	common.OptionMap["MjNotifyEnabled"] = strconv.FormatBool(setting.MjNotifyEnabled)
 	common.OptionMap["MjAccountFilterEnabled"] = strconv.FormatBool(setting.MjAccountFilterEnabled)
@@ -235,6 +244,37 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
+	if IsRetiredModelPricingOption(key) {
+		return common.NewMessage(RetiredModelPricingMessage)
+	}
+	if IsRetiredStatisticsOption(key) {
+		return common.NewMessage(RetiredStatisticsSettingsMessage)
+	}
+	if operation_setting.IsBalanceReminderOption(key) {
+		if err := operation_setting.ValidateBalanceReminderOption(key, value); err != nil {
+			return err
+		}
+		config, err := operation_setting.ParseBalanceReminderConfig(value)
+		if err != nil {
+			return err
+		}
+		return ValidateBalanceReminderSiteConfig(config)
+	}
+	if operation_setting.IsRetiredQuotaOption(key) {
+		return common.NewMessage(operation_setting.RetiredQuotaSettingsMessage)
+	}
+	if IsRetiredChannelMaintenanceOption(key) {
+		return common.NewMessage("Legacy Channel management has been retired. Use the Provider and Channel APIs instead.")
+	}
+	if err := operation_setting.ValidateRewardOption(key, value); err != nil {
+		return err
+	}
+	if err := operation_setting.ValidateCheckinOption(key, value); err != nil {
+		return err
+	}
+	if err := operation_setting.ValidateCheckoutOption(key, value); err != nil {
+		return err
+	}
 	if key == "global.accepted_conversion_losses" {
 		var codes []string
 		if common.UnmarshalJsonStr(value, &codes) != nil || codes == nil || len(codes) > 1000 {
@@ -251,9 +291,6 @@ func validateOptionValue(key string, value string) error {
 	}
 	if key == legacyAccessTokenRetireAtKey {
 		return errLegacyRetireAtReadOnly
-	}
-	if err := operation_setting.ValidateQuotaOption(key, value); err != nil {
-		return err
 	}
 	if key == "EmailProvider" || key == "ResendApiKey" || key == "ResendFrom" {
 		if key == "EmailProvider" && value != "smtp" && value != "resend" {
@@ -279,9 +316,6 @@ func validateOptionValue(key string, value string) error {
 	if key == operation_setting.ToolPriceOptionKey {
 		return operation_setting.ValidateToolPricesJSON(value)
 	}
-	if key == operation_setting.ChannelTestConcurrencyOptionKey {
-		return operation_setting.ValidateChannelTestConcurrency(value)
-	}
 	if key == operation_setting.LogMaxRangeDaysOptionKey {
 		return operation_setting.ValidateLogMaxRangeDays(value)
 	}
@@ -301,9 +335,6 @@ func UpdateOption(key string, value string) error {
 	if IsPasskeyDomainOption(key) {
 		_, err := UpdatePasskeyDomainOptions(map[string]string{key: value}, false, "")
 		return err
-	}
-	if IsModelPricingOption(key) {
-		return UpdateModelPricingOptions(map[string]string{key: value})
 	}
 	if err := validateOptionValue(key, value); err != nil {
 		return err
@@ -393,6 +424,15 @@ func UpdateOptionsBulk(values map[string]string) error {
 }
 
 func updateOptionMap(key string, value string) (err error) {
+	if err := operation_setting.ValidateRewardOption(key, value); err != nil {
+		return err
+	}
+	if err := operation_setting.ValidateCheckinOption(key, value); err != nil {
+		return err
+	}
+	if err := operation_setting.ValidateCheckoutOption(key, value); err != nil {
+		return err
+	}
 	if err := setting.ValidateGatewayBudgetOption(key, value); err != nil {
 		return err
 	}
@@ -402,8 +442,41 @@ func updateOptionMap(key string, value string) (err error) {
 		common.OptionMapRWMutex.Unlock()
 		return nil
 	}
+	if key != "QuotaRemindEnabled" && key != "QuotaRemindThreshold" && operation_setting.IsBalanceReminderOption(key) {
+		if err := validateOptionValue(key, value); err != nil {
+			return err
+		}
+	}
 	common.OptionMapRWMutex.Lock()
 	defer common.OptionMapRWMutex.Unlock()
+	if key == operation_setting.BalanceReminderConfigOption {
+		if err := operation_setting.ApplyBalanceReminderOption(key, value); err != nil {
+			return err
+		}
+		common.OptionMap[key] = value
+		return nil
+	}
+	if operation_setting.IsRewardOption(key) {
+		if err := operation_setting.ApplyRewardOption(key, value); err != nil {
+			return err
+		}
+		common.OptionMap[key] = value
+		return nil
+	}
+	if operation_setting.IsCheckinOption(key) {
+		if err := operation_setting.ApplyCheckinOption(key, value); err != nil {
+			return err
+		}
+		common.OptionMap[key] = value
+		return nil
+	}
+	if operation_setting.IsCheckoutOption(key) {
+		if err := operation_setting.ApplyCheckoutOption(key, value); err != nil {
+			return err
+		}
+		common.OptionMap[key] = value
+		return nil
+	}
 	common.OptionMap[key] = value
 
 	// 检查是否是模型配置 - 使用更规范的方式处理
@@ -477,8 +550,6 @@ func updateOptionMap(key string, value string) (err error) {
 		case "TaskPluginEnabled":
 			constant.TaskPluginEnabled = boolValue
 			jsplugin.DefaultRegistry.SetEnabled(boolValue)
-		case "DataExportEnabled":
-			common.DataExportEnabled = boolValue
 		case "DefaultCollapseSidebar":
 			common.DefaultCollapseSidebar = boolValue
 		case "MjNotifyEnabled":
@@ -660,12 +731,6 @@ func updateOptionMap(key string, value string) (err error) {
 		common.TurnstileSiteKey = value
 	case "TurnstileSecretKey":
 		common.TurnstileSecretKey = value
-	case "QuotaForNewUser":
-		common.QuotaForNewUser, _ = strconv.Atoi(value)
-	case "QuotaForInviter":
-		common.QuotaForInviter, _ = strconv.Atoi(value)
-	case "QuotaForInvitee":
-		common.QuotaForInvitee, _ = strconv.Atoi(value)
 	case "QuotaRemindThreshold":
 		common.QuotaRemindThreshold, _ = strconv.Atoi(value)
 	case "PreConsumedQuota":
@@ -680,10 +745,6 @@ func updateOptionMap(key string, value string) (err error) {
 		err = setting.UpdateModelRequestRateLimitGroupByJSONString(value)
 	case "RetryTimes":
 		common.RetryTimes, _ = strconv.Atoi(value)
-	case "DataExportInterval":
-		common.DataExportInterval, _ = strconv.Atoi(value)
-	case "DataExportDefaultTime":
-		common.DataExportDefaultTime = value
 	case "ModelRatio":
 		err = ratio_setting.UpdateModelRatioByJSONString(value)
 	case "GroupRatio":
@@ -714,8 +775,6 @@ func updateOptionMap(key string, value string) (err error) {
 	//	common.ChatLink2 = value
 	case "ChannelDisableThreshold":
 		common.ChannelDisableThreshold, _ = strconv.ParseFloat(value, 64)
-	case "QuotaPerUnit":
-		common.QuotaPerUnit, _ = strconv.ParseFloat(value, 64)
 	case "SensitiveWords":
 		setting.SensitiveWordsFromString(value)
 	case "AutomaticDisableKeywords":
@@ -767,7 +826,6 @@ func handleConfigUpdate(key, value string) bool {
 	if configName == "performance_setting" {
 		performance_setting.UpdateAndSync()
 	} else if configName == "billing_setting" {
-		InvalidatePricingCache()
 		ratio_setting.InvalidateExposedDataCache()
 	}
 

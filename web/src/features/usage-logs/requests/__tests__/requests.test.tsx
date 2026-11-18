@@ -211,6 +211,76 @@ it('shows cache and audio quantities for a WebSocket request and its attempt', a
   expect(within(drawer).queryByText('Estimated')).not.toBeInTheDocument()
 })
 
+it.each([
+  undefined,
+  { version: 0, source: '' },
+  { version: 1, source: 'wallet', preference: 'wallet_only' },
+  {
+    version: 1,
+    source: 'subscription',
+    preference: 'subscription_first',
+    subscription_id: 31,
+    period_id: 91,
+  },
+])(
+  'shows only the frozen funding snapshot without hiding known receivables (%j)',
+  async (funding) => {
+    api.defaults.adapter = async (config) => ({
+      config,
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      data: {
+        success: true,
+        data: {
+          items: new URL(
+            api.getUri(config),
+            'http://localhost'
+          ).pathname.endsWith('/attempts')
+            ? [attempt]
+            : [
+                {
+                  ...request,
+                  funding,
+                  funding_pending: funding?.source === 'subscription',
+                  sale_pending: false,
+                },
+              ],
+          total: 1,
+          page: 1,
+          page_size: 20,
+        },
+      },
+    })
+    renderRequests()
+    await userEvent.setup().click(
+      await screen.findByRole('button', {
+        name: `View attempts for request ${requestId}`,
+      })
+    )
+    const drawer = await screen.findByRole('dialog', {
+      name: 'Request attempts',
+    })
+    expect(within(drawer).getByText('9,007,199.254740993 USD')).toBeVisible()
+    if (funding?.version !== 1) {
+      expect(
+        within(drawer).getByText('Funding source unavailable')
+      ).toBeVisible()
+    } else if (funding.source === 'wallet') {
+      expect(within(drawer).getByText('Wallet')).toBeVisible()
+    } else {
+      expect(within(drawer).getByText('Subscription entitlement')).toBeVisible()
+      expect(within(drawer).getByText('91')).toBeVisible()
+      expect(
+        within(drawer).getByText('Funding allocation pending')
+      ).toBeVisible()
+      expect(
+        within(drawer).queryByText('Pending calculation')
+      ).not.toBeInTheDocument()
+    }
+  }
+)
+
 it('shows a precise charge and estimated usage, opens the real self attempt, and closes with Escape', async () => {
   const user = userEvent.setup()
   renderRequests()

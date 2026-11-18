@@ -1,147 +1,181 @@
 package model
 
 import (
-	"math/rand"
-	"time"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"io"
+	"math/big"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/clock"
+	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/shopspring/decimal"
 	"gorm.io/gorm"
 )
 
-// Checkin 签到记录
+// Checkin records the actual awarded amount. Historical rows retain their USD
+// denomination; migration never credits a historical check-in again.
 type Checkin struct {
-	Id           int    `json:"id" gorm:"primaryKey;autoIncrement"`
-	UserId       int    `json:"user_id" gorm:"not null;uniqueIndex:idx_user_checkin_date"`
-	CheckinDate  string `json:"checkin_date" gorm:"type:varchar(10);not null;uniqueIndex:idx_user_checkin_date"` // 格式: YYYY-MM-DD
-	QuotaAwarded int    `json:"quota_awarded" gorm:"not null"`
-	CreatedAt    int64  `json:"created_at" gorm:"bigint"`
+	Id          int          `json:"id" gorm:"primaryKey;autoIncrement"`
+	UserId      int          `json:"user_id" gorm:"not null;uniqueIndex:idx_user_checkin_date"`
+	CheckinDate string       `json:"checkin_date" gorm:"type:varchar(10);not null;uniqueIndex:idx_user_checkin_date"`
+	Amount      money.Amount `json:"amount" gorm:"embedded;embeddedPrefix:amount_"`
+	CreatedAt   int64        `json:"created_at" gorm:"bigint;autoCreateTime:false"`
 }
 
-// CheckinRecord 用于API返回的签到记录（不包含敏感字段）
+// CheckinRecord excludes internal row and user IDs from the calendar API.
 type CheckinRecord struct {
-	CheckinDate  string `json:"checkin_date"`
-	QuotaAwarded int    `json:"quota_awarded"`
+	CheckinDate string       `json:"checkin_date"`
+	Amount      money.Amount `json:"amount"`
 }
 
-func (Checkin) TableName() string {
-	return "checkins"
-}
+// CheckinAwardTotal may exceed the int64 storage range of an individual award.
+type CheckinAwardTotal = MoneyTotal
 
-// GetUserCheckinRecords 获取用户在指定日期范围内的签到记录
+func (Checkin) TableName() string { return "checkins" }
+
 func GetUserCheckinRecords(userId int, startDate, endDate string) ([]Checkin, error) {
-	var records []Checkin
-	err := DB.Where("user_id = ? AND checkin_date >= ? AND checkin_date <= ?",
-		userId, startDate, endDate).
-		Order("checkin_date DESC").
-		Find(&records).Error
+	records := make([]Checkin, 0)
+	err := DB.Where("user_id = ? AND checkin_date >= ? AND checkin_date <= ?", userId, startDate, endDate).
+		Order("checkin_date DESC").Find(&records).Error
 	return records, err
 }
 
-// HasCheckedInToday 检查用户今天是否已签到
 func HasCheckedInToday(userId int) (bool, error) {
-	today := time.Now().Format("2006-01-02")
 	var count int64
-	err := DB.Model(&Checkin{}).
-		Where("user_id = ? AND checkin_date = ?", userId, today).
-		Count(&count).Error
+	err := DB.Model(&Checkin{}).Where("user_id = ? AND checkin_date = ?", userId, clock.Now().Format("2006-01-02")).Count(&count).Error
 	return count > 0, err
 }
 
-// UserCheckin 执行用户签到
-// 签到记录与额度增加在同一事务中完成
+// checkinReward samples inclusive bounds without overflowing max-min+1.
+func checkinReward(rewardRange operation_setting.CheckinRewardRange, reader io.Reader) (money.Amount, error) {
+	if err := rewardRange.Validate(); err != nil {
+		return money.Amount{}, err
+	}
+	width := new(big.Int).Sub(big.NewInt(rewardRange.Max.Nanos), big.NewInt(rewardRange.Min.Nanos))
+	width.Add(width, big.NewInt(1))
+	offset, err := rand.Int(reader, width)
+	if err != nil {
+		return money.Amount{}, err
+	}
+	offset.Add(offset, big.NewInt(rewardRange.Min.Nanos))
+	return money.NewAmount(offset.Int64(), rewardRange.Min.Currency)
+}
+
+// UserCheckin commits the date, credit and automatic debt repayment together.
 func UserCheckin(userId int) (*Checkin, error) {
 	setting := operation_setting.GetCheckinSetting()
 	if !setting.Enabled {
 		return nil, common.NewMessage("Check-in feature is not enabled")
 	}
-
-	// 检查今天是否已签到
-	hasChecked, err := HasCheckedInToday(userId)
+	if userId <= 0 {
+		return nil, common.NewMessage("Invalid parameters")
+	}
+	now := clock.Now()
+	source, err := checkinReward(setting.RewardRange, rand.Reader)
 	if err != nil {
 		return nil, err
 	}
-	if hasChecked {
-		return nil, common.NewMessage("Already checked in today")
-	}
-
-	// 计算随机额度奖励
-	quotaAwarded := setting.MinQuota
-	if setting.MaxQuota > setting.MinQuota {
-		quotaAwarded = setting.MinQuota + rand.Intn(setting.MaxQuota-setting.MinQuota+1)
-	}
-
-	today := time.Now().Format("2006-01-02")
 	checkin := &Checkin{
-		UserId:       userId,
-		CheckinDate:  today,
-		QuotaAwarded: quotaAwarded,
-		CreatedAt:    time.Now().Unix(),
+		UserId: userId, CheckinDate: now.Format("2006-01-02"), CreatedAt: now.Unix(),
+		Amount: money.Amount{Currency: SettlementCurrency()},
 	}
-
-	// 事务保证签到记录与额度增加的原子性
 	err = DB.Transaction(func(tx *gorm.DB) error {
-		// 步骤1: 创建签到记录
-		// 数据库有唯一约束 (user_id, checkin_date)，可以防止并发重复签到
+		var user User
+		if err := tx.Select("id").First(&user, userId).Error; err != nil {
+			return err
+		}
+		// The unique user/date index serializes competing check-ins. A later
+		// posting failure rolls this row back with the wallet and ledger writes.
 		if err := tx.Create(checkin).Error; err != nil {
-			return common.NewMessage("Check-in failed, please try again later")
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "idx_user_checkin_date" {
+				return common.NewMessage("Already checked in today")
+			}
+			return err
 		}
-
-		// 步骤2: 在事务中增加用户额度
-		if err := tx.Model(&User{}).Where("id = ?", userId).
-			Update("quota", gorm.Expr("quota + ?", quotaAwarded)).Error; err != nil {
-			return common.NewMessage("Check-in failed: quota update error")
+		if source.Nanos == 0 {
+			return nil
 		}
-
-		return nil
+		credited := source
+		var fx decimal.NullDecimal
+		if source.Currency != SettlementCurrency() {
+			rate, err := GetAccountingFXRate(tx.Statement.Context, tx, source.Currency, SettlementCurrency())
+			if err != nil {
+				return err
+			}
+			value, err := source.Value().Convert(rate)
+			if err != nil {
+				return err
+			}
+			credited, err = value.Credit()
+			if err != nil {
+				return err
+			}
+			fx = decimal.NewNullDecimal(rate.Decimal())
+		}
+		// A positive promised reward must not become a successful zero credit.
+		if credited.Nanos == 0 {
+			return common.NewMessage("Invalid amount")
+		}
+		posting := LedgerPosting{
+			Account: UserWalletAccount(userId), Type: LedgerEntryTopUp, Amount: credited,
+			IdempotencyKey: fmt.Sprintf("checkin:%d:%s", userId, checkin.CheckinDate),
+			Remark:         "Daily check-in", sourceAmount: &source, fxRate: fx,
+		}
+		if err := validateLedgerPosting(posting); err != nil {
+			return err
+		}
+		if _, err := postLedgerEntries(tx, []LedgerPosting{posting}); err != nil {
+			return err
+		}
+		checkin.Amount = credited
+		return tx.Model(checkin).Updates(map[string]any{"amount_nanos": credited.Nanos, "amount_currency": credited.Currency}).Error
 	})
-
 	if err != nil {
-		return nil, err
+		var message *common.Message
+		if errors.As(err, &message) {
+			return nil, message
+		}
+		return nil, common.NewMessage("Check-in failed, please try again later")
 	}
-
-	// 事务成功后，异步更新缓存
-	go func() {
-		_ = cacheIncrUserQuota(userId, int64(quotaAwarded))
-	}()
-
 	return checkin, nil
 }
 
-// GetUserCheckinStats 获取用户签到统计信息
 func GetUserCheckinStats(userId int, month string) (map[string]any, error) {
-	// 获取指定月份的所有签到记录
-	startDate := month + "-01"
-	endDate := month + "-31"
-
-	records, err := GetUserCheckinRecords(userId, startDate, endDate)
+	records, err := GetUserCheckinRecords(userId, month+"-01", month+"-31")
 	if err != nil {
 		return nil, err
 	}
-
-	// 转换为不包含敏感字段的记录
 	checkinRecords := make([]CheckinRecord, len(records))
-	for i, r := range records {
-		checkinRecords[i] = CheckinRecord{
-			CheckinDate:  r.CheckinDate,
-			QuotaAwarded: r.QuotaAwarded,
-		}
+	for i, record := range records {
+		checkinRecords[i] = CheckinRecord{CheckinDate: record.CheckinDate, Amount: record.Amount}
 	}
-
-	// 检查今天是否已签到
-	hasCheckedToday, _ := HasCheckedInToday(userId)
-
-	// 获取用户所有时间的签到统计
+	hasCheckedToday, err := HasCheckedInToday(userId)
+	if err != nil {
+		return nil, err
+	}
 	var totalCheckins int64
-	var totalQuota int64
-	DB.Model(&Checkin{}).Where("user_id = ?", userId).Count(&totalCheckins)
-	DB.Model(&Checkin{}).Where("user_id = ?", userId).Select("COALESCE(SUM(quota_awarded), 0)").Scan(&totalQuota)
-
+	if err := DB.Model(&Checkin{}).Where("user_id = ?", userId).Count(&totalCheckins).Error; err != nil {
+		return nil, err
+	}
+	var grouped []struct {
+		Currency money.Currency
+		Nanos    decimal.Decimal
+	}
+	if err := DB.Model(&Checkin{}).Where("user_id = ?", userId).
+		Select("amount_currency AS currency, SUM(amount_nanos) AS nanos").Group("amount_currency").Order("amount_currency").Scan(&grouped).Error; err != nil {
+		return nil, err
+	}
+	totals := make([]CheckinAwardTotal, len(grouped))
+	for i, total := range grouped {
+		totals[i] = CheckinAwardTotal{Nanos: total.Nanos.String(), Currency: total.Currency}
+	}
 	return map[string]any{
-		"total_quota":      totalQuota,      // 所有时间累计获得的额度
-		"total_checkins":   totalCheckins,   // 所有时间累计签到次数
-		"checkin_count":    len(records),    // 本月签到次数
-		"checked_in_today": hasCheckedToday, // 今天是否已签到
-		"records":          checkinRecords,  // 本月签到记录详情（不含id和user_id）
+		"total_awarded": totals, "total_checkins": totalCheckins, "checkin_count": len(records),
+		"checked_in_today": hasCheckedToday, "records": checkinRecords,
 	}, nil
 }

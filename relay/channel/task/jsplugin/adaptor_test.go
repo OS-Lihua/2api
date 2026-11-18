@@ -630,7 +630,9 @@ export function buildContentRequest(ctx) {
 	adaptor := New(plugin)
 	adaptor.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: base.URL, ApiKey: "key"}})
 
-	descriptor, err := adaptor.BuildContentRequest(t.Context(), &model.Task{TaskID: "task", Data: []byte(`{}`)}, "video", channel.TaskArtifactClientRequest{Method: http.MethodGet})
+	task := &model.Task{TaskID: "task", Data: []byte(`{}`)}
+	ctx := taskProtocolAuthority(t, adaptor, "key", base.URL, task)
+	descriptor, err := adaptor.BuildContentRequest(ctx, task, "video", channel.TaskArtifactClientRequest{Method: http.MethodGet})
 	require.NoError(t, err)
 	require.NotNil(t, descriptor)
 	assert.Equal(t, map[string]string{
@@ -643,6 +645,116 @@ export function buildContentRequest(ctx) {
 	// Renderers run on every client read and may not fetch.
 	_, err = adaptor.ConvertToOpenAIVideo(&model.Task{TaskID: "task_public", Status: model.TaskStatusSuccess})
 	assert.ErrorContains(t, err, "utils.fetch is not available in protocols.openai_video.render")
+}
+
+// taskProtocolAuthority is explicit host authority for isolated protocol fixtures.
+// It is never installed by production code or inferred from task.ID/IsChannelTest.
+func taskProtocolAuthority(t *testing.T, adaptor *TaskAdaptor, key, baseURL string, tasks ...*model.Task) context.Context {
+	t.Helper()
+	if adaptor.info == nil {
+		adaptor.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{}})
+	}
+	info := *adaptor.info
+	provider := *adaptor.info.ProviderMeta
+	info.ProviderMeta = &provider
+	adaptor.Init(&info)
+	adaptor.info.ChannelId = 1
+	adaptor.info.ApiKey = key
+	adaptor.info.ChannelBaseUrl = baseURL
+	ctx := t.Context()
+	for _, task := range tasks {
+		task.ChannelId = 1
+		var err error
+		ctx, err = adaptor.WithTransientTaskAuthority(ctx, task, func(context.Context) error { return nil })
+		require.NoError(t, err)
+	}
+	return ctx
+}
+
+func TestTaskTransientAuthorityIsExplicitAndBound(t *testing.T) {
+	service.InitHttpClient()
+	plugin, err := pluginruntime.NewRegistry().Register(mockPlugin+`
+export function buildBatchQueryRequest(ctx) { return {url:ctx.baseUrl+"/batch",method:"POST",body:{}}; }
+export function parseBatchResult() { return {}; }
+`, pluginruntime.Options{})
+	require.NoError(t, err)
+	for _, name := range []string{"allowed", "missing", "provider_only", "other_context", "other_task", "other_plugin", "other_key", "other_slot", "other_owner", "other_upstream", "other_destination", "other_proxy", "revoked", "cancelled", "persisted"} {
+		t.Run(name, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			defer server.Close()
+			adaptor := New(plugin)
+			adaptor.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelId: 7, ChannelBaseUrl: server.URL, ApiKey: "original", ChannelMultiKeyIndex: 1}, IsChannelTest: true})
+			task := &model.Task{ChannelId: 7, UserId: 9, TaskID: "public", Platform: "mock-task", PrivateData: model.TaskPrivateData{UpstreamTaskID: "original-task"}}
+			parent, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			allowed := true
+			authorize := func(context.Context) error {
+				if !allowed {
+					return model.ErrProviderStatusConflict
+				}
+				return nil
+			}
+			_, err := adaptor.WithTransientTaskAuthority(parent, task, nil)
+			require.Error(t, err, "no nil callback may grant authority")
+			ctx, err := adaptor.WithTransientTaskAuthority(parent, task, authorize)
+			require.NoError(t, err)
+			destination, proxy := server.URL, ""
+			switch name {
+			case "other_destination":
+				destination = server.URL + "/different"
+			case "other_proxy":
+				proxy = server.URL
+			case "missing", "other_context":
+				ctx = parent
+			case "provider_only":
+				ctx, err = adaptor.WithTransientProviderAuthority(parent, authorize)
+				require.NoError(t, err)
+			case "other_task":
+				copy := *task
+				task = &copy
+			case "other_plugin":
+				copy := *plugin
+				adaptor.plugin = &copy
+			case "other_key":
+				adaptor.info.ApiKey = "replacement"
+			case "other_slot":
+				adaptor.info.ChannelMultiKeyIndex = 0
+			case "other_owner":
+				task.UserId++
+			case "other_upstream":
+				task.PrivateData.UpstreamTaskID = "replacement"
+			case "revoked":
+				allowed = false
+			case "cancelled":
+				cancel()
+			case "persisted":
+				task.ID = 123
+			}
+			for _, batch := range []bool{false, true} {
+				var resp *http.Response
+				var err error
+				if batch {
+					resp, err = adaptor.FetchBatchTasksWithContext(ctx, destination, "original", []*model.Task{task}, proxy)
+				} else {
+					resp, err = adaptor.FetchTaskWithContext(ctx, destination, "original", task, proxy)
+				}
+				if name == "allowed" {
+					require.NoError(t, err)
+					require.NoError(t, resp.Body.Close())
+				} else {
+					require.Error(t, err)
+					assert.Zero(t, calls)
+				}
+			}
+			if name == "allowed" {
+				assert.Equal(t, 2, calls)
+			}
+		})
+	}
 }
 
 type taskQueryRoundTripper func(*http.Request) (*http.Response, error)
@@ -783,9 +895,9 @@ export function parseBatchResult() {return [];}
 			adaptor := New(plugin)
 			var resp *http.Response
 			if tc.batch {
-				resp, err = adaptor.FetchBatchTasks(tc.start, "channel-secret", []*model.Task{task}, "")
+				resp, err = adaptor.FetchBatchTasksWithContext(taskProtocolAuthority(t, adaptor, "channel-secret", tc.start, task), tc.start, "channel-secret", []*model.Task{task}, "")
 			} else {
-				resp, err = adaptor.FetchTask(tc.start, "channel-secret", task, "")
+				resp, err = adaptor.FetchTaskWithContext(taskProtocolAuthority(t, adaptor, "channel-secret", tc.start, task), tc.start, "channel-secret", task, "")
 			}
 			if tc.wantError != "" {
 				require.ErrorContains(t, err, tc.wantError)
@@ -936,10 +1048,12 @@ func TestTaskAdaptorMapsJSContract(t *testing.T) {
 	assert.Empty(t, recorder.Body.String(), "response parsing must not write before the durable task barrier")
 	assert.Equal(t, map[string]float64{"seconds": 7}, adaptor.AdjustBillingOnSubmit(info, []byte(`{"seconds":7}`)))
 
-	queryResp, err := adaptor.FetchTask(server.URL, "secret", &model.Task{
+	task := &model.Task{
 		Action:      info.Action,
 		PrivateData: model.TaskPrivateData{UpstreamTaskID: parsed.UpstreamTaskID},
-	}, "")
+	}
+	queryCtx := taskProtocolAuthority(t, adaptor, "secret", server.URL, task)
+	queryResp, err := adaptor.FetchTaskWithContext(queryCtx, server.URL, "secret", task, "")
 	require.NoError(t, err)
 	queryBody, err := io.ReadAll(queryResp.Body)
 	require.NoError(t, err)
@@ -1031,10 +1145,10 @@ export function parseBatchResult() { return {}; }
 					resp, requestErr = adaptor.DoRequest(c, info, body)
 				case "poll":
 					wantKey, wantPlugin = "task-key", "query"
-					resp, requestErr = adaptor.FetchTask(server.URL, "argument-key", task, "")
+					resp, requestErr = adaptor.FetchTaskWithContext(taskProtocolAuthority(t, adaptor, "task-key", server.URL, task), server.URL, "argument-key", task, "")
 				case "batch":
 					wantKey, wantPlugin = "batch-key", "batch"
-					resp, requestErr = adaptor.FetchBatchTasks(server.URL, "batch-key", []*model.Task{task}, "")
+					resp, requestErr = adaptor.FetchBatchTasksWithContext(taskProtocolAuthority(t, adaptor, "batch-key", server.URL, task), server.URL, "batch-key", []*model.Task{task}, "")
 				}
 				if resp != nil {
 					t.Cleanup(func() { _ = resp.Body.Close() })
@@ -1704,7 +1818,7 @@ func TestTaskAdaptorBatchBridge(t *testing.T) {
 		{PrivateData: model.TaskPrivateData{UpstreamTaskID: "task-a"}},
 		{PrivateData: model.TaskPrivateData{UpstreamTaskID: "task-b"}},
 	}
-	resp, err := adaptor.FetchBatchTasks(server.URL, "secret", tasks, "")
+	resp, err := adaptor.FetchBatchTasksWithContext(taskProtocolAuthority(t, adaptor, "secret", server.URL, tasks...), server.URL, "secret", tasks, "")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	payload, err := io.ReadAll(resp.Body)
@@ -1831,7 +1945,7 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			resp, fetchErr := adaptor.FetchTask(server.URL, "secret", testCase.task, "")
+			resp, fetchErr := adaptor.FetchTaskWithContext(taskProtocolAuthority(t, adaptor, "secret", server.URL, testCase.task), server.URL, "secret", testCase.task, "")
 			require.NoError(t, fetchErr)
 			require.NoError(t, resp.Body.Close())
 			assert.Equal(t, testCase.want, requested)
@@ -1887,7 +2001,7 @@ export function parseTaskResult(ctx, body, response){
 			PluginState:    []byte(`{"req_key":"kept"}`),
 		},
 	}
-	resp, err := adaptor.FetchTask(server.URL, "secret", task, "")
+	resp, err := adaptor.FetchTaskWithContext(taskProtocolAuthority(t, adaptor, "secret", server.URL, task), server.URL, "secret", task, "")
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 
@@ -1975,7 +2089,7 @@ export function parseBatchResult(){return [];}
 		{Properties: model.Properties{OriginModelName: "model-a"}, PrivateData: model.TaskPrivateData{UpstreamTaskID: "task-a"}},
 		{Properties: model.Properties{OriginModelName: "model-b"}, PrivateData: model.TaskPrivateData{UpstreamTaskID: "task-b"}},
 	}
-	resp, err := adaptor.FetchBatchTasks(server.URL, "secret", tasks, "")
+	resp, err := adaptor.FetchBatchTasksWithContext(taskProtocolAuthority(t, adaptor, "secret", server.URL, tasks...), server.URL, "secret", tasks, "")
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 	assert.Equal(t, []any{"task-a", "task-b"}, captured["ids"])
@@ -2810,7 +2924,7 @@ func TestTaskAdaptorChainsDoubaoThroughNewAPIUpstream(t *testing.T) {
 		Properties:  model.Properties{OriginModelName: modelName, UpstreamModelName: modelName},
 		PrivateData: model.TaskPrivateData{UpstreamTaskID: parsed.UpstreamTaskID},
 	}
-	queryResp, err := adaptor.FetchTask(gateway.URL, "sk-gateway", task, "")
+	queryResp, err := adaptor.FetchTaskWithContext(taskProtocolAuthority(t, adaptor, "sk-gateway", gateway.URL, task), gateway.URL, "sk-gateway", task, "")
 	require.NoError(t, err)
 	queryBody, err := io.ReadAll(queryResp.Body)
 	require.NoError(t, err)
@@ -2868,7 +2982,7 @@ func TestTaskAdaptorChainsSunoBatchFetchThroughNewAPIUpstream(t *testing.T) {
 		Properties:  model.Properties{OriginModelName: "suno_music", UpstreamModelName: "suno_music"},
 		PrivateData: model.TaskPrivateData{UpstreamTaskID: parsed.UpstreamTaskID},
 	}
-	batchResp, err := adaptor.FetchBatchTasks(gateway.URL, "sk-gateway", []*model.Task{task}, "")
+	batchResp, err := adaptor.FetchBatchTasksWithContext(taskProtocolAuthority(t, adaptor, "sk-gateway", gateway.URL, task), gateway.URL, "sk-gateway", []*model.Task{task}, "")
 	require.NoError(t, err)
 	batchBody, err := io.ReadAll(batchResp.Body)
 	require.NoError(t, err)
@@ -2898,8 +3012,8 @@ export function buildQueryRequest(){return {url:"https://provider.example"}}
 export function parseTaskResult(){return {status:"SUCCESS"}}
 `, key, key, param, model, key, key, param)
 	}
-	// The second decode matches its model as the first did: a channel alias
-	// or a case variant names the same task as the prepared name.
+	// Re-decoding uses the original Offering identity and selected Channel's
+	// upstream model, never a Provider's global alias projection.
 	previousDB := model.DB
 	database := model.UseTestDatabases(t)
 	model.DB = database
@@ -2912,14 +3026,14 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 		Models: "claimed-alias", ModelMapping: common.GetPointer(`{"claimed-alias":"claimed-model"}`)}).Error)
 	model.InitProviderCache()
 	for _, testCase := range []struct {
-		name, betaModel, prepared string
-		wantError                 bool
+		name, betaModel, prepared, upstream string
+		wantError                           bool
 	}{
 		{name: "same model", betaModel: "claimed-model", prepared: "claimed-model"},
 		{name: "model drift", betaModel: "drifted-model", prepared: "claimed-model", wantError: true},
 		{name: "same channel alias", betaModel: "claimed-alias", prepared: "claimed-alias"},
 		{name: "case variant", betaModel: "CLAIMED-MODEL", prepared: "claimed-model"},
-		{name: "declared name for a prepared alias", betaModel: "claimed-model", prepared: "claimed-alias", wantError: true},
+		{name: "declared name outside selected upstream identity", betaModel: "claimed-model", prepared: "claimed-alias", upstream: "provider-wire-model", wantError: true},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			registry := pluginruntime.NewRegistry()
@@ -2942,7 +3056,12 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 			c.Set("task_request", map[string]any{"by": "route-alpha", "param": "video"})
 			c.Set("task_action", "by-route-alpha")
 			c.Set("resolved_task_model", testCase.prepared)
-			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}, OriginModelName: testCase.prepared}
+			c.Set("task_gateway_endpoint", true)
+			upstream := testCase.upstream
+			if upstream == "" {
+				upstream = "claimed-model"
+			}
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelBaseUrl: "https://provider.example", UpstreamModelName: upstream}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}, OriginModelName: testCase.prepared}
 			adaptor := New(beta)
 			adaptor.Init(info)
 

@@ -97,10 +97,12 @@ type requestPart struct {
 }
 
 type submitResponse struct {
-	TaskID    string      `json:"taskId"`
-	TaskData  any         `json:"taskData"`
-	Immediate *taskResult `json:"immediate"`
-	State     any         `json:"state"`
+	Acceptance string      `json:"acceptance"`
+	Delivery   string      `json:"delivery"`
+	TaskID     string      `json:"taskId"`
+	TaskData   any         `json:"taskData"`
+	Immediate  *taskResult `json:"immediate"`
+	State      any         `json:"state"`
 }
 type taskResult struct {
 	Code             int     `json:"code"`
@@ -178,6 +180,15 @@ type TaskAdaptor struct {
 func New(plugin *pluginruntime.LoadedPlugin) *TaskAdaptor { return &TaskAdaptor{plugin: plugin} }
 func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo)   { a.info = info }
 
+// TaskPluginIdentity describes this already pinned adaptor, not a newly selected
+// plugin or proof of source code that was never captured on a historical task.
+func (a *TaskAdaptor) TaskPluginIdentity() (string, string) {
+	if a == nil || a.plugin == nil {
+		return "", ""
+	}
+	return a.plugin.Meta.Key, a.plugin.Meta.Version
+}
+
 // DecodeRequestAndSetAction selects the executing plugin's normalized request
 // without building a descriptor or exchanging credentials.
 func (a *TaskAdaptor) DecodeRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskError {
@@ -248,10 +259,12 @@ func (a *TaskAdaptor) DecodeRequestAndSetAction(c *gin.Context, info *relaycommo
 					resolved, resolvedOK := resolvedValue.(map[string]any)
 					kind, _ := resolved["kind"].(string)
 					resolvedModel, _ := resolved["model"].(string)
-					served, _, owned := model.ResolveTaskPluginModel(pinned.Generation, resolvedModel, a.plugin.Meta.Models)
-					modelMatches := owned && served == c.GetString("resolved_task_model")
+					modelMatches := false
 					if c.GetBool("task_gateway_endpoint") {
-						modelMatches = resolvedModel == info.OriginModelName || strings.EqualFold(resolvedModel, info.UpstreamModelName)
+						modelMatches = strings.TrimSpace(resolvedModel) != "" && (resolvedModel == info.OriginModelName || strings.EqualFold(resolvedModel, info.UpstreamModelName))
+					} else {
+						served, _, owned := model.ResolveTaskPluginModel(pinned.Generation, resolvedModel, a.plugin.Meta.Models)
+						modelMatches = owned && served == c.GetString("resolved_task_model")
 					}
 					if callErr != nil || !resolvedOK || kind != string(pluginruntime.RouteTypeSubmit) || !modelMatches {
 						return service.TaskErrorWrapperLocal(fmt.Errorf("final task plugin decoder rejected the pinned model"), "plugin_request_invalid", http.StatusBadRequest)
@@ -758,6 +771,12 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, bod
 		c.Request = originalRequest.WithContext(httptrace.WithClientTrace(originalRequest.Context(), trace))
 		defer func() { c.Request = originalRequest }()
 	}
+	if err := checkGatewayTaskCredentials(c.Request.Context()); err != nil {
+		if release != nil {
+			release()
+		}
+		return nil, err
+	}
 	resp, err := channel.DoTaskApiRequest(a, c, info, body)
 	if release != nil {
 		if err != nil || resp == nil {
@@ -913,11 +932,29 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 		}
 	}
 	var parsed submitResponse
-	if err = convert(value, &parsed); err != nil || strings.TrimSpace(parsed.TaskID) == "" {
-		if err == nil {
-			err = fmt.Errorf("plugin returned an empty taskId")
-		}
+	if err = convert(value, &parsed); err != nil {
 		return nil, service.TaskErrorWrapper(err, "plugin_submit_response_invalid", http.StatusBadGateway, common.UpstreamAddresses(c)...)
+	}
+	switch parsed.Acceptance {
+	case "":
+		parsed.Acceptance = "accepted"
+	case "accepted", "existing", "rejected", "unknown":
+	default:
+		return nil, service.TaskErrorWrapperLocal(fmt.Errorf("invalid submission acceptance"), "plugin_submit_response_invalid", http.StatusBadGateway)
+	}
+	if (parsed.Acceptance == "accepted" || parsed.Acceptance == "existing") && strings.TrimSpace(parsed.TaskID) == "" || parsed.Acceptance != "accepted" && parsed.Immediate != nil {
+		return nil, service.TaskErrorWrapperLocal(fmt.Errorf("invalid submission identity or completion"), "plugin_submit_response_invalid", http.StatusBadGateway)
+	}
+	if parsed.Delivery != "" {
+		pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedRoute)
+		pinned, valid := pinnedValue.(pluginruntime.PinnedRoute)
+		nativePresenter := exists && valid && pinned.Route.Render != ""
+		endpointValue, endpointExists := c.Get(pluginruntime.ContextKeyPinnedEndpoint)
+		endpoint, endpointValid := endpointValue.(pluginruntime.PinnedEndpoint)
+		responsesPresenter := endpointExists && endpointValid && endpoint.Protocol == "openai_responses"
+		if parsed.Delivery != "inline" || parsed.Acceptance != "accepted" || parsed.Immediate == nil || eventStream || !nativePresenter && !responsesPresenter {
+			return nil, service.TaskErrorWrapperLocal(fmt.Errorf("inline delivery requires an immediate presented result"), "plugin_submit_response_invalid", http.StatusBadGateway)
+		}
 	}
 	// Only an immediate terminal result goes unpersisted; any other task data
 	// is stored and keeps the persisted limit.
@@ -941,6 +978,7 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 		pluginState = nil
 	}
 	response := &channel.TaskSubmitResponse{
+		Acceptance:     parsed.Acceptance,
 		UpstreamTaskID: parsed.TaskID,
 		TaskData:       taskData,
 		PluginState:    pluginState,
@@ -958,6 +996,9 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 		}
 	}
 	response.Immediate = immediate
+	if parsed.Delivery == "inline" && info.BeginProviderCall != nil {
+		response.Stream = &model.TaskStreamFacts{Pending: true}
+	}
 	moneyFailure := immediate.Status == model.TaskStatusFailure && info.BeginProviderCall != nil
 	if immediate.Status != model.TaskStatusSuccess && !moneyFailure || info.IsChannelTest || !a.hasHook(c.Request.Context(), "extractUsageOnComplete") {
 		return response, nil
@@ -1119,6 +1160,83 @@ func (a *TaskAdaptor) GetModelList() []string { return append([]string(nil), a.p
 func (a *TaskAdaptor) GetChannelName() string { return a.plugin.Meta.Name }
 
 type gatewayTaskCredentialContextKey struct{}
+type transientTaskAuthorityContextKey struct{}
+
+type transientTaskAuthority struct {
+	task   *model.Task
+	plugin *pluginruntime.LoadedPlugin
+	key    string
+	index  int
+	check  func(context.Context) error
+}
+
+// WithTransientTaskAuthority grants one host-created, non-persistent task access
+// under an explicit live authorization check. It binds the exact task and loaded
+// plugin, selected Provider/key slot, and caller context; it is never a JS mode.
+// Callers must initialize the adaptor and task identity before granting access.
+func (a *TaskAdaptor) WithTransientTaskAuthority(ctx context.Context, task *model.Task, authorize func(context.Context) error) (context.Context, error) {
+	if task == nil {
+		return nil, model.ErrProviderStatusConflict
+	}
+	return a.withTransientAuthority(ctx, task, authorize)
+}
+
+// WithTransientProviderAuthority protects host probe submission before an
+// upstream task exists. It cannot authorize a task query or change billing mode.
+func (a *TaskAdaptor) WithTransientProviderAuthority(ctx context.Context, authorize func(context.Context) error) (context.Context, error) {
+	return a.withTransientAuthority(ctx, nil, authorize)
+}
+
+func (a *TaskAdaptor) withTransientAuthority(ctx context.Context, task *model.Task, authorize func(context.Context) error) (context.Context, error) {
+	if ctx == nil || authorize == nil || a.plugin == nil || a.info == nil || a.info.ProviderMeta == nil || a.info.ChannelId <= 0 || a.info.ChannelMultiKeyIndex < 0 || task != nil && (task.ID != 0 || task.PrivateData.Gateway != nil || task.PrivateData.LegacyObligation != nil || task.ChannelId != a.info.ChannelId) {
+		return nil, model.ErrProviderStatusConflict
+	}
+	providerID, providerType := a.info.ChannelId, a.info.ChannelType
+	key, index := a.info.ApiKey, a.info.ChannelMultiKeyIndex
+	baseURL, proxy := a.info.ChannelBaseUrl, a.info.ChannelSetting.Proxy
+	var taskIdentity func() bool
+	if task != nil {
+		owner, publicID, platform, upstreamID := task.UserId, task.TaskID, task.Platform, task.GetUpstreamTaskID()
+		privateKey := task.PrivateData.Key
+		taskIdentity = func() bool {
+			return task.ID == 0 && task.ChannelId == providerID && task.UserId == owner && task.TaskID == publicID && task.Platform == platform && task.GetUpstreamTaskID() == upstreamID && task.PrivateData.Key == privateKey && task.PrivateData.Gateway == nil && task.PrivateData.LegacyObligation == nil
+		}
+	}
+	scope := &transientTaskAuthority{task: task, plugin: a.plugin, key: key, index: index}
+	scope.check = func(callCtx context.Context) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if callCtx == nil || callCtx.Err() != nil {
+			return model.ErrProviderStatusConflict
+		}
+		scopes, _ := callCtx.Value(transientTaskAuthorityContextKey{}).([]*transientTaskAuthority)
+		if !slices.Contains(scopes, scope) || a.plugin != scope.plugin || a.info == nil || a.info.ProviderMeta == nil || a.info.ChannelId != providerID || a.info.ChannelType != providerType || a.info.ApiKey != key || a.info.ChannelMultiKeyIndex != index || a.info.ChannelBaseUrl != baseURL || a.info.ChannelSetting.Proxy != proxy || taskIdentity != nil && !taskIdentity() {
+			return model.ErrProviderStatusConflict
+		}
+		return authorize(callCtx)
+	}
+	scopes, _ := ctx.Value(transientTaskAuthorityContextKey{}).([]*transientTaskAuthority)
+	bound := context.WithValue(ctx, transientTaskAuthorityContextKey{}, append(slices.Clone(scopes), scope))
+	if err := scope.check(bound); err != nil {
+		return nil, err
+	}
+	if task == nil {
+		checks, _ := bound.Value(gatewayTaskCredentialContextKey{}).([]func(context.Context) error)
+		bound = context.WithValue(bound, gatewayTaskCredentialContextKey{}, append(slices.Clone(checks), scope.check))
+	}
+	return bound, nil
+}
+
+// A host query's base URL/proxy are distinct from the plugin's allowed artifact
+// destinations. Bind only these host inputs; descriptor/redirect policy is unchanged.
+func (a *TaskAdaptor) validateTransientQueryDestination(ctx context.Context, baseURL, proxy string) error {
+	scopes, _ := ctx.Value(transientTaskAuthorityContextKey{}).([]*transientTaskAuthority)
+	if len(scopes) > 0 && (a.info == nil || a.info.ProviderMeta == nil || a.info.ChannelBaseUrl != baseURL || a.info.ChannelSetting.Proxy != proxy) {
+		return model.ErrProviderStatusConflict
+	}
+	return nil
+}
 
 func (a *TaskAdaptor) gatewayTaskCredentialContext(ctx context.Context, task *model.Task, key string) context.Context {
 	index := 0
@@ -1126,8 +1244,20 @@ func (a *TaskAdaptor) gatewayTaskCredentialContext(ctx context.Context, task *mo
 		index = a.info.ChannelMultiKeyIndex
 	}
 	check := service.GatewayTaskCredentialCheck(task, key, index)
+	scopes, _ := ctx.Value(transientTaskAuthorityContextKey{}).([]*transientTaskAuthority)
+	for _, scope := range scopes {
+		if scope.task != nil && scope.task == task {
+			check = func(callCtx context.Context) error {
+				if scope.plugin != a.plugin || scope.key != key || scope.index != index {
+					return model.ErrProviderStatusConflict
+				}
+				return scope.check(callCtx)
+			}
+			break
+		}
+	}
 	if check == nil {
-		return ctx
+		check = func(context.Context) error { return model.ErrProviderStatusConflict }
 	}
 	checks, _ := ctx.Value(gatewayTaskCredentialContextKey{}).([]func(context.Context) error)
 	return context.WithValue(ctx, gatewayTaskCredentialContextKey{}, append(slices.Clone(checks), check))
@@ -1150,6 +1280,9 @@ func (a *TaskAdaptor) FetchBatchTasks(baseURL, key string, tasks []*model.Task, 
 }
 
 func (a *TaskAdaptor) FetchBatchTasksWithContext(requestCtx context.Context, baseURL, key string, tasks []*model.Task, proxy string) (*http.Response, error) {
+	if err := a.validateTransientQueryDestination(requestCtx, baseURL, proxy); err != nil {
+		return nil, err
+	}
 	for _, task := range tasks {
 		requestCtx = a.gatewayTaskCredentialContext(requestCtx, task, key)
 	}
@@ -1179,10 +1312,13 @@ func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy str
 // FetchTaskWithContext bounds management and request-scoped polling while the
 // background poller keeps its existing lifecycle through FetchTask.
 func (a *TaskAdaptor) FetchTaskWithContext(requestCtx context.Context, baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
-	requestCtx = a.gatewayTaskCredentialContext(requestCtx, task, key)
-	if task != nil && task.PrivateData.Gateway == nil && task.PrivateData.Key != "" {
+	if err := a.validateTransientQueryDestination(requestCtx, baseURL, proxy); err != nil {
+		return nil, err
+	}
+	if task != nil && task.PrivateData.Gateway == nil && task.PrivateData.LegacyObligation == nil && task.PrivateData.Key != "" {
 		key = task.PrivateData.Key
 	}
+	requestCtx = a.gatewayTaskCredentialContext(requestCtx, task, key)
 	ctx, err := a.queryContextWithContext(requestCtx, task, key, baseURL, proxy)
 	if err != nil {
 		return nil, err
@@ -1491,9 +1627,6 @@ func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, bod
 
 // ParseTaskResultWithContext keeps hook I/O inside the caller's deadline.
 func (a *TaskAdaptor) ParseTaskResultWithContext(requestCtx context.Context, task *model.Task, resp *http.Response, body []byte) (*relaycommon.TaskInfo, error) {
-	if a.info != nil {
-		requestCtx = a.gatewayTaskCredentialContext(requestCtx, task, a.info.ApiKey)
-	}
 	started := time.Now()
 	input := any(string(body))
 	var decoded any
@@ -1501,9 +1634,10 @@ func (a *TaskAdaptor) ParseTaskResultWithContext(requestCtx context.Context, tas
 		input = decoded
 	}
 	key, baseURL, proxy := a.queryCredentials()
-	if task != nil && task.PrivateData.Gateway == nil && task.PrivateData.Key != "" {
+	if task != nil && task.PrivateData.Gateway == nil && task.PrivateData.LegacyObligation == nil && task.PrivateData.Key != "" {
 		key = task.PrivateData.Key
 	}
+	requestCtx = a.gatewayTaskCredentialContext(requestCtx, task, key)
 	ctx, err := a.queryContextWithContext(requestCtx, task, key, baseURL, proxy)
 	if err != nil {
 		return nil, err
@@ -1795,7 +1929,13 @@ func (a *TaskAdaptor) BuildContentRequest(ctx context.Context, task *model.Task,
 		Credentialless: descriptor.Credentialless,
 		ContentPath:    descriptor.ContentPath,
 		MimeType:       descriptor.MimeType,
-		Authorize:      service.GatewayTaskCredentialCheck(task, a.info.ApiKey, a.info.ChannelMultiKeyIndex),
+		Authorize: func(callCtx context.Context) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			checks, _ := ctx.Value(gatewayTaskCredentialContextKey{}).([]func(context.Context) error)
+			return checkGatewayTaskCredentials(context.WithValue(callCtx, gatewayTaskCredentialContextKey{}, checks))
+		},
 	}, nil
 }
 
@@ -1881,7 +2021,7 @@ func (a *TaskAdaptor) queryContextWithContext(requestCtx context.Context, task *
 			}
 			ctx["state"] = state
 		}
-		if task.PrivateData.Gateway == nil && task.PrivateData.Key != "" {
+		if task.PrivateData.Gateway == nil && task.PrivateData.LegacyObligation == nil && task.PrivateData.Key != "" {
 			key = task.PrivateData.Key
 		}
 	}
@@ -1942,6 +2082,11 @@ func (a *TaskAdaptor) applyUpstreamCredentialsWithContext(requestCtx context.Con
 		return nil
 	}
 	ctx["upstream"] = map[string]any{"kind": pluginruntime.UpstreamKindVendor}
+	if a.plugin.Meta.Auth.Type != "" && a.plugin.Meta.Auth.Type != "none" && a.plugin.Meta.Auth.Type != "api_key" {
+		if err := checkGatewayTaskCredentials(requestCtx); err != nil {
+			return err
+		}
+	}
 	auth, err := resolveAuth(requestCtx, a.plugin.Meta.Auth, key, proxy)
 	if err != nil {
 		return err

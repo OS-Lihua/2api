@@ -115,12 +115,6 @@ export function VendorLinkedModels({
       header: t('Name Matching Rule'),
       cell: ({ row }) => rules[row.original.name_rule as 0 | 1 | 2 | 3]?.label,
     },
-    {
-      accessorKey: 'matched_count',
-      header: t('Matched models'),
-      cell: ({ row }) =>
-        row.original.name_rule === 0 ? '—' : (row.original.matched_count ?? 0),
-    },
   ]
   const { table } = useDataTable({
     data: query.data?.items ?? [],

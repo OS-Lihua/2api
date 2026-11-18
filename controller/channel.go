@@ -55,6 +55,16 @@ type OpenAIModelsResponse struct {
 	Success bool          `json:"success"`
 }
 
+// RetiredLegacyChannelManagement is reached only after the legacy route's
+// original authorization (and, for key reads, one-use verification) succeeds.
+// Shared Provider handlers remain available through the native Provider API.
+func RetiredLegacyChannelManagement(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	common.ApiErrorStatus(c, http.StatusGone,
+		common.NewMessage("Legacy Channel management has been retired. Use the Provider and Channel APIs instead."),
+		gin.H{"code": "legacy_channel_management_retired"})
+}
+
 func parseStatusFilter(statusParam string) int {
 	switch strings.ToLower(statusParam) {
 	case "enabled", "1":

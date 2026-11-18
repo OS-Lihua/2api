@@ -167,18 +167,23 @@ func MutateKeyPermissions(ctx context.Context, tokenID, ownerID int, revision in
 	return saved, err
 }
 
-// AllowedOfferingsQuery is the single authorization predicate for discovery,
-// detail and execution. All decision inputs come from one primary DB snapshot;
-// cached credential or group metadata cannot keep a revoked grant alive.
-func AllowedOfferingsQuery(ctx context.Context, userID, tokenID int) *gorm.DB {
+// VisibleOfferingsQuery applies live user status and Offering visibility for
+// browser sessions as well as API Keys. A cached group cannot retain access.
+func VisibleOfferingsQuery(ctx context.Context, userID int) *gorm.DB {
 	db := DB.WithContext(ctx)
 	users := db.Model(&User{}).Select("id").Where("id = ? AND status = ?", userID, common.UserStatusEnabled)
-	tokens := db.Model(&Token{}).Select("id").Where("id = ? AND user_id = ? AND status = ? AND (expired_time = -1 OR expired_time >= ?)", tokenID, userID, common.TokenStatusEnabled, common.GetTimestamp())
 	return db.Model(&ModelOffering{}).
 		Where("enabled = ?", true).
 		Where("EXISTS (?)", users).
+		Where(`("visibility" = 'all' OR "groups" @> jsonb_build_array((SELECT "group" FROM "users" WHERE "id" = ?)))`, userID)
+}
+
+// AllowedOfferingsQuery is the single API Key authorization predicate for
+// discovery, detail and execution. Decision inputs use one primary DB snapshot.
+func AllowedOfferingsQuery(ctx context.Context, userID, tokenID int) *gorm.DB {
+	tokens := DB.WithContext(ctx).Model(&Token{}).Select("id").Where("id = ? AND user_id = ? AND status = ? AND (expired_time = -1 OR expired_time >= ?)", tokenID, userID, common.TokenStatusEnabled, common.GetTimestamp())
+	return VisibleOfferingsQuery(ctx, userID).
 		Where("EXISTS (?)", tokens).
-		Where(`("visibility" = 'all' OR "groups" @> jsonb_build_array((SELECT "group" FROM "users" WHERE "id" = ?)))`, userID).
 		Where(`COALESCE((SELECT "default_allow" FROM "token_offering_policies" WHERE "token_id" = ?), TRUE) <> EXISTS (SELECT 1 FROM "token_offering_exceptions" WHERE "token_id" = ? AND "offering_id" = "model_offerings"."id")`, tokenID, tokenID)
 }
 

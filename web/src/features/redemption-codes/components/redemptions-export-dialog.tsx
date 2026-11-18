@@ -28,7 +28,7 @@ import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 export type RedemptionExportData = {
   keys: string[]
   name: string
-  quota: string
+  amount: string
 }
 
 type RedemptionsExportDialogProps = {
@@ -42,7 +42,7 @@ export function RedemptionsExportDialog(props: RedemptionsExportDialogProps) {
   const [saveToFile, setSaveToFile] = useState(false)
   const [format, setFormat] = useState<'txt' | 'md'>('txt')
   const [includeName, setIncludeName] = useState(true)
-  const [includeQuota, setIncludeQuota] = useState(true)
+  const [includeAmount, setIncludeAmount] = useState(true)
 
   const handleComplete = () => {
     if (!saveToFile) {
@@ -52,13 +52,13 @@ export function RedemptionsExportDialog(props: RedemptionsExportDialogProps) {
     const headers: string[] = []
     if (includeName) headers.push(t('Name'))
     headers.push(t('Code'))
-    if (includeQuota) headers.push(t('Quota'))
+    if (includeAmount) headers.push(t('Amount'))
 
     const rows = props.data.keys.map((key) => {
       const row: string[] = []
       if (includeName) row.push(props.data.name)
       row.push(key)
-      if (includeQuota) row.push(props.data.quota)
+      if (includeAmount) row.push(props.data.amount)
       return row.map((value) => value.replaceAll(/[\t\r\n]+/g, ' '))
     })
 
@@ -154,11 +154,11 @@ export function RedemptionsExportDialog(props: RedemptionsExportDialogProps) {
             </div>
             <div className='flex items-center gap-2'>
               <Checkbox
-                id={`${id}-quota`}
-                checked={includeQuota}
-                onCheckedChange={setIncludeQuota}
+                id={`${id}-amount`}
+                checked={includeAmount}
+                onCheckedChange={setIncludeAmount}
               />
-              <Label htmlFor={`${id}-quota`}>{t('Include quota')}</Label>
+              <Label htmlFor={`${id}-amount`}>{t('Include amount')}</Label>
             </div>
           </div>
         </div>

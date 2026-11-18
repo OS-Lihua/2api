@@ -23,10 +23,12 @@ import (
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
@@ -140,6 +142,7 @@ type textGatewayRun struct {
 	nativeError          *types.NewAPIError
 	status               int
 	code, message        string
+	stopKeepAlive        func()
 }
 
 func (run *textGatewayRun) fail(c *gin.Context, status int, code, message string) {
@@ -180,6 +183,11 @@ func gatewayPreparationRejection(err error, budget *service.GatewayAttemptBudget
 // runAuthorizedTextGateway uses one reservation and settlement for all actual sends.
 func runAuthorizedTextGateway(c *gin.Context) {
 	run := &textGatewayRun{}
+	defer func() {
+		if run.stopKeepAlive != nil {
+			run.stopKeepAlive()
+		}
+	}()
 	parent := c.Request
 	attempts := service.RunGatewayAttempts(parent.Context(), service.GatewayPolicy(), func(budget *service.GatewayAttemptBudget, exclusions *service.GatewayExclusions) service.GatewayAttemptResult {
 		previousStatus, previousCode, previousMessage := run.status, run.code, run.message
@@ -244,17 +252,7 @@ func TextGateway(c *gin.Context) {
 				return
 			}
 		}
-		// Resolution already distinguishes configured legacy models from missing names.
-		// Every text protocol must enforce legacy quota before entering the legacy relay.
-		if _, err := model.ValidateUserToken(c.GetString("token_key")); err != nil {
-			if errors.Is(err, model.ErrDatabase) {
-				gatewayError(c, http.StatusServiceUnavailable, "authorization_unavailable", i18n.T(c, i18n.MsgGatewayAuthorizationUnavailable))
-			} else {
-				gatewayError(c, http.StatusUnauthorized, "invalid_api_key", common.TranslateMessage(c, i18n.MsgTokenInvalid))
-			}
-			return
-		}
-		c.Next()
+		gatewayError(c, http.StatusNotFound, "model_not_found", i18n.T(c, i18n.MsgGatewayModelNotFound))
 		return
 	}
 	c.Abort()
@@ -275,10 +273,38 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
 	kind, pathName := middleware.TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
 	format, _ := kind.RelayFormat()
-	native, err := helper.GetAndValidateRequest(c, format)
+	if c.Request.URL.Path == "/v1/responses/compact" {
+		format = types.RelayFormatOpenAIResponsesCompaction
+	}
+	nativeOperation := kind == protocol.AlphaSearch || kind == protocol.DeepSeekTools || kind == protocol.OpenAIModerations
+	var native dto.Request
+	var err error
+	if nativeOperation {
+		storage, storageErr := common.GetBodyStorage(c)
+		err = storageErr
+		if err == nil {
+			var body []byte
+			body, err = storage.Bytes()
+			if err == nil {
+				native, err = helper.DecodeNativeOperationRequest(body, kind, pathName)
+			}
+		}
+	} else {
+		native, err = helper.GetAndValidateRequest(c, format)
+	}
 	if err != nil {
 		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
 		return
+	}
+	if compact, ok := native.(*dto.OpenAIResponsesCompactionRequest); ok {
+		// Preserve the compact endpoint's accepted wire fields. Its operation
+		// remains distinct from generation throughout Provider preparation.
+		native = &dto.OpenAIResponsesRequest{
+			Model: compact.Model, Input: compact.Input, Instructions: compact.Instructions,
+			PreviousResponseID: compact.PreviousResponseID, ParallelToolCalls: compact.ParallelToolCalls,
+			ServiceTier: compact.ServiceTier, PromptCacheKey: compact.PromptCacheKey,
+			PromptCacheOptions: compact.PromptCacheOptions, PromptCacheRetention: compact.PromptCacheRetention,
+		}
 	}
 	nonText := kind == protocol.OpenAIEmbeddings || kind == protocol.GeminiEmbed || kind == protocol.Rerank
 	if pathName != "" && !nonText {
@@ -293,7 +319,12 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		if pathName != "" {
 			native.SetModelName(pathName)
 		}
-	} else {
+	} else if !nativeOperation {
+		// Authorized, validated Claude streams may wait on image preparation.
+		// Transport comments are not usage, business output or a reservation.
+		if settings := operation_setting.GetGeneralSetting(); kind == protocol.AnthropicMessages && native.IsStream(c.Request) && settings.PingIntervalEnabled && run.stopKeepAlive == nil {
+			run.stopKeepAlive = helper.StartStreamKeepAlive(c, time.Duration(settings.PingIntervalSeconds)*time.Second)
+		}
 		if _, chat := native.(*dto.GeneralOpenAIRequest); !chat {
 			if err := service.PrepareGatewayMedia(c, native); err != nil {
 				run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
@@ -313,6 +344,9 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		}
 	}
 	requestedName := pathName
+	if operation, ok := native.(*helper.NativeOperationRequest); ok {
+		requestedName = operation.Model
+	}
 	if requestedName == "" {
 		var identity struct {
 			Model string `json:"model"`
@@ -413,6 +447,9 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	if info.StreamStatus == nil {
 		info.StreamStatus = relaycommon.NewStreamStatus()
 	}
+	defer func() {
+		common.SetContextKey(c, constant.ContextKeyResponseStreamStatus, info.StreamStatus)
+	}()
 	var sentAt time.Time
 	var firstByte time.Duration
 	info.ResponseFacts = &relaycommon.ResponseFacts{OnBusinessOutput: func() {
@@ -560,7 +597,23 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			}
 
 			record.Status = attempt.Status
-			if !info.ResponseFacts.BusinessOutput && !info.ResponseFacts.SourceOutputObserved && info.ResponseFacts.GeneratedText == "" && !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && !info.ResponseFacts.CompletionTokensReported && !info.ResponseFacts.IndependentUsageReported {
+			if nativeOperation {
+				if usage == nil {
+					usage = &dto.Usage{}
+				}
+				unmeasured := map[string]bool{}
+				if !info.ResponseFacts.PromptTokensReported {
+					unmeasured["p"], unmeasured["len"] = true, true
+				}
+				if !info.ResponseFacts.CompletionTokensReported {
+					unmeasured["c"] = true
+				}
+				input.UnmeasuredTokens, purchaseInput.UnmeasuredTokens = unmeasured, unmeasured
+				if kind == protocol.AlphaSearch {
+					input.ToolCount, purchaseInput.ToolCount = info.ResponseFacts.SourceToolCount, info.ResponseFacts.SourceToolCount
+				}
+			}
+			if !nativeOperation && !info.ResponseFacts.BusinessOutput && !info.ResponseFacts.SourceOutputObserved && info.ResponseFacts.GeneratedText == "" && !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && !info.ResponseFacts.CompletionTokensReported && !info.ResponseFacts.IndependentUsageReported {
 				usage = nil
 			}
 			if usage == nil && (info.ResponseFacts.BusinessOutput || info.ResponseFacts.GeneratedText != "") {
@@ -568,14 +621,14 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 			}
 			purchaseUsage := usage
 			if usage != nil {
-				if !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && (info.ResponseFacts.BusinessOutput || info.ResponseFacts.GeneratedText != "") {
+				if !nativeOperation && !info.ResponseFacts.UsageReported && !info.ResponseFacts.PromptTokensReported && (info.ResponseFacts.BusinessOutput || info.ResponseFacts.GeneratedText != "") {
 					usage.PromptTokens = max(usage.PromptTokens, estimatedInput)
 				}
 				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 				copy := *usage
 				purchaseUsage = &copy
 			}
-			if info.ResponseFacts.SourceOutputObserved {
+			if !nativeOperation && info.ResponseFacts.SourceOutputObserved {
 				if purchaseUsage == nil {
 					purchaseUsage = &dto.Usage{}
 				}
@@ -590,6 +643,14 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 					purchaseUsage.CompletionTokens = max(purchaseUsage.CompletionTokens, generated)
 				}
 			}
+			compactOutputUnknown := info.RelayMode == relayconstant.RelayModeResponsesCompact && info.ResponseFacts.SourceOutputObserved && info.ResponseFacts.SourceOutputTokens == nil && !info.ResponseFacts.CompletionTokensReported
+			if compactOutputUnknown {
+				input.UnmeasuredTokens = map[string]bool{"c": true}
+			}
+			purchaseOutputUnknown := compactOutputUnknown || preparedChat.HiddenChoices && info.ResponseFacts.SourceOutputObserved && !info.ResponseFacts.CompletionTokensReported
+			if purchaseOutputUnknown {
+				purchaseInput.UnmeasuredTokens = map[string]bool{"c": true}
+			}
 			if purchaseUsage != nil {
 				purchaseUsage.TotalTokens = purchaseUsage.PromptTokens + purchaseUsage.CompletionTokens
 				if run.attemptUsage == nil {
@@ -597,8 +658,25 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				}
 				run.attemptUsage[attempt.ID] = service.GatewayUsageSnapshot(purchaseUsage)
 				attempt.Usage, attempt.UsageSource = service.GatewayRecordUsage(purchaseUsage, info.ResponseFacts), "estimated"
+				if purchaseOutputUnknown {
+					attempt.Usage.UnmeasuredTokens = []string{"c"}
+				}
 				if info.ResponseFacts.UsageReported {
 					attempt.UsageSource = "upstream"
+				}
+				if nativeOperation {
+					attempt.UsageSource = "none"
+					if info.ResponseFacts.PromptTokensReported || info.ResponseFacts.CompletionTokensReported {
+						attempt.UsageSource = "upstream"
+					}
+					for _, key := range []string{"p", "len", "c"} {
+						if purchaseInput.UnmeasuredTokens[key] {
+							attempt.Usage.UnmeasuredTokens = append(attempt.Usage.UnmeasuredTokens, key)
+						}
+					}
+					if info.ResponseFacts.SourceToolCount != nil {
+						attempt.Usage.TaskFacts = map[string]any{"tool_count": *info.ResponseFacts.SourceToolCount}
+					}
 				}
 				cost, converted, costTrace, priceErr := service.GatewayPrice(purchase, purchaseUsage, purchaseInput, time.UnixMilli(attempt.StartedAt), decimal.NewFromInt(1), purchaseFX)
 				if run.attemptTrace == nil {
@@ -626,9 +704,19 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 				record.ChoiceCount = choiceCount
 				saleUsage := usage
 				record.Usage, record.UsageSource = service.GatewayRecordUsage(usage, info.ResponseFacts), attempt.UsageSource
+				if nativeOperation {
+					record.Usage.UnmeasuredTokens = append([]string(nil), attempt.Usage.UnmeasuredTokens...)
+					if input.ToolCount != nil {
+						record.Usage.TaskFacts = map[string]any{"tool_count": *input.ToolCount}
+					}
+				}
+				if compactOutputUnknown {
+					record.Usage.UnmeasuredTokens = []string{"c"}
+				}
 				estimateDeliveredOutput := attempt.Status == "partial" && !normalBudget || info.ResponseFacts.DownstreamWriteFailed || !info.ResponseFacts.UsageReported && attempt.Status == "cancelled"
-				if info.IsStream && estimateDeliveredOutput && usage != nil {
-					// Procurement retains reported usage; interrupted sales use delivered text.
+				if (info.IsStream && estimateDeliveredOutput || preparedChat.HiddenChoices) && usage != nil {
+					// Procurement retains all reported generation. Interrupted streams
+					// and best_of sales use only the output delivered downstream.
 					delivered := tokenkit.Count(info.TokenizerModel, info.ResponseFacts.GeneratedText)
 					if info.ResponseFacts.GeneratedOutputTokens != nil {
 						delivered = *info.ResponseFacts.GeneratedOutputTokens
@@ -722,6 +810,9 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 		return
 	}
 	purchaseInput = billingexpr.RequestInput{Body: append([]byte(nil), encoded...), Headers: make(map[string]string)}
+	if kind == protocol.AlphaSearch {
+		purchaseInput.ToolCount = common.GetPointer(1)
+	}
 	for key, values := range prepared.Headers() {
 		purchaseInput.Headers[strings.ToLower(key)] = strings.Join(values, ",")
 	}
@@ -952,7 +1043,7 @@ func gatewayAttemptOutcome(c *gin.Context, info *relaycommon.RelayInfo, err *typ
 	if info.StreamStatus.OutcomeSnapshot().OutputLimitReached() || info.ResponseFacts.OutputLimitObserved {
 		return "partial", "output_limit"
 	}
-	if !info.ResponseFacts.BusinessOutput {
+	if !info.ResponseFacts.BusinessOutput && !info.ResponseFacts.NativeOperationCompleted {
 		return "failed", "empty_response"
 	}
 	return "success", ""

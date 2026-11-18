@@ -543,19 +543,11 @@ export const GroupSelector: React.FC<GroupSelectorProps> = React.memo(
 GroupSelector.displayName = 'GroupSelector'
 
 // Export combined selector component
-export interface ModelGroupSelectorProps {
-  // Model props
-  selectedModel: string
-  models: ModelOption[]
-  onModelChange: (value: string) => void
-  // Group props
-  selectedGroup: string
-  groups: GroupOption[]
-  onGroupChange: (value: string) => void
-  // Common props
-  className?: string
-  disabled?: boolean
-}
+export type ModelGroupSelectorProps = ModelSelectorProps &
+  (
+    | (GroupSelectorProps & { showGroup?: true })
+    | (Partial<GroupSelectorProps> & { showGroup: false })
+  )
 
 /**
  * Combined Model and Group Selector Component
@@ -568,6 +560,7 @@ export const ModelGroupSelector: React.FC<ModelGroupSelectorProps> = ({
   selectedGroup,
   groups,
   onGroupChange,
+  showGroup = true,
   className,
   disabled = false,
 }) => {
@@ -584,7 +577,7 @@ export const ModelGroupSelector: React.FC<ModelGroupSelectorProps> = ({
     [models, selectedModel]
   )
   const currentGroup = useMemo(
-    () => groups.find((group) => group.value === selectedGroup),
+    () => groups?.find((group) => group.value === selectedGroup),
     [groups, selectedGroup]
   )
   const filteredModels = useMemo(() => {
@@ -618,7 +611,7 @@ export const ModelGroupSelector: React.FC<ModelGroupSelectorProps> = ({
 
   const handleGroupChange = useCallback(
     (value: string) => {
-      onGroupChange(value)
+      onGroupChange?.(value)
     },
     [onGroupChange]
   )
@@ -645,8 +638,28 @@ export const ModelGroupSelector: React.FC<ModelGroupSelectorProps> = ({
     }
   }, [open, selectedGroup, selectedModel])
 
+  const triggerContent = (
+    <>
+      <CpuIcon className='text-muted-foreground size-4 shrink-0' />
+      <span className='min-w-0 truncate text-xs'>
+        {currentModel?.label || t('Model')}
+      </span>
+      {showGroup && (
+        <span className='bg-muted text-muted-foreground hidden max-w-20 shrink-0 rounded px-1.5 py-0.5 text-[10px] sm:inline-flex'>
+          {currentGroup?.label || t('Group')}
+        </span>
+      )}
+      <ChevronsUpDown className='text-muted-foreground ml-auto size-3.5 shrink-0 opacity-60' />
+    </>
+  )
+
   const renderTrigger = () => (
     <Button
+      aria-label={
+        showGroup
+          ? `${currentModel?.label || t('Model')} ${currentGroup?.label || t('Group')}`
+          : currentModel?.label || t('Model')
+      }
       aria-expanded={open}
       className={cn(
         'h-8 max-w-[15rem] justify-start gap-2 border px-2.5 font-medium shadow-none',
@@ -659,14 +672,7 @@ export const ModelGroupSelector: React.FC<ModelGroupSelectorProps> = ({
       size='sm'
       variant='outline'
     >
-      <CpuIcon className='text-muted-foreground size-4 shrink-0' />
-      <span className='min-w-0 truncate text-xs'>
-        {currentModel?.label || t('Model')}
-      </span>
-      <span className='bg-muted text-muted-foreground hidden max-w-20 shrink-0 rounded px-1.5 py-0.5 text-[10px] sm:inline-flex'>
-        {currentGroup?.label || t('Group')}
-      </span>
-      <ChevronsUpDown className='text-muted-foreground ml-auto size-3.5 shrink-0 opacity-60' />
+      {triggerContent}
     </Button>
   )
 
@@ -687,7 +693,7 @@ export const ModelGroupSelector: React.FC<ModelGroupSelectorProps> = ({
         )}
         ref={groupScrollContainerRef}
       >
-        {groups.map((group) => {
+        {groups?.map((group) => {
           const isSelected = selectedGroup === group.value
 
           return (
@@ -789,13 +795,15 @@ export const ModelGroupSelector: React.FC<ModelGroupSelectorProps> = ({
 
   const renderContent = () => (
     <div
-      className={
+      className={cn(
         isMobile
-          ? 'grid gap-3 p-2 md:grid-cols-[9.5rem_minmax(0,1fr)]'
-          : modelGroupSelectorLayoutClasses.desktopContent
-      }
+          ? 'grid gap-3 p-2'
+          : modelGroupSelectorLayoutClasses.desktopContent,
+        isMobile && showGroup && 'md:grid-cols-[9.5rem_minmax(0,1fr)]',
+        !showGroup && 'md:grid-cols-1'
+      )}
     >
-      {renderGroupList()}
+      {showGroup && renderGroupList()}
       <div
         className={cn(
           'min-w-0 overflow-hidden rounded-lg border',
@@ -821,11 +829,12 @@ export const ModelGroupSelector: React.FC<ModelGroupSelectorProps> = ({
     </Drawer>
   ) : (
     <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger render={renderTrigger()} />
+      <PopoverTrigger render={renderTrigger()}>{triggerContent}</PopoverTrigger>
       <PopoverContent
         align='end'
         className={cn(
-          'bg-popover z-50 w-[34rem] max-w-[calc(100vw-2rem)] rounded-xl border p-0 shadow-lg',
+          'bg-popover z-50 max-w-[calc(100vw-2rem)] rounded-xl border p-0 shadow-lg',
+          showGroup ? 'w-[34rem]' : 'w-[22rem]',
           modelGroupSelectorLayoutClasses.desktopPanel
         )}
         collisionPadding={8}

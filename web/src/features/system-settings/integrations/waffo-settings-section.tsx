@@ -43,9 +43,6 @@ export interface WaffoSettingsValues {
   WaffoSandboxPrivateKey: string
   WaffoSandbox: boolean
   WaffoMerchantId: string
-  WaffoCurrency: string
-  WaffoUnitPrice: number
-  WaffoMinTopUp: number
   WaffoNotifyUrl: string
   WaffoReturnUrl: string
   WaffoPayMethods: string
@@ -254,42 +251,6 @@ export function WaffoSettingsSection({
                 onValueChange('WaffoSandboxPublicCert', event.target.value)
               }
               className='font-mono text-xs'
-            />
-          </div>
-        </div>
-
-        <div className='grid grid-cols-3 gap-4'>
-          <div className='grid gap-1.5'>
-            <Label>{t('Currency')}</Label>
-            <Input value={values.WaffoCurrency} disabled />
-          </div>
-          <div className='grid gap-1.5'>
-            <Label>{t('Unit price (USD)')}</Label>
-            <Input
-              type='number'
-              step={0.1}
-              min={0}
-              value={values.WaffoUnitPrice}
-              onChange={(event) =>
-                onValueChange(
-                  'WaffoUnitPrice',
-                  event.target.value === '' ? 0 : event.target.valueAsNumber
-                )
-              }
-            />
-          </div>
-          <div className='grid gap-1.5'>
-            <Label>{t('Minimum top-up quantity')}</Label>
-            <Input
-              type='number'
-              min={1}
-              value={values.WaffoMinTopUp}
-              onChange={(event) =>
-                onValueChange(
-                  'WaffoMinTopUp',
-                  event.target.value === '' ? 1 : event.target.valueAsNumber
-                )
-              }
             />
           </div>
         </div>

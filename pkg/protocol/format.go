@@ -27,6 +27,12 @@ func (t Type) RelayFormat() (types.RelayFormat, error) {
 		return types.RelayFormatOpenAIAudio, nil
 	case Rerank:
 		return types.RelayFormatRerank, nil
+	case AlphaSearch:
+		return types.RelayFormatOpenAIAlphaSearch, nil
+	case DeepSeekTools:
+		return types.RelayFormatDeepSeekTools, nil
+	case OpenAIModerations:
+		return types.RelayFormatOpenAI, nil
 	default:
 		return "", fmt.Errorf("unsupported protocol %q", t)
 	}

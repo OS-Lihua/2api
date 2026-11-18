@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,12 +18,15 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/plugins"
+	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 const maxTaskPluginSourceBytes = 8 << 20
@@ -118,8 +122,8 @@ func UploadTaskPlugin(c *gin.Context) {
 		return
 	}
 	detail := taskPluginDetail{Plugin: &plugin, Meta: loaded.Meta, Source: string(plugin.Source), Layer: "override", HasIcon: plugin.HasIcon(), SkippedRoutes: taskPluginSkippedRoutes(plugin.Key, plugin.Version)}
-	if plugin.Active && plugin.Enabled {
-		detail.PricingIssues = taskPluginPricingIssues(plugin.Key)
+	if plugin.Active {
+		detail.PricingDiagnostics = taskPluginPricingDiagnostics(c, plugin.Key)
 	}
 	common.ApiSuccess(c, detail)
 }
@@ -324,8 +328,8 @@ type taskPluginDetail struct {
 	Layer         string            `json:"layer"`
 	HasIcon       bool              `json:"has_icon"`
 	SkippedRoutes []string          `json:"skipped_routes"`
-	// PricingIssues is set by an upload that puts the version into service.
-	PricingIssues []model.ModelPricingIssue `json:"pricing_issues,omitempty"`
+	// Diagnostics describe current owners, never the requested historical version.
+	PricingDiagnostics *model.TaskPluginPricingDiagnostics `json:"pricing_diagnostics,omitempty"`
 }
 
 // taskPluginSkippedRoutes lists, as "METHOD /path", the declared top-level
@@ -388,7 +392,7 @@ func GetTaskPlugin(c *gin.Context) {
 			taskPluginCompileError(c, compileErr)
 			return
 		}
-		common.ApiSuccess(c, taskPluginDetail{Plugin: plugin, Meta: loaded.Meta, Source: string(plugin.Source), Layer: "override", HasIcon: plugin.HasIcon(), SkippedRoutes: taskPluginSkippedRoutes(plugin.Key, plugin.Version)})
+		common.ApiSuccess(c, taskPluginDetail{Plugin: plugin, Meta: loaded.Meta, Source: string(plugin.Source), Layer: "override", HasIcon: plugin.HasIcon(), SkippedRoutes: taskPluginSkippedRoutes(plugin.Key, plugin.Version), PricingDiagnostics: taskPluginPricingDiagnostics(c, key)})
 		return
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) || version != "" {
@@ -406,7 +410,7 @@ func GetTaskPlugin(c *gin.Context) {
 		return
 	}
 	_, _, hasIcon := plugins.Icon(key)
-	common.ApiSuccess(c, taskPluginDetail{Meta: loaded.Meta, Source: source, Layer: "factory", HasIcon: hasIcon, SkippedRoutes: taskPluginSkippedRoutes(key, loaded.Meta.Version)})
+	common.ApiSuccess(c, taskPluginDetail{Meta: loaded.Meta, Source: source, Layer: "factory", HasIcon: hasIcon, SkippedRoutes: taskPluginSkippedRoutes(key, loaded.Meta.Version), PricingDiagnostics: taskPluginPricingDiagnostics(c, key)})
 }
 
 type taskPluginDryRunRequest struct {
@@ -524,7 +528,7 @@ func DeleteTaskPluginVersion(c *gin.Context) {
 	var data any
 	if plugin.Active {
 		// Deleting the active version changes which plugin, if any, serves key.
-		data = gin.H{"pricing_issues": taskPluginPricingIssues(key)}
+		data = gin.H{"pricing_diagnostics": taskPluginPricingDiagnostics(c, key)}
 	}
 	common.ApiSuccess(c, data)
 }
@@ -573,7 +577,7 @@ func ActivateTaskPlugin(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	common.ApiSuccess(c, gin.H{"pricing_issues": taskPluginPricingIssues(target.Key)})
+	common.ApiSuccess(c, gin.H{"pricing_diagnostics": taskPluginPricingDiagnostics(c, target.Key)})
 }
 
 type taskPluginStatusRequest struct {
@@ -669,9 +673,7 @@ func SetTaskPluginStatus(c *gin.Context) {
 			return
 		}
 		if !hasActiveOverride {
-			if *request.Enabled {
-				response["pricing_issues"] = taskPluginPricingIssues(key)
-			}
+			response["pricing_diagnostics"] = taskPluginPricingDiagnostics(c, key)
 			common.ApiSuccess(c, response)
 			return
 		}
@@ -684,9 +686,7 @@ func SetTaskPluginStatus(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	if *request.Enabled {
-		response["pricing_issues"] = taskPluginPricingIssues(key)
-	}
+	response["pricing_diagnostics"] = taskPluginPricingDiagnostics(c, key)
 	common.ApiSuccess(c, response)
 }
 
@@ -730,16 +730,26 @@ func rejectTaskPluginRoutingConflict(c *gin.Context, key string, row *model.Task
 	return false
 }
 
-// taskPluginPricingIssues lists, after the registry sync, the task model prices
-// the plugin serving key cannot charge. The plugin change is already saved, so
-// a failed read only drops the notice; the model pricing page still shows them.
-func taskPluginPricingIssues(key string) []model.ModelPricingIssue {
-	issues, err := model.GetModelPricingIssues(key)
+// Diagnostics are a separate post-commit operation. Authorization rechecks the
+// original credential, live user and policy, including PAT scopes. Its row locks
+// require a normal transaction, not ReadOnly. SQL failures never undo a saved
+// plugin or masquerade as a successful empty diagnostic; retry uses detail GET.
+func taskPluginPricingDiagnostics(c *gin.Context, key string) *model.TaskPluginPricingDiagnostics {
+	result := &model.TaskPluginPricingDiagnostics{State: model.TaskPluginPricingNotAuthorized, Issues: []model.TaskPluginPricingIssue{}}
+	err := model.DB.WithContext(c.Request.Context()).Session(&gorm.Session{Logger: gormlogger.Discard}).Transaction(func(tx *gorm.DB) error {
+		pricing := authz.Permission{Resource: "pricing", Action: "read"}
+		visibility := model.TaskPluginPricingVisibility{
+			Offerings: middleware.AuthorizeDashboardMutation(tx, c, pricing, authz.Permission{Resource: "model", Action: "read"}),
+			Channels:  middleware.AuthorizeDashboardMutation(tx, c, pricing, authz.Permission{Resource: "channel", Action: "read"}),
+		}
+		var err error
+		result, err = model.GetTaskPluginPricingDiagnostics(c.Request.Context(), tx, key, visibility)
+		return err
+	}, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
 	if err != nil {
-		common.SysError(common.LogText("read pricing issues of task plugin %s: %v", key, err))
-		return nil
+		return &model.TaskPluginPricingDiagnostics{State: model.TaskPluginPricingUnavailable, Issues: []model.TaskPluginPricingIssue{}}
 	}
-	return issues
+	return result
 }
 
 func GetTaskPluginMarketplaceSources(c *gin.Context) {

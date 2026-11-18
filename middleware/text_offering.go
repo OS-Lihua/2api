@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/protocol"
@@ -49,20 +50,22 @@ func resolveOffering(c *gin.Context, name string) {
 		var request struct {
 			Model string `json:"model"`
 		}
-		if common.UnmarshalBodyReusable(c, &request) != nil || request.Model == "" {
+		if common.UnmarshalBodyReusable(c, &request) != nil {
 			c.Next()
 			return
 		}
 		name = request.Model
+		if name == "" && c.Request.URL.Path == "/v1/moderations" {
+			name = "text-moderation-stable"
+		}
+		if name == "" {
+			c.Next()
+			return
+		}
 	}
 	offering, err := model.FindModelOfferingByName(c.Request.Context(), name)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		legacy, legacyErr := model.LegacyModelConfigured(c.Request.Context(), name)
-		if legacyErr != nil {
-			abortWithOpenAiMessage(c, http.StatusInternalServerError, "Could not resolve model")
-			return
-		}
-		c.Set(textOfferingMissingContextKey, !legacy)
+		c.Set(textOfferingMissingContextKey, true)
 		c.Next()
 		return
 	}
@@ -81,9 +84,9 @@ func TextGatewayEndpoint(method, path string) (protocol.Type, string) {
 		return "", ""
 	}
 	switch path {
-	case "/v1/chat/completions":
+	case "/v1/completions", "/v1/chat/completions", "/pg/chat/completions":
 		return protocol.OpenAIChat, ""
-	case "/v1/responses":
+	case "/v1/responses", "/v1/responses/compact":
 		return protocol.OpenAIResponses, ""
 	case "/v1/messages":
 		return protocol.AnthropicMessages, ""
@@ -91,6 +94,14 @@ func TextGatewayEndpoint(method, path string) (protocol.Type, string) {
 		return protocol.OpenAIEmbeddings, ""
 	case "/v1/rerank":
 		return protocol.Rerank, ""
+	case "/v1/alpha/search":
+		return protocol.AlphaSearch, ""
+	case "/v1/tools/search":
+		return protocol.DeepSeekTools, constant.DeepSeekSearchModel
+	case "/v1/tools/fetch":
+		return protocol.DeepSeekTools, constant.DeepSeekFetchModel
+	case "/v1/moderations":
+		return protocol.OpenAIModerations, ""
 	}
 	if engine, found := strings.CutPrefix(path, "/v1/engines/"); found {
 		if name, found := strings.CutSuffix(engine, "/embeddings"); found && name != "" && !strings.Contains(name, "/") {
@@ -118,7 +129,6 @@ func TextGatewayEndpoint(method, path string) (protocol.Type, string) {
 }
 
 // TextOfferingMissing retains failed resolution until after credential checks.
-// A configured legacy model continues through its existing quota and relay path.
 func TextOfferingMissing(c *gin.Context) bool {
 	return c.GetBool(textOfferingMissingContextKey)
 }

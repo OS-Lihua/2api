@@ -19,6 +19,11 @@ For commercial licensing, please contact support@quantumnous.com
 import { api, type ApiRequestConfig } from '@/lib/api'
 import { createServerError } from '@/lib/server-error-message'
 
+import {
+  assertTaskPluginScope,
+  readPricingDiagnostics,
+  taskPluginScope,
+} from './lib/pricing-diagnostics'
 import type {
   ApiResponse,
   MarketplaceSource,
@@ -73,18 +78,31 @@ export async function listTaskPlugins() {
   return requireSuccess(response.data)
 }
 
-export async function getTaskPlugin(key: string, version?: string) {
+export async function getTaskPlugin(
+  key: string,
+  version?: string,
+  signal?: AbortSignal
+) {
+  const scope = taskPluginScope()
   const response = await api.get<ApiResponse<TaskPluginDetail>>(
     `/api/plugin/task/${encodeURIComponent(key)}`,
-    { params: version ? { version } : undefined }
+    { ...mutationConfig, params: version ? { version } : undefined, signal }
   )
-  return requireSuccess(response.data)
+  assertTaskPluginScope(scope, signal)
+  const detail = requireSuccess(response.data)
+  return {
+    ...detail,
+    pricing_diagnostics: readPricingDiagnostics(detail.pricing_diagnostics),
+  }
 }
 
-export async function getTaskPluginVersions(key: string) {
+export async function getTaskPluginVersions(key: string, signal?: AbortSignal) {
+  const scope = taskPluginScope()
   const response = await api.get<ApiResponse<TaskPluginRecord[]>>(
-    `/api/plugin/task/${encodeURIComponent(key)}/versions`
+    `/api/plugin/task/${encodeURIComponent(key)}/versions`,
+    { ...mutationConfig, signal }
   )
+  assertTaskPluginScope(scope, signal)
   return requireSuccess(response.data)
 }
 
@@ -97,12 +115,18 @@ export async function uploadTaskPlugin(
   remark: string,
   icon?: string
 ) {
+  const scope = taskPluginScope()
   const response = await api.post<ApiResponse<TaskPluginDetail>>(
     '/api/plugin/task',
     { source, remark, icon: icon || undefined },
     mutationConfig
   )
-  return requireSuccess(response.data)
+  assertTaskPluginScope(scope)
+  const data = requireSuccess(response.data)
+  return {
+    ...data,
+    pricing_diagnostics: readPricingDiagnostics(data?.pricing_diagnostics),
+  }
 }
 
 /**
@@ -117,6 +141,7 @@ export async function installMarketplacePlugin(request: {
   remark: string
   icon?: string
 }) {
+  const scope = taskPluginScope()
   const response = await api.post<ApiResponse<TaskPluginDetail>>(
     '/api/plugin/task',
     {
@@ -128,7 +153,12 @@ export async function installMarketplacePlugin(request: {
     },
     mutationConfig
   )
-  return requireSuccess(response.data)
+  assertTaskPluginScope(scope)
+  const data = requireSuccess(response.data)
+  return {
+    ...data,
+    pricing_diagnostics: readPricingDiagnostics(data?.pricing_diagnostics),
+  }
 }
 
 export async function listMarketplaceSources() {
@@ -148,12 +178,17 @@ export async function updateMarketplaceSources(sources: MarketplaceSource[]) {
 }
 
 export async function activateTaskPlugin(key: string, version: string) {
+  const scope = taskPluginScope()
   const response = await api.post<ApiResponse<TaskPluginPricingNotice>>(
     `/api/plugin/task/${encodeURIComponent(key)}/activate`,
     { version },
     mutationConfig
   )
-  return requireSuccess(response.data)
+  assertTaskPluginScope(scope)
+  const data = requireSuccess(response.data)
+  return {
+    pricing_diagnostics: readPricingDiagnostics(data?.pricing_diagnostics),
+  }
 }
 
 export async function setTaskPluginStatus(
@@ -161,12 +196,17 @@ export async function setTaskPluginStatus(
   enabled: boolean,
   options?: { cascade?: boolean; force?: boolean }
 ) {
+  const scope = taskPluginScope()
   const response = await api.post<ApiResponse<TaskPluginPricingNotice>>(
     `/api/plugin/task/${encodeURIComponent(key)}/status`,
     { enabled },
     { ...mutationConfig, params: options }
   )
-  return requireSuccess(response.data)
+  assertTaskPluginScope(scope)
+  const data = requireSuccess(response.data)
+  return {
+    pricing_diagnostics: readPricingDiagnostics(data?.pricing_diagnostics),
+  }
 }
 
 export async function deleteTaskPluginVersion(
@@ -174,11 +214,16 @@ export async function deleteTaskPluginVersion(
   version: string,
   force = false
 ) {
+  const scope = taskPluginScope()
   const response = await api.delete<ApiResponse<TaskPluginPricingNotice>>(
     `/api/plugin/task/${encodeURIComponent(key)}/versions/${encodeURIComponent(version)}`,
     { ...mutationConfig, params: force ? { force: true } : undefined }
   )
-  return requireSuccess(response.data)
+  assertTaskPluginScope(scope)
+  const data = requireSuccess(response.data)
+  return {
+    pricing_diagnostics: readPricingDiagnostics(data?.pricing_diagnostics),
+  }
 }
 
 export async function getTaskPluginEnabledOption() {

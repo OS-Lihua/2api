@@ -119,6 +119,9 @@ func TestAccessTokenRouteRulesCoverEveryDashboardRoute(t *testing.T) {
 			panel[key] = true
 		}
 	}
+	assert.False(t, registered["GET /api/token/auto-groups"], "retired Key group discovery must not be registered")
+	_, retiredGroupRule := middleware.AccessTokenRouteRule("GET /api/token/auto-groups")
+	assert.False(t, retiredGroupRule, "retired Key group discovery must not retain an authorization rule")
 	for _, key := range accessTokenExemptRoutes {
 		assert.True(t, registered[key], "exempt route %s is no longer registered", key)
 	}
