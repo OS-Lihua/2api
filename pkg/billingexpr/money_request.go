@@ -30,7 +30,7 @@ func parseMoneyLiterals(body string) (map[file.Location]*big.Rat, map[file.Locat
 	literalText := make(map[file.Location]string)
 	for _, token := range tokens {
 		switch token.Value {
-		case "_money_fixed", "_money_rule", "_money_condition", "_money_has_frozen_condition", "_money_frozen_condition", "_money_builtin", "_money_binary", "_money_unary", "_money_index":
+		case "_money_token", "_money_fixed", "_money_rule", "_money_condition", "_money_has_frozen_condition", "_money_frozen_condition", "_money_builtin", "_money_binary", "_money_unary", "_money_index", "_money_image_quantity":
 			if token.Kind == lexer.Identifier {
 				return nil, nil, fmt.Errorf("expr compile error: identifier %q is reserved for internal use", token.Value)
 			}

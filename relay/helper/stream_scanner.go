@@ -341,6 +341,10 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 						writeMutex.Lock()
 						defer writeMutex.Unlock()
 						err = PingData(c)
+						// Cancellation can stop PingData before it writes downstream.
+						if err != nil && info.ResponseFacts != nil && !errors.Is(err, c.Request.Context().Err()) {
+							info.ResponseFacts.DownstreamWriteFailed = true
+						}
 					}()
 					if err != nil {
 						logger.LogError(c, common.LogText("ping data error: %s", err.Error()))
@@ -363,7 +367,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		})
 	}
 
-	dataChan := make(chan string, 10)
+	dataChan := make(chan SSEEvent, 10)
 	var pendingSource string
 	sr := newStreamResult(info.StreamStatus)
 
@@ -377,12 +381,13 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			stop()
 			wg.Done()
 		}()
-		for data := range dataChan {
+		for event := range dataChan {
 			sr.reset()
 			func() {
 				writeMutex.Lock()
 				defer writeMutex.Unlock()
-				dataHandler(data, sr)
+				sr.eventName = event.Event
+				dataHandler(event.Data, sr)
 			}()
 			if sr.IsStopped() {
 				return
@@ -415,8 +420,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				logger.LogDebug(c, "stream scanner data: %s", data)
 			}
 
+			event := SSEEvent{}
 			if managed {
-				event := ParseSSEEvent(data)
+				event = ParseSSEEvent(data)
 				data = ""
 				if event.HasData {
 					data = event.Data
@@ -429,6 +435,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				}
 			}
 			data = strings.TrimSpace(data)
+			event.Data = data
 			select {
 			case <-stopChan:
 				pendingSource = data
@@ -446,7 +453,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				info.ReceivedResponseCount++
 
 				select {
-				case dataChan <- data:
+				case dataChan <- event:
 				case <-ctx.Done():
 					pendingSource = data
 					return
@@ -494,8 +501,8 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	// Source observation runs only after both stream goroutines have joined.
 	// It retains received frames without another public write or terminal callback.
 	if len(stoppedSource) > 0 && stoppedSource[0] != nil {
-		for data := range dataChan {
-			stoppedSource[0](data)
+		for event := range dataChan {
+			stoppedSource[0](event.Data)
 		}
 		if pendingSource != "" && pendingSource != "[DONE]" {
 			stoppedSource[0](pendingSource)

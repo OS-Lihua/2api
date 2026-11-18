@@ -26,27 +26,34 @@ func TestTaskPluginChannelSelectionFiltersBothCachePaths(t *testing.T) {
 	}
 	for i := range channels {
 		require.NoError(t, channels[i].Insert())
+		require.NoError(t, channels[i].AddAbilities(nil)) // Explicit historical helper fixture.
 	}
 
-	selected, err := GetProvider("default", "shared", 0, identityFilters("alpha", nil))
-	require.NoError(t, err)
-	require.NotNil(t, selected)
-	assert.Equal(t, "alpha", selected.Name)
-	selected, err = GetProvider("default", "shared", 0, identityFilters("", nil))
-	require.NoError(t, err)
-	assert.Nil(t, selected)
-	selected, err = GetProvider("default", "ordinary", 0, identityFilters("", nil))
-	require.NoError(t, err)
-	require.NotNil(t, selected)
-	assert.Equal(t, "ordinary", selected.Name)
-	selected, err = GetProvider("default", "legacy", 0, identityFilters("legacy-alpha", []int{constant.ChannelTypeKling}))
-	require.NoError(t, err)
-	require.NotNil(t, selected)
-	assert.Equal(t, "legacy-alpha", selected.Name)
-	selected, err = GetProvider("default", "legacy", 0, identityFilters("legacy-alpha", []int{constant.ChannelTypeKling, constant.ChannelTypeJimeng}))
-	require.NoError(t, err)
-	require.NotNil(t, selected)
-	assert.Contains(t, []string{"legacy-alpha", "legacy-beta"}, selected.Name)
+	originalMemoryCache := common.MemoryCacheEnabled
+	t.Cleanup(func() { common.MemoryCacheEnabled = originalMemoryCache; InitProviderCache() })
+	for _, memoryCache := range []bool{false, true} {
+		common.MemoryCacheEnabled = memoryCache
+		InitProviderCache()
+		selected, err := GetRandomSatisfiedProvider("default", "shared", 0, identityFilters("alpha", nil))
+		require.NoError(t, err)
+		require.NotNil(t, selected)
+		assert.Equal(t, "alpha", selected.Name)
+		selected, err = GetRandomSatisfiedProvider("default", "shared", 0, identityFilters("", nil))
+		require.NoError(t, err)
+		assert.Nil(t, selected)
+		selected, err = GetRandomSatisfiedProvider("default", "ordinary", 0, identityFilters("", nil))
+		require.NoError(t, err)
+		require.NotNil(t, selected)
+		assert.Equal(t, "ordinary", selected.Name)
+		selected, err = GetRandomSatisfiedProvider("default", "legacy", 0, identityFilters("legacy-alpha", []int{constant.ChannelTypeKling}))
+		require.NoError(t, err)
+		require.NotNil(t, selected)
+		assert.Equal(t, "legacy-alpha", selected.Name)
+		selected, err = GetRandomSatisfiedProvider("default", "legacy", 0, identityFilters("legacy-alpha", []int{constant.ChannelTypeKling, constant.ChannelTypeJimeng}))
+		require.NoError(t, err)
+		require.NotNil(t, selected)
+		assert.Contains(t, []string{"legacy-alpha", "legacy-beta"}, selected.Name)
+	}
 }
 
 func identityFilters(key string, channelTypes []int) []dto.ProviderFilter {
@@ -94,28 +101,35 @@ func TestNewAPIChannelServesExtendedTaskPlugins(t *testing.T) {
 	}
 	for i := range channels {
 		require.NoError(t, channels[i].Insert())
+		require.NoError(t, channels[i].AddAbilities(nil)) // Explicit historical helper fixture.
 	}
 
-	selected, err := GetProvider("default", "shared", 0, identityFilters("alpha", nil))
-	require.NoError(t, err)
-	require.NotNil(t, selected)
-	assert.Equal(t, "gateway", selected.Name)
-	selected, err = GetProvider("default", "shared", 0, identityFilters("delta", nil))
-	require.NoError(t, err)
-	require.NotNil(t, selected)
-	assert.Equal(t, "gateway-single", selected.Name, "a single task_plugin_key still binds a New API channel")
-	selected, err = GetProvider("default", "shared", 0, identityFilters("beta", nil))
-	require.NoError(t, err)
-	assert.Nil(t, selected, "unbound plugins never reach the gateway channel")
-	shared := []dto.ProviderFilter{{Kind: dto.FilterTaskPluginIdentity, TaskPluginKey: "beta", TaskPluginKeys: []string{"beta", "gamma"}}}
-	selected, err = GetProvider("default", "shared", 0, shared)
-	require.NoError(t, err)
-	require.NotNil(t, selected)
-	assert.Equal(t, "gateway", selected.Name, "a bound shared-model candidate admits the channel")
-	selected, err = GetProvider("default", "chat", 0, identityFilters("", nil))
-	require.NoError(t, err)
-	require.NotNil(t, selected)
-	assert.Equal(t, "gateway", selected.Name, "requests without a pinned plugin keep using the gateway")
+	originalMemoryCache := common.MemoryCacheEnabled
+	t.Cleanup(func() { common.MemoryCacheEnabled = originalMemoryCache; InitProviderCache() })
+	for _, memoryCache := range []bool{false, true} {
+		common.MemoryCacheEnabled = memoryCache
+		InitProviderCache()
+		selected, err := GetRandomSatisfiedProvider("default", "shared", 0, identityFilters("alpha", nil))
+		require.NoError(t, err)
+		require.NotNil(t, selected)
+		assert.Equal(t, "gateway", selected.Name)
+		selected, err = GetRandomSatisfiedProvider("default", "shared", 0, identityFilters("delta", nil))
+		require.NoError(t, err)
+		require.NotNil(t, selected)
+		assert.Equal(t, "gateway-single", selected.Name, "a single task_plugin_key still binds a New API channel")
+		selected, err = GetRandomSatisfiedProvider("default", "shared", 0, identityFilters("beta", nil))
+		require.NoError(t, err)
+		assert.Nil(t, selected, "unbound plugins never reach the gateway channel")
+		shared := []dto.ProviderFilter{{Kind: dto.FilterTaskPluginIdentity, TaskPluginKey: "beta", TaskPluginKeys: []string{"beta", "gamma"}}}
+		selected, err = GetRandomSatisfiedProvider("default", "shared", 0, shared)
+		require.NoError(t, err)
+		require.NotNil(t, selected)
+		assert.Equal(t, "gateway", selected.Name, "a bound shared-model candidate admits the channel")
+		selected, err = GetRandomSatisfiedProvider("default", "chat", 0, identityFilters("", nil))
+		require.NoError(t, err)
+		require.NotNil(t, selected)
+		assert.Equal(t, "gateway", selected.Name, "requests without a pinned plugin keep using the gateway")
+	}
 }
 
 func TestModelModifierNamesRouteWithAndWithoutMemoryCache(t *testing.T) {
@@ -124,6 +138,7 @@ func TestModelModifierNamesRouteWithAndWithoutMemoryCache(t *testing.T) {
 	t.Cleanup(func() { common.MemoryCacheEnabled = originalMemoryCache; InitProviderCache() })
 	channel := Provider{Id: 930001, Type: constant.ChannelTypeDeepSeek, Status: common.ChannelStatusEnabled, Name: "deepseek", Models: "deepseek-flash", Group: "default"}
 	require.NoError(t, channel.Insert())
+	require.NoError(t, channel.AddAbilities(nil)) // Explicit historical helper fixture.
 
 	for _, memoryCache := range []bool{false, true} {
 		common.MemoryCacheEnabled = memoryCache
@@ -132,6 +147,10 @@ func TestModelModifierNamesRouteWithAndWithoutMemoryCache(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, selected, "memory cache %v", memoryCache)
 		assert.Equal(t, "deepseek", selected.Name)
+		assert.True(t, IsProviderEnabledForGroupModel("default", "deepseek-flash@effort:max", channel.Id))
+		assert.False(t, IsProviderEnabledForGroupModel("other", "deepseek-flash", channel.Id))
+		assert.False(t, IsProviderEnabledForGroupModel("default", "deepseek-flash", channel.Id+1))
+		assert.False(t, IsProviderEnabledForGroupModel("default", "deepseek-pro", channel.Id))
 		selected, err = GetRandomSatisfiedProvider("default", "deepseek-pro@effort:max", 0, nil)
 		require.NoError(t, err)
 		assert.Nil(t, selected, "memory cache %v", memoryCache)

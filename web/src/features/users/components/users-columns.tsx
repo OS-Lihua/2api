@@ -32,9 +32,9 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
-import { getCurrencyDisplay } from '@/lib/currency'
-import { formatQuota } from '@/lib/format'
-import { useSystemConfigStore } from '@/stores/system-config-store'
+import { toIntlLocale } from '@/i18n/languages'
+import { formatMoneyAmount } from '@/lib/currency'
+import type { WalletSummary } from '@/lib/wallet-summary'
 
 import {
   USER_STATUS,
@@ -44,15 +44,17 @@ import {
 } from '../constants'
 import type { User } from '../types'
 import { DataTableRowActions } from './data-table-row-actions'
-import { UserQuotaCell } from './user-quota-cell'
+import { UserWalletCell } from './user-quota-cell'
 
-export function useUsersColumns(): ColumnDef<User>[] {
-  const { t } = useTranslation()
-  const currencyConfig = useSystemConfigStore((state) => state.config.currency)
-  const { meta: currency } = getCurrencyDisplay()
-  const quotaUnit = currency.kind === 'tokens' ? t('Tokens') : currency.symbol
-  return useMemo<ColumnDef<User>[]>(
-    () => [
+export function useUsersColumns(wallets?: {
+  visible: boolean
+  byId: Map<number, WalletSummary>
+  loading: boolean
+}): ColumnDef<User>[] {
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
+  return useMemo<ColumnDef<User>[]>(() => {
+    const columns: ColumnDef<User>[] = [
       {
         id: 'select',
         header: ({ table }) => (
@@ -183,14 +185,16 @@ export function useUsersColumns(): ColumnDef<User>[] {
         meta: { mobileBadge: true },
       },
       {
-        id: 'quota',
-        accessorKey: 'quota',
-        header: `${t('Available Balance')} (${quotaUnit})`,
-        cell: ({ row }) => {
-          const user = row.original
-          return <UserQuotaCell remaining={user.quota} used={user.used_quota} />
-        },
-        size: 180,
+        id: 'wallet',
+        header: t('Available Balance'),
+        cell: ({ row }) => (
+          <UserWalletCell
+            wallet={wallets?.byId.get(row.original.id)}
+            loading={!isUserDeleted(row.original) && wallets?.loading}
+          />
+        ),
+        enableSorting: false,
+        size: 220,
         minSize: 160,
         meta: { mobileOrder: 40 },
       },
@@ -240,11 +244,12 @@ export function useUsersColumns(): ColumnDef<User>[] {
         header: t('Invite Info'),
         cell: ({ row }) => {
           const user = row.original
-          const affCount = user.aff_count || 0
-          const affHistoryQuota = user.aff_history_quota || 0
+          const affCount = user.referral_rewards?.invited ?? user.aff_count ?? 0
+          const earned = user.referral_rewards?.earned
+          const hasEarnings = earned !== undefined && BigInt(earned.nanos) > 0n
           const inviterId = user.inviter_id || 0
 
-          if (affCount === 0 && affHistoryQuota === 0 && inviterId === 0) {
+          if (affCount === 0 && !hasEarnings && inviterId === 0) {
             return <span className='text-muted-foreground text-sm'>—</span>
           }
 
@@ -253,12 +258,12 @@ export function useUsersColumns(): ColumnDef<User>[] {
               data-table-text='secondary'
               className='min-w-0 space-y-1 text-xs font-normal'
             >
-              {(affCount > 0 || affHistoryQuota !== 0) && (
+              {(affCount > 0 || hasEarnings) && (
                 <LongText>
                   {t('Invited {{count}} users', { count: affCount })} ·{' '}
                   {t('Earnings')}:{' '}
                   <span className='tabular-nums'>
-                    {formatQuota(affHistoryQuota)}
+                    {formatMoneyAmount(earned, locale)}
                   </span>
                 </LongText>
               )}
@@ -295,9 +300,9 @@ export function useUsersColumns(): ColumnDef<User>[] {
         cell: ({ row }) => <DataTableRowActions row={row} />,
         meta: { pinned: 'right' as const },
       },
-    ],
-    // formatQuota reads the currency configuration from the store.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [t, quotaUnit, currencyConfig]
-  )
+    ]
+    return columns.filter(
+      (column) => column.id !== 'wallet' || wallets?.visible
+    )
+  }, [t, locale, wallets])
 }

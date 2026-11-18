@@ -224,7 +224,6 @@ describe('vendor management', () => {
               id: 7,
               model_name: 'example-*',
               name_rule: 1,
-              matched_count: 24,
               vendor_id: 3,
             },
           ],
@@ -242,7 +241,10 @@ describe('vendor management', () => {
       await screen.findByRole('button', { name: 'example-*' })
     ).toBeVisible()
     expect(screen.getByText('1 linked model records')).toBeVisible()
-    expect(screen.getByRole('cell', { name: '24' })).toBeVisible()
+    expect(
+      screen.queryByRole('columnheader', { name: 'Matched models' })
+    ).not.toBeInTheDocument()
+    expect(screen.getByRole('cell', { name: 'Prefix' })).toBeVisible()
     const user = userEvent.setup()
     await user.type(
       screen.getByPlaceholderText('Filter by model name...'),

@@ -16,90 +16,88 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import i18next from 'i18next'
-import { useState, useEffect, useCallback } from 'react'
+import { useRef, useState } from 'react'
 import { toast } from 'sonner'
 
-import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
-import { getSelf } from '@/lib/api'
-import { handleServerError } from '@/lib/handle-server-error'
+import type { MoneyAmount } from '@/lib/currency'
+import { requireServerSuccess } from '@/lib/server-error-message'
+import { useAuthStore } from '@/stores/auth-store'
+
 import {
-  getServerMessage,
-  requireServerSuccess,
-} from '@/lib/server-error-message'
-
-import { getAffiliateCode, transferAffiliateQuota } from '../api'
+  getAffiliateCode,
+  getReferralRewards,
+  transferAffiliateQuota,
+} from '../api'
 import { generateAffiliateLink } from '../lib'
+import type { AffiliateTransferRequest } from '../types'
 
-// ============================================================================
-// Affiliate Hook
-// ============================================================================
-
-export function useAffiliate() {
-  const [affiliateCode, setAffiliateCode] = useState<string>('')
-  const [affiliateLink, setAffiliateLink] = useState<string>('')
-  const [loading, setLoading] = useState(true)
-  const [transferring, setTransferring] = useState(false)
-  const { copyToClipboard } = useCopyToClipboard()
-
-  // Fetch affiliate code
-  const fetchAffiliateCode = useCallback(async () => {
-    try {
-      setLoading(true)
-      const response = requireServerSuccess(await getAffiliateCode())
-
-      if (response.success && response.data) {
-        setAffiliateCode(response.data)
-        const link = generateAffiliateLink(response.data)
-        setAffiliateLink(link)
+export function useAffiliate(userId: number) {
+  const client = useQueryClient()
+  const attempt = useRef<AffiliateTransferRequest | null>(null)
+  const [transferAttempt, setTransferAttempt] =
+    useState<AffiliateTransferRequest | null>(null)
+  const rewards = useQuery({
+    queryKey: ['referral-rewards', userId],
+    queryFn: ({ signal }) => getReferralRewards(signal),
+    enabled: !!userId,
+    meta: { errorToast: false },
+  })
+  const code = useQuery({
+    queryKey: ['affiliate-code', userId],
+    queryFn: async ({ signal }) => {
+      const response = requireServerSuccess(await getAffiliateCode(signal))
+      if (typeof response.data !== 'string') {
+        throw new Error('Referral rewards unavailable')
       }
-    } catch (error) {
-      handleServerError(error)
-    } finally {
-      setLoading(false)
+      return response.data
+    },
+    enabled: !!userId,
+    meta: { errorToast: false },
+  })
+  const transfer = useMutation({
+    meta: { errorToast: false },
+    mutationFn: async (request: AffiliateTransferRequest) => {
+      if (useAuthStore.getState().auth.user?.id !== userId) return false
+      requireServerSuccess(await transferAffiliateQuota(request))
+      if (useAuthStore.getState().auth.user?.id !== userId) return false
+      toast.success(i18next.t('Transfer successful'))
+      void client.invalidateQueries({ queryKey: ['referral-rewards', userId] })
+      void client.invalidateQueries({ queryKey: ['self-wallet', userId] })
+      return true
+    },
+  })
+
+  async function transferRewards(amount: MoneyAmount): Promise<boolean> {
+    if (useAuthStore.getState().auth.user?.id !== userId) return false
+    if (transfer.isPending) return false
+    if (!attempt.current) {
+      attempt.current = { amount, transfer_id: crypto.randomUUID() }
+      setTransferAttempt(attempt.current)
     }
-  }, [])
-
-  // Copy affiliate link
-  const copyAffiliateLink = useCallback(() => {
-    copyToClipboard(affiliateLink)
-  }, [affiliateLink, copyToClipboard])
-
-  // Transfer affiliate quota to balance
-  const transferQuota = useCallback(async (quota: number): Promise<boolean> => {
-    try {
-      setTransferring(true)
-      const response = await transferAffiliateQuota({ quota })
-
-      if (response.success) {
-        toast.success(
-          getServerMessage(response) || i18next.t('Transfer successful')
-        )
-        await getSelf()
-        return true
-      }
-
-      handleServerError(response, i18next.t('Transfer failed'))
-      return false
-    } catch (_error) {
-      handleServerError(_error, i18next.t('Transfer failed'))
-      return false
-    } finally {
-      setTransferring(false)
+    if (
+      attempt.current.amount.nanos !== amount.nanos ||
+      attempt.current.amount.currency !== amount.currency
+    ) {
+      throw new Error('Retry the pending transfer before changing the amount')
     }
-  }, [])
-
-  useEffect(() => {
-    fetchAffiliateCode()
-  }, [fetchAffiliateCode])
+    const success = await transfer.mutateAsync(attempt.current)
+    if (success) {
+      attempt.current = null
+      setTransferAttempt(null)
+    }
+    return success
+  }
 
   return {
-    affiliateCode,
-    affiliateLink,
-    loading,
-    transferring,
-    copyAffiliateLink,
-    transferQuota,
-    refetch: fetchAffiliateCode,
+    rewards: rewards.data ?? null,
+    affiliateLink: code.data ? generateAffiliateLink(code.data) : '',
+    loading: rewards.isPending || code.isPending,
+    error: rewards.error ?? code.error,
+    transferring: transfer.isPending,
+    transferAttempt,
+    transferRewards,
+    refetch: () => Promise.all([rewards.refetch(), code.refetch()]),
   }
 }

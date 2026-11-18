@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -15,7 +17,11 @@ import (
 )
 
 func TestSubscriptionGroupTransitionsPreserveAuthVersionAndSessions(t *testing.T) {
-	truncateTables(t)
+	usePaymentCompletionDB(t)
+	require.NoError(t, DB.AutoMigrate(&UserSession{}))
+	sqlDB, err := DB.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(4)
 	useUserCacheMiniRedis(t)
 	now := time.Now().Unix()
 	user := User{
@@ -43,14 +49,23 @@ func TestSubscriptionGroupTransitionsPreserveAuthVersionAndSessions(t *testing.T
 		Title:         "Upgraded",
 		DurationUnit:  SubscriptionDurationMonth,
 		DurationValue: 1,
-		TotalAmount:   100,
+		Price:         money.Amount{Nanos: 0, Currency: "USD"},
+		Allowance:     money.Amount{Nanos: 200_000, Currency: "USD"},
+		MoneyVersion:  1,
 		UpgradeGroup:  "pro",
 		Enabled:       true,
 	}
 	require.NoError(t, DB.Create(plan).Error)
 
-	subscription, err := CreateUserSubscriptionFromPlanTx(DB, user.Id, plan, "test")
-	require.NoError(t, err)
+	var subscription *UserSubscription
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockSubscriptionLifecycleUsersTx(tx, []int{user.Id}); err != nil {
+			return err
+		}
+		created, err := CreateUserSubscriptionFromPlanTx(tx, user.Id, plan, "test")
+		subscription = created
+		return err
+	}))
 	require.Equal(t, "default", subscription.PrevUserGroup)
 	require.NoError(t, RefreshUserGroupCache(user.Id))
 
@@ -67,7 +82,11 @@ func TestSubscriptionGroupTransitionsPreserveAuthVersionAndSessions(t *testing.T
 	assert.EqualValues(t, 1, cached.AuthVersion)
 
 	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
-		target, err := downgradeUserGroupForSubscriptionTx(tx, subscription, now+1)
+		locked, err := lockSubscriptionLifecycleTx(tx, subscription.Id)
+		if err != nil {
+			return err
+		}
+		target, err := downgradeUserGroupForSubscriptionTx(tx, locked, now+1)
 		assert.Equal(t, "default", target)
 		return err
 	}))
@@ -80,12 +99,12 @@ func TestSubscriptionGroupTransitionsPreserveAuthVersionAndSessions(t *testing.T
 	cached, err = GetUserCache(user.Id)
 	require.NoError(t, err)
 	assert.Equal(t, "default", cached.Group)
+	assert.EqualValues(t, 1, cached.AuthVersion)
 }
 
 func TestSubscriptionGroupCacheRefreshFailureDoesNotChangeCommittedResult(t *testing.T) {
-	db := UseTestDatabases(t)
-	require.NoError(t, db.AutoMigrate(&User{}, &SubscriptionPlan{}, &UserSubscription{}))
-	sqlDB, err := db.DB()
+	usePaymentCompletionDB(t)
+	sqlDB, err := DB.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(4)
 
@@ -102,7 +121,9 @@ func TestSubscriptionGroupCacheRefreshFailureDoesNotChangeCommittedResult(t *tes
 		Title:         "Cache failure plan",
 		DurationUnit:  SubscriptionDurationMonth,
 		DurationValue: 1,
-		TotalAmount:   100,
+		Price:         money.Amount{Nanos: 0, Currency: "USD"},
+		Allowance:     money.Amount{Nanos: 200_000, Currency: "USD"},
+		MoneyVersion:  1,
 		UpgradeGroup:  "pro",
 		Enabled:       true,
 	}
@@ -110,9 +131,11 @@ func TestSubscriptionGroupCacheRefreshFailureDoesNotChangeCommittedResult(t *tes
 	InvalidateSubscriptionPlanCache(plan.Id)
 
 	oldRedisEnabled, oldRDB := common.RedisEnabled, common.RDB
+	var redisFailures atomic.Int64
 	common.RedisEnabled = true
 	common.RDB = redis.NewClient(&redis.Options{
 		Dialer: func(context.Context, string, string) (net.Conn, error) {
+			redisFailures.Add(1)
 			return nil, errors.New("forced redis failure")
 		},
 		MaxRetries: -1,
@@ -126,6 +149,7 @@ func TestSubscriptionGroupCacheRefreshFailureDoesNotChangeCommittedResult(t *tes
 	require.NoError(t, err)
 	require.NotNil(t, message)
 	assert.Equal(t, "pro", message.Params["group"])
+	assert.Positive(t, redisFailures.Load(), "post-commit cache refresh must exercise the injected Redis failure")
 
 	var updated User
 	require.NoError(t, DB.First(&updated, user.Id).Error)

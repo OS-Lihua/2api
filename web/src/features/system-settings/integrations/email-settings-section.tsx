@@ -35,13 +35,9 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Switch } from '@/components/ui/switch'
-import { getCurrencyDisplay, getCurrencyLabel } from '@/lib/currency'
-import { parseQuotaFromDollars, quotaUnitsToDollars } from '@/lib/format'
 import { handleServerError } from '@/lib/handle-server-error'
 
 import {
-  SettingsControlChildren,
-  SettingsControlGroup,
   SettingsForm,
   SettingsSwitchContent,
   SettingsSwitchItem,
@@ -50,6 +46,7 @@ import { SettingsPageFormActions } from '../components/settings-page-context'
 import { SettingsSection } from '../components/settings-section'
 import { useResetForm } from '../hooks/use-reset-form'
 import { useUpdateOption } from '../hooks/use-update-option'
+import { BalanceReminderSettings } from './balance-reminder-settings'
 import {
   createEmailSchema,
   parseResendSender,
@@ -57,6 +54,7 @@ import {
 } from './email-settings-schema'
 
 type EmailSettingsSectionProps = {
+  reminderConfig: string
   defaultValues: Omit<EmailFormValues, 'ResendSenderName'>
 }
 
@@ -73,6 +71,7 @@ function getSmtpSecurityMode(values: {
 
 export function EmailSettingsSection({
   defaultValues,
+  reminderConfig,
 }: EmailSettingsSectionProps) {
   const { t } = useTranslation()
   const updateOption = useUpdateOption()
@@ -81,9 +80,6 @@ export function EmailSettingsSection({
     () => ({
       ...defaultValues,
       ...parseResendSender(defaultValues.ResendFrom),
-      QuotaRemindThreshold: String(
-        quotaUnitsToDollars(Number(defaultValues.QuotaRemindThreshold) || 0)
-      ),
     }),
     [defaultValues]
   )
@@ -93,16 +89,10 @@ export function EmailSettingsSection({
     defaultValues: initialValues,
   })
 
-  const [provider, smtpSSL, smtpStartTLS, quotaRemindEnabled] = useWatch({
+  const [provider, smtpSSL, smtpStartTLS] = useWatch({
     control: form.control,
-    name: [
-      'EmailProvider',
-      'SMTPSSLEnabled',
-      'SMTPStartTLSEnabled',
-      'QuotaRemindEnabled',
-    ],
+    name: ['EmailProvider', 'SMTPSSLEnabled', 'SMTPStartTLSEnabled'],
   })
-  const tokensOnly = getCurrencyDisplay().meta.kind === 'tokens'
   const isSaving = form.formState.isSubmitting || updateOption.isPending
   useResetForm(form, isSaving ? undefined : initialValues)
 
@@ -197,21 +187,6 @@ export function EmailSettingsSection({
           value: sanitized.SMTPForceAuthLogin,
         })
       }
-    }
-
-    if (values.QuotaRemindEnabled !== defaultValues.QuotaRemindEnabled) {
-      updates.push({
-        key: 'QuotaRemindEnabled',
-        value: values.QuotaRemindEnabled,
-      })
-    }
-
-    const threshold = values.QuotaRemindThreshold.trim()
-    if (threshold !== initialValues.QuotaRemindThreshold) {
-      updates.push({
-        key: 'QuotaRemindThreshold',
-        value: String(parseQuotaFromDollars(Number(threshold || 0))),
-      })
     }
 
     // Save credentials first. A failed configuration write must not activate
@@ -583,61 +558,9 @@ export function EmailSettingsSection({
               />
             </>
           )}
-          <SettingsControlGroup>
-            <FormField
-              control={form.control}
-              name='QuotaRemindEnabled'
-              render={({ field }) => (
-                <SettingsSwitchItem>
-                  <SettingsSwitchContent>
-                    <FormLabel>{t('Low balance reminder')}</FormLabel>
-                    <FormDescription>
-                      {t(
-                        'Remind users through their chosen notification method when their balance drops below the threshold'
-                      )}
-                    </FormDescription>
-                  </SettingsSwitchContent>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                    />
-                  </FormControl>
-                </SettingsSwitchItem>
-              )}
-            />
-
-            {quotaRemindEnabled && (
-              <SettingsControlChildren>
-                <FormField
-                  control={form.control}
-                  name='QuotaRemindThreshold'
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>
-                        {t('Default reminder threshold')} ({getCurrencyLabel()})
-                      </FormLabel>
-                      <FormControl>
-                        <Input
-                          autoComplete='off'
-                          type='number'
-                          min={0}
-                          step={tokensOnly ? 1 : 0.000001}
-                          {...field}
-                          onChange={(event) =>
-                            field.onChange(event.target.value)
-                          }
-                        />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-              </SettingsControlChildren>
-            )}
-          </SettingsControlGroup>
         </SettingsForm>
       </Form>
+      <BalanceReminderSettings config={reminderConfig} />
     </SettingsSection>
   )
 }

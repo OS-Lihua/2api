@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestServeTaskPluginProtocolWaitsForDurableSubmissionBeforeWriting(t *testing.T) {
@@ -147,12 +150,14 @@ func TestServeTaskPluginProtocolDisconnectDuringSubmissionFinishesDurableWithout
 }
 
 func TestServeTaskPluginProtocolDisconnectBeforeDurableBarrierPersistsAndSettlesWithoutRefund(t *testing.T) {
-	events := make([]string, 0, 3)
-	database := setupTaskSubmissionDatabase(t, true, &events)
-	previousLogConsumeEnabled := common.LogConsumeEnabled
-	common.LogConsumeEnabled = false
-	t.Cleanup(func() { common.LogConsumeEnabled = previousLogConsumeEnabled })
-
+	started, release := make(chan struct{}), make(chan struct{})
+	fixture := newNativeGatewayTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		assert.NoError(t, r.Context().Err(), "accepted submission uses the bounded detached context")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"task_id":"upstream_disconnect_persisted"}`)
+	}, canonicalSubmissionPlugin(true))
 	pinned := compilePluginProtocolTestEndpoint(t, "disconnect-before-durable", `
 		export const protocols = {openai_responses: {
 			renderEvents: function() { return {events: [], done: false}; },
@@ -160,173 +165,144 @@ func TestServeTaskPluginProtocolDisconnectBeforeDurableBarrierPersistsAndSettles
 		}};
 	`)
 	c, recorder := newPluginProtocolTestContext(true, true)
+	common.SetContextKey(c, constant.ContextKeyUserId, fixture.user.Id)
+	common.SetContextKey(c, constant.ContextKeyTokenId, fixture.token.Id)
 	requestContext, cancel := context.WithCancel(c.Request.Context())
+	defer cancel()
 	c.Request = c.Request.WithContext(requestContext)
-	billing := &taskSubmissionTestBilling{events: &events}
-	submitStarted := make(chan struct{})
-	releaseSubmit := make(chan struct{})
-	observationStarted := make(chan struct{}, 1)
-	done := make(chan struct{})
-
+	prepared, _ := fixture.request(t)
+	observations := 0
 	deps := pluginProtocolTestDeps()
-	deps.submit = func(c *gin.Context, info *relaycommon.RelayInfo) (*taskSubmissionOutcome, *dto.TaskError) {
-		info.Billing = billing
-		info.TaskRelayInfo.PublicTaskID = "task_disconnect_persisted"
-		info.TaskRelayInfo.LockedChannel = &model.Provider{
-			Id:   1,
-			Type: constant.ChannelTypeTaskPlugin,
-			Name: "disconnect-before-durable",
-		}
-		info.ProviderMeta = &relaycommon.ProviderMeta{
-			ChannelId:   1,
-			ChannelType: constant.ChannelTypeTaskPlugin,
-		}
-		return executeTaskSubmissionWith(c, info, func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
-			close(submitStarted)
-			<-releaseSubmit
-			return &relay.TaskSubmitResult{
-				UpstreamTaskID: "upstream_disconnect_persisted",
-				Platform:       constant.TaskPlatform(pinned.Plugin.Meta.Key),
-				Quota:          7,
-			}, nil
-		})
+	deps.submit = func(submit *gin.Context, _ *relaycommon.RelayInfo) (*taskSubmissionOutcome, *dto.TaskError) {
+		prepared.Request = prepared.Request.WithContext(submit.Request.Context())
+		return executeTaskSubmission(prepared, nil)
 	}
 	deps.loadTask = func(context.Context, int, constant.TaskPlatform, string) (*model.Task, bool, error) {
-		observationStarted <- struct{}{}
+		observations++
 		return nil, false, errors.New("observation must not start after disconnect")
 	}
-
-	go func() {
-		defer close(done)
-		serveTaskPluginProtocol(c, pinned, deps)
-	}()
+	done := make(chan struct{})
+	go func() { defer close(done); serveTaskPluginProtocol(c, pinned, deps) }()
 	select {
-	case <-submitStarted:
-	case <-time.After(2 * time.Second):
+	case <-started:
+	case <-time.After(5 * time.Second):
 		require.FailNow(t, "submission did not start")
 	}
 	cancel()
-	close(releaseSubmit)
+	close(release)
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		require.FailNow(t, "detached submission did not finish")
 	}
-
-	assert.Equal(t, []string{"reserve", "insert", "settle"}, events)
-	assert.Zero(t, billing.refunds)
 	var persisted model.Task
-	require.NoError(t, database.Where("task_id = ?", "task_disconnect_persisted").First(&persisted).Error)
-	assert.Equal(t, model.TaskStatus(model.TaskStatusNotStart), persisted.Status)
-	assert.Equal(t, 7, persisted.Quota)
+	require.NoError(t, fixture.db.Take(&persisted).Error)
+	assert.True(t, persisted.PrivateData.Gateway.Accepted)
 	assert.Equal(t, "upstream_disconnect_persisted", persisted.PrivateData.UpstreamTaskID)
+	assert.Zero(t, persisted.Quota)
+	assertSubmissionWallet(t, fixture, 1500000000)
+	var holds, releases int64
+	require.NoError(t, fixture.db.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&holds).Error)
+	require.NoError(t, fixture.db.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsumeRelease).Count(&releases).Error)
+	assert.EqualValues(t, 1, holds)
+	assert.Zero(t, releases)
+	assert.Zero(t, observations)
 	assert.Empty(t, recorder.Header().Get("Content-Type"))
 	assert.Empty(t, recorder.Body.String())
 	assert.False(t, recorder.Flushed)
-	select {
-	case <-observationStarted:
-		require.FailNow(t, "protocol observation started after client disconnect")
-	default:
-	}
 }
 
 func TestServeTaskPluginProtocolDisconnectDuringTerminalSettlementStopsOnlyObservation(t *testing.T) {
-	pinned := compilePluginProtocolTestEndpoint(t, "disconnect-terminal-settlement", `
-		export const protocols = {openai_responses: {
-			renderEvents: function() { return {events: [], done: false}; },
-			renderFinal: function() { return {}; }
-		}};
-	`)
-
-	previousDB := model.DB
-	previousMemoryCache := common.MemoryCacheEnabled
-	database := model.UseTestDatabases(t)
-	require.NoError(t, database.AutoMigrate(&model.Provider{}, &model.Task{}))
-	common.MemoryCacheEnabled = false
-	t.Cleanup(func() {
-		model.DB = previousDB
-		common.MemoryCacheEnabled = previousMemoryCache
-	})
-	baseURL := "https://example.com"
-	channel := model.Provider{
-		Type:    constant.ChannelTypeTaskPlugin,
-		Name:    "terminal-settlement",
-		Key:     "test-key",
-		BaseURL: &baseURL,
-		Status:  common.ChannelStatusEnabled,
-	}
-	require.NoError(t, database.Create(&channel).Error)
-	task := model.Task{
-		TaskID:    "task_terminal_disconnect",
-		Platform:  constant.TaskPlatform(pinned.Plugin.Meta.Key),
-		UserId:    71,
-		ChannelId: channel.Id,
-		Quota:     10,
-		Status:    model.TaskStatusSubmitted,
-		PrivateData: model.TaskPrivateData{
-			UpstreamTaskID: "upstream-terminal",
-		},
-	}
-	require.NoError(t, database.Create(&task).Error)
-
-	c, recorder := newPluginProtocolTestContext(true, true)
-	requestContext, cancel := context.WithCancel(c.Request.Context())
-	c.Request = c.Request.WithContext(requestContext)
-	billingEvents := make([]string, 0)
-	billing := &taskSubmissionTestBilling{events: &billingEvents}
-	observationStarted := make(chan struct{})
-	settlementStarted := make(chan struct{})
-	releaseSettlement := make(chan struct{})
-	t.Cleanup(func() {
-		select {
-		case <-releaseSettlement:
+	var submitCalls, queryCalls atomic.Int32
+	fixture := newNativeGatewayTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/kling/v1/videos/text2video":
+			submitCalls.Add(1)
+			_, _ = w.Write([]byte(`{"code":0,"data":{"task_id":"upstream-terminal","task_status":"submitted"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/kling/v1/videos/text2video/upstream-terminal":
+			queryCalls.Add(1)
+			_, _ = w.Write([]byte(`{"code":0,"data":{"task_id":"upstream-terminal","task_status":"succeed","task_result":{"videos":[{"id":"video-private","url":"https://cdn.example/video.mp4","duration":"5"}]},"final_unit_deduction":"1"}}`))
 		default:
-			close(releaseSettlement)
+			http.NotFound(w, r)
 		}
 	})
+	outcome, _, _ := fixture.submit(t)
+	task := *outcome.Task
+	require.NotNil(t, task.PrivateData.Gateway)
+	require.True(t, task.PrivateData.Gateway.Accepted)
+	requestID := task.PrivateData.Gateway.Settlement.Request.ID
+	plugin, ok := fixture.generation.Get("kling")
+	require.True(t, ok)
+	pinned := pluginruntime.PinnedEndpoint{Generation: fixture.generation, Plugin: plugin, Protocol: "openai_responses", Model: "kling-v3", MappedModel: "kling-v3"}
+	c, recorder := newPluginProtocolTestContext(true, true)
+	common.SetContextKey(c, constant.ContextKeyUserId, fixture.user.Id)
+	common.SetContextKey(c, constant.ContextKeyTokenId, fixture.token.Id)
+	c.Set("resolved_task_model", "kling-v3")
+	requestContext, cancel := context.WithCancel(c.Request.Context())
+	defer cancel()
+	c.Request = c.Request.WithContext(requestContext)
+	observationStarted := make(chan struct{})
+	settlementStarted := make(chan bool, 1)
+	releaseSettlement := make(chan struct{})
+	var releaseOnce, barrierOnce sync.Once
 	pollingDone := make(chan struct{})
-	adaptor := &terminalSettlementPollingAdaptor{
-		started: settlementStarted,
-		release: releaseSettlement,
-	}
-	previousAdaptorFactory := service.GetTaskAdaptorFunc
-	service.GetTaskAdaptorFunc = func(constant.TaskPlatform) service.TaskPollingAdaptor {
-		return adaptor
-	}
-	t.Cleanup(func() { service.GetTaskAdaptorFunc = previousAdaptorFactory })
-
+	// Stop the real gateway transaction immediately before its wallet charge.
+	// The reservation has already committed; its release and terminal debit are
+	// still uncommitted. Client cancellation must not roll back this transaction.
+	callback := "test:terminal-gateway-settlement"
+	require.NoError(t, fixture.db.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+		entry, ok := tx.Statement.Dest.(*model.LedgerEntry)
+		if !ok || entry.RequestId != requestID || entry.AccountType != model.LedgerAccountUserWallet || entry.Type != model.LedgerEntryCharge {
+			return
+		}
+		barrierOnce.Do(func() {
+			_, transactional := tx.Statement.ConnPool.(gorm.TxCommitter)
+			settlementStarted <- transactional
+			<-releaseSettlement
+		})
+	}))
+	t.Cleanup(func() { require.NoError(t, fixture.db.Callback().Create().Remove(callback)) })
 	deps := pluginProtocolTestDeps()
-	deps.submit = func(_ *gin.Context, info *relaycommon.RelayInfo) (*taskSubmissionOutcome, *dto.TaskError) {
-		info.Billing = billing
-		return &taskSubmissionOutcome{
-			Result:    &relay.TaskSubmitResult{},
-			Task:      &task,
-			RelayInfo: info,
-		}, nil
+	deps.submit = func(*gin.Context, *relaycommon.RelayInfo) (*taskSubmissionOutcome, *dto.TaskError) {
+		return outcome, nil
 	}
-	deps.loadTask = func(ctx context.Context, _ int, _ constant.TaskPlatform, _ string) (*model.Task, bool, error) {
+	deps.loadTask = func(ctx context.Context, userID int, platform constant.TaskPlatform, taskID string) (*model.Task, bool, error) {
+		assert.Equal(t, fixture.user.Id, userID)
+		assert.Equal(t, task.Platform, platform)
+		assert.Equal(t, task.TaskID, taskID)
 		close(observationStarted)
 		<-ctx.Done()
 		return nil, false, ctx.Err()
 	}
 	done := make(chan struct{})
-
 	go func() {
-		<-observationStarted
 		defer close(pollingDone)
-		service.DispatchPlatformUpdate(
-			context.Background(),
-			task.Platform,
-			map[int][]string{channel.Id: {"upstream-terminal"}},
-			map[string]*model.Task{"upstream-terminal": &task},
-		)
+		select {
+		case <-observationStarted:
+		case <-t.Context().Done():
+			return
+		}
+		service.DispatchPlatformUpdate(context.Background(), task.Platform, map[int][]string{fixture.provider.Id: {"upstream-terminal"}}, map[string]*model.Task{"upstream-terminal": &task})
 	}()
-	go func() {
-		defer close(done)
-		serveTaskPluginProtocol(c, pinned, deps)
-	}()
+	go func() { defer close(done); serveTaskPluginProtocol(c, pinned, deps) }()
+	t.Cleanup(func() {
+		cancel()
+		releaseOnce.Do(func() { close(releaseSettlement) })
+		select {
+		case <-pollingDone:
+		case <-time.After(2 * time.Second):
+			t.Error("settlement worker did not stop")
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("observation worker did not stop")
+		}
+	})
 	select {
-	case <-settlementStarted:
+	case transactional := <-settlementStarted:
+		require.True(t, transactional, "barrier must hold an actual gateway ledger transaction")
 	case <-time.After(2 * time.Second):
 		require.FailNow(t, "terminal settlement did not start")
 	}
@@ -336,52 +312,32 @@ func TestServeTaskPluginProtocolDisconnectDuringTerminalSettlementStopsOnlyObser
 	case <-time.After(2 * time.Second):
 		require.FailNow(t, "protocol observation did not stop after terminal disconnect")
 	}
+	assert.Equal(t, "text/event-stream", recorder.Header().Get("Content-Type"))
 	assert.Equal(t, []string{"response.created"}, pluginProtocolTestSSEEventTypes(recorder.Body.String()))
-	assert.Zero(t, billing.refunds)
-
-	close(releaseSettlement)
+	assert.NotContains(t, recorder.Body.String(), "upstream-terminal")
+	select {
+	case <-pollingDone:
+		t.Fatal("settlement bypassed its transaction barrier")
+	default:
+	}
+	var entries []model.LedgerEntry
+	require.NoError(t, fixture.db.Where("request_id = ?", requestID).Find(&entries).Error)
+	require.Len(t, entries, 1, "disconnect must not refund the committed reservation")
+	assert.Equal(t, model.LedgerEntryPreConsume, entries[0].Type)
+	assert.Equal(t, int64(-500_000_000), entries[0].Amount.Nanos)
+	releaseOnce.Do(func() { close(releaseSettlement) })
 	select {
 	case <-pollingDone:
 	case <-time.After(2 * time.Second):
 		require.FailNow(t, "terminal settlement was canceled with the client observation")
 	}
-
 	var persisted model.Task
-	require.NoError(t, database.Where("task_id = ?", task.TaskID).First(&persisted).Error)
+	require.NoError(t, fixture.db.Where("task_id = ?", task.TaskID).First(&persisted).Error)
 	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), persisted.Status)
 	assert.Equal(t, "100%", persisted.Progress)
-	assert.Equal(t, 10, persisted.Quota)
-	assert.True(t, adaptor.completed)
-	assert.Empty(t, billingEvents)
-}
-
-type terminalSettlementPollingAdaptor struct {
-	started   chan struct{}
-	release   chan struct{}
-	completed bool
-}
-
-func (a *terminalSettlementPollingAdaptor) Init(*relaycommon.RelayInfo) {}
-
-func (a *terminalSettlementPollingAdaptor) FetchTask(string, string, *model.Task, string) (*http.Response, error) {
-	return &http.Response{
-		StatusCode: http.StatusOK,
-		Body:       io.NopCloser(strings.NewReader(`{}`)),
-	}, nil
-}
-
-func (a *terminalSettlementPollingAdaptor) ParseTaskResult(*model.Task, *http.Response, []byte) (*relaycommon.TaskInfo, error) {
-	return &relaycommon.TaskInfo{
-		Status:   model.TaskStatusSuccess,
-		Progress: "100%",
-	}, nil
-}
-
-func (a *terminalSettlementPollingAdaptor) AdjustBillingOnComplete(task *model.Task, _ *relaycommon.TaskInfo) int {
-	close(a.started)
-	<-a.release
-	a.completed = true
-	return task.Quota
+	assert.Equal(t, int32(1), submitCalls.Load())
+	assert.Equal(t, int32(1), queryCalls.Load())
+	assertNativeTaskSettlement(t, fixture, &persisted)
 }
 
 func TestPluginProtocolBridgeBoundsDatabaseReadBelowHeartbeat(t *testing.T) {
@@ -1790,76 +1746,60 @@ func TestServeTaskPluginImageProtocolSubmissionErrorUsesOpenAIEnvelope(t *testin
 // cancel that call or refund a durable result: the task row, its settlement
 // and its consume log stay, and nothing is written to the closed connection.
 func TestServeTaskPluginImageProtocolDisconnectDuringSubmissionKeepsDurableSettlement(t *testing.T) {
-	events := make([]string, 0, 3)
-	database := setupTaskSubmissionDatabase(t, true, &events)
-	previousLogConsumeEnabled := common.LogConsumeEnabled
-	common.LogConsumeEnabled = false
-	t.Cleanup(func() { common.LogConsumeEnabled = previousLogConsumeEnabled })
-
+	started, release := make(chan struct{}), make(chan struct{})
+	fixture := newNativeGatewayTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		assert.NoError(t, r.Context().Err(), "accepted submission uses the bounded detached context")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"task_id":"task_image_disconnect","status":"SUCCESS","usage":{"units":2},"images":["https://cdn.example/1.png"]}`)
+	}, canonicalSubmissionPlugin(false))
 	pinned := imageProtocolTestEndpoint(t)
 	c, recorder := newImageProtocolTestContext("")
+	common.SetContextKey(c, constant.ContextKeyUserId, fixture.user.Id)
+	common.SetContextKey(c, constant.ContextKeyTokenId, fixture.token.Id)
 	c.Set(pluginruntime.ContextKeyPinnedEndpoint, pinned)
 	requestContext, cancel := context.WithCancel(c.Request.Context())
+	defer cancel()
 	c.Request = c.Request.WithContext(requestContext)
-	billing := &taskSubmissionTestBilling{events: &events}
-	submitStarted := make(chan struct{})
-	releaseSubmit := make(chan struct{})
-	done := make(chan struct{})
+	prepared, _ := fixture.request(t)
 	polls := 0
-
 	deps := pluginProtocolTestDeps()
-	deps.pollTask = func(context.Context, *model.Task) error {
-		polls++
-		return nil
+	deps.pollTask = func(context.Context, *model.Task) error { polls++; return nil }
+	deps.submit = func(submit *gin.Context, _ *relaycommon.RelayInfo) (*taskSubmissionOutcome, *dto.TaskError) {
+		prepared.Request = prepared.Request.WithContext(submit.Request.Context())
+		return executeTaskSubmission(prepared, nil)
 	}
-	deps.submit = func(c *gin.Context, info *relaycommon.RelayInfo) (*taskSubmissionOutcome, *dto.TaskError) {
-		info.Billing = billing
-		info.TaskRelayInfo.PublicTaskID = "task_image_disconnect"
-		info.TaskRelayInfo.LockedChannel = &model.Provider{Id: 1, Type: constant.ChannelTypeTaskPlugin, Name: "image-bridge"}
-		info.ProviderMeta = &relaycommon.ProviderMeta{ChannelId: 1, ChannelType: constant.ChannelTypeTaskPlugin}
-		return executeTaskSubmissionWith(c, info, func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
-			close(submitStarted)
-			<-releaseSubmit
-			// The upstream call runs on the request context: a context that
-			// followed the client would abort here and refund.
-			if requestErr := c.Request.Context().Err(); requestErr != nil {
-				return nil, service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
-			}
-			return &relay.TaskSubmitResult{
-				UpstreamTaskID: "task_image_disconnect",
-				Platform:       constant.TaskPlatform(pinned.Plugin.Meta.Key),
-				Quota:          7,
-				TaskData:       []byte(`{"images":["https://cdn.example/1.png"]}`),
-				Immediate:      &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, Progress: "100%"},
-			}, nil
-		})
-	}
-
-	go func() {
-		defer close(done)
-		serveTaskPluginImageProtocol(c, pinned, deps)
-	}()
+	done := make(chan struct{})
+	go func() { defer close(done); serveTaskPluginImageProtocol(c, pinned, deps) }()
 	select {
-	case <-submitStarted:
-	case <-time.After(2 * time.Second):
+	case <-started:
+	case <-time.After(5 * time.Second):
 		require.FailNow(t, "submission did not start")
 	}
 	cancel()
-	close(releaseSubmit)
+	close(release)
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		require.FailNow(t, "detached submission did not finish")
 	}
-
-	assert.Equal(t, []string{"reserve", "insert", "settle"}, events)
-	assert.Zero(t, billing.refunds)
 	var persisted model.Task
-	require.NoError(t, database.Where("task_id = ?", "task_image_disconnect").First(&persisted).Error)
+	require.NoError(t, fixture.db.Take(&persisted).Error)
+	assert.True(t, persisted.PrivateData.Gateway.Accepted)
 	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), persisted.Status)
-	assert.Equal(t, 7, persisted.Quota)
-	assert.True(t, persisted.PrivateData.ResultDiscarded, "the inline image result is not retained after the barrier")
-	assert.Zero(t, polls, "an immediate result is never polled")
+	assert.Zero(t, persisted.Quota)
+	assert.True(t, persisted.PrivateData.ResultDiscarded)
+	assertSubmissionWallet(t, fixture, 1750000000)
+	requestID := persisted.PrivateData.Gateway.Settlement.Request.ID
+	var entries, replay []model.LedgerEntry
+	require.NoError(t, fixture.db.Where("request_id = ?", requestID).Order("id").Find(&entries).Error)
+	require.Len(t, entries, 5)
+	_, err := model.SettleGateway(requestID)
+	require.NoError(t, err)
+	require.NoError(t, fixture.db.Where("request_id = ?", requestID).Order("id").Find(&replay).Error)
+	assert.Equal(t, entries, replay)
+	assert.Zero(t, polls)
 	assert.False(t, c.Writer.Written())
 	assert.Empty(t, recorder.Body.String())
 }

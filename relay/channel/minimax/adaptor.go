@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel"
@@ -54,9 +56,25 @@ func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayIn
 		OutputFormat: outputFormat,
 	}
 
+	if info.ResponseFacts != nil {
+		minimaxRequest.Model = info.UpstreamModelName
+		minimaxRequest.OutputFormat = "hex"
+		minimaxRequest.AudioSetting.SampleRate = 24000
+		minimaxRequest.AudioSetting.Channel = 1
+		if minimaxRequest.AudioSetting.Format == "" {
+			minimaxRequest.AudioSetting.Format = "mp3"
+		}
+	}
+
 	// 同步扩展字段的厂商自定义metadata
 	if len(request.Metadata) > 0 {
-		if err := common.Unmarshal(request.Metadata, &minimaxRequest); err != nil {
+		var err error
+		if info.ResponseFacts != nil {
+			err = common.DecodeJsonStrict(bytes.NewReader(request.Metadata), &minimaxRequest)
+		} else {
+			err = common.Unmarshal(request.Metadata, &minimaxRequest)
+		}
+		if err != nil {
 			return nil, fmt.Errorf("error unmarshalling metadata to minimax request: %w", err)
 		}
 	}
@@ -74,6 +92,9 @@ func (a *Protocol) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayIn
 	// Debug: log the request structure
 	// fmt.Printf("MiniMax TTS Request: %s\n", string(jsonData))
 
+	if info.ResponseFacts != nil {
+		return speechRequestBody{bytes.NewReader(jsonData)}, nil
+	}
 	return bytes.NewReader(jsonData), nil
 }
 
@@ -81,7 +102,57 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 	if info.RelayMode != constant.RelayModeImagesGenerations {
 		return nil, fmt.Errorf("unsupported image relay mode: %d", info.RelayMode)
 	}
-	return oaiImage2MiniMaxImageRequest(request), nil
+	converted := oaiImage2MiniMaxImageRequest(request)
+	if info.ResponseFacts != nil {
+		if converted.AigcWatermark != nil {
+			converted.AigcWatermark = new(*converted.AigcWatermark)
+		}
+		if request.Size != "" && request.Size != "auto" {
+			widthText, heightText, found := strings.Cut(request.Size, "x")
+			width, widthErr := strconv.Atoi(widthText)
+			height, heightErr := strconv.Atoi(heightText)
+			if !found || widthErr != nil || heightErr != nil {
+				return nil, types.NewMediaParameterError("size", "media_format_unsupported")
+			}
+			if err := validateMiniMaxDimensions(width, height); err != nil {
+				return nil, err
+			}
+			converted.Width, converted.Height, converted.AspectRatio = &width, &height, ""
+		}
+		if len(request.ExtraFields) > 0 {
+			var extra map[string]common.RawMessage
+			if err := common.Unmarshal(request.ExtraFields, &extra); err != nil {
+				return nil, types.NewMediaParameterError("request", "media_control_unsupported")
+			}
+			parameters := map[string]any{
+				"model": &converted.Model, "prompt": &converted.Prompt, "n": &converted.N,
+				"width": &converted.Width, "height": &converted.Height, "seed": &converted.Seed,
+				"aspect_ratio": &converted.AspectRatio, "response_format": &converted.ResponseFormat,
+				"prompt_optimizer": &converted.PromptOptimizer, "aigc_watermark": &converted.AigcWatermark,
+			}
+			for field, raw := range extra {
+				target, ok := parameters[field]
+				if !ok {
+					if field == "quality" {
+						return nil, types.NewMediaParameterError("quality", "media_control_unsupported")
+					}
+					return nil, types.NewMediaParameterError("request", "media_parameters_unrepresentable")
+				}
+				if err := common.Unmarshal(raw, target); err != nil {
+					return nil, types.NewMediaParameterError(field, "media_control_unsupported")
+				}
+			}
+			if (extra["width"] != nil || extra["height"] != nil) && extra["aspect_ratio"] == nil && request.Extra["aspect_ratio"] == nil {
+				converted.AspectRatio = ""
+			}
+		}
+		if raw, exists := request.Extra["seed"]; exists {
+			if err := common.Unmarshal(raw, &converted.Seed); err != nil {
+				return nil, types.NewMediaParameterError("seed", "media_control_unsupported")
+			}
+		}
+	}
+	return converted, nil
 }
 
 func (a *Protocol) Init(info *relaycommon.RelayInfo) {

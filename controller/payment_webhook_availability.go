@@ -25,7 +25,7 @@ func isStripeWebhookConfigured() bool {
 }
 
 func isStripeWebhookEnabled() bool {
-	return isStripeTopUpEnabled()
+	return isStripeWebhookConfigured()
 }
 
 func isCreemTopUpEnabled() bool {
@@ -43,7 +43,7 @@ func isCreemWebhookConfigured() bool {
 }
 
 func isCreemWebhookEnabled() bool {
-	return isCreemTopUpEnabled() && isCreemWebhookConfigured()
+	return isCreemWebhookConfigured()
 }
 
 func isWaffoTopUpEnabled() bool {
@@ -70,7 +70,7 @@ func isWaffoWebhookConfigured() bool {
 }
 
 func isWaffoWebhookEnabled() bool {
-	return isWaffoTopUpEnabled()
+	return isWaffoWebhookConfigured()
 }
 
 func isWaffoPancakeTopUpEnabled() bool {
@@ -85,12 +85,11 @@ func isWaffoPancakeTopUpEnabled() bool {
 }
 
 func isWaffoPancakeWebhookConfigured() bool {
-	return isWaffoPancakeTopUpEnabled()
+	// Verification keys are bundled; accepted orders carry their store binding.
+	return true
 }
 
-func isWaffoPancakeWebhookEnabled() bool {
-	return isWaffoPancakeTopUpEnabled()
-}
+func isWaffoPancakeWebhookEnabled() bool { return isWaffoPancakeWebhookConfigured() }
 
 func isEpayTopUpEnabled() bool {
 	if !isPaymentComplianceConfirmed() {
@@ -106,5 +105,5 @@ func isEpayWebhookConfigured() bool {
 }
 
 func isEpayWebhookEnabled() bool {
-	return isEpayTopUpEnabled()
+	return isEpayWebhookConfigured()
 }

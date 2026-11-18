@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/capability"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -20,6 +21,90 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestGatewayMediaMultipliersBoundNestedAndMultipartValues(t *testing.T) {
+	for _, tc := range []struct {
+		body    string
+		invalid bool
+	}{
+		{`{"n":0,"quality":"high","size":"1536x1024"}`, false},
+		{`{"n":128,"parameters":{"n":1},"metadata":{"duration":3600}}`, false},
+		{`{"n":18446744073686646784}`, true},
+		{`{"parameters":{"n":129}}`, true},
+		{`{"metadata":{"batch_size":129}}`, true},
+		{`{"duration":-1}`, true},
+		{`{"duration":1e200}`, true},
+		{`{"metadata":{"max_new_tokens":18446744073686646784}}`, true},
+		{`{"speed":0}`, true},
+		{`{"resolution":"999999999999999x1024"}`, true},
+		{`{"quality":"unbounded"}`, true},
+		{`{"parameters":{"sampleCount":129}}`, true},
+		{`{"input":{"width":99999999999999}}`, true},
+		{`{"aspect_ratio":"999999:1"}`, true},
+		{`{"generationConfig":{"maxOutputTokens":18446744073686646784}}`, true},
+	} {
+		t.Run(tc.body, func(t *testing.T) {
+			err := ValidateGatewayMediaMultipliers([]byte(tc.body))
+			if tc.invalid {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestGatewayMediaMultipartValidatesEveryMultiplierBeforeParsing(t *testing.T) {
+	for _, tc := range []struct {
+		name, value string
+		invalid     bool
+	}{
+		{"n", "0", false},
+		{"n", "129", true},
+		{"parameters", `{"n":18446744073686646784}`, true},
+		{"metadata", `{"duration":-1}`, true},
+	} {
+		t.Run(tc.name+tc.value, func(t *testing.T) {
+			var body bytes.Buffer
+			writer := multipart.NewWriter(&body)
+			require.NoError(t, writer.WriteField("model", "image-model"))
+			require.NoError(t, writer.WriteField("prompt", "edit"))
+			require.NoError(t, writer.WriteField(tc.name, tc.value))
+			part, err := writer.CreateFormFile("image", "image.png")
+			require.NoError(t, err)
+			_, err = part.Write([]byte("image"))
+			require.NoError(t, err)
+			require.NoError(t, writer.Close())
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
+			c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+			parsed, err := ParseGatewayMediaRequest(c)
+			if tc.invalid {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			request := parsed.Request.(*dto.ImageRequest)
+			require.NotNil(t, request.N)
+			assert.Equal(t, uint(1), *request.N)
+			assert.Equal(t, []string{"1"}, c.Request.MultipartForm.Value["n"])
+		})
+	}
+}
+
+func TestGatewayMediaMultipliersRespectModelAndChannelLimits(t *testing.T) {
+	images, output, seconds := int64(2), int64(16), int64(30)
+	limits := capability.Limits{MaxImages: &images, MaxOutputTokens: &output, MaxDurationSeconds: &seconds}
+	for _, body := range []string{
+		`{"n":3}`, `{"parameters":{"sampleCount":3}}`, `{"max_new_tokens":17}`, `{"generationConfig":{"maxOutputTokens":17}}`, `{"metadata":{"duration":31}}`,
+	} {
+		require.Error(t, ValidateGatewayMediaMultipliers([]byte(body), limits), body)
+	}
+	require.NoError(t, ValidateGatewayMediaMultipliers([]byte(`{"n":2,"max_new_tokens":0,"duration":30}`), limits))
+	zero := int64(0)
+	limits.MaxOutputTokens = &zero
+	require.Error(t, ValidateGatewayMediaMultipliers([]byte(`{"max_new_tokens":1}`), limits))
+}
 
 func TestLegacyDalleValidationAndPricesRemainCompatible(t *testing.T) {
 	for _, tc := range []struct {

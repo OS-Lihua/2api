@@ -57,6 +57,25 @@ async function renderUsers(initialEntry = '/users/') {
     if (url === '/api/group/') {
       return { data: { success: true, data: ['default', 'premium'] } }
     }
+    if (url === '/api/admin/v1/user-wallets') {
+      return {
+        data: {
+          success: true,
+          data: {
+            items: [
+              {
+                user_id: 2,
+                available: { nanos: '0', currency: 'USD' },
+                outstanding: { nanos: '0', currency: 'USD' },
+                consumed: { nanos: '0', currency: 'USD' },
+                sale_pending: false,
+                requests_paused: false,
+              },
+            ],
+          },
+        },
+      }
+    }
     return {
       data: {
         success: true,
@@ -126,21 +145,41 @@ it('searches only the selected user group and lists all users again after the fi
   const { get, router } = await renderUsers()
   expect(get).toHaveBeenCalledWith('/api/user/', {
     params: { p: 1, page_size: 20 },
+    signal: expect.any(AbortSignal),
   })
 
   await user.click(getGroupFilterTrigger())
   await user.click(await screen.findByRole('option', { name: /^premium/ }))
 
-  await waitFor(() => expect(get).toHaveBeenLastCalledWith(premiumSearchUrl))
+  await waitFor(() =>
+    expect(
+      [...get.mock.calls]
+        .reverse()
+        .find(([url]) => String(url).startsWith('/api/user/'))
+    ).toEqual([
+      premiumSearchUrl,
+      {
+        signal: expect.any(AbortSignal),
+      },
+    ])
+  )
   expect(router.state.location.search).toMatchObject({ group: ['premium'] })
   expect(getGroupFilterTrigger()).toHaveTextContent('premium')
 
   await user.click(screen.getByRole('option', { name: 'Clear filters' }))
 
   await waitFor(() =>
-    expect(get).toHaveBeenLastCalledWith('/api/user/', {
-      params: { p: 1, page_size: 20 },
-    })
+    expect(
+      [...get.mock.calls]
+        .reverse()
+        .find(([url]) => String(url).startsWith('/api/user/'))
+    ).toEqual([
+      '/api/user/',
+      {
+        params: { p: 1, page_size: 20 },
+        signal: expect.any(AbortSignal),
+      },
+    ])
   )
   expect(router.state.location.search).not.toHaveProperty('group')
 })
@@ -148,7 +187,9 @@ it('searches only the selected user group and lists all users again after the fi
 it('restores the user group filter from the page URL on load', async () => {
   const { get } = await renderUsers('/users/?group=%5B%22premium%22%5D')
 
-  expect(get).toHaveBeenCalledWith(premiumSearchUrl)
+  expect(get).toHaveBeenCalledWith(premiumSearchUrl, {
+    signal: expect.any(AbortSignal),
+  })
   expect(get).not.toHaveBeenCalledWith('/api/user/', expect.anything())
   expect(getGroupFilterTrigger()).toHaveTextContent('premium')
 })

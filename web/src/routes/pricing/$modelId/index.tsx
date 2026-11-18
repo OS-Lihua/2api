@@ -19,39 +19,29 @@ For commercial licensing, please contact support@quantumnous.com
 import { createFileRoute, redirect } from '@tanstack/react-router'
 import z from 'zod'
 
-import { ModelDetails } from '@/features/pricing/components/model-details'
+import { OfferingDetails } from '@/features/pricing'
 import { getModuleAccessForGuard } from '@/lib/nav-modules'
-import { useAuthStore } from '@/stores/auth-store'
 
 const modelDetailsSearchSchema = z.object({
-  search: z.string().optional(),
-  sort: z.string().optional(),
-  vendor: z.string().optional(),
+  search: z.string().default(''),
+  sort: z.string().default('name'),
+  vendor: z.string().default('all'),
   group: z.string().optional(),
   quotaType: z.string().optional(),
   endpointType: z.string().optional(),
-  tag: z.string().optional(),
-  tokenUnit: z.enum(['M', 'K']).optional(),
-  view: z.enum(['card', 'table']).optional().catch(undefined),
+  tag: z.string().default('all'),
+  tokenUnit: z.enum(['M', 'K']).default('M'),
+  view: z.enum(['card', 'table']).default('card').catch('card'),
   rechargePrice: z.boolean().optional(),
 })
 
 export const Route = createFileRoute('/pricing/$modelId/')({
   validateSearch: modelDetailsSearchSchema,
-  beforeLoad: async ({ context, location }) => {
+  beforeLoad: async ({ context }) => {
     const access = await getModuleAccessForGuard(context.queryClient, 'pricing')
     if (!access.enabled) {
       throw redirect({ to: '/' })
     }
-    if (access.requireAuth) {
-      const { auth } = useAuthStore.getState()
-      if (!auth.user) {
-        throw redirect({
-          to: '/sign-in',
-          search: { redirect: location.href },
-        })
-      }
-    }
   },
-  component: ModelDetails,
+  component: OfferingDetails,
 })

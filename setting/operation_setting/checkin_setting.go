@@ -1,37 +1,124 @@
 package operation_setting
 
-import "github.com/QuantumNous/new-api/setting/config"
+import (
+	"bytes"
+	"strings"
 
-// CheckinSetting 签到功能配置
-type CheckinSetting struct {
-	Enabled  bool `json:"enabled"`   // 是否启用签到功能
-	MinQuota int  `json:"min_quota"` // 签到最小额度奖励
-	MaxQuota int  `json:"max_quota"` // 签到最大额度奖励
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/money"
+	"github.com/QuantumNous/new-api/setting/config"
+)
+
+// CheckinRewardRange retains the original denomination of both inclusive bounds.
+type CheckinRewardRange struct {
+	Min money.Amount `json:"min"`
+	Max money.Amount `json:"max"`
 }
 
-// 默认配置
-var checkinSetting = CheckinSetting{
-	Enabled:  false, // 默认关闭
-	MinQuota: 1000,  // 默认最小额度 1000 (约 0.002 USD)
-	MaxQuota: 10000, // 默认最大额度 10000 (约 0.02 USD)
+func (r CheckinRewardRange) Validate() error {
+	if _, err := money.ParseCurrency(string(r.Min.Currency)); err != nil {
+		return common.NewMessage("Invalid amount")
+	}
+	if r.Min.Currency != r.Max.Currency || r.Min.Nanos < 0 || r.Max.Nanos < r.Min.Nanos {
+		return common.NewMessage("Invalid amount")
+	}
+	return nil
+}
+
+// UnmarshalJSON requires complete bounds, string nanos and no unknown fields.
+// Decode into fresh values so a partial or invalid range cannot mutate settings.
+func (r *CheckinRewardRange) UnmarshalJSON(data []byte) error {
+	type bound struct {
+		Nanos    *int64         `json:"nanos,string"`
+		Currency money.Currency `json:"currency"`
+	}
+	var input struct {
+		Min *bound `json:"min"`
+		Max *bound `json:"max"`
+	}
+	if err := common.DecodeJsonStrict(bytes.NewReader(data), &input); err != nil {
+		return common.NewMessage("Invalid amount")
+	}
+	if input.Min == nil || input.Max == nil || input.Min.Nanos == nil || input.Max.Nanos == nil {
+		return common.NewMessage("Invalid amount")
+	}
+	next := CheckinRewardRange{
+		Min: money.Amount{Nanos: *input.Min.Nanos, Currency: input.Min.Currency},
+		Max: money.Amount{Nanos: *input.Max.Nanos, Currency: input.Max.Currency},
+	}
+	if err := next.Validate(); err != nil {
+		return err
+	}
+	*r = next
+	return nil
+}
+
+// CheckinSetting publishes both bounds together through one reward_range option.
+type CheckinSetting struct {
+	Enabled     bool               `json:"enabled"`
+	RewardRange CheckinRewardRange `json:"reward_range"`
 }
 
 func init() {
-	// 注册到全局配置管理器
-	config.GlobalConfig.Register("checkin_setting", &checkinSetting)
+	config.GlobalConfig.Register("checkin_setting", &CheckinSetting{
+		RewardRange: CheckinRewardRange{
+			Min: money.Amount{Nanos: 2_000_000, Currency: "USD"},
+			Max: money.Amount{Nanos: 20_000_000, Currency: "USD"},
+		},
+	})
 }
 
-// GetCheckinSetting 获取签到配置
+// GetCheckinSetting returns a snapshot. Production updates replace the registered
+// pointer, so a request keeps the same enabled flag and complete reward range.
 func GetCheckinSetting() *CheckinSetting {
-	return &checkinSetting
+	current := config.GlobalConfig.Get("checkin_setting").(*CheckinSetting)
+	snapshot := *current
+	return &snapshot
 }
 
-// IsCheckinEnabled 是否启用签到功能
 func IsCheckinEnabled() bool {
-	return checkinSetting.Enabled
+	return GetCheckinSetting().Enabled
 }
 
-// GetCheckinQuotaRange 获取签到额度范围
-func GetCheckinQuotaRange() (min, max int) {
-	return checkinSetting.MinQuota, checkinSetting.MaxQuota
+func IsCheckinOption(key string) bool {
+	return key == "checkin_setting" || strings.HasPrefix(key, "checkin_setting.")
+}
+
+func ValidateCheckinOption(key, value string) error {
+	if !IsCheckinOption(key) {
+		return nil
+	}
+	switch key {
+	case "checkin_setting.enabled":
+		if value != "true" && value != "false" {
+			return common.NewMessage("Invalid parameters")
+		}
+		return nil
+	case "checkin_setting.reward_range":
+		var rewardRange CheckinRewardRange
+		return common.DecodeJsonStrict(strings.NewReader(value), &rewardRange)
+	default:
+		return common.NewMessage("Invalid parameters")
+	}
+}
+
+// ApplyCheckinOption is serialized by the option map lock. Validated snapshots
+// bypass the generic configuration updater's permissive in-place reflection.
+func ApplyCheckinOption(key, value string) error {
+	if err := ValidateCheckinOption(key, value); err != nil {
+		return err
+	}
+	next := GetCheckinSetting()
+	switch key {
+	case "checkin_setting.enabled":
+		next.Enabled = value == "true"
+	case "checkin_setting.reward_range":
+		if err := common.DecodeJsonStrict(strings.NewReader(value), &next.RewardRange); err != nil {
+			return err
+		}
+	default:
+		return common.NewMessage("Invalid parameters")
+	}
+	config.GlobalConfig.Register("checkin_setting", next)
+	return nil
 }

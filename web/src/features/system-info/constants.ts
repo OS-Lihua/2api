@@ -25,4 +25,5 @@ export const SYSTEM_TASK_TYPE_LABEL: Record<string, string> = {
   midjourney_poll: 'Drawing task polling',
   async_task_poll: 'Async task polling',
   wallet_reconcile: 'Wallet reconciliation',
+  balance_reminder: 'Balance reminders',
 }

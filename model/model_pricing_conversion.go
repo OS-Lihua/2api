@@ -1,25 +1,33 @@
 package model
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"maps"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/pluginhost"
+	"github.com/QuantumNous/new-api/plugins"
+	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	hostreasoning "github.com/QuantumNous/new-api/setting/reasoning"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/shopspring/decimal"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
-// ModelPricingConversion is a preview only. Saving still requires a versioned
-// ModelPricingChange through the existing pricing transaction.
+// ModelPricingConversion describes an offline conversion preview. Persisting the
+// result requires an immutable PriceVersion through the migration transaction.
 type ModelPricingConversion struct {
 	ModelPricingDescription
 	Expression        string `json:"expression,omitempty"`
@@ -192,11 +200,275 @@ func declaredEndpointNames(raw string) ([]string, error) {
 	return nil, errors.New("invalid endpoints")
 }
 
-func PreviewModelPricingConversion(name string, draft PricingValues) (*ModelPricingConversion, error) {
+// LegacyPricingConversionSource is an offline-only snapshot. Its private fields
+// cannot be replaced by callers with an empty candidate set. It contains no
+// credentials, request bodies, headers, URLs, or complete Provider settings.
+// The caller owns the transaction/source snapshot; no conversion reads DB or
+// rebuilds/publishes the serving process's Ability or task-alias caches.
+type LegacyPricingConversionSource struct {
+	providers  []legacyPricingProvider
+	abilities  []legacyPricingAbility
+	metadata   []Model
+	pricing    map[string]map[string]any
+	generation *jsplugin.RoutingGeneration
+	aliases    map[string]TaskAliasTarget
+	// Known declarations retain disabled/replaced identities for refusal only;
+	// they never authorize a Channel or provide a price validation schema.
+	declarations []*jsplugin.LoadedPlugin
+	selfUse      bool
+}
+
+type legacyPricingProvider struct {
+	ID                   int
+	Type                 int
+	Status               int
+	Models               string
+	ModelMapping         *string
+	TaskPluginKey        string
+	TaskExtendPluginKeys string
+}
+
+type legacyPricingAbility struct {
+	Model     string
+	ChannelID int
+	Enabled   bool
+}
+
+// loadLegacyMigrationPricingSource reproduces the source deployment's plugin
+// layer on an isolated registry. No runtime incumbent can stand in for source
+// rows: unreadable, ambiguous, invalid or conflicting active sources fail closed.
+func loadLegacyMigrationPricingSource(tx *gorm.DB) (*LegacyPricingConversionSource, error) {
+	tx = tx.Session(&gorm.Session{Logger: logger.Discard})
+	registry, err := plugins.NewFactoryRegistry()
+	if err != nil {
+		return nil, errors.New("legacy factory plugin declarations are invalid")
+	}
+	declarations := registry.Generation().Plugins()
+	var options []Option
+	if err := tx.Where(`"key" IN ?`, []string{"TaskPluginEnabled", setting.TaskPluginDisabledFactoryKeysKey, "SelfUseModeEnabled"}).Find(&options).Error; err != nil {
+		return nil, err
+	}
+	enabled, selfUse := true, false
+	var disabled []string
+	seenOptions := map[string]bool{}
+	for _, option := range options {
+		if seenOptions[option.Key] {
+			return nil, errors.New("ambiguous legacy plugin options")
+		}
+		seenOptions[option.Key] = true
+		switch option.Key {
+		case "TaskPluginEnabled":
+			enabled, err = strconv.ParseBool(option.Value)
+		case "SelfUseModeEnabled":
+			selfUse, err = strconv.ParseBool(option.Value)
+		case setting.TaskPluginDisabledFactoryKeysKey:
+			err = common.UnmarshalJsonStr(option.Value, &disabled)
+		}
+		if err != nil {
+			return nil, errors.New("invalid legacy plugin options")
+		}
+	}
+	registry.SetDisabledFactoryKeys(disabled)
+	var rows []TaskPlugin
+	if err := tx.Select("key", "api_version", "version", "source", "source_hash", "enabled", "active").Where("active = ?", true).Order("key, version, id").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var overrides []*jsplugin.LoadedPlugin
+	for _, row := range rows {
+		if seen[row.Key] {
+			return nil, errors.New("ambiguous active legacy task plugin versions")
+		}
+		seen[row.Key] = true
+		// Even a disabled active source retains its declared task identities
+		// for refusal: they must not silently turn into per-million text prices.
+		hash := sha256.Sum256([]byte(row.Source))
+		if hex.EncodeToString(hash[:]) != row.SourceHash {
+			return nil, errors.New("legacy task plugin source hash mismatch")
+		}
+		compiled, err := jsplugin.CompilePlugin(string(row.Source), jsplugin.Options{Key: row.Key, Version: row.Version})
+		if err != nil || compiled.Meta.APIVersion != row.APIVersion || compiled.Meta.Key != row.Key || compiled.Meta.Version != row.Version {
+			return nil, errors.New("invalid active legacy task plugin source")
+		}
+		declarations = append(declarations, compiled)
+		// Normal publication excludes a disabled override; an independently
+		// enabled factory can still supply this key.
+		if row.Enabled {
+			overrides = append(overrides, compiled)
+		}
+	}
+	if err := registry.ReplaceOverrides(overrides); err != nil || len(registry.RoutingErrors()) != 0 || registry.LastRebuildError() != "" {
+		return nil, errors.New("conflicting legacy task plugin declarations")
+	}
+	// The same host policy used by the live router must admit this isolated
+	// source generation before it can define Channels or task price units.
+	// There is no runtime incumbent, middleware, service, or global publication.
+	hostPolicy := pluginhost.New(pluginhost.HostRoutes())
+	if err := registry.SetGenerationPreparer(hostPolicy.PrepareOffline); err != nil || len(registry.RoutingErrors()) != 0 || registry.LastRebuildError() != "" {
+		return nil, errors.New("legacy task plugin host admission failed")
+	}
+	registry.SetEnabled(enabled)
+	source, err := LoadLegacyPricingConversionSource(tx, registry.Generation())
+	if err != nil {
+		return nil, err
+	}
+	source.declarations, source.selfUse = declarations, selfUse
+	return source, nil
+}
+
+// LoadLegacyPricingConversionSource reads every legacy routing row, including
+// disabled abilities. Enabled was not a filter in the historical safety check.
+// A missing table/read failure is an error, never an empty-source fallback.
+func LoadLegacyPricingConversionSource(tx *gorm.DB, generation *jsplugin.RoutingGeneration) (*LegacyPricingConversionSource, error) {
+	if tx == nil || generation == nil {
+		return nil, errors.New("legacy pricing conversion source is required")
+	}
+	source := &LegacyPricingConversionSource{generation: generation, aliases: map[string]TaskAliasTarget{}}
+	// Invalid settings must fail without logging their potentially secret values.
+	tx = tx.Session(&gorm.Session{Logger: logger.Discard})
+	if err := tx.Model(&Provider{}).Select(`id, type, status, models, model_mapping,
+		COALESCE(NULLIF(setting, '')::jsonb->>'task_plugin_key', '') AS task_plugin_key,
+		COALESCE(NULLIF(setting, '')::jsonb->'task_extend_plugin_keys', '[]'::jsonb)::text AS task_extend_plugin_keys`).Order("id").Scan(&source.providers).Error; err != nil {
+		return nil, err
+	}
+	if err := tx.Model(&Ability{}).Select("model", "channel_id", "enabled").Order("channel_id, model").Scan(&source.abilities).Error; err != nil {
+		return nil, err
+	}
+	if err := tx.Model(&Model{}).Select("model_name", "name_rule", "endpoints").Where("endpoints <> ?", "").Find(&source.metadata).Error; err != nil {
+		return nil, err
+	}
+	var err error
+	var duplicated []string
+	if source.pricing, _, duplicated, err = readModelPricingMaps(tx); err != nil {
+		return nil, err
+	}
+	if len(duplicated) != 0 {
+		return nil, errors.New("ambiguous legacy pricing options")
+	}
+	// Reproduce the legacy alias classification from the captured Provider rows
+	// and immutable plugin declaration generation, not a process-global view.
+	type aliasDraft struct {
+		spellings []string
+		byPlugin  map[string]map[string]struct{}
+	}
+	drafts := map[string]*aliasDraft{}
+	for _, provider := range source.providers {
+		if provider.Status != common.ChannelStatusEnabled || provider.ModelMapping == nil || *provider.ModelMapping == "" {
+			continue
+		}
+		var mapping map[string]string
+		if err := common.UnmarshalJsonStr(*provider.ModelMapping, &mapping); err != nil {
+			continue // The per-model check below reports an unverifiable route.
+		}
+		for _, name := range strings.Split(provider.Models, ",") {
+			if mapping[name] == "" {
+				continue
+			}
+			if _, declared := generation.CanonicalModel(name); declared {
+				continue
+			}
+			tail, cycle := followChannelModelMapping(mapping, name)
+			if cycle {
+				continue
+			}
+			declared, ok := generation.CanonicalModel(tail)
+			if !ok {
+				continue
+			}
+			plugin, ok := generation.GetByModel(declared)
+			if !ok {
+				continue
+			}
+			fold := jsplugin.ASCIIFold(name)
+			if drafts[fold] == nil {
+				drafts[fold] = &aliasDraft{byPlugin: map[string]map[string]struct{}{}}
+			}
+			draft := drafts[fold]
+			draft.spellings = append(draft.spellings, name)
+			if draft.byPlugin[plugin.Meta.Key] == nil {
+				draft.byPlugin[plugin.Meta.Key] = map[string]struct{}{}
+			}
+			draft.byPlugin[plugin.Meta.Key][declared] = struct{}{}
+		}
+	}
+	for fold, draft := range drafts {
+		if len(draft.byPlugin) != 1 {
+			continue
+		}
+		for key, targets := range draft.byPlugin {
+			target := TaskAliasTarget{Alias: slices.Min(draft.spellings), PluginKey: key}
+			if len(targets) == 1 {
+				for declared := range targets {
+					target.Declared = declared
+				}
+			}
+			source.aliases[fold] = target
+		}
+	}
+	return source, nil
+}
+
+// saleExpression preserves the executing plugin's historical override priority.
+// One Offering can have only one immutable sales expression/unit contract: when
+// legacy routes disagree, leave it disabled rather than choose an arbitrary one.
+func (source *LegacyPricingConversionSource) saleExpression(name string, routes []legacyGatewayChannel) string {
+	modelExpression := func(model string) (string, bool) {
+		effective := effectiveModelPricingWithSelfUse(source.pricing, model, source.selfUse)
+		if effective["billing_setting.billing_mode"] != billing_setting.BillingModeTieredExpr {
+			return "", false
+		}
+		expression, _ := effective["billing_setting.billing_expr"].(string)
+		return expression, true
+	}
+	var selected string
+	var selectedTask, found bool
+	for _, route := range routes {
+		if route.name != name {
+			continue
+		}
+		key, task := route.protocol.TaskPluginKey()
+		expression := ""
+		if task {
+			value, exists := source.pricing[billing_setting.PluginBillingExprOption][billing_setting.PluginBillingExprKey(key, name)]
+			if !exists && route.upstream != name {
+				value, exists = source.pricing[billing_setting.PluginBillingExprOption][billing_setting.PluginBillingExprKey(key, route.upstream)]
+			}
+			if exists {
+				expression, _ = value.(string)
+			} else if client, configured := modelExpression(name); configured {
+				expression = client
+			} else if route.upstream != name {
+				expression, _ = modelExpression(route.upstream)
+			}
+		} else if configured, exists := modelExpression(name); exists {
+			expression = configured
+		} else {
+			converted, err := source.Preview(name, modelPricingValues(source.pricing, name))
+			if err == nil && converted != nil && converted.UnsupportedReason == "" {
+				expression = converted.Expression
+			}
+		}
+		if strings.TrimSpace(expression) == "" || found && (selected != expression || selectedTask != task) {
+			return ""
+		}
+		selected, selectedTask, found = expression, task, true
+	}
+	return selected
+}
+
+func (source *LegacyPricingConversionSource) resolveAlias(name string) (TaskAliasTarget, bool) {
+	target, ok := source.aliases[jsplugin.ASCIIFold(name)]
+	return target, ok
+}
+
+func (source *LegacyPricingConversionSource) Preview(name string, draft PricingValues) (*ModelPricingConversion, error) {
+	if source == nil || source.generation == nil || source.pricing == nil {
+		return nil, errors.New("legacy pricing conversion source is required")
+	}
 	if draft == nil {
 		return nil, errors.New("pricing draft is required")
 	}
-	if err := ValidateModelPricing(name, draft); err != nil {
+	if err := validateModelPricingWithAliases(name, draft, modelPricingValues(source.pricing, name), source.generation, source.resolveAlias); err != nil {
 		return nil, err
 	}
 	if draft["billing_setting.billing_mode"] == billing_setting.BillingModeTieredExpr {
@@ -207,11 +479,13 @@ func PreviewModelPricingConversion(name string, draft PricingValues) (*ModelPric
 	legacyDraft := make(PricingValues, len(draft)+1)
 	maps.Copy(legacyDraft, draft)
 	legacyDraft["billing_setting.billing_mode"] = billing_setting.BillingModeRatio
-	effective, err := PreviewModelPricing(name, legacyDraft)
-	if err != nil {
-		return nil, err
+	values := make(map[string]map[string]any, len(source.pricing))
+	for key, entries := range source.pricing {
+		values[key] = maps.Clone(entries)
 	}
-	if err := ValidateModelPricing(name, effective); err != nil {
+	replaceModelPricing(values, name, legacyDraft)
+	effective := effectiveModelPricingWithSelfUse(values, name, source.selfUse)
+	if err := validateModelPricingWithAliases(name, effective, modelPricingValues(source.pricing, name), source.generation, source.resolveAlias); err != nil {
 		return nil, err
 	}
 	_, fixedPrice := effective["ModelPrice"]
@@ -223,24 +497,25 @@ func PreviewModelPricingConversion(name string, draft PricingValues) (*ModelPric
 		return &ModelPricingConversion{UnsupportedReason: "Gemini and OpenAI audio prices differ for this model. Use separate billing model names to convert them."}, nil
 	}
 
-	generation := jsplugin.DefaultRegistry.Generation()
+	generation := source.generation
 	if _, task := generation.GetByModel(name); task {
 		return &ModelPricingConversion{UnsupportedReason: "Task pricing must be converted manually using the task usage schema."}, nil
 	}
-	if _, task := ResolveTaskModelAlias(generation, name); task {
+	if _, task := source.resolveAlias(name); task {
 		return &ModelPricingConversion{UnsupportedReason: "Task pricing must be converted manually using the task usage schema."}, nil
 	}
 
 	// Inspect non-secret routing metadata so aliases cannot disguise a special
 	// settlement path as an ordinary text model.
-	var channels []Provider
-	candidates := DB.Model(&Ability{}).Select("channel_id").Where("model = ?", name)
-	if err := DB.Select("type", "status", "models", "model_mapping").Where("id IN (?)", candidates).Find(&channels).Error; err != nil {
-		return nil, err
+	candidates := map[int]bool{}
+	for _, ability := range source.abilities {
+		if ability.Model == name {
+			candidates[ability.ChannelID] = true
+		}
 	}
 	names := []string{name}
-	for _, channel := range channels {
-		if !slices.Contains(channel.GetModels(), name) {
+	for _, channel := range source.providers {
+		if !candidates[channel.ID] || !slices.Contains(strings.Split(channel.Models, ","), name) {
 			continue
 		}
 		if channel.Type == constant.ChannelTypeTaskPlugin {
@@ -280,6 +555,29 @@ func PreviewModelPricingConversion(name string, draft PricingValues) (*ModelPric
 				names = append(names, upstream)
 			}
 		}
+		// Type-60 task extensions are bindings, not generic text routes. Resolve
+		// only their declared names from this generation; an unavailable binding
+		// cannot safely establish ordinary text settlement.
+		if channel.Type == constant.ChannelTypeNewAPI {
+			var bindings []string
+			if err := common.UnmarshalJsonStr(channel.TaskExtendPluginKeys, &bindings); err != nil {
+				return &ModelPricingConversion{UnsupportedReason: "The model routing configuration could not be verified."}, nil
+			}
+			if channel.TaskPluginKey != "" {
+				bindings = append(bindings, channel.TaskPluginKey)
+			}
+			for _, key := range bindings {
+				plugin, ok := generation.Get(key)
+				if !ok {
+					return &ModelPricingConversion{UnsupportedReason: "The model routing configuration could not be verified."}, nil
+				}
+				if slices.ContainsFunc(plugin.Meta.Models, func(declared string) bool {
+					return jsplugin.ASCIIFold(declared) == jsplugin.ASCIIFold(upstream)
+				}) {
+					return &ModelPricingConversion{UnsupportedReason: "Task pricing must be converted manually using the task usage schema."}, nil
+				}
+			}
+		}
 	}
 	for _, modelName := range names {
 		lower := strings.ToLower(modelName)
@@ -290,13 +588,7 @@ func PreviewModelPricingConversion(name string, draft PricingValues) (*ModelPric
 			preview.BillingDetails.ImageCount = true
 		}
 	}
-	var metadata []Model
-	if err := DB.Select("model_name", "name_rule", "endpoints").
-		Where("model_name IN ? OR name_rule <> ?", names, NameRuleExact).
-		Where("endpoints <> ?", "").Find(&metadata).Error; err != nil {
-		return nil, err
-	}
-	for _, entry := range metadata {
+	for _, entry := range source.metadata {
 		if entry.Endpoints == "" || !slices.ContainsFunc(names, entry.MatchesName) {
 			continue
 		}

@@ -46,8 +46,6 @@ export const modelFormSchema = z.object({
   name_rule: z.number().min(0).max(3).default(0),
   status: z.boolean().default(true),
   sync_official: z.boolean().default(true),
-  enable_groups: z.array(z.string()).default([]),
-  quota_types: z.array(z.number()).default([]),
 })
 
 export type ModelFormValues = z.infer<typeof modelFormSchema>
@@ -62,8 +60,6 @@ export const MODEL_FORM_DEFAULT_VALUES: ModelFormValues = {
   name_rule: 0,
   status: true,
   sync_official: true,
-  enable_groups: [],
-  quota_types: [],
 }
 
 // ============================================================================
@@ -165,8 +161,6 @@ export function transformModelToFormDefaults(model: Model): ModelFormValues {
     name_rule: model.name_rule || 0,
     status: model.status === 1,
     sync_official: model.sync_official === 1,
-    enable_groups: model.enable_groups || [],
-    quota_types: model.quota_types || [],
   }
 }
 
@@ -187,8 +181,6 @@ export function transformFormDataToModelPayload(
     name_rule: formData.name_rule,
     status: formData.status ? 1 : 0,
     sync_official: formData.sync_official ? 1 : 0,
-    enable_groups: formData.enable_groups,
-    quota_types: formData.quota_types,
   }
 }
 

@@ -198,31 +198,19 @@ export function isModelSyncOfficial(model: Model): boolean {
 
 // Keep table labels compact; the drawer and tooltip share the full explanation.
 export function getModelChannelState(model: Model) {
-  const available = model.bound_channels?.length ?? 0
-  const configured = model.configured_channel_count ?? available
-  if (configured === 0) {
-    if (model.name_rule !== 0) {
-      return {
-        label: 'No matching channels',
-        description: 'No configured channel models match this metadata rule.',
-      }
-    }
+  if (model.name_rule !== 0) {
     return {
-      label: 'Metadata only',
       description:
-        'No channel is configured. This model will not appear in the model square.',
+        'Connections require a saved exact-name Model. Metadata rules do not bind Channels.',
     }
   }
-  if (available === 0) {
+  if (model.configured_channel_count === 0) {
     return {
-      label: 'No available channels',
-      description:
-        'No channel is currently available. This model will not appear in the model square.',
+      description: 'No Channel is configured for this Model ID.',
     }
   }
   return {
-    label: 'Available channels: {{count}}',
     description:
-      'Listing also depends on metadata visibility and the user’s group access.',
+      'Enabled counts include only enabled Channels with confirmed mappings and enabled Providers. They do not establish sale prices or Offering access.',
   }
 }

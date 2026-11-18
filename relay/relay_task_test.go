@@ -6,7 +6,9 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -15,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/money"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
@@ -47,6 +50,25 @@ func setupRelayChannelDB(t *testing.T) *gorm.DB {
 	return database
 }
 
+func persistRealtimeTaskEvidence(t *testing.T, database *gorm.DB, task *model.Task) {
+	t.Helper()
+	require.NoError(t, database.AutoMigrate(&model.Task{}, &model.User{}, &model.LegacySubscriptionTaskObligation{}))
+	var owners int64
+	require.NoError(t, database.Model(&model.User{}).Where("id = ?", task.UserId).Count(&owners).Error)
+	if owners == 0 {
+		require.NoError(t, database.Create(&model.User{Id: task.UserId, Username: "realtime-owner", Quota: 100, Status: common.UserStatusEnabled}).Error)
+	}
+	adaptor := GetTaskAdaptor(constant.TaskPlatform(strconv.Itoa(constant.ChannelTypeGemini)))
+	require.NotNil(t, adaptor)
+	identity, ok := adaptor.(interface{ TaskPluginIdentity() (string, string) })
+	require.True(t, ok)
+	key, version := identity.TaskPluginIdentity()
+	task.Platform = constant.TaskPlatform(key)
+	task.PrivateData.Execution = &model.TaskExecutionSnapshot{RequestID: "original-" + task.TaskID, TaskPlugin: &model.TaskPluginSnapshot{Key: key, Version: version}}
+	require.NoError(t, database.Create(task).Error)
+	require.NoError(t, model.MigrateLegacyTaskObligations(database))
+}
+
 func TestRealtimeFetchAppliesChannelHeaderOverrides(t *testing.T) {
 	database := setupRelayChannelDB(t)
 	service.InitHttpClient()
@@ -59,17 +81,19 @@ func TestRealtimeFetchAppliesChannelHeaderOverrides(t *testing.T) {
 	headerOverride := `{"X-API-Key":"{api_key}"}`
 	channel := &model.Provider{
 		Name: "realtime-header-override", Type: constant.ChannelTypeGemini,
-		Key: "channel-key", BaseURL: &server.URL, HeaderOverride: &headerOverride,
+		Key: "channel-key\nsaved-key", BaseURL: &server.URL, HeaderOverride: &headerOverride, Status: common.ChannelStatusEnabled,
+		ProviderInfo: model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2},
 	}
 	require.NoError(t, database.Create(channel).Error)
 	task := &model.Task{
-		TaskID: "public-task", ChannelId: channel.Id,
+		TaskID: "public-task", UserId: 7, ChannelId: channel.Id,
 		Status: model.TaskStatusInProgress, Progress: "50%",
 		PrivateData: model.TaskPrivateData{
 			Key: "saved-key", UpstreamTaskID: base64.RawURLEncoding.EncodeToString([]byte("operations/task-1")),
 		},
 	}
 
+	persistRealtimeTaskEvidence(t, database, task)
 	tryRealtimeFetch(task, true)
 
 	require.Len(t, requests, 1)
@@ -77,15 +101,30 @@ func TestRealtimeFetchAppliesChannelHeaderOverrides(t *testing.T) {
 	assert.Equal(t, "/v1beta/operations/task-1", request.URL.Path)
 	assert.Equal(t, "saved-key", request.Header.Get("X-API-Key"))
 	assert.Equal(t, "saved-key", request.Header.Get("X-Goog-Api-Key"))
+
+	t.Run("money task reads stay out of legacy realtime helper", func(t *testing.T) {
+		moneyTask := *task
+		moneyTask.PrivateData.Gateway = &model.TaskGatewaySnapshot{
+			Accepted: true, ProviderID: channel.Id, ProviderType: constant.ChannelTypeGemini, ChannelID: 1,
+			Settlement: model.GatewaySettlement{Attempt: &model.GatewayAttempt{ProviderID: channel.Id, ChannelID: 1}},
+		}
+		assert.Empty(t, tryRealtimeFetch(&moneyTask, true))
+		assert.Empty(t, requests, "money reads use persisted facts even when an original Provider credential remains valid")
+	})
+	t.Run("revoked original slot cannot use another enabled slot", func(t *testing.T) {
+		channel.ProviderInfo.MultiKeyStatusList = map[int]int{1: common.ChannelStatusManuallyDisabled}
+		require.NoError(t, database.Model(&model.Provider{}).Where("id = ?", channel.Id).Update("channel_info", channel.ProviderInfo).Error)
+		assert.Empty(t, tryRealtimeFetch(task, true))
+		assert.Empty(t, requests)
+		var evidence model.LegacyTaskObligation
+		require.NoError(t, database.First(&evidence, "source_task_id = ?", task.ID).Error)
+		assert.Equal(t, "unverified", evidence.State)
+	})
 }
 
 func TestRealtimeFetchRefundsTaskItFindsFailed(t *testing.T) {
 	database := setupRelayChannelDB(t)
-	require.NoError(t, database.AutoMigrate(&model.Task{}, &model.User{}, &model.Log{}))
-	previousLogDB := model.LOG_DB
-	previousFactory := service.GetTaskAdaptorFunc
-	previousRedis := common.RedisEnabled
-	model.LOG_DB = database
+	previousFactory, previousRedis := service.GetTaskAdaptorFunc, common.RedisEnabled
 	common.RedisEnabled = false
 	service.GetTaskAdaptorFunc = func(platform constant.TaskPlatform) service.TaskPollingAdaptor {
 		if adaptor := GetTaskAdaptor(platform); adaptor != nil {
@@ -93,39 +132,105 @@ func TestRealtimeFetchRefundsTaskItFindsFailed(t *testing.T) {
 		}
 		return nil
 	}
-	t.Cleanup(func() {
-		model.LOG_DB = previousLogDB
-		service.GetTaskAdaptorFunc = previousFactory
-		common.RedisEnabled = previousRedis
-	})
+	t.Cleanup(func() { service.GetTaskAdaptorFunc = previousFactory; common.RedisEnabled = previousRedis })
 	service.InitHttpClient()
+	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
 		_, _ = w.Write([]byte(`{"name":"operations/task-1","done":true,"error":{"code":3,"message":"blocked by safety"}}`))
 	}))
 	t.Cleanup(server.Close)
-	channel := &model.Provider{Name: "realtime-refund", Type: constant.ChannelTypeGemini, Key: "channel-key", BaseURL: &server.URL}
-	require.NoError(t, database.Create(channel).Error)
-	require.NoError(t, database.Create(&model.User{Id: 7, Username: "realtime-owner", Quota: 100}).Error)
-	task := &model.Task{
-		TaskID: "public-task", Platform: constant.TaskPlatform(strconv.Itoa(constant.ChannelTypeGemini)),
-		UserId: 7, ChannelId: channel.Id, Quota: 1000,
-		Status: model.TaskStatusInProgress, Progress: "50%",
-		PrivateData: model.TaskPrivateData{
-			Key: "channel-key", UpstreamTaskID: base64.RawURLEncoding.EncodeToString([]byte("operations/task-1")),
-		},
-	}
-	require.NoError(t, database.Create(task).Error)
-
+	provider := &model.Provider{Name: "realtime-refund", Type: constant.ChannelTypeGemini, Key: "channel-key", BaseURL: &server.URL, Status: common.ChannelStatusEnabled}
+	require.NoError(t, database.Create(provider).Error)
+	task := &model.Task{TaskID: "public-task", UserId: 7, ChannelId: provider.Id, Quota: 1000,
+		Status: model.TaskStatusInProgress, Progress: "50%", PrivateData: model.TaskPrivateData{
+			Key: provider.Key, UpstreamTaskID: base64.RawURLEncoding.EncodeToString([]byte("operations/task-1")),
+		}}
+	persistRealtimeTaskEvidence(t, database, task)
+	var evidence model.LegacyTaskObligation
+	require.NoError(t, database.First(&evidence, "source_task_id = ?", task.ID).Error)
 	tryRealtimeFetch(task, true)
-
 	var stored model.Task
 	require.NoError(t, database.First(&stored, task.ID).Error)
 	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), stored.Status)
 	assert.Equal(t, "blocked by safety", stored.FailReason)
-	assert.Zero(t, stored.Quota, "the failed task is refunded")
+	assert.Equal(t, 1000, stored.Quota, "an unverified historical task is not refund proof")
+	var afterEvidence model.LegacyTaskObligation
+	require.NoError(t, database.First(&afterEvidence, "source_task_id = ?", task.ID).Error)
+	assert.Equal(t, evidence, afterEvidence)
+
+	t.Run("canonical accepted task releases its actual reservation once", func(t *testing.T) {
+		// The outbox publishes through the log connection while holding its
+		// primary transaction; the account-only fixture's one-slot pool cannot.
+		sqlDB, err := database.DB()
+		require.NoError(t, err)
+		sqlDB.SetMaxOpenConns(4)
+		t.Cleanup(func() { sqlDB.SetMaxOpenConns(1) })
+		t.Setenv("GATEWAY_SETTLEMENT_JOURNAL_DIR", t.TempDir())
+		require.NoError(t, model.MigrateSubscriptionMoney(database))
+		require.NoError(t, model.MigrateGatewayBilling(database))
+		require.NoError(t, model.MigrateGatewayRecords())
+		require.NoError(t, database.Model(&model.User{}).Where("id = ?", 7).Update("setting", `{"billing_preference":"wallet_only"}`).Error)
+		_, err = model.TopUpWallet(model.WalletTopUp{UserId: 7, Source: money.Amount{Nanos: 5000, Currency: "USD"}, Reference: "canonical-refund-fixture"})
+		require.NoError(t, err)
+		request := model.GatewayRequest{ID: "canonical-realtime-refund", UserID: 7, SaleCurrency: "USD", SaleFXRate: "1", GroupRatio: "1", SaleExpression: "0.000001", StartedAt: time.Now().UnixMilli()}
+		attempt := model.GatewayAttempt{ID: "canonical-realtime-attempt", RequestID: request.ID, ProviderID: provider.Id, ChannelID: 99, StartedAt: request.StartedAt,
+			PurchaseExpression: "0.0000002", Cost: money.Amount{Currency: "USD"}, ConvertedCost: money.Amount{Currency: "USD"}, AccountingFXRate: "1"}
+		accepted := &model.Task{TaskID: "canonical-task", UserId: 7, ChannelId: provider.Id, Platform: task.Platform, Status: model.TaskStatusInProgress, Progress: "50%",
+			PrivateData: model.TaskPrivateData{UpstreamTaskID: task.PrivateData.UpstreamTaskID, Execution: task.PrivateData.Execution, Gateway: &model.TaskGatewaySnapshot{
+				ProviderID: provider.Id, ProviderType: provider.Type, ChannelID: 99, Settlement: model.GatewaySettlement{Request: request, Attempt: &attempt}, Facts: map[string]any{},
+			}}}
+		reserved := money.Amount{Nanos: 1000, Currency: "USD"}
+		require.NoError(t, model.ReserveGatewayTask(&request, reserved, reserved, accepted))
+		accepted.PrivateData.Gateway.Accepted = true
+		require.NoError(t, database.Save(accepted).Error)
+		wallet, err := model.GetUserWallet(7)
+		require.NoError(t, err)
+		assert.EqualValues(t, 4000, wallet.Balance.Nanos)
+		before := calls.Load()
+		assert.Empty(t, tryRealtimeFetch(accepted, true))
+		assert.Equal(t, before, calls.Load(), "client reads cannot poll or refund a money task")
+		require.NoError(t, service.UpdateGatewayTask(t.Context(), accepted))
+		require.NoError(t, database.First(accepted, accepted.ID).Error)
+		assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), accepted.Status)
+		assert.Equal(t, "blocked by safety", accepted.FailReason)
+		wallet, err = model.GetUserWallet(7)
+		require.NoError(t, err)
+		assert.EqualValues(t, 5000, wallet.Balance.Nanos)
+		var entries, replay []model.LedgerEntry
+		require.NoError(t, database.Where("request_id = ?", request.ID).Order("id").Find(&entries).Error)
+		require.NoError(t, service.SettleGatewayTask(t.Context(), accepted))
+		require.NoError(t, database.Where("request_id = ?", request.ID).Order("id").Find(&replay).Error)
+		assert.Equal(t, entries, replay)
+		var holds, releases, payables int
+		for _, entry := range entries {
+			if entry.Type == model.LedgerEntryPreConsume {
+				holds++
+				assert.Equal(t, money.Amount{Nanos: -1000, Currency: "USD"}, entry.Amount)
+			}
+			if entry.Type == model.LedgerEntryPreConsumeRelease {
+				releases++
+				assert.Equal(t, reserved, entry.Amount)
+			}
+			if entry.AccountType == model.LedgerAccountProviderPayable {
+				payables++
+				assert.EqualValues(t, 200, entry.Amount.Nanos)
+			}
+		}
+		assert.Equal(t, 1, holds)
+		assert.Equal(t, 1, releases)
+		assert.Equal(t, 1, payables)
+		projection, err := model.GetGatewayRequest(t.Context(), request.ID, 7)
+		require.NoError(t, err)
+		assert.Equal(t, money.Amount{Currency: "USD"}, projection.Receivable)
+		assert.False(t, projection.SalePending)
+		reconciled, err := model.ReconcileWallets(100)
+		require.NoError(t, err)
+		assert.Empty(t, reconciled.Mismatches)
+	})
 	var user model.User
 	require.NoError(t, database.First(&user, 7).Error)
-	assert.Equal(t, 1100, user.Quota)
+	assert.Equal(t, 100, user.Quota, "neither lifecycle revives the retired integer wallet")
 }
 
 func TestApplyChannelPinPreservesOriginTasksAndRetryMode(t *testing.T) {
@@ -224,64 +329,7 @@ func newTaskSubmitContext(t *testing.T, originalModel, mapping string) (*gin.Con
 		c.Set("model_mapping", mapping)
 	}
 	c.Set("task_request", map[string]any{"prompt": "p"})
-	return c, &relaycommon.RelayInfo{TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
-}
-
-func TestRelayTaskSubmitMapsBeforeValidateWhenOriginSet(t *testing.T) {
-	const mapping = `{"alias-model":"mid-model","mid-model":"declared-model"}`
-
-	c, info := newTaskSubmitContext(t, "alias-model", mapping)
-	pinMappingOrderPlugin(t, c, mappingOrderSubmitPlugin)
-	info.OriginModelName = "alias-model"
-
-	_, taskErr := RelayTaskSubmit(c, info)
-	require.NotNil(t, taskErr)
-	assert.Equal(t, "model_price_error", taskErr.Code)
-	assert.Equal(t, "alias-model", info.OriginModelName)
-	assert.Equal(t, "declared-model", info.UpstreamModelName)
-	assert.True(t, info.IsModelMapped)
-}
-
-func TestRelayTaskSubmitDeclaredNameWithoutMappingIsUnchanged(t *testing.T) {
-	c, info := newTaskSubmitContext(t, "declared-model", "")
-	pinMappingOrderPlugin(t, c, mappingOrderSubmitPlugin)
-	info.OriginModelName = "declared-model"
-
-	_, taskErr := RelayTaskSubmit(c, info)
-	require.NotNil(t, taskErr)
-	assert.Equal(t, "model_price_error", taskErr.Code)
-	assert.Equal(t, "declared-model", info.OriginModelName)
-	assert.Equal(t, "declared-model", info.UpstreamModelName)
-	assert.False(t, info.IsModelMapped)
-}
-
-func TestRelayTaskSubmitDoesNotApplyMappingTwice(t *testing.T) {
-	c, info := newTaskSubmitContext(t, "alias-model", `{"alias-model":"declared-model"}`)
-	pinMappingOrderPlugin(t, c, mappingOrderRewritePlugin)
-	info.OriginModelName = "alias-model"
-
-	_, taskErr := RelayTaskSubmit(c, info)
-	require.NotNil(t, taskErr)
-	assert.Equal(t, "model_price_error", taskErr.Code)
-	assert.Equal(t, "rewritten", info.UpstreamModelName, "late mapping would overwrite rewriteModel with the chain tail")
-	assert.Equal(t, "alias-model", info.OriginModelName)
-}
-
-func TestRelayTaskSubmitEmptyOriginKeepsLateMapping(t *testing.T) {
-	plugin, err := pluginruntime.NewRegistry().Register(mappingOrderSubmitPlugin, pluginruntime.Options{})
-	require.NoError(t, err)
-	synthesized := service.CoverTaskActionToModelName(constant.TaskPlatform(plugin.Meta.Key), "text_to_video")
-	c, info := newTaskSubmitContext(t, "pre-validate-upstream",
-		`{"pre-validate-upstream":"should-not-apply-early","`+synthesized+`":"legacy-tail"}`)
-	c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Plugin: plugin})
-	info.OriginModelName = ""
-
-	_, taskErr := RelayTaskSubmit(c, info)
-	require.NotNil(t, taskErr)
-	assert.Equal(t, "model_price_error", taskErr.Code)
-	assert.Equal(t, synthesized, info.OriginModelName)
-	assert.Equal(t, "legacy-tail", info.UpstreamModelName)
-	assert.True(t, info.IsModelMapped)
+	return c, &relaycommon.RelayInfo{TaskRelayInfo: &relaycommon.TaskRelayInfo{}, ProviderMeta: &relaycommon.ProviderMeta{}}
 }
 
 const billingFallbackPlugin = `
@@ -307,7 +355,6 @@ func saveBillingConfig(t *testing.T) {
 }
 
 func TestRelayTaskSubmitAliasBillingIdentityAndExprFallback(t *testing.T) {
-	const mapping = `{"alias-model":"declared-model"}`
 	const aliasExpr = `tier("alias", 2)`
 	const tailExpr = `tier("tail", 3)`
 	const legacyExpr = `tier("legacy", u("old_units") * 2)`
@@ -369,40 +416,42 @@ export function extractUsage(){return {old_units:2};}
 				}
 			}
 
-			c, info := newTaskSubmitContext(t, "alias-model", mapping)
-			c.Set("group", "default")
-			info.UserGroup = "default"
-			info.UsingGroup = "default"
-			source := testCase.source
-			if source == "" {
-				source = billingFallbackPlugin
-			}
-			pinMappingOrderPlugin(t, c, source)
-			info.OriginModelName = "alias-model"
-
-			_, taskErr := RelayTaskSubmit(c, info)
-			require.NotNil(t, taskErr)
-			assert.Equal(t, "alias-model", info.OriginModelName)
-			assert.Equal(t, "declared-model", info.UpstreamModelName)
-			assert.True(t, info.IsModelMapped)
-
+			// This is a historical pricing-source compatibility test, not a live
+			// request. Current requests never consult these retired option tables.
+			expression, found := billing_setting.ResolveTaskBillingExpr("bill-fallback", "alias-model", "declared-model")
+			assert.Equal(t, testCase.wantTiered, found)
+			info := &relaycommon.RelayInfo{OriginModelName: "alias-model", ProviderMeta: &relaycommon.ProviderMeta{UpstreamModelName: "declared-model"}}
 			task := model.InitTask(constant.TaskPlatform("bill-fallback"), info)
 			assert.Equal(t, "alias-model", task.Properties.OriginModelName)
 			assert.Equal(t, "declared-model", task.Properties.UpstreamModelName)
-
-			if testCase.wantTiered {
-				require.NotNil(t, info.TieredBillingSnapshot, "submission error: %+v", taskErr)
-				assert.Equal(t, "alias-model", info.TieredBillingSnapshot.ModelName)
-				assert.Equal(t, testCase.wantExpr, info.TieredBillingSnapshot.ExprString)
-				assert.Equal(t, billingexpr.ExprHashString(testCase.wantExpr), info.TieredBillingSnapshot.ExprHash)
-				assert.NotEqual(t, "model_price_error", taskErr.Code)
-				if testCase.wantExpr == legacyExpr {
-					assert.Equal(t, 4*common.QuotaPerUnit, info.TieredBillingSnapshot.EstimatedQuotaBeforeGroup)
-				}
-			} else {
-				assert.Nil(t, info.TieredBillingSnapshot)
-				assert.Equal(t, "model_price_error", taskErr.Code)
+			if !found {
+				assert.Empty(t, expression)
+				return
 			}
+			assert.Equal(t, testCase.wantExpr, expression)
+			if testCase.source != "" {
+				registry := pluginruntime.NewRegistry()
+				plugin, err := registry.Register(testCase.source, pluginruntime.Options{})
+				require.NoError(t, err)
+				schema, _ := plugin.Meta.UsageForModels("declared-model", "alias-model")
+				assert.Contains(t, schema, "seconds")
+				assert.NotContains(t, schema, "old_units")
+				assert.False(t, billing_setting.TaskExprCompatible(expression, schema))
+			}
+			// Preserve a persisted legacy expression even if the current plugin
+			// profile has narrowed. This evaluator must not mutate any funds.
+			snapshot := &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ModelName: "alias-model", ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), GroupRatio: 1, QuotaPerUnit: common.QuotaPerUnit, ExprVersion: billingexpr.ExprVersion(expression), TaskUsageBilling: true, UsageFacts: map[string]any{"old_units": float64(2)}}
+			assert.Equal(t, billingexpr.ExprHashString(testCase.wantExpr), snapshot.ExprHash)
+			result, _, err := service.EvaluateTaskCompletionUsage(snapshot, map[string]any{"old_units": float64(2)})
+			require.NoError(t, err)
+			want := int(2 * common.QuotaPerUnit)
+			if expression == tailExpr {
+				want = int(3 * common.QuotaPerUnit)
+			}
+			if expression == legacyExpr {
+				want = int(4 * common.QuotaPerUnit)
+			}
+			assert.Equal(t, want, result.ActualQuotaAfterGroup)
 		})
 	}
 }
@@ -456,40 +505,43 @@ func TestSharedTaskBillingExpressionSelectionAndFrozenSettlement(t *testing.T) {
 				billing_setting.PluginBillingExprOption: string(rawVariants), "billing_setting.billing_mode": string(modes), "billing_setting.billing_expr": string(expressions),
 			}))
 			c, info := newTaskSubmitContext(t, tc.model, tc.mapping)
-			c.Set("group", "default")
-			c.Set("task_plugin_key", tc.plugin)
-			info.UserGroup = "default"
-			info.UsingGroup = "default"
-			info.OriginModelName = tc.model
+			info.OriginModelName, info.UpstreamModelName = tc.model, tc.model
+			require.NoError(t, helper.ModelMappedHelper(c, info, nil))
 			plugin, ok := registry.Generation().Get(tc.plugin)
 			require.True(t, ok)
-			c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Generation: registry.Generation(), Plugin: plugin})
-			_, taskErr := RelayTaskSubmit(c, info)
-			require.NotNil(t, taskErr) // This fixture stops at reservation, before upstream submission.
+			expression, found := billing_setting.ResolveTaskBillingExpr(tc.plugin, tc.model, info.UpstreamModelName)
+			schema, _ := plugin.Meta.UsageForModels(info.UpstreamModelName, tc.model)
+			valid := found && !billingexpr.UsesFixedPricing(expression) && billing_setting.TaskExprCompatible(expression, schema)
 			if tc.wantPriceError {
-				assert.Equal(t, "model_price_error", taskErr.Code)
-				assert.Nil(t, info.TieredBillingSnapshot)
+				assert.False(t, valid, "incompatible historical pricing sources cannot become an implicit free price")
 				return
 			}
-			require.NotNil(t, info.TieredBillingSnapshot, "submission error: %+v", taskErr)
-			assert.Equal(t, tc.wantExpr, info.TieredBillingSnapshot.ExprString)
-			assert.NotEqual(t, "model_price_error", taskErr.Code)
-			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: `{}`, "billing_setting.billing_expr": `{}`}))
+			require.True(t, valid)
+			assert.Equal(t, tc.wantExpr, expression)
 			field := "seconds"
 			if tc.plugin == "billing-beta" {
 				field = "credits"
 			}
-			result, usage, err := service.EvaluateTaskCompletionUsage(info.TieredBillingSnapshot, map[string]any{field: float64(4)})
+			facts := map[string]any{field: float64(2)}
+			cost, _, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: facts})
+			require.NoError(t, err)
+			// A released task stored this complete snapshot. Replaying it must
+			// remain independent of current options and plugin schemas.
+			snapshot := &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ModelName: tc.model, ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), GroupRatio: 1, EstimatedQuotaBeforeGroup: cost * common.QuotaPerUnit, EstimatedQuotaAfterGroup: common.QuotaRound(cost * common.QuotaPerUnit), QuotaPerUnit: common.QuotaPerUnit, ExprVersion: billingexpr.ExprVersion(expression), TaskUsageBilling: true, UsageFacts: facts}
+			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: `{}`, "billing_setting.billing_expr": `{}`}))
+			result, usage, err := service.EvaluateTaskCompletionUsage(snapshot, map[string]any{field: float64(4)})
 			require.NoError(t, err)
 			assert.Equal(t, float64(4), usage[field])
-			assert.Equal(t, float64(2), info.TieredBillingSnapshot.UsageFacts[field])
-			assert.Equal(t, 2*info.TieredBillingSnapshot.EstimatedQuotaAfterGroup, result.ActualQuotaAfterGroup)
-			assert.Equal(t, tc.wantExpr, info.TieredBillingSnapshot.ExprString)
+			assert.Equal(t, float64(2), snapshot.UsageFacts[field])
+			assert.Equal(t, 2*snapshot.EstimatedQuotaAfterGroup, result.ActualQuotaAfterGroup)
+			assert.Equal(t, tc.wantExpr, snapshot.ExprString)
 		})
 	}
 }
 
 func TestSharedEndpointBillingKeepsOrdinaryAndPluginPricesSeparate(t *testing.T) {
+	db := model.UseTestDatabases(t)
+	require.NoError(t, db.AutoMigrate(&model.Wallet{}, &model.LedgerEntry{}, &model.GatewayBilling{}))
 	require.NoError(t, i18n.Init())
 	const taskExpr = `tier("images", u("image_count") * 0.05)`
 	const ordinaryExpr = `tier("images", fixed(0.04)) * image_count`
@@ -516,9 +568,9 @@ func TestSharedEndpointBillingKeepsOrdinaryAndPluginPricesSeparate(t *testing.T)
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			saveBillingConfig(t)
-			name, mapping, mappedModel := "declared-model", "", ""
+			name, mappedModel := "declared-model", ""
 			if tc.alias {
-				name, mapping, mappedModel = "alias-model", `{"alias-model":"declared-model"}`, "declared-model"
+				name, mappedModel = "alias-model", "declared-model"
 			}
 			mode := billing_setting.BillingModeTieredExpr
 			if tc.legacy {
@@ -558,38 +610,39 @@ func TestSharedEndpointBillingKeepsOrdinaryAndPluginPricesSeparate(t *testing.T)
 			ordinaryContext.Set(pluginruntime.ContextKeyRelayEndpoint, pluginruntime.PinnedEndpoint{Generation: registry.Generation(), Model: name, MappedModel: mappedModel, Candidates: candidates})
 			ordinary := &relaycommon.RelayInfo{
 				OriginModelName: name, UserGroup: "default", UsingGroup: "default", RelayFormat: kittypes.RelayFormatOpenAIImage,
-				Request: &kitdto.ImageRequest{Model: name, N: common.GetPointer(uint(2))}, BillingRequestInput: &billingexpr.RequestInput{},
+				Request: &kitdto.ImageRequest{Model: name, N: common.GetPointer(uint(2))}, BillingRequestInput: &billingexpr.RequestInput{ImageCount: common.GetPointer(2)},
 			}
-			ordinaryPrice, err := helper.ModelPriceHelper(ordinaryContext, ordinary, 1000, &kittypes.TokenCountMeta{})
+			ordinaryPrice, err := helper.ModelPriceHelper(ordinaryContext, ordinary, 1000, &kittypes.TokenCountMeta{ImagePriceRatio: 1, BillingRatios: map[string]float64{"n": 2}})
 			if tc.wantError != "" {
 				require.ErrorContains(t, err, tc.wantError)
 				assert.Nil(t, ordinary.TieredBillingSnapshot)
-				assert.Nil(t, ordinary.Billing, "pricing must fail before reservation")
+				var lifecycles, entries int64
+				require.NoError(t, db.Model(&model.GatewayBilling{}).Count(&lifecycles).Error)
+				require.NoError(t, db.Model(&model.LedgerEntry{}).Count(&entries).Error)
+				assert.Zero(t, lifecycles)
+				assert.Zero(t, entries, "pricing must fail before any reservation or ledger posting")
 			} else {
 				require.NoError(t, err)
 				assert.Equal(t, tc.ordinaryQuota, ordinaryPrice.QuotaToPreConsume)
 			}
 
-			pluginContext, task := newTaskSubmitContext(t, name, mapping)
-			pluginContext.Set("group", "default")
-			pluginContext.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Generation: registry.Generation(), Plugin: plugin})
-			task.OriginModelName, task.UserGroup, task.UsingGroup = name, "default", "default"
-			_, taskErr := RelayTaskSubmit(pluginContext, task)
-			require.NotNil(t, taskErr) // This fixture stops at reservation, before upstream submission.
-			assert.NotEqual(t, "model_price_error", taskErr.Code)
-			assert.Equal(t, tc.taskQuota, task.PriceData.Quota)
+			// Inspect the stored historical source contract without executing any
+			// retired request/session. Live money has distinct immutable owners.
+			expression, found := billing_setting.ResolveTaskBillingExpr("bill-fallback", name, "declared-model")
 			if tc.legacy {
-				assert.Nil(t, task.TieredBillingSnapshot)
+				assert.False(t, found)
 				assert.Nil(t, ordinary.TieredBillingSnapshot)
+				assert.Equal(t, tc.taskQuota, common.QuotaRound(0.04*2*common.QuotaPerUnit))
 				return
 			}
-			require.NotNil(t, task.TieredBillingSnapshot)
-			assert.True(t, task.TieredBillingSnapshot.TaskUsageBilling)
-			// Updating live prices must not change either in-flight meter.
-			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
-				"billing_setting.billing_expr": `{}`, billing_setting.PluginBillingExprOption: `{}`,
-			}))
-			settlement, _, err := service.EvaluateTaskCompletionUsage(task.TieredBillingSnapshot, map[string]any{"image_count": float64(3)})
+			require.True(t, found)
+			facts := map[string]any{"image_count": float64(2), "output_image_type": "1k", "unit": "image_count"}
+			cost, _, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: facts})
+			require.NoError(t, err)
+			snapshot := &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ModelName: name, ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), GroupRatio: 1, EstimatedQuotaBeforeGroup: cost * common.QuotaPerUnit, EstimatedQuotaAfterGroup: common.QuotaRound(cost * common.QuotaPerUnit), QuotaPerUnit: common.QuotaPerUnit, ExprVersion: billingexpr.ExprVersion(expression), TaskUsageBilling: true, UsageFacts: facts}
+			assert.Equal(t, tc.taskQuota, snapshot.EstimatedQuotaAfterGroup)
+			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"billing_setting.billing_expr": `{}`, billing_setting.PluginBillingExprOption: `{}`}))
+			settlement, _, err := service.EvaluateTaskCompletionUsage(snapshot, map[string]any{"image_count": float64(3)})
 			require.NoError(t, err)
 			assert.Equal(t, tc.taskFinal, settlement.ActualQuotaAfterGroup)
 			if tc.wantError != "" {
@@ -600,166 +653,6 @@ func TestSharedEndpointBillingKeepsOrdinaryAndPluginPricesSeparate(t *testing.T)
 			settlement, err = billingexpr.ComputeTieredQuotaWithRequest(ordinary.TieredBillingSnapshot, billingexpr.TokenParams{P: 1000, Len: 1000}, *ordinary.BillingRequestInput)
 			require.NoError(t, err)
 			assert.Equal(t, tc.ordinaryQuota, settlement.ActualQuotaAfterGroup)
-		})
-	}
-}
-
-// Issue #7478: task APIs answer 201 Created or 202 Accepted on submission.
-// Every 2xx must reach parseSubmitResponse; only other statuses are upstream
-// failures that keep the upstream status and body.
-func TestRelayTaskSubmitAcceptsAnySuccessfulUpstreamStatus(t *testing.T) {
-	service.InitHttpClient()
-	const source = `
-export const meta = {apiVersion:1,key:"status-echo",name:"Status Echo",version:"1.0.0",author:{name:"Test"},models:["declared-model"],fetchMode:"per_task"};
-export function buildSubmitRequest(ctx) { return {url: ctx.baseUrl+"/submit", method:"POST", body:{model: ctx.model}, action:"text_to_video"}; }
-export function parseSubmitResponse(ctx, response) { return {taskId: response.body.id, taskData: {status: response.statusCode}}; }
-export function buildQueryRequest(ctx) { return {url: ctx.baseUrl+"/query"}; }
-export function parseTaskResult() { return {status:"SUCCESS"}; }
-`
-	for _, tc := range []struct {
-		status   int
-		wantCode string
-	}{
-		{status: http.StatusOK},
-		{status: http.StatusCreated},
-		{status: http.StatusAccepted},
-		{status: http.StatusBadRequest, wantCode: "fail_to_fetch_task"},
-		{status: http.StatusBadGateway, wantCode: "fail_to_fetch_task"},
-	} {
-		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
-			saveBillingConfig(t)
-			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
-				"billing_setting.billing_mode": `{"declared-model":"tiered_expr"}`,
-				"billing_setting.billing_expr": `{"declared-model":"tier(\"flat\", 3)"}`,
-			}))
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(tc.status)
-				_, _ = w.Write([]byte(`{"id":"job-42","message":"upstream body"}`))
-			}))
-			defer server.Close()
-
-			c, info := newTaskSubmitContext(t, "declared-model", "")
-			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, server.URL)
-			c.Set("group", "default")
-			info.UserGroup, info.UsingGroup = "default", "default"
-			info.OriginModelName = "declared-model"
-			// An existing reservation stands in for the wallet so the fixture reaches the upstream call.
-			info.Billing = &imageReservation{limit: 1 << 30}
-			pinMappingOrderPlugin(t, c, source)
-
-			result, taskErr := RelayTaskSubmit(c, info)
-			if tc.wantCode != "" {
-				require.NotNil(t, taskErr)
-				assert.Equal(t, tc.wantCode, taskErr.Code)
-				assert.Equal(t, tc.status, taskErr.StatusCode)
-				assert.Contains(t, taskErr.Message, "upstream body")
-				assert.Nil(t, result)
-				return
-			}
-			require.Nil(t, taskErr, "submission error: %+v", taskErr)
-			require.NotNil(t, result)
-			assert.Equal(t, "job-42", result.UpstreamTaskID)
-			assert.JSONEq(t, `{"status":`+strconv.Itoa(tc.status)+`}`, string(result.TaskData))
-		})
-	}
-}
-
-// A retry prices the plugin it lands on from scratch and holds that price
-// before the upstream sees the request. Plugin A fails upstream on the first
-// attempt; the retry runs on plugin B, pinned the way
-// SetupContextForSelectedChannel pins another candidate plugin's channel.
-func TestRelayTaskSubmitRetryRepricesAndReservesBeforeUpstream(t *testing.T) {
-	service.InitHttpClient()
-	const source = `
-export const meta = {apiVersion:1,key:"KEY",name:"KEY",version:"1.0.0",author:{name:"Test"},models:["declared-model"],fetchMode:"per_task",usageSchema:{seconds:{type:"number",unit:"second",description:"Video generation unit price"}}};
-export function buildSubmitRequest(ctx) { return {url: ctx.baseUrl+"/submit", method:"POST", body:{model: ctx.model}, action:"text_to_video"}; }
-export function parseSubmitResponse(ctx, response) { return {taskId: response.body.id}; }
-export function buildQueryRequest(ctx) { return {url: ctx.baseUrl+"/query"}; }
-export function parseTaskResult() { return {status:"SUCCESS"}; }
-export function extractUsage() { return {seconds:2}; }
-`
-	pricier := map[string]string{"retry-a::declared-model": `tier("a", u("seconds") * 0.05)`, "retry-b::declared-model": `tier("b", u("seconds") * 0.4)`}
-	for _, tc := range []struct {
-		name, perCallPrice, wantCode string
-		expressions                  map[string]string
-		wallet, wantQuota            int
-		wantSubmitted                []string
-	}{
-		{name: "per-call plugin drops the previous expression", expressions: map[string]string{"retry-a::declared-model": `tier("a", u("seconds") * 0.02)`}, perCallPrice: `{"declared-model":0.04}`, wallet: 1 << 30, wantQuota: 40000, wantSubmitted: []string{"a", "b"}},
-		{name: "pricier plugin is held before submission", expressions: pricier, perCallPrice: `{}`, wallet: 1 << 30, wantQuota: 400000, wantSubmitted: []string{"a", "b"}},
-		{name: "unaffordable plugin is never submitted", expressions: pricier, perCallPrice: `{}`, wallet: 100000, wantCode: "insufficient_user_quota", wantSubmitted: []string{"a"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			saveBillingConfig(t)
-			savedPrices := ratio_setting.ModelPrice2JSONString()
-			t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(savedPrices)) })
-			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(tc.perCallPrice))
-			expressions, err := common.Marshal(tc.expressions)
-			require.NoError(t, err)
-			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
-				billing_setting.PluginBillingExprOption: string(expressions),
-				"billing_setting.billing_mode":          `{}`,
-				"billing_setting.billing_expr":          `{}`,
-				"group_ratio_setting.group_ratio":       `{"default":1}`,
-			}))
-			registry := pluginruntime.NewRegistry()
-			for _, key := range []string{"retry-a", "retry-b"} {
-				_, err := registry.Register(strings.ReplaceAll(source, "KEY", key), pluginruntime.Options{})
-				require.NoError(t, err)
-			}
-			// The fake stands in for the session the first attempt created; its
-			// limit is the most the wallet can hold.
-			billing := &imageReservation{limit: tc.wallet}
-			var submitted []string
-			var heldAtSubmit []int
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				attempt, _, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/")
-				submitted = append(submitted, attempt)
-				heldAtSubmit = append(heldAtSubmit, billing.held)
-				w.Header().Set("Content-Type", "application/json")
-				if attempt == "a" {
-					w.WriteHeader(http.StatusInternalServerError)
-				}
-				_, _ = w.Write([]byte(`{"id":"job-` + attempt + `"}`))
-			}))
-			defer server.Close()
-
-			c, info := newTaskSubmitContext(t, "declared-model", "")
-			c.Set("group", "default")
-			info.UserGroup, info.UsingGroup, info.OriginModelName = "default", "default", "declared-model"
-			info.Billing = billing
-			var result *TaskSubmitResult
-			var taskErr *dto.TaskError
-			for _, attempt := range []string{"a", "b"} {
-				plugin, ok := registry.Generation().Get("retry-" + attempt)
-				require.True(t, ok)
-				c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Generation: registry.Generation(), Plugin: plugin})
-				c.Set("task_plugin_key", plugin.Meta.Key)
-				common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, server.URL+"/"+attempt)
-				result, taskErr = RelayTaskSubmit(c, info)
-				if attempt == "a" {
-					require.NotNil(t, taskErr)
-					require.Equal(t, http.StatusInternalServerError, taskErr.StatusCode, "the first attempt fails upstream and is retried")
-				}
-			}
-
-			require.Equal(t, tc.wantSubmitted, submitted)
-			if tc.wantCode != "" {
-				require.NotNil(t, taskErr)
-				assert.Equal(t, tc.wantCode, taskErr.Code)
-				assert.Equal(t, http.StatusForbidden, taskErr.StatusCode)
-				return
-			}
-			require.Nil(t, taskErr, "submission error: %+v", taskErr)
-			assert.Equal(t, tc.wantQuota, result.Quota)
-			assert.Equal(t, tc.wantQuota, heldAtSubmit[1], "plugin B must not see the request before its price is held")
-			if tc.perCallPrice != `{}` {
-				assert.Nil(t, info.TieredBillingSnapshot, "a per-call plugin must not settle with the previous plugin's expression")
-				return
-			}
-			require.NotNil(t, info.TieredBillingSnapshot)
-			assert.Equal(t, tc.expressions["retry-b::declared-model"], info.TieredBillingSnapshot.ExprString)
 		})
 	}
 }

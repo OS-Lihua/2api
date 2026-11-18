@@ -2,11 +2,13 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,8 +20,10 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/money"
+	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relaykit/dto"
-	"github.com/QuantumNous/new-api/relaykit/types"
+
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
@@ -65,7 +69,8 @@ func modelManagementDB(t *testing.T) *gorm.DB {
 	database := model.UseTestDatabases(t)
 	model.LOG_DB = database
 	common.SetLogDatabaseType(common.DatabaseTypePostgreSQL)
-	require.NoError(t, database.AutoMigrate(&model.Model{}, &model.Vendor{}, &model.Provider{}, &model.Channel{}, &model.Ability{}, &model.Option{}, &model.User{}, &model.AuditLog{}))
+	require.NoError(t, database.AutoMigrate(&model.Model{}, &model.Vendor{}, &model.Provider{}, &model.Channel{}, &model.Ability{}, &model.Option{}, &model.User{}, &model.AuditLog{}, &model.ModelOffering{}, &model.ModelOfferingName{}, &model.ModelOfferingMember{}))
+	require.NoError(t, model.MigratePricing(database))
 	for _, value := range restoreRatios {
 		require.NoError(t, value.restore("{}"))
 	}
@@ -88,11 +93,101 @@ func modelManagementRequest(t *testing.T, handler gin.HandlerFunc, method, path 
 	return recorder
 }
 
+func legacyPricingSource(t *testing.T, db *gorm.DB) *model.LegacyPricingConversionSource {
+	t.Helper()
+	source, err := model.LoadLegacyPricingConversionSource(db, jsplugin.DefaultRegistry.Generation())
+	require.NoError(t, err)
+	return source
+}
+
+// Snapshot the actual historical bytes, not a synthesized legacy pricing view.
+func modelManagementOptions(t *testing.T, db *gorm.DB) []model.Option {
+	t.Helper()
+	var rows []model.Option
+	require.NoError(t, db.Order(`"key"`).Find(&rows).Error)
+	return rows
+}
+
+func modelManagementPrices(t *testing.T, db *gorm.DB) []model.PriceVersion {
+	t.Helper()
+	var rows []model.PriceVersion
+	require.NoError(t, db.Order("id").Find(&rows).Error)
+	return rows
+}
+
+func modelManagementPriceOwner(t *testing.T, db *gorm.DB, name string, kind protocol.Type) model.Channel {
+	t.Helper()
+	var member model.Model
+	err := db.Where("model_name = ?", name).First(&member).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		member = model.Model{ModelName: name, Status: 1}
+		require.NoError(t, db.Create(&member).Error)
+	} else {
+		require.NoError(t, err)
+	}
+	provider := model.Provider{Name: "Immutable price owner", Type: 1, Status: common.ChannelStatusEnabled}
+	require.NoError(t, db.Create(&provider).Error)
+	channel := model.Channel{ProviderID: provider.Id, ModelID: member.Id, Protocol: kind, UpstreamModelName: name, ParameterOverrides: "{}", Status: model.ChannelDisabled, MappingConfirmed: true}
+	require.NoError(t, db.Create(&channel).Error)
+	return channel
+}
+
+func modelManagementPriceActor(t *testing.T, db *gorm.DB) int {
+	t.Helper()
+	var user model.User
+	err := db.Where("username = ?", "immutable-price-actor").First(&user).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		user = model.User{Username: "immutable-price-actor", Status: common.UserStatusEnabled}
+		require.NoError(t, db.Create(&user).Error)
+	} else {
+		require.NoError(t, err)
+	}
+	return user.Id
+}
+
+func modelManagementPrice(t *testing.T, db *gorm.DB, owner model.Channel, expression string, at int64) model.PriceVersion {
+	t.Helper()
+	price := model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: owner.ID, Currency: money.Currency("USD"), Expression: expression, EffectiveAt: at}
+	require.NoError(t, model.CreatePriceVersion(context.Background(), &price, modelManagementPriceActor(t, db)))
+	return price
+}
+
+func modelManagementSale(t *testing.T, db *gorm.DB, memberID int, name string) (model.ModelOffering, model.PriceVersion) {
+	t.Helper()
+	offering := model.ModelOffering{Name: name, Visibility: "all", RouteMethod: "cost", Members: []model.ModelOfferingMember{{ModelID: memberID, Tier: 1}}}
+	require.NoError(t, model.SaveModelOffering(context.Background(), &offering, "save"))
+	price := model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: offering.ID, Currency: money.Currency("USD"), Expression: `tier("request", fixed(0))`, EffectiveAt: 1}
+	require.NoError(t, model.CreatePriceVersion(context.Background(), &price, modelManagementPriceActor(t, db)))
+	require.NoError(t, model.SaveModelOffering(context.Background(), &offering, "enable"))
+	return offering, price
+}
+
+func modelManagementSales(t *testing.T, db *gorm.DB) []SaleCatalogOffering {
+	t.Helper()
+	var result struct {
+		Success bool
+		Data    []SaleCatalogOffering
+	}
+	actor := modelManagementPriceActor(t, db)
+	response := modelManagementRequest(t, func(c *gin.Context) {
+		c.Set("id", actor)
+		GetPricing(c)
+	}, http.MethodGet, "/api/pricing", nil, &result)
+	require.True(t, result.Success, response.Body.String())
+	return result.Data
+}
+
 func TestModelPricingConversionDatabase(t *testing.T) {
 	previousQuota := common.QuotaPerUnit
 	common.QuotaPerUnit = 500000
 	t.Cleanup(func() { common.QuotaPerUnit = previousQuota })
 	db := modelManagementDB(t)
+	// These are legacy conversion sources, not account API mutations.
+	insertLegacyProvider := func(t *testing.T, provider *model.Provider) {
+		t.Helper()
+		require.NoError(t, provider.Insert())
+		require.NoError(t, provider.AddAbilities(nil))
+	}
 	contract, err := os.ReadFile("../pkg/billingexpr/testdata/frontend_simulation.json")
 	require.NoError(t, err)
 	var fixtures []struct {
@@ -108,13 +203,9 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 			continue
 		}
 		t.Run("frontend_contract/"+fixture.Name, func(t *testing.T) {
-			var response struct {
-				Success bool
-				Data    model.ModelPricingConversion
-			}
-			modelManagementRequest(t, PreviewModelPricingConversion, http.MethodPost, "/api/option/model_pricing/convert", fixture.Conversion, &response)
-			require.True(t, response.Success)
-			assert.Equal(t, fixture.Expression, response.Data.Expression)
+			converted, err := legacyPricingSource(t, db).Preview(fixture.Conversion.ModelName, fixture.Conversion.Pricing)
+			require.NoError(t, err)
+			assert.Equal(t, fixture.Expression, converted.Expression)
 		})
 	}
 	// The preview must resolve the draft, even when the running process
@@ -153,16 +244,12 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 		{"conversion-audio", model.PricingValues{"ModelRatio": float64(1), "AudioRatio": float64(2)}, `tier("base", p * 2 + c * 2 + ai * 4 + ao * 4)`, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			before, err := model.GetModelPricingSnapshot([]string{tc.name})
+			before := modelManagementOptions(t, db)
+			source := legacyPricingSource(t, db)
+			converted, err := source.Preview(tc.name, tc.draft)
 			require.NoError(t, err)
-			var response struct {
-				Success bool
-				Data    model.ModelPricingConversion
-			}
-			modelManagementRequest(t, PreviewModelPricingConversion, http.MethodPost, "/api/option/model_pricing/convert", map[string]any{"model_name": tc.name, "pricing": tc.draft}, &response)
-			require.True(t, response.Success)
-			assert.Equal(t, tc.expression, response.Data.Expression)
-			assert.Equal(t, tc.reason, response.Data.UnsupportedReason)
+			assert.Equal(t, tc.expression, converted.Expression)
+			assert.Equal(t, tc.reason, converted.UnsupportedReason)
 			if tc.name == "claude-3-7-sonnet-20250219" {
 				// Both providers include images in input; Claude reports cache
 				// separately and does not report an image token breakdown.
@@ -170,15 +257,15 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 					{PromptTokens: 1000, CompletionTokens: 100, UsageSemantic: "openai", PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 200, CachedCreationTokens: 50, ImageTokens: 300}},
 					{PromptTokens: 750, CompletionTokens: 100, UsageSemantic: "anthropic", ClaudeCacheCreation5mTokens: 50, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 200, CachedCreationTokens: 50}},
 				} {
-					tokens := service.BuildTieredTokenParams(&usage, usage.UsageSemantic == "anthropic", billingexpr.UsedVars(response.Data.Expression))
-					cost, _, err := billingexpr.RunExpr(response.Data.Expression, tokens)
+					tokens := service.BuildTieredTokenParams(&usage, usage.UsageSemantic == "anthropic", billingexpr.UsedVars(converted.Expression))
+					cost, _, err := billingexpr.RunExpr(converted.Expression, tokens)
 					require.NoError(t, err)
 					assert.Equal(t, float64(750), tokens.P)
 					assert.Equal(t, 3997.5, cost, "image input must remain billed exactly once")
 				}
 				usage := dto.Usage{PromptTokens: 750, CompletionTokens: 100, UsageSemantic: "anthropic", ClaudeCacheCreation5mTokens: 30, ClaudeCacheCreation1hTokens: 20, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 200, CachedCreationTokens: 50}}
-				tokens := service.BuildTieredTokenParams(&usage, true, billingexpr.UsedVars(response.Data.Expression))
-				cost, _, err := billingexpr.RunExpr(response.Data.Expression, tokens)
+				tokens := service.BuildTieredTokenParams(&usage, true, billingexpr.UsedVars(converted.Expression))
+				cost, _, err := billingexpr.RunExpr(converted.Expression, tokens)
 				require.NoError(t, err)
 				assert.Equal(t, 4042.5, cost, "mixed TTLs preserve both legacy cache-write prices")
 			}
@@ -187,57 +274,50 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 					{PromptTokens: 1000, CompletionTokens: 100, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 200}},
 					{PromptTokens: 800, CompletionTokens: 100, UsageSemantic: "anthropic", PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 200}},
 				} {
-					tokens := service.BuildTieredTokenParams(&usage, usage.UsageSemantic == "anthropic", billingexpr.UsedVars(response.Data.Expression))
-					cost, _, err := billingexpr.RunExpr(response.Data.Expression, tokens)
+					tokens := service.BuildTieredTokenParams(&usage, usage.UsageSemantic == "anthropic", billingexpr.UsedVars(converted.Expression))
+					cost, _, err := billingexpr.RunExpr(converted.Expression, tokens)
 					require.NoError(t, err)
 					assert.Equal(t, 256.5, cost, "cache reads remain billed across both response formats")
 				}
 			}
-			after, err := model.GetModelPricingSnapshot([]string{tc.name})
-			require.NoError(t, err)
-			assert.Equal(t, before.Entries, after.Entries, "preview must not write pricing")
+			assert.Equal(t, before, modelManagementOptions(t, db), "captured preview must not write historical options")
 			if tc.expression == "" {
 				return
 			}
-			pricing := tc.draft
-			pricing["billing_setting.billing_mode"] = "tiered_expr"
-			pricing["billing_setting.billing_expr"] = tc.expression
-			change := model.ModelPricingChange{ModelName: tc.name, ExpectedVersion: before.Entries[0].Version, Pricing: pricing}
-			require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{change}))
-			after, err = model.GetModelPricingSnapshot([]string{tc.name})
+			// Save the converted expression through the real immutable owner API,
+			// not through a retired model-name Option writer.
+			owner := modelManagementPriceOwner(t, db, tc.name, protocol.OpenAIChat)
+			price := modelManagementPrice(t, db, owner, tc.expression, 1)
+			current, err := model.CurrentPriceVersion(context.Background(), db, model.PriceOwnerChannel, owner.ID, 1)
 			require.NoError(t, err)
-			assert.Equal(t, pricing, after.Entries[0].Configured)
-			assert.ErrorIs(t, model.UpdateModelPricing([]model.ModelPricingChange{change}), model.ErrModelPricingConflict)
-			change.ExpectedVersion = after.Entries[0].Version
-			change.Pricing["billing_setting.billing_mode"] = "ratio"
-			require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{change}))
-			after, err = model.GetModelPricingSnapshot([]string{tc.name})
+			assert.Equal(t, price.ID, current.ID)
+			assert.Equal(t, tc.expression, current.Expression)
+			duplicate := model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: owner.ID, Currency: money.Currency("USD"), Expression: tc.expression, EffectiveAt: 1}
+			require.Error(t, model.CreatePriceVersion(context.Background(), &duplicate, price.CreatedBy), "same owner/effective time cannot overwrite the accepted expression")
+			assert.Equal(t, before, modelManagementOptions(t, db), "native saves never dual-write legacy options")
+			repeated, err := source.Preview(tc.name, tc.draft)
 			require.NoError(t, err)
-			assert.Equal(t, "ratio", after.Entries[0].Effective["billing_setting.billing_mode"])
-			if _, fixed := pricing["ModelPrice"]; !fixed {
-				var preview struct {
-					Success bool
-					Data    model.ModelPricingDescription
+			assert.Equal(t, converted, repeated)
+			if _, fixed := tc.draft["ModelPrice"]; !fixed {
+				require.NotEmpty(t, converted.Effective)
+				configuredCompletion, _ := tc.draft["CompletionRatio"].(float64)
+				var completion *float64
+				if _, exists := tc.draft["CompletionRatio"]; exists {
+					completion = &configuredCompletion
 				}
-				modelManagementRequest(t, PreviewModelPricing, http.MethodPost, "/api/option/model_pricing/preview", map[string]any{"model_name": tc.name, "pricing": pricing}, &preview)
-				require.True(t, preview.Success)
-				assert.Equal(t, after.Entries[0].Effective, preview.Data.Effective)
-				require.NotEmpty(t, response.Data.Effective)
-				for field, value := range response.Data.Effective {
-					assert.Equal(t, value, preview.Data.Effective[field], "conversion preview field %s", field)
+				assert.Equal(t, ratio_setting.ResolveCompletionRatio(tc.name, completion).Ratio, converted.Effective["CompletionRatio"])
+				for field, fallback := range map[string]float64{"CacheRatio": ratio_setting.DefaultCacheRatio, "CreateCacheRatio": ratio_setting.DefaultCreateCacheRatio, "ImageRatio": ratio_setting.DefaultImageRatio} {
+					if configured, exists := tc.draft[field]; exists {
+						assert.Equal(t, configured, converted.Effective[field])
+					} else {
+						assert.Equal(t, fallback, converted.Effective[field])
+					}
 				}
-				cache, _ := ratio_setting.GetCacheRatio(tc.name)
-				createCache, _ := ratio_setting.GetCreateCacheRatio(tc.name)
-				image, _ := ratio_setting.GetImageRatio(tc.name)
-				assert.Equal(t, ratio_setting.GetCompletionRatio(tc.name), preview.Data.Effective["CompletionRatio"])
-				assert.Equal(t, cache, preview.Data.Effective["CacheRatio"])
-				assert.Equal(t, createCache, preview.Data.Effective["CreateCacheRatio"])
-				assert.Equal(t, image, preview.Data.Effective["ImageRatio"])
 			}
 		})
 	}
-	require.NoError(t, (&model.Provider{Name: "Mapped image", Models: "conversion-alias", Type: 1, ModelMapping: common.GetPointer(`{"conversion-alias":"conversion-hop","conversion-hop":"gpt-image-2"}`)}).Insert())
-	preview, err := model.PreviewModelPricingConversion("conversion-alias", model.PricingValues{"ModelPrice": float64(1)})
+	insertLegacyProvider(t, &model.Provider{Name: "Mapped image", Models: "conversion-alias", Type: 1, ModelMapping: common.GetPointer(`{"conversion-alias":"conversion-hop","conversion-hop":"gpt-image-2"}`)})
+	preview, err := legacyPricingSource(t, db).Preview("conversion-alias", model.PricingValues{"ModelPrice": float64(1)})
 	require.NoError(t, err)
 	assert.Equal(t, `tier("image", fixed(1)) * image_count`, preview.Expression)
 	assert.Empty(t, preview.UnsupportedReason)
@@ -262,41 +342,35 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 				if tc.configured != nil {
 					draft["CreateCacheRatio"] = *tc.configured
 				}
-				var response struct {
-					Success bool
-					Data    model.ModelPricingConversion
+				converted, err := legacyPricingSource(t, db).Preview(tc.name, draft)
+				require.NoError(t, err)
+				require.NotEmpty(t, converted.Expression)
+				assert.Equal(t, tc.mode, converted.CacheWriteMode)
+				assert.Equal(t, float64(2), converted.Effective["ModelRatio"])
+				assert.Equal(t, float64(0.25), converted.Effective["CacheRatio"])
+				if tc.configured != nil {
+					assert.Equal(t, *tc.configured, converted.Effective["CreateCacheRatio"])
 				}
-				modelManagementRequest(t, PreviewModelPricingConversion, http.MethodPost, "/api/option/model_pricing/convert", map[string]any{"model_name": tc.name, "pricing": draft}, &response)
-				require.True(t, response.Success)
-				require.NotEmpty(t, response.Data.Expression)
-				assert.Equal(t, tc.mode, response.Data.CacheWriteMode)
-				var prices struct {
-					Success bool
-					Data    model.ModelPricingDescription
-				}
-				modelManagementRequest(t, PreviewModelPricing, http.MethodPost, "/api/option/model_pricing/preview", map[string]any{"model_name": tc.name, "pricing": draft}, &prices)
-				require.True(t, prices.Success)
-				assert.Equal(t, response.Data.Effective, prices.Data.Effective)
-				assert.Equal(t, response.Data.CacheWriteMode, prices.Data.CacheWriteMode)
-				vars := billingexpr.UsedVars(response.Data.Expression)
+				assert.Equal(t, converted.CacheWriteMode, model.ResolveCacheWriteMode(tc.name, draft))
+				vars := billingexpr.UsedVars(converted.Expression)
 				assert.Equal(t, tc.mode != model.CacheWriteNone, vars["cc"])
 				assert.Equal(t, tc.mode == model.CacheWriteClaudeTTL, vars["cc1h"])
 				assert.Equal(t, tc.mode == model.CacheWriteOpenAITTL, vars["cc12h"])
 				if tc.configured != nil && *tc.configured == 0 {
-					cost, _, err := billingexpr.RunExpr(response.Data.Expression, billingexpr.TokenParams{CC: 100, CC1h: 100, CC12h: 100})
+					cost, _, err := billingexpr.RunExpr(converted.Expression, billingexpr.TokenParams{CC: 100, CC1h: 100, CC12h: 100})
 					require.NoError(t, err)
 					assert.Zero(t, cost, "explicit zero cache prices must stay free")
 				}
 			})
 		}
 		// GPT names price the 12h write at twice the configured write price.
-		openai, err := model.PreviewModelPricingConversion("gpt-5.6-terra", model.PricingValues{"ModelRatio": 5.0, "CompletionRatio": 5.0, "CacheRatio": 0.1, "CreateCacheRatio": 1.25})
+		openai, err := legacyPricingSource(t, db).Preview("gpt-5.6-terra", model.PricingValues{"ModelRatio": 5.0, "CompletionRatio": 5.0, "CacheRatio": 0.1, "CreateCacheRatio": 1.25})
 		require.NoError(t, err)
 		assert.Equal(t, model.CacheWriteOpenAITTL, openai.CacheWriteMode)
 		assert.Equal(t, `tier("base", p * 10 + c * 50 + cr * 1 + cc * 12.5 + cc12h * 25)`, openai.Expression)
 		// The billing name remains authoritative for cache terms.
-		require.NoError(t, (&model.Provider{Name: "Cache alias", Type: 1, Models: "opaque-cache-alias", ModelMapping: common.GetPointer(`{"opaque-cache-alias":"claude-sonnet-4-6"}`)}).Insert())
-		alias, err := model.PreviewModelPricingConversion("opaque-cache-alias", model.PricingValues{"ModelRatio": 2.0})
+		insertLegacyProvider(t, &model.Provider{Name: "Cache alias", Type: 1, Models: "opaque-cache-alias", ModelMapping: common.GetPointer(`{"opaque-cache-alias":"claude-sonnet-4-6"}`)})
+		alias, err := legacyPricingSource(t, db).Preview("opaque-cache-alias", model.PricingValues{"ModelRatio": 2.0})
 		require.NoError(t, err)
 		assert.Equal(t, `tier("base", p * 4 + c * 4)`, alias.Expression)
 	})
@@ -312,7 +386,7 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 			{"ImageRatio", "img * 120", 2, dto.InputTokenDetails{CachedTokens: 600, ImageTokens: 500}, 108000, 102000},
 		} {
 			t.Run(tc.field, func(t *testing.T) {
-				converted, err := model.PreviewModelPricingConversion("overlapping-cache", model.PricingValues{"ModelRatio": 30.0, "CompletionRatio": 2.0, "CacheRatio": 1.0, tc.field: tc.ratio})
+				converted, err := legacyPricingSource(t, db).Preview("overlapping-cache", model.PricingValues{"ModelRatio": 30.0, "CompletionRatio": 2.0, "CacheRatio": 1.0, tc.field: tc.ratio})
 				require.NoError(t, err)
 				assert.Equal(t, `tier("base", p * 60 + c * 120 + cr * 60 + `+tc.term+`)`, converted.Expression)
 				usage := dto.Usage{PromptTokens: 1000, CompletionTokens: 100, PromptTokensDetails: tc.details}
@@ -330,19 +404,21 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 	})
 	t.Run("media_prices_and_request_adjustments", func(t *testing.T) {
 		for _, quantity := range []string{"129", "-1", "0.5", "18446744073709551615"} {
-			recorder := httptest.NewRecorder()
-			ctx, _ := gin.CreateTestContext(recorder)
-			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"z-image","parameters":{"n":`+quantity+`}}`))
-			ctx.Request.Header.Set("Content-Type", "application/json")
-			Relay(ctx, types.RelayFormatOpenAIImage)
-			assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+			t.Run(quantity, func(t *testing.T) {
+				_, engine := newCanonicalRelayFixture(t, protocol.OpenAIImages, "z-image")
+				recorder := httptest.NewRecorder()
+				request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"z-image","parameters":{"n":`+quantity+`}}`))
+				request.Header.Set("Content-Type", "application/json")
+				engine.ServeHTTP(recorder, request)
+				assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+			})
 		}
-		conflicting, err := model.PreviewModelPricingConversion("gemini-2.5-flash-conflict", model.PricingValues{"ModelRatio": 0.15, "AudioRatio": 10.0})
+		conflicting, err := legacyPricingSource(t, db).Preview("gemini-2.5-flash-conflict", model.PricingValues{"ModelRatio": 0.15, "AudioRatio": 10.0})
 		require.NoError(t, err)
 		assert.Contains(t, conflicting.UnsupportedReason, "Gemini and OpenAI audio prices differ")
 		aliName := "z-image-media-conversion"
-		require.NoError(t, (&model.Provider{Name: aliName, Models: aliName, Type: 17, Status: common.ChannelStatusEnabled}).Insert())
-		aliConversion, err := model.PreviewModelPricingConversion(aliName, model.PricingValues{"ModelPrice": 0.04})
+		insertLegacyProvider(t, &model.Provider{Name: aliName, Models: aliName, Type: 17, Status: common.ChannelStatusEnabled})
+		aliConversion, err := legacyPricingSource(t, db).Preview(aliName, model.PricingValues{"ModelPrice": 0.04})
 		require.NoError(t, err)
 		require.Empty(t, aliConversion.UnsupportedReason)
 		// Ali image billing lives in the alibaba task plugin, where prompt_extend is a
@@ -368,7 +444,7 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 			{"gemini-2.5-flash-overlap", model.PricingValues{"ModelRatio": 1.0}, dto.Usage{PromptTokens: 1000, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 800, AudioTokens: 500}}, 2100},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				converted, err := model.PreviewModelPricingConversion(tc.name, tc.pricing)
+				converted, err := legacyPricingSource(t, db).Preview(tc.name, tc.pricing)
 				require.NoError(t, err)
 				require.Empty(t, converted.UnsupportedReason)
 				require.NotNil(t, converted.BillingDetails.AudioInputPrice)
@@ -378,12 +454,12 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 				assert.InDelta(t, tc.want, cost, 1e-9)
 			})
 		}
-		converted, err := model.PreviewModelPricingConversion("dall-e-3", model.PricingValues{"ModelPrice": 0.04})
+		converted, err := legacyPricingSource(t, db).Preview("dall-e-3", model.PricingValues{"ModelPrice": 0.04})
 		require.NoError(t, err)
 		require.Empty(t, converted.UnsupportedReason)
 		assert.NotContains(t, converted.Expression, "256x256")
 		assert.NotContains(t, converted.Expression, "512x512")
-		smallImage, err := model.PreviewModelPricingConversion("dall-e-2", model.PricingValues{"ModelPrice": 0.02})
+		smallImage, err := legacyPricingSource(t, db).Preview("dall-e-2", model.PricingValues{"ModelPrice": 0.02})
 		require.NoError(t, err)
 		require.Empty(t, smallImage.UnsupportedReason)
 		assert.NotContains(t, smallImage.Expression, "1792")
@@ -407,9 +483,9 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 		}
 		for _, channelType := range []int{20, 58} {
 			name := fmt.Sprintf("gemini-3.5-flash-media-%d", channelType)
-			require.NoError(t, (&model.Provider{Name: name, Models: name, Type: channelType}).Insert())
+			insertLegacyProvider(t, &model.Provider{Name: name, Models: name, Type: channelType})
 			require.NoError(t, db.Create(&model.Model{ModelName: name, Endpoints: `{"custom-text":"/v1/custom"}`}).Error)
-			converted, err := model.PreviewModelPricingConversion(name, model.PricingValues{"ModelRatio": 0.75, "CompletionRatio": 6.0, "CacheRatio": 0.1})
+			converted, err := legacyPricingSource(t, db).Preview(name, model.PricingValues{"ModelRatio": 0.75, "CompletionRatio": 6.0, "CacheRatio": 0.1})
 			require.NoError(t, err)
 			assert.Empty(t, converted.UnsupportedReason)
 			assert.Equal(t, `tier("base", p * 1.5 + c * 9 + cr * 0.15)`, converted.Expression)
@@ -417,7 +493,7 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 		}
 	})
 	require.NoError(t, db.Create(&model.Model{ModelName: "conversion-metadata", Endpoints: `{"image-generation":"/v1/images/generations"}`}).Error)
-	preview, err = model.PreviewModelPricingConversion("conversion-metadata", model.PricingValues{"ModelPrice": float64(1)})
+	preview, err = legacyPricingSource(t, db).Preview("conversion-metadata", model.PricingValues{"ModelPrice": float64(1)})
 	require.NoError(t, err)
 	assert.Equal(t, `tier("image", fixed(1)) * image_count`, preview.Expression)
 	assert.Empty(t, preview.UnsupportedReason)
@@ -435,7 +511,7 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 			endpoints, err := common.Marshal(map[string]string{string(tc.endpoint): "/v1/fixture"})
 			require.NoError(t, err)
 			require.NoError(t, db.Create(&model.Model{ModelName: tc.rule, NameRule: tc.nameRule, Endpoints: string(endpoints)}).Error)
-			converted, err := model.PreviewModelPricingConversion(tc.name, model.PricingValues{"ModelPrice": 1.0})
+			converted, err := legacyPricingSource(t, db).Preview(tc.name, model.PricingValues{"ModelPrice": 1.0})
 			require.NoError(t, err)
 			if tc.endpoint == constant.EndpointTypeOpenAIVideo {
 				assert.Empty(t, converted.Expression)
@@ -446,10 +522,435 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 		})
 	}
 	sora := &model.Provider{Name: "Opaque video route", Models: "opaque-video-route", Type: constant.ChannelTypeSora, Group: "a,b"}
-	require.NoError(t, sora.Insert())
-	video, err := model.PreviewModelPricingConversion("opaque-video-route", model.PricingValues{"ModelPrice": 1.0})
+	insertLegacyProvider(t, sora)
+	video, err := legacyPricingSource(t, db).Preview("opaque-video-route", model.PricingValues{"ModelPrice": 1.0})
 	require.NoError(t, err)
 	assert.Equal(t, "Video pricing must be converted manually.", video.UnsupportedReason)
+}
+
+func TestModelMetadataOmitsLegacyPricing(t *testing.T) {
+	db := modelManagementDB(t)
+	publisher := model.Vendor{Name: "Metadata publisher", Status: 1}
+	require.NoError(t, db.Create(&publisher).Error)
+	metadata := model.Model{
+		ModelName: "metadata-price-independent", VendorID: publisher.Id, Status: 1,
+		Description: "Stored description", Tags: "stored-tag", Icon: "stored-icon",
+		Endpoints: `{"openai":{"path":"/v1/chat/completions","method":"POST"}}`,
+	}
+	require.NoError(t, common.Unmarshal([]byte(`{"features":["streaming"],"input_modalities":["text"],"output_modalities":["text"]}`), &metadata.Capabilities))
+	require.NoError(t, metadata.Insert())
+	provider := model.Provider{Name: "Metadata route", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled}
+	require.NoError(t, db.Create(&provider).Error)
+	require.NoError(t, db.Create(&model.Ability{Model: metadata.ModelName, Group: "metadata-group", ChannelId: provider.Id, Enabled: true}).Error)
+
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) { c.Set("role", common.RoleRootUser) })
+	engine.GET("/api/models/", GetAllModelsMeta)
+	engine.GET("/api/models/search", SearchModelsMeta)
+	engine.GET("/api/models/:id", GetModelMeta)
+	engine.POST("/api/models/", CreateModelMeta)
+	engine.PUT("/api/models/", UpdateModelMeta)
+	call := func(method, path string, body any) map[string]any {
+		t.Helper()
+		encoded, err := common.Marshal(body)
+		require.NoError(t, err)
+		request := httptest.NewRequest(method, path, bytes.NewReader(encoded))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, request)
+		require.Equal(t, http.StatusOK, recorder.Code)
+		var response struct {
+			Success bool
+			Data    map[string]any
+		}
+		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+		require.True(t, response.Success, recorder.Body.String())
+		return response.Data
+	}
+
+	// Metadata reads must not trigger the legacy pricing cache's Vendor scan.
+	var pricingVendorReads atomic.Int64
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register("metadata_pricing_probe", func(tx *gorm.DB) {
+		if tx.Statement.Table == "vendors" {
+			pricingVendorReads.Add(1)
+		}
+	}))
+	t.Cleanup(func() { require.NoError(t, db.Callback().Query().Remove("metadata_pricing_probe")) })
+	paths := []string{"/api/models/?page_size=1", "/api/models/search?keyword=price-independent&page_size=1", fmt.Sprintf("/api/models/%d", metadata.Id)}
+	baseline := make(map[string]map[string]any)
+	for _, pricing := range []struct{ ratio, price string }{
+		{`{"metadata-price-independent":2}`, `{}`},
+		{`{}`, `{"metadata-price-independent":123}`},
+		{`{}`, `{}`},
+	} {
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(pricing.ratio))
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(pricing.price))
+		for _, path := range paths {
+			pricingVendorReads.Store(0)
+			data := call(http.MethodGet, path, nil)
+			assert.Zero(t, pricingVendorReads.Load(), "metadata must not refresh legacy pricing: %s", path)
+			row := data
+			if items, ok := data["items"]; ok {
+				require.Len(t, items.([]any), 1)
+				assert.EqualValues(t, 1, data["total"])
+				assert.EqualValues(t, 1, data["page_size"])
+				row = items.([]any)[0].(map[string]any)
+			}
+			assert.NotContains(t, row, "quota_types", "retired billing fields must be absent, not zero-filled")
+			assert.Equal(t, metadata.Description, row["description"])
+			assert.Equal(t, metadata.Endpoints, row["endpoints"])
+			assert.Equal(t, []any{"openai"}, row["supported_endpoints"])
+			assert.Equal(t, []any{"streaming"}, row["capabilities"].(map[string]any)["features"])
+			for _, field := range []string{"bound_channels", "enable_groups", "matched_models", "matched_count"} {
+				assert.NotContains(t, row, field, "legacy route details must not escape the model:read boundary")
+			}
+			assert.EqualValues(t, 0, row["configured_channel_count"], "legacy abilities are not stable Channel relationships")
+			assert.EqualValues(t, 0, row["enabled_channel_count"])
+			if previous, exists := baseline[path]; exists {
+				assert.Equal(t, previous, data, "legacy price changes must not change metadata: %s", path)
+			} else {
+				baseline[path] = data
+			}
+		}
+	}
+
+	// Existing clients may still send the retired, non-persisted field. It must
+	// neither be echoed nor change any legacy pricing configuration.
+	require.NoError(t, db.Create(&model.Option{Key: "ModelPrice", Value: `{"metadata-price-independent":0.125,"metadata-created":0}`}).Error)
+	priceBefore := modelManagementOptions(t, db)
+	updated := call(http.MethodPut, "/api/models/", map[string]any{
+		"id": metadata.Id, "model_name": metadata.ModelName, "vendor_id": publisher.Id,
+		"description": "Updated description", "status": 1, "endpoints": metadata.Endpoints,
+		"quota_types": []int{1},
+	})
+	assert.NotContains(t, updated, "quota_types")
+	assert.Equal(t, []any{"streaming"}, updated["capabilities"].(map[string]any)["features"])
+	stored := call(http.MethodGet, fmt.Sprintf("/api/models/%d", metadata.Id), nil)
+	assert.Equal(t, "Updated description", stored["description"])
+	assert.Equal(t, metadata.Endpoints, stored["endpoints"])
+	created := call(http.MethodPost, "/api/models/", map[string]any{"model_name": "metadata-created", "status": 1, "quota_types": []int{0}})
+	assert.NotContains(t, created, "quota_types")
+	assert.NotZero(t, created["id"])
+	assert.Equal(t, priceBefore, modelManagementOptions(t, db))
+	assert.Empty(t, modelManagementPrices(t, db), "metadata CRUD must not invent prices")
+}
+
+func TestModelMetadataNativeEndpoints(t *testing.T) {
+	db := modelManagementDB(t)
+	provider := model.Provider{Name: "Native declarations", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled}
+	require.NoError(t, db.Create(&provider).Error)
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) { c.Set("role", common.RoleRootUser) })
+	engine.GET("/api/models/", GetAllModelsMeta)
+	engine.GET("/api/models/search", SearchModelsMeta)
+	engine.GET("/api/models/:id", GetModelMeta)
+	engine.POST("/api/models/", CreateModelMeta)
+	engine.PUT("/api/models/", UpdateModelMeta)
+	engine.DELETE("/api/models/:id", DeleteModelMeta)
+	engine.POST("/channels", SaveSingleModelChannel)
+	engine.PUT("/channels/:id", SaveSingleModelChannel)
+	engine.POST("/channels/:id/confirm", ConfirmSingleModelChannel)
+	engine.POST("/channels/:id/disable", DisableSingleModelChannel)
+	engine.DELETE("/channels/:id", DeleteSingleModelChannel)
+	call := func(method, path string, body any) map[string]any {
+		t.Helper()
+		encoded, err := common.Marshal(body)
+		require.NoError(t, err)
+		request := httptest.NewRequest(method, path, bytes.NewReader(encoded))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, request)
+		require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+		var result struct {
+			Success bool
+			Data    map[string]any
+		}
+		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &result))
+		require.True(t, result.Success, recorder.Body.String())
+		return result.Data
+	}
+	read := func(id int, expected ...string) {
+		t.Helper()
+		row := call(http.MethodGet, fmt.Sprintf("/api/models/%d", id), nil)
+		want := make([]any, 0, len(expected))
+		slices.Sort(expected)
+		for _, endpoint := range expected {
+			want = append(want, endpoint)
+		}
+		assert.Equal(t, want, row["supported_endpoints"], "native declaration for Model ID %d", id)
+	}
+
+	// Every built-in has an explicit native surface; no fallback to OpenAI or
+	// an Offering member is permitted. These enabled fixtures have no prices.
+	expected := map[protocol.Type][]string{
+		protocol.OpenAIChat:                  {"openai"},
+		protocol.OpenAIResponses:             {"openai-response", "openai-response-compact"},
+		protocol.OpenAIRealtime:              {"openai-realtime"},
+		protocol.AnthropicMessages:           {"anthropic"},
+		protocol.GeminiGenerate:              {"gemini"},
+		protocol.OpenAIEmbeddings:            {"embeddings"},
+		protocol.GeminiEmbed:                 {"gemini-embed"},
+		protocol.OpenAIImages:                {"image-generation"},
+		protocol.OpenAIAudioSpeech:           {"openai-audio-speech"},
+		protocol.OpenAIAudioTranscription:    {"openai-audio-transcription"},
+		protocol.Rerank:                      {"jina-rerank"},
+		protocol.AlphaSearch:                 {"openai-alpha-search"},
+		protocol.DeepSeekTools:               {"deepseek-tools-search", "deepseek-tools-fetch"},
+		protocol.OpenAIModerations:           {"openai-moderations"},
+		protocol.Type("task:native-fixture"): {"task:native-fixture"},
+	}
+	for _, kind := range append(protocol.Builtins(), protocol.Type("task:native-fixture")) {
+		t.Run(string(kind), func(t *testing.T) {
+			want, exists := expected[kind]
+			require.True(t, exists, "new protocols require an explicit presentation contract")
+			metadata := model.Model{ModelName: "native-" + string(kind), Status: 1}
+			require.NoError(t, metadata.Insert())
+			require.NoError(t, db.Create(&model.Channel{ProviderID: provider.Id, ModelID: metadata.Id, Protocol: kind, UpstreamModelName: "same-upstream-name", Status: model.ChannelEnabled, MappingConfirmed: true, ParameterOverrides: "{}"}).Error)
+			read(metadata.Id, want...)
+		})
+	}
+
+	metadata := model.Model{ModelName: "stable-native", Status: 1, Endpoints: `{"custom":"/custom","openai-response":{"path":"/custom/responses","method":"POST"}}`}
+	require.NoError(t, metadata.Insert())
+	pattern := model.Model{ModelName: "stable-", NameRule: model.NameRulePrefix, Status: 1, Endpoints: `["declared-only","declared-only"]`}
+	require.NoError(t, pattern.Insert())
+	// Poison the old name-keyed protocol cache with a route that does not own
+	// any new Channel. Neither prefix rules nor stale abilities may contribute.
+	require.NoError(t, db.Create(&model.Ability{Model: metadata.ModelName, ChannelId: provider.Id, Group: "default", Enabled: true}).Error)
+	read(metadata.Id, "custom", "openai-response")
+	read(pattern.Id, "declared-only")
+
+	created := call(http.MethodPost, "/channels", map[string]any{"provider_id": provider.Id, "model_id": metadata.Id, "protocol": protocol.AnthropicMessages, "upstream_model_name": "mutable-upstream"})
+	channelID := int(created["id"].(float64))
+	channelPath := fmt.Sprintf("/channels/%d", channelID)
+	read(metadata.Id, "custom", "openai-response") // pending
+	call(http.MethodPost, channelPath+"/confirm", nil)
+	read(metadata.Id, "custom", "openai-response") // confirmed, disabled
+	// Administrative declarations must not load a purchase price or require an
+	// Offering. Persist an enabled fixture without invoking the price gate.
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channelID).Update("status", model.ChannelEnabled).Error)
+	read(metadata.Id, "anthropic", "custom", "openai-response")
+	read(pattern.Id, "declared-only")
+
+	var priceReads, nativeReads atomic.Int64
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register("native_metadata_price_probe", func(tx *gorm.DB) {
+		if tx.Statement.Table == "price_versions" || tx.Statement.Table == "vendors" || tx.Statement.Table == "model_offerings" {
+			priceReads.Add(1)
+		}
+		if tx.Statement.Table == "channels" {
+			nativeReads.Add(1)
+		}
+	}))
+	t.Cleanup(func() { require.NoError(t, db.Callback().Query().Remove("native_metadata_price_probe")) })
+	for _, path := range []string{"/api/models/?page_size=100", "/api/models/search?keyword=stable-native&page_size=1"} {
+		priceReads.Store(0)
+		nativeReads.Store(0)
+		data := call(http.MethodGet, path, nil)
+		found := false
+		for _, item := range data["items"].([]any) {
+			row := item.(map[string]any)
+			if int(row["id"].(float64)) == metadata.Id {
+				found = true
+				assert.Equal(t, []any{"anthropic", "custom", "openai-response"}, row["supported_endpoints"])
+			}
+		}
+		require.True(t, found)
+		assert.Zero(t, priceReads.Load())
+		assert.EqualValues(t, 2, nativeReads.Load(), "one batch for connection counts and one for native endpoints, never one per Model")
+	}
+	priceReads.Store(0)
+	read(metadata.Id, "anthropic", "custom", "openai-response")
+	assert.Zero(t, priceReads.Load())
+
+	call(http.MethodPut, channelPath, map[string]any{"protocol": protocol.OpenAIResponses})
+	read(metadata.Id, "custom", "openai-response") // mapping edit resets confirmation
+	call(http.MethodPost, channelPath+"/confirm", nil)
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channelID).Update("status", model.ChannelEnabled).Error)
+	read(metadata.Id, "custom", "openai-response", "openai-response-compact")
+	call(http.MethodPost, channelPath+"/disable", nil)
+	read(metadata.Id, "custom", "openai-response")
+	require.Error(t, db.Model(&model.Channel{}).Where("id = ?", channelID).Updates(map[string]any{"status": model.ChannelEnabled, "mapping_confirmed": false}).Error)
+	read(metadata.Id, "custom", "openai-response") // invalid enable cannot change the declaration
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channelID).Update("status", model.ChannelEnabled).Error)
+	for _, status := range []int{common.ChannelStatusManuallyDisabled, common.ChannelStatusAutoDisabled, common.ChannelStatusEnabled} {
+		require.NoError(t, db.Model(&model.Provider{}).Where("id = ?", provider.Id).Update("status", status).Error)
+		if status == common.ChannelStatusEnabled {
+			read(metadata.Id, "custom", "openai-response", "openai-response-compact")
+		} else {
+			read(metadata.Id, "custom", "openai-response")
+		}
+	}
+
+	// A rename keeps ID ownership; recreating the old name cannot inherit it.
+	call(http.MethodPut, "/api/models/", map[string]any{"id": metadata.Id, "model_name": "renamed-native", "status": 0, "endpoints": `["array-custom","openai-response"]`})
+	read(metadata.Id, "array-custom", "openai-response", "openai-response-compact")
+	other := call(http.MethodPost, "/api/models/", map[string]any{"model_name": metadata.ModelName, "status": 1})
+	otherID := int(other["id"].(float64))
+	read(otherID)
+	call(http.MethodPut, channelPath, map[string]any{"model_id": otherID})
+	call(http.MethodPost, channelPath+"/confirm", nil)
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channelID).Update("status", model.ChannelEnabled).Error)
+	read(metadata.Id, "array-custom", "openai-response")
+	read(otherID, "openai-response", "openai-response-compact")
+	call(http.MethodDelete, channelPath, nil)
+	read(otherID)
+	// Hard-deleted Providers cannot leave native declarations behind. The FK
+	// first prevents deleting an account while its Channels still exist.
+	require.Error(t, db.Delete(&provider).Error)
+	require.NoError(t, db.Where("provider_id = ?", provider.Id).Delete(&model.Channel{}).Error)
+	require.NoError(t, db.Delete(&provider).Error)
+	read(otherID)
+	read(metadata.Id, "array-custom", "openai-response")
+	call(http.MethodDelete, fmt.Sprintf("/api/models/%d", metadata.Id), nil)
+	replacement := call(http.MethodPost, "/api/models/", map[string]any{"model_name": "renamed-native", "status": 1})
+	replacementID := int(replacement["id"].(float64))
+	require.NotEqual(t, metadata.Id, replacementID)
+	read(replacementID)
+}
+
+func TestMetadataWritesDoNotReadLegacyPricing(t *testing.T) {
+	db := modelManagementDB(t)
+	var legacyReads atomic.Int64
+	rejectLegacyRead := func(tx *gorm.DB) {
+		if tx.Statement.Table == "abilities" {
+			legacyReads.Add(1)
+			tx.AddError(errors.New("legacy abilities are unavailable to metadata operations"))
+		}
+	}
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register("metadata_without_legacy_pricing", rejectLegacyRead))
+	require.NoError(t, db.Callback().Row().Before("gorm:row").Register("metadata_without_legacy_pricing", rejectLegacyRead))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Query().Remove("metadata_without_legacy_pricing"))
+		require.NoError(t, db.Callback().Row().Remove("metadata_without_legacy_pricing"))
+	})
+	request := func(t *testing.T, handler gin.HandlerFunc, method, path string, id int, body any) int {
+		t.Helper()
+		before := legacyReads.Load()
+		var response struct {
+			Success bool
+			Data    struct{ ID int }
+		}
+		recorder := modelManagementRequest(t, func(c *gin.Context) {
+			if id > 0 {
+				c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(id)}}
+			}
+			handler(c)
+		}, method, path, body, &response)
+		require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+		require.True(t, response.Success, recorder.Body.String())
+		assert.Equal(t, before, legacyReads.Load(), "%s %s must not depend on legacy abilities", method, path)
+		return response.Data.ID
+	}
+
+	publisherID := request(t, CreateVendorMeta, http.MethodPost, "/api/vendors", 0, map[string]any{"name": "Independent metadata publisher"})
+	require.Positive(t, publisherID)
+	request(t, UpdateVendorMeta, http.MethodPut, "/api/vendors", 0, map[string]any{"id": publisherID, "name": "Renamed metadata publisher", "description": "Current publisher"})
+	publisher, err := model.GetVendorByID(publisherID)
+	require.NoError(t, err)
+	assert.Equal(t, "Renamed metadata publisher", publisher.Name)
+	assert.Equal(t, "Current publisher", publisher.Description)
+
+	for _, tc := range []struct {
+		name, path, nameKey, publisherKey string
+		create, update, remove            gin.HandlerFunc
+	}{
+		{"metadata", "/api/models", "model_name", "vendor_id", CreateModelMeta, UpdateModelMeta, DeleteModelMeta},
+		{"declarations", "/api/admin/v1/models", "name", "publisher_id", AdminCreateModel, AdminUpdateModel, AdminDeleteModel},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := map[string]any{tc.nameKey: "independent-" + tc.name, tc.publisherKey: publisherID, "description": "Before edit", "status": 1, "sync_official": 1, "endpoints": `["openai"]`}
+			id := request(t, tc.create, http.MethodPost, tc.path, 0, body)
+			require.Positive(t, id)
+			body["id"], body["description"] = id, "After edit"
+			request(t, tc.update, http.MethodPut, tc.path+"/"+strconv.Itoa(id), id, body)
+			stored, err := model.GetExactModel(id)
+			require.NoError(t, err)
+			assert.Equal(t, body[tc.nameKey], stored.ModelName)
+			assert.Equal(t, publisherID, stored.VendorID)
+			assert.Equal(t, "After edit", stored.Description)
+			assert.Equal(t, `["openai"]`, stored.Endpoints)
+			if tc.name == "metadata" {
+				request(t, UpdateModelMeta, http.MethodPut, tc.path+"?status_only=true", id, map[string]any{"id": id, "status": 0})
+				stored, err = model.GetExactModel(id)
+				require.NoError(t, err)
+				assert.Zero(t, stored.Status)
+				assert.Equal(t, "After edit", stored.Description)
+			}
+			request(t, tc.remove, http.MethodDelete, tc.path+"/"+strconv.Itoa(id), id, nil)
+			_, err = model.GetExactModel(id)
+			assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
+		})
+	}
+
+	t.Run("synchronization_and_publisher_assignment", func(t *testing.T) {
+		before := legacyReads.Load()
+		update := model.MetadataSyncUpdate{
+			MetadataSyncSelection: model.MetadataSyncSelection{ModelName: "independent-synchronized", RecordVersion: model.MetadataRecordVersion(nil, nil, nil), Create: true},
+			Values:                model.MetadataValues{Description: "Synchronized metadata", Status: 1, Endpoints: `["openai"]`},
+		}
+		result, err := model.ApplyMetadataSync([]model.MetadataSyncUpdate{update}, nil)
+		require.NoError(t, err)
+		assert.Equal(t, []string{update.ModelName}, result.CreatedModels)
+		assert.Equal(t, before, legacyReads.Load(), "synchronization must not read legacy abilities")
+		var stored model.Model
+		require.NoError(t, db.Where("model_name = ?", update.ModelName).First(&stored).Error)
+		assert.Equal(t, update.Values.Description, stored.Description)
+		operation := model.VendorOperation{Action: "assign", ModelIDs: []int{stored.Id}, TargetVendorID: publisherID}
+		preview, err := model.PreviewVendorOperation(operation)
+		require.NoError(t, err)
+		operation.ExpectedVersion = preview.Version
+		request(t, ApplyVendorOperation, http.MethodPost, "/api/vendors/operations", 0, operation)
+		assigned, err := model.GetExactModel(stored.Id)
+		require.NoError(t, err)
+		assert.Equal(t, publisherID, assigned.VendorID)
+		assert.Equal(t, update.Values.Description, assigned.Description)
+		request(t, BatchDeleteModelMeta, http.MethodPost, "/api/models/delete", 0, map[string]any{"model_ids": []int{stored.Id}})
+		_, err = model.GetExactModel(stored.Id)
+		assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	})
+	request(t, DeleteVendorMeta, http.MethodDelete, "/api/vendors/"+strconv.Itoa(publisherID), publisherID, nil)
+	_, err = model.GetVendorByID(publisherID)
+	assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
+}
+
+func TestMetadataDeletionPreservesNativeSalesAndHistoricalSources(t *testing.T) {
+	db := modelManagementDB(t)
+	record := model.Model{ModelName: "metadata-delete-cache", Description: "Before deletion", Status: 1}
+	require.NoError(t, record.Insert())
+	provider := model.Provider{Name: "Historical source", Type: 1, Status: common.ChannelStatusEnabled}
+	require.NoError(t, db.Create(&provider).Error)
+	ability := model.Ability{ChannelId: provider.Id, Model: record.ModelName, Group: "default", Enabled: true}
+	require.NoError(t, db.Create(&ability).Error)
+	require.NoError(t, db.Create(&model.Option{Key: "ModelPrice", Value: `{"metadata-delete-cache":0}`}).Error)
+	owner := modelManagementPriceOwner(t, db, "metadata-sale-retained", protocol.OpenAIChat)
+	modelManagementSale(t, db, owner.ModelID, "metadata-sale")
+	sales, prices, options := modelManagementSales(t, db), modelManagementPrices(t, db), modelManagementOptions(t, db)
+	require.Len(t, sales, 1)
+	before, err := model.GetExactModel(record.Id)
+	require.NoError(t, err)
+	assert.Equal(t, record.Description, before.Description)
+	result, err := model.DeleteModelMetadata([]int{record.Id})
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.DeletedCount)
+	_, err = model.GetExactModel(record.Id)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	var response struct {
+		Success bool
+		Data    struct {
+			Items []model.Model
+			Total int
+		}
+	}
+	modelManagementRequest(t, SearchModelsMeta, http.MethodGet, "/api/models/search?keyword=metadata-delete-cache", nil, &response)
+	require.True(t, response.Success)
+	assert.Empty(t, response.Data.Items)
+	assert.Zero(t, response.Data.Total, "deleted metadata must not reappear through historical Ability or Option data")
+	assert.Equal(t, sales, modelManagementSales(t, db))
+	assert.Equal(t, prices, modelManagementPrices(t, db))
+	assert.Equal(t, options, modelManagementOptions(t, db))
+	var preserved model.Ability
+	require.NoError(t, db.First(&preserved).Error)
+	assert.Equal(t, ability, preserved)
 }
 
 func TestModelManagementDatabase(t *testing.T) {
@@ -464,7 +965,7 @@ export function parseTaskResult() { return {}; }
 	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister("model-management-task") })
 	db := modelManagementDB(t)
 
-	t.Run("square_states_follow_catalog_policy", func(t *testing.T) {
+	t.Run("square_states_follow_stable_channel_status", func(t *testing.T) {
 		records := []model.Model{
 			{ModelName: "square-visible", Status: 1},
 			{ModelName: "square-hidden", Status: 0},
@@ -492,12 +993,20 @@ export function parseTaskResult() { return {}; }
 			Models: "square-disabled,square-partial-off,square-off-child"}
 		for _, channel := range []*model.Provider{&active, &inactive} {
 			require.NoError(t, channel.Insert())
+			require.NoError(t, channel.AddAbilities(nil))
 		}
+		connections := []model.Channel{
+			{ProviderID: active.Id, ModelID: records[0].Id, Protocol: "openai_chat", UpstreamModelName: "visible", ParameterOverrides: "{}", Status: model.ChannelEnabled, MappingConfirmed: true},
+			{ProviderID: active.Id, ModelID: records[1].Id, Protocol: "openai_chat", UpstreamModelName: "hidden", ParameterOverrides: "{}", Status: model.ChannelEnabled, MappingConfirmed: true},
+			{ProviderID: inactive.Id, ModelID: records[2].Id, Protocol: "openai_chat", UpstreamModelName: "disabled", ParameterOverrides: "{}", Status: model.ChannelEnabled, MappingConfirmed: true},
+			{ProviderID: active.Id, ModelID: records[7].Id, Protocol: "openai_chat", UpstreamModelName: "override", ParameterOverrides: "{}", Status: model.ChannelEnabled, MappingConfirmed: true},
+		}
+		require.NoError(t, db.Create(&connections).Error)
 		t.Cleanup(func() {
+			require.NoError(t, db.Where("model_id IN ?", ids).Delete(&model.Channel{}).Error)
 			require.NoError(t, db.Where("channel_id IN ?", []int{active.Id, inactive.Id}).Delete(&model.Ability{}).Error)
 			require.NoError(t, db.Where("id IN ?", []int{active.Id, inactive.Id}).Delete(&model.Provider{}).Error)
 			require.NoError(t, db.Unscoped().Where("id IN ?", ids).Delete(&model.Model{}).Error)
-			model.RefreshPricing()
 		})
 		var response struct {
 			Success bool
@@ -509,44 +1018,28 @@ export function parseTaskResult() { return {}; }
 		for _, row := range response.Data.Items {
 			byName[row.ModelName] = row
 		}
-		catalog := make(map[string]bool)
-		model.RefreshPricing()
-		for _, row := range model.GetPricing() {
-			catalog[row.ModelName] = true
-		}
 		expected := map[string]model.ModelSquareState{
 			"square-visible":         model.ModelSquareVisible,
 			"square-hidden":          model.ModelSquareHidden,
 			"square-catalog":         model.ModelSquareUnavailable,
 			"square-hidden-catalog":  model.ModelSquareHidden,
-			"square-bare":            model.ModelSquareVisible,
-			"square-disabled":        model.ModelSquareUnavailable,
-			"square-partial-":        model.ModelSquarePartial,
+			"square-partial-":        model.ModelSquareUnavailable,
 			"square-partial-hidden":  model.ModelSquareHidden,
-			"square-partial-on":      model.ModelSquareVisible,
-			"square-partial-off":     model.ModelSquareUnavailable,
-			"square-hidden-":         model.ModelSquarePartial,
-			"square-hidden-child":    model.ModelSquareHidden,
+			"square-hidden-":         model.ModelSquareHidden,
 			"square-hidden-override": model.ModelSquareVisible,
 			"square-off-":            model.ModelSquareHidden,
-			"square-off-child":       model.ModelSquareHidden,
 			"square-empty":           model.ModelSquareUnavailable,
 			"square-empty-hidden":    model.ModelSquareHidden,
-			"square-prefix-ending":   model.ModelSquareHidden,
-			"square-contains-ending": model.ModelSquareVisible,
-			"square-contains":        model.ModelSquareVisible,
 			"square-prefix-":         model.ModelSquareHidden,
+			"square-contains":        model.ModelSquareHidden,
 		}
 		for name, state := range expected {
 			row, exists := byName[name]
 			require.True(t, exists, name)
 			assert.Equal(t, state, row.SquareState, name)
-			if row.NameRule == model.NameRuleExact {
-				assert.Equal(t, state == model.ModelSquareVisible, catalog[name], name)
-			}
 		}
-		assert.Zero(t, byName["square-bare"].Id)
-		assert.Zero(t, byName["square-hidden-child"].Id)
+		assert.NotContains(t, byName, "square-bare")
+		assert.NotContains(t, byName, "square-hidden-child")
 		t.Run("filter_square_state_before_pagination", func(t *testing.T) {
 			type filteredResponse struct {
 				Success bool
@@ -589,11 +1082,11 @@ export function parseTaskResult() { return {}; }
 				query   string
 				names   []string
 			}{
-				{"list", GetAllModelsMeta, "?include_channel_models=true&square_state=visible", []string{"square-visible", "square-bare", "square-partial-on", "square-hidden-override", "square-contains-ending", "square-contains"}},
-				{"metadata_only", SearchModelsMeta, "?keyword=square-&square_state=visible", []string{"square-visible", "square-hidden-override", "square-contains"}},
+				{"list", GetAllModelsMeta, "?include_channel_models=true&square_state=visible", []string{"square-visible", "square-hidden-override"}},
+				{"metadata_only", SearchModelsMeta, "?keyword=square-&square_state=visible", []string{"square-visible", "square-hidden-override"}},
 				{"keyword", SearchModelsMeta, "?include_channel_models=true&keyword=square-partial&square_state=hidden", []string{"square-partial-hidden"}},
-				{"policy", SearchModelsMeta, "?include_channel_models=true&keyword=square-&square_state=partial&status=disabled", []string{"square-hidden-"}},
-				{"vendor_and_sync", SearchModelsMeta, "?include_channel_models=true&keyword=square-&square_state=partial&vendor=0&sync_official=no", []string{"square-hidden-", "square-partial-"}},
+				{"policy", SearchModelsMeta, "?include_channel_models=true&keyword=square-&square_state=partial&status=disabled", []string{}},
+				{"vendor_and_sync", SearchModelsMeta, "?include_channel_models=true&keyword=square-&square_state=partial&vendor=0&sync_official=no", []string{}},
 				{"no_matches", SearchModelsMeta, "?include_channel_models=true&keyword=square-bare&square_state=hidden", []string{}},
 			} {
 				t.Run(test.name, func(t *testing.T) {
@@ -621,7 +1114,7 @@ export function parseTaskResult() { return {}; }
 			var oversizedPage filteredResponse
 			modelManagementRequest(t, SearchModelsMeta, "GET", "/api/models/search?square_state=visible&keyword=square-&p="+strconv.Itoa(int(^uint(0)>>1)), nil, &oversizedPage)
 			require.True(t, oversizedPage.Success)
-			assert.Equal(t, 3, oversizedPage.Data.Total)
+			assert.Equal(t, 2, oversizedPage.Data.Total)
 			assert.Empty(t, oversizedPage.Data.Items)
 		})
 		var detail struct {
@@ -633,7 +1126,7 @@ export function parseTaskResult() { return {}; }
 			GetModelMeta(c)
 		}, "GET", "/api/models/"+strconv.Itoa(records[4].Id), nil, &detail)
 		require.True(t, detail.Success)
-		assert.Equal(t, model.ModelSquarePartial, detail.Data.SquareState)
+		assert.Equal(t, model.ModelSquareUnavailable, detail.Data.SquareState)
 	})
 	t.Run("channel_model_listing", func(t *testing.T) {
 		exact := model.Model{ModelName: "listing-exact", Status: 1, SyncOfficial: 1}
@@ -646,12 +1139,18 @@ export function parseTaskResult() { return {}; }
 		inactive := model.Provider{Name: "Listing inactive", Type: 1, Key: "fixture", Models: "listing-new,listing-disabled", Group: "default", Status: common.ChannelStatusManuallyDisabled}
 		for _, channel := range []*model.Provider{&active, &inactive} {
 			require.NoError(t, channel.Insert())
+			require.NoError(t, channel.AddAbilities(nil))
 		}
+		connections := []model.Channel{
+			{ProviderID: active.Id, ModelID: exact.Id, Protocol: "openai_chat", UpstreamModelName: "exact", ParameterOverrides: "{}", Status: model.ChannelEnabled, MappingConfirmed: true},
+			{ProviderID: inactive.Id, ModelID: exact.Id, Protocol: "openai_chat", UpstreamModelName: "disabled", ParameterOverrides: "{}", Status: model.ChannelEnabled, MappingConfirmed: true},
+		}
+		require.NoError(t, db.Create(&connections).Error)
 		t.Cleanup(func() {
+			require.NoError(t, db.Where("model_id = ?", exact.Id).Delete(&model.Channel{}).Error)
 			require.NoError(t, db.Where("channel_id IN ?", []int{active.Id, inactive.Id}).Delete(&model.Ability{}).Error)
 			require.NoError(t, db.Where("id IN ?", []int{active.Id, inactive.Id}).Delete(&model.Provider{}).Error)
 			require.NoError(t, db.Unscoped().Where("model_name LIKE ?", "listing-%").Delete(&model.Model{}).Error)
-			model.RefreshPricing()
 		})
 		type listingResponse struct {
 			Success bool
@@ -663,31 +1162,32 @@ export function parseTaskResult() { return {}; }
 		var response listingResponse
 		modelManagementRequest(t, SearchModelsMeta, "GET", "/api/models/search?include_channel_models=true&keyword=listing-", nil, &response)
 		require.True(t, response.Success)
-		require.Equal(t, 6, response.Data.Total)
+		require.Equal(t, 3, response.Data.Total)
 		names := make([]string, 0)
 		byName := make(map[string]model.Model)
 		for _, item := range response.Data.Items {
 			names = append(names, item.ModelName)
 			byName[item.ModelName] = item
 		}
-		assert.Equal(t, []string{"listing-rule-", "listing-catalog", "listing-exact", "listing-disabled", "listing-new", "listing-rule-child"}, names)
+		assert.Equal(t, []string{"listing-rule-", "listing-catalog", "listing-exact"}, names)
 		assert.True(t, byName[exact.ModelName].HasMetadata)
-		assert.False(t, byName["listing-new"].HasMetadata)
-		assert.Zero(t, byName["listing-new"].Id)
-		assert.Equal(t, 2, byName["listing-new"].ConfiguredChannelCount)
-		assert.Equal(t, 1, byName["listing-disabled"].ConfiguredChannelCount)
-		assert.Empty(t, byName["listing-disabled"].BoundChannels)
+		assert.NotContains(t, byName, "listing-new")
+		assert.NotContains(t, byName, "listing-disabled")
+		assert.NotContains(t, byName, "listing-rule-child")
+		assert.Equal(t, 2, byName[exact.ModelName].ConfiguredChannelCount)
+		assert.Equal(t, 1, byName[exact.ModelName].EnabledChannelCount)
+		assert.Zero(t, byName[rule.ModelName].ConfiguredChannelCount)
 		assert.Zero(t, byName[catalog.ModelName].ConfiguredChannelCount)
 		for _, tc := range []struct {
 			query string
 			total int
 			names []string
 		}{
-			{"&p=2&page_size=2", 6, []string{"listing-exact", "listing-disabled"}},
-			{"&p=9&page_size=2", 6, []string{}},
+			{"&p=2&page_size=2", 3, []string{"listing-exact"}},
+			{"&p=9&page_size=2", 3, []string{}},
 			{"&status=enabled", 3, []string{"listing-rule-", "listing-catalog", "listing-exact"}},
 			{"&sync_official=no", 2, []string{"listing-rule-", "listing-catalog"}},
-			{"&vendor=0", 6, []string{"listing-rule-", "listing-catalog", "listing-exact", "listing-disabled", "listing-new", "listing-rule-child"}},
+			{"&vendor=0", 3, []string{"listing-rule-", "listing-catalog", "listing-exact"}},
 			{"&vendor=999", 0, []string{}},
 		} {
 			var page listingResponse
@@ -706,19 +1206,25 @@ export function parseTaskResult() { return {}; }
 		var count int64
 		require.NoError(t, db.Model(&model.Model{}).Where("model_name LIKE ?", "listing-%").Count(&count).Error)
 		assert.EqualValues(t, 3, count)
-		prices, err := model.GetModelPricingSnapshot([]string{"listing-new"})
-		require.NoError(t, err)
-		require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{{ModelName: "listing-new", ExpectedVersion: prices.Entries[0].Version, Pricing: model.PricingValues{"ModelPrice": float64(0)}}}))
-		t.Cleanup(func() {
-			snapshot, err := model.GetModelPricingSnapshot([]string{"listing-new"})
-			require.NoError(t, err)
-			require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{{ModelName: "listing-new", ExpectedVersion: snapshot.Entries[0].Version, Reset: true}}))
-		})
+		// Historical price-only names do not create native metadata records.
+		require.NoError(t, db.Create(&model.Option{Key: "ModelPrice", Value: `{"listing-new":0}`}).Error)
+		priceOnly := modelManagementOptions(t, db)
+		t.Cleanup(func() { require.NoError(t, db.Where(`"key" = ?`, "ModelPrice").Delete(&model.Option{}).Error) })
 		require.NoError(t, db.Model(&model.Model{}).Where("model_name = ?", "listing-new").Count(&count).Error)
 		assert.Zero(t, count)
-		for _, price := range model.GetPricing() {
-			assert.NotEqual(t, catalog.ModelName, price.ModelName)
-		}
+		saleOwner := modelManagementPriceOwner(t, db, "sales-listed-member", protocol.OpenAIChat)
+		offering, salePrice := modelManagementSale(t, db, saleOwner.ModelID, "sales-listed")
+		sales := modelManagementSales(t, db)
+		require.Len(t, sales, 1)
+		assert.Equal(t, offering.ID, sales[0].ID)
+		require.NotNil(t, sales[0].Price)
+		assert.Equal(t, salePrice.ID, sales[0].Price.ID)
+		assert.Equal(t, salePrice.Expression, sales[0].Price.Expression)
+		require.Len(t, sales[0].Members, 1)
+		assert.Equal(t, saleOwner.ModelID, sales[0].Members[0].ModelID)
+		assert.NotEqual(t, catalog.ModelName, sales[0].Members[0].Name)
+		assert.NotEqual(t, "listing-new", sales[0].Members[0].Name)
+		priceHistory := modelManagementPrices(t, db)
 		created := model.Model{ModelName: "listing-new", Status: 1}
 		require.NoError(t, created.Insert())
 		var after listingResponse
@@ -728,10 +1234,13 @@ export function parseTaskResult() { return {}; }
 		require.NoError(t, created.Delete())
 		after = listingResponse{}
 		modelManagementRequest(t, SearchModelsMeta, "GET", "/api/models/search?include_channel_models=true&keyword=listing-new", nil, &after)
-		require.Len(t, after.Data.Items, 1)
-		assert.False(t, after.Data.Items[0].HasMetadata)
+		require.Empty(t, after.Data.Items)
+		assert.Zero(t, after.Data.Total)
+		assert.Equal(t, priceOnly, modelManagementOptions(t, db), "metadata create/delete preserves even an explicit historical zero")
+		assert.Equal(t, sales, modelManagementSales(t, db))
+		assert.Equal(t, priceHistory, modelManagementPrices(t, db))
 		require.NoError(t, db.Callback().Query().Before("gorm:query").Register("fail_listing_channels", func(tx *gorm.DB) {
-			if tx.Statement.Table == "providers" {
+			if tx.Statement.Table == "channels" {
 				tx.AddError(errors.New("channel lookup failed"))
 			}
 		}))
@@ -742,66 +1251,45 @@ export function parseTaskResult() { return {}; }
 
 	})
 
-	t.Run("pricing_saves_zero_switches_modes_and_rejects_stale_batches", func(t *testing.T) {
-		before, err := model.GetModelPricingSnapshot([]string{"matrix-priced", "matrix-other"})
-		require.NoError(t, err)
-		changes := []model.ModelPricingChange{
-			{ModelName: "matrix-priced", ExpectedVersion: before.EmptyVersion, Pricing: model.PricingValues{"ModelPrice": float64(0), "billing_setting.billing_mode": "ratio"}},
-			{ModelName: "matrix-other", ExpectedVersion: before.EmptyVersion, Pricing: model.PricingValues{"ModelRatio": float64(1), "CreateCacheRatio": 1.25}},
+	t.Run("immutable_prices_preserve_zero_and_reject_conflicting_versions", func(t *testing.T) {
+		owner := modelManagementPriceOwner(t, db, "matrix-priced", protocol.OpenAIChat)
+		other := modelManagementPriceOwner(t, db, "matrix-other", protocol.OpenAIChat)
+		actor := modelManagementPriceActor(t, db)
+		options := modelManagementOptions(t, db)
+		free := modelManagementPrice(t, db, owner, `tier("request", fixed(0))`, 1)
+		separate := modelManagementPrice(t, db, other, `tier("base", p * 2 + cc * 2.5)`, 1)
+		paid := modelManagementPrice(t, db, owner, `tier("base", p * 2 + c * 8 + cr * 0 + cc * 2.5)`, 2)
+		for _, expected := range []model.PriceVersion{free, paid, separate} {
+			current, err := model.CurrentPriceVersion(context.Background(), db, expected.OwnerType, expected.OwnerID, expected.EffectiveAt)
+			require.NoError(t, err)
+			assert.Equal(t, expected.ID, current.ID)
+			assert.Equal(t, expected.Expression, current.Expression)
 		}
-		require.NoError(t, model.UpdateModelPricing(changes))
-		loaded, err := model.GetModelPricingSnapshot([]string{"matrix-priced"})
-		require.NoError(t, err)
-		assert.Equal(t, float64(0), loaded.Entries[0].Effective["ModelPrice"])
-		stale := changes[0]
-		changes[0].ExpectedVersion = loaded.Entries[0].Version
-		changes[0].Pricing = model.PricingValues{"billing_setting.billing_mode": "tiered_expr", "billing_setting.billing_expr": `tier("base", p * 2 + c * 8 + cr * 0 + cc * 2.5)`, "ModelRatio": float64(1)}
-		require.NoError(t, model.UpdateModelPricing(changes[:1]))
-		loaded, err = model.GetModelPricingSnapshot([]string{"matrix-priced", "matrix-other"})
-		require.NoError(t, err)
-		assert.Equal(t, 1.25, loaded.Entries[0].Configured["CreateCacheRatio"])
-		assert.Equal(t, "tiered_expr", loaded.Entries[1].Effective["billing_setting.billing_mode"])
-		_, oldFixed := loaded.Entries[1].Configured["ModelPrice"]
-		assert.False(t, oldFixed)
-		other := model.ModelPricingChange{ModelName: "matrix-other", ExpectedVersion: loaded.Entries[0].Version, Pricing: model.PricingValues{"ModelRatio": float64(9)}}
-		err = model.UpdateModelPricing([]model.ModelPricingChange{other, stale})
-		assert.ErrorIs(t, err, model.ErrModelPricingConflict)
-		after, err := model.GetModelPricingSnapshot([]string{"matrix-priced", "matrix-other"})
-		require.NoError(t, err)
-		assert.Equal(t, loaded.Entries, after.Entries)
-		invalid := other
-		invalid.Pricing = model.PricingValues{"ModelPrice": float64(-1)}
-		assert.Error(t, model.UpdateModelPricing([]model.ModelPricingChange{invalid}))
-		// A physical failure after earlier option writes must roll back all
-		// rows and leave the previously published runtime price intact.
-		writes := 0
-		require.NoError(t, db.Callback().Update().Before("gorm:update").Register("fail_pricing_matrix", func(tx *gorm.DB) {
-			if tx.Statement.Table == "options" {
-				writes++
-				if writes == 3 {
-					tx.AddError(errors.New("injected write failure"))
-				}
+		loaded := modelManagementPrices(t, db)
+		duplicate := model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: owner.ID, Currency: money.Currency("USD"), Expression: `tier("request", fixed(9))`, EffectiveAt: 2}
+		require.ErrorContains(t, model.CreatePriceVersion(context.Background(), &duplicate, actor), "23505")
+		invalid := model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: other.ID, Currency: money.Currency("USD"), Expression: `tier("request", fixed(-1))`, EffectiveAt: 3}
+		require.Error(t, model.CreatePriceVersion(context.Background(), &invalid, actor))
+		assert.Equal(t, loaded, modelManagementPrices(t, db))
+		// An actual SQL error after INSERT must roll back the new history row.
+		require.NoError(t, db.Callback().Create().After("gorm:create").Register("fail_pricing_matrix", func(tx *gorm.DB) {
+			if tx.Statement.Table == "price_versions" {
+				tx.AddError(tx.Session(&gorm.Session{NewDB: true}).Exec("SELECT 1/0").Error)
 			}
 		}))
-		err = model.UpdateModelPricing([]model.ModelPricingChange{other})
-		require.Error(t, err)
-		require.NoError(t, db.Callback().Update().Remove("fail_pricing_matrix"))
-		after, err = model.GetModelPricingSnapshot([]string{"matrix-priced", "matrix-other"})
-		require.NoError(t, err)
-		assert.Equal(t, loaded.Entries, after.Entries)
-		ratio, _, _ := ratio_setting.GetModelRatio("matrix-other")
-		assert.Equal(t, float64(1), ratio)
-		// Two saves based on the same version cannot both succeed.
+		proposal := model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: other.ID, Currency: money.Currency("USD"), Expression: `tier("request", fixed(9))`, EffectiveAt: 3}
+		err := model.CreatePriceVersion(context.Background(), &proposal, actor)
+		require.NoError(t, db.Callback().Create().Remove("fail_pricing_matrix"))
+		require.ErrorContains(t, err, "22012", "failure must come from PostgreSQL after the inserted price, not validation or query construction")
+		assert.Equal(t, loaded, modelManagementPrices(t, db))
+		// Concurrent appends at one effective instant have exactly one winner.
 		var wg sync.WaitGroup
 		results := make(chan error, 2)
-		for _, value := range []float64{3, 4} {
-			wg.Add(1)
-			go func(value float64) {
-				defer wg.Done()
-				change := other
-				change.Pricing = model.PricingValues{"ModelRatio": value}
-				results <- model.UpdateModelPricing([]model.ModelPricingChange{change})
-			}(value)
+		for _, expression := range []string{`tier("request", fixed(3))`, `tier("request", fixed(4))`} {
+			wg.Go(func() {
+				proposal := model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: other.ID, Currency: money.Currency("USD"), Expression: expression, EffectiveAt: 3}
+				results <- model.CreatePriceVersion(context.Background(), &proposal, actor)
+			})
 		}
 		wg.Wait()
 		close(results)
@@ -809,47 +1297,55 @@ export function parseTaskResult() { return {}; }
 		for err := range results {
 			if err == nil {
 				successes++
-			} else if errors.Is(err, model.ErrModelPricingConflict) {
-				conflicts++
 			} else {
-				require.NoError(t, err)
+				require.ErrorContains(t, err, "23505")
+				conflicts++
 			}
 		}
 		assert.Equal(t, 1, successes)
 		assert.Equal(t, 1, conflicts)
+		winner, err := model.CurrentPriceVersion(context.Background(), db, model.PriceOwnerChannel, other.ID, 3)
+		require.NoError(t, err)
+		assert.Contains(t, []string{`tier("request", fixed(3))`, `tier("request", fixed(4))`}, winner.Expression)
+		require.Error(t, db.Model(&model.PriceVersion{}).Where("id = ?", free.ID).Update("expression", `tier("request", fixed(7))`).Error)
+		require.Error(t, db.Delete(&model.PriceVersion{}, free.ID).Error)
+		require.Error(t, db.Exec("TRUNCATE price_versions").Error)
+		assert.Equal(t, loaded, modelManagementPrices(t, db)[:len(loaded)], "all prior versions remain byte-for-byte unchanged")
+		assert.Equal(t, options, modelManagementOptions(t, db))
 	})
-	t.Run("task_usage_and_builtin_reset", func(t *testing.T) {
-		snapshot, err := model.GetModelPricingSnapshot([]string{"matrix-task"})
-		require.NoError(t, err)
-		assert.Contains(t, snapshot.Entries[0].UsageSchema, "seconds")
+	t.Run("task_usage_and_offline_builtin_defaults", func(t *testing.T) {
+		plugin, ok := jsplugin.DefaultRegistry.Generation().GetByModel("matrix-task")
+		require.True(t, ok)
+		schema, _ := plugin.Meta.UsageForModel("matrix-task")
+		assert.Contains(t, schema, "seconds")
+		owner := modelManagementPriceOwner(t, db, "matrix-task", protocol.Type("task:"+plugin.Meta.Key))
 		expression := `tier("base", u("seconds") * 0.25)`
-		change := model.ModelPricingChange{ModelName: "matrix-task", ExpectedVersion: snapshot.Entries[0].Version, Pricing: model.PricingValues{"billing_setting.billing_mode": "tiered_expr", "billing_setting.billing_expr": expression}}
-		require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{change}))
-		snapshot, err = model.GetModelPricingSnapshot([]string{"matrix-task"})
+		price := modelManagementPrice(t, db, owner, expression, 1)
+		before := modelManagementPrices(t, db)
+		invalid := model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: owner.ID, Currency: money.Currency("USD"), Expression: `tier("base", u("undeclared") * 1)`, EffectiveAt: 2}
+		require.Error(t, model.CreatePriceVersion(context.Background(), &invalid, price.CreatedBy))
+		assert.Equal(t, before, modelManagementPrices(t, db))
+		const name = "gpt-6-astra"
+		builtin, exists := billing_setting.GetBuiltinBillingExpr(name)
+		require.True(t, exists)
+		source := legacyPricingSource(t, db)
+		options := modelManagementOptions(t, db)
+		custom, err := source.Preview(name, model.PricingValues{"ModelPrice": float64(0)})
 		require.NoError(t, err)
-		assert.Equal(t, expression, snapshot.Entries[0].Effective["billing_setting.billing_expr"])
-		change.ExpectedVersion = snapshot.Entries[0].Version
-		change.Pricing["billing_setting.billing_expr"] = `tier("base", u("undeclared") * 1)`
-		assert.Error(t, model.UpdateModelPricing([]model.ModelPricingChange{change}))
-		{
-			const name = "gpt-6-astra"
-			builtin, exists := billing_setting.GetBuiltinBillingExpr(name)
-			require.True(t, exists)
-			before, err := model.GetModelPricingSnapshot([]string{name})
+		assert.Equal(t, `tier("request", fixed(0))`, custom.Expression)
+		// Choosing a builtin is now an explicit immutable owner version, not a
+		// reset that deletes stored model-name prices or invents a conversion.
+		builtinOwner := modelManagementPriceOwner(t, db, name, protocol.OpenAIChat)
+		customPrice := modelManagementPrice(t, db, builtinOwner, custom.Expression, 1)
+		builtinPrice := modelManagementPrice(t, db, builtinOwner, builtin, 2)
+		for _, expected := range []model.PriceVersion{customPrice, builtinPrice} {
+			current, err := model.CurrentPriceVersion(context.Background(), db, expected.OwnerType, expected.OwnerID, expected.EffectiveAt)
 			require.NoError(t, err)
-			require.Empty(t, before.Entries[0].Configured)
-			change = model.ModelPricingChange{ModelName: name, ExpectedVersion: before.Entries[0].Version, Pricing: model.PricingValues{"ModelPrice": float64(0)}}
-			require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{change}))
-			custom, err := model.GetModelPricingSnapshot([]string{name})
-			require.NoError(t, err)
-			assert.Equal(t, float64(0), custom.Entries[0].Effective["ModelPrice"])
-			change.ExpectedVersion, change.Pricing, change.Reset = custom.Entries[0].Version, nil, true
-			require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{change}))
-			reset, err := model.GetModelPricingSnapshot([]string{name})
-			require.NoError(t, err)
-			assert.Empty(t, reset.Entries[0].Configured)
-			assert.Equal(t, builtin, reset.Entries[0].Effective["billing_setting.billing_expr"])
+			assert.Equal(t, expected.ID, current.ID)
+			assert.Equal(t, expected.Expression, current.Expression)
 		}
+		assert.Equal(t, options, modelManagementOptions(t, db))
+		assert.Equal(t, before, modelManagementPrices(t, db)[:len(before)])
 	})
 	t.Run("concurrent_import_creates_one_record", func(t *testing.T) {
 		update := model.MetadataSyncUpdate{MetadataSyncSelection: model.MetadataSyncSelection{ModelName: "matrix-concurrent-import", RecordVersion: model.MetadataRecordVersion(nil, nil, nil), Create: true}, Values: model.MetadataValues{Description: "Imported", Status: 1}}
@@ -892,32 +1388,41 @@ export function parseTaskResult() { return {}; }
 		exact := &model.Model{ModelName: "matrix-hidden-unpriced", Status: 0, SyncOfficial: 0}
 		require.NoError(t, exact.Insert())
 		rule := &model.Model{ModelName: "matrix-hidden-", NameRule: model.NameRulePrefix}
-		enrichModels([]*model.Model{exact, rule})
-		assert.Equal(t, []string{"available"}, exact.EnableGroups)
-		assert.Equal(t, []model.BoundProvider{{Name: "Active route", Type: 1}}, exact.BoundChannels)
-		assert.Equal(t, []string{"matrix-hidden-unpriced"}, rule.MatchedModels)
+		connection := model.Channel{ProviderID: active.Id, ModelID: exact.Id, Protocol: "openai_chat", UpstreamModelName: "stable", ParameterOverrides: "{}", Status: model.ChannelEnabled, MappingConfirmed: true}
+		require.NoError(t, db.Create(&connection).Error)
+		require.NoError(t, enrichModels([]*model.Model{exact, rule}))
+		assert.Empty(t, exact.EnableGroups)
+		assert.Empty(t, exact.BoundChannels)
+		assert.Empty(t, rule.MatchedModels)
+		assert.Equal(t, 1, exact.ConfiguredChannelCount)
+		assert.Equal(t, 1, exact.EnabledChannelCount)
+		assert.Zero(t, rule.ConfiguredChannelCount)
 		assert.Empty(t, exact.Endpoints, "inferred endpoints must not become stored configuration")
-		priceBefore, err := model.GetModelPricingSnapshot([]string{"matrix-hidden-unpriced"})
-		require.NoError(t, err)
-		require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{{ModelName: exact.ModelName, ExpectedVersion: priceBefore.Entries[0].Version, Pricing: model.PricingValues{"ModelPrice": float64(0)}}}))
+		require.NoError(t, db.Create(&model.Option{Key: "ModelPrice", Value: `{"matrix-hidden-unpriced":0}`}).Error)
+		priceBefore := modelManagementOptions(t, db)
+		nativeBefore := modelManagementPrices(t, db)
 		exact.ModelName = "matrix-renamed"
 		exact.Endpoints = `{"openai":{"path":"/v1/chat/completions","method":"POST"}}`
 		response := modelManagementRequest(t, UpdateModelMeta, http.MethodPut, "/api/models/", exact, nil)
 		assert.Contains(t, response.Body.String(), `"success":true`)
 		var reloaded model.Model
 		require.NoError(t, db.First(&reloaded, exact.Id).Error)
-		enrichModels([]*model.Model{&reloaded})
+		require.NoError(t, enrichModels([]*model.Model{&reloaded}))
 		assert.Equal(t, exact.Endpoints, reloaded.Endpoints)
 		assert.Empty(t, reloaded.BoundChannels)
-		prices, err := model.GetModelPricingSnapshot([]string{"matrix-hidden-unpriced", "matrix-renamed"})
-		require.NoError(t, err)
-		assert.Equal(t, float64(0), prices.Entries[0].Configured["ModelPrice"])
-		assert.Empty(t, prices.Entries[1].Configured)
+		assert.Equal(t, 1, reloaded.ConfiguredChannelCount)
+		assert.Equal(t, 1, reloaded.EnabledChannelCount)
+		assert.Equal(t, priceBefore, modelManagementOptions(t, db), "rename does not move a historical model-name price")
+		assert.Equal(t, nativeBefore, modelManagementPrices(t, db))
+		var stable model.Channel
+		require.NoError(t, db.First(&stable, connection.ID).Error)
+		assert.Equal(t, exact.Id, stable.ModelID)
+		assert.Equal(t, "stable", stable.UpstreamModelName)
+		require.ErrorIs(t, reloaded.Delete(), model.ErrModelHasChannels)
+		require.NoError(t, db.Delete(&connection).Error)
 		require.NoError(t, reloaded.Delete())
-		require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{{ModelName: "matrix-hidden-unpriced", ExpectedVersion: prices.Entries[0].Version, Reset: true}}))
-		prices, err = model.GetModelPricingSnapshot([]string{"matrix-hidden-unpriced"})
-		require.NoError(t, err)
-		assert.Empty(t, prices.Entries[0].Configured)
+		assert.Equal(t, priceBefore, modelManagementOptions(t, db), "metadata deletion never resets historical prices")
+		assert.Equal(t, nativeBefore, modelManagementPrices(t, db))
 		var ability model.Ability
 		require.NoError(t, db.Where("model = ? AND channel_id = ? AND enabled = ?", "matrix-hidden-unpriced", active.Id, true).First(&ability).Error)
 	})
@@ -967,7 +1472,9 @@ export function parseTaskResult() { return {}; }
 		for _, candidate := range preview.Data.Candidates {
 			byName[candidate.ModelName] = candidate
 		}
-		assert.Equal(t, "site", byName["matrix-new"].Scope)
+		assert.Equal(t, "site", byName["matrix-existing"].Scope)
+		assert.Equal(t, "site", byName["matrix-blocked"].Scope)
+		assert.Equal(t, "catalog", byName["matrix-new"].Scope, "an obsolete Ability does not make a catalog entry a configured Model")
 		assert.Equal(t, "catalog", byName["matrix-catalog"].Scope)
 		assert.Equal(t, "blocked", byName["matrix-blocked"].Kind)
 		var count int64
@@ -977,8 +1484,8 @@ export function parseTaskResult() { return {}; }
 			{ModelName: "matrix-existing", RecordVersion: byName["matrix-existing"].RecordVersion, Fields: []string{"description", "endpoints"}},
 			{ModelName: "matrix-new", RecordVersion: byName["matrix-new"].RecordVersion, Create: true},
 		}}
-		beforePricing, err := model.GetModelPricingSnapshot([]string{"matrix-priced"})
-		require.NoError(t, err)
+		beforePricing := modelManagementPrices(t, db)
+		beforeOptions := modelManagementOptions(t, db)
 		// A failed model insert must also undo the earlier metadata update
 		// and the newly inserted supplier.
 		require.NoError(t, db.Callback().Create().Before("gorm:create").Register("fail_metadata_matrix", func(tx *gorm.DB) {
@@ -1013,9 +1520,8 @@ export function parseTaskResult() { return {}; }
 		require.NoError(t, db.Where("model_name = ?", "matrix-new").First(&created).Error)
 		assert.Equal(t, 1, created.SyncOfficial)
 		assert.Zero(t, created.Status)
-		afterPricing, err := model.GetModelPricingSnapshot([]string{"matrix-priced"})
-		require.NoError(t, err)
-		assert.Equal(t, beforePricing.Entries, afterPricing.Entries)
+		assert.Equal(t, beforePricing, modelManagementPrices(t, db))
+		assert.Equal(t, beforeOptions, modelManagementOptions(t, db))
 		response = modelManagementRequest(t, SyncUpstreamModels, "POST", "/api/models/sync_upstream", body, nil)
 		assert.Equal(t, http.StatusConflict, response.Code)
 		response = modelManagementRequest(t, SyncUpstreamModels, "POST", "/api/models/sync_upstream", map[string]any{}, nil)
@@ -1054,23 +1560,30 @@ func TestVendorManagementDatabase(t *testing.T) {
 		channel := model.Provider{Name: "Vendor fixture", Type: 1, Status: common.ChannelStatusEnabled}
 		require.NoError(t, db.Create(&channel).Error)
 		require.NoError(t, db.Create(&model.Ability{Model: "gemini-vendor-fixture", Group: "default", ChannelId: channel.Id, Enabled: true}).Error)
-		model.RefreshPricing()
-		model.GetPricing()
-		vendors := model.GetVendors()
-		require.Len(t, vendors, 1)
-		assert.Equal(t, "Google", vendors[0].Name)
-		assert.Equal(t, "Gemini.Color", vendors[0].Icon)
-		assert.Negative(t, vendors[0].ID)
+		publishers, err := model.GetRankingModelPublishers([]string{"gemini-vendor-fixture"})
+		require.NoError(t, err)
+		require.Len(t, publishers, 1)
+		assert.Equal(t, model.RankingModelPublisher{Name: "Google", Icon: "Gemini.Color"}, publishers["gemini-vendor-fixture"])
 		var count int64
 		require.NoError(t, db.Model(&model.Vendor{}).Count(&count).Error)
 		assert.Zero(t, count)
 		saved := model.Vendor{Name: "Google", Icon: "Gemini.Color"}
 		require.NoError(t, saved.Insert())
-		assert.Equal(t, saved.Id, model.GetVendors()[0].ID)
+		stored, err := model.GetVendorByID(saved.Id)
+		require.NoError(t, err)
+		assert.Equal(t, saved.Id, stored.Id)
+		assert.Equal(t, "Google", stored.Name)
+		withStored, err := model.GetRankingModelPublishers([]string{"gemini-vendor-fixture"})
+		require.NoError(t, err)
+		assert.Equal(t, publishers, withStored)
 		require.NoError(t, saved.Delete())
-		assert.Equal(t, vendors[0].ID, model.GetVendors()[0].ID)
+		_, err = model.GetVendorByID(saved.Id)
+		require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+		after, err := model.GetRankingModelPublishers([]string{"gemini-vendor-fixture"})
+		require.NoError(t, err)
+		assert.Equal(t, publishers, after)
 		require.NoError(t, db.Model(&model.Vendor{}).Count(&count).Error)
-		assert.Zero(t, count, "refresh must not recreate a deleted vendor")
+		assert.Zero(t, count, "display defaults must not recreate a deleted publisher")
 	})
 	t.Run("metadata_ownership_preview_merge_delete_and_rollback", func(t *testing.T) {
 		source := model.Vendor{Name: "  Vendor Source  ", Icon: "Gemini.Color"}
@@ -1097,11 +1610,10 @@ func TestVendorManagementDatabase(t *testing.T) {
 		rule := model.Model{ModelName: "vendor-rule-", VendorID: source.Id, NameRule: model.NameRulePrefix, Status: 1, SyncOfficial: 1}
 		require.NoError(t, one.Insert())
 		require.NoError(t, rule.Insert())
-		priceBefore, err := model.GetModelPricingSnapshot([]string{one.ModelName})
-		require.NoError(t, err)
-		require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{{ModelName: one.ModelName, ExpectedVersion: priceBefore.Entries[0].Version, Pricing: model.PricingValues{"ModelPrice": float64(0.25)}}}))
-		priceBefore, err = model.GetModelPricingSnapshot([]string{one.ModelName})
-		require.NoError(t, err)
+		owner := modelManagementPriceOwner(t, db, one.ModelName, protocol.OpenAIChat)
+		modelManagementPrice(t, db, owner, `tier("request", fixed(0.25))`, 1)
+		priceBefore := modelManagementPrices(t, db)
+		optionBefore := modelManagementOptions(t, db)
 		channel := model.Provider{Name: "Unchanged vendor channel", Type: 1, Status: common.ChannelStatusEnabled}
 		require.NoError(t, db.Create(&channel).Error)
 		ability := model.Ability{Model: one.ModelName, Group: "default", ChannelId: channel.Id, Enabled: true}
@@ -1214,9 +1726,8 @@ func TestVendorManagementDatabase(t *testing.T) {
 		after = one
 		after.VendorID = source.Id
 		assert.Error(t, after.Update(), "deleted vendors cannot acquire new references")
-		priceAfter, err := model.GetModelPricingSnapshot([]string{one.ModelName})
-		require.NoError(t, err)
-		assert.Equal(t, priceBefore.Entries[0], priceAfter.Entries[0], "assignment and merge preserve model pricing")
+		assert.Equal(t, priceBefore, modelManagementPrices(t, db), "assignment and merge preserve immutable owner prices")
+		assert.Equal(t, optionBefore, modelManagementOptions(t, db), "assignment and merge preserve historical option bytes")
 		var retainedChannel model.Provider
 		require.NoError(t, db.First(&retainedChannel, channel.Id).Error)
 		assert.Equal(t, channel.Name, retainedChannel.Name)
@@ -1253,212 +1764,198 @@ func TestVendorManagementDatabase(t *testing.T) {
 }
 
 func TestModelDeletionDatabase(t *testing.T) {
-	db := modelManagementDB(t)
-
-	var response struct {
-		Success bool
-		Data    model.ModelDeleteResult
-	}
-	metadataOnly := model.Model{ModelName: "metadata-only", Status: 1}
-	require.NoError(t, metadataOnly.Insert())
-	channel := model.Provider{Name: "Retained channel", Type: 1, Key: "fixture-key", Models: metadataOnly.ModelName, Group: "default", Status: common.ChannelStatusEnabled}
-	require.NoError(t, db.Create(&channel).Error)
-	require.NoError(t, channel.UpdateAbilities(db))
-	recorder := modelManagementRequest(t, func(c *gin.Context) {
-		c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(metadataOnly.Id)}}
-		DeleteModelMeta(c)
-	}, http.MethodDelete, "/api/models/"+strconv.Itoa(metadataOnly.Id), nil, &response)
-	require.True(t, response.Success, recorder.Body.String())
-	assert.Equal(t, model.ModelDeleteResult{DeletedCount: 1}, response.Data)
-	var retained model.Provider
-	require.NoError(t, db.First(&retained, channel.Id).Error)
-	assert.Equal(t, channel.Models, retained.Models)
-	var count int64
-	require.NoError(t, db.Model(&model.Ability{}).Where("channel_id = ?", channel.Id).Count(&count).Error)
-	assert.EqualValues(t, 1, count)
-
 	for _, rule := range []int{model.NameRuleExact, model.NameRulePrefix, model.NameRuleContains, model.NameRuleSuffix} {
-		t.Run(fmt.Sprintf("rule_%d_exact_names_only_atomic_and_cached", rule), func(t *testing.T) {
+		t.Run(fmt.Sprintf("rule_%d_atomic_metadata_only", rule), func(t *testing.T) {
+			db := modelManagementDB(t)
 			name := fmt.Sprintf("delete-rule-%d", rule)
 			first := model.Model{ModelName: name, NameRule: rule, Status: 1}
 			second := model.Model{ModelName: name + "-second", Status: 1}
-			require.NoError(t, first.Insert())
-			require.NoError(t, second.Insert())
+			keep := model.Model{ModelName: name + "-keep", Status: 1}
+			for _, record := range []*model.Model{&first, &second, &keep} {
+				require.NoError(t, record.Insert())
+			}
 			mapping := `{"` + name + `":"upstream-name"}`
 			priority, weight := int64(7), uint(9)
-			channels := []model.Provider{
-				{Name: "Enabled", Type: 1, Key: "fixture-key", Models: name + "," + name + "-keep," + second.ModelName, Group: "default,vip", Status: common.ChannelStatusEnabled, ModelMapping: &mapping, Priority: &priority, Weight: &weight},
+			providers := []model.Provider{
+				{Name: "Enabled", Type: 1, Key: "fixture-key", Models: name + "," + keep.ModelName + "," + second.ModelName, Group: "default,vip", Status: common.ChannelStatusEnabled, ModelMapping: &mapping, Priority: &priority, Weight: &weight},
 				{Name: "Disabled", Type: 1, Models: name + ",prefix-" + name, Group: "disabled-group", Status: common.ChannelStatusManuallyDisabled},
 				{Name: "Last model", Type: 1, Models: name, Group: "last-model-group", Status: common.ChannelStatusEnabled},
 				{Name: "Case-sensitive name", Type: 1, Models: strings.ToUpper(name), Group: "case-group", Status: common.ChannelStatusEnabled},
 			}
-			for i := range channels {
-				require.NoError(t, db.Create(&channels[i]).Error)
-				require.NoError(t, channels[i].UpdateAbilities(db))
+			for i := range providers {
+				require.NoError(t, db.Create(&providers[i]).Error)
+				// Explicit historical source, never a live account API mutation.
+				require.NoError(t, providers[i].AddAbilities(db))
 			}
+			archiveBefore, err := model.ArchiveLegacyAbilitySource(db)
+			require.NoError(t, err)
+			require.Positive(t, archiveBefore.RowCount)
+			require.NoError(t, db.Migrator().DropTable(&model.Ability{}))
 			common.MemoryCacheEnabled = true
 			model.InitProviderCache()
-			cached, err := model.GetRandomSatisfiedProvider("default", name, 0, nil)
+			cachedBefore, err := model.CacheGetProvider(providers[0].Id)
 			require.NoError(t, err)
-			require.NotNil(t, cached)
-			baseline, err := model.GetModelPricingSnapshot([]string{name})
-			require.NoError(t, err)
-			require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{{ModelName: name, ExpectedVersion: baseline.EmptyVersion, Pricing: model.PricingValues{"ModelPrice": float64(2)}}}))
-			pricingBefore, err := model.GetModelPricingSnapshot([]string{name, second.ModelName})
-			require.NoError(t, err)
-			if rule != model.NameRuleExact {
-				_, err := model.DeleteModelMetadata([]int{first.Id, second.Id}, true, true)
-				require.EqualError(t, err, "only exact-match models can be removed from channels")
-				after, err := model.GetModelPricingSnapshot([]string{name, second.ModelName})
+			require.NotNil(t, cachedBefore)
+			accountBefore := *cachedBefore
+
+			// Stored historical prices are immutable inputs here, not prices to
+			// delete or publish when metadata with a matching name disappears.
+			legacyPrices := []struct {
+				key     string
+				value   any
+				load    func(string) error
+				current func() string
+			}{
+				{"ModelPrice", 0, ratio_setting.UpdateModelPriceByJSONString, ratio_setting.ModelPrice2JSONString},
+				{"ModelRatio", 1, ratio_setting.UpdateModelRatioByJSONString, ratio_setting.ModelRatio2JSONString},
+				{"CompletionRatio", 2, ratio_setting.UpdateCompletionRatioByJSONString, ratio_setting.CompletionRatio2JSONString},
+				{"CacheRatio", 0.1, ratio_setting.UpdateCacheRatioByJSONString, ratio_setting.CacheRatio2JSONString},
+				{"CreateCacheRatio", 1.25, ratio_setting.UpdateCreateCacheRatioByJSONString, ratio_setting.CreateCacheRatio2JSONString},
+				{"ImageRatio", 3, ratio_setting.UpdateImageRatioByJSONString, ratio_setting.ImageRatio2JSONString},
+				{"AudioRatio", 4, ratio_setting.UpdateAudioRatioByJSONString, ratio_setting.AudioRatio2JSONString},
+				{"AudioCompletionRatio", 5, ratio_setting.UpdateAudioCompletionRatioByJSONString, ratio_setting.AudioCompletionRatio2JSONString},
+				{"billing_setting.billing_mode", "tiered_expr", nil, nil},
+				{"billing_setting.billing_expr", `tier("base", p * 2 + c * 4)`, nil, nil},
+			}
+			storedPrices := make(map[string]string, len(legacyPrices))
+			runtimePrices := make(map[string]string, len(legacyPrices))
+			for _, source := range legacyPrices {
+				encoded, err := common.Marshal(map[string]any{name: source.value, second.ModelName: source.value, keep.ModelName: source.value})
 				require.NoError(t, err)
-				assert.Equal(t, pricingBefore, after)
-				require.NoError(t, db.Model(&model.Model{}).Where("id IN ?", []int{first.Id, second.Id}).Count(&count).Error)
-				assert.EqualValues(t, 2, count)
-				for _, original := range channels {
+				storedPrices[source.key] = string(encoded)
+				require.NoError(t, db.Create(&model.Option{Key: source.key, Value: string(encoded)}).Error)
+				common.OptionMap[source.key] = string(encoded)
+				if source.load != nil {
+					require.NoError(t, source.load(string(encoded)))
+					runtimePrices[source.key] = source.current()
+				}
+			}
+			config.UpdateConfigFromMap(config.GlobalConfig.Get("billing_setting"), map[string]string{
+				"billing_mode": storedPrices["billing_setting.billing_mode"],
+				"billing_expr": storedPrices["billing_setting.billing_expr"],
+			})
+			billingConfigBefore := config.GlobalConfig.ExportAllConfigs()
+			assertSourcesUnchanged := func(t *testing.T) {
+				t.Helper()
+				for _, original := range providers {
 					var after model.Provider
 					require.NoError(t, db.First(&after, original.Id).Error)
 					assert.Equal(t, original, after)
 				}
-				return
+				archiveAfter, err := model.VerifyLegacyAbilitySourceArchive(db)
+				require.NoError(t, err)
+				assert.Equal(t, archiveBefore, archiveAfter)
+				assert.False(t, db.Migrator().HasTable(&model.Ability{}))
+				for _, source := range legacyPrices {
+					var stored model.Option
+					require.NoError(t, db.Where("key = ?", source.key).First(&stored).Error)
+					assert.Equal(t, storedPrices[source.key], stored.Value, source.key)
+					assert.Equal(t, storedPrices[source.key], common.OptionMap[source.key], source.key)
+					if source.current != nil {
+						assert.Equal(t, runtimePrices[source.key], source.current(), source.key)
+					}
+				}
+				billingConfigAfter := config.GlobalConfig.ExportAllConfigs()
+				for _, key := range []string{"billing_setting.billing_mode", "billing_setting.billing_expr"} {
+					assert.Equal(t, billingConfigBefore[key], billingConfigAfter[key], key)
+				}
+				cached, err := model.CacheGetProvider(providers[0].Id)
+				require.NoError(t, err)
+				require.NotNil(t, cached)
+				assert.Equal(t, accountBefore, *cached)
 			}
-			body := map[string]any{"model_ids": []int{first.Id, second.Id, first.Id}, "remove_from_channels": true}
-			// A failure at the final metadata delete must undo every earlier
-			// channel/ability write and keep the published cache intact.
-			require.NoError(t, db.Callback().Delete().Before("gorm:delete").Register("fail_model_deletion", func(tx *gorm.DB) {
-				if tx.Statement.Table == "models" {
+
+			for _, role := range []int{common.RoleAdminUser, common.RoleRootUser} {
+				for _, flags := range []struct{ channels, pricing bool }{{true, false}, {false, true}, {true, true}} {
+					for _, single := range []bool{false, true} {
+						body := map[string]any{"model_ids": []int{first.Id, second.Id}, "remove_from_channels": flags.channels, "remove_pricing": flags.pricing}
+						path := fmt.Sprintf("/api/models/delete?remove_from_channels=%t&remove_pricing=%t", flags.channels, flags.pricing)
+						recorder := modelManagementRequest(t, func(c *gin.Context) {
+							c.Set("role", role)
+							if single {
+								c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(first.Id)}}
+								DeleteModelMeta(c)
+							} else {
+								BatchDeleteModelMeta(c)
+							}
+						}, http.MethodPost, path, body, nil)
+						assert.Equal(t, http.StatusGone, recorder.Code, recorder.Body.String())
+						assert.Contains(t, recorder.Body.String(), `"success":false`)
+						var remaining int64
+						require.NoError(t, db.Model(&model.Model{}).Where("id IN ?", []int{first.Id, second.Id}).Count(&remaining).Error)
+						assert.EqualValues(t, 2, remaining)
+						assertSourcesUnchanged(t)
+					}
+				}
+			}
+
+			// A late failure after the delete has executed rolls the entire
+			// metadata batch back; no partial count or source mutation escapes.
+			require.NoError(t, db.Callback().Delete().After("gorm:delete").Register("fail_model_deletion", func(tx *gorm.DB) {
+				if tx.Statement.Table == "models" && tx.RowsAffected == 2 {
 					tx.AddError(errors.New("injected model deletion failure"))
 				}
 			}))
-			result, err := model.DeleteModelMetadata([]int{first.Id, second.Id}, true, false)
-			require.Error(t, err)
+			result, err := model.DeleteModelMetadata([]int{first.Id, second.Id})
+			require.EqualError(t, err, "injected model deletion failure")
 			assert.Zero(t, result)
 			require.NoError(t, db.Callback().Delete().Remove("fail_model_deletion"))
-			for _, original := range channels {
-				var after model.Provider
-				require.NoError(t, db.First(&after, original.Id).Error)
-				assert.Equal(t, original, after)
-			}
-			cached, err = model.GetRandomSatisfiedProvider("default", name, 0, nil)
-			require.NoError(t, err)
-			require.NotNil(t, cached)
-			recorder := modelManagementRequest(t, BatchDeleteModelMeta, http.MethodPost, "/api/models/delete", body, &response)
-			require.True(t, response.Success, recorder.Body.String())
-			assert.Equal(t, model.ModelDeleteResult{DeletedCount: 2, UpdatedChannels: 3}, response.Data)
-			for i, original := range channels {
-				var after model.Provider
-				require.NoError(t, db.First(&after, original.Id).Error)
-				original.Models = []string{name + "-keep", "prefix-" + name, "", strings.ToUpper(name)}[i]
-				assert.Equal(t, original, after, "only the model list changes")
-			}
-			var abilities []model.Ability
-			require.NoError(t, db.Where("channel_id IN ?", []int{channels[0].Id, channels[1].Id, channels[2].Id, channels[3].Id}).Find(&abilities).Error)
-			assert.Len(t, abilities, 4)
-			for _, ability := range abilities {
-				assert.NotEqual(t, name, ability.Model)
-				assert.NotEqual(t, second.ModelName, ability.Model)
-				assert.NotEmpty(t, ability.Model)
-				if ability.ChannelId == channels[0].Id {
-					assert.Equal(t, &priority, ability.Priority)
-					assert.Equal(t, weight, ability.Weight)
-					assert.True(t, ability.Enabled)
-				}
-				if ability.ChannelId == channels[1].Id {
-					assert.False(t, ability.Enabled)
-				}
-			}
-			for _, group := range []string{"default", "vip", "last-model-group"} {
-				cached, _ = model.GetRandomSatisfiedProvider(group, name, 0, nil)
-				assert.Nil(t, cached)
-			}
-			cached, err = model.GetRandomSatisfiedProvider("default", name+"-keep", 0, nil)
-			require.NoError(t, err)
-			require.NotNil(t, cached)
-			pricingAfter, err := model.GetModelPricingSnapshot([]string{name, second.ModelName})
-			require.NoError(t, err)
-			assert.Equal(t, pricingBefore, pricingAfter)
-			require.NoError(t, db.Model(&model.Model{}).Where("id IN ?", []int{first.Id, second.Id}).Count(&count).Error)
-			assert.Zero(t, count)
-			_, err = model.DeleteModelMetadata([]int{first.Id}, true, false)
-			assert.Error(t, err, "stale selections cannot delete newly created records")
-		})
-	}
-	for _, removeChannels := range []bool{false, true} {
-		t.Run(fmt.Sprintf("pricing_removal_channels_%t", removeChannels), func(t *testing.T) {
-			name := fmt.Sprintf("remove-pricing-%t", removeChannels)
-			metadata := model.Model{ModelName: name, NameRule: model.NameRuleExact, Status: 1}
-			require.NoError(t, metadata.Insert())
-			keep := name + "-keep"
-			channel := model.Provider{Name: "Independent pricing removal", Type: 1, Models: name + "," + keep, Group: "pricing-removal", Status: common.ChannelStatusEnabled}
+			var remaining int64
+			require.NoError(t, db.Model(&model.Model{}).Where("id IN ?", []int{first.Id, second.Id}).Count(&remaining).Error)
+			assert.EqualValues(t, 2, remaining)
+			assertSourcesUnchanged(t)
+			_, err = model.DeleteModelMetadata([]int{first.Id, 999999})
+			require.Error(t, err, "a missing model aborts the whole batch")
+			require.NoError(t, db.Model(&model.Model{}).Where("id IN ?", []int{first.Id, second.Id}).Count(&remaining).Error)
+			assert.EqualValues(t, 2, remaining)
+
+			channel := model.Channel{ProviderID: providers[0].Id, ModelID: first.Id, Protocol: protocol.OpenAIChat,
+				UpstreamModelName: "upstream", ParameterOverrides: "{}", Weight: 1, Status: model.ChannelPending}
 			require.NoError(t, db.Create(&channel).Error)
-			require.NoError(t, channel.UpdateAbilities(db))
-			model.InitProviderCache()
-			baseline, err := model.GetModelPricingSnapshot([]string{name, keep})
-			require.NoError(t, err)
-			pricing := model.PricingValues{"ModelRatio": float64(1), "ModelPrice": float64(0), "CompletionRatio": float64(2), "CacheRatio": float64(0.1), "CreateCacheRatio": float64(1.25), "ImageRatio": float64(3), "AudioRatio": float64(4), "AudioCompletionRatio": float64(5), "billing_setting.billing_mode": "tiered_expr", "billing_setting.billing_expr": `tier("base", p * 2 + c * 4)`}
-			require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{
-				{ModelName: name, ExpectedVersion: baseline.EmptyVersion, Pricing: pricing},
-				{ModelName: keep, ExpectedVersion: baseline.EmptyVersion, Pricing: model.PricingValues{"ModelPrice": float64(9)}},
-			}))
-			before, err := model.GetModelPricingSnapshot([]string{name, keep})
-			require.NoError(t, err)
-			body := map[string]any{"model_ids": []int{metadata.Id}, "remove_from_channels": removeChannels, "remove_pricing": true}
-			for _, single := range []bool{false, true} {
-				recorder := modelManagementRequest(t, func(c *gin.Context) {
-					c.Set("role", common.RoleAdminUser)
-					if single {
-						c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(metadata.Id)}}
-						DeleteModelMeta(c)
-					} else {
-						BatchDeleteModelMeta(c)
-					}
-				}, http.MethodPost, "/api/models/delete?remove_pricing=true", body, nil)
-				assert.Equal(t, http.StatusForbidden, recorder.Code, "pricing permissions cannot be bypassed through deletion")
+			_, err = model.DeleteModelMetadata([]int{first.Id, second.Id})
+			require.ErrorIs(t, err, model.ErrModelHasChannels)
+			require.NoError(t, db.Model(&model.Model{}).Where("id IN ?", []int{first.Id, second.Id}).Count(&remaining).Error)
+			assert.EqualValues(t, 2, remaining)
+			require.NoError(t, db.Delete(&channel).Error)
+			require.NoError(t, db.AutoMigrate(&model.ModelOffering{}, &model.ModelOfferingMember{}))
+			offering := model.ModelOffering{Name: "referenced", Visibility: "all", Groups: []string{}, RouteMethod: "weight",
+				AcceptedConversionLosses: []string{}, Members: []model.ModelOfferingMember{{ModelID: second.Id, Tier: 1}}}
+			require.NoError(t, db.Create(&offering).Error)
+			_, err = model.DeleteModelMetadata([]int{first.Id, second.Id})
+			require.ErrorIs(t, err, model.ErrModelOfferingMember)
+			require.NoError(t, db.Model(&model.Model{}).Where("id IN ?", []int{first.Id, second.Id}).Count(&remaining).Error)
+			assert.EqualValues(t, 2, remaining)
+			assertSourcesUnchanged(t)
+			require.NoError(t, db.Where("offering_id = ?", offering.ID).Delete(&model.ModelOfferingMember{}).Error)
+
+			var response struct {
+				Success bool
+				Data    model.ModelDeleteResult
 			}
-			updates := 0
-			require.NoError(t, db.Callback().Update().Before("gorm:update").Register("fail_deleted_pricing", func(tx *gorm.DB) {
-				if tx.Statement.Table == "options" {
-					updates++
-					if updates == 3 {
-						tx.AddError(errors.New("injected pricing deletion failure"))
-					}
-				}
-			}))
-			_, err = model.DeleteModelMetadata([]int{metadata.Id}, removeChannels, true)
-			require.Error(t, err)
-			require.NoError(t, db.Callback().Update().Remove("fail_deleted_pricing"))
-			after, err := model.GetModelPricingSnapshot([]string{name, keep})
-			require.NoError(t, err)
-			assert.Equal(t, before, after, "partial option writes roll back")
-			assert.Equal(t, billing_setting.BillingModeTieredExpr, billing_setting.GetBillingMode(name), "failed deletion must not publish new runtime pricing")
-			var retained model.Model
-			require.NoError(t, db.First(&retained, metadata.Id).Error)
-			var channelAfter model.Provider
-			require.NoError(t, db.First(&channelAfter, channel.Id).Error)
-			assert.Equal(t, channel.Models, channelAfter.Models)
-			_, err = model.DeleteModelMetadata([]int{metadata.Id, 999999}, removeChannels, true)
-			assert.Error(t, err, "a missing model aborts the whole batch")
+			body := map[string]any{"model_ids": []int{first.Id, second.Id, first.Id}}
 			recorder := modelManagementRequest(t, BatchDeleteModelMeta, http.MethodPost, "/api/models/delete", body, &response)
 			require.True(t, response.Success, recorder.Body.String())
-			after, err = model.GetModelPricingSnapshot([]string{name, keep})
-			require.NoError(t, err)
-			assert.Empty(t, after.Entries[0].Configured)
-			assert.Equal(t, before.Entries[1], after.Entries[1], "name rules do not expand pricing deletion")
-			assert.Equal(t, billing_setting.BillingModeRatio, billing_setting.GetBillingMode(name))
-			_, hasExpr := billing_setting.GetBillingExpr(name)
-			assert.False(t, hasExpr)
-			require.NoError(t, db.First(&channelAfter, channel.Id).Error)
-			expectedModels := channel.Models
-			if removeChannels {
-				expectedModels = keep
+			assert.Equal(t, model.ModelDeleteResult{DeletedCount: 2}, response.Data)
+			require.NoError(t, db.Model(&model.Model{}).Where("id IN ?", []int{first.Id, second.Id}).Count(&remaining).Error)
+			assert.Zero(t, remaining)
+			var retained model.Model
+			require.NoError(t, db.First(&retained, keep.Id).Error)
+			assert.Equal(t, keep.ModelName, retained.ModelName, "name rules never expand the selected IDs")
+			assertSourcesUnchanged(t)
+			_, err = model.DeleteModelMetadata([]int{first.Id})
+			require.Error(t, err, "stale selections cannot delete newly created records")
+			recorder = modelManagementRequest(t, func(c *gin.Context) {
+				c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(keep.Id)}}
+				DeleteModelMeta(c)
+			}, http.MethodDelete, "/api/models/"+strconv.Itoa(keep.Id), nil, &response)
+			require.True(t, response.Success, recorder.Body.String())
+			assert.Equal(t, model.ModelDeleteResult{DeletedCount: 1}, response.Data)
+			assertSourcesUnchanged(t)
+			for _, ids := range [][]int{nil, {0}, {-1}, make([]int, 1001)} {
+				_, err := model.DeleteModelMetadata(ids)
+				assert.Error(t, err)
 			}
-			assert.Equal(t, expectedModels, channelAfter.Models)
-			require.NoError(t, db.Model(&model.Model{}).Where("id = ?", metadata.Id).Count(&count).Error)
-			assert.Zero(t, count)
 		})
-	}
-	for _, ids := range [][]int{nil, {0}, {-1}, make([]int, 1001)} {
-		_, err := model.DeleteModelMetadata(ids, true, false)
-		assert.Error(t, err)
 	}
 }
 
@@ -1479,138 +1976,103 @@ export function parseTaskResult(){return {};}
 		require.NoError(t, err)
 		t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(spec.key) })
 		if spec.key == "matrix-alpha" {
-			single, err := model.GetModelPricingSnapshot([]string{name})
+			preview, err := legacyPricingSource(t, db).Preview(name, model.PricingValues{
+				"billing_setting.billing_mode": "tiered_expr", "billing_setting.billing_expr": base,
+			})
 			require.NoError(t, err)
-			require.Len(t, single.Entries[0].PluginVariants, 1, "a sole provider must expose its separate pricing editor")
-			assert.Equal(t, "matrix-alpha", single.Entries[0].PluginVariants[0].PluginKey)
+			assert.Equal(t, "This model already uses an expression.", preview.UnsupportedReason)
 		}
 	}
-
-	// Representative existing options have no plugin-expression row.
 	baseJSON, err := common.Marshal(map[string]string{name: base})
 	require.NoError(t, err)
 	modeJSON, err := common.Marshal(map[string]string{name: "tiered_expr"})
 	require.NoError(t, err)
+	// Historical options are fixture input only, never an online pricing writer.
 	require.NoError(t, db.Create(&[]model.Option{
 		{Key: "ModelPrice", Value: `{"unrelated-model":0.75}`},
 		{Key: "billing_setting.billing_expr", Value: string(baseJSON)},
 		{Key: "billing_setting.billing_mode", Value: string(modeJSON)},
 	}).Error)
-	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
-		"billing_setting.billing_expr": string(baseJSON), "billing_setting.billing_mode": string(modeJSON),
-	}))
-	before, err := model.GetModelPricingSnapshot([]string{name})
+	options := modelManagementOptions(t, db)
+	source := legacyPricingSource(t, db)
+	draft := model.PricingValues{"billing_setting.billing_mode": "tiered_expr", "billing_setting.billing_expr": base}
+	_, err = source.Preview(name, draft)
+	require.ErrorContains(t, err, "matrix-beta", "the base seconds expression cannot silently price a credits-only plugin")
+	draft[billing_setting.PluginBillingExprOption] = map[string]any{"matrix-beta": variant}
+	preview, err := source.Preview(name, draft)
 	require.NoError(t, err)
-	require.Len(t, before.Entries, 1)
-	require.Len(t, before.Entries[0].PluginVariants, 2)
-	assert.True(t, before.Entries[0].PluginVariants[0].Compatible)
-	assert.False(t, before.Entries[0].PluginVariants[1].Compatible)
-	assert.Equal(t, base, before.Entries[0].PluginVariants[1].Effective)
-	change := model.ModelPricingChange{ModelName: name, ExpectedVersion: before.Entries[0].Version, Pricing: model.PricingValues{
-		"billing_setting.billing_mode": "tiered_expr", "billing_setting.billing_expr": base,
-		billing_setting.PluginBillingExprOption: map[string]any{"matrix-beta": variant},
-	}}
-	require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{change}))
-	loaded, err := model.GetModelPricingSnapshot([]string{name})
-	require.NoError(t, err)
-	assert.Equal(t, change.Pricing, loaded.Entries[0].Configured)
-	require.Len(t, loaded.Entries[0].PluginVariants, 2)
-	assert.True(t, loaded.Entries[0].PluginVariants[0].Compatible)
-	assert.Equal(t, base, loaded.Entries[0].PluginVariants[0].Effective)
-	assert.True(t, loaded.Entries[0].PluginVariants[1].Compatible)
-	assert.Equal(t, variant, loaded.Entries[0].PluginVariants[1].Configured)
-	// Ordinary relay pricing and the existing plugin expressions are
-	// saved together without changing either plugin's billing contract.
-	ordinary := model.ModelPricingChange{ModelName: name, ExpectedVersion: loaded.Entries[0].Version, Pricing: model.PricingValues{
-		"billing_setting.billing_mode": "tiered_expr", "billing_setting.billing_expr": `tier("image", fixed(0.04)) * image_count`,
-		billing_setting.PluginBillingExprOption: map[string]any{"matrix-alpha": base, "matrix-beta": variant},
-	}}
-	require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{ordinary}))
-	separate, err := model.GetModelPricingSnapshot([]string{name})
-	require.NoError(t, err)
-	assert.Equal(t, ordinary.Pricing, separate.Entries[0].Configured)
-	assert.Equal(t, base, separate.Entries[0].PluginVariants[0].Effective)
-	assert.Equal(t, variant, separate.Entries[0].PluginVariants[1].Effective)
-	// Keep exercising the pre-existing plugin-default configuration below.
-	change.ExpectedVersion = separate.Entries[0].Version
-	require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{change}))
-	var flat map[string]string
-	require.NoError(t, common.UnmarshalJsonStr(loaded.Options[billing_setting.PluginBillingExprOption], &flat))
-	assert.Equal(t, map[string]string{"matrix-beta::" + name: variant}, flat)
-	all, err := model.GetModelPricingSnapshot(nil)
-	require.NoError(t, err)
-	for _, entry := range all.Entries {
-		assert.NotEqual(t, "matrix-beta::"+name, entry.ModelName)
+	assert.Equal(t, "This model already uses an expression.", preview.UnsupportedReason)
+	assert.Equal(t, options, modelManagementOptions(t, db), "offline validation never saves its draft")
+
+	alpha := modelManagementPriceOwner(t, db, name, protocol.Type("task:matrix-alpha"))
+	beta := modelManagementPriceOwner(t, db, name, protocol.Type("task:matrix-beta"))
+	ordinary := modelManagementPriceOwner(t, db, name, protocol.OpenAIChat)
+	assert.Equal(t, alpha.ModelID, beta.ModelID)
+	assert.Equal(t, alpha.ModelID, ordinary.ModelID)
+	alphaPrice := modelManagementPrice(t, db, alpha, base, 1)
+	betaPrice := modelManagementPrice(t, db, beta, variant, 1)
+	ordinaryPrice := modelManagementPrice(t, db, ordinary, `tier("image", fixed(0.04)) * image_count`, 1)
+	prices := modelManagementPrices(t, db)
+	invalid := model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: beta.ID, Currency: money.Currency("USD"), Expression: base, EffectiveAt: 2}
+	require.Error(t, model.CreatePriceVersion(context.Background(), &invalid, betaPrice.CreatedBy))
+	assert.Equal(t, prices, modelManagementPrices(t, db))
+	betaFree := modelManagementPrice(t, db, beta, `tier("free", u("credits") * 0)`, 2)
+	for _, expected := range []model.PriceVersion{alphaPrice, betaFree, ordinaryPrice} {
+		current, err := model.CurrentPriceVersion(context.Background(), db, expected.OwnerType, expected.OwnerID, 2)
+		require.NoError(t, err)
+		assert.Equal(t, expected.ID, current.ID)
+		assert.Equal(t, expected.Expression, current.Expression)
 	}
-	unrelated, err := model.GetModelPricingSnapshot([]string{"unrelated-model"})
+	historical, err := model.CurrentPriceVersion(context.Background(), db, model.PriceOwnerChannel, beta.ID, 1)
 	require.NoError(t, err)
-	assert.Equal(t, float64(0.75), unrelated.Entries[0].Configured["ModelPrice"])
+	assert.Equal(t, betaPrice.ID, historical.ID, "changing one owner never overwrites its accepted history")
+	prices = modelManagementPrices(t, db)
+	require.NoError(t, model.MigratePricing(db))
+	assert.Equal(t, prices, modelManagementPrices(t, db), "repeated schema migration preserves owner versions")
+	assert.Equal(t, options, modelManagementOptions(t, db), "native owner prices do not dual-write model-name options")
+
+	// Flat historical plugin keys retain the complete model name, including ::.
+	flatJSON, err := common.Marshal(map[string]string{"matrix-beta::" + name: variant})
+	require.NoError(t, err)
+	require.NoError(t, db.Create(&model.Option{Key: billing_setting.PluginBillingExprOption, Value: string(flatJSON)}).Error)
+	options = modelManagementOptions(t, db)
+	source = legacyPricingSource(t, db)
+	_, err = source.Preview(name, draft)
+	require.NoError(t, err)
+	unrelated, err := source.Preview("unrelated-model", model.PricingValues{"ModelPrice": float64(0.75)})
+	require.NoError(t, err)
+	assert.Equal(t, `tier("request", fixed(0.75))`, unrelated.Expression)
 	assert.NotContains(t, billing_setting.GetPricingSyncData(map[string]any{}), "plugin_billing_expr")
 	assert.NotContains(t, billing_setting.GetPricingSyncData(map[string]any{})["billing_expr"], "matrix-beta::"+name)
-	// Restart/re-read is idempotent; a second save based on its version succeeds.
-	require.NoError(t, db.AutoMigrate(&model.Option{}))
-	change.ExpectedVersion = loaded.Entries[0].Version
-	require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{change}))
-	repeated, err := model.GetModelPricingSnapshot([]string{name})
-	require.NoError(t, err)
-	assert.Equal(t, loaded.Entries[0].Version, repeated.Entries[0].Version)
-	// Changing only the provider price changes the model version.
-	change.Pricing[billing_setting.PluginBillingExprOption] = map[string]any{"matrix-beta": `tier("free", u("credits") * 0)`}
-	require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{change}))
-	updated, err := model.GetModelPricingSnapshot([]string{name})
-	require.NoError(t, err)
-	assert.NotEqual(t, loaded.Entries[0].Version, updated.Entries[0].Version)
-	assert.ErrorIs(t, model.UpdateModelPricing([]model.ModelPricingChange{change}), model.ErrModelPricingConflict)
-	// The legacy option API validates the full draft and cannot drop a required override.
-	response := modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", OptionUpdateRequest{Key: billing_setting.PluginBillingExprOption, Value: `{}`}, nil)
-	assert.Contains(t, response.Body.String(), `"success":false`)
-	assert.Contains(t, response.Body.String(), "matrix-beta")
-	afterFailure, err := model.GetModelPricingSnapshot([]string{name})
-	require.NoError(t, err)
-	assert.Equal(t, updated.Entries[0].Version, afterFailure.Entries[0].Version)
-	// Model-level legacy saves also skip providers with a stored override.
-	response = modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", OptionUpdateRequest{Key: "billing_setting.billing_expr", Value: string(baseJSON)}, nil)
-	assert.Contains(t, response.Body.String(), `"success":true`)
-	flat["matrix-beta::"+name] = variant
-	raw, err := common.Marshal(flat)
-	require.NoError(t, err)
-	response = modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", OptionUpdateRequest{Key: billing_setting.PluginBillingExprOption, Value: string(raw)}, nil)
-	assert.Contains(t, response.Body.String(), `"success":true`)
-	final, err := model.GetModelPricingSnapshot([]string{name})
-	require.NoError(t, err)
-	assert.Equal(t, variant, final.Entries[0].PluginVariants[1].Effective)
-	// A provider may disappear without making every legacy price save fail.
+	for _, request := range []OptionUpdateRequest{
+		{Key: billing_setting.PluginBillingExprOption, Value: `{}`},
+		{Key: billing_setting.PluginBillingExprOption, Value: string(flatJSON)},
+		{Key: "billing_setting.billing_expr", Value: string(baseJSON)},
+		{Key: "ModelRatio", Value: `{"shared-model::priced":2}`},
+	} {
+		response := modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", request, nil)
+		assert.Equal(t, http.StatusGone, response.Code)
+		assert.Contains(t, response.Body.String(), `"success":false`)
+		assert.Equal(t, options, modelManagementOptions(t, db))
+		assert.Equal(t, prices, modelManagementPrices(t, db))
+	}
+	// Removing a required override remains invalid in captured offline input.
+	_, err = source.Preview(name, model.PricingValues{"billing_setting.billing_mode": "tiered_expr", "billing_setting.billing_expr": base})
+	require.ErrorContains(t, err, "matrix-beta")
 	require.NoError(t, jsplugin.DefaultRegistry.Unregister("matrix-beta"))
-	stale, err := model.GetModelPricingSnapshot([]string{name})
-	require.NoError(t, err)
-	require.Len(t, stale.Entries[0].PluginVariants, 2)
-	assert.True(t, stale.Entries[0].PluginVariants[1].Stale)
-	assert.Equal(t, variant, stale.Entries[0].PluginVariants[1].Configured)
-	assert.Empty(t, stale.Entries[0].PluginVariants[1].Effective)
-	_, err = model.PreviewModelPricing(name, stale.Entries[0].Configured)
-	require.NoError(t, err)
-	ratioJSON, err := common.Marshal(map[string]float64{name: 2})
-	require.NoError(t, err)
-	response = modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", OptionUpdateRequest{Key: "ModelRatio", Value: string(ratioJSON)}, nil)
-	assert.Contains(t, response.Body.String(), `"success":true`)
-	response = modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", OptionUpdateRequest{Key: "billing_setting.billing_expr", Value: string(baseJSON)}, nil)
-	assert.Contains(t, response.Body.String(), `"success":true`)
-	final, err = model.GetModelPricingSnapshot([]string{name})
-	require.NoError(t, err)
-	assert.Equal(t, variant, final.Entries[0].PluginVariants[1].Configured)
-	// The versioned save also preserves an unchanged stale expression.
-	change = model.ModelPricingChange{ModelName: name, ExpectedVersion: final.Entries[0].Version, Pricing: final.Entries[0].Configured}
-	require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{change}))
-	change.Pricing[billing_setting.PluginBillingExprOption] = map[string]any{"matrix-beta": "1"}
-	// Even if this process's cache is ahead of storage, a changed stale
-	// override is validated against the locked database value.
+	stopped := legacyPricingSource(t, db)
+	_, err = stopped.Preview(name, draft)
+	require.NoError(t, err, "unchanged unavailable-plugin evidence remains intact for offline migration")
 	tamperedJSON, err := common.Marshal(map[string]string{"matrix-beta::" + name: "1"})
 	require.NoError(t, err)
 	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: string(tamperedJSON)}))
-	require.ErrorContains(t, model.UpdateModelPricing([]model.ModelPricingChange{change}), "does not declare this model")
-	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: final.Options[billing_setting.PluginBillingExprOption]}))
-	// Updating a plugin to stop declaring this model also leaves the
-	// stored override visible and inert, even with no active providers.
+	draft[billing_setting.PluginBillingExprOption] = map[string]any{"matrix-beta": "1"}
+	_, err = stopped.Preview(name, draft)
+	require.ErrorContains(t, err, "does not declare this model", "runtime cache cannot replace captured database evidence")
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: string(flatJSON)}))
+	invalid = model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: beta.ID, Currency: money.Currency("USD"), Expression: variant, EffectiveAt: 3}
+	require.Error(t, model.CreatePriceVersion(context.Background(), &invalid, betaPrice.CreatedBy))
+	assert.Equal(t, prices, modelManagementPrices(t, db), "stopping a plugin cannot mutate or extend its price history")
 	_, err = jsplugin.DefaultRegistry.Register(`
 export const meta = {apiVersion:1,key:"matrix-beta",name:"Beta updated",version:"2.0.0",author:{name:"Test"},models:["replacement-model"],fetchMode:"per_task",usageSchema:{credits:{type:"number",unit:"credit"}}};
 export function buildSubmitRequest(){return {};}
@@ -1620,23 +2082,15 @@ export function parseTaskResult(){return {};}
 `, jsplugin.Options{})
 	require.NoError(t, err)
 	require.NoError(t, jsplugin.DefaultRegistry.Unregister("matrix-alpha"))
-	stale, err = model.GetModelPricingSnapshot([]string{name})
+	changed := legacyPricingSource(t, db)
+	draft[billing_setting.PluginBillingExprOption] = map[string]any{"matrix-beta": variant}
+	_, err = changed.Preview(name, draft)
 	require.NoError(t, err)
-	require.Len(t, stale.Entries[0].PluginVariants, 1)
-	assert.True(t, stale.Entries[0].PluginVariants[0].Stale)
-	assert.Equal(t, "Beta updated", stale.Entries[0].PluginVariants[0].PluginName)
-	require.NoError(t, model.UpdateModelPricingOptions(map[string]string{"ModelRatio": string(ratioJSON)}))
-	// Removing just the stale override succeeds and leaves other prices.
-	response = modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", OptionUpdateRequest{Key: billing_setting.PluginBillingExprOption, Value: `{}`}, nil)
-	assert.Contains(t, response.Body.String(), `"success":true`)
-	final, err = model.GetModelPricingSnapshot([]string{name})
-	require.NoError(t, err)
-	assert.Empty(t, final.Entries[0].PluginVariants)
-	assert.Equal(t, base, final.Entries[0].Configured["billing_setting.billing_expr"])
-	// A complete reset removes all provider keys, including models containing ::.
-	require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{{ModelName: name, ExpectedVersion: final.Entries[0].Version, Reset: true}}))
-	final, err = model.GetModelPricingSnapshot([]string{name})
-	require.NoError(t, err)
-	assert.Empty(t, final.Entries[0].Configured)
-	assert.Equal(t, "{}", final.Options[billing_setting.PluginBillingExprOption])
+	delete(draft, billing_setting.PluginBillingExprOption)
+	_, err = changed.Preview(name, draft)
+	require.NoError(t, err, "discarding only a stale offline override must not discard unrelated saved evidence")
+	_, err = changed.Preview(name, model.PricingValues{})
+	require.NoError(t, err, "reset is a non-persistent offline draft, not deletion of financial history")
+	assert.Equal(t, options, modelManagementOptions(t, db))
+	assert.Equal(t, prices, modelManagementPrices(t, db))
 }

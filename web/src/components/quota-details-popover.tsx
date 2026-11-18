@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Fragment, type ReactNode } from 'react'
+import type { ReactNode } from 'react'
 
 import { Button } from '@/components/ui/button'
 import {
@@ -60,15 +60,18 @@ export function QuotaDetailsPopover(props: QuotaDetailsPopoverProps) {
       </div>
       <PopoverContent
         align='start'
-        className='w-72 max-w-[calc(100vw-2rem)] gap-3 p-3'
+        collisionPadding={16}
+        className='max-h-(--available-height) w-72 max-w-[calc(100vw-2rem)] gap-3 overflow-y-auto overscroll-contain p-3'
       >
         <PopoverTitle>{props.title}</PopoverTitle>
-        <dl className='grid grid-cols-[1fr_auto] gap-x-4 gap-y-2 text-sm tabular-nums'>
+        <dl className='grid min-w-0 grid-cols-1 gap-y-3 text-sm tabular-nums'>
           {props.details.map((detail) => (
-            <Fragment key={detail.label}>
-              <dt className='text-muted-foreground'>{detail.label}</dt>
-              <dd className='text-right break-all'>{detail.value}</dd>
-            </Fragment>
+            <div key={detail.label} className='grid min-w-0 grid-cols-1 gap-1'>
+              <dt className='text-muted-foreground wrap-anywhere'>
+                {detail.label}
+              </dt>
+              <dd className='min-w-0 wrap-anywhere'>{detail.value}</dd>
+            </div>
           ))}
         </dl>
         {props.description && (

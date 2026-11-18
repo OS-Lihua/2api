@@ -218,7 +218,7 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 	}
 
 	var channel *model.Provider
-	if task.PrivateData.Gateway != nil && descriptor.Authorize == nil {
+	if (task.PrivateData.Gateway != nil || task.PrivateData.LegacyObligation != nil) && descriptor.Authorize == nil {
 		var keyIndex int
 		channel, keyIndex, err = service.GatewayTaskProviderWithContext(c.Request.Context(), task)
 		if err == nil {

@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
@@ -58,7 +59,7 @@ func newAsyncTaskFixture(t *testing.T, upstream http.HandlerFunc) textGatewayFix
 	_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "sora"})
 	require.NoError(t, err)
 	fixture := newTextGatewayFixture(t, upstream)
-	require.NoError(t, model.DB.AutoMigrate(&model.Task{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.Task{}, &model.LegacySubscriptionTaskObligation{}, &model.LegacyTaskObligation{}))
 	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Updates(map[string]any{"model_name": "sora-2", "capabilities": capability.Set{Features: []capability.Feature{capability.Streaming}, InputModalities: []capability.Modality{capability.Text, capability.Image, capability.Video}, OutputModalities: []capability.Modality{capability.Video}}}).Error)
 	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:sora", "upstream_model_name": "sora-2"}).Error)
 	for _, price := range []*model.PriceVersion{
@@ -72,6 +73,580 @@ func newAsyncTaskFixture(t *testing.T, upstream http.HandlerFunc) textGatewayFix
 	service.GetTaskAdaptorFunc = func(platform constant.TaskPlatform) service.TaskPollingAdaptor { return relay.GetTaskAdaptor(platform) }
 	t.Cleanup(func() { service.GetTaskAdaptorFunc = previousFactory })
 	return fixture
+}
+
+func newMidjourneyTaskFixture(t *testing.T, upstream http.HandlerFunc) textGatewayFixture {
+	t.Helper()
+	fixture := newAsyncTaskFixture(t, upstream)
+	source, err := plugins.Source("midjourney")
+	require.NoError(t, err)
+	_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "midjourney"})
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeMidjourney).Error)
+	require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Updates(map[string]any{"model_name": "mj_imagine", "capabilities": capability.Set{Features: []capability.Feature{capability.Streaming}, InputModalities: []capability.Modality{capability.Text, capability.Image}, OutputModalities: []capability.Modality{capability.Image, capability.Text, capability.Video}}}).Error)
+	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"protocol": "task:midjourney", "upstream_model_name": "mj_imagine"}).Error)
+	fixture.offering.Aliases = append(fixture.offering.Aliases, "mj_imagine")
+	require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+	fixture.fake.Advance(time.Second)
+	for _, price := range []*model.PriceVersion{
+		{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("operation", u("operations") * 0.1)`, EffectiveAt: clock.Now().Unix()},
+		{OwnerType: model.PriceOwnerChannel, OwnerID: fixture.channel.ID, Currency: "USD", Expression: `tier("operation", u("operations") * 0.05)`, EffectiveAt: clock.Now().Unix()},
+	} {
+		require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
+	}
+	builder := newPluginGenerationBuilder(fixture.engine.Routes(), nil, productionPluginRouteHandlers)
+	require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(builder.prepare))
+	previousRegistry := defaultPluginDispatcher.registry
+	defaultPluginDispatcher.registry = jsplugin.DefaultRegistry
+	t.Cleanup(func() { defaultPluginDispatcher.registry = previousRegistry })
+	fixture.engine.NoRoute(defaultPluginDispatcher.dispatch)
+	return fixture
+}
+
+func TestMidjourneyNativeTaskUsesOneOfferingLifecycle(t *testing.T) {
+	for _, prefix := range []string{"/mj", "/fast/mj", "/relax/mj", "/turbo/mj"} {
+		t.Run(prefix, func(t *testing.T) {
+			var submits, queries atomic.Int32
+			fixture := newMidjourneyTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "provider-secret", r.Header.Get("Mj-Api-Secret"))
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method == http.MethodGet {
+					queries.Add(1)
+					assert.Equal(t, prefix+"/task/private-mj-job/fetch", r.URL.Path)
+					_, _ = io.WriteString(w, `{"id":"private-mj-job","action":"IMAGINE","status":"SUCCESS","progress":"100%","imageUrl":"https://artifact.invalid/private.png","buttons":[{"customId":"MJ::upsample::1::private-mj-job::SOLO","label":"U1"}]}`)
+					return
+				}
+				submits.Add(1)
+				assert.Equal(t, prefix+"/submit/imagine", r.URL.Path)
+				var body map[string]any
+				require.NoError(t, common.DecodeJson(r.Body, &body))
+				assert.Equal(t, false, body["unknown_flag"])
+				assert.EqualValues(t, 0, body["unknown_count"])
+				var holds int64
+				require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&holds).Error)
+				assert.EqualValues(t, 1, holds, "one durable hold must precede Provider I/O")
+				_, _ = io.WriteString(w, `{"code":1,"description":"submitted","result":"private-mj-job"}`)
+			})
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, prefix+"/submit/imagine", `{"prompt":"A bird","unknown_flag":false,"unknown_count":0}`)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.NotContains(t, response.Body.String(), "private-mj-job")
+			var task model.Task
+			require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
+			require.NotNil(t, task.PrivateData.Gateway)
+			assert.Equal(t, "private-mj-job", task.PrivateData.UpstreamTaskID)
+			assert.Equal(t, "midjourney", string(task.Platform))
+			assert.EqualValues(t, 1, submits.Load())
+			var wallet model.Wallet
+			require.NoError(t, model.DB.Where("account_type = ? AND owner_id = ?", model.LedgerAccountUserWallet, fixture.user.Id).Take(&wallet).Error)
+			assert.EqualValues(t, 910000000, wallet.Balance.Nanos)
+			for _, path := range []string{prefix + "/task/" + task.TaskID + "/fetch", "/v1/tasks/" + task.TaskID} {
+				read := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodGet, path, "")
+				require.Equal(t, http.StatusOK, read.Code, read.Body.String())
+				assert.NotContains(t, read.Body.String(), "private-mj-job")
+			}
+			assert.Zero(t, queries.Load(), "public reads must use persisted task state")
+			service.RunTaskPollingOnce(t.Context(), nil)
+			require.NoError(t, model.DB.First(&task, task.ID).Error)
+			require.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
+			require.NoError(t, service.SettleGatewayTask(t.Context(), &task))
+			requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.EqualValues(t, 90000000, requests[0].Receivable.Nanos)
+			attempts, count, err := model.ListGatewayAttempts(t.Context(), requests[0].ID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, count)
+			assert.EqualValues(t, 50000000, attempts[0].Cost.Nanos)
+			require.NoError(t, model.DB.First(fixture.token, fixture.token.Id).Error)
+			assert.Equal(t, common.TokenStatusEnabled, fixture.token.Status)
+		})
+	}
+}
+
+func TestMidjourneyBusinessAcceptanceDoesNotInventAnotherCharge(t *testing.T) {
+	for _, scenario := range []string{"rejected", "unknown", "unproved_existing", "proved_existing", "historical_existing", "historical_foreign_owner", "historical_wrong_provider", "historical_unverified_type"} {
+		t.Run(scenario, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newMidjourneyTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				call := calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case scenario == "proved_existing" && call == 1:
+					_, _ = io.WriteString(w, `{"code":1,"result":"private-existing-job"}`)
+				case scenario == "rejected":
+					_, _ = io.WriteString(w, `{"code":4,"description":"private-provider-error"}`)
+				case scenario == "unknown":
+					_, _ = io.WriteString(w, `{"code":777,"description":"private-provider-error"}`)
+				default:
+					_, _ = io.WriteString(w, `{"code":21,"result":"private-existing-job","properties":{"status":"SUCCESS"}}`)
+				}
+			})
+			var original model.Task
+			if strings.HasPrefix(scenario, "historical_") {
+				original = model.Task{TaskID: model.GenerateTaskID(), UserId: fixture.user.Id, ChannelId: fixture.channel.ProviderID, Platform: "midjourney", Status: model.TaskStatusQueued, PrivateData: model.TaskPrivateData{UpstreamTaskID: "private-existing-job", LegacyObligation: &model.TaskLegacyObligation{Version: "legacy_midjourney_obligations_v2", ProviderID: fixture.channel.ProviderID, ProviderType: constant.ChannelTypeMidjourney, Reconciliation: "pending", DebitEvidence: "unverified", RefundEvidence: "unverified"}}}
+				switch scenario {
+				case "historical_foreign_owner":
+					original.UserId++
+				case "historical_wrong_provider":
+					original.PrivateData.LegacyObligation.ProviderID++
+				case "historical_unverified_type":
+					original.PrivateData.LegacyObligation.ProviderType = 0
+				}
+				require.NoError(t, model.DB.Create(&original).Error)
+			}
+			if scenario == "proved_existing" {
+				first := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/mj/submit/imagine", `{"prompt":"A bird"}`)
+				require.Equal(t, 200, first.Code, first.Body.String())
+				require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&original).Error)
+			}
+			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/mj/submit/imagine", `{"prompt":"A bird"}`)
+			wantStatus := http.StatusBadGateway
+			wantBalance := int64(910000000)
+			if scenario == "rejected" {
+				wantStatus, wantBalance = http.StatusBadRequest, 1000000000
+			}
+			if scenario == "proved_existing" || scenario == "historical_existing" {
+				wantStatus = http.StatusOK
+				if scenario == "historical_existing" {
+					wantBalance = 1000000000
+				}
+				assert.Contains(t, response.Body.String(), original.TaskID)
+			}
+			assert.Equal(t, wantStatus, response.Code, response.Body.String())
+			assert.NotContains(t, response.Body.String(), "private-existing-job")
+			assert.NotContains(t, response.Body.String(), "private-provider-error")
+			var wallet model.Wallet
+			require.NoError(t, model.DB.Where("account_type = ? AND owner_id = ?", model.LedgerAccountUserWallet, fixture.user.Id).Take(&wallet).Error)
+			assert.Equal(t, wantBalance, wallet.Balance.Nanos)
+			wantCalls := int32(1)
+			if scenario == "proved_existing" {
+				wantCalls = 2
+			}
+			assert.Equal(t, wantCalls, calls.Load(), "unknown acknowledgement must never trigger another submit")
+			if strings.HasPrefix(scenario, "historical_") {
+				require.NoError(t, model.DB.First(&original, original.ID).Error)
+				assert.Nil(t, original.PrivateData.Gateway)
+				assert.Equal(t, "pending", original.PrivateData.LegacyObligation.Reconciliation)
+				assert.Equal(t, "unverified", original.PrivateData.LegacyObligation.DebitEvidence)
+			}
+			var tasks []model.Task
+			require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Order("id").Find(&tasks).Error)
+			wantTasks := int(wantCalls)
+			if strings.HasPrefix(scenario, "historical_") && original.UserId == fixture.user.Id {
+				wantTasks++
+			}
+			require.Len(t, tasks, wantTasks)
+			latest := tasks[len(tasks)-1]
+			require.NotNil(t, latest.PrivateData.Gateway)
+			assert.False(t, latest.PrivateData.Gateway.Accepted, "only an actually accepted new task may claim the reservation")
+			assert.Empty(t, latest.PrivateData.UpstreamTaskID, "21 without proof must not attach someone else's upstream task")
+			if scenario == "proved_existing" || scenario == "historical_existing" || scenario == "rejected" {
+				assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), latest.Status)
+				var billing model.GatewayBilling
+				require.NoError(t, model.DB.Where("request_id = ?", latest.PrivateData.Gateway.Settlement.Request.ID).Take(&billing).Error)
+				assert.True(t, latest.PrivateData.Gateway.Settlement.Attempt.CostPending, "acknowledgement alone never proves free procurement")
+			} else {
+				assert.Equal(t, model.TaskStatus(model.TaskStatusUnknown), latest.Status)
+			}
+		})
+	}
+}
+
+func TestMidjourneyImmediateDeliveryKeepsIndependentProcurement(t *testing.T) {
+	for _, protocol := range []string{"native", "responses", "responses_stream", "responses_background", "responses_background_native"} {
+		for _, delivery := range []string{"complete", "write_error", "short_write"} {
+			t.Run(protocol+"/"+delivery, func(t *testing.T) {
+				fixture := newMidjourneyTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					assert.Equal(t, "/mj/submit/upload-discord-images", r.URL.Path)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"code":1,"result":["https://private-artifact.invalid/image.png"]}`)
+				})
+				require.NoError(t, model.DB.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Update("model_name", "mj_upload").Error)
+				require.NoError(t, model.DB.Model(fixture.channel).Update("upstream_model_name", "mj_upload").Error)
+				fixture.offering.Aliases = append(fixture.offering.Aliases, "mj_upload")
+				require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+				path, body := "/mj/submit/upload-discord-images", `{"base64Array":["data:image/png;base64,aGVsbG8="]}`
+				if strings.HasPrefix(protocol, "responses") {
+					path, body = "/v1/responses", `{"model":"mj_upload","metadata":{"base64Array":["data:image/png;base64,aGVsbG8="]}}`
+					if protocol == "responses_stream" {
+						body = strings.Replace(body, `"model":`, `"stream":true,"model":`, 1)
+					}
+					if strings.HasPrefix(protocol, "responses_background") {
+						body = strings.Replace(body, `"model":`, `"background":true,"model":`, 1)
+					}
+				}
+				request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+				request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+				request.Header.Set("Content-Type", "application/json")
+				if strings.HasPrefix(protocol, "responses_background") {
+					accepted := httptest.NewRecorder()
+					fixture.engine.ServeHTTP(accepted, request)
+					require.Equal(t, http.StatusOK, accepted.Code, accepted.Body.String())
+					assert.NotContains(t, accepted.Body.String(), "/v1/tasks/", "metadata is not business delivery")
+					var metadata struct {
+						ID string `json:"id"`
+					}
+					require.NoError(t, common.Unmarshal(accepted.Body.Bytes(), &metadata))
+					require.NotEmpty(t, metadata.ID)
+					path = "/v1/responses/" + metadata.ID
+					if protocol == "responses_background_native" {
+						path = "/mj/task/task_" + strings.TrimPrefix(metadata.ID, "resp_") + "/fetch"
+					}
+					request = httptest.NewRequest(http.MethodGet, path, nil)
+					request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+				}
+				response := httptest.NewRecorder()
+				writer := gatewayPrefixOnlyWriter{ResponseRecorder: response, nilError: delivery != "write_error", full: delivery == "complete", beforeWrite: func() {
+					var billing model.GatewayBilling
+					require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&billing).Error)
+					assert.Equal(t, "reserved", billing.Phase, "inline sales must not finalize before delivery")
+				}}
+				fixture.engine.ServeHTTP(writer, request)
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				if delivery == "complete" {
+					assert.Contains(t, response.Body.String(), "/v1/tasks/")
+					assert.NotContains(t, response.Body.String(), "private-artifact.invalid")
+					if protocol == "native" {
+						var reply struct {
+							Result []string `json:"result"`
+						}
+						require.NoError(t, common.Unmarshal(response.Body.Bytes(), &reply))
+						require.Len(t, reply.Result, 1, "successful native upload must actually deliver its artifact")
+					} else if protocol == "responses_stream" {
+						assert.Contains(t, response.Body.String(), "event: response.completed")
+					} else if protocol == "responses_background_native" {
+						var reply struct {
+							Status   string `json:"status"`
+							ImageURL string `json:"imageUrl"`
+						}
+						require.NoError(t, common.Unmarshal(response.Body.Bytes(), &reply))
+						assert.Equal(t, "SUCCESS", reply.Status)
+						assert.Contains(t, reply.ImageURL, "/v1/tasks/")
+					} else {
+						var reply struct {
+							Status string `json:"status"`
+							Output []any  `json:"output"`
+						}
+						require.NoError(t, common.Unmarshal(response.Body.Bytes(), &reply))
+						assert.Equal(t, "completed", reply.Status)
+						require.Len(t, reply.Output, 1)
+					}
+				}
+				wantSale := int64(0)
+				if delivery == "complete" {
+					wantSale = 90000000
+				}
+				var task model.Task
+				require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
+				require.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
+				for range 2 {
+					require.NoError(t, service.SettleGatewayTask(t.Context(), &task))
+				}
+				requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, total)
+				assert.Equal(t, wantSale, requests[0].Receivable.Nanos)
+				attempts, total, err := model.ListGatewayAttempts(t.Context(), requests[0].ID, 0, 10)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, total)
+				assert.EqualValues(t, 50000000, attempts[0].Cost.Nanos)
+				assert.False(t, attempts[0].CostPending)
+				assertTextGatewayLedger(t, requests[0], 50000000)
+			})
+		}
+	}
+}
+
+func TestMidjourneyChildActionsAndNativeHistoryStayOwnerScoped(t *testing.T) {
+	var submits, queries, seeds atomic.Int32
+	fixture := newMidjourneyTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "provider-secret", r.Header.Get("Mj-Api-Secret"))
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mj/task/private-parent/image-seed":
+			seeds.Add(1)
+			_, _ = io.WriteString(w, `{"code":1,"result":"123456"}`)
+		case "/mj/task/private-parent/fetch":
+			queries.Add(1)
+			_, _ = io.WriteString(w, `{"id":"private-parent","action":"IMAGINE","status":"SUCCESS","progress":"100%","imageUrl":"https://artifact.invalid/parent.png","buttons":[{"customId":"MJ::upsample::1::private-parent::SOLO","label":"U1"}]}`)
+		case "/mj/submit/imagine":
+			submits.Add(1)
+			_, _ = io.WriteString(w, `{"code":1,"result":"private-parent"}`)
+		case "/mj/submit/action":
+			submits.Add(1)
+			var body map[string]any
+			require.NoError(t, common.DecodeJson(r.Body, &body))
+			assert.Equal(t, "private-parent", body["taskId"])
+			assert.Equal(t, "MJ::upsample::1::private-parent::SOLO", body["customId"])
+			_, _ = io.WriteString(w, `{"code":1,"result":"private-child"}`)
+		default:
+			t.Errorf("unexpected Provider operation %s", r.URL.Path)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	})
+	provider, err := model.GetProviderById(fixture.channel.ProviderID, true)
+	require.NoError(t, err)
+	providerURL, err := url.Parse(provider.GetBaseURL())
+	require.NoError(t, err)
+	fetch := system_setting.GetFetchSetting()
+	previousFetch, previousWorker := *fetch, system_setting.WorkerUrl
+	fetch.AllowPrivateIp = true
+	fetch.AllowedPorts = append(append([]string(nil), fetch.AllowedPorts...), providerURL.Port())
+	system_setting.WorkerUrl = ""
+	t.Cleanup(func() { *fetch, system_setting.WorkerUrl = previousFetch, previousWorker })
+	childOffering := *fixture.offering
+	childOffering.ID, childOffering.Name, childOffering.Aliases = 0, "mj_upscale", nil
+	require.NoError(t, model.SaveModelOffering(t.Context(), &childOffering, "save"))
+	require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: childOffering.ID, Currency: "USD", Expression: `tier("operation", u("operations") * 0.2)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+	require.NoError(t, model.SaveModelOffering(t.Context(), &childOffering, "enable"))
+	submit := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/mj/submit/imagine", `{"prompt":"Parent"}`)
+	require.Equal(t, http.StatusOK, submit.Code, submit.Body.String())
+	var parent model.Task
+	require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&parent).Error)
+	service.RunTaskPollingOnce(t.Context(), nil)
+	require.NoError(t, model.DB.First(&parent, parent.ID).Error)
+	require.Equal(t, model.TaskStatus(model.TaskStatusSuccess), parent.Status)
+	read := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodGet, "/mj/task/"+parent.TaskID+"/fetch", "")
+	require.Equal(t, http.StatusOK, read.Code, read.Body.String())
+	var public struct {
+		ID       string `json:"id"`
+		ImageURL string `json:"imageUrl"`
+		Buttons  []struct {
+			CustomID string `json:"customId"`
+		} `json:"buttons"`
+	}
+	require.NoError(t, common.Unmarshal(read.Body.Bytes(), &public))
+	require.Len(t, public.Buttons, 1)
+	assert.NotContains(t, read.Body.String(), "private-parent")
+	assert.Contains(t, public.ImageURL, "/v1/tasks/")
+	batch := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/mj/task/list-by-condition", `{"ids":["`+parent.TaskID+`"]}`)
+	require.Equal(t, http.StatusOK, batch.Code, batch.Body.String())
+	assert.Contains(t, batch.Body.String(), "imageUrl", "batch history must retain owner-scoped artifacts")
+	assert.NotContains(t, batch.Body.String(), "private-parent")
+	assert.EqualValues(t, 1, queries.Load(), "history reads must not poll")
+	seed := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodGet, "/mj/task/"+parent.TaskID+"/image-seed", "")
+	assert.Equal(t, http.StatusOK, seed.Code, seed.Body.String())
+	assert.Contains(t, seed.Body.String(), "123456")
+	assert.EqualValues(t, 1, seeds.Load())
+	body := `{"taskId":"` + parent.TaskID + `","customId":"` + public.Buttons[0].CustomID + `"}`
+	policy, err := model.GetKeyPermissions(t.Context(), fixture.token.Id, fixture.user.Id)
+	require.NoError(t, err)
+	policy, err = model.MutateKeyPermissions(t.Context(), fixture.token.Id, fixture.user.Id, policy.Revision, "replace", model.KeyPermissions{DefaultAllow: false, ExceptionIDs: []int{fixture.offering.ID}}, nil)
+	require.NoError(t, err)
+	denied := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/mj/submit/action", body)
+	assert.Equal(t, http.StatusNotFound, denied.Code, denied.Body.String())
+	assert.EqualValues(t, 1, submits.Load())
+	_, err = model.MutateKeyPermissions(t.Context(), fixture.token.Id, fixture.user.Id, policy.Revision, "replace", model.KeyPermissions{DefaultAllow: false, ExceptionIDs: []int{fixture.offering.ID, childOffering.ID}}, nil)
+	require.NoError(t, err)
+	child := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/mj/submit/action", body)
+	require.Equal(t, http.StatusOK, child.Code, child.Body.String())
+	assert.EqualValues(t, 2, submits.Load())
+	var accepted model.Task
+	require.NoError(t, model.DB.Where("id <> ? AND user_id = ?", parent.ID, fixture.user.Id).Take(&accepted).Error)
+	assert.Equal(t, parent.PrivateData.Gateway.ProviderID, accepted.PrivateData.Gateway.ProviderID)
+	assert.Equal(t, parent.PrivateData.Gateway.ChannelID, accepted.PrivateData.Gateway.ChannelID)
+	assert.Equal(t, childOffering.ID, accepted.PrivateData.Gateway.Settlement.Request.ModelOfferingID)
+	var childBilling model.GatewayBilling
+	require.NoError(t, model.DB.Where("request_id = ?", accepted.PrivateData.Gateway.Settlement.Request.ID).Take(&childBilling).Error)
+	assert.EqualValues(t, 180000000, childBilling.Reservation.Nanos)
+}
+
+func TestMidjourneyLegacyObligationsMigrateAfterCompletedV1(t *testing.T) {
+	var calls atomic.Int32
+	fixture := newMidjourneyTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Method == http.MethodPost {
+			assert.Equal(t, "/mj/submit/change", r.URL.Path)
+			var body map[string]any
+			require.NoError(t, common.DecodeJson(r.Body, &body))
+			assert.Equal(t, "legacy-queued", body["taskId"])
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"code":1,"result":"legacy-child"}`)
+			return
+		}
+		assert.Equal(t, "/mj/task/legacy-queued/fetch", r.URL.Path)
+		assert.Equal(t, "provider-secret", r.Header.Get("Mj-Api-Secret"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"legacy-queued","status":"SUCCESS","progress":"100%","imageUrl":"https://artifact.invalid/legacy.png"}`)
+	})
+	require.NoError(t, model.DB.AutoMigrate(&model.Midjourney{}))
+	marker := struct {
+		Version     string `gorm:"primaryKey;type:varchar(64)"`
+		CompletedAt int64
+	}{Version: "legacy_gateway_v1", CompletedAt: fixture.fake.Now().Unix()}
+	require.NoError(t, model.DB.Table("legacy_gateway_migrations").AutoMigrate(&marker))
+	require.NoError(t, model.DB.Table("legacy_gateway_migrations").Create(&marker).Error)
+	legacy := []model.Midjourney{
+		{UserId: fixture.user.Id, ChannelId: fixture.channel.ProviderID, MjId: "legacy-queued", Code: 1, Action: "IMAGINE", Status: "QUEUED", Progress: "10%", Quota: 1200, SubmitTime: fixture.fake.Now().Add(-48 * time.Hour).UnixMilli()},
+		{UserId: fixture.user.Id, ChannelId: fixture.channel.ProviderID + 1000, MjId: "legacy-missing-provider", Code: 22, Action: "IMAGINE", Status: "QUEUED", Progress: "0%", Quota: 2400, SubmitTime: fixture.fake.Now().Add(-48 * time.Hour).UnixMilli()},
+		{UserId: fixture.user.Id, ChannelId: fixture.channel.ProviderID, MjId: "legacy-completed", Code: 1, Action: "IMAGINE", Status: "SUCCESS", Progress: "100%", Quota: 3600, ImageUrl: "https://artifact.invalid/done.png"},
+	}
+	require.NoError(t, model.DB.Create(&legacy).Error)
+	var ledgerBefore int64
+	require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Count(&ledgerBefore).Error)
+	report, err := model.MigrateLegacyGateway(t.Context())
+	require.NoError(t, err)
+	assert.True(t, report.Committed)
+	assert.False(t, report.AlreadyCompleted, "the old v1 marker must not skip the MJ obligation version")
+	var imported []model.Task
+	require.NoError(t, model.DB.Where("platform = ?", "midjourney").Order("id").Find(&imported).Error)
+	require.Len(t, imported, 3)
+	for i := range imported {
+		task := &imported[i]
+		assert.Nil(t, task.PrivateData.Gateway, "historical tasks have no frozen PriceVersion or money reservation to invent")
+		assert.Zero(t, task.Quota, "unproven legacy quota must not enable a second refund")
+		assert.Empty(t, task.PrivateData.Key)
+		assert.Equal(t, legacy[i].MjId, task.PrivateData.UpstreamTaskID)
+		assert.NotEqual(t, legacy[i].MjId, task.TaskID)
+		encoded, err := common.Marshal(task.PrivateData)
+		require.NoError(t, err)
+		var private map[string]any
+		require.NoError(t, common.Unmarshal(encoded, &private))
+		obligation, ok := private["legacy_obligation"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "pending", obligation["reconciliation"])
+		assert.Equal(t, "unverified", obligation["debit_evidence"])
+		assert.Equal(t, "unverified", obligation["refund_evidence"])
+		assert.EqualValues(t, legacy[i].Quota, obligation["source_quota"])
+	}
+	assert.Empty(t, model.GetAllUnFinishTasks(), "migrated obligations must leave the legacy MJ poller")
+	assert.Empty(t, model.GetTimedOutUnfinishedTasks(fixture.fake.Now().Unix(), 100), "elapsed time is not historical terminal evidence")
+	assert.False(t, service.RefundMidjourneyQuota(t.Context(), &legacy[0], "legacy replay"))
+	service.RunTaskPollingOnce(t.Context(), nil)
+	assert.EqualValues(t, 1, calls.Load(), "only an available original Provider may be queried")
+	require.NoError(t, model.DB.First(&imported[0], imported[0].ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), imported[0].Status)
+	require.NoError(t, model.DB.First(&imported[1], imported[1].ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusQueued), imported[1].Status)
+	for _, id := range []string{imported[0].TaskID, legacy[0].MjId} {
+		response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodGet, "/mj/task/"+id+"/fetch", "")
+		assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), imported[0].TaskID)
+		assert.NotContains(t, response.Body.String(), "legacy-queued")
+	}
+	replayed, err := model.MigrateLegacyGateway(t.Context())
+	require.NoError(t, err)
+	assert.True(t, replayed.AlreadyCompleted)
+	var taskCount, billingCount, ledgerAfter int64
+	require.NoError(t, model.DB.Model(&model.Task{}).Count(&taskCount).Error)
+	require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Count(&billingCount).Error)
+	require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Count(&ledgerAfter).Error)
+	assert.EqualValues(t, 3, taskCount)
+	assert.Zero(t, billingCount)
+	assert.Equal(t, ledgerBefore, ledgerAfter)
+	var wallet model.Wallet
+	require.NoError(t, model.DB.Where("owner_id = ? AND account_type = ?", fixture.user.Id, model.LedgerAccountUserWallet).Take(&wallet).Error)
+	assert.EqualValues(t, 1000000000, wallet.Balance.Nanos)
+
+	childOffering := *fixture.offering
+	childOffering.ID, childOffering.Name, childOffering.Aliases = 0, "mj_upscale", nil
+	require.NoError(t, model.SaveModelOffering(t.Context(), &childOffering, "save"))
+	require.NoError(t, model.CreatePriceVersion(t.Context(), &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: childOffering.ID, Currency: "USD", Expression: `tier("operation", u("operations") * 0.1)`, EffectiveAt: clock.Now().Unix()}, fixture.sale.CreatedBy))
+	require.NoError(t, model.SaveModelOffering(t.Context(), &childOffering, "enable"))
+	childResponse := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/mj/submit/change", `{"taskId":"legacy-queued","action":"UPSCALE","index":1}`)
+	require.Equal(t, http.StatusOK, childResponse.Code, childResponse.Body.String())
+	var child model.Task
+	require.NoError(t, model.DB.Where(`"private_data"->>'gateway' IS NOT NULL`).Take(&child).Error)
+	assert.Equal(t, fixture.channel.ProviderID, child.PrivateData.Gateway.ProviderID, "historical child must keep the original Provider")
+	assert.Equal(t, childOffering.ID, child.PrivateData.Gateway.Settlement.Request.ModelOfferingID)
+	assert.Nil(t, imported[0].PrivateData.Gateway, "child routing cannot fabricate a historical Channel or frozen price")
+}
+
+func TestMidjourneyPollFailuresDoNotInventTerminalOutcome(t *testing.T) {
+	for _, historical := range []bool{false, true} {
+		for _, status := range []int{http.StatusNotFound, http.StatusInternalServerError, http.StatusOK} {
+			t.Run(fmt.Sprintf("historical=%t/http=%d", historical, status), func(t *testing.T) {
+				var recovered atomic.Bool
+				fixture := newMidjourneyTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					if r.Method == http.MethodPost {
+						_, _ = io.WriteString(w, `{"code":1,"result":"private-poll"}`)
+						return
+					}
+					if recovered.Load() {
+						_, _ = io.WriteString(w, `{"id":"private-poll","status":"SUCCESS","progress":"100%","imageUrl":"https://artifact.invalid/poll.png"}`)
+						return
+					}
+					w.WriteHeader(status)
+					_, _ = io.WriteString(w, `{"message":"temporarily unavailable"}`)
+				})
+				previous := constant.TaskPollMaxFailures
+				constant.TaskPollMaxFailures = 1
+				t.Cleanup(func() { constant.TaskPollMaxFailures = previous })
+				var task model.Task
+				if historical {
+					task = model.Task{TaskID: model.GenerateTaskID(), UserId: fixture.user.Id, ChannelId: fixture.channel.ProviderID, Platform: "midjourney", Status: model.TaskStatusQueued, Progress: "10%", PrivateData: model.TaskPrivateData{UpstreamTaskID: "private-poll", LegacyObligation: &model.TaskLegacyObligation{Version: "legacy_midjourney_obligations_v2", ProviderID: fixture.channel.ProviderID, ProviderType: constant.ChannelTypeMidjourney, Reconciliation: "pending", DebitEvidence: "unverified", RefundEvidence: "unverified"}}}
+					require.NoError(t, model.DB.Create(&task).Error)
+				} else {
+					response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/mj/submit/imagine", `{"prompt":"Pending poll"}`)
+					require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+					require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
+				}
+				before, progress := task.Status, task.Progress
+				service.RunTaskPollingOnce(t.Context(), nil)
+				require.NoError(t, model.DB.First(&task, task.ID).Error)
+				assert.Equal(t, before, task.Status, "transport errors and unrecognized bodies are not terminal Provider facts")
+				assert.Equal(t, progress, task.Progress)
+				assert.Zero(t, task.FinishTime)
+				if !historical {
+					var billing model.GatewayBilling
+					require.NoError(t, model.DB.Where("request_id = ?", task.PrivateData.Gateway.Settlement.Request.ID).Take(&billing).Error)
+					assert.Equal(t, "reserved", billing.Phase)
+					assert.Empty(t, task.PrivateData.Gateway.CompletionFacts)
+				}
+				recovered.Store(true)
+				service.RunTaskPollingOnce(t.Context(), nil)
+				require.NoError(t, model.DB.First(&task, task.ID).Error)
+				assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status, "the accepted original identity must remain recoverable")
+				if historical {
+					assert.Equal(t, "pending", task.PrivateData.LegacyObligation.Reconciliation)
+					var billed int64
+					require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Count(&billed).Error)
+					assert.Zero(t, billed)
+				}
+			})
+		}
+	}
+}
+
+func TestMidjourneyImageRequiresOwnerCredential(t *testing.T) {
+	for _, prefix := range []string{"/mj", "/fast/mj"} {
+		t.Run(prefix, func(t *testing.T) {
+			var calls atomic.Int32
+			artifact := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "image/png")
+				_, _ = w.Write([]byte("private-midjourney-image"))
+			}))
+			t.Cleanup(artifact.Close)
+			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				t.Error("image authorization must not contact the Provider")
+			})
+			fetch := system_setting.GetFetchSetting()
+			previousFetch, previousWorker := *fetch, system_setting.WorkerUrl
+			artifactURL, err := url.Parse(artifact.URL)
+			require.NoError(t, err)
+			fetch.AllowPrivateIp = true
+			fetch.AllowedPorts = append(append([]string(nil), fetch.AllowedPorts...), artifactURL.Port())
+			system_setting.WorkerUrl = ""
+			t.Cleanup(func() { *fetch, system_setting.WorkerUrl = previousFetch, previousWorker })
+			require.NoError(t, model.DB.AutoMigrate(&model.Midjourney{}, &model.Task{}))
+			legacy := &model.Midjourney{UserId: fixture.user.Id + 1000, MjId: "private-upstream-image", Status: "SUCCESS", ImageUrl: artifact.URL + "/private.png"}
+			require.NoError(t, model.DB.Create(legacy).Error)
+			for _, credential := range []string{"", fixture.token.Key} {
+				response := adminSecurityRequest(fixture.engine, credential, http.MethodGet, prefix+"/image/"+legacy.MjId, "")
+				if credential == "" {
+					assert.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
+				} else {
+					assert.Equal(t, http.StatusNotFound, response.Code, response.Body.String())
+				}
+				assert.NotContains(t, response.Body.String(), "private-midjourney-image")
+			}
+			assert.Zero(t, calls.Load(), "private image lookup must authorize before artifact I/O")
+			require.NoError(t, model.DB.First(fixture.token, fixture.token.Id).Error)
+			assert.Equal(t, common.TokenStatusEnabled, fixture.token.Status, "retired quota must not exhaust an enabled credential")
+		})
+	}
 }
 
 func TestAsyncTaskUsesOfferingIDPermissionsAcrossEntrypoints(t *testing.T) {
@@ -98,6 +673,8 @@ func TestAsyncTaskUsesOfferingIDPermissionsAcrossEntrypoints(t *testing.T) {
 			} else {
 				fixture = newAsyncTaskFixture(t, upstream)
 			}
+			legacyReads := isolateLegacyAbilityReads(t, false)
+			t.Cleanup(func() { assert.Zero(t, legacyReads.Load(), "public task creation must not use legacy routing") })
 			pat := createWalletTestAccessToken(t, fixture.user.Id, "api_key:read", "api_key:write")
 			policy := fmt.Sprintf("/api/token/%d/permissions", fixture.token.Id)
 			denied := adminSecurityRequest(fixture.engine, pat, http.MethodPatch, policy, `{"action":"deny_all","revision":0}`)
@@ -153,6 +730,65 @@ func TestAsyncTaskUsesOfferingIDPermissionsAcrossEntrypoints(t *testing.T) {
 				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, endpoint.path, strings.ReplaceAll(endpoint.body, "$MODEL", "gateway-alias"))
 				require.Equal(t, credential.status, response.Code, response.Body.String())
 				assert.EqualValues(t, 2, calls.Load())
+			}
+		})
+	}
+}
+
+func TestAsyncTaskFreezesUsageSchema(t *testing.T) {
+	for _, historical := range []bool{false, true} {
+		t.Run(fmt.Sprintf("missing_snapshot_%t", historical), func(t *testing.T) {
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method == http.MethodGet {
+					_, _ = w.Write([]byte(`{"id":"private-job","status":"completed","seconds":"2"}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"id":"private-job","status":"queued"}`))
+			})
+			plugin, found := jsplugin.DefaultRegistry.Get("sora")
+			require.True(t, found)
+			schema, _ := plugin.Meta.UsageForModels("sora-2")
+			field := schema["seconds"]
+			field.UnitLabel = jsplugin.LocalizedText{"en": "accepted-second"}
+			schema["seconds"] = field
+			request := httptest.NewRequest(http.MethodPost, "/v1/tasks/sora", strings.NewReader(`{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+			response := httptest.NewRecorder()
+			fixture.engine.ServeHTTP(response, request)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			var task model.Task
+			require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).Take(&task).Error)
+			if historical {
+				encoded, err := common.Marshal(task.PrivateData)
+				require.NoError(t, err)
+				var private map[string]any
+				require.NoError(t, common.Unmarshal(encoded, &private))
+				delete(private["gateway"].(map[string]any), "billing_usage_schema")
+				encoded, err = common.Marshal(private)
+				require.NoError(t, err)
+				require.NoError(t, model.DB.Model(&task).Update("private_data", string(encoded)).Error)
+			}
+			field.UnitLabel = jsplugin.LocalizedText{"en": "changed-second"}
+			schema["seconds"] = field
+			service.RunTaskPollingOnce(t.Context(), nil)
+			requests, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.Equal(t, "success", requests[0].Status)
+			assert.EqualValues(t, 180000000, requests[0].Receivable.Nanos)
+			encoded, err := common.Marshal(requests[0].Usage)
+			require.NoError(t, err)
+			var usage map[string]any
+			require.NoError(t, common.Unmarshal(encoded, &usage))
+			if historical {
+				assert.NotContains(t, usage, "billing_usage_schema", "old tasks must never read today's registry schema")
+			} else {
+				require.Contains(t, usage, "billing_usage_schema")
+				seconds := usage["billing_usage_schema"].(map[string]any)["seconds"].(map[string]any)
+				assert.Equal(t, "second", seconds["unit"])
+				assert.Equal(t, "accepted-second", seconds["unitLabel"].(map[string]any)["en"])
 			}
 		})
 	}
@@ -584,6 +1220,7 @@ func TestAsyncTaskRemixRetainsOriginalProviderAfterChannelEdit(t *testing.T) {
 func TestAsyncTaskHostProtocolsUseOfferingMoneyLifecycle(t *testing.T) {
 	for _, tc := range []struct{ path, body string }{
 		{"/v1/videos", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`},
+		{"/v1/video/generations", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`},
 		{"/v1/responses", `{"model":"gateway-alias","input":"A bird","background":true,"seconds":"4"}`},
 	} {
 		t.Run(tc.path, func(t *testing.T) {
@@ -595,6 +1232,7 @@ func TestAsyncTaskHostProtocolsUseOfferingMoneyLifecycle(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte(`{"id":"private-job","status":"queued"}`))
 			})
+			SetVideoRouter(fixture.engine)
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, tc.path, tc.body)
 			require.Equal(t, 200, response.Code, response.Body.String())
 			assert.Equal(t, 1, calls)
@@ -891,7 +1529,17 @@ func TestAsyncTaskVideoRemixUsesOwnedOriginalTask(t *testing.T) {
 		response := adminSecurityRequest(fixture.engine, foreignKey.Key, http.MethodPost, "/v1/videos/"+original.TaskID+"/remix", `{"prompt":"A green bird"}`)
 		assert.Equal(t, 401, response.Code, response.Body.String())
 	}
+	legacy := original
+	legacy.ID, legacy.TaskID, legacy.PrivateData.Gateway = 0, "legacy-remix-origin", nil
+	require.NoError(t, model.DB.Create(&legacy).Error)
+	read := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodGet, "/v1/tasks/"+legacy.TaskID, "")
+	assert.Equal(t, http.StatusOK, read.Code, read.Body.String())
+	response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/videos/"+legacy.TaskID+"/remix", `{"prompt":"A green bird"}`)
+	assert.Equal(t, http.StatusNotFound, response.Code, response.Body.String())
 	assert.Equal(t, 2, calls)
+	var reservations int64
+	require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
+	assert.EqualValues(t, 2, reservations, "a legacy task cannot start another legacy-funded submission")
 }
 
 func TestAsyncTaskSubmissionCannotOverwriteConcurrentPollCompletion(t *testing.T) {
@@ -1126,12 +1774,17 @@ func TestAsyncTaskRecoveryDoesNotStarveLaterTerminalFacts(t *testing.T) {
 func TestAsyncTaskUnknownSubmissionCannotStarvePollingOrTimeouts(t *testing.T) {
 	for _, expired := range []bool{false, true} {
 		t.Run(fmt.Sprintf("expired_%t", expired), func(t *testing.T) {
-			var accept atomic.Bool
+			var accept, complete atomic.Bool
+			complete.Store(!expired)
 			var polls atomic.Int32
 			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == http.MethodGet {
 					polls.Add(1)
 					w.Header().Set("Content-Type", "application/json")
+					if !complete.Load() {
+						_, _ = w.Write([]byte(`{"id":"known-job","status":"queued"}`))
+						return
+					}
 					_, _ = w.Write([]byte(`{"id":"known-job","status":"completed","seconds":"2"}`))
 					return
 				}
@@ -1185,25 +1838,70 @@ func TestAsyncTaskUnknownSubmissionCannotStarvePollingOrTimeouts(t *testing.T) {
 			service.RunTaskPollingOnce(t.Context(), nil)
 			var refreshed model.Task
 			require.NoError(t, model.DB.First(&refreshed, known.ID).Error)
+			requestID := known.PrivateData.Gateway.Settlement.Request.ID
 			if expired {
-				assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), refreshed.Status)
-				assert.True(t, refreshed.PrivateData.Gateway.CompletionUnknown)
+				require.Equal(t, model.TaskStatus(model.TaskStatusQueued), refreshed.Status, "elapsed time is not an observed Provider failure")
+				assert.True(t, refreshed.PrivateData.Gateway.Accepted)
+				assert.False(t, refreshed.PrivateData.Gateway.CompletionUnknown)
 				assert.Empty(t, refreshed.PrivateData.Gateway.CompletionFacts)
-				assert.Zero(t, polls.Load())
+				assert.Empty(t, refreshed.FailReason)
+				assert.Zero(t, refreshed.FinishTime)
+				assert.EqualValues(t, 1, polls.Load(), "accepted work must still be queried after the host timeout")
+				wallet, err := model.GetUserWallet(fixture.user.Id)
+				require.NoError(t, err)
+				assert.EqualValues(t, 640000000, wallet.Balance.Nanos, "unknown output must retain the original reservation")
+				var billing model.GatewayBilling
+				require.NoError(t, model.DB.First(&billing, "request_id = ?", requestID).Error)
+				assert.Equal(t, "reserved", billing.Phase)
+				assert.EqualValues(t, 360000000, billing.Reservation.Nanos)
+				var pendingEntries []model.LedgerEntry
+				require.NoError(t, model.DB.Where("request_id = ?", requestID).Find(&pendingEntries).Error)
+				require.Len(t, pendingEntries, 1)
+				assert.Equal(t, model.LedgerEntryPreConsume, pendingEntries[0].Type)
+				read := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodGet, "/v1/tasks/"+known.TaskID, "")
+				require.Equal(t, http.StatusOK, read.Code, read.Body.String())
+				assert.NotContains(t, read.Body.String(), "known-job")
+				_, err = service.RecoverGatewayTasks(t.Context(), 200)
+				require.NoError(t, err)
+				complete.Store(true)
+				service.RunTaskPollingOnce(t.Context(), nil)
+				require.NoError(t, model.DB.First(&refreshed, known.ID).Error)
+				assert.EqualValues(t, 2, polls.Load())
 			} else {
-				assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), refreshed.Status)
 				assert.EqualValues(t, 1, polls.Load())
 			}
+			require.Equal(t, model.TaskStatus(model.TaskStatusSuccess), refreshed.Status)
+			assert.Equal(t, requestID, refreshed.PrivateData.Gateway.Settlement.Request.ID)
+			assert.Equal(t, known.PrivateData.Gateway.ProviderID, refreshed.PrivateData.Gateway.ProviderID)
+			assert.Equal(t, known.PrivateData.Gateway.ChannelID, refreshed.PrivateData.Gateway.ChannelID)
+			request, err := model.GetGatewayRequest(t.Context(), requestID, fixture.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, "success", request.Status)
+			assert.Equal(t, known.PrivateData.Gateway.Settlement.Request.SalePriceVersionID, request.SalePriceVersionID)
+			assert.EqualValues(t, 180000000, request.Receivable.Nanos)
+			attempts, total, err := model.ListGatewayAttempts(t.Context(), requestID, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			assert.EqualValues(t, 100000000, attempts[0].Cost.Nanos)
 			var retained int64
 			require.NoError(t, model.DB.Model(&model.Task{}).Where("user_id = ? AND id <> ? AND status = ?", fixture.user.Id, known.ID, model.TaskStatusUnknown).Count(&retained).Error)
 			assert.EqualValues(t, unknown, retained, "unknown accepted identity must remain pending, not be discarded to free the queue")
+			var billing model.GatewayBilling
+			require.NoError(t, model.DB.First(&billing, "request_id = ?", requestID).Error)
+			assert.Equal(t, "settled", billing.Phase)
+			var entriesBefore, entriesAfter, reservations int64
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id = ?", requestID).Count(&entriesBefore).Error)
+			require.NoError(t, service.SettleGatewayTask(t.Context(), &refreshed))
+			service.RunTaskPollingOnce(t.Context(), nil)
+			_, err = service.RecoverGatewayTasks(t.Context(), 200)
+			require.NoError(t, err)
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id = ?", requestID).Count(&entriesAfter).Error)
+			assert.Equal(t, entriesBefore, entriesAfter, "recovery must not post a second settlement")
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("request_id = ? AND type = ?", requestID, model.LedgerEntryPreConsume).Count(&reservations).Error)
+			assert.EqualValues(t, 1, reservations)
 			wallet, err := model.GetUserWallet(fixture.user.Id)
 			require.NoError(t, err)
-			if expired {
-				assert.EqualValues(t, 1000000000, wallet.Balance.Nanos)
-			} else {
-				assert.EqualValues(t, 820000000, wallet.Balance.Nanos)
-			}
+			assert.EqualValues(t, 820000000, wallet.Balance.Nanos)
 		})
 	}
 }
@@ -1712,6 +2410,30 @@ func TestAsyncTaskRemixCredentialFailureDisablesOnlySelectedOriginalKey(t *testi
 	assert.NotEqual(t, common.ChannelStatusAutoDisabled, provider.ProviderInfo.MultiKeyStatusList[0])
 }
 
+func denyLegacyTaskAliasProjection(t *testing.T, providerID int) {
+	t.Helper()
+	database := model.DB
+	require.NoError(t, database.Model(&model.Provider{}).Where("id = ?", providerID).Updates(map[string]any{
+		"models":        "gateway-alias,suno_music",
+		"model_mapping": `{"gateway-alias":"unrelated-private-model","suno_music":"unrelated-private-model"}`,
+	}).Error)
+	var reads atomic.Int32
+	const callback = "test:deny_legacy_task_alias_projection"
+	require.NoError(t, database.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Table == "providers" {
+			fields := strings.ToLower(strings.Join(tx.Statement.Selects, ","))
+			if strings.Contains(fields, "models") || strings.Contains(fields, "model_mapping") {
+				reads.Add(1)
+				tx.AddError(fmt.Errorf("legacy Provider alias projection is unavailable"))
+			}
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, database.Callback().Query().Remove(callback))
+		assert.Zero(t, reads.Load(), "live task identity must come only from the authorized Offering and Channel")
+	})
+}
+
 func TestAsyncTaskNativeDecodeKeepsLaterCompatibleModel(t *testing.T) {
 	var calls atomic.Int32
 	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1722,6 +2444,7 @@ func TestAsyncTaskNativeDecodeKeepsLaterCompatibleModel(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":[{"url":"https://artifact.invalid/result.png","size":"2048x2048"}],"usage":{"generated_images":1}}`))
 	})
+	denyLegacyTaskAliasProjection(t, fixture.channel.ProviderID)
 	source, err := plugins.Source("doubao")
 	require.NoError(t, err)
 	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
@@ -2009,6 +2732,7 @@ func TestAsyncTaskNativeModelCarriersResolveOffering(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte(test.result))
 			})
+			denyLegacyTaskAliasProjection(t, fixture.channel.ProviderID)
 			source, err := plugins.Source(test.plugin)
 			require.NoError(t, err)
 			jsplugin.DefaultRegistry = jsplugin.NewRegistry()
@@ -2043,28 +2767,82 @@ func TestAsyncTaskNativeModelCarriersResolveOffering(t *testing.T) {
 	}
 }
 
-func TestAsyncTaskNativeLegacySubmissionStillRequiresLegacyQuota(t *testing.T) {
-	var calls atomic.Int32
-	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		_, _ = w.Write([]byte(`{"id":"unexpected"}`))
-	})
-	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "doubao-seedance-1-0-pro-250528", ChannelId: fixture.channel.ProviderID, Enabled: true}).Error)
-	source, err := plugins.Source("doubao")
-	require.NoError(t, err)
-	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
-	_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "doubao"})
-	require.NoError(t, err)
-	builder := newPluginGenerationBuilder(fixture.engine.Routes(), nil, productionPluginRouteHandlers)
-	require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(builder.prepare))
-	dispatcher := &pluginRouteDispatcher{registry: jsplugin.DefaultRegistry}
-	fixture.engine.NoRoute(dispatcher.dispatch)
-	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/doubao/api/v3/contents/generations/tasks", `{"model":"doubao-seedance-1-0-pro-250528","content":[{"type":"text","text":"A bird"}]}`)
-	assert.Equal(t, 401, response.Code, response.Body.String())
-	assert.Zero(t, calls.Load())
-	var reservations int64
-	require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
-	assert.Zero(t, reservations)
+func TestAsyncTaskSubmitRejectsUnmigratedModels(t *testing.T) {
+	for _, path := range []string{"/v1/tasks/sora", "/v1/videos", "/v1/video/generations"} {
+		for _, multipartBody := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/multipart=%t", path, multipartBody), func(t *testing.T) {
+				fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					t.Error("an unmigrated task must not contact the Provider")
+				})
+				SetVideoRouter(fixture.engine)
+				require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "sora-2", ChannelId: fixture.channel.ProviderID, Enabled: true}).Error)
+				var response *httptest.ResponseRecorder
+				if multipartBody {
+					var body bytes.Buffer
+					writer := multipart.NewWriter(&body)
+					require.NoError(t, writer.WriteField("model", "sora-2"))
+					require.NoError(t, writer.WriteField("prompt", "A bird"))
+					require.NoError(t, writer.WriteField("seconds", "4"))
+					require.NoError(t, writer.Close())
+					request := httptest.NewRequest(http.MethodPost, path, &body)
+					request.Header.Set("Content-Type", writer.FormDataContentType())
+					request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+					response = httptest.NewRecorder()
+					fixture.engine.ServeHTTP(response, request)
+				} else {
+					response = adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, `{"model":"sora-2","prompt":"A bird","seconds":"4"}`)
+				}
+				assert.Equal(t, http.StatusNotFound, response.Code, response.Body.String())
+				assert.Contains(t, response.Body.String(), "model_not_found")
+				token, err := model.GetTokenById(fixture.token.Id)
+				require.NoError(t, err)
+				assert.Equal(t, common.TokenStatusEnabled, token.Status)
+				var reservations int64
+				require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
+				assert.Zero(t, reservations)
+			})
+		}
+	}
+}
+
+func TestAsyncTaskNativeRejectsUnmigratedModel(t *testing.T) {
+	for _, test := range []struct {
+		plugin, model, path, body, codePath, code string
+	}{
+		{"doubao", "doubao-seedance-1-0-pro-250528", "/doubao/api/v3/contents/generations/tasks", `{"model":"doubao-seedance-1-0-pro-250528","content":[{"type":"text","text":"A bird"}]}`, "error.code", "NotFound"},
+		{"sunoapi", "suno_music", "/suno/submit/music", `{"prompt":"A bird"}`, "code", "model_not_found"},
+	} {
+		t.Run(test.plugin, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				_, _ = w.Write([]byte(`{"id":"unexpected"}`))
+			})
+			require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: test.model, ChannelId: fixture.channel.ProviderID, Enabled: true}).Error)
+			source, err := plugins.Source(test.plugin)
+			require.NoError(t, err)
+			jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+			_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: test.plugin})
+			require.NoError(t, err)
+			builder := newPluginGenerationBuilder(fixture.engine.Routes(), nil, productionPluginRouteHandlers)
+			require.NoError(t, jsplugin.DefaultRegistry.SetGenerationPreparer(builder.prepare))
+			dispatcher := &pluginRouteDispatcher{registry: jsplugin.DefaultRegistry}
+			fixture.engine.NoRoute(dispatcher.dispatch)
+			for _, unlimited := range []bool{false, true} {
+				require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"status": common.TokenStatusEnabled, "unlimited_quota": unlimited}).Error)
+				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, test.path, test.body)
+				assert.Equal(t, http.StatusNotFound, response.Code, response.Body.String())
+				assert.Equal(t, test.code, ojson.GetBytes(response.Body.Bytes(), test.codePath).String(), response.Body.String())
+				token, err := model.GetTokenById(fixture.token.Id)
+				require.NoError(t, err)
+				assert.Equal(t, common.TokenStatusEnabled, token.Status)
+			}
+			assert.Zero(t, calls.Load())
+			var reservations int64
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Where("type = ?", model.LedgerEntryPreConsume).Count(&reservations).Error)
+			assert.Zero(t, reservations)
+		})
+	}
 }
 
 func TestAsyncTaskCapabilitiesMustBeKnownAndPureBeforeAdmission(t *testing.T) {
@@ -2814,8 +3592,20 @@ func TestAsyncTaskPollingKeepsOtherProvidersAndLegacyProgressing(t *testing.T) {
 	require.Equal(t, http.StatusOK, second.Code, second.Body.String())
 	var ready model.Task
 	require.NoError(t, model.DB.Where("user_id = ? AND channel_id = ?", fixture.user.Id, peer.ProviderID).Take(&ready).Error)
-	legacy := &model.Task{TaskID: "legacy-poll-progress", Platform: ready.Platform, UserId: fixture.user.Id, Group: ready.Group, ChannelId: ready.ChannelId, Action: ready.Action, Status: model.TaskStatusSubmitted, SubmitTime: clock.Now().Unix(), Properties: ready.Properties, PrivateData: model.TaskPrivateData{UpstreamTaskID: "legacy-poll-job"}}
+	originalProvider, err := model.GetProviderById(ready.ChannelId, true)
+	require.NoError(t, err)
+	originalKey, _, keyErr := originalProvider.PreviewEnabledKey()
+	require.Nil(t, keyErr)
+	require.NotEmpty(t, originalKey)
+	require.NotNil(t, ready.PrivateData.Execution)
+	require.NotNil(t, ready.PrivateData.Execution.TaskPlugin)
+	originalPlugin := *ready.PrivateData.Execution.TaskPlugin
+	legacy := &model.Task{TaskID: "legacy-poll-progress", Platform: ready.Platform, UserId: fixture.user.Id, Group: ready.Group, ChannelId: ready.ChannelId, Action: ready.Action, Status: model.TaskStatusSubmitted, SubmitTime: clock.Now().Unix(), Properties: ready.Properties, PrivateData: model.TaskPrivateData{
+		UpstreamTaskID: "legacy-poll-job", Key: originalKey,
+		Execution: &model.TaskExecutionSnapshot{RequestID: "legacy-poll-original-request", TaskPlugin: &originalPlugin},
+	}}
 	require.NoError(t, model.DB.Create(legacy).Error)
+	require.NoError(t, model.MigrateLegacyTaskObligations(model.DB))
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() { service.RunTaskPollingOnce(ctx, nil); close(done) }()
@@ -3052,19 +3842,62 @@ func TestAsyncTaskImageCountUsesCompletedFactsOnBothSides(t *testing.T) {
 }
 
 func TestAsyncTaskUnavailableChannelUsesBackendLanguage(t *testing.T) {
-	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
-		assert.Fail(t, "unavailable task plugin must not contact its Provider")
-	})
-	require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "task:unavailable-plugin").Error)
-	for _, language := range []struct{ locale, message string }{{"en", "Task Channel is unavailable"}, {"zh-CN", "任务通道不可用"}, {"zh-TW", "任務通道無法使用"}} {
-		request := httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`))
-		request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
-		request.Header.Set("Content-Type", "application/json")
-		request.Header.Set("Accept-Language", language.locale)
-		response := httptest.NewRecorder()
-		fixture.engine.ServeHTTP(response, request)
-		assert.Equal(t, 503, response.Code, response.Body.String())
-		assert.Contains(t, response.Body.String(), language.message)
+	for _, scenario := range []string{"missing_plugin", "disabled_provider", "disabled_channel", "disabled_registry", "ordinary_unsupported_video"} {
+		t.Run(scenario, func(t *testing.T) {
+			var calls atomic.Int32
+			fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				assert.Fail(t, "unavailable or unsupported route must not contact Provider")
+			})
+			switch scenario {
+			case "missing_plugin":
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", "task:unavailable-plugin").Error)
+			case "disabled_provider":
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("status", common.ChannelStatusManuallyDisabled).Error)
+			case "disabled_channel":
+				require.NoError(t, model.DB.Model(fixture.channel).Update("status", model.ChannelDisabled).Error)
+			case "disabled_registry":
+				jsplugin.DefaultRegistry.SetEnabled(false)
+			case "ordinary_unsupported_video":
+				require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", protocol.OpenAIChat).Error)
+			}
+			before, err := model.GetUserWallet(fixture.user.Id)
+			require.NoError(t, err)
+			var ledgerBefore int64
+			require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Count(&ledgerBefore).Error)
+			for _, language := range []struct{ locale, message string }{{"en", "Task Channel is unavailable"}, {"zh-CN", "任务通道不可用"}, {"zh-TW", "任務通道無法使用"}} {
+				t.Run(language.locale, func(t *testing.T) {
+					request := httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`))
+					request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+					request.Header.Set("Content-Type", "application/json")
+					request.Header.Set("Accept-Language", language.locale)
+					response := httptest.NewRecorder()
+					fixture.engine.ServeHTTP(response, request)
+					if scenario == "ordinary_unsupported_video" {
+						assert.Equal(t, http.StatusNotImplemented, response.Code, response.Body.String())
+					} else {
+						assert.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+						assert.Contains(t, response.Body.String(), language.message)
+					}
+					assert.NotContains(t, response.Body.String(), fixture.token.Key)
+					assert.NotContains(t, response.Body.String(), "provider-secret")
+					assert.Zero(t, calls.Load())
+					var billings, tasks, ledgerAfter int64
+					require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Count(&billings).Error)
+					require.NoError(t, model.DB.Model(&model.Task{}).Count(&tasks).Error)
+					require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Count(&ledgerAfter).Error)
+					assert.Zero(t, billings)
+					assert.Zero(t, tasks)
+					assert.Equal(t, ledgerBefore, ledgerAfter)
+					after, err := model.GetUserWallet(fixture.user.Id)
+					require.NoError(t, err)
+					assert.Equal(t, before.Balance, after.Balance)
+					require.NoError(t, model.DB.First(fixture.token, fixture.token.Id).Error)
+					assert.Equal(t, common.TokenStatusEnabled, fixture.token.Status)
+					assert.Zero(t, fixture.token.RemainQuota)
+				})
+			}
+		})
 	}
 }
 

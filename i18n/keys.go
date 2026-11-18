@@ -50,6 +50,17 @@ const (
 	MsgDistributorNoAvailableChannelTaskPlugin = "distributor.no_available_channel_task_plugin"
 	MsgDistributorInvalidParseModel            = "distributor.invalid_request_parse_model"
 
+	MsgGatewayInvalidMediaRequest            = "gateway.invalid_media_request"
+	MsgGatewayPriceUnavailable               = "gateway.price_unavailable"
+	MsgGatewayMediaRequestFailed             = "gateway.media_request_failed"
+	MsgGatewayMediaCapabilityLimitExceeded   = "gateway.media_capability_limit_exceeded"
+	MsgGatewayMediaCapabilityMismatch        = "gateway.media_capability_mismatch"
+	MsgGatewayMediaControlUnsupported        = "gateway.media_control_unsupported"
+	MsgGatewayMediaFormatUnsupported         = "gateway.media_format_unsupported"
+	MsgGatewayMediaInputUnsupported          = "gateway.media_input_unsupported"
+	MsgGatewayMediaOutputLimitUnsupported    = "gateway.media_output_limit_unsupported"
+	MsgGatewayMediaParametersUnrepresentable = "gateway.media_parameters_unrepresentable"
+
 	MsgQuotaUserInsufficient             = "quota.user_insufficient"
 	MsgQuotaPreConsumeInsufficient       = "quota.pre_consume_insufficient"
 	MsgQuotaSubscriptionInsufficient     = "quota.subscription_insufficient"
@@ -73,6 +84,7 @@ const (
 	MsgRelayRetryGetChannelFailed   = "relay.retry_get_channel_failed"
 	MsgRelayRetryNoAvailableChannel = "relay.retry_no_available_channel"
 	MsgRelayAccessTokenUnsupported  = "relay.access_token_unsupported"
+	MsgQuotaBillingRetired          = "billing.quota_queries_retired"
 )
 
 // Emails and the name of the token created at registration, in the
@@ -109,6 +121,13 @@ const (
 	MsgSecurityEventLoginLinked          = "email.security_event.login_linked"
 	MsgSecurityEventLoginUnlinked        = "email.security_event.login_unlinked"
 	MsgSecurityEventWeChatLinked         = "email.security_event.wechat_linked"
+)
+
+// Exact balance reminders describe the original charge, not a live balance.
+const (
+	MsgBalanceReminderWalletTitle       = "notify.balance_wallet_title"
+	MsgBalanceReminderSubscriptionTitle = "notify.balance_subscription_title"
+	MsgBalanceReminderContent           = "notify.balance_content"
 )
 
 // Low-quota notices, in the recipient's saved language

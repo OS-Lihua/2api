@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, render, screen, within } from '@testing-library/react'
+import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { ChannelHealthSection } from '../channel-health-section'
@@ -49,32 +49,35 @@ function formItemOf(control: HTMLElement) {
 }
 
 describe('channel health layout', () => {
-  it('nests only the test mode and interval under the scheduled channel tests switch', () => {
+  it('keeps retained health fields in the responsive shared grid without an orphaned scheduled-options group', () => {
     show()
-    const options = screen.getByRole('group', {
-      name: 'Scheduled test options',
-    })
-    expect(within(options).getByRole('combobox')).toBeVisible()
     expect(
-      within(options).getByRole('spinbutton', {
-        name: 'Test interval (minutes)',
-      })
-    ).toBeVisible()
-    expect(
-      within(options).queryByRole('spinbutton', {
-        name: 'Channel test concurrency',
-      })
+      screen.queryByRole('group', { name: 'Scheduled test options' })
     ).not.toBeInTheDocument()
-    expect(within(options).queryByRole('switch')).not.toBeInTheDocument()
+    expect(screen.queryByRole('combobox')).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('spinbutton', { name: 'Test interval (minutes)' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('spinbutton', { name: 'Channel test concurrency' })
+    ).not.toBeInTheDocument()
+    const threshold = screen.getByRole('spinbutton', {
+      name: 'Health check timeout threshold (seconds)',
+    })
+    expect(formItemOf(threshold)?.parentElement).toHaveClass(
+      'grid',
+      'min-w-0',
+      'lg:grid-cols-2'
+    )
+    expect(formItemOf(threshold)?.parentElement).not.toHaveAttribute(
+      'role',
+      'group'
+    )
   })
 
   it('marks every switch row as full width so it never shares a grid row with an input', () => {
     show()
-    for (const name of [
-      'Scheduled channel tests',
-      'Re-enable on success',
-      'Disable on failure',
-    ]) {
+    for (const name of ['Re-enable on success', 'Disable on failure']) {
       expect(formItemOf(screen.getByRole('switch', { name }))).toHaveAttribute(
         'data-settings-form-span',
         'full'

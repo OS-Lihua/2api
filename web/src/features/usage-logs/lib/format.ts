@@ -24,6 +24,7 @@ import {
   splitBillingExprAndRequestRules,
   type ParsedTier,
 } from '@/features/pricing/lib/billing-expr'
+import { formatMoneyAmount } from '@/lib/currency'
 import { translateServerText } from '@/lib/server-error-message'
 
 import type { UsageLog } from '../data/schema'
@@ -610,7 +611,8 @@ export function logTokenName(
  */
 export function renderAuditContent(
   other: LogOtherData | null | undefined,
-  t: (key: string, opts?: Record<string, unknown>) => string
+  t: (key: string, opts?: Record<string, unknown>) => string,
+  locale?: Intl.LocalesArgument
 ): string | null {
   const op = other?.op
   if (!op?.action) return null
@@ -631,6 +633,30 @@ export function renderAuditContent(
       return t('Batch deleted {{count}} redemption codes', { count })
     }
     return t('Batch deleted redemption codes (count not recorded)')
+  }
+  if (op.action === 'redemption.create') {
+    const amount = op.params?.amount
+    if (amount !== undefined) {
+      const recordedAmount =
+        amount !== null &&
+        typeof amount === 'object' &&
+        'nanos' in amount &&
+        typeof amount.nanos === 'string' &&
+        'currency' in amount &&
+        typeof amount.currency === 'string'
+          ? { nanos: amount.nanos, currency: amount.currency }
+          : null
+      return t(
+        'Created {{count}} redemption codes named {{name}} ({{amount}} each)',
+        {
+          ...op.params,
+          amount: formatMoneyAmount(recordedAmount, locale),
+        }
+      )
+    }
+    if (op.params?.quota === undefined) {
+      return t('Created {{count}} redemption codes named {{name}}', op.params)
+    }
   }
   const template = AUDIT_TEMPLATES[op.action]
   if (!template) return null

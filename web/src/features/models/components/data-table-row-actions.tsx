@@ -28,7 +28,6 @@ import {
   DropdownMenuItem,
   DropdownMenuShortcut,
 } from '@/components/ui/dropdown-menu'
-import { useCanEditModelPricing } from '@/features/model-pricing/api'
 
 import { handleToggleModelStatus, isModelEnabled } from '../lib'
 import type { Model } from '../types'
@@ -41,7 +40,6 @@ interface DataTableRowActionsProps {
 
 export function DataTableRowActions({ row }: DataTableRowActionsProps) {
   const { t } = useTranslation()
-  const canPrice = useCanEditModelPricing()
   const model = row.original
   const { setOpen, setCurrentRow } = useModels()
   const queryClient = useQueryClient()
@@ -58,9 +56,7 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
     handleToggleModelStatus(model.id, model.status, queryClient)
   }
 
-  const toggleLabel = isEnabled
-    ? t('Hide from model square')
-    : t('Show in model square')
+  const toggleLabel = isEnabled ? t('Disable metadata') : t('Enable metadata')
 
   return (
     <div className='-ml-1.5 flex min-w-0 items-center gap-1 [&>button]:min-w-0 [&>button]:shrink'>
@@ -74,19 +70,6 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
           {model.id > 0 ? t('Edit') : t('Add metadata')}
         </span>
       </Button>
-
-      {canPrice && (
-        <Button
-          variant='ghost'
-          size='sm'
-          onClick={() => {
-            setCurrentRow(model)
-            setOpen('price-model')
-          }}
-        >
-          <span className='truncate'>{t('Pricing')}</span>
-        </Button>
-      )}
 
       {model.id > 0 && (
         <DataTableRowActionMenu ariaLabel={t('Open menu')}>

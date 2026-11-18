@@ -20,8 +20,9 @@ import { afterEach, beforeEach, expect, test } from 'vitest'
 
 import { useAuthStore } from '@/stores/auth-store'
 
-import { STORAGE_KEYS } from '../../../constants'
+import { DEFAULT_CONFIG, STORAGE_KEYS } from '../../../constants'
 import type { Message } from '../../../types'
+import { getInitialPlaygroundConfig } from '../../state/playground-state-utils'
 import {
   clearPlaygroundData,
   loadConfig,
@@ -96,6 +97,60 @@ test('legacy global data is removed instead of assigned to the first signed-in a
   for (const key of Object.values(STORAGE_KEYS)) {
     expect(localStorage.getItem(key)).toBeNull()
   }
+})
+
+test.each([false, true])(
+  'drops legacy group from versioned=%s account config while preserving messages, zero values and toggles',
+  (versioned) => {
+    useAuthStore.getState().auth.setUser({ id: 1, username: 'A', role: 1 })
+    const config = {
+      model: 'visible-offering',
+      group: 'legacy-route',
+      temperature: 0,
+      max_tokens: 0,
+      seed: 0,
+      stream: false,
+    }
+    localStorage.setItem(
+      `${STORAGE_KEYS.CONFIG}:1`,
+      JSON.stringify(versioned ? { version: 1, data: config } : config)
+    )
+    saveMessages(messages)
+    saveParameterEnabled({ temperature: false, seed: true })
+
+    const loaded = getInitialPlaygroundConfig()
+
+    expect(loaded).toEqual({
+      ...DEFAULT_CONFIG,
+      model: 'visible-offering',
+      temperature: 0,
+      max_tokens: 0,
+      seed: 0,
+      stream: false,
+    })
+    expect(loaded).not.toHaveProperty('group')
+    expect(localStorage.getItem(`${STORAGE_KEYS.CONFIG}:1`)).not.toContain(
+      'legacy-route'
+    )
+    expect(loadMessages()).toEqual(messages)
+    expect(loadParameterEnabled()).toEqual({ temperature: false, seed: true })
+  }
+)
+
+test('saving an old config object strips group before persisting it', () => {
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'A', role: 1 })
+  const config = {
+    model: 'visible-offering',
+    group: 'legacy-route',
+    stream: false,
+  }
+
+  saveConfig(config)
+
+  expect(loadConfig()).toEqual({ model: 'visible-offering', stream: false })
+  expect(localStorage.getItem(`${STORAGE_KEYS.CONFIG}:1`)).not.toContain(
+    'legacy-route'
+  )
 })
 
 test('storage calls without a signed-in user do not persist shared data', () => {

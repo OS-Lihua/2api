@@ -17,6 +17,16 @@ gateway.invalid_upstream_response: "上游回應無效"
 gateway.upstream_response_failed: "上游回應失敗"
 gateway.unsupported_parameters: "不支援的參數：{{.Parameters}}"
 common.database_error: "資料庫出錯，請聯繫管理員"
+gateway.invalid_media_request: "媒體請求無效"
+gateway.price_unavailable: "對外模型價格暫時無法使用"
+gateway.media_request_failed: "媒體請求失敗"
+gateway.media_output_limit_unsupported: "此通道無法執行請求的輸出 token 上限"
+gateway.media_capability_limit_exceeded: "參數超出模型或通道的能力限制"
+gateway.media_format_unsupported: "無法保留請求的回應格式"
+gateway.media_input_unsupported: "無法保留請求的輸入"
+gateway.media_control_unsupported: "無法保留請求的控制參數"
+gateway.media_parameters_unrepresentable: "此媒體協定無法表示該請求"
+gateway.media_capability_mismatch: "所選通道不具備請求所需的能力"
 auth.user_banned: "使用者已被封禁"
 token.get_info_failed: "獲取令牌資訊失敗，請稍後重試"
 token.invalid: "無效的令牌"
@@ -63,6 +73,7 @@ relay.group_upstream_saturated: "目前分組上游負載已飽和，請稍後�
 relay.retry_get_channel_failed: "獲取分組 {{.Group}} 下模型 {{.Model}} 的可用管道失敗（retry）：{{.Error}}"
 relay.retry_no_available_channel: "分組 {{.Group}} 下模型 {{.Model}} 的可用管道不存在（retry）"
 relay.access_token_unsupported: "暫不支援使用 access token"
+billing.quota_queries_retired: "以舊額度為基礎的帳單查詢已退役，請使用已授權的錢包 API。"
 
 # Emails and the name of the token created at registration
 user.default_token_name: "{{.Username}}的初始令牌"
@@ -91,6 +102,11 @@ email.security_event.email_confirmed: "電子郵件地址已確認"
 email.security_event.login_linked: "已綁定登入帳號 {{.Provider}}"
 email.security_event.login_unlinked: "已解綁登入帳號"
 email.security_event.wechat_linked: "已綁定微信帳號"
+
+# 精確餘額提醒
+notify.balance_wallet_title: "您的錢包餘額已低於提醒閾值"
+notify.balance_subscription_title: "您的訂閱週期餘額已低於提醒閾值"
+notify.balance_content: "{{.Time}} 的扣款後，餘額為 {{.Balance}}，低於 {{.Threshold}} 的提醒閾值。這是該筆扣款時的記錄，目前餘額可能已變更。請先檢查錢包及訂閱週期，再決定是否儲值。"
 
 # Low-quota notices
 notify.quota_low_title: "您的額度即將用盡"

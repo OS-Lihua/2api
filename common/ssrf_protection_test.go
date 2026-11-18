@@ -1,11 +1,56 @@
 package common
 
 import (
+	"context"
+	"errors"
 	"net"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestSSRFValidationCancellationStopsDNS(t *testing.T) {
+	protection := &SSRFProtection{ApplyIPFilterForDomain: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started, release := make(chan struct{}, 2), make(chan struct{})
+	previousResolver := net.DefaultResolver
+	net.DefaultResolver = &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-release:
+			return nil, errors.New("controlled DNS peer closed")
+		}
+	}}
+	t.Cleanup(func() { net.DefaultResolver = previousResolver })
+	finished := make(chan error, 1)
+	go func() { finished <- protection.ValidateURLWithContext(ctx, "https://notification.example.com") }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		close(release)
+		<-finished
+		t.Fatal("the controlled DNS request did not start")
+	}
+	cancel()
+	select {
+	case err := <-finished:
+		assert.ErrorIs(t, err, context.Canceled)
+		close(release)
+	case <-time.After(time.Second):
+		close(release)
+		<-finished
+		t.Error("SSRF DNS validation ignored caller cancellation")
+	}
+	assert.ErrorIs(t, protection.ValidateURLWithContext(ctx, "https://8.8.8.8"), context.Canceled, "cancelled callers must not advance to network I/O")
+}
 
 func TestSSRFProtectionRejectsLiteralPrivateAndReservedIPs(t *testing.T) {
 	protection := &SSRFProtection{

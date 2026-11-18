@@ -99,6 +99,9 @@ type TaskAdaptor interface {
 // TaskSubmitResponse is the transport-independent result of parsing an
 // upstream task submission. Parsing must not write to the client response.
 type TaskSubmitResponse struct {
+	// Acceptance is accepted (the default), rejected, unknown, or existing.
+	// Existing identities require an owner/Provider/upstream-ID proof by the host.
+	Acceptance     string
 	UpstreamTaskID string
 	TaskData       []byte
 	ClientResponse any

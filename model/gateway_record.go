@@ -9,6 +9,7 @@ import (
 	"slices"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/money"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -17,41 +18,49 @@ import (
 // GatewayUsage contains quantitative usage facts. UsageSource identifies
 // estimates; Provider extensions and raw response data never enter records.
 type GatewayUsage struct {
-	TaskFacts              map[string]any `json:"task_facts,omitempty"`
-	PromptTokens           int64          `json:"prompt_tokens"`
-	CompletionTokens       int64          `json:"completion_tokens"`
-	TotalTokens            int64          `json:"total_tokens"`
-	CachedTokens           int64          `json:"cached_tokens,omitempty"`
-	CacheCreationTokens    int64          `json:"cache_creation_tokens,omitempty"`
-	CacheCreation12hTokens int64          `json:"cache_creation_12h_tokens,omitempty"`
-	ImageInputTokens       int64          `json:"image_input_tokens,omitempty"`
-	AudioInputTokens       int64          `json:"audio_input_tokens,omitempty"`
-	ImageOutputTokens      int64          `json:"image_output_tokens,omitempty"`
-	AudioOutputTokens      int64          `json:"audio_output_tokens,omitempty"`
+	// Immutable display metadata; this is never an input to amount evaluation.
+	BillingUsageSchema     map[string]jsplugin.UsageFieldSchema `json:"billing_usage_schema,omitempty"`
+	TaskFacts              map[string]any                       `json:"task_facts,omitempty"`
+	UnmeasuredTokens       []string                             `json:"unmeasured_tokens,omitempty"`
+	PromptTokens           int64                                `json:"prompt_tokens"`
+	CompletionTokens       int64                                `json:"completion_tokens"`
+	TotalTokens            int64                                `json:"total_tokens"`
+	CachedTokens           int64                                `json:"cached_tokens,omitempty"`
+	CacheCreationTokens    int64                                `json:"cache_creation_tokens,omitempty"`
+	CacheCreation12hTokens int64                                `json:"cache_creation_12h_tokens,omitempty"`
+	ImageInputTokens       *int64                               `json:"image_input_tokens,omitempty"`
+	AudioInputTokens       *int64                               `json:"audio_input_tokens,omitempty"`
+	ImageOutputTokens      *int64                               `json:"image_output_tokens,omitempty"`
+	AudioOutputTokens      *int64                               `json:"audio_output_tokens,omitempty"`
+	ImageCount             *int64                               `json:"image_count,omitempty"`
+	AudioInputSeconds      *string                              `json:"audio_input_seconds,omitempty"`
+	AudioOutputSeconds     *string                              `json:"audio_output_seconds,omitempty"`
 }
 
 type GatewayRequest struct {
-	SalePending        bool           `json:"sale_pending,omitempty" gorm:"-"`
-	ID                 string         `json:"id" gorm:"type:varchar(64);primaryKey"`
-	UserID             int            `json:"user_id" gorm:"not null;index"`
-	TokenID            int            `json:"token_id" gorm:"not null;index"`
-	ModelOfferingID    int            `json:"model_offering_id" gorm:"not null;index"`
-	OfferingName       string         `json:"offering_name" gorm:"type:text;not null"`
-	RequestedName      string         `json:"requested_name" gorm:"type:text;not null"`
-	ChoiceCount        int            `json:"choice_count" gorm:"not null;default:1"`
-	SalePriceVersionID int            `json:"sale_price_version_id" gorm:"not null"`
-	SaleExpression     string         `json:"sale_expression" gorm:"type:text;not null"`
-	SaleCurrency       money.Currency `json:"sale_currency" gorm:"type:char(3);not null"`
-	SaleFXRate         string         `json:"sale_fx_rate" gorm:"type:text;not null"`
-	Usage              GatewayUsage   `json:"usage" gorm:"serializer:json;type:text;not null"`
-	UsageSource        string         `json:"usage_source" gorm:"type:varchar(16);not null"`
-	GroupRatio         string         `json:"group_ratio" gorm:"type:text;not null"`
-	Receivable         money.Amount   `json:"receivable" gorm:"embedded;embeddedPrefix:receivable_"`
-	LedgerEntryIDs     []string       `json:"ledger_entry_ids" gorm:"serializer:json;type:text;not null"`
-	StartedAt          int64          `json:"started_at" gorm:"not null;index"`
-	EndedAt            int64          `json:"ended_at" gorm:"not null"`
-	Status             string         `json:"status" gorm:"type:varchar(32);not null;index"`
-	ErrorCode          string         `json:"error_code,omitempty" gorm:"type:varchar(64);not null"`
+	Funding            GatewayFundingSnapshot `json:"funding" gorm:"serializer:json;type:text"`
+	FundingPending     bool                   `json:"funding_pending,omitempty" gorm:"-"`
+	SalePending        bool                   `json:"sale_pending,omitempty" gorm:"-"`
+	ID                 string                 `json:"id" gorm:"type:varchar(64);primaryKey"`
+	UserID             int                    `json:"user_id" gorm:"not null;index"`
+	TokenID            int                    `json:"token_id" gorm:"not null;index"`
+	ModelOfferingID    int                    `json:"model_offering_id" gorm:"not null;index"`
+	OfferingName       string                 `json:"offering_name" gorm:"type:text;not null"`
+	RequestedName      string                 `json:"requested_name" gorm:"type:text;not null"`
+	ChoiceCount        int                    `json:"choice_count" gorm:"not null;default:1"`
+	SalePriceVersionID int                    `json:"sale_price_version_id" gorm:"not null"`
+	SaleExpression     string                 `json:"sale_expression" gorm:"type:text;not null"`
+	SaleCurrency       money.Currency         `json:"sale_currency" gorm:"type:char(3);not null"`
+	SaleFXRate         string                 `json:"sale_fx_rate" gorm:"type:text;not null"`
+	Usage              GatewayUsage           `json:"usage" gorm:"serializer:json;type:text;not null"`
+	UsageSource        string                 `json:"usage_source" gorm:"type:varchar(16);not null"`
+	GroupRatio         string                 `json:"group_ratio" gorm:"type:text;not null"`
+	Receivable         money.Amount           `json:"receivable" gorm:"embedded;embeddedPrefix:receivable_"`
+	LedgerEntryIDs     []string               `json:"ledger_entry_ids" gorm:"serializer:json;type:text;not null"`
+	StartedAt          int64                  `json:"started_at" gorm:"not null;index"`
+	EndedAt            int64                  `json:"ended_at" gorm:"not null"`
+	Status             string                 `json:"status" gorm:"type:varchar(32);not null;index"`
+	ErrorCode          string                 `json:"error_code,omitempty" gorm:"type:varchar(64);not null"`
 }
 
 func (GatewayRequest) TableName() string { return "gateway_requests" }
@@ -101,6 +110,7 @@ func MigrateGatewayRecords() error {
 		started_at Int64, ended_at Int64, status String, error_code String
 		) ENGINE = ReplacingMergeTree() ORDER BY id`,
 		`ALTER TABLE gateway_requests ADD COLUMN IF NOT EXISTS choice_count Int64 DEFAULT 1`,
+		`ALTER TABLE gateway_requests ADD COLUMN IF NOT EXISTS funding String DEFAULT '{}'`,
 		`CREATE TABLE IF NOT EXISTS gateway_attempts (
 		id String, request_id String, channel_id Int64, provider_id Int64,
 		model_id Int64, member_tier Int64, started_at Int64, ended_at Int64,
@@ -379,13 +389,21 @@ func RecentOfferingOutputTokens(ctx context.Context, offeringID int, at int64) (
 		return 1024, nil
 	}
 	total := new(big.Rat)
+	samples := int64(0)
 	for _, record := range recent {
+		if slices.Contains(record.Usage.UnmeasuredTokens, "c") {
+			continue
+		}
 		if record.Usage.CompletionTokens < 0 || record.Usage.CompletionTokens > 1<<31-1 || record.ChoiceCount < 1 {
 			return 0, fmt.Errorf("invalid recorded output usage")
 		}
 		total.Add(total, big.NewRat(record.Usage.CompletionTokens, int64(record.ChoiceCount)))
+		samples++
 	}
-	mean := total.Quo(total, big.NewRat(int64(len(recent)), 1))
+	if samples == 0 {
+		return 1024, nil
+	}
+	mean := total.Quo(total, big.NewRat(samples, 1))
 	whole, remainder := new(big.Int), new(big.Int)
 	whole.QuoRem(mean.Num(), mean.Denom(), remainder)
 	if remainder.Sign() > 0 {

@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/pkg/capability"
+	"github.com/QuantumNous/new-api/pkg/protocol"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -92,6 +93,9 @@ func GetAndValidateRerankRequest(c *gin.Context) (*dto.RerankRequest, error) {
 		return nil, types.NewError(err, types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
 	}
 
+	if rerankRequest == nil {
+		return nil, errors.New("request is required")
+	}
 	if rerankRequest.Query == "" {
 		return nil, types.NewError(fmt.Errorf("query is empty"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
 	}
@@ -109,7 +113,7 @@ func GetAndValidateEmbeddingRequest(c *gin.Context, relayMode int) (*dto.Embeddi
 		return nil, types.NewError(err, types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
 	}
 
-	if embeddingRequest.Input == nil {
+	if embeddingRequest == nil || embeddingRequest.Input == nil {
 		return nil, fmt.Errorf("input is empty")
 	}
 	if relayMode == relayconstant.RelayModeModerations && embeddingRequest.Model == "" {
@@ -148,6 +152,9 @@ const RealtimeMaxOutputTokens = 4096
 // ValidateRealtimeMultipliers accepts the native infinity sentinel while keeping
 // all numeric and compatible-container limits behind the shared token guard.
 func ValidateRealtimeMultipliers(body []byte) error {
+	if common.JsonHasDuplicateFields(body) {
+		return &requestParameterError{path: "request", reason: "Invalid JSON request body"}
+	}
 	document := ojson.NewDoc(append([]byte(nil), body...))
 	for _, prefix := range []string{"", "parameters."} {
 		for _, field := range []string{"max_output_tokens", "max_response_output_tokens"} {
@@ -219,7 +226,7 @@ func NormalizeRealtimeRequestLimits(body []byte, caps capability.Set, inputToken
 // Responses has one output response; a vendor n>1 cannot silently multiply it.
 func ValidateResponsesMultipliers(body []byte) error {
 	var envelope struct{}
-	if common.Unmarshal(body, &envelope) != nil || !ojson.ParseBytes(body).IsObject() {
+	if common.Unmarshal(body, &envelope) != nil || !ojson.ParseBytes(body).IsObject() || common.JsonHasDuplicateFields(body) {
 		return &requestParameterError{path: "request", reason: "Invalid JSON request body"}
 	}
 	if container := ojson.GetBytes(body, "parameters"); container.Exists() && container.Type != ojson.Null && !container.IsObject() {
@@ -258,6 +265,66 @@ func GetAndValidateResponsesRequest(c *gin.Context) (*dto.OpenAIResponsesRequest
 	}
 	if ExceedsMaxTokensLimit(request.MaxOutputTokens) {
 		return nil, errors.New("max_output_tokens is invalid")
+	}
+	return request, nil
+}
+
+// NativeOperationRequest retains the complete host-native JSON document. Its
+// routing identity is separate from an optional DeepSeek body.model.
+type NativeOperationRequest struct {
+	dto.AlphaSearchRequest
+	HasImages bool `json:"-"`
+}
+
+func DecodeNativeOperationRequest(body []byte, kind protocol.Type, name string) (*NativeOperationRequest, error) {
+	if err := ValidateResponsesMultipliers(body); err != nil {
+		return nil, err
+	}
+	var controls struct {
+		Model      *string `json:"model"`
+		Stream     *bool   `json:"stream"`
+		Parameters struct {
+			Stream *bool `json:"stream"`
+		} `json:"parameters"`
+	}
+	if common.Unmarshal(body, &controls) != nil || controls.Stream != nil && *controls.Stream || controls.Parameters.Stream != nil && *controls.Parameters.Stream {
+		return nil, errors.New("native operation requires synchronous JSON")
+	}
+	if kind != protocol.DeepSeekTools {
+		if controls.Model != nil && *controls.Model != "" {
+			name = *controls.Model
+		}
+		if name == "" && kind == protocol.OpenAIModerations {
+			name = "text-moderation-stable"
+		}
+		if name == "" {
+			return nil, errors.New("model is required")
+		}
+	}
+	request := &NativeOperationRequest{AlphaSearchRequest: dto.AlphaSearchRequest{Model: name, RawBody: append([]byte(nil), body...)}}
+	if kind == protocol.OpenAIModerations {
+		input := ojson.GetBytes(body, "input")
+		if input.Type == ojson.String {
+			if input.String() == "" {
+				return nil, errors.New("input is empty")
+			}
+		} else if input.IsArray() && len(input.Array()) > 0 {
+			for _, item := range input.Array() {
+				if item.Type == ojson.String && item.String() != "" {
+					continue
+				}
+				if item.Get("type").String() == "text" && item.Get("text").Type == ojson.String && item.Get("text").String() != "" {
+					continue
+				}
+				if item.Get("type").String() == "image_url" && item.Get("image_url.url").Type == ojson.String && item.Get("image_url.url").String() != "" {
+					request.HasImages = true
+					continue
+				}
+				return nil, errors.New("invalid moderation input")
+			}
+		} else {
+			return nil, errors.New("input is empty")
+		}
 	}
 	return request, nil
 }
@@ -321,9 +388,13 @@ func GetAndValidOpenAIImageRequest(c *gin.Context, relayMode int) (*dto.ImageReq
 	switch relayMode {
 	case relayconstant.RelayModeImagesEdits:
 		if strings.Contains(c.Request.Header.Get("Content-Type"), "multipart/form-data") {
-			form, err := common.ParseMultipartFormReusable(c)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse image edit form request: %w", err)
+			form := c.Request.MultipartForm
+			if form == nil {
+				var err error
+				form, err = common.ParseMultipartFormReusable(c)
+				if err != nil {
+					return nil, fmt.Errorf("failed to parse image edit form request: %w", err)
+				}
 			}
 			formData := url.Values(form.Value)
 			c.Request.MultipartForm = form
@@ -445,7 +516,123 @@ func GetAndValidateClaudeRequest(c *gin.Context) (textRequest *dto.ClaudeRequest
 	return textRequest, nil
 }
 
+// CompletionsParameters are native text-completion fields absent from the Chat DTO.
+// Keep the host endpoint independent of relaykit's Chat request contract.
+type CompletionsParameters struct {
+	Echo     *bool           `json:"echo,omitempty"`
+	LogProbs json.RawMessage `json:"logprobs,omitempty"`
+	BestOf   *int            `json:"best_of,omitempty"`
+}
+
+// CompletionsPromptShape distinguishes prompt batches from already tokenized
+// input, whose token IDs must be counted without tokenizing their decimal text.
+func CompletionsPromptShape(prompt any) (int, int, error) {
+	if prompt == nil {
+		return 1, 0, nil
+	}
+	if _, ok := prompt.(string); ok {
+		return 1, 0, nil
+	}
+	items, ok := prompt.([]any)
+	if !ok || len(items) == 0 {
+		return 0, 0, errors.New("prompt is invalid")
+	}
+	batches := 1
+	var tokenPrompts [][]any
+	switch items[0].(type) {
+	case string:
+		if len(items) > MaxChatCompletionsN {
+			return 0, 0, errors.New("prompt batch is too large")
+		}
+		for _, item := range items {
+			if _, ok := item.(string); !ok {
+				return 0, 0, errors.New("prompt is invalid")
+			}
+		}
+		return len(items), 0, nil
+	case []any:
+		batches = len(items)
+		if batches > MaxChatCompletionsN {
+			return 0, 0, errors.New("prompt batch is too large")
+		}
+		for _, item := range items {
+			ids, ok := item.([]any)
+			if !ok || len(ids) == 0 {
+				return 0, 0, errors.New("prompt token IDs are invalid")
+			}
+			tokenPrompts = append(tokenPrompts, ids)
+		}
+	default:
+		tokenPrompts = [][]any{items}
+	}
+	tokens := 0
+	for _, ids := range tokenPrompts {
+		for _, value := range ids {
+			id, ok := value.(float64)
+			if !ok || id < 0 || id > math.MaxInt32 || math.Trunc(id) != id {
+				return 0, 0, errors.New("prompt token IDs are invalid")
+			}
+		}
+		tokens += len(ids)
+		if tokens > maxTokensLimit {
+			return 0, 0, errors.New("prompt token IDs exceed the token limit")
+		}
+	}
+	return batches, tokens, nil
+}
+
+func DecodeCompletionsRequest(body []byte) (*dto.GeneralOpenAIRequest, CompletionsParameters, error) {
+	type projection dto.GeneralOpenAIRequest
+	wire := struct {
+		*projection
+		CompletionsParameters
+		LogProbs json.RawMessage `json:"logprobs,omitempty"`
+	}{projection: &projection{}}
+	if err := common.Unmarshal(body, &wire); err != nil {
+		return nil, wire.CompletionsParameters, err
+	}
+	if _, _, err := CompletionsPromptShape(wire.Prompt); err != nil {
+		return nil, wire.CompletionsParameters, err
+	}
+	wire.CompletionsParameters.LogProbs = wire.LogProbs
+	if len(wire.LogProbs) > 0 && string(wire.LogProbs) != "null" {
+		var count int
+		if err := common.Unmarshal(wire.LogProbs, &count); err != nil {
+			// Preserve the previously accepted boolean compatibility field.
+			var enabled bool
+			if common.Unmarshal(wire.LogProbs, &enabled) != nil {
+				return nil, wire.CompletionsParameters, errors.New("logprobs is invalid")
+			}
+		} else if count < 0 || count > 5 {
+			return nil, wire.CompletionsParameters, errors.New("logprobs is invalid")
+		}
+	}
+	choices := 1
+	if wire.N != nil {
+		choices = *wire.N
+	}
+	if wire.BestOf != nil && (*wire.BestOf < max(1, choices) || *wire.BestOf > MaxChatCompletionsN || wire.Stream != nil && *wire.Stream) {
+		return nil, wire.CompletionsParameters, errors.New("best_of is invalid")
+	}
+	return (*dto.GeneralOpenAIRequest)(wire.projection), wire.CompletionsParameters, nil
+}
+
 func GetAndValidateTextRequest(c *gin.Context, relayMode int) (*dto.GeneralOpenAIRequest, error) {
+	if relayMode == relayconstant.RelayModeCompletions {
+		storage, err := common.GetBodyStorage(c)
+		if err != nil {
+			return nil, err
+		}
+		body, err := storage.Bytes()
+		if err != nil {
+			return nil, err
+		}
+		request, _, err := DecodeCompletionsRequest(body)
+		if err != nil {
+			return nil, err
+		}
+		return ValidateTextRequest(c, request, relayMode)
+	}
 	textRequest := &dto.GeneralOpenAIRequest{}
 	err := common.UnmarshalBodyReusable(c, textRequest)
 	if err != nil {

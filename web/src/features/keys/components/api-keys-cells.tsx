@@ -140,23 +140,6 @@ type ApiKeyRestrictionProps = {
   detailsTrigger?: 'hover' | 'click'
 }
 
-export function ModelLimitsCell(props: ApiKeyRestrictionProps) {
-  const { t } = useTranslation()
-  const models = props.apiKey.model_limits_enabled
-    ? (props.apiKey.model_limits || '').split(',').filter(Boolean)
-    : []
-
-  return (
-    <ApiKeyRestrictionCell
-      items={models}
-      label={t('{{count}} models', { count: models.length })}
-      title={t('Models')}
-      emptyLabel={t('Unlimited')}
-      detailsTrigger={props.detailsTrigger}
-    />
-  )
-}
-
 export function IpRestrictionsCell(props: ApiKeyRestrictionProps) {
   const { t } = useTranslation()
   const ips = (props.apiKey.allow_ips || '')

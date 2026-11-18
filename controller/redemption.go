@@ -6,8 +6,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
 	"github.com/gin-gonic/gin"
@@ -66,10 +66,14 @@ func AddRedemption(c *gin.Context) {
 		return
 	}
 
-	redemption := model.Redemption{}
-	err := c.ShouldBindJSON(&redemption)
-	if err != nil {
-		common.ApiError(c, err)
+	var redemption struct {
+		Name        string       `json:"name"`
+		Count       int          `json:"count"`
+		Amount      money.Amount `json:"amount"`
+		ExpiredTime int64        `json:"expired_time"`
+	}
+	if err := common.DecodeJsonStrict(c.Request.Body, &redemption); err != nil {
+		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
 	if utf8.RuneCountInString(redemption.Name) == 0 || utf8.RuneCountInString(redemption.Name) > 20 {
@@ -84,12 +88,8 @@ func AddRedemption(c *gin.Context) {
 		common.ApiErrorT(c, "Maximum 100 redemption codes can be generated at once")
 		return
 	}
-	if redemption.Quota <= 0 {
-		common.ApiErrorT(c, "Redemption quota must be positive")
-		return
-	}
-	if err := common.ValidateWalletQuota(redemption.Quota); err != nil {
-		common.ApiError(c, err)
+	if _, err := money.NewAmount(redemption.Amount.Nanos, redemption.Amount.Currency); err != nil || redemption.Amount.Nanos <= 0 {
+		common.ApiError(c, model.ErrInvalidRedemptionAmount)
 		return
 	}
 	if err := validateExpiredTime(redemption.ExpiredTime); err != nil {
@@ -104,21 +104,21 @@ func AddRedemption(c *gin.Context) {
 			Name:        redemption.Name,
 			Key:         key,
 			CreatedTime: common.GetTimestamp(),
-			Quota:       redemption.Quota,
+			Amount:      redemption.Amount,
+			Status:      common.RedemptionCodeStatusEnabled,
 			ExpiredTime: redemption.ExpiredTime,
 		}
-		err = cleanRedemption.Insert()
-		if err != nil {
-			common.SysError(common.LogText("failed to insert redemption: %s", err.Error()))
+		if err := cleanRedemption.Insert(); err != nil {
+			common.SysError(common.LogText("Failed to create redemption code"))
 			common.ApiErrorStatus(c, http.StatusOK, common.NewMessage("Failed to create redemption code, please try again later"), gin.H{"data": keys})
 			return
 		}
 		keys = append(keys, key)
 	}
 	recordManageAudit(c, "redemption.create", map[string]any{
-		"name":  redemption.Name,
-		"count": redemption.Count,
-		"quota": logger.FormatQuota(redemption.Quota),
+		"name":   redemption.Name,
+		"count":  redemption.Count,
+		"amount": redemption.Amount,
 	})
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
@@ -143,40 +143,54 @@ func DeleteRedemption(c *gin.Context) {
 }
 
 func UpdateRedemption(c *gin.Context) {
-	statusOnly := c.Query("status_only")
-	redemption := model.Redemption{}
-	err := c.ShouldBindJSON(&redemption)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	cleanRedemption, err := model.GetRedemptionById(redemption.Id)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	if statusOnly == "" {
-		if redemption.Quota <= 0 {
-			common.ApiErrorT(c, "Redemption quota must be positive")
+	var cleanRedemption *model.Redemption
+	var err error
+	if c.Query("status_only") != "" {
+		var request struct {
+			Id     int `json:"id"`
+			Status int `json:"status"`
+		}
+		if common.DecodeJsonStrict(c.Request.Body, &request) != nil || request.Id <= 0 ||
+			(request.Status != common.RedemptionCodeStatusEnabled && request.Status != common.RedemptionCodeStatusDisabled) {
+			common.ApiErrorT(c, "Invalid parameters")
 			return
 		}
-		if err := common.ValidateWalletQuota(redemption.Quota); err != nil {
+		cleanRedemption, err = model.GetRedemptionById(request.Id)
+		if err == nil {
+			cleanRedemption.Status = request.Status
+			err = cleanRedemption.SelectUpdate()
+		}
+	} else {
+		var request struct {
+			Id          int          `json:"id"`
+			Name        string       `json:"name"`
+			Amount      money.Amount `json:"amount"`
+			ExpiredTime int64        `json:"expired_time"`
+		}
+		if common.DecodeJsonStrict(c.Request.Body, &request) != nil || request.Id <= 0 {
+			common.ApiErrorT(c, "Invalid parameters")
+			return
+		}
+		if utf8.RuneCountInString(request.Name) == 0 || utf8.RuneCountInString(request.Name) > 20 {
+			common.ApiErrorT(c, "Redemption code name length must be between 1-20")
+			return
+		}
+		if _, err := money.NewAmount(request.Amount.Nanos, request.Amount.Currency); err != nil || request.Amount.Nanos <= 0 {
+			common.ApiError(c, model.ErrInvalidRedemptionAmount)
+			return
+		}
+		if err := validateExpiredTime(request.ExpiredTime); err != nil {
 			common.ApiError(c, err)
 			return
 		}
-		if err := validateExpiredTime(redemption.ExpiredTime); err != nil {
-			common.ApiError(c, err)
-			return
+		cleanRedemption, err = model.GetRedemptionById(request.Id)
+		if err == nil {
+			cleanRedemption.Name = request.Name
+			cleanRedemption.Amount = request.Amount
+			cleanRedemption.ExpiredTime = request.ExpiredTime
+			err = cleanRedemption.Update()
 		}
-		// If you add more fields, please also update redemption.Update()
-		cleanRedemption.Name = redemption.Name
-		cleanRedemption.Quota = redemption.Quota
-		cleanRedemption.ExpiredTime = redemption.ExpiredTime
 	}
-	if statusOnly != "" {
-		cleanRedemption.Status = redemption.Status
-	}
-	err = cleanRedemption.Update()
 	if err != nil {
 		common.ApiError(c, err)
 		return

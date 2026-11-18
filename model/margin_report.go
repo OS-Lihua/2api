@@ -35,6 +35,7 @@ type MarginRow struct {
 	Margin               *money.Amount  `json:"margin"`
 	KnownMargin          money.Amount   `json:"known_margin"`
 	SalePending          int            `json:"sale_pending"`
+	FundingPending       int            `json:"funding_pending"`
 	CostPending          int            `json:"cost_pending"`
 	ConvertedCostPending int            `json:"converted_cost_pending"`
 }
@@ -94,7 +95,7 @@ func MarginReport(ctx context.Context, filter MarginFilter, offset, limit int) (
  COALESCE(SUM("amount_nanos") FILTER (WHERE "idempotency_key" = 'gateway:' || "attempt_id" || ':payable'), 0) AS "initial",
  SUM(CASE WHEN "idempotency_key" = 'gateway:' || "attempt_id" || ':payable' THEN 1 WHEN "reverses_entry_id" IN (SELECT "id" FROM "ledger_entries" AS "source" WHERE "source"."idempotency_key" = 'gateway:' || "ledger_entries"."attempt_id" || ':payable') THEN -1 ELSE 0 END) AS "snapshot_posts",
  SUM(CASE WHEN "idempotency_key" = 'gateway:' || "attempt_id" || ':payable' OR "reverses_entry_id" IN (SELECT "id" FROM "ledger_entries" AS "source" WHERE "source"."idempotency_key" = 'gateway:' || "ledger_entries"."attempt_id" || ':payable') THEN ROUND("amount_nanos"::numeric * COALESCE("fx_rate", 1)) ELSE 0 END) AS "snapshot_converted"`).
-				Where(`"request_id" IN ? AND ("account_type" IN ? OR ("account_type" = ? AND "type" IN ?))`, ids, []LedgerAccountType{LedgerAccountPlatformRevenue, LedgerAccountProviderPayable, LedgerAccountUserReceivable}, LedgerAccountUserWallet, []LedgerEntryType{LedgerEntryCharge, LedgerEntryRepayment, LedgerEntryRefund}).
+				Where(`"request_id" IN ? AND ("account_type" IN ? OR ("account_type" IN ? AND "type" IN ?))`, ids, []LedgerAccountType{LedgerAccountPlatformRevenue, LedgerAccountProviderPayable, LedgerAccountUserReceivable}, []LedgerAccountType{LedgerAccountUserWallet, LedgerAccountSubscription, LedgerAccountSubscriptionUnlimited}, []LedgerEntryType{LedgerEntryCharge, LedgerEntryRepayment, LedgerEntryRefund}).
 				Group(`"request_id", "attempt_id", "account_type", "amount_currency"`).Scan(&entries).Error; err != nil {
 				return err
 			}
@@ -149,6 +150,9 @@ func MarginReport(ctx context.Context, filter MarginFilter, offset, limit int) (
 						totals[key] = total
 					}
 					if index == 0 {
+						if request.FundingPending {
+							total.FundingPending++
+						}
 						if request.SalePending || lifecycle.Phase == "reserved" || lifecycle.Phase == "settlement_pending" {
 							total.SalePending++
 						}
@@ -186,7 +190,7 @@ func MarginReport(ctx context.Context, filter MarginFilter, offset, limit int) (
 								total.revenue = total.revenue.Add(entry.Amount)
 							case LedgerAccountUserReceivable:
 								total.outstanding = total.outstanding.Add(entry.Amount)
-							case LedgerAccountUserWallet:
+							case LedgerAccountUserWallet, LedgerAccountSubscription, LedgerAccountSubscriptionUnlimited:
 								total.collected = total.collected.Sub(entry.Amount)
 							}
 						} else if entry.AccountType == LedgerAccountProviderPayable && entry.AttemptId == attempt.ID {

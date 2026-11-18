@@ -23,6 +23,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/oauth"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/legacymigrate"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/pkg/wsmanager"
 	"github.com/QuantumNous/new-api/relay"
@@ -47,6 +48,15 @@ var buildFS embed.FS
 var indexPage []byte
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "migrate-legacy" {
+		// Migration stdout is a machine-readable report, even when a caller
+		// enables Gin debug logging. No serving router exists in this process.
+		gin.SetMode(gin.ReleaseMode)
+		common.LogWriterMu.Lock()
+		gin.DefaultWriter = os.Stderr
+		common.LogWriterMu.Unlock()
+		os.Exit(legacymigrate.RunCLI(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	if len(os.Args) > 1 && os.Args[1] == "plugin" {
 		os.Exit(jsplugin.RunCLI(os.Args[2:], os.Stdout, os.Stderr))
 	}
@@ -87,28 +97,11 @@ func main() {
 		common.SysLog(common.LogText("memory cache enabled"))
 		common.SysLog(common.LogText("sync frequency: %d seconds", common.SyncFrequency))
 
-		// Add panic recovery and retry for InitProviderCache
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					common.SysLog(common.LogText("InitProviderCache panic: %v, retrying once", r))
-					// Retry once
-					_, _, fixErr := model.FixAbility()
-					if fixErr != nil {
-						common.FatalLog(common.LogText("InitProviderCache failed: %s", fixErr.Error()))
-					}
-				}
-			}()
-			model.InitProviderCache()
-		}()
+		model.InitProviderCache()
 
 		go model.SyncProviderCache(common.SyncFrequency)
 	}
 	wsmanager.StartSubscriber(context.Background())
-
-	// Warm pricing after channel cache initialization so Advanced Custom
-	// endpoint inference can read cached route settings on first request.
-	model.GetPricing()
 
 	// 热更新配置
 	go model.SyncOptions(common.SyncFrequency)
@@ -116,9 +109,6 @@ func main() {
 
 	// 周期性重载授权策略，保证多节点/多 master 部署下权限变更能传播到每个实例
 	go authz.StartPolicySync(common.SyncFrequency)
-
-	// 数据看板
-	go model.UpdateQuotaData()
 
 	if os.Getenv("CHANNEL_UPDATE_FREQUENCY") != "" {
 		frequency, err := strconv.Atoi(os.Getenv("CHANNEL_UPDATE_FREQUENCY"))
@@ -149,19 +139,11 @@ func main() {
 		return a
 	}
 
-	// Register the periodic channel test, upstream model update, and async task
-	// polling (Midjourney / Suno / video) jobs as scheduled system tasks
-	// (DB-lease dedup across masters + run history), then start the runner that
-	// schedules and executes them. Master-only execution and the UpdateTask
-	// switch are enforced inside the runner and each handler's Enabled().
+	// Register active polling/reconciliation jobs and the handlers that close
+	// retired maintenance jobs. DB leases deduplicate runs across masters;
+	// the runner and active handlers enforce master-only execution and UpdateTask.
 	controller.RegisterScheduledSystemTasks()
 	service.StartSystemTaskRunner()
-
-	if os.Getenv("BATCH_UPDATE_ENABLED") == "true" {
-		common.BatchUpdateEnabled = true
-		common.SysLog(common.LogText("batch update enabled with interval %ss", strconv.Itoa(common.BatchUpdateInterval)))
-		model.InitBatchUpdater()
-	}
 
 	if os.Getenv("ENABLE_PPROF") == "true" {
 		gopool.Go(func() {
@@ -228,10 +210,6 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
 		common.SysError(common.LogText("server forced to shutdown: %v", err))
-	}
-	// 内存中的看板数据保存入库，避免重启丢失未落库数据 (issue #5679)
-	if common.DataExportEnabled {
-		model.SaveQuotaDataCache()
 	}
 	common.SysLog(common.LogText("server exited"))
 }

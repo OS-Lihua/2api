@@ -122,7 +122,6 @@ beforeEach(() => {
     AutomaticRetryStatusCodes: '429,500-503',
     AutomaticDisableChannelEnabled: true,
     AutomaticEnableChannelEnabled: true,
-    'monitor_setting.auto_test_channel_enabled': true,
     CheckSensitiveEnabled: true,
     CheckSensitiveOnPromptEnabled: true,
     SensitiveWords: 'blocked',
@@ -207,9 +206,9 @@ describe('request policy settings', () => {
   it.each([
     [
       'health',
-      'Channel test concurrency',
+      'Health check timeout threshold (seconds)',
       '4',
-      'monitor_setting.channel_test_concurrency',
+      'ChannelDisableThreshold',
       4,
     ],
   ])(
@@ -313,19 +312,134 @@ describe('request policy settings', () => {
     expect(api.put).not.toHaveBeenCalled()
   })
 
-  it('turning scheduled checks off explains recovery without changing the recovery setting', async () => {
+  it('historical monitor options are not editable or saved and do not change the retained recovery setting', async () => {
+    Object.assign(settings, {
+      'monitor_setting.auto_test_channel_enabled': true,
+      'monitor_setting.auto_test_channel_minutes': 0,
+      'monitor_setting.channel_test_mode': 'unknown-old-mode',
+      'monitor_setting.channel_test_concurrency': 999,
+    })
     await renderPolicies('/system-settings/request-policies/health')
-    await userEvent.click(
-      await screen.findByRole('switch', { name: 'Scheduled channel tests' })
-    )
+    const recovery = await screen.findByRole('switch', {
+      name: 'Re-enable on success',
+    })
+    expect(recovery).toBeChecked()
+    expect(
+      screen.queryByRole('switch', { name: 'Scheduled channel tests' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('combobox', { name: 'Channel test mode' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('spinbutton', { name: 'Test interval (minutes)' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('spinbutton', { name: 'Channel test concurrency' })
+    ).not.toBeInTheDocument()
     expect(
       screen.getByText(
-        'Scheduled recovery is off. Bulk channel tests can still re-enable automatically disabled channels.'
+        'Legacy Channel management has been retired. Use the Provider and Channel APIs instead.'
       )
     ).toBeVisible()
-    expect(
+    await userEvent.click(screen.getByRole('button', { name: 'Save Changes' }))
+    expect(api.patch).not.toHaveBeenCalled()
+    expect(api.put).not.toHaveBeenCalled()
+    fireEvent.change(
+      screen.getByRole('spinbutton', {
+        name: 'Health check timeout threshold (seconds)',
+      }),
+      { target: { value: '12' } }
+    )
+    await userEvent.click(screen.getByRole('button', { name: 'Save Changes' }))
+    await waitFor(() =>
+      expect(api.patch).toHaveBeenCalledExactlyOnceWith(
+        '/api/option/request_policy',
+        { options: { ChannelDisableThreshold: '12' } }
+      )
+    )
+    expect(recovery).toBeChecked()
+  })
+
+  it('retained health controls save only changed normalized policy values', async () => {
+    await renderPolicies('/system-settings/request-policies/health')
+    await userEvent.click(
+      await screen.findByRole('switch', { name: 'Disable on failure' })
+    )
+    await userEvent.click(
       screen.getByRole('switch', { name: 'Re-enable on success' })
-    ).toBeChecked()
+    )
+    fireEvent.change(
+      screen.getByRole('spinbutton', {
+        name: 'Health check timeout threshold (seconds)',
+      }),
+      { target: { value: '8' } }
+    )
+    fireEvent.change(
+      screen.getByRole('textbox', { name: 'Auto-disable status codes' }),
+      { target: { value: ' 403, 500-503, 403 ' } }
+    )
+    fireEvent.change(
+      screen.getByRole('textbox', { name: 'Failure keywords' }),
+      { target: { value: 'first failure\r\nsecond failure' } }
+    )
+    await userEvent.click(screen.getByRole('button', { name: 'Save Changes' }))
+    await waitFor(() =>
+      expect(api.patch).toHaveBeenCalledExactlyOnceWith(
+        '/api/option/request_policy',
+        {
+          options: {
+            AutomaticDisableChannelEnabled: 'false',
+            AutomaticEnableChannelEnabled: 'false',
+            ChannelDisableThreshold: '8',
+            AutomaticDisableStatusCodes: '403,500-503',
+            AutomaticDisableKeywords: 'first failure\nsecond failure',
+          },
+        }
+      )
+    )
+    expect(api.put).not.toHaveBeenCalled()
+  })
+
+  it('invalid retained health rules block saving without silently dropping the rule', async () => {
+    await renderPolicies('/system-settings/request-policies/health')
+    const codes = await screen.findByRole('textbox', {
+      name: 'Auto-disable status codes',
+    })
+    const threshold = screen.getByRole('spinbutton', {
+      name: 'Health check timeout threshold (seconds)',
+    })
+    fireEvent.change(codes, { target: { value: '599-500' } })
+    fireEvent.change(threshold, { target: { value: '-1' } })
+    await userEvent.click(screen.getByRole('button', { name: 'Save Changes' }))
+    expect(codes).toHaveAttribute('aria-invalid', 'true')
+    expect(threshold).toHaveAttribute('aria-invalid', 'true')
+    expect(codes).toHaveValue('599-500')
+    expect(api.patch).not.toHaveBeenCalled()
+    expect(api.put).not.toHaveBeenCalled()
+  })
+
+  it('a rejected health save retains its draft and retries the same non-retired payload', async () => {
+    vi.mocked(api.patch).mockResolvedValueOnce({
+      data: { success: false, message: 'Save rejected' },
+    })
+    await renderPolicies('/system-settings/request-policies/health')
+    const keywords = await screen.findByRole('textbox', {
+      name: 'Failure keywords',
+    })
+    fireEvent.change(keywords, { target: { value: 'keep this draft' } })
+    const save = screen.getByRole('button', { name: 'Save Changes' })
+    await userEvent.click(save)
+    await waitFor(() => expect(api.patch).toHaveBeenCalledOnce())
+    await waitFor(() => expect(save).toBeEnabled())
+    expect(keywords).toHaveValue('keep this draft')
+    await userEvent.click(save)
+    await waitFor(() => expect(api.patch).toHaveBeenCalledTimes(2))
+    for (const call of vi.mocked(api.patch).mock.calls) {
+      expect(call).toEqual([
+        '/api/option/request_policy',
+        { options: { AutomaticDisableKeywords: 'keep this draft' } },
+      ])
+    }
     expect(api.put).not.toHaveBeenCalled()
   })
 

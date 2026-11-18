@@ -451,6 +451,81 @@ func TestKeyPermissionsIdentityVisibilityAndDeletion(t *testing.T) {
 	}
 }
 
+func TestRetiredQuotaBillingRoutesPreserveCredentials(t *testing.T) {
+	paths := []string{
+		"/dashboard/billing/subscription", "/v1/dashboard/billing/subscription",
+		"/dashboard/billing/usage", "/v1/dashboard/billing/usage",
+	}
+	for _, test := range []struct {
+		name   string
+		change func(*testing.T, *textGatewayFixture)
+		status int
+	}{
+		{name: "zero retired quota", status: http.StatusGone},
+		{name: "positive retired quota", status: http.StatusGone, change: func(t *testing.T, f *textGatewayFixture) {
+			require.NoError(t, model.DB.Model(f.token).Update("remain_quota", 100).Error)
+		}},
+		{name: "disabled credential", status: http.StatusUnauthorized, change: func(t *testing.T, f *textGatewayFixture) {
+			require.NoError(t, model.DB.Model(f.token).Update("status", common.TokenStatusDisabled).Error)
+		}},
+		{name: "legacy inactive credential", status: http.StatusUnauthorized, change: func(t *testing.T, f *textGatewayFixture) {
+			require.NoError(t, model.DB.Model(f.token).Update("status", common.TokenStatusExhausted).Error)
+		}},
+		{name: "expired credential", status: http.StatusUnauthorized, change: func(t *testing.T, f *textGatewayFixture) {
+			require.NoError(t, model.DB.Model(f.token).Update("expired_time", int64(1)).Error)
+		}},
+		{name: "restricted IP", status: http.StatusForbidden, change: func(t *testing.T, f *textGatewayFixture) {
+			require.NoError(t, model.DB.Model(f.token).Update("allow_ips", "203.0.113.0/24").Error)
+		}},
+		{name: "disabled user", status: http.StatusForbidden, change: func(t *testing.T, f *textGatewayFixture) {
+			require.NoError(t, model.DB.Model(f.user).Update("status", common.UserStatusDisabled).Error)
+		}},
+		{name: "unknown credential", status: http.StatusUnauthorized, change: func(_ *testing.T, f *textGatewayFixture) {
+			f.token.Key = "unknown-retired-query-key"
+		}},
+		{name: "missing credential", status: http.StatusUnauthorized, change: func(_ *testing.T, f *textGatewayFixture) {
+			f.token.Key = ""
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newTextGatewayFixture(t, func(http.ResponseWriter, *http.Request) { t.Error("billing queries must not contact a Provider") })
+			require.NoError(t, model.DB.Model(f.token).Updates(map[string]any{"remain_quota": 0, "unlimited_quota": false}).Error)
+			SetDashboardRouter(f.engine)
+			if test.change != nil {
+				test.change(t, &f)
+			}
+			wallet, err := model.GetUserWallet(f.user.Id)
+			require.NoError(t, err)
+			for _, path := range paths {
+				request := httptest.NewRequest(http.MethodGet, path, nil)
+				request.Header.Set("Accept-Language", "en-US")
+				if f.token.Key != "" {
+					request.Header.Set("Authorization", "Bearer "+f.token.Key)
+				}
+				response := httptest.NewRecorder()
+				f.engine.ServeHTTP(response, request)
+				assert.Equal(t, test.status, response.Code, path+": "+response.Body.String())
+				for _, field := range []string{"hard_limit_usd", "soft_limit_usd", "total_usage", "total_available", "balance", "consumed", "outstanding"} {
+					assert.NotContains(t, response.Body.String(), `"`+field+`"`)
+				}
+				if test.status == http.StatusGone {
+					assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+					assert.JSONEq(t, `{"success":false,"message":"Quota-based billing queries have been retired. Use the authorized wallet APIs.","message_key":"Quota-based billing queries have been retired. Use the authorized wallet APIs.","code":"quota_billing_retired"}`, response.Body.String())
+					saved, err := model.GetTokenByIds(f.token.Id, f.user.Id)
+					require.NoError(t, err)
+					assert.Equal(t, common.TokenStatusEnabled, saved.Status, "a retired query must not exhaust an otherwise valid credential")
+				}
+			}
+			after, err := model.GetUserWallet(f.user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, wallet, after, "retired queries cannot affect the wallet")
+			var requests int64
+			require.NoError(t, model.DB.Model(&model.GatewayBilling{}).Count(&requests).Error)
+			assert.Zero(t, requests)
+		})
+	}
+}
+
 func TestKeyPermissionsListDetailAndCall(t *testing.T) {
 	calls := 0
 	f := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {

@@ -70,7 +70,7 @@ var defaultVendorIcons = map[string]string{
 }
 
 // initDefaultVendorMapping 简化的默认供应商映射
-func initDefaultVendorMapping(metaMap map[string]*Model, vendorMap map[int]*Vendor, enableAbilities []AbilityWithProvider) {
+func initDefaultVendorMapping(metaMap map[string]*Model, vendorMap map[int]*Vendor, modelNames []string) {
 	patterns := make([]string, 0, len(defaultVendorRules))
 	for pattern := range defaultVendorRules {
 		patterns = append(patterns, pattern)
@@ -81,8 +81,7 @@ func initDefaultVendorMapping(metaMap map[string]*Model, vendorMap map[int]*Vend
 		}
 		return strings.Compare(a, b)
 	})
-	for _, ability := range enableAbilities {
-		modelName := ability.Model
+	for _, modelName := range modelNames {
 		if _, exists := metaMap[modelName]; exists {
 			continue
 		}

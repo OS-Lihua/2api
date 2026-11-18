@@ -63,9 +63,8 @@ const OPERATIONS_SECTIONS = [
     titleKey: 'Email & Notifications',
     build: (settings: OperationsSettings) => (
       <EmailSettingsSection
+        reminderConfig={settings['balance_reminder_setting.config']}
         defaultValues={{
-          QuotaRemindEnabled: settings.QuotaRemindEnabled,
-          QuotaRemindThreshold: settings.QuotaRemindThreshold,
           EmailProvider: settings.EmailProvider,
           ResendApiKey: settings.ResendApiKey,
           ResendKeyConfigured: settings.ResendKeyConfigured,

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
@@ -59,11 +60,15 @@ func taskGatewayAccessError(c *gin.Context) *dto.TaskError {
 // TaskGateway submits a resolved ModelOffering through the shared attempt and
 // money lifecycle. Accepted tasks retain the selected Channel for all polling.
 func TaskGateway(c *gin.Context) {
-	if middleware.TextOffering(c) == nil || !strings.HasPrefix(c.Request.URL.Path, "/v1/tasks/") && !c.GetBool("task_gateway_endpoint") {
+	if !strings.HasPrefix(c.Request.URL.Path, "/v1/tasks/") && !c.GetBool("task_gateway_endpoint") {
 		c.Next()
 		return
 	}
 	c.Abort()
+	if middleware.TextOffering(c) == nil {
+		respondTaskSubmissionError(c, &dto.TaskError{StatusCode: http.StatusNotFound, Code: "model_not_found", Message: "Model not found", LocalError: true})
+		return
+	}
 	if _, exists := c.Get(jsplugin.ContextKeyPinnedEndpoint); exists {
 		RelayTaskPluginEndpoint(c, presentGatewayTaskSubmission)
 		return
@@ -100,14 +105,29 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 	origins, _ := common.GetContextKeyType[[]*model.Task](c, constant.ContextKeyOriginTasks)
 	pinnedChannelID, pinnedProviderID := 0, 0
 	for _, origin := range origins {
-		if origin.PrivateData.Gateway == nil || !origin.PrivateData.Gateway.Accepted || origin.UserId != c.GetInt("id") || origin.Platform != origins[0].Platform {
+		channelID, providerID := 0, 0
+		if origin.UserId == c.GetInt("id") && origin.Platform == origins[0].Platform {
+			if snapshot := origin.PrivateData.Gateway; snapshot != nil && snapshot.Accepted {
+				channelID, providerID = snapshot.ChannelID, snapshot.ProviderID
+			} else if origin.PrivateData.LegacyObligation != nil {
+				// Historical imports prove only their original Provider, not a new
+				// Channel. The child's own Offering must authorize a current route
+				// on that Provider; never manufacture a historical Channel snapshot.
+				if provider, err := service.GatewayTaskProviderIdentity(origin); err == nil {
+					providerID = provider.Id
+				}
+			}
+		}
+		if providerID <= 0 {
 			return nil, &dto.TaskError{StatusCode: 400, Code: "origin_task_not_found", Message: "Origin task is unavailable", LocalError: true}
 		}
-		if pinnedChannelID != 0 && (origin.PrivateData.Gateway.ChannelID != pinnedChannelID || origin.PrivateData.Gateway.ProviderID != pinnedProviderID) {
+		if pinnedProviderID != 0 && providerID != pinnedProviderID || channelID != 0 && pinnedChannelID != 0 && channelID != pinnedChannelID {
 			return nil, &dto.TaskError{StatusCode: 400, Code: "origin_task_channel_conflict", Message: "Origin tasks must belong to the same Channel", LocalError: true}
 		}
-		pinnedChannelID = origin.PrivateData.Gateway.ChannelID
-		pinnedProviderID = origin.PrivateData.Gateway.ProviderID
+		if channelID != 0 {
+			pinnedChannelID = channelID
+		}
+		pinnedProviderID = providerID
 	}
 	started := c.GetTime(middleware.TextGatewayStartedAtKey)
 	sale, err := model.CurrentPriceVersion(c.Request.Context(), model.DB, model.PriceOwnerOffering, offering.ID, started.Unix())
@@ -131,6 +151,8 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 	var saleSource money.Amount
 	var accepted *model.Task
 	var acceptedInfo *relaycommon.RelayInfo
+	var existing *model.Task
+	var existingInfo *relaycommon.RelayInfo
 	var pending *model.Task
 	var previousAttempts []model.GatewayAttempt
 	attemptTraces := make(map[string]billingexpr.MoneyTraceResult)
@@ -190,6 +212,16 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 		maps.Copy(c.Keys, candidate.Context.Keys)
 		info, adaptor, facts, saleInput := candidate.Info, candidate.Adaptor, candidate.Facts, candidate.SaleInput
 		info.SubmittedUsage = maps.Clone(facts)
+		declaredSchema, _ := candidate.Plugin.Meta.UsageForModels(info.UpstreamModelName, info.OriginModelName)
+		// Deep-copy localized labels and enums before a plugin reload can replace them.
+		schemaJSON, err := common.Marshal(declaredSchema)
+		if err != nil {
+			return
+		}
+		var billingUsageSchema map[string]jsplugin.UsageFieldSchema
+		if err := common.Unmarshal(schemaJSON, &billingUsageSchema); err != nil {
+			return
+		}
 		contactedProvider := false
 		defer func() {
 			ctx := context.WithoutCancel(parent.Context())
@@ -254,7 +286,7 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 			pending.Action = info.Action
 			pending.PrivateData.Key = ""
 			pending.PrivateData.Execution = service.TaskExecutionSnapshotFromContext(c)
-			pending.PrivateData.Gateway = &model.TaskGatewaySnapshot{ProviderType: info.ChannelType, ChannelID: selected.ID, ProviderID: provider.Id, Facts: facts, RetainedFacts: candidate.RetainedFacts, SaleSource: source, SaleConditions: saleTrace.RequestSnapshot, Settlement: model.GatewaySettlement{Request: *record}}
+			pending.PrivateData.Gateway = &model.TaskGatewaySnapshot{BillingUsageSchema: billingUsageSchema, ProviderType: info.ChannelType, ChannelID: selected.ID, ProviderID: provider.Id, Facts: facts, RetainedFacts: candidate.RetainedFacts, SaleSource: source, SaleConditions: saleTrace.RequestSnapshot, Settlement: model.GatewaySettlement{Request: *record}}
 			if err := model.ReserveGatewayTask(record, reserve, source, pending); err != nil {
 				record, pending = nil, nil
 				lastStatus, lastCode = 503, "task_persistence_failed"
@@ -308,7 +340,7 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 				attempt.MemberTier = member.Tier
 			}
 		}
-		snapshot := &model.TaskGatewaySnapshot{ProviderType: info.ChannelType, ChannelID: selected.ID, ProviderID: provider.Id, Facts: facts, RetainedFacts: candidate.RetainedFacts, SaleSource: saleSource, SaleConditions: pending.PrivateData.Gateway.SaleConditions, PreviousAttempts: append([]model.GatewayAttempt(nil), previousAttempts...), Settlement: model.GatewaySettlement{Request: *record, Attempt: attempt, AttemptTrace: attemptTraces}}
+		snapshot := &model.TaskGatewaySnapshot{BillingUsageSchema: billingUsageSchema, ProviderType: info.ChannelType, ChannelID: selected.ID, ProviderID: provider.Id, Facts: facts, RetainedFacts: candidate.RetainedFacts, SaleSource: saleSource, SaleConditions: pending.PrivateData.Gateway.SaleConditions, PreviousAttempts: append([]model.GatewayAttempt(nil), previousAttempts...), Settlement: model.GatewaySettlement{Request: *record, Attempt: attempt, AttemptTrace: attemptTraces}}
 		pending.ChannelId = info.ChannelId
 		pending.Platform = constant.TaskPlatform(candidate.Plugin.Meta.Key)
 		pending.Action = info.Action
@@ -454,7 +486,37 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 		result.Delivered = true
 		parsed, taskErr := adaptor.ParseResponse(c, response, info)
 		if taskErr != nil || parsed == nil {
+			attempt.Status = "submission_unknown"
+			attempt.CostPending, attempt.ConvertedCostPending = true, true
 			lastStatus, lastCode = 502, "task_response_invalid"
+			return
+		}
+		if parsed.Acceptance != "" && parsed.Acceptance != "accepted" {
+			attempt.CostPending, attempt.ConvertedCostPending = true, true
+			attempt.Status = "submission_unknown"
+			lastStatus, lastCode = 502, "task_submission_unknown"
+			if parsed.Acceptance == "existing" {
+				// An upstream duplicate code is not authority to adopt an arbitrary
+				// task. Require one previously accepted identity owned by this user
+				// on the original Provider, not a status/result in the new response.
+				var matches []model.Task
+				err := model.DB.WithContext(parent.Context()).Where("user_id = ? AND platform = ? AND channel_id = ?", info.UserId, pending.Platform, provider.Id).
+					Where(`"private_data"->>'upstream_task_id' = ?`, parsed.UpstreamTaskID).
+					Where(`(("private_data"->'gateway'->>'accepted' = 'true' AND "private_data"->'gateway'->>'provider_id' = ?) OR "private_data"->'legacy_obligation'->>'provider_id' = ?)`, fmt.Sprint(provider.Id), fmt.Sprint(provider.Id)).Limit(2).Find(&matches).Error
+				if err == nil && len(matches) == 1 && matches[0].ResultRetrievable() {
+					original, identityErr := service.GatewayTaskProviderIdentity(&matches[0])
+					if identityErr == nil && original.Id == provider.Id {
+						existing, existingInfo = &matches[0], info
+					}
+				}
+			}
+			if parsed.Acceptance == "rejected" || existing != nil {
+				upstreamAccepted = false
+				attempt.Status = "failed"
+				attempt.ErrorClass = "request_rejected"
+				result.Failure = service.ClassifyGatewayFailure(http.StatusBadRequest, "", false, false, false, false)
+				lastStatus, lastCode = http.StatusBadRequest, "task_rejected"
+			}
 			return
 		}
 		budget.Delivered()
@@ -538,8 +600,14 @@ func submitGatewayTask(c *gin.Context) (*taskSubmissionOutcome, *dto.TaskError) 
 			}
 		}
 		if err := model.PrepareGatewaySettlement(intent); err == nil {
-			_, _ = model.SettleGateway(record.ID)
+			_, settleErr := model.SettleGateway(record.ID)
 			_ = model.PublishGatewayRecords(record.ID)
+			if existing != nil && (settleErr == nil || errors.Is(settleErr, model.ErrGatewayEvaluationPending)) {
+				return &taskSubmissionOutcome{Task: existing, RelayInfo: existingInfo}, nil
+			}
+		}
+		if existing != nil {
+			lastStatus, lastCode = http.StatusServiceUnavailable, "task_persistence_failed"
 		}
 	}
 	return nil, &dto.TaskError{StatusCode: lastStatus, Code: lastCode, Message: http.StatusText(lastStatus), LocalError: true}

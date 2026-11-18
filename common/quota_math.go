@@ -63,10 +63,14 @@ func (c *QuotaClamp) AuditMap() map[string]any {
 	if c == nil {
 		return nil
 	}
+	var original any = c.Original
+	if math.IsNaN(c.Original) || math.IsInf(c.Original, 0) {
+		original = fmt.Sprintf("%g", c.Original)
+	}
 	return map[string]any{
 		"op":       c.Op,
 		"kind":     c.Kind,
-		"original": c.Original,
+		"original": original,
 		"clamped":  c.Clamped,
 	}
 }
@@ -124,6 +128,15 @@ func QuotaFromFloatChecked(value float64) (int, *QuotaClamp) {
 // *QuotaClamp error instead of allowing a saturated result to reach billing.
 func QuotaFromFloatStrict(value float64) (int, error) {
 	return strictQuota(QuotaFromFloatChecked(value))
+}
+
+// AudioDurationTokens maps measured audio seconds to the existing 1000-token
+// minute unit. All metadata-derived conversions retain the saturation marker.
+func AudioDurationTokens(seconds float64) (int, *QuotaClamp) {
+	if seconds < 0 {
+		return saturateQuotaBounded(seconds, "AudioDurationTokens", MaxQuota, 0)
+	}
+	return saturateQuotaBounded(math.Round(math.Ceil(seconds)/60*1000), "AudioDurationTokens", MaxQuota, 0)
 }
 
 // QuotaRound converts a float64 quota value to int using half-away-from-zero

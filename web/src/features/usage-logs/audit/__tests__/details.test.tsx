@@ -30,6 +30,7 @@ import type { ReactElement } from 'react'
 import { I18nextProvider } from 'react-i18next'
 import { afterEach, expect, it, vi } from 'vitest'
 
+import fr from '@/i18n/locales/fr.json'
 import zh from '@/i18n/locales/zh.json'
 import type { PermissionResourceDef } from '@/lib/admin-permissions'
 import { api } from '@/lib/api'
@@ -76,6 +77,37 @@ afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
+})
+
+it('keeps exact voucher money in the localized audit summary and details', async () => {
+  const i18n = createInstance()
+  await i18n.init({ lng: 'fr', resources: { fr } })
+  const log: AuditLog = {
+    ...entry,
+    action: 'redemption.create',
+    other: {
+      op: {
+        action: 'redemption.create',
+        params: {
+          count: 2,
+          name: 'voucher',
+          amount: { nanos: '9007199254740993', currency: 'EUR' },
+        },
+      },
+    },
+  }
+  const detail = buildAuditDetails(log, i18n.t, { locale: 'fr-FR' })
+  expect(detail.summary).toBe(
+    'Création de 2 codes d’échange nommés voucher (9 007 199,254740993 EUR chacun)'
+  )
+  expect(detail.summary).not.toContain('{{quota}}')
+  expect(detail.fields).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        value: { nanos: '9007199254740993', currency: 'EUR' },
+      }),
+    ])
+  )
 })
 
 it.each([

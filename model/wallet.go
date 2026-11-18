@@ -24,6 +24,11 @@ const (
 	// LedgerAccountUserWallet is a user's balance in the settlement currency;
 	// its owner is the user ID.
 	LedgerAccountUserWallet LedgerAccountType = "user_wallet"
+	// LedgerAccountUserReferral holds earned invitation rewards awaiting transfer.
+	LedgerAccountUserReferral LedgerAccountType = "user_referral"
+	// Subscription accounts belong to immutable entitlement period IDs, not users.
+	LedgerAccountSubscription          LedgerAccountType = "subscription_period"
+	LedgerAccountSubscriptionUnlimited LedgerAccountType = "subscription_unlimited"
 	// LedgerAccountUserReceivable holds the user's unpaid charges. Repayments
 	// reduce this asset without recognizing revenue a second time.
 	LedgerAccountUserReceivable LedgerAccountType = "user_receivable"
@@ -39,14 +44,17 @@ const (
 type LedgerEntryType string
 
 const (
-	LedgerEntryRepayment         LedgerEntryType = "repayment"
-	LedgerEntryTopUp             LedgerEntryType = "top_up"
-	LedgerEntryPreConsume        LedgerEntryType = "pre_consume"
-	LedgerEntryPreConsumeRelease LedgerEntryType = "pre_consume_release"
-	LedgerEntryCharge            LedgerEntryType = "charge"
-	LedgerEntryRefund            LedgerEntryType = "refund"
-	LedgerEntryAdjustment        LedgerEntryType = "adjustment"
-	LedgerEntryOpeningBalance    LedgerEntryType = "opening_balance"
+	LedgerEntrySubscriptionGrant       LedgerEntryType = "subscription_grant"
+	LedgerEntrySubscriptionOpeningUsed LedgerEntryType = "subscription_opening_used"
+	LedgerEntryTransfer                LedgerEntryType = "reward_transfer"
+	LedgerEntryRepayment               LedgerEntryType = "repayment"
+	LedgerEntryTopUp                   LedgerEntryType = "top_up"
+	LedgerEntryPreConsume              LedgerEntryType = "pre_consume"
+	LedgerEntryPreConsumeRelease       LedgerEntryType = "pre_consume_release"
+	LedgerEntryCharge                  LedgerEntryType = "charge"
+	LedgerEntryRefund                  LedgerEntryType = "refund"
+	LedgerEntryAdjustment              LedgerEntryType = "adjustment"
+	LedgerEntryOpeningBalance          LedgerEntryType = "opening_balance"
 )
 
 type ledgerSign int
@@ -62,11 +70,34 @@ const (
 // payable account a charge is a purchase cost the platform owes, and a
 // refund is a credit from the Provider. A reversal has the opposite sign.
 var ledgerEntrySigns = map[LedgerAccountType]map[LedgerEntryType]ledgerSign{
+	LedgerAccountSubscription: {
+		LedgerEntrySubscriptionGrant:       ledgerSignPositive,
+		LedgerEntrySubscriptionOpeningUsed: ledgerSignNegative,
+		LedgerEntryPreConsume:              ledgerSignNegative,
+		LedgerEntryPreConsumeRelease:       ledgerSignPositive,
+		LedgerEntryCharge:                  ledgerSignNegative,
+		LedgerEntryRefund:                  ledgerSignPositive,
+		LedgerEntryAdjustment:              ledgerSignEither,
+	},
+	LedgerAccountSubscriptionUnlimited: {
+		LedgerEntrySubscriptionOpeningUsed: ledgerSignNegative,
+		LedgerEntryPreConsume:              ledgerSignNegative,
+		LedgerEntryPreConsumeRelease:       ledgerSignPositive,
+		LedgerEntryCharge:                  ledgerSignNegative,
+		LedgerEntryRefund:                  ledgerSignPositive,
+		LedgerEntryAdjustment:              ledgerSignEither,
+	},
+	LedgerAccountUserReferral: {
+		LedgerEntryTopUp:          ledgerSignPositive,
+		LedgerEntryOpeningBalance: ledgerSignPositive,
+		LedgerEntryTransfer:       ledgerSignNegative,
+	},
 	LedgerAccountUserReceivable: {
 		LedgerEntryCharge:    ledgerSignPositive,
 		LedgerEntryRepayment: ledgerSignNegative,
 	},
 	LedgerAccountUserWallet: {
+		LedgerEntryTransfer:          ledgerSignPositive,
 		LedgerEntryRepayment:         ledgerSignNegative,
 		LedgerEntryTopUp:             ledgerSignPositive,
 		LedgerEntryPreConsume:        ledgerSignNegative,
@@ -220,7 +251,7 @@ func PostLedgerEntries(postings ...LedgerPosting) ([]*LedgerEntry, error) {
 	for _, posting := range postings {
 		// Debt creation belongs to the gateway settlement, and repayments are
 		// inseparable pairs generated below. Neither is a standalone adjustment.
-		if posting.Account.Type == LedgerAccountUserReceivable || posting.Type == LedgerEntryRepayment {
+		if posting.Account.Type == LedgerAccountUserReceivable || posting.Type == LedgerEntryRepayment || posting.Type == LedgerEntryTransfer {
 			return nil, ErrLedgerInvalidEntry
 		}
 		if err := validateLedgerPosting(posting); err != nil {
@@ -258,7 +289,7 @@ func validateLedgerPosting(posting LedgerPosting) error {
 	if _, err := money.ParseCurrency(string(posting.Account.Currency)); err != nil {
 		return err
 	}
-	if (posting.Account.Type == LedgerAccountUserWallet || posting.Account.Type == LedgerAccountUserReceivable) && posting.Account.Currency != SettlementCurrency() {
+	if (posting.Account.Type == LedgerAccountUserWallet || posting.Account.Type == LedgerAccountUserReceivable || posting.Account.Type == LedgerAccountUserReferral || posting.Account.Type == LedgerAccountSubscription || posting.Account.Type == LedgerAccountSubscriptionUnlimited) && posting.Account.Currency != SettlementCurrency() {
 		return fmt.Errorf("%w: user wallets must use %s", money.ErrCurrencyMismatch, SettlementCurrency())
 	}
 	if posting.Amount.Currency != posting.Account.Currency {
@@ -293,11 +324,22 @@ func postLedgerEntries(tx *gorm.DB, postings []LedgerPosting) ([]*LedgerEntry, e
 	entries := make([]*LedgerEntry, 0, len(postings))
 	for _, posting := range postings {
 		wallet := wallets[posting.Account]
+		if posting.reversesEntryId != nil {
+			// The wallet lock serializes reversals. Check the immutable outcome
+			// before testing a balance already changed by the first reversal.
+			var reversed int64
+			if err := tx.Model(&LedgerEntry{}).Where("reverses_entry_id = ?", *posting.reversesEntryId).Count(&reversed).Error; err != nil {
+				return nil, err
+			}
+			if reversed > 0 {
+				return nil, ErrLedgerEntryAlreadyReversed
+			}
+		}
 		balance, err := wallet.Balance.Add(posting.Amount)
 		if err != nil {
 			return nil, err
 		}
-		if (wallet.AccountType == LedgerAccountUserWallet || wallet.AccountType == LedgerAccountUserReceivable) && balance.Nanos < 0 {
+		if (wallet.AccountType == LedgerAccountUserWallet || wallet.AccountType == LedgerAccountUserReceivable || wallet.AccountType == LedgerAccountUserReferral || wallet.AccountType == LedgerAccountSubscription) && balance.Nanos < 0 {
 			return nil, ErrInsufficientWalletBalance
 		}
 		entry := &LedgerEntry{
@@ -576,7 +618,7 @@ func ReverseLedgerEntry(entryId int64, operatorId int, remark string) (*LedgerEn
 			}
 			return err
 		}
-		if original.ReversesEntryId != nil || original.Type == LedgerEntryRepayment || original.AccountType == LedgerAccountUserReceivable {
+		if original.ReversesEntryId != nil || original.Type == LedgerEntryRepayment || original.Type == LedgerEntryTransfer || original.AccountType == LedgerAccountUserReceivable {
 			return ErrLedgerReversalNotReversible
 		}
 		var wallet Wallet

@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"errors"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -14,8 +16,13 @@ import (
 
 // ---- Shared types ----
 
+type SubscriptionPlanView struct {
+	model.SubscriptionPlan
+	PurchaseRevision string `json:"purchase_revision"`
+}
+
 type SubscriptionPlanDTO struct {
-	Plan model.SubscriptionPlan `json:"plan"`
+	Plan SubscriptionPlanView `json:"plan"`
 }
 
 type BillingPreferenceRequest struct {
@@ -23,7 +30,9 @@ type BillingPreferenceRequest struct {
 }
 
 type SubscriptionBalancePayRequest struct {
-	PlanId int `json:"plan_id"`
+	PlanId           int    `json:"plan_id"`
+	PurchaseID       string `json:"purchase_id"`
+	ExpectedRevision string `json:"expected_revision"`
 }
 
 // ---- User APIs ----
@@ -42,8 +51,13 @@ func GetSubscriptionPlans(c *gin.Context) {
 	result := make([]SubscriptionPlanDTO, 0, len(plans))
 	for _, p := range plans {
 		p.NormalizeDefaults()
+		revision, err := model.SubscriptionPurchaseRevision(&p)
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
 		result = append(result, SubscriptionPlanDTO{
-			Plan: p,
+			Plan: SubscriptionPlanView{SubscriptionPlan: p, PurchaseRevision: revision},
 		})
 	}
 	common.ApiSuccess(c, result)
@@ -51,19 +65,25 @@ func GetSubscriptionPlans(c *gin.Context) {
 
 func GetSubscriptionSelf(c *gin.Context) {
 	userId := c.GetInt("id")
-	settingMap, _ := model.GetUserSetting(userId, false)
+	settingMap, err := model.GetUserSetting(userId, false)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	pref := common.NormalizeBillingPreference(settingMap.BillingPreference)
 
 	// Get all subscriptions (including expired)
 	allSubscriptions, err := model.GetAllUserSubscriptions(userId)
 	if err != nil {
-		allSubscriptions = []model.SubscriptionSummary{}
+		common.ApiError(c, err)
+		return
 	}
 
 	// Get active subscriptions for backward compatibility
 	activeSubscriptions, err := model.GetAllActiveUserSubscriptions(userId)
 	if err != nil {
-		activeSubscriptions = []model.SubscriptionSummary{}
+		common.ApiError(c, err)
+		return
 	}
 
 	common.ApiSuccess(c, gin.H{
@@ -76,7 +96,7 @@ func GetSubscriptionSelf(c *gin.Context) {
 func UpdateSubscriptionPreference(c *gin.Context) {
 	userId := c.GetInt("id")
 	var req BillingPreferenceRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := common.DecodeJsonStrict(c.Request.Body, &req); err != nil {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
@@ -103,16 +123,26 @@ func SubscriptionRequestBalancePay(c *gin.Context) {
 
 	userId := c.GetInt("id")
 	var req SubscriptionBalancePayRequest
-	if err := c.ShouldBindJSON(&req); err != nil || req.PlanId <= 0 {
+	if err := common.DecodeJsonStrict(c.Request.Body, &req); err != nil || req.PlanId <= 0 {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
 
-	if err := model.PurchaseSubscriptionWithBalance(userId, req.PlanId); err != nil {
-		common.ApiError(c, err)
+	result, err := model.PurchaseSubscriptionWithBalance(c.Request.Context(), userId, req.PlanId, req.PurchaseID, req.ExpectedRevision)
+	if err != nil {
+		switch {
+		case errors.Is(err, model.ErrSubscriptionPurchaseTermsChanged):
+			common.ApiErrorStatus(c, http.StatusConflict, err, gin.H{"code": "subscription_purchase_terms_changed", "accepted": false})
+		case errors.Is(err, model.ErrSubscriptionPurchaseRevisionConflict):
+			common.ApiErrorStatus(c, http.StatusConflict, err, gin.H{"code": "subscription_purchase_revision_conflict"})
+		case errors.Is(err, model.ErrSubscriptionPurchaseConflict):
+			common.ApiErrorStatus(c, http.StatusConflict, err)
+		default:
+			common.ApiError(c, err)
+		}
 		return
 	}
-	common.ApiSuccess(c, nil)
+	common.ApiSuccess(c, result)
 }
 
 // ---- Admin APIs ----
@@ -126,8 +156,13 @@ func AdminListSubscriptionPlans(c *gin.Context) {
 	result := make([]SubscriptionPlanDTO, 0, len(plans))
 	for _, p := range plans {
 		p.NormalizeDefaults()
+		revision, err := model.SubscriptionPurchaseRevision(&p)
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
 		result = append(result, SubscriptionPlanDTO{
-			Plan: p,
+			Plan: SubscriptionPlanView{SubscriptionPlan: p, PurchaseRevision: revision},
 		})
 	}
 	common.ApiSuccess(c, result)
@@ -143,7 +178,7 @@ func AdminCreateSubscriptionPlan(c *gin.Context) {
 	}
 
 	var req AdminUpsertSubscriptionPlanRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := common.DecodeJsonStrict(c.Request.Body, &req); err != nil {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
@@ -152,18 +187,15 @@ func AdminCreateSubscriptionPlan(c *gin.Context) {
 		common.ApiErrorT(c, "Subscription plan title cannot be empty")
 		return
 	}
-	if req.Plan.PriceAmount < 0 {
-		common.ApiErrorT(c, "Price cannot be negative")
+	req.Plan.MoneyVersion = 1
+	if err := req.Plan.ValidateMoney(); err != nil {
+		common.ApiError(c, err)
 		return
 	}
-	if req.Plan.PriceAmount > 9999 {
+	if req.Plan.Price.Nanos > 9_999_000_000_000 {
 		common.ApiErrorT(c, "Price cannot exceed 9999")
 		return
 	}
-	if req.Plan.Currency == "" {
-		req.Plan.Currency = "USD"
-	}
-	req.Plan.Currency = "USD"
 	if req.Plan.AllowBalancePay == nil {
 		req.Plan.AllowBalancePay = common.GetPointer(true)
 	}
@@ -178,10 +210,6 @@ func AdminCreateSubscriptionPlan(c *gin.Context) {
 	}
 	if req.Plan.MaxPurchasePerUser < 0 {
 		common.ApiErrorT(c, "Purchase limit cannot be negative")
-		return
-	}
-	if req.Plan.TotalAmount < 0 {
-		common.ApiErrorT(c, "Total quota cannot be negative")
 		return
 	}
 	req.Plan.UpgradeGroup = strings.TrimSpace(req.Plan.UpgradeGroup)
@@ -223,7 +251,7 @@ func AdminUpdateSubscriptionPlan(c *gin.Context) {
 		return
 	}
 	var req AdminUpsertSubscriptionPlanRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := common.DecodeJsonStrict(c.Request.Body, &req); err != nil {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
@@ -231,19 +259,16 @@ func AdminUpdateSubscriptionPlan(c *gin.Context) {
 		common.ApiErrorT(c, "Subscription plan title cannot be empty")
 		return
 	}
-	if req.Plan.PriceAmount < 0 {
-		common.ApiErrorT(c, "Price cannot be negative")
+	req.Plan.MoneyVersion = 1
+	if err := req.Plan.ValidateMoney(); err != nil {
+		common.ApiError(c, err)
 		return
 	}
-	if req.Plan.PriceAmount > 9999 {
+	if req.Plan.Price.Nanos > 9_999_000_000_000 {
 		common.ApiErrorT(c, "Price cannot exceed 9999")
 		return
 	}
 	req.Plan.Id = id
-	if req.Plan.Currency == "" {
-		req.Plan.Currency = "USD"
-	}
-	req.Plan.Currency = "USD"
 	if req.Plan.DurationUnit == "" {
 		req.Plan.DurationUnit = model.SubscriptionDurationMonth
 	}
@@ -252,10 +277,6 @@ func AdminUpdateSubscriptionPlan(c *gin.Context) {
 	}
 	if req.Plan.MaxPurchasePerUser < 0 {
 		common.ApiErrorT(c, "Purchase limit cannot be negative")
-		return
-	}
-	if req.Plan.TotalAmount < 0 {
-		common.ApiErrorT(c, "Total quota cannot be negative")
 		return
 	}
 	req.Plan.UpgradeGroup = strings.TrimSpace(req.Plan.UpgradeGroup)
@@ -283,8 +304,12 @@ func AdminUpdateSubscriptionPlan(c *gin.Context) {
 		updateMap := map[string]any{
 			"title":                      req.Plan.Title,
 			"subtitle":                   req.Plan.Subtitle,
-			"price_amount":               req.Plan.PriceAmount,
-			"currency":                   req.Plan.Currency,
+			"price_nanos":                req.Plan.Price.Nanos,
+			"price_currency":             req.Plan.Price.Currency,
+			"allowance_nanos":            req.Plan.Allowance.Nanos,
+			"allowance_currency":         req.Plan.Allowance.Currency,
+			"unlimited":                  req.Plan.Unlimited,
+			"money_version":              1,
 			"duration_unit":              req.Plan.DurationUnit,
 			"duration_value":             req.Plan.DurationValue,
 			"custom_seconds":             req.Plan.CustomSeconds,
@@ -294,7 +319,6 @@ func AdminUpdateSubscriptionPlan(c *gin.Context) {
 			"creem_product_id":           req.Plan.CreemProductId,
 			"waffo_pancake_product_id":   req.Plan.WaffoPancakeProductId,
 			"max_purchase_per_user":      req.Plan.MaxPurchasePerUser,
-			"total_amount":               req.Plan.TotalAmount,
 			"upgrade_group":              req.Plan.UpgradeGroup,
 			"downgrade_group":            req.Plan.DowngradeGroup,
 			"quota_reset_period":         req.Plan.QuotaResetPeriod,
@@ -458,7 +482,7 @@ func AdminResetUserSubscriptionsByPlan(c *gin.Context) {
 		return
 	}
 	var req AdminResetSubscriptionRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := common.DecodeJsonStrict(c.Request.Body, &req); err != nil {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
@@ -491,7 +515,7 @@ func AdminResetPlanSubscriptions(c *gin.Context) {
 		return
 	}
 	var req AdminResetSubscriptionRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := common.DecodeJsonStrict(c.Request.Body, &req); err != nil {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}

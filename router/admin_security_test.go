@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/alicebob/miniredis/v2"
@@ -31,6 +32,7 @@ func newAdminTestServer(t *testing.T) (*gin.Engine, *model.User, string) {
 	db := model.UseTestDatabases(t)
 	require.NoError(t, i18n.Init())
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.UserAccessToken{}, &model.Option{}, &model.Model{}, &model.Vendor{}, &model.Provider{}, &model.Ability{}))
+	require.NoError(t, model.MigrateBalanceReminders(db))
 	require.NoError(t, model.MigrateAuditLogs())
 	require.NoError(t, model.EnsureLegacyAccessTokenRetireAt(time.Now().Unix()))
 	require.NoError(t, authz.Init(db))
@@ -53,6 +55,58 @@ func adminSecurityRequest(engine http.Handler, token, method, path, body string)
 	recorder := httptest.NewRecorder()
 	engine.ServeHTTP(recorder, request)
 	return recorder
+}
+
+func TestModelMetadataReadScopes(t *testing.T) {
+	engine, admin, _ := newAdminTestServer(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}))
+	require.NoError(t, authz.SetUserPermissions(admin.Id, authz.PermissionsMap{"model": {"read": true}}))
+	metadata := model.Model{ModelName: "scoped-metadata", Description: "Stored metadata", Status: 1, Endpoints: `["custom-declaration"]`}
+	require.NoError(t, metadata.Insert())
+	provider := model.Provider{Name: "Metadata provider", Status: common.ChannelStatusEnabled, Key: "must-not-be-returned"}
+	require.NoError(t, model.DB.Create(&provider).Error)
+	require.NoError(t, model.DB.Create(&model.Channel{ProviderID: provider.Id, ModelID: metadata.Id, Protocol: protocol.OpenAIRealtime, UpstreamModelName: "native-metadata", MappingConfirmed: true, Status: model.ChannelEnabled, ParameterOverrides: "{}"}).Error)
+	reader := createWalletTestAccessToken(t, admin.Id, "model:read")
+	wrongScope := createWalletTestAccessToken(t, admin.Id, "profile:read")
+	user := model.User{Username: "metadata-user", Password: "unused", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "metadata-user"}
+	require.NoError(t, model.DB.Create(&user).Error)
+	userToken := createWalletTestAccessToken(t, user.Id, "model:read")
+	paths := []string{"/api/models/?page_size=1", "/api/models/search?keyword=scoped-metadata", fmt.Sprintf("/api/models/%d", metadata.Id)}
+	for _, path := range paths {
+		response := adminSecurityRequest(engine, reader, http.MethodGet, path, "")
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		var result struct {
+			Success bool
+			Data    map[string]any
+		}
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+		require.True(t, result.Success, response.Body.String())
+		row := result.Data
+		if items, ok := row["items"]; ok {
+			require.Len(t, items.([]any), 1)
+			row = items.([]any)[0].(map[string]any)
+		}
+		assert.Equal(t, metadata.ModelName, row["model_name"])
+		assert.Equal(t, []any{"custom-declaration", "openai-realtime"}, row["supported_endpoints"])
+		assert.NotContains(t, response.Body.String(), provider.Key)
+		assert.NotContains(t, row, "quota_types")
+		assert.Equal(t, http.StatusForbidden, adminSecurityRequest(engine, wrongScope, http.MethodGet, path, "").Code)
+		assert.Equal(t, http.StatusForbidden, adminSecurityRequest(engine, userToken, http.MethodGet, path, "").Code)
+		assert.Equal(t, http.StatusUnauthorized, adminSecurityRequest(engine, "", http.MethodGet, path, "").Code)
+	}
+	for _, path := range []string{"/api/admin/v1/price-versions", "/api/admin/v1/user-wallets"} {
+		assert.Equal(t, http.StatusForbidden, adminSecurityRequest(engine, reader, http.MethodGet, path, "").Code, "model:read must not grant financial permissions")
+	}
+	assert.Equal(t, http.StatusForbidden, adminSecurityRequest(engine, reader, http.MethodPost, "/api/models/", `{"model_name":"not-authorized","status":1}`).Code)
+	logs, _, err := model.GetAuditLogs(model.AuditLogFilter{Category: model.AuditCategoryAccessToken, UserId: admin.Id}, 0, 100, common.RoleRootUser)
+	require.NoError(t, err)
+	successes := 0
+	for _, entry := range logs {
+		if entry.Success {
+			successes++
+		}
+	}
+	assert.Equal(t, 3, successes, "authorized metadata reads remain audited in the configured log database")
 }
 
 func TestAdminAPIDoesNotAcceptUnscopedLegacyCredentials(t *testing.T) {
@@ -151,7 +205,7 @@ func TestAdminAPIWriteAuditExcludesProviderSecrets(t *testing.T) {
 		_, _ = w.Write([]byte(`{"error":"transporterror-secret"}`))
 	}))
 	t.Cleanup(upstream.Close)
-	response := adminSecurityRequest(engine, root, http.MethodPost, "/api/admin/v1/providers", `{"provider":{"type":1,"base_url":"`+upstream.URL+`","name":"audit fixture","models":"gpt-test","group":"default","key":"credential-one\ncredential-two","header_override":"{\"X-Api-Key\":\"header-secret\"}","other":"account-secret","settings":"{\"custom\":\"deployment-secret\"}"},"mode":"multi_to_single"}`)
+	response := adminSecurityRequest(engine, root, http.MethodPost, "/api/admin/v1/providers", `{"provider":{"type":1,"base_url":"`+upstream.URL+`","name":"audit fixture","key":"credential-one\ncredential-two","header_override":"{\"X-Api-Key\":\"header-secret\"}","other":"account-secret","settings":"{\"custom\":\"deployment-secret\"}"},"mode":"multi_to_single"}`)
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 	var created struct {
 		Success bool

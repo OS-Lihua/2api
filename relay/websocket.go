@@ -34,15 +34,6 @@ func (realtimeProtocol) DoResponse(c *gin.Context, _ *http.Response, info *relay
 	return usage, apiErr
 }
 
-func WssHelper(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
-	usage, apiErr := exchangeRealtime(c, info, nil, nil)
-	if known, ok := usage.(*dto.RealtimeUsage); ok && (apiErr == nil || !info.UsePrice && !info.PriceData.UsePrice && known.TotalTokens > 0) {
-		// Completed token usage remains payable if a later session event fails.
-		service.PostWssConsumeQuota(c, info, info.UpstreamModelName, known, nil)
-	}
-	return apiErr
-}
-
 // ExchangeRealtime uses the existing native transport with a prepared account.
 func ExchangeRealtime(c *gin.Context, info *relaycommon.RelayInfo, prepared *relaychannel.PreparedWssRequest, connected func() error) (any, *types.NewAPIError) {
 	return exchangeRealtime(c, info, prepared, connected)

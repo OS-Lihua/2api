@@ -20,12 +20,77 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/pluginhost"
 	"github.com/QuantumNous/new-api/plugins"
 	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func completeHostRouteFacts(t *testing.T) []gin.RouteInfo {
+	t.Helper()
+	previousRegistry, previousDispatcher, previousMaster := jsplugin.DefaultRegistry, defaultPluginDispatcher, common.IsMasterNode
+	t.Cleanup(func() {
+		jsplugin.DefaultRegistry, defaultPluginDispatcher, common.IsMasterNode = previousRegistry, previousDispatcher, previousMaster
+	})
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	common.IsMasterNode = false
+	t.Setenv("FRONTEND_BASE_URL", "https://frontend.example.invalid")
+	engine := gin.New()
+	// Use the actual top-level registrar, not a second list of router calls.
+	SetRouter(engine, WebAssets{})
+	facts := engine.Routes()
+	for index := range facts {
+		facts[index] = gin.RouteInfo{Method: facts[index].Method, Path: facts[index].Path}
+	}
+	return facts
+}
+
+func TestPluginHostRouteFactsMatchRegisteredRoutes(t *testing.T) {
+	facts := completeHostRouteFacts(t)
+	require.NotEmpty(t, facts)
+	assert.ElementsMatch(t, facts, pluginhost.HostRoutes(), "offline host facts must cover every actual Method/Path, without extra or missing routes")
+	copy := pluginhost.HostRoutes()
+	copy[0].Path = "/mutated"
+	assert.ElementsMatch(t, facts, pluginhost.HostRoutes(), "callers cannot mutate the source host facts")
+}
+
+func assertOfflineHostAdmissionMatchesOnline(t *testing.T, candidate *jsplugin.RoutingGeneration, facts []gin.RouteInfo) {
+	t.Helper()
+	offline, err := pluginhost.New(facts).PrepareOffline(candidate, nil)
+	require.NoError(t, err)
+	builder := newPluginGenerationBuilder(facts, nil, testPluginRouteHandlers(func(*gin.Context, *jsplugin.RoutingGeneration, jsplugin.RouteBinding) {}))
+	online, err := builder.prepare(candidate, nil)
+	require.NoError(t, err)
+	assert.Equal(t, online.Errors, offline.Errors)
+	assert.Equal(t, online.Generation.Plugins(), offline.Generation.Plugins())
+	assert.Equal(t, online.Generation.RouteGroups(), offline.Generation.RouteGroups())
+	assert.Equal(t, online.Generation.SkippedRoutes(), offline.Generation.SkippedRoutes())
+	assert.Nil(t, offline.Generation.RuntimeHandler(), "offline validation must not publish a serving runtime")
+	assert.NotNil(t, online.Generation.RuntimeHandler())
+}
+
+func TestPluginOfflineHostAdmissionUsesActualHostFacts(t *testing.T) {
+	facts := completeHostRouteFacts(t)
+	registry, err := plugins.NewFactoryRegistry()
+	require.NoError(t, err)
+	assertOfflineHostAdmissionMatchesOnline(t, registry.Generation(), facts)
+	valid := compileRouterPlugin(t, "audit-host", "1.0.0", `[{method:"POST",path:"/audit-host/jobs",type:"submit"}]`)
+	pg := compileRouterPlugin(t, "pg", "1.0.0", `[{method:"POST",path:"/pg/jobs",type:"submit"}]`)
+	v1beta := compileRouterPlugin(t, "v1beta", "1.0.0", `[{method:"POST",path:"/v1beta/jobs",type:"submit"}]`)
+	require.NoError(t, registry.ReplaceOverrides([]*jsplugin.LoadedPlugin{valid, pg, v1beta}))
+	candidate := registry.Generation()
+	assertOfflineHostAdmissionMatchesOnline(t, candidate, facts)
+	prepared, err := pluginhost.New(pluginhost.HostRoutes()).PrepareOffline(candidate, nil)
+	require.NoError(t, err)
+	assert.Contains(t, prepared.Errors["pg"], `plugin key "pg" is a host path segment`)
+	assert.Contains(t, prepared.Errors["v1beta"], `plugin key "v1beta" is a host path segment`)
+	_, admitted := prepared.Generation.Get("audit-host")
+	assert.True(t, admitted, "a valid non-host key must remain usable")
+	_, admitted = prepared.Generation.Get("pg")
+	assert.False(t, admitted)
+}
 
 func TestPluginDispatcherMissFallsThroughWithoutLeakingInnerResponse(t *testing.T) {
 	outer, registry := newPluginRouterTest(t, nil, nil)
@@ -382,6 +447,7 @@ func TestPluginStaticRouteConflictsAreExcluded(t *testing.T) {
 					c.String(http.StatusOK, "plugin")
 				},
 			))
+			assertOfflineHostAdmissionMatchesOnline(t, registry.Generation(), outer.Routes())
 			require.NoError(t, registry.SetGenerationPreparer(builder.prepare))
 			outer.NoRoute(
 				(&pluginRouteDispatcher{registry: registry}).dispatch,
@@ -438,6 +504,7 @@ func TestHostNamespacesCarryOnlyBuiltInTopLevelRoutes(t *testing.T) {
 	builder := newPluginGenerationBuilder(outer.Routes(), nil, testPluginRouteHandlers(func(c *gin.Context, _ *jsplugin.RoutingGeneration, binding jsplugin.RouteBinding) {
 		c.String(http.StatusOK, binding.Plugin.Meta.Key)
 	}))
+	assertOfflineHostAdmissionMatchesOnline(t, registry.Generation(), outer.Routes())
 	require.NoError(t, registry.SetGenerationPreparer(builder.prepare))
 	outer.NoRoute(
 		(&pluginRouteDispatcher{registry: registry}).dispatch,

@@ -104,7 +104,7 @@ func prepareGatewayTaskRoute(c *gin.Context, selection *service.GatewaySelection
 		return nil, service.ErrGatewayUnavailable
 	}
 	candidate.Set("task_gateway_channel_selected", false)
-	info := &relaycommon.RelayInfo{UserId: c.GetInt("id"), TokenId: c.GetInt("token_id"), UsingGroup: common.GetContextKeyString(c, constant.ContextKeyUserGroup), OriginModelName: requested, StartTime: started, RequestId: requestID, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: publicTaskID}, ResponseFacts: &relaycommon.ResponseFacts{}}
+	info := &relaycommon.RelayInfo{UserId: c.GetInt("id"), TokenId: c.GetInt("token_id"), UserGroup: common.GetContextKeyString(c, constant.ContextKeyUserGroup), UsingGroup: common.GetContextKeyString(c, constant.ContextKeyUserGroup), OriginModelName: requested, StartTime: started, RequestId: requestID, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: publicTaskID}, ResponseFacts: &relaycommon.ResponseFacts{}}
 	info.InitChannelMeta(candidate)
 	var overrides map[string]any
 	if err := common.UnmarshalJsonStr(selection.Channel.ParameterOverrides, &overrides); err != nil {
@@ -114,7 +114,9 @@ func prepareGatewayTaskRoute(c *gin.Context, selection *service.GatewaySelection
 	info.Action = c.GetString("task_action")
 	info.UpstreamModelName = selection.Channel.UpstreamModelName
 	if len(origins) > 0 {
-		info.UpstreamModelName = origins[0].Properties.UpstreamModelName
+		if origins[0].Properties.UpstreamModelName != "" {
+			info.UpstreamModelName = origins[0].Properties.UpstreamModelName
+		}
 		info.OriginTaskID = origins[0].GetUpstreamTaskID()
 		for _, origin := range origins {
 			info.OriginTasks = append(info.OriginTasks, relaycommon.OriginTaskRef{TaskID: origin.TaskID, UpstreamTaskID: origin.GetUpstreamTaskID(), Action: origin.Action, Status: string(origin.Status), Data: origin.Data})
@@ -193,7 +195,7 @@ func prepareGatewayTaskRoute(c *gin.Context, selection *service.GatewaySelection
 		return nil, service.ErrGatewayCapability
 	}
 	retainedFacts := retainedGatewayTaskFacts(baselineFacts, facts, baselineErr, overrides)
-	if len(origins) > 0 {
+	if len(origins) > 0 && origins[0].PrivateData.Gateway != nil {
 		merged := maps.Clone(origins[0].PrivateData.Gateway.Facts)
 		maps.Copy(merged, facts)
 		facts = merged

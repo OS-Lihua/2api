@@ -2,10 +2,14 @@ package service
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -16,8 +20,7 @@ import (
 // NotifyChannelWatchers sends a channel notice (a channel disabled or enabled
 // automatically, or a test of all channels finished) to every administrator
 // who receives channel notices. Until they choose, the root user receives them
-// and other administrators do not. render builds the subject and content in
-// the recipient's saved language; an empty language means DEFAULT_LANGUAGE.
+// and other administrators do not; render uses each recipient's saved language.
 func NotifyChannelWatchers(notifyType string, render func(lang string) (subject string, content string)) {
 	notifyAdmins(notifyType, func(role int, setting dto.UserSetting) bool {
 		if setting.ChannelNotifyEnabled != nil {
@@ -28,8 +31,7 @@ func NotifyChannelWatchers(notifyType string, render func(lang string) (subject 
 }
 
 // NotifyUpstreamModelUpdateWatchers sends the upstream model update notice to
-// every administrator who enabled it. render builds the subject and content in
-// the recipient's saved language; an empty language means DEFAULT_LANGUAGE.
+// every administrator who enabled it, in their saved language.
 func NotifyUpstreamModelUpdateWatchers(render func(lang string) (subject string, content string)) {
 	sentCount := notifyAdmins(dto.NotifyTypeChannelUpdate, func(_ int, setting dto.UserSetting) bool {
 		return setting.UpstreamModelUpdateNotifyEnabled
@@ -37,8 +39,6 @@ func NotifyUpstreamModelUpdateWatchers(render func(lang string) (subject string,
 	common.SysLog(common.LogText("upstream model update notifications sent: %d", sentCount))
 }
 
-// notifyAdmins sends a notice to each enabled administrator for whom receives
-// returns true, and returns how many notices it sent.
 func notifyAdmins(notifyType string, receives func(role int, setting dto.UserSetting) bool, render func(lang string) (subject string, content string)) int {
 	var users []model.User
 	if err := model.DB.
@@ -65,232 +65,190 @@ func notifyAdmins(notifyType string, receives func(role int, setting dto.UserSet
 	return sentCount
 }
 
-func NotifyUser(userId int, userEmail string, userSetting dto.UserSetting, data dto.Notify) error {
-	notifyType := userSetting.NotifyType
-	if notifyType == "" {
-		notifyType = dto.NotifyTypeEmail
-	}
+type NotificationDeliveryStatus string
 
-	// Check notification limit
+const (
+	NotificationAccepted     NotificationDeliveryStatus = "accepted"
+	NotificationUnconfigured NotificationDeliveryStatus = "unconfigured"
+	NotificationRetry        NotificationDeliveryStatus = "retry"
+	NotificationRejected     NotificationDeliveryStatus = "rejected"
+)
+
+// NotificationDeliveryResult contains only controlled diagnostics. Acceptance
+// means the selected transport acknowledged the message, not that a person read it.
+type NotificationDeliveryResult struct {
+	Status NotificationDeliveryStatus
+	Code   string
+}
+
+var errNotificationDestination = errors.New("invalid notification destination")
+
+type notificationHTTPStatusError struct{ status int }
+
+func (err *notificationHTTPStatusError) Error() string {
+	return fmt.Sprintf("notification transport returned HTTP %d", err.status)
+}
+
+type notificationTransportError struct{ cause error }
+
+func (err *notificationTransportError) Error() string { return "notification transport failed" }
+func (err *notificationTransportError) Unwrap() error { return err.cause }
+
+// DeliverUserNotification performs one attempt without the legacy in-memory
+// limiter. Durable callers claim their attempt budget before entering this API.
+func DeliverUserNotification(ctx context.Context, userEmail string, setting dto.UserSetting, data dto.Notify) NotificationDeliveryResult {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	var err error
+	useWorker := system_setting.EnableWorker()
+	if err = ctx.Err(); err == nil {
+		switch setting.NotifyType {
+		case "", dto.NotifyTypeEmail:
+			address := setting.NotificationEmail
+			if address == "" {
+				address = userEmail
+			}
+			if address == "" {
+				return NotificationDeliveryResult{NotificationUnconfigured, model.BalanceReminderNotConfigured}
+			}
+			err = common.SendEmailWithContext(ctx, data.Title, address, notificationContent(data))
+		case dto.NotifyTypeWebhook:
+			if setting.WebhookUrl == "" {
+				return NotificationDeliveryResult{NotificationUnconfigured, model.BalanceReminderNotConfigured}
+			}
+			err = SendWebhookNotifyWithContext(ctx, setting.WebhookUrl, setting.WebhookSecret, data)
+		case dto.NotifyTypeBark:
+			if setting.BarkUrl == "" {
+				return NotificationDeliveryResult{NotificationUnconfigured, model.BalanceReminderNotConfigured}
+			}
+			finalURL := strings.ReplaceAll(setting.BarkUrl, "{{title}}", url.QueryEscape(data.Title))
+			finalURL = strings.ReplaceAll(finalURL, "{{content}}", url.QueryEscape(notificationContent(data)))
+			err = sendNotificationRequest(ctx, useWorker, http.MethodGet, finalURL, map[string]string{"User-Agent": "OneAPI-Bark-Notify/1.0"}, nil)
+		case dto.NotifyTypeGotify:
+			if setting.GotifyUrl == "" || setting.GotifyToken == "" {
+				return NotificationDeliveryResult{NotificationUnconfigured, model.BalanceReminderNotConfigured}
+			}
+			priority := setting.GotifyPriority
+			if priority < 0 || priority > 10 {
+				priority = 5
+			}
+			var body []byte
+			body, err = common.Marshal(struct {
+				Title    string `json:"title"`
+				Message  string `json:"message"`
+				Priority int    `json:"priority"`
+			}{data.Title, notificationContent(data), priority})
+			if err == nil {
+				finalURL := strings.TrimSuffix(setting.GotifyUrl, "/") + "/message?token=" + url.QueryEscape(setting.GotifyToken)
+				headers := map[string]string{"Content-Type": "application/json; charset=utf-8", "User-Agent": "NewAPI-Gotify-Notify/1.0"}
+				if useWorker {
+					headers["User-Agent"] = "OneAPI-Gotify-Notify/1.0"
+				}
+				err = sendNotificationRequest(ctx, useWorker, http.MethodPost, finalURL, headers, body)
+			}
+		default:
+			return NotificationDeliveryResult{NotificationRejected, model.BalanceReminderInvalidDestination}
+		}
+	}
+	if err == nil {
+		return NotificationDeliveryResult{NotificationAccepted, model.BalanceReminderDelivered}
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+		return NotificationDeliveryResult{NotificationRetry, model.BalanceReminderCancelled}
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return NotificationDeliveryResult{NotificationRetry, model.BalanceReminderTimeout}
+	}
+	if errors.Is(err, errNotificationDestination) {
+		return NotificationDeliveryResult{NotificationRejected, model.BalanceReminderInvalidDestination}
+	}
+	status := 0
+	var statusError *notificationHTTPStatusError
+	if errors.As(err, &statusError) {
+		status = statusError.status
+	}
+	var emailError *common.EmailDeliveryError
+	if errors.As(err, &emailError) {
+		if emailError.NotConfigured {
+			return NotificationDeliveryResult{NotificationUnconfigured, model.BalanceReminderNotConfigured}
+		}
+		if emailError.InvalidRecipient {
+			return NotificationDeliveryResult{NotificationRejected, model.BalanceReminderInvalidDestination}
+		}
+		status = emailError.HTTPStatus
+	}
+	var smtpError *textproto.Error
+	if errors.As(err, &smtpError) && smtpError.Code >= 500 && smtpError.Code < 600 {
+		return NotificationDeliveryResult{NotificationRejected, model.BalanceReminderTransportRejected}
+	}
+	if status >= 300 && status < 500 && status != 408 && status != 425 && status != 429 {
+		return NotificationDeliveryResult{NotificationRejected, model.BalanceReminderTransportRejected}
+	}
+	return NotificationDeliveryResult{NotificationRetry, model.BalanceReminderDeliveryFailed}
+}
+
+// NotifyUser retains the existing limiter and nil-on-unconfigured contract for
+// older notice callers. Durable delivery must use the explicit result above.
+func NotifyUser(userId int, userEmail string, userSetting dto.UserSetting, data dto.Notify) error {
 	canSend, err := CheckNotificationLimit(userId, data.Type)
 	if err != nil {
-		common.SysLog(common.LogText("failed to check notification limit: %s", err.Error()))
-		return err
+		return errors.New("notification limit check failed")
 	}
 	if !canSend {
-		return fmt.Errorf("notification limit exceeded for user %d with type %s", userId, notifyType)
+		return errors.New("notification limit exceeded")
 	}
-
-	switch notifyType {
-	case dto.NotifyTypeEmail:
-		// 优先使用设置中的通知邮箱，如果为空则使用用户的默认邮箱
-		emailToUse := userSetting.NotificationEmail
-		if emailToUse == "" {
-			emailToUse = userEmail
-		}
-		if emailToUse == "" {
-			common.SysLog(common.LogText("user %d has no email, skip sending email", userId))
-			return nil
-		}
-		return sendEmailNotify(emailToUse, data)
-	case dto.NotifyTypeWebhook:
-		webhookURLStr := userSetting.WebhookUrl
-		if webhookURLStr == "" {
-			common.SysLog(common.LogText("user %d has no webhook url, skip sending webhook", userId))
-			return nil
-		}
-
-		// 获取 webhook secret
-		webhookSecret := userSetting.WebhookSecret
-		return SendWebhookNotify(webhookURLStr, webhookSecret, data)
-	case dto.NotifyTypeBark:
-		barkURL := userSetting.BarkUrl
-		if barkURL == "" {
-			common.SysLog(common.LogText("user %d has no bark url, skip sending bark", userId))
-			return nil
-		}
-		return sendBarkNotify(barkURL, data)
-	case dto.NotifyTypeGotify:
-		gotifyUrl := userSetting.GotifyUrl
-		gotifyToken := userSetting.GotifyToken
-		if gotifyUrl == "" || gotifyToken == "" {
-			common.SysLog(common.LogText("user %d has no gotify url or token, skip sending gotify", userId))
-			return nil
-		}
-		return sendGotifyNotify(gotifyUrl, gotifyToken, userSetting.GotifyPriority, data)
+	result := DeliverUserNotification(context.Background(), userEmail, userSetting, data)
+	if result.Status == NotificationAccepted || result.Status == NotificationUnconfigured {
+		return nil
 	}
-	return nil
+	return errors.New(result.Code)
 }
 
-func sendEmailNotify(userEmail string, data dto.Notify) error {
-	// make email content
-	content := data.Content
-	// 处理占位符
-	for _, value := range data.Values {
-		content = strings.Replace(content, dto.ContentValueParam, fmt.Sprintf("%v", value), 1)
-	}
-	return common.SendEmail(data.Title, userEmail, content)
-}
-
-func sendBarkNotify(barkURL string, data dto.Notify) error {
-	// 处理占位符
+func notificationContent(data dto.Notify) string {
 	content := data.Content
 	for _, value := range data.Values {
 		content = strings.Replace(content, dto.ContentValueParam, fmt.Sprintf("%v", value), 1)
 	}
+	return content
+}
 
-	// 替换模板变量
-	finalURL := strings.ReplaceAll(barkURL, "{{title}}", url.QueryEscape(data.Title))
-	finalURL = strings.ReplaceAll(finalURL, "{{content}}", url.QueryEscape(content))
-
-	// 发送GET请求到Bark
-	var req *http.Request
-	var resp *http.Response
+// sendNotificationRequest shares the existing Worker/SSRF policy across all
+// notification transports, with real cancellation through DNS and network I/O.
+func sendNotificationRequest(ctx context.Context, useWorker bool, method, destination string, headers map[string]string, body []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	var response *http.Response
 	var err error
-
-	if system_setting.EnableWorker() {
-		// 使用worker发送请求
-		workerReq := &WorkerRequest{
-			URL:    finalURL,
-			Key:    system_setting.WorkerValidKey,
-			Method: http.MethodGet,
-			Headers: map[string]string{
-				"User-Agent": "OneAPI-Bark-Notify/1.0",
-			},
-		}
-
-		resp, err = DoWorkerRequest(workerReq)
-		if err != nil {
-			return fmt.Errorf("failed to send bark request through worker: %v", err)
-		}
-		defer resp.Body.Close()
-
-		// 检查响应状态
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return fmt.Errorf("bark request failed with status code: %d", resp.StatusCode)
-		}
+	if useWorker {
+		response, err = DoWorkerRequestWithContext(ctx, &WorkerRequest{
+			URL: destination, Key: system_setting.WorkerValidKey, Method: method, Headers: headers, Body: body,
+		})
 	} else {
-		// SSRF防护：验证Bark URL（非Worker模式）
-		if err := ValidateSSRFProtectedFetchURL(finalURL); err != nil {
-			return fmt.Errorf("request reject: %v", err)
+		if err = ValidateSSRFProtectedFetchURLWithContext(ctx, destination); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return errNotificationDestination
 		}
-
-		// 直接发送请求
-		req, err = http.NewRequest(http.MethodGet, finalURL, nil)
+		var request *http.Request
+		request, err = http.NewRequestWithContext(ctx, method, destination, bytes.NewReader(body))
 		if err != nil {
-			return fmt.Errorf("failed to create bark request: %v", err)
+			return errNotificationDestination
 		}
-
-		// 设置User-Agent
-		req.Header.Set("User-Agent", "OneAPI-Bark-Notify/1.0")
-
-		// 发送请求
-		client := GetSSRFProtectedHTTPClient()
-		resp, err = client.Do(req)
-		if err != nil {
-			return fmt.Errorf("failed to send bark request: %v", err)
+		for key, value := range headers {
+			request.Header.Set(key, value)
 		}
-		defer resp.Body.Close()
-
-		// 检查响应状态
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return fmt.Errorf("bark request failed with status code: %d", resp.StatusCode)
-		}
+		response, err = GetSSRFProtectedHTTPClient().Do(request)
 	}
-
-	return nil
-}
-
-func sendGotifyNotify(gotifyUrl string, gotifyToken string, priority int, data dto.Notify) error {
-	// 处理占位符
-	content := data.Content
-	for _, value := range data.Values {
-		content = strings.Replace(content, dto.ContentValueParam, fmt.Sprintf("%v", value), 1)
-	}
-
-	// 构建完整的 Gotify API URL
-	// 确保 URL 以 /message 结尾
-	finalURL := strings.TrimSuffix(gotifyUrl, "/") + "/message?token=" + url.QueryEscape(gotifyToken)
-
-	// Gotify优先级范围0-10，如果超出范围则使用默认值5
-	if priority < 0 || priority > 10 {
-		priority = 5
-	}
-
-	// 构建 JSON payload
-	type GotifyMessage struct {
-		Title    string `json:"title"`
-		Message  string `json:"message"`
-		Priority int    `json:"priority"`
-	}
-
-	payload := GotifyMessage{
-		Title:    data.Title,
-		Message:  content,
-		Priority: priority,
-	}
-
-	// 序列化为 JSON
-	payloadBytes, err := common.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("failed to marshal gotify payload: %v", err)
+		return &notificationTransportError{cause: err}
 	}
-
-	var req *http.Request
-	var resp *http.Response
-
-	if system_setting.EnableWorker() {
-		// 使用worker发送请求
-		workerReq := &WorkerRequest{
-			URL:    finalURL,
-			Key:    system_setting.WorkerValidKey,
-			Method: http.MethodPost,
-			Headers: map[string]string{
-				"Content-Type": "application/json; charset=utf-8",
-				"User-Agent":   "OneAPI-Gotify-Notify/1.0",
-			},
-			Body: payloadBytes,
-		}
-
-		resp, err = DoWorkerRequest(workerReq)
-		if err != nil {
-			return fmt.Errorf("failed to send gotify request through worker: %v", err)
-		}
-		defer resp.Body.Close()
-
-		// 检查响应状态
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return fmt.Errorf("gotify request failed with status code: %d", resp.StatusCode)
-		}
-	} else {
-		// SSRF防护：验证Gotify URL（非Worker模式）
-		if err := ValidateSSRFProtectedFetchURL(finalURL); err != nil {
-			return fmt.Errorf("request reject: %v", err)
-		}
-
-		// 直接发送请求
-		req, err = http.NewRequest(http.MethodPost, finalURL, bytes.NewBuffer(payloadBytes))
-		if err != nil {
-			return fmt.Errorf("failed to create gotify request: %v", err)
-		}
-
-		// 设置请求头
-		req.Header.Set("Content-Type", "application/json; charset=utf-8")
-		req.Header.Set("User-Agent", "NewAPI-Gotify-Notify/1.0")
-
-		// 发送请求
-		client := GetSSRFProtectedHTTPClient()
-		resp, err = client.Do(req)
-		if err != nil {
-			return fmt.Errorf("failed to send gotify request: %v", err)
-		}
-		defer resp.Body.Close()
-
-		// 检查响应状态
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return fmt.Errorf("gotify request failed with status code: %d", resp.StatusCode)
-		}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return &notificationHTTPStatusError{status: response.StatusCode}
 	}
-
 	return nil
 }

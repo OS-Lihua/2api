@@ -29,13 +29,6 @@ export type HealthSettings = {
   AutomaticEnableChannelEnabled: boolean
   AutomaticDisableKeywords: string
   AutomaticDisableStatusCodes: string
-  'monitor_setting.auto_test_channel_enabled': boolean
-  'monitor_setting.auto_test_channel_minutes': number
-  'monitor_setting.channel_test_concurrency': number
-  'monitor_setting.channel_test_mode':
-    | 'scheduled_all'
-    | 'auto_ban_only'
-    | 'passive_recovery'
 }
 export type FilteringSettings = Pick<
   SecuritySettings,
@@ -55,10 +48,6 @@ export const defaultRequestPolicySettings: RequestPolicySettings = {
   AutomaticEnableChannelEnabled: false,
   AutomaticDisableKeywords: '',
   AutomaticDisableStatusCodes: '401',
-  'monitor_setting.auto_test_channel_enabled': false,
-  'monitor_setting.auto_test_channel_minutes': 10,
-  'monitor_setting.channel_test_concurrency': 1,
-  'monitor_setting.channel_test_mode': 'scheduled_all',
   'channel_affinity_setting.enabled': false,
   'channel_affinity_setting.session_mode': '',
   'channel_affinity_setting.switch_on_success': true,

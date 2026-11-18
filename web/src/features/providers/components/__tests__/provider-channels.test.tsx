@@ -37,6 +37,11 @@ import { createInstance } from 'i18next'
 import { I18nextProvider } from 'react-i18next'
 import { afterEach, expect, it, vi } from 'vitest'
 
+import { ModelConnections } from '@/features/models/components/model-connections'
+import type { Model } from '@/features/models/types'
+import en from '@/i18n/locales/en.json'
+import fr from '@/i18n/locales/fr.json'
+import zh from '@/i18n/locales/zh.json'
 import { api } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth-store'
 
@@ -58,6 +63,436 @@ afterEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
   useAuthStore.getState().auth.reset()
+})
+
+const savedModel: Model = {
+  id: 2,
+  model_name: 'same-name',
+  name_rule: 0,
+  status: 1,
+  sync_official: 0,
+  created_time: 1,
+  updated_time: 1,
+  supported_endpoints: ['openai_chat'],
+}
+
+it('loads Model connections by stable ID through the shared read-only Channel table', async () => {
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
+  const get = vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        items: [
+          {
+            id: 31,
+            provider_id: 7,
+            model_id: 2,
+            protocol: 'openai_chat',
+            upstream_model_name: 'actual-upstream',
+            status: 'pending',
+            mapping_confirmed: false,
+          },
+        ],
+        total: 1,
+      },
+    },
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <ModelConnections model={savedModel} />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  expect(await screen.findByText('actual-upstream')).toBeVisible()
+  expect(get).toHaveBeenCalledWith('/api/admin/v1/channels', {
+    params: { model_id: 2, p: 1, page_size: 10 },
+    signal: expect.any(AbortSignal),
+  })
+  expect(
+    screen.getByRole('columnheader', { name: 'Provider ID' })
+  ).toBeVisible()
+  expect(screen.getByText('Pending confirmation')).toBeVisible()
+  for (const name of [
+    'New Channel',
+    'Edit',
+    'Delete',
+    'Confirm mapping',
+    'Capability probes',
+  ]) {
+    expect(screen.queryByRole('button', { name })).not.toBeInTheDocument()
+  }
+  expect(screen.queryByText('Enable Groups')).not.toBeInTheDocument()
+  expect(
+    screen.getByText(
+      'Native endpoints declared by channels and model metadata. Actual availability depends on the selected route and request.'
+    )
+  ).toBeVisible()
+  expect(
+    get.mock.calls.every(([url]) => url === '/api/admin/v1/channels')
+  ).toBe(true)
+  client.clear()
+})
+
+function channelResponse(name: string, modelId = 2, total = 1) {
+  return {
+    data: {
+      success: true,
+      data: {
+        items: name
+          ? [
+              {
+                id: modelId * 10,
+                provider_id: 7,
+                model_id: modelId,
+                protocol: 'openai_chat',
+                upstream_model_name: name,
+                status: 'enabled',
+                mapping_confirmed: true,
+              },
+            ]
+          : [],
+        total,
+      },
+    },
+  }
+}
+function channelSession(sid: string) {
+  useAuthStore.setState((state) => ({
+    auth: {
+      ...state.auth,
+      session: {
+        sid,
+        current: true,
+        login_method: 'password',
+        ip: '',
+        user_agent: '',
+        created_at: 1,
+        last_active_at: 1,
+        expires_at: 9999999999,
+      },
+    },
+  }))
+}
+function mountConnections(initial: Model = savedModel) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  const element = (model: Model) => (
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <ModelConnections model={model} />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  const result = render(element(initial))
+  return { client, rerender: (model: Model) => result.rerender(element(model)) }
+}
+
+it('requires channel:read separately from model:read and never requests Provider names', async () => {
+  useAuthStore.getState().auth.setUser({
+    id: 8,
+    username: 'metadata-reader',
+    role: 10,
+    permissions: {
+      admin_permissions: {
+        model: { read: true },
+        channel: { write: true, operate: true },
+      },
+    },
+  })
+  const get = vi
+    .spyOn(api, 'get')
+    .mockResolvedValue(channelResponse('forbidden'))
+  const { client } = mountConnections()
+  expect(screen.getByRole('status')).toHaveTextContent(
+    'Channel read permission is required to view connections.'
+  )
+  expect(get).not.toHaveBeenCalled()
+  expect(screen.queryByRole('table')).not.toBeInTheDocument()
+  await act(() =>
+    useAuthStore.getState().auth.setUser({
+      id: 8,
+      username: 'metadata-reader',
+      role: 10,
+      permissions: {
+        admin_permissions: { model: { read: true }, channel: { read: true } },
+      },
+    })
+  )
+  expect(await screen.findByText('forbidden')).toBeVisible()
+  expect(
+    get.mock.calls.every(([url]) => url === '/api/admin/v1/channels')
+  ).toBe(true)
+  expect(
+    screen.queryByRole('button', { name: 'New Channel' })
+  ).not.toBeInTheDocument()
+  client.clear()
+})
+
+it.each([
+  { id: 0, name_rule: 0 },
+  { id: 2, name_rule: 1 },
+])(
+  'does not infer Channels from unsaved or rule metadata $id/$name_rule',
+  (identity) => {
+    useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
+    const get = vi.spyOn(api, 'get')
+    const { client } = mountConnections({ ...savedModel, ...identity })
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Connections require a saved exact-name Model. Metadata rules do not bind Channels.'
+    )
+    expect(get).not.toHaveBeenCalled()
+    client.clear()
+  }
+)
+
+it('isolates same-name Model IDs, keeps a renamed ID, and cancels late target responses', async () => {
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
+  let finish: (value: ReturnType<typeof channelResponse>) => void = () => {}
+  const pending = new Promise<ReturnType<typeof channelResponse>>((resolve) => {
+    finish = resolve
+  })
+  const get = vi
+    .spyOn(api, 'get')
+    .mockImplementation((_url, config) =>
+      (config?.params as { model_id?: number } | undefined)?.model_id === 2
+        ? pending
+        : Promise.resolve(channelResponse('second-ID', 3))
+    )
+  const { client, rerender } = mountConnections()
+  await waitFor(() => expect(get).toHaveBeenCalledOnce())
+  const firstSignal = get.mock.calls[0][1]?.signal
+  rerender({ ...savedModel, id: 3 })
+  expect(await screen.findByText('second-ID')).toBeVisible()
+  expect(firstSignal?.aborted).toBe(true)
+  await act(async () => finish(channelResponse('late-first-ID')))
+  expect(screen.queryByText('late-first-ID')).not.toBeInTheDocument()
+  rerender({ ...savedModel, id: 3, model_name: 'renamed' })
+  expect(screen.getByText('second-ID')).toBeVisible()
+  expect(get).toHaveBeenCalledTimes(2)
+  expect(get.mock.calls.map(([, config]) => config?.params)).toEqual([
+    { model_id: 2, p: 1, page_size: 10 },
+    { model_id: 3, p: 1, page_size: 10 },
+  ])
+  client.clear()
+})
+
+it.each(['actor', 'session', 'permission'] as const)(
+  'discards late Channels after changing %s',
+  async (change) => {
+    useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
+    channelSession('before')
+    let finish: (value: ReturnType<typeof channelResponse>) => void = () => {}
+    const pending = new Promise<ReturnType<typeof channelResponse>>(
+      (resolve) => {
+        finish = resolve
+      }
+    )
+    const get = vi
+      .spyOn(api, 'get')
+      .mockReturnValueOnce(pending)
+      .mockResolvedValue(channelResponse('current-scope'))
+    const { client } = mountConnections()
+    await waitFor(() => expect(get).toHaveBeenCalledOnce())
+    const signal = get.mock.calls[0][1]?.signal
+    await act(() => {
+      if (change === 'session') channelSession('after')
+      else if (change === 'actor') {
+        useAuthStore
+          .getState()
+          .auth.setUser({ id: 9, username: 'other', role: 100 })
+      } else {
+        useAuthStore.getState().auth.setUser({
+          id: 1,
+          username: 'root',
+          role: 10,
+          permissions: { admin_permissions: { model: { read: true } } },
+        })
+      }
+    })
+    expect(signal?.aborted).toBe(true)
+    if (change === 'permission') {
+      expect(screen.getByRole('status')).toHaveTextContent(
+        'Channel read permission is required'
+      )
+    } else expect(await screen.findByText('current-scope')).toBeVisible()
+    await act(async () => finish(channelResponse('old-private-channel')))
+    expect(screen.queryByText('old-private-channel')).not.toBeInTheDocument()
+    expect(get).toHaveBeenCalledTimes(change === 'permission' ? 1 : 2)
+    client.clear()
+  }
+)
+
+it('keeps Channel load errors distinct from an empty result and retries the current ID', async () => {
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
+  const get = vi
+    .spyOn(api, 'get')
+    .mockRejectedValueOnce(new Error('Load rejected'))
+    .mockResolvedValue(channelResponse('', 2, 0))
+  const { client } = mountConnections()
+  expect(await screen.findByRole('button', { name: 'Retry' })).toBeVisible()
+  expect(screen.queryByText('No channels found')).not.toBeInTheDocument()
+  await userEvent.click(screen.getByRole('button', { name: 'Retry' }))
+  expect(await screen.findByText('No channels found')).toBeVisible()
+  expect(get).toHaveBeenCalledTimes(2)
+  expect(get).toHaveBeenLastCalledWith('/api/admin/v1/channels', {
+    params: { model_id: 2, p: 1, page_size: 10 },
+    signal: expect.any(AbortSignal),
+  })
+  client.clear()
+})
+
+it.each([
+  { write: false, operate: false },
+  { write: true, operate: false },
+  { write: false, operate: true },
+])(
+  'preserves separate Provider Channel write=$write and operate=$operate permissions',
+  async ({ write, operate }) => {
+    useAuthStore.getState().auth.setUser({
+      id: 8,
+      username: 'channel-reader',
+      role: 10,
+      permissions: {
+        admin_permissions: { channel: { read: true, write, operate } },
+      },
+    })
+    const get = vi
+      .spyOn(api, 'get')
+      .mockResolvedValue(channelResponse('provider-upstream'))
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    render(
+      <I18nextProvider i18n={i18n}>
+        <QueryClientProvider client={client}>
+          <ProviderChannels providerId={7} />
+        </QueryClientProvider>
+      </I18nextProvider>
+    )
+    expect(await screen.findByText('provider-upstream')).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'New Channel' }) !== null).toBe(
+      write
+    )
+    expect(screen.queryByRole('button', { name: 'Edit' }) !== null).toBe(write)
+    expect(screen.queryByRole('button', { name: 'Delete' }) !== null).toBe(
+      write
+    )
+    expect(screen.queryByRole('button', { name: 'Disable' }) !== null).toBe(
+      operate
+    )
+    expect(
+      screen.getByRole('button', { name: 'Capability probes' })
+    ).toBeVisible()
+    expect(get).toHaveBeenCalledWith('/api/admin/v1/channels', {
+      params: { provider_id: 7, p: 1, page_size: 10 },
+      signal: expect.any(AbortSignal),
+    })
+    client.clear()
+  }
+)
+
+it('does not refresh or finish an old Provider action after a session switch', async () => {
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
+  channelSession('action-before')
+  const get = vi
+    .spyOn(api, 'get')
+    .mockResolvedValue(channelResponse('provider-upstream'))
+  let finish: (value: { data: { success: boolean } }) => void = () => {}
+  const pending = new Promise<{ data: { success: boolean } }>((resolve) => {
+    finish = resolve
+  })
+  const post = vi.spyOn(api, 'post').mockReturnValue(pending)
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <ProviderChannels providerId={7} />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  await screen.findByText('provider-upstream')
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: 'Disable' }))
+  await user.click(
+    within(screen.getByRole('alertdialog')).getByRole('button', {
+      name: 'Continue',
+    })
+  )
+  await waitFor(() => expect(post).toHaveBeenCalledOnce())
+  await act(() => channelSession('action-after'))
+  await screen.findByText('provider-upstream')
+  const calls = get.mock.calls.length
+  await act(async () => finish({ data: { success: true } }))
+  expect(get).toHaveBeenCalledTimes(calls)
+  expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+  client.clear()
+})
+
+it('loads the next Channel page for the same Model ID without retaining prior rows', async () => {
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
+  const get = vi
+    .spyOn(api, 'get')
+    .mockResolvedValueOnce(channelResponse('first-page', 2, 11))
+    .mockResolvedValue(channelResponse('second-page', 2, 11))
+  const { client } = mountConnections()
+  await screen.findByText('first-page')
+  await userEvent.click(screen.getByRole('button', { name: 'Go to next page' }))
+  expect(await screen.findByText('second-page')).toBeVisible()
+  expect(screen.queryByText('first-page')).not.toBeInTheDocument()
+  expect(get).toHaveBeenLastCalledWith('/api/admin/v1/channels', {
+    params: { model_id: 2, p: 2, page_size: 10 },
+    signal: expect.any(AbortSignal),
+  })
+  client.clear()
+})
+
+it('keeps long read-only Channel names accessible on mobile while translated connection guidance changes', async () => {
+  const originalMatchMedia = window.matchMedia
+  vi.spyOn(window, 'matchMedia').mockImplementation((query) => ({
+    ...originalMatchMedia(query),
+    matches: query === '(max-width: 640px)',
+  }))
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
+  const name = `upstream-${'long-name-'.repeat(30)}`
+  const get = vi.spyOn(api, 'get').mockResolvedValue(channelResponse(name))
+  const translated = createInstance()
+  await translated.init({
+    lng: 'en',
+    resources: { en, fr, zh },
+    initAsync: false,
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  render(
+    <I18nextProvider i18n={translated}>
+      <QueryClientProvider client={client}>
+        <ModelConnections model={savedModel} />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  expect(await screen.findByText(name)).toBeVisible()
+  const guidance =
+    'Channel status does not establish a sale price, Offering access, or request availability.'
+  expect(screen.getByText(guidance)).toBeVisible()
+  await act(async () => translated.changeLanguage('fr'))
+  expect(screen.getByText(fr.translation[guidance])).toBeVisible()
+  expect(screen.getByText(name)).toBeVisible()
+  await act(async () => translated.changeLanguage('zh'))
+  expect(screen.getByText(zh.translation[guidance])).toBeVisible()
+  expect(screen.getByText(name)).toBeVisible()
+  expect(get).toHaveBeenCalledOnce()
+  expect(
+    screen.queryByRole('button', { name: zh.translation['New Channel'] })
+  ).not.toBeInTheDocument()
+  client.clear()
 })
 
 it('previews a batch, invalidates edited previews, and confirms before committing', async () => {
@@ -267,6 +702,7 @@ it('associates oversized upload errors with the file input and updates their lan
 })
 
 it('keyboard users expand and collapse one provider to load its channels', async () => {
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
   localStorage.clear()
   const get = vi.spyOn(api, 'get').mockImplementation(async (url) => {
     if (url === '/api/admin/v1/providers') {
@@ -333,6 +769,7 @@ it('keyboard users expand and collapse one provider to load its channels', async
   expect(await screen.findByText('No channels found')).toBeVisible()
   expect(get).toHaveBeenCalledWith('/api/admin/v1/channels', {
     params: { provider_id: 7, p: 1, page_size: 10 },
+    signal: expect.any(AbortSignal),
   })
   await userEvent.click(screen.getByRole('button', { name: 'Account A' }))
   await waitFor(() =>
@@ -350,7 +787,63 @@ it('keyboard users expand and collapse one provider to load its channels', async
   localStorage.clear()
 })
 
+it('allows authorized Channel creation by stable Model ID without bypassing model:read for names', async () => {
+  useAuthStore.getState().auth.setUser({
+    id: 8,
+    username: 'channel-writer',
+    role: 10,
+    permissions: {
+      admin_permissions: { channel: { read: true, write: true } },
+    },
+  })
+  const get = vi
+    .spyOn(api, 'get')
+    .mockResolvedValue({ data: { success: true, data: ['openai_chat'] } })
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValue({ data: { success: true, data: { id: 3 } } })
+  const saved = vi.fn()
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <ChannelMutateDrawer
+          providerId={7}
+          onClose={() => {}}
+          onSaved={saved}
+        />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  const user = userEvent.setup()
+  await user.type(
+    screen.getByRole('textbox', { name: 'Upstream model name' }),
+    'upstream-exact'
+  )
+  await user.type(screen.getByRole('textbox', { name: 'Model ID' }), '2')
+  expect(screen.getByRole('button', { name: 'Suggest Model' })).toBeDisabled()
+  await user.click(screen.getByRole('combobox', { name: 'Protocol' }))
+  await user.click(await screen.findByRole('option', { name: 'openai_chat' }))
+  await user.click(screen.getByRole('button', { name: 'Save changes' }))
+  await waitFor(() => expect(saved).toHaveBeenCalledOnce())
+  expect(post).toHaveBeenCalledWith(
+    '/api/admin/v1/channels',
+    expect.objectContaining({
+      provider_id: 7,
+      model_id: 2,
+      upstream_model_name: 'upstream-exact',
+    })
+  )
+  expect(
+    get.mock.calls.every(([url]) => url === '/api/admin/v1/channels/protocols')
+  ).toBe(true)
+  client.clear()
+})
+
 it('creating a channel suggests its Model, validates limits, and retains a rejected draft', async () => {
+  const longModelName = `legal-${'W'.repeat(250)}`
   useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
   vi.spyOn(api, 'get').mockImplementation(async (url) => {
     if (url === '/api/admin/v1/channels/protocols') {
@@ -360,12 +853,18 @@ it('creating a channel suggests its Model, validates limits, and retains a rejec
       return {
         data: {
           success: true,
-          data: { items: [{ id: 2, name: 'gpt-4o' }], selected_model_id: 2 },
+          data: {
+            items: [{ id: 2, name: longModelName }],
+            selected_model_id: 2,
+          },
         },
       }
     }
     return {
-      data: { success: true, data: { items: [{ id: 2, name: 'gpt-4o' }] } },
+      data: {
+        success: true,
+        data: { items: [{ id: 2, name: longModelName }] },
+      },
     }
   })
   let complete: (value: unknown) => void = () => {}
@@ -395,6 +894,17 @@ it('creating a channel suggests its Model, validates limits, and retains a rejec
     'openai/GPT-4o'
   )
   await userEvent.click(screen.getByRole('button', { name: 'Suggest Model' }))
+  const modelChoice = screen.getByRole('combobox', { name: 'Model' })
+  await waitFor(() => expect(modelChoice).toHaveTextContent(longModelName))
+  expect(modelChoice.closest('[data-slot="form-item"]')).toHaveClass(
+    'min-w-0',
+    'grid-cols-1'
+  )
+  expect(modelChoice).toHaveAttribute('title', longModelName)
+  await userEvent.click(modelChoice)
+  const option = await screen.findByRole('option', { name: longModelName })
+  expect(within(option).getByText(longModelName)).toHaveClass('wrap-anywhere')
+  await userEvent.click(option)
   await userEvent.click(screen.getByRole('combobox', { name: 'Protocol' }))
   await userEvent.click(
     await screen.findByRole('option', { name: 'openai_chat' })
@@ -436,6 +946,7 @@ it('creating a channel suggests its Model, validates limits, and retains a rejec
 })
 
 it('editing a channel clears overrides while saving zero limits and capability narrowing', async () => {
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
   const channel = {
     id: 3,
     provider_id: 7,
@@ -597,6 +1108,7 @@ it('opens capability probes and shows persisted results before activation', asyn
 })
 
 it('refreshes another administrator’s running probe and reconciles a failed submission', async () => {
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
   vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
   let status = 'running'
   vi.spyOn(api, 'get').mockImplementation(async () => ({
@@ -662,6 +1174,7 @@ it('refreshes another administrator’s running probe and reconciles a failed su
 })
 
 it('shows runtime circuit health separately from persistent Channel status', async () => {
+  useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
   vi.spyOn(api, 'get').mockResolvedValue({
     data: {
       success: true,
@@ -716,13 +1229,14 @@ it('shows runtime circuit health separately from persistent Channel status', asy
 })
 
 it('shows channels for this provider and confirms a pending mapping', async () => {
+  const longName = `legal-${'W'.repeat(250)}`
   useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
   const channel = {
     id: 3,
     provider_id: 7,
     model_id: 2,
     protocol: 'openai_chat',
-    upstream_model_name: 'gpt-4o',
+    upstream_model_name: longName,
     status: 'pending',
     mapping_confirmed: false,
     rpm: 60,
@@ -751,9 +1265,11 @@ it('shows channels for this provider and confirms a pending mapping', async () =
       </QueryClientProvider>
     </I18nextProvider>
   )
-  expect(await screen.findByText('gpt-4o')).toBeVisible()
+  expect(await screen.findByText(longName)).toBeVisible()
   await userEvent.click(screen.getByRole('button', { name: 'Confirm mapping' }))
-  expect(await screen.findByRole('alertdialog')).toBeVisible()
+  const dialog = await screen.findByRole('alertdialog')
+  expect(dialog).toBeVisible()
+  expect(within(dialog).getByText(longName)).toHaveClass('wrap-anywhere')
   await userEvent.click(screen.getByRole('button', { name: 'Continue' }))
   expect(post).toHaveBeenCalledWith('/api/admin/v1/channels/3/confirm')
 })

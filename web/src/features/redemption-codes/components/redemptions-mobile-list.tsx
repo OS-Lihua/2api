@@ -31,7 +31,8 @@ import {
   EmptyTitle,
 } from '@/components/ui/empty'
 import { Skeleton } from '@/components/ui/skeleton'
-import { formatQuota } from '@/lib/format'
+import { toIntlLocale } from '@/i18n/languages'
+import { formatMoneyAmount } from '@/lib/currency'
 import { cn } from '@/lib/utils'
 
 import { REDEMPTION_STATUS, REDEMPTION_STATUSES } from '../constants'
@@ -76,7 +77,8 @@ interface RedemptionsMobileListProps {
 }
 
 export function RedemptionsMobileList(props: RedemptionsMobileListProps) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const rows = props.table.getRowModel().rows
 
   if (props.isLoading) return <RedemptionsMobileSkeleton />
@@ -162,9 +164,9 @@ export function RedemptionsMobileList(props: RedemptionsMobileListProps) {
             </div>
 
             <div className='flex items-center justify-between gap-2 text-xs'>
-              <span className='text-muted-foreground'>{t('Quota')}</span>
+              <span className='text-muted-foreground'>{t('Amount')}</span>
               <span className='font-medium tabular-nums'>
-                {formatQuota(redemption.quota)}
+                {formatMoneyAmount(redemption.amount, locale)}
               </span>
             </div>
           </div>

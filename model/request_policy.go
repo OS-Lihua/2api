@@ -41,7 +41,6 @@ func requestPolicyDefaultOptions() map[string]string {
 	defaults := make(map[string]string)
 	for prefix, value := range map[string]any{
 		"channel_affinity_setting.": operation_setting.GetChannelAffinitySetting(),
-		"monitor_setting.":          operation_setting.GetMonitorSetting(),
 	} {
 		fields, err := config.ConfigToMap(value)
 		if err != nil {
@@ -64,12 +63,20 @@ func requestPolicyDefaultOptions() map[string]string {
 	return defaults
 }
 
+func IsRetiredChannelMaintenanceOption(key string) bool {
+	switch key {
+	case "monitor_setting.auto_test_channel_enabled", "monitor_setting.auto_test_channel_minutes", "monitor_setting.channel_test_mode", "monitor_setting.channel_test_concurrency":
+		return true
+	}
+	return false
+}
+
 func IsRequestPolicyOption(key string) bool {
 	if strings.HasPrefix(key, "channel_affinity_setting.") {
 		return true
 	}
 	switch key {
-	case "CheckSensitiveEnabled", "CheckSensitiveOnPromptEnabled", "SensitiveWords", "AutomaticEnableChannelEnabled", "ChannelDisableThreshold", "monitor_setting.auto_test_channel_enabled", "monitor_setting.auto_test_channel_minutes", "monitor_setting.channel_test_concurrency", "monitor_setting.channel_test_mode", "RetryTimes", "AutomaticRetryStatusCodes", "AutomaticDisableChannelEnabled", "AutomaticDisableStatusCodes", "AutomaticDisableKeywords":
+	case "CheckSensitiveEnabled", "CheckSensitiveOnPromptEnabled", "SensitiveWords", "AutomaticEnableChannelEnabled", "ChannelDisableThreshold", "RetryTimes", "AutomaticRetryStatusCodes", "AutomaticDisableChannelEnabled", "AutomaticDisableStatusCodes", "AutomaticDisableKeywords":
 		return true
 	}
 	return false
@@ -96,7 +103,11 @@ func BuildRequestPolicy(options map[string]string) (*RequestPolicySnapshot, erro
 			raw[key] = value
 		}
 	}
-	maps.Copy(raw, options)
+	for key, value := range options {
+		if !IsRetiredChannelMaintenanceOption(key) {
+			raw[key] = value
+		}
+	}
 	snapshot := &RequestPolicySnapshot{Options: raw}
 	affinityFields := map[string]string{}
 	for key, value := range raw {
@@ -143,7 +154,7 @@ func BuildRequestPolicy(options map[string]string) (*RequestPolicySnapshot, erro
 		return nil, err
 	}
 	snapshot.DisableKeywords = strings.Split(raw["AutomaticDisableKeywords"], "\n")
-	for _, key := range []string{"CheckSensitiveEnabled", "CheckSensitiveOnPromptEnabled", "AutomaticEnableChannelEnabled", "monitor_setting.auto_test_channel_enabled"} {
+	for _, key := range []string{"CheckSensitiveEnabled", "CheckSensitiveOnPromptEnabled", "AutomaticEnableChannelEnabled"} {
 		if _, err := strconv.ParseBool(raw[key]); err != nil {
 			return nil, fmt.Errorf("invalid boolean: %s", key)
 		}
@@ -154,10 +165,7 @@ func BuildRequestPolicy(options map[string]string) (*RequestPolicySnapshot, erro
 			snapshot.TextKeywords = append(snapshot.TextKeywords, word)
 		}
 	}
-	if err := operation_setting.ValidateChannelTestConcurrency(raw["monitor_setting.channel_test_concurrency"]); err != nil {
-		return nil, err
-	}
-	for _, key := range []string{"ChannelDisableThreshold", "monitor_setting.auto_test_channel_minutes"} {
+	for _, key := range []string{"ChannelDisableThreshold"} {
 		if raw[key] == "" && key == "ChannelDisableThreshold" {
 			continue
 		}
@@ -166,12 +174,6 @@ func BuildRequestPolicy(options map[string]string) (*RequestPolicySnapshot, erro
 			return nil, fmt.Errorf("invalid numeric value: %s", key)
 		}
 	}
-	switch raw["monitor_setting.channel_test_mode"] {
-	case "scheduled_all", "auto_ban_only", "passive_recovery":
-	default:
-		return nil, fmt.Errorf("invalid channel test mode")
-	}
-
 	if snapshot.Affinity.MaxEntries < 0 || snapshot.Affinity.DefaultTTLSeconds < 0 {
 		return nil, fmt.Errorf("invalid affinity cache limits")
 	}

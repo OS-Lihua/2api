@@ -1,9 +1,6 @@
 package model
 
 import (
-	"slices"
-
-	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 )
 
@@ -11,25 +8,9 @@ func IsProviderEnabledForGroupModel(group string, modelName string, channelID in
 	if group == "" || modelName == "" || channelID <= 0 {
 		return false
 	}
-	if !common.MemoryCacheEnabled {
-		return isChannelEnabledForGroupModelDB(group, modelName, channelID)
-	}
-
-	channelSyncLock.RLock()
-	defer channelSyncLock.RUnlock()
-
-	if group2model2channels == nil {
-		return false
-	}
-
-	if isChannelIDInList(group2model2channels[group][modelName], channelID) {
-		return true
-	}
-	normalized := ratio_setting.RoutingMatchModelName(modelName)
-	if normalized != "" && normalized != modelName {
-		return isChannelIDInList(group2model2channels[group][normalized], channelID)
-	}
-	return false
+	// Historical group/model checks use their explicit database projection;
+	// Provider account caching is independent of legacy routing metadata.
+	return isChannelEnabledForGroupModelDB(group, modelName, channelID)
 }
 
 func IsProviderEnabledForAnyGroupModel(groups []string, modelName string, channelID int) bool {
@@ -61,8 +42,4 @@ func isChannelEnabledForGroupModelDB(group string, modelName string, channelID i
 		Where(`"group" = ? and model = ? and channel_id = ? and enabled = ?`, group, normalized, channelID, true).
 		Count(&count).Error
 	return err == nil && count > 0
-}
-
-func isChannelIDInList(list []int, channelID int) bool {
-	return slices.Contains(list, channelID)
 }

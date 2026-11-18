@@ -37,6 +37,29 @@ func init() {
 	}
 }
 
+// NewFactoryRegistry constructs an isolated registry from this binary's factory
+// sources. It never reads or publishes the serving process's override generation.
+func NewFactoryRegistry() (*jsplugin.Registry, error) {
+	registry := jsplugin.NewRegistry()
+	entries, err := fs.ReadDir(taskPlugins, "tasks")
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		source, err := Source(entry.Name())
+		if err != nil {
+			return nil, err
+		}
+		if _, err := registry.RegisterFactory(source, jsplugin.Options{Key: entry.Name()}); err != nil {
+			return nil, err
+		}
+	}
+	return registry, nil
+}
+
 // Source returns the embedded factory source for a task plugin key.
 func Source(key string) (string, error) {
 	source, err := taskPlugins.ReadFile("tasks/" + key + "/plugin.js")

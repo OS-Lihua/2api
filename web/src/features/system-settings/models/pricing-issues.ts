@@ -18,12 +18,9 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
 import { t } from 'i18next'
-import { useTranslation } from 'react-i18next'
 
 import { useCanEditModelPricing } from '@/features/model-pricing/api'
-import { toIntlLocale } from '@/i18n/languages'
 import { api } from '@/lib/api'
-import { formatNumber } from '@/lib/format'
 import { createServerError } from '@/lib/server-error-message'
 
 /** A task model price one plugin provider cannot charge, as the gateway reports it. */
@@ -69,16 +66,4 @@ export function useModelPricingIssues() {
     enabled: canEdit,
     meta: { errorToast: false },
   })
-}
-
-/** The number of task models whose price needs attention, for nav badges. */
-export function useModelPricingIssueBadge(): string | undefined {
-  const { i18n } = useTranslation()
-  const issues = useModelPricingIssues().data ?? []
-  const count = new Set(issues.map((issue) => issue.model_name)).size
-  if (count === 0) return undefined
-  return formatNumber(
-    count,
-    toIntlLocale(i18n.resolvedLanguage || i18n.language)
-  )
 }

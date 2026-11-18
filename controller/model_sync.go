@@ -325,18 +325,9 @@ func SyncUpstreamPreview(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	missing, err := model.GetMissingModels()
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
 	siteNames := make(map[string]bool)
 	allNames := make(map[string]bool)
 	for name := range locals {
-		siteNames[name] = true
-		allNames[name] = true
-	}
-	for _, name := range missing {
 		siteNames[name] = true
 		allNames[name] = true
 	}

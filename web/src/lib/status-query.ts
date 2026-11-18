@@ -75,7 +75,7 @@ export function mapStatusDataToConfig(
       DEFAULT_CURRENCY_CONFIG.displayInCurrency,
     quotaDisplayType,
     quotaPerUnit: toNumber(
-      data.quota_per_unit,
+      data.legacy_quota_per_unit,
       DEFAULT_CURRENCY_CONFIG.quotaPerUnit
     ),
     usdExchangeRate: toNumber(

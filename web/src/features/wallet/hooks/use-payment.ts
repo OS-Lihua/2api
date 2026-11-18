@@ -16,155 +16,50 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import i18next from 'i18next'
-import { useState, useCallback } from 'react'
+import { useMutation } from '@tanstack/react-query'
+import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
-import { handleServerError } from '@/lib/handle-server-error'
+import { useAuthStore } from '@/stores/auth-store'
 
-import {
-  calculateAmount,
-  calculateStripeAmount,
-  calculateWaffoAmount,
-  calculateWaffoPancakeAmount,
-  requestPayment,
-  requestStripePayment,
-  isApiSuccess,
-} from '../api'
-import {
-  isStripePayment,
-  isWaffoPayment,
-  isWaffoPancakePayment,
-  submitPaymentForm,
-} from '../lib'
-import type { AmountRequest, AmountResponse } from '../types'
+import { requestCheckoutPayment } from '../api'
+import { submitPaymentForm } from '../lib/payment'
+import type { CheckoutProvider } from '../types'
 
-// ============================================================================
-// Payment Hook
-// ============================================================================
-
-type AmountCalculator = (request: AmountRequest) => Promise<AmountResponse>
-
-export interface PaymentAmountCalculators {
-  regular: AmountCalculator
-  stripe: AmountCalculator
-  waffo: AmountCalculator
-  waffoPancake: AmountCalculator
-}
-
-const defaultPaymentAmountCalculators: PaymentAmountCalculators = {
-  regular: calculateAmount,
-  stripe: calculateStripeAmount,
-  waffo: calculateWaffoAmount,
-  waffoPancake: calculateWaffoPancakeAmount,
-}
-
-export async function requestPaymentAmount(
-  topupAmount: number,
-  paymentType: string,
-  calculators: PaymentAmountCalculators = defaultPaymentAmountCalculators
-): Promise<number> {
-  let calculator = calculators.regular
-  if (isStripePayment(paymentType)) {
-    calculator = calculators.stripe
-  } else if (isWaffoPayment(paymentType)) {
-    calculator = calculators.waffo
-  } else if (isWaffoPancakePayment(paymentType)) {
-    calculator = calculators.waffoPancake
-  }
-
-  const response = await calculator({ amount: topupAmount })
-  if (!isApiSuccess(response) || !response.data) {
-    return 0
-  }
-
-  return Number.parseFloat(response.data)
-}
-
-export function usePayment() {
-  const [amount, setAmount] = useState<number>(0)
-  const [calculating, setCalculating] = useState(false)
-  const [processing, setProcessing] = useState(false)
-
-  // Calculate payment amount
-  const calculatePaymentAmount = useCallback(
-    async (topupAmount: number, paymentType: string) => {
+export function usePayment(provider: CheckoutProvider, userId: number) {
+  const { t } = useTranslation()
+  return useMutation({
+    meta: { errorToast: false },
+    mutationFn: async (quoteId: string) => {
+      if (useAuthStore.getState().auth.user?.id !== userId) return false
+      const response = await requestCheckoutPayment(provider, quoteId)
+      if (useAuthStore.getState().auth.user?.id !== userId) return false
+      const data = response.data
+      let url = response.url
+      if (provider !== 'epay') {
+        const field = provider === 'stripe' ? 'pay_link' : 'checkout_url'
+        if (typeof data === 'string') url = data
+        else if (data && typeof data === 'object') {
+          const payload = data as Record<string, unknown>
+          const target = payload[provider === 'waffo' ? 'payment_url' : field]
+          if (typeof target === 'string') url = target
+        }
+      }
+      let validUrl = false
       try {
-        setCalculating(true)
-        const calculatedAmount = await requestPaymentAmount(
-          topupAmount,
-          paymentType
-        )
-        setAmount(calculatedAmount)
-        return calculatedAmount
+        validUrl = !!url && ['http:', 'https:'].includes(new URL(url).protocol)
       } catch {
-        setAmount(0)
-        return 0
-      } finally {
-        setCalculating(false)
+        /* Invalid redirect values remain non-navigable. */
       }
+      if (!url || !validUrl) throw new Error(t('Invalid payment redirect URL'))
+      if (provider === 'epay') {
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+          throw new Error(t('Payment request failed'))
+        }
+        submitPaymentForm(url, data as Record<string, unknown>)
+      } else window.location.assign(url)
+      toast.success(t('Redirecting to payment page...'))
+      return true
     },
-    []
-  )
-
-  // Process payment
-  const processPayment = useCallback(
-    async (topupAmount: number, paymentType: string) => {
-      try {
-        setProcessing(true)
-
-        const isStripe = isStripePayment(paymentType)
-        const amount = Math.floor(topupAmount)
-
-        const response = isStripe
-          ? await requestStripePayment({
-              amount,
-              payment_method: 'stripe',
-            })
-          : await requestPayment({
-              amount,
-              payment_method: paymentType,
-            })
-
-        if (!isApiSuccess(response)) {
-          handleServerError(response, i18next.t('Payment request failed'))
-          return false
-        }
-
-        // Handle Stripe payment
-        if (isStripe && response.data?.pay_link) {
-          window.open(response.data.pay_link as string, '_blank')
-          toast.success(i18next.t('Redirecting to payment page...'))
-          return true
-        }
-
-        // Handle non-Stripe payment
-        if (!isStripe && response.data) {
-          const url = (response as unknown as { url?: string }).url
-          if (url) {
-            submitPaymentForm(url, response.data)
-            toast.success(i18next.t('Redirecting to payment page...'))
-            return true
-          }
-        }
-
-        return false
-      } catch (error) {
-        handleServerError(error, i18next.t('Payment request failed'))
-        return false
-      } finally {
-        setProcessing(false)
-      }
-    },
-    []
-  )
-
-  return {
-    amount,
-    calculating,
-    processing,
-    calculatePaymentAmount,
-    processPayment,
-    setAmount,
-  }
+  })
 }

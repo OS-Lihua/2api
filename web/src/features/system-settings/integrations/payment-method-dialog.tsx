@@ -42,7 +42,6 @@ const createPaymentMethodDialogSchema = (t: (key: string) => string) =>
     name: z.string().min(1, t('Payment method name is required')),
     type: z.string().min(1, t('Payment type key is required')),
     icon: z.string().optional(),
-    min_topup: z.string().optional(),
   })
 
 type PaymentMethodDialogFormValues = z.infer<
@@ -55,7 +54,6 @@ export type PaymentMethodData = {
   name: string
   type: string
   icon?: string
-  min_topup?: string
   color?: string
 }
 
@@ -119,7 +117,6 @@ export function PaymentMethodDialog({
       name: '',
       type: '',
       icon: '',
-      min_topup: '',
     },
   })
 
@@ -131,14 +128,12 @@ export function PaymentMethodDialog({
         name: editData.name,
         type: editData.type,
         icon: editData.icon ?? getDefaultIconName(editData.type),
-        min_topup: editData.min_topup ?? '',
       })
     } else {
       form.reset({
         name: '',
         type: '',
         icon: '',
-        min_topup: '',
       })
     }
   }, [editData, form, open])
@@ -151,9 +146,7 @@ export function PaymentMethodDialog({
     if (values.icon && values.icon.trim() !== '') {
       data.icon = values.icon.trim()
     }
-    if (values.min_topup && values.min_topup.trim() !== '') {
-      data.min_topup = values.min_topup
-    }
+
     onSave(data)
     form.reset()
     onOpenChange(false)
@@ -186,7 +179,10 @@ export function PaymentMethodDialog({
       <Form {...form}>
         <form
           id={PAYMENT_METHOD_FORM_ID}
-          onSubmit={form.handleSubmit(handleSubmit)}
+          onSubmit={(event) => {
+            event.stopPropagation()
+            void form.handleSubmit(handleSubmit)(event)
+          }}
           className='space-y-4'
         >
           <FormField
@@ -283,28 +279,6 @@ export function PaymentMethodDialog({
                   {t(
                     'Enter a react-icons component name. Invalid names show no icon.'
                   )}
-                </FormDescription>
-                <FormMessage />
-              </FormItem>
-            )}
-          />
-
-          <FormField
-            control={form.control}
-            name='min_topup'
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel>{t('Minimum top-up (optional)')}</FormLabel>
-                <FormControl>
-                  <Input
-                    type='number'
-                    step='0.01'
-                    placeholder={t('e.g., 50')}
-                    {...field}
-                  />
-                </FormControl>
-                <FormDescription>
-                  {t('Optional minimum recharge amount for this method.')}
                 </FormDescription>
                 <FormMessage />
               </FormItem>

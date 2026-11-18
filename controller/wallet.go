@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"context"
 	"errors"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -14,15 +16,18 @@ import (
 	"gorm.io/gorm"
 )
 
-// walletView is a wallet in the admin API. Amounts are decimal strings in
-// major currency units, for example "12.5".
+// walletView renders balances as decimal strings in major currency units,
+// for example "12.5".
 type walletView struct {
-	UserId         int            `json:"user_id"`
-	Currency       money.Currency `json:"currency"`
-	Balance        string         `json:"balance"`
-	UpdatedAt      int64          `json:"updated_at"`
-	Outstanding    string         `json:"outstanding,omitempty"`
-	RequestsPaused bool           `json:"requests_paused,omitempty"`
+	UserId         int              `json:"user_id"`
+	Currency       money.Currency   `json:"currency"`
+	Balance        string           `json:"balance"`
+	UpdatedAt      int64            `json:"updated_at"`
+	Outstanding    string           `json:"outstanding,omitempty"`
+	RequestsPaused bool             `json:"requests_paused,omitempty"`
+	Consumed       model.MoneyTotal `json:"consumed"`
+	SalePending    bool             `json:"sale_pending"`
+	FundingPending bool             `json:"funding_pending"`
 }
 
 type ledgerEntryView struct {
@@ -139,40 +144,76 @@ func respondLedgerError(c *gin.Context, err error) {
 	}
 }
 
-// GetUserWallet returns a user's wallet. A user without ledger entries has a
-// zero balance in the settlement currency.
+// GetUserWalletSummaries supplies the administrator list without widening the
+// user:read API's access to financial data or issuing one query per row.
+func GetUserWalletSummaries(c *gin.Context) {
+	values := c.Request.URL.Query()["user_ids"]
+	if len(values) != 1 || len(values[0]) == 0 || len(values[0]) > model.MaxWalletSummaryUsers*20 {
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid user ID"))
+		return
+	}
+	ids := make([]int, 0)
+	seen := map[int]bool{}
+	for value := range strings.SplitSeq(values[0], ",") {
+		id, err := strconv.Atoi(value)
+		if err != nil || id <= 0 || strconv.Itoa(id) != value || seen[id] || len(ids) == model.MaxWalletSummaryUsers {
+			common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid user ID"))
+			return
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	items, err := model.GetUserWalletSummaries(c.Request.Context(), ids)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		common.ApiErrorStatus(c, http.StatusNotFound, common.NewMessage("User does not exist"))
+		return
+	}
+	if err != nil {
+		respondLedgerError(c, err)
+		return
+	}
+	common.ApiSuccess(c, gin.H{"items": items})
+}
+
+// GetUserWallet returns the target user's wallet to an authorized administrator.
 func GetUserWallet(c *gin.Context) {
 	user, ok := walletTargetUser(c, false)
 	if !ok {
 		return
 	}
-	wallet, err := model.GetUserWallet(user.Id)
+	view, err := readUserWallet(c.Request.Context(), user.Id)
 	if err != nil {
 		common.ApiError(c, err)
 		return
-	}
-	view := walletView{UserId: user.Id, Currency: model.SettlementCurrency(), Balance: "0"}
-	if wallet != nil {
-		view.Currency = wallet.Balance.Currency
-		view.Balance = amountString(wallet.Balance)
-		view.UpdatedAt = wallet.UpdatedAt
-	}
-	outstanding, err := model.GetUserOutstanding(user.Id)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	pending, err := model.HasPendingGatewaySale(c.Request.Context(), user.Id)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	view.RequestsPaused = pending
-	if outstanding.Nanos > 0 {
-		view.Outstanding = amountString(outstanding)
-		view.RequestsPaused = true
 	}
 	common.ApiSuccess(c, view)
+}
+
+// GetSelfWallet reads only the authenticated user's wallet.
+func GetSelfWallet(c *gin.Context) {
+	view, err := readUserWallet(c.Request.Context(), c.GetInt("id"))
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, view)
+}
+
+func readUserWallet(ctx context.Context, userID int) (walletView, error) {
+	items, err := model.GetUserWalletSummaries(ctx, []int{userID})
+	if err != nil {
+		return walletView{}, err
+	}
+	item := items[0]
+	view := walletView{
+		UserId: userID, Currency: item.Available.Currency, Balance: amountString(item.Available),
+		UpdatedAt: item.UpdatedAt, RequestsPaused: item.RequestsPaused,
+		Consumed: item.Consumed, SalePending: item.SalePending, FundingPending: item.FundingPending,
+	}
+	if item.Outstanding.Nanos > 0 {
+		view.Outstanding = amountString(item.Outstanding)
+	}
+	return view, nil
 }
 
 // GetUserWalletEntries lists a user's ledger entries, newest first.
@@ -196,6 +237,44 @@ func GetUserWalletEntries(c *gin.Context) {
 		}
 		for _, entry := range entries {
 			views = append(views, newLedgerEntryView(entry))
+		}
+		pageInfo.SetTotal(int(total))
+	}
+	pageInfo.SetItems(views)
+	common.ApiSuccess(c, pageInfo)
+}
+
+type selfLedgerEntryView struct {
+	Id           int64                 `json:"id"`
+	Type         model.LedgerEntryType `json:"type"`
+	Currency     money.Currency        `json:"currency"`
+	Amount       string                `json:"amount"`
+	BalanceAfter string                `json:"balance_after"`
+	RequestId    string                `json:"request_id"`
+	CreatedAt    int64                 `json:"created_at"`
+}
+
+// GetSelfWalletEntries excludes administrator remarks and procurement details.
+func GetSelfWalletEntries(c *gin.Context) {
+	pageInfo := common.GetPageQuery(c)
+	views := []selfLedgerEntryView{}
+	wallet, err := model.GetUserWallet(c.GetInt("id"))
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if wallet != nil {
+		entries, total, err := model.ListLedgerEntries(wallet.Id, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		for _, entry := range entries {
+			views = append(views, selfLedgerEntryView{
+				Id: entry.Id, Type: entry.Type, Currency: entry.Amount.Currency,
+				Amount: amountString(entry.Amount), BalanceAfter: amountString(entry.BalanceAfter),
+				RequestId: entry.RequestId, CreatedAt: entry.CreatedAt,
+			})
 		}
 		pageInfo.SetTotal(int(total))
 	}
@@ -282,7 +361,7 @@ func CreateUserWalletAdjustment(c *gin.Context) {
 		return
 	}
 	var req walletAdjustmentRequest
-	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
+	if err := common.DecodeJsonStrict(c.Request.Body, &req); err != nil {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
@@ -300,6 +379,7 @@ func CreateUserWalletAdjustment(c *gin.Context) {
 		Account:    model.UserWalletAccount(user.Id),
 		Type:       model.LedgerEntryAdjustment,
 		Amount:     amount,
+		RequestId:  c.GetString(common.RequestIdKey),
 		OperatorId: c.GetInt("id"),
 		Remark:     remark,
 	})
@@ -327,7 +407,7 @@ func ReverseLedgerEntry(c *gin.Context) {
 		respondLedgerError(c, err)
 		return
 	}
-	if wallet.AccountType == model.LedgerAccountUserWallet {
+	if wallet.AccountType == model.LedgerAccountUserWallet || wallet.AccountType == model.LedgerAccountUserReferral {
 		owner, err := model.GetUserById(wallet.OwnerId, false)
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			common.ApiError(c, err)

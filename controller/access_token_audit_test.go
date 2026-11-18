@@ -1017,10 +1017,15 @@ func TestAuditDatabaseStartup(t *testing.T) {
 			model.DB, model.LOG_DB = db, db
 			common.SetLogDatabaseType(common.DatabaseTypePostgreSQL)
 			if upgrade {
-				require.NoError(t, db.AutoMigrate(&releasedAuditUser{}, &releasedAuditLog{}))
+				require.NoError(t, db.AutoMigrate(&releasedAuditUser{}, &releasedAuditLog{}, &model.Ability{}))
 				legacy := "released-token"
 				require.NoError(t, db.Create(&releasedAuditUser{Username: "released-owner", Password: "placeholder", AccessToken: &legacy, AffCode: "released-aff", Quota: 1234}).Error)
 				require.NoError(t, db.Create(&releasedAuditLog{UserId: 1, Type: model.LogTypeLogin, Content: "historical login", CreatedAt: 100, RequestId: "legacy-request"}).Error)
+				require.ErrorIs(t, model.InitDB(), model.ErrLegacyAbilityOffline, "released sources require the offline migration before serving")
+				report, err := model.MigrateLegacyGateway(context.Background())
+				require.NoError(t, err)
+				require.True(t, report.Committed)
+				require.False(t, db.Migrator().HasTable("abilities"))
 			}
 			for range 2 {
 				require.NoError(t, model.InitDB())

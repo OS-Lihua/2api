@@ -12,11 +12,14 @@ var _ channel.ProviderRequestFixer = (*Provider)(nil)
 var _ channel.ProviderProtocolComposer = (*Provider)(nil)
 
 func (p *Provider) ComposeProtocol(kind protocol.Type, generic channel.ProtocolHandler) (channel.ProtocolHandler, error) {
+	if kind == protocol.OpenAIModerations {
+		return generic, nil
+	}
 	if kind == protocol.OpenAIRealtime {
 		return generic, nil
 	}
-	if kind == protocol.OpenAIEmbeddings {
-		return &channel.WireProtocol{Kind: kind, Public: generic, Wire: &Protocol{}, SupportsCrossProtocol: true}, nil
+	if kind == protocol.OpenAIEmbeddings || kind == protocol.Rerank {
+		return &channel.WireProtocol{Kind: kind, Public: generic, Wire: &Protocol{}, SupportsCrossProtocol: kind == protocol.OpenAIEmbeddings, PublicResponse: true}, nil
 	}
 	if channel.IsNonTextProtocol(kind) {
 		return channel.ComposeNonTextProtocol(kind, generic, &Protocol{}, protocol.OpenAIEmbeddings, protocol.OpenAIImages, protocol.OpenAIAudioSpeech, protocol.OpenAIAudioTranscription, protocol.Rerank)

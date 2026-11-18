@@ -41,7 +41,7 @@ func TestTokenAllowUserQuotaQueryRoundTripsThroughRedisHashCache(t *testing.T) {
 	assert.Positive(t, server.TTL(getTokenCacheKey(token.Key)))
 }
 
-func TestTokenUpdateSynchronouslyNarrowsPreheatedAutoGroupsCache(t *testing.T) {
+func TestTokenUpdateSynchronouslyInvalidatesPreheatedCredentialCache(t *testing.T) {
 	truncateTables(t)
 	useUserCacheMiniRedis(t)
 	token := Token{
@@ -62,15 +62,32 @@ func TestTokenUpdateSynchronouslyNarrowsPreheatedAutoGroupsCache(t *testing.T) {
 	require.NoError(t, err)
 	assert.JSONEq(t, `["default","vip"]`, preheated.AutoGroups)
 
+	token.AllowIps = common.GetPointer("203.0.113.0/24")
+	token.Status = common.TokenStatusDisabled
 	require.NoError(t, token.SetAutoGroups([]string{"vip"}))
 	require.NoError(t, token.Update())
-	// Update 是限制性变更：写库前删除缓存并设置 fence。缓存不再提供旧的
-	// 宽分组值，下一次读取必须看到收紧后的分组。
+	// Invalidate the pre-update snapshot before storing narrower credential
+	// restrictions. Historical routing fields stay available for migration.
 	_, cacheErr := cacheGetTokenByKey(token.Key)
 	require.Error(t, cacheErr, "the pre-update cache entry must be invalidated")
 	reloaded, err := GetTokenByKey(token.Key, false)
 	require.NoError(t, err)
-	assert.JSONEq(t, `["vip"]`, reloaded.AutoGroups)
+	assert.Equal(t, common.TokenStatusDisabled, reloaded.Status)
+	require.NotNil(t, reloaded.AllowIps)
+	assert.Equal(t, "203.0.113.0/24", *reloaded.AllowIps)
+	assert.JSONEq(t, `["default","vip"]`, reloaded.AutoGroups)
+	_, err = ValidateWalletToken(token.Key)
+	assert.ErrorIs(t, err, ErrTokenInvalid)
+
+	// A delayed reader must not restore an enabled snapshot through the fence.
+	initialized, err := cacheInitToken(*preheated)
+	require.NoError(t, err)
+	assert.Zero(t, initialized)
+	credential, err := GetTokenCredential(token.Key)
+	require.NoError(t, err)
+	assert.Equal(t, common.TokenStatusDisabled, credential.Status)
+	require.NotNil(t, credential.AllowIps)
+	assert.Equal(t, "203.0.113.0/24", *credential.AllowIps)
 }
 
 // cacheSetTokenForTest 以测试身份写入完整 token 缓存（含额度字段），

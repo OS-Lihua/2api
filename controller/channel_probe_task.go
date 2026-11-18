@@ -222,6 +222,16 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 	c.Set("resolved_task_model", record.UpstreamModelName)
 	adaptor := taskadaptor.New(plugin)
 	adaptor.Init(info)
+	authorizeProvider := func(callCtx context.Context) error {
+		return provider.ValidateRouteKey(callCtx, apiKey, index)
+	}
+	boundCtx, err := adaptor.WithTransientProviderAuthority(ctx, authorizeProvider)
+	if err != nil {
+		return "failed", "credential_unavailable"
+	}
+	ctx = boundCtx
+	cleanRequest = cleanRequest.WithContext(ctx)
+	c.Request = cleanRequest
 	if taskErr := adaptor.ValidateRequestAndSetAction(c, info); taskErr != nil {
 		return "inconclusive", "request_not_representable"
 	}
@@ -283,6 +293,10 @@ func probeTaskChannel(ctx context.Context, record model.Channel, provider *model
 	task.PrivateData.UpstreamTaskID = submitted.UpstreamTaskID
 	task.PrivateData.PluginState = submitted.PluginState
 	task.PrivateData.Key = apiKey
+	ctx, err = adaptor.WithTransientTaskAuthority(ctx, task, authorizeProvider)
+	if err != nil {
+		return "failed", "credential_unavailable"
+	}
 	terminal := submitted.Immediate
 	// Poll a bounded number of times. A still-running Provider job is explicitly
 	// inconclusive, never a successful capability check based on acceptance.
@@ -619,6 +633,9 @@ func probeTaskMultipartWithinBudget(body []byte, contentType string) bool {
 }
 
 func fetchProbeArtifact(ctx context.Context, provider *model.Provider, descriptor *channel.TaskContentRequest) ([]byte, error) {
+	if descriptor.Authorize == nil || descriptor.Authorize(ctx) != nil {
+		return nil, errors.New("probe credential unavailable")
+	}
 	if len(descriptor.URL) > (channelProbeArtifactLimit*4/3)+1024 || len(descriptor.Body) > 1<<20 {
 		return nil, errors.New("invalid probe artifact")
 	}
@@ -650,6 +667,7 @@ func fetchProbeArtifact(ctx context.Context, provider *model.Provider, descripto
 		return nil, errors.New("probe transport failed")
 	}
 	isolated := *client
+	isolated.Transport = service.GatewayTaskHTTPTransport(client.Transport, descriptor.Authorize)
 	isolated.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	request, err := http.NewRequestWithContext(ctx, descriptor.Method, descriptor.URL, bytes.NewReader(descriptor.Body))
 	if err != nil {

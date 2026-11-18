@@ -16,6 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import type {
+  BalanceReminderPreference,
+  UserBalanceReminder,
+} from '@/lib/balance-reminder'
+import type { MoneyAmount } from '@/lib/currency'
 import type { UserPermissions } from '@/stores/auth-store'
 
 // ============================================================================
@@ -63,14 +68,11 @@ export interface UserProfile {
   aff_code?: string
   /** Number of successful affiliate invites */
   aff_count: number
-  /** Affiliate quota (pending rewards) */
-  aff_quota: number
-  /** Total affiliate quota earned (historical) */
-  aff_history_quota: number
   /** Invite user ID */
   invite_user_id?: number
   /** Account creation timestamp */
   created_time: number
+  balance_reminder?: UserBalanceReminder
   /** User settings (JSON string) */
   setting?: string
   /** WeChat ID (OAuth) */
@@ -98,10 +100,6 @@ export type NotifyType = 'email' | 'webhook' | 'bark' | 'gotify'
 export interface UserSettings {
   /** Notification type */
   notify_type?: NotifyType
-  /** Quota warning threshold in quota units; 0 or absent uses the site default */
-  quota_warning_threshold?: number
-  /** Receive low balance reminders; absent means on */
-  quota_warning_enabled?: boolean
   /** Webhook URL */
   webhook_url?: string
   /** Webhook secret */
@@ -116,8 +114,6 @@ export interface UserSettings {
   gotify_token?: string
   /** Gotify message priority (0-10) */
   gotify_priority?: number
-  /** Accept unset model ratio model */
-  accept_unset_model_ratio_model?: boolean
   /** Record IP log */
   record_ip_log?: boolean
   /** Receive upstream model update notifications (admin only) */
@@ -155,8 +151,7 @@ export interface EmailBindingFlow extends AccountSecurityResult {
  */
 export interface UpdateUserSettingsRequest {
   notify_type?: string
-  quota_warning_threshold?: number
-  quota_warning_enabled?: boolean
+  balance_reminder?: BalanceReminderPreference
   webhook_url?: string
   webhook_secret?: string
   notification_email?: string
@@ -164,7 +159,6 @@ export interface UpdateUserSettingsRequest {
   gotify_url?: string
   gotify_token?: string
   gotify_priority?: number
-  accept_unset_model_ratio_model?: boolean
   record_ip_log?: boolean
   upstream_model_update_notify_enabled?: boolean
   channel_notify_enabled?: boolean
@@ -202,8 +196,8 @@ export interface TwoFAStatus {
 export interface CheckinRecord {
   /** Check-in date (YYYY-MM-DD) */
   checkin_date: string
-  /** Quota awarded for this check-in */
-  quota_awarded: number
+  /** Actual credited amount in its recorded currency */
+  amount: MoneyAmount
 }
 
 /**
@@ -214,8 +208,8 @@ export interface CheckinStats {
   checked_in_today: boolean
   /** Total number of check-ins */
   total_checkins: number
-  /** Total quota earned from check-ins */
-  total_quota: number
+  /** Exact totals per currency; cumulative nanos can exceed int64 */
+  total_awarded: MoneyAmount[]
   /** Current month check-in count */
   checkin_count: number
   /** Check-in records for the queried month */
@@ -228,6 +222,7 @@ export interface CheckinStats {
 export interface CheckinStatusResponse {
   /** Whether check-in feature is enabled */
   enabled: boolean
+  reward_range: { min: MoneyAmount; max: MoneyAmount }
   /** Check-in statistics */
   stats: CheckinStats
 }
@@ -236,6 +231,7 @@ export interface CheckinStatusResponse {
  * Check-in action response
  */
 export interface CheckinResponse {
-  /** Quota awarded for this check-in */
-  quota_awarded: number
+  /** Actual credited amount in its recorded currency */
+  amount: MoneyAmount
+  checkin_date: string
 }

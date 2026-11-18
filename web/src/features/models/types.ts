@@ -43,7 +43,13 @@ export const MODEL_CAPABILITY_FEATURES = [
   'caching',
 ] as const
 
-export const MODEL_MODALITIES = ['text', 'image', 'audio', 'video', 'pdf'] as const
+export const MODEL_MODALITIES = [
+  'text',
+  'image',
+  'audio',
+  'video',
+  'pdf',
+] as const
 
 export const MODEL_CAPABILITY_LIMITS = [
   'context_length',
@@ -72,6 +78,7 @@ export interface Model {
   square_state?: ModelSquareState
   has_metadata?: boolean
   configured_channel_count?: number
+  enabled_channel_count?: number
   id: number
   model_name: string
   description?: string
@@ -86,12 +93,6 @@ export interface Model {
   updated_time: number
   name_rule: number
   capabilities?: ModelCapabilities
-  // Runtime fields
-  bound_channels?: BoundChannel[]
-  enable_groups?: string[]
-  quota_types?: number[]
-  matched_models?: string[]
-  matched_count?: number
 }
 
 /**
@@ -272,15 +273,6 @@ export interface PreviewUpstreamDiffResponse {
   success: boolean
   message?: string
   data?: MetadataSyncPreview
-}
-
-/**
- * Missing models response
- */
-export interface MissingModelsResponse {
-  success: boolean
-  message?: string
-  data?: string[]
 }
 
 /**

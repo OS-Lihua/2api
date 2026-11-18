@@ -207,7 +207,6 @@ func AdminCreateModel(c *gin.Context) {
 		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
 		return
 	}
-	model.RefreshPricing()
 	recordManageAudit(c, "model.create", map[string]any{"id": record.Id, "model_name": record.ModelName})
 	common.ApiSuccess(c, newAdminModelResponse(&record))
 }
@@ -243,7 +242,6 @@ func AdminUpdateModel(c *gin.Context) {
 		common.ApiErrorStatus(c, http.StatusInternalServerError, err)
 		return
 	}
-	model.RefreshPricing()
 	recordManageAudit(c, "model.update", map[string]any{"id": record.Id, "model_name": record.ModelName})
 	common.ApiSuccess(c, newAdminModelResponse(record))
 }
@@ -260,7 +258,7 @@ func AdminDeleteModel(c *gin.Context) {
 		adminModelLookupError(c, err)
 		return
 	}
-	if _, err := model.DeleteModelMetadata([]int{id}, false, false); err != nil {
+	if _, err := model.DeleteModelMetadata([]int{id}); err != nil {
 		if errors.Is(err, model.ErrModelHasChannels) || errors.Is(err, model.ErrModelOfferingMember) {
 			common.ApiErrorStatus(c, http.StatusConflict, err)
 			return

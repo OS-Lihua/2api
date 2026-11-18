@@ -5,6 +5,7 @@ import (
 	"math"
 
 	"github.com/expr-lang/expr/ast"
+	"github.com/expr-lang/expr/file"
 )
 
 // UsesFixedPricing includes unselected branches, even when compilation later
@@ -19,11 +20,68 @@ func UsesFixedPricingByHash(expression, hash string) bool {
 	return err == nil && entry.fixedPricing
 }
 
-// UsesOnlyFixedPricing reports whether every pricing leaf is per request,
+// UsesOnlyFixedPricing reports whether every pricing leaf uses fixed(),
 // including branches whose conditions fail or are optimized away.
 func UsesOnlyFixedPricing(expression string) bool {
 	entry, err := compileEntryFromCacheByHash(expression, ExprHashString(expression))
 	return err == nil && entry.fixedOnly
+}
+
+// UsesOnlyFixedRequestPricing excludes image quantity multipliers from fixed
+// pricing, while allowing image_count to select a request-priced branch.
+func UsesOnlyFixedRequestPricing(expression string) bool {
+	entry, err := compileEntryFromCacheByHash(expression, ExprHashString(expression))
+	return err == nil && entry.fixedRequestOnly
+}
+
+type imagePricePlan struct {
+	multipliers      map[file.Location]bool
+	fixedImagePrices map[file.Location]bool
+}
+
+// imagePricing tracks quantity factors through price branches, never probes.
+// A fixed leaf knows its unit before later factors have finished evaluating.
+func imagePricing(node ast.Node) imagePricePlan {
+	plan := imagePricePlan{multipliers: make(map[file.Location]bool), fixedImagePrices: make(map[file.Location]bool)}
+	type priceBranch struct {
+		node     ast.Node
+		perImage bool
+	}
+	pending := []priceBranch{{node: node}}
+	for len(pending) > 0 {
+		branch := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		switch part := branch.node.(type) {
+		case *ast.ConditionalNode:
+			pending = append(pending, priceBranch{part.Exp1, branch.perImage}, priceBranch{part.Exp2, branch.perImage})
+		case *ast.BinaryNode:
+			if part.Operator != "*" {
+				continue
+			}
+			leftImage, rightImage := branch.perImage, branch.perImage
+			if left, ok := part.Left.(*ast.IdentifierNode); ok && left.Value == "image_count" && containsPricingMarker(part.Right) {
+				plan.multipliers[part.Location()] = true
+				rightImage = true
+			}
+			if right, ok := part.Right.(*ast.IdentifierNode); ok && right.Value == "image_count" && containsPricingMarker(part.Left) {
+				plan.multipliers[part.Location()] = false
+				leftImage = true
+			}
+			pending = append(pending, priceBranch{part.Left, leftImage}, priceBranch{part.Right, rightImage})
+		case *ast.CallNode:
+			callee, ok := part.Callee.(*ast.IdentifierNode)
+			if !ok {
+				continue
+			}
+			if callee.Value == "tier" && len(part.Arguments) == 2 {
+				pending = append(pending, priceBranch{part.Arguments[1], branch.perImage})
+			}
+			if callee.Value == "fixed" {
+				plan.fixedImagePrices[part.Location()] = branch.perImage
+			}
+		}
+	}
+	return plan
 }
 
 func containsPricingMarker(node ast.Node) bool {

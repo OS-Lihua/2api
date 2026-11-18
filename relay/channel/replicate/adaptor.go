@@ -2,6 +2,8 @@ package replicate
 
 import (
 	"bytes"
+	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -12,9 +14,11 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -70,6 +74,13 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 	if info == nil {
 		return nil, errors.New("replicate adaptor: relay info is nil")
 	}
+	if info.ResponseFacts != nil && info.RelayMode != relayconstant.RelayModeImagesEdits {
+		for _, value := range []common.RawMessage{request.Image, request.Images, request.Mask} {
+			if len(value) > 0 && string(value) != "null" {
+				return nil, errors.New("replicate adaptor cannot preserve standard image inputs for generation")
+			}
+		}
+	}
 	if strings.TrimSpace(request.Prompt) == "" {
 		if v := c.PostForm("prompt"); strings.TrimSpace(v) != "" {
 			request.Prompt = v
@@ -93,8 +104,19 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 	inputPayload := make(map[string]any)
 	inputPayload["prompt"] = request.Prompt
 
-	if size := strings.TrimSpace(request.Size); size != "" {
-		if aspect, width, height, ok := mapOpenAISizeToFlux(size); ok {
+	if size := strings.TrimSpace(request.Size); size != "" && size != "auto" {
+		if info.ResponseFacts != nil {
+			widthText, heightText, found := strings.Cut(size, "x")
+			width, widthErr := strconv.Atoi(widthText)
+			height, heightErr := strconv.Atoi(heightText)
+			if modelName != ModelFlux11Pro || info.RelayMode == relayconstant.RelayModeImagesEdits || !found || widthErr != nil || heightErr != nil {
+				return nil, types.NewMediaParameterError("size", "media_format_unsupported")
+			}
+			if err := validateFluxCustomDimensions(width, height); err != nil {
+				return nil, err
+			}
+			inputPayload["aspect_ratio"], inputPayload["width"], inputPayload["height"] = "custom", width, height
+		} else if aspect, width, height, ok := mapOpenAISizeToFlux(size); ok {
 			if aspect != "" {
 				if aspect == "custom" {
 					inputPayload["aspect_ratio"] = "custom"
@@ -126,7 +148,52 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 		inputPayload["prompt_upsampling"] = true
 	}
 
-	if info.RelayMode == relayconstant.RelayModeImagesEdits {
+	if info.RelayMode == relayconstant.RelayModeImagesEdits && info.ResponseFacts != nil {
+		if len(request.Mask) > 0 && string(request.Mask) != "null" {
+			return nil, errors.New("replicate adaptor cannot preserve an image mask")
+		}
+		form := c.Request.MultipartForm
+		if form == nil {
+			var err error
+			form, err = common.ParseMultipartFormReusable(c)
+			if err != nil {
+				return nil, err
+			}
+		}
+		var fileHeader *multipart.FileHeader
+		for field, files := range form.File {
+			if field == "mask" && len(files) > 0 {
+				return nil, errors.New("replicate adaptor cannot preserve an image mask")
+			}
+			if field != "image" && !strings.HasPrefix(field, "image[") && field != "image_prompt" {
+				continue
+			}
+			for _, file := range files {
+				if fileHeader != nil {
+					return nil, errors.New("replicate adaptor cannot preserve multiple input images")
+				}
+				fileHeader = file
+			}
+		}
+		if len(form.Value["mask"]) > 0 {
+			return nil, errors.New("replicate adaptor cannot preserve an image mask")
+		}
+		if fileHeader == nil {
+			return nil, errors.New("replicate adaptor: image file is required for edits")
+		}
+		file, err := fileHeader.Open()
+		if err != nil {
+			return nil, errors.New("replicate adaptor: failed to open image file")
+		}
+		defer file.Close()
+		image, err := io.ReadAll(file)
+		if err != nil {
+			return nil, errors.New("replicate adaptor: failed to read image file")
+		}
+		// Replicate accepts data URIs as prediction file inputs. Send the image
+		// in the funded prediction instead of uploading during conversion.
+		inputPayload["image_prompt"] = "data:" + http.DetectContentType(image) + ";base64," + base64.StdEncoding.EncodeToString(image)
+	} else if info.RelayMode == relayconstant.RelayModeImagesEdits {
 		metadata := channel.NewProviderMetadata(info)
 		overrides, err := channel.ResolveHeaderOverride(info, c)
 		if err != nil {
@@ -187,6 +254,10 @@ func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayIn
 			return nil, fmt.Errorf("num_outputs must be an integer between 1 and %d", dto.MaxImageN)
 		}
 	}
+	if info.ResponseFacts != nil {
+		c.Request.Header.Set("Content-Type", "application/json")
+		return imageRequest{Input: inputPayload, requireImage: info.RelayMode == relayconstant.RelayModeImagesEdits}, nil
+	}
 	return map[string]any{
 		"input": inputPayload,
 	}, nil
@@ -201,11 +272,27 @@ func (a *Protocol) DoResponse(c *gin.Context, resp *http.Response, info *relayco
 		return nil, types.NewError(errors.New("replicate adaptor: empty response"), types.ErrorCodeBadResponse)
 	}
 
+	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(resp.Body)
+	if info.ResponseFacts != nil {
+		var data []dto.ImageData
+		output := ojson.GetBytes(responseBody, "output")
+		if output.Type == ojson.String {
+			if value := strings.TrimSpace(output.Str); value != "" {
+				data = append(data, dto.ImageData{Url: value})
+			}
+		} else if output.IsArray() {
+			for _, item := range output.Array() {
+				if item.Type == ojson.String && strings.TrimSpace(item.Str) != "" {
+					data = append(data, dto.ImageData{Url: item.Str})
+				}
+			}
+		}
+		openai.ObserveImageGeneration(info, data)
+	}
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
 	}
-	_ = resp.Body.Close()
 
 	var prediction PredictionResponse
 	if err := common.Unmarshal(responseBody, &prediction); err != nil {
@@ -260,6 +347,11 @@ func (a *Protocol) DoResponse(c *gin.Context, resp *http.Response, info *relayco
 	if len(urls) == 0 {
 		return nil, types.NewError(errors.New("replicate adaptor: empty prediction output"), types.ErrorCodeBadResponseBody)
 	}
+	if info.ResponseFacts != nil && len(urls) <= dto.MaxImageN {
+		count := int64(len(urls))
+		info.ResponseFacts.GeneratedImageCount = count
+		info.ResponseFacts.ImageCount = &count
+	}
 
 	var imageReq *dto.ImageRequest
 	if info != nil {
@@ -276,7 +368,7 @@ func (a *Protocol) DoResponse(c *gin.Context, resp *http.Response, info *relayco
 	}
 
 	if wantsBase64 {
-		converted, convErr := downloadImagesToBase64(urls)
+		converted, convErr := downloadImagesToBase64(c.Request.Context(), urls)
 		if convErr != nil {
 			return nil, types.NewError(convErr, types.ErrorCodeBadResponse)
 		}
@@ -304,6 +396,9 @@ func (a *Protocol) DoResponse(c *gin.Context, resp *http.Response, info *relayco
 		return nil, types.NewError(fmt.Errorf("replicate adaptor: encode response failed: %w", err), types.ErrorCodeBadResponseBody)
 	}
 
+	if info.ResponseFacts != nil {
+		return openai.WriteImageResponse(c, info, resp, responseBytes)
+	}
 	c.Writer.Header().Set("Content-Type", "application/json")
 	c.Writer.WriteHeader(http.StatusOK)
 	_, _ = c.Writer.Write(responseBytes)
@@ -320,13 +415,16 @@ func (a *Protocol) GetChannelName() string {
 	return ChannelName
 }
 
-func downloadImagesToBase64(urls []string) ([]string, error) {
+func downloadImagesToBase64(ctx context.Context, urls []string) ([]string, error) {
 	results := make([]string, 0, len(urls))
 	for _, url := range urls {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if strings.TrimSpace(url) == "" {
 			continue
 		}
-		_, data, err := service.GetImageFromUrl(url)
+		_, data, err := service.GetImageFromURLWithContext(ctx, url)
 		if err != nil {
 			return nil, fmt.Errorf("replicate adaptor: failed to download image from %s: %w", url, err)
 		}
@@ -389,6 +487,13 @@ func gcd(a, b int) int {
 	return a
 }
 
+func validateFluxCustomDimensions(width, height int) error {
+	if normalizeFluxDimension(width) != width || normalizeFluxDimension(height) != height {
+		return types.NewMediaParameterError("size", "media_format_unsupported")
+	}
+	return nil
+}
+
 func normalizeFluxDimension(value int) int {
 	const (
 		minDim = 256
@@ -418,41 +523,41 @@ func normalizeFluxDimension(value int) int {
 	return value
 }
 
+func imageFileFromForm(c *gin.Context, fieldCandidates ...string) (*multipart.FileHeader, error) {
+	mf := c.Request.MultipartForm
+	if mf == nil {
+		if _, err := c.MultipartForm(); err != nil {
+			return nil, errors.New("replicate adaptor: parse multipart form failed")
+		}
+		mf = c.Request.MultipartForm
+	}
+	if mf == nil || len(mf.File) == 0 {
+		return nil, nil
+	}
+	if len(fieldCandidates) == 0 {
+		fieldCandidates = []string{"image", "image[]", "image_prompt"}
+	}
+	for _, key := range fieldCandidates {
+		if files := mf.File[key]; len(files) > 0 {
+			return files[0], nil
+		}
+	}
+	for _, files := range mf.File {
+		if len(files) > 0 {
+			return files[0], nil
+		}
+	}
+	return nil, nil
+}
+
 func (p *Provider) uploadFileFromForm(c *gin.Context, metadata channel.ProviderMetadata, fieldCandidates ...string) (string, error) {
 	if metadata == nil || metadata.ProviderRequest() == nil || c == nil || c.Request == nil {
 		return "", errors.New("replicate adaptor: missing upload metadata")
 	}
 	info := metadata.ProviderRequest()
-
-	mf := c.Request.MultipartForm
-	if mf == nil {
-		if _, err := c.MultipartForm(); err != nil {
-			return "", fmt.Errorf("replicate adaptor: parse multipart form failed: %w", err)
-		}
-		mf = c.Request.MultipartForm
-	}
-	if mf == nil || len(mf.File) == 0 {
-		return "", nil
-	}
-
-	if len(fieldCandidates) == 0 {
-		fieldCandidates = []string{"image", "image[]", "image_prompt"}
-	}
-
-	var fileHeader *multipart.FileHeader
-	for _, key := range fieldCandidates {
-		if files := mf.File[key]; len(files) > 0 {
-			fileHeader = files[0]
-			break
-		}
-	}
-	if fileHeader == nil {
-		for _, files := range mf.File {
-			if len(files) > 0 {
-				fileHeader = files[0]
-				break
-			}
-		}
+	fileHeader, err := imageFileFromForm(c, fieldCandidates...)
+	if err != nil {
+		return "", err
 	}
 	if fileHeader == nil {
 		return "", nil

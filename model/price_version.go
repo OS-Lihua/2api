@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/money"
+	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"gorm.io/gorm"
 )
@@ -180,13 +181,37 @@ func validatePriceExpression(ctx context.Context, db *gorm.DB, expression string
 	for _, member := range members {
 		models[member.Id] = member
 	}
-	generation := jsplugin.DefaultRegistry.Generation()
+	generation := priceDeclarationGeneration(ctx)
 	validatedSchemas := map[string]bool{}
 	served := map[int]bool{}
 	ordinary := false
 	for _, candidate := range channels {
 		served[candidate.ModelID] = true
 		key, task := candidate.Protocol.TaskPluginKey()
+		if !task && candidate.Protocol == protocol.AlphaSearch {
+			used, err := billingexpr.MoneyUsedVars(expression)
+			if err != nil {
+				return common.NewMessage("Invalid price expression")
+			}
+			if used["u"] {
+				// Count expressions use canonical currency units; token-priced
+				// expressions remain separate and retain per-million coefficients.
+				for _, name := range []string{"p", "c", "len", "cr", "cc", "cc1h", "cc12h", "img", "img_cr", "img_o", "ai", "ao", "image_count"} {
+					if used[name] {
+						return common.NewMessage("Invalid price expression")
+					}
+				}
+				// The synchronous host owns this bounded fact; no task plugin is involved.
+				schema := map[string]jsplugin.UsageFieldSchema{"tool_count": {Type: "number", Unit: "count"}}
+				if !validatedSchemas["native_alpha_search"] {
+					if err := billing_setting.SmokeTestTaskMoneyExpr(expression, schema); err != nil {
+						return common.NewMessage("Invalid price expression")
+					}
+					validatedSchemas["native_alpha_search"] = true
+				}
+				continue
+			}
+		}
 		if !task {
 			ordinary = true
 			continue

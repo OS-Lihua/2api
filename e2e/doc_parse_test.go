@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -38,7 +39,7 @@ func TestDocumentPluginRunsGenericBatchArtifactChain(t *testing.T) {
 	service.InitHttpClient()
 	originalDB := model.DB
 	database := model.UseTestDatabases(t)
-	require.NoError(t, database.AutoMigrate(&model.TaskPlugin{}, &model.Provider{}, &model.Task{}))
+	require.NoError(t, database.AutoMigrate(&model.TaskPlugin{}, &model.Provider{}, &model.Task{}, &model.User{}, &model.LegacySubscriptionTaskObligation{}))
 	t.Cleanup(func() { model.DB = originalDB; jsplugin.DefaultRegistry.Unregister("doc-parse") })
 
 	source := docParsePluginSource
@@ -51,6 +52,7 @@ func TestDocumentPluginRunsGenericBatchArtifactChain(t *testing.T) {
 	controller.UploadTaskPlugin(uploadContext)
 	require.Equal(t, http.StatusOK, uploadRecorder.Code, uploadRecorder.Body.String())
 
+	var artifactReads atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -59,6 +61,7 @@ func TestDocumentPluginRunsGenericBatchArtifactChain(t *testing.T) {
 		case "/batch":
 			_, _ = io.WriteString(w, `{"tasks":[{"id":"doc-upstream-1","status":"SUCCESS","artifacts":[{"key":"text","url":"`+"http://"+r.Host+`/artifact/text","mimeType":"text/plain"},{"key":"json","url":"`+"http://"+r.Host+`/artifact/json","mimeType":"application/json"}]}]}`)
 		case "/artifact/text":
+			artifactReads.Add(1)
 			w.Header().Set("Content-Type", "text/plain")
 			_, _ = io.WriteString(w, "parsed text")
 		case "/artifact/json":
@@ -69,13 +72,15 @@ func TestDocumentPluginRunsGenericBatchArtifactChain(t *testing.T) {
 	}))
 	defer upstream.Close()
 	setting := dto.ProviderSettings{TaskPluginKey: "doc-parse"}
-	channel := model.Provider{Type: constant.ChannelTypeTaskPlugin, Name: "documents", Key: "unused", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "doc-parse-v1", Group: "default"}
+	const originalKey = "original-document-key"
+	channel := model.Provider{Type: constant.ChannelTypeTaskPlugin, Name: "documents", Key: "other-document-key\noriginal-document-key", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "doc-parse-v1", Group: "default",
+		ProviderInfo: model.ProviderInfo{IsMultiKey: true, MultiKeySize: 2}}
 	channel.SetSetting(setting)
 	require.NoError(t, database.Create(&channel).Error)
 
 	adaptor := relay.GetTaskAdaptor("doc-parse")
 	require.NotNil(t, adaptor)
-	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: channel.Type, ChannelBaseUrl: upstream.URL, ApiKey: channel.Key, ChannelSetting: setting, UpstreamModelName: "doc-parse-v1"}, OriginModelName: "doc-parse-v1", TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_doc_parse"}}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelId: channel.Id, ChannelType: channel.Type, ChannelMultiKeyIndex: 1, ChannelBaseUrl: upstream.URL, ApiKey: originalKey, ChannelSetting: setting, UpstreamModelName: "doc-parse-v1"}, OriginModelName: "doc-parse-v1", TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_doc_parse"}}
 	adaptor.Init(info)
 	submitRecorder := httptest.NewRecorder()
 	submitContext, _ := gin.CreateTestContext(submitRecorder)
@@ -99,19 +104,21 @@ func TestDocumentPluginRunsGenericBatchArtifactChain(t *testing.T) {
 		TaskID: info.PublicTaskID, Platform: "doc-parse", UserId: 7, ChannelId: channel.Id,
 		Status: model.TaskStatusInProgress, Data: parsed.TaskData,
 		PrivateData: model.TaskPrivateData{
-			UpstreamTaskID: parsed.UpstreamTaskID,
+			UpstreamTaskID: parsed.UpstreamTaskID, Key: originalKey,
 			Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
 				Key: "doc-parse", Name: "Document Parser", Version: "1.0.0",
 				Author: &model.TaskPluginAuthorSnapshot{Name: "Test"}, APIVersion: 1,
 			}},
 		},
 	}
+	require.NoError(t, database.Create(&model.User{Id: 7, Username: "document-owner", Status: common.UserStatusEnabled}).Error)
 	require.NoError(t, database.Create(&task).Error)
+	require.NoError(t, model.MigrateLegacyTaskObligations(database))
 
 	originalFactory := service.GetTaskAdaptorFunc
 	service.GetTaskAdaptorFunc = func(platform constant.TaskPlatform) service.TaskPollingAdaptor { return relay.GetTaskAdaptor(platform) }
 	t.Cleanup(func() { service.GetTaskAdaptorFunc = originalFactory })
-	service.DispatchPlatformUpdate(context.Background(), "doc-parse", map[int][]string{channel.Id: {parsed.UpstreamTaskID}}, map[string]*model.Task{parsed.UpstreamTaskID: &task})
+	require.NoError(t, service.UpdateLegacyTask(context.Background(), &task))
 	require.NoError(t, database.First(&task, task.ID).Error)
 	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
 
@@ -141,4 +148,20 @@ func TestDocumentPluginRunsGenericBatchArtifactChain(t *testing.T) {
 	controller.TaskArtifactContent(contentContext)
 	assert.Equal(t, http.StatusOK, contentRecorder.Code)
 	assert.Equal(t, "parsed text", contentRecorder.Body.String())
+	assert.EqualValues(t, 1, artifactReads.Load())
+	channel.ProviderInfo.MultiKeyStatusList = map[int]int{1: common.ChannelStatusManuallyDisabled}
+	require.NoError(t, database.Model(&model.Provider{}).Where("id = ?", channel.Id).Update("channel_info", channel.ProviderInfo).Error)
+	blockedRecorder := httptest.NewRecorder()
+	blockedContext, _ := gin.CreateTestContext(blockedRecorder)
+	blockedContext.Set("id", 7)
+	blockedContext.Params = contentContext.Params
+	blockedContext.Request = httptest.NewRequest(http.MethodGet, "/v1/tasks/"+task.TaskID+"/artifacts/text/content", nil)
+	controller.TaskArtifactContent(blockedContext)
+	assert.Equal(t, http.StatusServiceUnavailable, blockedRecorder.Code)
+	assert.Contains(t, blockedRecorder.Body.String(), "artifact_plugin_unavailable")
+	assert.EqualValues(t, 1, artifactReads.Load(), "another enabled key cannot replace the original slot")
+	var evidence model.LegacyTaskObligation
+	require.NoError(t, database.First(&evidence, "source_task_id = ?", task.ID).Error)
+	assert.Equal(t, "unverified", evidence.State)
+	assert.Equal(t, int64(0), evidence.SourceQuota, "a completed document is not financial settlement proof")
 }

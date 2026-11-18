@@ -2,10 +2,28 @@ package billingexpr
 
 import (
 	"errors"
+	"maps"
+
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/shopspring/decimal"
 )
+
+// NormalizeUnmeasuredOutputTokens applies the expression's output split to
+// gateway markers, whose c flag also covers any unmeasured output modality.
+func NormalizeUnmeasuredOutputTokens(unmeasured, used map[string]bool) map[string]bool {
+	result := maps.Clone(unmeasured)
+	if !result["img_o"] && !result["ao"] {
+		return result
+	}
+	delete(result, "c")
+	for _, modality := range []string{"img_o", "ao"} {
+		if result[modality] && !used[modality] {
+			result["c"] = true
+		}
+	}
+	return result
+}
 
 // MoneyTokenQuantities normalizes measured token categories for one expression.
 // Decimal quantities retain fractional long-lived cache units without rounding.

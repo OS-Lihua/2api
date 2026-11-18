@@ -40,6 +40,12 @@ type ConversionLossError struct {
 	Diagnostics []ConversionDiagnostic
 }
 
+// NewMediaParameterError identifies a request control that cannot be preserved.
+// Hosts translate approved codes and paths before exposing a diagnostic.
+func NewMediaParameterError(path, code string) *ConversionLossError {
+	return &ConversionLossError{Diagnostics: []ConversionDiagnostic{{Code: code, Path: path, Severity: ConversionDiagnosticError}}}
+}
+
 func (e *ConversionLossError) Error() string {
 	if e == nil || len(e.Diagnostics) == 0 {
 		return "conversion would lose protocol semantics"

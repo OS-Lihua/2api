@@ -34,7 +34,6 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Switch } from '@/components/ui/switch'
 import { getChannelTypeLabel } from '@/features/channels/lib'
-import { MODEL_PRICING_ISSUES_QUERY_KEY } from '@/features/system-settings/models/pricing-issues'
 import { handleServerError } from '@/lib/handle-server-error'
 import { resolveLocalizedText } from '@/lib/localized-text'
 
@@ -46,6 +45,10 @@ import {
 } from '../api'
 import { isStaleFactoryOverride } from '../lib/marketplace'
 import { toastPluginChange } from '../lib/plugin-change-toast'
+import {
+  isTaskPluginScopeCurrent,
+  useTaskPluginScope,
+} from '../lib/pricing-diagnostics'
 import type { TaskPluginListItem, TaskPluginUsage } from '../types'
 import { PluginCard } from './plugin-card'
 import { PluginIcon } from './plugin-icon'
@@ -59,6 +62,11 @@ type PluginsTableProps = {
 }
 
 export function PluginsTable(props: PluginsTableProps) {
+  const scope = useTaskPluginScope()
+  return <PluginsTableContent key={scope} {...props} scope={scope} />
+}
+
+function PluginsTableContent(props: PluginsTableProps & { scope: string }) {
   const { t, i18n } = useTranslation()
   const queryClient = useQueryClient()
   const [deleteTarget, setDeleteTarget] = useState<TaskPluginListItem | null>(
@@ -90,19 +98,24 @@ export function PluginsTable(props: PluginsTableProps) {
       options?: { cascade?: boolean; force?: boolean }
     }) => setTaskPluginStatus(key, enabled, options),
     onSuccess: (notice, variables) => {
+      if (!isTaskPluginScopeCurrent(props.scope)) return
       queryClient.invalidateQueries({ queryKey: ['task-plugins'] })
       queryClient.invalidateQueries({
-        queryKey: MODEL_PRICING_ISSUES_QUERY_KEY,
+        queryKey: ['task-plugin', variables.key],
       })
-      if (variables.enabled && notice?.pricing_issues?.length) {
-        toastPluginChange(t('Plugin enabled'), notice.pricing_issues)
-      }
+      toastPluginChange(
+        variables.enabled ? t('Plugin enabled') : t('Plugin disabled'),
+        notice.pricing_diagnostics,
+        variables.key,
+        props.scope
+      )
       setStatusConfirmation(null)
       setStatusTarget(null)
       setBlockedAction(null)
       setBlockedUsage(null)
     },
     onError: (error) => {
+      if (!isTaskPluginScopeCurrent(props.scope)) return
       if (error instanceof TaskPluginUsageError) {
         setStatusConfirmation(null)
         setBlockedUsage(error.usage)
@@ -120,17 +133,24 @@ export function PluginsTable(props: PluginsTableProps) {
       plugin: TaskPluginListItem
       force?: boolean
     }) => deleteTaskPluginVersion(plugin.meta.key, plugin.meta.version, force),
-    onSuccess: (notice) => {
+    onSuccess: (notice, variables) => {
+      if (!isTaskPluginScopeCurrent(props.scope)) return
       setDeleteTarget(null)
       setBlockedAction(null)
       setBlockedUsage(null)
-      toastPluginChange(t('Plugin version deleted'), notice?.pricing_issues)
+      toastPluginChange(
+        t('Plugin version deleted'),
+        notice.pricing_diagnostics,
+        variables.plugin.meta.key,
+        props.scope
+      )
       queryClient.invalidateQueries({ queryKey: ['task-plugins'] })
       queryClient.invalidateQueries({
-        queryKey: MODEL_PRICING_ISSUES_QUERY_KEY,
+        queryKey: ['task-plugin', variables.plugin.meta.key],
       })
     },
     onError: (error) => {
+      if (!isTaskPluginScopeCurrent(props.scope)) return
       if (error instanceof TaskPluginUsageError) {
         setBlockedUsage(error.usage)
         setBlockedAction('delete')

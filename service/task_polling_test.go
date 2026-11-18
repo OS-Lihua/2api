@@ -3,8 +3,10 @@ package service
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -14,10 +16,12 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
-	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/bytedance/gopkg/util/gopool"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -317,170 +321,68 @@ func TestDispatchPlatformUpdateUsesFetchMode(t *testing.T) {
 }
 
 func TestUpdateBatchTasksSettlesTieredUsageForTerminalStates(t *testing.T) {
-	testCases := []struct {
-		name        string
-		status      model.TaskStatus
-		units       float64
-		actualQuota int
+	for _, tc := range []struct {
+		name              string
+		status            model.TaskStatus
+		units, sale, cost int64
 	}{
-		{name: "success with usage", status: model.TaskStatusSuccess, units: 3, actualQuota: 3_000},
-		{name: "failure with usage", status: model.TaskStatusFailure, units: 3, actualQuota: 0},
-		{name: "success with zero usage", status: model.TaskStatusSuccess, units: 0, actualQuota: 0},
-		{name: "failure with zero usage", status: model.TaskStatusFailure, units: 0, actualQuota: 0},
-	}
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			truncate(t)
-
-			const userID, tokenID, channelID = 41, 41, 141
-			const initialQuota, preConsumedQuota = 10_000, 5_000
-			const tokenRemain = 8_000
-			seedUser(t, userID, initialQuota)
-			seedToken(t, tokenID, userID, "sk-batch-tiered", tokenRemain)
-			seedTaskPollingChannel(t, channelID, true)
-
-			expression := `tier("actual", u("units"))`
-			task := makeTask(userID, channelID, preConsumedQuota, tokenID, BillingSourceWallet, 0)
-			task.TaskID = "task_batch_tiered_" + string(testCase.status)
-			task.Platform = "batch-plugin"
-			task.PrivateData.UpstreamTaskID = "upstream_batch_tiered_" + string(testCase.status)
+		{"success with usage", model.TaskStatusSuccess, 3, 3000, 1500},
+		{"failure with usage", model.TaskStatusFailure, 3, 0, 1500},
+		{"success with zero usage", model.TaskStatusSuccess, 0, 0, 0},
+		{"failure with zero usage", model.TaskStatusFailure, 0, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			task := seedCanonicalWalletTaskWithPricing(t, 5000, `tier("actual", u("units") * 0.000001)`, `u("units") * 0.0000005`, map[string]any{"units": 5})
+			task.PrivateData.UpstreamTaskID = "batch-upstream"
 			task.SetData(map[string]any{"provider_payload": "must-be-preserved"})
-			task.PrivateData.BillingContext.TieredSnapshot = &billingexpr.BillingSnapshot{
-				ExprString:       expression,
-				ExprHash:         billingexpr.ExprHashString(expression),
-				GroupRatio:       1,
-				QuotaPerUnit:     1_000,
-				ExprVersion:      1,
-				TaskUsageBilling: true,
-			}
-			require.NoError(t, model.DB.Create(task).Error)
-
-			upstreamID := task.GetUpstreamTaskID()
-			reason := ""
-			if testCase.status == model.TaskStatusFailure {
-				reason = "upstream failed"
-			}
-			result := &BatchTaskResult{TaskInfo: relaycommon.TaskInfo{
-				TaskID:     upstreamID,
-				Status:     string(testCase.status),
-				Reason:     reason,
-				UsageFacts: map[string]any{"units": testCase.units},
-			}}
-			adaptor := &batchPollingAdaptor{results: map[string]*BatchTaskResult{upstreamID: result}}
-			taskIDs := []string{upstreamID}
-			taskMap := map[string]*model.Task{upstreamID: task}
-
-			require.NoError(t, UpdateBatchTasks(context.Background(), adaptor, map[int][]string{channelID: taskIDs}, taskMap))
-
+			require.NoError(t, model.DB.Save(task).Error)
+			id := task.GetUpstreamTaskID()
+			adaptor := &batchPollingAdaptor{results: map[string]*BatchTaskResult{id: {TaskInfo: relaycommon.TaskInfo{TaskID: id, Status: string(tc.status), UsageFacts: map[string]any{"units": tc.units}}}}}
+			tasks := map[string]*model.Task{id: task}
+			require.NoError(t, UpdateBatchTasks(t.Context(), adaptor, map[int][]string{77: {id}}, tasks))
 			var persisted model.Task
 			require.NoError(t, model.DB.First(&persisted, task.ID).Error)
-			assert.Equal(t, testCase.status, persisted.Status)
-			assert.Equal(t, testCase.actualQuota, persisted.Quota)
-			var persistedData map[string]any
-			require.NoError(t, common.Unmarshal(persisted.Data, &persistedData))
-			assert.Equal(t, "must-be-preserved", persistedData["provider_payload"])
-			assert.Equal(t, initialQuota+(preConsumedQuota-testCase.actualQuota), getUserQuota(t, userID))
-			assert.Equal(t, tokenRemain+(preConsumedQuota-testCase.actualQuota), getTokenRemainQuota(t, tokenID))
-			assert.Equal(t, int64(1), countLogs(t))
-			if testCase.status == model.TaskStatusFailure {
-				log := getLastLog(t)
-				require.NotNil(t, log)
-				assert.Equal(t, model.LogTypeRefund, log.Type)
-			}
-
-			// A duplicate terminal response must not settle the same task twice.
-			require.NoError(t, UpdateBatchTasks(context.Background(), adaptor, map[int][]string{channelID: taskIDs}, taskMap))
-			assert.Equal(t, initialQuota+(preConsumedQuota-testCase.actualQuota), getUserQuota(t, userID))
-			assert.Equal(t, int64(1), countLogs(t))
+			assert.Equal(t, tc.status, persisted.Status)
+			var data map[string]any
+			require.NoError(t, common.Unmarshal(persisted.Data, &data))
+			assert.Equal(t, "must-be-preserved", data["provider_payload"])
+			assertCanonicalWalletTaskAccounting(t, &persisted, 5000, tc.sale, tc.cost)
+			var before []model.LedgerEntry
+			require.NoError(t, model.DB.Order("id").Find(&before).Error)
+			require.NoError(t, UpdateBatchTasks(t.Context(), adaptor, map[int][]string{77: {id}}, tasks))
+			var after []model.LedgerEntry
+			require.NoError(t, model.DB.Order("id").Find(&after).Error)
+			assert.Equal(t, before, after)
+			assert.Zero(t, countLogs(t), "canonical refund/reconciliation is not an old quota log")
 		})
 	}
+
 }
 
 func TestUpdateBatchTasksRefundsFailedTieredTask(t *testing.T) {
-	truncate(t)
-
-	const userID, tokenID, channelID = 43, 43, 143
-	const initialQuota, preConsumedQuota, tokenRemain = 10_000, 5_000, 8_000
-	seedUser(t, userID, initialQuota)
-	seedToken(t, tokenID, userID, "sk-batch-tiered-refund", tokenRemain)
-	seedTaskPollingChannel(t, channelID, true)
-
-	expression := `tier("actual", u("units"))`
-	task := makeTask(userID, channelID, preConsumedQuota, tokenID, BillingSourceWallet, 0)
-	task.TaskID = "task_batch_tiered_refund"
-	task.Platform = "batch-plugin"
-	task.PrivateData.UpstreamTaskID = "upstream_batch_tiered_refund"
-	task.PrivateData.BillingContext.TieredSnapshot = &billingexpr.BillingSnapshot{
-		ExprString:       expression,
-		ExprHash:         billingexpr.ExprHashString(expression),
-		GroupRatio:       1,
-		QuotaPerUnit:     1_000,
-		ExprVersion:      1,
-		TaskUsageBilling: true,
-		UsageFacts:       map[string]any{"units": float64(5)},
-		EstimatedTier:    "actual",
-	}
-	require.NoError(t, model.DB.Create(task).Error)
-
-	upstreamID := task.GetUpstreamTaskID()
-	adaptor := &batchPollingAdaptor{results: map[string]*BatchTaskResult{
-		upstreamID: {TaskInfo: relaycommon.TaskInfo{
-			TaskID:     upstreamID,
-			Status:     model.TaskStatusFailure,
-			Reason:     "upstream failed",
-			UsageFacts: map[string]any{"units": float64(5)},
-		}},
-	}}
-	require.NoError(t, UpdateBatchTasks(context.Background(), adaptor, map[int][]string{channelID: {upstreamID}}, map[string]*model.Task{upstreamID: task}))
-
+	task := seedCanonicalWalletTaskWithPricing(t, 5000, `tier("actual", u("units") * 0.000001)`, `u("units") * 0.0000005`, map[string]any{"units": 5})
+	id := task.GetUpstreamTaskID()
+	adaptor := &batchPollingAdaptor{results: map[string]*BatchTaskResult{id: {TaskInfo: relaycommon.TaskInfo{TaskID: id, Status: model.TaskStatusFailure, Reason: "upstream failed", UsageFacts: map[string]any{"units": float64(5)}}}}}
+	require.NoError(t, UpdateBatchTasks(t.Context(), adaptor, map[int][]string{77: {id}}, map[string]*model.Task{id: task}))
 	var persisted model.Task
 	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
 	assert.EqualValues(t, model.TaskStatusFailure, persisted.Status)
-	assert.Zero(t, persisted.Quota)
-	assert.Equal(t, initialQuota+preConsumedQuota, getUserQuota(t, userID))
-	assert.Equal(t, tokenRemain+preConsumedQuota, getTokenRemainQuota(t, tokenID))
-
-	log := getLastLog(t)
-	require.NotNil(t, log)
-	assert.Equal(t, model.LogTypeRefund, log.Type)
-	assert.Equal(t, preConsumedQuota, log.Quota)
-	var other map[string]any
-	require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
-	assert.Equal(t, "tiered_expr", other["billing_mode"])
-	assert.Equal(t, "actual", other["matched_tier"])
-	facts, ok := other["usage_facts"].(map[string]any)
-	require.True(t, ok)
-	assert.Equal(t, map[string]any{"units": float64(5)}, facts)
+	assertCanonicalWalletTaskAccounting(t, &persisted, 5000, 0, 2500)
+	record, err := model.GetGatewayRequest(t.Context(), "wallet-task-settlement", 77)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"units": float64(5)}, record.Usage.TaskFacts)
+	assert.Zero(t, countLogs(t))
 }
 
 func TestUpdateBatchTasksRefundsFailedTaskWithoutUsageSettlement(t *testing.T) {
-	truncate(t)
-
-	const userID, tokenID, channelID = 42, 42, 142
-	const initialQuota, preConsumedQuota, tokenRemain = 10_000, 4_000, 7_000
-	seedUser(t, userID, initialQuota)
-	seedToken(t, tokenID, userID, "sk-batch-refund", tokenRemain)
-	seedTaskPollingChannel(t, channelID, true)
-
-	task := makeTask(userID, channelID, preConsumedQuota, tokenID, BillingSourceWallet, 0)
-	task.TaskID = "task_batch_refund"
-	task.Platform = "batch-plugin"
+	task := seedCanonicalWalletTaskWithPricing(t, 4000, `u("tokens") / 1000000000`, `0.000001`, nil)
 	task.Properties.OriginModelName = "missing-batch-token-price"
-	task.PrivateData.UpstreamTaskID = "upstream_batch_refund"
-	task.PrivateData.BillingContext.OriginModelName = "missing-batch-token-price"
-	require.NoError(t, model.DB.Create(task).Error)
-
-	upstreamID := task.GetUpstreamTaskID()
-	adaptor := &batchPollingAdaptor{results: map[string]*BatchTaskResult{
-		upstreamID: {TaskInfo: relaycommon.TaskInfo{TaskID: upstreamID, Status: model.TaskStatusFailure, Reason: "upstream failed", TotalTokens: 123}},
-	}}
-	require.NoError(t, UpdateBatchTasks(context.Background(), adaptor, map[int][]string{channelID: {upstreamID}}, map[string]*model.Task{upstreamID: task}))
-
-	assert.Equal(t, initialQuota+preConsumedQuota, getUserQuota(t, userID))
-	assert.Equal(t, tokenRemain+preConsumedQuota, getTokenRemainQuota(t, tokenID))
-	log := getLastLog(t)
-	require.NotNil(t, log)
-	assert.Equal(t, model.LogTypeRefund, log.Type)
+	require.NoError(t, model.DB.Save(task).Error)
+	id := task.GetUpstreamTaskID()
+	adaptor := &batchPollingAdaptor{results: map[string]*BatchTaskResult{id: {TaskInfo: relaycommon.TaskInfo{TaskID: id, Status: model.TaskStatusFailure, Reason: "upstream failed", TotalTokens: 123, UsageFactsUnknown: true}}}}
+	require.NoError(t, UpdateBatchTasks(t.Context(), adaptor, map[int][]string{77: {id}}, map[string]*model.Task{id: task}))
+	assertCanonicalWalletTaskAccounting(t, task, 4000, 0, 1000)
+	assert.Zero(t, countLogs(t))
 }
 
 func TestUpdateVideoTasksCanSkipPollingSleepPerChannel(t *testing.T) {
@@ -671,63 +573,27 @@ func TestUpdateVideoTasksMixedChannelSleepSettings(t *testing.T) {
 }
 
 func TestUpdateSunoTasksStalePollsRefundExactlyOnce(t *testing.T) {
-	truncate(t)
-
-	const userID, tokenID, channelID = 401, 401, 401
-	const initialUserQuota, initialTokenQuota, taskQuota = 10_000, 6_000, 2_500
-	const publicTaskID, upstreamTaskID = "suno_public_refund_once", "suno_upstream_refund_once"
-
-	seedUser(t, userID, initialUserQuota)
-	seedToken(t, tokenID, userID, "sk-suno-refund-once", initialTokenQuota)
-	baseURL := "https://suno.invalid"
-	require.NoError(t, model.DB.Create(&model.Provider{
-		Id:      channelID,
-		Type:    constant.ChannelTypeSunoAPI,
-		Name:    "suno_refund_once",
-		Key:     "sk-suno-channel",
-		Status:  common.ChannelStatusEnabled,
-		BaseURL: &baseURL,
-	}).Error)
-
-	task := makeTask(userID, channelID, taskQuota, tokenID, BillingSourceWallet, 0)
-	task.TaskID = publicTaskID
+	task := seedCanonicalWalletTask(t, 2500)
 	task.Platform = constant.TaskPlatformSuno
-	task.Status = model.TaskStatusInProgress
-	task.Progress = "50%"
-	task.SubmitTime = time.Now().Unix()
-	task.PrivateData.UpstreamTaskID = upstreamTaskID
-	require.NoError(t, model.DB.Create(task).Error)
-
-	var firstPollTask model.Task
-	var staleSecondPollTask model.Task
-	require.NoError(t, model.DB.First(&firstPollTask, task.ID).Error)
-	require.NoError(t, model.DB.First(&staleSecondPollTask, task.ID).Error)
-
-	adaptor := &batchPollingAdaptor{results: map[string]*BatchTaskResult{
-		upstreamTaskID: {TaskInfo: relaycommon.TaskInfo{
-			TaskID: upstreamTaskID,
-			Status: model.TaskStatusFailure,
-			Reason: "upstream failed",
-		}},
-	}}
-	previousFactory := GetTaskAdaptorFunc
-	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return adaptor }
-	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
-
-	require.NoError(t, updateBatchTasks(context.Background(), adaptor, channelID, []string{upstreamTaskID}, map[string]*model.Task{
-		upstreamTaskID: &firstPollTask,
-	}))
-	require.NoError(t, updateBatchTasks(context.Background(), adaptor, channelID, []string{upstreamTaskID}, map[string]*model.Task{
-		upstreamTaskID: &staleSecondPollTask,
-	}))
-
-	var reloaded model.Task
-	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
-	assert.EqualValues(t, model.TaskStatusFailure, reloaded.Status)
-	assert.Zero(t, reloaded.Quota)
-	assert.Equal(t, initialUserQuota+taskQuota, getUserQuota(t, userID))
-	assert.Equal(t, initialTokenQuota+taskQuota, getTokenRemainQuota(t, tokenID))
-	assert.Equal(t, int64(1), countLogs(t))
+	task.PrivateData.UpstreamTaskID = "suno_upstream_refund_once"
+	require.NoError(t, model.DB.Save(task).Error)
+	var first, stale model.Task
+	require.NoError(t, model.DB.First(&first, task.ID).Error)
+	require.NoError(t, model.DB.First(&stale, task.ID).Error)
+	id := task.GetUpstreamTaskID()
+	adaptor := &batchPollingAdaptor{results: map[string]*BatchTaskResult{id: {TaskInfo: relaycommon.TaskInfo{TaskID: id, Status: model.TaskStatusFailure, Reason: "upstream failed", UsageFacts: map[string]any{"tokens": 0}}}}}
+	require.NoError(t, updateBatchTasks(t.Context(), adaptor, 77, []string{id}, map[string]*model.Task{id: &first}))
+	assertCanonicalWalletTaskAccounting(t, &first, 2500, 0, 0)
+	var before []model.LedgerEntry
+	require.NoError(t, model.DB.Order("id").Find(&before).Error)
+	require.NoError(t, updateBatchTasks(t.Context(), adaptor, 77, []string{id}, map[string]*model.Task{id: &stale}))
+	var after []model.LedgerEntry
+	require.NoError(t, model.DB.Order("id").Find(&after).Error)
+	assert.Equal(t, before, after)
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusFailure, persisted.Status)
+	assert.Zero(t, countLogs(t))
 }
 
 func TestRunTaskPollingOnceDoesNotRefundHistoricalFailedTask(t *testing.T) {
@@ -758,6 +624,136 @@ func TestRunTaskPollingOnceDoesNotRefundHistoricalFailedTask(t *testing.T) {
 	assert.Equal(t, int64(0), countLogs(t))
 }
 
+func TestSweepTimedOutTasksPreservesArchivedSubscriptionObligations(t *testing.T) {
+	model.UseTestDatabases(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Task{}, &model.User{}, &model.Token{}, &model.Provider{}, &model.Log{}, &model.LegacyTaskObligation{}))
+	require.NoError(t, model.MigrateSubscriptionMoney(model.DB))
+
+	const userID, tokenID, initialQuota, initialTokenQuota, taskQuota = 405, 405, 10_000, 8_000, 1_200
+	seedUser(t, userID, initialQuota)
+	seedToken(t, tokenID, userID, "archived-subscription-timeout", initialTokenQuota)
+	parents := []model.UserSubscription{
+		{UserId: userID, Status: "active", MoneyVersion: 1},
+		{UserId: userID, Status: "active", MoneyVersion: 1},
+	}
+	require.NoError(t, model.DB.Create(&parents).Error)
+
+	// Fill the timeout batch with archived evidence on both sides of the old
+	// refund rollout. Half of the source subscriptions will no longer exist.
+	protectedIDs := make([]int64, 0, 100)
+	obligations := make([]model.LegacySubscriptionTaskObligation, 0, 100)
+	for index := range 100 {
+		task := makeTask(userID, 0, taskQuota, tokenID, BillingSourceSubscription, parents[index%2].Id)
+		task.TaskID = fmt.Sprintf("archived_subscription_timeout_%d", index)
+		task.Progress = "50%"
+		task.SubmitTime = model.TaskRefundLegacyCutoff - 100 + int64(index)
+		if index >= 50 {
+			task.SubmitTime = model.TaskRefundLegacyCutoff + int64(index)
+		}
+		if index == 99 {
+			task.Quota = 0 // Zero source quota is not proof that the obligation ended.
+		}
+		require.NoError(t, model.DB.Create(task).Error)
+		protectedIDs = append(protectedIDs, task.ID)
+		obligations = append(obligations, model.LegacySubscriptionTaskObligation{
+			SourceTaskID: task.ID, UserID: userID, SubscriptionID: task.PrivateData.SubscriptionId,
+			ProviderID: task.ChannelId, TaskID: task.TaskID, Platform: string(task.Platform),
+			SourceQuota: int64(task.Quota), SourceStatus: string(task.Status),
+			SourceCreatedAt: task.CreatedAt, SourceUpdatedAt: task.UpdatedAt,
+			State: "unverified", CapturedAt: time.Now().Unix(),
+		})
+	}
+	require.NoError(t, model.DB.Create(&obligations).Error)
+	require.NoError(t, model.DB.Delete(&parents[1]).Error)
+	var parentCount int64
+	require.NoError(t, model.DB.Model(&model.UserSubscription{}).Where("id IN ?", []int{parents[0].Id, parents[1].Id}).Count(&parentCount).Error)
+	require.EqualValues(t, 1, parentCount)
+	ordinaryEvidence := make([]model.LegacyTaskObligation, 0, 100)
+	for index := range 100 {
+		task := makeTask(userID, 0, taskQuota, tokenID, BillingSourceWallet, 0)
+		task.TaskID = fmt.Sprintf("archived_wallet_timeout_%d", index)
+		task.Progress = "50%"
+		task.SubmitTime = model.TaskRefundLegacyCutoff - 300 + int64(index)
+		if index == 99 {
+			task.Quota = 0
+		}
+		require.NoError(t, model.DB.Create(task).Error)
+		protectedIDs = append(protectedIDs, task.ID)
+		ordinaryEvidence = append(ordinaryEvidence, model.LegacyTaskObligation{SourceTaskID: task.ID, UserID: userID, TaskID: task.TaskID,
+			Platform: string(task.Platform), BillingSource: BillingSourceWallet, TokenID: tokenID, SourceQuota: int64(task.Quota), SourceStatus: string(task.Status), State: "unverified"})
+	}
+	require.NoError(t, model.DB.Create(&ordinaryEvidence).Error)
+
+	gatewayTask := makeTask(userID, 0, 0, 0, BillingSourceWallet, 0)
+	gatewayTask.TaskID = "accepted_gateway_timeout_unchanged"
+	gatewayTask.Progress = "50%"
+	gatewayTask.SubmitTime = model.TaskRefundLegacyCutoff - 200
+	gatewayTask.PrivateData.Gateway = &model.TaskGatewaySnapshot{Accepted: true}
+	require.NoError(t, model.DB.Create(gatewayTask).Error)
+	protectedIDs = append(protectedIDs, gatewayTask.ID)
+
+	ordinaryTask := makeTask(userID, 0, taskQuota, 0, BillingSourceWallet, 0)
+	ordinaryTask.TaskID = "ordinary_timeout_after_archived_obligations"
+	ordinaryTask.Progress = "50%"
+	ordinaryTask.SubmitTime = time.Now().Add(-2 * time.Hour).Unix()
+	require.NoError(t, model.DB.Create(ordinaryTask).Error)
+
+	var before []model.Task
+	require.NoError(t, model.DB.Where("id IN ?", protectedIDs).Order("id").Find(&before).Error)
+	previousTimeout := constant.TaskTimeoutMinutes
+	constant.TaskTimeoutMinutes = 1
+	t.Cleanup(func() { constant.TaskTimeoutMinutes = previousTimeout })
+
+	candidates := model.GetTimedOutUnfinishedTasks(time.Now().Add(-time.Minute).Unix(), 1)
+	candidateIDs := make([]int64, len(candidates))
+	for index, task := range candidates {
+		candidateIDs[index] = task.ID
+	}
+	assert.Equal(t, []int64{ordinaryTask.ID}, candidateIDs, "preserved obligations must be excluded before LIMIT")
+
+	for range 2 {
+		sweepTimedOutTasks(t.Context())
+	}
+
+	var after []model.Task
+	require.NoError(t, model.DB.Where("id IN ?", protectedIDs).Order("id").Find(&after).Error)
+	require.Len(t, after, len(before))
+	var changed []int64
+	for index := range before {
+		if !reflect.DeepEqual(before[index], after[index]) {
+			changed = append(changed, before[index].ID)
+		}
+	}
+	assert.Empty(t, changed, "timeout must preserve status, source quota, timestamps and identity of archived/Gateway tasks")
+	var remainingObligations []model.LegacySubscriptionTaskObligation
+	require.NoError(t, model.DB.Order("source_task_id").Find(&remainingObligations).Error)
+	assert.Equal(t, obligations, remainingObligations)
+	var remainingOrdinary []model.LegacyTaskObligation
+	require.NoError(t, model.DB.Order("source_task_id").Find(&remainingOrdinary).Error)
+	assert.Equal(t, ordinaryEvidence, remainingOrdinary)
+	var ordinary model.Task
+	require.NoError(t, model.DB.First(&ordinary, ordinaryTask.ID).Error)
+	assert.EqualValues(t, model.TaskStatusFailure, ordinary.Status)
+	assert.Equal(t, taskQuota, ordinary.Quota)
+	assert.Equal(t, initialQuota, getUserQuota(t, userID))
+	assert.Equal(t, initialTokenQuota, getTokenRemainQuota(t, tokenID))
+	var token model.Token
+	require.NoError(t, model.DB.First(&token, tokenID).Error)
+	assert.Zero(t, token.UsedQuota)
+	assert.Zero(t, countLogs(t), "clock-based status changes cannot prove a historical refund")
+	for _, table := range []string{"subscription_periods", "wallets", "ledger_entries"} {
+		var count int64
+		require.NoError(t, model.DB.Table(table).Count(&count).Error)
+		assert.Zero(t, count, "timeout must not invent subscription or money facts in %s", table)
+	}
+	pollable := model.GetAllUnFinishSyncTasks(len(protectedIDs))
+	pollableIDs := make([]int64, len(pollable))
+	for index, task := range pollable {
+		pollableIDs[index] = task.ID
+	}
+	assert.ElementsMatch(t, protectedIDs, pollableIDs, "actual Provider polling, including accepted Gateway tasks, is unchanged")
+}
+
 func TestSweepTimedOutTasksHonorsRefundRolloutBoundary(t *testing.T) {
 	truncate(t)
 
@@ -768,6 +764,19 @@ func TestSweepTimedOutTasksHonorsRefundRolloutBoundary(t *testing.T) {
 		modernTaskQuota = 1_200
 	)
 	seedUser(t, userID, initialQuota)
+
+	// The timeout batch must select historical work before LIMIT, so a full
+	// batch of overdue accepted money tasks cannot starve ordinary status cleanup.
+	gatewayTasks := make([]*model.Task, 100)
+	for index := range gatewayTasks {
+		gatewayTask := makeTask(userID, 0, 0, 0, BillingSourceWallet, 0)
+		gatewayTask.TaskID = fmt.Sprintf("accepted_money_timeout_%d", index)
+		gatewayTask.Progress = "50%"
+		gatewayTask.SubmitTime = 1771718300
+		gatewayTask.PrivateData.Gateway = &model.TaskGatewaySnapshot{Accepted: true}
+		gatewayTasks[index] = gatewayTask
+	}
+	require.NoError(t, model.DB.Create(&gatewayTasks).Error)
 
 	legacyTask := makeTask(userID, 0, legacyTaskQuota, 0, BillingSourceWallet, 0)
 	legacyTask.TaskID = "legacy_timeout_without_refund"
@@ -793,12 +802,17 @@ func TestSweepTimedOutTasksHonorsRefundRolloutBoundary(t *testing.T) {
 	require.NoError(t, model.DB.First(&reloadedModern, modernTask.ID).Error)
 	assert.EqualValues(t, model.TaskStatusFailure, reloadedLegacy.Status)
 	assert.EqualValues(t, model.TaskStatusFailure, reloadedModern.Status)
-	assert.Zero(t, reloadedLegacy.Quota)
-	assert.Zero(t, reloadedModern.Quota)
+	assert.Equal(t, legacyTaskQuota, reloadedLegacy.Quota)
+	assert.Equal(t, modernTaskQuota, reloadedModern.Quota)
 	assert.Contains(t, reloadedLegacy.FailReason, "old system")
 	assert.Equal(t, "Task timed out", reloadedModern.FailReason)
-	assert.Equal(t, initialQuota+modernTaskQuota, getUserQuota(t, userID))
-	assert.Equal(t, int64(1), countLogs(t))
+	var retained int64
+	require.NoError(t, model.DB.Model(&model.Task{}).
+		Where("user_id = ? AND status = ?", userID, model.TaskStatusInProgress).
+		Where(`"private_data"->>'gateway' IS NOT NULL`).Count(&retained).Error)
+	assert.EqualValues(t, len(gatewayTasks), retained, "accepted money tasks remain pending beyond the host deadline")
+	assert.Equal(t, initialQuota, getUserQuota(t, userID))
+	assert.Zero(t, countLogs(t))
 }
 
 // TASK_TIMEOUT_MINUTES defaults to 72 hours, the longest a vendor keeps a
@@ -832,7 +846,7 @@ func TestSweepTimedOutTasksAtTheDefaultDeadline(t *testing.T) {
 	assert.Equal(t, taskQuota, reloadedRunning.Quota)
 	assert.EqualValues(t, model.TaskStatusFailure, reloadedStuck.Status)
 	assert.Equal(t, "Task timed out", reloadedStuck.FailReason)
-	assert.Equal(t, initialQuota+taskQuota, getUserQuota(t, userID))
+	assert.Equal(t, initialQuota, getUserQuota(t, userID))
 }
 
 type scriptedPollingAdaptor struct {
@@ -887,6 +901,332 @@ func (a *scriptedBatchPollingAdaptor) ParseBatchResult([]*model.Task, *http.Resp
 	return a.results, nil
 }
 
+type legacyObligationPollingAdaptor struct {
+	scriptedPollingAdaptor
+	pluginKey, pluginVersion string
+	fetchMode                string
+	providerID               int
+	observed                 func(int, string, *model.Task)
+}
+
+func (a *legacyObligationPollingAdaptor) TaskPluginIdentity() (string, string) {
+	return a.pluginKey, a.pluginVersion
+}
+func (a *legacyObligationPollingAdaptor) Init(info *relaycommon.RelayInfo) {
+	a.providerID = info.ChannelId
+}
+func (a *legacyObligationPollingAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
+	if a.observed != nil {
+		a.observed(a.providerID, key, task)
+	}
+	return a.scriptedPollingAdaptor.FetchTask(baseURL, key, task, proxy)
+}
+
+func (a *legacyObligationPollingAdaptor) FetchMode() string { return a.fetchMode }
+func (a *legacyObligationPollingAdaptor) FetchBatchTasks(baseURL, key string, tasks []*model.Task, proxy string) (*http.Response, error) {
+	if len(tasks) != 1 {
+		return nil, fmt.Errorf("legacy batch must retain one original identity")
+	}
+	return a.FetchTask(baseURL, key, tasks[0], proxy)
+}
+func (a *legacyObligationPollingAdaptor) ParseBatchResult(tasks []*model.Task, _ *http.Response, _ []byte) (map[string]*BatchTaskResult, error) {
+	if a.parseErr != nil {
+		return nil, a.parseErr
+	}
+	if len(tasks) != 1 {
+		return nil, fmt.Errorf("missing original task result")
+	}
+	result := a.parse
+	if result == nil {
+		result = &relaycommon.TaskInfo{Status: model.TaskStatusInProgress}
+	}
+	return map[string]*BatchTaskResult{tasks[0].GetUpstreamTaskID(): {TaskInfo: *result}}, nil
+}
+
+func TestLegacyTaskPollingKeepsProviderAndOwnerIdentity(t *testing.T) {
+	for _, mode := range []string{"per_task", "batch"} {
+		t.Run(mode, func(t *testing.T) {
+			seedSubscriptionTaskMoney(t, 0)
+			require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", 77).Updates(map[string]any{"type": constant.ChannelTypeKling, "key": "provider-77-original"}).Error)
+			require.NoError(t, model.DB.Create(&model.User{Id: 78, Username: "other-task-owner", AffCode: "other-task-owner", Status: common.UserStatusEnabled}).Error)
+			require.NoError(t, model.DB.Create(&model.Provider{Id: 78, Type: constant.ChannelTypeKling, Key: "provider-78-original", Status: common.ChannelStatusEnabled}).Error)
+			var tasks []*model.Task
+			for index, ids := range [][2]int{{77, 77}, {78, 78}, {78, 77}} {
+				task := makeTask(ids[0], ids[1], 5000, 0, BillingSourceWallet, 0)
+				task.TaskID = fmt.Sprintf("public-task-%d", index)
+				task.Platform = "kling"
+				task.Status = model.TaskStatusQueued
+				task.PrivateData.UpstreamTaskID = "same-private-task-id"
+				task.PrivateData.Key = fmt.Sprintf("provider-%d-original", ids[1])
+				task.PrivateData.Execution = &model.TaskExecutionSnapshot{RequestID: fmt.Sprintf("original-request-%d", index), TaskPlugin: &model.TaskPluginSnapshot{Key: "kling", Version: "1.0.0", Generation: 7}}
+				require.NoError(t, model.DB.Create(task).Error)
+				archiveLegacyPollingTask(t, task)
+				tasks = append(tasks, task)
+			}
+			registry := jsplugin.NewRegistry()
+			_, err := registry.Register(channelSelectTaskPluginSource("kling", constant.ChannelTypeKling), jsplugin.Options{})
+			require.NoError(t, err)
+			oldRegistry, oldFactory, oldTimeout, oldLimit := jsplugin.DefaultRegistry, GetTaskAdaptorFunc, constant.TaskTimeoutMinutes, constant.TaskQueryLimit
+			jsplugin.DefaultRegistry = registry
+			constant.TaskTimeoutMinutes = 0
+			constant.TaskQueryLimit = 100
+			t.Cleanup(func() {
+				jsplugin.DefaultRegistry = oldRegistry
+				GetTaskAdaptorFunc = oldFactory
+				constant.TaskTimeoutMinutes = oldTimeout
+				constant.TaskQueryLimit = oldLimit
+			})
+			var mu sync.Mutex
+			seen := make(map[int64]int)
+			GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor {
+				a := &legacyObligationPollingAdaptor{pluginKey: "kling", pluginVersion: "1.0.0", fetchMode: mode}
+				a.observed = func(providerID int, key string, task *model.Task) {
+					mu.Lock()
+					seen[task.ID]++
+					mu.Unlock()
+					assert.Equal(t, task.ChannelId, providerID)
+					assert.Equal(t, task.PrivateData.Key, key)
+					status := model.TaskStatusSuccess
+					if task.ID == tasks[1].ID {
+						status = model.TaskStatusFailure
+					}
+					a.parse = &relaycommon.TaskInfo{TaskID: task.GetUpstreamTaskID(), Status: status}
+				}
+				return a
+			}
+			var before []model.LedgerEntry
+			require.NoError(t, model.DB.Order("id").Find(&before).Error)
+			RunTaskPollingOnce(t.Context(), nil)
+			for index, source := range tasks {
+				var got model.Task
+				require.NoError(t, model.DB.First(&got, source.ID).Error)
+				assert.Equal(t, 1, seen[source.ID])
+				assert.Equal(t, source.UserId, got.UserId)
+				assert.Equal(t, source.ChannelId, got.ChannelId)
+				expectedPrivate := source.PrivateData
+				if mode == "per_task" && index != 1 {
+					expectedPrivate.ResultURL = taskcommon.BuildProxyURL(source.TaskID)
+				}
+				assert.Equal(t, expectedPrivate, got.PrivateData)
+				assert.Equal(t, 5000, got.Quota)
+				status := model.TaskStatus(model.TaskStatusSuccess)
+				if index == 1 {
+					status = model.TaskStatusFailure
+				}
+				assert.Equal(t, status, got.Status)
+			}
+			var after []model.LedgerEntry
+			require.NoError(t, model.DB.Order("id").Find(&after).Error)
+			assert.Equal(t, before, after)
+			assert.Zero(t, countLogs(t))
+		})
+	}
+}
+
+func archiveLegacyPollingTask(t *testing.T, task *model.Task) {
+	t.Helper()
+	require.NoError(t, model.DB.AutoMigrate(&model.LegacyTaskObligation{}, &model.LegacySubscriptionTaskObligation{}))
+	requestID := ""
+	plugin := model.TaskPluginSnapshot{}
+	if task.PrivateData.Execution != nil {
+		requestID = task.PrivateData.Execution.RequestID
+		if task.PrivateData.Execution.TaskPlugin != nil {
+			plugin = *task.PrivateData.Execution.TaskPlugin
+		}
+	}
+	if task.PrivateData.BillingSource == BillingSourceSubscription {
+		require.NoError(t, model.DB.Create(&model.LegacySubscriptionTaskObligation{
+			SourceTaskID: task.ID, UserID: task.UserId, SubscriptionID: task.PrivateData.SubscriptionId,
+			ProviderID: task.ChannelId, TaskID: task.TaskID, Platform: string(task.Platform), RequestID: requestID,
+			SourceQuota: int64(task.Quota), SourceStatus: string(task.Status), State: "unverified",
+		}).Error)
+		return
+	}
+	require.NoError(t, model.DB.Create(&model.LegacyTaskObligation{
+		SourceTaskID: task.ID, UserID: task.UserId, ProviderID: task.ChannelId, TaskID: task.TaskID,
+		UpstreamTaskID: task.PrivateData.UpstreamTaskID, Platform: string(task.Platform), BillingSource: task.PrivateData.BillingSource,
+		TokenID: task.PrivateData.TokenId, SubscriptionID: task.PrivateData.SubscriptionId, RequestID: requestID,
+		PluginKey: plugin.Key, PluginVersion: plugin.Version, PluginGeneration: plugin.Generation,
+		SourceQuota: int64(task.Quota), SourceStatus: string(task.Status), State: "unverified",
+	}).Error)
+}
+
+func TestLegacyTaskPollingPreservesUnverifiedObligations(t *testing.T) {
+	for _, source := range []string{BillingSourceWallet, BillingSourceSubscription} {
+		for _, scenarioName := range []string{"success", "failure", "not_found", "gone", "failure_threshold", "transport_error", "hook_error", "unrecognized", "nonterminal_reason", "gateway_envelope", "batch_success", "batch_failure", "batch_not_found", "batch_gone", "batch_transport_error", "batch_hook_error", "batch_unrecognized", "batch_nonterminal_reason", "missing_provider", "missing_upstream", "missing_key", "provider_key_changed", "plugin_missing", "plugin_mismatch", "adaptor_without_identity", "owner_rebound", "provider_rebound", "evidence_read_error", "in_flight_owner_rebind"} {
+			scenario, mode := scenarioName, "per_task"
+			if batchScenario, ok := strings.CutPrefix(scenarioName, "batch_"); ok {
+				scenario, mode = batchScenario, "batch"
+			}
+			t.Run(source+"/"+scenarioName, func(t *testing.T) {
+				seedSubscriptionTaskMoney(t, 0)
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", 77).Updates(map[string]any{"type": constant.ChannelTypeKling, "key": "original-task-key"}).Error)
+				task := makeTask(77, 77, 5000, 77, source, 0)
+				task.Platform = "kling"
+				task.Status = model.TaskStatusQueued
+				task.Progress = "0%"
+				task.Properties.OriginModelName = "private-model-canary"
+				task.PrivateData.UpstreamTaskID = "original-upstream"
+				task.PrivateData.Key = "original-task-key"
+				task.PrivateData.PluginState = []byte(`{"secret":"private-state-canary"}`)
+				task.PrivateData.Execution = &model.TaskExecutionSnapshot{RequestID: "original-request", TaskPlugin: &model.TaskPluginSnapshot{Key: "kling", Version: "1.0.0", Generation: 7}}
+				if scenario == "missing_key" {
+					task.PrivateData.Key = ""
+				}
+				if scenario == "missing_provider" {
+					task.ChannelId = 999
+				}
+				if scenario == "missing_upstream" {
+					task.TaskID = ""
+					task.PrivateData.UpstreamTaskID = ""
+				}
+				task.PrivateData.PollFailures = 100
+				require.NoError(t, model.DB.Create(task).Error)
+				archiveLegacyPollingTask(t, task)
+				var ordinaryBefore []model.LegacyTaskObligation
+				var subscriptionBefore []model.LegacySubscriptionTaskObligation
+				require.NoError(t, model.DB.Find(&ordinaryBefore).Error)
+				require.NoError(t, model.DB.Find(&subscriptionBefore).Error)
+				switch scenario {
+				case "provider_key_changed":
+					require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", 77).Update("key", "replacement-not-original").Error)
+				case "owner_rebound":
+					require.NoError(t, model.DB.Model(task).Update("user_id", 78).Error)
+				case "provider_rebound":
+					require.NoError(t, model.DB.Model(task).Update("channel_id", 78).Error)
+				case "evidence_read_error":
+					require.NoError(t, model.DB.Exec(`ALTER TABLE "legacy_task_obligations" RENAME TO "temporarily_unavailable_evidence"`).Error)
+				}
+				registry := jsplugin.NewRegistry()
+				_, err := registry.Register(channelSelectTaskPluginSource("kling", constant.ChannelTypeKling), jsplugin.Options{})
+				require.NoError(t, err)
+				oldRegistry, oldFactory, oldTimeout, oldLimit := jsplugin.DefaultRegistry, GetTaskAdaptorFunc, constant.TaskTimeoutMinutes, constant.TaskQueryLimit
+				jsplugin.DefaultRegistry = registry
+				if scenario == "plugin_missing" {
+					jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+				}
+				constant.TaskTimeoutMinutes = 0
+				constant.TaskQueryLimit = 100
+				t.Cleanup(func() {
+					jsplugin.DefaultRegistry = oldRegistry
+					GetTaskAdaptorFunc = oldFactory
+					constant.TaskTimeoutMinutes = oldTimeout
+					constant.TaskQueryLimit = oldLimit
+				})
+				calls := 0
+				GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor {
+					if scenario == "adaptor_without_identity" {
+						return &scriptedPollingAdaptor{}
+					}
+					a := &legacyObligationPollingAdaptor{pluginKey: "kling", pluginVersion: "1.0.0", fetchMode: mode}
+					a.body = []byte(`{"detail":"provider-response-canary","credential":"original-task-key"}`)
+					a.observed = func(providerID int, key string, got *model.Task) {
+						calls++
+						assert.Equal(t, 77, providerID)
+						assert.Equal(t, "original-task-key", key)
+						assert.Equal(t, task.ID, got.ID)
+						if scenario == "in_flight_owner_rebind" {
+							require.NoError(t, model.DB.Model(&model.Task{}).Where("id = ?", got.ID).Update("user_id", 78).Error)
+						}
+					}
+					if scenario == "plugin_mismatch" {
+						a.pluginVersion = "2.0.0"
+					}
+					switch scenario {
+					case "success":
+						a.parse = &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, Progress: "100%"}
+					case "failure":
+						a.parse = &relaycommon.TaskInfo{Status: model.TaskStatusFailure, Reason: "provider-reason-canary original-task-key"}
+					case "transport_error":
+						a.fetchErr = fmt.Errorf("transport-error-canary https://original-task-key@provider.invalid?credential=original-task-key")
+					case "hook_error":
+						a.parseErr = fmt.Errorf("hook-error-canary credential=original-task-key")
+					case "unrecognized":
+						a.parse = &relaycommon.TaskInfo{Status: model.TaskStatusUnknown, Reason: "provider-reason-canary original-task-key"}
+					case "nonterminal_reason":
+						a.parse = &relaycommon.TaskInfo{Status: model.TaskStatusInProgress, Reason: "provider-reason-canary original-task-key"}
+					case "gateway_envelope":
+						a.body = []byte(`{"code":"success","data":{"task_id":"original-upstream","status":"SUCCESS","progress":"100%","fail_reason":"provider-reason-canary original-task-key","data":{"detail":"provider-response-canary","credential":"original-task-key"}}}`)
+					case "not_found":
+						a.statusCode = http.StatusNotFound
+					case "gone":
+						a.statusCode = http.StatusGone
+					case "failure_threshold":
+						a.statusCode = http.StatusServiceUnavailable
+					}
+					if a.parse != nil {
+						a.parse.Url = "https://provider.invalid/provider-result-canary?credential=original-task-key"
+						a.parse.PluginState = []byte(`{"opaque":"provider-plugin-state-canary","credential":"original-task-key"}`)
+					}
+					return a
+				}
+				var captured bytes.Buffer
+				oldDebug := common.DebugEnabled
+				common.DebugEnabled = true
+				common.LogWriterMu.Lock()
+				oldWriter, oldErrorWriter := gin.DefaultWriter, gin.DefaultErrorWriter
+				gin.DefaultWriter, gin.DefaultErrorWriter = &captured, &captured
+				common.LogWriterMu.Unlock()
+				RunTaskPollingOnce(t.Context(), nil)
+				common.LogWriterMu.Lock()
+				gin.DefaultWriter, gin.DefaultErrorWriter = oldWriter, oldErrorWriter
+				common.LogWriterMu.Unlock()
+				common.DebugEnabled = oldDebug
+				assert.NotContains(t, captured.String(), "private-model-canary")
+				assert.NotContains(t, captured.String(), "original-task-key")
+				assert.NotContains(t, captured.String(), "private-state-canary")
+				for _, secret := range []string{"provider-response-canary", "provider-reason-canary", "provider-result-canary", "provider-plugin-state-canary", "transport-error-canary", "hook-error-canary"} {
+					assert.NotContains(t, captured.String(), secret)
+				}
+				assert.NotEmpty(t, captured.String(), "safe diagnostics must remain enabled")
+				if scenario == "evidence_read_error" {
+					require.NoError(t, model.DB.Exec(`ALTER TABLE "temporarily_unavailable_evidence" RENAME TO "legacy_task_obligations"`).Error)
+				}
+				var after model.Task
+				require.NoError(t, model.DB.First(&after, task.ID).Error)
+				wantStatus := model.TaskStatus(model.TaskStatusQueued)
+				if scenario == "success" || scenario == "gateway_envelope" {
+					wantStatus = model.TaskStatusSuccess
+				}
+				if scenario == "nonterminal_reason" {
+					wantStatus = model.TaskStatusInProgress
+				}
+				if scenario == "failure" {
+					wantStatus = model.TaskStatusFailure
+				}
+				assert.Equal(t, wantStatus, after.Status)
+				assert.Equal(t, 5000, after.Quota)
+				assert.Equal(t, task.PrivateData.Execution, after.PrivateData.Execution)
+				assert.Equal(t, task.PrivateData.Key, after.PrivateData.Key)
+				switch scenario {
+				case "success", "failure", "nonterminal_reason":
+					assert.Equal(t, 1, calls)
+					assert.JSONEq(t, `{"opaque":"provider-plugin-state-canary","credential":"original-task-key"}`, string(after.PrivateData.PluginState))
+					if scenario == "failure" || mode == "batch" && scenario == "nonterminal_reason" {
+						assert.Equal(t, "provider-reason-canary original-task-key", after.FailReason)
+					}
+					if scenario == "success" {
+						assert.Equal(t, "https://provider.invalid/provider-result-canary?credential=original-task-key", after.PrivateData.ResultURL)
+					}
+				case "not_found", "gone", "failure_threshold", "transport_error", "hook_error", "unrecognized", "gateway_envelope", "in_flight_owner_rebind":
+					assert.Equal(t, 1, calls)
+				default:
+					assert.Zero(t, calls, "unproven identity or credential must not reach the Provider")
+				}
+				var ordinaryAfter []model.LegacyTaskObligation
+				var subscriptionAfter []model.LegacySubscriptionTaskObligation
+				require.NoError(t, model.DB.Find(&ordinaryAfter).Error)
+				require.NoError(t, model.DB.Find(&subscriptionAfter).Error)
+				assert.Equal(t, ordinaryBefore, ordinaryAfter)
+				assert.Equal(t, subscriptionBefore, subscriptionAfter)
+				assert.Equal(t, 0, getUserQuota(t, 77))
+				assert.Equal(t, 8000, getTokenRemainQuota(t, 77))
+				assert.Zero(t, countLogs(t))
+			})
+		}
+	}
+}
+
 func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 	testCases := []struct {
 		name          string
@@ -899,7 +1239,6 @@ func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 		maxFailures   int
 		wantStatus    model.TaskStatus
 		wantFailures  int
-		wantRefund    bool
 		wantReason    string
 		wantState     string
 		wantUnchanged bool
@@ -908,7 +1247,6 @@ func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 			name:          "404 fails immediately and refunds",
 			statusCode:    http.StatusNotFound,
 			wantStatus:    model.TaskStatusFailure,
-			wantRefund:    true,
 			wantReason:    "Upstream task not found",
 			wantUnchanged: false,
 		},
@@ -920,13 +1258,12 @@ func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 			wantUnchanged: true,
 		},
 		{
-			name:          "429 reaches threshold and refunds",
+			name:          "429 reaches threshold without refund",
 			statusCode:    http.StatusTooManyRequests,
 			priorFailures: 2,
 			maxFailures:   3,
 			wantStatus:    model.TaskStatusFailure,
 			wantFailures:  3,
-			wantRefund:    true,
 			wantReason:    "Failed to query the upstream task status",
 		},
 		{
@@ -1016,17 +1353,10 @@ func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 			if testCase.wantState != "" {
 				assert.JSONEq(t, testCase.wantState, string(persisted.PrivateData.PluginState))
 			}
-			if testCase.wantRefund {
-				assert.Equal(t, initialQuota+preConsumed, getUserQuota(t, userID))
-				assert.Equal(t, tokenRemain+preConsumed, getTokenRemainQuota(t, tokenID))
-				assert.Zero(t, persisted.Quota)
-				log := getLastLog(t)
-				require.NotNil(t, log)
-				assert.Equal(t, model.LogTypeRefund, log.Type)
-			} else {
-				assert.Equal(t, initialQuota, getUserQuota(t, userID))
-				assert.Equal(t, tokenRemain, getTokenRemainQuota(t, tokenID))
-			}
+			assert.Equal(t, initialQuota, getUserQuota(t, userID))
+			assert.Equal(t, tokenRemain, getTokenRemainQuota(t, tokenID))
+			assert.Equal(t, preConsumed, persisted.Quota)
+			assert.Zero(t, countLogs(t), "HTTP classification cannot prove a historical refund")
 		})
 	}
 }
@@ -1038,14 +1368,12 @@ func TestUpdateBatchTasksPollClassification(t *testing.T) {
 		resultStatus model.TaskStatus
 		wantStatus   model.TaskStatus
 		wantFailures int
-		wantRefund   bool
 		wantReason   string
 	}{
 		{
-			name:       "404 fails the batch and refunds",
+			name:       "404 classifies unarchived batch without refund",
 			statusCode: http.StatusNotFound,
 			wantStatus: model.TaskStatusFailure,
-			wantRefund: true,
 			wantReason: "Upstream task not found",
 		},
 		{
@@ -1095,12 +1423,10 @@ func TestUpdateBatchTasksPollClassification(t *testing.T) {
 			if testCase.wantReason != "" {
 				assert.Equal(t, testCase.wantReason, persisted.FailReason)
 			}
-			if testCase.wantRefund {
-				assert.Equal(t, initialQuota+preConsumed, getUserQuota(t, userID))
-				assert.Zero(t, persisted.Quota)
-			} else {
-				assert.Equal(t, initialQuota, getUserQuota(t, userID))
-			}
+			assert.Equal(t, initialQuota, getUserQuota(t, userID))
+			assert.Equal(t, tokenRemain, getTokenRemainQuota(t, tokenID))
+			assert.Equal(t, preConsumed, persisted.Quota)
+			assert.Zero(t, countLogs(t), "HTTP classification cannot prove a historical refund")
 		})
 	}
 }

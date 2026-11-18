@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { z } from 'zod'
 
 import type { AdminPermissionMatrix } from '@/lib/admin-permissions'
+import { referralRewardsSchema } from '@/lib/referral-rewards'
 
 // ============================================================================
 // User Schema & Types
@@ -48,8 +49,7 @@ export const userSchema = z.object({
   group: z.string(),
   aff_code: z.string().optional(),
   aff_count: z.number().optional(),
-  aff_quota: z.number().optional(),
-  aff_history_quota: z.number().optional(),
+  referral_rewards: referralRewardsSchema.optional(),
   inviter_id: z.number().optional(),
   linux_do_id: z.string().optional(),
   status: userStatusSchema,
@@ -81,7 +81,6 @@ export interface ApiResponse<T = unknown> {
 export type UserSortBy =
   | 'id'
   | 'username'
-  | 'quota'
   | 'group'
   | 'created_at'
   | 'last_login_at'
@@ -122,7 +121,6 @@ export interface UserFormData {
   display_name: string
   password?: string
   role?: number // Only used when creating user
-  quota?: number // Only used when updating user
   group?: string // Only used when updating user
   remark?: string // Only used when updating user
   admin_permissions?: AdminPermissionMatrix
@@ -134,16 +132,6 @@ export type ManageUserAction =
   | 'enable'
   | 'disable'
   | 'delete'
-  | 'add_quota'
-
-export type QuotaAdjustMode = 'add' | 'subtract' | 'override'
-
-export interface ManageUserQuotaPayload {
-  id: number
-  action: 'add_quota'
-  mode: QuotaAdjustMode
-  value: number
-}
 
 // ============================================================================
 // Dialog Types

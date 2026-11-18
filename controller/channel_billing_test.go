@@ -4,6 +4,8 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -12,6 +14,105 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestUpdateAllChannelsBalanceUsesStableAccountOrder(t *testing.T) {
+	db := model.UseTestDatabases(t)
+	require.NoError(t, db.AutoMigrate(&model.Provider{}, &model.User{}))
+	previousCache, previousRedis, previousInterval := common.MemoryCacheEnabled, common.RedisEnabled, common.RequestInterval
+	common.MemoryCacheEnabled, common.RedisEnabled, common.RequestInterval = true, false, 0
+	t.Cleanup(func() {
+		model.InitProviderCache()
+		common.MemoryCacheEnabled, common.RedisEnabled, common.RequestInterval = previousCache, previousRedis, previousInterval
+	})
+	var mu sync.Mutex
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if r.URL.Path == "/balance" {
+			name = "raw"
+		} else {
+			assert.Equal(t, "/v1/usage", r.URL.Path)
+		}
+		mu.Lock()
+		calls = append(calls, name)
+		mu.Unlock()
+		switch name {
+		case "positive":
+			_, _ = w.Write([]byte(`{"remaining":12.5,"isValid":true}`))
+		case "zero", "noauto":
+			_, _ = w.Write([]byte(`{"remaining":0,"isValid":true}`))
+		case "error":
+			http.Error(w, "fixture upstream unavailable", http.StatusServiceUnavailable)
+		case "raw":
+			_, _ = w.Write([]byte(`{"credits":{"remaining":0},"unit":"upstream-only"}`))
+		default:
+			t.Errorf("filtered Provider reached the upstream: %s", name)
+		}
+	}))
+	defer server.Close()
+	accounts := []model.Provider{
+		{Id: 11, Name: "positive", Priority: common.GetPointer(int64(100))},
+		{Id: 12, Name: "zero", Priority: common.GetPointer(int64(0))},
+		{Id: 13, Name: "error", Priority: common.GetPointer(int64(-100))},
+		{Id: 14, Name: "disabled", Priority: common.GetPointer(int64(999)), Status: common.ChannelStatusManuallyDisabled},
+		{Id: 15, Name: "multi", Priority: common.GetPointer(int64(1000)), ProviderInfo: model.ProviderInfo{IsMultiKey: true}},
+		{Id: 16, Name: "noauto", Priority: common.GetPointer(int64(50)), AutoBan: common.GetPointer(0)},
+		{Id: 17, Name: "raw", Priority: common.GetPointer(int64(25)), Type: constant.ChannelTypeAdvancedCustom, OtherSettings: `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/dashboard/billing/credit_grants","upstream_path":"/balance","converter":"none"}]}}`},
+	}
+	for index := range accounts {
+		account := &accounts[index]
+		account.Key, account.BaseURL, account.Balance = account.Name, common.GetPointer(server.URL), 99
+		if account.Type == 0 {
+			account.Type = constant.ChannelTypeSub2API
+		}
+		if account.Status == 0 {
+			account.Status = common.ChannelStatusEnabled
+		}
+		require.NoError(t, db.Create(account).Error)
+	}
+	model.InitProviderCache()
+	require.NoError(t, updateAllChannelsBalance())
+	mu.Lock()
+	assert.Equal(t, []string{"raw", "noauto", "error", "zero", "positive"}, calls, "live balance refresh must ignore historical Provider.Priority")
+	mu.Unlock()
+	for _, original := range accounts {
+		var stored model.Provider
+		require.NoError(t, db.First(&stored, original.Id).Error)
+		assert.Equal(t, original.Priority, stored.Priority)
+		assert.Equal(t, original.OtherSettings, stored.OtherSettings)
+		assert.Equal(t, original.Key, stored.Key)
+		expectedStatus := original.Status
+		switch original.Name {
+		case "positive":
+			assert.Equal(t, 12.5, stored.Balance)
+			assert.Positive(t, stored.BalanceUpdatedTime)
+		case "zero", "noauto":
+			assert.Zero(t, stored.Balance)
+			assert.Positive(t, stored.BalanceUpdatedTime)
+			if original.Name == "zero" {
+				expectedStatus = common.ChannelStatusAutoDisabled
+				assert.Equal(t, "Insufficient balance", stored.GetOtherInfo()["status_reason"])
+			}
+		default:
+			assert.Equal(t, original.Balance, stored.Balance)
+			assert.Zero(t, stored.BalanceUpdatedTime, "filtered, failed, and raw-only responses do not fabricate a balance")
+		}
+		assert.Equal(t, expectedStatus, stored.Status)
+		cached, err := model.CacheGetProvider(original.Id)
+		require.NoError(t, err)
+		assert.Equal(t, expectedStatus, cached.Status, "zero-balance disable is published to the live Provider cache")
+	}
+
+	mu.Lock()
+	calls = nil
+	mu.Unlock()
+	require.NoError(t, db.Exec("ALTER TABLE providers RENAME TO unavailable_providers").Error)
+	t.Cleanup(func() { require.NoError(t, db.Exec("ALTER TABLE unavailable_providers RENAME TO providers").Error) })
+	require.Error(t, updateAllChannelsBalance(), "a failed account read must not look like an empty successful scan")
+	mu.Lock()
+	assert.Empty(t, calls)
+	mu.Unlock()
+}
 
 func TestGetDeepSeekBalanceUSD(t *testing.T) {
 	tests := []struct {

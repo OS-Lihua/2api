@@ -1,15 +1,21 @@
 package model
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/money"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 // useWalletLedgerDB gives the test its own PostgreSQL schema with the wallet
@@ -18,6 +24,8 @@ func useWalletLedgerDB(t *testing.T) {
 	t.Helper()
 	UseTestDatabases(t)
 	require.NoError(t, migrateWalletLedger(DB))
+	require.NoError(t, DB.AutoMigrate(&User{}, &Option{}))
+	require.NoError(t, MigrateBalanceReminders(DB))
 }
 
 func usd(nanos int64) money.Amount {
@@ -29,6 +37,399 @@ func mustRate(t *testing.T, from, to money.Currency, rate string) *money.Rate {
 	r, err := money.NewRate(from, to, decimal.RequireFromString(rate))
 	require.NoError(t, err)
 	return &r
+}
+
+func TestBalanceReminderStrictSettingsAndAtomicPatch(t *testing.T) {
+	useWalletLedgerDB(t)
+	user := User{Username: "reminder-settings", Setting: `{"language":"fr","billing_preference":"wallet_only"}`}
+	require.NoError(t, DB.Create(&user).Error)
+	for _, body := range []string{`{}`, `null`, `{"enabled":false}`, `{"threshold":null}`, `{"enabled":null,"threshold":null}`, `{"enabled":true,"threshold":{"nanos":1,"currency":"USD"}}`, `{"enabled":true,"threshold":{"nanos":"-1","currency":"USD"}}`, `{"enabled":true,"threshold":{"nanos":"1","currency":"EUR"}}`, `{"enabled":true,"enabled":false,"threshold":null}`, `{"enabled":true,"threshold":null,"unknown":1}`} {
+		var settings BalanceReminderSettings
+		require.Error(t, common.UnmarshalJsonStr(body, &settings), body)
+	}
+	var settings BalanceReminderSettings
+	require.NoError(t, common.UnmarshalJsonStr(`{"enabled":false,"threshold":null}`, &settings))
+	assert.False(t, settings.Enabled)
+	assert.Nil(t, settings.Threshold)
+	zero := usd(0)
+	view, err := PatchUserNotificationSettings(t.Context(), user.Id, &BalanceReminderSettings{Enabled: true, Threshold: &zero}, func(current *User) error {
+		assert.Contains(t, current.Setting, "fr")
+		current.Setting = `{"language":"en","billing_preference":"wallet_only"}`
+		return nil
+	})
+	require.NoError(t, err)
+	require.NotNil(t, view.Threshold)
+	assert.Equal(t, zero, view.EffectiveThreshold)
+	_, err = PatchUserNotificationSettings(t.Context(), user.Id, nil, func(current *User) error { current.Setting = `{"language":"ja"}`; return nil })
+	require.NoError(t, err)
+	view, err = GetUserBalanceReminder(t.Context(), user.Id)
+	require.NoError(t, err)
+	require.NotNil(t, view.Threshold)
+	assert.Zero(t, view.Threshold.Nanos)
+	_, err = PatchUserNotificationSettings(t.Context(), user.Id, &BalanceReminderSettings{Enabled: false}, func(current *User) error { current.Setting = `{"language":"de"}`; return errors.New("patch rejected") })
+	require.Error(t, err)
+	require.NoError(t, DB.First(&user, user.Id).Error)
+	assert.Equal(t, `{"language":"ja"}`, user.Setting)
+	view, err = GetUserBalanceReminder(t.Context(), user.Id)
+	require.NoError(t, err)
+	assert.True(t, view.Enabled)
+	require.NotNil(t, view.Threshold)
+	for _, value := range []string{`{}`, `{"enabled":true,"threshold":null}`, `{"enabled":false,"threshold":{"nanos":"1","currency":"EUR"}}`, `{"enabled":true,"threshold":{"nanos":1,"currency":"USD"}}`} {
+		require.Error(t, UpdateOption(operation_setting.BalanceReminderConfigOption, value))
+	}
+	require.Error(t, UpdateOption("QuotaRemindThreshold", "1"))
+	require.Error(t, UpdateOptionsBulk(map[string]string{"QuotaRemindEnabled": "false", operation_setting.BalanceReminderConfigOption: `{"enabled":true,"threshold":{"nanos":"0","currency":"USD"}}`}))
+	site, err := GetBalanceReminderSiteSettings(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, usd(2_000_000), site.Threshold)
+	_, err = GetUserBalanceReminder(t.Context(), user.Id+10000)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	require.NoError(t, DB.Callback().Create().Before("gorm:create").Register("reminder-pref-failure", func(tx *gorm.DB) {
+		if tx.Statement.Table == "user_balance_reminders" {
+			tx.AddError(errors.New("preference storage failure"))
+		}
+	}))
+	_, err = PatchUserNotificationSettings(t.Context(), user.Id, &BalanceReminderSettings{Enabled: false}, func(current *User) error { current.Setting = `{"language":"de"}`; return nil })
+	require.Error(t, err)
+	require.NoError(t, DB.Callback().Create().Remove("reminder-pref-failure"))
+	require.NoError(t, DB.First(&user, user.Id).Error)
+	assert.Equal(t, `{"language":"ja"}`, user.Setting, "preference failure rolls back transport settings too")
+}
+
+func TestBalanceReminderMigrationPreservesSourcesAndConfirmedSettings(t *testing.T) {
+	UseTestDatabases(t)
+	require.NoError(t, DB.AutoMigrate(&User{}, &Option{}))
+	require.NoError(t, migrateWalletLedger(DB))
+	users := []User{{Username: "legacy-inherit", AffCode: "one", Setting: `{"quota_warning_threshold":0,"language":"fr"}`}, {Username: "legacy-small", AffCode: "two", Setting: `{"quota_warning_enabled":false,"quota_warning_threshold":0.0001}`}, {Username: "legacy-large", AffCode: "three", Setting: `{"quota_warning_threshold":4503599627370.497}`}}
+	require.NoError(t, DB.Create(&users).Error)
+	require.NoError(t, DB.Create(&Option{Key: "QuotaRemindThreshold", Value: "1000"}).Error)
+	require.NoError(t, MigrateBalanceReminders(DB))
+	want := []*int64{nil, new(int64(1)), new(int64(9007199254740994))}
+	for i, user := range users {
+		view, err := GetUserBalanceReminder(t.Context(), user.Id)
+		require.NoError(t, err)
+		if want[i] == nil {
+			assert.Nil(t, view.Threshold)
+		} else {
+			require.NotNil(t, view.Threshold)
+			assert.Equal(t, *want[i], view.Threshold.Nanos)
+		}
+		assert.Equal(t, i != 1, view.Enabled)
+		var after User
+		require.NoError(t, DB.First(&after, user.Id).Error)
+		assert.Equal(t, user.Setting, after.Setting)
+	}
+	zero := usd(0)
+	_, err := PatchUserNotificationSettings(t.Context(), users[2].Id, &BalanceReminderSettings{Enabled: false, Threshold: &zero}, nil)
+	require.NoError(t, err)
+	require.NoError(t, MigrateBalanceReminders(DB))
+	view, err := GetUserBalanceReminder(t.Context(), users[2].Id)
+	require.NoError(t, err)
+	assert.False(t, view.Enabled)
+	assert.Equal(t, zero, *view.Threshold)
+	var source Option
+	require.NoError(t, DB.Where("key = ?", "QuotaRemindThreshold").Take(&source).Error)
+	assert.Equal(t, "1000", source.Value)
+	for _, entity := range []any{&LedgerEntry{}, &balanceReminderEvent{}} {
+		var count int64
+		require.NoError(t, DB.Model(entity).Count(&count).Error)
+		assert.Zero(t, count)
+	}
+}
+
+func TestBalanceReminderMigrationRejectsInvalidAndDistinguishesFreshCurrency(t *testing.T) {
+	for _, tc := range []struct {
+		name, setting, option, currency string
+		ok                              bool
+	}{
+		{"fresh-eur", "", "", "EUR", true}, {"legacy-eur", "", "1000", "EUR", false}, {"user-eur", `{"quota_warning_threshold":1}`, "", "EUR", false}, {"negative", `{"quota_warning_threshold":-1}`, "", "USD", false}, {"overflow", "", "9223372036854775807", "USD", false}, {"invalid-bool", `{"quota_warning_enabled":"false"}`, "", "USD", false}, {"duplicate", `{"quota_warning_threshold":1,"quota_warning_threshold":2}`, "", "USD", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			UseTestDatabases(t)
+			require.NoError(t, DB.AutoMigrate(&User{}, &Option{}))
+			old := settlementCurrency
+			settlementCurrency = money.Currency(tc.currency)
+			t.Cleanup(func() { settlementCurrency = old })
+			if tc.setting != "" {
+				require.NoError(t, DB.Create(&User{Username: "legacy", Setting: tc.setting}).Error)
+			}
+			if tc.option != "" {
+				require.NoError(t, DB.Create(&Option{Key: "QuotaRemindThreshold", Value: tc.option}).Error)
+			}
+			err := MigrateBalanceReminders(DB)
+			if tc.ok {
+				require.NoError(t, err)
+				site, err := GetBalanceReminderSiteSettings(t.Context())
+				require.NoError(t, err)
+				assert.Equal(t, money.Amount{Nanos: 2_000_000, Currency: "EUR"}, site.Threshold)
+				require.NoError(t, MigrateBalanceReminders(DB))
+			} else {
+				require.Error(t, err)
+				assert.False(t, DB.Migrator().HasTable(&balanceReminderMigration{}))
+				var count int64
+				require.NoError(t, DB.Model(&Option{}).Where("key = ?", operation_setting.BalanceReminderConfigOption).Count(&count).Error)
+				assert.Zero(t, count)
+			}
+		})
+	}
+}
+
+func reminderDeliveryFixture(t *testing.T, events int) User {
+	t.Helper()
+	user, _ := subscriptionFundingFixture(t, "wallet_only", 1_500_000_000, 0, true, false)
+	threshold := usd(1_000_000_000)
+	_, err := PatchUserNotificationSettings(t.Context(), user.Id, &BalanceReminderSettings{Enabled: true, Threshold: &threshold}, nil)
+	require.NoError(t, err)
+	for i := 0; i < events; i++ {
+		if i > 0 {
+			_, err = TopUpWallet(WalletTopUp{UserId: user.Id, Source: usd(600_000_000), Reference: fmt.Sprintf("rearm-%d", i)})
+			require.NoError(t, err)
+		}
+		request := GatewayRequest{ID: fmt.Sprintf("delivery-%d", i), UserID: user.Id, SaleFXRate: "1"}
+		require.NoError(t, ReserveGateway(&request, usd(600_000_000), usd(600_000_000)))
+		require.NoError(t, PrepareGatewaySettlement(subscriptionFundingIntent(request, 600_000_000)))
+		_, err = SettleGateway(request.ID)
+		require.NoError(t, err)
+	}
+	return user
+}
+
+func TestBalanceReminderClaimLeaseBudgetAndRecheck(t *testing.T) {
+	t.Run("fixed-window", func(t *testing.T) {
+		fake := clock.UseFake(t, time.Date(2026, 11, 17, 10, 59, 0, 0, time.UTC))
+		user := reminderDeliveryFixture(t, 3)
+		deliveries, err := ClaimBalanceReminders(t.Context(), "worker-one", 1, time.Minute, 12*time.Hour, 2)
+		require.NoError(t, err)
+		require.Len(t, deliveries, 1)
+		first := deliveries[0]
+		assert.Equal(t, "wallet", first.Scope)
+		assert.Equal(t, "1500000000", first.Before.Nanos)
+		assert.Equal(t, "900000000", first.After.Nanos)
+		ok, err := CheckBalanceReminderDelivery(t.Context(), first.ID, first.ClaimToken)
+		require.NoError(t, err)
+		assert.True(t, ok)
+		require.NoError(t, FinishBalanceReminderDelivery(t.Context(), first.ID, first.ClaimToken, BalanceReminderOutcome{Status: "retry", Code: BalanceReminderDeliveryFailed, RetryAt: clock.Now().Add(time.Minute)}))
+		fake.Advance(2 * time.Minute)
+		deliveries, err = ClaimBalanceReminders(t.Context(), "worker-after-hour", 1, time.Minute, 12*time.Hour, 2)
+		require.NoError(t, err)
+		require.Len(t, deliveries, 1)
+		second := deliveries[0]
+		require.NoError(t, FinishBalanceReminderDelivery(t.Context(), second.ID, second.ClaimToken, BalanceReminderOutcome{Status: "sent", Code: BalanceReminderDelivered}))
+		deliveries, err = ClaimBalanceReminders(t.Context(), "other-process", 100, time.Minute, 12*time.Hour, 2)
+		require.NoError(t, err)
+		assert.Empty(t, deliveries)
+		var budget balanceReminderWindow
+		require.NoError(t, DB.Where("user_id = ?", user.Id).Take(&budget).Error)
+		assert.Equal(t, 2, budget.Attempts)
+		assert.Equal(t, time.Date(2026, 11, 17, 22, 59, 0, 0, time.UTC).UnixMilli(), budget.EndsAt)
+		fake.Advance(12 * time.Hour)
+		deliveries, err = ClaimBalanceReminders(t.Context(), "after-fixed-window", 100, time.Minute, 12*time.Hour, 2)
+		require.NoError(t, err)
+		assert.Len(t, deliveries, 2)
+	})
+	t.Run("lease-fencing", func(t *testing.T) {
+		fake := clock.UseFake(t, time.Unix(2000, 0))
+		reminderDeliveryFixture(t, 1)
+		first, err := ClaimBalanceReminders(t.Context(), "old", 1, time.Second, time.Hour, 10)
+		require.NoError(t, err)
+		require.Len(t, first, 1)
+		fake.Advance(2 * time.Second)
+		second, err := ClaimBalanceReminders(t.Context(), "new", 1, time.Minute, time.Hour, 10)
+		require.NoError(t, err)
+		require.Len(t, second, 1)
+		assert.NotEqual(t, first[0].ClaimToken, second[0].ClaimToken)
+		require.ErrorIs(t, FinishBalanceReminderDelivery(t.Context(), first[0].ID, first[0].ClaimToken, BalanceReminderOutcome{Status: "sent", Code: BalanceReminderDelivered}), ErrBalanceReminderLeaseLost)
+		ok, err := CheckBalanceReminderDelivery(t.Context(), first[0].ID, first[0].ClaimToken)
+		require.NoError(t, err)
+		assert.False(t, ok)
+		require.NoError(t, FinishBalanceReminderDelivery(t.Context(), second[0].ID, second[0].ClaimToken, BalanceReminderOutcome{Status: "sent", Code: BalanceReminderDelivered}))
+		require.Error(t, FinishBalanceReminderDelivery(t.Context(), second[0].ID, second[0].ClaimToken, BalanceReminderOutcome{Status: "retry", Code: "https://secret.invalid/token"}))
+	})
+	for _, reason := range []string{"recovered", "disabled", "sql-error"} {
+		t.Run(reason, func(t *testing.T) {
+			user := reminderDeliveryFixture(t, 1)
+			events, err := ClaimBalanceReminders(t.Context(), "recheck", 1, time.Minute, time.Hour, 2)
+			require.NoError(t, err)
+			require.Len(t, events, 1)
+			switch reason {
+			case "recovered":
+				_, err = TopUpWallet(WalletTopUp{UserId: user.Id, Source: usd(100_000_000), Reference: "restore"})
+				require.NoError(t, err)
+			case "disabled":
+				_, err = PatchUserNotificationSettings(t.Context(), user.Id, &BalanceReminderSettings{Enabled: false}, nil)
+				require.NoError(t, err)
+			case "sql-error":
+				require.NoError(t, DB.Exec("ALTER TABLE user_balance_reminders RENAME TO reminder_hidden").Error)
+				defer func() {
+					require.NoError(t, DB.Exec("ALTER TABLE reminder_hidden RENAME TO user_balance_reminders").Error)
+				}()
+			}
+			ok, err := CheckBalanceReminderDelivery(t.Context(), events[0].ID, events[0].ClaimToken)
+			if reason == "sql-error" {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				var event balanceReminderEvent
+				require.NoError(t, DB.First(&event, events[0].ID).Error)
+				assert.Equal(t, "skipped", event.Status)
+				assert.Equal(t, reason, event.Code)
+			}
+			assert.False(t, ok)
+		})
+	}
+	t.Run("stale-period", func(t *testing.T) {
+		user, sub := subscriptionFundingFixture(t, "subscription_only", 0, 1_500_000_000, false, false)
+		threshold := usd(1_000_000_000)
+		_, err := PatchUserNotificationSettings(t.Context(), user.Id, &BalanceReminderSettings{Enabled: true, Threshold: &threshold}, nil)
+		require.NoError(t, err)
+		request := GatewayRequest{ID: "reminder-delivery-old-period", UserID: user.Id, SaleFXRate: "1"}
+		require.NoError(t, ReserveGateway(&request, usd(600_000_000), usd(600_000_000)))
+		require.NoError(t, PrepareGatewaySettlement(subscriptionFundingIntent(request, 600_000_000)))
+		_, err = SettleGateway(request.ID)
+		require.NoError(t, err)
+		deliveries, err := ClaimBalanceReminders(t.Context(), "before-reset", 1, time.Minute, time.Hour, 2)
+		require.NoError(t, err)
+		require.Len(t, deliveries, 1)
+		require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+			locked, err := lockSubscriptionLifecycleTx(tx, sub.Id)
+			if err != nil {
+				return err
+			}
+			return createSubscriptionPeriodTx(tx, locked, usd(0), "reset")
+		}))
+		ok, err := CheckBalanceReminderDelivery(t.Context(), deliveries[0].ID, deliveries[0].ClaimToken)
+		require.NoError(t, err)
+		assert.False(t, ok)
+		var event balanceReminderEvent
+		require.NoError(t, DB.First(&event, deliveries[0].ID).Error)
+		assert.Equal(t, "skipped", event.Status)
+		assert.Equal(t, BalanceReminderStalePeriod, event.Code)
+	})
+	t.Run("concurrent-budget", func(t *testing.T) {
+		reminderDeliveryFixture(t, 3)
+		results := make(chan []BalanceReminderDelivery, 2)
+		errs := make(chan error, 2)
+		for _, name := range []string{"one", "two"} {
+			go func() {
+				rows, err := ClaimBalanceReminders(t.Context(), name, 2, time.Minute, time.Hour, 1)
+				results <- rows
+				errs <- err
+			}()
+		}
+		total := len(<-results) + len(<-results)
+		require.NoError(t, <-errs)
+		require.NoError(t, <-errs)
+		assert.Equal(t, 1, total)
+	})
+}
+
+func TestBalanceReminderDuePredicate(t *testing.T) {
+	clock.UseFake(t, time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC))
+	reminderDeliveryFixture(t, 1)
+	now := clock.Now().UnixMilli()
+	for _, tc := range []struct {
+		name, status string
+		next, lease  int64
+		due          bool
+	}{
+		{"pending-now", "pending", now, 0, true}, {"pending-future", "pending", now + 1, 0, false},
+		{"retry-now", "retry", now, 0, true}, {"retry-future", "retry", now + 1, 0, false},
+		{"lease-expired", "delivering", now + 1, now, true}, {"lease-live", "delivering", now - 1, now + 1, false},
+		{"sent", "sent", now - 1, 0, false}, {"skipped", "skipped", now - 1, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, DB.Model(&balanceReminderEvent{}).Where("id > 0").Updates(map[string]any{"status": tc.status, "next_attempt_at": tc.next, "lease_until": tc.lease}).Error)
+			var before, after balanceReminderEvent
+			require.NoError(t, DB.Take(&before).Error)
+			due, err := HasDueBalanceReminders(t.Context())
+			require.NoError(t, err)
+			assert.Equal(t, tc.due, due)
+			require.NoError(t, DB.Take(&after).Error)
+			assert.Equal(t, before, after)
+		})
+	}
+	var count int64
+	require.NoError(t, DB.Model(&balanceReminderWindow{}).Count(&count).Error)
+	assert.Zero(t, count)
+	require.NoError(t, DB.Exec("ALTER TABLE balance_reminder_events RENAME TO unavailable_reminders").Error)
+	due, err := HasDueBalanceReminders(t.Context())
+	assert.Error(t, err)
+	assert.False(t, due)
+	require.NoError(t, DB.Exec("ALTER TABLE unavailable_reminders RENAME TO balance_reminder_events").Error)
+}
+
+func TestBalanceReminderPurchaseAndDurableFacts(t *testing.T) {
+	user, _ := subscriptionFundingFixture(t, "wallet_only", 1_500_000_000, 0, true, false)
+	require.NoError(t, DB.AutoMigrate(&SubscriptionOrder{}))
+	require.NoError(t, migrateLOGDB())
+	threshold := usd(1_000_000_000)
+	_, err := PatchUserNotificationSettings(t.Context(), user.Id, &BalanceReminderSettings{Enabled: true, Threshold: &threshold}, nil)
+	require.NoError(t, err)
+	allowed := true
+	plan := SubscriptionPlan{Title: "Reminder purchase", Price: usd(600_000_000), Allowance: usd(0), Unlimited: true, MoneyVersion: 1, Enabled: true, DurationUnit: "month", DurationValue: 1, AllowBalancePay: &allowed}
+	require.NoError(t, DB.Create(&plan).Error)
+	revision, err := SubscriptionPurchaseRevision(&plan)
+	require.NoError(t, err)
+	purchaseID := "9241639c-31c7-4220-943b-d7f99f0cb990"
+	_, err = PurchaseSubscriptionWithBalance(t.Context(), user.Id, plan.Id, purchaseID, revision)
+	require.NoError(t, err)
+	_, err = PurchaseSubscriptionWithBalance(t.Context(), user.Id, plan.Id, purchaseID, revision)
+	require.NoError(t, err)
+	var events []balanceReminderEvent
+	require.NoError(t, DB.Find(&events).Error)
+	require.Len(t, events, 1)
+	assert.Equal(t, "1500000000", events[0].BeforeNanos.String())
+	assert.Equal(t, "900000000", events[0].AfterNanos.String())
+	require.NoError(t, DB.Model(&SubscriptionPlan{}).Where("id = ?", plan.Id).UpdateColumn("price_nanos", 0).Error)
+	require.NoError(t, DB.First(&plan, plan.Id).Error)
+	revision, err = SubscriptionPurchaseRevision(&plan)
+	require.NoError(t, err)
+	_, err = PurchaseSubscriptionWithBalance(t.Context(), user.Id, plan.Id, "440e6be4-4e56-4b2b-9496-4e511cb328e3", revision)
+	require.NoError(t, err)
+	var count int64
+	require.NoError(t, DB.Model(&balanceReminderEvent{}).Count(&count).Error)
+	assert.EqualValues(t, 1, count, "free grant creates no consumption event")
+	require.Error(t, DB.Model(&balanceReminderEvent{}).Where("id = ?", events[0].ID).UpdateColumn("user_id", user.Id+1).Error)
+	require.Error(t, DB.Delete(&balanceReminderEvent{}, events[0].ID).Error)
+	require.Error(t, DB.Exec("TRUNCATE balance_reminder_events").Error)
+	require.NoError(t, MigrateBalanceReminders(DB))
+	var retained balanceReminderEvent
+	require.NoError(t, DB.First(&retained, events[0].ID).Error)
+	assert.Equal(t, events[0], retained)
+	if LOG_DB.Dialector.Name() == "clickhouse" {
+		assert.False(t, LOG_DB.Migrator().HasTable(&balanceReminderEvent{}))
+		assert.False(t, LOG_DB.Migrator().HasTable(&UserBalanceReminder{}))
+	}
+}
+
+func TestBalanceReminderZeroBudgetAndThresholdEquality(t *testing.T) {
+	t.Run("zero-budget", func(t *testing.T) {
+		reminderDeliveryFixture(t, 1)
+		deliveries, err := ClaimBalanceReminders(t.Context(), "paused-budget", 10, time.Minute, time.Hour, 0)
+		require.NoError(t, err)
+		assert.Empty(t, deliveries)
+		var event balanceReminderEvent
+		require.NoError(t, DB.Take(&event).Error)
+		assert.Equal(t, "retry", event.Status)
+		assert.Equal(t, BalanceReminderRateLimited, event.Code)
+		assert.Zero(t, event.Attempts)
+	})
+	t.Run("equality", func(t *testing.T) {
+		user, _ := subscriptionFundingFixture(t, "wallet_only", 1_500_000_000, 0, true, false)
+		threshold := usd(1_000_000_000)
+		_, err := PatchUserNotificationSettings(t.Context(), user.Id, &BalanceReminderSettings{Enabled: true, Threshold: &threshold}, nil)
+		require.NoError(t, err)
+		for i, amount := range []int64{500_000_000, 1} {
+			request := GatewayRequest{ID: fmt.Sprintf("equality-%d", i), UserID: user.Id, SaleFXRate: "1"}
+			require.NoError(t, ReserveGateway(&request, usd(amount), usd(amount)))
+			require.NoError(t, PrepareGatewaySettlement(subscriptionFundingIntent(request, amount)))
+			_, err = SettleGateway(request.ID)
+			require.NoError(t, err)
+			var count int64
+			require.NoError(t, DB.Model(&balanceReminderEvent{}).Count(&count).Error)
+			assert.EqualValues(t, i, count)
+		}
+	})
 }
 
 func TestTopUpWalletCreditsSettlementCurrency(t *testing.T) {

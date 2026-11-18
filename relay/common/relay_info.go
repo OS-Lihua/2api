@@ -85,8 +85,10 @@ type TokenCountMeta struct {
 }
 
 type RelayInfo struct {
-	TokenId           int
-	TokenKey          string
+	TokenId  int
+	TokenKey string
+	// TokenGroup is retained for historical struct compatibility; runtime
+	// parameter overrides no longer project or evaluate this legacy value.
 	TokenGroup        string
 	UserId            int
 	UsingGroup        string // 使用的分组，当auto跨分组重试时，会变动
@@ -98,11 +100,14 @@ type RelayInfo struct {
 	//SendLastReasoningResponse bool
 	IsStream               bool
 	IsGeminiBatchEmbedding bool
-	IsPlayground           bool
-	UsePrice               bool
-	RelayMode              int
-	OriginModelName        string
-	ResponseModel          *ResponseModel
+	// EmbeddingDimensions has one entry per effective input; nil entries allow
+	// the Provider's default vector dimension. Empty means no request expectation.
+	EmbeddingDimensions []*int `json:"-"`
+	IsPlayground        bool
+	UsePrice            bool
+	RelayMode           int
+	OriginModelName     string
+	ResponseModel       *ResponseModel
 
 	// BillingModelName is the pricing identity for this request. It is kept
 	// separate from OriginModelName and UpstreamModelName so virtual pricing
@@ -157,13 +162,6 @@ type RelayInfo struct {
 	ChatToGeminiStreamState any
 	ReceivedResponseCount   int
 	FinalPreConsumedQuota   int // 最终预消耗的配额
-	// ForcePreConsume 为 true 时禁用 BillingSession 的信任额度旁路，
-	// 强制预扣全额。用于异步任务（视频/音乐生成等），因为请求返回后任务仍在运行，
-	// 必须在提交前锁定全额。
-	ForcePreConsume bool
-	// Billing 是计费会话，封装了预扣费/结算/退款的统一生命周期。
-	// 初始免费组可为 nil；若 auto 重试切换到付费组，会在发送前创建。
-	Billing BillingSettler
 	// BillingSource indicates whether this request is billed from wallet quota or subscription.
 	// "" or "wallet" => wallet; "subscription" => subscription
 	BillingSource string
@@ -272,7 +270,7 @@ func (info *RelayInfo) UpdateImageCount(count int64) {
 	if info.PriceData.UsePrice {
 		info.PriceData.AddOtherRatio("n", float64(count))
 	}
-	if info.TieredBillingSnapshot != nil && info.TieredBillingSnapshot.EstimatedImageCount != nil {
+	if info.ResponseFacts != nil || info.TieredBillingSnapshot != nil && info.TieredBillingSnapshot.EstimatedImageCount != nil {
 		n := int(count)
 		info.BillingImageCount = &n
 	}
@@ -614,12 +612,6 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 	//channelId := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
 	//paramOverride := common.GetContextKeyStringMap(c, constant.ContextKeyChannelParamOverride)
 
-	tokenGroup := common.GetContextKeyString(c, constant.ContextKeyTokenGroup)
-	// 当令牌分组为空时，表示使用用户分组
-	if tokenGroup == "" {
-		tokenGroup = common.GetContextKeyString(c, constant.ContextKeyUserGroup)
-	}
-
 	startTime := common.GetContextKeyTime(c, constant.ContextKeyRequestStartTime)
 	if startTime.IsZero() {
 		startTime = time.Now()
@@ -656,7 +648,6 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 		TokenId:        common.GetContextKeyInt(c, constant.ContextKeyTokenId),
 		TokenKey:       common.GetContextKeyString(c, constant.ContextKeyTokenKey),
 		TokenUnlimited: common.GetContextKeyBool(c, constant.ContextKeyTokenUnlimited),
-		TokenGroup:     tokenGroup,
 
 		isFirstResponse: true,
 		RelayMode:       relayconstant.Path2RelayMode(c.Request.URL.Path),

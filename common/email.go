@@ -1,14 +1,28 @@
 package common
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"net/smtp"
 	"slices"
 	"strings"
 	"time"
 )
+
+// EmailDeliveryError preserves the safe public message while allowing durable
+// notification delivery to distinguish configuration, recipient and HTTP errors.
+type EmailDeliveryError struct {
+	Cause            error
+	NotConfigured    bool
+	InvalidRecipient bool
+	HTTPStatus       int
+}
+
+func (err *EmailDeliveryError) Error() string { return err.Cause.Error() }
+func (err *EmailDeliveryError) Unwrap() error { return err.Cause }
 
 func generateMessageID() (string, error) {
 	split := strings.Split(SMTPFrom, "@")
@@ -41,26 +55,45 @@ func smtpTLSConfig() *tls.Config {
 	}
 }
 
-func newSMTPClient(addr string) (*smtp.Client, error) {
-	if SMTPSSLEnabled || (SMTPPort == 465 && !SMTPStartTLSEnabled) {
-		conn, err := tls.Dial("tcp", addr, smtpTLSConfig())
-		if err != nil {
-			return nil, err
-		}
-		client, err := smtp.NewClient(conn, SMTPServer)
-		if err != nil {
-			_ = conn.Close()
-			return nil, err
-		}
-		return client, nil
-	}
+type smtpContextConn struct {
+	net.Conn
+	stopCancellation func() bool
+}
 
-	client, err := smtp.Dial(addr)
+func (conn *smtpContextConn) Close() error {
+	conn.stopCancellation()
+	return conn.Conn.Close()
+}
+
+func newSMTPClient(addr string) (*smtp.Client, error) {
+	return newSMTPClientWithContext(context.Background(), addr)
+}
+
+func newSMTPClientWithContext(ctx context.Context, addr string) (*smtp.Client, error) {
+	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := raw.SetDeadline(deadline); err != nil {
+			_ = raw.Close()
+			return nil, err
+		}
+	}
+	conn := &smtpContextConn{Conn: raw}
+	conn.stopCancellation = context.AfterFunc(ctx, func() { _ = raw.Close() })
+	var transport net.Conn = conn
+	implicitTLS := SMTPSSLEnabled || (SMTPPort == 465 && !SMTPStartTLSEnabled)
+	if implicitTLS {
+		transport = tls.Client(conn, smtpTLSConfig())
+	}
+	client, err := smtp.NewClient(transport, SMTPServer)
+	if err != nil {
+		_ = transport.Close()
+		return nil, err
+	}
 
-	if SMTPStartTLSEnabled {
+	if !implicitTLS && SMTPStartTLSEnabled {
 		startTLSSupported, _ := client.Extension("STARTTLS")
 		if !startTLSSupported {
 			_ = client.Close()
@@ -76,6 +109,29 @@ func newSMTPClient(addr string) (*smtp.Client, error) {
 }
 
 func SendEmail(subject string, receiver string, content string) error {
+	return SendEmailWithContext(context.Background(), subject, receiver, content)
+}
+
+// SendEmailWithContext bounds the entire selected delivery attempt, including
+// SMTP greeting, TLS negotiation and message acknowledgement. Cancellation
+// closes the underlying connection instead of abandoning a sending goroutine.
+func SendEmailWithContext(ctx context.Context, subject string, receiver string, content string) (sendErr error) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	defer func() {
+		if sendErr == nil {
+			return
+		}
+		if ctx.Err() != nil {
+			sendErr = ctx.Err()
+		} else if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+			// The socket deadline can wake before the context's timer callback.
+			sendErr = context.DeadlineExceeded
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	OptionMapRWMutex.RLock()
 	provider := OptionMap["EmailProvider"]
 	resendKey := OptionMap["ResendApiKey"]
@@ -85,7 +141,7 @@ func SendEmail(subject string, receiver string, content string) error {
 	// a failed response does not prove that the first provider did not send.
 	switch provider {
 	case "resend":
-		return sendResendEmail(resendKey, resendFrom, subject, receiver, content)
+		return sendResendEmail(ctx, resendKey, resendFrom, subject, receiver, content)
 	case "", "smtp": // Preserve existing installations without a selector.
 	default:
 		return NewMessage("Email sending method must be SMTP or Resend")
@@ -93,12 +149,12 @@ func SendEmail(subject string, receiver string, content string) error {
 	if SMTPFrom == "" { // for compatibility
 		SMTPFrom = SMTPAccount
 	}
+	if SMTPServer == "" && SMTPAccount == "" {
+		return &EmailDeliveryError{Cause: NewMessage("SMTP server is not configured"), NotConfigured: true}
+	}
 	id, err2 := generateMessageID()
 	if err2 != nil {
-		return err2
-	}
-	if SMTPServer == "" && SMTPAccount == "" {
-		return NewMessage("SMTP server is not configured")
+		return &EmailDeliveryError{Cause: err2, NotConfigured: true}
 	}
 	encodedSubject := fmt.Sprintf("=?UTF-8?B?%s?=", base64.StdEncoding.EncodeToString([]byte(subject)))
 	mail := []byte(fmt.Sprintf("To: %s\r\n"+
@@ -112,7 +168,7 @@ func SendEmail(subject string, receiver string, content string) error {
 	addr := fmt.Sprintf("%s:%d", SMTPServer, SMTPPort)
 	to := strings.Split(receiver, ";")
 	var err error
-	client, err := newSMTPClient(addr)
+	client, err := newSMTPClientWithContext(ctx, addr)
 	if err != nil {
 		return err
 	}
@@ -142,9 +198,11 @@ func SendEmail(subject string, receiver string, content string) error {
 	if err != nil {
 		return err
 	}
-	err = client.Quit()
-	if err != nil {
-		SysError(LogText("failed to send email to %s: %v", receiver, err))
+	// DATA's positive completion reply already confirms provider acceptance.
+	// A later QUIT failure must not turn that receipt into a retry or leak the
+	// recipient/provider's arbitrary reply through server diagnostics.
+	if err = client.Quit(); err != nil {
+		SysError(LogText("SMTP session close failed after message acceptance"))
 	}
-	return err
+	return nil
 }

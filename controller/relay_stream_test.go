@@ -4,6 +4,10 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/capability"
+	"github.com/QuantumNous/new-api/pkg/protocol"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +20,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -27,6 +32,64 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func newCanonicalRelayFixture(t *testing.T, kind protocol.Type, name string, upstream ...http.HandlerFunc) (*nativeGatewayTaskFixture, *gin.Engine) {
+	t.Helper()
+	require.NoError(t, i18n.Init())
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("invalid request must not reach the Provider")
+		w.WriteHeader(http.StatusBadGateway)
+	})
+	if len(upstream) > 0 {
+		handler = upstream[0]
+	}
+	fixture := newNativeGatewayTaskFixture(t, handler)
+	if len(upstream) == 0 {
+		t.Cleanup(func() {
+			var reservations int64
+			require.NoError(t, fixture.db.Model(&model.GatewayBilling{}).Count(&reservations).Error)
+			assert.Zero(t, reservations, "keepalive and invalid inputs are not business delivery or billable usage")
+			assertSubmissionWallet(t, fixture, 2_000_000_000)
+		})
+	}
+	providerType, output := constant.ChannelTypeAnthropic, capability.Text
+	path := "/v1/messages"
+	if kind == protocol.OpenAIImages {
+		providerType, output, path = constant.ChannelTypeOpenAI, capability.Image, "/v1/images/generations"
+	} else if kind == protocol.DeepSeekTools {
+		providerType, path = constant.ChannelTypeDeepSeek, "/v1/tools/search"
+	}
+	capabilities := capability.Set{Features: []capability.Feature{capability.Streaming}, InputModalities: []capability.Modality{capability.Text, capability.Image}, OutputModalities: []capability.Modality{output}}
+	require.NoError(t, fixture.db.Model(&model.Provider{}).Where("id = ?", fixture.provider.Id).Update("type", providerType).Error)
+	require.NoError(t, fixture.db.Model(&model.Model{}).Where("id = ?", fixture.channel.ModelID).Updates(map[string]any{"model_name": name, "capabilities": capabilities}).Error)
+	require.NoError(t, fixture.db.Model(&model.Channel{}).Where("id = ?", fixture.channel.ID).Updates(map[string]any{"protocol": kind, "upstream_model_name": name, "capabilities": capabilities}).Error)
+	expression := `tier("fixed", fixed(0.01))`
+	if kind == protocol.OpenAIImages {
+		expression = `tier("image", fixed(0.04)) * image_count`
+	}
+	for _, old := range []*model.PriceVersion{fixture.sale, fixture.purchase} {
+		next := &model.PriceVersion{OwnerType: old.OwnerType, OwnerID: old.OwnerID, Currency: "USD", Expression: expression, EffectiveAt: time.Now().Unix()}
+		require.NoError(t, model.CreatePriceVersion(t.Context(), next, fixture.user.Id))
+	}
+	fixture.offering.Aliases = []string{name}
+	require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) {
+		if c.Request.Header.Get("Authorization") == "" {
+			c.Request.Header.Set("Authorization", "Bearer "+fixture.token.Key)
+		}
+	})
+	engine.Use(middleware.GatewayTokenAuth(), middleware.ResolveTextOffering())
+	if kind == protocol.OpenAIImages {
+		engine.POST(path, MediaGateway)
+	} else {
+		engine.POST(path, TextGateway)
+		if kind == protocol.DeepSeekTools {
+			engine.POST("/v1/tools/fetch", TextGateway)
+		}
+	}
+	return fixture, engine
+}
 
 func TestRelayKeepAliveDuringImagePreparation(t *testing.T) {
 	settings := operation_setting.GetGeneralSetting()
@@ -54,11 +117,7 @@ func TestRelayKeepAliveDuringImagePreparation(t *testing.T) {
 		w.WriteHeader(http.StatusBadGateway)
 	}))
 	defer imageServer.Close()
-	engine := gin.New()
-	engine.POST("/v1/messages", func(c *gin.Context) {
-		common.SetContextKey(c, constant.ContextKeyOriginalModel, "claude-sonnet-4-20250514")
-		Relay(c, types.RelayFormatClaude)
-	})
+	_, engine := newCanonicalRelayFixture(t, protocol.AnthropicMessages, "claude-sonnet-4-20250514")
 	gateway := httptest.NewServer(engine)
 	defer gateway.Close()
 	defer releaseOnce.Do(func() { close(releaseImage) })
@@ -175,13 +234,20 @@ func TestRelayKeepAlivePreservesValidationErrors(t *testing.T) {
 	settings.PingIntervalEnabled = true
 	t.Cleanup(func() { settings.PingIntervalEnabled = previousEnabled })
 	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-20250514","stream":true}`))
-	c.Request.Header.Set("Content-Type", "application/json")
-	Relay(c, types.RelayFormatClaude)
+	_, engine := newCanonicalRelayFixture(t, protocol.AnthropicMessages, "claude-sonnet-4-20250514")
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-20250514","stream":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(recorder, request)
 	require.Equal(t, http.StatusBadRequest, recorder.Code)
 	require.Contains(t, recorder.Header().Get("Content-Type"), "application/json")
 	require.NotContains(t, recorder.Body.String(), ": PING")
+	unauthorized := httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-20250514","stream":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer invalid-credential")
+	engine.ServeHTTP(unauthorized, request)
+	require.Equal(t, http.StatusUnauthorized, unauthorized.Code)
+	require.NotContains(t, unauthorized.Body.String(), ": PING", "authentication precedes all keepalive")
 }
 
 func TestStreamKeepAlivePreservesFastHTTPFailures(t *testing.T) {
@@ -256,13 +322,12 @@ func TestRelayKeepAliveHonorsStreamSettings(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			settings.PingIntervalEnabled = test.enabled
 			recorder := httptest.NewRecorder()
-			c, _ := gin.CreateTestContext(recorder)
+			_, engine := newCanonicalRelayFixture(t, protocol.AnthropicMessages, "claude-sonnet-4-20250514")
 			body := `{"model":"claude-sonnet-4-20250514","max_tokens":16,"stream":` + strconv.FormatBool(test.stream) + `,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"!"}}]}]}`
-			c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
-			c.Request.Header.Set("Content-Type", "application/json")
-			common.SetContextKey(c, constant.ContextKeyOriginalModel, "claude-sonnet-4-20250514")
-			Relay(c, types.RelayFormatClaude)
-			require.Equal(t, http.StatusInternalServerError, recorder.Code)
+			request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			engine.ServeHTTP(recorder, request)
+			require.Equal(t, http.StatusBadRequest, recorder.Code, "invalid image bytes are rejected by the canonical request boundary")
 			require.Contains(t, recorder.Header().Get("Content-Type"), "application/json")
 			require.NotContains(t, recorder.Body.String(), ": PING")
 			var response map[string]any

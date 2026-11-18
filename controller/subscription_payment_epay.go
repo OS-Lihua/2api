@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"strconv"
 	"time"
 
+	"errors"
 	"github.com/Calcium-Ion/go-epay/epay"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -14,6 +14,8 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/samber/lo"
+	"github.com/shopspring/decimal"
+	"gorm.io/gorm"
 )
 
 type SubscriptionEpayPayRequest struct {
@@ -27,7 +29,7 @@ func SubscriptionRequestEpay(c *gin.Context) {
 	}
 
 	var req SubscriptionEpayPayRequest
-	if err := c.ShouldBindJSON(&req); err != nil || req.PlanId <= 0 {
+	if err := common.DecodeJsonStrict(c.Request.Body, &req); err != nil || req.PlanId <= 0 {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
@@ -37,12 +39,21 @@ func SubscriptionRequestEpay(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	if err := plan.ValidateMoney(); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	if !plan.Enabled {
 		common.ApiErrorT(c, "Subscription plan is not enabled")
 		return
 	}
-	if plan.PriceAmount < 0.01 {
+	if plan.Price.Nanos < 10000000 || plan.Price.Nanos%10000000 != 0 {
 		common.ApiErrorT(c, "Plan amount is too low")
+		return
+	}
+	configured := operation_setting.GetCheckoutConfig().Providers["epay"]
+	if configured.ChargeUnit == nil || configured.ChargeUnit.Currency != plan.Price.Currency {
+		common.ApiErrorT(c, "Payment information has not been configured by administrator")
 		return
 	}
 	if !operation_setting.ContainsPayMethod(req.PaymentMethod) {
@@ -87,14 +98,13 @@ func SubscriptionRequestEpay(c *gin.Context) {
 	order := &model.SubscriptionOrder{
 		UserId:          userId,
 		PlanId:          plan.Id,
-		Money:           plan.PriceAmount,
 		TradeNo:         tradeNo,
 		PaymentMethod:   req.PaymentMethod,
 		PaymentProvider: model.PaymentProviderEpay,
 		CreateTime:      time.Now().Unix(),
 		Status:          common.TopUpStatusPending,
 	}
-	if err := order.Insert(); err != nil {
+	if err := order.InsertWithContract(plan); err != nil {
 		common.ApiErrorT(c, "Failed to create order")
 		return
 	}
@@ -102,7 +112,7 @@ func SubscriptionRequestEpay(c *gin.Context) {
 		Type:           req.PaymentMethod,
 		ServiceTradeNo: tradeNo,
 		Name:           fmt.Sprintf("SUB:%s", plan.Title),
-		Money:          strconv.FormatFloat(plan.PriceAmount, 'f', 2, 64),
+		Money:          decimal.NewFromInt(plan.Price.Nanos).Shift(-9).StringFixed(2),
 		Device:         epay.PC,
 		NotifyUrl:      notifyUrl,
 		ReturnUrl:      returnUrl,
@@ -160,7 +170,7 @@ func SubscriptionEpayNotify(c *gin.Context) {
 	LockOrder(verifyInfo.ServiceTradeNo)
 	defer UnlockOrder(verifyInfo.ServiceTradeNo)
 
-	if err := model.CompleteSubscriptionOrder(verifyInfo.ServiceTradeNo, common.GetJsonString(verifyInfo), model.PaymentProviderEpay, verifyInfo.Type); err != nil {
+	if err := completeExactEpaySubscription(verifyInfo.ServiceTradeNo, verifyInfo.Money, verifyInfo.Type); err != nil {
 		_, _ = c.Writer.Write([]byte("fail"))
 		return
 	}
@@ -209,7 +219,7 @@ func SubscriptionEpayReturn(c *gin.Context) {
 	if verifyInfo.TradeStatus == epay.StatusTradeSuccess {
 		LockOrder(verifyInfo.ServiceTradeNo)
 		defer UnlockOrder(verifyInfo.ServiceTradeNo)
-		if err := model.CompleteSubscriptionOrder(verifyInfo.ServiceTradeNo, common.GetJsonString(verifyInfo), model.PaymentProviderEpay, verifyInfo.Type); err != nil {
+		if err := completeExactEpaySubscription(verifyInfo.ServiceTradeNo, verifyInfo.Money, verifyInfo.Type); err != nil {
 			c.Redirect(http.StatusFound, paymentReturnPath("/wallet?pay=fail"))
 			return
 		}
@@ -217,4 +227,21 @@ func SubscriptionEpayReturn(c *gin.Context) {
 		return
 	}
 	c.Redirect(http.StatusFound, paymentReturnPath("/wallet?pay=pending"))
+}
+
+func completeExactEpaySubscription(tradeNo, paid, method string) error {
+	contract, err := model.GetSubscriptionOrderMoney(tradeNo)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	if contract != nil {
+		actual, err := service.CheckoutMajorAmount(paid, contract.ContractPrice.Currency)
+		if err != nil {
+			return err
+		}
+		if actual != contract.ContractPrice {
+			return common.NewMessage("Invalid amount")
+		}
+	}
+	return model.CompleteSubscriptionOrder(tradeNo, "", model.PaymentProviderEpay, method)
 }

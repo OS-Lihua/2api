@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,12 +13,8 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
-	"github.com/QuantumNous/new-api/pkg/billingexpr"
-	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
-	"github.com/QuantumNous/new-api/setting/operation_setting"
-	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -250,246 +247,134 @@ func TestDeleteChannelBatchReportsAndAuditsActualDeletedCount(t *testing.T) {
 	assert.Equal(t, float64(1), auditData.Operation.Params["count"])
 }
 
-func TestSettleTestQuotaUsesTieredBilling(t *testing.T) {
-	info := &relaycommon.RelayInfo{
-		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
-			BillingMode:   "tiered_expr",
-			ExprString:    `param("stream") == true ? tier("stream", p * 3) : tier("base", p * 2)`,
-			ExprHash:      billingexpr.ExprHashString(`param("stream") == true ? tier("stream", p * 3) : tier("base", p * 2)`),
-			GroupRatio:    1,
-			EstimatedTier: "stream",
-			QuotaPerUnit:  common.QuotaPerUnit,
-			ExprVersion:   1,
-		},
-		BillingRequestInput: &billingexpr.RequestInput{
-			Body: []byte(`{"stream":true}`),
-		},
-	}
-
-	quota, result := settleTestQuota(info, types.PriceData{
-		ModelRatio:      1,
-		CompletionRatio: 2,
-	}, &dto.Usage{
-		PromptTokens: 1000,
-	})
-
-	require.Equal(t, 1500, quota)
-	require.NotNil(t, result)
-	require.Equal(t, "stream", result.MatchedTier)
-}
-
-func TestBuildTestLogOtherInjectsTieredInfo(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-
-	info := &relaycommon.RelayInfo{
-		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
-			BillingMode: "tiered_expr",
-			ExprString:  `tier("base", p * 2)`,
-		},
-		ProviderMeta: &relaycommon.ProviderMeta{},
-	}
-	priceData := types.PriceData{
-		GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1},
-	}
-	usage := &dto.Usage{
-		PromptTokensDetails: dto.InputTokenDetails{
-			CachedTokens: 12,
-		},
-	}
-
-	requestRules := []billingexpr.RequestRuleTrace{{
-		Cond:       `param("service_tier") == "fast"`,
-		Multiplier: 2,
-		Matched:    true,
-	}}
-	other := buildTestLogOther(ctx, info, priceData, usage, &billingexpr.TieredResult{
-		MatchedTier:  "base",
-		RequestRules: requestRules,
-	})
-
-	fields := other.Snapshot()
-	require.Equal(t, "tiered_expr", fields["billing_mode"])
-	require.Equal(t, "base", fields["matched_tier"])
-	require.Equal(t, requestRules, fields["request_rules"])
-	require.NotEmpty(t, fields["expr_b64"])
-}
-
-func TestResolveChannelTestUserIDUsesRequestUser(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	ctx.Set("id", 2)
-
-	userID, err := resolveChannelTestUserID(ctx)
-
-	require.NoError(t, err)
-	require.Equal(t, 2, userID)
-}
-
-func TestSelectChannelsForAutomaticTestPassiveRecoveryOnlyUsesAutoDisabled(t *testing.T) {
-	channels := []*model.Provider{
-		{Id: 1, Status: common.ChannelStatusEnabled},
-		{Id: 2, Status: common.ChannelStatusAutoDisabled},
-		{Id: 3, Status: common.ChannelStatusManuallyDisabled},
-	}
-
-	selected := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModePassiveRecovery)
-
-	require.Len(t, selected, 1)
-	require.Equal(t, 2, selected[0].Id)
-}
-
-func TestSelectChannelsForAutomaticTestScheduledSkipsManualDisabled(t *testing.T) {
-	channels := []*model.Provider{
-		{Id: 1, Status: common.ChannelStatusEnabled},
-		{Id: 2, Status: common.ChannelStatusAutoDisabled},
-		{Id: 3, Status: common.ChannelStatusManuallyDisabled},
-	}
-
-	selected := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModeScheduledAll)
-
-	require.Len(t, selected, 2)
-	require.Equal(t, 1, selected[0].Id)
-	require.Equal(t, 2, selected[1].Id)
-}
-
-func TestSelectChannelsForAutomaticTestAutoBanOnlyUsesEligibleChannels(t *testing.T) {
-	autoBanEnabled := 1
-	autoBanDisabled := 0
-	channels := []*model.Provider{
-		{Id: 1, Status: common.ChannelStatusEnabled, AutoBan: &autoBanEnabled},
-		{Id: 2, Status: common.ChannelStatusEnabled, AutoBan: &autoBanDisabled},
-		{Id: 3, Status: common.ChannelStatusAutoDisabled, AutoBan: &autoBanEnabled},
-		{Id: 4, Status: common.ChannelStatusManuallyDisabled, AutoBan: &autoBanEnabled},
-		{Id: 5, Status: common.ChannelStatusEnabled},
-	}
-
-	selected := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModeAutoBanOnly)
-
-	require.Len(t, selected, 2)
-	require.Equal(t, 1, selected[0].Id)
-	require.Equal(t, 3, selected[1].Id)
-}
-
-func TestRunChannelTestWorkersHonorsConfiguredConcurrency(t *testing.T) {
-	originalInterval := common.RequestInterval
-	common.RequestInterval = 0
-	t.Cleanup(func() { common.RequestInterval = originalInterval })
-
-	channels := []*model.Provider{
-		{Id: 1, Status: common.ChannelStatusEnabled},
-		{Id: 2, Status: common.ChannelStatusEnabled},
-		{Id: 3, Status: common.ChannelStatusEnabled},
-		{Id: 4, Status: common.ChannelStatusEnabled},
-	}
-	started := make(chan struct{}, len(channels))
-	release := make(chan struct{})
-	var active atomic.Int32
-	var maxActive atomic.Int32
-	progress := make([]int, 0, len(channels)+1)
-	summaryResult := make(chan providerTestSummary, 1)
-
-	go func() {
-		summaryResult <- runChannelTestWorkers(
-			context.Background(),
-			channels,
-			2,
-			func(_ context.Context, _ *model.Provider) providerTestSummary {
-				current := active.Add(1)
-				defer active.Add(-1)
-				for {
-					observed := maxActive.Load()
-					if current <= observed || maxActive.CompareAndSwap(observed, current) {
-						break
-					}
-				}
-				started <- struct{}{}
-				<-release
-				return providerTestSummary{Tested: 1, Succeeded: 1}
-			},
-			func(processed, _ int) {
-				progress = append(progress, processed)
-			},
-		)
-	}()
-
-	<-started
-	<-started
-	select {
-	case <-started:
-		t.Fatal("started more channel tests than the configured concurrency")
-	default:
-	}
-	close(release)
-
-	summary := <-summaryResult
-
-	assert.Equal(t, int32(2), maxActive.Load())
-	assert.Equal(t, providerTestSummary{Tested: 4, Succeeded: 4}, summary)
-	assert.Equal(t, []int{0, 1, 2, 3, 4}, progress)
-}
-
-func TestRunChannelTestWorkersStopsAfterCancellation(t *testing.T) {
-	originalInterval := common.RequestInterval
-	common.RequestInterval = 0
-	t.Cleanup(func() { common.RequestInterval = originalInterval })
-
-	ctx, cancel := context.WithCancel(context.Background())
-	channels := []*model.Provider{
-		{Id: 1, Status: common.ChannelStatusEnabled},
-		{Id: 2, Status: common.ChannelStatusEnabled},
-		{Id: 3, Status: common.ChannelStatusEnabled},
-		{Id: 4, Status: common.ChannelStatusEnabled},
-	}
-	started := make(chan struct{}, len(channels))
-	progress := make([]int, 0, 1)
-	summaryResult := make(chan providerTestSummary, 1)
-
-	go func() {
-		summaryResult <- runChannelTestWorkers(
-			ctx,
-			channels,
-			2,
-			func(ctx context.Context, _ *model.Provider) providerTestSummary {
-				started <- struct{}{}
-				<-ctx.Done()
-				return providerTestSummary{Tested: 1, Succeeded: 1}
-			},
-			func(processed, _ int) {
-				progress = append(progress, processed)
-			},
-		)
-	}()
-
-	<-started
-	<-started
-	cancel()
-
-	summary := <-summaryResult
-
-	select {
-	case <-started:
-		t.Fatal("started another channel test after cancellation")
-	default:
-	}
-	assert.Equal(t, providerTestSummary{Tested: 2, Succeeded: 2}, summary)
-	assert.Equal(t, []int{0}, progress)
-}
-
-func TestTestAllChannelsRejectsExistingActiveTask(t *testing.T) {
+// Historic quota/expression metadata is readable evidence, not a live calculator.
+func TestHistoricalChannelTestLogsRemainReadable(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.SystemTask{}, &model.SystemTaskLock{}))
+	require.NoError(t, db.AutoMigrate(&model.QuotaData{}))
+	require.NoError(t, model.MigrateLogDB())
+	expression := `param("stream") == true ? tier("stream", p * 3) : tier("base", p * 2)`
+	for _, tc := range []struct {
+		name  string
+		quota int
+		tier  string
+	}{{"stream", 1500, "stream"}, {"base", 1000, "base"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			other := common.MapToJsonStr(map[string]any{
+				"billing_mode": "tiered_expr", "matched_tier": tc.tier,
+				"request_rules": []map[string]any{{"cond": `param("service_tier") == "fast"`, "multiplier": 2, "matched": true}},
+				"expr_b64":      base64.StdEncoding.EncodeToString([]byte(expression)),
+				"cache_tokens":  12, "cache_write_tokens": 30, "cache_creation_5m_tokens": 10, "cache_creation_1h_tokens": 20,
+				"admin_info": map[string]any{"channel_id": 99}, "root_info": map[string]any{"upstream_task_id": "retained-private-id"},
+			})
+			stored := model.Log{UserId: 2, Type: model.LogTypeConsume, CreatedAt: 3600, Content: "Historical channel test", ModelName: "retired-model", Quota: tc.quota, PromptTokens: 1000, RequestId: "historical-probe-" + tc.name, Other: other}
+			require.NoError(t, model.LOG_DB.Create(&stored).Error)
+			filter := model.LogFilter{Type: model.LogTypeConsume, RequestId: stored.RequestId, StartTimestamp: 3600, EndTimestamp: 3600}
+			rows, total, err := model.GetUserLogs(2, filter, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			require.Len(t, rows, 1)
+			assert.Equal(t, tc.quota, rows[0].Quota)
+			fields, err := common.StrToMap(rows[0].Other)
+			require.NoError(t, err)
+			assert.Equal(t, "tiered_expr", fields["billing_mode"])
+			assert.Equal(t, tc.tier, fields["matched_tier"])
+			assert.Equal(t, base64.StdEncoding.EncodeToString([]byte(expression)), fields["expr_b64"])
+			assert.Equal(t, float64(12), fields["cache_tokens"])
+			assert.Equal(t, float64(30), fields["cache_write_tokens"])
+			assert.Equal(t, float64(10), fields["cache_creation_5m_tokens"])
+			assert.Equal(t, float64(20), fields["cache_creation_1h_tokens"])
+			assert.Equal(t, []any{map[string]any{"cond": `param("service_tier") == "fast"`, "multiplier": float64(2), "matched": true}}, fields["request_rules"])
+			assert.NotContains(t, fields, "admin_info")
+			assert.NotContains(t, fields, "root_info")
+			_, total, err = model.GetUserLogs(3, filter, 0, 10)
+			require.NoError(t, err)
+			assert.Zero(t, total)
+			filter.StartTimestamp = 3601
+			_, total, err = model.GetUserLogs(2, filter, 0, 10)
+			require.NoError(t, err)
+			assert.Zero(t, total)
+			filter.StartTimestamp = 3600
+			rows, total, err = model.GetAllLogs(filter, 0, 10)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			require.Len(t, rows, 1)
+			model.FormatAdminLogs(rows)
+			fields, err = common.StrToMap(rows[0].Other)
+			require.NoError(t, err)
+			assert.Contains(t, fields, "admin_info")
+			assert.NotContains(t, fields, "root_info")
+			var persisted model.Log
+			require.NoError(t, model.LOG_DB.Where("request_id = ?", stored.RequestId).Take(&persisted).Error)
+			assert.Equal(t, other, persisted.Other, "read shaping never rewrites historic pricing/cache facts")
+		})
+	}
+	var statistics int64
+	require.NoError(t, db.Model(&model.QuotaData{}).Count(&statistics).Error)
+	assert.Zero(t, statistics, "reading historical logs never regenerates buffered statistics")
+}
 
-	existing, err := model.CreateSystemTask(model.SystemTaskTypeChannelTest, nil, nil)
-	require.NoError(t, err)
-
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/channel/test", nil)
-
-	TestAllChannels(ctx)
-
-	require.Equal(t, http.StatusConflict, recorder.Code)
-	require.Contains(t, recorder.Body.String(), existing.TaskID)
-	require.Contains(t, recorder.Body.String(), "A channel test task is already running or queued")
+func TestRetiredChannelTestsPreserveQueuedHistory(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.SystemTask{}, &model.SystemTaskLock{}, &model.QuotaData{}))
+	require.NoError(t, model.MigrateLogDB())
+	var upstreamCalls atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { upstreamCalls.Add(1); w.WriteHeader(http.StatusOK) }))
+	defer upstream.Close()
+	for _, status := range []int{common.ChannelStatusEnabled, common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled} {
+		provider := model.Provider{Type: constant.ChannelTypeOpenAI, Name: fmt.Sprintf("retired-%d", status), Status: status, Key: "fixture-only", BaseURL: common.GetPointer(upstream.URL), Models: "retired-model", Group: "default"}
+		require.NoError(t, db.Create(&provider).Error)
+	}
+	var originalProviders []model.Provider
+	require.NoError(t, db.Order("id").Find(&originalProviders).Error)
+	for _, mode := range []string{"scheduled_all", "passive_recovery", "auto_ban_only"} {
+		t.Run(mode, func(t *testing.T) {
+			existing, err := model.CreateSystemTask(model.SystemTaskTypeChannelTest, nil, map[string]any{"manual": true, "mode": mode, "notify": true, "concurrency": 2})
+			require.NoError(t, err)
+			for _, path := range []string{"/api/channel/test", "/api/channel/test/1"} {
+				recorder := httptest.NewRecorder()
+				ctx, _ := gin.CreateTestContext(recorder)
+				ctx.Set("id", 2)
+				ctx.Request = httptest.NewRequest(http.MethodGet, path, nil)
+				RetiredLegacyChannelManagement(ctx)
+				require.Equal(t, http.StatusGone, recorder.Code)
+				assert.Equal(t, "no-store", recorder.Header().Get("Cache-Control"))
+				assert.Contains(t, recorder.Body.String(), "legacy_channel_management_retired")
+				unchanged, err := model.GetSystemTaskByTaskID(existing.TaskID)
+				require.NoError(t, err)
+				assert.Equal(t, existing, unchanged, "retired HTTP must not enqueue, replace, or execute a queued job")
+			}
+			claimed, acquired, err := model.ClaimSystemTask(existing.ID, existing.Type, "retired-runner", common.GetTimestamp()+60)
+			require.NoError(t, err)
+			require.True(t, acquired)
+			handler := providerTestHandler{}
+			assert.False(t, handler.Enabled())
+			cancelled, cancel := context.WithCancel(context.Background())
+			cancel()
+			handler.Run(cancelled, claimed, "retired-runner")
+			running, err := model.GetSystemTaskByTaskID(existing.TaskID)
+			require.NoError(t, err)
+			assert.Equal(t, model.SystemTaskStatusRunning, running.Status)
+			handler.Run(context.Background(), claimed, "retired-runner")
+			finished, err := model.GetSystemTaskByTaskID(existing.TaskID)
+			require.NoError(t, err)
+			assert.Equal(t, model.SystemTaskStatusFailed, finished.Status)
+			assert.Equal(t, existing.Payload, finished.Payload)
+			assert.Equal(t, existing.State, finished.State)
+			assert.Equal(t, "Legacy Channel management has been retired. Use the Provider and Channel APIs instead.", finished.Error)
+			assert.Nil(t, finished.ActiveKey)
+		})
+	}
+	var currentProviders []model.Provider
+	require.NoError(t, db.Order("id").Find(&currentProviders).Error)
+	assert.Equal(t, originalProviders, currentProviders)
+	assert.Zero(t, upstreamCalls.Load())
+	var statistics, logs, locks, tasks int64
+	require.NoError(t, db.Model(&model.QuotaData{}).Count(&statistics).Error)
+	assert.Zero(t, statistics)
+	require.NoError(t, model.LOG_DB.Model(&model.Log{}).Count(&logs).Error)
+	assert.Zero(t, logs)
+	require.NoError(t, db.Model(&model.SystemTaskLock{}).Count(&locks).Error)
+	assert.Zero(t, locks)
+	require.NoError(t, db.Model(&model.SystemTask{}).Count(&tasks).Error)
+	assert.EqualValues(t, 3, tasks)
 }

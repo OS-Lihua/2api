@@ -26,11 +26,12 @@ func CloseResponseBodyGracefully(httpResponse *http.Response) {
 // ShouldCopyUpstreamHeader checks whether a given upstream response header
 // should be copied to the client response. It returns false for Content-Length
 // (managed separately) and X-Oneapi-Request-Id (to preserve the local instance
-// ID). X-Model-Fallback is owned by the gateway's actual selection. When the
+// ID). X-Model-Fallback and X-Gateway-Conversion-Loss describe local gateway
+// selection and conversion facts. When the
 // upstream header is X-Oneapi-Request-Id, the value is captured
 // into the Gin context for later logging.
 func ShouldCopyUpstreamHeader(c *gin.Context, k string, v []string) bool {
-	if strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "X-Model-Fallback") {
+	if strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "X-Model-Fallback") || strings.EqualFold(k, "X-Gateway-Conversion-Loss") {
 		return false
 	}
 	if strings.EqualFold(k, common.RequestIdKey) {

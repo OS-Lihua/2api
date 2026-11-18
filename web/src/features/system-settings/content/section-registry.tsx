@@ -21,38 +21,11 @@ import { createSectionRegistry } from '../utils/section-registry'
 import { AnnouncementsSection } from './announcements-section'
 import { ApiInfoSection } from './api-info-section'
 import { ChatSettingsSection } from './chat-settings-section'
-import { DashboardSection } from './dashboard-section'
 import { DrawingSettingsSection } from './drawing-settings-section'
 import { FAQSection } from './faq-section'
 import { UptimeKumaSection } from './uptime-kuma-section'
 
-/**
- * Validate and coerce DataExportDefaultTime to a safe value
- */
-function validateDataExportDefaultTime(value: string): 'week' | 'hour' | 'day' {
-  if (value === 'week' || value === 'hour' || value === 'day') {
-    return value
-  }
-  // Default to 'hour' if value is unexpected
-  return 'hour'
-}
-
 const CONTENT_SECTIONS = [
-  {
-    id: 'dashboard',
-    titleKey: 'Data Dashboard',
-    build: (settings: ContentSettings) => (
-      <DashboardSection
-        defaultValues={{
-          DataExportEnabled: settings.DataExportEnabled,
-          DataExportInterval: settings.DataExportInterval,
-          DataExportDefaultTime: validateDataExportDefaultTime(
-            settings.DataExportDefaultTime
-          ),
-        }}
-      />
-    ),
-  },
   {
     id: 'announcements',
     titleKey: 'Announcements',
@@ -125,7 +98,7 @@ const contentRegistry = createSectionRegistry<
   ContentSettings
 >({
   sections: CONTENT_SECTIONS,
-  defaultSection: 'dashboard',
+  defaultSection: 'announcements',
   basePath: '/system-settings/content',
   urlStyle: 'path',
 })

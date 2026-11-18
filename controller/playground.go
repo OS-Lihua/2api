@@ -1,58 +1,48 @@
 package controller
 
 import (
-	"errors"
-	"fmt"
+	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
-	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	"github.com/QuantumNous/new-api/relaykit/types"
 
 	"github.com/gin-gonic/gin"
 )
 
 func Playground(c *gin.Context) {
-	var newAPIError *types.NewAPIError
-
-	defer func() {
-		if newAPIError != nil {
-			c.JSON(newAPIError.StatusCode, gin.H{
-				"error": newAPIError.ToOpenAIError(common.UpstreamAddresses(c)...),
-			})
+	c.Abort()
+	if c.GetBool("use_access_token") {
+		gatewayError(c, http.StatusForbidden, "access_denied", i18n.T(c, i18n.MsgRelayAccessTokenUnsupported))
+		return
+	}
+	user, err := model.GetUserCache(c.GetInt("id"))
+	if err != nil {
+		gatewayError(c, http.StatusServiceUnavailable, "authorization_unavailable", i18n.T(c, i18n.MsgGatewayAuthorizationUnavailable))
+		return
+	}
+	user.WriteContext(c)
+	common.SetContextKey(c, constant.ContextKeyUsingGroup, user.Group)
+	c.Set("token_name", "playground")
+	offering := middleware.TextOffering(c)
+	if offering == nil {
+		if !middleware.TextOfferingMissing(c) {
+			gatewayError(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
+		} else {
+			gatewayError(c, http.StatusNotFound, "model_not_found", "Model not found")
 		}
-	}()
-
-	useAccessToken := c.GetBool("use_access_token")
-	if useAccessToken {
-		newAPIError = types.NewError(errors.New(i18n.T(c, i18n.MsgRelayAccessTokenUnsupported)), types.ErrorCodeAccessDenied, types.ErrOptionWithSkipRetry())
 		return
 	}
-
-	relayInfo, err := relaycommon.GenRelayInfo(c, types.RelayFormatOpenAI, nil, nil)
-	if err != nil {
-		newAPIError = types.NewError(err, types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+	var count int64
+	if err := model.VisibleOfferingsQuery(c.Request.Context(), user.Id).Where("model_offerings.id = ?", offering.ID).Count(&count).Error; err != nil {
+		gatewayError(c, http.StatusServiceUnavailable, "authorization_unavailable", i18n.T(c, i18n.MsgGatewayAuthorizationUnavailable))
 		return
 	}
-
-	userId := c.GetInt("id")
-
-	// Write user context to ensure acceptUnsetRatio is available
-	userCache, err := model.GetUserCache(userId)
-	if err != nil {
-		newAPIError = types.NewError(err, types.ErrorCodeQueryDataError, types.ErrOptionWithSkipRetry())
+	if count != 1 {
+		gatewayError(c, http.StatusNotFound, "model_not_found", "Model not found")
 		return
 	}
-	userCache.WriteContext(c)
-
-	tempToken := &model.Token{
-		UserId: userId,
-		Name:   fmt.Sprintf("playground-%s", relayInfo.UsingGroup),
-		Group:  relayInfo.UsingGroup,
-	}
-	_ = middleware.SetupContextForToken(c, tempToken)
-
-	Relay(c, types.RelayFormatOpenAI)
+	runAuthorizedTextGateway(c)
 }

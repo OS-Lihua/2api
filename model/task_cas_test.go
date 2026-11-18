@@ -20,7 +20,6 @@ func TestMain(m *testing.M) {
 	db := UseTestDatabases(scope)
 
 	common.RedisEnabled = false
-	common.BatchUpdateEnabled = false
 	common.LogConsumeEnabled = true
 
 	sqlDB, err := db.DB()

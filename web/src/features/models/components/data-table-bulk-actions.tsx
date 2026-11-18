@@ -167,14 +167,14 @@ export function DataTableBulkActions<TData>({
                 disabled={hasMissingMetadata}
                 onClick={handleEnableAll}
                 className='size-8'
-                aria-label={t('Show selected models in model square')}
-                title={t('Show selected models in model square')}
+                aria-label={t('Enable selected Model metadata')}
+                title={t('Enable selected Model metadata')}
               />
             }
           >
             <Eye />
             <span className='sr-only'>
-              {t('Show selected models in model square')}
+              {t('Enable selected Model metadata')}
             </span>
           </TooltipTrigger>
           <TooltipContent>
@@ -182,7 +182,7 @@ export function DataTableBulkActions<TData>({
               {t(
                 hasMissingMetadata
                   ? 'Add metadata to all selected models first.'
-                  : 'Show selected models in model square'
+                  : 'Enable selected Model metadata'
               )}
             </p>
           </TooltipContent>
@@ -197,14 +197,14 @@ export function DataTableBulkActions<TData>({
                 disabled={hasMissingMetadata}
                 onClick={handleDisableAll}
                 className='size-8'
-                aria-label={t('Hide selected models from model square')}
-                title={t('Hide selected models from model square')}
+                aria-label={t('Disable selected Model metadata')}
+                title={t('Disable selected Model metadata')}
               />
             }
           >
             <EyeOff />
             <span className='sr-only'>
-              {t('Hide selected models from model square')}
+              {t('Disable selected Model metadata')}
             </span>
           </TooltipTrigger>
           <TooltipContent>
@@ -212,7 +212,7 @@ export function DataTableBulkActions<TData>({
               {t(
                 hasMissingMetadata
                   ? 'Add metadata to all selected models first.'
-                  : 'Hide selected models from model square'
+                  : 'Disable selected Model metadata'
               )}
             </p>
           </TooltipContent>

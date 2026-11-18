@@ -20,8 +20,8 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/textprotocol"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
-	kitreasoning "github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
@@ -135,6 +135,10 @@ func (a *ChannelAdaptor) ProjectChatRequest(c *gin.Context, info *relaycommon.Re
 	}
 	switch converted.(type) {
 	case dto.GeneralOpenAIRequest, *dto.GeneralOpenAIRequest:
+		if info.RelayMode == relayconstant.RelayModeCompletions {
+			request, _, err := helper.DecodeCompletionsRequest(body)
+			return request, err
+		}
 		var effective dto.GeneralOpenAIRequest
 		if err := common.Unmarshal(body, &effective); err != nil {
 			return nil, err
@@ -167,13 +171,13 @@ func (a *ChannelAdaptor) ProjectChatRequest(c *gin.Context, info *relaycommon.Re
 	return nil, errors.New("native request requires an effective wire projection")
 }
 
-func (a *ChannelAdaptor) SetChatOutputLimit(converted any, body []byte, limit uint) ([]byte, error) {
+func (a *ChannelAdaptor) SetChatOutputLimit(info *relaycommon.RelayInfo, converted any, body []byte, limit uint) ([]byte, error) {
 	if projector, ok := converted.(channel.NativeRequestProjector); ok {
 		request, err := projector.ProjectNativeRequest(body)
 		if err != nil {
 			return nil, err
 		}
-		return a.SetChatOutputLimit(request, body, limit)
+		return a.SetChatOutputLimit(info, request, body, limit)
 	}
 	if setter, ok := converted.(channel.ChatOutputLimitSetter); ok {
 		return setter.SetChatOutputLimit(body, limit)
@@ -182,25 +186,11 @@ func (a *ChannelAdaptor) SetChatOutputLimit(converted any, body []byte, limit ui
 	switch converted.(type) {
 	case dto.GeneralOpenAIRequest, *dto.GeneralOpenAIRequest:
 		field = "max_completion_tokens"
+		if info.RelayMode == relayconstant.RelayModeCompletions {
+			field = "max_tokens"
+		}
 	case dto.ClaudeRequest, *dto.ClaudeRequest:
-		field = "max_tokens"
-		var request dto.ClaudeRequest
-		if err := common.Unmarshal(body, &request); err != nil {
-			return nil, err
-		}
-		if request.Thinking != nil && request.Thinking.Type == "enabled" {
-			intent, _, err := kitreasoning.FromClaude(&request)
-			if err != nil {
-				return nil, err
-			}
-			rendered, err := kitreasoning.RenderClaude(request.Model, intent, &limit, 0)
-			if err != nil {
-				return nil, err
-			}
-			if rendered.MaxTokens != nil || rendered.Thinking == nil || rendered.Thinking.GetBudgetTokens() != request.Thinking.GetBudgetTokens() {
-				return nil, errors.New("output limit cannot preserve the Claude thinking budget")
-			}
-		}
+		return channel.SetClaudeOutputLimit(body, "", limit)
 	case dto.OpenAIResponsesRequest, *dto.OpenAIResponsesRequest:
 		field = "max_output_tokens"
 	case dto.GeminiChatRequest, *dto.GeminiChatRequest:
@@ -236,6 +226,13 @@ func (a *ChannelAdaptor) SetChatOutputLimit(converted any, body []byte, limit ui
 	return common.Marshal(wire)
 }
 
+func (a *ChannelAdaptor) ValidateCredentialFormat(key string) error {
+	if validator, ok := a.provider.(channel.ProviderCredentialValidator); ok {
+		return validator.ValidateCredentialFormat(a.kind, key)
+	}
+	return nil
+}
+
 func (a *ChannelAdaptor) providerMetadata(info *relaycommon.RelayInfo) *channel.ProviderRequest {
 	metadata := channel.NewProviderMetadata(info)
 	metadata.Protocol = a.kind
@@ -244,10 +241,19 @@ func (a *ChannelAdaptor) providerMetadata(info *relaycommon.RelayInfo) *channel.
 		metadata.RelayFormat = types.RelayFormatOpenAI
 		metadata.RelayMode = relayconstant.RelayModeChatCompletions
 		metadata.RequestURLPath = "/v1/chat/completions"
+		if info.RelayMode == relayconstant.RelayModeCompletions {
+			metadata.RelayMode = info.RelayMode
+			metadata.RequestURLPath = "/v1/completions"
+		}
 	case protocol.OpenAIResponses:
 		metadata.RelayFormat = types.RelayFormatOpenAIResponses
 		metadata.RelayMode = relayconstant.RelayModeResponses
 		metadata.RequestURLPath = "/v1/responses"
+		if info.RelayMode == relayconstant.RelayModeResponsesCompact {
+			metadata.RelayFormat = types.RelayFormatOpenAIResponsesCompaction
+			metadata.RelayMode = info.RelayMode
+			metadata.RequestURLPath = "/v1/responses/compact"
+		}
 	case protocol.OpenAIRealtime:
 		metadata.RelayFormat = types.RelayFormatOpenAIRealtime
 		metadata.RelayMode = relayconstant.RelayModeRealtime
@@ -295,6 +301,22 @@ func (a *ChannelAdaptor) providerMetadata(info *relaycommon.RelayInfo) *channel.
 			metadata.RelayMode = info.RelayMode
 			metadata.RequestURLPath = "/v1/audio/translations"
 		}
+	case protocol.AlphaSearch:
+		metadata.RelayFormat = types.RelayFormatOpenAIAlphaSearch
+		metadata.RelayMode = relayconstant.RelayModeAlphaSearch
+		metadata.RequestURLPath = "/v1/alpha/search"
+	case protocol.DeepSeekTools:
+		metadata.RelayFormat = types.RelayFormatDeepSeekTools
+		metadata.RelayMode = relayconstant.RelayModeToolsSearch
+		metadata.RequestURLPath = "/v1/tools/search"
+		if info.RelayMode == relayconstant.RelayModeToolsFetch {
+			metadata.RelayMode = info.RelayMode
+			metadata.RequestURLPath = "/v1/tools/fetch"
+		}
+	case protocol.OpenAIModerations:
+		metadata.RelayFormat = types.RelayFormatOpenAI
+		metadata.RelayMode = relayconstant.RelayModeModerations
+		metadata.RequestURLPath = "/v1/moderations"
 	case protocol.Rerank:
 		metadata.RelayFormat = types.RelayFormatRerank
 		metadata.RelayMode = relayconstant.RelayModeRerank

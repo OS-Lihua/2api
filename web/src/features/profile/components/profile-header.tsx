@@ -16,17 +16,30 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { useQuery } from '@tanstack/react-query'
 import { Activity, BarChart3, WalletCards } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
+import { ErrorState } from '@/components/error-state'
+import { FundingStatus } from '@/components/funding-status'
+import { LoadingState } from '@/components/loading-state'
 import { StatusBadge } from '@/components/status-badge'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Card, CardContent } from '@/components/ui/card'
 import { IconBadge, type IconBadgeTone } from '@/components/ui/icon-badge'
 import { Skeleton } from '@/components/ui/skeleton'
+import { getSelfWallet } from '@/features/wallet/api'
+import { toIntlLocale } from '@/i18n/languages'
 import { getUserAvatarFallback, getUserAvatarStyle } from '@/lib/avatar'
-import { formatCompactNumber, formatQuota } from '@/lib/format'
+import { formatMoneyAmount } from '@/lib/currency'
+import { formatCompactNumber } from '@/lib/format'
 import { getRoleLabel } from '@/lib/roles'
+import {
+  isWalletScopeCurrent,
+  selfWalletSummarySchema,
+  walletReadScope,
+} from '@/lib/wallet-summary'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { getDisplayName } from '../lib'
 import type { UserProfile } from '../types'
@@ -41,7 +54,38 @@ interface ProfileHeaderProps {
 }
 
 export function ProfileHeader({ profile, loading }: ProfileHeaderProps) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const actor = useAuthStore((state) => state.auth.user)
+  const sessionId = useAuthStore((state) => state.auth.session?.sid ?? null)
+  const scope = walletReadScope('wallet')
+  const canReadWallet = scope.allowed && profile?.id === actor?.id
+  const query = useQuery({
+    queryKey: ['self-wallet', actor?.id, sessionId, 'summary', canReadWallet],
+    queryFn: async ({ signal }) => {
+      if (!isWalletScopeCurrent(scope, 'wallet')) {
+        throw new Error('Permission denied')
+      }
+      const value = await getSelfWallet(signal)
+      if (signal.aborted || !isWalletScopeCurrent(scope, 'wallet')) {
+        throw new Error('Session changed')
+      }
+      const summary = selfWalletSummarySchema.parse(value)
+      if (summary.user_id !== actor?.id) {
+        throw new Error('Invalid wallet response')
+      }
+      return summary
+    },
+    enabled: canReadWallet,
+    staleTime: 0,
+    gcTime: 0,
+    retry: false,
+    meta: { errorToast: false },
+  })
+  const wallet =
+    canReadWallet && !query.isError && !query.isFetching
+      ? query.data
+      : undefined
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
 
   if (loading) {
     return (
@@ -92,20 +136,6 @@ export function ProfileHeader({ profile, loading }: ProfileHeaderProps) {
     tone: IconBadgeTone
   }[] = [
     {
-      label: t('Current Balance'),
-      value: formatQuota(profile.quota),
-      description: t('Remaining quota'),
-      icon: WalletCards,
-      tone: 'success',
-    },
-    {
-      label: t('Total Usage'),
-      value: formatQuota(profile.used_quota),
-      description: t('Total consumed quota'),
-      icon: BarChart3,
-      tone: 'info',
-    },
-    {
       label: t('API Requests'),
       value: formatCompactNumber(profile.request_count),
       description: t('Total requests made'),
@@ -113,6 +143,31 @@ export function ProfileHeader({ profile, loading }: ProfileHeaderProps) {
       tone: 'chart-4',
     },
   ]
+  if (wallet) {
+    stats.unshift(
+      {
+        label: t('Available Balance'),
+        value: formatMoneyAmount(wallet.available, locale),
+        description: '',
+        icon: WalletCards,
+        tone: 'success',
+      },
+      {
+        label: t('Outstanding'),
+        value: formatMoneyAmount(wallet.outstanding, locale),
+        description: '',
+        icon: WalletCards,
+        tone: 'warning',
+      },
+      {
+        label: t('Posted consumption'),
+        value: formatMoneyAmount(wallet.consumed, locale),
+        description: '',
+        icon: BarChart3,
+        tone: 'info',
+      }
+    )
+  }
 
   return (
     <Card data-card-hover='false' className='gap-0 overflow-hidden py-0'>
@@ -163,7 +218,29 @@ export function ProfileHeader({ profile, loading }: ProfileHeaderProps) {
         </div>
       </CardContent>
       <div className='border-t'>
-        <div className='divide-border/60 grid grid-cols-3 divide-x'>
+        {canReadWallet && query.isError && (
+          <ErrorState
+            description={t('Failed to load wallet balances')}
+            onRetry={() => void query.refetch()}
+            className='min-h-0'
+          />
+        )}
+        {canReadWallet && (query.isPending || query.isFetching) && (
+          <LoadingState className='min-h-20' />
+        )}
+        {wallet && (
+          <div className='space-y-1 px-3 py-3 text-sm sm:px-5'>
+            <p className='text-muted-foreground'>
+              {t(
+                'Posted ledger consumption includes signed corrections. It excludes unsettled sales and legacy quota records. Debt repayments are not counted again.'
+              )}
+            </p>
+            {wallet.sale_pending && <p>{t('Sales awaiting accounting')}</p>}
+            <FundingStatus pending={wallet.funding_pending} />
+            {wallet.requests_paused && <p>{t('Requests paused')}</p>}
+          </div>
+        )}
+        <div className='divide-border/60 grid grid-cols-1 divide-y sm:grid-cols-2 sm:divide-x xl:grid-cols-4'>
           {stats.map((item) => (
             <div key={item.label} className='min-w-0 px-3 py-3 sm:px-5 sm:py-4'>
               <div className='flex items-center gap-2'>
@@ -175,7 +252,7 @@ export function ProfileHeader({ profile, loading }: ProfileHeaderProps) {
                 </div>
               </div>
 
-              <div className='text-foreground mt-1.5 truncate font-mono text-lg font-bold tracking-tight tabular-nums sm:mt-2 sm:text-2xl'>
+              <div className='text-foreground mt-1.5 font-mono text-lg font-bold tracking-tight wrap-anywhere tabular-nums sm:mt-2 sm:text-2xl'>
                 {item.value}
               </div>
               <div className='text-muted-foreground/60 mt-1 hidden text-xs md:block'>

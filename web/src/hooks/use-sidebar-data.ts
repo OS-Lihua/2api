@@ -29,7 +29,6 @@ import {
   ListTodo,
   MessageSquare,
   PlugZap,
-  Radio,
   ServerCog,
   Settings,
   ShieldCheck,
@@ -40,7 +39,7 @@ import {
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
-import type { SidebarBadges, SidebarData } from '@/components/layout/types'
+import type { SidebarData } from '@/components/layout/types'
 import { hasPermission } from '@/lib/admin-permissions'
 import { ROLE } from '@/lib/roles'
 import { useAuthStore } from '@/stores/auth-store'
@@ -51,7 +50,7 @@ import { useAuthStore } from '@/stores/auth-store'
  * These are shown when the URL does not match any nested sidebar view
  * registered in `layout/lib/sidebar-view-registry.ts`.
  */
-export function useSidebarData(badges: SidebarBadges = {}): SidebarData {
+export function useSidebarData(): SidebarData {
   const { t } = useTranslation()
   const user = useAuthStore((state) => state.auth.user)
   const canReadPricing = hasPermission(user, 'pricing', 'read')
@@ -143,11 +142,6 @@ export function useSidebarData(badges: SidebarBadges = {}): SidebarData {
         title: t('Admin'),
         items: [
           {
-            title: t('Channels'),
-            url: '/channels',
-            icon: Radio,
-          },
-          {
             title: t('Providers'),
             url: '/providers',
             icon: Building2,
@@ -218,8 +212,6 @@ export function useSidebarData(badges: SidebarBadges = {}): SidebarData {
             activeUrls: ['/system-settings'],
             icon: Settings,
             requiredRole: ROLE.SUPER_ADMIN,
-            // Model pricing lives in System Settings.
-            badge: badges.modelPricing,
           },
         ],
       },

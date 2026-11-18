@@ -18,17 +18,10 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { isAxiosError } from 'axios'
-import { useId, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { ConfirmDialog } from '@/components/confirm-dialog'
-import { Checkbox } from '@/components/ui/checkbox'
-import { Label } from '@/components/ui/label'
-import {
-  useCanEditModelPricing,
-  invalidateModelPricing,
-} from '@/features/model-pricing/api'
 import { createServerError, getServerMessage } from '@/lib/server-error-message'
 
 import { deleteModel, deleteModels } from '../../api'
@@ -43,30 +36,12 @@ interface ModelDeleteDialogProps {
 
 export function ModelDeleteDialog(props: ModelDeleteDialogProps) {
   const { t } = useTranslation()
-  const checkboxId = useId()
-  const pricingCheckboxId = useId()
-  const canEditPricing = useCanEditModelPricing()
-  const supportsChannelRemoval = props.models.every(
-    (model) => model.name_rule === 0
-  )
-  const [removePricing, setRemovePricing] = useState(false)
-  const [removeFromChannels, setRemoveFromChannels] = useState(false)
   const client = useQueryClient()
   const mutation = useMutation({
     mutationFn: async () => {
       const ids = props.models.map((model) => model.id)
       const response =
-        ids.length === 1
-          ? await deleteModel(
-              ids[0],
-              removeFromChannels && supportsChannelRemoval,
-              removePricing && canEditPricing
-            )
-          : await deleteModels(
-              ids,
-              removeFromChannels && supportsChannelRemoval,
-              removePricing && canEditPricing
-            )
+        ids.length === 1 ? await deleteModel(ids[0]) : await deleteModels(ids)
       if (!response.success) {
         throw createServerError(response, t('Failed to delete model'))
       }
@@ -74,10 +49,6 @@ export function ModelDeleteDialog(props: ModelDeleteDialogProps) {
     },
     onSuccess: async (result) => {
       await invalidateVendorData(client)
-      if (removePricing) await invalidateModelPricing(client)
-      if (removeFromChannels) {
-        await client.invalidateQueries({ queryKey: ['channels'] })
-      }
       toast.success(
         t('Successfully deleted {{count}} model(s)', {
           count: result.deleted_count,
@@ -103,7 +74,7 @@ export function ModelDeleteDialog(props: ModelDeleteDialogProps) {
         if (!open && !mutation.isPending) props.onClose()
       }}
       title={t('Delete Models?')}
-      desc={description}
+      desc={<span className='wrap-anywhere'>{description}</span>}
       confirmText={t('Delete')}
       destructive
       disabled={!props.models.length}
@@ -111,44 +82,11 @@ export function ModelDeleteDialog(props: ModelDeleteDialogProps) {
       handleConfirm={() => mutation.mutate()}
     >
       <div className='space-y-3'>
-        <div className='flex items-start gap-2'>
-          <Checkbox
-            id={checkboxId}
-            className='mt-0.5'
-            checked={removeFromChannels && supportsChannelRemoval}
-            disabled={mutation.isPending || !supportsChannelRemoval}
-            onCheckedChange={(checked) =>
-              setRemoveFromChannels(checked === true)
-            }
-          />
-          <Label htmlFor={checkboxId} className='flex-wrap leading-normal'>
-            {t('Also remove from all channels')}
-            {!supportsChannelRemoval && (
-              <span className='text-muted-foreground text-xs font-normal'>
-                {t('Only available for exact matching')}
-              </span>
-            )}
-          </Label>
-        </div>
-        <div className='flex items-start gap-2'>
-          <Checkbox
-            id={pricingCheckboxId}
-            className='mt-0.5'
-            checked={removePricing}
-            disabled={mutation.isPending || !canEditPricing}
-            onCheckedChange={(checked) => setRemovePricing(checked === true)}
-          />
-          <Label htmlFor={pricingCheckboxId} className='leading-normal'>
-            {t('Also remove pricing')}
-          </Label>
-        </div>
-        {(removePricing || !canEditPricing) && (
-          <p className='text-muted-foreground text-sm'>
-            {canEditPricing
-              ? t('Built-in pricing may become effective again.')
-              : t('Model pricing is managed by a super administrator.')}
-          </p>
-        )}
+        <p className='text-muted-foreground text-sm'>
+          {t(
+            'Channels and Offerings are not deleted with Model metadata. Referenced Models cannot be deleted.'
+          )}
+        </p>
         {mutation.isError && (
           <p role='alert' className='text-destructive text-sm'>
             {errorMessage || t('Failed to delete model')}

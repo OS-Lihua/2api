@@ -24,17 +24,14 @@ import { PromptInputButton } from '@/components/ai-elements/prompt-input'
 import { ModelGroupSelector } from '@/components/model-group-selector'
 
 import { getInputControlState } from '../../lib'
-import type { GroupOption, ModelOption } from '../../types'
+import type { ModelOption } from '../../types'
 
 type PlaygroundInputControlsProps = {
   disabled?: boolean
-  groups: GroupOption[]
-  groupValue: string
   isGenerating?: boolean
   isModelLoading?: boolean
   models: ModelOption[]
   modelValue: string
-  onGroupChange: (value: string) => void
   onModelChange: (value: string) => void
   onStop?: () => void
   text: string
@@ -43,13 +40,10 @@ type PlaygroundInputControlsProps = {
 
 export function PlaygroundInputControls({
   disabled,
-  groups,
-  groupValue,
   isGenerating,
   isModelLoading = false,
   models,
   modelValue,
-  onGroupChange,
   onModelChange,
   onStop,
   text,
@@ -59,7 +53,6 @@ export function PlaygroundInputControls({
   const { canSubmit, isSelectorDisabled, shouldShowStop } =
     getInputControlState({
       disabled,
-      groups,
       hasStopHandler: Boolean(onStop),
       isGenerating,
       isModelLoading,
@@ -72,9 +65,7 @@ export function PlaygroundInputControls({
       selectedModel={modelValue}
       models={models}
       onModelChange={onModelChange}
-      selectedGroup={groupValue}
-      groups={groups}
-      onGroupChange={onGroupChange}
+      showGroup={false}
       disabled={isSelectorDisabled}
     />
   )

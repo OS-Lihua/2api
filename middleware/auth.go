@@ -6,12 +6,10 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
@@ -19,7 +17,6 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
-	"github.com/QuantumNous/new-api/setting/ratio_setting"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -541,8 +538,6 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 			key = strings.TrimSpace(key[7:])
 		}
 		key = strings.TrimPrefix(key, "sk-")
-		parts := strings.Split(key, "-")
-		key = parts[0]
 
 		token, err := model.GetTokenCredential(key)
 		if err != nil {
@@ -626,32 +621,21 @@ func TaskOriginAuth() gin.HandlerFunc {
 	}
 }
 
-// LegacyTaskSubmissionAuth restores the legacy funding check after a native
-// decoder has established that the submission does not use a ModelOffering.
-func LegacyTaskSubmissionAuth() gin.HandlerFunc {
-	authenticate := TokenAuth()
-	return func(c *gin.Context) {
-		if TextOffering(c) != nil {
-			c.Next()
-			return
-		}
-		c.Set(taskReadAuthKey, false)
-		authenticate(c)
-	}
-}
-
-// GatewayTokenAuth authenticates gateway and discovery requests before resolution.
-// A configured legacy fallback still checks quota before dispatch.
+// GatewayTokenAuth validates wallet credentials for stateless text/media HTTP,
+// native realtime, and model discovery.
 func GatewayTokenAuth() func(c *gin.Context) {
 	return func(c *gin.Context) {
 		textProtocol, _ := TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
+		media := IsMediaGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
 		realtime := c.Request.Method == http.MethodGet && c.Request.URL.Path == "/v1/realtime"
-		if (textProtocol != "" || realtime) && c.GetTime(TextGatewayStartedAtKey).IsZero() {
+		if (textProtocol != "" || media || realtime) && c.GetTime(TextGatewayStartedAtKey).IsZero() {
 			// Freeze request-start prices before credential lookups.
 			c.Set(TextGatewayStartedAtKey, clock.Now())
 		}
 		discovery := c.Request.Method == http.MethodGet && (strings.HasPrefix(c.Request.URL.Path, "/v1/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/models") || strings.HasPrefix(c.Request.URL.Path, "/v1beta/openai/models"))
-		tokenAuth(textProtocol != "" || discovery || realtime)(c)
+		unsupportedNative := c.Request.Method == http.MethodPost && (c.Request.URL.Path == "/v1/edits" || strings.HasPrefix(c.Request.URL.Path, "/v1/models/")) || c.Request.Method == http.MethodDelete && strings.HasPrefix(c.Request.URL.Path, "/v1/models/")
+		unsupportedGemini := c.Request.Method == http.MethodPost && textProtocol == "" && strings.HasPrefix(c.Request.URL.Path, "/v1beta/models/")
+		tokenAuth(textProtocol != "" || media || discovery || realtime || unsupportedNative || unsupportedGemini)(c)
 	}
 }
 
@@ -682,7 +666,6 @@ func tokenAuth(walletCredential bool) func(c *gin.Context) {
 			}
 		}
 		key := c.Request.Header.Get("Authorization")
-		parts := make([]string, 0)
 		if strings.HasPrefix(key, "Bearer ") || strings.HasPrefix(key, "bearer ") {
 			key = strings.TrimSpace(key[7:])
 		}
@@ -692,12 +675,8 @@ func tokenAuth(walletCredential bool) func(c *gin.Context) {
 				key = strings.TrimSpace(key[7:])
 			}
 			key = strings.TrimPrefix(key, "sk-")
-			parts = strings.Split(key, "-")
-			key = parts[0]
 		} else {
 			key = strings.TrimPrefix(key, "sk-")
-			parts = strings.Split(key, "-")
-			key = parts[0]
 		}
 		validateToken := model.ValidateUserToken
 		responsesHandshake := c.Request.Method == http.MethodGet && c.Request.URL.Path == "/v1/responses" && strings.EqualFold(c.GetHeader("Upgrade"), "websocket")
@@ -754,26 +733,9 @@ func tokenAuth(walletCredential bool) func(c *gin.Context) {
 
 		userCache.WriteContext(c)
 
-		userGroup := userCache.Group
-		tokenGroup := token.Group
-		if tokenGroup != "" {
-			// check common.UserUsableGroups[userGroup]
-			if _, ok := service.GetUserUsableGroups(userGroup)[tokenGroup]; !ok {
-				abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgAuthTokenGroupForbidden, map[string]any{"Group": tokenGroup}))
-				return
-			}
-			// check group in common.GroupRatio
-			if !ratio_setting.ContainsGroupRatio(tokenGroup) {
-				if tokenGroup != "auto" {
-					abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgAuthTokenGroupDeprecated, map[string]any{"Group": tokenGroup}))
-					return
-				}
-			}
-			userGroup = tokenGroup
-		}
-		common.SetContextKey(c, constant.ContextKeyUsingGroup, userGroup)
+		common.SetContextKey(c, constant.ContextKeyUsingGroup, userCache.Group)
 
-		err = SetupContextForToken(c, token, parts...)
+		err = SetupContextForToken(c, token)
 		if err != nil {
 			return
 		}
@@ -805,7 +767,7 @@ func apiKeyFromWebSocketSubprotocol(protocols string) (string, bool) {
 	return "", false
 }
 
-func SetupContextForToken(c *gin.Context, token *model.Token, parts ...string) error {
+func SetupContextForToken(c *gin.Context, token *model.Token) error {
 	if token == nil {
 		return fmt.Errorf("token is nil")
 	}
@@ -823,7 +785,6 @@ func SetupContextForToken(c *gin.Context, token *model.Token, parts ...string) e
 	} else {
 		c.Set("token_model_limit_enabled", false)
 	}
-	common.SetContextKey(c, constant.ContextKeyTokenGroup, token.Group)
 	common.SetContextKey(c, constant.ContextKeyTokenCrossGroupRetry, token.CrossGroupRetry)
 	if token.AutoGroups != "" {
 		autoGroups, err := token.GetAutoGroups()
@@ -833,25 +794,6 @@ func SetupContextForToken(c *gin.Context, token *model.Token, parts ...string) e
 			common.SetContextKey(c, constant.ContextKeyTokenAutoGroups, autoGroups)
 		} else if len(autoGroups) > 0 {
 			common.SetContextKey(c, constant.ContextKeyTokenAutoGroups, autoGroups)
-		}
-	}
-	if len(parts) > 1 {
-		if model.IsAdmin(token.UserId) {
-			id, err := strconv.Atoi(parts[1])
-			if err != nil {
-				abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidChannelId))
-				return fmt.Errorf("invalid specific channel id")
-			}
-			service.GetChannelConstraints(c).AddPin(dto.ProviderPin{
-				ChannelId: id,
-				Source:    dto.PinSourceToken,
-				Rank:      dto.PinRankToken,
-				RetryMode: dto.PinRetrySingleAttempt,
-			})
-		} else {
-			c.Header("specific_channel_version", "701e3ae1dc3f7975556d354e0675168d004891c8")
-			abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgAuthChannelSelectForbidden))
-			return errors.New("regular users cannot specify a channel")
 		}
 	}
 	return nil

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel"
@@ -74,24 +76,55 @@ type LogoInfo struct {
 type imageRequestPayload struct {
 	ReqKey     string   `json:"req_key"`                      // Service identifier, fixed value: jimeng_high_aes_general_v21_L
 	Prompt     string   `json:"prompt"`                       // Prompt for image generation, supports both Chinese and English
-	Seed       int64    `json:"seed,omitempty"`               // Random seed, default -1 (random)
-	Width      int      `json:"width,omitempty"`              // Image width, default 512, range [256, 768]
-	Height     int      `json:"height,omitempty"`             // Image height, default 512, range [256, 768]
-	UsePreLLM  bool     `json:"use_pre_llm,omitempty"`        // Enable text expansion, default true
-	UseSR      bool     `json:"use_sr,omitempty"`             // Enable super resolution, default true
-	ReturnURL  bool     `json:"return_url,omitempty"`         // Whether to return image URL (valid for 24 hours)
+	Seed       *int64   `json:"seed,omitempty"`               // Random seed, default -1 (random)
+	Width      *int     `json:"width,omitempty"`              // Image width, default 512, range [256, 768]
+	Height     *int     `json:"height,omitempty"`             // Image height, default 512, range [256, 768]
+	UsePreLLM  *bool    `json:"use_pre_llm,omitempty"`        // Enable text expansion, default true
+	UseSR      *bool    `json:"use_sr,omitempty"`             // Enable super resolution, default true
+	ReturnURL  *bool    `json:"return_url,omitempty"`         // Whether to return image URL (valid for 24 hours)
 	LogoInfo   LogoInfo `json:"logo_info,omitempty"`          // Watermark information
 	ImageUrls  []string `json:"image_urls,omitempty"`         // Image URLs for input
 	BinaryData []string `json:"binary_data_base64,omitempty"` // Base64 encoded binary data
 }
 
 func (a *Protocol) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.ImageRequest) (any, error) {
+	if info.ResponseFacts != nil {
+		for _, value := range []common.RawMessage{request.Image, request.Images, request.Mask} {
+			if len(value) > 0 && string(value) != "null" {
+				return nil, fmt.Errorf("Jimeng cannot preserve standard image edit inputs")
+			}
+		}
+		if c.Request.MultipartForm != nil && len(c.Request.MultipartForm.File) > 0 {
+			return nil, fmt.Errorf("Jimeng cannot preserve uploaded image edit inputs")
+		}
+	}
 	payload := imageRequestPayload{
 		ReqKey: request.Model,
 		Prompt: request.Prompt,
 	}
 	if request.ResponseFormat == "" || request.ResponseFormat == "url" {
-		payload.ReturnURL = true // Default to returning image URLs
+		payload.ReturnURL = common.GetPointer(true)
+	} else {
+		payload.ReturnURL = common.GetPointer(false)
+	}
+	if request.Size != "" && request.Size != "auto" {
+		widthText, heightText, found := strings.Cut(request.Size, "x")
+		width, widthErr := strconv.Atoi(widthText)
+		height, heightErr := strconv.Atoi(heightText)
+		if !found || widthErr != nil || heightErr != nil {
+			return nil, types.NewMediaParameterError("size", "media_format_unsupported")
+		}
+		superResolution := false
+		if width > 768 || height > 768 {
+			if width%2 != 0 || height%2 != 0 {
+				return nil, types.NewMediaParameterError("size", "media_format_unsupported")
+			}
+			width, height, superResolution = width/2, height/2, true
+		}
+		if width < 256 || width > 768 || height < 256 || height > 768 {
+			return nil, types.NewMediaParameterError("size", "media_format_unsupported")
+		}
+		payload.Width, payload.Height, payload.UseSR = &width, &height, &superResolution
 	}
 
 	if len(request.ExtraFields) > 0 {

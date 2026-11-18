@@ -152,6 +152,16 @@ func InitDB() (err error) {
 			db = db.Debug()
 		}
 		DB = db
+		abilityState, err := inspectLegacyAbilityStartup(DB)
+		if err != nil {
+			return err
+		}
+		if abilityState == legacyAbilityEmpty && !common.IsMasterNode {
+			return ErrNativeDatabaseMaster
+		}
+		if err := ValidateLegacyMidjourneyMigration(DB); err != nil {
+			return err
+		}
 		if err := ensureUserQuotaColumns(DB); err != nil {
 			return err
 		}
@@ -172,8 +182,16 @@ func InitDB() (err error) {
 			return nil
 		}
 		common.SysLog(common.LogText("database migration started"))
-		err = migrateDB()
-		return err
+		if abilityState == legacyAbilityEmpty {
+			return initializeNativeDatabase(DB)
+		}
+		if err := migrateDB(); err != nil {
+			return err
+		}
+		if err := MigrateKeyPermissions(DB); err != nil {
+			return fmt.Errorf("migrate Key permissions: %w", err)
+		}
+		return nil
 	} else {
 		common.FatalLog(err)
 	}
@@ -260,8 +278,6 @@ func migrateDB() error {
 	if err := migratePrefillGroupUniqueness(DB); err != nil {
 		return err
 	}
-	// Migrate price_amount column from float/double to decimal for existing tables
-	migrateSubscriptionPlanPriceAmount()
 	// Migrate model_limits column from varchar to text for existing tables
 	if err := migrateTokenModelLimitsToText(); err != nil {
 		return err
@@ -270,6 +286,15 @@ func migrateDB() error {
 		common.SysError(common.LogText("failed to migrate options primary key: %s", err.Error()))
 	}
 
+	if err := migrateRedemptionAmounts(DB); err != nil {
+		return fmt.Errorf("migrate redemption amounts: %w", err)
+	}
+	if err := migrateCheckinAmounts(DB); err != nil {
+		return fmt.Errorf("migrate check-in amounts: %w", err)
+	}
+	if err := migrateCheckout(DB); err != nil {
+		return fmt.Errorf("migrate checkout: %w", err)
+	}
 	err := DB.AutoMigrate(
 		&Provider{},
 		&Channel{},
@@ -288,7 +313,6 @@ func migrateDB() error {
 		&Option{},
 		&LoginEncryptionKey{},
 		&Redemption{},
-		&Ability{},
 		&Log{},
 		&Midjourney{},
 		&TopUp{},
@@ -303,7 +327,6 @@ func migrateDB() error {
 		&TwoFABackupCode{},
 		&Checkin{},
 		&SubscriptionOrder{},
-		&UserSubscription{},
 		&SubscriptionPreConsumeRecord{},
 		&CustomOAuthProvider{},
 		&UserOAuthBinding{},
@@ -318,17 +341,26 @@ func migrateDB() error {
 	if err != nil {
 		return err
 	}
-	if err := MigrateKeyPermissions(DB); err != nil {
-		return fmt.Errorf("migrate Key permissions: %w", err)
-	}
 	if err := MigrateRecommendationRules(DB); err != nil {
 		return fmt.Errorf("migrate recommendation rules: %w", err)
 	}
 	if err := MigratePricing(DB); err != nil {
 		return fmt.Errorf("migrate pricing: %w", err)
 	}
+	if err := MigrateSubscriptionMoney(DB); err != nil {
+		return fmt.Errorf("migrate subscription money: %w", err)
+	}
+	if err := MigrateLegacyTaskObligations(DB); err != nil {
+		return fmt.Errorf("migrate legacy task obligations: %w", err)
+	}
 	if err := MigrateGatewayBilling(DB); err != nil {
 		return fmt.Errorf("migrate gateway billing: %w", err)
+	}
+	if err := migrateUserRewards(DB); err != nil {
+		return fmt.Errorf("migrate user rewards: %w", err)
+	}
+	if err := MigrateBalanceReminders(DB); err != nil {
+		return fmt.Errorf("migrate balance reminders: %w", err)
 	}
 	if err := InitializeUserAuthVersions(); err != nil {
 		return err
@@ -339,7 +371,7 @@ func migrateDB() error {
 	if err := InitializeExternalIdentityClaims(); err != nil {
 		return err
 	}
-	return DB.AutoMigrate(&SubscriptionPlan{})
+	return nil
 }
 
 func migrateLOGDB() error {
@@ -471,37 +503,6 @@ func migrateTokenModelLimitsToText() error {
 	}
 	common.SysLog(common.LogText("Successfully migrated %s.%s to text", tableName, columnName))
 	return nil
-}
-
-// migrateSubscriptionPlanPriceAmount migrates price_amount column from float/double to decimal(10,6)
-// This is safe to run multiple times - it checks the column type first
-func migrateSubscriptionPlanPriceAmount() {
-	tableName := "subscription_plans"
-	columnName := "price_amount"
-
-	if !DB.Migrator().HasTable(tableName) {
-		return
-	}
-
-	if !DB.Migrator().HasColumn(&SubscriptionPlan{}, columnName) {
-		return
-	}
-
-	var dataType string
-	if err := DB.Raw(`SELECT data_type FROM information_schema.columns
-		WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?`,
-		tableName, columnName).Scan(&dataType).Error; err != nil {
-		common.SysLog(common.LogText("Warning: failed to query metadata for %s.%s: %v", tableName, columnName, err))
-	} else if dataType == "numeric" {
-		return
-	}
-	alterSQL := fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN %s TYPE decimal(10,6) USING %s::decimal(10,6)`,
-		tableName, columnName, columnName)
-	if err := DB.Exec(alterSQL).Error; err != nil {
-		common.SysLog(common.LogText("Warning: failed to migrate %s.%s to decimal: %v", tableName, columnName, err))
-		return
-	}
-	common.SysLog(common.LogText("Successfully migrated %s.%s to decimal(10,6)", tableName, columnName))
 }
 
 func closeDB(db *gorm.DB) error {

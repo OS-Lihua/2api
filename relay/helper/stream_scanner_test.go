@@ -25,12 +25,51 @@ type headerCommitWriter struct {
 	*httptest.ResponseRecorder
 	headerStarted chan struct{}
 	once          sync.Once
+	failPing      bool
+	failFlush     bool
 }
 
 func (w *headerCommitWriter) WriteHeader(code int) {
 	// Let the scanner start while the first keepalive snapshots the headers.
 	w.once.Do(func() { close(w.headerStarted) })
 	w.ResponseRecorder.WriteHeader(code)
+}
+
+func (w *headerCommitWriter) Write(body []byte) (int, error) {
+	if w.failPing && !w.failFlush && strings.Contains(string(body), ": PING") {
+		return 0, io.ErrClosedPipe
+	}
+	return w.ResponseRecorder.Write(body)
+}
+
+func (w *headerCommitWriter) FlushError() error {
+	if w.failPing && w.failFlush {
+		return io.ErrClosedPipe
+	}
+	w.ResponseRecorder.Flush()
+	return nil
+}
+
+func TestStreamScannerHandler_PingFailureWithoutResponseFacts(t *testing.T) {
+	settings := operation_setting.GetGeneralSetting()
+	oldEnabled, oldInterval, oldTimeout := settings.PingIntervalEnabled, settings.PingIntervalSeconds, constant.StreamingTimeout
+	settings.PingIntervalEnabled, settings.PingIntervalSeconds, constant.StreamingTimeout = true, 1, 2
+	t.Cleanup(func() {
+		settings.PingIntervalEnabled, settings.PingIntervalSeconds, constant.StreamingTimeout = oldEnabled, oldInterval, oldTimeout
+	})
+	for _, flush := range []bool{false, true} {
+		t.Run(fmt.Sprintf("flush=%t", flush), func(t *testing.T) {
+			reader, writer := io.Pipe()
+			defer writer.Close()
+			recorder := &headerCommitWriter{ResponseRecorder: httptest.NewRecorder(), headerStarted: make(chan struct{}), failPing: true, failFlush: flush}
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/legacy-stream", nil)
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{}}
+			StreamScannerHandler(c, &http.Response{Body: reader}, info, func(string, *StreamResult) {})
+			require.NotNil(t, info.StreamStatus)
+			assert.Equal(t, relaycommon.StreamEndReasonPingFail, info.StreamStatus.EndReason)
+		})
+	}
 }
 
 func TestStreamScannerHandler_RequestKeepAliveHandoff(t *testing.T) {

@@ -24,8 +24,13 @@ import { Toaster } from 'sonner'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { api } from '@/lib/api'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { PluginDetailSheet } from '../components/plugin-detail-sheet'
+import {
+  taskPluginDetailKey,
+  taskPluginVersionsKey,
+} from '../lib/pricing-diagnostics'
 import type {
   TaskPluginDetail,
   TaskPluginListItem,
@@ -63,6 +68,7 @@ function renderSheet(
 ) {
   const item = makeItem()
   const detail: TaskPluginDetail = {
+    pricing_diagnostics: { state: 'ready', issues: [] },
     meta: { ...item.meta, ...metaOverrides },
     source: '',
     layer: 'factory',
@@ -73,8 +79,8 @@ function renderSheet(
       queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
     },
   })
-  queryClient.setQueryData(['task-plugin', item.meta.key], detail)
-  queryClient.setQueryData(['task-plugin-versions', item.meta.key], [])
+  queryClient.setQueryData(taskPluginDetailKey(item.meta.key), detail)
+  queryClient.setQueryData(taskPluginVersionsKey(item.meta.key), [])
   queryClients.push(queryClient)
   const view = render(
     <QueryClientProvider client={queryClient}>
@@ -99,6 +105,7 @@ function endpointRow(path: string): HTMLElement {
 afterEach(() => {
   for (const queryClient of queryClients) queryClient.clear()
   queryClients.length = 0
+  act(() => useAuthStore.getState().auth.reset())
 })
 
 describe('PluginDetailSheet metadata fields', () => {
@@ -589,7 +596,7 @@ test('activating a version lists the models it cannot charge', async () => {
     remark: '',
   })
   const versions = [version('1.2.3', true), version('1.0.0', false)]
-  fixture.queryClient.setQueryData(['task-plugin-versions', 'kling'], versions)
+  fixture.queryClient.setQueryData(taskPluginVersionsKey('kling'), versions)
   vi.spyOn(api, 'get').mockImplementation(async (url) => ({
     data: {
       success: true,
@@ -600,18 +607,28 @@ test('activating a version lists the models it cannot charge', async () => {
     data: {
       success: true,
       data: {
-        pricing_issues: [
-          {
-            model_name: 'kling-v1',
-            plugin_key: 'kling',
-            plugin_name: 'Kling',
-            reason: 'unconfigured',
-          },
-        ],
+        pricing_diagnostics: {
+          state: 'ready',
+          issues: [
+            {
+              owner_type: 'channel',
+              owner_id: 7,
+              owner_name: 'kling-v1',
+              price_version_id: null,
+              plugin_key: 'kling',
+              plugin_name: 'Kling',
+              reason: 'unconfigured',
+            },
+          ],
+        },
       },
     },
   })
-  render(<Toaster />)
+  render(
+    <QueryClientProvider client={fixture.queryClient}>
+      <Toaster />
+    </QueryClientProvider>
+  )
 
   await user.click(screen.getByRole('tab', { name: 'Version history' }))
   const row = screen.getByRole('row', { name: /1\.0\.0/ })
@@ -625,7 +642,7 @@ test('activating a version lists the models it cannot charge', async () => {
     expect.any(Object)
   )
   expect(await screen.findByText('Plugin version activated')).toBeVisible()
-  expect(screen.getByText('kling-v1: No price set')).toBeVisible()
+  expect(screen.getByText('Channel #7 · kling-v1')).toBeVisible()
 })
 
 test('version loading and failure allow retry without hiding the overview', async () => {
@@ -666,11 +683,11 @@ test('switching plugins returns to overview and never carries the previous compa
     ...fixture.item,
     meta: { ...fixture.item.meta, key: 'next', name: 'Next plugin' },
   }
-  fixture.queryClient.setQueryData(['task-plugin', 'next'], {
+  fixture.queryClient.setQueryData(taskPluginDetailKey('next'), {
     ...fixture.detail,
     meta: nextItem.meta,
   })
-  fixture.queryClient.setQueryData(['task-plugin-versions', 'next'], [])
+  fixture.queryClient.setQueryData(taskPluginVersionsKey('next'), [])
   await user.click(screen.getByRole('tab', { name: 'Source diff' }))
   fixture.rerender(
     <QueryClientProvider client={fixture.queryClient}>
@@ -690,13 +707,10 @@ test('comparison selection shows loading, retries failure, and resets after reop
   const user = userEvent.setup()
   const fixture = renderSheet({})
   await act(async () => {
-    fixture.queryClient.setQueryData(
-      ['task-plugin-versions', 'kling'],
-      [
-        { id: 1, version: '1.2.3', active: true },
-        { id: 2, version: '1.0.0', active: false },
-      ]
-    )
+    fixture.queryClient.setQueryData(taskPluginVersionsKey('kling'), [
+      { id: 1, version: '1.2.3', active: true },
+      { id: 2, version: '1.0.0', active: false },
+    ])
   })
   let rejectRequest!: (reason: Error) => void
   const request = vi.spyOn(api, 'get').mockImplementationOnce(
@@ -804,4 +818,178 @@ test('keeps the billing parameter table for plugins without usage profiles', asy
   expect(
     screen.queryByText('No billing parameters declared')
   ).not.toBeInTheDocument()
+})
+
+function detailActor(id = 1, sid = 'detail-session', pricingRead = true) {
+  useAuthStore.setState((state) => ({
+    auth: {
+      ...state.auth,
+      user: {
+        id,
+        username: `detail-${id}`,
+        role: 10,
+        permissions: {
+          admin_permissions: {
+            pricing: { read: pricingRead },
+            model: { read: true },
+            channel: { read: true },
+          },
+        },
+      },
+      session: {
+        sid,
+        current: true,
+        login_method: 'password',
+        ip: '',
+        user_agent: '',
+        created_at: 1,
+        last_active_at: 1,
+        expires_at: 9999999999,
+      },
+    },
+  }))
+}
+
+test.each(['account', 'session', 'permission'] as const)(
+  'a late detail GET cannot expose owners after a %s change',
+  async (change) => {
+    detailActor()
+    const fixture = renderSheet({})
+    fixture.unmount()
+    fixture.queryClient.removeQueries({ queryKey: ['task-plugin', 'kling'] })
+    let finishOld: (value: {
+      data: { success: boolean; data: TaskPluginDetail }
+    }) => void = () => undefined
+    let oldSignal: AbortSignal | undefined
+    let detailReads = 0
+    vi.spyOn(api, 'get').mockImplementation(async (url, config) => {
+      if (url.endsWith('/versions'))
+        {return { data: { success: true, data: [] } }}
+      if (url !== '/api/plugin/task/kling')
+        {throw new Error(`Unexpected GET ${url}`)}
+      detailReads += 1
+      if (detailReads === 1) {
+        if (!(config?.signal instanceof AbortSignal))
+          {throw new Error('Expected a cancellable detail request')}
+        oldSignal = config.signal
+        return new Promise((resolve) => {
+          finishOld = resolve
+        })
+      }
+      return {
+        data: {
+          success: true,
+          data: {
+            ...fixture.detail,
+            pricing_diagnostics: { state: 'not_authorized', issues: [] },
+          },
+        },
+      }
+    })
+    render(
+      <QueryClientProvider client={fixture.queryClient}>
+        <PluginDetailSheet
+          plugin={fixture.item}
+          onOpenChange={() => undefined}
+        />
+      </QueryClientProvider>
+    )
+    await waitFor(() => expect(detailReads).toBe(1))
+    act(() =>
+      detailActor(
+        change === 'account' ? 2 : 1,
+        change === 'session' ? 'new-detail-session' : 'detail-session',
+        change !== 'permission'
+      )
+    )
+    await waitFor(() => expect(detailReads).toBe(2))
+    expect(oldSignal?.aborted).toBe(true)
+    await act(async () =>
+      finishOld({
+        data: {
+          success: true,
+          data: {
+            ...fixture.detail,
+            pricing_diagnostics: {
+              state: 'ready',
+              issues: [
+                {
+                  owner_type: 'channel',
+                  owner_id: 777,
+                  owner_name: 'Old private owner',
+                  price_version_id: 88,
+                  plugin_key: 'kling',
+                  plugin_name: 'Kling',
+                  reason: 'incompatible',
+                },
+              ],
+            },
+          },
+        },
+      })
+    )
+    await userEvent
+      .setup()
+      .click(screen.getByRole('tab', { name: 'Billing parameters' }))
+    expect(
+      await screen.findByText(
+        'You are not authorized to read pricing diagnostics.'
+      )
+    ).toBeVisible()
+    expect(screen.queryByText(/Old private owner/)).not.toBeInTheDocument()
+    expect(
+      fixture.queryClient.getQueryData<TaskPluginDetail>(
+        taskPluginDetailKey('kling')
+      )?.pricing_diagnostics
+    ).toEqual({ state: 'not_authorized', issues: [] })
+  }
+)
+
+test('billing details label current-generation diagnostics and retry reads current details only', async () => {
+  const fixture = renderSheet({})
+  act(() =>
+    fixture.queryClient.setQueryData(taskPluginDetailKey('kling'), {
+      ...fixture.detail,
+      pricing_diagnostics: { state: 'unavailable', issues: [] },
+    })
+  )
+  const get = vi
+    .spyOn(api, 'get')
+    .mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          ...fixture.detail,
+          pricing_diagnostics: { state: 'ready', issues: [] },
+        },
+      },
+    })
+  const post = vi.spyOn(api, 'post')
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('tab', { name: 'Billing parameters' }))
+  expect(
+    screen.getByText(
+      'Checks the current running plugin and visible price owners, not the selected historical version.'
+    )
+  ).toBeVisible()
+  expect(screen.getByText('Pricing diagnostics are unavailable.')).toBeVisible()
+  expect(
+    screen.queryByText(
+      'Pricing diagnostics are unavailable. The plugin change was saved.'
+    )
+  ).not.toBeInTheDocument()
+  await user.click(
+    screen.getByRole('button', { name: 'Retry pricing diagnostics' })
+  )
+  expect(
+    await screen.findByText('No pricing issues found for visible price owners.')
+  ).toBeVisible()
+  expect(get).toHaveBeenCalledWith(
+    '/api/plugin/task/kling',
+    expect.objectContaining({
+      params: undefined,
+      signal: expect.any(AbortSignal),
+    })
+  )
+  expect(post).not.toHaveBeenCalled()
 })

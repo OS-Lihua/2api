@@ -8,9 +8,12 @@ import (
 )
 
 type RequestInput struct {
-	Headers map[string]string
-	Body    []byte
-	Usage   map[string]any
+	// UnmeasuredTokens names unavailable quantitative facts, not request probes.
+	// Exact evaluation fails only if the executed price reads one of them.
+	UnmeasuredTokens map[string]bool `json:"-"`
+	Headers          map[string]string
+	Body             []byte
+	Usage            map[string]any
 	// FreezeMoneyRequest captures only boolean request-pricing decisions.
 	// MoneySnapshot replays those decisions with new measured usage.
 	FreezeMoneyRequest   bool                  `json:"-"`
@@ -22,6 +25,9 @@ type RequestInput struct {
 	// ImageCount is a validated billing quantity, separate from the frozen
 	// request's n. Settlement can replace it with the actual returned count.
 	ImageCount *int
+	// ToolCount is a host-native operation quantity. Only u("tool_count")
+	// expressions use canonical count units; fixed/token expressions retain theirs.
+	ToolCount *int `json:"-"`
 }
 
 // TokenParams holds all token dimensions passed into an Expr evaluation.

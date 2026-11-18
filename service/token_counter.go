@@ -89,9 +89,14 @@ func countRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 		return 0, nil
 	}
 	if info.RelayMode == constant2.RelayModeAudioTranscription || info.RelayMode == constant2.RelayModeAudioTranslation {
-		multiForm, err := common.ParseMultipartFormReusable(c)
-		if err != nil {
-			return 0, fmt.Errorf("error parsing multipart form: %v", err)
+		multiForm := c.Request.MultipartForm
+		if multiForm == nil {
+			var err error
+			multiForm, err = common.ParseMultipartFormReusable(c)
+			if err != nil {
+				return 0, fmt.Errorf("error parsing multipart form: %v", err)
+			}
+			defer multiForm.RemoveAll()
 		}
 		fileHeaders := multiForm.File["file"]
 		totalAudioToken := 0
@@ -107,13 +112,35 @@ func countRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 			if err != nil {
 				return 0, fmt.Errorf("error getting audio duration: %v", err)
 			}
-			// duration 来自用户上传文件的元数据，可被伪造成天文数字或负数。
-			// 负值会让 token 估算变成负数（低估预扣费），先钳到 0 再转换。
-			if duration < 0 {
-				duration = 0
+			if info.ResponseFacts != nil && (math.IsNaN(duration) || math.IsInf(duration, 0) || duration <= 0 || duration > relaycommon.MaxTaskDurationSeconds) {
+				return 0, errors.New("audio duration exceeds the request limit")
 			}
-			// 一分钟 1000 token，与 $price / minute 对齐。
-			totalAudioToken += common.QuotaRound(math.Ceil(duration) / 60.0 * 1000)
+			if info.ResponseFacts != nil {
+				seconds := decimal.NewFromFloat(duration).String()
+				info.ResponseFacts.AudioInputSeconds = &seconds
+			}
+			tokens, clamp := common.AudioDurationTokens(duration)
+			if clamp != nil {
+				info.QuotaClamp = clamp
+			}
+			// Sum in the same bounded domain as each file's conversion.
+			totalAudioToken, clamp = common.QuotaFromFloatChecked(float64(totalAudioToken) + float64(tokens))
+			if clamp != nil {
+				info.QuotaClamp = clamp
+			}
+		}
+		if info.ResponseFacts != nil {
+			textTokens := utf8.RuneCountInString(meta.CombineText)
+			if meta.TokenType != types.TokenTypeTextNumber {
+				textTokens = tokenkit.Count(info.TokenizerModel, meta.CombineText)
+			}
+			info.ResponseFacts.AudioInputTokensEstimated = totalAudioToken
+			info.ResponseFacts.TextInputTokensEstimated = textTokens
+			total, clamp := common.QuotaFromFloatChecked(float64(totalAudioToken) + float64(textTokens))
+			if clamp != nil {
+				return 0, clamp
+			}
+			return total, nil
 		}
 		if usage != nil {
 			usage.PromptTokensDetails.AudioTokens = totalAudioToken

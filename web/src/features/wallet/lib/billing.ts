@@ -34,6 +34,14 @@ interface StatusConfig {
  * Status badge configuration
  */
 export const STATUS_CONFIG: Record<TopupStatus, StatusConfig> = {
+  quoted: {
+    variant: 'neutral',
+    label: 'Quoted',
+  },
+  failed: {
+    variant: 'danger',
+    label: 'Failed',
+  },
   success: {
     variant: 'success',
     label: 'Success',

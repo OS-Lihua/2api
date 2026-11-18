@@ -147,7 +147,7 @@ func TestInferencePresetSettingsAndDatabaseRoundTrip(t *testing.T) {
 					ok, _ := ProviderSatisfiesFilters(&loaded, tc.model, []filterdto.ProviderFilter{{Kind: filterdto.FilterRequestPath, RequestPath: tc.path}})
 					assert.Equal(t, tc.allowed, ok)
 				}
-				endpoints := getPricingEndpointTypesForAbility(AbilityWithProvider{ChannelType: channelType, Ability: Ability{Model: "allowed", ChannelId: loaded.Id}}, map[int]*dto.AdvancedCustomConfig{loaded.Id: actual})
+				endpoints := actual.SupportedEndpointTypesForModel("allowed")
 				expectedEndpoints := []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeOpenAIResponse, constant.EndpointTypeAnthropic, constant.EndpointTypeEmbeddings}
 				if channelType == constant.ChannelTypeSGLang {
 					expectedEndpoints = append(expectedEndpoints, constant.EndpointTypeJinaRerank)

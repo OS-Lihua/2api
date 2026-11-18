@@ -36,44 +36,36 @@ export function ModelSquareStatus(props: { model: Model; detail?: boolean }) {
   let label: string
   let description: string
   let variant: StatusVariant = 'neutral'
-  switch (props.model.square_state) {
-    case 'visible':
-      label = t('Displayed')
-      description = t(
-        'Visible only to users with access to the model’s groups.'
-      )
-      variant = 'success'
-      break
-    case 'hidden':
-      label = t('Listing hidden')
-      description = t('Hidden from the model square by metadata policy.')
-      break
-    case 'partial':
-      label = t('Partly shown')
-      description = t(
-        'Some matching models are hidden or have no available channel.'
-      )
-      variant = 'warning'
-      break
-    case 'unavailable':
-      label = t('Unavailable')
-      variant = 'warning'
-      description = t(
-        'No channel is currently available. This model will not appear in the model square.'
-      )
-      if (props.model.configured_channel_count === 0) {
-        description = t(
-          'No channel is configured. This model will not appear in the model square.'
-        )
-        if (props.model.name_rule !== 0) {
-          description = t(
-            'No configured channel models match this metadata rule.'
+  if (props.model.status !== 1) {
+    label = t('Metadata disabled')
+    description = t(
+      'Metadata status does not change Offering visibility or API authorization.'
+    )
+  } else if (props.model.name_rule !== 0) {
+    label = t('Metadata rule')
+    description = t(
+      'Connections require a saved exact-name Model. Metadata rules do not bind Channels.'
+    )
+  } else if (
+    props.model.enabled_channel_count === undefined ||
+    props.model.configured_channel_count === undefined
+  ) {
+    return <span className='text-muted-foreground'>—</span>
+  } else if (props.model.enabled_channel_count > 0) {
+    label = t('Enabled Channels')
+    description = t(
+      'Enabled counts include only enabled Channels with confirmed mappings and enabled Providers. They do not establish sale prices or Offering access.'
+    )
+    variant = 'success'
+  } else {
+    label = t('No enabled Channels')
+    description =
+      props.model.configured_channel_count === 0
+        ? t('No Channel is configured for this Model ID.')
+        : t(
+            'No Channel has an enabled Provider and a confirmed, enabled mapping for this Model ID.'
           )
-        }
-      }
-      break
-    default:
-      return <span className='text-muted-foreground'>—</span>
+    variant = 'warning'
   }
   const badge = (
     <StatusBadge

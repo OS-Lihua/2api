@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useMutation, useQuery } from '@tanstack/react-query'
 import type { ColumnDef } from '@tanstack/react-table'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { ConfirmDialog } from '@/components/confirm-dialog'
@@ -27,15 +27,15 @@ import { ErrorState } from '@/components/error-state'
 import { StatusBadge } from '@/components/status-badge'
 import { Button } from '@/components/ui/button'
 import { toIntlLocale } from '@/i18n/languages'
-import {
-  hasPermission,
-  ADMIN_PERMISSION_RESOURCES,
-  ADMIN_PERMISSION_ACTIONS,
-} from '@/lib/admin-permissions'
 import { formatNumber } from '@/lib/format'
 import { useAuthStore } from '@/stores/auth-store'
 
 import {
+  assertChannelAccess,
+  channelAccessScope,
+  channelScopeKey,
+  isChannelScopeCurrent,
+  type ChannelAccessScope,
   channelAction,
   channelKeys,
   listSingleModelChannels,
@@ -45,21 +45,44 @@ import { getChannelProbeLabels } from '../lib/channel-probes'
 import { ChannelMutateDrawer } from './channel-mutate-drawer'
 import { ChannelProbeDialog } from './channel-probe-dialog'
 
-export function ProviderChannels(props: { providerId: number }) {
+type ProviderChannelsProps =
+  | { providerId: number; modelId?: never; readOnly?: boolean }
+  | { modelId: number; providerId?: never; readOnly: true }
+
+export function ProviderChannels(props: ProviderChannelsProps) {
+  useAuthStore((state) => state.auth.user)
+  useAuthStore((state) => state.auth.session?.sid)
+  const scope = channelAccessScope()
+  return (
+    <ScopedChannels
+      key={JSON.stringify([
+        channelScopeKey(scope),
+        props.providerId,
+        props.modelId,
+        props.readOnly,
+      ])}
+      {...props}
+      scope={scope}
+    />
+  )
+}
+
+function ScopedChannels(
+  props: ProviderChannelsProps & { scope: ChannelAccessScope }
+) {
   const { t, i18n } = useTranslation()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const featureLabels = getChannelProbeLabels(t)
-  const user = useAuthStore((state) => state.auth.user)
-  const canWrite = hasPermission(
-    user,
-    ADMIN_PERMISSION_RESOURCES.CHANNEL,
-    ADMIN_PERMISSION_ACTIONS.WRITE
-  )
-  const canOperate = hasPermission(
-    user,
-    ADMIN_PERMISSION_RESOURCES.CHANNEL,
-    ADMIN_PERMISSION_ACTIONS.OPERATE
-  )
+  const canWrite = props.scope.read && props.scope.write && !props.readOnly
+  const canOperate = props.scope.read && props.scope.operate && !props.readOnly
+  const active = useRef(true)
+  useEffect(() => {
+    active.current = true
+    return () => {
+      active.current = false
+    }
+  }, [])
+  const current = () => active.current && isChannelScopeCurrent(props.scope)
   const [probing, setProbing] = useState<SingleModelChannel | null>(null)
   const [pagination, setPagination] = useState({ pageIndex: 0, pageSize: 10 })
   const [editing, setEditing] = useState<SingleModelChannel | null | undefined>(
@@ -69,17 +92,58 @@ export function ProviderChannels(props: { providerId: number }) {
     channel: SingleModelChannel
     action: string
   } | null>(null)
+  const filter =
+    props.modelId === undefined
+      ? { provider_id: props.providerId }
+      : { model_id: props.modelId }
+  const validTarget =
+    Number.isSafeInteger(props.modelId ?? props.providerId) &&
+    (props.modelId ?? props.providerId) > 0
   const query = useQuery({
-    queryKey: channelKeys.list(props.providerId, pagination.pageIndex + 1),
-    queryFn: () =>
-      listSingleModelChannels(props.providerId, pagination.pageIndex + 1),
+    queryKey: channelKeys.list(
+      filter,
+      pagination.pageIndex + 1,
+      pagination.pageSize,
+      props.scope
+    ),
+    queryFn: async ({ signal }) => {
+      assertChannelAccess(props.scope, 'read', signal)
+      const result = await listSingleModelChannels(
+        filter,
+        pagination.pageIndex + 1,
+        signal,
+        pagination.pageSize
+      )
+      assertChannelAccess(props.scope, 'read', signal)
+      return result
+    },
+    enabled: props.scope.read && validTarget,
+    retry: false,
+    staleTime: 0,
+    gcTime: 0,
     refetchInterval: 5_000,
+    meta: { errorToast: false },
   })
   const mutation = useMutation({
+    meta: { errorToast: false },
     mutationFn: async () => {
-      if (operation) await channelAction(operation.channel.id, operation.action)
+      if (!current() || props.readOnly || !operation) {
+        throw new Error('Channel access changed')
+      }
+      assertChannelAccess(
+        props.scope,
+        operation.action === 'delete' ? 'write' : 'operate'
+      )
+      await channelAction(operation.channel.id, operation.action)
+      return `${pagination.pageIndex}:${pagination.pageSize}`
     },
-    onSuccess: async () => {
+    onSuccess: async (completedPage) => {
+      if (
+        !current() ||
+        completedPage !== `${pagination.pageIndex}:${pagination.pageSize}`
+      ) {
+        return
+      }
       setOperation(null)
       await query.refetch()
     },
@@ -92,6 +156,7 @@ export function ProviderChannels(props: { providerId: number }) {
     },
     { accessorKey: 'protocol', header: t('Protocol') },
     { accessorKey: 'model_id', header: t('Model ID') },
+    { accessorKey: 'provider_id', header: t('Provider ID') },
     {
       accessorKey: 'status',
       header: t('Status'),
@@ -252,12 +317,20 @@ export function ProviderChannels(props: { providerId: number }) {
       ),
     },
   ]
+  const visibleColumns = props.readOnly
+    ? columns.filter((column) => column.id !== 'actions')
+    : columns
   const { table } = useDataTable({
-    data: query.data?.items ?? [],
-    columns,
+    data: props.scope.read && !query.isError ? (query.data?.items ?? []) : [],
+    columns: visibleColumns,
     getRowId: (row) => String(row.id),
     pagination,
-    onPaginationChange: setPagination,
+    onPaginationChange: (next) => {
+      setOperation(null)
+      setEditing(undefined)
+      setProbing(null)
+      setPagination(next)
+    },
     manualPagination: true,
     totalCount: query.data?.total ?? 0,
   })
@@ -274,12 +347,18 @@ export function ProviderChannels(props: { providerId: number }) {
           </Button>
         )}
       </div>
-      {query.isError ? (
+      {!props.scope.read && (
+        <p role='status'>
+          {t('Channel read permission is required to view connections.')}
+        </p>
+      )}
+      {props.scope.read && query.isError && (
         <ErrorState onRetry={() => void query.refetch()} />
-      ) : (
+      )}
+      {props.scope.read && !query.isError && (
         <DataTablePage
           table={table}
-          columns={columns}
+          columns={visibleColumns}
           fixedHeight={false}
           paginationInFooter={false}
           compactPagination
@@ -287,18 +366,19 @@ export function ProviderChannels(props: { providerId: number }) {
           emptyTitle={t('No channels found')}
         />
       )}
-      {editing !== undefined && (
+      {canWrite && editing !== undefined && props.providerId !== undefined && (
         <ChannelMutateDrawer
           providerId={props.providerId}
           channel={editing ?? undefined}
           onClose={() => setEditing(undefined)}
           onSaved={() => {
+            if (!current()) return
             setEditing(undefined)
             void query.refetch()
           }}
         />
       )}
-      {probing && (
+      {props.scope.read && !props.readOnly && probing && (
         <ChannelProbeDialog
           channel={probing}
           canOperate={canOperate}
@@ -311,11 +391,17 @@ export function ProviderChannels(props: { providerId: number }) {
           if (!open && !mutation.isPending) setOperation(null)
         }}
         title={t('Confirm channel change')}
-        desc={operation?.channel.upstream_model_name ?? ''}
+        desc={
+          <span className='wrap-anywhere'>
+            {operation?.channel.upstream_model_name ?? ''}
+          </span>
+        }
         destructive={operation?.action === 'delete'}
         isLoading={mutation.isPending}
         handleConfirm={() => mutation.mutate()}
-      />
+      >
+        {mutation.isError && <p role='alert'>{mutation.error.message}</p>}
+      </ConfirmDialog>
     </section>
   )
 }

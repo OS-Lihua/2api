@@ -43,9 +43,16 @@ import { I18nextProvider } from 'react-i18next'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
 import { TooltipProvider } from '@/components/ui/tooltip'
+import en from '@/i18n/locales/en.json'
+import fr from '@/i18n/locales/fr.json'
+import ja from '@/i18n/locales/ja.json'
+import ru from '@/i18n/locales/ru.json'
+import viLocale from '@/i18n/locales/vi.json'
+import zhTW from '@/i18n/locales/zh-TW.json'
 import zh from '@/i18n/locales/zh.json'
 import { api } from '@/lib/api'
 import { formatTimestampToDate } from '@/lib/format'
+import type { WalletSummary } from '@/lib/wallet-summary'
 import { useAuthStore } from '@/stores/auth-store'
 import {
   DEFAULT_CURRENCY_CONFIG,
@@ -53,6 +60,7 @@ import {
 } from '@/stores/system-config-store'
 
 import type { User } from '../../types'
+import { UserWalletCell } from '../user-quota-cell'
 import { useUsersColumns } from '../users-columns'
 import { UsersProvider } from '../users-provider'
 import { UsersTable } from '../users-table'
@@ -65,12 +73,24 @@ await i18n.init({
   initAsync: false,
 })
 
-function QuotaTable(props: { remaining: number; used: number }) {
-  const columns = useUsersColumns().filter((column) =>
-    ['quota', 'used_quota'].includes(
-      column.id ?? ('accessorKey' in column ? String(column.accessorKey) : '')
-    )
-  )
+function QuotaTable(props: {
+  remaining: string
+  used: string
+  outstanding?: string
+}) {
+  const wallet: WalletSummary = {
+    user_id: 1,
+    available: { nanos: props.remaining, currency: 'EUR' },
+    outstanding: { nanos: props.outstanding ?? '0', currency: 'EUR' },
+    consumed: { nanos: props.used, currency: 'EUR' },
+    sale_pending: false,
+    requests_paused: false,
+  }
+  const columns = useUsersColumns({
+    visible: true,
+    byId: new Map([[1, wallet]]),
+    loading: false,
+  }).filter((column) => column.id === 'wallet')
   const table = useReactTable({
     columns,
     data: [
@@ -80,8 +100,8 @@ function QuotaTable(props: { remaining: number; used: number }) {
         display_name: '',
         role: 1,
         status: 1,
-        quota: props.remaining,
-        used_quota: props.used,
+        quota: 999999,
+        used_quota: 999999,
         request_count: 0,
         group: 'default',
       } as User,
@@ -134,39 +154,129 @@ afterEach(() => {
     .setConfig({ currency: { ...DEFAULT_CURRENCY_CONFIG } })
 })
 
-it('shows balance above secondary usage text and opens quota details on click', async () => {
+it('keeps long native amounts, Chinese labels and the full explanation accessible in a viewport-bounded wallet popover', async () => {
+  const translated = createInstance()
+  await translated.init({ lng: 'zh', resources: { zh }, initAsync: false })
+  render(
+    <I18nextProvider i18n={translated}>
+      <UserWalletCell
+        wallet={{
+          user_id: 1,
+          available: { nanos: '9007199254740993', currency: 'EUR' },
+          outstanding: { nanos: '1', currency: 'EUR' },
+          consumed: { nanos: '-922337203685477580800000001', currency: 'EUR' },
+          sale_pending: true,
+          requests_paused: true,
+        }}
+      />
+    </I18nextProvider>
+  )
+  await userEvent.click(screen.getByRole('button'))
+  const dialog = screen.getByRole('dialog')
+  expect(dialog).toHaveClass('max-h-(--available-height)', 'overflow-y-auto')
+  const label = within(dialog).getByText(translated.t('Posted consumption'))
+  expect(label.parentElement).toHaveClass('grid-cols-1', 'min-w-0')
+  expect(label.nextElementSibling).toHaveTextContent(
+    '-922,337,203,685,477,580.800000001 EUR'
+  )
+  expect(label.nextElementSibling).toHaveClass('wrap-anywhere')
+  expect(
+    within(dialog).getByText(
+      translated.t(
+        'Posted ledger consumption includes signed corrections. It excludes unsettled sales and legacy quota records. Debt repayments are not counted again.'
+      )
+    )
+  ).toBeVisible()
+  expect(
+    within(dialog).getByText(translated.t('Requests paused'))
+  ).toBeVisible()
+})
+
+it('translates paused wallet details with real resources when switching all seven languages', async () => {
+  const translated = createInstance()
+  await translated.init({
+    lng: 'en',
+    fallbackLng: 'en',
+    initAsync: false,
+    resources: { en, fr, ja, ru, vi: viLocale, zhCN: zh, zhTW },
+  })
+  render(
+    <I18nextProvider i18n={translated}>
+      <UserWalletCell
+        wallet={{
+          user_id: 1,
+          available: { nanos: '9007199254740993', currency: 'EUR' },
+          outstanding: { nanos: '1', currency: 'EUR' },
+          consumed: { nanos: '-922337203685477580800000001', currency: 'JPY' },
+          sale_pending: true,
+          requests_paused: true,
+        }}
+      />
+    </I18nextProvider>
+  )
+  await userEvent.click(screen.getByRole('button'))
+  for (const [language, label, amount] of [
+    ['en', 'Requests paused', '9,007,199.254740993 EUR'],
+    ['zhCN', '请求已暂停', '9,007,199.254740993 EUR'],
+    ['zhTW', '請求已暫停', '9,007,199.254740993 EUR'],
+    ['fr', 'Requêtes suspendues', '9 007 199,254740993 EUR'],
+    ['ru', 'Запросы приостановлены', '9 007 199,254740993 EUR'],
+    ['ja', 'リクエスト停止中', '9,007,199.254740993 EUR'],
+    ['vi', 'Yêu cầu đã tạm dừng', '9.007.199,254740993 EUR'],
+  ]) {
+    await act(async () => translated.changeLanguage(language))
+    const dialog = screen.getByRole('dialog')
+    expect(within(dialog).getByText(label)).toBeVisible()
+    expect(
+      within(dialog).getByText(amount, { normalizer: (value) => value })
+    ).toBeVisible()
+    if (language !== 'en') {
+      expect(
+        within(dialog).queryByText('Requests paused')
+      ).not.toBeInTheDocument()
+    }
+  }
+})
+
+it('shows native balance above posted consumption and opens wallet details on click', async () => {
   render(
     <I18nextProvider i18n={i18n}>
-      <QuotaTable remaining={1900} used={1100} />
+      <QuotaTable remaining='1900000000' used='1100000000' />
     </I18nextProvider>
   )
   expect(
-    screen.getByRole('columnheader', { name: 'Available Balance ($)' })
-  ).toHaveAttribute('data-sortable', 'true')
+    screen.getByRole('columnheader', { name: 'Available Balance' })
+  ).toHaveAttribute('data-sortable', 'false')
   expect(screen.getAllByRole('columnheader')).toHaveLength(1)
   const cells = screen.getAllByRole('cell')
-  expect(within(cells[0]).getByText('0.0038')).toBeInTheDocument()
   expect(cells).toHaveLength(1)
+  expect(within(cells[0]).getByText('1.9 EUR')).toBeVisible()
+  expect(within(cells[0]).getByText('1.1 EUR')).toBeVisible()
   expect(
     within(cells[0]).queryByText('Available Balance')
   ).not.toBeInTheDocument()
-  expect(within(cells[0]).getByText('0.0022')).toBeInTheDocument()
-  expect(screen.getByText('0.0038').parentElement).toHaveClass('grid-cols-1')
-  expect(screen.getByText('Used amount').parentElement).toHaveAttribute(
+  expect(screen.getByText('1.9 EUR').parentElement).toHaveClass('grid-cols-1')
+  expect(screen.getByText('Posted consumption').parentElement).toHaveAttribute(
     'data-table-text',
     'secondary'
   )
   expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
-  expect(screen.queryByText('0.006')).not.toBeInTheDocument()
   const trigger = screen.getByRole('button', {
-    name: 'Available Balance 0.0038; Used amount 0.0022',
+    name: 'Available Balance 1.9 EUR; Posted consumption 1.1 EUR',
   })
   await userEvent.click(trigger)
-  const detail = await screen.findByRole('dialog', { name: 'Quota ($)' })
-  expect(within(detail).getByText('Available Balance')).toBeInTheDocument()
-  expect(within(detail).getByText('Total Used')).toBeInTheDocument()
-  expect(within(detail).getByText('0.0038')).toBeInTheDocument()
-  expect(within(detail).getByText('0.0022')).toBeInTheDocument()
+  const detail = await screen.findByRole('dialog', { name: 'Wallet' })
+  for (const text of [
+    'Available Balance',
+    'Posted consumption',
+    'Outstanding',
+    '1.9 EUR',
+    '1.1 EUR',
+    '0 EUR',
+  ]) {
+    expect(within(detail).getByText(text)).toBeVisible()
+  }
+  expect(within(detail).getByText(/includes signed corrections/)).toBeVisible()
   expect(within(detail).queryByRole('progressbar')).not.toBeInTheDocument()
   await userEvent.keyboard('{Escape}')
   await waitFor(() =>
@@ -175,48 +285,49 @@ it('shows balance above secondary usage text and opens quota details on click', 
   expect(trigger).toHaveFocus()
 })
 
-it.each([0, 500000])(
-  'shows usage for a zero balance only when used quota is nonzero (used=%s)',
-  async (used) => {
+it.each([
+  ['0', '0 EUR'],
+  ['1000000000', '1 EUR'],
+])(
+  'preserves a real zero wallet and posted consumption %s',
+  async (used, expected) => {
     render(
       <I18nextProvider i18n={i18n}>
-        <QuotaTable remaining={0} used={used} />
+        <QuotaTable remaining='0' used={used} />
       </I18nextProvider>
     )
-    if (used === 0) {
-      expect(screen.getAllByRole('cell')[0]).toHaveTextContent(/^No Quota$/)
-      expect(screen.queryByText('Used amount')).not.toBeInTheDocument()
-      await userEvent.click(screen.getByRole('button', { name: 'No Quota' }))
-      const detail = await screen.findByRole('dialog', { name: 'Quota ($)' })
-      expect(within(detail).getAllByText('0')).toHaveLength(2)
-      return
-    }
     expect(screen.queryByText('No Quota')).not.toBeInTheDocument()
-    expect(
-      within(screen.getAllByRole('cell')[0]).getByText('0')
-    ).toBeInTheDocument()
-    expect(
-      within(screen.getAllByRole('cell')[0]).getByText('1')
-    ).toBeInTheDocument()
+    expect(screen.getByText('Posted consumption')).toBeVisible()
+    await userEvent.click(
+      screen.getByRole('button', {
+        name: `Available Balance 0 EUR; Posted consumption ${expected}`,
+      })
+    )
+    const detail = await screen.findByRole('dialog', { name: 'Wallet' })
+    expect(within(detail).getAllByText('0 EUR')).toHaveLength(
+      used === '0' ? 3 : 2
+    )
+    expect(within(detail).getAllByText(expected).length).toBeGreaterThan(0)
   }
 )
 
-it('preserves negative balances in details opened with the keyboard', async () => {
+it('preserves outstanding debt and signed corrections in details opened with the keyboard', async () => {
   render(
     <I18nextProvider i18n={i18n}>
-      <QuotaTable remaining={-500000} used={1000000} />
+      <QuotaTable remaining='0' used='-2000000000' outstanding='1000000000' />
     </I18nextProvider>
   )
-  expect(screen.getByText('-1')).toHaveClass('text-destructive')
-  expect(screen.getByText('2')).toBeInTheDocument()
+  expect(screen.getByText('0 EUR')).toBeVisible()
+  expect(screen.getByText('-2 EUR')).toBeVisible()
   await userEvent.tab()
   await userEvent.keyboard('{Enter}')
   const detail = await screen.findByRole('dialog')
-  expect(within(detail).getByText('-1')).toBeInTheDocument()
-  expect(within(detail).getByText('2')).toBeInTheDocument()
+  expect(within(detail).getByText('1 EUR')).toBeVisible()
+  expect(within(detail).getByText('-2 EUR')).toBeVisible()
+  expect(within(detail).getByText('Outstanding')).toBeVisible()
 })
 
-it('shows the custom symbol only in the column header', () => {
+it('keeps the native money currency when a custom display symbol is configured', () => {
   useSystemConfigStore.getState().setConfig({
     currency: {
       ...DEFAULT_CURRENCY_CONFIG,
@@ -227,20 +338,20 @@ it('shows the custom symbol only in the column header', () => {
   })
   render(
     <I18nextProvider i18n={i18n}>
-      <QuotaTable remaining={1900} used={1100} />
+      <QuotaTable remaining='1900000000' used='1100000000' />
     </I18nextProvider>
   )
   expect(
-    screen.getByRole('columnheader', { name: 'Available Balance (🐱)' })
+    screen.getByRole('columnheader', { name: 'Available Balance' })
   ).toBeInTheDocument()
   for (const cell of screen.getAllByRole('cell')) {
     expect(cell).not.toHaveTextContent('🐱')
   }
   expect(
-    within(screen.getAllByRole('cell')[0]).getByText('0.0038')
+    within(screen.getAllByRole('cell')[0]).getByText('1.9 EUR')
   ).toBeInTheDocument()
   expect(
-    within(screen.getAllByRole('cell')[0]).getByText('0.0022')
+    within(screen.getAllByRole('cell')[0]).getByText('1.1 EUR')
   ).toBeInTheDocument()
 })
 
@@ -254,8 +365,22 @@ function UsersPage() {
   )
 }
 
-async function renderUsersList(emptyInvitation = false) {
-  useAuthStore.getState().auth.setUser({ id: 1, username: 'admin', role: 100 })
+async function renderUsersList(
+  emptyInvitation = false,
+  options: {
+    ledgerRead?: boolean
+    deleted?: boolean
+    initialEntry?: string
+  } = {}
+) {
+  useAuthStore.getState().auth.setUser({
+    id: 1,
+    username: 'admin',
+    role: 10,
+    permissions: {
+      admin_permissions: { ledger: { read: options.ledgerRead ?? true } },
+    },
+  })
   const usersResponse = {
     data: {
       success: true,
@@ -264,6 +389,7 @@ async function renderUsersList(emptyInvitation = false) {
           {
             id: 2,
             username: 'long-user-name-for-table-layout',
+            DeletedAt: options.deleted ? '2026-01-01T00:00:00Z' : null,
             display_name: 'A display name',
             role: 1,
             status: 1,
@@ -274,7 +400,14 @@ async function renderUsersList(emptyInvitation = false) {
             last_login_at: Math.floor(Date.now() / 1000) - 20,
             group: 'default',
             aff_count: emptyInvitation ? 0 : 2,
-            aff_history_quota: emptyInvitation ? 0 : 500000,
+            referral_rewards: {
+              available: { nanos: '0', currency: 'CNY' },
+              earned: {
+                nanos: emptyInvitation ? '0' : '9007199254740993',
+                currency: 'CNY',
+              },
+              invited: emptyInvitation ? 0 : 2,
+            },
             inviter_id: emptyInvitation ? 0 : 42,
           },
         ],
@@ -282,13 +415,34 @@ async function renderUsersList(emptyInvitation = false) {
       },
     },
   }
-  const get = vi
-    .spyOn(api, 'get')
-    .mockImplementation(async (url) =>
-      url === '/api/group/'
-        ? { data: { success: true, data: ['default'] } }
-        : usersResponse
-    )
+  const get = vi.spyOn(api, 'get').mockImplementation(async (url) => {
+    if (url === '/api/group/') {
+      return { data: { success: true, data: ['default'] } }
+    }
+    if (url === '/api/admin/v1/user-wallets') {
+      return {
+        data: {
+          success: true,
+          data: {
+            items: [
+              {
+                user_id: 2,
+                available: { nanos: '9007199254740993', currency: 'EUR' },
+                outstanding: { nanos: '1', currency: 'EUR' },
+                consumed: {
+                  nanos: '922337203685477580800000001',
+                  currency: 'JPY',
+                },
+                sale_pending: true,
+                requests_paused: true,
+              },
+            ],
+          },
+        },
+      }
+    }
+    return usersResponse
+  })
   const root = createRootRoute()
   const auth = createRoute({ getParentRoute: () => root, id: '_authenticated' })
   const users = createRoute({
@@ -298,7 +452,9 @@ async function renderUsersList(emptyInvitation = false) {
   })
   const router = createRouter({
     routeTree: root.addChildren([auth.addChildren([users])]),
-    history: createMemoryHistory({ initialEntries: ['/users/'] }),
+    history: createMemoryHistory({
+      initialEntries: [options.initialEntry ?? '/users/'],
+    }),
   })
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -316,18 +472,195 @@ async function renderUsersList(emptyInvitation = false) {
   return get
 }
 
-it('sends balance sorting to the server and keeps invitation details on two lines', async () => {
+it('bounds an oversized URL page to the batch limit before sending either request', async () => {
+  const get = await renderUsersList(false, {
+    initialEntry: '/users/?pageSize=1000',
+  })
+  await screen.findByText('9,007,199.254740993 EUR')
+  expect(get).toHaveBeenCalledWith('/api/user/', {
+    params: { p: 1, page_size: 100 },
+    signal: expect.any(AbortSignal),
+  })
+  for (const [, config] of get.mock.calls.filter(
+    ([url]) => url === '/api/user/'
+  )) {
+    expect(config).toMatchObject({ params: { page_size: 100 } })
+  }
+  expect(get).toHaveBeenCalledWith('/api/admin/v1/user-wallets', {
+    params: { user_ids: '2' },
+    signal: expect.any(AbortSignal),
+  })
+})
+
+it('does not request financial data for a user reader without ledger permission', async () => {
+  const get = await renderUsersList(false, { ledgerRead: false })
+  expect(
+    screen.queryByRole('columnheader', { name: 'Available Balance' })
+  ).not.toBeInTheDocument()
+  expect(
+    get.mock.calls.some(([url]) => url === '/api/admin/v1/user-wallets')
+  ).toBe(false)
+})
+
+it('excludes deleted rows from batch reads and never presents them as a zero wallet', async () => {
+  const get = await renderUsersList(false, { deleted: true })
+  expect(screen.getByText('Wallet unavailable')).toBeVisible()
+  expect(
+    get.mock.calls.some(([url]) => url === '/api/admin/v1/user-wallets')
+  ).toBe(false)
+  expect(screen.queryByText('0 EUR')).not.toBeInTheDocument()
+})
+
+it('hides cached financial data immediately after ledger permission is revoked', async () => {
+  await renderUsersList()
+  await screen.findByText('9,007,199.254740993 EUR')
+  act(() =>
+    useAuthStore.getState().auth.setUser({
+      id: 1,
+      username: 'admin',
+      role: 10,
+      permissions: { admin_permissions: { ledger: { read: false } } },
+    })
+  )
+  expect(screen.queryByText('9,007,199.254740993 EUR')).not.toBeInTheDocument()
+  expect(screen.queryByText('Posted consumption')).not.toBeInTheDocument()
+})
+
+it('rejects malformed batch totals without falling back to quota and retries the read', async () => {
+  const get = await renderUsersList()
+  await screen.findByText('9,007,199.254740993 EUR')
+  const original = get.getMockImplementation()
+  if (!original) throw new Error('Expected API fixture')
+  get.mockImplementation(async (url, config) => {
+    if (url === '/api/admin/v1/user-wallets') {
+      return { data: { success: true, data: { items: [] } } }
+    }
+    return original(url, config)
+  })
+  await act(async () => {
+    await clients[0].invalidateQueries({ queryKey: ['admin-user-wallets'] })
+  })
+  const retry = await screen.findByRole('button', { name: 'Retry' })
+  expect(screen.queryByText('9,007,199.254740993 EUR')).not.toBeInTheDocument()
+  expect(screen.queryByText('0.0038')).not.toBeInTheDocument()
+  get.mockImplementation(original)
+  await userEvent.click(retry)
+  expect(await screen.findByText('9,007,199.254740993 EUR')).toBeVisible()
+})
+
+it.each(['account', 'session'] as const)(
+  'does not reuse a pending batch response after the %s changes',
+  async (change) => {
+    const get = await renderUsersList()
+    await screen.findByText('9,007,199.254740993 EUR')
+    const original = get.getMockImplementation()
+    if (!original) throw new Error('Expected API fixture')
+    type Response = Awaited<ReturnType<typeof original>>
+    let resolve!: (value: Response) => void
+    const pending = new Promise<Response>((done) => {
+      resolve = done
+    })
+    let oldSignal: AbortSignal | undefined
+    let waiting = true
+    get.mockImplementation(async (url, config) => {
+      if (url !== '/api/admin/v1/user-wallets') return original(url, config)
+      if (waiting) {
+        waiting = false
+        oldSignal = config?.signal as AbortSignal
+        return pending
+      }
+      return {
+        data: {
+          success: true,
+          data: {
+            items: [
+              {
+                user_id: 2,
+                available: { nanos: '3000000000', currency: 'EUR' },
+                outstanding: { nanos: '0', currency: 'EUR' },
+                consumed: { nanos: '0', currency: 'EUR' },
+                sale_pending: false,
+                requests_paused: false,
+              },
+            ],
+          },
+        },
+      }
+    })
+    act(() => {
+      void clients[0].invalidateQueries({ queryKey: ['admin-user-wallets'] })
+    })
+    await waitFor(() => expect(oldSignal).toBeDefined())
+    act(() => {
+      const auth = useAuthStore.getState().auth
+      useAuthStore.setState({
+        auth: {
+          ...auth,
+          user: {
+            ...auth.user,
+            id: change === 'account' ? 9 : 1,
+            username: 'next-admin',
+            role: 10,
+            permissions: { admin_permissions: { ledger: { read: true } } },
+          },
+          session: {
+            sid: 'next-session',
+            current: true,
+            login_method: 'password',
+            ip: '',
+            user_agent: '',
+            created_at: 1,
+            last_active_at: 1,
+            expires_at: 9999999999,
+          },
+        },
+      })
+    })
+    expect(await screen.findByText('3 EUR')).toBeVisible()
+    expect(oldSignal?.aborted).toBe(true)
+    await act(async () => resolve(await original('/api/admin/v1/user-wallets')))
+    expect(
+      screen.queryByText('9,007,199.254740993 EUR')
+    ).not.toBeInTheDocument()
+    expect(screen.getByText('3 EUR')).toBeVisible()
+  }
+)
+
+it('reads current-page wallet summaries and preserves unbounded posted consumption', async () => {
+  const get = await renderUsersList()
+  expect(await screen.findByText('9,007,199.254740993 EUR')).toBeVisible()
+  expect(
+    screen.getByText('922,337,203,685,477,580.800000001 JPY')
+  ).toBeVisible()
+  expect(get).toHaveBeenCalledWith('/api/admin/v1/user-wallets', {
+    params: { user_ids: '2' },
+    signal: expect.any(AbortSignal),
+  })
+  expect(screen.queryByText('0.0038')).not.toBeInTheDocument()
+  await userEvent.click(
+    screen.getByRole('button', { name: /Available Balance 9,007,199/ })
+  )
+  const detail = await screen.findByRole('dialog', { name: 'Wallet' })
+  expect(within(detail).getByText('0.000000001 EUR')).toBeVisible()
+  expect(within(detail).getByText('Posted consumption')).toBeVisible()
+  expect(within(detail).getByText('Sales awaiting accounting')).toBeVisible()
+  expect(within(detail).getByText('Requests paused')).toBeVisible()
+})
+
+it('keeps wallet unsortable, sends ID sorting to the server and preserves invitation details', async () => {
   const get = await renderUsersList()
   expect(
     screen.getByRole('columnheader', { name: 'User Group' })
   ).toBeInTheDocument()
-  await userEvent.click(
-    screen.getByRole('button', { name: 'Available Balance ($)' })
-  )
-  await userEvent.click(screen.getByRole('menuitem', { name: 'Desc' }))
+  expect(
+    screen.queryByRole('button', { name: 'Available Balance' })
+  ).not.toBeInTheDocument()
+  await userEvent.click(screen.getByRole('button', { name: 'ID' }))
+  await userEvent.click(screen.getByRole('menuitem', { name: 'Asc' }))
   await waitFor(() =>
     expect(get).toHaveBeenCalledWith('/api/user/', {
-      params: expect.objectContaining({ sort_by: 'quota', sort_order: 'desc' }),
+      params: expect.objectContaining({ sort_by: 'id', sort_order: 'asc' }),
+      signal: expect.any(AbortSignal),
     })
   )
   expect(
@@ -335,6 +668,7 @@ it('sends balance sorting to the server and keeps invitation details on two line
   ).not.toBeInTheDocument()
   expect(screen.getByText('Inviter ID: 42')).toBeInTheDocument()
   expect(screen.getByText(/Invited 2 users · Earnings:/)).toBeInTheDocument()
+  expect(screen.getByText('9,007,199.254740993 CNY')).toBeVisible()
 })
 
 it('shows balance above usage on mobile cards in Chinese', async () => {
@@ -347,17 +681,21 @@ it('shows balance above usage on mobile cards in Chinese', async () => {
   await i18n.changeLanguage('zh')
   try {
     await renderUsersList()
-    expect(screen.getByText('可用余额 ($)')).toBeInTheDocument()
-    expect(screen.getByText('已用')).toBeInTheDocument()
-    expect(screen.getByText('0.0038')).toBeInTheDocument()
-    expect(screen.getByText('0.0022')).toBeInTheDocument()
+    expect(screen.getByText('可用余额')).toBeInTheDocument()
+    expect(await screen.findByText('已入账消费')).toBeInTheDocument()
+    expect(await screen.findByText('9,007,199.254740993 EUR')).toBeVisible()
+    expect(
+      screen.getByText('922,337,203,685,477,580.800000001 JPY')
+    ).toBeVisible()
     expect(screen.queryByRole('table')).not.toBeInTheDocument()
     await userEvent.click(
-      screen.getByRole('button', { name: /可用余额 0.0038/ })
+      screen.getByRole('button', { name: /可用余额 9,007,199/ })
     )
-    const detail = await screen.findByRole('dialog', { name: '额度 ($)' })
-    expect(within(detail).getByText('累计已用')).toBeInTheDocument()
-    expect(within(detail).getByText('0.0022')).toBeInTheDocument()
+    const detail = await screen.findByRole('dialog', { name: '钱包' })
+    expect(within(detail).getByText('已入账消费')).toBeInTheDocument()
+    expect(
+      within(detail).getByText('922,337,203,685,477,580.800000001 JPY')
+    ).toBeInTheDocument()
     await userEvent.keyboard('{Escape}')
   } finally {
     await i18n.changeLanguage('en')
@@ -394,10 +732,10 @@ it('combines creation and last login into one column with full dates visible dir
   ).not.toBeInTheDocument()
 })
 
-it('updates the header unit and converted amounts together when currency settings change', () => {
+it('keeps native values unchanged when legacy display FX settings change', () => {
   render(
     <I18nextProvider i18n={i18n}>
-      <QuotaTable remaining={500000} used={1000000} />
+      <QuotaTable remaining='1000000000' used='2000000000' />
     </I18nextProvider>
   )
   act(() =>
@@ -410,35 +748,35 @@ it('updates the header unit and converted amounts together when currency setting
     })
   )
   expect(
-    screen.getByRole('columnheader', { name: 'Available Balance (¥)' })
+    screen.getByRole('columnheader', { name: 'Available Balance' })
   ).toBeInTheDocument()
   expect(
-    within(screen.getAllByRole('cell')[0]).getByText('7')
+    within(screen.getAllByRole('cell')[0]).getByText('1 EUR')
   ).toBeInTheDocument()
   expect(
-    within(screen.getAllByRole('cell')[0]).getByText('14')
+    within(screen.getAllByRole('cell')[0]).getByText('2 EUR')
   ).toBeInTheDocument()
   for (const cell of screen.getAllByRole('cell')) {
     expect(cell).not.toHaveTextContent('¥')
   }
 })
 
-it('labels raw quota mode as tokens without introducing a currency symbol', () => {
+it('does not relabel native wallet money as tokens in the legacy raw quota mode', () => {
   useSystemConfigStore.getState().setConfig({
     currency: { ...DEFAULT_CURRENCY_CONFIG, quotaDisplayType: 'TOKENS' },
   })
   render(
     <I18nextProvider i18n={i18n}>
-      <QuotaTable remaining={100} used={200} />
+      <QuotaTable remaining='100' used='200' />
     </I18nextProvider>
   )
   expect(
-    screen.getByRole('columnheader', { name: 'Available Balance (Tokens)' })
+    screen.getByRole('columnheader', { name: 'Available Balance' })
   ).toBeInTheDocument()
   expect(
-    within(screen.getAllByRole('cell')[0]).getByText('100')
+    within(screen.getAllByRole('cell')[0]).getByText('0.0000001 EUR')
   ).toBeInTheDocument()
   expect(
-    within(screen.getAllByRole('cell')[0]).getByText('200')
+    within(screen.getAllByRole('cell')[0]).getByText('0.0000002 EUR')
   ).toBeInTheDocument()
 })

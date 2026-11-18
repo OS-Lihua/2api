@@ -38,7 +38,6 @@ func (v *Vendor) Insert() error {
 	})
 	if err == nil {
 		v.Version = VendorRecordVersion(v)
-		RefreshPricing()
 	}
 	return err
 }
@@ -71,7 +70,6 @@ func (v *Vendor) Update() error {
 	})
 	if err == nil {
 		v.Version = VendorRecordVersion(v)
-		RefreshPricing()
 	}
 	return err
 }

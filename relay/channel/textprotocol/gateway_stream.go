@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
@@ -63,11 +64,11 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 			text, _ := sourceOutput.ObserveResponses(normalized)
 			sourceBusiness = text != ""
 		} else {
-			text := gatewayStreamBusinessText(normalized, p.format)
+			text := gatewayStreamBusinessText(normalized, p.format, info.RelayMode == relayconstant.RelayModeCompletions)
 			sourceOutput.text.WriteString(text)
 			sourceBusiness = text != ""
 			if p.format == types.RelayFormatOpenAI {
-				sourceOutput.ObserveChat(normalized)
+				sourceOutput.ObserveChat(normalized, info.RelayMode == relayconstant.RelayModeCompletions)
 			} else if p.format == types.RelayFormatGemini {
 				sourceOutput.ObserveGemini(normalized)
 			}
@@ -171,6 +172,9 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 							textChoice = gjson.ParseBytes(withoutAudio)
 						}
 						business = relaycommon.ChatStreamChoiceBusinessText(textChoice) != ""
+						if info.RelayMode == relayconstant.RelayModeCompletions {
+							business = relaycommon.SourceText(choice.Get("text")) != ""
+						}
 					} else {
 						for _, part := range choice.Get("content.parts").Array() {
 							business = business || gatewayGeminiPartText(part) != "" || relaycommon.SourceText(part.Get("inlineData.data")) != ""
@@ -266,9 +270,9 @@ func (p *Handler) gatewayStreamResponse(c *gin.Context, resp *http.Response, inf
 		if p.format == types.RelayFormatOpenAIResponses {
 			sourceOutput.ObserveResponses(partial)
 		} else {
-			sourceOutput.text.WriteString(gatewayStreamBusinessText(partial, p.format))
+			sourceOutput.text.WriteString(gatewayStreamBusinessText(partial, p.format, info.RelayMode == relayconstant.RelayModeCompletions))
 			if p.format == types.RelayFormatOpenAI {
-				sourceOutput.ObserveChat(partial)
+				sourceOutput.ObserveChat(partial, info.RelayMode == relayconstant.RelayModeCompletions)
 			} else if p.format == types.RelayFormatGemini {
 				sourceOutput.ObserveGemini(partial)
 			}
@@ -504,7 +508,7 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 	if err := c.Request.Context().Err(); err != nil {
 		return "", err
 	}
-	text := gatewayStreamBusinessText(generatedBody, info.RelayFormat)
+	text := gatewayStreamBusinessText(generatedBody, info.RelayFormat, info.RelayMode == relayconstant.RelayModeCompletions)
 	if info.RelayFormat == types.RelayFormatOpenAIResponses {
 		var probe gatewayGeneratedOutput
 		if value, handled := probe.ObserveResponses(body); handled {
@@ -523,7 +527,7 @@ func writeGatewayStreamResult(c *gin.Context, info *relaycommon.RelayInfo, value
 		}
 	}
 	if info.RelayFormat == types.RelayFormatOpenAI {
-		output.ObserveChat(generatedBody)
+		output.ObserveChat(generatedBody, info.RelayMode == relayconstant.RelayModeCompletions)
 	} else if info.RelayFormat == types.RelayFormatGemini {
 		output.ObserveGemini(generatedBody)
 	}
@@ -567,12 +571,17 @@ func gatewayTerminalSnapshot(body []byte, format types.RelayFormat) bool {
 	return false
 }
 
-func gatewayStreamBusinessText(body []byte, format types.RelayFormat) string {
+func gatewayStreamBusinessText(body []byte, format types.RelayFormat, completions ...bool) string {
 	root := gjson.ParseBytes(body)
 	var text strings.Builder
 	switch format {
 	case types.RelayFormatOpenAI:
-		return relaycommon.ChatStreamBusinessText(body)
+		if len(completions) == 0 || !completions[0] {
+			return relaycommon.ChatStreamBusinessText(body)
+		}
+		for _, choice := range root.Get("choices").Array() {
+			text.WriteString(relaycommon.SourceText(choice.Get("text")))
+		}
 	case types.RelayFormatOpenAIResponses:
 		switch root.Get("type").String() {
 		case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.refusal.delta":

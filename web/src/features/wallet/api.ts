@@ -17,232 +17,168 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { api } from '@/lib/api'
+import { referralRewardsSchema } from '@/lib/referral-rewards'
+import {
+  createServerError,
+  requireServerSuccess,
+} from '@/lib/server-error-message'
 
+import { checkoutQuoteSchema } from './lib/checkout'
 import type {
+  WalletBalance,
+  ReferralRewards,
+  CheckoutProvider,
+  CheckoutQuoteRequest,
+  CheckoutQuote,
+  CheckoutPaymentResponse,
   RedemptionRequest,
-  PaymentRequest,
-  AmountRequest,
   AffiliateTransferRequest,
   ApiResponse,
   TopupInfoResponse,
   RedemptionResponse,
-  AmountResponse,
-  PaymentResponse,
-  StripePaymentResponse,
   AffiliateCodeResponse,
   AffiliateTransferResponse,
   BillingHistoryResponse,
   CompleteOrderRequest,
-  CreemPaymentRequest,
-  CreemPaymentResponse,
-  WaffoPaymentRequest,
-  WaffoPaymentResponse,
-  WaffoPancakePaymentRequest,
-  WaffoPancakePaymentResponse,
 } from './types'
 
-// ============================================================================
-// Wallet API Functions
-// ============================================================================
-
-/**
- * Check if API response is successful
- */
 export function isApiSuccess(response: ApiResponse): boolean {
   return response.success === true || response.message === 'success'
 }
 
-/**
- * Get topup configuration info
- */
-export async function getTopupInfo(): Promise<TopupInfoResponse> {
-  const res = await api.get('/api/user/topup/info')
-  return res.data
+export async function getSelfWallet(
+  signal?: AbortSignal
+): Promise<WalletBalance> {
+  const response = await api.get<ApiResponse<WalletBalance>>(
+    '/api/user/self/wallet',
+    { signal }
+  )
+  requireServerSuccess(response.data)
+  if (!response.data.data) throw createServerError(response.data)
+  return response.data.data
 }
 
-/**
- * Redeem a topup code
- */
+export async function getTopupInfo(
+  signal?: AbortSignal
+): Promise<TopupInfoResponse> {
+  const response = await api.get('/api/user/topup/info', { signal })
+  return response.data
+}
+
+export async function requestCheckoutQuote(
+  request: CheckoutQuoteRequest
+): Promise<CheckoutQuote> {
+  if (
+    request.provider === 'waffo' &&
+    (request.pay_method_index === undefined ||
+      !Number.isSafeInteger(request.pay_method_index) ||
+      request.pay_method_index < 0)
+  ) {
+    throw new Error('Select a payment method')
+  }
+  const response = await api.post<ApiResponse<CheckoutQuote>>(
+    '/api/user/topup/quote',
+    request,
+    { skipBusinessError: true } as Record<string, unknown>
+  )
+  requireServerSuccess(response.data)
+  const result = checkoutQuoteSchema.safeParse(response.data.data)
+  if (!result.success) throw new Error('Quote unavailable')
+  return result.data
+}
+
+export async function requestCheckoutPayment(
+  provider: CheckoutProvider,
+  quoteId: string
+): Promise<CheckoutPaymentResponse> {
+  const endpoint =
+    provider === 'epay'
+      ? '/api/user/pay'
+      : `/api/user/${provider.replace('_', '-')}/pay`
+  const response = await api.post<CheckoutPaymentResponse>(
+    endpoint,
+    { quote_id: quoteId },
+    { skipBusinessError: true } as Record<string, unknown>
+  )
+  if (!isApiSuccess(response.data)) {
+    throw createServerError(response.data, 'Payment request failed')
+  }
+  return response.data
+}
+
 export async function redeemTopupCode(
   request: RedemptionRequest
 ): Promise<RedemptionResponse> {
-  const res = await api.post('/api/user/topup', request)
-  return res.data
+  const response = await api.post('/api/user/topup', request)
+  return response.data
 }
 
-/**
- * Calculate payment amount for regular payment
- */
-export async function calculateAmount(
-  request: AmountRequest
-): Promise<AmountResponse> {
-  const res = await api.post('/api/user/amount', request, {
-    skipBusinessError: true,
-  } as Record<string, unknown>)
-  return res.data
+export async function getReferralRewards(
+  signal?: AbortSignal
+): Promise<ReferralRewards> {
+  const response = await api.get<ApiResponse<ReferralRewards>>(
+    '/api/user/referral-rewards',
+    { signal }
+  )
+  requireServerSuccess(response.data)
+  const parsed = referralRewardsSchema.safeParse(response.data.data)
+  if (!parsed.success) throw new Error('Referral rewards unavailable')
+  return parsed.data
 }
 
-/**
- * Calculate payment amount for Stripe payment
- */
-export async function calculateStripeAmount(
-  request: AmountRequest
-): Promise<AmountResponse> {
-  const res = await api.post('/api/user/stripe/amount', request, {
-    skipBusinessError: true,
-  } as Record<string, unknown>)
-  return res.data
+export async function getAffiliateCode(
+  signal?: AbortSignal
+): Promise<AffiliateCodeResponse> {
+  const response = await api.get('/api/user/aff', { signal })
+  return response.data
 }
 
-/**
- * Calculate payment amount for Waffo payment
- */
-export async function calculateWaffoAmount(
-  request: AmountRequest
-): Promise<AmountResponse> {
-  const res = await api.post('/api/user/waffo/amount', request, {
-    skipBusinessError: true,
-  } as Record<string, unknown>)
-  return res.data
-}
-
-/**
- * Request regular payment
- */
-export async function requestPayment(
-  request: PaymentRequest
-): Promise<PaymentResponse> {
-  const res = await api.post('/api/user/pay', request, {
-    skipBusinessError: true,
-  } as Record<string, unknown>)
-  return {
-    ...res.data,
-    url: res.data.url || (res as unknown as { url?: string }).url,
-  }
-}
-
-/**
- * Request Stripe payment
- */
-export async function requestStripePayment(
-  request: PaymentRequest
-): Promise<StripePaymentResponse> {
-  const res = await api.post('/api/user/stripe/pay', request, {
-    skipBusinessError: true,
-  } as Record<string, unknown>)
-  return res.data
-}
-
-/**
- * Request Creem payment
- */
-export async function requestCreemPayment(
-  request: CreemPaymentRequest
-): Promise<CreemPaymentResponse> {
-  const res = await api.post('/api/user/creem/pay', request, {
-    skipBusinessError: true,
-  } as Record<string, unknown>)
-  return res.data
-}
-
-/**
- * Request Waffo payment
- */
-export async function requestWaffoPayment(
-  request: WaffoPaymentRequest
-): Promise<WaffoPaymentResponse> {
-  const res = await api.post('/api/user/waffo/pay', request, {
-    skipBusinessError: true,
-  } as Record<string, unknown>)
-  return res.data
-}
-
-/**
- * Calculate payment amount for Waffo Pancake payment
- */
-export async function calculateWaffoPancakeAmount(
-  request: AmountRequest
-): Promise<AmountResponse> {
-  const res = await api.post('/api/user/waffo-pancake/amount', request, {
-    skipBusinessError: true,
-  } as Record<string, unknown>)
-  return res.data
-}
-
-/**
- * Request Waffo Pancake payment
- */
-export async function requestWaffoPancakePayment(
-  request: WaffoPancakePaymentRequest
-): Promise<WaffoPancakePaymentResponse> {
-  const res = await api.post('/api/user/waffo-pancake/pay', request, {
-    skipBusinessError: true,
-  } as Record<string, unknown>)
-  return res.data
-}
-
-/**
- * Get affiliate code
- */
-export async function getAffiliateCode(): Promise<AffiliateCodeResponse> {
-  const res = await api.get('/api/user/aff')
-  return res.data
-}
-
-/**
- * Transfer affiliate quota to balance
- */
 export async function transferAffiliateQuota(
   request: AffiliateTransferRequest
 ): Promise<AffiliateTransferResponse> {
-  const res = await api.post('/api/user/aff_transfer', request)
-  return res.data
+  const response = await api.post('/api/user/aff_transfer', request, {
+    skipBusinessError: true,
+  } as Record<string, unknown>)
+  return response.data
 }
 
-/**
- * Get billing history for current user
- */
 export async function getUserBillingHistory(
   page: number,
   pageSize: number,
-  keyword?: string
+  keyword?: string,
+  signal?: AbortSignal
 ): Promise<ApiResponse<BillingHistoryResponse>> {
   const params = new URLSearchParams({
     p: page.toString(),
     page_size: pageSize.toString(),
   })
-  if (keyword) {
-    params.append('keyword', keyword)
-  }
-  const res = await api.get(`/api/user/topup/self?${params.toString()}`)
-  return res.data
+  if (keyword) params.append('keyword', keyword)
+  const response = await api.get(`/api/user/topup/self?${params.toString()}`, {
+    signal,
+  })
+  return response.data
 }
 
-/**
- * Get billing history for all users (admin only)
- */
 export async function getAllBillingHistory(
   page: number,
   pageSize: number,
-  keyword?: string
+  keyword?: string,
+  signal?: AbortSignal
 ): Promise<ApiResponse<BillingHistoryResponse>> {
   const params = new URLSearchParams({
     p: page.toString(),
     page_size: pageSize.toString(),
   })
-  if (keyword) {
-    params.append('keyword', keyword)
-  }
-  const res = await api.get(`/api/user/topup?${params.toString()}`)
-  return res.data
+  if (keyword) params.append('keyword', keyword)
+  const response = await api.get(`/api/user/topup?${params.toString()}`, {
+    signal,
+  })
+  return response.data
 }
 
-/**
- * Complete a pending order (admin only)
- */
 export async function completeOrder(
   request: CompleteOrderRequest
 ): Promise<ApiResponse> {
-  const res = await api.post('/api/user/topup/complete', request)
-  return res.data
+  const response = await api.post('/api/user/topup/complete', request)
+  return response.data
 }

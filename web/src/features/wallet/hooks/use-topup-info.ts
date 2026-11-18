@@ -16,221 +16,90 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useState, useEffect, useCallback } from 'react'
+import { useQuery } from '@tanstack/react-query'
 
-import { handleServerError } from '@/lib/handle-server-error'
+import { createServerError } from '@/lib/server-error-message'
+import { useAuthStore } from '@/stores/auth-store'
 
-import { getTopupInfo } from '../api'
-import {
-  generatePresetAmounts,
-  mergePresetAmounts,
-  getMinTopupAmount,
-} from '../lib'
-import type {
-  TopupInfo,
-  PresetAmount,
-  CreemProduct,
-  PaymentMethod,
-  WaffoPayMethod,
-} from '../types'
+import { getTopupInfo, isApiSuccess } from '../api'
+import { checkoutInfoSchema } from '../lib/checkout'
+import type { PaymentMethod, WaffoPayMethod } from '../types'
 
-// ============================================================================
-// Topup Info Hook
-// ============================================================================
-
-function parseJsonArray(data: unknown): unknown[] {
-  if (Array.isArray(data)) {
-    return data
-  }
-
-  if (typeof data === 'string') {
-    try {
-      const parsed = JSON.parse(data)
-      return Array.isArray(parsed) ? parsed : []
-    } catch {
-      return []
-    }
-  }
-
-  return []
-}
-
-function parsePaymentMethods(
-  data: unknown,
-  stripeMinTopup: number
-): PaymentMethod[] {
-  return parseJsonArray(data)
-    .filter(
-      (item): item is Record<string, unknown> =>
-        !!item && typeof item === 'object'
-    )
-    .map((item) => {
-      const rawMinTopup = Number(item.min_topup)
-      const normalizedMinTopup = Number.isFinite(rawMinTopup) ? rawMinTopup : 0
-      const type = typeof item.type === 'string' ? item.type : ''
-
-      return {
-        name: typeof item.name === 'string' ? item.name : '',
-        type,
-        color: typeof item.color === 'string' ? item.color : undefined,
-        icon: typeof item.icon === 'string' ? item.icon : undefined,
-        min_topup:
-          type === 'stripe' && normalizedMinTopup <= 0
-            ? stripeMinTopup
-            : normalizedMinTopup,
-      }
-    })
-    .filter((item) => item.name && item.type && item.type !== 'waffo')
-}
-
-function parseWaffoPayMethods(data: unknown): WaffoPayMethod[] {
-  return parseJsonArray(data)
-    .filter(
-      (item): item is Record<string, unknown> =>
-        !!item && typeof item === 'object'
-    )
-    .map((item) => ({
-      name: typeof item.name === 'string' ? item.name : '',
-      icon: typeof item.icon === 'string' ? item.icon : undefined,
-      payMethodType:
-        typeof item.payMethodType === 'string' ? item.payMethodType : undefined,
-      payMethodName:
-        typeof item.payMethodName === 'string' ? item.payMethodName : undefined,
-    }))
-    .filter((item) => item.name)
-}
-
-function parseCreemProducts(data: unknown): CreemProduct[] {
-  return parseJsonArray(data)
-    .filter(
-      (item): item is Record<string, unknown> =>
-        !!item && typeof item === 'object'
-    )
-    .map((item) => {
-      const currency: CreemProduct['currency'] =
-        item.currency === 'EUR' ? 'EUR' : 'USD'
-
-      return {
-        name: typeof item.name === 'string' ? item.name : '',
-        productId: typeof item.productId === 'string' ? item.productId : '',
-        price: Number(item.price) || 0,
-        quota: Number(item.quota) || 0,
-        currency,
-      }
-    })
-    .filter((item) => item.name && item.productId)
-}
-
-function parseAmountOptions(data: unknown): number[] {
-  return parseJsonArray(data)
-    .map((item) => Number(item))
-    .filter((item) => Number.isFinite(item) && item > 0)
-}
-
-function parseDiscountMap(data: unknown): Record<number, number> {
-  if (!data) {
-    return {}
-  }
-
-  let parsedData = data
-
-  if (typeof data === 'string') {
-    try {
-      parsedData = JSON.parse(data)
-    } catch {
-      return {}
-    }
-  }
-
+function parseMethods(value: unknown): Record<string, unknown>[] {
+  let items = value
+  if (typeof items === 'string') items = JSON.parse(items)
+  if (items == null || items === '') return []
   if (
-    !parsedData ||
-    typeof parsedData !== 'object' ||
-    Array.isArray(parsedData)
+    !Array.isArray(items) ||
+    items.some(
+      (item) => !item || typeof item !== 'object' || Array.isArray(item)
+    )
   ) {
-    return {}
+    throw new Error('Payment configuration is unavailable')
   }
-
-  return Object.entries(parsedData).reduce<Record<number, number>>(
-    (result, [key, value]) => {
-      const numericKey = Number(key)
-      const numericValue = Number(value)
-
-      if (Number.isFinite(numericKey) && Number.isFinite(numericValue)) {
-        result[numericKey] = numericValue
-      }
-
-      return result
-    },
-    {}
-  )
+  return items as Record<string, unknown>[]
 }
 
 export function useTopupInfo() {
-  const [topupInfo, setTopupInfo] = useState<TopupInfo | null>(null)
-  const [presetAmounts, setPresetAmounts] = useState<PresetAmount[]>([])
-  const [loading, setLoading] = useState(true)
-
-  const fetchTopupInfo = useCallback(async () => {
-    try {
-      setLoading(true)
-
-      const response = await getTopupInfo()
-
-      if (!response.success || !response.data) {
-        handleServerError(response)
-        return
-      }
-
-      const processedData: TopupInfo = {
-        ...response.data,
-        pay_methods: parsePaymentMethods(
-          response.data.pay_methods,
-          response.data.stripe_min_topup
-        ),
-        amount_options: parseAmountOptions(response.data.amount_options),
-        discount: parseDiscountMap(response.data.discount),
-        creem_products: parseCreemProducts(response.data.creem_products),
-        waffo_pay_methods: parseWaffoPayMethods(
-          response.data.waffo_pay_methods
-        ),
-      }
-
-      setTopupInfo(processedData)
-
-      if (processedData.amount_options.length > 0) {
-        const customPresets = mergePresetAmounts(
-          processedData.amount_options,
-          processedData.discount || {}
+  const userId = useAuthStore((state) => state.auth.user?.id)
+  const query = useQuery({
+    queryKey: ['topup-info', userId],
+    enabled: !!userId,
+    meta: { errorToast: false },
+    queryFn: async ({ signal }) => {
+      const response = await getTopupInfo(signal)
+      if (!isApiSuccess(response) || !response.data) {
+        throw createServerError(
+          response,
+          'Payment configuration is unavailable'
         )
-        setPresetAmounts(customPresets)
-      } else {
-        const minTopup = getMinTopupAmount(processedData)
-        const defaultPresets = generatePresetAmounts(minTopup)
-        setPresetAmounts(defaultPresets)
       }
-    } catch (err) {
-      handleServerError(err)
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    let cancelled = false
-
-    queueMicrotask(() => {
-      if (!cancelled) void fetchTopupInfo()
-    })
-
-    return () => {
-      cancelled = true
-    }
-  }, [fetchTopupInfo])
-
+      const data = response.data
+      const checkout = checkoutInfoSchema.safeParse(data.checkout)
+      if (!checkout.success) {
+        throw new Error('Payment configuration is unavailable')
+      }
+      const methods: PaymentMethod[] = parseMethods(data.pay_methods)
+        .filter(
+          (method) =>
+            typeof method.name === 'string' && typeof method.type === 'string'
+        )
+        .map((method) => ({
+          name: method.name as string,
+          type: method.type as string,
+          icon: typeof method.icon === 'string' ? method.icon : undefined,
+        }))
+      const waffoMethods: WaffoPayMethod[] = parseMethods(
+        data.waffo_pay_methods
+      ).map((method) => {
+        if (typeof method.name !== 'string' || !method.name.trim()) {
+          throw new Error('Payment configuration is unavailable')
+        }
+        return {
+          name: method.name,
+          icon: typeof method.icon === 'string' ? method.icon : undefined,
+          payMethodType:
+            typeof method.payMethodType === 'string'
+              ? method.payMethodType
+              : undefined,
+          payMethodName:
+            typeof method.payMethodName === 'string'
+              ? method.payMethodName
+              : undefined,
+        }
+      })
+      return {
+        ...data,
+        checkout: checkout.data,
+        pay_methods: methods,
+        waffo_pay_methods: waffoMethods,
+      }
+    },
+  })
   return {
-    topupInfo,
-    presetAmounts,
-    loading,
-    refetch: fetchTopupInfo,
+    topupInfo: query.isError ? null : (query.data ?? null),
+    loading: query.isPending,
+    error: query.error,
+    refetch: query.refetch,
   }
 }

@@ -60,6 +60,7 @@ type WaffoPancakeWebhookData struct {
 	Currency                      string
 	Amount                        string
 	TaxAmount                     string
+	Total                         *string
 	ProductName                   string
 	MerchantProvidedBuyerIdentity string
 }
@@ -147,6 +148,44 @@ func CreateWaffoPancakeCheckoutSession(ctx context.Context, params *WaffoPancake
 	}, nil
 }
 
+// CreateExactPancakeSession saves the remote identity before issuing a buyer
+// token. A token failure can then be retried without creating another session.
+func CreateExactPancakeSession(ctx context.Context, order *model.CheckoutOrder, user *model.User) error {
+	client, err := newWaffoPancakeClient()
+	if err != nil {
+		return err
+	}
+	expires := 45 * 60
+	session, err := client.Checkout.CreateSession(ctx, pancake.CreateCheckoutSessionParams{
+		ProductID: order.ProductID, Currency: string(order.ChargeAmount.Currency),
+		BuyerEmail: optionalString(user.Email), ExpiresInSeconds: &expires,
+		PriceSnapshot:           &pancake.PriceInfo{Amount: model.CheckoutAmountString(order.ChargeAmount, model.PaymentProviderWaffoPancake), TaxCategory: pancake.TaxCategory("saas")},
+		OrderMerchantExternalID: optionalString(order.TradeNo),
+	})
+	if err != nil {
+		return err
+	}
+	if session == nil || session.SessionID == "" || session.CheckoutURL == "" {
+		return fmt.Errorf("empty checkout session")
+	}
+	return model.SaveCheckoutRemoteIdentity(context.WithoutCancel(ctx), order.TradeNo, session.SessionID, session.CheckoutURL)
+}
+
+func ResumeExactPancakeSession(ctx context.Context, order *model.CheckoutOrder, userID int) (string, error) {
+	if order.ProviderSessionID == "" || order.CheckoutURL == "" || order.ProviderMerchantID != setting.WaffoPancakeMerchantID {
+		return "", fmt.Errorf("checkout session is unavailable")
+	}
+	client, err := newWaffoPancakeClient()
+	if err != nil {
+		return "", err
+	}
+	token, err := client.Auth.IssueSessionToken(ctx, pancake.IssueSessionTokenParams{StoreID: &order.ProviderStoreID, BuyerIdentity: WaffoPancakeBuyerIdentityFromUserID(userID)})
+	if err != nil {
+		return "", err
+	}
+	return order.CheckoutURL + "#token=" + token.Token, nil
+}
+
 func optionalString(s string) *string {
 	if strings.TrimSpace(s) == "" {
 		return nil
@@ -169,7 +208,17 @@ func VerifyConfiguredWaffoPancakeWebhook(payload string, signatureHeader string)
 	if err != nil {
 		return nil, err
 	}
-	if storeID := strings.TrimSpace(setting.WaffoPancakeStoreID); storeID == "" || evt.StoreID != storeID {
+	storeID := strings.TrimSpace(setting.WaffoPancakeStoreID)
+	if evt.Data.OrderMerchantExternalID != nil {
+		if topUp := model.GetTopUpByTradeNo(*evt.Data.OrderMerchantExternalID); topUp != nil && topUp.ContractVersion == model.CheckoutContractVersion && topUp.PaymentProvider == model.PaymentProviderWaffoPancake {
+			order, err := model.GetCheckoutOrder(context.Background(), topUp.TradeNo)
+			if err != nil {
+				return nil, err
+			}
+			storeID = order.ProviderStoreID
+		}
+	}
+	if storeID == "" || evt.StoreID != storeID {
 		return nil, fmt.Errorf("Waffo Pancake webhook store mismatch")
 	}
 	identity := ""
@@ -194,6 +243,7 @@ func VerifyConfiguredWaffoPancakeWebhook(payload string, signatureHeader string)
 			Currency:                      evt.Data.Currency,
 			Amount:                        evt.Data.Amount,
 			TaxAmount:                     evt.Data.TaxAmount,
+			Total:                         evt.Data.Total,
 			ProductName:                   evt.Data.ProductName,
 			MerchantProvidedBuyerIdentity: identity,
 		},

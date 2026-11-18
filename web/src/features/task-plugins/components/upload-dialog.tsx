@@ -35,7 +35,6 @@ import {
 } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Spinner } from '@/components/ui/spinner'
-import { MODEL_PRICING_ISSUES_QUERY_KEY } from '@/features/system-settings/models/pricing-issues'
 
 import { activateTaskPlugin, uploadTaskPlugin } from '../api'
 import {
@@ -46,6 +45,10 @@ import {
   MAX_PLUGIN_SOURCE_BYTES,
   pluginSourceByteLength,
 } from '../lib/plugin-url'
+import {
+  isTaskPluginScopeCurrent,
+  useTaskPluginScope,
+} from '../lib/pricing-diagnostics'
 import type { TaskPluginDetail } from '../types'
 import { MarketplaceCapabilities } from './marketplace-capabilities'
 import { PluginIcon } from './plugin-icon'
@@ -60,6 +63,11 @@ type UploadDialogProps = {
 }
 
 export function UploadDialog(props: UploadDialogProps) {
+  const scope = useTaskPluginScope()
+  return <UploadDialogContent key={scope} {...props} scope={scope} />
+}
+
+function UploadDialogContent(props: UploadDialogProps & { scope: string }) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
   const [source, setSource] = useState('')
@@ -77,6 +85,7 @@ export function UploadDialog(props: UploadDialogProps) {
   const mutation = useMutation({
     mutationFn: () => uploadTaskPlugin(source, remark, icon),
     onSuccess: (data) => {
+      if (!isTaskPluginScopeCurrent(props.scope)) return
       setResult(data)
       queryClient.invalidateQueries({ queryKey: ['task-plugins'] })
       queryClient.invalidateQueries({
@@ -84,9 +93,6 @@ export function UploadDialog(props: UploadDialogProps) {
       })
       queryClient.invalidateQueries({
         queryKey: ['task-plugin-versions', data.meta.key],
-      })
-      queryClient.invalidateQueries({
-        queryKey: MODEL_PRICING_ISSUES_QUERY_KEY,
       })
       toast.success(
         data.plugin?.active === false
@@ -99,15 +105,13 @@ export function UploadDialog(props: UploadDialogProps) {
     mutationFn: (detail: TaskPluginDetail) =>
       activateTaskPlugin(detail.meta.key, detail.meta.version),
     onSuccess: (_, detail) => {
+      if (!isTaskPluginScopeCurrent(props.scope)) return
       queryClient.invalidateQueries({ queryKey: ['task-plugins'] })
       queryClient.invalidateQueries({
         queryKey: ['task-plugin', detail.meta.key],
       })
       queryClient.invalidateQueries({
         queryKey: ['task-plugin-versions', detail.meta.key],
-      })
-      queryClient.invalidateQueries({
-        queryKey: MODEL_PRICING_ISSUES_QUERY_KEY,
       })
       toast.success(t('Plugin version activated'))
     },
@@ -170,9 +174,9 @@ export function UploadDialog(props: UploadDialogProps) {
   if (result) {
     const needsActivation =
       result.plugin?.active === false && !activateMutation.isSuccess
-    const pricingIssues = activateMutation.isSuccess
-      ? activateMutation.data?.pricing_issues
-      : result.pricing_issues
+    const diagnostics = activateMutation.isSuccess
+      ? activateMutation.data.pricing_diagnostics
+      : result.pricing_diagnostics
 
     return (
       <Dialog
@@ -231,11 +235,12 @@ export function UploadDialog(props: UploadDialogProps) {
             </AlertDescription>
           )}
         </Alert>
-        {pricingIssues?.length ? (
-          <div className='text-muted-foreground text-sm'>
-            <PricingIssueList issues={pricingIssues} />
-          </div>
-        ) : null}
+        <PricingIssueList
+          diagnostics={diagnostics}
+          pluginKey={result.meta.key}
+          scope={props.scope}
+          saved
+        />
         {activateMutation.error && (
           <Alert variant='destructive'>
             <AlertTriangle aria-hidden='true' />

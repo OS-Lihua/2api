@@ -43,7 +43,7 @@ type proxyURLConfig struct {
 
 func checkRedirect(req *http.Request, via []*http.Request) error {
 	urlStr := req.URL.String()
-	if err := validateURLWithCurrentFetchSetting(urlStr, true); err != nil {
+	if err := validateURLWithCurrentFetchSetting(req.Context(), urlStr, true); err != nil {
 		return fmt.Errorf("redirect to %s blocked: %v", urlStr, err)
 	}
 	if len(via) >= 10 {
@@ -54,7 +54,7 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 
 func checkProtectedFetchRedirect(req *http.Request, via []*http.Request) error {
 	urlStr := req.URL.String()
-	if err := ValidateSSRFProtectedFetchURL(urlStr); err != nil {
+	if err := ValidateSSRFProtectedFetchURLWithContext(req.Context(), urlStr); err != nil {
 		return fmt.Errorf("redirect to %s blocked: %v", urlStr, err)
 	}
 	if len(via) >= 10 {
@@ -63,13 +63,17 @@ func checkProtectedFetchRedirect(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
-func validateURLWithCurrentFetchSetting(urlStr string, applyDomainIPFilter bool) error {
+func validateURLWithCurrentFetchSetting(ctx context.Context, urlStr string, applyDomainIPFilter bool) error {
 	fetchSetting := system_setting.GetFetchSetting()
-	return common.ValidateURLWithFetchSetting(urlStr, fetchSetting.EnableSSRFProtection, fetchSetting.AllowPrivateIp, fetchSetting.DomainFilterMode, fetchSetting.IpFilterMode, fetchSetting.DomainList, fetchSetting.IpList, fetchSetting.AllowedPorts, applyDomainIPFilter && fetchSetting.ApplyIPFilterForDomain)
+	return common.ValidateURLWithFetchSettingContext(ctx, urlStr, fetchSetting.EnableSSRFProtection, fetchSetting.AllowPrivateIp, fetchSetting.DomainFilterMode, fetchSetting.IpFilterMode, fetchSetting.DomainList, fetchSetting.IpList, fetchSetting.AllowedPorts, applyDomainIPFilter && fetchSetting.ApplyIPFilterForDomain)
 }
 
 func ValidateSSRFProtectedFetchURL(urlStr string) error {
-	return validateURLWithCurrentFetchSetting(urlStr, true)
+	return ValidateSSRFProtectedFetchURLWithContext(context.Background(), urlStr)
+}
+
+func ValidateSSRFProtectedFetchURLWithContext(ctx context.Context, urlStr string) error {
+	return validateURLWithCurrentFetchSetting(ctx, urlStr, true)
 }
 
 // maxTimeoutSeconds is the largest number of seconds that still converts to a

@@ -69,11 +69,11 @@ export function ResetSubscriptionsDialog() {
     <ConfirmDialog
       open={isOpen}
       onOpenChange={(nextOpen) => !nextOpen && setOpen(null)}
-      title={t('Reset subscription quota')}
+      title={t('Reset entitlement period')}
       desc={t('Reset all active subscriptions under {{plan}}?', {
         plan: planLabel,
       })}
-      confirmText={t('Reset quota')}
+      confirmText={t('Reset entitlement period')}
       handleConfirm={handleConfirm}
       disabled={!plan?.id}
       isLoading={resetting}

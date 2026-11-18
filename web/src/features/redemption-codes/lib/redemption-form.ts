@@ -19,7 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import type { TFunction } from 'i18next'
 import { z } from 'zod'
 
-import { parseQuotaFromDollars, quotaUnitsToEditableAmount } from '@/lib/format'
+import { moneyAmountToDecimal, parseDecimalMoneyAmount } from '@/lib/currency'
 
 import {
   REDEMPTION_VALIDATION,
@@ -38,7 +38,13 @@ export function getRedemptionFormSchema(t: TFunction) {
       .string()
       .min(REDEMPTION_VALIDATION.NAME_MIN_LENGTH, msg.NAME_LENGTH_INVALID)
       .max(REDEMPTION_VALIDATION.NAME_MAX_LENGTH, msg.NAME_LENGTH_INVALID),
-    quota_dollars: z.number().min(0, t('Quota must be a positive number')),
+    amount: z.string().refine((value) => {
+      const amount = parseDecimalMoneyAmount(value, 'USD')
+      return amount !== null && BigInt(amount.nanos) > 0n
+    }, t('Invalid redemption amount')),
+    currency: z
+      .string()
+      .regex(/^[A-Z]{3}$/, t('Enter a three-letter uppercase currency code.')),
     expired_time: z.date().nullable(),
     count: z
       .number()
@@ -50,7 +56,8 @@ export function getRedemptionFormSchema(t: TFunction) {
 
 export type RedemptionFormValues = {
   name: string
-  quota_dollars: number
+  amount: string
+  currency: string
   expired_time: Date | null
   count?: number
 }
@@ -61,7 +68,8 @@ export type RedemptionFormValues = {
 
 export const REDEMPTION_FORM_DEFAULT_VALUES: RedemptionFormValues = {
   name: '',
-  quota_dollars: 10,
+  amount: '10',
+  currency: 'USD',
   expired_time: null,
   count: 1,
 }
@@ -76,9 +84,13 @@ export const REDEMPTION_FORM_DEFAULT_VALUES: RedemptionFormValues = {
 export function transformFormDataToPayload(
   data: RedemptionFormValues
 ): RedemptionFormData {
+  const amount = parseDecimalMoneyAmount(data.amount, data.currency)
+  if (!amount || BigInt(amount.nanos) <= 0n) {
+    throw new Error('Invalid redemption amount')
+  }
   return {
     name: data.name,
-    quota: parseQuotaFromDollars(data.quota_dollars),
+    amount,
     expired_time: data.expired_time
       ? Math.floor(data.expired_time.getTime() / 1000)
       : 0,
@@ -94,7 +106,8 @@ export function transformRedemptionToFormDefaults(
 ): RedemptionFormValues {
   return {
     name: redemption.name,
-    quota_dollars: quotaUnitsToEditableAmount(redemption.quota),
+    amount: moneyAmountToDecimal(redemption.amount),
+    currency: redemption.amount.currency,
     expired_time:
       redemption.expired_time > 0
         ? new Date(redemption.expired_time * 1000)

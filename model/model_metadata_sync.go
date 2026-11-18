@@ -280,6 +280,5 @@ func ApplyMetadataSync(updates []MetadataSyncUpdate, upstreamVendors map[string]
 	if err != nil {
 		return nil, err
 	}
-	RefreshPricing()
 	return result, nil
 }

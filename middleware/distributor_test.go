@@ -68,7 +68,7 @@ func TestChannelMatchesExpectedTaskPluginRejectsUnindexedLegacyChannel(t *testin
 	assert.False(t, channelMatchesExpectedTaskPlugin(nil, &model.Provider{Type: constant.ChannelTypeKling}, "legacy-alpha"))
 
 	c.Set("expected_task_plugin_key", "legacy-alpha")
-	setupErr := SetupContextForSelectedChannel(c, &model.Provider{Type: constant.ChannelTypeJimeng}, "task-model")
+	setupErr := SetupContextForGatewayCandidate(c, &model.Provider{Type: constant.ChannelTypeJimeng}, "task-model")
 	require.NotNil(t, setupErr)
 	assert.Contains(t, setupErr.Error(), "does not match")
 }
@@ -100,7 +100,7 @@ func TestSharedEndpointRebindsToSelectedLegacyProvider(t *testing.T) {
 	assert.True(t, channelMatchesExpectedTaskPlugin(c, vertexChannel, candidates[0].Plugin.Meta.Key))
 	assert.False(t, channelMatchesExpectedTaskPlugin(c, &model.Provider{Type: constant.ChannelTypeKling}, candidates[0].Plugin.Meta.Key))
 
-	require.Nil(t, SetupContextForSelectedChannel(c, vertexChannel, "task-model"))
+	require.Nil(t, SetupContextForGatewayCandidate(c, vertexChannel, "task-model"))
 	pinnedValue, exists := c.Get(jsplugin.ContextKeyPinnedEndpoint)
 	require.True(t, exists)
 	pinned, ok := pinnedValue.(jsplugin.PinnedEndpoint)
@@ -204,6 +204,8 @@ func TestTokenModelLimitAllowsExemptAtNameByFullName(t *testing.T) {
 
 func TestDistributeHidesTaskPluginDetailsButLogsDiagnostics(t *testing.T) {
 	require.NoError(t, i18n.Init())
+	// Verify the retained localized diagnostics directly. No Provider routing,
+	// historical Ability table or financial side effect is part of this helper.
 	previousCacheEnabled := common.MemoryCacheEnabled
 	common.MemoryCacheEnabled = true
 	t.Cleanup(func() { common.MemoryCacheEnabled = previousCacheEnabled })
@@ -250,7 +252,9 @@ func TestDistributeHidesTaskPluginDetailsButLogsDiagnostics(t *testing.T) {
 							Model: "task-model", Candidates: candidates,
 						})
 					}
-				}, Distribute(), func(c *gin.Context) {
+				}, func(c *gin.Context) {
+					abortWithOpenAiMessage(c, http.StatusServiceUnavailable, noAvailableChannelMessage(c, group, "task-model"), "model_not_found")
+				}, func(c *gin.Context) {
 					t.Error("unavailable requests must stop before the relay handler")
 					c.Status(http.StatusNoContent)
 				})
@@ -306,7 +310,7 @@ func TestSharedEndpointRebindsToSelectedType61Plugin(t *testing.T) {
 	channel.SetSetting(dto.ProviderSettings{TaskPluginKey: "unrelated"})
 	assert.False(t, channelMatchesExpectedTaskPlugin(c, channel, "alpha"))
 	channel.SetSetting(dto.ProviderSettings{TaskPluginKey: "beta"})
-	require.Nil(t, SetupContextForSelectedChannel(c, channel, "task-model"))
+	require.Nil(t, SetupContextForGatewayCandidate(c, channel, "task-model"))
 	assert.Equal(t, "beta", c.GetString("task_plugin_key"))
 	assert.Equal(t, "beta", c.GetString("expected_task_plugin_key"))
 	assert.Equal(t, "beta", c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint).Plugin.Meta.Key)
@@ -340,7 +344,7 @@ export function parseTaskResult() { return {}; }
 	assert.False(t, channelMatchesExpectedTaskPlugin(c, channel, "route-alpha"))
 	channel.SetSetting(dto.ProviderSettings{TaskPluginKey: "route-beta"})
 
-	require.Nil(t, SetupContextForSelectedChannel(c, channel, "task-model"))
+	require.Nil(t, SetupContextForGatewayCandidate(c, channel, "task-model"))
 	pinned := c.MustGet(jsplugin.ContextKeyPinnedRoute).(jsplugin.PinnedRoute)
 	assert.Same(t, candidates[1].Plugin, pinned.Plugin)
 	assert.Equal(t, candidates[1].Route, pinned.Route)
@@ -389,14 +393,14 @@ func TestSharedEndpointRebindsToBoundNewAPIExtension(t *testing.T) {
 
 	channel.SetSetting(dto.ProviderSettings{TaskExtendPluginKeys: []string{"beta"}})
 	c := pin("alpha")
-	require.Nil(t, SetupContextForSelectedChannel(c, channel, "task-model"))
+	require.Nil(t, SetupContextForGatewayCandidate(c, channel, "task-model"))
 	assert.Equal(t, "beta", c.GetString("task_plugin_key"), "the only bound candidate executes")
 	assert.Equal(t, "beta", c.GetString("expected_task_plugin_key"))
 	assert.Equal(t, "beta", c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint).Plugin.Meta.Key)
 
 	channel.SetSetting(dto.ProviderSettings{TaskExtendPluginKeys: []string{"alpha", "beta"}})
 	c = pin("beta")
-	require.Nil(t, SetupContextForSelectedChannel(c, channel, "task-model"))
+	require.Nil(t, SetupContextForGatewayCandidate(c, channel, "task-model"))
 	assert.Equal(t, "alpha", c.GetString("task_plugin_key"), "the first bound candidate executes regardless of the earlier pin")
 	assert.Equal(t, "alpha", c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint).Plugin.Meta.Key)
 }

@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -22,6 +23,14 @@ type WorkerRequest struct {
 
 // DoWorkerRequest 通过Worker发送请求
 func DoWorkerRequest(req *WorkerRequest) (*http.Response, error) {
+	return DoWorkerRequestWithContext(context.Background(), req)
+}
+
+// DoWorkerRequestWithContext keeps worker downloads within their caller's lifetime.
+func DoWorkerRequestWithContext(ctx context.Context, req *WorkerRequest) (*http.Response, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if !system_setting.EnableWorker() {
 		return nil, fmt.Errorf("worker not enabled")
 	}
@@ -31,8 +40,8 @@ func DoWorkerRequest(req *WorkerRequest) (*http.Response, error) {
 
 	// SSRF防护：验证请求URL
 	fetchSetting := system_setting.GetFetchSetting()
-	if err := common.ValidateURLWithFetchSetting(req.URL, fetchSetting.EnableSSRFProtection, fetchSetting.AllowPrivateIp, fetchSetting.DomainFilterMode, fetchSetting.IpFilterMode, fetchSetting.DomainList, fetchSetting.IpList, fetchSetting.AllowedPorts, fetchSetting.ApplyIPFilterForDomain); err != nil {
-		return nil, fmt.Errorf("request reject: %v", err)
+	if err := common.ValidateURLWithFetchSettingContext(ctx, req.URL, fetchSetting.EnableSSRFProtection, fetchSetting.AllowPrivateIp, fetchSetting.DomainFilterMode, fetchSetting.IpFilterMode, fetchSetting.DomainList, fetchSetting.IpList, fetchSetting.AllowedPorts, fetchSetting.ApplyIPFilterForDomain); err != nil {
+		return nil, fmt.Errorf("request reject: %w", err)
 	}
 
 	workerUrl := system_setting.WorkerUrl
@@ -46,24 +55,42 @@ func DoWorkerRequest(req *WorkerRequest) (*http.Response, error) {
 		return nil, fmt.Errorf("failed to marshal worker payload: %v", err)
 	}
 
-	return GetHttpClient().Post(workerUrl, "application/json", bytes.NewBuffer(workerPayload))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, workerUrl, bytes.NewReader(workerPayload))
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	return GetHttpClient().Do(request)
 }
 
 func DoDownloadRequest(originUrl string, reason ...string) (resp *http.Response, err error) {
+	return DoDownloadRequestWithContext(context.Background(), originUrl, reason...)
+}
+
+// DoDownloadRequestWithContext preserves shared download and SSRF policy while
+// allowing the request's cancellation and budget to stop the network operation.
+func DoDownloadRequestWithContext(ctx context.Context, originUrl string, reason ...string) (*http.Response, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if system_setting.EnableWorker() {
-		common.SysLog(common.LogText("downloading file from worker: %s, reason: %s", originUrl, strings.Join(reason, ", ")))
+		common.SysLog(common.LogText("downloading file from worker: %s, reason: %s", common.MaskSensitiveInfo(originUrl), strings.Join(reason, ", ")))
 		req := &WorkerRequest{
 			URL: originUrl,
 			Key: system_setting.WorkerValidKey,
 		}
-		return DoWorkerRequest(req)
+		return DoWorkerRequestWithContext(ctx, req)
 	} else {
 		// SSRF防护：验证请求URL（非Worker模式）
-		if err := ValidateSSRFProtectedFetchURL(originUrl); err != nil {
+		if err := ValidateSSRFProtectedFetchURLWithContext(ctx, originUrl); err != nil {
 			return nil, fmt.Errorf("request reject: %v", err)
 		}
 
 		common.SysLog(common.LogText("downloading from origin: %s, reason: %s", common.MaskSensitiveInfo(originUrl), strings.Join(reason, ", ")))
-		return GetSSRFProtectedHTTPClient().Get(originUrl)
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, originUrl, nil)
+		if err != nil {
+			return nil, err
+		}
+		return GetSSRFProtectedHTTPClient().Do(request)
 	}
 }

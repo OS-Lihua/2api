@@ -17,8 +17,54 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import type { ModelCapabilities } from '@/features/models/types'
+import { hasPermission } from '@/lib/admin-permissions'
 import { api } from '@/lib/api'
 import { requireServerSuccess } from '@/lib/server-error-message'
+import { useAuthStore } from '@/stores/auth-store'
+
+export function channelAccessScope() {
+  const { user, session } = useAuthStore.getState().auth
+  const admin = !!user && user.role >= 10
+  return {
+    actorId: user?.id,
+    sessionId: session?.sid,
+    read: admin && hasPermission(user, 'channel', 'read'),
+    write: admin && hasPermission(user, 'channel', 'write'),
+    operate: admin && hasPermission(user, 'channel', 'operate'),
+    modelRead: admin && hasPermission(user, 'model', 'read'),
+  }
+}
+export type ChannelAccessScope = ReturnType<typeof channelAccessScope>
+export function channelScopeKey(scope: ChannelAccessScope) {
+  return [
+    scope.actorId,
+    scope.sessionId,
+    scope.read,
+    scope.write,
+    scope.operate,
+    scope.modelRead,
+  ] as const
+}
+export function isChannelScopeCurrent(scope: ChannelAccessScope) {
+  const current = channelScopeKey(channelAccessScope())
+  return channelScopeKey(scope).every(
+    (value, index) => value === current[index]
+  )
+}
+export function assertChannelAccess(
+  scope: ChannelAccessScope,
+  action: 'read' | 'write' | 'operate' = 'read',
+  signal?: AbortSignal
+) {
+  if (
+    signal?.aborted ||
+    !scope.read ||
+    !scope[action] ||
+    !isChannelScopeCurrent(scope)
+  ) {
+    throw new Error('Channel access changed')
+  }
+}
 
 export interface ChannelHealth {
   circuit: 'closed' | 'open' | 'half_open'
@@ -54,16 +100,34 @@ export interface ChannelModel {
 }
 export const channelKeys = {
   all: ['single-model-channels'] as const,
-  list: (providerId: number, page: number) =>
-    ['single-model-channels', providerId, page] as const,
+  list: (
+    filter: { provider_id?: number; model_id?: number },
+    page: number,
+    pageSize: number,
+    scope: ChannelAccessScope
+  ) =>
+    [
+      'single-model-channels',
+      ...channelScopeKey(scope),
+      filter,
+      page,
+      pageSize,
+    ] as const,
 }
 const path = '/api/admin/v1/channels'
 export async function listSingleModelChannels(
-  providerId: number,
-  page: number
+  filter: number | { provider_id?: number; model_id?: number },
+  page: number,
+  signal?: AbortSignal,
+  pageSize = 10
 ) {
   const response = await api.get(path, {
-    params: { provider_id: providerId, p: page, page_size: 10 },
+    params: {
+      ...(typeof filter === 'number' ? { provider_id: filter } : filter),
+      p: page,
+      page_size: pageSize,
+    },
+    signal,
   })
   return requireServerSuccess<{
     success: boolean
@@ -80,8 +144,8 @@ export interface ChannelProbeResult {
   reason: string
   tested_value?: number
 }
-export async function listChannelProbes(id: number) {
-  const response = await api.get(`${path}/${id}/probes`)
+export async function listChannelProbes(id: number, signal?: AbortSignal) {
+  const response = await api.get(`${path}/${id}/probes`, { signal })
   return requireServerSuccess<{
     success: boolean
     data: { capabilities: string[]; results: ChannelProbeResult[] }
@@ -114,18 +178,20 @@ export async function saveSingleModelChannel(
       : await api.patch(`${path}/${id}`, body)
   return requireServerSuccess(response.data)
 }
-export async function findChannelModels(keyword: string) {
+export async function findChannelModels(keyword: string, signal?: AbortSignal) {
   const response = await api.get('/api/admin/v1/models', {
     params: { keyword, page_size: 100 },
+    signal,
   })
   return requireServerSuccess<{
     success: boolean
     data: { items: ChannelModel[] }
   }>(response.data).data
 }
-export async function suggestChannelModels(name: string) {
+export async function suggestChannelModels(name: string, signal?: AbortSignal) {
   const response = await api.get(`${path}/suggest-models`, {
     params: { upstream_model_name: name },
+    signal,
   })
   return requireServerSuccess<{
     success: boolean

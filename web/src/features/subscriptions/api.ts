@@ -16,35 +16,88 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { api } from '@/lib/api'
+import { isAxiosError } from 'axios'
+import { z } from 'zod'
 
-import type {
-  ApiResponse,
-  PlanRecord,
-  PlanPayload,
-  UserSubscriptionRecord,
-  CreateUserSubscriptionRequest,
-  ResetUserSubscriptionsRequest,
-  ResetPlanSubscriptionsRequest,
-  SubscriptionResetResult,
-  SubscriptionPayResponse,
-  SubscriptionPayRequest,
-  SelfSubscriptionData,
+import { api } from '@/lib/api'
+import { requireServerSuccess } from '@/lib/server-error-message'
+import { useAuthStore } from '@/stores/auth-store'
+
+import {
+  balancePurchaseRequestSchema,
+  balancePurchaseResultSchema,
+  billingPreferenceSchema,
+  planPayloadSchema,
+  planRecordSchema,
+  selfSubscriptionDataSchema,
+  userSubscriptionRecordSchema,
+  type BalancePurchaseRequest,
+  type BalancePurchaseResult,
+  type ApiResponse,
+  type PlanRecord,
+  type PlanPayload,
+  type UserSubscriptionRecord,
+  type CreateUserSubscriptionRequest,
+  type ResetUserSubscriptionsRequest,
+  type ResetPlanSubscriptionsRequest,
+  type SubscriptionResetResult,
+  type SubscriptionPayResponse,
+  type SubscriptionPayRequest,
+  type SelfSubscriptionData,
 } from './types'
+
+export function subscriptionScope() {
+  const { user, session } = useAuthStore.getState().auth
+  return { userId: user?.id, sessionId: session?.sid ?? null }
+}
+export function isSubscriptionScopeCurrent(
+  scope: ReturnType<typeof subscriptionScope>
+) {
+  const current = subscriptionScope()
+  return (
+    current.userId === scope.userId && current.sessionId === scope.sessionId
+  )
+}
+const responseSchema = <T extends z.ZodType>(data: T) =>
+  z.object({
+    success: z.literal(true),
+    message: z.string().optional(),
+    data,
+  })
+async function readSubscription<T extends z.ZodType>(
+  path: string,
+  schema: T,
+  signal?: AbortSignal
+) {
+  const scope = subscriptionScope()
+  const response = await api.get(path, { signal })
+  if (signal?.aborted || !isSubscriptionScopeCurrent(scope)) {
+    throw new Error('Session changed')
+  }
+  return responseSchema(schema).parse(requireServerSuccess(response.data))
+}
 
 // ============================================================================
 // Admin Plan Management
 // ============================================================================
 
-export async function getAdminPlans(): Promise<ApiResponse<PlanRecord[]>> {
-  const res = await api.get('/api/subscription/admin/plans')
-  return res.data
+export async function getAdminPlans(
+  signal?: AbortSignal
+): Promise<ApiResponse<PlanRecord[]>> {
+  return readSubscription(
+    '/api/subscription/admin/plans',
+    z.array(planRecordSchema),
+    signal
+  )
 }
 
 export async function createPlan(
   data: PlanPayload
 ): Promise<ApiResponse<PlanRecord>> {
-  const res = await api.post('/api/subscription/admin/plans', data)
+  const res = await api.post(
+    '/api/subscription/admin/plans',
+    planPayloadSchema.parse(data)
+  )
   return res.data
 }
 
@@ -52,7 +105,10 @@ export async function updatePlan(
   id: number,
   data: PlanPayload
 ): Promise<ApiResponse<PlanRecord>> {
-  const res = await api.put(`/api/subscription/admin/plans/${id}`, data)
+  const res = await api.put(
+    `/api/subscription/admin/plans/${id}`,
+    planPayloadSchema.parse(data)
+  )
   return res.data
 }
 
@@ -71,12 +127,14 @@ export async function patchPlanStatus(
 // ============================================================================
 
 export async function getUserSubscriptions(
-  userId: number
+  userId: number,
+  signal?: AbortSignal
 ): Promise<ApiResponse<UserSubscriptionRecord[]>> {
-  const res = await api.get(
-    `/api/subscription/admin/users/${userId}/subscriptions`
+  return readSubscription(
+    `/api/subscription/admin/users/${userId}/subscriptions`,
+    z.array(userSubscriptionRecordSchema),
+    signal
   )
-  return res.data
 }
 
 export async function createUserSubscription(
@@ -155,11 +213,46 @@ export async function paySubscriptionWaffoPancake(
   return res.data
 }
 
+export class SubscriptionPurchaseTermsChanged extends Error {
+  constructor() {
+    super(
+      'Subscription purchase terms have changed. Review the plan and confirm again.'
+    )
+    this.name = 'SubscriptionPurchaseTermsChanged'
+  }
+}
+
 export async function paySubscriptionBalance(
-  data: SubscriptionPayRequest
-): Promise<SubscriptionPayResponse> {
-  const res = await api.post('/api/subscription/balance/pay', data)
-  return res.data
+  data: BalancePurchaseRequest
+): Promise<ApiResponse<BalancePurchaseResult>> {
+  const scope = subscriptionScope()
+  const request = balancePurchaseRequestSchema.parse(data)
+  try {
+    const res = await api.post('/api/subscription/balance/pay', request)
+    if (!isSubscriptionScopeCurrent(scope)) throw new Error('Session changed')
+    const result = responseSchema(balancePurchaseResultSchema).parse(
+      requireServerSuccess(res.data)
+    )
+    if (
+      result.data.purchase_revision !== request.expected_revision ||
+      result.data.subscription.plan_id !== request.plan_id
+    ) {
+      throw new Error('Payment request failed')
+    }
+    return result
+  } catch (error) {
+    if (!isSubscriptionScopeCurrent(scope)) throw new Error('Session changed')
+    if (
+      isAxiosError(error) &&
+      error.response?.status === 409 &&
+      error.response.data?.success === false &&
+      error.response.data?.code === 'subscription_purchase_terms_changed' &&
+      error.response.data?.accepted === false
+    ) {
+      throw new SubscriptionPurchaseTermsChanged()
+    }
+    throw error
+  }
 }
 
 // Mints a Pancake OnetimeProduct (see controller for the OnetimeProduct vs
@@ -205,30 +298,37 @@ export async function paySubscriptionEpay(
 // User Self Subscriptions
 // ============================================================================
 
-export async function getSelfSubscriptions(): Promise<
-  ApiResponse<UserSubscriptionRecord[]>
-> {
-  const res = await api.get('/api/subscription/self')
-  return res.data
+export async function getSelfSubscriptions(
+  signal?: AbortSignal
+): Promise<ApiResponse<SelfSubscriptionData>> {
+  return getSelfSubscriptionFull(signal)
 }
 
-export async function getSelfSubscriptionFull(): Promise<
-  ApiResponse<SelfSubscriptionData>
-> {
-  const res = await api.get('/api/subscription/self')
-  return res.data
+export async function getSelfSubscriptionFull(
+  signal?: AbortSignal
+): Promise<ApiResponse<SelfSubscriptionData>> {
+  return readSubscription(
+    '/api/subscription/self',
+    selfSubscriptionDataSchema,
+    signal
+  )
 }
 
-export async function getPublicPlans(): Promise<ApiResponse<PlanRecord[]>> {
-  const res = await api.get('/api/subscription/plans')
-  return res.data
+export async function getPublicPlans(
+  signal?: AbortSignal
+): Promise<ApiResponse<PlanRecord[]>> {
+  return readSubscription(
+    '/api/subscription/plans',
+    z.array(planRecordSchema),
+    signal
+  )
 }
 
 export async function updateBillingPreference(
   preference: string
 ): Promise<ApiResponse<{ billing_preference?: string }>> {
   const res = await api.put('/api/subscription/self/preference', {
-    billing_preference: preference,
+    billing_preference: billingPreferenceSchema.parse(preference),
   })
   return res.data
 }

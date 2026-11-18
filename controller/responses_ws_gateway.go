@@ -29,17 +29,11 @@ import (
 
 // responsesWSGateway composes the ordinary request middleware, shared Attempt
 // runner and GatewayBilling lifecycle around one response.create.
-func responsesWSGateway(c *gin.Context, call *relay.ResponsesWSCall) (bool, *types.NewAPIError) {
+func responsesWSGateway(c *gin.Context, call *relay.ResponsesWSCall) *types.NewAPIError {
 	offering := middleware.TextOffering(c)
 	if offering == nil {
-		if call.Established() || middleware.TextOfferingMissing(c) {
-			service.RecordGatewayModelAccessDenied(c)
-			return true, types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound)
-		}
-		return false, nil
-	}
-	if call.LegacyConnection {
-		return true, types.NewErrorWithStatusCode(errors.New("Connection billing identity changed; reconnect required"), "connection_locked", http.StatusConflict)
+		service.RecordGatewayModelAccessDenied(c)
+		return types.NewErrorWithStatusCode(errors.New("Model not found"), "model_not_found", http.StatusNotFound)
 	}
 	lockedOfferingID := middleware.TextOffering(c).ID
 	call.AuthorizeControl = func(control *gin.Context) *types.NewAPIError {
@@ -50,7 +44,7 @@ func responsesWSGateway(c *gin.Context, call *relay.ResponsesWSCall) (bool, *typ
 		return authorizeWebSocketOffering(control)
 	}
 	if apiErr := authorizeWebSocketOffering(c); apiErr != nil {
-		return true, apiErr
+		return apiErr
 	}
 	run := &textGatewayRun{}
 	parent := c.Request
@@ -61,11 +55,11 @@ func responsesWSGateway(c *gin.Context, call *relay.ResponsesWSCall) (bool, *typ
 	run.settle(parent.Context(), attempts)
 	if run.status != 0 {
 		if run.nativeError != nil {
-			return true, run.nativeError
+			return run.nativeError
 		}
-		return true, types.NewErrorWithStatusCode(errors.New(run.message), types.ErrorCode(run.code), run.status, types.ErrOptionWithSkipRetry())
+		return types.NewErrorWithStatusCode(errors.New(run.message), types.ErrorCode(run.code), run.status, types.ErrOptionWithSkipRetry())
 	}
-	return true, nil
+	return nil
 }
 
 func authorizeWebSocketOffering(c *gin.Context) *types.NewAPIError {
@@ -201,6 +195,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		return
 	}
 	chosen := candidates[selection.Channel.ID]
+	requestContext := c
 	c = chosen.Context
 	budget.RequirePermit(selection.Permit)
 	if call.Native == nil {
@@ -416,6 +411,9 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	sentAt = clock.Now()
 	contactedProvider = true
 	usage, apiErr := call.Exchange(c, info, selection.Channel.ID, selection.Channel.ProviderID, prepared, payload)
+	// Route preparation copies the context. Publish the final stream outcome
+	// to the request middleware so failed responses release the success limit.
+	common.SetContextKey(requestContext, constant.ContextKeyResponseStreamStatus, info.StreamStatus)
 	// The Attempt context may be expired while the client is still present.
 	// Classify against the parent before deciding cancellation accounting.
 	c.Request = parent
@@ -478,6 +476,9 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 		service.RecordGatewayChannelAffinity(c, selection)
 		failure = service.GatewayFailure{}
 	}
+	if attempt.Status != "success" && failure.Class == "upstream_error" && !failure.Switch && !info.ResponseFacts.DownstreamWriteFailed && parent.Context().Err() == nil && status == http.StatusOK {
+		failure = service.GatewayFailure{Class: "stream_interrupted", Switch: true}
+	}
 	if attempt.Status != "success" {
 		attempt.ErrorClass = failure.Class
 	}
@@ -499,7 +500,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 	}
 	if usage != nil {
 		observedUsage = usage
-		attempt.Usage, attempt.UsageSource = service.GatewayRecordUsage(usage), "estimated"
+		attempt.Usage, attempt.UsageSource = service.GatewayRecordUsage(usage, info.ResponseFacts), "estimated"
 		if info.ResponseFacts.UsageReported && !info.ResponseFacts.UsageEstimated {
 			attempt.UsageSource = "upstream"
 		}
@@ -538,7 +539,7 @@ func runResponsesWSGatewayAttempt(c *gin.Context, call *relay.ResponsesWSCall, r
 				}
 			}
 			run.saleUsage = saleUsage
-			run.record.Usage, run.record.UsageSource = service.GatewayRecordUsage(saleUsage), saleUsageSource
+			run.record.Usage, run.record.UsageSource = service.GatewayRecordUsage(saleUsage, info.ResponseFacts), saleUsageSource
 			source, receivable, saleTrace, priceErr := service.GatewayPrice(run.sale, saleUsage, input, started, run.ratio, run.saleFX)
 			saleTrace.MatchedTier = ""
 			run.saleTrace = &saleTrace

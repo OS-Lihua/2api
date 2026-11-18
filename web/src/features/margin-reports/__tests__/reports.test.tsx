@@ -19,14 +19,19 @@ For commercial licensing, please contact support@quantumnous.com
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
 import { api } from '@/lib/api'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { MarginReports } from '../index'
 
 let client: QueryClient
+beforeEach(() =>
+  useAuthStore.getState().auth.setUser({ id: 1, role: 100, username: 'root' })
+)
 afterEach(() => {
+  useAuthStore.getState().auth.reset()
   client?.clear()
   vi.restoreAllMocks()
 })
@@ -97,3 +102,56 @@ it('shows known amounts separately from unfinished margin and applies dimension 
     )
   )
 })
+
+it.each([1, 0, undefined])(
+  'preserves known gross margin while funding allocation is independent (%s)',
+  async (pending) => {
+    const amount = { nanos: '9007199254740993', currency: 'EUR' }
+    vi.spyOn(api, 'get').mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          total: 1,
+          items: [
+            {
+              model_offering_id: 17,
+              revenue: amount,
+              cost: { ...amount, nanos: '0' },
+              collected: { ...amount, nanos: '0' },
+              outstanding: { ...amount, nanos: '0' },
+              known_margin: amount,
+              margin: amount,
+              original_costs: [],
+              sale_pending: 0,
+              cost_pending: 0,
+              converted_cost_pending: 0,
+              funding_pending: pending,
+            },
+          ],
+        },
+      },
+    })
+    client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={client}>
+        <MarginReports />
+      </QueryClientProvider>
+    )
+    expect(
+      (await screen.findAllByText('9,007,199.254740993 EUR')).length
+    ).toBeGreaterThan(0)
+    expect(screen.queryByText('Incomplete accounting')).not.toBeInTheDocument()
+    if (pending === 1) {
+      expect(screen.getByText('Funding allocation pending')).toBeVisible()
+    } else {
+      expect(
+        screen.queryByText('Funding allocation pending')
+      ).not.toBeInTheDocument()
+    }
+    if (pending === undefined) {
+      expect(
+        screen.getAllByText('Funding status unavailable').length
+      ).toBeGreaterThan(0)
+    }
+  }
+)

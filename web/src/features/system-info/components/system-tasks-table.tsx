@@ -111,6 +111,14 @@ export function SystemTasksTable(props: SystemTasksTableProps) {
       <TableBody>
         {props.tasks.map((task) => {
           const progress = getProgress(task)
+          const error =
+            task.error ===
+              'Legacy Channel management has been retired. Use the Provider and Channel APIs instead.' ||
+            task.error ===
+              'Legacy Midjourney polling has been retired. Migrate historical tasks before starting the server.' ||
+            task.error === 'Balance reminder delivery could not complete.'
+              ? t(task.error)
+              : task.error
           return (
             <TableRow key={task.task_id} className='hover:bg-muted/30'>
               <TableCell className='px-4 py-3 align-middle'>
@@ -164,9 +172,9 @@ export function SystemTasksTable(props: SystemTasksTableProps) {
               </TableCell>
               <TableCell
                 className='text-destructive max-w-[220px] truncate py-3 pr-4 align-middle text-xs'
-                title={task.error || undefined}
+                title={error || undefined}
               >
-                {task.error || '-'}
+                {error || '-'}
               </TableCell>
             </TableRow>
           )

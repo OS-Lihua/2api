@@ -6,6 +6,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"io"
 	"net/http"
+
+	"github.com/QuantumNous/new-api/pkg/protocol"
 )
 
 // ErrUseHTTPTransport asks the host to use its ordinary HTTP transport after a
@@ -32,6 +34,17 @@ type ReplayableResponseBody interface{ SetReader(io.ReadCloser) }
 // ProviderExecution performs only the actual upstream exchange. Preparation
 // must finish before the host starts an Attempt and its send budget.
 type ProviderExecution func(*gin.Context) (*http.Response, error)
+
+// ProviderCredentialValidator checks protocol-specific credential syntax without I/O.
+type ProviderCredentialValidator interface {
+	ValidateCredentialFormat(protocol.Type, string) error
+}
+
+// ProviderRequestBodyPreparer resolves Provider-owned body fields without I/O.
+// Pricing and transport must use the resulting effective body.
+type ProviderRequestBodyPreparer interface {
+	PrepareRequestBody(*gin.Context, ProviderMetadata, []byte) ([]byte, error)
+}
 
 type ProviderRequestPreparer interface {
 	PrepareExecution(*gin.Context, ProviderMetadata, io.Reader) (ProviderExecution, error)

@@ -68,14 +68,18 @@ const originalPut = apiClient.put
 const originalConsoleLog = Reflect.get(console, 'log')
 let renderedDrawer: RenderedDrawer | null = null
 
-function redemption(id: number, quota = 500001): Redemption {
+function redemption(
+  id: number,
+  nanos = '1000002000',
+  currency = 'USD'
+): Redemption {
   return {
     id,
     user_id: 1,
     name: `code-${id}`,
     key: `key-${id}`,
     status: 1,
-    quota,
+    amount: { nanos, currency },
     created_time: 1,
     redeemed_time: 0,
     expired_time: 0,
@@ -143,9 +147,9 @@ function getSaveButton(): HTMLButtonElement {
   return screen.getByRole('button', { name: 'Save changes' })
 }
 
-function getControlByLabel(labelText: 'Name'): HTMLInputElement
-function getControlByLabel(labelText: 'Quota (CNY)'): HTMLInputElement
-function getControlByLabel(labelText: 'Quota (USD)'): HTMLInputElement
+function getControlByLabel(
+  labelText: 'Name' | 'Amount' | 'Currency'
+): HTMLInputElement
 function getControlByLabel(labelText: string): HTMLElement {
   const label = [...document.querySelectorAll<HTMLLabelElement>('label')].find(
     (candidate) => candidate.textContent?.trim() === labelText
@@ -190,8 +194,8 @@ afterEach(() => {
 })
 
 describe('redemption drawer', () => {
-  test('shows the reported CNY quota without floating-point noise', async () => {
-    const original = redemption(1, 13888889)
+  test('shows the voucher currency and exact amount without applying display exchange rates', async () => {
+    const original = redemption(1, '27777778000', 'CNY')
     apiClient.get = async () => ({ data: { success: true, data: original } })
 
     await renderDrawer(original, {
@@ -200,7 +204,8 @@ describe('redemption drawer', () => {
     })
     await waitForLoadedForm()
 
-    expect(getControlByLabel('Quota (CNY)').value).toBe('200')
+    expect(getControlByLabel('Amount').value).toBe('27.777778')
+    expect(getControlByLabel('Currency').value).toBe('CNY')
   })
 
   test('blocks updates and reports an error when loading rejects', async () => {
@@ -242,7 +247,7 @@ describe('redemption drawer', () => {
     }
   )
 
-  test('keeps the original quota when another field changes', async () => {
+  test('keeps every digit of the original amount when another field changes', async () => {
     const original = redemption(1)
     const updates: Array<Record<string, unknown>> = []
     apiClient.get = async () => ({ data: { success: true, data: original } })
@@ -254,17 +259,19 @@ describe('redemption drawer', () => {
 
     await renderDrawer(original)
     await waitForLoadedForm()
-    expect(getControlByLabel('Quota (USD)').value).toBe('1')
+    expect(getControlByLabel('Amount').value).toBe('1.000002')
 
     changeInput(getControlByLabel('Name'), 'renamed')
     submitForm()
     await waitFor(() => expect(updates).toHaveLength(1))
 
     expect(updates[0]?.name).toBe('renamed')
-    expect(updates[0]?.quota).toBe(500001)
+    expect(updates[0]?.amount).toEqual(original.amount)
+    expect(updates[0]).not.toHaveProperty('quota')
+    expect(updates[0]).not.toHaveProperty('count')
   })
 
-  test('recalculates quota when the quota field changes', async () => {
+  test('submits nanos without floating point conversion when amount or currency changes', async () => {
     const original = redemption(1)
     const updates: Array<Record<string, unknown>> = []
     apiClient.get = async () => ({ data: { success: true, data: original } })
@@ -276,11 +283,64 @@ describe('redemption drawer', () => {
 
     await renderDrawer(original)
     await waitForLoadedForm()
-    changeInput(getControlByLabel('Quota (USD)'), '2')
+    changeInput(getControlByLabel('Amount'), '9007199.254740993')
+    changeInput(getControlByLabel('Currency'), 'EUR')
     submitForm()
     await waitFor(() => expect(updates).toHaveLength(1))
 
-    expect(updates[0]?.quota).toBe(1000000)
+    expect(updates[0]?.amount).toEqual({
+      nanos: '9007199254740993',
+      currency: 'EUR',
+    })
+  })
+
+  test.each(['0', '-1', '0.0000000001', '9223372036.854775808', '1e3'])(
+    'rejects invalid redemption amount %s without saving',
+    async (amount) => {
+      const original = redemption(1)
+      const updates: unknown[] = []
+      apiClient.get = async () => ({ data: { success: true, data: original } })
+      apiClient.put = async (_url, data) => {
+        updates.push(data)
+        return { data: { success: true } }
+      }
+      await renderDrawer(original)
+      await waitForLoadedForm()
+      changeInput(getControlByLabel('Amount'), amount)
+      submitForm()
+      await waitFor(() =>
+        expect(screen.getByText('Invalid redemption amount')).toBeVisible()
+      )
+      expect(getControlByLabel('Amount')).toHaveAttribute(
+        'aria-invalid',
+        'true'
+      )
+      expect(updates).toEqual([])
+    }
+  )
+
+  test('rejects an incomplete currency code without saving', async () => {
+    const original = redemption(1)
+    const updates: unknown[] = []
+    apiClient.get = async () => ({ data: { success: true, data: original } })
+    apiClient.put = async (_url, data) => {
+      updates.push(data)
+      return { data: { success: true } }
+    }
+    await renderDrawer(original)
+    await waitForLoadedForm()
+    changeInput(getControlByLabel('Currency'), 'US')
+    submitForm()
+    await waitFor(() =>
+      expect(
+        screen.getByText('Enter a three-letter uppercase currency code.')
+      ).toBeVisible()
+    )
+    expect(getControlByLabel('Currency')).toHaveAttribute(
+      'aria-invalid',
+      'true'
+    )
+    expect(updates).toEqual([])
   })
 
   test('keeps a non-expiring code unchanged after closing an expiring code', async () => {
@@ -346,8 +406,8 @@ describe('redemption drawer', () => {
   )
 
   test('ignores an older response after switching records', async () => {
-    const first = redemption(1, 500001)
-    const second = redemption(2, 1000001)
+    const first = redemption(1, '1000002000')
+    const second = redemption(2, '2000002000')
     const firstRequest = deferred<{ data: unknown }>()
     const secondRequest = deferred<{ data: unknown }>()
     const requestedUrls: string[] = []
@@ -378,6 +438,6 @@ describe('redemption drawer', () => {
     await waitFor(() => expect(updates).toHaveLength(1))
 
     expect(updates[0]?.id).toBe(2)
-    expect(updates[0]?.quota).toBe(1000001)
+    expect(updates[0]?.amount).toEqual(second.amount)
   })
 })

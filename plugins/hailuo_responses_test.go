@@ -133,7 +133,7 @@ func TestHailuoArtifactContentProxy(t *testing.T) {
 	defer upstream.Close()
 	adaptor := taskplugin.New(loadHailuoPlugin(t))
 	adaptor.Init(&relaycommon.RelayInfo{
-		ProviderMeta: &relaycommon.ProviderMeta{ApiKey: "test-ak", ChannelBaseUrl: upstream.URL},
+		ProviderMeta: &relaycommon.ProviderMeta{ChannelId: 1, ApiKey: "test-ak", ChannelBaseUrl: upstream.URL},
 	})
 
 	for _, tc := range []struct {
@@ -153,13 +153,19 @@ func TestHailuoArtifactContentProxy(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, []channel.TaskArtifact{{Key: "video", Type: "video", MimeType: "video/mp4"}}, artifacts)
 
-			descriptor, err := adaptor.BuildContentRequest(t.Context(), task, "video", channel.TaskArtifactClientRequest{Method: http.MethodHead})
+			ctx := fixtureTaskAuthority(t, adaptor, task)
+			descriptor, err := adaptor.BuildContentRequest(ctx, task, "video", channel.TaskArtifactClientRequest{Method: http.MethodHead})
 			if tc.wantErr != "" {
 				require.ErrorContains(t, err, tc.wantErr)
 				return
 			}
 			require.NoError(t, err)
-			assert.Equal(t, &channel.TaskContentRequest{URL: signedURL, Method: http.MethodGet, Credentialless: true}, descriptor)
+			require.NotNil(t, descriptor.Authorize)
+			require.NoError(t, descriptor.Authorize(ctx))
+			require.Error(t, descriptor.Authorize(t.Context()))
+			comparable := *descriptor
+			comparable.Authorize = nil
+			assert.Equal(t, &channel.TaskContentRequest{URL: signedURL, Method: http.MethodGet, Credentialless: true}, &comparable)
 		})
 	}
 }
@@ -763,7 +769,7 @@ func TestHailuoThroughNewAPIGateway(t *testing.T) {
 
 	adaptor := taskplugin.New(plugin)
 	adaptor.Init(&relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{
-		ChannelType: constant.ChannelTypeNewAPI, ApiKey: "sk-gateway", ChannelBaseUrl: "https://gateway.example",
+		ChannelId: 1, ChannelType: constant.ChannelTypeNewAPI, ApiKey: "sk-gateway", ChannelBaseUrl: "https://gateway.example",
 	}})
 	success := map[string]any{"status_code": 0, "status_msg": "success"}
 	for _, tc := range []struct {
@@ -835,9 +841,15 @@ func TestHailuoThroughNewAPIGateway(t *testing.T) {
 			artifacts, err := adaptor.ListArtifacts(task)
 			require.NoError(t, err)
 			assert.Equal(t, []channel.TaskArtifact{{Key: "video", Type: "video", MimeType: "video/mp4"}}, artifacts)
-			descriptor, err := adaptor.BuildContentRequest(t.Context(), task, "video", channel.TaskArtifactClientRequest{Method: http.MethodHead})
+			ctx := fixtureTaskAuthority(t, adaptor, task)
+			descriptor, err := adaptor.BuildContentRequest(ctx, task, "video", channel.TaskArtifactClientRequest{Method: http.MethodHead})
 			require.NoError(t, err)
-			assert.Equal(t, tc.wantContent, descriptor)
+			comparable := *descriptor
+			require.NotNil(t, descriptor.Authorize)
+			require.NoError(t, descriptor.Authorize(ctx))
+			require.Error(t, descriptor.Authorize(t.Context()))
+			comparable.Authorize = nil
+			assert.Equal(t, tc.wantContent, &comparable)
 		})
 	}
 

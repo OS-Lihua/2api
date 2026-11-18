@@ -25,9 +25,6 @@ var DisplayInCurrencyEnabled = true
 var DisplayTokenStatEnabled = true
 var DrawingEnabled = true
 var TaskEnabled = true
-var DataExportEnabled = true
-var DataExportInterval = 5         // unit: minute
-var DataExportDefaultTime = "hour" // unit: minute
 var DefaultCollapseSidebar = false // default value of collapse sidebar
 
 // Any options with "Secret", "Token" in its key won't be return by GetOptions
@@ -127,9 +124,6 @@ var TurnstileSecretKey = ""
 var TelegramBotToken = ""
 var TelegramBotName = ""
 
-var QuotaForNewUser = 0
-var QuotaForInviter = 0
-var QuotaForInvitee = 0
 var ChannelDisableThreshold = 5.0
 var AutomaticDisableChannelEnabled = false
 var AutomaticEnableChannelEnabled = false
@@ -165,9 +159,6 @@ var requestInterval int
 var RequestInterval time.Duration
 
 var SyncFrequency int // unit is second
-
-var BatchUpdateEnabled = false
-var BatchUpdateInterval int
 
 var RelayTimeout int // unit is second
 

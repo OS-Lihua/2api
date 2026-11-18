@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/channelhealth"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/protocol"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/gin-gonic/gin"
@@ -209,6 +210,10 @@ func mutateSingleModelChannel(c *gin.Context, action model.ChannelAction) {
 				return err
 			}
 			if err := common.Unmarshal(patch, &request); err != nil {
+				return common.NewMessage("Invalid parameters")
+			}
+			var parameterOverrides map[string]any
+			if err := common.Unmarshal(request.ParameterOverrides, &parameterOverrides); err != nil || relaycommon.ValidateParamOverrideContextReferences(parameterOverrides) != nil {
 				return common.NewMessage("Invalid parameters")
 			}
 			current.ProviderID = request.ProviderID

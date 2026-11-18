@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var expectedKeys = []string{"alibaba", "doubao", "google", "hailuo", "jimeng", "kling", "sora", "sunoapi", "vertex-ai", "vidu", "xai"}
+var expectedKeys = []string{"alibaba", "doubao", "google", "hailuo", "jimeng", "kling", "midjourney", "sora", "sunoapi", "vertex-ai", "vidu", "xai"}
 
 func TestBuiltInVendorPluginsDeclareNativeRoutesAndLegacyChannelTypes(t *testing.T) {
 	generation := jsplugin.DefaultRegistry.Generation()
@@ -134,6 +134,30 @@ func TestBuiltInVendorPluginsDeclareNativeRoutesAndLegacyChannelTypes(t *testing
 		plugin, found := generation.GetByChannelType(channelType.value)
 		require.True(t, found)
 		require.Equal(t, channelType.key, plugin.Meta.Key)
+	}
+}
+
+func TestBuiltInMidjourneyNativeContracts(t *testing.T) {
+	source, err := Source("midjourney")
+	require.NoError(t, err)
+	registry := jsplugin.NewRegistry()
+	plugin, err := registry.RegisterFactory(source, jsplugin.Options{Key: "midjourney"})
+	require.NoError(t, err)
+	for _, prefix := range []string{"/mj", "/fast/mj", "/relax/mj", "/turbo/mj"} {
+		ctx := map[string]any{"method": "POST", "path": prefix + "/submit/imagine", "params": map[string]string{"operation": "imagine"}, "body": map[string]any{"kind": "json", "value": map[string]any{"prompt": "A bird"}}}
+		intent, err := plugin.Engine.CallPath(t.Context(), "native", []string{"decodeSubmit"}, ctx)
+		require.NoError(t, err)
+		assert.Equal(t, "mj_imagine", intent.(map[string]any)["model"])
+		ctx["requestBody"], ctx["action"] = map[string]any{"prompt": "A bird"}, "IMAGINE"
+		facts, err := plugin.Engine.Call(t.Context(), "extractUsage", ctx)
+		require.NoError(t, err)
+		assert.EqualValues(t, 1, facts.(map[string]any)["operations"])
+	}
+	for _, customID := range []string{"MJ::upsample::1::private", "MJ::JOB::upsample::1::private"} {
+		ctx := map[string]any{"method": "POST", "path": "/mj/submit/action", "params": map[string]string{"operation": "action"}, "body": map[string]any{"kind": "json", "value": map[string]any{"taskId": "task_public", "customId": customID}}}
+		intent, err := plugin.Engine.CallPath(t.Context(), "native", []string{"decodeSubmit"}, ctx)
+		require.NoError(t, err, customID)
+		assert.Equal(t, "mj_upscale", intent.(map[string]any)["model"])
 	}
 }
 

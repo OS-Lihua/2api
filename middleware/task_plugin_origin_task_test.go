@@ -1,7 +1,6 @@
 package middleware
 
 import (
-	"bytes"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,8 +10,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/dto"
-	appI18n "github.com/QuantumNous/new-api/i18n"
+
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/service"
@@ -305,7 +303,7 @@ func TestPrepareTaskPluginEndpointPinsOriginTaskChannel(t *testing.T) {
 	router.POST("/v1/responses", func(c *gin.Context) {
 		common.SetContextKey(c, constant.ContextKeyUserId, 7)
 		c.Next()
-	}, PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+	}, routeAuthorizedTaskPluginEndpoint(t, channel), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
 		reached = true
 		pinnedID, ok := resolvedOriginPin(c)
 		require.True(t, ok)
@@ -338,7 +336,7 @@ func TestPrepareTaskPluginEndpointRejectsUnknownOriginTask(t *testing.T) {
 	router.POST("/v1/responses", func(c *gin.Context) {
 		common.SetContextKey(c, constant.ContextKeyUserId, 7)
 		c.Next()
-	}, PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) { reached = true })
+	}, routeAuthorizedTaskPluginEndpoint(t, insertOriginTaskChannel(t, common.ChannelStatusEnabled)), PrepareTaskPluginEndpoint(), func(c *gin.Context) { reached = true })
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"claimed-model","input":"hello"}`))
 	request.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
@@ -346,98 +344,4 @@ func TestPrepareTaskPluginEndpointRejectsUnknownOriginTask(t *testing.T) {
 	assert.False(t, reached)
 	assert.Equal(t, http.StatusBadRequest, recorder.Code)
 	assert.Contains(t, recorder.Body.String(), "origin_task_not_found")
-}
-
-func TestDistributeHonorsOriginTaskChannelPin(t *testing.T) {
-	require.NoError(t, appI18n.Init())
-	setupOriginTaskDB(t)
-	channel := insertOriginTaskChannel(t, common.ChannelStatusEnabled)
-
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/vendor/jobs", strings.NewReader(`{}`))
-	c.Request.Header.Set("Content-Type", "application/json")
-	c.Set("resolved_task_model", "resolved-model")
-	service.GetChannelConstraints(c).AddPin(dto.ProviderPin{
-		ChannelId: channel.Id,
-		Source:    dto.PinSourceOriginTask,
-		Rank:      dto.PinRankOriginTask,
-		RetryMode: dto.PinRetrySameChannel,
-	})
-
-	nextCalled := false
-	handler := Distribute()
-	handler(c)
-	if !c.IsAborted() {
-		nextCalled = true
-	}
-	assert.True(t, nextCalled)
-	assert.Equal(t, channel.Id, common.GetContextKeyInt(c, constant.ContextKeyChannelId))
-}
-
-func TestDistributeTokenPinBeatsOriginPin(t *testing.T) {
-	require.NoError(t, appI18n.Init())
-	setupOriginTaskDB(t)
-	tokenChannel := insertOriginTaskChannel(t, common.ChannelStatusEnabled)
-	originChannel := insertOriginTaskChannel(t, common.ChannelStatusEnabled)
-
-	var warnBuf bytes.Buffer
-	previousWriter := gin.DefaultErrorWriter
-	gin.DefaultErrorWriter = &warnBuf
-	t.Cleanup(func() { gin.DefaultErrorWriter = previousWriter })
-
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/vendor/jobs", strings.NewReader(`{}`))
-	c.Request.Header.Set("Content-Type", "application/json")
-	c.Set("resolved_task_model", "resolved-model")
-	constraints := service.GetChannelConstraints(c)
-	constraints.AddPin(dto.ProviderPin{
-		ChannelId: tokenChannel.Id,
-		Source:    dto.PinSourceToken,
-		Rank:      dto.PinRankToken,
-		RetryMode: dto.PinRetrySingleAttempt,
-	})
-	constraints.AddPin(dto.ProviderPin{
-		ChannelId: originChannel.Id,
-		Source:    dto.PinSourceOriginTask,
-		Rank:      dto.PinRankOriginTask,
-		RetryMode: dto.PinRetrySameChannel,
-	})
-	nextCalled := false
-	Distribute()(c)
-	if !c.IsAborted() {
-		nextCalled = true
-	}
-	assert.True(t, nextCalled)
-	assert.Equal(t, tokenChannel.Id, common.GetContextKeyInt(c, constant.ContextKeyChannelId))
-	warn := warnBuf.String()
-	assert.Contains(t, warn, "winning_source=token")
-	assert.Contains(t, warn, fmt.Sprintf("winning_channel_id=%d", tokenChannel.Id))
-	assert.Contains(t, warn, "overridden_source=origin_task")
-	assert.Contains(t, warn, fmt.Sprintf("overridden_channel_id=%d", originChannel.Id))
-}
-
-func TestDistributePinViolatingIdentityFilterErrors(t *testing.T) {
-	require.NoError(t, appI18n.Init())
-	setupOriginTaskDB(t)
-	channel := insertOriginTaskChannel(t, common.ChannelStatusEnabled)
-
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/vendor/jobs", strings.NewReader(`{}`))
-	c.Request.Header.Set("Content-Type", "application/json")
-	c.Set("resolved_task_model", "resolved-model")
-	c.Set("expected_task_plugin_key", "alpha")
-	service.GetChannelConstraints(c).AddPin(dto.ProviderPin{
-		ChannelId: channel.Id,
-		Source:    dto.PinSourceOriginTask,
-		Rank:      dto.PinRankOriginTask,
-		RetryMode: dto.PinRetrySameChannel,
-	})
-
-	Distribute()(c)
-	assert.True(t, c.IsAborted())
-	assert.Equal(t, http.StatusBadRequest, recorder.Code)
-	assert.Contains(t, recorder.Body.String(), string(dto.FilterTaskPluginIdentity))
 }

@@ -5,14 +5,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/QuantumNous/new-api/pkg/capability"
+	"github.com/QuantumNous/new-api/pkg/channelhealth"
+	"github.com/QuantumNous/new-api/pkg/protocol"
+	"github.com/shopspring/decimal"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/textproto"
+	"slices"
 	"strings"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -584,6 +590,65 @@ func TestBuildTaskPluginRouteRequestRejectsUnsafeBodies(t *testing.T) {
 	})
 }
 
+// The protocol regressions enter the production Offering-based dispatcher.
+// Their catalog is explicit test configuration, not a Provider alias projection.
+func routeAuthorizedTaskPluginEndpoint(t *testing.T, original ...*model.Provider) gin.HandlerFunc {
+	t.Helper()
+	database := model.DB
+	provider := &model.Provider{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: "endpoint-test-key"}
+	if len(original) == 0 {
+		database = model.UseTestDatabases(t)
+	} else {
+		provider = original[0]
+	}
+	require.NoError(t, database.AutoMigrate(&model.Provider{}, &model.Vendor{}, &model.Model{}, &model.Channel{}, &model.ModelOffering{}, &model.ModelOfferingMember{}, &model.Task{}))
+	if len(original) == 0 {
+		require.NoError(t, database.Create(provider).Error)
+	}
+	offerings := map[string]*model.ModelOffering{}
+	add := func(name string, kind protocol.Type) {
+		member := &model.Model{ModelName: fmt.Sprintf("%s/%s", kind, name), Status: 1}
+		require.NoError(t, database.Create(member).Error)
+		require.NoError(t, database.Create(&model.Channel{ProviderID: provider.Id, ModelID: member.Id, Protocol: kind, UpstreamModelName: name, Status: model.ChannelEnabled, MappingConfirmed: true, ParameterOverrides: `{}`}).Error)
+		offering := offerings[name]
+		if offering == nil {
+			offering = &model.ModelOffering{Name: name, Visibility: "all", Groups: []string{}, RouteMethod: "cost", AcceptedConversionLosses: []string{}, Enabled: true}
+			require.NoError(t, database.Create(offering).Error)
+			offerings[name] = offering
+		}
+		entry := model.ModelOfferingMember{OfferingID: offering.ID, ModelID: member.Id, Tier: 1}
+		require.NoError(t, database.Create(&entry).Error)
+		offering.Members = append(offering.Members, entry)
+	}
+	for _, plugin := range jsplugin.DefaultRegistry.Generation().Plugins() {
+		if jsplugin.DefaultRegistry.Generation().FactoryKey(plugin.Meta.Key) {
+			continue
+		}
+		for _, name := range plugin.Meta.Models {
+			add(name, protocol.Type("task:"+plugin.Meta.Key))
+		}
+	}
+	add("ordinary-model", protocol.OpenAIChat)
+	add("dall-e-3", protocol.OpenAIImages)
+	route := RouteTaskPluginEndpoint()
+	return func(c *gin.Context) {
+		previous := model.DB
+		model.DB = database
+		defer func() { model.DB = previous }()
+		// Parsing failures still go through the production dispatcher's exact
+		// body-error response, with an already authorized test Offering.
+		offering := offerings["ordinary-model"]
+		if request, err := getModelFromRequest(c); err == nil {
+			if selected := offerings[request.Model]; selected != nil {
+				offering = selected
+			}
+		}
+		c.Set(textOfferingContextKey, offering)
+		c.Set("id", 7)
+		route(c)
+	}
+}
+
 func TestPrepareTaskPluginEndpointPinsGenerationBeforeParseAndDistribution(t *testing.T) {
 	const key = "endpoint-pin-test"
 	firstSource := taskProtocolPluginSource(
@@ -604,7 +669,7 @@ func TestPrepareTaskPluginEndpointPinsGenerationBeforeParseAndDistribution(t *te
 	reachedDistribution := false
 	router.POST(
 		"/v1/responses",
-		PinTaskPluginEndpoint(),
+		routeAuthorizedTaskPluginEndpoint(t),
 		func(c *gin.Context) {
 			_, updateErr := jsplugin.DefaultRegistry.Register(taskProtocolPluginSource(
 				key,
@@ -669,7 +734,7 @@ func TestPrepareTaskPluginEndpointClientDisconnectDoesNotCancelParseHook(t *test
 	reachedDistribution := false
 	router.POST(
 		"/v1/responses",
-		PinTaskPluginEndpoint(),
+		routeAuthorizedTaskPluginEndpoint(t),
 		func(c *gin.Context) {
 			requestContext, cancel := context.WithCancel(c.Request.Context())
 			cancel()
@@ -714,7 +779,7 @@ func TestPrepareTaskPluginEndpointUsesStrictOriginalStreamFlag(t *testing.T) {
 	reachedDistribution := false
 	router.POST(
 		"/v1/responses",
-		PinTaskPluginEndpoint(),
+		routeAuthorizedTaskPluginEndpoint(t),
 		PrepareTaskPluginEndpoint(),
 		func(c *gin.Context) {
 			reachedDistribution = true
@@ -766,7 +831,7 @@ func TestTaskPluginEndpointMissPreservesOrdinaryRequestBody(t *testing.T) {
 	router := gin.New()
 	router.POST(
 		"/v1/responses",
-		PinTaskPluginEndpoint(),
+		routeAuthorizedTaskPluginEndpoint(t),
 		PrepareTaskPluginEndpoint(),
 		func(c *gin.Context) {
 			_, pinned := c.Get(jsplugin.ContextKeyPinnedEndpoint)
@@ -825,7 +890,7 @@ func TestTaskPluginEndpointUsesOneCanonicalModelForDuplicateJSONKeys(t *testing.
 			router := gin.New()
 			router.POST(
 				"/v1/responses",
-				PinTaskPluginEndpoint(),
+				routeAuthorizedTaskPluginEndpoint(t),
 				PrepareTaskPluginEndpoint(),
 				func(c *gin.Context) {
 					reachedDownstream = true
@@ -856,11 +921,17 @@ func TestRequestBodyFailuresReportTheirCause(t *testing.T) {
 	t.Cleanup(func() { constant.MaxRequestBodyMB = previous })
 
 	reached := func(c *gin.Context) { c.Status(http.StatusNoContent) }
+	// This table exercises the retained body parser, not a retired selector.
+	parse := func(c *gin.Context) {
+		if _, _, err := getModelRequest(c); err != nil {
+			abortWithOpenAiMessage(c, invalidRequestStatus(err), appI18n.T(c, appI18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
+		}
+	}
 	router := gin.New()
-	router.POST("/v1/responses", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), Distribute(), reached)
-	router.POST("/v1/video/generations", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), Distribute(), reached)
-	router.POST("/v1/chat/completions", Distribute(), reached)
-	router.POST("/mj/submit/imagine", Distribute(), reached)
+	router.POST("/v1/responses", routeAuthorizedTaskPluginEndpoint(t), PrepareTaskPluginEndpoint(), parse, reached)
+	router.POST("/v1/video/generations", routeAuthorizedTaskPluginEndpoint(t), PrepareTaskPluginEndpoint(), parse, reached)
+	router.POST("/v1/chat/completions", parse, reached)
+	router.POST("/mj/submit/imagine", parse, reached)
 	router.POST("/v1/tasks/:key", PrepareTaskPluginSubmit(), reached)
 	router.POST("/vendor/jobs", func(c *gin.Context) {
 		c.Set(jsplugin.ContextKeyPinnedRoute, jsplugin.PinnedRoute{Plugin: routePlugin})
@@ -1020,7 +1091,7 @@ func TestPrepareTaskPluginEndpointRejectsModelDriftBeforeDistribution(t *testing
 	router := gin.New()
 	router.POST(
 		"/v1/responses",
-		PinTaskPluginEndpoint(),
+		routeAuthorizedTaskPluginEndpoint(t),
 		PrepareTaskPluginEndpoint(),
 		func(c *gin.Context) {
 			reachedDistribution = true
@@ -1074,7 +1145,7 @@ func TestPrepareTaskPluginEndpointAcceptsRegisteredVideoMultipartBody(t *testing
 	reachedDistribution := false
 	router.POST(
 		"/v1/videos",
-		PinTaskPluginEndpoint(),
+		routeAuthorizedTaskPluginEndpoint(t),
 		PrepareTaskPluginEndpoint(),
 		func(c *gin.Context) {
 			reachedDistribution = true
@@ -1122,7 +1193,7 @@ func TestPrepareTaskPluginEndpointExposesIndexedRefsForRepeatedImageFiles(t *tes
 	router := gin.New()
 	var pinnedProtocol string
 	var taskRequest any
-	router.POST("/v1/images/edits", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+	router.POST("/v1/images/edits", routeAuthorizedTaskPluginEndpoint(t), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
 		if pinned, ok := c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint); ok {
 			pinnedProtocol = pinned.Protocol
 		}
@@ -1142,7 +1213,7 @@ func TestPrepareTaskPluginEndpointExposesIndexedRefsForRepeatedImageFiles(t *tes
 
 	unclaimed := gin.New()
 	reachedRelay := false
-	unclaimed.POST("/v1/images/generations", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+	unclaimed.POST("/v1/images/generations", routeAuthorizedTaskPluginEndpoint(t), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
 		_, pinned := c.Get(jsplugin.ContextKeyPinnedEndpoint)
 		reachedRelay = !pinned
 		c.Status(http.StatusNoContent)
@@ -1171,7 +1242,7 @@ func TestVideoGenerationsIsNotClaimedByOpenAIVideoProtocol(t *testing.T) {
 	reachedDistribution := false
 	router.POST(
 		"/v1/video/generations",
-		PinTaskPluginEndpoint(),
+		routeAuthorizedTaskPluginEndpoint(t),
 		PrepareTaskPluginEndpoint(),
 		func(c *gin.Context) {
 			reachedDistribution = true
@@ -1704,7 +1775,7 @@ func TestPrepareTaskPluginEndpointSurfacesDecodeHookMessage(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(key)) })
 
 	router := gin.New()
-	router.POST("/v1/responses", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+	router.POST("/v1/responses", routeAuthorizedTaskPluginEndpoint(t), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
 		c.Status(http.StatusNoContent)
 	})
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"claimed-model"}`))
@@ -1772,7 +1843,7 @@ func TestPinTaskPluginEndpointRejectsUnsupportedRequestForms(t *testing.T) {
 			reachedPrepare := false
 			quotaConsumed := false
 			router := gin.New()
-			router.POST("/v1/responses", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+			router.POST("/v1/responses", routeAuthorizedTaskPluginEndpoint(t), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
 				reachedPrepare = true
 				quotaConsumed = true
 				require.NoError(t, model.DB.Create(&model.Task{TaskID: "should-not-exist", UserId: 1}).Error)
@@ -1811,7 +1882,7 @@ func TestPinTaskPluginEndpointMalformedStreamStillFailsInPrepare(t *testing.T) {
 
 	reachedNext := false
 	router := gin.New()
-	router.POST("/v1/responses", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+	router.POST("/v1/responses", routeAuthorizedTaskPluginEndpoint(t), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
 		reachedNext = true
 		c.Status(http.StatusNoContent)
 	})
@@ -1850,7 +1921,7 @@ func TestPinTaskPluginEndpointMovesParserToSurvivingSharedCandidate(t *testing.T
 		var pinned jsplugin.PinnedEndpoint
 		var action string
 		router := gin.New()
-		router.POST("/v1/responses", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+		router.POST("/v1/responses", routeAuthorizedTaskPluginEndpoint(t), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
 			pinned = c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint)
 			action = c.GetString("task_action")
 			c.Status(http.StatusNoContent)
@@ -1871,7 +1942,7 @@ func TestPinTaskPluginEndpointMovesParserToSurvivingSharedCandidate(t *testing.T
 		var pinned jsplugin.PinnedEndpoint
 		var action string
 		router := gin.New()
-		router.POST("/v1/responses", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+		router.POST("/v1/responses", routeAuthorizedTaskPluginEndpoint(t), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
 			pinned = c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint)
 			action = c.GetString("task_action")
 			c.Status(http.StatusNoContent)
@@ -2026,7 +2097,7 @@ func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
 			}
 			var gotKeys []string
 			router := gin.New()
-			router.POST("/v1/responses", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+			router.POST("/v1/responses", routeAuthorizedTaskPluginEndpoint(t), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
 				pinned := c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint)
 				for _, candidate := range pinned.Candidates {
 					gotKeys = append(gotKeys, candidate.Plugin.Meta.Key)
@@ -2053,6 +2124,62 @@ func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
 	}
 }
 
+func TestRouteTaskPluginEndpointRequiresOfferingBeforeParsing(t *testing.T) {
+	require.NoError(t, appI18n.Init())
+	previousCache, previousRedis := common.MemoryCacheEnabled, common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.MemoryCacheEnabled, common.RedisEnabled = previousCache, previousRedis })
+	db := model.UseTestDatabases(t)
+	require.NoError(t, db.AutoMigrate(&model.Provider{}, &model.Ability{}))
+	const key = "offering-required-test"
+	provider := &model.Provider{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: "private-upstream-credential", Name: "legacy trap", Models: "requires-offering", Group: "default"}
+	provider.SetSetting(kitdto.ProviderSettings{TaskPluginKey: key})
+	require.NoError(t, db.Create(provider).Error)
+	require.NoError(t, provider.AddAbilities(db))
+	for _, cached := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cache=%t", cached), func(t *testing.T) {
+			common.MemoryCacheEnabled = cached
+			model.InitProviderCache()
+			for _, path := range []string{"/v1/responses", "/v1/images/generations", "/v1/images/edits", "/v1/videos", "/v1/video/generations"} {
+				t.Run(path, func(t *testing.T) {
+					source := taskProtocolPluginSource(key, "1.0.0", `["requires-offering"]`, path, `throw new Error("decoder executed before Offering authorization");`)
+					_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+					require.NoError(t, err)
+					t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(key)) })
+					for _, valid := range []bool{false, true} {
+						t.Run(fmt.Sprintf("valid_body=%t", valid), func(t *testing.T) {
+							reads := &zstdBodyReadCounter{}
+							var body io.Reader = reads
+							if valid {
+								body = strings.NewReader(`{"model":"requires-offering","input":"private-request-body","prompt":"private-request-body"}`)
+							}
+							queries, downstream := 0, 0
+							const callback = "offering_required_no_selection"
+							require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) { queries++ }))
+							t.Cleanup(func() { db.Callback().Query().Remove(callback) })
+							engine := gin.New()
+							engine.POST(path, func(c *gin.Context) { common.SetContextKey(c, constant.ContextKeyUsingGroup, "default") }, RouteTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) { downstream++; c.Status(http.StatusNoContent) })
+							request := httptest.NewRequest(http.MethodPost, path, body)
+							request.Header.Set("Content-Type", "application/json")
+							request.Header.Set("Authorization", "Bearer private-client-credential")
+							response := httptest.NewRecorder()
+							engine.ServeHTTP(response, request)
+							assert.Equal(t, http.StatusNotFound, response.Code)
+							assert.Contains(t, response.Body.String(), `"code":"model_not_found"`)
+							assert.Zero(t, reads.reads.Load(), "missing Offering must reject before reading an invalid body")
+							assert.Zero(t, queries, "no legacy selector or Provider lookup")
+							assert.Zero(t, downstream, "neither reservation nor Provider execution may be reached")
+							for _, secret := range []string{provider.Key, "private-client-credential", "private-request-body", "decoder executed"} {
+								assert.NotContains(t, response.Body.String(), secret)
+							}
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 	require.NoError(t, appI18n.Init())
 	previousMaster := common.IsMasterNode
@@ -2067,7 +2194,12 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 		}
 	})
 	database := model.UseTestDatabases(t)
-	require.NoError(t, database.AutoMigrate(&model.Provider{}, &model.Ability{}, &model.Task{}))
+	require.NoError(t, database.AutoMigrate(&model.Provider{}, &model.Task{}, &model.Channel{}, &model.ModelOffering{}, &model.ModelOfferingMember{}))
+	require.NoError(t, model.MigratePricing(database))
+	require.NoError(t, database.Create(&model.User{Id: 7, Username: "selector-owner", Group: "default", Status: common.UserStatusEnabled, Role: common.RoleCommonUser, AffCode: "selector-owner"}).Error)
+	previousHealth, previousQuota := service.ChannelHealth, service.GatewayRouteQuota
+	service.ChannelHealth, service.GatewayRouteQuota = channelhealth.New(nil), service.NewGatewayRouteQuota(nil)
+	t.Cleanup(func() { service.ChannelHealth, service.GatewayRouteQuota = previousHealth, previousQuota })
 
 	for _, memoryCache := range []bool{false, true} {
 		t.Run(fmt.Sprintf("memory_cache=%t", memoryCache), func(t *testing.T) {
@@ -2110,7 +2242,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 				{name: "plugin multipart edits remain usable", path: "/v1/images/edits", multipart: true, pluginOnly: true, wantPlugin: true},
 				{name: "ordinary Responses bypass unsupported plugin mode", path: "/v1/responses", stream: true, syncOnly: true},
 				{name: "plugin Responses remain usable", path: "/v1/responses", pluginOnly: true, wantPlugin: true},
-				{name: "ordinary videos bypass plugin decoder", path: "/v1/videos", multipart: true, decoderRejects: true},
+				{name: "ordinary videos bypass plugin decoder", path: "/v1/videos", multipart: true, decoderRejects: true, wantStatus: http.StatusServiceUnavailable},
 				{name: "plugin videos remain usable", path: "/v1/videos", multipart: true, pluginOnly: true, wantPlugin: true},
 				{name: "selected plugin retains validation errors", pluginOnly: true, decoderRejects: true, wantStatus: http.StatusBadRequest},
 				{name: "selected plugin retains mode errors", path: "/v1/responses", pluginOnly: true, stream: true, syncOnly: true, wantStatus: http.StatusBadRequest},
@@ -2120,9 +2252,11 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 				{name: "rejected shared candidate still allows another plugin", pluginOnly: true, shared: true, decoderRejects: true, pluginPriority: 20, wantPlugin: true},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
-					for _, table := range []any{&model.Ability{}, &model.Provider{}, &model.Task{}} {
-						require.NoError(t, database.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(table).Error)
-					}
+					parentDB := model.DB
+					database := parentDB.Begin()
+					require.NoError(t, database.Error)
+					model.DB = database
+					t.Cleanup(func() { require.NoError(t, database.Rollback().Error); model.DB = parentDB })
 					key := "channel-route-test"
 					path := common.GetStringIfEmpty(tc.path, "/v1/images/generations")
 					modelName := common.GetStringIfEmpty(tc.model, "channel-route-model")
@@ -2191,9 +2325,59 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 						}
 						channels = append(channels, alternate)
 					}
-					for _, channel := range channels {
-						require.NoError(t, channel.Insert())
+					offering := &model.ModelOffering{Name: modelName, Visibility: "all", Groups: []string{}, RouteMethod: "cost", AcceptedConversionLosses: []string{}, Enabled: true}
+					for index, provider := range channels {
+						require.NoError(t, provider.Insert())
+						isTask := provider == plugin || provider.GetSetting().TaskPluginKey != ""
+						kind := protocol.OpenAIImages
+						if path == "/v1/responses" {
+							kind = protocol.OpenAIResponses
+						}
+						if path == "/v1/videos" {
+							// There is no native OpenAI video Channel protocol. This
+							// ordinary declaration must never authorize video I/O.
+							kind = protocol.OpenAIResponses
+						}
+						upstream := modelName
+						if isTask {
+							pluginKey := provider.GetSetting().TaskPluginKey
+							if tc.legacy {
+								pluginKey = key
+							}
+							kind = protocol.Type("task:" + pluginKey)
+							if tc.mapped {
+								upstream = "channel-route-model"
+							}
+						}
+						member := &model.Model{ModelName: fmt.Sprintf("offering-member-%d", index), Status: 1, Capabilities: capability.Set{InputModalities: []capability.Modality{capability.Text}, OutputModalities: []capability.Modality{capability.Text}}}
+						require.NoError(t, database.Create(member).Error)
+						channel := &model.Channel{ProviderID: provider.Id, ModelID: member.Id, Protocol: kind, UpstreamModelName: upstream, ParameterOverrides: "{}", Status: model.ChannelEnabled, MappingConfirmed: true, Weight: 1}
+						require.NoError(t, database.Create(channel).Error)
+						tier := 2
+						if isTask == (tc.pluginPriority > tc.ordinaryPriority+1) {
+							tier = 1
+						}
+						if provider != plugin && provider != ordinary {
+							tier = 3
+						}
+						if !(tc.wrongModel && provider == plugin) {
+							offering.Members = append(offering.Members, model.ModelOfferingMember{ModelID: member.Id, Tier: tier})
+						}
+						if tc.wrongGroup && provider == plugin {
+							offering.ChannelScope.ExcludeProviderIDs = append(offering.ChannelScope.ExcludeProviderIDs, provider.Id)
+						}
+						price := &model.PriceVersion{OwnerType: model.PriceOwnerChannel, OwnerID: channel.ID, ChannelID: &channel.ID, Currency: "USD", Expression: `tier("request", fixed(0.001))`, EffectiveAt: 1, CreatedBy: 7}
+						require.NoError(t, database.Create(price).Error)
 					}
+					if tc.pinOrdinary {
+						offering.ChannelScope.IncludeProviderIDs = []int{ordinary.Id}
+					}
+					if tc.pinPlugin {
+						offering.ChannelScope.IncludeProviderIDs = []int{plugin.Id}
+					}
+					require.NoError(t, database.Create(offering).Error)
+					sale := &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: offering.ID, OfferingID: &offering.ID, Currency: "USD", Expression: `tier("request", fixed(0.01))`, EffectiveAt: 1, CreatedBy: 7}
+					require.NoError(t, database.Create(sale).Error)
 					if tc.originPin {
 						require.NoError(t, database.Create(&model.Task{TaskID: "task-route-origin", UserId: 7, ChannelId: channels[len(channels)-1].Id, Platform: constant.TaskPlatform(key), Status: model.TaskStatusSuccess}).Error)
 					}
@@ -2217,14 +2401,55 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 					router.POST(path, func(c *gin.Context) {
 						common.SetContextKey(c, constant.ContextKeyUsingGroup, "route-test")
 						common.SetContextKey(c, constant.ContextKeyUserId, 7)
-						if tc.pinOrdinary || tc.pinPlugin {
-							id := ordinary.Id
-							if tc.pinPlugin {
-								id = plugin.Id
-							}
-							service.GetChannelConstraints(c).AddPin(dto.ProviderPin{ChannelId: id, Source: dto.PinSourceToken, Rank: dto.PinRankToken})
+						c.Set(textOfferingContextKey, offering)
+					}, RouteTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+						if _, claimed := c.Get(jsplugin.ContextKeyPinnedEndpoint); path == "/v1/videos" && !claimed {
+							storage, err := common.GetBodyStorage(c)
+							require.NoError(t, err)
+							preserved, err := storage.Bytes()
+							require.NoError(t, err)
+							assert.Equal(t, body, preserved)
+							assert.Empty(t, c.GetString("task_plugin_key"))
+							c.AbortWithStatus(http.StatusServiceUnavailable)
+							return
 						}
-					}, RouteTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), Distribute(), func(c *gin.Context) {
+						input := service.GatewayRouteInput{Sale: sale, Ratio: decimal.NewFromInt(1), StartedAt: time.Now()}
+						if tc.originPin {
+							input.PinnedProviderID = channels[len(channels)-1].Id
+						}
+						input.Prepare = func(selection *service.GatewaySelection) (*service.GatewayRouteFacts, error) {
+							key, isTask := strings.CutPrefix(string(selection.Channel.Protocol), "task:")
+							pinnedValue, claimed := c.Get(jsplugin.ContextKeyPinnedEndpoint)
+							if isTask != claimed {
+								return nil, service.ErrGatewayConversion
+							}
+							if claimed {
+								pinned := pinnedValue.(jsplugin.PinnedEndpoint)
+								if !slices.ContainsFunc(pinned.Candidates, func(binding jsplugin.ProtocolBinding) bool {
+									return binding.Plugin.Meta.Key == key && binding.Model == selection.Channel.UpstreamModelName
+								}) {
+									return nil, service.ErrGatewayConversion
+								}
+							}
+							return &service.GatewayRouteFacts{Usage: &kitdto.Usage{PromptTokens: 1, TotalTokens: 1}}, nil
+						}
+						selected, err := service.SelectGatewayRoute(c, offering, input)
+						require.NoError(t, err)
+						defer selected.Permit.Release(t.Context(), false)
+						defer service.ChannelHealth.Release(t.Context(), selected.Admission)
+						require.Nil(t, SetupContextForGatewayCandidate(c, selected.Provider, modelName))
+						c.Set("canonical_selected", selected)
+						if tc.retry {
+							input.Failures = &service.GatewayExclusions{Channels: map[int]bool{selected.Channel.ID: true}, Providers: map[int]bool{}}
+							next, err := service.SelectGatewayRoute(c, offering, input)
+							require.NoError(t, err)
+							assert.Equal(t, channels[len(channels)-1].Id, next.Provider.Id)
+							assert.Equal(t, selected.Channel.Protocol, next.Channel.Protocol, "retry must retain its selected protocol")
+							require.NoError(t, next.Permit.Release(t.Context(), false))
+							require.NoError(t, service.ChannelHealth.Release(t.Context(), next.Admission))
+						}
+						c.Next()
+					}, func(c *gin.Context) {
 						reached = true
 						_, pinned := c.Get(jsplugin.ContextKeyPinnedEndpoint)
 						assert.Equal(t, tc.wantPlugin, pinned)
@@ -2260,12 +2485,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 						}
 						assert.Equal(t, expected.Id, common.GetContextKeyInt(c, constant.ContextKeyChannelId))
 						assert.Equal(t, expected.Key, common.GetContextKeyString(c, constant.ContextKeyChannelKey))
-						if tc.retry {
-							next, _, err := service.CacheGetRandomSatisfiedChannel(&service.RetryParam{Ctx: c, TokenGroup: "route-test", ModelName: modelName, Retry: common.GetPointer(1)})
-							require.NoError(t, err)
-							require.NotNil(t, next)
-							assert.Equal(t, channels[len(channels)-1].Id, next.Id)
-						}
+
 						c.Status(http.StatusNoContent)
 					})
 					request := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
@@ -2314,6 +2534,11 @@ export function parseTaskResult() { return {status: "SUCCESS"}; }
 // plugin router does, each pinned to its candidates, for caller 7.
 func sharedTaskPluginRouteRouter(t *testing.T, plugins ...*jsplugin.LoadedPlugin) *gin.Engine {
 	t.Helper()
+	return sharedTaskPluginRouteRouterWithOfferings(t, nil, plugins...)
+}
+
+func sharedTaskPluginRouteRouterWithOfferings(t *testing.T, offerings map[string]*model.ModelOffering, plugins ...*jsplugin.LoadedPlugin) *gin.Engine {
+	t.Helper()
 	registry := jsplugin.NewRegistry()
 	require.NoError(t, registry.ReplaceOverrides(plugins))
 	generation := registry.Generation()
@@ -2322,6 +2547,13 @@ func sharedTaskPluginRouteRouter(t *testing.T, plugins ...*jsplugin.LoadedPlugin
 		router.Handle(group.Method, group.GinPath, func(c *gin.Context) {
 			c.Set(jsplugin.ContextKeyPinnedRoute, jsplugin.PinnedRoute{Generation: generation, Plugin: group.Bindings[0].Plugin, Route: group.Bindings[0].Route, Candidates: group.Bindings})
 			c.Set("id", 7)
+			if offerings != nil {
+				var body map[string]any
+				require.NoError(t, common.UnmarshalBodyReusable(c, &body))
+				name, _ := body["model"].(string)
+				require.NotNil(t, offerings[name], "test request must name an authorized Offering")
+				c.Set(textOfferingContextKey, offerings[name])
+			}
 			c.Next()
 		}, PrepareTaskPluginRoute(), func(c *gin.Context) {
 			pinned := c.MustGet(jsplugin.ContextKeyPinnedRoute).(jsplugin.PinnedRoute)
@@ -2382,18 +2614,84 @@ func TestPrepareTaskPluginRouteDecodesEverySharedSubmitCandidate(t *testing.T) {
 // A case variant or a channel alias of a declared model is matched on a
 // native path as on the host protocols: the task takes the declared spelling
 // or keeps the alias, and a rejection names the client's model.
+func TestPrepareTaskPluginRouteValidatesOriginalDecoderModel(t *testing.T) {
+	for _, tc := range []struct {
+		name, field string
+		accepted    bool
+	}{
+		{"upstream", `model:"scoped-model",`, true},
+		{"offering_alias", `model:"gateway-alias",`, true},
+		{"case_variant", `model:"SCOPED-MODEL",`, true},
+		{"missing", ``, false},
+		{"number", `model:17,`, false},
+		{"empty", `model:"",`, false},
+		{"foreign", `model:"private-other-model",`, false},
+		{"other_declared_model", `model:"other-model",`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupTaskPluginRouteDB(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.Provider{}, &model.Vendor{}, &model.Model{}, &model.Channel{}))
+			provider := &model.Provider{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: "original-test-key", Models: "gateway-alias", ModelMapping: common.GetPointer(`{"gateway-alias":"private-other-model"}`)}
+			require.NoError(t, model.DB.Create(provider).Error)
+			member := &model.Model{ModelName: "scoped-model", Status: 1}
+			require.NoError(t, model.DB.Create(member).Error)
+			require.NoError(t, model.DB.Create(&model.Channel{ProviderID: provider.Id, ModelID: member.Id, Protocol: "task:decoder-proof", UpstreamModelName: "scoped-model", Status: model.ChannelEnabled, MappingConfirmed: true, ParameterOverrides: `{}`}).Error)
+			offering := &model.ModelOffering{ID: 7, Name: "gateway-alias", Members: []model.ModelOfferingMember{{ModelID: member.Id, Tier: 1}}}
+			plugin := compileTaskRoutePlugin(t, fmt.Sprintf(`
+export const meta = {apiVersion:1,key:"decoder-proof",name:"Decoder proof",version:"1.0.0",author:{name:"Test"},models:["scoped-model","other-model"],fetchMode:"per_task",routes:[{method:"POST",path:"/probe/jobs",type:"submit",decode:"decode",render:"render"}]};
+export const native = {decode(ctx) {return {kind:"submit",%s requestBody:{marker:"preserved"}}},render(ctx,task){return task}};
+export function buildSubmitRequest(){return {url:"https://example.com"}};
+export function parseSubmitResponse(){return {taskId:"one"}};
+export function buildQueryRequest(){return {url:"https://example.com"}};
+export function parseTaskResult(){return {status:"SUCCESS"}};
+`, tc.field))
+			reached := false
+			router := gin.New()
+			router.POST("/probe/jobs", func(c *gin.Context) { c.Set(textOfferingContextKey, offering); c.Next() }, pinTaskPluginRoute(plugin, 0), PrepareTaskPluginRoute(), func(c *gin.Context) {
+				reached = true
+				assert.Equal(t, "gateway-alias", c.GetString("resolved_task_model"))
+				assert.Equal(t, map[string]any{"marker": "preserved"}, c.MustGet("task_request"))
+				c.Status(http.StatusNoContent)
+			})
+			response := performSharedRouteRequest(router, http.MethodPost, "/probe/jobs", `{"model":"gateway-alias","unknown":{"keep":false}}`)
+			status := http.StatusBadRequest
+			if tc.accepted {
+				status = http.StatusNoContent
+			}
+			assert.Equal(t, status, response.Code, response.Body.String())
+			assert.Equal(t, tc.accepted, reached)
+		})
+	}
+}
+
 func TestPrepareTaskPluginRouteMatchesChannelAliases(t *testing.T) {
 	setupTaskPluginRouteDB(t)
-	require.NoError(t, model.DB.AutoMigrate(&model.Provider{}))
-	require.NoError(t, model.DB.Create(&model.Provider{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: "key",
-		Models:       "scoped-alias,outside-alias,shared-alias",
-		ModelMapping: common.GetPointer(`{"scoped-alias":"scoped-model","outside-alias":"other-model","shared-alias":"shared-model"}`)}).Error)
-	// Replace any cached alias view, so the routes' generation builds its own
-	// from this channel.
-	model.InitProviderCache()
-	t.Cleanup(model.InitProviderCache)
+	require.NoError(t, model.DB.AutoMigrate(&model.Provider{}, &model.Vendor{}, &model.Model{}, &model.Channel{}, &model.ModelOffering{}, &model.ModelOfferingMember{}))
+	provider := &model.Provider{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: "key", Models: "scoped-alias,shared-alias", ModelMapping: common.GetPointer(`{"scoped-alias":"foreign-model","shared-alias":"foreign-model"}`)}
+	require.NoError(t, model.DB.Create(provider).Error)
+	offerings := map[string]*model.ModelOffering{}
+	for _, entry := range []struct {
+		names    []string
+		declared string
+		plugins  []string
+	}{
+		{[]string{"scoped-alias", "scoped-model", "SCOPED-MODEL"}, "scoped-model", []string{"alias-scoped"}},
+		{[]string{"outside-alias", "other-model"}, "other-model", []string{"alias-scoped"}},
+		{[]string{"shared-alias", "shared-model", "Shared-Model"}, "shared-model", []string{"alias-a", "alias-b"}},
+	} {
+		member := &model.Model{ModelName: entry.declared, Status: 1}
+		require.NoError(t, model.DB.Create(member).Error)
+		for _, key := range entry.plugins {
+			require.NoError(t, model.DB.Create(&model.Channel{ProviderID: provider.Id, ModelID: member.Id, Protocol: protocol.Type("task:" + key), UpstreamModelName: entry.declared, Status: model.ChannelEnabled, MappingConfirmed: true, ParameterOverrides: `{}`}).Error)
+		}
+		offering := &model.ModelOffering{Name: entry.names[0], Visibility: "all", Groups: []string{}, RouteMethod: "cost", AcceptedConversionLosses: []string{}, Enabled: true, Members: []model.ModelOfferingMember{{ModelID: member.Id, Tier: 1}}}
+		require.NoError(t, model.DB.Create(offering).Error)
+		for _, name := range entry.names {
+			offerings[name] = offering
+		}
+	}
 	shared := `[{method: "POST", path: "/probe/v1/shared", type: "submit", decode: "createJob", render: "jobStatus"}]`
-	router := sharedTaskPluginRouteRouter(t,
+	router := sharedTaskPluginRouteRouterWithOfferings(t, offerings,
 		compileTaskRoutePlugin(t, sharedRouteTestPluginSource("alias-scoped", `["scoped-model", "other-model"]`, `[
 			{method: "POST", path: "/probe/v1/scoped", type: "submit", decode: "createJob", render: "jobStatus", models: ["scoped-model"]},
 			{method: "POST", path: "/probe/v1/single", type: "submit", decode: "createJob", render: "jobStatus"}]`, "")),
@@ -2414,21 +2712,23 @@ func TestPrepareTaskPluginRouteMatchesChannelAliases(t *testing.T) {
 		{name: "alias on a route with models", path: "/probe/v1/scoped", model: "scoped-alias", status: http.StatusAccepted,
 			want: result{Plugin: "alias-scoped", Candidates: []string{"alias-scoped"}, Model: "scoped-alias"}},
 		{name: "case variant on a route with models", path: "/probe/v1/scoped", model: "SCOPED-MODEL", status: http.StatusAccepted,
-			want: result{Plugin: "alias-scoped", Candidates: []string{"alias-scoped"}, Model: "scoped-model"}},
+			want: result{Plugin: "alias-scoped", Candidates: []string{"alias-scoped"}, Model: "SCOPED-MODEL"}},
 		{name: "alias on a route without models", path: "/probe/v1/single", model: "scoped-alias", status: http.StatusAccepted,
 			want: result{Plugin: "alias-scoped", Candidates: []string{"alias-scoped"}, Model: "scoped-alias"}},
 		{name: "alias on a shared path", path: "/probe/v1/shared", model: "shared-alias", status: http.StatusAccepted,
 			want: result{Plugin: "alias-a", Candidates: []string{"alias-a", "alias-b"}, Model: "shared-alias"}},
 		{name: "case variant on a shared path", path: "/probe/v1/shared", model: "Shared-Model", status: http.StatusAccepted,
-			want: result{Plugin: "alias-a", Candidates: []string{"alias-a", "alias-b"}, Model: "shared-model"}},
+			want: result{Plugin: "alias-a", Candidates: []string{"alias-a", "alias-b"}, Model: "Shared-Model"}},
 		{name: "alias of a model outside the route models", path: "/probe/v1/scoped", model: "outside-alias", status: http.StatusBadRequest,
 			want: result{Message: `model "outside-alias" is not allowed on this route`}},
 		{name: "declared model outside the route models", path: "/probe/v1/scoped", model: "other-model", status: http.StatusBadRequest,
 			want: result{Message: `model "other-model" is not allowed on this route`}},
-		{name: "alias of another plugin's model", path: "/probe/v1/single", model: "shared-alias", status: http.StatusBadRequest,
-			want: result{Message: `model "shared-alias" is not served by this plugin`}},
-		{name: "case variant of another plugin's model", path: "/probe/v1/single", model: "Shared-Model", status: http.StatusBadRequest,
-			want: result{Message: `model "Shared-Model" is not served by this plugin`}},
+		// An authorized Offering with no Channel for this plugin path is
+		// unavailable, without disclosing another plugin's private catalog.
+		{name: "alias of another plugin's model", path: "/probe/v1/single", model: "shared-alias", status: http.StatusServiceUnavailable,
+			want: result{Message: "Task request failed"}},
+		{name: "case variant of another plugin's model", path: "/probe/v1/single", model: "Shared-Model", status: http.StatusServiceUnavailable,
+			want: result{Message: "Task request failed"}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			recorder := performSharedRouteRequest(router, http.MethodPost, testCase.path, fmt.Sprintf(`{"model":%q}`, testCase.model))

@@ -57,11 +57,10 @@ import { StatusBadge, type StatusBadgeProps } from '@/components/status-badge'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { DynamicPricingBreakdown } from '@/features/pricing/components/dynamic-pricing-breakdown'
-import { usePricingData } from '@/features/pricing/hooks/use-pricing-data'
 import { BILLING_PRICING_VARS } from '@/features/pricing/lib/billing-expr'
-import { pluginUsageSchema } from '@/features/pricing/lib/plugin-pricing'
 import { PolicyDecisionRecord } from '@/features/system-settings/request-policies/decision-record'
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
+import { toIntlLocale } from '@/i18n/languages'
 import { formatBillingCurrencyFromUSD } from '@/lib/currency'
 import { formatLogQuota, formatTokens, formatUseTime } from '@/lib/format'
 import { translateServerText } from '@/lib/server-error-message'
@@ -93,6 +92,7 @@ import {
 import { USAGE_BILLING_PATH, type LogOtherData } from '../../types'
 import { ResponseModelDetails } from '../model-badge'
 import { PluginAuthorLink } from '../plugin-author-link'
+import { QuotaSaturationFacts } from '../quota-saturation-facts'
 import { DetailRow, DetailSection } from './log-detail-layout'
 
 // Maps a channel-update changed-field token (as recorded by the backend audit)
@@ -154,15 +154,6 @@ function isUsageBillingPathLocal(
     return adminInfo.usage_billing_path === USAGE_BILLING_PATH.LOCAL
   }
   return adminInfo?.local_count_tokens === true
-}
-
-function quotaSaturationKindLabel(
-  kind: 'overflow' | 'underflow' | 'nan',
-  t: (key: string) => string
-): string {
-  if (kind === 'overflow') return t('Overflow')
-  if (kind === 'underflow') return t('Underflow')
-  return t('Invalid (NaN)')
 }
 
 function BillingBreakdown(props: {
@@ -518,7 +509,8 @@ interface DetailsDialogProps {
 }
 
 export function DetailsDialog(props: DetailsDialogProps) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const { copiedText, copyToClipboard } = useCopyToClipboard({ notify: false })
   const other = parseLogOther(props.log.other)
   const typeConfig = getLogTypeConfig(props.log.type)
@@ -534,13 +526,7 @@ export function DetailsDialog(props: DetailsDialogProps) {
     !isViolation &&
     other?.billing_mode === 'tiered_expr' &&
     !!other?.expr_b64
-  const pricingData = usePricingData(props.open && isTieredBilling)
-  const billingUsageSchema = pluginUsageSchema(
-    pricingData.models.find(
-      (model) => model.model_name === props.log.model_name
-    ),
-    other?.admin_info?.task_plugin?.key
-  )
+  const billingUsageSchema = other?.billing_usage_schema
   const hasAudioTokens = other?.ws || other?.audio
   const showTiming = isTimingLogType(props.log.type)
   const showAdminIp =
@@ -607,7 +593,7 @@ export function DetailsDialog(props: DetailsDialogProps) {
         t
       )
     : null
-  const operationText = renderAuditContent(other, t)
+  const operationText = renderAuditContent(other, t, locale)
   const details =
     (isTopup ? operationText : null) ??
     renderLogContent(other, t) ??
@@ -850,37 +836,9 @@ export function DetailsDialog(props: DetailsDialogProps) {
           </DetailSection>
         ) : null}
         {props.isAdmin && other?.admin_info?.quota_saturation && (
-          <DetailSection
-            icon={<AlertTriangle className='size-3.5' aria-hidden='true' />}
-            label={t('Quota clamped')}
-            variant='danger'
-          >
-            <p className='mb-1 text-xs wrap-break-word'>
-              {t('Quota saturation protection triggered')}
-            </p>
-            <DetailRow
-              label={t('Kind')}
-              value={quotaSaturationKindLabel(
-                other.admin_info.quota_saturation.kind,
-                t
-              )}
-            />
-            <DetailRow
-              label={t('Original value')}
-              value={String(other.admin_info.quota_saturation.original)}
-              mono
-            />
-            <DetailRow
-              label={t('Clamped to')}
-              value={String(other.admin_info.quota_saturation.clamped)}
-              mono
-            />
-            <DetailRow
-              label={t('Operation')}
-              value={other.admin_info.quota_saturation.op}
-              mono
-            />
-          </DetailSection>
+          <QuotaSaturationFacts
+            saturation={other.admin_info.quota_saturation}
+          />
         )}
 
         {/* Reject reason (admin only) */}

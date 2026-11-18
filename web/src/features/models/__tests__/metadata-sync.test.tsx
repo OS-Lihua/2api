@@ -24,6 +24,9 @@ import { describe, expect, it, vi } from 'vitest'
 import { api } from '@/lib/api'
 
 import { SyncWizardDialog } from '../components/dialogs/sync-wizard-dialog'
+import { ModelsDialogs } from '../components/models-dialogs'
+import { ModelsPrimaryButtons } from '../components/models-primary-buttons'
+import { ModelsProvider } from '../components/models-provider'
 import type { MetadataSyncCandidate, MetadataSyncPreview } from '../types'
 
 const preview: MetadataSyncPreview = {
@@ -63,9 +66,24 @@ const preview: MetadataSyncPreview = {
 }
 
 describe('metadata sync preview', () => {
-  it('shows additions and field effects and writes only after explicit confirmation', async () => {
-    vi.spyOn(api, 'get').mockResolvedValue({
-      data: { success: true, data: preview },
+  it('opens metadata sync directly, separates real site Models from upstream additions and writes only after explicit confirmation', async () => {
+    const get = vi.spyOn(api, 'get').mockImplementation(async (url) => {
+      if (!String(url).startsWith('/api/models/sync_upstream/preview')) {
+        throw new Error(`Unexpected request: ${url}`)
+      }
+      return {
+        data: {
+          success: true,
+          data: {
+            ...preview,
+            candidates: preview.candidates.map((item) =>
+              item.model_name === 'new-model'
+                ? { ...item, scope: 'catalog' as const }
+                : item
+            ),
+          },
+        },
+      }
     })
     const post = vi.spyOn(api, 'post').mockResolvedValue({
       data: {
@@ -87,18 +105,33 @@ describe('metadata sync preview', () => {
     })
     render(
       <QueryClientProvider client={client}>
-        <SyncWizardDialog open onOpenChange={() => {}} />
+        <ModelsProvider>
+          <ModelsPrimaryButtons />
+          <ModelsDialogs />
+        </ModelsProvider>
       </QueryClientProvider>
     )
     const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: 'Sync metadata' }))
     await user.click(
       screen.getByRole('button', { name: 'Load metadata preview' })
     )
+    expect(
+      await screen.findByRole('checkbox', { name: 'Select existing-model' })
+    ).toBeVisible()
+    expect(
+      screen.queryByRole('checkbox', { name: 'Select new-model' })
+    ).not.toBeInTheDocument()
+    await user.click(screen.getByRole('combobox', { name: 'Sync scope' }))
     await user.click(
-      await screen.findByRole('checkbox', { name: 'Select new-model' })
+      screen.getByRole('option', { name: 'Upstream model list' })
     )
+    await user.click(screen.getByRole('checkbox', { name: 'Select new-model' }))
     await user.click(
       screen.getByRole('checkbox', { name: 'Select existing-model' })
+    )
+    expect(get.mock.calls.some(([url]) => url === '/api/models/missing')).toBe(
+      false
     )
     expect(
       screen.queryByRole('checkbox', { name: 'Select protected-model' })
@@ -112,13 +145,13 @@ describe('metadata sync preview', () => {
       name: 'Apply Description for existing-model',
     })
     const status = screen.getByRole('checkbox', {
-      name: 'Apply Model square visibility for existing-model',
+      name: 'Apply Metadata status for existing-model',
     })
     expect(description).not.toBeChecked()
     expect(status).not.toBeChecked()
     expect(
       screen.getByText(
-        'Changes visibility in the model square. Channel status and existing API access are unchanged.'
+        'Metadata status does not change Offering visibility or API authorization.'
       )
     ).toBeInTheDocument()
     await user.click(description)
@@ -347,7 +380,7 @@ describe('metadata sync preview', () => {
       name: 'Apply Description for existing-model',
     })
     const status = screen.getByRole('checkbox', {
-      name: 'Apply Model square visibility for existing-model',
+      name: 'Apply Metadata status for existing-model',
     })
     const icon = screen.getByRole('checkbox', {
       name: 'Apply Icon for catalog-model',
@@ -548,7 +581,7 @@ describe('metadata sync preview', () => {
     ).toBeChecked()
     expect(
       screen.getByRole('checkbox', {
-        name: 'Apply Model square visibility for existing-model',
+        name: 'Apply Metadata status for existing-model',
       })
     ).not.toBeChecked()
     await user.click(screen.getByRole('button', { name: 'Back' }))

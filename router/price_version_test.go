@@ -17,6 +17,114 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestSaleCatalogHTTP(t *testing.T) {
+	engine, actor, token := newAdminTestServer(t)
+	db := model.DB
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.ModelOffering{}, &model.ModelOfferingMember{}, &model.ModelOfferingName{}))
+	require.NoError(t, model.MigratePricing(db))
+	fake := clock.UseFake(t, time.Now().Truncate(time.Second))
+	now := clock.Now().Unix()
+	member := model.Model{ModelName: "catalog-member", Description: "Member metadata", Status: 1}
+	require.NoError(t, member.Insert())
+	create := func(name, visibility string, groups []string, enabled bool) model.ModelOffering {
+		offering := model.ModelOffering{Name: name, Aliases: []string{name + "-alias"}, Visibility: visibility, Groups: groups, Members: []model.ModelOfferingMember{{ModelID: member.Id, Tier: 1}}}
+		require.NoError(t, model.SaveModelOffering(t.Context(), &offering, "save"))
+		require.NoError(t, db.Model(&offering).Update("enabled", enabled).Error)
+		return offering
+	}
+	all := create("catalog-all", "all", []string{}, true)
+	group := create("catalog-group", "groups", []string{"vip"}, true)
+	create("catalog-disabled", "all", []string{}, false)
+	missing := create("catalog-missing", "all", []string{}, true)
+	free := create("catalog-free", "all", []string{}, true)
+	expression := `tier("standard", p * 0.100000000000000001 + c * 2)`
+	for _, version := range []model.PriceVersion{
+		{OwnerType: model.PriceOwnerOffering, OwnerID: all.ID, Currency: "EUR", Expression: expression, EffectiveAt: now - 1, CreatedBy: actor.Id, CreatedAt: now},
+		{OwnerType: model.PriceOwnerOffering, OwnerID: all.ID, Currency: "JPY", Expression: `tier("future", fixed(99))`, EffectiveAt: now + 10, CreatedBy: actor.Id, CreatedAt: now},
+		{OwnerType: model.PriceOwnerOffering, OwnerID: group.ID, Currency: "USD", Expression: `tier("group", fixed(1))`, EffectiveAt: now - 1, CreatedBy: actor.Id, CreatedAt: now},
+		{OwnerType: model.PriceOwnerOffering, OwnerID: free.ID, Currency: "USD", Expression: `tier("free", fixed(0))`, EffectiveAt: now - 1, CreatedBy: actor.Id, CreatedAt: now},
+		{OwnerType: model.PriceOwnerOffering, OwnerID: missing.ID, Currency: "USD", Expression: `tier("future", fixed(1))`, EffectiveAt: now + 100, CreatedBy: actor.Id, CreatedAt: now},
+	} {
+		ownerID := version.OwnerID
+		version.OfferingID = &ownerID
+		require.NoError(t, db.Create(&version).Error)
+	}
+	anonymous := adminSecurityRequest(engine, "", "GET", "/api/pricing", "")
+	require.Equal(t, 401, anonymous.Code, anonymous.Body.String())
+	catalog := func() map[string]map[string]any {
+		response := adminSecurityRequest(engine, token, "GET", "/api/pricing?group=vip&at=999999999999", "")
+		require.Equal(t, 200, response.Code, response.Body.String())
+		assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+		var body struct {
+			Success bool             `json:"success"`
+			Data    []map[string]any `json:"data"`
+			AsOf    int64            `json:"as_of"`
+		}
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+		require.True(t, body.Success)
+		assert.Equal(t, clock.Now().Unix(), body.AsOf)
+		for _, private := range []string{"channel_scope", "minimum_margin_rate", "allow_loss_fallback", "created_by", "group_ratio", "model_ratio", "usable_group", "route_method", "accepted_conversion_losses"} {
+			assert.NotContains(t, response.Body.String(), `"`+private+`"`)
+		}
+		items := map[string]map[string]any{}
+		for _, item := range body.Data {
+			items[item["name"].(string)] = item
+		}
+		return items
+	}
+	items := catalog()
+	require.Len(t, items, 3)
+	assert.NotContains(t, items, group.Name)
+	assert.NotContains(t, items, "catalog-disabled")
+	assert.Equal(t, []any{all.Name + "-alias"}, items[all.Name]["aliases"])
+	assert.Nil(t, items[missing.Name]["price"], "absence must not become free")
+	assert.Equal(t, `tier("free", fixed(0))`, items[free.Name]["price"].(map[string]any)["expression"])
+	price := items[all.Name]["price"].(map[string]any)
+	assert.Equal(t, "EUR", price["currency"])
+	assert.Equal(t, expression, price["expression"])
+	memberItem := items[all.Name]["members"].([]any)[0].(map[string]any)
+	assert.EqualValues(t, 1, memberItem["tier"])
+	assert.Equal(t, member.ModelName, memberItem["name"])
+	require.NoError(t, db.Model(actor).Update("group", "vip").Error)
+	assert.Contains(t, catalog(), group.Name, "visibility must read the live database group")
+	require.NoError(t, db.Model(actor).Update("group", "default").Error)
+	assert.NotContains(t, catalog(), group.Name)
+	fake.Advance(10 * time.Second)
+	assert.Equal(t, "JPY", catalog()[all.Name]["price"].(map[string]any)["currency"])
+	t.Run("root cannot restore live model-name or float pricing writes", func(t *testing.T) {
+		require.NoError(t, db.Model(actor).Update("role", common.RoleRootUser).Error)
+		rootToken := createWalletTestAccessToken(t, actor.Id, "option:read", "option:write", "model:write")
+		for _, route := range []struct{ method, path, body string }{
+			{"GET", "/api/ratio_config", ""},
+			{"GET", "/api/option/model_pricing", ""},
+			{"GET", "/api/option/model_pricing/issues", ""},
+			{"PATCH", "/api/option/model_pricing", `{"changes":[]}`},
+			{"POST", "/api/option/model_pricing/convert", `{}`},
+			{"POST", "/api/option/model_pricing/preview", `{}`},
+			{"POST", "/api/option/rest_model_ratio", `{}`},
+			{"GET", "/api/ratio_sync/channels", ""},
+			{"POST", "/api/ratio_sync/fetch", `{}`},
+			{"DELETE", fmt.Sprintf("/api/models/%d?remove_pricing=true", member.Id), ""},
+			{"POST", "/api/models/delete", fmt.Sprintf(`{"model_ids":[%d],"remove_pricing":true}`, member.Id)},
+		} {
+			response := adminSecurityRequest(engine, rootToken, route.method, route.path, route.body)
+			assert.Equal(t, 410, response.Code, route.method+" "+route.path+": "+response.Body.String())
+		}
+		for _, key := range []string{"ModelRatio", "ModelPrice", "billing_setting.billing_expr", "GroupRatio", "GroupGroupRatio", "AutoGroups", "DefaultUseAutoGroup", "ExposeRatioEnabled"} {
+			body, err := common.Marshal(map[string]string{"key": key, "value": `{}`})
+			require.NoError(t, err)
+			response := adminSecurityRequest(engine, rootToken, "PUT", "/api/option/", string(body))
+			assert.Equal(t, 410, response.Code, key+": "+response.Body.String())
+		}
+		var count int64
+		require.NoError(t, db.Model(&model.Model{}).Where("id = ?", member.Id).Count(&count).Error)
+		assert.EqualValues(t, 1, count, "retired remove_pricing must not delete metadata")
+	})
+	require.NoError(t, db.Model(actor).Update("status", common.UserStatusDisabled).Error)
+	response := adminSecurityRequest(engine, token, "GET", "/api/pricing", "")
+	assert.NotEqual(t, 200, response.Code, "a disabled user cannot read the catalog")
+}
+
 func TestPriceVersionManagementHTTP(t *testing.T) {
 	engine, actor, token := newAdminTestServer(t)
 	db := model.DB

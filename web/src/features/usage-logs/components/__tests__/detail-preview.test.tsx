@@ -29,6 +29,7 @@ import { afterAll, afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import en from '@/i18n/locales/en.json'
 import zh from '@/i18n/locales/zh.json'
+import { api } from '@/lib/api'
 import {
   DEFAULT_CURRENCY_CONFIG,
   useSystemConfigStore,
@@ -379,24 +380,18 @@ test.each([
 ])(
   'task expression $tier shows its recorded unit price',
   ({ expression, tier, expected }) => {
-    client.setQueryData(['pricing'], {
-      data: [
-        {
-          model_name: 'wan2.5-i2v-preview',
-          billing_expr: 'tier("current", u("clips") * 99)',
-          billing_usage_schema: {
-            clips: { type: 'number', unit: 'count' },
-            seconds: { type: 'number', unit: 'second' },
-            tokens: { type: 'number', unit: 'token' },
-            units: { type: 'number', unit: 'credit' },
-            mode: { enum: ['pro', 'std'] },
-          },
-        },
-      ],
-      vendors: [],
-    })
+    const billingUsageSchema: NonNullable<
+      LogOtherData['billing_usage_schema']
+    > = {
+      clips: { type: 'number', unit: 'count' },
+      seconds: { type: 'number', unit: 'second' },
+      tokens: { type: 'number', unit: 'token' },
+      units: { type: 'number', unit: 'credit' },
+      mode: { enum: ['pro', 'std'] },
+    }
     const preview = renderPreview({
       is_task: true,
+      billing_usage_schema: billingUsageSchema,
       billing_mode: 'tiered_expr',
       expr_b64: Buffer.from(expression).toString('base64'),
       matched_tier: tier,
@@ -407,24 +402,16 @@ test.each([
   }
 )
 
-test('task log prices use localized unit labels from pricing metadata', async () => {
-  client.setQueryData(['pricing'], {
-    data: [
-      {
-        model_name: 'wan2.5-i2v-preview',
-        billing_usage_schema: {
-          images: {
-            type: 'number',
-            unit: 'count',
-            unitLabel: { en: 'image', zh: '张' },
-          },
-        },
-      },
-    ],
-    vendors: [],
-  })
+test('task log prices use localized unit labels from the accepted snapshot', async () => {
   const preview = renderPreview({
     is_task: true,
+    billing_usage_schema: {
+      images: {
+        type: 'number',
+        unit: 'count',
+        unitLabel: { en: 'image', zh: '张' },
+      },
+    },
     billing_mode: 'tiered_expr',
     expr_b64: btoa('tier("images", u("images") * 0.25)'),
     matched_tier: 'images',
@@ -436,7 +423,7 @@ test('task log prices use localized unit labels from pricing metadata', async ()
   ).toHaveTextContent('images · images $0.25/张')
 })
 
-test('task log prices select the executing provider’s schema', () => {
+test('task log prices retain the executing provider snapshot despite current catalog changes', () => {
   client.setQueryData(['pricing'], {
     data: [
       {
@@ -462,6 +449,9 @@ test('task log prices select the executing provider’s schema', () => {
   })
   const preview = renderPreview({
     is_task: true,
+    billing_usage_schema: {
+      images: { type: 'number', unit: 'count', unitLabel: { en: 'image' } },
+    },
     billing_mode: 'tiered_expr',
     expr_b64: btoa('tier("images", u("images") * 0.25)'),
     matched_tier: 'images',
@@ -492,6 +482,10 @@ test.each(['missing schema', 'unsupported expression', 'unknown tier'])(
         : 'tier("music", u("clips") * 0.25)'
     const preview = renderPreview({
       is_task: true,
+      billing_usage_schema:
+        scenario === 'missing schema'
+          ? undefined
+          : { clips: { type: 'number', unit: 'count' } },
       billing_mode: 'tiered_expr',
       expr_b64: Buffer.from(expression).toString('base64'),
       matched_tier: scenario === 'unknown tier' ? 'old' : 'music',
@@ -501,3 +495,27 @@ test.each(['missing schema', 'unsupported expression', 'unknown tier'])(
     )
   }
 )
+
+test('a historical task without a schema ignores current catalog metadata and never fetches pricing', async () => {
+  const get = vi.spyOn(api, 'get')
+  client.setQueryData(['pricing'], {
+    data: [
+      {
+        model_name: 'wan2.5-i2v-preview',
+        billing_usage_schema: { clips: { type: 'number', unit: 'count' } },
+      },
+    ],
+    vendors: [],
+  })
+  const preview = renderPreview({
+    is_task: true,
+    billing_mode: 'tiered_expr',
+    expr_b64: btoa('tier("old", u("clips") * 0.25)'),
+    matched_tier: 'old',
+  })
+  expect(preview).toHaveTextContent('Dynamic Pricing · old')
+  fireEvent.click(preview)
+  const dialog = within(await screen.findByRole('dialog'))
+  expect(dialog.getByText('tier("old", u("clips") * 0.25)')).toBeVisible()
+  expect(get.mock.calls.some(([url]) => url === '/api/pricing')).toBe(false)
+})

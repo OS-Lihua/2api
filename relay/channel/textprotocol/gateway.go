@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
@@ -90,11 +91,15 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	facts := info.ResponseFacts
 	var sourceOutput gatewayGeneratedOutput
 	sourceTokens := 0
+	compact := info.RelayMode == relayconstant.RelayModeResponsesCompact
+	completion := info.RelayMode == relayconstant.RelayModeCompletions
+	opaqueOutput := false
 	root := gjson.ParseBytes(body)
 	switch p.format {
 	case types.RelayFormatOpenAIResponses:
 		for index, item := range root.Get("output").Array() {
 			sourceOutput.ObserveItem(int64(index), item)
+			opaqueOutput = opaqueOutput || compact && item.Get("type").String() == "compaction" && relaycommon.SourceText(item.Get("encrypted_content")) != ""
 		}
 	case types.RelayFormatClaude:
 		for _, block := range root.Get("content").Array() {
@@ -111,6 +116,11 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	case types.RelayFormatOpenAI:
 		for _, choice := range root.Get("choices").Array() {
 			start := sourceOutput.text.Len()
+			if completion {
+				sourceOutput.text.WriteString(relaycommon.SourceText(choice.Get("text")))
+				sourceTokens += tokenkit.Count(info.TokenizerModelName(), sourceOutput.text.String()[start:])
+				continue
+			}
 			message := choice.Get("message")
 			content := message.Get("content")
 			if content.Type == gjson.String {
@@ -138,7 +148,11 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 		sourceTokens = tokenkit.Count(info.TokenizerModelName(), facts.SourceGeneratedText)
 	}
 	facts.SourceOutputTokens = &sourceTokens
-	facts.SourceOutputObserved = facts.SourceGeneratedText != "" || gatewayMediaOutput(body, p.format)
+	if opaqueOutput {
+		// Ciphertext cannot establish an output token estimate.
+		facts.SourceOutputTokens = nil
+	}
+	facts.SourceOutputObserved = opaqueOutput || facts.SourceGeneratedText != "" || gatewayMediaOutput(body, p.format)
 	observeGatewaySafety(info, body, p.format)
 	meter := gatewayUsageAccumulator{format: p.format, context: c}
 	usage, err := meter.Observe(body)
@@ -175,6 +189,34 @@ func (p *Handler) gatewayJSONResponse(c *gin.Context, resp *http.Response, info 
 	}
 	if info.IsStream {
 		return usage, types.NewError(fmt.Errorf("upstream returned JSON for a stream request"), types.ErrorCodeBadResponse)
+	}
+	if completion || compact {
+		facts.GeneratedText = facts.SourceGeneratedText
+		if !facts.PromptTokensReported {
+			usage.PromptTokens = max(usage.PromptTokens, info.GetEstimatePromptTokens())
+		}
+		if !facts.CompletionTokensReported && !opaqueOutput {
+			usage.CompletionTokens = max(usage.CompletionTokens, sourceTokens)
+		}
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+		budgetEnd := completion && gatewayOutputLimitReached(body, p.format)
+		if budgetEnd {
+			info.StreamStatus.MarkIncomplete("max_output_tokens")
+		}
+		business := facts.SourceOutputObserved
+		if !business && !budgetEnd {
+			if !info.PerformanceBusinessRejection {
+				info.StreamStatus.MarkFailed("empty_response", "", 0)
+			}
+			return usage, types.NewError(fmt.Errorf("upstream response contained no business output"), types.ErrorCodeBadResponse)
+		}
+		if err := helper.WriteGatewayJSONResponse(c, resp, facts, normalized, business); err != nil {
+			return usage, types.NewError(err, types.ErrorCodeBadResponse)
+		}
+		if facts.BusinessOutput && !opaqueOutput {
+			facts.GeneratedOutputTokens = &sourceTokens
+		}
+		return usage, nil
 	}
 	var response any
 	switch p.kind {

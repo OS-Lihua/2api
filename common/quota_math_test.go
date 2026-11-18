@@ -80,6 +80,18 @@ func TestQuotaFromFloatChecked(t *testing.T) {
 		assert.Equal(t, QuotaClampNaN, clamp.Kind)
 		assert.Equal(t, 0, clamp.Clamped)
 	}
+	for _, tc := range []struct {
+		value    float64
+		original any
+	}{{math.Inf(1), "+Inf"}, {math.Inf(-1), "-Inf"}, {math.NaN(), "NaN"}, {overflowingProduct, overflowingProduct}} {
+		_, clamp := QuotaFromFloatChecked(tc.value)
+		require.NotNil(t, clamp)
+		data, err := Marshal(clamp.AuditMap())
+		require.NoError(t, err)
+		var marker map[string]any
+		require.NoError(t, Unmarshal(data, &marker))
+		assert.Equal(t, tc.original, marker["original"])
+	}
 }
 
 func TestQuotaFromFloatStrictReturnsTypedClampError(t *testing.T) {

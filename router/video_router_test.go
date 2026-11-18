@@ -1,8 +1,11 @@
 package router
 
 import (
+	"encoding/base64"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -137,6 +140,98 @@ func TestGetOpenAIVideoRouteRendersJimengTask(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetVideoRoutesKeepMoneyTaskReadsPersisted(t *testing.T) {
+	var queries atomic.Int32
+	upstreamID := base64.RawURLEncoding.EncodeToString([]byte("operations/private-video"))
+	fixture := newAsyncTaskFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			queries.Add(1)
+			_, _ = w.Write([]byte(`{"name":"operations/private-video","done":false}`))
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{"id":%q,"status":"queued"}`, upstreamID)
+	})
+	SetVideoRouter(fixture.engine)
+	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/tasks/sora", `{"model":"gateway-alias","prompt":"A bird","seconds":"4"}`)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var before model.Task
+	require.NoError(t, model.DB.Where("user_id = ?", fixture.user.Id).First(&before).Error)
+	require.NotNil(t, before.PrivateData.Gateway)
+	require.True(t, before.PrivateData.Gateway.Accepted)
+	privateBefore, err := common.Marshal(before.PrivateData)
+	require.NoError(t, err)
+	var ledgerBefore int64
+	require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Count(&ledgerBefore).Error)
+
+	// A later Provider edit must not route a historical money read through the
+	// numeric Gemini helper using its current credentials.
+	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("type", constant.ChannelTypeGemini).Error)
+	for _, providerStatus := range []int{common.ChannelStatusEnabled, common.ChannelStatusManuallyDisabled} {
+		for _, oldLimits := range []bool{false, true} {
+			t.Run(fmt.Sprintf("provider_%d/old_limits_%t", providerStatus, oldLimits), func(t *testing.T) {
+				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("status", providerStatus).Error)
+				require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"status": common.TokenStatusEnabled, "remain_quota": 0, "model_limits_enabled": oldLimits, "model_limits": "unrelated-model"}).Error)
+				for _, path := range []string{"/v1/videos/" + before.TaskID, "/v1/video/generations/" + before.TaskID} {
+					read := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodGet, path, "")
+					assert.Equal(t, http.StatusOK, read.Code, read.Body.String())
+					assert.Contains(t, read.Body.String(), before.TaskID)
+					assert.NotContains(t, read.Body.String(), upstreamID)
+					assert.NotContains(t, read.Body.String(), "provider-secret")
+					assert.Zero(t, queries.Load(), "money task reads use persisted facts; only the guarded poller queries")
+				}
+			})
+		}
+	}
+
+	for _, credential := range []struct {
+		name    string
+		updates map[string]any
+	}{
+		{name: "disabled", updates: map[string]any{"status": common.TokenStatusDisabled}},
+		{name: "expired", updates: map[string]any{"status": common.TokenStatusEnabled, "expired_time": 1}},
+	} {
+		t.Run(credential.name, func(t *testing.T) {
+			require.NoError(t, model.DB.Model(fixture.token).Updates(credential.updates).Error)
+			for _, path := range []string{"/v1/videos/" + before.TaskID, "/v1/video/generations/" + before.TaskID} {
+				read := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodGet, path, "")
+				assert.Equal(t, http.StatusUnauthorized, read.Code, read.Body.String())
+			}
+		})
+	}
+	foreign := &model.User{Username: "foreign-video-reader", Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1}
+	require.NoError(t, model.DB.Create(foreign).Error)
+	foreignKey := &model.Token{UserId: foreign.Id, Key: "foreign-video-key", Status: common.TokenStatusEnabled, ExpiredTime: -1}
+	require.NoError(t, model.DB.Create(foreignKey).Error)
+	for _, prefix := range []string{"/v1/videos/", "/v1/video/generations/"} {
+		ownedByOther := adminSecurityRequest(fixture.engine, foreignKey.Key, http.MethodGet, prefix+before.TaskID, "")
+		missing := adminSecurityRequest(fixture.engine, foreignKey.Key, http.MethodGet, prefix+"task_missing", "")
+		assert.Equal(t, missing.Code, ownedByOther.Code)
+		assert.GreaterOrEqual(t, ownedByOther.Code, http.StatusBadRequest)
+		assert.NotContains(t, ownedByOther.Body.String(), before.TaskID)
+	}
+
+	var after model.Task
+	require.NoError(t, model.DB.First(&after, before.ID).Error)
+	privateAfter, err := common.Marshal(after.PrivateData)
+	require.NoError(t, err)
+	assert.Equal(t, before.Status, after.Status)
+	assert.Equal(t, before.Progress, after.Progress)
+	assert.Equal(t, string(before.Data), string(after.Data))
+	assert.Equal(t, string(privateBefore), string(privateAfter))
+	assert.Equal(t, before.UpdatedAt, after.UpdatedAt)
+	assert.Zero(t, queries.Load())
+	wallet, err := model.GetUserWallet(fixture.user.Id)
+	require.NoError(t, err)
+	assert.EqualValues(t, 640000000, wallet.Balance.Nanos)
+	var ledgerAfter int64
+	require.NoError(t, model.DB.Model(&model.LedgerEntry{}).Count(&ledgerAfter).Error)
+	assert.Equal(t, ledgerBefore, ledgerAfter)
+	var billing model.GatewayBilling
+	require.NoError(t, model.DB.Where("request_id = ?", before.PrivateData.Gateway.Settlement.Request.ID).First(&billing).Error)
+	assert.Equal(t, "reserved", billing.Phase)
 }
 
 func TestGetOpenAIVideoRouteHandsNativeXAITaskToPluginQuery(t *testing.T) {

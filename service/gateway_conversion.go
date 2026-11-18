@@ -526,8 +526,16 @@ func CloneGatewayRequest(request dto.Request) (dto.Request, error) {
 		clone = &dto.ClaudeRequest{}
 	case *dto.GeminiChatRequest:
 		clone = &dto.GeminiChatRequest{}
+	case *dto.EmbeddingRequest:
+		clone = &dto.EmbeddingRequest{}
+	case *dto.GeminiEmbeddingRequest:
+		clone = &dto.GeminiEmbeddingRequest{}
+	case *dto.GeminiBatchEmbeddingRequest:
+		clone = &dto.GeminiBatchEmbeddingRequest{}
+	case *dto.RerankRequest:
+		clone = &dto.RerankRequest{}
 	default:
-		return nil, fmt.Errorf("unsupported text request")
+		return nil, fmt.Errorf("unsupported gateway request")
 	}
 	body, err := common.Marshal(request)
 	if err != nil {

@@ -40,7 +40,7 @@ const codes: Redemption[] = [11, 22, 33].map((id) => ({
   name: `code-${id}`,
   key: `key-${id}`,
   status: 1,
-  quota: 100,
+  amount: { nanos: '200000', currency: 'USD' },
   created_time: 1,
   redeemed_time: 0,
   expired_time: 0,

@@ -18,21 +18,46 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { toast } from 'sonner'
 
-import type { ModelPricingIssue } from '@/features/system-settings/models/pricing-issues'
-
 import { PricingIssueList } from '../components/pricing-issue-list'
+import type { TaskPluginPricingDiagnostics } from '../types'
+import { isTaskPluginScopeCurrent } from './pricing-diagnostics'
 
-/**
- * Confirms a plugin change. When the serving plugin cannot charge some of its
- * models, the toast lists them instead of reporting plain success.
- */
+/** Saving succeeded independently of the availability of post-save diagnostics. */
 export function toastPluginChange(
   title: string,
-  issues: ModelPricingIssue[] | null | undefined
+  diagnostics: TaskPluginPricingDiagnostics,
+  pluginKey: string,
+  scope: string
 ) {
-  if (!issues?.length) {
-    toast.success(title)
-    return
+  let id: string | number | undefined
+  let dismissed = false
+  const showDiagnostics = (current: TaskPluginPricingDiagnostics) => {
+    if (dismissed || !isTaskPluginScopeCurrent(scope)) return
+    const options = {
+      id,
+      duration: undefined,
+      description: (
+        <PricingIssueList
+          diagnostics={current}
+          pluginKey={pluginKey}
+          scope={scope}
+          onDiagnosticsChange={showDiagnostics}
+          saved
+        />
+      ),
+      onDismiss: () => {
+        dismissed = true
+      },
+      onAutoClose: () => {
+        dismissed = true
+      },
+    }
+    // Updating the same toast lets Sonner remeasure its changed description.
+    if (current.state === 'ready' && current.issues.length === 0) {
+      id = toast.success(title, options)
+    } else {
+      id = toast.warning(title, { ...options, duration: Infinity })
+    }
   }
-  toast.warning(title, { description: <PricingIssueList issues={issues} /> })
+  showDiagnostics(diagnostics)
 }

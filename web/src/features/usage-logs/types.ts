@@ -20,7 +20,10 @@ For commercial licensing, please contact support@quantumnous.com
  * Type definitions for usage logs
  */
 import type { RequestRuleTrace } from '@/features/pricing/lib/billing-expr'
+import type { BillingUsageSchema } from '@/features/pricing/types'
 import type { PolicyEvent } from '@/features/system-settings/request-policies/api'
+import type { MoneyAmount } from '@/lib/currency'
+import type { ReferralRewards } from '@/lib/referral-rewards'
 
 import type { UsageLog } from './data/schema'
 // ============================================================================
@@ -114,7 +117,16 @@ export interface ToolSurchargeItem {
   price: number
 }
 
+export interface QuotaSaturation {
+  op: string
+  kind: 'overflow' | 'underflow' | 'nan'
+  original: number | string
+  clamped: number
+}
+
 export interface LogOtherData {
+  // Frozen when the request was accepted; never filled from today's catalog.
+  billing_usage_schema?: BillingUsageSchema
   admin_info?: {
     request_policy?: PolicyEvent[]
     is_multi_key?: boolean
@@ -138,12 +150,7 @@ export interface LogOtherData {
     // Quota saturation marker: set when a quota conversion clamped at the
     // supported single-request bound (overflow/underflow) or hit a NaN fallback while computing
     // this request's charge. Admin-only (nested under admin_info).
-    quota_saturation?: {
-      op: string
-      kind: 'overflow' | 'underflow' | 'nan'
-      original: number
-      clamped: number
-    }
+    quota_saturation?: QuotaSaturation
     // Reject / intercept reason (admin only)
     reject_reason?: string
     task_plugin?: TaskPluginInfo
@@ -163,7 +170,7 @@ export interface LogOtherData {
   // Frontend renders localized content from action + params via i18n templates.
   op?: {
     action?: string
-    params?: Record<string, string | number | boolean | string[]>
+    params?: Record<string, string | number | boolean | string[] | MoneyAmount>
   }
   // Operation audit details written by the admin-audit fallback in authHelper (type=3, admin only)
   audit_info?: {
@@ -521,12 +528,10 @@ export interface UserInfo {
   id: number
   username: string
   display_name?: string
-  quota: number
-  used_quota: number
   request_count: number
   group?: string
   aff_code?: string
   aff_count?: number
-  aff_quota?: number
+  referral_rewards?: ReferralRewards
   remark?: string
 }

@@ -2,14 +2,17 @@ package volcengine
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/MoeForge/moego/base64"
+	"github.com/MoeForge/moego/ojson"
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -50,14 +53,15 @@ type VolcengineTTSAudio struct {
 }
 
 type VolcengineTTSReqInfo struct {
-	ReqID           string                   `json:"reqid"`
-	Text            string                   `json:"text"`
-	Operation       string                   `json:"operation"`
-	Model           string                   `json:"model,omitempty"`
-	TextType        string                   `json:"text_type,omitempty"`
-	SilenceDuration float64                  `json:"silence_duration,omitempty"`
-	WithTimestamp   interface{}              `json:"with_timestamp,omitempty"`
-	ExtraParam      *VolcengineTTSExtraParam `json:"extra_param,omitempty"`
+	ReqID                      string                   `json:"reqid"`
+	Text                       string                   `json:"text"`
+	Operation                  string                   `json:"operation"`
+	Model                      string                   `json:"model,omitempty"`
+	TextType                   string                   `json:"text_type,omitempty"`
+	EnableTrailingSilenceAudio *bool                    `json:"enable_trailing_silence_audio,omitempty"`
+	SilenceDuration            *float64                 `json:"silence_duration,omitempty"`
+	WithTimestamp              any                      `json:"with_timestamp,omitempty"`
+	ExtraParam                 *VolcengineTTSExtraParam `json:"extra_param,omitempty"`
 }
 
 type VolcengineTTSExtraParam struct {
@@ -69,6 +73,27 @@ type VolcengineTTSExtraParam struct {
 	UnsupportedCharRatioThresh float64                   `json:"unsupported_char_ratio_thresh,omitempty"`
 	AigcWatermark              bool                      `json:"aigc_watermark,omitempty"`
 	CacheConfig                *VolcengineTTSCacheConfig `json:"cache_config,omitempty"`
+}
+
+// MarshalJSON preserves V1's JSON-string wire contract for extra_param.
+func (p VolcengineTTSExtraParam) MarshalJSON() ([]byte, error) {
+	type fields VolcengineTTSExtraParam
+	body, err := common.Marshal(fields(p))
+	if err != nil {
+		return nil, err
+	}
+	return common.Marshal(string(body))
+}
+
+// UnmarshalJSON accepts the native JSON string and existing object metadata,
+// validating their contents before encoding the final native wire.
+func (p *VolcengineTTSExtraParam) UnmarshalJSON(body []byte) error {
+	type fields VolcengineTTSExtraParam
+	var encoded string
+	if err := common.Unmarshal(body, &encoded); err != nil {
+		encoded = string(body)
+	}
+	return common.DecodeJsonStrict(strings.NewReader(encoded), (*fields)(p))
 }
 
 type VolcengineTTSCacheConfig struct {
@@ -142,53 +167,74 @@ func getContentTypeByEncoding(encoding string) string {
 	return "application/octet-stream"
 }
 
+func speechError(code int) *types.NewAPIError {
+	status := http.StatusBadGateway
+	switch code {
+	case 3001, 3006, 3010, 3011, 3050:
+		status = http.StatusBadRequest
+	case 3003:
+		status = http.StatusTooManyRequests
+	case 3005, 3031, 3040:
+		status = http.StatusServiceUnavailable
+	case 3030, 3032:
+		status = http.StatusGatewayTimeout
+	}
+	return types.WithOpenAIError(types.OpenAIError{Type: "upstream_error", Code: fmt.Sprintf("volcengine:%d", code), Message: "Volcengine speech request failed"}, status)
+}
+
 func handleTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, encoding string) (usage any, err *types.NewAPIError) {
-	body, readErr := io.ReadAll(resp.Body)
-	if readErr != nil {
-		return nil, types.NewErrorWithStatusCode(
-			errors.New("failed to read volcengine response"),
-			types.ErrorCodeReadResponseBodyFailed,
-			http.StatusInternalServerError,
-		)
-	}
 	defer resp.Body.Close()
-
+	body, readErr := io.ReadAll(resp.Body)
+	var audioData []byte
+	if info.ResponseFacts != nil {
+		if duration := ojson.GetBytes(body, "addition.duration"); duration.Exists() && duration.Raw != "null" {
+			info.ResponseFacts.AudioOutputDurationInvalid = true
+			if duration.Type == ojson.String {
+				openai.ObserveSpeechOutputDuration(info, duration.Str, time.Millisecond)
+			}
+		}
+		var encoded string
+		if raw := ojson.GetBytes(body, "data").Raw; raw != "" && common.UnmarshalJsonStr(raw, &encoded) == nil {
+			if decoded, decodeErr := base64.StdEncoding.DecodeString(encoded); decodeErr == nil && len(decoded) > 0 {
+				audioData = decoded
+				usage = openai.EstimateGeneratedSpeech(c, info, audioData, true)
+			}
+		}
+		if usage == nil && info.ResponseFacts.AudioOutputDurationReported {
+			usage = openai.EstimateGeneratedSpeech(c, info, nil, true)
+		}
+	}
+	if readErr != nil {
+		if info.ResponseFacts != nil {
+			if info.StreamStatus == nil {
+				info.StreamStatus = relaycommon.NewStreamStatus()
+			}
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, readErr)
+			info.StreamStatus.MarkIncomplete("incomplete_audio_response")
+		}
+		return usage, types.NewErrorWithStatusCode(errors.New("failed to read volcengine response"), types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
+	}
 	var volcResp VolcengineTTSResponse
-	if unmarshalErr := json.Unmarshal(body, &volcResp); unmarshalErr != nil {
-		return nil, types.NewErrorWithStatusCode(
-			errors.New("failed to parse volcengine response"),
-			types.ErrorCodeBadResponseBody,
-			http.StatusInternalServerError,
-		)
+	if unmarshalErr := common.Unmarshal(body, &volcResp); unmarshalErr != nil {
+		return usage, types.NewErrorWithStatusCode(errors.New("failed to parse volcengine response"), types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
-
 	if volcResp.Code != 3000 {
-		return nil, types.NewErrorWithStatusCode(
-			errors.New(volcResp.Message),
-			types.ErrorCodeBadResponse,
-			http.StatusBadRequest,
-		)
+		return usage, speechError(volcResp.Code)
 	}
-
-	audioData, decodeErr := base64.StdEncoding.DecodeString(volcResp.Data)
-	if decodeErr != nil {
-		return nil, types.NewErrorWithStatusCode(
-			errors.New("failed to decode audio data"),
-			types.ErrorCodeBadResponseBody,
-			http.StatusInternalServerError,
-		)
+	if audioData == nil {
+		var decodeErr error
+		audioData, decodeErr = base64.StdEncoding.DecodeString(volcResp.Data)
+		if decodeErr != nil {
+			return usage, types.NewErrorWithStatusCode(errors.New("failed to decode audio data"), types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		}
 	}
-
+	if info.ResponseFacts != nil {
+		return openai.WriteAudioResponse(c, info, resp, audioData), nil
+	}
 	contentType := getContentTypeByEncoding(encoding)
 	c.Header("Content-Type", contentType)
 	c.Data(http.StatusOK, contentType, audioData)
-
-	usage = &dto.Usage{
-		PromptTokens:     info.GetEstimatePromptTokens(),
-		CompletionTokens: 0,
-		TotalTokens:      info.GetEstimatePromptTokens(),
-	}
-
+	usage = &dto.Usage{PromptTokens: info.GetEstimatePromptTokens(), CompletionTokens: 0, TotalTokens: info.GetEstimatePromptTokens()}
 	return usage, nil
 }
 
@@ -226,7 +272,7 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 	}
 	defer conn.Close()
 
-	payload, marshalErr := json.Marshal(volcRequest)
+	payload, marshalErr := common.Marshal(volcRequest)
 	if marshalErr != nil {
 		return nil, types.NewErrorWithStatusCode(
 			fmt.Errorf("failed to marshal request: %w", marshalErr),

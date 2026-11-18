@@ -8,11 +8,11 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
-	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/model_setting"
@@ -223,6 +223,8 @@ func TestModelPriceHelperTieredRejectsPreConsumeOverflow(t *testing.T) {
 }
 
 func TestModelPriceHelperRequestBillingRatiosOnlyApplyToFixedPrice(t *testing.T) {
+	db := model.UseTestDatabases(t)
+	require.NoError(t, db.AutoMigrate(&model.Wallet{}, &model.LedgerEntry{}, &model.GatewayBilling{}))
 	gin.SetMode(gin.TestMode)
 	savedModelPrices := ratio_setting.ModelPrice2JSONString()
 	savedModelRatios := ratio_setting.ModelRatio2JSONString()
@@ -311,7 +313,11 @@ func TestModelPriceHelperRequestBillingRatiosOnlyApplyToFixedPrice(t *testing.T)
 	require.ErrorAs(t, err, &clamp)
 	require.Equal(t, "QuotaFromFloat", clamp.Op)
 	require.Equal(t, common.QuotaClampOverflow, clamp.Kind)
-	require.Nil(t, info.Billing)
+	var lifecycles, entries int64
+	require.NoError(t, db.Model(&model.GatewayBilling{}).Count(&lifecycles).Error)
+	require.NoError(t, db.Model(&model.LedgerEntry{}).Count(&entries).Error)
+	assert.Zero(t, lifecycles)
+	assert.Zero(t, entries, "overflow must fail before any hold or money posting")
 }
 
 // Pricing identity is resolved once in ModelPriceHelper via the candidate
@@ -782,23 +788,19 @@ func TestInputPreConsumeMultiplierLegacyAndRequestPrices(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tc.want, price.QuotaToPreConsume)
 			if tc.model == "image-input-policy" {
-				reservation := &priceTestReservation{held: price.QuotaToPreConsume}
-				info.Billing = reservation
+				snapshot := info.TieredBillingSnapshot
+				require.NotNil(t, snapshot)
 				operation_setting.GetQuotaSetting().PreConsumeMultiplier = 10
-				require.Nil(t, service.PrepareImageBillingForRequest(ctx, info, 2))
-				assert.Equal(t, 750, reservation.held, "retry must reuse the original fractional multiplier")
+				input := *info.BillingRequestInput
+				input.ImageCount = common.GetPointer(2)
+				// Replay historical estimate math only. Current money requests
+				// neither consult this option nor append another reservation.
+				prompt := float64(snapshot.EstimatedPromptTokens) * snapshot.PreConsumeMultiplier
+				result, err := billingexpr.ComputeTieredQuotaWithRequest(snapshot, billingexpr.TokenParams{P: prompt, Len: prompt}, input)
+				require.NoError(t, err)
+				assert.Equal(t, 2.5, snapshot.PreConsumeMultiplier)
+				assert.Equal(t, 750, result.ActualQuotaAfterGroup, "historical replay must retain the original fractional multiplier")
 			}
 		})
 	}
 }
-
-// priceTestReservation observes the reservation requested before image submission.
-type priceTestReservation struct{ held int }
-
-func (s *priceTestReservation) Settle(int) error         { return nil }
-func (s *priceTestReservation) Refund(*gin.Context)      {}
-func (s *priceTestReservation) NeedsRefund() bool        { return false }
-func (s *priceTestReservation) GetPreConsumedQuota() int { return s.held }
-func (s *priceTestReservation) Reserve(quota int) error  { s.held = max(s.held, quota); return nil }
-
-func (s *priceTestReservation) ReserveBeforeSubmit(quota int) error { return s.Reserve(quota) }

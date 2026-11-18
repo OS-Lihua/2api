@@ -47,6 +47,30 @@ func TestJsonRawMessageToString(t *testing.T) {
 	}
 }
 
+func TestDecodeJsonStrictRejectsAmbiguousFields(t *testing.T) {
+	for _, body := range []string{
+		`{"amount":{"nanos":"1"},"amount":{"nanos":"2"}}`,
+		`{"amount":{"nanos":"1","nanos":"2"}}`,
+		"{\"amount\":{\"nanos\":\"1\",\"na\\u006eos\":\"2\"}}",
+		`{"amount":[{"nanos":"1","nanos":"2"}]}`,
+		`{"amount":{"nanos":"1"}} {"amount":{"nanos":"2"}}`,
+		`{"unknown":1}`,
+	} {
+		var value struct {
+			Amount any `json:"amount"`
+		}
+		assert.Error(t, DecodeJsonStrict(strings.NewReader(body), &value), body)
+	}
+	var value struct {
+		Amount []struct {
+			Nanos string `json:"nanos"`
+		} `json:"amount"`
+	}
+	require.NoError(t, DecodeJsonStrict(strings.NewReader(`{"amount":[{"nanos":"1"},{"nanos":"2"}]}`), &value))
+	assert.Equal(t, "1", value.Amount[0].Nanos)
+	assert.Equal(t, "2", value.Amount[1].Nanos, "identical field names in different objects are valid")
+}
+
 func TestDecodeJsonWithValidation(t *testing.T) {
 	type request struct {
 		Code string `json:"code" binding:"required"`

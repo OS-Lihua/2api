@@ -1,8 +1,10 @@
 package controller
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -14,10 +16,10 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
-	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
 	"github.com/QuantumNous/new-api/constant"
@@ -308,19 +310,12 @@ func Register(c *gin.Context) {
 		}
 		// 生成默认令牌
 		token := model.Token{
-			UserId:             insertedUser.Id, // 使用插入后的用户ID
-			Name:               i18n.T(c, i18n.MsgUserDefaultTokenName, map[string]any{"Username": cleanUser.Username}),
-			Key:                key,
-			CreatedTime:        common.GetTimestamp(),
-			AccessedTime:       common.GetTimestamp(),
-			ExpiredTime:        -1,     // 永不过期
-			RemainQuota:        500000, // 示例额度
-			UnlimitedQuota:     true,
-			ModelLimitsEnabled: false,
-		}
-		token.AllowUserQuotaQuery = true
-		if setting.DefaultUseAutoGroup {
-			token.Group = "auto"
+			UserId:       insertedUser.Id, // 使用插入后的用户ID
+			Name:         i18n.T(c, i18n.MsgUserDefaultTokenName, map[string]any{"Username": cleanUser.Username}),
+			Key:          key,
+			CreatedTime:  common.GetTimestamp(),
+			AccessedTime: common.GetTimestamp(),
+			ExpiredTime:  -1, // 永不过期
 		}
 		if err := token.Insert(); err != nil {
 			common.ApiErrorT(c, "Failed to create default token")
@@ -335,6 +330,31 @@ func Register(c *gin.Context) {
 	return
 }
 
+type userRewardsResponse struct {
+	*model.User
+	ReferralRewards model.ReferralRewards `json:"referral_rewards"`
+}
+
+func usersWithReferralRewards(users []*model.User) ([]userRewardsResponse, error) {
+	ids := make([]int, len(users))
+	for i, user := range users {
+		ids[i] = user.Id
+	}
+	rewards, err := model.GetReferralRewardsForUsers(ids)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]userRewardsResponse, len(users))
+	for i, user := range users {
+		value, exists := rewards[user.Id]
+		if !exists {
+			return nil, gorm.ErrRecordNotFound
+		}
+		result[i] = userRewardsResponse{User: user, ReferralRewards: value}
+	}
+	return result, nil
+}
+
 func GetAllUsers(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
 	sortOptions := model.NewUserSortOptions(c.Query("sort_by"), c.Query("sort_order"))
@@ -344,8 +364,13 @@ func GetAllUsers(c *gin.Context) {
 		return
 	}
 
+	items, err := usersWithReferralRewards(users)
+	if err != nil {
+		common.ApiErrorT(c, "Database error, please contact the administrator")
+		return
+	}
 	pageInfo.SetTotal(int(total))
-	pageInfo.SetItems(users)
+	pageInfo.SetItems(items)
 
 	common.ApiSuccess(c, pageInfo)
 	return
@@ -374,8 +399,13 @@ func SearchUsers(c *gin.Context) {
 		return
 	}
 
+	items, err := usersWithReferralRewards(users)
+	if err != nil {
+		common.ApiErrorT(c, "Database error, please contact the administrator")
+		return
+	}
 	pageInfo.SetTotal(int(total))
-	pageInfo.SetItems(users)
+	pageInfo.SetItems(items)
 	common.ApiSuccess(c, pageInfo)
 	return
 }
@@ -401,16 +431,22 @@ func GetUser(c *gin.Context) {
 		return
 	}
 	user.AdminPermissions = authz.Capabilities(user.Id, user.Role)
+	rewards, err := model.GetReferralRewards(user.Id)
+	if err != nil {
+		common.ApiErrorT(c, "Database error, please contact the administrator")
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
-		"data":    user,
+		"data":    userRewardsResponse{User: user, ReferralRewards: rewards},
 	})
 	return
 }
 
 type TransferAffQuotaRequest struct {
-	Quota int `json:"quota" binding:"required"`
+	Amount     money.Amount `json:"amount"`
+	TransferID string       `json:"transfer_id"`
 }
 
 func TransferAffQuota(c *gin.Context) {
@@ -419,27 +455,31 @@ func TransferAffQuota(c *gin.Context) {
 	}
 
 	id := c.GetInt("id")
-	user, err := model.GetUserById(id, true)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
 	tran := TransferAffQuotaRequest{}
-	if err := c.ShouldBindJSON(&tran); err != nil {
-		common.ApiError(c, err)
+	if err := common.DecodeJsonStrict(c.Request.Body, &tran); err != nil {
+		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	err = user.TransferAffQuotaToQuota(tran.Quota)
+	entry, err := model.TransferReferralRewards(id, tran.Amount, tran.TransferID)
 	var message *common.Message
 	if errors.As(err, &message) {
 		common.ApiError(c, err)
 		return
 	}
 	if err != nil {
-		common.ApiErrorT(c, "Transfer failed {{error}}", map[string]any{"error": err.Error()})
+		common.ApiErrorT(c, "Database error, please contact the administrator")
 		return
 	}
-	common.ApiSuccessT(c, "Transfer successful", nil)
+	common.ApiSuccessT(c, "Transfer successful", gin.H{"amount": entry.Amount, "entry_id": entry.Id})
+}
+
+func GetReferralRewards(c *gin.Context) {
+	rewards, err := model.GetReferralRewards(c.GetInt("id"))
+	if err != nil {
+		common.ApiErrorT(c, "Database error, please contact the administrator")
+		return
+	}
+	common.ApiSuccess(c, rewards)
 }
 
 func GetAffCode(c *gin.Context) {
@@ -472,7 +512,13 @@ func GetSelf(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	reminder, err := model.GetUserBalanceReminder(c.Request.Context(), id)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	responseData := buildSelfUserData(user)
+	responseData["balance_reminder"] = reminder
 	// The authenticated role is loaded from GetUserCache. It should equal the
 	// row role, but use it for capabilities so GetSelf and login/refresh remain
 	// consistent with the authorization decision made for this request.
@@ -496,32 +542,30 @@ func buildSelfUserData(user *model.User) map[string]any {
 	permissions := calculateUserPermissions(user.Role)
 	permissions["admin_permissions"] = authz.Capabilities(user.Id, user.Role)
 	return map[string]any{
-		"id":                user.Id,
-		"username":          user.Username,
-		"display_name":      user.DisplayName,
-		"has_password":      user.HasPassword,
-		"role":              user.Role,
-		"status":            user.Status,
-		"email":             user.Email,
-		"github_id":         user.GitHubId,
-		"discord_id":        user.DiscordId,
-		"oidc_id":           user.OidcId,
-		"wechat_id":         user.WeChatId,
-		"telegram_id":       user.TelegramId,
-		"group":             user.Group,
-		"quota":             user.Quota,
-		"used_quota":        user.UsedQuota,
-		"request_count":     user.RequestCount,
-		"aff_code":          user.AffCode,
-		"aff_count":         user.AffCount,
-		"aff_quota":         user.AffQuota,
-		"aff_history_quota": user.AffHistoryQuota,
-		"inviter_id":        user.InviterId,
-		"linux_do_id":       user.LinuxDOId,
-		"setting":           user.Setting,
-		"stripe_customer":   user.StripeCustomer,
-		"sidebar_modules":   userSetting.SidebarModules, // 正确提取sidebar_modules字段
-		"permissions":       permissions,
+		"id":              user.Id,
+		"username":        user.Username,
+		"display_name":    user.DisplayName,
+		"has_password":    user.HasPassword,
+		"role":            user.Role,
+		"status":          user.Status,
+		"email":           user.Email,
+		"github_id":       user.GitHubId,
+		"discord_id":      user.DiscordId,
+		"oidc_id":         user.OidcId,
+		"wechat_id":       user.WeChatId,
+		"telegram_id":     user.TelegramId,
+		"group":           user.Group,
+		"quota":           user.Quota,
+		"used_quota":      user.UsedQuota,
+		"request_count":   user.RequestCount,
+		"aff_code":        user.AffCode,
+		"aff_count":       user.AffCount,
+		"inviter_id":      user.InviterId,
+		"linux_do_id":     user.LinuxDOId,
+		"setting":         user.Setting,
+		"stripe_customer": user.StripeCustomer,
+		"sidebar_modules": userSetting.SidebarModules, // 正确提取sidebar_modules字段
+		"permissions":     permissions,
 	}
 }
 
@@ -616,37 +660,12 @@ func generateDefaultSidebarConfig(userRole int) string {
 }
 
 func GetUserModels(c *gin.Context) {
-	id, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		id = c.GetInt("id")
-	}
-	user, err := model.GetUserCache(id)
-	if err != nil {
+	names := []string{}
+	if err := model.VisibleOfferingsQuery(c.Request.Context(), c.GetInt("id")).Order("name").Pluck("name", &names).Error; err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	groups := service.GetUserUsableGroups(user.Group)
-	group := c.Query("group")
-	var groupsToQuery []string
-	switch {
-	case group == "":
-		for g := range groups {
-			groupsToQuery = append(groupsToQuery, g)
-		}
-	case group == "auto":
-		if _, ok := groups[group]; ok {
-			groupsToQuery = service.GetUserAutoGroup(user.Group)
-		}
-	default:
-		if _, ok := groups[group]; ok {
-			groupsToQuery = []string{group}
-		}
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-		"data":    service.GetGroupsEnabledModels(groupsToQuery),
-	})
+	common.ApiSuccess(c, names)
 }
 
 func UpdateUser(c *gin.Context) {
@@ -1084,21 +1103,13 @@ func updateAdminPermissionsForUserInTx(c *gin.Context, tx *gorm.DB, userID int, 
 type ManageRequest struct {
 	Id     int    `json:"id"`
 	Action string `json:"action"`
-	Value  int    `json:"value"`
-	Mode   string `json:"mode"`
 }
 
 // ManageUser Only admin user can do this
 func ManageUser(c *gin.Context) {
 	var req ManageRequest
-	err := common.DecodeJson(c.Request.Body, &req)
-
-	if err != nil {
+	if err := common.DecodeJsonStrict(c.Request.Body, &req); err != nil || req.Id <= 0 {
 		common.ApiErrorT(c, "Invalid parameters")
-		return
-	}
-	if req.Action == "add_quota" {
-		manageUserQuota(c, req)
 		return
 	}
 	user := model.User{
@@ -1301,40 +1312,110 @@ func TopUp(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	quota, err := model.Redeem(req.Key, id)
+	amount, err := model.Redeem(req.Key, id)
 	if err != nil {
-		// 不向用户暴露兑换失败的细分原因，避免攻击者根据错误类型判断兑换码状态。
+		// Keep failures uniform and exclude the voucher credential from logs.
 		common.ApiErrorT(c, "Redemption failed, please try again later")
-		logger.LogError(c, common.LogText("failed to redeem key %s for user %d: %s", req.Key, id, err.Error()))
+		logger.LogError(c, common.LogText("Redemption failed for user %d", id))
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
-		"data":    quota,
+		"data":    amount,
 	})
 }
 
 type UpdateUserSettingRequest struct {
-	QuotaWarningType                 string  `json:"notify_type"`
-	QuotaWarningThreshold            float64 `json:"quota_warning_threshold"`
-	QuotaWarningEnabled              *bool   `json:"quota_warning_enabled,omitempty"`
-	WebhookUrl                       string  `json:"webhook_url,omitempty"`
-	WebhookSecret                    string  `json:"webhook_secret,omitempty"`
-	NotificationEmail                string  `json:"notification_email,omitempty"`
-	BarkUrl                          string  `json:"bark_url,omitempty"`
-	GotifyUrl                        string  `json:"gotify_url,omitempty"`
-	GotifyToken                      string  `json:"gotify_token,omitempty"`
-	GotifyPriority                   int     `json:"gotify_priority,omitempty"`
-	UpstreamModelUpdateNotifyEnabled *bool   `json:"upstream_model_update_notify_enabled,omitempty"`
-	ChannelNotifyEnabled             *bool   `json:"channel_notify_enabled,omitempty"`
-	AcceptUnsetModelRatioModel       bool    `json:"accept_unset_model_ratio_model"`
-	RecordIpLog                      bool    `json:"record_ip_log"`
+	QuotaWarningType                 string                         `json:"notify_type"`
+	BalanceReminder                  *model.BalanceReminderSettings `json:"balance_reminder,omitempty"`
+	WebhookUrl                       string                         `json:"webhook_url,omitempty"`
+	WebhookSecret                    string                         `json:"webhook_secret,omitempty"`
+	NotificationEmail                string                         `json:"notification_email,omitempty"`
+	BarkUrl                          string                         `json:"bark_url,omitempty"`
+	GotifyUrl                        string                         `json:"gotify_url,omitempty"`
+	GotifyToken                      string                         `json:"gotify_token,omitempty"`
+	GotifyPriority                   int                            `json:"gotify_priority,omitempty"`
+	UpstreamModelUpdateNotifyEnabled *bool                          `json:"upstream_model_update_notify_enabled,omitempty"`
+	ChannelNotifyEnabled             *bool                          `json:"channel_notify_enabled,omitempty"`
+	RetiredUnpricedModelSetting      common.RawMessage              `json:"accept_unset_model_ratio_model"`
+	RecordIpLog                      bool                           `json:"record_ip_log"`
+}
+
+func retiredQuotaReminderSettings(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	common.ApiErrorStatus(c, http.StatusGone, common.NewMessage("Legacy quota reminders have been retired. Use balance reminder settings."), gin.H{"code": "legacy_quota_reminder_settings_retired"})
+}
+
+// Go's JSON field matching also accepts case-folded aliases. Reject two such
+// names in an exact settings object rather than letting source order pick one.
+func settingsHaveFoldedDuplicates(data []byte) bool {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 {
+		return false
+	}
+	switch data[0] {
+	case '{':
+		var fields map[string]common.RawMessage
+		if common.Unmarshal(data, &fields) != nil {
+			return false
+		}
+		keys := make([]string, 0, len(fields))
+		for key, value := range fields {
+			for _, previous := range keys {
+				if strings.EqualFold(previous, key) {
+					return true
+				}
+			}
+			keys = append(keys, key)
+			if settingsHaveFoldedDuplicates(value) {
+				return true
+			}
+		}
+	case '[':
+		var values []common.RawMessage
+		if common.Unmarshal(data, &values) != nil {
+			return false
+		}
+		for _, value := range values {
+			if settingsHaveFoldedDuplicates(value) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func UpdateUserSetting(c *gin.Context) {
+	body, err := io.ReadAll(c.Request.Body)
+	var fields map[string]common.RawMessage
+	if err != nil || common.Unmarshal(body, &fields) != nil || fields == nil {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
+	retiredUnpriced, retiredReminder, nullReminder := false, false, false
+	for key, value := range fields {
+		if strings.EqualFold(key, "accept_unset_model_ratio_model") {
+			retiredUnpriced = true
+		}
+		if strings.EqualFold(key, "quota_warning_threshold") || strings.EqualFold(key, "quota_warning_enabled") {
+			retiredReminder = true
+		}
+		if strings.EqualFold(key, "balance_reminder") && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			nullReminder = true
+		}
+	}
+	if retiredUnpriced {
+		c.Header("Cache-Control", "no-store")
+		common.ApiErrorStatus(c, http.StatusGone, common.NewMessage("The setting for unpriced models has been retired."), gin.H{"code": "legacy_unpriced_model_setting_retired"})
+		return
+	}
+	if retiredReminder {
+		retiredQuotaReminderSettings(c)
+		return
+	}
 	var req UpdateUserSettingRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if nullReminder || settingsHaveFoldedDuplicates(body) || common.DecodeJsonStrict(bytes.NewReader(body), &req) != nil {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
@@ -1342,12 +1423,6 @@ func UpdateUserSetting(c *gin.Context) {
 	// 验证预警类型
 	if req.QuotaWarningType != dto.NotifyTypeEmail && req.QuotaWarningType != dto.NotifyTypeWebhook && req.QuotaWarningType != dto.NotifyTypeBark && req.QuotaWarningType != dto.NotifyTypeGotify {
 		common.ApiErrorT(c, "Invalid warning type")
-		return
-	}
-
-	// 验证预警阈值，0 表示使用系统默认阈值
-	if req.QuotaWarningThreshold < 0 {
-		common.ApiErrorT(c, "Reminder threshold cannot be negative")
 		return
 	}
 
@@ -1413,60 +1488,70 @@ func UpdateUserSetting(c *gin.Context) {
 		}
 	}
 
-	userId := c.GetInt("id")
-	user, err := model.GetUserById(userId, true)
+	userID := c.GetInt("id")
+	reminder, err := model.PatchUserNotificationSettings(c.Request.Context(), userID, req.BalanceReminder, func(user *model.User) error {
+		// Patch only form-owned keys after the model has locked the current user.
+		// Raw values retain old decimal migration sources and unrelated/future keys.
+		settings := map[string]common.RawMessage{}
+		if user.Setting != "" {
+			if common.JsonHasDuplicateFields([]byte(user.Setting)) || common.UnmarshalJsonStr(user.Setting, &settings) != nil || settings == nil {
+				return common.NewMessage("Update failed")
+			}
+		}
+		changes := map[string]any{
+			"notify_type": req.QuotaWarningType, "record_ip_log": req.RecordIpLog,
+			"webhook_url": "", "webhook_secret": "", "notification_email": "",
+			"bark_url": "", "gotify_url": "", "gotify_token": "", "gotify_priority": 0,
+		}
+		if user.Role >= common.RoleAdminUser {
+			if req.UpstreamModelUpdateNotifyEnabled != nil {
+				changes["upstream_model_update_notify_enabled"] = *req.UpstreamModelUpdateNotifyEnabled
+			}
+			if req.ChannelNotifyEnabled != nil {
+				changes["channel_notify_enabled"] = *req.ChannelNotifyEnabled
+			}
+		}
+		switch req.QuotaWarningType {
+		case dto.NotifyTypeWebhook:
+			changes["webhook_url"], changes["webhook_secret"] = req.WebhookUrl, req.WebhookSecret
+		case dto.NotifyTypeEmail:
+			changes["notification_email"] = req.NotificationEmail
+		case dto.NotifyTypeBark:
+			changes["bark_url"] = req.BarkUrl
+		case dto.NotifyTypeGotify:
+			changes["gotify_url"], changes["gotify_token"] = req.GotifyUrl, req.GotifyToken
+			if req.GotifyPriority < 0 || req.GotifyPriority > 10 {
+				changes["gotify_priority"] = 5
+			} else {
+				changes["gotify_priority"] = req.GotifyPriority
+			}
+		}
+		for key, value := range changes {
+			encoded, err := common.Marshal(value)
+			if err != nil {
+				return err
+			}
+			for stored := range settings {
+				if strings.EqualFold(stored, key) {
+					delete(settings, stored)
+				}
+			}
+			settings[key] = encoded
+		}
+		encoded, err := common.Marshal(settings)
+		if err != nil {
+			return err
+		}
+		user.Setting = string(encoded)
+		return nil
+	})
 	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	// 从已保存的设置出发，语言、侧边栏、扣费策略等不由此表单管理的字段保持不变；
-	// 请求未携带的开关也保持原值
-	settings := user.GetSetting()
-	settings.NotifyType = req.QuotaWarningType
-	settings.QuotaWarningThreshold = req.QuotaWarningThreshold
-	settings.AcceptUnsetRatioModel = req.AcceptUnsetModelRatioModel
-	settings.RecordIpLog = req.RecordIpLog
-	if req.QuotaWarningEnabled != nil {
-		settings.QuotaWarningEnabled = req.QuotaWarningEnabled
-	}
-	if user.Role >= common.RoleAdminUser {
-		if req.UpstreamModelUpdateNotifyEnabled != nil {
-			settings.UpstreamModelUpdateNotifyEnabled = *req.UpstreamModelUpdateNotifyEnabled
-		}
-		if req.ChannelNotifyEnabled != nil {
-			settings.ChannelNotifyEnabled = req.ChannelNotifyEnabled
-		}
-	}
-
-	// 只保留所选通知方式的配置，其他方式的配置清空
-	settings.WebhookUrl, settings.WebhookSecret = "", ""
-	settings.NotificationEmail = ""
-	settings.BarkUrl = ""
-	settings.GotifyUrl, settings.GotifyToken, settings.GotifyPriority = "", "", 0
-	switch req.QuotaWarningType {
-	case dto.NotifyTypeWebhook:
-		settings.WebhookUrl = req.WebhookUrl
-		settings.WebhookSecret = req.WebhookSecret
-	case dto.NotifyTypeEmail:
-		settings.NotificationEmail = req.NotificationEmail
-	case dto.NotifyTypeBark:
-		settings.BarkUrl = req.BarkUrl
-	case dto.NotifyTypeGotify:
-		settings.GotifyUrl = req.GotifyUrl
-		settings.GotifyToken = req.GotifyToken
-		// Gotify优先级范围0-10，超出范围则使用默认值5
-		if req.GotifyPriority < 0 || req.GotifyPriority > 10 {
-			settings.GotifyPriority = 5
-		} else {
-			settings.GotifyPriority = req.GotifyPriority
-		}
-	}
-
-	// 更新用户设置
-	if err := model.UpdateUserSetting(user.Id, settings); err != nil {
 		common.ApiErrorT(c, "Update failed")
 		return
 	}
-
-	common.ApiSuccessT(c, "Settings updated", nil)
+	if err := model.PublishUserAuthCache(userID); err != nil {
+		common.ApiErrorT(c, "Update failed")
+		return
+	}
+	common.ApiSuccessT(c, "Settings updated", gin.H{"balance_reminder": reminder})
 }

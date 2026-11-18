@@ -1,6 +1,7 @@
 package model
 
 import (
+	"database/sql"
 	"fmt"
 
 	"gorm.io/gorm"
@@ -15,6 +16,46 @@ type RankingQuotaBucket struct {
 	ModelName string `json:"model_name"`
 	Bucket    int64  `json:"bucket"`
 	Tokens    int64  `json:"tokens"`
+}
+
+type RankingModelPublisher struct {
+	Name string
+	Icon string
+}
+
+// GetRankingModelPublishers decorates historical model names without consulting
+// current routing, offerings or prices. Display defaults never create records.
+func GetRankingModelPublishers(modelNames []string) (map[string]RankingModelPublisher, error) {
+	publishers := make(map[string]RankingModelPublisher)
+	if len(modelNames) == 0 {
+		return publishers, nil
+	}
+	var metadata []Model
+	var vendors []Vendor
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Select("id", "model_name", "name_rule", "vendor_id", "status").Order("id").Find(&metadata).Error; err != nil {
+			return err
+		}
+		return tx.Select("id", "name", "icon").Order("id").Find(&vendors).Error
+	}, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}); err != nil {
+		return nil, err
+	}
+	vendorByID := make(map[int]*Vendor, len(vendors))
+	for i := range vendors {
+		vendorByID[vendors[i].Id] = &vendors[i]
+	}
+	resolved := resolveModelMetadata(metadata, modelNames)
+	initDefaultVendorMapping(resolved, vendorByID, modelNames)
+	for _, name := range modelNames {
+		item := resolved[name]
+		if item == nil || item.Status != 1 {
+			continue
+		}
+		if vendor := vendorByID[item.VendorID]; vendor != nil {
+			publishers[name] = RankingModelPublisher{Name: vendor.Name, Icon: vendor.Icon}
+		}
+	}
+	return publishers, nil
 }
 
 func GetRankingQuotaTotals(startTime int64, endTime int64) ([]RankingQuotaTotal, error) {

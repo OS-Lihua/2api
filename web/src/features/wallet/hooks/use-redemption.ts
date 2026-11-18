@@ -16,12 +16,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import i18next from 'i18next'
 import { useState, useCallback } from 'react'
+import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
-import { getSelf } from '@/lib/api'
-import { formatQuota } from '@/lib/format'
+import { toIntlLocale } from '@/i18n/languages'
+import { formatMoneyAmount } from '@/lib/currency'
 import { handleServerError } from '@/lib/handle-server-error'
 
 import { redeemTopupCode } from '../api'
@@ -31,38 +31,41 @@ import { redeemTopupCode } from '../api'
 // ============================================================================
 
 export function useRedemption() {
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const [redeeming, setRedeeming] = useState(false)
 
-  const redeemCode = useCallback(async (code: string): Promise<boolean> => {
-    if (!code || code.trim() === '') {
-      toast.error(i18next.t('Please enter a redemption code'))
-      return false
-    }
-
-    try {
-      setRedeeming(true)
-      const response = await redeemTopupCode({ key: code })
-
-      if (response.success && response.data) {
-        const quotaAdded = response.data
-        toast.success(
-          i18next.t('Redemption successful! Added: {{quota}}', {
-            quota: formatQuota(quotaAdded),
-          })
-        )
-        await getSelf()
-        return true
+  const redeemCode = useCallback(
+    async (code: string): Promise<boolean> => {
+      if (!code || code.trim() === '') {
+        toast.error(t('Please enter a redemption code'))
+        return false
       }
 
-      handleServerError(response, i18next.t('Redemption failed'))
-      return false
-    } catch (_error) {
-      handleServerError(_error, i18next.t('Redemption failed'))
-      return false
-    } finally {
-      setRedeeming(false)
-    }
-  }, [])
+      try {
+        setRedeeming(true)
+        const response = await redeemTopupCode({ key: code })
+
+        if (response.success && response.data) {
+          toast.success(
+            t('Redemption successful! Added: {{amount}}', {
+              amount: formatMoneyAmount(response.data, locale),
+            })
+          )
+          return true
+        }
+
+        handleServerError(response, t('Redemption failed'))
+        return false
+      } catch (_error) {
+        handleServerError(_error, t('Redemption failed'))
+        return false
+      } finally {
+        setRedeeming(false)
+      }
+    },
+    [locale, t]
+  )
 
   return {
     redeeming,

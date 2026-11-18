@@ -5,6 +5,7 @@ import (
 
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
@@ -62,12 +63,17 @@ func (p *RequestRepairProtocol) DoResponse(c *gin.Context, response *http.Respon
 	return p.Public.DoResponse(c, response, info)
 }
 func NewProtocolRequestContext(kind protocol.Type, info *relaycommon.RelayInfo) *ProtocolRequestContext {
+	mode := protocolRelayMode(kind)
+	if kind == protocol.OpenAIChat && info.RelayMode == relayconstant.RelayModeCompletions ||
+		kind == protocol.OpenAIResponses && info.RelayMode == relayconstant.RelayModeResponsesCompact {
+		mode = info.RelayMode
+	}
 	return &ProtocolRequestContext{Protocol: kind, ChannelType: info.ChannelType,
 		OriginModelName: info.OriginModelName, UpstreamModelName: info.UpstreamModelName,
 		IsStream: info.IsStream, SupportStreamOptions: info.SupportStreamOptions,
 		ReasoningEffort: info.ReasoningEffort, ReasoningConversion: info.ReasoningConversion,
 		RequestConversionChain: append([]types.RelayFormat(nil), info.RequestConversionChain...),
-		RelayFormat:            info.RelayFormat, RelayMode: protocolRelayMode(kind),
+		RelayFormat:            info.RelayFormat, RelayMode: mode,
 		SystemPrompt: info.ChannelSetting.SystemPrompt, SystemPromptOverride: info.ChannelSetting.SystemPromptOverride}
 }
 func ApplyProtocolRequestContext(c *gin.Context, info *relaycommon.RelayInfo, ctx *ProtocolRequestContext) {

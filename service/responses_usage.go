@@ -235,6 +235,7 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 				}
 			}
 			if facts := a.info.ResponseFacts; facts != nil {
+				facts.RecordTokenDetailPresence(raw, "response.usage")
 				prompt, completion := relaycommon.NativeUsagePresence(raw, "response.usage.input_tokens", "response.usage.output_tokens", "response.usage.total_tokens")
 				facts.InputDetailsReported = a.inputDetailsReported
 				if len(raw) == 0 {

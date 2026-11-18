@@ -31,11 +31,14 @@ import { api } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth-store'
 import { useSystemConfigStore } from '@/stores/system-config-store'
 
+import { metric, reportFixture } from '../../../__tests__/finance-fixtures'
+import type { FinanceFilter } from '../../../lib/finance'
 import { OverviewDashboard } from '../overview-dashboard'
 
 const storageKey = 'dashboard_overview_setup_guide_expanded'
 let client: QueryClient
 let keyLookupError: Error | null
+let requestCount = '1'
 
 beforeEach(() => {
   window.localStorage.clear()
@@ -47,12 +50,14 @@ beforeEach(() => {
     quota: 1000000,
     used_quota: 1000,
     request_count: 1,
+    permissions: { admin_permissions: { wallet: { read: true } } },
   })
   client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
   keyLookupError = null
-  vi.spyOn(api, 'get').mockImplementation(async (url) => {
+  requestCount = '1'
+  vi.spyOn(api, 'get').mockImplementation(async (url, config) => {
     switch (url) {
       case '/api/token/?p=1&size=10':
         if (keyLookupError) throw keyLookupError
@@ -77,8 +82,28 @@ beforeEach(() => {
         }
       case '/api/user/models':
         return { data: { success: true, data: ['gpt-4o-mini'] } }
-      case '/api/data/self':
-        return { data: { success: true, data: [] } }
+      case '/api/user/self/wallet':
+        return {
+          data: {
+            success: true,
+            data: {
+              user_id: 1,
+              currency: 'EUR',
+              balance: '9007199.254740993',
+              outstanding: '0.000000001',
+              consumed: { nanos: '1', currency: 'EUR' },
+              sale_pending: false,
+              requests_paused: false,
+              updated_at: 1,
+            },
+          },
+        }
+      case '/api/user/self/dashboard-finance': {
+        const report = reportFixture(config?.params as FinanceFilter)
+        report.totals.request_count = requestCount
+        report.totals.collected = metric('2')
+        return { data: { success: true, data: report } }
+      }
       default:
         throw new Error(`Unexpected dashboard request: ${url}`)
     }
@@ -107,6 +132,19 @@ async function renderOverview() {
 }
 
 describe('overview setup guide', () => {
+  it('uses the authorized exact wallet rather than legacy user quota for the balance', async () => {
+    await renderOverview()
+    expect(await screen.findByText('9,007,199.254740993 EUR')).toBeVisible()
+    expect(api.get).toHaveBeenCalledWith(
+      '/api/user/self/wallet',
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    )
+    expect(
+      vi
+        .mocked(api.get)
+        .mock.calls.some(([url]) => String(url).startsWith('/api/data'))
+    ).toBe(false)
+  })
   it('shows usage first and only a header entry when setup is complete', async () => {
     await renderOverview()
 
@@ -117,11 +155,11 @@ describe('overview setup guide', () => {
     ).toEqual(['Overview', 'Usage at a glance'])
     expect(screen.queryByText('Setup guide complete')).not.toBeInTheDocument()
     expect(screen.queryByText('Setup progress: 3/3')).not.toBeInTheDocument()
-    for (const name of ['API Keys', 'Channels', 'Usage Logs', 'Pricing']) {
+    for (const name of ['API Keys', 'Providers', 'Usage Logs', 'Pricing']) {
       expect(screen.queryByRole('button', { name })).not.toBeInTheDocument()
     }
-    const panel = document.getElementById(
-      toggle.getAttribute('aria-controls') ?? ''
+    const panel = document.querySelector(
+      `[id="${toggle.getAttribute('aria-controls')}"]`
     )
     expect(panel).toBeInTheDocument()
     expect(panel).not.toBeVisible()
@@ -137,7 +175,7 @@ describe('overview setup guide', () => {
     await user.keyboard('{Enter}')
     expect(toggle).toHaveAttribute('aria-expanded', 'true')
     expect(
-      document.getElementById(toggle.getAttribute('aria-controls') ?? '')
+      document.querySelector(`[id="${toggle.getAttribute('aria-controls')}"]`)
     ).toBeVisible()
     expect(
       screen.getByRole('heading', {
@@ -202,24 +240,21 @@ describe('overview setup guide', () => {
   })
 
   it('removes the collapsed progress banner when the remaining setup step completes', async () => {
+    requestCount = '0'
     useAuthStore.getState().auth.setUser({
       id: 1,
       username: 'dashboard-user',
       role: 1,
       quota: 1000000,
+      permissions: { admin_permissions: { wallet: { read: true } } },
     })
     window.localStorage.setItem(storageKey, 'collapsed')
     await renderOverview()
     expect(await screen.findByText('Setup progress: 2/3')).toBeVisible()
 
-    act(() => {
-      useAuthStore.getState().auth.setUser({
-        id: 1,
-        username: 'dashboard-user',
-        role: 1,
-        quota: 1000000,
-        request_count: 1,
-      })
+    await act(async () => {
+      requestCount = '1'
+      await client.invalidateQueries({ queryKey: ['dashboard-finance'] })
     })
     expect(
       await screen.findByRole('button', { name: 'Setup guide' })

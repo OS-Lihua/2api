@@ -132,62 +132,51 @@ func TestGetFlowQuotaDataUsesQuotaDataRoleSpecificDimensions(t *testing.T) {
 	require.Equal(t, 175, selfRows[0].Quota)
 }
 
-func TestLogQuotaDataSplitsRowsByUseGroupTokenChannelAndNode(t *testing.T) {
+func TestHistoricalQuotaDataPreservesDimensionsAndCacheTotals(t *testing.T) {
 	truncateTables(t)
-	CacheQuotaDataLock.Lock()
-	CacheQuotaData = make(map[string]*QuotaData)
-	CacheQuotaDataLock.Unlock()
-
-	LogQuotaData(QuotaDataLogParams{
-		UserID:    1,
-		Username:  "alice",
-		ModelName: "gpt-a",
-		CreatedAt: 3661,
-		UseGroup:  "vip",
-		TokenID:   11,
-		ChannelID: 1,
-		NodeName:  "node-a",
-		Quota:     100,
-		TokenUsed: 40,
-	})
-	LogQuotaData(QuotaDataLogParams{
-		UserID:    1,
-		Username:  "alice",
-		ModelName: "gpt-a",
-		CreatedAt: 3700,
-		UseGroup:  "vip",
-		TokenID:   11,
-		ChannelID: 1,
-		NodeName:  "node-a",
-		Quota:     50,
-		TokenUsed: 20,
-	})
-	LogQuotaData(QuotaDataLogParams{
-		UserID:    1,
-		Username:  "alice",
-		ModelName: "gpt-a",
-		CreatedAt: 3700,
-		UseGroup:  "default",
-		TokenID:   11,
-		ChannelID: 1,
-		NodeName:  "node-a",
-		Quota:     25,
-		TokenUsed: 10,
-	})
-
-	SaveQuotaDataCache()
-
-	var rows []QuotaData
-	require.NoError(t, DB.Order("quota DESC").Find(&rows).Error)
-	require.Len(t, rows, 2)
-	require.Equal(t, int64(3600), rows[0].CreatedAt)
-	require.Equal(t, "vip", rows[0].UseGroup)
-	require.Equal(t, 11, rows[0].TokenID)
-	require.Equal(t, 1, rows[0].ChannelID)
-	require.Equal(t, "node-a", rows[0].NodeName)
-	require.Equal(t, 2, rows[0].Count)
-	require.Equal(t, 150, rows[0].Quota)
-	require.Equal(t, 60, rows[0].TokenUsed)
-	require.Equal(t, "default", rows[1].UseGroup)
-	require.Equal(t, 25, rows[1].Quota)
+	seedFlowLookupData(t)
+	rows := []QuotaData{
+		{UserID: 1, Username: "alice", ModelName: "gpt-a", CreatedAt: 3600, UseGroup: "vip", TokenID: 11, ChannelID: 1, NodeName: "node-a", Quota: 150, TokenUsed: 60, Count: 2, CacheReadTokens: 12, CacheCreationTokens: 30},
+		{UserID: 1, Username: "alice", ModelName: "gpt-a", CreatedAt: 3600, UseGroup: "default", TokenID: 11, ChannelID: 1, NodeName: "node-a", Quota: 25, TokenUsed: 10, Count: 1, CacheReadTokens: 2, CacheCreationTokens: 5},
+		{UserID: 1, Username: "alice", ModelName: "gpt-a", CreatedAt: 3600, UseGroup: "vip", TokenID: 12, ChannelID: 1, NodeName: "node-a", Quota: 10, TokenUsed: 1, Count: 1, CacheCreationTokens: 1},
+		{UserID: 1, Username: "alice", ModelName: "gpt-a", CreatedAt: 3600, UseGroup: "vip", TokenID: 11, ChannelID: 2, NodeName: "node-a", Quota: 11, TokenUsed: 2, Count: 1, CacheCreationTokens: 2},
+		{UserID: 1, Username: "alice", ModelName: "gpt-a", CreatedAt: 3600, UseGroup: "vip", TokenID: 11, ChannelID: 1, NodeName: "node-b", Quota: 12, TokenUsed: 3, Count: 1, CacheCreationTokens: 3},
+	}
+	require.NoError(t, DB.Create(&rows).Error)
+	flow, err := GetFlowQuotaData(3600, 3600, "alice", 0, common.RoleRootUser)
+	require.NoError(t, err)
+	require.Len(t, flow, len(rows))
+	for _, source := range rows {
+		matched := false
+		for _, view := range flow {
+			if view.UseGroup == source.UseGroup && view.TokenID == source.TokenID && view.ChannelID == source.ChannelID && view.NodeName == source.NodeName {
+				matched = true
+				require.Equal(t, source.Quota, view.Quota)
+				require.Equal(t, source.TokenUsed, view.TokenUsed)
+				require.Equal(t, source.Count, view.Count)
+			}
+		}
+		require.True(t, matched, "historical group/token/provider/node dimensions must not be collapsed")
+	}
+	for _, read := range []func() ([]*QuotaData, error){
+		func() ([]*QuotaData, error) { return GetQuotaDataByUserId(1, 3600, 3600) },
+		func() ([]*QuotaData, error) { return GetQuotaDataByUsername("alice", 3600, 3600) },
+		func() ([]*QuotaData, error) { return GetAllQuotaDates(3600, 3600, "") },
+		func() ([]*QuotaData, error) { return GetQuotaDataGroupByUser(3600, 3600) },
+	} {
+		history, err := read()
+		require.NoError(t, err)
+		require.Len(t, history, 1)
+		require.Equal(t, 208, history[0].Quota)
+		require.Equal(t, 76, history[0].TokenUsed)
+		require.Equal(t, 6, history[0].Count)
+		require.EqualValues(t, 14, history[0].CacheReadTokens)
+		require.EqualValues(t, 41, history[0].CacheCreationTokens)
+	}
+	none, err := GetQuotaDataByUserId(1, 3601, 7199)
+	require.NoError(t, err)
+	require.Empty(t, none)
+	var retained []QuotaData
+	require.NoError(t, DB.Order("id").Find(&retained).Error)
+	require.Equal(t, rows, retained, "all historical views are read-only")
 }

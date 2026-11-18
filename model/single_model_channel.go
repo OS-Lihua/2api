@@ -9,7 +9,6 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/capability"
-	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"gorm.io/gorm"
 )
@@ -145,7 +144,7 @@ func validateChannelMutation(ctx context.Context, tx *gorm.DB, record *Channel, 
 		return common.NewMessage("Invalid upstream model name")
 	}
 	if key, task := record.Protocol.TaskPluginKey(); task {
-		if _, available := jsplugin.DefaultRegistry.Get(key); !available {
+		if _, available := priceDeclarationGeneration(ctx).Get(key); !available {
 			return common.NewMessage("Task plugin is not available")
 		}
 	}
