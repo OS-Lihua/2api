@@ -7,7 +7,8 @@ DEV_API_SERVICE = new-api
 DEV_POSTGRES_DB = new-api
 DEV_POSTGRES_USER = root
 
-.PHONY: all build-web build-all-web start-api dev dev-api dev-api-rebuild dev-web reset-setup test
+.PHONY: all build-web build-all-web start-api dev dev-api dev-api-rebuild dev-web reset-setup \
+	test test-modules test-router-native test-router-text test-router-other
 
 all: build-all-web start-api
 
@@ -38,25 +39,35 @@ dev-web:
 
 dev: dev-api dev-web
 
-# The main package embeds the ignored web/dist output and is covered after build-web.
-# Give native WebSocket, text gateway, and remaining router tests separate package timers.
+ROUTER_NATIVE_TESTS = TestResponsesWS|TestRealtime|TestWebSocket|TestNativeRouteCredentialForms
+ROUTER_TEXT_TESTS = TestTextGateway
+
 test:
+	$(MAKE) test-modules
+	$(MAKE) test-router-native
+	$(MAKE) test-router-text
+	$(MAKE) test-router-other
+
+# The main package embeds the ignored web/dist output and is covered after build-web.
+test-modules:
 	@echo "Testing root Go module..."
 	@set -eu; \
 		root_module=$$(GOWORK=off go list -m); \
-		router_package="$$root_module/router"; \
-		root_packages=$$(GOWORK=off go list -e ./... | grep -vxF -e "$$root_module" -e "$$router_package"); \
-		native_tests='^(TestResponsesWS|TestRealtime|TestWebSocket|TestNativeRouteCredentialForms)'; \
-		gateway_tests='^TestTextGateway'; \
-		other_tests='^(TestResponsesWS|TestRealtime|TestWebSocket|TestNativeRouteCredentialForms|TestTextGateway)'; \
-		GOWORK=off go test -timeout=40m $$root_packages; \
-		GOWORK=off go test -timeout=40m -run "$$native_tests" "$$router_package"; \
-		GOWORK=off go test -timeout=40m -run "$$gateway_tests" "$$router_package"; \
-		GOWORK=off go test -timeout=40m -skip "$$other_tests" "$$router_package"
+		root_packages=$$(GOWORK=off go list -e ./... | grep -vxF -e "$$root_module" -e "$$root_module/router"); \
+		GOWORK=off go test -timeout=40m $$root_packages
 	@echo "Testing relaykit Go module..."
 	@cd relaykit && GOWORK=off go test ./...
 	@echo "Testing tokenkit Go module..."
 	@cd tokenkit && GOWORK=off go test ./...
+
+test-router-native:
+	GOWORK=off go test -timeout=40m -run '^($(ROUTER_NATIVE_TESTS))' ./router
+
+test-router-text:
+	GOWORK=off go test -timeout=70m -run '^$(ROUTER_TEXT_TESTS)' ./router
+
+test-router-other:
+	GOWORK=off go test -timeout=70m -skip '^($(ROUTER_NATIVE_TESTS)|$(ROUTER_TEXT_TESTS))' ./router
 
 reset-setup:
 	@echo "Resetting local setup wizard state..."

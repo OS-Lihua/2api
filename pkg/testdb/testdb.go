@@ -1,9 +1,8 @@
 // Package testdb provisions isolated databases for backend tests.
 //
-// Each call creates a fresh PostgreSQL schema or ClickHouse database for one
-// test and drops it when the test ends, so tests can run in parallel against a
-// shared server. The package does not import the model package; callers open
-// the returned DSN with model.OpenDSN.
+// Each call creates a fresh schema or database for one test and drops it when
+// the test ends, so tests can run in parallel against a shared server. The
+// package does not import model. Callers open the returned DSN with model.OpenDSN.
 package testdb
 
 import (
@@ -86,6 +85,47 @@ func PostgresDSN(t T) string {
 		closeDB(admin)
 	})
 	return withQueryParam(t, base, "search_path", name)
+}
+
+// PostgresDatabaseDSN creates a fresh database for tests that inspect or write
+// database-wide state. The configured test role must be able to create databases.
+func PostgresDatabaseDSN(t T) string {
+	t.Helper()
+	base := os.Getenv(PostgresEnv)
+	if base == "" {
+		return ""
+	}
+	target, err := url.Parse(base)
+	if err != nil || (target.Scheme != "postgres" && target.Scheme != "postgresql") {
+		t.Fatalf("testdb: %s must be a PostgreSQL URL", PostgresEnv)
+		return ""
+	}
+	query := target.Query()
+	if query.Has("dbname") || query.Has("database") {
+		t.Fatalf("testdb: select the base database in the URL path")
+		return ""
+	}
+	name := isolatedName(t)
+	admin, err := gorm.Open(postgres.New(postgres.Config{DSN: base, PreferSimpleProtocol: true}), quietConfig())
+	if err != nil {
+		t.Fatalf("testdb: connect to %s for database provisioning", PostgresEnv)
+		return ""
+	}
+	t.Cleanup(func() { closeDB(admin) })
+	if err := admin.Exec(fmt.Sprintf(`CREATE DATABASE "%s" TEMPLATE template0`, name)).Error; err != nil {
+		t.Fatalf("testdb: create database %s: %v", name, err)
+		return ""
+	}
+	t.Cleanup(func() {
+		if err := admin.Exec(fmt.Sprintf(`DROP DATABASE "%s"`, name)).Error; err != nil {
+			t.Errorf("testdb: drop database %s: %v", name, err)
+		}
+	})
+	query.Del("search_path")
+	target.RawQuery = query.Encode()
+	target.Path = "/" + name
+	target.RawPath = ""
+	return target.String()
 }
 
 // ClickHouseLogDSN creates an empty ClickHouse database for t and returns a

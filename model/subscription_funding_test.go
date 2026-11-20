@@ -296,6 +296,10 @@ func TestLegacyTaskObligationsRejectIdentityRebinding(t *testing.T) {
 }
 
 func TestLegacyTaskObligationsRollbackUnsafeSources(t *testing.T) {
+	// Another test schema can already have committed the same migration.
+	neighbor := UseTestDatabases(t)
+	require.NoError(t, MigrateLegacyTaskObligations(neighbor))
+
 	for _, tc := range []struct{ name, raw string }{
 		{"invalid_json", `not-json-private-do-not-leak`},
 		{"duplicate_source", `{"billing_source":"subscription","billing_source":"wallet"}`},
@@ -334,7 +338,8 @@ func TestLegacyTaskObligationsRollbackUnsafeSources(t *testing.T) {
 			assert.NotContains(t, err.Error(), "private-do-not-leak")
 			assert.False(t, DB.Migrator().HasTable(&LegacyTaskObligation{}), "schema and first batch must roll back with a bad later batch")
 			var functions int64
-			require.NoError(t, DB.Raw(`SELECT COUNT(*) FROM pg_proc WHERE proname='protect_legacy_task_obligations'`).Scan(&functions).Error)
+			require.NoError(t, DB.Raw(`SELECT COUNT(*) FROM pg_proc
+ WHERE proname = 'protect_legacy_task_obligations' AND pronamespace = current_schema()::regnamespace`).Scan(&functions).Error)
 			assert.Zero(t, functions)
 			var count int64
 			require.NoError(t, DB.Model(&Task{}).Count(&count).Error)
