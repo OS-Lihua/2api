@@ -79,7 +79,15 @@ func TestLegacyAbilityRetirementStartup(t *testing.T) {
 	for _, source := range []string{"empty_legacy_source", "lost_source", "unsealed_archive", "import_state", "staging_only", "composite_type", "collation", "text_search"} {
 		for _, master := range []bool{true, false} {
 			t.Run(fmt.Sprintf("%s/master=%t", source, master), func(t *testing.T) {
-				t.Setenv("SQL_DSN", testdb.PostgresDSN(t))
+				var dsn string
+				if source == "import_state" || source == "staging_only" {
+					// The startup guard checks these reserved namespaces across the database.
+					dsn = testdb.PostgresDatabaseDSN(t)
+				} else {
+					dsn = testdb.PostgresDSN(t)
+				}
+				require.NotEmpty(t, dsn, "requires a real PostgreSQL fixture")
+				t.Setenv("SQL_DSN", dsn)
 				t.Setenv("SETTLEMENT_CURRENCY", "USD")
 				previous, previousMaster := model.DB, common.IsMasterNode
 				t.Cleanup(func() { model.DB, common.IsMasterNode = previous, previousMaster })
@@ -103,17 +111,28 @@ func TestLegacyAbilityRetirementStartup(t *testing.T) {
 					require.NoError(t, db.Exec(`CREATE TEXT SEARCH CONFIGURATION application_search (COPY = pg_catalog.english)`).Error)
 				case "staging_only":
 					require.NoError(t, db.Exec(`CREATE SCHEMA legacy_import_retirement_fixture; CREATE TABLE legacy_import_retirement_fixture.imported_record (id bigint)`).Error)
-					t.Cleanup(func() { require.NoError(t, db.Exec(`DROP SCHEMA legacy_import_retirement_fixture CASCADE`).Error) })
 				case "import_state":
-					t.Cleanup(func() { require.NoError(t, db.Exec(`DROP SCHEMA gateway_migration CASCADE`).Error) })
 					require.NoError(t, db.Exec(`CREATE SCHEMA gateway_migration; CREATE TABLE gateway_migration.source_imports (id bigint, phase text); INSERT INTO gateway_migration.source_imports VALUES (1,'loading')`).Error)
 				}
 				inventory := func() string {
 					var state string
-					require.NoError(t, db.Raw(`SELECT COALESCE(string_agg(n.nspname||'.'||c.relname,',' ORDER BY n.nspname,c.relname),'') FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' AND c.relkind IN ('r','p','S','v','m')`).Scan(&state).Error)
+					require.NoError(t, db.Raw(`SELECT COALESCE(string_agg(n.nspname || '.' || c.relname, ',' ORDER BY n.nspname, c.relname), '')
+ FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE (n.nspname IN (current_schema(), 'gateway_migration') OR left(n.nspname, 14) = 'legacy_import_')
+ AND c.relkind IN ('r','p','S','v','m')`).Scan(&state).Error)
 					return state
 				}
 				before := inventory()
+				if source == "lost_source" {
+					// Another package can create tables in its own test schema between snapshots.
+					neighborDSN := testdb.PostgresDSN(t)
+					neighbor, _, err := model.OpenDSN(testdb.PostgresEnv, neighborDSN, false)
+					require.NoError(t, err)
+					neighborPool, err := neighbor.DB()
+					require.NoError(t, err)
+					t.Cleanup(func() { _ = neighborPool.Close() })
+					require.NoError(t, neighbor.Exec(`CREATE TABLE unrelated_evidence (id bigint)`).Error)
+				}
 				common.IsMasterNode = master
 				for range 2 {
 					startupErr := model.InitDB()
@@ -1581,7 +1600,7 @@ func testLegacyMigrationReleasedDatabase(t *testing.T, kind, released string) {
 		_, err := exec.LookPath(client)
 		require.NoError(t, err)
 	}
-	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	dsn := testdb.PostgresDatabaseDSN(t)
 	require.NotEmpty(t, dsn, "requires an invocation-owned real PostgreSQL database")
 	t.Setenv("LEGACY_MIGRATION_TEST_TARGET", dsn)
 	t.Setenv("SETTLEMENT_CURRENCY", "USD")
@@ -1745,17 +1764,8 @@ INSERT INTO legacy_retained_records(record_key,exact_integer,payload) VALUES ('r
 	require.NoError(t, common.Unmarshal(stdout.Bytes(), &report))
 	assert.Equal(t, "backup_directory_failed", report.Failure)
 	var changedSchemas int64
-	require.NoError(t, db.Raw("SELECT count(*) FROM pg_namespace WHERE nspname = 'gateway_migration' OR nspname LIKE 'legacy_import_%'").Scan(&changedSchemas).Error)
+	require.NoError(t, db.Raw("SELECT count(*) FROM pg_namespace WHERE nspname = 'gateway_migration' OR left(nspname, 14) = 'legacy_import_'").Scan(&changedSchemas).Error)
 	require.Zero(t, changedSchemas)
-	// This test owns the import namespaces it is about to create. Remove them
-	// only after all replay/startup assertions, so later isolated-schema tests
-	// do not inherit this application's retained import-state evidence.
-	t.Cleanup(func() {
-		require.NoError(t, db.Exec(`DO $$ DECLARE owned_schema text; BEGIN
-		 FOR owned_schema IN SELECT nspname FROM pg_namespace WHERE nspname='gateway_migration' OR left(nspname,14)='legacy_import_' LOOP
-		 EXECUTE format('DROP SCHEMA %I CASCADE', owned_schema);
-		 END LOOP; END $$`).Error)
-	})
 
 	// Each blocked domain transaction must leave the imported legacy data
 	// intact. Repairing the imported data then permits the same command to resume.
