@@ -11,32 +11,34 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Checkout the event commit in both jobs. A PR merge ref can disappear while
+# Checkout the event commit in every job. A PR merge ref can disappear while
 # queued runs start, and a base branch can advance after the merge event.
 jobs:
   backend:
-    name: Backend test (${{ matrix.name }})
+    name: Backend test (${{ matrix.database }}, ${{ matrix.suite }})
     if: github.event.action != 'closed' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
+        database: [postgres-14, postgres-18, postgres-18-clickhouse-log]
+        suite: [modules, router-native, router-text, router-other]
         include:
           # PostgreSQL 14 is the minimum supported version.
-          - name: postgres-14
+          - database: postgres-14
             postgres: '14-alpine'
             clickhouse_log: false
-            checks: false
-          - name: postgres-18
+          - database: postgres-18
             postgres: '18-alpine'
             clickhouse_log: false
-            checks: true
           # Same primary database, with the log database on ClickHouse.
-          - name: postgres-18-clickhouse-log
+          - database: postgres-18-clickhouse-log
             postgres: '18-alpine'
             clickhouse_log: true
-            checks: false
+          - database: postgres-18
+            suite: modules
+            checks: true
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}
@@ -117,10 +119,11 @@ jobs:
         working-directory: tokenkit
         run: go build ./...
 
-      - name: Test root, relaykit, and tokenkit modules
+      - name: Run ${{ matrix.suite }} tests
         env:
           GOFLAGS: '-timeout=35m'
-        run: make test
+          TEST_SUITE: ${{ matrix.suite }}
+        run: make "test-$TEST_SUITE"
 
   frontend:
     name: Frontend typecheck and test
