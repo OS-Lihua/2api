@@ -42,7 +42,7 @@ func GetOptions(c *gin.Context) {
 	var options []*model.Option
 	common.OptionMapRWMutex.RLock()
 	for k, v := range common.OptionMap {
-		if k == "theme.frontend" || k == "ResendKeyConfigured" || k == "CompletionRatioMeta" || model.IsRetiredModelPricingOption(k) || model.IsRetiredChannelMaintenanceOption(k) || operation_setting.IsRetiredQuotaOption(k) || isRetiredQuotaReminderOption(k) || model.IsRetiredStatisticsOption(k) {
+		if k == "theme.frontend" || k == "ResendKeyConfigured" || k == "CompletionRatioMeta" || model.IsRetiredModelPricingOption(k) || model.IsRetiredChannelMaintenanceOption(k) || operation_setting.IsRetiredQuotaOption(k) || isRetiredQuotaReminderOption(k) || model.IsRetiredStatisticsOption(k) || model.IsRetiredAutoGroupOption(k) || model_setting.IsRetiredViolationFeeOption(k) {
 			continue
 		}
 		value := common.Interface2String(v)
@@ -138,6 +138,16 @@ func UpdateOption(c *gin.Context) {
 		common.ApiErrorStatus(c, http.StatusGone, common.NewMessage(model.RetiredStatisticsSettingsMessage), gin.H{"code": "legacy_statistics_settings_retired"})
 		return
 	}
+	if model.IsRetiredAutoGroupOption(identity.Key) {
+		c.Header("Cache-Control", "no-store")
+		common.ApiErrorStatus(c, http.StatusGone, common.NewMessage(model.RetiredAutoGroupSettingsMessage), gin.H{"code": "legacy_auto_group_settings_retired"})
+		return
+	}
+	if model_setting.IsRetiredViolationFeeOption(identity.Key) {
+		c.Header("Cache-Control", "no-store")
+		common.ApiErrorStatus(c, http.StatusGone, common.NewMessage(model_setting.RetiredViolationFeeSettingsMessage), gin.H{"code": "legacy_violation_fee_settings_retired"})
+		return
+	}
 	if model.IsRetiredModelPricingOption(identity.Key) {
 		RetiredModelPricing(c)
 		return
@@ -167,7 +177,7 @@ func UpdateOption(c *gin.Context) {
 		RetiredLegacyChannelManagement(c)
 		return
 	}
-	if option.Key == "GroupRatio" || option.Key == "GroupGroupRatio" || option.Key == "AutoGroups" || option.Key == "DefaultUseAutoGroup" || option.Key == "ExposeRatioEnabled" {
+	if option.Key == "GroupRatio" || option.Key == "GroupGroupRatio" {
 		RetiredModelPricing(c)
 		return
 	}
@@ -262,12 +272,6 @@ func UpdateOption(c *gin.Context) {
 		}
 	case "claude.default_max_tokens":
 		err = model_setting.ValidateClaudeDefaultMaxTokens(option.Value.(string))
-		if err != nil {
-			common.ApiError(c, err)
-			return
-		}
-	case operation_setting.ToolPriceOptionKey:
-		err = operation_setting.ValidateToolPricesJSON(option.Value.(string))
 		if err != nil {
 			common.ApiError(c, err)
 			return

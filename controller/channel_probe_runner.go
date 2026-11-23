@@ -81,12 +81,7 @@ func probeChannel(ctx context.Context, record model.Channel, provider *model.Pro
 	if provider.OpenAIOrganization != nil {
 		organization = *provider.OpenAIOrganization
 	}
-	channelOtherSettings := provider.GetOtherSettings()
-	// Capability probes always use the gateway's diagnostic conversion policy.
-	// A stored Provider policy is for live request routing and must not change
-	// probe observations or make unrelated Provider edits fail closed.
-	channelOtherSettings.ToolLossPolicy = string(types.ConversionLossPolicyAllow)
-	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: provider.Type, ChannelId: provider.Id, ChannelIsMultiKey: provider.ProviderInfo.IsMultiKey, ChannelMultiKeyIndex: index, ChannelBaseUrl: provider.GetBaseURL(), ApiType: apiType, ApiKey: key, Organization: organization, ChannelCreateTime: provider.CreatedTime, HeadersOverride: provider.GetHeaderOverride(), ChannelSetting: provider.GetSetting(), ChannelOtherSettings: channelOtherSettings, UpstreamModelName: record.UpstreamModelName}, DisablePing: true, OriginModelName: record.UpstreamModelName, RelayFormat: recipe.Format, RelayMode: recipe.Mode, IsStream: feature == "streaming", IsChannelTest: true}
+	info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: provider.Type, ChannelId: provider.Id, ChannelIsMultiKey: provider.ProviderInfo.IsMultiKey, ChannelMultiKeyIndex: index, ChannelBaseUrl: provider.GetBaseURL(), ApiType: apiType, ApiKey: key, Organization: organization, ChannelCreateTime: provider.CreatedTime, HeadersOverride: provider.GetHeaderOverride(), ChannelSetting: provider.GetSetting(), ChannelOtherSettings: provider.GetOtherSettings(), UpstreamModelName: record.UpstreamModelName}, DisablePing: true, OriginModelName: record.UpstreamModelName, RelayFormat: recipe.Format, RelayMode: recipe.Mode, IsStream: feature == "streaming", IsChannelTest: true}
 	cleanRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", nil)
 	if err != nil {
 		return "failed", "request_invalid"

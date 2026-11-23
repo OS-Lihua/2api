@@ -185,22 +185,149 @@ func TestLegacyMigrationFreshStartup(t *testing.T) {
 	require.NotEmpty(t, dsn, "requires an invocation-owned real PostgreSQL database")
 	t.Setenv("SQL_DSN", dsn)
 	t.Setenv("SETTLEMENT_CURRENCY", "USD")
-	previous, previousMaster := model.DB, common.IsMasterNode
-	t.Cleanup(func() { model.DB, common.IsMasterNode = previous, previousMaster })
-	common.IsMasterNode = true
+	previous, previousMaster, previousRedis := model.DB, common.IsMasterNode, common.RedisEnabled
+	t.Cleanup(func() { model.DB, common.IsMasterNode, common.RedisEnabled = previous, previousMaster, previousRedis })
+	common.IsMasterNode, common.RedisEnabled = true, false
 	for start := range 2 {
 		require.NoError(t, model.InitDB())
 		pool, err := model.DB.DB()
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = pool.Close() })
+		for _, column := range []string{"model_limits", "model_limits_enabled", "group", "auto_groups", "cross_group_retry", "remain_quota", "unlimited_quota", "used_quota", "allow_user_quota_query"} {
+			assert.False(t, model.DB.Migrator().HasColumn("tokens", column), "retired Key column %q must not exist", column)
+		}
+		for _, column := range []string{"models", "model_mapping", "group", "priority", "weight"} {
+			assert.False(t, model.DB.Migrator().HasColumn("providers", column), "retired Provider column %q must not exist", column)
+		}
 		if start == 0 {
 			require.NoError(t, model.DB.Create(&model.User{Id: 91, Username: "migration-fresh", Password: "fixture-password-hash", AffCode: "migration-fresh-aff"}).Error)
-			require.NoError(t, model.DB.Create(&model.Token{Id: 91, UserId: 91, Key: "fixture-fresh-key", ModelLimitsEnabled: true, ModelLimits: "unknown-model"}).Error)
+			require.NoError(t, model.DB.Create(&model.Token{Id: 91, UserId: 91, Key: "fixture-fresh-key"}).Error)
+			require.NoError(t, model.DB.Exec(`ALTER TABLE "tokens" ADD COLUMN "model_limits_enabled" boolean, ADD COLUMN "model_limits" varchar(1024), ADD COLUMN "group" text, ADD COLUMN "auto_groups" text, ADD COLUMN "cross_group_retry" boolean`).Error)
+			require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", 91).Updates(map[string]any{
+				"model_limits_enabled": true, "model_limits": "unknown-model", "group": "auto", "auto_groups": `malformed`, "cross_group_retry": true,
+			}).Error)
+
+			common.IsMasterNode = false
+			assert.Error(t, model.InitDB(), "a replica must wait for legacy Key permissions to be migrated")
+			opened, err := model.DB.DB()
+			require.NoError(t, err)
+			require.NoError(t, opened.Close())
+			common.IsMasterNode = true
 		}
 	}
 	var policy model.TokenOfferingPolicy
 	require.NoError(t, model.DB.Where("token_id = ?", 91).First(&policy).Error)
-	assert.False(t, policy.DefaultAllow, "moving the offline migration seam must retain normal startup's permission migration")
+	assert.False(t, policy.DefaultAllow, "an enabled list containing only unknown names must deny all")
+	assert.Zero(t, policy.Revision)
+
+	db := model.DB
+	provider := model.Provider{Type: 1, Key: "fresh-startup-fixture", Name: "existing native provider"}
+	require.NoError(t, db.Create(&provider).Error)
+	declareLegacyProviderColumns(t, db)
+	require.NoError(t, db.Exec(`UPDATE "providers" SET "priority" = 17 WHERE "id" = ?`, provider.Id).Error)
+	for _, master := range []bool{true, false} {
+		common.IsMasterNode = master
+		assert.ErrorIs(t, model.InitDB(), model.ErrLegacyProviderRouting)
+		opened, err := model.DB.DB()
+		require.NoError(t, err)
+		require.NoError(t, opened.Close())
+		model.DB = db
+	}
+	common.IsMasterNode = true
+	var priority int64
+	require.NoError(t, db.Table("providers").Where("id = ?", provider.Id).Pluck("priority", &priority).Error)
+	assert.EqualValues(t, 17, priority, "refused startup must not change the source")
+
+	// Old quota fields are separate from Key authority and need offline retirement.
+	quotaColumns := []string{"remain_quota", "unlimited_quota", "used_quota", "allow_user_quota_query"}
+	require.NoError(t, db.Exec(`ALTER TABLE "tokens"
+ ADD COLUMN "remain_quota" bigint, ADD COLUMN "unlimited_quota" boolean,
+ ADD COLUMN "used_quota" bigint, ADD COLUMN "allow_user_quota_query" boolean`).Error)
+	require.NoError(t, db.Exec(`UPDATE "tokens" SET "remain_quota" = 7, "unlimited_quota" = false,
+ "used_quota" = 3, "allow_user_quota_query" = true, "status" = ? WHERE "id" = 91`, common.TokenStatusExhausted).Error)
+	for _, master := range []bool{true, false} {
+		common.IsMasterNode = master
+		assert.ErrorIs(t, model.InitDB(), model.ErrLegacyKeyQuota)
+		opened, err := model.DB.DB()
+		require.NoError(t, err)
+		require.NoError(t, opened.Close())
+		model.DB = db
+	}
+	common.IsMasterNode = true
+
+	// A native database can have just one leftover Key routing column, even
+	// after its Key access policies have already been migrated.
+	require.NoError(t, db.Exec(`ALTER TABLE "tokens" ADD COLUMN "auto_groups" text`).Error)
+	common.IsMasterNode = false
+	require.ErrorIs(t, model.InitDB(), model.ErrLegacyKeyPermissions)
+	opened, err := model.DB.DB()
+	require.NoError(t, err)
+	require.NoError(t, opened.Close())
+	model.DB, common.IsMasterNode = db, true
+
+	// A failed Provider retirement must roll back the other retirements too.
+	require.NoError(t, db.Exec(`CREATE VIEW "provider_priority_dependency" AS SELECT "priority" FROM "providers"`).Error)
+	blocked, err := model.MigrateLegacyGateway(t.Context())
+	require.ErrorIs(t, err, model.ErrLegacyGatewayMigrationFailed)
+	assert.False(t, blocked.Committed)
+	assert.Contains(t, blocked.Items, model.LegacyGatewayMigrationItem{Resource: "migration", Reason: "provider_routing_retirement_failed_sqlstate_2BP01"})
+	assert.True(t, db.Migrator().HasColumn("tokens", "auto_groups"))
+	for _, column := range quotaColumns {
+		assert.True(t, db.Migrator().HasColumn("tokens", column), column)
+	}
+	var remaining int64
+	require.NoError(t, db.Table("tokens").Where("id = ?", 91).Pluck("remain_quota", &remaining).Error)
+	assert.EqualValues(t, 7, remaining)
+	assert.True(t, db.Migrator().HasColumn("providers", "priority"))
+	require.NoError(t, db.Exec(`DROP VIEW "provider_priority_dependency"`).Error)
+	first, err := model.MigrateLegacyGateway(t.Context())
+	require.NoError(t, err)
+	assert.False(t, first.AlreadyCompleted)
+	assert.EqualValues(t, 1, first.Counts["legacy_key_routing_columns_retired"])
+	assert.EqualValues(t, 4, first.Counts["legacy_key_quota_columns_retired"])
+	assert.EqualValues(t, 5, first.Counts["legacy_provider_routing_columns_retired"])
+	assert.Zero(t, first.Counts["legacy_key_limit_columns_retired"])
+	assert.Zero(t, first.Counts["key_policies_created"])
+	replay, err := model.MigrateLegacyGateway(t.Context())
+	require.NoError(t, err)
+	assert.True(t, replay.AlreadyCompleted)
+	assert.Zero(t, replay.Counts["legacy_key_routing_columns_retired"])
+	assert.Zero(t, replay.Counts["legacy_key_quota_columns_retired"])
+	for _, column := range quotaColumns {
+		assert.False(t, db.Migrator().HasColumn("tokens", column), column)
+	}
+	var savedKey model.Token
+	require.NoError(t, db.First(&savedKey, 91).Error)
+	assert.Equal(t, 91, savedKey.UserId)
+	assert.True(t, savedKey.Key == "fixture-fresh-key", "original Key must be preserved")
+	assert.Equal(t, common.TokenStatusExhausted, savedKey.Status)
+	_, err = model.ValidateUserToken(savedKey.Key)
+	assert.ErrorIs(t, err, model.ErrTokenInvalid)
+	assert.Zero(t, replay.Counts["legacy_provider_routing_columns_retired"])
+	for _, column := range []string{"models", "model_mapping", "group", "priority", "weight"} {
+		assert.False(t, db.Migrator().HasColumn("providers", column), column)
+	}
+	var storedProvider model.Provider
+	require.NoError(t, db.First(&storedProvider, provider.Id).Error)
+	assert.Equal(t, provider.Key, storedProvider.Key)
+	assert.Equal(t, provider.Name, storedProvider.Name)
+	var preserved model.TokenOfferingPolicy
+	require.NoError(t, db.Where("token_id = ?", 91).First(&preserved).Error)
+	assert.Equal(t, policy, preserved)
+
+	common.IsMasterNode = false
+	require.NoError(t, model.InitDB(), "a replica can start once the master has retired the old columns")
+	pool, err := model.DB.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pool.Close() })
+}
+
+func declareLegacyProviderColumns(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	require.NoError(t, db.Exec(`ALTER TABLE "providers"
+		ADD COLUMN IF NOT EXISTS "models" text, ADD COLUMN IF NOT EXISTS "model_mapping" text,
+		ADD COLUMN IF NOT EXISTS "group" varchar(64) DEFAULT 'default',
+		ADD COLUMN IF NOT EXISTS "priority" bigint DEFAULT 0, ADD COLUMN IF NOT EXISTS "weight" bigint DEFAULT 0`).Error)
 }
 
 // This explicit test-only schema represents a pre-retirement installation. A
@@ -209,6 +336,7 @@ func declareLegacyAbilityFixture(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	require.NoError(t, db.Exec(`DROP TABLE legacy_ability_retirements; DROP FUNCTION protect_legacy_ability_retirement()`).Error)
 	require.NoError(t, db.AutoMigrate(&model.Ability{}))
+	declareLegacyProviderColumns(t, db)
 }
 
 func midjourneyMigrationDB(t *testing.T) *gorm.DB {
@@ -1690,9 +1818,9 @@ INSERT INTO midjourneys (id,user_id,channel_id,mj_id,code,action,status,progress
  (91,41,53,'released-mj-queued',1,'IMAGINE','QUEUED','10%',1200,1700000000000,''),
  (92,42,1053,'released-mj-missing',22,'IMAGINE','QUEUED','0%',2400,1700000000000,''),
  (93,41,53,'released-mj-completed',1,'IMAGINE','SUCCESS','100%',3600,1700000000000,'https://artifact.invalid/released.png');
-INSERT INTO tokens (id,user_id,"key",status,name,expired_time,unlimited_quota,model_limits_enabled,model_limits,allow_ips) VALUES
- (61,41,'fixture-restricted-key',1,'restricted',-1,1,1,'migration-alias,unknown-old-model','127.0.0.1'),
- (62,42,'fixture-unrestricted-key',1,'unrestricted',-1,1,0,'','127.0.0.1');
+INSERT INTO tokens (id,user_id,"key",status,name,expired_time,unlimited_quota,model_limits_enabled,model_limits,allow_ips,"group",cross_group_retry,auto_groups) VALUES
+ (61,41,'fixture-restricted-key',1,'restricted',-1,1,1,'migration-alias,unknown-old-model','127.0.0.1','auto',1,'["vip","default"]'),
+ (62,42,'fixture-unrestricted-key',1,'unrestricted',-1,1,0,'','127.0.0.1','retired-group',0,NULL);
 DELETE FROM options WHERE "key" IN ('ModelRatio','ModelPrice','CompletionRatio','billing_setting.billing_mode','billing_setting.billing_expr','billing_setting.plugin_billing_expr');
 INSERT INTO options ("key",value) VALUES
  ('ModelRatio','{"migration-text":0.125,"unconvertible":-1,"claude-3-5-sonnet-20240620":1.5,"sora-similar-undeclared":0.25}'),
@@ -2004,6 +2132,25 @@ INSERT INTO legacy_retained_records(record_key,exact_integer,payload) VALUES ('r
 	require.NoError(t, db.Model(&model.TokenOfferingPolicy{}).Where("token_id = ?", 62).Count(&unrestricted).Error)
 	assert.Zero(t, unrestricted)
 	assert.Contains(t, report.Gateway.Items, model.LegacyGatewayMigrationItem{Resource: "key", ID: 61, Name: "unknown-old-model", Reason: "unknown_model_limit_name"})
+	assert.EqualValues(t, 2, report.Gateway.Counts["legacy_key_limit_columns_retired"])
+	assert.EqualValues(t, 3, report.Gateway.Counts["legacy_key_routing_columns_retired"])
+	assert.EqualValues(t, 4, report.Gateway.Counts["legacy_key_quota_columns_retired"])
+	assert.EqualValues(t, 5, report.Gateway.Counts["legacy_provider_routing_columns_retired"])
+	for _, column := range []string{"models", "model_mapping", "group", "priority", "weight"} {
+		assert.False(t, db.Migrator().HasColumn("providers", column), column)
+	}
+	for _, column := range []string{"model_limits", "model_limits_enabled", "group", "auto_groups", "cross_group_retry", "remain_quota", "unlimited_quota", "used_quota", "allow_user_quota_query"} {
+		assert.False(t, db.Migrator().HasColumn("tokens", column), column)
+	}
+	for _, pair := range []struct{ keyID, ownerID int }{{61, 41}, {62, 42}} {
+		var token model.Token
+		require.NoError(t, db.First(&token, pair.keyID).Error)
+		assert.Equal(t, pair.ownerID, token.UserId)
+		assert.Equal(t, common.TokenStatusEnabled, token.Status)
+		assert.EqualValues(t, -1, token.ExpiredTime)
+		require.NotNil(t, token.AllowIps)
+		assert.Equal(t, "127.0.0.1", *token.AllowIps)
+	}
 	var wallet model.Wallet
 	require.NoError(t, db.Where("owner_id = ? AND account_type = ?", 41, model.LedgerAccountUserWallet).First(&wallet).Error)
 	assert.Equal(t, money.Amount{Nanos: 1000002000, Currency: "USD"}, wallet.Balance)
@@ -2114,6 +2261,25 @@ INSERT INTO legacy_retained_records(record_key,exact_integer,payload) VALUES ('r
 	logDSN := testdb.ClickHouseLogDSN(t)
 	t.Setenv("LOG_SQL_DSN", logDSN)
 	catalogBeforeLate := catalogState()
+	// A previously converted database may still have legacy Provider columns.
+	// Running the offline command must drop them without replaying conversion.
+	var providerBefore, providerAfter model.Provider
+	require.NoError(t, db.First(&providerBefore, 51).Error)
+	declareLegacyProviderColumns(t, db)
+	require.NoError(t, db.Exec(`UPDATE "providers" SET "models" = 'must-not-be-reconverted', "priority" = 17 WHERE "id" = 51`).Error)
+	stdout.Reset()
+	stderr.Reset()
+	require.Zero(t, run(context.Background(), args, &stdout, &stderr))
+	report = migrationReport{}
+	require.NoError(t, common.Unmarshal(stdout.Bytes(), &report))
+	require.NotNil(t, report.Gateway)
+	assert.True(t, report.Gateway.Committed)
+	assert.False(t, report.Gateway.AlreadyCompleted, "retiring old Provider columns is a new change")
+	assert.EqualValues(t, 5, report.Gateway.Counts["legacy_provider_routing_columns_retired"])
+	assert.JSONEq(t, catalogBeforeLate, catalogState(), "Provider retirement cannot rewrite converted routing or money")
+	require.NoError(t, db.First(&providerAfter, providerBefore.Id).Error)
+	assert.Equal(t, providerBefore, providerAfter, "the Provider account is not rewritten")
+
 	existingBeforeLate := midjourneyMigrationState(t, db)
 	late := model.Midjourney{Id: 94, UserId: 987, ChannelId: 9999, MjId: "released-late-terminal", Action: "IMAGINE", Status: "SUCCESS", Progress: "100%", Quota: -17}
 	require.NoError(t, db.Create(&late).Error)
@@ -2184,6 +2350,11 @@ INSERT INTO legacy_retained_records(record_key,exact_integer,payload) VALUES ('r
 		common.IsMasterNode = master
 		require.NoError(t, model.InitDB(), "normal startup must accept the migrated database")
 		assert.False(t, db.Migrator().HasTable("abilities"), "neither startup role may recreate the retired source")
+		assert.False(t, db.Migrator().HasColumn("tokens", "model_limits"))
+		assert.False(t, db.Migrator().HasColumn("tokens", "model_limits_enabled"))
+		for _, column := range []string{"models", "model_mapping", "group", "priority", "weight"} {
+			assert.False(t, db.Migrator().HasColumn("providers", column), "startup must not recreate retired Provider column %q", column)
+		}
 		assert.JSONEq(t, originalAbilityFacts, abilityFacts("legacy_ability_sources"))
 		pool, err := model.DB.DB()
 		require.NoError(t, err)

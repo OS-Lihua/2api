@@ -52,6 +52,7 @@ func TestChannelPriorityPlan(t *testing.T) {
 func TestChannelPriorityDatabase(t *testing.T) {
 	db := UseTestDatabases(t)
 	require.NoError(t, db.AutoMigrate(&Provider{}, &Ability{}))
+	require.NoError(t, db.Exec(`ALTER TABLE providers ADD COLUMN priority bigint, ADD COLUMN weight bigint`).Error)
 	high, low, zero := int64(100), int64(99), int64(0)
 	w1, w2, w3, w4 := uint(11), uint(22), uint(33), uint(44)
 	channels := []Provider{
@@ -62,6 +63,7 @@ func TestChannelPriorityDatabase(t *testing.T) {
 	}
 	require.NoError(t, db.Create(&channels).Error)
 	for _, channel := range channels {
+		require.NoError(t, db.Exec(`UPDATE providers SET priority = ?, weight = ? WHERE id = ?`, channel.Priority, channel.Weight, channel.Id).Error)
 		for _, group := range []string{"default", "second"} {
 			require.NoError(t, db.Create(&Ability{Group: group, Model: "test", ChannelId: channel.Id, Priority: channel.Priority, Weight: uint(*channel.Weight), Enabled: true}).Error)
 		}
@@ -137,7 +139,7 @@ func TestChannelPriorityDatabase(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, initial, unchanged)
 	// Null priority is an effective zero and undo must restore the null itself.
-	require.NoError(t, db.Model(&Provider{}).Where("id = ?", channels[3].Id).Update("priority", nil).Error)
+	require.NoError(t, db.Exec(`UPDATE providers SET priority = NULL WHERE id = ?`, channels[3].Id).Error)
 	nullable, err := GetProviderPriorityOrder()
 	require.NoError(t, err)
 	var sorted []ProviderPriority

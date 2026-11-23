@@ -11,13 +11,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const userCacheSchemaVersion = 2
+const userCacheSchemaVersion = 3
 
 type UserBase struct {
 	Id             int    `json:"id"`
 	Group          string `json:"group"`
 	Email          string `json:"email"`
-	Quota          int    `json:"quota"`
 	Status         int    `json:"status"`
 	Role           int    `json:"role"`
 	Username       string `json:"username"`
@@ -29,7 +28,6 @@ type UserBase struct {
 }
 
 func (user UserBase) cacheMAC() (string, error) {
-	user.Quota = 0
 	return authCacheMAC(getUserCacheKey(user.Id), struct {
 		User           UserBase
 		AuthVersion    int64
@@ -40,7 +38,6 @@ func (user UserBase) cacheMAC() (string, error) {
 
 func (user *UserBase) WriteContext(c *gin.Context) {
 	common.SetContextKey(c, constant.ContextKeyUserGroup, user.Group)
-	common.SetContextKey(c, constant.ContextKeyUserQuota, user.Quota)
 	common.SetContextKey(c, constant.ContextKeyUserStatus, user.Status)
 	common.SetContextKey(c, constant.ContextKeyUserEmail, user.Email)
 	common.SetContextKey(c, constant.ContextKeyUserName, user.Username)
@@ -86,9 +83,7 @@ func populateUserCache(user User) error {
 	return writeUserCache(user.ToBaseUser(), true)
 }
 
-// updateUserCache refreshes non-quota user cache fields.
-// Quota is maintained by atomic quota delta paths and must not be overwritten
-// by stale user snapshots from profile/settings updates.
+// updateUserCache refreshes existing user metadata without creating a partial cache.
 func updateUserCache(user User) error {
 	if !common.RedisEnabled {
 		return nil
@@ -160,14 +155,6 @@ func getUserGroupCache(userId int) (string, error) {
 		return "", err
 	}
 	return cache.Group, nil
-}
-
-func getUserQuotaCache(userId int) (int, error) {
-	cache, err := GetUserCache(userId)
-	if err != nil {
-		return 0, err
-	}
-	return cache.Quota, nil
 }
 
 func getUserNameCache(userId int) (string, error) {

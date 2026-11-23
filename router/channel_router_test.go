@@ -33,6 +33,15 @@ func registerLegacyChannelCompatibilityTestRoutes(engine *gin.Engine) {
 	handlePermissionRoute(group, http.MethodPost, "/tag/disabled", authz.ChannelOperate, controller.DisableTagChannels)
 }
 
+// The retired tag handler reads the old Provider projection. Only subtests
+// that mount and exercise that handler need its historical columns.
+func restoreLegacyProviderTagFixture(t *testing.T) {
+	t.Helper()
+	require.NoError(t, model.DB.Exec(`ALTER TABLE "providers"
+		ADD COLUMN "models" text, ADD COLUMN "model_mapping" text,
+		ADD COLUMN "group" text, ADD COLUMN "priority" bigint, ADD COLUMN "weight" bigint`).Error)
+}
+
 func TestLegacyChannelRetirementAuthorityAndIsolation(t *testing.T) {
 	engine, admin, _ := newAdminTestServer(t)
 	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.TopUp{}, &model.QuotaData{}))
@@ -340,17 +349,19 @@ func TestProviderAccountListWithoutLegacyRoutingColumns(t *testing.T) {
 	setting := `{"credential":"adapter-secret"}`
 	header := `{"Authorization":"header-secret"}`
 	providers := []model.Provider{
-		{Name: "shared account", Type: 1, Status: common.ChannelStatusEnabled, Group: "vip", BaseURL: &address, Setting: &setting, HeaderOverride: &header,
+		{Name: "shared account", Type: 1, Status: common.ChannelStatusEnabled, BaseURL: &address, Setting: &setting, HeaderOverride: &header,
 			ProviderInfo: model.ProviderInfo{IsMultiKey: true, MultiKeySize: 1, MultiKeyDisabledReason: map[int]string{0: "upstream-secret"}}},
-		{Name: "second account", Type: 3, Status: common.ChannelStatusManuallyDisabled, Group: "default"},
-		{Name: "shared account", Type: 1, Status: common.ChannelStatusAutoDisabled, Group: "vip"},
-		{Name: "final account", Type: 3, Status: common.ChannelStatusEnabled, Group: "default"},
+		{Name: "second account", Type: 3, Status: common.ChannelStatusManuallyDisabled},
+		{Name: "shared account", Type: 1, Status: common.ChannelStatusAutoDisabled},
+		{Name: "final account", Type: 3, Status: common.ChannelStatusEnabled},
 	}
+	require.NoError(t, model.DB.Exec(`ALTER TABLE "providers"
+		ADD COLUMN IF NOT EXISTS "group" text, ADD COLUMN IF NOT EXISTS "priority" bigint`).Error)
+	legacyGroups := []string{"vip", "default", "vip", "default"}
 	for i := range providers {
-		priority := int64(100 - i)
-		providers[i].Priority = &priority
 		providers[i].Key = fmt.Sprintf("sk-provider-list-secret-%d", i)
 		require.NoError(t, model.DB.Create(&providers[i]).Error)
+		require.NoError(t, model.DB.Exec(`UPDATE "providers" SET "group" = ?, "priority" = ? WHERE "id" = ?`, legacyGroups[i], 100-i, providers[i].Id).Error)
 	}
 	path := "/api/admin/v1/providers"
 
@@ -376,11 +387,11 @@ func TestProviderAccountListWithoutLegacyRoutingColumns(t *testing.T) {
 		}
 	})
 
-	// Only this test's isolated schema loses these historical columns. Runtime
-	// account reads must not require them; offline source data is not modified.
-	for _, column := range []string{"group", "priority"} {
-		require.NoError(t, model.DB.Migrator().DropColumn(&model.Provider{}, column))
-		require.False(t, model.DB.Migrator().HasColumn(&model.Provider{}, column))
+	// Account reads must also work after the entire old routing schema is gone.
+	require.NoError(t, model.DB.Exec(`ALTER TABLE "providers" DROP COLUMN IF EXISTS "models", DROP COLUMN IF EXISTS "model_mapping",
+		DROP COLUMN IF EXISTS "group", DROP COLUMN IF EXISTS "priority", DROP COLUMN IF EXISTS "weight"`).Error)
+	for _, column := range []string{"models", "model_mapping", "group", "priority", "weight"} {
+		require.False(t, model.DB.Migrator().HasColumn("providers", column))
 	}
 	for _, tc := range []struct {
 		name     string

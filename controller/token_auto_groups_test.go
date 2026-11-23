@@ -8,21 +8,39 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
+
+type historicalTokenQuota struct {
+	RemainQuota         int
+	UsedQuota           int
+	UnlimitedQuota      bool
+	AllowUserQuotaQuery bool
+}
+
+func seedHistoricalTokenQuota(t *testing.T, db *gorm.DB, id int, quota historicalTokenQuota) {
+	t.Helper()
+	require.NoError(t, db.Exec(`ALTER TABLE tokens ADD COLUMN remain_quota bigint,
+		ADD COLUMN used_quota bigint, ADD COLUMN unlimited_quota boolean,
+		ADD COLUMN allow_user_quota_query boolean`).Error)
+	result := db.Exec(`UPDATE tokens SET remain_quota = ?, used_quota = ?, unlimited_quota = ?, allow_user_quota_query = ? WHERE id = ?`,
+		quota.RemainQuota, quota.UsedQuota, quota.UnlimitedQuota, quota.AllowUserQuotaQuery, id)
+	require.NoError(t, result.Error)
+	require.EqualValues(t, 1, result.RowsAffected)
+}
+
+func assertHistoricalTokenQuota(t *testing.T, db *gorm.DB, id int, want historicalTokenQuota) {
+	t.Helper()
+	var got historicalTokenQuota
+	require.NoError(t, db.Raw(`SELECT remain_quota, used_quota, unlimited_quota, allow_user_quota_query FROM tokens WHERE id = ?`, id).
+		Row().Scan(&got.RemainQuota, &got.UsedQuota, &got.UnlimitedQuota, &got.AllowUserQuotaQuery))
+	assert.Equal(t, want, got, "credential operations must not alter historical quota data")
+}
 
 func TestTokenManagementRejectsRetiredFields(t *testing.T) {
 	db := setupTokenControllerTestDB(t)
 	token := seedToken(t, db, 1, "historical-token", "historical-token-test-key")
-	token.RemainQuota = 73
-	token.UsedQuota = 27
-	token.UnlimitedQuota = false
-	token.AllowUserQuotaQuery = true
-	token.ModelLimitsEnabled = true
-	token.ModelLimits = "historical-model"
-	token.Group = "auto"
-	token.AutoGroups = `["vip","default"]`
-	token.CrossGroupRetry = true
-	require.NoError(t, db.Save(token).Error)
+	assertTokenQuotaColumnsAbsent(t, db)
 
 	for _, field := range []struct {
 		name  string
@@ -65,7 +83,7 @@ func TestTokenManagementRejectsRetiredFields(t *testing.T) {
 				assert.EqualValues(t, 1, count, "rejected requests must not create credentials")
 				saved, err := model.GetTokenByIds(token.Id, token.UserId)
 				require.NoError(t, err)
-				assert.Equal(t, *token, *saved, "rejected requests must preserve the credential and historical fields")
+				assert.Equal(t, *token, *saved, "rejected requests must preserve the credential")
 			})
 		}
 	}
@@ -74,34 +92,20 @@ func TestTokenManagementRejectsRetiredFields(t *testing.T) {
 func TestTokenUpdatePreservesHistoricalFields(t *testing.T) {
 	db := setupTokenControllerTestDB(t)
 	token := seedToken(t, db, 1, "historical-token", "historical-token-test-key")
-	token.RemainQuota = 73
-	token.UsedQuota = 27
-	token.UnlimitedQuota = false
-	token.AllowUserQuotaQuery = true
-	token.ModelLimitsEnabled = true
-	token.ModelLimits = "historical-model"
-	token.Group = "auto"
-	token.AutoGroups = `["vip","default"]`
-	token.CrossGroupRetry = true
-	require.NoError(t, db.Save(token).Error)
+	quota := historicalTokenQuota{RemainQuota: 73, UsedQuota: 27, AllowUserQuotaQuery: true}
+	seedHistoricalTokenQuota(t, db, token.Id, quota)
 
 	update := *token
 	update.Name = "updated-credential"
 	update.ExpiredTime = 4102444800
 	update.AllowIps = common.GetPointer("203.0.113.0/24")
 	update.Status = common.TokenStatusDisabled
-	update.RemainQuota = 500
-	update.UnlimitedQuota = true
-	update.AllowUserQuotaQuery = false
-	update.ModelLimitsEnabled = false
-	update.ModelLimits = "replacement-model"
-	update.Group = "default"
-	update.AutoGroups = ""
-	update.CrossGroupRetry = false
+	update.AccessedTime = 500 // Not an editable credential setting.
 	require.NoError(t, update.Update())
 
 	saved, err := model.GetTokenByIds(token.Id, token.UserId)
 	require.NoError(t, err)
 	token.Name, token.ExpiredTime, token.AllowIps, token.Status = update.Name, update.ExpiredTime, update.AllowIps, update.Status
-	assert.Equal(t, *token, *saved, "credential updates must preserve the historical migration and accounting fields")
+	assert.Equal(t, *token, *saved, "credential updates must preserve identity and access history")
+	assertHistoricalTokenQuota(t, db, token.Id, quota)
 }

@@ -92,8 +92,36 @@ func MigrateLegacyGateway(ctx context.Context) (*LegacyGatewayMigrationReport, e
 			return err
 		}
 		if abilityState == legacyAbilityNative {
-			report.AlreadyCompleted = true
-			return nil // Native initialization is not a legacy USD conversion.
+			// Native initialization is not a legacy USD conversion, but older
+			// native installations still carried retired routing columns.
+			stage = "key_policy"
+			columns, err := inspectLegacyKeyColumns(tx)
+			if err != nil {
+				return err
+			}
+			if err := migrateLegacyKeyPermissionsTx(tx, nil); err != nil {
+				return err
+			}
+			stage = "key_quota_retirement"
+			if err := retireLegacyKeyQuotaTx(tx, report); err != nil {
+				return err
+			}
+			stage = "provider_routing_retirement"
+			providerColumns, err := retireLegacyProviderRoutingTx(tx)
+			if err != nil {
+				return err
+			}
+			if providerColumns != 0 {
+				report.Counts["legacy_provider_routing_columns_retired"] = providerColumns
+			}
+			report.AlreadyCompleted = columns.ModelLimits+columns.Routing+columns.Quota+providerColumns == 0
+			if columns.ModelLimits != 0 {
+				report.Counts["legacy_key_limit_columns_retired"] = columns.ModelLimits
+			}
+			if columns.Routing != 0 {
+				report.Counts["legacy_key_routing_columns_retired"] = columns.Routing
+			}
+			return nil
 		}
 		if abilityState == legacyAbilityEmpty {
 			return ErrLegacyAbilityRetirement
@@ -136,7 +164,7 @@ func MigrateLegacyGateway(ctx context.Context) (*LegacyGatewayMigrationReport, e
 				return err
 			}
 			stage = "key_policy"
-			if err := migrateLegacyGatewayKeyPolicies(tx, report); err != nil {
+			if err := migrateLegacyKeyPermissionsTx(tx, report); err != nil {
 				return err
 			}
 			stage = "wallet"
@@ -148,6 +176,10 @@ func MigrateLegacyGateway(ctx context.Context) (*LegacyGatewayMigrationReport, e
 			}
 		}
 		if completed != 0 {
+			stage = "key_policy"
+			if err := migrateLegacyKeyPermissionsTx(tx, report); err != nil {
+				return err
+			}
 			// The money conversion is independent of the original gateway marker;
 			// previously migrated sites still retain released subscription terms.
 			stage = "subscription_money"
@@ -177,7 +209,6 @@ func MigrateLegacyGateway(ctx context.Context) (*LegacyGatewayMigrationReport, e
 		if err := migrateLegacyMidjourneyObligations(tx, report); err != nil {
 			return err
 		}
-		report.AlreadyCompleted = completed != 0 && obligationsCompleted != 0 && report.Counts["midjourney_obligations"] == 0 && abilityState == legacyAbilityRetired
 		if obligationsCompleted == 0 {
 			if err := tx.Create(&legacyGatewayMigration{Version: legacyMidjourneyMigrationVersion, CompletedAt: clock.Now().Unix()}).Error; err != nil {
 				return err
@@ -193,6 +224,22 @@ func MigrateLegacyGateway(ctx context.Context) (*LegacyGatewayMigrationReport, e
 		} else if _, err := inspectLegacyAbilityRetirementTx(tx); err != nil {
 			return err
 		}
+		stage = "key_quota_retirement"
+		if err := retireLegacyKeyQuotaTx(tx, report); err != nil {
+			return err
+		}
+		stage = "provider_routing_retirement"
+		providerColumns, err := retireLegacyProviderRoutingTx(tx)
+		if err != nil {
+			return err
+		}
+		if providerColumns != 0 {
+			report.Counts["legacy_provider_routing_columns_retired"] = providerColumns
+		}
+		report.AlreadyCompleted = completed != 0 && obligationsCompleted != 0 &&
+			report.Counts["midjourney_obligations"] == 0 && abilityState == legacyAbilityRetired &&
+			report.Counts["legacy_key_limit_columns_retired"] == 0 && report.Counts["legacy_key_routing_columns_retired"] == 0 &&
+			report.Counts["legacy_key_quota_columns_retired"] == 0 && providerColumns == 0
 		return nil
 	}, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
 	if err != nil {
@@ -307,8 +354,20 @@ type legacyGatewayOffering struct {
 	model       Model
 }
 
+// The catalog converter reads old routing declarations only before retirement.
+// Do not load account credentials into these offline snapshots.
+type legacyGatewayProvider struct {
+	Id            int
+	Type          int
+	Models        string
+	Group         string
+	ModelMapping  *string
+	ParamOverride *string
+	Setting       *string
+}
+
 type legacyGatewayChannel struct {
-	provider Provider
+	provider legacyGatewayProvider
 	name     string
 	upstream string
 	protocol protocol.Type
@@ -322,9 +381,8 @@ func migrateLegacyGatewayCatalog(ctx context.Context, tx *gorm.DB, report *Legac
 		return err
 	}
 	ctx = context.WithValue(ctx, legacyMigrationGenerationKey{}, pricingSource.generation)
-	var providers []Provider
-	// Source discovery needs only routing metadata, not credentials or URLs.
-	if err := tx.Select("id", "type", "models", "group", "model_mapping", "param_override", "setting").Order("id").Find(&providers).Error; err != nil {
+	var providers []legacyGatewayProvider
+	if err := tx.Table(providerTable).Select("id", "type", "models", "group", "model_mapping", "param_override", "setting").Order("id").Find(&providers).Error; err != nil {
 		return err
 	}
 	offerings := map[string]*legacyGatewayOffering{}
@@ -353,8 +411,14 @@ func migrateLegacyGatewayCatalog(ctx context.Context, tx *gorm.DB, report *Legac
 				aliasTargets[alias][target] = true
 			}
 		}
+		var groups []string
+		if provider.Group != "" {
+			for group := range strings.SplitSeq(strings.Trim(provider.Group, ","), ",") {
+				groups = append(groups, strings.TrimSpace(group))
+			}
+		}
 		seen := map[string]bool{}
-		for _, name := range provider.GetModels() {
+		for _, name := range legacyProviderModelNames(provider.Models) {
 			if seen[name] {
 				continue
 			}
@@ -371,7 +435,7 @@ func migrateLegacyGatewayCatalog(ctx context.Context, tx *gorm.DB, report *Legac
 				offerings[name] = entry
 			}
 			entry.providerIDs = append(entry.providerIDs, provider.Id)
-			entry.groups = append(entry.groups, provider.GetGroups()...)
+			entry.groups = append(entry.groups, groups...)
 			upstream, _ := followChannelModelMapping(mapping, name)
 			if upstream != strings.TrimSpace(upstream) {
 				return report.blocked("provider", int64(provider.Id), name, "invalid_upstream_model_name")
@@ -539,7 +603,7 @@ func priceDeclarationGeneration(ctx context.Context) *jsplugin.RoutingGeneration
 
 // The Provider type supplies a conservative default. Names never select a
 // protocol by resemblance; each new Channel still requires mapping confirmation.
-func legacyGatewayDefaultProtocol(provider Provider, name, upstream string, source *LegacyPricingConversionSource) (protocol.Type, error) {
+func legacyGatewayDefaultProtocol(provider legacyGatewayProvider, name, upstream string, source *LegacyPricingConversionSource) (protocol.Type, error) {
 	generation := source.generation
 	matches := func(plugin *jsplugin.LoadedPlugin) bool {
 		return slices.ContainsFunc(plugin.Meta.Models, func(declared string) bool {
@@ -602,46 +666,6 @@ func legacyGatewayDefaultProtocol(provider Provider, name, upstream string, sour
 		}
 		return protocol.OpenAIChat, nil
 	}
-}
-
-func migrateLegacyGatewayKeyPolicies(tx *gorm.DB, report *LegacyGatewayMigrationReport) error {
-	var tokens []Token
-	if err := lockForUpdate(tx).Select("id", "model_limits").Where(`"model_limits_enabled" = TRUE AND NOT EXISTS (SELECT 1 FROM "token_offering_policies" WHERE "token_id" = "tokens"."id")`).Order("id").Find(&tokens).Error; err != nil {
-		return err
-	}
-	var names []ModelOfferingName
-	if err := tx.Find(&names).Error; err != nil {
-		return err
-	}
-	offeringIDs := make(map[string]int, len(names))
-	for _, name := range names {
-		offeringIDs[name.Name] = name.OfferingID
-	}
-	for _, token := range tokens {
-		ids := map[int]bool{}
-		unknown := map[string]bool{}
-		for name := range strings.SplitSeq(token.ModelLimits, ",") {
-			if id, known := offeringIDs[name]; known {
-				ids[id] = true
-			} else if name != "" && !unknown[name] {
-				unknown[name] = true
-				report.Items = append(report.Items, LegacyGatewayMigrationItem{Resource: "key", ID: int64(token.Id), Name: name, Reason: "unknown_model_limit_name"})
-			}
-		}
-		if err := tx.Omit("Token").Create(&TokenOfferingPolicy{TokenID: token.Id, DefaultAllow: false}).Error; err != nil {
-			return err
-		}
-		for _, id := range slices.Sorted(maps.Keys(ids)) {
-			if err := tx.Omit("Token", "Offering").Create(&TokenOfferingException{TokenID: token.Id, OfferingID: id}).Error; err != nil {
-				return err
-			}
-		}
-		if err := tx.Create(&legacyGatewayMigrationMapping{Resource: "key_policy", LegacyID: int64(token.Id), TargetID: int64(token.Id)}).Error; err != nil {
-			return err
-		}
-		report.Counts["key_policies_created"]++
-	}
-	return nil
 }
 
 func migrateLegacyGatewayWallets(tx *gorm.DB, report *LegacyGatewayMigrationReport) error {

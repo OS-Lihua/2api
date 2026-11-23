@@ -243,8 +243,8 @@ func TestListModelsTokenLimitIncludesTieredBillingModel(t *testing.T) {
 	require.NoError(t, db.Create(&model.TokenOfferingPolicy{TokenID: token.Id, DefaultAllow: false}).Error)
 	require.NoError(t, db.Create(&model.TokenOfferingException{TokenID: token.Id, OfferingID: allowed.ID}).Error)
 	ids := decodeListModelsResponse(t, requestOfferingModels(t, token, constant.ChannelTypeOpenAI, func(c *gin.Context) {
-		common.SetContextKey(c, constant.ContextKeyTokenModelLimitEnabled, true)
-		common.SetContextKey(c, constant.ContextKeyTokenModelLimit, map[string]bool{"zz-token-unpriced-model": true})
+		c.Set("token_model_limit_enabled", true)
+		c.Set("token_model_limit", map[string]bool{"zz-token-unpriced-model": true})
 	}))
 	assert.Equal(t, map[string]struct{}{"zz-token-tiered-visible-model": {}}, ids, "only current Offering permission grants discovery; legacy ModelLimits neither grant nor deny")
 	require.NoError(t, db.Where("token_id = ?", token.Id).Delete(&model.TokenOfferingException{}).Error)
@@ -263,10 +263,10 @@ func TestListModelsTokenLimitUsesResolvedCustomAutoGroups(t *testing.T) {
 	require.NoError(t, db.Create(&model.TokenOfferingException{TokenID: token.Id, OfferingID: allowed.ID}).Error)
 	retired := func(c *gin.Context) {
 		common.SetContextKey(c, constant.ContextKeyUserGroup, "vip")
-		common.SetContextKey(c, constant.ContextKeyTokenGroup, "auto")
-		common.SetContextKey(c, constant.ContextKeyTokenAutoGroups, []string{"vip"})
-		common.SetContextKey(c, constant.ContextKeyTokenModelLimitEnabled, true)
-		common.SetContextKey(c, constant.ContextKeyTokenModelLimit, map[string]bool{"zz-vip-allowed": true, "zz-default-outside-snapshot": true})
+		c.Set("token_group", "auto")
+		c.Set("token_auto_groups", []string{"vip"})
+		c.Set("token_model_limit_enabled", true)
+		c.Set("token_model_limit", map[string]bool{"zz-vip-allowed": true, "zz-default-outside-snapshot": true})
 	}
 	assert.Equal(t, map[string]struct{}{"zz-vip-allowed": {}}, decodeListModelsResponse(t, requestOfferingModels(t, token, constant.ChannelTypeOpenAI, retired)))
 	require.NoError(t, db.Model(user).Update("group", "default").Error)
@@ -325,7 +325,7 @@ func newOfferingDiscoveryFixture(t *testing.T) (*gorm.DB, *model.User, *model.To
 	db := setupModelListControllerTestDB(t)
 	user := &model.User{Id: 1001, Username: "offering-discovery", Group: "default", Role: common.RoleCommonUser, Status: common.UserStatusEnabled}
 	require.NoError(t, db.Create(user).Error)
-	token := &model.Token{UserId: user.Id, Key: "offering-discovery-test-key", Name: "discovery", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 0, Group: "retired-group", ModelLimitsEnabled: true, ModelLimits: "retired-model"}
+	token := &model.Token{UserId: user.Id, Key: "offering-discovery-test-key", Name: "discovery", Status: common.TokenStatusEnabled, ExpiredTime: -1}
 	require.NoError(t, db.Create(token).Error)
 	return db, user, token
 }

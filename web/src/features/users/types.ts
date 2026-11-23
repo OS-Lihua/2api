@@ -43,8 +43,6 @@ export const userSchema = z.object({
   wechat_id: z.string().optional(),
   telegram_id: z.string().optional(),
   email: z.string().optional(),
-  quota: z.number(),
-  used_quota: z.number(),
   request_count: z.number(),
   group: z.string(),
   aff_code: z.string().optional(),

@@ -124,6 +124,55 @@ func TestMigrateProviderTableKeepsSingleModelChannels(t *testing.T) {
 	assert.Equal(t, channel, keptChannel)
 }
 
+func TestRetireLegacyProviderRoutingColumns(t *testing.T) {
+	db := UseTestDatabases(t)
+	require.NoError(t, db.AutoMigrate(&Provider{}))
+	provider := Provider{Type: 1, Key: "provider-retirement-fixture", Name: "existing provider"}
+	require.NoError(t, db.Create(&provider).Error)
+	require.NoError(t, db.Exec(`ALTER TABLE "providers"
+		ADD COLUMN IF NOT EXISTS "models" text, ADD COLUMN IF NOT EXISTS "model_mapping" text,
+		ADD COLUMN IF NOT EXISTS "group" text, ADD COLUMN IF NOT EXISTS "priority" bigint,
+		ADD COLUMN IF NOT EXISTS "weight" bigint`).Error)
+	require.NoError(t, db.Exec(`UPDATE "providers" SET "models" = ?, "priority" = ?, "weight" = ? WHERE "id" = ?`, "source-model", 2, 3, provider.Id).Error)
+	require.NoError(t, db.Exec(`CREATE TABLE "channels" ("provider_id" bigint REFERENCES "providers"("id"), "weight" bigint NOT NULL)`).Error)
+	require.NoError(t, db.Exec(`INSERT INTO "channels" ("provider_id", "weight") VALUES (?, ?)`, provider.Id, 17).Error)
+	require.NoError(t, db.Exec(`CREATE VIEW "legacy_provider_weight_view" AS SELECT "weight" FROM "providers"`).Error)
+
+	retire := func(want int64) error {
+		return db.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Exec(`SELECT pg_advisory_xact_lock(510050)`).Error; err != nil {
+				return err
+			}
+			count, err := retireLegacyProviderRoutingTx(tx)
+			if err == nil {
+				assert.Equal(t, want, count)
+			}
+			return err
+		})
+	}
+	require.ErrorContains(t, retire(0), "SQLSTATE 2BP01")
+	columns, err := inspectLegacyProviderRoutingColumns(db)
+	require.NoError(t, err)
+	assert.EqualValues(t, 5, columns)
+	var sourceModel string
+	require.NoError(t, db.Model(&Provider{}).Where("id = ?", provider.Id).Pluck("models", &sourceModel).Error)
+	assert.Equal(t, "source-model", sourceModel)
+	require.NoError(t, db.Exec(`DROP VIEW "legacy_provider_weight_view"`).Error)
+
+	require.NoError(t, retire(5))
+	require.NoError(t, retire(0))
+	columns, err = inspectLegacyProviderRoutingColumns(db)
+	require.NoError(t, err)
+	assert.Zero(t, columns)
+	var saved Provider
+	require.NoError(t, db.First(&saved, provider.Id).Error)
+	assert.Equal(t, provider.Name, saved.Name)
+	assert.Equal(t, provider.Key, saved.Key)
+	var weight int64
+	require.NoError(t, db.Table("channels").Where("provider_id = ?", provider.Id).Pluck("weight", &weight).Error)
+	assert.EqualValues(t, 17, weight)
+}
+
 func TestMigrateProviderTableRejectsBothTables(t *testing.T) {
 	db := UseTestDatabases(t)
 	require.NoError(t, db.AutoMigrate(&legacyProviderRow{}, &Provider{}))

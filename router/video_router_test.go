@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/testdb"
 	"github.com/QuantumNous/new-api/plugins"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -42,13 +43,12 @@ func TestGetOpenAIVideoRouteRendersJimengTask(t *testing.T) {
 		AuthVersion: 1,
 	}).Error)
 	require.NoError(t, database.Create(&model.Token{
-		Id:             1,
-		UserId:         91,
-		Key:            "jimengfetch",
-		Status:         common.TokenStatusEnabled,
-		Name:           "jimeng fetch",
-		ExpiredTime:    -1,
-		UnlimitedQuota: true,
+		Id:          1,
+		UserId:      91,
+		Key:         "jimengfetch",
+		Status:      common.TokenStatusEnabled,
+		Name:        "jimeng fetch",
+		ExpiredTime: -1,
 	}).Error)
 	require.NoError(t, database.Create(&model.Provider{
 		Id:     17,
@@ -173,7 +173,9 @@ func TestGetVideoRoutesKeepMoneyTaskReadsPersisted(t *testing.T) {
 		for _, oldLimits := range []bool{false, true} {
 			t.Run(fmt.Sprintf("provider_%d/old_limits_%t", providerStatus, oldLimits), func(t *testing.T) {
 				require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", fixture.channel.ProviderID).Update("status", providerStatus).Error)
-				require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"status": common.TokenStatusEnabled, "remain_quota": 0, "model_limits_enabled": oldLimits, "model_limits": "unrelated-model"}).Error)
+				require.NoError(t, model.DB.Model(fixture.token).Update("status", common.TokenStatusEnabled).Error)
+				testdb.SeedLegacyKeyQuota(t, model.DB, fixture.token.Id, testdb.LegacyKeyQuota{})
+				seedLegacyKeyLimits(t, fixture.token, oldLimits, "unrelated-model")
 				for _, path := range []string{"/v1/videos/" + before.TaskID, "/v1/video/generations/" + before.TaskID} {
 					read := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodGet, path, "")
 					assert.Equal(t, http.StatusOK, read.Code, read.Body.String())
@@ -238,7 +240,7 @@ func TestGetOpenAIVideoRouteHandsNativeXAITaskToPluginQuery(t *testing.T) {
 	setupRelayRouterTestDB(t)
 	require.NoError(t, model.DB.AutoMigrate(&model.Provider{}, &model.Task{}))
 	require.NoError(t, model.DB.Create(&model.User{Id: 92, Username: "xai-fetch-user", Status: common.UserStatusEnabled, Group: "default", Quota: 100}).Error)
-	require.NoError(t, model.DB.Create(&model.Token{UserId: 92, Key: "xaifetch", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}).Error)
+	require.NoError(t, model.DB.Create(&model.Token{UserId: 92, Key: "xaifetch", Status: common.TokenStatusEnabled, ExpiredTime: -1}).Error)
 	for taskID, requestPath := range map[string]string{"task_xai_native": "/v1/videos/generations", "task_xai_pinned": "/xai/v1/videos/generations", "task_xai_openai": "/v1/videos"} {
 		task := &model.Task{
 			CreatedAt:  1710000000,

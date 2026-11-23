@@ -128,8 +128,6 @@ export interface WalletBalance {
 export interface UserWalletData {
   id: number
   username: string
-  quota: number
-  used_quota: number
   request_count: number
   aff_count: number
   group: string

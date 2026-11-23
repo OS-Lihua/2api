@@ -182,10 +182,12 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 	common.QuotaPerUnit = 500000
 	t.Cleanup(func() { common.QuotaPerUnit = previousQuota })
 	db := modelManagementDB(t)
+	declareLegacyProviderRoutingColumns(t, db)
 	// These are legacy conversion sources, not account API mutations.
 	insertLegacyProvider := func(t *testing.T, provider *model.Provider) {
 		t.Helper()
 		require.NoError(t, provider.Insert())
+		seedLegacyProviderRouting(t, db, provider)
 		require.NoError(t, provider.AddAbilities(nil))
 	}
 	contract, err := os.ReadFile("../pkg/billingexpr/testdata/frontend_simulation.json")
@@ -1328,6 +1330,7 @@ export function parseTaskResult() { return {}; }
 		const name = "gpt-6-astra"
 		builtin, exists := billing_setting.GetBuiltinBillingExpr(name)
 		require.True(t, exists)
+		declareLegacyProviderRoutingColumns(t, db)
 		source := legacyPricingSource(t, db)
 		options := modelManagementOptions(t, db)
 		custom, err := source.Preview(name, model.PricingValues{"ModelPrice": float64(0)})
@@ -1782,9 +1785,11 @@ func TestModelDeletionDatabase(t *testing.T) {
 				{Name: "Last model", Type: 1, Models: name, Group: "last-model-group", Status: common.ChannelStatusEnabled},
 				{Name: "Case-sensitive name", Type: 1, Models: strings.ToUpper(name), Group: "case-group", Status: common.ChannelStatusEnabled},
 			}
+			declareLegacyProviderRoutingColumns(t, db)
 			for i := range providers {
 				require.NoError(t, db.Create(&providers[i]).Error)
 				// Explicit historical source, never a live account API mutation.
+				seedLegacyProviderRouting(t, db, &providers[i])
 				require.NoError(t, providers[i].AddAbilities(db))
 			}
 			archiveBefore, err := model.ArchiveLegacyAbilitySource(db)
@@ -1964,6 +1969,7 @@ func TestSharedModelPluginPricingDatabase(t *testing.T) {
 	const base = `tier("base", u("seconds") * 0.4)`
 	const variant = `tier("beta", u("credits") * 2)`
 	db := modelManagementDB(t)
+	declareLegacyProviderRoutingColumns(t, db)
 	for _, spec := range []struct{ key, field, unit string }{{"matrix-alpha", "seconds", "second"}, {"matrix-beta", "credits", "credit"}} {
 		source := fmt.Sprintf(`
 export const meta = {apiVersion:1,key:%q,name:%q,version:"1.0.0",author:{name:"Test"},models:[%q],fetchMode:"per_task",usageSchema:{%s:{type:"number",unit:%q}}};

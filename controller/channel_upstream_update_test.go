@@ -344,7 +344,9 @@ func TestFailedAdvancedCustomDetectionDoesNotStageFullRemoval(t *testing.T) {
 	settings.UpstreamModelUpdateCheckEnabled = true
 	settings.UpstreamModelUpdateAutoSyncEnabled = true
 	channel.SetOtherSettings(settings)
+	declareLegacyProviderRoutingColumns(t, db)
 	require.NoError(t, db.Create(channel).Error)
+	seedLegacyProviderRouting(t, db, channel)
 
 	modelsChanged, autoAdded, err := checkAndPersistChannelUpstreamModelUpdates(channel, &settings, true, true)
 	require.ErrorContains(t, err, "no valid model IDs")

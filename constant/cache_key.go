@@ -7,8 +7,3 @@ const (
 	UserEnabledKeyFmt  = "user_enabled:%d"
 	UserUsernameKeyFmt = "user_name:%d"
 )
-
-const (
-	TokenFiledRemainQuota = "RemainQuota"
-	TokenFieldGroup       = "Group"
-)

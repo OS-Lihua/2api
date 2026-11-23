@@ -110,7 +110,7 @@ func TestSaleCatalogHTTP(t *testing.T) {
 			response := adminSecurityRequest(engine, rootToken, route.method, route.path, route.body)
 			assert.Equal(t, 410, response.Code, route.method+" "+route.path+": "+response.Body.String())
 		}
-		for _, key := range []string{"ModelRatio", "ModelPrice", "billing_setting.billing_expr", "GroupRatio", "GroupGroupRatio", "AutoGroups", "DefaultUseAutoGroup", "ExposeRatioEnabled"} {
+		for _, key := range []string{"ModelRatio", "ModelPrice", "billing_setting.billing_expr", "GroupRatio", "GroupGroupRatio", "AutoGroups", "DefaultUseAutoGroup", "MaxTokenAutoGroups", "ExposeRatioEnabled"} {
 			body, err := common.Marshal(map[string]string{"key": key, "value": `{}`})
 			require.NoError(t, err)
 			response := adminSecurityRequest(engine, rootToken, "PUT", "/api/option/", string(body))

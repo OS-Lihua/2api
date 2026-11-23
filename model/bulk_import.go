@@ -496,7 +496,7 @@ func ImportBatch(ctx context.Context, rows []BulkImportRow, dryRun bool, actorID
 				record := *mutation.provider
 				temporary := record.Id
 				record.Id = 0
-				if err := tx.Create(&record).Error; err != nil {
+				if err := providerAccountColumns(tx).Create(&record).Error; err != nil {
 					return err
 				}
 				ids[temporary] = record.Id

@@ -198,7 +198,9 @@ func TestLegacyAbilityRetirementFreshAtomicity(t *testing.T) {
 			callback := "test:fresh_ability_failure"
 			triggered := false
 			fail := func(tx *gorm.DB) {
-				if (phase == "proof" && tx.Statement.Table == "legacy_ability_retirements") || (phase == "key_permissions" && tx.Statement.Table == "tokens") {
+				isProofWrite := phase == "proof" && tx.Statement.Table == "legacy_ability_retirements"
+				isKeySchemaRead := phase == "key_permissions" && strings.Contains(tx.Statement.SQL.String(), "'model_limits_enabled'")
+				if isProofWrite || isKeySchemaRead {
 					triggered = true
 					tx.AddError(tx.Exec(`SELECT 1/0`).Error)
 				}
@@ -206,7 +208,7 @@ func TestLegacyAbilityRetirementFreshAtomicity(t *testing.T) {
 			if phase == "proof" {
 				require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callback, fail))
 			} else {
-				require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callback, fail))
+				require.NoError(t, db.Callback().Row().Before("gorm:row").Register(callback, fail))
 			}
 			previous := DB
 			require.Error(t, initializeNativeDatabase(db))
@@ -215,7 +217,7 @@ func TestLegacyAbilityRetirementFreshAtomicity(t *testing.T) {
 			if phase == "proof" {
 				require.NoError(t, db.Callback().Create().Remove(callback))
 			} else {
-				require.NoError(t, db.Callback().Query().Remove(callback))
+				require.NoError(t, db.Callback().Row().Remove(callback))
 			}
 			empty, err := emptyNativeApplicationSchema(db)
 			require.NoError(t, err)
@@ -255,6 +257,8 @@ func legacyAbilityRetirementFixture(t *testing.T) *gorm.DB {
 	// Simulate an installation predating this retirement. Never used in production.
 	require.NoError(t, db.Exec(`DROP TABLE legacy_ability_retirements; DROP FUNCTION protect_legacy_ability_retirement()`).Error)
 	require.NoError(t, db.AutoMigrate(&Ability{}))
+	require.NoError(t, db.Exec(`ALTER TABLE "providers" ADD COLUMN "models" text, ADD COLUMN "group" text,
+		ADD COLUMN "model_mapping" text, ADD COLUMN "priority" bigint, ADD COLUMN "weight" bigint`).Error)
 	require.NoError(t, db.Create(&User{Id: 41, Username: "ability-root", Password: "fixture-hash", Role: 100, Status: 1, AffCode: "ability-root", Quota: 500000}).Error)
 	require.NoError(t, db.Exec(`INSERT INTO providers(id,type,"key",status,name,models,"group",model_mapping,setting,param_override)
  VALUES (51,1,'',1,'archive-provider','archive-model','default','{}','{}','{}');
@@ -324,7 +328,8 @@ func TestLegacyAbilityRetirementCompletedAndCorruptProofs(t *testing.T) {
 	require.NoError(t, db.Exec(`CREATE TABLE abilities AS SELECT "group",model,channel_id,enabled,priority,weight,tag FROM legacy_ability_sources;
  DROP TABLE legacy_ability_retirements,legacy_ability_sources,legacy_ability_source_manifests;
  DROP FUNCTION protect_legacy_ability_retirement(); DROP FUNCTION protect_legacy_ability_source();
- UPDATE providers SET model_mapping='{"archive-model":"cycle","cycle":"archive-model"}';
+ ALTER TABLE "providers" ADD COLUMN "model_mapping" text;
+ UPDATE "providers" SET "model_mapping"='{"archive-model":"cycle","cycle":"archive-model"}';
  UPDATE options SET value='{"archive-model":123}' WHERE key='ModelRatio'`).Error)
 	snapshot := func() string {
 		var state string

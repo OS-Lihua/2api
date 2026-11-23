@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"testing"
 
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -725,14 +726,15 @@ func TestChannelSettingsValidateHTTPTransport(t *testing.T) {
 	assert.Contains(t, err.Error(), "http2_connection_shards")
 }
 
-func TestChannelOtherSettingsValidateToolLossPolicy(t *testing.T) {
-	require.NoError(t, (*ProviderOtherSettings)(nil).ValidateToolLossPolicy())
-	require.NoError(t, (&ProviderOtherSettings{}).ValidateToolLossPolicy())
-	require.NoError(t, (&ProviderOtherSettings{ToolLossPolicy: "allow"}).ValidateToolLossPolicy())
-	require.NoError(t, (&ProviderOtherSettings{ToolLossPolicy: "safe"}).ValidateToolLossPolicy())
-	require.NoError(t, (&ProviderOtherSettings{ToolLossPolicy: "strict"}).ValidateToolLossPolicy())
-
-	err := (&ProviderOtherSettings{ToolLossPolicy: "drop"}).ValidateToolLossPolicy()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "tool_loss_policy")
+func TestProviderOtherSettingsIgnoreRetiredToolLossPolicy(t *testing.T) {
+	for _, policy := range []string{`null`, `""`, `"allow"`, `"safe"`, `"strict"`, `"drop"`, `17`} {
+		t.Run(policy, func(t *testing.T) {
+			var settings ProviderOtherSettings
+			require.NoError(t, kitutil.UnmarshalJsonStr(`{"tool_loss_policy":`+policy+`,"openrouter_enterprise":true}`, &settings))
+			assert.True(t, settings.IsOpenRouterEnterprise())
+			encoded, err := kitutil.Marshal(settings)
+			require.NoError(t, err)
+			assert.JSONEq(t, `{"openrouter_enterprise":true}`, string(encoded))
+		})
+	}
 }

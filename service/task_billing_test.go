@@ -93,15 +93,14 @@ func seedUser(t *testing.T, id int, quota int) {
 func seedToken(t *testing.T, id int, userId int, key string, remainQuota int) {
 	t.Helper()
 	token := &model.Token{
-		Id:          id,
-		UserId:      userId,
-		Key:         key,
-		Name:        "test_token",
-		Status:      common.TokenStatusEnabled,
-		RemainQuota: remainQuota,
-		UsedQuota:   0,
+		Id:     id,
+		UserId: userId,
+		Key:    key,
+		Name:   "test_token",
+		Status: common.TokenStatusEnabled,
 	}
 	require.NoError(t, model.DB.Create(token).Error)
+	testdb.SeedLegacyKeyQuota(t, model.DB, id, testdb.LegacyKeyQuota{RemainQuota: remainQuota})
 }
 
 func seedSubscriptionTaskMoney(t *testing.T, consumed int64) model.UserSubscription {
@@ -157,7 +156,7 @@ func seedChargedAccounting(t *testing.T, userID, channelID, tokenID, quota, requ
 	require.NoError(t, model.DB.Model(&model.Provider{}).Where("id = ?", channelID).
 		Update("used_quota", quota).Error)
 	if tokenID > 0 {
-		require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).
+		require.NoError(t, model.DB.Table("tokens").Where("id = ?", tokenID).
 			Update("used_quota", quota).Error)
 	}
 }
@@ -580,16 +579,12 @@ func getChannelUsedQuota(t *testing.T, id int) int64 {
 
 func getTokenRemainQuota(t *testing.T, id int) int {
 	t.Helper()
-	var token model.Token
-	require.NoError(t, model.DB.Select("remain_quota").Where("id = ?", id).First(&token).Error)
-	return token.RemainQuota
+	return testdb.ReadLegacyKeyQuota(t, model.DB, id).RemainQuota
 }
 
 func getTokenUsedQuota(t *testing.T, id int) int {
 	t.Helper()
-	var token model.Token
-	require.NoError(t, model.DB.Select("used_quota").Where("id = ?", id).First(&token).Error)
-	return token.UsedQuota
+	return testdb.ReadLegacyKeyQuota(t, model.DB, id).UsedQuota
 }
 
 func assertSubscriptionTaskSettlement(t *testing.T, reserved, actual int64, status model.TaskStatus) {

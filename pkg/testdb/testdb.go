@@ -128,6 +128,42 @@ func PostgresDatabaseDSN(t T) string {
 	return target.String()
 }
 
+// LegacyKeyQuota is the old SQL shape. Only tests of upgrade-era behavior
+// should install it; new database fixtures leave these columns absent.
+type LegacyKeyQuota struct {
+	RemainQuota         int
+	UsedQuota           int
+	UnlimitedQuota      bool
+	AllowUserQuotaQuery bool
+}
+
+func SeedLegacyKeyQuota(t T, db *gorm.DB, keyID int, quota LegacyKeyQuota) {
+	t.Helper()
+	if err := db.Exec(`ALTER TABLE "tokens"
+ ADD COLUMN IF NOT EXISTS "remain_quota" bigint NOT NULL DEFAULT 0,
+ ADD COLUMN IF NOT EXISTS "used_quota" bigint NOT NULL DEFAULT 0,
+ ADD COLUMN IF NOT EXISTS "unlimited_quota" boolean NOT NULL DEFAULT false,
+ ADD COLUMN IF NOT EXISTS "allow_user_quota_query" boolean NOT NULL DEFAULT false`).Error; err != nil {
+		t.Fatalf("testdb: declare legacy Key quota: %v", err)
+	}
+	result := db.Table("tokens").Where(`"id" = ?`, keyID).Updates(map[string]any{
+		"remain_quota": quota.RemainQuota, "used_quota": quota.UsedQuota,
+		"unlimited_quota": quota.UnlimitedQuota, "allow_user_quota_query": quota.AllowUserQuotaQuery,
+	})
+	if result.Error != nil || result.RowsAffected != 1 {
+		t.Fatalf("testdb: seed legacy Key quota for ID %d: rows=%d: %v", keyID, result.RowsAffected, result.Error)
+	}
+}
+
+func ReadLegacyKeyQuota(t T, db *gorm.DB, keyID int) LegacyKeyQuota {
+	t.Helper()
+	var quota LegacyKeyQuota
+	if err := db.Table("tokens").Select(`"remain_quota", "used_quota", "unlimited_quota", "allow_user_quota_query"`).Where(`"id" = ?`, keyID).Take(&quota).Error; err != nil {
+		t.Fatalf("testdb: read legacy Key quota for ID %d: %v", keyID, err)
+	}
+	return quota
+}
+
 // ClickHouseLogDSN creates an empty ClickHouse database for t and returns a
 // DSN that selects it. It returns "" when ClickHouseLogEnv is unset.
 func ClickHouseLogDSN(t T) string {

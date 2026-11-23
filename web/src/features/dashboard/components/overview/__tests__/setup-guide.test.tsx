@@ -43,7 +43,7 @@ let requestCount = '1'
 beforeEach(() => {
   window.localStorage.clear()
   useSystemConfigStore.setState(useSystemConfigStore.getInitialState(), true)
-  useAuthStore.getState().auth.setUser({
+  const legacyUser = {
     id: 1,
     username: 'dashboard-user',
     role: 1,
@@ -51,7 +51,8 @@ beforeEach(() => {
     used_quota: 1000,
     request_count: 1,
     permissions: { admin_permissions: { wallet: { read: true } } },
-  })
+  }
+  useAuthStore.getState().auth.setUser(legacyUser)
   client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -245,7 +246,6 @@ describe('overview setup guide', () => {
       id: 1,
       username: 'dashboard-user',
       role: 1,
-      quota: 1000000,
       permissions: { admin_permissions: { wallet: { read: true } } },
     })
     window.localStorage.setItem(storageKey, 'collapsed')

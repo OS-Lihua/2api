@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/testdb"
 	"github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
@@ -51,7 +52,8 @@ func TestKeyPermissionsFourProtocol(t *testing.T) {
 				})
 				// A fully funded legacy route with the same names must not bypass Offering-ID permissions.
 				require.NoError(t, model.DB.Model(f.user).Update("quota", 1_000_000).Error)
-				require.NoError(t, model.DB.Model(f.token).Updates(map[string]any{"remain_quota": 1_000_000, "unlimited_quota": false}).Error)
+				legacy := testdb.LegacyKeyQuota{RemainQuota: 1_000_000}
+				testdb.SeedLegacyKeyQuota(t, model.DB, f.token.Id, legacy)
 				require.NoError(t, model.DB.Create(&[]model.Ability{
 					{Group: "default", Model: f.offering.Name, ChannelId: f.channel.ProviderID, Enabled: true},
 					{Group: "default", Model: "gateway-alias", ChannelId: f.channel.ProviderID, Enabled: true},
@@ -97,8 +99,10 @@ func TestKeyPermissionsFourProtocol(t *testing.T) {
 				assert.Equal(t, entriesBefore.Data["total"], entriesAfter.Data["total"], "denied requests must not post ledger entries")
 				tokenAfter := walletAPIRequest(t, f.engine, pat, http.MethodGet, fmt.Sprintf("/api/token/%d", f.token.Id), "")
 				require.True(t, tokenAfter.Success, tokenAfter.Message)
-				assert.Equal(t, tokenBefore.Data["remain_quota"], tokenAfter.Data["remain_quota"])
-				assert.Equal(t, tokenBefore.Data["used_quota"], tokenAfter.Data["used_quota"])
+				assert.NotContains(t, tokenBefore.Data, "remain_quota")
+				assert.NotContains(t, tokenBefore.Data, "used_quota")
+				assert.Equal(t, tokenBefore.Data, tokenAfter.Data)
+				assert.Equal(t, legacy, testdb.ReadLegacyKeyQuota(t, model.DB, f.token.Id))
 				records := walletAPIRequest(t, f.engine, f.userPAT, http.MethodGet, "/api/requests/self", "")
 				require.True(t, records.Success, records.Message)
 				assert.EqualValues(t, 0, records.Data["total"], "denied requests must not create billable requests")
@@ -198,6 +202,12 @@ func TestKeyPermissionsAuthenticatesBeforeModelResolution(t *testing.T) {
 	}
 }
 
+func seedLegacyKeyLimits(t *testing.T, token *model.Token, enabled bool, names string) {
+	t.Helper()
+	require.NoError(t, model.DB.Exec(`ALTER TABLE "tokens" ADD COLUMN IF NOT EXISTS "model_limits_enabled" boolean, ADD COLUMN IF NOT EXISTS "model_limits" varchar(1024)`).Error)
+	require.NoError(t, model.DB.Model(token).Updates(map[string]any{"model_limits_enabled": enabled, "model_limits": names}).Error)
+}
+
 func TestKeyPermissionsLegacyAllowlistMigration(t *testing.T) {
 	f := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -208,9 +218,43 @@ func TestKeyPermissionsLegacyAllowlistMigration(t *testing.T) {
 	price := model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: other.ID, Currency: f.sale.Currency, Expression: f.sale.Expression, EffectiveAt: f.fake.Now().Unix() - 1}
 	require.NoError(t, model.CreatePriceVersion(t.Context(), &price, f.sale.CreatedBy))
 	require.NoError(t, model.SaveModelOffering(t.Context(), &other, "enable"))
-	require.NoError(t, model.DB.Model(f.token).Updates(map[string]any{"model_limits_enabled": true, "model_limits": "gateway-alias,missing-legacy-name"}).Error)
+	seedLegacyKeyLimits(t, f.token, true, "gateway-alias,gateway-alias,missing-legacy-name,outside-legacy-*")
+	// The restricted Key plus these 100 empty lists crosses the migration batch boundary.
+	batch := make([]model.Token, 100)
+	for i := range batch {
+		batch[i] = model.Token{UserId: f.user.Id, Key: fmt.Sprintf("batch-key-limit-%d", i)}
+	}
+	require.NoError(t, model.DB.Create(&batch).Error)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where(`"user_id" = ? AND "id" <> ?`, f.user.Id, f.token.Id).
+		Update("model_limits_enabled", true).Error)
+	require.NoError(t, model.DB.Exec(`CREATE VIEW "legacy_key_limit_test" AS SELECT "model_limits" FROM "tokens"`).Error)
+	require.ErrorContains(t, model.MigrateKeyPermissions(model.DB), "SQLSTATE 2BP01", "the dependent view must block the column drop after both batches")
+	policy, err := model.GetKeyPermissions(t.Context(), f.token.Id, f.user.Id)
+	require.NoError(t, err)
+	assert.True(t, policy.DefaultAllow)
+	assert.Empty(t, policy.ExceptionIDs)
+	var remainingPolicies int64
+	require.NoError(t, model.DB.Model(&model.TokenOfferingPolicy{}).Count(&remainingPolicies).Error)
+	assert.Zero(t, remainingPolicies, "the failed drop also rolls back the second batch")
+	require.NoError(t, model.DB.Exec(`DROP VIEW "legacy_key_limit_test"`).Error)
+	require.NoError(t, model.DB.Exec(`ALTER TABLE "tokens" ADD COLUMN "group" text`).Error)
+	require.NoError(t, model.DB.Exec(`CREATE VIEW "legacy_key_group_test" AS SELECT "group" FROM "tokens"`).Error)
+	require.ErrorContains(t, model.MigrateKeyPermissions(model.DB), "SQLSTATE 2BP01", "a routing column dependency must also abort the migration")
+	assert.True(t, model.DB.Migrator().HasColumn("tokens", "model_limits"), "the earlier limit drop is rolled back")
+	require.NoError(t, model.DB.Model(&model.TokenOfferingPolicy{}).Count(&remainingPolicies).Error)
+	assert.Zero(t, remainingPolicies)
+	require.NoError(t, model.DB.Exec(`DROP VIEW "legacy_key_group_test"`).Error)
 	require.NoError(t, model.MigrateKeyPermissions(model.DB))
 	require.NoError(t, model.MigrateKeyPermissions(model.DB))
+	for _, column := range []string{"model_limits", "model_limits_enabled", "group", "auto_groups", "cross_group_retry"} {
+		assert.False(t, model.DB.Migrator().HasColumn("tokens", column), column)
+	}
+	require.NoError(t, model.DB.Model(&model.TokenOfferingPolicy{}).Count(&remainingPolicies).Error)
+	assert.EqualValues(t, 101, remainingPolicies)
+	lastPolicy, err := model.GetKeyPermissions(t.Context(), batch[len(batch)-1].Id, f.user.Id)
+	require.NoError(t, err)
+	assert.False(t, lastPolicy.DefaultAllow, "an enabled empty list in the next batch still denies all")
+	assert.Empty(t, lastPolicy.ExceptionIDs)
 	pat := createWalletTestAccessToken(t, f.user.Id, "api_key:read")
 	permissions := adminSecurityRequest(f.engine, pat, http.MethodGet, fmt.Sprintf("/api/token/%d/permissions", f.token.Id), "")
 	assert.Contains(t, permissions.Body.String(), `"default_allow":false`)
@@ -222,9 +266,13 @@ func TestKeyPermissionsLegacyAllowlistMigration(t *testing.T) {
 	require.NoError(t, model.SaveModelOffering(t.Context(), f.offering, "save"))
 	allowed := adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, "/v1/models/renamed-legacy-offering", "")
 	assert.Equal(t, 200, allowed.Code, allowed.Body.String())
-	_, err := model.MutateKeyPermissions(t.Context(), f.token.Id, f.user.Id, 0, "allow_all", model.KeyPermissions{}, nil)
+	edited, err := model.MutateKeyPermissions(t.Context(), f.token.Id, f.user.Id, 0, "allow_all", model.KeyPermissions{}, nil)
 	require.NoError(t, err)
+	seedLegacyKeyLimits(t, f.token, true, "renamed-legacy-offering")
 	require.NoError(t, model.MigrateKeyPermissions(model.DB))
+	policy, err = model.GetKeyPermissions(t.Context(), f.token.Id, f.user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, edited, policy, "a current policy always takes precedence over a legacy list")
 	allowed = adminSecurityRequest(f.engine, f.token.Key, http.MethodGet, "/v1/models/outside-legacy-list", "")
 	assert.Equal(t, 200, allowed.Code, allowed.Body.String())
 }
@@ -463,7 +511,7 @@ func TestRetiredQuotaBillingRoutesPreserveCredentials(t *testing.T) {
 	}{
 		{name: "zero retired quota", status: http.StatusGone},
 		{name: "positive retired quota", status: http.StatusGone, change: func(t *testing.T, f *textGatewayFixture) {
-			require.NoError(t, model.DB.Model(f.token).Update("remain_quota", 100).Error)
+			testdb.SeedLegacyKeyQuota(t, model.DB, f.token.Id, testdb.LegacyKeyQuota{RemainQuota: 100})
 		}},
 		{name: "disabled credential", status: http.StatusUnauthorized, change: func(t *testing.T, f *textGatewayFixture) {
 			require.NoError(t, model.DB.Model(f.token).Update("status", common.TokenStatusDisabled).Error)
@@ -489,7 +537,9 @@ func TestRetiredQuotaBillingRoutesPreserveCredentials(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			f := newTextGatewayFixture(t, func(http.ResponseWriter, *http.Request) { t.Error("billing queries must not contact a Provider") })
-			require.NoError(t, model.DB.Model(f.token).Updates(map[string]any{"remain_quota": 0, "unlimited_quota": false}).Error)
+			if test.name == "zero retired quota" {
+				testdb.SeedLegacyKeyQuota(t, model.DB, f.token.Id, testdb.LegacyKeyQuota{})
+			}
 			SetDashboardRouter(f.engine)
 			if test.change != nil {
 				test.change(t, &f)

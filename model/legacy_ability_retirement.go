@@ -212,7 +212,7 @@ func initializeNativeDatabase(db *gorm.DB) error {
 		if err := migrateDB(); err != nil {
 			return err
 		}
-		if err := MigrateKeyPermissions(tx); err != nil {
+		if err := migrateLegacyKeyPermissionsTx(tx, nil); err != nil {
 			return err
 		}
 		if state == legacyAbilityNative {

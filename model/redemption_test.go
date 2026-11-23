@@ -245,12 +245,16 @@ func TestRedeemPreservesLegacyCacheAndCannotReplayResetStatus(t *testing.T) {
 	var user User
 	require.NoError(t, DB.First(&user, userID).Error)
 	require.NoError(t, populateUserCache(user))
+	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(userID), "Quota", 17).Err())
 	credited, err := Redeem(key, userID)
 	require.NoError(t, err)
 	assert.Equal(t, usd(1), credited)
 	cached, err := cacheGetUserBase(userID)
 	require.NoError(t, err)
-	assert.Equal(t, 17, cached.Quota)
+	assert.Equal(t, userID, cached.Id)
+	prior, err := common.RDB.HGet(t.Context(), getUserCacheKey(userID), "Quota").Int()
+	require.NoError(t, err)
+	assert.Equal(t, 17, prior)
 	require.NoError(t, DB.Model(&Redemption{}).Where("key = ?", key).
 		Updates(map[string]any{"status": common.RedemptionCodeStatusEnabled, "redeemed_time": 0, "used_user_id": 0}).Error)
 	_, err = Redeem(key, userID)

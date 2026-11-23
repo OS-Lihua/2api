@@ -85,14 +85,14 @@ func TestGetModelListGroupsUsesUserGroupWhenTokenGroupIsEmpty(t *testing.T) {
 	db, _, token := newOfferingDiscoveryFixture(t)
 	createDiscoveryOffering(t, db, "default-offering", true, "default")
 	createDiscoveryOffering(t, db, "vip-offering", true, "vip")
-	require.Equal(t, map[string]struct{}{"default-offering": {}}, decodeListModelsResponse(t, requestOfferingModels(t, token, constant.ChannelTypeOpenAI, func(c *gin.Context) { common.SetContextKey(c, constant.ContextKeyTokenGroup, "") })))
+	require.Equal(t, map[string]struct{}{"default-offering": {}}, decodeListModelsResponse(t, requestOfferingModels(t, token, constant.ChannelTypeOpenAI, func(c *gin.Context) { c.Set("token_group", "") })))
 }
 
 func TestGetModelListGroupsUsesExplicitTokenGroup(t *testing.T) {
 	db, _, token := newOfferingDiscoveryFixture(t)
 	createDiscoveryOffering(t, db, "default-offering", true, "default")
 	createDiscoveryOffering(t, db, "vip-offering", true, "vip")
-	require.Equal(t, map[string]struct{}{"default-offering": {}}, decodeListModelsResponse(t, requestOfferingModels(t, token, constant.ChannelTypeOpenAI, func(c *gin.Context) { common.SetContextKey(c, constant.ContextKeyTokenGroup, "vip") })), "retired token group is not authority to see another user group's Offering")
+	require.Equal(t, map[string]struct{}{"default-offering": {}}, decodeListModelsResponse(t, requestOfferingModels(t, token, constant.ChannelTypeOpenAI, func(c *gin.Context) { c.Set("token_group", "vip") })), "retired token group is not authority to see another user group's Offering")
 }
 
 func TestGetModelListGroupsUsesFilteredTokenAutoGroupsSnapshot(t *testing.T) {
@@ -101,8 +101,8 @@ func TestGetModelListGroupsUsesFilteredTokenAutoGroupsSnapshot(t *testing.T) {
 	createDiscoveryOffering(t, db, "vip-offering", true, "vip")
 	retired := func(c *gin.Context) {
 		common.SetContextKey(c, constant.ContextKeyUserGroup, "vip")
-		common.SetContextKey(c, constant.ContextKeyTokenGroup, "auto")
-		common.SetContextKey(c, constant.ContextKeyTokenAutoGroups, []string{"vip", "default"})
+		c.Set("token_group", "auto")
+		c.Set("token_auto_groups", []string{"vip", "default"})
 	}
 	require.Equal(t, map[string]struct{}{"vip-offering": {}}, decodeListModelsResponse(t, requestOfferingModels(t, token, constant.ChannelTypeOpenAI, retired)))
 	require.NoError(t, db.Model(user).Update("group", "default").Error)

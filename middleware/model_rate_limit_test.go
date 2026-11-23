@@ -241,7 +241,8 @@ func TestRetiredKeyGroupCannotChooseRateLimitBucket(t *testing.T) {
 				if c.Param("key") == "legacy-key-b" {
 					tokenID = 42
 				}
-				require.NoError(t, SetupContextForToken(c, &model.Token{Id: tokenID, UserId: userID, Name: "rate-limit probe", Group: c.Param("key")}))
+				c.Set("token_group", c.Param("key"))
+				require.NoError(t, SetupContextForToken(c, &model.Token{Id: tokenID, UserId: userID, Name: "rate-limit probe"}))
 			}, ModelRequestRateLimit(), func(c *gin.Context) {
 				calls++
 				c.Status(http.StatusOK)

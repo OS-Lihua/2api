@@ -5,44 +5,34 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func newTokenAutoGroupsContext() *gin.Context {
-	gin.SetMode(gin.TestMode)
-	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	return ctx
-}
-
-func TestSetupContextForTokenPreservesCustomAutoGroupsOrder(t *testing.T) {
-	ctx := newTokenAutoGroupsContext()
-	token := &model.Token{Id: 1, UserId: 2, AutoGroups: `["vip","default"]`}
-
-	require.NoError(t, SetupContextForToken(ctx, token))
-	value, ok := common.GetContextKey(ctx, constant.ContextKeyTokenAutoGroups)
-	require.True(t, ok)
-	assert.Equal(t, []string{"vip", "default"}, value)
-}
-
-func TestSetupContextForTokenTreatsStoredEmptyArrayAsInheritance(t *testing.T) {
-	ctx := newTokenAutoGroupsContext()
-	token := &model.Token{Id: 1, UserId: 2, AutoGroups: `[]`}
-
-	require.NoError(t, SetupContextForToken(ctx, token))
-	_, ok := common.GetContextKey(ctx, constant.ContextKeyTokenAutoGroups)
-	assert.False(t, ok)
-}
-
-func TestSetupContextForTokenMalformedAutoGroupsFailsClosed(t *testing.T) {
-	ctx := newTokenAutoGroupsContext()
-	token := &model.Token{Id: 1, UserId: 2, AutoGroups: `not-json`}
-
-	require.NoError(t, SetupContextForToken(ctx, token))
-	value, ok := common.GetContextKey(ctx, constant.ContextKeyTokenAutoGroups)
-	require.True(t, ok)
-	assert.Equal(t, []string{}, value)
+func TestSetupContextForTokenDoesNotPublishLegacyRoutingOrQuota(t *testing.T) {
+	for _, groups := range []struct{ name, stored string }{
+		{"ordered", `["vip","default"]`},
+		{"empty", `[]`},
+		{"malformed", `not-json`},
+	} {
+		t.Run(groups.name, func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			var token model.Token
+			payload, err := common.Marshal(map[string]any{
+				"id": 1, "user_id": 2, "group": "auto", "cross_group_retry": true, "auto_groups": groups.stored,
+				"remain_quota": 12, "unlimited_quota": false,
+			})
+			require.NoError(t, err)
+			require.NoError(t, common.Unmarshal(payload, &token))
+			require.NoError(t, SetupContextForToken(ctx, &token))
+			assert.Equal(t, token.UserId, ctx.GetInt("id"))
+			assert.Equal(t, token.Id, ctx.GetInt("token_id"))
+			for _, key := range []string{"token_group", "token_cross_group_retry", "token_auto_groups", "token_unlimited_quota", "token_quota"} {
+				_, present := ctx.Get(key)
+				assert.False(t, present, key)
+			}
+		})
+	}
 }

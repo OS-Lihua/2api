@@ -25,6 +25,7 @@ import (
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/pkg/protocol"
+	"github.com/QuantumNous/new-api/pkg/testdb"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
@@ -168,13 +169,10 @@ func assertSubmissionWallet(t *testing.T, fixture *nativeGatewayTaskFixture, nan
 	require.NoError(t, err)
 	assert.EqualValues(t, nanos, wallet.Balance.Nanos)
 	var user model.User
-	var token model.Token
 	require.NoError(t, fixture.db.First(&user, fixture.user.Id).Error)
-	require.NoError(t, fixture.db.First(&token, fixture.token.Id).Error)
 	assert.Equal(t, 1000000, user.Quota)
-	assert.Equal(t, 7654321, token.RemainQuota)
 	assert.Zero(t, user.UsedQuota)
-	assert.Zero(t, token.UsedQuota)
+	assert.Equal(t, testdb.LegacyKeyQuota{RemainQuota: 7654321}, testdb.ReadLegacyKeyQuota(t, fixture.db, fixture.token.Id))
 	var logs int64
 	require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("user_id = ?", user.Id).Count(&logs).Error)
 	assert.Zero(t, logs, "canonical consumption must not revive legacy consume logs")

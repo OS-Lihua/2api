@@ -67,6 +67,8 @@ func bulkBusinessState(t *testing.T) string {
 
 func TestBulkImportHTTP(t *testing.T) {
 	engine, actor, token, unified, _ := newBulkImportServer(t)
+	require.NoError(t, model.DB.Exec(`ALTER TABLE "providers" DROP COLUMN IF EXISTS "models", DROP COLUMN IF EXISTS "model_mapping",
+		DROP COLUMN IF EXISTS "group", DROP COLUMN IF EXISTS "priority", DROP COLUMN IF EXISTS "weight"`).Error)
 	secret := "credential-preview-sentinel"
 	body := fmt.Sprintf(`{"rows":[
  {"resource":"providers","action":"create","ref":"p","data":{"name":"Imported account","type":1,"key":%q,"base_url":"https://user:url-sentinel@example.com/?token=query-sentinel","header_override":"{\"Authorization\":\"header-sentinel\"}"}},

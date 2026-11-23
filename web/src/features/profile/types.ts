@@ -54,10 +54,6 @@ export interface UserProfile {
   email?: string
   /** User group */
   group: string
-  /** Current quota balance */
-  quota: number
-  /** Total used quota */
-  used_quota: number
   /** Total request count */
   request_count: number
   /** Account status (1=启用, 2=禁用, 3=待审核, 4=已删除) */

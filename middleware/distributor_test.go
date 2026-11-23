@@ -13,8 +13,8 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
-	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -95,12 +95,15 @@ func TestSharedEndpointRebindsToSelectedLegacyProvider(t *testing.T) {
 	c.Set("expected_task_plugin_key", candidates[0].Plugin.Meta.Key)
 
 	geminiChannel := &model.Provider{Id: 1, Type: constant.ChannelTypeGemini}
-	vertexChannel := &model.Provider{Id: 2, Type: constant.ChannelTypeVertexAi}
+	legacyMapping := `{"task-model":"obsolete-upstream"}`
+	vertexChannel := &model.Provider{Id: 2, Type: constant.ChannelTypeVertexAi, ModelMapping: &legacyMapping}
 	assert.True(t, channelMatchesExpectedTaskPlugin(c, geminiChannel, candidates[0].Plugin.Meta.Key))
 	assert.True(t, channelMatchesExpectedTaskPlugin(c, vertexChannel, candidates[0].Plugin.Meta.Key))
 	assert.False(t, channelMatchesExpectedTaskPlugin(c, &model.Provider{Type: constant.ChannelTypeKling}, candidates[0].Plugin.Meta.Key))
 
 	require.Nil(t, SetupContextForGatewayCandidate(c, vertexChannel, "task-model"))
+	_, hasLegacyMapping := c.Get("model_mapping")
+	assert.False(t, hasLegacyMapping, "the selected Channel owns the upstream model")
 	pinnedValue, exists := c.Get(jsplugin.ContextKeyPinnedEndpoint)
 	require.True(t, exists)
 	pinned, ok := pinnedValue.(jsplugin.PinnedEndpoint)
@@ -155,17 +158,20 @@ export const protocols = {openai_responses: {
 `, key, key, channelType)
 }
 
-func TestTokenModelLimitAllowsLegacyAliasAndModifierVariant(t *testing.T) {
-	aliasOnly := map[string]bool{"claude-3-7-sonnet-thinking": true}
-	assert.True(t, TokenModelLimitAllows(aliasOnly, "claude-3-7-sonnet-thinking"))
-	assert.False(t, TokenModelLimitAllows(aliasOnly, "claude-3-7-sonnet"))
-
-	baseOnly := map[string]bool{"claude-3-7-sonnet": true}
-	assert.True(t, TokenModelLimitAllows(baseOnly, "claude-3-7-sonnet@thinking:on"))
-	assert.True(t, TokenModelLimitAllows(baseOnly, "claude-3-7-sonnet-thinking"))
-
-	wildcard := map[string]bool{"gemini-2.5-flash-thinking-*": true}
-	assert.True(t, TokenModelLimitAllows(wildcard, "gemini-2.5-flash-thinking-8192"))
+func TestGetModelRequestIgnoresRetiredKeyLimitsForVideoReads(t *testing.T) {
+	for _, path := range []string{"/v1/videos/task_example", "/v1/video/generations/task_example"} {
+		t.Run(path, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodGet, path, nil)
+			c.Set("token_model_limit_enabled", true)
+			c.Set("token_model_limit", map[string]bool{"unrelated-model": true})
+			request, selectChannel, err := getModelRequest(c)
+			require.NoError(t, err)
+			assert.Empty(t, request.Model)
+			assert.False(t, selectChannel)
+			assert.Equal(t, relayconstant.RelayModeVideoFetchByID, c.GetInt("relay_mode"))
+		})
+	}
 }
 
 // /v1/tools/search and /v1/tools/fetch always route and bill by the DeepSeek
@@ -189,17 +195,20 @@ func TestGetModelRequestAssignsDeepSeekToolRoutingNames(t *testing.T) {
 	}
 }
 
-func TestTokenModelLimitAllowsExemptAtNameByFullName(t *testing.T) {
-	settings := model_setting.GetGlobalSettings()
-	original := append([]string(nil), settings.ThinkingModelBlacklist...)
-	t.Cleanup(func() { settings.ThinkingModelBlacklist = original })
-	settings.ThinkingModelBlacklist = append(original, "re:.*@sha256:.*")
-
-	fullOnly := map[string]bool{"opaque@sha256:deadbeef": true}
-	assert.True(t, TokenModelLimitAllows(fullOnly, "opaque@sha256:deadbeef"))
-
-	baseOnly := map[string]bool{"opaque": true}
-	assert.False(t, TokenModelLimitAllows(baseOnly, "opaque@sha256:deadbeef"))
+func TestGetModelRequestKeepsExactNameForOfferingResolution(t *testing.T) {
+	for _, name := range []string{"opaque@sha256:deadbeef", "claude-3-7-sonnet@thinking:on", "gemini-2.5-flash-thinking-8192"} {
+		t.Run(name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(fmt.Sprintf(`{"model":%q}`, name)))
+			c.Request.Header.Set("Content-Type", "application/json")
+			c.Set("token_model_limit_enabled", true)
+			c.Set("token_model_limit", map[string]bool{"opaque": true, "claude-3-7-sonnet": true, "gemini-2.5-flash-thinking-*": true})
+			request, selectChannel, err := getModelRequest(c)
+			require.NoError(t, err)
+			assert.Equal(t, name, request.Model)
+			assert.True(t, selectChannel)
+		})
+	}
 }
 
 func TestDistributeHidesTaskPluginDetailsButLogsDiagnostics(t *testing.T) {

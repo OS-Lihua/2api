@@ -24,6 +24,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/pkg/protocol"
+	"github.com/QuantumNous/new-api/pkg/testdb"
 	"github.com/QuantumNous/new-api/relay"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -80,7 +81,7 @@ func setupResponsesWSRequestTest(t *testing.T) (*model.User, *model.Token) {
 	// user a separate request bucket, including when the tests run with -count.
 	user := &model.User{Id: 5062000 + int(responsesWSTestUserSequence.Add(1)), Username: "responses-ws-user", Status: common.UserStatusEnabled, Group: "default", Quota: 1000, AuthVersion: 1}
 	require.NoError(t, db.Create(user).Error)
-	token := &model.Token{UserId: user.Id, Key: "responseswstoken", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 100}
+	token := &model.Token{UserId: user.Id, Key: "responseswstoken", Status: common.TokenStatusEnabled, ExpiredTime: -1}
 	require.NoError(t, db.Create(token).Error)
 	return user, token
 }
@@ -223,7 +224,12 @@ func TestResponsesWSRequestRunnerRefreshesBillingContextAndCleansBody(t *testing
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"input":"first"}`))
 	require.Nil(t, runner(request, "ws-first", func(c *gin.Context) *types.NewAPIError {
 		assert.Equal(t, user.Id, c.GetInt("id"))
-		assert.Equal(t, 100, c.GetInt("token_quota"))
+		assert.Equal(t, token.Id, c.GetInt("token_id"))
+		assert.Equal(t, token.Name, c.GetString("token_name"))
+		for _, key := range []string{"token_quota", "user_quota"} {
+			_, present := c.Get(key)
+			assert.False(t, present, key)
+		}
 		assert.Equal(t, "203.0.113.8", c.ClientIP())
 		assert.Equal(t, "ws-first", c.GetString(common.RequestIdKey))
 		assert.Equal(t, "ws-first", c.Request.Context().Value(common.RequestIdKey))
@@ -242,18 +248,20 @@ func TestResponsesWSRequestRunnerRefreshesBillingContextAndCleansBody(t *testing
 	}))
 	_, err := storage.Bytes()
 	assert.ErrorIs(t, err, common.ErrStorageClosed)
-	require.NoError(t, model.DB.Model(token).Updates(map[string]any{
-		"remain_quota": 2, "model_limits_enabled": true, "model_limits": "gpt-5.1",
-	}).Error)
+	testdb.SeedLegacyKeyQuota(t, model.DB, token.Id, testdb.LegacyKeyQuota{RemainQuota: 100})
+	require.NoError(t, model.DB.Model(token).Update("name", "renamed Key").Error)
+	testdb.SeedLegacyKeyQuota(t, model.DB, token.Id, testdb.LegacyKeyQuota{})
 	require.NoError(t, model.DB.Model(user).Updates(map[string]any{
 		"group": "updated", "setting": `{"billing_preference":"wallet_only"}`,
 	}).Error)
 	request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"input":"second"}`))
 	require.Nil(t, runner(request, "ws-second", func(c *gin.Context) *types.NewAPIError {
-		assert.Equal(t, 2, c.GetInt("token_quota"))
-		assert.True(t, c.GetBool("token_model_limit_enabled"))
-		modelLimits, _ := c.Get("token_model_limit")
-		assert.Equal(t, map[string]bool{"gpt-5.1": true}, modelLimits)
+		assert.Equal(t, token.Id, c.GetInt("token_id"))
+		assert.Equal(t, "renamed Key", c.GetString("token_name"))
+		for _, key := range []string{"user_quota", "token_quota", "token_unlimited_quota", "token_model_limit_enabled", "token_model_limit"} {
+			_, present := c.Get(key)
+			assert.False(t, present, key)
+		}
 		assert.Equal(t, "updated", common.GetContextKeyString(c, constant.ContextKeyUsingGroup))
 		userSetting, ok := common.GetContextKeyType[dto.UserSetting](c, constant.ContextKeyUserSetting)
 		require.True(t, ok)
@@ -290,7 +298,7 @@ func TestResponsesWSRequestRunnerRejectsRevokedCredentials(t *testing.T) {
 			require.NoError(t, model.DB.Model(token).Update("status", common.TokenStatusExhausted).Error)
 		}},
 		{name: "zero retired quota", status: http.StatusOK, update: func(t *testing.T, _ *model.User, token *model.Token) {
-			require.NoError(t, model.DB.Model(token).Update("remain_quota", 0).Error)
+			testdb.SeedLegacyKeyQuota(t, model.DB, token.Id, testdb.LegacyKeyQuota{})
 		}},
 		{name: "disabled user", status: http.StatusForbidden, update: func(t *testing.T, user *model.User, _ *model.Token) {
 			require.NoError(t, model.DB.Model(user).Update("status", common.UserStatusDisabled).Error)
@@ -461,7 +469,6 @@ func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*web
 		common.OptionMapRWMutex.Unlock()
 	})
 	require.NoError(t, model.DB.Model(user).Update("quota", 0).Error)
-	require.NoError(t, model.DB.Model(token).Update("remain_quota", 0).Error)
 	_, err := model.TopUpWallet(model.WalletTopUp{UserId: user.Id, Source: money.Amount{Nanos: 1_000_000_000, Currency: "USD"}, Reference: "responses-ws-initial"})
 	require.NoError(t, err)
 
@@ -729,8 +736,9 @@ func assertResponsesWSAccounting(t *testing.T, fixture *responsesWSBillingTest, 
 	assert.Empty(t, reconciliation.Mismatches)
 	require.NoError(t, model.DB.First(fixture.token, fixture.token.Id).Error)
 	require.NoError(t, model.DB.First(fixture.user, fixture.user.Id).Error)
-	assert.Zero(t, fixture.token.RemainQuota)
-	assert.Zero(t, fixture.token.UsedQuota)
+	for _, column := range []string{"remain_quota", "used_quota"} {
+		assert.False(t, model.DB.Migrator().HasColumn("tokens", column), column)
+	}
 	assert.Zero(t, fixture.user.Quota)
 	assert.Zero(t, fixture.user.UsedQuota)
 	return requests

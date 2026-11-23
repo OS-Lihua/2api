@@ -109,14 +109,14 @@ type createProviderRequest struct {
 	Provider                  json.RawMessage `json:"provider"`
 }
 
-// validProviderAccountFields keeps retired routing settings out of account
-// mutations. Omitted legacy fields already stored on a Provider are not rewritten.
+// validProviderAccountFields keeps retired routing and quota fields out of
+// account mutations. Stored historical values are not rewritten.
 func validProviderAccountFields(fields map[string]json.RawMessage) bool {
 	if fields == nil {
 		return false
 	}
 	for name, raw := range fields {
-		for _, retired := range []string{"models", "model_mapping", "group", "priority", "weight", "tool_loss_policy"} {
+		for _, retired := range []string{"models", "model_mapping", "group", "priority", "weight", "tool_loss_policy", "used_quota"} {
 			if strings.EqualFold(name, retired) {
 				return false
 			}

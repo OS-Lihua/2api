@@ -46,8 +46,6 @@ const target: User = {
   display_name: 'Wallet owner',
   role: 1,
   status: 1,
-  quota: 77,
-  used_quota: 0,
   request_count: 0,
   group: 'default',
 }

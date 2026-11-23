@@ -12,52 +12,18 @@ import (
 )
 
 type Token struct {
-	Id                 int            `json:"id"`
-	UserId             int            `json:"user_id" gorm:"index"`
-	Key                string         `json:"key" gorm:"type:varchar(128);uniqueIndex"`
-	Status             int            `json:"status" gorm:"default:1"`
-	Name               string         `json:"name" gorm:"index" `
-	CreatedTime        int64          `json:"created_time" gorm:"bigint"`
-	AccessedTime       int64          `json:"accessed_time" gorm:"bigint"`
-	ExpiredTime        int64          `json:"expired_time" gorm:"bigint;default:-1"` // -1 means never expired
-	RemainQuota        int            `json:"remain_quota" gorm:"default:0"`
-	UnlimitedQuota     bool           `json:"unlimited_quota"`
-	ModelLimitsEnabled bool           `json:"model_limits_enabled"`
-	ModelLimits        string         `json:"model_limits" gorm:"type:text"`
-	AllowIps           *string        `json:"allow_ips" gorm:"default:''"`
-	UsedQuota          int            `json:"used_quota" gorm:"default:0"` // used quota
-	Group              string         `json:"group" gorm:"default:''"`
-	CrossGroupRetry    bool           `json:"cross_group_retry"` // 跨分组重试，仅auto分组有效
-	AutoGroups         string         `json:"-" gorm:"type:text"`
-	DeletedAt          gorm.DeletedAt `gorm:"index"`
-	// 允许用此令牌查询所属用户的额度；新建令牌默认开启，已有令牌升级后保持关闭
-	AllowUserQuotaQuery bool   `json:"allow_user_quota_query"`
-	CacheExpiresAt      int64  `json:"-" gorm:"-"`
-	CacheMAC            string `json:"-" gorm:"-"`
-}
-
-func (token *Token) GetAutoGroups() ([]string, error) {
-	if token.AutoGroups == "" {
-		return nil, nil
-	}
-	var groups []string
-	if err := common.UnmarshalJsonStr(token.AutoGroups, &groups); err != nil {
-		return nil, err
-	}
-	return groups, nil
-}
-
-func (token *Token) SetAutoGroups(groups []string) error {
-	if len(groups) == 0 {
-		token.AutoGroups = ""
-		return nil
-	}
-	data, err := common.Marshal(groups)
-	if err != nil {
-		return err
-	}
-	token.AutoGroups = string(data)
-	return nil
+	Id             int            `json:"id"`
+	UserId         int            `json:"user_id" gorm:"index"`
+	Key            string         `json:"key" gorm:"type:varchar(128);uniqueIndex"`
+	Status         int            `json:"status" gorm:"default:1"`
+	Name           string         `json:"name" gorm:"index" `
+	CreatedTime    int64          `json:"created_time" gorm:"bigint"`
+	AccessedTime   int64          `json:"accessed_time" gorm:"bigint"`
+	ExpiredTime    int64          `json:"expired_time" gorm:"bigint;default:-1"` // -1 means never expired
+	AllowIps       *string        `json:"allow_ips" gorm:"default:''"`
+	DeletedAt      gorm.DeletedAt `gorm:"index"`
+	CacheExpiresAt int64          `json:"-" gorm:"-"`
+	CacheMAC       string         `json:"-" gorm:"-"`
 }
 
 func (token *Token) Clean() {
@@ -282,7 +248,7 @@ func GetTokenById(id int) (*Token, error) {
 }
 
 // GetTokenCredential reads credential restrictions from the primary database even
-// when cache invalidation failed. Historical Redis balances do not authorize keys.
+// when cache invalidation failed.
 func GetTokenCredential(key string) (*Token, error) {
 	if key == "" {
 		return nil, gorm.ErrRecordNotFound
@@ -307,8 +273,7 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 		return nil, err
 	}
 	if common.RedisEnabled {
-		// 用数据库快照初始化或修复元数据，Lua 保留正在使用的额度计数。
-		// 初始化失败不影响本次读取。
+		// 初始化或修复缓存时保留有效的访问时间；失败不影响本次读取。
 		if _, cacheErr := cacheInitToken(*token); cacheErr != nil {
 			common.SysLog(common.LogText("failed to init token cache: %s", cacheErr.Error()))
 		}
@@ -322,7 +287,7 @@ func (token *Token) Insert() error {
 	return err
 }
 
-// Update changes credential settings while preserving historical billing and routing fields.
+// Update changes credential settings without changing Key ownership or permissions.
 func (token *Token) Update() (err error) {
 	// 写库前失效缓存并设置 fence，防止并发读者把过期快照重新写回缓存。
 	if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
@@ -344,36 +309,6 @@ func (token *Token) Delete() (err error) {
 		common.SysLog(common.LogText("failed to invalidate token cache before delete: %s", cacheErr.Error()))
 	}
 	return DB.Delete(token).Error
-}
-
-func (token *Token) IsModelLimitsEnabled() bool {
-	return token.ModelLimitsEnabled
-}
-
-func (token *Token) GetModelLimits() []string {
-	if token.ModelLimits == "" {
-		return []string{}
-	}
-	return strings.Split(token.ModelLimits, ",")
-}
-
-func (token *Token) GetModelLimitsMap() map[string]bool {
-	limits := token.GetModelLimits()
-	limitsMap := make(map[string]bool)
-	for _, limit := range limits {
-		limitsMap[limit] = true
-	}
-	return limitsMap
-}
-
-func DisableModelLimits(tokenId int) error {
-	token, err := GetTokenById(tokenId)
-	if err != nil {
-		return err
-	}
-	token.ModelLimitsEnabled = false
-	token.ModelLimits = ""
-	return token.Update()
 }
 
 func DeleteTokenById(id int, userId int) (err error) {

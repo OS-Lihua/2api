@@ -775,26 +775,5 @@ func SetupContextForToken(c *gin.Context, token *model.Token) error {
 	c.Set("token_id", token.Id)
 	c.Set("token_key", token.Key)
 	c.Set("token_name", token.Name)
-	c.Set("token_unlimited_quota", token.UnlimitedQuota)
-	if !token.UnlimitedQuota {
-		c.Set("token_quota", token.RemainQuota)
-	}
-	if token.ModelLimitsEnabled {
-		c.Set("token_model_limit_enabled", true)
-		c.Set("token_model_limit", token.GetModelLimitsMap())
-	} else {
-		c.Set("token_model_limit_enabled", false)
-	}
-	common.SetContextKey(c, constant.ContextKeyTokenCrossGroupRetry, token.CrossGroupRetry)
-	if token.AutoGroups != "" {
-		autoGroups, err := token.GetAutoGroups()
-		if err != nil {
-			common.SysError(common.LogText("failed to parse auto groups for token %d: %v", token.Id, err))
-			autoGroups = []string{}
-			common.SetContextKey(c, constant.ContextKeyTokenAutoGroups, autoGroups)
-		} else if len(autoGroups) > 0 {
-			common.SetContextKey(c, constant.ContextKeyTokenAutoGroups, autoGroups)
-		}
-	}
 	return nil
 }

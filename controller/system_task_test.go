@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/testdb"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
@@ -51,10 +52,10 @@ func TestLegacyProviderMaintenanceTasksAreRetired(t *testing.T) {
 			settings.UpstreamModelUpdateAutoSyncEnabled = true
 			provider.SetOtherSettings(settings)
 			require.NoError(t, db.Create(provider).Error)
+			declareLegacyProviderRoutingColumns(t, db)
+			seedLegacyProviderRouting(t, db, provider)
 			require.NoError(t, db.AutoMigrate(&model.Ability{}))
 			require.NoError(t, provider.AddAbilities(db))
-			var originalProvider model.Provider
-			require.NoError(t, db.First(&originalProvider, provider.Id).Error)
 			var originalAbilities []model.Ability
 			require.NoError(t, db.Order("channel_id, model").Find(&originalAbilities).Error)
 			require.NotEmpty(t, originalAbilities)
@@ -62,6 +63,11 @@ func TestLegacyProviderMaintenanceTasksAreRetired(t *testing.T) {
 			require.NoError(t, err)
 			require.True(t, report.Committed)
 			require.False(t, db.Migrator().HasTable("abilities"))
+			require.False(t, db.Migrator().HasColumn("providers", "models"))
+			var originalProvider model.Provider
+			require.NoError(t, db.First(&originalProvider, provider.Id).Error)
+			assert.Equal(t, provider.Name, originalProvider.Name)
+			assert.Equal(t, provider.Key, originalProvider.Key)
 			originalSeal, err := model.VerifyLegacyAbilitySourceArchive(db)
 			require.NoError(t, err)
 			var archivedAbilities []model.Ability
@@ -162,8 +168,10 @@ func TestLegacyMidjourneyPollingTasksAreRetired(t *testing.T) {
 			require.NoError(t, model.MigrateLogDB())
 			user := model.User{Username: "retired-mj-user", Status: common.UserStatusEnabled, Quota: 1000, UsedQuota: 900}
 			require.NoError(t, db.Create(&user).Error)
-			token := model.Token{UserId: user.Id, Key: "retired-mj-token", Status: common.TokenStatusEnabled, RemainQuota: 1100, UsedQuota: 900}
+			token := model.Token{UserId: user.Id, Key: "retired-mj-token", Status: common.TokenStatusEnabled}
 			require.NoError(t, db.Create(&token).Error)
+			legacyQuota := testdb.LegacyKeyQuota{RemainQuota: 1100, UsedQuota: 900}
+			testdb.SeedLegacyKeyQuota(t, db, token.Id, legacyQuota)
 			var upstreamCalls atomic.Int64
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				upstreamCalls.Add(1)
@@ -252,6 +260,7 @@ func TestLegacyMidjourneyPollingTasksAreRetired(t *testing.T) {
 			require.NoError(t, db.Order("id").Find(&currentLegacy).Error)
 			assert.Equal(t, user, currentUser)
 			assert.Equal(t, token, currentToken)
+			assert.Equal(t, legacyQuota, testdb.ReadLegacyKeyQuota(t, db, token.Id))
 			assert.Equal(t, provider, currentProvider)
 			assert.Equal(t, originalPending, currentPending)
 			assert.Equal(t, legacy, currentLegacy)

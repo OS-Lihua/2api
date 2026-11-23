@@ -939,7 +939,7 @@ func TestProductionPluginNativeQueryTraversesInnerRouter(t *testing.T) {
 	require.NoError(t, model.DB.AutoMigrate(&model.Task{}))
 	user := model.User{Id: 91, Username: "native-query-owner", Status: common.UserStatusEnabled, Group: "default", Quota: 100}
 	require.NoError(t, model.DB.Create(&user).Error)
-	token := model.Token{UserId: user.Id, Key: "nativequerykey", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+	token := model.Token{UserId: user.Id, Key: "nativequerykey", Status: common.TokenStatusEnabled, ExpiredTime: -1}
 	require.NoError(t, model.DB.Create(&token).Error)
 	require.NoError(t, model.DB.Create(&model.Task{
 		TaskID:    "task_native_router",
@@ -980,8 +980,8 @@ func TestNativeRouteCredentialFormsAuthenticateThroughTokenAuth(t *testing.T) {
 	user := model.User{Username: "native-auth-user", Status: common.UserStatusEnabled, Group: "default", Quota: 100}
 	require.NoError(t, model.DB.Create(&user).Error)
 	allowedIPs := "10.9.8.0/24"
-	require.NoError(t, model.DB.Create(&model.Token{UserId: user.Id, Key: "nativeauthkey", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}).Error)
-	require.NoError(t, model.DB.Create(&model.Token{UserId: user.Id, Key: "nativeiplimited", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true, AllowIps: &allowedIPs}).Error)
+	require.NoError(t, model.DB.Create(&model.Token{UserId: user.Id, Key: "nativeauthkey", Status: common.TokenStatusEnabled, ExpiredTime: -1}).Error)
+	require.NoError(t, model.DB.Create(&model.Token{UserId: user.Id, Key: "nativeiplimited", Status: common.TokenStatusEnabled, ExpiredTime: -1, AllowIps: &allowedIPs}).Error)
 
 	outer := gin.New()
 	SetTaskPluginProtocolRouter(outer)

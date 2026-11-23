@@ -17,11 +17,9 @@ import (
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
-	"github.com/QuantumNous/new-api/setting/ratio_setting"
-
-	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 )
 
@@ -335,7 +333,6 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 		} else if c.Request.Method == http.MethodGet {
 			relayMode = relayconstant.RelayModeVideoFetchByID
 			shouldSelectChannel = false
-			modelRequest.Model = getTaskOriginModelName(c)
 		}
 		c.Set("relay_mode", relayMode)
 	} else if strings.Contains(c.Request.URL.Path, "/v1/video/generations") {
@@ -350,7 +347,6 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 		} else if c.Request.Method == http.MethodGet {
 			relayMode = relayconstant.RelayModeVideoFetchByID
 			shouldSelectChannel = false
-			modelRequest.Model = getTaskOriginModelName(c)
 		}
 		if _, ok := c.Get("relay_mode"); !ok {
 			c.Set("relay_mode", relayMode)
@@ -436,41 +432,6 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 	}
 
 	return &modelRequest, shouldSelectChannel, nil
-}
-
-// TokenModelLimitAllows reports whether a token model-limit map authorizes
-// model. Exact name, wildcard-normalized name, and routing-normalized name
-// (modifiers and legacy aliases stripped) are all accepted. The Responses
-// WebSocket relay shares this rule so both transports admit the same names.
-func TokenModelLimitAllows(limit map[string]bool, model string) bool {
-	if limit[model] {
-		return true
-	}
-	if formatted := ratio_setting.FormatMatchingModelName(model); limit[formatted] {
-		return true
-	}
-	return limit[ratio_setting.RoutingMatchModelName(model)]
-}
-
-// 修复 #4834: GET /v1/video/generations/:task_id && /v1/video/:task_id 此前不解析 model，
-// 当 token 启用「可用模型限制」时，下游 modelLimitEnable 校验会因
-// modelRequest.Model 为空而误报 "This token has no access to model"。
-// 从已存储的任务记录中回填 OriginModelName 即可让校验走在正确的模型上。
-func getTaskOriginModelName(c *gin.Context) string {
-	if !common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled) {
-		return ""
-	}
-
-	taskId := c.Param("task_id")
-	if taskId == "" {
-		return ""
-	}
-
-	userId := c.GetInt("id")
-	if task, exist, err := model.GetByTaskId(userId, taskId); err == nil && exist && task != nil {
-		return task.Properties.OriginModelName
-	}
-	return ""
 }
 
 // SetupContextForGatewayCandidate projects account metadata without consuming
@@ -566,7 +527,6 @@ func setupContextForSelectedChannel(c *gin.Context, channel *model.Provider, mod
 	}
 	common.SetContextKey(c, constant.ContextKeyChannelOrganization, organization)
 	common.SetContextKey(c, constant.ContextKeyChannelAutoBan, channel.GetAutoBan())
-	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
 	var key string

@@ -35,6 +35,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/pkg/protocol"
+	"github.com/QuantumNous/new-api/pkg/testdb"
 	"github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/service"
@@ -2829,7 +2830,8 @@ func TestAsyncTaskNativeRejectsUnmigratedModel(t *testing.T) {
 			dispatcher := &pluginRouteDispatcher{registry: jsplugin.DefaultRegistry}
 			fixture.engine.NoRoute(dispatcher.dispatch)
 			for _, unlimited := range []bool{false, true} {
-				require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"status": common.TokenStatusEnabled, "unlimited_quota": unlimited}).Error)
+				require.NoError(t, model.DB.Model(fixture.token).Update("status", common.TokenStatusEnabled).Error)
+				testdb.SeedLegacyKeyQuota(t, model.DB, fixture.token.Id, testdb.LegacyKeyQuota{UnlimitedQuota: unlimited})
 				response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, test.path, test.body)
 				assert.Equal(t, http.StatusNotFound, response.Code, response.Body.String())
 				assert.Equal(t, test.code, ojson.GetBytes(response.Body.Bytes(), test.codePath).String(), response.Body.String())
@@ -3894,7 +3896,7 @@ func TestAsyncTaskUnavailableChannelUsesBackendLanguage(t *testing.T) {
 					assert.Equal(t, before.Balance, after.Balance)
 					require.NoError(t, model.DB.First(fixture.token, fixture.token.Id).Error)
 					assert.Equal(t, common.TokenStatusEnabled, fixture.token.Status)
-					assert.Zero(t, fixture.token.RemainQuota)
+					assert.False(t, model.DB.Migrator().HasColumn("tokens", "remain_quota"))
 				})
 			}
 		})

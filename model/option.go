@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/performance_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -25,8 +26,12 @@ type Option struct {
 
 const RetiredStatisticsSettingsMessage = "Legacy statistics collection settings have been retired."
 const RetiredModelPricingMessage = "Model-name pricing has been retired. Manage Offering PriceVersions instead."
+const RetiredAutoGroupSettingsMessage = "Legacy automatic routing group settings have been retired."
 
 func IsRetiredModelPricingOption(key string) bool {
+	if strings.EqualFold(key, "ExposeRatioEnabled") || strings.EqualFold(key, operation_setting.ToolPriceOptionKey) {
+		return true
+	}
 	for _, sourceKey := range modelPricingOptionKeys {
 		if strings.EqualFold(key, sourceKey) {
 			return true
@@ -37,6 +42,10 @@ func IsRetiredModelPricingOption(key string) bool {
 
 func IsRetiredStatisticsOption(key string) bool {
 	return strings.EqualFold(key, "DataExportEnabled") || strings.EqualFold(key, "DataExportInterval") || strings.EqualFold(key, "DataExportDefaultTime")
+}
+
+func IsRetiredAutoGroupOption(key string) bool {
+	return strings.EqualFold(key, "AutoGroups") || strings.EqualFold(key, "DefaultUseAutoGroup") || strings.EqualFold(key, "MaxTokenAutoGroups")
 }
 
 func AllOption() ([]*Option, error) {
@@ -148,9 +157,6 @@ func InitOptionMap() {
 	common.OptionMap["WaffoPancakeProductID"] = setting.WaffoPancakeProductID
 	common.OptionMap["TopupGroupRatio"] = common.TopupGroupRatio2JSONString()
 	common.OptionMap["Chats"] = setting.Chats2JsonString()
-	common.OptionMap["AutoGroups"] = setting.AutoGroups2JsonString()
-	common.OptionMap["DefaultUseAutoGroup"] = strconv.FormatBool(setting.DefaultUseAutoGroup)
-	common.OptionMap["MaxTokenAutoGroups"] = strconv.Itoa(setting.GetMaxTokenAutoGroups())
 	common.OptionMap["PayMethods"] = operation_setting.PayMethods2JsonString()
 	common.OptionMap["GitHubClientId"] = ""
 	common.OptionMap["GitHubClientSecret"] = ""
@@ -163,22 +169,13 @@ func InitOptionMap() {
 	common.OptionMap["TurnstileSecretKey"] = ""
 	common.OptionMap["QuotaRemindEnabled"] = strconv.FormatBool(common.QuotaRemindEnabled)
 	common.OptionMap["QuotaRemindThreshold"] = strconv.Itoa(common.QuotaRemindThreshold)
-	common.OptionMap["PreConsumedQuota"] = strconv.Itoa(common.PreConsumedQuota)
 	common.OptionMap["ModelRequestRateLimitCount"] = strconv.Itoa(setting.ModelRequestRateLimitCount)
 	common.OptionMap["ModelRequestRateLimitDurationMinutes"] = strconv.Itoa(setting.ModelRequestRateLimitDurationMinutes)
 	common.OptionMap["ModelRequestRateLimitSuccessCount"] = strconv.Itoa(setting.ModelRequestRateLimitSuccessCount)
 	common.OptionMap["ModelRequestRateLimitGroup"] = setting.ModelRequestRateLimitGroup2JSONString()
-	common.OptionMap["ModelRatio"] = ratio_setting.ModelRatio2JSONString()
-	common.OptionMap["ModelPrice"] = ratio_setting.ModelPrice2JSONString()
-	common.OptionMap["CacheRatio"] = ratio_setting.CacheRatio2JSONString()
-	common.OptionMap["CreateCacheRatio"] = ratio_setting.CreateCacheRatio2JSONString()
 	common.OptionMap["GroupRatio"] = ratio_setting.GroupRatio2JSONString()
 	common.OptionMap["GroupGroupRatio"] = ratio_setting.GroupGroupRatio2JSONString()
 	common.OptionMap["UserUsableGroups"] = setting.UserUsableGroups2JSONString()
-	common.OptionMap["CompletionRatio"] = ratio_setting.CompletionRatio2JSONString()
-	common.OptionMap["ImageRatio"] = ratio_setting.ImageRatio2JSONString()
-	common.OptionMap["AudioRatio"] = ratio_setting.AudioRatio2JSONString()
-	common.OptionMap["AudioCompletionRatio"] = ratio_setting.AudioCompletionRatio2JSONString()
 	common.OptionMap["TopUpLink"] = common.TopUpLink
 	//common.OptionMap["ChatLink"] = common.ChatLink
 	//common.OptionMap["ChatLink2"] = common.ChatLink2
@@ -200,11 +197,13 @@ func InitOptionMap() {
 	common.OptionMap["AutomaticDisableKeywords"] = operation_setting.AutomaticDisableKeywordsToString()
 	common.OptionMap["AutomaticDisableStatusCodes"] = operation_setting.AutomaticDisableStatusCodesToString()
 	common.OptionMap["AutomaticRetryStatusCodes"] = operation_setting.AutomaticRetryStatusCodesToString()
-	common.OptionMap["ExposeRatioEnabled"] = strconv.FormatBool(ratio_setting.IsExposeRatioEnabled())
 
 	// 自动添加所有注册的模型配置
-	modelConfigs := config.GlobalConfig.ExportAllConfigs()
-	maps.Copy(common.OptionMap, modelConfigs)
+	for key, value := range config.GlobalConfig.ExportAllConfigs() {
+		if !IsRetiredModelPricingOption(key) {
+			common.OptionMap[key] = value
+		}
+	}
 
 	common.OptionMapRWMutex.Unlock()
 	loadOptionsFromDatabase()
@@ -249,6 +248,12 @@ func validateOptionValue(key string, value string) error {
 	}
 	if IsRetiredStatisticsOption(key) {
 		return common.NewMessage(RetiredStatisticsSettingsMessage)
+	}
+	if IsRetiredAutoGroupOption(key) {
+		return common.NewMessage(RetiredAutoGroupSettingsMessage)
+	}
+	if model_setting.IsRetiredViolationFeeOption(key) {
+		return common.NewMessage(model_setting.RetiredViolationFeeSettingsMessage)
 	}
 	if operation_setting.IsBalanceReminderOption(key) {
 		if err := operation_setting.ValidateBalanceReminderOption(key, value); err != nil {
@@ -313,14 +318,8 @@ func validateOptionValue(key string, value string) error {
 	if key == "ResendKeyConfigured" {
 		return common.NewMessage("Resend key configuration status is read-only")
 	}
-	if key == operation_setting.ToolPriceOptionKey {
-		return operation_setting.ValidateToolPricesJSON(value)
-	}
 	if key == operation_setting.LogMaxRangeDaysOptionKey {
 		return operation_setting.ValidateLogMaxRangeDays(value)
-	}
-	if key == "MaxTokenAutoGroups" {
-		return setting.ValidateMaxTokenAutoGroups(value)
 	}
 	return nil
 }
@@ -478,6 +477,10 @@ func updateOptionMap(key string, value string) (err error) {
 		return nil
 	}
 	common.OptionMap[key] = value
+	if IsRetiredAutoGroupOption(key) || IsRetiredModelPricingOption(key) || model_setting.IsRetiredViolationFeeOption(key) {
+		// Keep historical values available without applying them to live configuration.
+		return nil
+	}
 
 	// 检查是否是模型配置 - 使用更规范的方式处理
 	if handleConfigUpdate(key, value) {
@@ -498,7 +501,7 @@ func updateOptionMap(key string, value string) (err error) {
 			common.ImageDownloadPermission = intValue
 		}
 	}
-	if strings.HasSuffix(key, "Enabled") || key == "DefaultCollapseSidebar" || key == "DefaultUseAutoGroup" || key == "SMTPForceAuthLogin" || key == "SMTPInsecureSkipVerify" {
+	if strings.HasSuffix(key, "Enabled") || key == "DefaultCollapseSidebar" || key == "SMTPForceAuthLogin" || key == "SMTPInsecureSkipVerify" {
 		boolValue := value == "true"
 		switch key {
 		case "PasswordRegisterEnabled":
@@ -584,10 +587,6 @@ func updateOptionMap(key string, value string) (err error) {
 			common.SMTPForceAuthLogin = boolValue
 		case "WorkerAllowHttpImageRequestEnabled":
 			system_setting.WorkerAllowHttpImageRequestEnabled = boolValue
-		case "DefaultUseAutoGroup":
-			setting.DefaultUseAutoGroup = boolValue
-		case "ExposeRatioEnabled":
-			ratio_setting.SetExposeRatioEnabled(boolValue)
 		}
 	}
 	if key == setting.TaskPluginDisabledFactoryKeysKey {
@@ -619,10 +618,6 @@ func updateOptionMap(key string, value string) (err error) {
 		operation_setting.PayAddress = value
 	case "Chats":
 		err = setting.UpdateChatsByJsonString(value)
-	case "AutoGroups":
-		err = setting.UpdateAutoGroupsByJsonString(value)
-	case "MaxTokenAutoGroups":
-		err = setting.UpdateMaxTokenAutoGroups(value)
 	case "CustomCallbackAddress":
 		operation_setting.CustomCallbackAddress = value
 	case "EpayId":
@@ -733,8 +728,6 @@ func updateOptionMap(key string, value string) (err error) {
 		common.TurnstileSecretKey = value
 	case "QuotaRemindThreshold":
 		common.QuotaRemindThreshold, _ = strconv.Atoi(value)
-	case "PreConsumedQuota":
-		common.PreConsumedQuota, _ = strconv.Atoi(value)
 	case "ModelRequestRateLimitCount":
 		setting.ModelRequestRateLimitCount, _ = strconv.Atoi(value)
 	case "ModelRequestRateLimitDurationMinutes":
@@ -745,28 +738,12 @@ func updateOptionMap(key string, value string) (err error) {
 		err = setting.UpdateModelRequestRateLimitGroupByJSONString(value)
 	case "RetryTimes":
 		common.RetryTimes, _ = strconv.Atoi(value)
-	case "ModelRatio":
-		err = ratio_setting.UpdateModelRatioByJSONString(value)
 	case "GroupRatio":
 		err = ratio_setting.UpdateGroupRatioByJSONString(value)
 	case "GroupGroupRatio":
 		err = ratio_setting.UpdateGroupGroupRatioByJSONString(value)
 	case "UserUsableGroups":
 		err = setting.UpdateUserUsableGroupsByJSONString(value)
-	case "CompletionRatio":
-		err = ratio_setting.UpdateCompletionRatioByJSONString(value)
-	case "ModelPrice":
-		err = ratio_setting.UpdateModelPriceByJSONString(value)
-	case "CacheRatio":
-		err = ratio_setting.UpdateCacheRatioByJSONString(value)
-	case "CreateCacheRatio":
-		err = ratio_setting.UpdateCreateCacheRatioByJSONString(value)
-	case "ImageRatio":
-		err = ratio_setting.UpdateImageRatioByJSONString(value)
-	case "AudioRatio":
-		err = ratio_setting.UpdateAudioRatioByJSONString(value)
-	case "AudioCompletionRatio":
-		err = ratio_setting.UpdateAudioCompletionRatioByJSONString(value)
 	case "TopUpLink":
 		common.TopUpLink = value
 	//case "ChatLink":
@@ -797,11 +774,6 @@ func updateOptionMap(key string, value string) (err error) {
 
 // handleConfigUpdate 处理分层配置更新，返回是否已处理
 func handleConfigUpdate(key, value string) bool {
-	if key == operation_setting.ToolPriceOptionKey {
-		operation_setting.LoadToolPricesFromJSONString(value)
-		return true
-	}
-
 	parts := strings.SplitN(key, ".", 2)
 	if len(parts) != 2 {
 		return false // 不是分层配置
@@ -825,8 +797,6 @@ func handleConfigUpdate(key, value string) bool {
 	// 特定配置的后处理
 	if configName == "performance_setting" {
 		performance_setting.UpdateAndSync()
-	} else if configName == "billing_setting" {
-		ratio_setting.InvalidateExposedDataCache()
 	}
 
 	return true // 已处理

@@ -1017,7 +1017,8 @@ func TestAuditDatabaseStartup(t *testing.T) {
 			model.DB, model.LOG_DB = db, db
 			common.SetLogDatabaseType(common.DatabaseTypePostgreSQL)
 			if upgrade {
-				require.NoError(t, db.AutoMigrate(&releasedAuditUser{}, &releasedAuditLog{}, &model.Ability{}))
+				require.NoError(t, db.AutoMigrate(&releasedAuditUser{}, &releasedAuditLog{}, &model.Ability{}, &model.Provider{}))
+				declareLegacyProviderRoutingColumns(t, db)
 				legacy := "released-token"
 				require.NoError(t, db.Create(&releasedAuditUser{Username: "released-owner", Password: "placeholder", AccessToken: &legacy, AffCode: "released-aff", Quota: 1234}).Error)
 				require.NoError(t, db.Create(&releasedAuditLog{UserId: 1, Type: model.LogTypeLogin, Content: "historical login", CreatedAt: 100, RequestId: "legacy-request"}).Error)

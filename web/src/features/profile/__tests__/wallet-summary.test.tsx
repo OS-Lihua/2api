@@ -18,7 +18,7 @@ import { useAuthStore } from '@/stores/auth-store'
 import { ProfileHeader } from '../components/profile-header'
 import type { UserProfile } from '../types'
 
-const profile: UserProfile = {
+const profile: UserProfile & { quota: number; used_quota: number } = {
   id: 1,
   username: 'one',
   display_name: 'One',

@@ -32,7 +32,7 @@ type Provider struct {
 	TestModel          *string `json:"test_model"`
 	Status             int     `json:"status" gorm:"default:1"`
 	Name               string  `json:"name" gorm:"index"`
-	Weight             *uint   `json:"weight" gorm:"default:0"`
+	Weight             *uint   `json:"weight" gorm:"->;-:migration"`
 	CreatedTime        int64   `json:"created_time" gorm:"bigint"`
 	TestTime           int64   `json:"test_time" gorm:"bigint"`
 	ResponseTime       int     `json:"response_time"` // in milliseconds
@@ -40,13 +40,15 @@ type Provider struct {
 	Other              string  `json:"other"`
 	Balance            float64 `json:"balance"` // in USD
 	BalanceUpdatedTime int64   `json:"balance_updated_time" gorm:"bigint"`
-	Models             string  `json:"models"`
-	Group              string  `json:"group" gorm:"type:varchar(64);default:'default'"`
-	UsedQuota          int64   `json:"used_quota" gorm:"bigint;default:0"`
-	ModelMapping       *string `json:"model_mapping" gorm:"type:text"`
+	// Historical reads only. The serving model must neither create nor write
+	// these columns; the offline migration retires them after conversion.
+	Models       string  `json:"models" gorm:"->;-:migration"`
+	Group        string  `json:"group" gorm:"->;-:migration"`
+	UsedQuota    int64   `json:"used_quota" gorm:"bigint;default:0"`
+	ModelMapping *string `json:"model_mapping" gorm:"->;-:migration"`
 	//MaxInputTokens     *int    `json:"max_input_tokens" gorm:"default:0"`
 	StatusCodeMapping *string `json:"status_code_mapping" gorm:"type:varchar(1024);default:''"`
-	Priority          *int64  `json:"priority" gorm:"bigint;default:0"`
+	Priority          *int64  `json:"priority" gorm:"->;-:migration"`
 	AutoBan           *int    `json:"auto_ban" gorm:"default:1"`
 	OtherInfo         string  `json:"other_info"`
 	Tag               *string `json:"tag" gorm:"index"`
@@ -374,21 +376,14 @@ func (channel *Provider) SaveProviderInfo() error {
 }
 
 func (channel *Provider) GetModels() []string {
-	if channel.Models == "" {
-		return []string{}
-	}
-	return strings.Split(strings.Trim(channel.Models, ","), ",")
+	return legacyProviderModelNames(channel.Models)
 }
 
-func (channel *Provider) GetGroups() []string {
-	if channel.Group == "" {
+func legacyProviderModelNames(models string) []string {
+	if models == "" {
 		return []string{}
 	}
-	groups := strings.Split(strings.Trim(channel.Group, ","), ",")
-	for i, group := range groups {
-		groups[i] = strings.TrimSpace(group)
-	}
-	return groups
+	return strings.Split(strings.Trim(models, ","), ",")
 }
 
 func (channel *Provider) GetOtherInfo() map[string]any {
@@ -443,6 +438,12 @@ func GetAllProviders(startIdx int, num int, selectAll bool, idSort bool, sortOpt
 		err = order.Apply(DB).Limit(num).Offset(startIdx).Omit("key").Find(&channels).Error
 	}
 	return channels, err
+}
+
+func ListProvidersForBalanceRefresh() ([]*Provider, error) {
+	var providers []*Provider
+	err := DB.Order(clause.OrderByColumn{Column: clause.Column{Name: "id"}, Desc: true}).Find(&providers).Error
+	return providers, err
 }
 
 func GetProvidersByTag(tag string, idSort bool, selectAll bool, sortOptions ...ProviderSortOptions) ([]*Provider, error) {
@@ -524,12 +525,18 @@ func GetProviderById(id int, selectAll bool) (*Provider, error) {
 	if selectAll {
 		err = DB.First(channel, "id = ?", id).Error
 	} else {
-		err = DB.Omit("key").First(channel, "id = ?", id).Error
+		err = providerAccountColumns(DB, "Key").First(channel, "id = ?", id).Error
 	}
 	if err != nil {
 		return nil, err
 	}
 	return channel, nil
+}
+
+// Explicit Provider account queries must not depend on the routing columns
+// retained on historical databases for offline conversion.
+func providerAccountColumns(db *gorm.DB, omit ...string) *gorm.DB {
+	return db.Omit(append([]string{"Models", "ModelMapping", "Group", "Priority", "Weight"}, omit...)...)
 }
 
 func BatchInsertProviders(channels []Provider) error {
@@ -549,7 +556,7 @@ func BatchInsertProviders(channels []Provider) error {
 
 	// Keep each chunk backed by channels so generated IDs reach the caller.
 	for chunk := range slices.Chunk(channels, 50) {
-		if err := tx.Create(&chunk).Error; err != nil {
+		if err := providerAccountColumns(tx).Create(&chunk).Error; err != nil {
 			tx.Rollback()
 			return err
 		}
@@ -606,13 +613,6 @@ func (channel *Provider) GetBaseURL() string {
 	return url
 }
 
-func (channel *Provider) GetModelMapping() string {
-	if channel.ModelMapping == nil {
-		return ""
-	}
-	return *channel.ModelMapping
-}
-
 func (channel *Provider) GetStatusCodeMapping() string {
 	if channel.StatusCodeMapping == nil {
 		return ""
@@ -662,7 +662,7 @@ func (edit *ProviderEdit) Commit(channel *Provider) error {
 			}
 		}
 	}
-	result := edit.tx.Model(channel).Updates(channel)
+	result := providerAccountColumns(edit.tx).Model(channel).Updates(channel)
 	if result.Error != nil {
 		return result.Error
 	}

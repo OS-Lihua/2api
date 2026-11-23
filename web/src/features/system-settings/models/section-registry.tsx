@@ -23,7 +23,6 @@ import { ClaudeSettingsCard } from './claude-settings-card'
 import { GatewayBudgetSettings } from './gateway-budget-settings'
 import { GeminiSettingsCard } from './gemini-settings-card'
 import { GlobalSettingsCard } from './global-settings-card'
-import { GrokSettingsCard } from './grok-settings-card'
 
 function formatJsonForEditor(value: string, fallback: string) {
   const raw = (value ?? '').toString().trim()
@@ -125,21 +124,6 @@ const MODELS_SECTIONS = [
       />
     ),
   },
-  {
-    id: 'grok',
-    titleKey: 'Grok',
-    build: (settings: ModelSettings) => (
-      <GrokSettingsCard
-        defaultValues={{
-          'grok.violation_deduction_enabled':
-            settings['grok.violation_deduction_enabled'] ?? true,
-          'grok.violation_deduction_amount':
-            settings['grok.violation_deduction_amount'] ?? 0.05,
-        }}
-      />
-    ),
-  },
-
   {
     id: 'model-deployment',
     titleKey: 'Model Deployment',

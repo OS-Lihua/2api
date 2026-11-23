@@ -90,7 +90,11 @@ func TestTokenAuthIgnoresHistoricalQuota(t *testing.T) {
 	for _, redisEnabled := range []bool{false, true} {
 		t.Run(fmt.Sprintf("redis_%t", redisEnabled), func(t *testing.T) {
 			setupDashboardAuthMiddlewareTest(t)
-			require.NoError(t, model.DB.AutoMigrate(&model.Token{}))
+			db := model.DB
+			require.NoError(t, db.AutoMigrate(&model.Token{}))
+			require.NoError(t, db.Exec(`ALTER TABLE tokens ADD COLUMN remain_quota bigint,
+				ADD COLUMN used_quota bigint, ADD COLUMN unlimited_quota boolean,
+				ADD COLUMN allow_user_quota_query boolean`).Error)
 			if redisEnabled {
 				useRateLimitMiniRedis(t)
 			}
@@ -110,16 +114,14 @@ func TestTokenAuthIgnoresHistoricalQuota(t *testing.T) {
 				{"historical_unlimited", -7, true},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
-					token := model.Token{UserId: user.Id, Key: fmt.Sprintf("quota-auth-fixture-%d", index), Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: tc.remaining, UsedQuota: 23, UnlimitedQuota: tc.unlimited}
-					require.NoError(t, model.DB.Create(&token).Error)
+					token := model.Token{UserId: user.Id, Key: fmt.Sprintf("quota-auth-fixture-%d", index), Status: common.TokenStatusEnabled, ExpiredTime: -1}
+					require.NoError(t, db.Create(&token).Error)
+					result := db.Exec(`UPDATE tokens SET remain_quota = ?, used_quota = 23, unlimited_quota = ?, allow_user_quota_query = true WHERE id = ?`,
+						tc.remaining, tc.unlimited, token.Id)
+					require.NoError(t, result.Error)
+					require.EqualValues(t, 1, result.RowsAffected)
 					response := middlewareBearerRequest(router, "/credential", token.Key)
 					assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
-					var stored model.Token
-					require.NoError(t, model.DB.First(&stored, token.Id).Error)
-					assert.Equal(t, common.TokenStatusEnabled, stored.Status, "legacy quota must not mutate credential status")
-					assert.Equal(t, tc.remaining, stored.RemainQuota)
-					assert.Equal(t, 23, stored.UsedQuota)
-					assert.Equal(t, tc.unlimited, stored.UnlimitedQuota)
 					for _, validate := range []func(string) (*model.Token, error){model.ValidateUserToken, model.ValidateWalletToken} {
 						credential, err := validate(token.Key)
 						assert.NoError(t, err)
@@ -128,6 +130,15 @@ func TestTokenAuthIgnoresHistoricalQuota(t *testing.T) {
 							assert.Equal(t, user.Id, credential.UserId)
 						}
 					}
+					var status, remaining, used int
+					var unlimited, allowQuery bool
+					require.NoError(t, db.Raw(`SELECT status, remain_quota, used_quota, unlimited_quota, allow_user_quota_query FROM tokens WHERE id = ?`, token.Id).
+						Row().Scan(&status, &remaining, &used, &unlimited, &allowQuery))
+					assert.Equal(t, common.TokenStatusEnabled, status, "legacy quota must not mutate credential status")
+					assert.Equal(t, tc.remaining, remaining)
+					assert.Equal(t, 23, used)
+					assert.Equal(t, tc.unlimited, unlimited)
+					assert.True(t, allowQuery)
 					assert.NotContains(t, response.Body.String(), token.Key)
 				})
 			}
@@ -139,28 +150,31 @@ func TestTokenCredentialIgnoresHistoricalRedisCounters(t *testing.T) {
 	setupDashboardAuthMiddlewareTest(t)
 	require.NoError(t, model.DB.AutoMigrate(&model.Token{}))
 	_, client := useRateLimitMiniRedis(t)
-	token := model.Token{UserId: 1, Key: "credential-primary-counter-fixture", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 9, UsedQuota: 4}
+	token := model.Token{UserId: 1, Key: "credential-primary-counter-fixture", Status: common.TokenStatusEnabled, ExpiredTime: -1, AllowIps: common.GetPointer("203.0.113.0/24")}
 	require.NoError(t, model.DB.Create(&token).Error)
 	_, err := model.GetTokenByKey(token.Key, true)
 	require.NoError(t, err)
 	cacheKey := "token:" + common.GenerateHMAC(token.Key)
-	require.NoError(t, client.HSet(t.Context(), cacheKey, "RemainQuota", -37, "UsedQuota", 50).Err())
+	require.NoError(t, client.HSet(t.Context(), cacheKey, "CacheMAC", "invalid",
+		"RemainQuota", -37, "UsedQuota", 50, "UnlimitedQuota", false, "AllowUserQuotaQuery", true).Err())
 	credential, err := model.GetTokenCredential(token.Key)
 	require.NoError(t, err)
-	assert.Equal(t, 9, credential.RemainQuota, "credential reads must not merge mutable Redis balance counters")
-	assert.Equal(t, 4, credential.UsedQuota)
 	assert.Equal(t, token.Id, credential.Id)
 	assert.Equal(t, token.UserId, credential.UserId)
+	assert.Equal(t, token.Status, credential.Status)
+	assert.Equal(t, token.ExpiredTime, credential.ExpiredTime)
+	assert.Equal(t, token.AllowIps, credential.AllowIps)
 	for _, validate := range []func(string) (*model.Token, error){model.ValidateUserToken, model.ValidateWalletToken} {
 		_, err = validate(token.Key)
 		assert.NoError(t, err)
 	}
-	remaining, err := client.HGet(t.Context(), cacheKey, "RemainQuota").Int()
+	hash, err := client.HGetAll(t.Context(), cacheKey).Result()
 	require.NoError(t, err)
-	used, err := client.HGet(t.Context(), cacheKey, "UsedQuota").Int()
-	require.NoError(t, err)
-	assert.Equal(t, -37, remaining, "retiring the credential precheck must not rewrite historical Redis counters")
-	assert.Equal(t, 50, used)
+	assert.NotEmpty(t, hash["CacheMAC"])
+	assert.NotEqual(t, "invalid", hash["CacheMAC"])
+	for _, field := range []string{"RemainQuota", "UsedQuota", "UnlimitedQuota", "AllowUserQuotaQuery"} {
+		assert.NotContains(t, hash, field)
+	}
 }
 
 func TestTokenCredentialRestrictionsRemainAuthoritative(t *testing.T) {
@@ -169,6 +183,9 @@ func TestTokenCredentialRestrictionsRemainAuthoritative(t *testing.T) {
 		t.Run(fmt.Sprintf("redis_%t", redisEnabled), func(t *testing.T) {
 			setupDashboardAuthMiddlewareTest(t)
 			require.NoError(t, model.DB.AutoMigrate(&model.Token{}))
+			for _, column := range []string{"remain_quota", "used_quota", "unlimited_quota", "allow_user_quota_query"} {
+				assert.False(t, model.DB.Migrator().HasColumn(&model.Token{}, column), column)
+			}
 			if redisEnabled {
 				useRateLimitMiniRedis(t)
 			}
@@ -203,7 +220,7 @@ func TestTokenCredentialRestrictionsRemainAuthoritative(t *testing.T) {
 					if tc.missing {
 						userID += 100000
 					}
-					token := model.Token{UserId: userID, Key: fmt.Sprintf("credential-boundary-fixture-%d", index), Status: tc.status, ExpiredTime: tc.expires, RemainQuota: 0, UsedQuota: 11, UnlimitedQuota: true, AllowIps: &tc.allowIPs}
+					token := model.Token{UserId: userID, Key: fmt.Sprintf("credential-boundary-fixture-%d", index), Status: tc.status, ExpiredTime: tc.expires, AllowIps: &tc.allowIPs}
 					require.NoError(t, model.DB.Create(&token).Error)
 					for _, path := range []string{"/credential", "/wallet-credential"} {
 						response := middlewareBearerRequest(router, path, token.Key)
@@ -217,8 +234,8 @@ func TestTokenCredentialRestrictionsRemainAuthoritative(t *testing.T) {
 						wantStatus = common.TokenStatusExpired
 					}
 					assert.Equal(t, wantStatus, stored.Status)
-					assert.Zero(t, stored.RemainQuota)
-					assert.Equal(t, 11, stored.UsedQuota)
+					assert.Equal(t, token.ExpiredTime, stored.ExpiredTime)
+					assert.Equal(t, token.AllowIps, stored.AllowIps)
 				})
 			}
 			for _, key := range []string{"", "missing-credential-fixture"} {
@@ -236,7 +253,7 @@ func TestTokenCredentialCacheCannotOverridePrimaryIdentity(t *testing.T) {
 	require.NoError(t, model.DB.AutoMigrate(&model.Token{}))
 	server, client := useRateLimitMiniRedis(t)
 	user := createMiddlewarePATUser(t, "credential-cache", "unused-cache-dashboard")
-	token := model.Token{UserId: user.Id, Key: "credential-primary-identity-fixture", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 1}
+	token := model.Token{UserId: user.Id, Key: "credential-primary-identity-fixture", Status: common.TokenStatusEnabled, ExpiredTime: -1}
 	require.NoError(t, model.DB.Create(&token).Error)
 	cacheKey := "token:" + common.GenerateHMAC(token.Key)
 	router := gin.New()
@@ -247,15 +264,18 @@ func TestTokenCredentialCacheCannotOverridePrimaryIdentity(t *testing.T) {
 	require.Equal(t, http.StatusOK, middlewareBearerRequest(router, "/credential", token.Key).Code)
 
 	t.Run("tampered_metadata_cannot_change_identity", func(t *testing.T) {
-		require.NoError(t, client.HSet(t.Context(), cacheKey, "UserId", user.Id+1000, "Status", common.TokenStatusDisabled, "ExpiredTime", 1, "Group", "forged", "UnlimitedQuota", true).Err())
+		require.NoError(t, client.HSet(t.Context(), cacheKey, "UserId", user.Id+1000, "Status", common.TokenStatusDisabled, "ExpiredTime", 1, "Group", "forged").Err())
 		response := middlewareBearerRequest(router, "/credential", token.Key)
 		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 		assert.JSONEq(t, fmt.Sprintf(`{"id":%d,"token_id":%d}`, user.Id, token.Id), response.Body.String())
 	})
-	t.Run("forged_positive_balance_cannot_revive_disabled_primary", func(t *testing.T) {
+	t.Run("valid_stale_cache_cannot_revive_disabled_primary", func(t *testing.T) {
+		require.Equal(t, http.StatusOK, middlewareBearerRequest(router, "/credential", token.Key).Code)
 		require.NoError(t, model.DB.Model(&token).Update("status", common.TokenStatusDisabled).Error)
 		defer func() { require.NoError(t, model.DB.Model(&token).Update("status", common.TokenStatusEnabled).Error) }()
-		require.NoError(t, client.HSet(t.Context(), cacheKey, "Status", common.TokenStatusEnabled, "RemainQuota", 999999, "UnlimitedQuota", true).Err())
+		cached, err := model.GetTokenByKey(token.Key, false)
+		require.NoError(t, err)
+		require.Equal(t, common.TokenStatusEnabled, cached.Status, "the stale snapshot must still pass cache integrity checks")
 		assert.Equal(t, http.StatusUnauthorized, middlewareBearerRequest(router, "/credential", token.Key).Code)
 	})
 	t.Run("primary_ip_restriction_overrides_warm_cache", func(t *testing.T) {

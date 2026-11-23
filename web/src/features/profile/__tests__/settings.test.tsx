@@ -45,8 +45,6 @@ const profile: UserProfile = {
   display_name: 'Alice',
   role: 1,
   group: 'default',
-  quota: 1000000,
-  used_quota: 0,
   request_count: 0,
   status: 1,
   aff_count: 0,

@@ -19,12 +19,15 @@ import (
 	"github.com/QuantumNous/new-api/pkg/clock"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/money"
+	"github.com/QuantumNous/new-api/pkg/testdb"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -152,6 +155,93 @@ func TestLocalQuotaUnitIsReadOnlyHistoricalMetadata(t *testing.T) {
 	}
 }
 
+func TestLegacyAutoGroupOptionsAreRetired(t *testing.T) {
+	db := setupManageUserTestDB(t)
+	historical := map[string]string{
+		"AutoGroups": `["vip","default"]`, "DefaultUseAutoGroup": "true", "MaxTokenAutoGroups": "5", "maxtokenautogroups": "4",
+		"GroupRatio": `{"vip":0.875,"default":1}`, "GroupGroupRatio": `{"vip":{"vip":0.75}}`,
+	}
+	var before []model.Option
+	for key, value := range historical {
+		require.NoError(t, db.Create(&model.Option{Key: key, Value: value}).Error)
+	}
+	require.NoError(t, db.Order("key").Find(&before).Error)
+	common.OptionMapRWMutex.Lock()
+	previousOptions := common.OptionMap
+	common.OptionMap = maps.Clone(historical)
+	common.OptionMapRWMutex.Unlock()
+	previousTopUp := common.TopUpLink
+	previousDefault, previousMax, previousGroups := setting.DefaultUseAutoGroup, setting.GetMaxTokenAutoGroups(), setting.AutoGroups2JsonString()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptions
+		common.OptionMapRWMutex.Unlock()
+		common.TopUpLink = previousTopUp
+		setting.DefaultUseAutoGroup = previousDefault
+		require.NoError(t, setting.UpdateMaxTokenAutoGroups(strconv.Itoa(previousMax)))
+		require.NoError(t, setting.UpdateAutoGroupsByJsonString(previousGroups))
+	})
+
+	actor := model.User{Id: 1, Role: common.RoleRootUser}
+	response := reminderSettingsHTTP(t, GetOptions, http.MethodGet, "/api/option/", "", actor)
+	var listed struct {
+		Success bool
+		Data    []model.Option
+	}
+	require.Equal(t, http.StatusOK, response.Code)
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &listed))
+	require.True(t, listed.Success)
+	projected := make(map[string]string)
+	for _, option := range listed.Data {
+		projected[option.Key] = option.Value
+	}
+	assert.Equal(t, historical["GroupRatio"], projected["GroupRatio"])
+	assert.Equal(t, historical["GroupGroupRatio"], projected["GroupGroupRatio"])
+
+	for _, key := range []string{"AutoGroups", "DefaultUseAutoGroup", "MaxTokenAutoGroups", "maxtokenautogroups"} {
+		t.Run(key, func(t *testing.T) {
+			assert.NotContains(t, projected, key)
+			body, err := common.Marshal(OptionUpdateRequest{Key: key, Value: "7"})
+			require.NoError(t, err)
+			response := reminderSettingsHTTP(t, UpdateOption, http.MethodPut, "/api/option/", string(body), actor)
+			assert.Equal(t, http.StatusGone, response.Code)
+			assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+			var result struct {
+				Success bool
+				Code    string
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+			assert.False(t, result.Success)
+			assert.Equal(t, "legacy_auto_group_settings_retired", result.Code)
+			assert.Error(t, model.UpdateOption(key, "7"))
+		})
+	}
+	assert.Error(t, model.UpdateOptionsBulk(map[string]string{
+		"TopUpLink": "https://example.invalid/changed", "MaxTokenAutoGroups": "9",
+	}))
+	var after []model.Option
+	require.NoError(t, db.Order("key").Find(&after).Error)
+	assert.Equal(t, before, after, "retirement preserves historical rows and rejects mixed writes atomically")
+	common.OptionMapRWMutex.RLock()
+	afterMap := maps.Clone(common.OptionMap)
+	common.OptionMapRWMutex.RUnlock()
+	assert.Equal(t, historical, afterMap)
+	discounts, err := model.ExactGroupDiscounts([]string{"vip", "default"})
+	require.NoError(t, err)
+	assert.Equal(t, "0.75", discounts["vip"].String(), "own-group sale discount still takes precedence")
+	assert.Equal(t, "1", discounts["default"].String())
+
+	response = reminderSettingsHTTP(t, GetStatus, http.MethodGet, "/api/status", "", actor)
+	var status struct {
+		Success bool
+		Data    map[string]common.RawMessage
+	}
+	require.Equal(t, http.StatusOK, response.Code)
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &status))
+	require.True(t, status.Success)
+	assert.NotContains(t, status.Data, "default_use_auto_group")
+}
+
 func TestLegacyStatisticsSettingsAreRetired(t *testing.T) {
 	for _, mode := range []string{"projection", "status", "http", "internal", "bulk", "active"} {
 		t.Run(mode, func(t *testing.T) {
@@ -264,7 +354,7 @@ func TestGetOptionsOmitsRetiredPricingWithoutChangingLegacySources(t *testing.T)
 	retiredKeys := []string{
 		"ModelPrice", "ModelRatio", "CompletionRatio", "CacheRatio", "CreateCacheRatio",
 		"ImageRatio", "AudioRatio", "AudioCompletionRatio", "billing_setting.billing_mode",
-		"billing_setting.billing_expr", "billing_setting.plugin_billing_expr", "CompletionRatioMeta",
+		"billing_setting.billing_expr", "billing_setting.plugin_billing_expr", "CompletionRatioMeta", "ExposeRatioEnabled", operation_setting.ToolPriceOptionKey,
 	}
 	for _, configured := range []bool{false, true} {
 		t.Run(fmt.Sprintf("configured_%t", configured), func(t *testing.T) {
@@ -280,6 +370,7 @@ func TestGetOptionsOmitsRetiredPricingWithoutChangingLegacySources(t *testing.T)
 				values["billing_setting.billing_mode"] = `{"legacy-zero":"tiered_expr","legacy-priced":"tiered_expr"}`
 				values["billing_setting.billing_expr"] = `{"legacy-zero":"0","legacy-priced":"p * 0.125"}`
 				values["billing_setting.plugin_billing_expr"] = `{}`
+				values["ExposeRatioEnabled"] = "true"
 				config.UpdateConfigFromMap(config.GlobalConfig.Get("billing_setting"), map[string]string{
 					"billing_mode":        values["billing_setting.billing_mode"],
 					"billing_expr":        values["billing_setting.billing_expr"],
@@ -335,7 +426,7 @@ func TestLegacyModelPricingOptionWritesAreRetired(t *testing.T) {
 	keys := []string{
 		"ModelPrice", "ModelRatio", "CompletionRatio", "CacheRatio", "CreateCacheRatio",
 		"ImageRatio", "AudioRatio", "AudioCompletionRatio", "billing_setting.billing_mode",
-		"billing_setting.billing_expr", "billing_setting.plugin_billing_expr",
+		"billing_setting.billing_expr", "billing_setting.plugin_billing_expr", "ExposeRatioEnabled", operation_setting.ToolPriceOptionKey,
 	}
 	for _, mode := range []string{"single", "bulk", "http"} {
 		t.Run(mode, func(t *testing.T) {
@@ -350,6 +441,7 @@ func TestLegacyModelPricingOptionWritesAreRetired(t *testing.T) {
 			values["billing_setting.billing_mode"] = `{"legacy-zero":"tiered_expr","legacy-paid":"ratio"}`
 			values["billing_setting.billing_expr"] = `{"legacy-zero":"0"}`
 			values["billing_setting.plugin_billing_expr"] = `{}`
+			values["ExposeRatioEnabled"] = "true"
 			for key, value := range values {
 				require.NoError(t, db.Create(&model.Option{Key: key, Value: value}).Error)
 			}
@@ -396,6 +488,114 @@ func TestLegacyModelPricingOptionWritesAreRetired(t *testing.T) {
 			assert.Equal(t, common.TopUpLink, link.Value)
 		})
 	}
+}
+
+func TestLegacyModelPricingReloadPreservesSourceWithoutApplyingSettings(t *testing.T) {
+	db := modelManagementDB(t)
+	previousOptions := config.GlobalConfig.ExportAllConfigs()
+	previousTopUpLink := common.TopUpLink
+	t.Cleanup(func() {
+		operation_setting.LoadToolPricesFromJSONString(previousOptions[operation_setting.ToolPriceOptionKey])
+		common.TopUpLink = previousTopUpLink
+	})
+	const modelName = "old-pricing-reload-model"
+	const toolName = "old-pricing-reload-tool"
+	historical := map[string]string{
+		"ModelPrice":                         `{"old-pricing-reload-model":1.25}`,
+		"ModelRatio":                         `{"old-pricing-reload-model":0.75}`,
+		"billing_setting.billing_mode":       `{"old-pricing-reload-model":"tiered_expr"}`,
+		"billing_setting.billing_expr":       `{"old-pricing-reload-model":"p * 0.125"}`,
+		operation_setting.ToolPriceOptionKey: `{"old-pricing-reload-tool":2.5}`,
+	}
+	for key, value := range historical {
+		require.NoError(t, db.Create(&model.Option{Key: key, Value: value}).Error)
+	}
+	var before []model.Option
+	require.NoError(t, db.Order("key").Find(&before).Error)
+	for range 2 {
+		model.InitOptionMap()
+		_, hasPrice := ratio_setting.GetModelPrice(modelName, false)
+		_, hasRatio, _ := ratio_setting.GetModelRatio(modelName)
+		assert.False(t, hasPrice)
+		assert.False(t, hasRatio)
+		assert.Zero(t, operation_setting.GetToolPrice(toolName))
+		loaded := config.GlobalConfig.ExportAllConfigs()
+		assert.Equal(t, previousOptions["billing_setting.billing_mode"], loaded["billing_setting.billing_mode"])
+		assert.Equal(t, previousOptions["billing_setting.billing_expr"], loaded["billing_setting.billing_expr"])
+		common.OptionMapRWMutex.RLock()
+		stored := maps.Clone(common.OptionMap)
+		common.OptionMapRWMutex.RUnlock()
+		for key, value := range historical {
+			assert.Equal(t, value, stored[key])
+		}
+	}
+	var after []model.Option
+	require.NoError(t, db.Order("key").Find(&after).Error)
+	assert.Equal(t, before, after)
+}
+
+func TestLegacyViolationFeeSettingsAreRetired(t *testing.T) {
+	db := modelManagementDB(t)
+	previousTopUpLink := common.TopUpLink
+	t.Cleanup(func() { common.TopUpLink = previousTopUpLink })
+	const topUpLink = "https://example.invalid/original"
+	historical := map[string]string{
+		"grok.violation_deduction_enabled": "false",
+		"grok.violation_deduction_amount":  "0.125",
+	}
+	for key, value := range historical {
+		require.NoError(t, db.Create(&model.Option{Key: key, Value: value}).Error)
+	}
+	require.NoError(t, db.Create(&model.Option{Key: "TopUpLink", Value: topUpLink}).Error)
+	var before []model.Option
+	require.NoError(t, db.Order("key").Find(&before).Error)
+	for range 2 {
+		model.InitOptionMap()
+		loaded := config.GlobalConfig.ExportAllConfigs()
+		for key, value := range historical {
+			assert.NotContains(t, loaded, key, "reload must not re-enable %s", key)
+			common.OptionMapRWMutex.RLock()
+			stored := common.OptionMap[key]
+			common.OptionMapRWMutex.RUnlock()
+			assert.Equal(t, value, stored)
+		}
+	}
+	var options struct {
+		Success bool           `json:"success"`
+		Data    []model.Option `json:"data"`
+	}
+	recorder := modelManagementRequest(t, GetOptions, http.MethodGet, "/api/option/", nil, &options)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.True(t, options.Success)
+	visible := make(map[string]string, len(options.Data))
+	for _, option := range options.Data {
+		visible[option.Key] = option.Value
+	}
+	assert.Equal(t, topUpLink, visible["TopUpLink"])
+	for key := range historical {
+		assert.NotContains(t, visible, key)
+		for _, spelling := range []string{key, strings.ToUpper(key)} {
+			for _, value := range []any{nil, "0.75"} {
+				var response struct {
+					Success bool   `json:"success"`
+					Code    string `json:"code"`
+				}
+				recorder := modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", OptionUpdateRequest{Key: spelling, Value: value}, &response)
+				assert.Equal(t, http.StatusGone, recorder.Code, spelling)
+				assert.Equal(t, "no-store", recorder.Header().Get("Cache-Control"))
+				assert.False(t, response.Success)
+				assert.Equal(t, "legacy_violation_fee_settings_retired", response.Code)
+			}
+			assert.ErrorContains(t, model.UpdateOption(spelling, "0.75"), "Legacy violation fee settings have been retired.")
+			assert.ErrorContains(t, model.UpdateOptionsBulk(map[string]string{
+				spelling: "0.75", "TopUpLink": "https://example.invalid/changed",
+			}), "Legacy violation fee settings have been retired.")
+		}
+	}
+	var after []model.Option
+	require.NoError(t, db.Order("key").Find(&after).Error)
+	assert.Equal(t, before, after)
+	assert.Equal(t, topUpLink, common.TopUpLink)
 }
 
 func TestBalanceReminderSiteHTTPContract(t *testing.T) {
@@ -528,6 +728,7 @@ func TestLegacyQuotaSettingsRejectLiveMutation(t *testing.T) {
 		{"quota_setting.trust_quota_usd", "10", "25"},
 		{"quota_setting.pre_consume_multiplier", "1", "2"},
 		{"quota_setting.enable_free_model_pre_consume", "true", "false"},
+		{"PreConsumedQuota", "500", "600"},
 	} {
 		for _, stored := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/stored=%t", tc.key, stored), func(t *testing.T) {
@@ -598,6 +799,7 @@ func TestLegacyQuotaSettingsRejectLiveMutation(t *testing.T) {
 
 func TestUpdateOptionRejectsInvalidTaskBillingExpressions(t *testing.T) {
 	database := modelManagementDB(t)
+	declareLegacyProviderRoutingColumns(t, database)
 	const pluginKey = "billing-save-probe"
 	const modelName = "billing-save-model"
 	source := `
@@ -662,6 +864,7 @@ export function parseTaskResult() { return {}; }
 
 func TestUpdateOptionRejectsUsageExpressionWithoutTaskPlugin(t *testing.T) {
 	database := modelManagementDB(t)
+	declareLegacyProviderRoutingColumns(t, database)
 	legacySource, err := model.LoadLegacyPricingConversionSource(database, jsplugin.DefaultRegistry.Generation())
 	require.NoError(t, err)
 	const modelName = "billing-save-model-without-plugin"
@@ -714,7 +917,7 @@ export function parseTaskResult() { return {}; }
 	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(pluginKey) })
 
 	mapping := `{"alias-model":"declared-model"}`
-	require.NoError(t, model.DB.Create(&model.Provider{
+	provider := model.Provider{
 		Id:           1,
 		Type:         54,
 		Key:          "key-1",
@@ -723,7 +926,10 @@ export function parseTaskResult() { return {}; }
 		Group:        "default",
 		Models:       "alias-model,declared-model",
 		ModelMapping: &mapping,
-	}).Error)
+	}
+	declareLegacyProviderRoutingColumns(t, database)
+	require.NoError(t, database.Create(&provider).Error)
+	seedLegacyProviderRouting(t, database, &provider)
 	legacySource, err := model.LoadLegacyPricingConversionSource(database, jsplugin.DefaultRegistry.Generation())
 	require.NoError(t, err)
 
@@ -864,8 +1070,10 @@ func TestPreConsumePolicyDatabase(t *testing.T) {
 			operation_setting.GetQuotaSetting().PreConsumeMultiplier = tc.multiplier
 			user := model.User{Username: fmt.Sprintf("policy-user-%d", i), Quota: tc.wallet, Group: "default", Setting: `{"billing_preference":"wallet_only"}`, AffCode: fmt.Sprintf("policy-aff-%d", i)}
 			require.NoError(t, db.Create(&user).Error)
-			token := model.Token{UserId: user.Id, Key: fmt.Sprintf("policy-token-%d", i), RemainQuota: tc.token, UnlimitedQuota: tc.unlimited}
+			token := model.Token{UserId: user.Id, Key: fmt.Sprintf("policy-token-%d", i)}
 			require.NoError(t, db.Create(&token).Error)
+			legacy := testdb.LegacyKeyQuota{RemainQuota: tc.token, UnlimitedQuota: tc.unlimited}
+			testdb.SeedLegacyKeyQuota(t, db, token.Id, legacy)
 			_, err := model.TopUpWallet(model.WalletTopUp{UserId: user.Id, Source: money.Amount{Nanos: 10000000, Currency: "USD"}, Reference: fmt.Sprintf("policy-opening-%d", i)})
 			require.NoError(t, err)
 			price := &model.PriceVersion{ID: i + 100, Currency: "USD", Expression: `tier("base", p * 3 + c * 15)`}
@@ -894,9 +1102,8 @@ func TestPreConsumePolicyDatabase(t *testing.T) {
 			require.NoError(t, err)
 			assert.EqualValues(t, 5500000, wallet.Balance.Nanos)
 			require.NoError(t, db.First(&user, user.Id).Error)
-			require.NoError(t, db.First(&token, token.Id).Error)
 			assert.Equal(t, tc.wallet, user.Quota)
-			assert.Equal(t, tc.token, token.RemainQuota)
+			assert.Equal(t, legacy, testdb.ReadLegacyKeyQuota(t, db, token.Id))
 			var holds, releases int64
 			require.NoError(t, db.Model(&model.LedgerEntry{}).Where("request_id = ? AND type = ?", request.ID, model.LedgerEntryPreConsume).Count(&holds).Error)
 			require.NoError(t, db.Model(&model.LedgerEntry{}).Where("request_id = ? AND type = ?", request.ID, model.LedgerEntryPreConsumeRelease).Count(&releases).Error)

@@ -97,6 +97,11 @@ func TestModelConnectionsStableIdentityAPI(t *testing.T) {
 	disabled := model.Provider{Name: "disabled-provider", Type: 1, Status: common.ChannelStatusManuallyDisabled}
 	require.NoError(t, db.Create(&provider).Error)
 	require.NoError(t, db.Create(&disabled).Error)
+	// Seed the historical routing facts explicitly; new Provider writes must not persist them.
+	require.NoError(t, db.Exec(`ALTER TABLE "providers" ADD COLUMN "models" text, ADD COLUMN "group" text`).Error)
+	seeded := db.Exec(`UPDATE "providers" SET "models" = ?, "group" = ? WHERE "id" = ?`, provider.Models, provider.Group, provider.Id)
+	require.NoError(t, seeded.Error)
+	require.EqualValues(t, 1, seeded.RowsAffected)
 	require.NoError(t, provider.UpdateAbilities(db))
 	channels := []model.Channel{
 		{ProviderID: provider.Id, ModelID: records[0].Id, Protocol: "openai_chat", UpstreamModelName: "first", ParameterOverrides: "{}", Status: model.ChannelEnabled, MappingConfirmed: true},
@@ -211,6 +216,7 @@ func TestModelConnectionsStableIdentityAPI(t *testing.T) {
 		var retained model.Provider
 		require.NoError(t, db.First(&retained, provider.Id).Error)
 		assert.Equal(t, provider.Models, retained.Models)
+		assert.Equal(t, provider.Group, retained.Group)
 		for _, batch := range []bool{false, true} {
 			method, path, body := http.MethodDelete, fmt.Sprintf("/api/models/%d", records[0].Id), ""
 			if batch {
@@ -1088,24 +1094,24 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.prepare_content)u
 			assert.Equal(t, tc.expected, result["data"].(map[string]any)["status"], result)
 		}
 	})
-	t.Run("stored Provider loss policy does not control Channel probes", func(t *testing.T) {
-		for _, policy := range []string{"allow", "safe", "strict"} {
+	t.Run("stored Provider loss policy does not control host conversion or Channel probes", func(t *testing.T) {
+		for _, policy := range []string{`"allow"`, `"safe"`, `"strict"`, `"legacy-unknown"`, `17`} {
 			var request dto.GeneralOpenAIRequest
 			require.NoError(t, common.UnmarshalJsonStr(`{"model":"claude-sonnet-4-20250514","reasoning_effort":"low","max_tokens":64,"messages":[{"role":"user","content":"Call probe_echo with value ok."}],"tools":[{"type":"function","function":{"name":"probe_echo","parameters":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}}}],"tool_choice":{"type":"function","function":{"name":"probe_echo"}}}`, &request))
-			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeAnthropic, ChannelOtherSettings: dto.ProviderOtherSettings{ToolLossPolicy: policy}}, OriginModelName: request.Model}
+			account := model.Provider{OtherSettings: `{"tool_loss_policy":` + policy + `}`}
+			info := &relaycommon.RelayInfo{ProviderMeta: &relaycommon.ProviderMeta{ChannelType: constant.ChannelTypeAnthropic, ChannelOtherSettings: account.GetOtherSettings()}, OriginModelName: request.Model}
 			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 			converted, err := service.ConvertRequest(ctx, info, types.RelayFormatClaude, &request)
+			require.NoError(t, err, "retired Provider settings must not reject conversion: %s", policy)
 			require.NotNil(t, converted)
 			assert.True(t, slices.ContainsFunc(converted.Diagnostics, func(diagnostic types.ConversionDiagnostic) bool {
 				return diagnostic.Code == "forced_tool_choice_downgraded"
 			}), "generic conversion retains the real loss diagnostic")
-			if policy == "allow" {
-				require.NoError(t, err)
-			} else {
-				var loss *types.ConversionLossError
-				require.ErrorAs(t, err, &loss, "generic opt-in loss policies are not retired")
-			}
+			info.ConvOptions().ToolLossPolicy = types.ConversionLossPolicySafe
+			_, err = service.ConvertRequest(ctx, info, types.RelayFormatClaude, &request)
+			var loss *types.ConversionLossError
+			require.ErrorAs(t, err, &loss, "explicit converter options still reject conversion loss")
 		}
 		var calls atomic.Int32
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1145,7 +1151,7 @@ export function buildContentRequest(ctx){if(ctx.data&&ctx.data.prepare_content)u
 				}
 				var stored model.Provider
 				require.NoError(t, db.First(&stored, account.Id).Error)
-				assert.Equal(t, raw, stored.OtherSettings, "probe overrides only its in-memory copy")
+				assert.Equal(t, raw, stored.OtherSettings, "probing must leave historical settings unchanged")
 			})
 		}
 	})

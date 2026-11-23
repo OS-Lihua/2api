@@ -8173,6 +8173,8 @@
     "Legacy quota reminders have been retired. Use balance reminder settings.": "Устаревшие уведомления о квоте выведены из эксплуатации. Используйте настройки уведомления о балансе.",
     "Legacy missing-model discovery has been retired. Use Models and metadata sync.": "Устаревший поиск отсутствующих моделей выведен из эксплуатации. Используйте управление моделями и синхронизацию метаданных.",
     "Legacy statistics collection settings have been retired.": "Устаревшие настройки сбора статистики выведены из эксплуатации.",
+    "Legacy automatic routing group settings have been retired.": "Устаревшие настройки автоматической маршрутизации по группам больше не действуют.",
+    "Legacy violation fee settings have been retired.": "Устаревшие настройки платы за нарушения больше не действуют.",
     "Current PriceVersion diagnostics": "Диагностика текущих версий цен",
     "Checks the current running plugin and visible price owners, not the selected historical version.": "Проверяется текущий работающий плагин и видимые объекты тарификации, а не выбранная историческая версия.",
     "Pricing diagnostics are unavailable. The plugin change was saved.": "Диагностика цен недоступна. Изменение плагина сохранено.",

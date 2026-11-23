@@ -162,6 +162,23 @@ func InitDB() (err error) {
 		if err := ValidateLegacyMidjourneyMigration(DB); err != nil {
 			return err
 		}
+		columns, err := inspectLegacyKeyColumns(DB)
+		if err != nil {
+			return fmt.Errorf("inspect legacy Key schema: %w", err)
+		}
+		if !common.IsMasterNode && columns.ModelLimits+columns.Routing != 0 {
+			return ErrLegacyKeyPermissions
+		}
+		if columns.Quota != 0 {
+			return ErrLegacyKeyQuota
+		}
+		providerColumns, err := inspectLegacyProviderRoutingColumns(DB)
+		if err != nil {
+			return fmt.Errorf("inspect legacy Provider routing: %w", err)
+		}
+		if providerColumns != 0 {
+			return ErrLegacyProviderRouting
+		}
 		if err := ensureUserQuotaColumns(DB); err != nil {
 			return err
 		}
@@ -276,10 +293,6 @@ func migrateDB() error {
 		return err
 	}
 	if err := migratePrefillGroupUniqueness(DB); err != nil {
-		return err
-	}
-	// Migrate model_limits column from varchar to text for existing tables
-	if err := migrateTokenModelLimitsToText(); err != nil {
 		return err
 	}
 	if err := migrateOptionPrimaryKey(DB); err != nil {
@@ -474,35 +487,6 @@ func clickHouseLogTableHasTTL() (bool, error) {
 func clickHouseCreateTableHasTTL(createTableSQL string) bool {
 	upperSQL := strings.ToUpper(createTableSQL)
 	return strings.Contains(upperSQL, "\nTTL ") || strings.Contains(upperSQL, " TTL ")
-}
-
-// migrateTokenModelLimitsToText migrates model_limits column from varchar(1024) to text
-// This is safe to run multiple times - it checks the column type first
-func migrateTokenModelLimitsToText() error {
-	tableName := "tokens"
-	columnName := "model_limits"
-
-	if !DB.Migrator().HasTable(tableName) {
-		return nil
-	}
-
-	if !DB.Migrator().HasColumn(&Token{}, columnName) {
-		return nil
-	}
-
-	var dataType string
-	if err := DB.Raw(`SELECT data_type FROM information_schema.columns
-		WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?`,
-		tableName, columnName).Scan(&dataType).Error; err != nil {
-		common.SysLog(common.LogText("Warning: failed to query metadata for %s.%s: %v", tableName, columnName, err))
-	} else if dataType == "text" {
-		return nil
-	}
-	if err := DB.Exec(fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN %s TYPE text`, tableName, columnName)).Error; err != nil {
-		return fmt.Errorf("failed to migrate %s.%s to text: %w", tableName, columnName, err)
-	}
-	common.SysLog(common.LogText("Successfully migrated %s.%s to text", tableName, columnName))
-	return nil
 }
 
 func closeDB(db *gorm.DB) error {

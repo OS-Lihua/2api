@@ -32,10 +32,23 @@ export function parseTaskResult() { return {}; }
 `, version, usageSchema)
 }
 
+func addLegacyProviderMappingColumns(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	require.NoError(t, db.Exec(`ALTER TABLE providers ADD COLUMN models text, ADD COLUMN model_mapping text`).Error)
+}
+
+func setLegacyProviderMapping(t *testing.T, db *gorm.DB, id int, names, mapping string) {
+	t.Helper()
+	result := db.Exec(`UPDATE providers SET models = ?, model_mapping = ? WHERE id = ?`, names, mapping, id)
+	require.NoError(t, result.Error)
+	require.EqualValues(t, 1, result.RowsAffected)
+}
+
 func legacyUsagePricingFixture(t *testing.T) (*gorm.DB, *jsplugin.Registry) {
 	t.Helper()
 	db := UseTestDatabases(t)
 	require.NoError(t, db.AutoMigrate(&Provider{}, &Ability{}, &Model{}, &Option{}))
+	addLegacyProviderMappingColumns(t, db)
 	previous := jsplugin.DefaultRegistry
 	registry := jsplugin.NewRegistry()
 	jsplugin.DefaultRegistry = registry
@@ -46,8 +59,9 @@ func legacyUsagePricingFixture(t *testing.T) (*gorm.DB, *jsplugin.Registry) {
 func insertLegacyUsageProvider(t *testing.T, db *gorm.DB, id int, names, mapping string) {
 	t.Helper()
 	provider := Provider{Id: id, Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled,
-		Name: fmt.Sprintf("legacy-%d", id), Models: names, ModelMapping: &mapping}
+		Name: fmt.Sprintf("legacy-%d", id)}
 	require.NoError(t, db.Create(&provider).Error)
+	setLegacyProviderMapping(t, db, id, names, mapping)
 	for name := range strings.SplitSeq(names, ",") {
 		require.NoError(t, db.Create(&Ability{Group: "default", Model: name, ChannelId: id, Enabled: true}).Error)
 	}
@@ -402,8 +416,10 @@ func TestModelPricingIssuesFollowPluginChanges(t *testing.T) {
 		jsplugin.DefaultRegistry.Unregister("issue-alpha")
 		jsplugin.DefaultRegistry.Unregister("issue-beta")
 	})
-	provider := Provider{Name: "private", Key: "fixture", Models: "ignored-old-model", ModelMapping: new(`{"priced":"not-a-declaration"}`)}
+	addLegacyProviderMappingColumns(t, db)
+	provider := Provider{Name: "private", Key: "fixture"}
 	require.NoError(t, db.Create(&provider).Error)
+	setLegacyProviderMapping(t, db, provider.Id, "ignored-old-model", `{"priced":"not-a-declaration"}`)
 	price := func(ownerType string, id int, expression string, effective int64) PriceVersion {
 		record := PriceVersion{OwnerType: ownerType, OwnerID: id, Currency: "USD", Expression: expression, EffectiveAt: effective, CreatedBy: actor.Id}
 		if ownerType == PriceOwnerChannel {

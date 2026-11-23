@@ -34,7 +34,7 @@ func GetQuotaSetting() *QuotaSetting {
 const RetiredQuotaSettingsMessage = "Legacy quota reservation settings have been retired."
 
 func IsRetiredQuotaOption(key string) bool {
-	if strings.EqualFold(key, "QuotaPerUnit") {
+	if strings.EqualFold(key, "QuotaPerUnit") || strings.EqualFold(key, "PreConsumedQuota") {
 		return true
 	}
 	switch key {

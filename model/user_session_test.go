@@ -601,7 +601,11 @@ func TestUserBaseIncludesAuthorizationFields(t *testing.T) {
 	assert.Equal(t, user.Role, base.Role)
 	assert.Equal(t, user.AuthVersion, base.AuthVersion)
 	assert.Equal(t, userCacheSchemaVersion, base.CacheSchema)
-	assert.Equal(t, user.Quota, base.Quota)
+	assert.Equal(t, user.Status, base.Status)
+	assert.Equal(t, user.Group, base.Group)
+	encoded, err := common.Marshal(base)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), `"quota"`)
 }
 
 func TestUserUpdateBumpsAuthVersionOnlyForAuthorizationChanges(t *testing.T) {

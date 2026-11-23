@@ -129,6 +129,9 @@ func TestProviderAdminAPIRejectsRetiredRoutingFields(t *testing.T) {
 		{"group", map[string]any{"group": "new-group"}},
 		{"priority", map[string]any{"priority": 100}},
 		{"weight", map[string]any{"weight": 10}},
+		{"legacy used quota", map[string]any{"used_quota": 900}},
+		{"null legacy used quota", map[string]any{"used_quota": nil}},
+		{"case folded legacy used quota", map[string]any{"Used_Quota": 900}},
 		{"top level loss policy", map[string]any{"tool_loss_policy": "allow"}},
 		{"nested loss policy", map[string]any{"settings": `{"tool_loss_policy":"allow","aws_region":"us-west-2"}`}},
 		{"case insensitive loss policy", map[string]any{"Settings": `{"TOOL_LOSS_POLICY":"allow"}`}},
@@ -185,7 +188,8 @@ func TestProviderSettingsRetainValidationWithRetiredLossPolicy(t *testing.T) {
 		providerType                    int
 	}{
 		{name: "unknown historical policy", other: `{"tool_loss_policy":"legacy-unknown","aws_region":"us-east-1"}`},
-		{name: "invalid policy JSON type", other: `{"tool_loss_policy":17}`, wantError: "cannot unmarshal"},
+		{name: "historical policy with a non-string value", other: `{"tool_loss_policy":17,"openrouter_enterprise":true}`},
+		{name: "invalid active field JSON type", other: `{"tool_loss_policy":17,"openrouter_enterprise":17}`, wantError: "cannot unmarshal"},
 		{name: "invalid settings JSON", setting: `{`, wantError: "unexpected end"},
 		{name: "invalid other settings JSON", other: `{`, wantError: "unexpected end"},
 		{name: "proxy still checked", setting: `{"proxy":"ftp://localhost"}`, other: `{"tool_loss_policy":"legacy-unknown"}`, wantError: "invalid channel proxy"},
@@ -340,6 +344,30 @@ func TestProviderAdminAPISearchDoesNotProbeHiddenURLValues(t *testing.T) {
 	}
 }
 
+// Only fixtures that exercise historical routing may create these source columns.
+func declareLegacyProviderRoutingColumns(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	require.NoError(t, db.Exec(`ALTER TABLE "providers" ADD COLUMN "models" text, ADD COLUMN "model_mapping" text,
+		ADD COLUMN "group" varchar(64) DEFAULT 'default', ADD COLUMN "priority" bigint DEFAULT 0, ADD COLUMN "weight" bigint DEFAULT 0`).Error)
+}
+
+func seedLegacyProviderRouting(t *testing.T, db *gorm.DB, provider *model.Provider) {
+	t.Helper()
+	if provider.Group == "" {
+		provider.Group = "default"
+	}
+	if provider.Priority == nil {
+		provider.Priority = common.GetPointer(int64(0))
+	}
+	if provider.Weight == nil {
+		provider.Weight = common.GetPointer(uint(0))
+	}
+	result := db.Exec(`UPDATE "providers" SET "models" = ?, "model_mapping" = ?, "group" = ?, "priority" = ?, "weight" = ? WHERE "id" = ?`,
+		provider.Models, provider.ModelMapping, provider.Group, provider.Priority, provider.Weight, provider.Id)
+	require.NoError(t, result.Error)
+	require.EqualValues(t, 1, result.RowsAffected)
+}
+
 func TestProviderAdminAPIIgnoresLegacyAbilityWrites(t *testing.T) {
 	for _, operation := range []string{"create", "batch_create", "direct_insert", "patch", "replace", "append", "disable", "enable", "key_disable", "key_enable", "keys_disable", "keys_enable", "key_delete", "disabled_delete", "delete", "batch_delete"} {
 		t.Run(operation, func(t *testing.T) {
@@ -355,6 +383,8 @@ func TestProviderAdminAPIIgnoresLegacyAbilityWrites(t *testing.T) {
 				provider.ProviderInfo.MultiKeyStatusList[1] = common.ChannelStatusAutoDisabled
 			}
 			require.NoError(t, model.DB.Create(provider).Error)
+			declareLegacyProviderRoutingColumns(t, model.DB)
+			seedLegacyProviderRouting(t, model.DB, provider)
 			// Historical tools still construct source projections explicitly.
 			require.NoError(t, provider.AddAbilities(nil))
 			var before []model.Ability
@@ -584,6 +614,8 @@ func TestProviderAdminAPIAccountTransactionsRemainAtomic(t *testing.T) {
 
 func TestProviderAdminAPIManagesProviderWithWriteOnlyKeys(t *testing.T) {
 	engine := newProviderAdminEngine(t)
+	require.NoError(t, model.DB.Exec(`ALTER TABLE "providers" DROP COLUMN IF EXISTS "models", DROP COLUMN IF EXISTS "model_mapping",
+		DROP COLUMN IF EXISTS "group", DROP COLUMN IF EXISTS "priority", DROP COLUMN IF EXISTS "weight"`).Error)
 
 	created := callProviderAPI(t, engine, http.MethodPost, "", `{"mode":"multi_to_single","multi_key_mode":"polling","provider":{
 		"name":"account one","type":1,"key":"`+providerKeyA+`\n`+providerKeyB+`\n`+providerKeyC+`",

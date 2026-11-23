@@ -8173,6 +8173,8 @@
     "Legacy quota reminders have been retired. Use balance reminder settings.": "Legacy quota reminders have been retired. Use balance reminder settings.",
     "Legacy missing-model discovery has been retired. Use Models and metadata sync.": "Legacy missing-model discovery has been retired. Use Models and metadata sync.",
     "Legacy statistics collection settings have been retired.": "Legacy statistics collection settings have been retired.",
+    "Legacy automatic routing group settings have been retired.": "Legacy automatic routing group settings have been retired.",
+    "Legacy violation fee settings have been retired.": "Legacy violation fee settings have been retired.",
     "Current PriceVersion diagnostics": "Current PriceVersion diagnostics",
     "Checks the current running plugin and visible price owners, not the selected historical version.": "Checks the current running plugin and visible price owners, not the selected historical version.",
     "Pricing diagnostics are unavailable. The plugin change was saved.": "Pricing diagnostics are unavailable. The plugin change was saved.",

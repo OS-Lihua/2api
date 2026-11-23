@@ -56,17 +56,19 @@ func TestUpdateChannelStatusPersistsMultiKeyState(t *testing.T) {
 func TestUpdateProviderStatusPreservesConcurrentConfiguration(t *testing.T) {
 	setupChannelStatusTest(t)
 	clock.UseFake(t, time.Unix(1234, 0))
+	db := DB
+	require.NoError(t, db.Exec(`ALTER TABLE providers ADD COLUMN models text`).Error)
+	t.Cleanup(func() { require.NoError(t, db.Exec(`ALTER TABLE providers DROP COLUMN models`).Error) })
 
 	channel := Provider{
 		Name:         "single-key-status",
 		Key:          "original-key",
 		Status:       common.ChannelStatusEnabled,
-		Models:       "original-model",
-		Group:        "default",
 		UsedQuota:    100,
 		ProviderInfo: ProviderInfo{},
 	}
-	require.NoError(t, DB.Create(&channel).Error)
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, db.Exec(`UPDATE providers SET models = ? WHERE id = ?`, "original-model", channel.Id).Error)
 
 	stale, err := GetProviderById(channel.Id, true)
 	require.NoError(t, err)
@@ -80,9 +82,9 @@ func TestUpdateProviderStatusPreservesConcurrentConfiguration(t *testing.T) {
 	require.NoError(t, DB.Model(&Provider{}).Where("id = ?", channel.Id).Updates(map[string]any{
 		"key":          "rotated-key\nspare-key",
 		"used_quota":   gorm.Expr("used_quota + ?", 250),
-		"models":       "concurrent-model",
 		"channel_info": concurrentChannelInfo,
 	}).Error)
+	require.NoError(t, db.Exec(`UPDATE providers SET models = ? WHERE id = ?`, "concurrent-model", channel.Id).Error)
 
 	assert.False(t, UpdateProviderStatus(stale.Id, stale.Key, common.ChannelStatusAutoDisabled, "old failure", 0))
 	require.True(t, UpdateProviderStatus(channel.Id, "", common.ChannelStatusManuallyDisabled, "manual operation"))

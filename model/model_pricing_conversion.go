@@ -326,7 +326,7 @@ func LoadLegacyPricingConversionSource(tx *gorm.DB, generation *jsplugin.Routing
 	source := &LegacyPricingConversionSource{generation: generation, aliases: map[string]TaskAliasTarget{}}
 	// Invalid settings must fail without logging their potentially secret values.
 	tx = tx.Session(&gorm.Session{Logger: logger.Discard})
-	if err := tx.Model(&Provider{}).Select(`id, type, status, models, model_mapping,
+	if err := tx.Table(providerTable).Select(`id, type, status, models, model_mapping,
 		COALESCE(NULLIF(setting, '')::jsonb->>'task_plugin_key', '') AS task_plugin_key,
 		COALESCE(NULLIF(setting, '')::jsonb->'task_extend_plugin_keys', '[]'::jsonb)::text AS task_extend_plugin_keys`).Order("id").Scan(&source.providers).Error; err != nil {
 		return nil, err

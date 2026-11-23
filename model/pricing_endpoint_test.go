@@ -17,8 +17,10 @@ import (
 func TestProviderCacheDoesNotReadLegacyTaskAliases(t *testing.T) {
 	database := UseTestDatabases(t)
 	require.NoError(t, database.AutoMigrate(&Provider{}))
-	provider := &Provider{Type: constant.ChannelTypeOpenAI, Key: "cache-test-key", Status: common.ChannelStatusEnabled, Models: "unrelated", ModelMapping: common.GetPointer(`{"unrelated":"foreign-model"}`)}
+	addLegacyProviderMappingColumns(t, database)
+	provider := &Provider{Type: constant.ChannelTypeOpenAI, Key: "cache-test-key", Status: common.ChannelStatusEnabled}
 	require.NoError(t, database.Create(provider).Error)
+	setLegacyProviderMapping(t, database, provider.Id, "unrelated", `{"unrelated":"foreign-model"}`)
 	previous := common.MemoryCacheEnabled
 	t.Cleanup(func() { common.MemoryCacheEnabled = previous })
 	reads := 0

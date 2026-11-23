@@ -363,6 +363,7 @@ func TestRechargeEpayPreservesLegacyQuotaAndCache(t *testing.T) {
 
 	user := insertUserForPaymentGuardTest(t, 502, 7)
 	require.NoError(t, populateUserCache(*user))
+	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id), "Quota", 7).Err())
 	order := createEpayTestOrder(t, user.Id, "EPAYTESTREDISSYNC", PaymentProviderEpay, common.TopUpStatusPending)
 
 	alreadyDone, err := RechargeEpay(order.TradeNo, "alipay", "127.0.0.1")
@@ -371,7 +372,10 @@ func TestRechargeEpayPreservesLegacyQuotaAndCache(t *testing.T) {
 	assert.Equal(t, 7, getUserQuotaForPaymentGuardTest(t, user.Id))
 	cached, err := cacheGetUserBase(user.Id)
 	require.NoError(t, err)
-	assert.Equal(t, 7, cached.Quota)
+	assert.Equal(t, user.Id, cached.Id)
+	prior, err := common.RDB.HGet(t.Context(), getUserCacheKey(user.Id), "Quota").Int()
+	require.NoError(t, err)
+	assert.Equal(t, 7, prior)
 	assert.Equal(t, usd(2_000_000_000), paymentWalletBalance(t, user.Id))
 
 	alreadyDone, err = RechargeEpay(order.TradeNo, "alipay", "127.0.0.1")
@@ -379,7 +383,10 @@ func TestRechargeEpayPreservesLegacyQuotaAndCache(t *testing.T) {
 	assert.True(t, alreadyDone)
 	cached, err = cacheGetUserBase(user.Id)
 	require.NoError(t, err)
-	assert.Equal(t, 7, cached.Quota)
+	assert.Equal(t, user.Id, cached.Id)
+	prior, err = common.RDB.HGet(t.Context(), getUserCacheKey(user.Id), "Quota").Int()
+	require.NoError(t, err)
+	assert.Equal(t, 7, prior)
 	assert.Equal(t, usd(2_000_000_000), paymentWalletBalance(t, user.Id))
 }
 

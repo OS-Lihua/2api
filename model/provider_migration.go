@@ -1,6 +1,7 @@
 package model
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -12,6 +13,34 @@ const (
 	providerTable       = "providers"
 	legacyProviderTable = "channels"
 )
+
+var ErrLegacyProviderRouting = errors.New("legacy Provider routing requires offline migration; stop all nodes and run migrate-legacy")
+
+func inspectLegacyProviderRoutingColumns(db *gorm.DB) (int64, error) {
+	var count int64
+	err := db.Raw(`SELECT COUNT(*) FROM pg_catalog.pg_attribute
+		WHERE attrelid = to_regclass('providers') AND attnum > 0 AND NOT attisdropped
+		AND attname IN ('models', 'model_mapping', 'group', 'priority', 'weight')`).Scan(&count).Error
+	return count, err
+}
+
+// The caller holds the schema migration lock and has either initialized a
+// native catalog or finished converting the legacy Provider declarations.
+// Only providers is altered; channels.weight still controls weighted routing.
+func retireLegacyProviderRoutingTx(tx *gorm.DB) (int64, error) {
+	count, err := inspectLegacyProviderRoutingColumns(tx)
+	if err != nil || count == 0 {
+		return 0, err
+	}
+	// No CASCADE: a dependant outside the old schema must block retirement.
+	if err := tx.Exec(`ALTER TABLE "providers"
+		DROP COLUMN IF EXISTS "models", DROP COLUMN IF EXISTS "model_mapping",
+		DROP COLUMN IF EXISTS "group", DROP COLUMN IF EXISTS "priority",
+		DROP COLUMN IF EXISTS "weight"`).Error; err != nil {
+		return 0, err
+	}
+	return count, nil
+}
 
 type providerSchemaRename struct {
 	// Kind is a pg_class relkind ("i" index, "S" sequence) or "c" for a

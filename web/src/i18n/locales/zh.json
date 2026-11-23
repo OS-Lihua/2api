@@ -8173,6 +8173,8 @@
     "Legacy quota reminders have been retired. Use balance reminder settings.": "旧版额度提醒已退役。请使用余额提醒设置。",
     "Legacy missing-model discovery has been retired. Use Models and metadata sync.": "旧版缺失模型发现已退役。请使用模型管理和元数据同步。",
     "Legacy statistics collection settings have been retired.": "旧版统计数据采集设置已退役。",
+    "Legacy automatic routing group settings have been retired.": "旧版自动分组选路设置已退役。",
+    "Legacy violation fee settings have been retired.": "旧版违规扣减设置已退役。",
     "Current PriceVersion diagnostics": "当前价格版本诊断",
     "Checks the current running plugin and visible price owners, not the selected historical version.": "检查当前运行的插件和可见的定价对象，而不是选中的历史版本。",
     "Pricing diagnostics are unavailable. The plugin change was saved.": "定价诊断暂不可用。插件变更已保存。",

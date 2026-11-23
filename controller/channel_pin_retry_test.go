@@ -406,8 +406,8 @@ func TestChannelAffinityRetryPriorities(t *testing.T) {
 				engine.Use(middleware.RequestId(), middleware.GatewayTokenAuth(), middleware.ResolveTextOffering())
 				engine.POST("/v1/messages", func(c *gin.Context) {
 					c.Set(service.GatewayRouteRandomSource, func(uint64) uint64 { return 0 })
-					common.SetContextKey(c, constant.ContextKeyTokenAutoGroups, tc.auto)
-					common.SetContextKey(c, constant.ContextKeyTokenCrossGroupRetry, tc.cross)
+					c.Set("token_auto_groups", tc.auto)
+					c.Set("token_cross_group_retry", tc.cross)
 					TextGateway(c)
 				})
 				request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"affinity-retry-test","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}`))

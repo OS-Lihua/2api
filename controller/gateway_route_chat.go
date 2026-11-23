@@ -114,7 +114,6 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 	if compact && !common.SupportsResponsesCompact(info.ChannelType, info.ApiType) {
 		return nil, service.ErrGatewayCapability
 	}
-	info.ChannelOtherSettings.ToolLossPolicy = string(types.ConversionLossPolicyAllow)
 	info.UpstreamModelName = selection.Channel.UpstreamModelName
 	info.IsModelMapped = true
 	saleInput, err := helper.ResolveIncomingBillingExprRequestInput(candidate, info)

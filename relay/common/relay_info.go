@@ -93,7 +93,6 @@ type RelayInfo struct {
 	UserId            int
 	UsingGroup        string // 使用的分组，当auto跨分组重试时，会变动
 	UserGroup         string // 用户所在分组
-	TokenUnlimited    bool
 	StartTime         time.Time
 	FirstResponseTime time.Time
 	isFirstResponse   bool
@@ -142,7 +141,6 @@ type RelayInfo struct {
 	ReasoningConversion *dto.ReasoningConversionState
 	UserSetting         dto.UserSetting
 	UserEmail           string
-	UserQuota           int
 	RelayFormat         types.RelayFormat
 	// UpstreamProtocol is set only by the explicit Channel adapter entry point.
 	// Legacy relays leave it empty and retain their existing usage fallbacks.
@@ -403,9 +401,9 @@ func (info *RelayInfo) ToString() string {
 	fmt.Fprintf(b, "FinalPreConsumedQuota: %d, ", info.FinalPreConsumedQuota)
 
 	// User & token info (mask secrets)
-	fmt.Fprintf(b, "User{ Id: %d, Email: %q, Group: %q, UsingGroup: %q, Quota: %d }, ",
-		info.UserId, common.MaskEmail(info.UserEmail), info.UserGroup, info.UsingGroup, info.UserQuota)
-	fmt.Fprintf(b, "Token{ Id: %d, Unlimited: %t, Key: ***masked*** }, ", info.TokenId, info.TokenUnlimited)
+	fmt.Fprintf(b, "User{ Id: %d, Email: %q, Group: %q, UsingGroup: %q }, ",
+		info.UserId, common.MaskEmail(info.UserEmail), info.UserGroup, info.UsingGroup)
+	fmt.Fprintf(b, "Token{ Id: %d, Key: ***masked*** }, ", info.TokenId)
 
 	// Time info
 	latencyMs := info.FirstResponseTime.Sub(info.StartTime).Milliseconds()
@@ -640,14 +638,12 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 		UserId:     common.GetContextKeyInt(c, constant.ContextKeyUserId),
 		UsingGroup: common.GetContextKeyString(c, constant.ContextKeyUsingGroup),
 		UserGroup:  common.GetContextKeyString(c, constant.ContextKeyUserGroup),
-		UserQuota:  common.GetContextKeyInt(c, constant.ContextKeyUserQuota),
 		UserEmail:  common.GetContextKeyString(c, constant.ContextKeyUserEmail),
 
 		OriginModelName: originModelName,
 
-		TokenId:        common.GetContextKeyInt(c, constant.ContextKeyTokenId),
-		TokenKey:       common.GetContextKeyString(c, constant.ContextKeyTokenKey),
-		TokenUnlimited: common.GetContextKeyBool(c, constant.ContextKeyTokenUnlimited),
+		TokenId:  common.GetContextKeyInt(c, constant.ContextKeyTokenId),
+		TokenKey: common.GetContextKeyString(c, constant.ContextKeyTokenKey),
 
 		isFirstResponse: true,
 		RelayMode:       relayconstant.Path2RelayMode(c.Request.URL.Path),
@@ -1006,9 +1002,6 @@ func (info *RelayInfo) ConvOptions() *convmeta.Options {
 		PreserveEffortTail:     model_setting.ShouldPreserveEffortTail,
 	}
 	if info != nil {
-		if info.ProviderMeta != nil {
-			options.ToolLossPolicy = types.ConversionLossPolicy(info.ChannelOtherSettings.ToolLossPolicy)
-		}
 		info.convOptions = options
 	}
 	return options

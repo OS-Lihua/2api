@@ -10,6 +10,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/money"
+	"github.com/QuantumNous/new-api/pkg/testdb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -60,9 +61,16 @@ func TestGatewayReservationUsesOnlyLedgerBalanceWithLegacyCaches(t *testing.T) {
 			user.Quota = legacy
 			require.NoError(t, DB.Model(&user).UpdateColumn("quota", legacy).Error)
 			require.NoError(t, populateUserCache(user))
-			token := Token{UserId: user.Id, Key: "canonical-cache-fixture", Name: "canonical cache", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: legacy}
+			require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id), "Quota", legacy).Err())
+			token := Token{UserId: user.Id, Key: "canonical-cache-fixture", Name: "canonical cache", Status: common.TokenStatusEnabled, ExpiredTime: -1}
 			require.NoError(t, token.Insert())
+			legacyQuota := testdb.LegacyKeyQuota{RemainQuota: legacy}
+			testdb.SeedLegacyKeyQuota(t, DB, token.Id, legacyQuota)
 			_, err := GetTokenByKey(token.Key, true)
+			require.NoError(t, err)
+			cacheKey := getTokenCacheKey(token.Key)
+			require.NoError(t, common.RDB.HSet(t.Context(), cacheKey, "RemainQuota", legacy, "UsedQuota", 0).Err())
+			cacheBefore, err := common.RDB.HGetAll(t.Context(), cacheKey).Result()
 			require.NoError(t, err)
 			if cacheState == "unavailable" {
 				server.Close()
@@ -102,21 +110,23 @@ func TestGatewayReservationUsesOnlyLedgerBalanceWithLegacyCaches(t *testing.T) {
 			require.NoError(t, DB.Model(&LedgerEntry{}).Where("type = ?", LedgerEntryPreConsumeRelease).Count(&releases).Error)
 			assert.EqualValues(t, 1, releases)
 			var savedUser User
-			var savedToken Token
 			require.NoError(t, DB.First(&savedUser, user.Id).Error)
-			require.NoError(t, DB.First(&savedToken, token.Id).Error)
 			assert.Equal(t, legacy, savedUser.Quota)
-			assert.Equal(t, legacy, savedToken.RemainQuota)
 			assert.Zero(t, savedUser.UsedQuota)
-			assert.Zero(t, savedToken.UsedQuota)
+			assert.Equal(t, legacyQuota, testdb.ReadLegacyKeyQuota(t, DB, token.Id))
 			if cacheState != "unavailable" {
 				cachedUser, err := cacheGetUserBase(user.Id)
 				require.NoError(t, err)
 				cachedToken, err := cacheGetTokenByKey(token.Key)
 				require.NoError(t, err)
-				assert.Equal(t, legacy, cachedUser.Quota)
-				assert.Equal(t, legacy, cachedToken.RemainQuota)
-				assert.Zero(t, cachedToken.UsedQuota)
+				assert.Equal(t, token.Id, cachedToken.Id)
+				assert.Equal(t, user.Id, cachedUser.Id)
+				prior, err := common.RDB.HGet(t.Context(), getUserCacheKey(user.Id), "Quota").Int()
+				require.NoError(t, err)
+				assert.Equal(t, legacy, prior)
+				cacheAfter, err := common.RDB.HGetAll(t.Context(), cacheKey).Result()
+				require.NoError(t, err)
+				assert.Equal(t, cacheBefore, cacheAfter)
 			}
 		})
 	}
@@ -182,9 +192,14 @@ func TestGatewayReservationRollsBackLedgerAndLeavesCachesUnchanged(t *testing.T)
 	user.Quota = 123
 	require.NoError(t, DB.Model(&user).UpdateColumn("quota", user.Quota).Error)
 	require.NoError(t, populateUserCache(user))
-	token := Token{UserId: user.Id, Key: "rollback-cache-fixture", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 456}
+	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id), "Quota", 123).Err())
+	token := Token{UserId: user.Id, Key: "rollback-cache-fixture", Status: common.TokenStatusEnabled, ExpiredTime: -1}
 	require.NoError(t, token.Insert())
 	_, err := GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+	cacheKey := getTokenCacheKey(token.Key)
+	require.NoError(t, common.RDB.HSet(t.Context(), cacheKey, "RemainQuota", 456, "UsedQuota", 0).Err())
+	cacheBefore, err := common.RDB.HGetAll(t.Context(), cacheKey).Result()
 	require.NoError(t, err)
 	injected := errors.New("injected reservation snapshot failure")
 	require.NoError(t, DB.Callback().Update().Before("gorm:update").Register("reserve_snapshot_failure", func(tx *gorm.DB) {
@@ -207,9 +222,14 @@ func TestGatewayReservationRollsBackLedgerAndLeavesCachesUnchanged(t *testing.T)
 	require.NoError(t, err)
 	cachedToken, err := cacheGetTokenByKey(token.Key)
 	require.NoError(t, err)
-	assert.Equal(t, 123, cachedUser.Quota)
-	assert.Equal(t, 456, cachedToken.RemainQuota)
-	assert.Zero(t, cachedToken.UsedQuota)
+	assert.Equal(t, user.Id, cachedUser.Id)
+	prior, err := common.RDB.HGet(t.Context(), getUserCacheKey(user.Id), "Quota").Int()
+	require.NoError(t, err)
+	assert.Equal(t, 123, prior)
+	assert.Equal(t, token.Id, cachedToken.Id)
+	cacheAfter, err := common.RDB.HGetAll(t.Context(), cacheKey).Result()
+	require.NoError(t, err)
+	assert.Equal(t, cacheBefore, cacheAfter)
 	require.NoError(t, DB.Callback().Update().Remove("reserve_snapshot_failure"))
 	require.NoError(t, ReserveGateway(&request, usd(7), usd(7)), "the same request can retry after a fully rolled-back transaction")
 	wallet, err = GetUserWallet(user.Id)

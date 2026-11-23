@@ -27,7 +27,7 @@ func setupChannelSelectAutoGroupsTest(t *testing.T) *gorm.DB {
 	require.NoError(t, model.MigratePricing(db))
 	require.NoError(t, model.MigrateKeyPermissions(db))
 	require.NoError(t, db.Create(&model.User{Id: 7, Username: "offering-route-owner", Group: "default", Status: common.UserStatusEnabled}).Error)
-	require.NoError(t, db.Create(&model.Token{Id: 7, UserId: 7, Key: "selector-test-key", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 0}).Error)
+	require.NoError(t, db.Create(&model.Token{Id: 7, UserId: 7, Key: "selector-test-key", Status: common.TokenStatusEnabled, ExpiredTime: -1}).Error)
 	require.False(t, db.Migrator().HasTable("abilities"), "runtime routing must not recreate retired projections")
 	previousCache := common.MemoryCacheEnabled
 	t.Cleanup(func() { common.MemoryCacheEnabled = previousCache })
@@ -64,8 +64,8 @@ func TestCacheGetRandomSatisfiedChannelUsesTokenAutoGroupsWhenGlobalAutoIsEmpty(
 			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 			ctx.Set("id", 7)
 			common.SetContextKey(ctx, constant.ContextKeyUserGroup, "default")
-			common.SetContextKey(ctx, constant.ContextKeyTokenAutoGroups, []string{"invalid", "default", "vip"})
-			common.SetContextKey(ctx, constant.ContextKeyTokenCrossGroupRetry, true)
+			ctx.Set("token_auto_groups", []string{"invalid", "default", "vip"})
+			ctx.Set("token_cross_group_retry", true)
 			input := GatewayRouteInput{Protocol: protocol.OpenAIChat, Sale: sale, Ratio: decimal.NewFromInt(1), Prepare: func(*GatewaySelection) (*GatewayRouteFacts, error) {
 				return &GatewayRouteFacts{Usage: &kitdto.Usage{}}, nil
 			}}
@@ -82,7 +82,7 @@ func TestCacheGetRandomSatisfiedChannelUsesTokenAutoGroupsWhenGlobalAutoIsEmpty(
 			assert.Equal(t, 2, second.Tier)
 			require.NoError(t, second.Permit.Release(t.Context(), false))
 			require.NoError(t, ChannelHealth.Release(t.Context(), second.Admission))
-			assert.Empty(t, common.GetContextKeyString(ctx, constant.ContextKeyAutoGroup))
+			assert.Empty(t, ctx.GetString("auto_group"))
 			assert.Empty(t, setting.GetAutoGroups())
 			assert.False(t, db.Migrator().HasTable("abilities"))
 		})

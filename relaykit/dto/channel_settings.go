@@ -136,10 +136,6 @@ type ProviderOtherSettings struct {
 	// /v1/chat/completions endpoint. When unset, chat completions keep using
 	// the native /api/chat protocol.
 	OllamaOpenAIChat bool `json:"ollama_openai_chat,omitempty"`
-	// ToolLossPolicy is a channel-level opt-in for request-phase conversion
-	// rejection. Empty follows the default allow policy. Accepted values:
-	// "", "allow", "safe", "strict".
-	ToolLossPolicy string `json:"tool_loss_policy,omitempty"`
 }
 
 func (s *ProviderOtherSettings) IsOpenRouterEnterprise() bool {
@@ -147,20 +143,6 @@ func (s *ProviderOtherSettings) IsOpenRouterEnterprise() bool {
 		return false
 	}
 	return *s.OpenRouterEnterprise
-}
-
-// ValidateToolLossPolicy validates the channel-level request-phase tool-loss
-// policy. Empty keeps the default allow policy.
-func (s *ProviderOtherSettings) ValidateToolLossPolicy() error {
-	if s == nil {
-		return nil
-	}
-	switch strings.TrimSpace(s.ToolLossPolicy) {
-	case "", string(types.ConversionLossPolicyAllow), string(types.ConversionLossPolicySafe), string(types.ConversionLossPolicyStrict):
-		return nil
-	default:
-		return fmt.Errorf("invalid tool_loss_policy: %s", s.ToolLossPolicy)
-	}
 }
 
 const (

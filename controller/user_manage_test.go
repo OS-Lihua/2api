@@ -103,11 +103,9 @@ func TestIdentityCreationDoesNotSeedLegacyQuota(t *testing.T) {
 				assert.Equal(t, money.Amount{Nanos: 1500000001, Currency: "USD"}, entries[0].Amount)
 				require.Len(t, tokens, 1)
 				token := tokens[0]
-				assert.Zero(t, token.RemainQuota)
-				assert.False(t, token.UnlimitedQuota)
-				assert.False(t, token.ModelLimitsEnabled)
-				assert.Empty(t, token.Group)
-				assert.False(t, token.AllowUserQuotaQuery)
+				for _, column := range []string{"model_limits_enabled", "group", "remain_quota", "used_quota", "unlimited_quota", "allow_user_quota_query"} {
+					assert.False(t, db.Migrator().HasColumn("tokens", column), column)
+				}
 				assert.Equal(t, int64(-1), token.ExpiredTime)
 				assert.False(t, strings.Contains(recorder.Body.String(), token.Key))
 				credential, err := model.ValidateWalletToken(token.Key)
@@ -150,7 +148,7 @@ func TestReferralMoneyHTTPContract(t *testing.T) {
 	t.Cleanup(func() { *operation_setting.GetPaymentSetting() = previous })
 	operation_setting.GetPaymentSetting().ComplianceConfirmed = true
 	operation_setting.GetPaymentSetting().ComplianceTermsVersion = operation_setting.CurrentComplianceTermsVersion
-	user := model.User{Username: "http-referral", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Quota: 777}
+	user := model.User{Username: "http-referral", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Quota: 777, UsedQuota: 137}
 	require.NoError(t, db.Create(&user).Error)
 	_, err := model.PostLedgerEntries(model.LedgerPosting{Account: model.LedgerAccount{Type: model.LedgerAccountUserReferral, OwnerId: user.Id, Currency: "USD"}, Type: model.LedgerEntryTopUp, Amount: money.Amount{Nanos: 9007199254740993, Currency: "USD"}})
 	require.NoError(t, err)
@@ -178,6 +176,8 @@ func TestReferralMoneyHTTPContract(t *testing.T) {
 		assert.Contains(t, recorder.Body.String(), `"nanos":"9007199254740993"`)
 		assert.NotContains(t, recorder.Body.String(), "aff_quota")
 		assert.NotContains(t, recorder.Body.String(), "aff_history_quota")
+		assert.NotContains(t, recorder.Body.String(), `"quota":`, path)
+		assert.NotContains(t, recorder.Body.String(), `"used_quota":`, path)
 	}
 	self := request(http.MethodGet, "/api/user/self", "")
 	var selfResult struct {
@@ -185,6 +185,8 @@ func TestReferralMoneyHTTPContract(t *testing.T) {
 	}
 	require.NoError(t, common.Unmarshal(self.Body.Bytes(), &selfResult))
 	require.True(t, selfResult.Success, "profile queries must work after the legacy reward columns are removed")
+	assert.NotContains(t, self.Body.String(), `"quota":`)
+	assert.NotContains(t, self.Body.String(), `"used_quota":`)
 	for _, body := range []string{
 		`{"quota":500000}`,
 		`{"amount":{"nanos":1,"currency":"USD"},"transfer_id":"numeric"}`,
@@ -226,6 +228,7 @@ func TestReferralMoneyHTTPContract(t *testing.T) {
 	persisted, err := model.GetUserById(user.Id, false)
 	require.NoError(t, err)
 	assert.Equal(t, 777, persisted.Quota)
+	assert.Equal(t, 137, persisted.UsedQuota)
 }
 
 func setupManageUserTestDB(t *testing.T) *gorm.DB {
@@ -467,7 +470,7 @@ func TestManageUserRejectsRetiredQuotaMutations(t *testing.T) {
 	require.NoError(t, err)
 	var quotaKey string
 	for _, key := range server.Keys() {
-		if server.HGet(key, "Id") == strconv.Itoa(user.Id) && server.HGet(key, "Quota") != "" {
+		if server.HGet(key, "Id") == strconv.Itoa(user.Id) && server.HGet(key, "CacheMAC") != "" {
 			quotaKey = key
 			break
 		}
@@ -1036,17 +1039,18 @@ func TestManageUserQuotaCacheUsesCommittedIntegerDifference(t *testing.T) {
 			t.Cleanup(func() { _ = common.RDB.Close(); common.RDB = previousRDB })
 			cache, err := model.GetUserCache(user.Id)
 			require.NoError(t, err)
-			assert.Equal(t, tc.legacy, cache.Quota)
+			assert.Equal(t, user.Id, cache.Id)
 			_, err = model.GetUserCache(operator.Id)
 			require.NoError(t, err)
 			var quotaKey string
 			for _, key := range server.Keys() {
-				if server.HGet(key, "Id") == strconv.Itoa(user.Id) && server.HGet(key, "Quota") != "" {
+				if server.HGet(key, "Id") == strconv.Itoa(user.Id) && server.HGet(key, "CacheMAC") != "" {
 					quotaKey = key
 					break
 				}
 			}
 			require.NotEmpty(t, quotaKey)
+			assert.Empty(t, server.HGet(quotaKey, "Quota"))
 			server.HSet(quotaKey, "Quota", strconv.Itoa(tc.cached))
 			if tc.missingCache {
 				server.Del(quotaKey)
@@ -1369,7 +1373,9 @@ func TestBalanceReminderUserHTTPAtomicPatch(t *testing.T) {
 		assert.Equal(t, saved.Setting, cache.Setting)
 		assert.Equal(t, int64(1), cache.AuthVersion)
 		assert.Equal(t, 500000, saved.Quota)
-		assert.Equal(t, 500000, cache.Quota)
+		exists, err := common.RDB.HExists(t.Context(), fmt.Sprintf("user:%d", user.Id), "Quota").Result()
+		require.NoError(t, err)
+		assert.False(t, exists)
 	}
 	put := func(body string) (*httptest.ResponseRecorder, *model.BalanceReminderView, bool) {
 		t.Helper()

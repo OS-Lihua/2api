@@ -70,6 +70,7 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/testdb"
 	"github.com/QuantumNous/new-api/plugins"
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
@@ -93,11 +94,10 @@ func TestListModelsSupportsOpenAIAndGeminiAuthentication(t *testing.T) {
 	}
 	require.NoError(t, model.DB.Create(&user).Error)
 	require.NoError(t, model.DB.Create(&model.Token{
-		UserId:         user.Id,
-		Key:            "modelstestkey",
-		Status:         common.TokenStatusEnabled,
-		ExpiredTime:    -1,
-		UnlimitedQuota: true,
+		UserId:      user.Id,
+		Key:         "modelstestkey",
+		Status:      common.TokenStatusEnabled,
+		ExpiredTime: -1,
 	}).Error)
 
 	engine := gin.New()
@@ -161,7 +161,7 @@ func TestGeminiRelayHandsLongRunningPredictionToPluginRoute(t *testing.T) {
 	require.NoError(t, i18n.Init())
 	user := model.User{Username: "veo-user", Status: common.UserStatusEnabled, Group: "default", Quota: 100}
 	require.NoError(t, model.DB.Create(&user).Error)
-	require.NoError(t, model.DB.Create(&model.Token{UserId: user.Id, Key: "veotestkey", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}).Error)
+	require.NoError(t, model.DB.Create(&model.Token{UserId: user.Id, Key: "veotestkey", Status: common.TokenStatusEnabled, ExpiredTime: -1}).Error)
 
 	engine := gin.New()
 	SetRelayRouter(engine)
@@ -260,7 +260,9 @@ func TestGeminiRelayRejectsUnclaimedNativeActions(t *testing.T) {
 			for _, action := range []string{"predictLongRunning", "unknownAction"} {
 				for _, quota := range []int{0, legacyQuota} {
 					t.Run(fmt.Sprintf("%s/quota_%d", action, quota), func(t *testing.T) {
-						require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"status": common.TokenStatusEnabled, "remain_quota": quota, "unlimited_quota": false}).Error)
+						legacy := testdb.LegacyKeyQuota{RemainQuota: quota}
+						testdb.SeedLegacyKeyQuota(t, model.DB, fixture.token.Id, legacy)
+						require.NoError(t, model.DB.Model(fixture.token).Update("status", common.TokenStatusEnabled).Error)
 						require.NoError(t, model.DB.Model(fixture.user).Update("quota", legacyQuota).Error)
 						response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1beta/models/gemini-2.5-flash:"+action, `{"contents":[{"parts":[{"text":"Hello"}]}]}`)
 						assert.Equal(t, http.StatusNotImplemented, response.Code, response.Body.String())
@@ -271,7 +273,7 @@ func TestGeminiRelayRejectsUnclaimedNativeActions(t *testing.T) {
 						key, err := model.GetTokenById(fixture.token.Id)
 						require.NoError(t, err)
 						assert.Equal(t, common.TokenStatusEnabled, key.Status)
-						assert.Equal(t, quota, key.RemainQuota)
+						assert.Equal(t, legacy, testdb.ReadLegacyKeyQuota(t, model.DB, key.Id))
 						wallet, err := model.GetUserWallet(fixture.user.Id)
 						require.NoError(t, err)
 						assert.EqualValues(t, 1000000000, wallet.Balance.Nanos)
@@ -348,7 +350,7 @@ func newTextGatewayFixture(t *testing.T, upstream http.HandlerFunc) textGatewayF
 	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(previousRatio)) })
 	user := &model.User{Username: "gateway-user", Status: common.UserStatusEnabled, Group: "default", Role: common.RoleCommonUser, AuthVersion: 1, AffCode: "gateway"}
 	require.NoError(t, db.Create(user).Error)
-	token := &model.Token{UserId: user.Id, Key: "gatewaytestkey", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 0}
+	token := &model.Token{UserId: user.Id, Key: "gatewaytestkey", Status: common.TokenStatusEnabled, ExpiredTime: -1}
 	require.NoError(t, db.Create(token).Error)
 	_, err := model.TopUpWallet(model.WalletTopUp{UserId: user.Id, Source: money.Amount{Nanos: 1_000_000_000, Currency: "USD"}, Reference: "gateway-initial"})
 	require.NoError(t, err)
@@ -484,7 +486,9 @@ func TestGatewaySynchronousNativeOperations(t *testing.T) {
 				require.NoError(t, model.SaveModelOffering(t.Context(), fixture.offering, "save"))
 			}
 			// Retired route groups and model limits cannot affect Offering dispatch.
-			require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"group": "retired", "model_limits_enabled": true, "model_limits": "unrelated"}).Error)
+			require.NoError(t, model.DB.Exec(`ALTER TABLE "tokens" ADD COLUMN "group" text`).Error)
+			require.NoError(t, model.DB.Model(fixture.token).Update("group", "retired").Error)
+			seedLegacyKeyLimits(t, fixture.token, true, "unrelated")
 			price := &model.PriceVersion{OwnerType: model.PriceOwnerOffering, OwnerID: fixture.offering.ID, Currency: "USD", Expression: `tier("request", fixed(0.01))`, EffectiveAt: clock.Now().Unix()}
 			require.NoError(t, model.CreatePriceVersion(t.Context(), price, fixture.sale.CreatedBy))
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, test.path, test.body)
@@ -536,8 +540,9 @@ func TestGatewaySynchronousNativeOperations(t *testing.T) {
 			}
 			require.NoError(t, model.DB.First(fixture.token, fixture.token.Id).Error)
 			assert.Equal(t, common.TokenStatusEnabled, fixture.token.Status)
-			assert.Zero(t, fixture.token.RemainQuota)
-			assert.Zero(t, fixture.token.UsedQuota)
+			for _, column := range []string{"remain_quota", "used_quota"} {
+				assert.False(t, model.DB.Migrator().HasColumn("tokens", column), column)
+			}
 		})
 	}
 }
@@ -937,8 +942,9 @@ func TestTextGatewayNativeOperations(t *testing.T) {
 			}
 			require.NoError(t, model.DB.First(fixture.token, fixture.token.Id).Error)
 			assert.Equal(t, common.TokenStatusEnabled, fixture.token.Status)
-			assert.Zero(t, fixture.token.RemainQuota)
-			assert.Zero(t, fixture.token.UsedQuota)
+			for _, column := range []string{"remain_quota", "used_quota"} {
+				assert.False(t, model.DB.Migrator().HasColumn("tokens", column), column)
+			}
 		})
 	}
 }
@@ -992,7 +998,7 @@ func TestTextGatewayNativeOperationsRejectLegacyFallback(t *testing.T) {
 				if reason != "disabled Key" {
 					assert.Equal(t, common.TokenStatusEnabled, fixture.token.Status)
 				}
-				assert.Zero(t, fixture.token.UsedQuota)
+				assert.False(t, model.DB.Migrator().HasColumn("tokens", "used_quota"))
 			})
 		}
 	}
@@ -4776,14 +4782,15 @@ func TestResponsesWSGatewayControlDoesNotCheckRetiredQuota(t *testing.T) {
 		}
 		_, _, _ = peer.ReadMessage()
 	})
-	require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"unlimited_quota": false, "remain_quota": 1_000_000}).Error)
+	testdb.SeedLegacyKeyQuota(t, model.DB, fixture.token.Id, testdb.LegacyKeyQuota{RemainQuota: 1_000_000})
 	client := dialResponsesGateway(t, fixture)
 	require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
 	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gateway-alias","input":"Hello","max_output_tokens":16}`)))
 	_, created, err := client.ReadMessage()
 	require.NoError(t, err)
 	assert.Equal(t, "response.created", ojson.GetBytes(created, "type").String())
-	require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"status": common.TokenStatusEnabled, "remain_quota": 0}).Error)
+	require.NoError(t, model.DB.Model(fixture.token).Update("status", common.TokenStatusEnabled).Error)
+	testdb.SeedLegacyKeyQuota(t, model.DB, fixture.token.Id, testdb.LegacyKeyQuota{})
 	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.cancel","response_id":"active-response"}`)))
 	_, raw, err := client.ReadMessage()
 	require.NoError(t, err)
@@ -7735,6 +7742,9 @@ func TestProviderSensitiveEditRechecksPermissionAfterLock(t *testing.T) {
 				t.Run(operation+"/"+lockTable+"/"+changeKind, func(t *testing.T) {
 					fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("unexpected upstream call") })
 					registerLegacyChannelCompatibilityTestRoutes(fixture.engine)
+					if operation == "tag" {
+						restoreLegacyProviderTagFixture(t)
+					}
 					provider, err := model.GetProviderById(fixture.channel.ProviderID, true)
 					require.NoError(t, err)
 					provider.Key = "permission-first-key\npermission-spare-key"
@@ -8030,6 +8040,7 @@ func TestProviderBatchStatusFailureRecordsCommittedTargets(t *testing.T) {
 			defer unregister()
 			path, body, action := "/api/test-only/legacy-channel/status/batch", fmt.Sprintf(`{"ids":[%d,%d],"status":2}`, firstID, failed.Id), "channel.status_update_batch"
 			if operation == "tag" {
+				restoreLegacyProviderTagFixture(t)
 				require.NoError(t, model.DB.Model(&model.Provider{}).Where(`"id" IN ?`, []int{firstID, failed.Id}).Update("tag", "partial-disable-tag").Error)
 				path, body, action = "/api/test-only/legacy-channel/tag/disabled", `{"tag":"partial-disable-tag"}`, "channel.tag_disable"
 			}
@@ -24565,7 +24576,8 @@ func TestGatewayRejectsUnmigratedModels(t *testing.T) {
 			fixture := newTextGatewayFixture(t, func(http.ResponseWriter, *http.Request) { t.Error("unmigrated models must not dispatch") })
 			require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "unmigrated-model", ChannelId: fixture.channel.ProviderID, Enabled: true}).Error)
 			for _, unlimited := range []bool{false, true} {
-				require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"status": common.TokenStatusEnabled, "unlimited_quota": unlimited}).Error)
+				require.NoError(t, model.DB.Model(fixture.token).Update("status", common.TokenStatusEnabled).Error)
+				testdb.SeedLegacyKeyQuota(t, model.DB, fixture.token.Id, testdb.LegacyKeyQuota{UnlimitedQuota: unlimited})
 				response := adminSecurityRequest(fixture.engine, fixture.token.Key, source.method, source.path, source.body)
 				assert.Equal(t, http.StatusNotFound, response.Code, response.Body.String())
 				codePath := "error.code"
@@ -24596,7 +24608,9 @@ func TestGatewayIgnoresRetiredKeyRouteGroups(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
 	})
-	require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"group": "retired-group", "auto_groups": `["other"]`, "cross_group_retry": true, "model_limits_enabled": true, "model_limits": "unrelated-model"}).Error)
+	require.NoError(t, model.DB.Exec(`ALTER TABLE "tokens" ADD COLUMN "group" text, ADD COLUMN "auto_groups" text, ADD COLUMN "cross_group_retry" boolean`).Error)
+	require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"group": "retired-group", "auto_groups": `["other"]`, "cross_group_retry": true}).Error)
+	seedLegacyKeyLimits(t, fixture.token, true, "unrelated-model")
 	response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, "/v1/chat/completions", `{"model":"gateway-alias","messages":[{"role":"user","content":"Hello"}]}`)
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 	records, total, err := model.ListGatewayRequests(t.Context(), model.GatewayRequestFilter{UserID: fixture.user.Id}, 0, 10)

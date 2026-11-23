@@ -377,11 +377,9 @@ func TestOptInSafeToolLossRejectedAsBadRequestWithAdminDiagnostics(t *testing.T)
 		OriginModelName: "gpt-4o",
 		ProviderMeta: &relaycommon.ProviderMeta{
 			UpstreamModelName: "gpt-4o",
-			ChannelOtherSettings: dto.ProviderOtherSettings{
-				ToolLossPolicy: string(types.ConversionLossPolicySafe),
-			},
 		},
 	}
+	info.ConvOptions().ToolLossPolicy = types.ConversionLossPolicySafe
 
 	tools, err := common.Marshal([]map[string]any{{"codeExecution": map[string]any{}}})
 	require.NoError(t, err)

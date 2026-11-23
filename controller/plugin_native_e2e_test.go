@@ -24,6 +24,7 @@ import (
 	"github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/relay"
 
+	"github.com/QuantumNous/new-api/pkg/testdb"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
@@ -90,8 +91,9 @@ func newNativeGatewayTaskFixture(t *testing.T, upstream http.HandlerFunc, plugin
 	require.NoError(t, model.MigrateLogDB())
 	user := &model.User{Username: "native-gateway-user", Status: common.UserStatusEnabled, Group: "default", Role: common.RoleCommonUser, AuthVersion: 1, Quota: 1_000_000, Setting: `{"billing_preference":"wallet_only"}`}
 	require.NoError(t, db.Create(user).Error)
-	token := &model.Token{UserId: user.Id, Key: "nativegatewaytestkey", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 7654321}
+	token := &model.Token{UserId: user.Id, Key: "nativegatewaytestkey", Status: common.TokenStatusEnabled, ExpiredTime: -1}
 	require.NoError(t, db.Create(token).Error)
+	testdb.SeedLegacyKeyQuota(t, db, token.Id, testdb.LegacyKeyQuota{RemainQuota: 7654321})
 	_, err = model.TopUpWallet(model.WalletTopUp{UserId: user.Id, Source: money.Amount{Nanos: 2_000_000_000, Currency: "USD"}, Reference: "native-task-initial"})
 	require.NoError(t, err)
 	vendor := &model.Vendor{Name: "Native task publisher", Status: 1}
@@ -197,11 +199,9 @@ func assertNativeTaskSettlement(t *testing.T, fixture *nativeGatewayTaskFixture,
 	require.NoError(t, err)
 	assert.Equal(t, money.Amount{Nanos: 1_875_000_000, Currency: "USD"}, wallet.Balance)
 	var user model.User
-	var token model.Token
 	require.NoError(t, fixture.db.First(&user, fixture.user.Id).Error)
-	require.NoError(t, fixture.db.First(&token, fixture.token.Id).Error)
 	assert.Equal(t, 1_000_000, user.Quota, "archived quota is not a second money lifecycle")
-	assert.Equal(t, 7654321, token.RemainQuota)
+	assert.Equal(t, testdb.LegacyKeyQuota{RemainQuota: 7654321}, testdb.ReadLegacyKeyQuota(t, fixture.db, fixture.token.Id))
 	before, err := common.Marshal(entries)
 	require.NoError(t, err)
 	require.NoError(t, service.SettleGatewayTask(t.Context(), task))

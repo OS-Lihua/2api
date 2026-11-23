@@ -1184,12 +1184,6 @@ func UpdateChannel(c *gin.Context) {
 	}
 	// 记录变更的字段名（语言无关的字段标识），密钥仅记录"已更换"绝不记录内容。
 	changedFields := make([]string, 0)
-	if channel.Models != originChannel.Models {
-		changedFields = append(changedFields, "models")
-	}
-	if channel.Group != originChannel.Group {
-		changedFields = append(changedFields, "group")
-	}
 	if channel.Type != originChannel.Type {
 		changedFields = append(changedFields, "type")
 	}

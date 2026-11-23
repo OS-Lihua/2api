@@ -119,16 +119,13 @@ func seedToken(t *testing.T, db *gorm.DB, userID int, name string, rawKey string
 	t.Helper()
 
 	token := &model.Token{
-		UserId:         userID,
-		Name:           name,
-		Key:            rawKey,
-		Status:         common.TokenStatusEnabled,
-		CreatedTime:    1,
-		AccessedTime:   1,
-		ExpiredTime:    -1,
-		RemainQuota:    100,
-		UnlimitedQuota: true,
-		Group:          "default",
+		UserId:       userID,
+		Name:         name,
+		Key:          rawKey,
+		Status:       common.TokenStatusEnabled,
+		CreatedTime:  1,
+		AccessedTime: 1,
+		ExpiredTime:  -1,
 	}
 	if err := db.Create(token).Error; err != nil {
 		t.Fatalf("failed to create token: %v", err)
@@ -194,16 +191,11 @@ func getTokenKeyColumnType(t *testing.T, db *gorm.DB) string {
 	}
 }
 
-func getTokenAutoGroupsColumnType(t *testing.T, db *gorm.DB) string {
+func assertTokenQuotaColumnsAbsent(t *testing.T, db *gorm.DB) {
 	t.Helper()
-
-	var dataType string
-	if err := db.Raw(`SELECT data_type FROM information_schema.columns
-		WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?`,
-		"tokens", "auto_groups").Scan(&dataType).Error; err != nil {
-		t.Fatalf("failed to inspect token auto_groups column: %v", err)
+	for _, column := range []string{"remain_quota", "used_quota", "unlimited_quota", "allow_user_quota_query"} {
+		assert.False(t, db.Migrator().HasColumn(&model.Token{}, column), column)
 	}
-	return strings.ToLower(dataType)
 }
 
 func TestTokenMigrationFromChar48ToVarchar128(t *testing.T) {
@@ -228,7 +220,7 @@ func TestTokenMigrationFromChar48ToVarchar128(t *testing.T) {
 		ModelLimitsEnabled: false,
 		ModelLimits:        "",
 		AllowIps:           common.GetPointer(""),
-		UsedQuota:          0,
+		UsedQuota:          27,
 		Group:              "default",
 		CrossGroupRetry:    false,
 	}).Error; err != nil {
@@ -244,11 +236,14 @@ func TestTokenMigrationFromChar48ToVarchar128(t *testing.T) {
 	if got := getTokenKeyColumnType(t, db); got != "varchar(128)" {
 		t.Fatalf("expected migrated key column type varchar(128), got %q", got)
 	}
-	if !db.Migrator().HasColumn(&model.Token{}, "auto_groups") {
-		t.Fatal("expected migration to add auto_groups column")
-	}
-	if got := getTokenAutoGroupsColumnType(t, db); got != "text" {
-		t.Fatalf("expected migrated auto_groups column type text, got %q", got)
+	// The historical rows exist for the upgrade, but current AutoMigrate must
+	// not recreate an automatic routing list that this release never had.
+	assert.False(t, db.Migrator().HasColumn(&model.Token{}, "auto_groups"))
+	require.NoError(t, db.AutoMigrate(&model.ModelOffering{}, &model.ModelOfferingName{}, &model.TokenOfferingPolicy{}, &model.TokenOfferingException{}))
+	require.NoError(t, model.MigrateKeyPermissions(db))
+	require.NoError(t, model.MigrateKeyPermissions(db))
+	for _, column := range []string{"model_limits", "model_limits_enabled", "group", "auto_groups", "cross_group_retry"} {
+		assert.False(t, db.Migrator().HasColumn(&model.Token{}, column), column)
 	}
 
 	var migratedToken model.Token
@@ -261,28 +256,24 @@ func TestTokenMigrationFromChar48ToVarchar128(t *testing.T) {
 	if migratedToken.Name != "legacy-token" {
 		t.Fatalf("expected migrated token name to be preserved, got %q", migratedToken.Name)
 	}
-	if migratedToken.AutoGroups != "" {
-		t.Fatalf("expected legacy token to inherit global Auto groups, got %q", migratedToken.AutoGroups)
-	}
-	require.True(t, db.Migrator().HasColumn(&model.Token{}, "allow_user_quota_query"))
-	assert.False(t, migratedToken.AllowUserQuotaQuery, "tokens created before the upgrade keep user quota queries off")
+	assert.False(t, db.Migrator().HasColumn(&model.Token{}, "allow_user_quota_query"), "AutoMigrate must not add the retired query flag")
+	var remaining, used int
+	var unlimited bool
+	require.NoError(t, db.Raw(`SELECT remain_quota, used_quota, unlimited_quota FROM tokens WHERE id = ?`, migratedToken.Id).
+		Row().Scan(&remaining, &used, &unlimited))
+	assert.Equal(t, 100, remaining)
+	assert.Equal(t, 27, used)
+	assert.True(t, unlimited, "the Key width migration must preserve old billing evidence")
 
 	inserted := model.Token{
-		UserId:             8,
-		Name:               "long-token",
-		Key:                longKey,
-		Status:             common.TokenStatusEnabled,
-		CreatedTime:        1,
-		AccessedTime:       1,
-		ExpiredTime:        -1,
-		RemainQuota:        200,
-		UnlimitedQuota:     true,
-		ModelLimitsEnabled: false,
-		ModelLimits:        "",
-		AllowIps:           common.GetPointer(""),
-		UsedQuota:          0,
-		Group:              "default",
-		CrossGroupRetry:    false,
+		UserId:       8,
+		Name:         "long-token",
+		Key:          longKey,
+		Status:       common.TokenStatusEnabled,
+		CreatedTime:  1,
+		AccessedTime: 1,
+		ExpiredTime:  -1,
+		AllowIps:     common.GetPointer(""),
 	}
 	if err := db.Create(&inserted).Error; err != nil {
 		t.Fatalf("failed to insert long token after migration: %v", err)
@@ -303,8 +294,9 @@ func TestTokenAutoMigrateUsesVarchar128KeyColumn(t *testing.T) {
 	if got := getTokenKeyColumnType(t, db); got != "varchar(128)" {
 		t.Fatalf("expected key column type varchar(128), got %q", got)
 	}
-	if got := getTokenAutoGroupsColumnType(t, db); got != "text" {
-		t.Fatalf("expected auto_groups column type text, got %q", got)
+	assertTokenQuotaColumnsAbsent(t, db)
+	for _, column := range []string{"model_limits", "model_limits_enabled", "group", "auto_groups", "cross_group_retry"} {
+		assert.False(t, db.Migrator().HasColumn(&model.Token{}, column), column)
 	}
 }
 
@@ -474,15 +466,10 @@ func TestTokenManagementCreatesCredentialSettings(t *testing.T) {
 	assert.Equal(t, common.TokenStatusEnabled, token.Status)
 	assert.NotEmpty(t, token.GetFullKey())
 	assert.NotContains(t, recorder.Body.String(), token.GetFullKey())
-	assert.Zero(t, token.RemainQuota)
-	assert.Zero(t, token.UsedQuota)
-	assert.False(t, token.UnlimitedQuota)
-	assert.False(t, token.AllowUserQuotaQuery)
-	assert.False(t, token.ModelLimitsEnabled)
-	assert.Empty(t, token.ModelLimits)
-	assert.Empty(t, token.Group)
-	assert.Empty(t, token.AutoGroups)
-	assert.False(t, token.CrossGroupRetry)
+	assertTokenQuotaColumnsAbsent(t, db)
+	for _, column := range []string{"model_limits", "model_limits_enabled", "group", "auto_groups", "cross_group_retry"} {
+		assert.False(t, db.Migrator().HasColumn(&model.Token{}, column), column)
+	}
 	var count int64
 	require.NoError(t, db.Model(&model.Token{}).Count(&count).Error)
 	assert.EqualValues(t, 1, count)
@@ -492,12 +479,7 @@ func TestTokenManagementUpdatesPreserveHistoryAndPermissionRevision(t *testing.T
 	db := setupTokenControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.TokenOfferingPolicy{}, &model.TokenOfferingException{}))
 	token := seedToken(t, db, 1, "historical-credential", "history-permission-test-key")
-	token.RemainQuota, token.UsedQuota = 73, 27
-	token.UnlimitedQuota = false
-	token.AllowUserQuotaQuery, token.ModelLimitsEnabled = true, true
-	token.ModelLimits, token.Group = "historical-model", "auto"
-	token.AutoGroups, token.CrossGroupRetry = `["vip","default"]`, true
-	require.NoError(t, db.Save(token).Error)
+	assertTokenQuotaColumnsAbsent(t, db)
 	permissions, err := model.MutateKeyPermissions(t.Context(), token.Id, token.UserId, 0, "deny_all", model.KeyPermissions{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(1), permissions.Revision)
@@ -557,7 +539,7 @@ func TestGetTokenUsageRetiresQuotaWithoutBypassingIPWhitelist(t *testing.T) {
 	require.NoError(t, i18n.Init())
 	for _, tc := range []struct {
 		name       string
-		allow      bool
+		legacyFlag bool
 		expired    bool
 		allowIps   string
 		remoteAddr string
@@ -565,15 +547,15 @@ func TestGetTokenUsageRetiresQuotaWithoutBypassingIPWhitelist(t *testing.T) {
 		language   string
 		message    string
 	}{
-		{name: "switch off", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusGone},
+		{name: "native key", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusGone},
 		{name: "simplified Chinese client", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusGone, language: "zh-CN", message: "基于旧额度的账单查询已退役，请使用已授权的钱包 API。"},
 		{name: "traditional Chinese client", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusGone, language: "zh-TW", message: "以舊額度為基礎的帳單查詢已退役，請使用已授權的錢包 API。"},
-		{name: "switch on without IP whitelist", allow: true, remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusGone},
-		{name: "switch on with matching IP whitelist", allow: true, allowIps: "198.51.100.1\n203.0.113.0/24", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusGone},
-		{name: "expired key with the switch on", allow: true, expired: true, remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusGone},
-		{name: "switch on from an IP outside the whitelist", allow: true, allowIps: "198.51.100.1", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusForbidden},
-		{name: "switch off from an IP outside the whitelist", allowIps: "198.51.100.1", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusForbidden},
-		{name: "unresolved client IP with a whitelist", allow: true, allowIps: "203.0.113.0/24", remoteAddr: "unresolved", wantStatus: http.StatusForbidden},
+		{name: "old query switch cannot revive billing", legacyFlag: true, remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusGone},
+		{name: "matching IP whitelist", allowIps: "198.51.100.1\n203.0.113.0/24", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusGone},
+		{name: "expired key", expired: true, remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusGone},
+		{name: "old query switch cannot bypass IP whitelist", legacyFlag: true, allowIps: "198.51.100.1", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusForbidden},
+		{name: "IP outside the whitelist", allowIps: "198.51.100.1", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusForbidden},
+		{name: "unresolved client IP with a whitelist", allowIps: "203.0.113.0/24", remoteAddr: "unresolved", wantStatus: http.StatusForbidden},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := setupTokenControllerTestDB(t)
@@ -584,7 +566,13 @@ func TestGetTokenUsageRetiresQuotaWithoutBypassingIPWhitelist(t *testing.T) {
 			user := &model.User{Username: "quota-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", Quota: 12345, UsedQuota: 678, AuthVersion: 1, AffCode: "quota-owner"}
 			require.NoError(t, db.Create(user).Error)
 			token := seedToken(t, db, user.Id, "usage-token", "usagekey1234")
-			updates := map[string]any{"allow_user_quota_query": tc.allow, "allow_ips": tc.allowIps, "used_quota": 30}
+			quota := historicalTokenQuota{RemainQuota: 100, UsedQuota: 30, UnlimitedQuota: true, AllowUserQuotaQuery: true}
+			if tc.legacyFlag {
+				seedHistoricalTokenQuota(t, db, token.Id, quota)
+			} else {
+				assertTokenQuotaColumnsAbsent(t, db)
+			}
+			updates := map[string]any{"allow_ips": tc.allowIps}
 			if tc.expired {
 				updates["status"], updates["expired_time"] = common.TokenStatusExpired, 1
 			}
@@ -619,9 +607,9 @@ func TestGetTokenUsageRetiresQuotaWithoutBypassingIPWhitelist(t *testing.T) {
 			}
 			saved, err := model.GetTokenByIds(token.Id, user.Id)
 			require.NoError(t, err)
-			assert.Equal(t, 100, saved.RemainQuota)
-			assert.Equal(t, 30, saved.UsedQuota)
-			assert.Equal(t, tc.allow, saved.AllowUserQuotaQuery)
+			if tc.legacyFlag {
+				assertHistoricalTokenQuota(t, db, token.Id, quota)
+			}
 			assert.Equal(t, tc.allowIps, *saved.AllowIps)
 			wantTokenStatus := common.TokenStatusEnabled
 			if tc.expired {
@@ -749,15 +737,12 @@ func verifyAPITokenAudit(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			empty := ""
-			owned := &model.Token{UserId: user.Id, Name: "owned", Key: fmt.Sprintf("owned-key-secret-%d", index), Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 100, UnlimitedQuota: true, Group: "auto", CrossGroupRetry: true, AutoGroups: `["default"]`, AllowIps: &empty}
+			owned := &model.Token{UserId: user.Id, Name: "owned", Key: fmt.Sprintf("owned-key-secret-%d", index), Status: common.TokenStatusEnabled, ExpiredTime: -1, AllowIps: &empty}
 			if tc.initialStatus != 0 {
 				owned.Status = tc.initialStatus
 			}
 			if owned.Status == common.TokenStatusExpired || tc.expired {
 				owned.ExpiredTime = 1
-			}
-			if owned.Status == common.TokenStatusExhausted {
-				owned.RemainQuota, owned.UnlimitedQuota = 0, false
 			}
 			foreign := &model.Token{UserId: other.Id, Name: "private-foreign-name", Key: fmt.Sprintf("foreign-key-secret-%d", index)}
 			require.NoError(t, model.DB.Create(owned).Error)

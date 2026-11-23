@@ -737,9 +737,7 @@ func TestSweepTimedOutTasksPreservesArchivedSubscriptionObligations(t *testing.T
 	assert.Equal(t, taskQuota, ordinary.Quota)
 	assert.Equal(t, initialQuota, getUserQuota(t, userID))
 	assert.Equal(t, initialTokenQuota, getTokenRemainQuota(t, tokenID))
-	var token model.Token
-	require.NoError(t, model.DB.First(&token, tokenID).Error)
-	assert.Zero(t, token.UsedQuota)
+	assert.Zero(t, getTokenUsedQuota(t, tokenID))
 	assert.Zero(t, countLogs(t), "clock-based status changes cannot prove a historical refund")
 	for _, table := range []string{"subscription_periods", "wallets", "ledger_entries"} {
 		var count int64

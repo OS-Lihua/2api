@@ -14,6 +14,7 @@ import (
 // with array-form metadata look like a broken routing configuration.
 func TestModelPricingConversionAcceptsDeclaredEndpointArray(t *testing.T) {
 	db := modelManagementDB(t)
+	declareLegacyProviderRoutingColumns(t, db)
 	previousQuota := common.QuotaPerUnit
 	common.QuotaPerUnit = 500000
 	t.Cleanup(func() { common.QuotaPerUnit = previousQuota })

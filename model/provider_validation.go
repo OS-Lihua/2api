@@ -103,18 +103,9 @@ func ValidateProvider(channel *Provider, isAdd bool) error {
 		return fmt.Errorf("SGLang channel base URL cannot be empty")
 	}
 
-	// 如果是添加操作，检查 channel 和 key 是否为空
-	if isAdd {
-		if channel.Key == "" {
-			return fmt.Errorf("channel cannot be empty")
-		}
-
-		// 检查模型名称长度是否超过 255
-		for _, m := range channel.GetModels() {
-			if len(m) > 255 {
-				return common.NewMessage("Model name is too long: {{model}}", map[string]any{"model": m})
-			}
-		}
+	// 新建 Provider 必须提供密钥。
+	if isAdd && channel.Key == "" {
+		return fmt.Errorf("channel cannot be empty")
 	}
 
 	// VertexAI 特殊校验

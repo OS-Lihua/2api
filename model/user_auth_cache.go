@@ -43,7 +43,7 @@ func userAuthFenceTTLSeconds() int {
 	return cacheTTL + extra
 }
 
-func writeUserCache(user *UserBase, includeQuota bool) error {
+func writeUserCache(user *UserBase, createOnMiss bool) error {
 	if user == nil || user.Id <= 0 || !common.RedisEnabled {
 		return nil
 	}
@@ -51,9 +51,9 @@ func writeUserCache(user *UserBase, includeQuota bool) error {
 	if user.AuthVersion <= 0 {
 		return fmt.Errorf("invalid user auth version")
 	}
-	includeQuotaArg := "0"
-	if includeQuota {
-		includeQuotaArg = "1"
+	createOnMissArg := "0"
+	if createOnMiss {
+		createOnMissArg = "1"
 	}
 	ttl := userCacheTTLSeconds()
 	user.CacheExpiresAt = time.Now().Add(time.Duration(ttl) * time.Second).UnixMilli()
@@ -82,16 +82,14 @@ redis.call('HSET', KEYS[1],
   'Id', ARGV[2], 'Group', ARGV[3], 'Email', ARGV[4],
   'Status', ARGV[5], 'Role', ARGV[6], 'Username', ARGV[7],
   'Setting', ARGV[8], 'AuthVersion', ARGV[1], 'CacheSchema', ARGV[9],
-  'CacheExpiresAt', ARGV[13], 'CacheMAC', ARGV[14])
-if ARGV[10] == '1' and not string.match(redis.call('HGET', KEYS[1], 'Quota') or '', '^-?%d+$') then
-  redis.call('HSET', KEYS[1], 'Quota', ARGV[11])
-end
-redis.call('EXPIRE', KEYS[1], ARGV[12])
+  'CacheExpiresAt', ARGV[12], 'CacheMAC', ARGV[13])
+redis.call('HDEL', KEYS[1], 'Quota')
+redis.call('EXPIRE', KEYS[1], ARGV[11])
 return 1`
 	result, err := common.RDB.Eval(context.Background(), script,
 		[]string{getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id)},
 		user.AuthVersion, user.Id, user.Group, user.Email, user.Status, user.Role,
-		user.Username, user.Setting, user.CacheSchema, includeQuotaArg, user.Quota, ttl,
+		user.Username, user.Setting, user.CacheSchema, createOnMissArg, ttl,
 		user.CacheExpiresAt, mac,
 	).Int()
 	if err != nil {
@@ -226,8 +224,7 @@ func BumpUserAuthVersion(userId int) (int64, error) {
 	return next, nil
 }
 
-// PublishUserAuthCache refreshes user metadata from the database. Quota stays
-// under the atomic quota-delta paths.
+// PublishUserAuthCache refreshes user metadata from the database.
 func PublishUserAuthCache(userId int) error {
 	if !common.RedisEnabled {
 		return nil
@@ -250,7 +247,6 @@ func PublishUserAuthCache(userId int) error {
 			return err
 		}
 		previousBase, verifiedBase := authoritative.ToBaseUser(), verified.ToBaseUser()
-		previousBase.Quota, verifiedBase.Quota = 0, 0
 		if *previousBase == *verifiedBase {
 			return nil
 		}

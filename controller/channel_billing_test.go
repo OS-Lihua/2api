@@ -51,14 +51,18 @@ func TestUpdateAllChannelsBalanceUsesStableAccountOrder(t *testing.T) {
 	}))
 	defer server.Close()
 	accounts := []model.Provider{
-		{Id: 11, Name: "positive", Priority: common.GetPointer(int64(100))},
-		{Id: 12, Name: "zero", Priority: common.GetPointer(int64(0))},
-		{Id: 13, Name: "error", Priority: common.GetPointer(int64(-100))},
-		{Id: 14, Name: "disabled", Priority: common.GetPointer(int64(999)), Status: common.ChannelStatusManuallyDisabled},
-		{Id: 15, Name: "multi", Priority: common.GetPointer(int64(1000)), ProviderInfo: model.ProviderInfo{IsMultiKey: true}},
-		{Id: 16, Name: "noauto", Priority: common.GetPointer(int64(50)), AutoBan: common.GetPointer(0)},
-		{Id: 17, Name: "raw", Priority: common.GetPointer(int64(25)), Type: constant.ChannelTypeAdvancedCustom, OtherSettings: `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/dashboard/billing/credit_grants","upstream_path":"/balance","converter":"none"}]}}`},
+		{Id: 11, Name: "positive"},
+		{Id: 12, Name: "zero"},
+		{Id: 13, Name: "error"},
+		{Id: 14, Name: "disabled", Status: common.ChannelStatusManuallyDisabled},
+		{Id: 15, Name: "multi", ProviderInfo: model.ProviderInfo{IsMultiKey: true}},
+		{Id: 16, Name: "noauto", AutoBan: common.GetPointer(0)},
+		{Id: 17, Name: "raw", Type: constant.ChannelTypeAdvancedCustom, OtherSettings: `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/dashboard/billing/credit_grants","upstream_path":"/balance","converter":"none"}]}}`},
 	}
+	// Keep historical priorities that conflict with the live ID order, without
+	// relying on the active Provider model to create or maintain that column.
+	priorities := []int64{100, 0, -100, 999, 1000, 50, 25}
+	require.NoError(t, db.Exec(`ALTER TABLE "providers" ADD COLUMN IF NOT EXISTS "priority" bigint`).Error)
 	for index := range accounts {
 		account := &accounts[index]
 		account.Key, account.BaseURL, account.Balance = account.Name, common.GetPointer(server.URL), 99
@@ -69,16 +73,19 @@ func TestUpdateAllChannelsBalanceUsesStableAccountOrder(t *testing.T) {
 			account.Status = common.ChannelStatusEnabled
 		}
 		require.NoError(t, db.Create(account).Error)
+		require.NoError(t, db.Exec(`UPDATE "providers" SET "priority" = ? WHERE "id" = ?`, priorities[index], account.Id).Error)
 	}
 	model.InitProviderCache()
 	require.NoError(t, updateAllChannelsBalance())
 	mu.Lock()
 	assert.Equal(t, []string{"raw", "noauto", "error", "zero", "positive"}, calls, "live balance refresh must ignore historical Provider.Priority")
 	mu.Unlock()
-	for _, original := range accounts {
+	for index, original := range accounts {
 		var stored model.Provider
 		require.NoError(t, db.First(&stored, original.Id).Error)
-		assert.Equal(t, original.Priority, stored.Priority)
+		var legacyPriority int64
+		require.NoError(t, db.Table("providers").Where("id = ?", original.Id).Pluck("priority", &legacyPriority).Error)
+		assert.Equal(t, priorities[index], legacyPriority)
 		assert.Equal(t, original.OtherSettings, stored.OtherSettings)
 		assert.Equal(t, original.Key, stored.Key)
 		expectedStatus := original.Status
@@ -104,6 +111,13 @@ func TestUpdateAllChannelsBalanceUsesStableAccountOrder(t *testing.T) {
 	}
 
 	mu.Lock()
+	calls = nil
+	mu.Unlock()
+	require.NoError(t, db.Exec(`ALTER TABLE "providers" DROP COLUMN IF EXISTS "models", DROP COLUMN IF EXISTS "model_mapping",
+		DROP COLUMN IF EXISTS "group", DROP COLUMN IF EXISTS "priority", DROP COLUMN IF EXISTS "weight"`).Error)
+	require.NoError(t, updateAllChannelsBalance())
+	mu.Lock()
+	assert.Equal(t, []string{"raw", "noauto", "error", "positive"}, calls, "the previously auto-disabled account remains excluded after retirement")
 	calls = nil
 	mu.Unlock()
 	require.NoError(t, db.Exec("ALTER TABLE providers RENAME TO unavailable_providers").Error)

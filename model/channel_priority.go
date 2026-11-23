@@ -92,7 +92,7 @@ func ReorderProviderPriority(move ProviderPriorityMove) (ProviderPriorityOrder, 
 			if move.Preview {
 				continue
 			}
-			if err := tx.Model(&Provider{}).Where("id = ?", change.ID).Update("priority", change.Priority).Error; err != nil {
+			if err := tx.Table(providerTable).Where("id = ?", change.ID).Update("priority", change.Priority).Error; err != nil {
 				return err
 			}
 			if err := tx.Model(&Ability{}).Where("channel_id = ?", change.ID).Update("priority", change.Priority).Error; err != nil {
