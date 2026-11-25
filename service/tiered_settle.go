@@ -228,7 +228,9 @@ func TryTieredSettle(relayInfo *relaycommon.RelayInfo, params billingexpr.TokenP
 	// Surface any single-request saturation from settlement onto RelayInfo so the
 	// consume log records it under admin_info, regardless of which caller
 	// (text, audio, WSS) consumes the returned quota. First non-nil wins.
-	noteQuotaClamp(relayInfo, tr.Clamp)
+	if relayInfo.QuotaClamp == nil {
+		relayInfo.QuotaClamp = tr.Clamp
+	}
 
 	return true, tr.ActualQuotaAfterGroup, &tr
 }

@@ -1417,11 +1417,11 @@ func TestLegacyPricingConversionSourceSnapshot(t *testing.T) {
 	require.NotEmpty(t, dsn)
 	t.Setenv("SQL_DSN", dsn)
 	t.Setenv("SETTLEMENT_CURRENCY", "USD")
-	previousDB, previousMaster, previousGeneration, previousQuota := model.DB, common.IsMasterNode, jsplugin.DefaultRegistry, common.QuotaPerUnit
+	previousDB, previousMaster, previousGeneration := model.DB, common.IsMasterNode, jsplugin.DefaultRegistry
 	t.Cleanup(func() {
-		model.DB, common.IsMasterNode, jsplugin.DefaultRegistry, common.QuotaPerUnit = previousDB, previousMaster, previousGeneration, previousQuota
+		model.DB, common.IsMasterNode, jsplugin.DefaultRegistry = previousDB, previousMaster, previousGeneration
 	})
-	common.IsMasterNode, common.QuotaPerUnit = true, 500000
+	common.IsMasterNode = true
 	require.NoError(t, model.InitDB())
 	db := model.DB.Session(&gorm.Session{Logger: logger.Discard})
 	pool, err := db.DB()
@@ -1515,11 +1515,11 @@ func TestLegacyMigrationTaskPricingSource(t *testing.T) {
 			require.NotEmpty(t, dsn)
 			t.Setenv("SQL_DSN", dsn)
 			t.Setenv("SETTLEMENT_CURRENCY", "USD")
-			previousDB, previousMaster, previousQuota, previousRegistry := model.DB, common.IsMasterNode, common.QuotaPerUnit, jsplugin.DefaultRegistry
+			previousDB, previousMaster, previousRegistry := model.DB, common.IsMasterNode, jsplugin.DefaultRegistry
 			t.Cleanup(func() {
-				model.DB, common.IsMasterNode, common.QuotaPerUnit, jsplugin.DefaultRegistry = previousDB, previousMaster, previousQuota, previousRegistry
+				model.DB, common.IsMasterNode, jsplugin.DefaultRegistry = previousDB, previousMaster, previousRegistry
 			})
-			common.IsMasterNode, common.QuotaPerUnit = true, 500000
+			common.IsMasterNode = true
 			require.NoError(t, model.InitDB())
 			db := model.DB.Session(&gorm.Session{Logger: logger.Discard})
 			model.DB = db

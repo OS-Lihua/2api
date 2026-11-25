@@ -178,9 +178,6 @@ func modelManagementSales(t *testing.T, db *gorm.DB) []SaleCatalogOffering {
 }
 
 func TestModelPricingConversionDatabase(t *testing.T) {
-	previousQuota := common.QuotaPerUnit
-	common.QuotaPerUnit = 500000
-	t.Cleanup(func() { common.QuotaPerUnit = previousQuota })
 	db := modelManagementDB(t)
 	declareLegacyProviderRoutingColumns(t, db)
 	// These are legacy conversion sources, not account API mutations.
@@ -2032,6 +2029,20 @@ export function parseTaskResult(){return {};}
 	historical, err := model.CurrentPriceVersion(context.Background(), db, model.PriceOwnerChannel, beta.ID, 1)
 	require.NoError(t, err)
 	assert.Equal(t, betaPrice.ID, historical.ID, "changing one owner never overwrites its accepted history")
+	for _, quote := range []struct {
+		price model.PriceVersion
+		input billingexpr.MoneyInput
+		want  string
+	}{
+		{alphaPrice, billingexpr.MoneyInput{TaskUsage: true, Request: billingexpr.RequestInput{Usage: map[string]any{"seconds": 2}}}, "0.8 USD"},
+		{*historical, billingexpr.MoneyInput{TaskUsage: true, Request: billingexpr.RequestInput{Usage: map[string]any{"credits": 2}}}, "4 USD"},
+		{betaFree, billingexpr.MoneyInput{TaskUsage: true, Request: billingexpr.RequestInput{Usage: map[string]any{"credits": 2}}}, "0 USD"},
+		{ordinaryPrice, billingexpr.MoneyInput{ImageCount: common.GetPointer(2)}, "0.08 USD"},
+	} {
+		amount, _, err := billingexpr.RunMoneyExpr(quote.price.Expression, quote.input, quote.price.Currency)
+		require.NoError(t, err)
+		assert.Equal(t, quote.want, amount.String())
+	}
 	prices = modelManagementPrices(t, db)
 	require.NoError(t, model.MigratePricing(db))
 	assert.Equal(t, prices, modelManagementPrices(t, db), "repeated schema migration preserves owner versions")

@@ -3,11 +3,7 @@ package service
 import (
 	"strings"
 
-	"github.com/QuantumNous/new-api/common"
-
 	"github.com/QuantumNous/new-api/relaykit/types"
-
-	"github.com/shopspring/decimal"
 )
 
 const (
@@ -61,32 +57,4 @@ func NormalizeViolationFeeError(err *types.NewAPIError) *types.NewAPIError {
 	}
 
 	return err
-}
-
-func shouldChargeViolationFee(err *types.NewAPIError) bool {
-	if err == nil {
-		return false
-	}
-	if err.GetErrorCode() == types.ErrorCodeViolationFeeGrokCSAM {
-		return true
-	}
-	// In case some callers didn't normalize, keep a safety net.
-	return HasCSAMViolationMarker(err)
-}
-
-func calcViolationFeeQuota(amount, groupRatio float64) int {
-	if amount <= 0 {
-		return 0
-	}
-	if groupRatio <= 0 {
-		return 0
-	}
-	quota := common.QuotaFromDecimal(decimal.NewFromFloat(amount).
-		Mul(decimal.NewFromFloat(common.QuotaPerUnit)).
-		Mul(decimal.NewFromFloat(groupRatio)).
-		Round(0))
-	if quota <= 0 {
-		return 0
-	}
-	return quota
 }

@@ -43,13 +43,13 @@ type ModelPricingDescription struct {
 }
 
 func legacyInputPricePerMillion(ratio float64) (decimal.Decimal, error) {
-	if common.QuotaPerUnit <= 0 || math.IsInf(common.QuotaPerUnit, 0) || math.IsNaN(common.QuotaPerUnit) {
-		return decimal.Zero, errors.New("invalid quota unit")
-	}
 	if ratio < 0 || math.IsInf(ratio, 0) || math.IsNaN(ratio) {
 		return decimal.Zero, errors.New("input ratio must be finite and non-negative")
 	}
-	return decimal.NewFromFloat(ratio).Mul(decimal.NewFromInt(1_000_000)).Div(decimal.NewFromFloat(common.QuotaPerUnit)), nil
+	// The released pricing format used 500,000 units per USD. This is
+	// part of the import format, not a setting for live settlement.
+	const legacyUnitsPerUSD = 500_000
+	return decimal.NewFromFloat(ratio).Mul(decimal.NewFromInt(1_000_000)).Div(decimal.NewFromInt(legacyUnitsPerUSD)), nil
 }
 
 type LegacyPricingRule struct {

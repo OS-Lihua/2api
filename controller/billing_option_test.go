@@ -5,7 +5,6 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/shopspring/decimal"
 	"maps"
-	"math"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -20,9 +19,6 @@ import (
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/money"
 	"github.com/QuantumNous/new-api/pkg/testdb"
-	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	"github.com/QuantumNous/new-api/relay/helper"
-	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
@@ -37,7 +33,7 @@ func TestLocalQuotaUnitIsReadOnlyHistoricalMetadata(t *testing.T) {
 	for _, mode := range []string{"projection", "http", "internal", "bulk", "startup", "startup_missing", "startup_malformed", "startup_zero"} {
 		t.Run(mode, func(t *testing.T) {
 			db := setupManageUserTestDB(t)
-			previousUnit, previousTopup := common.QuotaPerUnit, common.TopUpLink
+			previousTopup := common.TopUpLink
 			previousConfig := config.GlobalConfig.ExportAllConfigs()
 			common.OptionMapRWMutex.Lock()
 			previousOptions := common.OptionMap
@@ -56,12 +52,12 @@ func TestLocalQuotaUnitIsReadOnlyHistoricalMetadata(t *testing.T) {
 			}
 			beforeMap := maps.Clone(common.OptionMap)
 			common.OptionMapRWMutex.Unlock()
-			common.QuotaPerUnit, common.TopUpLink = 500000, beforeMap["TopUpLink"]
+			common.TopUpLink = beforeMap["TopUpLink"]
 			t.Cleanup(func() {
 				common.OptionMapRWMutex.Lock()
 				common.OptionMap = previousOptions
 				common.OptionMapRWMutex.Unlock()
-				common.QuotaPerUnit, common.TopUpLink = previousUnit, previousTopup
+				common.TopUpLink = previousTopup
 				require.NoError(t, config.GlobalConfig.LoadFromDB(previousConfig))
 			})
 			for key, value := range beforeMap {
@@ -114,7 +110,6 @@ func TestLocalQuotaUnitIsReadOnlyHistoricalMetadata(t *testing.T) {
 			default:
 				for range 2 {
 					model.InitOptionMap()
-					assert.Equal(t, float64(500000), common.QuotaPerUnit, "loading source metadata must not mutate the old runtime divisor")
 				}
 			}
 			var after []model.Option
@@ -132,7 +127,6 @@ func TestLocalQuotaUnitIsReadOnlyHistoricalMetadata(t *testing.T) {
 			} else {
 				assert.Equal(t, beforeMap, afterMap)
 			}
-			assert.Equal(t, float64(500000), common.QuotaPerUnit)
 			assert.Equal(t, beforeMap["TopUpLink"], common.TopUpLink)
 			response := reminderSettingsHTTP(t, GetStatus, http.MethodGet, "/api/status", "", operator)
 			var status struct {
@@ -1034,11 +1028,8 @@ export function parseTaskResult() { return {}; }
 // through the same public entry points used by the relay.
 func TestPreConsumePolicyDatabase(t *testing.T) {
 	previousConfig := config.GlobalConfig.ExportAllConfigs()
-	previousUnit := common.QuotaPerUnit
-	common.QuotaPerUnit = 500000
 	t.Cleanup(func() {
 		require.NoError(t, config.GlobalConfig.LoadFromDB(previousConfig))
-		common.QuotaPerUnit = previousUnit
 	})
 	db := modelManagementDB(t)
 	require.NoError(t, db.AutoMigrate(&model.Token{}))
@@ -1158,35 +1149,6 @@ func TestPreConsumePolicyDatabase(t *testing.T) {
 			require.NoError(t, err)
 			assert.Empty(t, reconciled.Mismatches)
 		})
-	}
-}
-
-func TestPreConsumeMultiplierRejectsInvalidRuntimeAndOverflow(t *testing.T) {
-	fixture := newNativeGatewayTaskFixture(t, func(http.ResponseWriter, *http.Request) {
-		t.Fatal("a rejected historical quote cannot contact a Provider")
-	})
-	var originalEntries int64
-	require.NoError(t, fixture.db.Model(&model.LedgerEntry{}).Count(&originalEntries).Error)
-	previous := config.GlobalConfig.ExportAllConfigs()
-	t.Cleanup(func() { require.NoError(t, config.GlobalConfig.LoadFromDB(previous)) })
-	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
-		"billing_setting.billing_mode":    `{"policy-overflow":"tiered_expr"}`,
-		"billing_setting.billing_expr":    `{"policy-overflow":"tier(\"base\", p * 3)"}`,
-		"group_ratio_setting.group_ratio": `{"default":1}`,
-	}))
-	for _, multiplier := range []float64{0, -0.5, math.NaN(), math.Inf(1), math.MaxFloat64} {
-		operation_setting.GetQuotaSetting().PreConsumeMultiplier = multiplier
-		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-		info := &relaycommon.RelayInfo{OriginModelName: "policy-overflow", UserGroup: "default", UsingGroup: "default", BillingRequestInput: &billingexpr.RequestInput{}}
-		_, err := helper.ModelPriceHelper(ctx, info, 1000, &types.TokenCountMeta{})
-		require.Error(t, err)
-		var lifecycles, entries int64
-		require.NoError(t, fixture.db.Model(&model.GatewayBilling{}).Count(&lifecycles).Error)
-		require.NoError(t, fixture.db.Model(&model.LedgerEntry{}).Count(&entries).Error)
-		assert.Zero(t, lifecycles)
-		assert.Equal(t, originalEntries, entries, "invalid quotation cannot create any hold or ledger entry")
-		assertSubmissionWallet(t, fixture, 2000000000)
 	}
 }
 

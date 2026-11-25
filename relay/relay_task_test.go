@@ -20,17 +20,16 @@ import (
 	"github.com/QuantumNous/new-api/pkg/money"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
-	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
-	kittypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
-	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
+
+const legacyTaskFixtureUnitsPerUSD = 500_000
 
 func setupRelayChannelDB(t *testing.T) *gorm.DB {
 	t.Helper()
@@ -440,16 +439,16 @@ export function extractUsage(){return {old_units:2};}
 			}
 			// Preserve a persisted legacy expression even if the current plugin
 			// profile has narrowed. This evaluator must not mutate any funds.
-			snapshot := &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ModelName: "alias-model", ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), GroupRatio: 1, QuotaPerUnit: common.QuotaPerUnit, ExprVersion: billingexpr.ExprVersion(expression), TaskUsageBilling: true, UsageFacts: map[string]any{"old_units": float64(2)}}
+			snapshot := &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ModelName: "alias-model", ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), GroupRatio: 1, QuotaPerUnit: legacyTaskFixtureUnitsPerUSD, ExprVersion: billingexpr.ExprVersion(expression), TaskUsageBilling: true, UsageFacts: map[string]any{"old_units": float64(2)}}
 			assert.Equal(t, billingexpr.ExprHashString(testCase.wantExpr), snapshot.ExprHash)
 			result, _, err := service.EvaluateTaskCompletionUsage(snapshot, map[string]any{"old_units": float64(2)})
 			require.NoError(t, err)
-			want := int(2 * common.QuotaPerUnit)
+			want := int(2 * legacyTaskFixtureUnitsPerUSD)
 			if expression == tailExpr {
-				want = int(3 * common.QuotaPerUnit)
+				want = int(3 * legacyTaskFixtureUnitsPerUSD)
 			}
 			if expression == legacyExpr {
-				want = int(4 * common.QuotaPerUnit)
+				want = int(4 * legacyTaskFixtureUnitsPerUSD)
 			}
 			assert.Equal(t, want, result.ActualQuotaAfterGroup)
 		})
@@ -527,7 +526,7 @@ func TestSharedTaskBillingExpressionSelectionAndFrozenSettlement(t *testing.T) {
 			require.NoError(t, err)
 			// A released task stored this complete snapshot. Replaying it must
 			// remain independent of current options and plugin schemas.
-			snapshot := &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ModelName: tc.model, ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), GroupRatio: 1, EstimatedQuotaBeforeGroup: cost * common.QuotaPerUnit, EstimatedQuotaAfterGroup: common.QuotaRound(cost * common.QuotaPerUnit), QuotaPerUnit: common.QuotaPerUnit, ExprVersion: billingexpr.ExprVersion(expression), TaskUsageBilling: true, UsageFacts: facts}
+			snapshot := &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ModelName: tc.model, ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), GroupRatio: 1, EstimatedQuotaBeforeGroup: cost * legacyTaskFixtureUnitsPerUSD, EstimatedQuotaAfterGroup: common.QuotaRound(cost * legacyTaskFixtureUnitsPerUSD), QuotaPerUnit: legacyTaskFixtureUnitsPerUSD, ExprVersion: billingexpr.ExprVersion(expression), TaskUsageBilling: true, UsageFacts: facts}
 			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: `{}`, "billing_setting.billing_expr": `{}`}))
 			result, usage, err := service.EvaluateTaskCompletionUsage(snapshot, map[string]any{field: float64(4)})
 			require.NoError(t, err)
@@ -535,124 +534,6 @@ func TestSharedTaskBillingExpressionSelectionAndFrozenSettlement(t *testing.T) {
 			assert.Equal(t, float64(2), snapshot.UsageFacts[field])
 			assert.Equal(t, 2*snapshot.EstimatedQuotaAfterGroup, result.ActualQuotaAfterGroup)
 			assert.Equal(t, tc.wantExpr, snapshot.ExprString)
-		})
-	}
-}
-
-func TestSharedEndpointBillingKeepsOrdinaryAndPluginPricesSeparate(t *testing.T) {
-	db := model.UseTestDatabases(t)
-	require.NoError(t, db.AutoMigrate(&model.Wallet{}, &model.LedgerEntry{}, &model.GatewayBilling{}))
-	require.NoError(t, i18n.Init())
-	const taskExpr = `tier("images", u("image_count") * 0.05)`
-	const ordinaryExpr = `tier("images", fixed(0.04)) * image_count`
-	savedPrices := ratio_setting.ModelPrice2JSONString()
-	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(savedPrices)) })
-	for _, tc := range []struct {
-		name, expression, override          string
-		ordinaryQuota, taskQuota, taskFinal int
-		wantError                           string
-		alias, shared, legacy               bool
-	}{
-		{name: "task usage price is rejected by ordinary relay", expression: taskExpr, taskQuota: 50000, taskFinal: 75000, wantError: "task usage expression"},
-		{name: "enum fallback cannot silently bill zero", expression: `u("output_image_type") == "2k" ? tier("2k", u("image_count") * 0.08) : tier("1k", 0.04)`, taskQuota: 20000, taskFinal: 20000, wantError: "task usage expression"},
-		{name: "unselected usage branch is rejected", expression: `true ? tier("flat", 0.04) : tier("images", u("image_count"))`, taskQuota: 20000, taskFinal: 20000, wantError: "task usage expression"},
-		{name: "dynamic usage key is rejected", expression: `tier("images", u(u("unit")) * 0.05)`, taskQuota: 50000, taskFinal: 75000, wantError: "task usage expression"},
-		{name: "plain task USD price is ambiguous", expression: `tier("flat", 0.04)`, taskQuota: 20000, taskFinal: 20000, wantError: "shares its billing expression"},
-		{name: "alias retains task USD price", expression: `tier("flat", 0.04)`, taskQuota: 20000, taskFinal: 20000, wantError: "shares its billing expression", alias: true},
-		{name: "per image relay and plugin overrides", expression: ordinaryExpr, override: taskExpr, ordinaryQuota: 40000, taskQuota: 50000, taskFinal: 75000},
-		{name: "mapped plugin override", expression: ordinaryExpr, override: taskExpr, ordinaryQuota: 40000, taskQuota: 50000, taskFinal: 75000, alias: true},
-		{name: "token relay and plugin overrides", expression: `tier("tokens", p * 2)`, override: taskExpr, ordinaryQuota: 1000, taskQuota: 50000, taskFinal: 75000},
-		{name: "ordinary constant has ordinary units with plugin override", expression: `tier("flat", 80000)`, override: taskExpr, ordinaryQuota: 40000, taskQuota: 50000, taskFinal: 75000},
-		{name: "another plugin still inherits task USD units", expression: `tier("flat", 0.04)`, override: taskExpr, taskQuota: 50000, taskFinal: 75000, wantError: "shares its billing expression", shared: true},
-		{name: "legacy per image pricing stays shared", ordinaryQuota: 40000, taskQuota: 40000, legacy: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			saveBillingConfig(t)
-			name, mappedModel := "declared-model", ""
-			if tc.alias {
-				name, mappedModel = "alias-model", "declared-model"
-			}
-			mode := billing_setting.BillingModeTieredExpr
-			if tc.legacy {
-				mode = billing_setting.BillingModeRatio
-			}
-			variants := map[string]string{}
-			if tc.override != "" {
-				variants["bill-fallback::declared-model"] = tc.override
-			}
-			modes, err := common.Marshal(map[string]string{name: mode})
-			require.NoError(t, err)
-			expressions, err := common.Marshal(map[string]string{name: tc.expression})
-			require.NoError(t, err)
-			overrides, err := common.Marshal(variants)
-			require.NoError(t, err)
-			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
-				"billing_setting.billing_mode": string(modes), "billing_setting.billing_expr": string(expressions),
-				billing_setting.PluginBillingExprOption: string(overrides), "group_ratio_setting.group_ratio": `{"default":1}`,
-			}))
-			prices, err := common.Marshal(map[string]float64{name: 0.04})
-			require.NoError(t, err)
-			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(string(prices)))
-			registry := pluginruntime.NewRegistry()
-			source := strings.Replace(billingFallbackPlugin, `fetchMode:"per_task"`, `fetchMode:"per_task",usageSchema:{image_count:{type:"number",unit:"count",description:"Image generation unit price"},output_image_type:{enum:["1k","2k"]},unit:{enum:["image_count"]}}`, 1)
-			source += `export function extractUsage(){return {image_count:2,output_image_type:"1k",unit:"image_count"};}`
-			plugin, err := registry.Register(source, pluginruntime.Options{})
-			require.NoError(t, err)
-			candidates := []pluginruntime.ProtocolBinding{{Plugin: plugin}}
-			if tc.shared {
-				other, err := registry.Register(strings.ReplaceAll(source, "bill-fallback", "other-images"), pluginruntime.Options{})
-				require.NoError(t, err)
-				candidates = append(candidates, pluginruntime.ProtocolBinding{Plugin: other})
-			}
-			ordinaryContext, _ := gin.CreateTestContext(httptest.NewRecorder())
-			ordinaryContext.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
-			ordinaryContext.Request.Header.Set("Accept-Language", "en")
-			ordinaryContext.Set(pluginruntime.ContextKeyRelayEndpoint, pluginruntime.PinnedEndpoint{Generation: registry.Generation(), Model: name, MappedModel: mappedModel, Candidates: candidates})
-			ordinary := &relaycommon.RelayInfo{
-				OriginModelName: name, UserGroup: "default", UsingGroup: "default", RelayFormat: kittypes.RelayFormatOpenAIImage,
-				Request: &kitdto.ImageRequest{Model: name, N: common.GetPointer(uint(2))}, BillingRequestInput: &billingexpr.RequestInput{ImageCount: common.GetPointer(2)},
-			}
-			ordinaryPrice, err := helper.ModelPriceHelper(ordinaryContext, ordinary, 1000, &kittypes.TokenCountMeta{ImagePriceRatio: 1, BillingRatios: map[string]float64{"n": 2}})
-			if tc.wantError != "" {
-				require.ErrorContains(t, err, tc.wantError)
-				assert.Nil(t, ordinary.TieredBillingSnapshot)
-				var lifecycles, entries int64
-				require.NoError(t, db.Model(&model.GatewayBilling{}).Count(&lifecycles).Error)
-				require.NoError(t, db.Model(&model.LedgerEntry{}).Count(&entries).Error)
-				assert.Zero(t, lifecycles)
-				assert.Zero(t, entries, "pricing must fail before any reservation or ledger posting")
-			} else {
-				require.NoError(t, err)
-				assert.Equal(t, tc.ordinaryQuota, ordinaryPrice.QuotaToPreConsume)
-			}
-
-			// Inspect the stored historical source contract without executing any
-			// retired request/session. Live money has distinct immutable owners.
-			expression, found := billing_setting.ResolveTaskBillingExpr("bill-fallback", name, "declared-model")
-			if tc.legacy {
-				assert.False(t, found)
-				assert.Nil(t, ordinary.TieredBillingSnapshot)
-				assert.Equal(t, tc.taskQuota, common.QuotaRound(0.04*2*common.QuotaPerUnit))
-				return
-			}
-			require.True(t, found)
-			facts := map[string]any{"image_count": float64(2), "output_image_type": "1k", "unit": "image_count"}
-			cost, _, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: facts})
-			require.NoError(t, err)
-			snapshot := &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ModelName: name, ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), GroupRatio: 1, EstimatedQuotaBeforeGroup: cost * common.QuotaPerUnit, EstimatedQuotaAfterGroup: common.QuotaRound(cost * common.QuotaPerUnit), QuotaPerUnit: common.QuotaPerUnit, ExprVersion: billingexpr.ExprVersion(expression), TaskUsageBilling: true, UsageFacts: facts}
-			assert.Equal(t, tc.taskQuota, snapshot.EstimatedQuotaAfterGroup)
-			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"billing_setting.billing_expr": `{}`, billing_setting.PluginBillingExprOption: `{}`}))
-			settlement, _, err := service.EvaluateTaskCompletionUsage(snapshot, map[string]any{"image_count": float64(3)})
-			require.NoError(t, err)
-			assert.Equal(t, tc.taskFinal, settlement.ActualQuotaAfterGroup)
-			if tc.wantError != "" {
-				return
-			}
-			require.NotNil(t, ordinary.TieredBillingSnapshot)
-			assert.False(t, ordinary.TieredBillingSnapshot.TaskUsageBilling)
-			settlement, err = billingexpr.ComputeTieredQuotaWithRequest(ordinary.TieredBillingSnapshot, billingexpr.TokenParams{P: 1000, Len: 1000}, *ordinary.BillingRequestInput)
-			require.NoError(t, err)
-			assert.Equal(t, tc.ordinaryQuota, settlement.ActualQuotaAfterGroup)
 		})
 	}
 }

@@ -73,14 +73,12 @@ func checkoutQuoteForTest(t *testing.T, body string) model.CheckoutQuoteResponse
 
 func TestTopUpQuotaValidation(t *testing.T) {
 	useCheckoutControllerDB(t)
-	oldDisplay, oldQuota := operation_setting.GetGeneralSetting().QuotaDisplayType, common.QuotaPerUnit
+	oldDisplay := operation_setting.GetGeneralSetting().QuotaDisplayType
 	t.Cleanup(func() {
 		operation_setting.GetGeneralSetting().QuotaDisplayType = oldDisplay
-		common.QuotaPerUnit = oldQuota
 	})
 	for _, display := range []string{"USD", "CNY", "TOKENS"} {
 		operation_setting.GetGeneralSetting().QuotaDisplayType = display
-		common.QuotaPerUnit = 0
 		quote := checkoutQuoteForTest(t, `{"provider":"epay","payment_method":"alipay","selection":{"kind":"amount","source_amount":{"nanos":"1000000001","currency":"USD"}}}`)
 		assert.Equal(t, money.Amount{Nanos: 1_000_000_001, Currency: "USD"}, quote.CreditAmount)
 		assert.Equal(t, money.Amount{Nanos: 7_310_000_000, Currency: "CNY"}, quote.ChargeAmount)

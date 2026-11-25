@@ -32,11 +32,11 @@ func TestFormatWaffoPancakeAmount_UsesDisplayPriceString(t *testing.T) {
 
 func TestGetWaffoPancakePayMoney(t *testing.T) {
 	useCheckoutControllerDB(t)
-	display, quota, price := operation_setting.GetGeneralSetting().QuotaDisplayType, common.QuotaPerUnit, setting.WaffoPancakeUnitPrice
+	display, price := operation_setting.GetGeneralSetting().QuotaDisplayType, setting.WaffoPancakeUnitPrice
 	t.Cleanup(func() {
-		operation_setting.GetGeneralSetting().QuotaDisplayType, common.QuotaPerUnit, setting.WaffoPancakeUnitPrice = display, quota, price
+		operation_setting.GetGeneralSetting().QuotaDisplayType, setting.WaffoPancakeUnitPrice = display, price
 	})
-	common.QuotaPerUnit, setting.WaffoPancakeUnitPrice = 0, 900
+	setting.WaffoPancakeUnitPrice = 900
 	require.NoError(t, operation_setting.ApplyCheckoutOption(operation_setting.CheckoutConfigOption, `{"providers":{"waffo_pancake":{"enabled":true,"source_unit":{"nanos":"1000000000","currency":"USD"},"charge_unit":{"nanos":"2500000000","currency":"USD"},"minimum":{"nanos":"1","currency":"USD"},"group_ratios":{"vip":"1.2"},"discounts":[{"source_amount":{"nanos":"10000000000","currency":"USD"},"ratio":"0.8"}]}}}`))
 	source := money.Amount{Nanos: 10_000_000_000, Currency: "USD"}
 	for _, display := range []string{"USD", "CNY", "TOKENS"} {

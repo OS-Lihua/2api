@@ -3,7 +3,6 @@ package controller
 import (
 	"testing"
 
-	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -15,9 +14,6 @@ import (
 func TestModelPricingConversionAcceptsDeclaredEndpointArray(t *testing.T) {
 	db := modelManagementDB(t)
 	declareLegacyProviderRoutingColumns(t, db)
-	previousQuota := common.QuotaPerUnit
-	common.QuotaPerUnit = 500000
-	t.Cleanup(func() { common.QuotaPerUnit = previousQuota })
 
 	for _, tc := range []struct {
 		name        string
