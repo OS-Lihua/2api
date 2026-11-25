@@ -23,13 +23,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// gatewayPreparedChat stays in request memory. Route evaluates the same
+// gatewayPreparedRequest stays in request memory. Route evaluates the same
 // effective quantities and probes later sent by the selected candidate.
-type gatewayPreparedChat struct {
+type gatewayPreparedRequest struct {
 	Context   *gin.Context
 	Info      *relaycommon.RelayInfo
 	Adaptor   *relay.ChannelAdaptor
-	Request   *dto.GeneralOpenAIRequest
 	Converted any
 	Encoded   []byte
 	SaleInput billingexpr.RequestInput
@@ -47,7 +46,7 @@ func gatewayProjectionFailure(c *gin.Context, info *relaycommon.RelayInfo, err e
 	return service.ErrGatewayCapability
 }
 
-func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection, original *dto.GeneralOpenAIRequest, native dto.Request, kind protocol.Type, accepted []string, started time.Time, mean int64) (*gatewayPreparedChat, error) {
+func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection, original *dto.GeneralOpenAIRequest, native dto.Request, kind protocol.Type, accepted []string, started time.Time, mean int64) (*gatewayPreparedRequest, error) {
 	candidate := c.Copy()
 	if selection.Provider.Setting != nil && *selection.Provider.Setting != "" {
 		var settings dto.ProviderSettings
@@ -280,25 +279,35 @@ func prepareGatewayChatRoute(c *gin.Context, selection *service.GatewaySelection
 			quality = 1
 		}
 	}
-	return &gatewayPreparedChat{Context: candidate, Info: info, Adaptor: adaptor, Request: request, Converted: converted, Encoded: encoded, SaleInput: saleInput, Usage: usage, Choices: choices,
+	return &gatewayPreparedRequest{Context: candidate, Info: info, Adaptor: adaptor, Converted: converted, Encoded: encoded, SaleInput: saleInput, Usage: usage, Choices: choices,
 		Facts: service.GatewayRouteFacts{Usage: usage, SaleInput: saleInput, PurchaseInput: purchaseInput, Quality: quality, ConversionLosses: losses}}, nil
 }
 
 // Keep the sale declaration in the caller's frozen money lifecycle.
-func gatewayChatRoute(c *gin.Context, run *textGatewayRun, offering *model.ModelOffering, request *dto.GeneralOpenAIRequest, native dto.Request, kind protocol.Type, started time.Time, exclusions *service.GatewayExclusions) (*service.GatewaySelection, *gatewayPreparedChat, error) {
-	mean, err := model.RecentOfferingOutputTokens(c.Request.Context(), offering.ID, started.UnixMilli())
-	if err != nil {
-		return nil, nil, err
+func gatewayChatRoute(c *gin.Context, run *textGatewayRun, offering *model.ModelOffering, request *dto.GeneralOpenAIRequest, native dto.Request, kind protocol.Type, started time.Time, exclusions *service.GatewayExclusions) (*service.GatewaySelection, *gatewayPreparedRequest, error) {
+	var mean int64
+	var err error
+	if request != nil {
+		mean, err = model.RecentOfferingOutputTokens(c.Request.Context(), offering.ID, started.UnixMilli())
+		if err != nil {
+			return nil, nil, err
+		}
 	}
-	prepared := map[int]*gatewayPreparedChat{}
+	prepared := map[int]*gatewayPreparedRequest{}
 	accepted := service.GatewayAcceptedConversionLosses(offering)
 	var conversionFailure *service.GatewayConversionError
 	selection, err := service.SelectGatewayRoute(c, offering, service.GatewayRouteInput{Protocol: kind, AcceptedConversionLosses: accepted, Sale: run.sale, SaleFX: run.saleFX, Ratio: run.ratio, StartedAt: started, Failures: exclusions,
 		Prepare: func(selection *service.GatewaySelection) (*service.GatewayRouteFacts, error) {
-			if !service.GatewayCapabilitiesMatch(request, selection.Capabilities, 0) {
-				return nil, service.ErrGatewayCapability
+			var candidate *gatewayPreparedRequest
+			var err error
+			if request == nil {
+				candidate, err = prepareGatewayEmbeddingRoute(c, selection, native, kind, accepted, started)
+			} else {
+				if !service.GatewayCapabilitiesMatch(request, selection.Capabilities, 0) {
+					return nil, service.ErrGatewayCapability
+				}
+				candidate, err = prepareGatewayChatRoute(c, selection, request, native, kind, accepted, started, mean)
 			}
-			candidate, err := prepareGatewayChatRoute(c, selection, request, native, kind, accepted, started, mean)
 			if err != nil {
 				if errors.As(err, &conversionFailure) {
 					return nil, service.ErrGatewayConversion

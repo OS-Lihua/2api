@@ -9,8 +9,11 @@ import (
 var _ channel.ProviderProtocolComposer = (*Provider)(nil)
 
 func (p *Provider) ComposeProtocol(kind protocol.Type, generic channel.ProtocolHandler) (channel.ProtocolHandler, error) {
+	if kind == protocol.Rerank {
+		return generic, nil
+	}
 	if channel.IsNonTextProtocol(kind) {
-		return channel.ComposeNonTextProtocol(kind, generic, &Protocol{}, protocol.Rerank)
+		return nil, fmt.Errorf("cohere does not support non-text protocol %q", kind)
 	}
 	switch kind {
 	case protocol.OpenAIChat:

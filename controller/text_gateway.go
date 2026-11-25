@@ -84,7 +84,7 @@ func gatewayError(c *gin.Context, status int, code, message string) {
 	case protocol.AnthropicMessages:
 		payload = gin.H{"type": "error", "error": gin.H{"type": code, "message": message}}
 		event = "error"
-	case protocol.GeminiGenerate:
+	case protocol.GeminiGenerate, protocol.GeminiEmbed:
 		googleStatus := "UNAVAILABLE"
 		if status == http.StatusBadRequest {
 			googleStatus = "INVALID_ARGUMENT"
@@ -274,33 +274,55 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	offering := middleware.TextOffering(c)
 	userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
 	kind, pathName := middleware.TextGatewayEndpoint(c.Request.Method, c.Request.URL.Path)
-	format, _ := service.GatewayProtocolFormat(kind)
+	format, _ := kind.RelayFormat()
 	native, err := helper.GetAndValidateRequest(c, format)
 	if err != nil {
 		run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
 		return
 	}
-	if pathName != "" {
+	nonText := kind == protocol.OpenAIEmbeddings || kind == protocol.GeminiEmbed || kind == protocol.Rerank
+	if pathName != "" && !nonText {
 		native.SetModelName(pathName)
 	}
-	if _, chat := native.(*dto.GeneralOpenAIRequest); !chat {
-		if err := service.PrepareGatewayMedia(c, native); err != nil {
+	var request *dto.GeneralOpenAIRequest
+	if nonText {
+		if _, _, err := helper.GatewayEmbeddingInput(native); err != nil {
 			run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
 			return
 		}
+		if pathName != "" {
+			native.SetModelName(pathName)
+		}
+	} else {
+		if _, chat := native.(*dto.GeneralOpenAIRequest); !chat {
+			if err := service.PrepareGatewayMedia(c, native); err != nil {
+				run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
+				return
+			}
+		}
+		projected, err := service.GatewayChatProjection(c, native)
+		if err != nil {
+			run.fail(c, http.StatusBadRequest, "unsupported_parameter", "The request cannot be converted")
+			return
+		}
+		projection := *projected
+		request = &projection
+		request.Stream = common.GetPointer(native.IsStream(c.Request))
+		if pathName != "" {
+			request.Model = pathName
+		}
 	}
-	request, err := service.GatewayChatProjection(c, native)
-	if err != nil {
-		run.fail(c, http.StatusBadRequest, "unsupported_parameter", "The request cannot be converted")
-		return
+	requestedName := pathName
+	if requestedName == "" {
+		var identity struct {
+			Model string `json:"model"`
+		}
+		if common.UnmarshalBodyReusable(c, &identity) != nil || identity.Model == "" {
+			run.fail(c, http.StatusBadRequest, "invalid_request", "Invalid text request")
+			return
+		}
+		requestedName = identity.Model
 	}
-	projection := *request
-	request = &projection
-	request.Stream = common.GetPointer(native.IsStream(c.Request))
-	if pathName != "" {
-		request.Model = pathName
-	}
-	requestedName := request.Model
 	started := c.GetTime(middleware.TextGatewayStartedAtKey)
 	if started.IsZero() {
 		started = clock.Now()
@@ -427,7 +449,6 @@ func runTextGatewayAttempt(c *gin.Context, run *textGatewayRun, budget *service.
 	}
 	common.SetContextKey(c, constant.ContextKeyResponseFacts, info.ResponseFacts)
 	input := preparedChat.SaleInput
-	request = preparedChat.Request
 	adaptor, converted, encoded := preparedChat.Adaptor, preparedChat.Converted, preparedChat.Encoded
 	estimatedInput, estimatedUsage, choiceCount := selection.InputTokens, preparedChat.Usage, preparedChat.Choices
 	info.ResponseFacts.ExpectedChoices = choiceCount

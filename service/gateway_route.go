@@ -187,6 +187,18 @@ func SelectGatewayRoute(c *gin.Context, offering *model.ModelOffering, input Gat
 				lastStage = max(lastStage, 2)
 				continue
 			}
+			protocolMatch := true
+			switch input.Protocol {
+			case protocol.OpenAIEmbeddings, protocol.GeminiEmbed:
+				protocolMatch = candidate.Protocol == protocol.OpenAIEmbeddings || candidate.Protocol == protocol.GeminiEmbed
+			case protocol.Rerank:
+				protocolMatch = candidate.Protocol == protocol.Rerank
+			}
+			if !protocolMatch {
+				reject(candidate.ID, "protocol")
+				lastStage = max(lastStage, 4)
+				continue
+			}
 			active = append(active, &GatewaySelection{Channel: candidate, Provider: provider, Tier: tier})
 		}
 		hasClosed := slices.ContainsFunc(active, func(selection *GatewaySelection) bool {

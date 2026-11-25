@@ -9,8 +9,8 @@ import (
 var _ channel.ProviderProtocolComposer = (*Provider)(nil)
 
 func (p *Provider) ComposeProtocol(kind protocol.Type, generic channel.ProtocolHandler) (channel.ProtocolHandler, error) {
-	if channel.IsNonTextProtocol(kind) {
-		return channel.ComposeNonTextProtocol(kind, generic, &Protocol{}, protocol.OpenAIEmbeddings, protocol.Rerank)
+	if kind == protocol.OpenAIEmbeddings || kind == protocol.Rerank {
+		return &channel.WireProtocol{Kind: kind, Public: generic, Wire: &Protocol{}, SupportsCrossProtocol: kind == protocol.OpenAIEmbeddings, PublicResponse: true}, nil
 	}
 	return nil, fmt.Errorf("jina does not serve text protocol %q", kind)
 }

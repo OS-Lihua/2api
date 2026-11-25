@@ -74,8 +74,8 @@ func resolveOffering(c *gin.Context, name string) {
 	c.Next()
 }
 
-// TextGatewayEndpoint identifies only the four stateless HTTP text operations.
-// Gemini carries the offering name in its URL; the other protocols use JSON.
+// TextGatewayEndpoint identifies stateless text, embedding and rerank operations.
+// Gemini and the legacy engine URL carry the offering name in the path.
 func TextGatewayEndpoint(method, path string) (protocol.Type, string) {
 	if method != http.MethodPost {
 		return "", ""
@@ -87,12 +87,29 @@ func TextGatewayEndpoint(method, path string) (protocol.Type, string) {
 		return protocol.OpenAIResponses, ""
 	case "/v1/messages":
 		return protocol.AnthropicMessages, ""
+	case "/v1/embeddings":
+		return protocol.OpenAIEmbeddings, ""
+	case "/v1/rerank":
+		return protocol.Rerank, ""
+	}
+	if engine, found := strings.CutPrefix(path, "/v1/engines/"); found {
+		if name, found := strings.CutSuffix(engine, "/embeddings"); found && name != "" && !strings.Contains(name, "/") {
+			return protocol.OpenAIEmbeddings, name
+		}
 	}
 	for _, prefix := range []string{"/v1beta/models/", "/v1/models/"} {
 		if modelAction, ok := strings.CutPrefix(path, prefix); ok {
-			for _, action := range []string{"generateContent", "streamGenerateContent"} {
-				if name, found := strings.CutSuffix(modelAction, ":"+action); found && name != "" {
-					return protocol.GeminiGenerate, name
+			for _, action := range []struct {
+				name string
+				kind protocol.Type
+			}{
+				{"generateContent", protocol.GeminiGenerate},
+				{"streamGenerateContent", protocol.GeminiGenerate},
+				{"embedContent", protocol.GeminiEmbed},
+				{"batchEmbedContents", protocol.GeminiEmbed},
+			} {
+				if name, found := strings.CutSuffix(modelAction, ":"+action.name); found && name != "" {
+					return action.kind, name
 				}
 			}
 		}

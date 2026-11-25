@@ -4,11 +4,9 @@ package nontextprotocol
 
 import (
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
-	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/protocol"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/gemini"
@@ -16,7 +14,6 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
-	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
 
@@ -172,53 +169,8 @@ func geminiEmbeddingToOpenAI(info *relaycommon.RelayInfo, request any) (any, err
 func (p *Handler) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
 	info.FinalRequestRelayFormat, _ = channel.ProtocolRelayFormat(p.kind)
 	info.UpstreamProtocol = p.kind
-	if p.kind == protocol.GeminiEmbed {
-		return geminiEmbeddingResponse(c, resp, info)
-	}
-	if p.kind == protocol.OpenAIEmbeddings && info.RelayFormat == types.RelayFormatGemini {
-		return openAIEmbeddingToGemini(c, resp, info)
+	if p.kind == protocol.GeminiEmbed || p.kind == protocol.OpenAIEmbeddings && (info.ResponseFacts != nil || info.RelayFormat == types.RelayFormatGemini) {
+		return embeddingResponse(c, resp, info, p.kind)
 	}
 	return p.openai.DoResponse(c, resp, info)
-}
-
-func openAIEmbeddingToGemini(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
-	}
-	var response struct {
-		Data  []dto.OpenAIEmbeddingResponseItem `json:"data"`
-		Usage *dto.Usage                        `json:"usage"`
-	}
-	if err = common.Unmarshal(body, &response); err != nil {
-		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
-	}
-	if len(response.Data) == 0 {
-		return nil, types.NewError(fmt.Errorf("empty embedding response"), types.ErrorCodeBadResponseBody)
-	}
-	usage := response.Usage
-	if usage == nil {
-		usage = service.ResponseText2Usage(c, "", info.UpstreamModelName, info.GetEstimatePromptTokens())
-	}
-	var metadata *dto.GeminiEmbeddingUsageMetadata
-	if response.Usage != nil {
-		metadata = &dto.GeminiEmbeddingUsageMetadata{PromptTokenCount: usage.PromptTokens}
-	}
-	var result any
-	if info.IsGeminiBatchEmbedding {
-		embeddings := make([]*dto.ContentEmbedding, 0, len(response.Data))
-		for _, item := range response.Data {
-			embeddings = append(embeddings, &dto.ContentEmbedding{Values: item.Embedding})
-		}
-		result = dto.GeminiBatchEmbeddingResponse{Embeddings: embeddings, UsageMetadata: metadata}
-	} else {
-		result = dto.GeminiEmbeddingResponse{Embedding: dto.ContentEmbedding{Values: response.Data[0].Embedding}, UsageMetadata: metadata}
-	}
-	body, err = common.Marshal(result)
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
-	}
-	service.IOCopyBytesGracefully(c, resp, body)
-	return usage, nil
 }
