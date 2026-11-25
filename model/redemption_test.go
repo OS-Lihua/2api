@@ -242,6 +242,8 @@ func TestRedeemRejectsUnavailableCreditsWithoutConsumingCode(t *testing.T) {
 func TestRedeemPreservesLegacyCacheAndCannotReplayResetStatus(t *testing.T) {
 	userID, key := setupRedeemFixture(t, 1)
 	useUserCacheMiniRedis(t)
+	// This test checks cache preservation, not expiry. Redeem can sleep for up to three seconds.
+	common.SyncFrequency = 60
 	var user User
 	require.NoError(t, DB.First(&user, userID).Error)
 	require.NoError(t, populateUserCache(user))
