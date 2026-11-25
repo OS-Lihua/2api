@@ -490,6 +490,51 @@ func TestLegacyModelPricingOptionWritesAreRetired(t *testing.T) {
 	}
 }
 
+func TestLegacyCheckoutOptionsAreMigrationOnly(t *testing.T) {
+	db := modelManagementDB(t)
+	legacy := []model.Option{
+		{Key: "TopupGroupRatio", Value: `{"vip":1.000000000000000001}`},
+		{Key: "payment_setting.amount_options", Value: `[11,23]`},
+		{Key: "payment_setting.amount_discount", Value: `{"11":0.900000000000000001}`},
+	}
+	require.NoError(t, db.Create(&legacy).Error)
+	const complianceKey = "payment_setting.compliance_confirmed"
+	common.OptionMapRWMutex.Lock()
+	for _, option := range legacy {
+		common.OptionMap[option.Key] = option.Value
+	}
+	common.OptionMap[complianceKey] = "true"
+	common.OptionMapRWMutex.Unlock()
+
+	var list struct {
+		Success bool
+		Data    []model.Option
+	}
+	response := modelManagementRequest(t, GetOptions, http.MethodGet, "/api/option/", nil, &list)
+	require.Equal(t, http.StatusOK, response.Code)
+	require.True(t, list.Success)
+	listed := make(map[string]string, len(list.Data))
+	for _, option := range list.Data {
+		listed[option.Key] = option.Value
+	}
+	assert.Equal(t, "true", listed[complianceKey])
+	for _, option := range legacy {
+		assert.NotContains(t, listed, option.Key)
+		for _, spelling := range []string{option.Key, strings.ToUpper(option.Key)} {
+			var result struct{ Code string }
+			response := modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", OptionUpdateRequest{Key: spelling, Value: `{}`}, &result)
+			assert.Equal(t, http.StatusGone, response.Code, spelling)
+			assert.Equal(t, "no-store", response.Header().Get("Cache-Control"), spelling)
+			assert.Equal(t, "legacy_checkout_settings_retired", result.Code, spelling)
+			assert.Error(t, model.UpdateOption(spelling, `{}`), spelling)
+			assert.Error(t, model.UpdateOptionsBulk(map[string]string{spelling: `{}`, "TopUpLink": "https://example.invalid/changed"}), spelling)
+		}
+	}
+	var rows []model.Option
+	require.NoError(t, db.Find(&rows).Error)
+	assert.ElementsMatch(t, legacy, rows)
+}
+
 func TestLegacyModelPricingReloadPreservesSourceWithoutApplyingSettings(t *testing.T) {
 	db := modelManagementDB(t)
 	previousOptions := config.GlobalConfig.ExportAllConfigs()

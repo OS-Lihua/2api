@@ -42,7 +42,7 @@ func GetOptions(c *gin.Context) {
 	var options []*model.Option
 	common.OptionMapRWMutex.RLock()
 	for k, v := range common.OptionMap {
-		if k == "theme.frontend" || k == "ResendKeyConfigured" || k == "CompletionRatioMeta" || model.IsRetiredModelPricingOption(k) || model.IsRetiredChannelMaintenanceOption(k) || operation_setting.IsRetiredQuotaOption(k) || isRetiredQuotaReminderOption(k) || model.IsRetiredStatisticsOption(k) || model.IsRetiredAutoGroupOption(k) || model_setting.IsRetiredViolationFeeOption(k) {
+		if k == "theme.frontend" || k == "ResendKeyConfigured" || k == "CompletionRatioMeta" || model.IsRetiredModelPricingOption(k) || model.IsRetiredChannelMaintenanceOption(k) || operation_setting.IsRetiredQuotaOption(k) || isRetiredQuotaReminderOption(k) || model.IsRetiredStatisticsOption(k) || model.IsRetiredAutoGroupOption(k) || model_setting.IsRetiredViolationFeeOption(k) || operation_setting.IsRetiredCheckoutOption(k) {
 			continue
 		}
 		value := common.Interface2String(v)
@@ -131,6 +131,11 @@ func UpdateOption(c *gin.Context) {
 	if operation_setting.IsRetiredQuotaOption(identity.Key) {
 		c.Header("Cache-Control", "no-store")
 		common.ApiErrorStatus(c, http.StatusGone, common.NewMessage(operation_setting.RetiredQuotaSettingsMessage), gin.H{"code": "legacy_quota_settings_retired"})
+		return
+	}
+	if operation_setting.IsRetiredCheckoutOption(identity.Key) {
+		c.Header("Cache-Control", "no-store")
+		common.ApiErrorStatus(c, http.StatusGone, common.NewMessage(operation_setting.RetiredCheckoutSettingsMessage), gin.H{"code": "legacy_checkout_settings_retired"})
 		return
 	}
 	if model.IsRetiredStatisticsOption(identity.Key) {

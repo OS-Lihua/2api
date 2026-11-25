@@ -8174,6 +8174,7 @@
     "Legacy missing-model discovery has been retired. Use Models and metadata sync.": "旧式の不足モデル検出は廃止されました。モデル管理とメタデータ同期を使用してください。",
     "Legacy statistics collection settings have been retired.": "旧式の統計データ収集設定は廃止されました。",
     "Legacy automatic routing group settings have been retired.": "旧式の自動グループルーティング設定は廃止されました。",
+    "Legacy top-up settings have been retired. Use the checkout settings instead.": "旧式のチャージ設定は廃止されました。決済設定を使用してください。",
     "Legacy violation fee settings have been retired.": "旧式の違反手数料設定は廃止されました。",
     "Current PriceVersion diagnostics": "現在の価格バージョンの診断",
     "Checks the current running plugin and visible price owners, not the selected historical version.": "選択した過去のバージョンではなく、現在稼働中のプラグインと閲覧可能な価格対象を確認します。",

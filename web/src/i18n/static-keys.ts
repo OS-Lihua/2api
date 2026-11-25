@@ -1100,6 +1100,7 @@ export const STATIC_I18N_KEYS = [
   'Legacy quota reservation settings have been retired.',
   'Legacy statistics collection settings have been retired.',
   'Legacy automatic routing group settings have been retired.',
+  'Legacy top-up settings have been retired. Use the checkout settings instead.',
   'Legacy violation fee settings have been retired.',
   'The setting for unpriced models has been retired.',
   'Legacy model-channel removal has been retired. Manage Channels by Model ID instead.',

@@ -11,7 +11,19 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-const CheckoutConfigOption = "checkout_setting.config"
+const (
+	CheckoutConfigOption           = "checkout_setting.config"
+	LegacyTopupGroupRatioOption    = "TopupGroupRatio"
+	LegacyCheckoutPresetsOption    = "payment_setting.amount_options"
+	LegacyCheckoutDiscountsOption  = "payment_setting.amount_discount"
+	RetiredCheckoutSettingsMessage = "Legacy top-up settings have been retired. Use the checkout settings instead."
+)
+
+func IsRetiredCheckoutOption(key string) bool {
+	return strings.EqualFold(key, LegacyTopupGroupRatioOption) ||
+		strings.EqualFold(key, LegacyCheckoutPresetsOption) ||
+		strings.EqualFold(key, LegacyCheckoutDiscountsOption)
+}
 
 var CheckoutProviders = []string{"epay", "stripe", "creem", "waffo", "waffo_pancake"}
 

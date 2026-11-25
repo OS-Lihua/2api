@@ -8174,6 +8174,7 @@
     "Legacy missing-model discovery has been retired. Use Models and metadata sync.": "Cơ chế phát hiện mô hình còn thiếu cũ đã ngừng hoạt động. Hãy sử dụng quản lý mô hình và đồng bộ siêu dữ liệu.",
     "Legacy statistics collection settings have been retired.": "Các cài đặt thu thập thống kê cũ đã ngừng hoạt động.",
     "Legacy automatic routing group settings have been retired.": "Các cài đặt định tuyến tự động theo nhóm cũ đã ngừng hoạt động.",
+    "Legacy top-up settings have been retired. Use the checkout settings instead.": "Các cài đặt nạp tiền cũ đã ngừng hoạt động. Hãy dùng phần cài đặt thanh toán.",
     "Legacy violation fee settings have been retired.": "Các cài đặt phí vi phạm cũ đã ngừng hoạt động.",
     "Current PriceVersion diagnostics": "Chẩn đoán phiên bản giá hiện tại",
     "Checks the current running plugin and visible price owners, not the selected historical version.": "Kiểm tra plugin đang chạy và các đối tượng định giá có thể xem, không phải phiên bản lịch sử đã chọn.",

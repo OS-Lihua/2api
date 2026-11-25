@@ -8174,6 +8174,7 @@
     "Legacy missing-model discovery has been retired. Use Models and metadata sync.": "L’ancienne détection des modèles manquants a été retirée. Utilisez la gestion des modèles et la synchronisation des métadonnées.",
     "Legacy statistics collection settings have been retired.": "Les anciens paramètres de collecte des statistiques ont été retirés.",
     "Legacy automatic routing group settings have been retired.": "Les anciens paramètres de routage automatique par groupe ont été retirés.",
+    "Legacy top-up settings have been retired. Use the checkout settings instead.": "Les anciens paramètres de recharge ont été retirés. Utilisez les paramètres de paiement.",
     "Legacy violation fee settings have been retired.": "Les anciens paramètres de frais pour infraction ont été retirés.",
     "Current PriceVersion diagnostics": "Diagnostic des versions tarifaires actuelles",
     "Checks the current running plugin and visible price owners, not the selected historical version.": "Vérifie le plugin actuellement exécuté et les entités tarifées visibles, et non la version historique sélectionnée.",

@@ -155,7 +155,6 @@ func InitOptionMap() {
 	common.OptionMap["WaffoPancakeMinTopUp"] = strconv.Itoa(setting.WaffoPancakeMinTopUp)
 	common.OptionMap["WaffoPancakeStoreID"] = setting.WaffoPancakeStoreID
 	common.OptionMap["WaffoPancakeProductID"] = setting.WaffoPancakeProductID
-	common.OptionMap["TopupGroupRatio"] = common.TopupGroupRatio2JSONString()
 	common.OptionMap["Chats"] = setting.Chats2JsonString()
 	common.OptionMap["PayMethods"] = operation_setting.PayMethods2JsonString()
 	common.OptionMap["GitHubClientId"] = ""
@@ -267,6 +266,9 @@ func validateOptionValue(key string, value string) error {
 	}
 	if operation_setting.IsRetiredQuotaOption(key) {
 		return common.NewMessage(operation_setting.RetiredQuotaSettingsMessage)
+	}
+	if operation_setting.IsRetiredCheckoutOption(key) {
+		return common.NewMessage(operation_setting.RetiredCheckoutSettingsMessage)
 	}
 	if IsRetiredChannelMaintenanceOption(key) {
 		return common.NewMessage("Legacy Channel management has been retired. Use the Provider and Channel APIs instead.")
@@ -435,7 +437,8 @@ func updateOptionMap(key string, value string) (err error) {
 	if err := setting.ValidateGatewayBudgetOption(key, value); err != nil {
 		return err
 	}
-	if key == retiredThemeOptionKey || key == legacyAccessTokenRetireAtKey {
+	// Checkout migration reads retired top-up settings directly from the database.
+	if key == retiredThemeOptionKey || key == legacyAccessTokenRetireAtKey || operation_setting.IsRetiredCheckoutOption(key) {
 		common.OptionMapRWMutex.Lock()
 		delete(common.OptionMap, key)
 		common.OptionMapRWMutex.Unlock()
@@ -694,8 +697,6 @@ func updateOptionMap(key string, value string) (err error) {
 		setting.WaffoPancakeUnitPrice, _ = strconv.ParseFloat(value, 64)
 	case "WaffoPancakeMinTopUp":
 		setting.WaffoPancakeMinTopUp, _ = strconv.Atoi(value)
-	case "TopupGroupRatio":
-		err = common.UpdateTopupGroupRatioByJSONString(value)
 	case "GitHubClientId":
 		common.GitHubClientId = value
 	case "GitHubClientSecret":

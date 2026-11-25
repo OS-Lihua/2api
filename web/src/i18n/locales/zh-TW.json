@@ -8174,6 +8174,7 @@
     "Legacy missing-model discovery has been retired. Use Models and metadata sync.": "舊版缺失模型探索已退役。請使用模型管理與中繼資料同步。",
     "Legacy statistics collection settings have been retired.": "舊版統計資料收集設定已退役。",
     "Legacy automatic routing group settings have been retired.": "舊版自動分組路由設定已退役。",
+    "Legacy top-up settings have been retired. Use the checkout settings instead.": "舊版儲值設定已退役。請使用收款設定。",
     "Legacy violation fee settings have been retired.": "舊版違規扣減設定已退役。",
     "Current PriceVersion diagnostics": "目前價格版本診斷",
     "Checks the current running plugin and visible price owners, not the selected historical version.": "檢查目前執行的外掛與可見的定價對象，而非選取的歷史版本。",

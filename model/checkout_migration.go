@@ -67,7 +67,7 @@ func migrateCheckoutConfig(tx *gorm.DB) error {
 		return err
 	}
 	var options []Option
-	if err := tx.Where(`"key" IN ?`, []string{operation_setting.CheckoutConfigOption, "general_setting.quota_display_type", "DisplayInCurrencyEnabled", "TopupGroupRatio", "payment_setting.amount_options", "payment_setting.amount_discount", "StripePriceId", "CreemProducts", "WaffoCurrency", "WaffoUnitPrice", "WaffoMinTopUp", "WaffoEnabled", "WaffoPancakeUnitPrice", "WaffoPancakeMinTopUp"}).Find(&options).Error; err != nil {
+	if err := tx.Where(`"key" IN ?`, []string{operation_setting.CheckoutConfigOption, "general_setting.quota_display_type", "DisplayInCurrencyEnabled", operation_setting.LegacyTopupGroupRatioOption, operation_setting.LegacyCheckoutPresetsOption, operation_setting.LegacyCheckoutDiscountsOption, "StripePriceId", "CreemProducts", "WaffoCurrency", "WaffoUnitPrice", "WaffoMinTopUp", "WaffoEnabled", "WaffoPancakeUnitPrice", "WaffoPancakeMinTopUp"}).Find(&options).Error; err != nil {
 		return err
 	}
 	stored := map[string]string{}
@@ -103,7 +103,7 @@ func migrateCheckoutConfig(tx *gorm.DB) error {
 		ratios := map[string]string{}
 		var rawRatios map[string]json.RawMessage
 		ratiosValid := true
-		if text := stored["TopupGroupRatio"]; text != "" {
+		if text := stored[operation_setting.LegacyTopupGroupRatioOption]; text != "" {
 			if common.UnmarshalJsonStr(text, &rawRatios) != nil {
 				ratiosValid = false
 			}
@@ -212,7 +212,7 @@ func legacyCheckoutAmount(text string, currency money.Currency) (money.Amount, e
 
 func importCheckoutPresets(stored map[string]string, provider *operation_setting.CheckoutProvider) error {
 	var presets []int64
-	if text := stored["payment_setting.amount_options"]; text != "" {
+	if text := stored[operation_setting.LegacyCheckoutPresetsOption]; text != "" {
 		if err := common.UnmarshalJsonStr(text, &presets); err != nil {
 			return err
 		}
@@ -229,7 +229,7 @@ func importCheckoutPresets(stored map[string]string, provider *operation_setting
 		}
 	}
 	var discounts map[string]json.RawMessage
-	if text := stored["payment_setting.amount_discount"]; text != "" {
+	if text := stored[operation_setting.LegacyCheckoutDiscountsOption]; text != "" {
 		if err := common.UnmarshalJsonStr(text, &discounts); err != nil {
 			return err
 		}
