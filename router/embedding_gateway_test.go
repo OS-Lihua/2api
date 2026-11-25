@@ -460,21 +460,30 @@ func TestEmbeddingGatewayAuthorizesBeforeParsingEveryEntrypoint(t *testing.T) {
 }
 
 func TestEmbeddingGatewayFiltersProtocolMismatchBeforeDispatch(t *testing.T) {
-	for _, kind := range []protocol.Type{protocol.OpenAIEmbeddings, protocol.Rerank} {
-		t.Run(string(kind), func(t *testing.T) {
+	for _, test := range []struct {
+		requested protocol.Type
+		rejected  protocol.Type
+	}{
+		{protocol.OpenAIEmbeddings, protocol.OpenAIChat},
+		{protocol.OpenAIEmbeddings, protocol.Rerank},
+		{protocol.Rerank, protocol.OpenAIChat},
+		{protocol.Rerank, protocol.OpenAIEmbeddings},
+	} {
+		t.Run(string(test.requested)+"/rejects_"+string(test.rejected), func(t *testing.T) {
 			var rejectedCalls atomic.Int32
 			fixture := newTextGatewayFixture(t, func(w http.ResponseWriter, r *http.Request) { rejectedCalls.Add(1) })
+			require.NoError(t, model.DB.Model(fixture.channel).Update("protocol", test.rejected).Error)
 			compatible := addTextGatewayChannel(t, fixture, func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
-				if kind == protocol.Rerank {
+				if test.requested == protocol.Rerank {
 					_, _ = io.WriteString(w, `{"results":[{"index":0,"relevance_score":0.9}],"usage":{"total_tokens":12}}`)
 				} else {
 					_, _ = io.WriteString(w, `{"data":[{"index":0,"embedding":[0.1,0.2]}],"usage":{"prompt_tokens":12}}`)
 				}
 			})
-			require.NoError(t, model.DB.Model(compatible).Update("protocol", kind).Error)
+			require.NoError(t, model.DB.Model(compatible).Update("protocol", test.requested).Error)
 			path, body := "/v1/embeddings", `{"model":"gateway-alias","input":"bird"}`
-			if kind == protocol.Rerank {
+			if test.requested == protocol.Rerank {
 				path, body = "/v1/rerank", `{"model":"gateway-alias","query":"bird","documents":["bird"]}`
 			}
 			response := adminSecurityRequest(fixture.engine, fixture.token.Key, http.MethodPost, path, body)
@@ -484,9 +493,9 @@ func TestEmbeddingGatewayFiltersProtocolMismatchBeforeDispatch(t *testing.T) {
 			require.NoError(t, err)
 			require.EqualValues(t, 1, total)
 			assert.Equal(t, compatible.ID, attempts[0].ChannelID)
-			diagnostics, err := common.Marshal(attempts[0].RouteDiagnostics)
+			excludedCounts, err := common.Marshal(attempts[0].RouteDiagnostics["excluded_counts"])
 			require.NoError(t, err)
-			assert.Contains(t, string(diagnostics), `"protocol":1`)
+			assert.JSONEq(t, `{"protocol":1}`, string(excludedCounts))
 		})
 	}
 }
