@@ -29,8 +29,6 @@ import (
 	"gorm.io/gorm"
 )
 
-const legacyTaskFixtureUnitsPerUSD = 500_000
-
 func setupRelayChannelDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	previousDB := model.DB
@@ -437,20 +435,18 @@ export function extractUsage(){return {old_units:2};}
 				assert.NotContains(t, schema, "old_units")
 				assert.False(t, billing_setting.TaskExprCompatible(expression, schema))
 			}
-			// Preserve a persisted legacy expression even if the current plugin
-			// profile has narrowed. This evaluator must not mutate any funds.
-			snapshot := &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ModelName: "alias-model", ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), GroupRatio: 1, QuotaPerUnit: legacyTaskFixtureUnitsPerUSD, ExprVersion: billingexpr.ExprVersion(expression), TaskUsageBilling: true, UsageFacts: map[string]any{"old_units": float64(2)}}
-			assert.Equal(t, billingexpr.ExprHashString(testCase.wantExpr), snapshot.ExprHash)
-			result, _, err := service.EvaluateTaskCompletionUsage(snapshot, map[string]any{"old_units": float64(2)})
+			// The imported expression remains evaluable when the plugin profile narrows.
+			input := billingexpr.MoneyInput{TaskUsage: true, Request: billingexpr.RequestInput{Usage: map[string]any{"old_units": float64(2)}}}
+			amount, _, err := billingexpr.RunMoneyExpr(expression, input, "USD")
 			require.NoError(t, err)
-			want := int(2 * legacyTaskFixtureUnitsPerUSD)
-			if expression == tailExpr {
-				want = int(3 * legacyTaskFixtureUnitsPerUSD)
+			want := "2 USD"
+			switch expression {
+			case tailExpr:
+				want = "3 USD"
+			case legacyExpr:
+				want = "4 USD"
 			}
-			if expression == legacyExpr {
-				want = int(4 * legacyTaskFixtureUnitsPerUSD)
-			}
-			assert.Equal(t, want, result.ActualQuotaAfterGroup)
+			assert.Equal(t, want, amount.String())
 		})
 	}
 }
@@ -521,19 +517,12 @@ func TestSharedTaskBillingExpressionSelectionAndFrozenSettlement(t *testing.T) {
 			if tc.plugin == "billing-beta" {
 				field = "credits"
 			}
-			facts := map[string]any{field: float64(2)}
-			cost, _, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: facts})
-			require.NoError(t, err)
-			// A released task stored this complete snapshot. Replaying it must
-			// remain independent of current options and plugin schemas.
-			snapshot := &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ModelName: tc.model, ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), GroupRatio: 1, EstimatedQuotaBeforeGroup: cost * legacyTaskFixtureUnitsPerUSD, EstimatedQuotaAfterGroup: common.QuotaRound(cost * legacyTaskFixtureUnitsPerUSD), QuotaPerUnit: legacyTaskFixtureUnitsPerUSD, ExprVersion: billingexpr.ExprVersion(expression), TaskUsageBilling: true, UsageFacts: facts}
+			input := billingexpr.MoneyInput{TaskUsage: true, Request: billingexpr.RequestInput{Usage: map[string]any{field: float64(4)}}}
 			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: `{}`, "billing_setting.billing_expr": `{}`}))
-			result, usage, err := service.EvaluateTaskCompletionUsage(snapshot, map[string]any{field: float64(4)})
+			amount, _, err := billingexpr.RunMoneyExpr(expression, input, "USD")
 			require.NoError(t, err)
-			assert.Equal(t, float64(4), usage[field])
-			assert.Equal(t, float64(2), snapshot.UsageFacts[field])
-			assert.Equal(t, 2*snapshot.EstimatedQuotaAfterGroup, result.ActualQuotaAfterGroup)
-			assert.Equal(t, tc.wantExpr, snapshot.ExprString)
+			want := map[string]string{baseExpr: "8 USD", alphaExpr: "12 USD", betaExpr: "20 USD", aliasExpr: "28 USD"}
+			assert.Equal(t, want[tc.wantExpr], amount.String())
 		})
 	}
 }

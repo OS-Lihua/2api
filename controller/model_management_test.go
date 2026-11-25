@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -29,6 +30,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -180,6 +182,13 @@ func modelManagementSales(t *testing.T, db *gorm.DB) []SaleCatalogOffering {
 func TestModelPricingConversionDatabase(t *testing.T) {
 	db := modelManagementDB(t)
 	declareLegacyProviderRoutingColumns(t, db)
+	priceAmount := func(t *testing.T, expression string, usage *dto.Usage, input billingexpr.RequestInput, actualImages ...int) string {
+		t.Helper()
+		price := &model.PriceVersion{Expression: expression, Currency: "USD"}
+		amount, _, _, err := service.GatewayPrice(price, usage, input, time.Time{}, decimal.NewFromInt(1), nil, actualImages...)
+		require.NoError(t, err)
+		return amount.String()
+	}
 	// These are legacy conversion sources, not account API mutations.
 	insertLegacyProvider := func(t *testing.T, provider *model.Provider) {
 		t.Helper()
@@ -256,27 +265,17 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 					{PromptTokens: 1000, CompletionTokens: 100, UsageSemantic: "openai", PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 200, CachedCreationTokens: 50, ImageTokens: 300}},
 					{PromptTokens: 750, CompletionTokens: 100, UsageSemantic: "anthropic", ClaudeCacheCreation5mTokens: 50, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 200, CachedCreationTokens: 50}},
 				} {
-					tokens := service.BuildTieredTokenParams(&usage, usage.UsageSemantic == "anthropic", billingexpr.UsedVars(converted.Expression))
-					cost, _, err := billingexpr.RunExpr(converted.Expression, tokens)
-					require.NoError(t, err)
-					assert.Equal(t, float64(750), tokens.P)
-					assert.Equal(t, 3997.5, cost, "image input must remain billed exactly once")
+					assert.Equal(t, "0.0039975 USD", priceAmount(t, converted.Expression, &usage, billingexpr.RequestInput{}), "image input must remain billed exactly once")
 				}
 				usage := dto.Usage{PromptTokens: 750, CompletionTokens: 100, UsageSemantic: "anthropic", ClaudeCacheCreation5mTokens: 30, ClaudeCacheCreation1hTokens: 20, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 200, CachedCreationTokens: 50}}
-				tokens := service.BuildTieredTokenParams(&usage, true, billingexpr.UsedVars(converted.Expression))
-				cost, _, err := billingexpr.RunExpr(converted.Expression, tokens)
-				require.NoError(t, err)
-				assert.Equal(t, 4042.5, cost, "mixed TTLs preserve both legacy cache-write prices")
+				assert.Equal(t, "0.0040425 USD", priceAmount(t, converted.Expression, &usage, billingexpr.RequestInput{}), "mixed TTLs preserve both legacy cache-write prices")
 			}
 			if tc.name == "deepseek-chat" {
 				for _, usage := range []dto.Usage{
 					{PromptTokens: 1000, CompletionTokens: 100, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 200}},
 					{PromptTokens: 800, CompletionTokens: 100, UsageSemantic: "anthropic", PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 200}},
 				} {
-					tokens := service.BuildTieredTokenParams(&usage, usage.UsageSemantic == "anthropic", billingexpr.UsedVars(converted.Expression))
-					cost, _, err := billingexpr.RunExpr(converted.Expression, tokens)
-					require.NoError(t, err)
-					assert.Equal(t, 256.5, cost, "cache reads remain billed across both response formats")
+					assert.Equal(t, "0.0002565 USD", priceAmount(t, converted.Expression, &usage, billingexpr.RequestInput{}), "cache reads remain billed across both response formats")
 				}
 			}
 			assert.Equal(t, before, modelManagementOptions(t, db), "captured preview must not write historical options")
@@ -376,28 +375,22 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 
 	t.Run("same_price_cache_reads_preserve_overlapping_categories", func(t *testing.T) {
 		for _, tc := range []struct {
-			field, term             string
-			ratio                   float64
-			details                 dto.InputTokenDetails
-			cost, unpricedCacheCost float64
+			field, term            string
+			ratio                  float64
+			details                dto.InputTokenDetails
+			amount, unpricedAmount string
 		}{
-			{"CreateCacheRatio", "cc * 75", 1.25, dto.InputTokenDetails{CachedTokens: 800, CacheWriteTokens: 500}, 97500, 79500},
-			{"ImageRatio", "img * 120", 2, dto.InputTokenDetails{CachedTokens: 600, ImageTokens: 500}, 108000, 102000},
+			{"CreateCacheRatio", "cc * 75", 1.25, dto.InputTokenDetails{CachedTokens: 800, CacheWriteTokens: 500}, "0.0975 USD", "0.0795 USD"},
+			{"ImageRatio", "img * 120", 2, dto.InputTokenDetails{CachedTokens: 600, ImageTokens: 500}, "0.108 USD", "0.102 USD"},
 		} {
 			t.Run(tc.field, func(t *testing.T) {
 				converted, err := legacyPricingSource(t, db).Preview("overlapping-cache", model.PricingValues{"ModelRatio": 30.0, "CompletionRatio": 2.0, "CacheRatio": 1.0, tc.field: tc.ratio})
 				require.NoError(t, err)
 				assert.Equal(t, `tier("base", p * 60 + c * 120 + cr * 60 + `+tc.term+`)`, converted.Expression)
 				usage := dto.Usage{PromptTokens: 1000, CompletionTokens: 100, PromptTokensDetails: tc.details}
-				params := service.BuildTieredTokenParams(&usage, false, billingexpr.UsedVars(converted.Expression))
-				cost, _, err := billingexpr.RunExpr(converted.Expression, params)
-				require.NoError(t, err)
-				assert.Equal(t, tc.cost, cost, "preserve the existing overlapping-category charge")
+				assert.Equal(t, tc.amount, priceAmount(t, converted.Expression, &usage, billingexpr.RequestInput{}), "preserve the existing overlapping-category charge")
 				unpriced := `tier("base", p * 60 + c * 120 + ` + tc.term + `)`
-				params = service.BuildTieredTokenParams(&usage, false, billingexpr.UsedVars(unpriced))
-				cost, _, err = billingexpr.RunExpr(unpriced, params)
-				require.NoError(t, err)
-				assert.Equal(t, tc.unpricedCacheCost, cost, "existing expressions without cr retain their OpenAI normalization")
+				assert.Equal(t, tc.unpricedAmount, priceAmount(t, unpriced, &usage, billingexpr.RequestInput{}), "existing expressions without cr retain their OpenAI normalization")
 			})
 		}
 	})
@@ -424,33 +417,29 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 		// usage fact; the legacy conversion no longer adds a per-channel request multiplier.
 		assert.Equal(t, `tier("image", fixed(0.04)) * image_count`, aliConversion.Expression)
 		assert.Empty(t, aliConversion.BillingDetails.RequestRules)
-		quantity := 3
-		aliCost, _, err := billingexpr.RunExprWithRequest(aliConversion.Expression, billingexpr.TokenParams{}, billingexpr.RequestInput{ImageCount: &quantity, Body: []byte(`{"parameters":{"prompt_extend":true}}`)})
-		require.NoError(t, err)
-		assert.Equal(t, 120000.0, aliCost)
+		imageUsage := &dto.Usage{}
+		input := billingexpr.RequestInput{Body: []byte(`{"parameters":{"prompt_extend":true}}`)}
+		assert.Equal(t, "0.12 USD", priceAmount(t, aliConversion.Expression, imageUsage, input, 3))
 		for _, tc := range []struct {
 			name    string
 			pricing model.PricingValues
 			usage   dto.Usage
-			want    float64
+			want    string
 		}{
-			{"gemini-2.5-flash", model.PricingValues{"ModelRatio": 0.15, "CompletionRatio": 2.0, "CacheRatio": 0.1}, dto.Usage{PromptTokens: 1000, CompletionTokens: 100, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 100, AudioTokens: 200}}, 473},
-			{"gemini-2.5-flash-zero", model.PricingValues{"ModelRatio": 0.0}, dto.Usage{PromptTokens: 1000, PromptTokensDetails: dto.InputTokenDetails{AudioTokens: 200}}, 200},
-			{"media-audio", model.PricingValues{"ModelRatio": 1.0, "CompletionRatio": 3.0, "AudioRatio": 2.0, "AudioCompletionRatio": 4.0}, dto.Usage{PromptTokens: 1000, CompletionTokens: 100, PromptTokensDetails: dto.InputTokenDetails{TextTokens: 800, AudioTokens: 200}, CompletionTokenDetails: dto.OutputTokenDetails{TextTokens: 50, AudioTokens: 50}}, 3500},
-			{"media-free-audio", model.PricingValues{"ModelRatio": 1.0, "AudioRatio": 0.0}, dto.Usage{PromptTokens: 1000, CompletionTokens: 100, PromptTokensDetails: dto.InputTokenDetails{AudioTokens: 200}, CompletionTokenDetails: dto.OutputTokenDetails{AudioTokens: 100}}, 1600},
-			{"media-audio-cache", model.PricingValues{"ModelRatio": 1.0, "CompletionRatio": 3.0, "AudioRatio": 2.0, "CacheRatio": 0.1}, dto.Usage{PromptTokens: 1000, CompletionTokens: 100, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 400, AudioTokens: 200}, CompletionTokenDetails: dto.OutputTokenDetails{AudioTokens: 50}}, 2900},
-			{"media-text-cache", model.PricingValues{"ModelRatio": 1.0, "CompletionRatio": 3.0, "AudioRatio": 2.0, "CacheRatio": 0.1}, dto.Usage{PromptTokens: 1000, CompletionTokens: 100, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 400}}, 1880},
-			{"gemini-2.5-flash-overlap", model.PricingValues{"ModelRatio": 1.0}, dto.Usage{PromptTokens: 1000, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 800, AudioTokens: 500}}, 2100},
+			{"gemini-2.5-flash", model.PricingValues{"ModelRatio": 0.15, "CompletionRatio": 2.0, "CacheRatio": 0.1}, dto.Usage{PromptTokens: 1000, CompletionTokens: 100, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 100, AudioTokens: 200}}, "0.000473 USD"},
+			{"gemini-2.5-flash-zero", model.PricingValues{"ModelRatio": 0.0}, dto.Usage{PromptTokens: 1000, PromptTokensDetails: dto.InputTokenDetails{AudioTokens: 200}}, "0.0002 USD"},
+			{"media-audio", model.PricingValues{"ModelRatio": 1.0, "CompletionRatio": 3.0, "AudioRatio": 2.0, "AudioCompletionRatio": 4.0}, dto.Usage{PromptTokens: 1000, CompletionTokens: 100, PromptTokensDetails: dto.InputTokenDetails{TextTokens: 800, AudioTokens: 200}, CompletionTokenDetails: dto.OutputTokenDetails{TextTokens: 50, AudioTokens: 50}}, "0.0035 USD"},
+			{"media-free-audio", model.PricingValues{"ModelRatio": 1.0, "AudioRatio": 0.0}, dto.Usage{PromptTokens: 1000, CompletionTokens: 100, PromptTokensDetails: dto.InputTokenDetails{AudioTokens: 200}, CompletionTokenDetails: dto.OutputTokenDetails{AudioTokens: 100}}, "0.0016 USD"},
+			{"media-audio-cache", model.PricingValues{"ModelRatio": 1.0, "CompletionRatio": 3.0, "AudioRatio": 2.0, "CacheRatio": 0.1}, dto.Usage{PromptTokens: 1000, CompletionTokens: 100, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 400, AudioTokens: 200}, CompletionTokenDetails: dto.OutputTokenDetails{AudioTokens: 50}}, "0.0029 USD"},
+			{"media-text-cache", model.PricingValues{"ModelRatio": 1.0, "CompletionRatio": 3.0, "AudioRatio": 2.0, "CacheRatio": 0.1}, dto.Usage{PromptTokens: 1000, CompletionTokens: 100, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 400}}, "0.00188 USD"},
+			{"gemini-2.5-flash-overlap", model.PricingValues{"ModelRatio": 1.0}, dto.Usage{PromptTokens: 1000, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 800, AudioTokens: 500}}, "0.0021 USD"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				converted, err := legacyPricingSource(t, db).Preview(tc.name, tc.pricing)
 				require.NoError(t, err)
 				require.Empty(t, converted.UnsupportedReason)
 				require.NotNil(t, converted.BillingDetails.AudioInputPrice)
-				params := service.BuildTieredTokenParams(&tc.usage, false, billingexpr.UsedVars(converted.Expression))
-				cost, _, err := billingexpr.RunExpr(converted.Expression, params)
-				require.NoError(t, err)
-				assert.InDelta(t, tc.want, cost, 1e-9)
+				assert.Equal(t, tc.want, priceAmount(t, converted.Expression, &tc.usage, billingexpr.RequestInput{}))
 			})
 		}
 		converted, err := legacyPricingSource(t, db).Preview("dall-e-3", model.PricingValues{"ModelPrice": 0.04})
@@ -462,23 +451,21 @@ func TestModelPricingConversionDatabase(t *testing.T) {
 		require.NoError(t, err)
 		require.Empty(t, smallImage.UnsupportedReason)
 		assert.NotContains(t, smallImage.Expression, "1792")
-		smallCost, _, err := billingexpr.RunExprWithRequest(smallImage.Expression, billingexpr.TokenParams{}, billingexpr.RequestInput{Body: []byte(`{"size":"256x256"}`), ImageCount: &quantity})
-		require.NoError(t, err)
-		assert.Equal(t, 24000.0, smallCost)
+		input = billingexpr.RequestInput{Body: []byte(`{"size":"256x256"}`)}
+		assert.Equal(t, "0.024 USD", priceAmount(t, smallImage.Expression, imageUsage, input, 3))
 		for _, tc := range []struct {
 			size, quality string
 			count         int
-			cost          float64
+			amount        string
 		}{
-			{"1024x1024", "standard", 3, 120000},
-			{"1024x1024", "hd", 2, 160000},
-			{"1024x1792", "hd", 3, 360000},
+			{"1024x1024", "standard", 3, "0.12 USD"},
+			{"1024x1024", "hd", 2, "0.16 USD"},
+			{"1024x1792", "hd", 3, "0.36 USD"},
 		} {
 			body, err := common.Marshal(map[string]any{"size": tc.size, "quality": tc.quality})
 			require.NoError(t, err)
-			cost, _, err := billingexpr.RunExprWithRequest(converted.Expression, billingexpr.TokenParams{}, billingexpr.RequestInput{Body: body, ImageCount: &tc.count})
-			require.NoError(t, err)
-			assert.InDelta(t, tc.cost, cost, 1e-9)
+			input := billingexpr.RequestInput{Body: body}
+			assert.Equal(t, tc.amount, priceAmount(t, converted.Expression, imageUsage, input, tc.count))
 		}
 		for _, channelType := range []int{20, 58} {
 			name := fmt.Sprintf("gemini-3.5-flash-media-%d", channelType)

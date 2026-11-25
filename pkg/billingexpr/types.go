@@ -3,8 +3,6 @@ package billingexpr
 import (
 	"crypto/sha256"
 	"fmt"
-
-	"github.com/QuantumNous/new-api/common"
 )
 
 type RequestInput struct {
@@ -72,10 +70,7 @@ type TraceResult struct {
 	Cost         float64            `json:"cost"`
 }
 
-// BillingSnapshot captures billing state at pre-consume time. Expression and
-// request fields stay frozen; group-dependent fields are refreshed before an
-// auto-group retry and settlement. It is fully serializable and contains no
-// compiled program pointers.
+// BillingSnapshot is the serialized format used by historical tasks.
 type BillingSnapshot struct {
 	EstimatedImageCount       *int           `json:"estimated_image_count,omitempty"`
 	BillingMode               string         `json:"billing_mode"`
@@ -95,27 +90,6 @@ type BillingSnapshot struct {
 	ExprVersion               int            `json:"expr_version"`
 	TaskUsageBilling          bool           `json:"task_usage_billing,omitempty"`
 	UsageFacts                map[string]any `json:"usage_facts,omitempty"`
-}
-
-// TieredResult holds everything needed after running tiered settlement.
-type TieredResult struct {
-	// BillingTokens records the actual normalized inputs for successful token
-	// billing that explicitly references img_cr. Logs serialize these through
-	// the shared injection path, not as additional snapshot state.
-	BillingTokens          *TokenParams       `json:"-"`
-	ImageCount             *int               `json:"image_count,omitempty"`
-	BillingUnit            BillingUnit        `json:"billing_unit"`
-	FixedPrice             *float64           `json:"fixed_price,omitempty"`
-	ActualQuotaBeforeGroup float64            `json:"actual_quota_before_group"`
-	ActualQuotaAfterGroup  int                `json:"actual_quota_after_group"`
-	MatchedTier            string             `json:"matched_tier"`
-	RequestRules           []RequestRuleTrace `json:"request_rules,omitempty"`
-	CrossedTier            bool               `json:"crossed_tier"`
-	// Clamp records a single-request saturation event during quota conversion so the
-	// caller can surface it on the consume log for admin auditing. Nil when no
-	// clamping occurred. Not serialized: the marker is attached separately via
-	// the shared quota-saturation audit path.
-	Clamp *common.QuotaClamp `json:"-"`
 }
 
 // ExprHashString returns the SHA-256 hex digest of an expression string.

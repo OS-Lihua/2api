@@ -3,6 +3,7 @@ package billing_setting_test
 import (
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/controller"
@@ -14,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -40,15 +42,15 @@ func TestGPT6AstraBuiltinBilling(t *testing.T) {
 		name                                       string
 		input, output, cached, written, written12h int
 		request                                    string
-		quota                                      int
+		amount                                     string
 	}{
-		{"standard", 1000, 100, 0, 0, 0, `{}`, 7500},
-		{"client flex cannot discount standard pricing", 1000, 100, 0, 0, 0, `{"service_tier":"flex"}`, 7500},
-		{"cache at context boundary", 272000, 1000, 200000, 20000, 0, `{}`, 510000},
-		{"whole request above boundary", 272001, 1000, 200000, 20000, 0, `{}`, 1007510},
+		{"standard", 1000, 100, 0, 0, 0, `{}`, "0.015 USD"},
+		{"client flex cannot discount standard pricing", 1000, 100, 0, 0, 0, `{"service_tier":"flex"}`, "0.015 USD"},
+		{"cache at context boundary", 272000, 1000, 200000, 20000, 0, `{}`, "1.02 USD"},
+		{"whole request above boundary", 272001, 1000, 200000, 20000, 0, `{}`, "2.01502 USD"},
 		// The prompt caching guide example: 4000 of the 7000 writes are 12h.
-		{"12h cache writes", 12000, 0, 4000, 7000, 4000, `{}`, 75750},
-		{"12h cache writes above boundary", 300000, 0, 200000, 20000, 10000, `{}`, 1375000},
+		{"12h cache writes", 12000, 0, 4000, 7000, 4000, `{}`, "0.1515 USD"},
+		{"12h cache writes above boundary", 300000, 0, 200000, 20000, 10000, `{}`, "2.75 USD"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			usage := &dto.Usage{
@@ -56,12 +58,11 @@ func TestGPT6AstraBuiltinBilling(t *testing.T) {
 				PromptTokensDetails: dto.InputTokenDetails{CachedTokens: tc.cached, CacheWriteTokens: tc.written,
 					CacheWriteTokensDetails: &dto.CacheWriteTokenDetails{TTL30mTokens: tc.written - tc.written12h, TTL12hTokens: tc.written12h}},
 			}
-			params := service.BuildTieredTokenParams(usage, false, billingexpr.UsedVars(expression))
-			result, err := billingexpr.ComputeTieredQuotaWithRequest(&billingexpr.BillingSnapshot{
-				ExprString: expression, GroupRatio: 1, QuotaPerUnit: 500000,
-			}, params, billingexpr.RequestInput{Body: []byte(tc.request)})
+			price := &model.PriceVersion{Expression: expression, Currency: "USD"}
+			input := billingexpr.RequestInput{Body: []byte(tc.request)}
+			amount, _, _, err := service.GatewayPrice(price, usage, input, time.Time{}, decimal.NewFromInt(1), nil)
 			require.NoError(t, err)
-			assert.Equal(t, tc.quota, result.ActualQuotaAfterGroup)
+			assert.Equal(t, tc.amount, amount.String())
 		})
 	}
 
@@ -134,10 +135,10 @@ func TestImageModelBuiltinPricesAndOverrides(t *testing.T) {
 			usage := &dto.Usage{PromptTokens: 1000, CompletionTokens: 100, PromptTokensDetails: dto.InputTokenDetails{
 				CachedTokens: 300, ImageTokens: 600, CachedTokensDetails: &dto.CachedTokenDetails{ImageTokens: common.GetPointer(200)},
 			}}
-			result, err := billingexpr.ComputeTieredQuota(&billingexpr.BillingSnapshot{ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), GroupRatio: 1, QuotaPerUnit: 500000},
-				service.BuildTieredTokenParams(usage, false, billingexpr.UsedVars(expression)))
+			price := &model.PriceVersion{Expression: expression, Currency: "USD"}
+			amount, _, _, err := service.GatewayPrice(price, usage, billingexpr.RequestInput{}, time.Time{}, decimal.NewFromInt(1), nil)
 			require.NoError(t, err)
-			assert.Equal(t, 4113, result.ActualQuotaAfterGroup)
+			assert.Equal(t, "0.008225 USD", amount.String())
 			encoded, err := common.Marshal(map[string]float64{name: 0})
 			require.NoError(t, err)
 			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(string(encoded)))
@@ -155,9 +156,8 @@ func TestImageModelBuiltinPricesAndOverrides(t *testing.T) {
 }
 
 // DeepSeek prices are peak/off-peak expressions in USD per 1M tokens; peak is
-// twice off-peak. The same usage settles to the same quota from a Chat,
-// Responses or Anthropic response, and the Search/Fetch routing names cost
-// $0.75 per 1,000 requests with no token price. Which tier runs depends on the clock; both are pinned here.
+// twice off-peak. Equivalent Chat, Responses, and Anthropic usage costs the
+// same amount. Search and Fetch cost $0.75 per 1,000 requests.
 func TestDeepSeekBuiltinBilling(t *testing.T) {
 	settings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
 	saved := *settings
@@ -176,38 +176,37 @@ func TestDeepSeekBuiltinBilling(t *testing.T) {
 	responses := &dto.Usage{}
 	service.ApplyResponsesUsage(responses, &dto.Usage{InputTokens: 3000, OutputTokens: 500, InputTokensDetails: &dto.InputTokenDetails{CachedTokens: 2000}})
 	anthropic := &dto.Usage{PromptTokens: 1000, CompletionTokens: 500, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 2000}, UsageSemantic: "anthropic"}
-	quota := func(expression string, usage *dto.Usage) billingexpr.TieredResult {
-		params := service.BuildTieredTokenParams(usage, usage.UsageSemantic == "anthropic", billingexpr.UsedVars(expression))
-		result, err := billingexpr.ComputeTieredQuota(&billingexpr.BillingSnapshot{
-			ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), GroupRatio: 1, QuotaPerUnit: 500000,
-		}, params)
-		require.NoError(t, err)
-		return result
-	}
-	for model, want := range map[string]map[string]int{
+	for name, want := range map[string]map[string]string{
 		// flash: 1000*0.15 + 2000*0.003 + 500*0.6 = $0.000456 off-peak.
-		"deepseek-flash":               {"off_peak": 228, "peak": 456},
-		"deepseek-v4-flash":            {"off_peak": 228, "peak": 456},
-		"deepseek-v4-flash-vision-exp": {"off_peak": 228, "peak": 456},
+		"deepseek-flash":               {"off_peak": "0.000456 USD", "peak": "0.000912 USD"},
+		"deepseek-v4-flash":            {"off_peak": "0.000456 USD", "peak": "0.000912 USD"},
+		"deepseek-v4-flash-vision-exp": {"off_peak": "0.000456 USD", "peak": "0.000912 USD"},
 		// pro: 1000*0.66 + 2000*0.022 + 500*1.98 = $0.001694 off-peak.
-		"deepseek-v4-pro": {"off_peak": 847, "peak": 1694},
+		"deepseek-v4-pro": {"off_peak": "0.001694 USD", "peak": "0.003388 USD"},
 	} {
-		t.Run(model, func(t *testing.T) {
-			assert.Equal(t, billing_setting.BillingModeTieredExpr, billing_setting.GetBillingMode(model))
-			expression, ok := billing_setting.GetBillingExpr(model)
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, billing_setting.BillingModeTieredExpr, billing_setting.GetBillingMode(name))
+			expression, ok := billing_setting.GetBillingExpr(name)
 			require.True(t, ok)
+			price := &model.PriceVersion{Expression: expression, Currency: "USD"}
 			for name, usage := range map[string]*dto.Usage{"chat": chat, "responses": responses, "anthropic": anthropic} {
-				result := quota(expression, usage)
-				require.Contains(t, want, result.MatchedTier, name)
-				assert.Equal(t, want[result.MatchedTier], result.ActualQuotaAfterGroup, name)
+				for tier, hour := range map[string]int{"peak": 1, "off_peak": 0} {
+					at := time.Date(2026, time.November, 23, hour, 0, 0, 0, time.UTC)
+					amount, _, trace, err := service.GatewayPrice(price, usage, billingexpr.RequestInput{}, at, decimal.NewFromInt(1), nil)
+					require.NoError(t, err)
+					assert.Equal(t, tier, trace.MatchedTier, name)
+					assert.Equal(t, want[tier], amount.String(), name)
+				}
 			}
 		})
 	}
-	for _, model := range []string{"deepseek-search", "deepseek-fetch"} {
-		expression, ok := billing_setting.GetBillingExpr(model)
-		require.True(t, ok, model)
-		result := quota(expression, &dto.Usage{})
-		assert.Equal(t, billingexpr.BillingUnitRequest, result.BillingUnit, model)
-		assert.Equal(t, 375, result.ActualQuotaAfterGroup, model)
+	for _, name := range []string{"deepseek-search", "deepseek-fetch"} {
+		expression, ok := billing_setting.GetBillingExpr(name)
+		require.True(t, ok, name)
+		price := &model.PriceVersion{Expression: expression, Currency: "USD"}
+		amount, _, trace, err := service.GatewayPrice(price, &dto.Usage{}, billingexpr.RequestInput{}, time.Time{}, decimal.NewFromInt(1), nil)
+		require.NoError(t, err)
+		assert.Equal(t, billingexpr.BillingUnitRequest, trace.BillingUnit, name)
+		assert.Equal(t, "0.00075 USD", amount.String(), name)
 	}
 }

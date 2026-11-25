@@ -8,7 +8,6 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/money"
-	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 
 	"github.com/shopspring/decimal"
@@ -436,55 +435,6 @@ func TestPostTextConsumeQuotaBillsOpenAI12hCacheWrites(t *testing.T) {
 			assert.Zero(t, countLogs(t))
 		})
 	}
-}
-
-// TestTryTieredSettleRecordsClampOnOverflow guards that an oversized tiered
-// settlement both saturates the quota and records the clamp on RelayInfo, so
-// every consume path (text, audio, WSS) can surface it under admin_info.
-func TestTryTieredSettleRecordsClampOnOverflow(t *testing.T) {
-	// exprOutput = p * 1e12; quotaBeforeGroup = p*1e12 / 1e6 * 5e5 far exceeds
-	// the supported single-request range and must saturate.
-	exprStr := `tier("base", p * 1000000000000)`
-	relayInfo := &relaycommon.RelayInfo{
-		OriginModelName: "overflow-model",
-		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
-			BillingMode:  "tiered_expr",
-			ExprString:   exprStr,
-			ExprHash:     billingexpr.ExprHashString(exprStr),
-			GroupRatio:   1,
-			QuotaPerUnit: 500_000,
-		},
-	}
-
-	ok, quota, result := TryTieredSettle(relayInfo, billingexpr.TokenParams{P: 1_000_000_000})
-
-	require.True(t, ok)
-	require.NotNil(t, result)
-	require.Equal(t, common.MaxQuota, quota, "oversized settlement must clamp, never wrap negative")
-	require.NotNil(t, relayInfo.QuotaClamp, "clamp must be recorded on RelayInfo for admin auditing")
-	require.Equal(t, common.QuotaClampOverflow, relayInfo.QuotaClamp.Kind)
-}
-
-// TestTryTieredSettleNoClampInRange confirms an in-range settlement leaves
-// RelayInfo.QuotaClamp nil.
-func TestTryTieredSettleNoClampInRange(t *testing.T) {
-	exprStr := `tier("base", p * 2 + c * 10)`
-	relayInfo := &relaycommon.RelayInfo{
-		OriginModelName: "in-range-model",
-		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
-			BillingMode:  "tiered_expr",
-			ExprString:   exprStr,
-			ExprHash:     billingexpr.ExprHashString(exprStr),
-			GroupRatio:   1,
-			QuotaPerUnit: 500_000,
-		},
-	}
-
-	ok, _, result := TryTieredSettle(relayInfo, billingexpr.TokenParams{P: 1000, C: 500})
-
-	require.True(t, ok)
-	require.NotNil(t, result)
-	require.Nil(t, relayInfo.QuotaClamp, "in-range settlement must not record a clamp")
 }
 
 // A request whose upstream returns no usage is logged without a charge. The

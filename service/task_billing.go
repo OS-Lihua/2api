@@ -1,16 +1,11 @@
 package service
 
 import (
-	"context"
 	"encoding/base64"
-	"fmt"
-	"maps"
-	"math"
 
 	"github.com/QuantumNous/new-api/common"
 
 	"github.com/QuantumNous/new-api/model"
-	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -138,38 +133,4 @@ func taskModelName(task *model.Task) string {
 		return bc.OriginModelName
 	}
 	return task.Properties.OriginModelName
-}
-
-// RefundTaskQuota is a retired integer-billing entrypoint. Historical counters
-// cannot prove a refundable charge, even when zero. Canonical tasks settle only
-// through SettleGatewayTask and its immutable money lifecycle.
-func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool {
-	return false
-}
-
-// RecalculateTaskQuota cannot turn historical integer evidence into a new bill.
-func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int, reason *common.Message, clamps ...*common.QuotaClamp) {
-}
-
-// RecalculateTaskQuotaByTokens never reprices an accepted historical task using
-// today's model or group settings.
-func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTokens int) bool {
-	return false
-}
-
-// EvaluateTaskCompletionUsage evaluates actual facts against the frozen task
-// expression. It neither mutates the snapshot nor moves funds: synchronous
-// submission and polling have different persistence and settlement barriers.
-func EvaluateTaskCompletionUsage(snap *billingexpr.BillingSnapshot, facts map[string]any) (billingexpr.TieredResult, map[string]any, error) {
-	if snap == nil {
-		return billingexpr.TieredResult{}, nil, fmt.Errorf("task billing snapshot is missing")
-	}
-	usage := make(map[string]any, len(snap.UsageFacts)+len(facts))
-	maps.Copy(usage, snap.UsageFacts)
-	maps.Copy(usage, facts)
-	result, err := billingexpr.ComputeTieredQuotaWithRequest(snap, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: usage})
-	if err == nil && (result.ActualQuotaBeforeGroup < 0 || math.IsNaN(result.ActualQuotaBeforeGroup)) {
-		err = fmt.Errorf("task completion expression produced an invalid cost")
-	}
-	return result, usage, err
 }

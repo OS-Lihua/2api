@@ -479,7 +479,7 @@ for expression evaluation, including fields outside the selected profile.
 Saving an expression checks literal usage keys against the selected schema;
 already stored expressions are not migrated. Single-plugin submissions retain
 the existing key-check behavior; shared models enforce the compatibility rule
-above. Existing runtime error and quota safety checks still apply.
+above. Existing runtime validation and amount safety checks still apply.
 Completion continues to evaluate the frozen expression after overlaying measured
 facts; no schema snapshot or database migration is introduced.
 
@@ -493,19 +493,11 @@ declared value list. The schema description is display-only metadata and never
 affects evaluation. `token` is the host unit for upstream billing tokens (for
 example doubao `usage.completion_tokens`). `credit` is the host unit for vendor
 resource-pack units (for example kling `final_unit_deduction`). Both share the
-int32 quota bound, not the 3600-second / 128-count limits.
+int32 usage bound, not the 3600-second / 128-count limits.
 
-Task usage billing has a deliberately different conversion rule from token
-billing:
-
-```
-task quota = expression output in USD * QuotaPerUnit * groupRatio
-token quota = expression output in $/1M tokens / 1,000,000 * QuotaPerUnit * groupRatio
-```
-
-In other words, a task expression already returns the request's dollar cost.
-For example, `u("seconds") * 0.4` means $0.40 per second. Engine semantics do
-not divide task output by one million.
+A task expression returns the request amount in the price version's currency.
+For example, `u("seconds") * 0.4` means $0.40 per second for a USD price.
+Unlike token-priced expressions, task output is not divided by one million.
 
 The visual editor generates, and public pricing displays recognize, exactly
 these canonical task shapes. Expressions outside these shapes remain valid in
@@ -552,82 +544,36 @@ Cartesian product. Smoke vectors are capped at
 evaluated result must be finite and non-negative.
 
 Submission evaluates the expression with request-derived usage facts and
-freezes both the expression and those facts in the billing snapshot. On
+freezes both the price and those facts in the gateway settlement record. On
 completion, the host overlays completion facts on the frozen submission facts
 key by key, so measured values replace estimates while facts omitted by the
 completion hook retain their submission values. The same expression is then
 evaluated again; a changed fact can therefore produce a settlement delta and a
-different matched tier. Evaluation failure keeps the pre-consumed charge.
+different matched tier.
 
 ---
 
 ## Architecture
 
-### Data Flow
-
 ```
-Frontend Editor → Storage → Pre-consume → Settlement → Log Display
+Price version -> Wallet reservation -> Settlement from measured usage -> Request record
 ```
 
-### 1. Frontend Editor
+### Price and reservation
 
-**File**: `web/src/pages/Setting/Ratio/components/TieredPricingEditor.jsx`
+The gateway uses a price version with an expression and a currency. At
+reservation it captures the price and request inputs needed for settlement,
+including the sale discount and the time used by time-based rules. Legacy
+option maps are migration sources, not active price settings.
 
-Two editing modes:
-- **Visual mode**: Fill in prices per variable, conditions per tier. Generates expression via `generateExprFromVisualConfig()`.
-- **Raw mode**: Edit the expression string directly. Includes preset templates for common models.
+### Settlement and request records
 
-The editor outputs a billing expression string and an optional request rule expression string. These are combined via `combineBillingExpr(billingExpr, requestRuleExpr)` before storage.
-
-### 2. Storage
-
-**File**: `setting/billing_setting/tiered_billing.go`
-
-Two option maps stored in the `options` DB table:
-- `ModelBillingMode`: `{ "model-name": "tiered_expr" }` — activates tiered billing for a model
-- `ModelBillingExpr`: `{ "model-name": "tier(\"base\", p * 2.5 + c * 15)" }` — the expression
-
-On save, the expression is validated:
-1. Compiled via `billingexpr.CompileFromCache()` — syntax check
-2. Smoke-tested with sample token vectors — ensures non-negative results
-
-### 3. Pre-consume (Quota Estimation)
-
-**File**: `relay/helper/price.go` → `modelPriceHelperTiered()`
-
-When a request arrives and the model uses `tiered_expr` billing:
-1. Loads expression from `billing_setting.GetBillingExpr()`
-2. Builds `RequestInput` (headers + body) for `param()` / `header()` functions
-3. Runs the expression with locally estimated input tokens (`P` and `Len`) and zero output tokens (`C=0`). Client output limits do not affect the reservation. If request token estimation is disabled, the estimated input is zero.
-4. Converts output to quota: `rawCost / 1,000,000 * QuotaPerUnit`. For token-priced leaves, multiplies this reservation by `quota_setting.pre_consume_multiplier` (default 1; any finite positive decimal). The multiplier does not change context-length tier selection, actual settlement, or request-priced leaves. The snapshot freezes the multiplier for image quantity retries; group retries reuse the multiplied reservation. Older snapshots with no multiplier retain a factor of 1.
-5. Creates `BillingSnapshot` and stores it on `RelayInfo`. Expression and request state stay frozen for settlement. An auto-group retry refreshes group-dependent fields from the selected group before the next upstream attempt. If a free initial group skipped pre-consume and the retry selects a paid group, the billing session is created before that attempt. If an existing session moves to a more expensive group, its reservation is raised to that group's estimate before sending; cheaper groups are refunded only after actual usage is settled.
-
-Wallet trust bypass uses `quota_setting.trust_quota_usd` (default 10 USD; 0 disables bypass). Both the wallet and any limited API token must exceed the threshold. The wallet must still cover the estimated reservation before bypass is considered. Subscriptions and asynchronous tasks do not use this bypass. Legacy token-ratio pricing also reserves estimated input cost times the multiplier, without the former `PreConsumedQuota` floor or output-token estimate. Task usage pricing is unchanged.
-
-### 4. Settlement (Actual Billing)
-
-**Files**: `service/tiered_settle.go`, `pkg/billingexpr/settle.go`
-
-After the upstream response returns with actual token usage:
-
-1. `BuildTieredTokenParams(usage, isClaudeUsageSemantic, usedVars)`:
-   - Reads actual token counts from `dto.Usage`
-   - For GPT-format APIs (prompt_tokens includes everything): subtracts sub-categories from P/C **only when** the expression uses their variables (detected via AST introspection of the compiled expression)
-   - For Claude-format APIs: cache reads and writes omitted from the expression are added to input; separately priced cache remains separate
-
-2. `TryTieredSettle(relayInfo, params)`:
-   - Uses the captured `BillingSnapshot`, whose group-dependent fields have been refreshed from the final selected group
-   - Re-runs the expression with actual token counts
-   - Converts via `quotaConversion()` (version-dispatched)
-   - Returns actual quota
-
-### 5. Log Display
-
-**Files**: `service/log_info_generate.go`, `web/src/helpers/render.jsx`
-
-Backend: `InjectTieredBillingInfo()` adds `billing_mode`, `expr_b64` (base64 expression), `matched_tier`, and the structured `request_rules` trace list to the log's `other` JSON.
-
-Frontend: Detects `billing_mode === "tiered_expr"`, decodes `expr_b64`, parses tiers via shared `parseTiersFromExpr()`, and renders request multipliers from `request_rules` when present. Without log traces, it falls back to parsing the stored expression.
+`service.GatewayPrice` normalizes actual token usage with `MoneyTokenQuantities`
+and evaluates the captured expression with `RunMoneyExpr`. Measured media
+quantities can differ from request estimates. Evaluation keeps exact decimals
+through the sale discount and currency conversion; monetary amounts are
+rounded at the storage boundary. Historical quota logs and task snapshots
+remain readable; they do not compute new charges.
 
 ---
 
@@ -655,15 +601,11 @@ Example: `p * 2.5 + c * 15 + cr * 0.25`
 
 This ensures that heavy cache usage doesn't cause the tier condition to incorrectly evaluate to a lower tier. For example, if a request has 300K total context but 250K is cached, `p` with cache subtracted would be only 50K (standard tier), while `len` correctly reports 300K (long-context tier).
 
-### Quota Conversion
+### Monetary Units
 
-Expression coefficients are $/1M tokens. Conversion to internal quota:
-
-```
-quota = exprOutput / 1,000,000 * QuotaPerUnit * groupRatio
-```
-
-This matches the per-call billing pattern: `quota = modelPrice * QuotaPerUnit * groupRatio`.
+Token coefficients are prices per million tokens in the price version's
+currency. Fixed request prices and task usage expressions return amounts
+in that currency directly, with no integer quota conversion.
 
 ### Expression Versioning
 
@@ -672,7 +614,7 @@ Expressions can carry a version prefix: `v1:tier(...)`. No prefix = v1.
 Version controls:
 - Compile environment (available variables and functions)
 - Token normalization logic
-- Quota conversion formula
+- Interpretation of expression results
 
 This enables future evolution without breaking existing expressions.
 
@@ -682,12 +624,8 @@ This enables future evolution without breaking existing expressions.
 
 | Layer | Files |
 |-------|-------|
-| Expression engine | `pkg/billingexpr/compile.go`, `run.go`, `money.go`, `settle.go`, `round.go`, `types.go` |
-| Storage | `setting/billing_setting/tiered_billing.go` |
-| Pre-consume | `relay/helper/price.go`, `relay/helper/billing_expr_request.go` |
-| Settlement | `service/tiered_settle.go`, `service/quota.go` |
-| Log injection | `service/log_info_generate.go` |
-| Frontend editor | `web/src/pages/Setting/Ratio/components/TieredPricingEditor.jsx` |
-| Frontend display | `web/src/helpers/render.jsx`, `web/src/helpers/utils.jsx` |
-| Model detail | `web/src/components/table/model-pricing/modal/components/DynamicPricingBreakdown.jsx` |
-| Log display | `web/src/hooks/usage-logs/useUsageLogsData.jsx`, `web/src/components/table/usage-logs/UsageLogsColumnDefs.jsx` |
+| Expression engine | `pkg/billingexpr/compile.go`, `run.go`, `money.go`, `money_usage.go`, `types.go` |
+| Price evaluation | `service/gateway_price.go` |
+| Reservation and settlement | `model/gateway_billing.go`, `service/task_gateway.go` |
+| Frontend editor | `web/src/features/system-settings/models/tiered-pricing-editor.tsx` |
+| Request records | `web/src/features/usage-logs/requests/` |

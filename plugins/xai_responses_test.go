@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -107,10 +108,6 @@ func TestXAIModeratedVideoKeepsItsCharge(t *testing.T) {
 	_, trace, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: facts})
 	require.NoError(t, err)
 	assert.Equal(t, "720p", trace.MatchedTier)
-	snapshot := &billingexpr.BillingSnapshot{
-		BillingMode: billing_setting.BillingModeTieredExpr, ModelName: videoModel, ExprString: expression, ExprHash: billingexpr.ExprHashString(expression),
-		GroupRatio: 1, QuotaPerUnit: 500000, ExprVersion: billingexpr.ExprVersion(expression), TaskUsageBilling: true, UsageFacts: facts,
-	}
 
 	for _, tc := range []struct {
 		name         string
@@ -121,7 +118,7 @@ func TestXAIModeratedVideoKeepsItsCharge(t *testing.T) {
 		wantReason   string
 		wantFacts    map[string]any
 		wantTier     string
-		wantQuota    int
+		wantAmount   string
 		wantVideo    bool
 	}{
 		{name: "still rendering", httpStatus: http.StatusAccepted, body: ``, wantStatus: "IN_PROGRESS"},
@@ -129,17 +126,17 @@ func TestXAIModeratedVideoKeepsItsCharge(t *testing.T) {
 		{
 			name: "delivered video settles on its length", httpStatus: http.StatusOK,
 			body:       `{"status":"done","progress":100,"model":"grok-imagine-video-1.5","video":{"url":"https://vidgen.x.ai/v.mp4","duration":6,"respect_moderation":true},"usage":{"cost_in_usd_ticks":8500000000}}`,
-			wantStatus: "SUCCESS", wantFacts: map[string]any{"seconds": float64(6)}, wantTier: "720p", wantQuota: 425000, wantVideo: true,
+			wantStatus: "SUCCESS", wantFacts: map[string]any{"seconds": float64(6)}, wantTier: "720p", wantAmount: "0.85 USD", wantVideo: true,
 		},
 		{
 			name: "moderated output is charged", httpStatus: http.StatusOK,
 			body:       `{"status":"done","progress":100,"video":{"url":"","duration":8,"respect_moderation":false},"usage":{"cost_in_usd_ticks":11200000000}}`,
-			wantStatus: "SUCCESS", wantFacts: map[string]any{"seconds": float64(8), "moderated": true}, wantTier: "blocked", wantQuota: 25000,
+			wantStatus: "SUCCESS", wantFacts: map[string]any{"seconds": float64(8), "moderated": true}, wantTier: "blocked", wantAmount: "0.05 USD",
 		},
 		{
 			name: "failure xAI billed is charged", httpStatus: http.StatusOK,
 			body:       `{"status":"failed","error":{"code":"invalid_argument","message":"Content blocked by moderation"},"usage":{"cost_in_usd_ticks":500000000}}`,
-			wantStatus: "SUCCESS", wantFacts: map[string]any{"moderated": true}, wantTier: "blocked", wantQuota: 25000,
+			wantStatus: "SUCCESS", wantFacts: map[string]any{"moderated": true}, wantTier: "blocked", wantAmount: "0.05 USD",
 		},
 		{
 			name: "unbilled failure is refunded", httpStatus: http.StatusOK,
@@ -180,10 +177,12 @@ func TestXAIModeratedVideoKeepsItsCharge(t *testing.T) {
 				return
 			}
 			assert.Equal(t, tc.wantFacts, result.UsageFacts)
-			settled, _, err := service.EvaluateTaskCompletionUsage(snapshot, result.UsageFacts)
+			usage := maps.Clone(facts)
+			maps.Copy(usage, downstream.UsageFacts)
+			amount, settled, err := billingexpr.RunMoneyExpr(expression, billingexpr.MoneyInput{TaskUsage: true, Request: billingexpr.RequestInput{Usage: usage}}, "USD")
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantTier, settled.MatchedTier)
-			assert.Equal(t, tc.wantQuota, settled.ActualQuotaAfterGroup)
+			assert.Equal(t, tc.wantAmount, amount.String())
 
 			task.Status = model.TaskStatusSuccess
 			artifacts, err := adaptor.ListArtifacts(task)
@@ -566,22 +565,18 @@ func TestXAIEditSettlesOnOutputResolution(t *testing.T) {
 	reserved, err := adaptor.ExtractUsageFactsValidated(c, info)
 	require.NoError(t, err)
 	assert.Equal(t, map[string]any{"seconds": float64(6), "resolution": "720p", "input_images": float64(0), "input_video_seconds": float64(15), "moderated": false}, reserved)
-	snapshot := &billingexpr.BillingSnapshot{
-		BillingMode: billing_setting.BillingModeTieredExpr, ModelName: videoModel, ExprString: expression, ExprHash: billingexpr.ExprHashString(expression),
-		GroupRatio: 1, QuotaPerUnit: 500000, ExprVersion: billingexpr.ExprVersion(expression), TaskUsageBilling: true, UsageFacts: reserved,
-	}
 
 	for _, tc := range []struct {
 		name           string
 		path           string
 		wantResolution string
 		wantTier       string
-		wantQuota      int
+		wantAmount     string
 	}{
-		{name: "a file served whole settles on its 720p track", path: "/faststart.mp4", wantResolution: "720p", wantTier: "720p", wantQuota: 250000},
-		{name: "a moov after the media is read by Range", path: "/tail.mp4", wantResolution: "480p", wantTier: "480p", wantQuota: 190000},
-		{name: "a file that is not MP4 keeps the reserved cap", path: "/text.mp4", wantTier: "720p", wantQuota: 250000},
-		{name: "an unreadable file keeps the reserved cap", path: "/missing.mp4", wantTier: "720p", wantQuota: 250000},
+		{name: "a file served whole settles on its 720p track", path: "/faststart.mp4", wantResolution: "720p", wantTier: "720p", wantAmount: "0.5 USD"},
+		{name: "a moov after the media is read by Range", path: "/tail.mp4", wantResolution: "480p", wantTier: "480p", wantAmount: "0.38 USD"},
+		{name: "a file that is not MP4 keeps the reserved cap", path: "/text.mp4", wantTier: "720p", wantAmount: "0.5 USD"},
+		{name: "an unreadable file keeps the reserved cap", path: "/missing.mp4", wantTier: "720p", wantAmount: "0.5 USD"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := `{"status":"done","progress":100,"video":{"url":"` + server.URL + tc.path + `","duration":14,"respect_moderation":true}}`
@@ -601,10 +596,12 @@ func TestXAIEditSettlesOnOutputResolution(t *testing.T) {
 				assert.JSONEq(t, `{"extension_seconds":6,"output_resolution":"`+tc.wantResolution+`"}`, string(result.PluginState))
 			}
 			assert.Equal(t, wantFacts, result.UsageFacts)
-			settled, _, err := service.EvaluateTaskCompletionUsage(snapshot, result.UsageFacts)
+			usage := maps.Clone(reserved)
+			maps.Copy(usage, result.UsageFacts)
+			amount, settled, err := billingexpr.RunMoneyExpr(expression, billingexpr.MoneyInput{TaskUsage: true, Request: billingexpr.RequestInput{Usage: usage}}, "USD")
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantTier, settled.MatchedTier)
-			assert.Equal(t, tc.wantQuota, settled.ActualQuotaAfterGroup)
+			assert.Equal(t, tc.wantAmount, amount.String())
 		})
 	}
 	moov := len(ftyp) + len(mdat)
