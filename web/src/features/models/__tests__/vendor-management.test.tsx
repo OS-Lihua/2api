@@ -20,13 +20,18 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { AxiosError } from 'axios'
+import { createInstance } from 'i18next'
+import { I18nextProvider } from 'react-i18next'
 import { describe, expect, it, vi } from 'vitest'
 
+import zhTW from '@/i18n/locales/zh-TW.json'
+import zhCN from '@/i18n/locales/zh.json'
 import { api, type ApiRequestConfig } from '@/lib/api'
 
 import { VendorMutateDialog } from '../components/dialogs/vendor-mutate-dialog'
 import { VendorOperationDialog } from '../components/dialogs/vendor-operation-dialog'
 import { VendorLinkedModels } from '../components/vendor-linked-models'
+import { getModelsSectionNavItems } from '../section-registry'
 
 vi.mock('@tanstack/react-router', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@tanstack/react-router')>()),
@@ -79,6 +84,34 @@ function conflict() {
 }
 
 describe('vendor management', () => {
+  it.each([
+    ['zhCN', zhCN, '模型发行方', '创建模型发行方', '模型发行方名称', '供应商'],
+    ['zhTW', zhTW, '模型發行方', '建立模型發行方', '模型發行方名稱', '供應商'],
+  ])(
+    'distinguishes model publishers from providers in %s',
+    async (lng, resource, publisher, create, name, provider) => {
+      const i18n = createInstance()
+      await i18n.init({ lng, resources: { [lng]: resource }, initAsync: false })
+
+      renderWithClient(
+        <I18nextProvider i18n={i18n}>
+          <VendorMutateDialog
+            open
+            currentVendor={null}
+            onOpenChange={() => {}}
+          />
+        </I18nextProvider>
+      )
+
+      expect(getModelsSectionNavItems(i18n.t)).toContainEqual(
+        expect.objectContaining({ title: publisher, url: '/models/vendors' })
+      )
+      expect(screen.getByRole('dialog', { name: create })).toBeVisible()
+      expect(screen.getByRole('textbox', { name: `${name} *` })).toBeVisible()
+      expect(i18n.t('Providers')).toBe(provider)
+    }
+  )
+
   it('edits only vendor metadata using the saved version and protects unsaved changes', async () => {
     vi.spyOn(api, 'get').mockResolvedValue({
       data: { success: true, data: vendor },
